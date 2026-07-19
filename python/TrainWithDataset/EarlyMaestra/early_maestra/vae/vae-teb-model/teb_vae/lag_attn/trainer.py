@@ -14,6 +14,13 @@ Run from the repository root, which is what puts ``teb_vae``, ``train`` and ``ut
     TEB_RUN_STAMP="$(date '+%Y-%m-%d--[%H-%M]')" torchrun --nproc_per_node=7 \
         -m teb_vae.lag_attn.trainer --config teb_vae/lag_attn/configs/default.yaml
 
+From an IDE's Run button, with no command line: set ``RUN_CONFIG`` at the bottom of this file to
+the config path and hit Run. It ships as ``None``, so until it is set a bare launch still refuses
+to start rather than silently training some default configuration. Note this is a *single* process
+-- fine for a smoke run, but a config whose ``general_config.cuda_devices`` lists several GPUs will
+have Lightning spawn DDP workers underneath it, which is rarely what is wanted from a Run button;
+point ``RUN_CONFIG`` at a single-device variant such as ``configs/tiny.yaml``.
+
 Everything about *running* an experiment -- run directories, seeding, log sinks, MLflow, the
 ``Trainer`` itself -- is the framework's. This module supplies the three things the framework
 cannot know: how to turn ``model_config.VAE_model`` into a net, which callbacks this model wants,
@@ -23,26 +30,39 @@ from __future__ import annotations
 
 import argparse
 import inspect
+import os
+import sys
 import tempfile
 import time
 from typing import Any, Dict, List
 
-import torch
-from lightning.pytorch.callbacks import Callback, ModelCheckpoint
-from loguru import logger
+#: Repository root: ``teb_vae/lag_attn/trainer.py`` -> up three.
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from teb_vae.lag_attn.config import resolve_config_file
-from teb_vae.lag_attn.nets.model import SeqVaeLagAttn
-from teb_vae.lag_attn.task import SeqVaeLagAttnTask
-from train.callbacks import (
+# An IDE's Run button executes this file as a script, which puts *this directory* on sys.path
+# rather than the repository root -- so the `teb_vae.` and `train.` imports below would fail with
+# ModuleNotFoundError before __main__ is ever reached. Launching as
+# `python -m teb_vae.lag_attn.trainer` from the repo root sets __package__ and needs none of this,
+# which is why the insert is guarded rather than unconditional.
+if not __package__ and _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
+import torch  # noqa: E402
+from lightning.pytorch.callbacks import Callback, ModelCheckpoint  # noqa: E402
+from loguru import logger  # noqa: E402
+
+from teb_vae.lag_attn.config import resolve_config_file  # noqa: E402
+from teb_vae.lag_attn.nets.model import SeqVaeLagAttn  # noqa: E402
+from teb_vae.lag_attn.task import SeqVaeLagAttnTask  # noqa: E402
+from train.callbacks import (  # noqa: E402
     HyperparameterLoggingCallback,
     LossPlotCallback,
     MetricsHistoryCsvCallback,
     MetricsLoggingCallback,
 )
-from train.data_module import GraphDataModule
-from train.graph_model_base import GraphModelBase
-from train.graph_models_utils import check_model_class, load_checkpoint_strict
+from train.data_module import GraphDataModule  # noqa: E402
+from train.graph_model_base import GraphModelBase  # noqa: E402
+from train.graph_models_utils import check_model_class, load_checkpoint_strict  # noqa: E402
 
 #: Every metric suffix the task emits. Kept here rather than imported from the task because it is
 #: the trainer that must tell ``MetricsLoggingCallback`` what to collect -- that callback hardcodes
@@ -298,7 +318,6 @@ class LagAttnTrainer(GraphModelBase):
                     plot_frequency=plot_config.get("plot_frequency", 1),
                     num_examples=plot_config.get("num_examples", 2),
                     file_format=plot_config.get("file_format", "pdf"),
-                    forecast_channels=plot_config.get("forecast_channels", (0, 43, 80)),
                     forecast_anchor_frac=plot_config.get("forecast_anchor_frac", 0.6),
                     mlflow_logger=self.mlflow_logger,
                 )
@@ -333,17 +352,16 @@ def main(config_path: str) -> None:
         logger.info(f"resolved config {config_path} -> {resolved_path}")
 
         graph_model = LagAttnTrainer(config_file_path=resolved_path)
+        # Both pre-flight guards run here, before setup_config, because that is what makes them
+        # cheap to hit: setup_config seeds the run, creates the output directories, opens the log
+        # sinks and connects MLflow, so a launch that fails after it has already left a run
+        # directory and an MLflow run behind on every rank. The driver loads the whole config in
+        # its constructor, so both guards have everything they need this early.
+        _check_stat_path(graph_model.config)
+        _check_declared_widths_against_shard(graph_model.config)
+
         graph_model.setup_config()
 
-    dataset_config = graph_model.config.get("dataset_config", {}) or {}
-    if dataset_config.get("stat_path") is None:
-        # The loader passes None straight through and the dataset merely skips normalization, so an
-        # absent or misspelled stat_path (the config key is `stat_path`; the loader's parameter is
-        # `stats_path`) would otherwise train a model on raw-scale inputs and report nothing.
-        raise ValueError(
-            "dataset_config.stat_path must be set; without it normalization is silently disabled "
-            "and the model trains on unnormalized inputs."
-        )
     data_module = GraphDataModule(graph_model.config)
 
     graph_model.create_model()
@@ -351,11 +369,165 @@ def main(config_path: str) -> None:
     logger.info(f"Training completed in {(time.time() - start_time) / 60:.2f} minutes.")
 
 
+def _check_stat_path(config: Dict[str, Any]) -> None:
+    """Refuse to start without a normalization statistics file that actually exists.
+
+    Args:
+        config: The resolved run config.
+
+    Raises:
+        ValueError: If ``stat_path`` is unset or names a file that is not there.
+    """
+    dataset_config = config.get("dataset_config", {}) or {}
+    stat_path = dataset_config.get("stat_path")
+    if stat_path is None:
+        # The loader passes None straight through and the dataset merely skips normalization, so an
+        # absent or misspelled stat_path (the config key is `stat_path`; the loader's parameter is
+        # `stats_path`) would otherwise train a model on raw-scale inputs and report nothing.
+        raise ValueError(
+            "dataset_config.stat_path must be set; without it normalization is silently disabled "
+            "and the model trains on unnormalized inputs."
+        )
+    if not os.path.isfile(str(stat_path)):
+        # Set-but-wrong is the same failure as unset, and it is the likelier one: the loader emits
+        # `UserWarning: Statistics file not found ... Normalization disabled` and carries on, so a
+        # mistyped or not-yet-generated path costs a full run on raw-scale inputs -- with a warning
+        # nobody reads in a multi-day log. Checking the key is non-None was never enough.
+        raise ValueError(
+            f"dataset_config.stat_path does not exist: {stat_path!r}. The loader would only warn "
+            f"and silently disable normalization. Generate the stats for this dataset with "
+            f"hdf5_dataset/calculate_dataset_stats.py at trim_minutes=1.0, matching "
+            f"dataloader_config.dataset_kwargs.trim_minutes."
+        )
+
+
+def _check_declared_widths_against_shard(config: Dict[str, Any]) -> None:
+    r"""Compare the configured $c_y$ / $c_u$ against the first training shard, before the fit.
+
+    The task already checks this against every real batch, which is the authoritative check. This
+    one exists only to move the failure earlier: without it a width mismatch surfaces inside
+    ``training_step``, by which point every rank has initialised, the run directory and MLflow run
+    exist, and the shards have been opened. Called from ``main`` before ``setup_config``, so
+    reading two HDF5 *shapes* is all a mismatched launch costs. Every rank runs it and every rank
+    raises, which is the intended behaviour -- they read the same config and the same shard, so a
+    disagreement is not rank-local.
+
+    Deliberately not fatal on anything but a genuine mismatch: a missing file, a missing field or
+    an unreadable shard is left to the data module, which reports those far better than a
+    pre-flight peek can. Same reasoning as the ``stat_path`` guard above -- catch the silent and
+    expensive case, not every case.
+
+    Args:
+        config: The resolved run config.
+
+    Raises:
+        ValueError: If a declared width disagrees with the shard's own channel counts.
+    """
+    dataset_config = config.get("dataset_config", {}) or {}
+    shards = dataset_config.get("vae_train_datasets") or []
+    vae_config = (config.get("model_config", {}) or {}).get("VAE_model", {}) or {}
+    if not shards or "c_y" not in vae_config or "c_u" not in vae_config:
+        return
+
+    try:
+        import h5py
+
+        with h5py.File(str(shards[0]), "r") as handle:
+            # Stored layout is (N, C, T); the loader transposes to (T, C) per sample.
+            widths = {name: int(handle[name].shape[1]) for name in
+                      ("fhr_st", "fhr_ph", "up_st", "up_ph")}
+    except Exception:  # noqa: BLE001 - the data module reports these properly; see docstring.
+        return
+
+    use_up_st = bool(vae_config.get("use_up_st", True))
+    expected_c_y = widths["fhr_st"] + widths["fhr_ph"]
+    expected_c_u = widths["up_st"] + widths["up_ph"] if use_up_st else widths["up_ph"]
+
+    problems = []
+    if int(vae_config["c_y"]) != expected_c_y:
+        problems.append(
+            f"c_y={vae_config['c_y']} but the shard gives {expected_c_y} "
+            f"(fhr_st={widths['fhr_st']} + fhr_ph={widths['fhr_ph']})"
+        )
+    if int(vae_config["c_u"]) != expected_c_u:
+        composition = (
+            f"up_st={widths['up_st']} + up_ph={widths['up_ph']}"
+            if use_up_st
+            else f"up_ph={widths['up_ph']}"
+        )
+        problems.append(
+            f"c_u={vae_config['c_u']} but the shard gives {expected_c_u} "
+            f"({composition}, use_up_st={use_up_st})"
+        )
+    if problems:
+        raise ValueError(
+            "model_config.VAE_model channel widths disagree with "
+            f"{shards[0]}: " + "; ".join(problems) + ". The widths are a property of the HDF5: "
+            "either fix the config or point dataset_config at the shards these widths were "
+            "chosen for. Note 58 is both the current use_up_st=true c_u and the old phase-only "
+            "one, so decide from use_up_st before trusting the number."
+        )
+
+
+#: Config used when the module is launched with no ``--config`` -- i.e. an IDE's Run button.
+#:
+#: **Ships as ``None`` on purpose.** A default pointing at a real file means a bare run silently
+#: trains *some* configuration; the trainer this was ported from did exactly that, and a run that
+#: quietly trained the baseline instead of what the operator meant is worse than one that refuses
+#: to start. Left ``None``, a bare launch still fails asking for ``--config``, exactly as before.
+#:
+#: To use the Run button, set this to a config path and hit Run:
+#:
+#: .. code-block:: python
+#:
+#:     RUN_CONFIG = "teb_vae/lag_attn/configs/tiny.yaml"
+#:
+#: A relative path is resolved against the repository root, not the working directory, so it does
+#: not matter what an IDE sets the latter to. ``--config`` always wins when supplied.
+#:
+#: To vary anything *other* than the config path -- devices, epochs, batch size, widths -- write a
+#: small variant config with ``base: default.yaml`` (see ``configs/tiny.yaml``) and point this at
+#: it, rather than editing values here. The run's durable record is the resolved config dumped to
+#: the run log and to MLflow; settings injected from Python would not appear in either.
+RUN_CONFIG: str | None = None
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--config",
-        required=True,
-        help="Path to the YAML config, e.g. teb_vae/lag_attn/configs/default.yaml. Run from the repo root.",
+        default=None,
+        help="Path to the YAML config, e.g. teb_vae/lag_attn/configs/default.yaml. Run from the "
+        "repo root. Optional only if RUN_CONFIG is set in this file (for an IDE Run button).",
     )
-    main(parser.parse_args().config)
+    _args = parser.parse_args()
+
+    _config_path = _args.config or RUN_CONFIG
+    if _config_path is None:
+        # Same refusal as when --config was declared required, and for the same reason.
+        parser.error(
+            "--config is required. To launch from an IDE Run button instead, set RUN_CONFIG "
+            "near the bottom of this file to a config path."
+        )
+
+    # Repo-root-relative, because that is the convention every documented invocation already uses
+    # and an IDE's working directory is not something this module can rely on. Absolute paths and
+    # paths supplied on the command line from the repo root are both unaffected.
+    if not os.path.isabs(_config_path):
+        _config_path = os.path.join(_REPO_ROOT, _config_path)
+
+    # Resolving the config path is not enough: the paths *inside* a config are repo-root-relative
+    # too (see `configs/tiny.yaml`, whose shard and stats paths are), as is `out_dir_base` in some
+    # variants. Under an IDE Run button the working directory is whatever the IDE chose, and a
+    # relative shard path then silently resolves to nothing -- the loader only warns and yields an
+    # empty index, so the run dies as "No samples match the specified filters" with no mention of
+    # the real cause. Every documented invocation already requires the repo root, so make it so
+    # rather than requiring the operator to configure it.
+    if os.path.abspath(os.getcwd()) != _REPO_ROOT:
+        logger.info(f"changing working directory to the repo root: {_REPO_ROOT}")
+        os.chdir(_REPO_ROOT)
+
+    if _args.config is None:
+        logger.info(f"no --config given; using RUN_CONFIG={_config_path}")
+
+    main(_config_path)

@@ -161,7 +161,7 @@ def test_causal_group_norm_rejects_indivisible_channels():
 
 def test_input_adapter_projects_both_stream_widths():
     """One adapter, two widths. The stream is an argument, not a class."""
-    for in_dim in (87, 101, 58):
+    for in_dim in (109, 58, 15):
         adapter = InputAdapter(in_dim=in_dim, d_model=_D_MODEL, dropout=0.0).eval()
         x = torch.randn(_BATCH, _SEQ_LEN, in_dim)
         with torch.no_grad():

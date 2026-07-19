@@ -28,8 +28,8 @@ from teb_vae.lag_attn.nets.blocks import (
 class InputAdapter(nn.Module):
     """Project a raw feature stream into the internal model width.
 
-    One class serves both streams. They differ only in ``in_dim`` -- $87$ for the target ($43$
-    scattering plus $44$ phase-harmonic channels), $101$ or $58$ for the source (with or without
+    One class serves both streams. They differ only in ``in_dim`` -- $109$ for the target ($43$
+    scattering plus $66$ phase-harmonic channels), $58$ or $15$ for the source (with or without
     its $43$ scattering channels) -- and a channel count is an argument, not a subclass.
 
     Shapes:

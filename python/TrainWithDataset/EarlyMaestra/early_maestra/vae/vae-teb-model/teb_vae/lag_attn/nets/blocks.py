@@ -29,7 +29,7 @@ def geometric_schedule(
     """Interpolate ``n_hidden`` layer widths geometrically between two sizes.
 
     Widths follow $s_i = s_0 r^i$ with $r = (s_{out} / s_{in})^{1/(n+1)}$, so each layer
-    changes width by the same *ratio* rather than the same amount. For a funnel from $87$ to
+    changes width by the same *ratio* rather than the same amount. For a funnel from $109$ to
     $8$ that keeps the per-layer compression even instead of dropping most of it in one step.
 
     Args:

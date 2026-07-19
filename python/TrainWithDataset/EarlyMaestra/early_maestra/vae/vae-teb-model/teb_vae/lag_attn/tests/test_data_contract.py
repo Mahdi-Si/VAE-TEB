@@ -1,6 +1,6 @@
 r"""The committed shard really produces the batch the model's forward signature expects.
 
-The model takes ``y_st (B,T,43)``, ``y_ph (B,T,44)`` and a source stream assembled from ``up_st``
+The model takes ``y_st (B,T,43)``, ``y_ph (B,T,66)`` and a source stream assembled from ``up_st``
 and ``up_ph``. Between the HDF5 file and those tensors sit a channel-first on-disk layout, a
 per-sample transpose, a symmetric trim, and a normalization step that reads a separate stats file --
 and almost every failure in that chain is silent. A missing index field yields "No samples match the
@@ -63,11 +63,11 @@ def test_the_fixtures_are_small_enough_to_live_in_the_repo():
 
 
 def test_the_batch_carries_the_model_input_contract(batch):
-    """Channel counts are the contract; the constructor rejects a stream of the wrong width."""
+    """Channel counts are the contract; the task checks them against every batch."""
     assert batch.fhr_st.shape == (2, _EXPECTED_T, 43)
-    assert batch.fhr_ph.shape == (2, _EXPECTED_T, 44)
+    assert batch.fhr_ph.shape == (2, _EXPECTED_T, 66)
     assert batch.up_st.shape == (2, _EXPECTED_T, 43)
-    assert batch.up_ph.shape == (2, _EXPECTED_T, 58)
+    assert batch.up_ph.shape == (2, _EXPECTED_T, 15)
     assert batch.weight.shape == (2, _EXPECTED_T)
 
 
@@ -84,11 +84,33 @@ def test_the_feature_fields_arrive_time_major(batch):
 def test_the_source_stream_concatenates_to_the_configured_width(batch, config):
     """What the task builds and hands to the model as ``u_stream``."""
     u_stream = torch.cat([batch.up_st, batch.up_ph], dim=-1)
-    assert u_stream.shape[-1] == config["model_config"]["VAE_model"]["c_u"] == 101
+    assert u_stream.shape[-1] == config["model_config"]["VAE_model"]["c_u"] == 58
 
 
 def test_the_target_stream_concatenates_to_the_configured_width(batch, config):
     assert batch.fhr_st.shape[-1] + batch.fhr_ph.shape[-1] == config["model_config"]["VAE_model"]["c_y"]
+
+
+def test_the_configured_widths_match_the_committed_shard(batch, config):
+    r"""The check the net's constructor used to make against a constant, made against data.
+
+    This is the replacement for the old ``c_u == (101 if use_up_st else 58)`` assertion in
+    ``test_config_load.py``: same intent, but it reads the widths off a real HDF5 instead of
+    off a second copy of the config, so it cannot go stale the way that one did.
+
+    Limitation worth naming: it pins the config against the *tiny* shard, while ``default.yaml``
+    points at production HDF5. It is therefore only as good as ``scripts/make_tiny_shard.py``'s
+    ``CHANNELS`` tracking ``hdf5_dataset/new_pipeline/create_new_pipeline.py`` -- which is why
+    that dict carries a comment pointing back at it.
+    """
+    vae = config["model_config"]["VAE_model"]
+    assert batch.fhr_st.shape[-1] + batch.fhr_ph.shape[-1] == vae["c_y"]
+    expected_c_u = (
+        batch.up_st.shape[-1] + batch.up_ph.shape[-1]
+        if vae["use_up_st"]
+        else batch.up_ph.shape[-1]
+    )
+    assert expected_c_u == vae["c_u"]
 
 
 def test_the_raw_signals_keep_the_sixteen_fold_decimation_ratio(batch):

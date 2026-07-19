@@ -142,7 +142,7 @@ class SeqVaeLagAttnTask(LightningModelBase):
         r"""Assemble the source stream $u$ consumed by the net's forward.
 
         With ``use_up_st=True`` the stream is ``[up_st, up_ph]`` concatenated along the channel
-        axis, $(B, T, 101)$; otherwise it is ``up_ph`` alone, $(B, T, 58)$. Both are independent
+        axis, $(B, T, 58)$; otherwise it is ``up_ph`` alone, $(B, T, 15)$. Both are independent
         first-class HDF5 datasets.
 
         Args:
@@ -152,27 +152,102 @@ class SeqVaeLagAttnTask(LightningModelBase):
             The source stream, $(B, T, c_u)$.
 
         Raises:
-            RuntimeError: If a field the model's configuration requires is absent from the batch.
-                The net would otherwise fail later with a channel-count error naming neither the
-                missing field nor the config key that would fix it.
+            RuntimeError: If a field the model's configuration requires is absent from the batch,
+                or if the assembled stream is not as wide as the model was built for. The net
+                would otherwise fail later with a channel-count error naming neither the missing
+                field nor the config key that would fix it.
         """
         up_ph = getattr(batch, "up_ph", None)
         if up_ph is None:
             raise RuntimeError(
                 "batch has no `up_ph` field. Add 'up_ph' to dataset_kwargs.load_fields in the "
                 "config, and check the HDF5 files were built by the pipeline that writes up_ph as "
-                "a first-class 58-channel dataset."
+                "a first-class dataset."
             )
         if not bool(getattr(self.orig_model, "use_up_st", False)):
-            return up_ph
+            return self._checked_source(up_ph, up_st=None, up_ph=up_ph)
         up_st = getattr(batch, "up_st", None)
         if up_st is None:
             raise RuntimeError(
                 "the model was built with use_up_st=True but the batch has no `up_st` field. "
                 "Either add 'up_st' to dataset_kwargs.load_fields, rebuild the HDF5 with up_st, or "
-                "set use_up_st=false and c_u=58 in model_config.VAE_model."
+                "set use_up_st=false and c_u to up_ph's own width in model_config.VAE_model."
             )
-        return torch.cat([up_st, up_ph], dim=-1)
+        return self._checked_source(
+            torch.cat([up_st, up_ph], dim=-1), up_st=up_st, up_ph=up_ph
+        )
+
+    def _checked_source(
+        self,
+        stream: torch.Tensor,
+        *,
+        up_st: Optional[torch.Tensor],
+        up_ph: torch.Tensor,
+    ) -> torch.Tensor:
+        r"""Return the source stream, having checked its width against the model's $c_u$.
+
+        Checked here rather than in the net's constructor because this is the only place that can
+        see both. The model's $c_u$ is a number from a config file; this is the data. The check
+        that used to live in the constructor compared the config against *module constants* --
+        that is, against another copy of the config -- so it went stale the moment the dataset
+        pipeline changed its phase-harmonic selection, and it could never catch a correct config
+        pointed at a stale shard.
+
+        Args:
+            stream: The assembled source stream.
+            up_st: The scattering block, or ``None`` under the ``use_up_st=False`` ablation.
+            up_ph: The phase-harmonic block.
+
+        Returns:
+            ``stream`` unchanged.
+
+        Raises:
+            RuntimeError: If the stream's width disagrees with the model's ``c_u``.
+        """
+        expected, got = int(self.orig_model.c_u), int(stream.shape[-1])
+        if got == expected:
+            return stream
+        breakdown = (
+            f"up_ph={int(up_ph.shape[-1])}"
+            if up_st is None
+            else f"up_st={int(up_st.shape[-1])} + up_ph={int(up_ph.shape[-1])}"
+        )
+        raise RuntimeError(
+            f"source stream is {got} channels ({breakdown}) but the model was built with "
+            f"c_u={expected} (use_up_st={bool(self.orig_model.use_up_st)}). These widths come "
+            f"from the HDF5, not from the model: either set model_config.VAE_model.c_u={got}, "
+            f"or point dataset_config at the shards this c_u was chosen for. Note 58 is both "
+            f"the current use_up_st=true width and the old phase-only width, so decide from "
+            f"use_up_st before trusting the number."
+        )
+
+    def _build_target_streams(self, batch: Any) -> Tuple[torch.Tensor, torch.Tensor]:
+        r"""Return ``(fhr_st, fhr_ph)``, having checked their joint width against $c_y$.
+
+        The mirror of :meth:`_build_source_stream` for the target. ``c_y`` had no validation of
+        any kind before the widths moved to the data boundary.
+
+        Args:
+            batch: A batch from the data module.
+
+        Returns:
+            The target scattering and phase-harmonic blocks.
+
+        Raises:
+            RuntimeError: If their concatenated width disagrees with the model's ``c_y``.
+        """
+        y_st, y_ph = batch.fhr_st, batch.fhr_ph
+        expected = int(self.orig_model.c_y)
+        got = int(y_st.shape[-1]) + int(y_ph.shape[-1])
+        if got != expected:
+            raise RuntimeError(
+                f"target stream is {got} channels (fhr_st={int(y_st.shape[-1])} + "
+                f"fhr_ph={int(y_ph.shape[-1])}) but the model was built with c_y={expected}. "
+                f"These widths come from the HDF5, not from the model: either set "
+                f"model_config.VAE_model.c_y={got}, or point dataset_config at the shards this "
+                f"c_y was chosen for."
+            )
+        return y_st, y_ph
 
     # ------------------------------------------------------------------
     # Beta schedule
@@ -362,8 +437,7 @@ class SeqVaeLagAttnTask(LightningModelBase):
             steps and $L_{\mathrm{main}}$ otherwise. ``metrics['main_loss']`` always carries the
             detached perm-free value, which is what the spike breaker watches.
         """
-        y_st = batch.fhr_st
-        y_ph = batch.fhr_ph
+        y_st, y_ph = self._build_target_streams(batch)
         u_stream = self._build_source_stream(batch)
         # Per-step validity. Gaps (weight ~ 0) would otherwise pollute every loss term, and the KL
         # curve is only trustworthy if they do not.

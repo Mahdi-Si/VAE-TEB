@@ -224,7 +224,7 @@ def permutation_kl(
     Args:
         model: The model.
         y_st: Target scattering features ``(B, T, 43)``.
-        y_ph: Target phase-harmonic features ``(B, T, 44)``.
+        y_ph: Target phase-harmonic features ``(B, T, 66)``.
         u_stream: Source stream ``(B, T, c_u)``.
         weight: Optional per-step validity weight ``(B, T)``.
         generator: Optional CPU generator seeding the derangement.

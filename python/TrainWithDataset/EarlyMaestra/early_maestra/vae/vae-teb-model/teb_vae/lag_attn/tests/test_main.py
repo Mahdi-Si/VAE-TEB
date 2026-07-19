@@ -175,3 +175,108 @@ def test_config_is_required():
 
     assert result.returncode != 0
     assert "--config" in result.stderr
+
+
+# --------------------------------------------------------------------------------------
+# The IDE Run button
+# --------------------------------------------------------------------------------------
+def test_run_config_ships_unset_so_a_bare_launch_still_refuses():
+    """The Run-button affordance must not re-create the hazard ``--config`` was made required for.
+
+    ``test_config_is_required`` above pins the behaviour; this pins the *reason* it still holds.
+    A shipped ``RUN_CONFIG`` pointing at a real file would make a bare launch silently train that
+    configuration, which is exactly what the required flag was introduced to stop.
+    """
+    assert trainer_module.RUN_CONFIG is None
+
+
+def test_the_module_is_importable_as_a_script_from_an_unrelated_directory(tmp_path):
+    """An IDE's Run button executes the file, so ``sys.path[0]`` is its own directory.
+
+    Without the repo-root bootstrap the ``teb_vae.`` imports raise ModuleNotFoundError before
+    ``__main__`` is reached, and the failure looks like a broken install rather than a launch mode.
+    Run from ``tmp_path`` so a repo-root working directory cannot mask a missing bootstrap.
+    """
+    result = subprocess.run(
+        [sys.executable, str(_REPO_ROOT / "teb_vae" / "lag_attn" / "trainer.py")],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+    )
+
+    # It must get past the imports and reach the argument parser -- which then refuses, because
+    # RUN_CONFIG ships unset.
+    assert "ModuleNotFoundError" not in result.stderr, result.stderr
+    assert "--config is required" in result.stderr, result.stderr
+
+
+def test_a_missing_stats_file_raises_before_any_training_happens(recording_main, tmp_path):
+    """Set-but-wrong is the same failure as unset, and likelier.
+
+    The loader warns ``Statistics file not found ... Normalization disabled`` and carries on, so a
+    mistyped or not-yet-generated ``stat_path`` costs a full run on raw-scale inputs -- announced
+    only by a warning in a multi-day log. Checking the key is non-None was never enough.
+    """
+    from teb_vae.lag_attn.config import load_config
+
+    config = load_config(str(_TINY))
+    config["dataset_config"]["stat_path"] = str(tmp_path / "not_generated_yet.hdf5")
+    path = tmp_path / "missing_stats.yaml"
+    path.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="stat_path does not exist"):
+        trainer_module.main(str(path))
+
+    assert "create_model" not in recording_main
+
+
+def test_the_width_guard_is_actually_wired_into_main(recording_main, tmp_path, monkeypatch):
+    """The guard's own tests call it directly, so nothing else pins it to the launch path.
+
+    Deleting the call from ``main`` leaves the whole suite green -- the per-batch check in the task
+    still catches a mismatch, so the loss is failure *latency* on a multi-rank launch rather than
+    correctness, but a safety net nothing exercises is one that quietly stops existing.
+    """
+    called = []
+    monkeypatch.setattr(
+        trainer_module,
+        "_check_declared_widths_against_shard",
+        lambda config: called.append(config),
+    )
+
+    trainer_module.main(_tiny_config_at(tmp_path))
+
+    assert called, "main() no longer calls _check_declared_widths_against_shard"
+    assert called[0]["model_config"]["VAE_model"]["c_y"] == 109
+
+
+def test_both_pre_flight_guards_run_before_setup_config(tmp_path, monkeypatch):
+    """Their whole value is failing before the run directory and MLflow run exist.
+
+    ``setup_config`` seeds the run, creates the output directories, opens the log sinks and
+    connects MLflow. A guard that fires after it has already left that debris behind on every rank
+    of a 7-rank launch.
+    """
+    order = []
+    monkeypatch.setattr(
+        trainer_module.LagAttnTrainer,
+        "setup_config",
+        lambda self: order.append("setup_config"),
+    )
+    monkeypatch.setattr(
+        trainer_module, "_check_stat_path", lambda config: order.append("stat_path")
+    )
+    monkeypatch.setattr(
+        trainer_module, "_check_declared_widths_against_shard", lambda config: order.append("widths")
+    )
+    monkeypatch.setattr(trainer_module, "GraphDataModule", lambda config: None)
+    monkeypatch.setattr(
+        trainer_module.LagAttnTrainer, "create_model", lambda self: order.append("create_model")
+    )
+
+    with pytest.raises(AttributeError):
+        # GraphDataModule is stubbed to None, so main dies at train_dataloader() -- after the part
+        # under test. The order up to that point is the assertion.
+        trainer_module.main(_tiny_config_at(tmp_path))
+
+    assert order[:3] == ["stat_path", "widths", "setup_config"], order

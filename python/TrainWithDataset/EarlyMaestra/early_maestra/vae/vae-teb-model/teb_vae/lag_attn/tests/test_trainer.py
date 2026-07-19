@@ -19,7 +19,11 @@ import pytest
 import torch
 
 from teb_vae.lag_attn.tests.conftest import SHIPPED_KWARGS
-from teb_vae.lag_attn.trainer import _TRACKED_METRICS, LagAttnTrainer
+from teb_vae.lag_attn.trainer import (
+    _TRACKED_METRICS,
+    LagAttnTrainer,
+    _check_declared_widths_against_shard,
+)
 from train.callbacks import (
     MetricsHistoryCsvCallback,
     MetricsLoggingCallback,
@@ -106,8 +110,8 @@ def test_the_geometry_reaches_the_constructor(trainer):
     assert kwargs["sequence_length"] == 300
     assert kwargs["d_model"] == 128
     assert kwargs["d_z"] == 24
-    assert kwargs["c_y"] == 87
-    assert kwargs["c_u"] == 101
+    assert kwargs["c_y"] == 109
+    assert kwargs["c_u"] == 58
     assert kwargs["max_lag"] == 90
 
 
@@ -352,3 +356,70 @@ def test_the_metrics_history_writer_is_wired_to_the_collector(built_callbacks):
 
     assert writer.source is collector
     assert collector.tracked_metrics == _TRACKED_METRICS
+
+
+# --------------------------------------------------------------------------------------
+# Pre-fit width guard
+# --------------------------------------------------------------------------------------
+# Derived from __file__, not cwd-relative, and not incidentally: the guard swallows a failed open
+# (a missing shard is the data module's to report), so a path that does not resolve makes the two
+# positive tests below pass without ever reaching the width arithmetic they exist to check.
+_SHARD = str(Path(__file__).resolve().parent / "fixtures" / "tiny_shard.hdf5")
+
+
+def _width_config(**vae):
+    """A minimal config carrying just what the pre-fit width guard reads."""
+    declared = dict(c_y=109, c_u=58, use_up_st=True)
+    declared.update(vae)
+    return {
+        "dataset_config": {"vae_train_datasets": [_SHARD]},
+        "model_config": {"VAE_model": declared},
+    }
+
+
+@pytest.mark.parametrize(
+    "declared, expected_fragment",
+    [
+        # The trap: the old phase-only pairing, which no config-shaped check can catch.
+        (dict(use_up_st=False, c_u=58), "up_ph=15"),
+        (dict(c_y=87), "fhr_ph=66"),
+        (dict(c_u=101), "up_st=43 + up_ph=15"),
+    ],
+)
+def test_declared_widths_are_checked_against_the_shard_before_the_fit(
+    declared, expected_fragment
+):
+    """Fails on rank 0 before the data module, not inside ``training_step``.
+
+    The task's check against the real batch is the authoritative one; this only moves the failure
+    earlier, before every rank has initialised and an MLflow run and run directory exist. The
+    message must name the shard's own per-field widths, or the reader cannot tell which of the
+    two numbers is wrong.
+    """
+    with pytest.raises(ValueError, match="channel widths disagree") as excinfo:
+        _check_declared_widths_against_shard(_width_config(**declared))
+
+    assert expected_fragment in str(excinfo.value)
+
+
+@pytest.mark.parametrize(
+    "declared", [dict(), dict(use_up_st=False, c_u=15)]
+)
+def test_widths_matching_the_shard_pass_the_pre_fit_guard(declared):
+    _check_declared_widths_against_shard(_width_config(**declared))
+
+
+def test_the_pre_fit_guard_defers_rather_than_masking_a_data_module_error():
+    """An unreadable shard is the data module's to report -- it does so far better than a peek.
+
+    A guard that raised here would replace ``FileNotFoundError: <path>`` with a width complaint
+    about a file that does not exist.
+    """
+    _check_declared_widths_against_shard(
+        {
+            "dataset_config": {"vae_train_datasets": ["/nonexistent/shard.hdf5"]},
+            "model_config": {"VAE_model": {"c_y": 109, "c_u": 58, "use_up_st": True}},
+        }
+    )
+    # And a config that declares nothing for it to check is a no-op, not a crash.
+    _check_declared_widths_against_shard({})

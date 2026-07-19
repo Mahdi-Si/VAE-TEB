@@ -199,10 +199,18 @@ def test_load_fields_covers_what_the_model_and_plots_read_and_nothing_else(shipp
     assert load_fields.isdisjoint({"target", "epoch", "cs_label", "bg_label"})
 
 
-def test_the_source_stream_width_agrees_with_the_ablation_toggle(shipped):
-    """The constructor rejects a mismatch, but it does so after a config has already shipped."""
+def test_the_declared_widths_are_positive_and_consistent(shipped):
+    """What can honestly be checked from a config file alone: not much.
+
+    This used to assert ``c_u == (101 if use_up_st else 58)`` -- the same hardcoded constant table
+    that lived in the net's constructor, and it went stale in the same way, for the same reason:
+    a config file cannot tell you how wide the HDF5 is. The real check is against the data, in
+    ``test_data_contract.py::test_the_configured_widths_match_the_committed_shard``. What survives
+    here is only the part that is true independent of any dataset.
+    """
     vae = shipped["model_config"]["VAE_model"]
-    assert vae["c_u"] == (101 if vae["use_up_st"] else 58)
+    assert vae["c_y"] > 0 and vae["c_u"] > 0
+    assert isinstance(vae["use_up_st"], bool)
 
 
 def test_lr_milestone_is_singular(shipped):

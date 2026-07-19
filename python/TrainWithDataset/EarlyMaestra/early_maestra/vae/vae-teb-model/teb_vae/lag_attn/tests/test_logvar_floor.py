@@ -22,7 +22,7 @@ from teb_vae.lag_attn.nets.decoders import (
 
 _LO, _HI = -5.0, 3.0
 _TOL = 1e-4
-_D_MODEL, _D_Z, _D_HIDDEN, _C, _HORIZON = 32, 8, 32, 87, 4
+_D_MODEL, _D_Z, _D_HIDDEN, _C, _HORIZON = 32, 8, 32, 109, 4
 _BATCH, _SEQ_LEN = 2, 8
 
 

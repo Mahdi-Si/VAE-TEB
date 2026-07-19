@@ -122,17 +122,53 @@ def test_encode_only_can_return_the_posterior_mean(prod_kwargs, inputs):
     assert torch.equal(out["z"], out["mu_post"])
 
 
-def test_source_channel_count_must_agree_with_the_ablation_toggle(tiny_kwargs):
-    with pytest.raises(ValueError, match="c_u"):
-        SeqVaeLagAttn(**dict(tiny_kwargs, c_u=58, use_up_st=True))
-    with pytest.raises(ValueError, match="c_u"):
-        SeqVaeLagAttn(**dict(tiny_kwargs, c_u=101, use_up_st=False))
-
-
 def test_the_source_ablation_config_constructs(tiny_kwargs):
     torch.manual_seed(0)
-    model = SeqVaeLagAttn(**dict(tiny_kwargs, c_u=58, use_up_st=False))
-    assert model.c_u == 58
+    model = SeqVaeLagAttn(**dict(tiny_kwargs, c_u=15, use_up_st=False))
+    assert model.c_u == 15
+    # Asserting `model.c_u` alone would pass against an implementation that recomputed the width
+    # actually used to build the adapter -- which is what the old constructor did.
+    assert model.source_adapter.linear.in_features == 15
+
+
+def test_c_u_is_honoured_rather_than_derived_from_the_ablation_toggle(tiny_kwargs):
+    """The constructor trusts the caller's widths; the task checks them against the batch.
+
+    This pairing (``c_u`` not matching what ``use_up_st`` implies) used to raise, and before that
+    the constructor silently overwrote ``c_u`` with a constant chosen by ``use_up_st``. Both were
+    wrong for the same reason: the widths are a property of the HDF5, which this constructor
+    cannot see, and the constants went stale the moment the dataset pipeline changed its
+    phase-harmonic selection -- taking every pre-change checkpoint's rebuild with them.
+    """
+    torch.manual_seed(0)
+    model = SeqVaeLagAttn(**dict(tiny_kwargs, c_u=15, use_up_st=True))
+    assert model.c_u == 15
+    assert model.source_adapter.linear.in_features == 15
+
+
+def test_a_legacy_checkpoints_geometry_still_rebuilds(tiny_kwargs):
+    """A checkpoint written before the channel migration must still reconstruct.
+
+    ``on_save_checkpoint`` stores the exact constructor kwargs, so a pre-migration blob carries
+    ``c_y=87, c_u=101``. A constructor that validated widths against current constants would
+    refuse to rebuild it, and ``check_model_class`` passes first, so the error would blame the
+    geometry rather than the migration.
+    """
+    torch.manual_seed(0)
+    model = SeqVaeLagAttn(**dict(tiny_kwargs, c_y=87, c_u=101, use_up_st=True))
+    assert (model.c_y, model.c_u) == (87, 101)
+
+
+@pytest.mark.parametrize("zeroed", [{"c_u": 0}, {"c_y": 0}])
+def test_a_zero_channel_width_raises(tiny_kwargs, zeroed):
+    """Zero is the one width the constructor can reject without knowing the dataset.
+
+    ``nn.Linear(0, d_model)`` is legal and returns its bias broadcast over the batch, so a zero
+    width builds a model that trains to completion having never read that stream -- then reports
+    its KL as a transfer entropy. Same failure mode the ``max_lag`` guard exists to prevent.
+    """
+    with pytest.raises(ValueError, match="must be >= 1"):
+        SeqVaeLagAttn(**dict(tiny_kwargs, **zeroed))
 
 
 def test_head_width_must_tile_the_model_width(tiny_kwargs):

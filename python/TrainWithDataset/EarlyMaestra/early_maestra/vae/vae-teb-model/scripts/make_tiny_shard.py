@@ -51,7 +51,14 @@ DECIMATION = 16
 #: the FHR-UP cross-phase block. The model reads the first four; the fifth exists because the stats
 #: calculator computes over it and an absent field would just be skipped, leaving the fixture unable
 #: to catch a cross-phase regression later.
-CHANNELS = {"fhr_st": 43, "fhr_ph": 44, "up_st": 43, "up_ph": 58, "fhr_up_ph": 62}
+#:
+#: **Source of truth: `hdf5_dataset/new_pipeline/create_new_pipeline.py`.** The two self-phase
+#: widths follow `PHASE_HARMONIC_K_STEPS` there (currently `(4, 6, 8)` -> fhr_ph 66, up_ph 15;
+#: `(0, 4, 6, 8)` would give 94 and 26). Nothing in the test suite checks this fixture against the
+#: production pipeline, so if that constant changes and this dict does not, the suite stays green
+#: against a shard certifying the wrong geometry and the first real symptom is a width error on a
+#: prod box. Re-run this script whenever that selection changes.
+CHANNELS = {"fhr_st": 43, "fhr_ph": 66, "up_st": 43, "up_ph": 15, "fhr_up_ph": 79}
 
 #: Scattering fields whose channels 1..C-1 are log-transformed at normalization time. Their samples
 #: must be strictly positive: a negative value is clamped to 0 and becomes log(1e-6) ~ -13.8, which
@@ -105,10 +112,16 @@ def write_shard(path: str, *, n_samples: int, seq_len: int, seed: int) -> None:
             "target", data=np.zeros((n_samples, seq_len), dtype="f4"), compression="lzf"
         )
 
-        # Index-builder fields. `epoch` is seconds before delivery and must clear the config's
-        # `epoch_max: -48000` filter, or the index comes back empty.
+        # Index-builder fields. `epoch` is seconds before delivery, and must clear whatever
+        # epoch_min/epoch_max the config sets or the index comes back empty.
+        #
+        # This was -50000.0, chosen to clear the old `epoch_max: -48000`. That filter was itself
+        # a bug -- it selected zero segments from any real dataset, whose extraction floor is
+        # MIN_DOMAIN_START_DATASET = -44640 -- so the fixture had been shaped around it and was
+        # unreachable in production. -20000 s (~5.6 h before delivery) sits inside the real
+        # window, which is what a fixture that means to exercise the real filters needs.
         handle.create_dataset(
-            "epoch", data=np.full((n_samples,), -50000.0, dtype="f4"), compression="lzf"
+            "epoch", data=np.full((n_samples,), -20000.0, dtype="f4"), compression="lzf"
         )
         handle.create_dataset(
             "cs_label", data=np.zeros((n_samples,), dtype="u1"), compression="lzf"
