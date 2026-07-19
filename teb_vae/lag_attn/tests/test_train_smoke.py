@@ -119,7 +119,7 @@ def test_the_zero_kl_init_invariant_survives_the_whole_stack(fit):
     generator = torch.Generator().manual_seed(0)
     outputs = model(
         torch.randn(batch_size, seq_len, 43, generator=generator),
-        torch.randn(batch_size, seq_len, 44, generator=generator),
+        torch.randn(batch_size, seq_len, 66, generator=generator),
         torch.randn(batch_size, seq_len, model.c_u, generator=generator),
     )
 

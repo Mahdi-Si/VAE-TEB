@@ -54,11 +54,11 @@ def test_dropout_is_off():
 def test_inputs_match_the_model_input_contract(inputs):
     y_st, y_ph, u_stream = inputs
     assert y_st.shape == (BATCH, SEQ_LEN, 43)
-    assert y_ph.shape == (BATCH, SEQ_LEN, 44)
-    assert u_stream.shape == (BATCH, SEQ_LEN, 101)
-    # c_y is the concatenated FHR stream; c_u the concatenated UP stream. Both are asserted by
-    # the constructor, so a fixture that disagreed would fail every construction test with a
-    # message pointing at the model rather than at here.
+    assert y_ph.shape == (BATCH, SEQ_LEN, 66)
+    assert u_stream.shape == (BATCH, SEQ_LEN, 58)
+    # c_y is the concatenated FHR stream; c_u the concatenated UP stream. Neither is asserted by
+    # the constructor any more -- widths are a dataset fact, checked against the real batch in
+    # the task -- so this is what keeps the synthetic fixtures honest about the contract.
     assert y_st.shape[-1] + y_ph.shape[-1] == TINY_KWARGS["c_y"]
     assert u_stream.shape[-1] == TINY_KWARGS["c_u"]
 

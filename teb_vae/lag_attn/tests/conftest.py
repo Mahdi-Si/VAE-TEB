@@ -40,8 +40,8 @@ TINY_KWARGS = dict(
     d_z=8,
     horizon=4,
     warmup_period=2,
-    c_y=87,
-    c_u=101,
+    c_y=109,
+    c_u=58,
     use_up_st=True,
     max_lag=8,
     num_heads=4,
@@ -52,9 +52,9 @@ TINY_KWARGS = dict(
 BATCH = 2
 SEQ_LEN = int(TINY_KWARGS["sequence_length"])
 
-# The flag set the original's own test suite called "prod", ported under its original name
-# because that is what the architecture fixture records. `lambda_perm` and
-# `perm_every_n_batches` are small so a schedule is observable inside a handful of steps.
+# The flag set the original's own test suite called "prod", ported under its original name for
+# continuity with that suite. `lambda_perm` and `perm_every_n_batches` are small so a schedule
+# is observable inside a handful of steps.
 #
 # It is a misnomer, and worth knowing why: it leaves four flags the shipped config sets at their
 # constructor defaults. See SHIPPED_KWARGS. Smooth log-variance bounding and a residual
@@ -141,9 +141,9 @@ def make_stub_batch(batch_size: int = 4, seq_len: int = SEQ_LEN, seed: int = 0):
     generator = torch.Generator().manual_seed(seed)
     return types.SimpleNamespace(
         fhr_st=torch.randn(batch_size, seq_len, 43, generator=generator),
-        fhr_ph=torch.randn(batch_size, seq_len, 44, generator=generator),
+        fhr_ph=torch.randn(batch_size, seq_len, 66, generator=generator),
         up_st=torch.randn(batch_size, seq_len, 43, generator=generator),
-        up_ph=torch.randn(batch_size, seq_len, 58, generator=generator),
+        up_ph=torch.randn(batch_size, seq_len, 15, generator=generator),
         weight=torch.ones(batch_size, seq_len),
     )
 
@@ -201,14 +201,15 @@ def task():
 def inputs():
     """Seeded ``(y_st, y_ph, u_stream)`` tensors matching the tiny config.
 
-    The channel counts are the model's input contract and are fixed regardless of model size:
-    $43$ FHR scattering, $44$ FHR phase-harmonic, and $101$ for the concatenated UP stream
-    ``[up_st(43), up_ph(58)]``.
+    The channel counts are the dataset's, and are independent of model size: $43$ FHR scattering,
+    $66$ FHR phase-harmonic, and $58$ for the concatenated UP stream ``[up_st(43), up_ph(15)]``.
+    They track ``hdf5_dataset/new_pipeline/create_new_pipeline.py``; when its phase-harmonic
+    selection changes, these move with it.
     """
     generator = torch.Generator().manual_seed(0)
     y_st = torch.randn(BATCH, SEQ_LEN, 43, generator=generator)
-    y_ph = torch.randn(BATCH, SEQ_LEN, 44, generator=generator)
-    u_stream = torch.randn(BATCH, SEQ_LEN, 101, generator=generator)
+    y_ph = torch.randn(BATCH, SEQ_LEN, 66, generator=generator)
+    u_stream = torch.randn(BATCH, SEQ_LEN, 58, generator=generator)
     return y_st, y_ph, u_stream
 
 

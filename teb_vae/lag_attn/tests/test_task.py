@@ -158,17 +158,17 @@ def test_the_source_stream_is_the_concatenation_the_model_was_built_for(task, st
 
     u_stream = module._build_source_stream(stub_batch)
 
-    assert u_stream.shape[-1] == module.orig_model.c_u == 101
+    assert u_stream.shape[-1] == module.orig_model.c_u == 58
     assert torch.equal(u_stream[..., :43], stub_batch.up_st)
     assert torch.equal(u_stream[..., 43:], stub_batch.up_ph)
 
 
 def test_the_phase_only_ablation_drops_the_scattering_block(task, prod_kwargs, stub_batch):
-    module = task(model_kwargs=dict(prod_kwargs, use_up_st=False, c_u=58))
+    module = task(model_kwargs=dict(prod_kwargs, use_up_st=False, c_u=15))
 
     u_stream = module._build_source_stream(stub_batch)
 
-    assert u_stream.shape[-1] == 58
+    assert u_stream.shape[-1] == 15
     assert torch.equal(u_stream, stub_batch.up_ph)
 
 
@@ -180,6 +180,50 @@ def test_a_missing_source_field_names_the_config_key_that_fixes_it(task, stub_ba
 
     with pytest.raises(RuntimeError, match="load_fields"):
         module._build_source_stream(stub_batch)
+
+
+# --------------------------------------------------------------------------------------
+# Channel widths are checked against the data, not against a constant
+# --------------------------------------------------------------------------------------
+def test_a_stale_phase_only_c_u_is_caught_against_the_actual_batch(task, prod_kwargs, stub_batch):
+    r"""The trap a constant-based constructor check could not see.
+
+    $58$ is now the *with-scattering* width and used to be the phase-only one. A config left at
+    the old phase-only setting -- ``use_up_st: false`` with ``c_u: 58`` -- therefore passes every
+    config-shaped check while the data is $15$ wide. Only a comparison against the batch catches
+    it, and the message has to name the per-field widths or the reader cannot tell which of the
+    two numbers is wrong.
+    """
+    module = task(model_kwargs=dict(prod_kwargs, use_up_st=False, c_u=58))
+
+    with pytest.raises(RuntimeError) as excinfo:
+        module._build_source_stream(stub_batch)
+
+    message = str(excinfo.value)
+    for fragment in ("up_ph=15", "c_u=58", "use_up_st=False", "model_config.VAE_model.c_u"):
+        assert fragment in message, f"{fragment!r} missing from: {message}"
+
+
+def test_a_batch_from_a_pre_migration_shard_is_caught(task, stub_batch):
+    """The other direction: a correct config pointed at an old-width HDF5.
+
+    No constant-based check could ever catch this one -- it validates the config against the
+    config, and here the config is right and the data is wrong.
+    """
+    module = task()  # c_u=58, use_up_st=True; an old shard makes the stream 43+58=101
+    stub_batch.up_ph = torch.randn(stub_batch.up_st.shape[0], stub_batch.up_st.shape[1], 58)
+
+    with pytest.raises(RuntimeError, match="source stream is 101 channels"):
+        module._build_source_stream(stub_batch)
+
+
+def test_the_target_width_is_checked_too(task, stub_batch):
+    """``c_y`` had no validation of any kind before the widths moved to the data boundary."""
+    module = task()
+    stub_batch.fhr_ph = torch.randn(stub_batch.fhr_st.shape[0], stub_batch.fhr_st.shape[1], 44)
+
+    with pytest.raises(RuntimeError, match="target stream is 87 channels"):
+        module._build_target_streams(stub_batch)
 
 
 def test_kld_raw_is_reported_separately_from_kld_train(task, stub_batch, perturb_posterior):

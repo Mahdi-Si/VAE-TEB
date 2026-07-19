@@ -8,7 +8,7 @@
 #
 # Prerequisites:
 #   * HDF5 datasets produced by `hdf5_dataset/new_pipeline/create_new_pipeline.py`, which writes
-#     `up_st` (43 channels, log-normalised) and `up_ph` (58 channels, asinh-normalised) as
+#     `up_st` (43 channels, log-normalised) and `up_ph` (15 channels, asinh-normalised) as
 #     first-class datasets alongside `fhr_st` and `fhr_ph`.
 #   * The stats file at `stat_path` regenerated after any dataset rebuild by
 #     `hdf5_dataset/calculate_dataset_stats.py`, with a matching `trim_minutes`.
@@ -16,8 +16,13 @@
 # Run from the repo root:
 #   python -m teb_vae.lag_attn.trainer --config teb_vae/lag_attn/configs/default.yaml
 #
-# Ablation toggle: `use_up_st: true` -> source stream = concat(up_st, up_ph), c_u=101.
-# `use_up_st: false` -> source stream = up_ph alone, c_u=58. The constructor rejects a mismatch.
+# Ablation toggle: `use_up_st: true` -> source stream = concat(up_st, up_ph), c_u=58.
+# `use_up_st: false` -> source stream = up_ph alone, c_u=15. The task rejects a mismatch on the
+# first batch, comparing against the HDF5's real widths rather than against a hardcoded constant.
+#
+# Careful: 58 is the CURRENT with-scattering width and was the OLD phase-only width, so a stale
+# `c_u: 58` paired with `use_up_st: false` looks plausible and is wrong. Decide from `use_up_st`
+# first, then set the width.
 
 general_config:
   tag: lag_attn_baseline
@@ -78,8 +83,8 @@ model_config:
     horizon: 30            # H_d = 30 decimated steps = 2 min forecast
     warmup_period: 30      # first 2 minutes ignored in both feature and KL losses
     sequence_length: 300
-    c_y: 87                # 43 (fhr_st) + 44 (fhr_ph)
-    c_u: 101               # 43 (up_st) + 58 (up_ph); must be 58 when use_up_st=false
+    c_y: 109               # 43 (fhr_st) + 66 (fhr_ph)
+    c_u: 58                # 43 (up_st) + 15 (up_ph); must be 15 when use_up_st=false
     use_up_st: true
     lstm_layers: 2
     dropout: 0.1
@@ -184,16 +189,25 @@ model_config:
 
 
 dataset_config:
+  # REPOINT THESE. The previous directory (`12H_22min_tlo_stratified_20sec_updelay`) holds the
+  # OLD channel selection -- fhr_ph=44, up_ph=58 -- and the widths below are 66/15. The path is
+  # deliberately left non-existent rather than pointing at the old data, so a run fails on a
+  # missing file instead of on a width mismatch that someone might "fix" by reverting c_y/c_u.
+  #
+  # `stat_path` must be regenerated from the SAME rebuilt dataset with trim_minutes=1.0. A stats
+  # file stores fixed-width per-channel arrays and there is no width cross-check in the loader:
+  # an old one fails deep inside normalize_tensor_data (IndexError when the stats are wider than
+  # the data, a broadcast RuntimeError when narrower), naming neither the field nor the cause.
   vae_train_datasets:
-    - /data1/fetal-heart-tracing/HDF5_Datasets/12H_22min_tlo_stratified_20sec_updelay/pre_training_dataset/train_dataset_cs.hdf5
-    - /data1/fetal-heart-tracing/HDF5_Datasets/12H_22min_tlo_stratified_20sec_updelay/pre_training_dataset/train_dataset_no_cs.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_new_channel_selection/pre_training_dataset/train_dataset_cs.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_new_channel_selection/pre_training_dataset/train_dataset_no_cs.hdf5
   vae_test_datasets:
-    - /data1/fetal-heart-tracing/HDF5_Datasets/12H_22min_tlo_stratified_20sec_updelay/pre_training_dataset/test_dataset_cs.hdf5
-    - /data1/fetal-heart-tracing/HDF5_Datasets/12H_22min_tlo_stratified_20sec_updelay/pre_training_dataset/test_dataset_no_cs.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_new_channel_selection/pre_training_dataset/test_dataset_cs.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_new_channel_selection/pre_training_dataset/test_dataset_no_cs.hdf5
 
   # Note the key is `stat_path` while the loader parameter is `stats_path`. A typo'd `stats_path:`
   # here yields None and silently disables normalization, so the entry point guards it explicitly.
-  stat_path: /data1/fetal-heart-tracing/HDF5_Datasets/12H_22min_tlo_stratified_20sec_updelay/stats.hdf5
+  stat_path: /data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_new_channel_selection/stats.hdf5
 
   dataloader_config:
     num_workers: 4
@@ -217,8 +231,13 @@ dataset_config:
       allowed_guids: null
       cs_label: null
       bg_label: null
-      epoch_min: null
-      epoch_max: -48000
+      # This was `epoch_max: -48000`, which selected ZERO segments: it keeps epoch <= -48000 s
+      # (earlier than 13.3 h before delivery) while the dataset's own extraction floor is
+      # MIN_DOMAIN_START_DATASET = -44640 s (12.4 h), so CombinedHDF5Dataset raised
+      # "No samples match the specified filters." As `epoch_min` the bound is a no-op against a
+      # 12.4 h dataset, i.e. train on the full extraction window.
+      epoch_min: -48000
+      epoch_max: null
       label: null
       cache_size: 10000
       # Must match the stats file's trim_minutes or normalization is wrong; a mismatch only warns.
@@ -328,5 +347,9 @@ advanced_config:
       plot_frequency: 1                 # plot every validation epoch
       num_examples: 2                   # 2 samples per trigger
       file_format: "pdf"
-      forecast_channels: [0, 43, 80]    # st[0], ph[0], ph[37]
-      forecast_anchor_frac: 0.6         # anchor at 60% of the sequence
+      # `forecast_channels` was removed. It named three channels to spot-check the predictive
+      # band, which presupposed knowing which channels were worth looking at -- and its inherited
+      # indices silently changed meaning when fhr_ph went 44 -> 66. The companion now reports
+      # 2-sigma coverage for *every* channel over *every* anchor and draws the band for whichever
+      # channel calibrates worst, so nothing has to be chosen.
+      forecast_anchor_frac: 0.6         # anchor at 60% of the sequence, for that one band plot

@@ -21,7 +21,7 @@ on its own so the correction cannot win by laundering target information, and th
 starts at $K_t \equiv 0$ so any measured coupling had to be learned.
 
 Shapes, with $B$ batch, $T$ steps, $L = \mathrm{max\_lag}+1$ lags, $H_d$ forecast horizon:
-inputs are ``(B, T, 43)``, ``(B, T, 44)`` and ``(B, T, c_u)``; the latent is ``(B, T, d_z)``;
+inputs are ``(B, T, 43)``, ``(B, T, 66)`` and ``(B, T, c_u)``; the latent is ``(B, T, d_z)``;
 forecasts are ``(B, T, H_d, c_y)``.
 """
 from __future__ import annotations
@@ -49,10 +49,6 @@ _LIKELIHOOD_CHOICES = ("mse", "gaussian_nll")
 # below any meaningful coupling, well above float noise on a collapsed dimension.
 _KLD_ACTIVE_EPS = 1e-2
 
-# The two source configurations. The source stream is either its scattering channels plus its
-# phase-harmonic channels, or the phase-harmonic channels alone.
-_C_U_WITH_SCATTERING = 101
-_C_U_PHASE_ONLY = 58
 
 
 class SeqVaeLagAttn(nn.Module):
@@ -70,8 +66,8 @@ class SeqVaeLagAttn(nn.Module):
         d_z: int = 24,
         horizon: int = 30,
         warmup_period: int = 30,
-        c_y: int = 87,
-        c_u: int = 101,
+        c_y: int = 109,
+        c_u: int = 58,
         use_up_st: bool = True,
         max_lag: int = 90,
         num_heads: int = 4,
@@ -108,8 +104,10 @@ class SeqVaeLagAttn(nn.Module):
             horizon: Decimated forecast horizon $H_d$.
             warmup_period: Initial steps ignored by both the KL and the feature loss. The
                 encoders need history before their states mean anything.
-            c_y: Target feature channel count ($43$ scattering plus $44$ phase-harmonic).
-            c_u: Source feature channel count. Must agree with ``use_up_st``.
+            c_y: Target feature channel count ($43$ scattering plus $66$ phase-harmonic).
+            c_u: Source feature channel count. Must match what the task actually assembles:
+                $43 + 15 = 58$ with ``use_up_st=True``, $15$ without. Checked against the first
+                real batch rather than here -- see the note in the constructor body.
             use_up_st: Whether the source stream includes its scattering channels. An ablation
                 toggle: ``False`` feeds the phase-harmonic channels alone.
             max_lag: Maximum past lag; the attention window is $L = \mathrm{max\_lag}+1$ wide.
@@ -157,23 +155,31 @@ class SeqVaeLagAttn(nn.Module):
             init_weights: Apply the standard initialisation before the delta heads are zeroed.
 
         Raises:
-            ValueError: If ``c_u`` disagrees with ``use_up_st``, if
+            ValueError: If ``c_y`` or ``c_u`` is not positive, if
                 $\mathrm{num\_heads} \cdot d_{head} \ne d_{model}$, if ``max_lag`` is negative,
                 or if ``head_structured_latent`` is set and $d_z$ is not divisible by
                 ``num_heads``.
         """
         super().__init__()
 
-        # Validate the geometry before building anything: every one of these produces a model
-        # that is wrong rather than one that fails, and two of the three would otherwise only
-        # surface as a shape error somewhere deep in a forward.
-        expected_c_u = _C_U_WITH_SCATTERING if use_up_st else _C_U_PHASE_ONLY
-        if int(c_u) != expected_c_u:
+        # Validate the geometry before building anything: each of these produces a model that is
+        # wrong rather than one that fails, and would otherwise only surface as a shape error
+        # somewhere deep in a forward.
+        #
+        # The *values* of `c_y` and `c_u` are deliberately not validated here. They are properties
+        # of the dataset, not of the model, and this constructor cannot see the dataset. The check
+        # that used to live here compared them against module constants -- which is exactly what
+        # went stale when the pipeline's phase-harmonic channel selection changed, and which also
+        # made every pre-change checkpoint un-rebuildable. Agreement with the data is now checked
+        # against the real batch in the task, where the per-field channel counts are in hand.
+        #
+        # Their positivity *is* checked, because it cannot go stale and because zero is silent:
+        # `nn.Linear(0, d_model)` is legal and returns its bias broadcast over the batch, so a
+        # zero width builds a model that trains to completion having never read that stream --
+        # the same failure mode the `max_lag` guard below exists to prevent.
+        if int(c_y) < 1 or int(c_u) < 1:
             raise ValueError(
-                f"c_u={c_u} is inconsistent with use_up_st={use_up_st}; expected {expected_c_u} "
-                f"({_C_U_WITH_SCATTERING} = 43 scattering + 58 phase-harmonic channels when "
-                f"use_up_st=True, {_C_U_PHASE_ONLY} phase-harmonic channels only when False). "
-                f"Both are first-class fields in the dataset; there is no slicing fallback."
+                f"c_y and c_u are channel counts and must be >= 1, got c_y={c_y}, c_u={c_u}"
             )
         if int(num_heads) * int(d_head) != int(d_model):
             raise ValueError(
@@ -198,7 +204,7 @@ class SeqVaeLagAttn(nn.Module):
         self.warmup_period = int(warmup_period)
         self.c_y = int(c_y)
         self.use_up_st = bool(use_up_st)
-        self.c_u = expected_c_u
+        self.c_u = int(c_u)
         self.max_lag = int(max_lag)
         self.mu_scale = float(mu_scale)
         self.delta_mu_scale = float(delta_mu_scale)
@@ -501,7 +507,7 @@ class SeqVaeLagAttn(nn.Module):
 
         Args:
             y_st: Target scattering features ``(B, T, 43)``.
-            y_ph: Target phase-harmonic features ``(B, T, 44)``.
+            y_ph: Target phase-harmonic features ``(B, T, 66)``.
             u_stream: Source stream ``(B, T, c_u)``.
             lag_band_mask: Optional boolean keep-mask over lags, ``(L,)`` or ``(T, L)`` in lag
                 order. Intersected with the causal validity mask. ``None`` is a bit-exact
@@ -603,7 +609,7 @@ class SeqVaeLagAttn(nn.Module):
 
         Args:
             y_st: Target scattering features ``(B, T, 43)``.
-            y_ph: Target phase-harmonic features ``(B, T, 44)``.
+            y_ph: Target phase-harmonic features ``(B, T, 66)``.
             u_stream: Source stream ``(B, T, c_u)``.
             sample_z: Reparameterise when ``True``, else return the posterior mean as ``z``.
             lag_band_mask: Optional lag keep-mask; see :meth:`forward`.
@@ -801,7 +807,7 @@ class SeqVaeLagAttn(nn.Module):
 
         Args:
             y_st: Target scattering features ``(B, T, 43)``.
-            y_ph: Target phase-harmonic features ``(B, T, 44)``.
+            y_ph: Target phase-harmonic features ``(B, T, 66)``.
             u_stream: Source stream ``(B, T, c_u)``.
             reduce_mean: Return the support-mean scalar rather than the per-step tensor.
 
@@ -874,7 +880,7 @@ class SeqVaeLagAttn(nn.Module):
         Args:
             forward_outputs: The dict returned by :meth:`forward`.
             y_st: Target scattering features ``(B, T, 43)``.
-            y_ph: Target phase-harmonic features ``(B, T, 44)``.
+            y_ph: Target phase-harmonic features ``(B, T, 66)``.
             weight: Optional per-step validity weight ``(B, T)``.
             compute_kld_loss: Include the KL term.
             beta: Weight on the KL term.

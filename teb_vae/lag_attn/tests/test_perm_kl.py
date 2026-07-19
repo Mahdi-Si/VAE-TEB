@@ -61,8 +61,8 @@ def _inputs(batch=_BATCH):
     generator = torch.Generator().manual_seed(0)
     return (
         torch.randn(batch, _SEQ_LEN, 43, generator=generator),
-        torch.randn(batch, _SEQ_LEN, 44, generator=generator),
-        torch.randn(batch, _SEQ_LEN, 101, generator=generator),
+        torch.randn(batch, _SEQ_LEN, 66, generator=generator),
+        torch.randn(batch, _SEQ_LEN, 58, generator=generator),
     )
 
 

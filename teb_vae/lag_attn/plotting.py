@@ -9,11 +9,12 @@ Two figures per validation sample, from a single forward pass:
    argmax overlay, two TE-lag-attribution maps (raw p99-clipped and column-normalised), and two
    forecast reconstructions (overlap-averaged and stride-``H_d`` concatenated).
 
-2. A companion figure carrying the three signals the model exists to produce: the learned
-   predictive band :math:`\mu_{\mathrm{full}} \pm 2\sigma_{\mathrm{full}}` against the true future
-   :math:`Y^{+}` (G7), the per-dim raw KL against the active-fraction threshold (G4), and the
-   source-permutation negative control :math:`K_{\mathrm{true}}` vs :math:`K_{\mathrm{shuffled}}`
-   (G6). The control reuses the states the forward already computed via
+2. A companion figure carrying the three signals the model exists to produce: the calibration of
+   the learned predictive band :math:`\mu_{\mathrm{full}} \pm 2\sigma_{\mathrm{full}}` against the
+   true future :math:`Y^{+}` -- reported as per-channel coverage over every supervised anchor, so
+   no channel has to be hand-picked -- (G7), the per-dim raw KL against the active-fraction
+   threshold (G4), and the source-permutation negative control :math:`K_{\mathrm{true}}` vs
+   :math:`K_{\mathrm{shuffled}}` (G6). The control reuses the states the forward already computed via
    :func:`~teb_vae.lag_attn.nets.controls.perm_kl_from_forward`; it is only drawn when the batch is
    large enough to derange (:math:`B \geq 2`).
 
@@ -61,6 +62,10 @@ COLOR_LIGHT_GRAY = "#EEEEEE"
 
 #: Per-dim KL below this (nats) marks an inactive latent dimension in the companion's G4 panel.
 _KLD_ACTIVE_EPS = 1e-2
+
+#: Two-sided coverage of a $\pm 2\sigma$ band under a Gaussian, $\mathrm{erf}(2/\sqrt{2})$. The
+#: nominal the decoders' predictive band should hit; not $0.95$, which is $\pm 1.96\sigma$.
+_NOMINAL_2SIGMA = 0.9545
 
 
 # =============================================================================
@@ -323,7 +328,7 @@ def _future_target(y_st: torch.Tensor, y_ph: torch.Tensor, horizon: int) -> torc
 
     Args:
         y_st: FHR scattering features ``(B, T, 43)``.
-        y_ph: FHR phase features ``(B, T, 44)``.
+        y_ph: FHR phase features ``(B, T, 66)``.
         horizon: Forecast horizon :math:`H_d`.
 
     Returns:
@@ -369,9 +374,9 @@ def _build_diagnostic_figure(
     Args:
         outs: Forward-output dict from the model's ``forward``.
         y_st: FHR scattering features ``(B, T, 43)``.
-        y_ph: FHR phase features ``(B, T, 44)``.
+        y_ph: FHR phase features ``(B, T, 66)``.
         up_st: UP scattering features ``(B, T, 43)``, or ``None`` if absent.
-        up_ph: UP self-phase harmonics ``(B, T, 58)``.
+        up_ph: UP self-phase harmonics ``(B, T, 15)``.
         fhr_raw: Raw FHR trace ``(B, R)`` or ``None``.
         up_raw: Raw UP trace ``(B, R)`` or ``None``.
         sample_idx: Index into the batch.
@@ -394,8 +399,8 @@ def _build_diagnostic_figure(
 
     # ---- Numpy views of the relevant tensors for this sample ---------------
     y_st_np = _np(y_st[i])                                          # (T, 43)
-    y_ph_np = _np(y_ph[i])                                          # (T, 44)
-    up_ph_np = _np(up_ph[i])                                        # (T, 58)
+    y_ph_np = _np(y_ph[i])                                          # (T, 66)
+    up_ph_np = _np(up_ph[i])                                        # (T, 15)
     up_st_np = _np(up_st[i]) if up_st is not None else None         # (T, 43) or None
 
     mu_prior_np = _np(outs["mu_prior"][i])                          # (T, d_z)
@@ -408,7 +413,7 @@ def _build_diagnostic_figure(
     te_lag_np = _np(outs["te_lag_map"][i])                          # (T, L)
     kld_per_t_np = _np(outs["kld_per_t"][i])                        # (T,)
 
-    mu_full_np = _np(outs["mu_full"][i])                            # (T, H_d, 87)
+    mu_full_np = _np(outs["mu_full"][i])                            # (T, H_d, c_y)
 
     T = int(y_st_np.shape[0])
     d_z = int(mu_prior_np.shape[-1])
@@ -551,15 +556,17 @@ def _build_diagnostic_figure(
 
     # ---- Row: FHR features stacked heatmap --------------------------------
     ax, cax = row_axes("fhr_feats")
-    fhr_stack, fhr_sep = _stack_feature_blocks(y_st_np.T, y_ph_np.T)     # (87, T)
+    fhr_stack, fhr_sep = _stack_feature_blocks(y_st_np.T, y_ph_np.T)     # (c_y, T)
     vabs_fhr = _safe_vabs(fhr_stack)
     im = ax.imshow(
         fhr_stack, aspect="auto", cmap="bwr", origin="upper",
         vmin=-vabs_fhr, vmax=vabs_fhr,
         extent=[0.0, t_max, fhr_stack.shape[0] - 0.5, -0.5],
     )
+    # Row ranges are derived, not written down: they moved once already when the dataset's
+    # phase-harmonic channel selection changed, and a stale label on a heatmap is invisible.
     ax.set_title(
-        "FHR features — scattering (rows 0-42)  |  phase (rows 43-86)",
+        f"FHR features — scattering (rows 0-{st_ch - 1})  |  phase (rows {st_ch}-{C_y - 1})",
         fontsize=9, pad=6,
     )
     ax.set_xlabel("Time (s)", fontsize=8)
@@ -573,12 +580,15 @@ def _build_diagnostic_figure(
     # ---- Row: UP features stacked heatmap ---------------------------------
     ax, cax = row_axes("up_feats")
     if up_st_np is not None:
-        up_stack, up_sep = _stack_feature_blocks(up_st_np.T, up_ph_np.T)  # (101, T)
+        up_stack, up_sep = _stack_feature_blocks(up_st_np.T, up_ph_np.T)  # (c_u, T)
+        up_st_ch = int(up_st_np.shape[-1])
+        up_ch = up_st_ch + int(up_ph_np.shape[-1])
         title_up = (
-            "UP features — scattering (rows 0-42)  |  self-phase (rows 43-100)"
+            f"UP features — scattering (rows 0-{up_st_ch - 1})  |  "
+            f"self-phase (rows {up_st_ch}-{up_ch - 1})"
         )
     else:
-        up_stack, up_sep = up_ph_np.T, None                               # (58, T)
+        up_stack, up_sep = up_ph_np.T, None                               # (c_u, T)
         title_up = "UP features — self-phase only (up_st absent)"
     vabs_up = _safe_vabs(up_stack)
     im = ax.imshow(
@@ -765,8 +775,8 @@ def _build_diagnostic_figure(
     _finalise_time_axis(ax)
 
     # ---- Rows: Forecast — avg and single, imshow over all channels ------
-    # Both rows draw μ_full across all 87 feature channels (fhr_st on rows 0..42, fhr_ph on rows
-    # 43..86, with a white separator line between them). The first row is the overlap-averaged
+    # Both rows draw μ_full across all c_y feature channels (fhr_st first, then fhr_ph, with a
+    # white separator line between them). The first row is the overlap-averaged
     # forecast, the second is the stride-H_d single-window concatenation. A shared symmetric colour
     # range is used across both rows so the two imshows are directly comparable, driven by the
     # larger of the two finite ranges.
@@ -839,7 +849,6 @@ def _build_companion_figure(
     guid: str,
     warmup: int,
     horizon: int,
-    forecast_channels: Tuple[int, ...],
     forecast_anchor_frac: float,
     kld_active_frac: float,
     kld_shuffled_scalar: float,
@@ -849,7 +858,7 @@ def _build_companion_figure(
     Args:
         outs: Forward-output dict from the model's ``forward``.
         y_st: FHR scattering features ``(B, T, 43)``.
-        y_ph: FHR phase features ``(B, T, 44)``.
+        y_ph: FHR phase features ``(B, T, 66)``.
         kld_shuffled_per_t: ``(B, T)`` per-step KL under the deranged source, from
             :func:`~teb_vae.lag_attn.nets.controls.perm_kl_from_forward`.
         sample_idx: Index into the batch.
@@ -857,8 +866,8 @@ def _build_companion_figure(
         guid: GUID string for the figure title.
         warmup: Warmup period ``T_w``.
         horizon: Decimated forecast horizon ``H_d``.
-        forecast_channels: Channels shown in the predictive-band row.
-        forecast_anchor_frac: Fractional position of the drawn anchor.
+        forecast_anchor_frac: Fractional position of the anchor whose predictive band is
+            drawn for the worst-calibrated channel.
         kld_active_frac: Fraction of latent dims above the activity threshold.
         kld_shuffled_scalar: The support-masked mean shuffled KL, for the ratio annotation.
 
@@ -867,6 +876,7 @@ def _build_companion_figure(
     """
     s = sample_idx
     T = int(y_st.shape[1])
+    st_ch = int(y_st.shape[-1])
     anchor = int(np.clip(round(forecast_anchor_frac * T), warmup, max(T - horizon - 1, warmup)))
 
     y_plus = _future_target(y_st, y_ph, horizon)  # (B, T-H, H, C)
@@ -874,29 +884,73 @@ def _build_companion_figure(
     sigma_full = np.exp(0.5 * _np(outs["logvar_full"][s, anchor]))
     truth = _np(y_plus[s, anchor])  # (H, C)
 
-    fig = plt.figure(figsize=(16, 9))
-    grid = fig.add_gridspec(2, len(forecast_channels), height_ratios=[1.0, 1.0], hspace=0.45)
+    # Per-channel calibration over EVERY supervised anchor, not a hand-picked few. Three spot
+    # checks out of c_y cannot show a subset of badly-calibrated channels, and which three was an
+    # arbitrary choice that silently changed meaning when the dataset's channel selection moved.
+    # Averaging over all anchors also makes the statistic robust: a single anchor gives only H_d
+    # samples per channel, so its coverage is quantised to 1/H_d.
+    n_anchor = int(y_plus.shape[1])
+    lo, hi = int(warmup), n_anchor
+    if hi <= lo:  # tiny geometries where the warmup eats the whole anchor support
+        lo, hi = 0, max(n_anchor, 1)
+    mu_all = _np(outs["mu_full"][s, lo:hi])  # (A, H, C)
+    sd_all = np.exp(0.5 * _np(outs["logvar_full"][s, lo:hi]))
+    truth_all = _np(y_plus[s, lo:hi])
+    inside = np.abs(truth_all - mu_all) <= 2.0 * sd_all
+    coverage = inside.reshape(-1, inside.shape[-1]).mean(axis=0)  # (C,)
+    n_channels = int(coverage.shape[0])
+    median_cover = float(np.median(coverage))
+    worst = int(np.argmin(coverage))
 
-    # --- Row 1: learned predictive band, one panel per channel (G7) ----------
+    fig = plt.figure(figsize=(16, 9))
+    grid = fig.add_gridspec(2, 3, height_ratios=[1.0, 1.0], hspace=0.45)
+
+    # --- Row 1a: how well calibrated is the predictive Gaussian, over all channels? ----------
+    ax = fig.add_subplot(grid[0, 0])
+    ax.hist(coverage, bins=np.linspace(0.0, 1.0, 41), color=COLOR_BLUE,
+            edgecolor=COLOR_BLACK, linewidth=0.4)
+    ax.axvline(_NOMINAL_2SIGMA, color=COLOR_VERMILLION, linestyle="--", linewidth=1.4,
+               label=rf"nominal $2\sigma$ = {_NOMINAL_2SIGMA:.1%}")
+    ax.axvline(median_cover, color=COLOR_ORANGE, linestyle=":", linewidth=1.6,
+               label=f"median {median_cover:.1%}")
+    ax.set_title(rf"$2\sigma$ coverage across all {n_channels} channels, {hi - lo} anchors")
+    ax.set_xlabel(r"per-channel $2\sigma$ coverage")
+    ax.set_ylabel("channels")
+    ax.legend(loc="best", frameon=False, fontsize=8)
+    style_axes(ax)
+
+    # --- Row 1b: and *which* channels are miscalibrated ---------------------
+    ax = fig.add_subplot(grid[0, 1])
+    channels = np.arange(n_channels)
+    ax.plot(channels, coverage, color=COLOR_BLUE, linewidth=0.9)
+    ax.axhline(_NOMINAL_2SIGMA, color=COLOR_VERMILLION, linestyle="--", linewidth=1.4,
+               label=rf"nominal $2\sigma$")
+    if 0 < st_ch < n_channels:
+        ax.axvline(st_ch - 0.5, color=COLOR_GRAY, linewidth=1.2,
+                   label=f"scattering | phase ({st_ch})")
+    ax.set_ylim(0.0, 1.02)
+    ax.set_title(f"coverage by channel  (worst: ch {worst} at {coverage[worst]:.0%})")
+    ax.set_xlabel("feature channel")
+    ax.set_ylabel(r"$2\sigma$ coverage")
+    ax.legend(loc="best", frameon=False, fontsize=8)
+    style_axes(ax)
+
+    # --- Row 1c: the predictive band itself, for the channel the data says is worst ----------
+    # Data-driven rather than configured: whichever channel the model calibrates worst is the one
+    # worth looking at, and it costs no choice to find it.
+    ax = fig.add_subplot(grid[0, 2])
     steps = np.arange(1, horizon + 1)
-    for i, ch in enumerate(forecast_channels):
-        ax = fig.add_subplot(grid[0, i])
-        if ch >= mu_full.shape[-1]:
-            ax.set_visible(False)
-            continue
-        mu_c, sd_c, y_c = mu_full[:, ch], sigma_full[:, ch], truth[:, ch]
-        ax.fill_between(steps, mu_c - 2 * sd_c, mu_c + 2 * sd_c, color=COLOR_BLUE,
-                        alpha=0.22, linewidth=0, label=r"$\mu \pm 2\sigma$")
-        ax.plot(steps, mu_c, color=COLOR_BLUE, linewidth=1.6, label=r"$\mu_{\mathrm{full}}$")
-        ax.plot(steps, y_c, color=COLOR_VERMILLION, linewidth=1.4, linestyle="--",
-                label=r"$Y^{+}$")
-        cover = float(np.mean(np.abs(y_c - mu_c) <= 2 * sd_c))
-        ax.set_title(f"channel {ch} @ anchor {anchor}  (2$\\sigma$ coverage {cover:.0%})")
-        ax.set_xlabel("horizon step $h$")
-        ax.set_ylabel("feature value" if i == 0 else "")
-        style_axes(ax)
-        if i == 0:
-            ax.legend(loc="best", frameon=False, fontsize=8)
+    mu_c, sd_c, y_c = mu_full[:, worst], sigma_full[:, worst], truth[:, worst]
+    ax.fill_between(steps, mu_c - 2 * sd_c, mu_c + 2 * sd_c, color=COLOR_BLUE,
+                    alpha=0.22, linewidth=0, label=r"$\mu \pm 2\sigma$")
+    ax.plot(steps, mu_c, color=COLOR_BLUE, linewidth=1.6, label=r"$\mu_{\mathrm{full}}$")
+    ax.plot(steps, y_c, color=COLOR_VERMILLION, linewidth=1.4, linestyle="--", label=r"$Y^{+}$")
+    at_anchor = float(np.mean(np.abs(y_c - mu_c) <= 2 * sd_c))
+    ax.set_title(f"worst channel {worst} @ anchor {anchor}  (here {at_anchor:.0%})")
+    ax.set_xlabel("horizon step $h$")
+    ax.set_ylabel("feature value")
+    ax.legend(loc="best", frameon=False, fontsize=8)
+    style_axes(ax)
 
     # --- Row 2 left: per-dim raw KL + active threshold (G4) ------------------
     ax = fig.add_subplot(grid[1, 0])
@@ -967,7 +1021,6 @@ class LagAttnPlotCallback(Callback):
         file_format: Output image format (``"pdf"`` or ``"png"``).
         mlflow_logger: Optional MLflow logger — each saved file is registered as a run artifact
             when set.
-        forecast_channels: Channels shown in the companion's predictive-band row.
         forecast_anchor_frac: Fractional position of the anchor whose forecast window is drawn.
         subdir: Name of the output subdirectory created under ``output_dir``.
     """
@@ -980,7 +1033,6 @@ class LagAttnPlotCallback(Callback):
         *,
         file_format: str = "pdf",
         mlflow_logger: Any = None,
-        forecast_channels: Tuple[int, ...] = (0, 43, 80),
         forecast_anchor_frac: float = 0.6,
         subdir: str = "lag_attn_diagnostics",
     ) -> None:
@@ -991,7 +1043,6 @@ class LagAttnPlotCallback(Callback):
         self.num_examples = max(1, int(num_examples))
         self.file_format = file_format.lower().lstrip(".")
         self._mlflow_logger = mlflow_logger
-        self.forecast_channels = tuple(int(c) for c in forecast_channels)
         self.forecast_anchor_frac = float(forecast_anchor_frac)
 
     # ------------------------------------------------------------------
@@ -1036,10 +1087,11 @@ class LagAttnPlotCallback(Callback):
         batch = pl_module.transfer_batch_to_device(batch, pl_module.device, dataloader_idx=0)
         model = pl_module.orig_model
 
-        y_st, y_ph = batch.fhr_st, batch.fhr_ph
+        # Delegates the channel assembly, the width checks and their clear error messages to the
+        # task, so the plotting path cannot disagree with the training path about either.
+        y_st, y_ph = pl_module._build_target_streams(batch)
         up_ph = _get_field(batch, "up_ph")
         up_st = _get_field(batch, "up_st") if bool(getattr(model, "use_up_st", False)) else None
-        # Delegates the up_st/up_ph channel assembly and its clear error messages to the task.
         u_stream = pl_module._build_source_stream(batch)
 
         was_training = pl_module.training
@@ -1103,7 +1155,6 @@ class LagAttnPlotCallback(Callback):
                     outs=outs, y_st=y_st, y_ph=y_ph,
                     kld_shuffled_per_t=perm_out["kld_shuffled_per_t"],
                     sample_idx=s, epoch=epoch, guid=guid, warmup=warmup, horizon=horizon,
-                    forecast_channels=self.forecast_channels,
                     forecast_anchor_frac=self.forecast_anchor_frac,
                     kld_active_frac=kld_active_frac,
                     kld_shuffled_scalar=float(perm_out["kld_shuffled"]),
