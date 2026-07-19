@@ -14,12 +14,11 @@ Run from the repository root, which is what puts ``teb_vae``, ``train`` and ``ut
     TEB_RUN_STAMP="$(date '+%Y-%m-%d--[%H-%M]')" torchrun --nproc_per_node=7 \
         -m teb_vae.lag_attn.trainer --config teb_vae/lag_attn/configs/default.yaml
 
-From an IDE's Run button, with no command line: set ``RUN_CONFIG`` at the bottom of this file to
-the config path and hit Run. It ships as ``None``, so until it is set a bare launch still refuses
-to start rather than silently training some default configuration. Note this is a *single* process
--- fine for a smoke run, but a config whose ``general_config.cuda_devices`` lists several GPUs will
-have Lightning spawn DDP workers underneath it, which is rarely what is wanted from a Run button;
-point ``RUN_CONFIG`` at a single-device variant such as ``configs/tiny.yaml``.
+From an IDE's Run button, with no command line: ``RUN_CONFIG`` at the bottom of this file names the
+config to use, and ships pointing at ``configs/default.yaml``. Note this is a *single* process, so
+a config whose ``general_config.cuda_devices`` lists several GPUs -- ``default.yaml`` lists seven
+-- will have Lightning spawn DDP workers underneath it. For a single-device smoke run point
+``RUN_CONFIG`` at a single-device variant such as ``configs/tiny.yaml``.
 
 Everything about *running* an experiment -- run directories, seeding, log sinks, MLflow, the
 ``Trainer`` itself -- is the framework's. This module supplies the three things the framework
@@ -318,6 +317,7 @@ class LagAttnTrainer(GraphModelBase):
                     plot_frequency=plot_config.get("plot_frequency", 1),
                     num_examples=plot_config.get("num_examples", 2),
                     file_format=plot_config.get("file_format", "pdf"),
+                    forecast_channels=plot_config.get("forecast_channels", (0, 43, 80)),
                     forecast_anchor_frac=plot_config.get("forecast_anchor_frac", 0.6),
                     mlflow_logger=self.mlflow_logger,
                 )
@@ -471,25 +471,20 @@ def _check_declared_widths_against_shard(config: Dict[str, Any]) -> None:
 
 #: Config used when the module is launched with no ``--config`` -- i.e. an IDE's Run button.
 #:
-#: **Ships as ``None`` on purpose.** A default pointing at a real file means a bare run silently
-#: trains *some* configuration; the trainer this was ported from did exactly that, and a run that
-#: quietly trained the baseline instead of what the operator meant is worse than one that refuses
-#: to start. Left ``None``, a bare launch still fails asking for ``--config``, exactly as before.
-#:
-#: To use the Run button, set this to a config path and hit Run:
-#:
-#: .. code-block:: python
-#:
-#:     RUN_CONFIG = "teb_vae/lag_attn/configs/tiny.yaml"
+#: Points at the full ``default.yaml``, so a bare Run-button launch trains the real configuration.
+#: Note that this is a *single* process while ``default.yaml`` lists seven ``cuda_devices``:
+#: Lightning will spawn DDP workers underneath the Run button. That is the prod recipe, not a smoke
+#: run -- for a single-device smoke launch point this at ``configs/tiny.yaml`` instead, or pass
+#: ``--config`` on the command line, which always wins over this value.
 #:
 #: A relative path is resolved against the repository root, not the working directory, so it does
-#: not matter what an IDE sets the latter to. ``--config`` always wins when supplied.
+#: not matter what an IDE sets the latter to.
 #:
 #: To vary anything *other* than the config path -- devices, epochs, batch size, widths -- write a
 #: small variant config with ``base: default.yaml`` (see ``configs/tiny.yaml``) and point this at
 #: it, rather than editing values here. The run's durable record is the resolved config dumped to
 #: the run log and to MLflow; settings injected from Python would not appear in either.
-RUN_CONFIG: str | None = None
+RUN_CONFIG: str | None = "teb_vae/lag_attn/configs/default.yaml"
 
 
 if __name__ == "__main__":
