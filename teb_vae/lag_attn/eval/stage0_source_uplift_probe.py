@@ -82,6 +82,11 @@ _RIDGE_LAMBDAS: Tuple[float, ...] = (1e0, 1e1, 1e2, 1e3, 1e4)
 # deliberately generous: a genuine but small coupling should clear it, and it is worth recalibrating
 # once a first real run exists (mirrors scalars.py's collapse thresholds).
 _UPLIFT_REL_FLOOR = 0.01
+# How many strongest FHR channels the per-channel breakdown reports. A pooled uplift averages an
+# informative channel against ~c_y quiet ones, so a coupling confined to a few channels can read as
+# a ceiling; the per-channel view (with its own shuffle control) is what makes such a localised
+# signal visible.
+_TOP_CHANNELS = 8
 
 
 @dataclass
@@ -496,6 +501,36 @@ def run_probe(samples: Sequence[Sample], config: ProbeConfig) -> Dict[str, objec
         for o, b, f in zip(config.horizon_offsets, off_base, off_full)
     ]
 
+    # Per-channel uplift, aggregated over the horizon: the pooled number averages an informative
+    # FHR channel against ~c_y quiet ones, so a coupling confined to a few channels can read as a
+    # ceiling. Each channel carries its OWN shuffle control, so a channel that merely reacts to any
+    # UP (matched ~ shuffled) is not mistaken for a specific one.
+    c_y = y_eval.shape[1] // n_off
+
+    def channel_mse(pred: np.ndarray) -> np.ndarray:
+        return ((pred - y_eval) ** 2).reshape(-1, n_off, c_y).mean(axis=(0, 1))
+
+    mse_base_c = channel_mse(base_pred)
+    mse_full_c = channel_mse(full_pred)
+    mse_shuffled_c = channel_mse(shuffled_pred)
+    safe_base_c = np.clip(mse_base_c, 1e-12, None)
+    uplift_c = (mse_base_c - mse_full_c) / safe_base_c
+    uplift_shuffled_c = (mse_base_c - mse_shuffled_c) / safe_base_c
+    top = np.argsort(uplift_c)[::-1][:_TOP_CHANNELS]
+    per_channel = [
+        {
+            "channel": int(c),
+            "uplift_rel_matched": float(uplift_c[c]),
+            "uplift_rel_shuffled": float(uplift_shuffled_c[c]),
+            "mse_base": float(mse_base_c[c]),
+        }
+        for c in top
+    ]
+    # A localised-coupling candidate: a channel whose matched uplift clears the floor AND at least
+    # doubles its own shuffle control (genuine pairing, not a reaction to any source).
+    localized = (uplift_c >= _UPLIFT_REL_FLOOR) & (uplift_c >= 2.0 * np.clip(uplift_shuffled_c, 0.0, None))
+    best_channel = int(np.argmax(uplift_c))
+
     verdict = _verdict(uplift_rel, uplift_shuffled_rel)
     return {
         "verdict": verdict,
@@ -508,6 +543,11 @@ def run_probe(samples: Sequence[Sample], config: ProbeConfig) -> Dict[str, objec
         "r2_base": _pooled_r2(base_pred, y_eval),
         "r2_full": _pooled_r2(full_pred, y_eval),
         "per_offset": per_offset,
+        "per_channel": per_channel,
+        "localized_candidate": bool(localized.any()),
+        "n_localized_channels": int(localized.sum()),
+        "best_channel": best_channel,
+        "best_channel_uplift_rel": float(uplift_c[best_channel]),
         "ridge_lambda_base": base_lam,
         "ridge_lambda_full": full_lam,
         "n_rows_total": int(x_hist.shape[0]),
@@ -655,6 +695,15 @@ def format_report(results: Dict[str, object], nonlinear: Optional[Dict[str, floa
             f"     {row['offset_steps']:>3d}st/{row['offset_seconds']:>3d}s   "
             f"{row['mse_base']:.5f}    {row['mse_full']:.5f}   {row['uplift_rel']*100:+.3f} %"
         )
+    lines.append("")
+    lines.append("  strongest FHR channels (of c_y), matched vs its own shuffle control:")
+    lines.append("     channel   uplift_matched   uplift_shuffled   MSE_base")
+    for row in results["per_channel"]:  # type: ignore[index]
+        lines.append(
+            f"     {row['channel']:>5d}      {row['uplift_rel_matched']*100:+7.2f} %       "
+            f"{row['uplift_rel_shuffled']*100:+7.2f} %     {row['mse_base']:.5f}"
+        )
+
     if nonlinear is not None:
         lines.append("")
         lines.append(
@@ -664,6 +713,14 @@ def format_report(results: Dict[str, object], nonlinear: Optional[Dict[str, floa
     lines.append("")
     lines.append(f"  VERDICT: {str(results['verdict']).upper()}")
     lines.append(_verdict_gloss(str(results["verdict"])))
+    if results.get("localized_candidate"):
+        lines.append(
+            f"  NOTE: {results['n_localized_channels']} FHR channel(s) show a localised source signal\n"
+            f"        that survives their own shuffle control (best = channel "
+            f"{results['best_channel']} at {num('best_channel_uplift_rel')*100:+.2f}%). A pooled\n"
+            f"        verdict averages this away; the coupling may be real but confined to a few\n"
+            f"        channels. Worth a channel-focused follow-up before concluding 'no coupling'."
+        )
     lines.append("=" * 74)
     return "\n".join(lines)
 
@@ -692,25 +749,30 @@ def _verdict_gloss(verdict: str) -> str:
 
 # --- Self-test (no dataset required) ----------------------------------------------------------
 def _fabricate_samples(
-    *, coupled: bool, n_records: int, seq_len: int, rng: np.random.Generator
+    *, coupled: bool, n_records: int, seq_len: int, rng: np.random.Generator, n_target_channels: int = 6
 ) -> List[Sample]:
     r"""Fabricate recordings with or without a known injected UP$\to$FHR coupling.
 
     The target is a per-channel AR(1) process (strong self-predictability, like FHR). When
-    ``coupled``, a fixed fraction of the *future* target is driven by the source at a known lag, so
-    a correctly built probe must find held-out uplift that vanishes under the shuffle control. When
-    not, the source is independent noise and the uplift must stay at ~0.
+    ``coupled``, the *future* of exactly two target channels is driven by the source at a known lag,
+    so a correctly built probe must find held-out uplift that vanishes under the shuffle control.
+    With a large ``n_target_channels`` this is the *dilution* case: only 2 of many channels carry
+    the signal, so the pooled uplift washes out while the per-channel view must still surface
+    channels 0 and 1. When not ``coupled``, the source is independent noise and the uplift must stay
+    at ~0.
 
     Args:
         coupled: Whether to inject the source->target dependence.
         n_records: Number of recordings to fabricate.
         seq_len: Sequence length $T$.
         rng: RNG.
+        n_target_channels: Number of target channels; only channels 0 and 1 ever carry the signal,
+            so a large value dilutes the pooled uplift.
 
     Returns:
         The fabricated samples.
     """
-    c_y, c_u = 6, 4
+    c_y, c_u = int(n_target_channels), 4
     inject_lag = 12          # source acts on the target this many steps later
     ar = 0.85                # target self-persistence
     coupling = 0.6           # weight of the injected source term
@@ -753,9 +815,16 @@ def self_test() -> int:
 
     coupled = run_probe(_fabricate_samples(coupled=True, n_records=40, seq_len=200, rng=rng), config)
     null = run_probe(_fabricate_samples(coupled=False, n_records=40, seq_len=200, rng=rng), config)
+    # Dilution: the SAME coupling into 2 channels out of 40, so the pooled uplift washes out while
+    # the per-channel breakdown must still surface channels 0 and 1 as a localised candidate.
+    diluted = run_probe(
+        _fabricate_samples(coupled=True, n_records=40, seq_len=200, rng=rng, n_target_channels=40),
+        config,
+    )
 
     print(format_report(coupled, None))
     print(format_report(null, None))
+    print(format_report(diluted, None))
 
     ok = True
     if coupled["verdict"] != "coupling_present":
@@ -768,6 +837,15 @@ def self_test() -> int:
         ok = False
     if null["verdict"] != "data_ceiling":
         print(f"FAIL: null dataset -> {null['verdict']} (expected data_ceiling)")
+        ok = False
+    # The dilution case is the point of the per-channel view: even when pooled dilutes the signal,
+    # the two injected channels must be surfaced as a localised candidate.
+    top_channels = {row["channel"] for row in diluted["per_channel"][:4]}  # type: ignore[index]
+    if not diluted["localized_candidate"]:
+        print("FAIL: per-channel probe did not flag a localised candidate on the diluted signal")
+        ok = False
+    if not {0, 1} <= top_channels:
+        print(f"FAIL: per-channel probe did not surface the injected channels; top4={top_channels}")
         ok = False
     print("\nSELF-TEST:", "PASS" if ok else "FAIL")
     return 0 if ok else 1
