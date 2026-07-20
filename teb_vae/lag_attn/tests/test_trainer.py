@@ -190,7 +190,7 @@ def test_create_model_passes_the_loss_hyperparameters_to_the_task(trainer):
     hparams = trainer.pl_model.hparams
     assert hparams["likelihood"] == "gaussian_nll"
     assert hparams["sigma_obs"] == "learned"
-    assert hparams["free_bits"] == 0.1
+    assert hparams["free_bits"] == 0.01
     assert hparams["detach_baseline_in_full"] is True
     assert hparams["beta_schedule"]["kind"] == "linear_warmup"
 

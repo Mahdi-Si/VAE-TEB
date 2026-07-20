@@ -39,6 +39,26 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 from matplotlib.gridspec import GridSpec  # noqa: E402
 
+from teb_vae.lag_attn.figure_primitives import (  # noqa: E402
+    COLOR_BLACK,
+    COLOR_BLUE,
+    COLOR_GRAY,
+    COLOR_GREEN,
+    COLOR_LIGHT_GRAY,
+    COLOR_ORANGE,
+    COLOR_PURPLE,
+    COLOR_VERMILLION,
+    attach_lag_seconds_axis,
+    average_forecast_per_channel,
+    concat_single_forecasts,
+    future_target,
+    kld_per_dim_np,
+    safe_vabs,
+    shade_warmup,
+    stack_feature_blocks,
+    time_axes,
+    to_numpy,
+)
 from teb_vae.lag_attn.nets import controls  # noqa: E402
 from utils.mlflow_utils import log_artifact_to_mlflow  # noqa: E402
 from utils.style import (  # noqa: E402
@@ -47,18 +67,6 @@ from utils.style import (  # noqa: E402
     save_figure,
     style_axes,
 )
-
-# The figures depend on these exact hues, so they are fixed here as literals rather than pulled from
-# ``utils.style`` (whose palette is a different, evolving set). Only the colours the two builders
-# actually draw with are kept.
-COLOR_BLUE = "#3F72AF"
-COLOR_ORANGE = "#FFB200"
-COLOR_GREEN = "#46D855"
-COLOR_PURPLE = "#5642EB"
-COLOR_VERMILLION = "#F23F04"
-COLOR_GRAY = "#393E46"
-COLOR_BLACK = "#000000"
-COLOR_LIGHT_GRAY = "#EEEEEE"
 
 #: Per-dim KL below this (nats) marks an inactive latent dimension in the companion's G4 panel.
 _KLD_ACTIVE_EPS = 1e-2
@@ -107,235 +115,6 @@ def _guid_of(batch: Any, index: int = 0) -> str:
         except Exception:  # noqa: BLE001
             return "unknown"
     return str(field)
-
-
-def _np(t: torch.Tensor) -> np.ndarray:
-    """Detach + move to CPU + float32 numpy view (strict, non-optional)."""
-    return t.detach().cpu().float().numpy()
-
-
-def _kld_per_dim_np(
-    mu_prior: np.ndarray,
-    logvar_prior: np.ndarray,
-    mu_post: np.ndarray,
-    logvar_post: np.ndarray,
-) -> np.ndarray:
-    """Closed-form diagonal-Gaussian KL, per timestep per latent dim.
-
-    Args:
-        mu_prior: ``(T, d_z)`` prior mean.
-        logvar_prior: ``(T, d_z)`` prior log-variance.
-        mu_post: ``(T, d_z)`` posterior mean.
-        logvar_post: ``(T, d_z)`` posterior log-variance.
-
-    Returns:
-        ``(T, d_z)`` per-step per-dim KL in nats.
-    """
-    return 0.5 * (
-        logvar_prior
-        - logvar_post
-        + (np.exp(logvar_post) + (mu_post - mu_prior) ** 2) / np.exp(logvar_prior)
-        - 1.0
-    )
-
-
-def _time_axes(
-    T: int, R: int, fs_raw: float = 4.0
-) -> Tuple[np.ndarray, np.ndarray, float]:
-    """Return ``(time_raw_sec, time_dec_sec, t_max_sec)`` for unified alignment.
-
-    All diagnostic rows share a single physical-time axis. The raw FHR/UP trace lives on
-    ``time_raw`` (step ``1/fs_raw``); decimated features / latents live on ``time_dec`` (step
-    ``t_max / T``). The imshow ``extent`` and the ``ax.set_xlim`` call for every axes both use
-    ``(0.0, t_max_sec)``.
-
-    Args:
-        T: Number of decimated steps (e.g. 300).
-        R: Number of raw samples (e.g. 4800).
-        fs_raw: Raw sampling rate in Hz (default 4.0).
-
-    Returns:
-        Tuple ``(time_raw, time_dec, t_max_sec)``:
-        - ``time_raw``: ``(R,)`` seconds axis for the raw signal.
-        - ``time_dec``: ``(T,)`` seconds axis for decimated tensors; step centres at
-          ``0, Δ, 2Δ, …`` with ``Δ = t_max / T``.
-        - ``t_max_sec``: total window length in seconds (``R / fs_raw``).
-    """
-    t_max = float(R) / float(fs_raw)
-    time_raw = np.arange(R, dtype=np.float64) / float(fs_raw)
-    time_dec = np.arange(T, dtype=np.float64) * (t_max / float(T))
-    return time_raw, time_dec, t_max
-
-
-def _attach_lag_seconds_axis(
-    ax: Any, step_seconds: float, delta_up_seconds: float
-) -> Any:
-    r"""Add a right-hand secondary y-axis in physical seconds.
-
-    Maps a decimated lag index $\ell$ to $\mathrm{lag}_{\mathrm{phys}}(\ell) =
-    s\,\ell + \Delta_{UP}$ (``step_seconds`` $s$, ``delta_up_seconds`` $\Delta_{UP}$), so the lag
-    panels read in both model-lag and physical-second coordinates. Non-fatal: any Matplotlib error
-    is swallowed so plotting never crashes training.
-
-    Args:
-        ax: The lag-panel axes (primary y is the decimated lag $\ell$).
-        step_seconds: Decimated step duration $s$ in seconds.
-        delta_up_seconds: Fixed preprocessing UP shift $\Delta_{UP}$ in seconds.
-
-    Returns:
-        The created secondary axis, or ``None`` if it could not be attached.
-    """
-    s = float(step_seconds)
-    d = float(delta_up_seconds)
-    if s <= 0.0:
-        return None
-    try:
-        sec = ax.secondary_yaxis(
-            "right",
-            functions=(lambda l: s * l + d, lambda v: (v - d) / s),
-        )
-        sec.set_ylabel("Lag (s)", fontsize=8)
-        return sec
-    except Exception:  # noqa: BLE001 — plotting must never crash training
-        return None
-
-
-def _shade_warmup(
-    ax: Any,
-    warmup: int,
-    t_max: float,
-    T: int,
-    *,
-    color: str = COLOR_LIGHT_GRAY,
-) -> None:
-    """Shade the first ``warmup`` decimated steps, in seconds, on an axes.
-
-    Args:
-        ax: Target axes.
-        warmup: Warmup length in decimated steps.
-        t_max: Full x-axis extent in seconds (``R / fs_raw``).
-        T: Total number of decimated steps (for step-to-seconds conversion).
-        color: Shading colour.
-    """
-    if warmup and warmup > 0 and T > 0:
-        warmup_sec = float(warmup) * (t_max / float(T))
-        ax.axvspan(0.0, warmup_sec, color=color, alpha=0.35, zorder=0)
-
-
-def _average_forecast_per_channel(
-    mu_pred: np.ndarray,
-    T: int,
-    H_d: int,
-    warmup: int,
-) -> np.ndarray:
-    """Average overlapping per-anchor horizon forecasts onto the decimated axis.
-
-    Anchor ``t ∈ [warmup, T - H_d)`` contributes its per-horizon prediction ``mu_pred[t, h, :]`` to
-    the target decimated index ``τ = t + 1 + h``. The returned array averages every anchor's
-    contribution to each ``τ``. Positions with no contributing anchor are set to ``NaN`` (so they
-    render as gaps in a matplotlib imshow, or masked cells in a heatmap).
-
-    Args:
-        mu_pred: ``(T, H_d, C)`` per-anchor horizon prediction.
-        T: Number of decimated steps.
-        H_d: Forecast horizon in decimated steps.
-        warmup: Warmup length in decimated steps.
-
-    Returns:
-        ``(T, C)`` averaged forecast (float32). Uncovered positions are NaN.
-    """
-    C = mu_pred.shape[-1]
-    acc = np.zeros((T, C), dtype=np.float64)
-    cnt = np.zeros((T,), dtype=np.float64)
-    t_start = max(int(warmup), 0)
-    t_end = max(t_start, T - H_d)
-    for t in range(t_start, t_end):
-        tau_end = min(t + 1 + H_d, T)
-        tau = np.arange(t + 1, tau_end)
-        h = tau - (t + 1)
-        acc[tau] += mu_pred[t, h, :]
-        cnt[tau] += 1.0
-    with np.errstate(invalid="ignore", divide="ignore"):
-        avg = acc / np.where(cnt > 0.0, cnt, 1.0)[:, None]
-    avg[cnt == 0.0] = np.nan
-    return avg.astype(np.float32)
-
-
-def _concat_single_forecasts(
-    mu_pred: np.ndarray,
-    T: int,
-    H_d: int,
-    warmup: int,
-) -> np.ndarray:
-    """Non-overlapping, stride-``H_d`` concatenation of per-anchor horizons.
-
-    Starting at ``t = warmup``, walk forward in strides of ``H_d`` anchors; each anchor contributes
-    its full horizon slice ``[t+1, t+1+H_d)`` to the output. Any positions not covered are ``NaN``
-    so imshow masks them.
-
-    Args:
-        mu_pred: ``(T, H_d, C)`` per-anchor horizon prediction.
-        T: Number of decimated steps.
-        H_d: Forecast horizon in decimated steps.
-        warmup: Warmup length in decimated steps.
-
-    Returns:
-        ``(T, C)`` concatenated forecast (float32). Uncovered positions NaN.
-    """
-    C = mu_pred.shape[-1]
-    out = np.full((T, C), np.nan, dtype=np.float32)
-    t = max(int(warmup), 0)
-    while t + 1 + H_d <= T and t < T:
-        out[t + 1 : t + 1 + H_d, :] = mu_pred[t, :, :].astype(np.float32)
-        t += H_d
-    return out
-
-
-def _stack_feature_blocks(
-    top: np.ndarray, bottom: Optional[np.ndarray]
-) -> Tuple[np.ndarray, Optional[int]]:
-    """Vertically stack two feature blocks and return the separator row.
-
-    Args:
-        top: ``(C_top, T)`` upper block.
-        bottom: ``(C_bot, T)`` lower block, or ``None``.
-
-    Returns:
-        ``(stacked, separator_row)`` where ``separator_row`` is the y-position of the boundary
-        between the two blocks (``C_top - 0.5``), or ``None`` when only the top block is present.
-    """
-    if bottom is None:
-        return top, None
-    stacked = np.concatenate([top, bottom], axis=0)
-    return stacked, top.shape[0] - 1
-
-
-def _safe_vabs(arr: np.ndarray) -> float:
-    """Return a strictly-positive symmetric colour-limit for a ``bwr`` imshow.
-
-    Ignores NaN/Inf entries. Falls back to ``1.0`` if the array has no finite values or the finite
-    max is zero.
-    """
-    finite = arr[np.isfinite(arr)]
-    if finite.size == 0:
-        return 1.0
-    vabs = float(np.abs(finite).max())
-    return vabs if vabs > 0.0 else 1.0
-
-
-def _future_target(y_st: torch.Tensor, y_ph: torch.Tensor, horizon: int) -> torch.Tensor:
-    r"""Unfold :math:`Y^{+}`: at anchor :math:`t`, the window ``Y[t+1 : t+1+H]``.
-
-    Args:
-        y_st: FHR scattering features ``(B, T, 43)``.
-        y_ph: FHR phase features ``(B, T, 66)``.
-        horizon: Forecast horizon :math:`H_d`.
-
-    Returns:
-        ``(B, T - H_d, H_d, C_y)``.
-    """
-    Y = torch.cat([y_st, y_ph], dim=-1)
-    return Y[:, 1:, :].unfold(dimension=1, size=horizon, step=1).permute(0, 1, 3, 2)
 
 
 # =============================================================================
@@ -398,22 +177,22 @@ def _build_diagnostic_figure(
     i = sample_idx
 
     # ---- Numpy views of the relevant tensors for this sample ---------------
-    y_st_np = _np(y_st[i])                                          # (T, 43)
-    y_ph_np = _np(y_ph[i])                                          # (T, 66)
-    up_ph_np = _np(up_ph[i])                                        # (T, 15)
-    up_st_np = _np(up_st[i]) if up_st is not None else None         # (T, 43) or None
+    y_st_np = to_numpy(y_st[i])                                          # (T, 43)
+    y_ph_np = to_numpy(y_ph[i])                                          # (T, 66)
+    up_ph_np = to_numpy(up_ph[i])                                        # (T, 15)
+    up_st_np = to_numpy(up_st[i]) if up_st is not None else None         # (T, 43) or None
 
-    mu_prior_np = _np(outs["mu_prior"][i])                          # (T, d_z)
-    logvar_prior_np = _np(outs["logvar_prior"][i])
-    mu_post_np = _np(outs["mu_post"][i])
-    logvar_post_np = _np(outs["logvar_post"][i])
-    z_np = _np(outs["z"][i])                                        # (T, d_z)
+    mu_prior_np = to_numpy(outs["mu_prior"][i])                          # (T, d_z)
+    logvar_prior_np = to_numpy(outs["logvar_prior"][i])
+    mu_post_np = to_numpy(outs["mu_post"][i])
+    logvar_post_np = to_numpy(outs["logvar_post"][i])
+    z_np = to_numpy(outs["z"][i])                                        # (T, d_z)
 
-    attn_np = _np(outs["attn_weights"][i])                          # (T, M, L)
-    te_lag_np = _np(outs["te_lag_map"][i])                          # (T, L)
-    kld_per_t_np = _np(outs["kld_per_t"][i])                        # (T,)
+    attn_np = to_numpy(outs["attn_weights"][i])                          # (T, M, L)
+    te_lag_np = to_numpy(outs["te_lag_map"][i])                          # (T, L)
+    kld_per_t_np = to_numpy(outs["kld_per_t"][i])                        # (T,)
 
-    mu_full_np = _np(outs["mu_full"][i])                            # (T, H_d, c_y)
+    mu_full_np = to_numpy(outs["mu_full"][i])                            # (T, H_d, c_y)
 
     T = int(y_st_np.shape[0])
     d_z = int(mu_prior_np.shape[-1])
@@ -423,7 +202,7 @@ def _build_diagnostic_figure(
     st_ch = int(y_st_np.shape[-1])
 
     # Per-dim per-step KL, computed once and reused.
-    kld_per_dim = _kld_per_dim_np(
+    kld_per_dim = kld_per_dim_np(
         mu_prior_np, logvar_prior_np, mu_post_np, logvar_post_np
     )  # (T, d_z)
 
@@ -438,8 +217,8 @@ def _build_diagnostic_figure(
     # Full-sequence forecast reductions on mu_full only (the residual-corrected prediction). The
     # baseline mu_base is tracked in the loss via lambda_base but is not drawn here to keep the
     # layout compact.
-    avg_full = _average_forecast_per_channel(mu_full_np, T, H_d, warmup)
-    concat_full = _concat_single_forecasts(mu_full_np, T, H_d, warmup)
+    avg_full = average_forecast_per_channel(mu_full_np, T, H_d, warmup)
+    concat_full = concat_single_forecasts(mu_full_np, T, H_d, warmup)
 
     # ------------------------------------------------------------------
     # Shared physical-time axis (seconds) — every row uses this.
@@ -448,12 +227,12 @@ def _build_diagnostic_figure(
     fs_raw = 4.0
     if has_raw:
         assert fhr_raw is not None and up_raw is not None
-        R = int(_np(fhr_raw[i]).ravel().shape[0])
+        R = int(to_numpy(fhr_raw[i]).ravel().shape[0])
     else:
         # Fall back to the nominal 16× decimation so downstream math is still well-defined when the
         # raw signal is missing from the batch.
         R = T * 16
-    time_raw, time_dec, t_max = _time_axes(T, R, fs_raw=fs_raw)
+    time_raw, time_dec, t_max = time_axes(T, R, fs_raw=fs_raw)
 
     # ------------------------------------------------------------------
     # Figure and gridspec
@@ -526,14 +305,14 @@ def _build_diagnostic_figure(
     def _finalise_time_axis(ax: Any) -> None:
         """Every row ends with this so all panels line up column-for-column."""
         ax.set_xlim(0.0, t_max)
-        _shade_warmup(ax, warmup, t_max, T)
+        shade_warmup(ax, warmup, t_max, T)
 
     # ---- Row: Raw FHR + UP -------------------------------------------------
     if has_raw:
         ax, cax = row_axes("raw")
         assert fhr_raw is not None and up_raw is not None  # has_raw guard
-        fhr_np = _np(fhr_raw[i]).ravel()
-        up_np = _np(up_raw[i]).ravel()
+        fhr_np = to_numpy(fhr_raw[i]).ravel()
+        up_np = to_numpy(up_raw[i]).ravel()
         ax.plot(time_raw, fhr_np, color=COLOR_BLUE, linewidth=0.8, label="FHR")
         ax2 = ax.twinx()
         ax2.plot(time_raw, up_np, color=COLOR_GREEN, linewidth=0.8, label="UP")
@@ -556,8 +335,8 @@ def _build_diagnostic_figure(
 
     # ---- Row: FHR features stacked heatmap --------------------------------
     ax, cax = row_axes("fhr_feats")
-    fhr_stack, fhr_sep = _stack_feature_blocks(y_st_np.T, y_ph_np.T)     # (c_y, T)
-    vabs_fhr = _safe_vabs(fhr_stack)
+    fhr_stack, fhr_sep = stack_feature_blocks(y_st_np.T, y_ph_np.T)     # (c_y, T)
+    vabs_fhr = safe_vabs(fhr_stack)
     im = ax.imshow(
         fhr_stack, aspect="auto", cmap="bwr", origin="upper",
         vmin=-vabs_fhr, vmax=vabs_fhr,
@@ -580,7 +359,7 @@ def _build_diagnostic_figure(
     # ---- Row: UP features stacked heatmap ---------------------------------
     ax, cax = row_axes("up_feats")
     if up_st_np is not None:
-        up_stack, up_sep = _stack_feature_blocks(up_st_np.T, up_ph_np.T)  # (c_u, T)
+        up_stack, up_sep = stack_feature_blocks(up_st_np.T, up_ph_np.T)  # (c_u, T)
         up_st_ch = int(up_st_np.shape[-1])
         up_ch = up_st_ch + int(up_ph_np.shape[-1])
         title_up = (
@@ -590,7 +369,7 @@ def _build_diagnostic_figure(
     else:
         up_stack, up_sep = up_ph_np.T, None                               # (c_u, T)
         title_up = "UP features — self-phase only (up_st absent)"
-    vabs_up = _safe_vabs(up_stack)
+    vabs_up = safe_vabs(up_stack)
     im = ax.imshow(
         up_stack, aspect="auto", cmap="bwr", origin="upper",
         vmin=-vabs_up, vmax=vabs_up,
@@ -608,7 +387,7 @@ def _build_diagnostic_figure(
     # ---- Row: Latent z ----------------------------------------------------
     ax, cax = row_axes("z_latent")
     z_img = z_np.T                                                  # (d_z, T)
-    vabs_z = _safe_vabs(z_img)
+    vabs_z = safe_vabs(z_img)
     im = ax.imshow(
         z_img, aspect="auto", cmap="bwr", origin="lower",
         vmin=-vabs_z, vmax=vabs_z,
@@ -624,7 +403,7 @@ def _build_diagnostic_figure(
     # ---- Row: Posterior μ vs prior μ split heatmap ------------------------
     ax, cax = row_axes("post_prior")
     post_prior = np.concatenate([mu_post_np.T, mu_prior_np.T], axis=0)   # (2*d_z, T)
-    vabs_pp = _safe_vabs(post_prior)
+    vabs_pp = safe_vabs(post_prior)
     im = ax.imshow(
         post_prior, aspect="auto", cmap="bwr", origin="upper",
         vmin=-vabs_pp, vmax=vabs_pp,
@@ -711,7 +490,7 @@ def _build_diagnostic_figure(
     )
     ax.set_xlabel("Time (s)", fontsize=8)
     ax.set_ylabel("Lag ℓ (0 = current)", fontsize=8)
-    _attach_lag_seconds_axis(ax, step_seconds, delta_up_seconds)
+    attach_lag_seconds_axis(ax, step_seconds, delta_up_seconds)
     ax.legend(loc="upper right", fontsize=7, framealpha=0.95)
     _style_heatmap_spines(ax)
     _attach_cbar(cax, im, "Attn prob")
@@ -746,7 +525,7 @@ def _build_diagnostic_figure(
     )
     ax.set_xlabel("Time (s)", fontsize=8)
     ax.set_ylabel("Lag ℓ (0 = current)", fontsize=8)
-    _attach_lag_seconds_axis(ax, step_seconds, delta_up_seconds)
+    attach_lag_seconds_axis(ax, step_seconds, delta_up_seconds)
     _style_heatmap_spines(ax)
     _attach_cbar(cax, im, "KL weight")
     _finalise_time_axis(ax)
@@ -769,7 +548,7 @@ def _build_diagnostic_figure(
     )
     ax.set_xlabel("Time (s)", fontsize=8)
     ax.set_ylabel("Lag ℓ (0 = current)", fontsize=8)
-    _attach_lag_seconds_axis(ax, step_seconds, delta_up_seconds)
+    attach_lag_seconds_axis(ax, step_seconds, delta_up_seconds)
     _style_heatmap_spines(ax)
     _attach_cbar(cax, im, "Column-norm")
     _finalise_time_axis(ax)
@@ -879,10 +658,10 @@ def _build_companion_figure(
     st_ch = int(y_st.shape[-1])
     anchor = int(np.clip(round(forecast_anchor_frac * T), warmup, max(T - horizon - 1, warmup)))
 
-    y_plus = _future_target(y_st, y_ph, horizon)  # (B, T-H, H, C)
-    mu_full = _np(outs["mu_full"][s, anchor])  # (H, C)
-    sigma_full = np.exp(0.5 * _np(outs["logvar_full"][s, anchor]))
-    truth = _np(y_plus[s, anchor])  # (H, C)
+    y_plus = future_target(y_st, y_ph, horizon)  # (B, T-H, H, C)
+    mu_full = to_numpy(outs["mu_full"][s, anchor])  # (H, C)
+    sigma_full = np.exp(0.5 * to_numpy(outs["logvar_full"][s, anchor]))
+    truth = to_numpy(y_plus[s, anchor])  # (H, C)
 
     # Per-channel calibration over EVERY supervised anchor, not a hand-picked few. Three spot
     # checks out of c_y cannot show a subset of badly-calibrated channels, and which three was an
@@ -893,9 +672,9 @@ def _build_companion_figure(
     lo, hi = int(warmup), n_anchor
     if hi <= lo:  # tiny geometries where the warmup eats the whole anchor support
         lo, hi = 0, max(n_anchor, 1)
-    mu_all = _np(outs["mu_full"][s, lo:hi])  # (A, H, C)
-    sd_all = np.exp(0.5 * _np(outs["logvar_full"][s, lo:hi]))
-    truth_all = _np(y_plus[s, lo:hi])
+    mu_all = to_numpy(outs["mu_full"][s, lo:hi])  # (A, H, C)
+    sd_all = np.exp(0.5 * to_numpy(outs["logvar_full"][s, lo:hi]))
+    truth_all = to_numpy(y_plus[s, lo:hi])
     inside = np.abs(truth_all - mu_all) <= 2.0 * sd_all
     coverage = inside.reshape(-1, inside.shape[-1]).mean(axis=0)  # (C,)
     n_channels = int(coverage.shape[0])
@@ -956,7 +735,7 @@ def _build_companion_figure(
     ax = fig.add_subplot(grid[1, 0])
     mu_p, lv_p = outs["mu_prior"][s], outs["logvar_prior"][s]
     mu_q, lv_q = outs["mu_post"][s], outs["logvar_post"][s]
-    per_dim = _np(
+    per_dim = to_numpy(
         0.5 * (lv_p - lv_q + (lv_q.exp() + (mu_q - mu_p).pow(2)) / lv_p.exp() - 1.0)
     )[warmup:].mean(axis=0)
     dims = np.arange(per_dim.shape[0])
@@ -973,8 +752,8 @@ def _build_companion_figure(
 
     # --- Row 2 rest: K_true vs K_shuffled per step (G6) -----------------------
     ax = fig.add_subplot(grid[1, 1:])
-    k_true = _np(outs["kld_per_t"][s])
-    k_shuf = _np(kld_shuffled_per_t[s])
+    k_true = to_numpy(outs["kld_per_t"][s])
+    k_shuf = to_numpy(kld_shuffled_per_t[s])
     t_axis = np.arange(T)
     ax.plot(t_axis, k_true, color=COLOR_BLUE, linewidth=1.4, label=r"$K_{\mathrm{true}}$")
     ax.plot(t_axis, k_shuf, color=COLOR_VERMILLION, linewidth=1.2, alpha=0.85,

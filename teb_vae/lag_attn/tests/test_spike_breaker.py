@@ -5,15 +5,17 @@ bounded below by zero and routinely goes negative. The breaker's relative test i
 $\ell > m \cdot \max(\mathrm{EMA}, \mathrm{floor})$ -- note $\max(\mathrm{EMA}, \mathrm{floor})$,
 **not** $\max(|\mathrm{EMA}|, \mathrm{floor})$ -- which silently assumes a loss bounded below by
 zero. Once the EMA is negative the test degenerates and starts discarding healthy batches, so the
-shipped config switches the relative test off with a floor far above any reachable loss and keeps
-only the non-finite guard, which never consults the threshold. The first block below is the
-evidence for that choice, in both directions.
+shipped config switches the relative test off with a floor far above any reachable loss. The first
+block below is the evidence for that choice, in both directions.
+
+The 2026-07 baseline then measured what the non-finite guard alone costs: a *finite* blow-up
+(epoch 79, ``main_loss`` $\approx -0.5 \to +4..+10$, no NaN in the run) sailed through and the run
+was lost. The shipped config therefore also enables ``additive_margin`` -- skip when
+$\ell > \mathrm{EMA} + \mathrm{margin}$, against the raw EMA, so it works at a negative baseline
+-- and the re-enactment test below drives that exact event through the shipped block.
 
 The other reachable failure is DDP-only, and the last block demonstrates it rather than asserting
 it absent: it is the one that would cost days of a headline run to diagnose from a training curve.
-
-No tuning happens here. What the breaker should look like once the real loss's sign and magnitude
-are known at production scale is a question a tiny local run cannot answer.
 """
 from __future__ import annotations
 
@@ -147,14 +149,44 @@ def test_at_a_zero_floor_a_negative_ema_makes_every_positive_batch_a_spike(task)
 
 
 def test_the_shipped_floor_leaves_an_ordinary_positive_batch_alone(task):
-    """The shipped configuration: relative detection off, so no healthy batch is ever discarded."""
+    """The shipped configuration: the sign-crossing batch that a zero floor discards must train.
+
+    The ``50.0`` feed pins the additive margin off to show the *relative* test is genuinely off
+    under the huge floor -- with the shipped margin active that batch is caught, which is the
+    following test's subject, not this one's.
+    """
     module = task()
-    shipped = _breaker_config(ema_floor=1.0e9)
+    shipped = _breaker_config(ema_floor=1.0e9, additive_margin=3.0)
     for _ in range(5):
         _feed(module, -0.5, shipped)
 
-    assert not _skipped(_feed(module, 0.3, shipped)[0])
-    assert not _skipped(_feed(module, 50.0, shipped)[0])  # relative detection is genuinely off
+    assert not _skipped(_feed(module, 0.3, shipped)[0])  # +0.3 < EMA + 3.0: inside the margin
+    floor_only = _breaker_config(ema_floor=1.0e9, additive_margin=0.0)
+    assert not _skipped(_feed(module, 50.0, floor_only)[0])  # relative detection is genuinely off
+
+
+def test_the_shipped_margin_catches_the_epoch79_blowup(task):
+    r"""The finite blow-up the 2026-07 baseline actually had, re-enacted under the shipped block.
+
+    That run: ``main_loss`` EMA $\approx -0.5$ for 78 epochs, then finite batches at $+4..+10$
+    in one epoch -- no NaN anywhere, so the non-finite guard had nothing to catch, and the
+    relative test was (correctly) disabled by the floor. The run never recovered. The additive
+    test is the one that fires here: $5.0 > \mathrm{EMA} + 3.0$, sign-agnostic because it
+    compares against the raw EMA rather than ``max(EMA, floor)``.
+    """
+    module = task()
+    shipped = _breaker_config(ema_floor=1.0e9, additive_margin=3.0)
+    for _ in range(5):
+        _feed(module, -0.5, shipped)  # the healthy negative-NLL regime
+    ema_before = module._spike_ema_loss
+    assert ema_before < 0.0
+
+    metrics, returned = _feed(module, 5.0, shipped)
+
+    assert _skipped(metrics)
+    assert torch.isfinite(returned)
+    assert module._spike_ema_loss == ema_before, "a skipped spike must not drag the EMA up"
+    assert float(metrics["main_loss"]) < 0.0, "the logged main_loss was replaced by the EMA"
 
 
 def test_the_shipped_floor_still_catches_a_nan(task):

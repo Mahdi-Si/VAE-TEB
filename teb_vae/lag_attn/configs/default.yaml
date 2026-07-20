@@ -29,8 +29,14 @@ general_config:
 
   seed: 42
   cuda_devices: [0, 1, 2, 3, 4, 5, 6]
-  lr: 0.001
-  lr_milestone: [1000]      # singular; the experiment driver reads this exact key
+  # 1e-3 with no decay inside the run destabilised the 2026-07 baseline: the learned-variance
+  # NLL sharpens the landscape as logvars shrink (errors weighted by e^{-logvar}), and at a
+  # constant 1e-3 the run showed a recovered precursor spike at epoch 69 and a permanent finite
+  # blow-up at epoch 79 (total_loss -0.7 -> +7, never recovered; see metrics_history.csv of that
+  # run). 3e-4 restores the stability margin; the milestones put the x0.1 decays inside the run
+  # instead of at the never-reached epoch 1000.
+  lr: 0.0003
+  lr_milestone: [60, 120]   # singular; the experiment driver reads this exact key
   plot_frequency: 1
   epochs: 5000
   accumulate_grad_batches: 1
@@ -52,13 +58,29 @@ model_config:
     # (the posterior log-variance is a zero-init residual around the prior) and grows only as the
     # source pathway earns it, and the anchor KL support drops the last `horizon` steps from the
     # denominator -- both change the natural KL scale.
+    #
+    # Do NOT retune `end` down to the 1e-3 scale. The 2026-07 baseline ran with end: 0.001 and,
+    # after a finite optimizer blow-up at epoch 79, settled permanently into the equilibrium this
+    # architecture exists to forbid: baseline wrecked (pred_gap 1-3), target information laundered
+    # through the latent (kld_raw tripled and kept rising for 75 epochs, every dim active, delta
+    # heads saturating) while shuffle_penalty stayed ~0 -- i.e. the extra KL was not source-
+    # specific. At beta ~ 1e-3 the KL term (~0.002 nats against a feat loss of ~3.5) provides no
+    # restoring force out of that basin.
     beta_schedule:
       kind: linear_warmup
       start: 1.0e-4
       end: 0.1
       warmup_epochs: 50
     kld_beta: 0.001        # fallback when beta_schedule.kind == constant
-    free_bits: 0.1         # nats per latent dim per step; 0.0 disables
+    # nats per latent dim per step; 0.0 disables. Lowered 0.1 -> 0.01 after the 2026-07 baseline:
+    # 0.1/dim x d_z=24 = 2.4 nats/step is a hard FLOOR the optimiser is rewarded for filling
+    # whether or not the divergence is source-driven or predictive -- a laundering subsidy. That
+    # run posted kld_raw ~8 nats/step with pred_gap ~0.006 and shuffle_penalty ~0.006 (the latent
+    # diverged strongly but was neither predictive nor source-specific). A small floor still guards
+    # against total early collapse (with the zero-KL-at-init design and the beta warmup, collapse
+    # risk is low) without subsidising 2.4 nats of source-agnostic KL. Retune against kld_raw and
+    # the prediction-space control (feat_loss < base_loss < feat_loss_shuffled).
+    free_bits: 0.01
 
     # --- Reconstruction likelihood --------------------------------------------
     # `sigma_obs: learned` makes the loss consume the decoder logvar_full/logvar_base heads, giving
@@ -274,7 +296,8 @@ advanced_config:
     rotation: "100 MB"
     retention: "14 days"
 
-  # Loss-spike circuit breaker, deliberately configured as a NON-FINITE GUARD ONLY.
+  # Loss-spike circuit breaker: NON-FINITE GUARD plus a sign-agnostic ADDITIVE spike test.
+  # The RELATIVE test stays off.
   #
   # The breaker's relative test is `watched > multiplier * max(EMA, ema_floor)`, which assumes a
   # loss bounded below by zero. This model's main_loss is a Gaussian NLL with a learned observation
@@ -285,28 +308,34 @@ advanced_config:
   # skips 4 of 4 and logs -0.5 for each. The EMA only updates on accepted batches, so it stays
   # negative and the bias persists: the run silently drops its hardest batches. No value of
   # ema_floor fixes this -- a negative floor makes the threshold negative and skips nearly
-  # everything; 0.0 is as good as the relative test gets here.
+  # everything; 0.0 is as good as the relative test gets here. So ema_floor is set far above any
+  # reachable loss, which switches the relative test off.
+  #
+  # What that alone cost was measured on the 2026-07 baseline: a FINITE blow-up (epoch 79,
+  # main_loss ~ -0.5 -> +4..+10 within one epoch, no NaN anywhere in the run) sailed through --
+  # the non-finite guard had nothing to catch and the only test that could have fired was
+  # disabled. The run never recovered. `additive_margin` closes exactly that gap: skip when
+  # `watched > EMA + margin`, compared against the RAW EMA, not the floored one, so it works in
+  # the negative-NLL regime. The margin is in nats of main_loss: healthy epoch-to-epoch
+  # fluctuation on that run was ~ +/-0.3 around an EMA of ~ -0.5, while the blow-up batches
+  # landed 5-10 above it, so 3.0 is ~10x the noise and ~2x below the crash -- it cannot trip on
+  # the sign crossing (an ordinary +0.3 batch needs EMA + 3.0 > +2.5 to be skipped) and it
+  # catches the event this run actually had. A deliberate regime shift (the beta ramp) moves
+  # main_loss by well under 3 nats per EMA timescale, so it does not trip either.
   #
   # (The trainer this replaced gated on `ema_before > 0.0`, so its breaker simply went inert once
   # the EMA turned negative. It was never protecting a negative-loss run either.)
-  #
-  # So: ema_floor is set far above any reachable loss, which switches the relative test off. The
-  # non-finite check does not consult the threshold at all, so NaN/inf still trigger the
-  # zero-gradient skip -- and that is the protection worth keeping, because it is what stops a NaN
-  # loss writing NaN gradients into the weights. What is given up is detection of a *positive*
-  # blow-up during early training while the EMA is still positive.
-  #
-  # Revisit once the real sign and scale of main_loss have been measured at production scale: if it
-  # stays positive throughout, a real ema_floor and relative detection become usable again.
   spike_breaker:
     enabled: true
     multiplier: 5.0
     ema_decay: 0.02        # EMA smoothing (smaller = longer memory); reported, not acted on
     warmup_batches: 100    # priming window before gating activates
     comparison_metric: main_loss
-    # >> any reachable loss: relative detection off, NaN/inf guard on. The exponent sign is not
-    # decoration -- YAML parses `1.0e9` as a string, which validate_config rejects as not a float.
+    # >> any reachable loss: relative detection off. The exponent sign is not decoration -- YAML
+    # parses `1.0e9` as a string, which validate_config rejects as not a float.
     ema_floor: 1.0e+9
+    # Sign-agnostic finite-spike detection: skip when watched > EMA + margin (nats). 0 disables.
+    additive_margin: 3.0
     # Escape hatch: after this many CONSECUTIVE skips, force-accept the next finite-loss batch and
     # hard-re-seed the EMA to it. 0 disables the hatch.
     max_consecutive_skips: 25

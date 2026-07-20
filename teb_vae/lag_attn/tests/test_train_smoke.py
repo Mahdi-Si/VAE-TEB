@@ -171,7 +171,7 @@ def test_the_first_epochs_lr_cell_is_nan_and_the_rest_are_not(fit):
     frame = pd.read_csv(Path(driver.train_results_dir) / "metrics_history.csv")
 
     assert math.isnan(float(frame["lr"].iloc[0]))
-    assert float(frame["lr"].iloc[1]) == pytest.approx(0.001)
+    assert float(frame["lr"].iloc[1]) == pytest.approx(0.0003)  # general_config.lr via tiny->default
 
 
 def test_the_checkpoint_is_written_to_the_run_checkpoint_directory(fit):

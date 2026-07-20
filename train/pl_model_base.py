@@ -393,6 +393,13 @@ class LightningModelBase(L.LightningModule, ABC):
           accepted batches so a skipped spike never pollutes the baseline.
         * ``ema_floor`` ($0.0$) — floor on the comparison base only, so a collapsed EMA
           cannot make the threshold unreachably small.
+        * ``additive_margin`` ($0.0$ = off) — when positive, also spike when
+          $\ell > \mathrm{EMA} + \mathrm{additive\_margin}$. Unlike the relative test this
+          is sign-agnostic: it compares against the raw EMA, not the floored one, so it
+          keeps working when the watched loss is a negative NLL — the regime in which the
+          relative test degenerates (``max(EMA, floor)`` stops tracking the EMA) and is
+          therefore disabled via a huge ``ema_floor``. $0.0$ disables the test rather than
+          meaning "any batch above the EMA", since half of all healthy batches land there.
         * ``warmup_batches`` ($100$) — never skip during the first this-many batches
           (the EMA has not stabilised yet).
         * ``max_consecutive_skips`` ($25$) — after this many consecutive skips,
@@ -415,6 +422,7 @@ class LightningModelBase(L.LightningModule, ABC):
         multiplier = float(cfg.get("multiplier", 5.0))
         ema_decay = float(cfg.get("ema_decay", 0.02))
         ema_floor = float(cfg.get("ema_floor", 0.0))
+        additive_margin = float(cfg.get("additive_margin", 0.0))
         warmup_batches = int(cfg.get("warmup_batches", 100))
         max_consecutive_skips = int(cfg.get("max_consecutive_skips", 25))
         comparison_metric = str(cfg.get("comparison_metric", "total_loss"))
@@ -438,7 +446,11 @@ class LightningModelBase(L.LightningModule, ABC):
         self._spike_batches_seen += 1
         ema_before = self._spike_ema_loss
 
-        # Local skip decision.
+        # Local skip decision. The two finite tests are independent and OR-ed: the relative
+        # test compares against the *floored* EMA (its threshold must stay reachable when the
+        # EMA collapses toward zero), while the additive test compares against the *raw* EMA
+        # (its whole point is to keep working when the EMA is negative, where the floor makes
+        # the relative test either degenerate or inert).
         if is_nonfinite:
             is_spike_local = True
         elif self._spike_batches_seen <= warmup_batches or ema_before is None:
@@ -446,6 +458,8 @@ class LightningModelBase(L.LightningModule, ABC):
         else:
             ema_ref = max(ema_before, ema_floor)
             is_spike_local = loss_value > multiplier * ema_ref
+            if additive_margin > 0.0:
+                is_spike_local = is_spike_local or (loss_value > ema_before + additive_margin)
 
         # Skip if ANY rank skips (MAX): ranks must agree so their optimizer steps stay
         # in lockstep under DDP.
