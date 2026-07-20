@@ -65,10 +65,210 @@ _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.
 if not __package__ and _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
-from model.vae_teb_prediction.model.model_raw.testing.causal_te_validation.events import (  # noqa: E402
-    detect_contractions,
-    detect_decelerations,
-)
+try:
+    from scipy.signal import find_peaks, savgol_filter
+except Exception:  # pragma: no cover - scipy is a hard dependency elsewhere in the repo
+    find_peaks = None  # type: ignore[assignment]
+    savgol_filter = None  # type: ignore[assignment]
+
+
+# --- Event detectors (vendored) ---------------------------------------------------------------
+# The contraction and deceleration detectors below are vendored verbatim from
+# ``model/vae_teb_prediction/model/model_raw/testing/causal_te_validation/events.py`` (the
+# causal-TE validation suite's detectors), so the event definitions match that suite exactly.
+# They are copied rather than imported because importing that module triggers its package
+# ``__init__``, which has a circular import that fails outside a full test run -- and because this
+# eval package is otherwise free of any dependency on the deprecated ``model/`` tree. The only
+# dependency here is scipy (already a hard dep), with the same graceful fallback.
+
+
+def _smooth(x: np.ndarray, *, window: int, poly: int = 3) -> np.ndarray:
+    """Savitzky-Golay smoothing with a robust fallback when scipy is missing.
+
+    Args:
+        x: 1-D signal.
+        window: Smoothing window in samples (made odd; clipped to length).
+        poly: Polynomial order (must be < window).
+
+    Returns:
+        Smoothed signal of identical shape.
+    """
+    if savgol_filter is None or x.size < max(window, poly + 2):
+        return np.asarray(x, dtype=np.float32)
+    w = int(window)
+    if w % 2 == 0:
+        w += 1
+    w = max(w, poly + 2 + (1 if (poly + 2) % 2 == 0 else 0))
+    if w >= x.size:
+        return np.asarray(x, dtype=np.float32)
+    smoothed = savgol_filter(np.asarray(x, dtype=np.float32), w, poly)
+    return np.asarray(smoothed, dtype=np.float32)
+
+
+def _drop_edge_events(indices: np.ndarray, *, n_raw: int, edge_lo: int, edge_hi: int) -> np.ndarray:
+    """Remove events within ``edge_lo``/``edge_hi`` samples of the trace ends."""
+    if indices.size == 0:
+        return indices
+    keep = (indices >= edge_lo) & (indices < (n_raw - edge_hi))
+    return indices[keep]
+
+
+def _to_1d(x: np.ndarray) -> np.ndarray:
+    """Coerce an arbitrary-shape array to 1-D by averaging any non-time axes."""
+    arr = np.asarray(x, dtype=np.float32)
+    if arr.ndim == 1:
+        return arr
+    if arr.ndim == 2:
+        return arr.mean(axis=0).astype(np.float32)
+    return arr.reshape(-1, arr.shape[-1]).mean(axis=0).astype(np.float32)
+
+
+def detect_contractions(
+    up_raw: np.ndarray,
+    fs: float = 4.0,
+    *,
+    smooth_seconds: float = 10.0,
+    min_distance_seconds: float = 60.0,
+    min_width_seconds: float = 20.0,
+    prominence_sigma: float = 0.5,
+    edge_seconds: float = 30.0,
+) -> Dict[str, np.ndarray]:
+    r"""Detect uterine-contraction events on the raw UP trace.
+
+    Smooths the trace, finds local maxima with ``distance=60 s``, ``width=20 s`` and
+    ``prominence=0.5 \sigma``, then estimates each rising-edge ``onset_raw`` by walking back from
+    the peak until the smoothed gradient drops below the 80th percentile of positive gradients.
+
+    Args:
+        up_raw: Raw UP signal $(R,)$ at ``fs`` Hz.
+        fs: Sampling rate in Hz.
+        smooth_seconds: Savitzky-Golay window in seconds.
+        min_distance_seconds: Minimum spacing between peaks.
+        min_width_seconds: Minimum peak width at half-prominence.
+        prominence_sigma: Required prominence in units of $\sigma$ of the smoothed UP.
+        edge_seconds: Drop events within this many seconds of either end.
+
+    Returns:
+        ``{"onset_raw", "peak_raw", "end_raw"}`` of int64 raw-sample indices (empty when none).
+    """
+    sig = _to_1d(up_raw)
+    n = int(sig.size)
+    empty = {"onset_raw": np.empty(0, dtype=np.int64),
+             "peak_raw":  np.empty(0, dtype=np.int64),
+             "end_raw":   np.empty(0, dtype=np.int64)}
+    if n < int(60 * fs) or find_peaks is None:
+        return empty
+
+    smooth_w = max(int(round(smooth_seconds * fs)), 5)
+    smooth = _smooth(sig, window=smooth_w, poly=3)
+    sig_std = float(np.nanstd(smooth)) or 1.0
+
+    distance = max(int(round(min_distance_seconds * fs)), 1)
+    width = max(int(round(min_width_seconds * fs)), 1)
+    prominence = float(prominence_sigma) * sig_std
+
+    peaks, _ = find_peaks(smooth, distance=distance, prominence=prominence, width=width)
+    edge = int(round(edge_seconds * fs))
+    peaks = _drop_edge_events(np.asarray(peaks, dtype=np.int64), n_raw=n, edge_lo=edge, edge_hi=edge)
+    if peaks.size == 0:
+        return empty
+
+    grad = np.gradient(smooth).astype(np.float32)
+    pos_grad = grad[grad > 0]
+    grad_thresh = float(np.percentile(pos_grad, 80)) if pos_grad.size > 0 else 0.0
+    onsets = np.empty_like(peaks)
+    ends = np.empty_like(peaks)
+    look_back = int(round(60.0 * fs))
+    look_fwd = int(round(60.0 * fs))
+    for i, p in enumerate(peaks):
+        lo = max(0, int(p) - look_back)
+        idx = int(p)
+        while idx > lo and grad[idx] >= grad_thresh:
+            idx -= 1
+        onsets[i] = idx
+        hi = min(n - 1, int(p) + look_fwd)
+        idx = int(p)
+        while idx < hi and grad[idx] <= -grad_thresh:
+            idx += 1
+        ends[i] = idx
+
+    return {"onset_raw": onsets, "peak_raw": peaks, "end_raw": ends}
+
+
+def detect_decelerations(
+    fhr_raw: np.ndarray,
+    fs: float = 4.0,
+    *,
+    smooth_seconds: float = 8.0,
+    min_distance_seconds: float = 15.0,
+    prominence_bpm: float = 10.0,
+    prominence_sigma: float = 0.3,
+    edge_seconds: float = 30.0,
+) -> Dict[str, np.ndarray]:
+    r"""Detect FHR-deceleration events (downward dips) on the raw FHR trace.
+
+    Decelerations are local minima, so the detector inverts the smoothed signal and calls
+    ``find_peaks``. The prominence threshold is the max of an absolute bpm threshold (used when the
+    signal looks like raw bpm) and a $\sigma$-relative threshold, so it works on bpm and z-scored
+    signals alike.
+
+    Args:
+        fhr_raw: Raw FHR signal $(R,)$ at ``fs`` Hz.
+        fs: Sampling rate in Hz.
+        smooth_seconds: Savitzky-Golay window in seconds.
+        min_distance_seconds: Minimum spacing between deceleration nadirs.
+        prominence_bpm: Prominence in bpm when the signal looks like raw bpm.
+        prominence_sigma: Prominence in units of $\sigma$.
+        edge_seconds: Drop events within this many seconds of either end.
+
+    Returns:
+        ``{"onset_raw", "nadir_raw", "end_raw"}`` of int64 raw-sample indices (empty when none).
+    """
+    sig = _to_1d(fhr_raw)
+    n = int(sig.size)
+    empty = {"onset_raw": np.empty(0, dtype=np.int64),
+             "nadir_raw": np.empty(0, dtype=np.int64),
+             "end_raw":   np.empty(0, dtype=np.int64)}
+    if n < int(30 * fs) or find_peaks is None:
+        return empty
+
+    smooth_w = max(int(round(smooth_seconds * fs)), 5)
+    smooth = _smooth(sig, window=smooth_w, poly=3)
+    sig_std = float(np.nanstd(smooth)) or 1.0
+    sig_max = float(np.nanmax(np.abs(smooth))) if smooth.size else 0.0
+    looks_like_bpm = sig_max > 30.0  # FHR in bpm is centred near 140
+
+    prominence = max(
+        float(prominence_bpm) if looks_like_bpm else 0.0,
+        float(prominence_sigma) * sig_std,
+    )
+    distance = max(int(round(min_distance_seconds * fs)), 1)
+
+    inv = -smooth
+    nadirs, _ = find_peaks(inv, distance=distance, prominence=prominence)
+    edge = int(round(edge_seconds * fs))
+    nadirs = _drop_edge_events(np.asarray(nadirs, dtype=np.int64), n_raw=n, edge_lo=edge, edge_hi=edge)
+    if nadirs.size == 0:
+        return empty
+
+    grad = np.gradient(smooth).astype(np.float32)
+    look_back = int(round(60.0 * fs))
+    look_fwd = int(round(60.0 * fs))
+    onsets = np.empty_like(nadirs)
+    ends = np.empty_like(nadirs)
+    for i, t in enumerate(nadirs):
+        lo = max(0, int(t) - look_back)
+        idx = int(t)
+        while idx > lo and grad[idx] <= 0:
+            idx -= 1
+        onsets[i] = idx
+        hi = min(n - 1, int(t) + look_fwd)
+        idx = int(t)
+        while idx < hi and grad[idx] >= 0:
+            idx += 1
+        ends[i] = idx
+
+    return {"onset_raw": onsets, "nadir_raw": nadirs, "end_raw": ends}
 
 # The physiological contraction->deceleration delay is 20-120 s; the -20 s UP pre-shift adds ~20 s to
 # the *detected* lag, so the response window is widened to 20-160 s post-onset. The pre window is the
