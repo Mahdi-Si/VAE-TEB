@@ -57,7 +57,7 @@ import json
 import os
 import sys
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple, cast
 
 import numpy as np
 
@@ -102,6 +102,11 @@ class ProbeConfig:
         seed: RNG seed for the guid split, the row subsample, and the shuffle control.
         eval_frac: Fraction of recordings held out for scoring.
         val_frac: Fraction of the fit recordings held out to select the ridge penalty.
+        event_channel: Source channel used as the contraction-activity proxy. Default $0$ is
+            ``up_st``'s S0 low-pass (the only non-log channel), i.e. the UP envelope.
+        event_percentile: Anchors whose recent activity is at/above this per-eval quantile form the
+            "near a contraction" subset the event-conditioned readout scores.
+        event_window: Number of recent steps averaged into the anchor's activity score.
     """
 
     hist_lags: Tuple[int, ...] = _DEFAULT_HIST_LAGS
@@ -112,6 +117,9 @@ class ProbeConfig:
     seed: int = 0
     eval_frac: float = 0.3
     val_frac: float = 0.2
+    event_channel: int = 0
+    event_percentile: float = 0.7
+    event_window: int = 3
 
 
 @dataclass
@@ -233,7 +241,7 @@ def _cat_fields(item: object, names: Sequence[str]) -> np.ndarray:
 # --- Design-matrix construction ---------------------------------------------------------------
 def build_design(
     samples: Sequence[Sample], config: ProbeConfig
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     r"""Assemble anchor-wise regression matrices from a list of recordings.
 
     For every valid anchor $t$ in every recording it stacks the lagged target history, the lagged
@@ -247,11 +255,12 @@ def build_design(
         config: The lag sets, horizon offsets and warm-up.
 
     Returns:
-        ``(x_hist, x_up, y_future, group)``: the baseline design $(N, |hist|\,c_y)$, the source
-        design $(N, |up|\,c_u)$, the target block $(N, |off|\,c_y)$, and a per-row integer group id
-        $(N,)$ that ties each anchor to its recording (so the shuffle control can permute across
-        recordings only). ``x_hist`` and ``y_future`` are non-finite-scrubbed to zero, which is the
-        normalised mean.
+        ``(x_hist, x_up, y_future, group, activity)``: the baseline design $(N, |hist|\,c_y)$, the
+        source design $(N, |up|\,c_u)$, the target block $(N, |off|\,c_y)$, a per-row integer group
+        id $(N,)$ that ties each anchor to its recording (so the shuffle control can permute across
+        recordings only), and the per-anchor UP activity $(N,)$ (a causal rolling mean of the
+        envelope channel) that the event-conditioned readout thresholds. ``x_hist`` and
+        ``y_future`` are non-finite-scrubbed to zero, which is the normalised mean.
 
     Raises:
         ValueError: If no valid anchor exists across all samples (e.g. lags longer than the
@@ -267,11 +276,20 @@ def build_design(
     up_rows: List[np.ndarray] = []
     fut_rows: List[np.ndarray] = []
     group_rows: List[np.ndarray] = []
+    activity_rows: List[np.ndarray] = []
+    event_channel = int(config.event_channel)
+    event_window = max(1, int(config.event_window))
 
     for group_id, sample in enumerate(samples):
         seq_len = sample.y.shape[0]
         y = np.nan_to_num(sample.y, nan=0.0, posinf=0.0, neginf=0.0)
         u = np.nan_to_num(sample.u, nan=0.0, posinf=0.0, neginf=0.0)
+
+        # Per-step UP activity: a causal rolling mean of the envelope channel, so an anchor's score
+        # reflects only its own recent past (never the future it is asked to predict).
+        channel = event_channel if event_channel < u.shape[1] else 0
+        kernel = np.ones(event_window, dtype=np.float32) / float(event_window)
+        activity_t = np.convolve(u[:, channel], kernel, mode="full")[:seq_len]
         valid = sample.weight > 0.0
         if valid.shape[0] != seq_len:  # a defensive guard; the loader keeps these aligned
             valid = np.ones(seq_len, dtype=bool)
@@ -302,6 +320,7 @@ def build_design(
         up_rows.append(src)
         fut_rows.append(fut)
         group_rows.append(np.full(n, group_id, dtype=np.int64))
+        activity_rows.append(activity_t[anchors])
 
     if not hist_rows:
         raise ValueError(
@@ -314,6 +333,7 @@ def build_design(
         np.concatenate(up_rows, axis=0),
         np.concatenate(fut_rows, axis=0),
         np.concatenate(group_rows, axis=0),
+        np.concatenate(activity_rows, axis=0),
     )
 
 
@@ -411,6 +431,86 @@ def _per_offset_mse(pred: np.ndarray, target: np.ndarray, n_offsets: int) -> np.
     return np.mean((p - t) ** 2, axis=(0, 2))
 
 
+def _event_conditioned_refit(
+    x_hist: np.ndarray,
+    x_up: np.ndarray,
+    y_future: np.ndarray,
+    group: np.ndarray,
+    activity: np.ndarray,
+    config: ProbeConfig,
+    rng: np.random.Generator,
+) -> Dict[str, object]:
+    r"""Refit and score the probe on the high-UP-activity (near-contraction) anchors only.
+
+    Filters all anchors to those whose recent UP activity is at or above the ``event_percentile``
+    quantile, then runs the full split/fit/score pipeline on that subset alone. A source
+    contribution confined to contractions dilutes over all anchors but is recoverable when both the
+    fit and the score are restricted to those anchors -- refitting (rather than scoring the global
+    fit on a subset) is what lets a temporally sparse coupling show, since the global fit is
+    calibrated to the average activity and underfits the high-activity regime.
+
+    Args:
+        x_hist: Baseline design $(N, P_h)$.
+        x_up: Source design $(N, P_u)$.
+        y_future: Target block $(N, K)$.
+        group: Per-row recording id $(N,)$.
+        activity: Per-row UP activity $(N,)$.
+        config: The probe configuration (``event_percentile`` and ``event_channel``).
+        rng: RNG for the subset's split and shuffle control.
+
+    Returns:
+        A JSON-serialisable summary of the event subset: its size, threshold, matched/shuffled
+        pooled uplift, their gap, and the best channel's matched/shuffled uplift. ``n_event_rows``
+        carries the subset size; the metrics are ``0.0``/``-1`` when the subset is too small or has
+        too few recordings to split.
+    """
+    threshold = float(np.quantile(activity, config.event_percentile))
+    mask = activity >= threshold
+    n_event = int(mask.sum())
+    empty = {
+        "event_channel": int(config.event_channel),
+        "activity_percentile": float(config.event_percentile),
+        "activity_threshold": threshold,
+        "n_event_rows": n_event,
+        "uplift_rel_matched": 0.0,
+        "uplift_rel_shuffled": 0.0,
+        "uplift_gap": 0.0,
+        "best_channel": -1,
+        "best_channel_uplift_matched": 0.0,
+        "best_channel_uplift_shuffled": 0.0,
+        "matched_beats_shuffled": False,
+    }
+    # Need enough anchors and enough distinct recordings to survive a by-recording split.
+    if n_event < 200 or np.unique(group[mask]).size < 4:
+        return empty
+
+    try:
+        res = _score_design(x_hist[mask], x_up[mask], y_future[mask], group[mask], config, rng)
+    except ValueError:
+        return empty
+
+    per_channel = res["per_channel"]
+    best = per_channel[0] if per_channel else {  # type: ignore[index]
+        "channel": -1, "uplift_rel_matched": 0.0, "uplift_rel_shuffled": 0.0,
+    }
+    matched = float(res["uplift_rel"])  # type: ignore[arg-type]
+    shuffled = float(res["uplift_shuffled_rel"])  # type: ignore[arg-type]
+    return {
+        "event_channel": int(config.event_channel),
+        "activity_percentile": float(config.event_percentile),
+        "activity_threshold": threshold,
+        "n_event_rows": n_event,
+        "uplift_rel_matched": matched,
+        "uplift_rel_shuffled": shuffled,
+        "uplift_gap": matched - shuffled,
+        "best_channel": int(best["channel"]),
+        "best_channel_uplift_matched": float(best["uplift_rel_matched"]),
+        "best_channel_uplift_shuffled": float(best["uplift_rel_shuffled"]),
+        # The specificity signal: matched clearly beats a stranger's source on these anchors.
+        "matched_beats_shuffled": bool(matched > shuffled + 0.01),
+    }
+
+
 # --- Orchestration ----------------------------------------------------------------------------
 def run_probe(samples: Sequence[Sample], config: ProbeConfig) -> Dict[str, object]:
     r"""Fit the baseline and full regressors and return the uplift, per-offset and shuffle results.
@@ -428,21 +528,64 @@ def run_probe(samples: Sequence[Sample], config: ProbeConfig) -> Dict[str, objec
         ValueError: If the fit or eval split ends up empty (too few recordings for ``eval_frac``).
     """
     rng = np.random.default_rng(config.seed)
-    x_hist, x_up, y_future, group = build_design(samples, config)
+    x_hist, x_up, y_future, group, activity = build_design(samples, config)
 
-    # Optional row cap: subsample anchors uniformly to bound the solve, keeping group ids aligned.
+    # Optional row cap: subsample anchors uniformly to bound the solve, keeping arrays aligned.
     if x_hist.shape[0] > config.max_rows:
         pick = rng.choice(x_hist.shape[0], size=config.max_rows, replace=False)
-        x_hist, x_up, y_future, group = x_hist[pick], x_up[pick], y_future[pick], group[pick]
+        x_hist, x_up, y_future, group, activity = (
+            x_hist[pick], x_up[pick], y_future[pick], group[pick], activity[pick],
+        )
 
-    # Split by recording (group), never by anchor: anchors from one recording are correlated, so an
-    # anchor-level split would leak the eval distribution into the fit and inflate every number.
+    results = _score_design(x_hist, x_up, y_future, group, config, rng)
+
+    # Event-conditioned readout: REFIT the whole probe on near-contraction anchors only (high recent
+    # UP activity). A source contribution confined to contractions dilutes over all anchors but is
+    # recoverable when the fit and the score are both restricted to those anchors. Refitting (rather
+    # than scoring the global fit on a subset) is what lets a temporally sparse coupling show: the
+    # global fit is calibrated to the average activity and underfits the high-activity regime.
+    results["event_conditioned"] = _event_conditioned_refit(
+        x_hist, x_up, y_future, group, activity, config, rng
+    )
+    return results
+
+
+def _score_design(
+    x_hist: np.ndarray,
+    x_up: np.ndarray,
+    y_future: np.ndarray,
+    group: np.ndarray,
+    config: ProbeConfig,
+    rng: np.random.Generator,
+) -> Dict[str, object]:
+    r"""Split by recording, fit the baseline and full ridge, and score the uplift and controls.
+
+    The reusable core of the probe: :func:`run_probe` calls it once on all anchors and again on the
+    near-contraction subset. Splitting is by recording (``group``), never by anchor, because anchors
+    from one recording are correlated and an anchor-level split would leak the eval distribution into
+    the fit.
+
+    Args:
+        x_hist: Baseline design $(N, P_h)$.
+        x_up: Source design $(N, P_u)$.
+        y_future: Target block $(N, K)$.
+        group: Per-row recording id $(N,)$.
+        config: The probe configuration.
+        rng: RNG for the split and the shuffle control.
+
+    Returns:
+        The pooled/per-offset/per-channel metrics, the shuffle control, the selected ridge
+        penalties, the counts, and the ``verdict``.
+
+    Raises:
+        ValueError: If the fit or eval split ends up empty (too few recordings for ``eval_frac``).
+    """
     groups = np.unique(group)
     rng.shuffle(groups)
     n_eval = max(1, int(round(config.eval_frac * groups.size)))
     if groups.size - n_eval < 1:
         raise ValueError(
-            f"only {groups.size} recording(s) after the row cap; need >= 2 for a fit/eval split"
+            f"only {groups.size} recording(s); need >= 2 for a fit/eval split"
         )
     eval_groups = set(groups[:n_eval].tolist())
     fit_val_groups = groups[n_eval:]
@@ -531,9 +674,8 @@ def run_probe(samples: Sequence[Sample], config: ProbeConfig) -> Dict[str, objec
     localized = (uplift_c >= _UPLIFT_REL_FLOOR) & (uplift_c >= 2.0 * np.clip(uplift_shuffled_c, 0.0, None))
     best_channel = int(np.argmax(uplift_c))
 
-    verdict = _verdict(uplift_rel, uplift_shuffled_rel)
     return {
-        "verdict": verdict,
+        "verdict": _verdict(uplift_rel, uplift_shuffled_rel),
         "uplift_rel": float(uplift_rel),
         "uplift_abs": float(uplift_abs),
         "uplift_shuffled_rel": float(uplift_shuffled_rel),
@@ -624,7 +766,7 @@ def nonlinear_uplift(samples: Sequence[Sample], config: ProbeConfig) -> Optional
         return None
 
     rng = np.random.default_rng(config.seed)
-    x_hist, x_up, y_future, group = build_design(samples, config)
+    x_hist, x_up, y_future, group, _activity = build_design(samples, config)
     if x_hist.shape[0] > config.max_rows:
         pick = rng.choice(x_hist.shape[0], size=config.max_rows, replace=False)
         x_hist, x_up, y_future, group = x_hist[pick], x_up[pick], y_future[pick], group[pick]
@@ -704,6 +846,22 @@ def format_report(results: Dict[str, object], nonlinear: Optional[Dict[str, floa
             f"{row['uplift_rel_shuffled']*100:+7.2f} %     {row['mse_base']:.5f}"
         )
 
+    event = results.get("event_conditioned")
+    if isinstance(event, dict) and int(event.get("n_event_rows", 0)) > 0:
+        lines.append("")
+        lines.append(
+            f"  event-conditioned (near-contraction anchors: UP ch {event['event_channel']} "
+            f">= p{int(event['activity_percentile']*100)}, n={event['n_event_rows']}):"
+        )
+        lines.append(f"     pooled uplift  matched / shuffled  = "
+                     f"{float(event['uplift_rel_matched'])*100:+.3f} % / "
+                     f"{float(event['uplift_rel_shuffled'])*100:+.3f} %")
+        lines.append(f"     best channel {int(event['best_channel'])}: matched / shuffled  = "
+                     f"{float(event['best_channel_uplift_matched'])*100:+.2f} % / "
+                     f"{float(event['best_channel_uplift_shuffled'])*100:+.2f} %")
+        if event.get("matched_beats_shuffled"):
+            lines.append("     -> matched beats shuffled here: a temporally sparse source signal.")
+
     if nonlinear is not None:
         lines.append("")
         lines.append(
@@ -749,45 +907,71 @@ def _verdict_gloss(verdict: str) -> str:
 
 # --- Self-test (no dataset required) ----------------------------------------------------------
 def _fabricate_samples(
-    *, coupled: bool, n_records: int, seq_len: int, rng: np.random.Generator, n_target_channels: int = 6
+    *,
+    coupled: bool,
+    n_records: int,
+    seq_len: int,
+    rng: np.random.Generator,
+    n_target_channels: int = 6,
+    event_gated: bool = False,
 ) -> List[Sample]:
     r"""Fabricate recordings with or without a known injected UP$\to$FHR coupling.
 
-    The target is a per-channel AR(1) process (strong self-predictability, like FHR). When
-    ``coupled``, the *future* of exactly two target channels is driven by the source at a known lag,
-    so a correctly built probe must find held-out uplift that vanishes under the shuffle control.
-    With a large ``n_target_channels`` this is the *dilution* case: only 2 of many channels carry
-    the signal, so the pooled uplift washes out while the per-channel view must still surface
-    channels 0 and 1. When not ``coupled``, the source is independent noise and the uplift must stay
-    at ~0.
+    The target is a per-channel AR(1) process (strong self-predictability, like FHR).
+
+    * ``coupled`` (always-on): the *future* of two target channels is driven by the source at a
+      known lag, so the probe must find held-out uplift that vanishes under the shuffle control.
+    * large ``n_target_channels`` (dilution): only 2 of many channels carry the signal, so the
+      pooled uplift washes out while the per-channel view must still surface channels 0 and 1.
+    * ``event_gated`` (temporally sparse): the coupling fires only while a slow "contraction"
+      envelope on source channel 0 is high, so the pooled-over-all-anchors uplift dilutes while the
+      event-conditioned readout (which selects high-activity anchors) concentrates it.
+    * not ``coupled``: the source is independent noise and the uplift must stay at ~0.
 
     Args:
         coupled: Whether to inject the source->target dependence.
         n_records: Number of recordings to fabricate.
         seq_len: Sequence length $T$.
         rng: RNG.
-        n_target_channels: Number of target channels; only channels 0 and 1 ever carry the signal,
-            so a large value dilutes the pooled uplift.
+        n_target_channels: Number of target channels; only channels 0 and 1 ever carry the signal.
+        event_gated: Gate the coupling by a slow envelope on source channel 0 (the event channel),
+            making it temporally sparse.
 
     Returns:
         The fabricated samples.
     """
     c_y, c_u = int(n_target_channels), 4
-    inject_lag = 12          # source acts on the target this many steps later
-    ar = 0.85                # target self-persistence
-    coupling = 0.6           # weight of the injected source term
+    inject_lag = 12                       # source acts on the target this many steps later
+    ar = 0.85                             # target self-persistence
+    coupling = 1.0 if event_gated else 0.6
+    period = 25                           # contraction recurrence, in steps (event_gated only)
 
     samples: List[Sample] = []
+    steps = np.arange(seq_len, dtype=np.float32)
     for record in range(n_records):
         u = rng.standard_normal((seq_len, c_u)).astype(np.float32)
+        if event_gated:
+            # Recurring "contraction" bursts (a binary on/off gate) on the event channel (0). The
+            # coupling is additive while a burst is on, so refitting on high-activity anchors -- where
+            # the gate is on -- recovers it cleanly, while it dilutes over all anchors.
+            phase = float(rng.uniform(0.0, 2.0 * np.pi))
+            env = (np.sin(2.0 * np.pi * steps / period + phase) > 0.6).astype(np.float32)
+            u[:, 0] = env + 0.05 * rng.standard_normal(seq_len).astype(np.float32)
+        else:
+            env = np.ones(seq_len, dtype=np.float32)
+
         y = np.zeros((seq_len, c_y), dtype=np.float32)
         noise = 0.3 * rng.standard_normal((seq_len, c_y)).astype(np.float32)
         for t in range(1, seq_len):
             y[t] = ar * y[t - 1] + noise[t]
             if coupled and t - inject_lag >= 0:
-                # Route the first source channel into the first two target channels at a fixed lag.
-                y[t, 0] += coupling * u[t - inject_lag, 0]
-                y[t, 1] += coupling * u[t - inject_lag, 1]
+                if event_gated:
+                    # Carriers on channels 1,2; gated by the contraction envelope at target time.
+                    y[t, 0] += coupling * env[t] * u[t - inject_lag, 1]
+                    y[t, 1] += coupling * env[t] * u[t - inject_lag, 2]
+                else:
+                    y[t, 0] += coupling * u[t - inject_lag, 0]
+                    y[t, 1] += coupling * u[t - inject_lag, 1]
         weight = np.ones(seq_len, dtype=np.float32)
         samples.append(Sample(y=y, u=u, weight=weight, guid=f"rec{record}"))
     return samples
@@ -821,10 +1005,17 @@ def self_test() -> int:
         _fabricate_samples(coupled=True, n_records=40, seq_len=200, rng=rng, n_target_channels=40),
         config,
     )
+    # Temporal sparsity: the coupling fires only during contractions, so the all-anchor uplift
+    # dilutes while the event-conditioned readout must concentrate it.
+    gated = run_probe(
+        _fabricate_samples(coupled=True, n_records=60, seq_len=240, rng=rng, event_gated=True),
+        config,
+    )
 
     print(format_report(coupled, None))
     print(format_report(null, None))
     print(format_report(diluted, None))
+    print(format_report(gated, None))
 
     ok = True
     if coupled["verdict"] != "coupling_present":
@@ -846,6 +1037,21 @@ def self_test() -> int:
         ok = False
     if not {0, 1} <= top_channels:
         print(f"FAIL: per-channel probe did not surface the injected channels; top4={top_channels}")
+        ok = False
+    # Event-conditioning refits on near-contraction anchors and must flag the source as specific
+    # there (matched beats shuffled) on gated data, while NOT flagging it on the null. That the
+    # readout distinguishes the two is the property under test; the absolute pooled uplift is
+    # confounded across subsets by their differing baseline variance and is not asserted.
+    event = cast(Dict[str, object], gated["event_conditioned"])
+    null_event = cast(Dict[str, object], null["event_conditioned"])
+    if int(cast(int, event["n_event_rows"])) <= 0:
+        print("FAIL: event-conditioned readout found no near-contraction anchors on gated data")
+        ok = False
+    if not event["matched_beats_shuffled"]:
+        print("FAIL: event-conditioning did not flag the gated source as specific on contractions")
+        ok = False
+    if null_event["matched_beats_shuffled"]:
+        print("FAIL: event-conditioning flagged specificity on the null (no coupling) data")
         ok = False
     print("\nSELF-TEST:", "PASS" if ok else "FAIL")
     return 0 if ok else 1
