@@ -41,6 +41,12 @@ Run (from the repo root):
     python -m teb_vae.lag_attn.eval.stage0_source_uplift_probe \
         --config teb_vae/lag_attn/configs/default.yaml
 
+    # Cross-phase screen (approach #1): does UP->FHR coupling exist in the fhr_up_ph representation
+    # at all? --source cross swaps the source design to the directional cross-phase field. Read the
+    # printed caveat: a negative is decisive, a positive is leak-suspect (fhr_up_ph is not causal).
+    python -m teb_vae.lag_attn.eval.stage0_source_uplift_probe \
+        --config teb_vae/lag_attn/configs/default.yaml --source cross
+
     # Correctness self-test -- fabricates data with a known injected coupling and a null, and
     # asserts the probe recovers the first and not the second. Needs no dataset:
     python -m teb_vae.lag_attn.eval.stage0_source_uplift_probe --self-test
@@ -102,10 +108,8 @@ class ProbeConfig:
         seed: RNG seed for the guid split, the row subsample, and the shuffle control.
         eval_frac: Fraction of recordings held out for scoring.
         val_frac: Fraction of the fit recordings held out to select the ridge penalty.
-        event_channel: Source channel used as the contraction-activity proxy. Default $0$ is
-            ``up_st``'s S0 low-pass (the only non-log channel), i.e. the UP envelope.
-        event_percentile: Anchors whose recent activity is at/above this per-eval quantile form the
-            "near a contraction" subset the event-conditioned readout scores.
+        event_percentile: Anchors whose recent UP-envelope activity is at/above this quantile form
+            the "near a contraction" subset the event-conditioned readout refits and scores.
         event_window: Number of recent steps averaged into the anchor's activity score.
     """
 
@@ -117,7 +121,6 @@ class ProbeConfig:
     seed: int = 0
     eval_frac: float = 0.3
     val_frac: float = 0.2
-    event_channel: int = 0
     event_percentile: float = 0.7
     event_window: int = 3
 
@@ -128,41 +131,63 @@ class Sample:
 
     Attributes:
         y: Target features $(T, c_y)$ = ``concat(fhr_st, fhr_ph)``.
-        u: Source features $(T, c_u)$ = ``concat(up_st, up_ph)`` or ``up_ph`` alone.
+        u: Source features $(T, c_u)$. The design the source lags are drawn from -- either the
+            model's UP stream (``concat(up_st, up_ph)`` / ``up_ph``) or the cross-phase field
+            ``fhr_up_ph`` under the cross-phase screen.
         weight: Per-step validity $(T,)$; ``> 0`` marks a usable step.
         guid: Recording identifier, used to split fit/eval by recording (never by anchor).
+        activity_signal: The UP contraction envelope $(T,)$ (``up_st`` S0 low-pass), carried
+            separately from ``u`` so the event-conditioned readout thresholds on the true
+            contraction proxy even when ``u`` is the cross-phase field.
     """
 
     y: np.ndarray
     u: np.ndarray
     weight: np.ndarray
     guid: str
+    activity_signal: np.ndarray
 
 
 # --- Data loading (real shards) ---------------------------------------------------------------
+#: Source designs the probe can build. ``up`` is the model's own UP stream; ``cross`` is the
+#: directional UP->FHR cross-phase field ``fhr_up_ph`` -- purpose-built for the coupling but NOT
+#: strictly causal (its low-pass window peeks ahead), so it is a coupling-existence screen where a
+#: negative is decisive and a positive is leak-suspect (see the note printed with a cross run).
+_SOURCE_FIELDS = {
+    "up": ("up_st", "up_ph"),          # concat; up_ph alone when use_up_st is False
+    "cross": ("fhr_up_ph",),
+}
+
+
 def load_samples_from_config(
-    config_path: str, *, split: str, max_samples: Optional[int]
+    config_path: str, *, split: str, max_samples: Optional[int], source: str = "up"
 ) -> List[Sample]:
     r"""Load samples through the training loader so features match what the model sees.
 
     Builds a :class:`CombinedHDF5Dataset` with the config's own ``stat_path`` normalisation,
-    ``trim_minutes``, ``load_fields`` and filters, then reads the target/source blocks exactly as
-    the task assembles them (``concat(fhr_st, fhr_ph)`` and, under ``use_up_st``,
-    ``concat(up_st, up_ph)``).
+    ``trim_minutes`` and filters, then reads the target block (``concat(fhr_st, fhr_ph)``) and the
+    requested source block. The UP contraction envelope (``up_st`` S0) is always read as the
+    activity proxy, independently of ``source``, so the event-conditioned readout stays valid under
+    the cross-phase screen.
 
     Args:
         config_path: Path to a leaf YAML config; its ``base:`` chain is resolved.
         split: ``'train'``, ``'test'`` or ``'both'`` -- which shard list to read.
         max_samples: Cap on recordings loaded (``None`` for all).
+        source: ``'up'`` (the model's UP stream) or ``'cross'`` (the ``fhr_up_ph`` cross-phase
+            field). The cross-phase screen answers "does coupling exist in *any* representation".
 
     Returns:
         The loaded samples.
 
     Raises:
-        ValueError: If the requested split names no shards, or a required field is absent.
+        ValueError: If the requested split names no shards, or ``source`` is unknown.
     """
     from teb_vae.lag_attn.config import load_config
     from hdf5_dataset.hdf5_dataset import CombinedHDF5Dataset
+
+    if source not in _SOURCE_FIELDS:
+        raise ValueError(f"source must be one of {sorted(_SOURCE_FIELDS)}, got {source!r}")
 
     config = load_config(config_path)
     dataset_config = config.get("dataset_config", {}) or {}
@@ -185,6 +210,13 @@ def load_samples_from_config(
     raw_kwargs = dict(dataloader_config.get("dataset_kwargs") or {})
     dataset_kwargs = {name: value for name, value in raw_kwargs.items() if name in accepted}
 
+    # Ensure every field this probe needs is loaded, whatever the config's load_fields lists: the
+    # target, the source (which for the cross screen is fhr_up_ph -- absent from the model's
+    # load_fields), the UP envelope for the activity proxy, and the validity weight.
+    needed = {"fhr_st", "fhr_ph", "up_st", "up_ph", "weight", "guid", *_SOURCE_FIELDS[source]}
+    existing = dataset_kwargs.get("load_fields")
+    dataset_kwargs["load_fields"] = sorted(set(existing) | needed) if existing else sorted(needed)
+
     dataset = CombinedHDF5Dataset(
         paths=shards,
         stats_path=dataset_config.get("stat_path"),
@@ -197,11 +229,22 @@ def load_samples_from_config(
     if max_samples is not None:
         count = min(count, int(max_samples))
 
+    if source == "up":
+        source_fields = ("up_st", "up_ph") if use_up_st else ("up_ph",)
+    else:
+        source_fields = _SOURCE_FIELDS[source]
+
     samples: List[Sample] = []
     for index in range(count):
         item = dataset[index]
         y = _cat_fields(item, ("fhr_st", "fhr_ph"))
-        u = _cat_fields(item, ("up_st", "up_ph")) if use_up_st else _cat_fields(item, ("up_ph",))
+        u = _cat_fields(item, source_fields)
+        # UP contraction envelope: up_st S0 (channel 0), with graceful fallbacks so the activity
+        # proxy is defined even on a shard missing up_st.
+        envelope_field = "up_st" if getattr(item, "up_st", None) is not None else (
+            "up_ph" if getattr(item, "up_ph", None) is not None else None
+        )
+        activity = _cat_fields(item, (envelope_field,))[:, 0] if envelope_field else u[:, 0]
         weight = getattr(item, "weight", None)
         if weight is None:
             weight_np = np.ones(y.shape[0], dtype=np.float32)
@@ -209,7 +252,9 @@ def load_samples_from_config(
             raw = weight.numpy() if hasattr(weight, "numpy") else weight
             weight_np = np.asarray(raw, dtype=np.float32).reshape(-1)
         guid = str(getattr(item, "guid", f"_row{index}"))
-        samples.append(Sample(y=y, u=u, weight=weight_np, guid=guid))
+        samples.append(
+            Sample(y=y, u=u, weight=weight_np, guid=guid, activity_signal=np.ascontiguousarray(activity))
+        )
     return samples
 
 
@@ -277,7 +322,6 @@ def build_design(
     fut_rows: List[np.ndarray] = []
     group_rows: List[np.ndarray] = []
     activity_rows: List[np.ndarray] = []
-    event_channel = int(config.event_channel)
     event_window = max(1, int(config.event_window))
 
     for group_id, sample in enumerate(samples):
@@ -285,11 +329,12 @@ def build_design(
         y = np.nan_to_num(sample.y, nan=0.0, posinf=0.0, neginf=0.0)
         u = np.nan_to_num(sample.u, nan=0.0, posinf=0.0, neginf=0.0)
 
-        # Per-step UP activity: a causal rolling mean of the envelope channel, so an anchor's score
-        # reflects only its own recent past (never the future it is asked to predict).
-        channel = event_channel if event_channel < u.shape[1] else 0
+        # Per-step UP activity: a causal rolling mean of the contraction envelope (carried in
+        # activity_signal, always the UP envelope regardless of what the source design u is), so an
+        # anchor's score reflects only its own recent past (never the future it is asked to predict).
+        envelope = np.nan_to_num(sample.activity_signal, nan=0.0, posinf=0.0, neginf=0.0)
         kernel = np.ones(event_window, dtype=np.float32) / float(event_window)
-        activity_t = np.convolve(u[:, channel], kernel, mode="full")[:seq_len]
+        activity_t = np.convolve(envelope, kernel, mode="full")[:seq_len]
         valid = sample.weight > 0.0
         if valid.shape[0] != seq_len:  # a defensive guard; the loader keeps these aligned
             valid = np.ones(seq_len, dtype=bool)
@@ -455,7 +500,7 @@ def _event_conditioned_refit(
         y_future: Target block $(N, K)$.
         group: Per-row recording id $(N,)$.
         activity: Per-row UP activity $(N,)$.
-        config: The probe configuration (``event_percentile`` and ``event_channel``).
+        config: The probe configuration (``event_percentile`` and ``event_window``).
         rng: RNG for the subset's split and shuffle control.
 
     Returns:
@@ -468,7 +513,6 @@ def _event_conditioned_refit(
     mask = activity >= threshold
     n_event = int(mask.sum())
     empty = {
-        "event_channel": int(config.event_channel),
         "activity_percentile": float(config.event_percentile),
         "activity_threshold": threshold,
         "n_event_rows": n_event,
@@ -496,7 +540,6 @@ def _event_conditioned_refit(
     matched = float(res["uplift_rel"])  # type: ignore[arg-type]
     shuffled = float(res["uplift_shuffled_rel"])  # type: ignore[arg-type]
     return {
-        "event_channel": int(config.event_channel),
         "activity_percentile": float(config.event_percentile),
         "activity_threshold": threshold,
         "n_event_rows": n_event,
@@ -766,7 +809,7 @@ def nonlinear_uplift(samples: Sequence[Sample], config: ProbeConfig) -> Optional
         return None
 
     rng = np.random.default_rng(config.seed)
-    x_hist, x_up, y_future, group, _activity = build_design(samples, config)
+    x_hist, x_up, y_future, group = build_design(samples, config)[:4]  # activity unused here
     if x_hist.shape[0] > config.max_rows:
         pick = rng.choice(x_hist.shape[0], size=config.max_rows, replace=False)
         x_hist, x_up, y_future, group = x_hist[pick], x_up[pick], y_future[pick], group[pick]
@@ -812,7 +855,13 @@ def format_report(results: Dict[str, object], nonlinear: Optional[Dict[str, floa
         """Pull a numeric result as a plain float (the dict is typed ``object`` for JSON)."""
         return float(results[key])  # type: ignore[arg-type]
 
+    source = str(results.get("source", "up"))
     lines = ["", "=" * 74, "Stage 0 - model-free UP->FHR predictive-uplift probe", "=" * 74]
+    source_label = {
+        "up": "up  (up_st + up_ph : the model's own UP stream)",
+        "cross": "cross  (fhr_up_ph : directional UP->FHR cross-phase -- see caveat below)",
+    }.get(source, source)
+    lines.append(f"source = {source_label}")
     lines.append(
         f"recordings={results['n_recordings']}  rows(total/fit/eval)="
         f"{results['n_rows_total']}/{results['n_rows_fit']}/{results['n_rows_eval']}"
@@ -820,6 +869,15 @@ def format_report(results: Dict[str, object], nonlinear: Optional[Dict[str, floa
     lines.append(
         f"ridge lambda base/full = {num('ridge_lambda_base'):g} / {num('ridge_lambda_full'):g}"
     )
+    if source == "cross":
+        lines.append("")
+        lines.append(
+            "  CAVEAT (cross-phase screen): fhr_up_ph is NOT strictly causal -- its low-pass window\n"
+            "  peeks ahead, and it carries this recording's own near-future FHR. So a NEGATIVE (~0\n"
+            "  uplift) is decisive evidence of no coupling, but a POSITIVE is NOT conclusive: matched\n"
+            "  can beat the baseline AND the shuffle control from that look-ahead leak alone. Confirm\n"
+            "  any positive with the strictly-causal raw event-locked test (approach #2)."
+        )
     lines.append("")
     lines.append(f"  MSE  baseline (FHR history only)        = {num('mse_base'):.6f}")
     lines.append(f"  MSE  full     (+ lagged UP source)      = {num('mse_full'):.6f}")
@@ -850,7 +908,7 @@ def format_report(results: Dict[str, object], nonlinear: Optional[Dict[str, floa
     if isinstance(event, dict) and int(event.get("n_event_rows", 0)) > 0:
         lines.append("")
         lines.append(
-            f"  event-conditioned (near-contraction anchors: UP ch {event['event_channel']} "
+            f"  event-conditioned (near-contraction anchors: UP envelope "
             f">= p{int(event['activity_percentile']*100)}, n={event['n_event_rows']}):"
         )
         lines.append(f"     pooled uplift  matched / shuffled  = "
@@ -973,7 +1031,10 @@ def _fabricate_samples(
                     y[t, 0] += coupling * u[t - inject_lag, 0]
                     y[t, 1] += coupling * u[t - inject_lag, 1]
         weight = np.ones(seq_len, dtype=np.float32)
-        samples.append(Sample(y=y, u=u, weight=weight, guid=f"rec{record}"))
+        # Channel 0 doubles as the activity/envelope proxy (the gate lives there when event_gated).
+        samples.append(
+            Sample(y=y, u=u, weight=weight, guid=f"rec{record}", activity_signal=u[:, 0].copy())
+        )
     return samples
 
 
@@ -1071,6 +1132,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--config", default=None, help="Path to the YAML config (resolves its base: chain).")
     parser.add_argument("--split", default="test", choices=("train", "test", "both"),
                         help="Which shard list to read (default: the held-out test shards).")
+    parser.add_argument("--source", default="up", choices=("up", "cross"),
+                        help="Source design: 'up' = the model's UP stream (up_st+up_ph); "
+                             "'cross' = the fhr_up_ph cross-phase screen (approach #1; see its caveat).")
     parser.add_argument("--max-samples", type=int, default=1500, help="Cap on recordings loaded (default 1500).")
     parser.add_argument("--max-rows", type=int, default=60000, help="Cap on anchor rows fed to the solver.")
     parser.add_argument("--seed", type=int, default=0, help="Seed for the split, subsample and shuffle control.")
@@ -1085,9 +1149,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         parser.error("--config is required unless --self-test is given")
 
     config = ProbeConfig(max_rows=args.max_rows, seed=args.seed)
-    samples = load_samples_from_config(args.config, split=args.split, max_samples=args.max_samples)
-    print(f"loaded {len(samples)} recordings from the {args.split} split of {args.config}")
+    samples = load_samples_from_config(
+        args.config, split=args.split, max_samples=args.max_samples, source=args.source
+    )
+    print(
+        f"loaded {len(samples)} recordings from the {args.split} split of {args.config} "
+        f"(source={args.source})"
+    )
     results = run_probe(samples, config)
+    results["source"] = args.source  # for the report header and the JSON dump
     nonlinear = nonlinear_uplift(samples, config) if args.nonlinear else None
     print(format_report(results, nonlinear))
 
@@ -1113,6 +1183,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 RUN_CONFIG: Optional[str] = "teb_vae/lag_attn/configs/default.yaml"
 RUN_SELF_TEST: bool = False      # True -> run the no-dataset correctness self-test instead of a probe
 RUN_SPLIT: str = "test"          # 'train' | 'test' | 'both' -- which shard list to read
+# 'cross' runs the fhr_up_ph cross-phase screen (approach #1) -- the current default so a bare Run
+# button does exactly that. Set to 'up' to reproduce the model's own UP-stream probe.
+RUN_SOURCE: str = "cross"
 RUN_MAX_SAMPLES: int = 1500      # cap on recordings loaded
 RUN_MAX_ROWS: int = 60000        # cap on anchor rows fed to the solver
 RUN_SEED: int = 0                # seed for the split, subsample and shuffle control
@@ -1139,6 +1212,7 @@ def _run_button_argv() -> List[str]:
     argv = [
         "--config", RUN_CONFIG,
         "--split", RUN_SPLIT,
+        "--source", RUN_SOURCE,
         "--max-samples", str(RUN_MAX_SAMPLES),
         "--max-rows", str(RUN_MAX_ROWS),
         "--seed", str(RUN_SEED),
