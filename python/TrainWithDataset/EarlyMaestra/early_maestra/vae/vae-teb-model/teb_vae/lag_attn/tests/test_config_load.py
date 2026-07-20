@@ -142,20 +142,26 @@ def test_causal_norm_is_on(shipped):
     assert shipped["model_config"]["VAE_model"]["causal_norm"] is True
 
 
-def test_the_breaker_is_configured_as_a_non_finite_guard_only(shipped):
-    r"""The relative test cannot work on a loss that goes negative, so it is switched off.
+def test_the_breaker_is_a_non_finite_guard_plus_the_additive_test(shipped):
+    r"""The relative test stays off; the additive test is what detects a finite blow-up.
 
     ``max(EMA, ema_floor)`` collapses to the floor once the EMA is negative, and at a $0.0$ floor
     that makes every positive batch a spike -- discarding its gradient and logging the EMA in place
     of the real loss. A floor far above any reachable loss disables the relative test outright,
     while the non-finite guard, which never consults the threshold, keeps a NaN from reaching the
     weights.
+
+    That pair alone was measured insufficient: the 2026-07 baseline's epoch-79 blow-up was finite
+    (no NaN in the whole run), so nothing fired and the run was lost. ``additive_margin`` is the
+    sign-agnostic test (``watched > EMA + margin``, against the raw EMA) that catches exactly that
+    event; it must stay positive or the breaker is back to catching only NaN.
     """
     breaker = shipped["advanced_config"]["spike_breaker"]
 
     assert breaker["enabled"] is True  # the non-finite guard is the point
     assert breaker["comparison_metric"] == "main_loss"
     assert breaker["ema_floor"] >= 1.0e9
+    assert breaker["additive_margin"] == 3.0  # finite-spike detection; 0 would disable it
     assert breaker["ema_decay"] == 0.02  # the framework's spelling of the old ema_momentum
 
 

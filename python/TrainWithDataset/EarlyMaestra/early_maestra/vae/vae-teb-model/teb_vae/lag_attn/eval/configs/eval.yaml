@@ -1,0 +1,184 @@
+# Evaluation configuration for a trained lag-attentive residual VAE-TEB checkpoint.
+#
+# Chains off the training config, so the model geometry, the normalisation statistics and the
+# objective all stay in one place and cannot drift between a run and its evaluation. Only what
+# genuinely differs for an offline, single-process, read-only analysis pass is restated here.
+#
+# Run from the repo root:
+#   python -m teb_vae.lag_attn.eval.run \
+#       --config teb_vae/lag_attn/eval/configs/eval.yaml \
+#       --checkpoint /path/to/lag-attn-epoch=412.ckpt
+#
+# Note what this file does NOT set: the objective. `likelihood`, `sigma_obs`, `free_bits`,
+# `lambda_full`, `lambda_base`, `lag_smoothness_lambda`, `detach_baseline_in_full`, `kld_beta`
+# and `beta_schedule` are inherited from default.yaml and are then reconciled against the
+# checkpoint's own `hyper_parameters`, which is the authoritative record of what was trained.
+# A disagreement is an error, not something to average over.
+base: ../../configs/default.yaml
+
+general_config:
+  # Separate tag so an eval run directory never lands inside a training run's.
+  tag: lag_attn_eval
+
+  batch_size:
+    # 32, not the training 128. Under no_grad the activation retention that dominates training
+    # is gone, but the transients are not: the horizon core materialises (B, T, H_d, d_hidden)
+    # tensors of roughly 590 MB at B=128 and the attention window is cloned dense at roughly
+    # 1.79 GB, on top of which the permutation control adds a third decoder pass and the lag
+    # ablation runs one forward per band.
+    #
+    # `test` is the key GraphDataModule actually reads for the eval loader. A batch size placed
+    # under `eval_config` would be a dead key and the loader would quietly run at 128, which is
+    # the exact configuration this bound exists to avoid. Results are batch-size-invariant --
+    # the model uses GroupNorm and LayerNorm, no BatchNorm -- so this costs only time.
+    test: 32
+
+dataset_config:
+  # REPOINT THESE, exactly as in default.yaml, and for the same reason: the placeholder path
+  # does not exist, so a run fails on a missing file rather than on a width mismatch someone
+  # might "fix" by reverting c_y/c_u. Preflight additionally refuses any path still containing
+  # REPOINT_ME, so the failure names the real cause instead of surfacing as a missing file.
+  #
+  # This is the k-fold test split, one HDF5 per canonical subgroup, rather than the pretraining
+  # test files default.yaml points at. That is a deliberate semantic change: "test" here means
+  # all eight subgroups and all three clinical classes, not healthy-only. The pretraining split
+  # remains usable -- override `vae_test_datasets` back to it in a variant config.
+  vae_test_datasets:
+    - /data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_new_channel_selection/k_fold_cross_validation_dataset/test/healthy_no_bg_no_cs.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_new_channel_selection/k_fold_cross_validation_dataset/test/healthy_no_bg_cs.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_new_channel_selection/k_fold_cross_validation_dataset/test/healthy_bg_no_cs.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_new_channel_selection/k_fold_cross_validation_dataset/test/healthy_bg_cs.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_new_channel_selection/k_fold_cross_validation_dataset/test/acidosis_no_cs.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_new_channel_selection/k_fold_cross_validation_dataset/test/acidosis_cs.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_new_channel_selection/k_fold_cross_validation_dataset/test/hie_no_cs.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_new_channel_selection/k_fold_cross_validation_dataset/test/hie_cs.hdf5
+
+  dataloader_config:
+    # Forced to 0, and re-forced in code with a warning if a variant config raises it.
+    #
+    # Not tuning: create_optimized_dataloader hardcodes persistent_workers=True whenever
+    # num_workers > 0, and with spawn multiprocessing over a multi-file HDF5 dataset the workers
+    # degrade after the first full iteration, silently truncating the second pass to the first
+    # file's index range. Eval makes many passes over the same loader, so it meets that failure
+    # every time. In the predecessor pipeline it presented as "only 1 class found".
+    num_workers: 0
+
+    dataset_kwargs:
+      # A list replaces wholesale on merge, so the inherited fields are restated rather than
+      # extended. Adds the four classification-era fields: the probe reads `target` for its
+      # class histogram and `epoch` for provenance, and the class/subgroup analyses read
+      # `cs_label` / `bg_label`.
+      load_fields:
+        [
+          'fhr',
+          'up',
+          'fhr_st',
+          'fhr_ph',
+          'up_ph',
+          'up_st',
+          'weight',
+          'guid',
+          'target',
+          'cs_label',
+          'bg_label',
+          'epoch',
+        ]
+
+      # --- Training-time filters, turned off explicitly -------------------------
+      # These are inherited, and each one silently *drops eval samples* rather than failing.
+      # Stated here at their eval values so the effective filter set is readable in one place
+      # instead of being three levels of merge away.
+      #
+      # `epoch_min: -48000` is a no-op against a 12.4 h dataset, but only by arithmetic that
+      # holds for the current extraction floor; null removes the coupling entirely.
+      # `label` filters by exact float equality against the one-hot target and would quietly
+      # exclude whole subgroups.
+      epoch_min: null
+      epoch_max: null
+      label: null
+
+      # 0, not the inherited 10000. Under training that cache is per-worker and bounded by the
+      # worker count; at num_workers: 0 it becomes main-process RAM -- roughly 240 KB per sample,
+      # so 10000 entries is about 2.4 GB held for the whole run. It is also FIFO with no reuse
+      # policy, so against a test split larger than the cache it thrashes and buys nothing.
+      cache_size: 0
+
+
+# Evaluation-only settings. Everything that shapes a run lives here rather than in run.py's
+# RUN_ARGS, because this file is dumped into the run directory and is the durable record; a
+# value injected from Python would appear in neither that dump nor MLflow.
+#
+# Every key below is validated at load: an unknown key raises and names the valid set, so a
+# misspelling cannot silently mean "no cap".
+eval_config:
+  # Seeds torch, numpy and random. `forward` samples z unconditionally, so evaluating with a
+  # mean-z model would report a forecast the model never actually makes; the sampling is seeded
+  # rather than suppressed, and the seed is recorded in summary.json. KL readouts are unaffected
+  # either way, being functions of mu and logvar only.
+  seed: 42
+
+  # Global cap on the number of test samples any analysis sees. null evaluates the whole split.
+  # Applied as a seeded subsample over the full index space, never as a prefix: the loader is
+  # built shuffle=False over eight concatenated per-subgroup files, so a prefix cap would draw
+  # file 0 alone -- one subgroup, one class.
+  max_samples: null
+
+  # Per-analysis retention caps, for the analyses that must hold per-sample tensors in memory.
+  # Same seeded-subsample rule as max_samples. Cap *names* are not validated against a fixed
+  # list -- the set grows with each analysis -- so a cap whose name no analysis reads simply
+  # does nothing; the values are validated.
+  caps:
+    predictions: 2000
+    attention: 2000
+    # One full multi-row PDF per recording, so this cap bounds pages rather than memory. At the
+    # production geometry a page is a few seconds and a few hundred KB; uncapped over the eight
+    # k-fold shards it would be the longest step in the run and produce more pages than anyone
+    # reads. The draw is stratified over the source files, so 8 reaches every subgroup.
+    samples: 8
+
+  # Splits each loader batch into micro-batches for the lag ablation alone, which runs one
+  # forward per band on top of the attention window's dense clone -- so its peak memory is the
+  # band count times a normal forward's. null leaves the batch whole.
+  #
+  # It bounds memory and does not change what is measured. Note it is not exactly neutral either:
+  # `forward` samples z and the noise tensor's shape follows the batch, so splitting changes which
+  # draws are made and moves every absolute number by that sampling noise. Bands within one run
+  # are compared under common random numbers regardless, so the band-to-band differences -- which
+  # are the measurement -- are unaffected.
+  ablation_batch_size: null
+
+  # Lag bands for the ablation, as inclusive [lo, hi] pairs in model-lag units. At 4 s per
+  # decimated step and max_lag: 90 the window spans about 6 minutes of UP history.
+  # Validated against max_lag; lo > hi is an empty band and raises.
+  bands:
+    lag_0_10: [0, 10]
+    lag_11_30: [11, 30]
+    lag_31_60: [31, 60]
+    lag_61_90: [61, 90]
+
+  # Offset between a model lag index and physical seconds, for the second axis on every lag
+  # figure: seconds = 4 * lag - up_shift_secs, i.e. the raw-file delay a peak at lag l implies.
+  #
+  # UNVERIFIED, and deliberately a new key rather than a read of an existing one. The dataset
+  # pipeline builds its MIMO adaptor with up_shift_secs=-20 and the model documentation reads an
+  # attention peak at lag l as a raw-file delay of 4(l + 5) seconds, which agrees; but
+  # plotting.py's lag axis reads `delta_up_seconds` off an attribute the model does not have, so
+  # the offset has never actually been applied anywhere in this repository. The sign must be
+  # pinned against the pipeline documentation before any figure caption states it as fact.
+  up_shift_secs: -20
+
+  # Floor on the load health probe's `residual_ratio` -- the masked RMS of delta_mu_src relative
+  # to the full forecast. Below it the probe WARNS and records; it never raises. A genuinely
+  # collapsed source pathway is a finding to report, not a run to abort, and the check that does
+  # raise is the weight-space one, which is the only signal that separates "the checkpoint never
+  # loaded" from "a real model whose source pathway collapsed".
+  #
+  # Chosen a priori and worth recalibrating against the first genuinely trained checkpoint.
+  health_probe_floor: 0.01
+
+  # Fraction of saturated elements above which mu_prior_sat_frac / delta_mu_sat_frac are flagged.
+  # Both quantities are tanh-squashed to a configured scale, so a saturated element is one whose
+  # gradient has effectively vanished: a high reading is a mis-set hyperparameter, not a property
+  # of the data. On delta_mu_scale it additionally caps every transfer-entropy number the run
+  # reports, since the measured coupling is being clipped by the bound rather than by the model.
+  saturation_flag_threshold: 0.05

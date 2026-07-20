@@ -1,0 +1,72 @@
+# Eval configuration for the hermetic test suite: the committed 4-sample shard, no MLflow.
+#
+# Chains off configs/tiny.yaml rather than off eval.yaml, because what the tests need is the
+# tiny *dataset* wiring -- the committed shard and its stats file -- not the production k-fold
+# paths. The eval-only settings below therefore restate the whole `eval_config` block instead
+# of inheriting it.
+#
+# Every path is repository-root relative, matching tiny.yaml: entry points chdir to the repo
+# root before resolving anything.
+base: ../../../configs/tiny.yaml
+
+general_config:
+  tag: lag_attn_eval_tiny
+  batch_size:
+    # Two batches over a four-sample shard, so multi-batch iteration is actually exercised.
+    test: 2
+  folders_config:
+    out_dir_base: output/teb_vae_eval_tiny
+
+model_config:
+  VAE_model:
+    # These two exist only so the objective reconciliation passes against the suite's tiny
+    # checkpoint, which is built with the task's own PROD_HPARAMS: a constant beta at 0.01.
+    # default.yaml ships a linear_warmup schedule at kld_beta 0.001, and preflight raises on a
+    # disagreement between config and checkpoint rather than silently preferring either.
+    beta_schedule: null
+    kld_beta: 0.01
+
+dataset_config:
+  vae_test_datasets: [teb_vae/lag_attn/tests/fixtures/tiny_shard.hdf5]
+  stat_path: teb_vae/lag_attn/tests/fixtures/tiny_stats.hdf5
+
+  dataloader_config:
+    num_workers: 0
+    dataset_kwargs:
+      load_fields:
+        [
+          'fhr',
+          'up',
+          'fhr_st',
+          'fhr_ph',
+          'up_ph',
+          'up_st',
+          'weight',
+          'guid',
+          'target',
+          'cs_label',
+          'bg_label',
+          'epoch',
+        ]
+      epoch_min: null
+      epoch_max: null
+      label: null
+      cache_size: 0
+
+eval_config:
+  seed: 42
+  max_samples: null
+  caps:
+    predictions: 4
+    attention: 4
+    samples: 2
+  # The tiny geometry is max_lag: 8, so L = 9 and every band lag must fall in [0, 8].
+  bands:
+    lag_0_2: [0, 2]
+    lag_3_8: [3, 8]
+  up_shift_secs: -20
+  health_probe_floor: 0.01
+  saturation_flag_threshold: 0.05
+  # Left whole: the fixture's batches are two samples and the suite exercises the split path
+  # explicitly where it matters.
+  ablation_batch_size: null

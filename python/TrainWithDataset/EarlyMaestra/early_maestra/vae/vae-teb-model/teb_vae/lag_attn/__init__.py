@@ -11,4 +11,7 @@ Layout::
     eval/       slow analysis against a checkpoint, run by a human
 
 Variants are configs, not subclasses.
+
+``DESIGN.md`` is this model's contract; ``eval/EVAL.md`` is the evaluation pipeline's, and
+``eval/FIGURE_GUIDE.md`` says how to read what a run emits.
 """

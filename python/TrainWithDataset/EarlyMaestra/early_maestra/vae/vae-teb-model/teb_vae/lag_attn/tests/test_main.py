@@ -180,14 +180,18 @@ def test_config_is_required():
 # --------------------------------------------------------------------------------------
 # The IDE Run button
 # --------------------------------------------------------------------------------------
-def test_run_config_ships_unset_so_a_bare_launch_still_refuses():
-    """The Run-button affordance must not re-create the hazard ``--config`` was made required for.
+def test_run_config_ships_pointing_at_a_real_config_and_the_flag_still_wins():
+    """The Run button launches the real configuration; ``--config`` overrides it regardless.
 
-    ``test_config_is_required`` above pins the behaviour; this pins the *reason* it still holds.
-    A shipped ``RUN_CONFIG`` pointing at a real file would make a bare launch silently train that
-    configuration, which is exactly what the required flag was introduced to stop.
+    ``RUN_CONFIG`` shipped as ``None`` until 5f23af7, which pointed it at ``default.yaml`` so a
+    bare Run-button launch trains the real recipe -- deliberately, with the module docstring and
+    the constant's own comment rewritten to say so. What still has to hold is the precedence:
+    ``--config`` wins over this value, so the dict cannot quietly redirect a command-line run.
     """
-    assert trainer_module.RUN_CONFIG is None
+    assert trainer_module.RUN_CONFIG == "teb_vae/lag_attn/configs/default.yaml"
+    assert Path(_REPO_ROOT / trainer_module.RUN_CONFIG).is_file(), (
+        "RUN_CONFIG names a config that does not exist, so the Run button is broken"
+    )
 
 
 def test_the_module_is_importable_as_a_script_from_an_unrelated_directory(tmp_path):
@@ -204,10 +208,16 @@ def test_the_module_is_importable_as_a_script_from_an_unrelated_directory(tmp_pa
         text=True,
     )
 
-    # It must get past the imports and reach the argument parser -- which then refuses, because
-    # RUN_CONFIG ships unset.
+    # It must get past the imports and into ``__main__``. Asserting on the *bootstrap* rather
+    # than on how far the run then gets: with RUN_CONFIG shipping set, a bare launch proceeds
+    # into config resolution and stops at whatever the environment supplies (on an unconfigured
+    # box, the missing stats file), which is not a property of the launch mode under test.
     assert "ModuleNotFoundError" not in result.stderr, result.stderr
-    assert "--config is required" in result.stderr, result.stderr
+    assert "changing working directory to the repo root" in result.stderr, result.stderr
+    # And specifically down the Run-button path: no --config was passed, so the bare launch must
+    # resolve through RUN_CONFIG. This is the branch the test exists to cover; the chdir line
+    # above would also appear on a run that took its config from the command line.
+    assert "no --config given; using RUN_CONFIG=" in result.stderr, result.stderr
 
 
 def test_a_missing_stats_file_raises_before_any_training_happens(recording_main, tmp_path):

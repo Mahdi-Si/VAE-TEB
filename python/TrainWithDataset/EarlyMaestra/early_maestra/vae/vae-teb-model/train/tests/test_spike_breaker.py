@@ -119,6 +119,69 @@ def test_ema_floor_clamps_comparison_base():
     assert metrics["spike_skipped"].item() == 1.0
 
 
+# --- Additive margin: sign-agnostic finite-spike detection ----------------------
+# The relative test compares against max(EMA, ema_floor) and so cannot express "a finite jump
+# above a NEGATIVE baseline"; the additive test compares against the raw EMA and can. These
+# tests drive the negative-EMA regime directly, with the relative test disabled the same way a
+# negative-NLL consumer disables it (a floor far above any reachable loss).
+
+def test_additive_margin_catches_finite_spike_over_negative_ema():
+    model = _model()
+    cfg = _cfg(ema_floor=1.0e9, additive_margin=3.0)
+    for _ in range(3):
+        _feed(model, -0.5, cfg)                    # settle a negative EMA
+    ema_before = model._spike_ema_loss
+    assert ema_before is not None and ema_before < 0.0
+
+    metrics, _ = _feed(model, 5.0, cfg)            # 5.0 > -0.5 + 3.0 -> skip
+
+    assert metrics["spike_skipped"].item() == 1.0
+    assert model._spike_ema_loss == ema_before     # a skipped spike must not move the EMA
+
+
+def test_additive_margin_leaves_fluctuations_within_margin_alone():
+    # The sign-crossing batch that a zero ema_floor would have discarded: +0.3 above an EMA of
+    # -0.5 is inside the margin and must train.
+    model = _model()
+    cfg = _cfg(ema_floor=1.0e9, additive_margin=3.0)
+    for _ in range(3):
+        _feed(model, -0.5, cfg)
+
+    metrics, _ = _feed(model, 0.3, cfg)
+
+    assert metrics["spike_skipped"].item() == 0.0
+
+
+def test_additive_margin_zero_disables_the_test():
+    # 0.0 must mean "off", not "margin of zero": half of all healthy batches land above the EMA,
+    # and a zero margin would skip every one of them.
+    model = _model()
+    cfg = _cfg(ema_floor=1.0e9, additive_margin=0.0)
+    _feed(model, -0.5, cfg)
+
+    metrics, _ = _feed(model, 50.0, cfg)           # far above the EMA, but both tests are off
+
+    assert metrics["spike_skipped"].item() == 0.0
+
+
+def test_additive_margin_respects_warmup():
+    model = _model()
+    cfg = _cfg(ema_floor=1.0e9, additive_margin=3.0, warmup_batches=3)
+    _feed(model, -0.5, cfg)                        # batch 1 seeds the EMA
+    metrics, _ = _feed(model, 50.0, cfg)           # batch 2: inside warmup -> never skip
+    assert metrics["spike_skipped"].item() == 0.0
+
+
+def test_additive_and_relative_tests_are_ored():
+    # With both enabled, either firing skips: a spike below the relative threshold but above
+    # EMA + margin is still caught.
+    model = _model()
+    cfg = _cfg(multiplier=5.0, ema_floor=0.0, additive_margin=2.0)
+    _feed(model, 1.0, cfg)                         # EMA = 1.0; relative threshold = 5.0
+    metrics, _ = _feed(model, 4.0, cfg)            # 4 < 5*1, but 4 > 1 + 2 -> skip
+    assert metrics["spike_skipped"].item() == 1.0
+
+
 # --- S4-T03: escape hatch + comparison_metric ----------------------------------
 
 def test_escape_hatch_force_accepts_after_cap():

@@ -334,6 +334,7 @@ class GraphModelBase(ABC):
             ("advanced_config.spike_breaker.multiplier", float),
             ("advanced_config.spike_breaker.ema_decay", float),
             ("advanced_config.spike_breaker.ema_floor", float),
+            ("advanced_config.spike_breaker.additive_margin", float),
             ("advanced_config.spike_breaker.warmup_batches", int),
             ("advanced_config.spike_breaker.max_consecutive_skips", int),
             ("advanced_config.spike_breaker.comparison_metric", str),

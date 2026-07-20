@@ -317,7 +317,6 @@ class LagAttnTrainer(GraphModelBase):
                     plot_frequency=plot_config.get("plot_frequency", 1),
                     num_examples=plot_config.get("num_examples", 2),
                     file_format=plot_config.get("file_format", "pdf"),
-                    forecast_channels=plot_config.get("forecast_channels", (0, 43, 80)),
                     forecast_anchor_frac=plot_config.get("forecast_anchor_frac", 0.6),
                     mlflow_logger=self.mlflow_logger,
                 )
