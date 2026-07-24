@@ -1,0 +1,16 @@
+# Architecture A/B arm: conv_norm_groups = 1 (was min(8, d_model) per conv block).
+#
+# Each encoder conv block pre-norms with GroupNorm(min(8, 128)) = GroupNorm(8, 128) by default.
+# Setting the group count to 1 makes each a per-timestep normaliser over all channels (a
+# LayerNorm-like statistic on the channel axis, still causal because it never pools across time),
+# testing whether the 8-group split fragments the channel statistics. The parameter count is
+# unchanged -- GroupNorm affine parameters are per-channel -- so this isolates the normaliser's
+# grouping. Everything else is inherited from default.yaml.
+#
+#   TEB_RUN_STAMP="$(date '+%Y-%m-%d--[%H-%M]')" torchrun --nproc_per_node=7 \
+#       -m teb_vae.lag_attn_rws.trainer --config teb_vae/lag_attn_rws/configs/sweep_norm_groups_1.yaml
+base: default.yaml
+
+model_config:
+  VAE_model:
+    conv_norm_groups: 1

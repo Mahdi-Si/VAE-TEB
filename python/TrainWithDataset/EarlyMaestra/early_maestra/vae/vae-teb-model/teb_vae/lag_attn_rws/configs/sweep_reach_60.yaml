@@ -1,0 +1,16 @@
+# Calibration arm: causal_reach_budget_s = 60 (keeps 59/109 target and 23/58 source channels).
+#
+# Below 100 s every source phase-harmonic channel is pruned, so from this arm down the source
+# stream is up_st alone -- which is what answers whether up_ph earns its place. Everything else
+# is inherited from default.yaml, so this arm differs from the shipped configuration in exactly
+# one resolved key.
+#
+# Arms of this sweep build different input-adapter widths, so no two arms share a checkpoint.
+#
+#   TEB_RUN_STAMP="$(date '+%Y-%m-%d--[%H-%M]')" torchrun --nproc_per_node=7 \
+#       -m teb_vae.lag_attn_rws.trainer --config teb_vae/lag_attn_rws/configs/sweep_reach_60.yaml
+base: default.yaml
+
+model_config:
+  VAE_model:
+    causal_reach_budget_s: 60

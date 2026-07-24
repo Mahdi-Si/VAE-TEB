@@ -1,0 +1,15 @@
+# Architecture A/B arm: encoder_extra_kernel = 7 (was 15).
+#
+# The two appended long-dilation blocks per encoder use kernel 15 by default -- the widest convs
+# in the stack, so they carry a disproportionate share of the encoder parameters. Narrowing them
+# to 7 removes 4 convs x 8 x 128 x 128 = 524,288 parameters (two appended blocks per encoder, two
+# encoders), a ~16% cut, while keeping the same dilation reach. Everything else is inherited from
+# default.yaml, so a metric difference against the baseline has one explanation.
+#
+#   TEB_RUN_STAMP="$(date '+%Y-%m-%d--[%H-%M]')" torchrun --nproc_per_node=7 \
+#       -m teb_vae.lag_attn_rws.trainer --config teb_vae/lag_attn_rws/configs/sweep_enc_kernel_7.yaml
+base: default.yaml
+
+model_config:
+  VAE_model:
+    encoder_extra_kernel: 7

@@ -1,0 +1,16 @@
+# Calibration arm: causal_reach_budget_s = 120 (keeps 78/109 target and 29/58 source channels).
+#
+# The budget the design was costed against: its maximum delay is exactly 30 steps, which is
+# exactly the shipped warmup_period, so this is the largest finite budget that fits the shipped
+# warm-up. Everything else is inherited from default.yaml, so this arm differs from the shipped
+# configuration in exactly one resolved key.
+#
+# Arms of this sweep build different input-adapter widths, so no two arms share a checkpoint.
+#
+#   TEB_RUN_STAMP="$(date '+%Y-%m-%d--[%H-%M]')" torchrun --nproc_per_node=7 \
+#       -m teb_vae.lag_attn_rws.trainer --config teb_vae/lag_attn_rws/configs/sweep_reach_120.yaml
+base: default.yaml
+
+model_config:
+  VAE_model:
+    causal_reach_budget_s: 120

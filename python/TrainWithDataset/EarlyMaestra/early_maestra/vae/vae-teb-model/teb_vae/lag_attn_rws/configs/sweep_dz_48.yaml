@@ -1,0 +1,13 @@
+# Calibration arm: latent width d_z = 48.
+#
+# Restates the shipped value on purpose: the arm stays pinned at 48 even if default.yaml is
+# later revised. While default.yaml still carries the KL weight this arm inherits, this arm
+# duplicates the corresponding KL-weight arm and one run serves both readouts.
+#
+#   TEB_RUN_STAMP="$(date '+%Y-%m-%d--[%H-%M]')" torchrun --nproc_per_node=7 \
+#       -m teb_vae.lag_attn_rws.trainer --config teb_vae/lag_attn_rws/configs/sweep_dz_48.yaml
+base: default.yaml
+
+model_config:
+  VAE_model:
+    d_z: 48    # divisible by num_heads (4), required by the head-structured posterior

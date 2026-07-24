@@ -13,7 +13,7 @@ answer already in it.
 """
 from __future__ import annotations
 
-from typing import Tuple
+from typing import Optional, Tuple
 
 import torch
 from torch import nn
@@ -37,7 +37,13 @@ class InputAdapter(nn.Module):
         Output: ``(B, T, d_model)``
     """
 
-    def __init__(self, in_dim: int, d_model: int = 128, dropout: float = 0.1) -> None:
+    def __init__(
+        self,
+        in_dim: int,
+        d_model: int = 128,
+        dropout: float = 0.1,
+        post_residual_activation: bool = True,
+    ) -> None:
         """Initialize the adapter.
 
         Args:
@@ -45,6 +51,10 @@ class InputAdapter(nn.Module):
                 streams have different widths and a default would silently fit only one of them.
             d_model: Internal model width.
             dropout: Dropout probability applied after the activation.
+            post_residual_activation: Whether the projection's residual MLP ends in a normalise +
+                GELU. ``True`` (the default) reproduces the original seam. ``False`` drops the
+                post-residual GELU, so the seam does not gate the exported representation or
+                attenuate the backward gradient through it.
         """
         super().__init__()
         self.linear = nn.Linear(in_dim, d_model)
@@ -54,7 +64,7 @@ class InputAdapter(nn.Module):
         self.res_mlp = ResidualMLP(
             input_dim=d_model,
             hidden_dims=geometric_schedule(d_model, d_model, 3),
-            final_activation=True,
+            final_activation=post_residual_activation,
             use_skip_connection=True,
             use_input_layer_norm=True,
             activation=nn.GELU,
@@ -108,6 +118,9 @@ class CausalConvLstmEncoder(nn.Module):
         lstm_layers: int,
         lstm_dropout: float,
         conv_dropout: float,
+        stack_skip_connection: bool = True,
+        post_residual_activation: bool = True,
+        conv_norm_groups: Optional[int] = None,
     ) -> None:
         """Initialize the encoder.
 
@@ -118,6 +131,21 @@ class CausalConvLstmEncoder(nn.Module):
             lstm_layers: LSTM depth.
             lstm_dropout: Dropout between LSTM layers. Ignored by PyTorch at a single layer.
             conv_dropout: Dropout inside the convolution blocks and the MLPs.
+            stack_skip_connection: Whether to add a second, stack-level residual on top of each
+                conv block's own pre-norm residual. ``True`` (the default) reproduces the
+                original double-residual stack exactly. ``False`` drops the redundant term --
+                and does not build its ``GroupNorm``s at all -- leaving a single clean residual
+                chain whose activation scale is stable through depth and whose input skip is
+                preserved.
+            post_residual_activation: Whether the ``front_mlp`` and ``fusion`` residual MLPs end in
+                a normalise + GELU. ``True`` (the default) reproduces the original seams. ``False``
+                drops the post-residual GELU at both, so those seams neither gate the encoded
+                representation nor attenuate the backward gradient flowing through them.
+            conv_norm_groups: Number of groups for every conv block's pre-norm ``GroupNorm``.
+                ``None`` (the default) keeps each block's ``min(8, d_model)``. Threaded into the
+                blocks' ``norm_groups`` -- distinct from the ``nn.Conv1d`` group count -- so a
+                value of ``1`` normalises over all channels per timestep without changing the
+                parameter count.
 
         Raises:
             ValueError: If the kernel and dilation schedules disagree in length, or if no
@@ -134,11 +162,13 @@ class CausalConvLstmEncoder(nn.Module):
         if len(cnn_kernels) < 1:
             raise ValueError("need at least one causal conv block")
 
+        self.post_residual_activation = bool(post_residual_activation)
+
         # Stage A: front-end residual MLP, holding the channel count at d_model.
         self.front_mlp = ResidualMLP(
             input_dim=d_model,
             hidden_dims=geometric_schedule(d_model, d_model, 3),
-            final_activation=True,
+            final_activation=self.post_residual_activation,
             use_skip_connection=True,
             use_input_layer_norm=True,
             activation=nn.GELU,
@@ -156,17 +186,26 @@ class CausalConvLstmEncoder(nn.Module):
                     dilation=dilation,
                     dropout=conv_dropout,
                     activation=nn.GELU,
+                    norm_groups=conv_norm_groups,
                 )
                 for kernel, dilation in zip(cnn_kernels, cnn_dilations)
             ]
         )
-        # One inter-block skip norm between each adjacent conv pair.
-        self.stack_skip_norms = nn.ModuleList(
-            [
-                nn.GroupNorm(num_groups=min(8, d_model), num_channels=d_model)
-                for _ in range(len(self.convs) - 1)
-            ]
-        )
+        self.stack_skip_connection = bool(stack_skip_connection)
+        # One inter-block skip norm between each adjacent conv pair -- built only when the
+        # stack-level skip is in use. When off, an unused GroupNorm would still sit in DDP's
+        # expectation set as a starved parameter (or force find_unused_parameters=True), so it is
+        # not created at all rather than created and skipped.
+        self.stack_skip_norms: Optional[nn.ModuleList]
+        if self.stack_skip_connection:
+            self.stack_skip_norms = nn.ModuleList(
+                [
+                    nn.GroupNorm(num_groups=min(8, d_model), num_channels=d_model)
+                    for _ in range(len(self.convs) - 1)
+                ]
+            )
+        else:
+            self.stack_skip_norms = None
         self.conv_out_norm = nn.LayerNorm(d_model)
 
         # Stage C: the unidirectional LSTM branch. Bidirectional would read the future.
@@ -184,7 +223,7 @@ class CausalConvLstmEncoder(nn.Module):
         self.fusion = ResidualMLP(
             input_dim=2 * d_model,
             hidden_dims=geometric_schedule(2 * d_model, d_model, 3),
-            final_activation=True,
+            final_activation=self.post_residual_activation,
             use_skip_connection=True,
             use_input_layer_norm=True,
             activation=nn.GELU,
@@ -209,8 +248,16 @@ class CausalConvLstmEncoder(nn.Module):
         # The conv blocks work in (B, C, T); the rest of the model works in (B, T, C).
         x_conv = x_lin.transpose(1, 2).contiguous()
         out = self.convs[0](x_conv)
+        skip_norms = self.stack_skip_norms
         for index in range(1, len(self.convs)):
-            out = self.convs[index](out) + self.stack_skip_norms[index - 1](out)
+            block_out = self.convs[index](out)
+            if skip_norms is not None:
+                # The redundant second residual: each conv block is already a pre-norm residual,
+                # so this stack-level term adds a second, GroupNorm-rescaled copy of the stream on
+                # top of the one the block added. Kept for the sibling; off, the stream stays a
+                # single clean residual chain and x_lin re-enters at full weight below.
+                block_out = block_out + skip_norms[index - 1](out)
+            out = block_out
         conv_out = self.conv_out_norm(out.transpose(1, 2).contiguous() + x_lin)
 
         lstm_out, _ = self.lstm(x_lin)

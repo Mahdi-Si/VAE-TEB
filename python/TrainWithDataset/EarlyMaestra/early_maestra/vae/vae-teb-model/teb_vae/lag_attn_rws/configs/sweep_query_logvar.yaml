@@ -1,0 +1,16 @@
+# Architecture A/B arm: query_uses_logvar = true (was false).
+#
+# By default the lag-attention query is a projection of the prior mean mu^p alone. With this arm
+# it reads [mu^p || logvar^p], so the query can also condition on how *certain* the prior belief
+# is when it asks the source memory "what would move this belief". query_proj widens to 2*d_z in
+# (+6,144 parameters at d_z=48). Both inputs are read off the target-only prior head, so source
+# purity is untouched and the KL/lag-map identity is unchanged. Everything else is inherited from
+# default.yaml.
+#
+#   TEB_RUN_STAMP="$(date '+%Y-%m-%d--[%H-%M]')" torchrun --nproc_per_node=7 \
+#       -m teb_vae.lag_attn_rws.trainer --config teb_vae/lag_attn_rws/configs/sweep_query_logvar.yaml
+base: default.yaml
+
+model_config:
+  VAE_model:
+    query_uses_logvar: true

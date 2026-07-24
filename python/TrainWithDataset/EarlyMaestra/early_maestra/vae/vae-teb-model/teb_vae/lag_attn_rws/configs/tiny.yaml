@@ -1,0 +1,49 @@
+# Local smoke variant: one epoch, one device, the committed 4-sample shard.
+#
+# Everything not named here is inherited from default.yaml -- including the settings that are
+# correctness requirements rather than preferences (causal_norm, compile: false, the spike
+# breaker's ema_floor, num_sanity_val_steps: 0), which is the point: a variant that re-stated
+# them could drift from them.
+#
+# The geometry stays real. sequence_length, the channel counts and trim_minutes match the shipped
+# config, because the committed shard carries the real field shapes -- and the raw-index geometry
+# (forecast of anchor t starts at 16*(t+1)) is only exercised at the real trim. Only the model's
+# widths shrink so a CPU forward is fast.
+#
+# likelihood: mse is a deliberate delta, not a simplification: it is the configuration that
+# starves the decoder log-variance heads, so the smoke path and the DDP-strategy fallback it
+# implies get exercised where they are cheap to observe.
+#
+#   python -m teb_vae.lag_attn_rws.trainer --config teb_vae/lag_attn_rws/configs/tiny.yaml
+base: default.yaml
+
+general_config:
+  tag: lag_attn_rws_tiny
+  cuda_devices: [0]
+  epochs: 1
+  batch_size: {train: 2, test: 2}
+  folders_config: {out_dir_base: output/teb_vae_rws_tiny}
+
+model_config:
+  VAE_model:
+    d_model: 32          # = num_heads * d_head
+    d_z: 8               # divisible by num_heads, required by the head-structured posterior
+    d_head: 8
+    max_lag: 8
+    lstm_layers: 1
+    dropout: 0.0
+    likelihood: mse
+
+dataset_config:
+  # Repo-root-relative: entry points run from the repo root. The fixtures are the sibling's --
+  # both models read the same shards through the same loader.
+  vae_train_datasets: [teb_vae/lag_attn/tests/fixtures/tiny_shard.hdf5]
+  vae_test_datasets: [teb_vae/lag_attn/tests/fixtures/tiny_shard.hdf5]
+  stat_path: teb_vae/lag_attn/tests/fixtures/tiny_stats.hdf5
+  dataloader_config:
+    num_workers: 0       # no worker spawn for 4 samples
+
+advanced_config:
+  tracking:
+    mlflow:
+      enabled: false     # a smoke run is not a result

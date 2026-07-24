@@ -1,0 +1,17 @@
+# Calibration arm: converged KL weight beta_schedule.end = 0.3.
+#
+# Everything else is inherited from default.yaml, so this arm and the shipped configuration
+# differ in exactly one resolved key and a metric difference between the two runs has one
+# explanation. Deliberately no per-arm tag or MLflow run name: either would be a second delta;
+# a run is identified by its TEB_RUN_STAMP directory and its resolved-config artifact.
+#
+#   TEB_RUN_STAMP="$(date '+%Y-%m-%d--[%H-%M]')" torchrun --nproc_per_node=7 \
+#       -m teb_vae.lag_attn_rws.trainer --config teb_vae/lag_attn_rws/configs/sweep_beta_0p3.yaml
+base: default.yaml
+
+model_config:
+  VAE_model:
+    beta_schedule:
+      # Only the converged weight moves. The linear warm-up from exactly 0 and its epoch count
+      # are inherited: the warm-up is the posterior-collapse guard, not part of the swept axis.
+      end: 0.3

@@ -1,0 +1,15 @@
+# Calibration arm: causal_reach_budget_s = 32 (keeps 43/109 target and 19/58 source channels).
+#
+# The most causal arm: maximum delay 8 steps (32 s), the source stream reduced to up_st alone
+# (every up_ph channel reaches at least 100 s). Everything else is inherited from default.yaml,
+# so this arm differs from the shipped configuration in exactly one resolved key.
+#
+# Arms of this sweep build different input-adapter widths, so no two arms share a checkpoint.
+#
+#   TEB_RUN_STAMP="$(date '+%Y-%m-%d--[%H-%M]')" torchrun --nproc_per_node=7 \
+#       -m teb_vae.lag_attn_rws.trainer --config teb_vae/lag_attn_rws/configs/sweep_reach_32.yaml
+base: default.yaml
+
+model_config:
+  VAE_model:
+    causal_reach_budget_s: 32

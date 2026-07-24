@@ -1,0 +1,16 @@
+# Calibration arm: converged KL weight beta_schedule.end = 1.0.
+#
+# Restates the shipped value on purpose: the arm stays pinned at 1.0 even if default.yaml is
+# later revised to the sweep's winner. Until such a revision this arm and the headline baseline
+# are the same configuration, and the baseline run's metrics stand in for this arm.
+#
+#   TEB_RUN_STAMP="$(date '+%Y-%m-%d--[%H-%M]')" torchrun --nproc_per_node=7 \
+#       -m teb_vae.lag_attn_rws.trainer --config teb_vae/lag_attn_rws/configs/sweep_beta_1p0.yaml
+base: default.yaml
+
+model_config:
+  VAE_model:
+    beta_schedule:
+      # Only the converged weight moves. The linear warm-up from exactly 0 and its epoch count
+      # are inherited: the warm-up is the posterior-collapse guard, not part of the swept axis.
+      end: 1.0
