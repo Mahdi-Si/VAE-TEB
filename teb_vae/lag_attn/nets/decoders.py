@@ -47,6 +47,7 @@ class _HorizonRefine(nn.Module):
         d_hidden: int,
         kernel_size: int = 3,
         dilations: Tuple[int, ...] = (1, 2),
+        film_cond_dim: Optional[int] = None,
     ) -> None:
         """Initialize the refine stack.
 
@@ -54,6 +55,11 @@ class _HorizonRefine(nn.Module):
             d_hidden: Channel width, held constant through the stack.
             kernel_size: Convolution kernel width.
             dilations: Dilation per block.
+            film_cond_dim: Width of the per-block FiLM conditioning vector, or ``None`` for no
+                per-block FiLM. When set, each block gets its own zero-initialised
+                $(\\gamma, \\beta)$ generator, so every block -- not just the top of the stack --
+                reads the latent. Zero-init makes the modulation an exact identity at construction,
+                so this is a strict capacity add.
         """
         super().__init__()
         self.blocks = nn.ModuleList()
@@ -78,19 +84,41 @@ class _HorizonRefine(nn.Module):
                 )
             )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Refine along the horizon axis.
+        # Per-block FiLM: one generator per block, zero-initialised so gamma = beta = 0 and the
+        # block behaves exactly as it does without FiLM at construction. Left None when the core
+        # owns FiLM at the top of the stack (or runs no FiLM at all), so no dead generators exist.
+        self.film: Optional[nn.ModuleList]
+        if film_cond_dim is not None:
+            self.film = nn.ModuleList(
+                [nn.Linear(film_cond_dim, 2 * d_hidden) for _ in dilations]
+            )
+            for layer in self.film:
+                layer = cast(nn.Linear, layer)
+                nn.init.zeros_(layer.weight)
+                nn.init.zeros_(layer.bias)
+        else:
+            self.film = None
+
+    def forward(self, x: torch.Tensor, cond: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """Refine along the horizon axis, optionally modulating each block by the latent.
 
         Args:
             x: Input of shape ``(N, d_hidden, H_d)``.
+            cond: Per-block FiLM conditioning ``(N, film_cond_dim)``, or ``None``. Ignored unless
+                the stack was built with ``film_cond_dim``.
 
         Returns:
             Output of the same shape.
         """
-        for block in self.blocks:
+        for index, block in enumerate(self.blocks):
             block = cast(nn.ModuleDict, block)
             y = block["conv"](x)
             y = F.gelu(block["norm"](y))
+            if self.film is not None and cond is not None:
+                film = cast(nn.ModuleList, self.film)
+                gamma, beta = cast(nn.Linear, film[index])(cond).chunk(2, dim=-1)
+                # Broadcast the per-channel modulation over the horizon axis (the last dim of y).
+                y = y * (1.0 + gamma[..., None]) + beta[..., None]
             x = x + y
         return x
 
@@ -119,6 +147,7 @@ class HorizonDecoderCore(nn.Module):
         kernel_size: int = 3,
         depth: int = 2,
         film: bool = False,
+        film_per_block: bool = False,
     ) -> None:
         """Initialize the shared horizon core.
 
@@ -128,11 +157,27 @@ class HorizonDecoderCore(nn.Module):
             kernel_size: Horizon-convolution kernel width.
             depth: Number of dilated blocks; dilations are $1, 2, 4, \\dots$.
             film: Whether to apply FiLM conditioning per horizon step.
+            film_per_block: Move FiLM from a single top-of-stack generator to one generator per
+                refine block, so every block reads the latent instead of only the input to the
+                stack. Requires ``film``. When set, the single ``film_gen`` is **not** built and the
+                per-block generators live inside ``refine``; the two are never built together, so no
+                dead generator exists.
+
+        Raises:
+            ValueError: If ``film_per_block`` is set without ``film`` -- per-block FiLM is a form of
+                FiLM, not a separate mechanism, so that combination is a construction error rather
+                than a silent no-op.
         """
         super().__init__()
         self.horizon = int(horizon)
         self.d_hidden = int(d_hidden)
         self.film = bool(film)
+        self.film_per_block = bool(film_per_block)
+        if self.film_per_block and not self.film:
+            raise ValueError(
+                "film_per_block=True requires film=True; per-block FiLM is a form of FiLM, not a "
+                "separate mechanism"
+            )
 
         # An internal forecast-step embedding: which step of the horizon this is, not what time
         # it was in the recording.
@@ -141,10 +186,15 @@ class HorizonDecoderCore(nn.Module):
 
         depth = max(1, int(depth))
         dilations = tuple(2**index for index in range(depth))
-        self.refine = _HorizonRefine(d_hidden, kernel_size=kernel_size, dilations=dilations)
+        refine_film_dim = d_hidden if (self.film and self.film_per_block) else None
+        self.refine = _HorizonRefine(
+            d_hidden, kernel_size=kernel_size, dilations=dilations, film_cond_dim=refine_film_dim
+        )
 
-        if self.film:
-            # Zero-init gives gamma = beta = 0, i.e. an identity FiLM at init.
+        if self.film and not self.film_per_block:
+            # Single top-of-stack FiLM. Zero-init gives gamma = beta = 0, i.e. an identity FiLM at
+            # construction. Built only when FiLM is on and not per-block, so the per-block core
+            # carries no dead generator.
             self.film_gen: Optional[nn.Linear] = nn.Linear(d_hidden, 2 * d_hidden)
             nn.init.zeros_(self.film_gen.weight)
             nn.init.zeros_(self.film_gen.bias)
@@ -167,13 +217,17 @@ class HorizonDecoderCore(nn.Module):
         feat = h.unsqueeze(2).expand(-1, -1, horizon, -1)
         feat = feat + self.horizon_embedding[None, None, :, :]
         if self.film_gen is not None:
+            # Single top-of-stack FiLM path (only when not per-block).
             gamma, beta = self.film_gen(h).chunk(2, dim=-1)
             feat = feat * (1.0 + gamma[:, :, None, :]) + beta[:, :, None, :]
 
         skip = feat
         # Fold (B, T) into the batch: each anchor's horizon is refined independently.
         flat = feat.reshape(batch * seq_len, horizon, d_hidden).transpose(1, 2).contiguous()
-        flat = self.refine(flat)
+        # Per-block FiLM reads the projected state h -- the only latent entry point -- so each
+        # block's modulation is a function of z alone, and the decoder still consumes nothing else.
+        cond = h.reshape(batch * seq_len, d_hidden) if self.film_per_block else None
+        flat = self.refine(flat, cond)
         feat = flat.transpose(1, 2).reshape(batch, seq_len, horizon, d_hidden)
         return self.out_norm(feat + skip)
 

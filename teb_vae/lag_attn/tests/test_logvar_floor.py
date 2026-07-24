@@ -11,7 +11,9 @@ subsequent batch forever.
 """
 from __future__ import annotations
 
+import pytest
 import torch
+from torch import nn
 
 from teb_vae.lag_attn.nets import decoders
 from teb_vae.lag_attn.nets.decoders import (
@@ -152,3 +154,90 @@ def test_horizon_anchors_are_refined_independently():
 
     with torch.no_grad():
         assert torch.allclose(core.decode(h)[:, 4], core.decode(perturbed)[:, 4], atol=1e-6)
+
+
+# ---------------------------------------------------------------------------------------
+# Per-block FiLM (film_per_block=True)
+# ---------------------------------------------------------------------------------------
+def test_per_block_film_builds_generators_not_a_single_gen_and_starts_at_zero():
+    """Per-block FiLM moves the generators into the refine stack; the single top-of-stack
+    generator is not built, so no dead parameter sits in DDP's expectation set. Every per-block
+    generator is exactly zero at construction, so it is an exact identity there."""
+    torch.manual_seed(0)
+    depth = 3
+    core = HorizonDecoderCore(d_hidden=_D_HIDDEN, horizon=_HORIZON, depth=depth, film=True,
+                              film_per_block=True)
+    assert core.film_gen is None
+    assert core.refine.film is not None and len(core.refine.film) == depth
+    for layer in core.refine.film:
+        layer = _as_linear(layer)
+        assert layer.weight.abs().max().item() == 0.0
+        assert layer.bias.abs().max().item() == 0.0
+
+
+def test_per_block_film_is_an_identity_at_construction():
+    """Zero-init per-block FiLM makes the freshly-constructed core numerically identical to a
+    FiLM-free one, so it is a strict capacity add. Scoped to the bare core, exactly like the
+    single-FiLM test above -- a core inside the assembled model is xavier-refilled afterwards."""
+    torch.manual_seed(0)
+    plain = HorizonDecoderCore(d_hidden=_D_HIDDEN, horizon=_HORIZON, depth=3, film=False)
+    torch.manual_seed(0)
+    filmed = HorizonDecoderCore(d_hidden=_D_HIDDEN, horizon=_HORIZON, depth=3, film=True,
+                                film_per_block=True)
+    filmed.load_state_dict(plain.state_dict(), strict=False)
+
+    h = torch.randn(_BATCH, _SEQ_LEN, _D_HIDDEN)
+    with torch.no_grad():
+        assert torch.allclose(plain.decode(h), filmed.decode(h), atol=1e-6)
+
+
+def test_per_block_film_generators_all_receive_gradient():
+    """Every per-block generator is on the gradient path, so plain ``'ddp'`` stays valid: a
+    generator built but never reached would be exactly the starved parameter the freeze exists to
+    avoid elsewhere."""
+    torch.manual_seed(0)
+    core = HorizonDecoderCore(d_hidden=_D_HIDDEN, horizon=_HORIZON, depth=3, film=True,
+                              film_per_block=True).train()
+    h = torch.randn(_BATCH, _SEQ_LEN, _D_HIDDEN)
+    core.decode(h).pow(2).sum().backward()
+    starved = [
+        name for name, param in core.refine.film.named_parameters()  # type: ignore[union-attr]
+        if param.grad is None
+    ]
+    assert not starved, f"per-block FiLM generators without a gradient: {starved}"
+
+
+def test_per_block_off_keeps_the_single_film_generator_and_no_refine_film():
+    """The default (per-block off) is the original single-FiLM core, unchanged: one top-of-stack
+    generator, no per-block generators."""
+    torch.manual_seed(0)
+    core = HorizonDecoderCore(d_hidden=_D_HIDDEN, horizon=_HORIZON, depth=2, film=True)
+    assert core.film_gen is not None
+    assert core.refine.film is None
+
+
+def test_per_block_film_adds_the_expected_parameter_count():
+    """At the shipped decoder geometry (d_hidden 128, depth 3): three Linear(128, 256) generators
+    replace one, so +2 x (128*256 + 256) = +66,048."""
+    torch.manual_seed(0)
+    single = HorizonDecoderCore(d_hidden=128, horizon=30, depth=3, film=True)
+    torch.manual_seed(0)
+    per_block = HorizonDecoderCore(d_hidden=128, horizon=30, depth=3, film=True,
+                                   film_per_block=True)
+    delta = sum(p.numel() for p in per_block.parameters()) - sum(
+        p.numel() for p in single.parameters()
+    )
+    assert delta == 66048
+
+
+def test_per_block_film_without_film_is_a_construction_error():
+    """Per-block FiLM is a form of FiLM; asking for it with ``film=False`` is a mistake caught at
+    construction, not a silent no-op."""
+    with pytest.raises(ValueError, match="film_per_block=True requires film=True"):
+        HorizonDecoderCore(d_hidden=_D_HIDDEN, horizon=_HORIZON, film=False, film_per_block=True)
+
+
+def _as_linear(layer) -> nn.Linear:
+    """Narrow a ``ModuleList`` element to ``nn.Linear`` for the type checker."""
+    assert isinstance(layer, nn.Linear)
+    return layer

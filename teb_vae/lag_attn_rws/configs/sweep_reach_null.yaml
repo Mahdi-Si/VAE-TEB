@@ -1,0 +1,16 @@
+# Calibration arm: causal_reach_budget_s = null -- all channels, no delay.
+#
+# Restates the shipped value on purpose: this is the unguarded endpoint of the reach sweep (the
+# clean architecture comparison, whose KL is NOT a transfer entropy), and it stays pinned even
+# if default.yaml is later revised to a finite budget. While default.yaml still ships null, the
+# headline baseline run's metrics stand in for this arm.
+#
+# Arms of this sweep build different input-adapter widths, so no two arms share a checkpoint.
+#
+#   TEB_RUN_STAMP="$(date '+%Y-%m-%d--[%H-%M]')" torchrun --nproc_per_node=7 \
+#       -m teb_vae.lag_attn_rws.trainer --config teb_vae/lag_attn_rws/configs/sweep_reach_null.yaml
+base: default.yaml
+
+model_config:
+  VAE_model:
+    causal_reach_budget_s: null

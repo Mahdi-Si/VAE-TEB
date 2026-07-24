@@ -1,0 +1,15 @@
+# Calibration arm: latent width d_z = 24.
+#
+# Everything else is inherited from default.yaml -- including the KL weight, so revising
+# default.yaml's beta_schedule.end to the KL-weight sweep's winner flows into this arm without
+# touching it. One resolved key differs, so a metric difference between arms has one
+# explanation. Deliberately no per-arm tag or MLflow run name: either would be a second delta;
+# a run is identified by its TEB_RUN_STAMP directory and its resolved-config artifact.
+#
+#   TEB_RUN_STAMP="$(date '+%Y-%m-%d--[%H-%M]')" torchrun --nproc_per_node=7 \
+#       -m teb_vae.lag_attn_rws.trainer --config teb_vae/lag_attn_rws/configs/sweep_dz_24.yaml
+base: default.yaml
+
+model_config:
+  VAE_model:
+    d_z: 24    # divisible by num_heads (4), required by the head-structured posterior

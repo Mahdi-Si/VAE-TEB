@@ -1,0 +1,21 @@
+# Calibration arm: causal_reach_budget_s = 240 (keeps 94/109 target and 43/58 source channels).
+#
+# The one two-key arm of the calibration study, by structural necessity rather than drift: a
+# 240 s budget admits channels whose forward reach needs a delay of up to ceil(240 / 4) = 60
+# steps (the current filter bank realizes a worst delay of 57), and the budget resolver
+# refuses a maximum delay that outruns warmup_period -- the
+# first max(delta) steps of a delayed stream are partly zero-filled, so they must fall inside
+# the support the loss already discards. warmup_period therefore rises to exactly the worst
+# admissible delay. The loss support shrinks to anchors [60, 270); per-anchor units are
+# unchanged, so this arm's NLL and KL remain comparable to the others'.
+#
+# Arms of this sweep build different input-adapter widths, so no two arms share a checkpoint.
+#
+#   TEB_RUN_STAMP="$(date '+%Y-%m-%d--[%H-%M]')" torchrun --nproc_per_node=7 \
+#       -m teb_vae.lag_attn_rws.trainer --config teb_vae/lag_attn_rws/configs/sweep_reach_240.yaml
+base: default.yaml
+
+model_config:
+  VAE_model:
+    causal_reach_budget_s: 240
+    warmup_period: 60

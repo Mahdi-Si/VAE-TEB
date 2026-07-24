@@ -12,7 +12,7 @@ construct without a configured logger.
 from __future__ import annotations
 
 import copy
-from typing import Callable, Tuple, cast
+from typing import Callable, Optional, Tuple, cast
 
 import torch
 import torch.nn.functional as F
@@ -111,26 +111,33 @@ class CausalMultiChannelConvBlock(nn.Module):
         stride: int = 1,
         bias: bool = False,
         dropout: float = 0.2,
+        norm_groups: Optional[int] = None,
     ) -> None:
         """Initialize the block.
 
         Args:
             in_channels: Input channel count.
             out_channels: Output channel count.
-            groups: Convolution groups.
+            groups: Convolution groups. Distinct from ``norm_groups``: this is the ``nn.Conv1d``
+                group count, which partitions the *convolution*, not the pre-norm.
             filter_size: Convolution kernel width.
             activation: Activation class, instantiated once.
             dilation: Convolution dilation.
             stride: Convolution stride.
             bias: Whether the convolution carries a bias.
             dropout: Dropout probability; ``0.0`` disables the layer entirely.
+            norm_groups: Number of groups for the pre-norm ``GroupNorm``. ``None`` (the default)
+                keeps ``min(8, in_channels)``. Set to ``1`` for a per-timestep LayerNorm-like
+                normaliser over all channels; the parameter count is unchanged either way, so
+                nothing is starved.
         """
         super().__init__()
 
         self.left_padding = (filter_size - 1) * dilation
         # min(8, C): GroupNorm needs num_groups to divide num_channels, and a narrow block can
-        # have fewer than 8 channels.
-        self.pre_norm = nn.GroupNorm(num_groups=min(8, in_channels), num_channels=in_channels)
+        # have fewer than 8 channels. An explicit norm_groups overrides that default.
+        pre_norm_groups = min(8, in_channels) if norm_groups is None else int(norm_groups)
+        self.pre_norm = nn.GroupNorm(num_groups=pre_norm_groups, num_channels=in_channels)
         self.conv = nn.Conv1d(
             in_channels,
             out_channels,
