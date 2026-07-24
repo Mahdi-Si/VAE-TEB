@@ -58,6 +58,7 @@ from teb_vae.lag_attn.eval.analyses import calibration as calibration_analysis  
 from teb_vae.lag_attn.eval.analyses import cross_subgroup as cross_subgroup_analysis  # noqa: E402
 from teb_vae.lag_attn.eval.analyses import forecast as forecast_analysis  # noqa: E402
 from teb_vae.lag_attn.eval.analyses import frequency_band as frequency_band_analysis  # noqa: E402
+from teb_vae.lag_attn.eval.analyses import kld_time_to_delivery as kld_time_to_delivery_analysis  # noqa: E402
 from teb_vae.lag_attn.eval.analyses import lag_ablation as lag_ablation_analysis  # noqa: E402
 from teb_vae.lag_attn.eval.analyses import latent as latent_analysis  # noqa: E402
 from teb_vae.lag_attn.eval.analyses import perm_control as perm_control_analysis  # noqa: E402
@@ -90,6 +91,9 @@ ANALYSIS_FUNCTIONS: Dict[str, Any] = {
     "attention": attention_analysis.run_attention_analysis,
     "te_lag": te_lag_analysis.run_te_lag_analysis,
     "latent": latent_analysis.run_latent_analysis,
+    # Latent's time-resolved companion: the same per-segment KL, cut by time to delivery and
+    # tested across clinical classes. Runs its own forward pass, so it needs no other analysis.
+    "kld_time_to_delivery": kld_time_to_delivery_analysis.run_kld_time_to_delivery_analysis,
     "calibration": calibration_analysis.run_calibration_analysis,
     "perm_control": perm_control_analysis.run_perm_control_analysis,
     "lag_ablation": lag_ablation_analysis.run_lag_ablation_analysis,
@@ -154,10 +158,21 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Cap on test samples. Overrides eval_config.max_samples.",
     )
+    # Valid names for --only / --skip are the keys of ANALYSIS_FUNCTIONS above, in run order:
+    #   forecast, frequency_band, uplift, residual, scalars, attention, te_lag, latent,
+    #   kld_time_to_delivery, calibration, perm_control, lag_ablation, samples, cross_subgroup
+    # Both flags take a comma-separated list, so several can be named at once (e.g.
+    # --only latent,kld_time_to_delivery  or  --skip samples,perm_control). `probe` and
+    # `band_partition` are NOT valid: they always run and are not selectable. An unknown name
+    # raises at startup rather than silently running everything (--only) or nothing extra (--skip).
     parser.add_argument(
-        "--only", default=None, help="Comma-separated analyses to run, to the exclusion of the rest."
+        "--only", default=None,
+        help="Comma-separated analyses to run exclusively (names from ANALYSIS_FUNCTIONS).",
     )
-    parser.add_argument("--skip", default=None, help="Comma-separated analyses to skip.")
+    parser.add_argument(
+        "--skip", default=None,
+        help="Comma-separated analyses to skip (names from ANALYSIS_FUNCTIONS).",
+    )
     return parser
 
 
@@ -647,6 +662,11 @@ RUN_ARGS: Dict[str, Any] = {
     "output_dir": None,
     "device": None,
     "max_samples": None,
+    # Comma-separated analysis names, or None for all. Valid names are the keys of
+    # ANALYSIS_FUNCTIONS: forecast, frequency_band, uplift, residual, scalars, attention, te_lag,
+    # latent, kld_time_to_delivery, calibration, perm_control, lag_ablation, samples,
+    # cross_subgroup. Several may be listed (e.g. "latent,kld_time_to_delivery"); `probe` and
+    # `band_partition` always run and are not selectable.
     "only": None,
     "skip": None,
 }
