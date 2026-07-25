@@ -82,6 +82,9 @@ _METRIC_SUFFIXES = (
     # pinned on its clamp; mean_logvar_prior and logvar_prior_floor_frac are the watch for the
     # failure that inflates the coupling readout while everything else looks healthy.
     "mean_logvar_full", "mean_logvar_base",
+    # Whether the decoder's logvar_clamp is binding, at each end. The shipped [-5, 3] is
+    # inherited from a feature-coefficient decoder and is re-derived from these two columns.
+    "logvar_full_floor_frac", "logvar_full_ceil_frac",
     "mean_logvar_prior", "mean_logvar_post", "logvar_prior_floor_frac",
     "delta_mu_rms", "mu_post_prior_gap_rms",
     # The tanh-bounded latent heads' saturation fractions: a bound that is always active is a
@@ -93,12 +96,13 @@ _METRIC_SUFFIXES = (
 #: ``train/`` variant of these would produce a column that is NaN in every row of every run.
 _VAL_ONLY_SUFFIXES = ("nll_shuffled_block", "kld_shuffled", "shuffle_penalty")
 
-#: Suffixes the *framework* injects rather than the task, and only on training batches when the
-#: spike breaker is enabled. They are the whole diagnostic surface of the breaker -- the
-#: per-step skip decision and the EMA it compares against -- and this repository has already
-#: lost a run that trained normally and then skipped every batch forever, a failure only these
-#: two columns can show.
-_TRAIN_ONLY_SUFFIXES = ("spike_skipped", "spike_ema_loss")
+#: Suffixes emitted on training batches only. Two are the *framework's*, injected when the spike
+#: breaker is enabled: they are its whole diagnostic surface -- the per-step skip decision and
+#: the EMA it compares against -- and this repository has already lost a run that trained
+#: normally and then skipped every batch forever, a failure only those two columns can show. The
+#: third is the task's pre-clip gradient norm, which exists on the training path alone and is
+#: what the provisional ``gradient_clip_val`` is re-derived from.
+_TRAIN_ONLY_SUFFIXES = ("spike_skipped", "spike_ema_loss", "grad_norm")
 
 #: The names the framework actually puts in ``callback_metrics``: every task metric is logged as
 #: ``{stage}/{name}``, plus the bare ``lr`` the base logs once per epoch. A bare suffix here
@@ -345,7 +349,13 @@ class LagAttnRwsTrainer(GraphModelBase):
             callback_list.append(
                 LagAttnRwsPlotCallback(
                     output_dir=self.train_results_dir,
-                    plot_frequency=plot_config.get("plot_frequency", 1),
+                    # The same knob the HTML loss plot above uses -- `general_config.
+                    # plot_frequency` -- and deliberately not a second key under this block.
+                    # The two figures are read together (the curves say a metric moved, the
+                    # diagnostic says what the model was doing when it moved), so two
+                    # independent cadences produce epochs where one exists and the other does
+                    # not, and nothing marks which epochs those are.
+                    plot_frequency=self.plot_every_epoch,
                     num_examples=plot_config.get("num_examples", 2),
                     file_format=plot_config.get("file_format", "pdf"),
                     mlflow_logger=self.mlflow_logger,

@@ -896,6 +896,25 @@ class SeqVaeLagAttnRws(nn.Module):
                 forward_outputs["logvar_base"] * elem_mask
             ).sum() / elem_denom
 
+            # Whether the DECODER's log-variance bound is binding, at each end separately.
+            # mean_logvar_full cannot answer this: one mean is equally consistent with a
+            # well-spread distribution and with half the mass pinned on each clamp. The shipped
+            # [-5, 3] was inherited from a decoder that emitted feature coefficients, and the
+            # config marks it for re-derivation against a z-scored raw target from exactly these
+            # two numbers. The two ends fail differently -- pinned at the floor the decoder is
+            # over-confident and the NLL's squared term explodes (this is what a loss spike looks
+            # like from the inside); pinned at the ceiling it has given up and is predicting
+            # noise, which reads as a healthy falling NLL while pred_gap goes to zero.
+            lo, hi = self.logvar_clamp
+            bound_margin = _LOGVAR_FLOOR_MARGIN_FRAC * (hi - lo)
+            logvar_full = forward_outputs["logvar_full"]
+            logvar_full_floor_frac = (
+                (logvar_full <= lo + bound_margin).to(dtype) * elem_mask
+            ).sum() / elem_denom
+            logvar_full_ceil_frac = (
+                (logvar_full >= hi - bound_margin).to(dtype) * elem_mask
+            ).sum() / elem_denom
+
             # The prior-variance floor watch. The KL carries (mu_q - mu_p)^2 / sigma_p^2, so
             # a prior variance pinned on its lower clamp inflates the coupling readout by
             # orders of magnitude while the decoder-side logvar metrics above look healthy.
@@ -940,6 +959,8 @@ class SeqVaeLagAttnRws(nn.Module):
             "anchor_coverage_frac": anchor_coverage_frac,
             "mean_logvar_full": mean_logvar_full,
             "mean_logvar_base": mean_logvar_base,
+            "logvar_full_floor_frac": logvar_full_floor_frac,
+            "logvar_full_ceil_frac": logvar_full_ceil_frac,
             "mean_logvar_prior": mean_logvar_prior,
             "mean_logvar_post": mean_logvar_post,
             "logvar_prior_floor_frac": logvar_prior_floor_frac,

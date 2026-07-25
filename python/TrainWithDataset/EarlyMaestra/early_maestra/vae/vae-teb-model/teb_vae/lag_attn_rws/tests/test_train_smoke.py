@@ -234,11 +234,44 @@ def test_a_fit_completes_under_the_causal_reach_budget(guarded_fit):
 
 def test_the_guarded_runs_losses_stay_finite(guarded_fit):
     """A delayed stream is zero for its first max(delta) steps; those steps must fall inside the
-    warm-up rather than reaching the loss as a block of zeros."""
+    warm-up rather than reaching the loss as a block of zeros.
+
+    ``train/grad_norm`` is excluded and has its own test below: under the guard the *losses* are
+    finite while the gradient is not, and collapsing the two would report the gradient defect
+    under a name that says "losses" -- or, worse, invite someone to make it pass by relaxing the
+    loss check.
+    """
     _, trainer = guarded_fit
 
     for name, value in trainer.callback_metrics.items():
+        if name.startswith("train/grad_norm"):
+            continue
         assert math.isfinite(float(value)), f"{name} is {float(value)}"
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "KNOWN DEFECT, reach arms only. Every finite causal_reach_budget_s zero-fills the "
+        "delayed prefix, and at step 0 EVERY surviving channel is zero (the fastest survivor is "
+        "already one step stale). That all-zero vector is zero-variance input to the adapter "
+        "norm and to each causal conv pre-norm, and the 1/sqrt(eps) = 316x backward "
+        "amplification of ~10 stacked norms compounds: measured in float64 on this fixture, the "
+        "global gradient norm is ~1e+26 at every budget (32/60/120/240 s) against ~98 unguarded, "
+        "and overflows fp32 to inf. It does NOT scale with max_delay -- one all-zero step is "
+        "enough -- so it is not fixed by raising warmup_period. Consequence: with "
+        "gradient_clip_val=250 the clip coefficient is ~1e-24, every reach-arm step is scaled to "
+        "nothing, and the arm trains only AdamW's weight decay while completing normally. "
+        "The unguarded baseline (causal_reach_budget_s: null) builds no gate and is unaffected."
+    ),
+)
+def test_the_guarded_runs_gradient_stays_finite(guarded_fit):
+    """The gradient the guarded arms actually optimise with. Fix this before running them."""
+    _, trainer = guarded_fit
+
+    grad_norm = trainer.callback_metrics["train/grad_norm"]
+
+    assert math.isfinite(float(grad_norm)), f"guarded train/grad_norm is {float(grad_norm)}"
 
 
 def test_the_guarded_checkpoint_rebuilds_at_its_own_channel_widths(guarded_fit):

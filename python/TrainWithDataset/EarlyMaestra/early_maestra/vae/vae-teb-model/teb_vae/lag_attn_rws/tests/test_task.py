@@ -32,6 +32,7 @@ _STAGE_METRICS = {
     "kld_active_frac", "kld_beta",
     "anchor_coverage_frac",
     "mean_logvar_full", "mean_logvar_base",
+    "logvar_full_floor_frac", "logvar_full_ceil_frac",
     "mean_logvar_prior", "mean_logvar_post", "logvar_prior_floor_frac",
     "delta_mu_rms", "mu_post_prior_gap_rms",
     "mu_prior_sat_frac", "delta_mu_sat_frac",
