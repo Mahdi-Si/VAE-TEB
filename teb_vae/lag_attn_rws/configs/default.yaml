@@ -26,7 +26,17 @@ general_config:
   # change from the summed raw NLL, so the sibling's stability-tuned value transfers; the clip
   # threshold below does NOT and is scaled instead.
   lr: 0.0003
-  lr_milestone: [60, 120]   # singular; the experiment driver reads this exact key
+  # Singular; the experiment driver reads this exact key. Decay is x0.1 per milestone.
+  #
+  # Deliberately LATER than the sibling's [60, 120], and the reason is the beta ramp below. z is
+  # the only route to the decoder here, so the source pathway starts at exactly zero KL and can
+  # only earn coupling once beta is on -- which is epoch 50. Under [60, 120] that leaves ~10
+  # epochs at 3e-4 with the KL fully weighted, then 3e-6 for the rest of the run: the coupling
+  # readout would be measured on a model that was effectively frozen before it could open. These
+  # milestones give 400 epochs at full LR with beta at its endpoint. Every sweep arm inherits
+  # them, so the arms stay comparable to each other; they are no longer LR-comparable to
+  # teb_vae/lag_attn, which must be stated beside any base-vs-sibling number.
+  lr_milestone: [400, 800]
   plot_frequency: 1
   epochs: 5000
   accumulate_grad_batches: 1
@@ -308,8 +318,11 @@ advanced_config:
     # their uncertainty bands, the prior latent beside the source-derived shift, the per-dimension
     # and total KL, and the two lag panels. The trainer imports the plotter only when this is on,
     # so it costs nothing when off.
+    #
+    # There is deliberately NO plot_frequency here: the cadence is `general_config.plot_frequency`,
+    # the same key that drives loss_plot_epoch.html, so the curves and the figure that explains
+    # them always exist for the same epochs.
     lag_attn_rws_plotting:
       enabled: true
-      plot_frequency: 1
       num_examples: 2
       file_format: "pdf"

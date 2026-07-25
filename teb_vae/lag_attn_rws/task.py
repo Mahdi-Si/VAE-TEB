@@ -162,6 +162,44 @@ class SeqVaeLagAttnRwsTask(LightningModelBase):
             f"{allocated_gib:.2f} GiB allocated, {reserved_gib:.2f} GiB reserved"
         )
 
+    def on_before_optimizer_step(self, optimizer: Any) -> None:
+        r"""Log the global gradient $L_2$ norm **before** clipping, once per optimizer step.
+
+        ``advanced_config.trainer.gradient_clip_val`` ships at a provisional $250$ -- scaled from
+        the sibling's $0.5$ by the $\approx 2 \times 480$ change in loss magnitude, not measured
+        -- and the config says to re-derive it from the first real run. Nothing else records the
+        quantity it must be derived from: Lightning removed ``track_grad_norm`` in 2.x, so a run
+        reports the clip threshold it used and never what it was clipping. A threshold far below
+        the typical norm rescales every step (the run is really training at a much lower
+        effective learning rate); far above it, the clip is decoration and a genuine blow-up
+        reaches the weights.
+
+        The hook order is what makes the number the right one: Lightning's precision plugin calls
+        this hook and *then* ``_clip_gradients``, so what is measured here is the pre-clip norm --
+        the only version comparable against ``gradient_clip_val``. Under DDP the gradients have
+        already been all-reduced by the end of the backward, so every rank measures the same
+        value and no synchronisation is needed. On a batch the spike breaker skipped the norm is
+        $\approx 0$ by construction; ``train/spike_skipped`` is the column that says so.
+
+        Args:
+            optimizer: The optimizer Lightning is about to step; unused (the gradients are read
+                off the module's own parameters, which is the same set).
+        """
+        norms = [
+            torch.linalg.vector_norm(parameter.grad.detach())
+            for parameter in self.parameters()
+            if parameter.grad is not None
+        ]
+        if not norms:
+            return
+        self.log(
+            "train/grad_norm",
+            torch.linalg.vector_norm(torch.stack(norms)),
+            on_step=True,
+            on_epoch=True,
+            logger=True,
+        )
+
     # ------------------------------------------------------------------
     # Batch -> model inputs
     # ------------------------------------------------------------------
