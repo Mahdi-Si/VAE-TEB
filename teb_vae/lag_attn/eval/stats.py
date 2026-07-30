@@ -2,7 +2,9 @@ r"""Non-parametric rank statistics shared by more than one analysis.
 
 These are the pieces the cross-subgroup and the KLD-to-delivery analyses both need: the Holm
 step-down correction, Cliff's delta and its magnitude label, the Kruskal-Wallis omnibus wrapper,
-and the pairwise Mann-Whitney sweep. They live here rather than inside either analysis because
+and the pairwise Mann-Whitney sweep -- plus the two an unpaired rank sweep cannot answer: a
+paired within-recording comparison (:func:`wilcoxon_paired`) and an interval on a mean over
+recordings (:func:`bootstrap_ci`). They live here rather than inside either analysis because
 ``analyses/__init__.py``'s rule is that analyses never import one another -- so a helper two of
 them share has to sit one layer down, exactly as ``masks`` and ``metrics`` do.
 
@@ -14,7 +16,7 @@ test actually runs rather than at module load.
 """
 from __future__ import annotations
 
-from typing import Any, Dict, List, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Sequence, Tuple
 
 import numpy as np
 
@@ -22,6 +24,11 @@ import numpy as np
 #: power and its $p$-value is an artifact of the group size rather than a statement about the data,
 #: so such a group is *excluded and recorded* rather than silently entered.
 MIN_GROUP_SIZE = 3
+
+#: Bootstrap resamples used when a caller does not say. Two thousand is the conventional floor for
+#: a percentile interval: the $2.5$th and $97.5$th order statistics of $2000$ draws are stable to
+#: about the third decimal, and the cost is one array index per draw.
+DEFAULT_BOOTSTRAP_RESAMPLES = 2000
 
 #: Cliff's delta magnitude thresholds, as Romano et al. give them. Reported beside every delta so
 #: a reader does not have to carry the table, and so "significant" is never quoted without the
@@ -146,6 +153,156 @@ def kruskal_across_groups(samples: Dict[str, np.ndarray]) -> Dict[str, Any]:
     statistic, p_value = stats.kruskal(*samples.values())
     record["statistic"] = float(statistic)
     record["p_value"] = float(p_value)
+    return record
+
+
+def wilcoxon_paired(
+    left: Iterable[float],
+    right: Iterable[float],
+    *,
+    label_left: str = "left",
+    label_right: str = "right",
+) -> Dict[str, Any]:
+    r"""Wilcoxon signed-rank test on two readouts measured on the *same* recordings.
+
+    Mann-Whitney compares two independent groups; this is the paired counterpart, for the
+    comparisons where each recording contributes both values -- a branch against a control on the
+    same segment, a model score against a baseline's. Pairing removes the between-recording
+    variance, which dominates every readout in this pipeline, so the paired test is the one with
+    power here and the unpaired one would throw that away.
+
+    The statistic is $\min(W^+, W^-)$, the sum of the ranks of the $|d_i|$ carrying one sign,
+    over the pairs with $d_i = \mathrm{left}_i - \mathrm{right}_i \ne 0$. Pairs where either
+    value is non-finite are dropped and counted rather than imputed: a recording that scored no
+    anchors on one branch is absent from the comparison, not tied on it.
+
+    Args:
+        left: One value per recording.
+        right: The paired value per recording, in the same order.
+        label_left: Name of the left readout, for the orientation note.
+        label_right: Name of the right readout.
+
+    Returns:
+        The test, the number of usable pairs, the statistic, the $p$-value, and the median paired
+        difference. Both statistics are ``NaN`` and a ``note`` is set -- never an exception --
+        when the test could not run: mismatched lengths, fewer than :data:`MIN_GROUP_SIZE`
+        finite pairs, or differences that are identically zero, which ``scipy`` rejects because
+        the signed ranks then carry nothing.
+    """
+    from scipy import stats
+
+    x = np.asarray(list(left), dtype=np.float64)
+    y = np.asarray(list(right), dtype=np.float64)
+    record: Dict[str, Any] = {
+        "test": "wilcoxon-signed-rank",
+        "label_left": label_left,
+        "label_right": label_right,
+        "n_pairs": 0,
+        "statistic": float("nan"),
+        "p_value": float("nan"),
+        "median_difference": float("nan"),
+        "difference_orientation": f"positive means {label_left} runs higher than {label_right}",
+    }
+    if x.size != y.size:
+        record["note"] = f"unpaired inputs: {x.size} left values against {y.size} right values"
+        return record
+
+    usable = np.isfinite(x) & np.isfinite(y)
+    differences = x[usable] - y[usable]
+    record["n_pairs"] = int(differences.size)
+    record["n_dropped"] = int(x.size - differences.size)
+    if differences.size < MIN_GROUP_SIZE:
+        record["note"] = (
+            f"only {differences.size} finite pair(s); below the minimum of {MIN_GROUP_SIZE} a "
+            f"signed-rank p-value is an artifact of the pair count"
+        )
+        return record
+
+    record["median_difference"] = float(np.median(differences))
+    if not np.any(differences != 0.0):
+        # Not a failure: the two readouts are identical on every recording, which is a finding.
+        record["note"] = "every paired difference is exactly zero, so the signed ranks carry nothing"
+        return record
+
+    # Read by attribute rather than unpacked: ``wilcoxon`` returns a named result object, and
+    # tuple-unpacking it loses which field is which at the call site. Typed ``Any`` because the
+    # installed scipy stubs do not describe that object's fields.
+    result: Any = stats.wilcoxon(differences, alternative="two-sided")
+    record["statistic"] = float(result.statistic)
+    record["p_value"] = float(result.pvalue)
+    return record
+
+
+def bootstrap_ci(
+    values: Iterable[float],
+    *,
+    confidence: float = 0.95,
+    resamples: int = DEFAULT_BOOTSTRAP_RESAMPLES,
+    seed: int = 0,
+) -> Dict[str, Any]:
+    r"""A seeded percentile bootstrap interval for the mean of a per-recording vector.
+
+    $$\left[\hat{\theta}^{*}_{(\alpha/2)},\ \hat{\theta}^{*}_{(1 - \alpha/2)}\right],
+    \qquad \hat{\theta}^{*}_b = \frac{1}{n}\sum_{i} v_{\pi_b(i)}$$
+
+    Percentile rather than normal-approximation, because the per-recording distributions here are
+    small-$n$ and visibly skewed, and a $\pm 1.96\,\mathrm{SE}$ interval on such a sample reports
+    a symmetry the data does not have.
+
+    **Recordings, not anchors.** The caller passes one value per recording; consecutive anchors
+    overlap in $29$ of their $30$ horizon steps and one recording contributes tens of segments, so
+    resampling anchors would report an interval narrower than the data supports by roughly the
+    pseudo-replication factor.
+
+    Args:
+        values: One value per recording. Non-finite entries are dropped and counted.
+        confidence: Coverage of the interval, in $(0, 1)$.
+        resamples: Bootstrap resamples.
+        seed: Seed for the resampling, so the interval is reproducible from the summary alone.
+
+    Returns:
+        The point estimate, the interval, the honest $n$, and the settings that produced it. The
+        point and the bounds are ``NaN`` with a ``note`` -- never an exception -- when fewer than
+        :data:`MIN_GROUP_SIZE` finite values are available.
+
+    Raises:
+        ValueError: If ``confidence`` is not in $(0, 1)$ or ``resamples`` is not positive. Those
+            are caller errors rather than data conditions, and a silently degenerate interval
+            would read as a measurement.
+    """
+    if not 0.0 < float(confidence) < 1.0:
+        raise ValueError(f"confidence must lie in (0, 1), got {confidence!r}.")
+    if int(resamples) < 1:
+        raise ValueError(f"resamples must be positive, got {resamples!r}.")
+
+    sample = np.asarray(list(values), dtype=np.float64)
+    finite = sample[np.isfinite(sample)]
+    alpha = 1.0 - float(confidence)
+    record: Dict[str, Any] = {
+        "statistic": "mean",
+        "n": int(finite.size),
+        "n_dropped": int(sample.size - finite.size),
+        "confidence": float(confidence),
+        "resamples": int(resamples),
+        "seed": int(seed),
+        "method": "percentile bootstrap over recordings",
+        "point": float("nan"),
+        "lo": float("nan"),
+        "hi": float("nan"),
+    }
+    if finite.size < MIN_GROUP_SIZE:
+        record["note"] = (
+            f"only {finite.size} finite value(s); below the minimum of {MIN_GROUP_SIZE} a "
+            f"bootstrap interval reproduces the sample rather than estimating its spread"
+        )
+        return record
+
+    record["point"] = float(finite.mean())
+    generator = np.random.default_rng(int(seed))
+    draws = generator.integers(0, finite.size, size=(int(resamples), finite.size))
+    means = finite[draws].mean(axis=1)
+    record["lo"] = float(np.quantile(means, alpha / 2.0))
+    record["hi"] = float(np.quantile(means, 1.0 - alpha / 2.0))
     return record
 
 

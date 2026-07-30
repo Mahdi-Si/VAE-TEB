@@ -34,6 +34,59 @@ _LOG_2PI = math.log(2.0 * math.pi)
 KLD_ACTIVE_EPS = 1e-2
 
 
+def raw_sample_score(
+    mu: torch.Tensor,
+    target: torch.Tensor,
+    *,
+    likelihood: str,
+    logvar: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    r"""The unmasked, unsummed score of every raw forecast sample.
+
+    Under ``'gaussian_nll'`` the per-sample term carries the full constant,
+
+    $$-\log p(x \mid \mu, \sigma^2) = \tfrac{1}{2}\left[\log 2\pi + \log\sigma^2
+    + (x - \mu)^2 e^{-\log\sigma^2}\right],$$
+
+    so summing it over an anchor's $H \cdot R$ forecast samples gives a true negative log-density
+    in nats. Under ``'mse'`` the per-sample term is $(x - \mu)^2$.
+
+    Exposed separately from :func:`masked_raw_block_per_anchor` because the *same* elementwise
+    term is reduced over two different axis sets: over $(\tau, r)$ for the per-anchor block score
+    the objective uses, and over $r$ alone for the horizon-resolved score the evaluation reads.
+    Written twice, the two reductions could stop being decompositions of one another -- and the
+    property that the horizon curve sums back to the anchor score is exactly what makes it
+    readable.
+
+    Every argument broadcasts, so a constant-mean baseline may be passed as a $(B, T, 1, 1)$
+    tensor and a fixed observation variance as a scalar; the returned score is the broadcast
+    shape, which ``target`` always fixes to the full grid.
+
+    Args:
+        mu: Forecast mean, broadcastable to $(B, T_{\mathrm{valid}}, H, R)$.
+        target: Raw future target $(B, T_{\mathrm{valid}}, H, R)$.
+        likelihood: ``'mse'`` or ``'gaussian_nll'``.
+        logvar: Forecast log-variance, broadcastable to the same shape; required under
+            ``'gaussian_nll'``, ignored under ``'mse'``.
+
+    Returns:
+        The per-raw-sample score $(B, T_{\mathrm{valid}}, H, R)$.
+
+    Raises:
+        ValueError: On an unknown ``likelihood``, or ``'gaussian_nll'`` without ``logvar``.
+    """
+    validate_choice(likelihood, LIKELIHOOD_CHOICES, "likelihood")
+
+    diff2 = (target - mu) ** 2
+    if likelihood == "mse":
+        return diff2
+    if logvar is None:
+        raise ValueError(
+            "likelihood='gaussian_nll' requires logvar; only 'mse' works without one"
+        )
+    return 0.5 * (_LOG_2PI + logvar + diff2 * torch.exp(-logvar))
+
+
 def masked_raw_block_per_anchor(
     mu: torch.Tensor,
     target: torch.Tensor,
@@ -44,15 +97,9 @@ def masked_raw_block_per_anchor(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     r"""Each anchor's own masked block score, before any averaging.
 
-    Under ``'gaussian_nll'`` the per-sample term carries the full constant,
-
-    $$-\log p(x \mid \mu, \sigma^2) = \tfrac{1}{2}\left[\log 2\pi + \log\sigma^2
-    + (x - \mu)^2 e^{-\log\sigma^2}\right],$$
-
-    so an anchor's block value is a true negative log-density in nats over its $H \cdot R$
-    forecast samples. Under ``'mse'`` the per-sample term is $(x - \mu)^2$, summed over the same
-    block so the scale convention (and therefore the meaning of $\beta$) is preserved across
-    likelihoods.
+    The per-sample term is :func:`raw_sample_score`; this sums it over the anchor's $H \cdot R$
+    forecast samples. Under ``'mse'`` the sum runs over the same block, so the scale convention
+    (and therefore the meaning of $\beta$) is preserved across likelihoods.
 
     Separated from the reduction below because a Monte Carlo predictive estimate must combine
     *per-anchor* scores across latent draws before averaging over anchors, and a second copy of
@@ -78,22 +125,14 @@ def masked_raw_block_per_anchor(
     Raises:
         ValueError: On an unknown ``likelihood``, or ``'gaussian_nll'`` without ``logvar``.
     """
-    validate_choice(likelihood, LIKELIHOOD_CHOICES, "likelihood")
-
-    diff2 = (target - mu) ** 2
-    if likelihood == "gaussian_nll":
-        if logvar is None:
-            raise ValueError(
-                "likelihood='gaussian_nll' requires logvar; only 'mse' works without one"
-            )
-        per_sample = 0.5 * (_LOG_2PI + logvar + diff2 * torch.exp(-logvar))
-    else:
-        per_sample = diff2
+    per_sample = raw_sample_score(mu, target, likelihood=likelihood, logvar=logvar)
 
     block_per_anchor = (per_sample * mask[..., None]).sum(dim=(2, 3))  # (B, T_valid)
     # The same indicator kl_mask is built from, so the two terms are averaged over one anchor
     # set rather than two that agree only by coincidence.
-    contributing = contributing_anchors(mask).to(mu.dtype)              # (B, T_valid)
+    # Taken from the score's dtype rather than from ``mu``'s: a constant-mean baseline may arrive
+    # as a scalar of another dtype, and the indicator has to match what it accompanies.
+    contributing = contributing_anchors(mask).to(block_per_anchor.dtype)  # (B, T_valid)
     return block_per_anchor, contributing
 
 

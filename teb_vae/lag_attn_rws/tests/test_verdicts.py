@@ -20,6 +20,7 @@ from teb_vae.lag_attn_rws.eval.metrics import (
     FAIL,
     INCONCLUSIVE,
     PASS,
+    VERDICT_ORDER,
     Aggregate,
     build_verdicts,
 )
@@ -38,15 +39,31 @@ def _by_name(verdicts) -> dict:
 
 def test_every_verdict_is_reported_every_time():
     """A criterion that silently disappears when it cannot be evaluated reads as a criterion
-    that passed."""
+    that passed.
+
+    Driven from the registry rather than from a literal list, deliberately. The list here was the
+    four original criteria; the three variance criteria that joined them made this the *third*
+    place a verdict name had to be written down, and a test that has to be edited to add a
+    criterion stops being a guard against one going missing. The four originals are pinned
+    separately below, so relaxing to the registry does not relax what they are.
+    """
     names = [verdict.name for verdict in build_verdicts(_aggregate())]
 
-    assert names == [
+    assert names == list(VERDICT_ORDER)
+    assert len(names) == len(set(names))
+
+
+def test_the_four_original_criteria_are_still_reported_in_order():
+    """The registry may grow; it may not quietly drop one of these."""
+    names = [verdict.name for verdict in build_verdicts(_aggregate())]
+    originals = [
         "predictive_improvement",
         "source_specificity",
         "prior_carries_target_state",
         "latent_not_collapsed",
     ]
+
+    assert [name for name in names if name in originals] == originals
 
 
 def test_no_verdict_is_a_bare_boolean_and_each_carries_its_numbers():

@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import math
+import sys
 import time
 import traceback
 from dataclasses import dataclass, field
@@ -111,6 +112,11 @@ def json_safe(value: Any) -> Any:
     ``null`` natively, and a metric that is NaN is reported as such by the analysis that
     produced it rather than by its serialised form.
 
+    A ``torch.Tensor`` is converted through its own ``tolist``. The framework is reached for
+    lazily and only when it is *already* imported: a tensor cannot exist unless ``torch`` is in
+    ``sys.modules``, so the guard costs one dict lookup, and this module stays importable -- and
+    testable -- on a box with no torch installed.
+
     Args:
         value: Any value destined for the summary.
 
@@ -128,6 +134,9 @@ def json_safe(value: Any) -> Any:
         return number if math.isfinite(number) else None
     if isinstance(value, np.ndarray):
         return [json_safe(item) for item in value.tolist()]
+    torch = sys.modules.get("torch")
+    if torch is not None and isinstance(value, torch.Tensor):
+        return json_safe(value.detach().cpu().tolist())
     if isinstance(value, Path):
         return str(value)
     if isinstance(value, dict):

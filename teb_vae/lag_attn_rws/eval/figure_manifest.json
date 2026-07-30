@@ -1,0 +1,55 @@
+{
+  "_comment": "Every figure a full evaluation run emits, by analysis directory, with dynamically-named figure families recorded as families. Kept equal to a real run by tests/test_eval_smoke.py; read by the fast documentation tests in tests/test_eval_docs.py. Regenerate by deleting this file and running the smoke suite once.",
+  "figures": {
+    "attention": [
+      "attention_profile.pdf",
+      "lag_heatmap.pdf"
+    ],
+    "calibration": [
+      "logvar_distribution.pdf",
+      "pit_reliability.pdf"
+    ],
+    "coupling": [
+      "pred_gap_distribution.pdf"
+    ],
+    "cross_subgroup": [
+      "subgroup_heatmap.pdf"
+    ],
+    "events": [
+      "conditioned_coupling.pdf",
+      "contraction_triggered.pdf",
+      "deceleration_skill.pdf"
+    ],
+    "forecast": [
+      "anchor_profile.pdf",
+      "baseline_comparison.pdf",
+      "forecast_overlay.pdf",
+      "horizon_skill.pdf"
+    ],
+    "lag_kl": [
+      "lag_kl_profile.pdf"
+    ],
+    "latent": [
+      "kl_spectrum.pdf"
+    ],
+    "sufficiency": [
+      "sufficiency.pdf"
+    ],
+    "time_to_delivery": [
+      "time_to_delivery_trajectory.pdf"
+    ],
+    "trajectory": [
+      "trajectory_profile.pdf"
+    ]
+  },
+  "families": {
+    "grouped_variants": {
+      "pattern": "*_by_clinical_class.pdf and *_by_subgroup.pdf, beside the table each resolves",
+      "guide_marker": "_by_clinical_class.pdf"
+    },
+    "sample_pages": {
+      "pattern": "samples/<selection>/sample<index>_<guid>_epoch<epoch>.pdf",
+      "guide_marker": "The per-sample pages"
+    }
+  }
+}

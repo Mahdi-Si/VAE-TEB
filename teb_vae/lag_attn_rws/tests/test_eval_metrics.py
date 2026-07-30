@@ -17,13 +17,17 @@ import pytest
 import torch
 
 from teb_vae.lag_attn_rws.eval.metrics import (
+    VECTOR_READOUTS,
     Aggregate,
     BatchReadout,
     aggregate_by_recording,
     batch_guids,
     batch_size_of,
+    build_verdicts,
     evaluate,
     evaluate_batch,
+    lag_anchor_counts,
+    lag_profiles,
     latent_health,
     lag_summary,
 )
@@ -136,42 +140,103 @@ def test_a_batch_too_small_to_derange_scores_only_the_two_real_branches(trained_
     assert "mc_nll_shuffled_block" not in readout.columns
 
 
-def test_the_per_dimension_kl_and_the_lag_profiles_have_the_model_shapes(
-    trained_task, stub_batch
-):
+def test_the_per_dimension_kl_and_the_lag_profiles_are_per_sample(trained_task, stub_batch):
+    """Amended deliberately: these three were $(d_z,)$ and $(L,)$ -- reduced over the batch
+    inside ``evaluate_batch`` and then averaged across batches with equal weight per batch, while
+    every scalar column went per recording. So ``latent_health.kl_total_nats`` did not in general
+    equal ``readouts.source_conditioned_kl_raw``, which it is a decomposition of. They now carry
+    a leading sample axis and travel the scalars' aggregation chain, and two more vectors travel
+    it with them.
+    """
     readout = evaluate_batch(trained_task, stub_batch, num_samples=1)
     model = trained_task.orig_model
+    num_lags = model.max_lag + 1
 
-    assert readout.kld_per_dim.shape == (model.d_z,)
-    assert readout.lag_profile.shape == (model.max_lag + 1,)
-    assert readout.attention_profile.shape == (model.max_lag + 1,)
+    assert readout.kld_per_dim.shape == (BATCH, model.d_z)
+    assert readout.lag_profile.shape == (BATCH, num_lags)
+    assert readout.lag_profile_support_corrected.shape == (BATCH, num_lags)
+    assert readout.lag_support.shape == (BATCH, num_lags)
+    assert readout.attention_profile.shape == (BATCH, num_lags)
 
 
 def test_the_lag_map_profile_sums_to_the_total_kl(trained_task, stub_batch):
     r"""The identity the head-structured latent buys: $\sum_\ell \widetilde K_{t,\ell} = K_t$,
-    exactly rather than in expectation, because the attention probabilities carry no dropout."""
+    exactly rather than in expectation, because the attention probabilities carry no dropout.
+
+    Asserted per sample now that the profile is per sample, which is strictly the stronger claim:
+    the batch-level equality follows from it, and a compensating pair of per-sample errors cannot
+    hide inside it.
+    """
     readout = evaluate_batch(trained_task, stub_batch, num_samples=1)
-    support = kl_support_counts(trained_task, stub_batch)
-    kl_total = float(
-        (readout.columns["source_conditioned_kl_raw"] * support).sum() / support.sum()
+
+    assert torch.allclose(
+        readout.lag_profile.sum(dim=1),
+        readout.columns["source_conditioned_kl_raw"],
+        rtol=1e-5,
     )
 
-    assert float(readout.lag_profile.sum()) == pytest.approx(kl_total, rel=1e-5)
+
+def test_the_per_dimension_kl_sums_to_the_headline_kl_across_unequal_recordings(trained_task):
+    """The identity the aggregation bug broke, in the shape that exposes it: two recordings whose
+    segments score different numbers of anchors.
+
+    The old per-batch reduction made ``kld_per_dim`` an *anchor-weighted* mean over the batch
+    while ``source_conditioned_kl_raw`` was per recording then across recordings, so the two
+    agreed only when every recording contributed equally -- which is exactly the case a fixture
+    of identical stub batches produces, and exactly the case a real test split never does.
+    """
+    batch = make_stub_batch(batch_size=4, seed=5)
+    batch.guid = ["a", "a", "b", "b"]
+    # Recording 'a' loses the back of its window, so it scores fewer anchors than 'b' does --
+    # but not zero, which would exclude it and leave nothing to disagree about.
+    batch.weight[:2, 9:] = 0.0
+
+    results = evaluate(trained_task, _OneBatchLoader([batch]), num_samples=1)
+
+    assert results["n_recordings"] == 2
+    assert results["latent_health"]["kl_total_nats"] == pytest.approx(
+        results["readouts"]["source_conditioned_kl_raw"], rel=1e-6
+    )
+    assert results["latent_health"]["kl_total_nats"] > 0.0, "a zero KL would agree vacuously"
+
+    # Non-vacuity: the anchor-weighted mean the removed per-batch reduction produced is a
+    # genuinely different number here, so the agreement above is a property of the aggregation
+    # rather than of a fixture in which every recording happens to weigh the same. The KL is a
+    # function of mu and logvar alone, so a second forward reproduces it exactly.
+    readout = evaluate_batch(trained_task, batch, num_samples=1)
+    support = kl_support_counts(trained_task, batch)
+    anchor_weighted = float(
+        (readout.columns["source_conditioned_kl_raw"] * support).sum() / support.sum()
+    )
+    assert anchor_weighted != pytest.approx(
+        results["readouts"]["source_conditioned_kl_raw"], rel=1e-3
+    )
 
 
 # =============================================================================
 # Aggregation
 # =============================================================================
-def _readout(guids, values, anchors) -> BatchReadout:
-    """A hand-built readout carrying one column, for the aggregation arithmetic."""
-    width = 3
+def _readout(guids, values, anchors, vectors=None) -> BatchReadout:
+    """A hand-built readout carrying one column, for the aggregation arithmetic.
+
+    Args:
+        guids: Recording identifier per sample.
+        values: The single column's per-sample values.
+        anchors: Contributing anchors per sample; a zero excludes that sample.
+        vectors: Optional per-sample vector values, one row per sample, shared by every vector
+            readout. Zeros when omitted.
+    """
+    rows = torch.zeros(len(guids), 3) if vectors is None else torch.tensor(
+        vectors, dtype=torch.float32
+    )
     return BatchReadout(
         guids=list(guids),
         columns={"score": torch.tensor(values, dtype=torch.float32)},
         n_anchors=torch.tensor(anchors, dtype=torch.float32),
-        kld_per_dim=torch.zeros(width),
-        lag_profile=torch.zeros(width),
-        attention_profile=torch.zeros(width),
+        # Driven from the readout set rather than listed: every vector travels the identical
+        # chain, so this helper tests the chain rather than a particular vector, and a readout
+        # added later reaches these assertions without an edit here.
+        **{name: rows for name in VECTOR_READOUTS},
     )
 
 
@@ -202,6 +267,28 @@ def test_a_recording_with_no_scored_segments_does_not_reach_the_headline():
     assert aggregate.n_samples_without_anchors == 1
 
 
+def test_a_pass_that_scored_nothing_reports_no_headline_rather_than_zeros():
+    """The across-recording denominator must not be clamped to 1 when no recording survived.
+
+    A fabricated ``0.0`` per column is not a neutral placeholder: it is a number the verdicts
+    then read as a measurement. The loss criteria would FAIL on ``0.0 == 0.0`` and the two clamp
+    criteria would PASS on a log-variance nothing ever wrote -- a run that measured nothing
+    reporting a diagnosis instead of admitting it measured nothing.
+    """
+    aggregate = aggregate_by_recording([_readout(["a", "b"], [4.0, 6.0], [0, 0])])
+
+    assert aggregate.overall == {}, "no recording contributed, so there is no headline"
+    assert aggregate.n_recordings == 0
+    assert aggregate.n_samples == 2, "every segment seen is still counted"
+    assert aggregate.n_samples_without_anchors == 2
+    assert aggregate.kld_per_dim == [], "the vectors travel the same chain and are equally absent"
+
+    statuses = {verdict.name: verdict.status for verdict in build_verdicts(aggregate)}
+    assert set(statuses.values()) == {"INCONCLUSIVE"}, (
+        f"a pass that measured nothing must not diagnose anything, got {statuses}"
+    )
+
+
 def test_segments_of_one_recording_count_once(trained_task):
     """Three segments of recording A and one of B: A must not outvote B three to one."""
     aggregate = aggregate_by_recording(
@@ -213,6 +300,28 @@ def test_segments_of_one_recording_count_once(trained_task):
     assert aggregate.per_recording["b"]["score"] == pytest.approx(10.0)
     # The recording mean, not the segment mean, which would be 4.0.
     assert aggregate.overall["score"] == pytest.approx(6.0)
+
+
+def test_the_vector_readouts_take_the_same_route_as_the_scalars():
+    """Same per-recording denominator, same zero-anchor exclusion. Written on the arithmetic
+    rather than on a model so the chain is pinned independently of what produces the numbers."""
+    aggregate = aggregate_by_recording(
+        [
+            _readout(
+                ["a", "a", "b"],
+                [1.0, 3.0, 10.0],
+                [10, 10, 10],
+                vectors=[[1.0, 0.0, 0.0], [3.0, 0.0, 0.0], [10.0, 0.0, 0.0]],
+            ),
+            _readout(["b"], [0.0], [0], vectors=[[99.0, 0.0, 0.0]]),
+        ]
+    )
+
+    # a -> 2.0, b -> 10.0 (the zero-anchor segment measured nothing), across recordings -> 6.0.
+    assert aggregate.overall["score"] == pytest.approx(6.0)
+    assert aggregate.kld_per_dim[0] == pytest.approx(6.0)
+    assert aggregate.lag_profile[0] == pytest.approx(6.0)
+    assert aggregate.lag_support[0] == pytest.approx(6.0)
 
 
 def test_an_absent_identifier_still_aggregates(trained_task, stub_batch):
@@ -290,6 +399,92 @@ def test_the_lag_report_folds_in_a_configured_input_delay():
 
 def test_the_lag_report_is_empty_when_nothing_was_collected():
     assert lag_summary(Aggregate()) == {}
+
+
+# =============================================================================
+# The per-lag support correction
+# =============================================================================
+#: The shipped geometry, which is what the anchor counts below are stated in: $T = 300$ steps, a
+#: $30$-step warm-up, a $30$-step horizon and $L = 91$ lags, so the trained anchor range is
+#: $[30, 270)$ -- 240 anchors.
+_SHIPPED_T, _SHIPPED_WARMUP, _SHIPPED_T_VALID, _SHIPPED_NUM_LAGS = 300, 30, 270, 91
+
+
+def _shipped_support_and_validity():
+    """Full KL support over the trained anchor range, with the attention's own lag mask."""
+    from teb_vae.lag_attn.nets.attention import LagCrossAttention
+
+    support = torch.zeros(1, _SHIPPED_T)
+    support[:, _SHIPPED_WARMUP:_SHIPPED_T_VALID] = 1.0
+    attention = LagCrossAttention(
+        d_model=32, num_heads=4, d_head=8, max_lag=_SHIPPED_NUM_LAGS - 1
+    )
+    return support, attention.build_lag_mask(_SHIPPED_T)
+
+
+def test_the_per_lag_anchor_counts_shrink_with_the_lag():
+    r"""Lag $\ell$ exists only at anchors $t \ge \ell$, so over the trained range $[30, 270)$
+    every lag up to the warm-up sees all 240 anchors and lag $90$ sees $180$ -- a 25% shortfall
+    the common denominator does not know about."""
+    support, validity = _shipped_support_and_validity()
+
+    counts = lag_anchor_counts(support, validity)
+
+    assert counts.shape == (1, _SHIPPED_NUM_LAGS)
+    assert float(counts[0, 0]) == 240.0
+    assert float(counts[0, 30]) == 240.0
+    assert float(counts[0, 90]) == 180.0
+    assert float(counts[0, 60]) == 210.0
+
+
+def test_the_support_correction_recovers_an_argmax_the_raw_profile_gets_wrong():
+    """The known-answer case. Every lag carries the same attribution *per contributing anchor*
+    except lag 90, which carries 5% more -- so the truth peaks at lag 90. Dividing every bin by
+    the common anchor total scales each one by its own support instead, which shrinks lag 90 by
+    25% and moves the peak to the short end; dividing by each lag's own count returns the
+    per-anchor value the model actually produced.
+    """
+    support, validity = _shipped_support_and_validity()
+    per_anchor = torch.ones(_SHIPPED_NUM_LAGS)
+    per_anchor[90] = 1.05
+    lag_map = validity.to(torch.float32)[None, :, :] * per_anchor[None, None, :]
+
+    raw, corrected, counts = lag_profiles(lag_map, support, validity)
+
+    assert int(raw.argmax(dim=1)[0]) <= _SHIPPED_WARMUP, "the raw profile peaks short"
+    assert int(corrected.argmax(dim=1)[0]) == 90
+    assert torch.allclose(corrected[0], per_anchor, atol=1e-5)
+    assert float(raw[0, 90]) == pytest.approx(1.05 * 180.0 / 240.0, rel=1e-5)
+    assert float(counts[0, 90]) == 180.0
+
+
+def test_the_raw_attribution_still_sums_to_the_total_kl_under_the_correction():
+    """The correction is emitted *beside* the raw attribution rather than in place of it, because
+    only the raw one is a decomposition of $\\bar K$ and that identity is load-bearing."""
+    support, validity = _shipped_support_and_validity()
+    lag_map = torch.rand(1, _SHIPPED_T, _SHIPPED_NUM_LAGS) * validity.to(torch.float32)
+
+    raw, _corrected, _counts = lag_profiles(lag_map, support, validity)
+    expected = (lag_map.sum(dim=2) * support).sum(dim=1) / support.sum(dim=1)
+
+    assert torch.allclose(raw.sum(dim=1), expected, rtol=1e-5)
+
+
+def test_the_lag_report_carries_both_argmaxes_and_the_counts_behind_them():
+    """Both, and named: where they disagree, the difference is the support bias itself."""
+    aggregate = Aggregate(
+        lag_profile=[0.9, 0.5, 0.1],
+        lag_profile_support_corrected=[0.1, 0.5, 0.9],
+        lag_support=[240.0, 220.0, 180.0],
+        attention_profile=[0.5, 0.2, 0.3],
+    )
+
+    summary = lag_summary(aggregate)
+
+    assert summary["kl_argmax_lag_step"] == 0
+    assert summary["kl_argmax_lag_step_support_corrected"] == 2
+    assert summary["kl_lag_compensated_seconds_support_corrected"] == pytest.approx(8.0)
+    assert summary["kl_lag_anchor_counts"] == [240.0, 220.0, 180.0]
 
 
 # =============================================================================

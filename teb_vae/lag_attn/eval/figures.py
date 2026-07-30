@@ -253,6 +253,7 @@ def heatmap_with_colorbar(
     colorbar_label: str = "",
     separator_row: Optional[int] = None,
     extent: Optional[Tuple[float, float, float, float]] = None,
+    interpolation: str = "nearest",
 ) -> Any:
     """Draw a heatmap with its colourbar, tolerating empty and all-``NaN`` input.
 
@@ -277,6 +278,11 @@ def heatmap_with_colorbar(
         separator_row: Row index of the last row of the upper feature block. A horizontal rule is
             drawn at ``separator_row + 0.5``, which is where the two blocks actually meet.
         extent: Optional imshow extent, for a panel sharing a physical axis with another.
+        interpolation: What ``imshow`` does between cells. ``'nearest'`` resamples to the
+            renderer's pixel grid; ``'none'`` emits the cells themselves, which is what a
+            *vector* output wants -- in a PDF the resampling is done at a resolution the file
+            does not carry, so a cell boundary can land half a cell away from where the data
+            says it is. Pass ``'none'`` wherever the reader is expected to index a cell.
 
     Returns:
         The image handle, or ``None`` when there was nothing to draw.
@@ -306,7 +312,7 @@ def heatmap_with_colorbar(
 
     image = ax.imshow(
         field, aspect="auto", origin="upper", cmap=colormap, vmin=vmin, vmax=vmax,
-        interpolation="nearest", extent=extent,
+        interpolation=interpolation, extent=extent,
     )
     if separator_row is not None:
         ax.axhline(float(separator_row) + 0.5, color=COLOR_BLACK, linewidth=0.8)

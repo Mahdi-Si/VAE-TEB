@@ -26,74 +26,29 @@ budget the filter bank refuses -- rather than days into a production run.
 2. its final ``val/kld_active_frac`` is below
    :data:`KL_COLLAPSE_MIN_ACTIVE_DIMS` $/\, d_z$.
 
-The two clauses are one statement at the same threshold: the latent finished carrying less
-than two dimensions' worth of source information, in total nats per anchor (clause 1) or in
-active-dimension count (clause 2). The criterion reads the *tail* of the run, never an early
-window: the KL starts at exactly $0$ by construction (the zero-initialised posterior residual)
-and the $\beta$ warm-up holds it there deliberately, so an any-window reading would classify
-every healthy run as collapsed. It presumes the run trained at least the patience length,
-which every sweep arm's stated minimum epoch count exceeds. Defined numerically once, here,
-so the sweep reports apply arithmetic rather than judgement; :func:`is_collapsed` is that
-arithmetic, and the report references this module rather than restating the numbers.
+The criterion itself lives in :mod:`teb_vae.lag_attn_rws.collapse`, which depends on nothing:
+the offline acceptance gate applies the same arithmetic and must stay importable without
+``torch``. Its definition and rationale are recorded there; the tests below pin the behaviour
+that the sweep reports depend on.
 """
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Dict, Sequence
+from typing import Any, Dict
 
 import pytest
 
 from teb_vae.lag_attn.config import load_config
 from teb_vae.lag_attn_rws.channel_reach import resolve_stream_budgets
-from teb_vae.lag_attn_rws.nets.losses import KLD_ACTIVE_EPS
+from teb_vae.lag_attn_rws.collapse import (
+    KL_COLLAPSE_MIN_ACTIVE_DIMS,
+    KL_COLLAPSE_PATIENCE_EPOCHS,
+    KL_COLLAPSE_THRESHOLD_NATS,
+    is_collapsed,
+)
 
 _CONFIG_DIR = Path(__file__).resolve().parents[1] / "configs"
 _DEFAULT = _CONFIG_DIR / "default.yaml"
-
-# --------------------------------------------------------------------------------------
-# The collapse criterion (see the module docstring for the definition and its rationale)
-# --------------------------------------------------------------------------------------
-
-#: Consecutive final epochs the raw KL must stay below the threshold for clause 1 to fire.
-KL_COLLAPSE_PATIENCE_EPOCHS = 5
-
-#: The active-dimension floor of clause 2: fewer than this many active dimensions at the end
-#: of the run is a collapsed latent, whatever the total KL reads.
-KL_COLLAPSE_MIN_ACTIVE_DIMS = 2
-
-#: Clause 1's threshold in nats per anchor: the total KL of a latent whose information sits
-#: entirely in :data:`KL_COLLAPSE_MIN_ACTIVE_DIMS` dimensions, each barely clearing the
-#: per-dimension activity epsilon the training metric ``kld_active_frac`` counts against.
-KL_COLLAPSE_THRESHOLD_NATS = KL_COLLAPSE_MIN_ACTIVE_DIMS * KLD_ACTIVE_EPS
-
-
-def is_collapsed(
-    kl_raw_per_epoch: Sequence[float],
-    kld_active_frac_per_epoch: Sequence[float],
-    d_z: int,
-) -> bool:
-    r"""Apply the collapse criterion to a completed run's per-epoch validation series.
-
-    Args:
-        kl_raw_per_epoch: The ``val/source_conditioned_kl_raw`` column of the run's metrics
-            CSV, in epoch order. Nats per anchor, summed over $d_z$.
-        kld_active_frac_per_epoch: The ``val/kld_active_frac`` column, in epoch order.
-        d_z: The arm's latent width, from its resolved configuration.
-
-    Returns:
-        Whether the run is collapsed under either clause.
-    """
-    kl_tail = list(kl_raw_per_epoch)[-KL_COLLAPSE_PATIENCE_EPOCHS:]
-    kl_dead = len(kl_tail) == KL_COLLAPSE_PATIENCE_EPOCHS and all(
-        value < KL_COLLAPSE_THRESHOLD_NATS for value in kl_tail
-    )
-
-    active_frac = list(kld_active_frac_per_epoch)
-    dims_dead = bool(active_frac) and (
-        active_frac[-1] < KL_COLLAPSE_MIN_ACTIVE_DIMS / float(d_z)
-    )
-    return kl_dead or dims_dead
-
 
 # --------------------------------------------------------------------------------------
 # The arm inventory
