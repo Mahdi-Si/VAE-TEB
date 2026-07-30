@@ -122,6 +122,22 @@ def _reject(name):
     raise AssertionError(f"summary.json contains the non-standard constant {name!r}")
 
 
+def test_a_tensor_is_converted_through_its_own_tolist():
+    """Without the branch a tensor falls through to the repr catch-all and lands in the summary
+    as the string ``'tensor([3., 4.])'`` -- readable, unparseable, and silently not a number.
+
+    ``torch`` is reached for through ``sys.modules``, so the branch is live exactly when a tensor
+    could exist. Importing it here is what puts it there.
+    """
+    import torch
+
+    safe = json_safe({"block": torch.tensor([3.0, 4.0]), "scalar": torch.tensor(2.5)})
+
+    assert safe["block"] == [3.0, 4.0]
+    assert safe["scalar"] == pytest.approx(2.5)
+    json.dumps(safe, allow_nan=False)
+
+
 def test_an_unserialisable_value_is_recorded_rather_than_failing_the_write(tmp_path):
     """A write that raises at the end of a multi-hour run loses everything."""
     report = Report()

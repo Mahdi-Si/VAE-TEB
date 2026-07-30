@@ -290,19 +290,47 @@ def test_the_guarded_checkpoint_rebuilds_at_its_own_channel_widths(guarded_fit):
     assert load_checkpoint_strict(rebuilt, blob) is not None
 
 
+#: The one module allowed to call a global seeding function, and what makes it safe.
+#:
+#: The evaluation's oracle fits a probe, and a probe's *initialisation* runs on the global
+#: generators -- ``nn.init`` takes no generator, so seeding it locally is not available. What the
+#: ban actually protects against is a seed that **persists**: one that silently overrides
+#: ``general_config.seed`` while looking like diligence. ``oracle.py`` seeds inside
+#: ``torch.random.fork_rng``, which restores the state it found on exit, so nothing downstream of
+#: the fit sees a stream it would not otherwise have seen.
+#:
+#: That is a property of behaviour rather than of source text, so it is asserted where it can be:
+#: ``test_eval_oracle.py`` runs the fit and checks the global state afterwards against the state
+#: the same pass leaves without one.
+SEEDING_EXEMPT_MODULES = {"oracle.py"}
+
+
 def test_no_module_in_the_package_seeds_by_hand():
     """``general_config.seed`` through the framework's ``configure_determinism`` is the only
     seeding route; a stray global seed would silently override it while looking like
     diligence. The permutation generator's own rank-derived seed is a *local*
     ``torch.Generator``, deliberately different per rank, and leaves the global RNG untouched
     -- which is why the patterns below name the global calls specifically.
+
+    :data:`SEEDING_EXEMPT_MODULES` is the single narrow exception, and it is asserted to be *used*
+    as well as permitted: an exemption for a module that no longer seeds is a permission that
+    outlived its reason, and the next reach for a global seed there would go unreported.
     """
     offenders = []
+    exempt_and_seeding = set()
     for path in _PACKAGE_DIR.rglob("*.py"):
         if "tests" in path.parts:
             continue  # tests seed themselves for reproducibility, legitimately
         source = path.read_text(encoding="utf-8")
         for pattern in ("torch.manual_seed", "seed_everything", "np.random.seed"):
-            if pattern in source:
-                offenders.append(f"{path.name}: {pattern}")
+            if pattern not in source:
+                continue
+            if path.name in SEEDING_EXEMPT_MODULES:
+                exempt_and_seeding.add(path.name)
+                continue
+            offenders.append(f"{path.name}: {pattern}")
     assert offenders == []
+    assert exempt_and_seeding == SEEDING_EXEMPT_MODULES, (
+        f"{sorted(SEEDING_EXEMPT_MODULES - exempt_and_seeding)} no longer seeds; drop the "
+        f"exemption rather than leaving a permission nothing uses"
+    )

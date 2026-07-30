@@ -63,10 +63,20 @@ from teb_vae.lag_attn_rws.nets.raw_masks import forecast_mask as build_forecast_
 from teb_vae.lag_attn_rws.nets.raw_masks import kl_mask as build_kl_mask
 from teb_vae.lag_attn_rws.nets.raw_targets import build_future_index, build_future_target
 
-# "On the floor" for the prior log-variance: within this fraction of the clamp range of the
-# lower asymptote. The smooth bound never reaches the asymptote exactly, so an equality test
-# would report 0.0 forever while the variance sits pinned.
-_LOGVAR_FLOOR_MARGIN_FRAC = 0.05
+# "On the floor" for a log-variance: within this fraction of the clamp range of the lower
+# asymptote (and, symmetrically, of the upper one for "on the ceiling"). The smooth bound never
+# reaches an asymptote exactly, so an equality test would report 0.0 forever while the variance
+# sits pinned.
+#
+# Public because the evaluation reads the same fractions off the same tensors: a margin restated
+# there would make "the prior variance is pinned" mean one thing in a training log and another in
+# a summary, and the two would drift the first time either was tuned.
+LOGVAR_FLOOR_MARGIN_FRAC = 0.05
+
+# "Saturated" for a tanh-bounded quantity: within one percent of its own bound. Public for the
+# same reason as the margin above -- the evaluation recomputes both saturation fractions over the
+# masked support, and a second literal is a second definition.
+SATURATION_FRAC = 0.99
 
 
 class SeqVaeLagAttnRws(nn.Module):
@@ -707,9 +717,9 @@ class SeqVaeLagAttnRws(nn.Module):
         # Saturation diagnostics: a bound that is always active is a bound that is binding, and
         # a binding bound is a silently mis-set hyperparameter.
         with torch.no_grad():
-            mu_prior_sat_frac = (mu_prior.abs() >= (0.99 * self.mu_scale)).float().mean()
+            mu_prior_sat_frac = (mu_prior.abs() >= (SATURATION_FRAC * self.mu_scale)).float().mean()
             delta_mu_sat_frac = (
-                (mu_post - mu_prior).abs() >= (0.99 * self.delta_mu_scale)
+                (mu_post - mu_prior).abs() >= (SATURATION_FRAC * self.delta_mu_scale)
             ).float().mean()
 
         # Decode the valid anchor range only. The tail H anchors have no fully observed raw
@@ -906,7 +916,7 @@ class SeqVaeLagAttnRws(nn.Module):
             # like from the inside); pinned at the ceiling it has given up and is predicting
             # noise, which reads as a healthy falling NLL while pred_gap goes to zero.
             lo, hi = self.logvar_clamp
-            bound_margin = _LOGVAR_FLOOR_MARGIN_FRAC * (hi - lo)
+            bound_margin = LOGVAR_FLOOR_MARGIN_FRAC * (hi - lo)
             logvar_full = forward_outputs["logvar_full"]
             logvar_full_floor_frac = (
                 (logvar_full <= lo + bound_margin).to(dtype) * elem_mask
@@ -922,7 +932,7 @@ class SeqVaeLagAttnRws(nn.Module):
             if bool(support.any()):
                 logvar_prior_masked = forward_outputs["logvar_prior"][support]
                 lo, hi = self.logvar_clamp
-                floor_threshold = lo + _LOGVAR_FLOOR_MARGIN_FRAC * (hi - lo)
+                floor_threshold = lo + LOGVAR_FLOOR_MARGIN_FRAC * (hi - lo)
                 logvar_prior_floor_frac = (
                     (logvar_prior_masked <= floor_threshold).to(dtype).mean()
                 )

@@ -128,8 +128,12 @@ def test_no_sibling_only_or_unconditional_key_is_present(shipped, tiny):
 
 def test_the_cross_channel_block_appears_in_no_config():
     """``fhr_up_ph`` mixes both signals in one coefficient; a single appearance anywhere in a
-    config -- load_fields, normalize_fields, a comment someone uncommented -- is a defect."""
-    for path in (_CONFIG, _TINY):
+    config -- load_fields, normalize_fields, a comment someone uncommented -- is a defect.
+
+    The evaluation override delta is covered too: it restates ``load_fields`` wholesale, which is
+    exactly where the block could reappear."""
+    overrides = Path(__file__).resolve().parents[1] / "eval" / "configs" / "eval_overrides.yaml"
+    for path in (_CONFIG, _TINY, overrides):
         assert "fhr_up_ph" not in path.read_text(encoding="utf-8"), path.name
 
 

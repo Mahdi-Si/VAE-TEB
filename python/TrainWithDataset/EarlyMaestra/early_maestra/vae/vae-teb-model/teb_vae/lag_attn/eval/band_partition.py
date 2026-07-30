@@ -44,6 +44,12 @@ than guessed at. The resulting clinical occupancy over the $109$ target channels
 $1 / 22 / 40 / 32$ across ``slow_baseline`` / ``deceleration`` / ``variability`` /
 ``beat_to_beat``, plus those $14$.
 
+The arithmetic is per *stream* rather than per model: :func:`build_partition` partitions whichever
+block ``phase_dataset`` names, so the same call describes the $c_y$ target of this package's model
+and the $c_u$ source stream a model that consumes one is given. Only the phase block's identity
+changes; the scattering side is banded through the same filter map either way, because both
+selections index one filter bank.
+
 Note also that ``FILTER_HZ`` **descends** with index -- filter $0$ is the fastest -- so the
 higher-frequency member of a pair carries the *lower* index. That is exactly the kind of
 inversion re-deriving the selection gets wrong, and reading ``sel_i`` / ``sel_j`` avoids.
@@ -73,6 +79,11 @@ REQUIRED_ATTRS: Tuple[str, ...] = (
     "sel_xi_j_hz",
     "sel_power",
 )
+
+#: The phase datasets a shard carries, one per signal. Both index the *same* order-1 filter bank,
+#: so either one's ``sel_i`` / ``sel_j`` pairs widen the filter-index-to-Hz map the scattering
+#: side is banded with -- which is why a partition of one block still harvests the other.
+PHASE_DATASETS: Tuple[str, ...] = ("fhr_ph", "up_ph")
 
 #: Wavelets per octave, $Q$. The harmonic grid is $p = 2^{k/Q}$, so the kind of a channel is
 #: $k = \mathrm{round}(Q \log_2 p)$. Matches ``create_new_pipeline.SCATTERING_Q``; restated
@@ -356,8 +367,9 @@ def build_partition(
     *,
     n_scattering: int,
     bands: Optional[Dict[str, Tuple[float, float]]] = None,
+    phase_dataset: str = "fhr_ph",
 ) -> BandPartition:
-    r"""Build the $c_y$-channel map from a shard's stored provenance.
+    r"""Build one stream's channel map from a shard's stored provenance.
 
     Args:
         shard_path: Path to any shard of the split under evaluation. The selection is a property
@@ -365,27 +377,38 @@ def build_partition(
             and a mismatch between two shards would already have failed the runner's per-batch
             width check.
         n_scattering: Width of the scattering block, from the batch. Passed rather than assumed:
-            the model stores only the combined $c_y$ and cannot supply the split.
+            the model stores only the combined width and cannot supply the split.
         bands: The clinical band table. ``None`` uses :data:`CLINICAL_BANDS`.
+        phase_dataset: Which phase block this partition is over -- ``'fhr_ph'`` for the target
+            stream, ``'up_ph'`` for a source stream. The *other* block of
+            :data:`PHASE_DATASETS` is still read where it exists, because it references the same
+            order-1 filter bank and so widens the frequency map the scattering side is banded
+            with; it contributes no channels.
 
     Returns:
         The partition, with the scattering block occupying channels $[0, n_{\mathrm{st}})$ and
-        the phase block the rest, matching the ``cat([y_st, y_ph])`` the model is given.
+        the phase block the rest, matching the ``cat([st, ph])`` the model is given.
 
     Raises:
         RuntimeError: If the shard's provenance is missing or inconsistent. See
             :func:`read_selection`.
     """
     table = dict(CLINICAL_BANDS if bands is None else bands)
-    fhr_ph = read_selection(shard_path, "fhr_ph")
-    try:
-        up_ph: Optional[Dict[str, np.ndarray]] = read_selection(shard_path, "up_ph")
-    except (KeyError, RuntimeError):
-        # The UP block only ever widens the filter map; a shard without it still describes every
-        # target channel, which is what this partition is over.
-        up_ph = None
+    selections: Dict[str, Dict[str, np.ndarray]] = {
+        phase_dataset: read_selection(shard_path, phase_dataset)
+    }
+    for name in PHASE_DATASETS:
+        if name in selections:
+            continue
+        try:
+            selections[name] = read_selection(shard_path, name)
+        except (KeyError, RuntimeError):
+            # The other block only ever widens the filter map; a shard without it still describes
+            # every channel of the block this partition is over.
+            continue
 
-    frequencies = _filter_frequencies([fhr_ph] + ([up_ph] if up_ph else []))
+    frequencies = _filter_frequencies(list(selections.values()))
+    primary = selections[phase_dataset]
 
     records: List[ChannelRecord] = []
     # ---- Scattering block: channel 0 is order-0, channel c >= 1 is filter c - 1 -------------
@@ -413,11 +436,11 @@ def build_partition(
         ))
 
     # ---- Phase block: element k of every sel_* array describes channel n_st + k -------------
-    powers = np.asarray(fhr_ph["sel_power"]).ravel()
-    xi_i = np.asarray(fhr_ph["sel_xi_i_hz"]).ravel()
-    xi_j = np.asarray(fhr_ph["sel_xi_j_hz"]).ravel()
-    index_i = np.asarray(fhr_ph["sel_i"]).ravel()
-    index_j = np.asarray(fhr_ph["sel_j"]).ravel()
+    powers = np.asarray(primary["sel_power"]).ravel()
+    xi_i = np.asarray(primary["sel_xi_i_hz"]).ravel()
+    xi_j = np.asarray(primary["sel_xi_j_hz"]).ravel()
+    index_i = np.asarray(primary["sel_i"]).ravel()
+    index_j = np.asarray(primary["sel_j"]).ravel()
     for offset in range(int(powers.shape[0])):
         records.append(ChannelRecord(
             channel=int(n_scattering) + offset, block="phase",
@@ -439,13 +462,16 @@ def build_partition(
         band_hz_ranges=table,
         coverage={
             "shard": str(shard_path),
+            "phase_dataset": str(phase_dataset),
             "n_filters_with_frequency": len(frequencies),
             "n_scattering_without_frequency": n_without_frequency,
-            "up_ph_attrs_present": up_ph is not None,
+            # Whether the UP selection contributed to the filter map at all, whichever block is
+            # being partitioned: it widens the frequency coverage of both.
+            "up_ph_attrs_present": "up_ph" in selections,
             "phase_band_hz": [float(value) for value in
-                              np.asarray(fhr_ph.get("sel_band_hz", [])).ravel().tolist()],
+                              np.asarray(primary.get("sel_band_hz", [])).ravel().tolist()],
             "phase_k_steps": [int(value) for value in
-                              np.asarray(fhr_ph.get("sel_k_steps", [])).ravel().tolist()],
+                              np.asarray(primary.get("sel_k_steps", [])).ravel().tolist()],
             "note": (
                 "a scattering channel has no recoverable centre frequency when no selected "
                 "phase pair referenced its filter, which happens outside the phase selection's "

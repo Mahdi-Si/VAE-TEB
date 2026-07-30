@@ -124,10 +124,64 @@ def test_the_interpretation_traps_are_recorded(design):
 
 
 def test_the_context_sufficiency_limitation_is_carried(design):
+    """The bullet must say what was measured and what is still unmeasured about it.
+
+    It began life as "the gap is not measured", and the evaluation's oracle probe now measures it.
+    A bullet left in the first form would read as a standing gap in the work; one saying only
+    "measured" would drop the part that still matters -- the estimate's two bias directions oppose
+    and neither is quantified, so it is not a bound and nothing downstream may treat it as one.
+    """
     limitations = design[design.index("## 11.") : design.index("## 12.")]
 
     assert "lean-limit" in limitations
     assert "context-sufficiency" in limitations
+    # What was measured, and by what.
+    assert "oracle" in limitations and "target_state" in limitations
+    # What remains unmeasured: both directions, and the refusal to call it a bound.
+    assert "biases the gap down" in limitations and "biases it up" in limitations
+    assert "not a bound" in limitations
+
+
+def test_the_limitations_record_what_the_evaluation_closed_and_what_it_did_not(design):
+    """A limitations section that only ever grows is a section nobody reads. Once the evaluation
+    landed, several of these bullets stopped being true -- and the ones that did *not* have to
+    stay, by name, or they become oversights rather than decisions."""
+    limitations = design[design.index("## 11.") : design.index("## 12.")]
+
+    # The evaluation is no longer "the minimum readout set only".
+    assert "minimum readout set" not in limitations
+    # What it closed, and what it deliberately did not -- each named rather than implied.
+    for absence in (
+        "Lag ablation",          # blocked model-side, with the reason restated
+        "Necessity is not measured",
+        "raw target history",    # the oracle's conditioning, hence estimate not bound
+        "spectral analysis",     # deferred: the VLF band the geometry cannot deliver
+        "distributional distances",
+        "held-out clinical discrimination",
+    ):
+        assert absence.lower() in limitations.lower(), f"DESIGN.md §11 no longer names: {absence}"
+
+
+def test_the_closeout_names_the_evaluation_commands(design):
+    """§13's command block is where an operator looks for how to run this module. The gate was
+    there; the evaluation and its acceptance check were not, so a finished checkpoint had no
+    documented path to a verified number."""
+    closeout = design[design.index("## 13.") : design.index("## 14.")]
+
+    assert "teb_vae.lag_attn_rws.eval.run" in closeout
+    assert "teb_vae.lag_attn_rws.eval.verify" in closeout
+    assert "EVAL.md" in closeout
+
+
+def test_the_results_document_names_the_command_that_fills_it():
+    """Its tables are generated, not transcribed, and the three sourcing rules that make the copy
+    safe are what stop a renamed directory relabelling a measurement."""
+    results = (_PACKAGE_DIR / "RESULTS.md").read_text(encoding="utf-8")
+
+    assert "eval.verify --runs" in results
+    assert "metrics_history.csv" in results
+    # Collapsed arms marked rather than dropped, and which pred_gap the tables carry.
+    assert "marked" in results and "pred_gap_mc_nats" in results
 
 
 # ---------------------------------------------------------------------------------------

@@ -1,0 +1,865 @@
+r"""Where in the past the source informed the future, read without the biases that make it wrong.
+
+The lag-resolved KL attribution is the readout this architecture exists to produce:
+
+$$\widetilde K_{t,\ell} = \sum_m K^{(m)}_t\,\alpha^{(m)}_{t,\ell},
+\qquad \sum_\ell \widetilde K_{t,\ell} = K_t.$$
+
+That identity is exact rather than approximate -- each head's attention sums to one over its
+valid lags, and the latent groups are head-aligned, so the split is a decomposition rather than a
+weighting. It is also fragile in one specific way, and this analysis re-measures it on the run
+being reported rather than inheriting it from a fixture: dropout on the attention probabilities
+would rescale them so they no longer sum to one, and the attribution would then hold only in
+expectation. Every number below would still look entirely reasonable.
+
+**The profile is reported twice and the two disagree on purpose.** The raw attribution divides
+every lag bin by the same anchor total, which is what keeps it summing to $\bar K$ and makes it a
+decomposition; it is also biased short, because lag $\ell$ is causally valid only at anchors
+$t \ge \ell$ and the long lags are therefore averaged over anchors that could not have
+contributed to them. The support-corrected profile divides each bin by its own contributing-anchor
+count. Where the two argmaxes disagree, the difference *is* that bias.
+
+**An argmax alone is not a reading of a profile.** Ties resolve to the lowest index, and
+``entmax15`` -- which the shipped model uses -- assigns lags exactly zero, so a profile that is
+flat or nearly empty still has a perfectly confident argmax. So the peak is described rather than
+merely located: its width, the mass concentrated near it, whether a second peak exists, and
+whether the profile is degenerate by a stated mechanical criterion rather than by eye.
+
+**The lag is the compensated one.** $\tau = 4(\ell + \delta)$ seconds, with $\delta$ read from the
+model's own accessor and converted by the module both the training figure and this analysis
+share. The original-sensor figure -- which adds back the $20$ s preprocessing already removed --
+appears nowhere here: it locates a finding in the raw files and is not the physiological delay.
+"""
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Sequence, Tuple
+
+import numpy as np
+import pandas as pd
+
+from teb_vae.lag_attn_rws.eval import cohort
+from teb_vae.lag_attn_rws.eval import figures_seam as figures
+from teb_vae.lag_attn_rws.eval._reuse import labels
+from teb_vae.lag_attn_rws.eval.frames import (
+    grouped_frame_entry,
+    per_recording_means,
+    scored_sample_count,
+)
+from teb_vae.lag_attn_rws.eval.lag_axis import (
+    compensated_seconds_axis,
+    padded_profile,
+    profile_column,
+)
+from teb_vae.lag_attn_rws.eval.report_seam import IDENTITY_TOLERANCE, identity_tolerance_for
+from teb_vae.lag_attn_rws.nets.lag_report import SECONDS_PER_STEP, lag_compensated_seconds
+
+#: This analysis's own subdirectory inside the results directory.
+ANALYSIS_DIRNAME = "lag_kl"
+
+#: What it writes.
+PROFILE_FILENAME = "lag_kl_profile.csv"
+SUMMARY_FILENAME = "lag_kl_summary.csv"
+PER_RECORDING_FILENAME = "lag_kl_per_recording.csv"
+STRATIFIED_PROFILE_FILENAME = "lag_kl_stratified_profile.csv"
+STRATIFIED_PEAKS_FILENAME = "lag_kl_stratified_peaks.csv"
+
+#: The figure, named as ``FIGURE_GUIDE.md`` names it.
+PROFILE_FIGURE = "lag_kl_profile.pdf"
+
+#: Fraction of the peak a bin must reach to count as part of it. Half, so the reported width is
+#: the familiar full width at half maximum and a reader does not have to learn a local convention.
+PEAK_FRACTION = 0.5
+
+#: A profile is **degenerate** below this peak-to-median ratio: the peak is not distinguishable
+#: from the bulk, so its argmax names a bin rather than a finding. Mechanical rather than
+#: eyeballed, because "the profile looked flat" is not a criterion a second reader can apply.
+DEGENERATE_PEAK_TO_MEDIAN = 1.1
+
+#: A profile is also degenerate above this exact-zero fraction. ``entmax15`` assigns exact zeros,
+#: so a profile can be sparse legitimately; one that is *this* sparse has a handful of live bins
+#: and its shape is set by which of them survived rather than by where the source informed.
+DEGENERATE_ZERO_FRACTION = 0.9
+
+#: Seconds per lag step, for quoting a peak *width* in the units its axis is drawn in. A width is
+#: a difference of lag indices, so the causal input delay cancels out of it -- which is why this
+#: is the step size rather than a call to the compensated converter.
+SECONDS_PER_LAG_STEP = SECONDS_PER_STEP
+
+#: The per-sample columns this analysis reduces per recording -- the identity residual, so a
+#: reader can see which recordings carry it, and the KL the profile decomposes.
+VALUE_COLUMNS: Tuple[str, ...] = (
+    "lag_map_identity_max_abs",
+    "head_kl_identity_max_abs",
+    "source_conditioned_kl_raw",
+)
+
+
+def peak_width(profile: Sequence[float], *, fraction: float = PEAK_FRACTION) -> Dict[str, Any]:
+    r"""Describe the peak by its extent rather than by its position alone.
+
+    The contiguous run of bins around the argmax that stay at or above ``fraction`` of the peak
+    -- the full width at half maximum when ``fraction`` is $0.5$. Contiguity is what makes it a
+    *width*: counting every bin above the threshold anywhere in the profile would report a bimodal
+    profile as one very wide peak, which is the opposite of what a second peak means.
+
+    Args:
+        profile: One value per lag.
+        fraction: Height, as a fraction of the peak, defining the peak's edge.
+
+    Returns:
+        The argmax, the peak value, the inclusive bin bounds of the peak, and its width in bins.
+        All ``None`` on an empty or non-finite profile.
+    """
+    values = np.asarray(list(profile), dtype=np.float64)
+    if values.size == 0 or not np.isfinite(values).any():
+        return {"argmax": None, "peak": None, "lo": None, "hi": None, "width_bins": None}
+    finite = np.where(np.isfinite(values), values, -np.inf)
+    argmax = int(np.argmax(finite))
+    peak = float(finite[argmax])
+    threshold = peak * float(fraction)
+    lo = argmax
+    while lo > 0 and finite[lo - 1] >= threshold:
+        lo -= 1
+    hi = argmax
+    while hi + 1 < finite.size and finite[hi + 1] >= threshold:
+        hi += 1
+    return {
+        "argmax": argmax,
+        "peak": peak,
+        "lo": int(lo),
+        "hi": int(hi),
+        "width_bins": int(hi - lo + 1),
+    }
+
+
+def mass_above(profile: Sequence[float], *, fraction: float = PEAK_FRACTION) -> Dict[str, Any]:
+    """How much of the profile's total sits in bins at or above a fraction of the peak.
+
+    The concentration the argmax does not report: a profile whose peak holds four fifths of the
+    attribution and one whose peak holds a twentieth have the same argmax and are different
+    findings.
+
+    Args:
+        profile: One value per lag.
+        fraction: Height threshold, as a fraction of the peak.
+
+    Returns:
+        The share of the total in those bins, how many bins they are, and the threshold used.
+    """
+    values = np.asarray(list(profile), dtype=np.float64)
+    finite = values[np.isfinite(values)]
+    total = float(finite.sum()) if finite.size else 0.0
+    if not finite.size or total <= 0.0:
+        return {"share": float("nan"), "n_bins": 0, "threshold": float("nan")}
+    threshold = float(finite.max()) * float(fraction)
+    selected = finite[finite >= threshold]
+    return {
+        "share": float(selected.sum() / total),
+        "n_bins": int(selected.size),
+        "threshold": threshold,
+    }
+
+
+def secondary_peaks(
+    profile: Sequence[float], *, fraction: float = PEAK_FRACTION, min_separation: int = 1
+) -> List[Dict[str, Any]]:
+    """Find local maxima other than the tallest, above a fraction of it.
+
+    A second peak is a finding rather than noise: it says the source informs the forecast at two
+    separated delays, which an argmax reports as one of them and a mean reports as neither.
+
+    Args:
+        profile: One value per lag.
+        fraction: How tall, relative to the global peak, a local maximum must be to count.
+        min_separation: How many bins a local maximum must stand clear of the global peak.
+
+    Returns:
+        One record per secondary peak -- its lag, its value and its share of the global peak --
+        ordered by height, tallest first.
+    """
+    values = np.asarray(list(profile), dtype=np.float64)
+    if values.size < 3 or not np.isfinite(values).any():
+        return []
+    finite = np.where(np.isfinite(values), values, -np.inf)
+    argmax = int(np.argmax(finite))
+    peak = float(finite[argmax])
+    if not np.isfinite(peak) or peak <= 0.0:
+        return []
+    threshold = peak * float(fraction)
+    found: List[Dict[str, Any]] = []
+    for index in range(1, finite.size - 1):
+        if abs(index - argmax) <= int(min_separation):
+            continue
+        value = float(finite[index])
+        if value >= threshold and value >= finite[index - 1] and value >= finite[index + 1]:
+            found.append({"lag_step": index, "value": value, "share_of_peak": value / peak})
+    return sorted(found, key=lambda record: -record["value"])
+
+
+def degeneracy(profile: Sequence[float]) -> Dict[str, Any]:
+    """Decide mechanically whether a profile has a shape worth reading at all.
+
+    Two ways it does not, and they are different failures. A **flat** profile -- peak barely above
+    the median -- has an argmax that names whichever bin won a coin toss. A profile that is almost
+    entirely **exact zeros** has a shape set by which handful of bins ``entmax15`` kept alive.
+
+    Args:
+        profile: One value per lag.
+
+    Returns:
+        The flag, the two measured statistics behind it, the thresholds they were judged against,
+        and the reasons that fired. An empty profile is degenerate, with that as its reason.
+    """
+    values = np.asarray(list(profile), dtype=np.float64)
+    finite = values[np.isfinite(values)]
+    if finite.size == 0:
+        return {
+            "degenerate": True,
+            "peak_to_median": float("nan"),
+            "zero_fraction": float("nan"),
+            "peak_to_median_threshold": DEGENERATE_PEAK_TO_MEDIAN,
+            "zero_fraction_threshold": DEGENERATE_ZERO_FRACTION,
+            "reasons": ["the profile carries no finite value"],
+        }
+    median = float(np.median(finite))
+    peak = float(finite.max())
+    # A zero median makes the ratio infinite rather than undefined, which is the right reading:
+    # a peak standing over an all-zero bulk is as far from flat as a profile gets.
+    ratio = float("inf") if median == 0.0 and peak > 0.0 else (
+        peak / median if median != 0.0 else float("nan")
+    )
+    zero_fraction = float((finite == 0.0).sum() / finite.size)
+    reasons: List[str] = []
+    if np.isfinite(ratio) and ratio < DEGENERATE_PEAK_TO_MEDIAN:
+        reasons.append(
+            f"peak-to-median {ratio:.3g} is below {DEGENERATE_PEAK_TO_MEDIAN}, so the peak is not "
+            f"distinguishable from the bulk and its argmax names a bin rather than a lag"
+        )
+    if zero_fraction > DEGENERATE_ZERO_FRACTION:
+        reasons.append(
+            f"{zero_fraction:.1%} of the bins are exactly zero, above "
+            f"{DEGENERATE_ZERO_FRACTION:.0%}, so the shape is set by which bins survived "
+            f"sparsification rather than by where the source informed"
+        )
+    return {
+        "degenerate": bool(reasons),
+        "peak_to_median": ratio,
+        "zero_fraction": zero_fraction,
+        "peak_to_median_threshold": DEGENERATE_PEAK_TO_MEDIAN,
+        "zero_fraction_threshold": DEGENERATE_ZERO_FRACTION,
+        "reasons": reasons,
+    }
+
+
+def profile_frame(lag: Dict[str, Any], seconds: np.ndarray) -> pd.DataFrame:
+    """Lay the two profiles and their denominator out as one table, keyed by lag.
+
+    Args:
+        lag: The pass's lag block.
+        seconds: The compensated-seconds axis.
+
+    Returns:
+        One row per lag: its index, its compensated seconds, the raw attribution and its share of
+        the total, the support-corrected attribution, and the contributing-anchor count that
+        separates them.
+    """
+    raw = np.asarray(list(lag.get("kl_lag_profile") or []), dtype=np.float64)
+    if raw.size == 0:
+        return pd.DataFrame(
+            columns=[
+                "lag_step", "compensated_seconds", "kl_nats", "share",
+                "kl_nats_support_corrected", "anchor_count",
+            ]
+        )
+    corrected = np.asarray(
+        list(lag.get("kl_lag_profile_support_corrected") or []), dtype=np.float64
+    )
+    counts = np.asarray(list(lag.get("kl_lag_anchor_counts") or []), dtype=np.float64)
+    total = float(raw.sum())
+    return pd.DataFrame(
+        {
+            "lag_step": np.arange(raw.size, dtype=int),
+            "compensated_seconds": seconds[: raw.size],
+            "kl_nats": raw,
+            "share": raw / total if total > 0.0 else np.full(raw.size, np.nan),
+            "kl_nats_support_corrected": padded_profile(corrected, raw.size),
+            "anchor_count": padded_profile(counts, raw.size),
+        }
+    )
+
+
+def build_summary_rows(lag: Dict[str, Any], delay_steps: int) -> List[Dict[str, Any]]:
+    """Describe each profile's peak, one row per profile.
+
+    Args:
+        lag: The pass's lag block.
+        delay_steps: The causal input delay, for the seconds column.
+
+    Returns:
+        One row per profile -- raw and support-corrected -- carrying the argmax and its seconds,
+        the peak's width and edges, the mass concentrated near it, how many secondary peaks were
+        found, and the degeneracy verdict. A row whose profile is degenerate still reports its
+        argmax; what changes is that the row says not to read it.
+    """
+    rows: List[Dict[str, Any]] = []
+    for name, key, note in (
+        (
+            "raw",
+            "kl_lag_profile",
+            "divides every bin by the same anchor total; sums over lags to the headline KL and "
+            "is biased toward short lags",
+        ),
+        (
+            "support_corrected",
+            "kl_lag_profile_support_corrected",
+            "divides each bin by its own contributing-anchor count; does not sum to the KL and "
+            "is the profile to read for where the source informed",
+        ),
+    ):
+        profile = list(lag.get(key) or [])
+        peak = peak_width(profile)
+        concentration = mass_above(profile)
+        secondary = secondary_peaks(profile)
+        verdict = degeneracy(profile)
+        argmax = peak["argmax"]
+        rows.append(
+            {
+                "profile": name,
+                "source_key": key,
+                "meaning": note,
+                "argmax_lag_step": argmax,
+                "compensated_seconds": (
+                    None if argmax is None
+                    else float(lag_compensated_seconds(argmax, delay_steps=delay_steps))
+                ),
+                "peak_nats": peak["peak"],
+                "peak_lo_lag_step": peak["lo"],
+                "peak_hi_lag_step": peak["hi"],
+                "peak_width_bins": peak["width_bins"],
+                "peak_width_seconds": (
+                    None if peak["width_bins"] is None
+                    else float(peak["width_bins"]) * float(SECONDS_PER_LAG_STEP)
+                ),
+                "mass_above_half_peak": concentration["share"],
+                "n_bins_above_half_peak": concentration["n_bins"],
+                "n_secondary_peaks": len(secondary),
+                "secondary_peak_lag_steps": [record["lag_step"] for record in secondary],
+                "degenerate": verdict["degenerate"],
+                "peak_to_median": verdict["peak_to_median"],
+                "zero_fraction": verdict["zero_fraction"],
+                "degenerate_reasons": "; ".join(verdict["reasons"]),
+            }
+        )
+    return rows
+
+
+# =============================================================================
+# Stratified profiles
+#
+# No pipeline before this one cut the lag readout by anything. What is emitted here is the whole
+# 91-bin profile per cohort and per time window rather than a per-cohort argmax, because an argmax
+# is not a reading of a profile -- and because two cohorts whose peaks coincide can still put very
+# different amounts of mass near them.
+#
+# The profiles stratified are the ones free of a bias the pooled reading has to state and remove:
+# the support-corrected pair, whose per-lag denominator is each lag's own contributing-anchor
+# count, and the **untruncated** pair, restricted to the anchors at which every lag exists. Only
+# the second is free of the renormalisation the correction cannot reach, so a per-cohort argmax
+# claim rests on it -- which is why the restricted anchor range travels in the output beside every
+# row.
+# =============================================================================
+#: The per-sample vector readouts stratified, as ``(reported profile, attribute, what it is)``.
+#: Every one travels the same aggregation chain the pooled profiles do -- per recording first,
+#: then across recordings within the cohort -- so a per-cohort profile and the pooled one differ
+#: only in which recordings entered them.
+STRATIFIED_PROFILES: Tuple[Tuple[str, str, str], ...] = (
+    (
+        "kl_support_corrected",
+        "lag_profile_support_corrected",
+        "per-lag KL attribution on each lag's own contributing-anchor count",
+    ),
+    (
+        "kl_untruncated",
+        "lag_profile_untruncated",
+        "per-lag KL attribution over the anchors whose lag support is complete -- the profile a "
+        "per-cohort argmax claim rests on",
+    ),
+    (
+        "attention_support_corrected",
+        "attention_profile_support_corrected",
+        "head-averaged attention on each lag's own contributing-anchor count",
+    ),
+    (
+        "attention_untruncated",
+        "attention_profile_untruncated",
+        "head-averaged attention over the anchors whose lag support is complete",
+    ),
+)
+
+#: The per-head vector, kept separate because it is $M \cdot L$ wide and is reshaped rather than
+#: read directly. Head-averaging before profiling discards exactly what the head-structured
+#: posterior exists to expose, so the per-cohort reading keeps the heads apart too.
+PER_HEAD_ATTRIBUTE = "attention_profile_per_head"
+
+#: The axis name the time-window stratification is reported under. Not a cohort column on the
+#: table -- it is derived from ``epoch`` -- so it is named here rather than looked up.
+TIME_AXIS = "time_window"
+
+
+def _is_null_label(value: Any) -> bool:
+    """Return whether a cohort label is absent, in either of the two forms it arrives in.
+
+    A label collected in-process is ``None``; the same label read back out of ``per_sample.csv``
+    is ``NaN``. Both mean the segment belongs to no cohort.
+
+    Args:
+        value: One row's label on one axis.
+
+    Returns:
+        ``True`` when the label is absent.
+    """
+    return value is None or (isinstance(value, float) and np.isnan(value))
+
+
+def _group_profiles(
+    rows: np.ndarray, guids: Sequence[Any], groups: Sequence[Any]
+) -> Dict[str, Tuple[np.ndarray, int]]:
+    """Average a per-sample vector within each recording, then within each cohort.
+
+    Args:
+        rows: The per-sample vectors, $(n, C)$, in the per-sample table's row order.
+        guids: The recording of each row.
+        groups: The cohort of each row; rows with no cohort are dropped, because a segment with no
+            cohort belongs to none of them and folding them together would create one named after
+            the absence.
+
+    Returns:
+        Cohort to ``(profile, n_recordings)``. ``NaN`` rows -- the segments that scored no anchors
+        -- are skipped by the means rather than imputed, so a cohort's count is the recordings
+        that actually measured something.
+    """
+    values = np.asarray(rows, dtype=np.float64)
+    if values.ndim != 2 or values.shape[0] != len(guids) or values.shape[0] != len(groups):
+        return {}
+    frame = pd.DataFrame(values)
+    frame["guid"] = list(guids)
+    # Stringifying before the null test would turn a NaN label into the cohort `"nan"`, which
+    # `notna()` then keeps: the table is read back from CSV on any re-run, and that is where an
+    # absent class or a non-canonical shard basename arrives as NaN rather than as `None`.
+    frame["group"] = [None if _is_null_label(value) else str(value) for value in groups]
+    frame = frame[frame["group"].notna()]
+    if frame.empty:
+        return {}
+    columns = list(range(values.shape[1]))
+    per_guid = frame.groupby(["group", "guid"])[columns].mean()
+    per_group = per_guid.groupby("group")[columns].mean()
+    # Recordings that measured something, not rows: a recording whose every segment scored no
+    # anchors is an all-NaN row that the means above correctly skip, so counting it here would
+    # label the profile with evidence that did not go into it.
+    counts = per_guid.notna().any(axis=1).groupby("group").sum().astype(int)
+    return {
+        str(group): (
+            np.asarray(per_group.loc[group], dtype=np.float64), int(counts.loc[group])
+        )
+        for group in per_group.index
+    }
+
+
+def _axis_labels(per_sample: pd.DataFrame) -> Dict[str, Tuple[List[Any], Dict[str, float]]]:
+    """Return each stratification axis's per-row labels, plus the time axis's window centres.
+
+    Args:
+        per_sample: The collected per-sample table.
+
+    Returns:
+        Axis name to ``(labels, centres)``. ``centres`` is empty except on the time axis, where it
+        maps each window's label to its centre in hours so the emitted rows carry a number as well
+        as a name.
+    """
+    axes: Dict[str, Tuple[List[Any], Dict[str, float]]] = {
+        axis: ([value for value in per_sample[axis]] if axis in per_sample.columns else [], {})
+        for axis in labels.GROUP_COLUMNS
+    }
+    if "epoch" not in per_sample.columns:
+        return axes
+
+    # The same 0.5 h grid the trajectory analysis is cut on, taken from the layer below rather
+    # than restated: two analyses reading different grids would report windows that do not line up.
+    binned = cohort.add_time_bins(per_sample)
+    centres: Dict[str, float] = {}
+    window: List[Any] = [None] * len(per_sample)
+    # The binned frame is a row subset, so its index labels are the table's own -- which is what
+    # puts each window label back on the row it came from rather than on the row at that position.
+    positions = {label: position for position, label in enumerate(per_sample.index)}
+    for label, centre in zip(binned.index, binned[cohort.BIN_CENTER_COLUMN]):
+        name = f"{float(centre):g} h"
+        centres[name] = float(centre)
+        position = positions.get(label)
+        if position is not None:
+            window[position] = name
+    axes[TIME_AXIS] = (window, centres)
+    return axes
+
+
+def stratified_profiles(
+    per_sample: pd.DataFrame,
+    vectors: Dict[str, np.ndarray],
+    *,
+    delay_steps: int,
+    n_lags: int,
+    num_heads: int,
+) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    """Emit every stratified profile at full lag resolution, and record the axes that were skipped.
+
+    Args:
+        per_sample: The collected per-sample table, for the cohort labels and the time axis.
+        vectors: The per-sample vector readouts, in the table's row order.
+        delay_steps: The causal input delay, for the seconds column.
+        n_lags: Lag window width $L$, for the per-head reshape.
+        num_heads: How many heads the per-head vector holds.
+
+    Returns:
+        ``(frame, skipped)``. The frame is long-form -- one row per (axis, cohort, profile, lag) --
+        so a reader pivots it rather than opening one file per cohort. ``skipped`` names each axis
+        that carried fewer than two cohorts, which on a single-class split is the ordinary outcome
+        and not a failure.
+    """
+    seconds = compensated_seconds_axis(n_lags, delay_steps)
+    guids = list(per_sample["guid"]) if "guid" in per_sample.columns else []
+    requested: List[Tuple[str, str, str]] = list(STRATIFIED_PROFILES)
+    rows: List[Dict[str, Any]] = []
+    skipped: Dict[str, Any] = {}
+
+    for axis, (row_labels, centres) in _axis_labels(per_sample).items():
+        # The shared predicate, so an absent label cannot be counted as a cohort here and then
+        # dropped by `_group_profiles` below -- which is how a single-class split kept its skip
+        # note from being written.
+        distinct = labels.distinct_groups(row_labels)
+        if len(distinct) < 2:
+            skipped[axis] = (
+                f"{len(distinct)} distinct {axis} value(s) in this split, so there is nothing to "
+                f"compare; the pooled profile stands"
+            )
+            continue
+        for name, attribute, note in requested:
+            for group, (profile, count) in _group_profiles(
+                vectors.get(attribute, np.zeros((0, 0))), guids, row_labels
+            ).items():
+                rows.extend(
+                    _profile_rows(
+                        axis, group, name, note, profile, seconds,
+                        count=count, centre=centres.get(group),
+                    )
+                )
+        rows.extend(
+            _per_head_rows(
+                axis, centres, vectors.get(PER_HEAD_ATTRIBUTE, np.zeros((0, 0))), guids,
+                row_labels, seconds, n_lags=n_lags, num_heads=num_heads,
+            )
+        )
+
+    columns = [
+        "group_column", "group", "bin_center_h", "profile", "meaning", "head", "n_recordings",
+        "lag_step", "compensated_seconds", "value",
+    ]
+    return pd.DataFrame(rows, columns=columns), skipped
+
+
+def _profile_rows(
+    axis: str,
+    group: str,
+    name: str,
+    meaning: str,
+    profile: np.ndarray,
+    seconds: np.ndarray,
+    *,
+    count: int,
+    centre: Optional[float] = None,
+    head: Optional[int] = None,
+) -> List[Dict[str, Any]]:
+    """Lay one cohort's profile out as one row per lag."""
+    values = padded_profile(profile, seconds.size)
+    return [
+        {
+            "group_column": axis,
+            "group": group,
+            "bin_center_h": centre,
+            "profile": name,
+            "meaning": meaning,
+            "head": head,
+            "n_recordings": int(count),
+            "lag_step": int(lag),
+            "compensated_seconds": float(seconds[lag]),
+            "value": float(values[lag]),
+        }
+        for lag in range(seconds.size)
+    ]
+
+
+def _per_head_rows(
+    axis: str,
+    centres: Dict[str, float],
+    rows: np.ndarray,
+    guids: Sequence[Any],
+    row_labels: Sequence[Any],
+    seconds: np.ndarray,
+    *,
+    n_lags: int,
+    num_heads: int,
+) -> List[Dict[str, Any]]:
+    """Stratify the per-head attention, reshaping the flattened vector exactly once.
+
+    The vector is flattened head-major so that it travels the same one-trailing-axis aggregation
+    chain every other vector readout does. A flat vector whose length does not factor into
+    $M \\cdot L$ is a mis-assembled profile rather than a short one, so it is dropped whole rather
+    than reshaped into a plausible wrong answer.
+    """
+    values = np.asarray(rows, dtype=np.float64)
+    if num_heads <= 0 or values.ndim != 2 or values.shape[1] != num_heads * n_lags:
+        return []
+    emitted: List[Dict[str, Any]] = []
+    for group, (profile, count) in _group_profiles(values, guids, row_labels).items():
+        reshaped = profile.reshape(num_heads, n_lags)
+        for head in range(num_heads):
+            emitted.extend(
+                _profile_rows(
+                    axis, group, f"attention_head_{head}",
+                    "per-head attention over the lags, on the pooled anchor support",
+                    reshaped[head], seconds, count=count,
+                    centre=centres.get(group), head=head,
+                )
+            )
+    return emitted
+
+
+def stratified_peak_rows(frame: pd.DataFrame, delay_steps: int) -> List[Dict[str, Any]]:
+    """Describe each stratified profile's peak, one row per (axis, cohort, profile).
+
+    Args:
+        frame: The long-form stratified table.
+        delay_steps: The causal input delay, for the seconds column.
+
+    Returns:
+        One row per profile carrying the same description the pooled summary carries -- the
+        argmax and its compensated seconds, the peak's width and edges, the mass near it, the
+        secondary peaks and the degeneracy verdict -- so a per-cohort reading is held to the same
+        standard as the pooled one rather than being reported as a bare argmax.
+    """
+    rows: List[Dict[str, Any]] = []
+    if frame.empty:
+        return rows
+    for (axis, group, name), cell in frame.groupby(
+        ["group_column", "group", "profile"], sort=True
+    ):
+        ordered = cell.sort_values("lag_step")
+        profile = list(np.asarray(ordered["value"], dtype=np.float64))
+        peak = peak_width(profile)
+        concentration = mass_above(profile)
+        secondary = secondary_peaks(profile)
+        verdict = degeneracy(profile)
+        argmax = peak["argmax"]
+        rows.append(
+            {
+                "group_column": axis,
+                "group": group,
+                "profile": name,
+                "n_recordings": int(ordered["n_recordings"].iloc[0]),
+                "argmax_lag_step": argmax,
+                "compensated_seconds": (
+                    None if argmax is None
+                    else float(lag_compensated_seconds(argmax, delay_steps=delay_steps))
+                ),
+                "peak_value": peak["peak"],
+                "peak_width_bins": peak["width_bins"],
+                "peak_width_seconds": (
+                    None if peak["width_bins"] is None
+                    else float(peak["width_bins"]) * float(SECONDS_PER_LAG_STEP)
+                ),
+                "mass_above_half_peak": concentration["share"],
+                "n_secondary_peaks": len(secondary),
+                "secondary_peak_lag_steps": [record["lag_step"] for record in secondary],
+                "degenerate": verdict["degenerate"],
+                "degenerate_reasons": "; ".join(verdict["reasons"]),
+            }
+        )
+    return rows
+
+
+def build_profile_figure(
+    profile: pd.DataFrame, lag: Dict[str, Any], *, delay_steps: int, n_lags: int
+) -> Any:
+    """Draw the two profiles against the compensated-seconds axis, with the peak marked.
+
+    Two panels. The top overlays the raw attribution and the support-corrected one on the same
+    axis, because the whole content of the correction is where the two part company. The bottom
+    is the contributing-anchor count that separates them -- drawn rather than described, since a
+    reader looking at a corrected profile is entitled to see the denominator that produced it.
+
+    Args:
+        profile: The per-lag table.
+        lag: The pass's lag block, read for the two argmaxes.
+        delay_steps: The causal input delay, for the axis.
+        n_lags: Lag window width, so the axis spans the window even when the profile is empty.
+
+    Returns:
+        The figure; the caller renders and closes it.
+    """
+    figure, axes = figures.new_figure(2)
+    seconds = compensated_seconds_axis(n_lags, delay_steps)
+    raw = profile_column(profile, "kl_nats", n_lags)
+    corrected = profile_column(profile, "kl_nats_support_corrected", n_lags)
+    axis = axes[0, 0]
+    figures.multi_line_panel(
+        axis, seconds, np.vstack([raw, corrected]),
+        ["raw attribution (sums to the KL)", "support-corrected (per contributing anchor)"],
+        title="Per-lag KL attribution",
+        xlabel=figures.COMPENSATED_LAG_AXIS_LABEL,
+        ylabel="nats per anchor",
+    )
+    for key, colour, label in (
+        ("kl_argmax_lag_step", figures.COLOR_BLUE, "raw argmax"),
+        ("kl_argmax_lag_step_support_corrected", figures.COLOR_ORANGE, "corrected argmax"),
+    ):
+        argmax = lag.get(key)
+        if argmax is None:
+            continue
+        axis.axvline(
+            float(lag_compensated_seconds(int(argmax), delay_steps=delay_steps)),
+            color=colour, linestyle="--", linewidth=1.0, label=label,
+        )
+    if axis.get_legend_handles_labels()[0]:
+        axis.legend(fontsize=6, loc="best", ncol=2)
+
+    figures.multi_line_panel(
+        axes[1, 0], seconds, profile_column(profile, "anchor_count", n_lags)[None, :],
+        ["contributing anchors"],
+        title="Anchors contributing to each lag -- the correction's denominator",
+        xlabel=figures.COMPENSATED_LAG_AXIS_LABEL,
+        ylabel="anchors per segment",
+    )
+    return figure
+
+
+def run_lag_kl_analysis(
+    context: Any,
+    *,
+    eval_config: Dict[str, Any],
+    output_dir: Any,
+    probe: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Report the per-lag KL attribution, its peak structure, and the identity behind it.
+
+    Args:
+        context: The analysis context, read for the pass's lag block and the per-sample table.
+        eval_config: The validated block. Unused: nothing here is tunable, because an operator who
+            could widen the degeneracy criterion could make a flat profile read as a finding.
+        output_dir: The results directory; this analysis writes into its own subdirectory.
+        probe: The loader probe's record. Unused.
+
+    Returns:
+        The protocol's keys plus the peak description, the identity residuals with the verdict
+        they earn, and the delay every reported lag was compensated by.
+    """
+    collection = context.collection
+    per_sample = collection.per_sample
+    results = dict(getattr(collection, "results", None) or {})
+    lag = dict(results.get("lag") or {})
+    directory = Path(output_dir) / ANALYSIS_DIRNAME
+    directory.mkdir(parents=True, exist_ok=True)
+
+    delay_steps = int(lag.get("delay_steps") or 0)
+    n_lags = int(lag.get("n_lags") or len(lag.get("kl_lag_profile") or []))
+    seconds = compensated_seconds_axis(n_lags, delay_steps)
+    profile = profile_frame(lag, seconds)
+    profile.to_csv(directory / PROFILE_FILENAME, index=False)
+
+    summary_rows = build_summary_rows(lag, delay_steps)
+    pd.DataFrame(summary_rows).to_csv(directory / SUMMARY_FILENAME, index=False)
+
+    per_guid = per_recording_means(per_sample, VALUE_COLUMNS)
+    per_guid.to_csv(directory / PER_RECORDING_FILENAME)
+
+    stratified, skipped_axes = stratified_profiles(
+        per_sample,
+        dict(getattr(collection, "vectors", None) or {}),
+        delay_steps=delay_steps,
+        n_lags=n_lags,
+        num_heads=int(lag.get("num_heads") or 0),
+    )
+    stratified.to_csv(directory / STRATIFIED_PROFILE_FILENAME, index=False)
+    stratified_peaks = stratified_peak_rows(stratified, delay_steps)
+    pd.DataFrame(stratified_peaks).to_csv(directory / STRATIFIED_PEAKS_FILENAME, index=False)
+
+    figure_name = str(
+        figures.render_to_pdf(
+            build_profile_figure(profile, lag, delay_steps=delay_steps, n_lags=n_lags),
+            directory / PROFILE_FIGURE,
+        ).name
+    )
+    return {
+        "n_samples": scored_sample_count(per_sample, "source_conditioned_kl_raw"),
+        "composition": {"n_recordings": int(len(per_guid)), "n_lags": n_lags},
+        "plan": {"capped": False},
+        # Every reported lag carries both, because a lag index is not seconds and the delay it is
+        # compensated by is a per-channel maximum rather than a single figure.
+        "delay_steps": delay_steps,
+        "source_delay_is_max_over_channels": bool(
+            lag.get("source_delay_is_max_over_channels", True)
+        ),
+        "peaks": summary_rows,
+        # The stratified reading: which axes were cut, which were skipped for holding one cohort,
+        # and the anchor restriction the untruncated profiles were computed over. The profiles
+        # themselves are on the CSV at full lag resolution -- an argmax in a summary is exactly
+        # the reduction this analysis exists to refuse.
+        "stratified": {
+            "axes": sorted(set(stratified["group_column"])) if len(stratified) else [],
+            "skipped_axes": skipped_axes,
+            "profiles": [name for name, _, _ in STRATIFIED_PROFILES],
+            "n_rows": int(len(stratified)),
+            "n_lags": n_lags,
+            "restricted_to_anchors_from": max(n_lags - 1, 0),
+            "peaks": stratified_peaks,
+        },
+        "identity": _identity_block(
+            lag, (results.get("readouts") or {}).get("source_conditioned_kl_raw")
+        ),
+        "grouped_frames": [
+            grouped_frame_entry(ANALYSIS_DIRNAME, PER_RECORDING_FILENAME, VALUE_COLUMNS)
+        ],
+        "files": [
+            PROFILE_FILENAME, SUMMARY_FILENAME, PER_RECORDING_FILENAME,
+            STRATIFIED_PROFILE_FILENAME, STRATIFIED_PEAKS_FILENAME, figure_name,
+        ],
+    }
+
+
+def _identity_block(lag: Dict[str, Any], kl_scale: Optional[float]) -> Dict[str, Any]:
+    """Report both structural identities against the tolerance the run judges them at.
+
+    Surfaced here as well as in the sanity block because this is the analysis whose every number
+    rests on them: a lag profile that does not sum to the KL is a decomposition of nothing, and a
+    reader holding this analysis's output should not have to go looking for whether it held. The
+    tolerance is resolved through the same function the sanity block uses, so the two cannot
+    reach opposite conclusions about one residual.
+
+    Args:
+        lag: The pass's lag block.
+        kl_scale: The headline KL the identities are over, which sets the tolerance.
+
+    Returns:
+        The residuals, the tolerance and its floor, and whether each held. A residual the pass did
+        not measure is absent rather than zero.
+    """
+    tolerance = identity_tolerance_for(kl_scale)
+    block: Dict[str, Any] = {
+        "tolerance_nats": float(tolerance),
+        "tolerance_floor_nats": float(IDENTITY_TOLERANCE),
+    }
+    for key, value in dict(lag.get("identity_residuals") or {}).items():
+        block[key] = float(value)
+        block[f"{key}_holds"] = bool(float(value) <= tolerance)
+    # The aggregate form of the second identity, which a reader can check by hand against the
+    # headline KL: the per-head split is a decomposition of the same number.
+    block["kld_per_head_total_nats"] = lag.get("kld_per_head_total_nats")
+    return block

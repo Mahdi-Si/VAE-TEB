@@ -1,0 +1,168 @@
+# The evaluation override delta, merged OVER a checkpoint's own resolved_config.yaml.
+#
+# This is not a config: it has no `base:` key and it does not stand alone. A training run writes
+# its fully resolved configuration beside its checkpoints, and that file is the record of what
+# the model was trained on — the geometry, the normalisation statistics, the objective. The
+# evaluation reads it and deep-merges this delta on top, so the run's own contract stays
+# authoritative and everything that genuinely differs is one small reviewable file.
+#
+# A `base:` chain cannot do that job: `base:` resolves relative to the file naming it, and the
+# checkpoint's resolved config is a runtime path no committed file can reference. Pointing it at
+# the shipped default.yaml instead would evaluate against what a config file currently says
+# rather than what the run trained under. `load_eval_overrides` refuses a `base:` key here.
+#
+# Run from the repo root:
+#   python -m teb_vae.lag_attn_rws.eval.probe --config <run>/model_checkpoints/resolved_config.yaml
+
+general_config:
+  batch_size:
+    # 32, not the training 128. Under no_grad the activation retention that dominates training is
+    # gone, but the transients are not: the decoder runs four branches over 480 raw samples per
+    # anchor at K Monte Carlo draws, and the attention weights alone are (B, T, 4, 91).
+    #
+    # `test` is the key GraphDataModule actually reads for the eval loader. A batch size placed
+    # under `eval_config` would be a dead key and the loader would quietly run at 128, which is
+    # the exact configuration this bound exists to avoid. Results are batch-size-invariant — the
+    # model uses GroupNorm and LayerNorm, no BatchNorm — so this costs only time.
+    test: 32
+
+dataset_config:
+  # REPOINT THESE, exactly as in default.yaml and for the same reason: the placeholder paths do
+  # not exist, so a run fails on a missing file rather than on a width mismatch someone might
+  # "fix" by reverting c_y/c_u. Preflight additionally refuses any path still containing
+  # REPOINT_ME, so the failure names the real cause.
+  #
+  # This is the shared k-fold HOLDOUT split — one HDF5 per canonical subgroup, all eight, all
+  # three clinical classes — rather than the healthy-only pretraining test files default.yaml
+  # points at. One pool, no fold loop, no double counting. Two consequences travel with it and
+  # are recorded in every summary: the checkpoint trains on `pre_training_dataset/*`, which is
+  # disjoint from this cohort, so evaluation is leakage-free; and the model has never seen
+  # ACIDOSIS or HIE, so every class contrast is an out-of-distribution comparison rather than
+  # held-out discrimination.
+  #
+  # The dataset pipeline's default build mode is `augmented`, which writes per-fold test splits
+  # instead of this `test/` directory. If it is absent, that is the reason.
+  vae_test_datasets:
+    - /data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_new_channel_selection/k_fold_cross_validation_dataset/test/healthy_no_bg_no_cs.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_new_channel_selection/k_fold_cross_validation_dataset/test/healthy_no_bg_cs.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_new_channel_selection/k_fold_cross_validation_dataset/test/healthy_bg_no_cs.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_new_channel_selection/k_fold_cross_validation_dataset/test/healthy_bg_cs.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_new_channel_selection/k_fold_cross_validation_dataset/test/acidosis_no_cs.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_new_channel_selection/k_fold_cross_validation_dataset/test/acidosis_cs.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_new_channel_selection/k_fold_cross_validation_dataset/test/hie_no_cs.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_new_channel_selection/k_fold_cross_validation_dataset/test/hie_cs.hdf5
+
+  dataloader_config:
+    dataset_kwargs:
+      # A list replaces wholesale on merge, so the inherited fields are restated rather than
+      # extended. Five are added, and every clinical question in this pipeline needs one of them:
+      # `target` recovers the class code (as a ratio against `weight`, never read directly),
+      # `epoch` is time before delivery, `cs_label`/`bg_label` are the subgroup cuts, and
+      # `time_from_labor_onset` is NaN wherever the GUID is absent from the labour-onset table.
+      #
+      # The loader SKIPS a field a shard does not carry, silently, so presence is asserted after
+      # the first batch rather than assumed from this list.
+      #
+      # The cross-channel FHRxUP phase-harmonic block is absent here and everywhere, and its name
+      # appears in no config at all: a coefficient mixing both signals would destroy the
+      # target-only / source-conditioned separation the whole design rests on.
+      load_fields:
+        [
+          'fhr',
+          'up',
+          'fhr_st',
+          'fhr_ph',
+          'up_ph',
+          'up_st',
+          'weight',
+          'guid',
+          'target',
+          'epoch',
+          'cs_label',
+          'bg_label',
+          'time_from_labor_onset',
+        ]
+
+      # 0, not the inherited 10000. Under training that cache is per-worker and bounded by the
+      # worker count; at num_workers: 0 it becomes main-process RAM — roughly 240 KB per sample,
+      # so 10000 entries is about 2.4 GB held for the whole run. It is also FIFO with no reuse
+      # policy, so against a test split larger than the cache it thrashes and buys nothing.
+      cache_size: 0
+
+      # Not restated, deliberately. `num_workers` is forced to 0 in code with a warning (spawn
+      # workers over a multi-file HDF5 dataset silently truncate every pass after the first).
+      # `epoch_min: -48000` / `epoch_max: null` / `label: null` are already correct in
+      # default.yaml: `epoch` is negative and the dataset floor is -44640 s, so the minimum is a
+      # no-op, and `label` filters by exact float equality against a weight-scaled target and
+      # would quietly drop every partially-valid segment. Restating them here would create a
+      # second place for them to be wrong.
+      #
+      # `trim_minutes: 1.0` is likewise inherited and NOT restated: the whole raw-index geometry
+      # (the forecast of anchor t starts at raw sample 16*(t+1)) assumes that trimmed grid, and a
+      # mismatch against the stats file only warns. Preflight checks it.
+
+# Evaluation-only settings. Everything that shapes a run lives here rather than in argv, because
+# this block is dumped into the run directory and is the durable record; a value injected from
+# Python would appear in neither that dump nor MLflow.
+#
+# Every key is validated at load: an unknown key raises and names the valid set, so a misspelling
+# cannot silently mean "no cap".
+eval_config:
+  # Seeds random, numpy and torch, and is recorded in summary.json. The predictive scores draw z,
+  # so an unseeded run reports different numbers for the same checkpoint.
+  seed: 42
+
+  # Monte Carlo draws per anchor for the marginalised predictive score, under common random
+  # numbers across branches. The specification's starting value, not a measured optimum; K = 1
+  # reduces the estimator exactly to the training-path single-draw score.
+  num_mc_samples: 8
+
+  # Global cap on the samples any analysis sees. null evaluates the whole split. A cap is drawn
+  # STRATIFIED, never as a prefix: the loader is unshuffled over eight concatenated per-subgroup
+  # files, so a prefix cap yields one subgroup and one class.
+  max_samples: null
+
+  # Per-analysis retention caps for the analyses that hold per-sample tensors. Empty means no
+  # analysis is capped; a cap of 0 is refused, because an empty analysis that still reports
+  # success is indistinguishable in the output from one that found nothing.
+  #
+  # Retention is opt-in: a quantity absent from here is retained for NO samples, because the
+  # alternative default is about 2.4 MB per sample held for a whole split. Four names are read:
+  #
+  #   waveforms  the per-anchor forecast blocks (truth, both branches and the full branch's
+  #              log-variance) plus the raw UP trace and its weight. `forecast_overlay.pdf` and
+  #              the whole event analysis -- deceleration skill and the contraction-triggered
+  #              response -- are silent without it. It also bounds their RUNTIME: the deceleration
+  #              detector runs three times per anchor per retained sample.
+  #   attention  the (T, M, L) attention weights, behind `lag_heatmap.pdf`.
+  #   pages      how many stratified per-sample diagnostic pages to render. Unlike the other two
+  #              this retains nothing; it caps a figure count, and the pages are re-rendered from
+  #              the loader rather than read off a retained array.
+  #   oracle     how many segments the sufficiency probe caches encoder states for (~159 KB each).
+  #              THE ONLY CAP HERE WHOSE ABSENCE DOES NOT MEAN ZERO: absent means every segment,
+  #              because a probe fitted on nothing is not a cheaper measurement but no measurement.
+  #              It also shortens the fit, whose step count is derived from the population.
+  #
+  # Contraction-CONDITIONED coupling needs none of them: the contraction timing travels on the
+  # per-anchor table for every anchor of the split.
+  caps: {}
+
+  # How much worse, in nats per anchor, a forecast from a stranger's prior latent must be before
+  # the prior is credited with carrying the target's predictive state. Explicitly provisional:
+  # where that boundary actually sits is what the first converged run answers, so the verdict
+  # always reports the measured degradation beside this number.
+  prior_shuffle_min_nats: 1.0
+
+  # Latent dimensions that must clear the per-dimension activity epsilon for the latent to count
+  # as uncollapsed.
+  min_active_dims: 2
+
+  # Seconds after a detected contraction within which an anchor counts as event-conditioned. One
+  # forecast horizon (30 steps x 4 s), so the window is the interval over which a contraction
+  # could still influence the block the model is predicting.
+  event_lag_window_s: 120.0
+
+  # Resamples behind every bootstrap interval, drawn over RECORDINGS. Recordings, not anchors:
+  # consecutive anchors' forecast windows overlap in 29 of their 30 steps, so resampling anchors
+  # would report an interval narrower than the data supports by that factor.
+  bootstrap_resamples: 2000

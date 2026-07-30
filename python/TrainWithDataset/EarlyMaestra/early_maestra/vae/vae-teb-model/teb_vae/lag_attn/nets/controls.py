@@ -25,15 +25,89 @@ without: the control is something one *does to* a model, not something a model *
 """
 from __future__ import annotations
 
-from typing import Dict, Optional, Tuple
+from collections import Counter
+from typing import Dict, Hashable, List, Optional, Sequence, Tuple
 
 import torch
+
+
+class NoCrossGroupPartner(ValueError):
+    """No permutation can pair every element with one from a *different* group.
+
+    Raised rather than returned so a caller cannot mistake an impossible batch for a drawn one,
+    and typed separately from the ordinary ``ValueError`` guards so a caller may catch exactly
+    this case -- a batch holding too few distinct recordings -- without also swallowing a shape
+    or size error.
+    """
+
+
+def groups_can_derange(groups: Sequence[Hashable]) -> bool:
+    r"""Whether a cross-group derangement of ``groups`` exists at all.
+
+    A permutation pairing every element with one of a different group is a perfect matching in
+    the bipartite graph joining $i$ to every $j$ with $g_j \neq g_i$. By Hall's theorem such a
+    matching exists **iff** no group holds more than half the batch,
+
+    $$2 \max_g |g| \le B,$$
+
+    since the largest group is the only set whose neighbourhood can be too small: any set
+    spanning two or more groups may reach every element. The condition is therefore exact, not
+    conservative -- a batch it rejects has no valid pairing at all, whatever algorithm is used.
+
+    Args:
+        groups: One group label per batch element.
+
+    Returns:
+        ``True`` when a cross-group derangement exists.
+    """
+    batch_size = len(groups)
+    if batch_size < 2:
+        return False
+    return 2 * max(Counter(groups).values()) <= batch_size
+
+
+def _grouped_derangement(
+    groups: Sequence[Hashable], generator: Optional[torch.Generator]
+) -> List[int]:
+    r"""Draw a permutation pairing every element with one from a different group.
+
+    Lay the batch out with each group's members contiguous, then rotate that layout by the
+    largest group's size $m$. Two positions $k$ and $(k + m) \bmod B$ can only fall inside the
+    same run of length $c \le m$ if $m < c$ (impossible) or, wrapping, if $B - m < c \le m$,
+    i.e. $B < 2m$ -- which :func:`groups_can_derange` has already excluded. So the rotation is
+    fixed-point-free *and* cross-group by construction, with no rejection loop.
+
+    The layout order is randomised, so the draw is not a fixed function of the batch. It is
+    **not** uniform over the valid cross-group derangements, which the control does not need: it
+    needs each target paired with a stranger, not a uniformly chosen stranger.
+
+    Args:
+        groups: One group label per batch element; must satisfy :func:`groups_can_derange`.
+        generator: Optional CPU generator for reproducibility.
+
+    Returns:
+        The permutation as a list, where element $i$ takes from index ``result[i]``.
+    """
+    members: Dict[Hashable, List[int]] = {}
+    # Shuffling the indices first, then bucketing, randomises the order *within* each run; the
+    # buckets themselves then appear in first-touch order, which the shuffle also randomises.
+    for index in torch.randperm(len(groups), generator=generator).tolist():
+        members.setdefault(groups[index], []).append(index)
+
+    layout = [index for bucket in members.values() for index in bucket]
+    shift = max(len(bucket) for bucket in members.values())
+    perm = [0] * len(groups)
+    for position, index in enumerate(layout):
+        perm[index] = layout[(position + shift) % len(layout)]
+    return perm
 
 
 def make_derangement(
     batch_size: int,
     generator: Optional[torch.Generator] = None,
     device: Optional[torch.device] = None,
+    *,
+    groups: Optional[Sequence[Hashable]] = None,
 ) -> torch.Tensor:
     r"""Draw a batch-index derangement $\pi$ with $\pi(i) \neq i$ for every $i$.
 
@@ -44,22 +118,54 @@ def make_derangement(
     importantly, one buggy predicate away from silently letting an identity mapping through. A
     control that is quietly not a control reports the model as source-specific when it is not.
 
+    With ``groups`` the guarantee is strengthened from $\pi(i) \neq i$ to
+    $g_{\pi(i)} \neq g_i$. That matters wherever batch neighbours are not independent: an
+    unshuffled loader over per-recording shards puts consecutive segments of one recording in one
+    batch, and $\pi(i) \neq i$ then happily pairs a segment with *its own recording's* next
+    segment -- which is not a stranger's source, and weakens the control by an amount nothing
+    reports.
+
     Args:
         batch_size: Batch size $B$; must be at least $2$.
         generator: Optional CPU generator for reproducibility.
         device: Device of the returned index tensor. Defaults to CPU.
+        groups: Optional group label per batch element -- a recording identifier, typically.
+            ``None`` draws the ungrouped Sattolo derangement, bit for bit.
 
     Returns:
-        A ``(B,)`` long tensor holding $\pi$, with no fixed points.
+        A ``(B,)`` long tensor holding $\pi$, with no fixed points and, under ``groups``, no
+        within-group pairs.
 
     Raises:
-        ValueError: If ``batch_size < 2``, where no derangement exists.
+        ValueError: If ``batch_size < 2``, where no derangement exists, or if ``groups`` has a
+            different length.
+        NoCrossGroupPartner: If ``groups`` admits no cross-group pairing at all -- one group
+            holding more than half the batch, of which a single-group batch is the usual case.
     """
     if batch_size < 2:
         raise ValueError(
             f"a derangement requires batch_size >= 2, got {batch_size}; callers must "
             "skip the permutation control for degenerate batches"
         )
+
+    if groups is not None:
+        if len(groups) != batch_size:
+            raise ValueError(
+                f"groups must have one label per batch element: got {len(groups)} for "
+                f"batch_size {batch_size}"
+            )
+        if not groups_can_derange(groups):
+            largest, count = Counter(groups).most_common(1)[0]
+            raise NoCrossGroupPartner(
+                f"no cross-group derangement exists: group {largest!r} holds {count} of "
+                f"{batch_size} elements, and a pairing needs every group to hold at most half. "
+                f"Callers must exclude such a batch from the control and count the exclusion "
+                f"rather than falling back to a within-group pairing."
+            )
+        return torch.tensor(
+            _grouped_derangement(groups, generator), dtype=torch.long, device=device
+        )
+
     perm = list(range(batch_size))
     for i in range(batch_size - 1, 0, -1):
         j = int(torch.randint(0, i, (1,), generator=generator).item())
@@ -72,23 +178,31 @@ def resolve_perm_index(
     perm_index: Optional[torch.Tensor],
     generator: Optional[torch.Generator],
     device: torch.device,
+    *,
+    groups: Optional[Sequence[Hashable]] = None,
 ) -> torch.Tensor:
     """Validate a supplied permutation index, or draw a fresh derangement.
+
+    A *supplied* index is shape-checked and otherwise trusted, ``groups`` included: the caller
+    that built it is the one that knows what it means, and re-deriving the grouping here would
+    only be able to disagree with it.
 
     Args:
         batch_size: Expected batch size $B$.
         perm_index: A precomputed ``(B,)`` index, or ``None`` to draw one.
         generator: Optional CPU generator seeding the draw.
         device: Device for the result.
+        groups: Optional group label per batch element; see :func:`make_derangement`.
 
     Returns:
         A ``(B,)`` long index tensor.
 
     Raises:
         ValueError: If a supplied index has the wrong shape, or the batch is too small.
+        NoCrossGroupPartner: If ``groups`` admits no cross-group pairing.
     """
     if perm_index is None:
-        return make_derangement(batch_size, generator=generator, device=device)
+        return make_derangement(batch_size, generator=generator, device=device, groups=groups)
     perm_index = perm_index.to(device=device, dtype=torch.long)
     if perm_index.shape != (batch_size,):
         raise ValueError(
