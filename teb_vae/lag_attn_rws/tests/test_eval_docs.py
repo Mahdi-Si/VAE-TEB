@@ -19,6 +19,11 @@ it with one extra name rather than by editing a committed document.
 The fourth binding is the operations side: every way ``preflight.py`` refuses a run has a row in
 ``EVAL.md``'s recovery table, extracted from the module's AST rather than from a list somebody
 maintains.
+
+The fifth is inside the code: ``run.py``'s ``RUN_ARGS`` comment table lists the names ``only`` and
+``skip`` accept, for an operator editing that dict rather than typing flags. ``--help`` is
+interpolated from the registry and cannot go stale; a hand-written table can, and it is read at
+exactly the moment someone is choosing a name.
 """
 from __future__ import annotations
 
@@ -360,6 +365,52 @@ def test_the_exit_code_semantics_are_written_down(eval_doc):
     assert "read the backup" in operations.lower()
     # What a refusal leaves behind, stated rather than implied.
     assert "no `summary.json`" in operations
+
+
+# =============================================================================
+# (e) The launch dict's own table of selectable analyses
+# =============================================================================
+def launch_table_analyses(source: str) -> List[str]:
+    r"""Return the analysis names ``RUN_ARGS``' comment table lists, in order.
+
+    Anchored on two spaces after the ``#`` and a colon after the name, which is what separates a
+    table row from the prose around it and from a row's own continuation lines. Read from the
+    ``RUN_ARGS`` assignment onward so a name mentioned anywhere else in the module -- the registry
+    itself is above it -- cannot stand in for a row.
+    """
+    block = source[source.index("RUN_ARGS: Dict[str, Any] = {"):]
+    return re.findall(r"^\s*#\s{2,}(\w+):", block, flags=re.MULTILINE)
+
+
+def test_the_launch_table_lists_every_selectable_analysis_and_only_those():
+    """Both directions at once, because the table is an ordered list of exactly the registry: a
+    missing row is a name an operator will not know to type, and a stale row is one that raises
+    at startup after they typed it."""
+    listed = launch_table_analyses(Path(run_module.__file__).read_text(encoding="utf-8"))
+
+    assert listed == list(run_module.ANALYSES), (
+        f"run.py's RUN_ARGS comment table lists {listed}, but --only/--skip accept "
+        f"{list(run_module.ANALYSES)}. The table is what an operator reads while editing the "
+        f"dict; --help is interpolated from the registry and cannot disagree with it."
+    )
+    # The unskippable step is named in the table's prose as the one thing neither key takes; a
+    # row for it would read as a fifteenth choice that raises when chosen.
+    assert not set(run_module.UNSKIPPABLE_ANALYSES) & set(listed)
+
+
+def test_a_missing_or_stale_launch_table_row_is_caught():
+    """Non-vacuity: a regex matching nothing would pass the equality above on an empty registry.
+    Exercised against synthetic sources rather than by editing the module."""
+    assert launch_table_analyses("RUN_ARGS: Dict[str, Any] = {\n    #   forecast:  what\n") == [
+        "forecast"
+    ]
+    # A continuation line, and the prose around the table, are not rows.
+    assert launch_table_analyses(
+        "RUN_ARGS: Dict[str, Any] = {\n"
+        "    # Which analyses run. `band_partition` is not selectable.\n"
+        "    #   forecast:         Is the forecast any good. Skill against persistence and\n"
+        "    #                     climatology, resolved by horizon step.\n"
+    ) == ["forecast"]
 
 
 def test_the_interpretation_rules_are_all_present(eval_doc):

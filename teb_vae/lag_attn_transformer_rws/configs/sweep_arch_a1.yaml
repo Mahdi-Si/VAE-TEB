@@ -1,0 +1,38 @@
+# Architecture arm A1: pure causal Transformer, no convolution stem, four full-context blocks
+# per stream.
+#
+# The question: does the convolutional inductive bias earn its place? The stem is the only part
+# of this encoder that imposes a fixed local reach; removing it leaves attention to discover
+# local morphology from data alone. Against A2 -- the same arm *with* the stem -- the difference
+# is exactly the stem's 201,728 parameters and nothing else, which is the comparison this pair
+# exists to make.
+#
+# Two keys are the stem's removal (a kernel schedule and its dilations, emptied together because
+# they are positional against each other) and two make both streams symmetric full-context, so
+# the only surviving asymmetry between A1 and A2 is the stem. Four declared deltas, none of them
+# drift.
+#
+# Parameter total 2,029,567: -201,728 for the two stems, +164,352 for the source encoder's fourth
+# attention block, so -37,376 against the shipped configuration rather than the stem cost.
+#
+# Note that A0 in this study is the model this package is compared against --
+# teb_vae/lag_attn_rws, the dilated-conv-plus-LSTM encoder pair -- not a config in this directory.
+# The shipped default.yaml is A3, the recommended arm.
+#
+#   TEB_RUN_STAMP="$(date '+%Y-%m-%d--[%H-%M]')" torchrun --nproc_per_node=7 \
+#       -m teb_vae.lag_attn_transformer_rws.trainer \
+#       --config teb_vae/lag_attn_transformer_rws/configs/sweep_arch_a1.yaml
+base: default.yaml
+
+model_config:
+  VAE_model:
+    # Empty together: conv_receptive_field refuses schedules of unequal length, because the two
+    # are positional against each other and a mismatch would pair the wrong kernel with the wrong
+    # dilation. The stem reach falls from 21 steps to 1 -- the identity.
+    encoder_conv_kernels: []
+    encoder_conv_dilations: []
+    # Symmetric with the target: four blocks, full causal prefix. The source state's reach is then
+    # unbounded rather than the shipped 66 steps, which is the locality property Phase 2 sweeps
+    # separately; here it is held equal to the target's so the stem is the only variable against A2.
+    source_attention_blocks: 4
+    source_attention_window: null

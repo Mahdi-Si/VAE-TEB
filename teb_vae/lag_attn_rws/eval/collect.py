@@ -818,28 +818,42 @@ def bounds_record(model: Any) -> Dict[str, Any]:
     }
 
 
-def normalization_record(loader: Any) -> Dict[str, Any]:
-    """Return the loader's FHR z-scoring, so a later analysis can report bpm without a loader.
+#: The raw signals whose z-scoring is recorded: the target, so a score can be reported in bpm, and
+#: the source, so the per-sample pages draw the UP trace in mmHg. Both are entries the *figures*
+#: need; nothing in this file reads either.
+_NORMALIZED_SIGNALS = ("fhr", "up")
 
-    Only the ``fhr`` entry, and only its two scalars. The full statistics dict carries per-channel
-    arrays for seven fields and torch tensors beside them, none of which any analysis reads and
-    none of which survives a JSON round trip.
+
+def normalization_record(loader: Any) -> Dict[str, Any]:
+    """Return the loader's raw-signal z-scoring, so a later analysis needs no loader.
+
+    Only the two raw signals, and only their two scalars each. The full statistics dict carries
+    per-channel arrays for seven fields and torch tensors beside them, none of which any analysis
+    reads and none of which survives a JSON round trip.
+
+    ``up`` is here for one reason: the per-sample page draws the source trace beside the target,
+    and the training callback -- which reaches the loader's statistics directly -- draws it in
+    mmHg. Without this entry the same builder would render the same segment in z-units on the
+    evaluation's copy of the page, and the two would silently disagree.
 
     Args:
         loader: The evaluation dataloader.
 
     Returns:
-        ``{'fhr': {'mean': ..., 'std': ...}}``, or ``{}`` when the dataset reports no statistics.
-        Empty is the honest outcome rather than a failure: an evaluation without them still
-        produces every number, in the loader's own units and labelled as such.
+        ``{field: {'mean': ..., 'std': ...}}`` for each raw signal the dataset reports, or ``{}``
+        when it reports none. A partial record is the honest outcome rather than a failure: an
+        evaluation without a field's statistics still produces every number, in the loader's own
+        units and labelled as such.
     """
     dataset = getattr(loader, "dataset", None)
     getter = getattr(dataset, "get_normalization_stats", None)
     stats = getter() if callable(getter) else None
-    block = (stats or {}).get("fhr")
-    if not isinstance(block, dict) or "mean" not in block or "std" not in block:
-        return {}
-    return {"fhr": {"mean": float(block["mean"]), "std": float(block["std"])}}
+    record: Dict[str, Any] = {}
+    for field in _NORMALIZED_SIGNALS:
+        block = (stats or {}).get(field)
+        if isinstance(block, dict) and "mean" in block and "std" in block:
+            record[field] = {"mean": float(block["mean"]), "std": float(block["std"])}
+    return record
 
 
 def _counts_of(frame: pd.DataFrame, column: str) -> Dict[str, int]:

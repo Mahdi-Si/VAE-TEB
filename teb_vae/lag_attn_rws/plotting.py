@@ -6,7 +6,10 @@ the same page and may import neither Lightning nor this module. :func:`build_dia
 re-exported here so the callback, and every caller and test that reached for
 ``plotting.build_diagnostic_figure``, are unchanged.
 
-What is left here is the callback: when to draw, which samples, and where the files go. It never
+What is left here is the callback: when to draw, which samples, and where the files go. It supplies
+one thing the model's own input builders cannot: the raw ``up`` trace, which the net never sees --
+it consumes the decimated UP feature blocks -- and which the page's first row draws beside the
+target. It never
 raises into the training loop -- generation is wrapped in a broad ``try/except`` that warns and
 closes any leaked figures -- and every saved file goes to MLflow through the rank-0 artifact seam
 :func:`utils.mlflow_utils.log_artifact_to_mlflow`. This module lives in the model layer rather
@@ -170,7 +173,6 @@ class LagAttnRwsPlotCallback(Callback):
         *,
         file_format: str = "pdf",
         mlflow_logger: Any = None,
-        forecast_anchor_frac: float = 0.6,
         subdir: str = "lag_attn_rws_diagnostics",
     ) -> None:
         """Initialize the callback.
@@ -181,7 +183,6 @@ class LagAttnRwsPlotCallback(Callback):
             num_examples: Samples of the first validation batch to draw.
             file_format: Figure extension, e.g. ``'pdf'`` or ``'png'``.
             mlflow_logger: The run's MLflow logger, or ``None`` to skip artifact upload.
-            forecast_anchor_frac: Where in the trained-anchor range to place the forecast zoom.
             subdir: Subdirectory name under ``output_dir``.
         """
         super().__init__()
@@ -194,7 +195,6 @@ class LagAttnRwsPlotCallback(Callback):
         self.plot_frequency = max(1, int(plot_frequency))
         self.num_examples = max(1, int(num_examples))
         self.file_format = file_format.lower().lstrip(".")
-        self.forecast_anchor_frac = float(forecast_anchor_frac)
         self._mlflow_logger = mlflow_logger
 
     def on_validation_epoch_end(self, trainer: Any, pl_module: Any) -> None:
@@ -288,9 +288,11 @@ class LagAttnRwsPlotCallback(Callback):
                 guid=guid,
                 beta=beta,
                 scalars={name: float(value) for name, value in scalars.items()},
+                # The raw source, which no builder of the model's inputs returns: the net is fed
+                # the decimated UP feature blocks and never sees this trace.
+                up_raw=_get_field(batch, "up"),
                 normalization_stats=stats,
                 delay_steps=_source_delay_steps(model),
-                forecast_anchor_frac=self.forecast_anchor_frac,
             )
             path = self.output_dir / (
                 f"lag_attn_rws_epoch{epoch:04d}_sample{index}_{guid[:16]}.{self.file_format}"

@@ -1,0 +1,24 @@
+# Width arm: encoder_d_ff = 384 (shipped 256).
+#
+# The one width in this encoder that is free to move. At d_model = 128 the shipped feed-forward
+# hidden width is 2x the model width, below the 4x a Transformer block conventionally carries;
+# 384 is 3x. The question is whether the block's position-wise capacity, not its depth, is what
+# binds -- a distinction the depth arms cannot answer because adding a block adds attention and
+# feed-forward capacity together.
+#
+# +344,064 parameters: the SwiGLU feed-forward holds 3*d*d_ff, so +3*128*128 = 49,152 per block
+# across all seven attention blocks (four target, three source).
+#
+# d_model stays 128: it is the width the prior head, the posterior fusion, the lag attention and
+# the decoder input all assume, and the derived encoder head width d_model / encoder_num_heads
+# must stay even for the rotary position encoding. d_ff is internal to a block and constrained by
+# neither.
+#
+#   TEB_RUN_STAMP="$(date '+%Y-%m-%d--[%H-%M]')" torchrun --nproc_per_node=7 \
+#       -m teb_vae.lag_attn_transformer_rws.trainer \
+#       --config teb_vae/lag_attn_transformer_rws/configs/sweep_ff_384.yaml
+base: default.yaml
+
+model_config:
+  VAE_model:
+    encoder_d_ff: 384

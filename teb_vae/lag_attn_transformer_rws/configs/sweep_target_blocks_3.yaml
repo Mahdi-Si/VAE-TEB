@@ -1,0 +1,25 @@
+# Depth arm: target_attention_blocks = 3 (shipped 4).
+#
+# The target encoder is what the conditional prior p(z_t | Y_<=t) reads, so its depth sets how
+# much of the forecast the target-only branch can carry on its own. A shallower target prior is
+# the arm that tests whether the shipped depth is buying anything -- and it has to be read
+# carefully: a *weaker* prior raises the source-conditioned KL without the coupling having grown,
+# which is exactly the number this study refuses to select on. Read it against the base
+# reconstruction D_0 and the base-minus-full gap.
+#
+# The target keeps the full causal prefix in every arm; only the block count moves.
+#
+# -164,352 parameters, one attention block: 4*128^2 + 3*128*256 + 4*128.
+#
+# d_model stays 128 in every arm of this sweep. It is the width the prior head, the posterior
+# fusion, the lag attention's key-value projections and the decoder input all assume; moving it
+# would be a different model rather than a depth arm.
+#
+#   TEB_RUN_STAMP="$(date '+%Y-%m-%d--[%H-%M]')" torchrun --nproc_per_node=7 \
+#       -m teb_vae.lag_attn_transformer_rws.trainer \
+#       --config teb_vae/lag_attn_transformer_rws/configs/sweep_target_blocks_3.yaml
+base: default.yaml
+
+model_config:
+  VAE_model:
+    target_attention_blocks: 3

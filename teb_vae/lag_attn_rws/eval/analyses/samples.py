@@ -42,7 +42,7 @@ from torch.utils.data import DataLoader, Subset
 
 from teb_vae.lag_attn_rws.eval import figures_seam as figures
 from teb_vae.lag_attn_rws.eval._reuse import subsample_indices
-from teb_vae.lag_attn_rws.eval.metrics import model_inputs
+from teb_vae.lag_attn_rws.eval.metrics import batch_field, model_inputs
 from teb_vae.lag_attn_rws.sample_page import build_diagnostic_figure
 
 #: This analysis's own subdirectory inside the results directory.
@@ -306,6 +306,10 @@ def render_pages(
                 guid=str(row["guid"]),
                 beta=float(task.hparams.get("kld_beta", 1.0)),
                 scalars=_page_scalars(row),
+                # Read off the batch rather than from `model_inputs`, which returns only what the
+                # net is fed: the raw source trace is never one of the model's inputs. `None` for
+                # a batch that does not carry it, which the page renders as an FHR-only first row.
+                up_raw=batch_field(moved, "up"),
                 normalization_stats=normalization or None,
                 delay_steps=int(delay_steps),
             )
