@@ -138,7 +138,26 @@ RESOLVED_BUDGET_KEY = "resolved_causal_budget"
 
 
 class LagAttnRwsTrainer(GraphModelBase):
-    """Experiment driver for :class:`~teb_vae.lag_attn_rws.nets.model.SeqVaeLagAttnRws`."""
+    """Experiment driver for :class:`~teb_vae.lag_attn_rws.nets.model.SeqVaeLagAttnRws`.
+
+    Everything below the three class attributes is model-independent -- the config-to-constructor
+    sweep, the reach-budget resolution, the callback assembly and the DDP strategy selection -- so
+    a sibling architecture that keeps this objective, this data contract and this metric surface
+    reuses all of it by subclassing and re-pointing the attributes, rather than by copying a
+    driver that would then be free to drift.
+    """
+
+    #: The net this driver builds. A class attribute rather than a literal at each construction
+    #: site so a sibling architecture can be trained through this driver without duplicating the
+    #: kwarg sweep, the guards or the callback assembly.
+    MODEL_CLS = SeqVaeLagAttnRws
+
+    #: The Lightning task the net is wrapped in.
+    TASK_CLS = SeqVaeLagAttnRwsTask
+
+    #: Checkpoint filename stem, before the epoch placeholder. Lightning auto-prefixes each
+    #: placeholder with its own name, so this must not itself contain ``epoch=``.
+    CHECKPOINT_STEM = "lag-attn-rws"
 
     #: The causal guard this run resolved, populated by :meth:`_build_model_kwargs` and read by
     #: :meth:`create_model` for the startup log. ``None`` means no reach budget is configured.
@@ -165,7 +184,7 @@ class LagAttnRwsTrainer(GraphModelBase):
             Constructor kwargs for the net.
         """
         vae_config = (self.config.get("model_config", {}) or {}).get("VAE_model", {}) or {}
-        valid_parameters = set(inspect.signature(SeqVaeLagAttnRws.__init__).parameters)
+        valid_parameters = set(inspect.signature(self.MODEL_CLS.__init__).parameters)
         model_kwargs = {
             name: value
             for name, value in vae_config.items()
@@ -197,7 +216,7 @@ class LagAttnRwsTrainer(GraphModelBase):
         """
         model_kwargs = self._build_model_kwargs()
         logger.info(
-            "Building SeqVaeLagAttnRws with kwargs: "
+            f"Building {self.MODEL_CLS.__name__} with kwargs: "
             + ", ".join(
                 # The four channel tuples are hundreds of integers long and are recorded in full
                 # in the resolved config; here they would bury every other kwarg.
@@ -215,9 +234,12 @@ class LagAttnRwsTrainer(GraphModelBase):
             "read up to 974 s into their own future, so the source-conditioned KL is not a "
             "transfer entropy."
         )
-        self.pytorch_model = SeqVaeLagAttnRws(**model_kwargs)
+        self.pytorch_model = self.MODEL_CLS(**model_kwargs)
 
-        if not self.pytorch_model.causal_norm:
+        # ``getattr`` with a safe default rather than a bare read: an architecture with no
+        # time-pooling normaliser has no ``causal_norm`` argument at all, and the default states
+        # what such a model is -- causal by construction, so there is nothing to warn about.
+        if not getattr(self.pytorch_model, "causal_norm", True):
             logger.warning(
                 "causal_norm=False: the encoders' GroupNorm pools statistics across time, so "
                 "the prior conditions on the future and the source-conditioned KL is NOT a "
@@ -231,16 +253,16 @@ class LagAttnRwsTrainer(GraphModelBase):
         if self.checkpoint is not None:
             blob = torch.load(str(self.checkpoint), map_location="cpu", weights_only=False)
             # Before the load, not after: a blob from another model may align by accident.
-            check_model_class(blob, SeqVaeLagAttnRws.__name__)
+            check_model_class(blob, self.MODEL_CLS.__name__)
             if load_checkpoint_strict(model=self.pytorch_model, checkpoint=blob) is None:
                 raise RuntimeError(
                     f"could not align core_model_checkpoint {self.checkpoint!r} into "
-                    f"SeqVaeLagAttnRws (no matching module keys). Training would otherwise "
-                    f"continue from random weights."
+                    f"{self.MODEL_CLS.__name__} (no matching module keys). Training would "
+                    f"otherwise continue from random weights."
                 )
             logger.info(f"Model loaded from checkpoint: {self.checkpoint}")
 
-        self.pl_model = SeqVaeLagAttnRwsTask(
+        self.pl_model = self.TASK_CLS(
             self.pytorch_model,
             lr=self.lr,
             lr_milestones=self.lr_milestones,
@@ -327,7 +349,7 @@ class LagAttnRwsTrainer(GraphModelBase):
             monitor=checkpoint_config.get("monitor", "val/total_loss"),
             # Lightning auto-prefixes each placeholder with its own name, so
             # "model-epoch={epoch}" would render as "model-epoch=epoch=00".
-            filename="lag-attn-rws-{epoch:02d}",
+            filename=f"{self.CHECKPOINT_STEM}-{{epoch:02d}}",
             save_top_k=checkpoint_config.get("save_top_k", 3),
             mode=checkpoint_config.get("mode", "min"),
         )
@@ -367,7 +389,7 @@ class LagAttnRwsTrainer(GraphModelBase):
         return trainer
 
 
-def main(config_path: str) -> None:
+def main(config_path: str, trainer_cls: type[LagAttnRwsTrainer] = LagAttnRwsTrainer) -> None:
     """Resolve the config, build everything, and run the fit.
 
     The call order is load-bearing and nothing chains it. ``setup_config`` is what seeds the
@@ -376,8 +398,14 @@ def main(config_path: str) -> None:
     -- which silently drops the MLflow callback from the fit. The pre-flight guards run *before*
     ``setup_config`` so a doomed launch leaves no run directory and no MLflow run behind.
 
+    ``trainer_cls`` is a parameter rather than a literal because the four pre-flight guards, the
+    resolved-config persistence and the temporary-file dance around them are model-independent:
+    a sibling architecture's entry point delegates here with its own driver instead of copying
+    them, which is the only way they cannot drift.
+
     Args:
         config_path: Path to the YAML config. Its ``base:`` chain is resolved first.
+        trainer_cls: The driver class to construct. Defaults to this module's.
     """
     start_time = time.time()
 
@@ -389,7 +417,7 @@ def main(config_path: str) -> None:
         resolved_path = resolve_config_file(config_path, resolved_dir)
         logger.info(f"resolved config {config_path} -> {resolved_path}")
 
-        graph_model = LagAttnRwsTrainer(config_file_path=resolved_path)
+        graph_model = trainer_cls(config_file_path=resolved_path)
         _check_stat_path(graph_model.config)
         _check_declared_widths_against_shard(graph_model.config)
         _check_raw_target_normalized(graph_model.config)

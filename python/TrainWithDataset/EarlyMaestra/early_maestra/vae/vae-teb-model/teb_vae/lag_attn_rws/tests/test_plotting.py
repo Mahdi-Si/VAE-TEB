@@ -1,13 +1,15 @@
 r"""The validation diagnostic figure, and the guards that keep it out of the training loop's way.
 
 Two kinds of test here. The builder is driven directly from a real forward pass, which is what
-pins the *content* -- that the forecast is drawn in bpm and that a lag axis says which of the two
-lag quantities it shows. The callback is driven through its real hook with a fake trainer, which
-is what pins the *behaviour* -- silent off rank zero, silent during the sanity pass, silent
-between plot epochs, and never raising into a fit.
+pins the *content* -- that the forecast is drawn in bpm, that its windows tile the recording
+without overlapping, that the untrained anchors are gone from the maps rather than merely shaded,
+and that a lag axis says which of the two lag quantities it shows. The callback is driven through
+its real hook with a fake trainer, which is what pins the *behaviour* -- silent off rank zero,
+silent during the sanity pass, silent between plot epochs, and never raising into a fit.
 
 Both directions are asserted wherever a single direction would pass vacuously: the bpm test also
-checks the no-statistics fallback, and the frequency test also checks the epoch that should fire.
+checks the no-statistics fallback, the source-trace test also checks the batch that carries no
+``up``, and the frequency test also checks the epoch that should fire.
 """
 from __future__ import annotations
 
@@ -19,6 +21,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 
+import numpy as np  # noqa: E402
 import pytest  # noqa: E402
 import torch  # noqa: E402
 
@@ -27,9 +30,13 @@ from teb_vae.lag_attn_rws.nets.lag_report import COMPENSATED_LAG_AXIS_LABEL  # n
 from teb_vae.lag_attn_rws.plotting import LagAttnRwsPlotCallback  # noqa: E402
 from train.test_utils import FakeMLflowLogger, FakeTrainer  # noqa: E402
 
-#: A plausible target scale: the loader z-scores the raw FHR by one global mean and standard
-#: deviation, so inverting it is an affine map with these two numbers.
-_STATS = {"fhr": {"mean": 140.0, "std": 20.0}}
+#: Plausible raw-signal scales: the loader z-scores each by one global mean and standard
+#: deviation, so inverting either is an affine map with its two numbers.
+_STATS = {"fhr": {"mean": 140.0, "std": 20.0}, "up": {"mean": 30.0, "std": 10.0}}
+
+#: Raw sampling rate, restated rather than imported: the page's second-axis arithmetic is what is
+#: under test, and borrowing its own constant would make these assertions circular.
+_FS_RAW = 4.0
 
 
 def _forward(task_module: Any, batch: Any) -> dict:
@@ -59,6 +66,7 @@ def _build(task_module: Any, batch: Any, **overrides) -> Any:
         guid="rec-0001",
         beta=0.25,
         scalars={"nll_base_block": 1.0, "nll_full_block": 0.5, "pred_gap": 0.5},
+        up_raw=batch.up,
         normalization_stats=_STATS,
     )
     kwargs.update(overrides)
@@ -99,7 +107,7 @@ def test_the_forecast_panel_is_drawn_in_bpm(task, stub_batch):
     module = task()
     figure = _build(module, stub_batch)
     try:
-        ax = _axes_titled(figure, "Forecast at anchor")
+        ax = _axes_titled(figure, "Forecast")
         assert "bpm" in ax.get_ylabel()
     finally:
         plt.close(figure)
@@ -110,7 +118,7 @@ def test_without_statistics_the_forecast_panel_says_normalised_instead_of_lying(
     bpm -- so the test above is about the conversion and not about the word."""
     figure = _build(task(), stub_batch, normalization_stats=None)
     try:
-        ax = _axes_titled(figure, "Forecast at anchor")
+        ax = _axes_titled(figure, "Forecast")
         assert "normalised" in ax.get_ylabel()
         assert "bpm" not in ax.get_ylabel()
     finally:
@@ -123,17 +131,107 @@ def test_the_bpm_conversion_is_the_loaders_inverse(task, stub_batch):
     module = task()
     figure = _build(module, stub_batch)
     try:
-        ax = _axes_titled(figure, "Forecast at anchor")
-        drawn = ax.lines[0].get_ydata()  # the true future, plotted first
-        geometry = module.orig_model.geometry
-        start = geometry.future_block_start(
-            int(round(0.6 * (geometry.t_valid - 1 - geometry.warmup))) + geometry.warmup
-        )
+        ax = _axes_titled(figure, "Forecast")
+        drawn = np.asarray(ax.lines[0].get_ydata(), dtype=float)  # the truth, plotted first
         expected = (
-            stub_batch.fhr[0, start : start + len(drawn)] * (_STATS["fhr"]["std"] + 1e-8)
-            + _STATS["fhr"]["mean"]
+            stub_batch.fhr[0].numpy() * (_STATS["fhr"]["std"] + 1e-8) + _STATS["fhr"]["mean"]
         )
-        assert torch.allclose(torch.as_tensor(drawn).float(), expected, atol=1e-3)
+        # The truth is drawn only where a window covers it, so the comparison is on the covered
+        # positions -- and asserting there are some is what stops an all-NaN curve passing.
+        covered = np.isfinite(drawn)
+        assert covered.any(), "the truth was drawn nowhere"
+        assert np.allclose(drawn[covered], expected[covered], atol=1e-3)
+    finally:
+        plt.close(figure)
+
+
+def test_the_forecast_windows_tile_the_recording_without_overlapping(task, stub_batch):
+    """One anchor forecasts $H \\cdot R$ raw samples, so the anchors whose windows abut are spaced
+    exactly $H$ apart. Drawn any other way the panel would show the same instant twice, from two
+    different latents, with nothing saying which curve belonged to which."""
+    module = task()
+    figure = _build(module, stub_batch)
+    try:
+        geometry = module.orig_model.geometry
+        anchors = list(range(geometry.warmup, geometry.t_valid, geometry.horizon))
+        assert anchors, "the tiny geometry must still fit at least one window"
+        edges = [geometry.future_block_start(anchor) / _FS_RAW for anchor in anchors]
+        edges.append(
+            (geometry.future_block_start(anchors[-1]) + geometry.horizon * geometry.r) / _FS_RAW
+        )
+
+        ax = _axes_titled(figure, "Forecast")
+        # truth, base mean, full mean, then one vertical rule per window boundary
+        drawn_edges = [float(line.get_xdata()[0]) for line in ax.lines[3:]]
+        assert drawn_edges == pytest.approx(edges)
+
+        # The support of the base mean: exactly the tiled samples, in one unbroken run -- which is
+        # what "consecutive and non-overlapping" means once the NaN gaps are accounted for.
+        base = np.asarray(ax.lines[1].get_ydata(), dtype=float)
+        covered = np.flatnonzero(np.isfinite(base))
+        assert covered.size == len(anchors) * geometry.horizon * geometry.r
+        assert np.array_equal(covered, np.arange(covered[0], covered[-1] + 1))
+        assert covered[0] == geometry.future_block_start(anchors[0])
+    finally:
+        plt.close(figure)
+
+
+def test_the_untrained_anchors_are_cut_from_the_maps_rather_than_shaded_over(task, stub_batch):
+    """Shading leaves the columns in the array, where they still set the colour scale: a warm-up
+    transient then compresses every trained anchor into the bottom of the colormap. The axes still
+    span the whole recording, so the rows stay column-aligned with the two raw ones above."""
+    module = task()
+    figure = _build(module, stub_batch)
+    try:
+        geometry = module.orig_model.geometry
+        t_max = geometry.raw_len / _FS_RAW
+        step = t_max / geometry.t
+        warmup_sec, tail_sec = geometry.warmup * step, geometry.t_valid * step
+        trained = geometry.t_valid - geometry.warmup
+
+        expected = {
+            "Target-only latent state": (warmup_sec, tail_sec, trained),
+            "Per-dimension source-conditioned KL": (warmup_sec, tail_sec, trained),
+            "$\\widetilde K": (warmup_sec, tail_sec, trained),
+            # Attention is a property of the source stream and is defined at every step; only the
+            # two KL maps are identically zero in the tail by construction of the mask.
+            "Lag attention": (warmup_sec, t_max, geometry.t - geometry.warmup),
+        }
+        for prefix, (left, right, columns) in expected.items():
+            ax = _axes_titled(figure, prefix)
+            image = ax.images[0]
+            assert image.get_extent()[:2] == pytest.approx((left, right)), prefix
+            assert image.get_array().shape[1] == columns, prefix
+            # One grey span per margin the row leaves empty, so a blank strip reads as "cut
+            # deliberately" rather than as a panel that failed to draw.
+            assert len(ax.patches) == (1 if right == pytest.approx(t_max) else 2), prefix
+
+        for ax in figure.axes:
+            if ax.get_title():
+                assert ax.get_xlim() == pytest.approx((0.0, t_max)), ax.get_title()
+    finally:
+        plt.close(figure)
+
+
+def test_the_first_row_draws_the_source_trace_beside_the_target(task, stub_batch):
+    """The lag-attention and lag-KL rows are statements about UP, and a reader cannot check one
+    against a trace that is not on the page. Both directions: a batch without ``up`` still builds,
+    with no orphaned second axis claiming a signal that was never drawn."""
+    figure = _build(task(), stub_batch)
+    try:
+        ax = _axes_titled(figure, "Raw target FHR")
+        assert "bpm" in ax.get_ylabel()
+        twins = [child for child in figure.axes if child.get_ylabel().startswith("UP")]
+        assert len(twins) == 1 and twins[0].get_ylabel() == "UP (mmHg)"
+        drawn = np.asarray(twins[0].lines[0].get_ydata(), dtype=float)
+        expected = stub_batch.up[0].numpy() * (_STATS["up"]["std"] + 1e-8) + _STATS["up"]["mean"]
+        assert np.allclose(drawn, expected, atol=1e-3)
+    finally:
+        plt.close(figure)
+
+    figure = _build(task(), stub_batch, up_raw=None)
+    try:
+        assert not [child for child in figure.axes if child.get_ylabel().startswith("UP")]
     finally:
         plt.close(figure)
 

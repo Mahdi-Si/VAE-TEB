@@ -1,0 +1,18 @@
+# Source-locality arm: source_attention_window = 32 (shipped 16).
+#
+# Predicted source-state reach R_U = min(21 + 3*(32-1), 300) = 114 steps = 456 s, against the lag
+# search range of 90 steps = 360 s. This is the arm where the bound first *exceeds* the lag range:
+# a source state at step j can already carry information from beyond the furthest lag the
+# cross-attention searches, so the encoder starts doing part of the alignment the lag attention
+# exists to do. Whether that helps the forecast or blurs the lag attribution is the question.
+#
+# Zero parameter change: the window is a mask, not a width.
+#
+#   TEB_RUN_STAMP="$(date '+%Y-%m-%d--[%H-%M]')" torchrun --nproc_per_node=7 \
+#       -m teb_vae.lag_attn_transformer_rws.trainer \
+#       --config teb_vae/lag_attn_transformer_rws/configs/sweep_window_32.yaml
+base: default.yaml
+
+model_config:
+  VAE_model:
+    source_attention_window: 32

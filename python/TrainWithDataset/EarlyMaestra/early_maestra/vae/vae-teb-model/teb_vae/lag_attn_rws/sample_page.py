@@ -2,12 +2,17 @@ r"""The seven-row per-sample diagnostic page, and nothing else.
 
 One figure per sample, from a single forward pass:
 
-1. The raw target trace **in bpm**, with the plotted anchor's forecast window marked.
-2. That window zoomed: the true future against the base ($z^p$) and full ($z^q$) forecasts and
-   their $\mu \pm 2\sigma$ bands. This is the panel the whole model exists to produce -- the two
-   curves are the two predictions whose log-score difference is the coupling readout -- and it is
-   the reason the normalization statistics are plumbed this far: a forecast drawn in z-units
-   cannot be checked against physiology by eye.
+1. The raw target FHR **in bpm** and the raw source UP **in mmHg**, on one time axis with one
+   y-axis each. UP shares the row rather than getting one of its own because rows 6 and 7 are
+   statements *about* this trace: a contraction has to be findable in the same column of the page
+   as the response it is claimed to drive.
+2. The forecast over the whole recording, tiled into **consecutive non-overlapping** windows: the
+   true future against the base ($z^p$) and full ($z^q$) forecasts and their $\mu \pm 2\sigma$
+   bands, with a thin dashed vertical at every window edge. This is the panel the whole model
+   exists to produce -- the two curves are the two predictions whose log-score difference is the
+   coupling readout -- and it is the reason the normalization statistics are plumbed this far: a
+   forecast drawn in z-units cannot be checked against physiology by eye. The tiling is this
+   module's alone; see :func:`build_diagnostic_figure`.
 3. $\mu^p_t$ over $\mu^q_t - \mu^p_t$: the target-only latent state, and the additional
    source-derived shift, on one colour scale so their relative size is visible. The design's
    claim is that the second is *small but useful*; a delta as large as the state itself means the
@@ -16,6 +21,20 @@ One figure per sample, from a single forward pass:
 5. The total per-step KL $K_t$.
 6. The lag-attention matrix, head-averaged, with its per-step argmax overlaid.
 7. The source-conditioned KL attributed across lags, $\widetilde K_{t,\ell}$.
+
+**Rows 3-7 are drawn over the trained anchors only.** The warm-up prefix $[0, w)$ is excluded from
+every one of them, and the tail $[T - H, T)$ from all but the attention: those columns are not
+merely uninteresting, they carry no gradient at all -- the tail is neither decoded nor inside the
+KL support -- and while they stayed in the arrays they set the colour scale, so a warm-up transient
+compressed the whole trained region into the bottom of the colormap. They are removed from the
+*panel's copy* of the data, not shaded over it; the axes still span the full recording, so every
+row stays column-aligned with rows 1 and 2, and the empty margins are marked in grey.
+
+**Everything here is a drawing decision.** This module cuts and re-lays-out arrays it is handed and
+does nothing else: it takes the forward dict as given, never re-runs the model, never re-scores
+anything, and is imported by no part of the training loop or of any metric. The tiling below in
+particular is *not* how the model forecasts -- the forward pass decodes every valid anchor at
+stride $1$, and the objective and every reported number are computed over all of them.
 
 Both lag panels carry a secondary axis in **compensated** seconds -- $4\,(\ell + \delta)$, the
 residual physiological lag on the mechanically aligned timeline -- and say so in the label. The
@@ -52,10 +71,12 @@ from teb_vae.lag_attn.figure_primitives import (  # noqa: E402
     COLOR_BLACK,
     COLOR_BLUE,
     COLOR_GRAY,
+    COLOR_GREEN,
     COLOR_LIGHT_GRAY,
     COLOR_ORANGE,
     COLOR_VERMILLION,
     attach_lag_seconds_axis,
+    concat_single_forecasts,
     safe_vabs,
     shade_warmup,
     time_axes,
@@ -78,6 +99,11 @@ _FS_RAW = 4.0
 #: Band width drawn around each forecast mean, in standard deviations.
 _BAND_SIGMAS = 2.0
 
+#: Physical unit of each raw signal the page draws, for the axis labels. Only reachable when the
+#: loader's statistics are known -- see :func:`_denormalised`, which falls back to z-units rather
+#: than putting one of these on an axis it cannot honour.
+_SIGNAL_UNITS = {"fhr": "bpm", "up": "mmHg"}
+
 #: Vertical strip reserved above the first panel for the two-line title, in inches.
 _HEADER_INCHES = 0.75
 
@@ -89,24 +115,29 @@ _HEADER_INCHES = 0.75
 _IMSHOW_INTERPOLATION = "none"
 
 
-def _in_bpm(
-    values: torch.Tensor, normalization_stats: Optional[Dict[str, Any]]
+def _denormalised(
+    values: torch.Tensor, field: str, normalization_stats: Optional[Dict[str, Any]]
 ) -> Tuple[np.ndarray, str]:
-    """Invert the loader's z-scoring on a target-signal tensor, when the statistics are known.
+    """Invert the loader's z-scoring on one raw signal, when the statistics are known.
 
     Args:
-        values: Target-signal values in loader units.
+        values: Raw-signal values in loader units.
+        field: The loader field name, ``'fhr'`` or ``'up'``.
         normalization_stats: The loader's statistics dict, or ``None``.
 
     Returns:
         ``(array, unit_label)`` -- the values and the unit to put on the axis. The label is the
-        honest one: without statistics the figure stays in z-units rather than mislabelling
-        them.
+        honest one: without statistics for *this* field the values stay in z-units rather than
+        being mislabelled. The two signals are resolved independently, so a run whose statistics
+        carry only the target draws that one in bpm and the source in z-units.
     """
     from train.graph_models_utils import denormalize_signal_data
 
-    if normalization_stats is not None and "fhr" in normalization_stats:
-        return to_numpy(denormalize_signal_data(values, "fhr", normalization_stats)), "bpm"
+    if normalization_stats is not None and field in normalization_stats:
+        return (
+            to_numpy(denormalize_signal_data(values, field, normalization_stats)),
+            _SIGNAL_UNITS[field],
+        )
     return to_numpy(values), "normalised"
 
 
@@ -121,11 +152,24 @@ def build_diagnostic_figure(
     guid: str,
     beta: float,
     scalars: Dict[str, float],
+    up_raw: Optional[torch.Tensor] = None,
     normalization_stats: Optional[Dict[str, Any]] = None,
     delay_steps: int = 0,
-    forecast_anchor_frac: float = 0.6,
 ) -> Any:
     r"""Build the seven-row diagnostic figure for one sample.
+
+    The forecast row is tiled rather than zoomed, and the tiling is a **choice of what to draw**,
+    not a change to what the model does: ``outs`` already carries a forecast for every valid anchor
+    at stride $1$, all of which the objective scored, and this row selects a subset of them. One
+    anchor predicts $H \cdot R$ raw samples, so the anchors whose forecasts abut without overlapping
+    are spaced exactly $H$ apart; the tiling starts at the first trained anchor $w$ and runs while
+    an anchor is still valid, i.e. ``range(warmup, t_valid, horizon)``. Plotted at the model's own
+    stride instead, adjacent windows would overlap by $(H-1)/H$ and the row would show each instant
+    $H$ times over, from $H$ different latents. Two spans are therefore blank by construction:
+    everything before $w$'s own window, and whatever tail is left when the recording is not an exact
+    number of windows -- reaching the segment end would need the final anchor, whose window overlaps
+    the last tiled one. At production geometry that is $8$ windows of $120$ s covering $124$ s to
+    $1084$ s, leaving $[0, 124)$ s and $[1084, 1200)$ s undrawn.
 
     Args:
         outs: The model's forward dict.
@@ -139,9 +183,11 @@ def build_diagnostic_figure(
         beta: The KL weight **resolved for this epoch**, not the raw hyperparameter.
         scalars: Loss readouts for the title (``nll_base_block``, ``nll_full_block``,
             ``pred_gap``, ``source_conditioned_kl_raw``); missing keys are skipped.
-        normalization_stats: The loader's statistics, so the target renders in bpm.
+        up_raw: The raw source $(B, L_{\mathrm{raw}})$ in loader units, or ``None``. The model
+            never sees it -- it consumes the decimated UP feature blocks -- so it is passed in
+            beside the target rather than read off the forward dict.
+        normalization_stats: The loader's statistics, so the two traces render in bpm and mmHg.
         delay_steps: The causal input delay $\delta$, for the compensated lag axes.
-        forecast_anchor_frac: Where in the trained-anchor range to place the forecast zoom.
 
     Returns:
         The matplotlib ``Figure``. The caller saves and closes it.
@@ -150,29 +196,61 @@ def build_diagnostic_figure(
     t_steps, horizon, raw_per_step = geometry.t, geometry.horizon, geometry.r
     warmup, t_valid = geometry.warmup, geometry.t_valid
     time_raw, time_dec, t_max = time_axes(t_steps, geometry.raw_len, fs_raw=_FS_RAW)
+    seconds_per_step = t_max / float(t_steps)
 
-    # The anchor whose forecast is drawn: a fraction into the trained range, so it is never the
-    # warm-up edge (untrained) nor the final anchor (whose window ends exactly at the segment
-    # end and shows no continuation).
-    anchor = warmup + int(round(forecast_anchor_frac * max(0, t_valid - 1 - warmup)))
-    anchor = int(min(max(anchor, warmup), t_valid - 1))
-    window_start = geometry.future_block_start(anchor)
-    window_stop = window_start + horizon * raw_per_step
+    # The two boundaries rows 3-7 are cut at. Both are properties of the objective, not of the
+    # figure: nothing before `warmup_sec` enters any loss, and nothing after `tail_sec` is either
+    # decoded or inside the KL support, so a latent there carries no gradient at all.
+    warmup_sec = float(warmup) * seconds_per_step
+    tail_sec = float(t_valid) * seconds_per_step
 
-    fhr_np, unit = _in_bpm(fhr_raw[i], normalization_stats)
+    # The tiling's anchors, and the raw-second position of every window edge -- one per window
+    # plus the last window's end. Mirrors `concat_single_forecasts`, which walks the identical
+    # set: it stops at `t + 1 + H <= T`, which is `t < T - H = t_valid`.
+    tile_anchors = list(range(warmup, t_valid, horizon))
+    window_edges = [geometry.future_block_start(t) / _FS_RAW for t in tile_anchors]
+    if tile_anchors:
+        window_edges.append(
+            (geometry.future_block_start(tile_anchors[-1]) + horizon * raw_per_step) / _FS_RAW
+        )
+
+    fhr_np, unit = _denormalised(fhr_raw[i], "fhr", normalization_stats)
     fhr_np = np.asarray(fhr_np).ravel()
 
-    # Both forecasts and both bands, denormalized through the same affine map as the truth, so
-    # the three curves in the zoom panel are directly comparable.
-    def _forecast(branch: str) -> List[np.ndarray]:
-        """Return ``[mean, lower, upper]`` of one branch's forecast at ``anchor``, in ``unit``."""
-        mean = outs[f"mu_{branch}"][i, anchor].reshape(-1)
-        sigma = torch.exp(0.5 * outs[f"logvar_{branch}"][i, anchor].reshape(-1))
-        curves = [mean, mean - _BAND_SIGMAS * sigma, mean + _BAND_SIGMAS * sigma]
-        return [_in_bpm(curve, normalization_stats)[0].ravel() for curve in curves]
+    # The source trace, on the target's own axis. Skipped rather than fatal when it is absent or
+    # on another grid: a page that cannot draw UP is still the page every other row needs.
+    up_np: Optional[np.ndarray] = None
+    up_unit = "normalised"
+    if up_raw is not None:
+        candidate, up_unit = _denormalised(up_raw[i], "up", normalization_stats)
+        candidate = np.asarray(candidate).ravel()
+        if candidate.size == time_raw.size:
+            up_np = candidate
 
-    base_mean, base_lo, base_hi = _forecast("base")
-    full_mean, full_lo, full_hi = _forecast("full")
+    # Both forecasts and both bands, denormalized through the same affine map as the truth, so
+    # the three curves in the forecast panel are directly comparable, then tiled onto the raw
+    # grid. `concat_single_forecasts` is the shared helper for exactly this walk; its trailing
+    # axis is "channels" for the decimated model and raw-samples-per-token here, and its `(T, R)`
+    # result flattens to the raw grid because horizon token h of anchor t is decimated step
+    # t + 1 + h, i.e. raw `[R(t + 1 + h), ...)` = `future_block_start(t) + R*h`. Uncovered
+    # positions come back NaN and render as gaps rather than as a fabricated continuation.
+    def _tiled(branch: str) -> List[np.ndarray]:
+        """Return ``[mean, lower, upper]`` of one branch, tiled onto the raw grid, in ``unit``."""
+        mean = outs[f"mu_{branch}"][i]
+        sigma = torch.exp(0.5 * outs[f"logvar_{branch}"][i])
+        curves = [mean, mean - _BAND_SIGMAS * sigma, mean + _BAND_SIGMAS * sigma]
+        return [
+            concat_single_forecasts(
+                _denormalised(curve, "fhr", normalization_stats)[0], t_steps, horizon, warmup
+            ).reshape(-1)
+            for curve in curves
+        ]
+
+    base_mean, base_lo, base_hi = _tiled("base")
+    full_mean, full_lo, full_hi = _tiled("full")
+    # The truth restricted to the tiled support, so the forecast panel is about the predicted
+    # windows alone and the uncovered spans read as absent rather than as unpredicted.
+    truth_tiled = np.where(np.isfinite(full_mean), fhr_np, np.nan)
 
     mu_prior_np = to_numpy(outs["mu_prior"][i])                       # (T, d_z)
     delta_mu_np = to_numpy(outs["mu_post"][i] - outs["mu_prior"][i])  # (T, d_z)
@@ -184,7 +262,9 @@ def build_diagnostic_figure(
 
     row_specs = [
         ("raw", 0.9),
-        ("forecast", 1.1),
+        # Taller than the other line rows: it now carries the whole recording rather than one
+        # 480-sample window, and two forecasts with their bands on top of it.
+        ("forecast", 1.3),
         ("latent", 1.2),
         ("kld_dims", 1.1),
         ("kld_total", 0.85),
@@ -230,16 +310,43 @@ def build_diagnostic_figure(
             ax.spines[spine].set_color(COLOR_BLACK)
             ax.spines[spine].set_linewidth(0.6)
 
-    def finalise_time_axis(ax: Any) -> None:
-        """Pin the shared physical-time axis and shade the untrained warm-up."""
+    def finalise_time_axis(ax: Any, *, tail: bool = False) -> None:
+        """Pin the shared physical-time axis and mark the spans this row draws nothing over.
+
+        Args:
+            ax: The axes to finalise.
+            tail: Whether this row also stops at the last trained anchor.
+        """
+        # Every row spans the whole recording whatever it draws, so a column of the page is the
+        # same instant on all seven of them.
         ax.set_xlim(0.0, t_max)
         shade_warmup(ax, warmup, t_max, t_steps)
+        if tail:
+            ax.axvspan(tail_sec, t_max, color=COLOR_LIGHT_GRAY, alpha=0.35, zorder=0)
 
-    def lag_panel(ax: Any, values: np.ndarray, title: str, cmap: str) -> Any:
-        """Draw a ``(T, L)`` lag map with a compensated-seconds secondary axis."""
+    def trained_columns(values: np.ndarray, *, drop_tail: bool) -> Tuple[np.ndarray, float]:
+        """Cut a time-first array down to the anchors the objective actually scored.
+
+        Args:
+            values: An array whose first axis is the decimated step.
+            drop_tail: Whether to also drop the tail $H$ anchors, which are neither decoded nor
+                inside the KL support and so receive no gradient at all.
+
+        Returns:
+            ``(cut, stop_seconds)`` -- the surviving columns and the second the last one ends at,
+            which is the right edge of the ``imshow`` extent that draws them.
+        """
+        stop = t_valid if drop_tail else t_steps
+        return values[warmup:stop], (tail_sec if drop_tail else t_max)
+
+    def lag_panel(
+        ax: Any, values: np.ndarray, title: str, cmap: str, *, drop_tail: bool
+    ) -> Any:
+        """Draw a ``(T, L)`` lag map, trained columns only, with a compensated-seconds axis."""
+        trained, stop_sec = trained_columns(values, drop_tail=drop_tail)
         image = ax.imshow(
-            values.T, aspect="auto", cmap=cmap, origin="lower",
-            extent=[0.0, t_max, -0.5, n_lags - 0.5],
+            trained.T, aspect="auto", cmap=cmap, origin="lower",
+            extent=[warmup_sec, stop_sec, -0.5, n_lags - 0.5],
             interpolation=_IMSHOW_INTERPOLATION,
         )
         ax.set_title(title, fontsize=9, pad=6)
@@ -257,117 +364,142 @@ def build_diagnostic_figure(
             # Overriding the primitive's generic label: which of the two lag quantities is drawn
             # is exactly the thing a reader must not have to guess.
             secondary.set_ylabel(COMPENSATED_LAG_AXIS_LABEL, fontsize=8)
-        finalise_time_axis(ax)
+        finalise_time_axis(ax, tail=drop_tail)
         return image
 
-    # ---- Row: the raw target trace ----------------------------------------
+    # ---- Row: the two raw traces ------------------------------------------
     ax, cax = row_axes("raw")
-    ax.plot(time_raw, fhr_np, color=COLOR_BLUE, linewidth=0.7)
-    ax.axvspan(
-        window_start / _FS_RAW, window_stop / _FS_RAW,
-        color=COLOR_ORANGE, alpha=0.25, zorder=0,
-    )
-    ax.set_title(
-        f"Raw target FHR — anchor {anchor} forecast window shaded "
-        f"(raw [{window_start}, {window_stop}))",
-        fontsize=9, pad=6,
-    )
+    ax.plot(time_raw, fhr_np, color=COLOR_BLUE, linewidth=0.7, label=f"FHR ({unit})")
+    ax.set_title("Raw target FHR and raw source UP", fontsize=9, pad=6)
     ax.set_xlabel("Time (s)", fontsize=8)
-    ax.set_ylabel(f"FHR ({unit})", fontsize=8)
+    ax.set_ylabel(f"FHR ({unit})", fontsize=8, color=COLOR_BLUE)
     style_axes(ax, grid="both")
     finalise_time_axis(ax)
+    if up_np is not None:
+        # Its own y-axis, because the two signals share neither unit nor scale and a single axis
+        # would flatten whichever has the smaller range into a line. `twinx` makes the new axes'
+        # patch transparent, so the warm-up shading below still shows through.
+        twin = ax.twinx()
+        twin.plot(time_raw, up_np, color=COLOR_GREEN, linewidth=0.7, label=f"UP ({up_unit})")
+        twin.set_ylabel(f"UP ({up_unit})", fontsize=8, color=COLOR_GREEN)
+        twin.tick_params(axis="y", labelsize=7, colors=COLOR_GREEN)
+        twin.grid(False)
+        twin.set_xlim(0.0, t_max)
+        handles = list(ax.get_lines()) + list(twin.get_lines())
+        ax.legend(
+            handles, [handle.get_label() for handle in handles],
+            loc="upper right", fontsize=7, framealpha=0.95,
+        )
     cax.set_visible(False)
 
-    # ---- Row: the forecast window, zoomed ---------------------------------
+    # ---- Row: the forecast, tiled into non-overlapping windows -------------
     ax, cax = row_axes("forecast")
-    window_time = time_raw[window_start:window_stop]
+    # The truth first, so it stays ``ax.lines[0]`` -- the tests read it from there.
+    ax.plot(time_raw, truth_tiled, color=COLOR_BLACK, linewidth=0.7, label="true $Y^{+}$")
+    ax.fill_between(time_raw, base_lo, base_hi, color=COLOR_GRAY, alpha=0.22, linewidth=0)
     ax.plot(
-        window_time, fhr_np[window_start:window_stop],
-        color=COLOR_BLACK, linewidth=1.1, label="true $Y^{+}$",
-    )
-    ax.fill_between(window_time, base_lo, base_hi, color=COLOR_GRAY, alpha=0.22, linewidth=0)
-    ax.plot(
-        window_time, base_mean, color=COLOR_GRAY, linewidth=1.0, linestyle="--",
+        time_raw, base_mean, color=COLOR_GRAY, linewidth=0.8, linestyle="--",
         label="base ($z^p$, target-only)",
     )
     ax.fill_between(
-        window_time, full_lo, full_hi, color=COLOR_VERMILLION, alpha=0.18, linewidth=0
+        time_raw, full_lo, full_hi, color=COLOR_VERMILLION, alpha=0.18, linewidth=0
     )
     ax.plot(
-        window_time, full_mean, color=COLOR_VERMILLION, linewidth=1.0,
+        time_raw, full_mean, color=COLOR_VERMILLION, linewidth=0.8,
         label="full ($z^q$, source-conditioned)",
     )
+    # Where one forecast ends and the next begins. Without them the tiling reads as a single
+    # continuous prediction, which is exactly what it is not: each window is decoded from one
+    # latent and never sees the window before it.
+    for edge in window_edges:
+        ax.axvline(edge, color=COLOR_GRAY, linewidth=0.5, linestyle="--", alpha=0.7, zorder=1)
+    window_seconds = horizon * raw_per_step / _FS_RAW
     ax.set_title(
-        f"Forecast at anchor {anchor} — mean $\\pm$ {_BAND_SIGMAS:.0f}$\\sigma$ "
-        f"({horizon}$\\times${raw_per_step} = {horizon * raw_per_step} raw samples)",
+        f"Forecast — {len(tile_anchors)} consecutive non-overlapping {window_seconds:.0f} s "
+        f"windows from the first trained anchor, mean $\\pm$ {_BAND_SIGMAS:.0f}$\\sigma$ "
+        f"({horizon}$\\times${raw_per_step} = {horizon * raw_per_step} raw samples each; "
+        f"dashed: window edges)",
         fontsize=9, pad=6,
     )
     ax.set_xlabel("Time (s)", fontsize=8)
     ax.set_ylabel(f"FHR ({unit})", fontsize=8)
     ax.legend(loc="upper right", fontsize=7, framealpha=0.95)
     style_axes(ax, grid="both")
-    ax.set_xlim(float(window_time[0]), float(window_time[-1]))
+    finalise_time_axis(ax)
     cax.set_visible(False)
 
     # ---- Row: prior mean over the source-derived delta ---------------------
     ax, cax = row_axes("latent")
-    latent_stack = np.concatenate([mu_prior_np.T, delta_mu_np.T], axis=0)  # (2*d_z, T)
+    # Stacked time-first so the cut below is one slice of one axis, then transposed for imshow.
+    latent_stack, latent_stop = trained_columns(
+        np.concatenate([mu_prior_np, delta_mu_np], axis=1), drop_tail=True
+    )
     vabs = safe_vabs(latent_stack)
     image = ax.imshow(
-        latent_stack, aspect="auto", cmap="bwr", origin="upper",
-        vmin=-vabs, vmax=vabs, extent=[0.0, t_max, 2 * d_z - 0.5, -0.5],
+        latent_stack.T, aspect="auto", cmap="bwr", origin="upper",
+        vmin=-vabs, vmax=vabs, extent=[warmup_sec, latent_stop, 2 * d_z - 0.5, -0.5],
         interpolation=_IMSHOW_INTERPOLATION,
     )
     ax.axhline(d_z - 0.5, color="white", linewidth=1.2, linestyle="--")
     ax.set_yticks([d_z // 2, d_z + d_z // 2])
     ax.set_yticklabels(["$\\mu^p$", "$\\mu^q-\\mu^p$"])
     ax.set_title(
-        "Target-only latent state and the source-derived shift (shared colour scale)",
+        "Target-only latent state and the source-derived shift (shared colour scale, "
+        "trained anchors only)",
         fontsize=9, pad=6,
     )
     ax.set_xlabel("Time (s)", fontsize=8)
     heatmap_spines(ax)
     attach_cbar(cax, image, "value")
-    finalise_time_axis(ax)
+    finalise_time_axis(ax, tail=True)
 
     # ---- Row: per-dimension KL --------------------------------------------
     ax, cax = row_axes("kld_dims")
+    kld_dims_trained, kld_dims_stop = trained_columns(kld_dims_np, drop_tail=True)
     image = ax.imshow(
-        kld_dims_np.T, aspect="auto", cmap="magma", origin="lower",
-        extent=[0.0, t_max, -0.5, d_z - 0.5],
+        kld_dims_trained.T, aspect="auto", cmap="magma", origin="lower",
+        extent=[warmup_sec, kld_dims_stop, -0.5, d_z - 0.5],
         interpolation=_IMSHOW_INTERPOLATION,
     )
-    ax.set_title("Per-dimension source-conditioned KL (nats)", fontsize=9, pad=6)
+    ax.set_title(
+        "Per-dimension source-conditioned KL (nats, trained anchors only)", fontsize=9, pad=6
+    )
     ax.set_xlabel("Time (s)", fontsize=8)
     ax.set_ylabel("Latent dim", fontsize=8)
     heatmap_spines(ax)
     attach_cbar(cax, image, "nats")
-    finalise_time_axis(ax)
+    finalise_time_axis(ax, tail=True)
 
     # ---- Row: total KL per step -------------------------------------------
     ax, cax = row_axes("kld_total")
-    ax.plot(time_dec, kld_total_np, color=COLOR_VERMILLION, linewidth=0.9)
-    # The tail H anchors carry no reconstruction term, so the KL there is untrained and must not
-    # be read as coupling fading away at the end of the recording.
-    ax.axvspan(
-        float(t_valid) * (t_max / float(t_steps)), t_max,
-        color=COLOR_LIGHT_GRAY, alpha=0.35, zorder=0,
-    )
+    # Cut like the two KL heatmaps rather than merely shaded: the warm-up carries the encoders'
+    # settling transient, and left in it sets the y-scale so the trained range flattens.
+    kld_trained, _ = trained_columns(kld_total_np, drop_tail=True)
+    kld_time, _ = trained_columns(time_dec, drop_tail=True)
+    ax.plot(kld_time, kld_trained, color=COLOR_VERMILLION, linewidth=0.9)
     ax.set_title(
-        "$K_t$ — total source-conditioned KL per step (warm-up and untrained tail shaded)",
+        "$K_t$ — total source-conditioned KL per step (trained anchors only)",
         fontsize=9, pad=6,
     )
     ax.set_xlabel("Time (s)", fontsize=8)
     ax.set_ylabel("nats", fontsize=8)
     style_axes(ax, grid="both")
-    finalise_time_axis(ax)
+    finalise_time_axis(ax, tail=True)
     cax.set_visible(False)
 
     # ---- Row: lag attention with its argmax --------------------------------
     ax, cax = row_axes("lag_attn")
-    image = lag_panel(ax, alpha_np, "Lag attention (head-averaged) with per-step argmax", "viridis")
+    # The tail stays here alone among the five: attention is a property of the source stream and
+    # is defined at every step, whereas the KL panels above and below it are identically zero
+    # there by construction of the mask.
+    image = lag_panel(
+        ax, alpha_np, "Lag attention (head-averaged) with per-step argmax", "viridis",
+        drop_tail=False,
+    )
+    attn_trained, _ = trained_columns(alpha_np, drop_tail=False)
+    attn_time, _ = trained_columns(time_dec, drop_tail=False)
     ax.plot(
-        time_dec, alpha_np.argmax(axis=1),
+        attn_time, attn_trained.argmax(axis=1),
         color=COLOR_ORANGE, linewidth=0.7, alpha=0.85,
     )
     attach_cbar(cax, image, "attention")
@@ -375,7 +507,8 @@ def build_diagnostic_figure(
     # ---- Row: the KL attributed across lags --------------------------------
     ax, cax = row_axes("kl_lag_map")
     image = lag_panel(
-        ax, kl_lag_np, "$\\widetilde K_{t,\\ell}$ — source-conditioned KL by lag", "magma"
+        ax, kl_lag_np, "$\\widetilde K_{t,\\ell}$ — source-conditioned KL by lag", "magma",
+        drop_tail=True,
     )
     attach_cbar(cax, image, "nats")
 

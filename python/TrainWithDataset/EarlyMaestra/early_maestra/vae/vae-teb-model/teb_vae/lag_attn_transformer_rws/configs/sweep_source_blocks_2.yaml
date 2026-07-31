@@ -1,0 +1,23 @@
+# Depth arm: source_attention_blocks = 2 (shipped 3).
+#
+# The source encoder's depth and its window jointly set the source state's reach,
+# R_U = min(21 + N_U*(W_U - 1), 300). At two blocks and the shipped 16-step window that is
+# 21 + 2*15 = 51 steps = 204 s, against 66 steps = 264 s shipped -- both inside the 90-step /
+# 360 s lag search range, so this arm moves the reach without changing the regime.
+#
+# The window is held at the shipped 16 so depth is the single variable; the window sweep prices
+# the other axis separately.
+#
+# -164,352 parameters, one attention block: 4*128^2 + 3*128*256 + 4*128.
+#
+# d_model stays 128 in every arm of this sweep: it is the width every downstream interface
+# assumes.
+#
+#   TEB_RUN_STAMP="$(date '+%Y-%m-%d--[%H-%M]')" torchrun --nproc_per_node=7 \
+#       -m teb_vae.lag_attn_transformer_rws.trainer \
+#       --config teb_vae/lag_attn_transformer_rws/configs/sweep_source_blocks_2.yaml
+base: default.yaml
+
+model_config:
+  VAE_model:
+    source_attention_blocks: 2

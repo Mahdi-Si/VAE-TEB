@@ -1,0 +1,21 @@
+# Source-locality arm: source_attention_window = 8 (shipped 16).
+#
+# Predicted source-state reach R_U = min(21 + 3*(8-1), 300) = 42 steps = 168 s, against the lag
+# search range of 90 steps = 360 s. The tightest arm of the sweep: the source encoder sees under
+# three minutes of its own history, so a source state is close to a pure local descriptor and the
+# lag cross-attention carries almost all of the temporal alignment.
+#
+# What the sweep is for: a narrower window is expected to sharpen lag identity -- adjacent lags
+# stay distinguishable because their encoder states overlap less -- at the cost of a weaker source
+# representation. This arm is the sharp end of that trade.
+#
+# Zero parameter change: the window is a mask, not a width.
+#
+#   TEB_RUN_STAMP="$(date '+%Y-%m-%d--[%H-%M]')" torchrun --nproc_per_node=7 \
+#       -m teb_vae.lag_attn_transformer_rws.trainer \
+#       --config teb_vae/lag_attn_transformer_rws/configs/sweep_window_8.yaml
+base: default.yaml
+
+model_config:
+  VAE_model:
+    source_attention_window: 8

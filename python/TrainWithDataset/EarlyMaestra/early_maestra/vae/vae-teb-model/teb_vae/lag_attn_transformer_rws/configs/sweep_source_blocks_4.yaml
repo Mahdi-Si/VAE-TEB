@@ -1,0 +1,25 @@
+# Depth arm: source_attention_blocks = 4 (shipped 3).
+#
+# At four blocks and the shipped 16-step window the source state reaches
+# 21 + 4*15 = 81 steps = 324 s -- still inside the 90-step / 360 s lag search range, but only
+# just. This is the deepest source encoder that keeps the locality property the architecture
+# rests on: at five blocks the bound would pass the lag range and the encoder would begin doing
+# the alignment the lag cross-attention exists to do.
+#
+# The window is held at the shipped 16 so depth is the single variable. Not the same arm as
+# sweep_arch_a2.yaml, which also removes the window: that one asks whether the source encoder
+# should be the target encoder, this one asks whether it should be deeper.
+#
+# +164,352 parameters, one attention block: 4*128^2 + 3*128*256 + 4*128.
+#
+# d_model stays 128 in every arm of this sweep: it is the width every downstream interface
+# assumes.
+#
+#   TEB_RUN_STAMP="$(date '+%Y-%m-%d--[%H-%M]')" torchrun --nproc_per_node=7 \
+#       -m teb_vae.lag_attn_transformer_rws.trainer \
+#       --config teb_vae/lag_attn_transformer_rws/configs/sweep_source_blocks_4.yaml
+base: default.yaml
+
+model_config:
+  VAE_model:
+    source_attention_blocks: 4

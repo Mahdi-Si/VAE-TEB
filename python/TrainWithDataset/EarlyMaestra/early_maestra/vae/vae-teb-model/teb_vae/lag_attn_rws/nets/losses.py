@@ -12,20 +12,42 @@ Masks arrive on the decimated grid (``nets/raw_masks.py``) and are broadcast ove
 samples of each horizon token. A masked position contributes exactly zero -- multiplicatively,
 so a finite planted value at a masked position cannot move the loss at all -- and an anchor
 whose whole window is masked drops out of the denominator as well as the numerator.
+
+The whole objective lives here as free functions, not as methods on one model. Two architectures
+now forecast the same raw target under the same three-term loss, and what they optimise must never
+diverge: a copy of :func:`compute_loss` in a second model class would be two definitions of the
+quantity every comparison between them is read off. The model classes keep one-line methods that
+delegate here, so a caller still writes ``model.compute_loss(...)`` and the arithmetic has exactly
+one home.
 """
 from __future__ import annotations
 
 import math
-from typing import Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import torch
 
 from teb_vae.lag_attn.nets.blocks import validate_choice
+from teb_vae.lag_attn_rws.nets.geometry import TrimmedRawGeometry
 from teb_vae.lag_attn_rws.nets.raw_masks import contributing_anchors
+from teb_vae.lag_attn_rws.nets.raw_masks import forecast_mask as build_forecast_mask
+from teb_vae.lag_attn_rws.nets.raw_masks import kl_mask as build_kl_mask
+from teb_vae.lag_attn_rws.nets.raw_targets import build_future_target
 
 LIKELIHOOD_CHOICES = ("mse", "gaussian_nll")
 
 _LOG_2PI = math.log(2.0 * math.pi)
+
+# "On the floor" for a log-variance: within this fraction of the clamp range of the lower
+# asymptote (and, symmetrically, of the upper one for "on the ceiling"). The smooth bound never
+# reaches an asymptote exactly, so an equality test would report 0.0 forever while the variance
+# sits pinned.
+#
+# Public because the evaluation reads the same fractions off the same tensors: a margin restated
+# there would make "the prior variance is pinned" mean one thing in a training log and another in
+# a summary, and the two would drift the first time either was tuned. Re-exported from
+# ``nets/model.py``, which is where every existing consumer imports it from.
+LOGVAR_FLOOR_MARGIN_FRAC = 0.05
 
 # A latent dimension counts as carrying information once its mean per-step KL clears this.
 # Well below any meaningful coupling, well above float noise on a collapsed dimension. Public
@@ -234,3 +256,231 @@ def masked_source_kl(
         "source_conditioned_kl_train": kl_train,
         "kld_active_frac": kld_active_frac,
     }
+
+
+def kld_tensor(
+    mu_prior: torch.Tensor,
+    logvar_prior: torch.Tensor,
+    mu_post: torch.Tensor,
+    logvar_post: torch.Tensor,
+) -> torch.Tensor:
+    r"""Closed-form KL between two diagonal Gaussians, per step and per dimension.
+
+    $$\mathrm{KL} = \tfrac{1}{2}\left[\log\sigma^{2,p} - \log\sigma^{2,q}
+    + \frac{\sigma^{2,q} + (\mu^q - \mu^p)^2}{\sigma^{2,p}} - 1\right]$$
+
+    Closed-form rather than sampled: this quantity is the model's output, not an intermediate,
+    and a Monte-Carlo estimate would put variance straight into the number being reported.
+    Returned unmasked over the full sequence; masking is the caller's job, because every caller
+    wants a different window.
+
+    A free function rather than a method, because it reads nothing off a model: the two
+    architectures that report this KL must compute it identically, and one formula written twice
+    is two formulas.
+
+    Args:
+        mu_prior: Prior mean ``(B, T, d_z)``.
+        logvar_prior: Prior log-variance ``(B, T, d_z)``.
+        mu_post: Posterior mean ``(B, T, d_z)``.
+        logvar_post: Posterior log-variance ``(B, T, d_z)``.
+
+    Returns:
+        The per-step per-dimension KL ``(B, T, d_z)``.
+    """
+    return 0.5 * (
+        logvar_prior
+        - logvar_post
+        + (logvar_post.exp() + (mu_post - mu_prior) ** 2) / logvar_prior.exp()
+        - 1.0
+    )
+
+
+# lean-limit: all valid anchors are decoded every batch; add anchor subsampling when a
+# measured production run exceeds device memory after the documented config levers are
+# exhausted.
+def compute_loss(
+    forward_outputs: Dict[str, torch.Tensor],
+    fhr_raw: torch.Tensor,
+    *,
+    weight: torch.Tensor,
+    geometry: TrimmedRawGeometry,
+    future_index: torch.Tensor,
+    coverage_floor: float,
+    logvar_clamp: Tuple[float, float],
+    beta: float = 1.0,
+    lambda_full: float = 1.0,
+    lambda_base: float = 1.0,
+    likelihood: str = "gaussian_nll",
+    free_bits: float = 0.0,
+) -> Dict[str, Any]:
+    r"""Compute the three-term objective in nats per anchor.
+
+    $$\mathcal{L} = \lambda_{\mathrm{full}} D_1 + \lambda_{\mathrm{base}} D_0
+    + \beta\,\mathrm{KL}_{\mathrm{train}}$$
+
+    * $D_1$ -- masked NLL of the raw future under the **full** (posterior-latent) forecast,
+      summed over the $H \cdot R$ block, averaged over contributing anchors.
+    * $D_0$ -- the same under the **base** (prior-latent) forecast. At unit weights,
+      $D_1 + \beta\,\mathrm{KL}$ at $\beta = 1$ is the exact ELBO of the source-conditioned
+      branch; adding $D_0$ doubles the reconstruction pressure against the KL, so $\beta = 1$ is
+      a principled starting point rather than a distinguished optimum.
+    * $\mathrm{KL}_{\mathrm{train}}$ -- the free-bits-floored KL over the *same* anchor support
+      the reconstruction uses, $[w, T - H)$: charging KL on anchors with no reconstruction term
+      produces an end-of-sequence droop resembling fading coupling.
+
+    The raw future target and every mask are built internally from ``fhr_raw`` and ``weight``,
+    matching the convention that the caller passes raw signals.
+
+    A free function taking the geometry and the two scalar bounds explicitly, rather than a method
+    reading them off ``self``: this is what both raw-signal architectures optimise, and it must be
+    one definition rather than one per model class. Each model keeps a thin method that supplies
+    its own geometry.
+
+    Args:
+        forward_outputs: The dict returned by a model's ``forward``.
+        fhr_raw: Raw target signal ``(B, L_raw)``, loader-normalized.
+        weight: Decimated validity signal ``(B, T)``.
+        geometry: The model's trimmed-grid geometry.
+        future_index: The model's cached raw-target index grid, as
+            :func:`~teb_vae.lag_attn_rws.nets.raw_targets.build_future_index` returns it.
+        coverage_floor: Minimum valid fraction of an anchor's forecast window for the anchor to
+            enter the loss at all.
+        logvar_clamp: ``(lo, hi)`` effective range of the model's log-variances, which the two
+            binding-bound diagnostics are read against.
+        beta: Weight on the trained KL term.
+        lambda_full: Weight on the full-forecast reconstruction.
+        lambda_base: Weight on the base-forecast reconstruction.
+        likelihood: ``'mse'`` or ``'gaussian_nll'``.
+        free_bits: Per-dimension per-step KL floor; enters the trained KL only.
+
+    Returns:
+        ``{'metrics': ..., 'likelihood': ...}``. ``metrics`` maps names to scalar tensors -- the
+        three terms, ``total_loss``, the block/sample reconstruction pairs, ``pred_gap``, both KL
+        readouts, ``kld_active_frac``, ``kld_beta``, ``anchor_coverage_frac`` and the
+        log-variance diagnostics -- and is safe to splat into a metric logger. The likelihood
+        name string is deliberately outside it.
+
+    Raises:
+        ValueError: On an unknown ``likelihood``, a raw length that does not match the geometry,
+            or a ``weight`` that does not match the trimmed grid.
+    """
+    validate_choice(likelihood, LIKELIHOOD_CHOICES, "likelihood")
+    device, dtype = fhr_raw.device, fhr_raw.dtype
+
+    target = build_future_target(fhr_raw, geometry, future_index=future_index)
+    mask, coverage_frac = build_forecast_mask(
+        weight, geometry, coverage_floor=coverage_floor
+    )
+    kl_support = build_kl_mask(mask, geometry)
+
+    nll_full_block, nll_full_sample = masked_raw_likelihood(
+        forward_outputs["mu_full"],
+        target,
+        mask,
+        likelihood=likelihood,
+        logvar=forward_outputs["logvar_full"],
+    )
+    nll_base_block, nll_base_sample = masked_raw_likelihood(
+        forward_outputs["mu_base"],
+        target,
+        mask,
+        likelihood=likelihood,
+        logvar=forward_outputs["logvar_base"],
+    )
+
+    kld_btd = kld_tensor(
+        mu_prior=forward_outputs["mu_prior"],
+        logvar_prior=forward_outputs["logvar_prior"],
+        mu_post=forward_outputs["mu_post"],
+        logvar_post=forward_outputs["logvar_post"],
+    )
+    kl_terms = masked_source_kl(kld_btd, kl_support, free_bits=free_bits)
+
+    total_loss = (
+        lambda_full * nll_full_block
+        + lambda_base * nll_base_block
+        + beta * kl_terms["source_conditioned_kl_train"]
+    )
+
+    # Diagnostics over the same masked supports the losses use, so each stays inside its own
+    # bound band instead of scaling with the mask density.
+    with torch.no_grad():
+        pred_gap = nll_base_block - nll_full_block
+
+        elem_mask = mask[..., None]
+        elem_denom = (elem_mask.sum() * float(geometry.r)).clamp_min(1.0)
+        mean_logvar_full = (forward_outputs["logvar_full"] * elem_mask).sum() / elem_denom
+        mean_logvar_base = (forward_outputs["logvar_base"] * elem_mask).sum() / elem_denom
+
+        # Whether the DECODER's log-variance bound is binding, at each end separately.
+        # mean_logvar_full cannot answer this: one mean is equally consistent with a
+        # well-spread distribution and with half the mass pinned on each clamp. The shipped
+        # [-5, 3] was inherited from a decoder that emitted feature coefficients, and the
+        # config marks it for re-derivation against a z-scored raw target from exactly these
+        # two numbers. The two ends fail differently -- pinned at the floor the decoder is
+        # over-confident and the NLL's squared term explodes (this is what a loss spike looks
+        # like from the inside); pinned at the ceiling it has given up and is predicting
+        # noise, which reads as a healthy falling NLL while pred_gap goes to zero.
+        lo, hi = logvar_clamp
+        bound_margin = LOGVAR_FLOOR_MARGIN_FRAC * (hi - lo)
+        logvar_full = forward_outputs["logvar_full"]
+        logvar_full_floor_frac = (
+            (logvar_full <= lo + bound_margin).to(dtype) * elem_mask
+        ).sum() / elem_denom
+        logvar_full_ceil_frac = (
+            (logvar_full >= hi - bound_margin).to(dtype) * elem_mask
+        ).sum() / elem_denom
+
+        # The prior-variance floor watch. The KL carries (mu_q - mu_p)^2 / sigma_p^2, so
+        # a prior variance pinned on its lower clamp inflates the coupling readout by
+        # orders of magnitude while the decoder-side logvar metrics above look healthy.
+        support = kl_support > 0
+        if bool(support.any()):
+            logvar_prior_masked = forward_outputs["logvar_prior"][support]
+            floor_threshold = lo + LOGVAR_FLOOR_MARGIN_FRAC * (hi - lo)
+            logvar_prior_floor_frac = (
+                (logvar_prior_masked <= floor_threshold).to(dtype).mean()
+            )
+            mean_logvar_prior = logvar_prior_masked.mean()
+            mean_logvar_post = forward_outputs["logvar_post"][support].mean()
+            delta_mu_rms = (
+                (forward_outputs["mu_post"] - forward_outputs["mu_prior"])[support]
+                .pow(2)
+                .mean()
+                .sqrt()
+            )
+        else:
+            zero = torch.zeros((), device=device, dtype=dtype)
+            logvar_prior_floor_frac = zero
+            mean_logvar_prior = zero.clone()
+            mean_logvar_post = zero.clone()
+            delta_mu_rms = zero.clone()
+
+        # Coverage over the trained anchors, pre-floor: the distribution this summarises
+        # is what decides whether the shipped coverage_floor is right.
+        anchor_coverage_frac = coverage_frac[:, geometry.warmup :].mean()
+
+    metrics: Dict[str, torch.Tensor] = {
+        "total_loss": total_loss,
+        "nll_full_block": nll_full_block,
+        "nll_full_sample": nll_full_sample,
+        "nll_base_block": nll_base_block,
+        "nll_base_sample": nll_base_sample,
+        "pred_gap": pred_gap,
+        "source_conditioned_kl_raw": kl_terms["source_conditioned_kl_raw"],
+        "source_conditioned_kl_train": kl_terms["source_conditioned_kl_train"],
+        "kld_active_frac": kl_terms["kld_active_frac"],
+        "kld_beta": torch.tensor(float(beta), device=device, dtype=dtype),
+        "anchor_coverage_frac": anchor_coverage_frac,
+        "mean_logvar_full": mean_logvar_full,
+        "mean_logvar_base": mean_logvar_base,
+        "logvar_full_floor_frac": logvar_full_floor_frac,
+        "logvar_full_ceil_frac": logvar_full_ceil_frac,
+        "mean_logvar_prior": mean_logvar_prior,
+        "mean_logvar_post": mean_logvar_post,
+        "logvar_prior_floor_frac": logvar_prior_floor_frac,
+        "delta_mu_rms": delta_mu_rms,
+    }
+    # The one non-tensor lives outside the metric dict, so a caller cannot splat a string
+    # into a numeric logger by accident.
+    return {"metrics": metrics, "likelihood": likelihood}

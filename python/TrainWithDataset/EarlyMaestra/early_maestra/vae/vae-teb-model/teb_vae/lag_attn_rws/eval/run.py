@@ -1550,6 +1550,12 @@ def _finished_run(output_dir: Optional[Any]) -> bool:
 #: Keyed by argparse ``dest``. Resolution is per key, so varying only the checkpoint works without
 #: editing anything here, and a key that is not an argparse ``dest`` raises at startup.
 #:
+#: **Running this file directly needs exactly one of two things filled in below**: ``checkpoint``,
+#: or an ``output_dir`` naming a finished run whose tables the analyses re-read. With both left
+#: ``None`` the run refuses at startup, because there is then neither a model to collect the
+#: tables with nor tables to read. Nothing else is required: the working directory is moved to the
+#: repository root for you, and every other value falls back to the merged configuration.
+#:
 #: Do not add run settings here. The seed, the caps and the draw count belong in the override
 #: delta, which is dumped into the run directory as the durable record; a value injected from
 #: Python would appear in no artifact.
@@ -1560,8 +1566,41 @@ RUN_ARGS: Dict[str, Any] = {
     "device": None,
     "num_samples": None,
     "max_batches": None,
-    # Comma-separated analysis names, or None for all of them. `band_partition` always runs and
-    # is not selectable.
+    # Which analyses run. Both keys take a comma-separated string of the names below --
+    # ``"forecast,coupling"`` -- and both default to ``None``, which runs **every** one of them,
+    # in the order listed. `band_partition` runs regardless and is not selectable by either key;
+    # naming it raises rather than being read as a typo. An unknown name raises at startup too,
+    # before the checkpoint is loaded, so a misspelling costs a parse rather than a first pass
+    # over the shards.
+    #
+    #   forecast:         Is the forecast any good. Skill against persistence, climatology and
+    #                     the segment's own mean, in nats and in bpm, resolved by horizon step.
+    #   coupling:         What the source added. `pred_gap` per recording in both estimators,
+    #                     with a paired Wilcoxon, bootstrap intervals and the positive fraction.
+    #   perm_control:     Is it *this* recording's source. The GUID-aware shuffle control, whose
+    #                     verdict is three losses and deliberately not the KL.
+    #   latent:           The per-dimension KL spectrum and active dimensions -- plus the
+    #                     prior-variance-pinned detector that catches an inflated coupling number.
+    #   lag_kl:           Where in the past the source informed the future. The per-lag KL
+    #                     attribution in its raw, support-corrected and untruncated forms.
+    #   attention:        The attention per head, and its entropy against the ceiling truncated
+    #                     lag support actually allows rather than against log L.
+    #   calibration:      Is the decoder's learned variance the spread of its own errors. PIT,
+    #                     coverage, CRPS. An `mse` checkpoint records a skip.
+    #   residual:         How far apart the two forecasts are, in bpm, and the two latent-drift
+    #                     quantities behind them.
+    #   trajectory:       The readouts against time -- within one segment, and assembled across a
+    #                     whole delivery on the absolute time axis.
+    #   time_to_delivery: The readouts binned on a 0.5 h grid of time before delivery,
+    #                     class-stratified, with Holm across windows.
+    #   events:           What the raw target unlocks. Deceleration forecast skill, the
+    #                     contraction-triggered response, and contraction-conditioned coupling.
+    #   sufficiency:      What the latent bottleneck costs, against an evaluation-only oracle
+    #                     decoder. The one analysis whose cost is a training loop, not a forward.
+    #   samples:          Per-recording diagnostic PDF pages -- a stratified draw, plus the
+    #                     extremes of each headline metric. Needs a checkpoint; skips without one.
+    #   cross_subgroup:   Do the cohorts actually differ. Kruskal, Holm, then Mann-Whitney, over
+    #                     the per-recording CSVs the analyses above it wrote, so it runs last.
     "only": None,
     "skip": None,
 }

@@ -1,0 +1,33 @@
+# Architecture arm A2: symmetric conv-Transformer -- the shipped stem, four full-context blocks
+# per stream.
+#
+# The question: is the source encoder's *asymmetry* earning anything? The shipped configuration
+# gives the source three blocks at a 16-step causal window, so its state summarises a local
+# neighbourhood and the late lag cross-attention decides which neighbourhood matters. A2 removes
+# that asymmetry and lets the source read its whole causal prefix with the same depth as the
+# target. If A2 forecasts no better, the bounded window costs nothing and buys lag resolution;
+# if it forecasts better, the trade is real and Phase 2's window sweep prices it.
+#
+# Against A1 -- the same arm without the stem -- the difference is exactly 201,728 parameters,
+# two gated causal depthwise convolution blocks per encoder (50,176 at kernel 5 plus 50,688 at
+# kernel 9, twice).
+#
+# Parameter total 2,231,295: the shipped 2,066,943 plus the source encoder's fourth attention
+# block, 164,352.
+#
+# A0 in this study is the model this package is compared against -- teb_vae/lag_attn_rws -- not a
+# config in this directory. The shipped default.yaml is A3, the recommended arm.
+#
+#   TEB_RUN_STAMP="$(date '+%Y-%m-%d--[%H-%M]')" torchrun --nproc_per_node=7 \
+#       -m teb_vae.lag_attn_transformer_rws.trainer \
+#       --config teb_vae/lag_attn_transformer_rws/configs/sweep_arch_a2.yaml
+base: default.yaml
+
+model_config:
+  VAE_model:
+    # Symmetric with the target in both depth and context. The two keys move together on purpose:
+    # a fourth source block at the shipped 16-step window would be a depth arm (that is
+    # sweep_source_blocks_4.yaml), and full context at three blocks would be a window arm (that is
+    # sweep_window_full.yaml). A2 is the arm where the source encoder is the target encoder.
+    source_attention_blocks: 4
+    source_attention_window: null

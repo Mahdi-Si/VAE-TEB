@@ -1,0 +1,24 @@
+# Source-locality arm: no source window at all -- the full causal prefix, as the target has.
+#
+# The source-state reach is reported as **unbounded** rather than as a number: null removes the
+# bound, it does not set it to the sequence length. The encoder is free to summarise the whole of
+# U_{<=t}, which is the limiting case of the sweep and the negative control for the locality
+# argument the shipped 16-step window rests on. If lag attribution is no worse here, the window
+# is buying nothing.
+#
+# The rest of the sweep, with the predicted bound against the 90-step / 360 s lag search range:
+# window 8 -> 42 steps / 168 s, 16 (shipped) -> 66 / 264, 32 -> 114 / 456, 64 -> 210 / 840.
+#
+# Not the same arm as sweep_arch_a2.yaml, which *also* gives the source a fourth attention block:
+# this one holds the depth at the shipped three so the window is the single variable.
+#
+# Zero parameter change: the window is a mask, not a width.
+#
+#   TEB_RUN_STAMP="$(date '+%Y-%m-%d--[%H-%M]')" torchrun --nproc_per_node=7 \
+#       -m teb_vae.lag_attn_transformer_rws.trainer \
+#       --config teb_vae/lag_attn_transformer_rws/configs/sweep_window_full.yaml
+base: default.yaml
+
+model_config:
+  VAE_model:
+    source_attention_window: null
