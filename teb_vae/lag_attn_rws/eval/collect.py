@@ -76,7 +76,7 @@ import pandas as pd
 import torch
 from loguru import logger
 
-from teb_vae.lag_attn_rws.eval import events
+from teb_vae.lag_attn_rws.eval import events, spectra
 from teb_vae.lag_attn_rws.eval._reuse import labels, subsample_indices
 from teb_vae.lag_attn_rws.eval.metrics import (
     VECTOR_READOUTS,
@@ -104,6 +104,24 @@ PER_ANCHOR_FILENAME = "per_anchor.parquet"
 VECTORS_FILENAME = "per_sample_vectors.npz"
 RETAINED_FILENAME = "retained_arrays.npz"
 COLLECTION_FILENAME = "collection.json"
+
+#: The pooled cross-spectral maps, at full frequency resolution and resolved by lead time. A third
+#: sidecar rather than a block on the record, because $14$ arrays of $(H, F)$ per cohort is about a
+#: megabyte of JSON that ``record_summary_view`` would then embed into ``summary.json``; and not a
+#: fourth family inside ``per_sample_vectors.npz``, which is documented as row-aligned with
+#: ``per_sample.csv`` and whose consumers index it that way.
+COHERENCE_FILENAME = "coherence_spectra.npz"
+
+#: Prefix under which the per-segment cross-spectral sums travel in the vectors sidecar. They are
+#: row-aligned like every other vector readout, but they are **sums** rather than means, so they
+#: are deliberately not members of ``metrics.VECTOR_READOUTS`` -- that tuple drives
+#: ``aggregate_by_recording``, which takes per-recording *means*, and a mean of two segments' sums
+#: is not a quantity anything downstream could use.
+SPECTRAL_VECTOR_PREFIX = "coherence_"
+
+#: Cohort key under which the whole split's pooled spectra are accumulated, beside one key per
+#: clinical class. Named rather than ``None`` so the sidecar reads without a legend.
+SPECTRA_POOLED_KEY = "all"
 
 #: Columns that identify a segment, as opposed to scoring it. Ordered so the head of
 #: ``per_sample.csv`` reads as "which recording, when, which cohort" before any number.
@@ -411,6 +429,10 @@ class Collection:
         vectors: Per-sample vector readouts, aligned with ``per_sample``'s row order.
         retained: Heavy arrays kept under the retention plan, each with a matching
             ``<name>_sample_index`` array so a row can be traced back to its segment.
+        spectra: The pooled cross-spectral maps, keyed ``<cohort>_<statistic>`` and shaped
+            $(H, F)$ -- **not** row-aligned with ``per_sample``, which is why they live in their
+            own sidecar rather than in ``vectors``. Empty on a geometry too short to hold one Welch
+            window, and on a run collected before the coherence analysis existed.
         results: The readouts, verdicts and control accounting the pass computed.
         record: The provenance sidecar -- see :func:`write_collection`.
         from_cache: Whether this came off disk rather than out of a forward pass.
@@ -420,6 +442,7 @@ class Collection:
     per_anchor: pd.DataFrame
     vectors: Dict[str, np.ndarray] = field(default_factory=dict)
     retained: Dict[str, np.ndarray] = field(default_factory=dict)
+    spectra: Dict[str, np.ndarray] = field(default_factory=dict)
     results: Dict[str, Any] = field(default_factory=dict)
     record: Dict[str, Any] = field(default_factory=dict)
     from_cache: bool = False
@@ -443,6 +466,9 @@ class _Collector:
         self._retained: Dict[str, List[np.ndarray]] = {}
         self._retained_index: Dict[str, List[int]] = {}
         self._horizon: Dict[str, np.ndarray] = {}
+        self._spectral: Dict[str, List[np.ndarray]] = {}
+        self._pooled: Dict[str, np.ndarray] = {}
+        self._band_index: Optional[np.ndarray] = None
         self._sample_index = 0
         self._n_batches = 0
         self._started = time.perf_counter()
@@ -465,6 +491,7 @@ class _Collector:
         self._append_anchors(batch, readout, batch_size)
         self._append_retained(readout, batch_size)
         self._accumulate_horizon(readout)
+        self._accumulate_spectral(batch, readout, batch_size, scored)
         self._sample_index += batch_size
         self._n_batches += 1
         self._log_progress()
@@ -668,6 +695,136 @@ class _Collector:
             else:
                 self._horizon[name] = array
 
+    def _accumulate_spectral(
+        self, batch: Any, readout: BatchReadout, batch_size: int, scored: np.ndarray
+    ) -> None:
+        r"""Reduce this batch's cross-spectral sums two ways, and store both.
+
+        The full $(B, H, F)$ product is roughly $430$ KB per segment -- most of a gigabyte over a
+        real split -- so neither marginal is stored whole. What travels instead is:
+
+        * **band-collapsed, lead-resolved, per segment** into the vectors sidecar, which is the
+          form every interval, cohort cut and per-recording statistic is computed from; and
+        * **frequency-resolved, lead-resolved, pooled** over the split and over each clinical
+          class into its own sidecar, which is the form the frequency $\times$ lead-time map is
+          drawn from.
+
+        Both are sums, and nothing here ratios. Summing two segments' statistics and ratioing once
+        is exactly the ratio of their pooled windows, which is what lets the per-recording
+        reduction downstream be a plain ``groupby`` sum -- and what keeps the coherence's
+        small-sample bias out of every number.
+
+        The band collapse happens here rather than in ``metrics`` because the pooling needs each
+        sample's clinical class, which is a property of the batch rather than of the model; keeping
+        both reductions in one place is what stops them disagreeing about which windows were kept.
+
+        Args:
+            batch: The batch, for the clinical-class labels the pooled maps are keyed on.
+            readout: Its readouts, carrying ``spectral_sums``.
+            batch_size: The batch's sample count.
+            scored: Which samples scored at least one anchor.
+        """
+        sums = readout.spectral_sums
+        if not sums:
+            return
+        classes = _class_column(batch, batch_size)
+
+        # Any statistic seen on an earlier batch but absent from this one is padded with NaN rows
+        # rather than skipped. Skipping would leave that key short by a batch while every other key
+        # grew, and the vectors sidecar is aligned to ``per_sample.csv`` **by position** -- so from
+        # the first such batch onward, one sample's spectra would sit on another sample's row and
+        # every cohort cut downstream would be reading the wrong recording. The source statistics
+        # are the ones this can happen to: they exist only where the batch carried a raw UP trace.
+        for name in self._spectral_names(sums):
+            values = sums.get(name)
+            if values is None:
+                template = self._spectral[f"{SPECTRAL_VECTOR_PREFIX}{name}"][0]
+                self._spectral[f"{SPECTRAL_VECTOR_PREFIX}{name}"].append(
+                    np.full((batch_size,) + template.shape[1:], np.nan, dtype=np.float64)
+                )
+                continue
+            array = values.detach().cpu().to(torch.float64).numpy()
+            key = f"{SPECTRAL_VECTOR_PREFIX}{name}"
+            if array.ndim == 3:
+                # (B, H, F). Pooled first, at full resolution, before the bands are applied.
+                self._accumulate_pooled(name, array, classes)
+                collapsed = spectra.collapse_to_bands(
+                    array, self._spectral_band_index(array.shape[-1]), len(spectra.band_names())
+                )
+                # Flattened tau-major to one trailing axis, the convention every vector readout
+                # follows -- see ``spectra.reshape_band_horizon`` for the one place it is undone.
+                rows = collapsed.reshape(array.shape[0], -1)
+            else:
+                # (B, H): the window counts and the time-domain references. Pooled as well, so the
+                # sidecar carries its own denominator rather than borrowing the vectors'.
+                self._accumulate_pooled(name, array, classes)
+                rows = array
+            # Blanked on the same rule as every other vector readout: a segment that scored no
+            # anchors measured nothing, and a row of exact zeros would average in as a measurement.
+            self._spectral.setdefault(key, []).append(np.where(scored[:, None], rows, np.nan))
+
+    def _accumulate_pooled(
+        self, name: str, array: np.ndarray, classes: Sequence[Optional[str]]
+    ) -> None:
+        """Add one statistic's batch to the pooled map and to each clinical class's own.
+
+        Args:
+            name: The statistic's name.
+            array: $(B, H, F)$ or $(B, H)$.
+            classes: One clinical class per sample, ``None`` where the segment carries none.
+        """
+        cohorts: Dict[str, Any] = {SPECTRA_POOLED_KEY: slice(None)}
+        for label in {value for value in classes if value}:
+            cohorts[str(label)] = np.array(
+                [value == label for value in classes], dtype=bool
+            )
+        for cohort, selector in cohorts.items():
+            block = array[selector].sum(axis=0)
+            key = f"{cohort}_{name}"
+            self._pooled[key] = (
+                block if key not in self._pooled else self._pooled[key] + block
+            )
+
+    def _spectral_names(self, sums: Dict[str, Any]) -> List[str]:
+        """Every statistic seen so far, plus this batch's, so no key is ever skipped for a batch.
+
+        The union rather than this batch's own keys. The vectors sidecar is positionally aligned
+        with ``per_sample.csv``, so a key that misses one batch is short by that batch's rows for
+        ever after -- and every row below the gap then belongs to a different segment. Returning
+        the union lets the caller pad the absentees instead.
+
+        Args:
+            sums: This batch's cross-spectral statistics.
+
+        Returns:
+            The statistic names, in a stable order.
+        """
+        known = [
+            name[len(SPECTRAL_VECTOR_PREFIX) :]
+            for name in self._spectral
+            if name.startswith(SPECTRAL_VECTOR_PREFIX)
+        ]
+        return known + [name for name in sums if name not in known]
+
+    def _spectral_band_index(self, n_freq: int) -> np.ndarray:
+        r"""The bin-to-band map for this run's spectra, built once.
+
+        Derived from the readout's own bin count rather than from the geometry, so it is correct
+        even where the collector was handed no geometry -- and so the map can never describe a
+        different ``nperseg`` than the sums it is applied to.
+
+        Args:
+            n_freq: One-sided bin count $F$, from which $\mathrm{nperseg} = 2(F - 1)$.
+
+        Returns:
+            $(F,)$ of band positions.
+        """
+        cached = self._band_index
+        if cached is None or cached.size != int(n_freq):
+            cached = spectra.band_index(spectra.frequency_axis(2 * (int(n_freq) - 1)))
+            self._band_index = cached
+        return cached
+
     # -- assembly ------------------------------------------------------------------
     def finish(self) -> "Collection":
         """Build the tables, the sidecars and the accounting.
@@ -697,6 +854,12 @@ class _Collector:
             )
             for name, blocks in self._vectors.items()
         }
+        # The cross-spectral sums ride the same sidecar and the same row order as every other
+        # vector readout, under their own prefix. They are kept out of ``VECTOR_READOUTS`` because
+        # that tuple drives the per-recording *mean*, and these are sums.
+        vectors.update(
+            {name: np.concatenate(blocks, axis=0) for name, blocks in self._spectral.items()}
+        )
         per_anchor = _concatenate_blocks(self._anchor_blocks)
         retained = self._finish_retained()
         return Collection(
@@ -704,6 +867,7 @@ class _Collector:
             per_anchor=per_anchor,
             vectors=vectors,
             retained=retained,
+            spectra=dict(self._pooled),
             record=self._build_record(per_sample, per_anchor, retained),
         )
 
@@ -760,7 +924,58 @@ class _Collector:
             # The residual and log-variance sums, resolved by horizon step. On neither table by
             # construction: both are per anchor, and this axis is inside an anchor.
             "horizon": {name: values.tolist() for name, values in sorted(self._horizon.items())},
+            # What the cross-spectral estimator did, so a reader of the numbers can check the
+            # convention rather than infer it. Small and flat: the spectra themselves are two
+            # sidecars away.
+            "coherence": self._coherence_record(),
         }
+
+    def _coherence_record(self) -> Dict[str, Any]:
+        """Describe the cross-spectral estimator and how much of the split it could measure.
+
+        The window-drop accounting is the part that matters. Whole-window validity is *stricter*
+        than the per-step mask every other analysis scores on, so this analysis legitimately
+        describes a smaller population -- and a reader who does not see the drop fraction beside
+        the numbers has no way to tell a well-covered run from one where most windows fell in gaps.
+
+        Returns:
+            The layout, the band table with its bin counts, the seam bins, and the drop accounting.
+            Empty when the pass accumulated nothing.
+        """
+        if not self._pooled:
+            return {}
+        record: Dict[str, Any] = {"bands": spectra.band_edges()}
+        geometry = self._geometry
+        if geometry is not None:
+            layout = spectra.slice_geometry(
+                t_valid=geometry.t_valid,
+                warmup=geometry.warmup,
+                horizon=geometry.horizon,
+                raw_per_step=geometry.r,
+            )
+            record.update(layout.describe())
+            axis = spectra.frequency_axis(layout.nperseg)
+            record["band_bin_counts"] = spectra.band_bin_counts(axis)
+            record["seam_bins"] = spectra.seam_bins(layout.nperseg, layout.raw_per_step).tolist()
+            record["seam_frequencies_hz"] = [
+                float(axis[index])
+                for index in spectra.seam_bins(layout.nperseg, layout.raw_per_step)
+            ]
+
+        kept = self._pooled.get(f"{SPECTRA_POOLED_KEY}_n_windows")
+        possible = self._pooled.get(f"{SPECTRA_POOLED_KEY}_n_windows_possible")
+        if kept is not None and possible is not None:
+            total_kept = float(np.asarray(kept).sum())
+            total_possible = float(np.asarray(possible).sum())
+            record["n_windows_kept"] = total_kept
+            record["n_windows_possible"] = total_possible
+            record["window_drop_fraction"] = (
+                1.0 - total_kept / total_possible if total_possible > 0.0 else float("nan")
+            )
+            # Per lead time as well: a gap costs the same windows at every $\tau$, so a profile
+            # that varies with $\tau$ means the slice construction is misaligned.
+            record["n_windows_kept_per_lead"] = np.asarray(kept).tolist()
+        return record
 
 
 def geometry_record(geometry: Any) -> Dict[str, int]:
@@ -1085,6 +1300,8 @@ def write_collection(collection: Collection, results_dir: Any) -> Path:
     np.savez_compressed(results_dir / VECTORS_FILENAME, **collection.vectors)
     if collection.retained:
         np.savez_compressed(results_dir / RETAINED_FILENAME, **collection.retained)
+    if collection.spectra:
+        np.savez_compressed(results_dir / COHERENCE_FILENAME, **collection.spectra)
 
     path = results_dir / COLLECTION_FILENAME
     with open(path, "w", encoding="utf-8") as handle:
@@ -1182,6 +1399,13 @@ def load_collection(results_dir: Any) -> Collection:
     if retained_path.is_file():
         with np.load(retained_path) as handle:
             retained = {name: handle[name] for name in handle.files}
+    # Absent on a directory collected before the coherence analysis existed, which the analysis
+    # reports as a skip naming the re-collection rather than as an empty result.
+    pooled_spectra: Dict[str, np.ndarray] = {}
+    coherence_path = results_dir / COHERENCE_FILENAME
+    if coherence_path.is_file():
+        with np.load(coherence_path) as handle:
+            pooled_spectra = {name: handle[name] for name in handle.files}
 
     _check_row_counts(record, per_sample, per_anchor, results_dir)
     return Collection(
@@ -1189,6 +1413,7 @@ def load_collection(results_dir: Any) -> Collection:
         per_anchor=per_anchor,
         vectors=vectors,
         retained=retained,
+        spectra=pooled_spectra,
         results=dict(record.get("results") or {}),
         record=record,
         from_cache=True,

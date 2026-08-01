@@ -97,9 +97,11 @@ from teb_vae.lag_attn_rws.eval.analyses import (  # noqa: E402
 )
 from teb_vae.lag_attn_rws.eval.analyses import band_partition as band_partition_analysis  # noqa: E402
 from teb_vae.lag_attn_rws.eval.analyses import calibration as calibration_analysis  # noqa: E402
+from teb_vae.lag_attn_rws.eval.analyses import coherence as coherence_analysis  # noqa: E402
 from teb_vae.lag_attn_rws.eval.analyses import coupling as coupling_analysis  # noqa: E402
 from teb_vae.lag_attn_rws.eval.analyses import attention as attention_analysis  # noqa: E402
 from teb_vae.lag_attn_rws.eval.analyses import cross_subgroup as cross_subgroup_analysis  # noqa: E402
+from teb_vae.lag_attn_rws.eval.analyses import distributions as distributions_analysis  # noqa: E402
 from teb_vae.lag_attn_rws.eval.analyses import events as events_analysis  # noqa: E402
 from teb_vae.lag_attn_rws.eval.analyses import forecast as forecast_analysis  # noqa: E402
 from teb_vae.lag_attn_rws.eval.analyses import lag_kl as lag_kl_analysis  # noqa: E402
@@ -181,6 +183,13 @@ ANALYSIS_FUNCTIONS: Dict[str, Any] = {
     "attention": attention_analysis.run_attention_analysis,
     "calibration": calibration_analysis.run_calibration_analysis,
     "residual": residual_analysis.run_residual_analysis,
+    # Beside ``residual`` because the two answer the same question in two domains: how far apart the
+    # forecast and the truth are, and -- here -- at which frequencies and how far ahead.
+    "coherence": coherence_analysis.run_coherence_analysis,
+    # The last of the table-describing analyses, before the against-time ones. It reads
+    # ``per_sample.csv`` and nothing else, so its position is a reading order rather than a
+    # dependency.
+    "distributions": distributions_analysis.run_distributions_analysis,
     "trajectory": trajectory_analysis.run_trajectory_analysis,
     "time_to_delivery": time_to_delivery_analysis.run_time_to_delivery_analysis,
     "events": events_analysis.run_events_analysis,
@@ -1589,6 +1598,10 @@ RUN_ARGS: Dict[str, Any] = {
     #                     coverage, CRPS. An `mse` checkpoint records a skip.
     #   residual:         How far apart the two forecasts are, in bpm, and the two latent-drift
     #                     quantities behind them.
+    #   coherence:        The forecast in the frequency domain, resolved by lead time: coherence,
+    #                     spectral gain, phase, and an exact split of the residual spectrum.
+    #   distributions:    The shape of each metric over 20-minute segments, by cohort. Histograms
+    #                     at both levels; descriptive only, and deliberately tests nothing.
     #   trajectory:       The readouts against time -- within one segment, and assembled across a
     #                     whole delivery on the absolute time axis.
     #   time_to_delivery: The readouts binned on a 0.5 h grid of time before delivery,

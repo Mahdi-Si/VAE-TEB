@@ -423,7 +423,7 @@ def _is_null_label(value: Any) -> bool:
 
 
 def _group_profiles(
-    rows: np.ndarray, guids: Sequence[Any], groups: Sequence[Any]
+    rows: np.ndarray, guids: Sequence[Any], groups: Sequence[Any], axis: str
 ) -> Dict[str, Tuple[np.ndarray, int]]:
     """Average a per-sample vector within each recording, then within each cohort.
 
@@ -433,6 +433,12 @@ def _group_profiles(
         groups: The cohort of each row; rows with no cohort are dropped, because a segment with no
             cohort belongs to none of them and folding them together would create one named after
             the absence.
+        axis: The stratification axis, choosing the returned order. Both call sites lay the result
+            straight into the emitted rows, so this is what puts the stratified table in the same
+            healthy-first cohort order every figure in this evaluation is drawn in; ``groupby``
+            alone would order it alphabetically. On the time axis, which the canonical order does
+            not know, the alphabetical order stands and ``bin_center_h`` carries the number a
+            reader sorts on.
 
     Returns:
         Cohort to ``(profile, n_recordings)``. ``NaN`` rows -- the segments that scored no anchors
@@ -458,12 +464,13 @@ def _group_profiles(
     # anchors is an all-NaN row that the means above correctly skip, so counting it here would
     # label the profile with evidence that did not go into it.
     counts = per_guid.notna().any(axis=1).groupby("group").sum().astype(int)
-    return {
+    profiles = {
         str(group): (
             np.asarray(per_group.loc[group], dtype=np.float64), int(counts.loc[group])
         )
         for group in per_group.index
     }
+    return {name: profiles[name] for name in cohort.ordered_groups(list(profiles), axis)}
 
 
 def _axis_labels(per_sample: pd.DataFrame) -> Dict[str, Tuple[List[Any], Dict[str, float]]]:
@@ -544,7 +551,7 @@ def stratified_profiles(
             continue
         for name, attribute, note in requested:
             for group, (profile, count) in _group_profiles(
-                vectors.get(attribute, np.zeros((0, 0))), guids, row_labels
+                vectors.get(attribute, np.zeros((0, 0))), guids, row_labels, axis
             ).items():
                 rows.extend(
                     _profile_rows(
@@ -619,7 +626,7 @@ def _per_head_rows(
     if num_heads <= 0 or values.ndim != 2 or values.shape[1] != num_heads * n_lags:
         return []
     emitted: List[Dict[str, Any]] = []
-    for group, (profile, count) in _group_profiles(values, guids, row_labels).items():
+    for group, (profile, count) in _group_profiles(values, guids, row_labels, axis).items():
         reshaped = profile.reshape(num_heads, n_lags)
         for head in range(num_heads):
             emitted.extend(
@@ -644,11 +651,23 @@ def stratified_peak_rows(frame: pd.DataFrame, delay_steps: int) -> List[Dict[str
         One row per profile carrying the same description the pooled summary carries -- the
         argmax and its compensated seconds, the peak's width and edges, the mass near it, the
         secondary peaks and the degeneracy verdict -- so a per-cohort reading is held to the same
-        standard as the pooled one rather than being reported as a bare argmax.
+        standard as the pooled one rather than being reported as a bare argmax. Ordered by axis,
+        then by cohort in the canonical order, then by profile.
     """
     rows: List[Dict[str, Any]] = []
     if frame.empty:
         return rows
+    # The canonical position of each cohort, per axis. Applied as a final sort rather than by
+    # iterating in that order, so the row-building loop below stays a plain ``groupby``.
+    position = {
+        str(axis): {
+            group: index
+            for index, group in enumerate(
+                cohort.ordered_groups(sorted({str(name) for name in cell["group"]}), str(axis))
+            )
+        }
+        for axis, cell in frame.groupby("group_column", sort=True)
+    }
     for (axis, group, name), cell in frame.groupby(
         ["group_column", "group", "profile"], sort=True
     ):
@@ -683,6 +702,13 @@ def stratified_peak_rows(frame: pd.DataFrame, delay_steps: int) -> List[Dict[str
                 "degenerate_reasons": "; ".join(verdict["reasons"]),
             }
         )
+    rows.sort(
+        key=lambda row: (
+            row["group_column"],
+            position.get(row["group_column"], {}).get(row["group"], len(rows)),
+            row["profile"],
+        )
+    )
     return rows
 
 
@@ -726,10 +752,10 @@ def build_profile_figure(
             continue
         axis.axvline(
             float(lag_compensated_seconds(int(argmax), delay_steps=delay_steps)),
-            color=colour, linestyle="--", linewidth=1.0, label=label,
+            color=colour, linestyle="--", linewidth=figures.LINE_REGULAR, label=label,
         )
     if axis.get_legend_handles_labels()[0]:
-        axis.legend(fontsize=6, loc="best", ncol=2)
+        axis.legend(fontsize=figures.FONT_SMALL, loc="best", ncol=2)
 
     figures.multi_line_panel(
         axes[1, 0], seconds, profile_column(profile, "anchor_count", n_lags)[None, :],

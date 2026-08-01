@@ -49,7 +49,7 @@ import numpy as np
 import pandas as pd
 from loguru import logger
 
-from teb_vae.lag_attn_rws.eval import figures_seam as figures
+from teb_vae.lag_attn_rws.eval import cohort, figures_seam as figures
 from teb_vae.lag_attn_rws.eval._reuse import labels, stats as shared_stats
 from teb_vae.lag_attn_rws.eval.report_seam import json_safe
 
@@ -130,6 +130,20 @@ METRIC_SOURCES: Tuple[MetricSource, ...] = (
     MetricSource(
         "calibration", "calibration_per_recording.csv", "mean_logvar_full"
     ),
+    # The frequency-domain pair, in the LF band. Two rather than one because they separate the two
+    # ways a cohort's forecast can differ spectrally -- reproducing less of the truth's variation,
+    # and paying more error for what it does reproduce -- and a cohort can differ on either alone.
+    #
+    # The second is the normalised residual rather than the spectral **gain**, deliberately.
+    # ``higher_is_better`` is a direction this table publishes, and the gain has none: below $1$ is
+    # over-smoothing, above $1$ is over-dispersion, and the mean-square-optimal value is neither --
+    # it is the coherence. Registering it either way would state a preference the quantity does not
+    # have. The residual has a real direction, and the gain is still resolved by cohort through the
+    # analysis's own grouped variants.
+    MetricSource(
+        "coherence", "coherence_per_recording.csv", "coherence_full_lf", higher_is_better=True
+    ),
+    MetricSource("coherence", "coherence_per_recording.csv", "residual_normalised_full_lf"),
 )
 
 #: Written into every record, so a $p$-value here is readable without this module.
@@ -191,15 +205,18 @@ def usable_groups(
 
     Returns:
         ``(usable, excluded)`` -- the cohorts large enough to test, and the sizes of those that
-        were not. The second is returned rather than discarded because "this subgroup had two
-        recordings" is the explanation for a missing comparison, and a reader who cannot see it
-        will assume the comparison was made.
+        were not, both in the canonical cohort order so every table and figure downstream reads
+        healthy-first rather than alphabetically. The second is returned rather than discarded
+        because "this subgroup had two recordings" is the explanation for a missing comparison,
+        and a reader who cannot see it will assume the comparison was made.
     """
     usable: Dict[str, np.ndarray] = {}
     excluded: Dict[str, int] = {}
     if group_column not in frame.columns or column not in frame.columns:
         return usable, excluded
-    for group in labels.distinct_groups(list(frame[group_column])):
+    for group in cohort.ordered_groups(
+        labels.distinct_groups(list(frame[group_column])), group_column
+    ):
         values = np.asarray(
             frame.loc[frame[group_column].astype(str) == group, column], dtype=np.float64
         )
@@ -359,18 +376,18 @@ def build_heatmap_figure(record: Dict[str, Any]) -> Any:
         positions = np.arange(len(finite))
         axis.barh(positions, heights, color=figures.COLOR_BLUE, alpha=0.85)
         axis.set_yticks(positions)
-        axis.set_yticklabels(list(finite["metric"]), fontsize=6)
+        axis.set_yticklabels(list(finite["metric"]), fontsize=figures.FONT_SMALL)
         axis.axvline(
             -np.log10(float(record["alpha"])), color=figures.COLOR_VERMILLION,
-            linestyle="--", linewidth=1.2,
+            linestyle="--", linewidth=figures.LINE_REGULAR,
             label=f"alpha = {float(record['alpha']):g} (Holm-adjusted)",
         )
-        axis.legend(fontsize=7, loc="best")
+        axis.legend(fontsize=figures.FONT_LABEL, loc="best")
         axis.invert_yaxis()
     else:
         axis.text(
             0.5, 0.5, figures.EMPTY_NOTE, transform=axis.transAxes,
-            ha="center", va="center", fontsize=9, color=figures.COLOR_GRAY,
+            ha="center", va="center", fontsize=figures.FONT_NOTE, color=figures.COLOR_GRAY,
         )
     axis.set_title(f"Omnibus significance by {record['group_column']} (Kruskal-Wallis, Holm)")
     axis.set_xlabel("$-\\log_{10}$ Holm-adjusted $p$")
@@ -380,8 +397,41 @@ def build_heatmap_figure(record: Dict[str, Any]) -> Any:
     return figure
 
 
+def _ordered_pair_labels(pairs: pd.DataFrame, group_column: str) -> List[str]:
+    """Return the ``'<left> vs <right>'`` column labels in canonical cohort order.
+
+    Args:
+        pairs: The flattened pairwise comparisons.
+        group_column: The cohort axis, choosing the canonical order.
+
+    Returns:
+        Each distinct pair once, sorted by where its two cohorts fall in the canonical order. A
+        cohort the order does not know sorts after every one it does, so an unrecognised shard
+        stem lands at the right-hand end rather than in the middle.
+    """
+    present = {str(name) for name in pairs["left"]} | {str(name) for name in pairs["right"]}
+    position = {
+        group: index
+        for index, group in enumerate(cohort.ordered_groups(sorted(present), group_column))
+    }
+    distinct = {
+        f"{row.left} vs {row.right}": (
+            position.get(str(row.left), len(position)),
+            position.get(str(row.right), len(position)),
+        )
+        for row in pairs.itertuples()
+    }
+    return sorted(distinct, key=lambda label: distinct[label])
+
+
 def _draw_effect_heatmap(figure: Any, ax: Any, record: Dict[str, Any]) -> None:
     """Draw Cliff's delta for every pair of every metric that survived Holm.
+
+    The columns run in the canonical cohort order rather than alphabetically, so the pairs of one
+    cohort sit together and the healthy pairs sit left. Only the *column order* is this analysis's
+    to choose: which cohort of a pair is ``left`` comes from the shared
+    ``pairwise_comparisons``, and Cliff's delta is signed against that choice -- reorienting a pair
+    here would flip its sign against the number in ``cross_subgroup_pairwise.csv``.
 
     Args:
         figure: The parent figure, for the colourbar.
@@ -398,7 +448,7 @@ def _draw_effect_heatmap(figure: Any, ax: Any, record: Dict[str, Any]) -> None:
         )
         return
 
-    labels_x = sorted({f"{row.left} vs {row.right}" for row in pairs.itertuples()})
+    labels_x = _ordered_pair_labels(pairs, record["group_column"])
     field = np.full((len(metrics), len(labels_x)), np.nan)
     for row in pairs.itertuples():
         field[metrics.index(row.metric), labels_x.index(f"{row.left} vs {row.right}")] = (
@@ -409,9 +459,9 @@ def _draw_effect_heatmap(figure: Any, ax: Any, record: Dict[str, Any]) -> None:
         symmetric=True, colorbar_label="Cliff's delta", interpolation="none",
     )
     ax.set_yticks(np.arange(len(metrics)))
-    ax.set_yticklabels(metrics, fontsize=6)
+    ax.set_yticklabels(metrics, fontsize=figures.FONT_SMALL)
     ax.set_xticks(np.arange(len(labels_x)))
-    ax.set_xticklabels(labels_x, rotation=30, ha="right", fontsize=5)
+    ax.set_xticklabels(labels_x, rotation=30, ha="right", fontsize=figures.FONT_TINY)
 
 
 def largest_effects(pairs: pd.DataFrame, limit: int = LARGEST_EFFECTS) -> List[Dict[str, Any]]:

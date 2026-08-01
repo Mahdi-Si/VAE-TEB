@@ -9,11 +9,24 @@
       "logvar_distribution.pdf",
       "pit_reliability.pdf"
     ],
+    "coherence": [
+      "coherence_bands.pdf",
+      "coherence_decomposition.pdf",
+      "coherence_lead_time.pdf",
+      "coherence_seam.pdf",
+      "coherence_source.pdf",
+      "coherence_spectrum.pdf"
+    ],
     "coupling": [
-      "pred_gap_distribution.pdf"
+      "pred_gap_distribution.pdf",
+      "pred_gap_percent.pdf"
     ],
     "cross_subgroup": [
       "subgroup_heatmap.pdf"
+    ],
+    "distributions": [
+      "class_histograms.pdf",
+      "subgroup_histograms.pdf"
     ],
     "events": [
       "conditioned_coupling.pdf",

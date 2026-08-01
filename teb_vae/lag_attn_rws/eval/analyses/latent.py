@@ -196,10 +196,10 @@ def build_spectrum_figure(
         positions = np.arange(values.size, dtype=np.float64)
         axis.bar(positions, values, color=figures.COLOR_BLUE, alpha=0.85, width=0.8)
         axis.axhline(
-            float(threshold), color=figures.COLOR_VERMILLION, linestyle="--", linewidth=1.2,
+            float(threshold), color=figures.COLOR_VERMILLION, linestyle="--", linewidth=figures.LINE_REGULAR,
             label=f"activity threshold {float(threshold):g} nats",
         )
-        axis.legend(fontsize=7, loc="best")
+        axis.legend(fontsize=figures.FONT_LABEL, loc="best")
     else:
         axis.text(
             0.5, 0.5, figures.EMPTY_NOTE, ha="center", va="center", transform=axis.transAxes

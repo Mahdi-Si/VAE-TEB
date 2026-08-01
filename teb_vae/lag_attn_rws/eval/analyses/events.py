@@ -48,7 +48,7 @@ import numpy as np
 import pandas as pd
 from loguru import logger
 
-from teb_vae.lag_attn_rws.eval import events
+from teb_vae.lag_attn_rws.eval import cohort, events
 from teb_vae.lag_attn_rws.eval import figures_seam as figures
 from teb_vae.lag_attn_rws.eval._reuse import labels, stats as shared_stats
 from teb_vae.lag_attn_rws.eval.collect import CONTRACTION_AGE_COLUMN
@@ -561,10 +561,18 @@ def conditioned_rows(
         cut["difference"] = cut["event"] - cut["control"]
         pieces.append(cut)
         rows.append(_conditioned_row(name, column, cut, resamples=resamples, seed=seed))
-        for cohort, cell in cut.groupby(labels.CLASS_COLUMN, dropna=True):
+        # Named ``class_name`` rather than ``cohort``, which is the module holding the canonical
+        # order two lines below. The per-class rows follow that order rather than the alphabetical
+        # one ``groupby`` produces, so the CSV reads healthy, acidosis, HIE like every figure.
+        by_class = {
+            str(class_name): cell
+            for class_name, cell in cut.groupby(labels.CLASS_COLUMN, dropna=True)
+        }
+        for class_name in cohort.ordered_groups(list(by_class), labels.CLASS_COLUMN):
             rows.append(
                 _conditioned_row(
-                    name, column, cell, resamples=resamples, seed=seed, cohort=str(cohort)
+                    name, column, by_class[class_name],
+                    resamples=resamples, seed=seed, cohort=class_name,
                 )
             )
     per_recording = (
@@ -656,23 +664,28 @@ def build_triggered_figure(record: Dict[str, Any]) -> Any:
         axis.fill_between(seconds, low, high, color=figures.COLOR_GRAY, alpha=0.3, linewidth=0,
                           label=f"random-trigger null ({NULL_BAND_SIGMAS:g} sd)")
         axis.plot(seconds, np.asarray(block["null_mean"], dtype=np.float64),
-                  color=figures.COLOR_GRAY, linewidth=0.8, linestyle="--", label="null mean")
-        axis.plot(seconds, mean, color=figures.COLOR_VERMILLION, linewidth=1.2, label=name)
+                  color=figures.COLOR_GRAY, linewidth=figures.LINE_THIN, linestyle="--", label="null mean")
+        axis.plot(seconds, mean, color=figures.COLOR_VERMILLION, linewidth=figures.LINE_REGULAR, label=name)
         axis.axvspan(*RESPONSE_WINDOW_S, color=figures.COLOR_ORANGE, alpha=0.12, zorder=0)
         axis.set_title(f"Contraction-triggered {name}, n = {int(record.get('n_triggers') or 0)}")
         axis.set_xlabel("time after contraction onset (s)")
         axis.set_ylabel("bpm" if name != "difference" else "bpm (full - base)")
-        axis.legend(fontsize=7, loc="best")
+        axis.legend(fontsize=figures.FONT_LABEL, loc="best")
         figures.style_axes(axis)
     if not curves:
         axes[0, 0].text(0.5, 0.5, figures.EMPTY_NOTE, transform=axes[0, 0].transAxes,
-                        ha="center", va="center", fontsize=9, color=figures.COLOR_GRAY)
+                        ha="center", va="center", fontsize=figures.FONT_NOTE, color=figures.COLOR_GRAY)
         figures.style_axes(axes[0, 0])
     return figure
 
 
 def build_conditioned_figure(per_recording: pd.DataFrame) -> Any:
-    """Draw the event-versus-control comparison per readout, split by clinical class."""
+    """Draw the event-versus-control comparison per readout, split by clinical class.
+
+    The classes run healthy, acidosis, HIE and are coloured green, amber, red -- the same order
+    and palette every other cohort figure in this evaluation uses, so two of them can be read
+    side by side. ``groupby`` alone would order them alphabetically, putting acidosis first.
+    """
     metrics = [name for name, _ in CONDITIONED_READOUTS]
     figure, axes = figures.new_figure(len(metrics))
     for index, metric in enumerate(metrics):
@@ -680,14 +693,24 @@ def build_conditioned_figure(per_recording: pd.DataFrame) -> Any:
         cut = per_recording[per_recording["metric"] == metric] if len(per_recording) else (
             per_recording
         )
-        groups: Dict[str, np.ndarray] = {}
+        values: Dict[str, np.ndarray] = {}
         if len(cut):
-            for cohort, cell in cut.groupby(labels.CLASS_COLUMN, dropna=False):
-                groups[f"{cohort}"] = finite_column(cell, "difference")
+            # ``dropna=False`` keeps the unlabelled recordings as their own violin rather than
+            # dropping them silently; the canonical order does not know that label, so it lands
+            # after the three classes it does know.
+            by_class = {
+                f"{name}": finite_column(cell, "difference")
+                for name, cell in cut.groupby(labels.CLASS_COLUMN, dropna=False)
+            }
+            values = {
+                name: by_class[name]
+                for name in cohort.ordered_groups(list(by_class), labels.CLASS_COLUMN)
+            }
         figures.violin_panel(
-            axis, groups or {"all": np.zeros(0)},
+            axis, values or {"all": np.zeros(0)},
             title=f"{metric}: anchors near a contraction minus control anchors",
             ylabel="difference (nats per anchor)",
+            colors=figures.group_colors(list(values)),
             reference=0.0, reference_label="no conditioning effect",
         )
     return figure

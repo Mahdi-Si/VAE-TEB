@@ -173,6 +173,31 @@ def suite_oracle_budget():
     oracle.DEFAULT_FIT_EPOCHS, oracle.DEFAULT_CURVE_POINTS = original
 
 
+#: The shipped page counts are sized for a reviewer looking at a production split: ten stratified
+#: pages and ten per extreme tail, over three metrics, is seventy renders of a seven-row figure.
+#: Every fixture that drives a full run pays for all of them, and a page is a *picture* -- no
+#: number in any table depends on how many were drawn, so the suite gains nothing from the volume
+#: and the gate roughly doubles because of it.
+#:
+#: So the suite renders a few of each. The tests that question the page *selection* -- the
+#: stratification, the extremes, the disjointness of the two tails -- pass their own counts
+#: explicitly rather than inheriting these.
+SUITE_STRATIFIED_PAGES = 2
+SUITE_EXTREME_PAGES_PER_TAIL = 1
+
+
+@pytest.fixture(scope="session", autouse=True)
+def suite_page_budget():
+    """Shrink the diagnostic-page counts for the whole session, and put them back afterwards."""
+    from teb_vae.lag_attn_rws.eval.analyses import samples
+
+    original = (samples.DEFAULT_STRATIFIED_PAGES, samples.EXTREME_PAGES_PER_TAIL)
+    samples.DEFAULT_STRATIFIED_PAGES = SUITE_STRATIFIED_PAGES
+    samples.EXTREME_PAGES_PER_TAIL = SUITE_EXTREME_PAGES_PER_TAIL
+    yield
+    samples.DEFAULT_STRATIFIED_PAGES, samples.EXTREME_PAGES_PER_TAIL = original
+
+
 def make_stub_batch(batch_size: int = BATCH, seq_len: int = SEQ_LEN, seed: int = 0):
     """Build a batch exposing the fields the task reads, raw target included.
 

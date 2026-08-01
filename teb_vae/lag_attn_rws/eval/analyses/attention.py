@@ -361,7 +361,7 @@ def _shade_truncated(axis: Any, seconds: np.ndarray, truncation: Dict[str, Any])
         color=figures.COLOR_LIGHT_GRAY, alpha=0.35, zorder=0,
         label=f"lags truncated at {n_truncated} of the trained anchors",
     )
-    axis.legend(fontsize=6, loc="best", ncol=2)
+    axis.legend(fontsize=figures.FONT_SMALL, loc="best", ncol=2)
 
 
 def build_heatmap_figure(
@@ -415,7 +415,7 @@ def build_heatmap_figure(
     warmup = int(geometry.get("warmup", 0))
     if warmup > 0 and steps:
         axes[0, 0].axvline(
-            warmup * step_seconds, color=figures.COLOR_BLACK, linewidth=0.8, linestyle="--"
+            warmup * step_seconds, color=figures.COLOR_BLACK, linewidth=figures.LINE_THIN, linestyle="--"
         )
     return figure
 

@@ -70,10 +70,48 @@ Report = report.Report
 #: handed to it.
 json_safe = report.json_safe
 
-#: Grouped variants: the long-form ``(group, metric, n, mean, q25, median, q75)`` table, and the
-#: emitter that writes it beside its violin figure for each grouping axis.
+#: Grouped variants: the long-form ``(group, metric, n, mean, q25, median, q75)`` table.
 summarise_by_group = report.summarise_by_group
-emit_grouped_variants = report.emit_grouped_variants
+
+
+def emit_grouped_variants(frame: Any, directory: Any, **kwargs: Any) -> Dict[str, Any]:
+    """Write this package's by-group tables and figures, in its own cohort order and palette.
+
+    The mechanism is the shared emitter's; what is added here is the two presentation decisions
+    this package makes and the sibling does not, supplied together because a figure whose violins
+    are ordered one way and coloured by another convention is worse than either alone:
+
+    * cohorts run **healthy, acidosis, HIE** and the eight subgroups in their canonical order,
+      from :func:`~teb_vae.lag_attn_rws.eval.cohort.ordered_groups`, rather than alphabetically --
+      which would put ``acidosis`` first on every class figure and interleave the classes on every
+      subgroup one;
+    * they are coloured green / amber / red by severity, from
+      :func:`~teb_vae.lag_attn_rws.eval.figures_seam.group_colors`.
+
+    Both are passed rather than reimplemented, so the skip rules, the counts and the record's
+    shape stay the shared ones and cannot drift from the sibling's.
+
+    Args:
+        frame: The analysis's per-recording frame.
+        directory: The analysis's output directory.
+        **kwargs: Forwarded to :func:`~teb_vae.lag_attn.eval.report.emit_grouped_variants`.
+
+    Returns:
+        Its record, unchanged in shape.
+    """
+    # Imported here rather than at module scope: this module is the runner's reporting surface and
+    # is imported for ``Report`` alone on paths that draw nothing, and ``figures_seam`` costs
+    # matplotlib. The shared emitter takes its own figure import the same way and for the reason.
+    from teb_vae.lag_attn_rws.eval import figures_seam
+    from teb_vae.lag_attn_rws.eval.cohort import ordered_groups
+
+    return report.emit_grouped_variants(
+        frame,
+        directory,
+        order_groups=lambda groups, axis: ordered_groups(groups, axis),
+        group_palette=figures_seam.group_colors,
+        **kwargs,
+    )
 
 #: Derived blocks whose content is model-agnostic: what each analysis saw, which caps never fired,
 #: and every file the run emitted.
@@ -111,6 +149,18 @@ INCONCLUSIVE = report.INCONCLUSIVE
 HEADLINE_SCALARS: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
     ("pred_gap_mc_nats", ("readouts", "mc_pred_gap")),
     ("pred_gap_train_path_nats", ("readouts", "pred_gap")),
+    # The same answer as a proportion. Registered because nats do not compare across checkpoints
+    # whose block scores differ in scale, which is exactly what an arm table asks them to do -- and
+    # because "the source removed 4% of the forecast error" is a sentence a reader can check
+    # against a trace, where "3.1 nats per anchor" is not. Both spaces are here because they fail
+    # differently: the error-space pair is blind to the forecast's variance, and the
+    # likelihood-space one is the headline score itself and so inherits its every property.
+    ("pred_gap_rmse_pct", ("coupling", "pred_gap_percent", "headline", "pred_gap_rmse_pct")),
+    ("pred_gap_mse_pct", ("coupling", "pred_gap_percent", "headline", "pred_gap_mse_pct")),
+    (
+        "pred_gap_mc_likelihood_pct",
+        ("coupling", "pred_gap_percent", "headline", "pred_gap_mc_likelihood_pct"),
+    ),
     ("d_base_mc_nats", ("readouts", "mc_nll_base_block")),
     ("d_full_mc_nats", ("readouts", "mc_nll_full_block")),
     ("d_shuffled_mc_nats", ("readouts", "mc_nll_shuffled_block")),
@@ -147,6 +197,24 @@ HEADLINE_SCALARS: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
     ("calibration_mean_standardised_sq", ("calibration", "mean_standardised_sq")),
     ("calibration_pit_max_cdf_deviation", ("calibration", "pit", "max_cdf_deviation")),
     ("calibration_nll_gain_per_raw_sample", ("calibration", "nll", "gain_per_raw_sample")),
+    # The forecast in the frequency domain, in the LF band and pooled over lead time. Three
+    # numbers because they fail independently and an arm table that read only one would miss two
+    # of the three ways a forecast can be wrong at a frequency:
+    #
+    #   coherence  how much of the truth's LF variation the forecast reproduces in phase;
+    #   gain       whether it has the truth's amplitude there. Below 1 is the over-smoothing every
+    #              mean-square-trained forecaster is prone to, and it is invisible to the coherence
+    #              -- a perfectly coherent forecast at half amplitude still carries a quarter of the
+    #              truth's variance as error;
+    #   delta      what the source added, which is `pred_gap` resolved by frequency.
+    #
+    # LF rather than any other band: VLF is four bins wide, MF carries the decoder's token-seam
+    # frequency, and HF is mostly beyond what a two-minute forecast can speak to. Unlike the
+    # calibration entries above these resolve under every likelihood, because the cross-spectra
+    # read only the forecast means and the truth.
+    ("coherence_msc_lf_full", ("coherence", "headline", "coherence_full_lf")),
+    ("coherence_gain_lf_full", ("coherence", "headline", "gain_full_lf")),
+    ("coherence_delta_msc_lf", ("coherence", "headline", "delta_coherence_lf")),
     ("same_recording_pairing_rate", ("controls", "same_recording_pairing_rate")),
     ("n_samples", ("n_samples",)),
     ("n_recordings", ("n_recordings",)),
@@ -173,7 +241,20 @@ PRED_GAP_CONVENTION = (
     "pred_gap_mc_nats is the headline: the Monte Carlo marginalised block score difference "
     "D_base - D_full in nats per anchor, where D = -[logsumexp_r(-D_r) - log K] is the log of "
     "the average likelihood over K latent draws. pred_gap_train_path_nats is the single-draw "
-    "training-path difference, reported beside it as the objective-parity column."
+    "training-path difference, reported beside it as the objective-parity column. "
+    "Three percentage columns restate the same finding as a proportion, each computed per "
+    "recording and then averaged: pred_gap_rmse_pct and pred_gap_mse_pct are the percentage of "
+    "the target-only branch's point-forecast error the source removed, in root-mean-square and "
+    "mean-square respectively, and are scale-free; pred_gap_mc_likelihood_pct is "
+    "100*(exp(pred_gap_mc_nats / (H*R)) - 1), the extra probability density the "
+    "source-conditioned forecast puts on each observed raw sample, where H*R is the fixed block "
+    "size rather than a per-anchor scored-sample count and so understates the improvement "
+    "wherever forecast steps are masked. That third column exists only under gaussian_nll: under "
+    "mse a block score is a sum of squared errors rather than a log density, so it is null there "
+    "rather than exponentiated into a density ratio that would not be one. None of the three is "
+    "pred_gap divided by a block score: a "
+    "log score has no natural zero, D_base is legitimately negative for a sharp forecast, and "
+    "that ratio would change sign with its own denominator."
 )
 
 
@@ -530,6 +611,130 @@ def check_argmax_lag(results: Dict[str, Any]) -> Dict[str, Any]:
     )
 
 
+#: How far the spectral residual may sit from the block scores before the magnitude check
+#: complains, as a multiplicative factor either way.
+#:
+#: Deliberately loose, and the looseness is the honest part: the two cannot be equal. Whole-window
+#: dropping removes samples the per-step mask kept, the $50\%$ Welch overlap counts interior
+#: samples twice, and the Hann $w^2$ weighting is not uniform. All three are second-order for a
+#: stationary residual, but none is zero, so a tight bound here would fail on every healthy run.
+#:
+#: A loose gate is still a gate. What it catches is a factor-of-$N$ or factor-of-$U$ normalisation
+#: error -- the realistic failure mode, and one that would otherwise reach the headline as a
+#: perfectly plausible coherence. It does not claim to catch a $5\%$ effect; the exact identity
+#: beside it does that job, and that one is gated at :data:`IDENTITY_RTOL`.
+#:
+#: Provisional: where the boundary actually sits is what the first converged run answers, and the
+#: check always reports the measured ratio beside this number.
+COHERENCE_MAGNITUDE_TOLERANCE = 2.0
+
+
+def check_coherence_parseval(results: Dict[str, Any]) -> Dict[str, Any]:
+    r"""The spectral residual must equal the time-domain residual it decomposes.
+
+    $$\sum_{\text{bands}} \big(S_{xx} + S_{yy} - 2\,\mathrm{Re}\,S_{xy}\big)
+    \;=\; \sum_{\text{windows}} \frac{1}{U}\sum_n w_n^2\,\big(e_n - \bar e^{(w)}\big)^2 .$$
+
+    The two sides are accumulated **independently** in the collection pass -- one through the FFT,
+    one in the time domain -- over the identical kept windows, and they are equal in real arithmetic
+    by the DFT's Parseval theorem. So anything above float64 round-off is a real error, and the
+    check is gated at the same :data:`IDENTITY_RTOL` as the other two identities rather than at a
+    tolerance chosen to let it pass.
+
+    Four things break it, and the message names all four because the symptom is identical: a wrong
+    $N U$ divisor, a missing or duplicated one-sided doubling factor, a band table that does not
+    partition every bin, and the two accumulators disagreeing about which windows were kept.
+
+    Args:
+        results: The accumulated results.
+
+    Returns:
+        The verdict, with the measured worst relative error beside it.
+    """
+    block = dict(_dig(results, ("coherence", "reconciliation")) or {})
+    measured = block.get("parseval_max_relative_error")
+    if measured is None or not math.isfinite(float(measured)):
+        return _inconclusive(
+            "the run carries no coherence reconciliation, so the spectral residual could not be "
+            "checked against the time domain",
+            parseval_max_relative_error=measured,
+        )
+    worst = float(measured)
+    return _verdict(
+        worst <= IDENTITY_RTOL,
+        f"the band-summed residual spectrum matches the windowed time-domain residual to "
+        f"{_reported(worst)}"
+        if worst <= IDENTITY_RTOL
+        else (
+            f"the band-summed residual spectrum disagrees with the windowed time-domain residual "
+            f"by {_reported(worst)} relative, which is above round-off. One of four things is "
+            f"wrong: the nperseg*U divisor, the one-sided doubling of the non-DC bins, a band "
+            f"table that does not cover every bin from DC to Nyquist, or the two accumulators "
+            f"disagreeing about which Welch windows were kept"
+        ),
+        parseval_max_relative_error=_reported(worst),
+        rtol=IDENTITY_RTOL,
+    )
+
+
+def check_coherence_detrended_share(results: Dict[str, Any]) -> Dict[str, Any]:
+    r"""How much of the forecast's error the spectrum can see at all.
+
+    **Named for what it measures.** It compares the *detrended* windowed residual power against the
+    *raw* windowed residual power -- both accumulated by the same pass over the same kept windows --
+    and it does **not** compare either against the block scores. It cannot: the spectral estimate
+    drops whole windows the per-step mask kept, counts overlapped samples twice and weights by
+    $w^2$, so no tolerance against ``sq_error_full`` would be a measurement rather than a fudge.
+
+    What it does measure is the analysis's one blind spot, as a number. Each Welch window has its
+    own mean removed, so the spectrum carries nothing about the forecast's **level**; the share
+    reported here is what survives that removal, and its complement is the level error. A share
+    near $1$ means the band numbers describe essentially all of the error. A share near $0$ means
+    almost all of it is a constant offset, and no coherence, gain or band figure in the analysis is
+    describing the forecast's actual failure -- which is a finding, not a formatting detail.
+
+    See :data:`COHERENCE_MAGNITUDE_TOLERANCE` for why the bound is loose, and
+    :func:`check_coherence_parseval` for the exact identity beside it.
+
+    Args:
+        results: The accumulated results.
+
+    Returns:
+        The verdict, with the measured share beside it.
+    """
+    block = dict(_dig(results, ("coherence", "reconciliation")) or {})
+    shares = [
+        float(block[name])
+        for name in ("detrended_share_of_raw_base", "detrended_share_of_raw_full")
+        if name in block and math.isfinite(float(block.get(name, float("nan"))))
+    ]
+    if not shares:
+        return _inconclusive(
+            "the run carries no coherence reconciliation, so the share of the forecast error the "
+            "spectrum can see was not measured"
+        )
+    worst = min(shares)
+    # A share far below 1 means most of the residual is a constant offset the spectrum cannot see;
+    # far above 1 is impossible and means the two accumulators describe different windows.
+    agrees = (1.0 / COHERENCE_MAGNITUDE_TOLERANCE) <= worst <= COHERENCE_MAGNITUDE_TOLERANCE
+    return _verdict(
+        agrees,
+        f"the detrended residual power is {_reported(worst)} of the raw residual power, within "
+        f"the factor of {COHERENCE_MAGNITUDE_TOLERANCE:g} this check allows; the complement is "
+        f"the forecast's level error, which the spectrum does not see"
+        if agrees
+        else (
+            f"the detrended residual power is {_reported(worst)} of the raw residual power, "
+            f"outside a factor of {COHERENCE_MAGNITUDE_TOLERANCE:g}. Below it, almost all of the "
+            f"forecast error is a constant offset the spectrum cannot see and no band number "
+            f"describes the forecast; above it, the two accumulators are not summing the same "
+            f"windows"
+        ),
+        detrended_share_of_raw=_reported(worst),
+        tolerance_factor=COHERENCE_MAGNITUDE_TOLERANCE,
+    )
+
+
 def build_sanity(
     results: Dict[str, Any],
     headline: Dict[str, Any],
@@ -560,6 +765,12 @@ def build_sanity(
         # inherited from the model tests: the checkpoint and the data are what a summary's reader
         # is holding, and neither is what a fixture proved.
         **{name: check_lag_identity(results, name) for name in LAG_IDENTITIES},
+        # The cross-spectral estimator's own two: an exact identity against the time domain, and a
+        # loose bound on how much of the forecast error the spectrum can see at all -- which is
+        # deliberately NOT a comparison against the block scores, for the reason its docstring
+        # gives. Both INCONCLUSIVE where the analysis skipped.
+        "coherence_parseval": check_coherence_parseval(results),
+        "coherence_detrended_share": check_coherence_detrended_share(results),
         # The population checks are the shared ones: what they read is the probe's record, which
         # says nothing about which model produced it.
         "per_file_counts": report.check_per_file_counts(probe),
