@@ -27,7 +27,7 @@ import time
 import traceback
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Sequence
 
 import numpy as np
 from loguru import logger
@@ -350,6 +350,8 @@ def emit_grouped_variants(
     group_columns: Optional[List[str]] = None,
     stem: str = "per_sample",
     references: Optional[Dict[str, float]] = None,
+    order_groups: Optional[Callable[[List[str], str], Sequence[str]]] = None,
+    group_palette: Optional[Callable[[Sequence[str]], Dict[str, str]]] = None,
 ) -> Dict[str, Any]:
     """Write the by-group CSV and figure for each grouping axis, or record why not.
 
@@ -364,6 +366,13 @@ def emit_grouped_variants(
             :data:`~teb_vae.lag_attn.eval.labels.GROUP_COLUMNS`.
         stem: Filename stem, yielding ``<stem>_by_<group>.csv`` and ``.pdf``.
         references: Optional metric-to-reference-value mapping, drawn as a horizontal line.
+        order_groups: Optional ``(groups, group_column) -> ordered groups``, deciding the
+            left-to-right violin order and the CSV's row order alike. ``None`` keeps the
+            alphabetical order :func:`~teb_vae.lag_attn.eval.labels.distinct_groups` returns. A
+            callable that drops or invents a label is ignored, because the counts and the values
+            below are keyed on the labels actually present.
+        group_palette: Optional ``groups -> {label: colour}``. ``None`` uses the figure module's
+            default. Supplied by a package that draws cohorts from a palette of its own.
 
     Returns:
         Grouping axis to a record: either the paths written and the per-group counts, or
@@ -407,8 +416,27 @@ def emit_grouped_variants(
             }
             continue
 
+        # The reporting order, applied once and used by the table and the figure alike. Filtered
+        # back onto the labels actually present so a caller's ordering cannot add a cohort that
+        # is not there or silently drop one that is.
+        if order_groups is not None:
+            requested = [str(name) for name in order_groups(list(groups), group_column)]
+            groups = [name for name in requested if name in groups]
+            groups += [name for name in labels.distinct_groups(list(frame[group_column]))
+                       if name not in groups]
+
         directory.mkdir(parents=True, exist_ok=True)
         summary = summarise_by_group(frame, group_column, present)
+        if len(summary):
+            # ``groupby`` orders alphabetically, so the table would otherwise disagree with the
+            # figure drawn beside it about which cohort comes first.
+            position = {group: index for index, group in enumerate(groups)}
+            summary = (
+                summary.assign(_order=[position.get(str(name), len(groups)) for name in summary["group"]])
+                .sort_values(["_order", "metric"], kind="stable")
+                .drop(columns="_order")
+                .reset_index(drop=True)
+            )
         csv_path = directory / f"{stem}_by_{group_column}.csv"
         summary.to_csv(csv_path, index=False)
 
@@ -424,6 +452,7 @@ def emit_grouped_variants(
         figure, _ = figures.grouped_violin_figure(
             values_by_metric, groups,
             title_prefix=f"by {group_column}: ", references=references,
+            colors=None if group_palette is None else group_palette(groups),
         )
         try:
             pdf_path = figures.render_to_pdf(figure, directory / f"{stem}_by_{group_column}.pdf")

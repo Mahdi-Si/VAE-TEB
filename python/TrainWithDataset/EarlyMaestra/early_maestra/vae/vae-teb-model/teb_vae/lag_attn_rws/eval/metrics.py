@@ -103,6 +103,12 @@ from teb_vae.lag_attn_rws.nets.model import LOGVAR_FLOOR_MARGIN_FRAC, SATURATION
 from teb_vae.lag_attn_rws.nets.raw_masks import VALID_THRESHOLD, forecast_mask, kl_mask
 from teb_vae.lag_attn_rws.nets.raw_targets import build_future_target
 
+# The Welch layout, the taper and the one-sided weights live one layer down, because this module
+# computes the cross-spectral sums and ``analyses/coherence`` turns them into readouts -- and an
+# analysis may not import another. A second copy of the scaling convention in either place is how
+# the two would come to disagree about what a spectrum is.
+from teb_vae.lag_attn_rws.eval import spectra  # noqa: E402
+
 #: Monte Carlo draws per anchor. The specification's starting value; more may be used for a
 #: final analysis, and $K = 1$ reduces the estimator exactly to the training-path score.
 DEFAULT_NUM_SAMPLES = 8
@@ -662,6 +668,270 @@ def horizon_block_sums(
 
 
 # =============================================================================
+# The tau-slice: a forecast block grid read as continuous time series, one per lead time
+# =============================================================================
+def tau_slices(block: torch.Tensor, *, warmup: int) -> torch.Tensor:
+    r"""Read a $(B, T_{\mathrm{valid}}, H, R)$ forecast grid as $H$ continuous $4\,$Hz series.
+
+    Fix a horizon step $\tau$ and concatenate over consecutive anchors. Because raw index
+    $n(t, \tau, r) = R(t + 1) + R\tau + r$ advances by exactly $R$ when $t$ advances by one, and
+    each anchor contributes exactly the $R$ samples $r \in [0, R)$, the concatenation is
+    **contiguous, gap-free and non-overlapping**: slice $\tau$ is precisely the raw signal over
+    $[R(w + 1 + \tau),\ R(T_{\mathrm{valid}} + 1 + \tau))$, sampled once each. At $\tau = H - 1$
+    that upper end is exactly $L_{\mathrm{raw}}$, so the last slice closes on the record's end.
+
+    This is the construction the whole coherence analysis rests on, and it is what makes a spectral
+    reading of the forecast possible at all. Adjacent anchors' forecast *blocks* overlap in $H - 1$
+    of their $H$ steps, so a spectrum taken over blocks would count almost every sample thirty
+    times; and a single $H \cdot R$ block is two minutes, far too short to resolve the frequencies
+    a fetal heart rate trace is read for. One $\tau$-slice is $A \cdot R$ samples -- $960$ s at the
+    shipped geometry -- with every raw sample appearing exactly once.
+
+    The trained-anchor prefix is dropped rather than masked: those anchors carry no loss term, so
+    their forecasts are untrained output and including them would put untrained samples in the
+    middle of a series whose spectrum is then attributed to the model.
+
+    Args:
+        block: $(B, T_{\mathrm{valid}}, H, R)$ -- the raw target, a branch's forecast mean, or any
+            quantity on that grid.
+        warmup: Leading anchors excluded from every loss, $w$.
+
+    Returns:
+        $(B, H, A R)$ with $A = T_{\mathrm{valid}} - w$, in strict time order along the last axis.
+    """
+    trained = block[:, int(warmup) :]
+    # (B, A, H, R) -> (B, H, A, R) -> (B, H, A*R). The reshape is anchor-major and sub-sample-minor,
+    # which is what puts the samples in time order; transposing the last two axes instead would
+    # interleave the sub-samples of every anchor and produce a plausible-looking spectrum of
+    # nothing.
+    return trained.permute(0, 2, 1, 3).reshape(block.shape[0], block.shape[2], -1)
+
+
+def tau_slice_window_validity(mask: torch.Tensor, *, layout: Any) -> torch.Tensor:
+    r"""Which Welch windows of each $\tau$-slice contain no invalid sample.
+
+    **A window touching a gap is dropped whole; nothing is ever interpolated.** ``events`` fills
+    gaps before smoothing because a peak finder needs a continuous trace and the interpolant only
+    has to not manufacture an edge. A spectral estimate cannot take that trade: the interpolant is
+    a deterministic ramp whose own spectrum -- concentrated at low frequency, absent at high --
+    would be attributed to the model, and in exactly the bands this analysis is read for.
+
+    The test is an exact ``all()`` rather than a coverage threshold, and that is a consequence of
+    the layout rather than a choice made here: the forecast mask is constant within a decimated
+    step, and ``nperseg`` and the hop are integer multiples of $R$, so a window spans a whole
+    number of anchors and is either entirely scored or not.
+
+    Args:
+        mask: The decimated forecast mask $(B, T_{\mathrm{valid}}, H)$ -- the pipeline's own scoring
+            mask, which already folds the warm-up, anchor validity, forecast-step validity and the
+            coverage floor.
+        layout: The :class:`~teb_vae.lag_attn_rws.eval.spectra.SliceGeometry` for this run.
+
+    Returns:
+        $(B, H, W)$ of the mask's dtype, $1$ where every anchor the window spans is scored.
+    """
+    trained = mask[:, int(layout.warmup) :]
+    # (B, A, H) -> (B, W, H, nperseg_steps): one entry per window, holding the anchors it spans.
+    windows = trained.unfold(
+        dimension=1, size=int(layout.nperseg_steps), step=int(layout.hop_steps)
+    )
+    return windows.amin(dim=-1).permute(0, 2, 1)
+
+
+def source_tau_slices(up_raw: torch.Tensor, *, layout: Any) -> torch.Tensor:
+    r"""Cut the raw UP trace into the same $\tau$-slice spans the forecast occupies.
+
+    Slice $\tau$ covers raw $[R(w + 1 + \tau),\ R(T_{\mathrm{valid}} + 1 + \tau))$, so the source's
+    slice is the *contemporaneous* uterine pressure -- the pressure during the window being
+    forecast, not the pressure the model read. That is the point: the model conditions on UP only
+    up to each anchor, so a forecast coherent with UP over its own horizon has anticipated the
+    contraction rather than copied it.
+
+    Args:
+        up_raw: The raw UP trace $(B, L_{\mathrm{raw}})$, as the loader stores it (z-scored).
+        layout: The :class:`~teb_vae.lag_attn_rws.eval.spectra.SliceGeometry` for this run.
+
+    Returns:
+        $(B, H, A R)$, aligned sample-for-sample with :func:`tau_slices` of the forecast grid.
+    """
+    stride = int(layout.raw_per_step)
+    # Every start offset in steps of R, then the H that begin at R(w + 1 + tau).
+    strided = up_raw.unfold(dimension=1, size=int(layout.n_samples), step=stride)
+    first = int(layout.warmup) + 1
+    return strided[:, first : first + int(layout.horizon)]
+
+
+def _welch_segments(
+    series: torch.Tensor, *, layout: Any, window: torch.Tensor
+) -> torch.Tensor:
+    r"""Cut a $\tau$-slice into overlapping Welch segments, detrended and tapered.
+
+    Args:
+        series: $(B, H, A R)$ from :func:`tau_slices`.
+        layout: The slice layout.
+        window: The periodic Hann window $(N,)$, on the series' device and dtype.
+
+    Returns:
+        $(B, H, W, N)$, each segment mean-removed and multiplied by the taper.
+    """
+    segments = series.unfold(dimension=-1, size=int(layout.nperseg), step=int(layout.hop))
+    # Each segment's own mean, of that series alone -- the two series are detrended independently,
+    # which is what makes the cross-spectrum the covariance of the two detrended segments.
+    return (segments - segments.mean(dim=-1, keepdim=True)) * window
+
+
+@torch.no_grad()
+def cross_spectral_sums(
+    target: torch.Tensor,
+    mu_base: torch.Tensor,
+    mu_full: torch.Tensor,
+    up_raw: Optional[torch.Tensor],
+    mask: torch.Tensor,
+    *,
+    layout: Any,
+) -> Dict[str, torch.Tensor]:
+    r"""Accumulate the $\tau$-slice cross-spectral sufficient statistics for one batch.
+
+    **Sufficient statistics, never ratios.** Every quantity returned is a sum over the windows this
+    batch contributed, so a caller adds two batches', two segments' or two recordings' and ratios
+    once at the end. That is not a stylistic preference:
+
+    * $S_{ee} = S_{xx} + S_{yy} - 2\,\mathrm{Re}\,S_{xy}$ is linear in the three spectra, so the
+      residual decomposition and the Parseval identity hold at *every* aggregation level only if
+      the coherence, the gain and the phase all come from one aggregated triple.
+    * Magnitude-squared coherence is exactly $1$ on a single window, for any two signals whatever.
+      It carries no information until cross-spectra are averaged, so an implementation that ratioed
+      here -- per batch, per segment, anywhere before the end -- would report perfect coherence
+      everywhere and look entirely plausible doing it.
+
+    **Float64 throughout, from model output that is float32.** Not to add precision the inputs do
+    not have, but so the two sides of the Parseval identity -- one taken through the FFT, one
+    accumulated in the time domain from the same float32 tensors -- differ by the estimator's
+    correctness rather than by its arithmetic. At float32 they agree only to about $10^{-6}$, which
+    is the order of the tolerance the identity is gated at, and a real normalisation bug would then
+    be indistinguishable from round-off.
+
+    **A window touching a gap contributes exactly zero and is not counted**; see
+    :func:`tau_slice_window_validity` for why nothing is interpolated. Invalid samples are finite
+    (a gap is stored as $0$ bpm, roughly $-11\sigma$ after z-scoring) so they cannot poison an
+    accumulator through a ``NaN``; they are removed by the mask alone, which is why the mask is
+    applied multiplicatively rather than by indexing.
+
+    Args:
+        target: The raw future target $(B, T_{\mathrm{valid}}, H, R)$.
+        mu_base: The target-only forecast mean, the same shape.
+        mu_full: The source-conditioned forecast mean, the same shape.
+        up_raw: The raw UP trace $(B, L_{\mathrm{raw}})$, or ``None`` when the batch does not carry
+            it -- in which case the four source-side statistics are absent rather than zero, so a
+            reader cannot mistake "not collected" for "no coupling".
+        mask: The decimated forecast mask $(B, T_{\mathrm{valid}}, H)$.
+        layout: The :class:`~teb_vae.lag_attn_rws.eval.spectra.SliceGeometry` for this run.
+
+    Returns:
+        Per-sample accumulators, each $(B, H, F)$ in float64 except the counts and the time-domain
+        references, which are $(B, H)$:
+
+        * ``sxx``, ``syy_base``, ``syy_full`` -- auto-spectra of the truth and the two branches.
+        * ``sxy_base_re``/``_im``, ``sxy_full_re``/``_im`` -- $\overline{X}Y$, split into real and
+          imaginary parts because the durable sidecar stores real arrays.
+        * ``suu``, ``sux_truth_re``/``_im``, ``sux_base_re``/``_im``, ``sux_full_re``/``_im`` --
+          the source side, absent when ``up_raw`` is ``None``.
+        * ``n_windows``, ``n_windows_possible`` -- the honest denominator and what it would have
+          been with no gaps.
+        * ``ss_detrended_base``/``_full`` -- the time-domain residual sum of squares under the same
+          taper and the same kept windows, which is the **exact** right-hand side of the Parseval
+          identity.
+        * ``ss_raw_base``/``_full`` -- the same without mean removal, for the loose magnitude
+          reconciliation against the block scores. The difference between the two *is* the
+          forecast's level error, which the spectrum by construction says nothing about.
+
+        Empty when ``layout.n_windows`` is zero -- a geometry too short to hold one window measures
+        nothing, and reporting zeros would be a measurement of that.
+    """
+    if int(layout.n_windows) <= 0:
+        return {}
+
+    device = target.device
+    window = torch.as_tensor(
+        spectra.welch_window(int(layout.nperseg)), dtype=torch.float64, device=device
+    )
+    weights = torch.as_tensor(
+        spectra.one_sided_weights(int(layout.nperseg)), dtype=torch.float64, device=device
+    )
+    taper_power = float(window.pow(2).sum())
+    denominator = float(layout.nperseg) * taper_power
+
+    keep = tau_slice_window_validity(mask, layout=layout).to(torch.float64)  # (B, H, W)
+    keep_bcast = keep[..., None]
+
+    def segments_of(block: torch.Tensor) -> torch.Tensor:
+        sliced = tau_slices(block.to(torch.float64), warmup=int(layout.warmup))
+        return _welch_segments(sliced, layout=layout, window=window)
+
+    truth = segments_of(target)
+    base = segments_of(mu_base)
+    full = segments_of(mu_full)
+
+    fourier = {
+        "truth": torch.fft.rfft(truth, dim=-1),
+        "base": torch.fft.rfft(base, dim=-1),
+        "full": torch.fft.rfft(full, dim=-1),
+    }
+
+    def accumulate(left: torch.Tensor, right: torch.Tensor) -> torch.Tensor:
+        r"""$\sum_W \mathrm{keep} \cdot c_k \overline{L_k} R_k / (N U)$, summed over windows."""
+        product = torch.conj(left) * right * weights
+        return (product * keep_bcast).sum(dim=2) / denominator
+
+    sums: Dict[str, torch.Tensor] = {
+        "sxx": accumulate(fourier["truth"], fourier["truth"]).real,
+        "syy_base": accumulate(fourier["base"], fourier["base"]).real,
+        "syy_full": accumulate(fourier["full"], fourier["full"]).real,
+        "n_windows": keep.sum(dim=2),
+        "n_windows_possible": torch.full_like(keep.sum(dim=2), float(layout.n_windows)),
+    }
+    for name, spectrum in (("base", fourier["base"]), ("full", fourier["full"])):
+        cross = accumulate(fourier["truth"], spectrum)
+        sums[f"sxy_{name}_re"] = cross.real
+        sums[f"sxy_{name}_im"] = cross.imag
+
+    # The time-domain side of the Parseval identity, accumulated independently of the FFT over the
+    # identical kept windows. `truth`/`base`/`full` are already detrended and tapered, so the
+    # difference of two of them is the tapered, detrended residual -- which is exactly what the
+    # left-hand side sums to, since removing each series' own mean removes the residual's.
+    for name, segments in (("base", base), ("full", full)):
+        detrended = segments - truth
+        sums[f"ss_detrended_{name}"] = (
+            (detrended.pow(2).sum(dim=-1) * keep).sum(dim=2) / taper_power
+        )
+
+    # The same without mean removal, for the magnitude check against the block scores. Re-cut from
+    # the raw blocks rather than reconstructed, because the level is precisely what the detrended
+    # form has discarded.
+    raw_residual = tau_slices((mu_base - target).to(torch.float64), warmup=int(layout.warmup))
+    raw_residual_full = tau_slices((mu_full - target).to(torch.float64), warmup=int(layout.warmup))
+    for name, series in (("base", raw_residual), ("full", raw_residual_full)):
+        segments = series.unfold(dimension=-1, size=int(layout.nperseg), step=int(layout.hop))
+        tapered = (segments * window).pow(2).sum(dim=-1)
+        sums[f"ss_raw_{name}"] = (tapered * keep).sum(dim=2) / taper_power
+
+    if up_raw is not None:
+        source = _welch_segments(
+            source_tau_slices(up_raw.to(torch.float64), layout=layout),
+            layout=layout,
+            window=window,
+        )
+        source_fourier = torch.fft.rfft(source, dim=-1)
+        sums["suu"] = accumulate(source_fourier, source_fourier).real
+        for name in ("truth", "base", "full"):
+            cross = accumulate(source_fourier, fourier[name])
+            sums[f"sux_{name}_re"] = cross.real
+            sums[f"sux_{name}_im"] = cross.imag
+
+    return sums
+
+
+# =============================================================================
 # Per-batch evaluation
 # =============================================================================
 #: The vector readouts, by attribute name. Every one is per sample on a :class:`BatchReadout` and
@@ -754,6 +1024,13 @@ class BatchReadout:
             branch's raw samples -- see :func:`calibration_sums`. Empty under ``'mse'``, where the
             decoder's log-variance head is never trained and a probability-integral transform of
             its output would be arithmetic over an untrained tensor.
+        spectral_sums: The $\tau$-slice cross-spectral sufficient statistics -- see
+            :func:`cross_spectral_sums`. Per sample and at full frequency resolution, $(B, H, F)$,
+            because the band collapse and the cohort pooling both need labels this layer does not
+            have. **Unconditional**, unlike ``retained``: the coherence analysis must be able to
+            run offline against a finished directory with no checkpoint, which is only possible if
+            the pass always wrote them -- exactly as ``horizon_sums`` is always written. Empty only
+            where the geometry cannot hold one Welch window.
     """
 
     guids: List[str]
@@ -776,6 +1053,7 @@ class BatchReadout:
     retained: Dict[str, torch.Tensor] = field(default_factory=dict)
     horizon_sums: Dict[str, torch.Tensor] = field(default_factory=dict)
     calibration_sums: Dict[str, torch.Tensor] = field(default_factory=dict)
+    spectral_sums: Dict[str, torch.Tensor] = field(default_factory=dict)
 
 
 def _per_sample_mean(per_anchor: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
@@ -1597,6 +1875,26 @@ def evaluate_batch(
         else {}
     )
 
+    # The tau-slice cross-spectra, over every sample of the pass. Unconditional, and deliberately
+    # not behind a retention cap: `retained` exists because a (T_valid, H, R) tensor is hundreds of
+    # kilobytes per sample, while these reduce to (H, F) per sample and reduce again to (H, B) on
+    # the durable sidecar. Making them optional would mean the coherence analysis is silent under
+    # the shipped `caps: {}` and cannot re-run offline, which is the property the whole
+    # collect-then-analyse split exists to have.
+    spectral = cross_spectral_sums(
+        target,
+        outputs["mu_base"],
+        outputs["mu_full"],
+        batch_field(batch, "up"),
+        mask,
+        layout=spectra.slice_geometry(
+            t_valid=geometry.t_valid,
+            warmup=geometry.warmup,
+            horizon=geometry.horizon,
+            raw_per_step=geometry.r,
+        ),
+    )
+
     # Built only when asked for: the names resolve against the forward's own outputs plus the
     # raw future, so a retained array cannot be a differently assembled version of what was
     # scored.
@@ -1632,6 +1930,7 @@ def evaluate_batch(
         attention_entropy_per_head=per_head_entropy,
         kld_per_head=_per_sample_vector_mean(outputs["kld_per_t_per_head"], kl_support),
         calibration_sums=calibration,
+        spectral_sums=spectral,
         n_control_pairs=n_control_pairs,
         n_same_recording_pairs=n_same_recording_pairs,
         per_anchor=per_anchor,
@@ -2554,12 +2853,18 @@ def evaluate(
             if on_batch is not None:
                 on_batch(batch, readout)
             # Released as soon as the sink has had them. The readouts are held for the whole
-            # loader so the aggregation can run over all of them at once, and the per-anchor and
-            # retained tensors are two to three orders of magnitude larger than the per-sample
-            # columns beside them -- keeping those alive for a full split would cost gigabytes
-            # for values nothing reads again.
+            # loader so the aggregation can run over all of them at once, and the per-anchor,
+            # retained and cross-spectral tensors are two to three orders of magnitude larger than
+            # the per-sample columns beside them -- keeping those alive for a full split would cost
+            # gigabytes for values nothing reads again.
+            #
+            # ``spectral_sums`` is the largest of the three and the easiest to overlook, because
+            # unlike ``retained`` it is populated unconditionally: fourteen $(B, H, F)$ float64
+            # arrays, $0.8$ MiB per segment, still on the model's device -- the sink copies them to
+            # host but that does not free the originals. Nothing after this loop reads it.
             readout.per_anchor = {}
             readout.retained = {}
+            readout.spectral_sums = {}
             if max_batches is not None and len(readouts) >= int(max_batches):
                 break
     finally:

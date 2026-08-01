@@ -220,6 +220,31 @@ def test_a_metric_the_table_does_not_carry_yields_no_pages_rather_than_raising()
     assert not len(tails["low"]) and not len(tails["high"])
 
 
+def test_the_two_tails_never_share_a_segment() -> None:
+    """Asking for more per tail than the split can fill lowers the count rather than overlapping.
+    A segment rendered into both ``_low/`` and ``_high/`` reads as simultaneously the best and the
+    worst case, and the ones that would double up sit nearest the median -- extreme in neither
+    direction."""
+    frame = pd.DataFrame({"guid": list("abcdefg"), "mc_pred_gap": [float(i) for i in range(7)]})
+
+    tails = samples_analysis.extreme_rows(frame, "mc_pred_gap", per_tail=10)
+
+    assert len(tails["low"]) == 3 and len(tails["high"]) == 3
+    assert set(tails["low"]["guid"]).isdisjoint(set(tails["high"]["guid"]))
+    # Still the actual extremes, taken from each end.
+    assert list(tails["low"]["guid"]) == ["a", "b", "c"]
+    assert list(tails["high"]["guid"]) == ["e", "f", "g"]
+
+
+def test_a_single_finite_value_is_not_reported_as_both_extremes() -> None:
+    """One value is one observation, not a low and a high."""
+    frame = pd.DataFrame({"guid": ["a", "b"], "mc_pred_gap": [1.0, np.nan]})
+
+    tails = samples_analysis.extreme_rows(frame, "mc_pred_gap", per_tail=10)
+
+    assert not len(tails["low"]) and not len(tails["high"])
+
+
 # =============================================================================
 # The analysis
 # =============================================================================

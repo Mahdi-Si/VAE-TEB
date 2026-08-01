@@ -122,7 +122,7 @@ def _note_empty(ax: Any) -> None:
         transform=ax.transAxes,
         ha="center",
         va="center",
-        fontsize=9,
+        fontsize=plt.rcParams["axes.labelsize"],
         color=COLOR_GRAY,
     )
 
@@ -166,12 +166,12 @@ def histogram_panel(
 
     ax.hist(finite, bins=int(bins), color=color, alpha=0.85, edgecolor=COLOR_BLACK, linewidth=0.3)
     median = float(np.median(finite))
-    ax.axvline(median, color=COLOR_VERMILLION, linestyle="--", linewidth=1.2,
+    ax.axvline(median, color=COLOR_VERMILLION, linestyle="--", linewidth=plt.rcParams["lines.linewidth"],
                label=f"median {median:.4g}")
     if reference is not None and np.isfinite(reference):
-        ax.axvline(float(reference), color=COLOR_GRAY, linestyle=":", linewidth=1.2,
+        ax.axvline(float(reference), color=COLOR_GRAY, linestyle=":", linewidth=plt.rcParams["lines.linewidth"],
                    label=reference_label or f"reference {float(reference):.4g}")
-    ax.legend(fontsize=7, loc="best")
+    ax.legend(loc="best")
     style_axes(ax)
     return int(finite.size)
 
@@ -234,8 +234,8 @@ def ribbon_plot(
             high = np.nanpercentile(curves, 75, axis=0)
 
     ax.fill_between(axis_x, low, high, color=color, alpha=0.25, linewidth=0, label="IQR")
-    ax.plot(axis_x, median, color=color, linewidth=1.4, label=label or "median")
-    ax.legend(fontsize=7, loc="best")
+    ax.plot(axis_x, median, color=color, linewidth=plt.rcParams["lines.linewidth"], label=label or "median")
+    ax.legend(loc="best")
     style_axes(ax)
     return int(np.isfinite(median).sum())
 
@@ -315,10 +315,10 @@ def heatmap_with_colorbar(
         interpolation=interpolation, extent=extent,
     )
     if separator_row is not None:
-        ax.axhline(float(separator_row) + 0.5, color=COLOR_BLACK, linewidth=0.8)
+        ax.axhline(float(separator_row) + 0.5, color=COLOR_BLACK, linewidth=plt.rcParams["axes.linewidth"])
     colorbar = fig.colorbar(image, ax=ax, fraction=0.025, pad=0.01)
     if colorbar_label:
-        colorbar.set_label(colorbar_label, fontsize=8)
+        colorbar.set_label(colorbar_label, fontsize=plt.rcParams["axes.labelsize"])
     colorbar.ax.tick_params(labelsize=7)
     style_axes(ax, grid="none")
     return image
@@ -367,7 +367,7 @@ def violin_panel(
     ax.set_title(title)
     ax.set_ylabel(ylabel)
     ax.set_xticks(np.arange(len(labels)) + 1.0)
-    ax.set_xticklabels(labels, rotation=20, ha="right", fontsize=7)
+    ax.set_xticklabels(labels, rotation=20, ha="right", fontsize=plt.rcParams["xtick.labelsize"])
 
     if not populated:
         _note_empty(ax)
@@ -388,12 +388,12 @@ def violin_panel(
         body.set_linewidth(0.4)
     if "cmedians" in parts:
         parts["cmedians"].set_color(COLOR_VERMILLION)
-        parts["cmedians"].set_linewidth(1.2)
+        parts["cmedians"].set_linewidth(plt.rcParams["lines.linewidth"])
 
     if reference is not None and np.isfinite(reference):
-        ax.axhline(float(reference), color=COLOR_GRAY, linestyle=":", linewidth=1.2,
+        ax.axhline(float(reference), color=COLOR_GRAY, linestyle=":", linewidth=plt.rcParams["lines.linewidth"],
                    label=reference_label or f"reference {float(reference):.4g}")
-        ax.legend(fontsize=7, loc="best")
+        ax.legend(loc="best")
     style_axes(ax)
     return len(populated)
 
@@ -422,6 +422,7 @@ def grouped_violin_figure(
     *,
     title_prefix: str = "",
     references: Optional[Any] = None,
+    colors: Optional[Any] = None,
 ) -> Tuple[Any, Any]:
     r"""Build a figure with one violin panel per metric, each split across the same groups.
 
@@ -434,13 +435,16 @@ def grouped_violin_figure(
         groups: The group labels, in the order the violins should appear.
         title_prefix: Prepended to each panel title, typically the grouping axis.
         references: Optional metric-to-reference-value mapping for a horizontal line.
+        colors: Optional label-to-colour mapping. ``None`` uses :func:`group_colors`; a caller
+            supplies one when its package draws cohorts from a palette of its own, so that its
+            grouped variants match the rest of its figures rather than this module's default.
 
     Returns:
         ``(fig, axes)``, unsaved and unclosed -- the caller owns both, so it can assert on the
         in-memory figure before it is written.
     """
     metrics = dict(values_by_metric)
-    colors = group_colors(groups)
+    colors = dict(colors) if colors is not None else group_colors(groups)
     reference_table = dict(references or {})
 
     fig, axes = new_figure(max(len(metrics), 1), height_per_row=3.0)
@@ -506,9 +510,9 @@ def multi_line_panel(
             continue
         colour = palette(row / max(int(field.shape[0]) - 1, 1))
         label = str(labels[row]) if row < len(labels) else f"group {row}"
-        ax.plot(axis_x, field[row], color=colour, linewidth=1.3, label=label)
+        ax.plot(axis_x, field[row], color=colour, linewidth=plt.rcParams["lines.linewidth"], label=label)
         drawn += 1
-    ax.legend(fontsize=6, loc="best", ncol=2)
+    ax.legend(loc="best", ncol=2)
     style_axes(ax)
     return drawn
 
@@ -521,7 +525,7 @@ def label_rows(ax: Any, labels: Sequence[str]) -> None:
         labels: One label per row, in row order.
     """
     ax.set_yticks(np.arange(len(labels)))
-    ax.set_yticklabels([str(label) for label in labels], fontsize=6)
+    ax.set_yticklabels([str(label) for label in labels], fontsize=plt.rcParams["ytick.labelsize"])
 
 
 def frequency_scatter(
@@ -591,13 +595,13 @@ def frequency_scatter(
     if shades is not None:
         colorbar = fig.colorbar(handle, ax=ax, fraction=0.025, pad=0.01)
         if colour_label:
-            colorbar.set_label(colour_label, fontsize=8)
+            colorbar.set_label(colour_label, fontsize=plt.rcParams["axes.labelsize"])
         colorbar.ax.tick_params(labelsize=7)
     if n_dropped:
         # In the legend rather than only in a CSV: a panel silently missing 14 of 43 channels
         # looks complete.
         ax.plot([], [], linestyle="none", label=f"{n_dropped} channel(s) with no centre frequency")
-        ax.legend(fontsize=6, loc="best")
+        ax.legend(loc="best")
     style_axes(ax)
     return handle
 
@@ -633,10 +637,10 @@ def label_channel_blocks(ax: Any, n_scattering: int, n_total: int) -> None:
         n_total: Total channel count $c_y$.
     """
     if 0 < int(n_scattering) < int(n_total):
-        ax.axhline(float(n_scattering) - 0.5, color=COLOR_BLACK, linewidth=0.8, linestyle="--")
+        ax.axhline(float(n_scattering) - 0.5, color=COLOR_BLACK, linewidth=plt.rcParams["axes.linewidth"], linestyle="--")
         ax.text(
             0.005, float(n_scattering) - 0.5, " phase-harmonic below",
-            transform=ax.get_yaxis_transform(), fontsize=6, va="bottom", color=COLOR_GRAY,
+            transform=ax.get_yaxis_transform(), fontsize=plt.rcParams["ytick.labelsize"], va="bottom", color=COLOR_GRAY,
         )
 
 

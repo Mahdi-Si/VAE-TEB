@@ -58,8 +58,13 @@ MANIFEST_FILENAME = "sample_pages.csv"
 #: How many pages the stratified draw renders when ``eval_config.caps.pages`` says nothing, and
 #: how many rows each extreme takes. Constants rather than settings: a page is a picture, and no
 #: number in any table depends on how many were drawn.
-DEFAULT_STRATIFIED_PAGES = 8
-EXTREME_PAGES_PER_TAIL = 2
+#:
+#: Ten per selection, so every directory under ``samples/`` holds the same number and a reader
+#: comparing two of them is comparing like with like. ``EXTREME_PAGES_PER_TAIL`` is an **upper**
+#: bound rather than a promise -- see :func:`extreme_rows`, which lowers it rather than let the two
+#: tails of one metric overlap.
+DEFAULT_STRATIFIED_PAGES = 10
+EXTREME_PAGES_PER_TAIL = 10
 
 #: The metrics the extremes are taken on, as ``(directory stem, column, ascending is "low")``.
 #: One per axis a page could be worth opening for: the coupling readout, the forecast score and
@@ -363,19 +368,31 @@ def stratified_rows(per_sample: pd.DataFrame, *, cap: int, seed: int) -> pd.Data
 def extreme_rows(per_sample: pd.DataFrame, column: str, *, per_tail: int) -> Dict[str, pd.DataFrame]:
     """Return the rows carrying the smallest and largest finite values of one column.
 
+    **The two tails are disjoint**, and on a small split that costs pages rather than correctness:
+    ``per_tail`` is lowered to half the finite rows when there are not enough to fill both. Taking
+    the head and the tail of fewer than $2 \\times$ ``per_tail`` rows would put the same segment in
+    ``<metric>_low/`` *and* ``<metric>_high/``, where it reads as simultaneously the best and the
+    worst case the model produced -- and the segments that double up are the ones nearest the
+    median, which are not extreme in either direction.
+
     Args:
         per_sample: The per-sample table.
         column: The metric to sort on.
-        per_tail: Rows per tail.
+        per_tail: Rows per tail, as an upper bound.
 
     Returns:
-        ``{'low': frame, 'high': frame}``, both empty when the column is absent or carries no
-        finite value.
+        ``{'low': frame, 'high': frame}``, disjoint, both empty when the column is absent or
+        carries no finite value.
     """
     if per_sample.empty or column not in per_sample.columns:
         return {"low": per_sample.head(0), "high": per_sample.head(0)}
     finite = per_sample[per_sample[column].notna()].sort_values(column)
-    return {"low": finite.head(int(per_tail)), "high": finite.tail(int(per_tail))}
+    per_tail = min(int(per_tail), len(finite) // 2)
+    if per_tail < 1:
+        # One finite value is not two extremes. Reporting it as both would be the same claim the
+        # disjointness rule above exists to prevent, made on the thinnest possible evidence.
+        return {"low": finite.head(0), "high": finite.head(0)}
+    return {"low": finite.head(per_tail), "high": finite.tail(per_tail)}
 
 
 # =============================================================================

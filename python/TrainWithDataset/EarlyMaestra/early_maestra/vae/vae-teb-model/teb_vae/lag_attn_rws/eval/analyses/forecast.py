@@ -55,6 +55,7 @@ from teb_vae.lag_attn_rws.eval._reuse import stats as shared_stats
 from teb_vae.lag_attn_rws.eval.frames import finite_column as _finite_column
 from teb_vae.lag_attn_rws.eval.frames import grouped_frame_entry
 from teb_vae.lag_attn_rws.eval.frames import per_recording_means
+from teb_vae.lag_attn_rws.eval.frames import skill_against
 from teb_vae.lag_attn_rws.eval.metrics import (
     BASELINE_LOGVAR,
     BASELINE_NAMES,
@@ -110,28 +111,6 @@ GROUPED_METRICS: Tuple[str, ...] = tuple(
 # =============================================================================
 # Skill
 # =============================================================================
-def skill_against(model: np.ndarray, baseline: np.ndarray) -> np.ndarray:
-    r"""Per-recording squared-error skill, $1 - \mathrm{MSE}_{\rm model}/\mathrm{MSE}_{\rm ref}$.
-
-    Computed per recording and then averaged, rather than as a ratio of the two averages. The two
-    differ, and this is the form the acceptance criteria are stated in: a forecast equal to the
-    truth scores exactly $1$ on **every** recording and a forecast equal to the baseline exactly
-    $0$ on every recording, so the mean carries those answers unchanged -- and a bootstrap over
-    recordings then has a per-recording quantity to resample.
-
-    Args:
-        model: Per-recording mean squared error of the model branch.
-        baseline: Per-recording mean squared error of the baseline.
-
-    Returns:
-        The per-recording skill, ``NaN`` wherever the baseline's error is zero or either value is
-        missing. A zero-error baseline is a degenerate recording -- a constant signal the baseline
-        reproduces exactly -- and dividing by it would report an infinite skill as evidence.
-    """
-    with np.errstate(divide="ignore", invalid="ignore"):
-        return np.where(baseline > 0.0, 1.0 - model / baseline, np.nan)
-
-
 def build_skill_rows(
     per_guid: pd.DataFrame, *, resamples: int, seed: int
 ) -> List[Dict[str, Any]]:
@@ -372,11 +351,11 @@ def build_baseline_figure(
         axis.barh(positions, values, color=figures.COLOR_BLUE, alpha=0.85, height=0.6)
         axis.errorbar(
             values, positions, xerr=np.vstack([low, high]),
-            fmt="none", ecolor=figures.COLOR_BLACK, elinewidth=1.0, capsize=3.0,
+            fmt="none", ecolor=figures.COLOR_BLACK, elinewidth=figures.LINE_REGULAR, capsize=3.0,
         )
-        axis.axvline(0.0, color=figures.COLOR_GRAY, linestyle=":", linewidth=1.2)
+        axis.axvline(0.0, color=figures.COLOR_GRAY, linestyle=":", linewidth=figures.LINE_REGULAR)
         axis.set_yticks(positions)
-        axis.set_yticklabels(labels, fontsize=7)
+        axis.set_yticklabels(labels, fontsize=figures.FONT_LABEL)
     else:
         axis.text(0.5, 0.5, figures.EMPTY_NOTE, ha="center", va="center", transform=axis.transAxes)
     axis.set_title(f"Squared-error skill, bootstrap CI over recordings (errors in {unit})")

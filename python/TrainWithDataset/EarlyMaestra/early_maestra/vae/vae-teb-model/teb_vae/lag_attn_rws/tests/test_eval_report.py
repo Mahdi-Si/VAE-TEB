@@ -39,7 +39,38 @@ def test_the_seam_binds_the_shared_implementations_rather_than_copies() -> None:
     assert report_seam.Report is shared_report.Report
     assert report_seam.StepRecord is shared_report.StepRecord
     assert report_seam.summarise_by_group is shared_report.summarise_by_group
-    assert report_seam.emit_grouped_variants is shared_report.emit_grouped_variants
+
+
+def test_the_grouped_emitter_delegates_rather_than_reimplementing(monkeypatch) -> None:
+    """The one seam entry that is not a bare binding, and the reason it must still not be a fork.
+
+    It adds this package's cohort order and palette -- two presentation decisions the sibling does
+    not make -- and nothing else. Asserted by intercepting the shared function: what reaches it is
+    the caller's own arguments plus exactly those two, so the skip rules, the counts and the
+    record's shape stay the shared ones. A reimplementation would pass every behavioural test in
+    ``test_eval_grouped.py`` and drift from the sibling's on the first change to either.
+    """
+    from teb_vae.lag_attn_rws.eval import cohort, figures_seam
+
+    seen = {}
+
+    def _spy(frame, directory, **kwargs):
+        seen.update({"frame": frame, "directory": directory, **kwargs})
+        return {"intercepted": True}
+
+    monkeypatch.setattr(shared_report, "emit_grouped_variants", _spy)
+    result = report_seam.emit_grouped_variants("frame", "dir", value_columns=["pred_gap"])
+
+    assert result == {"intercepted": True}
+    assert (seen["frame"], seen["directory"]) == ("frame", "dir")
+    assert seen["value_columns"] == ["pred_gap"]
+    # The two additions, checked by what they *do* rather than by identity: the ordering is a
+    # lambda over ``cohort.ordered_groups``, so only its result is comparable.
+    assert seen["group_palette"] is figures_seam.group_colors
+    assert seen["order_groups"](["hie", "acidosis", "healthy"], "clinical_class") == (
+        cohort.ordered_groups(["hie", "acidosis", "healthy"], "clinical_class")
+    ) == ["healthy", "acidosis", "hie"]
+    assert set(seen) == {"frame", "directory", "value_columns", "order_groups", "group_palette"}
 
 
 def test_the_runner_writes_its_summary_through_the_same_serialiser() -> None:
@@ -166,13 +197,19 @@ def test_an_unresolved_headline_path_yields_none_rather_than_raising() -> None:
     assert headline["verdict_source_specificity"] is None
 
 
-#: Headline names that exist only under a likelihood with a predictive distribution. Under
-#: ``'mse'`` the decoder's log-variance head is never fitted, so the calibration census is not
-#: computed at all -- and a number invented for it would be arithmetic over an untrained tensor.
-_CALIBRATION_HEADLINE_NAMES = (
+#: Headline names that exist only under a likelihood with a predictive distribution, for two
+#: unrelated reasons that happen to share a precondition.
+#:
+#: The calibration census: under ``'mse'`` the decoder's log-variance head is never fitted, so it
+#: is not computed at all -- and a number invented for it would be arithmetic over an untrained
+#: tensor. The likelihood-space percentage: under ``'mse'`` a block score is a sum of squared
+#: errors rather than a log-density, so exponentiating it yields no density ratio; the two
+#: error-space percentages beside it have no such precondition and must still resolve.
+_GAUSSIAN_NLL_ONLY_HEADLINE_NAMES = (
     "calibration_mean_standardised_sq",
     "calibration_pit_max_cdf_deviation",
     "calibration_nll_gain_per_raw_sample",
+    "pred_gap_mc_likelihood_pct",
 )
 
 
@@ -180,10 +217,10 @@ def test_every_headline_name_resolves_on_a_real_run(evaluated) -> None:
     """A registry entry whose path never resolves is a number the acceptance gate silently reads
     as absent, which is indistinguishable from an analysis that did not run.
 
-    The calibration entries are the one legitimate exception, and the exception is *conditional*
-    rather than a hole in the guard: they resolve under ``gaussian_nll`` and cannot exist under
-    ``mse``, which is what this fixture's checkpoint was trained under. Any other unresolved name
-    still fails here.
+    The likelihood-conditional entries are the one legitimate exception, and the exception is
+    *conditional* rather than a hole in the guard: they resolve under ``gaussian_nll`` and cannot
+    exist under ``mse``, which is what this fixture's checkpoint was trained under. Any other
+    unresolved name still fails here.
     """
     summary = evaluated["summary"]
     headline = summary["results"]["headline"]
@@ -193,7 +230,7 @@ def test_every_headline_name_resolves_on_a_real_run(evaluated) -> None:
         name for name, _ in report_seam.HEADLINE_SCALARS if headline.get(name) is None
     )
     expected = (
-        [] if likelihood == "gaussian_nll" else sorted(_CALIBRATION_HEADLINE_NAMES)
+        [] if likelihood == "gaussian_nll" else sorted(_GAUSSIAN_NLL_ONLY_HEADLINE_NAMES)
     )
     assert unresolved == expected
 
@@ -275,6 +312,11 @@ def test_the_sanity_block_appears_in_every_summary(evaluated) -> None:
         # model tests: a lag profile that does not sum to the KL decomposes nothing.
         "lag_map_sums_to_kl",
         "per_head_kl_sums_to_kl",
+        # The cross-spectral estimator's own: an exact Parseval identity between the FFT and the
+        # time domain, and a loose magnitude check that the spectral residual is the same size as
+        # the forecast error it describes.
+        "coherence_parseval",
+        "coherence_detrended_share",
         "per_file_counts",
         "classes_present",
         "target_not_truncated",

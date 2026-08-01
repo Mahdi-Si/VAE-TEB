@@ -163,6 +163,34 @@ def grouped_frame_entry(
     }
 
 
+def skill_against(model: np.ndarray, baseline: np.ndarray) -> np.ndarray:
+    r"""Per-recording squared-error skill, $1 - \mathrm{MSE}_{\rm model}/\mathrm{MSE}_{\rm ref}$.
+
+    Computed per recording and then averaged, rather than as a ratio of the two averages. The two
+    differ, and this is the form the acceptance criteria are stated in: a forecast equal to the
+    truth scores exactly $1$ on **every** recording and a forecast equal to the baseline exactly
+    $0$ on every recording, so the mean carries those answers unchanged -- and a bootstrap over
+    recordings then has a per-recording quantity to resample.
+
+    It lives here rather than in the analysis that needed it first because two of them need it
+    now: ``forecast`` scores each model branch against the three trivial baselines, and
+    ``coupling`` scores the source-conditioned branch against the target-only one to say what
+    percentage of the forecast error the source removed. An analysis may not import another, and
+    a second copy of this arithmetic is exactly the drift the layering rule exists to prevent.
+
+    Args:
+        model: Per-recording mean squared error of the model branch.
+        baseline: Per-recording mean squared error of the baseline.
+
+    Returns:
+        The per-recording skill, ``NaN`` wherever the baseline's error is zero or either value is
+        missing. A zero-error baseline is a degenerate recording -- a constant signal the baseline
+        reproduces exactly -- and dividing by it would report an infinite skill as evidence.
+    """
+    with np.errstate(divide="ignore", invalid="ignore"):
+        return np.where(baseline > 0.0, 1.0 - model / baseline, np.nan)
+
+
 def finite_column(frame: pd.DataFrame, name: str) -> np.ndarray:
     """Return one column as a float array, or all-``NaN`` when the frame does not carry it.
 

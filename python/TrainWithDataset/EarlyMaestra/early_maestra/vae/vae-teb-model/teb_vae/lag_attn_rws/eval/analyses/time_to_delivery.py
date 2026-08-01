@@ -153,13 +153,16 @@ def _class_samples(frame: pd.DataFrame, column: str) -> Tuple[Dict[str, np.ndarr
 
     Returns:
         ``(usable, excluded)`` -- the classes with at least ``MIN_GROUP_SIZE`` recordings, and the
-        sizes of those without. The exclusion is returned rather than dropped because "this class
-        had two recordings in this window" is the explanation for a window the test skipped, and a
-        reader who cannot see it will assume the comparison was made.
+        sizes of those without, both in the canonical healthy / acidosis / HIE order. The
+        exclusion is returned rather than dropped because "this class had two recordings in this
+        window" is the explanation for a window the test skipped, and a reader who cannot see it
+        will assume the comparison was made.
     """
     usable: Dict[str, np.ndarray] = {}
     excluded: Dict[str, int] = {}
-    for group in sorted(set(frame["group"].astype(str))):
+    for group in cohort.ordered_groups(
+        sorted(set(frame["group"].astype(str))), labels.CLASS_COLUMN
+    ):
         values = np.asarray(
             frame.loc[frame["group"].astype(str) == group, column], dtype=np.float64
         )
@@ -188,7 +191,9 @@ def analyse_windows(
         two classes -- the ordinary outcome on the healthy-only pretraining split, not a failure.
     """
     groups = (
-        sorted(set(per_recording["group"].astype(str)))
+        cohort.ordered_groups(
+            sorted(set(per_recording["group"].astype(str))), labels.CLASS_COLUMN
+        )
         if not per_recording.empty and "group" in per_recording.columns
         else []
     )
@@ -407,14 +412,14 @@ def _draw_panel(ax: Any, rows: Sequence[Dict[str, Any]], axis: str, *, title: st
     if not groups:
         ax.text(
             0.5, 0.5, figures.EMPTY_NOTE, transform=ax.transAxes,
-            ha="center", va="center", fontsize=9, color=figures.COLOR_GRAY,
+            ha="center", va="center", fontsize=figures.FONT_NOTE, color=figures.COLOR_GRAY,
         )
         ax.set_title(title)
         figures.style_axes(ax)
         return 0
 
-    # From the one shared mapping, so a cohort is the same colour here as on every other figure
-    # this repository draws of it.
+    # From this package's one cohort palette, so a class is the same green / amber / red here as
+    # on every other figure this evaluation draws of it.
     colours = figures.group_colors(groups)
     for group in groups:
         cell = sorted(
@@ -432,7 +437,7 @@ def _draw_panel(ax: Any, rows: Sequence[Dict[str, Any]], axis: str, *, title: st
         )
         ax.plot(
             x, np.array([row["median"] for row in cell], dtype=np.float64),
-            marker="o", markersize=3, color=colour, linewidth=1.4,
+            marker="o", markersize=3, color=colour, linewidth=figures.LINE_EMPHASIS,
             label=f"{group} (n={int(sum(row['n_recordings'] for row in cell))})",
         )
         for row in cell:
@@ -440,14 +445,14 @@ def _draw_panel(ax: Any, rows: Sequence[Dict[str, Any]], axis: str, *, title: st
                 str(int(row["n_recordings"])),
                 (float(row["bin_center_h"]), float(row["median"])),
                 textcoords="offset points", xytext=(0, 5), ha="center",
-                fontsize=5, color=colour,
+                fontsize=figures.FONT_TINY, color=colour,
             )
     ax.set_title(title)
     ax.set_xlabel("Time before delivery (hours)")
     ax.set_ylabel("nats per anchor")
     # Delivery sits at the right, so the eye reads left to right toward it.
     ax.invert_xaxis()
-    ax.legend(fontsize=7, loc="best")
+    ax.legend(fontsize=figures.FONT_LABEL, loc="best")
     figures.style_axes(ax)
     return len(groups)
 

@@ -212,9 +212,26 @@ def trajectory_rows(
 def ordered_groups(groups: Sequence[str], axis: str) -> List[str]:
     """Return cohort labels in a stable, human-meaningful order.
 
+    **This is the evaluation's one cohort order**, and every table and figure that resolves a
+    quantity by cohort reads it: the grouped violin fan-out, the trajectories, the significance
+    tables, the stratified lag profiles and the conditioned-coupling violins alike. Alphabetical
+    is the default everywhere it is not called, and alphabetical is wrong in a specific way -- it
+    puts ``acidosis`` before ``healthy`` on every class figure, and on the subgroup axis it
+    interleaves the three classes (``acidosis_cs``, ``acidosis_no_cs``, ``healthy_bg_cs``, ...) so
+    that neither the severity ordering nor the background/caesarean structure is visible.
+
+    The order is severity-ascending on both axes, which is also the order the two source tables
+    already carry: :data:`~teb_vae.lag_attn.eval.labels.CLASS_NAMES` is keyed by the dataset's own
+    class codes $1, 2, 3$, and :data:`~teb_vae.lag_attn.eval.labels.CANONICAL_SUBGROUPS` is
+    written in the intended order. Neither is restated here, so a subgroup added to the dataset
+    appears in the figures without an edit to this module.
+
     Args:
         groups: The labels present.
-        axis: The cohort axis, choosing the canonical order.
+        axis: The cohort axis, choosing the canonical order. An axis that is neither the class nor
+            the subgroup column -- ``lag_kl``'s time-window axis is the one such caller -- matches
+            nothing and falls through to the alphabetical order, which is the previous behaviour
+            rather than a new one.
 
     Returns:
         Classes in healthy / acidosis / HIE order, subgroups in canonical order, with anything
@@ -259,7 +276,9 @@ def cohort_counts(frame: pd.DataFrame, column: str) -> Dict[str, Dict[str, int]]
         column: The cohort axis.
 
     Returns:
-        ``{'segments': {...}, 'recordings': {...}}``, skipping unlabelled rows.
+        ``{'segments': {...}, 'recordings': {...}}``, skipping unlabelled rows. Both are keyed in
+        the canonical cohort order rather than by descending count, so the population block of a
+        summary reads in the same order as the figures beside it.
     """
     if frame.empty or column not in frame.columns:
         return {"segments": {}, "recordings": {}}
@@ -270,9 +289,13 @@ def cohort_counts(frame: pd.DataFrame, column: str) -> Dict[str, Dict[str, int]]
         if "guid" in labelled.columns
         else segments.iloc[:0]
     )
-    return {
+    counted = {
         "segments": {str(name): int(count) for name, count in segments.items()},
         "recordings": {str(name): int(count) for name, count in recordings.items()},
+    }
+    return {
+        level: {name: table[name] for name in ordered_groups(list(table), column)}
+        for level, table in counted.items()
     }
 
 

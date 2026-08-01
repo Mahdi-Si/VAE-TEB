@@ -155,11 +155,33 @@ def test_the_limitations_record_what_the_evaluation_closed_and_what_it_did_not(d
         "Lag ablation",          # blocked model-side, with the reason restated
         "Necessity is not measured",
         "raw target history",    # the oracle's conditioning, hence estimate not bound
-        "spectral analysis",     # deferred: the VLF band the geometry cannot deliver
+        # Answered by the coherence analysis; what remains is below delta-f and time-resolved.
+        "spectral analysis",
         "distributional distances",
         "held-out clinical discrimination",
     ):
         assert absence.lower() in limitations.lower(), f"DESIGN.md §11 no longer names: {absence}"
+
+
+def test_the_spectral_limitation_records_what_the_coherence_analysis_closed(design):
+    """The one bullet in §11 whose stated reason has since been *answered* rather than merely
+    outlived.
+
+    A limitation that is quietly deleted the day it stops binding leaves no record that it ever
+    did, and a reader of the next spectral question re-derives the same objection from scratch. A
+    limitation left standing after it has been closed is worse: it reads as an oversight and sends
+    that reader looking for an analysis that already exists. So the bullet has to do both -- name
+    what closed it, and name what genuinely remains.
+    """
+    limitations = design[design.index("## 11.") : design.index("## 12.")].lower()
+
+    # What closed it, and the resolution that did.
+    assert "coherence" in limitations
+    assert "7.8" in limitations
+    assert "tau" in limitations or r"\tau" in limitations
+    # And the three absences that survive, each named rather than implied.
+    assert "non-stationary" in limitations
+    assert "absolute band power" in limitations
 
 
 def test_the_closeout_names_the_evaluation_commands(design):

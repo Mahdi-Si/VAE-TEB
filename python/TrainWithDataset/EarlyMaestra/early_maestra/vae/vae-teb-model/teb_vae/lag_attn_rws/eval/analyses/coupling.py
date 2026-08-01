@@ -28,6 +28,31 @@ how many recordings were dropped for carrying no finite value.
 one of fifty nats over two thousand are not the same finding, and a point estimate renders them
 identically. So: a percentile bootstrap over *recordings*, and a paired signed-rank test on the
 per-recording block scores, which is the paired form because each recording contributes both.
+
+**The same answer as a percentage.** Nats are the objective's units and say nothing about
+proportion: whether $3$ nats over a $480$-sample block is a large improvement or a negligible one
+is not readable off the number, and two checkpoints whose block scores differ in scale cannot be
+compared on it at all. Three percentages are reported beside it, in the two spaces where a ratio
+has a natural zero:
+
+* ``pred_gap_rmse_pct`` $= 100\left(1 - \mathrm{RMSE}_{\mathrm{full}}/\mathrm{RMSE}_{\mathrm{base}}
+  \right)$ -- the percentage of the point-forecast error the source removed. **Scale-free**, so it
+  is the same number in $z$ units and in bpm.
+* ``pred_gap_mse_pct`` $= 100\left(1 - \mathrm{MSE}_{\mathrm{full}}/\mathrm{MSE}_{\mathrm{base}}
+  \right)$ -- the ``mse_skill`` convention the forecast analysis already reports against the
+  trivial baselines, here applied source-versus-no-source.
+* ``pred_gap_mc_likelihood_pct`` $= 100\left(e^{\Delta/(H \cdot R)} - 1\right)$ -- the percentage
+  form of the headline nats themselves: how much more probability density the source-conditioned
+  forecast puts on each observed raw sample. **Under ``gaussian_nll`` only**: under ``mse`` a block
+  score is a sum of squared errors rather than a log density, so its exponential is not a density
+  ratio, and the column is omitted with its reason rather than emitted with a false unit.
+
+**No percentage is a ratio of the two block scores**, and that is a correctness boundary rather
+than a stylistic choice. $D_{\mathrm{base}}$ is a negative log *density* summed over $H \cdot R$
+raw samples: it has no natural zero and is legitimately negative for a sharp forecast, so
+$\Delta / D_{\mathrm{base}}$ changes sign with its own denominator and is unbounded near it. The
+forecast analysis states the same rule for the same reason, which is why its NLL-space column is
+a difference rather than $1 -$ a ratio.
 """
 from __future__ import annotations
 
@@ -46,6 +71,7 @@ from teb_vae.lag_attn_rws.eval.frames import (
     per_recording_means,
     positive_fraction,
     scored_sample_count,
+    skill_against,
 )
 
 #: This analysis's own subdirectory inside the results directory.
@@ -55,8 +81,9 @@ ANALYSIS_DIRNAME = "coupling"
 PER_RECORDING_FILENAME = "coupling_per_recording.csv"
 SUMMARY_FILENAME = "coupling_summary.csv"
 
-#: The figure, named as ``FIGURE_GUIDE.md`` names it.
+#: The figures, named as ``FIGURE_GUIDE.md`` names them.
 DISTRIBUTION_FIGURE = "pred_gap_distribution.pdf"
+PERCENT_FIGURE = "pred_gap_percent.pdf"
 
 #: The two ``pred_gap`` estimators, each with the path it was computed on. The label travels with
 #: the column into every row this analysis writes: the block score difference is the same
@@ -88,6 +115,21 @@ KL_COLUMNS: Tuple[str, ...] = (
     "source_conditioned_kl_shuffled_raw",
 )
 
+#: The two branches' mean squared forecast error, per scored raw sample, base first. Reduced here
+#: only because the error-space percentages are ratios of them; the forecast analysis reports the
+#: errors themselves, and this one reports what the source did to them.
+SQUARED_ERROR_COLUMNS: Tuple[str, str] = ("sq_error_base", "sq_error_full")
+
+#: The likelihood the **likelihood-space** percentage is defined under, and only that one.
+#:
+#: Exponentiating a block score is meaningful only where the score is a log-density. Under
+#: ``'mse'`` it is a plain sum of squared errors -- ``metrics.marginalise_block_scores`` says so and
+#: marginalises by averaging rather than by ``logsumexp`` for the same reason -- so
+#: $e^{\Delta/(H \cdot R)}$ is not a density ratio, is not a probability of anything, and is out by
+#: a factor of two even against the most charitable unit-variance reading. The error-space
+#: percentages are unaffected: a squared error is a squared error under either likelihood.
+LIKELIHOOD_PERCENT_REQUIRES = "gaussian_nll"
+
 #: Every per-sample column this analysis reduces per recording.
 VALUE_COLUMNS: Tuple[str, ...] = (
     "mc_pred_gap",
@@ -97,13 +139,62 @@ VALUE_COLUMNS: Tuple[str, ...] = (
     "nll_base_block",
     "nll_full_block",
     *KL_COLUMNS,
+    *SQUARED_ERROR_COLUMNS,
 )
+
+#: The percentage readouts, each with the space it is measured in. Derived per recording from the
+#: columns above rather than accumulated in the collection pass, which is what keeps an offline
+#: ``--only coupling`` re-run able to produce them from the tables alone.
+#:
+#: The arithmetic is written out in :func:`percent_columns` rather than tabled here as callables:
+#: three explicit expressions can be checked against the documentation by reading them, and a
+#: registry of lambdas cannot.
+PERCENT_COLUMNS: Tuple[Tuple[str, str], ...] = (
+    (
+        "pred_gap_rmse_pct",
+        "error space: 100 * (1 - RMSE_full / RMSE_base), the percentage of the point-forecast "
+        "error the source removed. Scale-free, so identical in z units and in bpm",
+    ),
+    (
+        "pred_gap_mse_pct",
+        "error space: 100 * (1 - MSE_full / MSE_base), the mse_skill convention applied "
+        "source-versus-no-source rather than model-versus-baseline",
+    ),
+    (
+        "pred_gap_mc_likelihood_pct",
+        "likelihood space: 100 * (exp(mc_pred_gap / (H*R)) - 1), how much more probability "
+        "density the source-conditioned forecast puts on each observed raw sample. H*R is the "
+        "fixed block size, not a per-anchor scored-sample count, so this understates the "
+        "improvement on any anchor with masked forecast steps",
+    ),
+)
+
+#: The two error-space percentages, and the likelihood-space one, named rather than positional.
+#: The figure draws the first pair on one axis and the third on its own, and the split is a
+#: statement about what shares a scale -- not something a reader should have to infer from the
+#: registry's ordering.
+ERROR_SPACE_PERCENTS: Tuple[str, str] = ("pred_gap_rmse_pct", "pred_gap_mse_pct")
+LIKELIHOOD_SPACE_PERCENT = "pred_gap_mc_likelihood_pct"
+
+#: The one promoted to the histogram and to the by-cohort fan-out. Root-mean-square rather than
+#: mean-square for the same reason ``GROUPED_METRICS`` promotes it: the two are one ratio under a
+#: root, and the rooted one is the figure a reader can state in a sentence about a trace.
+HEADLINE_PERCENT = ERROR_SPACE_PERCENTS[0]
 
 #: The subset worth resolving by cohort. Both ``pred_gap`` estimators and the KL beside them, not
 #: the four block scores those two gaps are the differences of: a grouped figure with eight panels
 #: is one nobody reads, and the block scores are dominated by how forecastable a recording is
 #: rather than by what the source added to it.
-GROUPED_METRICS: Tuple[str, ...] = ("mc_pred_gap", "pred_gap", *KL_COLUMNS)
+#:
+#: One percentage joins them, not three. ``pred_gap_mse_pct`` is a monotone restatement of
+#: ``pred_gap_rmse_pct`` -- the same recordings in the same order -- so a second panel of it would
+#: cost a reader's attention and tell them nothing the first did not.
+GROUPED_METRICS: Tuple[str, ...] = (
+    "mc_pred_gap",
+    "pred_gap",
+    *KL_COLUMNS,
+    HEADLINE_PERCENT,
+)
 
 
 def build_gap_rows(
@@ -157,6 +248,180 @@ def build_gap_rows(
     return rows
 
 
+def raw_samples_per_anchor(record: Dict[str, Any]) -> Optional[float]:
+    r"""$H \cdot R$, the raw samples one anchor's forecast block covers, or ``None``.
+
+    Read off the collection record's geometry block rather than assumed, because it is the
+    denominator that turns a block score into a per-sample one and a wrong constant there would
+    rescale the likelihood percentage silently.
+
+    Args:
+        record: The collection record. An offline re-run against a directory whose record carries
+            no geometry block passes an empty mapping.
+
+    Returns:
+        $H \cdot R$ as a float, or ``None`` when the geometry is absent or degenerate. ``None``
+        means the likelihood-space percentage is not computed at all -- reported as a skip rather
+        than as a number divided by a guess.
+    """
+    geometry = record.get("geometry") or {}
+    horizon = geometry.get("horizon")
+    raw_per_step = geometry.get("raw_per_step")
+    if horizon is None or raw_per_step is None:
+        return None
+    total = float(horizon) * float(raw_per_step)
+    return total if total > 0.0 else None
+
+
+def likelihood_percent_support(record: Dict[str, Any]) -> Dict[str, Any]:
+    """Whether the likelihood-space percentage is defined for this run, and if not, why not.
+
+    Two independent preconditions, reported separately because they fail for unrelated reasons and
+    an operator reading a skip needs to know which one it was: the run must have been scored under
+    a likelihood whose block score is a log-density, and the block size that score is divided by
+    must be known.
+
+    Args:
+        record: The collection record, read for ``likelihood`` and ``geometry``.
+
+    Returns:
+        A skip record in this package's usual shape -- ``skipped`` with a ``reason`` beside it --
+        carrying the resolved block size, which is ``None`` exactly when the percentage is skipped.
+    """
+    likelihood = str(record.get("likelihood") or "")
+    samples_per_anchor = raw_samples_per_anchor(record)
+    if not likelihood:
+        # Unknown is a skip, not a pass. The record has carried this key since before the
+        # percentage existed, so an absent one means something is wrong with the tables rather
+        # than that the run is old -- and the failure mode this whole precondition exists to
+        # prevent is emitting a number whose units nobody checked.
+        reason = "the collection record does not say which likelihood the run was scored under"
+    elif likelihood != LIKELIHOOD_PERCENT_REQUIRES:
+        reason = (
+            f"likelihood={likelihood!r}: a block score is a sum of squared errors rather than a "
+            f"log-density, so exponentiating it does not yield a density ratio"
+        )
+    elif samples_per_anchor is None:
+        reason = "the collection record carries no usable geometry, so H*R is unknown"
+    else:
+        reason = ""
+    return {
+        "skipped": bool(reason),
+        "reason": reason or None,
+        "likelihood": likelihood or None,
+        "raw_samples_per_anchor": None if reason else samples_per_anchor,
+    }
+
+
+def percent_columns(
+    per_guid: pd.DataFrame, *, samples_per_anchor: Optional[float]
+) -> Dict[str, np.ndarray]:
+    r"""The three percentage readouts, one value per recording.
+
+    Every one is computed **per recording and then averaged**, never as a ratio of two averages --
+    the rule :func:`~teb_vae.lag_attn_rws.eval.frames.skill_against` states and the rest of this
+    pipeline's aggregation chain obeys. It is also what gives the bootstrap a per-recording
+    quantity to resample.
+
+    Args:
+        per_guid: Per-recording means, carrying the two branches' squared error and the gap.
+        samples_per_anchor: $H \cdot R$, or ``None`` to omit the likelihood-space percentage.
+
+    Returns:
+        Name to per-recording values, ``NaN`` wherever a recording measured nothing. The
+        likelihood entry is **absent** rather than all-``NaN`` when ``samples_per_anchor`` is
+        ``None``, so a reader can tell "not computed" from "computed and unmeasurable".
+    """
+    # ``skill_against`` guards the denominator at strictly positive and fails to NaN: a recording
+    # whose target-only branch has zero error is degenerate, and an infinite percentage reported
+    # as evidence is worse than an absent one.
+    base_column, full_column = SQUARED_ERROR_COLUMNS
+    mse_skill = skill_against(
+        finite_column(per_guid, full_column), finite_column(per_guid, base_column)
+    )
+    # The RMSE ratio is $1 - \mathrm{skill}$ exactly, so taking the root of that rather than
+    # dividing a second time means the two error-space percentages share one guard and cannot
+    # disagree about the sign. The radicand is a ratio of two means of squares and so is never
+    # negative; ``errstate`` is here for the NaNs the guard above introduces, not for that.
+    with np.errstate(invalid="ignore"):
+        rmse_ratio = np.sqrt(1.0 - mse_skill)
+    rmse_name, mse_name = ERROR_SPACE_PERCENTS
+    columns: Dict[str, np.ndarray] = {
+        rmse_name: 100.0 * (1.0 - rmse_ratio),
+        mse_name: 100.0 * mse_skill,
+    }
+    if samples_per_anchor is not None:
+        # ``expm1`` rather than ``exp(x) - 1``: the exponent here is a per-anchor gap divided by
+        # several hundred, so it is small, and the subtraction would cancel away most of the
+        # significant digits of the answer.
+        columns[LIKELIHOOD_SPACE_PERCENT] = 100.0 * np.expm1(
+            finite_column(per_guid, "mc_pred_gap") / float(samples_per_anchor)
+        )
+    return columns
+
+
+def build_percent_rows(
+    per_guid: pd.DataFrame, *, resamples: int, seed: int
+) -> List[Dict[str, Any]]:
+    """Summarise each percentage over the recordings, with its uncertainty and its denominator.
+
+    Args:
+        per_guid: Per-recording means, **after** :func:`percent_columns` has been written onto it.
+        resamples: Bootstrap resamples, from ``eval_config.bootstrap_resamples``.
+        seed: Bootstrap seed, from ``eval_config.seed``.
+
+    Returns:
+        One row per percentage present on the frame, carrying the mean and its interval, the
+        quartiles, and the fraction of recordings the source helped **with its denominator**. A
+        percentage the frame does not carry yields no row rather than a row of ``NaN``.
+    """
+    rows: List[Dict[str, Any]] = []
+    for name, path in PERCENT_COLUMNS:
+        if name not in per_guid.columns:
+            continue
+        values = finite_column(per_guid, name)
+        interval = shared_stats.bootstrap_ci(values, resamples=resamples, seed=seed)
+        positive = positive_fraction(values)
+        rows.append(
+            {
+                "metric": name,
+                "source_column": name,
+                "score_path": path,
+                **{key: value for key, value in describe(values).items() if key != "metric"},
+                "ci_lo": interval["lo"],
+                "ci_hi": interval["hi"],
+                "ci_method": interval["method"],
+                "bootstrap_resamples": int(interval["resamples"]),
+                "positive_fraction": positive["fraction"],
+                "n_positive": positive["n_positive"],
+                "n_recordings_scored": positive["n"],
+                "n_recordings_dropped_not_finite": positive["n_dropped_not_finite"],
+            }
+        )
+    return rows
+
+
+def percent_headline(rows: Sequence[Dict[str, Any]]) -> Dict[str, float]:
+    """The percentage point estimates, flattened for the headline registry.
+
+    A name whose mean is not finite is **omitted** rather than carried as ``NaN``. The headline's
+    own consistency check fails on a non-finite number and passes on an absent one, and the two
+    say different things: ``None`` is "this run did not measure it", where ``NaN`` in a block of
+    finite scalars reads as a broken readout.
+
+    Args:
+        rows: The percentage summary rows.
+
+    Returns:
+        Metric name to its mean over recordings, carrying only the finite ones.
+    """
+    return {
+        str(row["metric"]): float(row["mean"])
+        for row in rows
+        if np.isfinite(row["mean"])
+    }
+
+
 def build_kl_rows(
     per_guid: pd.DataFrame, *, resamples: int, seed: int
 ) -> List[Dict[str, Any]]:
@@ -195,6 +460,32 @@ def build_kl_rows(
     return rows
 
 
+def _shade_mean_interval(axis: Any, row: Dict[str, Any]) -> None:
+    """Shade a summary row's bootstrap interval across a histogram, and label it as the mean's.
+
+    Shared by the two figures this module draws rather than written twice, because they ship side
+    by side: a divergence in the alpha, the colour or the label's wording would read as a
+    difference between the two findings rather than as an editing accident.
+
+    Shaded rather than drawn as a point range for the reason the label spells out -- an interval on
+    the *mean* over a distribution of per-recording values is routinely far narrower than the data,
+    and a point range invites reading it as the spread.
+
+    Args:
+        axis: The histogram panel to shade.
+        row: A summary row carrying ``ci_lo`` and ``ci_hi``. A row missing either, or carrying a
+            non-finite bound, is left undrawn rather than shaded over an invented range.
+    """
+    low, high = row.get("ci_lo"), row.get("ci_hi")
+    if low is None or high is None or not np.isfinite(low) or not np.isfinite(high):
+        return
+    axis.axvspan(
+        float(low), float(high), color=figures.COLOR_ORANGE, alpha=0.25, zorder=0,
+        label=f"95% CI of the mean [{float(low):.4g}, {float(high):.4g}]",
+    )
+    axis.legend(fontsize=figures.FONT_LABEL, loc="best")
+
+
 def build_distribution_figure(
     per_guid: pd.DataFrame, gap_rows: Sequence[Dict[str, Any]]
 ) -> Any:
@@ -227,21 +518,72 @@ def build_distribution_figure(
         reference=0.0,
         reference_label="no improvement",
     )
-    low, high = headline.get("ci_lo"), headline.get("ci_hi")
-    if low is not None and high is not None and np.isfinite(low) and np.isfinite(high):
-        # The interval on the *mean*, drawn over the distribution of the values it summarises.
-        # Shaded rather than plotted as a point range so it cannot be misread as a data range.
-        axis.axvspan(
-            float(low), float(high), color=figures.COLOR_ORANGE, alpha=0.25, zorder=0,
-            label=f"95% CI of the mean [{float(low):.4g}, {float(high):.4g}]",
-        )
-        axis.legend(fontsize=7, loc="best")
+    _shade_mean_interval(axis, headline)
 
     figures.violin_panel(
         axes[1, 0],
         {name: finite_column(per_guid, column) for name, column, _ in PRED_GAP_COLUMNS},
         title="pred_gap per recording, by estimator",
         ylabel="nats per anchor",
+        reference=0.0,
+        reference_label="no improvement",
+    )
+    return figure
+
+
+def build_percent_figure(
+    per_guid: pd.DataFrame, percent_rows: Sequence[Dict[str, Any]]
+) -> Any:
+    """Draw the three percentages, with the two spaces kept on separate axes.
+
+    Three panels rather than one, and the split is the content. The two error-space percentages
+    share a panel because they are the same ratio under a root and are therefore the same order of
+    magnitude. The likelihood-space one gets its own axis because it is *not*: a per-sample
+    density ratio and an error reduction routinely differ by an order of magnitude, and one shared
+    axis would flatten whichever is smaller into a line at zero and report it as nothing.
+
+    Args:
+        per_guid: Per-recording means carrying the percentage columns.
+        percent_rows: The summary rows, read for the headline percentage's interval.
+
+    Returns:
+        The figure; the caller renders and closes it.
+    """
+    figure, axes = figures.new_figure(3)
+    headline = next(
+        (row for row in percent_rows if row.get("metric") == HEADLINE_PERCENT), {}
+    )
+
+    axis = axes[0, 0]
+    figures.histogram_panel(
+        axis,
+        finite_column(per_guid, HEADLINE_PERCENT),
+        title=(
+            f"{HEADLINE_PERCENT} per recording, "
+            f"n = {int(headline.get('n_recordings_scored') or 0)}"
+        ),
+        xlabel="percent of the target-only forecast error removed",
+        reference=0.0,
+        reference_label="no improvement",
+    )
+    _shade_mean_interval(axis, headline)
+
+    figures.violin_panel(
+        axes[1, 0],
+        {name: finite_column(per_guid, name) for name in ERROR_SPACE_PERCENTS},
+        title="error space: percent of the forecast error the source removed",
+        ylabel="percent",
+        reference=0.0,
+        reference_label="no improvement",
+    )
+    # A column the run did not produce reads back as all-NaN, which the panel draws as its empty
+    # note -- so a run scored under 'mse', or one whose geometry was unavailable, says "not
+    # measured" on the page rather than dropping a panel and changing the figure's shape.
+    figures.violin_panel(
+        axes[2, 0],
+        {LIKELIHOOD_SPACE_PERCENT: finite_column(per_guid, LIKELIHOOD_SPACE_PERCENT)},
+        title="likelihood space: extra density on each observed raw sample",
+        ylabel="percent",
         reference=0.0,
         reference_label="no improvement",
     )
@@ -258,43 +600,71 @@ def run_coupling_analysis(
     """Report both coupling readouts per recording, with intervals and honest denominators.
 
     Args:
-        context: The analysis context, read for the collected per-sample table.
+        context: The analysis context, read for the collected per-sample table and -- for the
+            block size the likelihood percentage divides by -- the collection record.
         eval_config: The validated block, for the bootstrap settings.
         output_dir: The results directory; this analysis writes into its own subdirectory.
         probe: The loader probe's record. Unused: the population this analysis describes is the
             set of recordings that scored an anchor, which only the table knows.
 
     Returns:
-        The protocol's keys plus the two summary tables and the paths written.
+        The protocol's keys, the gap rows in both estimators, the three percentage rows with the
+        flat block the headline registry reads, the KL rows, and the paths written.
     """
     per_sample = context.collection.per_sample
     directory = Path(output_dir) / ANALYSIS_DIRNAME
     directory.mkdir(parents=True, exist_ok=True)
 
     per_guid = per_recording_means(per_sample, VALUE_COLUMNS)
+    # The percentages are derived here and written onto the frame *before* it is saved, so the
+    # per-recording table carries them beside the values they came from -- which is what lets the
+    # runner's by-cohort fan-out resolve one of them without a second reduction.
+    support = likelihood_percent_support(context.collection.record or {})
+    for name, values in percent_columns(
+        per_guid, samples_per_anchor=support["raw_samples_per_anchor"]
+    ).items():
+        per_guid[name] = values
     per_guid.to_csv(directory / PER_RECORDING_FILENAME)
 
     resamples = int(eval_config.get("bootstrap_resamples", 2000))
     seed = int(eval_config.get("seed", 0))
     gap_rows = build_gap_rows(per_guid, resamples=resamples, seed=seed)
+    percent_rows = build_percent_rows(per_guid, resamples=resamples, seed=seed)
     kl_rows = build_kl_rows(per_guid, resamples=resamples, seed=seed)
-    pd.DataFrame(gap_rows + kl_rows).to_csv(directory / SUMMARY_FILENAME, index=False)
-
-    figure_name = str(
-        figures.render_to_pdf(
-            build_distribution_figure(per_guid, gap_rows), directory / DISTRIBUTION_FIGURE
-        ).name
+    pd.DataFrame(gap_rows + percent_rows + kl_rows).to_csv(
+        directory / SUMMARY_FILENAME, index=False
     )
+
+    figure_names = [
+        str(
+            figures.render_to_pdf(
+                build_distribution_figure(per_guid, gap_rows), directory / DISTRIBUTION_FIGURE
+            ).name
+        ),
+        str(
+            figures.render_to_pdf(
+                build_percent_figure(per_guid, percent_rows), directory / PERCENT_FIGURE
+            ).name
+        ),
+    ]
     return {
         "n_samples": scored_sample_count(per_sample, "mc_pred_gap"),
         "composition": {"n_recordings": int(len(per_guid))},
         "plan": {"capped": False, "bootstrap_resamples": resamples, "seed": seed},
         "pred_gap": gap_rows,
+        "pred_gap_percent": {
+            "rows": percent_rows,
+            # Flat, finite scalars only: this is what the headline registry digs into.
+            "headline": percent_headline(percent_rows),
+            # Why the likelihood-space percentage is absent, when it is. The two error-space ones
+            # have no precondition beyond the columns they reduce, so they need no such record.
+            "likelihood_space": support,
+        },
         "kl": kl_rows,
         # Declared, not emitted: the by-class and by-subgroup variants are the runner's fan-out
         # over this frame, which carries one row per recording and the cohort each belongs to.
         "grouped_frames": [
             grouped_frame_entry(ANALYSIS_DIRNAME, PER_RECORDING_FILENAME, GROUPED_METRICS)
         ],
-        "files": [PER_RECORDING_FILENAME, SUMMARY_FILENAME, figure_name],
+        "files": [PER_RECORDING_FILENAME, SUMMARY_FILENAME, *figure_names],
     }

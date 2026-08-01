@@ -327,10 +327,10 @@ def build_pit_figure(pit: pd.DataFrame, coverage: pd.DataFrame) -> Any:
         width = float(finite_column(pit, "bin_right")[0] - finite_column(pit, "bin_left")[0])
         axis.bar(centers, density, width=width * 0.95, color=figures.COLOR_BLUE, alpha=0.85)
         axis.axhline(
-            1.0, color=figures.COLOR_VERMILLION, linestyle="--", linewidth=1.2,
+            1.0, color=figures.COLOR_VERMILLION, linestyle="--", linewidth=figures.LINE_REGULAR,
             label="uniform (calibrated)",
         )
-        axis.legend(fontsize=7, loc="best")
+        axis.legend(fontsize=figures.FONT_LABEL, loc="best")
     else:
         axis.text(
             0.5, 0.5, figures.EMPTY_NOTE, ha="center", va="center", transform=axis.transAxes
@@ -345,10 +345,10 @@ def build_pit_figure(pit: pd.DataFrame, coverage: pd.DataFrame) -> Any:
     if counts.size and counts.sum() > 0.0:
         empirical = np.cumsum(counts) / float(counts.sum())
         edges = finite_column(pit, "bin_right")
-        axis.plot([0.0, 1.0], [0.0, 1.0], color=figures.COLOR_GRAY, linestyle=":", linewidth=1.2,
+        axis.plot([0.0, 1.0], [0.0, 1.0], color=figures.COLOR_GRAY, linestyle=":", linewidth=figures.LINE_REGULAR,
                   label="calibrated")
-        axis.plot(edges, empirical, color=figures.COLOR_BLUE, linewidth=1.4, label="observed")
-        axis.legend(fontsize=7, loc="best")
+        axis.plot(edges, empirical, color=figures.COLOR_BLUE, linewidth=figures.LINE_EMPHASIS, label="observed")
+        axis.legend(fontsize=figures.FONT_LABEL, loc="best")
     else:
         axis.text(
             0.5, 0.5, figures.EMPTY_NOTE, ha="center", va="center", transform=axis.transAxes
@@ -401,12 +401,12 @@ def build_logvar_figure(histogram: pd.DataFrame, bounds: Dict[str, Any]) -> Any:
             (hi - margin, f"ceiling margin {hi - margin:g}"),
         ):
             axis.axvline(
-                position, color=figures.COLOR_VERMILLION, linestyle="--", linewidth=1.2,
+                position, color=figures.COLOR_VERMILLION, linestyle="--", linewidth=figures.LINE_REGULAR,
                 label=label,
             )
         for position in (lo, hi):
-            axis.axvline(position, color=figures.COLOR_GRAY, linestyle=":", linewidth=1.0)
-        axis.legend(fontsize=7, loc="best")
+            axis.axvline(position, color=figures.COLOR_GRAY, linestyle=":", linewidth=figures.LINE_REGULAR)
+        axis.legend(fontsize=figures.FONT_LABEL, loc="best")
     axis.set_title("Decoder log-variance over the scored raw samples")
     axis.set_xlabel("log-variance")
     axis.set_ylabel("fraction of raw samples")

@@ -253,7 +253,7 @@ def _draw_within_segment(ax: Any, cell: pd.DataFrame, *, title: str, ylabel: str
     if not len(cell):
         ax.text(
             0.5, 0.5, figures.EMPTY_NOTE, transform=ax.transAxes,
-            ha="center", va="center", fontsize=9, color=figures.COLOR_GRAY,
+            ha="center", va="center", fontsize=figures.FONT_NOTE, color=figures.COLOR_GRAY,
         )
         ax.set_title(title)
         figures.style_axes(ax)
@@ -267,12 +267,12 @@ def _draw_within_segment(ax: Any, cell: pd.DataFrame, *, title: str, ylabel: str
     )
     ax.plot(
         x, np.asarray(ordered["median"], dtype=np.float64),
-        color=figures.COLOR_BLUE, linewidth=1.3, label="median over recordings",
+        color=figures.COLOR_BLUE, linewidth=figures.LINE_EMPHASIS, label="median over recordings",
     )
     ax.set_title(title)
     ax.set_xlabel("Time in segment (s)")
     ax.set_ylabel(ylabel)
-    ax.legend(fontsize=7, loc="best")
+    ax.legend(fontsize=figures.FONT_LABEL, loc="best")
     figures.style_axes(ax)
 
 
@@ -286,7 +286,7 @@ def _draw_whole_delivery(ax: Any, trajectory: pd.DataFrame, *, guid: Optional[st
     if trajectory.empty:
         ax.text(
             0.5, 0.5, figures.EMPTY_NOTE, transform=ax.transAxes,
-            ha="center", va="center", fontsize=9, color=figures.COLOR_GRAY,
+            ha="center", va="center", fontsize=figures.FONT_NOTE, color=figures.COLOR_GRAY,
         )
         ax.set_title("Whole-delivery trajectory")
         figures.style_axes(ax)
@@ -303,12 +303,12 @@ def _draw_whole_delivery(ax: Any, trajectory: pd.DataFrame, *, guid: Optional[st
             continue
         values = np.asarray(cell[column], dtype=np.float64).copy()
         values[np.isfinite(gaps) & (gaps > BREAK_TOLERANCE_S)] = np.nan
-        ax.plot(hours, values, linewidth=1.0, label=name)
+        ax.plot(hours, values, linewidth=figures.LINE_REGULAR, label=name)
     ax.set_title(f"Whole-delivery trajectory: {chosen}")
     ax.set_xlabel("Time before delivery (hours)")
     ax.set_ylabel("nats per anchor")
     ax.invert_xaxis()
-    ax.legend(fontsize=7, loc="best")
+    ax.legend(fontsize=figures.FONT_LABEL, loc="best")
     figures.style_axes(ax)
 
 

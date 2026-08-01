@@ -147,11 +147,23 @@ def test_a_grouped_violin_figure_draws_one_body_per_populated_group() -> None:
 #: leaving its guide entry pointing at a file nothing writes.
 _FIGURE_CONSTANTS = (
     ("forecast", ("BASELINE_FIGURE", "ANCHOR_FIGURE", "OVERLAY_FIGURE", "HORIZON_FIGURE")),
-    ("coupling", ("DISTRIBUTION_FIGURE",)),
+    ("coupling", ("DISTRIBUTION_FIGURE", "PERCENT_FIGURE")),
     ("latent", ("SPECTRUM_FIGURE",)),
     ("lag_kl", ("PROFILE_FIGURE",)),
     ("attention", ("PROFILE_FIGURE", "HEATMAP_FIGURE")),
     ("calibration", ("PIT_FIGURE", "LOGVAR_FIGURE")),
+    (
+        "coherence",
+        (
+            "LEAD_TIME_FIGURE",
+            "SPECTRUM_FIGURE",
+            "BANDS_FIGURE",
+            "DECOMPOSITION_FIGURE",
+            "SOURCE_FIGURE",
+            "SEAM_FIGURE",
+        ),
+    ),
+    ("distributions", ("CLASS_FIGURE", "SUBGROUP_FIGURE")),
     ("trajectory", ("PROFILE_FIGURE",)),
     ("time_to_delivery", ("TRAJECTORY_FIGURE",)),
     ("events", ("DECELERATION_FIGURE", "TRIGGERED_FIGURE", "CONDITIONED_FIGURE")),
@@ -209,15 +221,18 @@ def test_the_figure_guide_documents_nothing_that_is_not_emitted() -> None:
 # =============================================================================
 # The clinical figures
 #
-# Two properties they share and neither is visual: the cohort colours come from the one shared
-# mapping, so a class is the same colour here as on every training figure of that class; and a
-# split with one cohort emits nothing rather than a single violin inviting a comparison there is
-# nothing to compare against.
+# Two properties they share and neither is visual: the cohort colours come from this package's one
+# clinical palette, so a class is the same colour on every figure of this evaluation; and a split
+# with one cohort emits nothing rather than a single violin inviting a comparison there is nothing
+# to compare against.
+#
+# ``test_eval_cohort_presentation.py`` is where that palette and the cohort order it travels with
+# are pinned. What is asserted here is only the seam's part in it.
 # =============================================================================
 def test_a_cohort_keeps_the_same_colour_across_every_figure_that_draws_it() -> None:
     """Asserted against the mapping rather than eyeballed. A figure whose classes are coloured by
-    whatever order they arrived in cannot be compared with any other figure in the repository, and
-    the failure is invisible until two figures are put side by side."""
+    whatever order they arrived in cannot be compared with any other figure in the run, and the
+    failure is invisible until two figures are put side by side."""
     from teb_vae.lag_attn.eval import labels as shared_labels
 
     names = [shared_labels.CLASS_NAMES[code] for code in sorted(shared_labels.CLASS_NAMES)]
@@ -228,6 +243,20 @@ def test_a_cohort_keeps_the_same_colour_across_every_figure_that_draws_it() -> N
     # alone, must come back the same colour.
     assert figures_seam.group_colors(list(reversed(names))) == colours
     assert figures_seam.group_colors([names[1]])[names[1]] == colours[names[1]]
+
+
+def test_the_seam_overrides_the_shared_palette_rather_than_binding_it() -> None:
+    """The one place this seam deliberately does *not* bind the sibling's function.
+
+    ``utils.style.CLASS_COLORS_DEFAULT`` paints ``healthy`` blue and is shared with the
+    ``lag_attn`` sibling and with ``model/transformer_experiment``, so it is overridden here rather
+    than repainted there. A future edit reverting to the bare binding would restore blue on every
+    cohort figure in this evaluation, and no other test would say so.
+    """
+    from teb_vae.lag_attn.eval import figures as shared
+
+    assert figures_seam.group_colors is not shared.group_colors
+    assert figures_seam.group_colors(["healthy"]) != shared.group_colors(["healthy"])
 
 
 def test_the_subgroup_heatmap_reports_the_absence_of_a_survivor_rather_than_drawing_nothing() -> None:
