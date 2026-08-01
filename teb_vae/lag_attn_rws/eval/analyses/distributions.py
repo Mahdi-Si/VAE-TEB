@@ -26,7 +26,7 @@ states why: a forty-bin density over the six recordings of a small cohort is a r
 estimates nothing, takes the panel's y-limit with it, and squashes the distribution the reader came
 for.
 
-**Three presentation choices, each load-bearing:**
+**Four presentation choices, each load-bearing:**
 
 * **Density, not counts.** The healthy cohort contributes an order of magnitude more segments than
   HIE. On a count axis every panel would show one tall healthy curve and two flat lines, which is
@@ -35,6 +35,14 @@ for.
 * **One bin grid per panel**, computed from the pooled values across the cohorts drawn there. Two
   histograms on two different grids are not a comparison, and the difference between them can be
   the binning.
+* **A faint fill under a hairline outline, with every fill beneath every outline.** The cohorts
+  are drawn on top of one another, and the whole subject is where they differ -- so the encoding
+  has to survive three or four of them overlapping. A solid fill hides whatever is behind it, and
+  a heavy one blends with its neighbours into a colour no legend explains; what stays legible
+  through a stack is a **line**. So the fill is dropped to a tint that only locates a cohort's
+  mass, the shape is carried by an outline at full opacity and the lightest weight in the
+  package's scale, and the two are drawn in separate passes so that no cohort's outline is washed
+  out by a later cohort's fill. See :data:`FILL_ALPHA` and :data:`FILL_ZORDER`.
 * **The error metrics are rooted per segment and converted to bpm**, because a distribution of
   squared $z$-units is unreadable and a clinician thinks in heartbeats. That rooting is legitimate
   here and would not be elsewhere: ``residual``'s rule is that *averaging* finished roots is
@@ -52,6 +60,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
+from matplotlib.colors import to_rgba
 
 from teb_vae.lag_attn_rws.eval import cohort
 from teb_vae.lag_attn_rws.eval import figures_seam as figures
@@ -377,6 +386,29 @@ LEGEND_HEADROOM_FRACTION = 0.24
 #: column and collides with its neighbours. A label is compact, vertical, and on every panel.
 DENSITY_YLABEL = "density (bars); recordings (strip)"
 
+#: How opaque a cohort's filled body is. Faint on purpose: up to four cohorts are drawn on top of
+#: one another in a single panel, and a fill heavy enough to read on its own hides whatever is
+#: behind it and blends with its neighbours into a colour the legend does not explain. At this
+#: value the fill does one job -- locating where a cohort's mass is -- and the outline does the
+#: rest, which is why it is safe to make it this light.
+#:
+#: The outline is drawn in the cohort's own colour rather than a darkened one, which was tried and
+#: rejected: it evens out the contrast of the light end of a class's subgroup tints, but it also
+#: turns the amber of ``acidosis`` brown, and the severity hue is the one thing on these figures
+#: that is read without the legend.
+FILL_ALPHA = 0.18
+
+#: Every fill is drawn beneath every outline, rather than each cohort being drawn whole in turn.
+#: That is what makes the overlaps readable at all: within one z-level matplotlib draws in call
+#: order, so a cohort's outline would be veiled by the fill of every cohort drawn after it, and the
+#: first entry in the legend would be the hardest curve to trace. That is an artefact of the draw
+#: order reading as a property of the data. Two levels fix it -- the bodies below, the shapes above.
+#:
+#: Both sit around the Line2D default of $2.0$, so the reference line still draws over the fills
+#: and the outlines still draw over it: a null line a cohort's outline crosses stays a null line.
+FILL_ZORDER = 1.6
+OUTLINE_ZORDER = 2.4
+
 
 def draw_density_panel(
     ax: Any,
@@ -402,6 +434,13 @@ def draw_density_panel(
     estimates nothing, sets the y-limit for the whole panel, and squashes the distribution the
     reader came for. The strip says the one thing the recording level is there to say: how wide the
     between-recording spread is against the between-segment one drawn beneath it.
+
+    **The densities are drawn as outlines over tints, in two passes rather than one per cohort**,
+    because the panel's subject is where cohorts *differ* and they are drawn on top of one another.
+    A cohort's body is filled at :data:`FILL_ALPHA`, faint enough that a stack of them still reads
+    as tints of the cohorts in the legend; its shape is carried by a hairline outline at full
+    opacity; and every fill is drawn beneath every outline -- see :data:`FILL_ZORDER` -- so which
+    cohort is legible is not decided by which was drawn last.
 
     Args:
         ax: Target axes.
@@ -442,15 +481,32 @@ def draw_density_panel(
         values = segment_by_group.get(group, np.zeros(0))
         if values.size == 0:
             continue
+        colour = colours.get(group, figures.COLOR_BLUE)
+        # Two passes over the one grid, for the reason ``FILL_ZORDER`` states: the bodies of every
+        # cohort first, then their outlines above all of them.
+        #
         # Density rather than counts: the cohorts differ in size by an order of magnitude, and on
         # a count axis every panel would report that rather than the metric.
+        #
+        # The translucency is on the *face colour* rather than on the artist, which is what lets
+        # the outline stay opaque -- ``alpha`` would fade the border along with the fill and give
+        # back the soft-edged blur this encoding exists to replace. This pass carries the legend
+        # entry, so the swatch is the mark actually on the page rather than half of it.
         ax.hist(
             values, bins=edges, density=True, histtype="stepfilled",
-            color=colours.get(group, figures.COLOR_BLUE), alpha=0.40, linewidth=0.0,
+            color=to_rgba(colour, FILL_ALPHA), edgecolor=colour,
+            linewidth=figures.LINE_HAIRLINE, zorder=FILL_ZORDER,
             label=(
                 f"{group} ({values.size} seg / "
                 f"{recording_by_group.get(group, np.zeros(0)).size} rec)"
             ),
+        )
+        # The same staircase re-stroked above every fill, and deliberately unlabelled so the legend
+        # keeps one row per cohort. Identical geometry, colour and weight to the border above, so
+        # it restores that border where a later cohort covered it rather than adding a second mark.
+        ax.hist(
+            values, bins=edges, density=True, histtype="step",
+            color=colour, linewidth=figures.LINE_HAIRLINE, zorder=OUTLINE_ZORDER,
         )
         drawn.append(group)
 

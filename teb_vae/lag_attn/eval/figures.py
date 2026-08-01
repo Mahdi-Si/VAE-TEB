@@ -32,6 +32,7 @@ import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
+from matplotlib import cbook  # noqa: E402
 
 from teb_vae.lag_attn.figure_primitives import (  # noqa: E402
     COLOR_BLACK,
@@ -324,6 +325,35 @@ def heatmap_with_colorbar(
     return image
 
 
+#: The inner box plot's two marks, weighted in **points** as multiples of the active
+#: ``lines.linewidth`` -- the inter-quartile bar first, then the whisker.
+#:
+#: Points rather than data units, which is the one geometric decision in this mark. A box drawn a
+#: fixed fraction of a violin's width wide occupies a fixed share of the *data* axis, and the axis
+#: holds one unit per group however many groups there are -- so the same box renders as a slab on
+#: a three-cohort panel and as a sliver on an eight-subgroup one. Weighted in points it is the
+#: same mark on both, which is what lets the two figures be read against each other.
+#:
+#: The multiples are chosen so that under ``lag_attn_rws``'s style refinement they come out at
+#: exactly that package's ``LINE_HEAVY`` ($2.4$) and ``LINE_THIN`` ($0.65$) -- the weights its
+#: ``distributions`` strip already draws an inter-quartile span and a range with. One visual
+#: vocabulary for "these are quartiles", across two figures built by different modules.
+INNER_BOX_BAR_WEIGHT_RATIO = 2.67
+INNER_BOX_WHISKER_WEIGHT_RATIO = 0.72
+
+#: The median dot's diameter in points, and the weight of its outline as a multiple of the active
+#: ``lines.linewidth``. Sized to sit inside the bar it marks rather than to straddle it.
+INNER_BOX_MEDIAN_MARKERSIZE = 3.0
+INNER_BOX_MEDIAN_EDGE_RATIO = 0.55
+
+#: The whisker rule: the most extreme observation within $1.5 \times$ the inter-quartile range of
+#: the quartiles -- Tukey's convention, and matplotlib's own default. Named rather than left
+#: implicit because the alternative convention would be redundant here: matplotlib evaluates a
+#: violin's kernel density between the data's own minimum and maximum, so the body already *is*
+#: the full range and a whisker drawn to it would restate the outline it sits inside.
+INNER_BOX_WHISKER_IQR = 1.5
+
+
 def violin_panel(
     ax: Any,
     samples: Any,
@@ -335,11 +365,27 @@ def violin_panel(
     reference: Optional[float] = None,
     reference_label: str = "",
 ) -> int:
-    """Draw one violin per group, tolerating empty and all-``NaN`` groups.
+    r"""Draw one violin per group, each with a thin box plot inside it.
 
     A violin rather than a box: these distributions are routinely bimodal -- a set of recordings
     the model forecasts well and a tail it does not -- and a box plot renders both as the same
-    five numbers. The median is marked, so the central tendency is still readable at a glance.
+    five numbers.
+
+    **The interior is a box plot rather than a bare median line**, which is the usual pairing and
+    the one these panels need. A median tick answers "where is the centre" and nothing else, so
+    the two questions asked of every violin here -- how wide is the middle half, and how far past
+    it does the cohort reach -- had to be estimated by eye off the body's outline, which is a
+    kernel density and therefore smoothed past exactly the quartiles being read. The box states
+    all three: the heavy bar is $Q_1$ to $Q_3$, the hairline through it runs to Tukey's adjacent
+    values, and the dot is the median.
+
+    Three choices in it are deliberate. The median dot is **white** because the bar it sits on is
+    drawn over cohort hues that include a red, against which this package's accent colour has too
+    little contrast to read; white on black reads on every cohort and needs no per-cohort rule.
+    **No fliers** are drawn: matplotlib evaluates the kernel density between the data's own
+    extremes, so every outlier is already on the page as the body's tail, and a second marker for
+    it would read as a second observation. And **no caps**, which at this weight are
+    indistinguishable from the whisker they terminate.
 
     A group with no finite value is kept in position with an empty slot rather than dropped, so
     the categories stay aligned with their labels; dropping it would silently shift every label
@@ -374,10 +420,12 @@ def violin_panel(
         style_axes(ax)
         return 0
 
+    drawn = [finite[index] for index in populated]
+    centres = [index + 1.0 for index in populated]
     parts = ax.violinplot(
-        [finite[index] for index in populated],
-        positions=[index + 1.0 for index in populated],
-        showmedians=True,
+        drawn,
+        positions=centres,
+        showmedians=False,
         showextrema=False,
         widths=0.8,
     )
@@ -386,9 +434,27 @@ def violin_panel(
         body.set_alpha(0.65)
         body.set_edgecolor(COLOR_BLACK)
         body.set_linewidth(0.4)
-    if "cmedians" in parts:
-        parts["cmedians"].set_color(COLOR_VERMILLION)
-        parts["cmedians"].set_linewidth(plt.rcParams["lines.linewidth"])
+
+    # The interior. The statistics come from the same function ``Axes.boxplot`` computes its own
+    # from, so the whisker rule here and on any box plot elsewhere in the repository cannot drift
+    # apart -- it is a convention with an edge case worth not owning twice, ending at the most
+    # extreme *observation* inside the fence rather than at the fence. Only the drawing is ours,
+    # and only because ``Axes.boxplot`` sizes its box in data units; see the weights above.
+    weight = float(plt.rcParams["lines.linewidth"])
+    for centre, box in zip(centres, cbook.boxplot_stats(drawn, whis=INNER_BOX_WHISKER_IQR)):
+        ax.vlines(
+            centre, box["whislo"], box["whishi"], color=COLOR_BLACK,
+            linewidth=weight * INNER_BOX_WHISKER_WEIGHT_RATIO, zorder=3,
+        )
+        ax.vlines(
+            centre, box["q1"], box["q3"], color=COLOR_BLACK,
+            linewidth=weight * INNER_BOX_BAR_WEIGHT_RATIO, zorder=3,
+        )
+        ax.plot(
+            [centre], [box["med"]], marker="o", markersize=INNER_BOX_MEDIAN_MARKERSIZE,
+            markerfacecolor="white", markeredgecolor=COLOR_BLACK,
+            markeredgewidth=weight * INNER_BOX_MEDIAN_EDGE_RATIO, zorder=4,
+        )
 
     if reference is not None and np.isfinite(reference):
         ax.axhline(float(reference), color=COLOR_GRAY, linestyle=":", linewidth=plt.rcParams["lines.linewidth"],

@@ -25,7 +25,7 @@ import sys
 from pathlib import Path
 
 import numpy as np
-from matplotlib.collections import PolyCollection
+from matplotlib.collections import LineCollection, PolyCollection
 
 from teb_vae.lag_attn.eval import figures as shared_figures
 from teb_vae.lag_attn_rws.eval import figures_seam
@@ -70,6 +70,40 @@ def test_an_empty_group_keeps_its_slot_so_the_labels_stay_aligned() -> None:
 
     assert populated == 2
     assert labels == ["healthy", "acidosis", "hie"]
+
+
+def test_the_violin_interior_draws_the_quartiles_and_the_adjacent_values() -> None:
+    r"""The mark inside a violin is what a reader takes the middle half off, so it has to be the
+    quartiles rather than anything that merely looks like them.
+
+    The sample carries one extreme value, and that is what makes the test non-vacuous: it
+    separates the two whisker conventions. An implementation drawing the **range** reaches $100$;
+    Tukey's adjacent value stops at the furthest observation inside the fence, which is $9$. The
+    outlier is still on the page either way -- matplotlib evaluates the violin's kernel density
+    between the data's own extremes, so it is the body's tail.
+    """
+    values = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 100.0]
+
+    figure, axes = figures_seam.new_figure(1)
+    try:
+        figures_seam.violin_panel(axes[0, 0], {"healthy": values})
+        spans = sorted(
+            (round(float(segment[0][1]), 6), round(float(segment[1][1]), 6))
+            for artist in axes[0, 0].collections
+            if isinstance(artist, LineCollection)
+            for segment in artist.get_segments()
+        )
+        medians = [
+            float(line.get_ydata()[0])
+            for line in axes[0, 0].lines
+            if line.get_marker() == "o"
+        ]
+    finally:
+        shared_figures.plt.close(figure)
+
+    # The whisker first, then the inter-quartile bar: $Q_1 = 3.25$, $Q_3 = 7.75$ on this sample.
+    assert spans == [(1.0, 9.0), (3.25, 7.75)]
+    assert medians == [5.5]
 
 
 def test_render_to_pdf_writes_the_file_and_leaves_no_open_figure(tmp_path) -> None:
