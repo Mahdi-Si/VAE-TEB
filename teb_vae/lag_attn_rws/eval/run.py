@@ -1576,7 +1576,9 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def resolve_arguments(
-    argv: Optional[Sequence[str]] = None, run_args: Optional[Dict[str, Any]] = None
+    argv: Optional[Sequence[str]] = None,
+    run_args: Optional[Dict[str, Any]] = None,
+    parser: Optional[argparse.ArgumentParser] = None,
 ) -> Tuple[Dict[str, Any], Dict[str, str]]:
     """Resolve the argument set from the command line and :data:`RUN_ARGS`, **per key**.
 
@@ -1588,6 +1590,10 @@ def resolve_arguments(
     Args:
         argv: Command-line arguments. ``None`` reads ``sys.argv[1:]``.
         run_args: The fallback dict. ``None`` uses the module-level :data:`RUN_ARGS`.
+        parser: The parser to read the valid ``dest`` set from and to parse with. ``None`` builds
+            this package's. A second entry point passes its own, so its ``prog=`` names it in a
+            usage error and its ``--only`` help lists *its* registry -- while the resolution rule
+            below stays one implementation for both.
 
     Returns:
         ``(values, sources)``, where ``sources`` maps each key to ``'cli'``, ``'config'`` or
@@ -1599,7 +1605,7 @@ def resolve_arguments(
             would otherwise silently do nothing, which is the same class of failure the
             ``eval_config`` validator guards against.
     """
-    parser = build_parser()
+    parser = build_parser() if parser is None else parser
     fallback = dict(RUN_ARGS if run_args is None else run_args)
 
     valid_dests = {action.dest for action in parser._actions if action.dest != "help"}

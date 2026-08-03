@@ -145,7 +145,12 @@ def build_parser() -> argparse.ArgumentParser:
 
 def _cli(argv: Optional[List[str]] = None) -> int:
     """Parse arguments and run. Returns the process exit code."""
-    values = vars(build_parser().parse_args(argv))
+    # The sibling's resolver, handed this package's parser: the merge rule, the source record and
+    # the unknown-key refusal are one implementation, while the usage line and the ``--only`` help
+    # name this model's entry point and this model's own registry.
+    values, sources = shared_run.resolve_arguments(
+        argv, run_args=RUN_ARGS, parser=build_parser()
+    )
     if values["checkpoint"] is None and not shared_run._finished_run(values["output_dir"]):
         raise SystemExit(
             "--checkpoint is required unless --output-dir names a finished run directory: the "
@@ -157,12 +162,90 @@ def _cli(argv: Optional[List[str]] = None) -> int:
         # samples match the specified filters" with no mention of the real cause.
         logger.info(f"changing working directory to the repo root: {_REPO_ROOT}")
         os.chdir(_REPO_ROOT)
-    sources = {key: ("cli" if value is not None else "default") for key, value in values.items()}
     logger.info(
         "resolved arguments: "
         + ", ".join(f"{key}={values[key]!r} (from {sources[key]})" for key in sorted(values))
     )
     return main(**values, argument_sources=sources)
+
+
+#: Values used for arguments absent from the command line -- i.e. an IDE's Run button.
+#:
+#: Keyed by argparse ``dest``. Resolution is per key, so varying only the checkpoint works without
+#: editing anything else here, and a key that is not an argparse ``dest`` raises at startup.
+#:
+#: **Running this file directly needs exactly one of two things filled in below**: ``checkpoint``,
+#: or an ``output_dir`` naming a finished run whose tables the analyses re-read. With both left
+#: ``None`` the run refuses at startup, because there is then neither a model to collect the tables
+#: with nor tables to read. Nothing else is required: the working directory is moved to the
+#: repository root for you, and every other value falls back to the merged configuration.
+#:
+#: Do not add run settings here. The seed, the caps and the draw count belong in the override
+#: delta (``configs/eval_overrides.yaml``), which is dumped into the run directory as the durable
+#: record; a value injected from Python would appear in no artifact. In particular
+#: ``caps.encoder_attention`` lives there -- absent, this model's own analysis records a skip.
+RUN_ARGS: Dict[str, Any] = {
+    "checkpoint": None,
+    "output_dir": None,
+    "overrides": None,
+    "device": None,
+    "num_samples": None,
+    "max_batches": None,
+    # Which analyses run. Both keys take a comma-separated string of the names below --
+    # ``"forecast,encoder_attention"`` -- and both default to ``None``, which runs **every** one of
+    # them, in the order listed. `band_partition` runs regardless and is not selectable by either
+    # key; naming it raises rather than being read as a typo. An unknown name raises at startup
+    # too, before the checkpoint is loaded, so a misspelling costs a parse rather than a first pass
+    # over the shards.
+    #
+    # The first sixteen are the sibling's, one implementation shared by both models; the
+    # seventeenth is this architecture's own and runs last, because the merge appends it after the
+    # shared registry rather than reordering a run order both models share. `band_partition` makes
+    # eighteen steps in a full run and is the one that is not on this list.
+    #
+    #   forecast:          Is the forecast any good. Skill against persistence, climatology and
+    #                      the segment's own mean, in nats and in bpm, resolved by horizon step.
+    #   coupling:          What the source added. `pred_gap` per recording in both estimators,
+    #                      with a paired Wilcoxon, bootstrap intervals and the positive fraction.
+    #   perm_control:      Is it *this* recording's source. The GUID-aware shuffle control, whose
+    #                      verdict is three losses and deliberately not the KL.
+    #   latent:            The per-dimension KL spectrum and active dimensions -- plus the
+    #                      prior-variance-pinned detector that catches an inflated coupling number.
+    #   lag_kl:            Where in the past the source informed the future. The per-lag KL
+    #                      attribution in its raw, support-corrected and untruncated forms.
+    #   attention:         The *lag cross-attention* per head, and its entropy against the ceiling
+    #                      truncated lag support actually allows rather than against log L.
+    #   calibration:       Is the decoder's learned variance the spread of its own errors. PIT,
+    #                      coverage, CRPS. An `mse` checkpoint records a skip.
+    #   residual:          How far apart the two forecasts are, in bpm, and the two latent-drift
+    #                      quantities behind them.
+    #   coherence:         The forecast in the frequency domain, resolved by lead time: coherence,
+    #                      spectral gain, phase, and an exact split of the residual spectrum.
+    #   distributions:     The shape of each metric over 20-minute segments, by cohort. Histograms
+    #                      at both levels; descriptive only, and deliberately tests nothing.
+    #   trajectory:        The readouts against time -- within one segment, and assembled across a
+    #                      whole delivery on the absolute time axis.
+    #   time_to_delivery:  The readouts binned on a 0.5 h grid of time before delivery,
+    #                      class-stratified, with Holm across windows.
+    #   events:            What the raw target unlocks. Deceleration forecast skill, the
+    #                      contraction-triggered response, and contraction-conditioned coupling.
+    #   sufficiency:       What the latent bottleneck costs, against an evaluation-only oracle
+    #                      decoder. The one analysis whose cost is a training loop, not a forward.
+    #   samples:           Per-recording diagnostic PDF pages -- a stratified draw, plus the
+    #                      extremes of each headline metric. Needs a checkpoint; skips without one.
+    #   cross_subgroup:    Do the cohorts actually differ. Kruskal, Holm, then Mann-Whitney, over
+    #                      the per-recording CSVs the analyses above it wrote, so it runs last of
+    #                      the shared ones.
+    #   encoder_attention: **This model's own.** What the two *encoder* self-attentions attend to:
+    #                      per-head entropy against its truncation-aware ceiling, attention mass by
+    #                      temporal distance, and the measured source reach against the lag range.
+    #                      Runs its own bounded pass, so it needs a checkpoint and a loader, and it
+    #                      needs `caps.encoder_attention` in the override delta -- absent, it
+    #                      records a skip naming the key. Read it beside `attention`, which
+    #                      profiles a different mechanism entirely.
+    "only": None,
+    "skip": None,
+}
 
 
 if __name__ == "__main__":

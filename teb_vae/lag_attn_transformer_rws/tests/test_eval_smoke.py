@@ -473,6 +473,43 @@ def test_the_help_text_lists_the_flags_and_this_models_analyses(capsys) -> None:
         assert name in out
 
 
+def test_the_launch_dict_and_the_command_line_resolve_per_key() -> None:
+    """The launch dict is what an IDE's Run button uses, and it is resolved *per key* -- the common
+    iteration is varying one thing, so a flag must override that one value and leave the rest of
+    the dict standing."""
+    values, sources = shared_run.resolve_arguments(
+        ["--checkpoint", "a.ckpt"],
+        run_args={**trf_run.RUN_ARGS, "device": "cpu", "only": "encoder_attention"},
+        parser=trf_run.build_parser(),
+    )
+
+    assert (values["checkpoint"], sources["checkpoint"]) == ("a.ckpt", "cli")
+    assert (values["device"], sources["device"]) == ("cpu", "config")
+    assert (values["only"], sources["only"]) == ("encoder_attention", "config")
+    assert (values["output_dir"], sources["output_dir"]) == (None, "default")
+
+
+def test_the_shipped_launch_dict_resolves() -> None:
+    """It ships in ``run.py`` and no normal test run exercises it, so a key renamed on the parser
+    would otherwise be found by an operator pressing Run rather than by this suite. The unknown-key
+    refusal inside the resolver is what turns that rename into a startup error."""
+    values, _ = shared_run.resolve_arguments([], parser=trf_run.build_parser(),
+                                             run_args=trf_run.RUN_ARGS)
+
+    assert set(values) == set(trf_run.RUN_ARGS)
+
+
+def test_the_launch_dict_offers_exactly_the_command_lines_own_settings() -> None:
+    """A key here that is not a flag is a setting that would appear in no artifact -- the override
+    delta is the durable record, and this dict is a launch convenience rather than a second
+    configuration surface."""
+    dests = {
+        action.dest for action in trf_run.build_parser()._actions if action.dest != "help"
+    }
+
+    assert set(trf_run.RUN_ARGS) == dests
+
+
 def test_the_probe_help_text_names_this_package(capsys) -> None:
     from teb_vae.lag_attn_transformer_rws.eval import probe as trf_probe
 
