@@ -503,10 +503,10 @@ def test_the_summary_carries_the_exit_code_and_the_failure_list(evaluated):
 
 
 def test_the_run_context_records_what_the_arm_tables_consume(evaluated, trained_run):
-    """The parameter count, the checkpoint's training epoch, the anchor-coverage distribution
-    the ``coverage_floor`` is confirmed against, and the observed objective magnitude the spike
-    breaker's ``additive_margin`` is re-derived from -- each checked against an independent
-    reading rather than merely present."""
+    """The parameter count, the checkpoint's training epoch, the class of model that produced
+    the run, the anchor-coverage distribution the ``coverage_floor`` is confirmed against, and
+    the observed objective magnitude the spike breaker's ``additive_margin`` is re-derived from
+    -- each checked against an independent reading rather than merely present."""
     import torch
 
     from teb_vae.lag_attn_rws.eval import run as run_module
@@ -517,6 +517,11 @@ def test_the_run_context_records_what_the_arm_tables_consume(evaluated, trained_
     assert context["n_parameters"] == sum(p.numel() for p in task.orig_model.parameters())
     blob = torch.load(trained_run, map_location="cpu", weights_only=False)
     assert context["train_epoch"] == blob["epoch"]
+    # Copied out of the checkpoint's own stamp, which is the only place it is written: the dumped
+    # config carries every constructor keyword and not the class they build. A table that ranks
+    # architectures against each other reads this key, so the summary has to carry it.
+    assert context["model_class"] == blob["model_class"]
+    assert context["model_class"] == run_module.RWS_BINDING.model_cls.__name__
 
     coverage = context["anchor_coverage_frac"]
     assert coverage["n_anchors"] > 0

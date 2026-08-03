@@ -258,18 +258,39 @@ PRED_GAP_CONVENTION = (
 )
 
 
-def build_headline(results: Dict[str, Any]) -> Dict[str, Any]:
+def build_headline(
+    results: Dict[str, Any],
+    extra: Sequence[Tuple[str, Tuple[str, ...]]] = (),
+) -> Dict[str, Any]:
     """Flatten the run's headline scalars and verdict statuses out of the per-analysis blocks.
 
     Args:
         results: The accumulated results.
+        extra: Additional ``(name, path)`` entries, from the binding of the model being evaluated,
+            resolved after the shared ones and in declaration order. Empty for a model whose every
+            analysis is shared. They are appended rather than added to :data:`HEADLINE_SCALARS`
+            because every path in *that* tuple must resolve on every run of every model, and a
+            model-specific entry there would read as a number the others failed to produce.
 
     Returns:
         Name to value, with ``None`` wherever the producing analysis did not report, plus the
         ``pred_gap_convention`` sentence.
+
+    Raises:
+        ValueError: If an extra entry reuses a shared name. The extras resolve last, so a reused
+            name would replace a shared reading with a model-specific one under the shared
+            name -- and every arm table, every acceptance gate and every cross-model row reads
+            this block by name, so the substitution would be invisible in the artifact.
     """
+    collisions = sorted({name for name, _ in extra} & {name for name, _ in HEADLINE_SCALARS})
+    if collisions:
+        raise ValueError(
+            f"a binding registers headline scalars whose names are already shared: {collisions}. "
+            f"An extra scalar is an addition, never an override: name it for the analysis that "
+            f"produces it, as the shared entries are named for theirs."
+        )
     headline: Dict[str, Any] = {
-        name: _dig(results, path) for name, path in HEADLINE_SCALARS
+        name: _dig(results, path) for name, path in tuple(HEADLINE_SCALARS) + tuple(extra)
     }
     by_name = {
         str(verdict.get("name")): verdict
@@ -804,6 +825,7 @@ def finalise(
     per_sample: Optional[Any] = None,
     per_anchor: Optional[Any] = None,
     probe: Optional[Dict[str, Any]] = None,
+    headline_scalars: Sequence[Tuple[str, Tuple[str, ...]]] = (),
 ) -> Dict[str, Any]:
     """Assemble the derived blocks immediately before the summary is written.
 
@@ -823,6 +845,8 @@ def finalise(
         per_sample: The per-sample table, for the cross-table sanity check.
         per_anchor: The per-anchor table, for the same.
         probe: The loader probe's record, for the population checks.
+        headline_scalars: The evaluated model's own headline entries, appended to the shared
+            registry. Empty for a model that registers no analysis of its own.
 
     Returns:
         The artifact manifest, which belongs beside the summary rather than inside its results.
@@ -839,7 +863,10 @@ def finalise(
             return {**fallback, "error": f"{type(exc).__name__}: {exc}"}
 
     results = report_state.results
-    report_state.set("headline", _safe("headline", lambda: build_headline(results), {}))
+    report_state.set(
+        "headline",
+        _safe("headline", lambda: build_headline(results, headline_scalars), {}),
+    )
     report_state.set(
         "coverage",
         _safe(
@@ -936,7 +963,13 @@ def console_summary(results: Dict[str, Any], steps: Sequence[StepRecord]) -> str
     try:
         lines = ["", "=" * 78, "eval summary", "=" * 78]
         headline = results.get("headline") or {}
-        for name, _ in HEADLINE_SCALARS:
+        # The block's own keys rather than :data:`HEADLINE_SCALARS`, so a binding's registered
+        # scalars reach the operator's table as well as ``summary.json``. Insertion order is the
+        # shared entries then the binding's, so a model that registers none prints what it always
+        # printed. The two trailing kinds are rendered below and as prose respectively.
+        for name in headline:
+            if name.startswith("verdict_") or name == "pred_gap_convention":
+                continue
             value = headline.get(name)
             rendered = (
                 f"{float(value):.6g}"

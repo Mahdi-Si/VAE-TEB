@@ -4,10 +4,14 @@ Puts the repository root on ``sys.path`` so the absolute ``teb_vae.*`` imports r
 which directory pytest is invoked from, and exposes the fixtures the suite is built on. Mirrors
 ``teb_vae/lag_attn_rws/tests/conftest.py``, including its ``utils`` pre-import pin.
 
-Three things are imported from the sibling suite rather than restated: ``perturb_posterior``,
-``make_stub_batch`` and ``absolutize_dataset_paths``. They describe the *data* and the *trap*, both
-of which are shared -- the batch contract is the same one, and the posterior delta heads are
-zero-initialised in both models, so at initialisation every KL assertion passes vacuously in both.
+The data fixtures are imported from the sibling suite rather than restated: ``perturb_posterior``,
+``make_stub_batch``, ``absolutize_dataset_paths``, the multi-class shard writer and its event and
+level generators, and the two session-wide budget shrinkers. They describe the *data* and the
+*trap*, both of which are shared -- the batch contract is the same one, the shards describe the
+dataset rather than either model, and the posterior delta heads are zero-initialised in both
+models, so at initialisation every KL assertion passes vacuously in both. The sibling's own
+conftest already establishes the convention by importing a perturbation fixture from *its*
+sibling.
 
 The constructor keyword sets are defined fresh, because they are the one thing that is not shared:
 this model has no ``lstm_layers``, ``encoder_extra_dilations``, ``encoder_extra_kernel``,
@@ -23,7 +27,7 @@ from __future__ import annotations
 import importlib
 import sys
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 import pytest
 import torch
@@ -50,9 +54,20 @@ except Exception:
 from teb_vae.lag_attn.tests.conftest import perturb_posterior  # noqa: E402,F401
 from teb_vae.lag_attn_rws.tests.conftest import (  # noqa: E402,F401
     BATCH,
+    MULTI_CLASS_GUIDS_PER_SHARD,
+    MULTI_CLASS_SEGMENTS_PER_GUID,
+    MULTI_CLASS_SEQ_LEN,
+    MULTI_CLASS_SUBGROUPS,
     STUB_GAP_STEP,
     absolutize_dataset_paths,
+    forecastable_level,
+    inject_events,
+    injected_event_indices,
     make_stub_batch,
+    subgroup_labels,
+    suite_oracle_budget,
+    suite_page_budget,
+    write_multi_class_shards,
 )
 
 # Tiny but structurally faithful: ``num_heads * d_head == d_model``, ``d_z % num_heads == 0`` (the
@@ -353,6 +368,202 @@ def _make_task(model_kwargs: Optional[dict] = None, hparams: Optional[dict] = No
 def task():
     """Factory fixture: ``task(model_kwargs=None, hparams=None, **task_kwargs)``."""
     return _make_task
+
+
+# ---------------------------------------------------------------------------------------
+# The evaluation fixtures
+#
+# The shards, the shard writer and the two budget shrinkers are the sibling's, imported above: they
+# describe the dataset and the suite's own cost, neither of which is a property of either model.
+# What is local is everything downstream of the model class -- the repointed delta reads THIS
+# package's committed overrides, and the checkpoint is a conv-Transformer.
+# ---------------------------------------------------------------------------------------
+@pytest.fixture(scope="session")
+def multi_class_shards(tmp_path_factory) -> List[str]:
+    """One shard per canonical subgroup, three recordings each, three clinical classes."""
+    return write_multi_class_shards(tmp_path_factory.mktemp("multi_class"), seed=11)
+
+
+def write_repointed_overrides(directory: Path, shards: List[str]) -> Path:
+    """Write **this package's** committed delta with its placeholder shard paths replaced.
+
+    Repointing the placeholders is exactly what an operator does before a real run, so a test
+    driving the pipeline end to end does the same thing rather than assembling a delta of its own:
+    the committed file stays load-bearing, and a key added to it reaches the run under test
+    without anything here being updated.
+
+    Not the sibling's helper, which resolves the sibling's delta: the two packages ship two
+    committed files, and evaluating this model against the other one's settings is exactly the
+    silent divergence the parity test exists to catch.
+
+    Args:
+        directory: Where to write the repointed delta.
+        shards: The shard paths to evaluate.
+
+    Returns:
+        Path to the written delta.
+    """
+    import yaml
+
+    from teb_vae.lag_attn_rws.eval.config_schema import load_eval_overrides
+    from teb_vae.lag_attn_transformer_rws.eval.binding import TRF_BINDING
+
+    overrides = load_eval_overrides(TRF_BINDING.overrides_path)
+    overrides["dataset_config"]["vae_test_datasets"] = list(shards)
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / "eval_overrides_repointed.yaml"
+    path.write_text(yaml.safe_dump(overrides, sort_keys=False), encoding="utf-8")
+    return path
+
+
+@pytest.fixture(scope="session")
+def repointed_overrides(multi_class_shards, tmp_path_factory) -> Path:
+    """This package's committed delta, repointed at the generated shards. Treat as read-only."""
+    return write_repointed_overrides(
+        tmp_path_factory.mktemp("eval_overrides"), multi_class_shards
+    )
+
+
+#: Optimizer steps the throwaway checkpoint runs, and the rate they run at.
+#:
+#: Few, deliberately. The checkpoint's job is to be a *loadable* one: preflight verifies a load in
+#: weight space by requiring the zero-initialised delta heads or FiLM generators to have moved, and
+#: a handful of Adam steps moves them. It is not a fit -- the generated shards are white noise, so
+#: no number of steps would make this model forecast them -- and every extra step is time every
+#: evaluation test in this package pays once.
+TRAINED_STEPS = 8
+TRAINED_LR = 1e-3
+
+
+@pytest.fixture(scope="session")
+def trained_run(multi_class_shards, tmp_path_factory) -> Path:
+    """A briefly-trained conv-Transformer checkpoint in a run-shaped directory.
+
+    Mirrors what the training entry point leaves behind -- ``model_checkpoints/`` holding the blob
+    and the resolved config beside it -- so the evaluation entry point reaches it exactly as it
+    would a production run, through ``resolved_config_for``.
+
+    ``gaussian_nll`` rather than the tiny config's ``mse``: the decoder's learned log-variance
+    heads are the observation model, and an ``mse`` checkpoint makes every calibration path a
+    permanent skip -- which would leave the smoke run asserting that an analysis skipped rather
+    than that it ran.
+
+    The training is what moves the posterior delta heads off zero. Those heads are
+    zero-initialised, so an untrained checkpoint is indistinguishable *in weight space* from one
+    that never loaded, and preflight would refuse it -- a fixture that fails preflight is a fixture
+    that tests nothing.
+    """
+    from teb_vae.lag_attn.config import load_config
+    from teb_vae.lag_attn_transformer_rws.nets.model import SeqVaeLagAttnTrfRws
+    from teb_vae.lag_attn_transformer_rws.task import SeqVaeLagAttnTrfRwsTask
+    from teb_vae.lag_attn_rws.trainer import RESOLVED_CONFIG_FILENAME
+    from teb_vae.lag_attn_transformer_rws.trainer import LagAttnTrfRwsTrainer
+    from train.data_module import GraphDataModule
+
+    import yaml
+
+    run_dir = tmp_path_factory.mktemp("trf_run")
+    checkpoint_dir = run_dir / "model_checkpoints"
+    checkpoint_dir.mkdir()
+
+    tiny = Path(_REPO_ROOT) / "teb_vae" / "lag_attn_transformer_rws" / "configs" / "tiny.yaml"
+    config = absolutize_dataset_paths(load_config(str(tiny)))
+    config["model_config"]["VAE_model"]["likelihood"] = "gaussian_nll"
+    config["dataset_config"]["vae_train_datasets"] = list(multi_class_shards)
+    config["dataset_config"]["vae_test_datasets"] = list(multi_class_shards)
+    config["dataset_config"]["dataloader_config"]["num_workers"] = 0
+    config["general_config"]["batch_size"] = {"train": 4, "test": 4}
+    config_path = run_dir / "config.yaml"
+    config_path.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
+
+    driver = LagAttnTrfRwsTrainer(config_file_path=str(config_path))
+    model_kwargs = driver._build_model_kwargs()
+    torch.manual_seed(0)
+    model = SeqVaeLagAttnTrfRws(**model_kwargs)
+    task = SeqVaeLagAttnTrfRwsTask(
+        model, lr=TRAINED_LR, model_kwargs=model_kwargs,
+        **dict(TASK_HPARAMS, likelihood="gaussian_nll"),
+    )
+    task.setup("fit")
+    task.train()
+
+    loader = GraphDataModule(config).train_dataloader()
+    optimizer = torch.optim.Adam(task.parameters(), lr=TRAINED_LR)
+    step = 0
+    while step < TRAINED_STEPS:
+        for index, batch in enumerate(loader):
+            loss, _metrics = task.compute_loss_and_metrics(batch, index, "train")
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            optimizer.step()
+            step += 1
+            if step >= TRAINED_STEPS:
+                break
+    task.eval()
+
+    blob = {"state_dict": task.state_dict(), "epoch": 0, "global_step": step,
+            "hyper_parameters": dict(task.hparams)}
+    task.on_save_checkpoint(blob)
+    checkpoint = checkpoint_dir / f"{LagAttnTrfRwsTrainer.CHECKPOINT_STEM}-epoch=00.ckpt"
+    torch.save(blob, checkpoint)
+    (checkpoint_dir / RESOLVED_CONFIG_FILENAME).write_text(
+        yaml.safe_dump(config, sort_keys=False), encoding="utf-8"
+    )
+    return checkpoint
+
+
+#: Retention for the shared evaluation fixture below. Only this model's own cap is set, and it is
+#: set rather than left absent for one reason: the artifact scan that reads this run has to reach
+#: the tables and figures **this package** writes, and an absent cap makes ``encoder_attention``
+#: record a skip and emit nothing. Eight is what the stratified draw needs to reach all three
+#: clinical classes across the eight subgroup shards. The other four caps stay absent, so the run
+#: costs no retention it does not need.
+EVALUATED_CAPS = {"encoder_attention": 8}
+
+
+@pytest.fixture(scope="session")
+def evaluated(trained_run, multi_class_shards, tmp_path_factory) -> Dict[str, Any]:
+    """One real evaluation run of this model; every assertion built on it questions the same run.
+
+    Driven through this package's committed override delta with its placeholder shards repointed,
+    which is what an operator does before a real run -- so the merge, the preflight guards it
+    satisfies and the generated multi-class shards are all exercised by the same pass.
+
+    Two Monte Carlo draws rather than the shipped eight: the tests reading this fixture are about
+    the artifacts rather than the numbers, and each draw decodes every branch over every anchor.
+
+    ``main`` returns the process **exit code**, not the summary path: an analysis failing must be
+    visible to a shell. The path is therefore assembled from the directory this fixture named,
+    which is what a caller with an explicit ``--output-dir`` does anyway.
+    """
+    import json
+
+    import yaml
+
+    from teb_vae.lag_attn_transformer_rws.eval import run as trf_run
+
+    overrides = write_repointed_overrides(
+        tmp_path_factory.mktemp("evaluated_overrides"), multi_class_shards
+    )
+    delta = yaml.safe_load(overrides.read_text(encoding="utf-8"))
+    delta["eval_config"]["caps"] = dict(EVALUATED_CAPS)
+    overrides.write_text(yaml.safe_dump(delta, sort_keys=False), encoding="utf-8")
+
+    output_dir = tmp_path_factory.mktemp("trf_eval")
+    exit_code = trf_run.main(
+        trained_run, output_dir, overrides=overrides, device="cpu", num_samples=2
+    )
+    results_dir = Path(output_dir) / trf_run.RESULTS_DIRNAME
+    summary_path = results_dir / trf_run.SUMMARY_FILENAME
+    text = summary_path.read_text(encoding="utf-8")
+    return {
+        "exit_code": exit_code,
+        "summary_path": summary_path,
+        "text": text,
+        "summary": json.loads(text),
+        "results_dir": results_dir,
+    }
 
 
 @pytest.fixture
