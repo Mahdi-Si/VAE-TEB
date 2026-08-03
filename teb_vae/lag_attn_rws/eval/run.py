@@ -91,6 +91,7 @@ from torch.utils.data import DataLoader, RandomSampler, Subset  # noqa: E402
 from teb_vae.lag_attn.config import load_config  # noqa: E402
 from teb_vae.lag_attn_rws.eval import cohort, collect, preflight, probe as probe_module  # noqa: E402
 from teb_vae.lag_attn_rws.eval._reuse import configure_numerics, subsample_indices  # noqa: E402
+from teb_vae.lag_attn_rws.eval.binding import ModelBinding  # noqa: E402
 from teb_vae.lag_attn_rws.eval.analyses import (  # noqa: E402
     GROUPED_FRAMES_KEY,
     AnalysisContext,
@@ -113,6 +114,7 @@ from teb_vae.lag_attn_rws.eval.analyses import sufficiency as sufficiency_analys
 from teb_vae.lag_attn_rws.eval.analyses import time_to_delivery as time_to_delivery_analysis  # noqa: E402
 from teb_vae.lag_attn_rws.eval.analyses import trajectory as trajectory_analysis  # noqa: E402
 from teb_vae.lag_attn_rws.eval.config_schema import (  # noqa: E402
+    DEFAULT_OVERRIDES_PATH,
     force_single_process_loader,
     merge_eval_overrides_with_provenance,
     validate_eval_config,
@@ -205,6 +207,53 @@ ANALYSIS_FUNCTIONS: Dict[str, Any] = {
 #: reader; the run itself derives the same tuple from the registry when it selects, so the two
 #: cannot disagree about what is registered.
 ANALYSES: Tuple[str, ...] = tuple(ANALYSIS_FUNCTIONS)
+
+#: The model this entry point evaluates. Everything below reads the facts it carries rather than
+#: naming a class, so a second architecture reuses this runner by passing its own binding instead
+#: of forking it -- which is what keeps one fix to an analysis reaching both models.
+#:
+#: ``extra_analyses`` is empty and a test in this package's suite pins it empty: the shared
+#: registry is the shared models' contract, and an analysis registered there would reach every
+#: model that uses this pipeline whether or not the question it answers means anything for them.
+RWS_BINDING = ModelBinding(
+    model_cls=SeqVaeLagAttnRws,
+    task_cls=SeqVaeLagAttnRwsTask,
+    tag="lag_attn_rws",
+    geometry_keys=preflight.GEOMETRY_KEYS,
+    encoder_disclosure=preflight.rws_encoder_disclosure,
+    overrides_path=DEFAULT_OVERRIDES_PATH,
+)
+
+
+def merged_analysis_functions(binding: ModelBinding) -> Dict[str, Any]:
+    """Return the shared registry with a binding's own analyses appended, in declaration order.
+
+    Built fresh on every call rather than once at import, so a test that replaces
+    :data:`ANALYSIS_FUNCTIONS` still drives what the run selects from -- and so the extras a
+    second package registers appear in its help text, its selection and its ``summary.json``
+    record from one place.
+
+    Args:
+        binding: The model binding whose ``extra_analyses`` are appended.
+
+    Returns:
+        A new ordered mapping: every shared analysis, then the binding's own.
+
+    Raises:
+        ValueError: If an extra analysis reuses a shared name. Replacing a shared implementation
+            silently would leave two models reporting different things under one name, which is
+            indistinguishable in the output from them agreeing.
+    """
+    collisions = sorted(set(binding.extra_analyses) & set(ANALYSIS_FUNCTIONS))
+    if collisions:
+        raise ValueError(
+            f"binding for {binding.model_cls.__name__} registers analyses whose names are "
+            f"already in the shared registry: {collisions}. An extra analysis is an addition, "
+            f"never an override: rename it, or -- if the shared implementation is genuinely "
+            f"wrong -- fix it there, where both models get the fix."
+        )
+    return {**ANALYSIS_FUNCTIONS, **binding.extra_analyses}
+
 
 #: Offsets applied to ``eval_config.seed`` for the four explicit generators. All non-zero and
 #: distinct, so the sample cap's draw, the loader's shuffle, the derangement and the Monte Carlo
@@ -334,7 +383,12 @@ def preserve_prior_summary(results_dir: Path) -> List[Path]:
     return preserved
 
 
-def make_output_dir(config: Dict[str, Any], explicit: Optional[Any] = None) -> Path:
+def make_output_dir(
+    config: Dict[str, Any],
+    explicit: Optional[Any] = None,
+    *,
+    binding: ModelBinding = RWS_BINDING,
+) -> Path:
     """Create and return the results directory for this evaluation run.
 
     An explicit directory is used as given, which is what makes the documented offline re-run
@@ -344,6 +398,9 @@ def make_output_dir(config: Dict[str, Any], explicit: Optional[Any] = None) -> P
     Args:
         config: The resolved run config, for its ``out_dir_base`` and ``tag``.
         explicit: An explicit run directory from ``--output-dir``, used as given.
+        binding: The model being evaluated, whose ``tag`` is the fallback when the config
+            declares none -- so two models' runs land in two directories rather than in one told
+            apart only by timestamp.
 
     Returns:
         The ``eval_results`` directory inside the run directory.
@@ -356,7 +413,7 @@ def make_output_dir(config: Dict[str, Any], explicit: Optional[Any] = None) -> P
 
     general = config.get("general_config") or {}
     base = Path(str((general.get("folders_config") or {}).get("out_dir_base", "output")))
-    tag = str(general.get("tag", "lag_attn_rws"))
+    tag = str(general.get("tag", binding.tag))
     # Second resolution, unlike training's minute stamp: two evaluation runs in the same minute
     # is normal, and the numeric suffix below is the backstop for the same second.
     stamp = datetime.now().strftime("%Y-%m-%d--[%H-%M-%S]")
@@ -553,8 +610,12 @@ def read_checkpoint(checkpoint_path: Any) -> Dict[str, Any]:
 
 
 def load_task(
-    checkpoint_path: Path, device: torch.device, *, blob: Optional[Dict[str, Any]] = None
-) -> SeqVaeLagAttnRwsTask:
+    checkpoint_path: Path,
+    device: torch.device,
+    *,
+    blob: Optional[Dict[str, Any]] = None,
+    binding: ModelBinding = RWS_BINDING,
+) -> Any:
     """Rebuild the net and its task from a checkpoint, and load the weights.
 
     The order is load-bearing: the class guard runs before construction, because the net's
@@ -566,6 +627,9 @@ def load_task(
         device: Device to place the model on.
         blob: An already-read checkpoint, so a caller that needed its ``model_kwargs`` before
             construction does not pay a second read. Read from ``checkpoint_path`` when omitted.
+        binding: The model to rebuild. Every refusal below names ``binding.model_cls``, so a run
+            of another architecture reports the class it was actually asked for rather than this
+            one's.
 
     Returns:
         The task, in evaluation mode on ``device``.
@@ -578,15 +642,16 @@ def load_task(
             initialised weights and report the result as a measurement.
     """
     checkpoint_path = Path(checkpoint_path)
+    model_name = binding.model_cls.__name__
     if blob is None:
         blob = read_checkpoint(checkpoint_path)
-    check_model_class(blob, SeqVaeLagAttnRws.__name__)
+    check_model_class(blob, model_name)
 
     model_kwargs = blob.get("model_kwargs") if isinstance(blob, dict) else None
     if not model_kwargs:
         raise RuntimeError(
             f"checkpoint {str(checkpoint_path)!r} carries no 'model_kwargs', so the architecture "
-            f"cannot be rebuilt. SeqVaeLagAttnRws() with no arguments builds the production "
+            f"cannot be rebuilt. {model_name}() with no arguments builds the production "
             f"geometry rather than raising, so guessing would silently evaluate the wrong model."
         )
     hparams = blob.get("hyper_parameters") if isinstance(blob, dict) else None
@@ -597,8 +662,8 @@ def load_task(
             f"assumed defaults would report a different objective's numbers."
         )
 
-    model = SeqVaeLagAttnRws(**model_kwargs)
-    task = SeqVaeLagAttnRwsTask(
+    model = binding.model_cls(**model_kwargs)
+    task = binding.task_cls(
         model,
         model_kwargs=model_kwargs,
         beta_schedule=hparams.get("beta_schedule"),
@@ -610,7 +675,7 @@ def load_task(
     )
     if load_checkpoint_strict(model=task.orig_model, checkpoint=blob) is None:
         raise RuntimeError(
-            f"could not align checkpoint {str(checkpoint_path)!r} into SeqVaeLagAttnRws: no "
+            f"could not align checkpoint {str(checkpoint_path)!r} into {model_name}: no "
             f"module matched its state dict. Evaluating would otherwise proceed on randomly "
             f"initialised weights and report the numbers as a result."
         )
@@ -845,26 +910,30 @@ def _finite(value: Any) -> Optional[float]:
 
 def build_run_context(
     *,
-    task: Optional[SeqVaeLagAttnRwsTask],
+    # Whichever task the binding named; every read below is through the shared interface.
+    task: Optional[Any],
     blob: Optional[Dict[str, Any]],
     config: Dict[str, Any],
     collection: collect.Collection,
 ) -> Dict[str, Any]:
     r"""Record the run facts the calibration study's tables consume.
 
-    Four things a summary must carry so the arm comparison and the first-run checklist are
+    Five things a summary must carry so the arm comparison and the first-run checklist are
     arithmetic rather than archaeology: the parameter count (the architecture arms are judged
-    per parameter), the checkpoint's training epoch, the anchor-coverage distribution the
-    ``coverage_floor`` is confirmed or revised against, and the observed magnitude of the
-    training objective the spike breaker's ``additive_margin`` is re-derived from.
+    per parameter), the checkpoint's training epoch, the class of model that produced the run
+    (which architecture a row belongs to, when a comparison spans more than one), the
+    anchor-coverage distribution the ``coverage_floor`` is confirmed or revised against, and the
+    observed magnitude of the training objective the spike breaker's ``additive_margin`` is
+    re-derived from.
 
-    Outside ``results`` deliberately: the first two are facts about the *checkpoint*, absent on
+    Outside ``results`` deliberately: the first three are facts about the *checkpoint*, absent on
     a pass that built no model, and ``results`` is the block an offline re-run must reproduce
     byte for byte.
 
     Args:
         task: The loaded task, or ``None`` on a pass with no checkpoint.
-        blob: The checkpoint blob, read for its training epoch. ``None`` without a checkpoint.
+        blob: The checkpoint blob, read for its training epoch and its model-class stamp.
+            ``None`` without a checkpoint.
         config: The merged run config, the fallback source of the objective weights.
         collection: The shared pass's output, read for the per-anchor coverage column and the
             aggregated readouts.
@@ -924,6 +993,14 @@ def build_run_context(
             else int(sum(parameter.numel() for parameter in task.orig_model.parameters()))
         ),
         "train_epoch": None if blob is None else blob.get("epoch"),
+        # Which architecture produced the run. Copied out of the checkpoint's own stamp -- the
+        # only place it is written -- because a run directory otherwise records it nowhere: the
+        # dumped config carries every constructor keyword and not the class they build. A table
+        # that ranks two architectures against each other has to key its rows on something, and
+        # the alternatives are the directory name, which a rename would relabel, or the geometry,
+        # which two arms of one model can differ in. ``None`` on a pass that read no checkpoint,
+        # exactly as the two facts above are.
+        "model_class": None if blob is None else blob.get("model_class"),
         "anchor_coverage_frac": coverage,
         "observed_loss_scale": {
             "nll_full_block": nll_full,
@@ -960,8 +1037,14 @@ def main(
     only: Optional[str] = None,
     skip: Optional[str] = None,
     argument_sources: Optional[Dict[str, str]] = None,
+    binding: ModelBinding = RWS_BINDING,
 ) -> int:
     """Evaluate a checkpoint -- or re-read a finished run -- and write ``summary.json``.
+
+    **The binding decides which model is rebuilt**, which override delta is merged when none is
+    given, which constructor keys preflight reconciles, and which analyses run on top of the
+    shared registry. Everything else here is architecture-independent, which is what lets a second
+    model reuse this function instead of copying it.
 
     Everything that shapes the run comes from the merged configuration's ``eval_config`` block --
     the seed, the Monte Carlo draw count, the two verdict thresholds -- rather than from
@@ -984,6 +1067,8 @@ def main(
             every one of them, which is the default.
         skip: Comma-separated analyses to skip, from :data:`ANALYSES`. ``None`` skips none.
         argument_sources: Which source supplied each argument, recorded in ``summary.json``.
+        binding: The model being evaluated. Defaults to this package's, so every existing call
+            site says nothing extra.
 
     Returns:
         The process exit code: non-zero when any step failed. **Not** the sanity block's warning
@@ -1005,7 +1090,15 @@ def main(
         # load_config is a no-op on an already-resolved file (it carries no `base:` key) and is
         # used anyway so there is exactly one config reader in the tree.
         run_config = load_config(str(config_path))
-        config, overridden = merge_eval_overrides_with_provenance(run_config, overrides)
+        # The delta is the binding's own when none was named, so the default follows the model
+        # rather than whichever module the merge happens to live in. The two committed deltas are
+        # held equal by test today -- one evaluation protocol is what makes the cross-model
+        # comparison mean anything -- so this is not about which shards ship; it is that each
+        # package owns a self-contained delta documenting its own launch commands, and an
+        # operator's repointed copy of one must not be read for a run of the other.
+        config, overridden = merge_eval_overrides_with_provenance(
+            run_config, binding.overrides_path if overrides is None else overrides
+        )
     else:
         # No checkpoint: the run being re-read already dumped the merged configuration it used,
         # and re-deriving one from today's committed delta would evaluate the tables in this
@@ -1019,13 +1112,16 @@ def main(
     # analysis name must cost a parse rather than a model load and a first pass over the shards.
     eval_config = validate_eval_config(config)
     config["eval_config"] = eval_config
-    selected = select_analyses(tuple(ANALYSIS_FUNCTIONS), only, skip)
+    # Built once and used for the selection, the run loop and the record below, so the three
+    # cannot disagree about what this model's registry holds.
+    registry = merged_analysis_functions(binding)
+    selected = select_analyses(tuple(registry), only, skip)
 
     seed = int(eval_config["seed"])
     numerics = configure_numerics(seed)
     resolved_device = resolve_device(device)
 
-    results_dir = make_output_dir(config, output_dir)
+    results_dir = make_output_dir(config, output_dir, binding=binding)
     sink_id = configure_logging(results_dir, config)
     report = Report()
     try:
@@ -1042,7 +1138,7 @@ def main(
             # The blob is read once and handed on, so the reconciliation below compares against
             # the checkpoint's own record rather than against a second read of the same file.
             blob = read_checkpoint(checkpoint_path)
-            task = load_task(checkpoint_path, resolved_device, blob=blob)
+            task = load_task(checkpoint_path, resolved_device, blob=blob, binding=binding)
             # Outside any failure isolation: a refusal must reach the operator as a refusal
             # rather than as a step that happened to fail, and must leave no summary behind it.
             preflight_record = preflight.run_preflight(
@@ -1051,6 +1147,7 @@ def main(
                 checkpoint_path=checkpoint_path,
                 model_kwargs=blob.get("model_kwargs") or {},
                 hyper_parameters=dict(task.hparams),
+                binding=binding,
             )
             preflight.write_preflight(preflight_record, results_dir)
         else:
@@ -1104,7 +1201,7 @@ def main(
             probe=probe_record,
         )
         run_analyses(
-            report, selected, ANALYSIS_FUNCTIONS,
+            report, selected, registry,
             context=context, eval_config=eval_config, output_dir=results_dir,
             probe=probe_record,
         )
@@ -1133,6 +1230,10 @@ def main(
             per_sample=collection.per_sample,
             per_anchor=collection.per_anchor,
             probe=probe_record,
+            # What this model's own analyses put in the headline, appended to the shared registry.
+            # Empty for a model that registers none, which is why the block below is identical for
+            # a run that adds nothing.
+            headline_scalars=binding.headline_scalars,
         )
 
         summary = {
@@ -1243,7 +1344,8 @@ def read_preflight(results_dir: Path) -> Dict[str, Any]:
 def load_or_collect_tables(
     results_dir: Path,
     *,
-    task: Optional[SeqVaeLagAttnRwsTask],
+    # Whichever task the binding named; every read below is through the shared interface.
+    task: Optional[Any],
     config: Dict[str, Any],
     eval_config: Dict[str, Any],
     checkpoint_path: Optional[Path],

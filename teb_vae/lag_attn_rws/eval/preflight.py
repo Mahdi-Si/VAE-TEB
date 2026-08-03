@@ -40,12 +40,13 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Tuple, cast
+from typing import Any, Callable, Dict, List, Mapping, Tuple, cast
 
 import torch
 from loguru import logger
 
 from teb_vae.lag_attn_rws import channel_reach
+from teb_vae.lag_attn_rws.eval.binding import ModelBinding
 from teb_vae.lag_attn_rws.nets.lag_report import SECONDS_PER_STEP
 
 # The training entry point's own guards, imported rather than copied. Their messages name the
@@ -85,6 +86,11 @@ REQUIRED_EVAL_LOAD_FIELDS: Tuple[str, ...] = (
 #: Constructor keys reconciled against the checkpoint's own ``model_kwargs``. Every one of them
 #: changes what the numbers mean: the geometry decides which raw samples an anchor forecasts, and
 #: the widths decide which channels feed which stream.
+#:
+#: This is the *rws* model's set, and it is what ``RWS_BINDING.geometry_keys`` is built from. The
+#: reconciliation itself takes the tuple as an argument, because a second architecture reconciles
+#: a different set -- its own encoder's keys, and not ``causal_norm``, which its constructor
+#: refuses outright.
 GEOMETRY_KEYS: Tuple[str, ...] = (
     "sequence_length",
     "d_model",
@@ -359,6 +365,7 @@ def reconcile_with_checkpoint(
     *,
     model_kwargs: Mapping[str, Any],
     hyper_parameters: Mapping[str, Any],
+    geometry_keys: Tuple[str, ...],
 ) -> Dict[str, Any]:
     """Refuse a config that contradicts the checkpoint it is being used to evaluate.
 
@@ -378,6 +385,10 @@ def reconcile_with_checkpoint(
         config: The merged run config.
         model_kwargs: The checkpoint's own constructor kwargs.
         hyper_parameters: The checkpoint's own task hyperparameters.
+        geometry_keys: The constructor keys to compare, from the binding of the model being
+            evaluated. A key absent from the tuple is not compared and does not appear in the
+            ``compared`` record, so a narrowed set is visible in the artifact rather than silently
+            passing a config the run never checked.
 
     Returns:
         The reconciliation record: what was compared and what the checkpoint carries.
@@ -389,7 +400,7 @@ def reconcile_with_checkpoint(
     compared: Dict[str, Any] = {}
     disagreements: List[str] = []
 
-    for key in GEOMETRY_KEYS:
+    for key in geometry_keys:
         if key not in vae_config or key not in model_kwargs:
             continue
         config_value, checkpoint_value = vae_config[key], model_kwargs[key]
@@ -554,43 +565,45 @@ def channels_reading_past_the_horizon(horizon_seconds: float) -> Dict[str, Any]:
     }
 
 
-def causality_disclosure(config: Mapping[str, Any], model: Any) -> Dict[str, Any]:
-    """Record what this run's causal standing actually is, in the run's own artifacts.
+#: The causality-record keys the *shared* half owns, which no encoder disclosure may return. They
+#: are properties of the feature bank and the geometry rather than of either encoder, and a reader
+#: comparing two models' ``preflight.json`` files compares them down these exact names.
+SHARED_CAUSALITY_KEYS: frozenset = frozenset({
+    "not_causal",
+    "statement",
+    "max_channel_reach_s",
+    "causal_reach_budget_s",
+    "source_delay_steps",
+    "source_delay_seconds",
+    "source_delay_is_max_over_channels",
+    "horizon_seconds",
+    "channels_reading_past_the_horizon",
+})
 
-    Unconditional, including the refusal sentence. A finite reach budget prunes channels on a
-    $95\\%$-energy quantile and delays the survivors; it narrows the leak, it does not close it,
-    and no budget currently trains. So the statement stands at every budget and the budget's
-    effect is recorded beside it rather than in place of it.
+
+def rws_encoder_disclosure(model: Any) -> Dict[str, Any]:
+    """Return the encoder-specific half of the causality record for the recurrent encoder.
+
+    Split out of :func:`causality_disclosure` because it is the one part of that record that is a
+    property of the *encoder* rather than of the feature bank: the refusal sentence, the channel
+    reaches, the source delay and the horizon are true of any model reading this dataset, while
+    ``causal_norm`` is a key one architecture has and another has no equivalent for. Each model
+    discloses what is true of it, and a shared key that means nothing in one of them would be
+    worse than two honest blocks.
+
+    Takes ``model: Any`` and imports no model class, so the module stays free of the network it
+    describes.
 
     Args:
-        config: The merged run config, for the configured budget.
         model: The rebuilt net, which is what was trained and is therefore the authority on the
             guard it actually carries.
 
     Returns:
-        The disclosure record, promoted into ``summary.json`` as well as written to
-        ``preflight.json``.
+        The encoder's own keys, merged into the causality record in this order.
     """
-    horizon_seconds = float(model.horizon) * SECONDS_PER_STEP
-    delay_steps = int(model.source_delay_steps)
-    per_block = channels_reading_past_the_horizon(horizon_seconds)
     record: Dict[str, Any] = {
-        "not_causal": True,
-        "statement": NOT_CAUSAL_STATEMENT,
-        # The number the statement points at, recomputed from the bank rather than restated.
-        "max_channel_reach_s": max(
-            (entry["max_reach_s"] for entry in per_block.values()), default=0.0
-        ),
-        "causal_reach_budget_s": _vae_config(config).get("causal_reach_budget_s"),
         "causal_norm": bool(model.causal_norm),
         "n_causalized_norms": int(model.n_causalized_norms),
-        "source_delay_steps": delay_steps,
-        "source_delay_seconds": delay_steps * SECONDS_PER_STEP,
-        # Per-channel delays have no single representative, so the maximum is used and every lag
-        # computed from it is an upper bound. Recorded beside the number so the choice travels.
-        "source_delay_is_max_over_channels": True,
-        "horizon_seconds": horizon_seconds,
-        "channels_reading_past_the_horizon": per_block,
     }
     if not record["causal_norm"]:
         # A second, independent failure of the same interpretation, and the more serious one: the
@@ -605,6 +618,66 @@ def causality_disclosure(config: Mapping[str, Any], model: Any) -> Dict[str, Any
     return record
 
 
+def causality_disclosure(
+    config: Mapping[str, Any],
+    model: Any,
+    encoder_disclosure: Callable[[Any], Dict[str, Any]] = rws_encoder_disclosure,
+) -> Dict[str, Any]:
+    """Record what this run's causal standing actually is, in the run's own artifacts.
+
+    Unconditional, including the refusal sentence. A finite reach budget prunes channels on a
+    $95\\%$-energy quantile and delays the survivors; it narrows the leak, it does not close it,
+    and no budget currently trains. So the statement stands at every budget and the budget's
+    effect is recorded beside it rather than in place of it.
+
+    Args:
+        config: The merged run config, for the configured budget.
+        model: The rebuilt net, which is what was trained and is therefore the authority on the
+            guard it actually carries.
+        encoder_disclosure: Returns the encoder-specific keys, merged in at the position they
+            occupy in the record. Defaults to this model's, so a caller with one model to
+            evaluate says nothing extra; a run of another architecture passes its own through
+            the binding.
+
+    Returns:
+        The disclosure record, promoted into ``summary.json`` as well as written to
+        ``preflight.json``.
+    """
+    horizon_seconds = float(model.horizon) * SECONDS_PER_STEP
+    delay_steps = int(model.source_delay_steps)
+    per_block = channels_reading_past_the_horizon(horizon_seconds)
+    # The encoder's own block, whatever it turns out to be for this architecture. Checked against
+    # the keys the shared record owns before it is merged: the splat sits mid-literal, so a reused
+    # name would either replace a shared key -- including ``statement``, the refusal sentence this
+    # function documents as unconditional -- or be dropped by a key below it, and both would be
+    # silent in an artifact whose whole purpose is to be read literally.
+    disclosed = encoder_disclosure(model)
+    reserved = sorted(set(disclosed) & SHARED_CAUSALITY_KEYS)
+    if reserved:
+        raise ValueError(
+            f"the encoder disclosure returned key(s) the shared causality record already owns: "
+            f"{reserved}. An encoder discloses what is true of *it*; the shared half is not "
+            f"overridable, because a reader compares two models' records down these key names."
+        )
+    return {
+        "not_causal": True,
+        "statement": NOT_CAUSAL_STATEMENT,
+        # The number the statement points at, recomputed from the bank rather than restated.
+        "max_channel_reach_s": max(
+            (entry["max_reach_s"] for entry in per_block.values()), default=0.0
+        ),
+        "causal_reach_budget_s": _vae_config(config).get("causal_reach_budget_s"),
+        **disclosed,
+        "source_delay_steps": delay_steps,
+        "source_delay_seconds": delay_steps * SECONDS_PER_STEP,
+        # Per-channel delays have no single representative, so the maximum is used and every lag
+        # computed from it is an upper bound. Recorded beside the number so the choice travels.
+        "source_delay_is_max_over_channels": True,
+        "horizon_seconds": horizon_seconds,
+        "channels_reading_past_the_horizon": per_block,
+    }
+
+
 # =============================================================================
 # The run
 # =============================================================================
@@ -615,6 +688,7 @@ def run_preflight(
     checkpoint_path: Any,
     model_kwargs: Mapping[str, Any],
     hyper_parameters: Mapping[str, Any],
+    binding: ModelBinding,
 ) -> Dict[str, Any]:
     """Run every guard, then record the run's causal standing.
 
@@ -630,6 +704,9 @@ def run_preflight(
         checkpoint_path: The checkpoint being evaluated, recorded in the output.
         model_kwargs: The checkpoint's own constructor kwargs.
         hyper_parameters: The checkpoint's own task hyperparameters.
+        binding: The binding of the model being evaluated, for the constructor keys the
+            reconciliation compares and the encoder half of the causality record. Passed in
+            rather than imported, so this module still names no model class.
 
     Returns:
         The preflight record, ready for :func:`write_preflight`.
@@ -651,7 +728,10 @@ def run_preflight(
     )
 
     reconciliation = reconcile_with_checkpoint(
-        config, model_kwargs=model_kwargs, hyper_parameters=hyper_parameters
+        config,
+        model_kwargs=model_kwargs,
+        hyper_parameters=hyper_parameters,
+        geometry_keys=binding.geometry_keys,
     )
     load_check = verify_weights_loaded(model)
 
@@ -679,7 +759,7 @@ def run_preflight(
             "config_matches_checkpoint": reconciliation,
             "weights_loaded": load_check,
         },
-        "causality": causality_disclosure(config, model),
+        "causality": causality_disclosure(config, model, binding.encoder_disclosure),
     }
 
 

@@ -248,6 +248,29 @@ def test_the_walk_found_modules_to_check() -> None:
     assert len(modules) >= 4, f"only found {[path.name for path in modules]}"
 
 
+def test_the_model_binding_is_walked_and_sits_at_layer_zero() -> None:
+    """The walk is directory-driven, so this is what says the file was actually picked up rather
+    than that a rule happened to hold over a set it was not in.
+
+    ``binding`` holds the facts the pipeline cannot derive about the model it is evaluating, and
+    it stays at layer 0 precisely so that naming those facts costs no ``torch`` import: the
+    acceptance gate and the documentation tests read the type without a numeric stack. It carries
+    no exemption, because a module that named a model class would not be at layer 0 at all.
+    """
+    stems = {module.stem for module in _shipped_modules()}
+    assert "binding" in stems
+
+    binding = next(module for module in _shipped_modules() if module.stem == "binding")
+    names = imported_names(binding.read_text(encoding="utf-8"), _module_name_for(binding))
+
+    assert forbidden_imports(binding.read_text(encoding="utf-8"), _module_name_for(binding)) == []
+    assert "binding" not in EXEMPTIONS
+    assert "binding" not in MODEL_TOUCHING
+    # Stdlib only, so importing the seam costs nothing: no torch, no numpy, no matplotlib, and
+    # nothing from this repository -- which is what keeps a concrete binding out of this module.
+    assert all(not name.startswith(("torch", "numpy", "matplotlib", "teb_vae")) for name in names)
+
+
 @pytest.mark.parametrize(
     "module", _shipped_modules(), ids=lambda path: str(path.relative_to(EVAL_ROOT))
 )

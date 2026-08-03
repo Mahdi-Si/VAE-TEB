@@ -24,6 +24,7 @@ from pathlib import Path
 import pytest
 import torch
 import yaml
+from loguru import logger
 
 from teb_vae.lag_attn.config import load_config
 from teb_vae.lag_attn_rws import channel_reach
@@ -65,6 +66,7 @@ def _run(config: dict, loaded: dict) -> dict:
         checkpoint_path=loaded["checkpoint"],
         model_kwargs=loaded["model_kwargs"],
         hyper_parameters=loaded["hyper_parameters"],
+        binding=run_module.RWS_BINDING,
     )
 
 
@@ -200,6 +202,7 @@ def test_a_width_mismatch_against_the_shard_is_refused(config, loaded, monkeypat
             checkpoint_path=loaded["checkpoint"],
             model_kwargs=loaded["model_kwargs"],
             hyper_parameters=loaded["hyper_parameters"],
+            binding=run_module.RWS_BINDING,
         )
 
 
@@ -256,6 +259,62 @@ def test_a_key_the_config_omits_defers_to_the_constructor(config, loaded) -> Non
     assert record["passed"] is True
 
 
+def test_the_compared_set_is_the_bindings_and_a_narrower_one_is_visible(config, loaded) -> None:
+    """Which keys are reconciled is the binding's, not this module's, because a second
+    architecture reconciles a different set -- its own encoder's, and not ``causal_norm``.
+
+    A narrowed tuple must *narrow the comparison* rather than raise: the record then shows the
+    dropped key absent from ``compared``, so a run that quietly stopped checking something is
+    legible in its own artifact instead of passing indistinguishably from one that checked it.
+    """
+    full = preflight.reconcile_with_checkpoint(
+        config,
+        model_kwargs=loaded["model_kwargs"],
+        hyper_parameters=loaded["hyper_parameters"],
+        geometry_keys=run_module.RWS_BINDING.geometry_keys,
+    )
+    narrowed = preflight.reconcile_with_checkpoint(
+        config,
+        model_kwargs=loaded["model_kwargs"],
+        hyper_parameters=loaded["hyper_parameters"],
+        geometry_keys=tuple(
+            key for key in run_module.RWS_BINDING.geometry_keys if key != "d_z"
+        ),
+    )
+
+    assert "d_z" in full["compared"]
+    assert narrowed["passed"] is True
+    assert "d_z" not in narrowed["compared"]
+    # Only that key moved: the objective keys are reconciled from their own tuple and are
+    # untouched by a change to the geometry set.
+    assert set(full["compared"]) - set(narrowed["compared"]) == {"d_z"}
+
+
+def test_a_key_the_binding_drops_is_no_longer_refused(config, loaded) -> None:
+    """The other direction, and the one that matters for a second model: a config contradicting
+    a key the binding does not carry must pass, because that key is not part of this
+    architecture's geometry at all."""
+    broken = copy.deepcopy(config)
+    broken["model_config"]["VAE_model"]["d_z"] = int(loaded["model_kwargs"]["d_z"]) + 1
+
+    with pytest.raises(EvalPreconditionUnmet, match="d_z"):
+        preflight.reconcile_with_checkpoint(
+            broken,
+            model_kwargs=loaded["model_kwargs"],
+            hyper_parameters=loaded["hyper_parameters"],
+            geometry_keys=run_module.RWS_BINDING.geometry_keys,
+        )
+
+    assert preflight.reconcile_with_checkpoint(
+        broken,
+        model_kwargs=loaded["model_kwargs"],
+        hyper_parameters=loaded["hyper_parameters"],
+        geometry_keys=tuple(
+            key for key in run_module.RWS_BINDING.geometry_keys if key != "d_z"
+        ),
+    )["passed"] is True
+
+
 # =============================================================================
 # Weight-space load verification
 # =============================================================================
@@ -301,6 +360,90 @@ def test_a_model_perturbed_only_through_its_posterior_still_passes(loaded) -> No
 # =============================================================================
 # Causality and reach disclosure
 # =============================================================================
+def test_the_disclosure_is_assembled_exactly_as_it_is_written_down(config, loaded) -> None:
+    """The whole record, against a dict written out by hand: key for key, value for value and in
+    order. The encoder's half arrives through a callable rather than being read inline, and an
+    extraction that changed *what* the record says -- or where a key sits in it -- would be
+    invisible to every assertion that reads one key at a time.
+    """
+    model = loaded["model"]
+    horizon_seconds = float(model.horizon) * 4.0
+    per_block = preflight.channels_reading_past_the_horizon(horizon_seconds)
+    expected = {
+        "not_causal": True,
+        "statement": preflight.NOT_CAUSAL_STATEMENT,
+        "max_channel_reach_s": max(entry["max_reach_s"] for entry in per_block.values()),
+        "causal_reach_budget_s": config["model_config"]["VAE_model"]["causal_reach_budget_s"],
+        "causal_norm": bool(model.causal_norm),
+        "n_causalized_norms": int(model.n_causalized_norms),
+        "source_delay_steps": int(model.source_delay_steps),
+        "source_delay_seconds": int(model.source_delay_steps) * 4.0,
+        "source_delay_is_max_over_channels": True,
+        "horizon_seconds": horizon_seconds,
+        "channels_reading_past_the_horizon": per_block,
+    }
+
+    record = preflight.causality_disclosure(config, model)
+
+    assert record == expected
+    assert list(record) == list(expected)
+    # And the same record when the callable is passed explicitly, which is how a run reaches it.
+    assert (
+        preflight.causality_disclosure(config, model, preflight.rws_encoder_disclosure) == expected
+    )
+
+
+def test_the_encoder_half_is_this_encoders_and_carries_its_consequence(loaded) -> None:
+    """``causal_norm`` is a property of the recurrent encoder rather than of the feature bank, so
+    it and its consequence sentence live in the callable the binding supplies. The warning is
+    part of the disclosure: a run whose prior conditions on its own future must say so in the log
+    as well as in the record."""
+
+    class _Pooling:
+        causal_norm, n_causalized_norms = False, 0
+
+    assert preflight.rws_encoder_disclosure(loaded["model"]) == {
+        "causal_norm": bool(loaded["model"].causal_norm),
+        "n_causalized_norms": int(loaded["model"].n_causalized_norms),
+    }
+
+    pooling = preflight.rws_encoder_disclosure(_Pooling())
+    assert pooling["causal_norm"] is False
+    assert "p(z_t | Y_<=t) conditions on Y_>t" in pooling["causal_norm_consequence"]
+
+
+def test_the_consequence_is_logged_and_not_only_recorded(loaded) -> None:
+    """An operator reading the console must be told; a sentence only in ``preflight.json`` is a
+    sentence nobody sees until after the run."""
+
+    class _Pooling:
+        causal_norm, n_causalized_norms = False, 0
+
+    warnings = []
+    sink = logger.add(lambda message: warnings.append(str(message)), level="WARNING")
+    try:
+        preflight.rws_encoder_disclosure(_Pooling())
+    finally:
+        logger.remove(sink)
+
+    assert any("causal_norm=False" in message for message in warnings)
+
+
+def test_a_binding_may_disclose_something_else_entirely(config, loaded) -> None:
+    """What makes the seam a seam: an encoder with no ``causal_norm`` discloses its own facts and
+    the record carries no key that means nothing for it. The bank-side half is unchanged, because
+    it describes the dataset rather than the encoder."""
+    record = preflight.causality_disclosure(
+        config, loaded["model"], lambda model: {"time_pooling_norms": 0}
+    )
+
+    assert record["time_pooling_norms"] == 0
+    assert "causal_norm" not in record
+    assert "n_causalized_norms" not in record
+    assert record["statement"] == preflight.NOT_CAUSAL_STATEMENT
+    assert record["channels_reading_past_the_horizon"]
+
+
 def test_the_disclosure_records_the_guard_the_model_actually_carries(config, loaded) -> None:
     record = _run(config, loaded)["causality"]
     model = loaded["model"]

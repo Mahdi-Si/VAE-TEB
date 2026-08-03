@@ -510,9 +510,16 @@ def test_the_procedure_is_executable_rather_than_a_result(results):
 # No roadmap in the shipped tree
 # ---------------------------------------------------------------------------------------
 #: Files the roadmap-token ban does not apply to. This module names every banned token as a
-#: literal, and the planning document is the artefact the ban exists to keep *out* of everything
-#: else -- it does not survive the module, and a reference to it from a shipped file would dangle.
-_ROADMAP_BAN_EXEMPT = frozenset({Path(__file__).name, "SPEC_AND_SPRINTS.md"})
+#: literal, and a planning document is the artefact the ban exists to keep *out* of everything
+#: else -- it does not survive the work, and a reference to it from a shipped file would dangle.
+#:
+#: Both roadmaps are exempt: the model's, and the evaluation package's own. They are the same kind
+#: of document and they live inside the package for the same reason -- the work they describe is
+#: this package's -- so a ban that caught one of them would be catching the artefact it protects
+#: rather than a leak from it.
+_ROADMAP_BAN_EXEMPT = frozenset(
+    {Path(__file__).name, "SPEC_AND_SPRINTS.md", "EVAL_SPEC_AND_SPRINTS.md"}
+)
 
 #: Tokens no shipped file may carry: the planning document's name, its section word, and its task
 #: identifiers. The word "task" is deliberately not banned -- ``task.py`` is a module of this
