@@ -14,7 +14,7 @@ from pathlib import Path
 
 import pytest
 
-from teb_vae.lag_attn_rws.eval import probe as probe_module
+from teb_vae.lag_attn_rws.eval import launch, probe as probe_module
 from teb_vae.lag_attn_rws.tests.conftest import (
     MULTI_CLASS_GUIDS_PER_SHARD,
     MULTI_CLASS_SEGMENTS_PER_GUID,
@@ -245,14 +245,37 @@ def test_main_merges_the_committed_overrides_over_the_run_s_own_config(
     assert (tmp_path / "results" / probe_module.PROBE_FILENAME).is_file()
 
 
-def test_the_parser_requires_a_config_and_defaults_the_rest() -> None:
+def test_the_parser_takes_a_config_and_defaults_the_rest() -> None:
     args = probe_module.build_parser().parse_args(["--config", "run/resolved_config.yaml"])
 
     assert args.config == "run/resolved_config.yaml"
     assert args.overrides is None and args.output_dir is None and args.max_batches is None
 
-    with pytest.raises(SystemExit):
-        probe_module.build_parser().parse_args([])
+
+def test_a_config_is_still_required_but_the_entry_point_is_what_requires_it() -> None:
+    """The guarantee is unchanged -- the probe reads a run config and there is none to guess -- but
+    it is enforced after the launch dict is merged rather than by ``required=True``, which fires
+    before ``RUN_ARGS`` is ever read and would make an IDE Run-button launch impossible. So the
+    parser accepts an empty command line and the entry point is what refuses it."""
+    assert probe_module.build_parser().parse_args([]).config is None
+
+    with pytest.raises(SystemExit) as excinfo:
+        probe_module._cli([])
+
+    # The operator who hit Run typed no command line, so "pass --config" alone is unactionable.
+    message = str(excinfo.value.code)
+    assert "--config" in message and "RUN_ARGS" in message
+
+
+def test_a_config_supplied_only_by_the_launch_dict_satisfies_the_requirement() -> None:
+    """The other direction, and the point of the dict: with the value filled in there is nothing
+    left to refuse, so pressing Run gets a probe rather than a usage error."""
+    values, sources = launch.resolve_launch_args(
+        probe_module.build_parser(), {"config": "run/resolved_config.yaml"}, []
+    )
+
+    assert (values["config"], sources["config"]) == ("run/resolved_config.yaml", "config")
+    assert launch.missing_required(values, ("config",)) is None
 
 
 def test_the_module_is_runnable_on_its_own() -> None:

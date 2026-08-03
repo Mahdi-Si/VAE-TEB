@@ -91,6 +91,7 @@ from torch.utils.data import DataLoader, RandomSampler, Subset  # noqa: E402
 from teb_vae.lag_attn.config import load_config  # noqa: E402
 from teb_vae.lag_attn_rws.eval import cohort, collect, preflight, probe as probe_module  # noqa: E402
 from teb_vae.lag_attn_rws.eval._reuse import configure_numerics, subsample_indices  # noqa: E402
+from teb_vae.lag_attn_rws.eval import launch  # noqa: E402
 from teb_vae.lag_attn_rws.eval.binding import ModelBinding  # noqa: E402
 from teb_vae.lag_attn_rws.eval.analyses import (  # noqa: E402
     GROUPED_FRAMES_KEY,
@@ -1605,31 +1606,11 @@ def resolve_arguments(
             would otherwise silently do nothing, which is the same class of failure the
             ``eval_config`` validator guards against.
     """
-    parser = build_parser() if parser is None else parser
-    fallback = dict(RUN_ARGS if run_args is None else run_args)
-
-    valid_dests = {action.dest for action in parser._actions if action.dest != "help"}
-    unknown = sorted(set(fallback) - valid_dests)
-    if unknown:
-        raise ValueError(
-            f"RUN_ARGS carries key(s) that are not command-line arguments: "
-            f"{', '.join(repr(key) for key in unknown)}. Valid keys are: "
-            f"{', '.join(sorted(valid_dests))}. RUN_ARGS is a launch convenience, not a second "
-            f"configuration surface -- settings that shape the run belong in the override delta, "
-            f"which is dumped into the run directory."
-        )
-
-    parsed = vars(parser.parse_args(list(argv) if argv is not None else None))
-    values: Dict[str, Any] = {}
-    sources: Dict[str, str] = {}
-    for key in sorted(valid_dests):
-        if parsed.get(key) is not None:
-            values[key], sources[key] = parsed[key], "cli"
-        elif fallback.get(key) is not None:
-            values[key], sources[key] = fallback[key], "config"
-        else:
-            values[key], sources[key] = None, "default"
-    return values, sources
+    return launch.resolve_launch_args(
+        build_parser() if parser is None else parser,
+        RUN_ARGS if run_args is None else run_args,
+        argv,
+    )
 
 
 def _cli(argv: Optional[List[str]] = None) -> int:
