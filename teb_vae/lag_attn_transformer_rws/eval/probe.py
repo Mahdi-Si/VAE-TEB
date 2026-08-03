@@ -33,7 +33,7 @@ if not __package__ and _REPO_ROOT not in sys.path:
 
 from loguru import logger  # noqa: E402
 
-from teb_vae.lag_attn_rws.eval import probe as shared_probe  # noqa: E402
+from teb_vae.lag_attn_rws.eval import launch, probe as shared_probe  # noqa: E402
 from teb_vae.lag_attn_transformer_rws.eval.binding import TRF_BINDING  # noqa: E402
 
 #: Re-exported so a caller does not reach into the sibling for the name the probe writes under.
@@ -75,8 +75,10 @@ def build_parser() -> argparse.ArgumentParser:
         description="Report what the evaluation split actually yields. No model, no checkpoint.",
     )
     parser.add_argument(
-        "--config", required=True,
-        help="Run config to probe; normally the resolved_config.yaml beside the checkpoints.",
+        "--config", default=None,
+        help="Run config to probe; normally the resolved_config.yaml beside the checkpoints. "
+             "Required, but not by argparse: it is enforced after the launch dict is merged, "
+             "because required=True fires before RUN_ARGS is ever consulted.",
     )
     parser.add_argument(
         "--overrides", default=None,
@@ -96,21 +98,46 @@ def build_parser() -> argparse.ArgumentParser:
 
 def _cli(argv: Optional[List[str]] = None) -> int:
     """Parse arguments and run. Returns the process exit code."""
-    args = build_parser().parse_args(argv)
+    values, sources = launch.resolve_launch_args(build_parser(), RUN_ARGS, argv)
+    refusal = launch.missing_required(values, ("config",))
+    if refusal:
+        raise SystemExit(refusal)
     if os.path.abspath(os.getcwd()) != _REPO_ROOT:
         # Shard paths inside a config are repo-root-relative for the tiny variant, and a relative
         # path resolved against an arbitrary working directory surfaces as "no samples match the
         # specified filters" with no mention of the real cause.
         logger.info(f"changing working directory to the repo root: {_REPO_ROOT}")
         os.chdir(_REPO_ROOT)
+    logger.info(
+        "resolved arguments: "
+        + ", ".join(f"{key}={values[key]!r} (from {sources[key]})" for key in sorted(values))
+    )
     record = main(
-        args.config,
-        overrides=args.overrides,
-        max_batches=args.max_batches,
-        output_dir=args.output_dir,
+        values["config"],
+        overrides=values["overrides"],
+        max_batches=values["max_batches"],
+        output_dir=values["output_dir"],
     )
     print(shared_probe.format_cohort_table(record))
     return 0
+
+
+#: Values used for arguments absent from the command line -- i.e. an IDE's Run button.
+#:
+#: Keyed by argparse ``dest``. Resolution is per key, so a flag overrides one value and leaves the
+#: rest standing, and a key that is not an argparse ``dest`` raises at startup.
+#:
+#: **Running this file directly needs ``config`` filled in below**: the probe reads a run config
+#: and reports what its evaluation split actually yields, and there is no default worth guessing.
+#: Point it at the ``resolved_config.yaml`` beside the checkpoints. Everything else is optional --
+#: ``overrides`` defaults to this package's committed delta, and omitting ``output_dir`` reports
+#: without writing.
+RUN_ARGS: Dict[str, Any] = {
+    "config": None,
+    "overrides": None,
+    "output_dir": None,
+    "max_batches": None,
+}
 
 
 if __name__ == "__main__":

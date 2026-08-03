@@ -47,7 +47,7 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from teb_vae.lag_attn_rws.eval import verify as shared
+from teb_vae.lag_attn_rws.eval import launch, verify as shared
 
 #: The filenames and headline columns the shared module already owns. Bound rather than restated:
 #: the two packages must disagree about none of them, and a binding cannot drift.
@@ -56,6 +56,10 @@ RESOLVED_CONFIG_FILENAME = shared.RESOLVED_CONFIG_FILENAME
 METRICS_HISTORY_FILENAME = shared.METRICS_HISTORY_FILENAME
 ACTIVE_FRAC_COLUMN = shared.ACTIVE_FRAC_COLUMN
 PRED_GAP_COLUMN = shared.PRED_GAP_COLUMN
+
+#: Where ``--runs`` writes the arm tables when no destination is named. Applied after the launch
+#: merge rather than as the parser's default, so a path in ``RUN_ARGS`` is reachable.
+DEFAULT_ARMS_OUT = "RESULTS_arms.md"
 
 #: The headline columns the tables read, named here so a rename in the reporting seam fails a test
 #: rather than silently emptying a column. ``tests/test_eval_verify.py`` pins each one against the
@@ -564,24 +568,53 @@ def build_parser() -> argparse.ArgumentParser:
              "the gate.",
     )
     parser.add_argument(
-        "--out", default="RESULTS_arms.md",
-        help="Tables only: where to write them.",
+        # Defaulted to None rather than to the filename, so a value in RUN_ARGS can win: the
+        # merge treats any non-None parsed value as having come from the command line, and an
+        # argparse default would therefore make the launch dict's entry unreachable. The real
+        # default is applied after the merge.
+        "--out", default=None,
+        help=f"Tables only: where to write them. Default: {DEFAULT_ARMS_OUT}.",
     )
     return parser
 
 
 def _cli(argv: Optional[List[str]] = None) -> int:
     """Dispatch between the gate and the tables. Returns the process exit code."""
-    args = build_parser().parse_args(argv)
-    if args.runs is not None:
-        if args.summary is not None:
+    values, _sources = launch.resolve_launch_args(build_parser(), RUN_ARGS, argv)
+    out = values["out"] or DEFAULT_ARMS_OUT
+    if values["runs"] is not None:
+        if values["summary"] is not None:
             print("give either a summary path or --runs, not both.")
             return 2
-        return compare_arms(args.runs, args.out)
-    if args.summary is None:
-        print("a summary path is required unless --runs names a directory of finished runs.")
+        return compare_arms(values["runs"], out)
+    if values["summary"] is None:
+        print(
+            "a summary path is required unless --runs names a directory of finished runs. Pass "
+            "one, or -- to launch this file from an IDE's Run button -- set 'summary' or 'runs' "
+            "in RUN_ARGS near the bottom of this module."
+        )
         return 2
-    return main(args.summary, args.json_out)
+    return main(values["summary"], values["json_out"])
+
+
+#: Values used for arguments absent from the command line -- i.e. an IDE's Run button.
+#:
+#: Keyed by argparse ``dest``. Resolution is per key, so a flag overrides one value and leaves the
+#: rest standing, and a key that is not an argparse ``dest`` raises at startup.
+#:
+#: **Running this file directly needs exactly one of ``summary`` or ``runs``**, which is the same
+#: choice the two entry points are: ``summary`` points at one run's ``summary.json`` and gates it,
+#: exiting non-zero when a sanity check failed; ``runs`` points at a directory of finished runs of
+#: **either or both** models and writes the arm tables and the cross-model comparison to ``out``
+#: instead. Setting both is refused, because it would be ambiguous which one was meant.
+#:
+#: This entry point reads only files a run left behind -- no checkpoint, no shard, no ``torch``.
+RUN_ARGS: Dict[str, Any] = {
+    "summary": None,
+    "json_out": None,
+    "runs": None,
+    "out": None,
+}
 
 
 if __name__ == "__main__":
