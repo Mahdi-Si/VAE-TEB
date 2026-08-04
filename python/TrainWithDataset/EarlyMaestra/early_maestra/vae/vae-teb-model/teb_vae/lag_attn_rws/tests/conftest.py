@@ -910,16 +910,30 @@ def evaluated(trained_run, repointed_overrides, tmp_path_factory) -> Dict[str, A
     visible to a shell, and a run without an explicit output directory has no path to hand back
     before it has chosen one. The path is therefore assembled from the directory this fixture
     named, which is what a caller with an explicit ``--output-dir`` does anyway.
+
+    **Retention caps are pinned empty here rather than inherited from the delta.** This is the
+    no-retention run: several tests built on it assert that an absent cap means silence and that
+    the plan records which cap decided it, and inheriting the shipped values would quietly turn
+    those into assertions about whatever that file currently says. ``event_evaluated`` below is the
+    caps-set counterpart, and the shipped values themselves are asserted in the config-load tests,
+    which is where a claim about a committed file belongs.
     """
     import json
 
+    import yaml
+
     from teb_vae.lag_attn_rws.eval import run as run_module
+
+    overrides = yaml.safe_load(Path(repointed_overrides).read_text(encoding="utf-8"))
+    overrides["eval_config"]["caps"] = {}
+    uncapped = tmp_path_factory.mktemp("uncapped_overrides") / "eval_overrides.yaml"
+    uncapped.write_text(yaml.safe_dump(overrides, sort_keys=False), encoding="utf-8")
 
     output_dir = tmp_path_factory.mktemp("eval")
     exit_code = run_module.main(
         trained_run,
         output_dir,
-        overrides=repointed_overrides,
+        overrides=uncapped,
         device="cpu",
         num_samples=2,
     )
