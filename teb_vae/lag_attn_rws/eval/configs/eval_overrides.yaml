@@ -145,7 +145,25 @@ eval_config:
   #
   # Contraction-CONDITIONED coupling needs none of them: the contraction timing travels on the
   # per-anchor table for every anchor of the split.
-  caps: {}
+  #
+  # Set rather than empty, so a stock run emits the COMPLETE artifact set: an empty block silently
+  # skipped the forecast overlay, the whole event analysis, the lag heatmap and the per-sample
+  # pages, and a directory missing a figure reads like a model that had nothing to show rather than
+  # a run that was never asked. The values are bounds on retention, not on what is measured -- the
+  # readouts every analysis computes are over the whole split either way.
+  #
+  #   waveforms 128  ~2.4 MB per retained sample, so ~310 MB, and it bounds the event analysis's
+  #                  runtime as well as its memory. Lower it first if a box is tight.
+  #   attention  64  ~437 KB per sample at (T, M, L) = (300, 4, 91).
+  #   pages      24  a figure count; retains nothing.
+  #
+  # `oracle` stays ABSENT on purpose, and that is not an oversight: it is the one cap whose absence
+  # means EVERY segment, so naming a number here would REDUCE what the sufficiency probe is fitted
+  # on. Absent is the complete setting.
+  caps:
+    waveforms: 128
+    attention: 64
+    pages: 24
 
   # How much worse, in nats per anchor, a forecast from a stranger's prior latent must be before
   # the prior is credited with carrying the target's predictive state. Explicitly provisional:

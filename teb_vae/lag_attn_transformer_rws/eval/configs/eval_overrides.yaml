@@ -171,13 +171,44 @@ eval_config:
   #                      materialises -- roughly 46 MB per batch at the batch size above -- and
   #                      because it is a second forward pass over whatever it is given.
   #
-  # It is absent from the block below deliberately, and that absence is asserted: this delta is the
-  # sibling's key for key, so a fifth cap here would make the two evaluation protocols differ.
-  # A run that wants the readout sets it on the command's own copy of this file.
+  # It is SET below, and it is the one key this delta carries that the sibling's does not. That is
+  # allowed for a precise reason rather than by exception: what makes the two models comparable is
+  # that every SHARED measurement is configured identically -- the same shards, seed, batch size,
+  # Monte Carlo draw count, thresholds, and the same caps for the four analyses both models run.
+  # `encoder_attention` gates an analysis the sibling does not have and cannot have, reads no
+  # shared table, and writes only into its own directory and its own headline scalars. No number
+  # the cross-model table compares moves because it is set. The test asserting the two deltas
+  # agree therefore exempts exactly the caps named by this model's own extra analyses, derived from
+  # the binding rather than written out, so the exemption cannot grow to cover a shared setting.
+  #
+  # 256 segments: enough for stable per-head means and for a clinical-class cut with usable counts
+  # per class, and eight batches of a second forward pass at the batch size above -- small beside
+  # the shared collection pass over the whole split. Lower it for a quick look; raising it buys
+  # precision on a description, and this analysis computes no test.
   #
   # Contraction-CONDITIONED coupling needs none of them: the contraction timing travels on the
   # per-anchor table for every anchor of the split.
-  caps: {}
+  #
+  # Set rather than empty, so a stock run emits the COMPLETE artifact set: an empty block silently
+  # skipped the forecast overlay, the whole event analysis, the lag heatmap and the per-sample
+  # pages, and a directory missing a figure reads like a model that had nothing to show rather than
+  # a run that was never asked. The values are bounds on retention, not on what is measured -- the
+  # readouts every analysis computes are over the whole split either way. The first three are the
+  # sibling's exactly, because they gate analyses BOTH models run.
+  #
+  #   waveforms 128  ~2.4 MB per retained sample, so ~310 MB, and it bounds the event analysis's
+  #                  runtime as well as its memory. Lower it first if a box is tight.
+  #   attention  64  ~437 KB per sample at (T, M, L) = (300, 4, 91).
+  #   pages      24  a figure count; retains nothing.
+  #
+  # `oracle` stays ABSENT on purpose, and that is not an oversight: it is the one cap whose absence
+  # means EVERY segment, so naming a number here would REDUCE what the sufficiency probe is fitted
+  # on. Absent is the complete setting.
+  caps:
+    waveforms: 128
+    attention: 64
+    pages: 24
+    encoder_attention: 256
 
   # How much worse, in nats per anchor, a forecast from a stranger's prior latent must be before
   # the prior is credited with carrying the target's predictive state. Explicitly provisional:

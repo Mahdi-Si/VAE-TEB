@@ -13,12 +13,15 @@ committed file rather than against a copy of its values, so a change on either s
 """
 from __future__ import annotations
 
+import copy
 from pathlib import Path
+from typing import Tuple
 
 import pytest
 import yaml
 
 from teb_vae.lag_attn.config import load_config
+from teb_vae.lag_attn_rws.eval import run as shared_run
 from teb_vae.lag_attn_rws.eval.config_schema import (
     DEFAULT_OVERRIDES_PATH as SIBLING_OVERRIDES_PATH,
     VALID_KEYS,
@@ -132,11 +135,48 @@ def test_the_cache_is_off(overrides) -> None:
 # =============================================================================
 # Equality with the sibling's delta
 # =============================================================================
-def test_the_evaluation_settings_are_the_siblings_key_for_key(overrides, sibling_overrides) -> None:
-    """The whole ``eval_config`` block, not a chosen subset: the seed, the draw count, the caps,
-    the two verdict thresholds, the event window and the resample count. A difference in any of
-    them makes the cross-model comparison a comparison of protocols."""
-    assert overrides["eval_config"] == sibling_overrides["eval_config"]
+#: The only keys this delta may carry that the sibling's does not: a retention cap named for an
+#: analysis **only this model has**. Derived from the binding rather than written out, so the
+#: exemption cannot quietly grow to cover a setting the two models share -- adding a shared cap
+#: here is impossible without first registering a shared analysis on this model's binding, which
+#: the registry parity test refuses.
+LOCAL_CAP_KEYS = frozenset(TRF_BINDING.extra_analyses)
+
+
+def _without_local_caps(eval_config: dict) -> Tuple[dict, dict]:
+    """Split an ``eval_config`` into (everything the sibling also configures, this model's caps)."""
+    shared = copy.deepcopy(eval_config)
+    caps = dict(shared.get("caps") or {})
+    local = {name: caps.pop(name) for name in sorted(LOCAL_CAP_KEYS) if name in caps}
+    shared["caps"] = caps
+    return shared, local
+
+
+def test_the_evaluation_settings_are_the_siblings_outside_this_models_own_caps(
+    overrides, sibling_overrides
+) -> None:
+    """The seed, the draw count, the four shared caps, the two verdict thresholds, the event window
+    and the resample count. A difference in any of them makes the cross-model comparison a
+    comparison of protocols rather than of architectures.
+
+    What may differ is exactly a cap gating an analysis the sibling does not have: it reads no
+    shared table and moves no number the cross-model table compares."""
+    mine, local = _without_local_caps(overrides["eval_config"])
+    theirs, sibling_local = _without_local_caps(sibling_overrides["eval_config"])
+
+    assert mine == theirs
+    assert sibling_local == {}, "the sibling has none of this model's analyses to cap"
+
+
+def test_the_exemption_is_actually_used_and_is_only_this_models_analyses() -> None:
+    """Not vacuous in either direction. If the delta stopped setting the cap this would fail rather
+    than the equality above passing for the wrong reason -- and the exempted names are pinned to
+    this model's own registry, so the carve-out cannot be widened by editing a literal."""
+    _shared, local = _without_local_caps(load_eval_overrides(TRF_BINDING.overrides_path)["eval_config"])
+
+    assert local == {"encoder_attention": 256}
+    assert LOCAL_CAP_KEYS == {"encoder_attention"}
+    assert not (LOCAL_CAP_KEYS & set(shared_run.ANALYSIS_FUNCTIONS))
 
 
 def test_the_holdout_split_is_the_siblings(overrides, sibling_overrides) -> None:
@@ -165,10 +205,18 @@ def test_the_batch_size_matches_and_the_reason_is_written_down(overrides, siblin
     assert "scaled_dot_product_attention" in text
 
 
-def test_the_two_deltas_differ_only_in_their_comments(overrides, sibling_overrides) -> None:
+def test_the_two_deltas_differ_only_in_their_comments_and_this_models_own_caps(
+    overrides, sibling_overrides
+) -> None:
     """The strongest form of the claim, and the one that catches a key added to one file and not
-    the other: parsed, the two documents are equal."""
-    assert overrides == sibling_overrides
+    the other: parsed, the two documents are equal once this model's own analysis caps are set
+    aside. Whole-document, so a divergence outside ``eval_config`` -- a shard, a loader field, a
+    batch size -- fails here even if the block-level tests above were narrowed."""
+    mine, theirs = copy.deepcopy(overrides), copy.deepcopy(sibling_overrides)
+    mine["eval_config"], _local = _without_local_caps(mine["eval_config"])
+    theirs["eval_config"], _ = _without_local_caps(theirs["eval_config"])
+
+    assert mine == theirs
 
 
 def test_the_delta_names_this_packages_launch_commands() -> None:
