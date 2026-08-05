@@ -30,6 +30,7 @@ _STAGE_METRICS = {
     "pred_gap",
     "source_conditioned_kl_raw", "source_conditioned_kl_train",
     "kld_active_frac", "kld_beta",
+    "prior_rate", "beta_prior",
     "anchor_coverage_frac",
     "mean_logvar_full", "mean_logvar_base",
     "logvar_full_floor_frac", "logvar_full_ceil_frac",
@@ -367,6 +368,47 @@ def test_the_scheduled_beta_is_what_weights_the_kl_and_what_is_reported(
 
     assert float(metrics["kld_beta"]) == pytest.approx(module._resolve_beta(module.current_epoch))
     assert float(metrics["kld_beta"]) != pytest.approx(0.01)  # not the raw hparam
+
+
+def test_the_configured_beta_prior_weights_the_objective_and_is_echoed(
+    task, stub_batch, perturb_posterior
+):
+    """The hparam reaches the loss by value, seen through the task: two identically-seeded
+    steps that differ only in ``beta_prior`` must differ in the total by exactly the weighted
+    prior rate, and the metric must echo the configured constant."""
+    anchored = task(hparams={"beta_prior": 0.5})
+    unanchored = task(hparams={"beta_prior": 0.0})
+    perturb_posterior(anchored.orig_model)
+    perturb_posterior(unanchored.orig_model)  # same seed in the factory -> identical weights
+
+    torch.manual_seed(2)
+    loss_anchored, metrics = anchored.compute_loss_and_metrics(stub_batch, 1, "train")
+    torch.manual_seed(2)
+    loss_unanchored, _ = unanchored.compute_loss_and_metrics(stub_batch, 1, "train")
+
+    assert float(metrics["beta_prior"]) == pytest.approx(0.5)
+    assert float(metrics["prior_rate"]) > 0.0
+    assert float(loss_anchored - loss_unanchored) == pytest.approx(
+        0.5 * float(metrics["prior_rate"]), rel=1e-4
+    )
+
+
+def test_the_permutation_control_is_unchanged_by_beta_prior(task, make_stub_batch_fn, perturb_posterior):
+    """The control re-scores the full branch under a stranger's source and leaves the prior
+    untouched, so its three readouts must be bitwise identical whatever the anchor weight --
+    driven at an absurd weight so any leak into the shuffled scoring would be unmissable."""
+    anchored = task(hparams={"beta_prior": 1.0e3})
+    unanchored = task(hparams={"beta_prior": 0.0})
+    perturb_posterior(anchored.orig_model)
+    perturb_posterior(unanchored.orig_model)  # same seed in the factory -> identical weights
+
+    torch.manual_seed(3)
+    _, with_anchor = anchored.compute_loss_and_metrics(make_stub_batch_fn(), 0, "val")
+    torch.manual_seed(3)
+    _, without = unanchored.compute_loss_and_metrics(make_stub_batch_fn(), 0, "val")
+
+    for name in ("nll_shuffled_block", "kld_shuffled", "shuffle_penalty"):
+        assert torch.equal(with_anchor[name], without[name]), name
 
 
 # --------------------------------------------------------------------------------------

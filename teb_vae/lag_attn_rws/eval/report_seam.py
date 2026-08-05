@@ -164,7 +164,23 @@ HEADLINE_SCALARS: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
     ("d_base_mc_nats", ("readouts", "mc_nll_base_block")),
     ("d_full_mc_nats", ("readouts", "mc_nll_full_block")),
     ("d_shuffled_mc_nats", ("readouts", "mc_nll_shuffled_block")),
+    # D_shuffled - D_base, per recording and then averaged, from the permutation control. The one
+    # predictive comparison here that is not referenced against the base branch, and therefore the
+    # one that still carries signal when the predictive gain is negative: it changes only the
+    # source, holding prior, decoder and latent geometry fixed. Read from the analysis rather than
+    # differenced from the two block scalars above, because the paired per-recording construction
+    # is not the difference of two pooled means and only the paired one has an interval behind it.
+    #
+    # It resolves through a *keyed* path rather than out of the analysis's ``penalties`` list:
+    # this block is assembled by walking key paths, which is exactly why the two penalties beside
+    # it have never appeared here.
+    ("source_margin_nats", ("perm_control", "source_margin_nats")),
     ("source_conditioned_kl_raw_nats", ("readouts", "source_conditioned_kl_raw")),
+    # The prior scale rate, beside the divergence it shares a support and a unit with. Registered
+    # because it is the quantity the anchor weight is calibrated against and an arm table
+    # comparing weights reads this block and nothing else -- and because it is reported under
+    # every objective, so a run that never weighted it still says what its prior was doing.
+    ("prior_rate_nats", ("readouts", "prior_rate")),
     ("kl_total_nats", ("latent_health", "kl_total_nats")),
     ("kl_active_dims", ("latent_health", "active_dims")),
     ("kl_top_dimension_share", ("latent_health", "top_dimension_share")),
@@ -226,6 +242,7 @@ HEADLINE_SCALARS: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
 #: registry change fails a test instead of silently dropping a criterion from the headline.
 HEADLINE_VERDICTS: Tuple[str, ...] = (
     "predictive_improvement",
+    "source_margin_positive",
     "source_specificity",
     "prior_carries_target_state",
     "latent_not_collapsed",

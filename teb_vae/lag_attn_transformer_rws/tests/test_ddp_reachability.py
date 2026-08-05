@@ -42,11 +42,23 @@ _NETS_DIR = Path(__file__).resolve().parents[1] / "nets"
 # ---------------------------------------------------------------------------------------
 # Half one: a real backward, under both configurations
 # ---------------------------------------------------------------------------------------
-def _loss(model: SeqVaeLagAttnTrfRws, seq_len: int) -> torch.Tensor:
-    """One forward and the real objective over a stub batch of the model's own geometry."""
+def _loss(model: SeqVaeLagAttnTrfRws, seq_len: int, beta_prior: float = 0.0) -> torch.Tensor:
+    """One forward and the real objective over a stub batch of the model's own geometry.
+
+    Args:
+        model: The net under test.
+        seq_len: Sequence length of the stub batch.
+        beta_prior: Weight of the prior scale rate, so the coverage claim is exercised under
+            the anchored objective as well as the historical three-term one.
+
+    Returns:
+        The scalar ``total_loss``.
+    """
     batch = make_stub_batch(BATCH, seq_len)
     out = model(batch.fhr_st, batch.fhr_ph, torch.cat([batch.up_st, batch.up_ph], dim=-1))
-    return model.compute_loss(out, batch.fhr, weight=batch.weight)["metrics"]["total_loss"]
+    return model.compute_loss(out, batch.fhr, weight=batch.weight, beta_prior=beta_prior)[
+        "metrics"
+    ]["total_loss"]
 
 
 def _unreached(model: SeqVaeLagAttnTrfRws) -> List[str]:
@@ -58,18 +70,22 @@ def _unreached(model: SeqVaeLagAttnTrfRws) -> List[str]:
     ]
 
 
-def test_every_parameter_is_reachable_under_the_unguarded_configuration(tiny_kwargs):
+@pytest.mark.parametrize("beta_prior", [0.0, 1.0e-2], ids=["unanchored", "anchored"])
+def test_every_parameter_is_reachable_under_the_unguarded_configuration(tiny_kwargs, beta_prior):
+    """Both anchor weights: the prior scale rate is the one objective term a config can switch
+    on, and the reachability claim must hold for the objective production actually optimises."""
     torch.manual_seed(0)
     model = SeqVaeLagAttnTrfRws(**tiny_kwargs)
 
-    _loss(model, SEQ_LEN).backward()
+    _loss(model, SEQ_LEN, beta_prior=beta_prior).backward()
 
     assert not _unreached(model), (
         f"unreachable under find_unused_parameters=False: {_unreached(model)}"
     )
 
 
-def test_every_parameter_is_reachable_under_a_real_reach_budget(tiny_kwargs):
+@pytest.mark.parametrize("beta_prior", [0.0, 1.0e-2], ids=["unanchored", "anchored"])
+def test_every_parameter_is_reachable_under_a_real_reach_budget(tiny_kwargs, beta_prior):
     """The guarded case, and it is only the guarded case if the guard is real.
 
     The channel tuples come from the same budget resolution the experiment driver runs, and the
@@ -86,7 +102,7 @@ def test_every_parameter_is_reachable_under_a_real_reach_budget(tiny_kwargs):
     assert model.target_adapter.mask_proj is not None
     assert model.target_adapter.start_embed is not None
 
-    _loss(model, int(kwargs["sequence_length"])).backward()
+    _loss(model, int(kwargs["sequence_length"]), beta_prior=beta_prior).backward()
 
     assert not _unreached(model), (
         f"unreachable under find_unused_parameters=False: {_unreached(model)}"

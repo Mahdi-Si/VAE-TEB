@@ -65,6 +65,30 @@ model_config:
     # is a laundering subsidy the sibling measured (KL filled whether or not it is source-driven),
     # and with the zero-KL start plus the beta warm-up, collapse is guarded structurally.
     free_bits: 0.0
+    # Weight of the prior scale anchor sum_d 0.5*(exp(lv_p) - 1 - lv_p), the term that keeps the
+    # conditional prior's log-variance off its clamp floor: nothing else in the objective
+    # penalises a NARROW prior, and the first production run pinned 99.2% of prior coordinates on
+    # the -5 floor within one epoch (0.118 at epoch 0, 0.812 at epoch 1). Constant, not a
+    # schedule -- the collapse completes between epoch 0 and epoch 1, so any warm-up would arrive
+    # after the damage.
+    #
+    # 0.1, not the 1.0e-2 this shipped at first. That value was a guess, and the dev-box arms on
+    # the committed HIE shard (RESULTS.md) measured it on the wrong side of a threshold: at
+    # 1.0e-2 the prior still finished on its floor (logvar_prior_floor_frac 0.955 against an
+    # unanchored 0.978) having only been delayed 6.7x in optimizer steps, while at 0.1 it held at
+    # 0.046 with kld_active_frac 0.69 against 0.25 in every collapsed arm.
+    #
+    # A threshold rather than a dial, and that is why the bracket matters more than the midpoint:
+    # the restoring force d/dlv_p is 0.5*(exp(lv_p) - 1), which SATURATES at 0.5*beta_prior as the
+    # log-variance falls, while the reconstruction's opposing pressure GROWS as the decoder
+    # sharpens. So a weight either exceeds that pressure or is eventually overrun by it, and no
+    # weight merely slows the descent to an acceptable rate.
+    #
+    # Still provisional in one respect the comment must not hide: that measurement is one shard,
+    # in-sample, on the convolutional-recurrent architecture. The transformer package's
+    # sweep_beta_prior_* arms bracket this value on both sides and are what confirm or revise it
+    # on the architecture the collapse was actually measured on.
+    beta_prior: 0.1
 
     # --- Reconstruction likelihood --------------------------------------------
     # 'gaussian_nll' consumes the decoder's learned log-variance heads, keeping every parameter
@@ -142,8 +166,15 @@ model_config:
     # Break the near-degeneracy of the 30 horizon tokens at init (~0.999 correlated at std 0.02),
     # so per-block FiLM has token-specific structure to modulate. 0.02 = the core's untouched seed.
     horizon_embed_std: 0.8
-    # Calibrate the shared decoder output heads onto the trivial mu=0/sigma=1 predictor at init:
-    # without it the raw-target NLL starts ~15 nats/sample above that predictor's ~1.4 level.
+    # Calibrate BOTH distribution heads onto their trivial starting points at init. One key, two
+    # halves, and setting it false reverts both:
+    #   * the shared decoder output heads onto mu=0/sigma=1 -- without it the raw-target NLL
+    #     starts ~15 nats/sample above that predictor's ~1.4 level;
+    #   * the prior head's log-variance onto exactly 0, i.e. sigma_p = 1, which is the scale
+    #     anchor's optimum -- without it the prior starts about 3 nats below it and, at
+    #     beta_prior: 0.0, reaches its clamp floor 3.3x sooner in optimizer steps.
+    # There is deliberately no key for one half alone: an arm reverting the prior calibration to
+    # reproduce the pre-anchor start reverts the decoder calibration with it.
     head_init_calibration: true
     # LayerNorm gain on the attended source summary in the posterior fusion: sqrt(d_model/d_head)
     # = sqrt(128/32) = 2, so the 32-wide source summary is not out-columned by the 128-wide state.
@@ -222,10 +253,21 @@ dataset_config:
 advanced_config:
   trainer:
     precision: "32-true"
-    # Provisional, scaled from the sibling's 0.5: the loss is a 480-sample summed NLL (two
-    # reconstruction terms), so gradient norms run ~2-3 orders larger and a 0.5-norm clip would
-    # rescale every step. Re-derive from the first run's observed gradient norms.
-    gradient_clip_val: 250.0
+    # MEASURED, replacing a 250.0 that was scaled from the feature-target sibling's 0.5 rather
+    # than derived. The first 1018-epoch production run of this objective logged `train/grad_norm`
+    # PRE-clip; its recorded percentiles are q50 2775, q90 3613, q95 3876, q99 4681, q99.9 5866,
+    # max 7313, min 703. Every recorded value exceeded 250, so the clip was rescaling essentially
+    # every step and the run was really training at roughly a eleventh of its configured learning
+    # rate. 5000 is the smallest round value above q99: the healthy tail passes and roughly the
+    # top one percent still clips.
+    #
+    # What that sample is: metrics_history.csv records ONE optimizer step per epoch for this
+    # metric, not the epoch's aggregate (the metrics collector reads callback_metrics at
+    # validation end, before the training epoch is reduced), so the percentiles above are per-STEP
+    # percentiles over 1,019 steps thinned from 452,250 -- which is the right distribution to set a
+    # per-step threshold from. `train/grad_clip_frac` is the same one-step-per-epoch sample of the
+    # exceedance indicator, so read it as a mean over epochs rather than per row.
+    gradient_clip_val: 5000.0
     gradient_clip_algorithm: "norm"
     sync_batchnorm: false     # there is no BatchNorm anywhere in this model
     deterministic: false

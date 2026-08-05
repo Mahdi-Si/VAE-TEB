@@ -112,12 +112,70 @@ def test_a_strangers_source_must_be_worse_than_no_source(base, full, shuffled, e
     assert verdict.values["shuffle_penalty"] == pytest.approx(shuffled - base)
 
 
+@pytest.mark.parametrize(
+    ("full", "shuffled", "expected"),
+    [
+        (8.0, 14.0, PASS),
+        # A stranger's source forecasts exactly as well as this recording's: nothing the source
+        # pathway carries is specific to this recording, whatever the KL says.
+        (8.0, 8.0, FAIL),
+        (8.0, 7.0, FAIL),
+    ],
+)
+def test_a_strangers_source_must_be_worse_than_this_recordings_own(full, shuffled, expected):
+    """The one predictive criterion referenced against ``full`` rather than against ``base``."""
+    verdict = _by_name(
+        build_verdicts(_aggregate(base=10.0, full=full, shuffled=shuffled))
+    )["source_margin_positive"]
+
+    assert verdict.status == expected
+    assert verdict.values["source_margin"] == pytest.approx(shuffled - full)
+
+
+def test_a_negative_gain_with_a_positive_margin_is_reported_as_both():
+    r"""The state the margin criterion exists to make sayable, and the reason it is not redundant.
+
+    A model whose latent geometry charges more for the source than the source delivers scores
+    $D_{\rm full} > D_{\rm base}$ -- no predictive gain -- while a derangement-shuffled stranger
+    still scores worse than the matched source. Every criterion referenced against $D_{\rm base}$
+    fails, and the run is nonetheless using *this* recording's source. Before the margin criterion
+    the summary could only say ``FAIL``; it must now say ``FAIL / PASS / FAIL``, and the middle
+    one is the finding.
+
+    Asserted against the registry rather than a literal count, because the emitted list carries a
+    synthetic entry beyond it and a count would pin the wrong number.
+    """
+    verdicts = build_verdicts(_aggregate(base=10.0, full=12.0, shuffled=14.0))
+    by_name = _by_name(verdicts)
+
+    assert by_name["predictive_improvement"].status == FAIL
+    assert by_name["source_margin_positive"].status == PASS
+    assert by_name["source_specificity"].status == FAIL
+    # And the three are adjacent and in this order, because they are read as a triple.
+    order = [verdict.name for verdict in verdicts]
+    triple = ["predictive_improvement", "source_margin_positive", "source_specificity"]
+    assert order[: len(triple)] == triple
+
+
+def test_the_stronger_criterion_implies_the_weaker_one():
+    """``source_specificity`` asks D_full < D_base < D_shuffled, which entails D_shuffled >
+    D_full. A run cannot pass the ordering and fail the margin, and a future edit that let it
+    would mean one of the two had stopped measuring what its name says."""
+    for base, full, shuffled in [
+        (10.0, 8.0, 14.0), (10.0, 8.0, 9.0), (10.0, 12.0, 14.0), (10.0, 9.9, 10.1),
+    ]:
+        by_name = _by_name(build_verdicts(_aggregate(base=base, full=full, shuffled=shuffled)))
+        if by_name["source_specificity"].status == PASS:
+            assert by_name["source_margin_positive"].status == PASS
+
+
 def test_a_control_that_could_not_run_is_inconclusive_not_failed():
     """A batch of one sample cannot be deranged. That is a missing measurement, not a failed
     criterion, and conflating them would report a healthy model as broken."""
     verdicts = _by_name(build_verdicts(_aggregate(base=10.0, full=8.0)))
 
     assert verdicts["predictive_improvement"].status == PASS
+    assert verdicts["source_margin_positive"].status == INCONCLUSIVE
     assert verdicts["source_specificity"].status == INCONCLUSIVE
     assert verdicts["prior_carries_target_state"].status == INCONCLUSIVE
 

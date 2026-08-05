@@ -1,0 +1,20 @@
+# Prior-anchor arm: beta_prior = 0.1.
+#
+# Restates the shipped value on purpose: the arm stays pinned at 0.1 even if default.yaml is
+# later revised to the sweep's winner. Until such a revision this arm and the headline baseline
+# are the same configuration, and the baseline run's metrics stand in for this arm.
+#
+# What set the shipped value is the sibling package's dev-box measurement -- the smallest weight
+# tested that held the prior off its clamp, at a floor fraction of 0.046 against 0.955 one order
+# below. This arm is where that carries over to this architecture or does not.
+#
+# 0 parameters: the anchor is an objective term, not a module.
+#
+#   TEB_RUN_STAMP="$(date '+%Y-%m-%d--[%H-%M]')" torchrun --nproc_per_node=7 \
+#       -m teb_vae.lag_attn_transformer_rws.trainer \
+#       --config teb_vae/lag_attn_transformer_rws/configs/sweep_beta_prior_0p1.yaml
+base: default.yaml
+
+model_config:
+  VAE_model:
+    beta_prior: 0.1

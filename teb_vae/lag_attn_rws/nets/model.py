@@ -169,10 +169,13 @@ class SeqVaeLagAttnRws(nn.Module):
                 $0.8$) breaks the near-degeneracy of the $H$ horizon tokens -- otherwise
                 $\approx 0.999$ correlated at init -- so per-block FiLM has token-specific
                 structure to modulate from step $0$.
-            head_init_calibration: Calibrate the shared decoder's output heads onto the trivial
-                $\mu = 0, \sigma = 1$ predictor at init, so the raw-target NLL starts near that
-                predictor's level rather than orders of magnitude above it. ``False`` (the
-                default) leaves the Xavier-filled heads untouched.
+            head_init_calibration: Calibrate every distribution head onto the trivial
+                $\mathcal{N}(0, 1)$ predictor at init: the shared decoder's output heads onto
+                $\mu = 0, \sigma = 1$, so the raw-target NLL starts near that predictor's level
+                rather than orders of magnitude above it, and the prior head's log-variance onto
+                exactly $0$ ($\sigma_p = 1$, the scale anchor's optimum), so the prior's scale
+                starts where the anchor term wants it rather than three nats below. ``False``
+                (the default) leaves the Xavier-filled heads untouched.
             a_head_gain: LayerNorm gain applied to the attended source summary inside the
                 head-structured posterior fusion. The default $1.0$ is the plain norm; the
                 shipped $2.0 = \sqrt{d_{model}/d_{head}}$ rescales the $d_{head}$-wide summary up
@@ -468,6 +471,7 @@ class SeqVaeLagAttnRws(nn.Module):
             self._reinit_horizon_embedding()
         if self.head_init_calibration:
             self._calibrate_output_heads()
+            self._calibrate_prior_scale()
         if self.a_head_gain != 1.0:
             self._set_a_head_gain()
 
@@ -598,6 +602,48 @@ class SeqVaeLagAttnRws(nn.Module):
         self.decoder.mean_head.weight.data.mul_(0.02)
         self.decoder.logvar_head.bias.data.fill_(math.log(5.0 / 3.0))
         self.decoder.logvar_head.weight.data.mul_(0.1)
+
+    def _calibrate_prior_scale(self) -> None:
+        r"""Pin the prior head's log-variance at unit scale ($\log\sigma_p^2 = 0$) at init.
+
+        Nothing else in the initialisation places the prior's scale: Xavier-filled, the head
+        starts around $-3$ nats and nothing in the objective but the scale anchor pushes it back
+        up, so it collapses onto the clamp floor within an epoch on real data. This is the
+        remaining half of the trivial-predictor calibration -- the decoder starts at
+        $\mathcal{N}(0, 1)$ over the target, the prior at $\sigma_p = 1$ over the latent.
+
+        The head is a ``ResidualMLP`` returning ``body(x) + skip_proj(x)`` with no single bias
+        governing its output level, so the decoder's shrink-plus-bias recipe does not transfer
+        -- and a shrink could not be exact anyway, since ``smooth_bound`` is a sigmoid and the
+        mean of the bound is not the bound of the mean. Instead the posterior deltas' own
+        zero-weight recipe: zero the final body layer's weight and the whole skip projection,
+        and seed the final bias at the pre-image of log-variance $0$ under
+        ``smooth_bound(*logvar_clamp)`` -- $\log(5/3)$ at the shipped $(-5, 3)$ -- so the raw
+        output is input-independent and the bounded output exactly $0$. The zeroed layers still
+        receive gradient (the final layer against its activations, the skip against its input),
+        and the posterior residual is built on the same raw tensor, so the exact zero-KL start
+        is untouched. Initialisation only; gated by the caller.
+
+        Raises:
+            ValueError: If the clamp interval does not contain $0$, which makes unit scale
+                unreachable, or if the head's skip path is an identity, which the recipe cannot
+                silence.
+        """
+        lo, hi = self.logvar_clamp
+        if not lo < 0.0 < hi:
+            raise ValueError(
+                f"prior scale calibration needs 0 inside logvar_clamp, got ({lo}, {hi})"
+            )
+        head = self.prior_head.logvar_prior_head
+        if not isinstance(head.skip_proj, nn.Linear):
+            raise ValueError(
+                "prior scale calibration requires a projected skip on the log-variance head; "
+                "with d_model == d_z the skip is an identity and the output cannot be pinned"
+            )
+        self._zero_linear(head.skip_proj)
+        final = cast(nn.Linear, head.body[-1])
+        nn.init.zeros_(final.weight)
+        final.bias.data.fill_(math.log((0.0 - lo) / (hi - 0.0)))
 
     def _set_a_head_gain(self) -> None:
         r"""Set the posterior fusion's attended-source LayerNorm gain to ``a_head_gain``.
@@ -794,15 +840,16 @@ class SeqVaeLagAttnRws(nn.Module):
         *,
         weight: torch.Tensor,
         beta: float = 1.0,
+        beta_prior: float = 0.0,
         lambda_full: float = 1.0,
         lambda_base: float = 1.0,
         likelihood: str = "gaussian_nll",
         free_bits: float = 0.0,
     ) -> Dict[str, Any]:
-        r"""Compute the three-term objective in nats per anchor.
+        r"""Compute the four-term objective in nats per anchor.
 
         $$\mathcal{L} = \lambda_{\mathrm{full}} D_1 + \lambda_{\mathrm{base}} D_0
-        + \beta\,\mathrm{KL}_{\mathrm{train}}$$
+        + \beta\,\mathrm{KL}_{\mathrm{train}} + \beta_p\,R_p$$
 
         * $D_1$ -- masked NLL of the raw future under the **full** (posterior-latent)
           forecast, summed over the $H \cdot R$ block, averaged over contributing anchors.
@@ -814,6 +861,9 @@ class SeqVaeLagAttnRws(nn.Module):
         * $\mathrm{KL}_{\mathrm{train}}$ -- the free-bits-floored KL over the *same* anchor
           support the reconstruction uses, $[w, T - H)$: charging KL on anchors with no
           reconstruction term produces an end-of-sequence droop resembling fading coupling.
+        * $R_p$ -- the prior's scale rate, anchoring $\sigma_p$ at $1$; nothing else in the
+          objective penalises a narrow prior. Off at the default ``beta_prior=0.0`` and still
+          reported as the ``prior_rate`` metric.
 
         The raw future target and every mask are built internally from ``fhr_raw`` and
         ``weight``, matching the sibling's convention that the caller passes raw signals.
@@ -830,6 +880,8 @@ class SeqVaeLagAttnRws(nn.Module):
             fhr_raw: Raw target signal ``(B, L_raw)``, loader-normalized.
             weight: Decimated validity signal ``(B, T)``.
             beta: Weight on the trained KL term.
+            beta_prior: Weight on the prior scale rate; ``0.0`` leaves the historical
+                three-term objective while ``prior_rate`` is still reported.
             lambda_full: Weight on the full-forecast reconstruction.
             lambda_base: Weight on the base-forecast reconstruction.
             likelihood: ``'mse'`` or ``'gaussian_nll'``.
@@ -837,10 +889,11 @@ class SeqVaeLagAttnRws(nn.Module):
 
         Returns:
             ``{'metrics': ..., 'likelihood': ...}``. ``metrics`` maps names to scalar
-            tensors -- the three terms, ``total_loss``, the block/sample reconstruction pairs,
-            ``pred_gap``, both KL readouts, ``kld_active_frac``, ``kld_beta``,
-            ``anchor_coverage_frac`` and the log-variance diagnostics -- and is safe to splat
-            into a metric logger. The likelihood name string is deliberately outside it.
+            tensors -- the four terms, ``total_loss``, the block/sample reconstruction pairs,
+            ``pred_gap``, both KL readouts, ``kld_active_frac``, ``kld_beta``, ``beta_prior``,
+            ``prior_rate``, ``anchor_coverage_frac`` and the log-variance diagnostics -- and is
+            safe to splat into a metric logger. The likelihood name string is deliberately
+            outside it.
 
         Raises:
             ValueError: On an unknown ``likelihood``, a raw length that does not match the
@@ -855,6 +908,7 @@ class SeqVaeLagAttnRws(nn.Module):
             coverage_floor=self.coverage_floor,
             logvar_clamp=self.logvar_clamp,
             beta=beta,
+            beta_prior=beta_prior,
             lambda_full=lambda_full,
             lambda_base=lambda_base,
             likelihood=likelihood,

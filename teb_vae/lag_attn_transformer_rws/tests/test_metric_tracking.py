@@ -64,12 +64,14 @@ def test_the_tracked_list_covers_what_this_task_emits(task, stub_batch, perturb_
 
 
 def test_every_tracked_metric_is_emitted_by_something(task, stub_batch, perturb_posterior):
-    """The other direction. Four names are logged through a hook rather than returned in a metrics
+    """The other direction. Five names are logged through a hook rather than returned in a metrics
     dict and so cannot appear in one: the two spike-breaker columns the base's training step
-    injects, the ``lr`` it logs at epoch start, and the pre-clip gradient norm the task logs in
-    ``on_before_optimizer_step`` -- which is the only place that quantity exists at all."""
+    injects, the ``lr`` it logs at epoch start, and the pre-clip gradient norm plus its
+    clip-exceedance indicator the task logs in ``on_before_optimizer_step`` -- which is the only
+    place those quantities exist at all."""
     logged_through_a_hook = {
         "train/spike_skipped", "train/spike_ema_loss", "lr", "train/grad_norm",
+        "train/grad_clip_frac",
     }
     module = task()
     perturb_posterior(module.orig_model)

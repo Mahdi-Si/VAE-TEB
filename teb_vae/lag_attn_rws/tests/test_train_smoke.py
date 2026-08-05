@@ -163,6 +163,29 @@ def test_the_scheduled_beta_reaches_the_csv(fit):
     assert float(frame["train/kld_beta"].iloc[0]) == pytest.approx(0.0)
 
 
+def test_the_prior_anchor_and_clip_diagnostics_reach_the_csv(fit):
+    """The prior scale rate, its echoed weight and the clip-exceedance fraction, through a real
+    fit under the tiny config's ``mse`` likelihood -- the configuration where a term emitted only
+    under ``gaussian_nll`` would silently produce an all-NaN column."""
+    driver, _ = fit
+    frame = pd.read_csv(Path(driver.train_results_dir) / "metrics_history.csv")
+
+    for column in (
+        "train/prior_rate", "val/prior_rate",
+        "train/beta_prior", "val/beta_prior",
+        "train/grad_clip_frac",
+    ):
+        assert column in frame.columns, f"{column} never reached the CSV"
+        assert frame[column].notna().any(), f"{column} is NaN in every epoch"
+
+    # The tiny config opts into the anchor, so the echoed weight is its constant -- proof the
+    # config key reaches the objective rather than being silently dropped at the kwarg sweep.
+    assert float(frame["train/beta_prior"].iloc[0]) == pytest.approx(0.1)
+    # An epoch's clip fraction is the mean of a 0/1 per-step indicator.
+    clip_frac = frame["train/grad_clip_frac"].dropna()
+    assert bool(((clip_frac >= 0.0) & (clip_frac <= 1.0)).all())
+
+
 def test_the_checkpoint_is_written_to_the_run_checkpoint_directory(fit):
     driver, _ = fit
 

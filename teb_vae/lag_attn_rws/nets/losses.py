@@ -14,7 +14,7 @@ so a finite planted value at a masked position cannot move the loss at all -- an
 whose whole window is masked drops out of the denominator as well as the numerator.
 
 The whole objective lives here as free functions, not as methods on one model. Two architectures
-now forecast the same raw target under the same three-term loss, and what they optimise must never
+now forecast the same raw target under the same four-term loss, and what they optimise must never
 diverge: a copy of :func:`compute_loss` in a second model class would be two definitions of the
 quantity every comparison between them is read off. The model classes keep one-line methods that
 delegate here, so a caller still writes ``model.compute_loss(...)`` and the arithmetic has exactly
@@ -258,6 +258,45 @@ def masked_source_kl(
     }
 
 
+def masked_prior_rate(
+    logvar_prior: torch.Tensor,
+    mask: torch.Tensor,
+) -> torch.Tensor:
+    r"""The prior's scale rate, summed over $d_z$, averaged over the masked anchors.
+
+    Per dimension the quantity is
+
+    $$\tfrac{1}{2}\left(e^{\ell} - 1 - \ell\right), \qquad \ell = \log\sigma^{2,p},$$
+
+    which is $\mathrm{KL}\!\left(\mathcal{N}(\mu_p, \sigma_p^2) \,\|\, \mathcal{N}(\mu_p, 1)\right)$
+    -- the scale half of the divergence from the prior to a unit-scale Gaussian at the same
+    mean. It is nonnegative, convex in $\ell$, and exactly zero at $\sigma_p = 1$; the prior
+    mean does not appear, so weighting it compresses nothing the base forecast depends on.
+
+    It exists because no other term penalises a *narrow* prior: the reconstruction strictly
+    prefers a deterministic latent, and $\mathrm{KL}(q \,\|\, p)$ constrains the posterior
+    against the prior without constraining the prior's own scale -- so the prior log-variance
+    is otherwise free to fall until it meets its clamp.
+
+    Reduced exactly as :func:`masked_source_kl` reduces the source divergence -- summed over
+    $d_z$, masked by the same $(B, T)$ anchor support, divided by the same contributing-anchor
+    count -- so the two are in the same nats-per-anchor units and addable without rescaling.
+    Unlike that function's raw readout this one carries gradient: weighted, it is an objective
+    term, not only a diagnostic.
+
+    Args:
+        logvar_prior: Prior log-variance ``(B, T, d_z)``.
+        mask: KL anchor mask ``(B, T)`` from ``nets/raw_masks.py::kl_mask`` -- the same support
+            the source divergence is averaged over.
+
+    Returns:
+        A scalar tensor in nats per anchor.
+    """
+    n_anchors = mask.sum().clamp_min(1.0)
+    rate_btd = 0.5 * (logvar_prior.exp() - 1.0 - logvar_prior)
+    return (rate_btd.sum(dim=-1) * mask).sum() / n_anchors
+
+
 def kld_tensor(
     mu_prior: torch.Tensor,
     logvar_prior: torch.Tensor,
@@ -308,15 +347,16 @@ def compute_loss(
     coverage_floor: float,
     logvar_clamp: Tuple[float, float],
     beta: float = 1.0,
+    beta_prior: float = 0.0,
     lambda_full: float = 1.0,
     lambda_base: float = 1.0,
     likelihood: str = "gaussian_nll",
     free_bits: float = 0.0,
 ) -> Dict[str, Any]:
-    r"""Compute the three-term objective in nats per anchor.
+    r"""Compute the four-term objective in nats per anchor.
 
     $$\mathcal{L} = \lambda_{\mathrm{full}} D_1 + \lambda_{\mathrm{base}} D_0
-    + \beta\,\mathrm{KL}_{\mathrm{train}}$$
+    + \beta\,\mathrm{KL}_{\mathrm{train}} + \beta_p\,R_p$$
 
     * $D_1$ -- masked NLL of the raw future under the **full** (posterior-latent) forecast,
       summed over the $H \cdot R$ block, averaged over contributing anchors.
@@ -327,6 +367,12 @@ def compute_loss(
     * $\mathrm{KL}_{\mathrm{train}}$ -- the free-bits-floored KL over the *same* anchor support
       the reconstruction uses, $[w, T - H)$: charging KL on anchors with no reconstruction term
       produces an end-of-sequence droop resembling fading coupling.
+    * $R_p$ -- the prior's scale rate (:func:`masked_prior_rate`), on the KL's own support. The
+      other three terms leave the prior's scale unconstrained from below, so without this one
+      the prior log-variance falls onto its clamp floor and the divergence stops being a rate.
+      At the shipped ``beta_prior: 0.0`` the objective is exactly the historical three-term sum;
+      $R_p$ is still computed and reported, unconditionally and under every likelihood, so a
+      collapsing prior is visible in any run's metrics whether or not a config opted in.
 
     The raw future target and every mask are built internally from ``fhr_raw`` and ``weight``,
     matching the convention that the caller passes raw signals.
@@ -348,6 +394,9 @@ def compute_loss(
         logvar_clamp: ``(lo, hi)`` effective range of the model's log-variances, which the two
             binding-bound diagnostics are read against.
         beta: Weight on the trained KL term.
+        beta_prior: Weight on the prior scale rate. ``0.0`` -- the default, so every caller
+            that predates the term is unaffected -- leaves the objective the three-term sum
+            while ``prior_rate`` is still reported.
         lambda_full: Weight on the full-forecast reconstruction.
         lambda_base: Weight on the base-forecast reconstruction.
         likelihood: ``'mse'`` or ``'gaussian_nll'``.
@@ -355,10 +404,10 @@ def compute_loss(
 
     Returns:
         ``{'metrics': ..., 'likelihood': ...}``. ``metrics`` maps names to scalar tensors -- the
-        three terms, ``total_loss``, the block/sample reconstruction pairs, ``pred_gap``, both KL
-        readouts, ``kld_active_frac``, ``kld_beta``, ``anchor_coverage_frac`` and the
-        log-variance diagnostics -- and is safe to splat into a metric logger. The likelihood
-        name string is deliberately outside it.
+        four terms, ``total_loss``, the block/sample reconstruction pairs, ``pred_gap``, both KL
+        readouts, ``kld_active_frac``, ``kld_beta``, ``beta_prior``, ``prior_rate``,
+        ``anchor_coverage_frac`` and the log-variance diagnostics -- and is safe to splat into a
+        metric logger. The likelihood name string is deliberately outside it.
 
     Raises:
         ValueError: On an unknown ``likelihood``, a raw length that does not match the geometry,
@@ -396,10 +445,15 @@ def compute_loss(
     )
     kl_terms = masked_source_kl(kld_btd, kl_support, free_bits=free_bits)
 
+    # On the KL's own anchor support, and in the graph: weighted, this is an objective term.
+    # Computed unconditionally so a run that never opted in still reports its prior's rate.
+    prior_rate = masked_prior_rate(forward_outputs["logvar_prior"], kl_support)
+
     total_loss = (
         lambda_full * nll_full_block
         + lambda_base * nll_base_block
         + beta * kl_terms["source_conditioned_kl_train"]
+        + beta_prior * prior_rate
     )
 
     # Diagnostics over the same masked supports the losses use, so each stays inside its own
@@ -470,7 +524,11 @@ def compute_loss(
         "source_conditioned_kl_raw": kl_terms["source_conditioned_kl_raw"],
         "source_conditioned_kl_train": kl_terms["source_conditioned_kl_train"],
         "kld_active_frac": kl_terms["kld_active_frac"],
+        "prior_rate": prior_rate,
         "kld_beta": torch.tensor(float(beta), device=device, dtype=dtype),
+        # Echoed like kld_beta so a metrics_history.csv identifies its own arm and the
+        # weighted terms can be recomposed from the file alone.
+        "beta_prior": torch.tensor(float(beta_prior), device=device, dtype=dtype),
         "anchor_coverage_frac": anchor_coverage_frac,
         "mean_logvar_full": mean_logvar_full,
         "mean_logvar_base": mean_logvar_base,

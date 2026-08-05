@@ -69,6 +69,11 @@ def clean_summary(**overrides: Any) -> Dict[str, Any]:
                 "d_base_mc_nats": 700.0,
                 "source_conditioned_kl_raw_nats": 2.0,
                 "kl_active_dims": 12,
+                "source_margin_nats": 3.0,
+                "prior_rate_nats": 4.0,
+                "mean_logvar_prior": -1.5,
+                "logvar_prior_floor_frac": 0.05,
+                **{f"verdict_{name}": "PASS" for name in verify.RWS_VERDICTS},
             },
             "verdicts": verdicts,
             "sanity": {
@@ -216,6 +221,7 @@ def write_arm(
     name: str,
     *,
     beta: float,
+    beta_prior: float = 1.0e-2,
     d_z: int = 48,
     reach: Optional[Any] = None,
     kept: Optional[Tuple[int, int]] = None,
@@ -240,6 +246,7 @@ def write_arm(
         "model_config": {
             "VAE_model": {
                 "beta_schedule": {"kind": "linear_warmup", "start": 0.0, "end": beta},
+                "beta_prior": beta_prior,
                 "d_z": d_z,
                 "causal_reach_budget_s": reach,
                 "c_y": 109,
@@ -300,6 +307,113 @@ def test_three_arms_key_the_beta_table_by_the_swept_value_not_the_directory(tmp_
     assert keys == ["0.1", "0.3", "1"], keys
     # And the misleadingly named directories appear only as identification, in value order.
     assert "beta_9p9" in rows[0] and "some_run" in rows[1] and "beta_0p1" in rows[2]
+
+
+def test_the_four_prior_anchor_arms_resolve_into_their_own_section(tmp_path):
+    """Without a section keyed on ``beta_prior`` the swept arms appear in no generated table and
+    the study becomes hand transcription -- which is what every other sweep here has a section to
+    avoid. The four are the shipped bracket, over three orders of magnitude."""
+    for name, weight in (
+        ("bp_0p001", 1.0e-3), ("bp_0p01", 1.0e-2), ("bp_0p1", 0.1), ("bp_1p0", 1.0),
+    ):
+        write_arm(tmp_path, name, beta=1.0, beta_prior=weight)
+    out = tmp_path / "arms.md"
+
+    assert verify.compare_arms(tmp_path, out) == 0
+    section = _section(out.read_text(encoding="utf-8"), "## Prior-anchor weight sweep")
+    rows = [line for line in section.splitlines() if line.startswith("| ")]
+    keys = [row.split("|")[1].strip() for row in rows[1:] if not row.startswith("|---")]
+
+    assert keys == ["0.001", "0.01", "0.1", "1"], keys
+    # The columns the study is read down, in the order it is read in: the floor first, the base
+    # forecast next, the coupling columns last.
+    header = rows[0]
+    for column in (
+        "`beta_prior`", "`logvar_prior_floor_frac`", "`mean_logvar_prior`", "`prior_rate`",
+        "`d_base_mc_nats`", "`pred_gap`", "`abs(pred_gap)/K`", "`source_margin`", "Verdicts",
+    ):
+        assert column in header, column
+
+
+def test_every_generated_table_is_well_formed_markdown(tmp_path):
+    """Every table's header, delimiter and body rows must agree on their cell count.
+
+    A header *label* that contains an unescaped ``|`` splits into extra cells, and a table whose
+    delimiter row no longer matches its header is not a table at all under GitHub-flavoured
+    markdown -- the whole section degrades to a paragraph of pipes. The failure is invisible from
+    the code, invisible to a per-label ``in header`` assertion (the substring is still there), and
+    surfaces only when somebody opens the document the multi-day arms are read from. So the check
+    is structural and runs over the whole emitted document rather than over one section.
+    """
+    write_arm(tmp_path, "low", beta=0.1, beta_prior=1.0e-3, d_z=24, reach=60, kept=(59, 23))
+    write_arm(tmp_path, "high", beta=1.0, beta_prior=1.0, d_z=64, pred_gap=-4.0)
+    out = tmp_path / "arms.md"
+
+    assert verify.compare_arms(tmp_path, out) == 0
+
+    def cells(line: str) -> int:
+        """Cell count of one markdown row, by the same split a renderer applies."""
+        return len(line.strip().strip("|").split("|"))
+
+    lines = out.read_text(encoding="utf-8").splitlines()
+    tables = 0
+    for index, line in enumerate(lines[:-1]):
+        if not line.startswith("|") or not set(lines[index + 1].strip()) <= set("|-: "):
+            continue
+        if not lines[index + 1].startswith("|"):
+            continue
+        tables += 1
+        width = cells(line)
+        assert cells(lines[index + 1]) == width, (
+            f"line {index + 1}: header has {width} cells, delimiter has "
+            f"{cells(lines[index + 1])} -- this section will not render as a table:\n{line}"
+        )
+        for body in lines[index + 2 :]:
+            if not body.startswith("|"):
+                break
+            assert cells(body) == width, f"line {index + 1}: row width {cells(body)} != {width}"
+
+    # A guard on the guard: a scan that matched no tables would pass on a broken document.
+    assert tables >= 5, f"only {tables} tables found; the scan is not reaching the sections"
+
+
+def test_the_amplification_ratio_carries_the_sign_of_the_gap(tmp_path):
+    """The ratio is |pred_gap| / K, and the same magnitude means opposite things either side of
+    zero: nats of forecast degradation per nat of rate where the gap is negative, nats of gain
+    where it is positive. A bare number would invite exactly the comparison it must not be read
+    as, so the cell says which."""
+    write_arm(tmp_path, "helping", beta=1.0, beta_prior=0.1, pred_gap=4.0)
+    write_arm(tmp_path, "hurting", beta=1.0, beta_prior=1.0, pred_gap=-4.0)
+    out = tmp_path / "arms.md"
+
+    assert verify.compare_arms(tmp_path, out) == 0
+    section = _section(out.read_text(encoding="utf-8"), "## Prior-anchor weight sweep")
+
+    helping = next(line for line in section.splitlines() if "helping" in line)
+    hurting = next(line for line in section.splitlines() if "hurting" in line)
+    # K is 2.0 in the fixture summary, so both are 2 -- and they are not the same finding.
+    assert "2 (gain)" in helping
+    assert "2 (cost)" in hurting
+
+
+def test_the_verdict_triple_is_rendered_as_one_cell(tmp_path):
+    """The three predictive verdicts together, because FAIL / PASS / FAIL is one state -- no
+    predictive gain, a positive source margin, and therefore no specificity -- and three separate
+    columns invite reading the first alone."""
+    results_dir = write_arm(tmp_path, "mixed", beta=1.0, beta_prior=0.1)
+    summary = json.loads((results_dir / verify.SUMMARY_FILENAME).read_text(encoding="utf-8"))
+    summary["results"]["headline"].update({
+        "verdict_predictive_improvement": "FAIL",
+        "verdict_source_margin_positive": "PASS",
+        "verdict_source_specificity": "FAIL",
+    })
+    (results_dir / verify.SUMMARY_FILENAME).write_text(json.dumps(summary), encoding="utf-8")
+    out = tmp_path / "arms.md"
+
+    assert verify.compare_arms(tmp_path, out) == 0
+    section = _section(out.read_text(encoding="utf-8"), "## Prior-anchor weight sweep")
+
+    assert "FAIL / PASS / FAIL" in section
 
 
 def test_a_collapsed_arm_is_marked_never_omitted(tmp_path):

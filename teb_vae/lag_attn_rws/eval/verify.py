@@ -101,6 +101,7 @@ ACTIVE_FRAC_COLUMN = "val/kld_active_frac"
 #: change fails a test instead of silently dropping a criterion from the gate.
 RWS_VERDICTS: Tuple[str, ...] = (
     "predictive_improvement",
+    "source_margin_positive",
     "source_specificity",
     "prior_carries_target_state",
     "latent_not_collapsed",
@@ -376,6 +377,7 @@ def main(summary_path: Any, json_out: Optional[Any] = None) -> int:
 #: arm's key in its table; a path the config does not carry keys the row ``(absent)``, which is
 #: itself information -- an arm file that dropped its swept key is not the arm it claims to be.
 SWEPT_BETA = ("model_config", "VAE_model", "beta_schedule", "end")
+SWEPT_BETA_PRIOR = ("model_config", "VAE_model", "beta_prior")
 SWEPT_DZ = ("model_config", "VAE_model", "d_z")
 SWEPT_REACH = ("model_config", "VAE_model", "causal_reach_budget_s")
 
@@ -618,6 +620,44 @@ def _headline_cell(arm: Dict[str, Any], column: str) -> str:
     return str(value)
 
 
+def _amplification_cell(arm: Dict[str, Any]) -> str:
+    r"""Render $|{\rm pred\_gap}| / K$, the nats of forecast movement per nat of divergence.
+
+    The ratio the prior-anchor work is judged on: a run can hold its prior off the clamp and still
+    be charging several nats of forecast for each nat of source-conditioned rate, and the floor
+    fraction alone does not say so. Derived here rather than registered as a headline scalar
+    because it is a ratio of two numbers that are already registered, and a third copy could
+    disagree with them.
+
+    The **sign** of ``pred_gap`` is not folded in, and the cell carries it: the same magnitude is
+    degradation where the gap is negative and gain where it is positive, so a bare ratio invites
+    exactly the comparison it must not be read as.
+    """
+    gap = arm["headline"].get(PRED_GAP_COLUMN)
+    kl = arm["headline"].get("source_conditioned_kl_raw_nats")
+    if gap is None or kl is None:
+        return "(missing)"
+    gap, kl = float(gap), float(kl)
+    if not kl:
+        return "(no rate)"
+    return f"{abs(gap) / kl:.6g} ({'gain' if gap > 0 else 'cost'})"
+
+
+def _verdict_triple_cell(arm: Dict[str, Any]) -> str:
+    """Render the three predictive verdicts as one cell, in registry order.
+
+    Together rather than as three columns because they are read as a triple: a FAIL / PASS / FAIL
+    is the specific state the margin verdict was added to make sayable -- no predictive gain, a
+    positive source margin, and therefore no specificity -- and three separate columns invite
+    reading the first one alone.
+    """
+    statuses = [
+        str(arm["headline"].get(f"verdict_{name}") or "?")
+        for name in ("predictive_improvement", "source_margin_positive", "source_specificity")
+    ]
+    return " / ".join(statuses)
+
+
 def _sweep_rows(
     arms: Sequence[Dict[str, Any]],
     key_path: Sequence[str],
@@ -687,6 +727,34 @@ def build_arm_tables(arms: Sequence[Dict[str, Any]]) -> str:
                     if arm["final_kld_active_frac"] is not None else _ABSENT
                 ),
                 _collapsed_cell(arm),
+            ],
+        ),
+    )
+
+    lines += ["", "## Prior-anchor weight sweep (`beta_prior`)", ""]
+    lines += _table(
+        ["`beta_prior`", "`logvar_prior_floor_frac`", "`mean_logvar_prior`", "`prior_rate`",
+         # Spelled `abs(...)` rather than with bars: a cell is split on `|`, so a header written
+         # `|`pred_gap`|/K` becomes three cells and the whole section stops being a table. This
+         # is also the spelling both RESULTS.md tables and their derived-quantity blocks use.
+         "`d_base_mc_nats`", "`pred_gap`", "`abs(pred_gap)/K`", "`source_margin`",
+         "`source_conditioned_kl_raw`", "`kld_active_frac` (final)", "Verdicts", "Run"],
+        _sweep_rows(
+            arms, SWEPT_BETA_PRIOR,
+            lambda arm: [
+                _headline_cell(arm, "logvar_prior_floor_frac"),
+                _headline_cell(arm, "mean_logvar_prior"),
+                _headline_cell(arm, "prior_rate_nats"),
+                _headline_cell(arm, "d_base_mc_nats"),
+                _headline_cell(arm, PRED_GAP_COLUMN),
+                _amplification_cell(arm),
+                _headline_cell(arm, "source_margin_nats"),
+                _headline_cell(arm, "source_conditioned_kl_raw_nats"),
+                _render(
+                    arm["final_kld_active_frac"]
+                    if arm["final_kld_active_frac"] is not None else _ABSENT
+                ),
+                _verdict_triple_cell(arm),
             ],
         ),
     )

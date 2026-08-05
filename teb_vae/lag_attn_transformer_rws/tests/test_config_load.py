@@ -83,6 +83,7 @@ REPLACED_ENCODER_KEYS = (
 TASK_LEVEL_KEYS = (
     "beta_schedule",
     "kld_beta",
+    "beta_prior",
     "lambda_full",
     "lambda_base",
     "likelihood",

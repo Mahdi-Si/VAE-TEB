@@ -1,12 +1,14 @@
 # Ablation arm: the initialisation-policy bundle off.
 #
 # The only arm that varies more than one key on purpose: it reverts the whole zero-parameter init
-# bundle at once (horizon-embedding std back to the core's 0.02 seed, output-head calibration off,
-# posterior source gain back to 1.0), so the baseline's synthetic-backed init policies are isolated
-# and measured on production data as a group rather than one at a time. The three keys move
-# together because they are one design decision -- start the model near the trivial predictor with
-# symmetry-broken horizon tokens and a balanced fusion -- not three independent knobs. Everything
-# else is inherited from default.yaml.
+# bundle at once (horizon-embedding std back to the core's 0.02 seed, decoder output-head AND
+# prior-head unit-scale calibration off, posterior source gain back to 1.0), so the baseline's
+# init policies are isolated and measured on production data as a group rather than one at a
+# time. The three keys move together because they are one design decision -- start the model near
+# the trivial predictor with symmetry-broken horizon tokens and a balanced fusion -- not three
+# independent knobs. Note head_init_calibration: false also restores the uncalibrated prior
+# start, the configuration in which the prior-variance collapse was measured. Everything else is
+# inherited from default.yaml.
 #
 #   TEB_RUN_STAMP="$(date '+%Y-%m-%d--[%H-%M]')" torchrun --nproc_per_node=7 \
 #       -m teb_vae.lag_attn_rws.trainer --config teb_vae/lag_attn_rws/configs/sweep_init_off.yaml

@@ -669,6 +669,9 @@ def load_task(
         model_kwargs=model_kwargs,
         beta_schedule=hparams.get("beta_schedule"),
         kld_beta=hparams.get("kld_beta", 1.0),
+        # Defaulted for checkpoints that predate the prior anchor; a checkpoint trained at a
+        # non-zero weight must be scored under that same objective.
+        beta_prior=hparams.get("beta_prior", 0.0),
         lambda_full=hparams.get("lambda_full", 1.0),
         lambda_base=hparams.get("lambda_base", 1.0),
         likelihood=hparams.get("likelihood", "gaussian_nll"),
@@ -979,11 +982,18 @@ def build_run_context(
     nll_full = _finite(readouts.get("nll_full_block"))
     nll_base = _finite(readouts.get("nll_base_block"))
     kl_raw = _finite(readouts.get("source_conditioned_kl_raw"))
+    # Absent from collections that predate the prior anchor; the fourth term then contributes
+    # nothing, which is exact at beta_prior 0.0 and a stated lower bound otherwise.
+    prior_rate = _finite(readouts.get("prior_rate"))
     lambda_full = float(weights.get("lambda_full", 1.0))
     lambda_base = float(weights.get("lambda_base", 1.0))
     beta_end = _beta_end(weights)
+    beta_prior = float(weights.get("beta_prior", 0.0))
     estimate = (
-        lambda_full * nll_full + lambda_base * nll_base + beta_end * kl_raw
+        lambda_full * nll_full
+        + lambda_base * nll_base
+        + beta_end * kl_raw
+        + beta_prior * (prior_rate if prior_rate is not None else 0.0)
         if nll_full is not None and nll_base is not None and kl_raw is not None
         else None
     )
@@ -1007,9 +1017,11 @@ def build_run_context(
             "nll_full_block": nll_full,
             "nll_base_block": nll_base,
             "source_conditioned_kl_raw": kl_raw,
+            "prior_rate": prior_rate,
             "lambda_full": lambda_full,
             "lambda_base": lambda_base,
             "beta_end": beta_end,
+            "beta_prior": beta_prior,
             "free_bits": float(weights.get("free_bits", 0.0)),
             "main_loss_estimate": estimate,
             # The raw KL stands in for the trained one, which the evaluation deliberately does
@@ -1018,7 +1030,9 @@ def build_run_context(
             "note": (
                 "training-path per-anchor magnitudes recombined with the objective's weights at "
                 "the end-of-ramp beta, for re-deriving the spike breaker's additive_margin; the "
-                "raw KL stands in for the trained one (exact at free_bits 0.0)"
+                "raw KL stands in for the trained one (exact at free_bits 0.0), and the prior "
+                "scale rate contributes only when the collection recorded it (exact at "
+                "beta_prior 0.0)"
             ),
         },
     }

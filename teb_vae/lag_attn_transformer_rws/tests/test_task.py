@@ -156,6 +156,34 @@ def test_the_loss_is_finite_and_carries_gradient(task, stub_batch, perturb_poste
     assert loss.requires_grad
 
 
+def test_both_wrappers_forward_beta_prior_by_value(task, stub_batch):
+    """Switching ``beta_prior`` from 0 to 1 must move ``total_loss`` by exactly the returned
+    ``prior_rate`` -- through this model's delegating ``compute_loss`` and through the
+    comparison model's, the one edit in the loss path that is made twice. A value assertion
+    rather than a signature check, because a wrapper that accepts the keyword and drops it
+    passes any signature test. Filed in this suite because the tree's import direction is
+    trf -> rws, never the reverse."""
+    from teb_vae.lag_attn_rws.tests.conftest import make_stub_batch as sibling_stub_batch
+
+    mine = task().orig_model.eval()
+    theirs = _sibling_task().orig_model.eval()
+
+    for model, batch in ((mine, stub_batch), (theirs, sibling_stub_batch())):
+        with torch.no_grad():
+            out = model(batch.fhr_st, batch.fhr_ph, torch.cat([batch.up_st, batch.up_ph], -1))
+            off = model.compute_loss(out, batch.fhr, weight=batch.weight, beta_prior=0.0)
+            on = model.compute_loss(out, batch.fhr, weight=batch.weight, beta_prior=1.0)
+
+        rate = on["metrics"]["prior_rate"]
+        assert float(rate) > 0.0, "an at-optimum prior would make this assertion vacuous"
+        assert torch.allclose(
+            on["metrics"]["total_loss"] - off["metrics"]["total_loss"],
+            rate,
+            rtol=1e-5,
+            atol=1e-4,
+        ), type(model).__name__
+
+
 def test_the_zero_kl_start_survives_the_task(task, stub_batch):
     """At initialisation the posterior *is* the prior, so the coupling readout starts at exactly
     zero and every nat it later reports had to be earned. Seen here through the task's own

@@ -1,0 +1,19 @@
+# Prior-anchor arm: beta_prior = 1.0, one order ABOVE the shipped 0.1.
+#
+# The strongest anchor in the sweep, two orders above the shipped weight and at parity with the
+# converged source-divergence weight (beta_schedule.end = 1.0). At this weight the prior's scale
+# term and the coupling term enter the objective at equal footing, so this arm bounds the sweep
+# from above: if even unit weight cannot hold the floor fraction down, the anchor's form -- not
+# its weight -- is what needs revisiting, and if it holds but nll_base_block degrades, the arm
+# prices the trade the lighter weights avoid.
+#
+# 0 parameters: the anchor is an objective term, not a module.
+#
+#   TEB_RUN_STAMP="$(date '+%Y-%m-%d--[%H-%M]')" torchrun --nproc_per_node=7 \
+#       -m teb_vae.lag_attn_transformer_rws.trainer \
+#       --config teb_vae/lag_attn_transformer_rws/configs/sweep_beta_prior_1p0.yaml
+base: default.yaml
+
+model_config:
+  VAE_model:
+    beta_prior: 1.0

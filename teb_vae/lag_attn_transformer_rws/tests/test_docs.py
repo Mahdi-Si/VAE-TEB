@@ -75,6 +75,7 @@ STUDY_HEADINGS = (
     "## Phase 2a",
     "## Phase 2b",
     "## Phase 3",
+    "## The prior-anchor weight",
 )
 
 #: The six bottleneck-health readouts, by the name the task emits them under. All six exist from

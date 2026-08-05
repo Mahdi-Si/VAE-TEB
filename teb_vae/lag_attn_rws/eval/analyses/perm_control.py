@@ -69,6 +69,17 @@ VALUE_COLUMNS: Tuple[str, ...] = tuple(
     column for _, column in BRANCH_COLUMNS
 ) + (_KL_TRUE, _KL_SHUFFLED)
 
+#: The penalty row whose mean is promoted to a keyed scalar beside the list.
+#:
+#: The headline block is assembled by walking key paths into this analysis's returned mapping, and
+#: ``penalties`` is a *list* -- which is why ``shuffle_penalty`` has never reached the headline
+#: despite being computed since the analysis existed. A row is not addressable by a path, so the
+#: one number an acceptance gate reads is emitted under its own key as well.
+SOURCE_MARGIN_PENALTY = "source_margin"
+
+#: That key. Named here rather than spelled in ``report_seam`` so the producer and the path agree.
+SOURCE_MARGIN_SCALAR = "source_margin_nats"
+
 #: The metrics resolved by cohort: the three block scores the specificity ordering is read from.
 #: The KL columns are left pooled -- the ordering is a statement about prediction space, and a
 #: by-cohort KL is the latent analysis's subject rather than this one's.
@@ -143,11 +154,23 @@ def build_branch_rows(
 def build_penalty_rows(
     per_guid: pd.DataFrame, *, resamples: int, seed: int
 ) -> List[Dict[str, Any]]:
-    """Score the two control penalties per recording: a stranger's source, a stranger's prior.
+    """Score three paired controls per recording, each against the branch it degrades.
 
     Each is a *paired* quantity -- both branches are scored on the same recording -- so the
     interval is over the per-recording differences and the test is the signed-rank one. Positive
-    means the control is worse than the branch it degrades, which is what a working control does.
+    means the control is worse than its reference, which is what a working control does; all
+    three share that convention, so their signs read the same way.
+
+    The third is referenced against **full** rather than base, and that is the whole reason it
+    exists. The two above it both ask what a control costs against the *no-source* branch, so both
+    inherit whatever the base forecast is doing; a run whose source pathway is being charged more
+    than it delivers fails every base-referenced comparison while still using this recording's
+    source rather than any source. ``source_margin`` is the comparison that survives that state:
+    it changes only the source and holds prior, decoder and latent geometry fixed, so a positive
+    value says the matched source beat a derangement-shuffled stranger even where the predictive
+    gain against base is negative. It is named a margin rather than a penalty because that is what
+    it is; it is built here because it is the same paired construction, and a second builder would
+    be a second place for the sign convention to drift.
 
     Args:
         per_guid: Per-recording means.
@@ -155,8 +178,8 @@ def build_penalty_rows(
         seed: Bootstrap seed.
 
     Returns:
-        One row per penalty, each carrying the fraction of recordings on which the control cost
-        something, with its denominator.
+        One row per control, each carrying the fraction of recordings on which it cost something,
+        with its denominator.
     """
     rows: List[Dict[str, Any]] = []
     for name, control_column, reference_column, meaning in (
@@ -171,6 +194,13 @@ def build_penalty_rows(
             "mc_nll_base_shuffled_mu_block",
             "mc_nll_base_block",
             "D_base(shuffled mu_p) - D_base: what a stranger's prior latent costs",
+        ),
+        (
+            "source_margin",
+            "mc_nll_shuffled_block",
+            "mc_nll_full_block",
+            "D_shuffled - D_full: what a stranger's source costs against this recording's own, "
+            "positive when the matched source forecasts better than the stranger",
         ),
     ):
         control = finite_column(per_guid, control_column)
@@ -280,12 +310,22 @@ def run_perm_control_analysis(
     verdict = source_specificity_verdict(
         _score("base"), _score("full"), _score("shuffled")
     )
+    # The margin's mean, lifted out of the list so a key path reaches it. ``None`` rather than NaN
+    # when the control did not run, because the headline distinguishes "not produced" from a
+    # number and a NaN there would read as a measurement.
+    margin_row = next(
+        (row for row in penalty_rows if row["penalty"] == SOURCE_MARGIN_PENALTY), None
+    )
+    margin_mean = None if margin_row is None else margin_row.get("mean")
+    if margin_mean is not None and not np.isfinite(float(margin_mean)):
+        margin_mean = None
     return {
         "n_samples": scored_sample_count(per_sample, "mc_nll_shuffled_block"),
         "composition": {"n_recordings": int(len(per_guid))},
         "plan": {"capped": False, "bootstrap_resamples": resamples, "seed": seed},
         "branches": branch_rows,
         "penalties": penalty_rows,
+        SOURCE_MARGIN_SCALAR: None if margin_mean is None else float(margin_mean),
         "kl_space": build_kl_description(per_guid),
         # The same criterion the run's own verdict list carries, applied to the same
         # per-recording means: one implementation, read here rather than restated.

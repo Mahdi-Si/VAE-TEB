@@ -75,7 +75,7 @@ def test_loss_only_keys_do_not_reach_the_constructor(trainer):
 
     for name in (
         "likelihood", "free_bits", "lambda_full", "lambda_base", "beta_schedule",
-        "kld_beta", "causal_reach_budget_s",
+        "kld_beta", "beta_prior", "causal_reach_budget_s",
     ):
         assert name not in kwargs, f"{name} is not the net's"
 
@@ -148,6 +148,10 @@ def test_create_model_passes_the_loss_hyperparameters_to_the_task(trainer):
     assert hparams["free_bits"] == 0.0
     assert hparams["beta_schedule"]["kind"] == "linear_warmup"
     assert hparams["beta_schedule"]["start"] == 0.0
+    # The shipped anchor weight, forwarded from default.yaml rather than the driver's 0.0
+    # fallback -- a driver that stopped reading the key would fall back silently, and this is
+    # the assertion that would catch it.
+    assert hparams["beta_prior"] == 0.1
 
 
 def test_create_model_forces_eager_execution(trainer):
