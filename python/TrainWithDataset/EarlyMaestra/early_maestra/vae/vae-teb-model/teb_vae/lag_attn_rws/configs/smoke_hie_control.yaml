@@ -1,0 +1,29 @@
+# The unanchored control for the local prior-anchor validation.
+#
+# Two deltas against smoke_hie.yaml, and they are one decision: reproduce the starting condition
+# the prior-variance collapse was actually measured in. `beta_prior: 0.0` removes the scale
+# anchor from the objective, and `head_init_calibration: false` reverts the prior head to the
+# uncalibrated start -- three nats below the anchor's optimum -- which is where the reported
+# production run began. Anchoring the objective while starting the head at the optimum would
+# measure the two together and attribute the result to whichever is named first.
+#
+# The key governs the DECODER output-head calibration as well (see sweep_init_off.yaml), so this
+# arm also starts its decoder off the trivial unit-variance predictor. That half is NOT what the
+# reported run did: its checkpoint records head_init_calibration true, and at the commit it ran
+# from that key drove the decoder calibration alone -- the prior-scale half did not yet exist. So
+# the reported start is decoder-calibrated and prior-uncalibrated, a combination no setting of
+# this one key can express. `false` matches it on the prior half, which is the half under test,
+# and diverges on the decoder half, which is why the base-forecast question is answered against
+# the calibrated bp0 control instead and RESULTS.md says so.
+#
+#   python -m teb_vae.lag_attn_rws.trainer --config teb_vae/lag_attn_rws/configs/smoke_hie_control.yaml
+base: smoke_hie.yaml
+
+general_config:
+  tag: lag_attn_rws_hie_smoke_control
+  folders_config: {out_dir_base: output/lag_attn_rws_hie_smoke_control}
+
+model_config:
+  VAE_model:
+    beta_prior: 0.0
+    head_init_calibration: false

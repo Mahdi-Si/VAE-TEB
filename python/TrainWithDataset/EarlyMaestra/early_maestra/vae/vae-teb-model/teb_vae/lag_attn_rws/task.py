@@ -6,7 +6,7 @@ tensors; this module turns one into the other and computes the objective
 
 $$
 \mathcal{L} = \lambda_{\mathrm{full}} D_1 + \lambda_{\mathrm{base}} D_0
-  + \beta(e)\,\mathrm{KL}_{\mathrm{train}},
+  + \beta(e)\,\mathrm{KL}_{\mathrm{train}} + \beta_p\,R_p,
 $$
 
 with every term in nats per anchor (the net's ``compute_loss`` owns the reduction convention).
@@ -70,6 +70,7 @@ class SeqVaeLagAttnRwsTask(LightningModelBase):
         model_kwargs: Optional[Dict[str, Any]] = None,
         beta_schedule: Optional[Dict[str, Any]] = None,
         kld_beta: float = 1.0,
+        beta_prior: float = 0.0,
         lambda_full: float = 1.0,
         lambda_base: float = 1.0,
         likelihood: str = "gaussian_nll",
@@ -95,6 +96,10 @@ class SeqVaeLagAttnRwsTask(LightningModelBase):
             beta_schedule: Structured $\beta$ schedule; see :meth:`_resolve_beta`. ``None``
                 falls back to the constant ``kld_beta``.
             kld_beta: Constant $\beta$ used when no schedule is configured.
+            beta_prior: Weight $\beta_p$ of the prior scale rate. A constant, never a
+                schedule: the prior-variance collapse this term prevents completes within the
+                first epoch, so a warm-up would arrive after the damage. ``0.0`` restores the
+                historical three-term objective exactly.
             lambda_full: Weight of the full (source-conditioned) reconstruction term.
             lambda_base: Weight of the base (target-only) reconstruction term.
             likelihood: ``'mse'`` or ``'gaussian_nll'``.
@@ -113,6 +118,7 @@ class SeqVaeLagAttnRwsTask(LightningModelBase):
         self.save_hyperparameters(
             "beta_schedule",
             "kld_beta",
+            "beta_prior",
             "lambda_full",
             "lambda_base",
             "likelihood",
@@ -163,7 +169,7 @@ class SeqVaeLagAttnRwsTask(LightningModelBase):
         )
 
     def on_before_optimizer_step(self, optimizer: Any) -> None:
-        r"""Log the global gradient $L_2$ norm **before** clipping, once per optimizer step.
+        r"""Log the pre-clip gradient $L_2$ norm and whether it exceeded the clip, per step.
 
         ``advanced_config.trainer.gradient_clip_val`` ships at a provisional $250$ -- scaled from
         the sibling's $0.5$ by the $\approx 2 \times 480$ change in loss magnitude, not measured
@@ -174,7 +180,25 @@ class SeqVaeLagAttnRwsTask(LightningModelBase):
         effective learning rate); far above it, the clip is decoration and a genuine blow-up
         reaches the weights.
 
-        The hook order is what makes the number the right one: Lightning's precision plugin calls
+        Two columns, because they answer different questions. ``train/grad_norm`` is the norm
+        itself; whether the threshold *bound* on a given step is not recoverable from it.
+        ``train/grad_clip_frac`` logs the per-step exceedance indicator -- $1.0$ is
+        normalised-gradient descent in disguise, $0.0$ is a clip that never fires. Omitted
+        entirely when the trainer configures no clipping -- an absent threshold *or* a
+        non-positive one, which is what Lightning itself treats as disabled -- since a fraction
+        against no threshold would be an answer to no question.
+
+        **What reaches ``metrics_history.csv`` is one step per epoch, not the epoch's
+        aggregate.** ``MetricsLoggingCallback`` reads ``trainer.callback_metrics`` from
+        ``on_validation_epoch_end``, which runs before the *training* epoch is reduced, so for a
+        metric logged from this hook with both ``on_step`` and ``on_epoch`` the bare key still
+        holds the last step's value. That is a usable sample rather than a defect -- a threshold
+        is a per-step question, and one step per epoch is an unbiased draw from the per-step
+        distribution -- but it governs how the columns are read: ``grad_clip_frac`` is $0$ or $1$
+        per row and its **mean over epochs** estimates the exceedance fraction. Every ``val/``
+        column is a true epoch mean; these two are the exception.
+
+        The hook order is what makes the numbers right: Lightning's precision plugin calls
         this hook and *then* ``_clip_gradients``, so what is measured here is the pre-clip norm --
         the only version comparable against ``gradient_clip_val``. Under DDP the gradients have
         already been all-reduced by the end of the backward, so every rank measures the same
@@ -192,13 +216,30 @@ class SeqVaeLagAttnRwsTask(LightningModelBase):
         ]
         if not norms:
             return
+        grad_norm = torch.linalg.vector_norm(torch.stack(norms))
         self.log(
             "train/grad_norm",
-            torch.linalg.vector_norm(torch.stack(norms)),
+            grad_norm,
             on_step=True,
             on_epoch=True,
             logger=True,
         )
+        clip_val = self.trainer.gradient_clip_val
+        # ``> 0`` and not merely ``is not None``, because that is the predicate Lightning itself
+        # clips on: ``Precision.clip_gradients`` returns immediately for a non-positive threshold,
+        # so a config carrying ``gradient_clip_val: 0`` -- the "0 disables it" convention, which
+        # still appears elsewhere in this repository -- clips nothing while every norm exceeds
+        # zero. Gated on ``is not None`` alone that run would report an exceedance fraction of
+        # 1.000 in every row: the one value read as "the threshold rescaled every step", for a run
+        # with no threshold at all.
+        if clip_val is not None and float(clip_val) > 0.0:
+            self.log(
+                "train/grad_clip_frac",
+                (grad_norm > float(clip_val)).to(grad_norm.dtype),
+                on_step=True,
+                on_epoch=True,
+                logger=True,
+            )
 
     # ------------------------------------------------------------------
     # Batch -> model inputs
@@ -486,6 +527,7 @@ class SeqVaeLagAttnRwsTask(LightningModelBase):
         forward_outputs = self.model(y_st, y_ph, u_stream)
 
         beta = self._resolve_beta(self.current_epoch)
+        beta_prior = float(self.hparams.get("beta_prior", 0.0))
         lambda_full = float(self.hparams.get("lambda_full", 1.0))
         lambda_base = float(self.hparams.get("lambda_base", 1.0))
         likelihood = str(self.hparams.get("likelihood", "gaussian_nll"))
@@ -496,6 +538,7 @@ class SeqVaeLagAttnRwsTask(LightningModelBase):
             fhr_raw,
             weight=weight,
             beta=beta,
+            beta_prior=beta_prior,
             lambda_full=lambda_full,
             lambda_base=lambda_base,
             likelihood=likelihood,
@@ -528,6 +571,9 @@ class SeqVaeLagAttnRwsTask(LightningModelBase):
                     fhr_raw,
                     weight=weight,
                     beta=0.0,
+                    # Zero like beta: the control re-scores the full branch under a stranger's
+                    # source and leaves the prior untouched, so no objective weight belongs here.
+                    beta_prior=0.0,
                     lambda_full=lambda_full,
                     lambda_base=lambda_base,
                     likelihood=likelihood,

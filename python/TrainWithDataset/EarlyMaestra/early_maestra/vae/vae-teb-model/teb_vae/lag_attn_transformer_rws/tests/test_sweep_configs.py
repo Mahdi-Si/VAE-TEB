@@ -1,11 +1,14 @@
-r"""Lint for the architecture arms: each is ``default.yaml`` plus a *declared* delta and nothing else.
+r"""Lint for the sweep arms: each is ``default.yaml`` plus a *declared* delta and nothing else.
 
-Twelve arms sweep three axes. **Architecture** (A1, A2) asks what the convolution stem and the
+Sixteen arms sweep four axes. **Architecture** (A1, A2) asks what the convolution stem and the
 source encoder's asymmetry are worth; the shipped ``default.yaml`` is A3, the recommended arm, and
 A0 is the model this package is compared against -- ``teb_vae/lag_attn_rws`` -- not a file here.
 **Source locality** sweeps $W_U \in \{8, 32, 64, \text{unbounded}\}$ around the shipped $16$, plus
 the causal-input reach budget the availability representation exists to make trainable.
-**Depth and width** moves $N_Y$, $N_U$ and $d_{\mathrm{ff}}$ one key at a time.
+**Depth and width** moves $N_Y$, $N_U$ and $d_{\mathrm{ff}}$ one key at a time. **The prior-anchor
+weight** brackets ``beta_prior`` over three orders of magnitude around the shipped $10^{-1}$; its
+$10^{-1}$ arm deliberately restates the shipped value -- pinned, so the arm survives a later
+revision of the default -- and therefore declares an *empty* delta.
 
 The lint holds :data:`DECLARED_DELTAS`, and it is the point of the file. Every
 ``configs/sweep_*.yaml`` must appear in it, and each arm's *resolved* delta against ``default.yaml``
@@ -48,6 +51,7 @@ _TARGET_BLOCKS = f"{_VAE}.target_attention_blocks"
 _SOURCE_BLOCKS = f"{_VAE}.source_attention_blocks"
 _SOURCE_WINDOW = f"{_VAE}.source_attention_window"
 _REACH = f"{_VAE}.causal_reach_budget_s"
+_BETA_PRIOR = f"{_VAE}.beta_prior"
 
 #: Every arm, by file name, with the complete set of leaves it is allowed to move against
 #: ``default.yaml``. An arm's resolved delta must equal its entry exactly -- neither a missing key
@@ -74,6 +78,15 @@ DECLARED_DELTAS: Dict[str, Dict[str, Any]] = {
     "sweep_source_blocks_2.yaml": {_SOURCE_BLOCKS: 2},
     "sweep_source_blocks_4.yaml": {_SOURCE_BLOCKS: 4},
     "sweep_ff_384.yaml": {_D_FF: 384},
+    # The prior-anchor weight, bracketing the shipped 0.1 over three orders of magnitude. The
+    # 0p1 arm restates the shipped value -- pinned against a later default revision -- so its
+    # resolved delta against default.yaml is empty by construction. That pin is exactly what made
+    # the revision from 1.0e-2 to 0.1 a two-line change here rather than a silent one: the empty
+    # delta moved from one arm to the other and this table had to say so.
+    "sweep_beta_prior_0p001.yaml": {_BETA_PRIOR: 1.0e-3},
+    "sweep_beta_prior_0p01.yaml": {_BETA_PRIOR: 1.0e-2},
+    "sweep_beta_prior_0p1.yaml": {},
+    "sweep_beta_prior_1p0.yaml": {_BETA_PRIOR: 1.0},
 }
 
 #: One causal Transformer block at the shipped widths: $4d^2 + 3 d\,d_{\mathrm{ff}} + 4d$ with

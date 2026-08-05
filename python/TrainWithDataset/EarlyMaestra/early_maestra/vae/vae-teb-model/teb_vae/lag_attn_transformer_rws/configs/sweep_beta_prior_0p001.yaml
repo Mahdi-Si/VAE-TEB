@@ -1,0 +1,18 @@
+# Prior-anchor arm: beta_prior = 1.0e-3, two orders BELOW the shipped 0.1.
+#
+# The weakest anchor in the sweep, one order below the shipped weight. The failure mode this arm
+# watches for is re-pinning: an anchor too weak to hold the prior's log-variance off the clamp
+# floor leaves the collapse intact and the sweep's lower bracket established. Read it on
+# logvar_prior_floor_frac and mean_logvar_prior first; a floor fraction that climbs back toward
+# 1.0 is this arm answering its question.
+#
+# 0 parameters: the anchor is an objective term, not a module.
+#
+#   TEB_RUN_STAMP="$(date '+%Y-%m-%d--[%H-%M]')" torchrun --nproc_per_node=7 \
+#       -m teb_vae.lag_attn_transformer_rws.trainer \
+#       --config teb_vae/lag_attn_transformer_rws/configs/sweep_beta_prior_0p001.yaml
+base: default.yaml
+
+model_config:
+  VAE_model:
+    beta_prior: 1.0e-3

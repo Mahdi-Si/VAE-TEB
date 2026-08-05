@@ -1,0 +1,19 @@
+# Prior-anchor arm: beta_prior = 1.0e-2, one order BELOW the shipped 0.1.
+#
+# The value this package shipped before the sibling's dev-box arms measured it. It is kept as an
+# arm rather than deleted because it is the one weight already known to fail on the other
+# architecture -- floor fraction 0.955 at 200 epochs, a 6.7x delay and nothing more -- so it is
+# the arm that says whether that threshold sits in the same place here. An arm expected to fail
+# is still an arm: if the prior holds at 1.0e-2 on this encoder, the threshold moves with the
+# architecture and the shipped value is over-anchored.
+#
+# 0 parameters: the anchor is an objective term, not a module.
+#
+#   TEB_RUN_STAMP="$(date '+%Y-%m-%d--[%H-%M]')" torchrun --nproc_per_node=7 \
+#       -m teb_vae.lag_attn_transformer_rws.trainer \
+#       --config teb_vae/lag_attn_transformer_rws/configs/sweep_beta_prior_0p01.yaml
+base: default.yaml
+
+model_config:
+  VAE_model:
+    beta_prior: 1.0e-2

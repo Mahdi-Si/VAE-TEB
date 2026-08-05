@@ -111,6 +111,44 @@ def kl_support_counts(module, batch) -> torch.Tensor:
     return kl_mask(forecast, model.geometry).sum(dim=1)
 
 
+def test_the_prior_rate_readout_recombines_into_the_objectives_own_term(
+    trained_task, stub_batch
+):
+    """The per-sample rate column against the batch-level reduction the objective computes.
+
+    The evaluation recomputes the expression rather than importing the loss function, because the
+    loss reduces a whole batch to one scalar and this table needs the quantity per sample. Two
+    copies of one formula is exactly the situation where a sign or a factor drifts, so the two are
+    pinned equal on the same batch, on the same support, here.
+    """
+    from teb_vae.lag_attn_rws.eval.metrics import model_inputs
+    from teb_vae.lag_attn_rws.nets.losses import masked_prior_rate
+    from teb_vae.lag_attn_rws.nets.raw_masks import forecast_mask, kl_mask
+
+    readout = evaluate_batch(trained_task, stub_batch, num_samples=1)
+
+    model = trained_task.orig_model
+    y_st, y_ph, u_stream, _fhr_raw, weight = model_inputs(trained_task, stub_batch)
+    with torch.no_grad():
+        outputs = model(y_st, y_ph, u_stream)
+    forecast, _ = forecast_mask(weight, model.geometry, coverage_floor=model.coverage_floor)
+    support_mask = kl_mask(forecast, model.geometry)
+    expected = float(masked_prior_rate(outputs["logvar_prior"], support_mask))
+
+    support = support_mask.sum(dim=1)
+    recombined = float((readout.columns["prior_rate"] * support).sum() / support.sum())
+    assert recombined == pytest.approx(expected, rel=1e-5)
+
+
+def test_the_prior_rate_is_zero_only_at_unit_scale(trained_task, stub_batch):
+    """Nonnegative everywhere and zero exactly at ``sigma_p = 1``, which is what makes it an
+    anchor rather than a penalty with a preferred direction."""
+    readout = evaluate_batch(trained_task, stub_batch, num_samples=1)
+
+    assert bool((readout.columns["prior_rate"] >= 0.0).all())
+    assert "prior_rate" in readout.columns
+
+
 def test_the_predictive_gap_is_the_difference_of_the_two_scores(trained_task, stub_batch):
     readout = evaluate_batch(trained_task, stub_batch, num_samples=1)
 

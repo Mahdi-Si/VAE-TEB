@@ -77,6 +77,10 @@ _METRIC_SUFFIXES = (
     "pred_gap",
     "source_conditioned_kl_raw", "source_conditioned_kl_train",
     "kld_active_frac", "kld_beta",
+    # The prior scale rate and its weight. The rate is reported whether or not a config opts
+    # into the anchor term, so a collapsing prior is visible in any run's CSV; the echoed
+    # weight is what lets a metrics_history.csv identify its own arm.
+    "prior_rate", "beta_prior",
     "anchor_coverage_frac",
     # The decoder-output variances (mean_logvar_full/base) do NOT detect a prior variance
     # pinned on its clamp; mean_logvar_prior and logvar_prior_floor_frac are the watch for the
@@ -101,8 +105,11 @@ _VAL_ONLY_SUFFIXES = ("nll_shuffled_block", "kld_shuffled", "shuffle_penalty")
 #: the EMA it compares against -- and this repository has already lost a run that trained
 #: normally and then skipped every batch forever, a failure only those two columns can show. The
 #: third is the task's pre-clip gradient norm, which exists on the training path alone and is
-#: what the provisional ``gradient_clip_val`` is re-derived from.
-_TRAIN_ONLY_SUFFIXES = ("spike_skipped", "spike_ema_loss", "grad_norm")
+#: what the provisional ``gradient_clip_val`` is re-derived from. The fourth is the fraction of
+#: optimizer steps whose pre-clip norm exceeded that threshold: ``grad_norm``'s epoch value is
+#: an aggregate, so without the fraction "how often did the clip bind" is not recoverable from
+#: any recorded quantity.
+_TRAIN_ONLY_SUFFIXES = ("spike_skipped", "spike_ema_loss", "grad_norm", "grad_clip_frac")
 
 #: The names the framework actually puts in ``callback_metrics``: every task metric is logged as
 #: ``{stage}/{name}``, plus the bare ``lr`` the base logs once per epoch. A bare suffix here
@@ -270,6 +277,7 @@ class LagAttnRwsTrainer(GraphModelBase):
             spike_breaker=self.config.get("advanced_config", {}).get("spike_breaker"),
             beta_schedule=vae_config.get("beta_schedule"),
             kld_beta=vae_config.get("kld_beta", 1.0),
+            beta_prior=vae_config.get("beta_prior", 0.0),
             lambda_full=vae_config.get("lambda_full", 1.0),
             lambda_base=vae_config.get("lambda_base", 1.0),
             likelihood=vae_config.get("likelihood", "gaussian_nll"),

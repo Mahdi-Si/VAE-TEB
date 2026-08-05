@@ -535,10 +535,17 @@ def test_the_run_context_records_what_the_arm_tables_consume(evaluated, trained_
     scale = context["observed_loss_scale"]
     readouts = evaluated["summary"]["results"]["readouts"]
     assert scale["nll_full_block"] == pytest.approx(readouts["nll_full_block"])
+    # Four terms, not the original three: the objective gained the prior scale anchor, so an
+    # estimate recombined without its weighted rate would under-report an anchored run's
+    # main_loss. The rate readout is absent until the collection emits it per sample, which is
+    # exactly the case the recombination must survive -- contributing nothing, exact at
+    # beta_prior 0.0.
+    assert "beta_prior" in scale
     assert scale["main_loss_estimate"] == pytest.approx(
         scale["lambda_full"] * scale["nll_full_block"]
         + scale["lambda_base"] * scale["nll_base_block"]
         + scale["beta_end"] * scale["source_conditioned_kl_raw"]
+        + scale["beta_prior"] * (scale["prior_rate"] or 0.0)
     )
 
 
@@ -571,6 +578,23 @@ def test_a_checkpoint_without_model_kwargs_is_refused(trained_run, tmp_path):
 
     with pytest.raises(RuntimeError, match="no 'model_kwargs'"):
         run_module.load_task(_mutated(trained_run, tmp_path, _drop), torch.device("cpu"))
+
+
+def test_a_checkpoint_trained_at_a_nonzero_beta_prior_is_scored_at_that_value(
+    trained_run, tmp_path
+):
+    """Asserted rather than assumed: a reconstruction that dropped the key would silently score
+    an anchored checkpoint under the unanchored objective. The distinctive value round-trips
+    from the blob's ``hyper_parameters`` into the rebuilt task's own."""
+
+    def _anchor(blob):
+        blob["hyper_parameters"]["beta_prior"] = 0.037
+
+    task = run_module.load_task(
+        _mutated(trained_run, tmp_path, _anchor), torch.device("cpu")
+    )
+
+    assert float(task.hparams["beta_prior"]) == pytest.approx(0.037)
 
 
 def test_a_checkpoint_without_hyperparameters_is_refused(trained_run, tmp_path):
@@ -759,3 +783,85 @@ def test_the_labour_onset_rows_are_counted_rather_than_dropped(evaluated):
     assert block["n_finite"] + block["n_nan"] == block["n_rows"]
     assert 0.0 < block["nan_fraction"] < 1.0
     assert block["min_hours"] <= block["mean_hours"] <= block["max_hours"]
+
+
+# =============================================================================
+# Reusing a directory collected under different acceptance criteria
+# =============================================================================
+def _collection_record(verdict_names) -> dict:
+    """The half of a collection record the currency check reads."""
+    return {"results": {"verdicts": [{"name": name, "status": "PASS"} for name in verdict_names]}}
+
+
+def test_a_directory_collected_under_the_current_criteria_is_reused(tmp_path):
+    """The ordinary offline path: the tables were written by this pipeline, so nothing objects."""
+    metrics.check_cached_verdicts(
+        _collection_record([name for name, _ in metrics.VERDICT_REGISTRY])["results"]["verdicts"]
+    )
+
+
+def test_a_directory_collected_before_a_criterion_existed_is_refused_by_name(tmp_path):
+    """The failure this check exists for, and the reason it cannot be left to ``order_verdicts``.
+
+    That guard runs over the list a *fresh* pass builds and is never reached on the reuse path, so
+    a directory collected under the earlier criteria would be re-reported verbatim: a summary
+    silently missing a criterion, which reads exactly like one where the criterion passed.
+    """
+    stale = [name for name, _ in metrics.VERDICT_REGISTRY if name != "source_margin_positive"]
+
+    with pytest.raises(metrics.StaleCachedVerdicts) as raised:
+        metrics.check_cached_verdicts(_collection_record(stale)["results"]["verdicts"])
+
+    message = str(raised.value)
+    # What moved, in both directions, and the one way out -- an operator reading this must not
+    # have to work out that re-collecting is the fix.
+    assert "source_margin_positive" in message
+    assert "--checkpoint" in message and "Re-collect" in message
+
+
+def test_a_verdict_the_registry_no_longer_declares_is_refused_too(tmp_path):
+    """The other direction. A renamed criterion leaves a record carrying a name nothing decides,
+    and reporting it would put a status against a criterion this pipeline no longer has."""
+    extra = [name for name, _ in metrics.VERDICT_REGISTRY] + ["a_criterion_that_was_removed"]
+
+    with pytest.raises(metrics.StaleCachedVerdicts) as raised:
+        metrics.check_cached_verdicts(_collection_record(extra)["results"]["verdicts"])
+
+    assert "a_criterion_that_was_removed" in str(raised.value)
+
+
+def test_a_record_written_before_verdicts_existed_at_all_is_not_refused(tmp_path):
+    """``None`` is older than the contract this check enforces, and the analyses re-run against
+    such a directory still produce their own numbers. Refusing it would be refusing a directory
+    the check has nothing to say about."""
+    metrics.check_cached_verdicts(None)
+
+
+@pytest.mark.slow
+def test_the_reuse_path_applies_the_check(trained_run, repointed_overrides, tmp_path):
+    """Wired, not merely defined: the check is on the reuse branch of ``load_or_collect``, so a
+    finished directory whose collection predates a criterion refuses on the *second* pass rather
+    than reporting a short verdict list."""
+    from teb_vae.lag_attn_rws.eval import collect as collect_module
+
+    overrides = repointed_overrides
+    output_dir = tmp_path / "run"
+    assert run_module.main(
+        trained_run, output_dir, overrides=overrides, device="cpu", num_samples=1,
+        only="perm_control",
+    ) == 0
+
+    results_dir = Path(output_dir) / run_module.RESULTS_DIRNAME
+    record_path = results_dir / collect_module.COLLECTION_FILENAME
+    record = json.loads(record_path.read_text(encoding="utf-8"))
+    record["results"]["verdicts"] = [
+        entry for entry in record["results"]["verdicts"]
+        if entry.get("name") != "source_margin_positive"
+    ]
+    record_path.write_text(json.dumps(record), encoding="utf-8")
+
+    with pytest.raises(metrics.StaleCachedVerdicts):
+        run_module.main(
+            trained_run, output_dir, overrides=overrides, device="cpu", num_samples=1,
+            only="perm_control",
+        )

@@ -88,5 +88,7 @@ def test_the_loss_hyperparameters_reach_the_checkpoint(task):
     config file."""
     module = task()
 
-    for name in ("likelihood", "free_bits", "lambda_full", "lambda_base", "beta_schedule"):
+    for name in (
+        "likelihood", "free_bits", "lambda_full", "lambda_base", "beta_schedule", "beta_prior",
+    ):
         assert name in module.hparams, f"{name} is not in hparams and will not be checkpointed"

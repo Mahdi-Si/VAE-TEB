@@ -202,6 +202,115 @@ def test_the_analysis_reports_the_ordering_the_outcome_and_the_pairing(tmp_path)
     assert penalties["shuffle_penalty"]["n_recordings_scored"] == 3
 
 
+def test_the_source_margin_is_referenced_against_full_and_signs_like_its_neighbours(
+    tmp_path,
+) -> None:
+    """The third paired control, and the two properties that make it readable beside the others.
+
+    It is $D_{\\rm shuffled} - D_{\\rm full}$, so a positive value says the matched source beat the
+    stranger -- the same "positive means the control is worse" convention the two penalties above
+    it use, which is what lets all three be read down one column without a sign table.
+    """
+    per_sample = _per_sample(
+        mc_nll_base_block=[10.0] * 6,
+        mc_nll_full_block=[8.0] * 6,
+        mc_nll_shuffled_block=[14.0] * 6,
+        mc_nll_base_shuffled_mu_block=[12.0] * 6,
+    )
+
+    result = perm_control_analysis.run_perm_control_analysis(
+        _context(per_sample), eval_config=EVAL_CONFIG, output_dir=tmp_path, probe=None
+    )
+
+    penalties = {row["penalty"]: row for row in result["penalties"]}
+    margin = penalties["source_margin"]
+    assert margin["mean"] == pytest.approx(6.0)  # 14 - 8, not 14 - 10
+    assert margin["positive_fraction"] == pytest.approx(1.0)
+    assert margin["n_recordings_scored"] == 3
+    # The same statistical furniture the other two carry, so it is quotable the same way.
+    shuffle = penalties["shuffle_penalty"]
+    assert set(margin) == set(shuffle), "the margin must be quotable exactly as the penalties are"
+    assert "D_shuffled - D_full" in margin["meaning"]
+
+
+def test_the_source_margin_is_positive_where_the_base_referenced_penalty_is_not(
+    tmp_path,
+) -> None:
+    """The state that motivates a third control at all.
+
+    The source pathway costs more than it delivers, so the forecast is worse than the target-only
+    one -- and a stranger's source is worse still. Referenced against base, the shuffle penalty is
+    *negative* and reads as a failed control; referenced against full, the margin is positive and
+    says the model is reading this recording. Both are true and they are different questions.
+    """
+    per_sample = _per_sample(
+        mc_nll_base_block=[10.0] * 6,
+        mc_nll_full_block=[12.0] * 6,
+        mc_nll_shuffled_block=[13.0] * 6,
+        mc_nll_base_shuffled_mu_block=[11.0] * 6,
+    )
+
+    result = perm_control_analysis.run_perm_control_analysis(
+        _context(per_sample), eval_config=EVAL_CONFIG, output_dir=tmp_path, probe=None
+    )
+
+    penalties = {row["penalty"]: row for row in result["penalties"]}
+    assert penalties["shuffle_penalty"]["mean"] == pytest.approx(3.0)
+    assert penalties["source_margin"]["mean"] == pytest.approx(1.0)
+    assert result["outcome"] == "no_improvement"
+    assert result["specificity_verdict"]["status"] == FAIL
+
+
+def test_the_margin_is_also_emitted_as_a_keyed_scalar(tmp_path) -> None:
+    """The headline block is assembled by walking key paths, and ``penalties`` is a list -- which
+    is why the shuffle penalty has never reached it. The margin is promoted, so it is emitted
+    under its own key as well as in the list, and the two must be the same number."""
+    result = perm_control_analysis.run_perm_control_analysis(
+        _context(
+            _per_sample(
+                mc_nll_base_block=[10.0] * 6,
+                mc_nll_full_block=[8.0] * 6,
+                mc_nll_shuffled_block=[14.0] * 6,
+                mc_nll_base_shuffled_mu_block=[12.0] * 6,
+            )
+        ),
+        eval_config=EVAL_CONFIG, output_dir=tmp_path, probe=None,
+    )
+
+    keyed = result[perm_control_analysis.SOURCE_MARGIN_SCALAR]
+    row = next(
+        row for row in result["penalties"]
+        if row["penalty"] == perm_control_analysis.SOURCE_MARGIN_PENALTY
+    )
+    assert keyed == pytest.approx(row["mean"])
+
+
+def test_the_summary_csv_still_carries_branch_rows_only(tmp_path) -> None:
+    """Stated as an assertion rather than left implicit: the margin is a *penalty* row, and
+    ``perm_control_summary.csv`` has only ever held the branch table. A reader looking for the
+    margin finds it in ``summary.json``'s ``penalties`` and in the headline, not here."""
+    perm_control_analysis.run_perm_control_analysis(
+        _context(
+            _per_sample(
+                mc_nll_base_block=[10.0] * 6,
+                mc_nll_full_block=[8.0] * 6,
+                mc_nll_shuffled_block=[14.0] * 6,
+                mc_nll_base_shuffled_mu_block=[12.0] * 6,
+            )
+        ),
+        eval_config=EVAL_CONFIG, output_dir=tmp_path, probe=None,
+    )
+
+    written = pd.read_csv(
+        tmp_path / perm_control_analysis.ANALYSIS_DIRNAME
+        / perm_control_analysis.SUMMARY_FILENAME
+    )
+    assert "penalty" not in written.columns
+    assert list(written["branch"]) == [
+        name for name, _ in perm_control_analysis.BRANCH_COLUMNS
+    ]
+
+
 def test_the_kl_reading_is_a_description_that_nothing_consumes(tmp_path) -> None:
     """``shuffled_exceeds_true`` sits true on a healthy model, so it is reported *and* labelled --
     and the verdict beside it is decided without it."""
@@ -260,3 +369,44 @@ def test_on_a_real_run_the_analysis_and_the_summary_agree_on_the_verdict(evaluat
         reported["source_specificity"]
     )
     assert results["perm_control"]["outcome"] in perm_control_analysis.OUTCOMES
+
+
+@pytest.mark.slow
+def test_the_margin_is_produced_offline_with_no_model_loaded(
+    trained_run, repointed_overrides, tmp_path
+) -> None:
+    """The readout must survive the path it will actually be read on.
+
+    ``--only perm_control`` against a finished directory builds no model and touches no GPU: it
+    reads ``per_sample.csv`` and recomputes. Every branch score the margin needs is already in
+    that table, so a re-run must produce the row, the keyed scalar and the headline entry without
+    a checkpoint -- which is what makes an already-finished production run reportable under the
+    new criterion without paying for the forward pass again.
+    """
+    import json
+
+    from teb_vae.lag_attn_rws.eval import run as run_module
+
+    output_dir = tmp_path / "run"
+    assert run_module.main(
+        trained_run, output_dir, overrides=repointed_overrides, device="cpu", num_samples=1,
+    ) == 0
+
+    # No checkpoint this time: the tables stand in for the model.
+    assert run_module.main(
+        None, output_dir, overrides=repointed_overrides, only="perm_control",
+    ) == 0
+
+    results_dir = output_dir / run_module.RESULTS_DIRNAME
+    summary = json.loads(
+        (results_dir / run_module.SUMMARY_FILENAME).read_text(encoding="utf-8")
+    )
+    analysis = summary["results"]["perm_control"]
+
+    row = next(
+        row for row in analysis["penalties"]
+        if row["penalty"] == perm_control_analysis.SOURCE_MARGIN_PENALTY
+    )
+    assert row["n_recordings_scored"] > 0
+    assert analysis[perm_control_analysis.SOURCE_MARGIN_SCALAR] == pytest.approx(row["mean"])
+    assert summary["results"]["headline"]["source_margin_nats"] == pytest.approx(row["mean"])

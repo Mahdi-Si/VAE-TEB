@@ -115,13 +115,18 @@ def _starved_parameters(module, batch_idx: int) -> list[str]:
     ]
 
 
-def test_under_gaussian_nll_no_parameter_is_left_without_a_gradient(task, perturb_posterior):
+@pytest.mark.parametrize("beta_prior", [0.0, 1.0e-2], ids=["unanchored", "anchored"])
+def test_under_gaussian_nll_no_parameter_is_left_without_a_gradient(
+    task, perturb_posterior, beta_prior
+):
     """What actually licenses ``find_unused_parameters=False`` for the shipped config.
 
     Perturbed first: at init the posterior deltas are zero, so the attention pathway carries no
     downstream weight and would read as starved for a reason that vanishes after one step.
+    Both anchor weights, because the prior scale rate is the one term a config can switch on:
+    the coverage claim must hold for the objective production actually optimises.
     """
-    module = task(hparams={"likelihood": "gaussian_nll"})
+    module = task(hparams={"likelihood": "gaussian_nll", "beta_prior": beta_prior})
     perturb_posterior(module.orig_model)
 
     starved = _starved_parameters(module, 0)
@@ -132,11 +137,14 @@ def test_under_gaussian_nll_no_parameter_is_left_without_a_gradient(task, pertur
     )
 
 
-def test_under_mse_the_decoder_logvar_head_is_what_starves(task, perturb_posterior):
+@pytest.mark.parametrize("beta_prior", [0.0, 1.0e-2], ids=["unanchored", "anchored"])
+def test_under_mse_the_decoder_logvar_head_is_what_starves(task, perturb_posterior, beta_prior):
     """The mirror image, and the justification for the fallback strategy: with mse the decoder
     log-variance head is trainable and unused. If this ever stops holding, the likelihood axis
-    of the strategy selector is unnecessary and should be deleted rather than kept."""
-    module = task(hparams={"likelihood": "mse"})
+    of the strategy selector is unnecessary and should be deleted rather than kept. The anchor
+    weight must not change the starved set either way: the prior's log-variance head sits
+    outside it under both, reached through the KL and the base forecast."""
+    module = task(hparams={"likelihood": "mse", "beta_prior": beta_prior})
     perturb_posterior(module.orig_model)
 
     starved = _starved_parameters(module, 0)

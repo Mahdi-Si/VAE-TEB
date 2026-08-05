@@ -39,14 +39,21 @@ def test_the_dict_separates_tensors_from_the_likelihood_string(tiny_kwargs):
     ), "a non-tensor inside metrics would poison a splatted logger"
 
 
-def test_the_total_is_the_documented_three_term_sum(tiny_kwargs, perturb_posterior):
+def test_the_total_is_the_documented_four_term_sum(tiny_kwargs, perturb_posterior):
     """Distinct coefficients, perturbed model: the total must recompose from the returned
-    parts under exactly the documented weights."""
+    parts under exactly the documented weights.
+
+    Four terms, not the original three: nothing in the three-term objective penalises a
+    *narrow* prior, and the first production run pinned 99.2% of prior log-variances on the
+    clamp floor within one epoch -- so the prior's scale rate joined the objective, weighted
+    by ``beta_prior``. Exercised at a non-zero weight so the term is covered rather than
+    multiplied by zero."""
     _, result = _loss(
         _model(tiny_kwargs),
         make_stub_batch(),
         perturb=perturb_posterior,
         beta=0.7,
+        beta_prior=0.11,
         lambda_full=1.0,
         lambda_base=0.3,
     )
@@ -55,10 +62,37 @@ def test_the_total_is_the_documented_three_term_sum(tiny_kwargs, perturb_posteri
         1.0 * metrics["nll_full_block"]
         + 0.3 * metrics["nll_base_block"]
         + 0.7 * metrics["source_conditioned_kl_train"]
+        + 0.11 * metrics["prior_rate"]
     )
     assert torch.allclose(metrics["total_loss"], recomposed, rtol=1e-6)
     assert float(metrics["source_conditioned_kl_train"]) > 0.0
+    assert float(metrics["prior_rate"]) > 0.0
     assert torch.allclose(metrics["kld_beta"], torch.tensor(0.7))
+    assert torch.allclose(metrics["beta_prior"], torch.tensor(0.11))
+
+    # The negative control: the historical three-term recomposition must now fall short by
+    # exactly the weighted prior rate, so a silently dropped fourth term cannot pass.
+    three_term = recomposed - 0.11 * metrics["prior_rate"]
+    assert not torch.allclose(metrics["total_loss"], three_term, rtol=1e-6)
+
+
+@pytest.mark.parametrize("likelihood", ["gaussian_nll", "mse"])
+def test_at_zero_beta_prior_the_rate_is_reported_but_inert(tiny_kwargs, likelihood):
+    """The opt-in contract: at the default ``beta_prior=0.0`` the total is bitwise the
+    three-term sum, while ``prior_rate`` is still emitted -- under every likelihood, ``mse``
+    included, so the smoke configuration reports it too."""
+    _, result = _loss(_model(tiny_kwargs), make_stub_batch(), likelihood=likelihood)
+    metrics = result["metrics"]
+
+    three_term = (
+        metrics["nll_full_block"]
+        + metrics["nll_base_block"]
+        + 1.0 * metrics["source_conditioned_kl_train"]
+    )
+    assert torch.equal(metrics["total_loss"], three_term)
+    assert torch.isfinite(metrics["prior_rate"])
+    assert float(metrics["prior_rate"]) > 0.0  # the uncalibrated prior is off unit scale
+    assert float(metrics["beta_prior"]) == 0.0
 
 
 @pytest.mark.parametrize("likelihood", ["gaussian_nll", "mse"])

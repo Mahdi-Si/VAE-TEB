@@ -18,7 +18,7 @@ import math
 import torch
 
 from teb_vae.lag_attn.nets.blocks import smooth_bound
-from teb_vae.lag_attn_rws.nets.model import SeqVaeLagAttnRws
+from teb_vae.lag_attn_rws.nets.model import LOGVAR_FLOOR_MARGIN_FRAC, SeqVaeLagAttnRws
 
 
 def _model(kwargs, **overrides) -> SeqVaeLagAttnRws:
@@ -158,6 +158,47 @@ def test_calibration_keeps_the_perturbation_test_meaningful(
     out = model(*inputs)
 
     assert not torch.equal(out["mu_base"], out["mu_full"])
+
+
+def test_the_calibrated_prior_starts_at_unit_scale(tiny_kwargs, inputs):
+    """The prior half of the calibration: the log-variance head's final layer and skip are
+    zeroed and the bias seeded at the pre-image of 0, so the bounded output is exactly 0
+    (sigma_p = 1, the scale anchor's optimum) for every input. Exactness is the point --
+    smooth_bound is a sigmoid, so a merely shrunk head would start near zero only on average,
+    not per coordinate. 1e-6 is float rounding on the log(5/3) -> sigmoid round trip, not a
+    modelling tolerance."""
+    model = _model(tiny_kwargs, head_init_calibration=True).eval()
+    with torch.no_grad():
+        out = model(*inputs)
+    logvar_prior = out["logvar_prior"]
+
+    assert float(logvar_prior.abs().max()) < 1e-6
+    # The pinned-prior watch metric therefore opens at exactly zero: no coordinate is within
+    # the floor margin of the clamp's lower end.
+    lo, hi = model.logvar_clamp
+    floor = lo + LOGVAR_FLOOR_MARGIN_FRAC * (hi - lo)
+    assert float((logvar_prior <= floor).float().mean()) == 0.0
+
+
+def test_the_uncalibrated_prior_is_not_at_unit_scale(tiny_kwargs, inputs):
+    """The negative control: Xavier-filled, the head's raw output sits near 0 and the sigmoid
+    bound maps it around -1, so the calibrated assertion above is not vacuous."""
+    model = _model(tiny_kwargs, head_init_calibration=False).eval()
+    with torch.no_grad():
+        out = model(*inputs)
+
+    assert float(out["logvar_prior"].abs().mean()) > 0.5
+
+
+def test_the_prior_calibration_preserves_the_zero_kl_start(tiny_kwargs, inputs):
+    """The posterior's log-variance residual is built on the prior's raw pre-bound tensor, so
+    pinning that tensor moves prior and posterior together and the KL stays exactly zero."""
+    model = _model(tiny_kwargs, head_init_calibration=True).train()
+    torch.manual_seed(0)
+    out = model(*inputs)
+
+    assert float(out["kld_per_t"].abs().max()) == 0.0
+    assert torch.equal(out["logvar_post"], out["logvar_prior"])
 
 
 # =========================================================================================

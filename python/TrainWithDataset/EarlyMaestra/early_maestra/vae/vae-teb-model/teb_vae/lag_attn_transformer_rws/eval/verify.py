@@ -114,6 +114,12 @@ SWEPT_D_FF = ("model_config", "VAE_model", "encoder_d_ff")
 #: bank rather than of either encoder.
 SWEPT_REACH = shared.SWEPT_REACH
 
+#: So is the prior-anchor weight's: it names a term in the shared objective rather than anything
+#: this encoder owns. The arms that sweep it ship in **this** package, because the prior-variance
+#: collapse the anchor answers was measured on this architecture -- which is why the section is
+#: rendered here as well as in the sibling.
+SWEPT_BETA_PRIOR = shared.SWEPT_BETA_PRIOR
+
 #: The encoder knobs, rendered together: each shipped architecture arm flips one or two of them
 #: against the baseline, and a row naming all seven is readable without knowing in advance which
 #: one this arm flipped. The stem arm is the pair of empty kernel and dilation lists.
@@ -457,6 +463,40 @@ def build_arm_tables(arms: Sequence[Dict[str, Any]]) -> str:
                 ],
             ),
         )
+
+    lines += ["", "## Prior-anchor weight sweep (`beta_prior`)", ""]
+    lines += [
+        "The reading order is fixed before any run: **first** the floor fraction and the mean "
+        "prior log-variance -- did the arm hold the prior off its clamp at all; **then** "
+        f"`{D_BASE_COLUMN}` -- did the anchor tax the base forecast it is designed to leave "
+        "alone; **only then** the coupling columns. An arm that fixes the floor fraction but not "
+        "the amplification ratio has not demonstrated the fix, which is why that ratio is a "
+        "column here rather than something a reader derives.",
+        "",
+    ]
+    lines += shared._table(
+        ["`beta_prior`", "`logvar_prior_floor_frac`", "`mean_logvar_prior`", "`prior_rate`",
+         # Spelled `abs(...)` rather than with bars: a cell is split on `|`, so a header written
+         # `|`pred_gap`|/K` becomes three cells and the whole section stops being a table. This
+         # is also the spelling this package's RESULTS.md derived-quantity block uses.
+         f"`{D_BASE_COLUMN}`", "`pred_gap`", "`abs(pred_gap)/K`", "`source_margin`",
+         f"`{KL_COLUMN}`", "`kld_active_frac` (final)", "Verdicts", "Run"],
+        shared._sweep_rows(
+            arms, SWEPT_BETA_PRIOR,
+            lambda arm: [
+                shared._headline_cell(arm, "logvar_prior_floor_frac"),
+                shared._headline_cell(arm, "mean_logvar_prior"),
+                shared._headline_cell(arm, "prior_rate_nats"),
+                shared._headline_cell(arm, D_BASE_COLUMN),
+                shared._headline_cell(arm, PRED_GAP_COLUMN),
+                shared._amplification_cell(arm),
+                shared._headline_cell(arm, "source_margin_nats"),
+                shared._headline_cell(arm, KL_COLUMN),
+                shared._render(_or_absent(arm["final_kld_active_frac"])),
+                shared._verdict_triple_cell(arm),
+            ],
+        ),
+    )
 
     lines += ["", "## Reach budget sweep (`causal_reach_budget_s`)", ""]
     lines += shared._table(

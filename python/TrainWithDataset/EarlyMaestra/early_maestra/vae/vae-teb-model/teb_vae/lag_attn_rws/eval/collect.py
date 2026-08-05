@@ -82,6 +82,7 @@ from teb_vae.lag_attn_rws.eval.metrics import (
     VECTOR_READOUTS,
     BatchReadout,
     batch_field,
+    check_cached_verdicts,
     evaluate,
 )
 from teb_vae.lag_attn_rws.eval.report_seam import json_safe
@@ -1517,6 +1518,12 @@ def load_or_collect(
     if (results_dir / COLLECTION_FILENAME).is_file():
         collection = load_collection(results_dir)
         check_provenance(collection.record, expected)
+        # Beside the provenance check because it is the same question asked of the other half of
+        # the record: that one says the tables describe *this* run, this one says they were
+        # written under *this* set of acceptance criteria. Both are refusals rather than repairs,
+        # and both belong here rather than at the point of use -- reuse is the only path on which
+        # either can be wrong.
+        check_cached_verdicts((collection.results or {}).get("verdicts"))
         logger.info(
             f"reusing {len(collection.per_sample)} collected row(s) from {results_dir}; "
             f"the forward pass is skipped"

@@ -102,6 +102,10 @@ def test_the_swept_paths_name_keys_the_shipped_arms_actually_set():
         verify.SWEPT_SOURCE_BLOCKS,
         verify.SWEPT_D_FF,
         verify.SWEPT_REACH,
+        # The prior-anchor axis belongs here even though the objective term is shared rather than
+        # this encoder's: the four arms that sweep it ship in THIS package, so this is the only
+        # suite in which renaming or retiring one can be caught.
+        verify.SWEPT_BETA_PRIOR,
     ):
         assert axis[-1] in swept, f"no shipped arm varies {axis[-1]!r}"
     # And the stem arm, which is the pair of empty lists rather than a scalar, is covered by the
@@ -173,6 +177,7 @@ def write_run(
     kept: Optional[Tuple[int, int]] = None,
     d_base: float = 700.0,
     pred_gap: float = 1.0,
+    beta_prior: float = 0.1,
     reach_median: Optional[float] = None,
     reach_p95: Optional[float] = None,
     lag_peak: Optional[int] = None,
@@ -215,6 +220,7 @@ def write_run(
 
     model: Dict[str, Any] = {
         "d_z": 48,
+        "beta_prior": beta_prior,
         "causal_reach_budget_s": reach,
         "c_y": 109,
         "c_u": 58,
@@ -355,6 +361,46 @@ def test_every_arm_appears_in_every_sweep_table(tmp_path):
     ):
         by_run = _by_run(_section(document, heading))
         assert set(by_run) == {"window_8", "target_5", "ff_384", "reach_120"}, heading
+
+
+def test_the_prior_anchor_arms_resolve_into_their_own_section(tmp_path):
+    """The prior-anchor sweep is rendered by this package's own ``build_arm_tables``, so it needs
+    its own test here.
+
+    The objective term is shared with the comparison model, but the four arms that sweep it ship in
+    *this* package and are run here, so this copy of the section is what the study is read from --
+    and until this test existed, deleting the whole block left the suite at its exact pass count.
+    Three regressions it closes: the section going missing or being renamed, ``SWEPT_BETA_PRIOR``
+    keying on the wrong config path (every row would collapse onto one inherited value), and a typo
+    in any of the four headline names inlined in this block, which renders ``(missing)`` rather
+    than raising.
+    """
+    write_run(tmp_path, "bp_low", beta_prior=1.0e-3)
+    write_run(tmp_path, "bp_shipped", beta_prior=0.1)
+    write_run(tmp_path, "bp_high", beta_prior=1.0)
+    out = tmp_path / "arms.md"
+
+    verify.compare_arms(tmp_path, out)
+    section = _section(out.read_text(encoding="utf-8"), "## Prior-anchor weight sweep")
+
+    rows = _rows(section)
+    # Keyed by each run's own resolved beta_prior, in numeric order -- not by directory name.
+    assert [_cells(row)[0] for row in rows] == ["0.001", "0.1", "1"], section
+    # Every headline name in this block resolves against a real summary. `(missing)` is what a
+    # mistyped column renders as, and it would otherwise ship as a table of blanks.
+    assert "(missing)" not in section, section
+
+    # The header is the line above the delimiter row -- this section carries prose first, so a
+    # fixed offset would drift the moment that prose is edited.
+    lines = section.splitlines()
+    header = next(
+        lines[index - 1] for index, line in enumerate(lines) if line.startswith("|---")
+    )
+    for column in (
+        "`beta_prior`", "`logvar_prior_floor_frac`", "`mean_logvar_prior`", "`prior_rate`",
+        "`pred_gap`", "`abs(pred_gap)/K`", "`source_margin`", "Verdicts",
+    ):
+        assert column in header, column
 
 
 def test_the_reach_table_reports_the_surviving_channels_not_the_declared_widths(tmp_path):
@@ -629,6 +675,7 @@ def test_the_emitted_document_never_uses_the_refused_name(tmp_path):
     "## Feed-forward width sweep",
     "## Reach budget sweep",
     "## Encoder architecture arms",
+    "## Prior-anchor weight sweep",
     "## Cross-model comparison",
 ])
 def test_the_document_carries_every_section_under_its_own_heading(tmp_path, heading):

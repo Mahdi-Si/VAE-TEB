@@ -9,9 +9,13 @@ unless the tracked list is driven from the real metrics dict, which is what happ
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
 
 import pytest
+import torch
 
+from teb_vae.lag_attn_rws.task import SeqVaeLagAttnRwsTask
 from teb_vae.lag_attn_rws.trainer import _TRACKED_METRICS, LagAttnRwsTrainer
 from train.callbacks import (
     MetricsHistoryCsvCallback,
@@ -59,6 +63,71 @@ def test_the_breaker_columns_are_tracked_train_only():
     for name in ("spike_skipped", "spike_ema_loss"):
         assert f"train/{name}" in _TRACKED_METRICS
         assert f"val/{name}" not in _TRACKED_METRICS
+
+
+def test_the_gradient_columns_are_tracked_train_only():
+    """The pre-clip norm and the clip-exceedance fraction exist on the training path alone --
+    they are logged from ``on_before_optimizer_step``, which validation never reaches -- so a
+    ``val/`` variant would be a column that is NaN in every row of every run."""
+    for name in ("grad_norm", "grad_clip_frac"):
+        assert f"train/{name}" in _TRACKED_METRICS
+        assert f"val/{name}" not in _TRACKED_METRICS
+
+
+class _GradientHookStub:
+    """The whole surface ``on_before_optimizer_step`` touches, and nothing else.
+
+    Bound to the unbound method rather than built from a real task: the hook reads only
+    ``self.parameters()``, ``self.trainer.gradient_clip_val`` and ``self.log``, so a stub tests the
+    threshold predicate directly and without a fit.
+    """
+
+    def __init__(self, clip_val: Any) -> None:
+        parameter = torch.nn.Parameter(torch.zeros(4))
+        parameter.grad = torch.full((4,), 3.0)  # gradient norm exactly 6.0
+        self._parameters = [parameter]
+        self.trainer = SimpleNamespace(gradient_clip_val=clip_val)
+        self.logged: dict = {}
+
+    def parameters(self):
+        return iter(self._parameters)
+
+    def log(self, name: str, value: Any, **_: Any) -> None:
+        self.logged[name] = float(value)
+
+
+@pytest.mark.parametrize(
+    "clip_val, expected_frac",
+    [
+        (None, None),      # no clipping configured
+        (0.0, None),       # the "0 disables it" convention -- Lightning clips nothing here
+        (0, None),         # and the integer spelling of the same
+        (-1.0, None),      # any non-positive threshold, by the same predicate
+        (5.0, 1.0),        # a real threshold the norm exceeds
+        (100.0, 0.0),      # a real threshold it does not
+    ],
+)
+def test_the_clip_fraction_is_logged_only_against_a_threshold_that_actually_clips(
+    clip_val, expected_frac
+):
+    """``grad_clip_frac`` must be absent whenever Lightning is not clipping, not merely whenever
+    the config omitted the key.
+
+    ``Precision.clip_gradients`` returns early for a non-positive threshold, so a run configured
+    with ``gradient_clip_val: 0`` rescales nothing -- while every finite norm exceeds zero. Gated
+    on ``is not None`` alone, that run reports an exceedance fraction of $1.000$ in every row,
+    which is precisely the reading that says the threshold rescaled every step. The norm itself is
+    logged either way, because it is a property of the run rather than of the threshold.
+    """
+    stub = _GradientHookStub(clip_val)
+
+    SeqVaeLagAttnRwsTask.on_before_optimizer_step(stub, optimizer=None)
+
+    assert stub.logged["train/grad_norm"] == pytest.approx(6.0)
+    if expected_frac is None:
+        assert "train/grad_clip_frac" not in stub.logged
+    else:
+        assert stub.logged["train/grad_clip_frac"] == expected_frac
 
 
 def test_beta_is_tracked_stage_prefixed_and_lr_bare():

@@ -1675,6 +1675,20 @@ def evaluate_batch(
         "nll_base_block": _per_sample_mean(training_base_block, contributing),
         "nll_full_block": _per_sample_mean(training_block, contributing),
         "source_conditioned_kl_raw": _per_sample_mean(outputs["kld_per_t"], kl_support),
+        # The prior's scale rate, on the same support and in the same nats-per-anchor units as the
+        # divergence above it, so the two are addable exactly as they are in the objective. The
+        # per-dimension expression is repeated from ``nets/losses.py::masked_prior_rate`` rather
+        # than imported, for the reason every readout here is recomputed: that function reduces to
+        # one scalar over a whole batch, and what this table needs is the same quantity resolved
+        # per sample. A test pins the two equal on the same inputs.
+        #
+        # It is reported whether or not the run's objective weighted it: a prior collapsing onto
+        # its clamp is visible here in any checkpoint, and a column that appeared only for
+        # anchored runs would be missing from exactly the runs it diagnoses.
+        "prior_rate": _per_sample_mean(
+            (0.5 * (outputs["logvar_prior"].exp() - 1.0 - outputs["logvar_prior"])).sum(dim=-1),
+            kl_support,
+        ),
         "mu_prior_rms": _per_sample_mean(
             (outputs["mu_prior"] ** 2).mean(dim=-1), kl_support
         ).sqrt(),
@@ -2336,6 +2350,13 @@ def lag_summary(
 #: reads, and the column is what keeps that decision here rather than in the reporting layer.
 VERDICT_REGISTRY: Tuple[Tuple[str, bool], ...] = (
     ("predictive_improvement", True),
+    # Between the gain and the specificity criteria because it sits between them in strength, and
+    # because the three are read as a triple. ``source_specificity`` asks
+    # $D_{\rm full} < D_{\rm base} < D_{\rm shuffled}$, which implies both of its neighbours; this
+    # one drops the base branch entirely and asks only whether the matched source beat a
+    # stranger's. The combination FAIL / PASS / FAIL is a real state and not a contradiction: no
+    # predictive gain, and still source-specific.
+    ("source_margin_positive", True),
     ("source_specificity", True),
     ("prior_carries_target_state", True),
     ("latent_not_collapsed", True),
@@ -2432,6 +2453,55 @@ def source_specificity_verdict(
     )
 
 
+def source_margin_verdict(
+    d_full: Optional[float], d_shuffled: Optional[float]
+) -> Verdict:
+    r"""Decide the margin criterion, $D_{\rm shuffled} > D_{\rm full}$.
+
+    **Two losses, and the base branch is deliberately not one of them.** Every other predictive
+    criterion here is referenced against $D_{\rm base}$, so every one of them inherits whatever
+    the target-only forecast is doing -- and a model whose latent geometry charges more for the
+    source than the source delivers fails all of them while still reading *this* recording's
+    source rather than any source. This criterion changes only the source: prior, decoder and
+    latent geometry are identical between the two branches, and the shuffled branch is the same
+    posterior handed a stranger's. So it is the one predictive comparison that survives a negative
+    predictive gain, and its passing beside a failing ``source_specificity`` is a state to report
+    rather than a contradiction to resolve.
+
+    It is strictly weaker than ``source_specificity``, which asks
+    $D_{\rm full} < D_{\rm base} < D_{\rm shuffled}$ and therefore implies this: a run cannot pass
+    that and fail this.
+
+    Args:
+        d_full: The source-conditioned branch's marginalised block score, or ``None``.
+        d_shuffled: The stranger's-source branch's, or ``None`` when the control did not run.
+
+    Returns:
+        The verdict, ``INCONCLUSIVE`` when either is missing -- a control that could not run and a
+        control that failed are different facts.
+    """
+    criterion = "D_shuffled > D_full"
+    if d_full is None or d_shuffled is None:
+        return Verdict(
+            "source_margin_positive", INCONCLUSIVE, criterion,
+            "the permutation control did not run; it needs a batch of at least two samples.",
+            {},
+        )
+    margin = float(d_shuffled) - float(d_full)
+    return Verdict(
+        "source_margin_positive", PASS if margin > 0.0 else FAIL, criterion,
+        "a stranger's source forecasts this recording worse than its own does, so the source "
+        "pathway is reading this recording rather than reacting to any source."
+        if margin > 0.0
+        else "a stranger's source forecasts this recording at least as well as its own, so "
+             "nothing the source pathway carries is specific to this recording.",
+        {
+            "d_full": float(d_full), "d_shuffled": float(d_shuffled),
+            "source_margin": margin,
+        },
+    )
+
+
 def order_verdicts(verdicts: Sequence[Verdict]) -> List[Verdict]:
     """Return the verdicts in :data:`VERDICT_ORDER`, refusing anything unregistered.
 
@@ -2469,6 +2539,60 @@ def order_verdicts(verdicts: Sequence[Verdict]) -> List[Verdict]:
         )
     by_name = {verdict.name: verdict for verdict in verdicts}
     return [by_name[name] for name in order]
+
+
+class StaleCachedVerdicts(RuntimeError):
+    """A reused collection's verdict block was produced under a different registry.
+
+    Distinct from a provenance mismatch: the tables describe the right run and are intact. What
+    has moved is the *contract* -- a criterion was added or renamed since the pass that wrote
+    them -- so the numbers are reusable and the verdict list is not.
+    """
+
+
+def check_cached_verdicts(cached: Optional[Sequence[Mapping[str, Any]]]) -> None:
+    """Refuse a reused verdict block that the current registry no longer describes.
+
+    The offline re-run path reads a finished directory's collection record and reports its
+    ``verdicts`` verbatim -- that is what makes ``--only <analysis>`` cheap, and it is correct for
+    as long as the registry has not moved. When it has, nothing downstream notices:
+    :func:`order_verdicts` guards the list a *fresh* pass builds and is never reached on this
+    path, so a directory collected under seven criteria would be re-reported as a seven-criterion
+    run under a pipeline that declares eight. A summary silently missing a criterion reads exactly
+    like one where that criterion passed.
+
+    Recomputing the missing entries instead was considered and rejected. Only some criteria are
+    decidable from what a collection record keeps -- the two predictive ones are, the calibration
+    census is not -- so a repair path would work for the criteria that happen to be cheap and
+    fail for the rest, which is a worse failure than a refusal because it is a partial one.
+
+    Args:
+        cached: The reused record's verdict list, or ``None`` when it carried none. ``None`` is
+            accepted: a record written before the block existed at all is a different and older
+            problem, and the analyses re-run against it still produce their own numbers.
+
+    Raises:
+        StaleCachedVerdicts: Naming what moved in each direction, and the one way to fix it.
+    """
+    if cached is None:
+        return
+    registered = [name for name, _ in VERDICT_REGISTRY]
+    produced = [str(entry.get("name")) for entry in cached if isinstance(entry, Mapping)]
+    missing = [name for name in registered if name not in produced]
+    unknown = [name for name in produced if name not in registered]
+    if not missing and not unknown:
+        return
+    raise StaleCachedVerdicts(
+        f"the collected tables here carry verdicts {produced}, which is not what this pipeline "
+        f"declares ({registered})."
+        + (f" Missing: {missing}." if missing else "")
+        + (f" No longer registered: {unknown}." if unknown else "")
+        + " The tables predate a change to the acceptance criteria, so their numbers are still "
+          "good but their verdict block is not, and reporting it would omit a criterion rather "
+          "than fail it. Re-collect: delete the collection from this directory, or point "
+          "--output-dir at a new one, and pass --checkpoint so the pass has a model to collect "
+          "with."
+    )
 
 
 def build_verdicts(
@@ -2543,6 +2667,7 @@ def build_verdicts(
             )
         )
 
+    verdicts.append(source_margin_verdict(full, shuffled))
     verdicts.append(source_specificity_verdict(base, full, shuffled))
 
     if base is None or base_shuffled is None:

@@ -135,7 +135,7 @@ def test_loss_only_keys_do_not_reach_the_constructor(driver):
 
     for name in (
         "likelihood", "free_bits", "lambda_full", "lambda_base", "beta_schedule",
-        "kld_beta", "causal_reach_budget_s",
+        "kld_beta", "beta_prior", "causal_reach_budget_s",
     ):
         assert name not in kwargs, f"{name} is not the net's"
 
