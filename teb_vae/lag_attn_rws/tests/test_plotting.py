@@ -40,10 +40,15 @@ _FS_RAW = 4.0
 
 
 def _forward(task_module: Any, batch: Any) -> dict:
-    """Run the net once on a stub batch and return everything the builder needs."""
+    """Run the net once on a stub batch and return everything the builder needs.
+
+    Through ``_build_forward_inputs``, which is the seam the callback itself now uses: a helper
+    that assembled the inputs its own way could go on passing after the callback's route to them
+    had changed.
+    """
     model = task_module.orig_model
     with torch.no_grad():
-        outs = model(*task_module._build_target_streams(batch), task_module._build_source_stream(batch))
+        outs = model(*task_module._build_forward_inputs(batch))
         kld_per_dim = model.kld_tensor(
             mu_prior=outs["mu_prior"],
             logvar_prior=outs["logvar_prior"],

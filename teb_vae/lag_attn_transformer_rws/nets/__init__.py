@@ -11,6 +11,10 @@ causal convolution block and the windowed causal self-attention block -- have no
 anywhere under ``teb_vae``, and reaching outside that tree for them would weaken the framework-free
 guard for two sibling packages at once.
 
-lean-limit: primitives imported from teb_vae/lag_attn/nets and teb_vae/lag_attn_rws/nets; promote
-to a common package when this model outlives its comparison or when a fourth consumer appears.
+lean-limit: primitives imported from teb_vae/lag_attn/nets and teb_vae/lag_attn_rws/nets; the
+fourth consumer this note named as its trigger now exists, so the trigger has fired and the
+promotion is deferred again. Promote to a common package when this model outlives its comparison,
+or when a consumer needs to modify one of the shared primitives rather than only import it.
+Deferred because this model is training and under active comparison, and a move would touch every
+test file of all four packages at once for no change in behaviour.
 """

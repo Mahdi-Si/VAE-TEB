@@ -170,6 +170,50 @@ class LagAttnRwsTrainer(GraphModelBase):
     #: :meth:`create_model` for the startup log. ``None`` means no reach budget is configured.
     resolved_budget: Optional[ChannelBudget] = None
 
+    @classmethod
+    def preflight(cls, config: Dict[str, Any]) -> None:
+        """Refuse a launch this driver's architecture cannot serve, before anything is built.
+
+        A documented no-op here, and deliberately so: every guard this architecture needs is one
+        of the four module-level ``_check_*`` functions, which ``main`` calls by name from its own
+        call site. A subclass that forgets ``super().preflight(config)`` therefore cannot drop an
+        inherited check -- there are none to drop -- which is the property that makes the hook
+        safe to override with a bare body.
+
+        Called after those four and before ``setup_config``, so a refusal raised here still
+        leaves no run directory, no log sink and no MLflow run behind.
+
+        Args:
+            config: The already-loaded resolved config dict, not a path. The driver has read the
+                file by the time this runs and a second read could only disagree with it.
+        """
+
+    def causal_standing_message(self) -> str:
+        """Return the one-line statement of this run's causal standing, for the startup log.
+
+        A run's log should say what its history states are a function of, because that is the
+        premise every coupling number it produces rests on and it is otherwise recoverable only
+        by reading the architecture. For this model the answer is decided by the reach budget:
+        pruned-and-delayed channels if one is configured, and otherwise the unguarded statement
+        that the stored two-sided features let step $t$ read its own future.
+
+        Called from :meth:`create_model` *before* ``self.pytorch_model`` is assigned, which is
+        deliberate: the sentence belongs beside the kwargs it describes, and a launch that dies
+        in the constructor should still have said what it was about to build. An override whose
+        answer depends on the built network must therefore derive it from the constructor kwargs
+        or from a module constant rather than from ``self.pytorch_model``, which is not there yet.
+
+        Returns:
+            The message, already formatted for a single ``logger.info`` call.
+        """
+        if self.resolved_budget is not None:
+            return self.resolved_budget.summary()
+        return (
+            "causal reach budget: none (all channels, no delay) -- input features at step t "
+            "read up to 974 s into their own future, so the source-conditioned KL is not a "
+            "transfer entropy."
+        )
+
     def _build_model_kwargs(self) -> Dict[str, Any]:
         """Translate the ``model_config.VAE_model`` block into constructor kwargs.
 
@@ -232,15 +276,9 @@ class LagAttnRwsTrainer(GraphModelBase):
             )
         )
         # The run's causal standing, stated in its own log rather than left to be inferred from
-        # the config: how many channels of each stored block survived the reach budget, and how
-        # stale the worst survivor is. Resolved by the call above, not re-derived.
-        logger.info(
-            self.resolved_budget.summary()
-            if self.resolved_budget is not None
-            else "causal reach budget: none (all channels, no delay) -- input features at step t "
-            "read up to 974 s into their own future, so the source-conditioned KL is not a "
-            "transfer entropy."
-        )
+        # the config. Behind a method because the sentence is architecture-specific and this one
+        # is false for a model whose inputs are not the stored two-sided features.
+        logger.info(self.causal_standing_message())
         self.pytorch_model = self.MODEL_CLS(**model_kwargs)
 
         # ``getattr`` with a safe default rather than a bare read: an architecture with no
@@ -409,7 +447,8 @@ def main(config_path: str, trainer_cls: type[LagAttnRwsTrainer] = LagAttnRwsTrai
     ``trainer_cls`` is a parameter rather than a literal because the four pre-flight guards, the
     resolved-config persistence and the temporary-file dance around them are model-independent:
     a sibling architecture's entry point delegates here with its own driver instead of copying
-    them, which is the only way they cannot drift.
+    them, which is the only way they cannot drift. What such a driver adds of its own goes in its
+    ``preflight`` classmethod, called here after the four and before ``setup_config``.
 
     Args:
         config_path: Path to the YAML config. Its ``base:`` chain is resolved first.
@@ -430,6 +469,11 @@ def main(config_path: str, trainer_cls: type[LagAttnRwsTrainer] = LagAttnRwsTrai
         _check_declared_widths_against_shard(graph_model.config)
         _check_raw_target_normalized(graph_model.config)
         _check_causal_budget_resolves(graph_model.config)
+        # After the four, before setup_config: the four are this architecture's and stay called
+        # by name here (three other places import them individually and assert on this order),
+        # while a sibling architecture's own guards go behind the hook. Handed the already-loaded
+        # config, so the hook cannot read a different file than the one that was just checked.
+        trainer_cls.preflight(graph_model.config)
 
         graph_model.setup_config()
         # After setup_config, which is what creates the run directories, and still inside the
