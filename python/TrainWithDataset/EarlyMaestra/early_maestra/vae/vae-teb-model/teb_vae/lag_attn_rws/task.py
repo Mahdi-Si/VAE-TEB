@@ -345,6 +345,31 @@ class SeqVaeLagAttnRwsTask(LightningModelBase):
             f"use_up_st before trusting the number."
         )
 
+    def _build_forward_inputs(self, batch: Any) -> Tuple[torch.Tensor, ...]:
+        """Return the positional tensors the net's ``forward`` takes, in order.
+
+        The one seam between a batch and a net's input signature. This model feeds its net the
+        two target feature blocks and the assembled source stream; a sibling architecture over a
+        different *input representation* keeps this whole class -- the objective, the metric
+        surface, the permutation control, the checkpoint contract -- and overrides only this
+        method. Everything downstream reads ``inputs[0]`` for the batch size and device rather
+        than a named tensor, so an override is free to return tensors of a different rank
+        entirely.
+
+        Deliberately not merged with :meth:`_build_raw_target`: the raw FHR is the
+        reconstruction *target*, scored by the loss, and it stays behind its own builder even for
+        an architecture that also feeds it to the net. One source of the target is what stops a
+        model from being scored against a tensor other than the one it was shown.
+
+        Args:
+            batch: A batch from the data module.
+
+        Returns:
+            ``(y_st, y_ph, u_stream)``, splatted into the net's forward.
+        """
+        y_st, y_ph = self._build_target_streams(batch)
+        return y_st, y_ph, self._build_source_stream(batch)
+
     def _build_raw_target(self, batch: Any) -> Tuple[torch.Tensor, torch.Tensor]:
         """Return ``(fhr, weight)``: the raw reconstruction target and its validity signal.
 
@@ -520,11 +545,10 @@ class SeqVaeLagAttnRwsTask(LightningModelBase):
             enters it on any stage -- and ``metrics['main_loss']`` carries its detached value
             under exactly that name, which is what the spike breaker watches.
         """
-        y_st, y_ph = self._build_target_streams(batch)
-        u_stream = self._build_source_stream(batch)
+        inputs = self._build_forward_inputs(batch)
         fhr_raw, weight = self._build_raw_target(batch)
 
-        forward_outputs = self.model(y_st, y_ph, u_stream)
+        forward_outputs = self.model(*inputs)
 
         beta = self._resolve_beta(self.current_epoch)
         beta_prior = float(self.hparams.get("beta_prior", 0.0))
@@ -556,8 +580,11 @@ class SeqVaeLagAttnRwsTask(LightningModelBase):
         metrics["delta_mu_sat_frac"] = forward_outputs["delta_mu_sat_frac"]
         metrics["mu_post_prior_gap_rms"] = self._mu_gap_rms(forward_outputs, weight)
 
+        # ``inputs[0]`` rather than a named tensor: the batch size and the device are properties
+        # of any of the net's inputs, and reading them off the first one is what keeps the
+        # control working for a subclass whose ``_build_forward_inputs`` returns something else.
         do_perm = self._sync_perm_decision(
-            self._should_run_perm(y_st.size(0), stage), y_st.device
+            self._should_run_perm(inputs[0].size(0), stage), inputs[0].device
         )
         if do_perm:
             # Readout only, under no_grad: the shuffled branch re-scores the forecast under a

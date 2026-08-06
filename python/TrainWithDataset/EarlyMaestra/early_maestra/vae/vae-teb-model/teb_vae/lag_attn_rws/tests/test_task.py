@@ -200,6 +200,69 @@ def test_a_missing_raw_target_field_names_the_config_key(task, stub_batch, field
 
 
 # --------------------------------------------------------------------------------------
+# The forward-input seam
+#
+# ``_build_forward_inputs`` is the one place a sibling architecture over a different input
+# representation is meant to differ, so it gets both halves: the default tuple is exactly what the
+# builders produce, and an override actually decides what the net receives.
+# --------------------------------------------------------------------------------------
+def test_the_default_forward_inputs_are_the_three_tensors_the_builders_produce(task, stub_batch):
+    """Same tensors, same order, same objects. A hook that rebuilt them independently could drift
+    from the builders whose width checks are the only thing standing between a mismatched shard
+    and a silently wrong run."""
+    module = task()
+
+    inputs = module._build_forward_inputs(stub_batch)
+
+    y_st, y_ph = module._build_target_streams(stub_batch)
+    assert len(inputs) == 3
+    assert inputs[0] is y_st
+    assert inputs[1] is y_ph
+    assert torch.equal(inputs[2], module._build_source_stream(stub_batch))
+
+
+def test_an_override_changes_what_the_net_receives_and_nothing_else(
+    task, stub_batch, perturb_posterior
+):
+    """The seam's whole contract, asserted on the one readout that can tell the difference: the
+    prior branch never sees the source, so a deranged source stream must leave ``nll_base_block``
+    bitwise identical while ``nll_full_block`` moves. Both halves are needed -- movement alone
+    would also be produced by an override that perturbed the target.
+
+    Overridden on the instance rather than by subclassing, so the *weights* are provably the same
+    object in both calls; the seed is re-set because one ``randn_like`` draw enters both branches
+    and an unseeded second call would move ``nll_base_block`` for reasons of its own.
+    """
+    module = task()
+    perturb_posterior(module.orig_model)
+    default_inputs = module._build_forward_inputs
+    torch.manual_seed(7)
+    _loss, reference = module.compute_loss_and_metrics(stub_batch, 0, "train")
+
+    def _deranged_source(batch):
+        y_st, y_ph, u_stream = default_inputs(batch)
+        return y_st, y_ph, u_stream.flip(0)
+
+    module._build_forward_inputs = _deranged_source
+    torch.manual_seed(7)
+    _loss, overridden = module.compute_loss_and_metrics(stub_batch, 0, "train")
+
+    assert torch.equal(overridden["nll_base_block"], reference["nll_base_block"])
+    assert not torch.equal(overridden["nll_full_block"], reference["nll_full_block"])
+
+
+@pytest.mark.parametrize("builder", ["_build_target_streams", "_build_source_stream"])
+def test_compute_loss_and_metrics_reaches_the_net_only_through_the_hook(builder):
+    """A remaining direct call to either stream builder would make the hook advisory: the
+    override above would run, and the net would go on being fed what it always was. Checked in the
+    source because a *surviving* call site produces a correct-looking run, not a failure."""
+    source = inspect.getsource(SeqVaeLagAttnRwsTask.compute_loss_and_metrics)
+
+    assert f"self.{builder}(" not in source
+    assert "self._build_forward_inputs(" in source
+
+
+# --------------------------------------------------------------------------------------
 # Channel widths are checked against the data, not against a constant
 # --------------------------------------------------------------------------------------
 def test_a_stale_phase_only_c_u_is_caught_against_the_actual_batch(task, tiny_kwargs, stub_batch):

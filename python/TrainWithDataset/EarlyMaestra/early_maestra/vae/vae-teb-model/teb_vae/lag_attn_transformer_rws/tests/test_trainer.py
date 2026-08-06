@@ -399,9 +399,12 @@ def test_setup_config_runs_before_the_model_is_built(recording_main, tmp_path):
     assert recording_main == ["setup_config", "create_model", "train_model"]
 
 
-def test_all_four_pre_flight_guards_run_before_setup_config(tmp_path, monkeypatch):
+def test_all_four_pre_flight_guards_and_the_driver_hook_run_before_setup_config(
+    tmp_path, monkeypatch
+):
     """Their whole value is failing before the run directory and MLflow run exist on every rank of
-    a multi-rank launch."""
+    a multi-rank launch. The driver's own ``preflight`` runs last of the five and still before
+    ``setup_config``, so a guard a sibling architecture adds keeps the same guarantee."""
     order = []
     monkeypatch.setattr(
         LagAttnTrfRwsTrainer, "setup_config", lambda self: order.append("setup_config")
@@ -415,6 +418,11 @@ def test_all_four_pre_flight_guards_run_before_setup_config(tmp_path, monkeypatc
         monkeypatch.setattr(
             shared_trainer, attribute, lambda config, _label=label: order.append(_label)
         )
+    monkeypatch.setattr(
+        LagAttnTrfRwsTrainer,
+        "preflight",
+        classmethod(lambda cls, config: order.append("preflight")),
+    )
     monkeypatch.setattr(shared_trainer, "GraphDataModule", lambda config: None)
     monkeypatch.setattr(
         LagAttnTrfRwsTrainer, "create_model", lambda self: order.append("create_model")
@@ -425,9 +433,20 @@ def test_all_four_pre_flight_guards_run_before_setup_config(tmp_path, monkeypatc
         # under test. The order up to that point is the assertion.
         trainer_module.main(_tiny_config_at(tmp_path))
 
-    assert order[:5] == [
-        "stat_path", "widths", "fhr_normalized", "causal_budget", "setup_config",
+    assert order[:6] == [
+        "stat_path", "widths", "fhr_normalized", "causal_budget", "preflight", "setup_config",
     ], order
+
+
+def test_the_base_preflight_is_a_no_op_so_a_subclass_cannot_drop_an_inherited_check():
+    """The four guards stay module-level and individually called, so there is nothing behind this
+    hook to inherit -- which is what makes an override that forgets ``super()`` harmless rather
+    than a silently disabled check."""
+    assert LagAttnRwsTrainer.preflight({}) is None
+    # ``is`` would compare two freshly bound classmethod objects and always fail; the question is
+    # whether this driver defines one of its own, which it does not.
+    assert "preflight" not in vars(LagAttnTrfRwsTrainer)
+    assert LagAttnTrfRwsTrainer.preflight({}) is None
 
 
 def test_a_missing_stat_path_raises_before_any_training_happens(recording_main, tmp_path):

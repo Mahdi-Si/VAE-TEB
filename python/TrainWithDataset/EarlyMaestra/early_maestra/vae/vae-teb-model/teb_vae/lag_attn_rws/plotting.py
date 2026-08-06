@@ -7,9 +7,10 @@ re-exported here so the callback, and every caller and test that reached for
 ``plotting.build_diagnostic_figure``, are unchanged.
 
 What is left here is the callback: when to draw, which samples, and where the files go. It supplies
-one thing the model's own input builders cannot: the raw ``up`` trace, which the net never sees --
-it consumes the decimated UP feature blocks -- and which the page's first row draws beside the
-target. It never
+the raw ``up`` trace the page's first row draws beside the target, taken from the batch rather than
+from the task's forward-input builder. Whether the net *also* sees that trace is model-dependent --
+a feature-input model consumes the decimated UP blocks and never sees it, a raw-input model is fed
+it directly -- and the page draws it either way, so the row means the same thing in both. It never
 raises into the training loop -- generation is wrapped in a broad ``try/except`` that warns and
 closes any leaked figures -- and every saved file goes to MLflow through the rank-0 artifact seam
 :func:`utils.mlflow_utils.log_artifact_to_mlflow`. This module lives in the model layer rather
@@ -230,9 +231,10 @@ class LagAttnRwsPlotCallback(Callback):
     def _generate_plots(self, trainer: Any, batch: Any, pl_module: Any, epoch: int) -> None:
         """Run one forward pass and write one figure per requested sample.
 
-        The streams are assembled through the task's own builders and the loss through the net's
-        own ``compute_loss``, so a figure cannot quietly disagree with the objective it
-        illustrates about what the model was fed or what it scored.
+        The net's inputs are assembled through the task's own ``_build_forward_inputs`` and the
+        loss through the net's own ``compute_loss``, so a figure cannot quietly disagree with the
+        objective it illustrates about what the model was fed or what it scored -- and a subclass
+        that changed its net's input signature gets a correct figure with nothing edited here.
 
         Args:
             trainer: The Lightning trainer.
@@ -244,14 +246,13 @@ class LagAttnRwsPlotCallback(Callback):
         # orig_model, not model: the latter may be a compiled wrapper without the net's methods.
         model = pl_module.orig_model
 
-        y_st, y_ph = pl_module._build_target_streams(batch)
-        u_stream = pl_module._build_source_stream(batch)
+        inputs = pl_module._build_forward_inputs(batch)
         fhr_raw, weight = pl_module._build_raw_target(batch)
 
         was_training = pl_module.training
         pl_module.eval()
         try:
-            outs = model(y_st, y_ph, u_stream)
+            outs = model(*inputs)
             # The schedule's value for this epoch, not hparams['kld_beta']: under any warm-up the
             # raw hyperparameter is the endpoint and the figure would report a constant.
             beta = float(pl_module._resolve_beta(pl_module.current_epoch))
@@ -276,7 +277,10 @@ class LagAttnRwsPlotCallback(Callback):
                 pl_module.train()
 
         stats = normalization_stats_of(trainer)
-        for index in range(min(self.num_examples, int(y_st.shape[0]))):
+        # ``inputs[0]`` rather than a named tensor: every input the net takes carries the batch
+        # size, and reading it off the first one is what keeps the loop bound right for a model
+        # whose forward signature is not this one's.
+        for index in range(min(self.num_examples, int(inputs[0].shape[0]))):
             guid = _guid_of(batch, index)
             figure = build_diagnostic_figure(
                 outs=outs,
@@ -288,8 +292,9 @@ class LagAttnRwsPlotCallback(Callback):
                 guid=guid,
                 beta=beta,
                 scalars={name: float(value) for name, value in scalars.items()},
-                # The raw source, which no builder of the model's inputs returns: the net is fed
-                # the decimated UP feature blocks and never sees this trace.
+                # The raw source, taken from the batch rather than from the forward inputs. A
+                # feature-input model is fed the decimated UP blocks and never sees this trace;
+                # a raw-input model is fed it directly. The row draws it either way.
                 up_raw=_get_field(batch, "up"),
                 normalization_stats=stats,
                 delay_steps=_source_delay_steps(model),

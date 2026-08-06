@@ -1,0 +1,63 @@
+# Local smoke variant: one epoch, one device, the committed 4-sample shard.
+#
+# Everything not named here is inherited from default.yaml -- including the settings that are
+# correctness requirements rather than preferences (compile: false, the spike breaker's ema_floor,
+# num_sanity_val_steps: 0, precision), which is the point: a variant that re-stated them could
+# drift from them.
+#
+# The geometry stays real. sequence_length, raw_per_step, warmup_period, the conv stem, the
+# attention block counts, the source window and trim_minutes all match the shipped config, because
+# the committed shard carries the real field shapes -- and two things are only exercised at the
+# real trim: the raw-index geometry (the forecast of anchor t starts at 16*(t+1)) and the front
+# ends' own 16-samples-per-token stride. In particular warmup_period stays 30, so the front ends
+# run at their PRODUCTION reach of 322 raw samples against the real 480-sample budget rather than
+# at some shrunken schedule the production run would never build. Only the model's widths shrink so
+# a CPU forward is fast; the front-end stage widths follow d_model automatically (8/16/24/32 here),
+# and its kernels are a module constant, so neither is named.
+#
+# Two deliberate deltas, neither a simplification:
+#
+#   likelihood: mse is the configuration that starves the decoder log-variance heads, so the smoke
+#   path and the DDP-strategy fallback it implies get exercised where they are cheap to observe.
+#
+#   lr_warmup_steps: 4 is short enough that the step ramp COMPLETES inside a smoke fit (two
+#   optimizer steps per epoch against the four-sample shard), which is what makes the step-granular
+#   scheduler path exercised by a real run rather than only by a unit test.
+#
+#   python -m teb_vae.lag_attn_transformer_e2e.trainer \
+#       --config teb_vae/lag_attn_transformer_e2e/configs/tiny.yaml
+base: default.yaml
+
+general_config:
+  tag: lag_attn_trf_e2e_tiny
+  cuda_devices: [0]
+  epochs: 1
+  lr_warmup_steps: 4
+  batch_size: {train: 2, test: 2}
+  folders_config: {out_dir_base: output/teb_vae_trf_e2e_tiny}
+
+model_config:
+  VAE_model:
+    d_model: 32          # = num_heads * d_head, = encoder_num_heads * 8 (even head width), and
+                         # divisible by 4, which the front end's (d/4, d/2, 3d/4, d) widths need
+    d_z: 8               # divisible by num_heads, required by the head-structured posterior
+    d_head: 8
+    max_lag: 8
+    encoder_d_ff: 64
+    dropout: 0.0
+    likelihood: mse
+
+dataset_config:
+  # Repo-root-relative: entry points run from the repo root. The fixtures are the siblings' --
+  # all three models read the same shards through the same loader, which is the point of the
+  # comparison. This one reads only fhr, up, weight and guid out of them.
+  vae_train_datasets: [teb_vae/lag_attn/tests/fixtures/tiny_shard.hdf5]
+  vae_test_datasets: [teb_vae/lag_attn/tests/fixtures/tiny_shard.hdf5]
+  stat_path: teb_vae/lag_attn/tests/fixtures/tiny_stats.hdf5
+  dataloader_config:
+    num_workers: 0       # no worker spawn for 4 samples
+
+advanced_config:
+  tracking:
+    mlflow:
+      enabled: false     # a smoke run is not a result

@@ -160,6 +160,56 @@ def test_create_model_forces_eager_execution(trainer):
     assert trainer.pl_model.model is trainer.pl_model.orig_model
 
 
+# --------------------------------------------------------------------------------------
+# The startup causal-standing log
+#
+# The sentence is a claim about what this architecture's history states are a function of, and it
+# is the premise every coupling number a run produces rests on. It moved behind a method so a
+# sibling architecture can state its own; these pin what *this* one still says, in both branches.
+# --------------------------------------------------------------------------------------
+@pytest.fixture
+def loguru_messages():
+    """Collect loguru output.
+
+    ``caplog`` cannot see it: loguru does not route through the stdlib ``logging`` module, so a
+    ``caplog.at_level`` assertion against these lines would pass on a driver that logged nothing.
+    """
+    from loguru import logger
+
+    messages: list[str] = []
+    sink_id = logger.add(messages.append, level="INFO", format="{message}")
+    yield messages
+    logger.remove(sink_id)
+
+
+def test_the_unguarded_causal_standing_is_stated_verbatim(trainer, loguru_messages):
+    """The unguarded default is what the shipped config runs, so this is the sentence that
+    appears in every production log. It says the inputs are two-sided and that the KL is
+    therefore not a transfer entropy -- the one claim a reader could otherwise take too far."""
+    trainer.create_model()
+
+    assert trainer.resolved_budget is None
+    assert trainer.causal_standing_message() == (
+        "causal reach budget: none (all channels, no delay) -- input features at step t "
+        "read up to 974 s into their own future, so the source-conditioned KL is not a "
+        "transfer entropy."
+    )
+    assert any(
+        "read up to 974 s into their own future" in message for message in loguru_messages
+    )
+
+
+def test_a_configured_budget_is_stated_as_the_resolved_survivor_counts(trainer):
+    """The other branch: with a budget the sentence is the resolution's own summary, so a run
+    records the guard it actually got rather than the one it asked for."""
+    trainer.config["model_config"]["VAE_model"]["causal_reach_budget_s"] = 120.0
+    trainer._build_model_kwargs()
+
+    assert trainer.resolved_budget is not None
+    assert trainer.causal_standing_message() == trainer.resolved_budget.summary()
+    assert trainer.causal_standing_message().startswith("causal reach budget 120 s:")
+
+
 def test_the_checkpoint_kwargs_are_the_ones_the_model_was_built_from(trainer):
     """So the blob rebuilds into this architecture and not the constructor's defaults."""
     trainer.create_model()
