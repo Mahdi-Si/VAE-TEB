@@ -1,0 +1,28 @@
+# Source-regularisation arm: source_dropout = 0.2 against the shipped null.
+#
+# What null means at each site, because it is not one number: the source adapter and the
+# source encoder run at the global 0.1, and the dropout on the attended source summary
+# inside the posterior fusion is OFF. This arm therefore moves the first two 0.1 -> 0.2
+# and the third 0 -> 0.2.
+#
+# Not an ablate-one arm -- the default ships the MECHANISM at no extra strength, because no
+# measurement supports a particular rate. These two arms are the measurement.
+#
+# What it tests. Over epochs 55-120 of the 125-epoch run the KL held at 1.44 nats and the latent
+# displacement at 0.084 -- both flat -- while the held-out predictive gain fell from +3.25 to
+# -0.70. A failure at constant rate and constant magnitude is a failure of the CONTENT of the map
+# from the source to delta_mu, which is a capacity/regularisation problem and not one beta can
+# reach. This raises the regularisation on exactly that map and nothing else: the target encoder,
+# the prior and the decoder all keep the global 0.1.
+#
+# What to read: the TRAIN-MINUS-HELD-OUT gap in pred_gap, not the held-out gain alone. The
+# signature to look for is a smaller gap with a smaller training gain -- that is regularisation
+# working. A smaller held-out gain with an unchanged gap is the pathway being starved instead, and
+# says the problem is data quantity rather than capacity.
+#
+#   TEB_RUN_STAMP="$(date '+%Y-%m-%d--[%H-%M]')" torchrun --nproc_per_node=7 \n#       -m teb_vae.lag_attn_transformer_rws.trainer \n#       --config teb_vae/lag_attn_transformer_rws/configs/sweep_source_dropout_0p2.yaml
+base: default.yaml
+
+model_config:
+  VAE_model:
+    source_dropout: 0.2

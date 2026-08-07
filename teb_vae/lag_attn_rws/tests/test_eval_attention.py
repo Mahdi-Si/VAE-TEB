@@ -35,7 +35,7 @@ from teb_vae.lag_attn_rws.eval.metrics import (
     attention_entropy,
     untruncated_anchor_mask,
 )
-from teb_vae.lag_attn_rws.nets.lag_report import lag_compensated_seconds
+from teb_vae.lag_attn.nets.lag_report import lag_compensated_seconds
 from teb_vae.lag_attn_rws.nets.model import SeqVaeLagAttnRws
 
 #: What the shipped geometry works out to, asserted against the model rather than hardcoded into

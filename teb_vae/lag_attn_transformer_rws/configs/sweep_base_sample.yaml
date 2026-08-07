@@ -1,0 +1,27 @@
+# Ablate-one arm: base_decode = sample, restoring the sampled base branch.
+#
+# The shipped default is 'mean'. This arm puts the noise back, and it is the control for the first
+# of the two changes aimed at the prior-variance collapse.
+#
+# What it isolates. Under 'sample' the base branch decodes z^p = mu^p + sigma^p * eps, so D_0's
+# gradient on the prior log-variance points down without limit -- sampling noise can only degrade a
+# forecast, and nothing in the objective opposes that from below. Under the shipped 'mean' that
+# term is gone and the prior's scale is left to KL(q||p), which pulls it up, and to the anchor.
+#
+# What to read. `logvar_prior_floor_frac` and `mean_logvar_prior` against the default's, at matched
+# epochs. The 125-epoch reference climbed 0.017 -> 0.496 and was still rising; if this arm
+# reproduces that trajectory and the default does not, the mechanism is confirmed. Read
+# `kld_active_frac` beside it: a prior held off its floor should keep more dimensions alive.
+#
+# Costs. None in parameters -- this changes no shape, so it shares a checkpoint geometry with the
+# default. It does change the init contract: under 'sample' base and full are bitwise identical at
+# step 0, under 'mean' they differ by the posterior's own noise. The KL is exactly zero either way.
+#
+#   TEB_RUN_STAMP="$(date '+%Y-%m-%d--[%H-%M]')" torchrun --nproc_per_node=7 \
+#       -m teb_vae.lag_attn_transformer_rws.trainer \
+#       --config teb_vae/lag_attn_transformer_rws/configs/sweep_base_sample.yaml
+base: default.yaml
+
+model_config:
+  VAE_model:
+    base_decode: sample

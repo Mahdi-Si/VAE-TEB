@@ -26,7 +26,7 @@ import pytest  # noqa: E402
 import torch  # noqa: E402
 
 from teb_vae.lag_attn_rws import plotting  # noqa: E402
-from teb_vae.lag_attn_rws.nets.lag_report import COMPENSATED_LAG_AXIS_LABEL  # noqa: E402
+from teb_vae.lag_attn.nets.lag_report import COMPENSATED_LAG_AXIS_LABEL  # noqa: E402
 from teb_vae.lag_attn_rws.plotting import LagAttnRwsPlotCallback  # noqa: E402
 from train.test_utils import FakeMLflowLogger, FakeTrainer  # noqa: E402
 

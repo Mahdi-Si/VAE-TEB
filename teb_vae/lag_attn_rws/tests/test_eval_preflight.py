@@ -27,7 +27,7 @@ import yaml
 from loguru import logger
 
 from teb_vae.lag_attn.config import load_config
-from teb_vae.lag_attn_rws import channel_reach
+from teb_vae.lag_attn import channel_reach
 from teb_vae.lag_attn_rws.eval import preflight, run as run_module
 from teb_vae.lag_attn_rws.eval.preflight import EvalPreconditionUnmet
 from teb_vae.lag_attn_rws.nets.model import SeqVaeLagAttnRws
@@ -494,7 +494,7 @@ def test_the_channel_counts_are_recomputed_rather_than_stored(config, loaded) ->
 def test_a_finite_budget_records_its_delay_and_the_surviving_channel_counts(config) -> None:
     """The disclosure stands at every budget -- the reach it prunes on is a 95%-energy quantile
     rather than a hard support -- so what a budget changes is recorded, not the verdict."""
-    from teb_vae.lag_attn_rws.channel_reach import resolve_stream_budgets
+    from teb_vae.lag_attn.channel_reach import resolve_stream_budgets
 
     budget = resolve_stream_budgets(
         {"causal_reach_budget_s": 120.0, "use_up_st": True, "warmup_period": 30,

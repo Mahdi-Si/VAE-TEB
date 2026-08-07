@@ -27,7 +27,7 @@ forecasts are ``(B, T, H_d, c_y)``.
 from __future__ import annotations
 
 import math
-from typing import Any, Dict, Optional, Tuple, cast
+from typing import Any, Dict, Optional, Sequence, Tuple, cast
 
 import torch
 from torch import nn
@@ -39,8 +39,9 @@ from teb_vae.lag_attn.nets.decoders import (
     HorizonDecoderCore,
     ResidualFutureDecoder,
 )
-from teb_vae.lag_attn.nets.encoders import CausalConvLstmEncoder, InputAdapter
-from teb_vae.lag_attn.nets.heads import PosteriorHead, PriorHead, TEAnalysisHead
+from teb_vae.lag_attn.nets.delays import ChannelGate
+from teb_vae.lag_attn.nets.encoders import AvailabilityInputAdapter, CausalConvLstmEncoder
+from teb_vae.lag_attn.nets.heads import POSTERIOR_LOGVAR_MODES, PosteriorHead, PriorHead, TEAnalysisHead
 
 _KLD_SUPPORT_CHOICES = ("full", "anchor")
 _LIKELIHOOD_CHOICES = ("mse", "gaussian_nll")
@@ -57,6 +58,11 @@ class SeqVaeLagAttn(nn.Module):
     See the module docstring for what the pieces are for. The constructor's job is to build them
     consistently and to refuse inconsistent geometry loudly, before any of it reaches a forward.
     """
+
+    #: The causal input guards, or ``None`` when no reach budget is configured. Declared so they
+    #: type as gates rather than as the ``Tensor | Module`` a bare submodule attribute would.
+    target_gate: Optional[ChannelGate]
+    source_gate: Optional[ChannelGate]
 
     def __init__(
         self,
@@ -83,6 +89,8 @@ class SeqVaeLagAttn(nn.Module):
         mu_scale: float = 5.0,
         delta_mu_scale: float = 3.0,
         delta_logvar_scale: float = 2.0,
+        posterior_logvar_mode: str = "residual",
+        source_dropout: Optional[float] = None,
         use_entmax: bool = False,
         attention_grad_checkpoint: bool = False,
         lag_bias_init: str = "normal",
@@ -93,6 +101,10 @@ class SeqVaeLagAttn(nn.Module):
         perm_every_n_batches: int = 4,
         causal_norm: bool = False,
         freeze_unused_attn_proj: bool = False,
+        target_keep_index: Optional[Sequence[int]] = None,
+        target_delays: Optional[Sequence[int]] = None,
+        source_keep_index: Optional[Sequence[int]] = None,
+        source_delays: Optional[Sequence[int]] = None,
         init_weights: bool = True,
     ) -> None:
         r"""Initialize the model.
@@ -127,6 +139,22 @@ class SeqVaeLagAttn(nn.Module):
             mu_scale: Saturation magnitude of the tanh-bounded prior mean.
             delta_mu_scale: Saturation magnitude of the tanh-bounded posterior mean delta.
             delta_logvar_scale: Saturation magnitude of the posterior log-variance delta.
+            source_dropout: Dropout rate for the SOURCE pathway alone -- its input adapter or
+                front end, its encoder, and the attended source summary inside the posterior
+                fusion. ``None`` reproduces the pre-key model exactly, which is *not* one number:
+                the adapter and encoder always ran at ``dropout`` and keep doing so, while the
+                posterior fusion's dropout on the attended source summary is a site this key
+                introduced and so resolves to $0$. Any explicit value applies to all three.
+                Deliberately not applied to the lag attention (its probabilities must stay
+                dropout-free or the per-lag KL attribution stops being exact) nor to the
+                shared decoder (one module invoked twice would draw two masks).
+            posterior_logvar_mode: ``'residual'`` builds the posterior log-variance as a
+                bounded delta on the prior's pre-bound raw value; ``'independent'`` gives it
+                its own head. ``'independent'`` is shipped because the residual form routes
+                the full branch's pressure to sharpen $\sigma^q$ onto the PRIOR's tensor, so
+                $D_1$ drags the prior's scale down alongside its own -- the second of the two
+                paths driving the prior-variance collapse, and the one that survives turning
+                off the base branch's noise. See :class:`PosteriorHead` for what it costs.
             use_entmax: Use ``entmax15`` attention, which can assign a lag exactly zero weight.
             attention_grad_checkpoint: Recompute the attention in the backward pass.
             lag_bias_init: ``'normal'`` or ``'alibi_decay'``.
@@ -152,6 +180,14 @@ class SeqVaeLagAttn(nn.Module):
                 never updated either way; clearing ``requires_grad`` makes that explicit and,
                 more usefully, drops it from DDP's expectation set, so the run can use plain
                 ``'ddp'`` instead of paying for ``find_unused_parameters=True`` every step.
+            target_keep_index: Indices of the target channels that survive the configured causal
+                reach budget, into the declared ``c_y``. ``None`` keeps every channel. The model
+                is still *built* with the full declared width -- the gather happens inside the
+                forward, after the data boundary has checked the batch against ``c_y``.
+            target_delays: One delay in decimated steps per surviving target channel, in the same
+                order as ``target_keep_index``.
+            source_keep_index: The same for the source stream, into the declared ``c_u``.
+            source_delays: The same for the source stream.
             init_weights: Apply the standard initialisation before the delta heads are zeroed.
 
         Raises:
@@ -209,13 +245,47 @@ class SeqVaeLagAttn(nn.Module):
         self.mu_scale = float(mu_scale)
         self.delta_mu_scale = float(delta_mu_scale)
         self.delta_logvar_scale = float(delta_logvar_scale)
+        self.posterior_logvar_mode = validate_choice(
+            posterior_logvar_mode, POSTERIOR_LOGVAR_MODES, "posterior_logvar_mode"
+        )
+        # Two resolutions of the one key, because the source-side sites did not all start from
+        # the same place and "unchanged" therefore means different numbers at each.
+        #
+        # The PATHWAY sites -- input adapter/front end and source encoder -- already existed and
+        # always ran at the global `dropout`, so an unset key must resolve to `dropout` there.
+        # The posterior fusion's dropout on the attended source summary is a NEW site introduced
+        # with this key; before it, `a` entered the fusion with no dropout at all, so an unset key
+        # must resolve to 0.0 there. Resolving both to `dropout` would add p=dropout inside the
+        # posterior of every run that leaves the key unset -- invisible in eval mode, and enough
+        # to make the source_dropout sweep arms measure against the wrong baseline.
+        #
+        # Setting the key moves both together, which is the intent: one source-pathway rate.
+        self.source_dropout = float(dropout if source_dropout is None else source_dropout)
+        self.posterior_source_dropout = 0.0 if source_dropout is None else float(source_dropout)
         self.head_structured_latent = bool(head_structured_latent)
         self.kld_support = validate_choice(kld_support, _KLD_SUPPORT_CHOICES, "kld_support")
         self.lambda_perm = float(lambda_perm)
         self.perm_every_n_batches = int(perm_every_n_batches)
 
-        self.target_adapter = InputAdapter(in_dim=self.c_y, d_model=d_model, dropout=dropout)
-        self.source_adapter = InputAdapter(in_dim=self.c_u, d_model=d_model, dropout=dropout)
+        # The causal input guard, if one is configured. Applied inside the forward, between the
+        # data boundary (which sees the full declared widths) and the input adapters (which see
+        # only the survivors), so a nonzero budget changes what the model reads without changing
+        # what the batch must contain.
+        self.target_gate = self._build_channel_gate(
+            self.c_y, target_keep_index, target_delays
+        )
+        self.source_gate = self._build_channel_gate(
+            self.c_u, source_keep_index, source_delays
+        )
+
+        # Built at the width and delays the gate actually emits, read back off the constructed
+        # gate rather than off the constructor arguments a second time. Unguarded, no availability
+        # term is constructed and the module is parameter-for-parameter the plain InputAdapter it
+        # replaces, so a model built without a budget is unchanged.
+        self.target_adapter = self._build_adapter(self.target_gate, self.c_y, dropout)
+        self.source_adapter = self._build_adapter(
+            self.source_gate, self.c_u, self.source_dropout
+        )
 
         # One extra dilated block per requested dilation, at kernel 15, for a longer receptive
         # field. The two streams differ only in their base kernel schedule.
@@ -235,8 +305,8 @@ class SeqVaeLagAttn(nn.Module):
             cnn_kernels=(3, 5, 11) + extra_kernels,
             cnn_dilations=encoder_dilations,
             lstm_layers=lstm_layers,
-            lstm_dropout=dropout,
-            conv_dropout=dropout,
+            lstm_dropout=self.source_dropout,
+            conv_dropout=self.source_dropout,
         )
 
         self.prior_head = PriorHead(
@@ -267,6 +337,10 @@ class SeqVaeLagAttn(nn.Module):
             num_heads=num_heads,
             d_head=d_head,
             delta_logvar_scale=self.delta_logvar_scale,
+            posterior_logvar_mode=self.posterior_logvar_mode,
+            # The posterior-fusion resolution, not the pathway one: see __init__ for why an
+            # unset key means 0.0 here and `dropout` at the pathway sites.
+            source_dropout=self.posterior_source_dropout,
         )
 
         # One horizon core, shared, so the residual decoder corrects the baseline inside the
@@ -317,6 +391,86 @@ class SeqVaeLagAttn(nn.Module):
         self._zero_init_delta_heads()
 
     @staticmethod
+    def _build_channel_gate(
+        declared_width: int,
+        keep_index: Optional[Sequence[int]],
+        delays: Optional[Sequence[int]],
+    ) -> Optional[ChannelGate]:
+        r"""Build one stream's causal input guard, or ``None`` when it has none.
+
+        With neither argument the stream is ungated and **no** module is created, so the unguarded
+        model is structurally identical to one built before the guard existed. With either, a gate
+        is built and the missing half is filled in -- a missing delay vector becomes zeros, a
+        missing keep-index becomes the identity -- because a gather without delays (or the
+        reverse) is far more likely to be a resolution bug than an intent.
+
+        Args:
+            declared_width: The stream's full declared channel count.
+            keep_index: Surviving channel indices, or ``None`` for all of them.
+            delays: Per-survivor delay in steps, or ``None`` for none.
+
+        Returns:
+            The gate, or ``None``.
+
+        Raises:
+            ValueError: Propagated from :class:`ChannelGate`, which owns the validation.
+        """
+        if keep_index is None and delays is None:
+            return None
+        return ChannelGate(
+            declared_width=int(declared_width), keep_index=keep_index, delays=delays
+        )
+
+    def _build_adapter(
+        self, gate: Optional[ChannelGate], declared_width: int, dropout: float
+    ) -> AvailabilityInputAdapter:
+        r"""Build one stream's input adapter at the width and delays its gate actually emits.
+
+        The gate is the single source of truth for both. Reading the delays back off the
+        constructed gate rather than off the constructor arguments a second time means the
+        availability pattern $m_{t,c} = \mathbb 1[t \ge \delta_c]$ cannot describe a guard the
+        stream never received: the gate fills in a missing delay vector with zeros and a missing
+        keep-index with the identity, and either substitution would leave the two out of step.
+
+        This model keeps its **gated** residual seam (``post_residual_activation=True``, the
+        original here) while the raw-signal siblings run the ungated one, so an unguarded model
+        built through this method is bitwise the plain-``InputAdapter`` model it replaces --
+        which is what ``tests/test_shared_code_stability.py`` pins.
+
+        Args:
+            gate: The stream's guard, or ``None`` when it is unguarded.
+            declared_width: The stream's declared channel count, used when there is no gate.
+            dropout: Dropout probability inside the projection stack.
+
+        Returns:
+            The adapter, carrying whichever availability terms the delays call for.
+        """
+        width = declared_width if gate is None else gate.out_channels
+        delays = None if gate is None else [int(value) for value in gate.delay.delay_steps]
+        return AvailabilityInputAdapter(
+            in_dim=width,
+            d_model=self.d_model,
+            sequence_length=self.sequence_length,
+            dropout=dropout,
+            delays=delays,
+            post_residual_activation=True,
+        )
+
+    @property
+    def source_delay_steps(self) -> int:
+        r"""The causal input delay $\delta$ the source stream is read with, in decimated steps.
+
+        Zero when no reach budget is configured. **Every lag report must add this back**: an
+        attention peak at lag $\ell$ refers to source content $\ell + \delta$ steps in the past,
+        so a figure or summary that omits it understates the physiological delay -- by up to two
+        minutes at the $120$ s budget, with nothing failing.
+
+        The source channels are delayed individually, so no single $\delta$ describes them all.
+        The maximum is reported, which makes a lag computed from it an upper bound.
+        """
+        return 0 if self.source_gate is None else self.source_gate.max_delay
+
+    @staticmethod
     def _zero_linear(layer: nn.Linear) -> None:
         """Zero a linear layer's weight and, if present, its bias."""
         nn.init.zeros_(layer.weight)
@@ -336,9 +490,41 @@ class SeqVaeLagAttn(nn.Module):
         parameters that carry what was learned.
         """
         for module in (self.posterior_head.delta_mu_head, self.posterior_head.delta_logvar_head):
+            # delta_logvar_head is None under posterior_logvar_mode='independent', where the
+            # posterior's log-variance is not a delta on anything and is handled below.
+            if module is None:
+                continue
             layers = list(module) if isinstance(module, nn.ModuleList) else [module]
             for layer in layers:
                 self._zero_linear(cast(nn.Linear, layer))
+
+        # The independent log-variance head has no zero that means "agree with the prior": its
+        # output IS the posterior's log-variance, so zeroing it would assert the midpoint of the
+        # clamp. Seeded instead at the pre-image of log-variance 0 -- zero weight, bias at
+        # log((0 - lo) / (hi - 0)) -- so the head starts input-independent at sigma_q = 1. That
+        # is exactly where head_init_calibration puts the PRIOR, so under the shipped flags the
+        # two agree and the KL is still exactly zero at init. Without that flag the prior starts
+        # elsewhere and the init KL is small but nonzero, which is the accepted cost of the mode.
+        independent = self.posterior_head.logvar_post_head
+        if independent is not None:
+            # Read off the head that owns the bound, not off the model: only some of these models
+            # keep logvar_clamp as an attribute, and the head is the thing that applies it.
+            lo, hi = self.posterior_head.logvar_clamp
+            if not lo < 0.0 < hi:
+                raise ValueError(
+                    f"posterior_logvar_mode='independent' seeds the head at unit scale, which "
+                    f"needs 0 inside logvar_clamp; got ({lo}, {hi})"
+                )
+            bias_value = math.log((0.0 - lo) / (hi - 0.0))
+            layers = (
+                list(independent)
+                if isinstance(independent, nn.ModuleList)
+                else [independent]
+            )
+            for layer in layers:
+                linear = cast(nn.Linear, layer)
+                nn.init.zeros_(linear.weight)
+                linear.bias.data.fill_(bias_value)
         self._zero_linear(self.residual_decoder.mean_head)
 
     @staticmethod
@@ -523,10 +709,16 @@ class SeqVaeLagAttn(nn.Module):
             collapses to $\alpha = 0$. That collapse happens at anchors inside the warm-up
             prefix, which never enter a forecast loss.
         """
+        # Concatenate at the declared widths, then gate: the surviving-channel indices are
+        # positional into the full stream, and the delay is applied before the adapters so the
+        # encoders never see a channel at a step it could not causally have known.
         target = torch.cat([y_st, y_ph], dim=-1)
+        if self.target_gate is not None:
+            target = self.target_gate(target)
+        source = u_stream if self.source_gate is None else self.source_gate(u_stream)
 
         h_y = self.target_encoder(self.target_adapter(target))
-        h_u = self.source_encoder(self.source_adapter(u_stream))
+        h_u = self.source_encoder(self.source_adapter(source))
 
         mu_prior, logvar_prior, decoder_state, raw_logvar_prior = self.prior_head(h_y)
 
@@ -618,9 +810,13 @@ class SeqVaeLagAttn(nn.Module):
             The encode dict: the prior and posterior parameters, the latent, both history
             states, the decoder conditioning state, and the attention.
         """
+        # Gated exactly as in `forward`; see the comment there.
         target = torch.cat([y_st, y_ph], dim=-1)
+        if self.target_gate is not None:
+            target = self.target_gate(target)
+        source = u_stream if self.source_gate is None else self.source_gate(u_stream)
         h_y = self.target_encoder(self.target_adapter(target))
-        h_u = self.source_encoder(self.source_adapter(u_stream))
+        h_u = self.source_encoder(self.source_adapter(source))
 
         mu_prior, logvar_prior, decoder_state, raw_logvar_prior = self.prior_head(h_y)
         m_lag, dead = self._combined_lag_mask(h_y.size(1), h_y.device, lag_band_mask)

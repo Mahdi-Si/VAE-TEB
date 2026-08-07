@@ -182,20 +182,32 @@ def loguru_messages():
     logger.remove(sink_id)
 
 
-def test_the_unguarded_causal_standing_is_stated_verbatim(trainer, loguru_messages):
-    """The unguarded default is what the shipped config runs, so this is the sentence that
-    appears in every production log. It says the inputs are two-sided and that the KL is
-    therefore not a transfer entropy -- the one claim a reader could otherwise take too far."""
+def test_the_shipped_causal_standing_is_the_resolved_budget(trainer, loguru_messages):
+    """The shipped config now runs guarded, so what every production log must state is what the
+    budget resolved TO -- the surviving channel counts and the worst delay. A run that logged the
+    unguarded sentence while training guarded would misdescribe its own inputs."""
     trainer.create_model()
 
-    assert trainer.resolved_budget is None
+    assert trainer.resolved_budget is not None
+    message = trainer.causal_standing_message()
+    assert message.startswith("causal reach budget 120 s:")
+    assert "c_y 78, c_u 29" in message
+    assert "max delay 30 steps" in message
+    # Substring, as the unguarded assertion below is: the logger prefixes what it emits, so an
+    # equality check would be testing the log format rather than the standing.
+    assert any("causal reach budget 120 s:" in logged for logged in loguru_messages)
+
+
+def test_the_unguarded_causal_standing_is_stated_verbatim(trainer):
+    """The other branch, still reachable through ``sweep_reach_null.yaml``. It says the inputs are
+    two-sided and that the KL is therefore not a transfer entropy -- the one claim a reader could
+    otherwise take too far, and the reason that arm has to keep saying it."""
+    trainer.resolved_budget = None
+
     assert trainer.causal_standing_message() == (
         "causal reach budget: none (all channels, no delay) -- input features at step t "
         "read up to 974 s into their own future, so the source-conditioned KL is not a "
         "transfer entropy."
-    )
-    assert any(
-        "read up to 974 s into their own future" in message for message in loguru_messages
     )
 
 

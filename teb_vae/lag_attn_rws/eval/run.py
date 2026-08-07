@@ -136,7 +136,7 @@ from teb_vae.lag_attn_rws.eval.report_seam import (  # noqa: E402,F401
     step_records,
     write_steps,
 )
-from teb_vae.lag_attn_rws.nets.lag_report import SECONDS_PER_STEP  # noqa: E402
+from teb_vae.lag_attn.nets.lag_report import SECONDS_PER_STEP  # noqa: E402
 from teb_vae.lag_attn_rws.nets.model import SeqVaeLagAttnRws  # noqa: E402
 from teb_vae.lag_attn_rws.task import SeqVaeLagAttnRwsTask  # noqa: E402
 from teb_vae.lag_attn_rws.trainer import RESOLVED_CONFIG_FILENAME  # noqa: E402

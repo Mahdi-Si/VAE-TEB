@@ -39,7 +39,7 @@ from typing import Any, Dict
 import pytest
 
 from teb_vae.lag_attn.config import load_config
-from teb_vae.lag_attn_rws.channel_reach import resolve_stream_budgets
+from teb_vae.lag_attn.channel_reach import resolve_stream_budgets
 from teb_vae.lag_attn_rws.collapse import (
     KL_COLLAPSE_MIN_ACTIVE_DIMS,
     KL_COLLAPSE_PATIENCE_EPOCHS,

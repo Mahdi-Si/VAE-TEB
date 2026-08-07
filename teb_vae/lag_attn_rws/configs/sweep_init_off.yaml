@@ -10,6 +10,17 @@
 # start, the configuration in which the prior-variance collapse was measured. Everything else is
 # inherited from default.yaml.
 #
+# One inherited interaction, which is now the largest single effect in this arm: default.yaml
+# ships posterior_logvar_mode: independent, whose q == p at init is recovered ONLY through
+# head_init_calibration. Turning that key off therefore also turns off the exact-zero-KL start --
+# measured on the tiny model at 54 nats/step mean, 142 max, against exactly 0 in the default. That
+# is a legitimate part of what the init bundle buys, so it stays in the arm, but it means this
+# arm's kld_raw and every per-lag KL attribution read off it START from a large unearned
+# divergence and are not comparable in absolute terms with the default's. Read them as
+# trajectories against this arm's own step 0, not against the default's. To measure the rest of
+# the bundle without that term, add `posterior_logvar_mode: residual` below, which starts at
+# exactly zero with or without the calibration.
+#
 #   TEB_RUN_STAMP="$(date '+%Y-%m-%d--[%H-%M]')" torchrun --nproc_per_node=7 \
 #       -m teb_vae.lag_attn_rws.trainer --config teb_vae/lag_attn_rws/configs/sweep_init_off.yaml
 base: default.yaml

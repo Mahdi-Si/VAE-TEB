@@ -173,12 +173,23 @@ def test_the_configured_comparison_metric_is_one_the_task_emits(
 
 def test_a_skipped_step_still_touches_every_parameter(task):
     """The skip path is a zero-gradient step, not an absent one: the forward already armed
-    DDP's reducer, which expects one gradient hook per parameter."""
+    DDP's reducer, which expects one gradient hook per parameter. The breaker returns
+    ``torch.where`` over the REAL loss -- backward still traverses the full graph, so every
+    hook fires -- and ``on_after_backward`` zeroes the NaN that a poisoned graph pushes
+    through the zero incoming gradient."""
     module = task()
 
-    _, returned = _feed(module, float("nan"), _shipped_breaker())
+    # A non-finite loss whose autograd graph spans every trainable parameter, as the real
+    # loss does; a leaf NaN would prove nothing about the hooks.
+    real = torch.stack([p.sum() for p in module.parameters() if p.requires_grad]).sum()
+    poisoned = real * float("nan")
+    metrics = {"total_loss": poisoned.detach(), "main_loss": poisoned.detach()}
+    returned = module._apply_spike_breaker(poisoned, metrics, _shipped_breaker())
+    assert _skipped(metrics)
+
     module.zero_grad(set_to_none=True)
     returned.backward()
+    module.on_after_backward()
 
     starved = [
         name
@@ -187,3 +198,9 @@ def test_a_skipped_step_still_touches_every_parameter(task):
     ]
     assert not starved, f"parameters left without a gradient hook on a skipped step: {starved}"
     assert math.isfinite(float(returned))
+    poisoned_grads = [
+        name
+        for name, parameter in module.named_parameters()
+        if parameter.grad is not None and torch.count_nonzero(parameter.grad) > 0
+    ]
+    assert not poisoned_grads, f"non-zero gradients survived a skipped step: {poisoned_grads}"

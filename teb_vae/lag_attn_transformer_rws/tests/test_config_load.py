@@ -117,6 +117,10 @@ TINY_DELTA_PATHS = frozenset(
         "general_config.cuda_devices",
         "general_config.epochs",
         "general_config.lr_warmup_steps",
+        # Pinned back to every-epoch in tiny: the shipped config plots every 5th epoch (a
+        # render-cost decision for multi-day runs), while the train-smoke tests count one
+        # figure set per epoch of a 1-3 epoch run.
+        "general_config.plot_frequency",
         "general_config.batch_size.train",
         "general_config.batch_size.test",
         "general_config.folders_config.out_dir_base",
@@ -361,9 +365,12 @@ def test_precision_is_float32(shipped):
     assert shipped["advanced_config"]["trainer"]["precision"] == "32-true"
 
 
-def test_compile_is_off_and_stays_off(shipped):
-    """The recurrence is gone, but the data-dependent boolean mask indexing behind
-    ``kld_active_frac`` and the masked source KL still break inductor."""
+def test_compile_ships_off(shipped):
+    """Off in the shipped config, but **live** rather than inert: with the recurrence gone this
+    driver honours the key (``compile_model_requested``), because only the net's forward is
+    compiled and the objective -- with the ``kld_active_frac`` indexing that genuinely defeats
+    inductor -- runs eager through ``orig_model``. It ships off because inductor may reassociate
+    float arithmetic and ``pred_gap`` is a $10^{-4}$-relative difference of two block NLLs."""
     assert shipped["advanced_config"]["trainer"]["compile"] is False
 
 
@@ -406,13 +413,15 @@ def test_the_breaker_is_pinned_by_value_rather_than_by_presence(shipped):
     assert breaker["max_consecutive_skips"] > 0  # the deadlock escape hatch
 
 
-def test_the_reach_budget_key_exists_and_ships_null(shipped):
-    """The config axis for the causal input delay: null = all channels, no delay -- the clean
-    architecture comparison. Presence is asserted (not merely non-error) because ``null`` and
-    *absent* look identical to a ``.get``."""
+def test_the_reach_budget_key_exists_and_ships_the_guard_on(shipped):
+    """The config axis for the causal input delay. It ships at $120$ s rather than ``null``:
+    the stored features are two-sided, so at ``null`` the target branch reads up to $974$ s of its
+    own future and $D_{\\mathrm{base}}$ is measured through that leak. Presence is asserted (not
+    merely non-error) because ``null`` and *absent* look identical to a ``.get``, and the value is
+    pinned because a silent revert to ``null`` would put the leak back with nothing failing."""
     vae = shipped["model_config"]["VAE_model"]
     assert "causal_reach_budget_s" in vae
-    assert vae["causal_reach_budget_s"] is None
+    assert vae["causal_reach_budget_s"] == 120
 
 
 def test_the_cross_channel_block_appears_in_no_config():

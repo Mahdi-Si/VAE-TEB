@@ -23,12 +23,12 @@ from typing import Any, Dict, List
 
 import torch
 
-from teb_vae.lag_attn_rws.channel_reach import resolve_stream_budgets
+from teb_vae.lag_attn.channel_reach import resolve_stream_budgets
 from teb_vae.lag_attn_rws.eval import lag_axis
 from teb_vae.lag_attn_rws.eval.analyses import attention as attention_analysis
 from teb_vae.lag_attn_rws.eval.analyses import lag_kl as lag_kl_analysis
 from teb_vae.lag_attn_rws.eval.metrics import Aggregate, lag_summary
-from teb_vae.lag_attn_rws.nets.lag_report import lag_compensated_seconds
+from teb_vae.lag_attn.nets.lag_report import lag_compensated_seconds
 from teb_vae.lag_attn_rws.nets.model import SeqVaeLagAttnRws
 from teb_vae.lag_attn_rws.plotting import _source_delay_steps
 

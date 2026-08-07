@@ -339,6 +339,26 @@ class SeqVaeLagAttnTask(LightningModelBase):
         """
         if batch_size < 2:
             return False  # a derangement needs at least two samples to swap
+        return self._perm_scheduled(batch_idx, stage)
+
+    def _perm_scheduled(self, batch_idx: int, stage: str) -> bool:
+        """The rank-invariant half of the control decision: stage and batch schedule.
+
+        Split out of :meth:`_should_run_perm` so the call site can skip the cross-rank
+        reduction whenever the schedule itself says no: every rank sees the same stage and
+        the same ``batch_idx`` sequence, so on an unscheduled step they all agree without a
+        collective -- while reducing anyway would cost an ``all_reduce`` plus a ``.item()``
+        GPU sync on most training steps to confirm a constant False. Only the batch-size
+        viability (the degenerate last batch of an uneven shard) differs per rank, and that
+        is what the reduction remains for on scheduled steps.
+
+        Args:
+            batch_idx: Index of the current batch.
+            stage: ``'train'``, ``'val'`` or ``'test'``.
+
+        Returns:
+            Whether the schedule selects this step, ignoring batch-size viability.
+        """
         if stage != "train":
             return True
         every = max(int(self.orig_model.perm_every_n_batches), 1)
@@ -506,7 +526,9 @@ class SeqVaeLagAttnTask(LightningModelBase):
         }
 
         lambda_perm = float(self.orig_model.lambda_perm)
-        do_perm = self._sync_perm_decision(
+        # The schedule short-circuit skips the collective in lockstep on unscheduled steps;
+        # see _perm_scheduled for why that is DDP-safe.
+        do_perm = self._perm_scheduled(batch_idx, stage) and self._sync_perm_decision(
             self._should_run_perm(batch_idx, y_st.size(0), stage), y_st.device
         )
         train_loss = main_loss

@@ -33,7 +33,7 @@ import os
 import sys
 import tempfile
 import time
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 #: Repository root: ``teb_vae/lag_attn/trainer.py`` -> up three.
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -50,6 +50,7 @@ import torch  # noqa: E402
 from lightning.pytorch.callbacks import Callback, ModelCheckpoint  # noqa: E402
 from loguru import logger  # noqa: E402
 
+from teb_vae.lag_attn.channel_reach import ChannelBudget, resolve_stream_budgets  # noqa: E402
 from teb_vae.lag_attn.config import resolve_config_file  # noqa: E402
 from teb_vae.lag_attn.nets.model import SeqVaeLagAttn  # noqa: E402
 from teb_vae.lag_attn.task import SeqVaeLagAttnTask  # noqa: E402
@@ -102,9 +103,23 @@ _TRACKED_METRICS = (
 #: that must never be forwarded (weight initialisation is not a config decision).
 _NON_CONSTRUCTOR_KEYS = frozenset({"horizon_refine", "encoder", "init_weights"})
 
+#: Constructor kwargs holding one entry per channel. Abbreviated in the startup log: at the
+#: shipped budget they are ~214 integers between them and would bury every other kwarg. The
+#: values themselves are not lost -- they are constructor arguments, so every checkpoint carries
+#: them in its ``model_kwargs`` and the adapters cannot be rebuilt without them.
+_CHANNEL_TUPLE_KEYS = frozenset(
+    {"target_keep_index", "target_delays", "source_keep_index", "source_delays"}
+)
+
 
 class LagAttnTrainer(GraphModelBase):
     """Experiment driver for :class:`~teb_vae.lag_attn.nets.model.SeqVaeLagAttn`."""
+
+    #: The causal guard this run resolved, populated by :meth:`_build_model_kwargs` and read by
+    #: :meth:`create_model` for the startup log. Declared here with a default so the standing
+    #: message is answerable before the kwargs have been built rather than raising. ``None`` means
+    #: no reach budget is configured.
+    resolved_budget: Optional[ChannelBudget] = None
 
     def _build_model_kwargs(self) -> Dict[str, Any]:
         """Translate the ``model_config.VAE_model`` block into constructor kwargs.
@@ -145,7 +160,41 @@ class LagAttnTrainer(GraphModelBase):
         if isinstance(logvar_clamp, (list, tuple)) and len(logvar_clamp) == 2:
             kwargs["logvar_clamp"] = (float(logvar_clamp[0]), float(logvar_clamp[1]))
 
+        # `causal_reach_budget_s` is translated, not forwarded: it names no constructor argument
+        # and resolves into the four concrete channel tuples the net takes. Resolved here rather
+        # than in `create_model` because the tuples must land in the model_kwargs written into
+        # every checkpoint -- the adapter widths depend on them, so a checkpoint that did not
+        # carry them could not be rebuilt. Held on the instance so `create_model` can state the
+        # run's causal standing without resolving a second time from a second read of the config.
+        self.resolved_budget = resolve_stream_budgets(vae_config)
+        if self.resolved_budget is not None:
+            kwargs.update(
+                target_keep_index=self.resolved_budget.target_keep_index,
+                target_delays=self.resolved_budget.target_delays,
+                source_keep_index=self.resolved_budget.source_keep_index,
+                source_delays=self.resolved_budget.source_delays,
+            )
         return kwargs
+
+    def causal_standing_message(self) -> str:
+        """Return the one-line statement of this run's causal standing, for the startup log.
+
+        A run's log should say what its history states are a function of, because that is the
+        premise every coupling number it produces rests on and it is otherwise recoverable only by
+        reading the architecture. For this model the answer is decided by the reach budget:
+        pruned-and-delayed channels if one is configured, and otherwise the unguarded statement
+        that the stored two-sided features let step $t$ read its own future.
+
+        Returns:
+            The message, already formatted for a single ``logger.info`` call.
+        """
+        if self.resolved_budget is not None:
+            return self.resolved_budget.summary()
+        return (
+            "causal reach budget: none (all channels, no delay) -- input features at step t "
+            "read up to 974 s into their own future, so the source-conditioned KL is not a "
+            "transfer entropy."
+        )
 
     def create_model(self) -> None:
         """Build the net, optionally load a checkpoint into it, and wrap it in its task.
@@ -159,8 +208,17 @@ class LagAttnTrainer(GraphModelBase):
         model_kwargs = self._build_model_kwargs()
         logger.info(
             "Building SeqVaeLagAttn with kwargs: "
-            + ", ".join(f"{key}={value}" for key, value in model_kwargs.items())
+            + ", ".join(
+                # The four channel tuples are hundreds of integers long; here they would bury
+                # every other kwarg. They are constructor arguments, so the checkpoint has them.
+                f"{key}=<{len(value)} channels>" if key in _CHANNEL_TUPLE_KEYS else f"{key}={value}"
+                for key, value in model_kwargs.items()
+            )
         )
+        # Before the constructor runs, so a launch that dies building the net has still said what
+        # it was about to build. Without this line a guarded run and an unguarded one are
+        # indistinguishable in the log except by parsing the abbreviated kwargs above.
+        logger.info(self.causal_standing_message())
         self.pytorch_model = SeqVaeLagAttn(**model_kwargs)
 
         if not self.pytorch_model.causal_norm:

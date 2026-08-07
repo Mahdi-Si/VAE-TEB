@@ -10,7 +10,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from teb_vae.lag_attn_rws.nets.lag_report import (
+from teb_vae.lag_attn.nets.lag_report import (
     MECHANICAL_SHIFT_SECONDS,
     SECONDS_PER_STEP,
     lag_compensated_seconds,

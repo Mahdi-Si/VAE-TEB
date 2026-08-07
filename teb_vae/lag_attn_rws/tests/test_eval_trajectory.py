@@ -26,7 +26,7 @@ import pandas as pd
 import pytest
 
 from teb_vae.lag_attn_rws.eval.analyses import trajectory as analysis
-from teb_vae.lag_attn_rws.nets.lag_report import SECONDS_PER_STEP
+from teb_vae.lag_attn.nets.lag_report import SECONDS_PER_STEP
 
 
 def _anchors(rows: List[Dict[str, Any]]) -> pd.DataFrame:

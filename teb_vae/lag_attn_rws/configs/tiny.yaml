@@ -21,6 +21,9 @@ general_config:
   tag: lag_attn_rws_tiny
   cuda_devices: [0]
   epochs: 1
+  # Pinned to 1: the base config plots every 5th epoch for multi-day runs, but a tiny
+  # smoke has 1-3 epochs and its train-smoke tests count one figure set per epoch.
+  plot_frequency: 1
   batch_size: {train: 2, test: 2}
   folders_config: {out_dir_base: output/teb_vae_rws_tiny}
 

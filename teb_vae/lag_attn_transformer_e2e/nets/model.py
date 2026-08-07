@@ -68,9 +68,10 @@ import torch
 from torch import nn
 
 from teb_vae.lag_attn.nets.attention import LagCrossAttention
-from teb_vae.lag_attn.nets.blocks import initialization
+from teb_vae.lag_attn.nets.blocks import initialization, validate_choice
 from teb_vae.lag_attn.nets.decoders import BaselineFutureDecoder, HorizonDecoderCore
-from teb_vae.lag_attn.nets.heads import PosteriorHead, TEAnalysisHead
+from teb_vae.lag_attn.nets.heads import POSTERIOR_LOGVAR_MODES, PosteriorHead, TEAnalysisHead
+from teb_vae.lag_attn.nets.lag_report import SECONDS_PER_STEP
 from teb_vae.lag_attn_rws.nets.geometry import TrimmedRawGeometry
 from teb_vae.lag_attn_rws.nets.heads import FullLatentPriorHead
 from teb_vae.lag_attn_rws.nets.losses import compute_loss as compute_raw_objective
@@ -83,6 +84,12 @@ from teb_vae.lag_attn_transformer_e2e.nets.frontend import (
 )
 from teb_vae.lag_attn_transformer_rws.nets.blocks import init_depthwise_
 from teb_vae.lag_attn_transformer_rws.nets.encoders import CausalConvTransformerEncoder
+
+
+#: How the base branch obtains its latent. ``'sample'`` draws $z^p$ from the prior under the
+#: shared $\epsilon$; ``'mean'`` decodes at $\mu^p$. A choice rather than a bool so the config
+#: says which of two named behaviours it wants, and so a third mode has somewhere to go.
+BASE_DECODE_CHOICES = ("sample", "mean")
 
 
 class SeqVaeLagAttnTrfE2E(nn.Module):
@@ -126,6 +133,7 @@ class SeqVaeLagAttnTrfE2E(nn.Module):
         head_init_calibration: bool = False,
         a_head_gain: float = 1.0,
         frontend_kernels: Sequence[int] = FRONTEND_KERNELS,
+        frontend_reach_budget_s: Optional[float] = None,
         encoder_conv_kernels: Sequence[int] = (5, 9),
         encoder_conv_dilations: Sequence[int] = (1, 2),
         encoder_num_heads: int = 4,
@@ -137,12 +145,15 @@ class SeqVaeLagAttnTrfE2E(nn.Module):
         mu_scale: float = 5.0,
         delta_mu_scale: float = 3.0,
         delta_logvar_scale: float = 2.0,
+        posterior_logvar_mode: str = "residual",
+        source_dropout: Optional[float] = None,
         use_entmax: bool = False,
         attention_grad_checkpoint: bool = False,
         lag_bias_init: str = "normal",
         alibi_slope_scale: float = 1.0,
         query_uses_logvar: bool = False,
         coverage_floor: float = 0.9,
+        base_decode: str = "sample",
         init_weights: bool = True,
     ) -> None:
         r"""Initialize the model.
@@ -197,6 +208,17 @@ class SeqVaeLagAttnTrfE2E(nn.Module):
                 sibling's blocks: no arm varies it, and the reach guard bounds any future choice.
                 Both streams are built at the same schedule -- a per-stream difference would be one
                 nobody has measured.
+            frontend_reach_budget_s: Cap on each front end's **backward** receptive field, in
+                seconds; ``None`` derives it from the warm-up as before. This is the one quantity
+                in this model that plays the role ``causal_reach_budget_s`` plays in the
+                feature-based siblings, and it is deliberately not that key: those models prune
+                channels whose *forward* reach reads past the anchor, and these front ends are
+                one-sided by construction, so there is no forward leak to bound. What there is
+                instead is a backward reach, and a front end that reached further back than the
+                warm-up would train its earliest anchors against the zero-padded transient at the
+                segment's start. Configured rather than derived because it is the knob a depth or
+                kernel arm has to move together with the stack, and a silently derived bound would
+                make such an arm fail at construction with a number nobody chose.
             encoder_conv_kernels: Kernel width per block of each encoder's causal depthwise
                 convolution stem. An empty schedule builds no stem, which is a stem-free
                 architecture arm.
@@ -217,12 +239,38 @@ class SeqVaeLagAttnTrfE2E(nn.Module):
             mu_scale: Saturation magnitude of the tanh-bounded prior mean.
             delta_mu_scale: Saturation magnitude of the tanh-bounded posterior mean delta.
             delta_logvar_scale: Saturation magnitude of the posterior log-variance delta.
+            source_dropout: Dropout rate for the SOURCE pathway alone -- its input adapter or
+                front end, its encoder, and the attended source summary inside the posterior
+                fusion. ``None`` reproduces the pre-key model exactly, which is *not* one number:
+                the adapter and encoder always ran at ``dropout`` and keep doing so, while the
+                posterior fusion's dropout on the attended source summary is a site this key
+                introduced and so resolves to $0$. Any explicit value applies to all three.
+                Deliberately not applied to the lag attention (its probabilities must stay
+                dropout-free or the per-lag KL attribution stops being exact) nor to the
+                shared decoder (one module invoked twice would draw two masks).
+            posterior_logvar_mode: ``'residual'`` builds the posterior log-variance as a
+                bounded delta on the prior's pre-bound raw value; ``'independent'`` gives it
+                its own head. ``'independent'`` is shipped because the residual form routes
+                the full branch's pressure to sharpen $\sigma^q$ onto the PRIOR's tensor, so
+                $D_1$ drags the prior's scale down alongside its own -- the second of the two
+                paths driving the prior-variance collapse, and the one that survives turning
+                off the base branch's noise. See :class:`PosteriorHead` for what it costs.
             use_entmax: Use ``entmax15`` lag attention, which can assign a lag exactly zero weight.
             attention_grad_checkpoint: Recompute the lag attention in the backward pass.
             lag_bias_init: ``'normal'`` or ``'alibi_decay'``.
             alibi_slope_scale: Multiplier on the ``'alibi_decay'`` slopes.
             query_uses_logvar: Whether the lag-attention query reads the prior log-variance as well
                 as its mean. Both forms are target-only, so source purity is untouched.
+            base_decode: How the base branch's latent is obtained -- ``'sample'`` draws
+                $z^p = \mu^p + \sigma^p \epsilon$ under the shared $\epsilon$, ``'mean'``
+                decodes at $z^p = \mu^p$. ``'mean'`` is shipped, and it is the only change
+                that removes a *direct* downward pressure on the prior's scale: $D_0$ decodes
+                a **sample** from the prior, sampling noise can only degrade a forecast, so
+                its gradient on $\ell^p$ points down without limit and nothing in the
+                objective opposes it from below. Under ``'mean'`` the prior's scale is left
+                to the KL, which pulls it *up* to cover $q$, and to the scale anchor. The
+                posterior branch stays stochastic either way, so the latent the coupling is
+                read from is still sampled.
             coverage_floor: Minimum valid fraction of an anchor's forecast window for the anchor to
                 enter the loss at all.
             init_weights: Apply the standard initialisation, and the depthwise correction it needs,
@@ -285,8 +333,26 @@ class SeqVaeLagAttnTrfE2E(nn.Module):
         self.mu_scale = float(mu_scale)
         self.delta_mu_scale = float(delta_mu_scale)
         self.delta_logvar_scale = float(delta_logvar_scale)
+        self.posterior_logvar_mode = validate_choice(
+            posterior_logvar_mode, POSTERIOR_LOGVAR_MODES, "posterior_logvar_mode"
+        )
+        # Two resolutions of the one key, because the source-side sites did not all start from
+        # the same place and "unchanged" therefore means different numbers at each.
+        #
+        # The PATHWAY sites -- input adapter/front end and source encoder -- already existed and
+        # always ran at the global `dropout`, so an unset key must resolve to `dropout` there.
+        # The posterior fusion's dropout on the attended source summary is a NEW site introduced
+        # with this key; before it, `a` entered the fusion with no dropout at all, so an unset key
+        # must resolve to 0.0 there. Resolving both to `dropout` would add p=dropout inside the
+        # posterior of every run that leaves the key unset -- invisible in eval mode, and enough
+        # to make the source_dropout sweep arms measure against the wrong baseline.
+        #
+        # Setting the key moves both together, which is the intent: one source-pathway rate.
+        self.source_dropout = float(dropout if source_dropout is None else source_dropout)
+        self.posterior_source_dropout = 0.0 if source_dropout is None else float(source_dropout)
         self.logvar_clamp = (float(logvar_clamp[0]), float(logvar_clamp[1]))
         self.coverage_floor = float(coverage_floor)
+        self.base_decode = validate_choice(base_decode, BASE_DECODE_CHOICES, "base_decode")
         # Init-policy bundle (zero-parameter, applied in the post-init block below). Each stores its
         # configured value here and re-initialises after the generic init; the recorded defaults are
         # exact no-ops.
@@ -303,10 +369,12 @@ class SeqVaeLagAttnTrfE2E(nn.Module):
         )
 
         # Two independently parameterised front ends at identical settings, in place of the two
-        # stored-feature adapters. The reach budget is derived here rather than configured: it is
-        # warmup_period expressed in raw samples, and an anchor outside the warm-up that reached
-        # further would be trained against the zero-padded transient at the segment's start.
-        self.frontend_reach_budget = self.warmup_period * self.raw_per_step
+        # stored-feature adapters. The budget bounds how far BACK a front end may see: an anchor
+        # outside the warm-up that reached further would be trained against the zero-padded
+        # transient at the segment's start. `None` derives it from the warm-up, which is what the
+        # model did before the key existed; a configured value is converted from seconds at the
+        # raw sampling rate and may only tighten that ceiling, never raise it.
+        self.frontend_reach_budget = self._resolve_frontend_budget(frontend_reach_budget_s)
         self.target_frontend = CausalRawFrontend(
             d_model=self.d_model,
             raw_per_step=self.raw_per_step,
@@ -319,7 +387,7 @@ class SeqVaeLagAttnTrfE2E(nn.Module):
             raw_per_step=self.raw_per_step,
             reach_budget=self.frontend_reach_budget,
             kernels=frontend_kernels,
-            dropout=dropout,
+            dropout=self.source_dropout,
         )
 
         # Two independent encoders, differing only in depth and in how much context the attention
@@ -345,7 +413,7 @@ class SeqVaeLagAttnTrfE2E(nn.Module):
             num_heads=encoder_num_heads,
             d_ff=encoder_d_ff,
             attention_window=source_attention_window,
-            dropout=dropout,
+            dropout=self.source_dropout,
         )
 
         self.prior_head = FullLatentPriorHead(
@@ -388,6 +456,10 @@ class SeqVaeLagAttnTrfE2E(nn.Module):
             num_heads=num_heads,
             d_head=d_head,
             delta_logvar_scale=self.delta_logvar_scale,
+            posterior_logvar_mode=self.posterior_logvar_mode,
+            # The posterior-fusion resolution, not the pathway one: see __init__ for why an
+            # unset key means 0.0 here and `dropout` at the pathway sites.
+            source_dropout=self.posterior_source_dropout,
         )
         self.te_analysis = TEAnalysisHead()
 
@@ -477,6 +549,49 @@ class SeqVaeLagAttnTrfE2E(nn.Module):
         if self.a_head_gain != 1.0:
             self._set_a_head_gain()
 
+    def _resolve_frontend_budget(self, budget_s: Optional[float]) -> int:
+        r"""Resolve the front ends' backward reach ceiling, in raw samples.
+
+        The warm-up is the hard ceiling either way: an anchor at step $w$ reaches back
+        $w \cdot R$ raw samples before the segment starts, and everything before that is
+        zero padding rather than signal. A configured budget may tighten that ceiling and may
+        not raise it, so the guard is a real bound rather than a way to opt out of one.
+
+        Args:
+            budget_s: The configured backward reach in seconds, or ``None`` to derive the
+                ceiling from ``warmup_period``.
+
+        Returns:
+            The budget in raw samples.
+
+        Raises:
+            ValueError: If ``budget_s`` is not positive, or exceeds the warm-up ceiling -- the
+                second names both numbers, because the fix is to raise ``warmup_period`` and a
+                message that named only the budget would send the reader to the wrong key.
+        """
+        ceiling = self.warmup_period * self.raw_per_step
+        if budget_s is None:
+            return ceiling
+
+        budget = float(budget_s)
+        if budget <= 0.0:
+            raise ValueError(
+                f"frontend_reach_budget_s must be > 0, got {budget_s}; use null to derive the "
+                f"ceiling from warmup_period"
+            )
+        # Seconds -> raw samples through the decimated grid: R samples per step, SECONDS_PER_STEP
+        # seconds per step. Floored, so a budget always buys at most what it asked for.
+        samples = int(budget * self.raw_per_step / SECONDS_PER_STEP)
+        if samples > ceiling:
+            raise ValueError(
+                f"frontend_reach_budget_s={budget_s} is {samples} raw samples, past the "
+                f"{ceiling} the warm-up allows (warmup_period={self.warmup_period} steps x "
+                f"raw_per_step={self.raw_per_step}). A front end reaching further back than the "
+                f"warm-up trains its earliest anchors against the segment's zero-padded "
+                f"transient; raise warmup_period to admit this budget."
+            )
+        return samples
+
     @property
     def source_delay_steps(self) -> int:
         r"""The causal input delay $\delta$ the source stream is read with, in decimated steps.
@@ -543,9 +658,41 @@ class SeqVaeLagAttnTrfE2E(nn.Module):
         parameters that carry what was learned.
         """
         for module in (self.posterior_head.delta_mu_head, self.posterior_head.delta_logvar_head):
+            # delta_logvar_head is None under posterior_logvar_mode='independent', where the
+            # posterior's log-variance is not a delta on anything and is handled below.
+            if module is None:
+                continue
             layers = list(module) if isinstance(module, nn.ModuleList) else [module]
             for layer in layers:
                 self._zero_linear(cast(nn.Linear, layer))
+
+        # The independent log-variance head has no zero that means "agree with the prior": its
+        # output IS the posterior's log-variance, so zeroing it would assert the midpoint of the
+        # clamp. Seeded instead at the pre-image of log-variance 0 -- zero weight, bias at
+        # log((0 - lo) / (hi - 0)) -- so the head starts input-independent at sigma_q = 1. That
+        # is exactly where head_init_calibration puts the PRIOR, so under the shipped flags the
+        # two agree and the KL is still exactly zero at init. Without that flag the prior starts
+        # elsewhere and the init KL is small but nonzero, which is the accepted cost of the mode.
+        independent = self.posterior_head.logvar_post_head
+        if independent is not None:
+            # Read off the head that owns the bound, not off the model: only some of these models
+            # keep logvar_clamp as an attribute, and the head is the thing that applies it.
+            lo, hi = self.posterior_head.logvar_clamp
+            if not lo < 0.0 < hi:
+                raise ValueError(
+                    f"posterior_logvar_mode='independent' seeds the head at unit scale, which "
+                    f"needs 0 inside logvar_clamp; got ({lo}, {hi})"
+                )
+            bias_value = math.log((0.0 - lo) / (hi - 0.0))
+            layers = (
+                list(independent)
+                if isinstance(independent, nn.ModuleList)
+                else [independent]
+            )
+            for layer in layers:
+                linear = cast(nn.Linear, layer)
+                nn.init.zeros_(linear.weight)
+                linear.bias.data.fill_(bias_value)
 
     def _zero_init_film_generators(self) -> None:
         r"""Zero every FiLM generator in the horizon core, so per-block FiLM starts as an identity.
@@ -664,11 +811,23 @@ class SeqVaeLagAttnTrfE2E(nn.Module):
         mu_post: torch.Tensor,
         logvar_post: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        r"""Draw one $\epsilon$ and sample both latents with it.
+        r"""Draw one $\epsilon$ and produce both latents from it.
 
-        Common random numbers: $z^p = \mu^p + \sigma^p \epsilon$ and
-        $z^q = \mu^q + \sigma^q \epsilon$ share the draw, so $p_t = q_t$ implies $z^p_t = z^q_t$
-        sample by sample and the base-minus-full readout carries no independent sampling noise.
+        Common random numbers: the posterior is always $z^q = \mu^q + \sigma^q \epsilon$,
+        and under ``base_decode='sample'`` the prior sample $z^p = \mu^p + \sigma^p \epsilon$
+        comes from the *same* draw -- so $p_t = q_t$ implies $z^p_t = z^q_t$ sample by sample
+        and the base-minus-full readout carries no independent sampling noise.
+
+        Under ``base_decode='mean'`` the base branch is decoded at $z^p = \mu^p$ instead,
+        and the identity above becomes an approximation: at initialisation the two forecasts
+        differ by the posterior's own noise rather than being bitwise equal. That is
+        deliberate. The draw is still taken -- it still serves the posterior, and taking it
+        unconditionally keeps a run's RNG consumption identical across the two modes, so an
+        arm that flips this key differs by the mode alone, not by every subsequent random
+        number.
+
+        The branch reads a constructor-fixed string, never a tensor, so it is identical on
+        every rank at every step and cannot drop a parameter from the graph.
 
         Args:
             mu_prior: Prior mean ``(B, T, d_z)``.
@@ -680,8 +839,13 @@ class SeqVaeLagAttnTrfE2E(nn.Module):
             ``(z_prior, z_post)``, both ``(B, T, d_z)``.
         """
         epsilon = torch.randn_like(mu_prior)
-        z_prior = mu_prior + epsilon * torch.exp(0.5 * logvar_prior)
         z_post = mu_post + epsilon * torch.exp(0.5 * logvar_post)
+        if self.base_decode == "mean":
+            # logvar_prior is untouched here, and still reaches the graph through the KL and the
+            # prior scale rate -- so the prior's log-variance head keeps receiving gradient, from
+            # the two terms that want it WIDE rather than from the one that wanted it narrow.
+            return mu_prior, z_post
+        z_prior = mu_prior + epsilon * torch.exp(0.5 * logvar_prior)
         return z_prior, z_post
 
     def forward(
@@ -712,7 +876,13 @@ class SeqVaeLagAttnTrfE2E(nn.Module):
             * ``mu_prior``, ``logvar_prior``, ``raw_logvar_prior`` -- the target-only prior, each
               ``(B, T, d_z)``.
             * ``mu_post``, ``logvar_post`` -- the source-conditioned posterior, ``(B, T, d_z)``.
-            * ``z_prior``, ``z_post`` -- paired samples under one $\epsilon$, ``(B, T, d_z)``.
+            * ``z_prior``, ``z_post`` -- the two latents the decoder is invoked on,
+              ``(B, T, d_z)``. Under ``base_decode='sample'`` they are paired samples under
+              one $\epsilon$. Under the shipped ``'mean'`` only ``z_post`` is sampled and
+              ``z_prior`` **is** the ``mu_prior`` tensor -- the same object, not a copy -- so
+              a caller computing a prior-sample statistic off it gets the mean instead, and
+              an in-place write to it corrupts ``mu_prior`` for every other consumer of this
+              dict. Read ``self.base_decode`` before treating it as a draw.
             * ``target_state``, ``source_state`` -- encoder history states, ``(B, T, d_model)``.
             * ``attended_source_heads`` -- per-head attended summaries
               ``(B, T, num_heads, d_head)``.

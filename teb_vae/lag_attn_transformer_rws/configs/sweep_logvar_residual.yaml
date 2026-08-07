@@ -1,0 +1,27 @@
+# Ablate-one arm: posterior_logvar_mode = residual, restoring the shared raw log-variance.
+#
+# The shipped default is 'independent'. This arm restores the residual parameterisation, and it is
+# the control for the second of the two changes aimed at the prior-variance collapse.
+#
+# What it isolates. Under 'residual', logvar_post = smooth_bound(raw_logvar_prior + delta), so the
+# FULL branch's pressure to sharpen sigma_q lands on the prior's own tensor and D_1 drags the
+# prior's log-variance down alongside its own. Measured on the tiny model, the full branch's
+# reconstruction alone puts a gradient of ~8.7e-2 on the prior log-variance head under 'residual'
+# and exactly 0 under 'independent'. This is the path that SURVIVES base_decode: mean, which is
+# why the two arms are separate rather than one combined revert.
+#
+# What to read. The same columns as sweep_base_sample: `logvar_prior_floor_frac`,
+# `mean_logvar_prior`, `kld_active_frac`. Running both arms and the default separates the two
+# mechanisms; running neither leaves them confounded.
+#
+# Costs. Parameter-neutral (the two modes build the same-shaped head). It restores the structural
+# zero-KL start, which the default recovers instead through head_init_calibration.
+#
+#   TEB_RUN_STAMP="$(date '+%Y-%m-%d--[%H-%M]')" torchrun --nproc_per_node=7 \
+#       -m teb_vae.lag_attn_transformer_rws.trainer \
+#       --config teb_vae/lag_attn_transformer_rws/configs/sweep_logvar_residual.yaml
+base: default.yaml
+
+model_config:
+  VAE_model:
+    posterior_logvar_mode: residual

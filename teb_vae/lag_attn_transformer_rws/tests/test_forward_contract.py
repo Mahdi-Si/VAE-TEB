@@ -19,7 +19,7 @@ import inspect
 import pytest
 import torch
 
-from teb_vae.lag_attn_rws.channel_reach import resolve_stream_budgets
+from teb_vae.lag_attn.channel_reach import resolve_stream_budgets
 from teb_vae.lag_attn_rws.trainer import _CHANNEL_TUPLE_KEYS, _NON_CONSTRUCTOR_KEYS
 from teb_vae.lag_attn_transformer_rws.nets.model import SeqVaeLagAttnTrfRws
 from teb_vae.lag_attn_transformer_rws.tests.conftest import BATCH, SEQ_LEN

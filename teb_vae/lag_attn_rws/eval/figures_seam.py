@@ -40,7 +40,7 @@ from __future__ import annotations
 from typing import Dict, List, Optional, Sequence
 
 from teb_vae.lag_attn_rws.eval._reuse import figures, labels
-from teb_vae.lag_attn_rws.nets.lag_report import COMPENSATED_LAG_AXIS_LABEL
+from teb_vae.lag_attn.nets.lag_report import COMPENSATED_LAG_AXIS_LABEL
 
 #: Drawn on an axes that had no finite data, in place of an empty frame that reads as a bug.
 EMPTY_NOTE = figures.EMPTY_NOTE

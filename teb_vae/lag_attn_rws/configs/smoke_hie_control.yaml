@@ -16,6 +16,19 @@
 # and diverges on the decoder half, which is why the base-forecast question is answered against
 # the calibrated bp0 control instead and RESULTS.md says so.
 #
+# What this arm no longer reproduces. It inherits default.yaml through smoke_hie.yaml, and that
+# file now ships three keys the reported run did not have: base_decode: mean,
+# posterior_logvar_mode: independent and causal_reach_budget_s: 120. So this is the unanchored
+# control FOR THE CURRENT BOTTLENECK, not a rerun of the reported configuration -- the anchor
+# comparison against smoke_hie.yaml is still clean, because both arms inherit all three equally,
+# but no absolute number here is comparable with the reported run's. Two consequences worth
+# stating: `head_init_calibration: false` now also costs the exact-zero-KL start, because
+# 'independent' recovers it only through that key (54 nats/step on the tiny model, against 0 in
+# the default); and the collapse this arm was written to start inside is what 'mean' and
+# 'independent' were added to prevent, so a run that does not collapse is the fix working rather
+# than the control failing. To rerun the reported configuration instead, pin `base_decode: sample`,
+# `posterior_logvar_mode: residual` and `causal_reach_budget_s: null` in the block below.
+#
 #   python -m teb_vae.lag_attn_rws.trainer --config teb_vae/lag_attn_rws/configs/smoke_hie_control.yaml
 base: smoke_hie.yaml
 

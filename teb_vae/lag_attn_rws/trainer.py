@@ -32,7 +32,7 @@ import os
 import sys
 import tempfile
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 #: Repository root: ``teb_vae/lag_attn_rws/trainer.py`` -> up three.
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -48,10 +48,11 @@ if not __package__ and _REPO_ROOT not in sys.path:
 import torch  # noqa: E402
 import yaml  # noqa: E402
 from lightning.pytorch.callbacks import Callback, ModelCheckpoint  # noqa: E402
+from lightning.pytorch.strategies import DDPStrategy  # noqa: E402
 from loguru import logger  # noqa: E402
 
 from teb_vae.lag_attn.config import resolve_config_file  # noqa: E402
-from teb_vae.lag_attn_rws.channel_reach import (  # noqa: E402
+from teb_vae.lag_attn.channel_reach import (  # noqa: E402
     ChannelBudget,
     resolve_stream_budgets,
 )
@@ -320,6 +321,7 @@ class LagAttnRwsTrainer(GraphModelBase):
             lambda_base=vae_config.get("lambda_base", 1.0),
             likelihood=vae_config.get("likelihood", "gaussian_nll"),
             free_bits=vae_config.get("free_bits", 0.0),
+            compile_model=self.compile_model_requested(),
         )
         # Re-forces the config's values onto hparams, so a checkpoint-restored run follows the
         # config it was launched with rather than the one it was originally trained under.
@@ -327,15 +329,80 @@ class LagAttnRwsTrainer(GraphModelBase):
             {"lr": self.lr, "lr_milestones": self.lr_milestones}, self.pl_model
         )
 
-    def select_ddp_strategy(self, num_devices: int, config: Dict[str, Any], model=None) -> str:
-        r"""Select the Lightning ``strategy`` string from the configured parameter usage.
+    def compile_model_requested(self) -> bool:
+        """Whether to wrap this architecture's net in ``torch.compile``.
 
-        Plain ``'ddp'`` implies ``find_unused_parameters=False``, under which the reducer
-        expects **every** parameter to be marked ready in every backward. Exactly one group of
-        parameters can starve here, and it is decided by config: the decoder log-variance heads
+        Always ``False`` here, and ``advanced_config.trainer.compile`` is deliberately **not**
+        read: this net's LSTM encoders defeat TorchInductor unconditionally, so honouring the
+        key would let a config turn on a path that cannot work. The key stays in the schema
+        because the framework validates it and because an architecture whose net compiles can
+        override this method to honour it -- which is what makes the refusal a property of the
+        net rather than of the objective, the task or the training step, none of which change.
+
+        Returns:
+            ``False``.
+        """
+        return False
+
+    def ddp_kwargs(self, config: Dict[str, Any]) -> Dict[str, Any]:
+        r"""The ``DistributedDataParallel`` settings every raw-signal architecture here runs under.
+
+        Split out from :meth:`select_ddp_strategy` so the *decision* is assertable without
+        reaching into Lightning's ``DDPStrategy._ddp_kwargs``, which is private and whose name is
+        not a contract.
+
+        ``find_unused_parameters`` is the only correctness entry and the only one that reads
+        config: under ``False`` the reducer expects **every** parameter to be marked ready in
+        every backward, and exactly one group can starve -- the decoder log-variance heads, which
         are consumed only under ``likelihood: gaussian_nll``. (The attention output projection
-        ``W_o`` -- the sibling's other starvation source -- is frozen unconditionally by this
-        net's constructor, so it is never in the reducer's expectation set at all.)
+        ``W_o``, the other starvation source in this family, is frozen unconditionally by the
+        net's constructor, so it is never in the expectation set at all.)
+
+        The other two are performance settings and are constants:
+
+        * ``broadcast_buffers=False``. DDP re-broadcasts every buffer from rank $0$ on **each
+          forward**, which here is $1.5$ MiB -- the eight fixed anti-alias filter banks, fourteen
+          rotary tables, three causal attention masks and the raw-target index grid. Every one is
+          a deterministic function of the config, built identically in each rank's constructor,
+          so the broadcast restores values that were never going to differ. Safe *because* there
+          is no ``BatchNorm`` anywhere in this family -- a running statistic is the one kind of
+          buffer that genuinely diverges per rank, and ``sync_batchnorm`` is off for the same
+          reason. A model that gained one would need this back.
+        * ``gradient_as_bucket_view=True``. Points ``param.grad`` at the reduction bucket instead
+          of a separate allocation, saving one model-sized gradient copy per step.
+
+        **``static_graph`` is deliberately absent**, and that is a correctness call rather than an
+        omission. It promises DDP that the autograd graph is identical on every iteration, and the
+        loss-spike circuit breaker breaks exactly that promise: on a skipped batch
+        ``LightningModelBase._apply_spike_breaker`` substitutes a loss summed over every trainable
+        parameter times zero, which is a structurally different backward from the one the first
+        iteration recorded. The breaker is enabled in the shipped configs, so the promise would be
+        false on precisely the batches that already went wrong.
+
+        Args:
+            config: The resolved config.
+
+        Returns:
+            Keyword arguments for ``DDPStrategy``.
+        """
+        vae_config = (config.get("model_config", {}) or {}).get("VAE_model", {}) or {}
+        gaussian = str(vae_config.get("likelihood", "gaussian_nll")) == "gaussian_nll"
+        return {
+            "find_unused_parameters": not gaussian,
+            "broadcast_buffers": False,
+            "gradient_as_bucket_view": True,
+        }
+
+    def select_ddp_strategy(
+        self, num_devices: int, config: Dict[str, Any], model=None
+    ) -> Union[str, DDPStrategy]:
+        r"""Select the Lightning ``strategy`` from the configured parameter usage.
+
+        A ``DDPStrategy`` instance rather than one of the ``'ddp'`` /
+        ``'ddp_find_unused_parameters_true'`` shorthand strings, because those strings can express
+        ``find_unused_parameters`` and nothing else, and two of the three settings this family
+        wants (:meth:`ddp_kwargs`) have no shorthand. The instance is equivalent to the string it
+        replaces on the one axis the string could carry.
 
         Everything is read from ``config`` and the ``model`` argument goes unused, which is
         deliberate rather than lazy: the framework passes the *Lightning module* here, not the
@@ -348,14 +415,12 @@ class LagAttnRwsTrainer(GraphModelBase):
             model: The Lightning module, unused. See above.
 
         Returns:
-            The Lightning ``strategy`` string.
+            ``'auto'`` on a single device -- there is no process group to configure -- otherwise a
+            configured ``DDPStrategy``.
         """
         if num_devices <= 1:
             return "auto"
-        vae_config = (config.get("model_config", {}) or {}).get("VAE_model", {}) or {}
-        if str(vae_config.get("likelihood", "gaussian_nll")) == "gaussian_nll":
-            return "ddp"
-        return "ddp_find_unused_parameters_true"
+        return DDPStrategy(**self.ddp_kwargs(config))
 
     def train_model(self, train_loader, validation_loader):
         """Build this model's callbacks and run the fit.

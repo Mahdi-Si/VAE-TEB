@@ -36,7 +36,7 @@ import tempfile
 import yaml
 
 from teb_vae.lag_attn.config import load_config
-from teb_vae.lag_attn_rws.channel_reach import resolve_stream_budgets
+from teb_vae.lag_attn.channel_reach import resolve_stream_budgets
 from teb_vae.lag_attn_transformer_rws.nets.model import SeqVaeLagAttnTrfRws
 from teb_vae.lag_attn_transformer_rws.trainer import LagAttnTrfRwsTrainer
 
@@ -51,6 +51,9 @@ _TARGET_BLOCKS = f"{_VAE}.target_attention_blocks"
 _SOURCE_BLOCKS = f"{_VAE}.source_attention_blocks"
 _SOURCE_WINDOW = f"{_VAE}.source_attention_window"
 _REACH = f"{_VAE}.causal_reach_budget_s"
+_BASE_DECODE = f"{_VAE}.base_decode"
+_LOGVAR_MODE = f"{_VAE}.posterior_logvar_mode"
+_SOURCE_DROPOUT = f"{_VAE}.source_dropout"
 _BETA_PRIOR = f"{_VAE}.beta_prior"
 
 #: Every arm, by file name, with the complete set of leaves it is allowed to move against
@@ -71,7 +74,15 @@ DECLARED_DELTAS: Dict[str, Dict[str, Any]] = {
     "sweep_window_32.yaml": {_SOURCE_WINDOW: 32},
     "sweep_window_64.yaml": {_SOURCE_WINDOW: 64},
     "sweep_window_full.yaml": {_SOURCE_WINDOW: None},
-    "sweep_reach_120.yaml": {_REACH: 120},
+    "sweep_reach_null.yaml": {_REACH: None},
+    # The three ablate-one arms for the bottleneck bundle. Each reverts exactly one shipped key,
+    # so the default and the arm differ in one mechanism and the attribution is not a matter of
+    # reading two changes at once. The two source-dropout arms are not reverts: the default ships
+    # the mechanism at the global rate, and these measure what raising it buys.
+    "sweep_base_sample.yaml": {_BASE_DECODE: "sample"},
+    "sweep_logvar_residual.yaml": {_LOGVAR_MODE: "residual"},
+    "sweep_source_dropout_0p2.yaml": {_SOURCE_DROPOUT: 0.2},
+    "sweep_source_dropout_0p3.yaml": {_SOURCE_DROPOUT: 0.3},
     # Phase 3: depth and width.
     "sweep_target_blocks_3.yaml": {_TARGET_BLOCKS: 3},
     "sweep_target_blocks_5.yaml": {_TARGET_BLOCKS: 5},
@@ -380,11 +391,12 @@ def test_the_window_sweep_brackets_the_lag_search_range(built):
     assert built["sweep_window_64.yaml"].source_encoder.receptive_field > lag_search_steps
 
 
-def test_the_reach_arm_resolves_at_the_costed_channel_counts():
+def test_the_shipped_reach_budget_resolves_at_the_costed_channel_counts():
     """The resolution is the go/no-go: it raises on a budget that keeps no channel or whose worst
-    delay outruns the warm-up. The counts are pinned on top so the arm's channel accounting is
-    fixed before any GPU time is spent."""
-    vae = _resolved("sweep_reach_120.yaml")["model_config"]["VAE_model"]
+    delay outruns the warm-up. Read off ``default.yaml`` because the guard is now the shipped
+    configuration, not an arm. The counts are pinned on top so the channel accounting is fixed
+    before any GPU time is spent."""
+    vae = _resolved("default.yaml")["model_config"]["VAE_model"]
 
     budget = resolve_stream_budgets(vae)
 
@@ -396,19 +408,19 @@ def test_the_reach_arms_worst_delay_fits_inside_the_warmup():
     inside the steps the loss already discards. The comparison is strictly greater-than, and this
     budget's worst delay is *exactly* the shipped warm-up -- the deepest admissible one, and
     therefore the hardest case for the availability representation."""
-    vae = _resolved("sweep_reach_120.yaml")["model_config"]["VAE_model"]
+    vae = _resolved("default.yaml")["model_config"]["VAE_model"]
 
     budget = resolve_stream_budgets(vae)
 
     assert budget.max_delay == vae["warmup_period"] == 30
 
 
-def test_the_reach_arm_constructs_both_availability_parameters(built):
+def test_the_shipped_config_constructs_both_availability_parameters(built):
     """$W_m$ and $e_{\\mathrm{start}}$ are what make a zero-filled prefix a representation rather
     than a numerical accident, and they exist only under a finite budget. Both directions: present
-    here, absent on the unguarded baseline."""
-    guarded = built["sweep_reach_120.yaml"]
-    unguarded = built["default.yaml"]
+    on the shipped guarded config, absent on the ablate-one arm that turns the guard off."""
+    guarded = built["default.yaml"]
+    unguarded = built["sweep_reach_null.yaml"]
 
     for adapter in (guarded.target_adapter, guarded.source_adapter):
         assert adapter.mask_proj is not None
@@ -418,14 +430,19 @@ def test_the_reach_arm_constructs_both_availability_parameters(built):
         assert adapter.start_embed is None
 
 
-def test_the_reach_arm_narrows_the_adapters_to_the_surviving_channels(built):
+def test_the_shipped_config_narrows_the_adapters_to_the_surviving_channels(built):
     """The budget is real only if it reached the widths. A budget that resolved and was then
     dropped by the signature sweep would leave the adapters at the declared $109$ and $58$."""
-    model = built["sweep_reach_120.yaml"]
+    model = built["default.yaml"]
 
     widths = (model.target_adapter.in_dim, model.source_adapter.in_dim)
     assert widths == REACH_120_CHANNELS
     assert model.source_delay_steps > 0
+
+    # The ablate-one arm is the other direction: no gate, no delay, declared widths.
+    unguarded = built["sweep_reach_null.yaml"]
+    assert (unguarded.target_adapter.in_dim, unguarded.source_adapter.in_dim) == (109, 58)
+    assert unguarded.source_delay_steps == 0
 
 
 # --------------------------------------------------------------------------------------

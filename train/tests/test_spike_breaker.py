@@ -52,10 +52,36 @@ def test_breaker_off_returns_raw_loss(monkeypatch):
 
 
 def test_nonfinite_train_batch_is_zero_gradient_step():
+    # The full skip contract, end to end: the returned loss is finite, backward through the
+    # REAL (poisoned) graph still fires a gradient hook for every parameter DDP's reducer
+    # armed, and the on_after_backward guard zeroes the NaN the poisoned graph produced.
     model = _model()
-    metrics, out = _feed(model, float("nan"), _cfg())
+    x, y = torch.randn(2, 4), torch.randn(2, 4)
+    real_loss = torch.nn.functional.mse_loss(model.model(x), y)
+    poisoned = real_loss * float("nan")  # NaN loss whose graph still reaches every parameter
+    metrics = {"total_loss": poisoned.detach()}
+    out = model._apply_spike_breaker(poisoned, metrics, _cfg())
     assert metrics["spike_skipped"].item() == 1.0
     assert torch.isfinite(out).item()  # the returned loss is finite despite the NaN input
+    model.zero_grad(set_to_none=True)
+    out.backward()
+    model.on_after_backward()
+    trainable = [p for p in model.parameters() if p.requires_grad]
+    assert all(p.grad is not None for p in trainable)
+    assert all(torch.count_nonzero(p.grad) == 0 for p in trainable)
+
+
+def test_finite_spike_yields_exact_zero_gradients_without_the_guard():
+    # A finite spike needs no gradient guard at all: torch.where routes a zero incoming
+    # gradient through the healthy graph, and backward is linear in it.
+    model = _model()
+    cfg = _cfg(multiplier=5.0, ema_decay=0.5)
+    _feed(model, 1.0, cfg)  # seed EMA = 1.0
+    x, y = torch.randn(2, 4), torch.randn(2, 4)
+    spike_loss = torch.nn.functional.mse_loss(model.model(x), y) + 100.0  # 100x the EMA
+    metrics = {"total_loss": spike_loss.detach()}
+    out = model._apply_spike_breaker(spike_loss, metrics, cfg)
+    assert metrics["spike_skipped"].item() == 1.0
     model.zero_grad(set_to_none=True)
     out.backward()
     trainable = [p for p in model.parameters() if p.requires_grad]
@@ -210,24 +236,42 @@ def test_comparison_metric_watches_main_loss():
 
 # --- S4-T04: DDP skip-decision sync --------------------------------------------
 
-def test_reduce_uses_max_on_skip_path():
+def test_reduce_flags_use_max_and_skip_if_any_rank_skips():
+    # One MAX-reduce carries both cross-rank facts as a tensor (no .item() sync): element 0
+    # is the skip decision, element 1 the non-finite flag.
+    model = _model()
+    trainer = FakeTrainer(world_size=2)
+    trainer.strategy = FakeStrategy(world_size=2, other_value=1.0)  # other rank flags both
+    model._trainer = trainer
+    flags = model._reduce_spike_flags(torch.tensor([0.0, 0.0]))
+    assert trainer.strategy.reduce_calls[-1] == ReduceOp.MAX
+    assert flags.tolist() == [1.0, 1.0]  # skip if any rank skips / any rank non-finite
+
+
+def test_remote_skip_flag_skips_the_local_batch():
+    # A healthy local loss must still skip when another rank spiked: the reduced flags,
+    # not the local ones, drive the decision.
     model = _model()
     trainer = FakeTrainer(world_size=2)
     trainer.strategy = FakeStrategy(world_size=2, other_value=1.0)  # other rank skips
     model._trainer = trainer
-    # local False, other True, MAX -> skip if any rank skips.
-    assert model._reduce_spike_decision(False, "max") is True
-    assert trainer.strategy.reduce_calls[-1] == ReduceOp.MAX
+    metrics, _ = _feed(model, 1.0, _cfg())
+    assert metrics["spike_skipped"].item() == 1.0
 
 
-def test_reduce_uses_min_on_force_path():
+def test_force_accept_is_vetoed_while_any_rank_is_nonfinite():
+    # The escape hatch used to MIN-reduce "finite and past the cap"; the equivalent
+    # single-collective form is "past the cap AND no rank non-finite". A remote NaN
+    # arrives as flags[1] = 1 through the MAX-reduce and must keep vetoing the force.
     model = _model()
     trainer = FakeTrainer(world_size=2)
-    trainer.strategy = FakeStrategy(world_size=2, other_value=0.0)  # other rank vetoes force
+    trainer.strategy = FakeStrategy(world_size=2, other_value=1.0)  # remote: spike + NaN
     model._trainer = trainer
-    # local True, other False, MIN -> force-accept only if every rank agrees.
-    assert model._reduce_spike_decision(True, "min") is False
-    assert trainer.strategy.reduce_calls[-1] == ReduceOp.MIN
+    cfg = _cfg(max_consecutive_skips=2)
+    for _ in range(5):  # far past the cap
+        metrics, _ = _feed(model, 1.0, cfg)
+        assert metrics["spike_skipped"].item() == 1.0
+    assert int(model._spike_forced_accepts_total) == 0
 
 
 def test_reduce_is_noop_on_single_device():
@@ -235,5 +279,6 @@ def test_reduce_is_noop_on_single_device():
     trainer = FakeTrainer(world_size=1)
     trainer.strategy = FakeStrategy(world_size=1, other_value=1.0)
     model._trainer = trainer
-    assert model._reduce_spike_decision(False, "max") is False  # flag returned unchanged
-    assert trainer.strategy.reduce_calls == []                  # reduce never called
+    flags = torch.tensor([0.0, 0.0])
+    assert model._reduce_spike_flags(flags) is flags  # returned unchanged
+    assert trainer.strategy.reduce_calls == []        # reduce never called

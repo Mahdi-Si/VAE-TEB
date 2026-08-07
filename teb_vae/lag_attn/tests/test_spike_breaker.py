@@ -258,36 +258,15 @@ def test_periodic_perm_steps_do_not_trip_the_breaker(task, perturb_posterior):
 # --------------------------------------------------------------------------------------
 # The DDP failure that is reachable
 # --------------------------------------------------------------------------------------
-class _PeerWithNonFiniteLoss(FakeStrategy):
-    """A second rank whose loss is persistently non-finite.
-
-    Such a peer reports ``is_spike_local = True`` unconditionally (the non-finite guard), so the
-    MAX reduce over the skip decision returns 1 -- every rank skips. And its ``forced_local`` is
-    gated on ``not is_nonfinite``, so it is always False and the MIN reduce over the force-accept
-    returns 0 -- the escape hatch never fires anywhere.
-
-    Two reduces with opposite senses, which one injected scalar cannot express; hence this class.
-    """
-
-    def __init__(self) -> None:
-        super().__init__(world_size=2)
-
-    def reduce(self, tensor, group=None, reduce_op=None):
-        self.reduce_calls.append(reduce_op)
-        name = getattr(reduce_op, "name", str(reduce_op)).upper()
-        peer_value = 0.0 if "MIN" in name else 1.0
-        return torch.minimum(tensor, torch.tensor(peer_value)) if "MIN" in name else torch.maximum(
-            tensor, torch.tensor(peer_value)
-        )
-
-
 def test_a_rank_with_a_non_finite_loss_vetoes_the_escape_hatch_forever(task):
     """The freeze, demonstrated.
 
-    A healthy rank, given a healthy loss, every step, forever -- and it never trains. The MAX
-    reduce keeps it skipping because a peer is skipping; the MIN reduce keeps the escape hatch shut
-    because that same peer, being non-finite, refuses to force-accept. The result is permanent
-    zero-gradient training with no error, no exception, and a loss curve that simply stops moving.
+    A healthy rank, given a healthy loss, every step, forever -- and it never trains. The single
+    MAX reduce carries both of the peer's facts: its skip flag keeps this rank skipping, and its
+    non-finite flag keeps the escape hatch shut (a force-accept requires every rank finite). The
+    result is permanent zero-gradient training with no error, no exception, and a loss curve that
+    simply stops moving. ``FakeStrategy``'s injected peer value of $1.0$ raises both flags, which
+    is exactly a persistently non-finite peer.
 
     Nothing here is a bug in this model: it is the framework's arithmetic, and this test exists so
     the shape of the failure is on record before a multi-day run hits it. From the outside the only
@@ -295,7 +274,7 @@ def test_a_rank_with_a_non_finite_loss_vetoes_the_escape_hatch_forever(task):
     """
     module = task()
     module._trainer = FakeTrainer()
-    module._trainer.strategy = _PeerWithNonFiniteLoss()
+    module._trainer.strategy = FakeStrategy(world_size=2, other_value=1.0)
     config = _breaker_config(max_consecutive_skips=3)
 
     skips = [_skipped(_feed(module, -10.0, config)[0]) for _ in range(20)]
@@ -325,13 +304,24 @@ def test_a_skipped_step_still_touches_every_parameter(task):
 
     The forward has already armed DDP's reducer, which expects one gradient hook per parameter. A
     ``None`` return, or a loss built from a single parameter, leaves the rest unreduced and the
-    next iteration raises "Expected to have finished reduction in the prior iteration".
+    next iteration raises "Expected to have finished reduction in the prior iteration". The
+    breaker therefore returns ``torch.where`` over the REAL loss -- backward still traverses the
+    full graph, so every hook fires -- and ``on_after_backward`` zeroes the NaN that a poisoned
+    graph pushes through the zero incoming gradient.
     """
     module = task()
 
-    _, returned = _feed(module, float("nan"), _breaker_config())
+    # A non-finite loss whose autograd graph spans every trainable parameter, as the real
+    # loss does; a leaf NaN would prove nothing about the hooks.
+    real = torch.stack([p.sum() for p in module.parameters() if p.requires_grad]).sum()
+    poisoned = real * float("nan")
+    metrics = {"total_loss": poisoned.detach(), "main_loss": poisoned.detach()}
+    returned = module._apply_spike_breaker(poisoned, metrics, _breaker_config())
+    assert _skipped(metrics)
+
     module.zero_grad(set_to_none=True)
     returned.backward()
+    module.on_after_backward()
 
     starved = [
         name
@@ -340,3 +330,9 @@ def test_a_skipped_step_still_touches_every_parameter(task):
     ]
     assert not starved, f"parameters left without a gradient hook on a skipped step: {starved}"
     assert math.isfinite(float(returned))
+    poisoned_grads = [
+        name
+        for name, parameter in module.named_parameters()
+        if parameter.grad is not None and torch.count_nonzero(parameter.grad) > 0
+    ]
+    assert not poisoned_grads, f"non-zero gradients survived a skipped step: {poisoned_grads}"

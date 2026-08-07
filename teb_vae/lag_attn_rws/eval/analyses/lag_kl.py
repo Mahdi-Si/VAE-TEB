@@ -52,7 +52,7 @@ from teb_vae.lag_attn_rws.eval.lag_axis import (
     profile_column,
 )
 from teb_vae.lag_attn_rws.eval.report_seam import IDENTITY_TOLERANCE, identity_tolerance_for
-from teb_vae.lag_attn_rws.nets.lag_report import SECONDS_PER_STEP, lag_compensated_seconds
+from teb_vae.lag_attn.nets.lag_report import SECONDS_PER_STEP, lag_compensated_seconds
 
 #: This analysis's own subdirectory inside the results directory.
 ANALYSIS_DIRNAME = "lag_kl"

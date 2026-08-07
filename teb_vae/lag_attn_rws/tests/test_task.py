@@ -76,10 +76,22 @@ def test_compilation_is_off_and_the_eager_module_is_what_runs(task):
     assert module.hparams.get("compile_model") is False
 
 
-def test_compilation_is_not_a_constructor_argument():
-    """It is a property of this net, not a caller's choice, so no config can re-enable it: the
-    knob does not exist on the task at all."""
-    assert "compile_model" not in inspect.signature(SeqVaeLagAttnRwsTask.__init__).parameters
+def test_compilation_defaults_off_and_no_config_can_turn_it_on_for_this_net():
+    """The invariant is unchanged -- no configuration reaches compilation for *this* net, whose
+    LSTM encoders defeat inductor unconditionally -- but it is now enforced where the refusal is
+    true rather than by the keyword's absence.
+
+    The keyword exists so a subclass over a net **without** an LSTM can opt in; the refusal for
+    this one lives in ``LagAttnRwsTrainer.compile_model_requested``, which does not read
+    ``advanced_config.trainer.compile`` at all. Both halves are asserted, because the keyword
+    defaulting to ``False`` would be worth nothing if the driver passed a config value into it."""
+    from teb_vae.lag_attn_rws.trainer import LagAttnRwsTrainer
+
+    parameter = inspect.signature(SeqVaeLagAttnRwsTask.__init__).parameters["compile_model"]
+    assert parameter.default is False
+
+    # The driver's refusal is unconditional: a config asking for compilation is still refused.
+    assert LagAttnRwsTrainer.compile_model_requested(object()) is False
 
 
 def test_the_forward_goes_through_model_and_everything_else_through_orig_model():
@@ -143,7 +155,7 @@ def test_the_breaker_actually_consumes_main_loss(task):
     metrics = {"total_loss": returned, "main_loss": torch.tensor(1.0)}
     module._apply_spike_breaker(returned, metrics, module.hparams["spike_breaker"])
 
-    assert module._spike_ema_loss == pytest.approx(1.0), (
+    assert float(module._spike_ema_loss) == pytest.approx(1.0), (
         "the breaker seeded its EMA from the returned loss, so it is not watching main_loss"
     )
 

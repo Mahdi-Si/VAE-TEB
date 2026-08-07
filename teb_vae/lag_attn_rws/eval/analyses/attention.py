@@ -51,7 +51,7 @@ from teb_vae.lag_attn_rws.eval.lag_axis import (
     padded_profile,
     profile_column,
 )
-from teb_vae.lag_attn_rws.nets.lag_report import SECONDS_PER_STEP
+from teb_vae.lag_attn.nets.lag_report import SECONDS_PER_STEP
 
 #: This analysis's own subdirectory inside the results directory.
 ANALYSIS_DIRNAME = "attention"

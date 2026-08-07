@@ -1,6 +1,6 @@
 r"""The per-channel delay is an index operation, and is tested as one.
 
-Nothing here is about wavelets or reaches -- :mod:`teb_vae.lag_attn_rws.channel_reach` owns
+Nothing here is about wavelets or reaches -- :mod:`teb_vae.lag_attn.channel_reach` owns
 those. What matters here is that the shift is exactly the shift it claims: channel $c$'s output
 at step $t$ is its input at $t - \delta_c$, positions with no source are zero, and a zero delay
 vector changes nothing at all. That last property is what makes the unguarded configuration a
@@ -11,7 +11,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from teb_vae.lag_attn_rws.nets.delays import ChannelDelay
+from teb_vae.lag_attn.nets.delays import ChannelDelay
 
 _BATCH, _STEPS, _CHANNELS = 2, 12, 5
 

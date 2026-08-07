@@ -60,6 +60,10 @@ _MODULE_NAME = "teb_vae.lag_attn_transformer_e2e.trainer"
 #: turn this into a test of that package's prose.
 INHERITED_FEATURE_REACH_PHRASE = "into their own future"
 
+#: A phrase unique to this package's own standing message, used to assert that the sibling's
+#: message is the sibling's. Kept short for the same reason as the constant above.
+FRONTEND_REACH_PHRASE = "front end"
+
 
 @pytest.fixture
 def driver(tmp_path):
@@ -208,14 +212,20 @@ def test_the_geometry_reaches_the_constructor(driver):
     assert kwargs["coverage_floor"] == 0.9
 
 
-def test_no_front_end_key_reaches_the_constructor_from_config(driver):
-    """The stage widths are derived from ``d_model`` and the kernels are a module constant, so
-    there is nothing to configure -- and therefore nothing for a signature sweep to drop in
-    silence, which is the failure a config key here would create."""
+def test_only_the_front_ends_reach_budget_reaches_the_constructor_from_config(driver):
+    """The front end's *shape* has no configuration surface: the stage widths are derived from
+    ``d_model`` and the kernels are a module constant, so a key for either would be one the
+    signature sweep drops in silence. Its *backward reach* is configurable, because that is the
+    bound the shape is checked against and an arm that changes the shape has to move it too.
+
+    Exactly one key, asserted as a set: a second one appearing is the failure this guards."""
     kwargs = driver._build_model_kwargs()
 
     assert "frontend_kernels" not in kwargs
-    assert not [name for name in kwargs if name.startswith("frontend")]
+    assert [name for name in kwargs if name.startswith("frontend")] == [
+        "frontend_reach_budget_s"
+    ]
+    assert kwargs["frontend_reach_budget_s"] == 120.0
 
 
 def test_loss_only_keys_do_not_reach_the_constructor(driver):
@@ -362,14 +372,21 @@ def test_the_startup_log_does_not_repeat_the_inherited_feature_reach_sentence(dr
 
 def test_the_siblings_message_is_untouched(tmp_path):
     """The replacement is this driver's, not a change to the one it inherits from: the comparison
-    model's log must keep stating the standing that is true of *it*."""
+    model's log must keep stating the standing that is true of *it*.
+
+    That sibling now ships a finite reach budget, so what is true of it is the resolved-budget
+    summary rather than the unguarded sentence. Both directions are asserted -- it must emit its
+    own summary, and it must not emit this package's front-end sentence -- because a driver that
+    logged nothing would pass a one-sided check."""
     sibling_config = (
         _REPO_ROOT / "teb_vae" / "lag_attn_transformer_rws" / "configs" / "default.yaml"
     )
     instance = LagAttnTrfRwsTrainer(config_file_path=str(sibling_config))
     instance._build_model_kwargs()  # populates resolved_budget, which the message branches on
 
-    assert INHERITED_FEATURE_REACH_PHRASE in instance.causal_standing_message()
+    message = instance.causal_standing_message()
+    assert message.startswith("causal reach budget 120 s:")
+    assert FRONTEND_REACH_PHRASE not in message
 
 
 def test_a_core_checkpoint_from_a_sibling_is_refused_before_it_is_loaded(driver, tmp_path):
@@ -806,3 +823,80 @@ def test_no_module_in_the_package_seeds_by_hand():
                 offenders.append(f"{path.name}: {pattern}")
 
     assert offenders == []
+
+
+# --------------------------------------------------------------------------------------
+# torch.compile: live here, refused in the raw-signal base
+# --------------------------------------------------------------------------------------
+def test_the_shipped_config_leaves_compilation_off(driver):
+    """Off is the shipped value, so the baseline is an eager run and the first compiled run is a
+    deliberate act. What this asserts is the *driver's* reading of the key, not the key itself --
+    the config test owns that."""
+    assert driver.compile_model_requested() is False
+
+
+def test_the_key_is_live_here_rather_than_ignored(driver):
+    """The distinction this package exists to make against its base. Flipping the key must change
+    the driver's answer; if it did not, an operator could set ``compile: true``, see nothing in the
+    log, and believe they had measured a compiled run."""
+    driver.config["advanced_config"]["trainer"]["compile"] = True
+    assert driver.compile_model_requested() is True
+
+
+def test_the_raw_signal_base_refuses_the_key_no_matter_what_it_says():
+    """The refusal two levels up is a property of *that* net -- its LSTM encoders defeat inductor
+    unconditionally -- so it must not read the config at all. A base that started honouring the key
+    would let a raw-signal config turn on a path that cannot work."""
+    assert "compile_model_requested" in vars(LagAttnRwsTrainer)
+    assert LagAttnRwsTrainer.compile_model_requested(object()) is False
+
+
+def test_the_compile_decision_is_inherited_rather_than_restated():
+    """It belongs to the conv-Transformer driver, not to this one: the blocker it clears is the
+    *LSTM*, which both transformer packages replaced, so a copy here would be a second copy of one
+    decision -- and the two would then be free to diverge on a question that has nothing to do with
+    the input representation this package exists to change."""
+    from teb_vae.lag_attn_transformer_rws.trainer import LagAttnTrfRwsTrainer
+
+    assert "compile_model_requested" not in vars(LagAttnTrfE2ETrainer)
+    assert (
+        LagAttnTrfE2ETrainer.compile_model_requested
+        is LagAttnTrfRwsTrainer.compile_model_requested
+    )
+
+
+def test_compilation_and_attention_checkpointing_are_refused_together(driver):
+    """The one genuine inductor blocker still reachable from this package's config surface. Silently
+    dropping either would give a run that is neither the compiled one nor the checkpointed one."""
+    driver.config["advanced_config"]["trainer"]["compile"] = True
+    driver.config["model_config"]["VAE_model"]["attention_grad_checkpoint"] = True
+
+    with pytest.raises(ValueError) as excinfo:
+        driver.compile_model_requested()
+
+    message = str(excinfo.value)
+    assert "attention_grad_checkpoint" in message and "compile" in message
+
+
+def test_a_compiled_run_says_so_in_the_log(driver, logged):
+    """Compilation may reassociate float arithmetic and ``pred_gap`` is a $10^{-4}$-relative
+    difference of two block NLLs, so a run that compiled must be identifiable from its log alone --
+    otherwise the eager and compiled coupling numbers are indistinguishable after the fact."""
+    driver.config["advanced_config"]["trainer"]["compile"] = True
+    driver.compile_model_requested()
+
+    assert any("torch.compile is ON" in line for line in logged)
+    assert any("pred_gap" in line for line in logged)
+
+
+def test_the_objective_is_never_the_thing_compiled():
+    """Only the forward is compiled. The task reaches ``compute_loss`` through ``orig_model``, which
+    is what keeps the data-dependent ``kld_active_frac`` indexing out of the graph -- so this is the
+    line that makes the whole key safe to honour, and it is asserted rather than trusted."""
+    import inspect
+
+    from teb_vae.lag_attn_rws.task import SeqVaeLagAttnRwsTask
+
+    source = inspect.getsource(SeqVaeLagAttnRwsTask.compute_loss_and_metrics)
+    assert "self.orig_model.compute_loss(" in source
+    assert "self.model.compute_loss(" not in source

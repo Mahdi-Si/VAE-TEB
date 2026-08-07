@@ -84,18 +84,28 @@ def test_the_task_is_the_comparison_models_task(task):
     assert isinstance(module, SeqVaeLagAttnRwsTask)
 
 
-def test_compilation_stays_off_and_the_eager_module_is_what_runs(task):
-    """The recurrence is gone, but the data-dependent boolean mask indexing behind
-    ``kld_active_frac`` and the masked source KL still defeat inductor."""
+def test_compilation_stays_off_by_default_and_the_eager_module_is_what_runs(task):
+    """Default-off, so a task built without an opinion is eager. The reason recorded here
+    previously -- the ``kld_active_frac`` mask indexing -- does **not** hold for the compiled
+    region: it lives in ``compute_loss``, which the task reaches through ``orig_model``, so only
+    the forward is ever compiled. Whether a run compiles is the driver's decision."""
     module = task()
 
     assert module.model is module.orig_model
     assert module.hparams.get("compile_model") is False
 
 
-def test_compilation_is_not_a_constructor_argument():
-    """A property of the net, not a caller's choice, so no config can re-enable it."""
-    assert "compile_model" not in inspect.signature(SeqVaeLagAttnTrfRwsTask.__init__).parameters
+def test_compilation_defaults_off_on_the_task_and_is_the_drivers_decision():
+    """The task's default is ``False``, so a task built without an opinion is eager and the
+    baseline is an eager run. Whether a *run* compiles is the driver's call, not the task's --
+    ``LagAttnTrfRwsTrainer.compile_model_requested`` reads ``advanced_config.trainer.compile``,
+    which it can because this architecture replaced the LSTM encoders that made the raw-signal
+    base refuse the key outright."""
+    from teb_vae.lag_attn_transformer_rws.trainer import LagAttnTrfRwsTrainer
+
+    parameter = inspect.signature(SeqVaeLagAttnTrfRwsTask.__init__).parameters["compile_model"]
+    assert parameter.default is False
+    assert "compile_model_requested" in vars(LagAttnTrfRwsTrainer)
 
 
 # --------------------------------------------------------------------------------------

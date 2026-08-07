@@ -24,7 +24,7 @@ import torch
 from teb_vae.lag_attn_rws.eval import report_seam
 from teb_vae.lag_attn_rws.eval.analyses import lag_kl
 from teb_vae.lag_attn_rws.eval.metrics import identity_residual_per_sample
-from teb_vae.lag_attn_rws.nets.lag_report import lag_compensated_seconds
+from teb_vae.lag_attn.nets.lag_report import lag_compensated_seconds
 from teb_vae.lag_attn_rws.nets.model import SeqVaeLagAttnRws
 
 from .conftest import SHIPPED_KWARGS, TINY_KWARGS

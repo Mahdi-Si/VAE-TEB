@@ -53,7 +53,7 @@ if not __package__ and _REPO_ROOT not in sys.path:
 
 from loguru import logger  # noqa: E402
 
-from teb_vae.lag_attn_rws.nets.lag_report import SECONDS_PER_STEP  # noqa: E402
+from teb_vae.lag_attn.nets.lag_report import SECONDS_PER_STEP  # noqa: E402
 from teb_vae.lag_attn_rws.trainer import main as run_training  # noqa: E402
 from teb_vae.lag_attn_transformer_e2e.nets.frontend import CausalRawFrontend  # noqa: E402
 from teb_vae.lag_attn_transformer_e2e.nets.model import SeqVaeLagAttnTrfE2E  # noqa: E402

@@ -135,7 +135,7 @@ def test_the_breaker_actually_consumes_main_loss(task):
     metrics = {"total_loss": returned, "main_loss": torch.tensor(1.0)}
     module._apply_spike_breaker(returned, metrics, module.hparams["spike_breaker"])
 
-    assert module._spike_ema_loss == pytest.approx(1.0), (
+    assert float(module._spike_ema_loss) == pytest.approx(1.0), (
         "the breaker seeded its EMA from the returned loss, so it is not watching main_loss"
     )
 

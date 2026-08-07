@@ -64,7 +64,7 @@ from teb_vae.lag_attn_rws.eval.metrics import (
     sigma_to_bpm,
     to_bpm,
 )
-from teb_vae.lag_attn_rws.nets.lag_report import SECONDS_PER_STEP
+from teb_vae.lag_attn.nets.lag_report import SECONDS_PER_STEP
 
 #: This analysis's own subdirectory inside the results directory.
 ANALYSIS_DIRNAME = "forecast"

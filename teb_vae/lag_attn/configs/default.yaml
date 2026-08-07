@@ -37,7 +37,9 @@ general_config:
   # instead of at the never-reached epoch 1000.
   lr: 0.0003
   lr_milestone: [60, 120]   # singular; the experiment driver reads this exact key
-  plot_frequency: 1
+  # Epoch cadence of the loss-curve HTML and the diagnostic figure, both rendered by rank 0
+  # inside the fit; at 1 a multi-day run pays two PDF renders plus an HTML rewrite every epoch.
+  plot_frequency: 5
   epochs: 5000
   accumulate_grad_batches: 1
   batch_size:
@@ -110,12 +112,60 @@ model_config:
     use_up_st: true
     lstm_layers: 2
     dropout: 0.1
+    # Dropout for the SOURCE pathway alone -- its adapter/front end, its encoder, and the attended
+    # source summary inside the posterior fusion.
+    #
+    # null = exactly the previous model, and that is NOT one number. The adapter and the encoder
+    # always ran at `dropout` above and keep doing so; the dropout on the attended source summary
+    # is a site this key INTRODUCED -- there was none there before -- so null leaves that one OFF.
+    # Resolving it to `dropout` as well would put p=0.1 inside the posterior of every run that
+    # leaves this key unset, invisible in eval mode. Any explicit value applies to all three sites.
+    #
+    # This exists because the measured failure is specific to the source pathway: over epochs
+    # 55-120 of the 125-epoch run the KL held at 1.44 nats and the latent displacement at 0.084,
+    # both unchanged, while the HELD-OUT predictive gain fell from +3.25 to -0.70. Same rate, same
+    # magnitude, degraded content -- the map from the source to delta_mu is memorising, and a
+    # rate-based lever (beta) cannot reach a failure that happens at constant rate.
+    #
+    # Shipped null, NOT an elevated value, and that is deliberate: no measurement supports any
+    # particular rate here, and putting an unvalidated one in the headline run would confound it.
+    # The mechanism ships; the strength is measured by arms that set this key to 0.2 and 0.3.
+    # Those arms exist as files only in teb_vae/lag_attn_transformer_rws/configs/ -- for this
+    # package the arm is a one-key override of this file, not a config that is already here.
+    source_dropout: null
     decoder_hidden: 128
     logvar_clamp: [-5.0, 3.0]
     # Latent stabilisers: saturation magnitudes of the tanh-bounded latent heads.
     mu_scale: 5.0
     delta_mu_scale: 3.0
     delta_logvar_scale: 2.0
+
+    # --- How the posterior's log-variance is built -------------------------------
+    # 'residual' adds a bounded delta to the PRIOR's pre-bound raw log-variance; 'independent'
+    # gives the posterior its own head. Under 'residual' the full branch's pressure to sharpen
+    # sigma_q lands on the prior's own tensor, so D_1 drags the prior's log-variance down
+    # alongside its own -- one of the two paths that collapse the conditional prior's scale.
+    # 'independent' severs it, leaving the prior's scale to KL(q||p), which wants it wide.
+    #
+    # 'residual' HERE, against 'independent' in the three raw-signal siblings, and the difference
+    # is structural rather than a preference not yet applied.
+    #
+    # Under 'independent' the two log-variances are separate functions, so q == p at init is no
+    # longer automatic. The siblings recover it exactly: head_init_calibration pins their prior's
+    # raw log-variance to the constant log(5/3), and the independent head is seeded at the same
+    # constant, so both start at logvar 0 and the KL is still exactly zero at step 0. This model
+    # has no such calibration -- its prior head starts xavier-filled and input-dependent -- so
+    # there is no constant for the posterior head to agree with, and the init KL measures 183
+    # nats instead of 0.
+    #
+    # That is not an acceptable start for this model in particular: its whole readout rests on
+    # K_t == 0 at init, so that any coupling it later reports had to be learned. 183 nats of
+    # unearned divergence would be indistinguishable from coupling in every downstream figure.
+    #
+    # The key is live and switchable; taking 'independent' here needs a prior-scale calibration
+    # for this model first, which is the raw-signal packages' `head_init_calibration` and does not
+    # exist here.
+    posterior_logvar_mode: residual
 
     # --- Causal history states (REQUIRED for the KL to mean anything) -----------
     # nn.GroupNorm over a (B, C, T) tensor reduces over every non-batch dim inside a group -- i.e.
@@ -129,6 +179,25 @@ model_config:
     # over the forecast-horizon axis within one anchor, mixing that anchor's outputs rather than
     # its inputs across time (probed: zero leak).
     causal_norm: true
+
+    # --- Causal input reach budget ---------------------------------------------
+    # `causal_norm` above fixes a leak the ENCODER introduces. This fixes a different one, present
+    # before the encoder sees anything: the stored features are two-sided wavelet transforms, so
+    # the value at anchor t already contains raw signal from up to 974 s AFTER t. At null the
+    # target-only branch is partly reading its own answer, and no encoder change can repair that.
+    #
+    # A finite budget (seconds) prunes every channel whose analytic forward reach exceeds it and
+    # delays each survivor by ceil(reach / 4) steps, so the guarantee is bought with channels and
+    # staleness rather than with an encoder property. 120 keeps 78 of 109 target and 29 of 58
+    # source channels at a worst delay of exactly 30 steps -- warmup_period, the deepest budget
+    # the warm-up admits, since the zero-filled prefix must fall inside the steps the loss already
+    # discards. null restores every channel at no delay, which is what every run before this key
+    # existed used.
+    #
+    # The adapters carry the availability projection and start embedding that make the zero-filled
+    # prefix a representation rather than a numerical accident; without them a finite budget drove
+    # the global gradient norm to ~1e26.
+    causal_reach_budget_s: 120
 
     # --- KL support ------------------------------------------------------------
     # 'anchor' trains the KL only over supervised anchors [warmup, T-horizon); 'full' extends it to
@@ -232,7 +301,9 @@ dataset_config:
   stat_path: /data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_new_channel_selection/stats.hdf5
 
   dataloader_config:
-    num_workers: 4
+    # 8 per rank: the prod box has 128 cores against 7 ranks (56 persistent workers), so the
+    # extra workers still leave headroom; revisit against the profiler's dataloader-next timing.
+    num_workers: 8
     prefetch_factor: 4
     normalize_fields: ['fhr', 'up', 'fhr_st', 'fhr_ph', 'up_st', 'up_ph']
     dataset_kwargs:
@@ -261,7 +332,10 @@ dataset_config:
       epoch_min: -48000
       epoch_max: null
       label: null
-      cache_size: 10000
+      # 0: the FIFO cache stores fully processed samples (~240 KB each, so 10000 held ~2.4 GB
+      # PER WORKER), and under the DistributedSampler's per-epoch reshuffle a worker almost
+      # never re-sees a cached index -- the RAM bought near-zero hits.
+      cache_size: 0
       # Must match the stats file's trim_minutes or normalization is wrong; a mismatch only warns.
       trim_minutes: 1.0
 
@@ -281,7 +355,11 @@ advanced_config:
     # nn.LSTM in the encoders, torch.utils.checkpoint inside the attention, and the
     # data-dependent boolean-mask indexing that computes kld_active_frac on every forward.
     compile: false
-    log_every_n_steps: 1
+    # Cadence of the per-STEP logger flush: each flush is a synchronous MLflow log_batch HTTP
+    # call from rank 0 carrying every on_step metric. Epoch aggregates, metrics_history.csv and
+    # the checkpoint monitor are epoch-level and unaffected; only the MLflow step-series
+    # resolution changes.
+    log_every_n_steps: 25
     num_sanity_val_steps: 0
     # Keep true: the data module builds plain loaders on purpose and relies on Lightning to inject
     # the DistributedSampler and call set_epoch each epoch.
@@ -373,7 +451,8 @@ advanced_config:
 
     lag_attn_plotting:
       enabled: true
-      plot_frequency: 1                 # plot every validation epoch
+      plot_frequency: 5                 # keep equal to general_config.plot_frequency, so the
+                                        # curves and the figure that explains them share epochs
       num_examples: 2                   # 2 samples per trigger
       file_format: "pdf"
       # `forecast_channels` was removed. It named three channels to spot-check the predictive
