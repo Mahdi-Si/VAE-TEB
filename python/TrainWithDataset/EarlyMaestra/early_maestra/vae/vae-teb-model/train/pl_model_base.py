@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import math
 from typing import Any, Dict, Iterable, Optional, Tuple, Union, cast
 from abc import ABC, abstractmethod
 from pathlib import Path
@@ -99,12 +98,20 @@ class LightningModelBase(L.LightningModule, ABC):
 
         # Loss-spike circuit-breaker running state. All zero/None until the first
         # training batch and only mutated when the breaker is enabled; kept here so the
-        # counters survive across steps and are visible to logging.
-        self._spike_ema_loss: Optional[float] = None
-        self._spike_consecutive: int = 0
+        # counters survive across steps and are visible to logging. Everything except the
+        # batch counter becomes a 0-dim device tensor on the breaker's first call and is
+        # only ever REBOUND (never mutated in place): reading a Python float out of any of
+        # them would be a per-step GPU->CPU sync, which is exactly what the breaker's
+        # tensorised implementation exists to avoid.
+        self._spike_ema_loss: Optional[torch.Tensor] = None
+        self._spike_ema_valid: Optional[torch.Tensor] = None
+        self._spike_consecutive: Union[int, torch.Tensor] = 0
         self._spike_batches_seen: int = 0
-        self._spike_skips_total: int = 0
-        self._spike_forced_accepts_total: int = 0
+        self._spike_skips_total: Union[int, torch.Tensor] = 0
+        self._spike_forced_accepts_total: Union[int, torch.Tensor] = 0
+        # The NaN-gradient guard ``on_after_backward`` applies; set by the breaker on every
+        # training step it runs, ``None`` whenever the breaker is disabled.
+        self._spike_grad_guard: Optional[torch.Tensor] = None
 
     @property
     def orig_model(self) -> nn.Module:
@@ -367,7 +374,11 @@ class LightningModelBase(L.LightningModule, ABC):
         spike_cfg = self.hparams.get("spike_breaker", None) if hasattr(self, "hparams") else None
         if stage == "train" and spike_cfg and spike_cfg.get("enabled", False):
             loss = self._apply_spike_breaker(loss, metrics, spike_cfg)
-        self._log_metrics(metrics, stage=stage, on_step=True)
+        # Step-level logging is train-only. Every metric here also carries on_epoch=True, and
+        # the epoch value is the only thing the CSV, the checkpoint monitor and the plots read
+        # from val/test -- while a val metric logged per step with sync_dist=True costs one
+        # cross-rank all-reduce per metric per validation batch.
+        self._log_metrics(metrics, stage=stage, on_step=(stage == "train"))
         return loss
 
     def _apply_spike_breaker(
@@ -378,11 +389,31 @@ class LightningModelBase(L.LightningModule, ABC):
         Folds the behaviour that VAE consumers previously hand-rolled as a
         ``training_step`` override. Tracks an exponential moving average (EMA) of a
         watched loss and, when the current loss spikes far above it, performs a
-        *zero-gradient step* instead of a real update. The step is realised as a loss
-        summed over **every** trainable parameter times $0$ — not ``None`` — because
-        the forward already armed DDP's gradient reducer, which then expects a hook to
-        fire for each parameter; a bare ``None`` (a true skip) would desynchronise the
-        reducer under DDP.
+        *zero-gradient step* instead of a real update.
+
+        The implementation is deliberately **sync-free**: every decision, the EMA and the
+        counters live in 0-dim device tensors, combined with ``torch.where`` rather than
+        Python branches, and the one cross-rank reduction stays a tensor. The previous
+        implementation called ``.item()`` three times per training step, and each of those
+        stalls the CPU until the whole forward has finished on the GPU — losing the
+        CPU run-ahead that hides dataloader and kernel-launch latency on *every* step, to
+        guard against a spike that almost never happens.
+
+        The zero-gradient step is realised in two halves, neither of which needs a CPU
+        copy of the decision:
+
+        * the returned loss is ``torch.where(skipped, 0, loss)`` — on a skip the *value*
+          is a finite $0$, while the real loss graph still receives a zero incoming
+          gradient, so every parameter's DDP reducer hook fires exactly as on a healthy
+          step (a bare ``None`` — a true skip — would desynchronise the reducer). Reverse-
+          mode backward is linear in the incoming gradient, so a finite graph turns that
+          zero into exactly-zero parameter gradients;
+        * a **non-finite** loss is the one case a zero incoming gradient does not
+          neutralise ($0 \cdot \infty = \mathrm{NaN}$ inside the poisoned graph), so the
+          breaker stashes ``_spike_grad_guard`` and :meth:`on_after_backward` zeroes every
+          gradient tensor on that step. Under gradient accumulation this conservatively
+          wipes the *accumulated* gradient of the window containing the non-finite
+          micro-batch; all consumers ship ``accumulate_grad_batches: 1``.
 
         Config keys (all optional, defaults in parentheses):
 
@@ -416,8 +447,8 @@ class LightningModelBase(L.LightningModule, ABC):
             cfg: The resolved ``spike_breaker`` config mapping.
 
         Returns:
-            Either the original ``loss`` (accepted / force-accepted) or a
-            zero-gradient no-op loss (skipped).
+            ``torch.where(skipped, 0, loss)`` — the original ``loss`` on an accepted or
+            force-accepted batch, a finite zero-valued zero-gradient step on a skipped one.
         """
         multiplier = float(cfg.get("multiplier", 5.0))
         ema_decay = float(cfg.get("ema_decay", 0.02))
@@ -434,63 +465,109 @@ class LightningModelBase(L.LightningModule, ABC):
             candidate = metrics.get("main_loss")
             if candidate is not None:
                 watched = candidate
-        loss_value = float(watched.detach().item()) if isinstance(watched, torch.Tensor) else float(watched)
-        # The non-finite guard must protect the loss that is actually backpropagated
-        # (``loss``/total_loss), not only the watched value: in ``main_loss`` mode the
-        # watched main_loss can stay finite while total_loss blows up, and returning a
-        # non-finite loss would corrupt every weight — the exact failure the breaker exists
-        # to prevent. So a spike is forced when EITHER value is non-finite.
-        returned_value = float(loss.detach().item()) if isinstance(loss, torch.Tensor) else float(loss)
-        is_nonfinite = not (math.isfinite(loss_value) and math.isfinite(returned_value))
+
+        device = loss.device if isinstance(loss, torch.Tensor) else self.device
+        watched_value = (
+            watched.detach() if isinstance(watched, torch.Tensor)
+            else torch.tensor(float(watched), device=device)
+        )
+        returned_value = (
+            loss.detach() if isinstance(loss, torch.Tensor)
+            else torch.tensor(float(loss), device=device)
+        )
+
+        # Lazy state creation: the device is only known once the first loss arrives. The
+        # narrowed locals carry this step's inputs; the attributes are rebound below.
+        long_zero = torch.zeros((), dtype=torch.long, device=device)
+        ema_before = self._spike_ema_loss
+        valid_before = self._spike_ema_valid
+        if ema_before is None or valid_before is None:
+            ema_before = torch.zeros((), device=device)
+            valid_before = torch.zeros((), dtype=torch.bool, device=device)
+        consecutive_before = (
+            self._spike_consecutive
+            if isinstance(self._spike_consecutive, torch.Tensor)
+            else long_zero
+        )
+        skips_total = (
+            self._spike_skips_total
+            if isinstance(self._spike_skips_total, torch.Tensor)
+            else long_zero
+        )
+        forced_total = (
+            self._spike_forced_accepts_total
+            if isinstance(self._spike_forced_accepts_total, torch.Tensor)
+            else long_zero
+        )
 
         self._spike_batches_seen += 1
-        ema_before = self._spike_ema_loss
 
-        # Local skip decision. The two finite tests are independent and OR-ed: the relative
-        # test compares against the *floored* EMA (its threshold must stay reachable when the
-        # EMA collapses toward zero), while the additive test compares against the *raw* EMA
-        # (its whole point is to keep working when the EMA is negative, where the floor makes
-        # the relative test either degenerate or inert).
-        if is_nonfinite:
-            is_spike_local = True
-        elif self._spike_batches_seen <= warmup_batches or ema_before is None:
-            is_spike_local = False
+        # The non-finite guard must protect the loss that is actually backpropagated
+        # (``loss``/total_loss), not only the watched value: in ``main_loss`` mode the
+        # watched main_loss can stay finite while total_loss blows up, and backpropagating
+        # a non-finite loss would corrupt every weight — the exact failure the breaker
+        # exists to prevent. So a spike is forced when EITHER value is non-finite.
+        nonfinite_local = ~(torch.isfinite(watched_value) & torch.isfinite(returned_value))
+
+        # Local finite-spike decision. The two finite tests are independent and OR-ed: the
+        # relative test compares against the *floored* EMA (its threshold must stay reachable
+        # when the EMA collapses toward zero), while the additive test compares against the
+        # *raw* EMA (its whole point is to keep working when the EMA is negative, where the
+        # floor makes the relative test either degenerate or inert). Both are masked by the
+        # warm-up window and by an EMA that has never been seeded; NaN comparisons are False,
+        # so a non-finite watched value never leaks through them either way.
+        if self._spike_batches_seen <= warmup_batches:
+            finite_spike_local = torch.zeros((), dtype=torch.bool, device=device)
         else:
-            ema_ref = max(ema_before, ema_floor)
-            is_spike_local = loss_value > multiplier * ema_ref
+            finite_spike_local = watched_value > multiplier * torch.clamp_min(ema_before, ema_floor)
             if additive_margin > 0.0:
-                is_spike_local = is_spike_local or (loss_value > ema_before + additive_margin)
+                finite_spike_local = finite_spike_local | (
+                    watched_value > ema_before + additive_margin
+                )
+            finite_spike_local = finite_spike_local & valid_before
+        spike_local = nonfinite_local | finite_spike_local
 
-        # Skip if ANY rank skips (MAX): ranks must agree so their optimizer steps stay
-        # in lockstep under DDP.
-        is_spike = self._reduce_spike_decision(is_spike_local, "max")
+        # One MAX-reduce carries both cross-rank facts the breaker needs: skip if ANY rank
+        # skips (element 0), and "some rank saw a non-finite loss" (element 1). The old MIN-
+        # reduce on the force-accept path is recovered without a second collective, because
+        # its rank-varying half was exactly "every rank finite" = NOT MAX(non-finite) — the
+        # consecutive-skip count is driven only by already-reduced decisions and therefore
+        # identical on every rank.
+        flags = self._reduce_spike_flags(
+            torch.stack([spike_local, nonfinite_local]).to(torch.float32)
+        )
+        is_spike = flags[0] > 0.5
+        any_nonfinite = flags[1] > 0.5
 
-        # Escape hatch: only after the cap, only if EVERY rank agrees (MIN), and never
-        # when a loss is non-finite (a finite forced step is safe, a NaN one is not).
-        forced = False
-        if is_spike:
-            forced_local = (
-                not is_nonfinite
-                and max_consecutive_skips > 0
-                and self._spike_consecutive >= max_consecutive_skips
-            )
-            forced = self._reduce_spike_decision(forced_local, "min")
-
-        if forced:
-            self._spike_ema_loss = loss_value  # hard re-seed the collapsed EMA
-            self._spike_consecutive = 0
-            self._spike_forced_accepts_total += 1
-            is_spike = False
-        elif is_spike:
-            self._spike_consecutive += 1
-            self._spike_skips_total += 1
+        # Escape hatch: only after the cap, and never while any rank's loss is non-finite
+        # (a finite forced step is safe, a NaN one is not).
+        if max_consecutive_skips > 0:
+            forced = is_spike & ~any_nonfinite & (consecutive_before >= max_consecutive_skips)
         else:
-            # Accept: advance (or seed) the EMA and clear the run length.
-            if ema_before is None:
-                self._spike_ema_loss = loss_value
-            else:
-                self._spike_ema_loss = ema_decay * loss_value + (1.0 - ema_decay) * ema_before
-            self._spike_consecutive = 0
+            forced = torch.zeros((), dtype=torch.bool, device=device)
+        skipped = is_spike & ~forced
+        accepted = ~skipped
+
+        # State advance, all by rebinding (never in place — logged tensors and captured
+        # references must keep their values). Accept: blend, or seed on the first accepted
+        # batch. Forced accept: hard re-seed (a momentum step barely moves a collapsed EMA).
+        # Skip: hold, so a skipped spike never pollutes the baseline. An accepted batch is
+        # finite on every rank by construction (any non-finite anywhere forces a skip), so
+        # the blend never mixes a NaN in.
+        seeded_or_blended = torch.where(
+            valid_before,
+            ema_decay * watched_value + (1.0 - ema_decay) * ema_before,
+            watched_value,
+        )
+        self._spike_ema_loss = torch.where(
+            forced, watched_value, torch.where(accepted, seeded_or_blended, ema_before)
+        )
+        self._spike_ema_valid = valid_before | accepted
+        self._spike_consecutive = torch.where(
+            skipped, consecutive_before + 1, torch.zeros_like(consecutive_before)
+        )
+        self._spike_skips_total = skips_total + skipped.to(torch.long)
+        self._spike_forced_accepts_total = forced_total + forced.to(torch.long)
 
         # Diagnostics for the logger (tensors so the metric-logging contract holds).
         # ``spike_ema_loss`` (instantaneous) and ``spike_skipped`` (0/1, whose epoch mean
@@ -498,55 +575,79 @@ class LightningModelBase(L.LightningModule, ABC):
         # left as instance attributes (``self._spike_skips_total`` /
         # ``self._spike_forced_accepts_total``) rather than logged, because an on_epoch
         # mean of a running total is meaningless.
-        ema_report = self._spike_ema_loss if self._spike_ema_loss is not None else 0.0
-        metrics["spike_ema_loss"] = torch.tensor(float(ema_report), device=self.device)
-        metrics["spike_skipped"] = torch.tensor(1.0 if is_spike else 0.0, device=self.device)
+        ema_report = self._spike_ema_loss
+        metrics["spike_ema_loss"] = ema_report
+        metrics["spike_skipped"] = skipped.to(torch.float32)
 
-        if is_spike:
-            # Replace the poisoned loss metric(s) with the finite EMA so a skipped
-            # NaN/huge value does not corrupt the epoch-aggregated training curve (the
-            # optimizer never saw it — see the zero-gradient step below).
-            safe_loss = torch.tensor(float(ema_report), device=self.device)
-            if "total_loss" in metrics:
-                metrics["total_loss"] = safe_loss
-            if comparison_metric == "main_loss" and "main_loss" in metrics:
-                metrics["main_loss"] = safe_loss
+        # On a skip, replace the poisoned loss metric(s) with the finite EMA so a skipped
+        # NaN/huge value does not corrupt the epoch-aggregated training curve (the
+        # optimizer never sees it — see the zero-gradient step below).
+        if "total_loss" in metrics:
+            metrics["total_loss"] = torch.where(
+                skipped, ema_report, self._as_tensor(metrics["total_loss"])
+            )
+        if comparison_metric == "main_loss" and "main_loss" in metrics:
+            metrics["main_loss"] = torch.where(
+                skipped, ema_report, self._as_tensor(metrics["main_loss"])
+            )
 
-            # Zero-gradient step touching every trainable parameter. The forward already
-            # armed DDP's reducer, which expects a gradient hook per parameter; a no-op
-            # built from all of them keeps every hook firing. nan_to_num keeps the value
-            # finite if a parameter itself went NaN (its gradient is 0 regardless), and
-            # the *0.0 makes every gradient exactly zero. Note this is a *zero-gradient*
-            # step, not a true skip: under automatic optimization the optimizer still
-            # steps, so AdamW's decoupled weight decay and carried momentum still nudge
-            # the weights slightly — matching what the consumer breakers do today and
-            # kept because returning ``None`` (a true skip) is DDP-unsafe once the reducer
-            # is armed.
-            zero_grad_loss = torch.zeros((), device=self.device)
-            for param in self.parameters():
-                if param.requires_grad:
-                    zero_grad_loss = zero_grad_loss + torch.nan_to_num(param).sum()
-            return zero_grad_loss * 0.0
-        return loss
+        # Second half of the zero-gradient step (see the class docstring's summary above):
+        # only a non-finite loss can push NaN through the zero incoming gradient, so the
+        # guard is armed for exactly that case and applied in ``on_after_backward``.
+        self._spike_grad_guard = skipped & any_nonfinite
 
-    def _reduce_spike_decision(self, flag: bool, op: str) -> bool:
-        """Reduce a boolean skip/force-accept decision across DDP ranks.
+        # Zero-gradient step, not a true skip: the value is a finite 0 while the real loss
+        # graph still receives a zero incoming gradient, so every parameter hook DDP's
+        # reducer armed during the forward fires exactly as on a healthy step. Under
+        # automatic optimization the optimizer still steps, so AdamW's decoupled weight
+        # decay and carried momentum still nudge the weights slightly — matching the
+        # previous implementation, and kept because returning ``None`` (a true skip) is
+        # DDP-unsafe once the reducer is armed.
+        return torch.where(
+            skipped, torch.zeros((), device=device, dtype=returned_value.dtype), loss
+        )
 
-        No-op (returns ``flag`` unchanged) when the module is unattached or running on a
-        single process. Otherwise reduces a $\\{0,1\\}$ tensor through the trainer
-        strategy with ``ReduceOp.MAX`` (``op="max"`` — skip if *any* rank skips) or
-        ``ReduceOp.MIN`` (``op="min"`` — force-accept only if *every* rank agrees).
+    def _reduce_spike_flags(self, flags: torch.Tensor) -> torch.Tensor:
+        r"""MAX-reduce the stacked breaker flags across DDP ranks, staying on the device.
+
+        No-op (returns ``flags`` unchanged) when the module is unattached or running on a
+        single process. Deliberately returns the reduced **tensor** rather than reading a
+        Python bool out of it: the read would be the per-step GPU sync the tensorised
+        breaker exists to remove.
+
+        Args:
+            flags: A stacked $\{0,1\}$ float tensor of per-rank facts to OR across ranks.
+
+        Returns:
+            The element-wise MAX across ranks, same shape and device as ``flags``.
         """
         trainer = getattr(self, "_trainer", None)
         strategy = getattr(trainer, "strategy", None) if trainer is not None else None
         world_size = getattr(strategy, "world_size", 1) if strategy is not None else 1
         if strategy is None or not world_size or world_size <= 1:
-            return flag
-        reduce_op = ReduceOp.MAX if op == "max" else ReduceOp.MIN
-        flag_tensor = torch.tensor(1.0 if flag else 0.0, device=self.device)
-        reduced = strategy.reduce(flag_tensor, reduce_op=reduce_op)
-        value = reduced.item() if isinstance(reduced, torch.Tensor) else float(reduced)
-        return value > 0.5
+            return flags
+        return strategy.reduce(flags, reduce_op=ReduceOp.MAX)
+
+    def on_after_backward(self) -> None:
+        """Zero every gradient on a batch the breaker skipped for a non-finite loss.
+
+        The breaker's returned ``torch.where`` already turns a *finite* skipped loss into
+        exactly-zero gradients (backward is linear in the incoming gradient). A non-finite
+        loss is the one case that mechanism cannot neutralise — $0 \\cdot \\infty$ inside
+        the poisoned graph produces NaN — so this hook overwrites the gradients wholesale.
+        ``masked_fill_`` with the 0-dim guard, rather than a multiply, because
+        $\\mathrm{NaN} \\cdot 0$ is still NaN; the fill *selects*, so the NaN is discarded.
+        Runs after DDP's all-reduce and before clipping and the optimizer, on every rank,
+        with the guard identical everywhere (it is derived from all-reduced flags), so the
+        ranks stay in lockstep. Costs one kernel launch per parameter per training step
+        while the breaker is enabled — launches, not syncs, so the CPU never stalls.
+        """
+        guard = self._spike_grad_guard
+        if guard is None:
+            return
+        for parameter in self.parameters():
+            if parameter.grad is not None:
+                parameter.grad.masked_fill_(guard, 0.0)
 
     def _log_learning_rate(self) -> None:
         """Report the first parameter group's LR once per epoch."""

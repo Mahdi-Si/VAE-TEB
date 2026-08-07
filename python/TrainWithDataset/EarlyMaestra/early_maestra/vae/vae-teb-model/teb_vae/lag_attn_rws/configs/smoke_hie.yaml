@@ -2,10 +2,16 @@
 #
 # NOT a sweep arm and not a result config -- it is the dev-box run that de-risks a production
 # calibration before multi-day time is spent on it. It shares the shipped model geometry with
-# default.yaml on purpose: the pathology this config exists to reproduce (the conditional prior's
+# default.yaml on purpose: the pathology it was written around (the conditional prior's
 # log-variance falling onto its clamp floor) is a property of the objective at the real widths,
 # and a shrunken model would not reproduce it. Only the run's *scale* is local -- one device, one
 # shard, hundreds of epochs instead of thousands.
+#
+# Read the sign carefully now: default.yaml ships base_decode: mean and posterior_logvar_mode:
+# independent, the two keys added to REMOVE that pathology, so this run is a check that the
+# collapse is gone rather than a reproduction of it. `logvar_prior_floor_frac` staying flat is the
+# pass condition, not the failure. The configuration the collapse was measured in is
+# base_decode: sample plus posterior_logvar_mode: residual; see smoke_hie_control.yaml.
 #
 # What it is NOT: a generalisation measurement. `output/hie_cs.hdf5` is 339 windows from 14
 # recordings, and it is used for BOTH splits, because `dataset_kwargs` is shared between the two

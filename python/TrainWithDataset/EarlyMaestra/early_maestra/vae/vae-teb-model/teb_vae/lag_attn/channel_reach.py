@@ -54,7 +54,7 @@ from teb_vae.lag_attn.eval.representation_capacity_probe import (
 # one dataset fact would let the guard and the reported lag desynchronise silently. Importing a
 # net module from outside `nets/` is the permitted direction -- the rule is that `nets/` must not
 # import this module -- and `lag_report` is plain torch.
-from teb_vae.lag_attn_rws.nets.lag_report import SECONDS_PER_STEP
+from teb_vae.lag_attn.nets.lag_report import SECONDS_PER_STEP
 
 #: Band edges of the stored phase-harmonic selections, in Hz, as
 #: ``hdf5_dataset/new_pipeline/create_new_pipeline.py`` sets them. The target block spans the

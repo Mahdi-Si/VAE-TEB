@@ -83,7 +83,7 @@ from teb_vae.lag_attn.figure_primitives import (  # noqa: E402
     to_numpy,
 )
 from teb_vae.lag_attn_rws.nets.geometry import TrimmedRawGeometry  # noqa: E402
-from teb_vae.lag_attn_rws.nets.lag_report import (  # noqa: E402
+from teb_vae.lag_attn.nets.lag_report import (  # noqa: E402
     COMPENSATED_LAG_AXIS_LABEL,
     SECONDS_PER_STEP,
     lag_compensated_seconds,

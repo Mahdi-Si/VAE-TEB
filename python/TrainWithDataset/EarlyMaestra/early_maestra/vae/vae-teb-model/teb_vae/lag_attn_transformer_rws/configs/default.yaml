@@ -52,7 +52,9 @@ general_config:
   # an epoch-granular ramp cannot express it. The framework's own LinearLR path additionally
   # rejects start_factor=0.0 and so cannot ramp from zero at all.
   lr_warmup_steps: 2000
-  plot_frequency: 1
+  # Epoch cadence of the loss-curve HTML and the diagnostic figure, both rendered by rank 0
+  # inside the fit; at 1 a multi-day run pays two PDF renders plus an HTML rewrite every epoch.
+  plot_frequency: 5
   epochs: 5000
   accumulate_grad_batches: 1
   batch_size:
@@ -121,6 +123,25 @@ model_config:
     c_u: 58                # 43 (up_st) + 15 (up_ph); must be 15 when use_up_st=false
     use_up_st: true
     dropout: 0.1
+    # Dropout for the SOURCE pathway alone -- its adapter/front end, its encoder, and the attended
+    # source summary inside the posterior fusion.
+    #
+    # null = exactly the previous model, and that is NOT one number. The adapter and the encoder
+    # always ran at `dropout` above and keep doing so; the dropout on the attended source summary
+    # is a site this key INTRODUCED -- there was none there before -- so null leaves that one OFF.
+    # Resolving it to `dropout` as well would put p=0.1 inside the posterior of every run that
+    # leaves this key unset, invisible in eval mode. Any explicit value applies to all three sites.
+    #
+    # This exists because the measured failure is specific to the source pathway: over epochs
+    # 55-120 of the 125-epoch run the KL held at 1.44 nats and the latent displacement at 0.084,
+    # both unchanged, while the HELD-OUT predictive gain fell from +3.25 to -0.70. Same rate, same
+    # magnitude, degraded content -- the map from the source to delta_mu is memorising, and a
+    # rate-based lever (beta) cannot reach a failure that happens at constant rate.
+    #
+    # Shipped null, NOT an elevated value, and that is deliberate: no measurement supports any
+    # particular rate here, and putting an unvalidated one in the headline run would confound it.
+    # The mechanism ships; sweep_source_dropout_0p2.yaml and _0p3.yaml measure the strength.
+    source_dropout: null
     decoder_hidden: 128
     # Inherited from a decoder that emitted feature coefficients; the right bounds for a
     # z-scored raw FHR target are unknown until the first run's log-variance distributions
@@ -137,12 +158,83 @@ model_config:
     # gap reads spuriously small. Revisit against the logged anchor_coverage_frac distribution.
     coverage_floor: 0.9
 
+    # --- How the base branch gets its latent ------------------------------------
+    # 'sample' decodes z^p = mu^p + sigma^p * eps (the shared eps); 'mean' decodes at mu^p.
+    #
+    # 'mean' is shipped because D_0 is the only term in the objective whose gradient DIRECTLY
+    # prefers a narrow prior: it decodes a *sample*, sampling noise can only degrade a forecast,
+    # so its gradient on the prior log-variance points down without limit and nothing opposes it
+    # from below. The 125-epoch anchored run has logvar_prior_floor_frac climbing 0.017 -> 0.496
+    # and still rising at epoch 125; the beta_prior anchor slowed that and did not stop it,
+    # because the anchor's restoring force saturates at beta_prior/2 per dimension while the
+    # reconstruction's opposing pressure grows as the decoder sharpens.
+    #
+    # Under 'mean' the prior's scale is left to the two terms that want it WIDE: KL(q||p), which
+    # pulls the prior out to cover the posterior, and the scale anchor. Note this does NOT make
+    # the model an autoencoder -- the posterior branch, which is the one the coupling is read
+    # from, is still sampled. What it removes is the pressure that was making the *prior*
+    # deterministic.
+    #
+    # The cost, accepted deliberately: base and full are no longer bitwise identical at init,
+    # since the full branch still carries the posterior's noise. The KL is still exactly zero
+    # there, because that depends on the two distributions and not on the samples drawn from
+    # them. sweep_base_sample.yaml is the ablate-one arm.
+    #
+    # The second cost, which is about comparability rather than init: under 'sample' the two
+    # branches shared one eps, so the sampling noise cancelled in D_base - D_full and the
+    # TRAINING-path pred_gap was a common-random-numbers contrast. Under 'mean' only the full
+    # branch is sampled, and sampling noise can only raise a branch's NLL, so the training-path
+    # gap is biased down by an amount that has nothing to do with the source. Do not compare a
+    # training-path pred_gap across this key. The OFFLINE eval is unaffected -- it rebuilds the
+    # pairing from the latent distributions and never reads base_decode -- so cross-run pred_gap
+    # comparisons belong there.
+    base_decode: mean
+
+    # --- How the posterior's log-variance is built -------------------------------
+    # 'residual' adds a bounded delta to the PRIOR's pre-bound raw log-variance; 'independent'
+    # gives the posterior its own head.
+    #
+    # This is the second of the two paths that collapse the prior's scale, and the one that
+    # survives base_decode: mean. Under 'residual', logvar_post = smooth_bound(raw_logvar_prior +
+    # delta), so the full branch's pressure to sharpen sigma_q lands on the PRIOR's own tensor:
+    # D_1 drags the prior's log-variance down alongside its own. Measured on the tiny model, the
+    # full branch's reconstruction alone puts a gradient of ~8.7e-2 on the prior log-variance head
+    # under 'residual' and exactly 0 under 'independent'.
+    #
+    # With both keys shipped, the prior's log-variance receives gradient from KL(q||p) -- which
+    # pulls it UP, to cover the posterior -- and from the beta_prior anchor, and from nothing that
+    # wants it narrow.
+    #
+    # The cost: q == p at init is no longer structural. It is recovered exactly under
+    # head_init_calibration (shipped true), which pins the prior's raw log-variance to the same
+    # constant the independent head is seeded at, so the KL is still exactly 0 at step 0.
+    #
+    # With head_init_calibration FALSE the init KL is not small: two independently initialised
+    # heads disagree by whatever their init happens to give, measured on the tiny model at 54
+    # nats/step mean and 142 nats/step max, against exactly 0 under 'residual' with or without the
+    # calibration. That matters because the readout rests on K_t == 0 at init -- unearned
+    # divergence on that scale is indistinguishable from coupling in every downstream figure. Any
+    # arm that sets head_init_calibration: false therefore inherits a broken zero-KL start from
+    # this key and should pin posterior_logvar_mode: residual unless the arm is about that start.
+    # sweep_logvar_residual.yaml is the ablate-one arm.
+    posterior_logvar_mode: independent
+
     # --- Causal input reach budget ---------------------------------------------
-    # Bound on how far (seconds) an input feature may read into its own future. null = no delay
-    # and all channels: the clean architecture comparison. A finite budget prunes channels whose
-    # analytic reach exceeds it and delays the survivors; the input adapters then carry the
-    # availability projection and the start embedding that make the zero-filled prefix trainable.
-    causal_reach_budget_s: null
+    # Bound on how far (seconds) an input feature may read into its own FUTURE. The stored
+    # features are two-sided wavelet transforms: at null, the value at anchor t carries raw signal
+    # from up to 974 s AFTER t, so the target-only branch is partly reading its own answer and
+    # every predictive readout taken against it is measured through that leak. A finite budget
+    # prunes the channels whose analytic reach exceeds it and delays the survivors; the input
+    # adapters then carry the availability projection and the start embedding that make the
+    # zero-filled prefix trainable.
+    #
+    # 120 resolves to 78 of 109 target channels and 29 of 58 source channels, at a maximum delay
+    # of exactly 30 steps -- which is warmup_period, the deepest budget the warm-up admits. It is
+    # the shipped value because the 1018-epoch baseline and the 125-epoch anchored run were both
+    # measured at null, so their D_base is not a target-only forecast: it is a target-only
+    # forecast plus up to sixteen minutes of lookahead, and the source has correspondingly less
+    # left to add. sweep_reach_null.yaml is the ablate-one arm that recovers the old behaviour.
+    causal_reach_budget_s: 120
 
     # --- Encoders --------------------------------------------------------------
     # The two history encoders, and the whole of what differs from the model this one is compared
@@ -226,7 +318,9 @@ dataset_config:
   stat_path: /data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_new_channel_selection/stats.hdf5
 
   dataloader_config:
-    num_workers: 4
+    # 8 per rank: the prod box has 128 cores against 7 ranks (56 persistent workers), so the
+    # extra workers still leave headroom; revisit against the profiler's dataloader-next timing.
+    num_workers: 8
     prefetch_factor: 4
     # 'fhr' here is REQUIRED: the raw target must arrive z-scored or the Gaussian NLL is
     # meaningless, and the loader raises nothing on its own. The entry point guards it.
@@ -254,7 +348,10 @@ dataset_config:
       epoch_min: -48000
       epoch_max: null
       label: null
-      cache_size: 10000
+      # 0: the FIFO cache stores fully processed samples (~240 KB each, so 10000 held ~2.4 GB
+      # PER WORKER), and under the DistributedSampler's per-epoch reshuffle a worker almost
+      # never re-sees a cached index -- the RAM bought near-zero hits.
+      cache_size: 0
       # Must match the stats file's trim_minutes or normalization is wrong; a mismatch only
       # warns. The whole raw-index geometry (forecast of anchor t starts at 16*(t+1)) assumes
       # this trimmed grid.
@@ -289,10 +386,21 @@ advanced_config:
     sync_batchnorm: false     # there is no BatchNorm anywhere in this model
     deterministic: false
     benchmark: true
-    # REQUIRED false: the LSTM is gone, but the data-dependent boolean mask indexing behind
-    # kld_active_frac and the masked source KL still break TorchInductor.
+    # LIVE for this architecture, and shipped off pending a measurement. The LSTM that made the
+    # raw-signal base refuse this key outright is gone, and the other blocker once recorded here
+    # was never one for the compiled region: only the net's FORWARD is compiled, and the task runs
+    # the objective through orig_model, so the data-dependent mask indexing behind kld_active_frac
+    # never enters the graph. What is left is a numerical question rather than a mechanical
+    # blocker: inductor may reassociate float arithmetic, and `pred_gap` is a difference of order
+    # 1e-1 between two block NLLs of order 1e+2. Before adopting a compiled run, set this true on
+    # ONE run, compare `pred_gap` on a fixed batch against the eager value, and only then keep it.
+    # Refused outright alongside attention_grad_checkpoint, which genuinely does defeat inductor.
     compile: false
-    log_every_n_steps: 1
+    # Cadence of the per-STEP logger flush: each flush is a synchronous MLflow log_batch HTTP
+    # call from rank 0 carrying every on_step metric. Epoch aggregates, metrics_history.csv and
+    # the checkpoint monitor are epoch-level and unaffected; only the MLflow step-series
+    # resolution changes. Matches the gradient-norm hook's sampling stride.
+    log_every_n_steps: 25
     # REQUIRED 0: MetricsLoggingCallback has no sanity guard, so a sanity pass would shift every
     # epoch number against MLflow and the checkpoint filenames.
     num_sanity_val_steps: 0

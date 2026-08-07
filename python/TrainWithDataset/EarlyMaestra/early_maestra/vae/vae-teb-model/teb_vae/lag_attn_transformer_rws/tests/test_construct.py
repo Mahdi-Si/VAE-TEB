@@ -17,7 +17,7 @@ import torch
 from torch import nn
 
 from teb_vae.lag_attn.nets.heads import PriorHead
-from teb_vae.lag_attn_rws.nets.delays import ChannelDelay, ChannelGate
+from teb_vae.lag_attn.nets.delays import ChannelDelay, ChannelGate
 from teb_vae.lag_attn_transformer_rws.nets.blocks import (
     CausalSelfAttention,
     GatedCausalConvBlock,

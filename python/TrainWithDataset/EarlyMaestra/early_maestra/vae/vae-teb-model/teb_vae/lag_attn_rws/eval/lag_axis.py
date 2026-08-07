@@ -25,7 +25,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from teb_vae.lag_attn_rws.nets.lag_report import lag_compensated_seconds
+from teb_vae.lag_attn.nets.lag_report import lag_compensated_seconds
 
 
 def compensated_seconds_axis(n_lags: int, delay_steps: int) -> np.ndarray:

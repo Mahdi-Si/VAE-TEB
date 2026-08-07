@@ -1,0 +1,40 @@
+# Ablate-one arm: causal_reach_budget_s = null, restoring the UNGUARDED input.
+#
+# The shipped default is 120 s. This arm turns the guard off, and it is the control for what that
+# guard costs and buys -- not a legacy setting kept around for convenience.
+#
+# What null means. The stored features are two-sided wavelet transforms, so the value at anchor t
+# already contains raw signal from after t -- up to 974 s of it, for the lowest-frequency channel.
+# Unguarded, the target-only branch is therefore partly reading its own answer, and D_base is a
+# target-only forecast plus lookahead. Every headline number measured before this arm existed (the
+# 1018-epoch baseline and the 125-epoch anchored run) was measured with the guard off, which is
+# why the arm has to stay runnable.
+#
+# It is NOT, however, those runs' configuration. This file overrides one key against a default.yaml
+# that the same commit also moved on two others: base_decode sample -> mean and
+# posterior_logvar_mode residual -> independent. So the delta between THIS ARM AND THE SHIPPED
+# DEFAULT isolates the reach guard exactly (both inherit the other two), while the delta between
+# this arm and the recorded baseline tables contains all three. Reading the second as the first
+# credits the reach guard with the two prior-collapse changes. To reproduce the baseline, add
+# `base_decode: sample` and `posterior_logvar_mode: residual` to the block below.
+#
+# What to read off it. D_base should be WORSE under the shipped default than here, and that is the
+# arm working rather than failing -- a guarded base branch has lost the lookahead it was quietly
+# using. The quantity of interest is the held-out pred_gap and the source margin: if the source's
+# contribution was being subsumed by the target branch's leak, the gap improves under the guard
+# even though both branches score worse in absolute terms.
+#
+# Costs and structural notes. Unguarded, all 109 target and 58 source channels survive and no
+# channel is delayed, so no gate module is constructed at all and neither availability parameter
+# (W_m, e_start) exists -- the model is parameter-for-parameter the pre-guard one. That also means
+# this arm builds different input-adapter widths from the default (109/58 against 78/29), so it
+# shares a checkpoint with neither the default nor any other reach arm.
+#
+#   TEB_RUN_STAMP="$(date '+%Y-%m-%d--[%H-%M]')" torchrun --nproc_per_node=7 \
+#       -m teb_vae.lag_attn_transformer_rws.trainer \
+#       --config teb_vae/lag_attn_transformer_rws/configs/sweep_reach_null.yaml
+base: default.yaml
+
+model_config:
+  VAE_model:
+    causal_reach_budget_s: null

@@ -37,7 +37,7 @@ from loguru import logger
 
 from teb_vae.lag_attn_rws.eval import cohort
 from teb_vae.lag_attn_rws.eval import figures_seam as figures
-from teb_vae.lag_attn_rws.nets.lag_report import SECONDS_PER_STEP
+from teb_vae.lag_attn.nets.lag_report import SECONDS_PER_STEP
 
 #: This analysis's own subdirectory inside the results directory.
 ANALYSIS_DIRNAME = "trajectory"

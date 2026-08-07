@@ -328,16 +328,23 @@ def test_every_key_the_preflight_refuses_is_documented_as_absent(design):
     assert len(INERT_MODEL_KEYS) == 8
 
 
-def test_the_front_end_has_no_configuration_surface(design, shipped):
+def test_the_front_ends_shape_has_no_configuration_surface(design, shipped):
     """The widths derive from ``d_model`` and the kernels are the constructor's own default, so
     there is nothing for an operator to set and nothing for the signature sweep to drop in silence.
-    Listed as deliberately absent so the choice reads as a choice rather than an omission."""
+    Listed as deliberately absent so the choice reads as a choice rather than an omission.
+
+    The backward reach is the one front-end quantity that *is* configured, and it must be in the
+    required list rather than the absent one -- the two lists are read as a pair, and a key in
+    neither is exactly the silent-drop failure this file exists to catch."""
     absent = _KEY_PATTERN.findall(_section(design, "Deliberately absent"))
+    required = _KEY_PATTERN.findall(_section(design, "Required"))
 
     assert "model_config.VAE_model.frontend_kernels" in absent
-    assert not [
+    assert "model_config.VAE_model.frontend_reach_budget_s" not in absent
+    assert "model_config.VAE_model.frontend_reach_budget_s" in required
+    assert [
         key for key in shipped["model_config"]["VAE_model"] if key.startswith("frontend")
-    ]
+    ] == ["frontend_reach_budget_s"]
 
 
 def test_the_seven_encoder_keys_are_documented_as_required(design):

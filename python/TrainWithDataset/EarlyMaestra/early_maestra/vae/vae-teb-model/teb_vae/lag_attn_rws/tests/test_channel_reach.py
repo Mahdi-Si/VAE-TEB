@@ -32,7 +32,7 @@ from teb_vae.lag_attn.eval.representation_capacity_probe import (
     forward_reach,
     select_phase_pairs,
 )
-from teb_vae.lag_attn_rws.channel_reach import (
+from teb_vae.lag_attn.channel_reach import (
     SOURCE_PHASE_BAND_HZ,
     TARGET_PHASE_BAND_HZ,
     block_reach_seconds,

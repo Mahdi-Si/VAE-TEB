@@ -45,7 +45,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from teb_vae.lag_attn_rws.nets.lag_report import SECONDS_PER_STEP
+from teb_vae.lag_attn.nets.lag_report import SECONDS_PER_STEP
 from teb_vae.lag_attn_rws.nets.raw_masks import VALID_THRESHOLD
 from teb_vae.lag_attn_transformer_rws.nets.blocks import (
     LAYER_SCALE_INIT,

@@ -42,9 +42,10 @@ def _config(**vae_overrides) -> dict:
 # --------------------------------------------------------------------------------------
 # The claim
 # --------------------------------------------------------------------------------------
-def test_the_shipped_config_earns_plain_ddp(trainer):
-    """The payoff of the learned observation variance plus the unconditional W_o freeze."""
-    assert trainer.select_ddp_strategy(8, trainer.config) == "ddp"
+def test_the_shipped_config_earns_every_parameter_reachable(trainer):
+    """The payoff of the learned observation variance plus the unconditional W_o freeze: the
+    reducer can expect every parameter, which is what the ``'ddp'`` shorthand used to say."""
+    assert trainer.ddp_kwargs(trainer.config)["find_unused_parameters"] is False
 
 
 def test_a_single_device_needs_no_strategy(trainer):
@@ -53,10 +54,38 @@ def test_a_single_device_needs_no_strategy(trainer):
 
 def test_an_mse_likelihood_starves_the_logvar_heads(trainer):
     """The tiny smoke configuration: mse stops consuming the decoder log-variance heads."""
-    assert (
-        trainer.select_ddp_strategy(8, _config(likelihood="mse"))
-        == "ddp_find_unused_parameters_true"
-    )
+    assert trainer.ddp_kwargs(_config(likelihood="mse"))["find_unused_parameters"] is True
+
+
+def test_the_buffer_broadcast_is_off_and_the_gradients_are_bucket_views(trainer):
+    """Two performance settings the shorthand strings cannot express, which is why the selector
+    returns an instance. ``broadcast_buffers=False`` is safe only because every buffer in this
+    family is a deterministic function of the config -- filter banks, rotary tables, causal masks,
+    index grids -- and there is no ``BatchNorm`` anywhere to carry a genuinely per-rank running
+    statistic."""
+    kwargs = trainer.ddp_kwargs(trainer.config)
+
+    assert kwargs["broadcast_buffers"] is False
+    assert kwargs["gradient_as_bucket_view"] is True
+
+
+def test_static_graph_is_not_claimed(trainer):
+    """The negative control on the performance bundle, and a correctness call rather than an
+    omission: the loss-spike breaker substitutes a zero-weighted sum over every parameter on a
+    skipped batch, which is a structurally different backward from the one iteration 1 recorded.
+    ``static_graph=True`` promises DDP that never happens, and the breaker ships enabled."""
+    assert "static_graph" not in trainer.ddp_kwargs(trainer.config)
+
+
+def test_the_settings_reach_the_strategy_object(trainer):
+    """``DDPStrategy`` forwards unrecognised kwargs into ``_ddp_kwargs`` and on to
+    ``DistributedDataParallel``. That name is Lightning-internal, so it is asserted **here only**
+    -- everything else in this file reads :meth:`ddp_kwargs`, which is ours. If Lightning ever
+    stops forwarding them, this is the test that says so rather than a silently slower run."""
+    strategy = trainer.select_ddp_strategy(8, trainer.config)
+
+    assert type(strategy).__name__ == "DDPStrategy"
+    assert strategy._ddp_kwargs == trainer.ddp_kwargs(trainer.config)
 
 
 def test_the_selector_is_a_pure_function_of_config(trainer):
@@ -66,7 +95,7 @@ def test_the_selector_is_a_pure_function_of_config(trainer):
     without_model = trainer.select_ddp_strategy(8, trainer.config)
     with_wrapper = trainer.select_ddp_strategy(8, trainer.config, model=object())
 
-    assert without_model == with_wrapper == "ddp"
+    assert without_model._ddp_kwargs == with_wrapper._ddp_kwargs
 
 
 def test_the_hook_is_the_un_prefixed_name_the_framework_looks_up():
@@ -86,7 +115,7 @@ def test_the_override_reaches_the_trainer_kwargs(trainer, monkeypatch):
 
     kwargs = trainer._build_trainer_kwargs([])
 
-    assert kwargs["strategy"] == "ddp"
+    assert type(kwargs["strategy"]).__name__ == "DDPStrategy"
     assert kwargs["accelerator"] == "gpu"
 
 

@@ -28,6 +28,7 @@ from typing import Any, Dict
 
 import numpy as np
 import pytest
+import torch
 import yaml
 
 from teb_vae.lag_attn_rws.eval import preflight, report_seam, run as run_module
@@ -306,10 +307,115 @@ def reference() -> Dict[str, Any]:
     return json.loads(REFERENCE_MANIFEST.read_text(encoding="utf-8"))
 
 
+#: The model keys the reference manifest was captured under, restated here because the shipped
+#: config has since moved off three of the four and this gate must not move with it.
+#: ``source_dropout`` is the exception and is pinned rather than restored: it still ships at
+#: ``null``, which resolves to the pre-key model at every site it touches, so the entry records
+#: the capture condition instead of overriding it -- see the exemption in
+#: :func:`test_the_legacy_keys_are_the_ones_the_shipped_config_has_moved_off`.
+#:
+#: The gate asks one question -- *is the binding seam a pure refactor?* -- and answers it by
+#: digesting a pipeline run against a capture from before the seam existed. That comparison is
+#: only meaningful if everything except the seam is held at the capture's values. When the
+#: bottleneck bundle changed what the model computes (the causal guard on, the base branch decoded
+#: at the prior mean, an independent posterior log-variance head), every digest moved for reasons
+#: that have nothing to do with the seam, and the gate would have been reporting a refactor
+#: failure that did not happen.
+#:
+#: So the checkpoint this gate evaluates is trained at the legacy values, and the shipped values
+#: are asserted elsewhere -- in the config-load tests, which is where a claim about a committed
+#: file belongs. Regenerating the manifest instead would have destroyed the only record of what
+#: the pipeline produced before the seam was opened; see the ``reference`` fixture.
+LEGACY_MODEL_KEYS = {
+    "causal_reach_budget_s": None,
+    "base_decode": "sample",
+    "posterior_logvar_mode": "residual",
+    "source_dropout": None,
+}
+
+
 @pytest.fixture(scope="module")
-def rerun(reference, trained_run, multi_class_shards, tmp_path_factory) -> Path:
+def legacy_trained_run(tmp_path_factory) -> Path:
+    """``trained_run``, rebuilt at :data:`LEGACY_MODEL_KEYS`.
+
+    Deliberately a copy of the shared fixture's construction rather than a parameter on it: every
+    other test in this suite must see the *shipped* model, and a switch on the shared fixture
+    would let a future edit point them at the legacy one by accident.
+    """
+    from teb_vae.lag_attn.config import load_config
+    from teb_vae.lag_attn_rws.nets.model import SeqVaeLagAttnRws
+    from teb_vae.lag_attn_rws.task import SeqVaeLagAttnRwsTask
+    from teb_vae.lag_attn_rws.tests.conftest import (
+        TASK_HPARAMS,
+        _REPO_ROOT,
+        absolutize_dataset_paths,
+    )
+    from teb_vae.lag_attn_rws.trainer import RESOLVED_CONFIG_FILENAME, LagAttnRwsTrainer
+
+    run_dir = tmp_path_factory.mktemp("legacy_run")
+    checkpoint_dir = run_dir / "model_checkpoints"
+    checkpoint_dir.mkdir()
+
+    tiny = Path(_REPO_ROOT) / "teb_vae" / "lag_attn_rws" / "configs" / "tiny.yaml"
+    config = absolutize_dataset_paths(load_config(str(tiny)))
+    config["model_config"]["VAE_model"].update(LEGACY_MODEL_KEYS)
+    config_path = run_dir / "config.yaml"
+    config_path.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
+
+    driver = LagAttnRwsTrainer(config_file_path=str(config_path))
+    model_kwargs = driver._build_model_kwargs()
+    torch.manual_seed(0)
+    model = SeqVaeLagAttnRws(**model_kwargs)
+    # Load-bearing, exactly as in the shared fixture: the delta heads are zero-initialised, so an
+    # unperturbed checkpoint is indistinguishable in weight space from one that never loaded.
+    generator = torch.Generator().manual_seed(3)
+    with torch.no_grad():
+        for parameter in model.posterior_head.parameters():
+            parameter.add_(torch.randn(parameter.shape, generator=generator) * 0.1)
+
+    task = SeqVaeLagAttnRwsTask(
+        model, lr=1e-3, model_kwargs=model_kwargs,
+        **dict(TASK_HPARAMS, likelihood=config["model_config"]["VAE_model"]["likelihood"]),
+    )
+    blob = {"state_dict": task.state_dict(), "epoch": 0, "global_step": 0,
+            "hyper_parameters": dict(task.hparams)}
+    task.on_save_checkpoint(blob)
+    torch.save(blob, checkpoint_dir / "lag-attn-rws-epoch=00.ckpt")
+
+    (checkpoint_dir / RESOLVED_CONFIG_FILENAME).write_text(
+        yaml.safe_dump(config, sort_keys=False), encoding="utf-8"
+    )
+    return checkpoint_dir / "lag-attn-rws-epoch=00.ckpt"
+
+
+def test_the_legacy_keys_are_the_ones_the_shipped_config_has_moved_off(shipped_vae_config):
+    """The guard on the guard. If a key here silently matched the shipped value again, this gate
+    would go back to testing the shipped model without anyone choosing that -- and if a key were
+    renamed, the override would land nowhere and the gate would quietly drift."""
+    for key, legacy in LEGACY_MODEL_KEYS.items():
+        assert key in shipped_vae_config, f"{key} is not a live config key any more"
+        if key != "source_dropout":
+            assert shipped_vae_config[key] != legacy, (
+                f"{key} ships at its legacy value {legacy!r}; this gate no longer holds anything "
+                f"fixed and the entry should be dropped"
+            )
+
+
+@pytest.fixture(scope="module")
+def shipped_vae_config() -> Dict[str, Any]:
+    """The shipped ``VAE_model`` block, for the guard above."""
+    from teb_vae.lag_attn.config import load_config
+    from teb_vae.lag_attn_rws.tests.conftest import _REPO_ROOT
+
+    shipped = Path(_REPO_ROOT) / "teb_vae" / "lag_attn_rws" / "configs" / "default.yaml"
+    return load_config(str(shipped))["model_config"]["VAE_model"]
+
+
+@pytest.fixture(scope="module")
+def rerun(reference, legacy_trained_run, multi_class_shards, tmp_path_factory) -> Path:
     """One full pipeline run under exactly the parameters the reference was captured with."""
     run = reference["run"]
+    trained_run = legacy_trained_run
     assert run["checkpoint_fixture"] == "trained_run"
     assert run["shards_fixture"] == "multi_class_shards"
 

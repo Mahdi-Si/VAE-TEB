@@ -78,15 +78,21 @@ class _GradientHookStub:
     """The whole surface ``on_before_optimizer_step`` touches, and nothing else.
 
     Bound to the unbound method rather than built from a real task: the hook reads only
-    ``self.parameters()``, ``self.trainer.gradient_clip_val`` and ``self.log``, so a stub tests the
-    threshold predicate directly and without a fit.
+    ``self.parameters()``, ``self.trainer`` (the clip threshold plus the sampling stride's
+    ``global_step``/``is_last_batch``), the stride class attribute and ``self.log``, so a stub
+    tests the threshold predicate directly and without a fit. ``global_step=0`` lands on the
+    stride, so the hook body runs.
     """
+
+    GRAD_NORM_LOG_EVERY_N_STEPS = SeqVaeLagAttnRwsTask.GRAD_NORM_LOG_EVERY_N_STEPS
 
     def __init__(self, clip_val: Any) -> None:
         parameter = torch.nn.Parameter(torch.zeros(4))
         parameter.grad = torch.full((4,), 3.0)  # gradient norm exactly 6.0
         self._parameters = [parameter]
-        self.trainer = SimpleNamespace(gradient_clip_val=clip_val)
+        self.trainer = SimpleNamespace(
+            gradient_clip_val=clip_val, global_step=0, is_last_batch=False
+        )
         self.logged: dict = {}
 
     def parameters(self):

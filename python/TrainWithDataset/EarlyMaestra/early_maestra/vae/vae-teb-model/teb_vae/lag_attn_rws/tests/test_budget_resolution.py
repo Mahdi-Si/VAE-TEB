@@ -12,7 +12,7 @@ import math
 
 import pytest
 
-from teb_vae.lag_attn_rws.channel_reach import (
+from teb_vae.lag_attn.channel_reach import (
     SECONDS_PER_STEP,
     block_reach_seconds,
     resolve_channel_budget,

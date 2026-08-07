@@ -86,7 +86,7 @@ import numpy as np
 import torch
 
 from teb_vae.lag_attn_rws.nets import controls
-from teb_vae.lag_attn_rws.nets.lag_report import (
+from teb_vae.lag_attn.nets.lag_report import (
     lag_compensated_seconds,
     lag_original_sensor_seconds,
 )

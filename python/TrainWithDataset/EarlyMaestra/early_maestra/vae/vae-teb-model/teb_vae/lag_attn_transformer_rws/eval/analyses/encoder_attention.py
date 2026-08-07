@@ -51,7 +51,7 @@ from teb_vae.lag_attn_rws.eval import figures_seam as figures
 from teb_vae.lag_attn_rws.eval._reuse import labels
 from teb_vae.lag_attn_rws.eval.cohort import ordered_groups
 from teb_vae.lag_attn_rws.eval.frames import grouped_frame_entry, per_recording_means
-from teb_vae.lag_attn_rws.nets.lag_report import SECONDS_PER_STEP
+from teb_vae.lag_attn.nets.lag_report import SECONDS_PER_STEP
 from teb_vae.lag_attn_transformer_rws.eval.encoder_attention import (
     POOLED_CLASS,
     REACH_QUANTILES,

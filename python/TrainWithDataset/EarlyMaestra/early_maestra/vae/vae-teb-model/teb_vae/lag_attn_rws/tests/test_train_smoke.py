@@ -109,11 +109,22 @@ def test_the_zero_kl_init_invariant_survives_the_whole_stack(fit):
     Re-derived from a freshly built model rather than read off the trained run: after an epoch
     the KL is legitimately nonzero, and the question is whether the model the config builds
     starts at zero.
+
+    The KL half holds in every configuration, because it is a function of the two *distributions*.
+    The forecast half depends on ``base_decode``, and the assertion is split accordingly rather
+    than relaxed to a tolerance for both:
+
+    * ``'sample'`` -- the shared $\epsilon$ makes $z^p = z^q$ elementwise, so the two forecasts
+      are bitwise identical.
+    * ``'mean'`` (shipped) -- the base branch decodes $\mu^p$ while the full branch still samples,
+      so the two differ by the posterior's own noise. What must hold instead is that the base
+      forecast **is** the decode of $\mu^p$, which is the property that makes $D_0$ noise-free.
     """
     driver, _ = fit
     from teb_vae.lag_attn_rws.nets.model import SeqVaeLagAttnRws
 
-    model = SeqVaeLagAttnRws(**driver._build_model_kwargs()).eval()
+    kwargs = driver._build_model_kwargs()
+    model = SeqVaeLagAttnRws(**kwargs).eval()
     batch_size, seq_len = 2, model.sequence_length
     generator = torch.Generator().manual_seed(0)
     outputs = model(
@@ -123,7 +134,16 @@ def test_the_zero_kl_init_invariant_survives_the_whole_stack(fit):
     )
 
     assert float(outputs["kld_per_t"].abs().max()) < 1e-6
-    assert torch.equal(outputs["mu_base"], outputs["mu_full"])
+
+    if model.base_decode == "sample":
+        assert torch.equal(outputs["mu_base"], outputs["mu_full"])
+    else:
+        assert torch.equal(outputs["z_prior"], outputs["mu_prior"])
+        expected_base, _ = model.decoder(outputs["mu_prior"][:, : model.geometry.t_valid])
+        assert torch.equal(outputs["mu_base"], expected_base)
+        # Non-vacuous: the full branch must still be somewhere else, or this would pass on a
+        # model whose posterior had stopped sampling.
+        assert not torch.equal(outputs["mu_base"], outputs["mu_full"])
 
 
 def test_every_declared_metric_reaches_the_logger(fit):
@@ -272,29 +292,47 @@ def test_the_guarded_runs_losses_stay_finite(guarded_fit):
         assert math.isfinite(float(value)), f"{name} is {float(value)}"
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "KNOWN DEFECT, reach arms only. Every finite causal_reach_budget_s zero-fills the "
-        "delayed prefix, and at step 0 EVERY surviving channel is zero (the fastest survivor is "
-        "already one step stale). That all-zero vector is zero-variance input to the adapter "
-        "norm and to each causal conv pre-norm, and the 1/sqrt(eps) = 316x backward "
-        "amplification of ~10 stacked norms compounds: measured in float64 on this fixture, the "
-        "global gradient norm is ~1e+26 at every budget (32/60/120/240 s) against ~98 unguarded, "
-        "and overflows fp32 to inf. It does NOT scale with max_delay -- one all-zero step is "
-        "enough -- so it is not fixed by raising warmup_period. Consequence: with "
-        "gradient_clip_val=250 the clip coefficient is ~1e-24, every reach-arm step is scaled to "
-        "nothing, and the arm trains only AdamW's weight decay while completing normally. "
-        "The unguarded baseline (causal_reach_budget_s: null) builds no gate and is unaffected."
-    ),
-)
-def test_the_guarded_runs_gradient_stays_finite(guarded_fit):
-    """The gradient the guarded arms actually optimise with. Fix this before running them."""
+#: What the guarded gradient norm must stay under. Not a tolerance -- a *decision boundary*
+#: between the two regimes below, set orders of magnitude above the measured value and orders of
+#: magnitude below the defect it replaces, so it can only be crossed by the defect returning.
+_GUARDED_GRAD_NORM_CEILING = 1e6
+
+
+def test_the_guarded_runs_gradient_stays_finite_and_small(guarded_fit):
+    r"""The gradient the guarded arms actually optimise with.
+
+    This was a ``strict`` xfail recording a real defect, and it is now a positive assertion
+    because the defect is fixed. What it was:
+
+    Every finite ``causal_reach_budget_s`` zero-fills the delayed prefix, and at step $0$ *every*
+    surviving channel is zero -- the fastest survivor is already one step stale. That all-zero
+    vector is zero-variance input to the adapter norm and to each causal conv pre-norm, and the
+    $1/\sqrt{\epsilon} = 316\times$ backward amplification of ~$10$ stacked norms compounds:
+    measured in float64 on this fixture, the global gradient norm reached ~$10^{26}$ at *every*
+    budget ($32/60/120/240$ s) against ~$98$ unguarded, and overflowed fp32 to ``inf``. It did not
+    scale with ``max_delay`` -- one all-zero step was enough -- so raising ``warmup_period`` did
+    not help, and at ``gradient_clip_val=250`` the clip coefficient was ~$10^{-24}$: every
+    reach-arm step was scaled to nothing and the arm trained AdamW's weight decay while completing
+    normally.
+
+    What fixed it: the adapters are now ``AvailabilityInputAdapter``, which adds
+    $W_m(m_t - \mathbf 1)$ and a start embedding, so "this position is empty" is a representation
+    the model is told about rather than a zero-variance accident. Measured through the real driver
+    on the committed shard at the $120$ s budget, the guarded gradient norm is ~$135$ against
+    ~$125$ for the transformer sibling -- the same order of magnitude as an unguarded run.
+
+    Finiteness alone would not catch a regression: the defect's $10^{26}$ is finite in float64.
+    The ceiling is what separates the two regimes.
+    """
     _, trainer = guarded_fit
 
-    grad_norm = trainer.callback_metrics["train/grad_norm"]
+    grad_norm = float(trainer.callback_metrics["train/grad_norm"])
 
-    assert math.isfinite(float(grad_norm)), f"guarded train/grad_norm is {float(grad_norm)}"
+    assert math.isfinite(grad_norm), f"guarded train/grad_norm is {grad_norm}"
+    assert grad_norm < _GUARDED_GRAD_NORM_CEILING, (
+        f"guarded train/grad_norm is {grad_norm:.3g}, past the {_GUARDED_GRAD_NORM_CEILING:g} "
+        f"ceiling -- the zero-prefix amplification this adapter exists to remove is back"
+    )
 
 
 def test_the_guarded_checkpoint_rebuilds_at_its_own_channel_widths(guarded_fit):

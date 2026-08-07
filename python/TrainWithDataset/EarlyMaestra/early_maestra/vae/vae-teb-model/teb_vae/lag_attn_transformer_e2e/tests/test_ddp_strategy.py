@@ -69,9 +69,9 @@ def _starved_parameters(module, batch) -> list:
 # --------------------------------------------------------------------------------------
 # The claim
 # --------------------------------------------------------------------------------------
-def test_the_shipped_config_earns_plain_ddp(driver):
+def test_the_shipped_config_earns_every_parameter_reachable(driver):
     """The payoff of the learned observation variance plus the unconditional W_o freeze."""
-    assert driver.select_ddp_strategy(7, driver.config) == "ddp"
+    assert driver.ddp_kwargs(driver.config)["find_unused_parameters"] is False
 
 
 def test_a_single_device_needs_no_strategy(driver):
@@ -80,10 +80,16 @@ def test_a_single_device_needs_no_strategy(driver):
 
 def test_an_mse_likelihood_starves_the_logvar_heads(driver):
     """The tiny smoke configuration: mse stops consuming the decoder log-variance heads."""
-    assert (
-        driver.select_ddp_strategy(7, _config(likelihood="mse"))
-        == "ddp_find_unused_parameters_true"
-    )
+    assert driver.ddp_kwargs(_config(likelihood="mse"))["find_unused_parameters"] is True
+
+
+def test_the_buffer_broadcast_is_off(driver):
+    """This architecture is the one with the most to gain and the most to check: its buffers are
+    the eight fixed anti-alias filter banks on top of the rotary tables, causal masks and raw-target
+    index grid the siblings carry -- $1.5$ MiB re-broadcast from rank 0 on every forward. All are
+    deterministic functions of the config, and there is no ``BatchNorm`` here to carry a per-rank
+    running statistic, so the broadcast only ever restored values that could not have differed."""
+    assert driver.ddp_kwargs(driver.config)["broadcast_buffers"] is False
 
 
 def test_the_selector_is_a_pure_function_of_config(driver):
@@ -93,7 +99,7 @@ def test_the_selector_is_a_pure_function_of_config(driver):
     without_model = driver.select_ddp_strategy(7, driver.config)
     with_wrapper = driver.select_ddp_strategy(7, driver.config, model=object())
 
-    assert without_model == with_wrapper == "ddp"
+    assert without_model._ddp_kwargs == with_wrapper._ddp_kwargs
 
 
 def test_the_selector_is_inherited_rather_than_re_pointed():
@@ -112,7 +118,7 @@ def test_the_override_reaches_the_trainer_kwargs(driver, monkeypatch):
 
     kwargs = driver._build_trainer_kwargs([])
 
-    assert kwargs["strategy"] == "ddp"
+    assert type(kwargs["strategy"]).__name__ == "DDPStrategy"
     assert kwargs["accelerator"] == "gpu"
 
 

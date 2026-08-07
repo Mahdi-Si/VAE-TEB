@@ -34,9 +34,21 @@ from teb_vae.lag_attn_transformer_rws.tests.test_forward_contract import guarded
 
 #: The two modules whose forwards run per batch and per rank. ``blocks.py`` is covered by the same
 #: walk because a branch introduced there would be just as fatal and just as invisible.
-_WALKED_MODULES = ("encoders.py", "model.py", "blocks.py")
-
 _NETS_DIR = Path(__file__).resolve().parents[1] / "nets"
+
+#: The shared net layer, which is where ``AvailabilityInputAdapter`` lives: three packages build
+#: one, so it sits beside the plain ``InputAdapter`` rather than in any one of them. Its forward
+#: carries the two conditionals this walk exists to police, so a walk scoped to this package's own
+#: ``nets/`` would pass by finding nothing.
+_SHARED_NETS_DIR = Path(__file__).resolve().parents[2] / "lag_attn" / "nets"
+
+#: ``(directory, filename)`` pairs, so the walk follows a module to whichever layer owns it.
+_WALKED_MODULES = (
+    (_NETS_DIR, "encoders.py"),
+    (_NETS_DIR, "model.py"),
+    (_NETS_DIR, "blocks.py"),
+    (_SHARED_NETS_DIR, "encoders.py"),
+)
 
 
 # ---------------------------------------------------------------------------------------
@@ -227,9 +239,9 @@ def _is_metadata_only(node: ast.expr) -> bool:
     return False
 
 
-@pytest.mark.parametrize("filename", _WALKED_MODULES)
-def test_no_forward_branches_on_a_tensor_value(filename):
-    source = (_NETS_DIR / filename).read_text(encoding="utf-8")
+@pytest.mark.parametrize("directory, filename", _WALKED_MODULES)
+def test_no_forward_branches_on_a_tensor_value(directory, filename):
+    source = (directory / filename).read_text(encoding="utf-8")
     conditionals = _forward_conditionals(source)
     offenders = [
         f"{filename}:{line} in {name}(): {ast.unparse(test)}"
@@ -246,8 +258,10 @@ def test_no_forward_branches_on_a_tensor_value(filename):
 
 def test_the_walk_finds_the_conditionals_that_are_there():
     """A silently empty walk would make the test above pass on any source at all -- including one
-    whose ``forward`` was renamed. Both adapter conditionals are known to exist."""
-    source = (_NETS_DIR / "encoders.py").read_text(encoding="utf-8")
+    whose ``forward`` was renamed, or one that moved to another package. Both adapter conditionals
+    are known to exist, and they are in the SHARED encoders module: scoping this to this package's
+    own ``nets/encoders.py`` is exactly how the walk went quietly empty once already."""
+    source = (_SHARED_NETS_DIR / "encoders.py").read_text(encoding="utf-8")
     conditionals = _forward_conditionals(source)
 
     assert len(conditionals) >= 2

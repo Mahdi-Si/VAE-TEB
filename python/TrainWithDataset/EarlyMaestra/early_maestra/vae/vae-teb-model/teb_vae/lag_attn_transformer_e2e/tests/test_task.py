@@ -123,12 +123,24 @@ def test_the_constructor_keyword_set_is_the_siblings():
     theirs = inspect.signature(SeqVaeLagAttnTrfRwsTask.__init__).parameters
 
     assert list(mine) == list(theirs)
-    assert "compile_model" not in mine  # a property of the net, not a caller's choice
+    # ``compile_model`` is in both, because both inherit one constructor from the shared base.
+    # It is admissible precisely because it is shared: it is an *execution* keyword rather than an
+    # objective one -- it changes nothing about what is optimised -- and the two schemas an
+    # evaluation entry point would rebuild these tasks from stay identical. What differs between
+    # the packages is which driver honours the config key, not which keywords the task takes.
+    assert mine["compile_model"].default is theirs["compile_model"].default is False
 
 
-def test_compilation_stays_off_and_the_eager_module_is_what_runs(task):
-    """Inductor is defeated by the data-dependent boolean mask indexing behind
-    ``kld_active_frac`` and by the masked source KL, both of which are inherited."""
+def test_compilation_stays_off_by_default_and_the_eager_module_is_what_runs(task):
+    """Default-off, so a task built without an opinion is the eager one and the baseline run is
+    eager.
+
+    The reason recorded here previously -- that the ``kld_active_frac`` mask indexing defeats
+    inductor -- does **not** hold for the compiled region: that indexing lives in ``compute_loss``,
+    which ``compute_loss_and_metrics`` reaches through ``orig_model``, so only the forward is ever
+    compiled. This package's driver therefore honours ``advanced_config.trainer.compile``
+    (``tests/test_trainer.py``); what ships is off, because inductor may reassociate float
+    arithmetic and ``pred_gap`` is a $10^{-4}$-relative difference of two block NLLs."""
     module = task()
 
     assert module.model is module.orig_model

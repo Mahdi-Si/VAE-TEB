@@ -122,7 +122,7 @@ def test_the_lag_axis_label_is_the_models_own_compensated_one() -> None:
     sensor figure adds back the $20$ s the preprocessing already removed and exists only to map a
     finding onto the original files; a figure that drew it under this name would double-count a
     deliberate correction."""
-    from teb_vae.lag_attn_rws.nets import lag_report
+    from teb_vae.lag_attn.nets import lag_report
 
     assert figures_seam.COMPENSATED_LAG_AXIS_LABEL is lag_report.COMPENSATED_LAG_AXIS_LABEL
     assert "compensated" in figures_seam.COMPENSATED_LAG_AXIS_LABEL

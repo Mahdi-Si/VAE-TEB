@@ -215,11 +215,17 @@ def test_the_run_used_a_single_process_loader(evaluated):
     assert loader_config["persistent_workers"] is False
 
 
-def test_an_unguarded_run_reports_no_input_delay(evaluated):
+def test_a_guarded_run_reports_its_input_delay(evaluated):
+    """The shipped config resolves a 120 s budget, whose worst source delay is 30 steps, and the
+    summary must carry that number: every lag the report quotes is offset by it, so a summary
+    claiming 0 would understate the physiological delay by two minutes with nothing failing.
+
+    Both places are asserted because they are written by different code paths and only their
+    agreement makes the lag axis trustworthy."""
     summary = evaluated["summary"]
 
-    assert summary["source_delay_steps"] == 0
-    assert summary["results"]["lag"]["delay_steps"] == 0
+    assert summary["source_delay_steps"] == 30
+    assert summary["results"]["lag"]["delay_steps"] == 30
 
 
 def test_the_lag_report_adds_back_the_causal_input_delay():
@@ -228,7 +234,7 @@ def test_the_lag_report_adds_back_the_causal_input_delay():
     understates the physiological delay by up to two minutes at the $120$ s budget, with nothing
     failing -- so the delay is read off the *model*, which is what was trained.
     """
-    from teb_vae.lag_attn_rws.channel_reach import resolve_stream_budgets
+    from teb_vae.lag_attn.channel_reach import resolve_stream_budgets
 
     budget = resolve_stream_budgets(
         {"causal_reach_budget_s": 120.0, "use_up_st": True, "warmup_period": 30,

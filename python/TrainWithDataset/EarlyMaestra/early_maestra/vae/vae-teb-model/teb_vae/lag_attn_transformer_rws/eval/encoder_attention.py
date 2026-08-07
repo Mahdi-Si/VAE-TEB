@@ -51,7 +51,7 @@ import torch
 
 from teb_vae.lag_attn_rws.eval._reuse import labels
 from teb_vae.lag_attn_rws.eval.metrics import batch_guids, model_inputs
-from teb_vae.lag_attn_rws.nets.lag_report import SECONDS_PER_STEP
+from teb_vae.lag_attn.nets.lag_report import SECONDS_PER_STEP
 
 #: The two history streams, in the order every table and figure reports them.
 TARGET_STREAM = "target"

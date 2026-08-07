@@ -45,9 +45,9 @@ from typing import Any, Callable, Dict, List, Mapping, Tuple, cast
 import torch
 from loguru import logger
 
-from teb_vae.lag_attn_rws import channel_reach
+from teb_vae.lag_attn import channel_reach
 from teb_vae.lag_attn_rws.eval.binding import ModelBinding
-from teb_vae.lag_attn_rws.nets.lag_report import SECONDS_PER_STEP
+from teb_vae.lag_attn.nets.lag_report import SECONDS_PER_STEP
 
 # The training entry point's own guards, imported rather than copied. Their messages name the
 # exact command that regenerates a stats file and the exact reason a width mismatch must not be
@@ -460,6 +460,12 @@ def load_witnesses(model: Any) -> Dict[str, List[torch.Tensor]]:
         ``posterior_head.delta_mu_head`` and ``delta_logvar_head``, zeroed so that $q \equiv p$
         at step $0$ and any coupling the model reports had to be learned against that null.
 
+        Under ``posterior_logvar_mode='independent'`` there is no ``delta_logvar_head`` -- the
+        posterior's log-variance is its own head, seeded at the pre-image of unit scale rather
+        than at zero, so it is **not** a zero-witness and is deliberately not collected here. The
+        mean delta is still zeroed in both modes, so the witness never becomes empty; an empty
+        witness would make the load check pass on a checkpoint that loaded nothing.
+
     ``film_generators``
         Every FiLM generator in the horizon core, zeroed *after* the generic initialisation
         xavier-refills them, so the per-block-FiLM decoder starts bitwise identical to the
@@ -486,7 +492,10 @@ def load_witnesses(model: Any) -> Dict[str, List[torch.Tensor]]:
 
     delta_heads: List[torch.Tensor] = []
     for head_name in ("delta_mu_head", "delta_logvar_head"):
-        delta_heads.extend(_tensors(getattr(model.posterior_head, head_name)))
+        head = getattr(model.posterior_head, head_name, None)
+        # None under posterior_logvar_mode='independent'; see the docstring.
+        if head is not None:
+            delta_heads.extend(_tensors(head))
 
     core = model.horizon_core
     film: List[torch.Tensor] = []
@@ -545,7 +554,7 @@ def channels_reading_past_the_horizon(horizon_seconds: float) -> Dict[str, Any]:
     carries energy from beyond the last sample the model is asked to forecast, so its "history"
     state has already seen the answer.
 
-    Recomputed from :func:`~teb_vae.lag_attn_rws.channel_reach.block_reach_seconds` on every run
+    Recomputed from :func:`~teb_vae.lag_attn.channel_reach.block_reach_seconds` on every run
     rather than stored as constants, because the reaches are a property of the production filter
     bank and a bank change must move these numbers.
 

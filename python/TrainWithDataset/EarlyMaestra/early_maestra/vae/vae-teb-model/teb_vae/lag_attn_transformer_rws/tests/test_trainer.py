@@ -285,15 +285,19 @@ def test_an_unalignable_core_checkpoint_raises_rather_than_training_from_scratch
 # The trainer kwargs: the DDP strategy and the learning-rate monitor
 # --------------------------------------------------------------------------------------
 def test_the_ddp_strategy_follows_the_configured_parameter_usage(driver):
-    """Plain ``'ddp'`` implies ``find_unused_parameters=False``, under which the reducer expects
-    every parameter to be marked ready in every backward. Exactly one group can starve, and it is
-    decided by config: the decoder log-variance heads are consumed only under ``gaussian_nll``."""
+    """``find_unused_parameters=False`` makes the reducer expect every parameter to be marked ready
+    in every backward. Exactly one group can starve, and it is decided by config: the decoder
+    log-variance heads are consumed only under ``gaussian_nll``.
+
+    Read off ``ddp_kwargs`` rather than off a strategy string, because the selector now returns a
+    configured ``DDPStrategy`` -- the shorthand strings can carry this one setting and none of the
+    others the inherited bundle sets."""
     config = driver.config
 
     assert driver.select_ddp_strategy(1, config) == "auto"
-    assert driver.select_ddp_strategy(7, config) == "ddp"
+    assert driver.ddp_kwargs(config)["find_unused_parameters"] is False
     config["model_config"]["VAE_model"]["likelihood"] = "mse"
-    assert driver.select_ddp_strategy(7, config) == "ddp_find_unused_parameters_true"
+    assert driver.ddp_kwargs(config)["find_unused_parameters"] is True
 
 
 def test_exactly_one_learning_rate_monitor_is_attached_and_it_is_step_granular(driver):
@@ -539,9 +543,16 @@ def test_the_resolved_config_is_written_beside_the_checkpoints(tmp_path, monkeyp
     # Fully resolved: the inherited keys are present and the `base:` pointer is gone.
     assert "base" not in reloaded
     assert reloaded["model_config"]["VAE_model"]["target_attention_blocks"] == 4
-    # The unguarded default records the *absence* of a guard explicitly, so a reader can tell it
-    # from a run written before the record existed.
-    assert reloaded["model_config"][shared_trainer.RESOLVED_BUDGET_KEY] is None
+    # The guarded default records what the budget resolved TO, not merely that one was asked for:
+    # the surviving channel counts and the worst delay are what a later offline pass has to read
+    # to rebuild the adapters, and `causal_reach_budget_s: 120` alone does not determine them
+    # without re-running the filter bank.
+    record = reloaded["model_config"][shared_trainer.RESOLVED_BUDGET_KEY]
+    assert record is not None
+    assert record["causal_reach_budget_s"] == 120
+    assert record["max_delay_steps"] == 30
+    assert len(record["target_keep_index"]) == 78
+    assert len(record["source_keep_index"]) == 29
 
 
 # --------------------------------------------------------------------------------------
@@ -625,3 +636,46 @@ def test_no_module_in_the_package_seeds_by_hand():
                 offenders.append(f"{path.name}: {pattern}")
 
     assert offenders == []
+
+
+# --------------------------------------------------------------------------------------
+# torch.compile: live here, and this is the driver that decides it
+# --------------------------------------------------------------------------------------
+def test_the_shipped_config_leaves_compilation_off(driver):
+    """Off is the shipped value, so the baseline is eager and a compiled run is a deliberate act."""
+    assert driver.compile_model_requested() is False
+
+
+def test_the_key_is_live_here_rather_than_ignored(driver):
+    """The distinction against the raw-signal base, whose LSTM encoders this architecture replaced.
+    If the key stayed inert an operator could set ``compile: true``, see nothing in the log, and
+    believe they had measured a compiled run."""
+    driver.config["advanced_config"]["trainer"]["compile"] = True
+
+    assert driver.compile_model_requested() is True
+
+
+def test_compilation_and_attention_checkpointing_are_refused_together(driver):
+    """The one genuine inductor blocker still reachable from this config surface. Silently dropping
+    either would give a run that is neither the compiled one nor the checkpointed one."""
+    driver.config["advanced_config"]["trainer"]["compile"] = True
+    driver.config["model_config"]["VAE_model"]["attention_grad_checkpoint"] = True
+
+    with pytest.raises(ValueError) as excinfo:
+        driver.compile_model_requested()
+
+    message = str(excinfo.value)
+    assert "attention_grad_checkpoint" in message and "compile" in message
+
+
+def test_the_objective_is_never_the_thing_compiled():
+    """Only the forward is compiled: the task reaches ``compute_loss`` through ``orig_model``, which
+    keeps the data-dependent ``kld_active_frac`` indexing out of the graph. This is the one line
+    that makes the key safe to honour, so it is asserted rather than trusted."""
+    import inspect as _inspect
+
+    from teb_vae.lag_attn_rws.task import SeqVaeLagAttnRwsTask
+
+    source = _inspect.getsource(SeqVaeLagAttnRwsTask.compute_loss_and_metrics)
+    assert "self.orig_model.compute_loss(" in source
+    assert "self.model.compute_loss(" not in source

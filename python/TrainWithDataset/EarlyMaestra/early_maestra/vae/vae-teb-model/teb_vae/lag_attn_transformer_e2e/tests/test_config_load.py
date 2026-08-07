@@ -72,6 +72,11 @@ INPUT_PATHS = (
     "model_config.VAE_model.c_u",
     "model_config.VAE_model.use_up_st",
     "model_config.VAE_model.causal_reach_budget_s",
+    # The two reach keys are a pair: the comparison config bounds how far a stored feature reads
+    # FORWARD (and this package refuses that key outright, having no stored features), while this
+    # one bounds how far the learned front end reaches BACK. Neither is the other's value under a
+    # different name, so both belong here rather than in PARITY_EXEMPT_PATHS.
+    "model_config.VAE_model.frontend_reach_budget_s",
     "dataset_config.dataloader_config.dataset_kwargs.load_fields",
     "dataset_config.dataloader_config.normalize_fields",
 )
@@ -116,6 +121,10 @@ TINY_DELTA_PATHS = frozenset(
         "general_config.cuda_devices",
         "general_config.epochs",
         "general_config.lr_warmup_steps",
+        # Pinned back to every-epoch in tiny: the shipped config plots every 5th epoch (a
+        # render-cost decision for multi-day runs), while the train-smoke tests count one
+        # figure set per epoch of a 1-3 epoch run.
+        "general_config.plot_frequency",
         "general_config.batch_size.train",
         "general_config.batch_size.test",
         "general_config.folders_config.out_dir_base",
@@ -270,13 +279,31 @@ def test_no_replaced_input_key_survives(shipped, tiny):
         assert present == []
 
 
-def test_the_front_end_has_no_configuration_surface(shipped, tiny):
-    """Its stage widths are derived from ``d_model`` and its kernels are a module constant, so
-    there is nothing here to set -- and a key that appeared would reach nothing, leaving the run
-    building a front end its config appears to describe and does not."""
+#: The only front-end key there is. Its stage widths are derived from ``d_model`` and its kernels
+#: are a module constant, so the *shape* has no configuration surface; what is configurable is the
+#: backward reach the shape is checked against, because that is the bound a depth or kernel arm
+#: has to move together with the stack.
+FRONTEND_KEYS = ("frontend_reach_budget_s",)
+
+
+def test_the_front_ends_only_configuration_surface_is_its_reach_budget(shipped, tiny):
+    """A second front-end key would reach nothing -- the signature sweep drops what names no
+    constructor argument without a word -- leaving the run building a front end its config appears
+    to describe and does not. Both directions, so the budget key cannot vanish either."""
     for config in (shipped, tiny):
         vae = config["model_config"]["VAE_model"]
-        assert [key for key in vae if "frontend" in key or "front_end" in key] == []
+        found = [key for key in vae if "frontend" in key or "front_end" in key]
+        assert sorted(found) == sorted(FRONTEND_KEYS)
+
+
+def test_the_front_end_reach_budget_ships_at_the_warmup_ceiling(shipped):
+    """$120$ s $= 480$ raw samples $=$ ``warmup_period * raw_per_step``, so the shipped value is
+    exactly what the model derived before the key existed -- explicit and sweepable rather than
+    implied. A budget may only tighten that ceiling; the constructor refuses a larger one."""
+    vae = shipped["model_config"]["VAE_model"]
+    assert vae["frontend_reach_budget_s"] == 120.0
+    ceiling_samples = vae["warmup_period"] * vae["raw_per_step"]
+    assert vae["frontend_reach_budget_s"] * vae["raw_per_step"] / 4.0 == ceiling_samples
 
 
 def test_the_shipped_config_builds_the_shipped_architecture(shipped):
@@ -396,9 +423,12 @@ def test_precision_is_float32(shipped):
     assert shipped["advanced_config"]["trainer"]["precision"] == "32-true"
 
 
-def test_compile_is_off_and_stays_off(shipped):
-    """The data-dependent boolean mask indexing behind ``kld_active_frac`` and the masked source KL
-    break inductor."""
+def test_compile_ships_off(shipped):
+    """Off in the shipped config, but **live** rather than inert here: the driver honours the key
+    (``compile_model_requested``), because only the net's forward is compiled and the objective --
+    with the ``kld_active_frac`` indexing that genuinely defeats inductor -- runs eager through
+    ``orig_model``. It ships off because inductor may reassociate float arithmetic and ``pred_gap``
+    is a $10^{-4}$-relative difference of two block NLLs, not because it cannot be turned on."""
     assert shipped["advanced_config"]["trainer"]["compile"] is False
 
 

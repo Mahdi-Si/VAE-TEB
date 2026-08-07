@@ -345,7 +345,7 @@ def test_an_analysis_may_import_its_own_module_and_the_layers_below_it() -> None
     source = (
         "from teb_vae.lag_attn_rws.eval import config_schema, events\n"
         "from teb_vae.lag_attn_rws.eval._reuse import stats\n"
-        "from teb_vae.lag_attn_rws.nets.lag_report import lag_compensated_seconds\n"
+        "from teb_vae.lag_attn.nets.lag_report import lag_compensated_seconds\n"
         "import numpy as np\n"
     )
     assert forbidden_imports(source, f"{PACKAGE}.analyses.coupling") == []

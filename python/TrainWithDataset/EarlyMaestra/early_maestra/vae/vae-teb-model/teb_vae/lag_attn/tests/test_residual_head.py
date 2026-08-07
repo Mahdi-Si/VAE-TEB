@@ -27,7 +27,9 @@ _BATCH, _SEQ_LEN = 2, 16
 _LO, _HI = -5.0, 3.0
 
 
-def _make_posterior(head_structured: bool) -> PosteriorHead:
+def _make_posterior(
+    head_structured: bool, posterior_logvar_mode: str = "residual"
+) -> PosteriorHead:
     torch.manual_seed(0)
     return PosteriorHead(
         d_model=_D_MODEL,
@@ -36,6 +38,7 @@ def _make_posterior(head_structured: bool) -> PosteriorHead:
         head_structured=head_structured,
         num_heads=_NUM_HEADS,
         d_head=_D_HEAD,
+        posterior_logvar_mode=posterior_logvar_mode,
     ).eval()
 
 
@@ -63,16 +66,46 @@ def _posterior_inputs(head_structured: bool):
     return h_y, a, mu_prior, raw_logvar_prior
 
 
-def test_the_residual_head_exists_and_the_independent_head_does_not():
-    """The independent head is not disabled, it is not built. There is nothing to dangle."""
+@pytest.mark.parametrize(
+    "mode, built, absent",
+    [
+        ("residual", "delta_logvar_head", "logvar_post_head"),
+        ("independent", "logvar_post_head", "delta_logvar_head"),
+    ],
+)
+def test_exactly_one_log_variance_head_is_built(mode, built, absent):
+    """The unused head is not disabled, it is not built -- there is nothing to dangle.
+
+    That is a DDP requirement rather than tidiness: a head that exists and feeds nothing receives
+    no gradient, and under ``find_unused_parameters=False`` that hangs the run rather than failing
+    it. Both attributes are always *present*; exactly one is non-``None``."""
     for head_structured in (False, True):
-        head = _make_posterior(head_structured)
-        assert hasattr(head, "delta_logvar_head")
-        assert not hasattr(head, "logvar_post_head")
+        head = _make_posterior(head_structured, posterior_logvar_mode=mode)
+        assert getattr(head, built) is not None
+        assert getattr(head, absent) is None
+
+
+def test_every_parameter_of_the_built_head_reaches_the_output():
+    """The other half of the same requirement, measured rather than asserted from the structure:
+    every parameter must receive a gradient from the head's own output."""
+    for mode in ("residual", "independent"):
+        for head_structured in (False, True):
+            head = _make_posterior(head_structured, posterior_logvar_mode=mode)
+            mu_post, logvar_post = head(*_posterior_inputs(head_structured))
+            head.zero_grad()
+            (mu_post.sum() + logvar_post.sum()).backward()
+            dangling = [
+                name for name, parameter in head.named_parameters() if parameter.grad is None
+            ]
+            assert dangling == [], f"{mode}/{head_structured}: {dangling}"
 
 
 def test_retired_flags_are_not_constructor_arguments():
-    """Smooth bounding and the residual posterior are the model, not options."""
+    """Smooth bounding is the model, not an option.
+
+    ``posterior_logvar`` stays refused under its old name: the boolean it used to be is not the
+    ``posterior_logvar_mode`` choice that replaced it, and a config carrying the retired spelling
+    should fail rather than resolve to a default that happens to look plausible."""
     for retired in ("logvar_bound", "posterior_logvar"):
         with pytest.raises(TypeError):
             PosteriorHead(d_model=_D_MODEL, d_z=_D_Z, **{retired: "whatever"})

@@ -26,7 +26,7 @@ from pathlib import Path
 from typing import Any, Dict, Tuple
 
 from teb_vae.lag_attn_rws.eval.binding import ModelBinding
-from teb_vae.lag_attn_rws.nets.lag_report import SECONDS_PER_STEP
+from teb_vae.lag_attn.nets.lag_report import SECONDS_PER_STEP
 from teb_vae.lag_attn_transformer_rws.eval.analyses import encoder_attention
 from teb_vae.lag_attn_transformer_rws.nets.model import SeqVaeLagAttnTrfRws
 from teb_vae.lag_attn_transformer_rws.task import SeqVaeLagAttnTrfRwsTask

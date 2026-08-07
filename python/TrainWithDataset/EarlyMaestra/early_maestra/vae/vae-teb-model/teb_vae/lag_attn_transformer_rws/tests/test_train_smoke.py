@@ -200,8 +200,22 @@ def test_the_zero_kl_init_invariant_survives_the_whole_stack(fit):
         torch.randn(batch_size, seq_len, model.c_u, generator=generator),
     )
 
+    # The KL half holds in every configuration, because it is a function of the two
+    # *distributions* -- including under the shipped independent posterior log-variance head,
+    # which head_init_calibration pins to the prior's own constant.
     assert float(outputs["kld_per_t"].abs().max()) == 0.0
-    assert torch.equal(outputs["mu_base"], outputs["mu_full"])
+
+    # The forecast half depends on base_decode, so it is split rather than relaxed for both.
+    if model.base_decode == "sample":
+        assert torch.equal(outputs["mu_base"], outputs["mu_full"])
+    else:
+        # Shipped: the base branch decodes mu^p while the full branch still samples, so the two
+        # differ by the posterior's own noise. What must hold instead is that the base forecast
+        # IS the decode of mu^p -- the property that makes D_0 noise-free.
+        assert torch.equal(outputs["z_prior"], outputs["mu_prior"])
+        expected_base, _ = model.decoder(outputs["mu_prior"][:, : model.geometry.t_valid])
+        assert torch.equal(outputs["mu_base"], expected_base)
+        assert not torch.equal(outputs["mu_base"], outputs["mu_full"])
 
 
 def test_every_declared_metric_reaches_the_logger(fit):

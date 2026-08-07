@@ -76,6 +76,63 @@ class LagAttnTrfRwsTrainer(LagAttnRwsTrainer):
     TASK_CLS = SeqVaeLagAttnTrfRwsTask
     CHECKPOINT_STEM = "lag-attn-trf-rws"
 
+    def compile_model_requested(self) -> bool:
+        """Honour ``advanced_config.trainer.compile``, which a conv-Transformer net can serve.
+
+        The inherited refusal is a fact about the *raw-signal* net, not about the objective or the
+        task: its LSTM encoders defeat TorchInductor unconditionally. This architecture replaced
+        those encoders, so the blocker does not exist here and the key becomes live -- for this
+        driver and for every driver below it, which is why the implementation lives here rather
+        than being restated in each.
+
+        Of the three blockers once recorded against this family, one is gone with the recurrence,
+        one is refused below, and the third never applied to the compiled region at all:
+
+        * **LSTM encoders** -- replaced by the causal conv-Transformer.
+        * **A checkpointed attention region** -- still reachable, because
+          ``attention_grad_checkpoint`` is a live config key. Refused explicitly rather than
+          silently ignored: a run that quietly dropped either the checkpointing or the compilation
+          is a run the operator did not configure.
+        * **The data-dependent mask indexing behind** ``kld_active_frac`` -- lives in
+          ``compute_loss``, which the task reaches through ``orig_model``. Only the forward is
+          compiled, so that indexing never enters the graph.
+
+        **Compilation is not numerically free, and that is why every config here ships it off.**
+        Inductor may reassociate float arithmetic, and this family's headline readout is
+        ``pred_gap`` -- a difference of order $10^{-1}$ between two block NLLs of order $10^{2}$,
+        a relative scale of about $10^{-4}$. Before adopting a compiled run, compare ``pred_gap``
+        on one fixed batch against the eager value; a difference there is a difference in the
+        number the model exists to produce, not a rounding detail.
+
+        Returns:
+            ``True`` when the config asks for compilation.
+
+        Raises:
+            ValueError: If compilation is requested together with ``attention_grad_checkpoint``,
+                naming both keys.
+        """
+        trainer_config = (self.config.get("advanced_config", {}) or {}).get("trainer", {}) or {}
+        if not bool(trainer_config.get("compile", False)):
+            return False
+
+        vae_config = (self.config.get("model_config", {}) or {}).get("VAE_model", {}) or {}
+        if bool(vae_config.get("attention_grad_checkpoint", False)):
+            raise ValueError(
+                "advanced_config.trainer.compile is true and "
+                "model_config.VAE_model.attention_grad_checkpoint is true, and the two cannot "
+                "both hold: the recomputed lag-attention region defeats TorchInductor, so one "
+                "of them would be silently dropped and the run would be neither the compiled "
+                "one nor the checkpointed one. Turn off whichever the run does not need -- the "
+                "shipped configs set attention_grad_checkpoint: false, so compilation is the "
+                "one to keep unless memory is the binding constraint."
+            )
+        logger.info(
+            "torch.compile is ON for the net's forward; the objective stays eager through "
+            "orig_model. Inductor may reassociate float arithmetic -- verify `pred_gap` against "
+            "an eager run on one fixed batch before reading this run's coupling numbers."
+        )
+        return True
+
     def _build_model_kwargs(self) -> Dict[str, Any]:
         """Sweep the config onto the constructor, re-admitting the keys whose ``null`` is a value.
 

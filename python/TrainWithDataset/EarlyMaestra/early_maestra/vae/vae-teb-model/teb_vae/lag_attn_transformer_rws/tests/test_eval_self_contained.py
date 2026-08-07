@@ -345,7 +345,7 @@ def test_the_siblings_evaluation_package_is_permitted_at_every_layer() -> None:
         "from teb_vae.lag_attn_rws.eval import run as shared_run\n"
         "from teb_vae.lag_attn_rws.eval.analyses import coupling\n"
         "from teb_vae.lag_attn_rws.eval.binding import ModelBinding\n"
-        "from teb_vae.lag_attn_rws.nets.lag_report import SECONDS_PER_STEP\n"
+        "from teb_vae.lag_attn.nets.lag_report import SECONDS_PER_STEP\n"
     )
     assert forbidden_imports(source, f"{PACKAGE}.analyses.encoder_attention") == []
     assert forbidden_imports(source, f"{PACKAGE}.run") == []

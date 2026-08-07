@@ -156,9 +156,15 @@ def test_the_resolved_config_is_written_beside_the_checkpoints(tmp_path, monkeyp
     # Fully resolved: the inherited keys are present and the `base:` pointer is gone.
     assert "base" not in reloaded
     assert reloaded["model_config"]["VAE_model"]["causal_norm"] is True
-    # The unguarded default records the *absence* of a guard explicitly, so a reader can tell it
-    # from a run written before the record existed.
-    assert reloaded["model_config"][trainer_module.RESOLVED_BUDGET_KEY] is None
+    # The guarded default records what the budget resolved TO, not merely that one was asked for:
+    # the surviving channel counts and the worst delay are what a later offline pass needs to
+    # rebuild the adapters, and `causal_reach_budget_s: 120` alone does not determine them without
+    # re-running the filter bank.
+    record = reloaded["model_config"][trainer_module.RESOLVED_BUDGET_KEY]
+    assert record is not None
+    assert record["causal_reach_budget_s"] == 120
+    assert record["max_delay_steps"] == 30
+    assert (len(record["target_keep_index"]), len(record["source_keep_index"])) == (78, 29)
 
 
 def _persisted_config(tmp_path, monkeypatch, mutate=None) -> dict:

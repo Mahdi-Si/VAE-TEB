@@ -13,10 +13,17 @@ with every term in nats per anchor (the net's ``compute_loss`` owns the reductio
 
 Everything else is inherited. There is no ``training_step`` here: the framework's own step
 dispatches to :meth:`compute_loss_and_metrics`, logs the returned metrics, and runs the
-loss-spike circuit breaker from ``advanced_config.spike_breaker``. ``compile_model=False`` is
-forced in the constructor and is not a caller's choice: the LSTM encoders, the checkpointed
-attention region and the data-dependent mask indexing behind ``kld_active_frac`` each defeat
-TorchInductor independently.
+loss-spike circuit breaker from ``advanced_config.spike_breaker``. ``compile_model`` **defaults**
+to ``False`` and that is the only correct value for *this* net -- its LSTM encoders defeat
+TorchInductor on their own, and a checkpointed attention region defeats it again whenever
+``attention_grad_checkpoint`` is set.
+
+It is a default rather than a hard-wired constant because those are two facts about this
+architecture, not about the objective, and a subclass over a different net may have neither. The
+third blocker once recorded here -- the data-dependent mask indexing behind ``kld_active_frac`` --
+is **not** a reason for any subclass: it lives in ``compute_loss``, which
+:meth:`compute_loss_and_metrics` reaches through ``self.orig_model``. Only the forward is ever
+compiled, so that indexing stays eager by construction rather than by a graph break.
 
 The permutation control runs on **validation batches only** and never enters the loss. It is a
 readout: the shuffled-forecast score ``nll_shuffled_block`` against ``nll_base_block`` and
@@ -58,6 +65,12 @@ class SeqVaeLagAttnRwsTask(LightningModelBase):
         "source_conditioned_kl_raw",
     )
 
+    #: Step stride of the gradient-norm hook: the norm costs one reduction kernel per
+    #: parameter, and computing it on every step buys nothing the CSV records (see
+    #: :meth:`on_before_optimizer_step` for what IS recorded). The epoch's last batch always
+    #: logs regardless of the stride, which is what keeps the CSV's sample exact.
+    GRAD_NORM_LOG_EVERY_N_STEPS: int = 25
+
     def __init__(
         self,
         base_model: nn.Module,
@@ -75,6 +88,7 @@ class SeqVaeLagAttnRwsTask(LightningModelBase):
         lambda_base: float = 1.0,
         likelihood: str = "gaussian_nll",
         free_bits: float = 0.0,
+        compile_model: bool = False,
     ) -> None:
         r"""Initialize the task.
 
@@ -104,6 +118,19 @@ class SeqVaeLagAttnRwsTask(LightningModelBase):
             lambda_base: Weight of the base (target-only) reconstruction term.
             likelihood: ``'mse'`` or ``'gaussian_nll'``.
             free_bits: Per-dim per-step KL floor in nats; enters the trained KL only.
+            compile_model: Wrap the net in ``torch.compile``. Defaults to ``False``, which is
+                the only correct value **for this net**: its LSTM encoders defeat TorchInductor
+                on their own, and a checkpointed attention region defeats it again whenever
+                ``attention_grad_checkpoint`` is set. The keyword exists because those are
+                facts about *this architecture*, not about the objective or the training step,
+                and a subclass whose net has neither may pass ``True``.
+
+                What compiling does **not** reach, in any subclass: only the forward is
+                compiled. :meth:`compute_loss_and_metrics` runs the objective through
+                ``self.orig_model``, so the data-dependent boolean mask indexing behind
+                ``kld_active_frac`` and the prior-floor watch stays eager by construction
+                rather than by a graph break. That separation is what makes the keyword safe
+                to offer at all.
         """
         super().__init__(
             base_model,
@@ -111,8 +138,7 @@ class SeqVaeLagAttnRwsTask(LightningModelBase):
             lr_milestones=lr_milestones,
             weight_decay=weight_decay,
             module_name=module_name,
-            # Permanent, not a default: three independent things in this net break inductor.
-            compile_model=False,
+            compile_model=compile_model,
             spike_breaker=spike_breaker,
         )
         self.save_hyperparameters(
@@ -193,10 +219,18 @@ class SeqVaeLagAttnRwsTask(LightningModelBase):
         ``on_validation_epoch_end``, which runs before the *training* epoch is reduced, so for a
         metric logged from this hook with both ``on_step`` and ``on_epoch`` the bare key still
         holds the last step's value. That is a usable sample rather than a defect -- a threshold
-        is a per-step question, and one step per epoch is an unbiased draw from the per-step
+        is a per-step question, and one step per epoch is a usable draw from the per-step
         distribution -- but it governs how the columns are read: ``grad_clip_frac`` is $0$ or $1$
         per row and its **mean over epochs** estimates the exceedance fraction. Every ``val/``
         column is a true epoch mean; these two are the exception.
+
+        Because only that one-step-per-epoch sample is ever recorded, the hook runs every
+        :attr:`GRAD_NORM_LOG_EVERY_N_STEPS` optimizer steps rather than every step -- one norm
+        reduction kernel per parameter is pure overhead on the steps in between. The epoch's
+        last batch is exempt from the stride, so the value the CSV samples is computed on
+        exactly the step it always sampled. The on_epoch aggregate and the MLflow step series
+        become every-Nth systematic samples of the per-step distribution, which reads the same
+        way as before for both columns.
 
         The hook order is what makes the numbers right: Lightning's precision plugin calls
         this hook and *then* ``_clip_gradients``, so what is measured here is the pre-clip norm --
@@ -209,6 +243,12 @@ class SeqVaeLagAttnRwsTask(LightningModelBase):
             optimizer: The optimizer Lightning is about to step; unused (the gradients are read
                 off the module's own parameters, which is the same set).
         """
+        trainer = self.trainer
+        if not (
+            trainer.is_last_batch
+            or trainer.global_step % self.GRAD_NORM_LOG_EVERY_N_STEPS == 0
+        ):
+            return
         norms = [
             torch.linalg.vector_norm(parameter.grad.detach())
             for parameter in self.parameters()
@@ -583,7 +623,13 @@ class SeqVaeLagAttnRwsTask(LightningModelBase):
         # ``inputs[0]`` rather than a named tensor: the batch size and the device are properties
         # of any of the net's inputs, and reading them off the first one is what keeps the
         # control working for a subclass whose ``_build_forward_inputs`` returns something else.
-        do_perm = self._sync_perm_decision(
+        #
+        # The reduction is skipped on training steps entirely, not merely answered False: the
+        # control is validation-only, the stage is identical on every rank, so each rank skips
+        # the collective in lockstep -- while calling ``_sync_perm_decision`` here would cost an
+        # ``all_reduce`` plus a ``.item()`` GPU sync on EVERY training step to confirm a
+        # constant False, stalling the CPU behind the forward each time.
+        do_perm = stage != "train" and self._sync_perm_decision(
             self._should_run_perm(inputs[0].size(0), stage), inputs[0].device
         )
         if do_perm:

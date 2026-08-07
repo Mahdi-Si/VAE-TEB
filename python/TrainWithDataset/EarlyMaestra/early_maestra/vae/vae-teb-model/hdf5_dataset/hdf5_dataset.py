@@ -1059,6 +1059,14 @@ def create_optimized_dataloader(
         prefetch_factor=prefetch_factor if num_workers > 0 else None,
         multiprocessing_context='spawn' if num_workers > 0 else None,
         persistent_workers=True if num_workers > 0 else False,
+        # Loader-level pinning: the collated batch is copied into page-locked memory by the
+        # loader's pin thread in the MAIN process, which is what lets the trainer's
+        # non_blocking host-to-device copy overlap the transfer with compute. This is NOT the
+        # dataset-level `pin_memory` kwarg (worker-side per-tensor pinning): pinned status does
+        # not survive the worker->main IPC handoff, so that one buys nothing under workers and
+        # should stay off. Gated on CUDA so CPU-only runs skip the pointless copy (and the
+        # torch warning it would emit).
+        pin_memory=torch.cuda.is_available(),
         collate_fn=attribute_dict_collate
     )
 

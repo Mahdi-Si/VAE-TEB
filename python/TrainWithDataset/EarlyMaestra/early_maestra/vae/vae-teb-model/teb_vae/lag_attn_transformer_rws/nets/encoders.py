@@ -1,4 +1,8 @@
-r"""The availability-aware input adapter and the causal conv-Transformer stream encoder.
+r"""The causal conv-Transformer stream encoder.
+
+The availability-aware input adapter that precedes it is re-exported here but lives in
+``teb_vae/lag_attn/nets/encoders.py``: three packages build one, so it sits in the shared layer
+beside the plain :class:`~teb_vae.lag_attn.nets.encoders.InputAdapter` whose stack it reproduces.
 
 For each stream $s \in \{Y, U\}$ the path is
 
@@ -19,13 +23,13 @@ Run this module to print the receptive-field table::
 """
 from __future__ import annotations
 
-from typing import List, Optional, Sequence
+from typing import Optional, Sequence
 
 import torch
 from torch import nn
 
-from teb_vae.lag_attn.nets.blocks import ResidualMLP, geometric_schedule
-from teb_vae.lag_attn_rws.nets.lag_report import SECONDS_PER_STEP
+from teb_vae.lag_attn.nets.encoders import START_EMBED_STD, AvailabilityInputAdapter
+from teb_vae.lag_attn.nets.lag_report import SECONDS_PER_STEP
 from teb_vae.lag_attn_transformer_rws.nets.blocks import (
     LAYER_SCALE_INIT,
     ROPE_BASE,
@@ -34,10 +38,15 @@ from teb_vae.lag_attn_transformer_rws.nets.blocks import (
     RMSNorm,
 )
 
-#: Standard deviation of the learned start embedding, per the architecture's initialisation list.
-#: Small enough that a fully unavailable token starts as a quiet, learnable constant rather than
-#: as a large perturbation of the residual stream.
-START_EMBED_STD = 0.02
+#: Re-exported so ``from ...nets.encoders import AvailabilityInputAdapter`` keeps resolving beside
+#: :class:`CausalConvTransformerEncoder`, which is the only thing this package pairs it with. The
+#: adapter itself lives in ``teb_vae/lag_attn/nets/encoders.py`` because three packages build one.
+__all__ = [
+    "AvailabilityInputAdapter",
+    "CausalConvTransformerEncoder",
+    "START_EMBED_STD",
+    "conv_receptive_field",
+]
 
 
 def conv_receptive_field(
@@ -67,239 +76,6 @@ def conv_receptive_field(
             f"{len(dilations)}; they are positional against each other"
         )
     return 1 + sum((int(kernel) - 1) * int(dilation) for kernel, dilation in zip(kernels, dilations))
-
-
-class AvailabilityInputAdapter(nn.Module):
-    r"""Project a gated feature stream to the model width, telling it which channels are real.
-
-    The stack is the sibling's ``InputAdapter(post_residual_activation=False)`` exactly --
-    ``Linear -> LayerNorm -> GELU -> Dropout -> ResidualMLP``, submodule for submodule and name
-    for name, so a matched state dict transfers between the two -- with two terms added to the
-    first linear's output:
-
-    $$
-    e_t = W_x \bar x_t + W_m\!\left(m_t - \mathbf 1\right)
-        + \mathbb 1\!\left[\textstyle\sum_c m_{t,c} = 0\right] e_{\mathrm{start}},
-    \qquad m_{t,c} = \mathbb 1[t \ge \delta_c].
-    $$
-
-    **Why this exists.** When the per-channel causal delay guard is active, the first
-    $\max_c \delta_c$ steps of a channel are exact zeros -- no data, a fill value. An exactly zero
-    token entering repeated normalisation layers produces derivatives of order
-    $1/\sqrt{\epsilon}$, and the as-built guarded configurations of the encoder this replaces reach
-    global gradient norms around $10^{26}$ that way. The two terms turn "this position is empty"
-    from a numerical accident into a representation the model is told about.
-
-    **Why the projection reads $m_t - \mathbf 1$ rather than $m_t$.** The two differ by the
-    constant $W_m \mathbf 1$, which the first linear's own bias already spans, so they are the same
-    model. Written this way the term is *exactly* zero wherever every channel is available -- which
-    is everywhere past the delayed prefix -- so the availability mechanism cannot quietly shift the
-    representation on the part of the sequence where nothing is missing, and the comparison this
-    package exists to make stays clean.
-
-    **What is conditional and what is not.** Both terms are added **unconditionally in the
-    forward**; whether each exists is settled at construction. That order matters, and the
-    intuitive reading of why is wrong: a parameter multiplied by an identically-zero tensor is
-    still reachable -- its ``AccumulateGrad`` node fires and it receives a zeros gradient, so
-    ``DistributedDataParallel`` marks it ready. What breaks ``find_unused_parameters=False`` is a
-    parameter left *out of the graph*, which is what a data-dependent
-    ``if indicator.any(): e = e + e_start`` would do, on some ranks and not others, on some batches
-    and not others. There is no such branch here.
-
-    Construction is conditional for parameter economy and honesty instead, and the two terms have
-    different conditions because they become non-trivial at different points:
-
-    * $W_m$ exists when $\max_c \delta_c > 0$. Below that $m \equiv 1$, the term is identically
-      zero, and the projection would be a parameter that can never receive a gradient.
-    * $e_{\mathrm{start}}$ exists when $\min_c \delta_c > 0$. The indicator is non-zero for some
-      $t$ exactly when *every* channel is delayed, so a mixed delay vector such as $(0, 3, 5)$
-      satisfies $\max > 0$ while leaving the start token permanently inert.
-
-    With no delays at all -- the unguarded configuration, where the model builds no gate object --
-    neither exists, which is correct: without delays there is no all-zero prefix to repair.
-
-    Shapes:
-        Input:  ``(B, T, in_dim)``
-        Output: ``(B, T, d_model)``
-    """
-
-    #: Declared so the registered buffers type as tensors rather than as ``Tensor | Module``. They
-    #: are registered only when their term is built, so on an unguarded adapter these attributes
-    #: are absent rather than ``None`` -- which is the same convention the model uses for the gate
-    #: itself, and which keeps an inert buffer out of every ``named_buffers`` listing.
-    availability: torch.Tensor
-    start_indicator: torch.Tensor
-
-    def __init__(
-        self,
-        *,
-        in_dim: int,
-        d_model: int,
-        sequence_length: int,
-        dropout: float = 0.1,
-        delays: Optional[Sequence[int]] = None,
-    ) -> None:
-        r"""Build the projection stack and whichever availability terms the delays call for.
-
-        Args:
-            in_dim: Input channel count -- the *surviving* width the gate emits, not the declared
-                one.
-            d_model: Internal model width.
-            sequence_length: Sequence length $T$ the availability pattern is built for. The
-                pattern is a constant of the delays, not a function of the batch, so it is built
-                once here.
-            dropout: Dropout probability after the activation and inside the residual MLP.
-            delays: One delay $\delta_c$ per surviving channel, in decimated steps, or ``None`` for
-                the unguarded case -- which the model represents by having no gate object at all,
-                not by an identity one.
-
-        Raises:
-            ValueError: If ``delays`` is given with a length other than ``in_dim``, or contains a
-                negative entry.
-        """
-        super().__init__()
-        self.in_dim = int(in_dim)
-        self.d_model = int(d_model)
-        self.sequence_length = int(sequence_length)
-
-        # The sibling adapter, submodule for submodule and name for name.
-        self.linear = nn.Linear(in_dim, d_model)
-        self.norm = nn.LayerNorm(d_model)
-        self.act = nn.GELU()
-        self.drop = nn.Dropout(dropout)
-        self.res_mlp = ResidualMLP(
-            input_dim=d_model,
-            hidden_dims=geometric_schedule(d_model, d_model, 3),
-            final_activation=False,
-            use_skip_connection=True,
-            use_input_layer_norm=True,
-            activation=nn.GELU,
-            dropout=dropout,
-        )
-
-        delay_values = self._validate_delays(delays, self.in_dim)
-        self.max_delay = max(delay_values) if delay_values else 0
-        self.min_delay = min(delay_values) if delay_values else 0
-
-        self.mask_proj: Optional[nn.Linear] = None
-        self.start_embed: Optional[nn.Parameter] = None
-        if self.max_delay > 0:
-            pattern = self._availability_pattern(delay_values, self.sequence_length)
-            # Non-persistent, like every geometry- and budget-shaped tensor in this model: its
-            # width is the surviving-channel count, so a persistent copy would make a checkpoint
-            # trained at one reach budget fail to load at another, reported as misaligned keys
-            # rather than as a budget mismatch.
-            self.register_buffer("availability", pattern, persistent=False)
-            self.mask_proj = nn.Linear(self.in_dim, d_model, bias=False)
-            if self.min_delay > 0:
-                indicator = (pattern.sum(dim=-1) == 0).to(pattern.dtype).unsqueeze(-1)
-                self.register_buffer("start_indicator", indicator, persistent=False)
-                self.start_embed = nn.Parameter(torch.randn(d_model) * START_EMBED_STD)
-
-    @staticmethod
-    def _validate_delays(delays: Optional[Sequence[int]], in_dim: int) -> List[int]:
-        """Return the delays as a list of ints, or an empty list for the unguarded case.
-
-        Args:
-            delays: The per-survivor delays, or ``None``.
-            in_dim: The surviving channel count the delays must be positional against.
-
-        Returns:
-            The delays, or ``[]``.
-
-        Raises:
-            ValueError: If the length disagrees with ``in_dim`` or any entry is negative.
-        """
-        if delays is None:
-            return []
-        values = [int(value) for value in delays]
-        if len(values) != in_dim:
-            raise ValueError(
-                f"delays has {len(values)} entries but the adapter reads {in_dim} channels; the "
-                f"delay vector is positional against the surviving channels, so a length mismatch "
-                f"would mark the wrong channels unavailable with no other failure signal"
-            )
-        negative = [(index, value) for index, value in enumerate(values) if value < 0]
-        if negative:
-            raise ValueError(
-                f"delays must be >= 0; got negative entries at {negative}"
-            )
-        return values
-
-    @staticmethod
-    def _availability_pattern(delays: Sequence[int], sequence_length: int) -> torch.Tensor:
-        r"""Build $m_{t,c} = \mathbb 1[t \ge \delta_c]$ as a $(T, C)$ float tensor.
-
-        Args:
-            delays: One delay per channel. Empty gives an all-ones $(T, 0)$ pattern, which no
-                caller uses.
-            sequence_length: Sequence length $T$.
-
-        Returns:
-            The availability pattern, ``float32``.
-        """
-        steps = torch.arange(sequence_length).unsqueeze(-1)
-        return (steps >= torch.tensor(list(delays), dtype=torch.long)).to(torch.float32)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Project the stream and add whichever availability terms were built.
-
-        Args:
-            x: Gated feature stream ``(B, T, in_dim)``.
-
-        Returns:
-            The projected stream ``(B, T, d_model)``.
-
-        Raises:
-            ValueError: If the sequence is longer than the availability pattern was built for.
-        """
-        seq_len = int(x.shape[1])
-        embedded = self.linear(x)
-
-        # Both terms are added whenever they exist, on every rank and every batch. The tests are
-        # `is None` checks on modules built in __init__, never on tensor content: see the class
-        # docstring for why that distinction is the one DDP cares about.
-        if self.mask_proj is not None:
-            embedded = embedded + self.mask_proj(self._slice(self.availability, seq_len) - 1.0)
-        if self.start_embed is not None:
-            embedded = embedded + self._slice(self.start_indicator, seq_len) * self.start_embed
-
-        return self.res_mlp(self.drop(self.act(self.norm(embedded))))
-
-    def _slice(self, pattern: torch.Tensor, seq_len: int) -> torch.Tensor:
-        """Take the first ``seq_len`` steps of a constant pattern, refusing a longer request.
-
-        Args:
-            pattern: A ``(T, ...)`` constant built at ``sequence_length``.
-            seq_len: The batch's sequence length.
-
-        Returns:
-            The leading ``seq_len`` steps.
-
-        Raises:
-            ValueError: If ``seq_len`` exceeds what the pattern was built for.
-        """
-        if seq_len > self.sequence_length:
-            raise ValueError(
-                f"sequence of {seq_len} steps exceeds the availability pattern built for "
-                f"sequence_length={self.sequence_length}"
-            )
-        return pattern[:seq_len]
-
-    def extra_repr(self) -> str:
-        """Report the widths and which availability terms were built."""
-        terms = [
-            name
-            for name, built in (
-                ("W_m", self.mask_proj is not None),
-                ("e_start", self.start_embed is not None),
-            )
-            if built
-        ]
-        return (
-            f"{self.in_dim} -> {self.d_model}, max_delay={self.max_delay}, "
-            f"availability_terms={terms or 'none'}"
-        )
 
 
 class CausalConvTransformerEncoder(nn.Module):

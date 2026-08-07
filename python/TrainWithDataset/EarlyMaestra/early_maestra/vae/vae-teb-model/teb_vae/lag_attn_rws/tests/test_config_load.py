@@ -184,13 +184,15 @@ def test_the_breaker_is_a_non_finite_guard_plus_the_additive_test(shipped):
     assert breaker["max_consecutive_skips"] > 0  # the deadlock escape hatch
 
 
-def test_the_reach_budget_key_exists_and_ships_null(shipped):
-    """The config axis for the causal input delay: null = all channels, no delay -- the clean
-    architecture comparison against the sibling. Presence is asserted (not merely non-error)
-    because ``null`` and *absent* look identical to a ``.get``."""
+def test_the_reach_budget_key_exists_and_ships_the_guard_on(shipped):
+    """The config axis for the causal input delay. It ships at $120$ s rather than ``null``:
+    the stored features are two-sided, so at ``null`` the target branch reads up to $974$ s of its
+    own future and $D_{\\mathrm{base}}$ is measured through that leak. Presence is asserted (not
+    merely non-error) because ``null`` and *absent* look identical to a ``.get``, and the value is
+    pinned because a silent revert to ``null`` would put the leak back with nothing failing."""
     vae = shipped["model_config"]["VAE_model"]
     assert "causal_reach_budget_s" in vae
-    assert vae["causal_reach_budget_s"] is None
+    assert vae["causal_reach_budget_s"] == 120
 
 
 def test_load_fields_covers_what_the_model_and_plots_read(shipped):

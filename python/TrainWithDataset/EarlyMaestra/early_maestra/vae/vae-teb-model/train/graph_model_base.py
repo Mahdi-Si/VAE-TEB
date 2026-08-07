@@ -9,7 +9,7 @@ import matplotlib
 
 from abc import ABC, abstractmethod
 from datetime import datetime
-from typing import List, Optional
+from typing import List, Optional, Union
 import atexit
 import sys
 import yaml
@@ -20,6 +20,7 @@ from lightning.pytorch.callbacks import EarlyStopping, LearningRateMonitor
 from lightning.pytorch.loggers import Logger as LightningLogger
 from lightning.pytorch.loggers import MLFlowLogger
 from lightning.pytorch.profilers import SimpleProfiler
+from lightning.pytorch.strategies import Strategy
 from utils.custom_logger import setup_logging
 from loguru import logger
 
@@ -386,13 +387,22 @@ class GraphModelBase(ABC):
                         "config: unrecognized block 'advanced_config.{}' is ignored", key,
                     )
 
-    def select_ddp_strategy(self, num_devices: int, config: dict, model=None) -> str:
-        """Return the DDP strategy string for ``num_devices`` GPUs.
+    def select_ddp_strategy(
+        self, num_devices: int, config: dict, model=None
+    ) -> Union[str, Strategy]:
+        """Return the DDP strategy for ``num_devices`` GPUs.
 
         Default reproduces the canonical choice: ``"ddp"`` for more than one device,
         ``"auto"`` otherwise. ``config`` and ``model`` are accepted (and ignored by the
         default) so consumers whose models need ``find_unused_parameters=True`` — dead
         logvar heads, structured latent, curriculum — can override this hook wholesale.
+
+        The return type admits a ``Strategy`` instance as well as a shorthand string,
+        because ``Trainer(strategy=...)`` accepts either and the strings can express
+        ``find_unused_parameters`` and nothing else. A consumer that needs any other DDP
+        setting — ``broadcast_buffers``, ``gradient_as_bucket_view``, a comm hook — has
+        to return an instance, so the annotation says so rather than making every such
+        override a type error.
         """
         return "ddp" if num_devices > 1 else "auto"
 
