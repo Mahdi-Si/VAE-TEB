@@ -65,7 +65,7 @@ from teb_vae.lag_attn_rws.nets.heads import FullLatentPriorHead
 from teb_vae.lag_attn_rws.nets.losses import compute_loss as compute_raw_objective
 from teb_vae.lag_attn_rws.nets.losses import kld_tensor as closed_form_kld
 from teb_vae.lag_attn_rws.nets.model import SATURATION_FRAC
-from teb_vae.lag_attn_rws.nets.raw_targets import build_future_index
+from teb_vae.lag_attn_rws.nets.raw_targets import build_future_index, build_future_target
 from teb_vae.lag_attn_transformer_rws.nets.blocks import init_depthwise_
 from teb_vae.lag_attn_transformer_rws.nets.encoders import (
     AvailabilityInputAdapter,
@@ -121,6 +121,7 @@ class SeqVaeLagAttnTrfRws(nn.Module):
         horizon_depth: int = 2,
         horizon_kernel: int = 3,
         horizon_film: bool = False,
+        horizon_attention_blocks: int = 0,
         horizon_embed_std: float = 0.02,
         head_init_calibration: bool = False,
         a_head_gain: float = 1.0,
@@ -184,6 +185,12 @@ class SeqVaeLagAttnTrfRws(nn.Module):
             horizon_depth: Number of dilated blocks in the horizon core.
             horizon_kernel: Horizon-convolution kernel width.
             horizon_film: Whether to FiLM-condition each horizon step on the decoder state.
+            horizon_attention_blocks: Number of bidirectional self-attention blocks the shared
+                horizon core runs over its $H$ forecast tokens, after the dilated refine stack.
+                The convolutions mix horizon steps through a fixed local window; these mix all $H$
+                at once, so the forecast can be shaped as a whole. $0$ (the default) builds no
+                module, leaving the core exactly as it is without them. The head count is the
+                core's own default and is deliberately not a keyword here: no arm varies it.
             horizon_embed_std: Standard deviation the horizon-step embedding is re-seeded at,
                 *after* the generic initialisation. The default $0.02$ leaves the core's own seed
                 in place; a larger value (shipped $0.8$) breaks the near-degeneracy of the $H$
@@ -453,7 +460,9 @@ class SeqVaeLagAttnTrfRws(nn.Module):
 
         # ONE shared decoder, invoked twice per forward -- on z^p and on z^q -- and receiving
         # nothing else. Its input width is d_z (the latent, not an encoder state), and
-        # out_channels here counts RAW SAMPLES PER HORIZON TOKEN, not feature channels. Dropout
+        # out_channels here counts RAW SAMPLES PER HORIZON TOKEN, not feature channels. It is
+        # resolved through `_default_decoder_out_channels` unless a subclass overrides that hook,
+        # so this model cannot be configured onto a width its target does not have. Dropout
         # must be zero, not stylistic: invoking one module twice draws two independent dropout
         # masks, so base and full would differ at initialisation even with z^p == z^q, and
         # independent noise would enter the base-minus-full readout on every training step.
@@ -464,11 +473,13 @@ class SeqVaeLagAttnTrfRws(nn.Module):
             depth=horizon_depth,
             film=horizon_film,
             film_per_block=True,
+            attention_blocks=horizon_attention_blocks,
         )
+        self.decoder_out_channels = self._default_decoder_out_channels()
         self.decoder = BaselineFutureDecoder(
             core=self.horizon_core,
             d_model=d_z,
-            out_channels=self.raw_per_step,
+            out_channels=self.decoder_out_channels,
             d_hidden=decoder_hidden,
             dropout=0.0,
             logvar_clamp=logvar_clamp,
@@ -517,6 +528,32 @@ class SeqVaeLagAttnTrfRws(nn.Module):
             self._calibrate_prior_scale()
         if self.a_head_gain != 1.0:
             self._set_a_head_gain()
+
+    def _default_decoder_out_channels(self) -> int:
+        r"""What each horizon token emits: $R$, the raw samples per horizon token.
+
+        A method rather than a literal, and deliberately **not** a constructor keyword. It is the
+        one construction decision a sibling forecasting a different target has to make differently,
+        and it cannot be made from outside: the width a feature-domain sibling needs is its target
+        gate's surviving-channel count, and the gate is built by *this* constructor -- so a subclass
+        computing the width before ``super().__init__`` has nothing to read it off, and a subclass
+        narrowing ``__init__``'s signature to intercept a keyword breaks the ``inspect.signature``
+        sweep in ``trainer._build_model_kwargs``, which would then forward no configuration at all
+        and silently build an all-defaults model.
+
+        No keyword accompanies it, unlike the conv-LSTM sibling's: nothing configures such a
+        keyword, no YAML in the repository names one, and the width stays recoverable from a
+        checkpoint through the stamped ``target_keep_index`` -- so a second field could only ever
+        disagree with the gate.
+
+        Called at the decoder's construction site, after the gates and before
+        :func:`initialization`, :func:`init_depthwise_` and the calibration passes, so an override
+        changes the emitted width and nothing about the RNG stream or the init order.
+
+        Returns:
+            $R$, the raw samples per horizon token, for this model.
+        """
+        return self.raw_per_step
 
     @staticmethod
     def _build_channel_gate(
@@ -965,17 +1002,23 @@ class SeqVaeLagAttnTrfRws(nn.Module):
         lambda_base: float = 1.0,
         likelihood: str = "gaussian_nll",
         free_bits: float = 0.0,
+        lambda_ms: float = 0.0,
+        lambda_deriv: float = 0.0,
+        lambda_boundary: float = 0.0,
     ) -> Dict[str, Any]:
-        r"""Compute the four-term objective in nats per anchor.
+        r"""Compute the seven-term objective, per anchor.
 
         $$\mathcal{L} = \lambda_{\mathrm{full}} D_1 + \lambda_{\mathrm{base}} D_0
-        + \beta\,\mathrm{KL}_{\mathrm{train}} + \beta_p\,R_p$$
+        + \beta\,\mathrm{KL}_{\mathrm{train}} + \beta_p\,R_p
+        + \lambda_{\mathrm{ms}} \mathcal{L}_{\mathrm{ms}}
+        + \lambda_{\Delta} \mathcal{L}_{\Delta}
+        + \lambda_{\mathrm{boundary}} \mathcal{L}_{\mathrm{boundary}}$$
 
-        Delegates to :func:`~teb_vae.lag_attn_rws.nets.losses.compute_loss`, supplying this model's
-        geometry, its cached raw-target index grid and its two scalar bounds. Shared rather than
-        reimplemented, and that is the point: this architecture exists to be compared against the
-        one it replaces, and a second copy of the objective would make the comparison partly a
-        comparison of two losses.
+        Delegates to :func:`~teb_vae.lag_attn_rws.nets.losses.compute_loss`, gathering the raw
+        future target from this model's cached index grid and supplying its geometry, its block
+        width and its two scalar bounds. Shared rather than reimplemented, and that is the point:
+        this architecture exists to be compared against the one it replaces, and a second copy of
+        the objective would make the comparison partly a comparison of two losses.
 
         Args:
             forward_outputs: The dict returned by :meth:`forward`.
@@ -988,6 +1031,10 @@ class SeqVaeLagAttnTrfRws(nn.Module):
             lambda_base: Weight on the base-forecast reconstruction.
             likelihood: ``'mse'`` or ``'gaussian_nll'``.
             free_bits: Per-dimension per-step KL floor; enters the trained KL only.
+            lambda_ms: Weight on the multiscale $L_1$ shape term; ``0.0`` skips it and reports
+                an exact zero.
+            lambda_deriv: Weight on the derivative Huber shape term, same contract.
+            lambda_boundary: Weight on the boundary-continuity shape term, same contract.
 
         Returns:
             ``{'metrics': ..., 'likelihood': ...}``; see the shared implementation for the metric
@@ -999,10 +1046,11 @@ class SeqVaeLagAttnTrfRws(nn.Module):
         """
         return compute_raw_objective(
             forward_outputs,
-            fhr_raw,
+            build_future_target(fhr_raw, self.geometry, future_index=self.future_index),
             weight=weight,
             geometry=self.geometry,
-            future_index=self.future_index,
+            # The raw block's last axis counts raw samples per horizon token.
+            block_width=self.geometry.r,
             coverage_floor=self.coverage_floor,
             logvar_clamp=self.logvar_clamp,
             beta=beta,
@@ -1011,4 +1059,7 @@ class SeqVaeLagAttnTrfRws(nn.Module):
             lambda_base=lambda_base,
             likelihood=likelihood,
             free_bits=free_bits,
+            lambda_ms=lambda_ms,
+            lambda_deriv=lambda_deriv,
+            lambda_boundary=lambda_boundary,
         )

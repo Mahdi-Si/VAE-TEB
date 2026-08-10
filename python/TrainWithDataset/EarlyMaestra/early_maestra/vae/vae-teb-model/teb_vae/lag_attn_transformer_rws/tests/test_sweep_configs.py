@@ -5,10 +5,20 @@ source encoder's asymmetry are worth; the shipped ``default.yaml`` is A3, the re
 A0 is the model this package is compared against -- ``teb_vae/lag_attn_rws`` -- not a file here.
 **Source locality** sweeps $W_U \in \{8, 32, 64, \text{unbounded}\}$ around the shipped $16$, plus
 the causal-input reach budget the availability representation exists to make trainable.
-**Depth and width** moves $N_Y$, $N_U$ and $d_{\mathrm{ff}}$ one key at a time. **The prior-anchor
+**Depth and width** moves $N_Y$, $N_U$ and $d_{\mathrm{ff}}$ one key at a time, re-centred on the
+raised baseline: the target-depth arms are $4$ and $8$ around the shipped $6$, and the width arm is
+the lower bracket $384$ below the shipped $512$. Both lower brackets are the values this package
+shipped before the capacity revision, so each asks whether its raise was needed rather than merely
+probing downwards. **The prior-anchor
 weight** brackets ``beta_prior`` over three orders of magnitude around the shipped $10^{-1}$; its
 $10^{-1}$ arm deliberately restates the shipped value -- pinned, so the arm survives a later
 revision of the default -- and therefore declares an *empty* delta.
+
+Six further arms are ablate-one reverts rather than sweeps: four for the bottleneck bundle, and two
+for the decoder-side pair the capacity revision added -- the auxiliary shape terms in the criterion
+(``sweep_aux_off.yaml``) and the self-attention over the horizon tokens
+(``sweep_horizon_attn_off.yaml``). Each sets its mechanism back to the value that shipped before it
+existed, so what the pair cost is read off two runs rather than inferred from one.
 
 The lint holds :data:`DECLARED_DELTAS`, and it is the point of the file. Every
 ``configs/sweep_*.yaml`` must appear in it, and each arm's *resolved* delta against ``default.yaml``
@@ -55,6 +65,10 @@ _BASE_DECODE = f"{_VAE}.base_decode"
 _LOGVAR_MODE = f"{_VAE}.posterior_logvar_mode"
 _SOURCE_DROPOUT = f"{_VAE}.source_dropout"
 _BETA_PRIOR = f"{_VAE}.beta_prior"
+_LAMBDA_MS = f"{_VAE}.lambda_ms"
+_LAMBDA_DERIV = f"{_VAE}.lambda_deriv"
+_LAMBDA_BOUNDARY = f"{_VAE}.lambda_boundary"
+_HORIZON_ATTENTION = f"{_VAE}.horizon_attention_blocks"
 
 #: Every arm, by file name, with the complete set of leaves it is allowed to move against
 #: ``default.yaml``. An arm's resolved delta must equal its entry exactly -- neither a missing key
@@ -65,10 +79,10 @@ DECLARED_DELTAS: Dict[str, Dict[str, Any]] = {
     "sweep_arch_a1.yaml": {
         _CONV_KERNELS: [],
         _CONV_DILATIONS: [],
-        _SOURCE_BLOCKS: 4,
+        _SOURCE_BLOCKS: 6,
         _SOURCE_WINDOW: None,
     },
-    "sweep_arch_a2.yaml": {_SOURCE_BLOCKS: 4, _SOURCE_WINDOW: None},
+    "sweep_arch_a2.yaml": {_SOURCE_BLOCKS: 6, _SOURCE_WINDOW: None},
     # Phase 2: source locality, and the reach budget.
     "sweep_window_8.yaml": {_SOURCE_WINDOW: 8},
     "sweep_window_32.yaml": {_SOURCE_WINDOW: 32},
@@ -83,9 +97,11 @@ DECLARED_DELTAS: Dict[str, Dict[str, Any]] = {
     "sweep_logvar_residual.yaml": {_LOGVAR_MODE: "residual"},
     "sweep_source_dropout_0p2.yaml": {_SOURCE_DROPOUT: 0.2},
     "sweep_source_dropout_0p3.yaml": {_SOURCE_DROPOUT: 0.3},
-    # Phase 3: depth and width.
-    "sweep_target_blocks_3.yaml": {_TARGET_BLOCKS: 3},
-    "sweep_target_blocks_5.yaml": {_TARGET_BLOCKS: 5},
+    # Phase 3: depth and width. The two target-depth arms bracket the shipped 6 by two blocks in
+    # each direction, and the lower one is the value this package shipped before the capacity
+    # revision -- so it asks whether the raise was needed rather than merely probing downwards.
+    "sweep_target_blocks_4.yaml": {_TARGET_BLOCKS: 4},
+    "sweep_target_blocks_8.yaml": {_TARGET_BLOCKS: 8},
     "sweep_source_blocks_2.yaml": {_SOURCE_BLOCKS: 2},
     "sweep_source_blocks_4.yaml": {_SOURCE_BLOCKS: 4},
     "sweep_ff_384.yaml": {_D_FF: 384},
@@ -98,19 +114,35 @@ DECLARED_DELTAS: Dict[str, Dict[str, Any]] = {
     "sweep_beta_prior_0p01.yaml": {_BETA_PRIOR: 1.0e-2},
     "sweep_beta_prior_0p1.yaml": {},
     "sweep_beta_prior_1p0.yaml": {_BETA_PRIOR: 1.0},
+    # The two ablate-one arms for the decoder-side bundle: the shape terms in the criterion, and
+    # the self-attention over the horizon tokens in the shared decoder core. Each reverts its
+    # mechanism to the value that shipped before it existed, so the pair prices the two halves of
+    # the revision separately. The aux arm is declared multi-key on purpose -- the three weights
+    # were shipped together and price one decision, and turning off one of three would answer a
+    # question nobody has asked yet.
+    "sweep_aux_off.yaml": {_LAMBDA_MS: 0.0, _LAMBDA_DERIV: 0.0, _LAMBDA_BOUNDARY: 0.0},
+    "sweep_horizon_attn_off.yaml": {_HORIZON_ATTENTION: 0},
 }
 
 #: One causal Transformer block at the shipped widths: $4d^2 + 3 d\,d_{\mathrm{ff}} + 4d$ with
-#: $d = 128$, $d_{\mathrm{ff}} = 256$. Every depth arm moves the total by exactly this.
-ATTENTION_BLOCK_PARAMS = 4 * 128**2 + 3 * 128 * 256 + 4 * 128
+#: $d = 128$, $d_{\mathrm{ff}} = 512$. Every depth arm moves the total by a multiple of this.
+ATTENTION_BLOCK_PARAMS = 4 * 128**2 + 3 * 128 * 512 + 4 * 128
+
+#: One horizon self-attention block at the shipped decoder width: four bias-free
+#: $d_{\mathrm{hidden}} \times d_{\mathrm{hidden}}$ projections, one ``LayerNorm`` and one scalar
+#: residual gain, at $d_{\mathrm{hidden}} = 256$. The decoder is shared, so this cost is the same
+#: in every package of the family that ships the blocks.
+HORIZON_ATTENTION_BLOCK_PARAMS = 4 * 256**2 + 2 * 256 + 1
 
 #: Both stems together: two gated causal depthwise convolution blocks per encoder, at kernels
 #: $5$ and $9$. This is the A1-to-A2 difference, and the only one.
 STEM_PARAMS = 2 * (50_176 + 50_688)
 
-#: Going $d_{\mathrm{ff}} = 256 \to 384$ across the seven attention blocks the shipped
-#: architecture holds (four target, three source), at $3 d$ parameters per unit of width.
-FF_384_PARAMS = 3 * 128 * (384 - 256) * 7
+#: Going $d_{\mathrm{ff}} = 512 \to 384$ across the nine attention blocks the shipped
+#: architecture holds (six target, three source), at $3 d$ parameters per unit of width. Negative:
+#: the shipped width is now the larger one, so this arm is the lower bracket rather than an
+#: upgrade.
+FF_384_PARAMS = 3 * 128 * (384 - 512) * 9
 
 #: Predicted source-state reach per window arm, $R_U = \min(21 + 3(W_U - 1),\, T)$ in steps, with
 #: ``None`` meaning *unbounded* rather than clamped at $T$. Pinned here so a change to the stem
@@ -249,7 +281,7 @@ def test_the_lint_reports_a_declared_delta_that_does_not_match_the_file(default_
     arm_flat = _flatten(_resolved("sweep_ff_384.yaml"))
 
     assert resolved_delta(arm_flat, default_flat) == DECLARED_DELTAS["sweep_ff_384.yaml"]
-    assert resolved_delta(arm_flat, default_flat) != {_D_FF: 512}
+    assert resolved_delta(arm_flat, default_flat) != {_D_FF: 256}
 
 
 # --------------------------------------------------------------------------------------
@@ -321,12 +353,19 @@ def test_the_a1_arm_builds_no_convolution_stem(built):
 
 
 def test_both_phase_one_arms_make_the_source_encoder_the_target_encoder(built):
-    """Four blocks, full causal prefix, on both streams. The source bound is *absent* under A1 and
-    A2, which is what makes the stem the only difference between them."""
+    """Six blocks, full causal prefix, on both streams. The source bound is *absent* under A1 and
+    A2, which is what makes the stem the only difference between them.
+
+    Read off the *shipped* target depth rather than against a literal: the arms' claim is symmetry,
+    so a revision of the default's target depth that left these files behind would silently turn
+    them into depth arms and this comparison would stop being about the stem."""
+    shipped_depth = len(built["default.yaml"].target_encoder.attention_blocks)
+
+    assert shipped_depth == 6
     for name in ("sweep_arch_a1.yaml", "sweep_arch_a2.yaml"):
         model = built[name]
-        assert len(model.source_encoder.attention_blocks) == 4, name
-        assert len(model.target_encoder.attention_blocks) == 4, name
+        assert len(model.source_encoder.attention_blocks) == shipped_depth, name
+        assert len(model.target_encoder.attention_blocks) == shipped_depth, name
         assert model.source_encoder.attention_window is None, name
         assert model.source_encoder.receptive_field is None, name
 
@@ -348,17 +387,19 @@ def test_a2_minus_a1_is_exactly_the_stem_cost(params):
 
 
 def test_a1_against_the_shipped_configuration_is_not_the_stem_cost(params):
-    """A1 also gives the source encoder a fourth attention block, so its delta against the shipped
-    arm is $-201{,}728 + 164{,}352$. Stated because the naive reading -- A1 is the default without
-    its stem -- is wrong and would misattribute a parameter-matched comparison."""
+    """A1 also raises the source encoder from three blocks to six, so its delta against the shipped
+    arm is $-201{,}728 + 3 \\cdot 262{,}656$ -- positive. Stated because the naive reading -- A1 is
+    the default without its stem -- is wrong and would misattribute a parameter-matched
+    comparison."""
     delta = params["sweep_arch_a1.yaml"] - params["default.yaml"]
 
-    assert delta == -STEM_PARAMS + ATTENTION_BLOCK_PARAMS
-    assert delta == -37_376
+    assert delta == -STEM_PARAMS + 3 * ATTENTION_BLOCK_PARAMS
+    assert delta == 586_240
 
 
-def test_a2_against_the_shipped_configuration_is_one_attention_block(params):
-    assert params["sweep_arch_a2.yaml"] - params["default.yaml"] == ATTENTION_BLOCK_PARAMS
+def test_a2_against_the_shipped_configuration_is_three_attention_blocks(params):
+    """The source encoder goes from the shipped three blocks to the target's six."""
+    assert params["sweep_arch_a2.yaml"] - params["default.yaml"] == 3 * ATTENTION_BLOCK_PARAMS
 
 
 # --------------------------------------------------------------------------------------
@@ -451,16 +492,17 @@ def test_the_shipped_config_narrows_the_adapters_to_the_surviving_channels(built
 @pytest.mark.parametrize(
     "name,blocks",
     [
-        ("sweep_target_blocks_3.yaml", -1),
-        ("sweep_target_blocks_5.yaml", 1),
+        ("sweep_target_blocks_4.yaml", -2),
+        ("sweep_target_blocks_8.yaml", 2),
         ("sweep_source_blocks_2.yaml", -1),
         ("sweep_source_blocks_4.yaml", 1),
     ],
 )
-def test_a_depth_arm_moves_the_total_by_exactly_one_attention_block(name, blocks, params):
-    r"""$4d^2 + 3 d\,d_{\mathrm{ff}} + 4d = 164{,}352$ per block, whichever stream it is added to."""
+def test_a_depth_arm_moves_the_total_by_whole_attention_blocks(name, blocks, params):
+    r"""$4d^2 + 3 d\,d_{\mathrm{ff}} + 4d = 262{,}656$ per block, whichever stream it is added to.
+    The target arms bracket the shipped depth by two blocks each way, the source arms by one."""
     assert params[name] - params["default.yaml"] == blocks * ATTENTION_BLOCK_PARAMS
-    assert ATTENTION_BLOCK_PARAMS == 164_352
+    assert ATTENTION_BLOCK_PARAMS == 262_656
 
 
 def test_a_depth_arm_moves_one_stream_and_leaves_the_other_alone(built):
@@ -468,10 +510,10 @@ def test_a_depth_arm_moves_one_stream_and_leaves_the_other_alone(built):
     default = built["default.yaml"]
 
     for name, target, source in (
-        ("sweep_target_blocks_3.yaml", 3, 3),
-        ("sweep_target_blocks_5.yaml", 5, 3),
-        ("sweep_source_blocks_2.yaml", 4, 2),
-        ("sweep_source_blocks_4.yaml", 4, 4),
+        ("sweep_target_blocks_4.yaml", 4, 3),
+        ("sweep_target_blocks_8.yaml", 8, 3),
+        ("sweep_source_blocks_2.yaml", 6, 2),
+        ("sweep_source_blocks_4.yaml", 6, 4),
     ):
         model = built[name]
         assert len(model.target_encoder.attention_blocks) == target, name
@@ -492,16 +534,47 @@ def test_the_source_depth_arms_stay_inside_the_lag_search_range(built):
 
 
 def test_the_width_arm_moves_the_total_by_the_feed_forward_cost_alone(params, built):
-    r"""$3 d \,\Delta d_{\mathrm{ff}}$ per block across the seven attention blocks the shipped
-    architecture holds -- $344{,}064$ -- and nothing else: the attention projections, the stem and
-    every downstream component are untouched."""
+    r"""$3 d \,\Delta d_{\mathrm{ff}}$ per block across the nine attention blocks the shipped
+    architecture holds -- $-442{,}368$ -- and nothing else: the attention projections, the stem and
+    every downstream component are untouched. Negative, because $384$ is now the lower bracket."""
     assert params["sweep_ff_384.yaml"] - params["default.yaml"] == FF_384_PARAMS
-    assert FF_384_PARAMS == 344_064
+    assert FF_384_PARAMS == -442_368
 
     model = built["sweep_ff_384.yaml"]
     blocks = len(model.target_encoder.attention_blocks) + len(model.source_encoder.attention_blocks)
-    assert blocks == 7
+    assert blocks == 9
     assert model.target_encoder.d_ff == 384
+
+
+# --------------------------------------------------------------------------------------
+# The decoder-side bundle: the shape terms and the horizon attention
+# --------------------------------------------------------------------------------------
+def test_the_aux_arm_moves_only_the_criterion(params, built):
+    """The three shape terms hold no parameters, so this arm shares a checkpoint geometry with the
+    default and its result cannot be explained by capacity. Asserted on both sides -- the totals
+    are equal *and* the decoder core is the same object shape -- because the whole point of the
+    arm is that the only difference is what the criterion prices."""
+    assert params["sweep_aux_off.yaml"] == params["default.yaml"]
+
+    arm = built["sweep_aux_off.yaml"]
+    default = built["default.yaml"]
+    assert arm.horizon_core.attention_blocks == default.horizon_core.attention_blocks
+
+
+def test_the_horizon_attention_arm_removes_exactly_the_two_decoder_blocks(params, built):
+    r"""$4 d_{\mathrm{hidden}}^2 + 2 d_{\mathrm{hidden}} + 1 = 262{,}657$ per block at the shipped
+    $256$, twice. The arm builds **no** attention module rather than an inert one, which is what
+    makes the reverted decoder parameter-for-parameter the core as it was before the blocks
+    existed."""
+    delta = params["sweep_horizon_attn_off.yaml"] - params["default.yaml"]
+
+    assert delta == -2 * HORIZON_ATTENTION_BLOCK_PARAMS
+    assert delta == -525_314
+
+    arm = built["sweep_horizon_attn_off.yaml"]
+    assert arm.horizon_core.attention_blocks == 0
+    assert arm.horizon_core.attention is None
+    assert built["default.yaml"].horizon_core.attention_blocks == 2
 
 
 def test_the_model_width_is_the_same_in_every_arm(built):

@@ -7,6 +7,8 @@ the parts in isolation and silently fail in composition.
 """
 from __future__ import annotations
 
+import math
+
 import pytest
 import torch
 from torch import nn
@@ -103,6 +105,53 @@ def test_the_zero_survives_the_generic_weight_init(tiny_kwargs):
     assert all(layer.weight.abs().max().item() == 0.0 for layer in layers)
 
 
+def test_the_default_decoder_width_leaves_the_model_bitwise_unchanged(tiny_kwargs):
+    """Every parameter, not just the shapes: the decoder is built partway through ``__init__``,
+    so a width resolved at a different point in the constructor would consume the shared RNG
+    stream differently and silently re-seed every module after it."""
+    implicit = _model(tiny_kwargs)
+    explicit = _model(tiny_kwargs, decoder_out_channels=int(tiny_kwargs["raw_per_step"]))
+
+    left, right = dict(implicit.named_parameters()), dict(explicit.named_parameters())
+    assert set(left) == set(right)
+    differing = [name for name, value in left.items() if not torch.equal(value, right[name])]
+    assert not differing, differing
+    assert implicit.decoder_out_channels == implicit.raw_per_step == 16
+
+
+def test_a_non_default_decoder_width_reaches_the_forecast_heads(tiny_kwargs, inputs):
+    """The seam a feature-target sibling is built on: the decoder emits that many values per
+    horizon token, and nothing else about the model moves."""
+    width = 7
+    model = _model(tiny_kwargs, decoder_out_channels=width).eval()
+    assert model.decoder.out_channels == model.decoder_out_channels == width
+    assert model.raw_per_step == 16, "the raw grid is geometry, not the decoder width"
+
+    with torch.no_grad():
+        out = model(*inputs)
+    expected = (inputs[0].shape[0], model.geometry.t_valid, model.horizon, width)
+    for key in ("mu_base", "logvar_base", "mu_full", "logvar_full"):
+        assert out[key].shape == expected, key
+
+
+def test_the_init_passes_still_apply_at_a_non_default_decoder_width(tiny_kwargs):
+    """The decoder must stay built *before* the generic init and the three re-initialisations,
+    so widening it cannot move any of them past their targets."""
+    model = _model(tiny_kwargs, decoder_out_channels=7, head_init_calibration=True)
+
+    for name in ("delta_mu_head", "delta_logvar_head"):
+        module = getattr(model.posterior_head, name)
+        layers = list(module) if isinstance(module, nn.ModuleList) else [module]
+        for layer in layers:
+            assert layer.weight.abs().max().item() == 0.0, f"{name} not zeroed"
+    # The calibration reaches every one of the wider head's outputs, not the first sixteen:
+    # log(5/3) is what smooth_bound(-5, 3) maps to sigma = 1, and an uncalibrated tail would
+    # put the init NLL of those channels orders of magnitude above the trivial predictor's.
+    bias = model.decoder.logvar_head.bias
+    assert bias.numel() == 7
+    assert torch.allclose(bias, torch.full_like(bias, math.log(5.0 / 3.0)))
+
+
 def test_the_attention_output_projection_is_frozen(tiny_kwargs):
     """W_o feeds nothing under the head-structured posterior; freezing it drops it from DDP's
     expectation set."""
@@ -168,16 +217,17 @@ def test_a_narrowed_extra_kernel_still_forwards(tiny_kwargs, inputs):
     assert out["mu_prior"].shape[-1] == model.d_z
 
 
-def test_horizon_depth_4_constructs_and_forwards(tiny_kwargs, inputs):
-    """The ``horizon_depth: 4`` arm's decode path -- refine dilations $(1, 2, 4, 8)$ with a fourth
-    per-block FiLM generator -- is otherwise unexercised. Construct it, confirm the fourth
-    generator is present and zeroed (the identity-at-init re-zero covers every depth), and run a
-    forward to the contract shape."""
-    model = _model(tiny_kwargs, horizon_depth=4).eval()
+def test_horizon_depth_5_constructs_and_forwards(tiny_kwargs, inputs):
+    """The ``horizon_depth: 5`` arm's decode path -- refine dilations $(1, 2, 4, 8, 16)$ with a
+    fifth per-block FiLM generator -- is otherwise unexercised; depth $4$ is now the shipped value
+    and every other test in this suite builds it. Construct it, confirm the fifth generator is
+    present and zeroed (the identity-at-init re-zero covers every depth), and run a forward to the
+    contract shape."""
+    model = _model(tiny_kwargs, horizon_depth=5).eval()
 
     refine = model.horizon_core.refine
-    assert len(refine.blocks) == 4
-    assert refine.film is not None and len(refine.film) == 4
+    assert len(refine.blocks) == 5
+    assert refine.film is not None and len(refine.film) == 5
     assert all(float(generator.weight.abs().max()) == 0.0 for generator in refine.film)
 
     with torch.no_grad():

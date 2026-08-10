@@ -1,0 +1,21 @@
+# Calibration arm: converged KL weight beta_schedule.end = 2.5.
+#
+# Half the scale-matched value, and the arm that says whether the bracket has a floor inside it: if
+# 2.5 and 5.0 read the same, the scale-matching argument is coarser than the difference it predicts
+# and the shipped value is not worth defending to one significant figure.
+#
+# beta_prior moves with beta, holding beta_prior/beta = 0.1. The anchor's restoring force saturates
+# at beta_prior/2 per dimension while the reconstruction it opposes is what grew, so freezing it
+# while beta moves would sweep two axes at once.
+#
+#   TEB_RUN_STAMP="$(date '+%Y-%m-%d--[%H-%M]')" torchrun --nproc_per_node=7 \
+#       -m teb_vae.lag_attn_fs.trainer --config teb_vae/lag_attn_fs/configs/sweep_beta_2p5.yaml
+base: default.yaml
+
+model_config:
+  VAE_model:
+    beta_schedule:
+      # Only the converged weight moves. The linear warm-up from exactly 0 and its epoch count are
+      # inherited: the warm-up is the posterior-collapse guard, not part of the swept axis.
+      end: 2.5
+    beta_prior: 0.25

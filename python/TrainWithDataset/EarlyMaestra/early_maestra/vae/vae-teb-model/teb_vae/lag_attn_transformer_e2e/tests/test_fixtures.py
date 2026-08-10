@@ -150,13 +150,17 @@ def test_the_tiny_warmup_gives_the_front_end_a_usable_reach_budget():
 
 def test_shipped_kwargs_is_the_production_geometry_not_a_miniature():
     assert SHIPPED_KWARGS["sequence_length"] == 300
-    assert SHIPPED_KWARGS["d_z"] == 48
+    assert SHIPPED_KWARGS["d_z"] == 64
     assert SHIPPED_KWARGS["max_lag"] == 90
     assert SHIPPED_KWARGS["warmup_period"] == 30
     assert SHIPPED_KWARGS["raw_per_step"] == 16
     assert SHIPPED_KWARGS["encoder_conv_kernels"] == (5, 9)
-    assert SHIPPED_KWARGS["target_attention_blocks"] == 4
+    assert SHIPPED_KWARGS["encoder_d_ff"] == 512
+    assert SHIPPED_KWARGS["target_attention_blocks"] == 6
     assert SHIPPED_KWARGS["source_attention_blocks"] == 3
+    assert SHIPPED_KWARGS["decoder_hidden"] == 256
+    assert SHIPPED_KWARGS["horizon_depth"] == 4
+    assert SHIPPED_KWARGS["horizon_attention_blocks"] == 2
 
 
 # ---------------------------------------------------------------------------------------

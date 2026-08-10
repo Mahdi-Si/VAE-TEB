@@ -194,6 +194,51 @@ def test_both_wrappers_forward_beta_prior_by_value(task, stub_batch):
         ), type(model).__name__
 
 
+@pytest.mark.parametrize(
+    ("weight_key", "metric_key"),
+    [
+        ("lambda_ms", "aux_multiscale"),
+        ("lambda_deriv", "aux_derivative"),
+        ("lambda_boundary", "aux_boundary"),
+    ],
+)
+def test_both_wrappers_forward_each_shape_weight_by_value(
+    task, stub_batch, weight_key, metric_key
+):
+    """The ``beta_prior`` pattern, once per shape term: switching a weight from 0 to 1 must move
+    ``total_loss`` by exactly the returned term -- through this model's delegating
+    ``compute_loss`` and through the comparison model's, the edits in the loss path that are
+    made twice. A value assertion rather than a signature check, because a wrapper that accepts
+    a keyword and drops it passes any signature test.
+
+    The off call is also the zeros-when-off contract seen through the wrapper: at weight 0 the
+    term is not computed and its metric is an exact zero, so the difference is the *on* value
+    alone. Filed in this suite because the tree's import direction is trf -> rws, never the
+    reverse."""
+    from teb_vae.lag_attn_rws.tests.conftest import make_stub_batch as sibling_stub_batch
+
+    mine = task().orig_model.eval()
+    theirs = _sibling_task().orig_model.eval()
+
+    for model, batch in ((mine, stub_batch), (theirs, sibling_stub_batch())):
+        with torch.no_grad():
+            out = model(batch.fhr_st, batch.fhr_ph, torch.cat([batch.up_st, batch.up_ph], -1))
+            off = model.compute_loss(
+                out, batch.fhr, weight=batch.weight, **{weight_key: 0.0}
+            )
+            on = model.compute_loss(out, batch.fhr, weight=batch.weight, **{weight_key: 1.0})
+
+        term = on["metrics"][metric_key]
+        assert float(term) > 0.0, "an exactly-satisfied term would make this assertion vacuous"
+        assert float(off["metrics"][metric_key]) == 0.0, "zeros-when-off"
+        assert torch.allclose(
+            on["metrics"]["total_loss"] - off["metrics"]["total_loss"],
+            term,
+            rtol=1e-5,
+            atol=1e-4,
+        ), type(model).__name__
+
+
 def test_the_zero_kl_start_survives_the_task(task, stub_batch):
     """At initialisation the posterior *is* the prior, so the coupling readout starts at exactly
     zero and every nat it later reports had to be earned. Seen here through the task's own

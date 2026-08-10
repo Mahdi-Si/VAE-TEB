@@ -77,7 +77,7 @@ from teb_vae.lag_attn_rws.nets.heads import FullLatentPriorHead
 from teb_vae.lag_attn_rws.nets.losses import compute_loss as compute_raw_objective
 from teb_vae.lag_attn_rws.nets.losses import kld_tensor as closed_form_kld
 from teb_vae.lag_attn_rws.nets.model import SATURATION_FRAC
-from teb_vae.lag_attn_rws.nets.raw_targets import build_future_index
+from teb_vae.lag_attn_rws.nets.raw_targets import build_future_index, build_future_target
 from teb_vae.lag_attn_transformer_e2e.nets.frontend import (
     FRONTEND_KERNELS,
     CausalRawFrontend,
@@ -129,6 +129,7 @@ class SeqVaeLagAttnTrfE2E(nn.Module):
         horizon_depth: int = 2,
         horizon_kernel: int = 3,
         horizon_film: bool = False,
+        horizon_attention_blocks: int = 0,
         horizon_embed_std: float = 0.02,
         head_init_calibration: bool = False,
         a_head_gain: float = 1.0,
@@ -190,6 +191,12 @@ class SeqVaeLagAttnTrfE2E(nn.Module):
             horizon_depth: Number of dilated blocks in the horizon core.
             horizon_kernel: Horizon-convolution kernel width.
             horizon_film: Whether to FiLM-condition each horizon step on the decoder state.
+            horizon_attention_blocks: Number of bidirectional self-attention blocks the shared
+                horizon core runs over its $H$ forecast tokens, after the dilated refine stack.
+                The convolutions mix horizon steps through a fixed local window; these mix all $H$
+                at once, so the forecast can be shaped as a whole. $0$ (the default) builds no
+                module, leaving the core exactly as it is without them. The head count is the
+                core's own default and is deliberately not a keyword here: no arm varies it.
             horizon_embed_std: Standard deviation the horizon-step embedding is re-seeded at,
                 *after* the generic initialisation. The default $0.02$ leaves the core's own seed in
                 place; a larger value (shipped $0.8$) breaks the near-degeneracy of the $H$ horizon
@@ -476,6 +483,7 @@ class SeqVaeLagAttnTrfE2E(nn.Module):
             depth=horizon_depth,
             film=horizon_film,
             film_per_block=True,
+            attention_blocks=horizon_attention_blocks,
         )
         self.decoder = BaselineFutureDecoder(
             core=self.horizon_core,
@@ -1034,17 +1042,23 @@ class SeqVaeLagAttnTrfE2E(nn.Module):
         lambda_base: float = 1.0,
         likelihood: str = "gaussian_nll",
         free_bits: float = 0.0,
+        lambda_ms: float = 0.0,
+        lambda_deriv: float = 0.0,
+        lambda_boundary: float = 0.0,
     ) -> Dict[str, Any]:
-        r"""Compute the four-term objective in nats per anchor.
+        r"""Compute the seven-term objective, per anchor.
 
         $$\mathcal{L} = \lambda_{\mathrm{full}} D_1 + \lambda_{\mathrm{base}} D_0
-        + \beta\,\mathrm{KL}_{\mathrm{train}} + \beta_p\,R_p$$
+        + \beta\,\mathrm{KL}_{\mathrm{train}} + \beta_p\,R_p
+        + \lambda_{\mathrm{ms}} \mathcal{L}_{\mathrm{ms}}
+        + \lambda_{\Delta} \mathcal{L}_{\Delta}
+        + \lambda_{\mathrm{boundary}} \mathcal{L}_{\mathrm{boundary}}$$
 
-        Delegates to :func:`~teb_vae.lag_attn_rws.nets.losses.compute_loss`, supplying this model's
-        geometry, its cached raw-target index grid and its two scalar bounds. Shared rather than
-        reimplemented, and that is the point: this architecture exists to be compared against the one
-        it changes the input of, and a second copy of the objective would make the comparison partly
-        a comparison of two losses.
+        Delegates to :func:`~teb_vae.lag_attn_rws.nets.losses.compute_loss`, gathering the raw
+        future target from this model's cached index grid and supplying its geometry, its block
+        width and its two scalar bounds. Shared rather than reimplemented, and that is the point:
+        this architecture exists to be compared against the one it changes the input of, and a
+        second copy of the objective would make the comparison partly a comparison of two losses.
 
         The signature keeps the sibling's argument name, so a caller holding either model reaches
         the objective the same way -- which is what lets one task, one plotting callback and one
@@ -1063,6 +1077,10 @@ class SeqVaeLagAttnTrfE2E(nn.Module):
             lambda_base: Weight on the base-forecast reconstruction.
             likelihood: ``'mse'`` or ``'gaussian_nll'``.
             free_bits: Per-dimension per-step KL floor; enters the trained KL only.
+            lambda_ms: Weight on the multiscale $L_1$ shape term; ``0.0`` skips it and reports
+                an exact zero.
+            lambda_deriv: Weight on the derivative Huber shape term, same contract.
+            lambda_boundary: Weight on the boundary-continuity shape term, same contract.
 
         Returns:
             ``{'metrics': ..., 'likelihood': ...}``; see the shared implementation for the metric
@@ -1074,10 +1092,11 @@ class SeqVaeLagAttnTrfE2E(nn.Module):
         """
         return compute_raw_objective(
             forward_outputs,
-            fhr_raw,
+            build_future_target(fhr_raw, self.geometry, future_index=self.future_index),
             weight=weight,
             geometry=self.geometry,
-            future_index=self.future_index,
+            # The raw block's last axis counts raw samples per horizon token.
+            block_width=self.geometry.r,
             coverage_floor=self.coverage_floor,
             logvar_clamp=self.logvar_clamp,
             beta=beta,
@@ -1086,4 +1105,7 @@ class SeqVaeLagAttnTrfE2E(nn.Module):
             lambda_base=lambda_base,
             likelihood=likelihood,
             free_bits=free_bits,
+            lambda_ms=lambda_ms,
+            lambda_deriv=lambda_deriv,
+            lambda_boundary=lambda_boundary,
         )

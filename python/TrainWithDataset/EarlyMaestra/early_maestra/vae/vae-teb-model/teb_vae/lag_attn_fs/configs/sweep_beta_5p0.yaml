@@ -1,0 +1,31 @@
+# Calibration arm: converged KL weight beta_schedule.end = 5.0, the scale-matched value -- and the
+# value this package shipped BEFORE the sweep ran.
+#
+# 5.0 is where the sibling's ratio of KL weight to reconstruction scale lands: 2340/480 = 4.875, and
+# 5.0 is the round value beside it. The DIRECTION is the part that is easy to get backwards -- a
+# larger reconstruction at fixed beta makes beta*KL relatively WEAKER, so the scale-matched value is
+# ABOVE the inherited 1.0, not below it. The rate column of the sweep confirms that direction: the
+# latent narrows monotonically as beta rises.
+#
+# What the scale-matching argument INFERRED from the direction is what this arm refuted. It reasoned
+# that the inherited beta would leave the latent over-open, carrying target information a permutation
+# control might not catch. On the committed HIE shard this arm is third of four on the base forecast,
+# the forecast gap at both horizon ends, the latent width and that very control (RESULTS.md), and
+# default.yaml moved to sweep_beta_1p0's value as a result. The file stays pinned at 5.0 so the
+# hypothesis is re-measurable at production scale rather than reconstructed from this comment.
+#
+# beta_prior moves with beta, holding beta_prior/beta = 0.1. The anchor's restoring force saturates
+# at beta_prior/2 per dimension while the reconstruction it opposes is what grew, so freezing it
+# while beta moves would sweep two axes at once.
+#
+#   TEB_RUN_STAMP="$(date '+%Y-%m-%d--[%H-%M]')" torchrun --nproc_per_node=7 \
+#       -m teb_vae.lag_attn_fs.trainer --config teb_vae/lag_attn_fs/configs/sweep_beta_5p0.yaml
+base: default.yaml
+
+model_config:
+  VAE_model:
+    beta_schedule:
+      # Only the converged weight moves. The linear warm-up from exactly 0 and its epoch count are
+      # inherited: the warm-up is the posterior-collapse guard, not part of the swept axis.
+      end: 5.0
+    beta_prior: 0.5

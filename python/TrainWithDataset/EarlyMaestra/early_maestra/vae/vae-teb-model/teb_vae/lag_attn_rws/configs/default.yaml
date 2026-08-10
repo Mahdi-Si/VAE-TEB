@@ -102,9 +102,49 @@ model_config:
     lambda_full: 1.0
     lambda_base: 1.0
 
+    # --- Auxiliary shape terms --------------------------------------------------
+    # Three shape penalties on the forecast MEANS of both branches, added to the criterion beside
+    # the two reconstruction terms. The factorized Gaussian NLL scores every raw sample
+    # independently, so its optimum is the conditional mean and a fully parallel decoder is free to
+    # emit an over-smoothed one: the per-sample likelihood cannot tell a forecast that has the right
+    # envelope, slope and starting level from one that merely has the right average. These terms can.
+    #
+    # A term is computed ONLY when its weight is nonzero; at 0.0 its metric is reported as exact 0.0
+    # rather than as the term's would-be value. That keeps a term-off arm's CSV honest (a zero column
+    # is a zero contribution) and keeps the full-block intermediates out of the graph of any run that
+    # has the term off. The branch reads a config-constant float, identical on every rank and every
+    # batch, so DDP graph identity is unaffected.
+    #
+    # UNITS: these are L1 and Huber quantities on z-scored raw samples, not nats. `total_loss` is
+    # therefore a weighted MIXED-UNIT criterion; the pure-nats readouts are the NLL metrics
+    # (`nll_full_block`, `nll_base_block`, `main_loss`). Read a go/no-go on `val/total_loss` with
+    # that in mind, and read the three `aux_*` columns beside it.
+    #
+    # PROVISIONAL, all three: no run has measured the per-term magnitudes at this scale, so these
+    # are the smallest weights that make the terms visible without letting them dominate the
+    # likelihood. Re-derive from the first production run's metrics_history.csv -- the three aux
+    # columns against `main_loss`. Setting all three to 0.0 prices the bundle as a whole and is a
+    # config edit rather than a code change.
+    #
+    # Multiscale L1 between the pooled forecast mean and the pooled target at rates (1, 4, 16),
+    # which is where the block's envelope lives rather than its sample-by-sample detail.
+    lambda_ms: 0.1
+    # Huber (delta 1.0) between the first differences of forecast and target: the term that prices
+    # slope, which is what an over-smoothed mean loses first.
+    lambda_deriv: 0.1
+    # |first forecast sample - anchor's last observed sample|. Half the others' weight because it
+    # constrains ONE sample per anchor against 480 for the terms above; at parity it would out-weigh
+    # them per-sample by that factor.
+    lambda_boundary: 0.05
+
     # --- Backbone widths -------------------------------------------------------
     d_model: 128
-    d_z: 48                # the latent must carry the whole FHR predictive state; sweep axis
+    # The latent must carry the whole FHR predictive state, and it is the decoder's ONLY input --
+    # there is no state bypass here -- so it is the model's narrowest point. 64 = 4 groups of 16,
+    # divisible by num_heads as the head-structured posterior requires. Raised from 48 with the
+    # decoder widths below: the first production run's forecasts were judged over-smoothed, and the
+    # encoders held 1.35 M parameters against a 0.3 M decoder reading a 48-vector. Sweep axis.
+    d_z: 64
     horizon: 30            # H = 30 decimated steps = 2 min forecast
     raw_per_step: 16       # R raw samples per horizon token; horizon * R = 480 per anchor
     warmup_period: 30      # first 2 minutes ignored in every loss
@@ -135,7 +175,10 @@ model_config:
     # Those arms exist as files only in teb_vae/lag_attn_transformer_rws/configs/ -- for this
     # package the arm is a one-key override of this file, not a config that is already here.
     source_dropout: null
-    decoder_hidden: 128
+    # Hidden width of the shared horizon decoder core. 256, doubled with the latent above: the
+    # decoder is the only thing standing between one latent vector and 480 raw samples, and at 128
+    # it held roughly a fifth of the parameters the two encoders did.
+    decoder_hidden: 256
     # Inherited from a decoder that emitted feature coefficients; the right bounds for a
     # z-scored raw FHR target are unknown until the first run's log-variance distributions
     # are inspected.
@@ -250,9 +293,18 @@ model_config:
     query_uses_logvar: false
 
     # --- Shared horizon decoder core -------------------------------------------
-    horizon_depth: 3
+    # Four dilated refine blocks, so the dilations are (1, 2, 4, 8) and the receptive field over the
+    # horizon axis is 31 -- one more than the 30 horizon tokens, i.e. every token can see the whole
+    # block through the convolutions alone. At depth 3 it was 15, half the horizon.
+    horizon_depth: 4
     horizon_kernel: 3
     horizon_film: true
+    # Bidirectional self-attention over the H horizon tokens, run inside the shared decoder core
+    # after the dilated refine stack. The convolutions mix horizon steps through a fixed local
+    # window; these mix all H at once, so the forecast is shaped as a whole rather than assembled
+    # from overlapping neighbourhoods. 0 builds no module, leaving the core exactly as it is
+    # without them. Head count is the core's own (4) and has no key: no arm varies it.
+    horizon_attention_blocks: 2
 
     # --- Initialisation policies (zero-parameter; the init-off arm varies all three) -------
     # Applied after the generic init; each is a no-op at the constructor default, so the sweep's
@@ -368,6 +420,12 @@ advanced_config:
     # percentiles over 1,019 steps thinned from 452,250 -- which is the right distribution to set a
     # per-step threshold from. `train/grad_clip_frac` is the same one-step-per-epoch sample of the
     # exceedance indicator, so read it as a mean over epochs rather than per row.
+    #
+    # PROVISIONAL AT THIS CAPACITY: that measurement predates the wider latent, the wider and deeper
+    # decoder, the horizon attention and the three auxiliary shape terms, each of which moves the
+    # gradient this threshold is set against. Ships unchanged because a guessed rescaling would be
+    # worse than a measured value carried across; re-derive it from the first run at this geometry
+    # by the five-step procedure in RESULTS.md.
     gradient_clip_val: 5000.0
     gradient_clip_algorithm: "norm"
     sync_batchnorm: false     # there is no BatchNorm anywhere in this model
@@ -414,6 +472,13 @@ advanced_config:
   # is ~2 * 480 larger, and a correlated-noise scaling of the same headroom lands near 1e+3.
   # PROVISIONAL: re-derive from the first real run's observed main_loss fluctuation; until then
   # the non-finite guard is the hard protection and the margin errs loose rather than tight.
+  #
+  # `main_loss` IS the optimised total, so the three auxiliary shape terms are inside the watched
+  # quantity and the margin is no longer stated in nats alone: it now bounds the movement of a
+  # mixed-unit criterion. At the shipped weights the aux contribution is small beside a 480-sample
+  # summed NLL, so the margin is not rescaled for it -- but that is an expectation rather than a
+  # measurement, and it is one more reason to re-derive the margin from the first run at this
+  # geometry (the aux columns are logged per epoch from epoch 0, so the split is readable).
   spike_breaker:
     enabled: true
     multiplier: 5.0

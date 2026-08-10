@@ -2,11 +2,15 @@ r"""Lint for the calibration sweep arms, and the study's numeric collapse criter
 
 Three one-variable calibration sweeps and five architecture A/B arms exercise the shipped
 configuration. The calibration sweeps vary the converged KL weight ``beta_schedule.end`` over
-$\{0.1, 0.3, 1.0, 3.0\}$, the latent width ``d_z`` over $\{24, 32, 48, 64\}$, and the causal
+$\{0.1, 0.3, 1.0, 3.0\}$, the latent width ``d_z`` over $\{24, 32, 48, 64, 96\}$, and the causal
 input budget ``causal_reach_budget_s`` over $\{\mathrm{null}, 240, 120, 60, 32\}$ seconds. The
-architecture arms each flip one structural knob against the baseline: ``encoder_extra_kernel``
+latent ladder brackets the shipped $64$ on both sides: $48$ is the value this package shipped
+before the capacity revision, so it asks whether the raise was needed, and $96$ is the upper
+bracket the raise opened. The $64$ arm restates the shipped value and therefore declares an empty
+delta -- pinned, so the comparison survives a later revision of the default.
+The architecture arms each flip one structural knob against the baseline: ``encoder_extra_kernel``
 $\to 7$, ``conv_norm_groups`` $\to 1$, ``query_uses_logvar`` $\to$ true, ``horizon_depth``
-$\to 4$, and the init-off ablation. Every arm is ``default.yaml`` plus its swept delta and
+$\to 5$, and the init-off ablation. Every arm is ``default.yaml`` plus its swept delta and
 nothing else, so any pair of runs differs by one resolved key and a metric difference between
 them has one explanation. Two arms are deliberate multi-key exceptions: the $240$ s reach arm
 must also raise ``warmup_period`` to $60$ (that budget admits channels whose forward reach needs
@@ -80,6 +84,7 @@ _ARMS: Dict[str, Any] = {
     "sweep_dz_32.yaml": (_D_Z, 32, {}),
     "sweep_dz_48.yaml": (_D_Z, 48, {}),
     "sweep_dz_64.yaml": (_D_Z, 64, {}),
+    "sweep_dz_96.yaml": (_D_Z, 96, {}),
     "sweep_reach_null.yaml": (_REACH, None, {}),
     "sweep_reach_240.yaml": (_REACH, 240, {_WARMUP: 60}),
     "sweep_reach_120.yaml": (_REACH, 120, {}),
@@ -88,7 +93,7 @@ _ARMS: Dict[str, Any] = {
     "sweep_enc_kernel_7.yaml": (_ENC_KERNEL, 7, {}),
     "sweep_norm_groups_1.yaml": (_NORM_GROUPS, 1, {}),
     "sweep_query_logvar.yaml": (_QUERY_LOGVAR, True, {}),
-    "sweep_horizon_depth_4.yaml": (_HORIZON_DEPTH, 4, {}),
+    "sweep_horizon_depth_5.yaml": (_HORIZON_DEPTH, 5, {}),
     "sweep_init_off.yaml": (_EMBED_STD, 0.02, {_HEAD_CALIB: False, _A_HEAD_GAIN: 1.0}),
 }
 
@@ -96,12 +101,12 @@ _ARMS: Dict[str, Any] = {
 #: resolved files, so the files -- not this table alone -- carry the burden of proof.
 _STATED_SETS = {
     _BETA_END: {0.1, 0.3, 1.0, 3.0},
-    _D_Z: {24, 32, 48, 64},
+    _D_Z: {24, 32, 48, 64, 96},
     _REACH: {None, 240, 120, 60, 32},
     _ENC_KERNEL: {7},
     _NORM_GROUPS: {1},
     _QUERY_LOGVAR: {True},
-    _HORIZON_DEPTH: {4},
+    _HORIZON_DEPTH: {5},
     _EMBED_STD: {0.02},
 }
 

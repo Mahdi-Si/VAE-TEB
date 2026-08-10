@@ -53,11 +53,16 @@ def test_the_init_decode_bitwise_equals_a_film_free_pass(tiny_kwargs):
     ``torch.equal`` to a FiLM-free core holding the same shared weights. If ``initialization`` had
     been allowed to leave FiLM random, this would fail."""
     core = _model(tiny_kwargs).horizon_core
+    # Everything except FiLM is mirrored off the built core, the horizon attention included: this
+    # is a FiLM comparison, and a reference that silently dropped the attention blocks would make
+    # it a comparison of two different decoders the moment the shipped config turns them on.
     reference = HorizonDecoderCore(
         d_hidden=core.d_hidden,
         horizon=core.horizon,
         depth=len(core.refine.blocks),
         film=False,
+        attention_blocks=core.attention_blocks,
+        attention_heads=core.attention_heads,
     )
     # Copy the shared (non-FiLM) weights; the FiLM generators have no counterpart and are dropped.
     reference.load_state_dict(core.state_dict(), strict=False)

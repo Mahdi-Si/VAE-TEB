@@ -67,6 +67,25 @@ def test_the_flags_that_change_the_architecture_survive(task):
         assert flag in checkpoint["model_kwargs"], f"{flag} missing from model_kwargs"
 
 
+def test_the_horizon_attention_depth_survives_into_the_blob(task):
+    """Recorded separately because ``TINY_KWARGS`` deliberately does not set it -- the tiny model
+    runs the decoder without attention -- so the loop above cannot cover it.
+
+    It has to be there for the same reason the encoder block counts do, and more sharply: the
+    blocks are the *only* thing the key builds, so a blob that lost it would rebuild a blockless
+    decoder whose remaining tensors all still align, and the load would be reported as a success.
+    """
+    module = task(model_kwargs=dict(TINY_KWARGS, horizon_attention_blocks=2))
+    checkpoint = _lightning_style_checkpoint(module)
+
+    assert checkpoint["model_kwargs"]["horizon_attention_blocks"] == 2
+
+    blockless = SeqVaeLagAttnTrfE2E(**TINY_KWARGS)
+    rebuilt = SeqVaeLagAttnTrfE2E(**checkpoint["model_kwargs"])
+    assert set(rebuilt.state_dict()) == set(module.orig_model.state_dict())
+    assert set(blockless.state_dict()) != set(module.orig_model.state_dict())
+
+
 def test_the_base_stamp_survives_the_override(task):
     """``on_save_checkpoint`` adds a field; it must not replace the base's work. An override that
     skipped ``super()`` would drop ``model_class`` and every guard that reads it would silently

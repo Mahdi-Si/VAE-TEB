@@ -12,6 +12,7 @@ completion with no error anywhere.
 """
 from __future__ import annotations
 
+import inspect
 from pathlib import Path
 
 import pytest
@@ -102,8 +103,10 @@ def test_all_three_pre_flight_guards_run_before_setup_config(tmp_path, monkeypat
     )
     monkeypatch.setattr(
         trainer_module,
+        # ``**_`` because ``main`` hands this one the driver's TARGET_FIELDS; the stub records
+        # the order and has no opinion about the fields.
         "_check_raw_target_normalized",
-        lambda config: order.append("fhr_normalized"),
+        lambda config, **_: order.append("fhr_normalized"),
     )
     monkeypatch.setattr(trainer_module, "GraphDataModule", lambda config: None)
     monkeypatch.setattr(
@@ -314,6 +317,57 @@ def test_a_missing_fhr_raises_naming_the_offending_list(
         trainer_module.main(_tiny_config_at(tmp_path, _drop_fhr))
 
     assert "create_model" not in recording_main
+
+
+def test_the_guard_names_the_field_as_well_as_the_list(tmp_path):
+    """Called directly, at a two-field target: a sibling forecasting a feature block has two
+    fields to get wrong, and "one of them is missing" is not a fix anybody can act on."""
+    config = load_config(str(_TINY))
+    dataloader = config["dataset_config"]["dataloader_config"]
+    dataloader["normalize_fields"] = ["fhr", "fhr_st"]
+
+    with pytest.raises(ValueError, match=r"'fhr_ph' in .*normalize_fields"):
+        trainer_module._check_raw_target_normalized(config, fields=("fhr_st", "fhr_ph"))
+
+    # And the shipped default is unchanged, which is what the evaluation's preflight and the two
+    # transformer packages all call it with.
+    trainer_module._check_raw_target_normalized(config)
+
+
+def test_main_checks_the_drivers_own_target_fields(recording_main, tmp_path):
+    """The plumbing a ``trainer_cls=`` wiring mistake breaks: the guard must read the driver it
+    was handed, not this module's literal.
+
+    One config, normalizing ``fhr`` but not ``fhr_st``: the default driver passes it and a
+    driver declaring the feature fields must be refused. Both directions, because a guard wired
+    to the wrong class would still refuse *something* and a one-sided test would not say which.
+    """
+
+    def _drop_fhr_st(config):
+        config["dataset_config"]["dataloader_config"]["normalize_fields"].remove("fhr_st")
+
+    config_path = _tiny_config_at(tmp_path, _drop_fhr_st)
+
+    trainer_module.main(config_path)
+    assert "create_model" in recording_main
+
+    class _FeatureTargetTrainer(trainer_module.LagAttnRwsTrainer):
+        TARGET_FIELDS = ("fhr_st", "fhr_ph")
+
+    with pytest.raises(ValueError, match=r"'fhr_st'"):
+        trainer_module.main(config_path, trainer_cls=_FeatureTargetTrainer)
+
+
+def test_the_normalisation_guard_is_called_by_main_and_not_from_preflight():
+    """``preflight`` is documented as a no-op precisely so a subclass that forgets ``super()``
+    cannot drop an inherited check. Moving this guard behind it would silently disable it for
+    the one package whose ``preflight`` override has a bare body."""
+    source = inspect.getsource(trainer_module.main)
+    assert "_check_raw_target_normalized" in source
+    assert (
+        "_check_raw_target_normalized"
+        not in inspect.getsource(trainer_module.LagAttnRwsTrainer.preflight)
+    )
 
 
 # Derived from __file__, not cwd-relative: the width guard swallows a failed open (a missing

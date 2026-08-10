@@ -15,9 +15,43 @@ import pytest
 import torch
 
 from teb_vae.lag_attn_rws.tests.conftest import SHIPPED_KWARGS
-from teb_vae.lag_attn_rws.trainer import LagAttnRwsTrainer
+from teb_vae.lag_attn_rws.trainer import _TRACKED_METRICS, LagAttnRwsTrainer
+from train.callbacks import MetricsLoggingCallback
 
 _CONFIG = Path(__file__).resolve().parents[1] / "configs" / "default.yaml"
+
+
+def _redirected(trainer_cls, base_dir):
+    """Build one driver of ``trainer_cls`` on the shipped config, writing under ``base_dir``."""
+    driver = trainer_cls(config_file_path=str(_CONFIG))
+    driver.output_base_dir = str(base_dir)
+    driver.train_results_dir = str(Path(base_dir) / "train_results")
+    driver.model_checkpoint_dir = str(Path(base_dir) / "model_checkpoints")
+    return driver
+
+
+def _capture_callbacks(driver, monkeypatch):
+    """Return the callback list ``train_model`` assembles, without building a model or fitting.
+
+    ``build_trainer`` is intercepted, and ``pl_model`` is left unset: the assembly reads it only
+    to hand it on, so the whole production net does not have to be constructed to find out which
+    callbacks a config wires.
+    """
+    captured = {}
+
+    def _capture(callbacks, model=None):
+        captured["callbacks"] = callbacks
+
+        class _StubTrainer:
+            def fit(self, *args, **kwargs):
+                captured["fit"] = True
+
+        return _StubTrainer()
+
+    monkeypatch.setattr(type(driver), "build_trainer", staticmethod(_capture))
+    driver.pl_model = None
+    driver.train_model(object(), object())
+    return captured
 
 
 @pytest.fixture
@@ -25,11 +59,7 @@ def trainer(tmp_path):
     """A driver on the shipped config, with its output directories redirected under
     ``tmp_path``. ``setup_config`` is never called -- it would seed, open log sinks and probe
     MLflow -- so the directories are assigned directly."""
-    driver = LagAttnRwsTrainer(config_file_path=str(_CONFIG))
-    driver.output_base_dir = str(tmp_path)
-    driver.train_results_dir = str(tmp_path / "train_results")
-    driver.model_checkpoint_dir = str(tmp_path / "model_checkpoints")
-    return driver
+    return _redirected(LagAttnRwsTrainer, tmp_path)
 
 
 # --------------------------------------------------------------------------------------
@@ -57,7 +87,7 @@ def test_the_geometry_reaches_the_constructor(trainer):
 
     assert kwargs["sequence_length"] == 300
     assert kwargs["d_model"] == 128
-    assert kwargs["d_z"] == 48
+    assert kwargs["d_z"] == 64
     assert kwargs["horizon"] == 30
     assert kwargs["raw_per_step"] == 16
     assert kwargs["warmup_period"] == 30
@@ -104,6 +134,15 @@ def test_a_null_config_value_falls_through_to_the_constructor_default(trainer):
     trainer.config["model_config"]["VAE_model"]["dropout"] = None
 
     assert "dropout" not in trainer._build_model_kwargs()
+
+
+def test_the_decoder_width_rides_the_signature_sweep_with_no_special_case(trainer):
+    """It is a constructor argument like any other, so the sweep carries it into the kwargs a
+    checkpoint records -- which is the only place a non-default decoder width is recoverable
+    from, the raw grid no longer implying it."""
+    trainer.config["model_config"]["VAE_model"]["decoder_out_channels"] = 78
+
+    assert trainer._build_model_kwargs()["decoder_out_channels"] == 78
 
 
 def test_init_weights_is_never_a_config_decision(trainer):
@@ -306,3 +345,62 @@ def test_a_mistyped_init_policy_key_is_caught_by_the_seam(trainer):
     model = _built_model(trainer)
 
     assert float(model.horizon_core.horizon_embedding.std()) < 0.05
+
+
+# --------------------------------------------------------------------------------------
+# The callback seams
+# --------------------------------------------------------------------------------------
+def test_the_tracked_metric_list_is_reached_through_the_class_attribute(trainer, monkeypatch):
+    """A sibling adding a metric must not have to override ``train_model`` to collect it: that
+    method is the whole callback assembly, and a copy of it would be free to drift from this one
+    on every knob it wires -- the checkpoint monitor, the hyperparameter keys, the plot cadence."""
+    assert LagAttnRwsTrainer.TRACKED_METRICS is _TRACKED_METRICS
+
+    class _ExtraMetricTrainer(LagAttnRwsTrainer):
+        TRACKED_METRICS = _TRACKED_METRICS + ("val/a_sibling_metric",)
+
+    assert "train_model" not in vars(_ExtraMetricTrainer), (
+        "the point of the seam is that a subclass does not override train_model"
+    )
+
+    driver = _redirected(_ExtraMetricTrainer, trainer.output_base_dir)
+    captured = _capture_callbacks(driver, monkeypatch)
+
+    collector = next(
+        cb for cb in captured["callbacks"] if isinstance(cb, MetricsLoggingCallback)
+    )
+    assert collector.tracked_metrics == _TRACKED_METRICS + ("val/a_sibling_metric",)
+
+
+def test_the_plotting_block_name_is_an_attribute_the_assembly_reads(trainer, monkeypatch):
+    """The literal is one string in one place, and a run whose config spells the block
+    differently gets no figure, no error, and nothing in the log saying why."""
+    assert LagAttnRwsTrainer.PLOT_CONFIG_KEY == "lag_attn_rws_plotting"
+
+    class _RenamedBlockTrainer(LagAttnRwsTrainer):
+        PLOT_CONFIG_KEY = "a_block_no_config_carries"
+
+    driver = _redirected(_RenamedBlockTrainer, trainer.output_base_dir)
+    captured = _capture_callbacks(driver, monkeypatch)
+
+    names = [type(cb).__name__ for cb in captured["callbacks"]]
+    assert "LagAttnRwsPlotCallback" not in names
+
+
+def test_the_plot_callback_import_happens_only_when_the_figure_is_enabled(trainer, monkeypatch):
+    """The callback pulls matplotlib. Resolved eagerly -- as a class attribute would be -- every
+    run would import it, including the ones on a box that has no display stack at all."""
+    import sys
+
+    monkeypatch.delitem(sys.modules, "teb_vae.lag_attn_rws.plotting", raising=False)
+
+    disabled = _redirected(LagAttnRwsTrainer, trainer.output_base_dir)
+    disabled.config["advanced_config"]["callbacks"]["lag_attn_rws_plotting"]["enabled"] = False
+    _capture_callbacks(disabled, monkeypatch)
+    assert "teb_vae.lag_attn_rws.plotting" not in sys.modules
+
+    enabled = _redirected(LagAttnRwsTrainer, trainer.output_base_dir)
+    captured = _capture_callbacks(enabled, monkeypatch)
+    assert "teb_vae.lag_attn_rws.plotting" in sys.modules
+    assert "LagAttnRwsPlotCallback" in [type(cb).__name__ for cb in captured["callbacks"]]
+    assert LagAttnRwsTrainer.plot_callback_cls().__name__ == "LagAttnRwsPlotCallback"

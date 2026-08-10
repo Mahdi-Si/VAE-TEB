@@ -56,7 +56,8 @@ rather than on every figure this builds.
 """
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional, Tuple
+from dataclasses import dataclass
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -90,14 +91,29 @@ from teb_vae.lag_attn.nets.lag_report import (  # noqa: E402
 )
 from utils.style import style_axes  # noqa: E402
 
-__all__ = ["build_diagnostic_figure"]
+__all__ = [
+    "BAND_SIGMAS",
+    "ForecastRowInputs",
+    "build_diagnostic_figure",
+    "raw_context_row",
+    "raw_forecast_rows",
+]
+
+#: The two row names the forecast seam owns. Named constants rather than literals repeated in a
+#: sibling package: the layout's row list is this module's, and a name that disagrees with it
+#: raises a ``KeyError`` from inside a callback that swallows exceptions to protect the fit.
+RAW_ROW = "raw"
+FORECAST_ROW = "forecast"
 
 #: Raw sampling rate of the target signal, in Hz. With ``decimation = 16`` this is the $4$ s
 #: decimated step the whole geometry is built on.
 _FS_RAW = 4.0
 
-#: Band width drawn around each forecast mean, in standard deviations.
-_BAND_SIGMAS = 2.0
+#: Band width drawn around each forecast mean, in standard deviations. Public because a sibling
+#: page draws the same band around a forecast in another domain, and two pages of one family
+#: quoting different intervals under the same $\pm k\sigma$ caption is a difference nobody would
+#: look for.
+BAND_SIGMAS = 2.0
 
 #: Physical unit of each raw signal the page draws, for the axis labels. Only reachable when the
 #: loader's statistics are known -- see :func:`_denormalised`, which falls back to z-units rather
@@ -141,6 +157,214 @@ def _denormalised(
     return to_numpy(values), "normalised"
 
 
+@dataclass(frozen=True)
+class ForecastRowInputs:
+    r"""Everything the page's first two rows need, and the layout hooks they draw through.
+
+    The two rows are the only ones that depend on what is being forecast. Rows $3$ to $7$ -- the
+    latent state, the per-dimension KL, $K_t$ and the two lag maps -- are statements about the
+    latent and the attention, and are identical whatever the target is. So the page hands these
+    two out behind a seam and keeps the GridSpec, the row cuts, the shared time axis and the
+    caption in one place; a sibling forecasting another domain writes a replacement for
+    :func:`raw_forecast_rows` and inherits the rest of the page unedited.
+
+    ``row_axes`` and ``finalise_time_axis`` are passed rather than reimplemented because they are
+    what makes a column of the page one instant on all seven rows: an implementation that set its
+    own limits would break the alignment that the whole figure is read by.
+
+    Attributes:
+        outs: The model's forward dict.
+        target: The forecast target the builder was handed, in loader units. Raw samples for the
+            raw-signal models; a feature block for a model forecasting coefficients.
+        batch: The loader batch, or ``None``. Present so an implementation whose ``target`` is
+            *not* the raw signal can still draw the raw traces for physiological context, which
+            it cannot recover from ``target``.
+        geometry: The model's trimmed-grid geometry.
+        sample_index: Which sample of the batch to draw.
+        normalization_stats: The loader's statistics, or ``None``.
+        up_raw: The raw source, or ``None``.
+        time_raw: The raw-grid time axis in seconds.
+        t_max: The recording's length in seconds; the right edge of every row.
+        row_axes: Maps a row name to its ``(main, cax)`` axes pair. The two names these rows own
+            are :data:`RAW_ROW` and :data:`FORECAST_ROW`.
+        finalise_time_axis: Pins the shared time axis and shades the warm-up.
+    """
+
+    outs: Dict[str, Any]
+    target: torch.Tensor
+    batch: Any
+    geometry: TrimmedRawGeometry
+    sample_index: int
+    normalization_stats: Optional[Dict[str, Any]]
+    up_raw: Optional[torch.Tensor]
+    time_raw: Any
+    t_max: float
+    row_axes: Callable[[str], Tuple[Any, Any]]
+    finalise_time_axis: Callable[..., None]
+
+
+def raw_context_row(rows: ForecastRowInputs, fhr_values: torch.Tensor) -> Tuple[np.ndarray, str]:
+    """Draw :data:`RAW_ROW`: the raw target trace, and the raw source on a twin axis beside it.
+
+    Shared by every page in the family rather than owned by the raw one, because the row means the
+    same thing whatever the model forecasts -- it is physiological context, not a readout, and rows
+    $6$ and $7$ are statements *about* the UP trace it draws. What differs between pages is only
+    where the FHR values come from: the raw page already holds them as its target, a feature-domain
+    page has to reach into the batch for them, and neither can recover the other's.
+
+    Args:
+        rows: The row inputs and the layout hooks.
+        fhr_values: The raw target of the sample being drawn, $(L_{\\mathrm{raw}},)$ in loader
+            units. Already indexed by sample -- this function draws one recording.
+
+    Returns:
+        ``(values, unit)`` -- the trace as drawn and the unit it is in, so a caller rendering the
+        same signal again in another row converts it once. The unit is ``'normalised'`` when the
+        loader's statistics are unavailable, never a physical unit the values are not in.
+    """
+    ax, cax = rows.row_axes(RAW_ROW)
+    fhr_np, unit = _denormalised(fhr_values, "fhr", rows.normalization_stats)
+    fhr_np = np.asarray(fhr_np).ravel()
+
+    # The source trace, on the target's own axis. Skipped rather than fatal when it is absent or
+    # on another grid: a page that cannot draw UP is still the page every other row needs.
+    up_np: Optional[np.ndarray] = None
+    up_unit = "normalised"
+    if rows.up_raw is not None:
+        candidate, up_unit = _denormalised(
+            rows.up_raw[rows.sample_index], "up", rows.normalization_stats
+        )
+        candidate = np.asarray(candidate).ravel()
+        if candidate.size == rows.time_raw.size:
+            up_np = candidate
+
+    ax.plot(rows.time_raw, fhr_np, color=COLOR_BLUE, linewidth=0.7, label=f"FHR ({unit})")
+    ax.set_title("Raw target FHR and raw source UP", fontsize=9, pad=6)
+    ax.set_xlabel("Time (s)", fontsize=8)
+    ax.set_ylabel(f"FHR ({unit})", fontsize=8, color=COLOR_BLUE)
+    style_axes(ax, grid="both")
+    rows.finalise_time_axis(ax)
+    if up_np is not None:
+        # Its own y-axis, because the two signals share neither unit nor scale and a single axis
+        # would flatten whichever has the smaller range into a line. `twinx` makes the new axes'
+        # patch transparent, so the warm-up shading below still shows through.
+        twin = ax.twinx()
+        twin.plot(rows.time_raw, up_np, color=COLOR_GREEN, linewidth=0.7, label=f"UP ({up_unit})")
+        twin.set_ylabel(f"UP ({up_unit})", fontsize=8, color=COLOR_GREEN)
+        twin.tick_params(axis="y", labelsize=7, colors=COLOR_GREEN)
+        twin.grid(False)
+        twin.set_xlim(0.0, rows.t_max)
+        handles = list(ax.get_lines()) + list(twin.get_lines())
+        ax.legend(
+            handles, [handle.get_label() for handle in handles],
+            loc="upper right", fontsize=7, framealpha=0.95,
+        )
+    cax.set_visible(False)
+    return fhr_np, unit
+
+
+def raw_forecast_rows(rows: ForecastRowInputs) -> None:
+    r"""Draw the raw-signal page's first two rows: the two raw traces, then the tiled forecast.
+
+    The forecast row is tiled rather than zoomed, and the tiling is a **choice of what to draw**,
+    not a change to what the model does: ``outs`` already carries a forecast for every valid anchor
+    at stride $1$, all of which the objective scored, and this row selects a subset of them. One
+    anchor predicts $H \cdot R$ raw samples, so the anchors whose forecasts abut without overlapping
+    are spaced exactly $H$ apart; the tiling starts at the first trained anchor $w$ and runs while
+    an anchor is still valid, i.e. ``range(warmup, t_valid, horizon)``. Plotted at the model's own
+    stride instead, adjacent windows would overlap by $(H-1)/H$ and the row would show each instant
+    $H$ times over, from $H$ different latents. Two spans are therefore blank by construction:
+    everything before $w$'s own window, and whatever tail is left when the recording is not an exact
+    number of windows -- reaching the segment end would need the final anchor, whose window overlaps
+    the last tiled one. At production geometry that is $8$ windows of $120$ s covering $124$ s to
+    $1084$ s, leaving $[0, 124)$ s and $[1084, 1200)$ s undrawn.
+
+    Args:
+        rows: The row inputs and the layout hooks.
+    """
+    geometry = rows.geometry
+    i, time_raw = rows.sample_index, rows.time_raw
+    t_steps, horizon, raw_per_step = geometry.t, geometry.horizon, geometry.r
+    warmup, t_valid = geometry.warmup, geometry.t_valid
+    stats = rows.normalization_stats
+
+    # ---- Row: the two raw traces ------------------------------------------
+    # The target *is* the raw trace here, so the context row and the forecast row draw the same
+    # signal and the conversion is done once, by the row that owns it.
+    fhr_np, unit = raw_context_row(rows, rows.target[i])
+
+    # The tiling's anchors, and the raw-second position of every window edge -- one per window
+    # plus the last window's end. Mirrors `concat_single_forecasts`, which walks the identical
+    # set: it stops at `t + 1 + H <= T`, which is `t < T - H = t_valid`.
+    tile_anchors = list(range(warmup, t_valid, horizon))
+    window_edges = [geometry.future_block_start(t) / _FS_RAW for t in tile_anchors]
+    if tile_anchors:
+        window_edges.append(
+            (geometry.future_block_start(tile_anchors[-1]) + horizon * raw_per_step) / _FS_RAW
+        )
+
+    # Both forecasts and both bands, denormalized through the same affine map as the truth, so
+    # the three curves in the forecast panel are directly comparable, then tiled onto the raw
+    # grid. `concat_single_forecasts` is the shared helper for exactly this walk; its trailing
+    # axis is "channels" for the decimated model and raw-samples-per-token here, and its `(T, R)`
+    # result flattens to the raw grid because horizon token h of anchor t is decimated step
+    # t + 1 + h, i.e. raw `[R(t + 1 + h), ...)` = `future_block_start(t) + R*h`. Uncovered
+    # positions come back NaN and render as gaps rather than as a fabricated continuation.
+    def _tiled(branch: str) -> List[np.ndarray]:
+        """Return ``[mean, lower, upper]`` of one branch, tiled onto the raw grid, in ``unit``."""
+        mean = rows.outs[f"mu_{branch}"][i]
+        sigma = torch.exp(0.5 * rows.outs[f"logvar_{branch}"][i])
+        curves = [mean, mean - BAND_SIGMAS * sigma, mean + BAND_SIGMAS * sigma]
+        return [
+            concat_single_forecasts(
+                _denormalised(curve, "fhr", stats)[0], t_steps, horizon, warmup
+            ).reshape(-1)
+            for curve in curves
+        ]
+
+    base_mean, base_lo, base_hi = _tiled("base")
+    full_mean, full_lo, full_hi = _tiled("full")
+    # The truth restricted to the tiled support, so the forecast panel is about the predicted
+    # windows alone and the uncovered spans read as absent rather than as unpredicted.
+    truth_tiled = np.where(np.isfinite(full_mean), fhr_np, np.nan)
+
+    # ---- Row: the forecast, tiled into non-overlapping windows -------------
+    ax, cax = rows.row_axes(FORECAST_ROW)
+    # The truth first, so it stays ``ax.lines[0]`` -- the tests read it from there.
+    ax.plot(time_raw, truth_tiled, color=COLOR_BLACK, linewidth=0.7, label="true $Y^{+}$")
+    ax.fill_between(time_raw, base_lo, base_hi, color=COLOR_GRAY, alpha=0.22, linewidth=0)
+    ax.plot(
+        time_raw, base_mean, color=COLOR_GRAY, linewidth=0.8, linestyle="--",
+        label="base ($z^p$, target-only)",
+    )
+    ax.fill_between(
+        time_raw, full_lo, full_hi, color=COLOR_VERMILLION, alpha=0.18, linewidth=0
+    )
+    ax.plot(
+        time_raw, full_mean, color=COLOR_VERMILLION, linewidth=0.8,
+        label="full ($z^q$, source-conditioned)",
+    )
+    # Where one forecast ends and the next begins. Without them the tiling reads as a single
+    # continuous prediction, which is exactly what it is not: each window is decoded from one
+    # latent and never sees the window before it.
+    for edge in window_edges:
+        ax.axvline(edge, color=COLOR_GRAY, linewidth=0.5, linestyle="--", alpha=0.7, zorder=1)
+    window_seconds = horizon * raw_per_step / _FS_RAW
+    ax.set_title(
+        f"Forecast — {len(tile_anchors)} consecutive non-overlapping {window_seconds:.0f} s "
+        f"windows from the first trained anchor, mean $\\pm$ {BAND_SIGMAS:.0f}$\\sigma$ "
+        f"({horizon}$\\times${raw_per_step} = {horizon * raw_per_step} raw samples each; "
+        f"dashed: window edges)",
+        fontsize=9, pad=6,
+    )
+    ax.set_xlabel("Time (s)", fontsize=8)
+    ax.set_ylabel(f"FHR ({unit})", fontsize=8)
+    ax.legend(loc="upper right", fontsize=7, framealpha=0.95)
+    style_axes(ax, grid="both")
+    rows.finalise_time_axis(ax)
+    cax.set_visible(False)
+
+
 def build_diagnostic_figure(
     *,
     outs: Dict[str, Any],
@@ -155,21 +379,20 @@ def build_diagnostic_figure(
     up_raw: Optional[torch.Tensor] = None,
     normalization_stats: Optional[Dict[str, Any]] = None,
     delay_steps: int = 0,
+    forecast_rows: Optional[Callable[[ForecastRowInputs], None]] = None,
+    batch: Any = None,
 ) -> Any:
     r"""Build the seven-row diagnostic figure for one sample.
 
-    The forecast row is tiled rather than zoomed, and the tiling is a **choice of what to draw**,
-    not a change to what the model does: ``outs`` already carries a forecast for every valid anchor
-    at stride $1$, all of which the objective scored, and this row selects a subset of them. One
-    anchor predicts $H \cdot R$ raw samples, so the anchors whose forecasts abut without overlapping
-    are spaced exactly $H$ apart; the tiling starts at the first trained anchor $w$ and runs while
-    an anchor is still valid, i.e. ``range(warmup, t_valid, horizon)``. Plotted at the model's own
-    stride instead, adjacent windows would overlap by $(H-1)/H$ and the row would show each instant
-    $H$ times over, from $H$ different latents. Two spans are therefore blank by construction:
-    everything before $w$'s own window, and whatever tail is left when the recording is not an exact
-    number of windows -- reaching the segment end would need the final anchor, whose window overlaps
-    the last tiled one. At production geometry that is $8$ windows of $120$ s covering $124$ s to
-    $1084$ s, leaving $[0, 124)$ s and $[1084, 1200)$ s undrawn.
+    This function owns the layout: the row heights, the GridSpec with its reserved colorbar
+    column, the two boundaries the maps are cut at, the shared time axis every row is pinned to,
+    and the caption. Rows $3$ to $7$ -- the latent state, the per-dimension KL, $K_t$, the lag
+    attention and the KL-by-lag map -- are drawn here, because they are statements about the
+    latent and the attention and read the same whatever is being forecast.
+
+    Rows $1$ and $2$ are the ones that depend on the target domain, and they go through
+    ``forecast_rows``; see :func:`raw_forecast_rows`, the default, for what the raw-signal page
+    draws and why its forecast row is tiled.
 
     Args:
         outs: The model's forward dict.
@@ -188,12 +411,17 @@ def build_diagnostic_figure(
             beside the target rather than read off the forward dict.
         normalization_stats: The loader's statistics, so the two traces render in bpm and mmHg.
         delay_steps: The causal input delay $\delta$, for the compensated lag axes.
+        forecast_rows: Draws rows $1$ and $2$. ``None`` -- the default, so every existing caller
+            is unaffected -- uses :func:`raw_forecast_rows`.
+        batch: The loader batch, passed straight to ``forecast_rows``. Unused by the raw page,
+            which reads its traces off ``fhr_raw``, and the only route to them for an
+            implementation whose target is not the raw signal.
 
     Returns:
         The matplotlib ``Figure``. The caller saves and closes it.
     """
     i = int(sample_index)
-    t_steps, horizon, raw_per_step = geometry.t, geometry.horizon, geometry.r
+    t_steps = geometry.t
     warmup, t_valid = geometry.warmup, geometry.t_valid
     time_raw, time_dec, t_max = time_axes(t_steps, geometry.raw_len, fs_raw=_FS_RAW)
     seconds_per_step = t_max / float(t_steps)
@@ -203,54 +431,6 @@ def build_diagnostic_figure(
     # decoded or inside the KL support, so a latent there carries no gradient at all.
     warmup_sec = float(warmup) * seconds_per_step
     tail_sec = float(t_valid) * seconds_per_step
-
-    # The tiling's anchors, and the raw-second position of every window edge -- one per window
-    # plus the last window's end. Mirrors `concat_single_forecasts`, which walks the identical
-    # set: it stops at `t + 1 + H <= T`, which is `t < T - H = t_valid`.
-    tile_anchors = list(range(warmup, t_valid, horizon))
-    window_edges = [geometry.future_block_start(t) / _FS_RAW for t in tile_anchors]
-    if tile_anchors:
-        window_edges.append(
-            (geometry.future_block_start(tile_anchors[-1]) + horizon * raw_per_step) / _FS_RAW
-        )
-
-    fhr_np, unit = _denormalised(fhr_raw[i], "fhr", normalization_stats)
-    fhr_np = np.asarray(fhr_np).ravel()
-
-    # The source trace, on the target's own axis. Skipped rather than fatal when it is absent or
-    # on another grid: a page that cannot draw UP is still the page every other row needs.
-    up_np: Optional[np.ndarray] = None
-    up_unit = "normalised"
-    if up_raw is not None:
-        candidate, up_unit = _denormalised(up_raw[i], "up", normalization_stats)
-        candidate = np.asarray(candidate).ravel()
-        if candidate.size == time_raw.size:
-            up_np = candidate
-
-    # Both forecasts and both bands, denormalized through the same affine map as the truth, so
-    # the three curves in the forecast panel are directly comparable, then tiled onto the raw
-    # grid. `concat_single_forecasts` is the shared helper for exactly this walk; its trailing
-    # axis is "channels" for the decimated model and raw-samples-per-token here, and its `(T, R)`
-    # result flattens to the raw grid because horizon token h of anchor t is decimated step
-    # t + 1 + h, i.e. raw `[R(t + 1 + h), ...)` = `future_block_start(t) + R*h`. Uncovered
-    # positions come back NaN and render as gaps rather than as a fabricated continuation.
-    def _tiled(branch: str) -> List[np.ndarray]:
-        """Return ``[mean, lower, upper]`` of one branch, tiled onto the raw grid, in ``unit``."""
-        mean = outs[f"mu_{branch}"][i]
-        sigma = torch.exp(0.5 * outs[f"logvar_{branch}"][i])
-        curves = [mean, mean - _BAND_SIGMAS * sigma, mean + _BAND_SIGMAS * sigma]
-        return [
-            concat_single_forecasts(
-                _denormalised(curve, "fhr", normalization_stats)[0], t_steps, horizon, warmup
-            ).reshape(-1)
-            for curve in curves
-        ]
-
-    base_mean, base_lo, base_hi = _tiled("base")
-    full_mean, full_lo, full_hi = _tiled("full")
-    # The truth restricted to the tiled support, so the forecast panel is about the predicted
-    # windows alone and the uncovered spans read as absent rather than as unpredicted.
-    truth_tiled = np.where(np.isfinite(full_mean), fhr_np, np.nan)
 
     mu_prior_np = to_numpy(outs["mu_prior"][i])                       # (T, d_z)
     delta_mu_np = to_numpy(outs["mu_post"][i] - outs["mu_prior"][i])  # (T, d_z)
@@ -367,66 +547,25 @@ def build_diagnostic_figure(
         finalise_time_axis(ax, tail=drop_tail)
         return image
 
-    # ---- Row: the two raw traces ------------------------------------------
-    ax, cax = row_axes("raw")
-    ax.plot(time_raw, fhr_np, color=COLOR_BLUE, linewidth=0.7, label=f"FHR ({unit})")
-    ax.set_title("Raw target FHR and raw source UP", fontsize=9, pad=6)
-    ax.set_xlabel("Time (s)", fontsize=8)
-    ax.set_ylabel(f"FHR ({unit})", fontsize=8, color=COLOR_BLUE)
-    style_axes(ax, grid="both")
-    finalise_time_axis(ax)
-    if up_np is not None:
-        # Its own y-axis, because the two signals share neither unit nor scale and a single axis
-        # would flatten whichever has the smaller range into a line. `twinx` makes the new axes'
-        # patch transparent, so the warm-up shading below still shows through.
-        twin = ax.twinx()
-        twin.plot(time_raw, up_np, color=COLOR_GREEN, linewidth=0.7, label=f"UP ({up_unit})")
-        twin.set_ylabel(f"UP ({up_unit})", fontsize=8, color=COLOR_GREEN)
-        twin.tick_params(axis="y", labelsize=7, colors=COLOR_GREEN)
-        twin.grid(False)
-        twin.set_xlim(0.0, t_max)
-        handles = list(ax.get_lines()) + list(twin.get_lines())
-        ax.legend(
-            handles, [handle.get_label() for handle in handles],
-            loc="upper right", fontsize=7, framealpha=0.95,
+    # ---- Rows 1-2: whatever this model forecasts ---------------------------
+    # Behind a seam, because these two are the only rows that depend on the target domain.
+    # Everything below -- the cuts, the shared axis, the lag panels, the caption -- is a
+    # statement about the latent and the attention and is the same page whatever is forecast.
+    (forecast_rows or raw_forecast_rows)(
+        ForecastRowInputs(
+            outs=outs,
+            target=fhr_raw,
+            batch=batch,
+            geometry=geometry,
+            sample_index=i,
+            normalization_stats=normalization_stats,
+            up_raw=up_raw,
+            time_raw=time_raw,
+            t_max=t_max,
+            row_axes=row_axes,
+            finalise_time_axis=finalise_time_axis,
         )
-    cax.set_visible(False)
-
-    # ---- Row: the forecast, tiled into non-overlapping windows -------------
-    ax, cax = row_axes("forecast")
-    # The truth first, so it stays ``ax.lines[0]`` -- the tests read it from there.
-    ax.plot(time_raw, truth_tiled, color=COLOR_BLACK, linewidth=0.7, label="true $Y^{+}$")
-    ax.fill_between(time_raw, base_lo, base_hi, color=COLOR_GRAY, alpha=0.22, linewidth=0)
-    ax.plot(
-        time_raw, base_mean, color=COLOR_GRAY, linewidth=0.8, linestyle="--",
-        label="base ($z^p$, target-only)",
     )
-    ax.fill_between(
-        time_raw, full_lo, full_hi, color=COLOR_VERMILLION, alpha=0.18, linewidth=0
-    )
-    ax.plot(
-        time_raw, full_mean, color=COLOR_VERMILLION, linewidth=0.8,
-        label="full ($z^q$, source-conditioned)",
-    )
-    # Where one forecast ends and the next begins. Without them the tiling reads as a single
-    # continuous prediction, which is exactly what it is not: each window is decoded from one
-    # latent and never sees the window before it.
-    for edge in window_edges:
-        ax.axvline(edge, color=COLOR_GRAY, linewidth=0.5, linestyle="--", alpha=0.7, zorder=1)
-    window_seconds = horizon * raw_per_step / _FS_RAW
-    ax.set_title(
-        f"Forecast — {len(tile_anchors)} consecutive non-overlapping {window_seconds:.0f} s "
-        f"windows from the first trained anchor, mean $\\pm$ {_BAND_SIGMAS:.0f}$\\sigma$ "
-        f"({horizon}$\\times${raw_per_step} = {horizon * raw_per_step} raw samples each; "
-        f"dashed: window edges)",
-        fontsize=9, pad=6,
-    )
-    ax.set_xlabel("Time (s)", fontsize=8)
-    ax.set_ylabel(f"FHR ({unit})", fontsize=8)
-    ax.legend(loc="upper right", fontsize=7, framealpha=0.95)
-    style_axes(ax, grid="both")
-    finalise_time_axis(ax)
-    cax.set_visible(False)
 
     # ---- Row: prior mean over the source-derived delta ---------------------
     ax, cax = row_axes("latent")

@@ -1,0 +1,29 @@
+# Calibration arm: converged KL weight beta_schedule.end = 1.0, the lower bracket -- and, since the
+# sweep ran, the SHIPPED value. This arm restates default.yaml and differs from it in nothing, so the
+# baseline run stands in for it; the file stays because it keeps the comparison that chose the value
+# runnable if default.yaml is later revised to another arm's winner.
+#
+# The value the raw-signal comparison model ships, carried over unchanged. That is the point of the
+# arm rather than an inheritance: this objective sums its reconstruction over H*C_keep = 2340
+# coefficients against that model's H*R = 480 samples, so at a shared beta the KL term is ~4.9x
+# weaker here relative to what it opposes. The arm existed to price that weakening, and the answer
+# was that it costs nothing: on the committed HIE shard it is first of four on the base forecast, the
+# forecast gap at both ends of the horizon, the latent width and the permutation control's margin
+# (RESULTS.md). The latent IS the widest of the four, and `shuffle_penalty` says the extra width is
+# carrying source rather than target -- which is what a weak rate was supposed to risk.
+#
+# beta_prior moves with beta, holding beta_prior/beta = 0.1. The anchor's restoring force saturates
+# at beta_prior/2 per dimension while the reconstruction it opposes is what grew, so freezing it
+# while beta moves would sweep two axes at once.
+#
+#   TEB_RUN_STAMP="$(date '+%Y-%m-%d--[%H-%M]')" torchrun --nproc_per_node=7 \
+#       -m teb_vae.lag_attn_fs.trainer --config teb_vae/lag_attn_fs/configs/sweep_beta_1p0.yaml
+base: default.yaml
+
+model_config:
+  VAE_model:
+    beta_schedule:
+      # Only the converged weight moves. The linear warm-up from exactly 0 and its epoch count are
+      # inherited: the warm-up is the posterior-collapse guard, not part of the swept axis.
+      end: 1.0
+    beta_prior: 0.1

@@ -25,7 +25,7 @@ import numpy as np  # noqa: E402
 import pytest  # noqa: E402
 import torch  # noqa: E402
 
-from teb_vae.lag_attn_rws import plotting  # noqa: E402
+from teb_vae.lag_attn_rws import plotting, sample_page  # noqa: E402
 from teb_vae.lag_attn.nets.lag_report import COMPENSATED_LAG_AXIS_LABEL  # noqa: E402
 from teb_vae.lag_attn_rws.plotting import LagAttnRwsPlotCallback  # noqa: E402
 from train.test_utils import FakeMLflowLogger, FakeTrainer  # noqa: E402
@@ -73,6 +73,9 @@ def _build(task_module: Any, batch: Any, **overrides) -> Any:
         scalars={"nll_base_block": 1.0, "nll_full_block": 0.5, "pred_gap": 0.5},
         up_raw=batch.up,
         normalization_stats=_STATS,
+        # As the callback passes it: the raw rows never read it, and a replacement seam cannot
+        # recover the raw traces without it.
+        batch=batch,
     )
     kwargs.update(overrides)
     return plotting.build_diagnostic_figure(**kwargs)
@@ -306,6 +309,56 @@ def test_it_plots_the_scheduled_beta_not_the_raw_hyperparameter(
     assert captured["beta"] != pytest.approx(float(module.hparams["kld_beta"]))
 
 
+#: Objective weights the figure has to carry, all off their defaults. ``beta_prior`` is here for
+#: the same reason the three shape weights are: the callback used to pass a subset of the task's
+#: weights, so the figure's recorded total described an objective nobody was training.
+_NON_DEFAULT_WEIGHTS = {
+    "beta_prior": 0.3,
+    "lambda_ms": 0.13,
+    "lambda_deriv": 0.17,
+    "lambda_boundary": 0.19,
+}
+
+
+def test_the_figure_records_the_objective_the_task_is_actually_training(
+    tmp_path, task, stub_batch, monkeypatch
+):
+    """The recorded scalars must be the *task's* objective, weight for weight.
+
+    Two halves, because either alone would pass on a callback that forwarded some weights and
+    defaulted the rest. The echoed weights pin every one by value -- the objective reports back
+    what it was called with, so a defaulted weight shows up as a $0.0$ echo against a nonzero
+    hparam. And the total is compared against the task's own on the same batch, seeded so the two
+    forward passes draw the same latent noise, which is what makes a figure's ``total_loss``
+    readable against the training curve at all."""
+    captured: dict = {}
+
+    def spy(**kwargs):
+        captured.update(kwargs)
+        return plt.figure()
+
+    monkeypatch.setattr(plotting, "build_diagnostic_figure", spy)
+    module = task(hparams=dict(_NON_DEFAULT_WEIGHTS))
+    module.eval()  # the callback evaluates and restores; matching it keeps the two comparable
+
+    torch.manual_seed(0)
+    _, task_metrics = module.compute_loss_and_metrics(stub_batch, 0, "val")
+
+    torch.manual_seed(0)
+    LagAttnRwsPlotCallback(tmp_path, num_examples=1).on_validation_epoch_end(
+        _trainer_with_batch(stub_batch), module
+    )
+
+    scalars = captured["scalars"]
+    for name, value in _NON_DEFAULT_WEIGHTS.items():
+        assert float(scalars[name]) == pytest.approx(value), name
+        # Not vacuous: each weight is on a term that is actually nonzero on this batch.
+        assert float(task_metrics[name]) == pytest.approx(value), name
+    assert float(scalars["total_loss"]) == pytest.approx(
+        float(task_metrics["total_loss"]), rel=1e-5
+    )
+
+
 def test_it_is_silent_off_rank_zero(tmp_path, task, stub_batch):
     logger = FakeMLflowLogger()
     callback = LagAttnRwsPlotCallback(tmp_path, mlflow_logger=logger)
@@ -383,3 +436,175 @@ def test_a_missing_validation_loader_is_not_an_error(tmp_path, task):
     callback.on_validation_epoch_end(trainer, task())
 
     assert list(callback.output_dir.glob("*.pdf")) == []
+
+
+# =============================================================================
+# The whole page, as an inventory
+# =============================================================================
+#: What each of the seven rows draws, in the order ``build_diagnostic_figure`` lays them out:
+#: ``(title prefix, lines, images, collections, spans)``. The tests above assert *why* each row
+#: looks as it does; this one asserts *that the set of them has not moved*, which is what a
+#: refactor of the builder can break without touching any single row's meaning.
+#:
+#: Read off a rendered page rather than derived from the source: the numbers are what the drawn
+#: figure has, so a row that stops drawing its band or its window edges fails here even though
+#: every other assertion in this file still passes.
+_ROW_INVENTORY = (
+    ("Raw target FHR and raw source UP", 1, 0, 0, 1),
+    ("Forecast", 7, 0, 2, 1),
+    ("Target-only latent state", 1, 1, 0, 2),
+    ("Per-dimension source-conditioned KL", 0, 1, 0, 2),
+    ("$K_t$", 1, 0, 0, 2),
+    ("Lag attention", 1, 1, 0, 1),
+    (r"$\widetilde K_{t,\ell}$", 0, 1, 0, 2),
+)
+
+
+def test_the_page_draws_the_same_seven_rows_with_the_same_artists(task, stub_batch):
+    r"""The characterisation of the assembled page: seven titled rows, each with the artists it
+    is supposed to have, in this order.
+
+    The forecast row's seven lines are the truth, the two forecast means and the four window
+    edges of the tiny geometry; its two collections are the two $\pm 2\sigma$ bands. A band
+    silently dropped, an axvline loop that stops running, or a row that ends up drawn twice all
+    show up here as a count, and nowhere else in this file.
+    """
+    figure = _build(task(), stub_batch)
+    try:
+        drawn = [ax for ax in figure.axes if ax.get_title()]
+        assert len(drawn) == len(_ROW_INVENTORY), [ax.get_title()[:30] for ax in drawn]
+
+        for ax, (prefix, lines, images, collections, spans) in zip(drawn, _ROW_INVENTORY):
+            assert ax.get_title().startswith(prefix), (ax.get_title(), prefix)
+            assert ax.get_xlabel() == "Time (s)", ax.get_title()
+            assert (len(ax.lines), len(ax.images), len(ax.collections), len(ax.patches)) == (
+                lines,
+                images,
+                collections,
+                spans,
+            ), ax.get_title()
+    finally:
+        plt.close(figure)
+
+
+def test_every_row_spans_the_whole_recording_on_one_time_axis(task, stub_batch):
+    """A column of the page is the same instant on all seven rows, which is the property that
+    lets a reader carry a feature of the forecast down into the lag map. Each row is free to
+    *draw* over a shorter span -- the maps are cut at the trained anchors -- but not to rescale
+    its axis."""
+    figure = _build(task(), stub_batch)
+    try:
+        t_max = None
+        for ax in figure.axes:
+            if not ax.get_title():
+                continue
+            lo, hi = ax.get_xlim()
+            assert lo == pytest.approx(0.0), ax.get_title()
+            t_max = hi if t_max is None else t_max
+            assert hi == pytest.approx(t_max), ax.get_title()
+    finally:
+        plt.close(figure)
+
+
+# =============================================================================
+# The forecast-row seam
+# =============================================================================
+def test_the_first_two_rows_are_replaceable_and_the_other_five_are_not(task, stub_batch):
+    """A sibling forecasting another domain supplies its own rows 1-2 and inherits the rest of
+    the page. Asserted by supplying a seam that draws nothing: the two rows it owns come back
+    empty and all five below it still draw, which is what "the layout is not duplicated by the
+    seam" means operationally."""
+    drawn = []
+
+    def _nothing(rows):
+        drawn.append(rows)
+        for name in (sample_page.RAW_ROW, sample_page.FORECAST_ROW):
+            main, cax = rows.row_axes(name)
+            main.set_title(f"replacement {name}")
+            cax.set_visible(False)
+
+    figure = _build(task(), stub_batch, forecast_rows=_nothing)
+    try:
+        assert len(drawn) == 1
+        titled = [ax.get_title() for ax in figure.axes if ax.get_title()]
+        assert titled[:2] == ["replacement raw", "replacement forecast"]
+        assert len(titled) == len(_ROW_INVENTORY)
+        # The five inherited rows still drew, so the seam took rows 1-2 and nothing else.
+        inherited = [prefix for prefix, *_ in _ROW_INVENTORY[2:]]
+        for prefix in inherited:
+            assert _axes_titled(figure, prefix).has_data(), prefix
+    finally:
+        plt.close(figure)
+
+
+def test_the_seam_receives_the_batch_and_the_layout_hooks(task, stub_batch):
+    """What a feature-domain implementation needs and cannot reconstruct: the batch, because its
+    own ``target`` is no longer the raw signal, and the two hooks that keep its rows on the same
+    time axis as the five below."""
+    seen = {}
+
+    def _record(rows):
+        seen["rows"] = rows
+        sample_page.raw_forecast_rows(rows)
+
+    figure = _build(task(), stub_batch, forecast_rows=_record)
+    try:
+        rows = seen["rows"]
+        assert rows.batch is stub_batch
+        assert torch.equal(rows.target, stub_batch.fhr)
+        assert rows.geometry.t == stub_batch.weight.shape[1]
+        assert callable(rows.row_axes) and callable(rows.finalise_time_axis)
+        # And the default implementation, called through the seam, still draws the raw page.
+        assert _axes_titled(figure, "Raw target FHR").has_data()
+    finally:
+        plt.close(figure)
+
+
+def test_the_callback_hands_the_page_the_tasks_rows_and_the_batch(tmp_path, task, stub_batch):
+    """The route by which a sibling's rows reach the shared callback: the task names them, and
+    the callback passes them on. Without it the seam exists but nothing can reach it, and a
+    sibling would need a second plotting module for two rows of a seven-row page."""
+    captured = {}
+
+    def _fake_builder(**kwargs):
+        captured.update(kwargs)
+        return plt.figure()
+
+    module = task()
+    marker = object()
+    module.forecast_rows = marker
+
+    callback = LagAttnRwsPlotCallback(tmp_path, num_examples=1)
+    trainer = _trainer_with_batch(stub_batch)
+    original = plotting.build_diagnostic_figure
+    plotting.build_diagnostic_figure = _fake_builder
+    try:
+        callback._generate_plots(trainer, stub_batch, module, epoch=0)
+    finally:
+        plotting.build_diagnostic_figure = original
+
+    assert captured["forecast_rows"] is marker
+    assert captured["batch"] is stub_batch
+
+
+def test_a_task_that_names_no_rows_gets_the_raw_page(tmp_path, task, stub_batch):
+    """The shipped path. ``None`` is what the builder turns back into its own implementation, so
+    the raw models are unaffected by the seam existing at all."""
+    captured = {}
+
+    def _fake_builder(**kwargs):
+        captured.update(kwargs)
+        return plt.figure()
+
+    module = task()
+    assert not hasattr(module, "forecast_rows")
+
+    callback = LagAttnRwsPlotCallback(tmp_path, num_examples=1)
+    original = plotting.build_diagnostic_figure
+    plotting.build_diagnostic_figure = _fake_builder
+    try:
+        callback._generate_plots(_trainer_with_batch(stub_batch), stub_batch, module, epoch=0)
+    finally:
+        plotting.build_diagnostic_figure = original
+
+    assert captured["forecast_rows"] is None

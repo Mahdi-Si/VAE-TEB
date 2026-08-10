@@ -46,6 +46,9 @@ DEFAULT_OVERRIDES_PATH = Path(__file__).resolve().parent / "configs" / "eval_ove
 #: width set the capacity behind it, and ``source_attention_window`` sets the source encoder's
 #: reach -- which is the axis the whole locality sweep varies and the thing the lag attention's
 #: ability to separate adjacent delays depends on.
+#:
+#: The objective weights are deliberately absent, ``beta_prior`` and the three shape lambdas
+#: alike: they weight the *training* criterion and enter none of the evaluated readouts.
 GEOMETRY_KEYS: Tuple[str, ...] = (
     "sequence_length",
     "d_model",
@@ -59,6 +62,7 @@ GEOMETRY_KEYS: Tuple[str, ...] = (
     "max_lag",
     "num_heads",
     "d_head",
+    "horizon_attention_blocks",
     "encoder_conv_kernels",
     "encoder_conv_dilations",
     "encoder_num_heads",

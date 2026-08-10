@@ -1,10 +1,11 @@
 # Calibration arm: latent width d_z = 64.
 #
-# Everything else is inherited from default.yaml -- including the KL weight, so revising
-# default.yaml's beta_schedule.end to the KL-weight sweep's winner flows into this arm without
-# touching it. One resolved key differs, so a metric difference between arms has one
-# explanation. Deliberately no per-arm tag or MLflow run name: either would be a second delta;
-# a run is identified by its TEB_RUN_STAMP directory and its resolved-config artifact.
+# Restates the shipped value on purpose: the arm stays pinned at 64 even if default.yaml is later
+# revised, so the comparison that chose the width stays runnable. While default.yaml still carries
+# this width the arm resolves to an empty delta and the baseline run stands in for it.
+#
+# The pin moved here from sweep_dz_48.yaml when the capacity revision raised the shipped latent
+# from 48 to 64; 48 is now a genuine arm, and it is the one that asks whether the raise was needed.
 #
 #   TEB_RUN_STAMP="$(date '+%Y-%m-%d--[%H-%M]')" torchrun --nproc_per_node=7 \
 #       -m teb_vae.lag_attn_rws.trainer --config teb_vae/lag_attn_rws/configs/sweep_dz_64.yaml

@@ -42,10 +42,19 @@ from teb_vae.lag_attn_transformer_rws.nets.model import SeqVaeLagAttnTrfRws
 from teb_vae.lag_attn_transformer_rws.tests.conftest import TINY_KWARGS as SIBLING_TINY_KWARGS
 
 #: Objective settings the two models are driven at. ``beta_prior`` is nonzero so the prior scale
-#: rate -- the one term a config can switch on -- is exercised rather than multiplied away, and
-#: ``free_bits`` is nonzero so the raw/train KL split is two different tensors rather than one.
+#: rate is exercised rather than multiplied away, ``free_bits`` is nonzero so the raw/train KL
+#: split is two different tensors rather than one, and the three shape weights are nonzero
+#: because at zero the objective does not compute those terms at all -- the comparison would be
+#: between two exact zeros and would hold whatever either delegation forwarded.
 _LOSS_KWARGS: Dict[str, Any] = dict(
-    beta=0.7, beta_prior=1.0e-2, lambda_full=1.0, lambda_base=0.5, free_bits=0.05
+    beta=0.7,
+    beta_prior=1.0e-2,
+    lambda_full=1.0,
+    lambda_base=0.5,
+    free_bits=0.05,
+    lambda_ms=0.13,
+    lambda_deriv=0.17,
+    lambda_boundary=0.19,
 )
 
 #: The sibling, built at **this** model's warm-up. ``warmup`` is one of the four fields of the

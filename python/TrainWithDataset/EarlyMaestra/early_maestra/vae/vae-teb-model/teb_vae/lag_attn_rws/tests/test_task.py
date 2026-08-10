@@ -31,6 +31,11 @@ _STAGE_METRICS = {
     "source_conditioned_kl_raw", "source_conditioned_kl_train",
     "kld_active_frac", "kld_beta",
     "prior_rate", "beta_prior",
+    # The three shape terms and their echoed weights. Present on every stage whether or not a
+    # config weights them: the pair is what distinguishes a term that was off from one that was
+    # on and small, and a column that appeared only in some arms could not be read across runs.
+    "aux_multiscale", "aux_derivative", "aux_boundary",
+    "lambda_ms", "lambda_deriv", "lambda_boundary",
     "anchor_coverage_frac",
     "mean_logvar_full", "mean_logvar_base",
     "logvar_full_floor_frac", "logvar_full_ceil_frac",
@@ -466,6 +471,72 @@ def test_the_configured_beta_prior_weights_the_objective_and_is_echoed(
     assert float(loss_anchored - loss_unanchored) == pytest.approx(
         0.5 * float(metrics["prior_rate"]), rel=1e-4
     )
+
+
+@pytest.mark.parametrize(
+    ("hparam", "metric"),
+    [
+        ("lambda_ms", "aux_multiscale"),
+        ("lambda_deriv", "aux_derivative"),
+        ("lambda_boundary", "aux_boundary"),
+    ],
+)
+def test_each_configured_shape_weight_weights_the_objective_and_is_echoed(
+    task, stub_batch, perturb_posterior, hparam, metric
+):
+    """The ``beta_prior`` pattern, per shape term: the hparam reaches the loss by value through
+    the task, the metric echoes it, and the term's own readout is what the totals differ by. The
+    off run also pins the zeros-when-off contract at the task level -- an unweighted term is
+    reported as an exact zero, never as its would-be value."""
+    weighted = task(hparams={hparam: 0.5})
+    unweighted = task(hparams={hparam: 0.0})
+    perturb_posterior(weighted.orig_model)
+    perturb_posterior(unweighted.orig_model)  # same seed in the factory -> identical weights
+
+    torch.manual_seed(2)
+    loss_weighted, metrics = weighted.compute_loss_and_metrics(stub_batch, 1, "train")
+    torch.manual_seed(2)
+    loss_unweighted, off_metrics = unweighted.compute_loss_and_metrics(stub_batch, 1, "train")
+
+    assert float(metrics[hparam]) == pytest.approx(0.5)
+    assert float(metrics[metric]) > 0.0
+    assert float(off_metrics[metric]) == 0.0
+    assert float(loss_weighted - loss_unweighted) == pytest.approx(
+        0.5 * float(metrics[metric]), rel=1e-4
+    )
+
+
+def test_the_shape_weights_default_to_zero_and_round_trip_through_the_hparams(task):
+    """They land in ``self.hparams`` -- and therefore in every checkpoint -- so a run's objective
+    stays recoverable from its checkpoint alone. Config-less operation resolves all three to
+    ``0.0``, which is the four-term objective every pre-existing run was trained under."""
+    default = task()
+    configured = task(hparams={"lambda_ms": 0.13, "lambda_deriv": 0.17, "lambda_boundary": 0.19})
+
+    for name, value in (("lambda_ms", 0.13), ("lambda_deriv", 0.17), ("lambda_boundary", 0.19)):
+        assert float(default.hparams[name]) == 0.0, name
+        assert float(configured.hparams[name]) == pytest.approx(value), name
+
+
+def test_the_permutation_control_is_unchanged_by_the_shape_weights(
+    task, make_stub_batch_fn, perturb_posterior
+):
+    """The control consumes only its own NLL, so the shape terms are passed 0.0 there rather
+    than the configured weights -- driven at absurd weights so any leak into the shuffled
+    scoring would be unmissable."""
+    absurd = {"lambda_ms": 1.0e3, "lambda_deriv": 1.0e3, "lambda_boundary": 1.0e3}
+    weighted = task(hparams=absurd)
+    unweighted = task(hparams={name: 0.0 for name in absurd})
+    perturb_posterior(weighted.orig_model)
+    perturb_posterior(unweighted.orig_model)  # same seed in the factory -> identical weights
+
+    torch.manual_seed(3)
+    _, with_shape = weighted.compute_loss_and_metrics(make_stub_batch_fn(), 0, "val")
+    torch.manual_seed(3)
+    _, without = unweighted.compute_loss_and_metrics(make_stub_batch_fn(), 0, "val")
+
+    for name in ("nll_shuffled_block", "kld_shuffled", "shuffle_penalty"):
+        assert torch.equal(with_shape[name], without[name]), name
 
 
 def test_the_permutation_control_is_unchanged_by_beta_prior(task, make_stub_batch_fn, perturb_posterior):

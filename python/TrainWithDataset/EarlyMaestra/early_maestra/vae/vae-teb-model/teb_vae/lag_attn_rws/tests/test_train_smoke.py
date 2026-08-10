@@ -206,6 +206,42 @@ def test_the_prior_anchor_and_clip_diagnostics_reach_the_csv(fit):
     assert bool(((clip_frac >= 0.0) & (clip_frac <= 1.0)).all())
 
 
+def test_the_auxiliary_shape_terms_reach_the_csv_with_real_values(fit):
+    """The three shape terms, through a real fit under the tiny config's ``mse`` likelihood.
+
+    Nonzero is the assertion that matters, and it is not implied by the column existing: a term
+    whose weight resolves to $0.0$ is deliberately **not computed** and reports an exact $0.0$, so a
+    weight that failed to reach the objective -- dropped at the kwarg sweep, lost in the task's
+    forwarding, missing from a wrapper's signature -- produces a well-formed all-zero column and no
+    error anywhere. The echoed weights are checked beside the terms so a zero column can be read
+    unambiguously as one or the other.
+
+    ``mse`` is the right likelihood to check this under, not a limitation: the shape terms read the
+    forecast *means* only, so they are identical under either likelihood.
+    """
+    driver, _ = fit
+    frame = pd.read_csv(Path(driver.train_results_dir) / "metrics_history.csv")
+
+    for stage in ("train", "val"):
+        for term, weight in (
+            ("aux_multiscale", ("lambda_ms", 0.1)),
+            ("aux_derivative", ("lambda_deriv", 0.1)),
+            ("aux_boundary", ("lambda_boundary", 0.05)),
+        ):
+            column = f"{stage}/{term}"
+            assert column in frame.columns, f"{column} never reached the CSV"
+            values = frame[column].dropna()
+            assert not values.empty, f"{column} is NaN in every epoch"
+            assert bool(values.abs().lt(float("inf")).all()), f"{column} is not finite"
+            assert float(values.abs().max()) > 0.0, (
+                f"{column} is zero in every epoch: its weight never reached the objective"
+            )
+
+            echoed = f"{stage}/{weight[0]}"
+            assert echoed in frame.columns, f"{echoed} never reached the CSV"
+            assert float(frame[echoed].dropna().iloc[0]) == pytest.approx(weight[1])
+
+
 def test_the_checkpoint_is_written_to_the_run_checkpoint_directory(fit):
     driver, _ = fit
 

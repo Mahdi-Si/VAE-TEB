@@ -1,13 +1,18 @@
-# Width arm: encoder_d_ff = 384 (shipped 256).
+# Width arm: encoder_d_ff = 384 (shipped 512).
 #
 # The one width in this encoder that is free to move. At d_model = 128 the shipped feed-forward
-# hidden width is 2x the model width, below the 4x a Transformer block conventionally carries;
-# 384 is 3x. The question is whether the block's position-wise capacity, not its depth, is what
-# binds -- a distinction the depth arms cannot answer because adding a block adds attention and
-# feed-forward capacity together.
+# hidden width is 4x the model width, the ratio a Transformer block conventionally carries; 384 is
+# 3x, and it is the lower bracket on the capacity revision that raised this key from 256. The
+# question is whether the block's position-wise capacity, not its depth, is what binds -- a
+# distinction the depth arms cannot answer because adding a block adds attention and feed-forward
+# capacity together.
 #
-# +344,064 parameters: the SwiGLU feed-forward holds 3*d*d_ff, so +3*128*128 = 49,152 per block
-# across all seven attention blocks (four target, three source).
+# No upper bracket ships. 512 already sits at the standard ratio, so an arm above it is only worth
+# launching if the baseline still reads capacity-bound; adding one later is one yaml file and one
+# table row.
+#
+# -442,368 parameters: the SwiGLU feed-forward holds 3*d*d_ff, so -3*128*128 = -49,152 per block
+# across all nine attention blocks (six target, three source).
 #
 # d_model stays 128: it is the width the prior head, the posterior fusion, the lag attention and
 # the decoder input all assume, and the derived encoder head width d_model / encoder_num_heads

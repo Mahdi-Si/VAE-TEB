@@ -188,9 +188,9 @@ def build_probe(model: Any, *, width_multiplier: int = 1) -> nn.Module:
     No new decoder class: ``BaselineFutureDecoder`` already takes one conditioning tensor and one
     shared horizon core and emits $(B, T, H, R)$, so the oracle is that class built at the encoder
     state's width. Everything that decides *capacity* -- the hidden width, the core's depth, its
-    kernel, its FiLM arrangement, the log-variance clamp -- is read off the model that is being
-    measured rather than restated, which is what makes "the comparison isolates the bottleneck" a
-    property rather than a claim.
+    kernel, its FiLM arrangement, its horizon-attention depth, the log-variance clamp -- is read off
+    the model that is being measured rather than restated, which is what makes "the comparison
+    isolates the bottleneck" a property rather than a claim.
 
     The core is a **fresh** one. Sharing the production core would give the probe the trained
     horizon dynamics for free and make $D_{\mathrm{oracle}}$ a statement about the projection layer
@@ -228,6 +228,11 @@ def build_probe(model: Any, *, width_multiplier: int = 1) -> nn.Module:
         depth=depth,
         film=bool(reference.film),
         film_per_block=bool(reference.film_per_block),
+        # The horizon attention is capacity like everything else here, so it is mirrored rather
+        # than restated: a probe built without the blocks the loaded model has would answer a
+        # question about a decoder nobody trained.
+        attention_blocks=int(reference.attention_blocks),
+        attention_heads=int(reference.attention_heads),
     )
     probe = BaselineFutureDecoder(
         core=core,

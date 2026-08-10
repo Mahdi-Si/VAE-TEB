@@ -117,7 +117,7 @@ def test_the_geometry_reaches_the_constructor(driver):
 
     assert kwargs["sequence_length"] == 300
     assert kwargs["d_model"] == 128
-    assert kwargs["d_z"] == 48
+    assert kwargs["d_z"] == 64
     assert kwargs["horizon"] == 30
     assert kwargs["raw_per_step"] == 16
     assert kwargs["warmup_period"] == 30
@@ -420,7 +420,9 @@ def test_all_four_pre_flight_guards_and_the_driver_hook_run_before_setup_config(
         ("_check_causal_budget_resolves", "causal_budget"),
     ):
         monkeypatch.setattr(
-            shared_trainer, attribute, lambda config, _label=label: order.append(_label)
+            # ``**_`` because the normalisation guard is handed the driver's TARGET_FIELDS;
+            # these stubs record the order and have no opinion about any guard's arguments.
+            shared_trainer, attribute, lambda config, _label=label, **_: order.append(_label)
         )
     monkeypatch.setattr(
         LagAttnTrfRwsTrainer,
@@ -542,7 +544,7 @@ def test_the_resolved_config_is_written_beside_the_checkpoints(tmp_path, monkeyp
     reloaded = yaml.safe_load(written.read_text(encoding="utf-8"))
     # Fully resolved: the inherited keys are present and the `base:` pointer is gone.
     assert "base" not in reloaded
-    assert reloaded["model_config"]["VAE_model"]["target_attention_blocks"] == 4
+    assert reloaded["model_config"]["VAE_model"]["target_attention_blocks"] == 6
     # The guarded default records what the budget resolved TO, not merely that one was asked for:
     # the surviving channel counts and the worst delay are what a later offline pass has to read
     # to rebuild the adapters, and `causal_reach_budget_s: 120` alone does not determine them

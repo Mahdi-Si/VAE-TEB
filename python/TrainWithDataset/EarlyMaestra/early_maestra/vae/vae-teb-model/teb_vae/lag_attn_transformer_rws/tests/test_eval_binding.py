@@ -54,6 +54,7 @@ TRF_GEOMETRY_KEYS = (
     "max_lag",
     "num_heads",
     "d_head",
+    "horizon_attention_blocks",
     "encoder_conv_kernels",
     "encoder_conv_dilations",
     "encoder_num_heads",
@@ -137,6 +138,32 @@ def test_the_geometry_keys_drop_causal_norm_and_add_the_seven_encoder_keys() -> 
 
     assert sibling - mine == {"causal_norm"}
     assert mine - sibling == set(ENCODER_KEYS)
+
+
+def test_a_checkpoint_predating_the_horizon_attention_still_reconciles() -> None:
+    """The reconciliation skips a key either side lacks, which is what lets a run trained before
+    a knob existed stay evaluable against a config that now carries it. Asserted rather than
+    inferred: the alternative -- refusing on a key the checkpoint could not have recorded -- would
+    strand every checkpoint written before this revision.
+    """
+    older = {key: value for key, value in TINY_KWARGS.items()}
+    older.pop("horizon_attention_blocks", None)
+
+    record = _reconcile(_config(horizon_attention_blocks=2), older)
+
+    assert record["passed"] is True
+    assert "horizon_attention_blocks" not in record["compared"]
+
+
+def test_a_disagreeing_horizon_attention_depth_is_refused() -> None:
+    """The other direction, and the reason the key is in the tuple at all: two blocks of decoder
+    attention are two blocks of capacity, so a config claiming them over a checkpoint trained
+    without them describes a model that was never fitted."""
+    with pytest.raises(preflight.EvalPreconditionUnmet, match="horizon_attention_blocks"):
+        _reconcile(
+            _config(horizon_attention_blocks=2),
+            dict(TINY_KWARGS, horizon_attention_blocks=0),
+        )
 
 
 def test_causal_norm_is_not_merely_irrelevant_here_but_unconstructable() -> None:

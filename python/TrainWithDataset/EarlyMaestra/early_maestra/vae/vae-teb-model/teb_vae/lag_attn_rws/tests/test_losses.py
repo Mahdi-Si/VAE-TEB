@@ -1,9 +1,16 @@
-r"""The masked raw likelihood and the masked prior rate: per-anchor reductions, in nats.
+r"""The per-anchor loss primitives: the raw likelihood, the prior rate, and the three shape terms.
 
 The numbers are pinned against hand-computed constants -- the likelihood at the tiny block size
-($H \cdot R = 4 \cdot 16 = 64$), the prior rate at the shipped latent width ($d_z = 48$) --
+($H \cdot R = 4 \cdot 16 = 64$), the prior rate at the shipped latent width ($d_z = 64$) --
 because "summed, not averaged, over its own axes" is exactly the property a silently
 mean-reduced implementation would fake on random data.
+
+The shape terms are pinned the same way and additionally against the mask, because each is an
+easy thing to write in a form that *looks* masked and is not: the multiscale term pools, so a
+mask applied after pooling would smear a gap sentinel across a whole window; the derivative term
+consumes two samples per element, so a mask taken from one of them admits half of every gap edge;
+and the boundary term reaches into a neighbouring anchor's block for the sample it compares
+against, which is exactly where a validity decision can be taken from the wrong anchor.
 """
 from __future__ import annotations
 
@@ -13,6 +20,10 @@ import pytest
 import torch
 
 from teb_vae.lag_attn_rws.nets.losses import (
+    MS_RATES,
+    masked_boundary_gap,
+    masked_derivative_huber,
+    masked_multiscale_l1,
     masked_prior_rate,
     masked_raw_likelihood,
     masked_source_kl,
@@ -131,7 +142,7 @@ def test_gradient_reaches_only_unmasked_positions():
 # --------------------------------------------------------------------------------------
 # The masked prior rate
 # --------------------------------------------------------------------------------------
-_D_Z = 48  # the shipped latent width; the hand constants below are stated at this width
+_D_Z = 64  # the shipped latent width; the hand constants below are stated at this width
 
 #: Per-dimension rate 0.5 * (e^lv - 1 - lv) at hand-picked log-variances: the optimum, the
 #: clamp floor the reported production run pinned on, and the value that run started from.
@@ -158,8 +169,8 @@ def test_the_prior_rate_is_exactly_zero_at_unit_variance():
 )
 def test_the_prior_rate_matches_the_hand_computed_constants(logvar, per_dim):
     """Pinned against constants computed by hand, not against the implementation: at the clamp
-    floor a fully-masked anchor costs 48 * 2.003369 = 96.16 nats, at the reported run's
-    starting log-variance 48 * 1.063457 = 51.05."""
+    floor a fully-masked anchor costs 64 * 2.003369 = 128.22 nats, at the reported run's
+    starting log-variance 64 * 1.063457 = 68.06."""
     rate = masked_prior_rate(
         torch.full((_B, _T_VALID, _D_Z), logvar), _prior_mask()
     )
@@ -219,3 +230,242 @@ def test_the_prior_rate_carries_gradient():
     assert logvar.grad is not None
     assert float(logvar.grad[:, 5].abs().max()) == 0.0
     assert float(logvar.grad[:, 4].abs().max()) > 0.0
+
+
+# --------------------------------------------------------------------------------------
+# The multiscale L1 term
+# --------------------------------------------------------------------------------------
+#: Pooled-element count of one tiny anchor's block, summed over the three rates:
+#: $64/1 + 64/4 + 64/16 = 64 + 16 + 4 = 84$. Every hand constant below is stated at this number,
+#: which is why the rates themselves are pinned first -- changing them changes what these tests
+#: mean, and a silently re-derived constant would hide that.
+_MS_POOLED_ELEMENTS = 84
+
+
+def test_the_pooling_rates_are_the_documented_ones():
+    """The constants below are stated at these three rates."""
+    assert MS_RATES == (1, 4, 16)
+    assert sum(_BLOCK // rate for rate in MS_RATES) == _MS_POOLED_ELEMENTS
+
+
+def test_the_multiscale_term_sums_over_every_scale():
+    """A constant offset of $0.5$: every pooled element at every rate is off by exactly $0.5$
+    (an average of a constant is that constant), so the per-anchor value is $84 \\cdot 0.5$.
+    A term that pooled at one rate only would read $32$, and one that averaged over scales
+    instead of summing would read $16$."""
+    mu = torch.zeros(_B, _T_VALID, _H, _R)
+    target = torch.full_like(mu, 0.5)
+
+    value = masked_multiscale_l1(mu, target, torch.ones(_B, _T_VALID, _H))
+
+    assert float(value) == pytest.approx(_MS_POOLED_ELEMENTS * 0.5, rel=1e-6)
+
+
+def test_a_masked_position_cannot_move_the_multiscale_term():
+    """The reason both operands are masked *before* pooling: after pooling, a gap sentinel at a
+    masked position would already have been averaged into every pool that covers it, and no mask
+    applied afterwards could take it back out."""
+    mu, target, _logvar, mask = _tensors()
+    mask[:, 5, 2] = 0.0
+
+    reference = masked_multiscale_l1(mu, target, mask)
+    planted = target.clone()
+    planted[:, 5, 2, :] = 1.0e6
+
+    assert torch.equal(reference, masked_multiscale_l1(mu, planted, mask))
+
+
+def test_the_multiscale_denominator_counts_contributing_anchors():
+    """Uniform data, whole anchors masked out: the per-anchor value must not move. An
+    all-anchor denominator would dilute it by the masked fraction."""
+    mu = torch.zeros(_B, _T_VALID, _H, _R)
+    target = torch.full_like(mu, 2.0)
+    full_mask = torch.ones(_B, _T_VALID, _H)
+    partial_mask = full_mask.clone()
+    partial_mask[:, :3] = 0.0
+
+    assert torch.allclose(
+        masked_multiscale_l1(mu, target, full_mask),
+        masked_multiscale_l1(mu, target, partial_mask),
+    )
+
+
+def test_an_all_masked_batch_gives_a_finite_zero_multiscale():
+    mu, target, _logvar, _mask = _tensors()
+    value = masked_multiscale_l1(mu, target, torch.zeros(_B, _T_VALID, _H))
+    assert float(value) == 0.0 and torch.isfinite(value)
+
+
+def test_a_block_shorter_than_the_coarsest_rate_is_refused_naming_the_geometry():
+    """A feature-target model with a narrow surviving channel set reaches this, and a silent
+    fallback -- skipping the coarse scale, or padding the block -- would make the term mean
+    something different at that geometry with nothing saying so."""
+    short = torch.zeros(_B, _T_VALID, 2, 4)  # flattened block of 8 < max(MS_RATES)
+    with pytest.raises(ValueError, match=r"8 elements.*H=2 x X=4.*16"):
+        masked_multiscale_l1(short, short.clone(), torch.ones(_B, _T_VALID, 2))
+
+
+# --------------------------------------------------------------------------------------
+# The derivative Huber term
+# --------------------------------------------------------------------------------------
+#: Difference pairs inside one anchor's flattened block: $H \cdot R - 1$.
+_PAIRS = _BLOCK - 1
+
+
+def _ramped_target(slope: float) -> torch.Tensor:
+    """A target whose flattened block rises by ``slope`` between consecutive samples."""
+    positions = torch.arange(_BLOCK, dtype=torch.float32).view(1, 1, _H, _R)
+    return (slope * positions).expand(_B, _T_VALID, _H, _R).contiguous()
+
+
+@pytest.mark.parametrize(
+    ("slope", "per_pair"),
+    # Quadratic branch: 0.5 * s^2 at s = 0.5. Linear branch: delta * (|s| - delta/2) at s = 3,
+    # delta = 1 -- the whole point of Huber over L2, and the only thing that pins delta.
+    [(0.5, 0.125), (3.0, 2.5)],
+    ids=["quadratic-branch", "linear-branch"],
+)
+def test_the_derivative_term_matches_the_hand_computed_huber(slope, per_pair):
+    """A flat forecast against a constant-slope target: every one of the $63$ pairs inside an
+    anchor is off by exactly ``slope``."""
+    mu = torch.zeros(_B, _T_VALID, _H, _R)
+    value = masked_derivative_huber(mu, _ramped_target(slope), torch.ones(_B, _T_VALID, _H))
+
+    assert float(value) == pytest.approx(_PAIRS * per_pair, rel=1e-6)
+
+
+def test_a_masked_position_cannot_move_the_derivative_term():
+    """Both pairs that touch a masked sample are excluded, which is what the *product* of the
+    pair's two mask entries buys over either one of them alone."""
+    mu, target, _logvar, mask = _tensors()
+    mask[:, 5, 2] = 0.0
+
+    reference = masked_derivative_huber(mu, target, mask)
+    planted = target.clone()
+    planted[:, 5, 2, :] = 1.0e6
+
+    assert torch.equal(reference, masked_derivative_huber(mu, planted, mask))
+
+
+def test_an_all_masked_batch_gives_a_finite_zero_derivative():
+    mu, target, _logvar, _mask = _tensors()
+    value = masked_derivative_huber(mu, target, torch.zeros(_B, _T_VALID, _H))
+    assert float(value) == 0.0 and torch.isfinite(value)
+
+
+def test_both_shape_terms_carry_gradient_only_where_the_mask_admits_it():
+    """Weighted, these are objective terms rather than diagnostics, so they must sit in the
+    graph -- and a gradient at a masked position would train the model against a gap."""
+    for term in (masked_multiscale_l1, masked_derivative_huber):
+        mu, target, _logvar, mask = _tensors()
+        mask[:, 5, 2] = 0.0
+        mu.requires_grad_(True)
+
+        value = term(mu, target, mask)
+        assert value.requires_grad, term.__name__
+        value.backward()
+
+        assert mu.grad is not None
+        assert float(mu.grad[:, 5, 2].abs().max()) == 0.0, term.__name__
+        assert float(mu.grad[:, 5, 1].abs().max()) > 0.0, term.__name__
+
+
+# --------------------------------------------------------------------------------------
+# The boundary continuity term
+# --------------------------------------------------------------------------------------
+_BOUNDARY_T_VALID, _BOUNDARY_H, _BOUNDARY_X = 3, 2, 4
+
+
+def _boundary_case():
+    r"""A hand-set geometry where each anchor's boundary gap is a written-down number.
+
+    Anchor $t$'s first forecast sample is ``mu[:, t, 0, 0]``; the sample it must continue is
+    ``target[:, t-1, 0, -1]``, because anchor $t-1$'s horizon step $0$ *is* decimated step $t$.
+    Gaps: $|5 - 1| = 4$ at $t = 1$ and $|2 - 4| = 2$ at $t = 2$; anchor $0$ has none.
+
+    Returns:
+        ``(mu, target, mask, weight)``.
+    """
+    shape = (1, _BOUNDARY_T_VALID, _BOUNDARY_H, _BOUNDARY_X)
+    mu, target = torch.zeros(shape), torch.zeros(shape)
+    mu[0, 0, 0, 0] = 99.0  # anchor 0 is excluded structurally; an absurd value must not show
+    mu[0, 1, 0, 0], mu[0, 2, 0, 0] = 5.0, 2.0
+    target[0, 0, 0, -1], target[0, 1, 0, -1] = 1.0, 4.0
+    mask = torch.ones(1, _BOUNDARY_T_VALID, _BOUNDARY_H)
+    weight = torch.ones(1, _BOUNDARY_T_VALID + _BOUNDARY_H)
+    return mu, target, mask, weight
+
+
+def test_the_boundary_term_is_the_hand_computed_gap_per_anchor():
+    """$(4 + 2) / 3$: summed over the two anchors that have a boundary, divided by the three
+    contributing ones -- the same denominator every other term uses."""
+    mu, target, mask, weight = _boundary_case()
+
+    assert float(masked_boundary_gap(mu, target, mask, weight)) == pytest.approx(6.0 / 3.0)
+
+
+def test_the_boundary_term_excludes_anchor_zero_structurally():
+    """Not by assuming a warm-up: the range starts at $t = 1$, so a ``warmup_period = 0``
+    geometry still has no anchor reaching for a sample before its own window. Anchor $0$'s
+    forecast carries $99$ above and contributes nothing."""
+    mu, target, mask, weight = _boundary_case()
+    reference = masked_boundary_gap(mu, target, mask, weight)
+
+    moved = mu.clone()
+    moved[0, 0, 0, 0] = -1.0e6
+
+    assert torch.equal(reference, masked_boundary_gap(moved, target, mask, weight))
+
+
+def test_a_below_threshold_boundary_sample_contributes_nothing():
+    """The anchor's own ``weight`` decides. Dropping anchor $2$'s validity removes its gap of
+    $2$ while the denominator -- the contributing-anchor count, which the mask decides -- stays
+    at three."""
+    mu, target, mask, weight = _boundary_case()
+    weight[0, 2] = 0.0
+
+    assert float(masked_boundary_gap(mu, target, mask, weight)) == pytest.approx(4.0 / 3.0)
+
+
+def test_the_boundary_validity_is_the_anchors_own_not_its_predecessors():
+    """The distinction the term is written around. Anchor $0$ is dropped from the forecast mask
+    entirely -- a coverage-floor decision about *its* window -- and anchor $1$'s boundary must
+    still count, because the sample it continues is anchor $1$'s own last observed one and its
+    validity is anchor $1$'s ``weight``. Reading ``mask[:, 0, 0]`` instead would silently zero
+    it. The denominator falls to the two contributing anchors: $(4 + 2) / 2$."""
+    mu, target, mask, weight = _boundary_case()
+    mask[0, 0] = 0.0
+
+    assert float(masked_boundary_gap(mu, target, mask, weight)) == pytest.approx(6.0 / 2.0)
+
+
+def test_a_single_anchor_geometry_gives_a_finite_zero_boundary():
+    """$T_{\\mathrm{valid}} = 1$ leaves the $t \\in [1, T_{\\mathrm{valid}})$ range empty."""
+    mu = torch.randn(1, 1, _BOUNDARY_H, _BOUNDARY_X)
+    value = masked_boundary_gap(
+        mu, torch.randn_like(mu), torch.ones(1, 1, _BOUNDARY_H), torch.ones(1, 1 + _BOUNDARY_H)
+    )
+    assert float(value) == 0.0 and torch.isfinite(value)
+
+
+def test_an_all_masked_batch_gives_a_finite_zero_boundary():
+    mu, target, mask, weight = _boundary_case()
+    value = masked_boundary_gap(mu, target, torch.zeros_like(mask), weight)
+    assert float(value) == 0.0 and torch.isfinite(value)
+
+
+def test_the_boundary_term_carries_gradient_into_the_first_forecast_sample_only():
+    """It is a one-sample term: everything else in the block must be untouched by it, or the
+    level anchor would quietly become a second reconstruction loss."""
+    mu, target, mask, weight = _boundary_case()
+    mu.requires_grad_(True)
+
+    value = masked_boundary_gap(mu, target, mask, weight)
+    assert value.requires_grad
+    value.backward()
+
+    assert mu.grad is not None
+    assert float(mu.grad[0, 1, 0, 0].abs()) > 0.0
+    assert float(mu.grad[0, 1, 0, 1:].abs().max()) == 0.0
+    assert float(mu.grad[0, 1, 1].abs().max()) == 0.0
+    assert float(mu.grad[0, 0].abs().max()) == 0.0  # anchor 0 has no boundary term

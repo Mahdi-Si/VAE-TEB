@@ -298,14 +298,14 @@ def test_the_encoder_parameter_count_is_its_blocks_plus_the_final_norm(stream):
 
 
 def test_the_shipped_encoders_match_the_architecture_totals():
-    """$758{,}400$ and $594{,}048$: the two numbers the parameter budget is built from."""
+    """$1{,}676{,}928$ and $888{,}960$: the two numbers the parameter budget is built from."""
     assert (
         sum(p.numel() for p in build_stream_encoder("target", SHIPPED_KWARGS).parameters())
-        == 758_400
+        == 1_676_928
     )
     assert (
         sum(p.numel() for p in build_stream_encoder("source", SHIPPED_KWARGS).parameters())
-        == 594_048
+        == 888_960
     )
 
 
