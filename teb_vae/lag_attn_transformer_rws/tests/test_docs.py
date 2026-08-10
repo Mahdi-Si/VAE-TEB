@@ -75,6 +75,7 @@ STUDY_HEADINGS = (
     "## Phase 2a",
     "## Phase 2b",
     "## Phase 3",
+    "## The decoder-side pair",
     "## The prior-anchor weight",
 )
 
@@ -203,15 +204,19 @@ def measured_totals() -> Dict[str, int]:
         model = SeqVaeLagAttnTrfRws(**dict(SHIPPED_KWARGS, **overrides))
         return sum(parameter.numel() for parameter in model.parameters())
 
+    #: The two Phase 1 arms make the source encoder the target encoder, so their source depth is
+    #: the shipped *target* depth rather than a literal -- the same rule the arm files follow.
+    symmetric_depth = int(SHIPPED_KWARGS["target_attention_blocks"])
+
     return {
         "shipped": total(),
         "a1": total(
             encoder_conv_kernels=(),
             encoder_conv_dilations=(),
-            source_attention_blocks=4,
+            source_attention_blocks=symmetric_depth,
             source_attention_window=None,
         ),
-        "a2": total(source_attention_blocks=4, source_attention_window=None),
+        "a2": total(source_attention_blocks=symmetric_depth, source_attention_window=None),
     }
 
 

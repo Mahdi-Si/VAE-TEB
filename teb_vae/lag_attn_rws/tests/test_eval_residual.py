@@ -3,8 +3,8 @@ r"""Three quantities that are routinely conflated, and the bias that hides in th
 **The two latent quantities are not the same number.** ``delta_mu_rms`` is the RMS of
 $\mu^q - \mu^p$ per **element**; ``mu_post_prior_gap_rms`` sums over $d_z$ first, so it is the size
 of the belief shift per step. At equal support they differ by exactly $\sqrt{d_z}$ -- which is
-what makes the conflation invisible on a $d_z = 1$ fixture and a factor of seven wrong at the
-shipped $d_z = 48$. The test builds them from real forward outputs and asserts the ratio.
+what makes the conflation invisible on a $d_z = 1$ fixture and a factor of eight wrong at the
+shipped $d_z = 64$. The test builds them from real forward outputs and asserts the ratio.
 
 **The forecast difference is not ``pred_gap``.** One is a distance between two forecasts, the
 other a difference between two *scores*. Two forecasts can differ everywhere and score identically,

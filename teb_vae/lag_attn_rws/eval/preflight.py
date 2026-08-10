@@ -23,10 +23,11 @@ can produce. So what raises is that the zeroed tensors are no longer zero, which
 (or a deliberate perturbation) can produce.
 
 The witness rule is **any-of**, and that is deliberate rather than lenient. Training moves the
-delta heads and the FiLM generators independently, so a checkpoint whose FiLM path never left
-zero is an ordinary model, not a failed load; an all-of rule would refuse it, and it would refuse
-this repository's own perturbed-init test fixture as well. Every witness's $\max|w|$ is reported
-beside the verdict, so which one carried the evidence is visible rather than inferred.
+delta heads, the FiLM generators and the horizon attention's residual gains independently, so a
+checkpoint whose FiLM path never left zero is an ordinary model, not a failed load; an all-of rule
+would refuse it, and it would refuse this repository's own perturbed-init test fixture as well.
+Every witness's largest deviation from its construction constant is reported beside the verdict,
+so which one carried the evidence is visible rather than inferred.
 
 **The coupling readout is not causal, and every artifact says so.** Under the shipped
 ``causal_reach_budget_s: null`` an input feature at step $t$ reads well over a quarter of an hour
@@ -47,6 +48,7 @@ from loguru import logger
 
 from teb_vae.lag_attn import channel_reach
 from teb_vae.lag_attn_rws.eval.binding import ModelBinding
+from teb_vae.lag_attn.nets.decoders import HORIZON_ATTENTION_GAIN_INIT
 from teb_vae.lag_attn.nets.lag_report import SECONDS_PER_STEP
 
 # The training entry point's own guards, imported rather than copied. Their messages name the
@@ -91,6 +93,10 @@ REQUIRED_EVAL_LOAD_FIELDS: Tuple[str, ...] = (
 #: reconciliation itself takes the tuple as an argument, because a second architecture reconciles
 #: a different set -- its own encoder's keys, and not ``causal_norm``, which its constructor
 #: refuses outright.
+#:
+#: The objective weights are deliberately absent, ``beta_prior`` and the three shape lambdas
+#: alike: they weight the *training* criterion and enter none of the evaluated readouts, so a
+#: config that changed one after the fit is not evaluating the wrong thing.
 GEOMETRY_KEYS: Tuple[str, ...] = (
     "sequence_length",
     "d_model",
@@ -104,6 +110,7 @@ GEOMETRY_KEYS: Tuple[str, ...] = (
     "max_lag",
     "num_heads",
     "d_head",
+    "horizon_attention_blocks",
     "causal_norm",
 )
 
@@ -452,9 +459,15 @@ def reconcile_with_checkpoint(
 # Weight-space load verification
 # =============================================================================
 def load_witnesses(model: Any) -> Dict[str, List[torch.Tensor]]:
-    r"""Return the tensors this model zeroes at construction, grouped by witness.
+    r"""Return this model's construction-constant tensors as **deviations** from their constant.
 
-    Two independent groups, because training moves them independently:
+    Every entry is a tensor whose value at construction is known exactly, expressed here as
+    ``value - constant`` -- so ``max|.|`` over a group is "how far training moved it", and the
+    zero-initialised groups, whose constant is $0$, are returned unchanged. Expressing the
+    deviation here rather than in :func:`verify_weights_loaded` is what lets a witness whose
+    constant is *not* zero join the set without turning the check into one that can never fail.
+
+    The groups are independent, because training moves them independently:
 
     ``delta_heads``
         ``posterior_head.delta_mu_head`` and ``delta_logvar_head``, zeroed so that $q \equiv p$
@@ -471,6 +484,14 @@ def load_witnesses(model: Any) -> Dict[str, List[torch.Tensor]]:
         xavier-refills them, so the per-block-FiLM decoder starts bitwise identical to the
         FiLM-free one and consults $z$ through that path only as training drives it off zero.
 
+    ``horizon_attention_gains``
+        The per-block residual gain of each horizon-attention block, which the constructor sets to
+        exactly $10^{-2}$ and the generic initialisation does not touch. Reported as the deviation
+        from that constant, so a checkpoint that never loaded reads $0$ here exactly as it does on
+        the other two groups. Present only when the model was built with attention blocks: an
+        empty group would add a permanent ``0.0`` to every run's record, and a group that is not
+        there says more than one that is always zero.
+
     Both heads are ``ModuleList``s under the head-structured posterior, so each is flattened
     rather than assumed to be a single layer, and biases are included: ``_zero_linear`` clears
     them too, so a checkpoint that moved only a bias is still evidence of a load.
@@ -479,7 +500,7 @@ def load_witnesses(model: Any) -> Dict[str, List[torch.Tensor]]:
         model: The rebuilt net, after the checkpoint load.
 
     Returns:
-        Witness name to the tensors that start at exactly zero.
+        Witness name to that witness's deviations from its construction constant.
     """
     def _tensors(module: Any) -> List[torch.Tensor]:
         layers = list(module) if isinstance(module, torch.nn.ModuleList) else [module]
@@ -504,15 +525,23 @@ def load_witnesses(model: Any) -> Dict[str, List[torch.Tensor]]:
     if core.refine.film is not None:
         film.extend(_tensors(core.refine.film))
 
-    return {"delta_heads": delta_heads, "film_generators": film}
+    witnesses = {"delta_heads": delta_heads, "film_generators": film}
+    if core.attention is not None:
+        witnesses["horizon_attention_gains"] = [
+            block.residual_gain.detach() - HORIZON_ATTENTION_GAIN_INIT
+            for block in core.attention
+        ]
+    return witnesses
 
 
 def verify_weights_loaded(model: Any) -> Dict[str, Any]:
     """Verify in weight space that a checkpoint actually reached the model.
 
-    Any-of, not all-of: the two witness groups receive gradient independently, so a real
-    checkpoint whose FiLM path never left zero is an ordinary model rather than a failed load.
-    Each group's $\\max|w|$ is reported so which one carried the evidence is visible.
+    Any-of, not all-of: the witness groups receive gradient independently, so a real checkpoint
+    whose FiLM path never left zero is an ordinary model rather than a failed load. Each group's
+    largest deviation from its construction constant is reported under ``max_abs_weight`` -- for
+    the zero-initialised groups that *is* $\\max|w|$, which is why the field keeps its name -- so
+    which witness carried the evidence is visible rather than inferred.
 
     Args:
         model: The rebuilt net, after the load.
@@ -521,8 +550,8 @@ def verify_weights_loaded(model: Any) -> Dict[str, Any]:
         The per-witness magnitudes, which witnesses carried evidence, and the verdict.
 
     Raises:
-        EvalPreconditionUnmet: If every zero-initialised tensor is still exactly zero, which no
-            trained model produces and every failed load does.
+        EvalPreconditionUnmet: If every witness tensor is still exactly at its construction
+            constant, which no trained model produces and every failed load does.
     """
     magnitudes = {
         name: max((float(tensor.detach().abs().max()) for tensor in tensors), default=0.0)
@@ -531,8 +560,9 @@ def verify_weights_loaded(model: Any) -> Dict[str, Any]:
     carried = sorted(name for name, value in magnitudes.items() if value > 0.0)
     if not carried:
         raise EvalPreconditionUnmet(
-            "every zero-initialised tensor in this model is still exactly zero, so no checkpoint "
-            "weights reached it. The likeliest causes are a state dict whose keys did not align "
+            "every witness tensor in this model is still exactly at the value the constructor "
+            "gave it, so no checkpoint weights reached it. The likeliest causes are a state dict "
+            "whose keys did not align "
             "(load_checkpoint_strict returns None rather than raising) and a path naming a "
             "freshly constructed but untrained checkpoint. This is a weight-space check, not a "
             "behavioural one: a genuinely trained model whose source pathway collapsed still has "

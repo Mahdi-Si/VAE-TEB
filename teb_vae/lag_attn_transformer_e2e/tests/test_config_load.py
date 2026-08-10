@@ -90,6 +90,9 @@ TASK_LEVEL_KEYS = (
     "beta_prior",
     "lambda_full",
     "lambda_base",
+    "lambda_ms",
+    "lambda_deriv",
+    "lambda_boundary",
     "likelihood",
     "free_bits",
 )
@@ -312,7 +315,7 @@ def test_the_shipped_config_builds_the_shipped_architecture(shipped):
 
     model = SeqVaeLagAttnTrfE2E(**_model_kwargs_from(shipped, LagAttnTrfE2ETrainer))
 
-    assert len(model.target_encoder.attention_blocks) == 4
+    assert len(model.target_encoder.attention_blocks) == 6
     assert len(model.source_encoder.attention_blocks) == 3
     assert model.source_encoder.attention_window == 16
     # The stem reaches 21 steps = 84 s; the source bound 21 + 3*15 = 66 steps = 264 s, inside the

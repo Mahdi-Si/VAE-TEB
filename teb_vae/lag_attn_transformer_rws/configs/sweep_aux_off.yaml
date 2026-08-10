@@ -1,0 +1,39 @@
+# Ablate-one arm: the three auxiliary shape weights to 0.0, leaving the bare four-term objective.
+#
+# The shipped default carries lambda_ms 0.1, lambda_deriv 0.1 and lambda_boundary 0.05. This arm
+# turns all three off together, because they were shipped together and price one decision: whether
+# shaping the forecast MEAN beyond the per-sample likelihood is what the over-smoothed forecast
+# needed. Pricing them individually would be three more arms answering a question nobody has yet
+# asked, and the first production run's per-term magnitudes are what would tell us which one to ask.
+#
+# What it isolates. The factorized Gaussian NLL scores every raw sample independently, so its
+# optimum is the conditional mean and a fully parallel decoder is free to emit an over-smoothed
+# one. The three terms price the envelope (pooled L1), the slope (derivative Huber) and the
+# starting level (boundary continuity) instead. With them off, nothing in the criterion can tell a
+# forecast with the right average from one with the right shape.
+#
+# What to read. `nll_full_block` and `nll_base_block` against the default's -- in nats, which is the
+# only comparison that is meaningful across the two, because the default's `total_loss` carries the
+# aux terms and this arm's does not. `pred_gap` beside them: an arm that scores the same in nats but
+# forecasts a visibly flatter waveform is the outcome the terms exist to prevent, and the per-epoch
+# diagnostic figure is where that shows.
+#
+# Its own three `aux_*` columns are exact 0.0 in every row, by the zeros-when-off contract -- a term
+# at weight 0 is not computed, so this arm cannot report what the shipped weights were buying. That
+# reading comes from the default's columns; this arm reports the predictive effect of removing them.
+#
+# Costs. None in parameters -- the terms hold none, so this arm shares a checkpoint geometry with
+# the default. It does change the criterion's units: without the aux terms `total_loss` is back to
+# pure nats per anchor, so a `val/total_loss` comparison against the default is reading two
+# different quantities. Compare the NLL columns.
+#
+#   TEB_RUN_STAMP="$(date '+%Y-%m-%d--[%H-%M]')" torchrun --nproc_per_node=7 \
+#       -m teb_vae.lag_attn_transformer_rws.trainer \
+#       --config teb_vae/lag_attn_transformer_rws/configs/sweep_aux_off.yaml
+base: default.yaml
+
+model_config:
+  VAE_model:
+    lambda_ms: 0.0
+    lambda_deriv: 0.0
+    lambda_boundary: 0.0

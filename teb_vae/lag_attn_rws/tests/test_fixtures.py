@@ -75,9 +75,12 @@ def test_the_kwargs_sets_satisfy_the_constructor_invariants():
 
 def test_shipped_kwargs_is_the_production_geometry_not_a_miniature():
     assert SHIPPED_KWARGS["sequence_length"] == 300
-    assert SHIPPED_KWARGS["d_z"] == 48
+    assert SHIPPED_KWARGS["d_z"] == 64
     assert SHIPPED_KWARGS["max_lag"] == 90
     assert SHIPPED_KWARGS["causal_norm"] is True
+    assert SHIPPED_KWARGS["decoder_hidden"] == 256
+    assert SHIPPED_KWARGS["horizon_depth"] == 4
+    assert SHIPPED_KWARGS["horizon_attention_blocks"] == 2
 
 
 def test_the_slow_marker_is_registered(request):

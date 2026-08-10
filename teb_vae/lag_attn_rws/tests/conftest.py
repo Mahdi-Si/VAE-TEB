@@ -73,13 +73,14 @@ BATCH = 2
 SEQ_LEN = int(TINY_KWARGS["sequence_length"])
 
 # What configs/default.yaml sets, at full production geometry. Unlike the tiny set this builds
-# the real thing -- 300 steps, d_z = 48, entmax attention, causal norms, the extra encoder
-# dilations -- so construction-time invariants are checked against the model that actually
-# trains, not a miniature of it. Forward passes stay on TINY_KWARGS for speed.
+# the real thing -- 300 steps, d_z = 64, entmax attention, causal norms, the extra encoder
+# dilations, a 256-wide decoder core four refine blocks deep with two horizon-attention blocks on
+# top -- so construction-time invariants are checked against the model that actually trains, not a
+# miniature of it. Forward passes stay on TINY_KWARGS for speed.
 SHIPPED_KWARGS = dict(
     sequence_length=300,
     d_model=128,
-    d_z=48,
+    d_z=64,
     horizon=30,
     raw_per_step=16,
     warmup_period=30,
@@ -91,10 +92,11 @@ SHIPPED_KWARGS = dict(
     d_head=32,
     lstm_layers=2,
     dropout=0.1,
-    decoder_hidden=128,
-    horizon_depth=3,
+    decoder_hidden=256,
+    horizon_depth=4,
     horizon_kernel=3,
     horizon_film=True,
+    horizon_attention_blocks=2,
     horizon_embed_std=0.8,
     head_init_calibration=True,
     a_head_gain=2.0,

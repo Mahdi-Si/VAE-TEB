@@ -1,0 +1,70 @@
+# Development validation config: the production model over the committed HIE sample shard.
+#
+# NOT a sweep arm and not a result config -- it is the dev-box run that reads this objective's
+# pre-registered acceptance criteria before any production time is spent on it. It shares the
+# shipped model geometry with default.yaml on purpose: what is read here (the seven-term
+# recomposition, whether the KL opens off zero, whether the conditional prior stays off its clamp
+# floor, and where the decoder's log-variance sits inside its clamp) is a property of the objective
+# at the real widths and at the real block cardinality. A shrunken model would not reproduce it --
+# and the block is the one thing that must not shrink, because H * C_keep = 2340 is what every
+# reported nat is summed over. Only the run's *scale* is local: one device, one shard, hundreds of
+# epochs instead of thousands.
+#
+# What it is NOT: a generalisation measurement. `output/hie_cs.hdf5` is 339 windows from 14
+# recordings, and it is used for BOTH splits, because `dataset_kwargs` is shared between the two
+# loaders (train/data_module.py) and so cannot carry a per-split GUID filter. Every `val/` column is
+# therefore in-sample. That is adequate for what is read here -- all four criteria are optimisation
+# diagnostics -- and it is why no verdict from this run is quoted as a coupling result. The
+# roadmap's own expectation is a negative held-out gap that lives in the source pathway, and an
+# in-sample run cannot see it.
+#
+# Prerequisite: output/hie_cs_stats.hdf5, ALREADY GENERATED from this shard by
+# hdf5_dataset/calculate_dataset_stats.py at trim_minutes=1.0, so there is nothing to regenerate.
+# Inheriting the four-sample fixture statistics instead would pass every existing guard (the channel
+# counts match) and silently train on mis-normalised data -- and this model is the one that can least
+# afford it, because `fhr_st` and `fhr_ph` are its reconstruction TARGET rather than only its input.
+#
+#   python -m teb_vae.lag_attn_fs.trainer --config teb_vae/lag_attn_fs/configs/smoke_hie.yaml
+base: default.yaml
+
+general_config:
+  tag: lag_attn_fs_hie_smoke
+  cuda_devices: [0]
+  # Counted in optimizer STEPS, not epochs. 339 windows at batch 32 is 11 steps per epoch against
+  # a production run's hundreds, so an epoch here is a fraction of one there and every criterion
+  # phrased in epochs has to be restated in steps before it is read. 200 epochs is ~2,200 steps,
+  # matching the window the sibling package's gradient-norm derivation asks for and the budget its
+  # own local arms were read at.
+  epochs: 200
+  # The two figure cadences (loss_plot_epoch.html and the per-epoch diagnostic page) share this
+  # key. Every epoch would spend more wall-clock plotting than training at this shard size, and the
+  # page here is seven rows including a 78x30 error map per drawn sample.
+  plot_frequency: 20
+  batch_size: {train: 32, test: 32}
+  folders_config: {out_dir_base: output/lag_attn_fs_hie_smoke}
+
+model_config:
+  VAE_model:
+    # ONLY the ramp length. The endpoint is inherited, deliberately: this config must track whatever
+    # weight default.yaml ships, or the dev-box reading stops being a reading of the shipped model.
+    # The ramp itself cannot be inherited -- 50 epochs is 1% of a 5,000-epoch production run and a
+    # quarter of this one, and the coupling columns would be read off a model that had barely been
+    # asked to pay for its rate. Scaled so beta sits at its endpoint for the last 90% of the run,
+    # as it effectively does in production.
+    beta_schedule:
+      warmup_epochs: 20
+
+dataset_config:
+  # Repo-root-relative: entry points run from the repo root. Both splits are the same shard; see
+  # the header for why, and for what that does and does not license.
+  vae_train_datasets: [output/hie_cs.hdf5]
+  vae_test_datasets: [output/hie_cs.hdf5]
+  stat_path: output/hie_cs_stats.hdf5
+  dataloader_config:
+    num_workers: 2       # 339 samples; worker spawn dominates beyond this on Windows
+    prefetch_factor: 2
+
+advanced_config:
+  tracking:
+    mlflow:
+      enabled: false     # no tracking server on the dev box; the run directory is the record

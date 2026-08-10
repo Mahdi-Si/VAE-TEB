@@ -29,6 +29,13 @@ from torch import nn
 
 from teb_vae.lag_attn.nets.blocks import ResidualMLP, geometric_schedule, smooth_bound
 
+#: What each horizon-attention block's residual gain is set to at construction. Small enough that
+#: the stack starts near-identity, nonzero so every projection behind it carries gradient from the
+#: first step. Named because it is a *known construction constant* that a trained checkpoint must
+#: have moved -- which is what makes the gains usable as a load witness in the evaluation
+#: pipeline's preflight.
+HORIZON_ATTENTION_GAIN_INIT = 1.0e-2
+
 
 class _HorizonRefine(nn.Module):
     """Stack of dilated convolutions along the forecast-horizon axis.
@@ -123,11 +130,92 @@ class _HorizonRefine(nn.Module):
         return x
 
 
+class _HorizonSelfAttention(nn.Module):
+    r"""Pre-norm bidirectional self-attention over the forecast-horizon tokens.
+
+    The dilated convolutions above mix horizon steps through a fixed local window; this mixes all
+    $H_d$ of them at once, so a forecast can be shaped as a whole rather than assembled from
+    overlapping neighbourhoods. The attention is deliberately **not** masked: this axis is the
+    forecast horizon of a single anchor, every step of which is predicted from the same $t$, so
+    there is no future here to leak -- the same argument that lets the refine stack pad
+    symmetrically.
+
+    Hand-rolled rather than :class:`torch.nn.MultiheadAttention` for two reasons that are
+    correctness rather than taste. MHA applies its attention dropout functionally, where the
+    dropout-zero scans that guard the twice-invoked decoder cannot see it; and the generic
+    :func:`~teb_vae.lag_attn.nets.blocks.initialization` pass would xavier-fill MHA's *packed*
+    ``in_proj_weight`` as one $3d \times d$ matrix, giving q, k and v a fan-in three times the one
+    they actually have.
+
+    No positional encoding of its own: the core's ``horizon_embedding`` is already what tells the
+    $H_d$ tokens apart, and a second one would be a duplicate identity for the same axis.
+
+    Shapes:
+        Input:  ``(N, H_d, d_hidden)``
+        Output: ``(N, H_d, d_hidden)``
+    """
+
+    def __init__(self, d_hidden: int, num_heads: int) -> None:
+        """Initialize one attention block.
+
+        Args:
+            d_hidden: Token width; must be divisible by ``num_heads``. Validated by the core,
+                which is where the two values meet a configuration.
+            num_heads: Number of attention heads.
+        """
+        super().__init__()
+        self.num_heads = int(num_heads)
+        self.d_head = d_hidden // self.num_heads
+
+        self.norm = nn.LayerNorm(d_hidden)
+        # Bias-free: the pre-norm already centres the input, so a bias on the query and key
+        # projections only shifts every logit by the same constant.
+        self.q_proj = nn.Linear(d_hidden, d_hidden, bias=False)
+        self.k_proj = nn.Linear(d_hidden, d_hidden, bias=False)
+        self.v_proj = nn.Linear(d_hidden, d_hidden, bias=False)
+        self.out_proj = nn.Linear(d_hidden, d_hidden, bias=False)
+
+        # A bare nn.Parameter, which is exactly what makes this survive: `initialization` fills
+        # Linear and Conv1d weights and re-inits LayerNorm, and ignores loose parameters -- so the
+        # gain stays where the constructor put it and the stack starts near-identity. Small rather
+        # than zero, so every projection above carries gradient from the first step instead of
+        # waiting for the gain to leave an exact zero.
+        self.residual_gain = nn.Parameter(torch.full((1,), HORIZON_ATTENTION_GAIN_INIT))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Mix the horizon tokens of each row and add the result back.
+
+        Args:
+            x: Horizon tokens ``(N, H_d, d_hidden)``. Anchors are folded into ``N`` by the caller,
+                so one row is one anchor's forecast and nothing crosses between them.
+
+        Returns:
+            The same shape.
+        """
+        n_rows, horizon, d_hidden = x.shape
+        normed = self.norm(x)
+        # (N, heads, H_d, d_head): heads next to the batch, so the attention runs over the horizon.
+        query = self.q_proj(normed).reshape(n_rows, horizon, self.num_heads, self.d_head)
+        key = self.k_proj(normed).reshape(n_rows, horizon, self.num_heads, self.d_head)
+        value = self.v_proj(normed).reshape(n_rows, horizon, self.num_heads, self.d_head)
+        attended = F.scaled_dot_product_attention(
+            query.transpose(1, 2),
+            key.transpose(1, 2),
+            value.transpose(1, 2),
+            # No mask (the horizon is not time) and no dropout (this module is invoked twice per
+            # forward, and two masks would make the base and full forecasts differ by noise).
+            dropout_p=0.0,
+        )
+        attended = attended.transpose(1, 2).reshape(n_rows, horizon, d_hidden)
+        return x + self.residual_gain * self.out_proj(attended)
+
+
 class HorizonDecoderCore(nn.Module):
     r"""Shared horizon-refinement core, used by both future decoders.
 
-    Holds the forecast-step embedding, optional FiLM modulation, the dilated refine stack and the
-    output norm. Both decoders push their projected ``(B, T, d_hidden)`` state through the same
+    Holds the forecast-step embedding, optional FiLM modulation, the dilated refine stack, an
+    optional stack of self-attention blocks over the horizon tokens, and the output norm. Both
+    decoders push their projected ``(B, T, d_hidden)`` state through the same
     :meth:`decode`, so the residual decoder operates as a correction *in the baseline's
     representation space*.
 
@@ -137,7 +225,8 @@ class HorizonDecoderCore(nn.Module):
 
     Note this core's normalisers are deliberately *not* causalised. They pool over the forecast
     axis of a single anchor, not across input time: every step of that axis is predicted from the
-    same $t$, so pooling over it cannot reach information the anchor did not already have.
+    same $t$, so pooling over it cannot reach information the anchor did not already have. The
+    optional self-attention over the horizon tokens is symmetric for the same reason.
     """
 
     def __init__(
@@ -148,6 +237,8 @@ class HorizonDecoderCore(nn.Module):
         depth: int = 2,
         film: bool = False,
         film_per_block: bool = False,
+        attention_blocks: int = 0,
+        attention_heads: int = 4,
     ) -> None:
         """Initialize the shared horizon core.
 
@@ -162,11 +253,19 @@ class HorizonDecoderCore(nn.Module):
                 stack. Requires ``film``. When set, the single ``film_gen`` is **not** built and the
                 per-block generators live inside ``refine``; the two are never built together, so no
                 dead generator exists.
+            attention_blocks: Number of bidirectional self-attention blocks run over the $H_d$
+                horizon tokens after the refine stack. ``0`` (the default) builds no module at all,
+                so a core that does not ask for them is parameter-for-parameter and
+                forward-identical to one built before they existed.
+            attention_heads: Heads per attention block. Must divide ``d_hidden``. Read only when
+                ``attention_blocks`` is positive, so a width that no attention will ever see is not
+                held to a constraint it does not need.
 
         Raises:
             ValueError: If ``film_per_block`` is set without ``film`` -- per-block FiLM is a form of
                 FiLM, not a separate mechanism, so that combination is a construction error rather
-                than a silent no-op.
+                than a silent no-op. Or if ``attention_heads`` does not divide ``d_hidden`` while
+                attention is requested.
         """
         super().__init__()
         self.horizon = int(horizon)
@@ -200,6 +299,27 @@ class HorizonDecoderCore(nn.Module):
             nn.init.zeros_(self.film_gen.bias)
         else:
             self.film_gen = None
+
+        # Built only when asked for, following the same rule as ``film_gen``: a core at the default
+        # holds no attention module, so its state dict, its parameter count and its forward are the
+        # ones it had before this knob existed.
+        self.attention_blocks = max(0, int(attention_blocks))
+        self.attention_heads = int(attention_heads)
+        self.attention: Optional[nn.ModuleList]
+        if self.attention_blocks > 0:
+            if self.attention_heads < 1 or self.d_hidden % self.attention_heads != 0:
+                raise ValueError(
+                    f"attention_heads={self.attention_heads} must be a positive divisor of "
+                    f"d_hidden={self.d_hidden}; the horizon tokens are split evenly across heads "
+                    f"and a remainder would silently drop channels"
+                )
+            self.attention = nn.ModuleList(
+                _HorizonSelfAttention(self.d_hidden, self.attention_heads)
+                for _ in range(self.attention_blocks)
+            )
+        else:
+            self.attention = None
+
         self.out_norm = nn.LayerNorm(d_hidden)
 
     def decode(self, h: torch.Tensor) -> torch.Tensor:
@@ -228,7 +348,17 @@ class HorizonDecoderCore(nn.Module):
         # block's modulation is a function of z alone, and the decoder still consumes nothing else.
         cond = h.reshape(batch * seq_len, d_hidden) if self.film_per_block else None
         flat = self.refine(flat, cond)
-        feat = flat.transpose(1, 2).reshape(batch, seq_len, horizon, d_hidden)
+
+        # Back to channels-last, with the anchors still folded into the batch: the attention mixes
+        # the horizon tokens of one anchor and can no more reach across anchors than the
+        # convolutions above can. Each block adds its own residual; the skip and the output norm
+        # below are untouched, so the attention is a strict addition to the refine path.
+        feat = flat.transpose(1, 2)
+        if self.attention is not None:
+            for block in self.attention:
+                feat = block(feat)
+
+        feat = feat.reshape(batch, seq_len, horizon, d_hidden)
         return self.out_norm(feat + skip)
 
 

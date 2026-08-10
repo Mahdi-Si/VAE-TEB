@@ -6,10 +6,15 @@ tensors; this module turns one into the other and computes the objective
 
 $$
 \mathcal{L} = \lambda_{\mathrm{full}} D_1 + \lambda_{\mathrm{base}} D_0
-  + \beta(e)\,\mathrm{KL}_{\mathrm{train}} + \beta_p\,R_p,
+  + \beta(e)\,\mathrm{KL}_{\mathrm{train}} + \beta_p\,R_p
+  + \lambda_{\mathrm{ms}} \mathcal{L}_{\mathrm{ms}} + \lambda_{\Delta} \mathcal{L}_{\Delta}
+  + \lambda_{\mathrm{boundary}} \mathcal{L}_{\mathrm{boundary}},
 $$
 
-with every term in nats per anchor (the net's ``compute_loss`` owns the reduction convention).
+with the first four terms in nats per anchor (the net's ``compute_loss`` owns the reduction
+convention) and the three shape terms in $L_1$/Huber units, which makes ``total_loss`` a
+mixed-unit criterion and the ``nll_*`` metrics the pure-nats readouts. Each shape weight
+defaults to $0.0$, at which its term is not computed and its metric is an exact zero.
 
 Everything else is inherited. There is no ``training_step`` here: the framework's own step
 dispatches to :meth:`compute_loss_and_metrics`, logs the returned metrics, and runs the
@@ -88,6 +93,9 @@ class SeqVaeLagAttnRwsTask(LightningModelBase):
         lambda_base: float = 1.0,
         likelihood: str = "gaussian_nll",
         free_bits: float = 0.0,
+        lambda_ms: float = 0.0,
+        lambda_deriv: float = 0.0,
+        lambda_boundary: float = 0.0,
         compile_model: bool = False,
     ) -> None:
         r"""Initialize the task.
@@ -118,6 +126,14 @@ class SeqVaeLagAttnRwsTask(LightningModelBase):
             lambda_base: Weight of the base (target-only) reconstruction term.
             likelihood: ``'mse'`` or ``'gaussian_nll'``.
             free_bits: Per-dim per-step KL floor in nats; enters the trained KL only.
+            lambda_ms: Weight $\lambda_{\mathrm{ms}}$ of the multiscale $L_1$ shape term. At
+                ``0.0`` -- the default -- the term is not computed and its metric is an exact
+                zero. Constants, never schedules, for the same reason ``beta_prior`` is one:
+                these shape the mean the reconstruction is already training, so nothing is
+                gained by letting them arrive late.
+            lambda_deriv: Weight $\lambda_{\Delta}$ of the derivative Huber shape term.
+            lambda_boundary: Weight $\lambda_{\mathrm{boundary}}$ of the boundary-continuity
+                shape term.
             compile_model: Wrap the net in ``torch.compile``. Defaults to ``False``, which is
                 the only correct value **for this net**: its LSTM encoders defeat TorchInductor
                 on their own, and a checkpointed attention region defeats it again whenever
@@ -149,6 +165,9 @@ class SeqVaeLagAttnRwsTask(LightningModelBase):
             "lambda_base",
             "likelihood",
             "free_bits",
+            "lambda_ms",
+            "lambda_deriv",
+            "lambda_boundary",
         )
         self._model_kwargs: Dict[str, Any] = dict(model_kwargs or {})
         self._perm_generator: Optional[torch.Generator] = None
@@ -596,6 +615,9 @@ class SeqVaeLagAttnRwsTask(LightningModelBase):
         lambda_base = float(self.hparams.get("lambda_base", 1.0))
         likelihood = str(self.hparams.get("likelihood", "gaussian_nll"))
         free_bits = float(self.hparams.get("free_bits", 0.0))
+        lambda_ms = float(self.hparams.get("lambda_ms", 0.0))
+        lambda_deriv = float(self.hparams.get("lambda_deriv", 0.0))
+        lambda_boundary = float(self.hparams.get("lambda_boundary", 0.0))
 
         loss_metrics = self.orig_model.compute_loss(
             forward_outputs,
@@ -607,6 +629,9 @@ class SeqVaeLagAttnRwsTask(LightningModelBase):
             lambda_base=lambda_base,
             likelihood=likelihood,
             free_bits=free_bits,
+            lambda_ms=lambda_ms,
+            lambda_deriv=lambda_deriv,
+            lambda_boundary=lambda_boundary,
         )["metrics"]
         main_loss = loss_metrics["total_loss"]
 
@@ -651,6 +676,12 @@ class SeqVaeLagAttnRwsTask(LightningModelBase):
                     lambda_base=lambda_base,
                     likelihood=likelihood,
                     free_bits=0.0,
+                    # Zero for the same reason as beta_prior, and one more: only this call's NLL
+                    # is consumed, so computing the shape terms here would buy a full extra pass
+                    # over both forecast blocks for numbers nothing reads.
+                    lambda_ms=0.0,
+                    lambda_deriv=0.0,
+                    lambda_boundary=0.0,
                 )["metrics"]
             metrics["nll_shuffled_block"] = shuffled["nll_full_block"]
             # Raw, not floored: only the raw KL is readable as an information rate, and the

@@ -137,9 +137,10 @@ TINY_KWARGS: Dict[str, Any] = dict(
     source_attention_window=4,
 )
 
-# What configs/default.yaml sets, at full production geometry -- 300 steps, $d_z = 48$, entmax
-# attention, the $(5, 9)$ stem, four full-context target blocks and three source blocks at a
-# 16-step window -- so construction-time invariants are checked against the model that actually
+# What configs/default.yaml sets, at full production geometry -- 300 steps, $d_z = 64$, entmax
+# attention, the $(5, 9)$ stem, six full-context target blocks and three source blocks at a
+# 16-step window, a $256$-wide decoder core four refine blocks deep with two horizon-attention
+# blocks on top -- so construction-time invariants are checked against the model that actually
 # trains rather than a miniature of it. Forward passes in this suite stay on TINY_KWARGS for speed.
 #
 # Leaf for leaf the sibling's production set minus three keys, which is the comparison this package
@@ -150,7 +151,7 @@ TINY_KWARGS: Dict[str, Any] = dict(
 SHIPPED_KWARGS: Dict[str, Any] = dict(
     sequence_length=300,
     d_model=128,
-    d_z=48,
+    d_z=64,
     horizon=30,
     raw_per_step=16,
     warmup_period=30,
@@ -158,10 +159,11 @@ SHIPPED_KWARGS: Dict[str, Any] = dict(
     num_heads=4,
     d_head=32,
     dropout=0.1,
-    decoder_hidden=128,
-    horizon_depth=3,
+    decoder_hidden=256,
+    horizon_depth=4,
     horizon_kernel=3,
     horizon_film=True,
+    horizon_attention_blocks=2,
     horizon_embed_std=0.8,
     head_init_calibration=True,
     a_head_gain=2.0,
@@ -177,8 +179,8 @@ SHIPPED_KWARGS: Dict[str, Any] = dict(
     encoder_conv_kernels=(5, 9),
     encoder_conv_dilations=(1, 2),
     encoder_num_heads=4,
-    encoder_d_ff=256,
-    target_attention_blocks=4,
+    encoder_d_ff=512,
+    target_attention_blocks=6,
     source_attention_blocks=3,
     source_attention_window=16,
 )

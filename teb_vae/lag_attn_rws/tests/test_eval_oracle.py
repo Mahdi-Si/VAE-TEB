@@ -217,8 +217,29 @@ def test_the_probe_mirrors_the_production_decoder_rather_than_restating_its_shap
         probe.core.refine.blocks[0]["conv"].kernel_size
         == model.horizon_core.refine.blocks[0]["conv"].kernel_size
     )
+    assert probe.core.attention_blocks == model.horizon_core.attention_blocks
+    assert probe.core.attention_heads == model.horizon_core.attention_heads
     assert probe.out_channels == model.decoder.out_channels
     assert probe.logvar_clamp == model.logvar_clamp
+
+
+def test_the_probe_carries_the_models_horizon_attention_rather_than_none() -> None:
+    """The mirroring above is asserted on a model whose attention is off, where "mirrored" and
+    "hardcoded to zero" are the same number. Built with the blocks on, the probe must have them
+    -- a blockless probe would bound a decoder nobody trained, and would make the oracle gap read
+    as bottleneck cost when part of it was missing capacity."""
+    from teb_vae.lag_attn_rws.nets.model import SeqVaeLagAttnRws
+
+    torch.manual_seed(0)
+    model = SeqVaeLagAttnRws(**dict(TINY_KWARGS, horizon_attention_blocks=2))
+
+    probe = oracle.build_probe(model)
+
+    assert probe.core.attention is not None
+    assert len(probe.core.attention) == 2
+    # A fresh stack, not the model's: sharing it would hand the probe trained horizon dynamics.
+    model_parameters = {id(parameter) for parameter in model.parameters()}
+    assert not model_parameters & {id(p) for p in probe.core.attention.parameters()}
 
 
 def test_the_probe_reads_the_encoder_state_rather_than_the_latent(tiny_model) -> None:

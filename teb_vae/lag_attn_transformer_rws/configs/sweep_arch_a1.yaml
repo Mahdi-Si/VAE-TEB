@@ -1,4 +1,4 @@
-# Architecture arm A1: pure causal Transformer, no convolution stem, four full-context blocks
+# Architecture arm A1: pure causal Transformer, no convolution stem, six full-context blocks
 # per stream.
 #
 # The question: does the convolutional inductive bias earn its place? The stem is the only part
@@ -12,8 +12,13 @@
 # the only surviving asymmetry between A1 and A2 is the stem. Four declared deltas, none of them
 # drift.
 #
-# Parameter total 2,029,567: -201,728 for the two stems, +164,352 for the source encoder's fourth
-# attention block, so -37,376 against the shipped configuration rather than the stem cost.
+# The source depth here is the TARGET's depth, whatever that is: the arm's claim is symmetry, so
+# when default.yaml moved the target from four blocks to six this file moved with it.
+#
+# Parameter total 5,583,084: -201,728 for the two stems, +787,968 for the source encoder's fourth,
+# fifth and sixth attention blocks, so +586,240 against the shipped configuration rather than the
+# negative of the stem cost. (Counted without the reach guard's availability adapters, as every
+# total in this study is; a guarded run adds 6,272 to each of them alike.)
 #
 # Note that A0 in this study is the model this package is compared against --
 # teb_vae/lag_attn_rws, the dilated-conv-plus-LSTM encoder pair -- not a config in this directory.
@@ -31,8 +36,8 @@ model_config:
     # dilation. The stem reach falls from 21 steps to 1 -- the identity.
     encoder_conv_kernels: []
     encoder_conv_dilations: []
-    # Symmetric with the target: four blocks, full causal prefix. The source state's reach is then
+    # Symmetric with the target: six blocks, full causal prefix. The source state's reach is then
     # unbounded rather than the shipped 66 steps, which is the locality property Phase 2 sweeps
     # separately; here it is held equal to the target's so the stem is the only variable against A2.
-    source_attention_blocks: 4
+    source_attention_blocks: 6
     source_attention_window: null

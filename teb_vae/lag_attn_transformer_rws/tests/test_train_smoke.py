@@ -44,6 +44,7 @@ from .conftest import absolutize_dataset_paths
 pytestmark = pytest.mark.slow
 
 _TINY = Path(__file__).resolve().parents[1] / "configs" / "tiny.yaml"
+_DEFAULT = Path(__file__).resolve().parents[1] / "configs" / "default.yaml"
 
 #: Epochs each fit runs. Three rather than the config's one, for two reasons that are both about
 #: what only a multi-epoch run can show: ``lr`` is logged at train-epoch *start* with
@@ -285,14 +286,24 @@ def test_the_run_directory_has_the_expected_layout(fit):
 
 def test_the_resolved_config_is_written_beside_the_checkpoints(fit):
     """A run's own config is otherwise recoverable only from the text of its log or from an MLflow
-    artifact whose on-disk location nothing can derive."""
+    artifact whose on-disk location nothing can derive.
+
+    The target depth is the probe for the ``base:`` chain having resolved -- ``tiny.yaml`` does not
+    set it, so the value can only have come from ``default.yaml``. Read off that file rather than
+    pinned as a literal: a revision of the shipped depth would otherwise fail here for a reason
+    that has nothing to do with what this test is about."""
     driver, _, _ = fit
+    shipped_depth = yaml.safe_load(_DEFAULT.read_text(encoding="utf-8"))
+    shipped_depth = shipped_depth["model_config"]["VAE_model"]["target_attention_blocks"]
 
     written = Path(driver.model_checkpoint_dir) / RESOLVED_CONFIG_FILENAME
     assert written.is_file()
     reloaded = yaml.safe_load(written.read_text(encoding="utf-8"))
     assert "base" not in reloaded
-    assert reloaded["model_config"]["VAE_model"]["target_attention_blocks"] == 4
+    assert "target_attention_blocks" not in yaml.safe_load(
+        _TINY.read_text(encoding="utf-8")
+    )["model_config"]["VAE_model"], "the probe stopped being inherited"
+    assert reloaded["model_config"]["VAE_model"]["target_attention_blocks"] == shipped_depth
 
 
 def test_the_checkpoint_is_written_under_this_models_stem(fit):

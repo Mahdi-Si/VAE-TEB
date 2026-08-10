@@ -1,0 +1,23 @@
+# Calibration arm: converged KL weight beta_schedule.end = 10.0, the upper bracket.
+#
+# Twice the scale-matched value, and the arm that has to fail for the bracket to have found
+# anything: a rate this heavy is the standard route to a latent that stops carrying the source at
+# all. Read `kld_active_frac` and the collapse criterion (teb_vae/lag_attn_rws/collapse.py) first
+# here -- a collapsed arm is a recorded result, not a dropped one, and it is what says the shipped
+# value sits below a ceiling rather than merely above a floor.
+#
+# beta_prior moves with beta, holding beta_prior/beta = 0.1. That puts the anchor at 1.0 here, at
+# parity with the raw sibling's converged KL weight, so this is also the arm that says whether an
+# anchor that strong starts taxing the base forecast it is designed to leave alone.
+#
+#   TEB_RUN_STAMP="$(date '+%Y-%m-%d--[%H-%M]')" torchrun --nproc_per_node=7 \
+#       -m teb_vae.lag_attn_fs.trainer --config teb_vae/lag_attn_fs/configs/sweep_beta_10p0.yaml
+base: default.yaml
+
+model_config:
+  VAE_model:
+    beta_schedule:
+      # Only the converged weight moves. The linear warm-up from exactly 0 and its epoch count are
+      # inherited: the warm-up is the posterior-collapse guard, not part of the swept axis.
+      end: 10.0
+    beta_prior: 1.0

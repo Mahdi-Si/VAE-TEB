@@ -256,15 +256,23 @@ class LagAttnRwsPlotCallback(Callback):
             # The schedule's value for this epoch, not hparams['kld_beta']: under any warm-up the
             # raw hyperparameter is the endpoint and the figure would report a constant.
             beta = float(pl_module._resolve_beta(pl_module.current_epoch))
+            # Every objective weight the task passes, not a subset: the figure's recorded
+            # ``total_loss`` is read against the training curve, and a weight left at its
+            # default here would make the two disagree by exactly that term with nothing on the
+            # page saying so.
             scalars = model.compute_loss(
                 outs,
                 fhr_raw,
                 weight=weight,
                 beta=beta,
+                beta_prior=float(pl_module.hparams.get("beta_prior", 0.0)),
                 lambda_full=float(pl_module.hparams.get("lambda_full", 1.0)),
                 lambda_base=float(pl_module.hparams.get("lambda_base", 1.0)),
                 likelihood=str(pl_module.hparams.get("likelihood", "gaussian_nll")),
                 free_bits=float(pl_module.hparams.get("free_bits", 0.0)),
+                lambda_ms=float(pl_module.hparams.get("lambda_ms", 0.0)),
+                lambda_deriv=float(pl_module.hparams.get("lambda_deriv", 0.0)),
+                lambda_boundary=float(pl_module.hparams.get("lambda_boundary", 0.0)),
             )["metrics"]
             kld_per_dim = model.kld_tensor(
                 mu_prior=outs["mu_prior"],
@@ -280,6 +288,12 @@ class LagAttnRwsPlotCallback(Callback):
         # ``inputs[0]`` rather than a named tensor: every input the net takes carries the batch
         # size, and reading it off the first one is what keeps the loop bound right for a model
         # whose forward signature is not this one's.
+        # Which two rows the page draws first is the task's to say, because it is the task that
+        # decides what ``_build_raw_target`` returns: a model forecasting something other than
+        # the raw signal needs its own first two rows and the same five below them. Resolved off
+        # the module rather than captured, so the existing monkeypatch seam still intercepts.
+        forecast_rows = getattr(pl_module, "forecast_rows", None)
+
         for index in range(min(self.num_examples, int(inputs[0].shape[0]))):
             guid = _guid_of(batch, index)
             figure = build_diagnostic_figure(
@@ -298,6 +312,10 @@ class LagAttnRwsPlotCallback(Callback):
                 up_raw=_get_field(batch, "up"),
                 normalization_stats=stats,
                 delay_steps=_source_delay_steps(model),
+                forecast_rows=forecast_rows,
+                # The batch itself, for the same reason: a task whose target is not the raw
+                # signal cannot recover the raw traces from what it returned.
+                batch=batch,
             )
             path = self.output_dir / (
                 f"lag_attn_rws_epoch{epoch:04d}_sample{index}_{guid[:16]}.{self.file_format}"

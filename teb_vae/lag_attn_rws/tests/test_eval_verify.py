@@ -222,7 +222,7 @@ def write_arm(
     *,
     beta: float,
     beta_prior: float = 1.0e-2,
-    d_z: int = 48,
+    d_z: int = 64,
     reach: Optional[Any] = None,
     kept: Optional[Tuple[int, int]] = None,
     pred_gap: float = 1.0,
@@ -253,7 +253,7 @@ def write_arm(
                 "c_u": 58,
                 "encoder_extra_kernel": 15,
                 "query_uses_logvar": False,
-                "horizon_depth": 3,
+                "horizon_depth": 4,
                 "horizon_embed_std": 0.8,
                 "head_init_calibration": True,
                 "a_head_gain": 2.0,
@@ -346,7 +346,8 @@ def test_every_generated_table_is_well_formed_markdown(tmp_path):
     is structural and runs over the whole emitted document rather than over one section.
     """
     write_arm(tmp_path, "low", beta=0.1, beta_prior=1.0e-3, d_z=24, reach=60, kept=(59, 23))
-    write_arm(tmp_path, "high", beta=1.0, beta_prior=1.0, d_z=64, pred_gap=-4.0)
+    # 96, not 64: the "high" arm has to sit above the shipped latent, and 64 is now the default.
+    write_arm(tmp_path, "high", beta=1.0, beta_prior=1.0, d_z=96, pred_gap=-4.0)
     out = tmp_path / "arms.md"
 
     assert verify.compare_arms(tmp_path, out) == 0

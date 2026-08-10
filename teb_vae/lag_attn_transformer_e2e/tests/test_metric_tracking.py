@@ -21,7 +21,6 @@ each placeholder with its own name, so a stem containing ``epoch=`` renders as `
 """
 from __future__ import annotations
 
-import inspect
 from pathlib import Path
 
 import pytest
@@ -250,10 +249,12 @@ def test_the_plotting_block_name_is_the_inherited_drivers_literal():
     """The callback assembly is inherited, so the key it reads is that module's spelling. A config
     that renamed the block to match this package would leave the figure permanently off, with the
     flag still reading ``enabled: true`` to anyone looking at the config -- and the figure is one of
-    the four readouts a run of this model has."""
-    source = inspect.getsource(LagAttnRwsTrainer.train_model)
+    the four readouts a run of this model has.
 
-    assert f'"{PLOTTING_BLOCK}"' in source
+    Asserted on the resolved attribute rather than on ``train_model``'s source: this driver could
+    also silence its own figure by overriding the key, which no reading of the inherited method
+    would show."""
+    assert LagAttnTrfE2ETrainer.PLOT_CONFIG_KEY == PLOTTING_BLOCK == LagAttnRwsTrainer.PLOT_CONFIG_KEY
     config = yaml.safe_load(_CONFIG.read_text(encoding="utf-8"))
     assert PLOTTING_BLOCK in config["advanced_config"]["callbacks"]
 

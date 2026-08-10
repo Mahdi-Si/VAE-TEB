@@ -251,6 +251,81 @@ def concat_single_forecasts(
     return out
 
 
+def select_forecast_channels(
+    truth: np.ndarray,
+    mu: np.ndarray,
+    sigma: np.ndarray,
+    *,
+    count: int = 3,
+    n_sigmas: float = 2.0,
+) -> Tuple[np.ndarray, np.ndarray]:
+    r"""Pick the target channels a forecast panel should draw, from the data rather than a config.
+
+    A multi-channel forecast cannot draw every channel, and the choice of which few to draw must
+    not be a configured list of indices: ``lag_attn`` carried a ``forecast_channels`` key until the
+    stored phase-harmonic block went from $44$ to $66$ channels and every inherited index silently
+    began naming a different coefficient. The rule here is a property of the run instead -- the
+    channels are ranked by how well the predictive Gaussian is calibrated on *this* batch, so the
+    same rule keeps meaning the same thing at any channel count.
+
+    Calibration is the $n\sigma$ coverage per channel, $\Pr(|Y^{+} - \mu| \le n\sigma)$ estimated
+    over every element of the block the caller passes. The returned channels are the extremes and
+    the middle of that ranking -- worst first, then evenly spaced positions up to the best -- which
+    is what makes the panel show a failure if there is one and a representative success if there is
+    not. Drawing only the worst would make every panel look broken; drawing only the best, the
+    opposite.
+
+    Ties are broken by channel index (the sort is stable), and ``NaN`` positions are ignored, so
+    the answer is a deterministic function of the arrays handed in. A channel with no finite
+    element at all scores $0$ and therefore sorts as worst, which is the honest outcome: a channel
+    that could not be scored is exactly the one worth looking at.
+
+    Args:
+        truth: The forecast target, any shape whose **last** axis is the channel.
+        mu: The predictive mean, broadcastable against ``truth``.
+        sigma: The predictive standard deviation, broadcastable against ``truth``.
+        count: How many channels to return. Clipped to the channel count.
+        n_sigmas: Width of the predictive interval coverage is measured over.
+
+    Returns:
+        ``(indices, coverage)`` -- the chosen channel indices, positional into ``truth``'s last
+        axis and ordered worst-calibrated first, and the per-channel coverage of **every** channel
+        so a caller can label the ones it draws without recomputing the statistic.
+
+    Raises:
+        ValueError: If ``truth`` has no channel axis, or ``count`` is not positive.
+    """
+    if truth.ndim < 1 or truth.shape[-1] < 1:
+        raise ValueError(f"truth must have a non-empty channel axis, got shape {truth.shape}")
+    if count < 1:
+        raise ValueError(f"count must be >= 1, got {count}")
+
+    n_channels = int(truth.shape[-1])
+    inside = np.abs(truth - mu) <= float(n_sigmas) * sigma
+    # Scored only where all three arrays are finite. The forecast block is NaN wherever no anchor
+    # covered the position, and counting those as misses would rank a channel by how much of the
+    # recording the tiling happened to reach rather than by how well it was predicted.
+    scored = np.isfinite(truth) & np.isfinite(mu) & np.isfinite(sigma)
+    flat_inside = np.broadcast_to(inside & scored, truth.shape).reshape(-1, n_channels)
+    flat_scored = np.broadcast_to(scored, truth.shape).reshape(-1, n_channels)
+    counts = flat_scored.sum(axis=0)
+    coverage = np.divide(
+        flat_inside.sum(axis=0).astype(np.float64),
+        np.where(counts > 0, counts, 1).astype(np.float64),
+    )
+    coverage[counts == 0] = 0.0
+
+    # Stable, so equal coverages come back in channel order and the selection is reproducible.
+    ranked = np.argsort(coverage, kind="stable")
+    take = min(int(count), n_channels)
+    # Evenly spaced positions in the ranking, ends included: worst, ..., best. `linspace` with
+    # `take == 1` gives the worst alone, which is the shipped single-channel rule this generalises.
+    positions = np.unique(
+        np.linspace(0, n_channels - 1, num=take).round().astype(int)
+    )
+    return ranked[positions], coverage
+
+
 def stack_feature_blocks(
     top: np.ndarray, bottom: Optional[np.ndarray]
 ) -> Tuple[np.ndarray, Optional[int]]:

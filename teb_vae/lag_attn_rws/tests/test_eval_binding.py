@@ -54,6 +54,7 @@ RWS_GEOMETRY_KEYS = (
     "max_lag",
     "num_heads",
     "d_head",
+    "horizon_attention_blocks",
     "causal_norm",
 )
 
@@ -308,7 +309,7 @@ def reference() -> Dict[str, Any]:
 
 
 #: The model keys the reference manifest was captured under, restated here because the shipped
-#: config has since moved off three of the four and this gate must not move with it.
+#: config has since moved off six of the seven and this gate must not move with it.
 #: ``source_dropout`` is the exception and is pinned rather than restored: it still ships at
 #: ``null``, which resolves to the pre-key model at every site it touches, so the entry records
 #: the capture condition instead of overriding it -- see the exemption in
@@ -322,15 +323,25 @@ def reference() -> Dict[str, Any]:
 #: that have nothing to do with the seam, and the gate would have been reporting a refactor
 #: failure that did not happen.
 #:
+#: The three decoder keys are the same story one revision later. ``tiny.yaml`` names neither the
+#: decoder's width nor its depth, so both are inherited live from ``default.yaml`` -- and the
+#: capacity revision moved all three, which changes the decoder's *weights* and therefore every
+#: forecast digest in the manifest. Pinned at the capture's geometry, they hold the checkpoint at the
+#: model the manifest describes. ``d_z`` needs no entry: ``tiny.yaml`` sets it itself, so the flip in
+#: ``default.yaml`` never reaches this fixture.
+#:
 #: So the checkpoint this gate evaluates is trained at the legacy values, and the shipped values
 #: are asserted elsewhere -- in the config-load tests, which is where a claim about a committed
 #: file belongs. Regenerating the manifest instead would have destroyed the only record of what
 #: the pipeline produced before the seam was opened; see the ``reference`` fixture.
-LEGACY_MODEL_KEYS = {
+LEGACY_MODEL_KEYS: Dict[str, Any] = {
     "causal_reach_budget_s": None,
     "base_decode": "sample",
     "posterior_logvar_mode": "residual",
     "source_dropout": None,
+    "decoder_hidden": 128,
+    "horizon_depth": 3,
+    "horizon_attention_blocks": 0,
 }
 
 

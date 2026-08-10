@@ -4,9 +4,10 @@ The rule and its rationale live in ``teb_vae/lag_attn/tests/test_nets_are_framew
 machinery is imported rather than restated, exactly as both sibling packages' own copies do. One
 extension is needed and it is the same one: the shared ``_ALLOWED_ROOTS`` admits ``teb_vae``
 wholesale -- necessarily, since this package reuses net layers from three sibling packages -- and
-that would wave through an import of any of their Lightning tasks, trainers, plotting, config
-loaders, evaluation packages or test helpers. Those are forbidden by dotted prefix instead, on all
-**four** packages, so a net stays constructible without the framework around it.
+that would wave through an import of any of their Lightning tasks, trainers, plotting, diagnostic
+pages, config loaders, evaluation packages or test helpers. Those are forbidden by dotted prefix
+instead, on **all six packages of the family**, so a net stays constructible without the framework
+around it.
 
 This package's own ``nets`` is included in the ban even though nothing under it could import its own
 task today: the task does not exist yet, and a guard whose coverage lags the package it guards is a
@@ -44,10 +45,17 @@ _PACKAGES = (
     "lag_attn_rws",
     "lag_attn_transformer_rws",
     "lag_attn_transformer_e2e",
+    "lag_attn_fs",
+    "lag_attn_transformer_fs",
 )
 
 #: Everything under a ``teb_vae`` package that is not a net layer.
-_FRAMEWORK_MODULES = ("task", "trainer", "plotting", "config", "eval", "tests")
+#:
+#: ``sample_page`` is here for the same reason ``plotting`` is, and is the easier one to forget:
+#: both modules import matplotlib and ``utils.style``, and a net that reached one for a row builder
+#: would need a figure backend to construct. The page is reached through the task, which is where
+#: the batch field names and the drawing both belong.
+_FRAMEWORK_MODULES = ("task", "trainer", "plotting", "sample_page", "config", "eval", "tests")
 
 _FRAMEWORK_PREFIXES = tuple(
     f"teb_vae.{package}.{module}" for package in _PACKAGES for module in _FRAMEWORK_MODULES
@@ -104,9 +112,9 @@ def test_module_names_no_batch_fields(path):
     )
 
 
-def test_the_dotted_ban_covers_all_four_packages():
-    """The extension is only worth having if it names every package a net could reach into, and
-    this package is now the fourth."""
+def test_the_dotted_ban_covers_every_package_in_the_family():
+    """The extension is only worth having if it names every package a net could reach into, and a
+    new sibling arriving is exactly the event that makes a hand-kept list go stale."""
     for package in _PACKAGES:
         for module in _FRAMEWORK_MODULES:
             assert f"teb_vae.{package}.{module}" in _LOCAL_FORBIDDEN_PREFIXES

@@ -1,0 +1,21 @@
+# Calibration arm: latent width d_z = 96 (shipped 64).
+#
+# The upper bracket the capacity revision opened. z is the decoder's only input -- there is no
+# state bypass in this architecture -- so the latent is the model's narrowest point, and the raise
+# from 48 to 64 was an argument rather than a measurement. This arm is what turns it into one.
+# +126,063 parameters, all of it the heads that read and write z; 96 = 4 groups of 24, so the
+# head-structured posterior still divides evenly.
+#
+# Everything else is inherited from default.yaml -- including the KL weight, so revising
+# default.yaml's beta_schedule.end to the KL-weight sweep's winner flows into this arm without
+# touching it. One resolved key differs, so a metric difference between arms has one explanation.
+# Deliberately no per-arm tag or MLflow run name: either would be a second delta; a run is
+# identified by its TEB_RUN_STAMP directory and its resolved-config artifact.
+#
+#   TEB_RUN_STAMP="$(date '+%Y-%m-%d--[%H-%M]')" torchrun --nproc_per_node=7 \
+#       -m teb_vae.lag_attn_rws.trainer --config teb_vae/lag_attn_rws/configs/sweep_dz_96.yaml
+base: default.yaml
+
+model_config:
+  VAE_model:
+    d_z: 96    # divisible by num_heads (4), required by the head-structured posterior

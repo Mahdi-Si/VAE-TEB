@@ -112,9 +112,36 @@ model_config:
     lambda_full: 1.0
     lambda_base: 1.0
 
+    # --- Auxiliary shape terms --------------------------------------------------
+    # Three shape penalties on the forecast MEANS of both branches, added to the criterion beside
+    # the two reconstruction terms. The factorized Gaussian NLL scores every raw sample
+    # independently, so its optimum is the conditional mean and a fully parallel decoder is free to
+    # emit an over-smoothed one: the per-sample likelihood cannot tell a forecast that has the right
+    # envelope, slope and starting level from one that merely has the right average. These terms can.
+    #
+    # Identical to the comparison model's values on purpose: the objective is shared code and the
+    # target is the same 480-sample raw block, so a different weight here would be a second
+    # difference between the two runs.
+    #
+    # A term is computed ONLY when its weight is nonzero; at 0.0 its metric is reported as exact 0.0
+    # rather than as the term's would-be value. The branch reads a config-constant float, identical
+    # on every rank and every batch, so DDP graph identity is unaffected.
+    #
+    # UNITS: these are L1 and Huber quantities on z-scored raw samples, not nats. `total_loss` is
+    # therefore a weighted MIXED-UNIT criterion; the pure-nats readouts are the NLL metrics.
+    #
+    # PROVISIONAL, all three -- see the comparison model's config for the derivation and the
+    # re-derivation procedure.
+    lambda_ms: 0.1
+    lambda_deriv: 0.1
+    lambda_boundary: 0.05
+
     # --- Backbone widths -------------------------------------------------------
     d_model: 128
-    d_z: 48                # the latent must carry the whole FHR predictive state; sweep axis
+    # The latent must carry the whole FHR predictive state, and it is the decoder's ONLY input --
+    # there is no state bypass here -- so it is the model's narrowest point. 64 = 4 groups of 16,
+    # divisible by num_heads as the head-structured posterior requires. Sweep axis.
+    d_z: 64
     horizon: 30            # H = 30 decimated steps = 2 min forecast
     raw_per_step: 16       # R raw samples per horizon token; horizon * R = 480 per anchor
     # First 2 minutes ignored in every loss, and the hard ceiling on the front ends' backward
@@ -160,7 +187,9 @@ model_config:
     # Those arms exist as files only in teb_vae/lag_attn_transformer_rws/configs/ -- for this
     # package the arm is a one-key override of this file, not a config that is already here.
     source_dropout: null
-    decoder_hidden: 128
+    # Hidden width of the shared horizon decoder core. 256, doubled with the latent above: the
+    # decoder is the only thing standing between one latent vector and 480 raw samples.
+    decoder_hidden: 256
     # Inherited from a decoder that emitted feature coefficients; the right bounds for a
     # z-scored raw FHR target are unknown until the first run's log-variance distributions
     # are inspected.
@@ -251,9 +280,13 @@ model_config:
     # heads and latent groups; they happen to agree here and nothing may couple them. The derived
     # head width d_model / encoder_num_heads = 32 must be even (rotary position encoding).
     encoder_num_heads: 4
-    encoder_d_ff: 256
-    # Full causal prefix for the target: the prior must condition on all of Y_{<=t}.
-    target_attention_blocks: 4
+    # SwiGLU feed-forward hidden width. 512 = 4 * d_model, the ratio a Transformer block
+    # conventionally carries; this shipped at 256 (2x).
+    encoder_d_ff: 512
+    # Full causal prefix for the target: the prior must condition on all of Y_{<=t}. Six blocks:
+    # the target encoder is what the conditional prior reads, so its depth sets how much of the
+    # forecast the target-only branch can carry alone.
+    target_attention_blocks: 6
     # Bounded causal window for the source, so the source state's reach stays SHORTER than the
     # 360 s lag search range: the encoder characterises a local source neighbourhood and the lag
     # attention selects which one.
@@ -280,9 +313,17 @@ model_config:
     query_uses_logvar: false
 
     # --- Shared horizon decoder core -------------------------------------------
-    horizon_depth: 3
+    # Four dilated refine blocks, so the dilations are (1, 2, 4, 8) and the receptive field over the
+    # horizon axis is 31 -- one more than the 30 horizon tokens. At depth 3 it was 15.
+    horizon_depth: 4
     horizon_kernel: 3
     horizon_film: true
+    # Bidirectional self-attention over the H horizon tokens, run inside the shared decoder core
+    # after the dilated refine stack. The convolutions mix horizon steps through a fixed local
+    # window; these mix all H at once, so the forecast is shaped as a whole rather than assembled
+    # from overlapping neighbourhoods. 0 builds no module, leaving the core exactly as it is
+    # without them. Head count is the core's own (4) and has no key: no arm varies it.
+    horizon_attention_blocks: 2
 
     # --- Initialisation policies (zero-parameter) ------------------------------
     # Applied after the generic init; each is a no-op at the constructor default, so an init-off
@@ -437,7 +478,15 @@ advanced_config:
   #
   # This exact configuration has already cost this repository a run: a breaker that trains
   # normally for eighty epochs and then skips every batch forever leaves a frozen validation
-  # number and nothing else. PROVISIONAL margin -- re-derive from the first real run's observed
+  # number and nothing else.
+  #
+  # `main_loss` IS the optimised total, so the three auxiliary shape terms are inside the watched
+  # quantity and the margin now bounds the movement of a mixed-unit criterion rather than of a pure
+  # nat count. At the shipped weights the aux contribution is small beside a 480-sample summed NLL,
+  # so the margin is not rescaled for it -- an expectation rather than a measurement, and one more
+  # thing the re-derivation below settles.
+  #
+  # PROVISIONAL margin -- re-derive from the first real run's observed
   # main_loss fluctuation; until then the non-finite guard is the hard protection.
   spike_breaker:
     enabled: true

@@ -83,17 +83,31 @@ def _unreached(model: SeqVaeLagAttnTrfRws) -> List[str]:
 
 
 @pytest.mark.parametrize("beta_prior", [0.0, 1.0e-2], ids=["unanchored", "anchored"])
-def test_every_parameter_is_reachable_under_the_unguarded_configuration(tiny_kwargs, beta_prior):
+@pytest.mark.parametrize(
+    "horizon_attention_blocks", [0, 2], ids=["attention-off", "attention-on"]
+)
+def test_every_parameter_is_reachable_under_the_unguarded_configuration(
+    tiny_kwargs, beta_prior, horizon_attention_blocks
+):
     """Both anchor weights: the prior scale rate is the one objective term a config can switch
-    on, and the reachability claim must hold for the objective production actually optimises."""
+    on, and the reachability claim must hold for the objective production actually optimises.
+
+    Both horizon-attention depths for the same reason: the decoder's attention parameters are on
+    a path both branches traverse, but "must be" and "is" are different claims and only the second
+    one stops a production run hanging on the reducer.
+    """
     torch.manual_seed(0)
-    model = SeqVaeLagAttnTrfRws(**tiny_kwargs)
+    model = SeqVaeLagAttnTrfRws(
+        **dict(tiny_kwargs, horizon_attention_blocks=horizon_attention_blocks)
+    )
 
     _loss(model, SEQ_LEN, beta_prior=beta_prior).backward()
 
     assert not _unreached(model), (
         f"unreachable under find_unused_parameters=False: {_unreached(model)}"
     )
+    attention = [name for name, _ in model.named_parameters() if ".attention." in name]
+    assert len(attention) == 7 * horizon_attention_blocks, attention
 
 
 @pytest.mark.parametrize("beta_prior", [0.0, 1.0e-2], ids=["unanchored", "anchored"])
@@ -156,11 +170,19 @@ def test_the_probe_catches_a_parameter_that_is_genuinely_dangling(tiny_kwargs):
     assert _unreached(model) == ["orphan"]
 
 
-def test_the_frozen_output_projection_is_excluded_rather_than_unreachable(tiny_kwargs):
+@pytest.mark.parametrize(
+    "horizon_attention_blocks", [0, 2], ids=["attention-off", "attention-on"]
+)
+def test_the_frozen_output_projection_is_excluded_rather_than_unreachable(
+    tiny_kwargs, horizon_attention_blocks
+):
     """The lag attention's $W_o$ feeds nothing and would be permanently unreachable; clearing
-    ``requires_grad`` is what keeps it out of the reducer's expectation set instead."""
+    ``requires_grad`` is what keeps it out of the reducer's expectation set instead. It stays the
+    *only* frozen tensor with the horizon attention on: those parameters train."""
     torch.manual_seed(0)
-    model = SeqVaeLagAttnTrfRws(**tiny_kwargs)
+    model = SeqVaeLagAttnTrfRws(
+        **dict(tiny_kwargs, horizon_attention_blocks=horizon_attention_blocks)
+    )
 
     frozen = [name for name, p in model.named_parameters() if not p.requires_grad]
 

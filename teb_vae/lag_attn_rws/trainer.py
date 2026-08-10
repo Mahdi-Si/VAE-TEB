@@ -32,7 +32,7 @@ import os
 import sys
 import tempfile
 import time
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 #: Repository root: ``teb_vae/lag_attn_rws/trainer.py`` -> up three.
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -82,6 +82,13 @@ _METRIC_SUFFIXES = (
     # into the anchor term, so a collapsing prior is visible in any run's CSV; the echoed
     # weight is what lets a metrics_history.csv identify its own arm.
     "prior_rate", "beta_prior",
+    # The three auxiliary shape terms and their echoed weights. Unlike the prior rate these are
+    # zero whenever their weight is zero -- the objective does not compute an unweighted shape
+    # term -- so the pair of columns is what distinguishes "the term was off" from "the term was
+    # on and small". They are L1/Huber quantities, not nats: total_loss carries them and the
+    # nll_* columns are the pure-nats readouts.
+    "aux_multiscale", "aux_derivative", "aux_boundary",
+    "lambda_ms", "lambda_deriv", "lambda_boundary",
     "anchor_coverage_frac",
     # The decoder-output variances (mean_logvar_full/base) do NOT detect a prior variance
     # pinned on its clamp; mean_logvar_prior and logvar_prior_floor_frac are the watch for the
@@ -167,9 +174,43 @@ class LagAttnRwsTrainer(GraphModelBase):
     #: placeholder with its own name, so this must not itself contain ``epoch=``.
     CHECKPOINT_STEM = "lag-attn-rws"
 
+    #: Loader fields the reconstruction target is built from, checked by ``main``'s normalisation
+    #: guard. A class attribute beside the three above and for the same reason: a sibling
+    #: forecasting another domain re-points it instead of copying the guard, and the guard keeps
+    #: running from ``main`` where no subclass can drop it.
+    TARGET_FIELDS: Tuple[str, ...] = ("fhr",)
+
+    #: The framework metric names this driver collects into ``metrics_history.csv``. An attribute
+    #: rather than the module global read directly, so a sibling emitting extra metrics adds them
+    #: here instead of overriding ``train_model`` -- which is 75 lines of callback assembly whose
+    #: copy would be free to drift from this one.
+    TRACKED_METRICS: Tuple[str, ...] = _TRACKED_METRICS
+
+    #: Config block the diagnostic plotter reads its settings from. Deliberately not derived from
+    #: the package name: a sibling that renames it to match its own package gets no figure, no
+    #: error and nothing in the log saying why.
+    PLOT_CONFIG_KEY = "lag_attn_rws_plotting"
+
     #: The causal guard this run resolved, populated by :meth:`_build_model_kwargs` and read by
     #: :meth:`create_model` for the startup log. ``None`` means no reach budget is configured.
     resolved_budget: Optional[ChannelBudget] = None
+
+    @classmethod
+    def plot_callback_cls(cls) -> type[Callback]:
+        """Return the diagnostic-plot callback class, importing it on the way.
+
+        A method rather than a class attribute because the import must stay **lazy**: the
+        callback pulls matplotlib, and a module-level attribute would import it in every run
+        whether or not the config asked for a figure. Called only inside ``train_model``'s
+        enabled branch, so enabling the flag before the module exists still fails loudly at the
+        import rather than silently plotting nothing.
+
+        Returns:
+            The callback class ``train_model`` constructs.
+        """
+        from teb_vae.lag_attn_rws.plotting import LagAttnRwsPlotCallback
+
+        return LagAttnRwsPlotCallback
 
     @classmethod
     def preflight(cls, config: Dict[str, Any]) -> None:
@@ -321,6 +362,9 @@ class LagAttnRwsTrainer(GraphModelBase):
             lambda_base=vae_config.get("lambda_base", 1.0),
             likelihood=vae_config.get("likelihood", "gaussian_nll"),
             free_bits=vae_config.get("free_bits", 0.0),
+            lambda_ms=vae_config.get("lambda_ms", 0.0),
+            lambda_deriv=vae_config.get("lambda_deriv", 0.0),
+            lambda_boundary=vae_config.get("lambda_boundary", 0.0),
             compile_model=self.compile_model_requested(),
         )
         # Re-forces the config's values onto hparams, so a checkpoint-restored run follows the
@@ -435,7 +479,7 @@ class LagAttnRwsTrainer(GraphModelBase):
         callbacks_config = self.config.get("advanced_config", {}).get("callbacks", {}) or {}
         checkpoint_config = callbacks_config.get("model_checkpoint", {}) or {}
 
-        self.metrics_callback = MetricsLoggingCallback(tracked_metrics=_TRACKED_METRICS)
+        self.metrics_callback = MetricsLoggingCallback(tracked_metrics=self.TRACKED_METRICS)
         self.metrics_csv_callback = MetricsHistoryCsvCallback(
             source=self.metrics_callback, output_dir=self.train_results_dir
         )
@@ -472,15 +516,15 @@ class LagAttnRwsTrainer(GraphModelBase):
             self.checkpoint_callback,
         ]
 
-        # The diagnostic plotter is opt-in and pulls matplotlib, so it is imported only when the
-        # config asks for it. Enabling the flag before the plotting module exists fails loudly
-        # at this import rather than silently plotting nothing.
-        plot_config = callbacks_config.get("lag_attn_rws_plotting", {}) or {}
+        # The diagnostic plotter is opt-in and pulls matplotlib, so the class -- and with it the
+        # import -- is resolved only when the config asks for it.
+        plot_config = callbacks_config.get(self.PLOT_CONFIG_KEY, {}) or {}
         if plot_config.get("enabled", False):
-            from teb_vae.lag_attn_rws.plotting import LagAttnRwsPlotCallback
-
+            # Bound loosely: the seam's contract is "a Callback", while the keywords below are
+            # this callback's own and a sibling's replacement is free to take more.
+            plot_callback_cls: Any = self.plot_callback_cls()
             callback_list.append(
-                LagAttnRwsPlotCallback(
+                plot_callback_cls(
                     output_dir=self.train_results_dir,
                     # The same knob the HTML loss plot above uses -- `general_config.
                     # plot_frequency` -- and deliberately not a second key under this block.
@@ -532,7 +576,9 @@ def main(config_path: str, trainer_cls: type[LagAttnRwsTrainer] = LagAttnRwsTrai
         graph_model = trainer_cls(config_file_path=resolved_path)
         _check_stat_path(graph_model.config)
         _check_declared_widths_against_shard(graph_model.config)
-        _check_raw_target_normalized(graph_model.config)
+        _check_raw_target_normalized(
+            graph_model.config, fields=trainer_cls.TARGET_FIELDS
+        )
         _check_causal_budget_resolves(graph_model.config)
         # After the four, before setup_config: the four are this architecture's and stay called
         # by name here (three other places import them individually and assert on this order),
@@ -689,20 +735,30 @@ def _check_declared_widths_against_shard(config: Dict[str, Any]) -> None:
         )
 
 
-def _check_raw_target_normalized(config: Dict[str, Any]) -> None:
-    """Refuse to start unless the raw FHR target is loaded *and* normalized.
+def _check_raw_target_normalized(
+    config: Dict[str, Any], *, fields: Sequence[str] = ("fhr",)
+) -> None:
+    """Refuse to start unless every field the target is built from is loaded *and* normalized.
 
-    Specific to this model: the raw ``fhr`` is the reconstruction target. Without it in
-    ``load_fields`` the task fails on the first batch (late, after every rank initialised);
-    without it in ``normalize_fields`` nothing fails at all -- the target arrives at ~140 bpm
-    scale, the Gaussian NLL is computed against a z-scale variance model, and the run trains a
-    meaningless objective to completion.
+    Without a target field in ``load_fields`` the task fails on the first batch (late, after
+    every rank initialised); without it in ``normalize_fields`` nothing fails at all -- the
+    target arrives at ~140 bpm scale, the Gaussian NLL is computed against a z-scale variance
+    model, and the run trains a meaningless objective to completion.
+
+    ``fields`` is a parameter rather than the literal ``'fhr'`` because which fields carry the
+    target is the one thing a sibling architecture forecasting another domain changes about this
+    check. The default is this model's, so the three places that call the guard with one argument
+    -- the evaluation's preflight among them -- are unaffected; ``main`` passes the driver's
+    ``TARGET_FIELDS``. The guard deliberately stays in ``main``'s by-name list rather than moving
+    behind the ``preflight`` hook, whose documented no-op property is what makes a bare-bodied
+    override safe.
 
     Args:
         config: The resolved run config.
+        fields: Loader field names the reconstruction target is built from.
 
     Raises:
-        ValueError: Naming the offending config key when ``'fhr'`` is missing from either list.
+        ValueError: Naming the offending field and the offending list.
     """
     dataloader_config = (config.get("dataset_config", {}) or {}).get(
         "dataloader_config", {}
@@ -710,16 +766,23 @@ def _check_raw_target_normalized(config: Dict[str, Any]) -> None:
     load_fields = (dataloader_config.get("dataset_kwargs", {}) or {}).get("load_fields") or []
     normalize_fields = dataloader_config.get("normalize_fields") or []
 
+    # Field by field, so a config carrying one of a two-field target is refused naming the one
+    # it is missing rather than the pair.
     missing = []
-    if "fhr" not in load_fields:
-        missing.append("dataset_config.dataloader_config.dataset_kwargs.load_fields")
-    if "fhr" not in normalize_fields:
-        missing.append("dataset_config.dataloader_config.normalize_fields")
+    for field in fields:
+        if field not in load_fields:
+            missing.append(
+                f"'{field}' in dataset_config.dataloader_config.dataset_kwargs.load_fields"
+            )
+        if field not in normalize_fields:
+            missing.append(
+                f"'{field}' in dataset_config.dataloader_config.normalize_fields"
+            )
     if missing:
         raise ValueError(
-            "'fhr' must be listed in " + " and in ".join(missing) + ": the raw FHR is this "
-            "model's reconstruction target, and an unnormalized target makes the Gaussian NLL "
-            "meaningless with nothing else raising."
+            "this model's reconstruction target requires " + " and ".join(missing) + ": an "
+            "unloaded target field fails on the first batch and an unnormalized one makes the "
+            "Gaussian NLL meaningless with nothing else raising."
         )
 
 

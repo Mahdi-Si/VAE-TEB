@@ -20,6 +20,7 @@ test in this package that claims to check KL behaviour perturbs first.
 """
 from __future__ import annotations
 
+import pytest
 import torch
 
 from teb_vae.lag_attn_transformer_rws.nets.model import SeqVaeLagAttnTrfRws
@@ -27,6 +28,15 @@ from teb_vae.lag_attn_transformer_rws.nets.model import SeqVaeLagAttnTrfRws
 #: Above which a perturbed KL counts as genuinely nonzero. Far below any meaningful coupling and
 #: far above float noise on a collapsed one.
 _TOL = 1e-6
+
+#: Every test here runs twice: with the horizon core's self-attention off and with it on. The
+#: second parametrisation is where the attention's own dropout-freedom is *proved* rather than
+#: read off its source -- ``mu_base`` and ``mu_full`` come from two invocations of one core in
+#: train mode, so any stochastic path anywhere inside it, module or functional, breaks their
+#: bitwise equality. A separate determinism assertion would say less than this one does.
+pytestmark = pytest.mark.parametrize(
+    "horizon_attention_blocks", [0, 2], ids=["attention-off", "attention-on"]
+)
 
 
 def _closed_form_kl(out: dict) -> torch.Tensor:
@@ -44,11 +54,13 @@ def _closed_form_kl(out: dict) -> torch.Tensor:
     )
 
 
-def _forward(tiny_kwargs, inputs, perturb=None, *, train: bool = True):
+def _forward(tiny_kwargs, inputs, blocks, perturb=None, *, train: bool = True):
     # Dropout deliberately ON: the bitwise identities below must hold with the encoders dropping
     # activations, because only the decoder and both attentions are dropout-free.
     torch.manual_seed(0)
-    model = SeqVaeLagAttnTrfRws(**dict(tiny_kwargs, dropout=0.1))
+    model = SeqVaeLagAttnTrfRws(
+        **dict(tiny_kwargs, dropout=0.1, horizon_attention_blocks=blocks)
+    )
     if perturb is not None:
         perturb(model)
     model.train(train)
@@ -56,8 +68,8 @@ def _forward(tiny_kwargs, inputs, perturb=None, *, train: bool = True):
     return model(*inputs)
 
 
-def test_the_kl_is_exactly_zero_at_init(tiny_kwargs, inputs):
-    out = _forward(tiny_kwargs, inputs)
+def test_the_kl_is_exactly_zero_at_init(tiny_kwargs, inputs, horizon_attention_blocks):
+    out = _forward(tiny_kwargs, inputs, horizon_attention_blocks)
     assert float(_closed_form_kl(out).abs().max()) == 0.0
     # The model's own readouts agree: per-step KL and its lag attribution are exactly zero.
     assert float(out["kld_per_t"].abs().max()) == 0.0
@@ -65,33 +77,40 @@ def test_the_kl_is_exactly_zero_at_init(tiny_kwargs, inputs):
     assert float(out["kld_per_t_per_head"].abs().max()) == 0.0
 
 
-def test_the_posterior_equals_the_prior_at_init(tiny_kwargs, inputs):
-    out = _forward(tiny_kwargs, inputs)
+def test_the_posterior_equals_the_prior_at_init(tiny_kwargs, inputs, horizon_attention_blocks):
+    out = _forward(tiny_kwargs, inputs, horizon_attention_blocks)
     assert torch.equal(out["mu_post"], out["mu_prior"])
     assert torch.equal(out["logvar_post"], out["logvar_prior"])
 
 
-def test_the_latent_samples_are_identical_at_init(tiny_kwargs, inputs):
-    out = _forward(tiny_kwargs, inputs)
+def test_the_latent_samples_are_identical_at_init(tiny_kwargs, inputs, horizon_attention_blocks):
+    out = _forward(tiny_kwargs, inputs, horizon_attention_blocks)
     assert torch.equal(out["z_prior"], out["z_post"])
 
 
-def test_base_and_full_forecasts_are_bitwise_identical_in_train_mode(tiny_kwargs, inputs):
+def test_base_and_full_forecasts_are_bitwise_identical_in_train_mode(
+    tiny_kwargs, inputs, horizon_attention_blocks
+):
     """The identity that decoder dropout would break: one module, two invocations, two independent
-    masks. Zero dropout in the decoder is what makes this exact."""
-    out = _forward(tiny_kwargs, inputs)
+    masks. Zero dropout in the decoder is what makes this exact -- and under the attention-on
+    parametrisation it is also the proof that the horizon attention draws no mask of its own."""
+    out = _forward(tiny_kwargs, inputs, horizon_attention_blocks)
     assert torch.equal(out["mu_base"], out["mu_full"])
     assert torch.equal(out["logvar_base"], out["logvar_full"])
 
 
-def test_the_encoder_dropout_is_actually_active_in_train_mode(tiny_kwargs, inputs):
+def test_the_encoder_dropout_is_actually_active_in_train_mode(
+    tiny_kwargs, inputs, horizon_attention_blocks
+):
     """The control for the paragraph above: if dropout were inert in train mode, every identity in
     this file would hold for reasons that say nothing about one common encoder forward.
 
     Two train-mode passes over the same input, seeded differently, must differ.
     """
     torch.manual_seed(0)
-    model = SeqVaeLagAttnTrfRws(**dict(tiny_kwargs, dropout=0.1)).train()
+    model = SeqVaeLagAttnTrfRws(
+        **dict(tiny_kwargs, dropout=0.1, horizon_attention_blocks=horizon_attention_blocks)
+    ).train()
 
     torch.manual_seed(1)
     first = model(*inputs)["target_state"]
@@ -101,10 +120,10 @@ def test_the_encoder_dropout_is_actually_active_in_train_mode(tiny_kwargs, input
     assert not torch.equal(first, second), "dropout is not active; the train-mode claims are empty"
 
 
-def test_the_same_identities_hold_under_eval(tiny_kwargs, inputs):
+def test_the_same_identities_hold_under_eval(tiny_kwargs, inputs, horizon_attention_blocks):
     """``eval()`` is the mode the diagnostic figure and the permutation control run in, so the
     identities are asserted there too rather than inferred from the train-mode ones."""
-    out = _forward(tiny_kwargs, inputs, train=False)
+    out = _forward(tiny_kwargs, inputs, horizon_attention_blocks, train=False)
 
     assert float(out["kld_per_t"].abs().max()) == 0.0
     assert torch.equal(out["z_prior"], out["z_post"])
@@ -112,13 +131,15 @@ def test_the_same_identities_hold_under_eval(tiny_kwargs, inputs):
     assert torch.equal(out["logvar_base"], out["logvar_full"])
 
 
-def test_everything_above_becomes_false_once_perturbed(tiny_kwargs, inputs, perturb_posterior):
+def test_everything_above_becomes_false_once_perturbed(
+    tiny_kwargs, inputs, perturb_posterior, horizon_attention_blocks
+):
     """The zero must be a property of the init, not of the model being unable to produce a KL.
 
     Without this, a model whose KL was structurally stuck at zero -- a broken posterior, a detached
     graph, a source encoder returning a constant -- would pass every test above.
     """
-    out = _forward(tiny_kwargs, inputs, perturb=perturb_posterior)
+    out = _forward(tiny_kwargs, inputs, horizon_attention_blocks, perturb=perturb_posterior)
     assert float(_closed_form_kl(out).abs().max()) > _TOL
     assert float(out["kld_per_t"].abs().max()) > _TOL
     assert not torch.equal(out["z_prior"], out["z_post"])

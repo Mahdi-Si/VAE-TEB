@@ -169,9 +169,9 @@ def write_run(
     model_class: Optional[str] = verify.THIS_MODEL_CLASS,
     window: Any = 16,
     window_absent: bool = False,
-    target_blocks: int = 4,
+    target_blocks: int = 6,
     source_blocks: int = 3,
-    d_ff: int = 256,
+    d_ff: int = 512,
     conv_kernels: Sequence[int] = (5, 9),
     reach: Optional[Any] = None,
     kept: Optional[Tuple[int, int]] = None,
@@ -219,7 +219,7 @@ def write_run(
     (results_dir / verify.SUMMARY_FILENAME).write_text(json.dumps(summary), encoding="utf-8")
 
     model: Dict[str, Any] = {
-        "d_z": 48,
+        "d_z": 64,
         "beta_prior": beta_prior,
         "causal_reach_budget_s": reach,
         "c_y": 109,
@@ -343,7 +343,7 @@ def test_every_arm_appears_in_every_sweep_table(tmp_path):
     module that filtered by "the axis this arm looks like it varies" would drop rows on the arms
     that vary two."""
     write_run(tmp_path, "window_8", window=8)
-    write_run(tmp_path, "target_5", target_blocks=5)
+    write_run(tmp_path, "target_8", target_blocks=8)
     write_run(tmp_path, "ff_384", d_ff=384)
     write_run(tmp_path, "reach_120", reach=120, kept=(78, 29))
     out = tmp_path / "arms.md"
@@ -360,7 +360,7 @@ def test_every_arm_appears_in_every_sweep_table(tmp_path):
         "## Encoder architecture arms",
     ):
         by_run = _by_run(_section(document, heading))
-        assert set(by_run) == {"window_8", "target_5", "ff_384", "reach_120"}, heading
+        assert set(by_run) == {"window_8", "target_8", "ff_384", "reach_120"}, heading
 
 
 def test_the_prior_anchor_arms_resolve_into_their_own_section(tmp_path):

@@ -139,13 +139,19 @@ def test_the_tiny_source_bound_stays_inside_the_sequence():
 
 def test_shipped_kwargs_is_the_production_geometry_not_a_miniature():
     assert SHIPPED_KWARGS["sequence_length"] == 300
-    assert SHIPPED_KWARGS["d_z"] == 48
+    assert SHIPPED_KWARGS["d_z"] == 64
     assert SHIPPED_KWARGS["max_lag"] == 90
     assert SHIPPED_KWARGS["encoder_conv_kernels"] == (5, 9)
     assert SHIPPED_KWARGS["encoder_conv_dilations"] == (1, 2)
-    assert SHIPPED_KWARGS["target_attention_blocks"] == 4
+    assert SHIPPED_KWARGS["encoder_d_ff"] == 512
+    assert SHIPPED_KWARGS["target_attention_blocks"] == 6
     assert SHIPPED_KWARGS["source_attention_blocks"] == 3
     assert SHIPPED_KWARGS["source_attention_window"] == 16
+    # The decoder side of the capacity bundle, which is shared code and therefore the half a
+    # miniature of this fixture would silently lose.
+    assert SHIPPED_KWARGS["decoder_hidden"] == 256
+    assert SHIPPED_KWARGS["horizon_depth"] == 4
+    assert SHIPPED_KWARGS["horizon_attention_blocks"] == 2
 
 
 def test_the_slow_marker_is_registered(request):

@@ -1,0 +1,33 @@
+# Ablate-one arm: horizon_attention_blocks = 0 (shipped 2).
+#
+# The shared decoder core runs bidirectional self-attention over the H = 30 horizon tokens after
+# its dilated refine stack. This arm removes it and leaves the convolutions alone, which is the
+# other half of the pair of mechanisms the capacity revision added to the decoder.
+#
+# What it isolates. The refine stack mixes horizon steps through a fixed local window; at
+# horizon_depth 4 its receptive field is 31 steps, so a token can reach the whole block through the
+# convolutions alone -- but only through a chain of them, and only with a weight schedule fixed at
+# construction. The attention mixes all 30 at once with content-dependent weights, so the forecast
+# is shaped as a whole rather than assembled from overlapping neighbourhoods. The question is
+# whether that distinction is worth its parameters once the refine stack already spans the horizon.
+#
+# The attention is symmetric over this axis on purpose, and removing it changes nothing about
+# causality: every step of the horizon is predicted from the same anchor t, so there is no future
+# on that axis to leak. Both arms are equally causal in the sense the module claims.
+#
+# What to read. `nll_full_block` and `nll_base_block` against the default's, and the per-epoch
+# diagnostic figure: the shape terms and the horizon attention aim at the same defect from the two
+# ends -- the criterion and the decoder -- so an arm that loses nothing here says the criterion was
+# doing the work alone. `sweep_aux_off.yaml` is the other end of that pair.
+#
+# -525,314 parameters, two attention blocks at the shipped decoder_hidden 256:
+# 2 * (4*256^2 + 2*256 + 1) -- four bias-free projections, one LayerNorm, one scalar residual gain.
+#
+#   TEB_RUN_STAMP="$(date '+%Y-%m-%d--[%H-%M]')" torchrun --nproc_per_node=7 \
+#       -m teb_vae.lag_attn_transformer_rws.trainer \
+#       --config teb_vae/lag_attn_transformer_rws/configs/sweep_horizon_attn_off.yaml
+base: default.yaml
+
+model_config:
+  VAE_model:
+    horizon_attention_blocks: 0

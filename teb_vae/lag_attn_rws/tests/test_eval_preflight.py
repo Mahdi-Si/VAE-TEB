@@ -319,7 +319,8 @@ def test_a_key_the_binding_drops_is_no_longer_refused(config, loaded) -> None:
 # Weight-space load verification
 # =============================================================================
 def test_a_freshly_constructed_model_is_refused(loaded) -> None:
-    """Every zero-initialised tensor is still zero, which no trained model produces."""
+    """Every witness tensor is still at the value the constructor gave it, which no trained model
+    produces."""
     torch.manual_seed(0)
     fresh = SeqVaeLagAttnRws(**TINY_KWARGS)
 
@@ -327,17 +328,64 @@ def test_a_freshly_constructed_model_is_refused(loaded) -> None:
         preflight.verify_weights_loaded(fresh)
 
     message = str(excinfo.value)
-    assert "still exactly zero" in message
+    assert "still exactly at the value the constructor gave it" in message
     # Both witnesses reported, so a reader can see the check was not vacuous.
     assert "delta_heads" in message and "film_generators" in message
 
 
+def test_a_freshly_constructed_model_with_horizon_attention_is_refused_too() -> None:
+    """The refusal must survive the witness set growing. The attention's residual gains start at a
+    *nonzero* constant, so a witness that reported $\\max|w|$ rather than the deviation from that
+    constant would carry "evidence" on every model ever built -- and this check could then never
+    fire again.
+    """
+    torch.manual_seed(0)
+    fresh = SeqVaeLagAttnRws(**dict(TINY_KWARGS, horizon_attention_blocks=2))
+
+    with pytest.raises(EvalPreconditionUnmet) as excinfo:
+        preflight.verify_weights_loaded(fresh)
+
+    assert "horizon_attention_gains" in str(excinfo.value)
+
+
 def test_the_loaded_checkpoint_passes_and_names_the_witness(loaded) -> None:
+    """The shipped configuration builds the horizon attention, so the record carries all three
+    groups. The third one is conditional on the model rather than always present: a blockless core
+    reports two, because an always-zero column in every such run's record would say less than its
+    absence does. Both halves are asserted here so the conditionality is pinned in one place."""
     record = preflight.verify_weights_loaded(loaded["model"])
 
     assert record["passed"] is True
     assert record["witnesses_with_evidence"], "no witness carried evidence"
-    assert set(record["max_abs_weight"]) == {"delta_heads", "film_generators"}
+    assert loaded["model"].horizon_core.attention is not None
+    assert set(record["max_abs_weight"]) == {
+        "delta_heads",
+        "film_generators",
+        "horizon_attention_gains",
+    }
+
+    torch.manual_seed(0)
+    blockless = SeqVaeLagAttnRws(**TINY_KWARGS)
+    assert blockless.horizon_core.attention is None
+    assert set(preflight.load_witnesses(blockless)) == {"delta_heads", "film_generators"}
+
+
+def test_a_trained_attention_gain_is_itself_evidence_of_a_load() -> None:
+    """The positive half. A gain that has moved off its construction constant can only have been
+    moved by training, so it is a load witness in its own right -- the one the two existing groups
+    cannot supply for a run whose posterior and FiLM path both stayed put."""
+    torch.manual_seed(0)
+    model = SeqVaeLagAttnRws(**dict(TINY_KWARGS, horizon_attention_blocks=2))
+    assert model.horizon_core.attention is not None
+    with torch.no_grad():
+        for block in model.horizon_core.attention:
+            block.residual_gain.add_(0.25)
+
+    record = preflight.verify_weights_loaded(model)
+
+    assert record["witnesses_with_evidence"] == ["horizon_attention_gains"]
+    assert record["max_abs_weight"]["delta_heads"] == 0.0
+    assert record["max_abs_weight"]["horizon_attention_gains"] == pytest.approx(0.25)
 
 
 def test_a_model_perturbed_only_through_its_posterior_still_passes(loaded) -> None:

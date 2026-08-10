@@ -9,8 +9,14 @@ The parameter budget is asserted as per-encoder subtotals and as *deltas*, never
 total. The encoders are what this package owns; everything downstream is imported, so a legitimate
 change to a shared component must not fail a test here. The absolute number belongs in the design
 record, checked against ``sum(p.numel() ...)`` rather than against a literal.
+
+The decoder's width is asserted here for the same reason the constructor's other decisions are: it
+is resolved by a method rather than read off a configuration key, so nothing in a config file says
+what it is and only the assembled model can be asked.
 """
 from __future__ import annotations
+
+import inspect
 
 import pytest
 import torch
@@ -33,16 +39,16 @@ from teb_vae.lag_attn_transformer_rws.tests.conftest import SHIPPED_KWARGS
 #: filter bank. At $d = 128$ that is $50{,}176$ at $k = 5$ and $50{,}688$ at $k = 9$.
 #:
 #: An attention block costs $4d^2 + 3d\,d_{\mathrm{ff}} + 4d$: four bias-free projections, the
-#: SwiGLU triple, and $d$ apiece for two norms and two LayerScale vectors -- $164{,}352$ at
-#: $d = 128$, $d_{\mathrm{ff}} = 256$.
+#: SwiGLU triple, and $d$ apiece for two norms and two LayerScale vectors -- $262{,}656$ at
+#: $d = 128$, $d_{\mathrm{ff}} = 512$.
 #:
 #: Each encoder then adds $d$ for its final RMSNorm. Target: $50{,}176 + 50{,}688 +
-#: 4 \cdot 164{,}352 + 128 = 758{,}400$. Source: the same stem, three attention blocks, one norm =
-#: $594{,}048$.
+#: 6 \cdot 262{,}656 + 128 = 1{,}676{,}928$. Source: the same stem, three attention blocks, one
+#: norm = $888{,}960$.
 _CONV_BLOCK_5, _CONV_BLOCK_9 = 50_176, 50_688
-_ATTENTION_BLOCK = 164_352
+_ATTENTION_BLOCK = 262_656
 _FINAL_NORM = 128
-_TARGET_ENCODER = _CONV_BLOCK_5 + _CONV_BLOCK_9 + 4 * _ATTENTION_BLOCK + _FINAL_NORM
+_TARGET_ENCODER = _CONV_BLOCK_5 + _CONV_BLOCK_9 + 6 * _ATTENTION_BLOCK + _FINAL_NORM
 _SOURCE_ENCODER = _CONV_BLOCK_5 + _CONV_BLOCK_9 + 3 * _ATTENTION_BLOCK + _FINAL_NORM
 
 #: The stem's cost across both streams, which is exactly what the stem-free architecture arm
@@ -66,9 +72,9 @@ _BANNED_ON_HISTORY_PATH = (
 )
 
 
-def _model(kwargs, **overrides) -> SeqVaeLagAttnTrfRws:
+def _model(kwargs, cls=SeqVaeLagAttnTrfRws, **overrides) -> SeqVaeLagAttnTrfRws:
     torch.manual_seed(0)
-    return SeqVaeLagAttnTrfRws(**dict(kwargs, **overrides))
+    return cls(**dict(kwargs, **overrides))
 
 
 def _n_parameters(**overrides) -> int:
@@ -293,20 +299,112 @@ def test_the_encoder_head_count_does_not_touch_the_latent_grouping(tiny_kwargs, 
 
 
 # ---------------------------------------------------------------------------------------
+# The decoder's width, and the hook that names it
+# ---------------------------------------------------------------------------------------
+#: Every parameter of the constructor, in order, ``self`` included. Written out because the
+#: configuration surface is pinned *against* this schema -- the trainer forwards a config block by
+#: sweeping it with ``inspect.signature``, and the design record lists the keys in both directions
+#: -- so a keyword arriving or leaving is a change to what a YAML file can say, not an internal
+#: detail. In particular there is no ``decoder_out_channels``: the width is the hook's to decide,
+#: and a keyword beside it could only ever disagree with the gate.
+_CONSTRUCTOR_PARAMETERS = (
+    "self", "sequence_length", "d_model", "d_z", "horizon", "raw_per_step", "warmup_period",
+    "c_y", "c_u", "use_up_st", "max_lag", "num_heads", "d_head", "dropout", "decoder_hidden",
+    "horizon_depth", "horizon_kernel", "horizon_film", "horizon_attention_blocks",
+    "horizon_embed_std",
+    "head_init_calibration", "a_head_gain", "encoder_conv_kernels", "encoder_conv_dilations",
+    "encoder_num_heads", "encoder_d_ff", "target_attention_blocks", "source_attention_blocks",
+    "source_attention_window", "logvar_clamp", "mu_scale", "delta_mu_scale", "delta_logvar_scale",
+    "posterior_logvar_mode", "source_dropout", "use_entmax", "attention_grad_checkpoint",
+    "lag_bias_init", "alibi_slope_scale", "query_uses_logvar", "coverage_floor", "base_decode",
+    "target_keep_index", "target_delays", "source_keep_index", "source_delays", "init_weights",
+)
+
+
+def test_the_decoder_emits_the_raw_samples_per_horizon_token(shipped_model):
+    """$R = 16$, read off the assembled head. No configuration key names it, so the model is the
+    only place the width can be asked -- and ``raw_per_step`` remains a *geometry* input that the
+    width happens to equal here, which is why both are asserted rather than one."""
+    assert shipped_model.decoder_out_channels == shipped_model.raw_per_step == 16
+    assert shipped_model.decoder.out_channels == 16
+    assert shipped_model.decoder.mean_head.out_features == 16
+    assert shipped_model.decoder.logvar_head.out_features == 16
+
+
+def test_the_constructor_schema_is_the_recorded_one():
+    """Set equality against a written-out list, and order too.
+
+    The trainer builds a run's kwargs by sweeping this signature, and the design record enumerates
+    the config keys in both directions against it. A keyword that appeared here would be silently
+    settable from YAML with nothing documenting it; one that vanished would be silently dropped from
+    every config that sets it, and the run would train an architecture its own config does not
+    describe.
+    """
+    parameters = tuple(inspect.signature(SeqVaeLagAttnTrfRws.__init__).parameters)
+
+    assert set(parameters) == set(_CONSTRUCTOR_PARAMETERS)
+    assert parameters == _CONSTRUCTOR_PARAMETERS
+    assert "decoder_out_channels" not in parameters
+
+
+def test_an_overridden_width_hook_moves_the_head_and_nothing_else(tiny_kwargs):
+    """The seam, exercised the way a feature-domain sibling uses it.
+
+    The hook is called at the decoder's construction site -- after both gates and before the
+    generic initialisation, the depthwise repair and the two calibration passes -- so an override
+    changes the emitted width and nothing about the init order. Both halves are asserted: the
+    decoder is the new width, and the depthwise count and the log-variance calibration are the ones
+    a $16$-wide model gets, which they could not be if the decoder had moved past either pass.
+    """
+    class _WiderDecoder(SeqVaeLagAttnTrfRws):
+        def _default_decoder_out_channels(self) -> int:
+            return 78
+
+    # Built with the calibration on, because the calibration pass is what dates the decoder's
+    # construction relative to the init block.
+    calibrated = dict(tiny_kwargs)
+    calibrated["head_init_calibration"] = True
+    reference = _model(calibrated)
+    widened = _model(calibrated, cls=_WiderDecoder)
+
+    assert widened.decoder_out_channels == widened.decoder.out_channels == 78
+    assert widened.raw_per_step == reference.raw_per_step == 16, "the geometry input is untouched"
+    assert widened.n_depthwise_init == reference.n_depthwise_init
+    # The calibration ran on the wide head, so it was built before the calibration pass.
+    reference_bias = reference.decoder.logvar_head.bias
+    assert widened.decoder.logvar_head.bias.numel() == 78
+    assert torch.equal(
+        widened.decoder.logvar_head.bias,
+        torch.full_like(widened.decoder.logvar_head.bias, float(reference_bias[0])),
+    )
+    # And the width is the only structural difference: same parameter names, same shapes but the
+    # decoder's two output heads.
+    before = dict(reference.named_parameters())
+    after = dict(widened.named_parameters())
+    assert set(before) == set(after)
+    assert sorted(name for name in before if before[name].shape != after[name].shape) == [
+        "decoder.logvar_head.bias",
+        "decoder.logvar_head.weight",
+        "decoder.mean_head.bias",
+        "decoder.mean_head.weight",
+    ]
+
+
+# ---------------------------------------------------------------------------------------
 # The parameter budget
 # ---------------------------------------------------------------------------------------
 def test_the_shipped_encoder_subtotals(shipped_model):
     target = sum(p.numel() for p in shipped_model.target_encoder.parameters())
     source = sum(p.numel() for p in shipped_model.source_encoder.parameters())
 
-    assert target == _TARGET_ENCODER == 758_400
-    assert source == _SOURCE_ENCODER == 594_048
+    assert target == _TARGET_ENCODER == 1_676_928
+    assert source == _SOURCE_ENCODER == 888_960
 
 
 def test_a_block_costs_what_the_arithmetic_says(shipped_model):
     """The subtotals above are sums of these, so pinning the parts as well as the total says
     *where* a change landed rather than only that one happened."""
-    d_model, d_ff = 128, 256
+    d_model, d_ff = 128, 512
     conv_blocks = [
         module for module in shipped_model.target_encoder.modules()
         if isinstance(module, GatedCausalConvBlock)
@@ -323,7 +421,7 @@ def test_a_block_costs_what_the_arithmetic_says(shipped_model):
 
 
 def test_removing_one_target_attention_block_costs_exactly_one_block():
-    assert _n_parameters() - _n_parameters(target_attention_blocks=3) == _ATTENTION_BLOCK
+    assert _n_parameters() - _n_parameters(target_attention_blocks=5) == _ATTENTION_BLOCK
 
 
 def test_removing_the_stem_from_both_streams_costs_exactly_the_stem():
