@@ -32,7 +32,7 @@ Quick start — dataset only::
     )
 
     sample = dataset[0]
-    # sample['fhr_st']                    -> (S_i, 300, 43)   segments x timesteps x channels
+    # sample['fhr_st']                    -> (S_i, 300, C)    segments x timesteps x channels
     # sample['target']                    -> (S_i, 300)
     # sample['delta_t']                   -> (S_i,)            seconds between segments
     # sample['segment_indices']           -> (S_i,)            ordinal grid slot
@@ -52,7 +52,7 @@ Quick start — dataloader with padding::
     )
 
     for batch in loader:
-        fhr_st  = batch['fhr_st']                    # (B, S_max, 300, 43)
+        fhr_st  = batch['fhr_st']                    # (B, S_max, 300, C)
         mask    = batch['mask']                      # (B, S_max)  True=valid
         delta_t = batch['delta_t']                   # (B, S_max)
         target  = batch['target']                    # (B, S_max, 300)  pad=-1
@@ -67,14 +67,22 @@ Padding values (set in ``sequence_collate_fn``)::
     weight          -> 0.0
     segment_indices -> -1
     all features    -> 0.0
+    <block>_valid   -> False  (0.0 cast to bool; see _PAD_VALUES)
+
+Which coefficient blocks a sample carries depends on the file, not on this
+module: a two-sided dataset stores ``fhr_st``/``fhr_ph``/``fhr_up_ph``/
+``up_st``/``up_ph``, a causal one stores no ``fhr_up_ph`` and narrower
+scattering blocks, and with ``emit_validity_mask=True`` each block is
+accompanied by a boolean ``<block>_valid``.  Everything here is written against
+whatever keys the inner dataset produces.
 
 Trimming interaction:
     When ``trim_minutes`` is set (e.g. 1.0), the inner ``CombinedHDF5Dataset``
     trims ``trim_minutes`` from each end of every segment.  This affects:
 
     - Raw signals (fhr, up): 5280 -> 4800 samples  (at trim=1.0)
-    - Feature sequences (fhr_st, fhr_ph, fhr_up_ph, up_st, up_ph, target,
-      weight): 330 -> 300 timesteps  (at trim=1.0, decimation=16)
+    - Every feature sequence, plus target and weight: 330 -> 300 timesteps
+      (at trim=1.0, decimation=16)
 
     ``segment_duration`` should match the effective window after trimming
     (default 1200.0 s = 20 min).
@@ -82,10 +90,12 @@ Trimming interaction:
 
 import os
 import gc
+import sys
 import atexit
 import threading
 import traceback
 import warnings
+import h5py
 import numpy as np
 from typing import Sequence, List, Tuple, Dict, Any, Optional
 from collections import defaultdict, OrderedDict
@@ -93,11 +103,19 @@ from collections import defaultdict, OrderedDict
 import torch
 from torch.utils.data import Dataset, DataLoader
 
+# Launched as a script, this file's own directory goes on sys.path ahead of everything else, and
+# `hdf5_dataset` then resolves to the sibling *module* hdf5_dataset.py rather than to the package
+# that contains it. Putting the repository root first is what lets the self-test below run from
+# the Run button with no PYTHONPATH set.
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if not __package__ and _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
 from hdf5_dataset.hdf5_dataset import (
+    CAUSAL,
+    TWO_SIDED,
     CombinedHDF5Dataset,
     AttributeDict,
-    create_initial_hdf5,
-    append_sample,
 )
 
 # Default effective segment duration in seconds (20 min after 1-min trim each side).
@@ -110,6 +128,13 @@ _META_FIELDS = frozenset({
 })
 
 # Padding values used by the collate function.
+#
+# Boolean fields — the ``<block>_valid`` masks — are deliberately absent. They
+# take ``_DEFAULT_PAD``, and ``torch.full(..., 0.0, dtype=torch.bool)`` is
+# exactly ``False``, which is what a padded segment position means. Naming them
+# here would be the fragile option rather than the explicit one: the natural
+# thing to write is ``-1.0`` alongside ``target``, and ``-1.0`` cast to bool is
+# silently ``True`` — padding that claims every channel is valid.
 _PAD_VALUES: Dict[str, float] = {
     'target': -1.0,
     'weight': 0.0,
@@ -702,39 +727,114 @@ def create_sequence_dataloader(
 # ======================================================================
 
 
-def _run_smoke_test() -> None:
-    """Create a dummy HDF5, verify dataset + collate + dataloader end-to-end.
+#: Stored geometry both fixtures use: 22-minute segments at 4 Hz, decimated by 16.
+_SMOKE_LEN_SIGNAL = 5280
+_SMOKE_LEN_SEQUENCE = 330
 
-    Creates 3 GUIDs with 3/7/5 segments and irregular epoch gaps, then
-    checks shapes, ``delta_t`` correctness, and padding values.
+#: Shipped block widths per variant. The causal build drops the never-valid channels from each
+#: scattering block and produces no cross-phase block at all.
+_SMOKE_WIDTHS: Dict[str, Dict[str, int]] = {
+    TWO_SIDED: {'fhr_st': 43, 'fhr_ph': 66, 'fhr_up_ph': 79, 'up_st': 43, 'up_ph': 15},
+    CAUSAL: {'fhr_st': 36, 'fhr_ph': 66, 'up_st': 36, 'up_ph': 15},
+}
+
+#: Per-block warm-up ranges the causal fixture spans, matching the measured production ones. The
+#: top of the ``fhr_st`` range is what makes the fixture interesting: 293 stored steps rebases to
+#: 278 at ``trim_minutes=1.0``, leaving that channel 22 valid steps of 300.
+_SMOKE_WARMUP_RANGE: Dict[str, Tuple[int, int]] = {
+    'fhr_st': (5, 293), 'up_st': (5, 293), 'fhr_ph': (8, 149), 'up_ph': (56, 149),
+}
+
+
+def _write_synthetic_shard(
+    path: str,
+    guid_configs: List[Tuple[str, int, float, Tuple[float, float]]],
+    *,
+    transform: str = TWO_SIDED,
+    seed: int = 42,
+) -> int:
+    """Write a synthetic shard in the shipped schema, straight through h5py.
+
+    Deliberately not through either writer. ``hdf5_dataset.create_initial_hdf5`` is the superseded
+    pre-split schema — ``fhr_ph`` pinned at 44, no ``up_ph`` at all — so a fixture built with it
+    does not exercise the shapes ``CombinedHDF5Dataset`` actually sees; and the current writer sits
+    behind the production-only import path this module must not depend on. A dozen lines of h5py
+    is the smaller cost of the two.
+
+    Args:
+        path: File to write.
+        guid_configs: ``(guid, n_segments, first_epoch, (gap_lo, gap_hi))`` per recording.
+        transform: ``'two_sided'`` or ``'causal'``; selects the widths, the blocks, and whether
+            per-channel warm-up attributes are written.
+        seed: Seed for the synthetic coefficients.
+
+    Returns:
+        The number of segments written.
+    """
+    widths = _SMOKE_WIDTHS[transform]
+    rng = np.random.RandomState(seed)
+
+    guids: List[str] = []
+    epochs: List[float] = []
+    for guid, n_segments, first_epoch, (gap_lo, gap_hi) in guid_configs:
+        epoch = first_epoch
+        for _ in range(n_segments):
+            guids.append(guid)
+            epochs.append(epoch)
+            epoch += rng.uniform(gap_lo, gap_hi)
+    n = len(guids)
+
+    with h5py.File(path, 'w', libver='latest') as h5f:
+        h5f.attrs['transform'] = transform
+        h5f.create_dataset(
+            'fhr', data=(rng.randn(n, _SMOKE_LEN_SIGNAL) * 10 + 140).astype(np.float32)
+        )
+        h5f.create_dataset(
+            'up', data=(rng.randn(n, _SMOKE_LEN_SIGNAL) * 5 + 20).astype(np.float32)
+        )
+        for block, width in widths.items():
+            dataset = h5f.create_dataset(
+                block, data=rng.randn(n, width, _SMOKE_LEN_SEQUENCE).astype(np.float32)
+            )
+            if transform == CAUSAL:
+                low, high = _SMOKE_WARMUP_RANGE[block]
+                warmup = np.linspace(low, high, width).astype(np.int32)
+                dataset.attrs['causal_warmup_steps'] = warmup
+                # Recorded beside the warm-up exactly as the writer does; nothing here reads it.
+                dataset.attrs['causal_delay_s'] = (warmup * 4.0).astype(np.float32)
+        h5f.create_dataset('target', data=np.ones((n, _SMOKE_LEN_SEQUENCE), dtype=np.float32))
+        h5f.create_dataset('weight', data=np.ones((n, _SMOKE_LEN_SEQUENCE), dtype=np.float32))
+        h5f.create_dataset('epoch', data=np.asarray(epochs, dtype=np.float32))
+        h5f.create_dataset(
+            'cs_label', data=np.asarray([g == guid_configs[0][0] for g in guids], dtype=np.uint8)
+        )
+        h5f.create_dataset('bg_label', data=np.ones(n, dtype=np.uint8))
+        h5f.create_dataset('time_from_labor_onset', data=np.full(n, np.nan, dtype=np.float32))
+        h5f.create_dataset('second_stage_onset', data=np.full(n, np.nan, dtype=np.float32))
+        h5f.create_dataset(
+            'guid', data=np.asarray(guids, dtype=object), dtype=h5py.string_dtype('utf-8')
+        )
+    return n
+
+
+def _run_smoke_test() -> None:
+    """Create dummy HDF5 shards, verify dataset + collate + dataloader end-to-end.
+
+    Two fixtures, both in the schema the current pipeline writes: a two-sided one carrying all
+    five coefficient blocks, and a causal one carrying four narrower blocks plus their per-channel
+    warm-up. Checks shapes, ``delta_t``, padding values, trimming, the GUID cache, and — on the
+    causal fixture — the validity masks and how they survive stacking and padding.
     """
     import tempfile
     import shutil
 
     tmpdir = tempfile.mkdtemp(prefix="guid_seq_test_")
     hdf5_path = os.path.join(tmpdir, "test.hdf5")
+    causal_path = os.path.join(tmpdir, "test_causal.hdf5")
     print(f"Temp dir: {tmpdir}")
 
-    # LEGACY pre-split layout (22-min segments): fhr_up_ph holds cross-phase
-    # concatenated with UP self-phase and there is no up_ph dataset. The
-    # current pipeline (new_pipeline/create_new_pipeline.py) produces
-    # fhr_ph=66 / fhr_up_ph=79 / up_ph=15 instead, so this fixture does NOT
-    # exercise the shape CombinedHDF5Dataset sees in production — in
-    # particular nothing here covers the up_ph path.
-    len_signal = 5280
-    len_sequence = 330
-    n_cross_phase_channels = 137
-
-    create_initial_hdf5(
-        hdf5_path,
-        len_signal=len_signal,
-        n_channels=44 + n_cross_phase_channels,
-        len_sequence=len_sequence,
-        n_cross_phase_channels=n_cross_phase_channels,
-        n_up_st_channels=43,
-    )
-
-    rng = np.random.RandomState(42)
+    len_signal = _SMOKE_LEN_SIGNAL
+    len_sequence = _SMOKE_LEN_SEQUENCE
 
     # (guid, n_segments, epoch_start, (step_lo, step_hi))
     guid_configs = [
@@ -743,25 +843,8 @@ def _run_smoke_test() -> None:
         ("GUID_C", 5, -30000.0, (1200.0, 1800.0)),
     ]
 
-    for guid, n_segs, epoch_start, (step_lo, step_hi) in guid_configs:
-        epoch = epoch_start
-        for _ in range(n_segs):
-            append_sample(
-                hdf5_path,
-                fhr=rng.randn(len_signal).astype(np.float32) * 10 + 140,
-                up=rng.randn(len_signal).astype(np.float32) * 5 + 20,
-                fhr_st=rng.randn(43, len_sequence).astype(np.float32),
-                fhr_ph=rng.randn(44, len_sequence).astype(np.float32),
-                fhr_up_ph=rng.randn(n_cross_phase_channels, len_sequence).astype(np.float32),
-                up_st=rng.randn(43, len_sequence).astype(np.float32),
-                target=np.ones(len_sequence, dtype=np.float32),
-                weight=np.ones(len_sequence, dtype=np.float32),
-                guid=guid,
-                epoch=epoch,
-                cs_label=(guid == "GUID_A"),
-                bg_label=True,
-            )
-            epoch += rng.uniform(step_lo, step_hi)
+    _write_synthetic_shard(hdf5_path, guid_configs, transform=TWO_SIDED)
+    _write_synthetic_shard(causal_path, guid_configs, transform=CAUSAL)
 
     # --- Test dataset ---
     print("\n=== Testing SignalSequenceDataset ===")
@@ -778,9 +861,9 @@ def _run_smoke_test() -> None:
     guid = sample['guid']
     n_segs = sample['num_segments']
     print(f"\nSample GUID={guid}, num_segments={n_segs}")
-    print(f"  fhr_st shape:         {sample['fhr_st'].shape}")
-    print(f"  fhr_ph shape:         {sample['fhr_ph'].shape}")
-    print(f"  fhr_up_ph shape:      {sample['fhr_up_ph'].shape}")
+    for block, width in _SMOKE_WIDTHS[TWO_SIDED].items():
+        assert sample[block].shape == (n_segs, len_sequence, width), block
+        print(f"  {block} shape:{'':<{max(0, 14 - len(block))}}{tuple(sample[block].shape)}")
     print(f"  target shape:         {sample['target'].shape}")
     print(f"  weight shape:         {sample['weight'].shape}")
     print(f"  epoch shape:          {sample['epoch'].shape}")
@@ -890,10 +973,59 @@ def _run_smoke_test() -> None:
     assert sample_t['weight'].shape[-1] == trimmed_dec, \
         f"weight trim: expected {trimmed_dec}, got {sample_t['weight'].shape[-1]}"
     print(f"  fhr raw:              {sample_t['fhr'].shape}  (expect [..., {trimmed_raw}])")
-    print(f"  fhr_st trimmed:       {sample_t['fhr_st'].shape}  (expect [..., {trimmed_dec}, 43])")
+    print(f"  fhr_st trimmed:       {sample_t['fhr_st'].shape}  (expect [..., {trimmed_dec}, C])")
     print(f"  target trimmed:       {sample_t['target'].shape}  (expect [..., {trimmed_dec}])")
     print(f"  weight trimmed:       {sample_t['weight'].shape}  (expect [..., {trimmed_dec}])")
     print("  Trimming:             [OK]")
+
+    # --- Test the causal variant, with its validity masks ---
+    print("\n=== Testing the causal variant ===")
+    ds_causal = SignalSequenceDataset(
+        paths=[causal_path],
+        cache_size=0,
+        guid_cache_size=0,
+        pin_memory=False,
+        trim_minutes=1.0,
+        emit_validity_mask=True,
+    )
+    inner = ds_causal.inner_dataset
+    assert inner.transform == CAUSAL
+    assert 'fhr_up_ph' not in _SMOKE_WIDTHS[CAUSAL]
+
+    warmup = inner.causal_warmup_steps
+    assert warmup is not None, "a causal dataset must report its warm-up"
+    trim_steps = int(4 * 60 * 1.0) // 16
+    for block, (low, high) in _SMOKE_WARMUP_RANGE.items():
+        # Rebased by the loader's own slice: what was stored against 330 steps now describes 300.
+        assert warmup[block].max() == max(high - trim_steps, 0), block
+        assert warmup[block].min() == max(low - trim_steps, 0), block
+    print(f"  warm-up rebased by {trim_steps} steps: "
+          f"fhr_st {warmup['fhr_st'].min()}..{warmup['fhr_st'].max()}  [OK]")
+
+    sample_c = ds_causal[0]
+    n_segs_c = sample_c['num_segments']
+    for block, width in _SMOKE_WIDTHS[CAUSAL].items():
+        assert sample_c[block].shape == (n_segs_c, trimmed_dec, width), block
+        mask = sample_c[f"{block}_valid"]
+        assert mask.shape == (n_segs_c, trimmed_dec, width), block
+        assert mask.dtype == torch.bool, f"{block}: stacking must not silently cast the mask"
+        assert torch.equal(mask[0], inner.channel_valid_mask(block)), block
+    assert 'fhr_up_ph' not in sample_c and 'fhr_up_ph_valid' not in sample_c
+    # The slowest surviving channel keeps 22 of 300 steps -- thin, and visible here rather than
+    # only in a training curve.
+    slowest = int(sample_c['fhr_st_valid'][0, :, -1].sum())
+    print(f"  fhr_st_valid:         {tuple(sample_c['fhr_st_valid'].shape)} bool, "
+          f"slowest channel keeps {slowest}/{trimmed_dec} steps  [OK]")
+
+    batch_c = next(iter(DataLoader(
+        ds_causal, batch_size=3, shuffle=False, collate_fn=sequence_collate_fn,
+    )))
+    for i, length in enumerate(batch_c['lengths'].tolist()):
+        if length < batch_c['mask'].shape[1]:
+            padded = batch_c['fhr_st_valid'][i, length:]
+            assert padded.dtype == torch.bool and not padded.any(), \
+                "a padded segment position must read as fully invalid"
+    print(f"  padded fhr_st_valid:  {tuple(batch_c['fhr_st_valid'].shape)}, pad=False  [OK]")
 
     # --- Test GUID-level cache ---
     print("\n=== Testing GUID-level cache ===")

@@ -7,35 +7,59 @@ from tqdm import tqdm
 import matplotlib.pyplot as plt
 import seaborn as sns
 import torch
-from hdf5_dataset.hdf5_dataset import normalize_tensor_data
+from hdf5_dataset.hdf5_dataset import (
+    TWO_SIDED,
+    _resolve_dataset_layout,
+    normalize_tensor_data,
+    rebase_causal_warmup,
+    resolve_transform,
+)
 import argparse
 
 
 class DatasetStatsCalculator:
-    """
+    r"""
     Calculate statistics (mean and variance) for HDF5 datasets created with create_initial_hdf5.
 
     Every channel count is read from the HDF5 itself (``shape[0]`` of each
     field), and the per-channel transform is chosen by field name, so this
     class adapts automatically whenever the coefficient selection changes.
-    The counts quoted below are the current values at the production geometry
-    (J=11, Q=4, T=16, shape=5280), not assumptions baked into the code.
+    Two layouts are in use, and a file says which it is through its root
+    ``transform`` attribute (absent = legacy two-sided); the counts quoted
+    below are the current values at the production geometry (J=11, Q=4, T=16,
+    shape=5280), not assumptions baked into the code.
 
-    - FHR scattering (``fhr_st``, 43): channel 0 regular, channels 1-42
-      log-transformed. Stored unmasked — the width is fixed by the filter bank.
+    - FHR scattering (``fhr_st``, 43 two-sided / 36 causal): channel 0 regular,
+      the rest log-transformed. Stored unmasked — the width is fixed by the
+      filter bank.
     - FHR self-phase (``fhr_ph``, 66): all asinh-transformed. Selected on the
       0.008-1.0 Hz band crossed with harmonic steps k in {4, 6, 8}.
-    - FHR-UP cross-phase (``fhr_up_ph``, 79): cross-channel coefficients only
-      (not concatenated with the UP self-phase block). All asinh-transformed.
-      Two-band selection with the UP cap at 0.05 Hz.
-    - UP scattering (``up_st``, 43): channel 0 regular, channels 1-42
-      log-transformed (same structure as ``fhr_st``).
+    - FHR-UP cross-phase (``fhr_up_ph``, 79, two-sided only): cross-channel
+      coefficients only (not concatenated with the UP self-phase block). All
+      asinh-transformed. Two-band selection with the UP cap at 0.05 Hz. The
+      causal variant does not produce this block at all.
+    - UP scattering (``up_st``, 43 two-sided / 36 causal): channel 0 regular,
+      the rest log-transformed (same structure as ``fhr_st``).
     - UP self-phase (``up_ph``, 15): standalone field with its own per-channel
       asinh stats. Selected on the 0.008-0.05 Hz contraction band crossed with
       harmonic steps k in {4, 6, 8}.
 
     See ``hdf5_dataset/PHASE_HARMONIC_CHANNEL_SELECTION.md`` for the selection
     rationale.
+
+    **The causal valid region.** A one-sided filter reads only the past, so
+    until its warm-up has passed a channel's output is a function of the
+    assumed pre-recording history rather than of the recording. Accumulating
+    over that region would fold the assumption into the constants every model
+    normalises with, so a causal file's per-block ``causal_warmup_steps``
+    attribute is read and $t < W_c$ excluded per channel:
+
+    $$\mu_c = \frac{1}{N_c}\sum_{t \ge W_c} g(x_c(t)), \qquad
+      \sigma^2_c = \frac{1}{N_c}\sum_{t \ge W_c} g(x_c(t))^2 - \mu_c^2$$
+
+    $N_c$ is already counted per channel for the non-finite exclusion, so the
+    warm-up only changes which samples enter the sum. A two-sided or legacy
+    file has no such attribute and accumulates exactly as it always has.
 
     Efficiently computes statistics using online algorithms to handle large datasets
     that may not fit entirely in memory.
@@ -51,6 +75,14 @@ class DatasetStatsCalculator:
             'fhr', 'up', 'fhr_st', 'fhr_ph', 'fhr_up_ph', 'up_st', 'up_ph'
         ]
         self.trim_minutes = trim_minutes
+
+        # Which variant the last calculate_stats / load_stats touched, so that
+        # save_stats can record it and a caller can read it back. It lives on
+        # the instance rather than in the stats dict because every key of that
+        # dict becomes a group in the saved file. Two-sided until a file says
+        # otherwise, which is what every dataset built before the attribute
+        # existed is.
+        self.source_transform = TWO_SIDED
 
         if device is None:
             self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -154,6 +186,79 @@ class DatasetStatsCalculator:
                 
         return stats
     
+    def _resolve_valid_region(
+        self, valid_files: List[str]
+    ) -> Tuple[Optional[Any], Optional[Dict[str, np.ndarray]]]:
+        """Refuse an incoherent file list and work out what part of each channel is valid.
+
+        Reuses the loader's resolver rather than repeating the rule, so a list
+        the loader would refuse cannot be quietly averaged here. That refusal is
+        load-bearing: field shapes come from ``valid_files[0]`` alone, so a
+        36-wide file fed into a 43-wide accumulator would leave seven channels
+        at ``count == 0``, which ``_finalize_stats`` turns into mean and
+        variance $0$, which ``save_stats`` writes as ``std = 0``, which
+        ``normalize_tensor_data`` divides by $0 + 10^{-8}$ — inflating those
+        channels by $10^{8}$ with no exception anywhere.
+
+        Args:
+            valid_files: Existing HDF5 files, in the order given.
+
+        Returns:
+            ``(layout, rebased_warmup)``. The warm-up is ``None`` for a
+            two-sided or legacy dataset and is rebased for ``trim_minutes``,
+            because the accumulation runs over the trimmed window.
+
+        Raises:
+            ValueError: If the files disagree about variant, block set or a
+                block width, or if a channel has no valid step left.
+        """
+        layout = _resolve_dataset_layout(valid_files)
+        self.source_transform = TWO_SIDED if layout is None else layout.transform
+        warmup = (
+            None
+            if layout is None
+            else rebase_causal_warmup(layout, self.trim_samples_decimated, self.trim_minutes)
+        )
+        return layout, warmup
+
+    def _blank_warmup_region(
+        self,
+        field: str,
+        data: np.ndarray,
+        warmup: Optional[Dict[str, np.ndarray]]
+    ) -> np.ndarray:
+        r"""Remove each channel's warm-up from a freshly read, already trimmed batch.
+
+        Blanked with NaN rather than sliced away because the boundary is
+        **per channel**: no rectangular slice of a $(B, C, T)$ batch expresses
+        "channel 0 from step 0, channel 35 from step 278". Everything that
+        consumes this data already drops non-finite values per channel — the
+        accumulator through ``torch.isfinite``, the histogram collector through
+        ``np.isfinite`` — so a blanked step is excluded from $N_c$ and from the
+        plotted distribution alike, and no second exclusion mechanism appears
+        that the two paths could then disagree about.
+
+        The batch is blanked **in place**; both callers pass an array they have
+        just read out of HDF5 and own outright.
+
+        Args:
+            field: Field the batch belongs to.
+            data: ``(B, C, T)`` batch, already trimmed, or a raw ``(B, T)``
+                signal, which has no warm-up and is returned untouched.
+            warmup: Rebased per-block warm-up, or ``None`` for a two-sided or
+                legacy dataset, which is likewise returned untouched.
+
+        Returns:
+            *data*, for use at the call site.
+        """
+        if warmup is None or field not in warmup:
+            return data
+
+        for channel, invalid_steps in enumerate(warmup[field]):
+            if invalid_steps > 0:
+                data[:, channel, :int(invalid_steps)] = np.nan
+        return data
+
     def _update_single_channel_stats(
         self, 
         stats: Dict[str, Any], 
@@ -308,9 +413,13 @@ class DatasetStatsCalculator:
             hdf5_files: List of paths to HDF5 files
             batch_size: Number of samples to process at once for memory efficiency
             progress_bar: Whether to show progress bar
-            
+
         Returns:
             Dictionary containing calculated statistics for each field
+
+        Raises:
+            ValueError: If the files do not describe one coherent dataset, or if
+                a causal channel has no valid step to accumulate over.
         """
         # Validate input files
         valid_files = []
@@ -319,10 +428,14 @@ class DatasetStatsCalculator:
                 valid_files.append(file_path)
             else:
                 warnings.warn(f"File not found: {file_path}")
-        
+
         if not valid_files:
             raise ValueError("No valid HDF5 files found")
-        
+
+        # What these files are, and which part of each channel is a function of
+        # the recording rather than of the assumed pre-recording history.
+        layout, warmup = self._resolve_valid_region(valid_files)
+
         # Get field shapes from first file
         field_shapes = {}
         with h5py.File(valid_files[0], 'r') as f:
@@ -341,7 +454,17 @@ class DatasetStatsCalculator:
         
         # Initialize statistics
         stats = self._initialize_stats(field_shapes)
-        
+
+        # Carried into the saved file so a consumer can see which region the
+        # constants were computed over. Kept in the **untrimmed** coordinates
+        # the dataset stores it in, matching that attribute exactly rather than
+        # inventing a second meaning for one name; the stats file records its
+        # own ``trim_minutes`` beside it, which is what rebases the two.
+        if layout is not None and layout.warmup_steps is not None:
+            for field, vector in layout.warmup_steps.items():
+                if field in stats:
+                    stats[field]['causal_warmup_steps'] = vector.astype(np.int32)
+
         # Process each file
         total_samples = 0
         for file_path in (tqdm(valid_files, desc="Processing files") if progress_bar else valid_files):
@@ -372,7 +495,11 @@ class DatasetStatsCalculator:
                                 start_trim = self.trim_samples_decimated
                                 end_trim = -self.trim_samples_decimated if self.trim_samples_decimated > 0 else None
                                 data = data[:, :, start_trim:end_trim]
-                        
+
+                        # Applied after the trim, because the warm-up was rebased
+                        # into the trimmed window's coordinates.
+                        data = self._blank_warmup_region(field, data, warmup)
+
                         if field in ['fhr', 'up']:
                             self._update_single_channel_stats(stats[field], data)
                         else:
@@ -415,6 +542,13 @@ class DatasetStatsCalculator:
             import datetime
             f.attrs['created_at'] = datetime.datetime.now().isoformat()
             f.attrs['trim_minutes'] = self.trim_minutes if self.trim_minutes is not None else -1.0
+
+            # Which dataset variant these constants describe. Written on both
+            # variants, so that a file *without* it is unambiguously a legacy
+            # two-sided one rather than merely unlabelled — which is what lets
+            # the loader detect a causal dataset paired with two-sided
+            # constants instead of normalising with them.
+            f.attrs['transform'] = self.source_transform
             
             # Save information about log transformation
             f.attrs['log_epsilon'] = 1e-6
@@ -448,6 +582,13 @@ class DatasetStatsCalculator:
                 else:
                     # Multi-channel data
                     field_group.attrs['n_channels'] = field_stats['n_channels']
+                    # Present only for a causal source, in the same untrimmed
+                    # coordinates the dataset stores it in: it says which steps
+                    # of each channel entered the sums beside it.
+                    if 'causal_warmup_steps' in field_stats:
+                        field_group.attrs['causal_warmup_steps'] = np.asarray(
+                            field_stats['causal_warmup_steps'], dtype=np.int32
+                        )
                     field_group.create_dataset('mean', data=field_stats['mean'], dtype='f4')
                     field_group.create_dataset('variance', data=field_stats['variance'], dtype='f4')
                     field_group.create_dataset('std', data=np.sqrt(field_stats['variance']), dtype='f4')
@@ -478,18 +619,24 @@ class DatasetStatsCalculator:
         
         Args:
             stats_path: Path to statistics HDF5 file
-            
+
         Returns:
-            Dictionary containing loaded statistics
+            Dictionary containing loaded statistics. The variant is not one of
+            its keys — every key becomes a field group on the way back out — and
+            is read into :attr:`source_transform` instead.
         """
         if not os.path.exists(stats_path):
             raise FileNotFoundError(f"Statistics file not found: {stats_path}")
-        
+
         stats = {}
         with h5py.File(stats_path, 'r') as f:
             # Load global metadata
             log_epsilon = f.attrs.get('log_epsilon', 1e-6)
-            
+            # A stats file written before the attribute existed is a two-sided
+            # one, exactly as a dataset without it is; absence is the expected
+            # state of every stats file currently on disk, not a defect.
+            self.source_transform = resolve_transform(f.attrs)
+
             for field in f.keys():
                 if field == 'metadata':
                     continue
@@ -509,6 +656,10 @@ class DatasetStatsCalculator:
                 else:
                     # Multi-channel data
                     field_stats['n_channels'] = field_group.attrs['n_channels']
+                    if 'causal_warmup_steps' in field_group.attrs:
+                        field_stats['causal_warmup_steps'] = np.asarray(
+                            field_group.attrs['causal_warmup_steps'], dtype=np.int32
+                        )
                     field_stats['mean'] = field_group['mean'][()]
                     field_stats['variance'] = field_group['variance'][()]
                     field_stats['std'] = field_group['std'][()]
@@ -604,6 +755,77 @@ class DatasetStatsCalculator:
                     elif i in asinh_channels: transform_type = "asinh"
                     print(f"    Ch {i:2d}: {std:.6f} ({transform_type})")
 
+    def _collect_sample_data(
+        self,
+        valid_files: List[str],
+        max_samples: int,
+        warmup: Optional[Dict[str, np.ndarray]],
+        progress_bar: bool = True
+    ) -> Dict[str, Any]:
+        """Read a bounded, evenly spread subset of every field for plotting.
+
+        Separate from :meth:`calculate_stats` because it always was: the
+        histograms are drawn from raw samples rather than from the accumulators,
+        with their own trim slicing. That makes the warm-up exclusion something
+        this loop has to apply too — left out, a causal file's *constants* would
+        exclude the invalid region while the *distributions* plotted beside them
+        still contained it, and the two panels of one figure would disagree
+        about what the data is.
+
+        Args:
+            valid_files: Existing HDF5 files.
+            max_samples: Upper bound on segments collected across all files.
+            warmup: Rebased per-block warm-up, or ``None`` for a two-sided or
+                legacy dataset.
+            progress_bar: Whether to show a progress bar.
+
+        Returns:
+            One array per field, ``None`` for a field no file carried.
+        """
+        collected: Dict[str, List[np.ndarray]] = {field: [] for field in self.stats_fields}
+        total_collected = 0
+
+        for file_path in (tqdm(valid_files, desc="Collecting data") if progress_bar else valid_files):
+            if total_collected >= max_samples:
+                break
+
+            with h5py.File(file_path, 'r') as f:
+                available_fields = [field for field in self.stats_fields if field in f]
+                if not available_fields:
+                    continue
+
+                file_samples = f[available_fields[0]].shape[0]
+                samples_needed = max_samples - total_collected
+                samples_to_take = min(file_samples, samples_needed)
+
+                if samples_to_take < file_samples:
+                    indices = np.linspace(0, file_samples - 1, samples_to_take, dtype=int)
+                else:
+                    indices = np.arange(file_samples)
+
+                for field in available_fields:
+                    data = f[field][indices]
+                    if self.trim_minutes is not None:
+                        if field in ['fhr', 'up']:
+                            start_trim = self.trim_samples_raw
+                            end_trim = -self.trim_samples_raw if self.trim_samples_raw > 0 else None
+                            data = data[:, start_trim:end_trim]
+                        else:
+                            start_trim = self.trim_samples_decimated
+                            end_trim = -self.trim_samples_decimated if self.trim_samples_decimated > 0 else None
+                            data = data[:, :, start_trim:end_trim]
+                    # The same exclusion the accumulation applies, through the
+                    # same helper; the plotting path below already drops
+                    # non-finite values per channel.
+                    collected[field].append(self._blank_warmup_region(field, data, warmup))
+
+                total_collected += samples_to_take
+
+        return {
+            field: (np.concatenate(batches, axis=0) if batches else None)
+            for field, batches in collected.items()
+        }
+
     def plot_histograms(
         self,
         hdf5_files: List[str],
@@ -643,48 +865,12 @@ class DatasetStatsCalculator:
             return
         
         print(f"Collecting sample data for histogram plotting (max {max_samples:,} samples)...")
-        sample_data = {field: [] for field in self.stats_fields}
-        total_collected = 0
-        
-        for file_path in (tqdm(valid_files, desc="Collecting data") if progress_bar else valid_files):
-            if total_collected >= max_samples:
-                break
-                
-            with h5py.File(file_path, 'r') as f:
-                available_fields = [field for field in self.stats_fields if field in f]
-                if not available_fields:
-                    continue
-                
-                file_samples = f[available_fields[0]].shape[0]
-                samples_needed = max_samples - total_collected
-                samples_to_take = min(file_samples, samples_needed)
-                
-                if samples_to_take < file_samples:
-                    indices = np.linspace(0, file_samples - 1, samples_to_take, dtype=int)
-                else:
-                    indices = np.arange(file_samples)
-                
-                for field in available_fields:
-                    data = f[field][indices]
-                    if self.trim_minutes is not None:
-                        if field in ['fhr', 'up']:
-                            start_trim = self.trim_samples_raw
-                            end_trim = -self.trim_samples_raw if self.trim_samples_raw > 0 else None
-                            data = data[:, start_trim:end_trim]
-                        else:
-                            start_trim = self.trim_samples_decimated
-                            end_trim = -self.trim_samples_decimated if self.trim_samples_decimated > 0 else None
-                            data = data[:, :, start_trim:end_trim]
-                    sample_data[field].append(data)
-                
-                total_collected += samples_to_take
-        
-        for field in self.stats_fields:
-            if sample_data[field]:
-                sample_data[field] = np.concatenate(sample_data[field], axis=0)
-            else:
-                sample_data[field] = None
-        
+        # Resolved again rather than carried over from calculate_stats above:
+        # it costs one attribute read per file and keeps this path correct
+        # whichever order the two are called in.
+        _, warmup = self._resolve_valid_region(valid_files)
+        sample_data = self._collect_sample_data(valid_files, max_samples, warmup, progress_bar)
+
         available_fields = [field for field in self.stats_fields if sample_data[field] is not None]
         if not available_fields:
             print("No data available for plotting")
@@ -988,7 +1174,10 @@ if __name__ == "__main__":
         metadata={
             'input_files': input_files,
             'num_files': len(input_files),
-            'description': 'Statistics (J=11, Q=4, T=16): FHR/UP scattering + FHR self-phase + cross-phase + UP self-phase'
+            # Which blocks a file actually carries depends on its variant — the
+            # causal one produces no cross-phase block — so this says what was
+            # measured over rather than naming blocks that may not be there.
+            'description': 'Statistics (J=11, Q=4, T=16) over whichever coefficient blocks the input files store'
         },
         # Must match the loader's trim_minutes, because statistics are
         # accumulated over the trimmed region only. Production uses 1.0

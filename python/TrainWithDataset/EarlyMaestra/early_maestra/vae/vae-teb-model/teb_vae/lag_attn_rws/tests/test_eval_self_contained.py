@@ -502,5 +502,6 @@ def test_every_heatmap_on_the_page_disables_interpolation() -> None:
     source = SAMPLE_PAGE.read_text(encoding="utf-8")
 
     assert source.count("ax.imshow(") == source.count("interpolation=_IMSHOW_INTERPOLATION")
-    assert source.count("ax.imshow(") == 3
+    # The latent map, the per-dimension KL, the shared lag panel, and the gated-input row.
+    assert source.count("ax.imshow(") == 4
     assert '_IMSHOW_INTERPOLATION = "none"' in source

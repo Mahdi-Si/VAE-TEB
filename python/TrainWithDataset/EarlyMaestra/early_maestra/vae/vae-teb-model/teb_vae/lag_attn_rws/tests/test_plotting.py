@@ -88,6 +88,16 @@ def _axes_titled(figure: Any, prefix: str) -> Any:
     return matches[0]
 
 
+def _pages(callback: Any) -> Any:
+    """The per-sample pages the callback wrote, sorted.
+
+    By the page prefix rather than by extension: the callback also writes the run-level
+    causal-input-budget figure into the same directory, and a bare ``*.pdf`` glob would count it
+    as a page and make "one figure per requested sample" pass for the wrong reason.
+    """
+    return sorted(callback.output_dir.glob("lag_attn_rws_epoch*.pdf"))
+
+
 def _trainer_with_batch(batch: Any, **kwargs) -> FakeTrainer:
     """A fake trainer whose validation loader yields ``batch`` once."""
     trainer = FakeTrainer(**kwargs)
@@ -275,10 +285,12 @@ def test_it_writes_one_figure_per_requested_sample_and_logs_each(tmp_path, task,
 
     callback.on_validation_epoch_end(trainer, task())
 
-    written = sorted(callback.output_dir.glob("*.pdf"))
+    written = _pages(callback)
     assert len(written) == 2
-    assert [call[0] for call in logger.experiment.calls] == ["log_artifact", "log_artifact"]
-    assert sorted(Path(call[2][0]) for call in logger.experiment.calls) == written
+    # Three artifacts, not two: the run-level input-budget figure goes up once alongside them.
+    logged = sorted(Path(call[2][0]) for call in logger.experiment.calls)
+    assert [call[0] for call in logger.experiment.calls] == ["log_artifact"] * 3
+    assert logged == sorted([*written, callback.output_dir / "causal_input_budget.pdf"])
 
 
 def test_it_plots_the_scheduled_beta_not_the_raw_hyperparameter(
@@ -387,10 +399,10 @@ def test_it_honours_the_plot_frequency_in_both_directions(tmp_path, task, stub_b
     callback = LagAttnRwsPlotCallback(tmp_path, plot_frequency=5, num_examples=1)
 
     callback.on_validation_epoch_end(_trainer_with_batch(stub_batch, current_epoch=0), module)
-    assert list(callback.output_dir.glob("*.pdf")) == []
+    assert _pages(callback) == []
 
     callback.on_validation_epoch_end(_trainer_with_batch(stub_batch, current_epoch=4), module)
-    assert len(list(callback.output_dir.glob("*.pdf"))) == 1
+    assert len(_pages(callback)) == 1
 
 
 def test_a_failure_inside_the_figure_never_reaches_the_training_loop(
@@ -406,7 +418,7 @@ def test_a_failure_inside_the_figure_never_reaches_the_training_loop(
 
     callback.on_validation_epoch_end(_trainer_with_batch(stub_batch), task())
 
-    assert list(callback.output_dir.glob("*.pdf")) == []
+    assert _pages(callback) == []
 
 
 def test_a_failing_validation_loader_never_reaches_the_training_loop(tmp_path, task):

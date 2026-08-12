@@ -333,10 +333,15 @@ def test_the_validation_figures_are_written_by_a_real_fit(fit):
     """
     driver, _, _ = fit
 
-    figures = list((Path(driver.train_results_dir) / "lag_attn_rws_diagnostics").glob("*.pdf"))
+    directory = Path(driver.train_results_dir) / "lag_attn_rws_diagnostics"
+    figures = list(directory.glob("lag_attn_rws_epoch*.pdf"))
 
     # One per requested example per plotted epoch, at plot_frequency 1.
     assert len(figures) == 2 * SMOKE_EPOCHS, [path.name for path in figures]
+    # And no input figures at all: those describe the stored scattering and phase-harmonic
+    # channels, and this model declares no `c_y` because it is handed the raw traces instead.
+    # The absence is the designed behaviour, not a failure the callback swallowed.
+    assert list(directory.glob("causal_input_budget.*")) == []
 
 
 def test_the_figure_builder_receives_every_key_it_reads(fit):

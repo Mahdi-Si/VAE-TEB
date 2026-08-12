@@ -10,7 +10,10 @@ What is left here is the callback: when to draw, which samples, and where the fi
 the raw ``up`` trace the page's first row draws beside the target, taken from the batch rather than
 from the task's forward-input builder. Whether the net *also* sees that trace is model-dependent --
 a feature-input model consumes the decimated UP blocks and never sees it, a raw-input model is fed
-it directly -- and the page draws it either way, so the row means the same thing in both. It never
+it directly -- and the page draws it either way, so the row means the same thing in both. It also supplies the page's
+gated-input rows and, once per run, writes the companion causal-input-budget figure; both come
+from :mod:`teb_vae.lag_attn_rws.input_budget`, and both are separately guarded so that a model
+whose channels the production filter bank cannot describe still gets its pages. It never
 raises into the training loop -- generation is wrapped in a broad ``try/except`` that warns and
 closes any leaked figures -- and every saved file goes to MLflow through the rank-0 artifact seam
 :func:`utils.mlflow_utils.log_artifact_to_mlflow`. This module lives in the model layer rather
@@ -144,6 +147,53 @@ def _guid_of(batch: Any, index: int = 0) -> str:
     return str(field)
 
 
+def consumes_feature_blocks(model: Any) -> bool:
+    """Whether ``model`` consumes the stored scattering and phase-harmonic blocks.
+
+    The two input figures describe those blocks, so for a model over another input
+    representation -- the end-to-end raw-signal sibling, which is handed the raw traces and
+    declares no channel widths at all -- there is nothing to draw and nothing to warn about.
+    Separated from the failure path so that "this model has no such input" and "this model's
+    input could not be described" do not arrive as the same message.
+
+    Args:
+        model: The net.
+
+    Returns:
+        ``True`` when the model declares both stream widths.
+    """
+    return getattr(model, "c_y", None) is not None and getattr(model, "c_u", None) is not None
+
+
+def input_stream_panels(model: Any, inputs: Any, sample_index: int) -> Any:
+    """Build the page's gated-input rows, or none of them if they cannot be described.
+
+    Wrapped rather than called directly, because everything the rows need beyond the tensors --
+    the filter bank's per-channel reaches and centre frequencies -- is keyed to the *production*
+    channel widths. A model over other widths is a page without these rows and a named warning,
+    not a page that fails to be drawn at all: the seven rows below them do not depend on any of
+    it.
+
+    Args:
+        model: The net.
+        inputs: The task's forward inputs, exactly as splatted into ``forward``.
+        sample_index: Which sample of the batch the page is being drawn for.
+
+    Returns:
+        A tuple of :class:`~teb_vae.lag_attn_rws.sample_page.InputStreamPanel`, possibly empty.
+    """
+    if not consumes_feature_blocks(model):
+        return ()
+
+    from teb_vae.lag_attn_rws.input_budget import stream_panels
+
+    try:
+        return tuple(stream_panels(model, inputs, sample_index=sample_index))
+    except Exception as exc:  # noqa: BLE001 - the rest of the page does not depend on these rows
+        logger.warning(f"LagAttnRwsPlotCallback: input rows skipped: {exc}")
+        return ()
+
+
 def _source_delay_steps(model: Any) -> int:
     """Return the model's causal input delay in decimated steps.
 
@@ -197,6 +247,11 @@ class LagAttnRwsPlotCallback(Callback):
         self.num_examples = max(1, int(num_examples))
         self.file_format = file_format.lower().lstrip(".")
         self._mlflow_logger = mlflow_logger
+        # The run-level causal-input-budget figure is a constant of the configuration, not of an
+        # epoch or a sample, so it is written once. Tracked with a flag rather than by testing
+        # for the file: a resumed run writing it again is right (the budget may have changed),
+        # and one that skipped it because a stale file existed would describe the previous guard.
+        self._budget_figure_written = False
 
     def on_validation_epoch_end(self, trainer: Any, pl_module: Any) -> None:
         """Draw the figures for this epoch, if this rank and epoch should.
@@ -226,6 +281,35 @@ class LagAttnRwsPlotCallback(Callback):
         except Exception as exc:  # noqa: BLE001 - a figure is never worth failing a fit for
             plt.close("all")
             logger.warning(f"LagAttnRwsPlotCallback failed: {exc}")
+
+    def _write_budget_figure(self, trainer: Any, model: Any) -> None:
+        """Write the run-level causal-input-budget figure, once.
+
+        Separate from the per-sample pages and separately guarded: it describes the guard the
+        model was built with, so it is worth having even for a run whose pages fail, and a
+        model whose channels the filter bank cannot describe must not cost the pages that do not
+        need it.
+
+        Args:
+            trainer: The Lightning trainer, for the MLflow artifact seam.
+            model: The net.
+        """
+        if self._budget_figure_written or not consumes_feature_blocks(model):
+            return
+        # Set before the attempt, not after: a model this cannot describe cannot be described on
+        # the next epoch either, and retrying would warn once per validation epoch for the rest
+        # of the fit.
+        self._budget_figure_written = True
+        try:
+            from teb_vae.lag_attn_rws.input_budget import write_input_budget_figure
+
+            path = write_input_budget_figure(
+                model, self.output_dir, file_format=self.file_format
+            )
+            log_artifact_to_mlflow(self._mlflow_logger, path, trainer)
+        except Exception as exc:  # noqa: BLE001 - a figure is never worth failing a fit for
+            plt.close("all")
+            logger.warning(f"LagAttnRwsPlotCallback: input-budget figure skipped: {exc}")
 
     @torch.no_grad()
     def _generate_plots(self, trainer: Any, batch: Any, pl_module: Any, epoch: int) -> None:
@@ -284,6 +368,8 @@ class LagAttnRwsPlotCallback(Callback):
             if was_training:
                 pl_module.train()
 
+        self._write_budget_figure(trainer, model)
+
         stats = normalization_stats_of(trainer)
         # ``inputs[0]`` rather than a named tensor: every input the net takes carries the batch
         # size, and reading it off the first one is what keeps the loop bound right for a model
@@ -316,6 +402,10 @@ class LagAttnRwsPlotCallback(Callback):
                 # The batch itself, for the same reason: a task whose target is not the raw
                 # signal cannot recover the raw traces from what it returned.
                 batch=batch,
+                # The encoders' actual input: the same tensors the forward above consumed, put
+                # through the model's own gates. Built per sample rather than once for the batch
+                # so the row is the recording the rest of the page is about.
+                input_streams=input_stream_panels(model, inputs, index),
             )
             path = self.output_dir / (
                 f"lag_attn_rws_epoch{epoch:04d}_sample{index}_{guid[:16]}.{self.file_format}"

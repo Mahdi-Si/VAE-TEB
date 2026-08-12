@@ -9,6 +9,7 @@ import pickle
 import atexit
 import threading
 import warnings
+from dataclasses import dataclass
 from functools import lru_cache
 import gc
 from torch.utils.data.dataloader import default_collate
@@ -16,6 +17,251 @@ import yaml
 import random
 from torch.utils.data import DataLoader, Sampler
 from collections import Counter, defaultdict
+
+
+# ---------------------------------------------------------------------------
+# Stored field groups
+# ---------------------------------------------------------------------------
+# One definition of what a coefficient block is. Every membership test below —
+# which fields get trimmed on the channel axis, which get normalised, which get
+# transposed into the model's (time, channel) layout, and which carry a default
+# per-channel transform — reads it from here. Written out separately at each
+# site, they drifted: a block added to one list and not another is normalised
+# but not transposed, or transposed but never trimmed, and neither shows up as
+# an error.
+#
+# Nothing here says a file must contain all of them. ``__getitem__`` skips any
+# field the file does not have, which is what makes an absent ``fhr_up_ph`` on
+# a causal file need no special case anywhere.
+_SCATTERING_FIELDS = ('fhr_st', 'up_st')
+_PHASE_FIELDS = ('fhr_ph', 'fhr_up_ph', 'up_ph')
+_COEFFICIENT_FIELDS = frozenset(_SCATTERING_FIELDS + _PHASE_FIELDS)
+_RAW_FIELDS = ('fhr', 'up')
+#: Fields normalisation applies to: the coefficient blocks plus the raw signals.
+_NORMALISED_FIELDS = _COEFFICIENT_FIELDS | frozenset(_RAW_FIELDS)
+
+
+# ---------------------------------------------------------------------------
+# Transform variants
+# ---------------------------------------------------------------------------
+# A file written by the current pipeline records which wavelet bank produced
+# it. A file **without** that attribute is a legacy two-sided file: absence is
+# the normal, expected state of every dataset already on disk and is never a
+# defect, so it is resolved silently and warns about nothing.
+TWO_SIDED = 'two_sided'
+CAUSAL = 'causal'
+
+
+def resolve_transform(attrs: Any) -> str:
+    """Which wavelet bank produced a file, with the legacy default applied.
+
+    Args:
+        attrs: The file's root HDF5 attributes.
+
+    Returns:
+        ``'two_sided'`` or ``'causal'``. A missing ``transform`` attribute
+        resolves to ``'two_sided'`` — every dataset built before the attribute
+        existed is one, and reading one is the common case, not a degraded one.
+    """
+    value = attrs.get('transform', TWO_SIDED)
+    if isinstance(value, bytes):
+        value = value.decode('utf-8')
+    return str(value)
+
+
+@dataclass(frozen=True)
+class _FileLayout:
+    """What one shard says about itself, read from attributes and shapes alone.
+
+    Costs one file open per path and reads no coefficient data. It exists
+    because a list of files that disagree with each other is accepted silently
+    today and fails much later, in two different ways: ``default_collate``
+    raises something opaque on the first mixed batch, while
+    ``SignalSequenceDataset`` iterates the first segment's keys and instead
+    **drops** whichever field the other file did not have.
+
+    Attributes:
+        path: The file this describes.
+        transform: Resolved variant; see :func:`resolve_transform`.
+        widths: Channels per stored coefficient block.
+        lengths: Stored (untrimmed) steps per coefficient block.
+        warmup_steps: Per-channel warm-up in untrimmed decimated steps, per
+            block, or ``None`` for a two-sided file. Untrimmed because that is
+            the storage geometry every other stored field uses; the loader
+            rebases it for its own trim.
+    """
+
+    path: str
+    transform: str
+    widths: Dict[str, int]
+    lengths: Dict[str, int]
+    warmup_steps: Optional[Dict[str, np.ndarray]]
+
+
+def _read_file_layout(path: str) -> _FileLayout:
+    """Read one shard's self-description.
+
+    Args:
+        path: HDF5 file to describe.
+
+    Returns:
+        The file's :class:`_FileLayout`.
+
+    Raises:
+        ValueError: If the file claims to be causal but its warm-up attributes
+            are missing or disagree with the channel axis they describe. Those
+            attributes are all-or-nothing: a partially-attributed causal file
+            would silently give some blocks a valid region and others none.
+    """
+    with h5py.File(path, 'r', libver='latest') as f:
+        transform = resolve_transform(f.attrs)
+        widths: Dict[str, int] = {}
+        lengths: Dict[str, int] = {}
+        for name in sorted(_COEFFICIENT_FIELDS):
+            if name in f:
+                widths[name] = int(f[name].shape[1])
+                lengths[name] = int(f[name].shape[2])
+
+        warmup: Optional[Dict[str, np.ndarray]] = None
+        if transform == CAUSAL:
+            warmup = {}
+            for name, width in widths.items():
+                if 'causal_warmup_steps' not in f[name].attrs:
+                    raise ValueError(
+                        f"{path} declares transform='causal' but its '{name}' block carries no "
+                        f"causal_warmup_steps attribute. The valid region of that block is then "
+                        f"unknowable, and reading it as fully valid would feed a model the "
+                        f"assumed pre-recording history as if it were signal."
+                    )
+                vector = np.asarray(f[name].attrs['causal_warmup_steps'], dtype=np.int64)
+                if vector.shape != (width,):
+                    raise ValueError(
+                        f"{path}: '{name}' stores {width} channels but its causal_warmup_steps "
+                        f"has {vector.size} entries. The attribute describes a different channel "
+                        f"axis than the data, so no channel's validity can be trusted."
+                    )
+                warmup[name] = vector
+    return _FileLayout(
+        path=path, transform=transform, widths=widths, lengths=lengths, warmup_steps=warmup
+    )
+
+
+def _resolve_dataset_layout(paths: Sequence[str]) -> Optional[_FileLayout]:
+    """Refuse an incoherent file list, and return what the coherent ones agree on.
+
+    Variants are compared **resolved**, so a list mixing a legacy shard (no
+    ``transform`` attribute) with a newly-written two-sided shard is accepted:
+    they are the same variant, and comparing the raw attribute would refuse a
+    combination that works perfectly well today.
+
+    A file that cannot be opened is warned about and skipped, exactly as the
+    index build already does — a coherence check is not the place to start
+    failing on a broken file that is tolerated everywhere else.
+
+    Args:
+        paths: The dataset's files, in the order given.
+
+    Returns:
+        The first readable file's layout, which every other readable file
+        agrees with, or ``None`` if none could be read.
+
+    Raises:
+        ValueError: On the first file that disagrees about variant, block set
+            or a block width, naming the file and the disagreement.
+    """
+    reference: Optional[_FileLayout] = None
+    for path in paths:
+        if not os.path.exists(path):
+            continue  # _build_index warns about this; one message is enough.
+        try:
+            layout = _read_file_layout(path)
+        except ValueError:
+            raise
+        except Exception as error:
+            warnings.warn(f"Could not read the layout of {path}: {error}")
+            continue
+
+        if reference is None:
+            reference = layout
+            continue
+
+        if layout.transform != reference.transform:
+            raise ValueError(
+                f"Mixed transform variants in one dataset: {layout.path} is "
+                f"'{layout.transform}' but {reference.path} is '{reference.transform}'. "
+                f"Their channel axes mean different things and their statistics are not "
+                f"interchangeable; build one dataset per variant."
+            )
+        if set(layout.widths) != set(reference.widths):
+            missing = sorted(set(reference.widths) - set(layout.widths))
+            extra = sorted(set(layout.widths) - set(reference.widths))
+            raise ValueError(
+                f"Mismatched coefficient blocks: {layout.path} is missing {missing} and adds "
+                f"{extra} relative to {reference.path}. A sample would carry different keys "
+                f"depending on which file it came from, which collates into an opaque failure "
+                f"or silently drops the field."
+            )
+        for name, width in layout.widths.items():
+            if width != reference.widths[name]:
+                raise ValueError(
+                    f"Mismatched '{name}' width: {layout.path} stores {width} channels but "
+                    f"{reference.path} stores {reference.widths[name]}."
+                )
+    return reference
+
+
+def rebase_causal_warmup(
+    layout: _FileLayout, trim_steps: int, trim_minutes: Optional[float] = None
+) -> Optional[Dict[str, np.ndarray]]:
+    r"""Move the stored warm-up into the coordinates of a trimmed window.
+
+    Rebasing is $W' = \max(W - \text{trim},\ 0)$: the stored vector counts from
+    stored step $0$, while a consumer that trims ``trim_steps`` from each end
+    starts reading at stored step ``trim_steps``, so a channel whose warm-up
+    ended at stored step $20$ has $20 - 15 = 5$ invalid steps left in a window
+    trimmed by $15$.
+
+    Shared by every consumer that reads the valid region — the sample loader and
+    the statistics calculator — because they must agree on it exactly: a
+    statistic accumulated over a wider region than the loader serves would
+    normalise the data with constants drawn partly from the pre-recording
+    history.
+
+    Args:
+        layout: The dataset's resolved layout.
+        trim_steps: Decimated steps discarded from **each** end.
+        trim_minutes: Only used to make the refusal below name the setting the
+            caller actually configured.
+
+    Returns:
+        ``{block: (C,) int64}`` of rebased warm-ups, or ``None`` for a two-sided
+        or legacy layout, which has no warm-up and is not a degraded case.
+
+    Raises:
+        ValueError: If any channel has no valid step left. Such a column
+            normalises to zeros indistinguishable from real coefficients, so it
+            must not be served or accumulated over.
+    """
+    if layout.warmup_steps is None:
+        return None
+
+    rebased: Dict[str, np.ndarray] = {}
+    for name in sorted(layout.warmup_steps):
+        stored = layout.warmup_steps[name]
+        kept_steps = layout.lengths[name] - 2 * trim_steps
+        vector = np.maximum(stored - trim_steps, 0).astype(np.int64)
+
+        dead = np.flatnonzero(kept_steps - vector <= 0)
+        if dead.size:
+            raise ValueError(
+                f"'{name}' channel {int(dead[0])} has no valid step: its warm-up is "
+                f"{int(stored[dead[0]])} stored steps, which rebases to {int(vector[dead[0]])} "
+                f"against a {kept_steps}-step window at trim_minutes={trim_minutes}. "
+                f"An all-invalid channel normalises to zeros indistinguishable from real "
+                f"coefficients, so it must not be served."
+            )
+        rebased[name] = vector
+    return rebased
 
 
 def normalize_tensor_data(
@@ -405,22 +651,48 @@ class CombinedHDF5Dataset(Dataset):
     """
     High-performance PyTorch Dataset for one or more HDF5 files with identical structure.
 
-    With Scattering transform (J=11, Q=4, T=16). Channel counts below are the
-    current production values; nothing in this class depends on them — widths
-    come from the data and the stats file, and the per-channel transform is
-    chosen by field name:
-    - FHR scattering (``fhr_st``): 43 coefficients (first order)
-    - FHR self-phase (``fhr_ph``): 66 selected coefficients
-    - FHR↔UP cross-channel phase (``fhr_up_ph``): 79 coefficients
-    - UP scattering (``up_st``): 43 coefficients (first order)
-    - UP self-phase (``up_ph``): 15 selected coefficients
+    Nothing in this class depends on a particular channel count: widths come
+    from the data and the stats file, and the per-channel transform is chosen
+    by field name. Two layouts are in use, and a file says which it is through
+    its root ``transform`` attribute (absent = legacy two-sided):
+
+    ==================  ==========  ========
+    Block               two-sided   causal
+    ==================  ==========  ========
+    ``fhr_st``          43          36
+    ``fhr_ph``          66          66
+    ``fhr_up_ph``       79          absent
+    ``up_st``           43          36
+    ``up_ph``           15          15
+    ==================  ==========  ========
 
     All multi-channel scattering/phase fields are first-class HDF5 datasets
     with their own per-channel statistics. ``up_ph`` is no longer virtually
-    sliced from ``fhr_up_ph`` — each of the five fields flows through the
-    same normalisation code path. The two self-phase fields also carry
-    ``sel_*`` attrs describing which wavelet pair each channel came from; see
+    sliced from ``fhr_up_ph`` — each field flows through the same
+    normalisation code path. The two self-phase fields also carry ``sel_*``
+    attrs describing which wavelet pair each channel came from; see
     ``PHASE_HARMONIC_CHANNEL_SELECTION.md``.
+
+    **The causal valid region.** A one-sided filter reads only the past, so
+    before its warm-up has passed a channel's output is a function of the
+    assumed pre-recording history rather than of the recording. That boundary
+    is a property of the *filter bank*: it is identical for every segment in
+    every file, which is why it arrives as a per-block attribute rather than a
+    stored per-sample mask — a $(C, T)$ boolean array per sample would
+    replicate one constant tens of thousands of times, about 76 KB per sample
+    against about 600 bytes per file.
+
+    The stored vector is in **untrimmed** step coordinates, matching every
+    other stored field, so this class rebases it for its own ``trim_minutes``:
+    a channel with stored warm-up 20 read at ``trim_minutes=1.0`` reports 5,
+    because the loader's own slice already discarded the first 15 steps.
+    :attr:`causal_warmup_steps` is the rebased vector and
+    :meth:`channel_valid_mask` is the ``(T, C)`` boolean form of it.
+
+    **The group delay is not compensated.** Beyond its warm-up a causal
+    channel is still *stale* by its composed group delay — hundreds of seconds
+    on the slow channels — and nothing here shifts it back. A consumer that
+    aligns channels in time must read ``causal_delay_s`` off the block itself.
 
     Optimized for:
     - Multi-GPU training with DistributedDataParallel
@@ -445,6 +717,12 @@ class CombinedHDF5Dataset(Dataset):
         stats_path: Path to HDF5 statistics file for data normalization (None disables normalization).
         normalize_fields: List of fields to normalize (None normalizes all available fields with stats).
         trim_minutes: Optional trimming time in minutes for signal data
+        emit_validity_mask: Add a ``<block>_valid`` boolean field per
+            coefficient block to every sample. Default off: the mask is a
+            dataset constant, so paying for it per sample, per worker, per
+            collate and per host-to-device copy is only worth it for a model
+            that consumes it batched. A model that does not can read
+            :meth:`channel_valid_mask` once instead. Causal datasets only.
     """
     def __init__(
         self,
@@ -462,6 +740,7 @@ class CombinedHDF5Dataset(Dataset):
         stats_path: Optional[str] = None,
         normalize_fields: Optional[Sequence[str]] = None,
         trim_minutes: Optional[float] = None,
+        emit_validity_mask: bool = False,
     ):
         self.paths = [paths] if isinstance(paths, str) else list(paths)
         self.load_fields = None if load_fields is None else set(load_fields)
@@ -477,6 +756,7 @@ class CombinedHDF5Dataset(Dataset):
         self.stats_path = stats_path
         self.normalize_fields = set(normalize_fields) if normalize_fields is not None else None
         self.trim_minutes = trim_minutes
+        self.emit_validity_mask = emit_validity_mask
         if self.trim_minutes is not None:
             self.trim_samples_raw = int(4 * 60 * self.trim_minutes)
             self.trim_samples_decimated = self.trim_samples_raw // 16
@@ -499,37 +779,52 @@ class CombinedHDF5Dataset(Dataset):
         self.normalization_enabled = False
         
         # Define which channels should use LOG normalization for optimal coefficients.
-        # These configs are overwritten at load time by whatever the stats file
-        # says (see `_load_normalization_stats`); what is kept here is a
-        # sensible fallback used only when no stats file is provided.
+        # Derived from the field groups rather than listing block names a third
+        # time: a scattering block keeps its order-0 channel linear and log-
+        # transforms the rest, a phase block is signed and takes asinh
+        # throughout. These configs are overwritten at load time by whatever
+        # the stats file says (see `_load_normalization_stats`); what is kept
+        # here is a sensible fallback used only when no stats file is provided.
         self.log_norm_channels_config = {
-            'fhr_st': 'all_except_0',  # every scattering coefficient except order 0
-            'up_st': 'all_except_0',   # UP scattering: same structure as fhr_st
+            name: 'all_except_0' for name in _SCATTERING_FIELDS
         }
-        self.asinh_norm_channels_config = {
-            'fhr_ph': 'all',     # FHR self-phase harmonics
-            'fhr_up_ph': 'all',  # FHR↔UP cross-channel phase coefficients
-            'up_ph': 'all',      # UP self-phase harmonics (first-class field)
-        }
-        
+        self.asinh_norm_channels_config = {name: 'all' for name in _PHASE_FIELDS}
+
         # This will be populated from the stats file, but the config above provides a fallback.
         self.order0_channels: Dict[str, List[int]] = {}
         self.log_epsilon = 1e-6  # For log transformation
-        
+
         # Register cleanup for proper file handle management
         atexit.register(self._cleanup_handles)
-        
+
+        # What these files are, resolved before anything reads them: an
+        # incoherent list is refused here rather than at the first mixed batch,
+        # and the causal warm-up is needed before a single sample is served.
+        self._layout = _resolve_dataset_layout(self.paths)
+        self.transform = TWO_SIDED if self._layout is None else self._layout.transform
+        self._rebased_warmup: Optional[Dict[str, np.ndarray]] = None
+        self._valid_mask_cache: Dict[str, torch.Tensor] = {}
+        self._resolve_validity()
+
+        if self.emit_validity_mask and self._rebased_warmup is None:
+            raise ValueError(
+                f"emit_validity_mask=True needs a causal dataset, but these files resolve to "
+                f"'{self.transform}'. A two-sided block has no warm-up, so the only mask this "
+                f"could emit is all-True — which would assert that every step of every channel "
+                f"is honest about the past, the very thing the causal variant exists to fix."
+            )
+
         # Load normalization statistics if provided
         if self.stats_path is not None:
             self._load_normalization_stats()
-        
+
         # Build index with optimized filtering
         self._build_index()
-        
+
         # Validate dataset
         if not self.index_map:
             raise ValueError("No samples match the specified filters.")
-        
+
         print(f"Initialized HDF5Dataset: {len(self.index_map)} samples from {len(self.paths)} files")
         if self.cache_size > 0:
             print(f"Caching enabled: {min(self.cache_size, len(self.index_map))} samples")
@@ -547,6 +842,12 @@ class CombinedHDF5Dataset(Dataset):
         state['file_handles'] = [None] * len(self.paths)
         # Clear cache (each worker builds its own)
         state['_cache'] = {}
+        # The validity masks are KEPT, unlike the sample cache. They are a
+        # filter-bank constant — a few tens of KB for the whole dataset, the
+        # same in every worker — so shipping them costs less than having every
+        # worker rebuild them, and they cannot go stale because nothing mutates
+        # them. Stated explicitly because the default for a cache here is to
+        # drop it.
         return state
 
     def __setstate__(self, state):
@@ -557,6 +858,161 @@ class CombinedHDF5Dataset(Dataset):
         self._cache_lock = threading.Lock()
         # File handles remain None — will be lazily opened on first access
 
+    # ------------------------------------------------------------------
+    # The causal valid region
+    # ------------------------------------------------------------------
+    def _resolve_validity(self) -> None:
+        r"""Rebase the stored warm-up for this trim, report it, and refuse a dead channel.
+
+        Rebasing is $W' = \max(W - \text{trim},\ 0)$, because the loader's own
+        slice has already discarded the first ``trim`` steps: a channel whose
+        warm-up ended at stored step 20 has $20 - 15 = 5$ invalid steps left in
+        a window that starts at stored step 15.
+
+        The per-channel counts are **printed**, not merely available. At the
+        production geometry the slowest surviving channel rebases to 278 and
+        keeps 22 valid steps of 300 — $7\%$ of the window, with that channel's
+        statistics resting on it. A number that thin should be visible before a
+        training run, not inferred from its results afterwards.
+
+        Raises:
+            ValueError: If any channel has no valid step at all. Returning it
+                would hand a model a column that normalises to zeros
+                indistinguishable from real coefficients.
+        """
+        if self._layout is None:
+            return
+
+        trim = self.trim_samples_decimated
+        rebased = rebase_causal_warmup(self._layout, trim, self.trim_minutes)
+        if rebased is None:
+            return
+
+        report: List[str] = []
+        for name, vector in rebased.items():
+            kept_steps = self._layout.lengths[name] - 2 * trim
+            valid = kept_steps - vector
+            report.append(
+                f"  {name}: {int(valid.min())}..{int(valid.max())} valid of {kept_steps} steps; "
+                f"per channel {valid.tolist()}"
+            )
+
+        self._rebased_warmup = rebased
+        print(f"Causal validity (warm-up rebased by {trim} trimmed steps):")
+        for line in report:
+            print(line)
+
+    @property
+    def causal_warmup_steps(self) -> Optional[Dict[str, np.ndarray]]:
+        r"""Per-channel warm-up in **this dataset's** step coordinates, or ``None``.
+
+        The stored attribute is untrimmed, matching the storage geometry of
+        every other field; what is returned here is rebased for
+        ``trim_minutes``, because that is the window a sample actually spans. A
+        stored warm-up of 20 at ``trim_minutes=1.0`` reports 5.
+
+        Returns:
+            ``{block: (C,) int64}`` for a causal dataset, ``None`` for a
+            two-sided or legacy one — which has no warm-up to report and is not
+            a degraded case.
+        """
+        if self._rebased_warmup is None:
+            return None
+        return {name: vector.copy() for name, vector in self._rebased_warmup.items()}
+
+    def channel_valid_mask(self, field: str) -> torch.Tensor:
+        r"""The valid region of one block as a $(T, C)$ boolean tensor.
+
+        $(T, C)$ rather than $(C, T)$: it matches the transposed layout
+        ``__getitem__`` hands out, so a model can apply it to the data without
+        transposing either. Built once per block and cached — it is a filter-bank
+        constant, identical for every sample in every file of this dataset.
+
+        Args:
+            field: A coefficient block name, e.g. ``'fhr_st'``.
+
+        Returns:
+            ``(T, C)`` bool, ``True`` where the channel has left its warm-up.
+
+        Raises:
+            ValueError: On a two-sided dataset, which has no warm-up, or on a
+                block this dataset does not store.
+        """
+        if self._rebased_warmup is None:
+            raise ValueError(
+                f"channel_valid_mask('{field}') needs a causal dataset; these files resolve to "
+                f"'{self.transform}', whose blocks carry no warm-up."
+            )
+        if field not in self._rebased_warmup:
+            raise ValueError(
+                f"'{field}' is not a coefficient block of this dataset; it stores "
+                f"{sorted(self._rebased_warmup)}"
+            )
+        cached = self._valid_mask_cache.get(field)
+        if cached is not None:
+            return cached
+
+        assert self._layout is not None  # guaranteed by _rebased_warmup being set
+        kept_steps = self._layout.lengths[field] - 2 * self.trim_samples_decimated
+        warmup = torch.from_numpy(self._rebased_warmup[field])
+        steps = torch.arange(kept_steps, dtype=warmup.dtype).unsqueeze(1)
+        mask = steps >= warmup.unsqueeze(0)
+        self._valid_mask_cache[field] = mask
+        return mask
+
+    def _check_stats_pairing(self) -> None:
+        """Refuse a stats file that describes a different dataset than this one.
+
+        Deliberately called **outside** the broad ``except Exception`` in
+        :meth:`_load_normalization_stats`: that handler turns any failure into a
+        warning and disables normalisation, so a genuinely mispaired stats file
+        caught in there would degrade a run to *unnormalised training data*
+        rather than stopping it. Both checks below are about which dataset the
+        constants were computed over, which is not a loading problem to recover
+        from.
+
+        Variants are compared **resolved**, so a legacy stats file (written
+        before the attribute existed) paired with a legacy or two-sided dataset
+        is a match and says nothing. The mismatch that matters is a causal
+        dataset normalised with two-sided constants, computed over a different
+        channel set and over the invalid region as well.
+
+        Raises:
+            ValueError: On a variant mismatch, or on a block whose channel count
+                disagrees with the stats file's.
+        """
+        try:
+            with h5py.File(self.stats_path, 'r') as f:
+                stats_transform = resolve_transform(f.attrs)
+                stats_widths = {
+                    field: int(f[field].attrs['n_channels'])
+                    for field in f.keys()
+                    if field in _COEFFICIENT_FIELDS and 'n_channels' in f[field].attrs
+                }
+        except OSError:
+            # A stats file that cannot be opened at all is not a mispairing, and
+            # how this class answers one is not this check's business: the load
+            # below hits the same error and warns exactly as it always has.
+            return
+
+        if stats_transform != self.transform:
+            raise ValueError(
+                f"Statistics/dataset variant mismatch: {self.stats_path} was computed over a "
+                f"'{stats_transform}' dataset but these files are '{self.transform}'. The two "
+                f"variants have different channels and different valid regions, so normalising "
+                f"one with the other's constants is silently wrong."
+            )
+
+        if self._layout is not None:
+            for field, width in stats_widths.items():
+                stored = self._layout.widths.get(field)
+                if stored is not None and stored != width:
+                    raise ValueError(
+                        f"Statistics/dataset width mismatch on '{field}': {self.stats_path} holds "
+                        f"{width} channels but {self._layout.path} stores {stored}. The stats file "
+                        f"is keyed to a different channel selection."
+                    )
+
     def _load_normalization_stats(self):
         """
         Load normalization statistics from HDF5 file.
@@ -566,7 +1022,10 @@ class CombinedHDF5Dataset(Dataset):
         if not os.path.exists(self.stats_path):
             warnings.warn(f"Statistics file not found: {self.stats_path}. Normalization disabled.")
             return
-        
+
+        # Before the recovering handler below, never inside it — see the method's docstring.
+        self._check_stats_pairing()
+
         try:
             stats = {}
             with h5py.File(self.stats_path, 'r') as f:
@@ -878,11 +1337,11 @@ class CombinedHDF5Dataset(Dataset):
                 data = f[name][sample_idx]
 
                 if self.trim_minutes is not None:
-                    if name in ['fhr', 'up']:
+                    if name in _RAW_FIELDS:
                         start_trim = self.trim_samples_raw
                         end_trim = -self.trim_samples_raw if self.trim_samples_raw > 0 else None
                         data = data[start_trim:end_trim]
-                    elif name in ['fhr_st', 'fhr_ph', 'fhr_up_ph', 'up_st', 'up_ph']:
+                    elif name in _COEFFICIENT_FIELDS:
                         start_trim = self.trim_samples_decimated
                         end_trim = -self.trim_samples_decimated if self.trim_samples_decimated > 0 else None
                         data = data[:, start_trim:end_trim]
@@ -900,13 +1359,12 @@ class CombinedHDF5Dataset(Dataset):
                     tensor = self._create_tensor(np.asarray(data))
 
                     # Apply normalization if enabled and applicable
-                    if (self.normalization_enabled and
-                        name in ['fhr', 'up', 'fhr_st', 'fhr_ph', 'fhr_up_ph', 'up_st', 'up_ph']):
+                    if self.normalization_enabled and name in _NORMALISED_FIELDS:
                         tensor = self._normalize_data(name, tensor)
 
                     # SPEED OPTIMIZATION: Apply permutation here once instead of multiple times in training
                     # Convert from HDF5 format (channels, sequence) to model format (sequence, channels)
-                    if name in ['fhr_st', 'fhr_ph', 'fhr_up_ph', 'up_st', 'up_ph'] and tensor.dim() == 2:
+                    if name in _COEFFICIENT_FIELDS and tensor.dim() == 2:
                         tensor = tensor.transpose(0, 1)  # (channels, seq) -> (seq, channels)
 
                     out[name] = tensor
@@ -914,6 +1372,18 @@ class CombinedHDF5Dataset(Dataset):
         except Exception as e:
             warnings.warn(f"Error loading sample {idx} from {self.paths[file_idx]}: {e}")
             raise
+
+        if self.emit_validity_mask:
+            # Deliberately outside the loop above: a mask must bypass
+            # ``_create_tensor`` (which casts through float32 and would turn a
+            # boolean mask into floats), normalisation (there is nothing to
+            # standardise) and the transpose (it is already in (T, C) layout).
+            # The tensor is the shared cached constant, not a per-sample copy —
+            # collating and stacking both copy it, so a consumer sees its own
+            # batched array; treat the per-sample one as read-only.
+            for name in sorted(_COEFFICIENT_FIELDS):
+                if name in out:
+                    out[f"{name}_valid"] = self.channel_valid_mask(name)
 
         out.setdefault('source_file', os.path.normpath(self.paths[file_idx]))
         out.setdefault('source_file_basename', os.path.basename(self.paths[file_idx]))

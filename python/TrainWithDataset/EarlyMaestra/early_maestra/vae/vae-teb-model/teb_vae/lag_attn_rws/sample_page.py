@@ -22,6 +22,14 @@ One figure per sample, from a single forward pass:
 6. The lag-attention matrix, head-averaged, with its per-step argmax overlaid.
 7. The source-conditioned KL attributed across lags, $\widetilde K_{t,\ell}$.
 
+Between rows $2$ and $3$ the page draws **one optional row per gated input stream** -- the target
+and the source exactly as the encoders receive them, surviving channels only, each already shifted
+by its own causal delay. They are what the seven rows below are conditioned on, and they are drawn
+from :class:`InputStreamPanel` objects the caller supplies; a caller that supplies none gets the
+seven-row page unchanged. See :mod:`teb_vae.lag_attn_rws.input_budget`, which builds them and which
+also draws the run-level companion figure: the same channels against the forecast window, which is
+where "what may this model be asked to predict" is answered.
+
 **Rows 3-7 are drawn over the trained anchors only.** The warm-up prefix $[0, w)$ is excluded from
 every one of them, and the tail $[T - H, T)$ from all but the attention: those columns are not
 merely uninteresting, they carry no gradient at all -- the tail is neither decoded nor inside the
@@ -57,7 +65,7 @@ rather than on every figure this builds.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -94,6 +102,8 @@ from utils.style import style_axes  # noqa: E402
 __all__ = [
     "BAND_SIGMAS",
     "ForecastRowInputs",
+    "InputStreamPanel",
+    "annotate_channel_frequencies",
     "build_diagnostic_figure",
     "raw_context_row",
     "raw_forecast_rows",
@@ -155,6 +165,148 @@ def _denormalised(
             _SIGNAL_UNITS[field],
         )
     return to_numpy(values), "normalised"
+
+
+@dataclass(frozen=True)
+class InputStreamPanel:
+    r"""One of the model's input streams, **after the causal guard**, ready to draw.
+
+    The page's other rows are all statements about what the model produced; this one is the only
+    statement about what it was given. It is drawn from the tensor the encoder actually receives
+    -- the surviving channels only, each already shifted by its own delay $\delta_c$ -- rather
+    than from the stored block, because the difference between those two is precisely the guard
+    the row exists to make visible.
+
+    Assembled by :func:`~teb_vae.lag_attn_rws.input_budget.stream_panels`, which owns the filter
+    bank and the reach arithmetic. Passed in as plain arrays so this module stays a drawing
+    module: nothing here imports ``kymatio``, and the evaluation, which draws the same page, does
+    not acquire it by importing this one.
+
+    Attributes:
+        name: Stream name, ``'target'`` or ``'source'``. Becomes the row key ``input_<name>``.
+        values: The gated stream of the sample being drawn, $(T, C_{\mathrm{kept}})$, in the
+            channel order the encoder sees.
+        delays: One delay $\delta_c$ in decimated steps per surviving channel, same order. All
+            zero for an unguarded run, which draws as a flat staircase at $t = 0$.
+        center_hz: One representative centre frequency per surviving channel, same order;
+            ``nan`` where the channel has none (the order-$0$ scattering low-pass).
+        blocks: ``(name, start, stop)`` per stored block, as half-open ranges **into the
+            surviving channels**, for the row's dividers and its y-axis labels.
+        title: The panel title, which is where the budget, the surviving counts and the delay
+            range are stated.
+    """
+
+    name: str
+    values: np.ndarray
+    delays: np.ndarray
+    center_hz: np.ndarray
+    blocks: Tuple[Tuple[str, int, int], ...]
+    title: str
+
+
+def annotate_channel_frequencies(ax: Any, center_hz: np.ndarray, *, count: int = 8) -> Any:
+    """Label a channel axis with the centre frequencies of a sample of its channels.
+
+    A twin axis carrying tick *labels* at channel positions, not a frequency scale: the channel
+    axis is not monotone in frequency -- it descends within a block and restarts at the next one
+    -- so a continuous secondary scale would be a straight misreading. Shared by the per-sample
+    input rows and the run-level budget figure so a channel is annotated identically in both.
+
+    Args:
+        ax: The axes whose y-axis is the channel index.
+        center_hz: One centre frequency per channel, in Hz; ``nan`` where the channel has none.
+        count: How many channels to label.
+
+    Returns:
+        The twin axes, or ``None`` when there are no channels to label.
+    """
+    values = np.asarray(center_hz, dtype=float)
+    if not values.size:
+        return None
+    sampled = np.unique(np.linspace(0, values.size - 1, num=min(count, values.size), dtype=int))
+    secondary = ax.twinx()
+    secondary.set_ylim(ax.get_ylim())
+    secondary.set_yticks(sampled)
+    secondary.set_yticklabels(
+        [
+            "$S_0$" if not np.isfinite(values[index]) else f"{values[index]:.3g}"
+            for index in sampled
+        ],
+        fontsize=6,
+    )
+    secondary.set_ylabel("channel centre freq. (Hz)", fontsize=7)
+    secondary.grid(False)
+    return secondary
+
+
+def _input_stream_row(ax: Any, panel: InputStreamPanel, *, t_max: float, seconds_per_step: float):
+    """Draw one gated input stream as a channel-by-time heatmap, and return the image.
+
+    Three things are marked on it, and each is a property of the guard rather than of the sample:
+    the block dividers, the per-channel centre frequency on a right-hand axis, and the staircase
+    at $t = \\delta_c$ before which the channel carries the guard's zero fill rather than data.
+
+    Args:
+        ax: The row's main axes.
+        panel: The stream to draw.
+        t_max: The recording's length in seconds, so the row shares the page's time axis.
+        seconds_per_step: $\\Delta$, for placing the delay staircase in physical time.
+
+    Returns:
+        The ``AxesImage``, for the caller's colorbar.
+    """
+    values = np.asarray(panel.values, dtype=float)
+    n_channels = values.shape[1]
+
+    # Robust limits rather than min/max: these are z-scored wavelet coefficients, and one
+    # heavy-tailed channel otherwise sets the scale for all of them and flattens the rest to a
+    # single colour. NaN-aware because a gated stream may carry non-finite values from the loader.
+    finite = values[np.isfinite(values)]
+    low, high = (
+        (float(np.percentile(finite, 1.0)), float(np.percentile(finite, 99.0)))
+        if finite.size
+        else (0.0, 1.0)
+    )
+    if not high > low:
+        high = low + 1.0
+
+    image = ax.imshow(
+        values.T, aspect="auto", cmap="viridis", origin="lower",
+        vmin=low, vmax=high, extent=[0.0, t_max, -0.5, n_channels - 0.5],
+        interpolation=_IMSHOW_INTERPOLATION,
+    )
+
+    # Block dividers and their names. Drawn from the panel's own spans rather than from a channel
+    # count restated here: under a reach budget the blocks lose different numbers of channels, so
+    # the boundary is not where the declared widths would put it.
+    ticks, labels = [], []
+    for index, (name, start, stop) in enumerate(panel.blocks):
+        if index:
+            ax.axhline(start - 0.5, color="white", linewidth=1.0, linestyle="--")
+        ticks.append(0.5 * (start + stop) - 0.5)
+        labels.append(name)
+    ax.set_yticks(ticks)
+    ax.set_yticklabels(labels, fontsize=7)
+
+    annotate_channel_frequencies(ax, panel.center_hz)
+
+    # Where each channel's data begins. Under the guard the first $\delta_c$ steps of a channel
+    # have no source and are emitted as zero, and the whole staircase must sit inside the shaded
+    # warm-up -- that requirement is what `resolve_channel_budget` enforces, and this is where a
+    # reader can see that it holds.
+    if n_channels and int(np.max(panel.delays)) > 0:
+        ax.step(
+            np.asarray(panel.delays, dtype=float) * seconds_per_step,
+            np.arange(n_channels), where="mid",
+            color=COLOR_ORANGE, linewidth=0.9,
+            label="guard: first step with data, $\\delta_c$",
+        )
+        ax.legend(loc="lower right", fontsize=6, framealpha=0.9)
+
+    ax.set_title(panel.title, fontsize=9, pad=6)
+    ax.set_xlabel("Time (s)", fontsize=8)
+    ax.set_ylabel("Input channel", fontsize=8)
+    return image
 
 
 @dataclass(frozen=True)
@@ -381,6 +533,7 @@ def build_diagnostic_figure(
     delay_steps: int = 0,
     forecast_rows: Optional[Callable[[ForecastRowInputs], None]] = None,
     batch: Any = None,
+    input_streams: Optional[Sequence[InputStreamPanel]] = None,
 ) -> Any:
     r"""Build the seven-row diagnostic figure for one sample.
 
@@ -416,6 +569,9 @@ def build_diagnostic_figure(
         batch: The loader batch, passed straight to ``forecast_rows``. Unused by the raw page,
             which reads its traces off ``fhr_raw``, and the only route to them for an
             implementation whose target is not the raw signal.
+        input_streams: The model's gated input streams, one row each, drawn between the forecast
+            and the latent. ``None`` or empty -- the default, so every existing caller is
+            unaffected -- draws the seven rows alone.
 
     Returns:
         The matplotlib ``Figure``. The caller saves and closes it.
@@ -440,11 +596,16 @@ def build_diagnostic_figure(
     kl_lag_np = to_numpy(outs["source_kl_lag_map"][i])                # (T, L)
     d_z, n_lags = mu_prior_np.shape[1], alpha_np.shape[1]
 
+    # One row per gated input stream, between what the model produced and the latent it produced
+    # it from. Built into the row list rather than reserved unconditionally, so a caller that
+    # passes none gets exactly the page it got before.
+    panels = tuple(input_streams or ())
     row_specs = [
         ("raw", 0.9),
         # Taller than the other line rows: it now carries the whole recording rather than one
         # 480-sample window, and two forecasts with their bands on top of it.
         ("forecast", 1.3),
+        *((f"input_{panel.name}", 1.25) for panel in panels),
         ("latent", 1.2),
         ("kld_dims", 1.1),
         ("kld_total", 0.85),
@@ -566,6 +727,19 @@ def build_diagnostic_figure(
             finalise_time_axis=finalise_time_axis,
         )
     )
+
+    # ---- Rows: the gated input streams, as the encoders receive them --------
+    # Drawn over the whole recording, not cut to the trained anchors like the rows below: the
+    # warm-up columns are where the guard's zero fill lives, and cutting them would remove the
+    # one span the delay staircase exists to be checked against.
+    for panel in panels:
+        ax, cax = row_axes(f"input_{panel.name}")
+        image = _input_stream_row(
+            ax, panel, t_max=t_max, seconds_per_step=seconds_per_step
+        )
+        heatmap_spines(ax)
+        attach_cbar(cax, image, "value")
+        finalise_time_axis(ax)
 
     # ---- Row: prior mean over the source-derived delta ---------------------
     ax, cax = row_axes("latent")

@@ -346,10 +346,16 @@ def test_the_validation_figures_are_written_by_a_real_fit(fit):
     """
     driver, _, _ = fit
 
-    figures = list((Path(driver.train_results_dir) / "lag_attn_rws_diagnostics").glob("*.pdf"))
+    directory = Path(driver.train_results_dir) / "lag_attn_rws_diagnostics"
+    figures = list(directory.glob("lag_attn_rws_epoch*.pdf"))
 
     # One per requested example per plotted epoch, at plot_frequency 1.
     assert len(figures) == 2 * SMOKE_EPOCHS, [path.name for path in figures]
+    # And the run-level causal-input-budget figure, exactly once however many epochs ran: it
+    # describes the guard the model was built with, which no epoch changes.
+    assert [path.name for path in directory.glob("causal_input_budget.*")] == [
+        "causal_input_budget.pdf"
+    ]
 
 
 def test_the_figure_builder_receives_every_key_it_reads(fit):

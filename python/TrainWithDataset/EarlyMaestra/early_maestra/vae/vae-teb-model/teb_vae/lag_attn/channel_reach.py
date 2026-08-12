@@ -103,6 +103,48 @@ def block_reach_seconds() -> Dict[str, Tuple[float, ...]]:
     }
 
 
+@lru_cache(maxsize=1)
+def block_center_hz() -> Dict[str, Tuple[float, ...]]:
+    r"""Representative centre frequency in Hz, per channel, for each stored feature block.
+
+    The companion of :func:`block_reach_seconds`, and deliberately the same shape: reach answers
+    "how far into its own future does this channel see", this one answers "what does it see",
+    and a figure that draws the guard needs both against one channel axis.
+
+    The convention is the evaluation's, not a new one --
+    :mod:`teb_vae.lag_attn.eval.band_partition` bands a phase channel by $\xi_j$, the **faster**
+    leg of the pair, so this returns that. Note that the two are not interchangeable: a pair's
+    reach is set by its *slower* leg (see :func:`block_reach_seconds`), so a fast-labelled phase
+    channel can still be an expensive one, which is exactly the tradeoff the budget figure draws.
+
+    The order-$0$ scattering channel $S_0 = x \star \phi$ has no centre frequency and is reported
+    as ``nan`` rather than as $0$ Hz: "the low-pass" and "a $0$ Hz wavelet" are different claims,
+    and the second would put it in the slow-baseline band as though it were one channel of the
+    bank.
+
+    Returns:
+        ``{'fhr_st': (43,), 'fhr_ph': (66,), 'up_st': (43,), 'up_ph': (15,)}``, each in the
+        stored channel order, in Hz.
+    """
+    bank = build_filter_bank()
+    hz = bank.hz
+    # S0 first, then the order-1 filters in bank order -- the layout the pipeline stores and
+    # `block_reach_seconds` assumes, so the two vectors index the same channels.
+    scattering = (float("nan"),) + tuple(float(value) for value in hz)
+
+    def phase_hz(band: Tuple[float, float]) -> Tuple[float, ...]:
+        return tuple(
+            float(hz[j]) for _, j in select_phase_pairs(bank, band[0], band[1])
+        )
+
+    return {
+        "fhr_st": scattering,
+        "fhr_ph": phase_hz(TARGET_PHASE_BAND_HZ),
+        "up_st": scattering,
+        "up_ph": phase_hz(SOURCE_PHASE_BAND_HZ),
+    }
+
+
 def stream_reach_seconds(*, use_up_st: bool = True) -> Dict[str, Tuple[float, ...]]:
     r"""Per-channel reach for the two streams the model actually consumes.
 
