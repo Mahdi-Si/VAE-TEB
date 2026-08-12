@@ -1,3 +1,28 @@
+"""Manual plotting and statistics walkthrough over a dataset file — not an automated test.
+
+Despite the ``test_`` prefix it defines no test function; it is a script driven by the
+``__main__`` block below, and its module-level imports are written for execution from inside
+``hdf5_dataset/`` (``from hdf5_dataset import ...``, ``from calculate_dataset_stats import ...``),
+which do not resolve from the repository root. pytest collected it regardless and the resulting
+``ImportError`` aborted the whole ``hdf5_dataset`` run before any real test executed.
+
+The guard below stops collection at the first line rather than at the imports, so the suite runs.
+The script itself is unchanged and still works the way it always has, run directly with a real
+dataset path. Repairing it into a test is a separate job: what it does — write stats, render
+histograms, plot random samples — has no assertion to make.
+"""
+if __name__ != "__main__":
+    # Reached only when something imports this file, which in practice means pytest collecting it.
+    # Skipping before the imports below keeps the run alive; skipping on the module name rather
+    # than unconditionally keeps the ``__main__`` path — the only supported way to use this file —
+    # working exactly as it did.
+    import pytest
+
+    pytest.skip(
+        "plotting script, not an automated test; run it directly instead",
+        allow_module_level=True,
+    )
+
 import os
 import random
 import numpy as np

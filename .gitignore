@@ -2,6 +2,7 @@ data/
 # Committed test fixtures that happen to live in a `data/` directory. A parent directory cannot be
 # re-included one file at a time, so the directory itself is un-ignored first.
 !teb_vae/lag_attn_rws/tests/data/
+!hdf5_dataset/tests/data/
 .idea/
 .vscode/
 __pycache__/

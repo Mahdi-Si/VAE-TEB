@@ -1,16 +1,25 @@
 import os
-import h5py
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib
 import random
-import torch
-from typing import List, Optional
+from typing import Optional
 
-from hdf5_dataset.hdf5_dataset import CombinedHDF5Dataset, normalize_tensor_data
-from calculate_dataset_stats import DatasetStatsCalculator
+from hdf5_dataset.hdf5_dataset import CombinedHDF5Dataset
 
 matplotlib.use('Agg')
+
+#: Coefficient panels, in display order: ``(field, y-axis label, panel title, colourbar label)``.
+#: Which of them a figure actually gets is decided per sample, because a causal file stores no
+#: ``fhr_up_ph`` — the cross-phase block is not produced causally — and reaching for it there
+#: raises ``AttributeError`` from the middle of a plotting loop, naming nothing useful.
+COEFFICIENT_PANELS = (
+    ('fhr_st', 'Scattering Channels', 'Normalized FHR Scattering Transform',
+     'Normalized Amplitude'),
+    ('fhr_ph', 'Phase Channels', 'Normalized FHR Phase Harmonics', 'Normalized Phase'),
+    ('fhr_up_ph', 'Cross-Phase Channels', 'Normalized FHR-UP Cross-Phase',
+     'Normalized Cross-Phase'),
+)
 
 
 def plot_random_dataset_samples(
@@ -24,10 +33,12 @@ def plot_random_dataset_samples(
     """
     Plot randomly selected samples from the HDF5 dataset showing:
     - FHR and UP signals (line plots)
-    - Normalized fhr_st, fhr_ph, fhr_up_ph (imshow plots)
-    
+    - one imshow panel per stored FHR coefficient block, from
+      :data:`COEFFICIENT_PANELS` filtered by what the file carries — three on a
+      two-sided file, two on a causal one, which stores no ``fhr_up_ph``
+
     Uses professional color scheme from the plotting callback.
-    
+
     Args:
         hdf5_file_path: Path to the HDF5 dataset file
         stats_file_path: Path to the statistics file for normalization
@@ -107,21 +118,22 @@ def plot_random_dataset_samples(
         
         # Load sample
         sample = dataset[sample_idx]
-        
+
         # Extract data
         fhr_signal = sample.fhr.cpu().numpy()  # Raw FHR signal
         up_signal = sample.up.cpu().numpy()    # Raw UP signal
-        fhr_st_norm = sample.fhr_st.cpu().numpy()    # Normalized scattering transform
-        fhr_ph_norm = sample.fhr_ph.cpu().numpy()    # Normalized phase harmonics
-        fhr_up_ph_norm = sample.fhr_up_ph.cpu().numpy()  # Normalized cross-phase
-        
+        # Whatever coefficient blocks this file carries, in the documented order. A two-sided file
+        # yields all three and the figure is what it always was; a causal file yields two.
+        panels = [entry for entry in COEFFICIENT_PANELS if entry[0] in sample]
+
         # Create time axis for signals
         N = len(fhr_signal)
         t_signal = np.arange(0, N) / Fs
-        
-        # Create figure with 5 subplots (2 signals + 3 imshow)
-        fig, axes = plt.subplots(5, 1, figsize=(20, 20), constrained_layout=True)
-        
+
+        # Create figure: two signal plots above one imshow per coefficient block
+        n_rows = 2 + len(panels)
+        fig, axes = plt.subplots(n_rows, 1, figsize=(20, 4 * n_rows), constrained_layout=True)
+
         # Configure scientific paper grid style for all subplots
         for ax in axes[:2]:  # Only for signal plots
             ax.grid(True, linestyle='-', alpha=0.4, linewidth=0.4, color='#D2C1B6')
@@ -148,40 +160,22 @@ def plot_random_dataset_samples(
         axes[1].set_title('Uterine Pressure (UP) Signal', fontweight='normal', pad=12)
         axes[1].autoscale(enable=True, axis='x', tight=True)
         
-        # Plot 3: Normalized FHR Scattering Transform
+        # Coefficient panels, one per stored block.
         # Note: Data comes from dataloader as (sequence, channels), transpose for correct display
-        im1 = axes[2].imshow(fhr_st_norm.T, aspect='auto', cmap='seismic', origin='upper', interpolation='none')
-        axes[2].set_ylabel('Scattering Channels', fontweight='normal')
-        axes[2].set_title('Normalized FHR Scattering Transform', fontweight='normal', pad=12)
-        cbar1 = plt.colorbar(im1, ax=axes[2], shrink=0.8)
-        cbar1.ax.tick_params(labelsize=10, colors='#666666')
-        cbar1.set_label('Normalized Amplitude', fontweight='normal', fontsize=11, color='#666666')
-        cbar1.outline.set_color('#A2B9A7')
-        cbar1.outline.set_linewidth(0.7)
-        
-        # Plot 4: Normalized FHR Phase Harmonics
-        # Note: Data comes from dataloader as (sequence, channels), transpose for correct display
-        im2 = axes[3].imshow(fhr_ph_norm.T, aspect='auto', cmap='seismic', origin='upper', interpolation='none')
-        axes[3].set_ylabel('Phase Channels', fontweight='normal')
-        axes[3].set_title('Normalized FHR Phase Harmonics', fontweight='normal', pad=12)
-        cbar2 = plt.colorbar(im2, ax=axes[3], shrink=0.8)
-        cbar2.ax.tick_params(labelsize=10, colors='#666666')
-        cbar2.set_label('Normalized Phase', fontweight='normal', fontsize=11, color='#666666')
-        cbar2.outline.set_color('#A2B9A7')
-        cbar2.outline.set_linewidth(0.7)
-        
-        # Plot 5: Normalized FHR-UP Cross-Phase
-        # Note: Data comes from dataloader as (sequence, channels), transpose for correct display
-        im3 = axes[4].imshow(fhr_up_ph_norm.T, aspect='auto', cmap='seismic', origin='upper', interpolation='none')
-        axes[4].set_ylabel('Cross-Phase Channels', fontweight='normal')
-        axes[4].set_xlabel('Time Steps', fontweight='normal')
-        axes[4].set_title('Normalized FHR-UP Cross-Phase', fontweight='normal', pad=12)
-        cbar3 = plt.colorbar(im3, ax=axes[4], shrink=0.8)
-        cbar3.ax.tick_params(labelsize=10, colors='#666666')
-        cbar3.set_label('Normalized Cross-Phase', fontweight='normal', fontsize=11, color='#666666')
-        cbar3.outline.set_color('#A2B9A7')
-        cbar3.outline.set_linewidth(0.7)
-        
+        for row, (field, ylabel, title, cbar_label) in enumerate(panels, start=2):
+            axis = axes[row]
+            image = axis.imshow(sample[field].cpu().numpy().T, aspect='auto', cmap='seismic',
+                                origin='upper', interpolation='none')
+            axis.set_ylabel(ylabel, fontweight='normal')
+            axis.set_title(title, fontweight='normal', pad=12)
+            if row == n_rows - 1:
+                axis.set_xlabel('Time Steps', fontweight='normal')
+            cbar = plt.colorbar(image, ax=axis, shrink=0.8)
+            cbar.ax.tick_params(labelsize=10, colors='#666666')
+            cbar.set_label(cbar_label, fontweight='normal', fontsize=11, color='#666666')
+            cbar.outline.set_color('#A2B9A7')
+            cbar.outline.set_linewidth(0.7)
+
         # Set overall title
         sample_guid = sample.guid if hasattr(sample, 'guid') else f"Sample_{sample_idx}"
         fig.suptitle(f'Dataset Sample Analysis — {sample_guid}', 

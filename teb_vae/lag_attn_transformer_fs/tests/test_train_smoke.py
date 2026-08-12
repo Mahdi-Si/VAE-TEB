@@ -420,8 +420,12 @@ def test_the_page_is_written_once_per_plotted_epoch_per_drawn_sample(fit):
         item for item in trainer.callbacks if type(item).__name__ == "LagAttnRwsPlotCallback"
     )
 
+    # The page prefix, not `*.pdf`: the callback writes the run-level causal-input-budget figure
+    # into the same directory, and it is not a page of any epoch.
     figures = sorted(
-        (Path(driver.train_results_dir) / "lag_attn_rws_diagnostics").glob("*.pdf")
+        (Path(driver.train_results_dir) / "lag_attn_rws_diagnostics").glob(
+            "lag_attn_rws_epoch*.pdf"
+        )
     )
     # The stem is `..._epoch%04d_sample%d_%s`, so the epoch is recoverable from the name; a page per
     # epoch is the property, not a total, because the batch may hold fewer samples than the config

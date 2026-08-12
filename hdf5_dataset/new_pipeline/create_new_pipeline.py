@@ -14,6 +14,7 @@ import math
 import json
 import pickle
 import random
+import hashlib
 import logging
 import traceback
 from collections import defaultdict
@@ -34,6 +35,21 @@ from tqdm import tqdm
 from early_maestra.adaptor.mimo_adaptor import EarlyMaestraMimoAdaptor
 from Variational_AutoEncoder.seqvae_teb.hdf5_dataset.kymatio_phase_scattering import (
     KymatioPhaseScattering1D,
+)
+# Absolute, with the production prefix, unlike every other module in this package: this file is
+# launched as a script and so has no ``__package__`` for a relative import to resolve against.
+from Variational_AutoEncoder.seqvae_teb.hdf5_dataset.causal_scattering import (
+    CAUSAL_KERNEL_TAPS,
+    CAUSAL_WARMUP_QUANTILE,
+    GAMMATONE_ORDER,
+    CausalChannelPlan,
+    build_causal_bank,
+    build_channel_plan,
+    build_filter_bank,
+)
+from Variational_AutoEncoder.seqvae_teb.hdf5_dataset.causal_scattering_torch import (
+    CausalTorchBank,
+    transform_batch_numpy,
 )
 
 # ---------------------------------------------------------------------------
@@ -181,6 +197,49 @@ PHASE_HARMONIC_K_STEPS = (4, 6, 8)
 # `harmonic_ratios=[2, 3]` silently matches zero harmonic-3 coefficients —
 # $\log_2 3 = 1.585$ needs $k = 6.34$, which is off-grid. See doc §3.3.)
 PHASE_POWER_REL_TOL = 0.05
+
+
+# ---------------------------------------------------------------------------
+# Transform variant
+# ---------------------------------------------------------------------------
+# The stored features are wavelet transforms, and the two-sided ones read raw samples on both
+# sides of the step they are stored at -- so a model told it is conditioning on "the past up to
+# $t$" reads part of the interval it is asked to forecast. The causal variant replaces the bank
+# with a strictly one-sided one, drops the channels whose warm-up outruns the stored segment, and
+# records the per-channel warm-up so every consumer can honour it.
+#
+# The variant is a root attribute of every file this pipeline writes from now on, which makes a
+# file self-describing. A file **without** that attribute is a legacy two-sided file: absence is
+# the normal, expected state of every dataset already on disk and is never a defect.
+TWO_SIDED = "two_sided"
+CAUSAL = "causal"
+TRANSFORMS = (TWO_SIDED, CAUSAL)
+
+# Blocks a file may store, and the two the causal variant does not produce. ``fhr_up_ph`` mixes
+# both signals into one coefficient, no model loads it, and it is the one block with no ``sel_*``
+# provenance to verify channel identity against.
+COEFFICIENT_BLOCKS = ("fhr_st", "fhr_ph", "fhr_up_ph", "up_st", "up_ph")
+CAUSAL_BLOCKS = ("fhr_st", "fhr_ph", "up_st", "up_ph")
+
+
+def validate_transform(transform: str) -> str:
+    """Refuse an unknown transform variant, naming both valid values.
+
+    Args:
+        transform: The requested variant.
+
+    Returns:
+        The variant, unchanged, so this can wrap an assignment.
+
+    Raises:
+        ValueError: If it is not one of :data:`TRANSFORMS`.
+    """
+    if transform not in TRANSFORMS:
+        raise ValueError(
+            f"unknown transform {transform!r}; use {TWO_SIDED!r} for the two-sided kymatio "
+            f"bank or {CAUSAL!r} for the one-sided gammatone bank"
+        )
+    return transform
 
 
 @dataclass(frozen=True)
@@ -403,6 +462,32 @@ def deduplicate_segments(
 # ============================================================================
 # HDF5 I/O
 # ============================================================================
+#: ``source_pickle_path`` when a build did not resume from a fold pickle. An explicit sentinel
+#: rather than an empty string: ``""`` is indistinguishable from an attribute written out of an
+#: unset variable, and this is the record that says whether two datasets are comparable at all.
+NO_SOURCE_PICKLE = "<fresh run>"
+
+
+def guid_set_digest(records_list: Optional[List[str]]) -> str:
+    """A stable digest of the GUID set a shard is built from.
+
+    Comparability with an existing dataset is the entire justification for the resumed-run path:
+    a causal build is only comparable to the two-sided one segment for segment if both consumed
+    the same fold pickle and therefore the same GUIDs. Nothing records that today, which makes the
+    claim unverifiable once the run is over. Sorting before hashing makes the digest a property of
+    the *set* rather than of the order the records happened to be discovered in, so two builds of
+    the same shard agree whatever their variant.
+
+    Args:
+        records_list: The ``.mat`` paths this shard is built from; ``None`` is treated as empty.
+
+    Returns:
+        The SHA-256 hex digest of the sorted GUID stems.
+    """
+    stems = sorted({os.path.splitext(os.path.basename(r))[0] for r in (records_list or [])})
+    return hashlib.sha256("\n".join(stems).encode("utf-8")).hexdigest()
+
+
 def _write_selection_attrs(dataset, selection: PhaseChannelSelection) -> None:
     r"""Attach per-channel selection provenance to a coefficient dataset.
 
@@ -438,14 +523,51 @@ def _write_selection_attrs(dataset, selection: PhaseChannelSelection) -> None:
     dataset.attrs["sel_k_steps"] = np.asarray(selection.k_steps, dtype=np.int32)
 
 
+def _write_causal_attrs(dataset, plan: CausalChannelPlan) -> None:
+    r"""Attach per-channel warm-up and delay to a causal coefficient dataset.
+
+    ``causal_warmup_steps`` is the leading region in which a channel's output
+    is a function of the assumed pre-recording history rather than of the
+    recording, in **untrimmed** decimated steps — the storage geometry every
+    other stored field uses, so a consumer reading the file at any trim rebases
+    it itself. Storing it trimmed would make the attribute silently wrong for
+    every other trim.
+
+    It is an attribute and not a stored mask because it is a property of the
+    filter bank and is therefore identical for every segment in every file: a
+    per-sample $(C, T)$ boolean mask would replicate one constant array tens of
+    thousands of times, about 76 KB per sample against about 600 bytes per file.
+
+    Note:
+        ``causal_delay_s`` — the composed group delay each channel is stale by —
+        has **no reader inside this pipeline**, which does not compensate for
+        it. It is written ahead of its consumer, exactly as the ``sel_*`` attrs
+        were: the future reader is whatever replaces the two-sided $L_{95}$
+        reach guard in ``teb_vae/lag_attn/channel_reach.py``, which is
+        meaningless on causal data because future energy there is exactly zero.
+        That guard needs a staleness number per channel, and this is it.
+
+    Args:
+        dataset: Target HDF5 coefficient dataset.
+        plan: The block's channel plan, which the dataset was sized from.
+    """
+    dataset.attrs["causal_warmup_steps"] = plan.warmup_steps.astype(np.int32)
+    dataset.attrs["causal_delay_s"] = plan.delay_s.astype(np.float32)
+
+
 def create_initial_hdf5(
     path: str,
     len_signal: int,
     len_sequence: int,
     fhr_ph_selection: PhaseChannelSelection,
-    n_cross_phase_channels: int,
+    n_fhr_st_channels: int,
+    n_cross_phase_channels: Optional[int],
     n_up_st_channels: int = 0,
     up_ph_selection: Optional[PhaseChannelSelection] = None,
+    transform: str = TWO_SIDED,
+    channel_plan: Optional[Dict[str, CausalChannelPlan]] = None,
+    source_pickle_path: Optional[str] = None,
+    source_guid_digest: Optional[str] = None,
 ) -> None:
     """Create a new empty HDF5 file with the full dataset schema.
 
@@ -453,24 +575,79 @@ def create_initial_hdf5(
     the UP self-phase harmonics live in a separate first-class ``up_ph``
     dataset with their own per-channel asinh stats.
 
-    The two self-phase blocks are sized from their selections rather than from
-    a channel count, so the stored width and the mask applied at write time
-    cannot disagree. Both also carry ``sel_*`` provenance attrs describing
-    every channel (see :func:`_write_selection_attrs`).
+    Every block is sized from what will actually be written into it — the two
+    self-phase blocks from their selections, the scattering blocks from the
+    resolved width — so the stored width and the data written at write time
+    cannot disagree. Both self-phase blocks carry ``sel_*`` provenance attrs
+    describing every channel (see :func:`_write_selection_attrs`), identically
+    on both variants: the causal build changes which *scattering* channels
+    survive and changes no phase selection at all.
+
+    The file is self-describing: ``transform`` is written on both variants, and
+    a causal file additionally records the filter-bank constants its warm-up
+    vectors were derived under. A file **without** ``transform`` is a legacy
+    two-sided file — the normal state of every dataset already on disk — and
+    needs no migration.
 
     Args:
         path: Output HDF5 file path (overwrites if exists).
         len_signal: Raw signal length (e.g. 5760).
+        len_sequence: Sequence dimension length.
         fhr_ph_selection: Selection for ``fhr_ph``; supplies its width and
             provenance attrs.
-        len_sequence: Sequence dimension length.
+        n_fhr_st_channels: Channels for ``fhr_st``; 43 two-sided, 36 causal.
         n_cross_phase_channels: Channels for ``fhr_up_ph`` (pure cross-phase,
-            equals ``masks["n_cross"]``).
+            equals ``masks["n_cross"]``); ``None`` = do not create the dataset,
+            which is what the causal variant does.
         n_up_st_channels: Number of UP scattering channels (0 = do not create
             ``up_st`` dataset).
         up_ph_selection: Selection for ``up_ph``; ``None`` = do not create the
             ``up_ph`` dataset.
+        transform: ``'two_sided'`` or ``'causal'``.
+        channel_plan: Required for ``'causal'``: supplies the per-channel
+            warm-up and delay attrs, and is cross-checked against the widths.
+        source_pickle_path: The fold pickle this build resumed from, recorded
+            so comparability with the dataset that produced it is checkable
+            afterwards. ``None`` records :data:`NO_SOURCE_PICKLE`.
+        source_guid_digest: Digest of the GUID set written here, from
+            :func:`guid_set_digest`. ``None`` records the digest of the empty
+            set, which is what a file created without a records list contains.
+
+    Raises:
+        ValueError: On an unknown *transform*; on a causal file with no channel
+            plan, with a cross-phase width, or whose widths disagree with the
+            plan.
     """
+    validate_transform(transform)
+    if transform == CAUSAL:
+        if channel_plan is None:
+            raise ValueError(
+                "a causal file needs its channel_plan: the stored warm-up vectors and the "
+                "surviving channel set both come from it, and neither is recoverable afterwards"
+            )
+        if n_cross_phase_channels is not None:
+            raise ValueError(
+                f"the causal variant does not produce fhr_up_ph, so n_cross_phase_channels must "
+                f"be None, not {n_cross_phase_channels}. Creating the dataset would leave it "
+                f"empty for the whole build."
+            )
+        if up_ph_selection is None:
+            raise ValueError("a causal file needs up_ph_selection; up_ph is not optional there")
+        # The widths and the plan come from one resolver, so a disagreement here means the
+        # parameters and the plan were resolved at different times or from different banks —
+        # which would store a warm-up vector describing channels the data does not contain.
+        for name, width in (
+            ("fhr_st", n_fhr_st_channels),
+            ("fhr_ph", fhr_ph_selection.n_channels),
+            ("up_st", n_up_st_channels),
+            ("up_ph", up_ph_selection.n_channels),
+        ):
+            if channel_plan[name].n_channels != width:
+                raise ValueError(
+                    f"channel plan for '{name}' has {channel_plan[name].n_channels} channels but "
+                    f"the dataset is being created {width} wide"
+                )
+
     try:
         os.remove(path)
     except OSError:
@@ -479,6 +656,25 @@ def create_initial_hdf5(
     chunk_n = 32
     str_dt = h5py.string_dtype(encoding="utf-8")
     with h5py.File(path, "w", libver="latest") as h5f:
+        h5f.attrs["transform"] = transform
+        # Provenance, on both variants: which fold pickle the run resumed from and which GUIDs
+        # landed here. A causal dataset is comparable to a two-sided one segment for segment only
+        # if both were built from the same pickle, and after the run these two attributes are the
+        # only surviving evidence either way. Absent on every file predating them, which means
+        # unknown provenance rather than an error.
+        h5f.attrs["source_pickle_path"] = (
+            NO_SOURCE_PICKLE if source_pickle_path is None else str(source_pickle_path)
+        )
+        h5f.attrs["source_guid_digest"] = (
+            guid_set_digest(None) if source_guid_digest is None else str(source_guid_digest)
+        )
+        if transform == CAUSAL:
+            # What the warm-up vectors below mean: the bank they were measured on, and the energy
+            # quantile they enclose. Recorded so the valid region is recoverable from the file
+            # rather than only from the code that wrote it.
+            h5f.attrs["causal_kernel_taps"] = np.int32(CAUSAL_KERNEL_TAPS)
+            h5f.attrs["gammatone_order"] = np.int32(GAMMATONE_ORDER)
+            h5f.attrs["causal_warmup_quantile"] = np.float32(CAUSAL_WARMUP_QUANTILE)
         h5f.create_dataset(
             "fhr",
             shape=(0, len_signal),
@@ -496,14 +692,14 @@ def create_initial_hdf5(
             compression="lzf",
         )
         # fhr_st width is fixed by the filter bank, not by a selection: one
-        # order-0 channel plus 42 first-order wavelets at J=11, Q=4. The whole
-        # scattering block is stored unmasked.
-        h5f.create_dataset(
+        # order-0 channel plus one per first-order wavelet, less whichever the
+        # causal drop rule removed. The whole block is stored unmasked.
+        fhr_st_ds = h5f.create_dataset(
             "fhr_st",
-            shape=(0, 43, len_sequence),
-            maxshape=(None, 43, len_sequence),
+            shape=(0, n_fhr_st_channels, len_sequence),
+            maxshape=(None, n_fhr_st_channels, len_sequence),
             dtype="f4",
-            chunks=(chunk_n, 43, len_sequence),
+            chunks=(chunk_n, n_fhr_st_channels, len_sequence),
             compression="lzf",
         )
         # fhr_ph width comes from the selection, never a literal. A hardcoded
@@ -519,17 +715,20 @@ def create_initial_hdf5(
             compression="lzf",
         )
         _write_selection_attrs(fhr_ph_ds, fhr_ph_selection)
-        h5f.create_dataset(
-            "fhr_up_ph",
-            shape=(0, n_cross_phase_channels, len_sequence),
-            maxshape=(None, n_cross_phase_channels, len_sequence),
-            dtype="f4",
-            chunks=(chunk_n, n_cross_phase_channels, len_sequence),
-            compression="lzf",
-        )
-        # up_st: UP scattering coefficients (optional, same structure as fhr_st)
-        if n_up_st_channels > 0:
+        # fhr_up_ph: cross-channel phase, two-sided only.
+        if n_cross_phase_channels is not None:
             h5f.create_dataset(
+                "fhr_up_ph",
+                shape=(0, n_cross_phase_channels, len_sequence),
+                maxshape=(None, n_cross_phase_channels, len_sequence),
+                dtype="f4",
+                chunks=(chunk_n, n_cross_phase_channels, len_sequence),
+                compression="lzf",
+            )
+        # up_st: UP scattering coefficients (optional, same structure as fhr_st)
+        up_st_ds = None
+        if n_up_st_channels > 0:
+            up_st_ds = h5f.create_dataset(
                 "up_st",
                 shape=(0, n_up_st_channels, len_sequence),
                 maxshape=(None, n_up_st_channels, len_sequence),
@@ -539,6 +738,7 @@ def create_initial_hdf5(
             )
         # up_ph: UP self-phase harmonics (optional). First-class field with its
         # own per-channel asinh stats — no longer concatenated into fhr_up_ph.
+        up_ph_ds = None
         if up_ph_selection is not None:
             n_up_ph = up_ph_selection.n_channels
             up_ph_ds = h5f.create_dataset(
@@ -550,6 +750,12 @@ def create_initial_hdf5(
                 compression="lzf",
             )
             _write_selection_attrs(up_ph_ds, up_ph_selection)
+        if transform == CAUSAL:
+            for name, dataset in (
+                ("fhr_st", fhr_st_ds), ("fhr_ph", fhr_ph_ds),
+                ("up_st", up_st_ds), ("up_ph", up_ph_ds),
+            ):
+                _write_causal_attrs(dataset, channel_plan[name])
         h5f.create_dataset(
             "target",
             shape=(0, len_sequence),
@@ -615,13 +821,59 @@ def create_initial_hdf5(
         )
 
 
+def create_hdf5_for_masks(
+    path: str,
+    masks: Dict[str, Any],
+    len_sequence: int,
+    len_signal: int = SIGNAL_LENGTH,
+    records_list: Optional[List[str]] = None,
+    source_pickle_path: Optional[str] = None,
+) -> None:
+    """Create an empty file whose every width and provenance attr comes from one place.
+
+    Both write paths — the per-partition classification files and the
+    pre-training files, which bypass ``_build_hdf5_for_partition`` entirely —
+    go through here, so a variant threaded into one of them cannot be missing
+    from the other. That half-threaded state is the real failure mode: it
+    produces a directory of files that disagree with each other about what they
+    contain. The same argument applies to the provenance attrs, which is why
+    the records list is taken here rather than written by whoever fills the
+    file afterwards.
+
+    Args:
+        path: Output HDF5 file path.
+        masks: Output of :func:`compute_scattering_masks`.
+        len_sequence: Sequence dimension length.
+        len_signal: Raw signal length.
+        records_list: The ``.mat`` paths this shard will be built from; the
+            stored GUID digest is taken from it.
+        source_pickle_path: The fold pickle the run resumed from, or ``None``
+            for a fresh run.
+    """
+    widths = resolve_channel_layout(masks)
+    create_initial_hdf5(
+        path=path,
+        len_signal=len_signal,
+        len_sequence=len_sequence,
+        fhr_ph_selection=masks["fhr_ph_selection"],
+        n_fhr_st_channels=widths["fhr_st"],
+        # None on the causal variant, which does not produce the cross-phase block.
+        n_cross_phase_channels=widths["fhr_up_ph"],
+        n_up_st_channels=widths["up_st"],
+        up_ph_selection=masks["up_ph_selection"],
+        transform=masks.get("transform", TWO_SIDED),
+        channel_plan=masks.get("channel_plan"),
+        source_pickle_path=source_pickle_path,
+        source_guid_digest=guid_set_digest(records_list),
+    )
+
+
 def append_samples_batch(
     path: str,
     fhr_batch: np.ndarray,
     up_batch: np.ndarray,
     fhr_st_batch: np.ndarray,
     fhr_ph_batch: np.ndarray,
-    fhr_up_ph_batch: np.ndarray,
     target_batch: np.ndarray,
     weight_batch: np.ndarray,
     guid_batch: list,
@@ -630,20 +882,26 @@ def append_samples_batch(
     bg_label_batch: np.ndarray,
     tlo_batch: np.ndarray,
     second_stage_batch: np.ndarray,
+    fhr_up_ph_batch: Optional[np.ndarray] = None,
     up_st_batch: Optional[np.ndarray] = None,
     up_ph_batch: Optional[np.ndarray] = None,
 ) -> None:
     """Append K samples to an existing HDF5 file in a single open/close.
 
+    ``fhr_up_ph`` is guarded in **both** directions, which the other optional
+    blocks are not. Writing it unconditionally raises ``KeyError`` on a causal
+    file, which has no such dataset; but skipping it when the dataset is absent
+    — the pattern ``up_st`` and ``up_ph`` use — would silently discard a
+    computed block on a two-sided file, which is the failure the geometry guard
+    exists to prevent. So a batch without a dataset and a dataset without a
+    batch both raise.
+
     Args:
         path: Path to existing HDF5 file.
         fhr_batch: Shape ``(K, len_signal)``.
         up_batch: Shape ``(K, len_signal)``.
-        fhr_st_batch: Shape ``(K, 43, len_seq)``.
+        fhr_st_batch: Shape ``(K, n_fhr_st, len_seq)``.
         fhr_ph_batch: Shape ``(K, n_ph, len_seq)``.
-        fhr_up_ph_batch: Shape ``(K, n_cross, len_seq)`` — cross-channel phase
-            coefficients only. UP self-phase harmonics are passed via
-            ``up_ph_batch``.
         target_batch: Shape ``(K, len_seq)``.
         weight_batch: Shape ``(K, len_seq)``.
         guid_batch: List of GUID strings, length K.
@@ -652,24 +910,46 @@ def append_samples_batch(
         bg_label_batch: Shape ``(K,)``, uint8.
         tlo_batch: Shape ``(K,)``, float32.
         second_stage_batch: Shape ``(K,)``, float32.
-        up_st_batch: Shape ``(K, 43, len_seq)``. Optional — only written if the
-            target HDF5 has the ``up_st`` dataset.
+        fhr_up_ph_batch: Shape ``(K, n_cross, len_seq)`` — cross-channel phase
+            coefficients only; UP self-phase harmonics go in ``up_ph_batch``.
+            ``None`` only for a causal file, which stores no such dataset.
+        up_st_batch: Shape ``(K, n_up_st, len_seq)``. Optional — only written if
+            the target HDF5 has the ``up_st`` dataset.
         up_ph_batch: Shape ``(K, n_up_phase, len_seq)``. Optional — only written
             if the target HDF5 has the ``up_ph`` dataset.
+
+    Raises:
+        ValueError: If ``fhr_up_ph`` exists in the file but no batch was given,
+            or a batch was given but the dataset does not exist.
     """
     k = fhr_batch.shape[0]
     if k == 0:
         return
     with h5py.File(path, "a", libver="latest") as h5f:
+        has_cross = "fhr_up_ph" in h5f
+        if has_cross and fhr_up_ph_batch is None:
+            raise ValueError(
+                f"{path} has an fhr_up_ph dataset but no fhr_up_ph_batch was given; it would be "
+                f"left empty for every sample written. Create the file with "
+                f"n_cross_phase_channels=None if this build does not produce it."
+            )
+        if fhr_up_ph_batch is not None and not has_cross:
+            raise ValueError(
+                f"{path} has no fhr_up_ph dataset but an fhr_up_ph_batch was given; the block "
+                f"would be computed and dropped on the floor with no error"
+            )
+
         idx = h5f["fhr"].shape[0]
         new_size = idx + k
+        # Iterates the datasets that exist, so an absent fhr_up_ph is simply not resized.
         for _name, ds in h5f.items():
             ds.resize((new_size,) + ds.shape[1:])
         h5f["fhr"][idx:new_size] = fhr_batch
         h5f["up"][idx:new_size] = up_batch
         h5f["fhr_st"][idx:new_size] = fhr_st_batch
         h5f["fhr_ph"][idx:new_size] = fhr_ph_batch
-        h5f["fhr_up_ph"][idx:new_size] = fhr_up_ph_batch
+        if fhr_up_ph_batch is not None:
+            h5f["fhr_up_ph"][idx:new_size] = fhr_up_ph_batch
         if up_st_batch is not None and "up_st" in h5f:
             h5f["up_st"][idx:new_size] = up_st_batch
         if up_ph_batch is not None and "up_ph" in h5f:
@@ -820,7 +1100,10 @@ def _build_phase_selection(
 
 
 def compute_scattering_masks(
-    signal_length: int, scattering_T: int = 16, device=None
+    signal_length: int,
+    scattering_T: int = 16,
+    device=None,
+    transform: str = TWO_SIDED,
 ) -> Dict[str, Any]:
     r"""Compute every coefficient selection once, up front.
 
@@ -835,17 +1118,30 @@ def compute_scattering_masks(
     $f_s = 4$ Hz) this yields ``fhr_ph`` = 66, ``fhr_up_ph`` = 79 and
     ``up_ph`` = 15.
 
+    For ``transform='causal'`` it additionally builds the causal bank and its
+    channel plan **here**, so that the widths written into the file, the
+    warm-up vectors stored beside them, the channels the transform gathers and
+    the operator's log all come from one object computed once. The plan's phase
+    pairs are taken from the :class:`PhaseChannelSelection` objects above and
+    never from a second selector, which is what makes channel $c$ of the data
+    and channel $c$ of the ``sel_*`` provenance the same channel by
+    construction rather than by agreement.
+
     Args:
         signal_length: Raw signal length (e.g. 5280).
         scattering_T: Decimation factor.
         device: Torch device.
+        transform: ``'two_sided'`` or ``'causal'``.
 
     Returns:
         Dict with two :class:`PhaseChannelSelection` objects
         (``fhr_ph_selection``, ``up_ph_selection``), the cross-phase mask
-        (``cross_mask``), its channel count (``n_cross``) and its selector
-        metadata (``cross_metadata``).
+        (``cross_mask``), its channel count (``n_cross``), its selector
+        metadata (``cross_metadata``), the scattering-block width
+        (``n_scattering``) and the resolved ``transform``; plus
+        ``causal_bank`` and ``channel_plan`` on the causal variant.
     """
+    validate_transform(transform)
     tmp_model = KymatioPhaseScattering1D(
         J=11,
         Q=SCATTERING_Q,
@@ -871,21 +1167,213 @@ def compute_scattering_masks(
     )
     cross_mask = cross_sel["cross_mask"]
 
-    return {
+    masks: Dict[str, Any] = {
         "fhr_ph_selection": fhr_ph_selection,
         "up_ph_selection": up_ph_selection,
         "cross_mask": cross_mask,
         "n_cross": int(cross_mask.sum().item()),
         "cross_metadata": cross_sel.get("metadata", {}),
+        # One order-0 channel plus one per first-order wavelet. Derived from the
+        # bank rather than written as 43, so a J/Q change moves every width that
+        # depends on it instead of leaving a literal behind.
+        "n_scattering": 1 + len(tmp_model.center_freqs),
+        "transform": transform,
     }
+
+    if transform == CAUSAL:
+        causal_bank = build_causal_bank(build_filter_bank(signal_length))
+        masks["causal_bank"] = causal_bank
+        masks["channel_plan"] = build_channel_plan(
+            causal_bank,
+            _selection_pairs(fhr_ph_selection),
+            _selection_pairs(up_ph_selection),
+            sequence_length=signal_length // scattering_T,
+            decimation=scattering_T,
+        )
+    return masks
+
+
+def _selection_pairs(selection: PhaseChannelSelection) -> np.ndarray:
+    """The $(i, j)$ pair array of a stored selection, in stored channel order.
+
+    The causal channel plan takes its pairs from here rather than from
+    ``causal_scattering.selected_pairs``, which rebuilds the same rule
+    independently. Two implementations that agree today could stop agreeing,
+    and the failure would be a warm-up vector describing a different channel
+    than the data and the ``sel_*`` attrs do — silently wrong rather than
+    loudly broken. ``selected_pairs`` keeps its role as the independent rebuild
+    used to *verify* a shard.
+
+    Args:
+        selection: The selection the block is sized from.
+
+    Returns:
+        ``(n_channels, 2)`` of filter indices, column 0 the lower frequency.
+    """
+    return np.stack(
+        [np.asarray(selection.i, dtype=int), np.asarray(selection.j, dtype=int)], axis=1
+    )
+
+
+def resolve_channel_layout(masks: Dict[str, Any]) -> Dict[str, Optional[int]]:
+    """Stored width of every coefficient block, or ``None`` for a block this variant omits.
+
+    The one place a width is decided. Every consumer — the schema that creates
+    the datasets, the guard that checks them, the operator log — reads it from
+    here, so a file cannot be created at one width and filled at another.
+
+    Args:
+        masks: Output of :func:`compute_scattering_masks`.
+
+    Returns:
+        ``{block: width or None}`` for all five blocks.
+    """
+    if masks.get("transform", TWO_SIDED) == CAUSAL:
+        plan = masks["channel_plan"]
+        widths: Dict[str, Optional[int]] = {
+            name: plan[name].n_channels for name in CAUSAL_BLOCKS
+        }
+        widths["fhr_up_ph"] = None
+        return widths
+
+    n_scattering = int(masks["n_scattering"])
+    return {
+        "fhr_st": n_scattering,
+        "fhr_ph": masks["fhr_ph_selection"].n_channels,
+        "fhr_up_ph": int(masks["n_cross"]),
+        "up_st": n_scattering,
+        "up_ph": masks["up_ph_selection"].n_channels,
+    }
+
+
+def describe_layout(masks: Dict[str, Any], device: Optional[Any] = None) -> Dict[str, Any]:
+    r"""Everything an operator needs to confirm before a multi-hour build commits.
+
+    Returned as a dict rather than formatted here, for two reasons. A test can assert the *layout*
+    against the channel plan instead of asserting the wording of an f-string; and the no-data smoke
+    check can print the same numbers the pipeline logs without a second copy of the derivation.
+    :func:`format_layout` turns it into lines.
+
+    Every value is derived at run time. The previous log carried ``43`` as a literal inside its
+    f-string, twice, which a change to $J$ or $Q$ would have left silently stale.
+
+    Args:
+        masks: Output of :func:`compute_scattering_masks`.
+        device: The torch device the transform will run on; ``None`` means the writer's own default.
+
+    Returns:
+        ``transform``, ``device``, per-block ``widths``, ``c_y``/``c_u``, and — on the causal
+        variant — the bank constants (``gammatone_order``, ``causal_kernel_taps``,
+        ``causal_warmup_quantile``), the ``dropped`` channels per block as
+        ``{'count', 'first', 'last'}``, and the per-block ``warmup_steps`` and ``delay_s`` ranges
+        as ``(min, max)``.
+    """
+    transform = masks.get("transform", TWO_SIDED)
+    widths = resolve_channel_layout(masks)
+    layout: Dict[str, Any] = {
+        "transform": transform,
+        "device": "default" if device is None else str(device),
+        "widths": widths,
+        "c_y": int(widths["fhr_st"] or 0) + int(widths["fhr_ph"] or 0),
+        "c_u": int(widths["up_st"] or 0) + int(widths["up_ph"] or 0),
+    }
+    if transform != CAUSAL:
+        return layout
+
+    plan = masks["channel_plan"]
+    # The undropped width per block: what the transform produces before the drop rule runs. The
+    # plan holds only the survivors, so the dropped set is the complement against these.
+    n_scattering = int(masks["n_scattering"])
+    full_widths = {
+        "fhr_st": n_scattering,
+        "up_st": n_scattering,
+        "fhr_ph": masks["fhr_ph_selection"].n_channels,
+        "up_ph": masks["up_ph_selection"].n_channels,
+    }
+    layout["gammatone_order"] = int(GAMMATONE_ORDER)
+    layout["causal_kernel_taps"] = int(CAUSAL_KERNEL_TAPS)
+    layout["causal_warmup_quantile"] = float(CAUSAL_WARMUP_QUANTILE)
+    dropped: Dict[str, Dict[str, Optional[int]]] = {}
+    warmup_range: Dict[str, Tuple[int, int]] = {}
+    delay_range: Dict[str, Tuple[float, float]] = {}
+    for name in CAUSAL_BLOCKS:
+        block = plan[name]
+        gone = sorted(set(range(full_widths[name])) - set(int(c) for c in block.kept))
+        dropped[name] = {
+            "count": len(gone),
+            "first": gone[0] if gone else None,
+            "last": gone[-1] if gone else None,
+        }
+        warmup_range[name] = (
+            int(block.warmup_steps.min()), int(block.warmup_steps.max())
+        )
+        delay_range[name] = (float(block.delay_s.min()), float(block.delay_s.max()))
+    layout["dropped"] = dropped
+    layout["warmup_steps"] = warmup_range
+    layout["delay_s"] = delay_range
+    return layout
+
+
+def format_layout(layout: Dict[str, Any]) -> List[str]:
+    """Render :func:`describe_layout` as the lines the operator reads before a build starts.
+
+    Args:
+        layout: Output of :func:`describe_layout`.
+
+    Returns:
+        One string per line, in the order they should be emitted.
+    """
+    widths = layout["widths"]
+    lines = []
+    if layout["transform"] == CAUSAL:
+        lines.append(
+            f"Transform: {layout['transform']} (gammatone n={layout['gammatone_order']}, "
+            f"{layout['causal_kernel_taps']} taps, "
+            f"warm-up quantile {layout['causal_warmup_quantile']:g})"
+        )
+    else:
+        lines.append(f"Transform: {layout['transform']}")
+    lines.append(
+        f"Channel layout: fhr_st={widths['fhr_st']} + fhr_ph={widths['fhr_ph']} "
+        f"(c_y={layout['c_y']}), up_st={widths['up_st']} + up_ph={widths['up_ph']} "
+        f"(c_u={layout['c_u']}), "
+        f"fhr_up_ph={widths['fhr_up_ph'] if widths['fhr_up_ph'] is not None else 'absent'}"
+    )
+    if layout["transform"] == CAUSAL:
+        for name in CAUSAL_BLOCKS:
+            gone = layout["dropped"][name]
+            if gone["count"]:
+                lines.append(
+                    f"Dropped {gone['count']} never-valid channels from {name} "
+                    f"(channels {gone['first']}..{gone['last']})"
+                )
+        lines.append(
+            "Warm-up range: "
+            + ", ".join(
+                f"{name} {layout['warmup_steps'][name][0]}..{layout['warmup_steps'][name][1]}"
+                for name in CAUSAL_BLOCKS
+            )
+            + " steps"
+        )
+        # Recorded, never compensated: a consumer that forecasts from these channels is reading
+        # each one as of this many seconds ago.
+        lines.append(
+            "Group delay: "
+            + ", ".join(
+                f"{name} {layout['delay_s'][name][0]:.1f}..{layout['delay_s'][name][1]:.1f}"
+                for name in CAUSAL_BLOCKS
+            )
+            + " s"
+        )
+    lines.append(f"Device: {layout['device']}")
+    return lines
 
 
 def _validate_geometry(
     hdf5_path: str,
-    st_model: KymatioPhaseScattering1D,
-    phase_mask: torch.Tensor,
-    cross_mask: torch.Tensor,
-    up_phase_mask: torch.Tensor,
+    expected_widths: Dict[str, Optional[int]],
+    pair_masks: Optional[Dict[str, torch.Tensor]] = None,
+    n_pairs: Optional[int] = None,
 ) -> None:
     """Fail fast on a geometry mismatch, before any transform work is done.
 
@@ -893,60 +1381,59 @@ def _validate_geometry(
     without this check:
 
     1. **Pair axis.** The masks are built against the filter bank inside
-       :func:`compute_scattering_masks`; they are applied to the one built
-       here. If those banks differ (``J``, ``Q``, or ``shape``), the mask has
-       the wrong length and ``phase_corr[mask, :]`` raises ``IndexError``.
+       :func:`compute_scattering_masks`; they are applied to the one built by
+       the writer. If those banks differ (``J``, ``Q``, or ``shape``), the mask
+       has the wrong length and ``phase_corr[mask, :]`` raises ``IndexError``.
        That raise lands in the per-record ``except Exception`` below, so
        *every* record fails identically, the run reports success, and a full
-       set of empty HDF5 files ships as if validated.
+       set of empty HDF5 files ships as if validated. The causal path indexes
+       responses by pair *index* rather than by a mask over a pair axis, so it
+       supplies no model and this check is skipped rather than faked.
     2. **Stored widths.** Every dataset this writer fills must exist and be
        exactly as wide as the block written into it. A dataset that is absent
        is worse than one that is mis-sized: ``append_samples_batch`` skips
        missing optional fields silently, so the coefficients are computed and
        then dropped on the floor with no error and no warning.
 
-    All five coefficient blocks are required because this writer
-    unconditionally computes all five.
+    The required-block set is the *mapping*, not a branch: a width means the
+    block must exist at that width, and ``None`` means it must be absent. That
+    is how a missing ``fhr_up_ph`` stays fatal for a two-sided build and is
+    correct for a causal one, with one implementation and no variant test
+    inside.
 
     Args:
         hdf5_path: The file about to be filled.
-        st_model: The transform whose output the masks will index.
-        phase_mask: FHR self-phase mask.
-        cross_mask: FHR-UP cross-phase mask.
-        up_phase_mask: UP self-phase mask.
+        expected_widths: ``{block: width or None}`` from
+            :func:`resolve_channel_layout`.
+        pair_masks: Masks whose length must match the transform's pair axis.
+        n_pairs: Pair-axis length of the transform the masks will index;
+            ``None`` skips the pair-axis check.
 
     Raises:
-        ValueError: On a pair-axis mismatch, a missing dataset, or a width
-            mismatch, naming the field and both numbers.
+        ValueError: On a pair-axis mismatch, a missing dataset, an unexpected
+            dataset, or a width mismatch, naming the field and both numbers.
     """
-    n_pairs = len(st_model.i_idx)
-    for field_name, mask in (
-        ("fhr_ph", phase_mask),
-        ("fhr_up_ph", cross_mask),
-        ("up_ph", up_phase_mask),
-    ):
-        if int(mask.shape[0]) != n_pairs:
-            raise ValueError(
-                f"Phase-pair axis mismatch for '{field_name}': the mask spans "
-                f"{int(mask.shape[0])} pairs but this transform produces "
-                f"{n_pairs}. The masks were built against a different filter "
-                f"bank — check that J, Q (SCATTERING_Q) and the signal length "
-                f"match between compute_scattering_masks and this writer."
-            )
+    if n_pairs is not None:
+        for field_name, mask in (pair_masks or {}).items():
+            if int(mask.shape[0]) != n_pairs:
+                raise ValueError(
+                    f"Phase-pair axis mismatch for '{field_name}': the mask spans "
+                    f"{int(mask.shape[0])} pairs but this transform produces "
+                    f"{n_pairs}. The masks were built against a different filter "
+                    f"bank — check that J, Q (SCATTERING_Q) and the signal length "
+                    f"match between compute_scattering_masks and this writer."
+                )
 
-    # Scattering width is fixed by the filter bank: one order-0 channel plus
-    # one per first-order wavelet. Derived, not assumed, so a J/Q change is
-    # caught here instead of as an h5py broadcast error mid-run.
-    n_scattering = 1 + len(st_model.center_freqs)
-    expected_widths = {
-        "fhr_st": n_scattering,
-        "up_st": n_scattering,
-        "fhr_ph": int(phase_mask.sum().item()),
-        "fhr_up_ph": int(cross_mask.sum().item()),
-        "up_ph": int(up_phase_mask.sum().item()),
-    }
     with h5py.File(hdf5_path, "r") as h5f:
         for field_name, n_expected in expected_widths.items():
+            if n_expected is None:
+                if field_name in h5f:
+                    raise ValueError(
+                        f"Dataset '{field_name}' exists in {hdf5_path} but this build does not "
+                        f"produce it, so it would stay empty for every sample. The file was "
+                        f"created for a different transform variant."
+                    )
+                continue
             if field_name not in h5f:
                 raise ValueError(
                     f"Dataset '{field_name}' is missing from {hdf5_path}, but "
@@ -1957,6 +2444,67 @@ def create_cv_splits(
 # ============================================================================
 # Step 4: HDF5 dataset creation from records list
 # ============================================================================
+def _transform_causal_record(
+    torch_bank: CausalTorchBank,
+    fhr: np.ndarray,
+    up: np.ndarray,
+    target_pairs: np.ndarray,
+    source_pairs: np.ndarray,
+    channel_plan: Dict[str, CausalChannelPlan],
+    scatter_batch_size: int,
+) -> Tuple[List[Optional[Dict[str, np.ndarray]]], Dict[int, str]]:
+    """Transform one record's segments causally, in batches, isolating any that fail.
+
+    The whole causal chain is a single forward call, so where the two-sided path runs four passes
+    and explodes each into four per-segment dicts, this is one call and a slice.
+
+    A ``RuntimeError`` from the transform is an out-of-memory guard: it is a property of the batch,
+    not of any one segment, so the batch is retried a segment at a time and only a segment that
+    fails **alone** is given up on. Storing a retried segment beside its peers is only sound
+    because the chain is batch-invariant — every operation in it is elementwise or an FFT along
+    time — which is why that invariance is asserted rather than assumed.
+
+    Args:
+        torch_bank: The realised causal bank, already on the build device.
+        fhr: Raw fetal heart rate for the record's kept segments, ``(n_valid, len_signal)``.
+        up: Raw uterine pressure, same shape.
+        target_pairs: ``(n, 2)`` phase pairs for ``fhr_ph``, in stored channel order.
+        source_pairs: ``(n, 2)`` phase pairs for ``up_ph``.
+        channel_plan: The stored plan; the transform gathers its channels.
+        scatter_batch_size: Segments per forward pass.
+
+    Returns:
+        ``(blocks, failures)``: one ``{block: (C, T)}`` dict per segment — ``None`` where the
+        segment failed — and ``{segment_index: error message}`` for those that did.
+    """
+    n_valid = int(fhr.shape[0])
+    blocks: List[Optional[Dict[str, np.ndarray]]] = [None] * n_valid
+    failures: Dict[int, str] = {}
+
+    def _run(start: int, stop: int) -> Dict[str, np.ndarray]:
+        return transform_batch_numpy(
+            torch_bank, fhr[start:stop], up[start:stop], target_pairs, source_pairs,
+            plan=channel_plan,
+        )
+
+    for batch_start in range(0, n_valid, scatter_batch_size):
+        batch_end = min(batch_start + scatter_batch_size, n_valid)
+        try:
+            batched = _run(batch_start, batch_end)
+            for local_j, global_j in enumerate(range(batch_start, batch_end)):
+                blocks[global_j] = {
+                    name: batched[name][local_j] for name in CAUSAL_BLOCKS
+                }
+        except RuntimeError:
+            for global_j in range(batch_start, batch_end):
+                try:
+                    alone = _run(global_j, global_j + 1)
+                    blocks[global_j] = {name: alone[name][0] for name in CAUSAL_BLOCKS}
+                except RuntimeError as segment_error:
+                    failures[global_j] = str(segment_error)
+    return blocks, failures
+
+
 def create_hdf5_dataset_from_records_list(
     hdf5_path: str,
     records_list: List[str],
@@ -1972,6 +2520,7 @@ def create_hdf5_dataset_from_records_list(
     run_guid_analysis: bool = False,
     scatter_batch_size: int = 16,
     verbose: bool = True,
+    transform: str = TWO_SIDED,
 ) -> List[str]:
     """Process a list of .mat files and write segments to an HDF5 file.
 
@@ -1994,28 +2543,67 @@ def create_hdf5_dataset_from_records_list(
         run_guid_analysis: Collect per-GUID tracking data.
         scatter_batch_size: Scattering batch size.
         verbose: Verbosity flag.
+        transform: ``'two_sided'`` or ``'causal'``; must match the variant the
+            file was created for and the masks were computed for.
 
     Returns:
         List of record paths that errored.
+
+    Raises:
+        ValueError: On an unknown *transform*, or if it disagrees with the one
+            the masks were computed for.
     """
+    validate_transform(transform)
+    if precomputed_masks.get("transform", TWO_SIDED) != transform:
+        raise ValueError(
+            f"transform={transform!r} but the masks were computed for "
+            f"{precomputed_masks.get('transform', TWO_SIDED)!r}; the causal variant needs its "
+            f"channel plan, which only compute_scattering_masks(transform='causal') builds"
+        )
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     scattering_T = 16
     signal_length = int(base_block_size * 1.5)
+    causal = transform == CAUSAL
 
-    # Q must match the bank the masks were built against in
-    # compute_scattering_masks; the pair-axis check below enforces that, but
-    # sharing the constant keeps the two from drifting in the first place.
-    st_model = KymatioPhaseScattering1D(
-        J=11, Q=SCATTERING_Q, T=scattering_T, shape=signal_length,
-        device=device, tukey_alpha=None, max_order=1,
-    )
+    if causal:
+        # No KymatioPhaseScattering1D on this path: the causal chain is a different filter bank,
+        # and building the two-sided one anyway would hold a second bank's worth of device memory
+        # for the whole build. The channel plan gathers the surviving channels inside the
+        # transform, so the blocks come back at their stored widths.
+        channel_plan = precomputed_masks["channel_plan"]
+        torch_bank = CausalTorchBank(
+            precomputed_masks["causal_bank"], device, n_signal=signal_length
+        )
+        # From the PhaseChannelSelection the sel_* provenance is written from, never from a second
+        # selector: channel c of the data and channel c of the provenance are then the same channel
+        # by construction rather than by two implementations agreeing.
+        target_pairs = _selection_pairs(precomputed_masks["fhr_ph_selection"])
+        source_pairs = _selection_pairs(precomputed_masks["up_ph_selection"])
+        # No pair-axis check: this path indexes responses by pair *index* rather than masking a
+        # pair axis, so there is no mask length that could disagree with a transform.
+        _validate_geometry(hdf5_path, resolve_channel_layout(precomputed_masks))
+    else:
+        # Q must match the bank the masks were built against in
+        # compute_scattering_masks; the pair-axis check below enforces that, but
+        # sharing the constant keeps the two from drifting in the first place.
+        st_model = KymatioPhaseScattering1D(
+            J=11, Q=SCATTERING_Q, T=scattering_T, shape=signal_length,
+            device=device, tukey_alpha=None, max_order=1,
+        )
 
-    phase_mask = precomputed_masks["fhr_ph_selection"].mask.to(device)
-    cross_mask = precomputed_masks["cross_mask"].to(device)
-    up_phase_mask = precomputed_masks["up_ph_selection"].mask.to(device)
+        phase_mask = precomputed_masks["fhr_ph_selection"].mask.to(device)
+        cross_mask = precomputed_masks["cross_mask"].to(device)
+        up_phase_mask = precomputed_masks["up_ph_selection"].mask.to(device)
 
-    _validate_geometry(hdf5_path, st_model, phase_mask, cross_mask, up_phase_mask)
+        _validate_geometry(
+            hdf5_path,
+            resolve_channel_layout(precomputed_masks),
+            pair_masks={
+                "fhr_ph": phase_mask, "fhr_up_ph": cross_mask, "up_ph": up_phase_mask,
+            },
+            n_pairs=len(st_model.i_idx),
+        )
 
     errors_list: List[str] = []
     guid_tracking: Optional[Dict[str, GuidTrackingEntry]] = (
@@ -2141,85 +2729,105 @@ def create_hdf5_dataset_from_records_list(
             # Batched scattering
             valid_fhr = fhr[valid_indices]
             valid_up = up[valid_indices]
-            st_input = torch.from_numpy(
-                np.stack([valid_fhr, valid_up], axis=1)
-            ).float().to(device)
+            n_valid = len(valid_indices)
+            scatter_failed: set = set()
+            causal_blocks: List[Optional[Dict[str, np.ndarray]]] = []
 
-            n_valid = st_input.shape[0]
             st_phase_list = [None] * n_valid
             st_cross_list = [None] * n_valid
             st_up_phase_list = [None] * n_valid
             st_up_scatter_list = [None] * n_valid
-            scatter_failed: set = set()
 
-            for batch_start in range(0, n_valid, scatter_batch_size):
-                batch_end = min(batch_start + scatter_batch_size, n_valid)
-                batch = st_input[batch_start:batch_end]
-                try:
-                    bp = st_model(
-                        x=batch, compute_phase=True,
-                        compute_cross_phase=False,
-                        scattering_channel=0, phase_channels=[0],
+            if causal:
+                causal_blocks, causal_failures = _transform_causal_record(
+                    torch_bank, valid_fhr, valid_up, target_pairs, source_pairs,
+                    channel_plan, scatter_batch_size,
+                )
+                for seg_j, message in causal_failures.items():
+                    orig_idx = valid_indices[seg_j]
+                    logger.error(
+                        f"{guid_key} seg {orig_idx} "
+                        f"(epoch={domain_starts[orig_idx]}): "
+                        f"scattering failed: {message}"
                     )
-                    bc = st_model(
-                        x=batch, compute_phase=False,
-                        compute_cross_phase=True,
-                        scattering_channel=0, phase_channels=[0, 1],
-                    )
-                    bup = st_model(
-                        x=batch, compute_phase=True,
-                        compute_cross_phase=False,
-                        scattering_channel=0, phase_channels=[1],
-                    )
-                    bus = st_model(
-                        x=batch, compute_phase=False,
-                        compute_cross_phase=False,
-                        scattering_channel=1,
-                    )
-                    bs = batch.shape[0]
-                    for lj in range(bs):
-                        gj = batch_start + lj
-                        st_phase_list[gj] = {
-                            k: (v[lj:lj+1] if isinstance(v, torch.Tensor) and v.shape[0] == bs else v)
-                            for k, v in bp.items()
-                        }
-                        st_cross_list[gj] = {
-                            k: (v[lj:lj+1] if isinstance(v, torch.Tensor) and v.shape[0] == bs else v)
-                            for k, v in bc.items()
-                        }
-                        st_up_phase_list[gj] = {
-                            k: (v[lj:lj+1] if isinstance(v, torch.Tensor) and v.shape[0] == bs else v)
-                            for k, v in bup.items()
-                        }
-                        st_up_scatter_list[gj] = {
-                            k: (v[lj:lj+1] if isinstance(v, torch.Tensor) and v.shape[0] == bs else v)
-                            for k, v in bus.items()
-                        }
-                except RuntimeError:
-                    for lj in range(batch.shape[0]):
-                        gj = batch_start + lj
-                        seg = st_input[gj:gj+1]
-                        try:
-                            sp = st_model(x=seg, compute_phase=True, compute_cross_phase=False, scattering_channel=0, phase_channels=[0])
-                            sc = st_model(x=seg, compute_phase=False, compute_cross_phase=True, scattering_channel=0, phase_channels=[0, 1])
-                            su = st_model(x=seg, compute_phase=True, compute_cross_phase=False, scattering_channel=0, phase_channels=[1])
-                            sus = st_model(x=seg, compute_phase=False, compute_cross_phase=False, scattering_channel=1)
-                            st_phase_list[gj] = sp
-                            st_cross_list[gj] = sc
-                            st_up_phase_list[gj] = su
-                            st_up_scatter_list[gj] = sus
-                        except RuntimeError as seg_err:
-                            orig_idx = valid_indices[gj]
-                            logger.error(
-                                f"{guid_key} seg {orig_idx} "
-                                f"(epoch={domain_starts[orig_idx]}): "
-                                f"scattering failed: {seg_err}"
-                            )
-                            scatter_failed.add(gj)
-                            if guid_tracking is not None:
-                                guid_tracking[guid_key].skipped_scatter_failed.append(
-                                    float(domain_starts[orig_idx])
+                    scatter_failed.add(seg_j)
+                    if guid_tracking is not None:
+                        guid_tracking[guid_key].skipped_scatter_failed.append(
+                            float(domain_starts[orig_idx])
+                        )
+            else:
+                st_input = torch.from_numpy(
+                    np.stack([valid_fhr, valid_up], axis=1)
+                ).float().to(device)
+
+                for batch_start in range(0, n_valid, scatter_batch_size):
+                    batch_end = min(batch_start + scatter_batch_size, n_valid)
+                    batch = st_input[batch_start:batch_end]
+                    try:
+                        bp = st_model(
+                            x=batch, compute_phase=True,
+                            compute_cross_phase=False,
+                            scattering_channel=0, phase_channels=[0],
+                        )
+                        bc = st_model(
+                            x=batch, compute_phase=False,
+                            compute_cross_phase=True,
+                            scattering_channel=0, phase_channels=[0, 1],
+                        )
+                        bup = st_model(
+                            x=batch, compute_phase=True,
+                            compute_cross_phase=False,
+                            scattering_channel=0, phase_channels=[1],
+                        )
+                        bus = st_model(
+                            x=batch, compute_phase=False,
+                            compute_cross_phase=False,
+                            scattering_channel=1,
+                        )
+                        bs = batch.shape[0]
+                        for lj in range(bs):
+                            gj = batch_start + lj
+                            st_phase_list[gj] = {
+                                k: (v[lj:lj+1] if isinstance(v, torch.Tensor) and v.shape[0] == bs else v)
+                                for k, v in bp.items()
+                            }
+                            st_cross_list[gj] = {
+                                k: (v[lj:lj+1] if isinstance(v, torch.Tensor) and v.shape[0] == bs else v)
+                                for k, v in bc.items()
+                            }
+                            st_up_phase_list[gj] = {
+                                k: (v[lj:lj+1] if isinstance(v, torch.Tensor) and v.shape[0] == bs else v)
+                                for k, v in bup.items()
+                            }
+                            st_up_scatter_list[gj] = {
+                                k: (v[lj:lj+1] if isinstance(v, torch.Tensor) and v.shape[0] == bs else v)
+                                for k, v in bus.items()
+                            }
+                    except RuntimeError:
+                        for lj in range(batch.shape[0]):
+                            gj = batch_start + lj
+                            seg = st_input[gj:gj+1]
+                            try:
+                                sp = st_model(x=seg, compute_phase=True, compute_cross_phase=False, scattering_channel=0, phase_channels=[0])
+                                sc = st_model(x=seg, compute_phase=False, compute_cross_phase=True, scattering_channel=0, phase_channels=[0, 1])
+                                su = st_model(x=seg, compute_phase=True, compute_cross_phase=False, scattering_channel=0, phase_channels=[1])
+                                sus = st_model(x=seg, compute_phase=False, compute_cross_phase=False, scattering_channel=1)
+                                st_phase_list[gj] = sp
+                                st_cross_list[gj] = sc
+                                st_up_phase_list[gj] = su
+                                st_up_scatter_list[gj] = sus
+                            except RuntimeError as seg_err:
+                                orig_idx = valid_indices[gj]
+                                logger.error(
+                                    f"{guid_key} seg {orig_idx} "
+                                    f"(epoch={domain_starts[orig_idx]}): "
+                                    f"scattering failed: {seg_err}"
                                 )
+                                scatter_failed.add(gj)
+                                if guid_tracking is not None:
+                                    guid_tracking[guid_key].skipped_scatter_failed.append(
+                                        float(domain_starts[orig_idx])
+                                    )
 
             # Collect valid scattered segments
             b_fhr, b_up = [], []
@@ -2236,18 +2844,27 @@ def create_hdf5_dataset_from_records_list(
                     continue
                 orig_idx = valid_indices[seg_j]
 
-                fhr_st_coeff = st_phase_list[seg_j]["scattering"][0]
-                up_st_coeff = st_up_scatter_list[seg_j]["scattering"][0]
-                fhr_ph_full = st_phase_list[seg_j]["phase_corr"][0]
-                cross_full = st_cross_list[seg_j]["cross_phase_corr"][0]
-                up_ph_full = st_up_phase_list[seg_j]["phase_corr"][0]
-
-                fhr_ph_coeff = fhr_ph_full[phase_mask, :]
-                # fhr_up_ph now carries ONLY the cross-channel phase
-                # coefficients. UP self-phase harmonics live in up_ph as a
-                # first-class field with their own per-channel asinh stats.
-                fhr_up_ph_coeff = cross_full[cross_mask, :]     # (n_cross, T)
-                up_ph_coeff = up_ph_full[up_phase_mask, :]       # (n_up_phase, T)
+                # Both variants end here holding the same thing: one ``(C, T)`` numpy array per
+                # stored block, already at its stored width. The causal path has no cross-phase
+                # entry at all, which is what keeps ``b_fhr_up_ph`` empty and the append guard
+                # below meaningful.
+                if causal:
+                    coefficients = causal_blocks[seg_j]
+                else:
+                    fhr_pass = st_phase_list[seg_j]
+                    reduced = {
+                        "fhr_st": fhr_pass["scattering"][0],
+                        "fhr_ph": fhr_pass["phase_corr"][0][phase_mask, :],
+                        # fhr_up_ph now carries ONLY the cross-channel phase
+                        # coefficients. UP self-phase harmonics live in up_ph as a
+                        # first-class field with their own per-channel asinh stats.
+                        "fhr_up_ph": st_cross_list[seg_j]["cross_phase_corr"][0][cross_mask, :],
+                        "up_st": st_up_scatter_list[seg_j]["scattering"][0],
+                        "up_ph": st_up_phase_list[seg_j]["phase_corr"][0][up_phase_mask, :],
+                    }
+                    coefficients = {
+                        name: value.detach().cpu().numpy() for name, value in reduced.items()
+                    }
 
                 if guid_tracking is not None:
                     guid_tracking[guid_key].included_domain_starts.append(
@@ -2259,11 +2876,12 @@ def create_hdf5_dataset_from_records_list(
 
                 b_fhr.append(fhr[orig_idx, :])
                 b_up.append(up[orig_idx, :])
-                b_fhr_st.append(fhr_st_coeff.detach().cpu().numpy())
-                b_up_st.append(up_st_coeff.detach().cpu().numpy())
-                b_fhr_ph.append(fhr_ph_coeff.detach().cpu().numpy())
-                b_fhr_up_ph.append(fhr_up_ph_coeff.detach().cpu().numpy())
-                b_up_ph.append(up_ph_coeff.detach().cpu().numpy())
+                b_fhr_st.append(coefficients["fhr_st"])
+                b_up_st.append(coefficients["up_st"])
+                b_fhr_ph.append(coefficients["fhr_ph"])
+                b_up_ph.append(coefficients["up_ph"])
+                if not causal:
+                    b_fhr_up_ph.append(coefficients["fhr_up_ph"])
                 b_target.append(pre_defined_target * sample_weights[orig_idx, :])
                 b_weight.append(sample_weights[orig_idx, :])
                 b_guid.append(record_name)
@@ -2280,7 +2898,10 @@ def create_hdf5_dataset_from_records_list(
                     up_batch=np.stack(b_up),
                     fhr_st_batch=np.stack(b_fhr_st),
                     fhr_ph_batch=np.stack(b_fhr_ph),
-                    fhr_up_ph_batch=np.stack(b_fhr_up_ph),
+                    # Explicitly None rather than an empty stack: the append guard raises when a
+                    # file has the dataset and the batch is missing, so this must say "this build
+                    # does not produce it" rather than "there happened to be nothing to write".
+                    fhr_up_ph_batch=None if causal else np.stack(b_fhr_up_ph),
                     target_batch=np.stack(b_target),
                     weight_batch=np.stack(b_weight),
                     guid_batch=b_guid,
@@ -2327,6 +2948,9 @@ def _build_hdf5_for_partition(
     run_guid_analysis: bool,
     scatter_batch_size: int,
     verbose: bool,
+    transform: str = TWO_SIDED,
+    device: Optional[torch.device] = None,
+    source_pickle_path: Optional[str] = None,
 ) -> None:
     """Build HDF5 files for one partition (train, val, or test).
 
@@ -2340,25 +2964,20 @@ def _build_hdf5_for_partition(
         run_guid_analysis: Whether to run GUID analysis.
         scatter_batch_size: Scattering batch size.
         verbose: Verbosity flag.
+        transform: ``'two_sided'`` or ``'causal'``.
+        device: Torch device for the transform; ``None`` lets the writer pick.
+        source_pickle_path: The fold pickle this run resumed from, recorded in
+            every shard it writes.
     """
     os.makedirs(part_dir, exist_ok=True)
-    n_cross = int(masks["n_cross"])
-    fhr_ph_selection = masks["fhr_ph_selection"]
-    up_ph_selection = masks["up_ph_selection"]
     for sg, records in subgroups.items():
         if not records:
             continue
         target, cs, bg = SUBGROUP_META[sg]
         hdf5_file = os.path.join(part_dir, f"{sg}.hdf5")
-        create_initial_hdf5(
-            path=hdf5_file,
-            len_signal=SIGNAL_LENGTH,
-            fhr_ph_selection=fhr_ph_selection,
-            len_sequence=sequence_length,
-            # fhr_up_ph now holds only the cross-channel phase coefficients.
-            n_cross_phase_channels=n_cross,
-            n_up_st_channels=43,
-            up_ph_selection=up_ph_selection,
+        create_hdf5_for_masks(
+            hdf5_file, masks, len_sequence=sequence_length,
+            records_list=records, source_pickle_path=source_pickle_path,
         )
         create_hdf5_dataset_from_records_list(
             hdf5_path=hdf5_file,
@@ -2371,9 +2990,11 @@ def _build_hdf5_for_partition(
             second_stage_map=second_stage_map,
             base_block_size=BASE_BLOCK_SIZE,
             overlap_percentage=OVERLAP_PERCENTAGE,
+            device=device,
             run_guid_analysis=run_guid_analysis,
             scatter_batch_size=scatter_batch_size,
             verbose=verbose,
+            transform=transform,
         )
 
 
@@ -2387,6 +3008,8 @@ def create_new_pipeline(
     num_workers: Optional[int] = None,
     screening_csv_path: Optional[str] = None,
     classification_pickle_path: Optional[str] = None,
+    transform: str = TWO_SIDED,
+    device: Optional[str] = None,
 ):
     """Run the complete new dataset creation pipeline.
 
@@ -2409,29 +3032,44 @@ def create_new_pipeline(
         scatter_batch_size: Scattering batch size.
         num_workers: Parallel prescreening workers.
         screening_csv_path: Skip Step 1, load this pre-computed CSV.
-        classification_pickle_path: Skip Steps 1-3, load this pickle.
+        classification_pickle_path: Skip Steps 1-3, load this pickle. Recorded
+            in every shard this run writes, together with a digest of that
+            shard's GUID set: a causal dataset is comparable to a two-sided one
+            segment for segment only if both resumed from the same pickle, and
+            afterwards those two attributes are the only evidence of it.
+        transform: ``'two_sided'`` (the shipped kymatio bank) or ``'causal'``
+            (the one-sided gammatone bank, narrower scattering blocks, no
+            ``fhr_up_ph``). Written into every file as a root attribute.
+        device: Torch device for the transform, e.g. ``'cuda:3'`` to pin one
+            GPU of eight. ``None`` keeps today's behaviour: the first CUDA
+            device if one exists, else the CPU.
+
+    Raises:
+        ValueError: On an unknown *transform*, before anything is created.
     """
+    # First statement, before os.makedirs and before the CSV is read: a refusal that arrives
+    # later leaves an output directory behind and reports a CSV problem instead of the real one.
+    validate_transform(transform)
+
     setup_verbosity(verbose)
     os.makedirs(output_base_path, exist_ok=True)
+    torch_device = None if device is None else torch.device(device)
 
     # Load CSV metadata (needed for HDF5 creation in all paths)
     labor_onset_map, second_stage_map = load_csv_metadata(tlo_csv_path, verbose)
 
     # Compute scattering masks once
     logger.info("Computing scattering masks (v3)...")
-    masks = compute_scattering_masks(SIGNAL_LENGTH, scattering_T=16)
-    fhr_ph_sel = masks["fhr_ph_selection"]
-    up_ph_sel = masks["up_ph_selection"]
+    masks = compute_scattering_masks(
+        SIGNAL_LENGTH, scattering_T=16, device=torch_device, transform=transform
+    )
     # Log the resolved layout and the active selection parameters: this is the
     # operator's confirmation that the intended variant is running, and it
     # surfaces c_y / c_u so a stale model config is caught before the run ends.
-    logger.info(
-        f"Channel layout: fhr_st=43 + fhr_ph={fhr_ph_sel.n_channels} "
-        f"(c_y={43 + fhr_ph_sel.n_channels}), "
-        f"up_st=43 + up_ph={up_ph_sel.n_channels} "
-        f"(c_u={43 + up_ph_sel.n_channels}), "
-        f"fhr_up_ph={masks['n_cross']}"
-    )
+    # Every number is derived, so a geometry change moves the log rather than
+    # leaving a stale literal in it.
+    for line in format_layout(describe_layout(masks, torch_device)):
+        logger.info(line)
     logger.info(
         f"Phase selection: k_steps={PHASE_HARMONIC_K_STEPS}, "
         f"fhr_band={FHR_PHASE_BAND_HZ} Hz, up_band={UP_PHASE_BAND_HZ} Hz"
@@ -2447,6 +3085,9 @@ def create_new_pipeline(
         sequence_length=sequence_length,
         scatter_batch_size=scatter_batch_size,
         verbose=verbose,
+        transform=transform,
+        device=torch_device,
+        source_pickle_path=classification_pickle_path,
     )
 
     # ------------------------------------------------------------------
@@ -2648,19 +3289,15 @@ def create_new_pipeline(
         ("test_dataset_no_cs.hdf5", test_no_cs, False, True),
     ]
 
-    pretrain_n_cross = int(masks["n_cross"])
+    # These four bypass _build_hdf5_for_partition entirely, which is exactly why they go through
+    # the same create_hdf5_for_masks: a variant threaded into the partition path alone would
+    # produce a directory whose classification and pre-training files disagree.
     for fname, records, cs, bg in pretrain_sets:
         hdf5_file = os.path.join(pretrain_path, fname)
         logger.info(f"Creating {fname} ({len(records)} GUIDs)...")
-        create_initial_hdf5(
-            path=hdf5_file,
-            len_signal=SIGNAL_LENGTH,
-            fhr_ph_selection=fhr_ph_sel,
-            len_sequence=sequence_length,
-            # fhr_up_ph now holds only the cross-channel phase coefficients.
-            n_cross_phase_channels=pretrain_n_cross,
-            n_up_st_channels=43,
-            up_ph_selection=up_ph_sel,
+        create_hdf5_for_masks(
+            hdf5_file, masks, len_sequence=sequence_length,
+            records_list=records, source_pickle_path=classification_pickle_path,
         )
         create_hdf5_dataset_from_records_list(
             hdf5_path=hdf5_file,
@@ -2673,9 +3310,11 @@ def create_new_pipeline(
             second_stage_map=second_stage_map,
             base_block_size=BASE_BLOCK_SIZE,
             overlap_percentage=OVERLAP_PERCENTAGE,
+            device=torch_device,
             run_guid_analysis=False,
             scatter_batch_size=scatter_batch_size,
             verbose=verbose,
+            transform=transform,
         )
 
     logger.info("Pretraining datasets complete.")
@@ -2715,6 +3354,16 @@ if __name__ == "__main__":
     scatter_batch_size = 128
     num_workers = None  # defaults to min(cpu_count, 8)
 
+    # "two_sided" = the shipped kymatio bank. "causal" = the one-sided gammatone bank: scattering
+    # blocks narrow to 36 channels, fhr_up_ph is not produced, and every block carries its
+    # per-channel warm-up. Write it to a SEPARATE output_base_path — nothing here modifies an
+    # existing dataset, and a causal build is only comparable to the two-sided one if it resumes
+    # from that run's classification_pickle_path, which pins the same GUIDs, folds and segments.
+    transform = "two_sided"
+    # Torch device for the transform, e.g. "cuda:3" to pin one GPU of eight on the production box.
+    # None keeps today's behaviour: the first CUDA device if there is one, else the CPU.
+    device = None
+
     # ---- Resume / skip flags (set to None for full pipeline) ----
     screening_csv_path = None  # e.g. r"/path/to/guid_screening_results.csv"
     classification_pickle_path = None  # e.g. r"/path/to/classification_dataset_records.pickle"
@@ -2729,4 +3378,6 @@ if __name__ == "__main__":
         num_workers=num_workers,
         screening_csv_path=screening_csv_path,
         classification_pickle_path=classification_pickle_path,
+        transform=transform,
+        device=device,
     )
