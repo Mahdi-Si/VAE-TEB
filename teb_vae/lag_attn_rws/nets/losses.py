@@ -556,9 +556,6 @@ def masked_boundary_gap(
     return (gap * valid * contributing[:, 1:]).sum() / n_anchors
 
 
-# lean-limit: all valid anchors are decoded every batch; add anchor subsampling when a
-# measured production run exceeds device memory after the documented config levers are
-# exhausted.
 def compute_loss(
     forward_outputs: Dict[str, torch.Tensor],
     target: torch.Tensor,
@@ -626,16 +623,30 @@ def compute_loss(
     the caller's: how a forecast target is gathered is the one thing a target domain owns, and
     reconstructing it here would tie this function back to a raw grid.
 
+    **Which anchors were decoded is read off the forward dict**, from ``anchor_index`` and
+    ``anchor_valid``, and a model that decodes every anchor simply does not emit them. Reading
+    them here rather than taking them as arguments is what expresses the seam once: no model
+    class overrides this function to thread an anchor set through, and no subclass can supply an
+    anchor set to the masks that disagrees with the one its forward decoded at.
+
+    ``masked_boundary_gap`` is the one term that cannot follow. It identifies anchor $t$'s last
+    observed sample with a slice of anchor $t-1$'s target block, which is an identity only while
+    the anchor axis is contiguous; under a gathered set the two rows are not neighbours. A
+    non-zero ``lambda_boundary`` together with an anchor set therefore raises rather than
+    silently comparing unrelated samples.
+
     A free function taking the geometry, the block width and the two scalar bounds explicitly,
     rather than a method reading them off ``self``: this is what every architecture in the family
     optimises, and it must be one definition rather than one per model class. Each model keeps a
     thin method that builds its own target and supplies its own geometry.
 
     Args:
-        forward_outputs: The dict returned by a model's ``forward``.
-        target: The forecast target ``(B, T_valid, H, X)``, on the same grid the forecast heads
-            emit. Also fixes the device and dtype of the echoed weights and the empty-support
-            zeros, which is why nothing else here needs a reference signal.
+        forward_outputs: The dict returned by a model's ``forward``. Optionally carries
+            ``anchor_index`` ``(B, A)`` and ``anchor_valid`` ``(B, A)``, the anchor set the
+            forecasts were decoded at; absent, every anchor in $[0, T_{\mathrm{valid}})$ was.
+        target: The forecast target ``(B, A, H, X)``, on the same grid and at the same anchors
+            the forecast heads emit. Also fixes the device and dtype of the echoed weights and the
+            empty-support zeros, which is why nothing else here needs a reference signal.
         weight: Decimated validity signal ``(B, T)``.
         geometry: The model's trimmed-grid geometry.
         block_width: $X$ -- what the target's last axis counts. Used **only** by the four
@@ -669,16 +680,32 @@ def compute_loss(
 
     Raises:
         ValueError: On an unknown ``likelihood``, a ``weight`` that does not match the trimmed
-            grid, or a forecast block too short for the coarsest pooling rate when ``lambda_ms``
-            is nonzero.
+            grid, a forecast block too short for the coarsest pooling rate when ``lambda_ms``
+            is nonzero, or a nonzero ``lambda_boundary`` on a gathered anchor set.
     """
     validate_choice(likelihood, LIKELIHOOD_CHOICES, "likelihood")
     device, dtype = target.device, target.dtype
 
+    anchors = forward_outputs.get("anchor_index")
+    anchor_valid = forward_outputs.get("anchor_valid")
+    if anchors is not None and lambda_boundary != 0.0:
+        raise ValueError(
+            "lambda_boundary is nonzero and the forward decoded an explicit anchor set "
+            "(anchor_index); masked_boundary_gap identifies anchor t's last observed sample with "
+            "a slice of anchor t-1's target block, which is a slicing identity only while the "
+            "anchor axis is contiguous. Set lambda_boundary to 0.0, or decode every anchor."
+        )
+
     mask, coverage_frac = build_forecast_mask(
-        weight, geometry, coverage_floor=coverage_floor
+        weight,
+        geometry,
+        coverage_floor=coverage_floor,
+        anchors=anchors,
+        anchor_valid=anchor_valid,
     )
-    kl_support = build_kl_mask(mask, geometry)
+    kl_support = build_kl_mask(
+        mask, geometry, anchors=anchors, anchor_valid=anchor_valid
+    )
 
     nll_full_block, nll_full_sample = masked_raw_likelihood(
         forward_outputs["mu_full"],
@@ -796,9 +823,20 @@ def compute_loss(
             mean_logvar_post = zero.clone()
             delta_mu_rms = zero.clone()
 
-        # Coverage over the trained anchors, pre-floor: the distribution this summarises
-        # is what decides whether the shipped coverage_floor is right.
-        anchor_coverage_frac = coverage_frac[:, geometry.warmup :].mean()
+        # Coverage over the trained anchors, pre-floor: the distribution this summarises is what
+        # decides whether the shipped coverage_floor is right. On the dense axis that is a slice
+        # past the warm-up. On a gathered one it is the same set expressed as a weight: past the
+        # warm-up and not padding, the latter because a padded slot repeats a real anchor and
+        # would otherwise be counted twice.
+        if anchors is None:
+            anchor_coverage_frac = coverage_frac[:, geometry.warmup :].mean()
+        else:
+            counted = (anchors >= geometry.warmup).to(dtype)
+            if anchor_valid is not None:
+                counted = counted * anchor_valid.to(dtype)
+            anchor_coverage_frac = (
+                coverage_frac * counted
+            ).sum() / counted.sum().clamp_min(1.0)
 
     metrics: Dict[str, torch.Tensor] = {
         "total_loss": total_loss,

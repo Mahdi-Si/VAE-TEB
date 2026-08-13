@@ -102,10 +102,20 @@ class AvailabilityInputAdapter(nn.Module):
     to the first linear's output:
 
     $$
-    e_t = W_x \bar x_t + W_m\!\left(m_t - \mathbf 1\right)
+    e_t = W_x \left(x_t \odot m_t\right) + W_m\!\left(m_t - \mathbf 1\right)
         + \mathbb 1\!\left[\textstyle\sum_c m_{t,c} = 0\right] e_{\mathrm{start}},
     \qquad m_{t,c} = \mathbb 1[t \ge \delta_c].
     $$
+
+    **The mask and the announcement are one vector.** $m_t$ both zeroes the input and drives the
+    announcement term, so the two cannot describe different regions -- which a separate masking
+    module beside this one could, silently, with every shape still correct. For a stream that
+    arrived through :class:`~teb_vae.lag_attn.nets.delays.ChannelDelay` the multiply changes
+    nothing: that module already returns ``gathered * available`` under the same $\delta$, so
+    those positions are exactly zero before they get here. It is load-bearing for a stream whose
+    unavailable prefix holds *real values on no defined scale* -- coefficients a one-sided
+    transform emitted from assumed pre-recording history, normalised with constants accumulated
+    while deliberately excluding them.
 
     **Why this exists.** When the per-channel causal delay guard is active, the first
     $\max_c \delta_c$ steps of a channel are exact zeros -- no data, a fill value. An exactly zero
@@ -278,26 +288,61 @@ class AvailabilityInputAdapter(nn.Module):
         """Project the stream and add whichever availability terms were built.
 
         Args:
-            x: Gated feature stream ``(B, T, in_dim)``.
+            x: Feature stream ``(B, T, in_dim)`` at the surviving width. Whatever it holds inside
+                each channel's unavailable prefix is masked away here, so a caller need not have
+                zeroed it.
 
         Returns:
             The projected stream ``(B, T, d_model)``.
 
         Raises:
-            ValueError: If the sequence is longer than the availability pattern was built for.
+            ValueError: If the channel count is not ``in_dim``, or if the sequence is longer than
+                the availability pattern was built for.
         """
         seq_len = int(x.shape[1])
-        embedded = self.linear(x)
+        self._validate_stream(x)
 
         # Both terms are added whenever they exist, on every rank and every batch. The tests are
         # `is None` checks on modules built in __init__, never on tensor content: see the class
-        # docstring for why that distinction is the one DDP cares about.
+        # docstring for why that distinction is the one DDP cares about. The same pattern zeroes
+        # the input and announces it -- one vector, so the two cannot disagree.
         if self.mask_proj is not None:
-            embedded = embedded + self.mask_proj(self._slice(self.availability, seq_len) - 1.0)
+            available = self._slice(self.availability, seq_len)
+            embedded = self.linear(x * available) + self.mask_proj(available - 1.0)
+        else:
+            embedded = self.linear(x)
         if self.start_embed is not None:
             embedded = embedded + self._slice(self.start_indicator, seq_len) * self.start_embed
 
         return self.res_mlp(self.drop(self.act(self.norm(embedded))))
+
+    def _validate_stream(self, x: torch.Tensor) -> None:
+        """Refuse a stream whose channel count is not the width this adapter was built for.
+
+        Checked rather than left to the projection. Without the availability term ``self.linear``
+        refuses a wrong width itself, but ``x * available`` **broadcasts**: a squeezed or
+        mis-sliced single-channel stream fans out to every channel and produces a plausible
+        encoding, so the guarded adapters -- the ones with a warm-up to respect -- would be the
+        lenient ones.
+
+        A method rather than a branch inside :meth:`forward`, and the distinction is the DDP rule
+        rather than style: the forward's own control flow must stay a set of construction-time
+        ``is None`` tests, so that no step can skip a projection and leave its parameter unready on
+        the ranks whose batch did not need it. This runs unconditionally, on every rank and every
+        batch, and either returns or raises.
+
+        Args:
+            x: The stream handed to :meth:`forward`.
+
+        Raises:
+            ValueError: If ``x`` is not 3-D or its last axis is not ``in_dim``.
+        """
+        if x.dim() != 3 or int(x.shape[-1]) != self.in_dim:
+            raise ValueError(
+                f"the stream is {tuple(x.shape)} but this adapter reads {self.in_dim} channels; "
+                f"the availability pattern is positional against that width and broadcasts over a "
+                f"narrower one rather than refusing it"
+            )
 
     def _slice(self, pattern: torch.Tensor, seq_len: int) -> torch.Tensor:
         """Take the first ``seq_len`` steps of a constant pattern, refusing a longer request.

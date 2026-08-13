@@ -1,0 +1,30 @@
+# Horizon arm: forecast two minutes, restoring comparability of the HORIZON with the shipped cells.
+#
+# It restores the horizon and nothing else. The block is still H * C_keep = 30 * 98 = 2940 against
+# `lag_attn_fs`'s 30 * 78 = 2340, because C_keep is what the warm-up budget decides and the two
+# budgets are different quantities on different filter banks -- so the nats remain non-comparable
+# whatever the horizon. What becomes comparable is the QUESTION: how far ahead the model is asked to
+# forecast, which is the axis every "the gap survives to the far horizon step" reading is made along.
+#
+# The cost is anchors, and it is the tradeoff the shipped horizon exists to take. Anchors live in
+# [F, T - H), so doubling H shortens T_valid from 285 to 270 and the anchor count from 152 to 137.
+# That is mild here; at the budget that would keep all 102 target channels (W' = 278) it is fatal --
+# 8 anchors at H = 15 and exactly ZERO at H = 30, so keeping every channel is geometrically
+# impossible at this horizon. Shortening the horizon buys back channels, which is why the horizon is
+# one of the two levers on the warm-up cost rather than an independent preference.
+#
+# `anchor_stride` moves with it, because the two are one decision: at S < H the windows overlap again
+# and at S > H there are target steps no phase ever covers.
+#
+# `horizon_depth` stays at 4, where the refine stack's receptive field of 31 tokens is one more than
+# the 30 horizon tokens -- the sibling's own recorded criterion, which binds at this horizon and does
+# not at the shipped one.
+#
+#   TEB_RUN_STAMP="$(date '+%Y-%m-%d--[%H-%M]')" torchrun --nproc_per_node=7 \
+#       -m teb_vae.lag_attn_cfs.trainer --config teb_vae/lag_attn_cfs/configs/sweep_horizon_30.yaml
+base: default.yaml
+
+model_config:
+  VAE_model:
+    horizon: 30
+    anchor_stride: 30

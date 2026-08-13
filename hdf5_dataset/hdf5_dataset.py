@@ -89,6 +89,13 @@ class _FileLayout:
             block, or ``None`` for a two-sided file. Untrimmed because that is
             the storage geometry every other stored field uses; the loader
             rebases it for its own trim.
+        quantile: The ``causal_warmup_quantile`` the warm-up was measured at, or
+            ``None`` for a two-sided file. Read here rather than where it is
+            compared because it describes the same boundary
+            ``warmup_steps`` does, and two files built at different quantiles
+            carry different *channel counts* as well as different vectors — so a
+            consumer that resolves a channel budget must be able to see it
+            without opening every file a second time.
     """
 
     path: str
@@ -96,6 +103,7 @@ class _FileLayout:
     widths: Dict[str, int]
     lengths: Dict[str, int]
     warmup_steps: Optional[Dict[str, np.ndarray]]
+    quantile: Optional[float]
 
 
 def _read_file_layout(path: str) -> _FileLayout:
@@ -122,6 +130,7 @@ def _read_file_layout(path: str) -> _FileLayout:
                 widths[name] = int(f[name].shape[1])
                 lengths[name] = int(f[name].shape[2])
 
+        quantile = f.attrs.get('causal_warmup_quantile') if transform == CAUSAL else None
         warmup: Optional[Dict[str, np.ndarray]] = None
         if transform == CAUSAL:
             warmup = {}
@@ -142,8 +151,53 @@ def _read_file_layout(path: str) -> _FileLayout:
                     )
                 warmup[name] = vector
     return _FileLayout(
-        path=path, transform=transform, widths=widths, lengths=lengths, warmup_steps=warmup
+        path=path,
+        transform=transform,
+        widths=widths,
+        lengths=lengths,
+        warmup_steps=warmup,
+        quantile=None if quantile is None else float(quantile),
     )
+
+
+def _check_layouts_agree(layout: _FileLayout, reference: _FileLayout) -> None:
+    """Refuse two shards that cannot be read as one dataset.
+
+    Extracted so the loader's tolerant scan and the strict causal reader below
+    apply the *same* comparison: the two differ in how they treat a missing or
+    unreadable file, not in what "these files disagree" means, and a second copy
+    of the comparison could only drift from this one.
+
+    Args:
+        layout: The shard being checked.
+        reference: The shard every other one must agree with.
+
+    Raises:
+        ValueError: On a disagreement about variant, block set or a block width,
+            naming both files and the disagreement.
+    """
+    if layout.transform != reference.transform:
+        raise ValueError(
+            f"Mixed transform variants in one dataset: {layout.path} is "
+            f"'{layout.transform}' but {reference.path} is '{reference.transform}'. "
+            f"Their channel axes mean different things and their statistics are not "
+            f"interchangeable; build one dataset per variant."
+        )
+    if set(layout.widths) != set(reference.widths):
+        missing = sorted(set(reference.widths) - set(layout.widths))
+        extra = sorted(set(layout.widths) - set(reference.widths))
+        raise ValueError(
+            f"Mismatched coefficient blocks: {layout.path} is missing {missing} and adds "
+            f"{extra} relative to {reference.path}. A sample would carry different keys "
+            f"depending on which file it came from, which collates into an opaque failure "
+            f"or silently drops the field."
+        )
+    for name, width in layout.widths.items():
+        if width != reference.widths[name]:
+            raise ValueError(
+                f"Mismatched '{name}' width: {layout.path} stores {width} channels but "
+                f"{reference.path} stores {reference.widths[name]}."
+            )
 
 
 def _resolve_dataset_layout(paths: Sequence[str]) -> Optional[_FileLayout]:
@@ -185,28 +239,7 @@ def _resolve_dataset_layout(paths: Sequence[str]) -> Optional[_FileLayout]:
             reference = layout
             continue
 
-        if layout.transform != reference.transform:
-            raise ValueError(
-                f"Mixed transform variants in one dataset: {layout.path} is "
-                f"'{layout.transform}' but {reference.path} is '{reference.transform}'. "
-                f"Their channel axes mean different things and their statistics are not "
-                f"interchangeable; build one dataset per variant."
-            )
-        if set(layout.widths) != set(reference.widths):
-            missing = sorted(set(reference.widths) - set(layout.widths))
-            extra = sorted(set(layout.widths) - set(reference.widths))
-            raise ValueError(
-                f"Mismatched coefficient blocks: {layout.path} is missing {missing} and adds "
-                f"{extra} relative to {reference.path}. A sample would carry different keys "
-                f"depending on which file it came from, which collates into an opaque failure "
-                f"or silently drops the field."
-            )
-        for name, width in layout.widths.items():
-            if width != reference.widths[name]:
-                raise ValueError(
-                    f"Mismatched '{name}' width: {layout.path} stores {width} channels but "
-                    f"{reference.path} stores {reference.widths[name]}."
-                )
+        _check_layouts_agree(layout, reference)
     return reference
 
 
@@ -262,6 +295,174 @@ def rebase_causal_warmup(
             )
         rebased[name] = vector
     return rebased
+
+
+#: Raw sampling rate of the stored signals in Hz, and raw samples per decimated
+#: step. The two constants the trim arithmetic is built from, named once because
+#: every consumer that rebases anything against a trimmed window needs both.
+RAW_SAMPLING_HZ = 4
+DECIMATION = 16
+
+
+def decimated_trim_steps(trim_minutes: Optional[float]) -> Tuple[int, int]:
+    """Raw samples and decimated steps one ``trim_minutes`` setting discards per end.
+
+    One function rather than the arithmetic written out at each site: a consumer
+    that rebases a warm-up against a trimmed window must use the *loader's* trim
+    exactly, and a copy of the conversion that rounded differently would move the
+    valid region without moving anything that reports it.
+
+    Args:
+        trim_minutes: The configured symmetric trim in minutes, or ``None`` for
+            no trim at all.
+
+    Returns:
+        ``(raw_samples, decimated_steps)`` discarded from **each** end.
+    """
+    if trim_minutes is None:
+        return 0, 0
+    raw = int(RAW_SAMPLING_HZ * 60 * trim_minutes)
+    return raw, raw // DECIMATION
+
+
+@dataclass(frozen=True)
+class CausalWarmup:
+    r"""A causal dataset's valid-region boundary, rebased for one consumer's trim.
+
+    What :meth:`CombinedHDF5Dataset.causal_warmup_steps` reports, available
+    *without* building a loader — so a model can resolve a channel budget from the
+    shards it is about to train on before any sample is read, and can be refused
+    if those shards do not agree with each other.
+
+    Attributes:
+        paths: The shards this was read from, in the order given.
+        trim_minutes: The trim the vectors below are expressed against.
+        trim_steps: Decimated steps that trim discards from **each** end.
+        quantile: The ``causal_warmup_quantile`` every shard agrees on. Part of
+            the record because the quantile sets both the warm-up vectors and the
+            stored channel count, so two datasets built at different quantiles
+            describe different channel axes.
+        warmup_steps: ``{block: (C,) int64}``, rebased: the first step of the
+            trimmed window at which each channel is a function of the recording
+            rather than of assumed pre-recording history.
+        kept_steps: ``{block: T}``, the steps the trimmed window leaves.
+    """
+
+    paths: Tuple[str, ...]
+    trim_minutes: Optional[float]
+    trim_steps: int
+    quantile: Optional[float]
+    warmup_steps: Dict[str, np.ndarray]
+    kept_steps: Dict[str, int]
+
+
+def read_causal_warmup(
+    paths: Sequence[str], trim_minutes: Optional[float] = None
+) -> CausalWarmup:
+    r"""Read the causal warm-up off a file list and rebase it for ``trim_minutes``.
+
+    The public entry point for a consumer that needs the boundary but not the
+    data: it opens each file's attributes, refuses a list that does not describe
+    one dataset, and rebases through :func:`rebase_causal_warmup` — the same
+    function the loader and the statistics calculator share, so a third consumer
+    cannot arrive at a third valid region.
+
+    **Every** file is read, not the first. A two-sided test shard beside causal
+    training shards, or a shard rebuilt at another ``causal_warmup_quantile``,
+    would otherwise resolve cleanly against the first file and be evaluated
+    against a boundary its own coefficients do not have.
+
+    Stricter than the loader's own scan in one way: a missing file raises here
+    rather than being skipped. The loader tolerates a short file list because it
+    still has samples to serve; a boundary resolved from a subset of the
+    configured shards is simply the wrong boundary.
+
+    Args:
+        paths: The dataset's files. All of them — training and held-out.
+        trim_minutes: The trim the consumer will read these files at. Must be
+            the loader's own setting, or the returned vectors describe a window
+            nothing serves.
+
+    Returns:
+        The rebased boundary, with the geometry it was rebased against.
+
+    Raises:
+        ValueError: If ``paths`` is empty, if a file is missing, if any file is
+            not causal, if the files disagree about variant, block set, block
+            width, quantile or warm-up, or if the rebase leaves a channel with no
+            valid step.
+    """
+    if not paths:
+        raise ValueError(
+            "read_causal_warmup was given no files. The warm-up boundary is a property of the "
+            "shards, so there is nothing to read it from."
+        )
+
+    layouts: List[_FileLayout] = []
+    for path in paths:
+        if not os.path.exists(path):
+            raise ValueError(
+                f"{path} does not exist. A warm-up boundary resolved from the shards that "
+                f"happen to be present is the wrong boundary for the dataset that was asked "
+                f"for, and nothing downstream would say so."
+            )
+        layouts.append(_read_file_layout(path))
+
+    for layout in layouts:
+        if layout.transform != CAUSAL:
+            raise ValueError(
+                f"{layout.path} resolves to transform='{layout.transform}', not '{CAUSAL}'. Its "
+                f"coefficients are two-sided: the value at step t is a weighted average over raw "
+                f"samples on both sides of t, so it has no warm-up and no valid region to resolve."
+            )
+
+    reference = layouts[0]
+    for layout in layouts[1:]:
+        _check_layouts_agree(layout, reference)
+        if layout.quantile != reference.quantile:
+            raise ValueError(
+                f"Mismatched causal_warmup_quantile: {layout.path} was built at "
+                f"{layout.quantile} but {reference.path} at {reference.quantile}. The quantile "
+                f"sets both the per-channel warm-up and which channels survive the build, so the "
+                f"two files describe different channel axes."
+            )
+        # Stored length, which `_check_layouts_agree` does not compare -- it is not a property a
+        # loader serving one sample at a time needs the files to share. This reader does: it
+        # rebases against `reference` alone and reports one `kept_steps` per block, so a shorter
+        # shard beside a longer one would have the entire budget, the dead-channel refusal and the
+        # consumer's own trim cross-check computed against a window it does not have.
+        for name, length in sorted(layout.lengths.items()):
+            if length != reference.lengths[name]:
+                raise ValueError(
+                    f"Mismatched '{name}' stored length: {layout.path} stores {length} steps but "
+                    f"{reference.path} stores {reference.lengths[name]}. The warm-up is rebased "
+                    f"against one window and reported once, so the shorter shard would be served "
+                    f"channels whose warm-up outruns it with every readout still reporting a full "
+                    f"valid region."
+                )
+        assert layout.warmup_steps is not None and reference.warmup_steps is not None
+        for name, vector in sorted(layout.warmup_steps.items()):
+            if not np.array_equal(vector, reference.warmup_steps[name]):
+                raise ValueError(
+                    f"Mismatched '{name}' causal_warmup_steps: {layout.path} disagrees with "
+                    f"{reference.path}. The warm-up is a constant of the filter bank, so two "
+                    f"shards that disagree were not built by the same bank and a budget resolved "
+                    f"from one of them scores pad on the other."
+                )
+
+    _, trim_steps = decimated_trim_steps(trim_minutes)
+    rebased = rebase_causal_warmup(reference, trim_steps, trim_minutes)
+    assert rebased is not None  # every layout is causal, checked above
+    return CausalWarmup(
+        paths=tuple(str(path) for path in paths),
+        trim_minutes=trim_minutes,
+        trim_steps=trim_steps,
+        quantile=reference.quantile,
+        warmup_steps=rebased,
+        kept_steps={
+            name: reference.lengths[name] - 2 * trim_steps for name in sorted(rebased)
+        },
+    )
 
 
 def normalize_tensor_data(
@@ -757,13 +958,10 @@ class CombinedHDF5Dataset(Dataset):
         self.normalize_fields = set(normalize_fields) if normalize_fields is not None else None
         self.trim_minutes = trim_minutes
         self.emit_validity_mask = emit_validity_mask
-        if self.trim_minutes is not None:
-            self.trim_samples_raw = int(4 * 60 * self.trim_minutes)
-            self.trim_samples_decimated = self.trim_samples_raw // 16
-        else:
-            self.trim_samples_raw = 0
-            self.trim_samples_decimated = 0
-        
+        self.trim_samples_raw, self.trim_samples_decimated = decimated_trim_steps(
+            self.trim_minutes
+        )
+
         # Thread-safe file handle management
         self.file_handles: List[Any] = [None] * len(self.paths)
         self._handle_locks = [threading.Lock() for _ in self.paths]

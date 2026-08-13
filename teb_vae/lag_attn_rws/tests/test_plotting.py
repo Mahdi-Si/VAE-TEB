@@ -620,3 +620,72 @@ def test_a_task_that_names_no_rows_gets_the_raw_page(tmp_path, task, stub_batch)
         plotting.build_diagnostic_figure = original
 
     assert captured["forecast_rows"] is None
+
+
+# =============================================================================
+# The two builder seams the page's input half is reached through
+# =============================================================================
+def test_a_task_naming_no_panel_builder_gets_the_production_bank_one(task, stub_batch):
+    """The shipped path through the second seam. A model over the stored scattering and
+    phase-harmonic blocks names no builder and gets ``input_budget.stream_panels``, which is what
+    keeps the four shipped models unaffected by the seam existing at all."""
+    from teb_vae.lag_attn_rws import input_budget
+
+    module = task()
+    inputs = module._build_forward_inputs(stub_batch)
+    assert not hasattr(module, "input_stream_panels")
+
+    resolved = plotting.input_stream_panels(module.orig_model, inputs, 0)
+    direct = input_budget.stream_panels(module.orig_model, inputs, sample_index=0)
+
+    assert [panel.name for panel in resolved] == ["target", "source"]
+    assert len(resolved) == len(direct)
+    for panel, expected in zip(resolved, direct):
+        assert panel.title == expected.title
+        assert np.array_equal(panel.values, expected.values)
+        assert np.array_equal(panel.delays, expected.delays)
+        # The staircase's legend label is a panel field now, and the shipped builder leaves it at
+        # the default -- which is the reach guard's reading, and is what this row means here.
+        assert panel.delay_label == sample_page.DELAY_STAIRCASE_LABEL
+
+
+def test_a_supplied_builder_replaces_it_and_its_failures_still_cost_only_the_rows(
+    task, stub_batch
+):
+    """Both halves of the seam's contract. A model whose streams the production bank cannot
+    describe supplies its own builder and gets its rows; and the replacement is wrapped in the same
+    handler as the default, because the seven rows below the input rows do not depend on them and a
+    figure is never worth failing a fit for."""
+    module = task()
+    inputs = module._build_forward_inputs(stub_batch)
+    marker = sample_page.InputStreamPanel(
+        name="target", values=np.zeros((4, 2)), delays=np.zeros(2, dtype=int),
+        center_hz=np.empty(0), blocks=(("block", 0, 2),), title="replacement",
+    )
+
+    replaced = plotting.input_stream_panels(
+        module.orig_model, inputs, 0, lambda *args, **kwargs: [marker]
+    )
+    assert replaced == (marker,)
+
+    def _explode(*args, **kwargs):
+        raise RuntimeError("no bank for this model")
+
+    assert plotting.input_stream_panels(module.orig_model, inputs, 0, _explode) == ()
+
+
+def test_a_task_naming_no_budget_figure_writes_the_production_bank_one(tmp_path, task, stub_batch):
+    """The run-level figure's seam, and the shipped path through it. The two figures describe
+    different guards and are written under different stems, so a driver that gained its own does
+    not overwrite this one."""
+    from teb_vae.lag_attn_rws import input_budget
+
+    module = task()
+    assert not hasattr(module, "input_budget_figure")
+    callback = LagAttnRwsPlotCallback(tmp_path, num_examples=1, file_format="png")
+
+    callback._write_budget_figure(_trainer_with_batch(stub_batch), module, module.orig_model)
+    plt.close("all")
+
+    assert callback._budget_figure_written is True
+    assert (callback.output_dir / f"{input_budget.BUDGET_FIGURE_STEM}.png").exists()

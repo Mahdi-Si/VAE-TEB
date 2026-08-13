@@ -34,12 +34,16 @@ from teb_vae.lag_attn_transformer_fs.nets.model import SeqVaeLagAttnTrfFs
 from teb_vae.lag_attn_transformer_fs.tests.conftest import (
     SHIPPED_KWARGS,
     STUB_GAP_STEP,
+    TINY_KEEP_INDEX,
+    TINY_KWARGS,
     make_patterned_batch,
     make_stub_batch,
     shipped_gated_kwargs,
+    tiny_gated_kwargs,
 )
 from teb_vae.lag_attn_rws.nets.losses import LOGVAR_FLOOR_MARGIN_FRAC
 from teb_vae.lag_attn_rws.nets.raw_masks import forecast_mask
+from teb_vae.lag_attn_rws.tests.test_objective import assert_objective_reassembles
 from teb_vae.lag_attn_transformer_rws.nets.model import SeqVaeLagAttnTrfRws
 
 #: Coefficients the recomposition runs at. Mutually distinct and none of them a default: at equal
@@ -556,6 +560,41 @@ def test_the_binding_bound_fractions_use_the_same_coefficient_denominator():
     assert torch.equal(metrics["logvar_full_ceil_frac"], expected_ceil)
     assert 0.0 <= float(metrics["logvar_full_floor_frac"]) <= 1.0
     assert 0.0 <= float(metrics["logvar_full_ceil_frac"]) <= 1.0
+
+
+@pytest.mark.parametrize("likelihood", ["gaussian_nll", "mse"])
+@pytest.mark.parametrize("guard", ["ungated", "gated"], ids=["ungated", "gated"])
+def test_every_metric_reassembles_from_the_primitives(perturb_posterior, likelihood, guard):
+    """This model's metrics, against the raw-signal suite's independent reassembly.
+
+    The arithmetic is the shared objective's -- one harness for all four forecasters -- and what
+    this file supplies is what this model owns: its target, built by the slice-and-stack that
+    shares no arithmetic with ``unfold``, its block width, and the four resolved forecast gaps.
+    """
+    gated = guard == "gated"
+    model = _model(tiny_gated_kwargs() if gated else dict(TINY_KWARGS))
+    perturb_posterior(model)
+    batch = _loss_batch()
+    outs = _forward(model, batch)
+
+    target = _stacked_block(_features(batch), model.horizon, model.geometry.t_valid)
+    if gated:
+        target = torch.index_select(target, -1, torch.tensor(TINY_KEEP_INDEX))
+
+    assert_objective_reassembles(
+        model,
+        outs,
+        target,
+        batch.weight,
+        model.compute_loss(
+            outs, _features(batch), weight=batch.weight, likelihood=likelihood, **_COEFFICIENTS
+        )["metrics"],
+        likelihood=likelihood,
+        coefficients=_COEFFICIENTS,
+        # Hand-written: the surviving width, or the declared one when nothing was dropped.
+        block_width=len(TINY_KEEP_INDEX) if gated else 109,
+        package_owned=_RESOLVED_GAP_KEYS,
+    )
 
 
 def test_the_block_width_follows_the_gate_at_every_budget(tiny_gated, tiny_kwargs):

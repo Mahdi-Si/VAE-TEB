@@ -47,6 +47,8 @@ from hdf5_dataset.hdf5_dataset import (
     TWO_SIDED,
     CombinedHDF5Dataset,
     _COEFFICIENT_FIELDS,
+    decimated_trim_steps,
+    read_causal_warmup,
     resolve_transform,
 )
 from hdf5_dataset.guid_hdf5_dataset import SignalSequenceDataset, sequence_collate_fn
@@ -396,6 +398,144 @@ def test_a_list_disagreeing_on_the_block_set_is_refused(
             cache_size=0, pin_memory=False, trim_minutes=TRIM_MINUTES,
         )
     assert "fhr_up_ph" in str(error.value)
+
+
+# =================================================================================================
+# Reading the boundary without building a loader
+# =================================================================================================
+# A model resolves which channels it may use *before* it is constructed -- its input widths depend
+# on the answer -- so it needs the boundary without a dataset, a stats file or a single sample
+# read. The three properties that matter are that it is the same boundary the loader serves, that
+# every configured file is checked rather than the first, and that a file list which does not
+# describe one dataset is refused instead of resolved from whichever shard came first.
+def test_the_boundary_read_without_a_loader_is_the_one_the_loader_serves(
+    causal_shard: Path
+) -> None:
+    """Same function, same trim, same vectors -- which is the whole reason it is shared."""
+    dataset = _dataset(causal_shard)
+    served = dataset.causal_warmup_steps
+    assert served is not None
+
+    read = read_causal_warmup([str(causal_shard)], TRIM_MINUTES)
+    assert sorted(read.warmup_steps) == sorted(served)
+    for field, vector in served.items():
+        assert np.array_equal(read.warmup_steps[field], vector), field
+    assert read.trim_steps == TRIM_STEPS
+    assert set(read.kept_steps.values()) == {KEPT_STEPS}
+
+    with h5py.File(causal_shard, "r") as handle:
+        assert read.quantile == pytest.approx(float(handle.attrs["causal_warmup_quantile"]))
+
+
+def test_the_trim_conversion_is_the_loader_s_own(causal_shard: Path) -> None:
+    """A consumer that rounded the trim differently would rebase against a window nothing serves."""
+    dataset = _dataset(causal_shard)
+    assert decimated_trim_steps(TRIM_MINUTES) == (
+        dataset.trim_samples_raw,
+        dataset.trim_samples_decimated,
+    )
+    assert decimated_trim_steps(TRIM_MINUTES) == (TRIM_STEPS * 16, TRIM_STEPS)
+    assert decimated_trim_steps(None) == (0, 0)
+
+
+@pytest.mark.parametrize("order", ("causal_first", "two_sided_first"))
+def test_every_file_is_read_rather_than_the_first(
+    causal_shard: Path, two_sided_shard: Path, order: str
+) -> None:
+    """A two-sided held-out shard beside causal training shards is the motivating case.
+
+    Resolved off the first file alone it comes out clean either way, and the held-out numbers are
+    then produced against a channel axis that means something else.
+    """
+    paths = [str(causal_shard), str(two_sided_shard)]
+    if order == "two_sided_first":
+        paths.reverse()
+    with pytest.raises(ValueError, match=TWO_SIDED):
+        read_causal_warmup(paths, TRIM_MINUTES)
+
+
+def test_files_built_at_different_quantiles_are_refused_naming_one(
+    causal_shard: Path, tmp_path: Path
+) -> None:
+    """The quantile sets the warm-up *and* which channels survive the build: it is a channel axis.
+
+    Two files that disagree about it are two datasets, and a budget resolved from one of them
+    describes a boundary the other does not have.
+    """
+    path = tmp_path / "other_quantile.hdf5"
+    shutil.copyfile(causal_shard, path)
+    with h5py.File(path, "a") as handle:
+        handle.attrs["causal_warmup_quantile"] = np.float32(0.99)
+
+    with pytest.raises(ValueError, match="causal_warmup_quantile") as error:
+        read_causal_warmup([str(causal_shard), str(path)], TRIM_MINUTES)
+    assert path.name in str(error.value)
+
+
+def test_files_disagreeing_on_the_warm_up_itself_are_refused(
+    causal_shard: Path, tmp_path: Path
+) -> None:
+    """It is a constant of the filter bank, so two shards that disagree had two banks."""
+    path = tmp_path / "shifted_warmup.hdf5"
+    shutil.copyfile(causal_shard, path)
+    with h5py.File(path, "a") as handle:
+        warmup = np.asarray(handle["fhr_ph"].attrs["causal_warmup_steps"])
+        warmup[5] += 1
+        handle["fhr_ph"].attrs["causal_warmup_steps"] = warmup
+
+    with pytest.raises(ValueError, match=r"Mismatched 'fhr_ph' causal_warmup_steps") as error:
+        read_causal_warmup([str(causal_shard), str(path)], TRIM_MINUTES)
+    assert path.name in str(error.value)
+
+
+def test_files_of_different_stored_length_are_refused_naming_the_block(
+    causal_shard: Path, tmp_path: Path
+) -> None:
+    """A shorter shard beside a longer one resolves the whole boundary against the wrong window.
+
+    This reader rebases against the first file alone and reports one ``kept_steps`` per block, so
+    a test shard built to a different segment length would have the budget, the dead-channel
+    refusal and a consumer's own trim cross-check all computed against a window it does not have
+    -- and the shorter shard would then be served channels whose warm-up outruns it, with every
+    valid-region readout still reporting a full one. The loader's own scan tolerates this because
+    it serves one sample at a time and never shares a length between files.
+    """
+    path = tmp_path / "shorter_segments.hdf5"
+    with h5py.File(causal_shard, "r") as source:
+        block = np.asarray(source["fhr_ph"][:])
+    with h5py.File(causal_shard, "r") as source, h5py.File(path, "w") as handle:
+        for name, item in source.items():
+            handle.create_dataset(
+                name, data=item[..., :-1] if name == "fhr_ph" else item[...]
+            )
+            handle[name].attrs.update(item.attrs)
+        handle.attrs.update(source.attrs)
+
+    with pytest.raises(ValueError, match=r"Mismatched 'fhr_ph' stored length") as error:
+        read_causal_warmup([str(causal_shard), str(path)], TRIM_MINUTES)
+    assert path.name in str(error.value)
+    # The probe is not vacuous: the same pair at equal length resolves without complaint.
+    assert block.shape[2] == read_causal_warmup([str(causal_shard)], None).kept_steps["fhr_ph"]
+
+
+def test_a_missing_file_is_refused_rather_than_skipped(
+    causal_shard: Path, tmp_path: Path
+) -> None:
+    """Stricter than the loader's own scan, and deliberately.
+
+    The loader tolerates a short list because it still has samples to serve. A boundary resolved
+    from a subset of the configured shards is simply the wrong boundary, and nothing downstream
+    would say so.
+    """
+    absent = tmp_path / "never_built.hdf5"
+    with pytest.raises(ValueError, match="never_built"):
+        read_causal_warmup([str(causal_shard), str(absent)], TRIM_MINUTES)
+
+
+def test_an_empty_file_list_is_refused() -> None:
+    """The boundary is a property of the shards; with none there is nothing to read it from."""
+    with pytest.raises(ValueError, match="no files"):
+        read_causal_warmup([], TRIM_MINUTES)
 
 
 # =================================================================================================

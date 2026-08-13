@@ -586,6 +586,38 @@ class SeqVaeLagAttnRwsTask(LightningModelBase):
             ).sum(dim=-1)
             return torch.sqrt((gap_sq * support).sum() / support.sum().clamp_min(1.0))
 
+    def _added_metrics(
+        self,
+        inputs: Tuple[torch.Tensor, ...],
+        forward_outputs: Dict[str, torch.Tensor],
+        weight: torch.Tensor,
+        stage: str,
+    ) -> Dict[str, torch.Tensor]:
+        """Readouts a subclass can only compute from the net's *inputs*, merged into the metrics.
+
+        A documented no-op here, and deliberately so, for the reason
+        :meth:`~teb_vae.lag_attn_rws.trainer.LagAttnRwsTrainer.preflight` is one: a subclass that
+        forgets ``super()._added_metrics(...)`` cannot drop an inherited readout, because there are
+        none to drop.
+
+        The hook exists because :meth:`compute_loss_and_metrics` is the only place that holds the
+        forward dict, the assembled inputs and the stage together, and a readout needing all three
+        would otherwise have to re-run the forward -- which would draw a second reparameterisation
+        $\\epsilon$ and move every subsequent step of the run. Everything a subclass adds here is a
+        *readout*: the returned loss is built before this runs and is not shown to it.
+
+        Args:
+            inputs: The positional tensors handed to the net's forward, as
+                :meth:`_build_forward_inputs` assembled them.
+            forward_outputs: The net's forward dict for this step.
+            weight: Decimated validity signal $(B, T)$.
+            stage: ``'train'``, ``'val'`` or ``'test'``.
+
+        Returns:
+            An empty mapping. Nothing here emits a metric of its own.
+        """
+        return {}
+
     # ------------------------------------------------------------------
     # Loss + metrics
     # ------------------------------------------------------------------
@@ -662,7 +694,16 @@ class SeqVaeLagAttnRwsTask(LightningModelBase):
             # stranger's source and never touches the objective.
             with torch.no_grad():
                 permuted = controls.perm_forward_outputs(
-                    self.orig_model, forward_outputs, generator=self._perm_generator
+                    self.orig_model,
+                    forward_outputs,
+                    generator=self._perm_generator,
+                    # The matched forward's own anchors, read from its dict exactly as
+                    # ``compute_loss`` reads them: absent on a model that decodes every anchor, so
+                    # this is bitwise the previous call there. On a model that decodes a tile it is
+                    # the difference between a control and a shape error -- the shuffled forecast is
+                    # scored against the same target block and the same mask as the matched one, and
+                    # two anchor sets would make the comparison a comparison of two questions.
+                    anchors=forward_outputs.get("anchor_index"),
                 )
                 shuffled = self.orig_model.compute_loss(
                     permuted,
@@ -693,6 +734,21 @@ class SeqVaeLagAttnRwsTask(LightningModelBase):
         # No else-branch zero-fill: an epoch-aggregated metric is the mean over the steps that
         # reported it, so zeros on skipped steps would scale it toward nothing and invert the
         # D_full < D_base < D_shuffled reading on a healthy model.
+
+        # Last, and refused rather than merged on a collision. A plain update would let a
+        # subclass's readout replace an objective metric *under the objective's own name*, so the
+        # CSV column and the MLflow series would silently stop being what every other cell of the
+        # grid reports there. Empty for this task; see the hook.
+        added = self._added_metrics(inputs, forward_outputs, weight, stage)
+        collisions = sorted(set(added) & set(metrics))
+        if collisions:
+            raise ValueError(
+                f"_added_metrics returned {collisions}, which the objective already reports. A "
+                f"readout that reuses an objective metric's name replaces it in metrics_history."
+                f"csv and in MLflow with no error, so the column keeps its meaning across the "
+                f"family only if the name is new. Rename it."
+            )
+        metrics.update(added)
 
         return main_loss, metrics
 

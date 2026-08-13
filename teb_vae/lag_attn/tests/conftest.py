@@ -213,6 +213,13 @@ def inputs():
     return y_st, y_ph, u_stream
 
 
+def pytest_configure(config: pytest.Config) -> None:
+    """Register the ``slow`` marker; there is no repo-wide pytest configuration to declare it."""
+    config.addinivalue_line(
+        "markers", "slow: long-running empirical validation, excluded from the default run"
+    )
+
+
 @pytest.fixture
 def perturb_posterior():
     """Factory fixture that breaks a model's zero-init so its KL terms become nonzero.

@@ -51,6 +51,8 @@ _PACKAGES = (
     "lag_attn_transformer_e2e",
     "lag_attn_fs",
     "lag_attn_transformer_fs",
+    "lag_attn_cfs",
+    "lag_attn_transformer_cfs",
 )
 
 #: Everything under a ``teb_vae`` package that is not a net layer.

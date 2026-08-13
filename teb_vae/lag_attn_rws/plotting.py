@@ -11,9 +11,12 @@ the raw ``up`` trace the page's first row draws beside the target, taken from th
 from the task's forward-input builder. Whether the net *also* sees that trace is model-dependent --
 a feature-input model consumes the decimated UP blocks and never sees it, a raw-input model is fed
 it directly -- and the page draws it either way, so the row means the same thing in both. It also supplies the page's
-gated-input rows and, once per run, writes the companion causal-input-budget figure; both come
-from :mod:`teb_vae.lag_attn_rws.input_budget`, and both are separately guarded so that a model
-whose channels the production filter bank cannot describe still gets its pages. It never
+gated-input rows and, once per run, writes the companion input-budget figure; both default to
+:mod:`teb_vae.lag_attn_rws.input_budget` and both are resolved off the task first, exactly as
+``forecast_rows`` is, because that module is welded to the production Morlet bank and a model
+guarded by something else would otherwise lose two rows and a figure to two log lines. Both are
+separately guarded so that a model whose channels no builder can describe still gets its pages.
+It never
 raises into the training loop -- generation is wrapped in a broad ``try/except`` that warns and
 closes any leaked figures -- and every saved file goes to MLflow through the rank-0 artifact seam
 :func:`utils.mlflow_utils.log_artifact_to_mlflow`. This module lives in the model layer rather
@@ -165,30 +168,43 @@ def consumes_feature_blocks(model: Any) -> bool:
     return getattr(model, "c_y", None) is not None and getattr(model, "c_u", None) is not None
 
 
-def input_stream_panels(model: Any, inputs: Any, sample_index: int) -> Any:
+def input_stream_panels(
+    model: Any, inputs: Any, sample_index: int, builder: Any = None
+) -> Any:
     """Build the page's gated-input rows, or none of them if they cannot be described.
 
-    Wrapped rather than called directly, because everything the rows need beyond the tensors --
-    the filter bank's per-channel reaches and centre frequencies -- is keyed to the *production*
-    channel widths. A model over other widths is a page without these rows and a named warning,
-    not a page that fails to be drawn at all: the seven rows below them do not depend on any of
-    it.
+    Wrapped rather than called directly, because everything the default builder needs beyond the
+    tensors -- the production filter bank's per-channel reaches and centre frequencies -- is keyed
+    to the *production* channel widths. A model over other widths is a page without these rows and
+    a named warning, not a page that fails to be drawn at all: the seven rows below them do not
+    depend on any of it.
+
+    That silence is also why ``builder`` exists. A model over another input representation reaches
+    the default builder's width check and loses two rows to one log line, so a package whose
+    streams the production bank does not describe supplies its own builder rather than editing this
+    one -- the same seam, and for the same reason, as ``forecast_rows``.
 
     Args:
         model: The net.
         inputs: The task's forward inputs, exactly as splatted into ``forward``.
         sample_index: Which sample of the batch the page is being drawn for.
+        builder: A replacement panel builder with the signature of
+            :func:`~teb_vae.lag_attn_rws.input_budget.stream_panels`, or ``None`` for that
+            function -- which is what every model over the production feature blocks wants.
 
     Returns:
         A tuple of :class:`~teb_vae.lag_attn_rws.sample_page.InputStreamPanel`, possibly empty.
     """
-    if not consumes_feature_blocks(model):
-        return ()
+    if builder is None:
+        if not consumes_feature_blocks(model):
+            return ()
 
-    from teb_vae.lag_attn_rws.input_budget import stream_panels
+        from teb_vae.lag_attn_rws.input_budget import stream_panels
+
+        builder = stream_panels
 
     try:
-        return tuple(stream_panels(model, inputs, sample_index=sample_index))
+        return tuple(builder(model, inputs, sample_index=sample_index))
     except Exception as exc:  # noqa: BLE001 - the rest of the page does not depend on these rows
         logger.warning(f"LagAttnRwsPlotCallback: input rows skipped: {exc}")
         return ()
@@ -282,30 +298,41 @@ class LagAttnRwsPlotCallback(Callback):
             plt.close("all")
             logger.warning(f"LagAttnRwsPlotCallback failed: {exc}")
 
-    def _write_budget_figure(self, trainer: Any, model: Any) -> None:
-        """Write the run-level causal-input-budget figure, once.
+    def _write_budget_figure(self, trainer: Any, pl_module: Any, model: Any) -> None:
+        """Write the run-level input-budget figure, once.
 
         Separate from the per-sample pages and separately guarded: it describes the guard the
         model was built with, so it is worth having even for a run whose pages fail, and a
         model whose channels the filter bank cannot describe must not cost the pages that do not
         need it.
 
+        Which figure is drawn is the task's to say, through an ``input_budget_figure`` seam
+        resolved the same way ``forecast_rows`` is. The shipped figure is a statement about the
+        two-sided *reach* guard and is built from the production Morlet bank; a model guarded by
+        something else -- a one-sided warm-up, say -- needs its own figure, and the alternative to
+        this seam is a run whose only sign of that is one warning per fit.
+
         Args:
             trainer: The Lightning trainer, for the MLflow artifact seam.
+            pl_module: The task, read for its optional figure seam.
             model: The net.
         """
-        if self._budget_figure_written or not consumes_feature_blocks(model):
+        writer = getattr(pl_module, "input_budget_figure", None)
+        if self._budget_figure_written or (writer is None and not consumes_feature_blocks(model)):
             return
         # Set before the attempt, not after: a model this cannot describe cannot be described on
         # the next epoch either, and retrying would warn once per validation epoch for the rest
         # of the fit.
         self._budget_figure_written = True
         try:
-            from teb_vae.lag_attn_rws.input_budget import write_input_budget_figure
+            if writer is None:
+                from teb_vae.lag_attn_rws.input_budget import write_input_budget_figure
 
-            path = write_input_budget_figure(
-                model, self.output_dir, file_format=self.file_format
-            )
+                path = write_input_budget_figure(
+                    model, self.output_dir, file_format=self.file_format
+                )
+            else:
+                path = writer(self.output_dir, file_format=self.file_format)
             log_artifact_to_mlflow(self._mlflow_logger, path, trainer)
         except Exception as exc:  # noqa: BLE001 - a figure is never worth failing a fit for
             plt.close("all")
@@ -368,7 +395,7 @@ class LagAttnRwsPlotCallback(Callback):
             if was_training:
                 pl_module.train()
 
-        self._write_budget_figure(trainer, model)
+        self._write_budget_figure(trainer, pl_module, model)
 
         stats = normalization_stats_of(trainer)
         # ``inputs[0]`` rather than a named tensor: every input the net takes carries the batch
@@ -379,6 +406,11 @@ class LagAttnRwsPlotCallback(Callback):
         # the raw signal needs its own first two rows and the same five below them. Resolved off
         # the module rather than captured, so the existing monkeypatch seam still intercepts.
         forecast_rows = getattr(pl_module, "forecast_rows", None)
+        # The same resolution, for the same reason, on the row that draws what the model was
+        # *given*: a package whose input streams the production filter bank cannot describe
+        # supplies its own builder, and a model over the shipped blocks names none and gets the
+        # shipped one.
+        panel_builder = getattr(pl_module, "input_stream_panels", None)
 
         for index in range(min(self.num_examples, int(inputs[0].shape[0]))):
             guid = _guid_of(batch, index)
@@ -405,7 +437,7 @@ class LagAttnRwsPlotCallback(Callback):
                 # The encoders' actual input: the same tensors the forward above consumed, put
                 # through the model's own gates. Built per sample rather than once for the batch
                 # so the row is the recording the rest of the page is about.
-                input_streams=input_stream_panels(model, inputs, index),
+                input_streams=input_stream_panels(model, inputs, index, panel_builder),
             )
             path = self.output_dir / (
                 f"lag_attn_rws_epoch{epoch:04d}_sample{index}_{guid[:16]}.{self.file_format}"
