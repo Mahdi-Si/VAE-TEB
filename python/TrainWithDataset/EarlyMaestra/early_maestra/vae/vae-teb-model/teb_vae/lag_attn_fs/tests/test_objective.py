@@ -28,13 +28,17 @@ from teb_vae.lag_attn_fs.nets.model import SeqVaeLagAttnFs
 from teb_vae.lag_attn_fs.tests.conftest import (
     SHIPPED_KWARGS,
     STUB_GAP_STEP,
+    TINY_KEEP_INDEX,
+    TINY_KWARGS,
     make_patterned_batch,
     make_stub_batch,
     shipped_gated_kwargs,
+    tiny_gated_kwargs,
 )
 from teb_vae.lag_attn_rws.nets.losses import LOGVAR_FLOOR_MARGIN_FRAC, raw_sample_score
 from teb_vae.lag_attn_rws.nets.model import SeqVaeLagAttnRws
 from teb_vae.lag_attn_rws.nets.raw_masks import contributing_anchors, forecast_mask
+from teb_vae.lag_attn_rws.tests.test_objective import assert_objective_reassembles
 
 #: Coefficients the recomposition runs at. Mutually distinct and none of them a default: at equal
 #: weights a term swapped for another passes, at ``beta_prior=0`` the fourth term is multiplied
@@ -173,6 +177,47 @@ def test_the_ungated_target_keeps_every_declared_channel(tiny_kwargs):
     assert model.target_gate is None
     assert built.shape[-1] == model.c_y == 109
     assert torch.equal(built, future_target(batch.fhr_st, batch.fhr_ph, model.horizon))
+
+
+def test_a_named_anchor_set_takes_the_dense_blocks_it_names(tiny_gated):
+    """The gathered window, against the rows of the dense block it selects.
+
+    A selection, not a second construction: anchor $t$'s block must be the same tensor whether it
+    was built as one of every anchor's or as one of three.
+    """
+    model = _model(tiny_gated)
+    stream = _features(make_patterned_batch())
+    dense = model._build_forecast_target(stream)
+    anchors = torch.tensor([[2, 6, 9], [3, 6, 11]])
+
+    gathered = model._build_forecast_target(stream, anchors)
+
+    assert gathered.shape == (2, 3, model.horizon, dense.shape[-1])
+    for row in range(2):
+        for slot, anchor in enumerate(anchors[row].tolist()):
+            assert torch.equal(gathered[row, slot], dense[row, anchor])
+
+
+def test_the_anchored_target_never_unfolds(tiny_gated, monkeypatch):
+    r"""No ``unfold`` in the anchored path, asserted by making one fail.
+
+    The two do not compose: ``unfold`` produces *every* window in order, so unfolding first and
+    selecting after would materialise the whole $(B, T_{\mathrm{valid}}, H, C)$ block -- a third
+    of a gigabyte at the production batch, and exactly the tensor a sparse anchor set exists to
+    avoid. The dense path still unfolds, which is why the same patch is checked to bite there.
+    """
+    model = _model(tiny_gated)
+    stream = _features(make_patterned_batch())
+    anchors = torch.tensor([[2, 6, 9], [3, 6, 11]])
+
+    def _refuse(*args, **kwargs):
+        raise AssertionError("unfold was called")
+
+    monkeypatch.setattr(torch.Tensor, "unfold", _refuse)
+
+    model._build_forecast_target(stream, anchors)  # must not raise
+    with pytest.raises(AssertionError, match="unfold was called"):
+        model._build_forecast_target(stream)
 
 
 @pytest.mark.parametrize(
@@ -604,6 +649,47 @@ def test_the_binding_bound_fractions_use_the_same_coefficient_denominator():
     assert torch.equal(metrics["logvar_full_ceil_frac"], expected_ceil)
     assert 0.0 <= float(metrics["logvar_full_floor_frac"]) <= 1.0
     assert 0.0 <= float(metrics["logvar_full_ceil_frac"]) <= 1.0
+
+
+# ---------------------------------------------------------------------------------------
+# The shared reassembly harness
+# ---------------------------------------------------------------------------------------
+@pytest.mark.parametrize("likelihood", ["gaussian_nll", "mse"])
+@pytest.mark.parametrize("guard", ["ungated", "gated"], ids=["ungated", "gated"])
+def test_every_metric_reassembles_from_the_primitives(perturb_posterior, likelihood, guard):
+    """This model's metrics, against the sibling suite's independent reassembly.
+
+    The arithmetic is the raw-signal package's -- one objective, one harness -- and what this
+    file supplies is what this model owns: its target, its block width, and the four resolved
+    forecast gaps it adds on top. Declaring those four is what makes an unannounced *fifth*
+    addition fail here rather than pass unnoticed.
+    """
+    gated = guard == "gated"
+    kwargs = tiny_gated_kwargs() if gated else dict(TINY_KWARGS)
+    model = _model(kwargs)
+    perturb_posterior(model)
+    batch = _loss_batch()
+    outs = _forward(model, batch)
+
+    # Built here, not by the model: the composition is the one `test_feature_target.py` pins.
+    target = future_target(batch.fhr_st, batch.fhr_ph, model.horizon)
+    if gated:
+        target = torch.index_select(target, -1, torch.tensor(TINY_KEEP_INDEX))
+
+    assert_objective_reassembles(
+        model,
+        outs,
+        target,
+        batch.weight,
+        model.compute_loss(
+            outs, _features(batch), weight=batch.weight, likelihood=likelihood, **_COEFFICIENTS
+        )["metrics"],
+        likelihood=likelihood,
+        coefficients=_COEFFICIENTS,
+        # Hand-written: the surviving width, or the declared one when nothing was dropped.
+        block_width=len(TINY_KEEP_INDEX) if gated else 109,
+        package_owned=_RESOLVED_GAP_KEYS,
+    )
 
 
 def test_the_block_width_follows_the_gate_at_every_budget(tiny_gated, tiny_kwargs):

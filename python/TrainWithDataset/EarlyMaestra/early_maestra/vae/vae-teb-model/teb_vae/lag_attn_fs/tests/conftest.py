@@ -66,10 +66,15 @@ from teb_vae.lag_attn_rws.tests.conftest import (  # noqa: E402,F401
     SHIPPED_KWARGS,
     STUB_GAP_STEP,
     TASK_HPARAMS,
+    TINY_DELAYS,
+    TINY_KEEP_INDEX,
     TINY_KWARGS,
+    TINY_SOURCE_DELAYS,
+    TINY_SOURCE_KEEP_INDEX,
     absolutize_dataset_paths,
     inputs,
     make_stub_batch,
+    tiny_gated_kwargs,
 )
 
 #: The reach budget the shipped configuration runs at, in seconds. It is the sibling's
@@ -179,29 +184,6 @@ def build_target_gate(budget_s: Optional[float] = SHIPPED_REACH_BUDGET_S):
         return SeqVaeLagAttnRws._build_channel_gate(SHIPPED_KWARGS["c_y"], None, None)
     return SeqVaeLagAttnRws._build_channel_gate(
         SHIPPED_KWARGS["c_y"], budget.target_keep_index, budget.target_delays
-    )
-
-
-#: A hand-made target guard for the tiny geometry, and the model width it implies. The shipped
-#: budget cannot be resolved at the tiny geometry -- its maximum delay is $30$ steps against a
-#: warm-up of $2$, which :func:`resolve_channel_budget` refuses -- so the gated path is exercised
-#: here at a guard chosen to fit. The delays are non-zero and distinct: a target that applied them
-#: would be wrong by a different amount in each channel, which is the failure the target builder's
-#: gather-not-gate rule exists to prevent.
-TINY_KEEP_INDEX = (0, 5, 9)
-TINY_DELAYS = (0, 1, 2)
-TINY_SOURCE_KEEP_INDEX = (2, 7)
-TINY_SOURCE_DELAYS = (0, 2)
-
-
-def tiny_gated_kwargs() -> Dict[str, Any]:
-    """The tiny constructor kwargs with a small causal guard on both streams."""
-    return dict(
-        TINY_KWARGS,
-        target_keep_index=TINY_KEEP_INDEX,
-        target_delays=TINY_DELAYS,
-        source_keep_index=TINY_SOURCE_KEEP_INDEX,
-        source_delays=TINY_SOURCE_DELAYS,
     )
 
 

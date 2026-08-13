@@ -171,7 +171,7 @@ def test_the_class_itself_defines_nothing_at_all():
 
 
 def test_the_target_domain_arrives_from_the_mixin_ahead_of_the_base():
-    """Where the five members went, and in which order they are reached.
+    """Where the members went, and in which order they are reached.
 
     ``compute_loss`` is the override the design names; ``_default_decoder_out_channels`` names a
     number and builds nothing, ``_build_forecast_target`` is a new method rather than an override
@@ -179,6 +179,11 @@ def test_the_target_domain_arrives_from_the_mixin_ahead_of_the_base():
     already returns. The MRO is asserted as a list because the *order* is what makes the width hook
     resolve to the feature one: reversed, the decoder would be built at ``raw_per_step`` and a
     feature block scored against it, with nothing raising.
+
+    ``_forecast_gaps_from_mask`` is the reduction of those four, split out from the resolver so a
+    subclass forecasting at a *gathered* anchor set changes which mask is built and nothing about
+    how the numbers are summed. It is not a fifth reported quantity, and the set below is where a
+    genuinely new member would have to announce itself.
     """
     own = {
         name
@@ -190,6 +195,7 @@ def test_the_target_domain_arrives_from_the_mixin_ahead_of_the_base():
         "_default_decoder_out_channels",
         "_build_forecast_target",
         "_resolved_forecast_gaps",
+        "_forecast_gaps_from_mask",
         "compute_loss",
     }
     assert [cls.__name__ for cls in SeqVaeLagAttnFs.__mro__] == [

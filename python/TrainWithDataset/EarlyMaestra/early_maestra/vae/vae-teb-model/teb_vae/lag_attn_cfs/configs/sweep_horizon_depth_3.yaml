@@ -1,0 +1,21 @@
+# Decoder-depth arm: three dilated refine blocks instead of four.
+#
+# The shipped depth is the two-sided sibling's, kept for PARITY rather than because the
+# receptive-field argument favours it: at kernel 3 the dilations are 2^i, so depth d spans
+# 1 + 2(2^d - 1) horizon tokens -- 15 at depth 3 and 31 at depth 4 -- and the sibling's own recorded
+# criterion is RF >= H + 1, which depth 3 fails at H = 15 by exactly one. The argument is moot in
+# both directions anyway, because `horizon_attention_blocks: 2` mixes every horizon token unmasked
+# after the refine stack, so no horizon token is out of reach at either depth.
+#
+# So the real case for depth 3 is parameter economy -- 328,960 fewer parameters -- and the case
+# against it is that a difference between this cell and the sibling would then have two candidate
+# explanations. This arm is what separates them: if it reads the same, the depth was never carrying
+# the comparison.
+#
+#   TEB_RUN_STAMP="$(date '+%Y-%m-%d--[%H-%M]')" torchrun --nproc_per_node=7 \
+#       -m teb_vae.lag_attn_cfs.trainer --config teb_vae/lag_attn_cfs/configs/sweep_horizon_depth_3.yaml
+base: default.yaml
+
+model_config:
+  VAE_model:
+    horizon_depth: 3

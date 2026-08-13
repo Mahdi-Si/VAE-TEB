@@ -1,0 +1,606 @@
+# Causal-feature-domain lag-attention VAE-TEB: the production training configuration.
+#
+# The model forecasts the next ONE MINUTE of the stored ONE-SIDED FHR feature future -- the 98
+# target channels surviving `causal_warmup_budget_steps`, over 15 decimated steps, so 1470
+# coefficients per anchor -- from a single shared latent. A target-only prior and a
+# source-conditioned posterior share one decoder, invoked twice with nothing else, so the per-step
+# KL between them is the source-conditioned coupling readout. Several settings below are correctness
+# requirements rather than preferences; those are marked.
+#
+# WHAT IS DIFFERENT ABOUT THIS CELL, in one paragraph, because every number below follows from it.
+# The stored coefficients are produced by a strictly one-sided gammatone bank, so a coefficient at
+# step t is a function of {x(s) : s <= t} and of nothing else -- which is what makes a forecast of
+# step t + 1 + tau a genuine forecast rather than a partial reconstruction of the target's own
+# future. Causality is bought with a WARM-UP: a one-sided filter's output depends on assumed
+# pre-recording history until its own leading delay has passed, and because the transform runs per
+# 22-minute segment that cost is paid once per segment. On the slowest surviving scattering channel
+# it consumes 278 of the 300 steps the model sees. Two things follow that have no analogue in the
+# two-sided cells: the forecast cannot begin at the model's own 30-step warm-up, and a channel
+# budget is a feasibility requirement rather than a tuning knob.
+#
+# Written out in full rather than inheriting the two-sided feature sibling's, and then pinned
+# leaf-for-leaf against it outside a declared allow-list (tests/test_config_load.py). Inheritance
+# would be the smaller file and the worse record: a `base:` chain hides which settings this run
+# shares with the model it is compared against, and the whole value of the comparison is that
+# everything outside the input representation is identical. Drift in `seed`, `lr`, `free_bits`, the
+# coverage floor or the spike breaker would be attributed to the transform.
+#
+# Prerequisites:
+#   * HDF5 datasets built by the CAUSAL variant of the pipeline, which writes `transform: 'causal'`,
+#     per-block `causal_warmup_steps` and `causal_delay_s`, and 36/66/36/15 channels. A two-sided
+#     shard is refused by name before any run directory exists.
+#   * The stats file at `stat_path` regenerated from those same shards by
+#     `hdf5_dataset/calculate_dataset_stats.py` at a matching `trim_minutes`. It accumulates its
+#     constants EXCLUDING the warm-up region, which is what makes zero the channel mean over the
+#     region the model actually reads -- and therefore what makes the source-null control a floor
+#     rather than a leak.
+#
+# NATS FROM THIS CONFIGURATION ARE COMPARABLE TO NO SIBLING. The reconstruction is summed over
+# H * C_keep = 15 * 98 = 1470 coefficients against `lag_attn_fs`'s 30 * 78 = 2340, and the horizon
+# differs on top of that, so neither the block nor the forecast question is the same.
+# `sweep_horizon_30.yaml` is the arm that restores comparability of the horizon; nothing restores
+# comparability of the block, because C_keep is what the budget decides.
+#
+# Run from the repo root:
+#   python -m teb_vae.lag_attn_cfs.trainer --config teb_vae/lag_attn_cfs/configs/default.yaml
+
+general_config:
+  tag: lag_attn_cfs_baseline
+
+  seed: 42
+  cuda_devices: [0, 1, 2, 3, 4, 5, 6]
+  # Adam's per-parameter normalisation makes the step size invariant to the loss-scale change from
+  # summing over 1470 coefficients instead of 2340, so the sibling's stability-tuned value transfers
+  # unchanged; the clip threshold below does NOT and is re-derived.
+  lr: 0.0003
+  # Singular; the experiment driver reads this exact key. Decay is x0.1 per milestone.
+  #
+  # Inherited from the comparison model, and for its reason: z is the only route to the decoder, so
+  # the source pathway starts at exactly zero KL and can only earn coupling once beta is on -- which
+  # is epoch 50. These milestones give 400 epochs at full LR with beta at its endpoint.
+  lr_milestone: [400, 800]
+  # Epoch cadence of the loss-curve HTML and the diagnostic figure, both rendered by rank 0
+  # inside the fit; at 1 a multi-day run pays two PDF renders plus an HTML rewrite every epoch.
+  plot_frequency: 5
+  epochs: 5000
+  accumulate_grad_batches: 1
+  # Held at the comparison model's 128 deliberately: the anchor tiling already cuts the five
+  # anchor-axis tensors by roughly 14x at the shipped stride, and spending that saving on a larger
+  # batch would confound the comparison with a different gradient-noise scale.
+  batch_size:
+    train: 128
+    test: 128
+
+  folders_config:
+    # IDENTITY, not a preference: a shared output tree makes the two models' runs
+    # indistinguishable by the only field anything indexes on.
+    out_dir_base: /data/deid/isilon/MS_model/new_vae_teb_cross_attention/lag_attn_cfs
+
+model_config:
+  VAE_model:
+    # --- KL / beta schedule ----------------------------------------------------
+    # NLL summed over the forecast block and KL summed over d_z are both nats per anchor, so
+    # beta = 1 would make reconstruction-plus-KL the exact ELBO of the source-conditioned branch.
+    # The warm-up starts at exactly 0: z is the ONLY route to the decoder, and a nonzero beta
+    # before the decoder can use the latent at all is the standard route to posterior collapse.
+    #
+    # 1.0 / 0.1, carried across from the two-sided feature sibling UNMEASURED at this scale, and the
+    # comment must not hide what that means. That pair was selected by a four-arm sweep over a block
+    # of 2340 coefficients at ~240 decoded anchors per step; this block is 1470 coefficients at
+    # ~10.1 decoded anchors per step, so the reconstruction side of the ratio the sweep was stated
+    # in is 0.63x on the block axis and the per-step anchor count is roughly a twenty-fourth. The
+    # sweep came out MONOTONE in beta with its lower edge winning every column, which is why the
+    # lower edge is what transfers rather than a scale-matched rescaling -- the one prediction that
+    # sweep refuted was exactly the scale-matching argument.
+    #
+    # Resolved by the headline run's `kld_active_frac` and `logvar_prior_floor_frac`, and a four-arm
+    # sweep mirroring the sibling's is the follow-up if either says the latent collapsed or the
+    # prior pinned. Until then a divergence from the sibling's curves is attributable to the target
+    # domain OR to this pair, and RESULTS.md says so.
+    beta_schedule:
+      kind: linear_warmup
+      start: 0.0
+      end: 1.0
+      warmup_epochs: 50
+    # nats per latent dim per step; 0.0 disables the floor. Deliberately zero: a positive floor
+    # is a laundering subsidy the raw sibling measured (KL filled whether or not it is source-driven),
+    # and with the zero-KL start plus the beta warm-up, collapse is guarded structurally.
+    free_bits: 0.0
+    # Weight of the prior scale anchor sum_d 0.5*(exp(lv_p) - 1 - lv_p), the term that keeps the
+    # conditional prior's log-variance off its clamp floor: nothing else in the objective penalises
+    # a NARROW prior, and the first production run of this family pinned 99.2% of prior coordinates
+    # on the -5 floor within one epoch. Constant, not a schedule -- the collapse completes between
+    # epoch 0 and epoch 1, so any warm-up would arrive after the damage.
+    #
+    # Moves with beta rather than independently: what is held fixed across this file and every sweep
+    # arm is the RATIO beta_prior/beta = 0.1, so the anchor keeps the same standing against the KL it
+    # is measured beside.
+    beta_prior: 0.1
+
+    # --- Reconstruction likelihood --------------------------------------------
+    # 'gaussian_nll' consumes the decoder's learned log-variance heads, keeping every parameter
+    # in DDP's expectation set (find_unused_parameters=False). 'mse' starves them; it exists for
+    # debugging, not for headline runs.
+    likelihood: gaussian_nll
+
+    # Reconstruction weighting: base and full at unit weight, per the objective's definition.
+    lambda_full: 1.0
+    lambda_base: 1.0
+
+    # --- Auxiliary shape terms (OFF, and lambda_boundary is REFUSED at any other value) --------
+    # The three shape penalties in the shared objective -- multiscale L1, derivative Huber and
+    # boundary continuity -- are RAW-WAVEFORM concepts, and this block's last axis is 98 surviving
+    # target channels: an unordered index with no metric, so a difference between adjacent entries
+    # is a difference between two unrelated coefficients. That is the two-sided sibling's reason and
+    # it is unchanged here.
+    #
+    # `lambda_boundary` carries a SECOND reason that is specific to this cell, and it is a refusal
+    # rather than a preference: the boundary term is a slicing identity over ADJACENT anchors,
+    # joining anchor t's first forecast sample to anchor t-1's last. This family always decodes a
+    # tiled anchor set whose entries are S apart, so at any non-zero weight the term would join two
+    # windows a whole horizon apart and score the gap between them as an error. The shared objective
+    # raises on that combination and the driver's pre-flight refuses it before a run directory
+    # exists.
+    lambda_ms: 0.0
+    lambda_deriv: 0.0
+    lambda_boundary: 0.0
+
+    # --- Backbone widths -------------------------------------------------------
+    d_model: 128
+    # The latent must carry the whole FHR predictive state, and it is the decoder's ONLY input --
+    # there is no state bypass here -- so it is the model's narrowest point. 64 = 4 groups of 16,
+    # divisible by num_heads as the head-structured posterior requires. Held at the comparison
+    # model's value, which is what keeps the two comparable.
+    d_z: 64
+    # H = 15 decimated steps = 1 min forecast, HALF the two-sided cells' horizon, and the reason is
+    # geometric rather than clinical. Anchors live in [F, T - H), so a shorter horizon LENGTHENS
+    # T_valid and buys back anchors -- at H = 30 and this floor there are 137 anchors against 152,
+    # and at the budget that keeps all 102 channels there would be none at all. The horizon is
+    # therefore one of the two levers on the warm-up cost, not an independent preference.
+    # `sweep_horizon_30.yaml` is the arm that restores comparability of the horizon with the four
+    # shipped cells.
+    horizon: 15
+    # A GEOMETRY INPUT, and not the decoder width. TrimmedRawGeometry validates the raw index
+    # identities against it and the diagnostic page draws its first row on the raw grid, so the key
+    # stays; what each horizon token emits is the surviving TARGET CHANNEL count, taken from the
+    # resolved warm-up budget rather than from any config key.
+    raw_per_step: 16
+    # The ANCHOR FLOOR, and it is one decision with `causal_warmup_budget_steps` below rather than
+    # two settings. A forecast at anchor t, horizon step tau, reads target time t + 1 + tau, and
+    # channel c is honest there only from W'_c onwards; requiring every kept channel to be valid
+    # across every anchor's whole window collapses to F >= B - 1, with B the slowest SURVIVOR's
+    # wait. B = 134 here, so 133 is the smallest floor the pairing admits and is what ships. The
+    # constructor refuses a lower one by name; without that refusal the objective would score the
+    # assumed pre-recording history of the slowest kept channel as signal, with every shape correct
+    # and every warm-fraction readout still reporting 1.0.
+    #
+    # 133 steps is 532 s, i.e. 8.87 minutes. It is a CAUSAL-VALIDITY boundary, not a clinical
+    # policy: nothing physiological distinguishes it from step 150, and the model's own 30-step
+    # warm-up has long passed at either. `sweep_floor_150.yaml` ships the ten-minute policy arm, at
+    # a cost of two tiles and 17 covered target steps for the identical 98 channels.
+    warmup_period: 133
+    sequence_length: 300
+    c_y: 102               # 36 (fhr_st) + 66 (fhr_ph); the two-sided widths are 43 and 66
+    c_u: 51                # 36 (up_st) + 15 (up_ph); must be 15 when use_up_st=false
+    use_up_st: true
+    lstm_layers: 2
+    dropout: 0.1
+    # Dropout for the SOURCE pathway alone -- its adapter/front end, its encoder, and the attended
+    # source summary inside the posterior fusion. null = exactly the previous model, which is NOT
+    # one number: the adapter and encoder always ran at `dropout` above and keep doing so, while the
+    # dropout on the attended source summary is a site this key INTRODUCED and null leaves off.
+    source_dropout: null
+    # Hidden width of the shared horizon decoder core. 256, doubled with the latent above: the
+    # decoder is the only thing standing between one latent vector and the whole forecast block.
+    decoder_hidden: 256
+    # Watched through logvar_full_floor_frac and logvar_full_ceil_frac, which are per-COEFFICIENT
+    # here because block_width is C_keep and not the raw grid's R.
+    logvar_clamp: [-5.0, 3.0]
+    # Latent stabilisers: saturation magnitudes of the tanh-bounded latent heads.
+    mu_scale: 5.0
+    delta_mu_scale: 3.0
+    delta_logvar_scale: 2.0
+
+    # --- Anchor coverage floor -------------------------------------------------
+    # Minimum valid fraction of an anchor's forecast window for the anchor to enter the loss at all:
+    # a half-masked anchor's summed NLL covers half a window and its base-minus-full gap reads
+    # spuriously small. Revisit against the logged anchor_coverage_frac distribution.
+    coverage_floor: 0.9
+
+    # --- How the base branch gets its latent ------------------------------------
+    # 'sample' decodes z^p = mu^p + sigma^p * eps (the shared eps); 'mean' decodes at mu^p.
+    #
+    # 'mean' is shipped because D_0 is the only term in the objective whose gradient DIRECTLY
+    # prefers a narrow prior: it decodes a *sample*, sampling noise can only degrade a forecast, so
+    # its gradient on the prior log-variance points down without limit and nothing opposes it from
+    # below. Under 'mean' the prior's scale is left to the two terms that want it WIDE: KL(q||p),
+    # which pulls the prior out to cover the posterior, and the scale anchor.
+    #
+    # The cost, accepted deliberately: base and full are no longer bitwise identical at init, since
+    # the full branch still carries the posterior's noise; and the TRAINING-path pred_gap is no
+    # longer a common-random-numbers contrast, so it is biased down by an amount that has nothing to
+    # do with the source. Do not compare a training-path pred_gap across this key.
+    base_decode: mean
+
+    # --- How the posterior's log-variance is built -------------------------------
+    # 'residual' adds a bounded delta to the PRIOR's pre-bound raw log-variance; 'independent' gives
+    # the posterior its own head. 'independent' is the second of the two paths that collapse the
+    # prior's scale and the one that survives base_decode: mean -- under 'residual' the full
+    # branch's pressure to sharpen sigma_q lands on the PRIOR's own tensor.
+    #
+    # The cost: q == p at init is no longer structural. It is recovered exactly under
+    # head_init_calibration (shipped true), which pins the prior's raw log-variance to the same
+    # constant the independent head is seeded at, so the KL is still exactly 0 at step 0 -- which is
+    # what the whole coupling readout rests on.
+    posterior_logvar_mode: independent
+
+    # --- Causal history states (REQUIRED for the KL to mean anything) -----------
+    # Swaps every encoder GroupNorm for CausalGroupNorm. Without it the encoder statistics pool
+    # across time, the "prior" conditions on the future, and the source-conditioned KL is not a
+    # coupling readout at all. Note this is about the NETWORK's history states and is independent of
+    # the one-sidedness of the stored coefficients: the transform can be causal and the encoder not.
+    causal_norm: true
+
+    # --- Causal input reach budget: REQUIRED null on this dataset ---------------
+    # The two-sided guard, and it is not merely unnecessary here but undefined. `causal_reach_budget_s`
+    # prunes channels by the FORWARD reach L95 of a filter -- an energy quantile of a two-sided
+    # kernel -- and it is measured on the production kymatio Morlet bank, which did not produce
+    # these coefficients. Fed a causal config it would read the same reaches it reads on a two-sided
+    # run and resolve delays that describe another dataset; and a delay is a SHIFT, so every gated
+    # channel would additionally be read late on top of its warm-up.
+    #
+    # Set alongside `causal_warmup_budget_steps` the warm-up resolver refuses both by name, so this
+    # null is load-bearing rather than decorative. It is present rather than absent so the parity
+    # comparison against the two-sided sibling stays leaf-for-leaf.
+    causal_reach_budget_s: null
+
+    # --- Causal WARM-UP budget: the guard this dataset actually needs -----------
+    # Threshold on W'_c, the leading delay enclosing 95% of a one-sided kernel's energy, rebased
+    # into the trimmed window the loader serves. A channel survives when W'_c <= this value. The
+    # threshold names no constructor argument: the driver resolves it against the CONFIGURED SHARDS
+    # into the four concrete channel tuples the network takes, and those tuples are what land in
+    # every checkpoint's model_kwargs -- so a run's channel set is recoverable from its checkpoint
+    # alone, with no shard present.
+    #
+    # Read from the shards rather than declared in YAML for a reason that is easy to miss: a dataset
+    # rebuilt at another `causal_warmup_quantile` changes both the warm-up vectors AND the stored
+    # channel count (0.90 keeps 37 scattering channels, 0.95 keeps 36, 0.99 keeps 35), so a config
+    # literal would silently describe a boundary the data no longer has. Every configured shard is
+    # validated, not only the first.
+    #
+    # 134 keeps 98 of 102 target channels. It is where `fhr_ph` tops out, so ALL 66 phase channels
+    # survive it, and the `fhr_st` staircase has a channel at exactly 134 with the next at 162 --
+    # the boundary lands on the ~0.008 Hz frequency edge both phase selections already use, rather
+    # than on an arbitrary cut. The four dropped channels wait 162, 194, 233 and 278 steps.
+    #
+    # The SOURCE is never gated by it: its slowest channels carry the contraction envelope, and
+    # dropping them to make every reachable lag warm would cost almost the whole `up_ph` block
+    # against a lag search that exists to find the 20-120 s contraction-to-deceleration delay. All
+    # 51 source channels are kept, the availability mechanism announces per step when each arrives,
+    # and the residual is MEASURED -- `source_lag_warmth_frac_st` and `_ph`.
+    causal_warmup_budget_steps: 134
+
+    # --- Anchor tiling ---------------------------------------------------------
+    # S, the spacing between decoded anchors, in [1, H]. At S = H consecutive forecast windows
+    # PARTITION the timeline instead of overlapping (H-1)/H, so no target coefficient is scored
+    # twice in one step and the gradients of one batch element stop being correlated across H
+    # anchors. Over epochs every anchor in [F, T_valid) is still used, because the per-segment phase
+    # rotates with the epoch.
+    #
+    # 15 = `horizon`, and the two must move together: a horizon change that left the stride behind
+    # would either overlap the windows again (S < H) or leave target steps that no phase ever covers
+    # (S > H, which the constructor refuses). tests/test_config_load.py asserts the equality here and
+    # in every arm rather than leaving it to be noticed.
+    #
+    # Validation and test decode every valid anchor -- stride 1, phase 0 -- rather than one tile
+    # grid: a single phase is deterministic but PHASE-BIASED, sampling the same 11 of 152 anchors at
+    # a fixed offset from the segment start forever. There is no gradient there, so neither the
+    # redundancy argument nor the memory argument applies. `sweep_anchor_stride_1.yaml` is the arm
+    # that trains densely too.
+    anchor_stride: 15
+    # F_u, the earliest source step lag attention may read: the lag mask generalises from
+    # 1[t - l >= 0] to 1[t - l >= F_u]. Ships at 0, where it is BITWISE the two-sided sibling's mask,
+    # and exists so the source compromise above is measurable rather than argued about. No arm moves
+    # it; `source_lag_warmth_frac_ph` falling below the fraction of lags that are warm at all is the
+    # measurement that would justify a non-zero value.
+    lag_floor: 0
+
+    # --- Attention -------------------------------------------------------------
+    max_lag: 90            # L = 91 (~6 minutes of UP history at 4 s/step)
+    num_heads: 4
+    d_head: 32
+    use_entmax: true       # exact zeros in the lag distribution, not merely small weights
+    attention_grad_checkpoint: false
+    # 'alibi_decay' seeds a learnable per-head short-lag prior on the attention scores.
+    lag_bias_init: alibi_decay
+    # Whether the attention query reads the prior log-variance alongside its mean. false = query
+    # from mu^p alone. Both inputs are target-only, so source purity holds either way.
+    query_uses_logvar: false
+
+    # --- Shared horizon decoder core -------------------------------------------
+    # Four dilated refine blocks, so the dilations are (1, 2, 4, 8) and the receptive field over the
+    # horizon axis is 31 tokens -- more than twice this cell's 15 horizon tokens.
+    #
+    # Depth 3 was considered and rejected. Its receptive field is 15, which fails the sibling's own
+    # recorded criterion of RF >= H + 1 by exactly one at this horizon; and the argument is moot in
+    # both directions anyway, because `horizon_attention_blocks: 2` mixes every horizon token
+    # unmasked after the refine stack. What settles it is PARITY: keeping the sibling's depth removes
+    # a confound from both the encoder and the target comparisons, and the only thing depth 3 buys is
+    # 328,960 parameters. `sweep_horizon_depth_3.yaml` ships the arm.
+    #
+    # Nothing in the shipped code ties this depth to the horizon, so the resolved receptive field is
+    # written to the startup log beside H, S, A_max and the block width.
+    horizon_depth: 4
+    horizon_kernel: 3
+    horizon_film: true
+    # Bidirectional self-attention over the H horizon tokens, run inside the shared decoder core
+    # after the dilated refine stack. 0 builds no module.
+    horizon_attention_blocks: 2
+
+    # --- Initialisation policies (zero-parameter; the init-off arm varies all three) -------
+    # Applied after the generic init; each is a no-op at the constructor default.
+    #
+    # Break the near-degeneracy of the horizon tokens at init, so per-block FiLM has token-specific
+    # structure to modulate. 0.8, and it is here by MEASUREMENT rather than by inheritance: the
+    # quantity the value is chosen against is the post-initialisation CORRELATION between two horizon
+    # tokens, which is a function of the embedding's scale against the broadcast projected latent's
+    # and does NOT depend on how many tokens there are. Measured on this model at both horizons:
+    # mean off-diagonal correlation 0.999247 at std 0.02, 0.763746 at 0.4, 0.445915 at 0.8 and
+    # 0.163197 at 1.6 for H = 15, against 0.999242 / 0.763937 / 0.447476 / 0.168075 for H = 30. The
+    # halved token count moved the third decimal place, so the sibling's value is the re-derived one.
+    horizon_embed_std: 0.8
+    # Calibrate BOTH distribution heads onto their trivial starting points at init: the shared
+    # decoder output heads onto mu=0/sigma=1, and the prior head's log-variance onto exactly 0. The
+    # second half is what keeps the init KL at exactly zero under posterior_logvar_mode: independent,
+    # and the whole coupling readout rests on that.
+    head_init_calibration: true
+    # LayerNorm gain on the attended source summary in the posterior fusion: sqrt(d_model/d_head)
+    # = sqrt(128/32) = 2, so the 32-wide source summary is not out-columned by the 128-wide state.
+    a_head_gain: 2.0
+
+    # Append dilated conv blocks to both encoders for a longer receptive field.
+    encoder_extra_dilations: [8, 16]
+    # Kernel width of every appended block. 15 is the widest conv in the stack and dominates the
+    # encoder parameter count.
+    encoder_extra_kernel: 15
+    # Group count for every encoder conv pre-norm. null = each block's min(8, d_model). The null is
+    # dropped by _build_model_kwargs' None-filter and never reaches the constructor.
+    conv_norm_groups: null
+
+  core_model_checkpoint: null
+
+
+dataset_config:
+  # REPOINT THESE at the built CAUSAL shards. The paths are deliberately non-existent rather than
+  # pointing at two-sided data, so a run fails on a missing file instead of on a `transform`
+  # refusal someone might "fix" by dropping the budget.
+  #
+  # A two-sided shard here is refused by name before any run directory exists, and that refusal is
+  # the load-bearing one: the two variants share every field name and every dtype, and only the
+  # root `transform` attribute and the channel counts tell them apart. A run against two-sided data
+  # with this config's c_y would fail the width check -- but a rebuilt two-sided dataset at 102
+  # channels would not, and it would train to completion on coefficients containing their own
+  # future while every number below reported a causal model.
+  vae_train_datasets:
+    - /data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_causal/pre_training_dataset/train_dataset_cs.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_causal/pre_training_dataset/train_dataset_no_cs.hdf5
+  vae_test_datasets:
+    - /data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_causal/pre_training_dataset/test_dataset_cs.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_causal/pre_training_dataset/test_dataset_no_cs.hdf5
+
+  # Note the key is `stat_path` while the loader parameter is `stats_path`. A typo'd `stats_path:`
+  # here yields None and silently disables normalization, so the entry point guards it explicitly.
+  # It must be generated from the SAME causal shards: the statistics exclude the warm-up region, and
+  # a two-sided stats file would both mis-normalise the target and destroy the source-null control's
+  # premise that zero is the channel mean over the region the model reads.
+  stat_path: /data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_causal/stats.hdf5
+
+  dataloader_config:
+    # 8 per rank: the prod box has 128 cores against 7 ranks (56 persistent workers), so the
+    # extra workers still leave headroom; revisit against the profiler's dataloader-next timing.
+    num_workers: 8
+    prefetch_factor: 4
+    # 'fhr_st' and 'fhr_ph' here are REQUIRED: they are this model's target, and it must arrive
+    # z-scored or the Gaussian NLL is meaningless with the loader raising nothing on its own. The
+    # entry point guards both, field by field, from LagAttnCfsTrainer.TARGET_FIELDS.
+    normalize_fields: ['fhr', 'up', 'fhr_st', 'fhr_ph', 'up_st', 'up_ph']
+    dataset_kwargs:
+      pin_memory: false
+      # The model consumes the four feature blocks and weight; fhr and up feed the diagnostic plots.
+      #
+      # 'guid' AND 'epoch' are LOAD-BEARING here rather than incidental, which is the one difference
+      # from the two-sided cells' list. The anchor tiling's per-segment phase is a stable hash of the
+      # recording identifier, the segment's own start time (`epoch` is domain_start in seconds), the
+      # training epoch and the seed -- and `load_fields` is honoured literally with no forced
+      # additions. Drop either and every segment is decoded at one tile grid forever, with A_max a
+      # geometry constant either way so no shape, no count and no metric differs. The driver's
+      # pre-flight refuses a config omitting them.
+      #
+      # The cross-channel FHRxUP phase-harmonic block is absent twice over: it would destroy the
+      # target-only / source-conditioned separation, and the causal variant does not store it.
+      load_fields:
+        [
+          'fhr',
+          'up',
+          'fhr_st',
+          'fhr_ph',
+          'up_ph',
+          'up_st',
+          'weight',
+          'guid',
+          'epoch',
+        ]
+      allowed_guids: null
+      cs_label: null
+      bg_label: null
+      epoch_min: -48000
+      epoch_max: null
+      label: null
+      # 0: the FIFO cache stores fully processed samples, and under the DistributedSampler's
+      # per-epoch reshuffle a worker almost never re-sees a cached index.
+      cache_size: 0
+      # Must match the stats file's trim_minutes or normalization is wrong; a mismatch only warns.
+      #
+      # It does one MORE thing here than in the two-sided cells: the stored warm-up vectors are
+      # rebased by exactly this trim, so it decides where every channel's validity boundary lands.
+      # A uniformly wrong rebase moves the anchor floor and the boundary TOGETHER, so every
+      # warm-fraction readout still reports 1.0 -- which is why the resolver cross-checks this value
+      # against `sequence_length` and refuses a mismatch naming both config paths.
+      trim_minutes: 1.0
+
+
+# Advanced configs ========================================================
+
+advanced_config:
+  trainer:
+    precision: "32-true"
+    # MEASURED at this loss scale, and it MOVED: 6000 against the two-sided sibling's 5000.
+    #
+    # The run: 600 optimizer steps at this file's model geometry over the committed causal fixture
+    # (teb_vae/lag_attn/tests/fixtures/tiny_shard_causal.hdf5, 4 windows, one CUDA device,
+    # likelihood: gaussian_nll, beta ramping to 1.0, AdamW at this file's lr), with the clip itself
+    # set far above anything reachable so nothing was rescaling the steps the norms were drawn from.
+    # Recorded pre-clip gradient norms with the whole shard in one batch -- the closest reachable
+    # analogue of a large-batch step: min 769, q50 3808, q90 4863, q95 5179, q99 5742, max 6663.
+    #
+    # 6000 is the smallest round value above q99, which is the family's own rule. It sits just below
+    # the observed maximum, so on a healthy run of this objective the clip essentially does not bind
+    # -- correct for a blow-up guard.
+    #
+    # Why it moved when the two-sided cell's did not: this cell decodes ~10.1 anchors per step
+    # against ~240, so the same summed block is averaged over a twenty-fourth of the anchors and the
+    # per-step gradient is correspondingly noisier. The block itself is SMALLER (1470 against 2340),
+    # which pushes the other way, and the anchor count wins.
+    #
+    # What the sample is and is not: 4 in-sample windows over 600 steps is a thinner tail than a
+    # production run's, and the same measurement at batch 1 -- four distinct batches, so the
+    # batch-to-batch component is present at its largest -- reads q99 19,915 and max 50,581. That
+    # regime is 32x smaller than the shipped batch of 128 and is recorded rather than used. Re-derive
+    # from the headline run's own `train/grad_norm` column, which samples one optimizer step per
+    # epoch.
+    gradient_clip_val: 6000.0
+    gradient_clip_algorithm: "norm"
+    sync_batchnorm: false     # there is no BatchNorm anywhere in this model
+    deterministic: false
+    benchmark: true
+    # REQUIRED false, permanently: the nn.LSTM encoders, the checkpointed attention region and
+    # the data-dependent boolean mask indexing behind kld_active_frac each break TorchInductor
+    # independently.
+    compile: false
+    # Cadence of the per-STEP logger flush: each flush is a synchronous MLflow log_batch HTTP call
+    # from rank 0 carrying every on_step metric. Matches the gradient-norm hook's sampling stride.
+    log_every_n_steps: 25
+    # REQUIRED 0: MetricsLoggingCallback has no sanity guard, so a sanity pass would shift every
+    # epoch number against MLflow and the checkpoint filenames.
+    num_sanity_val_steps: 0
+    # Keep true: the data module builds plain loaders on purpose and relies on Lightning to
+    # inject the DistributedSampler and call set_epoch each epoch.
+    use_distributed_sampler: true
+    profiler: simple
+
+  logging:
+    console_level: INFO
+    file_level: INFO
+    json_log: true
+    console_diagnose: false
+    rotation: "100 MB"
+    retention: "14 days"
+
+  # Loss-spike circuit breaker: NON-FINITE GUARD plus a sign-agnostic ADDITIVE spike test.
+  # The RELATIVE test stays off.
+  #
+  # The relative test is `watched > multiplier * max(EMA, ema_floor)`, which assumes a loss bounded
+  # below by zero. main_loss here is a learned-variance Gaussian NLL summed over 1470 coefficients
+  # and averaged over ~10 anchors, so it goes negative early -- the instrumented run below reached
+  # -690 within 600 steps. Once the EMA is negative the relative test degenerates to "skip every
+  # positive batch". So ema_floor sits far above any reachable loss, which switches the relative
+  # test off, and additive_margin carries the finite-blow-up detection: skip when
+  # watched > EMA + margin, against the RAW EMA, so it works in the negative-loss regime.
+  #
+  # The margin is in nats of the summed block and does not transfer across block sizes OR across
+  # anchor counts, and this cell changes both.
+  spike_breaker:
+    enabled: true
+    multiplier: 5.0
+    ema_decay: 0.02        # EMA smoothing (smaller = longer memory); reported, not acted on
+    warmup_batches: 100    # priming window before gating activates
+    comparison_metric: main_loss
+    # >> any reachable loss: relative detection off. CONFIRMED at this block size rather than
+    # inherited. The per-coefficient Gaussian NLL is bounded below by 0.5*(log 2pi + logvar_clamp_lo)
+    # ~ -1.58 at the shipped floor of -5, so the two reconstruction terms cannot reach beyond
+    # ~2 * 1470 * 1.58 ~ 4.6e+3 in magnitude, and the KL and the prior anchor are both nonnegative.
+    # The instrumented run's observed main_loss stayed inside [-690, +4994]. Five orders of magnitude
+    # of headroom, so the two-sided sibling's value is the re-derived one.
+    #
+    # The exponent sign is not decoration -- YAML parses `1.0e9` as a string, which validate_config
+    # rejects as not a float.
+    ema_floor: 1.0e+9
+    # Sign-agnostic finite-spike detection: skip when watched > EMA + margin (nats). 0 disables.
+    #
+    # MEASURED, and it MOVED: 3.0e+3 against the two-sided sibling's 5.0e+3. The statistic is the
+    # breaker's own -- `main_loss - EMA` at this file's `ema_decay`, which is exactly what the test
+    # compares -- rather than the epoch-to-epoch movement, because at ~10 decoded anchors per step
+    # the two are no longer close. Over the same 600-step instrumented run: with the whole shard in
+    # one batch the excursion above the EMA reached q99 -20, max 89; at batch 1, where the
+    # batch-to-batch component is present at its largest, q50 52, q90 576, q99 834, max 1089 after
+    # the breaker's own 100-batch priming window and 1613 including it.
+    #
+    # 3.0e+3 is ~1.9x the worst excursion measured in the noisiest regime the fixture can produce,
+    # and 0.63x the sibling's value -- which is the block ratio 1470/2340, arrived at from the
+    # measurement rather than from the ratio. It stays well inside the ~4.6e+3 magnitude the
+    # objective can reach, so the additive test can still fire rather than being decoration, which
+    # is the check the sibling's larger margin would fail at this block size.
+    additive_margin: 3.0e+3
+    # Escape hatch: after this many CONSECUTIVE skips, force-accept the next finite-loss batch
+    # and hard-re-seed the EMA to it. 0 disables the hatch.
+    max_consecutive_skips: 25
+
+  tracking:
+    mlflow:
+      enabled: true
+      tracking_uri: "http://localhost:5000"
+      # IDENTITY, all three of these and the variant tag below: inheriting any of them mixes this
+      # model's runs into the comparison model's experiment, which is unrecoverable afterwards
+      # because the two are then indistinguishable by every field anything indexes on.
+      experiment_name: seqvae-teb-lag-attn-cfs
+      run_name: lag_attn_cfs_baseline
+      artifact_location: null
+      # Logs and registers the final eager model at fit end, via the run-logging callback the
+      # trainer builder attaches automatically.
+      log_model: true
+      # Lightning's own per-checkpoint weight artifacts. Off: the ModelCheckpoint directory is
+      # the single copy.
+      log_checkpoints: false
+      log_config_artifact: true
+      tags:
+        project: teb_vae
+        stage: dev
+        variant: lag_attn_cfs
+
+  callbacks:
+    early_stopping:
+      enabled: false
+      monitor: "val/total_loss"
+      patience: 300
+      min_delta: 0.0001
+
+    model_checkpoint:
+      monitor: "val/total_loss"
+      save_top_k: 3
+      mode: "min"
+
+    # The per-epoch validation diagnostic figure. The trainer imports the plotter only when this is
+    # on, so it costs nothing when off.
+    #
+    # THE BLOCK NAME IS THE RAW-SIGNAL MODEL'S ON PURPOSE. The callback assembly is inherited whole,
+    # and it reads this literal; renaming the block to match this package would leave the figure
+    # permanently off, with `enabled: true` still reading correct to anyone looking at the config
+    # and nothing in the log saying why.
+    #
+    # There is deliberately NO plot_frequency here: the cadence is `general_config.plot_frequency`,
+    # the same key that drives loss_plot_epoch.html, so the curves and the figure that explains them
+    # always exist for the same epochs.
+    lag_attn_rws_plotting:
+      enabled: true
+      num_examples: 2
+      file_format: "pdf"

@@ -25,8 +25,16 @@ They divide the work:
   nowhere, so it holds whatever shape that function's signature takes, and it is the one that
   would catch a per-element denominator built from the wrong width: that mistake changes no loss,
   fails no shape check, and rescales the four log-variance diagnostics alone.
+
+The second of those is **shared**. :func:`reassembled_metrics` and
+:func:`assert_objective_reassembles` are free functions the feature-domain packages import and
+drive with their own model, their own target and their own block width, because the objective
+they are asking about is the same one. The dependency runs one way only: nothing here imports a
+package downstream of this one, so each of the four models is pinned by the suite that owns it.
 """
 from __future__ import annotations
+
+from typing import Iterable
 
 import pytest
 import torch
@@ -45,7 +53,12 @@ from teb_vae.lag_attn_rws.nets.losses import (
 from teb_vae.lag_attn_rws.nets.model import SeqVaeLagAttnRws
 from teb_vae.lag_attn_rws.nets.raw_masks import forecast_mask, kl_mask
 from teb_vae.lag_attn_rws.nets.raw_targets import build_future_index, build_future_target
-from teb_vae.lag_attn_rws.tests.conftest import STUB_GAP_STEP, make_stub_batch
+from teb_vae.lag_attn_rws.tests.conftest import (
+    STUB_GAP_STEP,
+    TINY_KWARGS,
+    make_stub_batch,
+    tiny_gated_kwargs,
+)
 
 #: Coefficients the equivalence harness runs at. Mutually distinct and none of them a default:
 #: at equal weights a term swapped for another passes, at ``beta_prior=0`` the fourth term is
@@ -372,6 +385,219 @@ def test_the_latent_diagnostics_are_present_and_finite(tiny_kwargs):
 
 
 # =============================================================================
+# The reassembly harness, shared with the feature-domain packages
+#
+# Two free functions rather than a test, because the same question has to be asked of four models
+# that live in four packages: this one owns the arithmetic and each package's own
+# ``test_objective.py`` supplies its model, its target and its block width. The dependency runs
+# one way -- this module imports nothing downstream of itself.
+# =============================================================================
+def reassembled_metrics(
+    model,
+    forward_outputs,
+    target: torch.Tensor,
+    weight: torch.Tensor,
+    *,
+    likelihood: str,
+    coefficients: dict,
+    block_width: int,
+) -> dict:
+    r"""Rebuild every metric the shared objective reports, from the objective's own primitives.
+
+    Calls :func:`~teb_vae.lag_attn_rws.nets.losses.compute_loss` nowhere. The masks come from
+    ``forecast_mask`` and ``kl_mask``, each term from the primitive that defines it, and the
+    weighted sum and the six per-element diagnostics are written out by hand -- exactly what the
+    objective itself writes out by hand.
+
+    A second copy of arithmetic is normally the thing to avoid; here it is the point, and it is
+    what makes this harness survive a change to the objective's *signature*. The per-element
+    denominator is the sharpest case: no shape check and no loss value depends on it, so a
+    denominator built from the wrong width rescales four reported numbers by a constant and
+    nothing else notices.
+
+    Args:
+        model: The net, read for its geometry, coverage floor and log-variance clamp.
+        forward_outputs: Its forward dict.
+        target: The forecast block $(B, T_{\mathrm{valid}}, H, X)$, built by the caller from
+            whatever its target domain is.
+        weight: Decimated validity signal $(B, T)$.
+        likelihood: ``'mse'`` or ``'gaussian_nll'``.
+        coefficients: The objective weights the model was scored at, keyed as its kwargs. Absent
+            keys default to $0.0$, which is what the shipped feature-domain callers do with the
+            three shape weights.
+        block_width: $X$ -- what the target's last axis counts. Written out by the caller rather
+            than read off the model, because this is the one quantity a self-consistent objective
+            cannot be checked against itself on.
+
+    Returns:
+        The expected metric dictionary, in the objective's own key set.
+    """
+    geometry, (lo, hi) = model.geometry, model.logvar_clamp
+    dtype = target.dtype
+
+    def _weight_of(name: str) -> float:
+        return float(coefficients.get(name, 0.0))
+
+    mask, coverage_frac = forecast_mask(
+        weight, geometry, coverage_floor=model.coverage_floor
+    )
+    kl_support = kl_mask(mask, geometry)
+
+    expected: dict = {}
+    expected["nll_full_block"], expected["nll_full_sample"] = masked_raw_likelihood(
+        forward_outputs["mu_full"],
+        target,
+        mask,
+        likelihood=likelihood,
+        logvar=forward_outputs["logvar_full"],
+    )
+    expected["nll_base_block"], expected["nll_base_sample"] = masked_raw_likelihood(
+        forward_outputs["mu_base"],
+        target,
+        mask,
+        likelihood=likelihood,
+        logvar=forward_outputs["logvar_base"],
+    )
+    expected.update(
+        masked_source_kl(
+            kld_tensor(
+                mu_prior=forward_outputs["mu_prior"],
+                logvar_prior=forward_outputs["logvar_prior"],
+                mu_post=forward_outputs["mu_post"],
+                logvar_post=forward_outputs["logvar_post"],
+            ),
+            kl_support,
+            free_bits=_weight_of("free_bits"),
+        )
+    )
+    expected["prior_rate"] = masked_prior_rate(forward_outputs["logvar_prior"], kl_support)
+
+    # The shape terms, each over both branches in the objective's own order, and each an exact
+    # zero when its weight is zero -- the objective does not compute an unweighted term at all,
+    # so its metric is a real zero rather than the value it would have taken.
+    zero = torch.zeros((), device=target.device, dtype=dtype)
+    for name, weight_key, term in (
+        ("aux_multiscale", "lambda_ms", masked_multiscale_l1),
+        ("aux_derivative", "lambda_deriv", masked_derivative_huber),
+    ):
+        expected[name] = (
+            term(forward_outputs["mu_full"], target, mask)
+            + term(forward_outputs["mu_base"], target, mask)
+            if _weight_of(weight_key) != 0.0
+            else zero.clone()
+        )
+    expected["aux_boundary"] = (
+        masked_boundary_gap(forward_outputs["mu_full"], target, mask, weight)
+        + masked_boundary_gap(forward_outputs["mu_base"], target, mask, weight)
+        if _weight_of("lambda_boundary") != 0.0
+        else zero.clone()
+    )
+
+    expected["total_loss"] = (
+        _weight_of("lambda_full") * expected["nll_full_block"]
+        + _weight_of("lambda_base") * expected["nll_base_block"]
+        + _weight_of("beta") * expected["source_conditioned_kl_train"]
+        + _weight_of("beta_prior") * expected["prior_rate"]
+        + _weight_of("lambda_ms") * expected["aux_multiscale"]
+        + _weight_of("lambda_deriv") * expected["aux_derivative"]
+        + _weight_of("lambda_boundary") * expected["aux_boundary"]
+    )
+    expected["pred_gap"] = expected["nll_base_block"] - expected["nll_full_block"]
+    expected["kld_beta"] = torch.tensor(_weight_of("beta"), dtype=dtype)
+    expected["beta_prior"] = torch.tensor(_weight_of("beta_prior"), dtype=dtype)
+    for name in ("lambda_ms", "lambda_deriv", "lambda_boundary"):
+        expected[name] = torch.tensor(_weight_of(name), dtype=dtype)
+    expected["anchor_coverage_frac"] = coverage_frac[:, geometry.warmup :].mean()
+
+    # The per-element reductions, over the mask broadcast across the block's last axis. The width
+    # is the caller's constant: this denominator is the whole reason the harness exists.
+    elem_mask = mask[..., None]
+    elem_denom = (elem_mask.sum() * float(block_width)).clamp_min(1.0)
+    margin = LOGVAR_FLOOR_MARGIN_FRAC * (hi - lo)
+    for branch in ("full", "base"):
+        expected[f"mean_logvar_{branch}"] = (
+            forward_outputs[f"logvar_{branch}"] * elem_mask
+        ).sum() / elem_denom
+    logvar_full = forward_outputs["logvar_full"]
+    expected["logvar_full_floor_frac"] = (
+        (logvar_full <= lo + margin).to(dtype) * elem_mask
+    ).sum() / elem_denom
+    expected["logvar_full_ceil_frac"] = (
+        (logvar_full >= hi - margin).to(dtype) * elem_mask
+    ).sum() / elem_denom
+
+    support = kl_support > 0
+    assert bool(support.any()), "the batch must leave some anchor inside the KL support"
+    logvar_prior_masked = forward_outputs["logvar_prior"][support]
+    expected["logvar_prior_floor_frac"] = (
+        (logvar_prior_masked <= lo + margin).to(dtype).mean()
+    )
+    expected["mean_logvar_prior"] = logvar_prior_masked.mean()
+    expected["mean_logvar_post"] = forward_outputs["logvar_post"][support].mean()
+    expected["delta_mu_rms"] = (
+        (forward_outputs["mu_post"] - forward_outputs["mu_prior"])[support]
+        .pow(2)
+        .mean()
+        .sqrt()
+    )
+    return expected
+
+
+def assert_objective_reassembles(
+    model,
+    forward_outputs,
+    target: torch.Tensor,
+    weight: torch.Tensor,
+    produced: dict,
+    *,
+    likelihood: str,
+    coefficients: dict,
+    block_width: int,
+    package_owned: Iterable[str] = (),
+) -> None:
+    r"""Assert a model's reported metrics are exactly :func:`reassembled_metrics`.
+
+    Key-set equality first, in both directions: a metric that appeared without being reassembled
+    would otherwise slip through the value comparison entirely. A package that adds readouts of
+    its own -- the feature-domain models' four resolved forecast gaps -- declares them in
+    ``package_owned``, so an unannounced *fifth* addition still fails here.
+
+    ``torch.equal``, not ``allclose``: the question is whether the number moved, and a tolerance
+    is exactly what would hide a term computed over a slightly different anchor set.
+
+    Args:
+        model: The net.
+        forward_outputs: Its forward dict.
+        target: The forecast block, built by the caller.
+        weight: Decimated validity signal $(B, T)$.
+        produced: The ``metrics`` dict the model returned.
+        likelihood: ``'mse'`` or ``'gaussian_nll'``.
+        coefficients: The objective weights the model was scored at.
+        block_width: $X$, written out by the caller.
+        package_owned: Metric names this package adds on top of the shared objective's.
+    """
+    expected = reassembled_metrics(
+        model,
+        forward_outputs,
+        target,
+        weight,
+        likelihood=likelihood,
+        coefficients=coefficients,
+        block_width=block_width,
+    )
+    owned = set(package_owned)
+    assert set(produced) - owned == set(expected), (
+        "the reassembly must cover every reported metric: "
+        f"missing={set(produced) - owned - set(expected)} "
+        f"extra={set(expected) - set(produced)}"
+    )
+    assert owned <= set(produced), f"declared but absent: {sorted(owned - set(produced))}"
+
+    differing = [key for key, value in expected.items() if not torch.equal(value, produced[key])]
+    assert not differing, differing
+
+
+# =============================================================================
 # The equivalence harness
 # =============================================================================
 @pytest.mark.parametrize("likelihood", ["gaussian_nll", "mse"])
@@ -407,128 +633,50 @@ def test_the_method_and_the_free_function_agree_on_every_metric(
 
 
 @pytest.mark.parametrize("likelihood", ["gaussian_nll", "mse"])
-def test_every_metric_reassembles_from_the_primitives(
-    tiny_kwargs, perturb_posterior, likelihood
-):
+@pytest.mark.parametrize("guard", ["ungated", "gated"], ids=["ungated", "gated"])
+def test_every_metric_reassembles_from_the_primitives(perturb_posterior, likelihood, guard):
     """The assembly, pinned independently: which target, which masks, which denominators.
 
-    This one calls the assembled objective nowhere. It builds the target and both masks from
-    ``build_future_target``, ``forecast_mask`` and ``kl_mask``, reduces them with the same
-    unchanged primitives the objective reduces them with, and writes out by hand only what the
-    objective itself writes out by hand -- the weighted sum and the six per-element diagnostics.
+    Driven through :func:`assert_objective_reassembles`, which calls the assembled objective
+    nowhere -- so it holds whatever shape that function's signature takes, and it is what a
+    later generalisation of ``nets/losses.py`` has to leave standing.
 
-    A second copy of arithmetic is normally the thing to avoid; here it is the point. The
-    diagnostics' per-element denominator is the one quantity in this function that no shape check
-    and no loss value depends on, so a denominator built from the wrong width rescales four
-    reported numbers by a constant and nothing else in the suite notices.
+    Both guard states, because they are different code paths into the same objective: a gated
+    model reads its streams through a channel gate and an input adapter carrying availability
+    terms, an ungated one through neither, and only the gated arm can catch a change that moves
+    the masked prefix.
     """
-    model = _model(tiny_kwargs)
+    kwargs = TINY_KWARGS if guard == "ungated" else tiny_gated_kwargs()
+    model = _model(dict(kwargs))
     batch = make_stub_batch()
     outs, result = _loss(
         model, batch, perturb=perturb_posterior, likelihood=likelihood, **_HARNESS_COEFFICIENTS
     )
-    metrics = result["metrics"]
-    geometry, (lo, hi) = model.geometry, model.logvar_clamp
-    dtype = batch.fhr.dtype
-
+    geometry = model.geometry
     target = build_future_target(
         batch.fhr, geometry, future_index=build_future_index(geometry)
     )
-    mask, coverage_frac = forecast_mask(
-        batch.weight, geometry, coverage_floor=model.coverage_floor
-    )
-    kl_support = kl_mask(mask, geometry)
 
-    expected = {}
-    expected["nll_full_block"], expected["nll_full_sample"] = masked_raw_likelihood(
-        outs["mu_full"], target, mask, likelihood=likelihood, logvar=outs["logvar_full"]
+    assert_objective_reassembles(
+        model,
+        outs,
+        target,
+        batch.weight,
+        result["metrics"],
+        likelihood=likelihood,
+        coefficients=_HARNESS_COEFFICIENTS,
+        # The raw grid's R, written out here rather than taken from the objective: this
+        # denominator is the whole reason the harness exists.
+        block_width=geometry.r,
     )
-    expected["nll_base_block"], expected["nll_base_sample"] = masked_raw_likelihood(
-        outs["mu_base"], target, mask, likelihood=likelihood, logvar=outs["logvar_base"]
-    )
-    kl_terms = masked_source_kl(
-        kld_tensor(
-            mu_prior=outs["mu_prior"],
-            logvar_prior=outs["logvar_prior"],
-            mu_post=outs["mu_post"],
-            logvar_post=outs["logvar_post"],
-        ),
-        kl_support,
-        free_bits=_HARNESS_COEFFICIENTS["free_bits"],
-    )
-    expected.update(kl_terms)
-    expected["prior_rate"] = masked_prior_rate(outs["logvar_prior"], kl_support)
-
-    # The shape terms, each summed over both branches in the objective's own order. The three
-    # primitives are called with the same masks assembled above, so what this pins is the
-    # *assembly*: which mask, which branches, and the fact that the weight tensor -- not a mask
-    # slice -- decides the boundary sample's validity.
-    for name, term in (
-        ("aux_multiscale", masked_multiscale_l1),
-        ("aux_derivative", masked_derivative_huber),
-    ):
-        expected[name] = term(outs["mu_full"], target, mask) + term(
-            outs["mu_base"], target, mask
-        )
-    expected["aux_boundary"] = masked_boundary_gap(
-        outs["mu_full"], target, mask, batch.weight
-    ) + masked_boundary_gap(outs["mu_base"], target, mask, batch.weight)
-
-    expected["total_loss"] = (
-        _HARNESS_COEFFICIENTS["lambda_full"] * expected["nll_full_block"]
-        + _HARNESS_COEFFICIENTS["lambda_base"] * expected["nll_base_block"]
-        + _HARNESS_COEFFICIENTS["beta"] * expected["source_conditioned_kl_train"]
-        + _HARNESS_COEFFICIENTS["beta_prior"] * expected["prior_rate"]
-        + _HARNESS_COEFFICIENTS["lambda_ms"] * expected["aux_multiscale"]
-        + _HARNESS_COEFFICIENTS["lambda_deriv"] * expected["aux_derivative"]
-        + _HARNESS_COEFFICIENTS["lambda_boundary"] * expected["aux_boundary"]
-    )
-    expected["pred_gap"] = expected["nll_base_block"] - expected["nll_full_block"]
-    expected["kld_beta"] = torch.tensor(_HARNESS_COEFFICIENTS["beta"], dtype=dtype)
-    expected["beta_prior"] = torch.tensor(_HARNESS_COEFFICIENTS["beta_prior"], dtype=dtype)
-    for name in ("lambda_ms", "lambda_deriv", "lambda_boundary"):
-        expected[name] = torch.tensor(_HARNESS_COEFFICIENTS[name], dtype=dtype)
-    expected["anchor_coverage_frac"] = coverage_frac[:, geometry.warmup :].mean()
-
-    # The per-element reductions, over the mask broadcast across the R raw samples of each
-    # horizon token. `geometry.r` written out here rather than taken from the objective: this
-    # denominator is the whole reason this test exists.
-    elem_mask = mask[..., None]
-    elem_denom = (elem_mask.sum() * float(geometry.r)).clamp_min(1.0)
-    margin = LOGVAR_FLOOR_MARGIN_FRAC * (hi - lo)
-    for branch in ("full", "base"):
-        expected[f"mean_logvar_{branch}"] = (
-            outs[f"logvar_{branch}"] * elem_mask
-        ).sum() / elem_denom
-    expected["logvar_full_floor_frac"] = (
-        (outs["logvar_full"] <= lo + margin).to(dtype) * elem_mask
-    ).sum() / elem_denom
-    expected["logvar_full_ceil_frac"] = (
-        (outs["logvar_full"] >= hi - margin).to(dtype) * elem_mask
-    ).sum() / elem_denom
-
-    support = kl_support > 0
-    assert bool(support.any()), "the stub batch must leave some anchor inside the KL support"
-    logvar_prior_masked = outs["logvar_prior"][support]
-    expected["logvar_prior_floor_frac"] = (
-        (logvar_prior_masked <= lo + margin).to(dtype).mean()
-    )
-    expected["mean_logvar_prior"] = logvar_prior_masked.mean()
-    expected["mean_logvar_post"] = outs["logvar_post"][support].mean()
-    expected["delta_mu_rms"] = (
-        (outs["mu_post"] - outs["mu_prior"])[support].pow(2).mean().sqrt()
-    )
-
-    assert set(expected) == set(metrics), (
-        "the reassembly must cover every reported metric: "
-        f"missing={set(metrics) - set(expected)} extra={set(expected) - set(metrics)}"
-    )
-    differing = [key for key, value in expected.items() if not torch.equal(value, metrics[key])]
-    assert not differing, differing
 
     # The denominator claim, stated as the ratio it is, so the assertion above cannot be read as
     # having compared two copies of the same mistake.
-    assert float(elem_denom) == pytest.approx(float(elem_mask.sum()) * geometry.r)
+    metrics = result["metrics"]
     assert float(metrics["nll_full_sample"]) == pytest.approx(
         float(metrics["nll_full_block"]) / (geometry.horizon * geometry.r), rel=1e-6
     )
+    # Not vacuous: the perturbation is what puts the KL and the posterior displacement on
+    # non-zero values, so the reassembly compared them at something.
+    assert float(metrics["source_conditioned_kl_raw"]) > 0.0
+    assert float(metrics["delta_mu_rms"]) > 0.0

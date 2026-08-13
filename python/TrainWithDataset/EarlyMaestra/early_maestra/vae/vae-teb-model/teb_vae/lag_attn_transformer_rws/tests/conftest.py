@@ -67,6 +67,7 @@ from teb_vae.lag_attn_rws.tests.conftest import (  # noqa: E402,F401
     subgroup_labels,
     suite_oracle_budget,
     suite_page_budget,
+    tiny_gated_kwargs,
     write_multi_class_shards,
 )
 

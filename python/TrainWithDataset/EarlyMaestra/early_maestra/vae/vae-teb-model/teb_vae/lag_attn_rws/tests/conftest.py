@@ -119,6 +119,38 @@ SHIPPED_KWARGS = dict(
 #: tiny trained-anchor range [warmup, T - H) = [2, 12), so the gap is visible to every mask.
 STUB_GAP_STEP = 10
 
+#: A hand-made channel guard for the tiny geometry. The shipped reach budget cannot be resolved
+#: here -- its maximum delay is $30$ steps against a warm-up of $2$, which the resolver refuses --
+#: so every suite in the family exercises its guarded path at this one instead. The delays are
+#: non-zero and distinct on purpose: a path that applied them where it should not would be wrong
+#: by a different number of steps in each channel, which is a failure a uniform guard hides.
+#:
+#: Defined here rather than in each package because all four models take the same four keywords
+#: and a second copy of a guard is a second guard.
+TINY_KEEP_INDEX = (0, 5, 9)
+TINY_DELAYS = (0, 1, 2)
+TINY_SOURCE_KEEP_INDEX = (2, 7)
+TINY_SOURCE_DELAYS = (0, 2)
+
+
+def tiny_gated_kwargs(kwargs: dict | None = None) -> Dict[str, Any]:
+    """Add the tiny channel guard to a tiny constructor keyword set.
+
+    Args:
+        kwargs: The keyword set to guard. Defaults to :data:`TINY_KWARGS`; the conv-Transformer
+            suites pass their own, whose seven extra encoder keys this knows nothing about.
+
+    Returns:
+        A copy carrying the guard on both streams.
+    """
+    return dict(
+        TINY_KWARGS if kwargs is None else kwargs,
+        target_keep_index=TINY_KEEP_INDEX,
+        target_delays=TINY_DELAYS,
+        source_keep_index=TINY_SOURCE_KEEP_INDEX,
+        source_delays=TINY_SOURCE_DELAYS,
+    )
+
 
 def absolutize_dataset_paths(config: dict) -> dict:
     """Rewrite the tiny config's shard and statistics paths to absolute, in place.

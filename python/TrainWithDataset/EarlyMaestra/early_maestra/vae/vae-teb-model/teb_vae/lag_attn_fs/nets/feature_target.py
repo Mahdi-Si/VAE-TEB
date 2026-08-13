@@ -50,7 +50,7 @@ distinguishable while there is no evaluation pipeline to ask the question proper
 """
 from __future__ import annotations
 
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import torch
 
@@ -103,17 +103,24 @@ class FeatureForecastTarget:
         """
         return self.c_y if self.target_gate is None else self.target_gate.out_channels
 
-    def _build_forecast_target(self, target_features: torch.Tensor) -> torch.Tensor:
-        r"""Gather the surviving channels, then unfold each anchor's future window.
+    def _build_forecast_target(
+        self, target_features: torch.Tensor, anchors: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        r"""Gather the surviving channels, then build each anchor's future window.
 
-        $$Y^{+}[b, t, \tau, k] = Y[b,\, t + 1 + \tau,\, \mathrm{keep}[k]],$$
+        $$Y^{+}[b, a, \tau, k] = Y[b,\, t_a + 1 + \tau,\, \mathrm{keep}[k]],$$
 
-        for anchors $t \in [0, T - H)$ and horizon steps $\tau \in [0, H)$.
+        for horizon steps $\tau \in [0, H)$ and anchors $t_a$: every $t \in [0, T - H)$ in order
+        when ``anchors`` is ``None``, and the supplied indices otherwise.
 
-        The gather runs **before** the unfold. The two commute, and doing it first is what keeps
-        the copy at $(B, T, C_{\mathrm{keep}})$ instead of $(B, T_{\mathrm{valid}}, H,
-        C_{\mathrm{keep}})$ -- a factor of $H$ at production batch sizes, where the latter is a
-        third of a gigabyte.
+        The gather runs **before** the window. The two commute, and doing it first is what keeps
+        the copy at $(B, T, C_{\mathrm{keep}})$ instead of $(B, A, H, C_{\mathrm{keep}})$ -- a
+        factor of $H$ at production batch sizes, where the latter is a third of a gigabyte.
+
+        With an anchor set the window is one ``gather`` on a $(B, A, H)$ time index and there is
+        **no unfold at all**. An unfold cannot follow a selection of anchors -- it produces every
+        window, in order -- so unfolding first and gathering after would materialise exactly the
+        dense block a sparse anchor set exists to avoid.
 
         The gate's **keep-index only**. Its delay reads channel $c$ at step $t - \delta_c$, which
         is the guard that keeps each input channel's forward reach behind the anchor's causal
@@ -122,9 +129,12 @@ class FeatureForecastTarget:
 
         Args:
             target_features: The caller's target stream $(B, T, c_y)$, on the decimated grid.
+            anchors: Optional anchor index $(B, A)$, integer, in $[0, T - H)$. ``None`` builds
+                every anchor's window, which is what a model decoding all of them wants.
 
         Returns:
-            The forecast target $(B, T_{\mathrm{valid}}, H, C_{\mathrm{keep}})$.
+            The forecast target $(B, A, H, C_{\mathrm{keep}})$, with $A = T_{\mathrm{valid}}$ in
+            the dense case.
 
         Raises:
             ValueError: If the stream is not 3-D, if its length is not $T$ -- which is what a
@@ -154,13 +164,23 @@ class FeatureForecastTarget:
             if self.target_gate is None
             else torch.index_select(target_features, -1, self.target_gate.keep_index)
         )
-        # unfold appends the window as a new trailing axis, so the permute is what makes the
-        # block horizon-major and the last axis the channel axis the decoder emits.
-        return (
-            gathered[:, 1:, :]
-            .unfold(dimension=1, size=self.horizon, step=1)
-            .permute(0, 1, 3, 2)
+        if anchors is None:
+            # unfold appends the window as a new trailing axis, so the permute is what makes the
+            # block horizon-major and the last axis the channel axis the decoder emits.
+            return (
+                gathered[:, 1:, :]
+                .unfold(dimension=1, size=self.horizon, step=1)
+                .permute(0, 1, 3, 2)
+            )
+
+        batch, channels = gathered.shape[0], gathered.shape[-1]
+        steps = torch.arange(self.horizon, device=gathered.device)
+        # (B, A, H): anchor a's horizon step tau reads decimated step t_a + 1 + tau.
+        time_index = anchors.to(torch.long)[:, :, None] + 1 + steps[None, None, :]
+        window = gathered.gather(
+            1, time_index.reshape(batch, -1, 1).expand(-1, -1, channels)
         )
+        return window.reshape(batch, anchors.shape[1], self.horizon, channels)
 
     @torch.no_grad()
     def _resolved_forecast_gaps(
@@ -215,6 +235,36 @@ class FeatureForecastTarget:
         mask, _coverage = forecast_mask(
             weight, self.geometry, coverage_floor=self.coverage_floor
         )
+        return self._forecast_gaps_from_mask(
+            forward_outputs, target, mask, likelihood=likelihood
+        )
+
+    @torch.no_grad()
+    def _forecast_gaps_from_mask(
+        self,
+        forward_outputs: Dict[str, torch.Tensor],
+        target: torch.Tensor,
+        mask: torch.Tensor,
+        *,
+        likelihood: str,
+    ) -> Dict[str, torch.Tensor]:
+        r"""The four resolved gaps, given the mask the anchor axis was built at.
+
+        Split out from :meth:`_resolved_forecast_gaps` so that a subclass forecasting at a
+        *gathered* anchor set changes only which mask is built, not how the four numbers are
+        reduced. The reduction is the part that must not fork: each of these is a partial sum of
+        the ``pred_gap`` printed beside it, and a second copy of the summation is a second
+        opportunity for one of them to stop being one.
+
+        Args:
+            forward_outputs: The dict returned by ``forward``.
+            target: The gathered forecast target $(B, A, H, C_{\mathrm{keep}})$.
+            mask: The forecast mask $(B, A, H)$, on whatever anchor axis the forward decoded.
+            likelihood: ``'mse'`` or ``'gaussian_nll'``, matching the objective's.
+
+        Returns:
+            ``{'pred_gap_tau_first', 'pred_gap_tau_last', 'pred_gap_st', 'pred_gap_ph'}``.
+        """
         # The objective's own denominator: anchors that contribute nothing leave the numerator and
         # the denominator together, so these stay per-anchor rather than scaling with mask density.
         n_anchors = contributing_anchors(mask).to(target.dtype).sum().clamp_min(1.0)
@@ -322,7 +372,12 @@ class FeatureForecastTarget:
                 geometry or the declared width, or a ``weight`` that does not match the trimmed
                 grid.
         """
-        target = self._build_forecast_target(target_features)
+        # The anchor set the forward decoded at, so the target is gathered at exactly the anchors
+        # the forecasts were emitted for. Absent on a model that decodes every anchor, which is
+        # what makes this one line the whole seam rather than an override in each subclass.
+        target = self._build_forecast_target(
+            target_features, forward_outputs.get("anchor_index")
+        )
         result = compute_shared_objective(
             forward_outputs,
             target,

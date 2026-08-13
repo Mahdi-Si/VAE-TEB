@@ -19,15 +19,19 @@ import math
 import pytest
 import torch
 
+from teb_vae.lag_attn_rws.nets.geometry import TrimmedRawGeometry
 from teb_vae.lag_attn_rws.nets.losses import (
     MS_RATES,
+    compute_loss,
     masked_boundary_gap,
     masked_derivative_huber,
     masked_multiscale_l1,
     masked_prior_rate,
+    masked_raw_block_per_anchor,
     masked_raw_likelihood,
     masked_source_kl,
 )
+from teb_vae.lag_attn_rws.nets.raw_masks import forecast_mask
 
 _B, _T_VALID, _H, _R = 2, 12, 4, 16
 _BLOCK = _H * _R  # 64 raw samples per anchor at the tiny geometry
@@ -469,3 +473,220 @@ def test_the_boundary_term_carries_gradient_into_the_first_forecast_sample_only(
     assert float(mu.grad[0, 1, 0, 1:].abs().max()) == 0.0
     assert float(mu.grad[0, 1, 1].abs().max()) == 0.0
     assert float(mu.grad[0, 0].abs().max()) == 0.0  # anchor 0 has no boundary term
+
+
+# =======================================================================================
+# The assembled objective on a gathered anchor set
+#
+# ``compute_loss`` reads the anchor set off the forward dict rather than taking it as an
+# argument, which is what expresses the seam once: no model class overrides the objective to
+# thread anchors through, and none can hand the masks an anchor set its forward did not decode
+# at. The shipped models emit neither key, so for them every assertion below is the dense one.
+#
+# No model is constructed here. The objective takes a dict of tensors, and building one by hand
+# is what lets the anchored numbers be checked against the dense ones on the *same* tensors --
+# with a model in the way the two sides would differ by the forward as well.
+# =======================================================================================
+_ANCHOR_GEOMETRY = TrimmedRawGeometry(raw_len=256, decimation=16, horizon=4, warmup=2)
+
+#: A feature-style block width: neither $R$ nor the horizon, so neither can stand in for it.
+_ANCHOR_X = 5
+
+#: The gapped step every anchored case carries, inside the trained range so every mask sees it.
+_ANCHOR_GAP_STEP = 10
+
+#: Weights every term the anchored path supports is exercised at. ``lambda_boundary`` is absent
+#: on purpose: the boundary term is refused on a gathered axis, and that refusal has its own test.
+_ANCHOR_COEFFICIENTS = dict(
+    beta=0.7,
+    beta_prior=0.11,
+    lambda_full=1.0,
+    lambda_base=0.3,
+    free_bits=0.05,
+    lambda_ms=0.13,
+    lambda_deriv=0.17,
+)
+
+
+def _anchor_case(seed: int = 0, d_z: int = 6):
+    """A hand-built forward dict on the dense anchor axis, its target, and a gapped weight.
+
+    Args:
+        seed: Draw seed, so a case is reproducible.
+        d_z: Latent width of the four distribution tensors.
+
+    Returns:
+        ``(outputs, target, weight)``. The dict carries no ``anchor_index``, so a caller adds one
+        to ask the anchored question of the very same tensors.
+    """
+    generator = torch.Generator().manual_seed(seed)
+    geometry = _ANCHOR_GEOMETRY
+    shape = (_B, geometry.t_valid, geometry.horizon, _ANCHOR_X)
+
+    def _draw(*size):
+        return torch.randn(*size, generator=generator)
+
+    outputs = {
+        "mu_full": _draw(*shape),
+        "logvar_full": _draw(*shape),
+        "mu_base": _draw(*shape),
+        "logvar_base": _draw(*shape),
+        "mu_prior": _draw(_B, geometry.t, d_z),
+        "logvar_prior": _draw(_B, geometry.t, d_z),
+        "mu_post": _draw(_B, geometry.t, d_z),
+        "logvar_post": _draw(_B, geometry.t, d_z),
+    }
+    target = _draw(*shape)
+    weight = torch.ones(_B, geometry.t)
+    weight[:, _ANCHOR_GAP_STEP] = 0.0
+    return outputs, target, weight
+
+
+def _gather_anchor_axis(tensor: torch.Tensor, anchors: torch.Tensor) -> torch.Tensor:
+    """Take the named rows of a tensor's anchor axis, one row set per sample."""
+    rows = torch.arange(tensor.shape[0])[:, None]
+    return tensor[rows, anchors]
+
+
+def _at_anchors(outputs, anchors: torch.Tensor, **extra):
+    """The forward dict with its four forecast tensors gathered at ``anchors``."""
+    gathered = {
+        key: _gather_anchor_axis(outputs[key], anchors)
+        for key in ("mu_full", "logvar_full", "mu_base", "logvar_base")
+    }
+    return dict(outputs, anchor_index=anchors, **gathered, **extra)
+
+
+def _scored(outputs, target, weight, **overrides):
+    """Score one case at the anchor coefficients, with per-call overrides."""
+    return compute_loss(
+        outputs,
+        target,
+        weight=weight,
+        geometry=_ANCHOR_GEOMETRY,
+        block_width=_ANCHOR_X,
+        coverage_floor=0.0,
+        logvar_clamp=(-5.0, 3.0),
+        **dict(_ANCHOR_COEFFICIENTS, **overrides),
+    )["metrics"]
+
+
+def test_the_full_anchor_range_supplied_explicitly_is_bitwise_the_dense_objective():
+    """The inertness claim, stated where it is read: naming every anchor changes no number.
+
+    ``torch.equal`` over the whole dict, because the seam's whole promise is that a model which
+    does not use it is unaffected to the last bit.
+
+    ``anchor_coverage_frac`` is the one exception, and it is a reduction order rather than a
+    value: the dense form averages a slice past the warm-up while the gathered form weights the
+    whole axis by the same condition, so the two sum the same numbers in a different order.
+    """
+    outputs, target, weight = _anchor_case()
+    dense = _scored(outputs, target, weight)
+
+    anchors = torch.arange(_ANCHOR_GEOMETRY.t_valid).expand(_B, -1).contiguous()
+    anchored = _scored(dict(outputs, anchor_index=anchors), target, weight)
+
+    assert set(dense) == set(anchored)
+    reordered = "anchor_coverage_frac"
+    differing = [
+        key
+        for key, value in dense.items()
+        if key != reordered and not torch.equal(value, anchored[key])
+    ]
+    assert not differing, differing
+    assert torch.allclose(dense[reordered], anchored[reordered], rtol=1e-6)
+
+
+def test_a_gathered_anchor_set_scores_exactly_the_anchors_it_names():
+    """Three anchors of twelve, against the dense objective's own per-anchor decomposition.
+
+    ``masked_raw_block_per_anchor`` is the objective's own primitive, so what this pins is the
+    *selection*: the numerator is the named anchors' block scores and the denominator is how many
+    of them contribute -- not how many exist, and not how many the dense axis holds.
+    """
+    outputs, target, weight = _anchor_case()
+    anchors = torch.tensor([[2, 6, 9], [3, 6, 11]])
+
+    dense_mask, _ = forecast_mask(weight, _ANCHOR_GEOMETRY)
+    per_anchor, contributing = masked_raw_block_per_anchor(
+        outputs["mu_full"],
+        target,
+        dense_mask,
+        likelihood="gaussian_nll",
+        logvar=outputs["logvar_full"],
+    )
+    expected = _gather_anchor_axis(per_anchor, anchors).sum() / _gather_anchor_axis(
+        contributing, anchors
+    ).sum()
+
+    metrics = _scored(
+        _at_anchors(outputs, anchors), _gather_anchor_axis(target, anchors), weight
+    )
+
+    assert float(metrics["nll_full_block"]) == pytest.approx(float(expected), rel=1e-6)
+    # Not the dense answer: the selection really did restrict the average.
+    dense = _scored(outputs, target, weight)
+    assert not torch.equal(metrics["nll_full_block"], dense["nll_full_block"])
+
+
+def test_a_padded_anchor_slot_leaves_every_number_where_it_was():
+    """A short row repeats its last valid anchor; marking it invalid must be the same as not
+    having it at all.
+
+    Without that, the repeated anchor's block would be scored twice by the reconstruction while
+    the KL support -- a set -- counted it once, and the two per-anchor denominators would
+    diverge, which is a change in what $\\beta$ means and nothing that raises.
+    """
+    outputs, target, weight = _anchor_case()
+    two = torch.tensor([[2, 6], [3, 6]])
+    three = torch.tensor([[2, 6, 6], [3, 6, 6]])
+    valid = torch.tensor([[True, True, False], [True, True, False]])
+
+    def _score(anchors, anchor_valid=None):
+        extra = {} if anchor_valid is None else {"anchor_valid": anchor_valid}
+        return _scored(
+            _at_anchors(outputs, anchors, **extra),
+            _gather_anchor_axis(target, anchors),
+            weight,
+        )
+
+    short, padded = _score(two), _score(three, valid)
+
+    for key in (
+        "nll_full_block",
+        "nll_base_block",
+        "source_conditioned_kl_raw",
+        "prior_rate",
+        "anchor_coverage_frac",
+    ):
+        assert float(padded[key]) == pytest.approx(float(short[key]), rel=1e-6), key
+
+
+def test_the_boundary_term_is_refused_on_a_gathered_anchor_set_naming_both():
+    """It is a slicing identity over *adjacent* anchors -- anchor $t$'s last observed sample is a
+    slice of anchor $t-1$'s block -- and a gathered set has no neighbours. Comparing the two rows
+    anyway would be a silent comparison of unrelated samples."""
+    outputs, target, weight = _anchor_case()
+    anchors = torch.tensor([[2, 6, 9], [3, 6, 11]])
+
+    with pytest.raises(ValueError, match="lambda_boundary.*anchor_index"):
+        _scored(
+            _at_anchors(outputs, anchors),
+            _gather_anchor_axis(target, anchors),
+            weight,
+            lambda_boundary=0.19,
+        )
+
+
+def test_anchor_coverage_frac_is_reported_over_the_supplied_axis():
+    """Anchors $6 \\ldots 9$ have one gapped forecast step of four and every other window is
+    whole, so over the three named anchors the mean is $(1 + 0.75 + 0.75)/3$."""
+    outputs, target, weight = _anchor_case()
+    anchors = torch.tensor([[2, 6, 9], [2, 6, 9]])
+
+    metrics = _scored(
+        _at_anchors(outputs, anchors), _gather_anchor_axis(target, anchors), weight
+    )
+
+    assert float(metrics["anchor_coverage_frac"]) == pytest.approx(2.5 / 3.0, rel=1e-6)

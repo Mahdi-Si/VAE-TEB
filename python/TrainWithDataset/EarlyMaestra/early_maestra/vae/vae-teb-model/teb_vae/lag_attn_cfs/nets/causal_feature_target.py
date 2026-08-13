@@ -1,0 +1,488 @@
+r"""The one-sided feature target: what changes when the coefficients contain no future.
+
+:class:`CausalFeatureForecastTarget` is
+:class:`~teb_vae.lag_attn_fs.nets.feature_target.FeatureForecastTarget` with two channel-layout
+constants, one refusal, and the readouts one anchor set of its own makes possible. What it does
+**not** override is the point: the decoder's width, the gathered-never-delayed target block and the
+delegation that hands the shared objective both are inherited unchanged, and so is the anchor seam,
+which lives in the shared objective and the shared masks rather than in any subclass.
+
+**The block split moves.** The one-sided cascade drops the seven slowest scattering channels per
+block at write time -- their warm-up outruns the stored segment at every trim -- so the first stored
+block is $36$ channels wide here against the two-sided $43$. Nothing but two reported numbers depends
+on it, which is exactly why it is checked against the data rather than left declared.
+
+**The four resolved gaps must be computed at the anchors that were decoded.** The parent builds its
+own mask with no anchor set, which is correct for a model that decodes every anchor and wrong for one
+that decodes a tile. Left alone, all four splits would be averaged over the dense anchor range while
+the ``pred_gap`` they are read against is averaged over the tiles, and the recomposition that makes
+them a decomposition rather than four unrelated numbers would not hold.
+
+**The seven added readouts live here for the same reason.** ``_resolved_forecast_gaps`` is the
+family's per-package metric hook -- the parent's ``compute_loss`` merges whatever it returns -- and
+it is the only one available, because the anchor seam is in the shared objective rather than in a
+subclass. Two of the seven are geometry *guards* rather than results: ``target_warm_frac`` must
+read exactly $1.0$ and ``anchors_per_sample`` must sit at its geometry-derived value, and a row
+outside either means the geometry broke rather than that the model learned something.
+
+**What is deliberately not here.** ``_default_decoder_out_channels``, ``compute_loss`` and
+``_build_forecast_target`` are the parent's, unmodified: the anchor set reaches all three through
+``forward_outputs['anchor_index']``, so the seam is expressed once in the shared code rather than
+three times in a subclass. And nothing here mentions an encoder, an adapter or a lag mask -- the
+input-side half of causality lives on the model, which is what lets a second architecture compose
+this same mixin.
+"""
+from __future__ import annotations
+
+from typing import Dict, List, Optional, Sequence, Tuple
+
+import torch
+
+from teb_vae.lag_attn_fs.nets.feature_target import FeatureForecastTarget
+from teb_vae.lag_attn_rws.nets.losses import raw_sample_score
+from teb_vae.lag_attn_rws.nets.raw_masks import contributing_anchors, forecast_mask
+
+#: How many contiguous groups the kept target channels are partitioned into by warm-up rank. Three
+#: because the question the split asks -- do the slow channels forecast differently from the fast
+#: ones? -- needs a middle to say "monotone" rather than "different", and because the two reported
+#: block gaps already cut the same axis a second way.
+WARM_TERTILES = 3
+
+#: What counts as a warm *block* at a step: at least half its channels past their own warm-up. A
+#: fraction rather than "all" or "any" because both extremes are degenerate on the real vectors --
+#: the first stored source block has a channel at $W' = 278$ against a $300$-step window, so "all"
+#: is almost never true, and its fastest channel is warm at step $0$, so "any" is almost always
+#: true.
+WARM_BLOCK_FRACTION = 0.5
+
+
+class CausalFeatureForecastTarget(FeatureForecastTarget):
+    r"""The feature target, re-pointed at the one-sided channel layout and a tiled anchor set.
+
+    Mixed in ahead of an encoder model exactly as its parent is, and for the same reason: it names
+    no encoder, so both cells of the encoder axis compose it.
+
+    Four things the composing model's constructor must resolve and set, declared here so the
+    contract is written where the readouts that consume it are. Each is a constant of the resolved
+    budget and the geometry, which is why none of them is recomputed per batch; the two patterns are
+    tensors so that a model moved to another device carries them.
+
+    Attributes:
+        target_warm_frac: The constant :meth:`_resolve_target_warm_frac` returns.
+        warm_tertile_id: ``(C_keep,)`` long, the tertile assignment of
+            :meth:`_resolve_warm_tertiles`.
+        source_block_warm_st: ``(T,)`` bool, the **first** stored source block's per-step warmth
+            from :meth:`_resolve_block_warm_steps`.
+        source_block_warm_ph: ``(T,)`` bool, the same for the second.
+    """
+
+    target_warm_frac: float
+    warm_tertile_id: torch.Tensor
+    source_block_warm_st: torch.Tensor
+    source_block_warm_ph: torch.Tensor
+
+    #: How many of the declared $c_y$ target channels belong to the **first** stored block.
+    #:
+    #: $36$, not the two-sided $43$: seven scattering channels per block were dropped at write time
+    #: because their one-sided warm-up outruns the stored segment at every trim. Both phase blocks
+    #: keep their full width -- their $0.008$ Hz band floor excludes those filters entirely -- so
+    #: the second block is unchanged at $66$ and $c_y = 102$.
+    #:
+    #: Declared here rather than inherited, so that a change to the two-sided split cannot move
+    #: this one and vice versa. It splits two reported numbers and feeds no loss, no shape and no
+    #: parameter, which is why a wrong value would mislabel rather than fail -- and why the suite
+    #: checks it against the width of the block the target is actually assembled from.
+    TARGET_BLOCK_SPLIT: int = 36
+
+    #: How many of the declared $c_u$ **source** channels belong to the **first** of the two stored
+    #: source blocks -- the boundary ``source_lag_warmth_frac_st`` and ``_ph`` are reported either
+    #: side of.
+    #:
+    #: The split is not decoration and a pooled figure would hide the thing it exists to show. The
+    #: two blocks' rebased warm-ups are $0 \ldots 278$ and $41 \ldots 134$: the first is warm from
+    #: step $0$ in its fastest channels, so pooling the two would let it carry the fraction while
+    #: almost no channel of the second is warm at the far lags -- and the second is the block with
+    #: the problem, its whole band being built from wavelets slower than $0.05$ Hz.
+    #:
+    #: A class constant for exactly the reasons :attr:`TARGET_BLOCK_SPLIT` is one, and resolved to
+    #: $0$ on a model built without the first source block, where the second is the whole stream and
+    #: there is no first block to report.
+    SOURCE_BLOCK_SPLIT: int = 36
+
+    @staticmethod
+    def _check_anchor_floor(warmup_period: int, kept_warmup_steps: Sequence[int]) -> None:
+        r"""Refuse an anchor floor the kept channels' warm-up does not admit.
+
+        A forecast at anchor $t$, horizon step $\tau$, reads target time $t + 1 + \tau$, and
+        channel $c$ is honest there only from $W'_c$ onwards. Requiring every kept channel to be
+        valid across every anchor's whole window collapses to $t + 1 \ge W'_c$ for all $t \ge F$,
+        which holds exactly when
+
+        $$F \;\ge\; B - 1, \qquad B = \max_{c \in \mathrm{kept}} W'_c.$$
+
+        Enforced rather than assumed, because the alternative is silent: the objective's mask is
+        $(B, A, H)$ and broadcasts over channels, so a floor one step too low scores the assumed
+        pre-recording history of the slowest kept channel as though it were signal, with every
+        shape correct and every warm-fraction readout still reporting $1.0$.
+
+        The inequality is $\ge B - 1$ rather than $\ge B$ because the earliest target step an anchor
+        reads is $t + 1$, not $t$; a floor of exactly $B - 1$ is the shipped configuration and must
+        be admitted.
+
+        Args:
+            warmup_period: The anchor floor $F$ the model was built at.
+            kept_warmup_steps: $W'_c$ per surviving target channel.
+
+        Raises:
+            ValueError: If the floor is below $B - 1$, naming both numbers.
+        """
+        if not kept_warmup_steps:
+            return
+        budget = max(int(step) for step in kept_warmup_steps)
+        if int(warmup_period) < budget - 1:
+            raise ValueError(
+                f"warmup_period={int(warmup_period)} is below the anchor floor the kept target "
+                f"channels require: the slowest of them is honest only from step {budget}, and a "
+                f"forecast at anchor t reads target step t + 1 at the earliest, so the floor must "
+                f"be at least {budget - 1}. Below it the objective scores assumed pre-recording "
+                f"history as signal, on coefficients normalised with constants that excluded "
+                f"exactly that region -- with every shape correct and nothing reporting it."
+            )
+
+    @staticmethod
+    def _resolve_target_warm_frac(
+        warmup_period: int,
+        horizon: int,
+        t_valid: int,
+        kept_warmup_steps: Sequence[int],
+    ) -> float:
+        r"""The share of scored target coefficients whose channel is past its own warm-up.
+
+        Over the triples the objective can ever score -- anchors $t \in [F, T_{\mathrm{valid}})$,
+        horizon steps $\tau \in [0, H)$, kept channels $c$ -- the fraction satisfying
+        $t + 1 + \tau \ge W'_c$.
+
+        **Resolved once, from the geometry, and emitted as a constant column.** Given the
+        constructor's pairing refusal and the anchor range this is identically $1.0$, so
+        recomputing a would-be four-dimensional density every step would be a tautology evaluated
+        per batch -- and the four-dimensional mask it would need is the one section-by-section
+        rejected: every denominator of a loss term is an anchor count, so a valid-channel count
+        that varied per anchor would make nats-per-anchor shrink silently with mask density.
+
+        What the column is for is **provenance**: a value other than $1.0$ on a logged row means
+        the checkpoint was built by code that predates the pairing refusal, which is a fact worth
+        being able to read off a run months later.
+
+        Args:
+            warmup_period: The anchor floor $F$.
+            horizon: $H$, forecast steps per anchor.
+            t_valid: $T_{\mathrm{valid}} = T - H$, one past the last anchor.
+            kept_warmup_steps: $W'_c$ per surviving target channel. Empty -- the ungated model --
+                gives $1.0$, which is right: with no warm-up every coefficient is honest.
+
+        Returns:
+            The fraction, in $[0, 1]$.
+        """
+        anchors = range(int(warmup_period), int(t_valid))
+        horizon = int(horizon)
+        if not kept_warmup_steps or horizon <= 0 or len(anchors) == 0:
+            return 1.0
+        warm = 0
+        for step in kept_warmup_steps:
+            for anchor in anchors:
+                # Horizon step tau reads target step t + 1 + tau, so the cold ones are exactly
+                # tau < W'_c - t - 1, clipped into [0, H].
+                warm += horizon - min(horizon, max(0, int(step) - anchor - 1))
+        return warm / float(len(anchors) * horizon * len(kept_warmup_steps))
+
+    @staticmethod
+    def _resolve_warm_tertiles(kept_warmup_steps: Sequence[int]) -> Tuple[int, ...]:
+        r"""Assign each kept target channel to a warm-up tertile: $0$ slowest-to-fastest rank.
+
+        The partition is by **rank** of $W'_c$, not by its value, into three contiguous groups as
+        equal in size as the count allows -- so the boundaries move when the budget moves rather
+        than sitting at declared step counts that a rebuilt dataset would invalidate. Ties are
+        broken by declared channel index, which is what makes the assignment a function of the
+        resolved vector alone.
+
+        The three groups cut **across** the stored block boundary and are therefore not a
+        restatement of ``pred_gap_st`` / ``pred_gap_ph``: at the shipped budget the kept set is
+        $32$ channels of the first stored block plus all $66$ of the second, and the two span
+        nearly the same rebased range.
+
+        Args:
+            kept_warmup_steps: $W'_c$ per surviving target channel.
+
+        Returns:
+            One tertile id in $[0, 3)$ per kept channel, positional against the kept axis.
+        """
+        count = len(kept_warmup_steps)
+        if count == 0:
+            return ()
+        order = sorted(range(count), key=lambda index: (int(kept_warmup_steps[index]), index))
+        assignment = [0] * count
+        for rank, channel in enumerate(order):
+            # Floor rather than round: it puts any remainder in the last group, so the three sizes
+            # differ by at most one whatever the count.
+            assignment[channel] = min(WARM_TERTILES - 1, rank * WARM_TERTILES // count)
+        return tuple(assignment)
+
+    @staticmethod
+    def _resolve_block_warm_steps(
+        block_warmup_steps: Sequence[int], sequence_length: int
+    ) -> torch.Tensor:
+        r"""Per step, whether at least half of one source block's channels are past their warm-up.
+
+        $$\mathrm{warm}_s = \mathbb{1}\!\left[\,\left|\{c : W'_c \le s\}\right|
+        \;\ge\; f\,\left|\{c\}\right|\,\right], \qquad f = 0.5.$$
+
+        An **empty** block is warm at every step, vacuously: a constraint over no channels holds,
+        and the alternative -- reporting a block that does not exist as permanently cold -- would
+        put a zero in the CSV that reads as a measurement rather than as an absence. The only
+        configuration that produces one is a source built without its first stored block, where the
+        second is the whole stream.
+
+        Args:
+            block_warmup_steps: $W'_c$ for the block's channels.
+            sequence_length: $T$, the window the pattern is built for.
+
+        Returns:
+            A ``(T,)`` boolean tensor.
+        """
+        steps = torch.arange(int(sequence_length))
+        if not block_warmup_steps:
+            return torch.ones(int(sequence_length), dtype=torch.bool)
+        waits = torch.tensor([int(step) for step in block_warmup_steps])
+        past = (steps[:, None] >= waits[None, :]).sum(dim=-1)
+        return past.to(torch.float64) >= WARM_BLOCK_FRACTION * float(waits.numel())
+
+    @torch.no_grad()
+    def _gap_by_kept_channel(
+        self,
+        forward_outputs: Dict[str, torch.Tensor],
+        target: torch.Tensor,
+        mask: torch.Tensor,
+        *,
+        likelihood: str,
+    ) -> torch.Tensor:
+        r"""The forecast gap $D_0 - D_1$ resolved per surviving target channel, in nats per anchor.
+
+        The per-element term is the objective's own :func:`raw_sample_score` and the denominator is
+        the objective's own contributing-anchor count, so the vector this returns sums to
+        ``pred_gap`` over the same mask -- which is the property both channel-axis splits reported
+        beside it rest on.
+
+        The two branches are reduced one at a time rather than differenced elementwise, for the
+        reason the parent's version gives: one branch's score is a
+        $(B, A, H, C_{\mathrm{keep}})$ tensor, and holding two of them plus their difference would
+        triple that for a vector of $C_{\mathrm{keep}}$ numbers.
+
+        Args:
+            forward_outputs: The dict returned by ``forward``.
+            target: The gathered forecast target $(B, A, H, C_{\mathrm{keep}})$.
+            mask: The forecast mask $(B, A, H)$ the objective scored under.
+            likelihood: ``'mse'`` or ``'gaussian_nll'``.
+
+        Returns:
+            The per-channel gap $(C_{\mathrm{keep}},)$.
+        """
+        n_anchors = contributing_anchors(mask).to(target.dtype).sum().clamp_min(1.0)
+
+        def _reduced(branch: str) -> torch.Tensor:
+            score = raw_sample_score(
+                forward_outputs[f"mu_{branch}"],
+                target,
+                likelihood=likelihood,
+                logvar=forward_outputs[f"logvar_{branch}"],
+            ) * mask[..., None]
+            return score.sum(dim=(0, 1, 2))
+
+        return (_reduced("base") - _reduced("full")) / n_anchors
+
+    @torch.no_grad()
+    def _anchors_per_sample(
+        self, forward_outputs: Dict[str, torch.Tensor], target: torch.Tensor
+    ) -> torch.Tensor:
+        r"""How many anchors this step actually decoded, per batch element.
+
+        A geometry guard, not a result: at the shipped $F = 133$, $S = H = 15$ and
+        $T_{\mathrm{valid}} = 285$ it is $11$ for $\varphi \le 1$ and $10$ otherwise, mean
+        $152/15$; at the validation stride of $1$ it is exactly $152$. A value off that band means
+        the tiling is not the one the configuration states.
+
+        Counted off ``anchor_valid`` rather than off the mask, deliberately: this must report the
+        **decoded** set, so that a batch whose ``weight`` is entirely zero still says which anchors
+        the forward built rather than reporting the geometry as having collapsed.
+
+        Args:
+            forward_outputs: The dict returned by ``forward``.
+            target: The forecast target, read for its dtype and device only.
+
+        Returns:
+            A scalar tensor.
+        """
+        anchors: Optional[torch.Tensor] = forward_outputs.get("anchor_index")
+        if anchors is None:
+            # A model that decodes every anchor; the count is the dense range's own length.
+            return torch.full(
+                (), float(self.geometry.t_valid), device=target.device, dtype=target.dtype
+            )
+        valid: Optional[torch.Tensor] = forward_outputs.get("anchor_valid")
+        if valid is None:
+            return torch.full(
+                (), float(anchors.shape[1]), device=target.device, dtype=target.dtype
+            )
+        return valid.to(target.dtype).sum() / float(max(1, anchors.shape[0]))
+
+    @torch.no_grad()
+    def _source_lag_warmth(
+        self, forward_outputs: Dict[str, torch.Tensor], target: torch.Tensor
+    ) -> Dict[str, torch.Tensor]:
+        r"""The share of attention mass landing on lags where a source block is warm, per block.
+
+        $$\texttt{source\_lag\_warmth\_frac} \;=\;
+        \frac{\sum_{b,a,m,\ell} v_{b,a}\,\alpha_{b,\,t_{b,a},\,m,\,\ell}\;
+              \mathrm{warm}\!\left(t_{b,a} - \ell\right)}
+             {\sum_{b,a,m,\ell} v_{b,a}\,\alpha_{b,\,t_{b,a},\,m,\,\ell}}$$
+
+        read at the anchors the forward decoded, with $v$ their validity. Normalising by the mass
+        actually present rather than by a row count is what keeps the value in $[0, 1]$ when rows
+        have no admissible lag at all: the attention normalises such a row to zero, and zero over
+        zero would otherwise be the answer.
+
+        This is the readout that sizes the compromise the design makes on the source. Lag attention
+        searches $L$ lags back from an anchor, into a region where much of the source is still
+        inside its own warm-up, and the design keeps every source channel rather than gating them
+        -- the alternative costs almost the whole second source block, against a lag search that
+        exists to find the $20$ to $120$ s contraction-to-deceleration delay. So the residual is
+        measured instead of resolved, and a **small** value here is the expected finding rather
+        than a failure.
+
+        ``attn_weights`` is the forward's returned tensor, which is post-dropout: the attention
+        applies dropout before the flip that produces it. At the shipped ``attn_dropout: 0.0`` --
+        the same condition that makes the lag-map sum identity hold -- that is the pre-dropout
+        tensor as well.
+
+        Args:
+            forward_outputs: The dict returned by ``forward``, carrying ``attn_weights``.
+            target: The forecast target, read for its dtype only.
+
+        Returns:
+            ``{'source_lag_warmth_frac_st', 'source_lag_warmth_frac_ph'}``.
+        """
+        alpha = forward_outputs["attn_weights"]  # (B, T, num_heads, L)
+        batch, _steps, heads, lags = alpha.shape
+        device, dtype = alpha.device, target.dtype
+
+        anchors: Optional[torch.Tensor] = forward_outputs.get("anchor_index")
+        if anchors is None:
+            dense = torch.arange(
+                self.geometry.warmup, self.geometry.t_valid, device=device, dtype=torch.long
+            )
+            anchors = dense[None, :].expand(batch, -1)
+            live = torch.ones(anchors.shape, device=device, dtype=dtype)
+        else:
+            anchors = anchors.to(torch.long)
+            valid: Optional[torch.Tensor] = forward_outputs.get("anchor_valid")
+            live = (
+                torch.ones(anchors.shape, device=device, dtype=dtype)
+                if valid is None
+                else valid.to(dtype)
+            )
+
+        index = anchors[:, :, None, None].expand(-1, -1, heads, lags)
+        # (B, A, num_heads, L): the attention rows of exactly the anchors that were decoded.
+        at_anchor = alpha.gather(1, index).to(dtype) * live[:, :, None, None]
+        total = at_anchor.sum().clamp_min(torch.finfo(dtype).tiny)
+
+        # (B, A, L): lag l at anchor t reads source step t - l. Negative entries have exactly zero
+        # attention -- the lag mask forbids them -- so they are clamped for the lookup and then
+        # excluded, rather than relied upon to be harmless.
+        lag_steps = anchors[:, :, None] - torch.arange(lags, device=device)[None, None, :]
+        readable = lag_steps >= 0
+        safe = lag_steps.clamp(min=0)
+
+        warmth: Dict[str, torch.Tensor] = {}
+        for name, pattern in (
+            ("st", self.source_block_warm_st),
+            ("ph", self.source_block_warm_ph),
+        ):
+            warm = readable & pattern.to(device)[safe]  # (B, A, L)
+            warmth[f"source_lag_warmth_frac_{name}"] = (
+                at_anchor * warm[:, :, None, :].to(dtype)
+            ).sum() / total
+        return warmth
+
+    @torch.no_grad()
+    def _resolved_forecast_gaps(
+        self,
+        forward_outputs: Dict[str, torch.Tensor],
+        target: torch.Tensor,
+        weight: torch.Tensor,
+        *,
+        likelihood: str,
+    ) -> Dict[str, torch.Tensor]:
+        r"""The four inherited gaps, three warm-up tertiles, and the family's four added readouts.
+
+        **Why the four inherited ones are recomputed here at all.** The parent's version builds its
+        mask with no anchor set, which is right for a model that decodes every anchor and wrong for
+        one that decodes a tile: the four splits would then be averaged over $T_{\mathrm{valid}}$
+        anchors while the ``pred_gap`` printed beside them is averaged over the roughly ten the
+        objective saw, and reading one against the other would be reading two different
+        denominators. Only the mask changes -- the reduction is the parent's own
+        :meth:`~teb_vae.lag_attn_fs.nets.feature_target.FeatureForecastTarget._forecast_gaps_from_mask`,
+        so each of those four stays a partial sum of the gap it is read beside.
+
+        **Why the other seven are emitted from here.** This method is the family's per-package
+        metric hook: the parent's ``compute_loss`` merges whatever it returns, which is how the
+        two-sided sibling ships its four added columns, and it is the only hook available because
+        the anchor seam lives in the shared objective rather than in a subclass.
+
+        The seven are two geometry guards (``target_warm_frac``, ``anchors_per_sample``), the
+        two-block source warmth split, and the three warm-up tertiles, which recompose to
+        ``pred_gap`` over the same denominator exactly as the block split does -- cutting the
+        channel axis by filter speed rather than by stored block, which the block split cannot,
+        since both blocks span nearly the same rebased range.
+
+        Args:
+            forward_outputs: The dict returned by ``forward``, carrying ``anchor_index``,
+                ``anchor_valid`` and ``attn_weights``.
+            target: The gathered forecast target $(B, A, H, C_{\mathrm{keep}})$.
+            weight: Decimated validity signal $(B, T)$.
+            likelihood: ``'mse'`` or ``'gaussian_nll'``, matching the objective's.
+
+        Returns:
+            The parent's four gap splits, plus ``pred_gap_warm_lo`` / ``_mid`` / ``_hi``,
+            ``target_warm_frac``, ``anchors_per_sample``, ``source_lag_warmth_frac_st`` and
+            ``source_lag_warmth_frac_ph``.
+        """
+        anchors: Optional[torch.Tensor] = forward_outputs.get("anchor_index")
+        anchor_valid: Optional[torch.Tensor] = forward_outputs.get("anchor_valid")
+        mask, _coverage = forecast_mask(
+            weight,
+            self.geometry,
+            coverage_floor=self.coverage_floor,
+            anchors=anchors,
+            anchor_valid=anchor_valid,
+        )
+        metrics = self._forecast_gaps_from_mask(
+            forward_outputs, target, mask, likelihood=likelihood
+        )
+
+        gap_by_channel = self._gap_by_kept_channel(
+            forward_outputs, target, mask, likelihood=likelihood
+        )
+        tertile = self.warm_tertile_id.to(gap_by_channel.device)
+        for group, name in enumerate(("lo", "mid", "hi")):
+            metrics[f"pred_gap_warm_{name}"] = (
+                gap_by_channel * (tertile == group).to(gap_by_channel.dtype)
+            ).sum()
+
+        # Resolved at construction and echoed, not measured: see _resolve_target_warm_frac for why
+        # recomputing it per batch would be a tautology, and what the column is actually for.
+        metrics["target_warm_frac"] = torch.full(
+            (), float(self.target_warm_frac), device=target.device, dtype=target.dtype
+        )
+        metrics["anchors_per_sample"] = self._anchors_per_sample(forward_outputs, target)
+        metrics.update(self._source_lag_warmth(forward_outputs, target))
+        return metrics

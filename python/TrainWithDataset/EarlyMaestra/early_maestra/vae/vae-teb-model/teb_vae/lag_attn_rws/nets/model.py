@@ -645,6 +645,27 @@ class SeqVaeLagAttnRws(nn.Module):
             delays=delays,
         )
 
+    def build_lag_mask(
+        self, seq_len: int, device: Optional[torch.device] = None
+    ) -> torch.Tensor:
+        r"""The lag-validity mask this model attends under: $m_{t,\ell} = \mathbb 1[t - \ell \ge 0]$.
+
+        Delegated to :meth:`LagCrossAttention.build_lag_mask`, which owns the shape and the lag
+        ordering. It lives on the **model** rather than being reached for on the attention module
+        because which lags a model may legitimately read is the model's decision, not the
+        attention's: a subclass that raises the floor overrides this one method, and the forward
+        and the permutation control then run under the same mask without either being told that a
+        floor exists.
+
+        Args:
+            seq_len: Sequence length $T$.
+            device: Device to build the mask on.
+
+        Returns:
+            A boolean $(T, L)$ mask, ``True`` where the lagged source step is readable.
+        """
+        return self.lag_attn.build_lag_mask(seq_len, device=device)
+
     @property
     def source_delay_steps(self) -> int:
         r"""The causal input delay $\delta$ the source stream is read with, in decimated steps.
@@ -939,7 +960,9 @@ class SeqVaeLagAttnRws(nn.Module):
             if self.query_uses_logvar
             else mu_prior
         )
-        _, alpha, attended_heads = self.lag_attn(self.query_proj(query), h_u)
+        _, alpha, attended_heads = self.lag_attn(
+            self.query_proj(query), h_u, self.build_lag_mask(h_u.shape[1], h_u.device)
+        )
 
         mu_post, logvar_post = self.posterior_head(
             h_y, attended_heads, mu_prior, raw_logvar_prior

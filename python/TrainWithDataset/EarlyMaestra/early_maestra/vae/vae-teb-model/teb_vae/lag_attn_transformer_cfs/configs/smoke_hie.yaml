@@ -1,0 +1,77 @@
+# Development validation config: the production model over a CAUSAL HIE sample shard.
+#
+# NOT a sweep arm and not a result config -- it is the dev-box run that reads this objective's
+# pre-registered acceptance criteria before any production time is spent on it. It shares the
+# shipped model geometry with default.yaml on purpose: what is read here (the recomposition of both
+# gap splits, whether the KL opens off zero, whether the conditional prior stays off its clamp floor,
+# where the decoder's log-variance sits inside its clamp, and whether `kld_source_null` sits close to
+# `source_conditioned_kl_raw`) is a property of the objective at the real widths, the real block
+# cardinality and the real anchor count. A shrunken model would not reproduce it -- and the block is
+# the one thing that must not shrink, because H * C_keep = 1470 is what every reported nat is summed
+# over, and the decoded anchor count is what it is averaged over. Only the run's *scale* is local:
+# one device, one shard, hundreds of epochs instead of thousands.
+#
+# PREREQUISITE, AND IT DOES NOT YET EXIST. The shard paths below are placeholders in the same sense
+# default.yaml's are: there is no committed causal HIE shard, and the two-sided `output/hie_cs.hdf5`
+# cannot stand in for one -- it carries no `transform` attribute, no per-block `causal_warmup_steps`
+# and the two-sided channel counts, and the pre-flight refuses it by name. Build a causal shard from
+# the same recordings through the causal variant of the pipeline, regenerate its statistics with
+# hdf5_dataset/calculate_dataset_stats.py at trim_minutes=1.0, and repoint both keys. The statistics
+# matter here more than anywhere else: they are accumulated EXCLUDING the warm-up region, which is
+# what makes zero the channel mean over the region the model reads -- and therefore what makes the
+# source-null control a floor rather than a leak.
+#
+# The shard is the conv-LSTM causal cell's, deliberately: the encoder edge is only readable if both
+# cells are read on the same data, and the two smoke configs therefore name the same file.
+#
+# What it is NOT: a generalisation measurement. A single-shard config uses one file for BOTH splits,
+# because `dataset_kwargs` is shared between the two loaders (train/data_module.py) and so cannot
+# carry a per-split GUID filter. Every `val/` column is therefore in-sample. That is adequate for
+# what is read here -- the Tier 1 criteria are geometry guards and the rest are optimisation
+# diagnostics -- and it is why no verdict from this run is quoted as a coupling result.
+#
+#   python -m teb_vae.lag_attn_transformer_cfs.trainer \
+#       --config teb_vae/lag_attn_transformer_cfs/configs/smoke_hie.yaml
+base: default.yaml
+
+general_config:
+  tag: lag_attn_trf_cfs_hie_smoke
+  cuda_devices: [0]
+  # Counted in optimizer STEPS, not epochs: a few hundred windows at batch 32 is a handful of steps
+  # per epoch against a production run's hundreds, so an epoch here is a fraction of one there and
+  # every criterion phrased in epochs has to be restated in steps before it is read.
+  epochs: 200
+  # Scaled into this run's own step budget, which the shipped 2000 would exhaust several times over:
+  # a few hundred windows at batch 32 is on the order of ten steps an epoch, so the shipped ramp
+  # would still be climbing when the run ended and every column would be read off a model that had
+  # never trained at its own learning rate.
+  lr_warmup_steps: 200
+  # The two figure cadences (loss_plot_epoch.html and the per-epoch diagnostic page) share this key.
+  plot_frequency: 20
+  batch_size: {train: 32, test: 32}
+  folders_config: {out_dir_base: output/lag_attn_trf_cfs_hie_smoke}
+
+model_config:
+  VAE_model:
+    # ONLY the ramp length. The endpoint is inherited, deliberately: this config must track whatever
+    # weight default.yaml ships, or the dev-box reading stops being a reading of the shipped model.
+    # The ramp itself cannot be inherited -- 50 epochs is 1% of a 5,000-epoch production run and a
+    # tenth of this one, and the coupling columns would be read off a model that had barely been
+    # asked to pay for its rate.
+    beta_schedule:
+      warmup_epochs: 20
+
+dataset_config:
+  # Repo-root-relative: entry points run from the repo root. Both splits are the same shard; see
+  # the header for why, and for what that does and does not license.
+  vae_train_datasets: [output/hie_cs_causal.hdf5]
+  vae_test_datasets: [output/hie_cs_causal.hdf5]
+  stat_path: output/hie_cs_causal_stats.hdf5
+  dataloader_config:
+    num_workers: 2       # a few hundred samples; worker spawn dominates beyond this on Windows
+    prefetch_factor: 2
+
+advanced_config:
+  tracking:
+    mlflow:
+      enabled: false     # no tracking server on the dev box; the run directory is the record

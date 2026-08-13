@@ -101,6 +101,7 @@ from utils.style import style_axes  # noqa: E402
 
 __all__ = [
     "BAND_SIGMAS",
+    "DELAY_STAIRCASE_LABEL",
     "ForecastRowInputs",
     "InputStreamPanel",
     "annotate_channel_frequencies",
@@ -139,6 +140,14 @@ _HEADER_INCHES = 0.75
 #: off. It also makes a rendered PDF's cells match the array's, which is what lets one be checked
 #: against the other.
 _IMSHOW_INTERPOLATION = "none"
+
+#: What the staircase on an input row means when the guard is a **reach budget**: the channel is
+#: read $\delta_c$ steps late, so its first $\delta_c$ steps carry the guard's zero fill. A
+#: :class:`InputStreamPanel` may override it, because a one-sided input stream draws the same
+#: staircase for a different quantity -- its warm-up, before which the coefficient exists but is a
+#: function of assumed pre-recording history -- and a row that called that a delay would name the
+#: wrong thing on the only axis the row is read by.
+DELAY_STAIRCASE_LABEL = "guard: first step with data, $\\delta_c$"
 
 
 def _denormalised(
@@ -194,6 +203,10 @@ class InputStreamPanel:
             surviving channels**, for the row's dividers and its y-axis labels.
         title: The panel title, which is where the budget, the surviving counts and the delay
             range are stated.
+        delay_label: Legend label of the staircase drawn at :attr:`delays`. Defaults to
+            :data:`DELAY_STAIRCASE_LABEL`, the reach guard's reading; a builder whose staircase is
+            some other per-channel boundary supplies its own, because the label is the only thing
+            on the row that says which quantity the step function is.
     """
 
     name: str
@@ -202,6 +215,7 @@ class InputStreamPanel:
     center_hz: np.ndarray
     blocks: Tuple[Tuple[str, int, int], ...]
     title: str
+    delay_label: str = DELAY_STAIRCASE_LABEL
 
 
 def annotate_channel_frequencies(ax: Any, center_hz: np.ndarray, *, count: int = 8) -> Any:
@@ -221,7 +235,11 @@ def annotate_channel_frequencies(ax: Any, center_hz: np.ndarray, *, count: int =
         The twin axes, or ``None`` when there are no channels to label.
     """
     values = np.asarray(center_hz, dtype=float)
-    if not values.size:
+    # A vector with no finite entry is a stream this figure has no frequency table for -- a
+    # one-sided bank, whose reaches and centres the production Morlets do not describe. Labelled
+    # anyway, every tick would read "$S_0$", which names the order-0 scattering low-pass: a wrong
+    # reading of every channel rather than a missing axis.
+    if not values.size or not np.isfinite(values).any():
         return None
     sampled = np.unique(np.linspace(0, values.size - 1, num=min(count, values.size), dtype=int))
     secondary = ax.twinx()
@@ -299,7 +317,7 @@ def _input_stream_row(ax: Any, panel: InputStreamPanel, *, t_max: float, seconds
             np.asarray(panel.delays, dtype=float) * seconds_per_step,
             np.arange(n_channels), where="mid",
             color=COLOR_ORANGE, linewidth=0.9,
-            label="guard: first step with data, $\\delta_c$",
+            label=panel.delay_label,
         )
         ax.legend(loc="lower right", fontsize=6, framealpha=0.9)
 
