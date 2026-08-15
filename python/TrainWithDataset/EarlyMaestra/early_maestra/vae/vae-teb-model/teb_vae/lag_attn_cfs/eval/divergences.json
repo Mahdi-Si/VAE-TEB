@@ -1,0 +1,199 @@
+{
+  "_comment": {
+    "what_this_is": "One entry per module of teb_vae/lag_attn_rws/eval, the pipeline this package was forked from, classifying how this package's copy relates to it. It is committed DATA rather than a paragraph because the failure it guards against is an OMISSION, and nobody notices a paragraph that was never written. EVAL.md's divergence register is rendered from this file rather than hand-kept, and tests/test_eval_divergences.py enforces every rule below.",
+    "equivalent": "Must stay behaviour-equivalent to the sibling's module. A docstring may differ; an output may not. Once the file exists here, at least one named assertion must exercise it -- an 'equivalent' claim nothing checks is the weakest thing in this file.",
+    "divergent": "Deliberately differs. Carries a non-empty 'reason' saying what differs and why, which is what EVAL.md renders.",
+    "absent": "Not ported at all. The file is asserted NOT to exist in this package, so a later copy of it fails here rather than quietly reintroducing a readout this target domain cannot support.",
+    "exercised_by": "'<test file>::<test function>' entries, required on an 'equivalent' module once its file exists. Named rather than counted so that deleting the assertion fails here.",
+    "how_to_change_an_entry": "Edit it in the same commit as the code. An entry that no longer describes the module beside it is exactly what this file exists to make impossible.",
+    "not_yet_ported": "A module whose file does not exist here yet carries its TARGET classification, and every rule that can be checked without the file is checked meanwhile: an 'absent' file must stay absent, a 'divergent' entry must carry a reason, and an 'equivalent' entry must name its assertions the moment the file appears."
+  },
+  "modules": {
+    "__init__.py": {
+      "state": "divergent",
+      "reason": "States that this package is a fork of the raw pipeline, why the four-field ModelBinding did not reach a target-domain change, and the four anti-drift measures that travel with the fork. The sibling's docstring describes a pipeline that is nobody's fork."
+    },
+    "_reuse.py": {
+      "state": "equivalent",
+      "reason": "",
+      "exercised_by": [
+        "test_eval_reuse.py::test_the_bound_names_are_exactly_the_siblings",
+        "test_eval_reuse.py::test_every_bound_name_resolves_to_the_same_object_both_packages_see"
+      ]
+    },
+    "analyses/__init__.py": {
+      "state": "equivalent",
+      "reason": "",
+      "exercised_by": [
+        "test_eval_sibling_agreement.py::test_the_analysis_protocol_is_the_same_contract_in_both_packages"
+      ]
+    },
+    "binding.py": {
+      "state": "divergent",
+      "reason": "The ModelBinding dataclass is unchanged, but this copy also carries the concrete CFS_BINDING and its GEOMETRY_KEYS -- sixteen against the sibling's fourteen, adding anchor_stride and lag_floor -- so it names a model class and sits at layer 1 here against layer 0 there. The sibling keeps its instance in run.py; this cell's binding is reconciled against preflight long before either package has a runner, which is what makes a key that names nothing cheap to find."
+    },
+    "cohort.py": {
+      "state": "equivalent",
+      "reason": "",
+      "exercised_by": [
+        "test_eval_sibling_agreement.py::test_the_cohort_order_is_one_ordering_in_both_packages",
+        "test_eval_sibling_agreement.py::test_the_time_axis_bins_identically_in_both_packages"
+      ]
+    },
+    "collect.py": {
+      "state": "divergent",
+      "reason": "Keys the per-anchor table on the forward's own anchor_index rather than on a row's position in the decoded set, because this cell gathers A_max anchors out of T_valid and a position is not the decimated step it scores. Retains four (152, 15, 98) forecast tensors per sample rather than blocks of a 4 Hz trace, records target_keep_index in collection.json for the kept-axis join, records what the pass cost and at what rate, and accumulates no cross-spectral sums because coherence is not ported."
+    },
+    "config_schema.py": {
+      "state": "divergent",
+      "reason": "Adds exactly one eval_config key, the nullable clock_margin_min_nats, which the availability-clock verdict is decided against. Everything else -- the merge, the provenance walk, the forced single-process loader and the closed valid-key set -- is the sibling's."
+    },
+    "events.py": {
+      "state": "divergent",
+      "reason": "Reduced to the contraction detector and the gap machinery it needs. The deceleration detector scores a clinical heart-rate trace in beats per minute and this cell forecasts wavelet coefficients, so it and everything reachable only from it -- the block-mode horizon-step helpers and the greedy event matcher -- are removed with their reason recorded."
+    },
+    "figures_seam.py": {
+      "state": "divergent",
+      "reason": "The palette, the style refinement and every bound panel are the sibling's. What differs is the lag-axis label: this seam binds lag_axis.COEFFICIENT_LAG_AXIS_LABEL and the group-delay caveat beside it rather than lag_report.COMPENSATED_LAG_AXIS_LABEL, because the axis here is stored-coefficient time. Binding the sibling's label would put the wrong claim on every lag figure while changing no arithmetic. Added since: caveat_note, which prints the group-delay caveat under a lag-resolved figure. One decision about wording and placement rather than one per analysis, because a figure is the artifact most likely to be shown without the directory it came from."
+    },
+    "frames.py": {
+      "state": "divergent",
+      "reason": "The aggregation chain, the skill formula, the summary statistics and the positive fraction are the sibling's arithmetic unchanged, and the sibling-agreement assertions named below keep them so. What diverges is one addition this target domain needs and the raw one has no use for: recomposition_check, the guard that a channel-axis split of pred_gap -- by warm-up tertile or by frequency band -- sums back to the gap it decomposes. Its tolerance is scaled by the block score rather than by the gap, because the gap is a difference of two block scores of order 1e3 and a tolerance relative to the difference would tighten without limit as a model improved. The raw cell's target is 16 raw channels with no such split, so the function would have no caller there.",
+      "exercised_by": [
+        "test_eval_sibling_agreement.py::test_the_skill_formula_is_one_formula_in_both_packages",
+        "test_eval_sibling_agreement.py::test_the_per_recording_aggregation_chain_agrees",
+        "test_eval_sibling_agreement.py::test_the_unrooted_reduction_that_keeps_the_jensen_pair_measurable_agrees",
+        "test_eval_sibling_agreement.py::test_the_summary_statistics_and_the_positive_fraction_agree"
+      ]
+    },
+    "lag_axis.py": {
+      "state": "divergent",
+      "reason": "The compensated-seconds arithmetic and both per-lag readers are the sibling's, unchanged. Added: COEFFICIENT_LAG_AXIS_LABEL and GROUP_DELAY_CAVEAT, because the coefficients are produced by a one-sided bank whose composed group delay reaches 791 s -- the same order as the 364 s lag search -- so this axis is stored-coefficient time and a caption that did not say so would read as a physiological latency. Added since: PREFLIGHT_FILENAME and read_lag_support, so the two per-lag analyses read the measured support margin off the run's own preflight record instead of assuming the shipped geometry -- the floor, max_lag and lag_floor move independently and an arm can reintroduce truncation."
+    },
+    "launch.py": {
+      "state": "equivalent",
+      "reason": "",
+      "exercised_by": [
+        "test_eval_sibling_agreement.py::test_the_launch_merge_resolves_identically_in_both_packages"
+      ]
+    },
+    "metrics.py": {
+      "state": "divergent",
+      "reason": "The readouts move to the feature domain: a five-argument dense forward, the model's own anchored target and mask builders, feature-space trivial predictors, the source-null branch, the warm-up tertiles, and no conversion out of the loader's z units at all -- BPM_UNIT, to_bpm, sigma_to_bpm and fhr_normalization are removed rather than repointed."
+    },
+    "oracle.py": {
+      "state": "divergent",
+      "reason": "Scores its probe through the anchored feature builders and emits H*C_keep per anchor rather than a raw block through build_future_target."
+    },
+    "preflight.py": {
+      "state": "divergent",
+      "reason": "The causal guard set: transform == 'causal' on every configured shard, the causal widths, causal_reach_budget_s refused outright, fhr_st/fhr_ph normalised in place of the raw 'fhr', guid added to the required load fields, the warm-up budget re-resolved against the evaluation shards and compared with the checkpoint's stamped tuples, and the lag-support margin measured and recorded rather than assumed. NOT_CAUSAL_STATEMENT is replaced -- the sibling's sentence says the inputs read their own future, which is false here and would be a false disclosure rather than a conservative one -- and the shared half of the causality record is wider, because the warm-up budget, the anchor geometry and the lag support belong to the target domain both cfs cells share rather than to either encoder. Also carries GUARD_RECOVERY, a machine-checked table the sibling keeps by hand in EVAL.md."
+    },
+    "probe.py": {
+      "state": "divergent",
+      "reason": "Two halves where the sibling has one. The population pass -- one loader iteration into loader_probe.json, and its four refusals -- is the sibling's, unchanged in behaviour, because it is what run.py and every population sanity check read. Added beside it is a forward-contract pass behind --checkpoint: this cell's forward takes five positional arguments and raises without a phase above stride 1, returns two keys the family's does not, and produces (B, A_max, H, C_keep) forecast tensors rather than (B, T_valid, H, R), so the readout module was written against a contract that was measured rather than read. It therefore loads a checkpoint, which makes this module layer 1 here and layer 0 in the sibling, and it refuses any geometry but the dense one so a contract measured at the training tiling cannot be reported."
+    },
+    "report_seam.py": {
+      "state": "divergent",
+      "reason": "The mechanism is the sibling's, bound object for bound object. Three content differences: the headline registry drops the three coherence entries and reports the calibration gain per coefficient rather than per element of a 4 Hz trace; HEADLINE_VERDICTS carries ten rather than eight, adding coupling_exceeds_availability_clock and anchor_geometry_intact; and the sanity block drops the two cross-spectral checks, which describe an estimator this package does not have. PRED_GAP_CONVENTION states the 1470-coefficient block and that the likelihood percentage is budget-local."
+    },
+    "run.py": {
+      "state": "divergent",
+      "reason": "Registers nineteen analyses rather than seventeen, defaults to CFS_BINDING, records the dense anchor geometry and the training stride in run_context, and registers no coherence step."
+    },
+    "spectra.py": {
+      "state": "absent",
+      "reason": "Not ported at all. It estimates cross-spectra from a 4 Hz raw residual; here a tau-slice gives 152 samples at 0.25 Hz per channel over band-limited envelopes, and the analysing filter's phase was discarded before the coefficient was stored. The frequency-resolved question is answered instead by spectral_skill, on the frequency axis the channels already carry."
+    },
+    "verify.py": {
+      "state": "divergent",
+      "reason": "Gates the ten-verdict registry rather than eight, adding coupling_exceeds_availability_clock -- which ships INCONCLUSIVE because its threshold ships unset -- and anchor_geometry_intact. Its arm axes are this cell's four sweep arms (anchor_stride, warmup_period, horizon, horizon_depth) rather than the sibling's five, the horizon section carries a refusal rather than a reading rule because a block score is per anchor over H*C_keep coefficients, and it renders a cross-cell table against the transformer cfs cell where the sibling renders none. Two smaller divergences: the kept-channel column is dropped, because the warm-up budget is fixed across all four arms and the column would be constant -- the anchor count and the warm fraction are what these arms move -- and the collapse verdict is reported UNKNOWN unless both per-epoch series are present, where the sibling answers with clause 1 alone and renders the result as 'no'."
+    },
+    "analyses/attention.py": {
+      "state": "divergent",
+      "reason": "The attainable entropy ceiling is MEASURED against preflight's own lag_support_margin_steps rather than assumed: three readings of one property -- the recorded margin, the geometry record's truncated-anchor count and the accumulated ceiling against log L -- are compared and their agreement recorded. The truncation accounting is keyed on anchor_floor rather than on a warm-up prefix, because nothing below the floor is decoded at all here; the lag axis is relabelled stored-coefficient time and the group-delay caveat is printed under both figures."
+    },
+    "analyses/band_partition.py": {
+      "state": "divergent",
+      "reason": "Widths 36/66/36/15, two new per-channel columns read off the shard attributes (causal_warmup_steps and causal_delay_s), a kept column marking the four channels the budget dropped, and a second channel map on the 98-wide kept axis that spectral_skill joins through."
+    },
+    "analyses/calibration.py": {
+      "state": "divergent",
+      "reason": "PIT, coverage, CRPS and the homoscedastic-MLE gain are computed over coefficients rather than over elements of a 4 Hz trace, and the keys say so -- n_coefficients and gain_per_coefficient rather than the sibling's per-raw-sample names, which over this denominator would be silently non-comparable. The CRPS stays in z units with no conversion out of them, and the logvar_clamp recommendation is per coefficient, which is the axis the objective's own block score reduces over."
+    },
+    "analyses/coherence.py": {
+      "state": "absent",
+      "reason": "Not ported at all. A stored scattering coefficient is a modulus, so phase agreement, group delay and the residual's three-way split into irreducible, timing and amplitude terms have no analogue here at any window length. spectral_skill replaces the half that does exist and is named differently on purpose, so a reader who knows the raw pipeline cannot carry the wrong contract across."
+    },
+    "analyses/coupling.py": {
+      "state": "divergent",
+      "reason": "Arithmetic unchanged; pred_gap_mc_likelihood_pct divides by H*C_keep = 1470 and is therefore budget-local, which the emitted record states."
+    },
+    "analyses/cross_subgroup.py": {
+      "state": "divergent",
+      "reason": "METRIC_SOURCES gains the cfs-only per-recording CSVs -- the warm-up tertiles, the source-null difference and the band-resolved skill."
+    },
+    "analyses/distributions.py": {
+      "state": "divergent",
+      "reason": "Eight metrics with every conversion out of z units removed; the unit is the loader's z units, labelled normalised."
+    },
+    "analyses/events.py": {
+      "state": "divergent",
+      "reason": "One readout of three. Contraction detection and seconds_since_contraction port unchanged and contraction-conditioned coupling with them; deceleration forecast skill and the contraction-triggered response are removed, because both score a clinical heart-rate trace in beats per minute."
+    },
+    "analyses/forecast.py": {
+      "state": "divergent",
+      "reason": "The three trivial baselines are rebuilt in feature space on the decimated grid and the horizon curve runs over 15 steps. Every column in a clinical unit is removed rather than repointed -- a wavelet modulus has no clinical unit and inverting the per-channel statistics would put the 98 scored channels on scales spanning orders of magnitude, which destroys the pooled mean squared error and the skill ratio -- so the error table reports the z-unit columns alone. The forecast overlay draws three kept channels against lead time rather than one trace, because what is forecast is an H x C_keep block, and it indexes the retained anchor axis by position rather than by decimated step: this model gathers its anchors, so the floor of 133 is not a valid index into a 152-long axis."
+    },
+    "analyses/lag_kl.py": {
+      "state": "divergent",
+      "reason": "All three profiles are kept -- raw, support-corrected and untruncated -- and the analysis MEASURES the truncation rather than asserting it inert: it reads preflight's own lag_support_margin_steps, measures the per-lag contributing-anchor counts, compares the three profiles, and records whether the computed and observed readings agree. The axis is relabelled stored-coefficient time and the group-delay caveat travels on every artifact that states a lag position and under the figure."
+    },
+    "analyses/latent.py": {
+      "state": "equivalent",
+      "reason": "",
+      "exercised_by": [
+        "test_eval_sibling_agreement.py::test_the_latent_spectrum_is_laid_out_the_same_way_in_both_packages",
+        "test_eval_sibling_agreement.py::test_the_latent_diagnostics_are_the_same_thirteen_reductions_in_both_packages",
+        "test_eval_sibling_agreement.py::test_the_only_gloss_that_differs_is_the_one_naming_this_target_domains_unit"
+      ]
+    },
+    "analyses/perm_control.py": {
+      "state": "equivalent",
+      "reason": "",
+      "exercised_by": [
+        "test_eval_sibling_agreement.py::test_the_specificity_outcome_is_named_the_same_way_in_both_packages",
+        "test_eval_sibling_agreement.py::test_the_three_paired_controls_keep_the_same_sign_convention_in_both_packages",
+        "test_eval_sibling_agreement.py::test_the_branch_summary_and_the_kl_description_agree_in_both_packages"
+      ]
+    },
+    "analyses/residual.py": {
+      "state": "divergent",
+      "reason": "The forecast-difference RMS is reported in z units rather than in a clinical unit; the two latent quantities and the Jensen pair are unchanged."
+    },
+    "analyses/samples.py": {
+      "state": "divergent",
+      "reason": "Draws this cell's fifteen-row diagnostic page through the task's own page seams rather than the raw cells' nine-row one."
+    },
+    "analyses/sufficiency.py": {
+      "state": "equivalent",
+      "reason": "",
+      "exercised_by": [
+        "test_eval_sibling_agreement.py::test_the_sufficiency_scores_and_both_gaps_are_defined_identically_in_both_packages",
+        "test_eval_sibling_agreement.py::test_the_oracle_score_join_and_its_summary_rows_agree"
+      ]
+    },
+    "analyses/time_to_delivery.py": {
+      "state": "equivalent",
+      "reason": "",
+      "exercised_by": [
+        "test_eval_sibling_agreement.py::test_the_time_before_delivery_grid_and_its_readouts_are_the_same_in_both_packages",
+        "test_eval_sibling_agreement.py::test_the_three_layers_of_inference_reach_the_same_verdicts"
+      ]
+    },
+    "analyses/trajectory.py": {
+      "state": "divergent",
+      "reason": "The within-segment structural caveat changes: nothing below the anchor floor F = 133 exists at all, so the profile starts there rather than showing a warm-up droop."
+    }
+  }
+}

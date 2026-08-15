@@ -35,7 +35,12 @@ from teb_vae.lag_attn_rws.nets.model import SeqVaeLagAttnRws
 from teb_vae.lag_attn_rws.trainer import _TRACKED_METRICS, LagAttnRwsTrainer
 from train.graph_model_base import GraphModelBase
 
-from .conftest import CAUSAL_C_U, CAUSAL_C_Y, absolutize_dataset_paths
+from .conftest import (
+    CAUSAL_C_U,
+    CAUSAL_C_Y,
+    absolutize_dataset_paths,
+    hand_seeding_offenders,
+)
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 _CONFIG_DIR = Path(__file__).resolve().parents[1] / "configs"
@@ -565,18 +570,28 @@ def test_no_module_in_the_package_seeds_by_hand():
     """``general_config.seed`` through the framework's ``configure_determinism`` is the only seeding
     route; a stray global seed would silently override it while looking like diligence -- and here
     it would additionally move every tile phase, since the seed is one of the four halves of the
-    phase key."""
-    package_dir = Path(__file__).resolve().parents[1]
-    offenders = []
-    for path in package_dir.rglob("*.py"):
-        if "tests" in path.parts:
-            continue  # tests seed themselves for reproducibility, legitimately
-        source = path.read_text(encoding="utf-8")
-        # The CALL, not the name: this package's task docstring has to name the framework's own
-        # seeding route to explain where the run seed it takes comes from, and a bare substring scan
-        # would read that sentence as a hand seed.
-        for pattern in ("torch.manual_seed(", "seed_everything(", "np.random.seed("):
-            if pattern in source:
-                offenders.append(f"{path.name}: {pattern}")
+    phase key.
 
-    assert offenders == []
+    The scan itself is :func:`~teb_vae.lag_attn_cfs.tests.conftest.hand_seeding_offenders`, shared
+    with ``test_nets_are_framework_free.py`` so the two views of this package check one rule -- and
+    exempting a seed inside ``torch.random.fork_rng``, which restores the stream it found and
+    therefore cannot override anything.
+    """
+    assert hand_seeding_offenders(Path(__file__).resolve().parents[1]) == []
+
+
+def test_the_seeding_scan_still_reports_an_unforked_seed(tmp_path):
+    """Non-vacuity for the exemption above, in both directions: a bare global seed is reported and
+    the same call inside a forked RNG is not. Without this, loosening the rule to admit the
+    oracle's probe initialisation would silently admit every hand seed in the package."""
+    package = tmp_path / "pkg"
+    package.mkdir()
+    (package / "bare.py").write_text("import torch\ntorch.manual_seed(0)\n", encoding="utf-8")
+    (package / "forked.py").write_text(
+        "import torch\nwith torch.random.fork_rng():\n    torch.manual_seed(0)\n",
+        encoding="utf-8",
+    )
+
+    offenders = hand_seeding_offenders(package)
+
+    assert offenders == ["bare.py: torch.manual_seed("]

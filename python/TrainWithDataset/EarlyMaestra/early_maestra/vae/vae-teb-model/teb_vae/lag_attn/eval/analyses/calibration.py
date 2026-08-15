@@ -260,7 +260,15 @@ def _write_figures(
     figure, axes = figures.new_figure(2)
     try:
         labels = list(nominal)
-        observed = [float(frame[f"coverage_{label}"].mean()) for label in labels]
+        # ``labels`` comes from the module constant, not from the frame, so the columns are not
+        # guaranteed to exist: an empty collection has none of them. Guarded exactly as this
+        # analysis's own summary guards them, so a bar is simply absent rather than a ``KeyError``
+        # at the last step of a multi-hour run.
+        observed = [
+            float(frame[f"coverage_{label}"].mean()) if f"coverage_{label}" in frame
+            else float("nan")
+            for label in labels
+        ]
         positions = np.arange(len(labels))
         axes[0, 0].bar(
             positions - 0.2, observed, width=0.4, label="observed",

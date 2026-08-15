@@ -33,6 +33,8 @@ from teb_vae.lag_attn.tests.test_nets_are_framework_free import (
     _imported_names,
 )
 
+from .conftest import hand_seeding_offenders
+
 _PACKAGE_DIR = Path(__file__).resolve().parents[1]
 _NETS_DIR = _PACKAGE_DIR / "nets"
 
@@ -185,16 +187,11 @@ def test_the_top_level_modules_are_outside_the_net_layer():
 
 def test_no_module_in_the_package_seeds_by_hand():
     """``general_config.seed`` through the framework's ``configure_determinism`` is the only seeding
-    route; a stray global seed would silently override it while looking like diligence."""
-    offenders = []
-    for path in _PACKAGE_DIR.rglob("*.py"):
-        if "tests" in path.parts:
-            continue  # tests seed themselves for reproducibility, legitimately
-        source = path.read_text(encoding="utf-8")
-        # The CALL, not the name: this package's task takes the run seed as a keyword and has to
-        # name the framework's own seeding route to explain where it comes from, and a bare
-        # substring scan would read that sentence as a hand seed.
-        for pattern in ("torch.manual_seed(", "seed_everything(", "np.random.seed("):
-            if pattern in source:
-                offenders.append(f"{path.name}: {pattern}")
-    assert offenders == []
+    route; a stray global seed would silently override it while looking like diligence.
+
+    The scan itself is :func:`~teb_vae.lag_attn_cfs.tests.conftest.hand_seeding_offenders`, shared
+    with ``test_trainer.py`` so the two views of this package check one rule -- and exempting a
+    seed inside ``torch.random.fork_rng``, which restores the stream it found and therefore cannot
+    override anything.
+    """
+    assert hand_seeding_offenders(_PACKAGE_DIR) == []

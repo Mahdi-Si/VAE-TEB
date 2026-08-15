@@ -188,7 +188,17 @@ def _write_per_dim_figure(
         # A dimension with no finite value would make violinplot raise, and an all-zero one has
         # no width to draw; both are replaced by a single zero so the axis stays complete.
         columns = [column if column.size else np.zeros(1) for column in columns]
-        ax.violinplot(columns, positions=dims, showmedians=True, widths=0.8)
+        # An empty *collection* has no ``d###`` columns at all, so the list comprehension above
+        # produces no entries and the per-column repair never runs. ``violinplot([])`` raises
+        # ("zero-size array to reduction operation minimum"), which would take down the run at
+        # its final step -- the one thing the panels are required not to do.
+        if columns:
+            ax.violinplot(columns, positions=dims, showmedians=True, widths=0.8)
+        else:
+            ax.text(
+                0.5, 0.5, figures.EMPTY_NOTE, transform=ax.transAxes,
+                ha="center", va="center", color=figures.COLOR_GRAY,
+            )
         ax.axhline(
             threshold, color=figures.COLOR_VERMILLION, linestyle="--", linewidth=1.2,
             label=f"active threshold {threshold:g}",

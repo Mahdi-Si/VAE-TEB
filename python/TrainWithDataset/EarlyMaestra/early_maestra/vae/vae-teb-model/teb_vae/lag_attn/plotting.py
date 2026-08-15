@@ -837,12 +837,17 @@ class LagAttnPlotCallback(Callback):
         if (epoch + 1) % self.plot_frequency != 0:
             return
 
-        batch = _first_validation_batch(trainer)
-        if batch is None:
-            logger.debug("LagAttnPlotCallback: no validation batch available.")
-            return
-
+        # The fetch is inside the guard, not above it: ``_first_validation_batch`` builds a fresh
+        # iterator over the validation loader every plotted epoch, which respawns workers and
+        # reopens HDF5 handles. It absorbs only ``StopIteration``, so a killed worker or an
+        # exhausted handle raises here -- and outside the guard that would end a multi-day fit for
+        # the sake of a diagnostic figure. The sibling callback already fetches inside its try.
         try:
+            batch = _first_validation_batch(trainer)
+            if batch is None:
+                logger.debug("LagAttnPlotCallback: no validation batch available.")
+                return
+
             self._generate_plots(trainer, batch, pl_module, epoch)
         except Exception as exc:  # noqa: BLE001 — plotting must never crash training
             # A builder or save that raises mid-way leaves its figure open; on a repeatable error

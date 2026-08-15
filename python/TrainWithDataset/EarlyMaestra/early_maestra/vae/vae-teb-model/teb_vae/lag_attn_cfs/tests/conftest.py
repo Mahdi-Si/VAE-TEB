@@ -457,6 +457,80 @@ def make_task(model_kwargs: Optional[Mapping[str, Any]] = None,
     return task
 
 
+#: Global-seeding calls no shipped module may make. The **call**, not the name: the task's own
+#: docstring has to name the framework's seeding route to explain where the run seed comes from,
+#: and a bare substring scan would read that sentence as a hand seed.
+HAND_SEEDING_CALLS: Sequence[str] = (
+    "torch.manual_seed",
+    "seed_everything",
+    "np.random.seed",
+)
+
+#: The one context manager that makes a global seed harmless, because it restores the stream it
+#: found on the way out. ``eval/oracle.py`` seeds inside it and has to: the probe's parameters are
+#: initialised by ``nn.init``, which takes no generator, so there is no way to make a probe
+#: reproducible without touching the global RNG -- and no analysis that runs afterwards may see a
+#: stream it would not otherwise have seen.
+SEEDING_FORK = "torch.random.fork_rng"
+
+
+def hand_seeding_offenders(package_dir: Path) -> list:
+    """Return every shipped module that seeds a global generator outside a forked RNG.
+
+    ``general_config.seed`` through the framework's ``configure_determinism`` is the only seeding
+    route this package has; a stray global seed would silently override it while looking like
+    diligence -- and here it would additionally move every tile phase, since the seed is one of
+    the four halves of the phase key.
+
+    A call **lexically inside** a ``with torch.random.fork_rng(...)`` block is exempt, and the
+    exemption is a property rather than a name: that block restores the global state on exit, so a
+    seed inside it provably cannot move the stream anything downstream draws from. Walked as an
+    AST rather than searched as text, because a substring scan can see neither the enclosing
+    ``with`` nor the difference between a call and a docstring mentioning one.
+
+    Args:
+        package_dir: The package root. ``tests`` is skipped: a test seeding itself for
+            reproducibility is doing the right thing.
+
+    Returns:
+        One ``"<file>: <call>"`` per offending call site.
+    """
+    import ast
+
+    def _dotted(node: Any) -> str:
+        """Return the dotted name of a call target, or ``''`` for anything else."""
+        parts = []
+        while isinstance(node, ast.Attribute):
+            parts.append(node.attr)
+            node = node.value
+        if not isinstance(node, ast.Name):
+            return ""
+        parts.append(node.id)
+        return ".".join(reversed(parts))
+
+    offenders = []
+    for path in sorted(package_dir.rglob("*.py")):
+        if "tests" in path.parts:
+            continue
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        forked = {
+            id(statement)
+            for node in ast.walk(tree)
+            if isinstance(node, (ast.With, ast.AsyncWith))
+            and any(_dotted(item.context_expr.func) == SEEDING_FORK
+                    for item in node.items
+                    if isinstance(item.context_expr, ast.Call))
+            for statement in ast.walk(node)
+        }
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            name = _dotted(node.func)
+            if name in HAND_SEEDING_CALLS and id(node) not in forked:
+                offenders.append(f"{path.name}: {name}(")
+    return offenders
+
+
 def absolutize_dataset_paths(config: Dict[str, Any]) -> Dict[str, Any]:
     """Rewrite a config's shard and statistics paths to absolute, in place.
 
@@ -483,6 +557,230 @@ def pytest_configure(config: pytest.Config) -> None:
     config.addinivalue_line(
         "markers", "slow: long-running empirical validation, excluded from the default run"
     )
+
+
+# =================================================================================================
+# The generated causal cohort fixture, and the run built on it
+#
+# The committed ``tiny_shard_causal.hdf5`` is one file whose ``target`` is all zeros and whose
+# ``weight`` is all ones, so every class-, subgroup- and cohort-aware path in the evaluation
+# pipeline self-skips against it and only the fallback branches are ever exercised. These fixtures
+# generate the multi-cohort set instead -- eight subgroup shards, real class codes, the clinical
+# fields -- through ``scripts/make_tiny_shard.py``'s ``causal_cohort`` mode.
+#
+# **What may be asserted on them, and what may not.** The shards are eight real raw segments from a
+# single production shard (``hie_cs.hdf5``), re-used under distinct identities across eight cohort
+# shards, scored -- where a model is involved at all -- by a tiny model trained for a handful of
+# steps. They are therefore evidence about SCHEMA, SHAPE, FINITENESS, DENOMINATORS, COHORT
+# MEMBERSHIP, COUNTS, IDENTITIES and REFUSALS, and about nothing else. No test may assert the sign,
+# magnitude, direction or significance of any clinical or statistical effect on them: not that a
+# forecast gap is positive, not that one cohort differs from another, not that the coupling exceeds
+# the availability clock, not that a lag peak lands anywhere in particular. Every one of those is a
+# finding about a model and a population, and this fixture is neither. Where a test needs a
+# direction to be non-vacuous it must CONSTRUCT the condition rather than hope the fixture supplies
+# it.
+#
+# They are generated into ``tmp_path_factory`` and never committed: regenerating the family's
+# committed binaries to add cohort fields would perturb every number the existing suites are pinned
+# against.
+# =================================================================================================
+#: What the ``causal_cohort`` mode names its statistics file, and the on-disk length it writes.
+#: Restated here rather than imported so a fixture cannot silently follow an edit to the script's
+#: ``RUN_ARGS``; the generator is driven with both stated explicitly.
+COHORT_STATS_FILENAME = "tiny_stats_causal_cohort.hdf5"
+COHORT_SEQ_LEN = 330
+
+
+def write_cohort_shards(directory: Path) -> Sequence[str]:
+    """Generate the eight causal subgroup shards and their statistics file into ``directory``.
+
+    Driven through ``scripts/make_tiny_shard.py``'s own entry point rather than by calling its
+    writers directly, so the script stays load-bearing: a change to how a causal shard is written
+    reaches this suite without anything here being updated. ``--seq-len`` is passed explicitly
+    because the merge lets that script's ``RUN_ARGS`` supply it otherwise, and a fixture whose
+    geometry depended on a hand-edited dict would move under the tests silently.
+
+    Args:
+        directory: Destination directory.
+
+    Returns:
+        The eight shard paths, in canonical subgroup order.
+    """
+    from scripts.make_tiny_shard import COHORT_SUBGROUPS, main as make_tiny_shard_main
+
+    exit_code = make_tiny_shard_main(
+        [
+            "--variants", "causal_cohort",
+            "--out-dir", str(directory),
+            "--seq-len", str(COHORT_SEQ_LEN),
+        ]
+    )
+    assert exit_code == 0
+    return [str(Path(directory) / f"{subgroup}.hdf5") for subgroup in COHORT_SUBGROUPS]
+
+
+@pytest.fixture(scope="session")
+def cohort_shards(tmp_path_factory) -> Sequence[str]:
+    """Paths to the eight generated causal subgroup shards. Session-scoped; treat as read-only."""
+    return write_cohort_shards(tmp_path_factory.mktemp("causal_cohort"))
+
+
+@pytest.fixture(scope="session")
+def cohort_stats(cohort_shards) -> str:
+    """The statistics file the generator wrote from those same shards.
+
+    One file over the whole set, produced by the real calculator: the dataset reader silently
+    disables normalization on any stats-schema mismatch, so a hand-rolled stats file is the one
+    shortcut here with a genuinely bad failure mode -- every shape stays right and every number
+    becomes wrong. On the causal variant the calculator additionally excludes each channel's
+    warm-up region, which is what makes zero the channel mean over the region the model reads.
+    """
+    return str(Path(cohort_shards[0]).parent / COHORT_STATS_FILENAME)
+
+
+@pytest.fixture(scope="session")
+def cohort_config(cohort_shards, cohort_stats) -> Dict[str, Any]:
+    """The tiny training config with the committed evaluation delta merged over it, repointed.
+
+    Built exactly as a run is -- the resolved config first, then
+    :func:`~teb_vae.lag_attn_cfs.eval.config_schema.merge_eval_overrides`, then the repoint that
+    stands in for editing the ``REPOINT_ME`` placeholders -- so the committed overrides file is
+    load-bearing in this suite rather than merely parsed by one test.
+    """
+    from teb_vae.lag_attn.config import load_config
+    from teb_vae.lag_attn_cfs.eval.config_schema import (
+        force_single_process_loader,
+        merge_eval_overrides,
+        validate_eval_config,
+    )
+
+    tiny = Path(_REPO_ROOT) / "teb_vae" / "lag_attn_cfs" / "configs" / "tiny.yaml"
+    config = copy.deepcopy(
+        merge_eval_overrides(absolutize_dataset_paths(load_config(str(tiny))))
+    )
+    dataset = config["dataset_config"]
+    dataset["vae_test_datasets"] = list(cohort_shards)
+    dataset["stat_path"] = cohort_stats
+    # Four per batch: enough batches that a per-batch bug cannot hide in a single pass.
+    config["general_config"]["batch_size"]["test"] = 4
+    force_single_process_loader(config)
+    config["eval_config"] = validate_eval_config(config)
+    return config
+
+
+@pytest.fixture(scope="session")
+def cohort_loader(cohort_config):
+    """A real test dataloader over the generated cohort shards."""
+    from train.data_module import GraphDataModule
+
+    return GraphDataModule(cohort_config).test_dataloader()
+
+
+@pytest.fixture(scope="session")
+def cohort_run(cohort_shards, cohort_stats, tmp_path_factory) -> Path:
+    r"""One real fit against the generated cohort shards; returns the run directory.
+
+    Marked ``slow`` at every consumer rather than here -- a fixture carries no marker of its own --
+    and nothing in the fast subset may depend on it.
+
+    Driven through ``trainer.main`` rather than by assembling a checkpoint by hand, because what an
+    evaluation reads out of this directory is precisely what the driver puts there and nothing else
+    can: ``model_kwargs`` carrying the four warm-up tuples the budget resolved against these shards,
+    and ``resolved_config.yaml`` recording the configuration that produced them. A blob saved from a
+    freshly constructed model would carry the same keys and would not prove the binding.
+
+    The base is the shipped ``tiny.yaml``, with exactly three leaves moved: both shard lists and
+    the statistics path, which is the repoint; and ``out_dir_base``, because the shipped value is a
+    path inside the repository and a test must not write there.
+    """
+    import yaml
+
+    from teb_vae.lag_attn.config import load_config
+    from teb_vae.lag_attn_cfs import trainer as trainer_module
+
+    run_root = tmp_path_factory.mktemp("cohort_run")
+    tiny = Path(_REPO_ROOT) / "teb_vae" / "lag_attn_cfs" / "configs" / "tiny.yaml"
+    config = absolutize_dataset_paths(load_config(str(tiny)))
+    dataset = config["dataset_config"]
+    dataset["vae_train_datasets"] = list(cohort_shards)
+    dataset["vae_test_datasets"] = list(cohort_shards)
+    dataset["stat_path"] = cohort_stats
+    config["general_config"]["folders_config"]["out_dir_base"] = str(run_root)
+
+    config_path = run_root / "resolved.yaml"
+    config_path.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
+    trainer_module.main(str(config_path))
+
+    # The driver names its own run directory from the tag and a timestamp, so it is found rather
+    # than predicted. Exactly one, or the fit wrote somewhere this fixture does not know about.
+    checkpoint_dirs = sorted(run_root.rglob("model_checkpoints"))
+    assert len(checkpoint_dirs) == 1, checkpoint_dirs
+    return checkpoint_dirs[0].parent
+
+
+@pytest.fixture(scope="session")
+def cohort_overrides(cohort_shards, cohort_stats, tmp_path_factory) -> Path:
+    """The committed evaluation delta with its two placeholder leaves repointed.
+
+    Exactly the edit an operator makes to that file before a real run, rather than a bespoke
+    overrides file: a delta carrying only the shard paths would **replace** the committed one, and
+    with it the clinical ``load_fields`` every cohort-aware readout is asked in -- the loader skips
+    a field it was not asked for, silently.
+
+    Session-scoped and written once; treat as read-only.
+    """
+    import yaml
+
+    from teb_vae.lag_attn_cfs.eval.config_schema import load_eval_overrides
+
+    overrides = load_eval_overrides()
+    overrides["dataset_config"]["vae_test_datasets"] = list(cohort_shards)
+    overrides["dataset_config"]["stat_path"] = cohort_stats
+    path = tmp_path_factory.mktemp("eval_overrides") / "eval_overrides_repointed.yaml"
+    path.write_text(yaml.safe_dump(overrides, sort_keys=False), encoding="utf-8")
+    return path
+
+
+@pytest.fixture(scope="session")
+def collected_run(cohort_run, cohort_overrides, tmp_path_factory) -> Dict[str, Any]:
+    r"""One real collection pass over the generated cohort shards; every artifact it left behind.
+
+    Marked ``slow`` at every consumer rather than here -- a fixture carries no marker of its own --
+    and nothing in the fast subset may depend on it. Session-scoped because the pass decodes four
+    branches over every anchor of every generated segment and several suites ask about the *same*
+    run; collecting once is what keeps that cost paid once.
+
+    Two Monte Carlo draws rather than the shipped eight: these tests are about the plumbing, and
+    each draw decodes every branch over every anchor.
+
+    ``main`` returns the process **exit code**, not a path: an analysis failing must be visible to
+    a shell. The results directory is therefore assembled from the directory this fixture named,
+    which is what a caller with an explicit ``--output-dir`` does anyway.
+    """
+    import json
+
+    from teb_vae.lag_attn_cfs.eval import run as run_module
+
+    output_dir = tmp_path_factory.mktemp("eval")
+    checkpoint = sorted((Path(cohort_run) / "model_checkpoints").glob("*.ckpt"))[0]
+    exit_code = run_module.main(
+        checkpoint,
+        output_dir,
+        overrides=cohort_overrides,
+        device="cpu",
+        num_samples=2,
+    )
+    results_dir = Path(output_dir) / run_module.RESULTS_DIRNAME
+    summary_path = results_dir / run_module.SUMMARY_FILENAME
+    text = summary_path.read_text(encoding="utf-8")
+    return {
+        "checkpoint": checkpoint,
+        "exit_code": exit_code,
+        "summary_path": summary_path,
+        "text": text,
+        "summary": json.loads(text),
+        "results_dir": results_dir,
+    }
 
 
 @pytest.fixture

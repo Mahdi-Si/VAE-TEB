@@ -1,0 +1,65 @@
+{
+  "_comment": "Every figure a full evaluation run of this cell emits, by analysis directory, with dynamically-named figure families recorded as families. Kept equal to a real run by tests/test_eval_smoke.py; read by the fast documentation tests in tests/test_eval_docs.py. Regenerate by deleting this file and running the smoke suite once.",
+  "figures": {
+    "attention": [
+      "attention_profile.pdf",
+      "lag_heatmap.pdf"
+    ],
+    "coupling": [
+      "pred_gap_distribution.pdf",
+      "pred_gap_percent.pdf"
+    ],
+    "cross_subgroup": [
+      "subgroup_heatmap.pdf"
+    ],
+    "distributions": [
+      "class_histograms.pdf",
+      "subgroup_histograms.pdf"
+    ],
+    "events": [
+      "conditioned_coupling.pdf"
+    ],
+    "forecast": [
+      "anchor_profile.pdf",
+      "baseline_comparison.pdf",
+      "forecast_overlay.pdf",
+      "horizon_skill.pdf"
+    ],
+    "lag_kl": [
+      "lag_kl_profile.pdf"
+    ],
+    "latent": [
+      "kl_spectrum.pdf"
+    ],
+    "source_null": [
+      "source_null_difference.pdf"
+    ],
+    "spectral_skill": [
+      "spectral_skill_bands.pdf"
+    ],
+    "sufficiency": [
+      "sufficiency.pdf"
+    ],
+    "time_to_delivery": [
+      "time_to_delivery_trajectory.pdf"
+    ],
+    "trajectory": [
+      "trajectory_profile.pdf"
+    ],
+    "warmup": [
+      "causal_warmup_budget.pdf",
+      "causal_warmup_tradeoff.pdf",
+      "warmup_tertiles.pdf"
+    ]
+  },
+  "families": {
+    "grouped_variants": {
+      "pattern": "*_by_clinical_class.pdf and *_by_subgroup.pdf, beside the table each resolves",
+      "guide_marker": "_by_clinical_class.pdf"
+    },
+    "sample_pages": {
+      "pattern": "samples/<selection>/sample<index>_<guid>_epoch<epoch>.pdf",
+      "guide_marker": "The per-recording pages"
+    }
+  }
+}

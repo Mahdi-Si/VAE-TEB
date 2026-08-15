@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import ast
 import inspect
+import subprocess
+import sys
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -23,6 +25,8 @@ import torch
 
 from teb_vae.lag_attn import figure_primitives, plotting
 from teb_vae.lag_attn.eval import figures
+
+from .conftest import _REPO_ROOT
 
 
 # ---------------------------------------------------------------------------
@@ -127,18 +131,46 @@ def test_safe_vabs_never_returns_zero() -> None:
 # Style discipline
 # ---------------------------------------------------------------------------
 def test_importing_figures_does_not_mutate_global_rcparams() -> None:
-    """``apply_publication_style`` is called once at pipeline start, never as an import side effect.
+    r"""``apply_publication_style`` is called once at pipeline start, never as an import side effect.
 
     An import that restyled would silently change any other figure produced in the same process,
     including another test's.
-    """
-    import importlib
 
-    before = dict(plt.rcParams)
-    importlib.reload(figures)
-    after = dict(plt.rcParams)
-    changed = {key for key in before if before[key] != after.get(key)}
-    assert not changed, f"importing figures.py changed rcParams: {sorted(changed)}"
+    Measured in a **subprocess**, for two independent reasons. This session imported ``figures``
+    long before this test runs, so an in-process check can only observe a *re-execution* of the
+    module body, not the real first import. And the way to force that re-execution --
+    ``importlib.reload`` -- re-executes into the same module object, replacing every public
+    callable with a fresh function object for the rest of the session; the sibling seams bound
+    the originals at *their* import time, so
+    ``teb_vae/lag_attn_cfs/tests/test_eval_figures.py``'s
+    ``assert figures_seam.render_to_pdf is shared_figures.render_to_pdf`` then fails for a reason
+    that has nothing to do with the seam. A subprocess measures the true import and leaves this
+    process's module graph untouched.
+    """
+    source = (
+        "import matplotlib\n"
+        "matplotlib.use('Agg')\n"
+        "import matplotlib.pyplot as plt\n"
+        "before = dict(plt.rcParams)\n"
+        "from teb_vae.lag_attn.eval import figures\n"
+        "print(','.join(sorted(k for k, v in plt.rcParams.items() if before.get(k) != v)))\n"
+        # And the styling is reachable, so it is opt-in rather than simply absent.
+        "figures.configure_figure_style()\n"
+        "assert sorted(k for k, v in plt.rcParams.items() if before.get(k) != v)\n"
+    )
+    completed = subprocess.run(
+        [sys.executable, "-c", source],
+        cwd=str(_REPO_ROOT),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.strip() == "", (
+        f"importing figures.py changed rcParams {completed.stdout.strip()}; styling must be an "
+        f"explicit call at pipeline start, not an import side effect"
+    )
 
 
 def test_the_behavioural_helpers_come_from_utils_style() -> None:

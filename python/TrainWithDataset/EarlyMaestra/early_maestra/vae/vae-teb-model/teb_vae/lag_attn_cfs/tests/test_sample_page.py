@@ -39,6 +39,7 @@ from teb_vae.lag_attn_cfs.causal_warmup import SOURCE_BLOCKS  # noqa: E402
 from teb_vae.lag_attn_fs import sample_page as feature_page  # noqa: E402
 from teb_vae.lag_attn_rws import plotting  # noqa: E402
 from teb_vae.lag_attn_rws import sample_page as shared_page  # noqa: E402
+from teb_vae.lag_attn_rws.nets import losses, raw_masks  # noqa: E402
 from teb_vae.lag_attn_rws.plotting import LagAttnRwsPlotCallback  # noqa: E402
 from train.test_utils import FakeTrainer  # noqa: E402
 
@@ -61,6 +62,11 @@ _STATS = {"fhr": {"mean": 140.0, "std": 20.0}, "up": {"mean": 30.0, "std": 10.0}
 
 #: The two rows this package's input builder adds, by title prefix.
 _INPUT_ROWS = ("Model input — target", "Model input — source")
+
+#: Every titled row of this package's page: the sibling's seven, the two input rows, and the six
+#: of ``CAUSAL_EXTRA_ROWS``. Stated as arithmetic rather than as ``15`` so a row added to the
+#: drawing module without one added to the layout -- or the reverse -- fails here by name.
+_PAGE_ROWS = 7 + len(_INPUT_ROWS) + len(sample_page.CAUSAL_EXTRA_ROWS)
 
 
 def _forward(module: Any, data: Any) -> dict:
@@ -124,6 +130,7 @@ def _render(module: Any, data: Any, pieces: Any = None, **overrides) -> Any:
         input_streams=plotting.input_stream_panels(
             module.orig_model, pieces["inputs"], 0, module.input_stream_panels
         ),
+        forecast_extra_rows=module.forecast_extra_rows,
     )
     kwargs.update(overrides)
     return plotting.build_diagnostic_figure(**kwargs)
@@ -204,7 +211,7 @@ def test_the_callback_draws_both_input_rows_and_warns_about_nothing(tmp_path, ta
     try:
         assert [message for message in warnings if "input rows skipped" in message] == []
         titled = [ax.get_title() for ax in figures[0].axes if ax.get_title()]
-        assert len(titled) == 9, titled
+        assert len(titled) == _PAGE_ROWS, titled
         for prefix in _INPUT_ROWS:
             assert _axes_titled(figures[0], prefix).has_data()
     finally:
@@ -356,14 +363,15 @@ def test_it_refuses_a_stream_whose_width_is_not_this_models_own(task, stub_batch
 # =================================================================================================
 # The forecast rows and the anchor overlay
 # =================================================================================================
-def test_the_page_has_nine_rows_on_one_time_axis(task, stub_batch):
-    """Seven inherited plus the two input rows; the seam replaces two of the seven and must not
-    touch the layout or the axis. A column of the page is one instant on every row, which is what
-    lets a reader carry a feature of the forecast down into the lag map."""
+def test_the_page_rows_all_share_one_time_axis(task, stub_batch):
+    """Seven inherited, the two input rows, and the six of ``CAUSAL_EXTRA_ROWS``; the seam replaces
+    two of the seven, adds six below them, and must not touch the layout or the axis. A column of
+    the page is one instant on every row, which is what lets a reader carry a feature of the
+    forecast down into the lag map -- and it is what an added row is most likely to break."""
     figure = _render(task(), stub_batch)
     try:
         titled = [ax for ax in figure.axes if ax.get_title()]
-        assert len(titled) == 9, [ax.get_title()[:30] for ax in titled]
+        assert len(titled) == _PAGE_ROWS, [ax.get_title()[:30] for ax in titled]
         t_max = stub_batch.fhr.shape[1] / _FS_RAW
         for ax in titled:
             assert ax.get_xlim() == pytest.approx((0.0, t_max)), ax.get_title()
@@ -543,6 +551,301 @@ def test_the_error_map_describes_the_anchor_the_row_shades(task, stub_batch):
         plt.close(figure)
 
 
+# =================================================================================================
+# The channel axis, and the field rows drawn on it
+# =================================================================================================
+#: Every panel on the page whose y-axis is a target or source **channel**, by title prefix. The
+#: latent, KL and lag panels are deliberately absent: their axes are latent dimensions and lags.
+_CHANNEL_AXES = _INPUT_ROWS + (
+    "true $Y^{+}$",
+    "base $\\mu^p$",
+    "full $\\mu^q$",
+    "Source skill",
+    "Predicted $\\sigma^q$",
+)
+
+
+def test_every_channel_axis_on_the_page_puts_coefficient_zero_at_the_top(task, stub_batch):
+    r"""Channel $0$ at the top and increasing downward, so the scattering block sits above the
+    phase block and a reader carries a channel index down the page without it moving. Asserted on
+    the extent **and** the origin together: the extent alone flips the axis and leaves the array
+    drawn upside down under it, which looks right on a symmetric field and is wrong on every
+    other."""
+    module = task()
+    figure = _render(module, stub_batch)
+    try:
+        for prefix in _CHANNEL_AXES:
+            image = _axes_titled(figure, prefix).images[0]
+            _left, _right, bottom, top = image.get_extent()
+            channels = image.get_array().shape[0]
+            assert image.origin == "upper", prefix
+            assert (bottom, top) == pytest.approx((channels - 0.5, -0.5)), prefix
+        # And the per-anchor error map, which is an untitled inset of the forecast row.
+        inset = _axes_titled(figure, "Forecast").child_axes[0].images[0]
+        assert inset.origin == "upper"
+        assert inset.get_extent()[2] > inset.get_extent()[3]
+    finally:
+        plt.close(figure)
+
+
+def test_the_field_rows_draw_the_same_tiling_the_lane_row_does(task, stub_batch):
+    r"""Both branches over **every** kept channel, consecutive and non-overlapping, from the
+    tiling the lane row above them already resolved. Three of $98$ channels cannot distinguish a
+    model that forecasts a few easy coefficients well from one that is uniformly mediocre, which
+    is what these rows exist to show -- but only if they are the same windows."""
+    module = task()
+    pieces = _forward(module, stub_batch)
+    figure = _render(module, stub_batch, pieces=pieces)
+    try:
+        geometry = module.orig_model.geometry
+        anchors = pieces["outs"]["anchor_index"][0].numpy()
+        valid = pieces["outs"]["anchor_valid"][0].numpy().astype(bool)
+        positions = sample_page._tiling_anchors(anchors, valid, geometry.horizon)
+        keep = [int(value) for value in module.orig_model.target_gate.keep_index]
+
+        drawn = {
+            name: _axes_titled(figure, prefix).images[0].get_array()
+            for name, prefix in (
+                ("truth", "true $Y^{+}$"),
+                ("base", "base $\\mu^p$"),
+                ("full", "full $\\mu^q$"),
+            )
+        }
+        for field in drawn.values():
+            assert field.shape == (len(keep), geometry.t)
+
+        for position in positions:
+            anchor = int(anchors[position])
+            window = slice(anchor + 1, anchor + 1 + geometry.horizon)
+            assert np.allclose(
+                drawn["truth"][:, window], pieces["target"][0, window, keep].numpy().T, atol=1e-5
+            ), position
+            for name in ("base", "full"):
+                assert np.allclose(
+                    drawn[name][:, window],
+                    pieces["outs"][f"mu_{name}"][0, position].numpy().T,
+                    atol=1e-5,
+                ), (name, position)
+
+        # Outside the drawn windows there is no forecast, and every field says so with a gap
+        # rather than with a fabricated continuation.
+        for field in drawn.values():
+            assert np.all(np.ma.getmaskarray(field)[:, : int(anchors[positions[0]]) + 1])
+        # One colour scale across the three, so a branch cannot be rescaled into looking right.
+        limits = {
+            _axes_titled(figure, prefix).images[0].get_clim()
+            for prefix in ("true $Y^{+}$", "base $\\mu^p$", "full $\\mu^q$")
+        }
+        assert len(limits) == 1
+    finally:
+        plt.close(figure)
+
+
+def test_the_skill_row_is_the_gap_resolved_per_channel_and_per_step(task, stub_batch):
+    """Signed, and on a symmetric diverging scale, because the interesting failure is the region
+    where conditioning on the source made the forecast *worse* -- which no scalar on the page can
+    show and an unsigned map would hide.
+
+    The full branch is displaced before drawing. At initialisation the posterior *is* the prior --
+    the delta head starts at zero -- so the two branches decode one tensor and every skill cell is
+    exactly $0$; asserted against that, this test would pass on an implementation that drew zeros
+    unconditionally."""
+    module = task()
+    pieces = _forward(module, stub_batch)
+    displaced = pieces["outs"]["mu_full"] + torch.linspace(
+        -0.4, 0.4, pieces["outs"]["mu_full"].shape[-1]
+    )
+    pieces["outs"] = dict(pieces["outs"], mu_full=displaced)
+    figure = _render(module, stub_batch, pieces=pieces)
+    try:
+        fields = {
+            name: _axes_titled(figure, prefix).images[0].get_array()
+            for name, prefix in (
+                ("truth", "true $Y^{+}$"),
+                ("base", "base $\\mu^p$"),
+                ("full", "full $\\mu^q$"),
+            )
+        }
+        image = _axes_titled(figure, "Source skill").images[0]
+        expected = np.abs(fields["truth"] - fields["base"]) - np.abs(
+            fields["truth"] - fields["full"]
+        )
+        assert np.allclose(
+            np.ma.filled(image.get_array(), 0.0), np.ma.filled(expected, 0.0), atol=1e-5
+        )
+        assert np.any(np.abs(np.ma.filled(expected, 0.0)) > 1e-3), "the displacement did not land"
+        low, high = image.get_clim()
+        assert low == pytest.approx(-high)
+        # The robust edge, not the maximum: the difference of two absolute errors is heavy-tailed
+        # in exactly the way one outlying cell washes the whole map to white.
+        finite = np.ma.compressed(image.get_array())
+        assert high == pytest.approx(float(np.percentile(np.abs(finite), 99.0)))
+    finally:
+        plt.close(figure)
+
+
+def test_the_per_window_score_is_the_objectives_own_number(task, stub_batch):
+    r"""Not a second implementation of the loss. The row's two curves go through the objective's
+    own :func:`raw_sample_score` under its own :func:`forecast_mask`, so a window's height is in
+    the same nats as the ``nll_base_block`` and ``nll_full_block`` in the page's title and their
+    difference is ``pred_gap`` restricted to that window. Recomputed here from the forward and the
+    batch -- an error curve drawn from a re-derived formula is the one diagnostic that can
+    disagree with the run it is diagnosing."""
+    module = task()
+    pieces = _forward(module, stub_batch)
+    figure = _render(module, stub_batch, pieces=pieces)
+    try:
+        model = module.orig_model
+        geometry = model.geometry
+        anchors = pieces["outs"]["anchor_index"][0].numpy()
+        valid = pieces["outs"]["anchor_valid"][0].numpy().astype(bool)
+        positions = sample_page._tiling_anchors(anchors, valid, geometry.horizon)
+        keep = torch.as_tensor(
+            [int(value) for value in model.target_gate.keep_index], dtype=torch.long
+        )
+
+        mask, _coverage = raw_masks.forecast_mask(
+            stub_batch.weight,
+            geometry,
+            coverage_floor=float(model.coverage_floor),
+            anchors=pieces["outs"]["anchor_index"],
+            anchor_valid=pieces["outs"]["anchor_valid"],
+        )
+        ax = _axes_titled(figure, "Per-window forecast score")
+        for branch, label in (("base", "$D_0$ base"), ("full", "$D_1$ full")):
+            drawn = np.asarray(_labelled(ax, label)[0].get_ydata(), dtype=float)
+            assert drawn.size == len(positions)
+            for lane, position in enumerate(positions):
+                anchor = int(anchors[position])
+                window = slice(anchor + 1, anchor + 1 + geometry.horizon)
+                expected = (
+                    losses.raw_sample_score(
+                        pieces["outs"][f"mu_{branch}"][0, position],
+                        pieces["target"][0, window].index_select(1, keep),
+                        likelihood=module.hparams["likelihood"],
+                        logvar=pieces["outs"][f"logvar_{branch}"][0, position],
+                    )
+                    * mask[0, position][:, None]
+                ).sum()
+                assert drawn[lane] == pytest.approx(float(expected), rel=1e-5), (branch, position)
+    finally:
+        plt.close(figure)
+
+
+def test_the_score_row_survives_a_batch_with_no_validity_signal(task, stub_batch):
+    """The mask is a function of ``weight``, and scoring an invalid span would put a spike on the
+    row the objective never saw. So the row is annotated rather than raised over: it keeps its
+    title, its axis and its place, the rows below stay column-aligned, and the gap is visible."""
+    import types
+
+    module = task()
+    # The forward still needs the weight; what is withheld is the *batch the page is handed*, so
+    # only the row under test loses its input.
+    pieces = _forward(module, stub_batch)
+    stripped = types.SimpleNamespace(
+        **{name: value for name, value in vars(stub_batch).items() if name != "weight"}
+    )
+    figure = _render(module, stub_batch, pieces=pieces, batch=stripped)
+    try:
+        ax = _axes_titled(figure, "Per-window forecast score")
+        assert len(ax.lines) == 0
+        assert any("no validity signal" in text.get_text() for text in ax.texts)
+        assert len([child for child in figure.axes if child.get_title()]) == _PAGE_ROWS
+    finally:
+        plt.close(figure)
+
+
+def test_every_inset_sits_in_the_span_this_tiling_leaves_blank(task):
+    r"""Which corner is blank is a property of the tiling, not of the panel. The two-sided page
+    stops short of the recording's end and puts its error map in the right margin; this tiling
+    starts at the anchor floor $F$ and runs to the end, so the blank span is the *prefix* -- and
+    the inherited box put the panel over the last windows of the very forecast it details.
+
+    At the **shipped** geometry, where the claim is the production one: $F = 133$ of $300$ steps,
+    so the prefix is a comfortable $44\%$ of the row. The tiny fixture's floor is too small to
+    hold a legible inset at all, which is what ``_PREFIX_MIN_SPAN`` is for."""
+    from .conftest import SHIPPED_SEQUENCE_LENGTH, shipped_warmup_kwargs
+
+    module = task(model_kwargs=shipped_warmup_kwargs())
+    figure = _render(module, make_stub_batch(2, SHIPPED_SEQUENCE_LENGTH))
+    try:
+        geometry = module.orig_model.geometry
+        floor = geometry.warmup / geometry.t
+        assert floor > sample_page._PREFIX_MIN_SPAN, "the shipped prefix must hold the insets"
+        for title, expected in (
+            ("Forecast", 1),                     # the per-anchor error map
+            ("Per-window forecast score", 2),    # the error and coverage profiles
+        ):
+            ax = _axes_titled(figure, title)
+            assert len(ax.child_axes) == expected, title
+            for inset in ax.child_axes:
+                # The inset's own span in the parent's axes fractions, which is what a box is
+                # expressed in and what the anchor floor is comparable against.
+                left, right = ax.transAxes.inverted().transform(
+                    inset.transAxes.transform([[0.0, 0.0], [1.0, 0.0]])
+                )[:, 0]
+                assert 0.0 <= left < right <= floor, (title, left, right)
+        # And the two-sided sibling keeps its own margin: the default is unchanged, so the page
+        # that box is right for did not move with this one.
+        assert feature_page._ERROR_MAP_BOX[0] > 0.5
+    finally:
+        plt.close(figure)
+
+
+def test_the_profiles_carry_one_point_per_kept_channel(task, stub_batch):
+    r"""Per-channel error and $2\sigma$ coverage over the same drawn windows, on the page's own
+    top-down channel axis, as insets of the *line* row -- an inset over a field row would hide the
+    span it covers, and this row carries one marker per drawn window whatever the run does."""
+    module = task()
+    figure = _render(module, stub_batch)
+    try:
+        kept = module.orig_model.decoder_out_channels
+        insets = _axes_titled(figure, "Per-window forecast score").child_axes
+        assert len(insets) == 2, "the error profile and the coverage profile"
+        for inset in insets:
+            assert inset.get_title() == "", "a titled axes on this page spans the recording"
+            # Top-down, like every channel axis above it.
+            assert inset.get_ylim() == pytest.approx((kept - 0.5, -0.5))
+            branches = [line for line in inset.lines if str(line.get_label()) in ("base", "full")]
+            assert len(branches) == 2
+            for line in branches:
+                assert np.asarray(line.get_ydata()).size == kept
+        # The coverage profile alone carries the nominal band, which is derived from the drawn
+        # band width rather than written as a number.
+        reference = [
+            line
+            for inset in insets
+            for line in inset.lines
+            if line.get_xdata()[0] == pytest.approx(sample_page._NOMINAL_COVERAGE)
+        ]
+        assert len(reference) == 1
+    finally:
+        plt.close(figure)
+
+
+def test_every_reserved_extra_row_is_drawn_and_every_drawn_row_is_reserved(task, stub_batch):
+    """The two halves live in one constant on purpose. A name reserved and not drawn is a blank
+    row on every page of the run; a name drawn and not reserved is a ``KeyError`` raised inside a
+    handler that swallows it, i.e. a page silently missing from the whole run."""
+    module = task()
+    assert module.forecast_extra_rows is sample_page.CAUSAL_EXTRA_ROWS
+
+    figure = _render(module, stub_batch)
+    try:
+        titled = [ax for ax in figure.axes if ax.get_title()]
+        assert len(titled) == _PAGE_ROWS
+        for _name, height in sample_page.CAUSAL_EXTRA_ROWS:
+            assert height > 0.0
+        # Each reserved row drew something; the layout puts them between the forecast row and the
+        # input rows, which is what keeps the input rows against the latent they feed.
+        order = [ax.get_title() for ax in titled]
+        forecast_at = next(i for i, title in enumerate(order) if title.startswith("Forecast"))
+        first_input = next(i for i, title in enumerate(order) if title.startswith(_INPUT_ROWS[0]))
+        assert first_input - forecast_at == len(sample_page.CAUSAL_EXTRA_ROWS) + 1
+    finally:
+        plt.close(figure)
+
+
 def test_the_page_carries_the_physical_delay_caveat(task, stub_batch):
     r"""One-sidedness and zero latency are different properties and this family buys only the
     first. The forecast claim needs no correction -- a coefficient at $t$ is a function of the past
@@ -611,7 +914,12 @@ def test_it_renders_at_the_shipped_geometry(task):
         assert module.orig_model.decoder_out_channels == 98
         ax = _axes_titled(figure, "Forecast")
         assert ax.child_axes[0].images[0].get_array().shape == (98, SHIPPED_HORIZON)
-        assert len([child for child in figure.axes if child.get_title()]) == 9
+        assert len([child for child in figure.axes if child.get_title()]) == _PAGE_ROWS
+        # And the field rows carry the same 98 channels over the whole recording, so the page is
+        # one channel axis from the input rows down to the error map.
+        for row in ("true $Y^{+}$", "base $\\mu^p$", "full $\\mu^q$", "Source skill"):
+            image = _axes_titled(figure, row).images[0]
+            assert image.get_array().shape == (98, SHIPPED_SEQUENCE_LENGTH), row
         assert _labelled(ax, "decoded anchors")[0].get_xdata().size == (
             SHIPPED_SEQUENCE_LENGTH - SHIPPED_HORIZON - module.orig_model.warmup_period
         )

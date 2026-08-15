@@ -64,6 +64,7 @@ from teb_vae.lag_attn_transformer_cfs.trainer import LagAttnTrfCfsTrainer
 # four constructors' keyword sets have to stay right, which is the same reason this package's
 # conftest imports its data half rather than repeating it.
 from teb_vae.lag_attn_cfs.tests.test_docs import (  # noqa: E402
+    EVALUATION_VERDICTS,
     _flat,
     _integers_stated_in,
     _markdown_section,
@@ -371,39 +372,65 @@ def test_the_mixin_section_states_why_neither_inheritance_works(design):
 
 
 def test_the_lean_limits_carry_their_replacement_triggers(design):
-    """A ``lean-limit`` note without a measurable trigger is a permanent excuse. Exactly three here,
-    all inherited from the target domain: the per-segment warm-up, the uncorrected group delay, and
-    the lag floor that never varies."""
+    """A ``lean-limit`` note without a measurable trigger is a permanent excuse. Exactly four here,
+    all inherited from the target domain: the per-segment warm-up, the uncorrected group delay, the
+    lag floor that never varies, and the availability-clock margin the evaluation ships unset."""
     flat = _flat(design)
 
-    assert len(re.findall(r"^> lean-limit: ", design, re.MULTILINE)) == 3
+    assert len(re.findall(r"^> lean-limit: ", design, re.MULTILINE)) == 4
     assert "when a measured run shows the anchor floor" in flat
     assert "when a lag result is to be reported as a physiological delay" in flat
     assert "when a run's `source_lag_warmth_frac_ph` falls below" in flat
+    assert "once the first production run on the causal holdout split has written" in flat
 
 
-def test_the_design_names_no_evaluation_entry_point(design):
-    """The evaluation is deferred whole, and a launch line for one would be the most convincing
-    possible way to imply otherwise."""
+def test_the_design_records_what_the_evaluation_closed_and_what_it_did_not(design):
+    """§14 carried "no evaluation pipeline" until there was one, and the failure mode of a record
+    like that is not that it goes missing -- it is that it stays.
+
+    What replaced it has to say the thing that is this package's rather than the parent's: the
+    pipeline is *bound*, not copied, and the reason is that two architectures are only comparable if
+    they are measured by one implementation.
+    """
+    section = _flat(_markdown_section(design, "## 14. "))
+
+    assert "No evaluation pipeline" not in section
+    assert "What the evaluation closed, and what it deliberately did not" in _flat(design)
+    assert "defines no numeric function" in section
+    assert "tests/test_eval_run.py" in section
+    # The comparability rule, in both directions, because a table with one edge reads as licence
+    # for both.
+    assert "lag_attn_cfs" in section and "lag_attn_transformer_fs" in section
+    assert "2340" in section
+
+
+def test_the_design_names_the_evaluation_entry_points(design):
+    """The mirror image of the assertion this replaced. §16 is where an operator copies a command
+    from, so the evaluation being reachable has to be visible there rather than only in §14."""
     section = _markdown_section(design, "## 16. ")
     commands = [line for line in section.splitlines() if "-m teb_vae" in line]
 
     assert commands, "§16 carries no launch lines"
-    assert all(("trainer" in line) or ("check_run" in line) for line in commands)
-    assert "There is no `eval` entry point" in section
+    assert all(
+        ("trainer" in line) or ("check_run" in line) or ("eval." in line) for line in commands
+    )
+    assert any("eval.run" in line for line in commands)
+    assert any("eval.verify" in line for line in commands)
+    assert "There is no `eval` entry point" not in section
 
 
 def test_every_companion_document_the_design_defers_to_exists(design):
     """This record defers four claims to sibling documents, so each of them is load-bearing: a moved
     file turns the deferral into a dead end. A sibling under ``teb_vae/`` is cited by its
-    package-relative path, as the whole family's records cite each other, so both roots are tried."""
+    package-relative path, as the whole family's records cite each other; a document inside *this*
+    package is cited relative to the package, the way ``eval/EVAL.md`` is. All three roots are
+    tried."""
     referenced = sorted({match for match in re.findall(r"[\w/]+\.md", design) if "/" in match})
 
     assert len(referenced) >= 4, f"the design record defers to only {referenced}"
+    roots = (_REPO_ROOT, _REPO_ROOT / "teb_vae", _PACKAGE_DIR)
     missing = [
-        path
-        for path in referenced
-        if not (_REPO_ROOT / path).is_file() and not (_REPO_ROOT / "teb_vae" / path).is_file()
+        path for path in referenced if not any((root / path).is_file() for root in roots)
     ]
     assert missing == [], f"DESIGN.md defers to documents that do not exist: {missing}"
 
@@ -505,7 +532,13 @@ def test_the_bottleneck_health_table_carries_every_readout(name, results):
 
 def test_every_backticked_metric_name_in_the_record_is_one_the_run_emits(results):
     """The general form of the two checks above, over the whole document. Restricted to names that
-    look like metric identifiers, so config keys, file names and prose survive it."""
+    look like metric identifiers, so config keys, file names and prose survive it.
+
+    The evaluation's verdict names share the shape and not the namespace -- a verdict is a status
+    the acceptance gate assigns, not a column a training step logs -- so they are resolved against
+    the gate's own registry, which is the causal parent's and therefore the same one both cells are
+    held to.
+    """
     candidates = set(re.findall(r"`([a-z][a-z0-9_]{4,})`", results))
     metric_shaped = {
         name
@@ -521,6 +554,7 @@ def test_every_backticked_metric_name_in_the_record_is_one_the_run_emits(results
         name
         for name in metric_shaped
         if not any(tracked.startswith(name) for tracked in _TRACKED_SUFFIXES)
+        and name not in EVALUATION_VERDICTS
     )
     assert unknown == [], unknown
 
@@ -560,12 +594,50 @@ def test_the_revert_record_names_the_shared_seams_outside_this_package(results):
         assert f"`{path}`" in section, path
 
 
-def test_the_record_states_that_there_is_no_evaluation_package(results):
+def test_the_record_states_that_its_own_numbers_carry_no_uncertainty(results):
     """Stated once, near the top, so no number on the page is read as though it had a confidence
-    interval."""
-    assert "no evaluation package" in results
+    interval -- and now that an evaluation package exists, the claim has to be the *narrow* one.
+    "There is no evaluation package" was the old form and is asserted gone."""
+    assert "no evaluation package" not in results
+    assert "in-sample and carries no uncertainty" in results
     assert "metrics_history.csv" in results
     assert "uncertainty" in results
+
+
+def test_the_record_maps_its_criteria_onto_the_verdicts_that_re_ask_them(results):
+    """A pre-registration and an acceptance gate that never referenced each other would be two
+    criteria sets nobody reconciled. The mapping itself is the causal parent's, because the
+    verdicts are -- so what this record must do is cite it rather than restate it, and a restated
+    copy is exactly what would drift."""
+    section = results.split("### The evaluation's second reading of these criteria")[1]
+    section = section.split("\n---")[0]
+
+    assert "teb_vae/lag_attn_cfs/RESULTS.md" in section
+    for verdict in ("anchor_geometry_intact", "coupling_exceeds_availability_clock"):
+        assert verdict in section, verdict
+
+
+def test_the_unset_clock_margin_is_recorded_as_an_open_item_owned_by_the_parent(results):
+    """The threshold is one key for two cells, deliberately: set per cell it would gate the two
+    architectures this record's own edge table exists to compare against two different bars."""
+    flat = _flat(results)
+
+    assert "clock_margin_min_nats` is unset" in flat
+    assert "INCONCLUSIVE" in flat
+    assert "set there once, for both cells" in flat
+
+
+def test_the_encoder_edge_names_the_cross_cell_table_that_renders_it(results):
+    """The edge table above it is filled by hand from two runs; the same comparison exists as a
+    rendered artifact with intervals, and a record that did not point at it invites the hand-filled
+    version to be the one that is quoted."""
+    section = results.split("### The two edges, read after both cells have run")[1]
+    section = section.split("\n---")[0]
+
+    assert "eval.verify --runs" in section
+    assert "cross-cell table" in section
+    # And the asymmetry, restated where the table is: the transform edge gets no such rendering.
+    assert "signs-and-orderings" in section
 
 
 def test_the_record_states_that_the_nats_are_comparable_to_no_other_target_domain(results):
@@ -582,12 +654,20 @@ def test_the_record_states_that_the_sign_of_the_gap_is_not_a_criterion(results):
     assert "negative `pred_gap` is not a failure" in results
 
 
-def test_no_launch_line_names_an_evaluation_entry_point(results):
-    """There is none, and a line naming one would be a launch that fails on the box."""
+def test_the_launch_lines_name_the_evaluation_entry_points(results):
+    """The mirror image of the assertion this replaced. The evaluation is where a claim with an
+    interval comes from, and a reader who has to go find its command is a reader who quotes the
+    in-sample number instead."""
     section = results.split("## Launch lines")[1].split("\n## ")[0]
 
-    assert ".eval" not in section
-    assert "eval.run" not in section
+    for line in (
+        "teb_vae.lag_attn_transformer_cfs.eval.run",
+        "teb_vae.lag_attn_transformer_cfs.eval.verify",
+        "teb_vae.lag_attn_cfs.check_run",
+    ):
+        assert line in section, line
+    # And the precondition, because these are the only lines here that do not run today.
+    assert "REPOINT_ME" in section
 
 
 def test_every_launch_line_names_a_config_that_exists(results):
@@ -598,6 +678,18 @@ def test_every_launch_line_names_a_config_that_exists(results):
     assert configs, "no launch line names a config at all"
     for config in configs:
         assert (repo_root / config).exists(), config
+
+
+def test_every_launch_line_names_a_module_that_exists(results):
+    """A launch line is copied and pasted; one naming a moved module fails at the shell with a
+    message about an import rather than about a run."""
+    section = results.split("## Launch lines")[1].split("\n## ")[0]
+    repo_root = _PACKAGE_DIR.parents[1]
+
+    modules = sorted(set(re.findall(r"-m (teb_vae[\w.]+)", section)))
+    assert len(modules) >= 4, modules
+    for dotted in modules:
+        assert (repo_root / Path(*dotted.split("."))).with_suffix(".py").is_file(), dotted
 
 
 # =================================================================================================

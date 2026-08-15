@@ -46,6 +46,7 @@ from typing import Dict, List, Set
 
 import pytest
 
+from teb_vae.lag_attn_cfs.eval.verify import CFS_VERDICTS
 from teb_vae.lag_attn_cfs.model_kwargs import WARMUP_MODEL_KWARGS
 from teb_vae.lag_attn_cfs.nets.causal_feature_target import CausalFeatureForecastTarget
 from teb_vae.lag_attn_cfs.nets.model import SeqVaeLagAttnCfs
@@ -130,6 +131,12 @@ FORBIDDEN_TOKENS = (
 _TRACKED_SUFFIXES = frozenset(
     name.split("/")[-1] for name in LagAttnCfsTrainer.TRACKED_METRICS
 )
+
+#: The evaluation's acceptance criteria, from the gate that decides them. They share the *shape* of
+#: a tracked metric name and none of the namespace: a verdict is a status the offline gate assigns,
+#: not a column a training step logs, and this record now names several of them where it maps its
+#: own criteria onto them. Imported rather than listed so a rename fails here.
+EVALUATION_VERDICTS = frozenset(CFS_VERDICTS)
 
 
 @pytest.fixture(scope="module")
@@ -467,26 +474,53 @@ def test_the_design_records_why_the_latent_gap_readout_is_re_pointed(design):
 
 
 def test_the_lean_limits_carry_their_replacement_triggers(design):
-    """A ``lean-limit`` note without a measurable trigger is a permanent excuse. Exactly three here:
-    the per-segment warm-up, the uncorrected group delay, and the lag floor that never varies."""
+    """A ``lean-limit`` note without a measurable trigger is a permanent excuse. Exactly four here:
+    the per-segment warm-up, the uncorrected group delay, the lag floor that never varies, and the
+    availability-clock margin the evaluation ships unset."""
     flat = _flat(design)
 
-    assert len(re.findall(r"^> lean-limit: ", design, re.MULTILINE)) == 3
+    assert len(re.findall(r"^> lean-limit: ", design, re.MULTILINE)) == 4
     assert "when a measured run shows the anchor floor" in flat
     assert "when a lag result is to be reported as a physiological delay" in flat
     assert "when a run's `source_lag_warmth_frac_ph` falls below" in flat
+    assert "once the first production run on the causal holdout split has written" in flat
 
 
-def test_the_design_names_no_evaluation_entry_point(design):
-    """The evaluation is deferred whole, and a launch line for one would be the most convincing
-    possible way to imply otherwise -- so the section says the absence out loud and carries no
-    command that would contradict it."""
+def test_the_design_records_what_the_evaluation_closed_and_what_it_did_not(design):
+    """§14 carried "no evaluation pipeline" until there was one, and the failure mode of a record
+    like that is not that it goes missing -- it is that it stays. So the absence claim is asserted
+    **gone**, and what replaced it is asserted to carry both halves: a limitation section that only
+    listed what was closed would read as a pipeline with no known gaps."""
+    section = _flat(_markdown_section(design, "## 14. "))
+
+    assert "No evaluation pipeline" not in section
+    assert "no `eval/` package" not in section
+    assert "What the evaluation closed, and what it deliberately did not" in _flat(design)
+    # Both halves, and the absences by name rather than by count.
+    for closed in ("bootstrap interval", "availability-clock hazard", "FAIL-able verdict"):
+        assert closed in section, closed
+    for absent in ("not ported at all", "no clinical unit", "No physical-lag readout"):
+        assert absent in section, absent
+
+
+def test_the_design_names_the_evaluation_entry_points(design):
+    """The mirror image of the assertion this replaced. §16 is where an operator copies a command
+    from, so the evaluation being reachable has to be visible there rather than only in §14 -- and
+    every line has to name a module that exists, because a launch line is copied and pasted."""
     section = _markdown_section(design, "## 16. ")
     commands = [line for line in section.splitlines() if "-m teb_vae" in line]
 
     assert commands, "§16 carries no launch lines"
-    assert all(("trainer" in line) or ("check_run" in line) for line in commands)
-    assert "There is no `eval` entry point" in section
+    assert all(
+        ("trainer" in line) or ("check_run" in line) or ("eval." in line) for line in commands
+    )
+    assert any("eval.run" in line for line in commands)
+    assert any("eval.verify" in line for line in commands)
+    assert "There is no `eval` entry point" not in section
+    # And the pairing, because two green checks that answer two questions are only confusing if
+    # nothing says so. Asserted here as well as in eval/EVAL.md, in both directions.
+    assert "did the fit behave" in _flat(section)
+    assert "is this finished checkpoint acceptable" in _flat(section)
 
 
 def test_every_companion_document_the_design_defers_to_exists(design):
@@ -495,15 +529,15 @@ def test_every_companion_document_the_design_defers_to_exists(design):
     reader who followed it has no way to tell a missing document from an unwritten one.
 
     A sibling under ``teb_vae/`` is cited by its package-relative path, as the whole family's records
-    cite each other, so both roots are tried.
+    cite each other; a document inside *this* package is cited relative to the package, the way
+    ``eval/EVAL.md`` is. All three roots are tried.
     """
     referenced = sorted({match for match in re.findall(r"[\w/]+\.md", design) if "/" in match})
 
     assert len(referenced) >= 4, f"the design record defers to only {referenced}"
+    roots = (_REPO_ROOT, _REPO_ROOT / "teb_vae", _PACKAGE_DIR)
     missing = [
-        path
-        for path in referenced
-        if not (_REPO_ROOT / path).is_file() and not (_REPO_ROOT / "teb_vae" / path).is_file()
+        path for path in referenced if not any((root / path).is_file() for root in roots)
     ]
     assert missing == [], f"DESIGN.md defers to documents that do not exist: {missing}"
 
@@ -592,7 +626,14 @@ def test_the_bottleneck_health_table_carries_every_readout(name, results):
 
 def test_every_backticked_metric_name_in_the_record_is_one_the_run_emits(results):
     """The general form of the two checks above, over the whole document. Restricted to names that
-    look like metric identifiers, so config keys, file names and prose survive it."""
+    look like metric identifiers, so config keys, file names and prose survive it.
+
+    **Evaluation verdict names share the shape and not the namespace.** ``source_specificity`` and
+    ``anchor_geometry_intact`` read exactly like tracked columns and are neither -- they are
+    criteria the acceptance gate decides -- so they are resolved against the gate's own registry
+    instead of being exempted by shape. A verdict name that is not in that registry still fails,
+    which is the same typo check one namespace over.
+    """
     candidates = set(re.findall(r"`([a-z][a-z0-9_]{4,})`", results))
     metric_shaped = {
         name
@@ -608,8 +649,18 @@ def test_every_backticked_metric_name_in_the_record_is_one_the_run_emits(results
         name
         for name in metric_shaped
         if not any(tracked.startswith(name) for tracked in _TRACKED_SUFFIXES)
+        and name not in EVALUATION_VERDICTS
     )
     assert unknown == [], unknown
+
+
+def test_the_verdict_namespace_the_scan_above_admits_is_the_gates_own() -> None:
+    """Non-vacuity for the exemption: a hand-kept list of verdict names would exempt a typo the
+    moment somebody added it here to make a test pass. This one is the gate's registry, imported
+    from the module that decides the criteria."""
+    assert len(EVALUATION_VERDICTS) == 10
+    assert "coupling_exceeds_availability_clock" in EVALUATION_VERDICTS
+    assert "not_a_verdict" not in EVALUATION_VERDICTS
 
 
 # =================================================================================================
@@ -647,12 +698,49 @@ def test_the_revert_record_names_the_shared_seams_outside_this_package(results):
         assert f"`{path}`" in section, path
 
 
-def test_the_record_states_that_there_is_no_evaluation_package(results):
+def test_the_record_states_that_its_own_numbers_carry_no_uncertainty(results):
     """Stated once, near the top, so no number on the page is read as though it had a confidence
-    interval."""
-    assert "no evaluation package" in results
+    interval -- and now that an evaluation package exists, the claim has to be the *narrow* one.
+    "There is no evaluation package" was the old form and is asserted gone: it would send a reader
+    looking for a pipeline that is there, and it would imply that these numbers are the only ones."""
+    assert "no evaluation package" not in results
+    assert "in-sample and carries no uncertainty" in results
     assert "metrics_history.csv" in results
     assert "uncertainty" in results
+
+
+def test_the_record_maps_every_criterion_onto_the_verdict_that_re_asks_it(results):
+    """A pre-registration and an acceptance gate that never referenced each other would be two
+    criteria sets nobody reconciled. Every tier-1 and tier-2 row is mapped, and the three verdicts
+    with no row above are named rather than left as a silent surplus."""
+    section = results.split("### The evaluation's second reading of these criteria")[1]
+    section = section.split("\n---")[0]
+
+    for verdict in (
+        "anchor_geometry_intact",
+        "source_specificity",
+        "source_margin_positive",
+        "latent_not_collapsed",
+        "prior_variance_not_pinned",
+        "decoder_variance_not_pinned",
+        "coupling_exceeds_availability_clock",
+        "predictive_improvement",
+        "prior_carries_target_state",
+        "calibration_near_nominal",
+    ):
+        assert verdict in section, verdict
+    # A criterion the evaluation does not re-ask is marked rather than dropped.
+    assert "None. This is a property of the optimisation trajectory" in section
+
+
+def test_the_unset_clock_margin_is_recorded_as_an_open_item(results):
+    """The one criterion whose verdict cannot be decided yet. Recorded with the run that resolves
+    it, because an open item with no owner and no trigger is a permanent one."""
+    flat = _flat(results)
+
+    assert "clock_margin_min_nats` is unset" in flat
+    assert "INCONCLUSIVE" in flat
+    assert "first production evaluation of a causal holdout split" in flat
 
 
 def test_the_record_states_that_the_nats_are_comparable_to_no_other_target_domain(results):
@@ -669,12 +757,34 @@ def test_the_record_states_that_the_sign_of_the_gap_is_not_a_criterion(results):
     assert "negative `pred_gap` is not a failure" in results
 
 
-def test_no_launch_line_names_an_evaluation_entry_point(results):
-    """There is none, and a line naming one would be a launch that fails on the box."""
+def test_the_launch_lines_name_the_evaluation_entry_points_of_both_cells(results):
+    """The mirror image of the assertion this replaced. The evaluation is where a claim with an
+    interval comes from, and a reader who has to go find its command is a reader who quotes the
+    in-sample number instead. Both cells, because this record is the one an operator holds while
+    the encoder edge is being read."""
     section = results.split("## Launch lines")[1].split("\n## ")[0]
 
-    assert ".eval" not in section
-    assert "eval.run" not in section
+    for line in (
+        "teb_vae.lag_attn_cfs.eval.run",
+        "teb_vae.lag_attn_cfs.eval.verify",
+        "teb_vae.lag_attn_transformer_cfs.eval.run",
+        "teb_vae.lag_attn_cfs.check_run",
+    ):
+        assert line in section, line
+    # And the precondition, because these four are the only lines here that do not run today.
+    assert "REPOINT_ME" in section
+
+
+def test_every_launch_line_names_a_module_that_exists(results):
+    """A launch line is copied and pasted; one naming a moved module fails at the shell with a
+    message about an import rather than about a run."""
+    section = results.split("## Launch lines")[1].split("\n## ")[0]
+    repo_root = _PACKAGE_DIR.parents[1]
+
+    modules = sorted(set(re.findall(r"-m (teb_vae[\w.]+)", section)))
+    assert len(modules) >= 4, modules
+    for dotted in modules:
+        assert (repo_root / Path(*dotted.split("."))).with_suffix(".py").is_file(), dotted
 
 
 def test_every_launch_line_names_a_config_that_exists(results):

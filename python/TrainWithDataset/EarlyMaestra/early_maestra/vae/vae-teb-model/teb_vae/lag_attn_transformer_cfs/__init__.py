@@ -39,6 +39,8 @@ Layout::
     task.py     the Lightning task, a diamond of two parents with an empty body
     trainer.py  the experiment driver, three re-pointed class attributes
     configs/    YAML configs resolved through ``teb_vae.lag_attn.config``
+    eval/       four files: a binding, an override delta, a runner and a gate -- and no numeric
+                function, so both cfs cells are measured by one implementation
     tests/      fast hermetic pytest
     RESULTS.md  the pre-registered criteria the headline run is scored against
 
@@ -61,8 +63,27 @@ predicting step $t + 1 + \tau$ from history up to $t$ is a genuine forecast what
 latency -- but any lag-resolved reading is an attribution over *stored-coefficient* time, not over
 physical delay.
 
-lean-limit: no evaluation package, so this model is not comparable through the shared evaluation
-pipeline and what a run emits -- ``metrics_history.csv``, the tracked metric surface,
-``train/grad_norm`` and the per-epoch diagnostic figure -- is its only readout; replace with a model
-binding and an evaluation package when the feature-domain evaluation contract exists.
+**This cell is evaluated by the causal parent's pipeline, not by a copy of it.**
+``teb_vae.lag_attn_transformer_cfs.eval`` supplies a ``ModelBinding``, an override delta, a runner
+and a gate, and delegates every readout, every analysis and every verdict to
+``teb_vae.lag_attn_cfs.eval`` -- which is what makes a difference between the two cfs cells'
+summaries attributable to the encoder rather than to two implementations. A loss level is
+comparable against ``lag_attn_cfs`` and is **not** comparable against ``lag_attn_transformer_fs``,
+whose blocks are $2340$ coefficients at a horizon of $30$ against this cell's $1470$ at $15$.
+
+lean-limit: the frequency-resolved readout is band-resolved skill and its timing half is unmeasured,
+because a stored coefficient is a modulus and the analysing filter's phase was discarded before the
+value was written; replace with a phase-carrying readout when the dataset stores a complex or
+phase-preserving block, which is a dataset change rather than an evaluation one.
+
+lean-limit: the lag axis is stored-coefficient time, uncorrected for a composed group delay reaching
+$791$ s -- the same order as the $364$ s lag search itself; replace with a per-channel-pair physical
+lag built from ``causal_delay_s`` when a lag result is to be reported as a physiological delay
+rather than as a coefficient-time attribution.
+
+lean-limit: ``eval_config.clock_margin_min_nats`` ships unset, so the availability-clock verdict
+reports INCONCLUSIVE and the gate is nine criteria rather than ten; replace with a value derived
+from the observed spread of the coupling-minus-clock difference across recordings once the first
+production run on the causal holdout split has written its ``source_null`` table. The key is the
+causal parent's and is set there once, for both cells.
 """

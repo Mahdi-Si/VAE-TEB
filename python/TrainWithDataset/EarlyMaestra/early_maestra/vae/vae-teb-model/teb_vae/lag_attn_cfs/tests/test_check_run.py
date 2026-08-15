@@ -505,3 +505,27 @@ def test_an_absent_tier_two_column_is_reported_as_absent(tmp_path, capsys):
 
     assert code == 0
     assert "val/kld_source_null: absent" in capsys.readouterr().out
+
+
+# =================================================================================================
+# The cross-reference to the offline gate
+# =================================================================================================
+def test_the_docstring_points_at_the_gate_that_answers_the_other_question():
+    """Two green checks that answer two questions are only confusing if nothing says so.
+
+    This module reads a run's own ``metrics_history.csv`` and answers *did the fit behave*, in
+    sample and per epoch, **while the run is still going**; ``eval/verify.py`` reads a finished
+    run's ``summary.json`` and answers *is this checkpoint acceptable*, on a held-out population and
+    with intervals. A reader of one who has never heard of the other treats an in-sample per-epoch
+    mean as a held-out result, which is the single most likely misreading of this file's output.
+
+    Asserted in both directions rather than in one: ``eval/EVAL.md`` carries the same pairing and
+    ``tests/test_eval_docs.py`` asserts it there, so neither module can quietly become the only
+    place the distinction is written down.
+    """
+    doc = check_run.__doc__ or ""
+
+    assert "eval.verify" in doc.replace("eval/verify.py", "eval.verify")
+    assert "while a run is still in flight" in doc
+    assert "is this checkpoint acceptable" in doc
+    assert "no denominator and no interval" in doc

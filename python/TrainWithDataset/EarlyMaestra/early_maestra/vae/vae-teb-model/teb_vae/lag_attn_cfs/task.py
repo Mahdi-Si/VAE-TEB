@@ -117,10 +117,13 @@ class SeqVaeLagAttnCfsTask(SeqVaeLagAttnFsTask):
         $F = 0$ and stride $1$, and everywhere else the inherited rows would draw a real forecast
         at the wrong time, with no shape error anywhere in it.
 
-        Three values are bound, and each is something the page cannot recover from the arrays it is
+        Five values are bound, and each is something the page cannot recover from the arrays it is
         handed: which declared channel each decoder output *is*, where the two stored blocks meet
-        on that channel axis, and the stride a training step tiles at -- which the page draws
-        beside the dense set it is itself produced at.
+        on that channel axis, the stride a training step tiles at -- which the page draws beside
+        the dense set it is itself produced at -- and the two the per-window score row needs. Those
+        last two are taken from where the objective takes them, the hyperparameter for the
+        likelihood and the net for the coverage floor, so a window's height on that row is the
+        block score this run computed rather than one drawn under some other assumption.
 
         Returns:
             A callable taking one
@@ -135,7 +138,27 @@ class SeqVaeLagAttnCfsTask(SeqVaeLagAttnFsTask):
             keep_index=None if gate is None else gate.keep_index,
             block_split=int(model.TARGET_BLOCK_SPLIT),
             training_stride=int(model.anchor_stride),
+            likelihood=str(self.hparams.get("likelihood", "gaussian_nll")),
+            coverage_floor=float(model.coverage_floor),
         )
+
+    @property
+    def forecast_extra_rows(self) -> Tuple[Tuple[str, float], ...]:
+        """The rows :attr:`forecast_rows` draws beyond the two the layout always reserves.
+
+        Resolved off the task by the callback and handed to the page builder, which is the only
+        place a GridSpec row can be created -- the seam itself runs after the layout is fixed and
+        can reach only rows that already exist. Returned from the drawing module's own constant
+        rather than restated here, so the names reserved and the names drawn are one object: a
+        name reserved and not drawn is a blank row on every page of the run, and a name drawn and
+        not reserved is a ``KeyError`` raised inside a handler that swallows it.
+
+        Returns:
+            ``(name, height_ratio)`` per row, in drawing order.
+        """
+        from teb_vae.lag_attn_cfs.sample_page import CAUSAL_EXTRA_ROWS
+
+        return CAUSAL_EXTRA_ROWS
 
     @property
     def input_stream_panels(self) -> Callable[..., Sequence[InputStreamPanel]]:

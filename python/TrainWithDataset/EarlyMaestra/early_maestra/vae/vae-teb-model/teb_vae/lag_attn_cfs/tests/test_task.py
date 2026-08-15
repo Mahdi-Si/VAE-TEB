@@ -68,10 +68,17 @@ _OWN_MEMBERS = {
     "_added_metrics",
     "compute_loss_and_metrics",
     "_stage",
-    # The three diagnostic-page seams. Each replaces a builder welded to something this family does
+    # The four diagnostic-page seams. Each replaces a builder welded to something this family does
     # not have -- a dense anchor axis, or the production two-sided filter bank -- and each of those
     # builders fails *quietly*, inside a handler that warns and continues.
+    #
+    # ``forecast_extra_rows`` is the fourth and is a seam of the *layout* rather than of the
+    # drawing: a GridSpec row can only be created before the rows seam runs, so the names the page
+    # reserves and the names it draws have to arrive from one object -- a name reserved and not
+    # drawn is a blank row on every page of the run, and a name drawn and not reserved is a
+    # KeyError inside a handler that swallows it.
     "forecast_rows",
+    "forecast_extra_rows",
     "input_stream_panels",
     "input_budget_figure",
     "warmup_budget",
@@ -130,9 +137,18 @@ def test_the_page_rows_are_this_packages_and_carry_the_tiling(task):
 
     module = task()
     rows = module.forecast_rows
-    assert set(rows.keywords) == {"keep_index", "block_split", "training_stride"}
+    # Five bound values, and each is something the page cannot recover from the arrays it is
+    # handed. The last two are the per-window score row's: taken from where the objective takes
+    # them -- the hyperparameter for the likelihood, the net for the coverage floor -- so a
+    # window's height on that row is the block score this run computed rather than one drawn under
+    # some other assumption.
+    assert set(rows.keywords) == {
+        "keep_index", "block_split", "training_stride", "likelihood", "coverage_floor",
+    }
     assert rows.keywords["block_split"] == 36
     assert rows.keywords["training_stride"] == module.orig_model.anchor_stride == TINY_STRIDE
+    assert rows.keywords["likelihood"] == module.hparams["likelihood"]
+    assert rows.keywords["coverage_floor"] == float(module.orig_model.coverage_floor)
 
 
 def test_the_input_panel_builder_is_a_module_level_function(task):

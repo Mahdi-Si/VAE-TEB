@@ -349,173 +349,180 @@ def build_sample_figure(
     rows = resolve_rows(("fhr", "up") if has_raw else ())
     grid = RowGrid(rows, t_max)
 
-    # ---- Raw FHR / UP context ------------------------------------------------
-    if grid.has("raw"):
-        ax, cax = grid.axes("raw")
-        ax.plot(time_raw, raw_fhr, color=COLOR_BLUE, linewidth=0.8, label="FHR")
+    # The figure exists from here on, so every exit below has to go through a close: a builder
+    # that raises mid-page leaves its caller no handle to reclaim it, and pyplot keeps every
+    # unclosed figure alive for the process.
+    try:
+        # ---- Raw FHR / UP context ------------------------------------------------
+        if grid.has("raw"):
+            ax, cax = grid.axes("raw")
+            ax.plot(time_raw, raw_fhr, color=COLOR_BLUE, linewidth=0.8, label="FHR")
+            twin = ax.twinx()
+            twin.plot(time_raw, raw_up, color=COLOR_GREEN, linewidth=0.8, label="UP")
+            ax.set_ylabel("FHR (normalised)", fontsize=8, color=COLOR_BLUE)
+            ax.tick_params(axis="y", labelcolor=COLOR_BLUE)
+            twin.set_ylabel("UP (normalised)", fontsize=8, color=COLOR_GREEN)
+            twin.tick_params(axis="y", labelcolor=COLOR_GREEN)
+            handles = ax.get_legend_handles_labels()
+            twin_handles = twin.get_legend_handles_labels()
+            ax.legend(handles[0] + twin_handles[0], handles[1] + twin_handles[1],
+                      loc="upper right", fontsize=7, framealpha=0.95)
+            style_axes(ax, grid="both")
+            grid.finalise(ax, "raw", "signals as loaded", warmup=warmup, T=T)
+            twin.set_xlim(0.0, t_max)
+            grid.hide_colorbar(cax)
+
+        # ---- Forecast, truth, residual -------------------------------------------
+        # The overlap-averaged rendering, so a per-anchor horizon tensor becomes something that can
+        # share the recording's own time axis with every other row.
+        forecast = average_forecast_per_channel(
+            np.asarray(to_numpy(outputs["mu_full"]), dtype=np.float32), T, int(horizon), int(warmup)
+        ).astype(np.float64)
+        truth = np.concatenate([y_st_np, y_ph_np], axis=-1)
+        residual = forecast - truth
+
+        # One limit across the forecast and target rows: they are the same quantity, and scaling
+        # them independently would make a badly-scaled forecast look like a well-scaled one.
+        paired = np.concatenate([forecast[np.isfinite(forecast)], truth[np.isfinite(truth)]])
+        shared_limit = safe_vabs(paired) if paired.size else 1.0
+
+        separator = n_scattering - 1 if 0 < n_scattering < n_channels else None
+        _channel_heatmap(
+            grid, "forecast", forecast.T, warmup=warmup, limit=shared_limit, separator=separator,
+            detail=f"overlap-averaged $\\mu_{{\\mathrm{{full}}}}$, {n_channels} channels, $H_d$={horizon}",
+            colorbar_label="value",
+        )
+        _channel_heatmap(
+            grid, "truth", truth.T, warmup=warmup, limit=shared_limit, separator=separator,
+            detail=f"$Y$, {n_channels} channels (scattering above row {n_scattering}, phase below)",
+            colorbar_label="value",
+        )
+        _channel_heatmap(
+            grid, "residual", residual.T, warmup=warmup, separator=separator,
+            detail="$\\mu_{\\mathrm{full}} - Y$, own colour range",
+            colorbar_label="residual",
+        )
+
+        # ---- Latent z ------------------------------------------------------------
+        latent = np.asarray(to_numpy(outputs["z"]), dtype=np.float64)
+        d_z = int(latent.shape[-1])
+        ax, cax = grid.axes("latent")
+        vabs_z = safe_vabs(latent.T)
+        image = ax.imshow(
+            latent.T, aspect="auto", cmap="bwr", origin="lower", vmin=-vabs_z, vmax=vabs_z,
+            extent=[0.0, t_max, -0.5, d_z - 0.5], interpolation="none",
+        )
+        ax.set_ylabel("Latent dim", fontsize=8)
+        _style_heatmap(ax)
+        grid.colorbar(cax, image, "z")
+        grid.finalise(ax, "latent", f"$d_z$={d_z}, one seeded draw", warmup=warmup, T=T)
+
+        # ---- Per-dimension KL ----------------------------------------------------
+        kld_per_dim = kld_per_dim_np(
+            np.asarray(to_numpy(outputs["mu_prior"]), dtype=np.float64),
+            np.asarray(to_numpy(outputs["logvar_prior"]), dtype=np.float64),
+            np.asarray(to_numpy(outputs["mu_post"]), dtype=np.float64),
+            np.asarray(to_numpy(outputs["logvar_post"]), dtype=np.float64),
+        )
+        kld_image = np.where(np.isfinite(kld_per_dim), kld_per_dim, 0.0).T
+        kld_max = float(kld_image.max()) if kld_image.size else 0.0
+        ax, cax = grid.axes("kld_dims")
+        image = ax.imshow(
+            kld_image, aspect="auto", cmap="magma", origin="lower",
+            vmin=0.0, vmax=kld_max if kld_max > 0.0 else 1.0,
+            extent=[0.0, t_max, -0.5, d_z - 0.5], interpolation="none",
+        )
+        ax.set_ylabel("Latent dim", fontsize=8)
+        _style_heatmap(ax)
+        grid.colorbar(cax, image, "KL (nats)")
+        grid.finalise(ax, "kld_dims", f"max {kld_max:.3g} nats", warmup=warmup, T=T)
+
+        # ---- Total K_t, with the attention entropy alongside ---------------------
+        kld_per_t = np.asarray(to_numpy(outputs["kld_per_t"]), dtype=np.float64).ravel()
+        alpha = np.asarray(to_numpy(outputs["attn_weights"]), dtype=np.float64)
+        mean_alpha = alpha.mean(axis=1)
+        n_lags = int(mean_alpha.shape[-1])
+        entropy = -(mean_alpha * np.log(mean_alpha + 1e-12)).sum(axis=-1)
+
+        ax, cax = grid.axes("kld_total")
+        ax.plot(time_dec, kld_per_t, color=COLOR_PURPLE, linewidth=1.0, label="$K_t$")
+        ax.set_ylabel("KL (nats)", fontsize=8, color=COLOR_PURPLE)
+        ax.tick_params(axis="y", labelcolor=COLOR_PURPLE)
         twin = ax.twinx()
-        twin.plot(time_raw, raw_up, color=COLOR_GREEN, linewidth=0.8, label="UP")
-        ax.set_ylabel("FHR (normalised)", fontsize=8, color=COLOR_BLUE)
-        ax.tick_params(axis="y", labelcolor=COLOR_BLUE)
-        twin.set_ylabel("UP (normalised)", fontsize=8, color=COLOR_GREEN)
-        twin.tick_params(axis="y", labelcolor=COLOR_GREEN)
+        twin.plot(time_dec, entropy, color=COLOR_ORANGE, linewidth=0.9, alpha=0.85,
+                  label="attention entropy")
+        twin.set_ylabel("Entropy (nats)", fontsize=8, color=COLOR_ORANGE)
+        twin.tick_params(axis="y", labelcolor=COLOR_ORANGE)
         handles = ax.get_legend_handles_labels()
         twin_handles = twin.get_legend_handles_labels()
         ax.legend(handles[0] + twin_handles[0], handles[1] + twin_handles[1],
                   loc="upper right", fontsize=7, framealpha=0.95)
         style_axes(ax, grid="both")
-        grid.finalise(ax, "raw", "signals as loaded", warmup=warmup, T=T)
+        grid.finalise(ax, "kld_total", "per-step KL against attention sharpness", warmup=warmup, T=T)
         twin.set_xlim(0.0, t_max)
         grid.hide_colorbar(cax)
 
-    # ---- Forecast, truth, residual -------------------------------------------
-    # The overlap-averaged rendering, so a per-anchor horizon tensor becomes something that can
-    # share the recording's own time axis with every other row.
-    forecast = average_forecast_per_channel(
-        np.asarray(to_numpy(outputs["mu_full"]), dtype=np.float32), T, int(horizon), int(warmup)
-    ).astype(np.float64)
-    truth = np.concatenate([y_st_np, y_ph_np], axis=-1)
-    residual = forecast - truth
+        # ---- Lag attention -------------------------------------------------------
+        ax, cax = grid.axes("attention")
+        image = ax.imshow(
+            mean_alpha.T, aspect="auto", cmap="viridis", origin="lower",
+            extent=[0.0, t_max, -0.5, n_lags - 0.5], interpolation="none",
+        )
+        ax.plot(time_dec, mean_alpha.argmax(axis=-1), color=COLOR_VERMILLION, linewidth=0.9,
+                alpha=0.9, label="argmax lag")
+        ax.set_ylabel(r"Lag $\ell$ (0 = current)", fontsize=8)
+        # Negated, matching every other lag figure. ``attach_lag_seconds_axis`` maps
+        # $\ell \mapsto s\ell + d$, while the pipeline's convention -- ``metrics.lag_to_seconds`` --
+        # is $s\ell - \Delta_{UP}$, because recovering the delay in the original recording means
+        # *undoing* the shift the dataset applied. Passing the shift through un-negated would label
+        # the same lag 40 s differently here than in ``attention/attention_heatmaps.pdf``.
+        attach_lag_seconds_axis(ax, step_seconds, -float(up_shift_secs))
+        ax.legend(loc="upper right", fontsize=7, framealpha=0.95)
+        _style_heatmap(ax)
+        grid.colorbar(cax, image, "attn prob")
+        grid.finalise(
+            ax, "attention", f"mean over {int(alpha.shape[1])} heads, $L$={n_lags}",
+            warmup=warmup, T=T,
+        )
 
-    # One limit across the forecast and target rows: they are the same quantity, and scaling
-    # them independently would make a badly-scaled forecast look like a well-scaled one.
-    paired = np.concatenate([forecast[np.isfinite(forecast)], truth[np.isfinite(truth)]])
-    shared_limit = safe_vabs(paired) if paired.size else 1.0
+        # ---- TE lag attribution --------------------------------------------------
+        # Column-normalised: the per-step KL varies over orders of magnitude across a recording, so
+        # a raw map is dominated by a few bright columns and the lag *selection* -- which is what
+        # this row exists to show -- is invisible everywhere else. Columns whose KL is effectively
+        # zero are left NaN so imshow draws them blank rather than amplifying rounding noise into a
+        # confident-looking pattern.
+        te_map = np.asarray(to_numpy(outputs["te_lag_map"]), dtype=np.float64).T
+        te_map = np.where(np.isfinite(te_map) & (te_map > 0.0), te_map, 0.0)
+        te_max = float(te_map.max()) if te_map.size else 0.0
+        column_max = te_map.max(axis=0, keepdims=True)
+        valid = column_max > max(1e-12, te_max * 1e-6)
+        te_norm = np.where(valid, te_map / np.where(valid, column_max, 1.0), np.nan)
 
-    separator = n_scattering - 1 if 0 < n_scattering < n_channels else None
-    _channel_heatmap(
-        grid, "forecast", forecast.T, warmup=warmup, limit=shared_limit, separator=separator,
-        detail=f"overlap-averaged $\\mu_{{\\mathrm{{full}}}}$, {n_channels} channels, $H_d$={horizon}",
-        colorbar_label="value",
-    )
-    _channel_heatmap(
-        grid, "truth", truth.T, warmup=warmup, limit=shared_limit, separator=separator,
-        detail=f"$Y$, {n_channels} channels (scattering above row {n_scattering}, phase below)",
-        colorbar_label="value",
-    )
-    _channel_heatmap(
-        grid, "residual", residual.T, warmup=warmup, separator=separator,
-        detail="$\\mu_{\\mathrm{full}} - Y$, own colour range",
-        colorbar_label="residual",
-    )
+        ax, cax = grid.axes("te_lag")
+        image = ax.imshow(
+            te_norm, aspect="auto", cmap="viridis", origin="lower", vmin=0.0, vmax=1.0,
+            extent=[0.0, t_max, -0.5, n_lags - 0.5], interpolation="none",
+        )
+        ax.set_ylabel(r"Lag $\ell$ (0 = current)", fontsize=8)
+        # Negated, matching every other lag figure. ``attach_lag_seconds_axis`` maps
+        # $\ell \mapsto s\ell + d$, while the pipeline's convention -- ``metrics.lag_to_seconds`` --
+        # is $s\ell - \Delta_{UP}$, because recovering the delay in the original recording means
+        # *undoing* the shift the dataset applied. Passing the shift through un-negated would label
+        # the same lag 40 s differently here than in ``attention/attention_heatmaps.pdf``.
+        attach_lag_seconds_axis(ax, step_seconds, -float(up_shift_secs))
+        _style_heatmap(ax)
+        grid.colorbar(cax, image, "column-norm")
+        grid.finalise(
+            ax, "te_lag",
+            f"{te_lag_label}, column-normalised (max {te_max:.3g} nats)",
+            warmup=warmup, T=T,
+        )
 
-    # ---- Latent z ------------------------------------------------------------
-    latent = np.asarray(to_numpy(outputs["z"]), dtype=np.float64)
-    d_z = int(latent.shape[-1])
-    ax, cax = grid.axes("latent")
-    vabs_z = safe_vabs(latent.T)
-    image = ax.imshow(
-        latent.T, aspect="auto", cmap="bwr", origin="lower", vmin=-vabs_z, vmax=vabs_z,
-        extent=[0.0, t_max, -0.5, d_z - 0.5], interpolation="none",
-    )
-    ax.set_ylabel("Latent dim", fontsize=8)
-    _style_heatmap(ax)
-    grid.colorbar(cax, image, "z")
-    grid.finalise(ax, "latent", f"$d_z$={d_z}, one seeded draw", warmup=warmup, T=T)
-
-    # ---- Per-dimension KL ----------------------------------------------------
-    kld_per_dim = kld_per_dim_np(
-        np.asarray(to_numpy(outputs["mu_prior"]), dtype=np.float64),
-        np.asarray(to_numpy(outputs["logvar_prior"]), dtype=np.float64),
-        np.asarray(to_numpy(outputs["mu_post"]), dtype=np.float64),
-        np.asarray(to_numpy(outputs["logvar_post"]), dtype=np.float64),
-    )
-    kld_image = np.where(np.isfinite(kld_per_dim), kld_per_dim, 0.0).T
-    kld_max = float(kld_image.max()) if kld_image.size else 0.0
-    ax, cax = grid.axes("kld_dims")
-    image = ax.imshow(
-        kld_image, aspect="auto", cmap="magma", origin="lower",
-        vmin=0.0, vmax=kld_max if kld_max > 0.0 else 1.0,
-        extent=[0.0, t_max, -0.5, d_z - 0.5], interpolation="none",
-    )
-    ax.set_ylabel("Latent dim", fontsize=8)
-    _style_heatmap(ax)
-    grid.colorbar(cax, image, "KL (nats)")
-    grid.finalise(ax, "kld_dims", f"max {kld_max:.3g} nats", warmup=warmup, T=T)
-
-    # ---- Total K_t, with the attention entropy alongside ---------------------
-    kld_per_t = np.asarray(to_numpy(outputs["kld_per_t"]), dtype=np.float64).ravel()
-    alpha = np.asarray(to_numpy(outputs["attn_weights"]), dtype=np.float64)
-    mean_alpha = alpha.mean(axis=1)
-    n_lags = int(mean_alpha.shape[-1])
-    entropy = -(mean_alpha * np.log(mean_alpha + 1e-12)).sum(axis=-1)
-
-    ax, cax = grid.axes("kld_total")
-    ax.plot(time_dec, kld_per_t, color=COLOR_PURPLE, linewidth=1.0, label="$K_t$")
-    ax.set_ylabel("KL (nats)", fontsize=8, color=COLOR_PURPLE)
-    ax.tick_params(axis="y", labelcolor=COLOR_PURPLE)
-    twin = ax.twinx()
-    twin.plot(time_dec, entropy, color=COLOR_ORANGE, linewidth=0.9, alpha=0.85,
-              label="attention entropy")
-    twin.set_ylabel("Entropy (nats)", fontsize=8, color=COLOR_ORANGE)
-    twin.tick_params(axis="y", labelcolor=COLOR_ORANGE)
-    handles = ax.get_legend_handles_labels()
-    twin_handles = twin.get_legend_handles_labels()
-    ax.legend(handles[0] + twin_handles[0], handles[1] + twin_handles[1],
-              loc="upper right", fontsize=7, framealpha=0.95)
-    style_axes(ax, grid="both")
-    grid.finalise(ax, "kld_total", "per-step KL against attention sharpness", warmup=warmup, T=T)
-    twin.set_xlim(0.0, t_max)
-    grid.hide_colorbar(cax)
-
-    # ---- Lag attention -------------------------------------------------------
-    ax, cax = grid.axes("attention")
-    image = ax.imshow(
-        mean_alpha.T, aspect="auto", cmap="viridis", origin="lower",
-        extent=[0.0, t_max, -0.5, n_lags - 0.5], interpolation="none",
-    )
-    ax.plot(time_dec, mean_alpha.argmax(axis=-1), color=COLOR_VERMILLION, linewidth=0.9,
-            alpha=0.9, label="argmax lag")
-    ax.set_ylabel(r"Lag $\ell$ (0 = current)", fontsize=8)
-    # Negated, matching every other lag figure. ``attach_lag_seconds_axis`` maps
-    # $\ell \mapsto s\ell + d$, while the pipeline's convention -- ``metrics.lag_to_seconds`` --
-    # is $s\ell - \Delta_{UP}$, because recovering the delay in the original recording means
-    # *undoing* the shift the dataset applied. Passing the shift through un-negated would label
-    # the same lag 40 s differently here than in ``attention/attention_heatmaps.pdf``.
-    attach_lag_seconds_axis(ax, step_seconds, -float(up_shift_secs))
-    ax.legend(loc="upper right", fontsize=7, framealpha=0.95)
-    _style_heatmap(ax)
-    grid.colorbar(cax, image, "attn prob")
-    grid.finalise(
-        ax, "attention", f"mean over {int(alpha.shape[1])} heads, $L$={n_lags}",
-        warmup=warmup, T=T,
-    )
-
-    # ---- TE lag attribution --------------------------------------------------
-    # Column-normalised: the per-step KL varies over orders of magnitude across a recording, so
-    # a raw map is dominated by a few bright columns and the lag *selection* -- which is what
-    # this row exists to show -- is invisible everywhere else. Columns whose KL is effectively
-    # zero are left NaN so imshow draws them blank rather than amplifying rounding noise into a
-    # confident-looking pattern.
-    te_map = np.asarray(to_numpy(outputs["te_lag_map"]), dtype=np.float64).T
-    te_map = np.where(np.isfinite(te_map) & (te_map > 0.0), te_map, 0.0)
-    te_max = float(te_map.max()) if te_map.size else 0.0
-    column_max = te_map.max(axis=0, keepdims=True)
-    valid = column_max > max(1e-12, te_max * 1e-6)
-    te_norm = np.where(valid, te_map / np.where(valid, column_max, 1.0), np.nan)
-
-    ax, cax = grid.axes("te_lag")
-    image = ax.imshow(
-        te_norm, aspect="auto", cmap="viridis", origin="lower", vmin=0.0, vmax=1.0,
-        extent=[0.0, t_max, -0.5, n_lags - 0.5], interpolation="none",
-    )
-    ax.set_ylabel(r"Lag $\ell$ (0 = current)", fontsize=8)
-    # Negated, matching every other lag figure. ``attach_lag_seconds_axis`` maps
-    # $\ell \mapsto s\ell + d$, while the pipeline's convention -- ``metrics.lag_to_seconds`` --
-    # is $s\ell - \Delta_{UP}$, because recovering the delay in the original recording means
-    # *undoing* the shift the dataset applied. Passing the shift through un-negated would label
-    # the same lag 40 s differently here than in ``attention/attention_heatmaps.pdf``.
-    attach_lag_seconds_axis(ax, step_seconds, -float(up_shift_secs))
-    _style_heatmap(ax)
-    grid.colorbar(cax, image, "column-norm")
-    grid.finalise(
-        ax, "te_lag",
-        f"{te_lag_label}, column-normalised (max {te_max:.3g} nats)",
-        warmup=warmup, T=T,
-    )
-
-    heading = f"guid {guid}" if epoch is None else f"guid {guid}, epoch {epoch}"
-    grid.figure.suptitle(
-        f"Sample diagnostics — {heading}", fontsize=11, color=COLOR_GRAY, y=0.995
-    )
-    return grid.figure
+        heading = f"guid {guid}" if epoch is None else f"guid {guid}, epoch {epoch}"
+        grid.figure.suptitle(
+            f"Sample diagnostics — {heading}", fontsize=11, color=COLOR_GRAY, y=0.995
+        )
+        return grid.figure
+    except BaseException:
+        plt.close(grid.figure)
+        raise

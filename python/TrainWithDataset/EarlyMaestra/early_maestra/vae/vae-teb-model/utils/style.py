@@ -236,8 +236,17 @@ def save_figure(fig: Any, path: Any, *, dpi: Optional[int] = None,
         path: Output file path.
         dpi: Override DPI (defaults to ``SAVE_DPI``).
         close: Whether to close the figure after saving.
+
+    Note:
+        The close runs in a ``finally``. ``close=True`` means the caller has handed the figure
+        over, and a save that raises -- an unwritable path, a full disk, a layout error inside
+        ``bbox_inches="tight"`` -- must not be the one path that keeps it alive: pyplot holds
+        every unclosed figure in a global registry, and the caller has already given up its
+        handle. On the success path this is exactly the previous behaviour.
     """
-    fig.savefig(str(path), dpi=dpi or SAVE_DPI, bbox_inches="tight",
-                pad_inches=0.05)
-    if close:
-        plt.close(fig)
+    try:
+        fig.savefig(str(path), dpi=dpi or SAVE_DPI, bbox_inches="tight",
+                    pad_inches=0.05)
+    finally:
+        if close:
+            plt.close(fig)

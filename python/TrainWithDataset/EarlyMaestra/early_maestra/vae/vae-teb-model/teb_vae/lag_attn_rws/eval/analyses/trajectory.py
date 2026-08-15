@@ -298,12 +298,17 @@ def _draw_whole_delivery(ax: Any, trajectory: pd.DataFrame, *, guid: Optional[st
     cell = trajectory[trajectory["guid"].astype(str) == str(chosen)].sort_values("t_abs_sec")
     hours = np.asarray(cell["hours_before_delivery"], dtype=np.float64)
     gaps = np.asarray(cell["gap_before_s"], dtype=np.float64)
+    # A break is the gap *before* a sample, so overwriting that sample with NaN to draw the break
+    # discards a measured value -- the first point after every gap was never drawn. Inserting the
+    # NaN instead breaks the line between the two samples and keeps both. Loop-invariant, so it is
+    # computed once here rather than per readout.
+    breaks = np.flatnonzero(np.isfinite(gaps) & (gaps > BREAK_TOLERANCE_S))
+    hours_with_breaks = np.insert(hours, breaks, np.nan)
     for name, column, _ in READOUTS:
         if column not in cell.columns:
             continue
-        values = np.asarray(cell[column], dtype=np.float64).copy()
-        values[np.isfinite(gaps) & (gaps > BREAK_TOLERANCE_S)] = np.nan
-        ax.plot(hours, values, linewidth=figures.LINE_REGULAR, label=name)
+        values = np.insert(np.asarray(cell[column], dtype=np.float64), breaks, np.nan)
+        ax.plot(hours_with_breaks, values, linewidth=figures.LINE_REGULAR, label=name)
     ax.set_title(f"Whole-delivery trajectory: {chosen}")
     ax.set_xlabel("Time before delivery (hours)")
     ax.set_ylabel("nats per anchor")
