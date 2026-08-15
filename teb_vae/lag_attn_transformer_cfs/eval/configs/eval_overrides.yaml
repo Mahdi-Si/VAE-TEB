@@ -1,0 +1,282 @@
+# The evaluation override delta, merged OVER a checkpoint's own resolved_config.yaml.
+#
+# This is not a config: it has no `base:` key and it does not stand alone. A training run writes
+# its fully resolved configuration beside its checkpoints, and that file is the record of what
+# the model was trained on — the geometry, the warm-up budget it resolved to, the normalisation
+# statistics, the objective. The evaluation reads it and deep-merges this delta on top, so the
+# run's own contract stays authoritative and everything that genuinely differs is one small
+# reviewable file.
+#
+# A `base:` chain cannot do that job: `base:` resolves relative to the file naming it, and the
+# checkpoint's resolved config is a runtime path no committed file can reference. Pointing it at
+# the shipped default.yaml instead would evaluate against what a config file currently says
+# rather than what the run trained under. `load_eval_overrides` refuses a `base:` key here.
+#
+# This is the conv-Transformer cell's delta. It is deliberately the conv-LSTM cell's, key for key
+# and value for value, and `tests/test_eval_binding.py` asserts that: the two models are compared
+# against each other, so a holdout split, a Monte Carlo draw count or a retention cap that differed
+# between them would make every side-by-side number a comparison of two protocols rather than of two
+# architectures. Only the comments below differ, where a value needed re-justifying against this
+# architecture's costs. This cell registers no extra analysis, so unlike the raw pair's deltas there
+# is not even a cap here that the sibling's file does not carry.
+#
+# Run from the repo root:
+#   python -m teb_vae.lag_attn_transformer_cfs.eval.probe --checkpoint <run>/model_checkpoints/<name>.ckpt
+
+general_config:
+  batch_size:
+    # 32, not the training 128. Under no_grad the activation retention that dominates training is
+    # gone, but the transients are not: the pass decodes four scored branches over
+    # A = 152 anchors x H = 15 steps x C_keep = 98 channels at K Monte Carlo draws, which is two
+    # ~894 KB tensors per branch per draw — about 1.8 MB per batch element — plus the (T, M, L)
+    # attention weights at (300, 4, 91). That is roughly 1.7x the raw cells' per-sample decode, and
+    # 32 still leaves the transient under 60 MB, so the sibling's value transfers rather than being
+    # halved on an argument nobody measured.
+    #
+    # Kept at the conv-LSTM cell's 32 rather than inherited without thought, because this model adds
+    # a cost the recurrent encoder did not have: encoder self-attention is O(B T^2 d) at T = 300,
+    # quadratic where the LSTM was linear. It stays 32 because that cost is TIME rather than memory —
+    # `CausalSelfAttention` runs through fused `scaled_dot_product_attention`, which never
+    # materialises the (B, H_e, T, T) probability tensor, so peak memory is linear in B exactly as it
+    # was. A smaller batch would make every run slower without making any of them fit, and it would
+    # put this model's runs on a different loader shape from the cell it is compared against.
+    #
+    # `test` is the key GraphDataModule actually reads for the eval loader. A batch size placed
+    # under `eval_config` would be a dead key and the loader would quietly run at 128, which is
+    # the exact configuration this bound exists to avoid. Results are batch-size-invariant — this
+    # architecture's normalisers are RMSNorm and LayerNorm, no BatchNorm — so this costs only time.
+    test: 32
+
+dataset_config:
+  # REPOINT THESE, exactly as in default.yaml and for the same reason: the placeholder paths do
+  # not exist, so a run fails on a missing file rather than on a `transform` refusal someone might
+  # "fix" by dropping the warm-up budget. Preflight additionally refuses any path still containing
+  # REPOINT_ME, so the failure names the real cause.
+  #
+  # These are the CAUSAL k-fold HOLDOUT split — one HDF5 per canonical subgroup, all eight, all
+  # three clinical classes — rather than the healthy-only pretraining test files default.yaml
+  # points at. One pool, no fold loop, no double counting. Two consequences travel with it and
+  # are recorded in every summary: the checkpoint trains on `pre_training_dataset/*`, which is
+  # disjoint from this cohort, so evaluation is leakage-free; and the model has never seen
+  # ACIDOSIS or HIE, so every class contrast is an out-of-distribution comparison rather than
+  # held-out discrimination.
+  #
+  # They must be the CAUSAL variant, and that is not a preference: the two-sided files carry every
+  # one of these field names and dtypes, and only the root `transform` attribute and the stored
+  # widths (36/66/36/15 against 43/66/43/15) tell them apart. Evaluating a two-sided shard would
+  # report a causal model on coefficients containing their own future. Preflight refuses on both
+  # the attribute and the widths.
+  #
+  # The dataset pipeline's default build mode is `augmented`, which writes per-fold test splits
+  # instead of this `test/` directory. If it is absent, that is the reason.
+  vae_test_datasets:
+    - /data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_causal/k_fold_cross_validation_dataset/test/healthy_no_bg_no_cs.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_causal/k_fold_cross_validation_dataset/test/healthy_no_bg_cs.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_causal/k_fold_cross_validation_dataset/test/healthy_bg_no_cs.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_causal/k_fold_cross_validation_dataset/test/healthy_bg_cs.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_causal/k_fold_cross_validation_dataset/test/acidosis_no_cs.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_causal/k_fold_cross_validation_dataset/test/acidosis_cs.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_causal/k_fold_cross_validation_dataset/test/hie_no_cs.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_causal/k_fold_cross_validation_dataset/test/hie_cs.hdf5
+
+  # REPOINTED, which the raw cells' delta deliberately does NOT do — and the difference is this
+  # cell's whole premise rather than a convenience. The causal statistics are accumulated
+  # EXCLUDING each channel's warm-up region, so zero is the channel mean over the region the model
+  # actually reads; that is exactly what makes `climatology = 0` the right feature-space baseline
+  # and what makes the source-null control a floor rather than a leak. A statistics file
+  # accumulated over the warm-up, or one from the two-sided variant, breaks both silently: every
+  # shape is right and every number is wrong.
+  #
+  # It must be regenerated by `hdf5_dataset/calculate_dataset_stats.py` from THESE shards at the
+  # run's own `trim_minutes` (1.0). Note the key is `stat_path` while the loader parameter is
+  # `stats_path`: a typo'd `stats_path:` here yields None and silently disables normalization.
+  stat_path: /data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_causal/k_fold_cross_validation_dataset/stats.hdf5
+
+  dataloader_config:
+    dataset_kwargs:
+      # A list replaces wholesale on merge, so the inherited fields are restated rather than
+      # extended. Four are added on top of the training contract, and every clinical question in
+      # this pipeline needs one of them: `target` recovers the class code (as a ratio against
+      # `weight`, never read directly), `cs_label`/`bg_label` are the subgroup cuts, and
+      # `time_from_labor_onset` is NaN wherever the GUID is absent from the labour-onset table.
+      #
+      # `guid` AND `epoch` are restated here rather than dropped, and on this cell that is
+      # load-bearing twice over. They key the per-recording aggregation and the trajectory axis, as
+      # in the raw cells — and they also key the anchor tiling's per-segment phase, which
+      # `load_fields` is honoured literally for with no forced additions. Drop either and every
+      # segment lands on one tile grid with no shape, no count and no metric differing.
+      #
+      # Four of these are loaded although the model reads none of them, and each has exactly one
+      # consumer here, so none of them is a leftover from the raw cells' list:
+      #   `up`     (B, 4800)  the contraction detector, whose output becomes
+      #                       `seconds_since_contraction` on the per-anchor table and drives
+      #                       contraction-conditioned coupling. A contraction exists nowhere in the
+      #                       tables unless the one pass holding the raw trace puts it there.
+      #   `fhr`    (B, 4800)  row 1 of the diagnostic page — the physiological context a reader of
+      #                       a page needs, on a page whose other rows are all coefficients.
+      #   `weight` (B, 300)   the ONLY trustworthy validity signal: these coefficients carry no gap
+      #                       sentinel of their own, so it gates every mask, every baseline and
+      #                       every event.
+      #   `target` (B, 300)   the class code, scaled by validity.
+      #
+      # The loader SKIPS a field a shard does not carry, silently, so presence is asserted after
+      # the first batch rather than assumed from this list.
+      #
+      # The cross-channel FHRxUP phase-harmonic block is absent twice over: a coefficient mixing
+      # both signals would destroy the target-only / source-conditioned separation the whole design
+      # rests on, and the causal variant does not store it at all.
+      load_fields:
+        [
+          'fhr',
+          'up',
+          'fhr_st',
+          'fhr_ph',
+          'up_ph',
+          'up_st',
+          'weight',
+          'guid',
+          'epoch',
+          'target',
+          'cs_label',
+          'bg_label',
+          'time_from_labor_onset',
+        ]
+
+      # 0, and it is already default.yaml's value — restated because this block is where a reader
+      # looks for it and because the reason is different under evaluation. Under training the cache
+      # is per-worker; at num_workers: 0 it becomes main-process RAM, and it is FIFO with no reuse
+      # policy, so against a test split larger than the cache it thrashes and buys nothing.
+      cache_size: 0
+
+      # Not restated, deliberately. `num_workers` is forced to 0 in code with a warning (spawn
+      # workers over a multi-file HDF5 dataset silently truncate every pass after the first).
+      # `epoch_min: -48000` / `epoch_max: null` / `label: null` are already correct in
+      # default.yaml: `epoch` is negative and the dataset floor is -44640 s, so the minimum is a
+      # no-op, and `label` filters by exact float equality against a weight-scaled target and
+      # would quietly drop every partially-valid segment. Restating them here would create a
+      # second place for them to be wrong.
+      #
+      # `trim_minutes: 1.0` is likewise inherited and NOT restated, and on this cell it decides
+      # more than normalisation: the stored per-channel warm-up vectors are rebased by exactly this
+      # trim, so it places every channel's validity boundary. A uniformly wrong rebase moves the
+      # anchor floor and the boundary together and every warm-fraction readout still reports 1.0.
+      # `resolve_warmup_budget` cross-checks it against `sequence_length`; preflight re-resolves
+      # the whole budget against these shards and compares it with the checkpoint's stamped tuples.
+      #
+      # `normalize_fields` is inherited too, and `fhr_st` / `fhr_ph` being in it is a correctness
+      # requirement rather than a preference: they are this model's TARGET, and an un-z-scored
+      # target makes the Gaussian NLL meaningless with the loader raising nothing on its own.
+
+# Evaluation-only settings. Everything that shapes a run lives here rather than in argv, because
+# this block is dumped into the run directory and is the durable record; a value injected from
+# Python would appear in neither that dump nor MLflow.
+#
+# Every key is validated at load: an unknown key raises and names the valid set, so a misspelling
+# cannot silently mean "no cap".
+eval_config:
+  # Seeds random, numpy and torch, and is recorded in summary.json. The predictive scores draw z,
+  # so an unseeded run reports different numbers for the same checkpoint.
+  seed: 42
+
+  # Monte Carlo draws per anchor for the marginalised predictive score, under common random
+  # numbers across the four scored branches. The specification's starting value, not a measured
+  # optimum; K = 1 reduces the estimator exactly to the training-path single-draw score. The fifth
+  # branch — `kld_source_null` — is a KL readout and is never decoded, so K does not multiply it.
+  num_mc_samples: 8
+
+  # Global cap on the samples any analysis sees. null evaluates the whole split. A cap is drawn
+  # STRATIFIED, never as a prefix: the loader is unshuffled over eight concatenated per-subgroup
+  # files, so a prefix cap yields one subgroup and one class.
+  max_samples: null
+
+  # Per-analysis retention caps for the analyses that hold per-sample tensors. A cap of 0 is
+  # refused, because an empty analysis that still reports success is indistinguishable in the
+  # output from one that found nothing.
+  #
+  # Retention is opt-in: a quantity absent from here is retained for NO samples. Four names are
+  # read:
+  #
+  #   waveforms  the per-anchor forecast blocks (truth, both branches and the full branch's
+  #              log-variance) plus the raw UP trace and its weight. The forecast overlay and the
+  #              whole event analysis are silent without it, and it bounds their RUNTIME as well as
+  #              their memory.
+  #   attention  the (T, M, L) attention weights, behind the lag heatmap.
+  #   pages      how many stratified per-sample diagnostic pages to render. Unlike the other two
+  #              this retains nothing; it caps a figure count, and the pages are re-rendered from
+  #              the loader rather than read off a retained array.
+  #   oracle     how many segments the sufficiency probe caches encoder states for.
+  #              THE ONLY CAP HERE WHOSE ABSENCE DOES NOT MEAN ZERO: absent means every segment,
+  #              because a probe fitted on nothing is not a cheaper measurement but no measurement.
+  #
+  # Contraction-CONDITIONED coupling needs none of them: the contraction timing travels on the
+  # per-anchor table for every anchor of the split.
+  #
+  # Set rather than empty, so a stock run emits the COMPLETE artifact set: an empty block silently
+  # skips the forecast overlay, the whole event analysis, the lag heatmap and the per-sample pages,
+  # and a directory missing a figure reads like a model that had nothing to show rather than a run
+  # that was never asked. The values are bounds on retention, not on what is measured.
+  #
+  #   waveforms  64  HALVED from the raw cells' 128. A retained set here is four (152, 15, 98) fp32
+  #                  tensors, ~3.4 MiB per sample against their ~2.0 MiB, so 64 holds about the
+  #                  same ~220 MB. Lower it first if a box is tight.
+  #   attention  64  unchanged; ~437 KB per sample at (T, M, L) = (300, 4, 91), which this cell
+  #                  shares with the raw ones.
+  #   pages      24  a figure count; retains nothing.
+  #
+  # `oracle` stays ABSENT on purpose, and that is not an oversight: it is the one cap whose absence
+  # means EVERY segment, so naming a number here would REDUCE what the sufficiency probe is fitted
+  # on. Absent is the complete setting.
+  caps:
+    waveforms: 64
+    attention: 64
+    pages: 24
+
+  # How much worse, in nats per anchor, a forecast from a stranger's prior latent must be before
+  # the prior is credited with carrying the target's predictive state. Explicitly provisional:
+  # where that boundary actually sits is what the first converged run answers, so the verdict
+  # always reports the measured degradation beside this number.
+  prior_shuffle_min_nats: 1.0
+
+  # Latent dimensions that must clear the per-dimension activity epsilon for the latent to count
+  # as uncollapsed.
+  min_active_dims: 2
+
+  # Seconds after a detected contraction within which an anchor counts as event-conditioned.
+  # Kept at the raw cells' 120.0 rather than halved with this cell's horizon: the window is the
+  # interval over which a contraction could still influence what is being predicted, which is a
+  # property of the physiology rather than of a 15-step forecast block. Halving it would also make
+  # the contraction-conditioned readouts non-comparable across cells for a reason that has nothing
+  # to do with the target domain. Two of this cell's horizons (15 steps x 4 s = 60 s) fit in it.
+  event_lag_window_s: 120.0
+
+  # Resamples behind every bootstrap interval, drawn over RECORDINGS. Recordings, not anchors: at
+  # the dense anchor set consecutive forecast windows overlap in 14 of their 15 steps, so
+  # resampling anchors would report an interval narrower than the data supports by that factor.
+  bootstrap_resamples: 2000
+
+  # THE MARGIN, IN NATS PER ANCHOR, THAT THE AVAILABILITY-CLOCK DIFFERENCE MUST CLEAR, AND IT
+  # SHIPS UNSET.
+  #
+  # The hazard it gates is this cell's alone. The source availability pattern is a deterministic
+  # function of t, identical in every row of a batch, and it enters q(z | Y, U) but not
+  # p(z | Y) — so the posterior can be pushed off the prior by the availability CLOCK alone, with
+  # no source information in it. The permutation control deranges rows, and no permutation of rows
+  # can remove something every row shares. `source_null` measures what is left after the clock:
+  #
+  #   Delta_clock = source_conditioned_kl_raw - kld_source_null
+  #
+  # per recording, bootstrapped over recordings, and `coupling_exceeds_availability_clock` FAILs
+  # when the lower end of that interval does not clear this key.
+  #
+  # null is the SETTING, not an omission. Where the boundary belongs is exactly what the first
+  # production runs on the causal holdout split are supposed to measure, and a provisional number
+  # would decide a FAIL on that run — a gate whose threshold is a guess either fails a healthy
+  # model or passes a broken one, and nobody can tell which from the output. Unset, the verdict is
+  # INCONCLUSIVE and the analysis still emits the measured difference, both interval ends and the
+  # positive fraction; `coupling_minus_clock_nats` is a headline scalar whatever this key says, so
+  # the arm tables carry it from the first run and the threshold can be set from them.
+  #
+  # Setting it is therefore a deliberate act with a value someone can defend. Validated when set:
+  # it must be a finite number of at least 0.001 nats, because zero passes on any non-negative
+  # difference and a negative value can never fail at all.
+  clock_margin_min_nats: null

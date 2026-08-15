@@ -411,6 +411,10 @@ class LagAttnRwsPlotCallback(Callback):
         # supplies its own builder, and a model over the shipped blocks names none and gets the
         # shipped one.
         panel_builder = getattr(pl_module, "input_stream_panels", None)
+        # And the rows that seam draws *beyond* the two the layout always reserves. Resolved off
+        # the module beside the builder that draws into them, so the names the layout creates and
+        # the names the drawing asks for arrive from one object and cannot disagree.
+        extra_rows = tuple(getattr(pl_module, "forecast_extra_rows", ()) or ())
 
         for index in range(min(self.num_examples, int(inputs[0].shape[0]))):
             guid = _guid_of(batch, index)
@@ -438,6 +442,7 @@ class LagAttnRwsPlotCallback(Callback):
                 # through the model's own gates. Built per sample rather than once for the batch
                 # so the row is the recording the rest of the page is about.
                 input_streams=input_stream_panels(model, inputs, index, panel_builder),
+                forecast_extra_rows=extra_rows,
             )
             path = self.output_dir / (
                 f"lag_attn_rws_epoch{epoch:04d}_sample{index}_{guid[:16]}.{self.file_format}"

@@ -108,6 +108,7 @@ __all__ = [
     "build_diagnostic_figure",
     "raw_context_row",
     "raw_forecast_rows",
+    "top_down_extent",
 ]
 
 #: The two row names the forecast seam owns. Named constants rather than literals repeated in a
@@ -148,6 +149,32 @@ _IMSHOW_INTERPOLATION = "none"
 #: function of assumed pre-recording history -- and a row that called that a delay would name the
 #: wrong thing on the only axis the row is read by.
 DELAY_STAIRCASE_LABEL = "guard: first step with data, $\\delta_c$"
+
+
+def top_down_extent(x_left: float, x_right: float, n_channels: int) -> List[float]:
+    r"""The ``imshow`` extent that puts channel $0$ at the **top** of a channel axis.
+
+    Every channel axis in this family reads top-down, because the stored order is canonical and
+    ascending -- a scattering block opens with $S_0$ and continues in descending centre frequency,
+    a phase block runs in ascending pair order -- so the first coefficient belongs at the first
+    line a reader's eye lands on, and the two blocks stack in the order they are concatenated in.
+    Written once because eight panels across three packages have to agree: two input rows, the
+    per-anchor error map, and the causal page's five stitched forecast fields. Two of them getting
+    it right and one not is a figure whose channel $0$ is in a different place on two rows of the
+    same page, which is the kind of disagreement nobody checks for.
+
+    Pair it with ``origin='upper'``: the extent alone flips the axis but leaves the array's first
+    row drawn at the bottom, which inverts the data instead of the axis.
+
+    Args:
+        x_left: Left edge of the extent, in the panel's own x-units.
+        x_right: Right edge, same units.
+        n_channels: How many channels the axis carries.
+
+    Returns:
+        The four-element extent, with cell centres at integer channel indices.
+    """
+    return [x_left, x_right, n_channels - 0.5, -0.5]
 
 
 def _denormalised(
@@ -288,9 +315,12 @@ def _input_stream_row(ax: Any, panel: InputStreamPanel, *, t_max: float, seconds
     if not high > low:
         high = low + 1.0
 
+    # Channel $0$ at the **top** -- see :func:`top_down_extent`. Nothing else on the row moves:
+    # the dividers, the block ticks and the staircase below are all in channel coordinates, and
+    # only the direction of the axis changes.
     image = ax.imshow(
-        values.T, aspect="auto", cmap="viridis", origin="lower",
-        vmin=low, vmax=high, extent=[0.0, t_max, -0.5, n_channels - 0.5],
+        values.T, aspect="auto", cmap="viridis", origin="upper",
+        vmin=low, vmax=high, extent=top_down_extent(0.0, t_max, n_channels),
         interpolation=_IMSHOW_INTERPOLATION,
     )
 
@@ -356,8 +386,14 @@ class ForecastRowInputs:
         time_raw: The raw-grid time axis in seconds.
         t_max: The recording's length in seconds; the right edge of every row.
         row_axes: Maps a row name to its ``(main, cax)`` axes pair. The two names these rows own
-            are :data:`RAW_ROW` and :data:`FORECAST_ROW`.
+            are :data:`RAW_ROW` and :data:`FORECAST_ROW`, plus whatever the caller asked for
+            through ``forecast_extra_rows``.
         finalise_time_axis: Pins the shared time axis and shades the warm-up.
+        attach_cbar: Attaches a labelled colorbar for an image onto a row's reserved cax, with the
+            page's own tick and label styling. Passed rather than reimplemented for the same
+            reason the two above are: an implementation that styled its own would put a
+            differently-sized colorbar beside rows that are supposed to be exactly as wide.
+        heatmap_spines: Draws all four spines on a heatmap axes and turns its grid off.
     """
 
     outs: Dict[str, Any]
@@ -371,6 +407,8 @@ class ForecastRowInputs:
     t_max: float
     row_axes: Callable[[str], Tuple[Any, Any]]
     finalise_time_axis: Callable[..., None]
+    attach_cbar: Callable[[Any, Any, str], None]
+    heatmap_spines: Callable[[Any], None]
 
 
 def raw_context_row(rows: ForecastRowInputs, fhr_values: torch.Tensor) -> Tuple[np.ndarray, str]:
@@ -552,6 +590,7 @@ def build_diagnostic_figure(
     forecast_rows: Optional[Callable[[ForecastRowInputs], None]] = None,
     batch: Any = None,
     input_streams: Optional[Sequence[InputStreamPanel]] = None,
+    forecast_extra_rows: Sequence[Tuple[str, float]] = (),
 ) -> Any:
     r"""Build the seven-row diagnostic figure for one sample.
 
@@ -590,6 +629,13 @@ def build_diagnostic_figure(
         input_streams: The model's gated input streams, one row each, drawn between the forecast
             and the latent. ``None`` or empty -- the default, so every existing caller is
             unaffected -- draws the seven rows alone.
+        forecast_extra_rows: ``(name, height_ratio)`` per additional row ``forecast_rows`` draws,
+            reserved immediately below :data:`FORECAST_ROW` and reachable through ``row_axes``
+            under those names. Empty -- the default -- leaves the layout exactly as it was, which
+            is what keeps the three pages that need no extra rows unedited. Supplied by the same
+            implementation that draws into them, because a name reserved here and not drawn is a
+            blank row and a name drawn and not reserved is a ``KeyError`` inside a callback that
+            swallows exceptions to protect the fit.
 
     Returns:
         The matplotlib ``Figure``. The caller saves and closes it.
@@ -623,6 +669,10 @@ def build_diagnostic_figure(
         # Taller than the other line rows: it now carries the whole recording rather than one
         # 480-sample window, and two forecasts with their bands on top of it.
         ("forecast", 1.3),
+        # Whatever else the forecast seam asked for, directly below its own row so the block about
+        # what the model predicted stays contiguous, and above the input rows so those still sit
+        # against the latent they feed.
+        *((str(name), float(height)) for name, height in forecast_extra_rows),
         *((f"input_{panel.name}", 1.25) for panel in panels),
         ("latent", 1.2),
         ("kld_dims", 1.1),
@@ -633,223 +683,236 @@ def build_diagnostic_figure(
     height_ratios = [height for _, height in row_specs]
     figure_height = sum(height_ratios) * 2.6
     fig = plt.figure(figsize=(14, figure_height))
-    # The two-line suptitle needs a fixed *physical* strip, not a fixed fraction: as a fraction
-    # it shrinks with every row added and the title lands on top of the first panel's own.
-    header_frac = _HEADER_INCHES / figure_height
-    # Two columns: every main axes sits in column 0 so all rows are exactly as wide, with a
-    # narrow reserved colorbar column beside it. Line rows hide their unused cax rather than
-    # skipping it, which would make those rows wider than the heatmap rows.
-    grid = GridSpec(
-        len(row_specs), 2, figure=fig,
-        height_ratios=height_ratios, width_ratios=[1.0, 0.022],
-        left=0.065, right=0.93, top=1.0 - header_frac, bottom=0.03,
-        # The gutter before the colorbar column has to hold the lag panels' secondary axis --
-        # its ticks *and* its label. Too narrow and matplotlib still draws the label, underneath
-        # the colorbar, where the one thing the axis has to say is invisible.
-        hspace=0.55, wspace=0.09,
-    )
-    row_of = {name: index for index, (name, _) in enumerate(row_specs)}
+    # Same contract as the sibling page builder: the figure is this function's until it is
+    # returned, so a row that raises closes it here rather than orphaning it in pyplot's registry.
+    try:
+        # The two-line suptitle needs a fixed *physical* strip, not a fixed fraction: as a fraction
+        # it shrinks with every row added and the title lands on top of the first panel's own.
+        header_frac = _HEADER_INCHES / figure_height
+        # Two columns: every main axes sits in column 0 so all rows are exactly as wide, with a
+        # narrow reserved colorbar column beside it. Line rows hide their unused cax rather than
+        # skipping it, which would make those rows wider than the heatmap rows.
+        grid = GridSpec(
+            len(row_specs), 2, figure=fig,
+            height_ratios=height_ratios, width_ratios=[1.0, 0.022],
+            left=0.065, right=0.93, top=1.0 - header_frac, bottom=0.03,
+            # The gutter before the colorbar column has to hold the lag panels' secondary axis --
+            # its ticks *and* its label. Too narrow and matplotlib still draws the label, underneath
+            # the colorbar, where the one thing the axis has to say is invisible.
+            hspace=0.55, wspace=0.09,
+        )
+        row_of = {name: index for index, (name, _) in enumerate(row_specs)}
 
-    def row_axes(name: str) -> Tuple[Any, Any]:
-        """Return the ``(main, cax)`` axes pair of a named row."""
-        index = row_of[name]
-        return fig.add_subplot(grid[index, 0]), fig.add_subplot(grid[index, 1])
+        def row_axes(name: str) -> Tuple[Any, Any]:
+            """Return the ``(main, cax)`` axes pair of a named row."""
+            index = row_of[name]
+            return fig.add_subplot(grid[index, 0]), fig.add_subplot(grid[index, 1])
 
-    def attach_cbar(cax: Any, image: Any, label: str) -> None:
-        """Attach a colorbar for ``image`` onto a row's reserved cax."""
-        cbar = fig.colorbar(image, cax=cax)
-        cbar.set_label(label, fontsize=8, color=COLOR_BLACK)
-        cbar.ax.tick_params(labelsize=7, colors=COLOR_BLACK)
+        def attach_cbar(cax: Any, image: Any, label: str) -> None:
+            """Attach a colorbar for ``image`` onto a row's reserved cax."""
+            cbar = fig.colorbar(image, cax=cax)
+            cbar.set_label(label, fontsize=8, color=COLOR_BLACK)
+            cbar.ax.tick_params(labelsize=7, colors=COLOR_BLACK)
 
-    def heatmap_spines(ax: Any) -> None:
-        """Draw all four spines on a heatmap axes."""
-        ax.grid(False)
-        for spine in ("top", "bottom", "left", "right"):
-            ax.spines[spine].set_visible(True)
-            ax.spines[spine].set_color(COLOR_BLACK)
-            ax.spines[spine].set_linewidth(0.6)
+        def heatmap_spines(ax: Any) -> None:
+            """Draw all four spines on a heatmap axes."""
+            ax.grid(False)
+            for spine in ("top", "bottom", "left", "right"):
+                ax.spines[spine].set_visible(True)
+                ax.spines[spine].set_color(COLOR_BLACK)
+                ax.spines[spine].set_linewidth(0.6)
 
-    def finalise_time_axis(ax: Any, *, tail: bool = False) -> None:
-        """Pin the shared physical-time axis and mark the spans this row draws nothing over.
+        def finalise_time_axis(ax: Any, *, tail: bool = False) -> None:
+            """Pin the shared physical-time axis and mark the spans this row draws nothing over.
 
-        Args:
-            ax: The axes to finalise.
-            tail: Whether this row also stops at the last trained anchor.
-        """
-        # Every row spans the whole recording whatever it draws, so a column of the page is the
-        # same instant on all seven of them.
-        ax.set_xlim(0.0, t_max)
-        shade_warmup(ax, warmup, t_max, t_steps)
-        if tail:
-            ax.axvspan(tail_sec, t_max, color=COLOR_LIGHT_GRAY, alpha=0.35, zorder=0)
+            Args:
+                ax: The axes to finalise.
+                tail: Whether this row also stops at the last trained anchor.
+            """
+            # Every row spans the whole recording whatever it draws, so a column of the page is the
+            # same instant on all seven of them.
+            ax.set_xlim(0.0, t_max)
+            shade_warmup(ax, warmup, t_max, t_steps)
+            if tail:
+                ax.axvspan(tail_sec, t_max, color=COLOR_LIGHT_GRAY, alpha=0.35, zorder=0)
 
-    def trained_columns(values: np.ndarray, *, drop_tail: bool) -> Tuple[np.ndarray, float]:
-        """Cut a time-first array down to the anchors the objective actually scored.
+        def trained_columns(values: np.ndarray, *, drop_tail: bool) -> Tuple[np.ndarray, float]:
+            """Cut a time-first array down to the anchors the objective actually scored.
 
-        Args:
-            values: An array whose first axis is the decimated step.
-            drop_tail: Whether to also drop the tail $H$ anchors, which are neither decoded nor
-                inside the KL support and so receive no gradient at all.
+            Args:
+                values: An array whose first axis is the decimated step.
+                drop_tail: Whether to also drop the tail $H$ anchors, which are neither decoded nor
+                    inside the KL support and so receive no gradient at all.
 
-        Returns:
-            ``(cut, stop_seconds)`` -- the surviving columns and the second the last one ends at,
-            which is the right edge of the ``imshow`` extent that draws them.
-        """
-        stop = t_valid if drop_tail else t_steps
-        return values[warmup:stop], (tail_sec if drop_tail else t_max)
+            Returns:
+                ``(cut, stop_seconds)`` -- the surviving columns and the second the last one ends at,
+                which is the right edge of the ``imshow`` extent that draws them.
+            """
+            stop = t_valid if drop_tail else t_steps
+            return values[warmup:stop], (tail_sec if drop_tail else t_max)
 
-    def lag_panel(
-        ax: Any, values: np.ndarray, title: str, cmap: str, *, drop_tail: bool
-    ) -> Any:
-        """Draw a ``(T, L)`` lag map, trained columns only, with a compensated-seconds axis."""
-        trained, stop_sec = trained_columns(values, drop_tail=drop_tail)
+        def lag_panel(
+            ax: Any, values: np.ndarray, title: str, cmap: str, *, drop_tail: bool
+        ) -> Any:
+            """Draw a ``(T, L)`` lag map, trained columns only, with a compensated-seconds axis."""
+            trained, stop_sec = trained_columns(values, drop_tail=drop_tail)
+            image = ax.imshow(
+                trained.T, aspect="auto", cmap=cmap, origin="lower",
+                extent=[warmup_sec, stop_sec, -0.5, n_lags - 0.5],
+                interpolation=_IMSHOW_INTERPOLATION,
+            )
+            ax.set_title(title, fontsize=9, pad=6)
+            ax.set_xlabel("Time (s)", fontsize=8)
+            ax.set_ylabel("Lag $\\ell$ (steps)", fontsize=8)
+            heatmap_spines(ax)
+            secondary = attach_lag_seconds_axis(
+                ax,
+                step_seconds=SECONDS_PER_STEP,
+                # The whole compensation, expressed as the axis offset: lag 0 already sits at
+                # 4*delta seconds once the source channels are read delta steps stale.
+                delta_up_seconds=float(lag_compensated_seconds(0, delay_steps=delay_steps)),
+            )
+            if secondary is not None:
+                # Overriding the primitive's generic label: which of the two lag quantities is drawn
+                # is exactly the thing a reader must not have to guess.
+                secondary.set_ylabel(COMPENSATED_LAG_AXIS_LABEL, fontsize=8)
+            finalise_time_axis(ax, tail=drop_tail)
+            return image
+
+        # ---- Rows 1-2: whatever this model forecasts ---------------------------
+        # Behind a seam, because these two are the only rows that depend on the target domain.
+        # Everything below -- the cuts, the shared axis, the lag panels, the caption -- is a
+        # statement about the latent and the attention and is the same page whatever is forecast.
+        (forecast_rows or raw_forecast_rows)(
+            ForecastRowInputs(
+                outs=outs,
+                target=fhr_raw,
+                batch=batch,
+                geometry=geometry,
+                sample_index=i,
+                normalization_stats=normalization_stats,
+                up_raw=up_raw,
+                time_raw=time_raw,
+                t_max=t_max,
+                row_axes=row_axes,
+                finalise_time_axis=finalise_time_axis,
+                attach_cbar=attach_cbar,
+                heatmap_spines=heatmap_spines,
+            )
+        )
+
+        # ---- Rows: the gated input streams, as the encoders receive them --------
+        # Drawn over the whole recording, not cut to the trained anchors like the rows below: the
+        # warm-up columns are where the guard's zero fill lives, and cutting them would remove the
+        # one span the delay staircase exists to be checked against.
+        for panel in panels:
+            ax, cax = row_axes(f"input_{panel.name}")
+            image = _input_stream_row(
+                ax, panel, t_max=t_max, seconds_per_step=seconds_per_step
+            )
+            heatmap_spines(ax)
+            attach_cbar(cax, image, "value")
+            finalise_time_axis(ax)
+
+        # ---- Row: prior mean over the source-derived delta ---------------------
+        ax, cax = row_axes("latent")
+        # Stacked time-first so the cut below is one slice of one axis, then transposed for imshow.
+        latent_stack, latent_stop = trained_columns(
+            np.concatenate([mu_prior_np, delta_mu_np], axis=1), drop_tail=True
+        )
+        vabs = safe_vabs(latent_stack)
         image = ax.imshow(
-            trained.T, aspect="auto", cmap=cmap, origin="lower",
-            extent=[warmup_sec, stop_sec, -0.5, n_lags - 0.5],
+            latent_stack.T, aspect="auto", cmap="bwr", origin="upper",
+            vmin=-vabs, vmax=vabs, extent=[warmup_sec, latent_stop, 2 * d_z - 0.5, -0.5],
             interpolation=_IMSHOW_INTERPOLATION,
         )
-        ax.set_title(title, fontsize=9, pad=6)
+        ax.axhline(d_z - 0.5, color="white", linewidth=1.2, linestyle="--")
+        ax.set_yticks([d_z // 2, d_z + d_z // 2])
+        ax.set_yticklabels(["$\\mu^p$", "$\\mu^q-\\mu^p$"])
+        ax.set_title(
+            "Target-only latent state and the source-derived shift (shared colour scale, "
+            "trained anchors only)",
+            fontsize=9, pad=6,
+        )
         ax.set_xlabel("Time (s)", fontsize=8)
-        ax.set_ylabel("Lag $\\ell$ (steps)", fontsize=8)
-        heatmap_spines(ax)
-        secondary = attach_lag_seconds_axis(
-            ax,
-            step_seconds=SECONDS_PER_STEP,
-            # The whole compensation, expressed as the axis offset: lag 0 already sits at
-            # 4*delta seconds once the source channels are read delta steps stale.
-            delta_up_seconds=float(lag_compensated_seconds(0, delay_steps=delay_steps)),
-        )
-        if secondary is not None:
-            # Overriding the primitive's generic label: which of the two lag quantities is drawn
-            # is exactly the thing a reader must not have to guess.
-            secondary.set_ylabel(COMPENSATED_LAG_AXIS_LABEL, fontsize=8)
-        finalise_time_axis(ax, tail=drop_tail)
-        return image
-
-    # ---- Rows 1-2: whatever this model forecasts ---------------------------
-    # Behind a seam, because these two are the only rows that depend on the target domain.
-    # Everything below -- the cuts, the shared axis, the lag panels, the caption -- is a
-    # statement about the latent and the attention and is the same page whatever is forecast.
-    (forecast_rows or raw_forecast_rows)(
-        ForecastRowInputs(
-            outs=outs,
-            target=fhr_raw,
-            batch=batch,
-            geometry=geometry,
-            sample_index=i,
-            normalization_stats=normalization_stats,
-            up_raw=up_raw,
-            time_raw=time_raw,
-            t_max=t_max,
-            row_axes=row_axes,
-            finalise_time_axis=finalise_time_axis,
-        )
-    )
-
-    # ---- Rows: the gated input streams, as the encoders receive them --------
-    # Drawn over the whole recording, not cut to the trained anchors like the rows below: the
-    # warm-up columns are where the guard's zero fill lives, and cutting them would remove the
-    # one span the delay staircase exists to be checked against.
-    for panel in panels:
-        ax, cax = row_axes(f"input_{panel.name}")
-        image = _input_stream_row(
-            ax, panel, t_max=t_max, seconds_per_step=seconds_per_step
-        )
         heatmap_spines(ax)
         attach_cbar(cax, image, "value")
-        finalise_time_axis(ax)
+        finalise_time_axis(ax, tail=True)
 
-    # ---- Row: prior mean over the source-derived delta ---------------------
-    ax, cax = row_axes("latent")
-    # Stacked time-first so the cut below is one slice of one axis, then transposed for imshow.
-    latent_stack, latent_stop = trained_columns(
-        np.concatenate([mu_prior_np, delta_mu_np], axis=1), drop_tail=True
-    )
-    vabs = safe_vabs(latent_stack)
-    image = ax.imshow(
-        latent_stack.T, aspect="auto", cmap="bwr", origin="upper",
-        vmin=-vabs, vmax=vabs, extent=[warmup_sec, latent_stop, 2 * d_z - 0.5, -0.5],
-        interpolation=_IMSHOW_INTERPOLATION,
-    )
-    ax.axhline(d_z - 0.5, color="white", linewidth=1.2, linestyle="--")
-    ax.set_yticks([d_z // 2, d_z + d_z // 2])
-    ax.set_yticklabels(["$\\mu^p$", "$\\mu^q-\\mu^p$"])
-    ax.set_title(
-        "Target-only latent state and the source-derived shift (shared colour scale, "
-        "trained anchors only)",
-        fontsize=9, pad=6,
-    )
-    ax.set_xlabel("Time (s)", fontsize=8)
-    heatmap_spines(ax)
-    attach_cbar(cax, image, "value")
-    finalise_time_axis(ax, tail=True)
+        # ---- Row: per-dimension KL --------------------------------------------
+        ax, cax = row_axes("kld_dims")
+        kld_dims_trained, kld_dims_stop = trained_columns(kld_dims_np, drop_tail=True)
+        # Top-down, matching the ``latent`` row directly above and every other channel axis on
+        # the page: both rows are indexed by the same latent dimension $d$, and drawing $d = 0$ at
+        # the top on one and at the bottom on the other makes the two rows impossible to read
+        # against each other. ``top_down_extent`` is paired with ``origin='upper'`` so the axis
+        # flips rather than the data -- see its docstring.
+        image = ax.imshow(
+            kld_dims_trained.T, aspect="auto", cmap="magma", origin="upper",
+            extent=top_down_extent(warmup_sec, kld_dims_stop, d_z),
+            interpolation=_IMSHOW_INTERPOLATION,
+        )
+        ax.set_title(
+            "Per-dimension source-conditioned KL (nats, trained anchors only)", fontsize=9, pad=6
+        )
+        ax.set_xlabel("Time (s)", fontsize=8)
+        ax.set_ylabel("Latent dim", fontsize=8)
+        heatmap_spines(ax)
+        attach_cbar(cax, image, "nats")
+        finalise_time_axis(ax, tail=True)
 
-    # ---- Row: per-dimension KL --------------------------------------------
-    ax, cax = row_axes("kld_dims")
-    kld_dims_trained, kld_dims_stop = trained_columns(kld_dims_np, drop_tail=True)
-    image = ax.imshow(
-        kld_dims_trained.T, aspect="auto", cmap="magma", origin="lower",
-        extent=[warmup_sec, kld_dims_stop, -0.5, d_z - 0.5],
-        interpolation=_IMSHOW_INTERPOLATION,
-    )
-    ax.set_title(
-        "Per-dimension source-conditioned KL (nats, trained anchors only)", fontsize=9, pad=6
-    )
-    ax.set_xlabel("Time (s)", fontsize=8)
-    ax.set_ylabel("Latent dim", fontsize=8)
-    heatmap_spines(ax)
-    attach_cbar(cax, image, "nats")
-    finalise_time_axis(ax, tail=True)
+        # ---- Row: total KL per step -------------------------------------------
+        ax, cax = row_axes("kld_total")
+        # Cut like the two KL heatmaps rather than merely shaded: the warm-up carries the encoders'
+        # settling transient, and left in it sets the y-scale so the trained range flattens.
+        kld_trained, _ = trained_columns(kld_total_np, drop_tail=True)
+        kld_time, _ = trained_columns(time_dec, drop_tail=True)
+        ax.plot(kld_time, kld_trained, color=COLOR_VERMILLION, linewidth=0.9)
+        ax.set_title(
+            "$K_t$ — total source-conditioned KL per step (trained anchors only)",
+            fontsize=9, pad=6,
+        )
+        ax.set_xlabel("Time (s)", fontsize=8)
+        ax.set_ylabel("nats", fontsize=8)
+        style_axes(ax, grid="both")
+        finalise_time_axis(ax, tail=True)
+        cax.set_visible(False)
 
-    # ---- Row: total KL per step -------------------------------------------
-    ax, cax = row_axes("kld_total")
-    # Cut like the two KL heatmaps rather than merely shaded: the warm-up carries the encoders'
-    # settling transient, and left in it sets the y-scale so the trained range flattens.
-    kld_trained, _ = trained_columns(kld_total_np, drop_tail=True)
-    kld_time, _ = trained_columns(time_dec, drop_tail=True)
-    ax.plot(kld_time, kld_trained, color=COLOR_VERMILLION, linewidth=0.9)
-    ax.set_title(
-        "$K_t$ — total source-conditioned KL per step (trained anchors only)",
-        fontsize=9, pad=6,
-    )
-    ax.set_xlabel("Time (s)", fontsize=8)
-    ax.set_ylabel("nats", fontsize=8)
-    style_axes(ax, grid="both")
-    finalise_time_axis(ax, tail=True)
-    cax.set_visible(False)
+        # ---- Row: lag attention with its argmax --------------------------------
+        ax, cax = row_axes("lag_attn")
+        # The tail stays here alone among the five: attention is a property of the source stream and
+        # is defined at every step, whereas the KL panels above and below it are identically zero
+        # there by construction of the mask.
+        image = lag_panel(
+            ax, alpha_np, "Lag attention (head-averaged) with per-step argmax", "viridis",
+            drop_tail=False,
+        )
+        attn_trained, _ = trained_columns(alpha_np, drop_tail=False)
+        attn_time, _ = trained_columns(time_dec, drop_tail=False)
+        ax.plot(
+            attn_time, attn_trained.argmax(axis=1),
+            color=COLOR_ORANGE, linewidth=0.7, alpha=0.85,
+        )
+        attach_cbar(cax, image, "attention")
 
-    # ---- Row: lag attention with its argmax --------------------------------
-    ax, cax = row_axes("lag_attn")
-    # The tail stays here alone among the five: attention is a property of the source stream and
-    # is defined at every step, whereas the KL panels above and below it are identically zero
-    # there by construction of the mask.
-    image = lag_panel(
-        ax, alpha_np, "Lag attention (head-averaged) with per-step argmax", "viridis",
-        drop_tail=False,
-    )
-    attn_trained, _ = trained_columns(alpha_np, drop_tail=False)
-    attn_time, _ = trained_columns(time_dec, drop_tail=False)
-    ax.plot(
-        attn_time, attn_trained.argmax(axis=1),
-        color=COLOR_ORANGE, linewidth=0.7, alpha=0.85,
-    )
-    attach_cbar(cax, image, "attention")
+        # ---- Row: the KL attributed across lags --------------------------------
+        ax, cax = row_axes("kl_lag_map")
+        image = lag_panel(
+            ax, kl_lag_np, "$\\widetilde K_{t,\\ell}$ — source-conditioned KL by lag", "magma",
+            drop_tail=True,
+        )
+        attach_cbar(cax, image, "nats")
 
-    # ---- Row: the KL attributed across lags --------------------------------
-    ax, cax = row_axes("kl_lag_map")
-    image = lag_panel(
-        ax, kl_lag_np, "$\\widetilde K_{t,\\ell}$ — source-conditioned KL by lag", "magma",
-        drop_tail=True,
-    )
-    attach_cbar(cax, image, "nats")
-
-    readouts = "  ".join(
-        f"{name}={float(scalars[name]):.4g}"
-        for name in ("nll_base_block", "nll_full_block", "pred_gap", "source_conditioned_kl_raw")
-        if name in scalars
-    )
-    fig.suptitle(
-        f"epoch {epoch} — sample {i} — guid {guid} — beta={beta:.4g}\n{readouts}",
-        fontsize=10, y=1.0 - 0.1 / figure_height, va="top",
-    )
-    return fig
+        readouts = "  ".join(
+            f"{name}={float(scalars[name]):.4g}"
+            for name in ("nll_base_block", "nll_full_block", "pred_gap", "source_conditioned_kl_raw")
+            if name in scalars
+        )
+        fig.suptitle(
+            f"epoch {epoch} — sample {i} — guid {guid} — beta={beta:.4g}\n{readouts}",
+            fontsize=10, y=1.0 - 0.1 / figure_height, va="top",
+        )
+        return fig
+    except BaseException:
+        plt.close(fig)
+        raise

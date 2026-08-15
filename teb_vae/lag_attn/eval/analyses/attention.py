@@ -191,9 +191,15 @@ def _write_summary_figure(
 
     figure, axes = figures.new_figure(3)
     try:
+        # $-1$ is the "no supported anchor" sentinel, not a lag of minus one, and the headline
+        # number already strips it (``argmax = argmax[argmax >= 0]`` below). The panel has to
+        # strip it too: ``histogram_panel`` filters only non-finite values, so a sentinel row
+        # would draw a bar at a lag that does not exist and would stretch the ``bins`` span to
+        # $[-1, L-1]$, leaving no bin edge on an integer lag.
+        argmax_lag = frame["argmax_lag"] if "argmax_lag" in frame else pd.Series(dtype=float)
         figures.histogram_panel(
             axes[0, 0],
-            frame.get("argmax_lag", pd.Series(dtype=float)),
+            argmax_lag[argmax_lag >= 0],
             title="Per-sample argmax lag",
             xlabel="Model lag $\\ell$",
             bins=max(len(lag_columns), 1),

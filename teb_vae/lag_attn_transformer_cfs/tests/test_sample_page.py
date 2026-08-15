@@ -65,16 +65,35 @@ def test_the_figure_modules_are_not_importable_from_this_package(module):
 # =================================================================================================
 def test_the_forecast_rows_resolve_to_the_causal_cells_builder(task):
     """By object identity on the *underlying function*, not merely by shape: the rows are bound with
-    three values the page cannot recover from the arrays it is handed -- which declared channel each
-    decoder output is, where the two stored blocks meet on that axis, and the stride a training step
-    tiles at."""
+    five values the page cannot recover from the arrays it is handed -- which declared channel each
+    decoder output is, where the two stored blocks meet on that axis, the stride a training step
+    tiles at, and the likelihood and coverage floor the per-window score row scores under."""
     module = task()
     rows = module.forecast_rows
 
     assert rows.func is causal_page.causal_forecast_rows
-    assert set(rows.keywords) == {"keep_index", "block_split", "training_stride"}
+    assert set(rows.keywords) == {
+        "keep_index", "block_split", "training_stride", "likelihood", "coverage_floor",
+    }
     assert rows.keywords["block_split"] == 36
     assert rows.keywords["training_stride"] == module.orig_model.anchor_stride == TINY_STRIDE
+    # The score row's two: the objective's own likelihood, and the net's own floor. Bound from
+    # where the objective takes them, so a window's height is this run's block score.
+    assert rows.keywords["likelihood"] == module.hparams["likelihood"]
+    assert rows.keywords["coverage_floor"] == module.orig_model.coverage_floor
+
+
+def test_the_extra_page_rows_resolve_to_the_causal_cells_constant(task):
+    """The six rows the seam draws below the two the layout always reserves. Returned from the
+    drawing module's own constant so the names reserved and the names drawn are one object: a name
+    reserved and not drawn is a blank row, and a name drawn and not reserved is a ``KeyError``
+    raised inside a handler that swallows it -- a page silently missing from the whole run."""
+    module = task()
+
+    assert module.forecast_extra_rows is causal_page.CAUSAL_EXTRA_ROWS
+    assert [name for name, _height in module.forecast_extra_rows] == [
+        "pred_truth", "pred_base", "pred_full", "pred_skill", "pred_sigma", "pred_gap",
+    ]
 
 
 def test_the_input_panel_builder_resolves_to_the_causal_cells(task):
@@ -107,7 +126,7 @@ def test_the_run_level_budget_figure_resolves_to_the_causal_cells(task):
 def test_the_page_seams_are_the_same_objects_both_causal_cells_draw_with(task):
     """The encoder edge on the diagnostic page: two runs read side by side must be drawn by one
     builder, or a difference in a figure is a difference between two plotting routines."""
-    for name in ("forecast_rows", "input_stream_panels"):
+    for name in ("forecast_rows", "input_stream_panels", "forecast_extra_rows"):
         assert (
             vars(SeqVaeLagAttnCfsTask)[name] is not None
         ), f"{name} moved off the causal parent"

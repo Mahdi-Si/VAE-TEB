@@ -28,6 +28,11 @@ machinery, the imported budget resolution and every anchor expectation in this s
 them while the models here are built from the sets below, so the splice is sound only while the two
 agree. ``test_fixtures.py`` asserts that they do, which is what turns the paragraph above into a
 measurement.
+
+**The evaluation fixtures at the bottom follow the same seam.** The generated cohort shards and
+their statistics file are imported from the causal sibling -- they describe the *dataset* -- while
+the fit, the repointed override delta and the evaluation run are local, because each is downstream
+of the model class. ``test_eval_fixtures.py`` is what proves that half.
 """
 from __future__ import annotations
 
@@ -89,6 +94,7 @@ from teb_vae.lag_attn_cfs.tests.conftest import (  # noqa: E402,F401
     CAUSAL_PH_WIDTH,
     CAUSAL_SHARD,
     CAUSAL_ST_WIDTH,
+    COHORT_STATS_FILENAME,
     SHIPPED_BUDGET_STEPS,
     SHIPPED_HORIZON,
     SHIPPED_SEQUENCE_LENGTH,
@@ -107,11 +113,14 @@ from teb_vae.lag_attn_cfs.tests.conftest import (  # noqa: E402,F401
     TWO_SIDED_SHARD,
     absolutize_dataset_paths,
     causal_config,
+    cohort_shards,
+    cohort_stats,
     make_stub_batch,
     make_streams,
     perturb_posterior,
     stored_warmup,
     without_key,
+    write_cohort_shards,
     write_variant,
 )
 
@@ -354,6 +363,142 @@ def pytest_configure(config: pytest.Config) -> None:
     config.addinivalue_line(
         "markers", "slow: long-running empirical validation, excluded from the default run"
     )
+
+
+# =================================================================================================
+# The evaluation fixtures
+#
+# The splice again, and along the same seam. The **shards and their statistics file** are the causal
+# cell's, imported above: eight generated subgroup shards carrying ``transform: 'causal'``, the
+# per-block warm-up attributes, the ``sel_*`` provenance and the five clinical fields. They describe
+# the dataset and the target domain, neither of which is a property of an encoder, and a second
+# generator here would be free to describe a boundary the data no longer has.
+#
+# What is local is everything downstream of the model class: the fit is a conv-Transformer, and the
+# repointed delta is **this package's** committed one rather than the causal cell's -- the two ship
+# two files, and evaluating this model against the other one's settings is exactly the silent
+# divergence the binding test's key-for-key comparison exists to catch.
+#
+# **What may be asserted on the run these produce.** The rule the causal suite's fixtures carry
+# binds here unchanged: eight real raw segments re-used under distinct identities, scored by a tiny
+# model trained for one epoch, are evidence about SCHEMA, SHAPE, FINITENESS, DENOMINATORS, COHORT
+# MEMBERSHIP, COUNTS, IDENTITIES and REFUSALS and about nothing else. No test may assert the sign,
+# magnitude, direction or significance of any clinical or statistical effect on them -- and in
+# particular no test may compare this cell's numbers against the causal cell's and read the
+# difference as an encoder finding.
+# =================================================================================================
+@pytest.fixture(scope="session")
+def trf_cohort_run(cohort_shards, cohort_stats, tmp_path_factory) -> Path:
+    r"""One real fit of this cell against the generated cohort shards; returns the run directory.
+
+    Marked ``slow`` at every consumer rather than here -- a fixture carries no marker of its own --
+    and nothing in the fast subset may depend on it.
+
+    Driven through ``trainer.main`` rather than by assembling a checkpoint by hand, because what an
+    evaluation reads out of this directory is precisely what the driver puts there and nothing else
+    can: ``model_kwargs`` carrying the four warm-up tuples the budget resolved against these shards,
+    ``model_class`` stamping which architecture produced the run -- which is what the cross-cell
+    table keys its rows on -- and ``resolved_config.yaml`` recording the configuration behind them.
+    A blob saved from a freshly constructed model would carry the same keys and would prove none of
+    it.
+
+    The base is **this package's** shipped ``tiny.yaml``, with exactly three leaves moved: both
+    shard lists and the statistics path, which is the repoint; and ``out_dir_base``, because the
+    shipped value is a path inside the repository and a test must not write there.
+    """
+    import yaml
+
+    from teb_vae.lag_attn.config import load_config
+    from teb_vae.lag_attn_transformer_cfs import trainer as trainer_module
+
+    run_root = tmp_path_factory.mktemp("trf_cohort_run")
+    tiny = Path(_REPO_ROOT) / "teb_vae" / "lag_attn_transformer_cfs" / "configs" / "tiny.yaml"
+    config = absolutize_dataset_paths(load_config(str(tiny)))
+    dataset = config["dataset_config"]
+    dataset["vae_train_datasets"] = list(cohort_shards)
+    dataset["vae_test_datasets"] = list(cohort_shards)
+    dataset["stat_path"] = cohort_stats
+    config["general_config"]["folders_config"]["out_dir_base"] = str(run_root)
+
+    config_path = run_root / "resolved.yaml"
+    config_path.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
+    trainer_module.main(str(config_path))
+
+    # The driver names its own run directory from the tag and a timestamp, so it is found rather
+    # than predicted. Exactly one, or the fit wrote somewhere this fixture does not know about.
+    checkpoint_dirs = sorted(run_root.rglob("model_checkpoints"))
+    assert len(checkpoint_dirs) == 1, checkpoint_dirs
+    return checkpoint_dirs[0].parent
+
+
+@pytest.fixture(scope="session")
+def trf_cohort_overrides(cohort_shards, cohort_stats, tmp_path_factory) -> Path:
+    """**This package's** committed evaluation delta with its two placeholder leaves repointed.
+
+    Exactly the edit an operator makes to that file before a real run, rather than a bespoke
+    overrides file: a delta carrying only the shard paths would **replace** the committed one, and
+    with it the clinical ``load_fields`` every cohort-aware readout is asked in -- the loader skips
+    a field it was not asked for, silently.
+
+    This package's file rather than the causal cell's, even though a test asserts the two are equal
+    key for key: that equality is a property this suite checks, not one it may assume, and reading
+    the other cell's file here would make the check unable to fail.
+
+    Session-scoped and written once; treat as read-only.
+    """
+    import yaml
+
+    from teb_vae.lag_attn_cfs.eval.config_schema import load_eval_overrides
+    from teb_vae.lag_attn_transformer_cfs.eval.binding import TRF_CFS_BINDING
+
+    overrides = load_eval_overrides(TRF_CFS_BINDING.overrides_path)
+    overrides["dataset_config"]["vae_test_datasets"] = list(cohort_shards)
+    overrides["dataset_config"]["stat_path"] = cohort_stats
+    path = tmp_path_factory.mktemp("trf_eval_overrides") / "eval_overrides_repointed.yaml"
+    path.write_text(yaml.safe_dump(overrides, sort_keys=False), encoding="utf-8")
+    return path
+
+
+@pytest.fixture(scope="session")
+def trf_collected_run(trf_cohort_run, trf_cohort_overrides, tmp_path_factory) -> Dict[str, Any]:
+    r"""One real evaluation of this cell through the causal pipeline; every artifact it left.
+
+    Marked ``slow`` at every consumer rather than here, and nothing in the fast subset may depend
+    on it. Session-scoped because the pass decodes four branches over every anchor of every
+    generated segment and several tests ask about the *same* run; collecting once is what keeps
+    that cost paid once.
+
+    Two Monte Carlo draws rather than the shipped eight: these tests are about the plumbing, and
+    each draw decodes every branch over every anchor.
+
+    ``main`` returns the process **exit code**, not a path: an analysis failing must be visible to
+    a shell. The results directory is therefore assembled from the directory this fixture named,
+    which is what a caller with an explicit ``--output-dir`` does anyway.
+    """
+    import json
+
+    from teb_vae.lag_attn_transformer_cfs.eval import run as run_module
+
+    output_dir = tmp_path_factory.mktemp("trf_eval")
+    checkpoint = sorted((Path(trf_cohort_run) / "model_checkpoints").glob("*.ckpt"))[0]
+    exit_code = run_module.main(
+        checkpoint,
+        output_dir,
+        overrides=trf_cohort_overrides,
+        device="cpu",
+        num_samples=2,
+    )
+    results_dir = Path(output_dir) / run_module.RESULTS_DIRNAME
+    summary_path = results_dir / run_module.SUMMARY_FILENAME
+    text = summary_path.read_text(encoding="utf-8")
+    return {
+        "checkpoint": checkpoint,
+        "exit_code": exit_code,
+        "summary_path": summary_path,
+        "text": text,
+        "summary": json.loads(text),
+        "results_dir": results_dir,
+    }
 
 
 @pytest.fixture

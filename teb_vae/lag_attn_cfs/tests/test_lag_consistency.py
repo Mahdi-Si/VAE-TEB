@@ -110,6 +110,7 @@ def _page(module: Any, batch: Any) -> Any:
         input_streams=plotting.input_stream_panels(
             model, inputs, 0, module.input_stream_panels
         ),
+        forecast_extra_rows=module.forecast_extra_rows,
     )
     figure.canvas.draw()
     return figure
@@ -279,3 +280,76 @@ def test_the_replaced_rows_do_not_move_the_lag_axis():
 
     for prefix in with_rows:
         assert with_rows[prefix] == pytest.approx(without_rows[prefix]), prefix
+
+
+# =================================================================================================
+# The evaluation pipeline is the third consumer of the same delta
+#
+# The figure and the model agree above. The evaluation is the consumer that did not exist when
+# that agreement was first established, and it is the one whose numbers get quoted: its two
+# lag-resolved analyses build their seconds axis from a ``delay_steps`` the run reads off the model
+# once and threads through the collection record. A second read under a guessed name is exactly the
+# failure this file exists for, so the read site is pinned here rather than only exercised.
+# =================================================================================================
+def test_the_evaluation_reads_the_delay_off_the_model_and_from_nowhere_else():
+    r"""One read site, and it is ``model.source_delay_steps``.
+
+    Pinned by inspecting the runner's source rather than by comparing two numbers that happen to be
+    zero on this cell: the whole point is that a *non-zero* delay reaching one consumer and not
+    another is invisible, and this family's delay is zero, so a value comparison here would pass
+    against a consumer that read nothing at all.
+    """
+    import inspect
+
+    from teb_vae.lag_attn_cfs.eval import run as run_module
+
+    source = inspect.getsource(run_module)
+
+    assert "int(task.orig_model.source_delay_steps)" in source
+    # And no other attribute name is reached for. ``_source_delay_steps`` is the plotting sibling's
+    # accessor and is asserted equal to the model's own above; a second *name* in the runner would
+    # be the guessed one.
+    assert source.count("source_delay_steps") == 2, (
+        "the runner must read the delay once and record it once; a third mention is a second read "
+        "site, which is how the two reports of one run came to disagree by two minutes"
+    )
+
+
+def test_every_reported_lag_carries_the_maximum_over_channels_flag():
+    r"""The source channels are masked individually and the model reports the **maximum**, so every
+    lag computed from it is an upper bound. The flag travels beside the numbers rather than being
+    stated once elsewhere, because a lag quoted without it reads as exact.
+
+    Asserted on all three emitters at once -- the lag report, and both analyses that read it -- so a
+    new emitter that dropped the flag fails here rather than in whichever summary is read first.
+    """
+    from teb_vae.lag_attn_cfs.eval.analyses import attention as attention_analysis
+    from teb_vae.lag_attn_cfs.eval.analyses import lag_kl as lag_kl_analysis
+    from teb_vae.lag_attn_cfs.eval.metrics import Aggregate, lag_summary
+
+    module, _batch = _module_and_batch()
+    delay = int(module.orig_model.source_delay_steps)
+    aggregate = Aggregate(
+        overall={},
+        lag_profile=[0.5, 0.3, 0.2],
+        lag_profile_support_corrected=[0.5, 0.3, 0.2],
+        lag_profile_untruncated=[0.5, 0.3, 0.2],
+        lag_support=[10.0, 10.0, 10.0],
+        attention_profile=[0.5, 0.3, 0.2],
+        kld_per_head=[1.0, 1.0],
+    )
+
+    report = lag_summary(aggregate, delay_steps=delay)
+
+    assert report["delay_steps"] == delay
+    assert report["source_delay_is_max_over_channels"] is True
+    # And both analyses carry it through rather than recomputing or dropping it.
+    for module_under_test in (lag_kl_analysis, attention_analysis):
+        assert "source_delay_is_max_over_channels" in inspect_source(module_under_test)
+
+
+def inspect_source(module: Any) -> str:
+    """The module's source text, for the flag-propagation assertion above."""
+    import inspect
+
+    return inspect.getsource(module)

@@ -76,6 +76,7 @@ from teb_vae.lag_attn_rws.sample_page import (  # noqa: E402
     RAW_ROW,
     ForecastRowInputs,
     raw_context_row,
+    top_down_extent,
 )
 from utils.style import style_axes  # noqa: E402
 
@@ -90,10 +91,13 @@ FORECAST_CHANNELS = 3
 #: gap visible rather than merely non-negative.
 _LANE_HEADROOM = 1.15
 
-#: Where the error map sits inside the forecast axes, as ``[x0, y0, width, height]`` in axes
-#: coordinates. Far right, because the tiling leaves the recording's tail undrawn by construction
-#: -- reaching the segment end would need an anchor whose window overlaps the last tiled one -- so
-#: the corner it covers is the emptiest one on the row.
+#: Where the error map sits inside **this** page's forecast axes, as ``[x0, y0, width, height]``
+#: in axes coordinates. Far right, because this tiling starts at the first trained anchor and
+#: leaves the recording's tail undrawn by construction -- reaching the segment end would need an
+#: anchor whose window overlaps the last tiled one -- so the corner it covers is the emptiest one
+#: on the row. A page whose blank corner is elsewhere passes its own ``box``: the causal sibling's
+#: tiling starts at a floor of $133$ and runs to the end, so its right margin is the one place on
+#: the row an inset would hide data.
 _ERROR_MAP_BOX = (0.775, 0.06, 0.215, 0.90)
 
 #: Interpolation for the error map, matching the sibling page's heatmaps. ``'none'`` rather than
@@ -207,6 +211,7 @@ def _draw_error_map(
     *,
     first_block_channels: int,
     anchor_seconds: float,
+    box: Sequence[float] = _ERROR_MAP_BOX,
 ) -> None:
     r"""Draw the per-channel absolute-error map for one anchor, inset into the forecast axes.
 
@@ -219,17 +224,25 @@ def _draw_error_map(
             have different reaches and therefore different blends, and it is the split the run
             reports ``pred_gap_st`` and ``pred_gap_ph`` over. ``0`` draws no line.
         anchor_seconds: The anchor's own position in the recording, for the panel's label.
+        box: ``[x0, y0, width, height]`` in the row's axes coordinates, defaulting to
+            :data:`_ERROR_MAP_BOX`. A parameter because *which corner is blank* is a property of
+            the caller's tiling, not of this panel: the two-sided page leaves its tail undrawn and
+            the causal one leaves the span below its anchor floor undrawn, and an inset over the
+            other page's drawn span hides exactly the forecast it is a detail of.
     """
     n_channels, horizon = error.shape
-    inset = ax.inset_axes(list(_ERROR_MAP_BOX))
+    inset = ax.inset_axes(list(box))
     image = inset.imshow(
         error,
         aspect="auto",
         cmap="magma",
-        origin="lower",
+        origin="upper",
         # Cell centres at integer $\tau$ and integer channel, so a cell read off the rendered
-        # figure is the array's cell rather than an interpolated neighbourhood of it.
-        extent=[-0.5, horizon - 0.5, -0.5, n_channels - 0.5],
+        # figure is the array's cell rather than an interpolated neighbourhood of it. Channel $0$
+        # at the top, the page's one channel-axis convention -- a map whose channel axis ran the
+        # other way from the input rows two rows above it would be read wrongly by anyone who
+        # carried a channel between them.
+        extent=top_down_extent(-0.5, horizon - 0.5, n_channels),
         vmin=0.0,
         vmax=safe_vabs(error),
         interpolation=_IMSHOW_INTERPOLATION,
@@ -314,10 +327,19 @@ def feature_forecast_rows(
     # $2\sigma$ wide and $\sigma$ is a learned per-coefficient quantity, so a fixed offset either
     # overlaps early in training or flattens every lane late in it.
     def lane_extent(channel: int) -> float:
-        """Total vertical span the widest artist of one lane needs."""
+        """Total vertical span the widest artist of one lane needs.
+
+        Both branches are measured, not just the source-conditioned one. The lane draws the
+        target-only band too, and $\\sigma^{p} > \\sigma^{q}$ is the ordinary case -- sizing the
+        stride off the narrower branch alone lets the wider band run into the lane above, so a
+        reader attributes one channel's uncertainty to the channel labelled there.
+        """
         half = BAND_SIGMAS * full_sigma[:, channel]
+        base_half = BAND_SIGMAS * base_sigma[:, channel]
         stacked = np.concatenate(
-            [full_mean[:, channel] - half, full_mean[:, channel] + half, truth[:, channel]]
+            [full_mean[:, channel] - half, full_mean[:, channel] + half,
+             base_mean[:, channel] - base_half, base_mean[:, channel] + base_half,
+             truth[:, channel]]
         )
         finite = stacked[np.isfinite(stacked)]
         return float(finite.max() - finite.min()) if finite.size else 0.0

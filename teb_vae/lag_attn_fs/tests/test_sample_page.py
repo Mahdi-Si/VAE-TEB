@@ -354,9 +354,18 @@ def test_the_error_map_is_an_inset_that_never_claims_the_shared_time_axis(task, 
             module.orig_model.decoder_out_channels,
             geometry.horizon,
         )
+        # The channel axis runs **top-down**: channel 0 at the top, which is the one convention
+        # every channel axis in the family reads by, so the map and the input rows two rows above
+        # it put the same channel at the same height. Paired with ``origin='upper'``; the extent
+        # alone would flip the axis and leave the array drawn upside down under it.
         assert image.get_extent() == pytest.approx(
-            (-0.5, geometry.horizon - 0.5, -0.5, module.orig_model.decoder_out_channels - 0.5)
+            tuple(
+                shared_page.top_down_extent(
+                    -0.5, geometry.horizon - 0.5, module.orig_model.decoder_out_channels
+                )
+            )
         )
+        assert image.origin == "upper"
         # 'none', because a resampled map invents values between two channels, and per-channel
         # resolution is the entire reason the panel exists.
         assert image.get_interpolation() == "none"

@@ -38,6 +38,7 @@ Layout::
     sample_page.py      the diagnostic page rows the tiling and the warm-up make different
     warmup_budget.py    the run-level warm-up figure, and the tradeoff curve that chose the budget
     check_run.py        scores a finished run directory against the criteria RESULTS.md registers
+    eval/               the evaluation pipeline: one checkpoint in, one reviewable directory out
     tests/              fast hermetic pytest
 
 **The stored warm-up region is not zeros and not NaN.** The dataset writer attaches the boundary
@@ -54,9 +55,26 @@ predicting step $t + 1 + \tau$ from history up to $t$ is a genuine forecast what
 latency -- but any lag-resolved reading is an attribution over *stored-coefficient* time, not over
 physical delay.
 
-lean-limit: no evaluation package, so this model is not comparable through the shared evaluation
-pipeline and what a run emits -- ``metrics_history.csv``, the tracked metric surface,
-``train/grad_norm`` and the per-epoch diagnostic figures -- is its only readout, scored by
-``check_run.py`` rather than by a verdict file; replace with a model binding and an evaluation
-package when the feature-domain evaluation contract exists.
+**A run has two readouts and they answer two questions.** ``check_run.py`` reads a run's own
+``metrics_history.csv`` and says whether the fit behaved -- in-sample, per epoch, with no
+denominator and no interval, and while the run is still going. ``eval/`` reads the finished
+checkpoint against the held-out causal split and says whether it is acceptable -- per recording,
+with bootstrap intervals, ten pre-registered verdicts and an offline gate that imports no ``torch``.
+Neither substitutes for the other; ``DESIGN.md`` §14 and ``eval/EVAL.md`` both carry the pairing.
+
+lean-limit: the frequency-resolved readout is band-resolved skill and its timing half is unmeasured,
+because a stored coefficient is a modulus and the analysing filter's phase was discarded before the
+value was written -- so a forecast that is right in every band but arrives a step late reads as a
+forecast that is right; replace with a phase-carrying readout when the dataset stores a complex or
+phase-preserving block, which is a dataset change rather than an evaluation one.
+
+lean-limit: the lag axis is stored-coefficient time, uncorrected for a composed group delay reaching
+$791$ s -- the same order as the $364$ s lag search itself; replace with a per-channel-pair physical
+lag built from ``causal_delay_s`` when a lag result is to be reported as a physiological delay
+rather than as a coefficient-time attribution.
+
+lean-limit: ``eval_config.clock_margin_min_nats`` ships unset, so the availability-clock verdict
+reports INCONCLUSIVE and the gate is nine criteria rather than ten; replace with a value derived
+from the observed spread of the coupling-minus-clock difference across recordings once the first
+production run on the causal holdout split has written its ``source_null`` table.
 """

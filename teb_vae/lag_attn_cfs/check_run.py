@@ -32,6 +32,18 @@ $\lceil (T_{\mathrm{valid}} - F)/S \rceil$ and its phase-dependent floor, comput
 own ``resolved_config.yaml``. Hard-coding the shipped $[10, 11]$ and $152$ would make the checker
 pass a run at another horizon, floor or stride for the wrong reason -- and the arms that move all
 three ship in ``configs/``.
+
+**This module is not the evaluation, and the two answer different questions.**
+:mod:`teb_vae.lag_attn_cfs.eval.verify` reads a finished run's ``eval_results/summary.json`` and
+answers *is this checkpoint acceptable* -- on the held-out causal split, per recording, with
+bootstrap intervals and ten pre-registered verdicts. This module reads
+``train_results/metrics_history.csv`` and answers *did the fit behave* -- in-sample, over one
+configured dataset, as per-epoch means with no denominator and no interval on anything. The
+difference that matters operationally is when each can be run: this one needs no checkpoint, no
+shard and no ``torch``, so it works **while a run is still in flight**, which is what it was built
+for; the gate needs a finished checkpoint and a completed evaluation pass. Two green checks that
+answer two questions are only confusing if nothing says so, so both ``DESIGN.md`` §16 and
+``eval/EVAL.md`` carry the same pairing in the other direction.
 """
 from __future__ import annotations
 

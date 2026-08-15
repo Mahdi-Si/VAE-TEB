@@ -249,8 +249,12 @@ def _write_te_figure(
         )
         seconds.set_xlabel("Physical delay (s)", fontsize=8)
 
+        # $-1$ is the "no supported anchor" sentinel written by ``_per_batch_te_lag``, not a lag.
+        # ``run_te_lag_analysis`` strips it before ``median_argmax_lag``; stripping it here too is
+        # what keeps the drawn median and the reported one the same number.
+        argmax_lag = frame["argmax_lag"] if "argmax_lag" in frame else pd.Series(dtype=float)
         figures.histogram_panel(
-            axes[1, 0], frame.get("argmax_lag", pd.Series(dtype=float)),
+            axes[1, 0], argmax_lag[argmax_lag >= 0],
             title="Per-sample argmax of the lag attribution",
             xlabel="Model lag $\\ell$", bins=max(len(lag_columns), 1),
             color=figures.COLOR_PURPLE,
