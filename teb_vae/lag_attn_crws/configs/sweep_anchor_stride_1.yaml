@@ -1,0 +1,27 @@
+# Tiling ablation: train on every valid anchor rather than on a tile.
+#
+# At stride 1 the anchor set is the dense range [F, T_valid), which is what every other cell of the
+# grid decodes and what validation already decodes here -- so this arm is the control that says what
+# the tiling itself costs or buys, with nothing else moved.
+#
+# What the tiling changes, and therefore what this arm measures. Consecutive forecast windows at
+# stride 1 overlap (H-1)/H, so each raw sample is scored by up to H anchors: the loss weights every
+# sample H times and correlates the gradients within one batch element. At stride H the windows
+# partition the timeline, no sample is scored twice in a step, and every anchor is still reached over
+# epochs because the per-segment phase rotates. The arm also restores 152 decoded anchors per step
+# against the tiling's ~10.1, so the per-step loss variance falls by roughly an order of magnitude --
+# which is why `gradient_clip_val` and `additive_margin` are inherited rather than re-derived here:
+# both are set at the noisier setting and are therefore loose, not tight, on this arm.
+#
+# The memory cost is the reason this is an arm rather than the default: the four forecast tensors and
+# the target go from (B, 11, 15, 16) to (B, 152, 15, 16) EACH.
+#
+#   TEB_RUN_STAMP="$(date '+%Y-%m-%d--[%H-%M]')" torchrun --nproc_per_node=7 \
+#       -m teb_vae.lag_attn_crws.trainer --config teb_vae/lag_attn_crws/configs/sweep_anchor_stride_1.yaml
+base: default.yaml
+
+model_config:
+  VAE_model:
+    # 1 is the INERT value -- the dense range -- so this arm decouples the stride from the horizon
+    # deliberately, which is the one place in this package where they are allowed to differ.
+    anchor_stride: 1
