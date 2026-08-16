@@ -1,0 +1,78 @@
+# Instrumented development run: the PRODUCTION model geometry over the committed causal fixture.
+#
+# NOT a sweep arm and not a result config. It exists because the two loss-scale constants this cell
+# could inherit -- `advanced_config.trainer.gradient_clip_val` and
+# `advanced_config.spike_breaker.additive_margin` -- are both stated in units of the summed block and
+# are properties of the *optimisation*, so neither transfers across an encoder change by argument.
+# The conv-LSTM cell of this row measured them on its own encoder over this same fixture; this file
+# re-measures them on this one. One moved and one did not, and only a measurement could say which.
+#
+# WHY THE MODEL MAY NOT SHRINK. What is read here -- the pre-clip gradient-norm percentiles and the
+# breaker's own excursion of `main_loss` above its EMA -- is a property of the objective at the real
+# widths, the real block cardinality and the real anchor count. `tiny.yaml` shares the geometry but
+# ships `mse` and shrunken widths, so its nats are on a different scale entirely; `default.yaml`
+# points at production shards that do not exist yet. Hence a third file, and only the run's *scale*
+# is local: one device, one committed shard, hundreds of epochs rather than thousands.
+#
+# THE CLIP IS PARKED, DELIBERATELY. `gradient_clip_val: 1.0e+9` sits far above anything reachable, so
+# nothing rescales the steps the norms are drawn from -- a run measured under an active clip reports
+# the distribution of an already-clipped optimizer, which is not the distribution a threshold should
+# be set from. Set it back to a real value only after the measurement is recorded.
+#
+# THE LR RAMP IS SCALED INTO THIS RUN'S OWN STEP BUDGET. The shipped 2000 steps would outlast the
+# whole 600-step run, so every norm would be drawn from a model that had never trained at its own
+# learning rate -- and a gradient-norm distribution measured under a ramp is the ramp's distribution.
+# 100 steps is a sixth of the run, which leaves five sixths of it at the shipped rate.
+#
+# STEP COUNT: 600 optimizer steps. The committed fixture holds 4 windows and `batch_size.train` is 4,
+# so the whole shard is one batch and one epoch is exactly one optimizer step -- 600 epochs is 600
+# steps, and the whole-shard batch is the closest reachable analogue of a large-batch production
+# step. A batch of 1 over the same 600 steps is the noisier regime, present at its largest, and is
+# worth recording beside it rather than instead of it: it is 32x smaller than the shipped batch of
+# 128 and its percentiles are not the ones a production threshold is set from.
+#
+# WHAT THIS RUN IS NOT. Four in-sample windows are a thinner tail than a production run's, so every
+# percentile it produces is PROVISIONAL and describes a memorised window rather than the production
+# objective. It sets a starting threshold; the headline run's own `train/grad_norm` column re-derives
+# it. And every `val/` column here is in-sample -- a single-shard config uses one file for both
+# splits, because `dataset_kwargs` is shared between the two loaders -- so no coupling number from
+# this run is a result.
+#
+#   python -m teb_vae.lag_attn_transformer_crws.trainer \
+#       --config teb_vae/lag_attn_transformer_crws/configs/smoke_causal.yaml
+base: default.yaml
+
+general_config:
+  tag: lag_attn_trf_crws_smoke_causal
+  cuda_devices: [0]
+  # 600 epochs at one optimizer step each; see the header for why the two are equal here.
+  epochs: 600
+  plot_frequency: 100
+  # Scaled into this run's own step budget; see the header. The shipped 2000 would never complete.
+  lr_warmup_steps: 100
+  # The whole committed shard in one batch. The beta ramp is INHERITED at 50 epochs, which is a
+  # twelfth of this budget, so the measured distribution covers the regime after beta reaches its
+  # endpoint rather than only the ramp.
+  batch_size: {train: 4, test: 4}
+  folders_config: {out_dir_base: output/lag_attn_trf_crws_smoke_causal}
+
+dataset_config:
+  # Repo-root-relative: entry points run from the repo root. Both splits are the same committed
+  # shard; see the header for what that does and does not license. The same file the conv-LSTM cell
+  # of this row measured its own two constants on, deliberately: the encoder edge is only readable
+  # if both cells are read on the same data.
+  vae_train_datasets: [teb_vae/lag_attn/tests/fixtures/tiny_shard_causal.hdf5]
+  vae_test_datasets: [teb_vae/lag_attn/tests/fixtures/tiny_shard_causal.hdf5]
+  stat_path: teb_vae/lag_attn/tests/fixtures/tiny_stats_causal.hdf5
+  dataloader_config:
+    num_workers: 0       # no worker spawn for 4 samples
+
+advanced_config:
+  trainer:
+    # Parked far above anything reachable so the clip does not bind while the distribution it is
+    # supposed to be derived from is being recorded. This is the whole reason the file exists.
+    gradient_clip_val: 1.0e+9
+
+  tracking:
+    mlflow:
+      enabled: false     # a dev-box measurement run; the run directory is the record

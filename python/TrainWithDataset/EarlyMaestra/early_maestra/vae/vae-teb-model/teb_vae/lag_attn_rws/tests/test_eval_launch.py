@@ -34,6 +34,8 @@ ENTRY_POINTS: Tuple[str, ...] = (
     "teb_vae.lag_attn_transformer_rws.eval.run",
     "teb_vae.lag_attn_transformer_rws.eval.probe",
     "teb_vae.lag_attn_transformer_rws.eval.verify",
+    # Not an evaluation runner, but a runner: the architecture extractor is launched the same way.
+    "teb_vae.lag_attn_transformer_cfs.nets.arch_viz.extract_arch",
 )
 
 
