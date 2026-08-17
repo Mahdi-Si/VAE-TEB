@@ -42,6 +42,7 @@ from teb_vae.lag_attn_cfs.tests.conftest import (
     tiny_warmup_kwargs,
 )
 from teb_vae.lag_attn_rws.nets import controls
+from teb_vae.lag_attn_rws.nets.losses import raw_sample_score
 
 #: The two per-block source-warmth columns, and the three warm-up tertiles, named once.
 _WARMTH_KEYS = ("source_lag_warmth_frac_st", "source_lag_warmth_frac_ph")
@@ -188,7 +189,7 @@ def test_a_floor_that_violates_the_pairing_cannot_be_constructed() -> None:
 def test_the_anchor_count_is_the_geometry_derived_tile_count_at_train_stride() -> None:
     r"""Every phase in $[0, S)$ at once, so the reported mean is the real one:
     $\lceil (T_{\mathrm{valid}} - F - \varphi)/S \rceil$, which at the shipped geometry is $11$
-    for $\varphi \le 1$ and $10$ otherwise, summing to $152$ and averaging to $152/15$.
+    for $\varphi \le 16$ and $4$ otherwise, summing to $137$ and averaging to $137/30$.
 
     The numbers are re-derived here from the geometry rather than written down, so a horizon change
     moves the expectation with the model instead of failing this test.
@@ -201,22 +202,22 @@ def test_the_anchor_count_is_the_geometry_derived_tile_count_at_train_stride() -
     metrics = _synthetic_gaps(model, phase, stride, batch=stride)
 
     per_phase = [-(-(span - value) // stride) for value in range(stride)]
-    assert span == 152 and stride == SHIPPED_HORIZON
-    assert min(per_phase) == 10 and max(per_phase) == 11
+    assert span == 137 and stride == SHIPPED_HORIZON
+    assert min(per_phase) == 4 and max(per_phase) == 5
     assert sum(per_phase) == span
     assert float(metrics["anchors_per_sample"]) == pytest.approx(span / stride, rel=1e-6)
 
 
 def test_the_anchor_count_is_the_whole_valid_range_at_the_validation_stride() -> None:
     r"""Validation and test decode every valid anchor, so the count is
-    $T_{\mathrm{valid}} - F = 152$ exactly -- not a tile set at one fixed phase, which would sample
+    $T_{\mathrm{valid}} - F = 137$ exactly -- not a tile set at one fixed phase, which would sample
     the same $11$ positions of every segment forever."""
     model = build(shipped_warmup_kwargs())
     span = model.geometry.t_valid - model.warmup_period
 
     metrics = _synthetic_gaps(model, None, 1, batch=2)
 
-    assert span == 152
+    assert span == 137
     assert float(metrics["anchors_per_sample"]) == float(span)
 
 
@@ -559,3 +560,125 @@ def test_the_null_is_read_over_the_tiled_anchor_support(perturb_posterior) -> No
     assert float(controls.source_null_kld(model, tiled, streams[2], weight)) != pytest.approx(
         float(controls.source_null_kld(model, dense, streams[2], weight)), rel=1e-9
     )
+
+
+# =================================================================================================
+# The per-block reconstruction weights
+# =================================================================================================
+def test_the_default_weights_leave_the_objective_bitwise_uniform() -> None:
+    r"""The property that makes the keywords safe to add to a shipped family: at the constructor
+    default the resolved vector is exactly ones, and :func:`raw_sample_score` skips the
+    multiplication rather than performing it against them.
+
+    Asserted as **bitwise** equality rather than ``approx``, because "close" is not the claim. Every
+    cell of the grid that does not weight its channels must score the block it scored before this
+    mechanism existed, or the six-cell comparison silently spans two objectives.
+    """
+    model, _streams, _features = _tiled()
+
+    assert torch.equal(
+        model.target_channel_weight, torch.ones_like(model.target_channel_weight)
+    )
+
+    generator = torch.Generator().manual_seed(7)
+    shape = (2, 3, model.horizon, model.decoder_out_channels)
+    mu = torch.randn(shape, generator=generator)
+    target = torch.randn(shape, generator=generator)
+    logvar = torch.randn(shape, generator=generator) * 0.3
+
+    bare = raw_sample_score(mu, target, likelihood="gaussian_nll", logvar=logvar)
+    weighted = raw_sample_score(
+        mu, target, likelihood="gaussian_nll", logvar=logvar,
+        channel_weight=model.target_channel_weight,
+    )
+
+    assert torch.equal(bare, weighted)
+
+
+def test_the_weights_are_renormalised_to_leave_the_block_scale_alone() -> None:
+    r"""The renormalisation is what keeps the two loss-scale constants valid, so it is checked as
+    arithmetic rather than trusted: $\sum_c w_c = C_{\mathrm{keep}}$ whatever the pair, while the
+    ratio between the two blocks is exactly the configured one.
+
+    Without it, $(1.0, 0.1)$ would shrink the reconstruction against a KL that did not move -- an
+    effective $\beta$ change wearing a channel weight's name.
+    """
+    model, _streams, _features = _tiled(target_weight_st=1.0, target_weight_ph=0.1)
+    weights = model.target_channel_weight
+    keep = model.target_gate.keep_index.cpu()
+    split = CausalFeatureForecastTarget.TARGET_BLOCK_SPLIT
+
+    first = weights[keep < split]
+    second = weights[keep >= split]
+    assert first.numel() and second.numel(), "the tiny budget must keep some of both blocks"
+
+    assert float(weights.sum()) == pytest.approx(float(weights.numel()), rel=1e-6)
+    # One value per block, and the ratio the configuration states.
+    assert float(first.min()) == pytest.approx(float(first.max()), rel=1e-6)
+    assert float(second.min()) == pytest.approx(float(second.max()), rel=1e-6)
+    assert float(first[0]) / float(second[0]) == pytest.approx(10.0, rel=1e-5)
+
+
+@pytest.mark.parametrize("likelihood", ("mse", "gaussian_nll"))
+def test_the_channel_splits_still_recompose_under_weighting(
+    perturb_posterior, likelihood
+) -> None:
+    """The weighting reaches the objective and the splits together or it is a reporting bug.
+
+    ``pred_gap`` is computed from the weighted reconstruction terms while the block and tertile
+    splits are reduced separately; if the vector reached one and not the other, each split would be
+    a decomposition of a quantity the objective does not optimise -- which no column would show.
+
+    **All three comparisons use the cancellation bound here**, where the uniform test compares the
+    two splits against each other at $10^{-6}$ relative. That is not a loosened tolerance hiding a
+    defect: the two splits are separate reductions of one elementwise product, and weighting spreads
+    that product's magnitudes over a $10\times$ range, so the two float32 accumulation orders
+    diverge by more than they do when every element carries the same weight. The quantity being
+    compared is still a difference of two block sums of order $10^{3}$, which is exactly what
+    :data:`_CANCELLATION_EPS` bounds.
+    """
+    model, streams, features = _tiled(target_weight_st=1.0, target_weight_ph=0.1)
+    perturb_posterior(model)
+    _out, metrics = _metrics(
+        model, streams, features, torch.tensor([0, 3]), likelihood=likelihood
+    )
+
+    total = float(metrics["pred_gap"])
+    assert total != 0.0, "the probe is vacuous on an unperturbed model"
+    tertiles = sum(float(metrics[name]) for name in _TERTILE_KEYS)
+    blocks = float(metrics["pred_gap_st"]) + float(metrics["pred_gap_ph"])
+
+    slack = _CANCELLATION_EPS * abs(float(metrics["nll_base_block"]))
+    assert tertiles == pytest.approx(blocks, abs=slack)
+    assert tertiles == pytest.approx(total, abs=slack)
+    assert blocks == pytest.approx(total, abs=slack)
+
+
+def test_the_weighting_actually_moves_the_objective() -> None:
+    """The other half: a mechanism that recomposed perfectly and changed nothing would pass every
+    assertion above. The weighted and uniform models are built at one seed and scored on one batch,
+    so the only difference between the two numbers is the vector."""
+    uniform, streams, features = _tiled()
+    weighted, _s, _f = _tiled(target_weight_st=1.0, target_weight_ph=0.1)
+    phase = torch.tensor([0, 3])
+
+    _o1, uniform_metrics = _metrics(uniform, streams, features, phase)
+    _o2, weighted_metrics = _metrics(weighted, streams, features, phase)
+
+    assert float(uniform_metrics["nll_base_block"]) != pytest.approx(
+        float(weighted_metrics["nll_base_block"]), rel=1e-9
+    )
+
+
+def test_both_weights_at_zero_is_refused() -> None:
+    """It would scale by infinity and leave an objective with no reconstruction term at all -- a
+    model that trains, reports and optimises the KL alone."""
+    with pytest.raises(ValueError, match="both zero"):
+        _tiled(target_weight_st=0.0, target_weight_ph=0.0)
+
+
+def test_a_negative_weight_is_refused() -> None:
+    """A negative weight rewards error on that block. Refused by name rather than left to surface
+    as a loss that falls without bound."""
+    with pytest.raises(ValueError, match="target_weight_ph"):
+        _tiled(target_weight_st=1.0, target_weight_ph=-0.5)

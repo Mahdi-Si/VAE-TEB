@@ -12,17 +12,26 @@ there. The comparison is total rather than schema-limited: this model's net is a
 comparison model's whose constructor schema gains three keys and loses none, so every key means the
 same thing in both files and every key is comparable.
 
-The twenty exemptions fall into four kinds, and the split is the record rather than bookkeeping.
+The nineteen exemptions fall into four kinds, and the split is the record rather than bookkeeping.
 **Five are identity** -- the run tag, the output directory, the MLflow experiment, the run name and
 the variant tag -- and inheriting any of them writes these runs into the other model's tree. **Four
 are the dataset**: causal shards and the statistics accumulated from them, plus the two loader keys
-the tile phase is derived from. **Eight are the geometry the transform forces**: the channel widths
-the one-sided cascade leaves, the horizon, the anchor floor the warm-up budget pairs with, the three
-keys that have no two-sided counterpart, and the reach budget this dataset makes undefined. **Three
-are numbers re-derived at this objective's own scale**, and they are the ones worth reading twice:
-of the four loss-scale constants measured, only two moved. ``ema_floor`` and ``horizon_embed_std``
+the tile phase is derived from. **Seven are the geometry the transform forces**: the channel widths
+the one-sided cascade leaves, the anchor floor the warm-up budget pairs with, the three keys that
+have no two-sided counterpart, and the reach budget this dataset makes undefined. **Three are
+numbers re-derived at this objective's own scale**, and they are the ones worth reading twice: of
+the four loss-scale constants measured, only two moved. ``ema_floor`` and ``horizon_embed_std``
 landed on the comparison model's values and live in :data:`MEASURED_TO_MATCH_PATHS`, whose test
 asserts the equality so that it reads as a measurement rather than as an oversight.
+
+**The horizon left this list when it stopped being a divergence.** This cell shipped at $H = 15$
+against the comparison model's $30$, and that was its eighth geometry exemption; both now forecast
+two minutes, so the exemption would be a permission that outlived its reason and
+``test_every_declared_parity_exemption_is_a_real_divergence`` would report it. What the move did
+*not* do is make the nats comparable -- the block is $30 \times 98 = 2940$ against $30 \times 78 =
+2340$, because $C_{\mathrm{keep}}$ is what the warm-up budget decides -- and it reversed the sign of
+the margin's retune, which ``test_each_retuned_value_is_a_real_move_with_a_measured_reason``
+records.
 """
 from __future__ import annotations
 
@@ -117,10 +126,8 @@ PARITY_EXEMPT_PATHS: Dict[str, str] = {
     "model_config.VAE_model.c_y": GEOMETRY_REASON,
     "model_config.VAE_model.c_u": GEOMETRY_REASON,
     "model_config.VAE_model.warmup_period": GEOMETRY_REASON,
-    "model_config.VAE_model.horizon": (
-        "one minute rather than two: a shorter horizon lengthens T_valid and buys back anchors, "
-        "which is one of the two levers on the warm-up cost"
-    ),
+    # `horizon` is deliberately ABSENT: both cells forecast two minutes, so an exemption here would
+    # be a permission with no divergence behind it. See the module docstring.
     "model_config.VAE_model.causal_reach_budget_s": (
         "null and REQUIRED null: the forward reach L95 is an energy quantile of a two-sided kernel, "
         "measured on a bank that did not produce these coefficients, and a delay is a shift"
@@ -136,13 +143,20 @@ PARITY_EXEMPT_PATHS: Dict[str, str] = {
         "the lag validity floor, which has no two-sided counterpart; it ships at 0, where the lag "
         "mask is bitwise the comparison model's"
     ),
+    "model_config.VAE_model.target_weight_st": (
+        "the per-block reconstruction weights, which have no two-sided counterpart: the comparison "
+        "model scores its channels uniformly, and its objective is a log-density because of it"
+    ),
+    "model_config.VAE_model.target_weight_ph": (
+        "the second of the pair; see target_weight_st"
+    ),
     "advanced_config.trainer.gradient_clip_val": (
         "RETUNED: re-derived from a 600-step instrumented run at this geometry, where q99 of the "
-        "pre-clip norm is 5742 against the comparison model's 4421 -- this cell averages the same "
-        "summed block over ~10.1 anchors per step rather than ~240"
+        "pre-clip norm is 14181 against the comparison model's 4421 -- this cell averages a LARGER "
+        "summed block over ~4.57 anchors per step rather than ~240"
     ),
     "advanced_config.spike_breaker.additive_margin": (
-        "RETUNED: the margin is stated in nats of the summed block, and this block is 1470 "
+        "RETUNED: the margin is stated in nats of the summed block, and this block is 2940 "
         "coefficients against 2340; measured against the breaker's own excursion-above-EMA "
         "statistic rather than against the epoch-to-epoch movement"
     ),
@@ -368,7 +382,7 @@ def test_the_anchor_stride_equals_the_configured_horizon(shipped):
     that left the stride behind fails here rather than training a different objective."""
     vae = shipped["model_config"]["VAE_model"]
 
-    assert vae["anchor_stride"] == vae["horizon"] == 15
+    assert vae["anchor_stride"] == vae["horizon"] == 30
 
 
 def test_the_shipped_config_builds_a_decoder_as_wide_as_the_budget_keeps(tmp_path):
@@ -387,7 +401,7 @@ def test_the_shipped_config_builds_a_decoder_as_wide_as_the_budget_keeps(tmp_pat
     assert len(kwargs["target_keep_index"]) == 98
     assert model.decoder_out_channels == 98
     assert model.raw_per_step == 16  # untouched by the width
-    assert model.horizon * model.decoder_out_channels == 1470
+    assert model.horizon * model.decoder_out_channels == 2940
 
 
 # --------------------------------------------------------------------------------------
@@ -461,18 +475,25 @@ def test_the_two_weights_hold_the_anchor_ratio_the_design_fixes(shipped, sibling
 
 @pytest.mark.parametrize("path", RETUNED_PATHS)
 def test_each_retuned_value_is_a_real_move_with_a_measured_reason(shipped, sibling, path):
-    """Both moved because this cell averages the same objective over roughly a twenty-fourth of the
-    anchors per step, and the two moved in **opposite** directions -- the clip up, because the
-    per-step gradient is noisier, and the margin down, because it is stated in nats of a block that
-    shrank by a third. A retune that moved both the same way would be a sign the scale argument had
-    been applied to one axis only."""
+    r"""Both moved, and at this horizon both moved **up** -- which is a change from the one-minute
+    configuration and is the thing to read here.
+
+    The clip is up for the reason it always was: this cell averages the same objective over roughly
+    a thirtieth of the anchors per step (${\approx}4.57$ tiles against ${\approx}240$ dense
+    anchors), so the per-step gradient is far noisier whatever the horizon.
+
+    The margin is stated in nats of the summed block, and the block is what the horizon moved. At
+    $H = 15$ it was $1470$ coefficients against the comparison model's $2340$, so the margin shrank;
+    at $H = 30$ it is $2940$ against $2340$, so it grows instead. The sign of this comparison is
+    therefore a direct readout of which side has the larger block, and asserting it pins that the
+    retune followed the block rather than being carried over.
+    """
     assert float(_get(shipped, path)) != float(_get(sibling, path))
     assert "RETUNED" in PARITY_EXEMPT_PATHS[path]
 
-    if path.endswith("gradient_clip_val"):
-        assert float(_get(shipped, path)) > float(_get(sibling, path))
-    else:
-        assert float(_get(shipped, path)) < float(_get(sibling, path))
+    # Both up, for two different reasons: the clip because of the anchor count, the margin because
+    # this block is now the larger of the two.
+    assert float(_get(shipped, path)) > float(_get(sibling, path))
 
 
 @pytest.mark.parametrize("path", MEASURED_TO_MATCH_PATHS)
@@ -484,14 +505,15 @@ def test_each_measured_constant_landed_on_the_comparison_models_value(shipped, s
     ``ema_floor`` disables the relative spike test outright, and the property it needs is that it
     sits far above any *reachable* loss. The per-coefficient Gaussian NLL is bounded below by
     $0.5(\\log 2\\pi + \\texttt{logvar\\_clamp\\_lo}) \\approx -1.58$, so two reconstruction terms
-    over $1470$ coefficients cannot reach beyond $\\approx 4.6 \\times 10^{3}$ in magnitude -- five
-    orders of magnitude of headroom, exactly as at the larger block.
+    over $2940$ coefficients cannot reach beyond $\\approx 9.3 \\times 10^{3}$ in magnitude -- five
+    orders of magnitude of headroom, exactly as at the smaller block.
 
     ``horizon_embed_std`` is chosen against the post-initialisation *correlation* between two
     horizon tokens, which is a function of the embedding's scale against the broadcast projected
     latent's and does not depend on how many tokens there are. Measured on this model at $0.8$:
-    $0.445915$ at $H = 15$ against $0.447476$ at $H = 30$. The halved token count moved the third
-    decimal place.
+    $0.445915$ at $H = 15$ against $0.447476$ at $H = 30$. That token-count independence is why the
+    value needed no revisiting when the horizon moved -- it is the one geometry-adjacent constant
+    the change did not touch, which is exactly what makes it worth an assertion.
     """
     assert float(_get(shipped, path)) == float(_get(sibling, path))
     assert path not in PARITY_EXEMPT_PATHS
@@ -745,7 +767,7 @@ def test_the_resolved_tiny_variant_validates_and_builds(tmp_path, loguru_warning
     # production width and the forward still decodes the production tile count.
     assert model.d_model == 32
     assert model.decoder_out_channels == 98
-    assert model.anchor_stride == 15
+    assert model.anchor_stride == 30
 
 
 # --------------------------------------------------------------------------------------

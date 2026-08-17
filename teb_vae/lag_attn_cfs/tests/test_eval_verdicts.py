@@ -256,7 +256,7 @@ def test_a_geometry_off_either_number_fails(anchors: float, warm: float) -> None
 
 
 def test_the_expectation_comes_from_the_checkpoint_rather_than_a_shipped_literal() -> None:
-    """So a legitimate arm -- ``sweep_horizon_30``, ``sweep_floor_150`` -- moves the expectation
+    """So a legitimate arm -- ``sweep_horizon_15``, ``sweep_floor_150`` -- moves the expectation
     with the model instead of failing a guard written against the shipped geometry."""
     verdict = anchor_geometry_verdict(120.0, 1.0, expected_anchors_per_sample=120)
 

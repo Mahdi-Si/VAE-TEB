@@ -90,6 +90,7 @@ def raw_sample_score(
     *,
     likelihood: str,
     logvar: Optional[torch.Tensor] = None,
+    channel_weight: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     r"""The unmasked, unsummed score of every raw forecast sample.
 
@@ -112,12 +113,25 @@ def raw_sample_score(
     tensor and a fixed observation variance as a scalar; the returned score is the broadcast
     shape, which ``target`` always fixes to the full grid.
 
+    **``channel_weight`` makes the result a weighted score rather than a log-density**, and that
+    is the whole of what it costs. Passed, the per-element term becomes $w_c \cdot(-\log p)$, so a
+    sum over the block is no longer a negative log-likelihood in nats: $\beta = 1$ stops being the
+    exact ELBO and any $e^{\Delta/\text{block}}$ rescaling of a gap stops being a probability
+    statement. It exists because a feature block's last axis counts *channels* produced by two
+    different transforms, and weighting them equally is a choice rather than a neutral default --
+    which the raw-signal cells, whose last axis counts raw samples of one signal, have no analogue
+    of. ``None`` leaves the term bitwise the unweighted one.
+
     Args:
         mu: Forecast mean, broadcastable to $(B, T_{\mathrm{valid}}, H, R)$.
         target: Raw future target $(B, T_{\mathrm{valid}}, H, R)$.
         likelihood: ``'mse'`` or ``'gaussian_nll'``.
         logvar: Forecast log-variance, broadcastable to the same shape; required under
             ``'gaussian_nll'``, ignored under ``'mse'``.
+        channel_weight: Per-element weight on the **last** axis, broadcastable to the score's
+            shape -- $(C,)$ for a feature block. ``None`` applies no weighting at all rather than
+            a vector of ones, so an unweighted model's arithmetic is untouched rather than
+            multiplied by one.
 
     Returns:
         The per-raw-sample score $(B, T_{\mathrm{valid}}, H, R)$.
@@ -129,12 +143,13 @@ def raw_sample_score(
 
     diff2 = (target - mu) ** 2
     if likelihood == "mse":
-        return diff2
+        return diff2 if channel_weight is None else diff2 * channel_weight
     if logvar is None:
         raise ValueError(
             "likelihood='gaussian_nll' requires logvar; only 'mse' works without one"
         )
-    return 0.5 * (_LOG_2PI + logvar + diff2 * torch.exp(-logvar))
+    score = 0.5 * (_LOG_2PI + logvar + diff2 * torch.exp(-logvar))
+    return score if channel_weight is None else score * channel_weight
 
 
 def masked_raw_block_per_anchor(
@@ -144,6 +159,7 @@ def masked_raw_block_per_anchor(
     *,
     likelihood: str,
     logvar: Optional[torch.Tensor] = None,
+    channel_weight: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     r"""Each anchor's own masked block score, before any averaging.
 
@@ -167,6 +183,9 @@ def masked_raw_block_per_anchor(
         likelihood: ``'mse'`` or ``'gaussian_nll'``.
         logvar: Forecast log-variance $(B, T_{\mathrm{valid}}, H, R)$; required under
             ``'gaussian_nll'``, ignored under ``'mse'``.
+        channel_weight: Per-channel weight on the block's last axis; see
+            :func:`raw_sample_score`, which is where it is applied. ``None`` is the unweighted
+            block every raw-signal cell scores.
 
     Returns:
         ``(block_per_anchor, contributing)``, both $(B, T_{\mathrm{valid}})$: the summed block
@@ -175,7 +194,9 @@ def masked_raw_block_per_anchor(
     Raises:
         ValueError: On an unknown ``likelihood``, or ``'gaussian_nll'`` without ``logvar``.
     """
-    per_sample = raw_sample_score(mu, target, likelihood=likelihood, logvar=logvar)
+    per_sample = raw_sample_score(
+        mu, target, likelihood=likelihood, logvar=logvar, channel_weight=channel_weight
+    )
 
     block_per_anchor = (per_sample * mask[..., None]).sum(dim=(2, 3))  # (B, T_valid)
     # The same indicator kl_mask is built from, so the two terms are averaged over one anchor
@@ -193,6 +214,7 @@ def masked_raw_likelihood(
     *,
     likelihood: str,
     logvar: Optional[torch.Tensor] = None,
+    channel_weight: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     r"""Masked reconstruction loss, summed over the forecast block, averaged over anchors.
 
@@ -206,6 +228,11 @@ def masked_raw_likelihood(
         logvar: Forecast log-variance $(B, T_{\mathrm{valid}}, H, R)$; required under
             ``'gaussian_nll'``, ignored under ``'mse'``.
 
+        channel_weight: Per-channel weight on the block's last axis; see
+            :func:`raw_sample_score`. Under a non-``None`` weight ``d_sample`` divides by the
+            element *count* rather than by the weight sum, so it stays the same fixed rescaling of
+            ``d_block`` it always was rather than becoming a weighted mean.
+
     Returns:
         ``(d_block, d_sample)``: the per-anchor block value (summed over the $H \cdot R$
         samples, averaged over batch and contributing anchors) and the fixed rescaling
@@ -215,7 +242,7 @@ def masked_raw_likelihood(
         ValueError: On an unknown ``likelihood``, or ``'gaussian_nll'`` without ``logvar``.
     """
     block_per_anchor, contributing = masked_raw_block_per_anchor(
-        mu, target, mask, likelihood=likelihood, logvar=logvar
+        mu, target, mask, likelihood=likelihood, logvar=logvar, channel_weight=channel_weight
     )
 
     # Average over the anchors that contribute at all: a fully masked anchor (warm-up, gap,
@@ -574,6 +601,7 @@ def compute_loss(
     lambda_ms: float = 0.0,
     lambda_deriv: float = 0.0,
     lambda_boundary: float = 0.0,
+    channel_weight: Optional[torch.Tensor] = None,
 ) -> Dict[str, Any]:
     r"""Compute the seven-term objective, per anchor.
 
@@ -713,6 +741,7 @@ def compute_loss(
         mask,
         likelihood=likelihood,
         logvar=forward_outputs["logvar_full"],
+        channel_weight=channel_weight,
     )
     nll_base_block, nll_base_sample = masked_raw_likelihood(
         forward_outputs["mu_base"],
@@ -720,6 +749,7 @@ def compute_loss(
         mask,
         likelihood=likelihood,
         logvar=forward_outputs["logvar_base"],
+        channel_weight=channel_weight,
     )
 
     kld_btd = kld_tensor(

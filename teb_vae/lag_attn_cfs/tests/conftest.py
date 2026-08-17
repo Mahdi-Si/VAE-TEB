@@ -67,8 +67,10 @@ SHIPPED_BUDGET_STEPS = 134
 #: needs $F \ge B - 1$ and nothing more.
 SHIPPED_WARMUP_PERIOD = 133
 
-#: The shipped forecast horizon (one minute) and the sequence length the loader's trim produces.
-SHIPPED_HORIZON = 15
+#: The shipped forecast horizon (two minutes) and the sequence length the loader's trim produces.
+#: Mirrors ``configs/default.yaml``; ``test_config_load.py`` reads the config independently, so the
+#: two routes disagreeing is what catches one of them going stale.
+SHIPPED_HORIZON = 30
 SHIPPED_SEQUENCE_LENGTH = 300
 
 #: The trim the shipped configuration reads the shards at, which is also what the committed

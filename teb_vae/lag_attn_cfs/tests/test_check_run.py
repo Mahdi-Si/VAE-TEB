@@ -18,7 +18,7 @@ asserted directly and are easy to lose in a rewrite:
 
 The anchor band is derived from the run's own resolved configuration rather than hard-coded, which
 the geometry test exercises with a configuration none of the shipped arms uses: a checker carrying
-the shipped $[10, 11]$ and $152$ as literals would pass a horizon arm for the wrong reason.
+the shipped $[4, 5]$ and $137$ as literals would pass a horizon arm for the wrong reason.
 """
 from __future__ import annotations
 
@@ -51,10 +51,10 @@ ROWS = 12
 
 #: The anchor counts the shipped geometry implies, written out **here** rather than imported, so
 #: the checker's own derivation is compared against a hand computation rather than against itself.
-#: $T_{\mathrm{valid}} = 300 - 15 = 285$, floor $133$, so $152$ anchors and
-#: $\lceil 152/15 \rceil = 11$ tiles at phase $0$ against $10$ at the last.
-SHIPPED_DENSE_ANCHORS = 152
-SHIPPED_TILE_BAND = (10, 11)
+#: $T_{\mathrm{valid}} = 300 - 30 = 270$, floor $133$, so $137$ anchors and
+#: $\lceil 137/30 \rceil = 5$ tiles at phase $0$ against $4$ at the last.
+SHIPPED_DENSE_ANCHORS = 137
+SHIPPED_TILE_BAND = (4, 5)
 
 
 def _row(epoch: int) -> Dict[str, Any]:
@@ -86,7 +86,7 @@ def _row(epoch: int) -> Dict[str, Any]:
         row[f"{stage}/source_lag_warmth_frac_ph"] = 0.02
     # The tiling: a training step's value is the batch mean over per-segment phases, so it sits
     # strictly inside the band, while both evaluation stages decode every valid anchor.
-    row["train/anchors_per_sample"] = 10.4
+    row["train/anchors_per_sample"] = 4.6
     row["val/anchors_per_sample"] = float(SHIPPED_DENSE_ANCHORS)
     row["train/total_loss"] = 1500.0 - epoch
     row["train/spike_skipped"] = 0.0
@@ -254,8 +254,8 @@ def test_a_clean_run_passes_every_derivable_criterion(tmp_path, capsys):
         # code predating the constructor's budget-and-floor refusal.
         (1, "val/target_warm_frac", 0.999999),
         # The tiling is not the one the configuration states.
-        (2, "train/anchors_per_sample", 8.0),
-        (2, "val/anchors_per_sample", 151.0),
+        (2, "train/anchors_per_sample", 3.0),
+        (2, "val/anchors_per_sample", 136.0),
         # The loss went non-finite, which the breaker's own guard should have caught first.
         (3, "train/total_loss", float("nan")),
         # The breaker latched: the margin is mis-tuned for this objective.
@@ -338,10 +338,13 @@ def test_the_anchor_band_is_the_hand_computed_one_at_the_shipped_geometry():
 
 
 def test_the_band_follows_the_run_rather_than_the_shipped_numbers(tmp_path, capsys):
-    """A checker carrying $[10, 11]$ and $152$ as literals would pass an arm at another horizon,
+    """A checker carrying $[4, 5]$ and $137$ as literals would pass an arm at another horizon,
     floor or stride for the wrong reason -- and three shipped arms move one of the three. Here the
-    history is the shipped one and the configuration is not, so the counts must be *rejected*."""
-    write_run(tmp_path, geometry={"horizon": 30, "anchor_stride": 30})
+    history is the shipped one and the configuration is not, so the counts must be *rejected*.
+
+    The planted geometry is the one-minute arm, which is what the package ships as
+    ``sweep_horizon_15.yaml``; before the shipped horizon moved it was the two-minute one."""
+    write_run(tmp_path, geometry={"horizon": 15, "anchor_stride": 15})
 
     code = check_run.main(run_dir=str(tmp_path))
 

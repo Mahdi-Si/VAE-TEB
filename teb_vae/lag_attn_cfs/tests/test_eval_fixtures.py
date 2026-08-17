@@ -216,7 +216,7 @@ def test_the_channel_widths_match_the_models_data_contract(batches) -> None:
 
 
 def test_the_dense_anchor_set_the_evaluation_decodes_at_is_the_full_one(batches) -> None:
-    r"""$[F, T - H) = [133, 285)$ is 152 anchors, and the evaluation decodes every one of them.
+    r"""$[F, T - H) = [133, 270)$ is 137 anchors, and the evaluation decodes every one of them.
 
     Derived from the length the LOADER yields rather than from the config constant, because a
     fixture written at a shorter window would leave the evaluation with no anchors at all and the
@@ -225,7 +225,7 @@ def test_the_dense_anchor_set_the_evaluation_decodes_at_is_the_full_one(batches)
     served = int(batches[0]["fhr_st"].shape[1])
 
     assert served == SHIPPED_SEQUENCE_LENGTH
-    assert served - SHIPPED_HORIZON - SHIPPED_WARMUP_PERIOD == 152
+    assert served - SHIPPED_HORIZON - SHIPPED_WARMUP_PERIOD == 137
 
 
 def test_all_the_clinical_fields_arrive_in_the_batch(batches) -> None:

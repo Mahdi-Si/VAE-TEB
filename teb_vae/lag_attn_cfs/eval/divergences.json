@@ -42,7 +42,7 @@
     },
     "collect.py": {
       "state": "divergent",
-      "reason": "Keys the per-anchor table on the forward's own anchor_index rather than on a row's position in the decoded set, because this cell gathers A_max anchors out of T_valid and a position is not the decimated step it scores. Retains four (152, 15, 98) forecast tensors per sample rather than blocks of a 4 Hz trace, records target_keep_index in collection.json for the kept-axis join, records what the pass cost and at what rate, and accumulates no cross-spectral sums because coherence is not ported."
+      "reason": "Keys the per-anchor table on the forward's own anchor_index rather than on a row's position in the decoded set, because this cell gathers A_max anchors out of T_valid and a position is not the decimated step it scores. Retains four (137, 30, 98) forecast tensors per sample rather than blocks of a 4 Hz trace, records target_keep_index in collection.json for the kept-axis join, records what the pass cost and at what rate, and accumulates no cross-spectral sums because coherence is not ported."
     },
     "config_schema.py": {
       "state": "divergent",
@@ -95,7 +95,7 @@
     },
     "report_seam.py": {
       "state": "divergent",
-      "reason": "The mechanism is the sibling's, bound object for bound object. Three content differences: the headline registry drops the three coherence entries and reports the calibration gain per coefficient rather than per element of a 4 Hz trace; HEADLINE_VERDICTS carries ten rather than eight, adding coupling_exceeds_availability_clock and anchor_geometry_intact; and the sanity block drops the two cross-spectral checks, which describe an estimator this package does not have. PRED_GAP_CONVENTION states the 1470-coefficient block and that the likelihood percentage is budget-local."
+      "reason": "The mechanism is the sibling's, bound object for bound object. Three content differences: the headline registry drops the three coherence entries and reports the calibration gain per coefficient rather than per element of a 4 Hz trace; HEADLINE_VERDICTS carries ten rather than eight, adding coupling_exceeds_availability_clock and anchor_geometry_intact; and the sanity block drops the two cross-spectral checks, which describe an estimator this package does not have. PRED_GAP_CONVENTION states the 2940-coefficient block and that the likelihood percentage is budget-local."
     },
     "run.py": {
       "state": "divergent",
@@ -103,7 +103,7 @@
     },
     "spectra.py": {
       "state": "absent",
-      "reason": "Not ported at all. It estimates cross-spectra from a 4 Hz raw residual; here a tau-slice gives 152 samples at 0.25 Hz per channel over band-limited envelopes, and the analysing filter's phase was discarded before the coefficient was stored. The frequency-resolved question is answered instead by spectral_skill, on the frequency axis the channels already carry."
+      "reason": "Not ported at all. It estimates cross-spectra from a 4 Hz raw residual; here a tau-slice gives 137 samples at 0.25 Hz per channel over band-limited envelopes, and the analysing filter's phase was discarded before the coefficient was stored. The frequency-resolved question is answered instead by spectral_skill, on the frequency axis the channels already carry."
     },
     "verify.py": {
       "state": "divergent",
@@ -127,7 +127,7 @@
     },
     "analyses/coupling.py": {
       "state": "divergent",
-      "reason": "Arithmetic unchanged; pred_gap_mc_likelihood_pct divides by H*C_keep = 1470 and is therefore budget-local, which the emitted record states."
+      "reason": "Arithmetic unchanged; pred_gap_mc_likelihood_pct divides by H*C_keep = 2940 and is therefore budget-local, which the emitted record states."
     },
     "analyses/cross_subgroup.py": {
       "state": "divergent",
@@ -143,7 +143,7 @@
     },
     "analyses/forecast.py": {
       "state": "divergent",
-      "reason": "The three trivial baselines are rebuilt in feature space on the decimated grid and the horizon curve runs over 15 steps. Every column in a clinical unit is removed rather than repointed -- a wavelet modulus has no clinical unit and inverting the per-channel statistics would put the 98 scored channels on scales spanning orders of magnitude, which destroys the pooled mean squared error and the skill ratio -- so the error table reports the z-unit columns alone. The forecast overlay draws three kept channels against lead time rather than one trace, because what is forecast is an H x C_keep block, and it indexes the retained anchor axis by position rather than by decimated step: this model gathers its anchors, so the floor of 133 is not a valid index into a 152-long axis."
+      "reason": "The three trivial baselines are rebuilt in feature space on the decimated grid and the horizon curve runs over 30 steps. Every column in a clinical unit is removed rather than repointed -- a wavelet modulus has no clinical unit and inverting the per-channel statistics would put the 98 scored channels on scales spanning orders of magnitude, which destroys the pooled mean squared error and the skill ratio -- so the error table reports the z-unit columns alone. The forecast overlay draws three kept channels against lead time rather than one trace, because what is forecast is an H x C_keep block, and it indexes the retained anchor axis by position rather than by decimated step: this model gathers its anchors, so the floor of 133 is not a valid index into a 137-long axis."
     },
     "analyses/lag_kl.py": {
       "state": "divergent",

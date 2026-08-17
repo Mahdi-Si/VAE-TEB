@@ -19,7 +19,7 @@ general_config:
   batch_size:
     # 32, not the training 128. Under no_grad the activation retention that dominates training is
     # gone, but the transients are not: the pass decodes four scored branches over
-    # A = 152 anchors x H = 15 steps x C_keep = 98 channels at K Monte Carlo draws, which is two
+    # A = 137 anchors x H = 30 steps x C_keep = 98 channels at K Monte Carlo draws, which is two
     # ~894 KB tensors per branch per draw — about 1.8 MB per batch element — plus the (T, M, L)
     # attention weights at (300, 4, 91). That is roughly 1.7x the raw cells' per-sample decode, and
     # 32 still leaves the transient under 60 MB, so the sibling's value transfers rather than being
@@ -200,7 +200,7 @@ eval_config:
   # and a directory missing a figure reads like a model that had nothing to show rather than a run
   # that was never asked. The values are bounds on retention, not on what is measured.
   #
-  #   waveforms  64  HALVED from the raw cells' 128. A retained set here is four (152, 15, 98) fp32
+  #   waveforms  64  HALVED from the raw cells' 128. A retained set here is four (137, 30, 98) fp32
   #                  tensors, ~3.4 MiB per sample against their ~2.0 MiB, so 64 holds about the
   #                  same ~220 MB. Lower it first if a box is tight.
   #   attention  64  unchanged; ~437 KB per sample at (T, M, L) = (300, 4, 91), which this cell

@@ -279,7 +279,7 @@ PRED_GAP_CONVENTION = (
     "the average likelihood over K latent draws. pred_gap_train_path_nats is the single-draw "
     "training-path difference, reported beside it as the objective-parity column. "
     "A block here is H*C_keep target coefficients -- 15 horizon steps by the 98 channels the "
-    "warm-up budget kept, 1470 at the shipped geometry -- and not a 480-sample raw window: the "
+    "warm-up budget kept, 2940 at the shipped geometry -- and not a 480-sample raw window: the "
     "forecast is over wavelet-modulus and phase-harmonic coefficients in the loader's z units, "
     "and there is no bpm anywhere in this pipeline. "
     "Three percentage columns restate the same finding as a proportion, each computed per "

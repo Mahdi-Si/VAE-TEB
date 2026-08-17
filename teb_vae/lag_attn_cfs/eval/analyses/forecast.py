@@ -3,7 +3,7 @@ r"""Is the forecast any good, against predictors that know nothing, and where in
 Every other readout in this pipeline is about the *coupling* -- what the source adds. This one is
 about the forecast itself, and it exists because a block score alone cannot answer the question. A
 block score of several hundred nats per anchor is not a number anybody can judge: it is a negative
-log density summed over $H \cdot C_{\mathrm{keep}} = 1470$ coefficients, so it is large under every
+log density summed over $H \cdot C_{\mathrm{keep}} = 2940$ coefficients, so it is large under every
 predictor and its scale is set by the block size rather than by the model. Two things make it
 readable, and a third says where in the forecast window the answer holds.
 

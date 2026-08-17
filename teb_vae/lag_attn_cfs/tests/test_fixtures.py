@@ -116,7 +116,7 @@ def test_the_tiny_geometry_reproduces_the_shipped_pairing_in_miniature():
     assert TINY_STRIDE == TINY_HORIZON
     assert TINY_WARMUP_PERIOD < TINY_SEQ_LEN - TINY_HORIZON
     assert SHIPPED_WARMUP_PERIOD == SHIPPED_BUDGET_STEPS - 1
-    assert SHIPPED_SEQUENCE_LENGTH - SHIPPED_HORIZON == 285
+    assert SHIPPED_SEQUENCE_LENGTH - SHIPPED_HORIZON == 270
 
 
 # --------------------------------------------------------------------------------------

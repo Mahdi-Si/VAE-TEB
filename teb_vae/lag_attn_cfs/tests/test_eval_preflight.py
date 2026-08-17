@@ -626,9 +626,9 @@ def test_the_anchor_geometry_records_both_strides(model) -> None:
     record = preflight.anchor_geometry(model)
 
     assert record["evaluation_stride"] == 1
-    assert record["anchors_per_sample"] == record["t_valid"] - record["anchor_floor"] == 152
+    assert record["anchors_per_sample"] == record["t_valid"] - record["anchor_floor"] == 137
     assert record["training_stride"] == SHIPPED_HORIZON
-    assert record["training_anchors_per_sample_max"] == -(-152 // SHIPPED_HORIZON)
+    assert record["training_anchors_per_sample_max"] == -(-137 // SHIPPED_HORIZON)
     assert record["block_width"] == SHIPPED_HORIZON * record["target_kept_width"]
 
 
@@ -758,7 +758,7 @@ def test_the_completed_record_carries_the_resolved_budget_beside_the_statement(
     assert causality["warmup_budget"]["budget_steps"] == 134
     assert causality["warmup_budget"]["target_kept_width"] == 98
     assert causality["lag_support"]["lag_support_margin_steps"] == SHIPPED_LAG_SUPPORT_MARGIN
-    assert causality["anchor_geometry"]["anchors_per_sample"] == 152
+    assert causality["anchor_geometry"]["anchors_per_sample"] == 137
     assert "stored-coefficient time" in causality["lag_axis"]["label"]
     assert "not a transfer entropy" in causality["lag_axis"]["caveat"]
 

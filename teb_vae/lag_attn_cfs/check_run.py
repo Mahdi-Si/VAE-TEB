@@ -29,7 +29,7 @@ never a tier-2 value.
 
 **The anchor band is derived, never assumed.** ``anchors_per_sample`` is compared against
 $\lceil (T_{\mathrm{valid}} - F)/S \rceil$ and its phase-dependent floor, computed from the run's
-own ``resolved_config.yaml``. Hard-coding the shipped $[10, 11]$ and $152$ would make the checker
+own ``resolved_config.yaml``. Hard-coding the shipped $[4, 5]$ and $137$ would make the checker
 pass a run at another horizon, floor or stride for the wrong reason -- and the arms that move all
 three ship in ``configs/``.
 
@@ -368,7 +368,7 @@ def check_gap_recomposition(rows: Sequence[Dict[str, str]]) -> Verdict:
 
     Compared **split against split** rather than either against ``pred_gap``, deliberately.
     ``pred_gap`` is ``nll_base_block - nll_full_block``, a difference of two order-$10^{3}$ sums over
-    $1470$ coefficients, so it loses several decimal digits to cancellation *before* any split is
+    $2940$ coefficients, so it loses several decimal digits to cancellation *before* any split is
     formed; the two splits difference the same per-element scores elementwise and agree to float32
     noise, while neither agrees with ``pred_gap`` to $10^{-6}$.
 

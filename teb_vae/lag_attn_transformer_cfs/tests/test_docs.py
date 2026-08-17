@@ -289,15 +289,23 @@ def test_the_encoder_axis_delta_is_the_two_history_encoders(design, measured_tot
 def test_the_target_axis_delta_decomposes_into_the_three_terms_the_design_states(
     design, measured_totals
 ):
-    """The decoder head, the halved horizon's embedding and the two adapters — and it must be the
-    same delta the conv-LSTM pair shows, because every module outside the encoders is shared."""
+    """The decoder head and the two adapters — and it must be the same delta the conv-LSTM pair
+    shows, because every module outside the encoders is shared.
+
+    **The horizon embedding is no longer a term**, and its absence is the thing to notice. It used
+    to contribute $-15 \\times 256 = -3840$, the halved horizon at ``decoder_hidden``; both cells now
+    forecast $30$ steps, so the two embeddings are the same size and the term is exactly zero. It is
+    written out below rather than dropped so that a future horizon divergence reappears here as a
+    failing sum rather than as a silently wrong total.
+    """
     section = _markdown_section(design, "## 13. ")
     delta = measured_totals["trf_cfs_guarded"] - measured_totals["trf_fs_guarded"]
 
     head = 514 * (98 - 78)
-    horizon_embedding = -15 * 256
+    horizon_embedding = (30 - 30) * 256
     adapters = 128 * (98 - 78) * 2 + 128 * (51 - 29) * 2 - 256
 
+    assert horizon_embedding == 0, "the two cells' horizons diverged; §13 needs its third term back"
     assert delta == head + horizon_embedding + adapters
     assert delta == measured_totals["cfs_guarded"] - measured_totals["fs_guarded"]
     for value in (delta, head, adapters):
@@ -344,11 +352,14 @@ def test_the_causality_claim_is_unconditional_and_says_what_makes_it_so(design):
 def test_the_design_names_both_edges_and_says_what_is_comparable_along_each(design):
     """The trap the square makes easy: both cells sum the same block over the same anchor count
     across the *encoder* edge, so a loss level is comparable there; across the *target* edge the
-    block is 1470 against 2340 and the horizon 15 against 30, so it is not."""
+    block is 2940 against 2340, so it is not -- even though the horizons now agree at 30, which is
+    the half of the claim that changed and the half a stale reading would get wrong."""
     section = _flat(_markdown_section(design, "## 5. "))
 
     assert "The encoder edge, against `lag_attn_cfs`: a loss *level* is comparable" in section
-    assert "The target edge, against `lag_attn_transformer_fs`: a loss level is *not* comparable" in section
+    assert "The target edge, against `lag_attn_transformer_fs`: a loss level is still *not* comparable" in section
+    # The horizon stopped being one of the reasons, and the section has to say which reason is left.
+    assert "for one reason now rather than two" in section
     assert "Not comparable across warm-up budgets within this model" in section
     assert "mutually unloadable checkpoints" in section
 
@@ -643,7 +654,7 @@ def test_the_encoder_edge_names_the_cross_cell_table_that_renders_it(results):
 def test_the_record_states_that_the_nats_are_comparable_to_no_other_target_domain(results):
     """Both halves: across the target axis, because the block differs, and across budgets within
     this model, because ``C_keep`` is what the budget decides."""
-    assert "1470" in results
+    assert "2940" in results
     assert "2340" in results
     assert "two budgets are not comparable" in results
 

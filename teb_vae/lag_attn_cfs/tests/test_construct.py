@@ -123,7 +123,7 @@ def test_the_geometry_defaults_are_the_causal_ones() -> None:
     }
     assert defaults["c_y"] == CAUSAL_C_Y
     assert defaults["c_u"] == CAUSAL_C_U
-    assert defaults["horizon"] == 15
+    assert defaults["horizon"] == 30
     assert defaults["warmup_period"] == 133
     # The inert defaults: a model built with no opinion decodes densely and floors no lag, which is
     # what every sibling does. The tiling is a configuration decision and the config states it.

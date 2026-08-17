@@ -5,7 +5,7 @@ horizon and depth arms answer questions about the target domain, which
 ``teb_vae/lag_attn_cfs/configs`` already asks; the encoder arms answer questions about the encoder,
 which ``teb_vae/lag_attn_transformer_rws/configs`` already asks. The tiling arm is the only one whose
 answer could differ between the two encoders, because what it moves is the per-step gradient noise --
-$152$ decoded anchors against $\approx 10.1$ -- and a pre-normalised attention stack is exactly the
+$137$ decoded anchors against $\approx 4.57$ -- and a pre-normalised attention stack is exactly the
 architecture whose stability is sensitive to that.
 
 These tests are a lint, not a fit. They exist so a malformed arm is caught on the development box --
@@ -127,7 +127,7 @@ def test_the_stride_arm_restores_the_dense_anchor_set():
     floor, stride, _horizon, t_valid = _geometry(_resolved("sweep_anchor_stride_1.yaml"))
 
     assert stride == 1
-    assert -(-(t_valid - floor) // stride) == t_valid - floor == 152
+    assert -(-(t_valid - floor) // stride) == t_valid - floor == 137
 
 
 def test_the_default_moves_the_stride_with_the_horizon():

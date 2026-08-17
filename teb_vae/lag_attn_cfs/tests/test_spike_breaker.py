@@ -1,6 +1,6 @@
 r"""The loss-spike breaker under a sign-indefinite loss averaged over roughly ten anchors a step.
 
-``main_loss`` here is a learned-variance Gaussian NLL summed over $H \cdot C_{\mathrm{keep}} = 1470$
+``main_loss`` here is a learned-variance Gaussian NLL summed over $H \cdot C_{\mathrm{keep}} = 2940$
 coefficients and averaged over the anchors the tiling decoded -- about $10.1$ at the shipped stride
 against the two-sided cell's $\approx 240$. Both halves of that matter and they pull in opposite
 directions: the block is $0.63\times$, so the loss *level* is smaller, while the anchor count is a
@@ -15,7 +15,7 @@ Ported rather than inherited, and the port earns its place: every threshold in t
 in nats of the summed block, so none of the two-sided cell's values transfer and none of its tests
 are evidence about this configuration. Each test below drives the breaker with the block **this**
 ``configs/default.yaml`` ships, at magnitudes this objective actually reaches -- the instrumented run
-the config's comments record saw ``main_loss`` inside $[-690, +4994]$ within 600 steps -- so a config
+the config's comments record saw ``main_loss`` inside $[-7556, +8487]$ within 600 steps -- so a config
 edit that regressed the behaviour fails here rather than on the production box.
 """
 from __future__ import annotations
@@ -38,9 +38,17 @@ KEPT_TARGET_CHANNELS = 98
 
 #: A loss magnitude this objective genuinely reaches, used to settle a healthy negative EMA. Chosen
 #: from the instrumented run rather than scaled from the sibling's: that run's post-ramp half sat at
-#: $-119 \pm 295$ with a minimum of $-690$, so a few hundred negative is the regime the breaker has
+#: $-119 \pm 295$ with a minimum of $-7556$, so a few hundred negative is the regime the breaker has
 #: to be quiet in.
 _HEALTHY_LOSS = -500.0
+
+#: The worst excursion above the EMA the instrumented run measured at $H = 30$, in the noisiest
+#: regime the committed fixture can produce (batch 1, four distinct batches), after the breaker's own
+#: priming window. The margin has to clear it or ordinary batches are skipped -- which reads in the
+#: log exactly like a model that keeps blowing up. It is also the value the conv-Transformer cell's
+#: suite pins, because the two cells share one margin across the encoder edge and this is the larger
+#: of the two measurements.
+_WORST_MEASURED_EXCURSION = 5090.2
 
 
 def _shipped_breaker(**overrides) -> dict:
@@ -83,17 +91,24 @@ def _skipped(metrics) -> bool:
 # --------------------------------------------------------------------------------------
 # The thresholds this cell had to move, and the one it did not
 # --------------------------------------------------------------------------------------
-def test_the_margin_moved_down_and_the_floor_did_not():
+def test_the_margin_moved_up_and_the_floor_did_not():
     """One of the two moved and the other did not, and the reason is the whole design of the block.
-    ``additive_margin`` is stated in nats of the summed block, so it follows the block -- which
-    *shrank* by a third here, the first time in this family that a re-derivation moved a threshold
-    downwards. The ``ema_floor`` is not a scale at all: it is a switch that turns the relative test
-    off by sitting above any reachable loss, and "above any reachable loss" is satisfied by the same
-    number at either block size."""
+    ``additive_margin`` is stated in nats of the summed block, so it follows the block -- which is
+    $30 \\times 98 = 2940$ coefficients against the comparison model's $30 \\times 78 = 2340$, so the
+    margin sits above that model's.
+
+    **The direction reversed with the horizon.** At $H = 15$ this block was $1470$, the smaller of
+    the two, and this was the first re-derivation in the family to move a threshold *downwards*; at
+    $H = 30$ the same rule moves it up instead. The rule did not change and the block did, which is
+    what makes the sign of this comparison worth asserting rather than assuming.
+
+    The ``ema_floor`` is not a scale at all: it is a switch that turns the relative test off by
+    sitting above any reachable loss, and "above any reachable loss" is satisfied by the same number
+    at either block size."""
     mine = load_config(str(_CONFIG))["advanced_config"]["spike_breaker"]
     theirs = load_config(str(_SIBLING_CONFIG))["advanced_config"]["spike_breaker"]
 
-    assert mine["additive_margin"] < theirs["additive_margin"]
+    assert mine["additive_margin"] > theirs["additive_margin"]
     assert mine["ema_floor"] == theirs["ema_floor"] >= 1.0e9
     assert mine["multiplier"] == theirs["multiplier"]
     assert mine["max_consecutive_skips"] == theirs["max_consecutive_skips"]
@@ -101,10 +116,10 @@ def test_the_margin_moved_down_and_the_floor_did_not():
 
 def test_the_floor_still_exceeds_any_loss_this_objective_can_reach():
     r"""Confirmed rather than assumed, at the block that has to stay under it. The reconstruction is
-    summed over $1470$ coefficients and the per-coefficient Gaussian NLL is bounded below by
+    summed over $2940$ coefficients and the per-coefficient Gaussian NLL is bounded below by
     $\tfrac{1}{2}(\log 2\pi + \ell_{\min}) \approx -1.58$ at the shipped ``logvar_clamp`` floor of
     $-5$, so the two reconstruction terms cannot fall below about
-    $2 \times 1470 \times 1.58 \approx 4.6 \times 10^{3}$ in magnitude. The KL and the prior anchor
+    $2 \times 2940 \times 1.58 \approx 9.3 \times 10^{3}$ in magnitude. The KL and the prior anchor
     are both nonnegative and only add.
     """
     config = load_config(str(_CONFIG))
@@ -119,11 +134,19 @@ def test_the_floor_still_exceeds_any_loss_this_objective_can_reach():
 
 
 def test_the_margin_stays_inside_the_range_the_objective_can_reach():
-    r"""The check the sibling's larger margin would fail at this block size, and the reason the
-    re-derivation had to move it down rather than leave it alone. A margin above the whole reachable
-    magnitude makes the additive test **decoration**: no finite value could ever exceed
-    $\mathrm{EMA} + \mathrm{margin}$, and the breaker would degenerate to its non-finite guard alone
-    with nothing in the log saying so."""
+    r"""The **upper** of the two bounds that fix the margin, and at this horizon it is the binding
+    one. A margin above the whole reachable magnitude makes the additive test **decoration**: no
+    finite value could ever exceed $\mathrm{EMA} + \mathrm{margin}$, and the breaker would degenerate
+    to its non-finite guard alone with nothing in the log saying so.
+
+    The lower bound is
+    :func:`test_the_margin_clears_the_worst_excursion_the_instrumented_run_measured`, and the two
+    are now close: the measured worst excursion is $5090$ and the reachable magnitude is
+    $\approx 9296$, so the admissible band is roughly $[5090, 9296]$ and the shipped $9000$ sits
+    near its top. At $H = 15$ the same band was $[1089, 4646]$ and the shipped $3000$ sat in the
+    middle of it -- the band did not scale with the block, because the excursion grew faster than
+    the block did. If a future change narrows it to nothing, this pair of tests is what says so.
+    """
     config = load_config(str(_CONFIG))
     vae = config["model_config"]["VAE_model"]
     # Two reconstruction terms, each summed over the block, each per-coefficient value bounded below
@@ -138,27 +161,26 @@ def test_the_margin_stays_inside_the_range_the_objective_can_reach():
     margin = float(config["advanced_config"]["spike_breaker"]["additive_margin"])
 
     assert margin < reachable
-    sibling_margin = float(
-        load_config(str(_SIBLING_CONFIG))["advanced_config"]["spike_breaker"]["additive_margin"]
-    )
-    assert sibling_margin > reachable, (
-        "the comparison model's margin is not actually out of range at this block size, so the "
-        "reason recorded for moving it does not hold"
-    )
+
+    # The band is real rather than nominal: the margin has to fit between the measured excursion and
+    # the reachable magnitude, and at this block those two are within a factor of two of each other.
+    # Asserted here rather than left to the pair of tests, because "there is still room" is the
+    # property that would be lost silently by a further horizon increase.
+    assert _WORST_MEASURED_EXCURSION < margin < reachable
 
 
 def test_the_margin_clears_the_worst_excursion_the_instrumented_run_measured():
-    """The other side of the same threshold. The breaker's own statistic is the excursion above the
-    EMA, and the run recorded in the config's comments measured its maximum at $1{,}089$ nats after
-    the priming window -- in the noisiest regime the committed fixture can produce, four distinct
-    single-sample batches, which is $32\\times$ smaller than the shipped batch. A margin below that
-    would skip ordinary batches, which reads in the log exactly like a model that keeps blowing
-    up."""
+    """The **lower** of the two bounds that fix the margin. The breaker's own statistic is the
+    excursion above the EMA, and the run recorded in the config's comments measured its maximum at
+    $5{,}090$ nats after the priming window -- in the noisiest regime the committed fixture can
+    produce, four distinct single-sample batches, which is $32\\times$ smaller than the shipped
+    batch. A margin below that would skip ordinary batches, which reads in the log exactly like a
+    model that keeps blowing up."""
     margin = float(
         load_config(str(_CONFIG))["advanced_config"]["spike_breaker"]["additive_margin"]
     )
 
-    assert margin > 1089.2
+    assert margin > _WORST_MEASURED_EXCURSION
 
 
 # --------------------------------------------------------------------------------------

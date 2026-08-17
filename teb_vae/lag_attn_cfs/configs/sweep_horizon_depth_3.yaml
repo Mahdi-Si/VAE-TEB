@@ -1,11 +1,17 @@
 # Decoder-depth arm: three dilated refine blocks instead of four.
 #
-# The shipped depth is the two-sided sibling's, kept for PARITY rather than because the
-# receptive-field argument favours it: at kernel 3 the dilations are 2^i, so depth d spans
-# 1 + 2(2^d - 1) horizon tokens -- 15 at depth 3 and 31 at depth 4 -- and the sibling's own recorded
-# criterion is RF >= H + 1, which depth 3 fails at H = 15 by exactly one. The argument is moot in
-# both directions anyway, because `horizon_attention_blocks: 2` mixes every horizon token unmasked
-# after the refine stack, so no horizon token is out of reach at either depth.
+# THE QUESTION THIS ARM ASKS CHANGED WITH THE HORIZON, and the header says so rather than leaving
+# a reader to recompute it. At kernel 3 the dilations are 2^i, so depth d spans 1 + 2(2^d - 1)
+# horizon tokens -- 15 at depth 3 and 31 at depth 4 -- and the family's recorded criterion is
+# RF >= H + 1. At the one-minute horizon that was 16, which depth 3 missed by exactly one and depth
+# 4 cleared with room to spare. At H = 30 it is 31: depth 4 now meets it EXACTLY and depth 3 misses
+# it by sixteen, so this arm halves the refine stack's reach relative to the block it must cover
+# rather than trimming a comfortable margin.
+#
+# The argument is still moot in both directions on reachability alone, because
+# `horizon_attention_blocks: 2` mixes every horizon token unmasked after the refine stack, so no
+# horizon token is out of reach at either depth. What the arm measures is whether the LOCAL dilated
+# path matters once the block is 30 tokens wide.
 #
 # So the real case for depth 3 is parameter economy -- 328,960 fewer parameters -- and the case
 # against it is that a difference between this cell and the sibling would then have two candidate
