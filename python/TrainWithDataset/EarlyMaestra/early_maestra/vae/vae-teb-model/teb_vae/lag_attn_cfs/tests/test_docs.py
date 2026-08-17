@@ -274,20 +274,25 @@ def test_the_headline_paragraph_carries_the_measured_total_and_both_comparisons(
     assert measured_totals["trf_cfs_guarded"] in section  # the encoder-axis one
 
 
-def test_the_target_axis_delta_decomposes_into_the_three_terms_the_design_states(
+def test_the_target_axis_delta_decomposes_into_the_two_terms_the_design_states(
     design, measured_totals
 ):
-    r"""The decoder head, the halved horizon's embedding and the two adapters. Each is *evaluated*
-    from the document's own factorisation rather than merely searched for, because a section
-    carrying the right total beside a wrong decomposition of it is the half a reader takes on
-    trust."""
+    r"""The decoder head and the two adapters. Each is *evaluated* from the document's own
+    factorisation rather than merely searched for, because a section carrying the right total beside
+    a wrong decomposition of it is the half a reader takes on trust.
+
+    **The horizon embedding used to be a third term and is now exactly zero**, because this cell and
+    ``lag_attn_fs`` both forecast $30$ steps. It is computed rather than deleted so that a future
+    horizon divergence between the two reappears here as a failing sum.
+    """
     section = _markdown_section(design, "## 13. ")
     delta = measured_totals["cfs_guarded"] - measured_totals["fs_guarded"]
 
     head = 514 * (98 - 78)
-    horizon_embedding = -15 * 256
+    horizon_embedding = (30 - 30) * 256
     adapters = 128 * (98 - 78) * 2 + 128 * (51 - 29) * 2 - 256
 
+    assert horizon_embedding == 0, "the two cells' horizons diverged; §13 needs its third term back"
     assert delta == head + horizon_embedding + adapters, (
         f"the target-axis delta is {delta:+,}, which no longer decomposes into the decoder head "
         f"({head:+,}), the horizon embedding ({horizon_embedding:+,}) and the adapters "
@@ -746,7 +751,7 @@ def test_the_unset_clock_margin_is_recorded_as_an_open_item(results):
 def test_the_record_states_that_the_nats_are_comparable_to_no_other_target_domain(results):
     """Both halves: across the target axis, because the block differs, and across budgets within
     this model, because ``C_keep`` is what the budget decides."""
-    assert "1470" in results
+    assert "2940" in results
     assert "2340" in results
     assert "two budgets are not comparable" in results
 

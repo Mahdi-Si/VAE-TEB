@@ -19,7 +19,7 @@ likelihoods, which is a different and larger number.
 
 **The baselines.** Persistence, climatology and the segment's own mean, rebuilt **in feature
 space** (:func:`baseline_forecasts`) and scored through the same loss function over the same mask
-at the same anchors. A summed-$1470$-coefficient block score is a large number under every
+at the same anchors. A summed-$2940$-coefficient block score is a large number under every
 predictor -- its scale is set by the block, not by the model -- so it is only readable against
 predictors that know nothing. Their observation variance is fixed at $\sigma = 1$ in the loader's
 $z$ units and stated, because under a Gaussian likelihood a point predictor has no variance of its
@@ -480,7 +480,7 @@ def baseline_forecasts(
     r"""Build the three trivial forecasts, each constant over its anchor's block, per channel.
 
     They exist to answer the question a block NLL alone cannot: is the forecast *good*, or merely
-    arithmetically fine? A summed-$1470$-coefficient log-density is a large number under any
+    arithmetically fine? A summed-$2940$-coefficient log-density is a large number under any
     predictor, so the only readable form of it is a comparison against predictors that know
     nothing.
 
@@ -1518,7 +1518,7 @@ def evaluate_batch(
 
     Three latent-free forecasts are scored beside the four -- persistence, climatology and the
     segment mean (:func:`baseline_forecasts`), all in **feature space** -- through the same loss
-    function and the same mask, because a summed-$1470$-coefficient block score is a large number
+    function and the same mask, because a summed-$2940$-coefficient block score is a large number
     under any predictor and only a comparison says whether the model is good or merely
     arithmetically fine.
 
@@ -2127,7 +2127,7 @@ def aggregate_by_recording(readouts: Sequence[BatchReadout]) -> Aggregate:
             # A segment that scored no anchors -- every anchor gapped or below the coverage
             # floor -- measured nothing. Its columns are not small, they are absent: the
             # per-sample mean divides by a denominator clamped to 1, so an empty numerator
-            # reads as exactly 0.0. Averaging that in would pull a summed-1470-coefficient block
+            # reads as exactly 0.0. Averaging that in would pull a summed-2940-coefficient block
             # score (hundreds of nats) toward zero and shrink pred_gap, with no other symptom.
             if float(readout.n_anchors[position]) <= 0.0:
                 aggregate.n_samples_without_anchors += 1
@@ -2699,7 +2699,7 @@ def anchor_geometry_verdict(
 
     Two exact numbers, and both are structural rather than statistical:
 
-    * ``anchors_per_sample`` must be $T_{\mathrm{valid}} - F$ -- $152$ at the shipped geometry --
+    * ``anchors_per_sample`` must be $T_{\mathrm{valid}} - F$ -- $137$ at the shipped geometry --
       because the evaluation decodes densely. A different count means the forward ran at the
       *training* tiling, and every number in the run was then computed over a different population
       with nothing else in the summary saying so.
@@ -3208,14 +3208,14 @@ def expected_anchors_per_sample(model: Any) -> int:
     r"""The dense anchor count a run of this checkpoint must decode: $T_{\mathrm{valid}} - F$.
 
     Derived from the checkpoint's own geometry rather than stated, so a legitimate arm --
-    ``sweep_horizon_30``, ``sweep_floor_150`` -- moves the expectation with the model instead of
+    ``sweep_horizon_15``, ``sweep_floor_150`` -- moves the expectation with the model instead of
     failing a guard written against the shipped one.
 
     Args:
         model: The rebuilt net.
 
     Returns:
-        The count, $152$ at the shipped geometry.
+        The count, $137$ at the shipped geometry.
     """
     return int(model.geometry.t_valid) - int(model.warmup_period)
 

@@ -64,9 +64,9 @@ closing a specific failure:
 is per-anchor over is $H \cdot C_{\mathrm{keep}}$ coefficients, so a run at $H = 30$ scores twice
 the block a run at $H = 15$ does and its nats are larger for that reason alone.
 
-There is deliberately **no cross-target table against** ``lag_attn_fs``. The blocks differ (1470
-against 2340 coefficients) and so do the horizons, so a level comparison would invite exactly the
-reading both ``DESIGN.md`` records forbid.
+There is deliberately **no cross-target table against** ``lag_attn_fs``. The blocks differ (2940
+against 2340 coefficients) even though the horizons no longer do, so a level comparison would invite
+exactly the reading both ``DESIGN.md`` records forbid.
 """
 from __future__ import annotations
 

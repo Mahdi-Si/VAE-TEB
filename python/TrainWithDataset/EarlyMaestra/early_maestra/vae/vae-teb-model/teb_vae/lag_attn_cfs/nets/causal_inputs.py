@@ -19,7 +19,7 @@ masks, and no model composing this mixin accepts it.
 
 **The anchor tiling.** The forecast cannot begin at the model's own $30$-step warm-up, because the
 slowest kept target channel is not honest until step $134$; and once the floor is that high the
-dense anchor range costs a $(B, 152, H, C)$ tensor five times over for windows that overlap
+dense anchor range costs a $(B, 137, H, C)$ tensor five times over for windows that overlap
 $(H-1)/H$. The forward therefore decodes a *tiled* anchor set,
 
 $$\mathcal A(\varphi) = \{\, F + \varphi + kS \;:\; k \ge 0,\; F + \varphi + kS < T_{\mathrm{valid}} \,\},$$
@@ -62,6 +62,8 @@ CAUSAL_ONLY_KEYWORDS: Tuple[str, ...] = (
     "source_warmup_steps",
     "anchor_stride",
     "lag_floor",
+    "target_weight_st",
+    "target_weight_ph",
 )
 
 #: What a composing constructor removes from its own ``locals()`` before forwarding the rest to the
@@ -96,6 +98,8 @@ class CausalWarmupInputs:
     source_warmup_steps: Optional[Tuple[int, ...]]
     anchor_stride: int
     lag_floor: int
+    target_weight_st: float
+    target_weight_ph: float
 
     # ------------------------------------------------------------------
     # Construction
@@ -110,6 +114,8 @@ class CausalWarmupInputs:
         source_warmup_steps: Optional[Sequence[int]],
         anchor_stride: int,
         lag_floor: int,
+        target_weight_st: float,
+        target_weight_ph: float,
     ) -> None:
         r"""Validate this mixin's four keywords and set them, **before** the base constructor runs.
 
@@ -129,6 +135,10 @@ class CausalWarmupInputs:
             source_warmup_steps: The same for the source stream.
             anchor_stride: $S$, the spacing between decoded anchors, in $[1, H]$.
             lag_floor: $F_u$, the earliest source step lag attention may read.
+            target_weight_st: Relative reconstruction weight of the first stored target block.
+            target_weight_ph: The same for the second. The pair is stashed here and resolved into
+                the ``target_channel_weight`` buffer after the base constructor, because
+                registering a buffer needs ``nn.Module.__init__`` to have run.
 
         Raises:
             ValueError: If ``anchor_stride`` is outside $[1, H]$, if ``lag_floor`` is negative, or
@@ -167,6 +177,9 @@ class CausalWarmupInputs:
         )
         self.anchor_stride = int(anchor_stride)
         self.lag_floor = int(lag_floor)
+        # Validated where they are resolved, against the keep-index they are positional over.
+        self.target_weight_st = float(target_weight_st)
+        self.target_weight_ph = float(target_weight_ph)
 
     def _validate_causal_geometry(self) -> None:
         r"""Check what only the base's resolved geometry can decide, and resolve the readouts.
@@ -217,6 +230,27 @@ class CausalWarmupInputs:
         )
         kept_target = (
             self.c_y if self.target_gate is None else self.target_gate.out_channels
+        )
+
+        # The reconstruction's per-channel weight, in DECLARED channel coordinates through the
+        # gate's keep-index -- the survivors are not contiguous, so a positional split would put
+        # the boundary in the wrong place the moment the budget drops a channel. Registered
+        # non-persistent for the reason every budget-shaped tensor here is: its length is
+        # C_keep, so a persistent copy would make a checkpoint trained at one budget fail to load
+        # at another and report it as a missing key rather than as a budget mismatch.
+        declared_target = (
+            torch.arange(self.c_y)
+            if self.target_gate is None
+            else self.target_gate.keep_index.cpu()
+        )
+        self.register_buffer(
+            "target_channel_weight",
+            self._resolve_channel_weights(
+                declared_target.tolist(),
+                weight_st=self.target_weight_st,
+                weight_ph=self.target_weight_ph,
+            ),
+            persistent=False,
         )
         self.register_buffer(
             "warm_tertile_id",

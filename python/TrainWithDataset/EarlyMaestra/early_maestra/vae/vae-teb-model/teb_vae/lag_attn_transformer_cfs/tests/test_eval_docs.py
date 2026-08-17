@@ -173,7 +173,7 @@ def test_both_edges_are_stated_and_they_are_not_the_same_statement(eval_doc) -> 
     target_edge = eval_doc[eval_doc.index("Against `lag_attn_transformer_fs`"):]
 
     assert "is* comparable" in encoder_edge
-    assert "1470" in encoder_edge and "152" in encoder_edge
+    assert "2940" in encoder_edge and "137" in encoder_edge
     assert "not* comparable" in target_edge
     assert "2340" in target_edge and "30" in target_edge
 

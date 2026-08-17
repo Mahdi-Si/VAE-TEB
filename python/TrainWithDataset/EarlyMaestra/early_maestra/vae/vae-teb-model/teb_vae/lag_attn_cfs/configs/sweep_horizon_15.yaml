@@ -1,0 +1,43 @@
+# Horizon arm: forecast one minute instead of two, and buy back the anchors that costs.
+#
+# The reverse of the arm this file replaces. Until the shipped horizon moved to 30 this package
+# shipped at H = 15 and carried a `sweep_horizon_30.yaml` that restored comparability of the
+# horizon with the rest of the grid; the shipped value is now 30, so the arm that has something to
+# measure is the one that shortens it.
+#
+# WHAT IT MEASURES. Anchors live in [F, T - H), so halving H lengthens T_valid from 270 to 285 and
+# the dense anchor count from 137 to 152 -- and with the stride following it down, the decoded tiles
+# per sample rise from ~4.57 to ~10.1, roughly 2.2x the forecast supervision per optimizer step at
+# the same batch size. Against that, each anchor is asked a strictly easier question: the block
+# falls from 30 * 98 = 2940 coefficients to 15 * 98 = 1470, and the far horizon steps that carry
+# almost no predictable signal are the ones dropped. This arm is what separates "the longer horizon
+# hurt because the far steps are unpredictable" from "the longer horizon hurt because it halved the
+# anchor count", which no single run at either horizon can tell apart.
+#
+# `anchor_stride` moves with it, because the two are one decision: at S < H the windows overlap
+# again and at S > H there are target steps no phase ever covers. The constructor refuses the
+# second and tests/test_config_load.py asserts the equality in every arm.
+#
+# `horizon_depth` stays at 4. At H = 15 the refine stack's receptive field of 31 tokens clears the
+# family's RF >= H + 1 criterion with room to spare, where at the shipped horizon it meets it
+# exactly -- so this arm relaxes that constraint rather than tightening it, and holding the depth
+# keeps the arm a horizon contrast rather than a horizon-and-depth one.
+#
+# THE NATS ARE NOT COMPARABLE TO THE SHIPPED RUN'S. The block is 1470 against 2940, so every summed
+# quantity -- `total_loss`, `nll_base_block`, `pred_gap` -- is on a different scale. Read the sign,
+# the trajectory, the bottleneck-health columns and `anchors_per_sample`; do not read a level.
+#
+# `gradient_clip_val` and `additive_margin` are INHERITED rather than re-derived, and the direction
+# is what makes that safe: both were measured at the shipped block of 2940 coefficients, and this
+# arm halves it. A threshold measured at the larger loss scale is loose on the smaller one, never
+# tight, so neither guard can start binding on a healthy run here. Re-derive them if this arm is
+# ever promoted to a headline.
+#
+#   TEB_RUN_STAMP="$(date '+%Y-%m-%d--[%H-%M]')" torchrun --nproc_per_node=7 \
+#       -m teb_vae.lag_attn_cfs.trainer --config teb_vae/lag_attn_cfs/configs/sweep_horizon_15.yaml
+base: default.yaml
+
+model_config:
+  VAE_model:
+    horizon: 15
+    anchor_stride: 15

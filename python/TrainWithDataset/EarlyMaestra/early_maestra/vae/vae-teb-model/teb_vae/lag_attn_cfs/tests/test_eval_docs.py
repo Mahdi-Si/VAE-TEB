@@ -550,7 +550,7 @@ def test_the_interpretation_rules_are_all_present(eval_doc) -> None:
         "budget-local",                      # the percentage, and the nats one step removed
         "availability clock",                # the hazard no permutation control can see
         "expected finding",                  # a small source-lag warmth is not a fault
-        "/1470 rescale",                     # the rescaled per-anchor score
+        "/2940 rescale",                     # the rescaled per-anchor score
         "band-resolved skill, not coherence",  # what the frequency readout is and is not
     ):
         assert rule in eval_doc, f"EVAL.md no longer states: {rule!r}"
@@ -571,4 +571,4 @@ def test_the_dense_decoding_geometry_is_stated(eval_doc) -> None:
     tiling is not it. A document that did not say so would leave a reader reconciling an
     evaluation table against a training CSV computed over a different population."""
     assert "anchor_phase=0, anchor_stride=1" in eval_doc
-    assert "152" in eval_doc
+    assert "137" in eval_doc

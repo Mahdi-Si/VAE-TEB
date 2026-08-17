@@ -1,7 +1,7 @@
 r"""The loss-spike breaker at this encoder, on a sign-indefinite loss over roughly ten anchors.
 
-``main_loss`` here is a learned-variance Gaussian NLL summed over $H \cdot C_{\mathrm{keep}} = 1470$
-coefficients and averaged over the anchors the tiling decoded -- about $10.1$ at the shipped stride.
+``main_loss`` here is a learned-variance Gaussian NLL summed over $H \cdot C_{\mathrm{keep}} = 2940$
+coefficients and averaged over the anchors the tiling decoded -- about $4.57$ at the shipped stride.
 Both numbers are the conv-LSTM causal cell's, because the **encoder edge changes neither**, which is
 what makes the two breaker constants below inherited-and-re-measured rather than re-derived.
 
@@ -36,7 +36,7 @@ KEPT_TARGET_CHANNELS = 98
 
 #: A loss magnitude this objective genuinely reaches, used to settle a healthy negative EMA. Chosen
 #: from the instrumented run rather than scaled: that run's post-ramp half sat well below zero with
-#: a minimum of $-3660$, so a few hundred negative is comfortably inside the regime the breaker has
+#: a minimum of $-7464$, so a few hundred negative is comfortably inside the regime the breaker has
 #: to be quiet in.
 _HEALTHY_LOSS = -500.0
 
@@ -44,7 +44,11 @@ _HEALTHY_LOSS = -500.0
 #: committed fixture can produce (batch 1, four distinct batches), after the breaker's own priming
 #: window. The margin has to clear it or ordinary batches are skipped -- which reads in the log
 #: exactly like a model that keeps blowing up.
-_WORST_MEASURED_EXCURSION = 1403.9
+#:
+#: This is the CONV-LSTM cell's $5090.2$ rather than this cell's own $3927.5$, deliberately: the two
+#: cells share one margin because the encoder edge changes neither the block nor the anchor count,
+#: so the bar that has to be cleared is the larger of the two measurements.
+_WORST_MEASURED_EXCURSION = 5090.2
 
 
 def _shipped_breaker(**overrides) -> dict:
@@ -89,8 +93,8 @@ def _skipped(metrics) -> bool:
 # --------------------------------------------------------------------------------------
 def test_the_loss_scale_constants_are_the_encoder_siblings_and_the_clip_is_not():
     """The asymmetry the re-derivation found, as a test. ``additive_margin`` and ``ema_floor`` are
-    stated in nats of the summed block; the encoder edge changes neither the block ($1470$) nor the
-    anchor count ($\\approx 10.1$), so both must equal the conv-LSTM causal cell's exactly.
+    stated in nats of the summed block; the encoder edge changes neither the block ($2940$) nor the
+    anchor count ($\\approx 4.57$), so both must equal the conv-LSTM causal cell's exactly.
     ``gradient_clip_val`` is a gradient-norm statistic, and the encoder is precisely what moves
     it."""
     mine = load_config(str(_CONFIG))["advanced_config"]
@@ -106,22 +110,29 @@ def test_the_loss_scale_constants_are_the_encoder_siblings_and_the_clip_is_not()
     assert mine["trainer"]["gradient_clip_val"] != theirs["trainer"]["gradient_clip_val"]
 
 
-def test_the_margin_is_smaller_than_the_two_sided_conv_transformer_cells():
+def test_the_margin_is_larger_than_the_two_sided_conv_transformer_cells():
     """The other edge: the block *does* move across the transform, from $2340$ coefficients at
-    $\\approx 240$ anchors to $1470$ at $\\approx 10.1$, so the margin that cell ships is out of
-    range here."""
+    $\\approx 240$ anchors to $2940$ at $\\approx 4.57$, so the margin that cell ships is out of
+    range here.
+
+    The direction reversed when both causal cells went to the two-minute horizon. At $H = 15$ this
+    block was the *smaller* of the two ($1470$ against $2340$) and the margin shrank below the
+    two-sided cell's; at $H = 30$ it is the larger, and the margin grows past it. The sign of this
+    comparison is a readout of which side has the bigger block, which is why it is asserted rather
+    than assumed.
+    """
     mine = load_config(str(_CONFIG))["advanced_config"]["spike_breaker"]
     theirs = load_config(str(_TARGET_SIBLING))["advanced_config"]["spike_breaker"]
 
-    assert mine["additive_margin"] < theirs["additive_margin"]
+    assert mine["additive_margin"] > theirs["additive_margin"]
 
 
 def test_the_floor_still_exceeds_any_loss_this_objective_can_reach():
     r"""Confirmed rather than assumed, at the block that has to stay under it. The reconstruction is
-    summed over $1470$ coefficients and the per-coefficient Gaussian NLL is bounded below by
+    summed over $2940$ coefficients and the per-coefficient Gaussian NLL is bounded below by
     $\tfrac{1}{2}(\log 2\pi + \ell_{\min}) \approx -1.58$ at the shipped ``logvar_clamp`` floor of
     $-5$, so the two reconstruction terms cannot fall below about
-    $2 \times 1470 \times 1.58 \approx 4.6 \times 10^{3}$ in magnitude. The KL and the prior anchor
+    $2 \times 2940 \times 1.58 \approx 9.3 \times 10^{3}$ in magnitude. The KL and the prior anchor
     are both nonnegative and only add.
     """
     config = load_config(str(_CONFIG))
@@ -153,9 +164,9 @@ def test_the_margin_stays_inside_the_range_the_objective_can_reach():
 
 
 def test_the_margin_clears_the_worst_excursion_the_instrumented_run_measured():
-    """The other side of the same threshold, at this encoder's own measurement rather than the
-    conv-LSTM cell's -- which is what makes "it did not move" a re-derivation rather than an
-    inheritance."""
+    """The lower of the two bounds the margin sits between; ``_the_margin_stays_inside_the_range``
+    is the upper one, and at this horizon they are close enough that the pair genuinely fixes the
+    value rather than leaving a wide band."""
     margin = float(
         load_config(str(_CONFIG))["advanced_config"]["spike_breaker"]["additive_margin"]
     )
@@ -169,7 +180,7 @@ def test_the_clip_sits_above_the_measured_q99_and_below_the_measured_maximum():
     something to catch. Both numbers are the instrumented run's, recorded in the config."""
     clip = float(load_config(str(_CONFIG))["advanced_config"]["trainer"]["gradient_clip_val"])
 
-    assert 6025.2 < clip < 6521.1
+    assert 13059.7 < clip < 14380.7
 
 
 # --------------------------------------------------------------------------------------

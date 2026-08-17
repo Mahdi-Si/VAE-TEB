@@ -5,10 +5,15 @@ anchor tiling and the anchor floor -- plus one that every cell makes and this on
 (the horizon), plus one parity choice inherited rather than measured (the decoder depth).
 
 Each is the shipped configuration with the smallest key set that expresses the change, and one of
-them moves **two** keys rather than one: ``sweep_horizon_30.yaml`` moves the stride with the
+them moves **two** keys rather than one: ``sweep_horizon_15.yaml`` moves the stride with the
 horizon, because below the horizon the forecast windows overlap again and above it there are target
 steps no phase ever covers. That is the axis rather than a second delta, and the test below states
 it as such.
+
+The horizon arm points **down** rather than up, and that is a consequence of the shipped horizon
+moving to $30$: the arm that has something to measure is the one that shortens it. It replaced a
+``sweep_horizon_30.yaml`` that restored the two-minute horizon back when the default was one
+minute.
 
 These tests are a lint, not a fit. They exist so a malformed arm is caught on the development box --
 a key that does not resolve, a stray second delta, a stride left behind by a horizon change, a file
@@ -36,8 +41,9 @@ _ARMS: Dict[str, Dict[str, Any]] = {
     # The tiling ablation. 1 is the INERT stride -- the dense range every other cell of the grid
     # decodes -- so this arm is the control that says what the tiling costs or buys.
     "sweep_anchor_stride_1.yaml": {f"{_VAE}.anchor_stride": 1},
-    # The horizon arm, and the one that moves two keys: the stride is not free.
-    "sweep_horizon_30.yaml": {f"{_VAE}.horizon": 30, f"{_VAE}.anchor_stride": 30},
+    # The horizon arm, and the one that moves two keys: the stride is not free. It shortens the
+    # shipped two-minute horizon back to one minute, which buys anchors and costs forecast reach.
+    "sweep_horizon_15.yaml": {f"{_VAE}.horizon": 15, f"{_VAE}.anchor_stride": 15},
     # The ten-minute policy floor. The budget stays at 134, because the pairing requires
     # F >= B - 1 rather than equality.
     "sweep_floor_150.yaml": {f"{_VAE}.warmup_period": 150},
@@ -175,18 +181,19 @@ def test_an_arm_pairs_its_floor_with_the_shipped_budget(name):
     assert floor >= vae["causal_warmup_budget_steps"] - 1
 
 
-def test_the_horizon_arm_resolves_to_the_two_sided_block_width_and_its_own_tile_count():
-    """The arm is a horizon change, not a silent half-change. What it restores is the *question* --
-    how far ahead the model is asked to forecast -- and what it does not restore is the block, which
-    is $30 \\times 98$ against the two-sided sibling's $30 \\times 78$ because $C_\\mathrm{keep}$ is
-    what the warm-up budget decides."""
-    floor, stride, horizon, t_valid = _geometry(_resolved("sweep_horizon_30.yaml"))
+def test_the_horizon_arm_halves_the_block_and_buys_back_the_anchors_that_costs():
+    """The arm is a horizon change, not a silent half-change, and it points the opposite way from
+    the one this package used to ship: the default now forecasts two minutes, so the arm shortens
+    to one. What it buys is anchors -- $T_\\mathrm{valid}$ lengthens and the tile count more than
+    doubles -- and what it costs is forecast reach. The block halves with the horizon, to
+    $15 \\times 98$, so no nat from this arm is comparable to a shipped one."""
+    floor, stride, horizon, t_valid = _geometry(_resolved("sweep_horizon_15.yaml"))
     kept = 98
 
-    assert horizon == 30
-    assert horizon * kept == 2940
-    assert t_valid == 270  # against the shipped 285: the anchors the longer horizon costs
-    assert -(-(t_valid - floor) // stride) == 5  # A_max, from the geometry rather than a literal
+    assert horizon == 15
+    assert horizon * kept == 1470  # against the shipped 2940
+    assert t_valid == 285  # against the shipped 270: the anchors the shorter horizon buys back
+    assert -(-(t_valid - floor) // stride) == 11  # A_max, from the geometry rather than a literal
 
 
 def test_the_stride_arm_restores_the_dense_anchor_set():
@@ -196,18 +203,24 @@ def test_the_stride_arm_restores_the_dense_anchor_set():
     floor, stride, _horizon, t_valid = _geometry(_resolved("sweep_anchor_stride_1.yaml"))
 
     assert stride == 1
-    assert -(-(t_valid - floor) // stride) == t_valid - floor == 152
+    assert -(-(t_valid - floor) // stride) == t_valid - floor == 137
 
 
-def test_the_floor_arm_keeps_the_identical_channels_and_costs_exactly_two_tiles():
+def test_the_floor_arm_keeps_the_identical_channels_and_costs_exactly_one_tile():
     """The cost of the policy, stated as a number rather than as an argument: the same $98$ channels
-    (the budget did not move), two fewer tiles at phase $0$, and $17$ fewer covered target steps."""
+    (the budget did not move), one fewer tile at phase $0$, and $17$ fewer covered target steps.
+
+    The **withheld steps** are the invariant and the **tiles** are not. At the one-minute horizon
+    the same $17$-step floor cost two tiles; at two minutes each tile covers $30$ steps rather than
+    $15$, so the identical policy costs half as many whole tiles. Both numbers are asserted so that
+    a future horizon change fails here rather than quietly re-pricing the arm.
+    """
     shipped_floor, stride, _horizon, t_valid = _geometry(load_config(str(_DEFAULT)))
     arm_floor, arm_stride, _h, arm_t_valid = _geometry(_resolved("sweep_floor_150.yaml"))
 
     assert (arm_stride, arm_t_valid) == (stride, t_valid)
     assert arm_floor - shipped_floor == 17
-    assert -(-(t_valid - shipped_floor) // stride) - -(-(t_valid - arm_floor) // stride) == 2
+    assert -(-(t_valid - shipped_floor) // stride) - -(-(t_valid - arm_floor) // stride) == 1
 
 
 @pytest.mark.parametrize("name", sorted(_ARMS))

@@ -360,7 +360,7 @@ def test_both_gap_splits_recompose_to_the_gap_in_the_same_row(fit):
     some other quantity would pass every test above.
 
     The tolerance is **absolute** rather than relative, and that is measured rather than lax:
-    ``pred_gap`` is a difference of two sums over $1470$ coefficients running to $\\approx 10^{3}$
+    ``pred_gap`` is a difference of two sums over $2940$ coefficients running to $\\approx 10^{3}$
     nats, so it loses several decimal digits to float32 cancellation before either split is formed.
     """
     driver, _ = fit

@@ -46,7 +46,7 @@ from teb_vae.lag_attn_rws.nets.raw_masks import contributing_anchors, forecast_m
 #: back from the model being checked against them. A ratio computed from a width the objective was
 #: **given** is self-consistent for any wrong width.
 _SHIPPED_KEPT_CHANNELS = 98
-_SHIPPED_BLOCK = 1470
+_SHIPPED_BLOCK = 2940
 
 #: What this package's ``compute_loss`` adds to the raw-signal sibling's metric dict: the four
 #: resolved gaps it inherits from the two-sided feature target, plus the seven this family
@@ -98,7 +98,7 @@ def _tiled(stride: int = TINY_STRIDE):
 # The block width
 # =================================================================================================
 def test_the_sample_score_divides_the_block_by_the_hand_written_cardinality() -> None:
-    r"""$H \cdot C_{\mathrm{keep}} = 15 \times 98 = 1470$, written out rather than read off the
+    r"""$H \cdot C_{\mathrm{keep}} = 30 \times 98 = 2940$, written out rather than read off the
     model -- and asserted a second time as ``horizon * decoder_out_channels``, so a horizon or
     budget change re-derives it instead of failing this literal."""
     kwargs = shipped_warmup_kwargs()
@@ -413,11 +413,12 @@ def test_at_init_the_two_reconstruction_terms_are_bitwise_equal(likelihood) -> N
 
 
 def test_the_shipped_block_is_comparable_to_no_sibling() -> None:
-    r"""Recorded where it is checkable rather than only in prose: at $H = 15$ against the two-sided
-    sibling's $30$, and $98$ kept channels against its $78$, the block is $1470$ against $2340$ --
-    so a nat from this configuration is comparable to no other cell of the grid."""
+    r"""Recorded where it is checkable rather than only in prose: at the two-sided sibling's own
+    $H = 30$ but $98$ kept channels against its $78$, the block is $2940$ against $2340$ -- so a nat
+    from this configuration is still comparable to no other cell of the grid, and the horizon is no
+    longer the reason."""
     model = build(shipped_warmup_kwargs())
 
-    assert model.horizon == 15
+    assert model.horizon == 30
     assert model.horizon * model.decoder_out_channels == _SHIPPED_BLOCK
     assert _SHIPPED_BLOCK != 30 * 78

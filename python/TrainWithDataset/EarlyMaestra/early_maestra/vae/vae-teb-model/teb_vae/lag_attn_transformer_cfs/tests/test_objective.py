@@ -47,7 +47,7 @@ from .conftest import (
 #: from the model being checked against them. A ratio computed from a width the objective was
 #: **given** is self-consistent for any wrong width.
 _SHIPPED_KEPT_CHANNELS = 98
-_SHIPPED_BLOCK = 1470
+_SHIPPED_BLOCK = 2940
 
 #: What this target domain adds to the raw-signal sibling's metric dict: the four resolved gaps it
 #: inherits from the two-sided feature target, plus the seven this family introduces.
@@ -327,12 +327,12 @@ def test_a_weighted_boundary_term_is_refused_because_the_anchors_are_not_neighbo
 
 def test_the_shipped_block_is_comparable_to_one_sibling_only() -> None:
     r"""Recorded where it is checkable rather than only in prose: at $H = 15$ against the two-sided
-    cells' $30$, and $98$ kept channels against their $78$, the block is $1470$ against $2340$ --
+    cells' $30$, and $98$ kept channels against their $78$, the block is $2940$ against $2340$ --
     so a nat from this configuration is comparable to the conv-LSTM causal cell and to nothing
     else."""
     model = build(shipped_warmup_kwargs())
 
-    assert model.horizon == 15
+    assert model.horizon == 30
     assert model.decoder_out_channels == _SHIPPED_KEPT_CHANNELS
     assert model.horizon * model.decoder_out_channels == _SHIPPED_BLOCK
     assert _SHIPPED_BLOCK != 30 * 78

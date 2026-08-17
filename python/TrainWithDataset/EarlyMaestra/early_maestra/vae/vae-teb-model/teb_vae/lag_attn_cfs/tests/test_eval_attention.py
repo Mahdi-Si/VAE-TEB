@@ -84,7 +84,7 @@ def test_no_decoded_anchor_is_truncated_at_the_shipped_geometry() -> None:
 
     assert _SHIPPED_MARGIN >= 0
     assert accounting["decoded_anchor_range"] == [SHIPPED_WARMUP_PERIOD, _SHIPPED_T_VALID]
-    assert accounting["n_decoded_anchors"] == 152
+    assert accounting["n_decoded_anchors"] == 137
     assert accounting["first_untruncated_anchor"] == _SHIPPED_N_LAGS - 1
     assert accounting["n_truncated_anchors"] == 0
     assert accounting["truncated_fraction"] == pytest.approx(0.0)

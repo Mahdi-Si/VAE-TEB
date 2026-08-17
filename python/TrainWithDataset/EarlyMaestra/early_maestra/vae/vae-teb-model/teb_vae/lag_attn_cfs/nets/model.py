@@ -54,7 +54,7 @@ class SeqVaeLagAttnCfs(CausalWarmupInputs, CausalFeatureForecastTarget, SeqVaeLa
         sequence_length: int = 300,
         d_model: int = 128,
         d_z: int = 48,
-        horizon: int = 15,
+        horizon: int = 30,
         raw_per_step: int = 16,
         warmup_period: int = 133,
         c_y: int = 102,
@@ -97,15 +97,18 @@ class SeqVaeLagAttnCfs(CausalWarmupInputs, CausalFeatureForecastTarget, SeqVaeLa
         source_warmup_steps: Optional[Sequence[int]] = None,
         anchor_stride: int = 1,
         lag_floor: int = 0,
+        target_weight_st: float = 1.0,
+        target_weight_ph: float = 1.0,
         init_weights: bool = True,
     ) -> None:
         r"""Initialize the model.
 
         Every keyword the base takes is forwarded unchanged; only the four below are this target
         domain's, and only ``target_delays`` / ``source_delays`` are gone. The defaults that differ
-        from the base's -- ``horizon`` $15$, ``warmup_period`` $133$, ``c_y`` $102$, ``c_u`` $51$ --
-        are this target domain's geometry rather than a preference, and a run that leaves them at
-        the base's values would be describing a dataset that does not exist.
+        from the base's -- ``warmup_period`` $133$, ``c_y`` $102$, ``c_u`` $51$ -- are this target
+        domain's geometry rather than a preference, and a run that leaves them at the base's values
+        would be describing a dataset that does not exist. ``horizon`` is **no longer** among them:
+        at $30$ it agrees with the base and with every other cell of the grid.
 
         Args:
             target_warmup_steps: $W'_c$ per **surviving** target channel, positional against
@@ -115,8 +118,15 @@ class SeqVaeLagAttnCfs(CausalWarmupInputs, CausalFeatureForecastTarget, SeqVaeLa
                 -- the dense range every sibling decodes, and the inert value -- so a model
                 constructed without an opinion behaves like the rest of the family. The tiling is a
                 configuration decision, and the shipped configuration states it.
-            lag_floor: $F_u$, the earliest source step lag attention may read. Ships at $0$, where
-                the lag mask is bitwise the sibling's.
+            lag_floor: $F_u$, the earliest source step lag attention may read. Ships at $0$,
+                where the lag mask is bitwise the sibling's.
+            target_weight_st: Relative reconstruction weight of the first stored target block,
+                the scattering coefficients. Both weights default to $1.0$, where the objective is
+                bitwise the uniform one.
+            target_weight_ph: The same for the second stored block, the phase-harmonic
+                coefficients. The pair is renormalised to leave the block scale unchanged, so what
+                the configuration states is a **ratio**: $(1.0, 0.1)$ and $(10.0, 1.0)$ describe
+                the same objective, agreeing to float32 rounding rather than bitwise.
 
         Raises:
             ValueError: If ``anchor_stride`` is outside $[1, H]$ or leaves a phase with no anchor;
@@ -143,6 +153,8 @@ class SeqVaeLagAttnCfs(CausalWarmupInputs, CausalFeatureForecastTarget, SeqVaeLa
             source_warmup_steps=source_warmup_steps,
             anchor_stride=anchor_stride,
             lag_floor=lag_floor,
+            target_weight_st=target_weight_st,
+            target_weight_ph=target_weight_ph,
         )
 
         super().__init__(**forwarded, target_delays=None, source_delays=None)

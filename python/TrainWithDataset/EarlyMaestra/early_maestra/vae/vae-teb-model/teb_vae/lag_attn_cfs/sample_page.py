@@ -487,8 +487,8 @@ def _draw_anchor_overlay(
         floor * seconds_per_step, color=COLOR_BLUE, linewidth=1.0, linestyle="-",
         label=f"anchor floor $F$={floor}",
     )
-    # A rug rather than one line per anchor: at the validation resolution there are 152 of them,
-    # and 152 vertical lines is a shaded band that hides the forecast underneath it.
+    # A rug rather than one line per anchor: at the validation resolution there are 137 of them,
+    # and 137 vertical lines is a shaded band that hides the forecast underneath it.
     ax.plot(
         decoded * seconds_per_step,
         np.full(decoded.size, low + _RUG_POSITION * (high - low)),

@@ -140,7 +140,8 @@ def test_the_budget_is_marked_and_the_forecast_window_is_shaded(shipped_budget):
             for patch in figure.axes[0].patches
             if patch.get_width() == pytest.approx(SHIPPED_HORIZON * _STEP_S)
         ]
-        assert window == [pytest.approx((0.0, 60.0))]
+        # H * 4 s = 120 s at the shipped two-minute horizon.
+        assert window == [pytest.approx((0.0, 120.0))]
         # The whole point of the mark: every kept target bar starts at or right of it.
         kept, _dropped = _bars(figure.axes[0])
         assert min(patch.get_x() for patch in kept.patches) >= expected
@@ -278,7 +279,7 @@ def test_the_shipped_budget_reads_98_channels_152_anchors_and_11_tiles(shipped_b
     assert point.kept == shipped_budget.target.kept_width
     assert point.anchors == t_valid - (shipped_budget.target.max_warmup - 1)
     assert point.tiles == -(-point.anchors // SHIPPED_HORIZON)
-    assert (point.kept, point.anchors, point.tiles) == (98, 152, 11)
+    assert (point.kept, point.anchors, point.tiles) == (98, 137, 5)
 
 
 def test_a_threshold_above_the_staircase_buys_nothing(shipped_budget):
@@ -326,22 +327,33 @@ def test_the_curve_is_computed_from_the_resolved_vectors_not_from_constants(ship
 
 
 def test_the_infeasible_region_is_where_no_tile_fits(shipped_budget):
-    r"""At the shipped one-minute horizon every threshold still admits a tile, and at two minutes
-    the slowest channels do not: keeping all $102$ is then *geometrically impossible*, because
-    $T_{\mathrm{valid}}$ is shorter by a whole horizon. That is what makes the horizon a lever on
-    the warm-up cost and not merely a forecast length, so the figure shades it rather than letting
-    the curves run to zero unremarked."""
+    r"""**The infeasible region exists at the shipped horizon**, and that is the whole point of
+    shading it.
+
+    At one minute every threshold still admits a tile. At the shipped two minutes the slowest ones
+    do not: keeping all $102$ channels needs a floor of $277$ against $T_{\mathrm{valid}} = 270$, so
+    it is *geometrically impossible* rather than merely expensive. $T_{\mathrm{valid}}$ is shorter
+    by a whole horizon, which is what makes the horizon a lever on the warm-up cost and not merely a
+    forecast length -- and it is why the figure shades the region rather than letting the curves run
+    to zero unremarked.
+
+    This assertion **reversed** when the shipped horizon moved from $15$ to $30$: the shaded region
+    used to be reachable only by an arm, and now the shipped configuration sits in the same figure
+    as it. The shipped budget of $134$ is far from that edge, so nothing about the shipped run
+    changes; what changes is that the figure's warning is about the configuration a reader is
+    looking at rather than about a hypothetical one.
+    """
     at_one_minute = warmup_budget.budget_tradeoff(
         shipped_budget.target.declared_warmup_steps,
         sequence_length=SHIPPED_SEQUENCE_LENGTH,
-        horizon=SHIPPED_HORIZON,
-        anchor_stride=SHIPPED_HORIZON,
+        horizon=SHIPPED_HORIZON // 2,
+        anchor_stride=SHIPPED_HORIZON // 2,
     )
     at_two_minutes = warmup_budget.budget_tradeoff(
         shipped_budget.target.declared_warmup_steps,
         sequence_length=SHIPPED_SEQUENCE_LENGTH,
-        horizon=2 * SHIPPED_HORIZON,
-        anchor_stride=2 * SHIPPED_HORIZON,
+        horizon=SHIPPED_HORIZON,
+        anchor_stride=SHIPPED_HORIZON,
     )
 
     assert all(point.tiles >= 1 for point in at_one_minute)
@@ -389,7 +401,7 @@ def test_the_figure_draws_three_curves_a_seconds_twin_and_the_shipped_mark(shipp
         assert ax.child_axes[0].get_xlim() == pytest.approx((_STEP_S * low, _STEP_S * high))
         marks = [line for line in ax.lines if line.get_linestyle() == "--"]
         assert len(marks) == 1 and marks[0].get_xdata()[0] == SHIPPED_BUDGET_STEPS
-        assert f"$B$={SHIPPED_BUDGET_STEPS}: 98 ch, 152 anchors, 11 tiles" in [
+        assert f"$B$={SHIPPED_BUDGET_STEPS}: 98 ch, 137 anchors, 5 tiles" in [
             text.get_text() for text in ax.texts
         ]
     finally:

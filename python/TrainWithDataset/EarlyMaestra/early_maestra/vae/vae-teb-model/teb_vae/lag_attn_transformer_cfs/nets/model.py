@@ -35,10 +35,11 @@ base constructor and
 it, both shared with the conv-LSTM cell.
 
 The unit consequence, restated where a reader will look for it: the reconstruction is summed over
-$H \cdot C_{\mathrm{keep}} = 15 \times 98 = 1470$ coefficients at the shipped budget, against the
+$H \cdot C_{\mathrm{keep}} = 30 \times 98 = 2940$ coefficients at the shipped budget, against the
 raw variant's $H \cdot R$ samples and against the two-sided feature variant's
 $30 \times 78 = 2340$, so the nats are comparable to neither -- nor across warm-up budgets within
-this model, since $C_{\mathrm{keep}}$ moves with the budget.
+this model, since $C_{\mathrm{keep}}$ moves with the budget. The *horizon* now agrees with every
+other cell of the grid; only $C_{\mathrm{keep}}$ separates this block from the two-sided one.
 """
 from __future__ import annotations
 
@@ -76,7 +77,7 @@ class SeqVaeLagAttnTrfCfs(
         sequence_length: int = 300,
         d_model: int = 128,
         d_z: int = 48,
-        horizon: int = 15,
+        horizon: int = 30,
         raw_per_step: int = 16,
         warmup_period: int = 133,
         c_y: int = 102,
@@ -120,15 +121,19 @@ class SeqVaeLagAttnTrfCfs(
         source_warmup_steps: Optional[Sequence[int]] = None,
         anchor_stride: int = 1,
         lag_floor: int = 0,
+        target_weight_st: float = 1.0,
+        target_weight_ph: float = 1.0,
         init_weights: bool = True,
     ) -> None:
         r"""Initialize the model.
 
         Every keyword the architecture parent takes is forwarded unchanged; only the four below are
-        this target domain's. The defaults that differ from the parent's -- ``horizon`` $15$,
-        ``warmup_period`` $133$, ``c_y`` $102$, ``c_u`` $51$ -- are this target domain's geometry
-        rather than a preference, and a run that left them at the parent's values would be
-        describing a dataset that does not exist.
+        this target domain's. The defaults that differ from the parent's -- ``warmup_period`` $133$,
+        ``c_y`` $102$, ``c_u`` $51$ -- are this target domain's geometry rather than a preference,
+        and a run that left them at the parent's values would be describing a dataset that does not
+        exist. ``horizon`` is **no longer** among them: at $30$ it agrees with the architecture
+        parent and with every other cell of the grid, so the forecast question is shared even though
+        the block is not.
 
         Args:
             target_warmup_steps: $W'_c$ per **surviving** target channel, positional against
@@ -138,8 +143,15 @@ class SeqVaeLagAttnTrfCfs(
                 -- the dense range every sibling decodes, and the inert value -- so a model
                 constructed without an opinion behaves like the rest of the family. The tiling is a
                 configuration decision, and the shipped configuration states it.
-            lag_floor: $F_u$, the earliest source step lag attention may read. Ships at $0$, where
-                the lag mask is bitwise the architecture parent's.
+            lag_floor: $F_u$, the earliest source step lag attention may read. Ships at $0$,
+                where the lag mask is bitwise the architecture parent's.
+            target_weight_st: Relative reconstruction weight of the first stored target block,
+                the scattering coefficients. Both weights default to $1.0$, where the objective is
+                bitwise the uniform one.
+            target_weight_ph: The same for the second stored block, the phase-harmonic
+                coefficients. The pair is renormalised to leave the block scale unchanged, so what
+                the configuration states is a **ratio**: $(1.0, 0.1)$ and $(10.0, 1.0)$ describe
+                the same objective, agreeing to float32 rounding rather than bitwise.
 
         Raises:
             ValueError: If ``anchor_stride`` is outside $[1, H]$ or leaves a phase with no anchor;
@@ -167,6 +179,8 @@ class SeqVaeLagAttnTrfCfs(
             source_warmup_steps=source_warmup_steps,
             anchor_stride=anchor_stride,
             lag_floor=lag_floor,
+            target_weight_st=target_weight_st,
+            target_weight_ph=target_weight_ph,
         )
 
         super().__init__(**forwarded, target_delays=None, source_delays=None)

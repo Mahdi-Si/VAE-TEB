@@ -31,7 +31,7 @@ every segment -- is not on either durable table. A pass with no checkpoint recor
 ``divergences.json``: every column, every reduction and every emitted key is the sibling's, because
 nothing it does depends on what a block score is a sum *over*. The target domain enters one layer
 down, in :mod:`teb_vae.lag_attn_cfs.eval.oracle`, where the probe emits
-$H \cdot C_{\mathrm{keep}} = 1470$ coefficients per anchor rather than $H \cdot R = 480$ raw
+$H \cdot C_{\mathrm{keep}} = 2940$ coefficients per anchor rather than $H \cdot R = 480$ raw
 samples and is scored at the anchors the forward decoded. The unit consequence travels with the
 run rather than being restated here: ``report_seam.PRED_GAP_CONVENTION`` states in the headline
 block that a nat here is summed over the surviving target channels and is therefore budget-local,

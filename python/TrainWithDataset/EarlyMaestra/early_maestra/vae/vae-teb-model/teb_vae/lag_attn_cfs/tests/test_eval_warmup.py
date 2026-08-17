@@ -39,9 +39,9 @@ EVAL_CONFIG = {"bootstrap_resamples": 200, "seed": 0}
 #: The shipped geometry, restated rather than imported from the analysis: the point of the guard is
 #: that the analysis derives these from a run's own record, so an assertion that read them from the
 #: same place would compare a number with itself.
-SHIPPED_T_VALID = 285
+SHIPPED_T_VALID = 270
 SHIPPED_FLOOR = 133
-SHIPPED_ANCHORS = 152
+SHIPPED_ANCHORS = 137
 
 
 def _per_sample(
@@ -205,12 +205,12 @@ def test_the_expected_anchor_count_is_derived_from_the_runs_own_geometry() -> No
     "t_valid, floor, anchors",
     [
         (SHIPPED_T_VALID, SHIPPED_FLOOR, SHIPPED_ANCHORS),
-        # sweep_horizon_30: T - H = 300 - 30, the same floor.
-        (270, SHIPPED_FLOOR, 137),
+        # sweep_horizon_15: T - H = 300 - 15 = 285, the same floor, so 152 anchors.
+        (285, SHIPPED_FLOOR, 152),
         # sweep_floor_150: the shipped horizon, a higher floor.
-        (SHIPPED_T_VALID, 150, 135),
+        (SHIPPED_T_VALID, 150, 120),
     ],
-    ids=["shipped", "horizon_30", "floor_150"],
+    ids=["shipped", "horizon_15", "floor_150"],
 )
 def test_a_legitimate_arm_passes_the_guard_without_an_edit(
     t_valid: int, floor: int, anchors: int

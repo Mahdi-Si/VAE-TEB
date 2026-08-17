@@ -30,7 +30,7 @@ identically. So: a percentile bootstrap over *recordings*, and a paired signed-r
 per-recording block scores, which is the paired form because each recording contributes both.
 
 **The same answer as a percentage.** Nats are the objective's units and say nothing about
-proportion: whether $3$ nats over a $1470$-coefficient block is a large improvement or a negligible
+proportion: whether $3$ nats over a $2940$-coefficient block is a large improvement or a negligible
 one is not readable off the number, and two checkpoints whose block scores differ in scale cannot be
 compared on it at all. Three percentages are reported beside it, in the two spaces where a ratio
 has a natural zero:

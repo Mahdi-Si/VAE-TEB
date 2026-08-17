@@ -284,4 +284,4 @@ def test_the_invariants_hold_at_the_production_geometry_and_budget() -> None:
         assert torch.equal(reference[key], resampled[key]), key
     assert not torch.equal(reference["source_state"], resampled["source_state"])
     assert float(_closed_form_kl(reference).abs().max()) == 0.0
-    assert tuple(reference["mu_base"].shape) == (BATCH, 11, 15, 98)
+    assert tuple(reference["mu_base"].shape) == (BATCH, 5, 30, 98)

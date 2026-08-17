@@ -69,7 +69,7 @@ and a gate, and delegates every readout, every analysis and every verdict to
 ``teb_vae.lag_attn_cfs.eval`` -- which is what makes a difference between the two cfs cells'
 summaries attributable to the encoder rather than to two implementations. A loss level is
 comparable against ``lag_attn_cfs`` and is **not** comparable against ``lag_attn_transformer_fs``,
-whose blocks are $2340$ coefficients at a horizon of $30$ against this cell's $1470$ at $15$.
+whose blocks are $2340$ coefficients against this cell's $2940$, both at a horizon of $30$.
 
 lean-limit: the frequency-resolved readout is band-resolved skill and its timing half is unmeasured,
 because a stored coefficient is a modulus and the analysing filter's phase was discarded before the

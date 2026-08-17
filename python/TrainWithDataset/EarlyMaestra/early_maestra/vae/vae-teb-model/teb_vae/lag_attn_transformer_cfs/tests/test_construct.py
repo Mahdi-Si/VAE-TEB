@@ -55,13 +55,13 @@ from teb_vae.lag_attn_transformer_rws.nets.model import SeqVaeLagAttnTrfRws
 #: This model's measured totals at the shipped geometry, with and without the resolved warm-up
 #: budget. They differ for two reasons at once: a guarded run builds availability input adapters the
 #: unguarded one does not have, and the guarded decoder is $98$ channels wide against $102$.
-_SHIPPED_GATED = 5_051_920
-_SHIPPED_UNGATED = 5_035_416
+_SHIPPED_GATED = 5_055_760
+_SHIPPED_UNGATED = 5_039_256
 
 #: The conv-LSTM causal cell's measured total at the same budget, and the difference. The encoder
 #: swap costs exactly what it costs in the two-sided pair, which is the sense in which the grid's
 #: two axes are independent.
-_CONV_LSTM_SHIPPED_GATED = 5_143_262
+_CONV_LSTM_SHIPPED_GATED = 5_147_102
 _ENCODER_EDGE_PARAMETERS = 91_342
 
 #: Surviving target channels at the shipped warm-up budget, and the declared width.
@@ -91,7 +91,7 @@ def test_the_model_constructs_at_the_production_geometry():
     model = _model(shipped_warmup_kwargs())
 
     assert model.geometry.raw_len == 4800
-    assert model.geometry.t_valid == 285
+    assert model.geometry.t_valid == 270
 
 
 def test_the_decoder_width_is_the_surviving_channel_count():
@@ -157,8 +157,8 @@ def test_the_encoder_edge_costs_the_same_as_it_does_in_the_two_sided_pair():
             == getattr(transformer.decoder, name).weight.shape
         ), name
     assert conv_lstm.decoder_out_channels == transformer.decoder_out_channels == _KEPT_CHANNELS
-    assert conv_lstm.horizon == transformer.horizon == 15
-    assert conv_lstm.anchor_stride == transformer.anchor_stride == 15
+    assert conv_lstm.horizon == transformer.horizon == 30
+    assert conv_lstm.anchor_stride == transformer.anchor_stride == 30
 
     assert _n_parameters(conv_lstm) == _CONV_LSTM_SHIPPED_GATED
     assert _n_parameters(conv_lstm) - _n_parameters(transformer) == _ENCODER_EDGE_PARAMETERS
@@ -290,6 +290,11 @@ def test_the_signature_is_the_architecture_parents_with_the_delays_replaced():
         "source_warmup_steps",
         "anchor_stride",
         "lag_floor",
+        # The per-block reconstruction weights. Keywords rather than a class constant because they
+        # are a *run's* decision and must land in the checkpoint's ``model_kwargs``: a checkpoint
+        # that did not record them would be a model whose objective could not be recovered.
+        "target_weight_st",
+        "target_weight_ph",
     }
     assert not any(
         parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters.values()
@@ -316,7 +321,7 @@ def test_the_geometry_defaults_are_the_causal_ones():
     }
 
     assert defaults["c_y"] == CAUSAL_C_Y
-    assert defaults["horizon"] == 15
+    assert defaults["horizon"] == 30
     assert defaults["warmup_period"] == 133
     # The inert defaults: a model built with no opinion decodes densely and floors no lag, which is
     # what every sibling does. The tiling is a configuration decision and the config states it.

@@ -1,8 +1,8 @@
 # Causal-feature conv-Transformer lag-attention VAE-TEB: the production training configuration.
 #
 # The sixth cell of the encoder-by-target grid, and the one that closes it. The model forecasts the
-# next ONE MINUTE of the stored ONE-SIDED FHR feature future -- the 98 target channels surviving
-# `causal_warmup_budget_steps`, over 15 decimated steps, so 1470 coefficients per anchor -- from a
+# next TWO MINUTES of the stored ONE-SIDED FHR feature future -- the 98 target channels surviving
+# `causal_warmup_budget_steps`, over 30 decimated steps, so 2940 coefficients per anchor -- from a
 # single shared latent, reached through the two causal conv-Transformer encoders rather than the
 # dilated-conv-plus-LSTM pair. A target-only prior and a source-conditioned posterior share one
 # decoder, invoked twice with nothing else, so the per-step KL between them is the
@@ -44,9 +44,12 @@
 #     rather than a leak.
 #
 # NATS FROM THIS CONFIGURATION ARE COMPARABLE ONLY TO THE CONV-LSTM CAUSAL CELL. The reconstruction
-# is summed over H * C_keep = 15 * 98 = 1470 coefficients against `lag_attn_transformer_fs`'s
-# 30 * 78 = 2340, and the horizon differs on top of that, so neither the block nor the forecast
-# question is the same across the target axis.
+# is summed over H * C_keep = 30 * 98 = 2940 coefficients against `lag_attn_transformer_fs`'s
+# 30 * 78 = 2340. The HORIZON now agrees across the target axis, so the forecast question is the
+# same one on both sides of it; the BLOCK still differs, because C_keep is what the warm-up budget
+# decides and no configuration change restores it. A loss LEVEL therefore remains readable only
+# against the conv-LSTM causal cell, and what the horizon move bought on the target axis is that a
+# per-horizon-step reading is now made along the same axis on both sides.
 #
 # Run from the repo root:
 #   python -m teb_vae.lag_attn_transformer_cfs.trainer \
@@ -58,7 +61,7 @@ general_config:
   seed: 42
   cuda_devices: [0, 1, 2, 3, 4, 5, 6]
   # Adam's per-parameter normalisation makes the step size invariant to the loss-scale change from
-  # summing over 1470 coefficients instead of 2340, so the sibling's stability-tuned value transfers
+  # summing over 2940 coefficients instead of 2340, so the sibling's stability-tuned value transfers
   # unchanged; the clip threshold below does NOT and is re-derived for this encoder.
   lr: 0.0003
   # Singular; the experiment driver reads this exact key. Decay is x0.1 per milestone.
@@ -170,12 +173,18 @@ model_config:
     # divisible by num_heads as the head-structured posterior requires. Held at both comparison
     # models' value, which is what keeps all three comparable.
     d_z: 64
-    # H = 15 decimated steps = 1 min forecast, HALF the two-sided cells' horizon, and the reason is
-    # geometric rather than clinical. Anchors live in [F, T - H), so a shorter horizon LENGTHENS
-    # T_valid and buys back anchors -- at H = 30 and this floor there are 137 anchors against 152,
-    # and at the budget that keeps all 102 channels there would be none at all. The horizon is
-    # therefore one of the two levers on the warm-up cost, not an independent preference.
-    horizon: 15
+    # H = 30 decimated steps = 2 min forecast, matching every other cell of the grid -- including
+    # the conv-LSTM causal cell on the encoder edge, which moved with it, so that edge still differs
+    # in the encoder alone.
+    #
+    # It is paid for in anchors, and the tradeoff is geometric rather than clinical. Anchors live in
+    # [F, T - H), so doubling H shortens T_valid from 285 to 270 and the dense anchor count from 152
+    # to 137; with the stride moving to 30 the decoded tiles per sample fall from ~10.1 to ~4.57.
+    # The floor is unaffected -- F >= B - 1 = 133 comes from the channel warm-up, not the horizon --
+    # but at the budget that would keep all 102 target channels (W' = 278) there are 8 anchors at
+    # H = 15 and exactly ZERO at H = 30, so keeping every channel is geometrically impossible here.
+    # The horizon remains one of the two levers on the warm-up cost.
+    horizon: 30
     # A GEOMETRY INPUT, and not the decoder width. TrimmedRawGeometry validates the raw index
     # identities against it and the diagnostic page draws its first row on the raw grid, so the key
     # stays; what each horizon token emits is the surviving TARGET CHANNEL count, taken from the
@@ -332,23 +341,68 @@ model_config:
     # anchors. Over epochs every anchor in [F, T_valid) is still used, because the per-segment phase
     # rotates with the epoch.
     #
-    # 15 = `horizon`, and the two must move together: a horizon change that left the stride behind
+    # 30 = `horizon`, and the two must move together: a horizon change that left the stride behind
     # would either overlap the windows again (S < H) or leave target steps that no phase ever covers
     # (S > H, which the constructor refuses). tests/test_config_load.py asserts the equality here and
     # in every arm rather than leaving it to be noticed.
     #
     # Validation and test decode every valid anchor -- stride 1, phase 0 -- rather than one tile
-    # grid: a single phase is deterministic but PHASE-BIASED, sampling the same 11 of 152 anchors at
+    # grid: a single phase is deterministic but PHASE-BIASED, sampling the same 5 of 137 anchors at
     # a fixed offset from the segment start forever. There is no gradient there, so neither the
     # redundancy argument nor the memory argument applies. `sweep_anchor_stride_1.yaml` is the arm
     # that trains densely too.
-    anchor_stride: 15
+    anchor_stride: 30
     # F_u, the earliest source step lag attention may read: the lag mask generalises from
     # 1[t - l >= 0] to 1[t - l >= F_u]. Ships at 0, where it is BITWISE the two-sided siblings' mask,
     # and exists so the source compromise above is measurable rather than argued about. No arm moves
     # it; `source_lag_warmth_frac_ph` falling below the fraction of lags that are warm at all is the
     # measurement that would justify a non-zero value.
     lag_floor: 0
+
+    # --- Per-block reconstruction weights ---------------------------------------
+    # The relative weight of the two stored target blocks in BOTH reconstruction terms. The
+    # objective was uniform over channels until now, and uniform was never neutral: at the shipped
+    # budget 66 of the 98 survivors are phase-harmonic against 32 scattering, so two-thirds of the
+    # loss went to `fhr_ph` by nothing more deliberate than there being twice as many of them.
+    #
+    # 1.0 / 0.1 shifts that: the resolved weights are 2.5389 on each scattering channel and 0.25389
+    # on each phase-harmonic one, so scattering carries 82.9% of the block against 32.7% before.
+    #
+    # RENORMALISED, which is why those numbers are not 1.0 and 0.1. The vector is scaled by
+    # C_keep / sum(w), so the weighted block sums to the same magnitude the uniform one did. Without
+    # that, this pair would shrink the reconstruction 2.5x against a KL that did not move -- a 2.5x
+    # rise in the effective beta wearing a channel weight's name, and `gradient_clip_val` and
+    # `additive_margin` would both be out of date again. Only the DISTRIBUTION across channels
+    # moves. What the pair states is therefore a RATIO: 10.0 / 1.0 configures the same objective.
+    #
+    # WHY SCATTERING IS FAVOURED, and it is a hypothesis this run tests rather than a settled fact.
+    # DIAGNOSIS.md section 8 measured that the channels the model gives up on -- suppressed at the
+    # input adapter, forecast as conditional variance rather than as level -- are largely the fast
+    # phase-harmonic ones, whose persistence R^2 is already negative by horizon step 4. Under a
+    # uniform objective most of the block was being spent on channels the optimiser had decided were
+    # unforecastable, and the two-minute horizon made that worse. Read `pred_gap_st` against
+    # `pred_gap_ph` to judge it: they recompose to `pred_gap` over the same denominator.
+    #
+    # THE COST, stated because it is not recoverable from the columns. A weighted reconstruction is
+    # not a log-density, so beta = 1 is no longer the exact ELBO of the source-conditioned branch.
+    # The renormalisation keeps the SCALE honest, not the UNIT. Both weights at 1.0 restore the
+    # uniform objective bitwise.
+    #
+    # THE EVALUATION PIPELINE IS DELIBERATELY NOT WEIGHTED, and this is the one asymmetry to hold in
+    # mind when reading a run. `eval/` scores its blocks through the same reduction with no weight
+    # vector, so every `nll_*` and `pred_gap` it reports is a true log-density in nats and
+    # `pred_gap_mc_likelihood_pct` remains a probability statement. Training optimises the weighted
+    # objective; the evaluation measures the unweighted one. That is the right split -- the weights
+    # are a training device for where capacity goes, not a claim about what a good forecast is --
+    # but it means a `pred_gap` from `metrics_history.csv` and a `pred_gap` from `summary.json` are
+    # no longer the same quantity, and neither document's value should be copied into the other's
+    # table.
+    #
+    # Equal on the ENCODER edge, necessarily: this is a property of the objective, not of an
+    # encoder, so both cfs cells ship the same pair or the two architectures are compared under two
+    # different losses.
+    target_weight_st: 1.0
+    target_weight_ph: 0.1
 
     # --- Attention -------------------------------------------------------------
     max_lag: 90            # L = 91 (~6 minutes of UP history at 4 s/step)
@@ -364,12 +418,15 @@ model_config:
 
     # --- Shared horizon decoder core -------------------------------------------
     # Four dilated refine blocks, so the dilations are (1, 2, 4, 8) and the receptive field over the
-    # horizon axis is 31 tokens -- more than twice this cell's 15 horizon tokens.
+    # horizon axis is 31 tokens against this cell's 30 horizon tokens.
     #
-    # Depth 3 was considered and rejected in the conv-LSTM causal cell, and the decision carries
-    # across the encoder edge unchanged: its receptive field is 15, which fails the family's own
-    # recorded criterion of RF >= H + 1 by exactly one at this horizon, and PARITY with both
-    # comparison models removes a confound from the encoder and the target comparisons alike.
+    # THE CRITERION NOW BINDS, where at the one-minute horizon it did not. RF = 1 + (k-1)(2^d - 1)
+    # = 31 and the family's recorded criterion is RF >= H + 1 = 31, so depth 4 is the SMALLEST depth
+    # that satisfies it -- exactly, with no margin. Depth 3 was considered and rejected in the
+    # conv-LSTM causal cell and the decision carries across the encoder edge unchanged; at this
+    # horizon its receptive field of 15 misses the criterion by sixteen rather than by one. PARITY
+    # with both comparison models removes a confound from the encoder and the target comparisons
+    # alike, and both of those models also ship depth 4 at H = 30.
     #
     # Nothing in the shipped code ties this depth to the horizon, so the resolved receptive field is
     # written to the startup log beside H, S, A_max and the block width.
@@ -487,9 +544,9 @@ dataset_config:
 advanced_config:
   trainer:
     precision: "32-true"
-    # MEASURED for this encoder at this loss scale, and it MOVED: 6500 against the conv-LSTM causal
-    # cell's 6000. The encoder edge is the only thing that changed -- the block is the same 1470
-    # coefficients averaged over the same ~10.1 anchors per step -- so this key is the one the edge
+    # MEASURED for this encoder at this loss scale, and it MOVED: 14000 against the conv-LSTM causal
+    # cell's 15000. The encoder edge is the only thing that changed -- the block is the same 2940
+    # coefficients averaged over the same ~4.57 anchors per step -- so this key is the one the edge
     # moves and `additive_margin` below is the one it does not.
     #
     # The run: 600 optimizer steps at this file's model geometry over the committed causal fixture
@@ -497,21 +554,33 @@ advanced_config:
     # likelihood: gaussian_nll, beta ramping to 1.0, AdamW at this file's lr), with the clip itself
     # set far above anything reachable so nothing was rescaling the steps the norms were drawn from.
     # Recorded pre-clip gradient norms with the whole shard in one batch -- the closest reachable
-    # analogue of a large-batch step: min 671, q50 4367, q90 5318, q95 5552, q99 6025, max 6521.
+    # analogue of a large-batch step: min 1489, q50 9359, q90 11395, q95 11918, q99 13060,
+    # max 14381.
     #
-    # 6500 is the smallest round value above q99. It is rounded to 500 rather than to 1000 here for
-    # a reason worth stating: the next thousand, 7000, sits ABOVE the observed maximum of 6521, so a
-    # blow-up guard set there would not have bound on a single step of the measured run. 6500 keeps
-    # the property the conv-LSTM cell's 6000 has -- above q99, just below the maximum -- which is
-    # what "essentially does not bind on a healthy run" has to mean to still be a guard.
+    # 14000 is the smallest round value above q99, and it sits just below the observed maximum --
+    # "above q99, just below the maximum", which is what "essentially does not bind on a healthy
+    # run" has to mean to still be a guard. Rounded to 1000 rather than to 500 because the next
+    # thousand is still under the maximum, which was NOT true at the one-minute horizon: there q99
+    # was 6025 against a maximum of 6521, so 7000 would have overshot and the value was rounded to
+    # 6500 instead. The rounding rule is the same; the headroom changed.
+    #
+    # RE-MEASURED AT H = 30, and it moved from 6500: q99 went 6025 -> 13060, a factor of 2.17 for a
+    # block that doubled. The block scales the summed loss and its gradient; the anchor count
+    # falling from ~10.1 tiles to ~4.57 makes the per-step gradient noisier on top of that.
+    #
+    # NOTE THE ORDERING AGAINST THE CONV-LSTM CELL REVERSED. At H = 15 this cell's clip was ABOVE
+    # that cell's (6500 against 6000); at H = 30 it is below (14000 against 15000). Both pairs were
+    # measured, and the H = 30 pair was measured under one harness on one fixture with one seed,
+    # which the H = 15 pair was not -- so the reversal is a fact about the two runs rather than an
+    # established property of the two encoders. It is recorded rather than explained.
     #
     # What the sample is and is not: 4 in-sample windows over 600 steps is a thinner tail than a
     # production run's, and the same measurement at batch 1 -- four distinct batches, so the
-    # batch-to-batch component is present at its largest -- reads q99 22,454 and max 42,831. That
+    # batch-to-batch component is present at its largest -- reads q99 42,686 and max 61,283. That
     # regime is 32x smaller than the shipped batch of 128 and is recorded rather than used. Re-derive
     # from the headline run's own `train/grad_norm` column, which samples one optimizer step per
     # epoch.
-    gradient_clip_val: 6500.0
+    gradient_clip_val: 14000.0
     gradient_clip_algorithm: "norm"
     sync_batchnorm: false     # there is no BatchNorm anywhere in this model
     deterministic: false
@@ -549,9 +618,9 @@ advanced_config:
   # The RELATIVE test stays off.
   #
   # The relative test is `watched > multiplier * max(EMA, ema_floor)`, which assumes a loss bounded
-  # below by zero. main_loss here is a learned-variance Gaussian NLL summed over 1470 coefficients
-  # and averaged over ~10 anchors, so it goes negative early -- the instrumented run below reached
-  # -3660 within 600 steps. Once the EMA is negative the relative test degenerates to "skip every
+  # below by zero. main_loss here is a learned-variance Gaussian NLL summed over 2940 coefficients
+  # and averaged over ~4.6 anchors, so it goes negative early -- the instrumented run below reached
+  # -7464 within 600 steps. Once the EMA is negative the relative test degenerates to "skip every
   # positive batch". So ema_floor sits far above any reachable loss, which switches the relative
   # test off, and additive_margin carries the finite-blow-up detection: skip when
   # watched > EMA + margin, against the RAW EMA, so it works in the negative-loss regime.
@@ -569,28 +638,44 @@ advanced_config:
     # >> any reachable loss: relative detection off. CONFIRMED at this block size rather than
     # inherited. The per-coefficient Gaussian NLL is bounded below by 0.5*(log 2pi + logvar_clamp_lo)
     # ~ -1.58 at the shipped floor of -5, so the two reconstruction terms cannot reach beyond
-    # ~2 * 1470 * 1.58 ~ 4.6e+3 in magnitude, and the KL and the prior anchor are both nonnegative.
-    # The instrumented run's observed main_loss stayed inside [-3660, +4235]. Five orders of
-    # magnitude of headroom.
+    # ~2 * 2940 * 1.58 ~ 9.3e+3 in magnitude, and the KL and the prior anchor are both nonnegative.
+    # The instrumented run's observed main_loss stayed inside [-7464, +8498], which is within a
+    # factor of 1.1 of that bound and confirms it empirically. Five orders of magnitude of headroom.
     #
     # The exponent sign is not decoration -- YAML parses `1.0e9` as a string, which validate_config
     # rejects as not a float.
     ema_floor: 1.0e+9
     # Sign-agnostic finite-spike detection: skip when watched > EMA + margin (nats). 0 disables.
     #
-    # MEASURED for this encoder, and it did NOT move: 3.0e+3, the conv-LSTM causal cell's value. The
-    # statistic is the breaker's own -- `main_loss - EMA` at this file's `ema_decay`, which is
-    # exactly what the test compares -- rather than the epoch-to-epoch movement, because at ~10
-    # decoded anchors per step the two are no longer close. Over the same 600-step instrumented run:
-    # with the whole shard in one batch the excursion above the EMA never reached zero at all (q99
-    # -159, max -142), because this encoder's loss falls monotonically on four in-sample windows; at
-    # batch 1, where the batch-to-batch component is present at its largest, q50 -365, q90 207,
-    # q99 803, max 1404 after the breaker's own 100-batch priming window.
+    # RE-MEASURED AT H = 30, and it moved with the block: 9.0e+3 against the one-minute horizon's
+    # 3.0e+3. It still EQUALS the conv-LSTM causal cell's, which is the property that matters on the
+    # encoder edge -- that edge changes neither the block nor the anchor count, so a margin that
+    # differed across it would gate two architectures the two cfs cells exist to compare against two
+    # different bars.
     #
-    # 3.0e+3 is ~2.1x the worst excursion measured in the noisiest regime the fixture can produce.
-    # It stays well inside the ~4.6e+3 magnitude the objective can reach, so the additive test can
-    # still fire rather than being decoration.
-    additive_margin: 3.0e+3
+    # The statistic is the breaker's own -- `main_loss - EMA` at this file's `ema_decay`, which is
+    # exactly what the test compares -- rather than the epoch-to-epoch movement, because at ~4.6
+    # decoded anchors per step the two are not close. Over the same 600-step instrumented run: with
+    # the whole shard in one batch the excursion above the EMA never reached zero at all (q99 -293,
+    # max -285), because this encoder's loss falls monotonically on four in-sample windows; at
+    # batch 1, where the batch-to-batch component is present at its largest, q50 -492, q90 768,
+    # q95 961, q99 1678, max 3928 after the breaker's own 100-batch priming window.
+    #
+    # THE VALUE CLEARS THE CONV-LSTM CELL'S EXCURSION, NOT THIS ONE'S, and that is deliberate. This
+    # cell's worst excursion is 3928 and that cell's is 5090, so the shared margin is 1.77x the
+    # LARGER of the two and 2.29x this cell's own -- the conservative direction, and the only way to
+    # hold one bar across the edge. Setting it from this cell's 3928 alone would give ~8.0e+3 and
+    # would leave the conv-LSTM cell's breaker firing on batches its own measurement says are
+    # healthy.
+    #
+    # The upper bound is what actually fixes the value. The margin must stay under the ~9.3e+3
+    # magnitude the objective can reach, or no finite loss could exceed EMA + margin and the additive
+    # test would be decoration; 9.0e+3 is the round value that also clears the excursion. At H = 15
+    # the two bounds were far apart (3.0e+3 was ~2.1x the excursion and 0.65x the reachable
+    # magnitude); the batch-1 excursion grew faster than the block did, so the window narrowed.
+    # Re-derive from a production run's own `main_loss` column if the breaker starts skipping
+    # healthy batches.
+    additive_margin: 9.0e+3
     # Escape hatch: after this many CONSECUTIVE skips, force-accept the next finite-loss batch
     # and hard-re-seed the EMA to it. 0 disables the hatch.
     max_consecutive_skips: 25

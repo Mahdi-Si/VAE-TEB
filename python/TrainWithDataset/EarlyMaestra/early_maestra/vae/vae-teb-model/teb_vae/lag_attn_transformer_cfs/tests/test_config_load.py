@@ -143,7 +143,10 @@ TARGET_EDGE_EXEMPT_PATHS: Dict[str, str] = {
     ),
     f"{_VAE}.c_y": "the one-sided cascade keeps 36 + 66 rather than 43 + 66",
     f"{_VAE}.c_u": "the one-sided cascade keeps 36 + 15 rather than 43 + 15",
-    f"{_VAE}.horizon": "a shorter horizon lengthens T_valid and buys back anchors",
+    # `horizon` is deliberately ABSENT: both cells forecast two minutes, so an exemption here would
+    # be a permission with no divergence behind it and the stale-exemption test would report it.
+    # The BLOCK still differs (30 * 98 against 30 * 78) because C_keep is what the budget decides,
+    # which is why `additive_margin` below stays exempt while the horizon no longer is.
     f"{_VAE}.warmup_period": "the anchor floor the warm-up budget pairs with",
     f"{_VAE}.causal_reach_budget_s": "undefined on this dataset; the resolver refuses a value",
     f"{_VAE}.causal_warmup_budget_steps": "no two-sided counterpart",
@@ -367,7 +370,7 @@ def test_the_shipped_config_builds_a_decoder_as_wide_as_the_budget_keeps(tmp_pat
     model = SeqVaeLagAttnTrfCfs(**kwargs)
     assert model.decoder.mean_head.out_features == KEPT_TARGET_CHANNELS
     assert model.raw_per_step == 16  # untouched by the width
-    assert model.horizon * model.decoder_out_channels == 1470
+    assert model.horizon * model.decoder_out_channels == 2940
 
 
 def test_the_shipped_geometry_pairs_the_floor_with_the_budget(shipped):
@@ -386,7 +389,7 @@ def test_the_anchor_stride_equals_the_configured_horizon(shipped):
     constructor refuses, because target steps between two tiles would never be scored."""
     vae = _get(shipped, _VAE)
 
-    assert vae["anchor_stride"] == vae["horizon"] == 15
+    assert vae["anchor_stride"] == vae["horizon"] == 30
     assert vae["lag_floor"] == 0
 
 
@@ -453,11 +456,15 @@ def test_every_comparable_leaf_equals_the_target_siblings_value(shipped, target_
         differing - set(TARGET_EDGE_EXEMPT_PATHS)
     )
 
-    # Three keys have no two-sided counterpart; nothing on the two-sided side is missing here.
+    # Five keys have no two-sided counterpart; nothing on the two-sided side is missing here.
     assert set(mine) - set(theirs) == {
         f"{_VAE}.causal_warmup_budget_steps",
         f"{_VAE}.anchor_stride",
         f"{_VAE}.lag_floor",
+        # The per-block reconstruction weights. The two-sided cell scores its channels uniformly,
+        # so it has no counterpart to compare against rather than a differing value.
+        f"{_VAE}.target_weight_st",
+        f"{_VAE}.target_weight_ph",
     }
     assert set(theirs) - set(mine) == set()
 
@@ -491,11 +498,17 @@ def test_the_clip_moved_on_both_edges_and_the_margin_on_only_one(
     """The one asymmetry worth stating as a test. ``additive_margin`` is in nats of the summed block
     and the encoder edge changes neither the block nor the anchor count, so it must equal the
     conv-LSTM causal cell's exactly -- and it is the two-sided cell's that differs.
-    ``gradient_clip_val`` is a gradient statistic, which both edges move."""
+    ``gradient_clip_val`` is a gradient statistic, which both edges move.
+
+    The value moved from $3.0 \\times 10^{3}$ to $9.0 \\times 10^{3}$ when both causal cells went to
+    the two-minute horizon, and the equality is what the move had to preserve: the two cells were
+    re-measured separately (worst excursions $3928$ here against $5090$ there) and the shared margin
+    clears the larger, because one bar across the edge is the point.
+    """
     breaker = "advanced_config.spike_breaker.additive_margin"
     clip = "advanced_config.trainer.gradient_clip_val"
 
-    assert _get(shipped, breaker) == _get(encoder_sibling, breaker) == 3.0e3
+    assert _get(shipped, breaker) == _get(encoder_sibling, breaker) == 9.0e3
     assert _get(shipped, breaker) != _get(target_sibling, breaker)
     assert _get(shipped, clip) != _get(encoder_sibling, clip)
     assert _get(shipped, clip) != _get(target_sibling, clip)
@@ -682,7 +695,7 @@ def test_the_resolved_tiny_variant_validates_and_builds(tmp_path, loguru_warning
     # production width and the forward still decodes the production tile count.
     assert model.d_model == 32
     assert model.decoder_out_channels == KEPT_TARGET_CHANNELS
-    assert model.anchor_stride == 15
+    assert model.anchor_stride == 30
 
 
 def test_the_local_variant_names_a_causal_shard_that_does_not_yet_exist(smoke_hie):

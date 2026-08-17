@@ -227,6 +227,66 @@ class CausalFeatureForecastTarget(FeatureForecastTarget):
             assignment[channel] = min(WARM_TERTILES - 1, rank * WARM_TERTILES // count)
         return tuple(assignment)
 
+    @classmethod
+    def _resolve_channel_weights(
+        cls,
+        keep_index: Sequence[int],
+        *,
+        weight_st: float,
+        weight_ph: float,
+    ) -> torch.Tensor:
+        r"""The per-kept-channel loss weight, **renormalised to leave the block scale alone**.
+
+        The two stored target blocks are produced by different transforms and weighting them
+        equally is a choice rather than a neutral default -- and at the shipped budget it is not
+        even a neutral *count*: $66$ of the $98$ survivors are phase-harmonic, so a uniform
+        objective already spends two-thirds of itself there. This returns $w_c$ per surviving
+        channel, positional against ``keep_index``, from one weight per stored block.
+
+        **The renormalisation is the load-bearing part.** The raw weights are scaled by
+        $C_{\mathrm{keep}} / \sum_c w_c$, so the weighted block sums to the same magnitude the
+        unweighted one did. Without it, $(1.0, 0.1)$ would shrink the reconstruction by $2.5\times$
+        against a KL that did not move -- which is a $2.5\times$ increase in the effective $\beta$
+        wearing a channel-weight's name, and it would put ``gradient_clip_val`` and
+        ``additive_margin`` back out of date on both cfs cells. Only the *distribution* across
+        channels moves; the ratio the configuration states is preserved exactly.
+
+        Equal weights return exactly ones: the scale is then $C_{\mathrm{keep}}/C_{\mathrm{keep}}
+        = 1$, so a model configured at $(1.0, 1.0)$ is bitwise the unweighted model rather than
+        merely close to it.
+
+        Args:
+            keep_index: The surviving target channels' **declared** indices, which is what the
+                block split is taken in -- the survivors are not contiguous.
+            weight_st: Relative weight of the first stored block (scattering).
+            weight_ph: Relative weight of the second (phase-harmonic).
+
+        Returns:
+            ``(C_keep,)`` float32, summing to $C_{\mathrm{keep}}$.
+
+        Raises:
+            ValueError: If either weight is negative, or if both are zero -- which would scale by
+                infinity and leave an objective with no reconstruction term at all.
+        """
+        for name, value in (("target_weight_st", weight_st), ("target_weight_ph", weight_ph)):
+            if not float(value) >= 0.0:  # catches NaN as well as negatives
+                raise ValueError(f"{name} must be >= 0 and not NaN, got {value!r}")
+
+        declared = torch.as_tensor(list(keep_index), dtype=torch.long)
+        weights = torch.where(
+            declared < cls.TARGET_BLOCK_SPLIT,
+            torch.tensor(float(weight_st)),
+            torch.tensor(float(weight_ph)),
+        ).to(torch.float32)
+
+        total = float(weights.sum())
+        if total <= 0.0:
+            raise ValueError(
+                "target_weight_st and target_weight_ph are both zero, which would leave the "
+                "objective with no reconstruction term; at least one block must carry weight"
+            )
+        return weights * (float(weights.numel()) / total)
+
     @staticmethod
     def _resolve_block_warm_steps(
         block_warmup_steps: Sequence[int], sequence_length: int
@@ -294,6 +354,10 @@ class CausalFeatureForecastTarget(FeatureForecastTarget):
                 target,
                 likelihood=likelihood,
                 logvar=forward_outputs[f"logvar_{branch}"],
+                # The objective's own weight, so this vector still sums to the ``pred_gap``
+                # printed beside it. Left out, every channel split would be a decomposition of a
+                # quantity the objective does not optimise.
+                channel_weight=self.target_channel_weight,
             ) * mask[..., None]
             return score.sum(dim=(0, 1, 2))
 
@@ -305,7 +369,7 @@ class CausalFeatureForecastTarget(FeatureForecastTarget):
     ) -> torch.Tensor:
         r"""How many anchors this step actually decoded, per batch element.
 
-        A geometry guard, not a result: at the shipped $F = 133$, $S = H = 15$ and
+        A geometry guard, not a result: at the shipped $F = 133$, $S = H = 30$ and
         $T_{\mathrm{valid}} = 285$ it is $11$ for $\varphi \le 1$ and $10$ otherwise, mean
         $152/15$; at the validation stride of $1$ it is exactly $152$. A value off that band means
         the tiling is not the one the configuration states.

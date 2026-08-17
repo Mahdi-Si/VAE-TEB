@@ -1,7 +1,7 @@
 r"""The shared collection pass, and the durable tables every later analysis reads.
 
 One forward over the split is the dominant cost of an evaluation -- four latent branches decoded
-over $H \cdot C_{\mathrm{keep}} = 1470$ target coefficients per anchor at $K$ Monte Carlo draws,
+over $H \cdot C_{\mathrm{keep}} = 2940$ target coefficients per anchor at $K$ Monte Carlo draws,
 plus a fifth KL-only arm -- and almost every analysis wants the same forward. So the pass runs
 **once**, and what it produces is written down:
 
@@ -34,14 +34,14 @@ plus a fifth KL-only arm -- and almost every analysis wants the same forward. So
 
 **A segment that scored no anchors measured nothing, and its columns are NaN rather than zero.**
 The per-sample mean divides by a denominator clamped to $1$, so an empty numerator reads as
-exactly ``0.0`` -- a fabricated score, not a small one. Averaged into a summed-$1470$-coefficient
+exactly ``0.0`` -- a fabricated score, not a small one. Averaged into a summed-$2940$-coefficient
 block figure of hundreds of nats it drags the headline toward zero and shrinks ``pred_gap`` with
 no other symptom. NaN is the representation that makes every downstream ``mean()`` skip it by
 default, and the exclusions are counted per recording and per subgroup rather than merely dropped.
 
 **Heavy quantities, one decision each.** Three things several later analyses want are on neither
 table, and each gets a different treatment rather than a blanket one. Per retained sample at the
-shipped geometry ($T = 300$, $T_{\mathrm{valid}} = 285$, $F = 133$, $A_{\max} = 152$, $H = 15$,
+shipped geometry ($T = 300$, $T_{\mathrm{valid}} = 270$, $F = 133$, $A_{\max} = 137$, $H = 30$,
 $C_{\mathrm{keep}} = 98$, $L = 91$, $M = 4$, fp32):
 
 * **Per-coefficient residuals and log-variances** ($A_{\max} \times H \times C_{\mathrm{keep}}$,

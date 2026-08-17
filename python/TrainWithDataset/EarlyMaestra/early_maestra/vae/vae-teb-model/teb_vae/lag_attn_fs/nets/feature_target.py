@@ -87,6 +87,21 @@ class FeatureForecastTarget:
     #: from rather than leaving it declared and unverified.
     TARGET_BLOCK_SPLIT: int = 43
 
+    #: Per-surviving-channel weight on the reconstruction, or ``None`` for the uniform objective.
+    #:
+    #: ``None`` here rather than a vector of ones, and the distinction is not cosmetic: the
+    #: reduction skips the multiplication entirely when this is ``None``, so a cell that does not
+    #: weight its channels scores a block that is *bitwise* the one it scored before this attribute
+    #: existed. Every cell but the two causal-feature ones leaves it here.
+    #:
+    #: **Declared without a value on purpose.** A cell that weights its channels registers this
+    #: name as a *buffer*, so the vector follows the model onto its device and a checkpoint cannot
+    #: carry one that disagrees with the gate -- and ``register_buffer`` refuses a name that already
+    #: exists on the class, which a ``= None`` default here would create. The two reduction sites
+    #: therefore read it through :func:`getattr` with a ``None`` default rather than as an
+    #: attribute, which is the whole cost of keeping it a buffer.
+    target_channel_weight: Optional[torch.Tensor]
+
     def _default_decoder_out_channels(self) -> int:
         r"""One output per surviving target channel: $C_{\mathrm{keep}}$, or $c_y$ ungated.
 
@@ -276,6 +291,10 @@ class FeatureForecastTarget:
                 target,
                 likelihood=likelihood,
                 logvar=forward_outputs[f"logvar_{branch}"],
+                # ``None`` on every cell that does not weight its channels, which is all of them
+                # except the causal pair; see :attr:`target_channel_weight` for why this is a
+                # ``getattr`` rather than an attribute read.
+                channel_weight=getattr(self, "target_channel_weight", None),
             ) * mask[..., None]
             return score.sum(dim=(0, 1, 3)), score.sum(dim=(0, 1, 2))
 
@@ -397,6 +416,10 @@ class FeatureForecastTarget:
             lambda_ms=lambda_ms,
             lambda_deriv=lambda_deriv,
             lambda_boundary=lambda_boundary,
+            # ``None`` on every cell but the causal pair, where it is the renormalised per-block
+            # weight. It reaches the two reconstruction terms and therefore ``pred_gap``; the gap
+            # splits below apply the same vector, so each stays a partial sum of it.
+            channel_weight=getattr(self, "target_channel_weight", None),
         )
         # Added here rather than inside the objective: the raw-signal models' block has one
         # physical channel and thirty horizon steps of one signal, so neither split says anything

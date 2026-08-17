@@ -300,13 +300,13 @@ def test_the_calibration_gain_is_registered_per_coefficient_rather_than_per_raw_
 
 
 def test_the_pred_gap_convention_states_the_block_this_cell_actually_scores() -> None:
-    """A reader of two runs has to know what a nat is per. Here a block is $15 \\times 98 = 1470$
+    """A reader of two runs has to know what a nat is per. Here a block is $30 \\times 98 = 2940$
     coefficients rather than 480 raw samples, and the percentage that divides by it is therefore
     budget-local -- two arms at two warm-up budgets divide by two different numbers."""
     convention = report_seam.PRED_GAP_CONVENTION
 
     assert "H*C_keep" in convention
-    assert "1470" in convention
+    assert "2940" in convention
     assert "BUDGET-LOCAL" in convention
     assert "bpm" in convention and "no bpm anywhere in this pipeline" in convention
     # The raw cells' block size appears once, in the clause that says this is not it: a reader

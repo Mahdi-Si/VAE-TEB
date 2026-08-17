@@ -106,8 +106,8 @@ GROUPED_METRICS: Tuple[str, ...] = VALUE_COLUMNS
 #: $10^{8}$ -- so an exact test fails on arithmetic rather than on geometry.
 #:
 #: $10^{-6}$ discriminates with room to spare. The smallest truncation this could hide is one
-#: anchor of the shipped $152$ seeing $L - 1$ lags instead of $L$, which moves the mean by
-#: $(\log L - \log(L-1))/152 \approx 7 \times 10^{-5}$ -- two orders of magnitude above the bound.
+#: anchor of the shipped $137$ seeing $L - 1$ lags instead of $L$, which moves the mean by
+#: $(\log L - \log(L-1))/137 \approx 7 \times 10^{-5}$ -- two orders of magnitude above the bound.
 CEILING_TOLERANCE = 1e-6
 
 
