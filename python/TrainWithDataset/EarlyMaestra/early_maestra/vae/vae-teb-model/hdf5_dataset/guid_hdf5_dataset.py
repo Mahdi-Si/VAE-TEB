@@ -800,7 +800,10 @@ def _write_synthetic_shard(
                 low, high = _SMOKE_WARMUP_RANGE[block]
                 warmup = np.linspace(low, high, width).astype(np.int32)
                 dataset.attrs['causal_warmup_steps'] = warmup
-                # Recorded beside the warm-up exactly as the writer does; nothing here reads it.
+                # Recorded beside the warm-up exactly as the real writer does, because
+                # ``read_causal_warmup`` requires both on a causal file. The value is a stand-in
+                # proportional to the warm-up rather than a bank measurement: this shard's
+                # coefficients are noise, so there is no filter whose delay it could state.
                 dataset.attrs['causal_delay_s'] = (warmup * 4.0).astype(np.float32)
         h5f.create_dataset('target', data=np.ones((n, _SMOKE_LEN_SEQUENCE), dtype=np.float32))
         h5f.create_dataset('weight', data=np.ones((n, _SMOKE_LEN_SEQUENCE), dtype=np.float32))

@@ -389,16 +389,21 @@ def test_the_headline_paragraph_carries_the_measured_total_and_both_comparisons(
 def test_the_input_representation_delta_decomposes_into_the_two_terms_the_design_states(
     design, measured_totals, measured_models
 ):
-    r"""The horizon embedding and the two input adapters -- and **not** the decoder head, which is
-    ``raw_per_step`` wide in both cells. Evaluated from the document's own factorisation rather than
-    merely searched for, and then attributed parameter name by parameter name: a section carrying the
-    right total beside a wrong decomposition of it is the half a reader takes on trust."""
+    r"""The two input adapters -- and **not** the decoder head, which is ``raw_per_step`` wide in
+    both cells. Evaluated from the document's own factorisation rather than merely searched for, and
+    then attributed parameter name by parameter name: a section carrying the right total beside a
+    wrong decomposition of it is the half a reader takes on trust.
+
+    **The horizon embedding used to be the second term and is now exactly zero**, because this cell
+    forecasts $30$ steps like the raw-signal sibling it is compared against. It is computed rather
+    than deleted so that a future horizon divergence between the two reappears as a failing sum."""
     section = _markdown_section(design, "## 13. ")
     delta = measured_totals["crws_guarded"] - measured_totals["rws_guarded"]
 
-    horizon_embedding = -15 * 256
+    horizon_embedding = (30 - 30) * 256
     adapters = 128 * (98 - 78) * 2 + 128 * (51 - 29) * 2 - 256
 
+    assert horizon_embedding == 0, "the two horizons diverged; §13 needs its second term back"
     assert delta == horizon_embedding + adapters, (
         f"the input-representation delta is {delta:+,}, which no longer decomposes into the "
         f"horizon embedding ({horizon_embedding:+,}) and the two adapters ({adapters:+,})"
@@ -412,10 +417,13 @@ def test_the_input_representation_delta_decomposes_into_the_two_terms_the_design
     differing = _differing_names(measured_models["crws_guarded"], measured_models["rws_guarded"])
     assert differing, "the two guarded models have identical parameter tables"
     for name in differing:
-        assert name.startswith(("horizon_core.horizon_embedding", "target_adapter.", "source_adapter.")), (
+        assert name.startswith(("target_adapter.", "source_adapter.")), (
             f"{name} differs between the guarded models and belongs to neither stated term"
         )
-    assert differing["horizon_core.horizon_embedding"] == horizon_embedding
+    # The horizon embedding is the same SIZE in both models now, so it is absent from `differing`
+    # rather than present with a value -- which is the parameter-level statement of the vanished
+    # second term, and the thing that would come back the moment the two horizons diverged.
+    assert "horizon_core.horizon_embedding" not in differing
     assert sum(value for name, value in differing.items() if "adapter" in name) == adapters
     assert (
         measured_models["crws_guarded"].decoder.mean_head.out_features
@@ -431,18 +439,18 @@ def test_the_input_representation_delta_decomposes_into_the_two_terms_the_design
     assert {128 * (98 - 78), 128 * (51 - 29)} <= factorisations, (
         f"§13 does not factorise both adapter widths; it states {factorisations}"
     )
-    for value in (delta, adapters, -horizon_embedding):
+    for value in (delta, adapters):
         assert str(value) in _unseparated(section), value
 
 
-def test_the_ungated_delta_decomposes_into_two_terms_as_well(design, measured_totals):
-    """Ungated against ungated the axis is the same horizon-embedding term plus the two input
-    linears at the narrower stored widths, and §13 states it -- so a reader comparing the ungated
-    arms is not left to derive it."""
+def test_the_ungated_delta_decomposes_into_its_two_input_linears(design, measured_totals):
+    """Ungated against ungated the axis is the two input linears at the narrower stored widths, and
+    §13 states it -- so a reader comparing the ungated arms is not left to derive it. The
+    horizon-embedding term is zero here for the same reason it is zero on the guarded arm."""
     section = _markdown_section(design, "## 13. ")
     delta = measured_totals["crws_ungated"] - measured_totals["rws_ungated"]
 
-    assert delta == -15 * 256 + 128 * (102 - 109) + 128 * (51 - 58)
+    assert delta == (30 - 30) * 256 + 128 * (102 - 109) + 128 * (51 - 58)
     assert delta == measured_totals["trf_crws_ungated"] - measured_totals["trf_rws_ungated"]
     assert str(abs(delta)) in _unseparated(section)
 
@@ -643,7 +651,7 @@ def test_the_geometry_section_states_the_policy_and_the_measured_channel_counts(
     assert "not a constraint" in section
     assert "every kept **target-stream** input channel is warm **by the first forecast step**" in section
     # The two costs, both stated as numbers: what the policy costs and what the horizon lever buys.
-    assert "$255$ anchors against $152$" in section
+    assert "$240$ anchors against $137$" in section
     assert "$137$ anchors against $152$" in section
 
 
@@ -738,7 +746,7 @@ def test_the_forward_return_section_states_the_key_count_and_the_shapes(design, 
     assert outputs["anchor_index"].dtype is torch.long
     assert outputs["anchor_valid"].dtype is torch.bool
     assert outputs["mu_full"].shape[-1] == 16
-    assert "$(B, 11, 15, 16)$" in section
+    assert "$(B, 5, 30, 16)$" in section
     assert "No `decoder_state` and no `delta_mu_src`" in section
     assert "decoder_state" not in outputs and "delta_mu_src" not in outputs
 
@@ -825,10 +833,10 @@ def test_the_documented_config_inventory_is_the_real_one(design):
         assert f"`{name}`" in section, name
     named = set(re.findall(r"`([\w.]+\.yaml)`", section))
     assert named <= set(shipped) | {"lag_attn_rws/configs/default.yaml"}, named - set(shipped)
-    assert "twenty" in section  # the exemption count, matched against test_config_load's list
+    assert "nineteen" in section  # the exemption count, matched against test_config_load's list
     from teb_vae.lag_attn_crws.tests.test_config_load import PARITY_EXEMPT_PATHS
 
-    assert len(PARITY_EXEMPT_PATHS) == 20
+    assert len(PARITY_EXEMPT_PATHS) == 19
 
 
 # =================================================================================================
@@ -895,7 +903,7 @@ def test_the_record_names_the_input_representation_edge_and_says_it_is_not_a_lev
     assert "`lag_attn_rws`" in section
     assert "**not** comparable as a level" in section
     assert "sign and the trajectory only" in section
-    assert "sweep_horizon_30.yaml" in section
+    assert "sweep_horizon_15.yaml" in section
 
 
 # =================================================================================================
@@ -1043,8 +1051,8 @@ def test_the_loss_scale_constants_section_states_the_measured_percentiles(result
 
     section = results.split("## The loss-scale constants")[1].split("\n## ")[0]
 
-    assert "`gradient_clip_val`" in section and "1000.0" in section
-    assert "`additive_margin`" in section and "5.0e+2" in section
+    assert "`gradient_clip_val`" in section and "12000.0" in section
+    assert "`additive_margin`" in section and "2.5e+3" in section
     assert "`ema_floor`" in section and "`horizon_embed_std`" in section
     assert str(round(breaker.MEASURED_GRAD_Q99)) in section
     assert str(round(breaker.MEASURED_EXCURSION_MAX)) in section

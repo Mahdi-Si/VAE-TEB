@@ -401,7 +401,7 @@ def test_the_anchor_stride_equals_the_configured_horizon(shipped) -> None:
     that left the stride behind fails here rather than training a different objective."""
     vae = shipped["model_config"]["VAE_model"]
 
-    assert vae["anchor_stride"] == vae["horizon"] == 15
+    assert vae["anchor_stride"] == vae["horizon"] == 30
 
 
 def test_the_shipped_config_builds_a_decoder_as_wide_as_the_raw_grid(tmp_path) -> None:
@@ -420,7 +420,7 @@ def test_the_shipped_config_builds_a_decoder_as_wide_as_the_raw_grid(tmp_path) -
 
     assert len(kwargs["target_keep_index"]) == 98  # the budget's reach: the INPUTS, not the target
     assert model.decoder_out_channels == model.raw_per_step == 16
-    assert model.horizon * model.geometry.r == 240
+    assert model.horizon * model.geometry.r == 480
 
 
 # --------------------------------------------------------------------------------------
@@ -837,7 +837,7 @@ def test_the_resolved_tiny_variant_validates_and_builds(tmp_path, loguru_warning
     # the production channel set and the forward still decodes the production tile count.
     assert model.d_model == 32
     assert model.target_adapter.linear.in_features == 98
-    assert model.anchor_stride == 15
+    assert model.anchor_stride == 30
 
 
 # --------------------------------------------------------------------------------------

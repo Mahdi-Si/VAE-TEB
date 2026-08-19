@@ -69,7 +69,7 @@ _ADDED_METRIC_KEYS = {
 #: The shipped raw block: $H \cdot R = 15 \times 16$ samples per anchor, against the two-sided
 #: sibling's $30 \times 16 = 480$. Recorded here because every loss-scale constant stated in nats has
 #: to be re-derived rather than transferred, and this is the number that makes that true.
-_SHIPPED_BLOCK = 240
+_SHIPPED_BLOCK = 480
 
 #: The two phases the tiled fixtures run at. Chosen so the second row is one anchor short of the
 #: first, which is the only way a padded slot exists at all -- and every padding assertion below
@@ -169,7 +169,7 @@ def test_the_sample_score_divides_the_block_by_the_horizon_times_the_raw_grid() 
     assert block == _SHIPPED_BLOCK
     # The causal-feature cell's block at the same horizon and the same inputs, for the same anchors:
     # a different quantity by a factor of 6.125, which is why no constant transfers between them.
-    assert 15 * 98 / block == pytest.approx(6.125)
+    assert 30 * 98 / block == pytest.approx(6.125)
 
 
 def test_the_block_width_is_the_raw_grids_own_and_the_logvar_diagnostics_follow_it() -> None:

@@ -207,7 +207,7 @@ class CausalRawInputs(CausalWarmupInputs):
         $162$, $194$, $233$ and $278$ steps, which are still cold hundreds of steps past this floor
         and are meant to be. That residual is *measured* rather than refused, by
         ``source_lag_warmth_frac_st`` and ``_ph``; a policy stated over every input channel would
-        push $F$ to $277$ and cost about $144$ of the $152$ anchors to enforce something this design
+        push $F$ to $277$ and cost about $144$ of the $137$ anchors to enforce something this design
         deliberately does not want.
 
         The remaining wording is exact and its obvious paraphrase is not. At the shipped $F = 133$

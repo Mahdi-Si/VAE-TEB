@@ -149,7 +149,7 @@ class SeqVaeLagAttnCrwsTask(SeqVaeLagAttnRwsTask):
         ``concat_single_forecasts``, which reads its per-anchor block at an **anchor** index; this
         model's forecast is $(A_{\max}, H, R)$ and is indexed by position in the decoded set. The two
         coincide only at floor $0$ and stride $1$. At the shipped geometry they do not even have
-        compatible ranges -- $152$ positions read at anchors $133 \dots 284$ -- so the page dies
+        compatible ranges -- $137$ positions read at anchors $133 \dots 269$ -- so the page dies
         inside a handler that warns and continues, and the run's diagnostics directory comes out
         empty; at a smaller floor it draws a real forecast at the wrong time with no exception in it.
 

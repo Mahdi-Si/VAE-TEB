@@ -36,11 +36,34 @@ ENTRY_POINTS: Tuple[str, ...] = (
     "teb_vae.lag_attn_transformer_rws.eval.verify",
     # Not an evaluation runner, but a runner: the architecture extractor is launched the same way.
     "teb_vae.lag_attn_transformer_cfs.nets.arch_viz.extract_arch",
+    # Nor are these two, and the same argument admits them: an operator launches them directly, so
+    # the convention is what makes them launchable without a command line. They are the two halves
+    # of a dataset build -- the shard and its statistics -- and a gate that builds a shard with a
+    # mistyped setting is a gate that measures the wrong thing for hours before saying so.
+    "hdf5_dataset.new_pipeline.create_new_pipeline",
+    "hdf5_dataset.calculate_dataset_stats",
 )
+
+#: Entry points whose module imports two packages that exist only on the production box. Importing
+#: them here goes through the repository's own shim, which stubs the prod-only adaptor and aliases
+#: the production import path onto the in-repo one -- the same shim every dataset test uses, rather
+#: than a second one free to drift from the layout the production box actually has.
+_SHIMMED = {"hdf5_dataset.new_pipeline.create_new_pipeline"}
 
 
 def _module(name: str) -> Any:
-    """Import an entry point by name."""
+    """Import an entry point by name.
+
+    Args:
+        name: Dotted module path from :data:`ENTRY_POINTS`.
+
+    Returns:
+        The imported module.
+    """
+    if name in _SHIMMED:
+        from hdf5_dataset.smoke_check_channel_selection import _import_pipeline
+
+        return _import_pipeline()
     return importlib.import_module(name)
 
 

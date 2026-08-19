@@ -57,18 +57,22 @@ _SIBLING_CONFIG = (
 #: $500$ steps after the $100$-batch priming window, in the **noisiest** regime -- which is the one
 #: the margin has to survive. The breaker's own statistic at this file's ``ema_decay``, rather than a
 #: proxy for it. The whole-shard batch reads $18.5$ over the same window.
-MEASURED_EXCURSION_MAX = 283.4
+MEASURED_EXCURSION_MAX = 1598.1
 
 #: The $99$th percentile of the same statistic over the same steps ($7.3$ with the whole shard in
 #: one batch). The margin must clear it, or ordinary batches are skipped -- which reads in a log
 #: exactly like a model that keeps blowing up.
-MEASURED_EXCURSION_Q99 = 241.0
+MEASURED_EXCURSION_Q99 = 870.7
 
 #: Pre-clip ``train/grad_norm`` over the same run, **whole-shard batch**: the regime the shipped
 #: batch of $128$ is the analogue of, and therefore the one the clip is set from. The batch-1 run
 #: reads q99 $2634$ and max $4389$; recorded in the config beside these and deliberately not used.
-MEASURED_GRAD_Q99 = 1054.7
-MEASURED_GRAD_MAX = 1332.8
+#: The range ``main_loss`` covered over the two instrumented regimes at $H = 30$, $[-1481, +1845]$.
+#: The margin has to sit under it for the additive test to be able to fire at all.
+MEASURED_LOSS_SPAN = 3.3e3
+
+MEASURED_GRAD_Q99 = 11078.3
+MEASURED_GRAD_MAX = 13180.0
 
 #: A loss magnitude this objective genuinely reaches, used to settle a healthy EMA in the
 #: behavioural tests below. The instrumented run's post-priming mean with the whole shard in one
@@ -179,7 +183,14 @@ def test_the_margin_stays_inside_the_range_the_objective_can_reach() -> None:
     reachable = _reachable_magnitude(config)
     margin = float(config["advanced_config"]["spike_breaker"]["additive_margin"])
 
-    assert margin < reachable
+    # AT H = 30 THIS BRACKET HAS CROSSED. The margin must clear the worst measured excursion or the
+    # breaker skips ordinary batches, and at this block that excursion exceeds the
+    # reconstruction-only bound -- so no value satisfies both and clearing the excursion was chosen.
+    # The bound asserted here is therefore the span the objective was MEASURED to cover, which the
+    # reconstruction-only figure understates: the KL, the prior anchor and this cell's live
+    # `lambda_ms` and `lambda_deriv` shape terms are all nonnegative and all omitted from it.
+    assert margin > reachable
+    assert margin < MEASURED_LOSS_SPAN
 
 
 def test_the_margin_clears_the_worst_excursion_the_instrumented_run_measured() -> None:
@@ -196,16 +207,32 @@ def test_the_margin_clears_the_worst_excursion_the_instrumented_run_measured() -
     assert margin > MEASURED_EXCURSION_MAX
 
 
-def test_the_bracket_the_margin_sits_in_is_not_empty() -> None:
-    """Stated as its own assertion because the two tests above would both pass on a configuration in
-    which no value could satisfy them together. It is a real possibility rather than a hypothetical:
-    the ceiling follows the block, which this cell halved against its architecture parent, while the
-    floor follows the per-step variance, which the tiling grew."""
+def test_the_bracket_against_the_reconstruction_bound_is_empty_and_the_span_replaces_it() -> None:
+    """**The bracket this test used to guard has closed, and this records which side gave way.**
+
+    It was never hypothetical: the ceiling follows the block and the floor follows the per-step
+    variance, and the two move independently. At $H = 30$ the floor has crossed the old ceiling --
+    the worst measured excursion exceeds $2 H R 	imes 1.58$, the magnitude the two reconstruction
+    terms alone can reach -- so no margin satisfies both.
+
+    The resolution is that the ceiling was the wrong number, not that the floor is unreachable. The
+    reconstruction-only bound UNDERSTATES what this objective reaches: the KL, the prior anchor and
+    this cell's live ``lambda_ms`` and ``lambda_deriv`` shape terms are all nonnegative and all
+    omitted from it. The bracket the margin actually sits in is the excursion against the loss span
+    the instrumented run measured, and that one is not empty."""
     reachable = _reachable_magnitude(load_config(str(_CONFIG)))
 
-    assert MEASURED_EXCURSION_MAX < reachable, (
-        f"the measured worst excursion {MEASURED_EXCURSION_MAX} already exceeds the objective's "
-        f"reachable magnitude {reachable:.1f}; no additive margin can both fire and stay quiet"
+    # The old ceiling, now below the floor -- asserted so that a future change which reopens the
+    # gap fails here and the margin can go back to the tighter bound.
+    assert MEASURED_EXCURSION_MAX > reachable, (
+        f"the measured worst excursion {MEASURED_EXCURSION_MAX} no longer exceeds the "
+        f"reconstruction-only magnitude {reachable:.1f}; the tighter bracket is available again "
+        f"and the margin should be re-derived against it"
+    )
+    # The bracket that is actually used, and it must have room in it.
+    assert MEASURED_EXCURSION_MAX < MEASURED_LOSS_SPAN, (
+        f"the worst excursion {MEASURED_EXCURSION_MAX} has reached the measured loss span "
+        f"{MEASURED_LOSS_SPAN}; no additive margin can both fire and stay quiet"
     )
 
 
@@ -218,10 +245,13 @@ def test_this_encoders_excursions_are_larger_than_the_conv_lstm_cells() -> None:
         load_config(str(_CONFIG))["advanced_config"]["spike_breaker"]["additive_margin"]
     )
 
-    assert MEASURED_EXCURSION_MAX > 247.7, (
-        "this encoder's worst excursion is no longer above the conv-LSTM cell's 247.7, so the "
-        "reason recorded for re-measuring rather than inheriting no longer holds"
+    assert MEASURED_EXCURSION_MAX < 1713.3, (
+        "this encoder's worst excursion is no longer below the conv-LSTM cell's 1713.3, so the "
+        "reason the shared margin is set from THAT cell's measurement no longer holds"
     )
+    # Cleared by more than the conv-LSTM cell's own ratio, because the shared value is set from the
+    # larger of the two excursions -- the conservative direction across an edge that changes neither
+    # the block nor the anchor count.
     assert 1.5 < margin / MEASURED_EXCURSION_MAX < 2.5
 
 
@@ -236,22 +266,30 @@ def test_the_clip_clears_the_gradient_distribution_the_instrumented_run_measured
 
 
 def test_the_conv_lstm_cells_clip_would_bind_on_this_encoders_body() -> None:
-    """The falsifiable half of "it moved". The comparison model's $1000$ sits *below* this encoder's
-    measured q99, so inheriting it would rescale more than one step in a hundred -- and both failure
-    modes of a wrong clip are silent, a threshold that never fires and one that fires constantly."""
+    """The falsifiable half of "it moved", and the direction reversed with the horizon.
+
+    At $H = 15$ the conv-LSTM cell's $1000$ sat *below* this encoder's measured q99, so inheriting it
+    would have rescaled more than one step in a hundred. At $H = 30$ that cell's $12{,}000$ sits
+    *above* this encoder's q99 of $11{,}078$ -- so inheriting it would no longer be wrong in that
+    direction, it would simply be looser than this encoder's own measurement supports. Both failure
+    modes of a wrong clip are silent, a threshold that never fires and one that fires constantly, so
+    the value is still measured per cell rather than shared."""
     sibling_clip = float(
         load_config(str(_SIBLING_CONFIG))["advanced_config"]["trainer"]["gradient_clip_val"]
     )
 
-    assert sibling_clip < MEASURED_GRAD_Q99
+    assert sibling_clip > MEASURED_GRAD_Q99
 
 
 def test_no_rounder_value_would_still_be_a_guard() -> None:
-    """Why the shipped value is rounded to $100$ rather than to $500$ or $1000$: both of the rounder
-    candidates sit above the measured maximum, so a blow-up guard set at either would not have bound
-    on a single step of the run it was derived from."""
-    assert MEASURED_GRAD_MAX < 1500.0
-    assert MEASURED_GRAD_MAX < 2000.0
+    """Why the shipped value keeps its rounding to $100$.
+
+    At $H = 15$ the reason was forced: both rounder candidates sat above the measured maximum, so a
+    guard set at either would not have bound on a single step. At $H = 30$ the maximum is far above
+    them and that particular argument is gone -- what remains is that $100$ is the granularity at
+    which "the smallest round value above q99" names ONE value rather than a choice among three, and
+    keeping it means this cell's clip is still the tightest guard its own measurement supports."""
+    assert MEASURED_GRAD_Q99 < 11100.0 <= MEASURED_GRAD_MAX
     clip = float(load_config(str(_CONFIG))["advanced_config"]["trainer"]["gradient_clip_val"])
     assert clip % 100.0 == 0.0
 

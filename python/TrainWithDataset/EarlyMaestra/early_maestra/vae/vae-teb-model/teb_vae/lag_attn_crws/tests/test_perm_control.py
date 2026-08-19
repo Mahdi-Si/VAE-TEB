@@ -4,7 +4,7 @@ r"""The imported permutation control, run against a model that decodes a tiled a
 so without this file their first execution would be on the production box after a full training
 epoch. That is not a hypothetical: the control decodes ``z_post_perm`` at the anchors the matched
 forward used, and with no anchor set supplied it decodes the contiguous prefix
-$[0, T_{\mathrm{valid}})$ instead -- $(B, 285, H, R)$ against a $(B, 11, H, R)$ forecast, which is a
+$[0, T_{\mathrm{valid}})$ instead -- $(B, 270, H, R)$ against a $(B, 5, H, R)$ forecast, which is a
 shape error rather than a wrong number, and one that arrives only on a validation step.
 
 The first assertion below is the shape, explicitly, and that is deliberate: ``torch.equal`` returns

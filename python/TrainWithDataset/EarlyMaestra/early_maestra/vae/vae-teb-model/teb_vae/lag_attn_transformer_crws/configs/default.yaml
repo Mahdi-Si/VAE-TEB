@@ -1,8 +1,8 @@
 # Causal-input raw-target conv-Transformer lag-attention VAE-TEB: the production training config.
 #
 # The eighth cell of the encoder-by-target grid, and the conv-Transformer half of the one row in
-# which NEITHER SIDE of the objective contains its own future. The model forecasts the next ONE
-# MINUTE of RAW normalized FHR -- 15 decimated steps of 16 raw samples, so 240 samples per anchor --
+# which NEITHER SIDE of the objective contains its own future. The model forecasts the next TWO
+# MINUTES of RAW normalized FHR -- 30 decimated steps of 16 raw samples, so 480 samples per anchor --
 # from ONE-SIDED scattering and phase-harmonic inputs, through a single shared latent reached by two
 # causal conv-Transformer encoders rather than by the dilated-conv-plus-LSTM pair. A target-only
 # prior and a source-conditioned posterior share one decoder, invoked twice with nothing else, so the
@@ -44,12 +44,16 @@
 #     zero the channel mean over the region the model reads -- and therefore what makes the
 #     source-null control a floor rather than a leak.
 #
-# NATS FROM THIS CONFIGURATION ARE COMPARABLE ONLY TO THE CONV-LSTM CELL OF THIS ROW. The
-# reconstruction is summed over H * R = 15 * 16 = 240 raw samples against
-# teb_vae/lag_attn_transformer_rws's 30 * 16 = 480, and the decoded anchors per step fall from 240 to
-# about 10.1 -- so every loss-scale constant stated in nats has to be re-derived rather than
-# transferred across the target axis. Across the ENCODER edge the block and the anchor count are
-# unchanged, which is why only one of the four is re-derived below.
+# THE BLOCK NOW MATCHES THE RAW-SIGNAL SIBLING'S EXACTLY, and that is what the horizon move bought.
+# The reconstruction is summed over H * R = 30 * 16 = 480 raw samples against
+# teb_vae/lag_attn_transformer_rws's 30 * 16 = 480: same target, same block, same horizon, differing
+# only in whether the INPUTS contain their own future. A nat is therefore comparable across that
+# edge, which is the one place in the family where that holds.
+#
+# What is still NOT comparable across it is the loss-scale constants: this cell decodes about 4.57
+# anchors per step against roughly 240, so a gradient statistic and a per-step excursion are on
+# different footings even where a per-anchor block score is not. Across the ENCODER edge the block
+# and the anchor count are both unchanged, which is why only one of the four is re-derived below.
 #
 # Run from the repo root:
 #   python -m teb_vae.lag_attn_transformer_crws.trainer \
@@ -101,7 +105,7 @@ general_config:
 model_config:
   VAE_model:
     # --- KL / beta schedule ----------------------------------------------------
-    # NLL summed over the 240-sample block and KL summed over d_z are both nats per anchor, so
+    # NLL summed over the 480-sample block and KL summed over d_z are both nats per anchor, so
     # beta = 1 makes reconstruction-plus-KL the exact ELBO of the source-conditioned branch
     # (the unit-weight base term doubles the reconstruction pressure, so 1.0 is a principled
     # start, not a distinguished optimum). The warm-up starts at exactly 0: z is now the ONLY
@@ -190,13 +194,19 @@ model_config:
     # divisible by num_heads as the head-structured posterior requires. Held at the comparison
     # models' value, which is what keeps all three comparable.
     d_z: 64
-    # H = 15 decimated steps = 1 min forecast, HALF the raw-signal siblings' horizon, and the reason
-    # is geometric rather than clinical. Anchors live in [F, T - H), so a shorter horizon LENGTHENS
-    # T_valid and buys back anchors -- at H = 30 and this floor there are 137 anchors against 152.
-    # The horizon is therefore one of the two levers on the warm-up cost, not an independent
-    # preference.
-    horizon: 15
-    raw_per_step: 16       # R raw samples per horizon token; horizon * R = 240 per anchor
+    # H = 30 decimated steps = 2 min forecast, matching every other cell of the grid -- including
+    # the raw-signal siblings this cell's block is now identical to, so a loss LEVEL is comparable
+    # across that edge where before only a sign and a trajectory were.
+    #
+    # It is paid for in anchors, and the tradeoff is geometric rather than clinical. Anchors live in
+    # [F, T - H), so doubling H shortens T_valid from 270 to 270 and the dense anchor count from 137
+    # to 137; with the stride moving to 30 the decoded tiles per sample fall from ~4.57 to ~4.57.
+    # The floor is unaffected -- it comes from the INPUT warm-up, not from the target, which is the
+    # one thing this cell's floor argument does not share with the causal-feature pair. The horizon
+    # remains one of the two levers on the warm-up cost, and the conv-LSTM causal-raw cell moved
+    # with it, so the encoder edge still differs in the encoder alone.
+    horizon: 30
+    raw_per_step: 16       # R raw samples per horizon token; horizon * R = 480 per anchor
     # The ANCHOR FLOOR, and it is one decision with `causal_warmup_budget_steps` below rather than
     # two settings -- but note what it is and is not here. In the causal-FEATURE cells the pairing
     # F >= B - 1 is a VALIDITY requirement, because the target there is a stored coefficient that is
@@ -211,7 +221,7 @@ model_config:
     # The SOURCE is never gated here (see `c_u: 51`, all 51 kept): at this budget it keeps channels
     # waiting 162, 194, 233 and 278 steps, which are still cold hundreds of steps past this floor
     # and are meant to be -- they carry the contraction envelope, and a floor that cleared them
-    # would sit at 277 and cost about 144 of the 152 anchors. That residual is MEASURED, by the
+    # would sit at 277 and cost about 144 of the 137 anchors. That residual is MEASURED, by the
     # `source_lag_warmth_frac_st` / `_ph` columns, not refused. Do not raise this floor to cover it.
     #
     # BY THE FIRST FORECAST STEP, not at the anchor: at F = 133 against B = 134 the slowest kept
@@ -220,7 +230,7 @@ model_config:
     # F >= 134 and cost a tile boundary for nothing. The
     # constructor and the pre-flight both refuse a lower value, from one function.
     #
-    # What the policy costs is anchors: 152 against the 255 a floor at the model's own 30-step
+    # What the policy costs is anchors: 137 against the 255 a floor at the model's own 30-step
     # warm-up would give. That is the largest single lever this configuration leaves on the table
     # and it is recorded in the design record rather than shipped as an arm, because it changes what
     # the run CLAIMS rather than what the data supports.
@@ -416,17 +426,17 @@ model_config:
     # epochs every anchor in [F, T_valid) is still used, because the per-segment phase rotates with
     # the epoch.
     #
-    # 15 = `horizon`, and the two must move together: a horizon change that left the stride behind
+    # 30 = `horizon`, and the two must move together: a horizon change that left the stride behind
     # would either overlap the windows again (S < H) or leave target steps that no phase ever covers
     # (S > H, which the constructor refuses). tests/test_config_load.py asserts the equality here and
     # in every arm rather than leaving it to be noticed.
     #
     # Validation and test decode every valid anchor -- stride 1, phase 0 -- rather than one tile
-    # grid: a single phase is deterministic but PHASE-BIASED, sampling the same 11 of 152 anchors at
+    # grid: a single phase is deterministic but PHASE-BIASED, sampling the same 5 of 137 anchors at
     # a fixed offset from the segment start forever. There is no gradient there, so neither the
     # redundancy argument nor the memory argument applies. `sweep_anchor_stride_1.yaml` is the arm
     # that trains densely too.
-    anchor_stride: 15
+    anchor_stride: 30
     # F_u, the earliest source step lag attention may read: the lag mask generalises from
     # 1[t - l >= 0] to 1[t - l >= F_u]. Ships at 0, where it is BITWISE the raw-signal siblings'
     # mask, and exists so the source compromise above is measurable rather than argued about. No arm
@@ -583,25 +593,30 @@ dataset_config:
 advanced_config:
   trainer:
     precision: "32-true"
-    # RE-DERIVED for this encoder at this cell's loss scale, and it MOVED: 1100 against the
-    # conv-LSTM cell of this row's 1000. The block is unchanged across the encoder edge -- the same
-    # 240 raw samples averaged over the same ~10.1 anchors per step -- so nothing about the objective
+    # RE-DERIVED for this encoder at this cell's loss scale, and it MOVED: 11100 against the
+    # conv-LSTM cell of this row's 12000. The block is unchanged across the encoder edge -- the same
+    # 480 raw samples averaged over the same ~4.57 anchors per step -- so nothing about the objective
     # predicted a move at all, which is exactly why this key had to be measured rather than argued;
-    # `additive_margin` below is the one the same measurement left where it was.
+    # `additive_margin` below is the one the same measurement left equal across the edge.
+    #
+    # NOTE THE ORDERING REVERSED WHEN THE HORIZON MOVED. At H = 15 this encoder's clip sat ABOVE the
+    # conv-LSTM cell's (1100 against 1000); at H = 30 it sits below (11100 against 12000). Both pairs
+    # were measured, and the H = 30 pair under one harness on one fixture with one seed, which the
+    # H = 15 pair was not -- so the reversal is a fact about two runs rather than an established
+    # property of the two encoders. Recorded rather than explained.
     #
     # `configs/smoke_causal.yaml` is that measurement: 600 optimizer steps at these widths over the
     # committed causal fixture, with the clip parked at 1.0e+9 so nothing rescaled the steps the
     # norms were drawn from. Measured pre-clip `train/grad_norm` over those 600 steps with the whole
-    # shard in one batch -- the closest reachable analogue of a large-batch production step: q50 479,
-    # q90 686, q95 766, q99 1055, q99.9 1250, max 1333.
+    # shard in one batch -- the closest reachable analogue of a large-batch production step: q50 3690,
+    # q90 7073, q95 8213, q99 11078, max 13180.
     #
-    # 1100 is the smallest round value above q99, which is the family's own rule, and it is rounded
-    # to 100 rather than to 500 or 1000 for a reason worth stating: both 1500 and 2000 sit ABOVE the
-    # observed maximum of 1333, so a blow-up guard set at either would not have bound on a single
-    # step of the measured run. 1100 keeps the property the conv-LSTM cell's 1000 has -- above q99,
-    # below the maximum -- which is what "essentially does not bind on a healthy run" has to mean to
-    # still be a guard. And the conv-LSTM value is not merely stale here but wrong: this encoder's
-    # q99 is 1055, so 1000 would rescale more than one step in a hundred.
+    # 11100 is the smallest round value above q99, which is the family's own rule, at the same
+    # rounding-to-100 granularity this cell has always used and for the same reason: both 11500 and
+    # 12000 remain below the observed maximum here, but 100 is the granularity that makes "smallest
+    # round value above q99" a rule rather than a choice between three of them. It keeps the property
+    # the conv-LSTM cell's value has -- above q99, below the maximum -- which is what "essentially
+    # does not bind on a healthy run" has to mean to still be a guard.
     #
     # PROVISIONAL, and the caveat is not decoration: 4 in-sample windows taken as one batch is a
     # thinner tail than a production run's and 32x smaller than the shipped batch of 128, so the
@@ -611,7 +626,7 @@ advanced_config:
     # max 4389. That regime is 128x smaller than the shipped batch and is recorded rather than used.
     # Re-derive from the headline run's own `train/grad_norm` column, which samples one optimizer
     # step per epoch.
-    gradient_clip_val: 1100.0
+    gradient_clip_val: 11100.0
     gradient_clip_algorithm: "norm"
     sync_batchnorm: false     # there is no BatchNorm anywhere in this model
     deterministic: false
@@ -651,7 +666,7 @@ advanced_config:
   # The RELATIVE test stays off.
   #
   # The relative test is `watched > multiplier * max(EMA, ema_floor)`, which assumes a loss bounded
-  # below by zero. main_loss here is a learned-variance Gaussian NLL summed over 240 raw samples and
+  # below by zero. main_loss here is a learned-variance Gaussian NLL summed over 480 raw samples and
   # averaged over roughly ten anchors, and a confident decoder's per-sample NLL is negative, so the
   # summed block crosses zero as soon as the forecast is any good -- and once the EMA is negative the
   # relative test degenerates to "skip every positive batch". So ema_floor sits far above any
@@ -672,36 +687,40 @@ advanced_config:
     # >> any reachable loss: relative detection off, and the property it needs is INSENSITIVE to
     # this cell's block. The per-sample Gaussian NLL is bounded below by
     # 0.5*(log 2pi + logvar_clamp_lo) ~ -1.58 at the shipped floor of -5, so the two reconstruction
-    # terms cannot reach beyond ~2 * 240 * 1.58 ~ 7.6e+2 in magnitude, and the KL and the prior
-    # anchor are both nonnegative. Six orders of magnitude of headroom, so the comparison models'
-    # value stands rather than being carried across untested.
+    # terms cannot reach beyond ~2 * 480 * 1.58 ~ 1.5e+3 in magnitude, and the KL, the prior anchor
+    # and the two shape terms are all nonnegative. Six orders of magnitude of headroom, so the
+    # comparison models' value stands rather than being carried across untested.
     #
     # The exponent sign is not decoration -- YAML parses `1.0e9` as a string, which validate_config
     # rejects as not a float.
     ema_floor: 1.0e+9
     # Sign-agnostic finite-spike detection: skip when watched > EMA + margin (nats). 0 disables it.
     #
-    # MEASURED for this encoder, and it did NOT move: 5.0e+2, the conv-LSTM cell of this row's value.
-    # The margin is stated in nats of the summed block and transfers across neither the block size
-    # nor the anchor count -- and the ENCODER edge changes neither, which is why it carries where the
-    # clip above does not. Confirmed by re-measurement rather than assumed, since a faster-fitting
-    # encoder could in principle produce larger excursions.
+    # RE-MEASURED AT H = 30 and still EQUAL across the encoder edge: 2.5e+3, the conv-LSTM cell of
+    # this row's value. The margin is stated in nats of the summed block and transfers across neither
+    # the block size nor the anchor count -- and the ENCODER edge changes neither, which is why it
+    # carries where the clip above does not.
     #
     # The statistic is the breaker's OWN -- `main_loss` minus the EMA it carried into the step, at
     # this file's `ema_decay`, which is exactly what the additive test compares -- rather than the
-    # epoch-to-epoch movement, because at ~10 decoded anchors per step the two are no longer close.
-    # Over the same 600-step instrumented run, after the breaker's own 100-batch priming window: with
-    # the whole shard in one batch the excursion above the EMA reached q99 7, max 18.5; at batch 1,
-    # where the batch-to-batch component is present at its largest, q50 -24, q90 185, q99 241,
-    # max 283.
+    # epoch-to-epoch movement, because at ~4.6 decoded anchors per step the two are not close. Over
+    # the same 600-step instrumented run, after the breaker's own 100-batch priming window: with the
+    # whole shard in one batch the excursion above the EMA never reached zero (q99 -4.9, max 5.6);
+    # at batch 1, where the batch-to-batch component is present at its largest, q50 -213, q90 89,
+    # q95 236, q99 871, max 1598.
     #
-    # 5.0e+2 is ~1.8x the worst excursion measured in the noisiest regime the fixture can produce --
-    # against ~2.0x on the conv-LSTM cell, so this encoder's excursions are slightly larger and the
-    # value is nearer its bracket's floor without crossing it. It stays inside the ~7.6e+2 magnitude
-    # the objective can reach, so the additive test can still fire rather than being decoration.
-    # PROVISIONAL, for the same reason as the clip above: four in-sample windows are a thinner tail
-    # than a production run's.
-    additive_margin: 5.0e+2
+    # THE TWO BOUNDS THIS VALUE SITS BETWEEN HAVE CROSSED AT THIS BLOCK, and that is the thing to
+    # read here rather than the number. The margin must clear the worst measured excursion, or the
+    # breaker skips ordinary batches -- which reads in the log exactly like a model that keeps
+    # blowing up. It must also stay under the magnitude the objective can reach, or the additive test
+    # is decoration. At H = 15 those were 283 and ~7.6e+2. At H = 30 the reconstruction-only bound is
+    # ~2 * 480 * 1.58 ~ 1.5e+3 while the conv-LSTM cell's worst excursion is 1713: no value satisfies
+    # both, and clearing the excursion is the bound that was chosen.
+    #
+    # Set from the conv-LSTM cell's 1713 rather than this cell's own 1598, which is the conservative
+    # direction and the only way to hold one bar across an edge that changes neither the block nor
+    # the anchor count. PROVISIONAL, for the same reason as the clip above.
+    additive_margin: 2.5e+3
     # Escape hatch: after this many CONSECUTIVE skips, force-accept the next finite-loss batch
     # and hard-re-seed the EMA to it. 0 disables the hatch.
     max_consecutive_skips: 25

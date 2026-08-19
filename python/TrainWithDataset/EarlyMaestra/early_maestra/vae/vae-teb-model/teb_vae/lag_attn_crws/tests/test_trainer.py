@@ -232,7 +232,7 @@ def test_the_two_new_geometry_keys_reach_the_constructor(driver):
     defaults with nothing raising."""
     kwargs = driver._build_model_kwargs()
 
-    assert kwargs["anchor_stride"] == 15
+    assert kwargs["anchor_stride"] == 30
     assert kwargs["lag_floor"] == 0
 
 
@@ -264,7 +264,7 @@ def test_the_resolved_kwargs_actually_build_the_model_the_config_describes(drive
     assert model.target_adapter.linear.in_features == GUARDED_TARGET_CHANNELS
     assert model.source_adapter.linear.in_features == GUARDED_SOURCE_CHANNELS
     assert model.raw_per_step == 16
-    assert model.anchor_stride == model.horizon == 15
+    assert model.anchor_stride == model.horizon == 30
     # The declared widths are untouched, which is what the data boundary checks against.
     assert (model.c_y, model.c_u) == (CAUSAL_C_Y, CAUSAL_C_U)
     # The unconditional freeze the DDP strategy relies on.
@@ -367,16 +367,16 @@ def test_create_model_logs_the_resolved_anchor_geometry(driver):
         logger.remove(sink)
 
     line = next(m for m in messages if "resolved anchor geometry" in m)
-    assert "H=15" in line and "S=15" in line and "F=133" in line
-    assert "A_max=11" in line and "T_valid=285" in line
-    assert "tiles per sample 10-11" in line
-    assert "raw block width H*R=240" in line
+    assert "H=30" in line and "S=30" in line and "F=133" in line
+    assert "A_max=5" in line and "T_valid=270" in line
+    assert "tiles per sample 4-5" in line
+    assert "raw block width H*R=480" in line
     # The refine stack's span, beside the horizon it has to cover. At the shipped horizon_depth=4
     # and horizon_kernel=3 it is 1 + 2*(2^4 - 1) = 31 tokens against H + 1 = 16, so the family's
     # RF >= H + 1 criterion is slack here -- and exactly binding on the horizon arm, at 31 against
     # 31, which is why it is printed rather than assumed: nothing in the shipped code ties
     # horizon_depth to horizon, so an arm that moved one and left the other would be silent.
-    assert "horizon receptive field=31 tokens against H+1=16" in line
+    assert "horizon receptive field=31 tokens against H+1=31" in line
 
 
 def test_the_logged_receptive_field_is_read_off_the_built_stack(driver):

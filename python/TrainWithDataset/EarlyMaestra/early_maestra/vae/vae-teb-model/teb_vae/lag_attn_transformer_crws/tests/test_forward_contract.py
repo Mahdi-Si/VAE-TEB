@@ -142,7 +142,7 @@ def test_the_tiny_geometry_derives_its_anchor_count(outputs) -> None:
 
 
 def test_the_shipped_geometry_forecasts_eleven_tiles() -> None:
-    r"""$(B, 11, 15, 16)$ at the production geometry: $\lceil (285 - 133)/15 \rceil = 11$ tiles of
+    r"""$(B, 5, 30, 16)$ at the production geometry: $\lceil (285 - 133)/15 \rceil = 11$ tiles of
     $15$ steps of $16$ raw samples. Derived from the constructed model rather than asserted as four
     literals, then checked against them."""
     kwargs = shipped_warmup_kwargs()
@@ -150,8 +150,8 @@ def test_the_shipped_geometry_forecasts_eleven_tiles() -> None:
     span = model.geometry.t_valid - model.warmup_period
 
     a_max = -(-span // int(kwargs["anchor_stride"]))
-    assert (a_max, model.horizon, model.raw_per_step) == (11, 15, 16)
-    assert span == 152
+    assert (a_max, model.horizon, model.raw_per_step) == (5, 30, 16)
+    assert span == 137
 
 
 def test_the_ungated_model_keeps_the_same_forecast_width(tiny_kwargs) -> None:

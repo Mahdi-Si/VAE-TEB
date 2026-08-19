@@ -1,0 +1,50 @@
+# Horizon arm: forecast one minute instead of two, and buy back the anchors that costs.
+#
+# The reverse of the arm this file replaces. Until the shipped horizon moved to 30 this package
+# shipped at H = 15 and carried a `sweep_horizon_30.yaml` that restored the raw-signal sibling's
+# horizon and block; the shipped value is now 30, so the arm that has something to measure is the
+# one that shortens it.
+#
+# WHAT THE SHIPPED HORIZON BOUGHT, and what this arm gives back. The block is H * R, and R is a
+# property of the raw grid rather than of a channel budget, so at H = 30 this cell's block is
+# 30 * 16 = 480 raw samples -- exactly `lag_attn_rws`'s. That makes a nat comparable across the
+# two-sided/one-sided INPUT boundary: same target, same block, same horizon, differing only in
+# whether the inputs contain the answer. It is the only place in the family where that holds, and
+# this arm is where it stops holding: at H = 15 the block is 240 against 480 and no level comparison
+# across that edge survives.
+#
+# WHAT IT MEASURES. Anchors live in [F, T - H), so halving H lengthens T_valid from 270 to 285 and
+# the dense anchor count from 137 to 152 -- and with the stride following it down, the decoded tiles
+# per sample rise from ~4.57 to ~10.1, roughly 2.2x the forecast supervision per optimizer step at
+# the same batch size. Against that, each anchor is asked a strictly easier question. This arm is
+# what separates "the longer horizon hurt because the far steps are unpredictable" from "the longer
+# horizon hurt because it halved the anchor count", which no single run at either horizon can tell
+# apart.
+#
+# The interaction with the input warm-up is unchanged by this arm and worth restating: at the budget
+# that keeps all 102 input channels (W' = 278) there are 8 anchors at H = 15 and exactly ZERO at
+# H = 30, so the horizon remains one of the two levers on the warm-up cost.
+#
+# `anchor_stride` moves with it, because the two are one decision: at S < H the windows overlap again
+# and at S > H there are target steps no phase ever covers. The constructor refuses the second and
+# tests/test_sweep_configs.py asserts the equality in every arm.
+#
+# `horizon_depth` stays at 4. At H = 15 the refine stack's receptive field of 31 tokens clears the
+# family's RF >= H + 1 criterion with room to spare, where at the shipped horizon it meets it
+# exactly -- so this arm relaxes that constraint rather than tightening it, and holding the depth
+# keeps the arm a horizon contrast rather than a horizon-and-depth one.
+#
+# `gradient_clip_val` and `additive_margin` are INHERITED rather than re-derived, and the direction
+# is what makes that safe: both were measured at the shipped block of 480 raw samples, and this arm
+# halves it. A threshold measured at the larger loss scale is loose on the smaller one, never tight,
+# so neither guard can start binding on a healthy run here. Re-derive them if this arm is ever
+# promoted to a headline.
+#
+#   TEB_RUN_STAMP="$(date '+%Y-%m-%d--[%H-%M]')" torchrun --nproc_per_node=7 \
+#       -m teb_vae.lag_attn_crws.trainer --config teb_vae/lag_attn_crws/configs/sweep_horizon_15.yaml
+base: default.yaml
+
+model_config:
+  VAE_model:
+    horizon: 15
+    anchor_stride: 15

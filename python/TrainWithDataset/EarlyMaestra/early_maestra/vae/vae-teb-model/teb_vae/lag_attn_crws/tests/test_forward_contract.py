@@ -13,8 +13,8 @@ the two models are parameter-for-parameter identical, so the key set is compared
 that defines it rather than against a literal.
 
 The forecast shapes are derived from the constructed geometry rather than written out. The one thing
-worth stating in numbers is what they resolve to: $(B, 11, 15, 16)$ at the shipped configuration --
-eleven tiles, fifteen horizon steps, sixteen raw samples per step -- which is a $240$-sample raw
+worth stating in numbers is what they resolve to: $(B, 5, 30, 16)$ at the shipped configuration --
+five tiles, thirty horizon steps, sixteen raw samples per step -- which is a $480$-sample raw
 block against ``lag_attn_rws``'s $480$, and about $10.1$ decoded anchors per step against its $240$.
 """
 from __future__ import annotations
@@ -148,10 +148,10 @@ def test_the_per_step_keys_keep_the_step_axis(outputs) -> None:
     assert tuple(out["source_kl_lag_map"].shape) == (BATCH, length, model.lag_attn.L)
 
 
-def test_the_shipped_geometry_forecasts_eleven_tiles_of_a_minute() -> None:
-    r"""The shipped forecast shape: $(B, 11, 15, 16)$, from the budget the committed shard resolves.
+def test_the_shipped_geometry_forecasts_five_tiles_of_two_minutes() -> None:
+    r"""The shipped forecast shape: $(B, 5, 30, 16)$, from the budget the committed shard resolves.
 
-    Every factor is derived: eleven is $\lceil 152/15 \rceil$, fifteen is the configured horizon,
+    Every factor is derived: five is $\lceil 137/30 \rceil$, thirty is the configured horizon,
     and sixteen is ``raw_per_step``. What is asserted as a literal is only that they resolve to
     those numbers, because that is the configuration every reported nat is produced at.
     """
@@ -164,7 +164,7 @@ def test_the_shipped_geometry_forecasts_eleven_tiles_of_a_minute() -> None:
         out = model(*make_streams(kwargs), torch.tensor([0, 7]))
 
     expected = (BATCH, _a_max(model), model.horizon, model.geometry.r)
-    assert expected == (BATCH, 11, SHIPPED_HORIZON, 16)
+    assert expected == (BATCH, 5, SHIPPED_HORIZON, 16)
     for key in ("mu_base", "logvar_base", "mu_full", "logvar_full"):
         assert tuple(out[key].shape) == expected, key
 

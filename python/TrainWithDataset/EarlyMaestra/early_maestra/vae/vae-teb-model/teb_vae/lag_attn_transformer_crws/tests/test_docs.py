@@ -251,25 +251,30 @@ def test_the_encoder_axis_delta_is_the_two_history_encoders(design, measured_tot
 def test_the_input_representation_delta_decomposes_into_the_two_terms_the_design_states(
     design, measured_totals, measured_models
 ):
-    """The horizon embedding and the two input adapters, with the decoder head contributing nothing
-    -- and it must be the same delta the conv-LSTM pair shows, because every module outside the
-    encoders is shared. Attributed by parameter name, not only summed."""
+    """The two input adapters, with the decoder head contributing nothing -- and it must be the same
+    delta the conv-LSTM pair shows, because every module outside the encoders is shared. Attributed
+    by parameter name, not only summed.
+
+    **The horizon embedding used to be the second term and is now exactly zero**, because this cell
+    forecasts $30$ steps like the raw-signal sibling it is compared against. It is computed rather
+    than deleted so a future horizon divergence reappears as a failing sum."""
     section = _markdown_section(design, "## 13. ")
     delta = measured_totals["trf_crws_guarded"] - measured_totals["trf_rws_guarded"]
 
-    horizon_embedding = -15 * 256
+    horizon_embedding = (30 - 30) * 256
     adapters = 128 * (98 - 78) * 2 + 128 * (51 - 29) * 2 - 256
 
+    assert horizon_embedding == 0, "the two horizons diverged; §13 needs its second term back"
     assert delta == horizon_embedding + adapters
     assert delta == measured_totals["crws_guarded"] - measured_totals["rws_guarded"]
     differing = _differing_names(
         measured_models["trf_crws_guarded"], measured_models["trf_rws_guarded"]
     )
     for name in differing:
-        assert name.startswith(
-            ("horizon_core.horizon_embedding", "target_adapter.", "source_adapter.")
-        ), name
-    assert differing["horizon_core.horizon_embedding"] == horizon_embedding
+        assert name.startswith(("target_adapter.", "source_adapter.")), name
+    # Absent rather than present-with-a-value: the two embeddings are the same size now, which is
+    # the parameter-level statement of the vanished second term.
+    assert "horizon_core.horizon_embedding" not in differing
     assert (
         measured_models["trf_crws_guarded"].decoder.mean_head.out_features
         == measured_models["trf_rws_guarded"].decoder.mean_head.out_features

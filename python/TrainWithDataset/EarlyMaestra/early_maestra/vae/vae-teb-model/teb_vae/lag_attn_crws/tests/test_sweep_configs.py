@@ -3,14 +3,14 @@ r"""Lint for the two arms: one axis each, a closed inventory, and a stride that 
 The two arms bracket the one decision this cell makes that the model it is compared against does not
 -- the anchor tiling -- plus the decision it makes *differently*, the horizon. Each is the shipped
 configuration with the smallest key set that expresses the change, and one of them moves **two** keys
-rather than one: ``sweep_horizon_30.yaml`` moves the stride with the horizon, because below the
+rather than one: ``sweep_horizon_15.yaml`` moves the stride with the horizon, because below the
 horizon the forecast windows overlap again and above it there are target steps no phase ever covers.
 That is the axis rather than a second delta, and the test below states it as such.
 
 **There is deliberately no floor arm**, and the absence is the record rather than an omission. The
 anchor floor here is a declared input-warmth policy rather than a validity requirement -- the raw
 target is honest at every step -- so the interesting move would be *downward*, to the model's own
-$30$-step warm-up, which buys $255$ anchors against $152$. Both the constructor and the pre-flight
+$30$-step warm-up, which buys $240$ anchors against $137$. Both the constructor and the pre-flight
 refuse it, from one function, and lifting that refusal changes what a run **claims** rather than what
 the data supports. It belongs in the design record, not in a launchable file.
 
@@ -41,7 +41,7 @@ _ARMS: Dict[str, Dict[str, Any]] = {
     # decodes -- so this arm is the control that says what the tiling itself costs or buys.
     "sweep_anchor_stride_1.yaml": {f"{_VAE}.anchor_stride": 1},
     # The horizon arm, and the one that moves two keys: the stride is not free.
-    "sweep_horizon_30.yaml": {f"{_VAE}.horizon": 30, f"{_VAE}.anchor_stride": 30},
+    "sweep_horizon_15.yaml": {f"{_VAE}.horizon": 15, f"{_VAE}.anchor_stride": 15},
 }
 
 #: Every non-arm file the directory may hold, with what each is for. Named so a file arriving
@@ -245,17 +245,18 @@ def test_the_horizon_arm_restores_the_comparison_models_block_exactly():
     $H \cdot R$ and $R$ is a property of the raw grid rather than of a channel budget, so at
     $H = 30$ it is $480$ raw samples -- **exactly** the comparison model's. This is the one arm in
     the family under which a nat crosses the two-sided/one-sided input boundary unchanged."""
-    floor, stride, horizon, t_valid = _geometry(_resolved("sweep_horizon_30.yaml"))
-    raw_per_step = _resolved("sweep_horizon_30.yaml")["model_config"]["VAE_model"]["raw_per_step"]
+    floor, stride, horizon, t_valid = _geometry(_resolved("sweep_horizon_15.yaml"))
+    raw_per_step = _resolved("sweep_horizon_15.yaml")["model_config"]["VAE_model"]["raw_per_step"]
     sibling = load_config(
         str(Path(__file__).resolve().parents[3] / "teb_vae" / "lag_attn_rws" / "configs"
             / "default.yaml")
     )["model_config"]["VAE_model"]
 
-    assert horizon == sibling["horizon"] == 30
-    assert horizon * raw_per_step == sibling["horizon"] * sibling["raw_per_step"] == 480
-    assert t_valid == 270  # against the shipped 285: the anchors the longer horizon costs
-    assert -(-(t_valid - floor) // stride) == 5  # A_max, from the geometry rather than a literal
+    assert horizon == 15 and sibling["horizon"] == 30
+    assert horizon * raw_per_step == 240
+    assert sibling["horizon"] * sibling["raw_per_step"] == 480
+    assert t_valid == 285  # against the shipped 270: the anchors the shorter horizon buys back
+    assert -(-(t_valid - floor) // stride) == 11  # A_max, from the geometry rather than a literal
 
 
 def test_the_stride_arm_restores_the_dense_anchor_set():
@@ -265,4 +266,4 @@ def test_the_stride_arm_restores_the_dense_anchor_set():
     floor, stride, _horizon, t_valid = _geometry(_resolved("sweep_anchor_stride_1.yaml"))
 
     assert stride == 1
-    assert -(-(t_valid - floor) // stride) == t_valid - floor == 152
+    assert -(-(t_valid - floor) // stride) == t_valid - floor == 137

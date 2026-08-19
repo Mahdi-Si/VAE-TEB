@@ -65,16 +65,27 @@ _SIBLING_CONFIG = (
 #: proxy for it. The whole-shard batch reads $23.9$ over the same window.
 MEASURED_EXCURSION_MAX = 247.7
 
-#: The $99$th percentile of the same statistic over the same steps ($8.5$ with the whole shard in
+#: The $99$th percentile of the same statistic over the same steps ($1.0$ with the whole shard in
 #: one batch). The margin must clear it, or ordinary batches are skipped -- which reads in a log
 #: exactly like a model that keeps blowing up.
-MEASURED_EXCURSION_Q99 = 233.6
+MEASURED_EXCURSION_Q99 = 487.8
+
+#: The worst excursion the batch-1 regime produced, which is the bound the margin actually clears.
+MEASURED_WORST_EXCURSION = 1713.3
+
+#: The range ``main_loss`` covered over the two instrumented regimes at $H = 30$, $[-1484, +1808]$.
+#: The margin has to sit under it for the additive test to be able to fire at all. It is the bound
+#: used rather than the reconstruction-only magnitude, which UNDERSTATES what this objective
+#: reaches: the KL, the prior anchor and this cell's live ``lambda_ms`` and ``lambda_deriv`` shape
+#: terms are all nonnegative and all omitted from that figure.
+MEASURED_LOSS_SPAN = 3.3e3
 
 #: Pre-clip ``train/grad_norm`` over the same run, **whole-shard batch**: the regime the shipped
 #: batch of $128$ is the analogue of, and therefore the one the clip is set from. The batch-1 run
-#: reads q99 $3045$ and max $4944$; recorded in the config beside these and deliberately not used.
-MEASURED_GRAD_Q99 = 953.2
-MEASURED_GRAD_MAX = 1420.3
+#: reads q99 $33{,}580$ and max $54{,}448$; recorded in the config beside these and deliberately
+#: not used.
+MEASURED_GRAD_Q99 = 11806.1
+MEASURED_GRAD_MAX = 19370.4
 
 #: A loss magnitude this objective genuinely reaches, used to settle a healthy EMA in the
 #: behavioural tests below. The instrumented run's post-priming mean with the whole shard in one
@@ -148,14 +159,21 @@ def _skipped(metrics) -> bool:
 # --------------------------------------------------------------------------------------
 def test_the_margin_moved_down_and_the_floor_did_not():
     """One of the two moved and the other did not, and the reason is the whole design of the block.
-    ``additive_margin`` is stated in nats of the summed block, so it follows the block -- which
-    halved here. The ``ema_floor`` is not a scale at all: it is a switch that turns the relative
-    test off by sitting above any reachable loss, and "above any reachable loss" is satisfied by the
-    same number at either block size, with *more* headroom at the smaller one rather than less."""
+
+    ``additive_margin`` is stated in nats of the summed block, so it follows what the loss actually
+    does -- and at $H = 30$ that is no longer the block, which now *equals* the comparison model's
+    $480$ raw samples. What separates the two cells is the anchor count: this one averages the same
+    block over roughly a fiftieth of the anchors, so its per-step excursions are larger and the
+    margin comes back larger. At $H = 15$ the block was half the comparison model's and this
+    assertion pointed the other way.
+
+    The ``ema_floor`` is not a scale at all: it is a switch that turns the relative test off by
+    sitting above any reachable loss, and "above any reachable loss" is satisfied by the same number
+    at either block size."""
     mine = load_config(str(_CONFIG))["advanced_config"]["spike_breaker"]
     theirs = load_config(str(_SIBLING_CONFIG))["advanced_config"]["spike_breaker"]
 
-    assert mine["additive_margin"] < theirs["additive_margin"]
+    assert mine["additive_margin"] > theirs["additive_margin"]
     assert mine["ema_floor"] == theirs["ema_floor"] >= 1.0e9
     assert mine["multiplier"] == theirs["multiplier"]
     assert mine["max_consecutive_skips"] == theirs["max_consecutive_skips"]
@@ -182,17 +200,33 @@ def test_the_margin_stays_inside_the_range_the_objective_can_reach():
     A margin above the whole reachable magnitude makes the additive test **decoration**: the healthy
     loss cannot swing that far, so nothing short of a genuine divergence exceeds
     $\mathrm{EMA} + \mathrm{margin}$ and the breaker degenerates to its non-finite guard alone, with
-    nothing in the log saying so."""
+    nothing in the log saying so.
+
+    **AT $H = 30$ THIS BRACKET HAS CROSSED, AND THE TEST RECORDS THAT RATHER THAN HIDING IT.** The
+    margin must also clear the worst measured excursion or the breaker skips ordinary batches, and
+    at this block that excursion ($1713$) exceeds the reconstruction-only bound
+    ($2 \times 480 \times 1.58 \approx 1518$): no value satisfies both. Clearing the excursion was
+    chosen, because a breaker that fires on healthy batches degrades training while an insensitive
+    one only fails to catch what the non-finite guard still catches.
+
+    So the assertion here is against what the objective can *actually* reach rather than against the
+    reconstruction-only bound, which understates it: the KL, the prior anchor and this cell's live
+    ``lambda_ms`` and ``lambda_deriv`` shape terms are all nonnegative and all omitted from that
+    figure. The instrumented run's ``main_loss`` spanned roughly $3.3 \times 10^{3}$, which is the
+    number the margin has to sit under for the test to be able to fire at all."""
     config = load_config(str(_CONFIG))
     reachable = _reachable_magnitude(config)
     margin = float(config["advanced_config"]["spike_breaker"]["additive_margin"])
 
-    assert margin < reachable
+    # The reconstruction-only bound, which the margin now deliberately exceeds.
+    assert margin > reachable
+    # The span the objective was measured to cover, which it must stay under.
+    assert margin < MEASURED_LOSS_SPAN
     sibling_margin = float(
         load_config(str(_SIBLING_CONFIG))["advanced_config"]["spike_breaker"]["additive_margin"]
     )
-    assert sibling_margin > reachable, (
-        "the comparison model's margin is not actually out of range at this block size, so the "
+    assert sibling_margin < margin, (
+        "the comparison model's margin is not actually below this cell's at this anchor count, so "
         "reason recorded for moving it does not hold"
     )
 
@@ -231,8 +265,8 @@ def test_the_clip_clears_the_gradient_distribution_the_instrumented_run_measured
     optimizer into a sign-descent method with nothing in the log saying so."""
     clip = float(load_config(str(_CONFIG))["advanced_config"]["trainer"]["gradient_clip_val"])
 
-    assert MEASURED_GRAD_Q99 < clip <= MEASURED_GRAD_MAX * 2.0
-    assert clip < float(
+    assert MEASURED_GRAD_Q99 < clip < MEASURED_GRAD_MAX
+    assert clip > float(
         load_config(str(_SIBLING_CONFIG))["advanced_config"]["trainer"]["gradient_clip_val"]
     )
 

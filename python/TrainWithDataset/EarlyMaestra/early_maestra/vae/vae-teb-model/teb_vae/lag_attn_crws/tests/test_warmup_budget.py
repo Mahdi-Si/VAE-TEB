@@ -205,9 +205,9 @@ def test_the_shipped_keyword_set_carries_the_budget_and_the_declared_widths(budg
     assert kwargs["target_keep_index"] == budget.target.keep_index
     assert kwargs["c_y"] == CAUSAL_C_Y and kwargs["c_u"] == CAUSAL_C_U
     assert len(kwargs["target_keep_index"]) < kwargs["c_y"]
-    assert kwargs["horizon"] == 15 and kwargs["warmup_period"] == 133
+    assert kwargs["horizon"] == 30 and kwargs["warmup_period"] == 133
     # Applied last, which is what makes an arm expressible as one keyword at the call site.
-    assert shipped_warmup_kwargs(_WarmupModel, horizon=30)["horizon"] == 30
+    assert shipped_warmup_kwargs(_WarmupModel, horizon=15)["horizon"] == 15
 
 
 def test_no_budget_adds_no_keys():

@@ -69,6 +69,33 @@ def resolve_transform(attrs: Any) -> str:
     return str(value)
 
 
+#: Which phase-harmonic operator built a causal file's two phase blocks. ``'none'`` multiplied the
+#: two legs of every pair at one stored index; ``'envelope'`` put them on one clock first. The
+#: alignment changes no width, no warm-up and no stored delay, so unlike every other property of a
+#: causal file it is **only** knowable from this attribute — which is why absence has to mean
+#: something definite rather than "unknown".
+LEG_ALIGNMENT_NONE = 'none'
+
+
+def resolve_leg_alignment(attrs: Any) -> str:
+    """Which phase-harmonic leg alignment produced a causal file, with the legacy default applied.
+
+    Args:
+        attrs: The file's root HDF5 attributes.
+
+    Returns:
+        The stored ``causal_leg_alignment``, or :data:`LEG_ALIGNMENT_NONE` when
+        the attribute is absent — the state of every causal shard written
+        before it existed, all of which multiplied the legs unaligned. Absence
+        is therefore an answer rather than a gap, exactly as a missing
+        ``transform`` is.
+    """
+    value = attrs.get('causal_leg_alignment', LEG_ALIGNMENT_NONE)
+    if isinstance(value, bytes):
+        value = value.decode('utf-8')
+    return str(value)
+
+
 @dataclass(frozen=True)
 class _FileLayout:
     """What one shard says about itself, read from attributes and shapes alone.
@@ -89,6 +116,24 @@ class _FileLayout:
             block, or ``None`` for a two-sided file. Untrimmed because that is
             the storage geometry every other stored field uses; the loader
             rebases it for its own trim.
+        delay_s: Per-channel composed group delay in **seconds**, per block, or
+            ``None`` for a two-sided file. Carries only the blocks that
+            actually have the attribute — like ``quantile`` and unlike
+            ``warmup_steps``, it is read tolerantly here and enforced by
+            :func:`read_causal_warmup`, because nothing in the loading path
+            compensates for a delay and refusing it here would take a shard
+            offline for a field no sample read uses.
+        novelty_frac: Per-channel novelty fraction, per block, or ``None`` for
+            a two-sided file. Carries only the blocks that have the attribute,
+            for the same reason ``delay_s`` does.
+        leg_alignment: Which phase-harmonic operator built the two phase
+            blocks, or ``None`` for a two-sided file. **Absent is read as**
+            :data:`LEG_ALIGNMENT_NONE`, so every shard written before the
+            attribute existed stays loadable and reads as what it is. Read here
+            rather than where it is compared because an aligned file has
+            exactly the widths, warm-ups and delays of an unaligned one: this
+            is the only thing that tells them apart, so a file list and a stats
+            pairing must both be able to see it.
         quantile: The ``causal_warmup_quantile`` the warm-up was measured at, or
             ``None`` for a two-sided file. Read here rather than where it is
             compared because it describes the same boundary
@@ -103,6 +148,9 @@ class _FileLayout:
     widths: Dict[str, int]
     lengths: Dict[str, int]
     warmup_steps: Optional[Dict[str, np.ndarray]]
+    delay_s: Optional[Dict[str, np.ndarray]]
+    novelty_frac: Optional[Dict[str, np.ndarray]]
+    leg_alignment: Optional[str]
     quantile: Optional[float]
 
 
@@ -132,9 +180,23 @@ def _read_file_layout(path: str) -> _FileLayout:
 
         quantile = f.attrs.get('causal_warmup_quantile') if transform == CAUSAL else None
         warmup: Optional[Dict[str, np.ndarray]] = None
+        delay: Optional[Dict[str, np.ndarray]] = None
+        novelty: Optional[Dict[str, np.ndarray]] = None
+        leg_alignment: Optional[str] = None
         if transform == CAUSAL:
+            leg_alignment = resolve_leg_alignment(f.attrs)
             warmup = {}
+            delay = {}
+            novelty = {}
             for name, width in widths.items():
+                if 'causal_delay_s' in f[name].attrs:
+                    delay[name] = np.asarray(
+                        f[name].attrs['causal_delay_s'], dtype=np.float64
+                    )
+                if 'causal_novelty_frac' in f[name].attrs:
+                    novelty[name] = np.asarray(
+                        f[name].attrs['causal_novelty_frac'], dtype=np.float64
+                    )
                 if 'causal_warmup_steps' not in f[name].attrs:
                     raise ValueError(
                         f"{path} declares transform='causal' but its '{name}' block carries no "
@@ -156,6 +218,9 @@ def _read_file_layout(path: str) -> _FileLayout:
         widths=widths,
         lengths=lengths,
         warmup_steps=warmup,
+        delay_s=delay,
+        novelty_frac=novelty,
+        leg_alignment=leg_alignment,
         quantile=None if quantile is None else float(quantile),
     )
 
@@ -173,8 +238,8 @@ def _check_layouts_agree(layout: _FileLayout, reference: _FileLayout) -> None:
         reference: The shard every other one must agree with.
 
     Raises:
-        ValueError: On a disagreement about variant, block set or a block width,
-            naming both files and the disagreement.
+        ValueError: On a disagreement about variant, leg alignment, block set
+            or a block width, naming both files and the disagreement.
     """
     if layout.transform != reference.transform:
         raise ValueError(
@@ -182,6 +247,14 @@ def _check_layouts_agree(layout: _FileLayout, reference: _FileLayout) -> None:
             f"'{layout.transform}' but {reference.path} is '{reference.transform}'. "
             f"Their channel axes mean different things and their statistics are not "
             f"interchangeable; build one dataset per variant."
+        )
+    if layout.leg_alignment != reference.leg_alignment:
+        raise ValueError(
+            f"Mixed causal leg alignments in one dataset: {layout.path} is "
+            f"'{layout.leg_alignment}' but {reference.path} is '{reference.leg_alignment}'. "
+            f"An aligned shard has exactly the widths, warm-ups and delays of an unaligned one, "
+            f"so nothing else here can tell them apart -- and the two hold different phase "
+            f"coefficients under the same channel names."
         )
     if set(layout.widths) != set(reference.widths):
         missing = sorted(set(reference.widths) - set(layout.widths))
@@ -345,6 +418,21 @@ class CausalWarmup:
         warmup_steps: ``{block: (C,) int64}``, rebased: the first step of the
             trimmed window at which each channel is a function of the recording
             rather than of assumed pre-recording history.
+        delay_s: ``{block: (C,) float64}``, the composed one-sided group delay
+            each channel is stale by, in **seconds** and **unrebased**. A delay
+            is not a step index: it says how far back in physical time a
+            coefficient's content sits, which no trim of the window moves. Kept
+            in seconds for the same reason — it is a constant of the filter
+            bank, and expressing it in steps would bake one decimation into a
+            number that does not depend on one.
+        novelty_frac: ``{block: (C,) float64}``, the share of each channel's
+            coefficient drawn from raw samples an anchor has not yet seen, at
+            the horizon the writer measured it over. Empty for a shard written
+            before the attribute existed; a consumer that needs it must say so
+            rather than assume a default, because there is no value a missing
+            novelty vector could safely stand in as.
+        leg_alignment: Which phase-harmonic operator built the phase blocks of
+            every shard in the list, all of which agree on it.
         kept_steps: ``{block: T}``, the steps the trimmed window leaves.
     """
 
@@ -353,6 +441,9 @@ class CausalWarmup:
     trim_steps: int
     quantile: Optional[float]
     warmup_steps: Dict[str, np.ndarray]
+    delay_s: Dict[str, np.ndarray]
+    novelty_frac: Dict[str, np.ndarray]
+    leg_alignment: str
     kept_steps: Dict[str, int]
 
 
@@ -372,10 +463,13 @@ def read_causal_warmup(
     would otherwise resolve cleanly against the first file and be evaluated
     against a boundary its own coefficients do not have.
 
-    Stricter than the loader's own scan in one way: a missing file raises here
-    rather than being skipped. The loader tolerates a short file list because it
-    still has samples to serve; a boundary resolved from a subset of the
-    configured shards is simply the wrong boundary.
+    Stricter than the loader's own scan in two ways. A missing file raises here
+    rather than being skipped: the loader tolerates a short file list because it
+    still has samples to serve, while a boundary resolved from a subset of the
+    configured shards is simply the wrong boundary. And ``causal_delay_s`` is
+    required here and merely read where present in the layout, because a
+    consumer that aligns channels resolves its shifts from that vector alone and
+    a shard without it is not a shard it can be configured against.
 
     Args:
         paths: The dataset's files. All of them — training and held-out.
@@ -384,13 +478,15 @@ def read_causal_warmup(
             nothing serves.
 
     Returns:
-        The rebased boundary, with the geometry it was rebased against.
+        The rebased boundary, with the geometry it was rebased against and the
+        per-channel group delay beside it.
 
     Raises:
         ValueError: If ``paths`` is empty, if a file is missing, if any file is
-            not causal, if the files disagree about variant, block set, block
-            width, quantile or warm-up, or if the rebase leaves a channel with no
-            valid step.
+            not causal, if a causal file carries no ``causal_delay_s`` or one of
+            the wrong width, if the files disagree about variant, block set,
+            block width, quantile, warm-up or delay, or if the rebase leaves a
+            channel with no valid step.
     """
     if not paths:
         raise ValueError(
@@ -415,6 +511,25 @@ def read_causal_warmup(
                 f"coefficients are two-sided: the value at step t is a weighted average over raw "
                 f"samples on both sides of t, so it has no warm-up and no valid region to resolve."
             )
+        # The delay is required *here* rather than in the layout: nothing on the loading path
+        # compensates for it, but a consumer that aligns channels onto one clock resolves its
+        # per-channel shifts from this vector and nothing else, so an absent one would be
+        # discovered as a missing key deep inside that resolution rather than named here.
+        assert layout.delay_s is not None  # every layout is causal, checked immediately above
+        for name, width in sorted(layout.widths.items()):
+            if name not in layout.delay_s:
+                raise ValueError(
+                    f"{layout.path} declares transform='{CAUSAL}' but its '{name}' block carries "
+                    f"no causal_delay_s attribute. A one-sided channel is stale by its composed "
+                    f"group delay, and a consumer that aligns channels in time has no other "
+                    f"source for that number."
+                )
+            if layout.delay_s[name].shape != (width,):
+                raise ValueError(
+                    f"{layout.path}: '{name}' stores {width} channels but its causal_delay_s has "
+                    f"{layout.delay_s[name].size} entries. The attribute describes a different "
+                    f"channel axis than the data, so no channel's staleness can be trusted."
+                )
 
     reference = layouts[0]
     for layout in layouts[1:]:
@@ -449,16 +564,39 @@ def read_causal_warmup(
                     f"shards that disagree were not built by the same bank and a budget resolved "
                     f"from one of them scores pad on the other."
                 )
+        assert layout.delay_s is not None and reference.delay_s is not None
+        for name, vector in sorted(layout.delay_s.items()):
+            if not np.array_equal(vector, reference.delay_s[name]):
+                raise ValueError(
+                    f"Mismatched '{name}' causal_delay_s: {layout.path} disagrees with "
+                    f"{reference.path}. The delay is a constant of the filter bank, exactly as "
+                    f"the warm-up is, so two shards that disagree were not built by the same "
+                    f"bank and a channel alignment resolved from one of them is the wrong shift "
+                    f"on the other."
+                )
 
     _, trim_steps = decimated_trim_steps(trim_minutes)
     rebased = rebase_causal_warmup(reference, trim_steps, trim_minutes)
     assert rebased is not None  # every layout is causal, checked above
+    assert reference.delay_s is not None and reference.novelty_frac is not None
+    assert reference.leg_alignment is not None
     return CausalWarmup(
         paths=tuple(str(path) for path in paths),
         trim_minutes=trim_minutes,
         trim_steps=trim_steps,
         quantile=reference.quantile,
         warmup_steps=rebased,
+        # Verbatim, not rebased: the trim moves where a window starts, not how far back in
+        # physical time a coefficient's content sits.
+        delay_s={name: reference.delay_s[name] for name in sorted(rebased)},
+        # Only the blocks that carry it. A shard predating the attribute yields an empty mapping,
+        # which a consumer must handle by name rather than by a stand-in value.
+        novelty_frac={
+            name: reference.novelty_frac[name]
+            for name in sorted(rebased)
+            if name in reference.novelty_frac
+        },
+        leg_alignment=reference.leg_alignment,
         kept_steps={
             name: reference.lengths[name] - 2 * trim_steps for name in sorted(rebased)
         },
@@ -893,7 +1031,11 @@ class CombinedHDF5Dataset(Dataset):
     **The group delay is not compensated.** Beyond its warm-up a causal
     channel is still *stale* by its composed group delay — hundreds of seconds
     on the slow channels — and nothing here shifts it back. A consumer that
-    aligns channels in time must read ``causal_delay_s`` off the block itself.
+    aligns channels in time reads that delay from
+    :attr:`CausalWarmup.delay_s`, which :func:`read_causal_warmup` populates
+    from the same ``causal_delay_s`` attribute beside the warm-up it already
+    reports, so the two arrive together and agree across every configured
+    shard.
 
     Optimized for:
     - Multi-GPU training with DistributedDataParallel
@@ -1175,13 +1317,19 @@ class CombinedHDF5Dataset(Dataset):
         dataset normalised with two-sided constants, computed over a different
         channel set and over the invalid region as well.
 
+        The same argument extends to the leg alignment, and there it is the
+        *only* check that can fire: an aligned shard and an unaligned one have
+        identical widths, so a stats file built on one and paired with the
+        other passes every other test here.
+
         Raises:
-            ValueError: On a variant mismatch, or on a block whose channel count
-                disagrees with the stats file's.
+            ValueError: On a variant or leg-alignment mismatch, or on a block
+                whose channel count disagrees with the stats file's.
         """
         try:
             with h5py.File(self.stats_path, 'r') as f:
                 stats_transform = resolve_transform(f.attrs)
+                stats_alignment = resolve_leg_alignment(f.attrs)
                 stats_widths = {
                     field: int(f[field].attrs['n_channels'])
                     for field in f.keys()
@@ -1200,6 +1348,16 @@ class CombinedHDF5Dataset(Dataset):
                 f"variants have different channels and different valid regions, so normalising "
                 f"one with the other's constants is silently wrong."
             )
+
+        if self._layout is not None and self._layout.leg_alignment is not None:
+            if stats_alignment != self._layout.leg_alignment:
+                raise ValueError(
+                    f"Statistics/dataset leg-alignment mismatch: {self.stats_path} was computed "
+                    f"over a '{stats_alignment}' dataset but these files are "
+                    f"'{self._layout.leg_alignment}'. The two hold different phase coefficients "
+                    f"at identical widths, so the width check below cannot see this and the "
+                    f"phase blocks would be normalised with another transform's mean and scale."
+                )
 
         if self._layout is not None:
             for field, width in stats_widths.items():

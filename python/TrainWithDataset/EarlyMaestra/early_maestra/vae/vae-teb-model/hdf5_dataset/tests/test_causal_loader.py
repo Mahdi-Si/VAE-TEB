@@ -34,7 +34,7 @@ import pickle
 import shutil
 import warnings
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import h5py
 import numpy as np
@@ -425,6 +425,78 @@ def test_the_boundary_read_without_a_loader_is_the_one_the_loader_serves(
 
     with h5py.File(causal_shard, "r") as handle:
         assert read.quantile == pytest.approx(float(handle.attrs["causal_warmup_quantile"]))
+
+
+def test_the_delay_is_the_shard_s_own_attribute_unrebased(causal_shard: Path) -> None:
+    r"""The group delay arrives beside the warm-up, in seconds, untouched by the trim.
+
+    A delay is not a step index. The warm-up says which steps of *this window* are usable and
+    therefore moves when the window does; the delay says how far back in physical time a
+    coefficient's content sits, which no trim can change. Rebasing it the way the warm-up is
+    rebased would silently shorten every delay by a minute at ``trim_minutes=1.0``, and the shift
+    vectors a consumer resolves from it would all be wrong by the same amount -- with every shape
+    correct and nothing to report it.
+    """
+    read = read_causal_warmup([str(causal_shard)], TRIM_MINUTES)
+    untrimmed = read_causal_warmup([str(causal_shard)], None)
+
+    assert sorted(read.delay_s) == sorted(read.warmup_steps)
+    with h5py.File(causal_shard, "r") as handle:
+        for field, vector in read.delay_s.items():
+            stored = np.asarray(handle[field].attrs["causal_delay_s"], dtype=np.float64)
+            assert np.array_equal(vector, stored), field
+            assert vector.shape == (handle[field].shape[1],), field
+            # Unrebased: the same numbers at both trims, unlike the warm-up beside them.
+            assert np.array_equal(untrimmed.delay_s[field], vector), field
+
+    assert not np.array_equal(
+        untrimmed.warmup_steps["fhr_st"], read.warmup_steps["fhr_st"]
+    )
+    # Seconds, and the published extremes of the composed one-sided delay.
+    assert float(read.delay_s["fhr_st"].min()) == pytest.approx(13.30, abs=0.05)
+    assert float(read.delay_s["fhr_st"].max()) == pytest.approx(791.02, abs=0.05)
+
+
+def test_a_causal_file_missing_the_delay_is_refused_naming_the_block(
+    causal_shard: Path, tmp_path: Path
+) -> None:
+    """A consumer that aligns channels has no other source for the number.
+
+    Required by this reader and merely read where present by the loader: nothing on the loading
+    path compensates for a delay, so refusing there would take a shard offline for a field no
+    sample read uses.
+    """
+    path = tmp_path / "no_delay.hdf5"
+    shutil.copyfile(causal_shard, path)
+    with h5py.File(path, "a") as handle:
+        del handle["up_ph"].attrs["causal_delay_s"]
+
+    with pytest.raises(ValueError, match=r"'up_ph' block carries no causal_delay_s") as error:
+        read_causal_warmup([str(path)], TRIM_MINUTES)
+    assert path.name in str(error.value)
+    # The loader itself is unmoved by the same file, which is the asymmetry being asserted.
+    assert _dataset(path).transform == CAUSAL
+
+
+def test_files_disagreeing_on_the_delay_are_refused_naming_one(
+    causal_shard: Path, tmp_path: Path
+) -> None:
+    """It is a constant of the filter bank, exactly as the warm-up is.
+
+    The two shards have identical widths, identical warm-ups and identical quantiles, so this is
+    the only check that can fire -- which is the point: a shard rebuilt at a different bank whose
+    delays alone moved would otherwise resolve one set of alignment shifts and be served another.
+    """
+    path = tmp_path / "shifted_delay.hdf5"
+    shutil.copyfile(causal_shard, path)
+    with h5py.File(path, "a") as handle:
+        delay = np.asarray(handle["fhr_ph"].attrs["causal_delay_s"])
+        delay[5] += np.float32(1.0)
+        handle["fhr_ph"].attrs["causal_delay_s"] = delay
+
+    with pytest.raises(ValueError, match=r"Mismatched 'fhr_ph' causal_delay_s") as error:
+        read_causal_warmup([str(causal_shard), str(path)], TRIM_MINUTES)
+    assert path.name in str(error.value)
 
 
 def test_the_trim_conversion_is_the_loader_s_own(causal_shard: Path) -> None:
@@ -1145,3 +1217,121 @@ def test_the_sample_plot_renders_both_variants(
         )
         assert rows == [expected_rows], shard.name
         assert list(output.glob("*.pdf")), shard.name
+
+
+# =================================================================================================
+# The leg alignment, which nothing else on the file reveals
+# =================================================================================================
+# An envelope-aligned causal shard has exactly the widths, warm-ups, delays and channel identities
+# of an unaligned one. Every other coherence check in this file therefore passes on a mixed pair,
+# and the only thing that can refuse one is the root attribute itself -- which is why absence has
+# to mean 'none' rather than 'unknown', and why the comparison lands beside the variant check
+# rather than beside the numeric ones.
+def _realign(source: Path, destination: Path, value: Optional[str]) -> Path:
+    """Copy a causal shard, setting or deleting its ``causal_leg_alignment``.
+
+    Args:
+        source: The shard to copy.
+        destination: Where to write the copy.
+        value: The alignment to record, or ``None`` to delete the attribute and produce the shape
+            every causal shard written before it existed has.
+
+    Returns:
+        *destination*.
+    """
+    shutil.copyfile(source, destination)
+    with h5py.File(destination, "a") as handle:
+        if value is None:
+            del handle.attrs["causal_leg_alignment"]
+        else:
+            handle.attrs["causal_leg_alignment"] = value
+    return destination
+
+
+def test_a_shard_without_the_attribute_reads_as_unaligned(
+    causal_shard: Path, tmp_path: Path
+) -> None:
+    """Absence is an answer, not a gap: every causal shard on disk predates the attribute.
+
+    Read as ``'none'`` rather than ``None``, so the comparisons below are between two strings and
+    a legacy shard beside a freshly written unaligned one is a match rather than a mismatch.
+    """
+    legacy = _realign(causal_shard, tmp_path / "legacy_alignment.hdf5", None)
+    with h5py.File(legacy, "r") as handle:
+        assert "causal_leg_alignment" not in handle.attrs
+
+    assert read_causal_warmup([str(legacy)], TRIM_MINUTES).leg_alignment == "none"
+    assert read_causal_warmup([str(causal_shard)], TRIM_MINUTES).leg_alignment == "none"
+    # And the pair loads as one dataset, which is the compatibility claim itself.
+    dataset = CombinedHDF5Dataset(
+        paths=[str(causal_shard), str(legacy)],
+        cache_size=0, pin_memory=False, trim_minutes=TRIM_MINUTES,
+    )
+    assert dataset.transform == CAUSAL
+
+
+def test_a_mixed_leg_alignment_list_is_refused_naming_both(
+    causal_shard: Path, tmp_path: Path
+) -> None:
+    """The refusal that no width, warm-up, delay or quantile check could ever make.
+
+    Both files here have identical everything except one string, and the two hold different phase
+    coefficients under the same channel names -- so a batch mixing them is a batch of two
+    different representations with nothing to say so.
+    """
+    aligned = _realign(causal_shard, tmp_path / "aligned.hdf5", "envelope")
+    with pytest.raises(ValueError, match="Mixed causal leg alignments") as error:
+        CombinedHDF5Dataset(
+            paths=[str(causal_shard), str(aligned)],
+            cache_size=0, pin_memory=False, trim_minutes=TRIM_MINUTES,
+        )
+    message = str(error.value)
+    assert "'none'" in message and "'envelope'" in message
+    assert causal_shard.name in message and aligned.name in message
+
+    # The strict reader refuses it too, and for the same reason.
+    with pytest.raises(ValueError, match="Mixed causal leg alignments"):
+        read_causal_warmup([str(causal_shard), str(aligned)], TRIM_MINUTES)
+
+
+def test_a_stats_file_built_at_another_alignment_is_refused_naming_both(
+    causal_shard: Path, causal_stats_file: Path, tmp_path: Path
+) -> None:
+    """A stats file is keyed to the coefficients it was accumulated over, alignment included.
+
+    The variant matches, every width matches, and the phase blocks hold different numbers. Without
+    this the phase channels would be normalised with another transform's mean and scale, and the
+    only symptom would be a training curve.
+    """
+    aligned = _realign(causal_shard, tmp_path / "aligned_shard.hdf5", "envelope")
+    with pytest.raises(ValueError, match="leg-alignment mismatch") as error:
+        _dataset(aligned, stats_path=str(causal_stats_file))
+    message = str(error.value)
+    assert "'none'" in message and "'envelope'" in message
+    assert str(causal_stats_file) in message
+
+    # The matching pair loads, so the refusal is about the disagreement and not about the check.
+    assert _dataset(causal_shard, stats_path=str(causal_stats_file)).transform == CAUSAL
+
+
+def test_the_stats_writer_records_the_alignment_it_accumulated_over(
+    causal_shard: Path, causal_stats_file: Path, tmp_path: Path
+) -> None:
+    """Written on both variants, so absence is 'unaligned' rather than 'unlabelled'.
+
+    That is what lets the pairing check above compare two strings instead of having to treat a
+    missing attribute as compatible with everything.
+    """
+    with h5py.File(causal_stats_file, "r") as handle:
+        assert handle.attrs["causal_leg_alignment"] == "none"
+
+    aligned = _realign(causal_shard, tmp_path / "aligned_source.hdf5", "envelope")
+    output = tmp_path / "aligned_stats.hdf5"
+    calculator = _calculator()
+    calculator.save_stats(
+        calculator.calculate_stats([str(aligned)], batch_size=4, progress_bar=False), str(output)
+    )
+    with h5py.File(output, "r") as handle:
+        assert handle.attrs["causal_leg_alignment"] == "envelope"
+    # Read back onto the instance, which is where the loader's comparison takes it from.
+    assert _calculator().load_stats(str(output)) is not None

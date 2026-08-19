@@ -926,6 +926,134 @@ def two_sided_responses(x: np.ndarray, bank: FilterBank) -> np.ndarray:
 
 
 # =================================================================================================
+# Leg alignment
+# =================================================================================================
+def pair_leg_skew(bank: CausalBank, pairs: np.ndarray) -> np.ndarray:
+    r"""How far apart in time the two legs of each phase-harmonic pair report the signal.
+
+    A phase-harmonic coefficient multiplies two wavelet responses **at the same index**, but the
+    two come from filters of different centre frequency and therefore different group delay, so
+    they describe two different physical instants. The gap is
+
+    $$\Delta_{ij} \;=\; \tau_i - \tau_j
+      \;=\; \frac{\gamma}{2\pi}\Bigl(\frac{1}{b_i} - \frac{1}{b_j}\Bigr)
+      \;=\; \tau_i\Bigl(1 - \frac{1}{p_{ij}}\Bigr),
+      \qquad p_{ij} = \frac{\xi_j}{\xi_i} \ge 1,$$
+
+    the last equality holding on a constant-$Q$ ladder, where $b \propto \sigma \propto \xi$ gives
+    $\tau_i/\tau_j = p_{ij}$. So the skew is $\tfrac12\tau_i$, $0.646\,\tau_i$ and $\tfrac34\tau_i$
+    for the three stored harmonic families $p \in \{2,\,2^{3/2},\,4\}$: **it grows with the
+    harmonic ratio, which is the parameter the block exists to sweep.**
+
+    Column $0$ of *pairs* indexes the lower frequency, so $\xi_i \le \xi_j$, so $\tau_i \ge \tau_j$
+    and the result is non-negative by construction; a negative entry means the pair list was built
+    or reordered by something other than :func:`select_phase_pairs`.
+
+    The low-pass delay $\tau_\phi$ is common to both legs and cancels, so this is the difference of
+    the **wavelet** delays and the composed one would give the same number.
+
+    Args:
+        bank: The causal bank the pairs index into.
+        pairs: ``(n_pairs, 2)`` of $(i, j)$, column $0$ indexing the lower frequency.
+
+    Returns:
+        ``(n_pairs,)`` skew in seconds, non-negative.
+    """
+    index = np.asarray(pairs, dtype=int).reshape(-1, 2)
+    delay = bank.group_delay_s
+    return delay[index[:, 0]] - delay[index[:, 1]]
+
+
+def leg_alignment_shift(
+    bank: CausalBank, pairs: np.ndarray
+) -> Tuple[np.ndarray, np.ndarray]:
+    r"""The per-pair delay and de-rotation that put both legs of a pair on one clock.
+
+    Leg $i$ is the slower one, so the pair is brought onto one clock by **delaying leg $j$**, which
+    is a pure delay of an already-causal response and is therefore exactly causal:
+
+    $$\tilde y_j^{\,\mathrm{al}}[t] \;=\; y_j[t - s_{ij}]\;e^{\,i2\pi\xi_j s_{ij}},
+      \qquad s_{ij} = \operatorname{round}\bigl(\Delta_{ij} f_s\bigr) \ge 0 .$$
+
+    **The phasor is not optional, and dropping it is worse than doing nothing.** A gammatone
+    delays its *envelope* by $\tau_g$ and its *carrier* by nothing -- the corrected kernel's
+    response at its own centre frequency is real and positive, so the phase delay there is exactly
+    zero (measured $\le 0.3^{\circ}$ on the shipped bank). A plain time shift therefore moves the
+    carrier as well as the envelope and injects a spurious rotation of $2\pi\xi_j s_{ij}$, which at
+    $\xi_j = 0.033$ Hz and $\Delta_{ij} = 291.6$ s is $9.6$ whole turns. Measured, the shift
+    without the phasor makes the block *worse* than leaving it alone: median correlation against
+    the centred block at the predicted delay moves from $+0.049$ to $-0.432$ on ``fhr_ph``. The
+    two outputs are returned together so a caller cannot take one and forget the other.
+
+    The shift is per **pair**, not per filter: one fast filter serves up to three slow partners at
+    three different harmonic ratios and needs a different $s_{ij}$ in each, so it must be applied
+    after a per-pair gather rather than to the response array.
+
+    Args:
+        bank: The causal bank the pairs index into.
+        pairs: ``(n_pairs, 2)`` of $(i, j)$, column $0$ indexing the lower frequency.
+
+    Returns:
+        ``(shift, phasor)``: ``(n_pairs,)`` non-negative integer raw-sample shifts, and
+        ``(n_pairs,)`` unit-modulus complex de-rotations to multiply the delayed leg by.
+
+    Raises:
+        ValueError: If any pair's skew is negative, which would mean advancing a leg -- reading
+            its own future -- rather than delaying it.
+    """
+    index = np.asarray(pairs, dtype=int).reshape(-1, 2)
+    skew = pair_leg_skew(bank, index)
+    negative = np.flatnonzero(skew < 0.0)
+    if negative.size:
+        row = int(negative[0])
+        raise ValueError(
+            f"phase pair {row} = ({int(index[row, 0])}, {int(index[row, 1])}) has skew "
+            f"{float(skew[row]):.4f} s < 0: column 0 must index the lower frequency, so the "
+            f"faster leg would have to be advanced rather than delayed, reading its own future."
+        )
+    shift = np.round(skew * FS).astype(np.int64)
+    phasor = np.exp(2j * np.pi * bank.xi[index[:, 1]] * shift)
+    return shift, phasor
+
+
+#: The leg-alignment modes the causal phase block ships. ``'none'`` multiplies the two legs at one
+#: stored index, as every shard on disk was built; ``'envelope'`` puts them on one clock through
+#: :func:`leg_alignment_shift`. There is deliberately no delay-without-phasor mode: it has no
+#: legitimate caller and scores *worse* than no alignment at all, so it exists only as a negative
+#: control built locally in the test that proves the phasor is doing the work.
+LEG_ALIGNMENT_MODES = ("none", "envelope")
+
+
+def resolve_leg_alignment(
+    bank: CausalBank, pairs: np.ndarray, leg_alignment: str
+) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+    """Turn a leg-alignment mode into the per-pair shift :func:`phase_products` takes.
+
+    One resolution shared by the numpy chain and its torch twin, so the two implementations of
+    the alignment cannot drift: the twin reimplements the *convolution*, never the filter design
+    or the quantities derived from it.
+
+    Args:
+        bank: The causal bank the pairs index into.
+        pairs: ``(n_pairs, 2)`` of $(i, j)$, column $0$ indexing the lower frequency.
+        leg_alignment: One of :data:`LEG_ALIGNMENT_MODES`.
+
+    Returns:
+        ``None`` for ``'none'``, or ``(shift, phasor)`` for ``'envelope'``.
+
+    Raises:
+        ValueError: On an unknown mode, naming it and the two that ship.
+    """
+    if leg_alignment == "none":
+        return None
+    if leg_alignment == "envelope":
+        return leg_alignment_shift(bank, pairs)
+    raise ValueError(
+        f"unknown leg_alignment {leg_alignment!r}; use 'none' or 'envelope'"
+    )
+
+
+# =================================================================================================
 # The chain
 # =================================================================================================
 @lru_cache(maxsize=4)
@@ -1075,6 +1203,8 @@ def phase_products(
     responses_high: np.ndarray,
     pairs: np.ndarray,
     xi: np.ndarray,
+    *,
+    leg_shift: Optional[Tuple[np.ndarray, np.ndarray]] = None,
 ) -> np.ndarray:
     r"""The un-smoothed phase-harmonic products $[y_i]^{p_{ij}}\,\overline{y_j}$.
 
@@ -1092,15 +1222,42 @@ def phase_products(
         responses_high: ``(n_filters, n_signal)``, supplying the conjugated leg $y_j$.
         pairs: ``(n_pairs, 2)`` of $(i, j)$, $i$ indexing the lower frequency.
         xi: Centre frequencies in cycles per sample.
+        leg_shift: ``None`` for the unaligned product, or the ``(shift, phasor)`` pair
+            :func:`leg_alignment_shift` returns, which delays the conjugated leg onto the slow
+            leg's clock. Applied **after** the per-pair gather below, which is the only correct
+            place: one fast filter serves up to three slow partners at three harmonic ratios, so a
+            shift applied to *responses_high* before the gather could satisfy one of them and
+            would be silently wrong for the other two, with every shape correct. Leading samples
+            are filled by replicating the response's first sample, which is the same assumed
+            history the causal convolution ahead of it already ran on.
 
     Returns:
         ``(n_pairs, n_signal)``, complex.
+
+    Raises:
+        ValueError: If *leg_shift*'s two vectors do not carry one entry per pair.
     """
     index_low, index_high = pairs[:, 0], pairs[:, 1]
     power = (xi[index_high] / xi[index_low])[:, None]
     y_low = responses_low[index_low]
     accelerated = np.abs(y_low) * np.exp(1j * power * np.angle(y_low))
-    return accelerated * np.conj(responses_high[index_high])
+
+    y_high = responses_high[index_high]
+    if leg_shift is not None:
+        shift, phasor = leg_shift
+        n_pairs = int(index_high.size)
+        if shift.shape != (n_pairs,) or phasor.shape != (n_pairs,):
+            raise ValueError(
+                f"leg_shift carries {shift.shape} shifts and {phasor.shape} phasors for "
+                f"{n_pairs} pairs. The shift is indexed by pair, not by filter, so a vector of "
+                f"another length would be gathered against the wrong pairs."
+            )
+        # Clipping the source index at zero *is* the edge replication: every tap the shift pushes
+        # before the start reads the response's first sample.
+        taps = np.arange(y_high.shape[-1])
+        source = np.maximum(taps[None, :] - shift[:, None], 0)
+        y_high = np.take_along_axis(y_high, source, axis=-1) * phasor[:, None]
+    return accelerated * np.conj(y_high)
 
 
 def smooth_products_kymatio(
@@ -1214,17 +1371,28 @@ def phase_block_causal(
     *,
     decimation: int = DECIMATION,
     pad: str = "edge",
+    leg_alignment: str = "none",
 ) -> np.ndarray:
     r"""Phase-harmonic correlations on a causal bank -- arm C.
 
-    Only the documented operator is available. ``'kymatio_truncate'`` has no causal counterpart:
-    keeping the positive-frequency half of a spectrum is a non-causal projection, so transplanting
-    production's deviation onto a causal chain would silently reintroduce future dependence.
+    Only the documented smoothing operator is available. ``'kymatio_truncate'`` has no causal
+    counterpart: keeping the positive-frequency half of a spectrum is a non-causal projection, so
+    transplanting production's deviation onto a causal chain would silently reintroduce future
+    dependence.
+
+    **The default is ``'none'``, and that is a compatibility decision rather than a preference.**
+    :func:`transform_sample` and the torch twin's batch entry point call this with no mode
+    argument, and the committed causal fixture's blocks are rebuilt through that path and diffed
+    against the stored bytes. A default of ``'envelope'`` would therefore turn a shared contract
+    test red, and would let an ad hoc build produce aligned data carrying no attribute that says
+    so. The writer passes the mode explicitly.
 
     Note:
         A pair's warm-up is set by its **slower** leg, and its delay compounds both legs plus the
         low-pass -- so a phase channel is staler than either of the scattering channels it is
-        built from. This is why the comparison reports the phase blocks separately.
+        built from. This is why the comparison reports the phase blocks separately. Under
+        ``'none'`` the composed *delay* is a prediction the block does not obey; see
+        :func:`_compose_phase`.
 
     Args:
         x_low: Signal supplying the accelerated leg, ``(n_signal,)``.
@@ -1233,16 +1401,27 @@ def phase_block_causal(
         bank: The causal bank.
         decimation: Subsampling factor.
         pad: History supplied before $t = 0$.
+        leg_alignment: ``'none'`` to multiply the legs at one stored index, as every shard on disk
+            was built, or ``'envelope'`` to put them on one clock first. See
+            :data:`LEG_ALIGNMENT_MODES`.
 
     Returns:
         ``(n_pairs, n_signal // decimation)``, real.
+
+    Raises:
+        ValueError: On an unknown *leg_alignment*.
     """
+    # Resolved before the early return and before any convolution, so an unknown mode is refused
+    # whatever the pair list holds and without paying for the chain first.
+    leg_shift = resolve_leg_alignment(bank, pairs, leg_alignment)
     if len(pairs) == 0:
         return np.zeros((0, int(x_low.shape[-1]) // decimation))
 
     responses_low = causal_convolve(x_low, bank.psi, pad=pad)
     responses_high = responses_low if x_high is x_low else causal_convolve(x_high, bank.psi, pad=pad)
-    products = phase_products(responses_low, responses_high, pairs, bank.xi)
+    products = phase_products(
+        responses_low, responses_high, pairs, bank.xi, leg_shift=leg_shift
+    )
     smoothed = causal_smooth(products, bank.phi, pad=pad)
     return smoothed.real[:, ::decimation]
 
@@ -1323,6 +1502,23 @@ def _compose_phase(
     The **maximum** rather than the sum: the product $[y_i]^{p}\overline{y_j}$ is formed pointwise
     from two responses at the same $t$, so it is usable once the slower leg is, and is only then
     smoothed by $\phi$. Summing here would overstate every phase channel.
+
+    **For the warm-up this is true under either leg alignment.** Delaying the fast leg by
+    $s_{ij}$ lengthens its own warm-up to $W_j + s_{ij}$, and that never overtakes $W_i$ on any
+    stored pair -- asserted rather than assumed, pair by pair, by
+    ``tests/test_causal_torch.py::test_the_leg_alignment_costs_no_warm_up_on_any_stored_pair``,
+    which reports the tightest slack in its failure message. So the composed warm-up, the stored
+    widths and the drop rule are the same numbers either way.
+
+    **For the delay it is true only under ``leg_alignment='envelope'``.** Under the unaligned
+    operator $\max(\tau_i, \tau_j) + \tau_\phi$ is a *prediction the block does not obey*: the two
+    legs report the signal at $t - \tau_i$ and $t - \tau_j$, so the product is a cross-scale phase
+    correlation evaluated across the skew rather than a delayed copy of the centred coefficient.
+    Measured against the centred block over twelve segments, the ``fhr_ph`` cross-correlation's
+    argmax overshoots this composition by a median of $60.5$ steps. Aligned, the same argmax lands
+    on it -- median signed miss $0$ steps, and the correlation *at* the composed delay rises from
+    $+0.07$ to $+0.80$. The number stored in ``causal_delay_s`` is therefore this one in both
+    cases, and it becomes correct rather than merely recorded when the block is built aligned.
 
     Args:
         per_filter: The quantity per first-order filter, ``(n_filters,)``.
@@ -1414,6 +1610,153 @@ def build_channel_plan(
             delay_s=block_delay[kept],
         )
     return plan
+
+
+def channel_alignment_delays(
+    delay_s: np.ndarray, reference_s: float, step_s: float
+) -> np.ndarray:
+    r"""Per-channel step shift that brings a whole stored block onto one reference clock.
+
+    $$d_c \;=\; \operatorname{round}\!\Bigl(\frac{\tau_{\mathrm{ref}} - \tau_c}{\Delta}\Bigr),
+      \qquad \Delta = \texttt{step\_s} .$$
+
+    Reading channel $c$ at step $t - d_c$ instead of $t$ makes every entry of the vector describe
+    one physical instant. It is a re-indexing of the lag origin, not a loss of information:
+    delaying channel $c$ by $d_c$ and then reading lag $\ell$ is reading channel $c$ at lag
+    $\ell + d_c$.
+
+    **Rounding, not ceiling.** Both directions are causally safe here -- $d_c \ge 0$ only selects
+    which *already-causal* stored step is read, and over-delaying is as non-anticipative as
+    under-delaying -- so the only criterion is residual misalignment, which rounding minimises at
+    $\lvert\tau_{\mathrm{ref}} - \tau_c - \Delta d_c\rvert \le \Delta/2$. (Contrast the warm-up
+    ceiling in :func:`build_channel_plan`, where the ceiling *is* load-bearing, because a step
+    that is $40\%$ pad is not $40\%$ valid.)
+
+    **The reference must be the maximum of the channels it is applied to.** A channel above it
+    would need $d_c < 0$, i.e. to be read from a *later* stored step, which reads raw signal after
+    the anchor and destroys the one property the causal construction exists for. Such channels are
+    dropped by the caller, not advanced -- this refuses them by name rather than silently
+    producing a negative gather, the same asymmetry that makes
+    :class:`~teb_vae.lag_attn.nets.delays.ChannelDelay` refuse a negative entry.
+
+    The comparison is exact rather than toleranced, because *reference_s* is meant to be one of
+    the entries of *delay_s* (or of a sibling block's, built by the same bank and stored at the
+    same precision), so equality at the reference channel is bitwise rather than approximate.
+
+    Args:
+        delay_s: ``(C,)`` composed group delay per stored channel, in seconds -- the shard's
+            ``causal_delay_s``.
+        reference_s: The common reference delay in seconds.
+        step_s: One stored step in seconds; $4$ s at the production geometry.
+
+    Returns:
+        ``(C,)`` non-negative integer step shifts, zero at the reference channel.
+
+    Raises:
+        ValueError: If any channel's delay exceeds the reference, naming the channel index and
+            both delays.
+    """
+    delay = np.asarray(delay_s, dtype=np.float64)
+    above = np.flatnonzero(delay > float(reference_s))
+    if above.size:
+        index = int(above[0])
+        raise ValueError(
+            f"channel {index} has delay {float(delay[index]):.4f} s, above the reference "
+            f"{float(reference_s):.4f} s ({above.size} of {delay.size} channels are). Aligning it "
+            f"would need a negative shift, which reads the channel's own future; a channel above "
+            f"the reference must be dropped, not advanced."
+        )
+    return np.round((float(reference_s) - delay) / float(step_s)).astype(np.int64)
+
+
+def novelty_fraction(
+    bank: CausalBank,
+    plan: Dict[str, CausalChannelPlan],
+    target_pairs: np.ndarray,
+    source_pairs: np.ndarray,
+    horizon_steps: int,
+    *,
+    decimation: int = DECIMATION,
+) -> Dict[str, np.ndarray]:
+    r"""Share of each stored channel drawn from raw samples an anchor has not yet seen.
+
+    A target coefficient stamped at $\Delta(t + 1 + h)$ is a weighted average over the past of
+    *that* instant, and the group delay puts most of that weight before the anchor at $\Delta t$.
+    With composed envelope $g_c = \lvert\psi_k\rvert \star \phi$,
+
+    $$\nu_c(h) \;=\; \frac{\int_0^{\Delta(1+h)} g_c(\tau)\,\mathrm d\tau}
+                          {\int_0^{\infty} g_c(\tau)\,\mathrm d\tau}$$
+
+    is the share of it that is genuinely new. This is **not** a leak -- every one of those
+    coefficients still depends on raw samples after the anchor, so the forecast claim is exact.
+    What it says is that the effective forecast horizon is **per channel**: the slowest kept
+    target channel draws $2.6\%$ of its value from the two minutes it is being asked to predict,
+    while a fast channel draws all of it. A block score summed over both mixes two different
+    claims, which is why the number is stored rather than assumed uniform.
+
+    **Phase channels take the slower leg.** A phase coefficient's sensitivity is a mixture of both
+    legs' envelopes, weighted by a product this function does not model; the slow leg's fraction
+    is the smaller of the two, so reporting it is the conservative choice and cannot overstate how
+    much of a channel is forecast. Column $0$ of a pair list is the slow leg by construction.
+
+    $S_0$ is $\phi$ alone -- no wavelet, no modulus -- so its composed envelope is the low-pass
+    itself. The scattering composition is written out here rather than delegated to
+    :func:`_compose_scattering`, which *adds* the low-pass term and is right for a support or a
+    delay but not for a fraction.
+
+    The convolution is done by FFT: the two kernels are $2^{15}$ taps each and a direct
+    convolution of $42$ such pairs takes minutes.
+
+    Note:
+        $\int_0^\infty$ is taken over the stored kernel, which holds $99.999\%$ of the true
+        envelope's $L^1$ mass at the shipped tap count -- the same approximation
+        :func:`causal_support_samples` makes, and for the same reason.
+
+    Args:
+        bank: The causal bank the plan was built from.
+        plan: The stored channel plan, one entry per block of :data:`CAUSAL_BLOCKS`.
+        target_pairs: ``(n_pairs, 2)`` phase pairs for ``fhr_ph``, in stored channel order.
+        source_pairs: ``(n_pairs, 2)`` phase pairs for ``up_ph``.
+        horizon_steps: Forecast horizon $H$ in decimated steps; the window is
+            ``horizon_steps * decimation`` raw samples.
+        decimation: Raw samples per stored step.
+
+    Returns:
+        ``{block: (C,) float64}`` in the unit interval, on the stored channel axis.
+
+    Raises:
+        ValueError: If *horizon_steps* is not positive, which would make the fraction meaningless
+            rather than merely small.
+    """
+    if int(horizon_steps) <= 0:
+        raise ValueError(
+            f"horizon_steps must be positive, got {horizon_steps}. A zero-length horizon has no "
+            f"novel samples in it by definition, which measures nothing about the bank."
+        )
+    horizon_samples = int(horizon_steps) * int(decimation)
+
+    # Linear (not circular) convolution of every wavelet modulus with the low-pass: the FFT is
+    # taken at the next power of two above the 2n-1 output length, so nothing wraps around into
+    # the leading taps this measurement is entirely about.
+    n_taps = bank.n_taps
+    size = 1 << int(math.ceil(math.log2(2 * n_taps)))
+    spectrum = np.fft.rfft(np.abs(bank.psi), n=size, axis=-1) * np.fft.rfft(bank.phi, n=size)
+    composed = np.fft.irfft(spectrum, n=size, axis=-1)[:, : 2 * n_taps - 1]
+    # Both factors are non-negative, so the true convolution is; anything below zero is FFT
+    # round-off, and clipping it keeps the cumulative fraction inside [0, 1] and non-decreasing.
+    composed = np.maximum(composed, 0.0)
+
+    per_filter = composed[:, :horizon_samples].sum(axis=-1) / composed.sum(axis=-1)
+    low_pass = float(bank.phi[:horizon_samples].sum() / bank.phi.sum())
+
+    scattering = np.concatenate([[low_pass], per_filter])
+    per_block = {
+        "fhr_st": scattering,
+        "up_st": scattering,
+        "fhr_ph": per_filter[np.asarray(target_pairs, dtype=int).reshape(-1, 2)[:, 0]],
+        "up_ph": per_filter[np.asarray(source_pairs, dtype=int).reshape(-1, 2)[:, 0]],
+    }
+    return {name: per_block[name][plan[name].kept] for name in CAUSAL_BLOCKS}
 
 
 # =================================================================================================
