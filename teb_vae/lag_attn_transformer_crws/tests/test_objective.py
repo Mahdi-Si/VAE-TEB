@@ -63,7 +63,7 @@ _ADDED_METRIC_KEYS = {
 #: The shipped raw block: $H \cdot R = 15 \times 16$ samples per anchor, against the conv-Transformer
 #: raw-signal parent's $30 \times 16 = 480$. Recorded here because every loss-scale constant stated in
 #: nats has to be re-derived rather than transferred, and this is the number that makes that true.
-_SHIPPED_BLOCK = 240
+_SHIPPED_BLOCK = 480
 
 #: The two phases the tiled fixtures run at. Chosen so the second row is one anchor short of the
 #: first, which is the only way a padded slot exists at all -- and every padding assertion below
@@ -162,7 +162,7 @@ def test_the_shipped_block_is_the_horizon_times_the_raw_grid() -> None:
     model = build(kwargs)
 
     assert model.horizon * model.geometry.r == _SHIPPED_BLOCK
-    assert model.horizon == 15 and model.geometry.r == 16
+    assert model.horizon == 30 and model.geometry.r == 16
 
 
 def test_the_target_is_the_raw_window_at_the_anchors_this_forward_decoded() -> None:

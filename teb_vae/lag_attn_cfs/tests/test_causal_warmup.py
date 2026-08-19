@@ -420,12 +420,17 @@ def test_a_second_shard_with_a_different_width_is_refused_naming_it(tmp_path: Pa
         block = handle["up_ph"]
         data = block[:, :14, :]
         warmup = np.asarray(block.attrs["causal_warmup_steps"])[:14]
+        # Both per-channel attributes are narrowed with the block. Carrying only one would trip
+        # the reader's own completeness check instead, and this test would then pass without ever
+        # exercising the width comparison it is named for.
+        delay = np.asarray(block.attrs["causal_delay_s"])[:14]
         del handle["up_ph"]
         created = handle.create_dataset("up_ph", data=data)
         created.attrs["causal_warmup_steps"] = warmup
+        created.attrs["causal_delay_s"] = delay
 
     other = write_variant(CAUSAL_SHARD, tmp_path / "narrow_up_ph.hdf5", narrow)
-    with pytest.raises(ValueError, match="up_ph"):
+    with pytest.raises(ValueError, match=r"Mismatched 'up_ph' width"):
         resolve_warmup_budget(causal_config(paths=[CAUSAL_SHARD, other]))
 
 

@@ -236,9 +236,9 @@ def test_the_geometry_and_the_encoder_block_reach_the_constructor(driver) -> Non
     kwargs = driver._build_model_kwargs()
 
     assert kwargs["sequence_length"] == 300
-    assert kwargs["horizon"] == 15
+    assert kwargs["horizon"] == 30
     assert kwargs["warmup_period"] == 133
-    assert kwargs["anchor_stride"] == 15
+    assert kwargs["anchor_stride"] == 30
     assert kwargs["c_y"] == 102
     assert kwargs["c_u"] == 51
     assert kwargs["target_attention_blocks"] == 2  # the tiny variant's own override
@@ -299,7 +299,7 @@ def test_the_built_model_is_this_packages_and_carries_both_halves(driver) -> Non
 
     assert isinstance(model, SeqVaeLagAttnTrfCrws)
     assert model.decoder_out_channels == 16
-    assert model.anchor_stride == 15
+    assert model.anchor_stride == 30
     assert not any(isinstance(module, torch.nn.LSTM) for module in model.modules())
 
 
@@ -319,7 +319,7 @@ def test_the_startup_log_states_the_resolved_anchor_geometry(driver, caplog) -> 
 
     geometry = [line for line in messages if "resolved anchor geometry" in line]
     assert geometry, messages[-5:]
-    for field in ("H=15", "S=15", "F=133", "T_valid=285", "A_max=11", "H*R=240"):
+    for field in ("H=30", "S=30", "F=133", "T_valid=270", "A_max=5", "H*R=480"):
         assert field in geometry[0], field
 
 

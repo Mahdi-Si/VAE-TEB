@@ -78,13 +78,13 @@ _ENCODER_KEYS = (
 #: budget. They differ for exactly one reason, unlike in the causal-feature pair: a guarded run
 #: builds two availability input adapters an unguarded one does not have. The decoder is $R = 16$
 #: wide either way, because the raw block's width is geometry rather than a gate's survivor count.
-_SHIPPED_GATED = 5_009_772
-_SHIPPED_UNGATED = 4_991_212
+_SHIPPED_GATED = 5_013_612
+_SHIPPED_UNGATED = 4_995_052
 
 #: The conv-LSTM cell of this row at the same budget, and the difference. The encoder swap costs
 #: exactly what it costs in the causal-feature pair and in the two-sided pair, which is the sense in
 #: which the grid's two axes are independent.
-_CONV_LSTM_SHIPPED_GATED = 5_101_114
+_CONV_LSTM_SHIPPED_GATED = 5_104_954
 _ENCODER_EDGE_PARAMETERS = 91_342
 
 #: What the shipped budget keeps of the $102$ declared target-stream channels. A literal here rather
@@ -305,7 +305,7 @@ def test_the_model_constructs_at_both_geometries(tiny_kwargs) -> None:
     shipped = _model(shipped_warmup_kwargs())
 
     assert (tiny.geometry.raw_len, tiny.geometry.t_valid) == (384, 20)
-    assert (shipped.geometry.raw_len, shipped.geometry.t_valid) == (4800, 285)
+    assert (shipped.geometry.raw_len, shipped.geometry.t_valid) == (4800, 270)
 
 
 def test_the_decoder_emits_raw_samples_because_no_width_hook_is_defined(tiny_warmup) -> None:

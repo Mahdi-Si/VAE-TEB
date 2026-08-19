@@ -164,7 +164,7 @@ def _hand_warmth(model, out) -> dict:
 def test_the_anchor_count_is_the_geometry_derived_tile_count_at_the_training_stride() -> None:
     r"""Every phase in $[0, S)$ at once, so the reported mean is the real one:
     $\lceil (T_{\mathrm{valid}} - F - \varphi)/S \rceil$, which at the shipped geometry is $11$ for
-    $\varphi \le 1$ and $10$ otherwise, summing to $152$ and averaging to $152/15$.
+    $\varphi \le 16$ and $4$ otherwise, summing to $137$ and averaging to $137/30$.
 
     Re-derived here from the model's own resolved geometry rather than written down, so a horizon or
     budget change moves the expectation with the model instead of failing this test.
@@ -176,14 +176,14 @@ def test_the_anchor_count_is_the_geometry_derived_tile_count_at_the_training_str
     reported = _anchor_count(model, torch.arange(stride), stride, batch=stride)
 
     per_phase = [-(-(span - phase) // stride) for phase in range(stride)]
-    assert stride == SHIPPED_HORIZON and span == 152
-    assert min(per_phase) == 10 and max(per_phase) == 11
+    assert stride == SHIPPED_HORIZON and span == 137
+    assert min(per_phase) == 4 and max(per_phase) == 5
     assert sum(per_phase) == span
     assert reported == pytest.approx(span / stride, rel=1e-6)
 
 
 def test_the_anchor_count_is_the_whole_valid_range_at_the_validation_stride() -> None:
-    r"""Validation and test decode every valid anchor, so the count is $T_{\mathrm{valid}} - F = 152$
+    r"""Validation and test decode every valid anchor, so the count is $T_{\mathrm{valid}} - F = 137$
     exactly -- not a tile set at one fixed phase, which would sample the same $11$ positions of every
     segment forever."""
     model = build(shipped_warmup_kwargs())

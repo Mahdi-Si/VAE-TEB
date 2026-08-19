@@ -61,7 +61,12 @@ from hdf5_dataset.causal_scattering import (
     causal_convolve,
     causal_smooth,
     causal_support_samples,
+    channel_alignment_delays,
     gammatone_rate,
+    leg_alignment_shift,
+    novelty_fraction,
+    pair_leg_skew,
+    phase_block_causal,
     production_padding,
     select_phase_pairs,
     selected_pairs,
@@ -72,6 +77,7 @@ from hdf5_dataset.causal_scattering_torch import CausalTorchBank, transform_batc
 from hdf5_dataset.tests.conftest import (
     FIXTURE_PATH,
     MEASUREMENTS_PATH,
+    SHARD_PATH,
     requires_cuda,
     requires_measurements,
     scale_relative_errors,
@@ -89,6 +95,13 @@ IMPORT_GUARDED_MODULES = ("causal_scattering", "causal_scattering_torch")
 #: Stored decimated length of a segment, and the layout the plan must produce.
 LEN_SEQUENCE = N_RAW // DECIMATION
 EXPECTED_CAUSAL_WIDTHS = {"fhr_st": 36, "fhr_ph": 66, "up_st": 36, "up_ph": 15}
+
+#: One stored step in seconds, and the shipped forecast horizon in stored steps. Both are
+#: *model-side* geometry rather than bank geometry, which is why they are written here rather than
+#: imported: the delay surface is a property of the filter bank alone, and these two numbers are
+#: what a consumer of it happens to configure. They are the values every shipped config uses.
+STEP_SECONDS = DECIMATION / FS
+HORIZON_STEPS = 30
 
 #: Agreement required of the torch chain against the numpy reference, per block, scale-relatively.
 #:
@@ -430,6 +443,99 @@ def test_the_plan_agrees_with_the_per_channel_csv(
                            channel_plan[name].delay_s[0], atol=1e-3)
 
 
+def _measurement_provenance() -> Dict[str, Any]:
+    """What the measurement run recorded about itself, beside the CSV it wrote.
+
+    Returns:
+        The ``arguments`` block of ``summary.json``.
+
+    Raises:
+        AssertionError: If the CSV is present without its summary, which means the review
+            directory was assembled by something other than the tool.
+    """
+    summary = MEASUREMENTS_PATH.parent / "summary.json"
+    assert summary.exists(), (
+        f"{MEASUREMENTS_PATH.name} is present but {summary.name} is not. The two are written by "
+        f"one run, so a CSV without its summary is a directory nothing can date."
+    )
+    return json.loads(summary.read_text(encoding="utf-8"))["arguments"]
+
+
+@requires_measurements
+def test_the_measurement_csv_describes_this_bank_and_this_shard() -> None:
+    r"""A **stale** CSV fails here; an absent one still skips.
+
+    ``output/`` is git-ignored, so a fresh clone and the production box have never run the
+    measurement tool and the comparison below can only ever be optional -- that is what
+    :data:`requires_measurements` is for. What it must not do is cover the *other* case: a CSV
+    left over from a run against a different shard, or at a different leg alignment, silently
+    passing every comparison built on it because the comparison was skipped for a different
+    reason. Absence is a skip; disagreement is a failure, and the message says which.
+
+    The tool records both facts in ``summary.json`` beside the CSV, which is the only place they
+    survive: the CSV's own rows are per channel and carry no run-level provenance at all.
+    """
+    arguments = _measurement_provenance()
+    shard = str(arguments.get("shard", ""))
+    alignment = str(arguments.get("leg_alignment", "none"))
+
+    assert Path(shard).name == SHARD_PATH.name, (
+        f"{MEASUREMENTS_PATH} was measured against {shard!r}, not {SHARD_PATH}. Every value in "
+        f"it describes a different dataset's channels; re-run the comparison tool."
+    )
+    assert alignment in ("none", "envelope"), f"unknown leg alignment {alignment!r} in the summary"
+    # The three shipped correlation columns describe whichever arm the run was made at, so a CSV
+    # built aligned cannot be read as the unaligned baseline the pins below assume.
+    assert alignment == "none", (
+        f"{MEASUREMENTS_PATH} was measured at leg_alignment={alignment!r}. Its r_at_best_lag, "
+        f"r_at_predicted_lag and r_at_zero_lag columns then describe the aligned arm, while the "
+        f"envelope columns beside them describe the same one; re-run without --leg-alignment to "
+        f"restore the comparison."
+    )
+
+
+@requires_measurements
+def test_the_measurement_csv_carries_the_leg_alignment_columns() -> None:
+    r"""The seven columns the alignment added, present and finite where they mean anything.
+
+    Three describe the bank -- the intra-pair skew, the integer shift that removes it and the
+    harmonic ratio the skew scales with. Four are measured against the centred block: the
+    correlation at the predicted delay, and the complex coherence before $\Re\{\cdot\}$ with its
+    residual rotation and that rotation's concentration across segments.
+
+    The scattering blocks have no pairs, so their rows are ``nan`` by construction rather than
+    absent -- the CSV keeps one row per stored channel of every block.
+    """
+    added = (
+        "pair_skew_s", "leg_shift_samples", "harmonic_power",
+        "r_at_predicted_lag_envelope", "coherence_abs_envelope",
+        "coherence_deg_envelope", "coherence_concentration_envelope",
+    )
+    rows: Dict[str, List[Dict[str, str]]] = {}
+    with MEASUREMENTS_PATH.open(newline="") as handle:
+        reader = csv.DictReader(handle)
+        assert reader.fieldnames is not None
+        assert set(added) <= set(reader.fieldnames), (
+            f"missing: {sorted(set(added) - set(reader.fieldnames))}"
+        )
+        for row in reader:
+            rows.setdefault(row["block"], []).append(row)
+
+    for name in ("fhr_ph", "up_ph"):
+        for column in added:
+            values = np.array([float(row[column]) for row in rows[name]])
+            assert np.isfinite(values).all(), f"{name}.{column}"
+        skew = np.array([float(row["pair_skew_s"]) for row in rows[name]])
+        assert (skew >= 0.0).all(), name
+        # The alignment is measured, not merely recorded: it beats the shipped arm on both blocks.
+        shipped = np.array([float(row["r_at_predicted_lag"]) for row in rows[name]])
+        envelope = np.array([float(row["r_at_predicted_lag_envelope"]) for row in rows[name]])
+        assert float(np.median(envelope)) > float(np.median(shipped)) + 0.3, name
+
+    for name in ("fhr_st", "up_st"):
+        for column in added:
+            assert all(row[column] == "nan" for row in rows[name]), f"{name}.{column}"
+
 #: The dataset reference's schema table, which is the document consumers read instead of the code.
 _REFERENCE_DOC = Path(__file__).resolve().parents[1] / "dataset_explained_research.md"
 
@@ -499,6 +605,230 @@ def test_the_two_phase_selectors_agree_in_order(
         selection = masks[key]
         assert np.array_equal(phase_pairs[name][:, 0], np.asarray(selection.i, dtype=int)), name
         assert np.array_equal(phase_pairs[name][:, 1], np.asarray(selection.j, dtype=int)), name
+
+
+# =================================================================================================
+# The delay surface
+# =================================================================================================
+# Four pure functions over the bank, the pair lists and a stored delay vector, and one assertion
+# about what they cost. Nothing here changes a stored value; what it does is make the intra-pair
+# skew, the shift that removes it and the per-channel alignment rule measurable rather than
+# implicit, so that the operator built on them in the transform can be checked against numbers
+# that were pinned before it existed.
+def test_the_pair_skew_reproduces_the_harmonic_ratio_identity(
+    causal_bank: CausalBank, phase_pairs: Dict[str, np.ndarray]
+) -> None:
+    r"""$\Delta_{ij} = \tau_i - \tau_j = \tau_i(1 - 1/p_{ij})$, on both stored selections.
+
+    The identity is the whole reason the skew is predictable rather than a table: on a constant-$Q$
+    ladder $b \propto \xi$, so $\tau_i/\tau_j = p_{ij}$ exactly and the skew is a fixed fraction of
+    the slow leg's own delay -- $\tfrac12$, $0.646$ and $\tfrac34$ for the three stored families.
+    Asserted against the ratio rebuilt from the **production** centre frequencies rather than from
+    the causal bank's own, so the two banks agreeing is part of what is checked.
+    """
+    reference = build_filter_bank()
+    for name, pairs in phase_pairs.items():
+        skew = pair_leg_skew(causal_bank, pairs)
+        power = reference.hz[pairs[:, 1]] / reference.hz[pairs[:, 0]]
+        identity = causal_bank.group_delay_s[pairs[:, 0]] * (1.0 - 1.0 / power)
+        assert np.allclose(skew, identity, rtol=1e-12, atol=1e-12), name
+        # Column 0 indexes the lower frequency, so the slow leg is always the first one.
+        assert (skew >= 0.0).all(), name
+        assert skew.shape == (pairs.shape[0],), name
+
+
+def test_every_source_phase_channel_is_skewed_by_most_of_a_minute(
+    causal_bank: CausalBank, phase_pairs: Dict[str, np.ndarray]
+) -> None:
+    r"""The number that makes the defect worth repairing, on the block that carries it worst.
+
+    ``up_ph`` is the block whose entire purpose is to carry contraction morphology into the lag
+    attention, and the attention searches $360$ s. **Every one** of its fifteen channels is built
+    from two legs at least $68.7$ s apart, with a median of $163.5$ s -- half the search range,
+    inside a single channel, before any cross-channel effect. A floor rather than an equality, so
+    a bank change that erodes the margin fails here rather than in a training curve.
+    """
+    source = pair_leg_skew(causal_bank, phase_pairs["up_ph"])
+    assert source.min() >= 68.7
+    assert float(np.median(source)) == pytest.approx(163.5, abs=0.1)
+    assert source.max() == pytest.approx(291.6, abs=0.1)
+
+    target = pair_leg_skew(causal_bank, phase_pairs["fhr_ph"])
+    assert (float(target.min()), float(target.max())) == pytest.approx((3.6, 291.6), abs=0.1)
+    assert float(np.median(target)) == pytest.approx(39.1, abs=0.1)
+
+
+def test_a_reused_fast_leg_gets_a_different_shift_in_each_pair_that_uses_it(
+    causal_bank: CausalBank, phase_pairs: Dict[str, np.ndarray]
+) -> None:
+    r"""The shift is indexed by **pair**, and this is the test that says so.
+
+    ``select_phase_pairs`` admits every $(i, j)$ meeting the band and ratio rule, so one fast
+    filter serves several slow partners at several harmonic ratios and needs a different
+    $s_{ij}$ in each. Measured on the shipped bank: $22$ of the $24$ distinct ``fhr_ph`` fast legs
+    are reused -- $20$ of them by three slow partners each -- and $5$ of the $7$ in ``up_ph``.
+
+    An implementation that shifted the *response array* before the per-pair gather could satisfy
+    at most one pair per reused filter and would be silently wrong for the rest, with every shape
+    correct and every existing gate green. That failure is invisible to a shape test and to a
+    round-trip test; it is visible here.
+    """
+    expected_reuse = {"fhr_ph": (24, 22, 20), "up_ph": (7, 5, 3)}
+    for name, pairs in phase_pairs.items():
+        shift, _ = leg_alignment_shift(causal_bank, pairs)
+        by_fast_leg: Dict[int, List[int]] = {}
+        for (_, fast), value in zip(pairs.tolist(), shift.tolist()):
+            by_fast_leg.setdefault(int(fast), []).append(int(value))
+
+        distinct, reused, by_three = expected_reuse[name]
+        assert len(by_fast_leg) == distinct, name
+        assert sum(len(v) > 1 for v in by_fast_leg.values()) == reused, name
+        assert sum(len(v) == 3 for v in by_fast_leg.values()) == by_three, name
+        # Every partner of a reused leg asks it for a *different* shift, which is the claim.
+        for fast, shifts in by_fast_leg.items():
+            assert len(set(shifts)) == len(shifts), f"{name}: fast leg {fast} -> {shifts}"
+
+
+def test_the_alignment_shift_is_non_negative_and_its_phasor_is_a_rotation(
+    causal_bank: CausalBank, phase_pairs: Dict[str, np.ndarray]
+) -> None:
+    r"""One shift and one unit-modulus phasor per pair, the shift derived from the stored delay.
+
+    The phasor's modulus is the thing to pin: it is the de-rotation that keeps the carrier where
+    it is while the envelope moves, so a modulus that drifted from $1$ would rescale every
+    coefficient of the block on top of rotating it. Derived from
+    :attr:`CausalBank.group_delay_s`, not from a second evaluation of $\gamma/(2\pi b)$, so the
+    bank stays the one source of the number.
+    """
+    for name, pairs in phase_pairs.items():
+        shift, phasor = leg_alignment_shift(causal_bank, pairs)
+        assert shift.shape == phasor.shape == (pairs.shape[0],), name
+        assert (shift >= 0).all(), name
+        assert np.abs(np.abs(phasor) - 1.0).max() < 1e-12, name
+        # The shift is the skew on the raw grid, rounded: no other quantity would round to this.
+        assert np.array_equal(shift, np.round(pair_leg_skew(causal_bank, pairs) * FS)), name
+
+    # A mis-ordered pair would need the faster leg advanced, which reads its own future.
+    flipped = phase_pairs["up_ph"][:, ::-1].copy()
+    with pytest.raises(ValueError, match="reading its own future"):
+        leg_alignment_shift(causal_bank, flipped)
+
+
+def test_the_leg_alignment_costs_no_warm_up_on_any_stored_pair(
+    causal_bank: CausalBank, phase_pairs: Dict[str, np.ndarray]
+) -> None:
+    r"""$W_j + s_{ij} \le W_i$ for all $81$ stored pairs -- the whole cost argument, asserted.
+
+    Delaying the fast leg lengthens *its* warm-up, and the pair's warm-up is
+    $\max(W_i,\ W_j + s_{ij}) + W_\phi$. The alignment is free exactly when the delayed fast leg
+    still warms up no later than the slow leg it was delayed onto, which holds because
+    $W \approx \rho\tau$ with $\rho \approx 1.48$ roughly constant, giving
+    $W_j + s_{ij} \approx f_s(\tau_i + (\rho - 1)\tau_j) \le f_s\rho\tau_i = W_i$.
+
+    Asymptotically true is not the same as true, so this checks every pair and reports the
+    tightest slack: a bank change that erodes it says by how much rather than merely failing. The
+    shipped margin is $8$ raw samples on ``fhr_ph`` and $132$ on ``up_ph`` -- thin on the target
+    block, which is why the composed warm-up rule, the stored widths and the drop rule all depend
+    on a test rather than on the approximation above.
+    """
+    support = np.array(
+        [causal_support_samples(causal_bank.psi[k]) for k in range(causal_bank.n_filters)],
+        dtype=np.int64,
+    )
+    tightest = {"fhr_ph": 8, "up_ph": 132}
+    for name, pairs in phase_pairs.items():
+        shift, _ = leg_alignment_shift(causal_bank, pairs)
+        slack = support[pairs[:, 0]] - (support[pairs[:, 1]] + shift)
+        worst = int(np.argmin(slack))
+        assert slack.min() >= 0, (
+            f"{name}: pair {worst} = ({int(pairs[worst, 0])}, {int(pairs[worst, 1])}) has "
+            f"{int(slack[worst])} raw samples of slack -- the delayed fast leg now warms up "
+            f"after the slow leg, so the composed warm-up rule and the stored widths would move"
+        )
+        assert int(slack.min()) == tightest[name], name
+
+    assert phase_pairs["fhr_ph"].shape[0] + phase_pairs["up_ph"].shape[0] == 81
+
+
+def test_the_channel_alignment_rounds_and_refuses_a_channel_above_the_reference(
+    channel_plan: Dict[str, CausalChannelPlan]
+) -> None:
+    r"""Rounding, a half-step residual, zero at the reference, and a named refusal.
+
+    The reference is filter $30$'s composed delay, $402.1604$ s -- simultaneously the maximum of
+    ``fhr_ph``, the maximum of ``up_ph`` and the lower band edge both phase selections already
+    use. Both streams reach it, and both carry four scattering channels above it, which cannot be
+    aligned at all: a negative shift reads a channel's own future.
+    """
+    reference = float(channel_plan["fhr_ph"].delay_s.max())
+    assert reference == pytest.approx(402.1604, abs=5e-4)
+    assert float(channel_plan["up_ph"].delay_s.max()) == pytest.approx(reference, abs=1e-9)
+
+    for stream, blocks in (("target", ("fhr_st", "fhr_ph")), ("source", ("up_st", "up_ph"))):
+        delay = np.concatenate([channel_plan[name].delay_s for name in blocks])
+        above = delay > reference
+        assert int(above.sum()) == 4, stream
+
+        shifts = channel_alignment_delays(delay[~above], reference, STEP_SECONDS)
+        assert (shifts >= 0).all(), stream
+        assert (int(shifts.min()), int(shifts.max())) == (0, 97), stream
+        # Rounding, not ceiling: both directions are causally safe, so the only criterion is the
+        # residual, and it is bounded by half a step rather than by a whole one.
+        residual = np.abs(reference - delay[~above] - STEP_SECONDS * shifts)
+        assert residual.max() <= STEP_SECONDS / 2.0, stream
+        assert float(residual.max()) == pytest.approx(1.89, abs=0.01), stream
+        # Zero at the reference itself, which is a channel of both streams.
+        assert int(shifts[np.argmin(np.abs(delay[~above] - reference))]) == 0, stream
+
+        with pytest.raises(ValueError, match="reads the channel's own future") as error:
+            channel_alignment_delays(delay, reference, STEP_SECONDS)
+        message = str(error.value)
+        assert f"channel {int(np.flatnonzero(above)[0])}" in message, stream
+        assert "402.16" in message, stream
+
+
+def test_the_novelty_fraction_is_the_published_table(
+    causal_bank: CausalBank,
+    phase_pairs: Dict[str, np.ndarray],
+    channel_plan: Dict[str, CausalChannelPlan],
+) -> None:
+    r"""How much of a target coefficient is drawn from raw samples the anchor has not seen.
+
+    Over the full $120$ s horizon the slowest kept channel draws $2.6\%$ of its value from the
+    window it is being asked to forecast, while $S_0$ draws all of it. This is not a leak -- every
+    coefficient still depends on samples after the anchor -- but it means the effective forecast
+    horizon is per channel, and a block score summed over both mixes two different claims.
+
+    Both ends of the range are pinned, because a bug that collapsed the fraction to a constant
+    would look plausible at either end alone.
+    """
+    novelty = novelty_fraction(
+        causal_bank, channel_plan, phase_pairs["fhr_ph"], phase_pairs["up_ph"], HORIZON_STEPS
+    )
+    assert sorted(novelty) == sorted(channel_plan)
+    for name, plan in channel_plan.items():
+        assert novelty[name].shape == (plan.n_channels,), name
+        assert (novelty[name] >= 0.0).all() and (novelty[name] <= 1.0).all(), name
+
+    # A scattering block stores $S_0$ at channel 0, so filter $k$ is channel $k + 1$.
+    scattering = novelty["fhr_st"]
+    assert float(scattering[0]) == pytest.approx(1.000, abs=5e-4)
+    assert float(scattering[31]) == pytest.approx(0.026, abs=5e-3)
+    for filter_index, expected in ((10, 1.000), (18, 0.974), (25, 0.267), (28, 0.073)):
+        assert float(scattering[filter_index + 1]) == pytest.approx(expected, abs=5e-3)
+    assert np.array_equal(novelty["up_st"], scattering)
+
+    # A phase channel takes its slow leg's value, which is the conservative one; every pair of
+    # both blocks tops out at filter 30, so both minima land on the reference channel's fraction.
+    for name in ("fhr_ph", "up_ph"):
+        assert float(novelty[name].min()) == pytest.approx(0.026, abs=5e-3), name
+        expected = scattering[phase_pairs[name][:, 0] + 1]
+        assert np.array_equal(novelty[name], expected), name
+
+    with pytest.raises(ValueError, match="horizon_steps must be positive"):
+        novelty_fraction(
+            causal_bank, channel_plan, phase_pairs["fhr_ph"], phase_pairs["up_ph"], 0
+        )
 
 
 # =================================================================================================
@@ -696,12 +1026,46 @@ def numpy_reference(
     ]
 
 
+@pytest.fixture(scope="module")
+def numpy_reference_aligned(
+    causal_bank: CausalBank,
+    raw_segments: Dict[str, np.ndarray],
+    phase_pairs: Dict[str, np.ndarray],
+    numpy_reference: List[Dict[str, np.ndarray]],
+) -> List[Dict[str, np.ndarray]]:
+    """The same reference with both phase blocks rebuilt envelope-aligned.
+
+    The **scattering** blocks are carried over from the unaligned reference deliberately rather
+    than recomputed. The alignment lives entirely inside the phase product, so those two blocks
+    must come out identical -- and the torch side under test computes them fresh at
+    ``leg_alignment='envelope'``, so gating them against the unaligned numpy values is what proves
+    the mode does not leak out of the phase path.
+    """
+    return [
+        {
+            **sample,
+            "fhr_ph": phase_block_causal(
+                raw_segments["fhr"][index].astype(np.float64),
+                raw_segments["fhr"][index].astype(np.float64),
+                phase_pairs["fhr_ph"], causal_bank, leg_alignment="envelope",
+            ),
+            "up_ph": phase_block_causal(
+                raw_segments["up"][index].astype(np.float64),
+                raw_segments["up"][index].astype(np.float64),
+                phase_pairs["up_ph"], causal_bank, leg_alignment="envelope",
+            ),
+        }
+        for index, sample in enumerate(numpy_reference)
+    ]
+
+
 def _gate(
     torch_bank: CausalTorchBank,
     raw_segments: Dict[str, np.ndarray],
     reference: List[Dict[str, np.ndarray]],
     pairs: Dict[str, np.ndarray],
     dtype: type,
+    leg_alignment: str = "none",
 ) -> Dict[str, Dict[str, float]]:
     """Worst-case scale-relative errors per block, over every gated segment.
 
@@ -711,6 +1075,8 @@ def _gate(
         reference: The numpy chain's output per segment.
         pairs: The phase selections.
         dtype: numpy dtype the signals are fed in as.
+        leg_alignment: The mode both chains are run at; *reference* must be the numpy output at
+            the same mode.
 
     Returns:
         ``{block: {'e_inf': ..., 'e_2': ...}}``.
@@ -721,6 +1087,7 @@ def _gate(
         raw_segments["up"][:GATE_SEGMENTS].astype(dtype),
         pairs["fhr_ph"],
         pairs["up_ph"],
+        leg_alignment=leg_alignment,
     )
     worst: Dict[str, Dict[str, float]] = {}
     for index, expected in enumerate(reference):
@@ -763,6 +1130,80 @@ def test_the_torch_chain_reproduces_numpy_in_float32(
         assert errors["e_2"] <= GATE_FLOAT32["e_2"], f"{name} {errors}"
 
 
+def test_the_torch_default_leg_alignment_is_bitwise_the_unaligned_block(
+    torch_bank_f64: CausalTorchBank,
+    raw_segments: Dict[str, np.ndarray],
+    phase_pairs: Dict[str, np.ndarray],
+) -> None:
+    """Asking for nothing and asking for ``'none'`` are the same tensor, bit for bit.
+
+    Every shard on disk was built through the no-argument call, so the default carries the whole
+    weight of "adding the mode changed no stored value". Bitwise rather than to a tolerance,
+    because the ``'none'`` branch must not merely round to the old result -- it must *be* it,
+    having taken no gather and no multiply on the way.
+    """
+    signals = torch.from_numpy(raw_segments["fhr"][:2].astype(np.float64))
+    implicit = torch_bank_f64.phase_block(signals, signals, phase_pairs["fhr_ph"])
+    explicit = torch_bank_f64.phase_block(
+        signals, signals, phase_pairs["fhr_ph"], leg_alignment="none"
+    )
+    aligned = torch_bank_f64.phase_block(
+        signals, signals, phase_pairs["fhr_ph"], leg_alignment="envelope"
+    )
+    assert torch.equal(implicit, explicit)
+    # Not vacuous: the aligned mode really does move the block it is asked to move.
+    assert not torch.equal(implicit, aligned)
+
+    with pytest.raises(ValueError, match="unknown leg_alignment 'delay'"):
+        torch_bank_f64.phase_block(
+            signals, signals, phase_pairs["fhr_ph"], leg_alignment="delay"
+        )
+
+
+def test_the_torch_chain_reproduces_numpy_aligned_in_float64(
+    torch_bank_f64: CausalTorchBank,
+    raw_segments: Dict[str, np.ndarray],
+    numpy_reference_aligned: List[Dict[str, np.ndarray]],
+    phase_pairs: Dict[str, np.ndarray],
+) -> None:
+    r"""The alignment, gated -- two independent implementations of one per-pair shift.
+
+    This is exactly the risk the gate exists for. The two paths delay the conjugated leg through
+    different primitives (``take_along_axis`` against ``torch.gather``) and de-rotate it in
+    different precisions, so an off-by-one in either index arithmetic, or a sign flip in either
+    phasor, breaks the agreement here rather than showing up as a shard that looks plausible.
+    """
+    worst = _gate(
+        torch_bank_f64, raw_segments, numpy_reference_aligned, phase_pairs, np.float64,
+        leg_alignment="envelope",
+    )
+    for name, errors in worst.items():
+        assert errors["e_inf"] <= GATE_FLOAT64["e_inf"], f"{name} {errors}"
+        assert errors["e_2"] <= GATE_FLOAT64["e_2"], f"{name} {errors}"
+
+
+def test_the_torch_chain_reproduces_numpy_aligned_in_float32(
+    torch_bank: CausalTorchBank,
+    raw_segments: Dict[str, np.ndarray],
+    numpy_reference_aligned: List[Dict[str, np.ndarray]],
+    phase_pairs: Dict[str, np.ndarray],
+) -> None:
+    r"""The aligned mode at build precision, against the same bound the unaligned mode meets.
+
+    The de-rotation is where single precision could plausibly have cost something: the phasor's
+    angle reaches $9.6$ turns, and evaluating $e^{\,i2\pi\xi_j s}$ in float32 would lose about four
+    digits of it. It does not, because both chains take the phasor from the float64 numpy bank and
+    round it once -- and that is what this bound is checking.
+    """
+    worst = _gate(
+        torch_bank, raw_segments, numpy_reference_aligned, phase_pairs, np.float32,
+        leg_alignment="envelope",
+    )
+    for name, errors in worst.items():
+        assert errors["e_inf"] <= GATE_FLOAT32["e_inf"], f"{name} {errors}"
+        assert errors["e_2"] <= GATE_FLOAT32["e_2"], f"{name} {errors}"
+
+
 def test_a_pointwise_relative_error_would_be_unbounded_on_this_data(
     numpy_reference: List[Dict[str, np.ndarray]]
 ) -> None:
@@ -782,30 +1223,42 @@ def test_the_gate_fails_on_a_perturbed_kernel(
     causal_bank: CausalBank,
     raw_segments: Dict[str, np.ndarray],
     numpy_reference: List[Dict[str, np.ndarray]],
+    numpy_reference_aligned: List[Dict[str, np.ndarray]],
     phase_pairs: Dict[str, np.ndarray],
 ) -> None:
     """The control. A gate that cannot fail proves nothing, so one kernel is deliberately moved.
 
     The perturbation is small -- a part in a thousand on one of 42 filters -- and it must still
-    break **both** metrics on the blocks that read that filter.
+    break **both** metrics on the blocks that read that filter, at **both** leg-alignment modes.
+    Run aligned as well because the alignment inserts a gather and a multiply between the
+    convolution and the product, and a gate that had stopped depending on the kernel there would
+    otherwise pass while measuring nothing.
     """
     perturbed = dataclasses.replace(causal_bank, psi=causal_bank.psi.copy())
     perturbed.psi[10] *= 1.001
     bank = CausalTorchBank(perturbed, "cpu", dtype=torch.complex128)
 
-    worst = _gate(bank, raw_segments, numpy_reference, phase_pairs, np.float64)
-    assert worst["fhr_st"]["e_inf"] > GATE_FLOAT64["e_inf"]
-    assert worst["fhr_st"]["e_2"] > GATE_FLOAT64["e_2"]
-    assert worst["fhr_ph"]["e_inf"] > GATE_FLOAT64["e_inf"]
-    assert worst["fhr_ph"]["e_2"] > GATE_FLOAT64["e_2"]
+    for mode, reference in (
+        ("none", numpy_reference), ("envelope", numpy_reference_aligned)
+    ):
+        worst = _gate(
+            bank, raw_segments, reference, phase_pairs, np.float64, leg_alignment=mode
+        )
+        assert worst["fhr_st"]["e_inf"] > GATE_FLOAT64["e_inf"], mode
+        assert worst["fhr_st"]["e_2"] > GATE_FLOAT64["e_2"], mode
+        assert worst["fhr_ph"]["e_inf"] > GATE_FLOAT64["e_inf"], mode
+        assert worst["fhr_ph"]["e_2"] > GATE_FLOAT64["e_2"], mode
 
 
 @requires_cuda
+@pytest.mark.parametrize("leg_alignment", ("none", "envelope"))
 def test_the_gate_holds_on_the_device_the_build_runs_on(
     causal_bank: CausalBank,
     raw_segments: Dict[str, np.ndarray],
     numpy_reference: List[Dict[str, np.ndarray]],
+    numpy_reference_aligned: List[Dict[str, np.ndarray]],
     phase_pairs: Dict[str, np.ndarray],
+    leg_alignment: str,
 ) -> None:
     """cuFFT is not MKL, and the dataset is built on a GPU.
 
@@ -813,9 +1266,16 @@ def test_the_gate_holds_on_the_device_the_build_runs_on(
     near $2\\times10^{-6}$ against the CPU's $1.4\\times10^{-6}$ -- which is inside the bound and
     would not have been inside a bound set from the CPU figure alone. Runs wherever a device
     exists, which includes the production box.
+
+    Parametrised over both leg-alignment modes because the aligned one is the only place in the
+    chain that gathers along the time axis with a broadcast index, and a gather is exactly the
+    operation whose device implementation is not the CPU's.
     """
+    reference = numpy_reference if leg_alignment == "none" else numpy_reference_aligned
     bank = CausalTorchBank(causal_bank, "cuda:0")
-    worst = _gate(bank, raw_segments, numpy_reference, phase_pairs, np.float32)
+    worst = _gate(
+        bank, raw_segments, reference, phase_pairs, np.float32, leg_alignment=leg_alignment
+    )
     for name, errors in worst.items():
         assert errors["e_inf"] <= GATE_FLOAT32["e_inf"], f"{name} {errors}"
         assert errors["e_2"] <= GATE_FLOAT32["e_2"], f"{name} {errors}"

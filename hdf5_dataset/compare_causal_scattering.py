@@ -72,22 +72,31 @@ import numpy as np
 from hdf5_dataset.causal_scattering import (
     CAUSAL_KERNEL_TAPS,
     GAMMATONE_ORDER,
+    LEG_ALIGNMENT_MODES,
     CausalBank,
     CausalChannelPlan,
     assert_matches_shard,
     build_causal_bank,
     build_channel_plan,
     build_truncated_morlet_bank,
+    causal_convolve,
+    causal_smooth,
     causal_support_samples,
     embed_on_two_sided_axis,
     future_energy_fraction,
     half_power_half_width,
+    leg_alignment_shift,
+    pair_leg_skew,
     phase_block_causal,
     phase_block_two_sided,
+    phase_products,
+    production_padding,
+    reflect_pad,
     response_summary,
     scattering_block_causal,
     scattering_block_two_sided,
     selected_pairs,
+    two_sided_responses,
     two_sided_taps,
 )
 from hdf5_dataset.hdf5_dataset import CAUSAL, TWO_SIDED, resolve_transform
@@ -241,7 +250,8 @@ def _arm_b(
 
 
 def _arm_c(
-    fhr: np.ndarray, up: np.ndarray, bank: CausalBank, pairs: Dict[str, np.ndarray]
+    fhr: np.ndarray, up: np.ndarray, bank: CausalBank, pairs: Dict[str, np.ndarray],
+    *, leg_alignment: str = LEG_ALIGNMENT_MODES[0],
 ) -> Dict[str, np.ndarray]:
     """Arm C for one segment.
 
@@ -250,6 +260,11 @@ def _arm_c(
         up: Raw uterine pressure, ``(n_signal,)``.
         bank: The causal bank.
         pairs: ``{'fhr_ph': ..., 'up_ph': ...}`` pair index arrays.
+        leg_alignment: The phase-harmonic operator the two phase blocks are built with. Defaults
+            to ``'none'``, which is what every shard on disk holds and what the shipped invocation
+            of this tool has always measured; ``'envelope'`` makes the *whole* study -- the gate,
+            the leakage control, the figures and the three correlation columns -- describe the
+            aligned arm instead. The scattering blocks are untouched by it either way.
 
     Returns:
         The four blocks, each ``(n_channels, 330)``.
@@ -257,8 +272,10 @@ def _arm_c(
     return {
         "fhr_st": scattering_block_causal(fhr, bank),
         "up_st": scattering_block_causal(up, bank),
-        "fhr_ph": phase_block_causal(fhr, fhr, pairs["fhr_ph"], bank),
-        "up_ph": phase_block_causal(up, up, pairs["up_ph"], bank),
+        "fhr_ph": phase_block_causal(fhr, fhr, pairs["fhr_ph"], bank,
+                                     leg_alignment=leg_alignment),
+        "up_ph": phase_block_causal(up, up, pairs["up_ph"], bank,
+                                    leg_alignment=leg_alignment),
     }
 
 
@@ -539,6 +556,8 @@ def measure_leakage(
     causal: CausalBank,
     pairs: Dict[str, np.ndarray],
     edit_time_s: float,
+    *,
+    leg_alignment: str = LEG_ALIGNMENT_MODES[0],
 ) -> Dict[str, Any]:
     r"""The direct test: edit the signal only in the future and see what moves in the past.
 
@@ -556,6 +575,9 @@ def measure_leakage(
         causal: The causal bank.
         pairs: Pair index arrays.
         edit_time_s: $t_0$; the edit occupies $t > t_0$ only.
+        leg_alignment: The phase-harmonic operator arm C is built with. The alignment adds a delay
+            and a pointwise complex multiply, neither of which can read forward, so the floor
+            below must hold at either setting -- which is the point of running it at both.
 
     Returns:
         Per-arm past-side movement curves and their maxima.
@@ -575,7 +597,7 @@ def measure_leakage(
 
     for label, compute in (
         ("two_sided", lambda x: _arm_b(x, x, bank, pairs, production=False)),
-        ("causal", lambda x: _arm_c(x, x, causal, pairs)),
+        ("causal", lambda x: _arm_c(x, x, causal, pairs, leg_alignment=leg_alignment)),
     ):
         base, moved = compute(fhr), compute(edited)
         curves[label] = {}
@@ -653,6 +675,8 @@ def measure_delay(
     pairs: Dict[str, np.ndarray],
     filters: Dict[str, Any],
     max_lag: int,
+    *,
+    leg_alignment: str = LEG_ALIGNMENT_MODES[0],
 ) -> Dict[str, Any]:
     r"""Per-channel realised delay of the causal arm against the two-sided one.
 
@@ -672,6 +696,9 @@ def measure_delay(
         pairs: Pair index arrays.
         filters: Output of :func:`measure_filters`, for the per-channel warm-up.
         max_lag: Largest lag searched, in steps.
+        leg_alignment: The phase-harmonic operator arm C is built with. The three correlations
+            below describe *that* arm; :func:`measure_leg_alignment` reports the envelope one
+            beside them regardless, on these same segments.
 
     Returns:
         Per-block arrays of median best lag and mean correlations.
@@ -688,7 +715,7 @@ def measure_delay(
 
     for index in range(fhr.shape[0]):
         arm_b = _arm_b(fhr[index], up[index], bank, pairs, production=False)
-        arm_c = _arm_c(fhr[index], up[index], causal, pairs)
+        arm_c = _arm_c(fhr[index], up[index], causal, pairs, leg_alignment=leg_alignment)
         for name in BLOCKS:
             lags, r_best, r_pred, r_zero = [], [], [], []
             for channel in range(arm_b[name].shape[0]):
@@ -720,6 +747,194 @@ def measure_delay(
         for name, values in accumulated.items()
     }
 
+
+def _complex_phase_blocks(
+    signal: np.ndarray,
+    bank: Any,
+    causal: CausalBank,
+    selection: np.ndarray,
+) -> Tuple[np.ndarray, np.ndarray]:
+    r"""The centred and envelope-aligned phase products of one signal, **before** $\Re\{\cdot\}$.
+
+    Both shipped phase blocks discard the imaginary part, and the rotation this function exists to
+    measure lives entirely in it: a coefficient that is the centred one rotated by $180^{\circ}$
+    has a *correlation* of $-1$ and a *coherence* of $1$, and only the second says that the repair
+    worked and a calibration constant is all that is missing. So the two blocks are rebuilt here
+    from the same public pieces the shipped ones use, stopping one step short of the real part.
+
+    Args:
+        signal: One raw segment, ``(n_signal,)``.
+        bank: The production two-sided bank.
+        causal: The causal bank.
+        selection: ``(n_pairs, 2)`` of $(i, j)$ for one phase block.
+
+    Returns:
+        ``(centred, aligned)``, each ``(n_pairs, n_signal // DECIMATION)`` complex.
+    """
+    n_signal = int(signal.shape[-1])
+    two_sided = two_sided_responses(signal, bank)
+    # `smooth_products_exact`, one step short of its `.real`: the same reflect-pad, the same
+    # spectrum, the same slice, so the real part of what comes back *is* the shipped arm-B block.
+    pad_left, pad_right, _ = production_padding(n_signal)
+    padded = reflect_pad(
+        phase_products(two_sided, two_sided, selection, bank.xi), pad_left, pad_right
+    )
+    smoothed = np.fft.ifft(np.fft.fft(padded, axis=-1) * bank.phi[None, :], axis=-1)
+    centred = smoothed[:, pad_left : pad_left + n_signal][:, ::DECIMATION]
+
+    responses = causal_convolve(signal, causal.psi)
+    product = phase_products(
+        responses, responses, selection, causal.xi,
+        leg_shift=leg_alignment_shift(causal, selection),
+    )
+    aligned = causal_smooth(product, causal.phi)[:, ::DECIMATION]
+    return centred, aligned
+
+
+def _coherence_at_lag(
+    centred: np.ndarray, aligned: np.ndarray, start: int, lag: int
+) -> complex:
+    r"""Complex coherence of one aligned channel against its centred twin at one lag.
+
+    $$\rho = \frac{\sum_t \overline{b_t}\,a_t}{\lVert a\rVert\,\lVert b\rVert},
+      \qquad a = \text{centred}[t],\ b = \text{aligned}[t + \ell],$$
+
+    mean-removed on both sides so it is the correlation of the fluctuations rather than of the
+    means. $\lvert\rho\rvert$ says how much of the centred coefficient the aligned one reproduces;
+    $\arg\rho$ is the residual rotation that $\Re\{\cdot\}$ turns into a sign.
+
+    **The sign convention is the calibration's.** The *aligned* leg is the conjugated one, so
+    $\arg\rho$ is the angle a future readout would rotate the aligned coefficient **by** to land
+    on the centred one -- multiply by $e^{\,i\arg\rho}$, not by its inverse. A reader comparing
+    against a table that formed $\rho$ the other way round will see every angle negated.
+
+    Args:
+        centred: One centred channel, ``(n_steps,)`` complex.
+        aligned: One aligned causal channel, same shape.
+        start: First step past that channel's warm-up.
+        lag: The predicted delay in steps.
+
+    Returns:
+        The complex coherence, or ``nan`` on a channel with no usable overlap.
+    """
+    lag = int(min(max(lag, 0), max(centred.shape[-1] - start - 9, 0)))
+    a = centred[start : centred.shape[-1] - lag] if lag else centred[start:]
+    b = aligned[start + lag :]
+    if a.size < 8 or b.size < 8:
+        return complex("nan")
+    a = a - a.mean()
+    b = b - b.mean()
+    scale = float(np.linalg.norm(a)) * float(np.linalg.norm(b))
+    if scale < 1e-30:
+        return complex("nan")
+    return complex(np.vdot(b, a) / scale)
+
+
+def measure_leg_alignment(
+    fhr: np.ndarray,
+    up: np.ndarray,
+    bank: Any,
+    causal: CausalBank,
+    pairs: Dict[str, np.ndarray],
+    filters: Dict[str, Any],
+) -> Dict[str, Dict[str, np.ndarray]]:
+    r"""What the envelope alignment does to the two phase blocks, per channel.
+
+    Six per-channel quantities, on the **same** segments and under the **same** warm-up
+    restriction :func:`measure_delay` uses, so the aligned column and the shipped one beside it in
+    ``per_channel.csv`` differ in the operator and in nothing else.
+
+    Three are properties of the bank alone -- the intra-pair skew, the integer shift that removes
+    it, and the harmonic ratio the skew scales with. Three are measured against the centred block
+    at the predicted delay: the correlation, which is what the shipped columns report for the
+    unaligned arm; the **complex coherence magnitude**, which is the same comparison before
+    $\Re\{\cdot\}$; and the **residual rotation**, with its concentration across segments.
+
+    **The rotation is recorded and never applied.** Its mechanism is the branch cut: $[y]^{p}$
+    uses the principal argument, so an unwrapped phase $\Psi = \operatorname{Arg} + 2\pi m$
+    contributes a factor $e^{-i2\pi p\,m(t)}$ which is $1$ for integer $p$ and not otherwise. A
+    causal leg and a centred one do not share a wrap count, so on the $p = 2^{6/4}$ family the two
+    blocks differ by a per-channel constant rotation that no shift can remove. Under $8^{\circ}$
+    on the two integer families; a concentrated constant on the third, which a future readout
+    could calibrate out and which nothing here does.
+
+    The scattering blocks carry no pairs and get ``nan`` rows, so the CSV keeps one row per stored
+    channel of every block rather than a ragged shape.
+
+    Args:
+        fhr: Raw fetal heart rate, ``(n_segments, n_signal)``.
+        up: Raw uterine pressure, same shape.
+        bank: The production filter bank.
+        causal: The causal bank.
+        pairs: Pair index arrays.
+        filters: Output of :func:`measure_filters`, for the per-channel warm-up.
+
+    Returns:
+        ``{block: {'pair_skew_s', 'leg_shift_samples', 'harmonic_power',
+        'r_at_predicted_lag_envelope', 'coherence_abs_envelope',
+        'coherence_deg_envelope', 'coherence_concentration_envelope'}}``, each ``(n_channels,)``.
+    """
+    warmup = _channel_warmup_steps(pairs, filters)
+    predicted = _predicted_channel_delay(filters, pairs)
+    predicted_steps = {
+        name: np.round(np.asarray(values) * FS / DECIMATION).astype(int)
+        for name, values in predicted.items()
+    }
+
+    measured: Dict[str, Dict[str, np.ndarray]] = {}
+    for name in BLOCKS:
+        width = len(warmup[name])
+        if name in SCATTERING_BLOCKS:
+            blank = np.full(width, np.nan)
+            measured[name] = {
+                key: blank.copy() for key in (
+                    "pair_skew_s", "leg_shift_samples", "harmonic_power",
+                    "r_at_predicted_lag_envelope", "coherence_abs_envelope",
+                    "coherence_deg_envelope", "coherence_concentration_envelope",
+                )
+            }
+            continue
+
+        selection = pairs[name]
+        signals = fhr if name == "fhr_ph" else up
+        skew = pair_leg_skew(causal, selection)
+        shift, _ = leg_alignment_shift(causal, selection)
+
+        correlations: List[np.ndarray] = []
+        coherences: List[np.ndarray] = []
+        for index in range(signals.shape[0]):
+            centred, aligned = _complex_phase_blocks(signals[index], bank, causal, selection)
+            per_channel = []
+            per_correlation = []
+            for channel in range(selection.shape[0]):
+                start = min(int(warmup[name][channel]), centred.shape[1] - 32)
+                lag = int(predicted_steps[name][channel])
+                per_channel.append(_coherence_at_lag(centred[channel], aligned[channel],
+                                                     start, lag))
+                per_correlation.append(_best_lag(
+                    centred[channel].real[start:], aligned[channel].real[start:], 0, lag
+                )[2])
+            coherences.append(np.asarray(per_channel))
+            correlations.append(np.asarray(per_correlation))
+
+        stacked = np.stack(coherences)
+        # Circular concentration of the rotation across segments: the resultant length of the
+        # unit phasors. Near 1 means a per-channel constant a calibration could remove; near 0
+        # means a signal-dependent rotation, which nothing could.
+        unit = np.exp(1j * np.angle(stacked))
+        concentration = np.abs(np.nanmean(unit, axis=0))
+        mean_rho = np.nanmean(stacked, axis=0)
+
+        measured[name] = {
+            "pair_skew_s": skew,
+            "leg_shift_samples": shift.astype(float),
+            "harmonic_power": bank.hz[selection[:, 1]] / bank.hz[selection[:, 0]],
+            "r_at_predicted_lag_envelope": np.nanmean(np.stack(correlations), axis=0),
+            "coherence_abs_envelope": np.abs(mean_rho),
+            "coherence_deg_envelope": np.degrees(np.angle(mean_rho)),
+            "coherence_concentration_envelope": concentration,
+        }
+    return measured
 
 def _channel_hz_by_block(bank: Any, pairs: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
     r"""Representative centre frequency per stored channel, for the panel axes.
@@ -949,6 +1164,11 @@ def build_parser() -> argparse.ArgumentParser:
                         help="t0 for the leakage test, in seconds. Default: 600")
     parser.add_argument("--max-lag-steps", dest="max_lag_steps", type=int,
                         help="Largest lag searched for the delay estimate. Default: 200")
+    parser.add_argument("--leg-alignment", dest="leg_alignment",
+                        choices=LEG_ALIGNMENT_MODES,
+                        help="Phase-harmonic leg alignment arm C is measured at. Default: none, "
+                             "which is what every shard on disk holds. The envelope-aligned "
+                             "diagnostic columns are written either way.")
     return parser
 
 
@@ -964,6 +1184,7 @@ def main(
     kernel_taps: Optional[int] = None,
     edit_time_s: Optional[float] = None,
     max_lag_steps: Optional[int] = None,
+    leg_alignment: Optional[str] = None,
     argument_sources: Optional[Dict[str, str]] = None,
 ) -> int:
     """Run the comparison, or the self-test, and write the artifacts.
@@ -979,6 +1200,10 @@ def main(
         kernel_taps: Causal kernel length.
         edit_time_s: $t_0$ for the leakage test.
         max_lag_steps: Largest lag searched.
+        leg_alignment: Phase-harmonic leg alignment arm C is measured at, throughout: the
+            validation gate, the leakage control, the figures and the three correlation columns.
+            The seven envelope-aligned diagnostic columns are written regardless, so the shipped
+            invocation produces the comparison in one file.
         argument_sources: Provenance from the launch merge, recorded in ``summary.json``.
 
     Returns:
@@ -994,6 +1219,7 @@ def main(
     kernel_taps = kernel_taps or CAUSAL_KERNEL_TAPS
     edit_time_s = 600.0 if edit_time_s is None else edit_time_s
     max_lag_steps = max_lag_steps or 200
+    leg_alignment = leg_alignment or LEG_ALIGNMENT_MODES[0]
 
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     logger.info("building the production bank and its causal counterparts")
@@ -1038,9 +1264,13 @@ def main(
         stored, fhr, up, bank, pairs, variant=variant, causal=causal, plan=plan
     )
     logger.info("running the leakage test")
-    leakage = measure_leakage(fhr[0], bank, causal, pairs, edit_time_s)
+    leakage = measure_leakage(fhr[0], bank, causal, pairs, edit_time_s,
+                              leg_alignment=leg_alignment)
     logger.info(f"measuring per-channel delay over {n_samples} segments")
-    delay = measure_delay(fhr, up, bank, causal, pairs, filters, max_lag_steps)
+    delay = measure_delay(fhr, up, bank, causal, pairs, filters, max_lag_steps,
+                          leg_alignment=leg_alignment)
+    logger.info("measuring the envelope alignment and its residual rotation")
+    alignment = measure_leg_alignment(fhr, up, bank, causal, pairs, filters)
     logger.info("resolving budgets for both arms")
     survivorship = measure_survivorship(filters, pairs, DEFAULT_BUDGETS)
 
@@ -1053,12 +1283,12 @@ def main(
 
     logger.info("writing figures")
     arm_b = _arm_b(fhr[0], up[0], bank, pairs, production=False)
-    arm_c = _arm_c(fhr[0], up[0], causal, pairs)
+    arm_c = _arm_c(fhr[0], up[0], causal, pairs, leg_alignment=leg_alignment)
     write_all_figures(
         output_dir, bank, causal, naive, filters, leakage, delay, survivorship,
         traces=(fhr[0], up[0], arm_b, arm_c), showcase=SHOWCASE_FILTERS,
     )
-    _write_per_channel(output_dir, bank, filters, delay, pairs)
+    _write_per_channel(output_dir, bank, filters, delay, pairs, alignment)
 
     panel_indices: List[Tuple[int, str]] = []
     if n_panels > 0:
@@ -1077,7 +1307,8 @@ def main(
                 "up": panel_up[position],
                 "arm_b": _arm_b(panel_fhr[position], panel_up[position], bank, pairs,
                                 production=False),
-                "arm_c": _arm_c(panel_fhr[position], panel_up[position], causal, pairs),
+                "arm_c": _arm_c(panel_fhr[position], panel_up[position], causal, pairs,
+                            leg_alignment=leg_alignment),
             })
         write_sample_panels(
             output_dir, panels, _channel_warmup_steps(pairs, filters),
@@ -1092,6 +1323,7 @@ def main(
             "sample_index": sample_index, "n_panels": n_panels, "order": order,
             "kernel_taps": kernel_taps,
             "edit_time_s": edit_time_s, "max_lag_steps": max_lag_steps,
+            "leg_alignment": leg_alignment,
         },
         "shard_transform": variant,
         # Read off the shard's own blocks, not off the channel plan: the plan describes what a
@@ -1143,6 +1375,7 @@ def _write_per_channel(
     filters: Dict[str, Any],
     delay: Dict[str, Any],
     pairs: Dict[str, np.ndarray],
+    alignment: Dict[str, Dict[str, np.ndarray]],
 ) -> None:
     """Write one CSV row per (block, channel) with every per-channel measurement.
 
@@ -1167,6 +1400,14 @@ def _write_per_channel(
         "bw3db_two_sided_hz", "bw3db_causal_hz", "dc_gain_rel", "neg_freq_gain_rel",
         "causal_warmup_steps", "measured_lag_steps", "measured_lag_s",
         "r_at_best_lag", "r_at_predicted_lag", "r_at_zero_lag",
+        # The leg alignment, from `measure_leg_alignment`. The first three are properties of the
+        # bank and the pair list; the last four are measured against the centred block on the same
+        # segments and under the same warm-up restriction as the three columns above them, so the
+        # aligned arm and the shipped one are comparable row for row. All seven are nan on the
+        # scattering blocks, which have no pairs and no skew.
+        "pair_skew_s", "leg_shift_samples", "harmonic_power",
+        "r_at_predicted_lag_envelope", "coherence_abs_envelope",
+        "coherence_deg_envelope", "coherence_concentration_envelope",
     ]
 
     with open(os.path.join(output_dir, "per_channel.csv"), "w", newline="", encoding="utf-8") as fh:
@@ -1176,6 +1417,7 @@ def _write_per_channel(
             reach = reach_by_block[block]
             causal_delay = causal_by_block[block]
             measured = delay[block]
+            aligned = alignment[block]
             for channel in range(len(reach)):
                 if block in SCATTERING_BLOCKS:
                     # Channel 0 is S_0 and has no centre frequency; the rest index the bank
@@ -1205,6 +1447,15 @@ def _write_per_channel(
                     "r_at_best_lag": f"{measured['r_at_best_lag'][channel]:.4f}",
                     "r_at_predicted_lag": f"{measured['r_at_predicted_lag'][channel]:.4f}",
                     "r_at_zero_lag": f"{measured['r_at_zero_lag'][channel]:.4f}",
+                    "pair_skew_s": f"{aligned['pair_skew_s'][channel]:.3f}",
+                    "leg_shift_samples": f"{aligned['leg_shift_samples'][channel]:.0f}",
+                    "harmonic_power": f"{aligned['harmonic_power'][channel]:.4f}",
+                    "r_at_predicted_lag_envelope":
+                        f"{aligned['r_at_predicted_lag_envelope'][channel]:.4f}",
+                    "coherence_abs_envelope": f"{aligned['coherence_abs_envelope'][channel]:.4f}",
+                    "coherence_deg_envelope": f"{aligned['coherence_deg_envelope'][channel]:.1f}",
+                    "coherence_concentration_envelope":
+                        f"{aligned['coherence_concentration_envelope'][channel]:.4f}",
                 })
 
 
@@ -1350,6 +1601,7 @@ RUN_ARGS: Dict[str, Any] = {
     "kernel_taps": None,    # causal kernel length; default 32768 (see CAUSAL_KERNEL_TAPS)
     "edit_time_s": None,    # t0 for the leakage test, seconds; default 600
     "max_lag_steps": None,  # largest lag searched for the delay estimate; default 200
+    "leg_alignment": None,  # arm C's phase-harmonic leg alignment; default "none"
 }
 
 

@@ -12,7 +12,7 @@ the reason is not the target domain -- the target *is* its target -- but the anc
 implementation tiles with :func:`~teb_vae.lag_attn.figure_primitives.concat_single_forecasts`, which
 walks ``range(warmup, t_valid, horizon)`` and reads ``mu_pred[t]`` at each **anchor** $t$; this
 model's forecast is $(A_{\max}, H, R)$ indexed by *position in the decoded set*. At the shipped
-geometry that is $152$ dense positions read at anchors $133 \dots 284$, so the first index is already
+geometry that is $137$ dense positions read at anchors $133 \dots 269$, so the first index is already
 out of range and the page dies inside a handler that warns and continues -- a whole run with an empty
 diagnostics directory and one log line. Where it does not raise it is worse: at a smaller floor it
 draws a real forecast at the wrong time, with no exception anywhere in it. The tiling is therefore

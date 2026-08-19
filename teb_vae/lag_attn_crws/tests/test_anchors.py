@@ -359,26 +359,26 @@ def test_the_forward_returns_the_anchors_it_decoded(model) -> None:
 # The shipped geometry
 # =================================================================================================
 def test_the_shipped_geometry_tiles_as_the_budget_predicts() -> None:
-    r"""$F = 133$, $S = H = 15$, $T_{\mathrm{valid}} = 285$: eleven tiles at $\varphi \le 1$ and ten
-    otherwise, mean $152/15$; and the dense validation resolution is $152$."""
+    r"""$F = 133$, $S = H = 30$, $T_{\mathrm{valid}} = 270$: five tiles at $\varphi \le 16$ and four
+    otherwise, mean $137/30$; and the dense validation resolution is $137$."""
     torch.manual_seed(0)
     model = SeqVaeLagAttnCrws(**shipped_warmup_kwargs()).eval()
     floor, t_valid, stride = _geometry(model)
-    assert (floor, t_valid, stride) == (133, 285, 15)
+    assert (floor, t_valid, stride) == (133, 270, 30)
 
     counts = []
     for phase in range(stride):
         _index, valid = model._build_anchor_index(
             batch=1, device=torch.device("cpu"), anchor_phase=phase
         )
-        assert tuple(valid.shape) == (1, 11)
+        assert tuple(valid.shape) == (1, 5)
         counts.append(int(valid.sum()))
 
-    assert counts[:2] == [11, 11] and set(counts[2:]) == {10}
-    assert sum(counts) == t_valid - floor == 152
+    assert counts[:17] == [5] * 17 and set(counts[17:]) == {4}
+    assert sum(counts) == t_valid - floor == 137
 
     dense, valid = model._build_anchor_index(
         batch=1, device=torch.device("cpu"), anchor_stride=1
     )
-    assert tuple(dense.shape) == (1, 152) and bool(valid.all())
-    assert int(dense[0, 0]) == 133 and int(dense[0, -1]) == 284
+    assert tuple(dense.shape) == (1, 137) and bool(valid.all())
+    assert int(dense[0, 0]) == 133 and int(dense[0, -1]) == 269

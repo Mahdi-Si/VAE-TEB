@@ -3,8 +3,8 @@
 # NOT a sweep arm and not a result config. It exists because the two loss-scale constants this cell
 # inherits -- `advanced_config.trainer.gradient_clip_val` and
 # `advanced_config.spike_breaker.additive_margin` -- are both stated in units of the summed block
-# and neither transfers: this cell's block is H * R = 15 * 16 = 240 raw samples against the
-# comparison model's 480, and it decodes about 10.1 anchors per training step against roughly 240.
+# and neither transfers: this cell's block is H * R = 30 * 16 = 480 raw samples against the
+# comparison model's 480, and it decodes about 4.57 anchors per training step against roughly 240.
 # The two changes push the gradient distribution in OPPOSITE directions, so the constants have to be
 # measured rather than scaled, and nothing else in this package produces the distribution to measure
 # them from.

@@ -47,6 +47,7 @@ from .causal_scattering import (
     N_RAW,
     CausalBank,
     CausalChannelPlan,
+    resolve_leg_alignment,
 )
 
 #: Pad modes offering an assumed pre-recording history. ``'edge'`` replicates $x(0)$, asserting
@@ -317,6 +318,7 @@ class CausalTorchBank:
         *,
         decimation: int = DECIMATION,
         pad: str = "edge",
+        leg_alignment: str = "none",
     ) -> torch.Tensor:
         r"""Phase-harmonic correlations $\Phi_{ij} = \Re\{([y_i]^{p_{ij}}\overline{y_j}) \star \phi\}$.
 
@@ -338,12 +340,24 @@ class CausalTorchBank:
                 selection it writes the ``sel_*`` provenance from.
             decimation: Subsampling factor applied once, at the end.
             pad: History supplied before $t = 0$.
+            leg_alignment: ``'none'`` or ``'envelope'``; see
+                :data:`~hdf5_dataset.causal_scattering.LEG_ALIGNMENT_MODES`. The shift and its
+                de-rotation phasor come from the shared numpy bank rather than being recomputed
+                here, which is what keeps the two implementations from drifting -- and is not only
+                a tidiness argument: the phasor's angle reaches $9.6$ turns, so evaluating
+                $e^{\,i2\pi\xi_j s}$ in this module's single precision would lose four digits that
+                a float64 evaluation rounded once does not.
 
         Returns:
             ``(B, n_pairs, n_signal // decimation)`` real.
+
+        Raises:
+            ValueError: On an unknown *leg_alignment*.
         """
         index = torch.as_tensor(np.asarray(pairs, dtype=np.int64).reshape(-1, 2),
                                 device=self.device)
+        # Resolved before the empty-pair return, so an unknown mode is refused either way.
+        leg_shift = resolve_leg_alignment(self.bank, pairs, leg_alignment)
         if index.shape[0] == 0:
             return torch.zeros(
                 (x_low.shape[0], 0, self.n_signal // decimation),
@@ -356,10 +370,39 @@ class CausalTorchBank:
         )
         low = responses_low[:, index[:, 0], :]
         high = responses_high[:, index[:, 1], :]
+        if leg_shift is not None:
+            high = self._align_leg(high, *leg_shift)
         power = (self._xi[index[:, 1]] / self._xi[index[:, 0]])[None, :, None]
         accelerated = torch.polar(torch.abs(low), power * torch.angle(low))
         smoothed = self.smooth_complex(accelerated * torch.conj(high), pad)
         return smoothed.real[..., ::decimation]
+
+    def _align_leg(
+        self, high: torch.Tensor, shift: np.ndarray, phasor: np.ndarray
+    ) -> torch.Tensor:
+        r"""Delay each **already-gathered** conjugated leg and de-rotate its carrier.
+
+        No restructuring is needed here, unlike the numpy reference: the gather onto the pair axis
+        has already happened above, so ``high`` is one row per pair and the per-pair shift lands
+        directly on it.
+
+        Args:
+            high: ``(B, n_pairs, n_signal)`` complex, the gathered conjugated legs.
+            shift: ``(n_pairs,)`` integer raw-sample shifts.
+            phasor: ``(n_pairs,)`` complex de-rotations, from the numpy bank in float64.
+
+        Returns:
+            ``(B, n_pairs, n_signal)`` complex.
+        """
+        taps = torch.arange(high.shape[-1], device=self.device)
+        # Clamping at zero is the edge replication: a tap the shift pushes before the start reads
+        # the response's first sample, which is the same assumed history the convolution ran on.
+        source = torch.clamp(
+            taps[None, :] - torch.as_tensor(shift, device=self.device)[:, None], min=0
+        )
+        delayed = torch.gather(high, -1, source[None].expand(high.shape[0], -1, -1))
+        rotation = torch.as_tensor(phasor, device=self.device).to(self._dtype)
+        return delayed * rotation[None, :, None]
 
     def transform_batch(
         self,
@@ -371,6 +414,7 @@ class CausalTorchBank:
         plan: Optional[Mapping[str, CausalChannelPlan]] = None,
         decimation: int = DECIMATION,
         pad: str = "edge",
+        leg_alignment: str = "none",
     ) -> Dict[str, torch.Tensor]:
         r"""All four stored blocks for a batch of segments, dropped to the plan's channels.
 
@@ -387,12 +431,16 @@ class CausalTorchBank:
                 the drop rule is measured against.
             decimation: Subsampling factor.
             pad: History supplied before $t = 0$.
+            leg_alignment: Applied to **both** phase blocks; it is a property of the transform a
+                shard was built with, not of one block. Defaults to ``'none'``, so a caller that
+                does not ask for the alignment gets bit-for-bit what every shard on disk holds.
 
         Returns:
             ``{'fhr_st', 'fhr_ph', 'up_st', 'up_ph'}``, each ``(B, C, n_signal // decimation)``.
 
         Raises:
-            ValueError: If a signal's length is not the length this bank was sized for.
+            ValueError: If a signal's length is not the length this bank was sized for, or on an
+                unknown *leg_alignment*.
         """
         for name, signal in (("fhr", fhr), ("up", up)):
             if int(signal.shape[-1]) != self.n_signal:
@@ -403,9 +451,11 @@ class CausalTorchBank:
 
         blocks = {
             "fhr_st": self.scattering_block(fhr, decimation=decimation, pad=pad),
-            "fhr_ph": self.phase_block(fhr, fhr, target_pairs, decimation=decimation, pad=pad),
+            "fhr_ph": self.phase_block(fhr, fhr, target_pairs, decimation=decimation, pad=pad,
+                                       leg_alignment=leg_alignment),
             "up_st": self.scattering_block(up, decimation=decimation, pad=pad),
-            "up_ph": self.phase_block(up, up, source_pairs, decimation=decimation, pad=pad),
+            "up_ph": self.phase_block(up, up, source_pairs, decimation=decimation, pad=pad,
+                                      leg_alignment=leg_alignment),
         }
         if plan is None:
             return blocks
@@ -449,6 +499,7 @@ def transform_batch_numpy(
     plan: Optional[Mapping[str, CausalChannelPlan]] = None,
     decimation: int = DECIMATION,
     pad: str = "edge",
+    leg_alignment: str = "none",
 ) -> Dict[str, np.ndarray]:
     """Transform a numpy batch and return numpy, for callers that never see a tensor.
 
@@ -464,6 +515,7 @@ def transform_batch_numpy(
         plan: The stored channel plan; ``None`` returns every channel.
         decimation: Subsampling factor.
         pad: History supplied before $t = 0$.
+        leg_alignment: Passed through to both phase blocks, defaulting to ``'none'``.
 
     Returns:
         The four blocks as numpy arrays, in the bank's real precision.
@@ -477,6 +529,7 @@ def transform_batch_numpy(
             plan=plan,
             decimation=decimation,
             pad=pad,
+            leg_alignment=leg_alignment,
         )
     return {name: value.detach().cpu().numpy() for name, value in blocks.items()}
 

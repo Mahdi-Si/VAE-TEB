@@ -1231,3 +1231,111 @@ def test_the_fixture_segments_are_verbatim_shard_rows(
     with h5py.File(SHARD_PATH, "r") as handle:
         assert np.array_equal(raw_segments["fhr"], handle["fhr"][indices])
         assert np.array_equal(raw_segments["up"], handle["up"][indices])
+
+
+def test_the_causal_file_records_which_operator_built_its_phase_blocks(
+    pipeline: Any, causal_file: Path, tmp_path_factory: pytest.TempPathFactory
+) -> None:
+    r"""``causal_leg_alignment``, on the root, on the causal variant only.
+
+    Every other constant a causal file records -- the kernel length, the gamma order, the warm-up
+    quantile, the widths, the per-channel warm-up and delay -- is either visible in the data's
+    shape or recoverable from another. The leg alignment is not: an envelope-aligned file has
+    exactly the widths, warm-ups and delays of an unaligned one and differs only in the values
+    inside its two phase blocks. If this attribute is missing, nothing anywhere can tell the two
+    apart, and a file list may mix them or a stats file normalise one with the other's constants.
+    """
+    with h5py.File(causal_file, "r") as handle:
+        assert handle.attrs["causal_leg_alignment"] == "none"
+
+    aligned_masks = pipeline.compute_scattering_masks(
+        LEN_SIGNAL, scattering_T=16, device=torch.device("cpu"),
+        transform="causal", leg_alignment="envelope",
+    )
+    aligned = tmp_path_factory.mktemp("aligned") / "causal_aligned.hdf5"
+    pipeline.create_hdf5_for_masks(str(aligned), aligned_masks, len_sequence=LEN_SEQUENCE)
+    with h5py.File(aligned, "r") as handle:
+        assert handle.attrs["causal_leg_alignment"] == "envelope"
+        # Everything else about the two files is the same, which is the point of the attribute.
+        assert {name: handle[name].shape[1] for name in EXPECTED_CAUSAL_WIDTHS} == (
+            EXPECTED_CAUSAL_WIDTHS
+        )
+
+
+def test_every_causal_block_carries_its_novelty_fraction(causal_file: Path) -> None:
+    r"""``causal_novelty_frac``: how much of each channel is drawn from unseen samples.
+
+    Per block, on the stored channel axis, in the unit interval. It says that "forecast" means
+    something different per channel -- the slowest kept target channel draws $0.25\%$ of its value
+    from the horizon it is asked to predict, the fastest all of it -- so a block score summed over
+    both mixes two claims. Both ends are pinned, because a bug that collapsed the vector to a
+    constant would look plausible at either one alone.
+    """
+    with h5py.File(causal_file, "r") as handle:
+        for field, width in EXPECTED_CAUSAL_WIDTHS.items():
+            novelty = np.asarray(handle[field].attrs["causal_novelty_frac"])
+            assert novelty.shape == (width,), field
+            assert novelty.dtype == np.float32, field
+            assert (novelty >= 0.0).all() and (novelty <= 1.0).all(), field
+
+        # $S_0$ is the low-pass alone and is entirely new over a 120 s horizon; the slowest kept
+        # wavelet, at a 791 s composed delay, is almost entirely old.
+        scattering = np.asarray(handle["fhr_st"].attrs["causal_novelty_frac"])
+        assert float(scattering[0]) == pytest.approx(1.000, abs=5e-4)
+        assert float(scattering[-1]) < 0.01
+        # A phase channel takes its slow leg's value, which is the conservative one, so both phase
+        # blocks bottom out at the reference channel's fraction rather than at their own.
+        for field in ("fhr_ph", "up_ph"):
+            assert float(
+                np.asarray(handle[field].attrs["causal_novelty_frac"]).min()
+            ) == pytest.approx(0.026, abs=5e-3), field
+
+
+def test_a_two_sided_file_carries_neither_new_causal_attribute(two_sided_file: Path) -> None:
+    """Both are gated on the causal path, which the exact-key-set tests above already enforce.
+
+    Stated separately because those tests read as being about ``sel_*`` provenance, and a future
+    reader adding a third causal attribute needs one place that says the gating is the rule rather
+    than an accident of which keys happened to be listed.
+    """
+    with h5py.File(two_sided_file, "r") as handle:
+        assert "causal_leg_alignment" not in handle.attrs
+        for field in EXPECTED_WIDTHS:
+            assert "causal_novelty_frac" not in handle[field].attrs, field
+
+
+def test_an_unknown_leg_alignment_is_refused_before_anything_is_created(
+    pipeline: Any, tmp_path: Path
+) -> None:
+    """Refused at mask time, not at transform time.
+
+    The mode reaches a root attribute as well as the operator, so a typo caught inside the
+    transform would already have created a directory of files claiming to be something they are
+    not -- and a build that runs for hours before saying so.
+    """
+    with pytest.raises(ValueError, match="unknown leg_alignment 'envelop'"):
+        pipeline.compute_scattering_masks(
+            LEN_SIGNAL, scattering_T=16, device=torch.device("cpu"),
+            transform="causal", leg_alignment="envelop",
+        )
+    assert not list(tmp_path.iterdir())
+
+
+def test_the_novelty_attribute_must_describe_the_block_it_sits_on(
+    pipeline: Any, causal_masks: Dict[str, Any], tmp_path: Path
+) -> None:
+    """A vector of the wrong length would attribute one channel's novelty to another.
+
+    It is read back as a parallel array to the warm-up, so a length disagreement is silent at
+    every later step: the numbers are plausible, the shapes broadcast, and the split by novelty
+    tertile would simply be a split by the wrong channels.
+    """
+    wrong = dict(causal_masks)
+    wrong["causal_novelty_frac"] = dict(causal_masks["causal_novelty_frac"])
+    wrong["up_ph"] = None  # unused key; present only to prove the copy is not the original
+    wrong["causal_novelty_frac"]["up_ph"] = np.zeros(3, dtype=np.float64)
+
+    with pytest.raises(ValueError, match=r"novelty fraction for 'up_ph' has 3 entries"):
+        pipeline.create_hdf5_for_masks(
+            str(tmp_path / "bad_novelty.hdf5"), wrong, len_sequence=LEN_SEQUENCE
+        )

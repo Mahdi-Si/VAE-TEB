@@ -130,10 +130,11 @@ PARITY_EXEMPT_PATHS: Dict[str, str] = {
     "model_config.VAE_model.c_y": GEOMETRY_REASON,
     "model_config.VAE_model.c_u": GEOMETRY_REASON,
     "model_config.VAE_model.warmup_period": GEOMETRY_REASON,
-    "model_config.VAE_model.horizon": (
-        "one minute rather than two: a shorter horizon lengthens T_valid and buys back anchors, "
-        "which is one of the two levers on the warm-up cost"
-    ),
+    # `horizon` is deliberately ABSENT: this cell now forecasts the comparison model's two minutes,
+    # so an exemption here would be a permission with no divergence behind it. The BLOCK matches
+    # with it -- H * R = 480 on both sides, because R is a property of the raw grid rather than of a
+    # channel budget -- which is what makes a nat comparable across the input-representation edge
+    # and is the whole of what the horizon move bought this row.
     "model_config.VAE_model.causal_reach_budget_s": (
         "null and REQUIRED null: the forward reach L95 is an energy quantile of a two-sided kernel, "
         "measured on a bank that did not produce these coefficients, and a delay is a shift"
@@ -390,7 +391,7 @@ def test_the_anchor_stride_equals_the_configured_horizon(shipped):
     that left the stride behind fails here rather than training a different objective."""
     vae = shipped["model_config"]["VAE_model"]
 
-    assert vae["anchor_stride"] == vae["horizon"] == 15
+    assert vae["anchor_stride"] == vae["horizon"] == 30
 
 
 def test_the_shipped_config_builds_a_decoder_as_wide_as_the_raw_grid(tmp_path):
@@ -409,7 +410,7 @@ def test_the_shipped_config_builds_a_decoder_as_wide_as_the_raw_grid(tmp_path):
 
     assert len(kwargs["target_keep_index"]) == 98  # the budget's reach: the INPUTS, not the target
     assert model.decoder_out_channels == model.raw_per_step == 16
-    assert model.horizon * model.geometry.r == 240
+    assert model.horizon * model.geometry.r == 480
 
 
 # --------------------------------------------------------------------------------------
@@ -465,17 +466,19 @@ def test_every_declared_parity_exemption_is_a_real_divergence(shipped, sibling):
 
 
 @pytest.mark.parametrize("path", RETUNED_PATHS)
-def test_each_retuned_constant_moved_down_from_the_comparison_models_value(shipped, sibling, path):
-    """Both are stated in units of the summed block, and this cell moves the block AND the anchor
-    count in opposite directions, so neither transfers by arithmetic and neither was scaled.
+def test_each_retuned_constant_moved_up_from_the_comparison_models_value(shipped, sibling, path):
+    """Both are stated in units of the summed block, and neither transfers by arithmetic.
 
-    The **direction** is asserted rather than only the difference, and it is the half a typo would
-    survive: the block halved, so a threshold that came back larger would be describing a model with
-    more to clip rather than less -- and both failure modes of a too-large threshold are silent, a
-    clip that never binds and an additive test that never fires."""
+    **The direction inverted when the horizon moved**, and that is what this asserts. At $H = 15$
+    this cell's block was half the comparison model's and both constants came back smaller. At
+    $H = 30$ the block is *equal* to it -- $30 \times 16 = 480$ raw samples on both sides, because
+    $R$ is a property of the raw grid -- while the anchor count is still roughly a fiftieth, so the
+    per-step gradient and the per-step excursion are both larger and both constants come back
+    bigger. The block stopped being the axis that separates these two cells; the anchor count is
+    now the whole of it."""
     assert path in PARITY_EXEMPT_PATHS
     assert PARITY_EXEMPT_PATHS[path].startswith("RETUNED")
-    assert float(_get(shipped, path)) < float(_get(sibling, path))
+    assert float(_get(shipped, path)) > float(_get(sibling, path))
 
 
 def test_the_instrumented_config_is_the_record_of_where_those_two_constants_came_from():
@@ -797,7 +800,7 @@ def test_the_resolved_tiny_variant_validates_and_builds(tmp_path, loguru_warning
     # the production channel set and the forward still decodes the production tile count.
     assert model.d_model == 32
     assert model.target_adapter.linear.in_features == 98
-    assert model.anchor_stride == 15
+    assert model.anchor_stride == 30
 
 
 # --------------------------------------------------------------------------------------

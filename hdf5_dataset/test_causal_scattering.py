@@ -31,11 +31,17 @@ from hdf5_dataset.causal_scattering import (
     GAUSSIAN_HALF_POWER,
     assert_matches_shard,
     build_causal_bank,
+    build_channel_plan,
     build_truncated_morlet_bank,
+    causal_convolve,
+    causal_smooth,
     embed_on_two_sided_axis,
     future_energy_fraction,
     half_power_half_width,
+    leg_alignment_shift,
+    phase_block_causal,
     phase_block_two_sided,
+    phase_products,
     production_padding,
     scattering_block_causal,
     scattering_block_two_sided,
@@ -53,6 +59,12 @@ from teb_vae.lag_attn.eval.representation_capacity_probe import (
 
 #: The committed shard the channel-identity and arm-B gates run against.
 SHARD = os.path.join("output", "hie_cs.hdf5")
+
+#: Eight real ``fhr``/``up`` segments, tracked in git, that the leg-alignment measurements run on.
+#: :data:`SHARD` is git-ignored and exists only on the machine it was built on, so a fidelity claim
+#: gated on it would be a claim that evaporates on a clean checkout and on the production box.
+FIXTURE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                       "tests", "data", "causal_fixture.hdf5")
 
 #: Kernel length for the tests that do not depend on the slowest filters being fully resolved.
 #: Shorter than the shipped default so the suite stays fast; the length requirement itself is
@@ -387,3 +399,335 @@ def test_production_phase_smoothing_is_the_analytic_projection(bank, pairs):
     produced = phase_block_two_sided(fhr, fhr, pairs["fhr_ph"], bank,
                                      phi_mode="kymatio_truncate")
     assert np.abs(produced - expected).max() / np.abs(expected).max() < 1e-9
+
+
+# =================================================================================================
+# The leg alignment
+# =================================================================================================
+# The causal phase block multiplies two wavelet responses at one stored index, and the two come
+# from filters of different group delay -- so they describe two different physical instants, up to
+# 291.6 s apart. ``leg_alignment='envelope'`` delays the faster leg onto the slower one's clock and
+# de-rotates its carrier. These tests establish, in order: that switching the mode on changes
+# nothing while it is off, that the shift lands per pair rather than per filter, that the aligned
+# block is still exactly causal, and that the block it produces is the one the repair predicts.
+@pytest.fixture(scope="module")
+def fixture_segments():
+    """The committed raw signals, ``(8, 5280)`` each, as float64.
+
+    Raises:
+        FileNotFoundError: If the tracked fixture is missing, which would otherwise turn the
+            fidelity measurement below into a silent skip.
+    """
+    if not os.path.exists(FIXTURE):
+        raise FileNotFoundError(
+            f"the committed raw-signal fixture is missing from {FIXTURE}; it is tracked in git, "
+            f"so restore it rather than skipping -- the alignment's whole evidence rests on it"
+        )
+    with h5py.File(FIXTURE, "r") as handle:
+        return (np.asarray(handle["fhr"][:], dtype=np.float64),
+                np.asarray(handle["up"][:], dtype=np.float64))
+
+
+def test_the_unaligned_product_is_the_operator_written_out(causal, pairs, fixture_segments):
+    r"""The default path is the two-line formula, evaluated independently, bit for bit.
+
+    "The default reproduces today's value" is only checkable against something other than another
+    call of the same function, so the reference here is $[y_i]^{p}\,\overline{y_j}$ written out
+    from the responses. Bitwise, because the ``None`` branch must take neither the gather nor the
+    multiply the aligned branch takes.
+    """
+    fhr, _ = fixture_segments
+    selection = pairs["fhr_ph"]
+    responses = causal_convolve(fhr[0], causal.psi)
+
+    power = (causal.xi[selection[:, 1]] / causal.xi[selection[:, 0]])[:, None]
+    y_low = responses[selection[:, 0]]
+    expected = (np.abs(y_low) * np.exp(1j * power * np.angle(y_low))) * np.conj(
+        responses[selection[:, 1]]
+    )
+    assert np.array_equal(
+        phase_products(responses, responses, selection, causal.xi), expected
+    )
+
+    # An identity shift must also be a no-op, which is what says the new branch adds nothing of
+    # its own: a gather by zero and a multiply by exactly one.
+    identity = (np.zeros(selection.shape[0], dtype=np.int64),
+                np.ones(selection.shape[0], dtype=np.complex128))
+    assert np.array_equal(
+        phase_products(responses, responses, selection, causal.xi, leg_shift=identity), expected
+    )
+
+
+def test_each_pair_is_delayed_by_its_own_shift_after_the_gather(causal, pairs, fixture_segments):
+    r"""Pair $r$'s conjugated leg is *its own* response, delayed by *its own* shift.
+
+    This is the assertion that catches a per-filter implementation of a per-pair quantity. On the
+    shipped bank $22$ of the $24$ distinct ``fhr_ph`` fast legs serve more than one slow partner,
+    each at a different harmonic ratio and so at a different $s_{ij}$; a shift applied to the
+    response array before the gather would satisfy one partner per filter and be silently wrong
+    for the rest, with every shape correct and every existing gate green.
+
+    The reference is built one pair at a time with an explicit roll, so it shares no index
+    arithmetic with the implementation it checks.
+    """
+    fhr, _ = fixture_segments
+    selection = pairs["fhr_ph"]
+    responses = causal_convolve(fhr[0], causal.psi)
+    shift, phasor = leg_alignment_shift(causal, selection)
+    produced = phase_products(
+        responses, responses, selection, causal.xi, leg_shift=(shift, phasor)
+    )
+
+    power = (causal.xi[selection[:, 1]] / causal.xi[selection[:, 0]])[:, None]
+    y_low = responses[selection[:, 0]]
+    accelerated = np.abs(y_low) * np.exp(1j * power * np.angle(y_low))
+    for row in range(selection.shape[0]):
+        steps = int(shift[row])
+        leg = responses[int(selection[row, 1])]
+        delayed = np.roll(leg, steps)
+        delayed[:steps] = leg[0]  # edge replication, written out rather than clipped
+        expected = accelerated[row] * np.conj(delayed * phasor[row])
+        assert np.array_equal(produced[row], expected), row
+
+    # Not vacuous: reused fast legs really do receive different shifts here.
+    by_fast_leg = {}
+    for (_, fast), steps in zip(selection.tolist(), shift.tolist()):
+        by_fast_leg.setdefault(int(fast), set()).add(int(steps))
+    assert sum(len(v) > 1 for v in by_fast_leg.values()) == 22
+
+
+def test_a_leg_shift_of_the_wrong_length_is_refused(causal, pairs, fixture_segments):
+    """A shift vector sized for another block's pairs is the mistake being guarded.
+
+    ``fhr_ph`` has $66$ pairs and ``up_ph`` $15$, so passing one block's shift to the other is a
+    live confusion; numpy would broadcast neither, but the refusal names the reason rather than
+    surfacing a shape error from three frames down.
+    """
+    fhr, _ = fixture_segments
+    responses = causal_convolve(fhr[0], causal.psi)
+    shift, phasor = leg_alignment_shift(causal, pairs["up_ph"])
+    with pytest.raises(ValueError, match="indexed by pair, not by filter"):
+        phase_products(
+            responses, responses, pairs["fhr_ph"], causal.xi, leg_shift=(shift, phasor)
+        )
+
+
+def test_the_causal_phase_block_defaults_to_the_unaligned_operator(causal, pairs,
+                                                                   fixture_segments):
+    """No mode argument, ``'none'``, and today's block are one array; an unknown mode is refused.
+
+    The default carries the compatibility guarantee: every shard on disk, and the committed
+    fixture the shared data-contract test rebuilds, came through the no-argument call.
+    """
+    fhr, _ = fixture_segments
+    selection = pairs["fhr_ph"]
+    implicit = phase_block_causal(fhr[0], fhr[0], selection, causal)
+    explicit = phase_block_causal(fhr[0], fhr[0], selection, causal, leg_alignment="none")
+    aligned = phase_block_causal(fhr[0], fhr[0], selection, causal, leg_alignment="envelope")
+    assert np.array_equal(implicit, explicit)
+    assert not np.array_equal(implicit, aligned)
+
+    with pytest.raises(ValueError, match="unknown leg_alignment 'delay'"):
+        phase_block_causal(fhr[0], fhr[0], selection, causal, leg_alignment="delay")
+    # Refused before the pair list is consulted, so an empty selection cannot hide a typo.
+    with pytest.raises(ValueError, match="unknown leg_alignment"):
+        phase_block_causal(
+            fhr[0], fhr[0], np.zeros((0, 2), dtype=int), causal, leg_alignment="envelop"
+        )
+
+
+def test_the_two_sided_arm_takes_no_shift(bank, pairs, fixture_segments):
+    """Arm B's legs have no skew to remove, and its call site must stay the unaligned one.
+
+    Checked at the level that matters -- the two-sided block equals the product formula with no
+    shift anywhere -- because arm B reproducing the shard is what makes every causal-versus-
+    two-sided difference attributable to the causal arm.
+    """
+    from hdf5_dataset.causal_scattering import smooth_products_exact, two_sided_responses
+
+    fhr, _ = fixture_segments
+    selection = pairs["fhr_ph"]
+    responses = two_sided_responses(fhr[0], bank)
+    expected = smooth_products_exact(
+        phase_products(responses, responses, selection, bank.xi), bank.phi
+    )
+    assert np.array_equal(
+        phase_block_two_sided(fhr[0], fhr[0], selection, bank, phi_mode="exact"), expected
+    )
+
+
+def test_the_aligned_phase_block_past_side_holds_at_the_round_off_floor(
+    bank, causal, pairs, edited_pair
+):
+    """An edit made only in the future must not move an aligned coefficient before it.
+
+    The alignment adds a delay and a pointwise complex multiply, neither of which can read
+    forward, so this is a confirmation rather than a discovery -- but the whole value of the
+    causal arm rests on it, and the delay is new index arithmetic that an off-by-one would make
+    anticipative. The bound is the same round-off floor the scattering chain is held to.
+    """
+    signal, edited, edit_step = edited_pair
+    selection = pairs["fhr_ph"]
+    horizon = edit_step // DECIMATION
+
+    for mode in ("none", "envelope"):
+        base = phase_block_causal(signal, signal, selection, causal, leg_alignment=mode)
+        moved = phase_block_causal(edited, edited, selection, causal, leg_alignment=mode)
+        scale = float(np.abs(base).max())
+        movement = float(np.abs(moved[:, :horizon] - base[:, :horizon]).max() / scale)
+        assert movement < 1e-10, f"{mode}: {movement:.3e}"
+
+    # The control: the two-sided block *does* move before the same edit, so the bound above is
+    # measuring causality rather than a transform that ignored its input.
+    two_sided = [
+        phase_block_two_sided(x, x, selection, bank, phi_mode="exact") for x in (signal, edited)
+    ]
+    scale = float(np.abs(two_sided[0]).max())
+    assert float(
+        np.abs(two_sided[1][:, :horizon] - two_sided[0][:, :horizon]).max() / scale
+    ) > 1e-4
+
+
+def _correlation_at_the_predicted_delay(reference, produced, predicted_step):
+    """Pearson correlation of a causal channel against its centred twin at the analytic delay.
+
+    Delegates the arithmetic to the comparison tool's own scorer, so the floors pinned below mean
+    the same thing as the ``r_at_predicted`` column of ``output/causal_scattering/per_channel.csv``
+    rather than being a second definition that happens to agree today. ``max_lag=0`` skips the
+    argmax scan, which this measurement does not read: on an oscillating phase channel the argmax
+    can lock onto the wrong sidelobe, while the correlation at the predicted lag has no such
+    ambiguity.
+
+    Args:
+        reference: The two-sided channel, ``(n_steps,)``.
+        produced: The causal channel, ``(n_steps,)``.
+        predicted_step: The composed delay in decimated steps.
+
+    Returns:
+        The correlation, or NaN on a degenerate channel.
+    """
+    from hdf5_dataset.compare_causal_scattering import _best_lag
+
+    return _best_lag(reference, produced, 0, int(predicted_step))[2]
+
+
+def test_the_envelope_alignment_beats_the_shipped_block_and_the_phasor_is_why(
+    bank, causal, pairs, fixture_segments
+):
+    r"""The three-way comparison: aligned, shipped, and delay-without-phasor.
+
+    Each causal phase channel is correlated against its centred counterpart **at the delay the
+    channel plan predicts**, $\max(\tau_i,\tau_j) + \tau_\phi$, over the steps past that channel's
+    own warm-up, and the median is taken over channel $\times$ segment.
+
+    The delay-only arm is built here from public pieces rather than shipped as a third mode. It
+    has no legitimate caller: a gammatone's phase delay at its own centre frequency is zero, so a
+    plain shift moves the carrier as well as the envelope and injects a rotation of up to $9.6$
+    turns. It exists only to show that the phasor is what does the work -- without it the block is
+    *worse* than no alignment at all, which is the failure a reimplementation would produce with
+    every shape correct.
+
+    Measured on the eight committed segments -- shipped, aligned, delay-only:
+    ``fhr_ph`` $+0.051$, $+0.799$, $-0.411$; ``up_ph`` $+0.110$, $+0.667$, $-0.274$.
+
+    On twelve segments of the full shard the aligned medians are $0.805$ and $0.732$. The gap on
+    ``up_ph`` is not a weaker repair: that block has $15$ channels of which $5$ carry the
+    $p = 2^{6/4}$ branch-cut rotation that is deliberately measured and not applied, so its pooled
+    median sits near the boundary between the two integer families' $+0.87$ / $+0.66$ and that
+    family's $-0.72$, and moves with the segment draw. ``fhr_ph``'s $66$ channels put the same
+    median well clear of it. The floors here are set from the measurement with margin, and
+    :func:`test_the_aligned_residual_is_the_non_integer_harmonic_family` is what turns ``up_ph``'s
+    lower figure from a soft number into a stated one.
+    """
+    fhr, up = fixture_segments
+    plan = build_channel_plan(causal, pairs["fhr_ph"], pairs["up_ph"])
+    floors = {"fhr_ph": 0.70, "up_ph": 0.55}
+    measured = {}
+
+    for name, signals in (("fhr_ph", fhr), ("up_ph", up)):
+        selection = pairs[name]
+        warmup = plan[name].warmup_steps
+        predicted = np.round(plan[name].delay_s * FS / DECIMATION).astype(int)
+        shift, phasor = leg_alignment_shift(causal, selection)
+        scores = {arm: [] for arm in ("shipped", "aligned", "delay_only")}
+
+        for index in range(signals.shape[0]):
+            signal = signals[index]
+            centred = phase_block_two_sided(signal, signal, selection, bank, phi_mode="exact")
+            # One convolution, three products: the arms then differ in the product alone, which
+            # is what makes their comparison a measurement of the alignment.
+            responses = causal_convolve(signal, causal.psi)
+            arms = {}
+            for arm, leg_shift in (
+                ("shipped", None),
+                ("aligned", (shift, phasor)),
+                ("delay_only", (shift, np.ones_like(phasor))),
+            ):
+                product = phase_products(
+                    responses, responses, selection, causal.xi, leg_shift=leg_shift
+                )
+                arms[arm] = causal_smooth(product, causal.phi).real[:, ::DECIMATION]
+
+            for channel in range(selection.shape[0]):
+                start = min(int(warmup[channel]), centred.shape[1] - 32)
+                for arm, block in arms.items():
+                    scores[arm].append(_correlation_at_the_predicted_delay(
+                        centred[channel, start:], block[channel, start:], predicted[channel]
+                    ))
+
+        summary = {arm: float(np.nanmedian(v)) for arm, v in scores.items()}
+        measured[name] = summary
+        assert summary["aligned"] >= floors[name], f"{name}: {summary}"
+        assert summary["shipped"] <= 0.20, f"{name}: {summary}"
+        assert summary["delay_only"] < summary["shipped"], f"{name}: {summary}"
+        assert summary["delay_only"] <= -0.15, f"{name}: {summary}"
+        # The mechanism claim, far more robust to the segment draw than any absolute floor: the
+        # alignment multiplies the agreement several-fold, and the phasor is what buys it.
+        assert summary["aligned"] >= 5.0 * abs(summary["shipped"]), f"{name}: {summary}"
+
+    # The narrower block is the one the branch-cut family dominates, not the one the repair works
+    # less well on; stated so the two floors above are not read as two different repairs.
+    assert measured["fhr_ph"]["aligned"] > measured["up_ph"]["aligned"]
+
+
+def test_the_aligned_residual_is_the_non_integer_harmonic_family(bank, causal, pairs,
+                                                                 fixture_segments):
+    r"""Split by harmonic ratio, the repair is complete on $p = 2$ and $p = 4$ and not on $2^{3/2}$.
+
+    $[y]^{p}$ uses the principal argument, so an unwrapped phase
+    $\Psi = \operatorname{Arg} + 2\pi m$ contributes a factor $e^{-i2\pi p\,m(t)}$ that is $1$ for
+    integer $p$ and not otherwise. A causal leg and a centred one do not share a wrap count, so on
+    the $p = 2^{6/4}$ family the two blocks differ by a rotation no shift can remove -- and taking
+    $\Re\{\cdot\}$ of a rotated complex quantity flips its sign. The coefficient is still exactly
+    causal and still informative; only its comparability to the centred block of the same name is
+    lost, which is the stance the published limits already take for the whole block.
+
+    Asserted rather than described, because it is the reason the pooled floors above sit where
+    they do: without it ``up_ph`` merely looks like a weaker repair.
+    """
+    fhr, up = fixture_segments
+    plan = build_channel_plan(causal, pairs["fhr_ph"], pairs["up_ph"])
+    # One segment: the family separation is a property of the operator rather than a statistic,
+    # and it is an order of magnitude larger than the segment-to-segment spread.
+    for name, signal in (("fhr_ph", fhr[0]), ("up_ph", up[0])):
+        selection = pairs[name]
+        power = bank.hz[selection[:, 1]] / bank.hz[selection[:, 0]]
+        integer_family = np.isclose(power, np.round(power), rtol=5e-2)
+        assert integer_family.sum() and (~integer_family).sum(), name
+
+        centred = phase_block_two_sided(signal, signal, selection, bank, phi_mode="exact")
+        aligned = phase_block_causal(
+            signal, signal, selection, causal, leg_alignment="envelope"
+        )
+        warmup = plan[name].warmup_steps
+        predicted = np.round(plan[name].delay_s * FS / DECIMATION).astype(int)
+        scores = np.array([
+            _correlation_at_the_predicted_delay(
+                centred[channel, min(int(warmup[channel]), centred.shape[1] - 32):],
+                aligned[channel, min(int(warmup[channel]), centred.shape[1] - 32):],
+                predicted[channel],
+            )
+            for channel in range(selection.shape[0])
+        ])
+        assert float(np.nanmedian(scores[integer_family])) >= 0.60, name
+        assert float(np.nanmedian(scores[~integer_family])) <= -0.40, name

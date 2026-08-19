@@ -227,6 +227,51 @@ class CausalFeatureForecastTarget(FeatureForecastTarget):
             assignment[channel] = min(WARM_TERTILES - 1, rank * WARM_TERTILES // count)
         return tuple(assignment)
 
+    def _set_channel_weights(self, *, target_weight_st: float, target_weight_ph: float) -> None:
+        r"""Stash the two per-block weights, **before** the base constructor runs.
+
+        Split from :meth:`_register_channel_weights` for the same reason the causal input mixin
+        splits its own two calls: this half needs no geometry and that half needs a built
+        ``nn.Module``. Split from ``_set_causal_inputs`` for a different and more important reason
+        -- the *raw*-target causal cells compose that mixin too, and a raw block's last axis counts
+        samples of one signal, so there are no stored blocks to weight and no split to take. Putting
+        these keywords there would make them required arguments of a call those cells make.
+
+        Args:
+            target_weight_st: Relative reconstruction weight of the first stored target block.
+            target_weight_ph: The same for the second.
+        """
+        self.target_weight_st = float(target_weight_st)
+        self.target_weight_ph = float(target_weight_ph)
+
+    def _register_channel_weights(self) -> None:
+        r"""Resolve the stashed pair into the ``target_channel_weight`` buffer, after the base.
+
+        In **declared** channel coordinates through the gate's keep-index rather than positionally:
+        the survivors are not contiguous, so a positional split would put the block boundary in the
+        wrong place the moment the budget drops a channel.
+
+        Registered non-persistent, like every budget-shaped tensor in this family: its length is
+        $C_{\mathrm{keep}}$, so a persistent copy would make a checkpoint trained at one budget fail
+        to load at another and report it as a missing key rather than as a budget mismatch. The two
+        scalars reach the checkpoint through ``model_kwargs`` instead, which is what makes a run's
+        objective recoverable from its checkpoint alone.
+        """
+        declared = (
+            torch.arange(self.c_y)
+            if self.target_gate is None
+            else self.target_gate.keep_index.cpu()
+        )
+        self.register_buffer(
+            "target_channel_weight",
+            self._resolve_channel_weights(
+                declared.tolist(),
+                weight_st=self.target_weight_st,
+                weight_ph=self.target_weight_ph,
+            ),
+            persistent=False,
+        )
+
     @classmethod
     def _resolve_channel_weights(
         cls,

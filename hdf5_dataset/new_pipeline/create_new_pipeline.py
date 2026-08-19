@@ -8,6 +8,7 @@ Self-contained script that:
   5. Builds pretraining HDF5 datasets from BG subgroup leftovers.
 """
 
+import argparse
 import os
 import sys
 import math
@@ -23,6 +24,16 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from functools import partial
 from typing import Any, Dict, List, Optional, Tuple
+
+#: Repository root: ``hdf5_dataset/new_pipeline/create_new_pipeline.py`` -> up three.
+_REPO_ROOT = os.path.dirname(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+)
+
+# Launched as a script -- an IDE's Run button -- this file's own directory goes on sys.path
+# instead of the repository root, and the launch helper below cannot be found at all.
+if not __package__ and _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
 
 import h5py
 import numpy as np
@@ -42,15 +53,20 @@ from Variational_AutoEncoder.seqvae_teb.hdf5_dataset.causal_scattering import (
     CAUSAL_KERNEL_TAPS,
     CAUSAL_WARMUP_QUANTILE,
     GAMMATONE_ORDER,
+    LEG_ALIGNMENT_MODES,
     CausalChannelPlan,
     build_causal_bank,
     build_channel_plan,
     build_filter_bank,
+    novelty_fraction,
 )
 from Variational_AutoEncoder.seqvae_teb.hdf5_dataset.causal_scattering_torch import (
     CausalTorchBank,
     transform_batch_numpy,
 )
+# Stdlib-only by design, and already imported this way by ``compare_causal_scattering.py``: the
+# dependency direction from a dataset builder to the launch helper is established.
+from teb_vae.lag_attn_rws.eval.launch import missing_required, resolve_launch_args
 
 # ---------------------------------------------------------------------------
 # Environment
@@ -221,6 +237,17 @@ TRANSFORMS = (TWO_SIDED, CAUSAL)
 COEFFICIENT_BLOCKS = ("fhr_st", "fhr_ph", "fhr_up_ph", "up_st", "up_ph")
 CAUSAL_BLOCKS = ("fhr_st", "fhr_ph", "up_st", "up_ph")
 
+# Forecast horizon, in decimated steps, the stored novelty fraction is measured over. It is the
+# horizon every shipped model config uses. Baked in here rather than configured, because the
+# number it produces is written into the file beside the geometry that produced it and a
+# configuration key would let the two disagree with nothing to say so.
+#
+# lean-limit: the novelty fraction is stored at this one horizon as a (C,) vector, so a model
+# trained at a different horizon reads a stale number with nothing on the file to reveal it;
+# replace with a (C, H) table, or a stored horizon attribute to check against, when a second
+# horizon actually ships.
+CAUSAL_NOVELTY_HORIZON_STEPS = 30
+
 
 def validate_transform(transform: str) -> str:
     """Refuse an unknown transform variant, naming both valid values.
@@ -240,6 +267,32 @@ def validate_transform(transform: str) -> str:
             f"bank or {CAUSAL!r} for the one-sided gammatone bank"
         )
     return transform
+
+
+def validate_leg_alignment(leg_alignment: str) -> str:
+    """Refuse an unknown phase-harmonic leg alignment, naming both valid values.
+
+    Checked here, at the top of a build, rather than only inside the transform: the mode reaches
+    a root attribute as well as the operator, so a typo caught at transform time would already
+    have created a directory of files claiming to be something they are not.
+
+    Args:
+        leg_alignment: The requested mode.
+
+    Returns:
+        The mode, unchanged, so this can wrap an assignment.
+
+    Raises:
+        ValueError: If it is not one of
+            :data:`~hdf5_dataset.causal_scattering.LEG_ALIGNMENT_MODES`.
+    """
+    if leg_alignment not in LEG_ALIGNMENT_MODES:
+        raise ValueError(
+            f"unknown leg_alignment {leg_alignment!r}; use 'none' to multiply a phase pair's two "
+            f"legs at one stored index, as every shard on disk was built, or 'envelope' to put "
+            f"them on one clock first"
+        )
+    return leg_alignment
 
 
 @dataclass(frozen=True)
@@ -523,8 +576,10 @@ def _write_selection_attrs(dataset, selection: PhaseChannelSelection) -> None:
     dataset.attrs["sel_k_steps"] = np.asarray(selection.k_steps, dtype=np.int32)
 
 
-def _write_causal_attrs(dataset, plan: CausalChannelPlan) -> None:
-    r"""Attach per-channel warm-up and delay to a causal coefficient dataset.
+def _write_causal_attrs(
+    dataset, plan: CausalChannelPlan, novelty: Optional[np.ndarray] = None
+) -> None:
+    r"""Attach per-channel warm-up, delay and novelty to a causal coefficient dataset.
 
     ``causal_warmup_steps`` is the leading region in which a channel's output
     is a function of the assumed pre-recording history rather than of the
@@ -538,21 +593,46 @@ def _write_causal_attrs(dataset, plan: CausalChannelPlan) -> None:
     per-sample $(C, T)$ boolean mask would replicate one constant array tens of
     thousands of times, about 76 KB per sample against about 600 bytes per file.
 
+    ``causal_novelty_frac`` is the share of each channel's coefficient drawn
+    from raw samples an anchor has not yet seen, over the horizon named by
+    :data:`CAUSAL_NOVELTY_HORIZON_STEPS`. It is a property of the filter bank
+    and therefore an attribute for the same reason the warm-up is. What it is
+    *for*: "forecast" means something different per channel — the slowest kept
+    target channel draws $2.6\%$ of its value from the window it is asked to
+    predict, a fast one draws all of it — and a block score summed over both
+    mixes two claims unless the split is available.
+
     Note:
         ``causal_delay_s`` — the composed group delay each channel is stale by —
         has **no reader inside this pipeline**, which does not compensate for
         it. It is written ahead of its consumer, exactly as the ``sel_*`` attrs
-        were: the future reader is whatever replaces the two-sided $L_{95}$
-        reach guard in ``teb_vae/lag_attn/channel_reach.py``, which is
-        meaningless on causal data because future energy there is exactly zero.
-        That guard needs a staleness number per channel, and this is it.
+        were: the reader is
+        ``hdf5_dataset.hdf5_dataset.read_causal_warmup``, which surfaces it
+        beside the warm-up for a consumer that aligns channels onto one clock.
 
     Args:
         dataset: Target HDF5 coefficient dataset.
         plan: The block's channel plan, which the dataset was sized from.
+        novelty: The block's ``(C,)`` novelty fraction, on the same stored
+            channel axis. ``None`` omits the attribute, which is what a caller
+            with no bank to measure it from writes.
+
+    Raises:
+        ValueError: If *novelty* does not describe the plan's channel axis. It
+            and the warm-up are read back as parallel vectors, so a length
+            disagreement would silently attribute one channel's novelty to
+            another.
     """
     dataset.attrs["causal_warmup_steps"] = plan.warmup_steps.astype(np.int32)
     dataset.attrs["causal_delay_s"] = plan.delay_s.astype(np.float32)
+    if novelty is not None:
+        if np.shape(novelty) != (plan.n_channels,):
+            raise ValueError(
+                f"novelty fraction for '{plan.name}' has {np.size(novelty)} entries but the "
+                f"block stores {plan.n_channels} channels; the attribute would describe a "
+                f"different channel axis than the warm-up beside it"
+            )
+        dataset.attrs["causal_novelty_frac"] = np.asarray(novelty, dtype=np.float32)
 
 
 def create_initial_hdf5(
@@ -566,6 +646,8 @@ def create_initial_hdf5(
     up_ph_selection: Optional[PhaseChannelSelection] = None,
     transform: str = TWO_SIDED,
     channel_plan: Optional[Dict[str, CausalChannelPlan]] = None,
+    leg_alignment: str = LEG_ALIGNMENT_MODES[0],
+    novelty_frac: Optional[Dict[str, np.ndarray]] = None,
     source_pickle_path: Optional[str] = None,
     source_guid_digest: Optional[str] = None,
 ) -> None:
@@ -606,6 +688,15 @@ def create_initial_hdf5(
         transform: ``'two_sided'`` or ``'causal'``.
         channel_plan: Required for ``'causal'``: supplies the per-channel
             warm-up and delay attrs, and is cross-checked against the widths.
+        leg_alignment: Causal only. Recorded as a root attribute, because an
+            aligned file has exactly the widths, warm-ups and delays of an
+            unaligned one and is otherwise indistinguishable from it — so a
+            consumer that mixed the two, or normalised one with the other's
+            statistics, would get no error and no warning. Absent on a file
+            written before the attribute existed, which is read as unaligned.
+        novelty_frac: Causal only. ``{block: (C,)}`` from
+            :func:`~hdf5_dataset.causal_scattering.novelty_fraction`, written
+            per block beside the warm-up. ``None`` omits it.
         source_pickle_path: The fold pickle this build resumed from, recorded
             so comparability with the dataset that produced it is checkable
             afterwards. ``None`` records :data:`NO_SOURCE_PICKLE`.
@@ -620,6 +711,7 @@ def create_initial_hdf5(
     """
     validate_transform(transform)
     if transform == CAUSAL:
+        validate_leg_alignment(leg_alignment)
         if channel_plan is None:
             raise ValueError(
                 "a causal file needs its channel_plan: the stored warm-up vectors and the "
@@ -675,6 +767,10 @@ def create_initial_hdf5(
             h5f.attrs["causal_kernel_taps"] = np.int32(CAUSAL_KERNEL_TAPS)
             h5f.attrs["gammatone_order"] = np.int32(GAMMATONE_ORDER)
             h5f.attrs["causal_warmup_quantile"] = np.float32(CAUSAL_WARMUP_QUANTILE)
+            # Which phase-harmonic operator built the two phase blocks. Unlike every other
+            # constant here it changes no width and no warm-up, so it is the one property of an
+            # aligned file that nothing else on it reveals.
+            h5f.attrs["causal_leg_alignment"] = leg_alignment
         h5f.create_dataset(
             "fhr",
             shape=(0, len_signal),
@@ -755,7 +851,11 @@ def create_initial_hdf5(
                 ("fhr_st", fhr_st_ds), ("fhr_ph", fhr_ph_ds),
                 ("up_st", up_st_ds), ("up_ph", up_ph_ds),
             ):
-                _write_causal_attrs(dataset, channel_plan[name])
+                _write_causal_attrs(
+                    dataset,
+                    channel_plan[name],
+                    None if novelty_frac is None else novelty_frac[name],
+                )
         h5f.create_dataset(
             "target",
             shape=(0, len_sequence),
@@ -863,6 +963,8 @@ def create_hdf5_for_masks(
         up_ph_selection=masks["up_ph_selection"],
         transform=masks.get("transform", TWO_SIDED),
         channel_plan=masks.get("channel_plan"),
+        leg_alignment=masks.get("causal_leg_alignment", LEG_ALIGNMENT_MODES[0]),
+        novelty_frac=masks.get("causal_novelty_frac"),
         source_pickle_path=source_pickle_path,
         source_guid_digest=guid_set_digest(records_list),
     )
@@ -1104,6 +1206,7 @@ def compute_scattering_masks(
     scattering_T: int = 16,
     device=None,
     transform: str = TWO_SIDED,
+    leg_alignment: str = LEG_ALIGNMENT_MODES[0],
 ) -> Dict[str, Any]:
     r"""Compute every coefficient selection once, up front.
 
@@ -1132,6 +1235,10 @@ def compute_scattering_masks(
         scattering_T: Decimation factor.
         device: Torch device.
         transform: ``'two_sided'`` or ``'causal'``.
+        leg_alignment: Causal only. Carried in the returned dict rather than
+            threaded separately, exactly as ``transform`` is, so the transform
+            that computes a coefficient and the attribute that records what
+            computed it are read from one object.
 
     Returns:
         Dict with two :class:`PhaseChannelSelection` objects
@@ -1139,7 +1246,11 @@ def compute_scattering_masks(
         (``cross_mask``), its channel count (``n_cross``), its selector
         metadata (``cross_metadata``), the scattering-block width
         (``n_scattering``) and the resolved ``transform``; plus
-        ``causal_bank`` and ``channel_plan`` on the causal variant.
+        ``causal_bank``, ``channel_plan``, ``causal_leg_alignment`` and
+        ``causal_novelty_frac`` on the causal variant.
+
+    Raises:
+        ValueError: On an unknown *transform* or *leg_alignment*.
     """
     validate_transform(transform)
     tmp_model = KymatioPhaseScattering1D(
@@ -1181,13 +1292,24 @@ def compute_scattering_masks(
     }
 
     if transform == CAUSAL:
+        validate_leg_alignment(leg_alignment)
         causal_bank = build_causal_bank(build_filter_bank(signal_length))
-        masks["causal_bank"] = causal_bank
-        masks["channel_plan"] = build_channel_plan(
+        target_pairs = _selection_pairs(fhr_ph_selection)
+        source_pairs = _selection_pairs(up_ph_selection)
+        plan = build_channel_plan(
             causal_bank,
-            _selection_pairs(fhr_ph_selection),
-            _selection_pairs(up_ph_selection),
+            target_pairs,
+            source_pairs,
             sequence_length=signal_length // scattering_T,
+            decimation=scattering_T,
+        )
+        masks["causal_bank"] = causal_bank
+        masks["channel_plan"] = plan
+        masks["causal_leg_alignment"] = leg_alignment
+        # Measured here, from the same bank and the same plan the widths come from, so the vector
+        # written beside a block's warm-up describes that block's channels by construction.
+        masks["causal_novelty_frac"] = novelty_fraction(
+            causal_bank, plan, target_pairs, source_pairs, CAUSAL_NOVELTY_HORIZON_STEPS,
             decimation=scattering_T,
         )
     return masks
@@ -1293,6 +1415,9 @@ def describe_layout(masks: Dict[str, Any], device: Optional[Any] = None) -> Dict
     layout["gammatone_order"] = int(GAMMATONE_ORDER)
     layout["causal_kernel_taps"] = int(CAUSAL_KERNEL_TAPS)
     layout["causal_warmup_quantile"] = float(CAUSAL_WARMUP_QUANTILE)
+    layout["causal_leg_alignment"] = str(
+        masks.get("causal_leg_alignment", LEG_ALIGNMENT_MODES[0])
+    )
     dropped: Dict[str, Dict[str, Optional[int]]] = {}
     warmup_range: Dict[str, Tuple[int, int]] = {}
     delay_range: Dict[str, Tuple[float, float]] = {}
@@ -1329,7 +1454,8 @@ def format_layout(layout: Dict[str, Any]) -> List[str]:
         lines.append(
             f"Transform: {layout['transform']} (gammatone n={layout['gammatone_order']}, "
             f"{layout['causal_kernel_taps']} taps, "
-            f"warm-up quantile {layout['causal_warmup_quantile']:g})"
+            f"warm-up quantile {layout['causal_warmup_quantile']:g}, "
+            f"leg alignment {layout['causal_leg_alignment']})"
         )
     else:
         lines.append(f"Transform: {layout['transform']}")
@@ -2452,6 +2578,7 @@ def _transform_causal_record(
     source_pairs: np.ndarray,
     channel_plan: Dict[str, CausalChannelPlan],
     scatter_batch_size: int,
+    leg_alignment: str = LEG_ALIGNMENT_MODES[0],
 ) -> Tuple[List[Optional[Dict[str, np.ndarray]]], Dict[int, str]]:
     """Transform one record's segments causally, in batches, isolating any that fail.
 
@@ -2472,6 +2599,8 @@ def _transform_causal_record(
         source_pairs: ``(n, 2)`` phase pairs for ``up_ph``.
         channel_plan: The stored plan; the transform gathers its channels.
         scatter_batch_size: Segments per forward pass.
+        leg_alignment: The phase-harmonic leg alignment the two phase blocks are built with. It
+            must be the one recorded on the file, which is why both come from the same masks.
 
     Returns:
         ``(blocks, failures)``: one ``{block: (C, T)}`` dict per segment — ``None`` where the
@@ -2484,7 +2613,7 @@ def _transform_causal_record(
     def _run(start: int, stop: int) -> Dict[str, np.ndarray]:
         return transform_batch_numpy(
             torch_bank, fhr[start:stop], up[start:stop], target_pairs, source_pairs,
-            plan=channel_plan,
+            plan=channel_plan, leg_alignment=leg_alignment,
         )
 
     for batch_start in range(0, n_valid, scatter_batch_size):
@@ -2580,6 +2709,11 @@ def create_hdf5_dataset_from_records_list(
         # by construction rather than by two implementations agreeing.
         target_pairs = _selection_pairs(precomputed_masks["fhr_ph_selection"])
         source_pairs = _selection_pairs(precomputed_masks["up_ph_selection"])
+        # From the masks, like the plan and the pairs: the coefficients written into a file and
+        # the root attribute that says how they were built then cannot disagree.
+        leg_alignment = precomputed_masks.get(
+            "causal_leg_alignment", LEG_ALIGNMENT_MODES[0]
+        )
         # No pair-axis check: this path indexes responses by pair *index* rather than masking a
         # pair axis, so there is no mask length that could disagree with a transform.
         _validate_geometry(hdf5_path, resolve_channel_layout(precomputed_masks))
@@ -2741,7 +2875,7 @@ def create_hdf5_dataset_from_records_list(
             if causal:
                 causal_blocks, causal_failures = _transform_causal_record(
                     torch_bank, valid_fhr, valid_up, target_pairs, source_pairs,
-                    channel_plan, scatter_batch_size,
+                    channel_plan, scatter_batch_size, leg_alignment,
                 )
                 for seg_j, message in causal_failures.items():
                     orig_idx = valid_indices[seg_j]
@@ -3009,6 +3143,7 @@ def create_new_pipeline(
     screening_csv_path: Optional[str] = None,
     classification_pickle_path: Optional[str] = None,
     transform: str = TWO_SIDED,
+    leg_alignment: str = LEG_ALIGNMENT_MODES[0],
     device: Optional[str] = None,
 ):
     """Run the complete new dataset creation pipeline.
@@ -3040,16 +3175,25 @@ def create_new_pipeline(
         transform: ``'two_sided'`` (the shipped kymatio bank) or ``'causal'``
             (the one-sided gammatone bank, narrower scattering blocks, no
             ``fhr_up_ph``). Written into every file as a root attribute.
+        leg_alignment: Causal only. ``'none'`` multiplies a phase pair's two
+            legs at one stored index, which is how every shard on disk was
+            built; ``'envelope'`` puts them on one clock first. Written into
+            every causal file as a root attribute, because it changes no width
+            and no warm-up and is otherwise unrecoverable from the file. Write
+            an aligned build to a **separate** output path: it is a new variant
+            beside the existing one, not a replacement for it.
         device: Torch device for the transform, e.g. ``'cuda:3'`` to pin one
             GPU of eight. ``None`` keeps today's behaviour: the first CUDA
             device if one exists, else the CPU.
 
     Raises:
-        ValueError: On an unknown *transform*, before anything is created.
+        ValueError: On an unknown *transform* or *leg_alignment*, before
+            anything is created.
     """
-    # First statement, before os.makedirs and before the CSV is read: a refusal that arrives
+    # First statements, before os.makedirs and before the CSV is read: a refusal that arrives
     # later leaves an output directory behind and reports a CSV problem instead of the real one.
     validate_transform(transform)
+    validate_leg_alignment(leg_alignment)
 
     setup_verbosity(verbose)
     os.makedirs(output_base_path, exist_ok=True)
@@ -3061,7 +3205,8 @@ def create_new_pipeline(
     # Compute scattering masks once
     logger.info("Computing scattering masks (v3)...")
     masks = compute_scattering_masks(
-        SIGNAL_LENGTH, scattering_T=16, device=torch_device, transform=transform
+        SIGNAL_LENGTH, scattering_T=16, device=torch_device, transform=transform,
+        leg_alignment=leg_alignment,
     )
     # Log the resolved layout and the active selection parameters: this is the
     # operator's confirmation that the intended variant is running, and it
@@ -3342,42 +3487,194 @@ def _discover_mat_files(records_base_path: str, folder_name: str) -> List[str]:
 # ============================================================================
 # Entry point
 # ============================================================================
-if __name__ == "__main__":
-    # ---- Configure paths here ----
-    records_base_path = r"/data/deid/datafabric/fetal-heart-tracing/StudyGroup2022_v4/"
-    output_base_path = r"/data1/fetal-heart-tracing/HDF5_Datasets/new_pipeline_6h"
-    tlo_csv_path = r"/path/to/complete_labor_onset.csv"
+def build_parser() -> argparse.ArgumentParser:
+    """Build the command-line parser.
 
-    # ---- Options ----
-    test_mode = "augmented"  # "augmented" (default) or "holdout"
-    verbose = False
-    scatter_batch_size = 128
-    num_workers = None  # defaults to min(cpu_count, 8)
+    No argument is ``required`` and none carries a non-``None`` default, both deliberately. A
+    ``required=True`` fires before :data:`RUN_ARGS` is ever consulted, which would make the Run
+    button unusable whatever the dict said; and the merge treats any non-``None`` parsed value as
+    having come from the command line, so an argparse default would make that key's ``RUN_ARGS``
+    entry silently unreachable. The real defaults are applied in :func:`main`, after the merge.
 
-    # "two_sided" = the shipped kymatio bank. "causal" = the one-sided gammatone bank: scattering
-    # blocks narrow to 36 channels, fhr_up_ph is not produced, and every block carries its
-    # per-channel warm-up. Write it to a SEPARATE output_base_path — nothing here modifies an
-    # existing dataset, and a causal build is only comparable to the two-sided one if it resumes
-    # from that run's classification_pickle_path, which pins the same GUIDs, folds and segments.
-    transform = "two_sided"
-    # Torch device for the transform, e.g. "cuda:3" to pin one GPU of eight on the production box.
-    # None keeps today's behaviour: the first CUDA device if there is one, else the CPU.
-    device = None
+    Returns:
+        The parser.
+    """
+    parser = argparse.ArgumentParser(
+        prog="python hdf5_dataset/new_pipeline/create_new_pipeline.py",
+        description="Build the HDF5 classification and pretraining datasets from raw records.",
+    )
+    parser.add_argument("--records-base-path", dest="records_base_path",
+                        help="Root directory holding the StudyGroup subfolders. Required.")
+    parser.add_argument("--output-base-path", dest="output_base_path",
+                        help="Output directory for every file this run writes. Required. Point a "
+                             "causal or an aligned build at a SEPARATE directory: each is a new "
+                             "variant beside the existing one, never a replacement for it.")
+    parser.add_argument("--tlo-csv-path", dest="tlo_csv_path",
+                        help="CSV with the labour-onset and second-stage columns. Required.")
+    parser.add_argument("--test-mode", dest="test_mode", choices=("augmented", "holdout"),
+                        help="Default: augmented.")
+    parser.add_argument("--verbose", dest="verbose", action=argparse.BooleanOptionalAction,
+                        default=None,
+                        help="Per-record progress output. Default: on.")
+    parser.add_argument("--scatter-batch-size", dest="scatter_batch_size", type=int,
+                        help="Segments per forward pass of the transform. Default: 128.")
+    parser.add_argument("--num-workers", dest="num_workers", type=int,
+                        help="Parallel prescreening workers. Default: min(cpu_count, 8).")
+    parser.add_argument("--screening-csv-path", dest="screening_csv_path",
+                        help="Skip step 1 and load this pre-computed screening CSV.")
+    parser.add_argument("--classification-pickle-path", dest="classification_pickle_path",
+                        help="Skip steps 1-3 and resume from this fold pickle. Recorded in every "
+                             "shard written, with a digest of its GUID set: a causal build is "
+                             "comparable to a two-sided one segment for segment only if both "
+                             "resumed from the same pickle.")
+    parser.add_argument("--transform", dest="transform", choices=TRANSFORMS,
+                        help=f"Wavelet bank. Default: {TWO_SIDED}.")
+    parser.add_argument("--leg-alignment", dest="leg_alignment", choices=LEG_ALIGNMENT_MODES,
+                        help="Causal only: the phase-harmonic operator. 'none' multiplies a "
+                             "pair's two legs at one stored index, as every shard on disk was "
+                             "built; 'envelope' puts them on one clock first. Recorded as a root "
+                             f"attribute. Default: {LEG_ALIGNMENT_MODES[0]}.")
+    parser.add_argument("--device", dest="device",
+                        help="Torch device for the transform, e.g. 'cuda:3' to pin one GPU of "
+                             "eight. Default: the first CUDA device if one exists, else the CPU.")
+    return parser
 
-    # ---- Resume / skip flags (set to None for full pipeline) ----
-    screening_csv_path = None  # e.g. r"/path/to/guid_screening_results.csv"
-    classification_pickle_path = None  # e.g. r"/path/to/classification_dataset_records.pickle"
 
+def main(
+    records_base_path: Optional[str] = None,
+    output_base_path: Optional[str] = None,
+    tlo_csv_path: Optional[str] = None,
+    test_mode: Optional[str] = None,
+    verbose: Optional[bool] = None,
+    scatter_batch_size: Optional[int] = None,
+    num_workers: Optional[int] = None,
+    screening_csv_path: Optional[str] = None,
+    classification_pickle_path: Optional[str] = None,
+    transform: Optional[str] = None,
+    leg_alignment: Optional[str] = None,
+    device: Optional[str] = None,
+) -> int:
+    """Apply the defaults the parser is not allowed to carry, then run the build.
+
+    A thin wrapper on :func:`create_new_pipeline`, which is not refactored: the builder's own
+    signature keeps its defaults for every in-process caller, and this restates them only because
+    the merge above must see ``None`` for "not supplied".
+
+    Args:
+        records_base_path: Root directory holding the StudyGroup subfolders.
+        output_base_path: Output directory for this run.
+        tlo_csv_path: CSV with the labour-onset and second-stage columns.
+        test_mode: ``'augmented'`` or ``'holdout'``.
+        verbose: Per-record progress output.
+        scatter_batch_size: Segments per forward pass.
+        num_workers: Parallel prescreening workers.
+        screening_csv_path: Pre-computed screening CSV to resume from.
+        classification_pickle_path: Fold pickle to resume from.
+        transform: Wavelet bank.
+        leg_alignment: Causal phase-harmonic operator.
+        device: Torch device for the transform.
+
+    Returns:
+        The process exit code.
+    """
     create_new_pipeline(
         records_base_path=records_base_path,
         output_base_path=output_base_path,
         tlo_csv_path=tlo_csv_path,
-        test_mode=test_mode,
-        verbose=verbose,
-        scatter_batch_size=scatter_batch_size,
+        test_mode=test_mode or "augmented",
+        # The builder's own default is True; the shipped operator invocation has always run quiet,
+        # so the launch dict below carries False and this leaves that choice to it.
+        verbose=True if verbose is None else verbose,
+        scatter_batch_size=scatter_batch_size or 128,
         num_workers=num_workers,
         screening_csv_path=screening_csv_path,
         classification_pickle_path=classification_pickle_path,
-        transform=transform,
+        transform=transform or TWO_SIDED,
+        leg_alignment=leg_alignment or LEG_ALIGNMENT_MODES[0],
         device=device,
     )
+    return 0
+
+
+def _cli(argv: Optional[List[str]] = None) -> int:
+    """Merge the command line over the launch dict and run. Returns the process exit code.
+
+    Args:
+        argv: Command-line arguments; ``None`` reads ``sys.argv[1:]``.
+
+    Returns:
+        The process exit code.
+
+    Raises:
+        SystemExit: If a required path was supplied by neither route, with a message naming both.
+    """
+    values, sources = resolve_launch_args(build_parser(), RUN_ARGS, argv)
+    refusal = missing_required(
+        values, ("records_base_path", "output_base_path", "tlo_csv_path")
+    )
+    if refusal:
+        raise SystemExit(refusal)
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
+    # Logged, not merely resolved: a build runs for hours and the only durable record of what it
+    # was asked for is what it said at the start.
+    logger.info(
+        "resolved arguments: "
+        + ", ".join(f"{key}={values[key]!r} (from {sources[key]})" for key in sorted(values))
+    )
+    return main(**values)
+
+
+#: **Edit the values below and press Run. There is no command line to type.**
+#:
+#: This dict is the whole operator surface of this file. Every key is used verbatim when the
+#: corresponding flag is absent from the command line, so with no arguments at all the run is
+#: exactly what is written here. (The parser above exists so the same build is also scriptable and
+#: so a one-off can override a single value without editing the file; nothing requires using it.)
+#:
+#: **Fill in the four paths marked FILL IN.** The rest have working defaults.
+#:
+#: ``transform`` and ``leg_alignment`` choose the variant, and both are recorded as root
+#: attributes of every file written:
+#:
+#: * ``transform='two_sided'`` -- the shipped kymatio bank.
+#: * ``transform='causal'`` -- the one-sided gammatone bank. Scattering blocks narrow to 36
+#:   channels, ``fhr_up_ph`` is not produced, and every block carries its per-channel warm-up,
+#:   group delay and novelty fraction.
+#: * ``leg_alignment='envelope'`` -- causal only. Puts the two legs of every phase-harmonic pair on
+#:   one clock before multiplying them. Changes no width, no warm-up and no stored delay; only the
+#:   values inside ``fhr_ph`` and ``up_ph``.
+#:
+#: **Point each variant at its own ``output_base_path``.** Nothing here modifies an existing
+#: dataset, and an aligned shard is indistinguishable from an unaligned one by shape alone -- the
+#: root attribute is the only thing that separates them, and the loader refuses a file list that
+#: mixes the two.
+#:
+#: **Set ``classification_pickle_path`` to the two-sided run's fold pickle.** That is what makes a
+#: causal or aligned build comparable to it segment for segment: the pickle pins the same GUIDs,
+#: folds, partitions and segments, and both shards then record the same GUID digest.
+RUN_ARGS: Dict[str, Any] = {
+    # ---- FILL IN: where the records are, where the output goes, and the labour-onset CSV ----
+    "records_base_path": r"/data/deid/datafabric/fetal-heart-tracing/StudyGroup2022_v4/",
+    "output_base_path": r"/data1/fetal-heart-tracing/HDF5_Datasets/new_pipeline_6h_causal_aligned",
+    "tlo_csv_path": r"/path/to/complete_labor_onset.csv",
+    # FILL IN: the two-sided run's pickle, so this build gets the same GUIDs, folds and segments.
+    # None runs the full pipeline from scratch and produces a dataset comparable to nothing.
+    "classification_pickle_path": None,
+
+    # ---- The variant. As written: the envelope-aligned causal build. ----
+    # Blank both (None) for the shipped two-sided build.
+    "transform": "causal",
+    "leg_alignment": "envelope",
+
+    # ---- Everything below has a working default ----
+    "device": None,                     # e.g. "cuda:3" to pin one GPU of eight; None autodetects
+    "test_mode": None,                  # "augmented" (default) or "holdout"
+    "verbose": False,                   # per-record progress output; the builder's default is True
+    "scatter_batch_size": 128,          # segments per forward pass of the transform
+    "num_workers": None,                # prescreening workers; default min(cpu_count, 8)
+    "screening_csv_path": None,         # skip step 1: e.g. r"/path/to/guid_screening_results.csv"
+}
+
+
+if __name__ == "__main__":
+    sys.exit(_cli())

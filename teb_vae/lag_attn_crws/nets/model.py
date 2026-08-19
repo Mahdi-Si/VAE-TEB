@@ -74,7 +74,7 @@ class SeqVaeLagAttnCrws(CausalRawInputs, SeqVaeLagAttnRws):
         sequence_length: int = 300,
         d_model: int = 128,
         d_z: int = 48,
-        horizon: int = 15,
+        horizon: int = 30,
         raw_per_step: int = 16,
         warmup_period: int = 133,
         c_y: int = 102,

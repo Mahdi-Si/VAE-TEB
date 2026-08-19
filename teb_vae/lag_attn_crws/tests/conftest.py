@@ -62,17 +62,18 @@ except Exception:
 #: intention, rather than surfacing as an ``ImportError`` in whichever test happened to collect
 #: first -- and rather than tempting a re-export to be added to that package, which this one may not
 #: edit.
-#: This package's shipped forecast horizon, in decimated steps, and it is **owned here** rather than
-#: imported from the causal-feature suite.
+
+#: This package's shipped forecast horizon, in decimated steps, **owned here** rather than imported
+#: from the causal-feature suite.
 #:
-#: The two packages agreed on 15 for as long as both shipped it, and the import was the smaller line.
-#: It was also wrong: a horizon is a property of a TARGET DOMAIN, and this one forecasts a raw FHR
-#: window while that one forecasts stored coefficients whose warm-up bounds the anchor floor. When
-#: `lag_attn_cfs` moved to 30 the shared constant silently re-pointed this suite's whole shipped
-#: geometry at a horizon this package does not ship, and the failure surfaced as an unrelated shape
-#: mismatch three files away. Owned locally, a divergence between the two is now a fact about two
-#: configs rather than a coupling.
-SHIPPED_HORIZON = 15
+#: The two packages agreed on 15 for as long as both shipped it, and the import was the smaller
+#: line. It was also wrong: a horizon is a property of a TARGET DOMAIN, and this one forecasts a raw
+#: FHR window while that one forecasts stored coefficients whose warm-up bounds the anchor floor.
+#: When `lag_attn_cfs` moved to 30 first, the shared constant silently re-pointed this suite's whole
+#: shipped geometry at a horizon this package did not yet ship, and the failure surfaced as an
+#: unrelated shape mismatch three files away. Both ship 30 now, and agreement between two configs is
+#: not a reason to have one constant.
+SHIPPED_HORIZON = 30
 
 IMPORTED_FROM_CAUSAL = (
     "BATCH",

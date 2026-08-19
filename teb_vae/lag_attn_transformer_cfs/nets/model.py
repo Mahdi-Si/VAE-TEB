@@ -179,11 +179,17 @@ class SeqVaeLagAttnTrfCfs(
             source_warmup_steps=source_warmup_steps,
             anchor_stride=anchor_stride,
             lag_floor=lag_floor,
-            target_weight_st=target_weight_st,
-            target_weight_ph=target_weight_ph,
+        )
+        # Separate from the call above because the RAW-target causal cells compose that mixin too
+        # and have no stored-block split to weight; this half is the feature target's own.
+        self._set_channel_weights(
+            target_weight_st=target_weight_st, target_weight_ph=target_weight_ph
         )
 
         super().__init__(**forwarded, target_delays=None, source_delays=None)
 
         # After the base, which is what validates the geometry the anchor checks read.
         self._validate_causal_geometry()
+        # After the geometry check, which is what resolves the gate the weights
+        # are positional over.
+        self._register_channel_weights()

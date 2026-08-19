@@ -1,20 +1,37 @@
+import argparse
 import os
-import h5py
-import numpy as np
+import sys
 from typing import List, Dict, Tuple, Optional, Any
-import warnings
-from tqdm import tqdm
-import matplotlib.pyplot as plt
-import seaborn as sns
-import torch
-from hdf5_dataset.hdf5_dataset import (
+
+#: Repository root: ``hdf5_dataset/calculate_dataset_stats.py`` -> up two.
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+# Launched as a script -- an IDE's Run button -- this file's own directory goes on sys.path
+# instead of the repository root, and every absolute import below fails before __main__ is
+# reached.
+if not __package__ and _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
+import h5py  # noqa: E402
+import numpy as np  # noqa: E402
+import warnings  # noqa: E402
+from tqdm import tqdm  # noqa: E402
+import matplotlib.pyplot as plt  # noqa: E402
+import seaborn as sns  # noqa: E402
+import torch  # noqa: E402
+from teb_vae.lag_attn_rws.eval.launch import (  # noqa: E402
+    missing_required,
+    resolve_launch_args,
+)
+from hdf5_dataset.hdf5_dataset import (  # noqa: E402
+    LEG_ALIGNMENT_NONE,
     TWO_SIDED,
     _resolve_dataset_layout,
     normalize_tensor_data,
     rebase_causal_warmup,
+    resolve_leg_alignment,
     resolve_transform,
 )
-import argparse
 
 
 class DatasetStatsCalculator:
@@ -83,6 +100,12 @@ class DatasetStatsCalculator:
         # otherwise, which is what every dataset built before the attribute
         # existed is.
         self.source_transform = TWO_SIDED
+
+        # And which phase-harmonic operator built the source's phase blocks. An
+        # aligned dataset and an unaligned one have identical widths and
+        # identical warm-ups, so this attribute is the only thing that stops a
+        # stats file computed over one being used to normalise the other.
+        self.source_leg_alignment = LEG_ALIGNMENT_NONE
 
         if device is None:
             self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -214,6 +237,11 @@ class DatasetStatsCalculator:
         """
         layout = _resolve_dataset_layout(valid_files)
         self.source_transform = TWO_SIDED if layout is None else layout.transform
+        self.source_leg_alignment = (
+            LEG_ALIGNMENT_NONE
+            if layout is None or layout.leg_alignment is None
+            else layout.leg_alignment
+        )
         warmup = (
             None
             if layout is None
@@ -549,6 +577,14 @@ class DatasetStatsCalculator:
             # the loader detect a causal dataset paired with two-sided
             # constants instead of normalising with them.
             f.attrs['transform'] = self.source_transform
+
+            # Which phase-harmonic operator the source's phase blocks came
+            # from. Written on both variants for the same reason `transform`
+            # is: absence then means "unaligned", unambiguously, rather than
+            # "unlabelled" -- and the loader compares it, because an aligned
+            # dataset paired with these constants would pass every width and
+            # variant check there is.
+            f.attrs['causal_leg_alignment'] = self.source_leg_alignment
             
             # Save information about log transformation
             f.attrs['log_epsilon'] = 1e-6
@@ -636,6 +672,7 @@ class DatasetStatsCalculator:
             # one, exactly as a dataset without it is; absence is the expected
             # state of every stats file currently on disk, not a defect.
             self.source_transform = resolve_transform(f.attrs)
+            self.source_leg_alignment = resolve_leg_alignment(f.attrs)
 
             for field in f.keys():
                 if field == 'metadata':
@@ -1161,40 +1198,174 @@ def calculate_and_save_dataset_stats(
     return stats
 
 
-if __name__ == "__main__":
+# ============================================================================
+# Entry point
+# ============================================================================
+def build_parser() -> argparse.ArgumentParser:
+    """Build the command-line parser.
 
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    input_files = [r"C:\Users\mahdi\Desktop\McGill\data\acidosis_no_cs.hdf5"]
-    output_file = r"C:\Users\mahdi\Desktop\McGill\data\stats.hdf5"
-    
-    # Calculate and save stats with histogram plotting enabled
-    stats = calculate_and_save_dataset_stats(
+    No argument is ``required`` and none carries a non-``None`` default. ``required=True`` fires
+    before :data:`RUN_ARGS` is consulted and would make the Run button unusable whatever the dict
+    said; and the merge reads any non-``None`` parsed value as having come from the command line,
+    so an argparse default would make that key's ``RUN_ARGS`` entry unreachable. Both real
+    defaults are applied in :func:`main`, after the merge.
+
+    Returns:
+        The parser.
+    """
+    parser = argparse.ArgumentParser(
+        prog="python hdf5_dataset/calculate_dataset_stats.py",
+        description="Accumulate per-channel normalisation statistics over a set of HDF5 shards.",
+    )
+    parser.add_argument("--input-files", dest="input_files", nargs="+",
+                        help="The shards to accumulate over. Required. All of them: a stats file "
+                             "computed over a subset normalises the rest with constants they did "
+                             "not contribute to.")
+    parser.add_argument("--output-file", dest="output_file",
+                        help="Path for the statistics HDF5. Required.")
+    parser.add_argument("--trim-minutes", dest="trim_minutes", type=float,
+                        help="Symmetric trim, in minutes, the statistics are accumulated over. "
+                             "MUST match the loader's own setting -- a mismatch normalises with "
+                             "constants drawn from a window the loader never serves, and produces "
+                             "only a warnings.warn at load time. Production uses 1.0.")
+    parser.add_argument("--batch-size", dest="batch_size", type=int,
+                        help="Samples per read. Affects memory only. Default: 100.")
+    parser.add_argument("--device", dest="device",
+                        help="Torch device, e.g. 'cuda:0'. Default: autodetect.")
+    parser.add_argument("--plot-histograms", dest="plot_histograms",
+                        action=argparse.BooleanOptionalAction, default=None,
+                        help="Write per-field histograms beside the output. Default: on.")
+    parser.add_argument("--histograms-dir", dest="histograms_dir",
+                        help="Where the histograms go. Default: beside the output file.")
+    parser.add_argument("--max-histogram-samples", dest="max_histogram_samples", type=int,
+                        help="Cap on the samples drawn for the histograms. Default: 50000.")
+    return parser
+
+
+def main(
+    input_files: Optional[List[str]] = None,
+    output_file: Optional[str] = None,
+    trim_minutes: Optional[float] = None,
+    batch_size: Optional[int] = None,
+    device: Optional[str] = None,
+    plot_histograms: Optional[bool] = None,
+    histograms_dir: Optional[str] = None,
+    max_histogram_samples: Optional[int] = None,
+) -> int:
+    """Apply the defaults the parser is not allowed to carry, then accumulate and save.
+
+    A thin wrapper on :func:`calculate_and_save_dataset_stats`, which is not refactored: it keeps
+    its own defaults for every in-process caller, and they are restated here only because the
+    merge above must see ``None`` for "not supplied".
+
+    Args:
+        input_files: The shards to accumulate over.
+        output_file: Path for the statistics HDF5.
+        trim_minutes: The trim the statistics are accumulated over.
+        batch_size: Samples per read.
+        device: Torch device.
+        plot_histograms: Whether to write the histograms.
+        histograms_dir: Where the histograms go.
+        max_histogram_samples: Cap on the histogram sample draw.
+
+    Returns:
+        The process exit code.
+    """
+    assert input_files is not None and output_file is not None  # enforced by _cli
+    calculate_and_save_dataset_stats(
         input_files,
         output_file,
+        batch_size=100 if batch_size is None else batch_size,
         metadata={
             'input_files': input_files,
             'num_files': len(input_files),
-            # Which blocks a file actually carries depends on its variant — the
-            # causal one produces no cross-phase block — so this says what was
-            # measured over rather than naming blocks that may not be there.
-            'description': 'Statistics (J=11, Q=4, T=16) over whichever coefficient blocks the input files store'
+            # Which blocks a file actually carries depends on its variant -- the causal one
+            # produces no cross-phase block -- so this says what was measured over rather than
+            # naming blocks that may not be there.
+            'description': (
+                'Statistics (J=11, Q=4, T=16) over whichever coefficient blocks the input '
+                'files store'
+            ),
         },
-        # Must match the loader's trim_minutes, because statistics are
-        # accumulated over the trimmed region only. Production uses 1.0
-        # (240 raw samples / 15 decimated steps per end -> 300-step,
-        # 20-minute model input). A mismatch normalises with the wrong
-        # mean/std and only produces a warnings.warn at load time.
-        trim_minutes=1.0,
+        trim_minutes=trim_minutes,
         device=device,
-        plot_histograms=True,  # Enable histogram plotting
-        max_histogram_samples=50000
+        plot_histograms=True if plot_histograms is None else plot_histograms,
+        histograms_dir=histograms_dir,
+        max_histogram_samples=(
+            50000 if max_histogram_samples is None else max_histogram_samples
+        ),
     )
-    
-    # Verify saved stats by reloading
-    calculator = DatasetStatsCalculator(device=device)
-    loaded_stats = calculator.load_stats(output_file)
-    print("\n--- Verifying saved stats by reloading and printing summary ---")
-    calculator.print_stats_summary(loaded_stats)
+    return 0
 
-    print("\nScript finished successfully.")
-    
+
+def _cli(argv: Optional[List[str]] = None) -> int:
+    """Merge the command line over the launch dict and run. Returns the process exit code.
+
+    Args:
+        argv: Command-line arguments; ``None`` reads ``sys.argv[1:]``.
+
+    Returns:
+        The process exit code.
+
+    Raises:
+        SystemExit: If either required path was supplied by neither route, naming both ways in.
+    """
+    values, sources = resolve_launch_args(build_parser(), RUN_ARGS, argv)
+    refusal = missing_required(values, ("input_files", "output_file"))
+    if refusal:
+        raise SystemExit(refusal)
+    if os.path.abspath(os.getcwd()) != _REPO_ROOT:
+        # Shard paths are repo-root-relative in every committed invocation, and a relative path
+        # resolved against an arbitrary working directory surfaces as a missing-file warning and
+        # an empty statistics file rather than as the path problem it is.
+        os.chdir(_REPO_ROOT)
+    print(
+        "resolved arguments: "
+        + ", ".join(f"{key}={values[key]!r} (from {sources[key]})" for key in sorted(values))
+    )
+    return main(**values)
+
+
+#: **Edit the values below and press Run. There is no command line to type.**
+#:
+#: This dict is the whole operator surface of this file. Every key is used verbatim when the
+#: corresponding flag is absent from the command line, so with no arguments at all the run is
+#: exactly what is written here. (The parser above exists so the same build is also scriptable and
+#: so a one-off can override a single value without editing the file; nothing requires using it.)
+#:
+#: **Fill in the two paths marked FILL IN.** The rest have working defaults.
+#:
+#: ``input_files`` takes **all** the shards of one dataset. Statistics computed over a subset
+#: normalise the rest with constants they never contributed to, and nothing downstream says so.
+#:
+#: ``trim_minutes`` **must match the loader's own setting.** Statistics are accumulated over the
+#: trimmed window only, so a mismatch normalises the data with constants drawn from a window
+#: nothing serves -- and it produces a ``warnings.warn`` at load time and nothing else. Production
+#: uses ``1.0``: 240 raw samples, 15 decimated steps per end, leaving the 300-step model input.
+#:
+#: A statistics file belongs to **one** variant. The transform and the phase-harmonic leg
+#: alignment of whatever ``input_files`` points at are both recorded here, and pairing this file
+#: with a dataset built at either other setting is refused by name at load time -- which matters
+#: most for the alignment, because an aligned shard and an unaligned one have identical widths and
+#: every other check passes.
+RUN_ARGS: Dict[str, Any] = {
+    # ---- FILL IN: every shard of one dataset, and where the statistics go ----
+    "input_files": [
+        r"C:\Users\mahdi\Desktop\McGill\data\acidosis_no_cs.hdf5",
+    ],
+    "output_file": r"C:\Users\mahdi\Desktop\McGill\data\stats.hdf5",
+
+    # ---- Must match the loader ----
+    "trim_minutes": 1.0,
+
+    # ---- Everything below has a working default ----
+    "device": None,                 # e.g. "cuda:0"; None autodetects
+    "batch_size": None,             # samples per read, memory only; default 100
+    "plot_histograms": None,        # default on
+    "histograms_dir": None,         # default beside the output file
+    "max_histogram_samples": None,  # default 50000
+}
+
+
+if __name__ == "__main__":
+    sys.exit(_cli())
