@@ -30,6 +30,7 @@ import pytest
 import yaml
 
 from teb_vae.lag_attn.config import load_config
+from teb_vae.lag_attn_cfs.causal_warmup import resolve_warmup_budget
 from teb_vae.lag_attn_crws.nets.causal_raw_inputs import CausalRawInputs
 from teb_vae.lag_attn_crws.trainer import LagAttnCrwsTrainer
 
@@ -116,8 +117,14 @@ def test_a_trim_that_does_not_produce_the_declared_window_is_refused_naming_both
 # The geometry
 # --------------------------------------------------------------------------------------
 def test_a_floor_that_does_not_pair_with_the_budget_is_refused_naming_both_numbers(config):
-    r"""$F \ge B - 1$ over the **survivors**, checked here so a mis-paired configuration fails before
-    a run directory exists rather than inside the constructor after every rank initialised."""
+    r"""$F \ge \max(B - 1,\; \max_c(W'_c + d_c))$ over the **survivors**, checked here so a mis-paired
+    configuration fails before a run directory exists rather than inside the constructor after every
+    rank initialised.
+
+    At the shipped configuration the second half binds: the aligned inputs are honest at the anchor
+    only from $B = 134$, so the floor is $134$ rather than the $133$ the scored-target half alone
+    would admit. The requirement is asserted beside the number, because the two halves differ by one
+    step and a message naming the wrong one would still name a plausible integer."""
     _vae(config)["warmup_period"] = 132
 
     with pytest.raises(ValueError) as excinfo:
@@ -125,7 +132,8 @@ def test_a_floor_that_does_not_pair_with_the_budget_is_refused_naming_both_numbe
 
     message = str(excinfo.value)
     assert "warmup_period=132" in message
-    assert "134" in message and "133" in message
+    assert "134" in message
+    assert "shifted onto a common clock" in message
 
 
 def test_the_floor_refusal_is_the_constructors_own_and_states_the_input_warmth_policy(config):
@@ -135,11 +143,18 @@ def test_the_floor_refusal_is_the_constructors_own_and_states_the_input_warmth_p
     objective -- it would decode anchors whose *inputs* are still partly pre-recording history, which
     is a different claim about the run rather than a wrong number in it."""
     _vae(config)["warmup_period"] = 100
+    resolved = resolve_warmup_budget(config)
+    assert resolved is not None
 
     with pytest.raises(ValueError) as preflight_error:
         LagAttnCrwsTrainer.preflight(config)
+    # The same three arguments the pre-flight resolves, shifts included: the refusal has one branch
+    # per alignment state, so a direct call that dropped the shifts would compare an aligned message
+    # against an unaligned one and fail on the wording rather than on the delegation.
     with pytest.raises(ValueError) as constructor_error:
-        CausalRawInputs._check_anchor_floor(100, (0, 134))
+        CausalRawInputs._check_anchor_floor(
+            100, resolved.target.warmup_steps, resolved.target.align_delays or ()
+        )
 
     assert str(preflight_error.value) == str(constructor_error.value)
     assert "input-warmth" in str(preflight_error.value)

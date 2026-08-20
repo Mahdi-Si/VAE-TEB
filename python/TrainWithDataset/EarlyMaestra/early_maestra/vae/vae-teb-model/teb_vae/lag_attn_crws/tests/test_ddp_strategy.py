@@ -10,9 +10,13 @@ what this cell changes about it is a live question on four counts:
 
 * the availability mask is now **load-bearing** rather than a guard that happens to be off;
 * ``start_embed`` is **conditionally constructed** -- it exists only when every channel of a stream
-  waits at least one step -- so a budget change flips a parameter into existence that is reached
-  only by the leading steps of a segment. That is a construction-time hazard, not a width change,
-  and the pre-flight refuses the one configuration that triggers it;
+  is unavailable for at least one step -- so a configuration change flips a parameter into
+  existence that is reached only by the leading steps of a segment. That is a construction-time
+  hazard, not a width change. Two things now trigger it: dropping the first source block, which the
+  pre-flight refuses by name, and the **channel alignment**, which the shipped configuration
+  enables and which puts one on *both* streams. The second is safe and the tests below say why --
+  the leading region it is live on is the leading region of every segment, so every rank reaches
+  it in every backward;
 * the decoder log-variance head is consumed only under ``gaussian_nll``, while ``tiny.yaml`` ships
   ``mse``. Its width is $R$ rather than a resolved channel count, which is the one thing about this
   starvation that a budget cannot move;
@@ -253,34 +257,55 @@ def test_the_attention_projection_is_frozen_out_of_the_expectation_set(task):
 # --------------------------------------------------------------------------------------
 # The start embedding: a construction-time hazard rather than a width
 # --------------------------------------------------------------------------------------
-def test_the_shipped_budget_builds_no_start_embedding_on_either_stream():
-    """The property the shipped configuration depends on, asserted so a budget change that flipped
-    it is visible. Both streams reach warm-up zero at the shipped budget -- the target because
-    ``fhr_st``'s fastest channels are honest from step $0$, the source because ``up_st``'s are -- so
-    neither adapter builds the start indicator, and there is no parameter reached only by the
-    leading steps of a segment."""
+def test_the_shipped_aligned_budget_builds_a_start_embedding_on_both_streams():
+    r"""The shipped configuration builds it, and the reason it is not the hazard it would once have
+    been.
+
+    Both streams reach warm-up zero on their own -- the target because ``fhr_st``'s fastest channels
+    are honest from step $0$, the source because ``up_st``'s are -- but the adapter is fed
+    $W'_c + d_c$, and the alignment shifts every channel of both streams onto one clock. The
+    combined minimum is therefore the fastest channel's *shift*, $91$ steps, and the adapter builds
+    a start indicator on each stream: a learned $d_{\mathrm{model}}$-wide vector per stream, live
+    on the leading region where no channel of that stream has arrived at all.
+
+    **Why ``find_unused_parameters=False`` still holds.** A parameter reached only by *some* batches
+    is the hazard; this one is reached by every batch of every rank, because the leading $91$ steps
+    are the leading steps of every segment the loader serves and the term is added unconditionally
+    in the forward -- the branch is ``self.start_embed is not None``, a test on a module built in
+    ``__init__``, never on tensor content. The two facts are asserted together, because the first
+    without the second reads as a regression.
+    """
     torch.manual_seed(0)
     model = SeqVaeLagAttnCrws(**shipped_warmup_kwargs())
 
     assert min(model.target_warmup_steps) == 0
     assert min(model.source_warmup_steps) == 0
     for adapter in (model.target_adapter, model.source_adapter):
-        assert getattr(adapter, "start_embed", None) is None
+        assert adapter.start_embed is not None
+        assert adapter.min_delay == 91
+        # Live on the leading region of every segment, and only there.
+        indicator = adapter.start_indicator.squeeze(-1)
+        assert bool(indicator[: adapter.min_delay].all())
+        assert not bool(indicator[adapter.min_delay :].any())
 
 
-def test_dropping_the_first_source_block_would_build_one_and_the_preflight_refuses_it():
-    """The negative control on the test above, and the reason the refusal exists.
+def test_the_unaligned_arm_builds_none_and_dropping_the_first_source_block_would():
+    """The comparison arm keeps the original property, and the negative control on it.
 
-    Without ``up_st`` the source's fastest surviving channel waits $41$ steps, so every step below
-    that has no available channel at all and the adapter builds its start embedding -- a parameter
-    reached only by the leading steps of a segment. Under ``find_unused_parameters=False`` a rank
-    whose batch never reaches those steps marks it unready and the reducer raises; and it is a
-    *construction-time* change, so no shape and no width anywhere says it happened.
+    With no alignment reference the gate is a pure gather, the adapter is fed the warm-up alone and
+    both streams reach zero, so neither builds a start indicator. Without ``up_st`` the source's
+    fastest surviving channel waits $41$ steps, so every step below that has no available channel at
+    all and the adapter builds one -- a *construction-time* change, with no shape and no width
+    anywhere saying it happened, which is why the pre-flight refuses that configuration by name.
     """
     from teb_vae.lag_attn.config import load_config
 
     torch.manual_seed(0)
-    source_only = shipped_warmup_kwargs()
+    unaligned = SeqVaeLagAttnCrws(**shipped_warmup_kwargs(align=False))
+    for adapter in (unaligned.target_adapter, unaligned.source_adapter):
+        assert getattr(adapter, "start_embed", None) is None
+
+    source_only = shipped_warmup_kwargs(align=False)
     keep = [
         index
         for index, step in enumerate(source_only["source_warmup_steps"])

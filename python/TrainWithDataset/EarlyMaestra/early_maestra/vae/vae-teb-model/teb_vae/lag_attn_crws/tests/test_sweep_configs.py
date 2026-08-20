@@ -10,7 +10,7 @@ That is the axis rather than a second delta, and the test below states it as suc
 **There is deliberately no floor arm**, and the absence is the record rather than an omission. The
 anchor floor here is a declared input-warmth policy rather than a validity requirement -- the raw
 target is honest at every step -- so the interesting move would be *downward*, to the model's own
-$30$-step warm-up, which buys $240$ anchors against $137$. Both the constructor and the pre-flight
+$30$-step warm-up, which buys $240$ anchors against $136$. Both the constructor and the pre-flight
 refuse it, from one function, and lifting that refusal changes what a run **claims** rather than what
 the data supports. It belongs in the design record, not in a launchable file.
 
@@ -266,4 +266,4 @@ def test_the_stride_arm_restores_the_dense_anchor_set():
     floor, stride, _horizon, t_valid = _geometry(_resolved("sweep_anchor_stride_1.yaml"))
 
     assert stride == 1
-    assert -(-(t_valid - floor) // stride) == t_valid - floor == 137
+    assert -(-(t_valid - floor) // stride) == t_valid - floor == 136

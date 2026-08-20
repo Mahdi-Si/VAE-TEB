@@ -79,6 +79,7 @@ from teb_vae.lag_attn_crws.tests.test_docs import (  # noqa: E402
     FORBIDDEN_TOKENS,
     FORWARD_DICT_KEYS,
     OMITTED_HEADING,
+    RUN_RECORD_FIELDS,
     REVERT_FILES,
     STUDY_HEADINGS,
     _differing_names,
@@ -256,16 +257,23 @@ def test_the_input_representation_delta_decomposes_into_the_two_terms_the_design
     by parameter name, not only summed.
 
     **The horizon embedding used to be the second term and is now exactly zero**, because this cell
-    forecasts $30$ steps like the raw-signal sibling it is compared against. It is computed rather
-    than deleted so a future horizon divergence reappears as a failing sum."""
+    forecasts $30$ steps like the raw-signal sibling it is compared against. **The two start
+    embeddings used to be a third and are now exactly zero too**: the reach guard builds both and
+    this cell built neither until the alignment made its shifted warm-up start above zero on both
+    streams. Both are computed rather than deleted so either divergence reappears as a failing
+    sum."""
     section = _markdown_section(design, "## 13. ")
     delta = measured_totals["trf_crws_guarded"] - measured_totals["trf_rws_guarded"]
 
     horizon_embedding = (30 - 30) * 256
-    adapters = 128 * (98 - 78) * 2 + 128 * (51 - 29) * 2 - 256
+    start_embeddings = (2 - 2) * 128
+    adapters = 128 * (98 - 78) * 2 + 128 * (47 - 29) * 2
 
     assert horizon_embedding == 0, "the two horizons diverged; §13 needs its second term back"
-    assert delta == horizon_embedding + adapters
+    assert start_embeddings == 0, (
+        "one of the two cells stopped building both start embeddings; §13 needs that term back"
+    )
+    assert delta == horizon_embedding + start_embeddings + adapters
     assert delta == measured_totals["crws_guarded"] - measured_totals["rws_guarded"]
     differing = _differing_names(
         measured_models["trf_crws_guarded"], measured_models["trf_rws_guarded"]
@@ -280,20 +288,20 @@ def test_the_input_representation_delta_decomposes_into_the_two_terms_the_design
         == measured_models["trf_rws_guarded"].decoder.mean_head.out_features
         == 16
     )
-    for value in (delta, adapters, -horizon_embedding):
+    for value in (delta, adapters):
         assert str(value) in _unseparated(section), value
 
 
 def test_the_guard_delta_is_the_two_availability_projections_alone(
     design, measured_totals, measured_models
 ):
-    """Nothing in this target domain widens a head, so every parameter the budget adds is under an
+    """Nothing in this target domain widens a head, so every parameter the guard adds is under an
     adapter -- asserted by name -- and the arithmetic §13 states for it is evaluated."""
     section = _markdown_section(design, "## 13. ")
     guard = measured_totals["trf_crws_guarded"] - measured_totals["trf_crws_ungated"]
     sibling = measured_totals["trf_rws_guarded"] - measured_totals["trf_rws_ungated"]
 
-    assert guard == 128 * 98 + 128 * 51 - 128 * 4
+    assert guard == 128 * 98 + 128 * 47 + 2 * 128 - 128 * 4 - 128 * 4
     for name in _differing_names(
         measured_models["trf_crws_guarded"], measured_models["trf_crws_ungated"]
     ):
@@ -539,9 +547,11 @@ def test_the_bottleneck_health_table_carries_every_readout(name, results):
 def test_every_backticked_metric_name_in_the_record_is_one_the_run_emits(results):
     """The general form of the checks above, over the whole document. Restricted to names that look
     like metric identifiers, so config keys, file names and prose survive it. The two forward-dict
-    keys and the eight dropped readouts share the shape and not the namespace and are admitted by
-    name; the dropped ones are asserted absent from the tracked surface above, so admitting them
-    here cannot hide a column that crept back in."""
+    keys, the eight dropped readouts and the two run-record fields share the shape and not the
+    namespace and are admitted by name; the dropped ones are asserted absent from the tracked
+    surface above, so admitting them here cannot hide a column that crept back in, and the
+    run-record ones live in the resolved-config dump and the preflight disclosure rather than in
+    any logged row."""
     candidates = set(re.findall(r"`([a-z][a-z0-9_]{4,})`", results))
     metric_shaped = {
         name
@@ -556,6 +566,7 @@ def test_every_backticked_metric_name_in_the_record_is_one_the_run_emits(results
         if not any(tracked.startswith(name) for tracked in _TRACKED_SUFFIXES)
         and name not in FORWARD_DICT_KEYS
         and name not in DROPPED_READOUTS
+        and name not in RUN_RECORD_FIELDS
     )
     assert unknown == [], unknown
 

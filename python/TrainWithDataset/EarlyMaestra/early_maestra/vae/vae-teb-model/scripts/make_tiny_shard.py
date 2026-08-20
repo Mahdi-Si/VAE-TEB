@@ -23,6 +23,15 @@ schema, the warm-up attributes and the channel plan all come from the production
 through the same import shim the dataset tests use, so nothing about the file's self-description is
 restated here.
 
+The causal shard is written with the phase-harmonic legs **envelope-aligned**, which is what the
+shipped model configuration expects and what its ``causal_leg_alignment`` root attribute records.
+The exact invocation that produced the two committed causal binaries is
+
+    python scripts/make_tiny_shard.py --variants causal --leg-alignment envelope
+
+and the unaligned variant stays one flag away (``--leg-alignment none``) so a comparison arm can be
+built without editing anything.
+
 **Causal multi-cohort** (``causal_cohort``) is the causal mode again, written into one shard per
 canonical subgroup with real clinical class codes, the two label axes and a labour-onset column --
 the cohort structure the evaluation pipeline's every by-class and by-subgroup readout needs, and
@@ -68,6 +77,7 @@ if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
 from hdf5_dataset.calculate_dataset_stats import calculate_and_save_dataset_stats  # noqa: E402
+from hdf5_dataset.causal_scattering import LEG_ALIGNMENT_MODES  # noqa: E402
 
 #: Minutes trimmed from each end. Matches the shipped config, so the fixture exercises the real
 #: trim path rather than a geometry no production run uses.
@@ -239,7 +249,9 @@ def read_causal_source(n_samples: int, signal_len: int) -> Dict[str, np.ndarray]
         }
 
 
-def causal_transform(n_samples: int, seq_len: int) -> Dict[str, Any]:
+def causal_transform(
+    n_samples: int, seq_len: int, leg_alignment: str = LEG_ALIGNMENT_MODES[0]
+) -> Dict[str, Any]:
     """Run the real causal bank over the committed raw segments, once.
 
     Shared by both causal modes rather than written twice, and the sharing is the point: what a
@@ -247,12 +259,19 @@ def causal_transform(n_samples: int, seq_len: int) -> Dict[str, Any]:
     filter bank would be a second warm-up boundary. Both callers therefore get their coefficients,
     their channel plan and their widths from one place.
 
-    There is no seed: the result is a deterministic function of the committed raw segments and the
-    filter bank, which is what makes it re-derivable rather than merely reproducible.
+    There is no seed: the result is a deterministic function of the committed raw segments, the
+    filter bank and the leg alignment, which is what makes it re-derivable rather than merely
+    reproducible.
+
+    The alignment is threaded into the mask resolution *and* the transform from one argument, so
+    the coefficients a caller writes and the ``causal_leg_alignment`` the writer stamps beside them
+    cannot describe two different operators.
 
     Args:
         n_samples: Segments to take from the committed raw fixture.
         seq_len: On-disk (untrimmed) feature-grid length.
+        leg_alignment: The phase-harmonic leg alignment, one of
+            :data:`~hdf5_dataset.causal_scattering.LEG_ALIGNMENT_MODES`.
 
     Returns:
         ``{'pipeline', 'masks', 'widths', 'raw', 'blocks', 'signal_len'}`` -- the production
@@ -270,7 +289,11 @@ def causal_transform(n_samples: int, seq_len: int) -> Dict[str, Any]:
 
     device = torch.device("cpu")
     masks = pipeline.compute_scattering_masks(
-        signal_len, scattering_T=DECIMATION, device=device, transform="causal"
+        signal_len,
+        scattering_T=DECIMATION,
+        device=device,
+        transform="causal",
+        leg_alignment=leg_alignment,
     )
     blocks = transform_batch_numpy(
         CausalTorchBank(masks["causal_bank"], device, n_signal=signal_len),
@@ -279,6 +302,7 @@ def causal_transform(n_samples: int, seq_len: int) -> Dict[str, Any]:
         pipeline._selection_pairs(masks["fhr_ph_selection"]),
         pipeline._selection_pairs(masks["up_ph_selection"]),
         plan=masks["channel_plan"],
+        leg_alignment=leg_alignment,
     )
     return {
         "pipeline": pipeline,
@@ -293,10 +317,11 @@ def causal_transform(n_samples: int, seq_len: int) -> Dict[str, Any]:
 def create_causal_file(path: str, transformed: Dict[str, Any], seq_len: int) -> None:
     """Create one empty causal HDF5 through the production writer.
 
-    The schema, the root constants and the per-block warm-up and delay attributes are all the
-    production writer's, reached through the import shim that stubs the prod-only adaptor. Nothing
-    about the file's self-description is restated here, because a second description of a warm-up
-    boundary is a second boundary.
+    The schema, the root constants and the per-block warm-up, delay and novelty attributes are all
+    the production writer's, reached through the import shim that stubs the prod-only adaptor.
+    Nothing about the file's self-description is restated here, because a second description of a
+    warm-up boundary is a second boundary. The leg alignment and the novelty vectors travel in the
+    resolved masks for the same reason: they come from the bank that produced the coefficients.
 
     Args:
         path: Destination ``.hdf5`` path. Overwritten if present.
@@ -320,21 +345,27 @@ def create_causal_file(path: str, transformed: Dict[str, Any], seq_len: int) -> 
         up_ph_selection=masks["up_ph_selection"],
         transform="causal",
         channel_plan=masks["channel_plan"],
+        leg_alignment=masks["causal_leg_alignment"],
+        novelty_frac=masks["causal_novelty_frac"],
     )
 
 
-def write_causal_shard(path: str, *, n_samples: int, seq_len: int) -> Dict[str, Any]:
+def write_causal_shard(
+    path: str, *, n_samples: int, seq_len: int, leg_alignment: str = LEG_ALIGNMENT_MODES[0]
+) -> Dict[str, Any]:
     """Write the single-file causal shard, transforming real raw segments with the real causal bank.
 
     Args:
         path: Destination ``.hdf5`` path. Overwritten if present.
         n_samples: Segments to take from the committed raw fixture.
         seq_len: On-disk (untrimmed) feature-grid length.
+        leg_alignment: The phase-harmonic leg alignment the phase blocks are built with, recorded
+            on the file as ``causal_leg_alignment``.
 
     Returns:
         The resolved per-block widths, so a caller can report what it wrote.
     """
-    transformed = causal_transform(n_samples, seq_len)
+    transformed = causal_transform(n_samples, seq_len, leg_alignment)
     blocks, raw = transformed["blocks"], transformed["raw"]
     create_causal_file(path, transformed, seq_len)
 
@@ -471,7 +502,9 @@ def cohort_weight_profile(seq_len: int) -> np.ndarray:
     return weight
 
 
-def write_causal_cohort_shards(directory: str, *, seq_len: int) -> List[str]:
+def write_causal_cohort_shards(
+    directory: str, *, seq_len: int, leg_alignment: str = LEG_ALIGNMENT_MODES[0]
+) -> List[str]:
     """Write one causal shard per canonical subgroup, from the real bank over real segments.
 
     The bank runs ONCE over the committed raw fixture and every shard selects rows from its output,
@@ -491,6 +524,8 @@ def write_causal_cohort_shards(directory: str, *, seq_len: int) -> List[str]:
         directory: Destination directory, created if absent. One ``<subgroup>.hdf5`` per entry of
             :data:`COHORT_SUBGROUPS` is written into it, overwriting any already there.
         seq_len: On-disk (untrimmed) feature-grid length.
+        leg_alignment: The phase-harmonic leg alignment every written shard is built at and
+            records; the eight files must agree, or the loader refuses the mixed list.
 
     Returns:
         The written shard paths, in :data:`COHORT_SUBGROUPS` order.
@@ -505,7 +540,7 @@ def write_causal_cohort_shards(directory: str, *, seq_len: int) -> List[str]:
             f"WITHIN one is not, because it would make that shard's per-recording aggregation an "
             f"average of identical rows."
         )
-    transformed = causal_transform(available, seq_len)
+    transformed = causal_transform(available, seq_len, leg_alignment)
     blocks, raw = transformed["blocks"], transformed["raw"]
     pipeline = transformed["pipeline"]
 
@@ -586,6 +621,10 @@ RUN_ARGS: Dict[str, Any] = {
     # Seed for the two-sided shard's synthesised values; None -> 0. Neither causal mode has a seed:
     # both are deterministic functions of the committed raw segments and the filter bank.
     "seed": None,
+    # Phase-harmonic leg alignment for the two causal variants: 'envelope' or 'none'; None ->
+    # 'envelope', which is what the committed binaries carry and what the shipped model configs
+    # expect. Ignored by 'two_sided', which has no causal phase block at all.
+    "leg_alignment": None,
 }
 
 #: Defaults applied after the merge, so every key above stays reachable from the dict.
@@ -595,6 +634,7 @@ _DEFAULTS: Dict[str, Any] = {
     "samples": 4,
     "seq_len": 330,
     "seed": 0,
+    "leg_alignment": "envelope",
 }
 
 VARIANT_CHOICES = ("two_sided", "causal", "causal_cohort")
@@ -637,6 +677,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="On-disk feature length before trimming (330 -> 300 after trim_minutes=1.0).",
     )
     parser.add_argument("--seed", type=int, help="Seed for the two-sided shard's values.")
+    parser.add_argument(
+        "--leg-alignment",
+        dest="leg_alignment",
+        choices=LEG_ALIGNMENT_MODES,
+        help=(
+            "Phase-harmonic leg alignment for the causal variants; 'envelope' by default, which "
+            "is what the committed binaries carry. 'none' builds the legacy comparison arm."
+        ),
+    )
     return parser
 
 
@@ -674,12 +723,17 @@ def main(argv: Optional[List[str]] = None) -> int:
         elif variant == "causal":
             shards = [os.path.join(values["out_dir"], "tiny_shard_causal.hdf5")]
             widths = write_causal_shard(
-                shards[0], n_samples=values["samples"], seq_len=values["seq_len"]
+                shards[0],
+                n_samples=values["samples"],
+                seq_len=values["seq_len"],
+                leg_alignment=values["leg_alignment"],
             )
-            print(f"  causal widths: {widths}")
+            print(f"  causal widths: {widths}, leg alignment: {values['leg_alignment']}")
         else:
             shards = write_causal_cohort_shards(
-                values["out_dir"], seq_len=values["seq_len"]
+                values["out_dir"],
+                seq_len=values["seq_len"],
+                leg_alignment=values["leg_alignment"],
             )
         for path in shards:
             print(f"wrote {path}")

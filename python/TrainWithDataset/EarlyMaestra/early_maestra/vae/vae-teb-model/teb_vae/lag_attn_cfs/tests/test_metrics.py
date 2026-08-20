@@ -1,11 +1,11 @@
-r"""The seven added readouts, and the eighth that is not a reduction of anything already in hand.
+r"""The ten added readouts, and the eleventh that is not a reduction of anything already in hand.
 
 Almost all of them are partial sums or fractions of quantities the objective already computes, so
 what is checked is exactly that: that each is the partial sum it claims to be, over the denominator
 it claims, of the number it is printed beside. A readout that recomposes to nothing is four
 unrelated numbers with suggestive names.
 
-Two of the seven are **guards** rather than results and are tested as such. ``target_warm_frac``
+Two of the ten are **guards** rather than results and are tested as such. ``target_warm_frac``
 must read exactly $1.0$ and ``anchors_per_sample`` must sit at its geometry-derived value; a row
 outside either means the geometry broke, not that the model learned something. Both are asserted
 against values re-derived here from the geometry rather than against literals, so a horizon or
@@ -44,9 +44,10 @@ from teb_vae.lag_attn_cfs.tests.conftest import (
 from teb_vae.lag_attn_rws.nets import controls
 from teb_vae.lag_attn_rws.nets.losses import raw_sample_score
 
-#: The two per-block source-warmth columns, and the three warm-up tertiles, named once.
+#: The two per-block source-warmth columns, and the two three-way channel splits, named once.
 _WARMTH_KEYS = ("source_lag_warmth_frac_st", "source_lag_warmth_frac_ph")
 _TERTILE_KEYS = ("pred_gap_warm_lo", "pred_gap_warm_mid", "pred_gap_warm_hi")
+_NOVELTY_KEYS = ("pred_gap_novel_lo", "pred_gap_novel_mid", "pred_gap_novel_hi")
 
 #: The tolerance the two channel-axis splits are compared against each other at. Both are reduced
 #: from the same elementwise term over the same mask and the same denominator, so they agree to
@@ -188,8 +189,8 @@ def test_a_floor_that_violates_the_pairing_cannot_be_constructed() -> None:
 # =================================================================================================
 def test_the_anchor_count_is_the_geometry_derived_tile_count_at_train_stride() -> None:
     r"""Every phase in $[0, S)$ at once, so the reported mean is the real one:
-    $\lceil (T_{\mathrm{valid}} - F - \varphi)/S \rceil$, which at the shipped geometry is $11$
-    for $\varphi \le 16$ and $4$ otherwise, summing to $137$ and averaging to $137/30$.
+    $\lceil (T_{\mathrm{valid}} - F - \varphi)/S \rceil$, which at the shipped geometry is $5$
+    for $\varphi \le 15$ and $4$ otherwise, summing to $136$ and averaging to $136/30$.
 
     The numbers are re-derived here from the geometry rather than written down, so a horizon change
     moves the expectation with the model instead of failing this test.
@@ -202,7 +203,7 @@ def test_the_anchor_count_is_the_geometry_derived_tile_count_at_train_stride() -
     metrics = _synthetic_gaps(model, phase, stride, batch=stride)
 
     per_phase = [-(-(span - value) // stride) for value in range(stride)]
-    assert span == 137 and stride == SHIPPED_HORIZON
+    assert span == 136 and stride == SHIPPED_HORIZON
     assert min(per_phase) == 4 and max(per_phase) == 5
     assert sum(per_phase) == span
     assert float(metrics["anchors_per_sample"]) == pytest.approx(span / stride, rel=1e-6)
@@ -210,14 +211,14 @@ def test_the_anchor_count_is_the_geometry_derived_tile_count_at_train_stride() -
 
 def test_the_anchor_count_is_the_whole_valid_range_at_the_validation_stride() -> None:
     r"""Validation and test decode every valid anchor, so the count is
-    $T_{\mathrm{valid}} - F = 137$ exactly -- not a tile set at one fixed phase, which would sample
-    the same $11$ positions of every segment forever."""
+    $T_{\mathrm{valid}} - F = 136$ exactly -- not a tile set at one fixed phase, which would sample
+    the same $5$ positions of every segment forever."""
     model = build(shipped_warmup_kwargs())
     span = model.geometry.t_valid - model.warmup_period
 
     metrics = _synthetic_gaps(model, None, 1, batch=2)
 
-    assert span == 137
+    assert span == 136
     assert float(metrics["anchors_per_sample"]) == float(span)
 
 
@@ -248,9 +249,15 @@ def test_the_source_warmth_split_is_taken_at_the_resolved_block_boundary() -> No
     split = CausalFeatureForecastTarget.SOURCE_BLOCK_SPLIT
     waits = kwargs["source_warmup_steps"]
 
-    first = [step for index, step in enumerate(waits) if index < split]
-    second = [step for index, step in enumerate(waits) if index >= split]
-    assert len(first) == split and len(second) == CAUSAL_C_U - split
+    # DECLARED coordinates, through the keep-index, and the alignment is what made that distinction
+    # load-bearing: the reference drops four `up_st` channels, so the survivors' vector is 47 long
+    # and a split taken positionally at 36 would put eleven `up_ph` channels in the `st` block and
+    # report both fractions against the wrong denominators, with nothing failing.
+    declared = list(kwargs["source_keep_index"])
+    first = [step for index, step in zip(declared, waits) if index < split]
+    second = [step for index, step in zip(declared, waits) if index >= split]
+    assert len(first) == 32 and len(second) == CAUSAL_C_U - split
+    assert len(first) + len(second) == len(waits) < CAUSAL_C_U
 
     for pattern, block in (
         (model.source_block_warm_st, first),
@@ -355,12 +362,26 @@ def test_the_tertile_boundaries_move_when_the_budget_moves() -> None:
         if step <= 100
     ]
     steps = [step for step in narrow_kwargs["target_warmup_steps"] if step <= 100]
+    # The shift vector is positional over the survivors, so it narrows with them; leaving it at the
+    # full width is refused by name at ``ChannelDelay`` rather than silently shifting the wrong
+    # channels, which is the guard doing its job on this very test.
+    shifts = [
+        shift
+        for shift, step in zip(narrow_kwargs["target_align_delays"], narrow_kwargs["target_warmup_steps"])
+        if step <= 100
+    ]
     narrow = build(
         dict(
             narrow_kwargs,
             target_keep_index=tuple(keep),
             target_warmup_steps=tuple(steps),
-            warmup_period=max(steps) - 1,
+            target_align_delays=tuple(shifts),
+            # Both halves of the floor: the scored target asks for max(steps) - 1, the shifted
+            # inputs for max(step + shift), and the narrowed stream is bound by the second.
+            warmup_period=max(
+                max(steps) - 1,
+                max(step + shift for step, shift in zip(steps, shifts)),
+            ),
         )
     )
 
@@ -402,11 +423,16 @@ def test_both_channel_splits_recompose_to_the_gap_they_are_read_beside(
     total = float(metrics["pred_gap"])
     assert total != 0.0, "the probe is vacuous on an unperturbed model"
     tertiles = sum(float(metrics[name]) for name in _TERTILE_KEYS)
+    novelty = sum(float(metrics[name]) for name in _NOVELTY_KEYS)
     blocks = float(metrics["pred_gap_st"]) + float(metrics["pred_gap_ph"])
 
     assert tertiles == pytest.approx(blocks, rel=_SPLIT_TOL, abs=1e-9)
+    # The novelty split is a third partition of the same per-channel vector, so it recomposes to
+    # the same number as the other two and at the same tolerance.
+    assert novelty == pytest.approx(blocks, rel=_SPLIT_TOL, abs=1e-9)
     slack = _CANCELLATION_EPS * abs(float(metrics["nll_base_block"]))
     assert tertiles == pytest.approx(total, abs=slack)
+    assert novelty == pytest.approx(total, abs=slack)
     assert blocks == pytest.approx(total, abs=slack)
 
 
@@ -440,12 +466,13 @@ def test_the_tertiles_are_zero_at_init_like_the_gap_they_decompose(perturb_poste
     model, streams, features = _tiled()
     _out, fresh = _metrics(model, streams, features, torch.tensor([0, 3]))
 
-    for name in _TERTILE_KEYS:
+    for name in _TERTILE_KEYS + _NOVELTY_KEYS:
         assert float(fresh[name]) == pytest.approx(0.0, abs=1e-6), name
 
     perturb_posterior(model)
     _out, moved = _metrics(model, streams, features, torch.tensor([0, 3]))
     assert any(float(moved[name]) != 0.0 for name in _TERTILE_KEYS)
+    assert any(float(moved[name]) != 0.0 for name in _NOVELTY_KEYS)
 
 
 def test_the_tertiles_carry_no_gradient() -> None:
@@ -682,3 +709,102 @@ def test_a_negative_weight_is_refused() -> None:
     as a loss that falls without bound."""
     with pytest.raises(ValueError, match="target_weight_ph"):
         _tiled(target_weight_st=1.0, target_weight_ph=-0.5)
+
+
+# =================================================================================================
+# The novelty tertiles
+# =================================================================================================
+def test_the_novelty_tertiles_partition_the_kept_channels_by_novelty_rank() -> None:
+    r"""The same rank rule as the warm-up split, applied to $\nu_c$ instead of $W'_c$.
+
+    Monotone in the stored share and gathered through the keep-index, which is what makes the three
+    columns a split of the block score by *how much of each coefficient is genuinely new* rather
+    than by position in the declared channel order.
+    """
+    kwargs = shipped_warmup_kwargs()
+    model = build(kwargs)
+    assignment = model.novelty_tertile_id.tolist()
+    kept = model.target_gate.keep_index.tolist()
+    shares = [kwargs["target_novelty_frac"][declared] for declared in kept]
+
+    counts = [assignment.count(group) for group in range(WARM_TERTILES)]
+    assert sum(counts) == len(kept) == model.decoder_out_channels
+    assert max(counts) - min(counts) <= 1
+
+    by_group = [
+        [shares[index] for index, group in enumerate(assignment) if group == value]
+        for value in range(WARM_TERTILES)
+    ]
+    for lower, upper in zip(by_group, by_group[1:]):
+        assert max(lower) <= min(upper)
+
+    # The split has something to say: the shipped bank runs the whole unit interval, from a channel
+    # the anchor has not seen at all to one that is 97% history over the same horizon.
+    assert min(shares) < 0.1 and max(shares) > 0.9
+
+
+def test_the_novelty_split_is_not_the_warm_up_split_under_another_name() -> None:
+    r"""Two questions about the same channels, and the answers differ.
+
+    They descend from one filter ladder, so a slow channel tends to be both late and mostly
+    history -- but the warm-up asks when a channel became a function of the recording at all, and
+    the novelty asks how much of what it reports at a *scored* step is still ahead of the anchor.
+    A channel warm across the whole window can carry $\nu = 0.026$. Asserted as a disagreement in
+    the assignment rather than as a correlation, which is the property that makes both columns
+    worth logging.
+    """
+    model = build(shipped_warmup_kwargs())
+    warm = model.warm_tertile_id.tolist()
+    novel = model.novelty_tertile_id.tolist()
+
+    assert warm != novel
+    assert sum(1 for a, b in zip(warm, novel) if a != b) > 0
+
+
+def test_the_novelty_vector_is_gathered_through_the_keep_index_not_taken_positionally() -> None:
+    """The failure this indirection exists for: a declared-width vector read positionally over the
+    survivors would attribute the four dropped channels' novelty to four channels that are kept.
+
+    Built by comparing against the split a *survivors*-length vector would produce, which is a
+    different partition -- so an implementation that dropped the gather fails here rather than
+    producing three plausible columns.
+    """
+    kwargs = shipped_warmup_kwargs()
+    model = build(kwargs)
+    declared = list(kwargs["target_novelty_frac"])
+    kept = model.target_gate.keep_index.tolist()
+
+    assert len(declared) > len(kept), "the fixture must drop a channel for this to bite"
+    gathered = CausalFeatureForecastTarget._resolve_novelty_tertiles(
+        [declared[index] for index in kept]
+    )
+    positional = CausalFeatureForecastTarget._resolve_novelty_tertiles(declared[: len(kept)])
+
+    assert tuple(model.novelty_tertile_id.tolist()) == gathered
+    assert gathered != positional
+
+
+def test_a_model_built_without_the_vector_still_reports_the_three_columns() -> None:
+    """The ungated comparison arm keeps the readout, because the readout is not part of the guard.
+
+    With no vector the partition falls back to the declared channel order -- which is a partition of
+    the axis and not a measurement of novelty -- and the point of asserting it is that the metric
+    surface does not depend on the arm. A *gated* feature run cannot reach this state: the mapping
+    refuses shards with no novelty vector rather than defaulting one.
+    """
+    model = build(dict(shipped_warmup_kwargs(), target_novelty_frac=None))
+
+    assert model.novelty_tertile_id.shape == model.warm_tertile_id.shape
+    assert sorted(set(model.novelty_tertile_id.tolist())) == list(range(WARM_TERTILES))
+
+
+def test_a_survivors_length_novelty_vector_is_refused_by_name() -> None:
+    """It is positional into the DECLARED axis, and a survivors-length one has the same dtype, the
+    same range and a plausible length -- so nothing but an explicit width check would catch it."""
+    kwargs = shipped_warmup_kwargs()
+    survivors = [
+        kwargs["target_novelty_frac"][index] for index in kwargs["target_keep_index"]
+    ]
+
+    with pytest.raises(ValueError, match="target_novelty_frac"):
+        build(dict(kwargs, target_novelty_frac=tuple(survivors)))

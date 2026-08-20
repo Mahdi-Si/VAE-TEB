@@ -47,7 +47,7 @@ from typing import Dict, List, Set
 import pytest
 
 from teb_vae.lag_attn_cfs.eval.verify import CFS_VERDICTS
-from teb_vae.lag_attn_cfs.model_kwargs import WARMUP_MODEL_KWARGS
+from teb_vae.lag_attn_cfs.model_kwargs import ALIGN_MODEL_KWARGS, WARMUP_MODEL_KWARGS
 from teb_vae.lag_attn_cfs.nets.causal_feature_target import CausalFeatureForecastTarget
 from teb_vae.lag_attn_cfs.nets.model import SeqVaeLagAttnCfs
 from teb_vae.lag_attn_cfs.trainer import LagAttnCfsTrainer
@@ -174,15 +174,23 @@ def measured_totals() -> Dict[str, int]:
         return sum(parameter.numel() for parameter in cls(**kwargs).parameters())
 
     def ungated(kwargs) -> Dict[str, object]:
-        # The four resolved channel tuples removed and nothing else, so the guarded and ungated
-        # arms differ in the guard alone rather than in a second hand-written keyword set.
-        return {key: value for key, value in kwargs.items() if key not in WARMUP_MODEL_KWARGS}
+        # Every resolved channel tuple removed and nothing else, so the guarded and ungated arms
+        # differ in the guard alone rather than in a second hand-written keyword set.
+        #
+        # BOTH tuples, and that is forced rather than chosen: a shift vector is positional over the
+        # SURVIVORS, so a stream that has lost its keep-index has no width for one to be positional
+        # against and ``ChannelDelay`` refuses it by name. "Ungated" therefore means the whole
+        # guard -- the warm-up mask and the common clock -- which is also what the number is read as.
+        dropped = set(WARMUP_MODEL_KWARGS) | set(ALIGN_MODEL_KWARGS)
+        return {key: value for key, value in kwargs.items() if key not in dropped}
 
     return {
         "cfs_guarded": total(SeqVaeLagAttnCfs, shipped_warmup_kwargs()),
         "cfs_ungated": total(SeqVaeLagAttnCfs, ungated(shipped_warmup_kwargs())),
         "trf_cfs_guarded": total(SeqVaeLagAttnTrfCfs, trf_warmup_kwargs()),
         "trf_cfs_ungated": total(SeqVaeLagAttnTrfCfs, ungated(trf_warmup_kwargs())),
+        "cfs_guarded_unaligned": total(SeqVaeLagAttnCfs, shipped_warmup_kwargs(align=False)),
+        "trf_cfs_guarded_unaligned": total(SeqVaeLagAttnTrfCfs, trf_warmup_kwargs(align=False)),
         "fs_guarded": total(SeqVaeLagAttnFs, shipped_gated_kwargs(120.0)),
         "fs_ungated": total(SeqVaeLagAttnFs, shipped_gated_kwargs(None)),
         "trf_fs_guarded": total(SeqVaeLagAttnTrfFs, trf_gated_kwargs(120.0)),
@@ -284,15 +292,23 @@ def test_the_target_axis_delta_decomposes_into_the_two_terms_the_design_states(
     **The horizon embedding used to be a third term and is now exactly zero**, because this cell and
     ``lag_attn_fs`` both forecast $30$ steps. It is computed rather than deleted so that a future
     horizon divergence between the two reappears here as a failing sum.
+
+    **The start embeddings used to be a fourth and are now exactly zero too.** They contributed
+    $-256$ while this cell built neither vector and ``lag_attn_fs`` built both; the alignment builds
+    both here as well, so the term vanishes -- and it is likewise computed rather than deleted.
     """
     section = _markdown_section(design, "## 13. ")
     delta = measured_totals["cfs_guarded"] - measured_totals["fs_guarded"]
 
     head = 514 * (98 - 78)
     horizon_embedding = (30 - 30) * 256
-    adapters = 128 * (98 - 78) * 2 + 128 * (51 - 29) * 2 - 256
+    start_embeddings = (2 - 2) * 128
+    adapters = 128 * (98 - 78) * 2 + 128 * (47 - 29) * 2 + start_embeddings
 
     assert horizon_embedding == 0, "the two cells' horizons diverged; §13 needs its third term back"
+    assert start_embeddings == 0, (
+        "one of the two cells stopped building both start embeddings; §13 needs that term back"
+    )
     assert delta == head + horizon_embedding + adapters, (
         f"the target-axis delta is {delta:+,}, which no longer decomposes into the decoder head "
         f"({head:+,}), the horizon embedding ({horizon_embedding:+,}) and the adapters "
@@ -336,8 +352,9 @@ def test_the_encoder_axis_delta_is_the_two_history_encoders(design, measured_tot
 
 def test_the_guard_delta_is_stated_with_the_sign_it_actually_has(design, measured_totals):
     """Two correct numbers that read as a contradiction unless the reason is written down: the
-    warm-up budget drops four channels so the availability projections dominate, while the
-    two-sided reach budget drops thirty-one so the narrowing does."""
+    warm-up budget drops four target channels and the alignment four source ones, so the machinery
+    the guard adds dominates, while the two-sided reach budget drops thirty-one so the narrowing
+    does."""
     section = _markdown_section(design, "## 13. ")
     causal = measured_totals["cfs_guarded"] - measured_totals["cfs_ungated"]
     two_sided = measured_totals["fs_guarded"] - measured_totals["fs_ungated"]
@@ -346,10 +363,33 @@ def test_the_guard_delta_is_stated_with_the_sign_it_actually_has(design, measure
         f"the guard now costs {causal:+,} here and {two_sided:+,} there; the section explains a "
         f"sign difference that no longer exists"
     )
-    # The three terms, as arithmetic rather than as three numbers that happen to be printed.
-    assert causal == 128 * 98 + 128 * 51 - 514 * 4 - 128 * 4
-    for value in (causal, two_sided, 128 * 98 + 128 * 51):
+    # The six terms, as arithmetic rather than as six numbers that happen to be printed.
+    assert causal == (
+        128 * 98 + 128 * 47 + 2 * 128 - 514 * 4 - 128 * 4 - 128 * 4
+    )
+    for value in (causal, two_sided):
         assert str(abs(value)) in _unseparated(section), value
+    # The two availability projections as factorisations rather than as products, which is how the
+    # section states them and is the form that survives a channel count moving.
+    for factor in (r"128 \times 98", r"128 \times 47", r"2 \times 128"):
+        assert factor in section, factor
+
+
+def test_the_design_states_the_unaligned_arm_and_the_delta_between_them(design, measured_totals):
+    r"""The unaligned row is a comparison arm rather than history, so it is measured like the rest.
+
+    The delta is $-768$ and factorises exactly: the source adapter loses four channels from two
+    $d_{\mathrm{model}}$-wide linears, and both adapters gain a start-of-record vector. Evaluated
+    from the document's own factorisation, because a table carrying the right total beside a wrong
+    decomposition of it is the half a reader takes on trust.
+    """
+    section = _markdown_section(design, "## 13. ")
+    delta = measured_totals["cfs_guarded"] - measured_totals["cfs_guarded_unaligned"]
+
+    assert delta == -4 * 128 * 2 + 2 * 128 == -768
+    assert measured_totals["cfs_guarded_unaligned"] in _integers_stated_in(section)
+    assert measured_totals["trf_cfs_guarded_unaligned"] in _integers_stated_in(section)
+    assert str(abs(delta)) in _unseparated(section)
 
 
 def test_the_records_agree_on_the_parameter_table(design, results, measured_totals):
@@ -437,13 +477,22 @@ def test_the_geometry_section_states_the_pairing_and_the_measured_channel_counts
         assert f"`{name}` ${kept}/{declared}$" in section, name
 
 
-def test_the_source_section_states_that_the_source_is_never_gated(design, budget):
-    """The compromise this design makes, and the reason the two warmth columns exist. Asserted
-    against the resolved budget: the source keep-index is the identity."""
+def test_the_source_section_states_which_rule_gates_the_source(design, budget, unaligned_budget):
+    """The compromise this design makes, and the reason the two warmth columns exist.
+
+    Asserted against both resolved budgets, because the two rules that could gate this stream do
+    different things: the **warm-up budget** gates it not at all -- its keep-index is the identity
+    at every threshold -- while the **alignment** removes exactly the four channels slower than the
+    reference, for the unrelated reason that they could reach it only by a negative shift.
+    """
     section = _flat(_markdown_section(design, "## 8. "))
 
-    assert budget.source.kept_width == budget.source.declared_width
-    assert f"all {budget.source.declared_width} source channels are kept" in section
+    assert unaligned_budget.source.kept_width == unaligned_budget.source.declared_width
+    assert budget.source.kept_width == 47 == budget.source.declared_width - 4
+    assert {
+        name: kept for name, kept, _declared in budget.source.block_counts()
+    } == {"up_st": 32, "up_ph": 15}
+    assert "the warm-up budget gates no source channel at all" in section.lower()
     assert "small value there is the expected finding, not a failure" in section
     assert "the coupling readout is measuring a clock" in section
 
@@ -480,13 +529,17 @@ def test_the_design_records_why_the_latent_gap_readout_is_re_pointed(design):
 
 def test_the_lean_limits_carry_their_replacement_triggers(design):
     """A ``lean-limit`` note without a measurable trigger is a permanent excuse. Exactly four here:
-    the per-segment warm-up, the uncorrected group delay, the lag floor that never varies, and the
-    availability-clock margin the evaluation ships unset."""
+    the per-segment warm-up, the residual pair-indexed lag bias, the lag floor that never varies,
+    and the availability-clock margin the evaluation ships unset.
+
+    The second was "the uncorrected group delay" until the alignment corrected the per-channel half
+    of it; what is left is the pair-indexed remainder, so the note is narrowed rather than removed.
+    """
     flat = _flat(design)
 
     assert len(re.findall(r"^> lean-limit: ", design, re.MULTILINE)) == 4
     assert "when a measured run shows the anchor floor" in flat
-    assert "when a lag result is to be reported as a physiological delay" in flat
+    assert "when a nonzero target reference can be divided out" in flat
     assert "when a run's `source_lag_warmth_frac_ph` falls below" in flat
     assert "once the first production run on the causal holdout split has written" in flat
 

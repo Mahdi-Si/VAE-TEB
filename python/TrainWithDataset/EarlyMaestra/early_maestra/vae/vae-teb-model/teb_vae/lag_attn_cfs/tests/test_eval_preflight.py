@@ -45,9 +45,11 @@ import pytest
 import torch
 from loguru import logger
 
+from teb_vae.lag_attn_cfs.causal_warmup import resolve_warmup_budget
 from teb_vae.lag_attn_cfs.eval import preflight
 from teb_vae.lag_attn_cfs.eval.binding import CFS_BINDING
 from teb_vae.lag_attn_cfs.eval.preflight import EvalPreconditionUnmet
+from teb_vae.lag_attn_cfs.model_kwargs import warmup_model_kwargs
 from teb_vae.lag_attn_cfs.nets.model import SeqVaeLagAttnCfs
 
 from .conftest import (
@@ -585,6 +587,99 @@ def test_a_budget_that_cannot_be_resolved_at_all_is_refused_carrying_the_reason(
     assert "sequence_length" in message and "299" in message
 
 
+def test_the_unaligned_record_says_so_rather_than_omitting_it(config, model, model_kwargs) -> None:
+    """A run reading a shard variant is a fact about the run, so it is recorded even when it is the
+    legacy one -- an absent key would read as an older artifact rather than as an unaligned run."""
+    record = _run(config, model, model_kwargs)["checks"]["warmup_budget_matches_checkpoint"]
+
+    assert record["reference_delay_s"] is None
+    assert record["leg_alignment"] == "none"
+    assert record["source_dropped_index"] == []
+    assert record["target_max_align_delay"] == record["source_max_align_delay"] == 0
+
+
+def test_the_alignment_record_names_the_reference_and_the_channels_it_dropped(config) -> None:
+    """The alignment removes channels for a reason the widths alone cannot state -- they are above
+    the reference, not slow -- and it is not recoverable from any metric the run emits."""
+    config["model_config"]["VAE_model"]["causal_align_reference"] = "target_max"
+    config["model_config"]["VAE_model"]["warmup_period"] = 134
+    resolved = resolve_warmup_budget(preflight.config_view_for_budget(config))
+    assert resolved is not None
+
+    record = preflight.check_warmup_budget_matches_checkpoint(
+        config,
+        model_kwargs=warmup_model_kwargs(resolved, SeqVaeLagAttnCfs),
+        model_cls=SeqVaeLagAttnCfs,
+    )
+
+    assert record["reference_delay_s"] == pytest.approx(402.1604, abs=5e-4)
+    assert record["source_dropped_index"] == [32, 33, 34, 35]
+    assert record["source_kept_width"] == 47
+    assert record["target_kept_width"] == 98
+    assert record["target_max_align_delay"] == record["source_max_align_delay"] == 97
+
+
+def test_a_checkpoint_built_at_another_reference_is_refused(config) -> None:
+    """The failure the warm-up comparison alone would miss.
+
+    Two arms at two *references* keep the identical target channels, so their checkpoints have the
+    same target width and load cleanly into each other -- only every lag moves. The alignment
+    tuples are therefore compared beside the warm-up ones rather than trusted to fall out of a
+    width check.
+    """
+    config["model_config"]["VAE_model"]["causal_align_reference"] = "target_max"
+    config["model_config"]["VAE_model"]["warmup_period"] = 134
+    resolved = resolve_warmup_budget(preflight.config_view_for_budget(config))
+    assert resolved is not None
+    stamped = dict(warmup_model_kwargs(resolved, SeqVaeLagAttnCfs))
+    # The unaligned arm's stamp: same four warm-up tuples, no shifts at all.
+    stamped["target_align_delays"] = None
+    stamped["source_align_delays"] = None
+
+    with pytest.raises(EvalPreconditionUnmet) as excinfo:
+        preflight.check_warmup_budget_matches_checkpoint(
+            config, model_kwargs=stamped, model_cls=SeqVaeLagAttnCfs
+        )
+
+    message = str(excinfo.value)
+    assert "target_align_delays" in message
+    assert "none at all" in message
+    assert "causal_align_reference" in message
+
+
+def test_the_disclosure_carries_the_reference_beside_the_stale_step_count(config) -> None:
+    r"""Two numbers that are both nonzero under an alignment and mean different things.
+
+    ``source_delay_steps`` is a count of *stored steps*, attained by the fastest channel -- the one
+    furthest from the reference. ``source_reference_delay_s`` is the physical instant every aligned
+    source channel reports at a step. A lag in seconds is computed from the second; a
+    stored-coefficient axis is indexed by the first. They travel together so a reader does not have
+    to guess which is which.
+    """
+    config["model_config"]["VAE_model"]["causal_align_reference"] = "target_max"
+    config["model_config"]["VAE_model"]["warmup_period"] = 134
+    resolved = resolve_warmup_budget(preflight.config_view_for_budget(config))
+    assert resolved is not None
+    aligned_model = SeqVaeLagAttnCfs(
+        **dict(
+            shipped_warmup_kwargs(warmup_period=134),
+            **warmup_model_kwargs(resolved, SeqVaeLagAttnCfs),
+        )
+    )
+    warmup = preflight.check_warmup_budget_matches_checkpoint(
+        config,
+        model_kwargs=warmup_model_kwargs(resolved, SeqVaeLagAttnCfs),
+        model_cls=SeqVaeLagAttnCfs,
+    )
+
+    record = preflight.causality_disclosure(config, aligned_model, warmup=warmup)
+
+    assert record["source_delay_steps"] == 97
+    assert record["source_reference_delay_s"] == pytest.approx(402.1604, abs=5e-4)
+    assert record["source_delay_seconds"] == pytest.approx(97 * 4.0)
+    assert record["source_reference_delay_s"] != record["source_delay_seconds"]
+
+
 # =================================================================================================
 # The measured geometry
 # =================================================================================================
@@ -719,12 +814,19 @@ def test_the_disclosure_is_assembled_exactly_as_it_is_written_down(config, model
         "source_delay_steps",
         "source_delay_seconds",
         "source_delay_is_max_over_channels",
+        # The alignment reference, beside the stored-step maximum and never merged into it: under a
+        # channel alignment both are nonzero and they are different quantities, so a reader who
+        # took one for the other would state a lag wrong by minutes with nothing failing.
+        "source_reference_delay_s",
         "horizon_seconds",
     ]
     assert record["one_sided_inputs"] is True
     assert record["transform"] == "causal"
     assert record["causal_reach_budget_s"] is None
     assert record["warmup_budget"] is None
+    # ``None`` rather than zero on a record with no resolved budget beside it: there is no common
+    # clock to name, and zero would read as "aligned to the anchor itself".
+    assert record["source_reference_delay_s"] is None
     assert record["horizon_seconds"] == float(model.horizon) * 4.0
     # And the same record when the callable is passed explicitly, which is how a run reaches it.
     assert preflight.causality_disclosure(config, model, preflight.cfs_encoder_disclosure) == record

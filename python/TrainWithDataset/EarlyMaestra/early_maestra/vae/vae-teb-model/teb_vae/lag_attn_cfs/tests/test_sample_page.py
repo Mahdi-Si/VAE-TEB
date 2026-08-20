@@ -761,7 +761,7 @@ def test_every_inset_sits_in_the_span_this_tiling_leaves_blank(task):
     starts at the anchor floor $F$ and runs to the end, so the blank span is the *prefix* -- and
     the inherited box put the panel over the last windows of the very forecast it details.
 
-    At the **shipped** geometry, where the claim is the production one: $F = 133$ of $300$ steps,
+    At the **shipped** geometry, where the claim is the production one: $F = 134$ of $300$ steps,
     so the prefix is a comfortable $44\%$ of the row. The tiny fixture's floor is too small to
     hold a legible inset at all, which is what ``_PREFIX_MIN_SPAN`` is for."""
     from .conftest import SHIPPED_SEQUENCE_LENGTH, shipped_warmup_kwargs

@@ -91,6 +91,10 @@ TASK_LEVEL_KEYS = (
     "lambda_deriv",
     "lambda_boundary",
     "causal_warmup_budget_steps",
+    # Both alignment keys are resolved against the SHARDS by the trainer and reach the
+    # constructor only as the two shift tuples, so neither names a constructor argument.
+    "causal_align_reference",
+    "causal_leg_alignment",
     "causal_reach_budget_s",
 )
 
@@ -150,6 +154,11 @@ TARGET_EDGE_EXEMPT_PATHS: Dict[str, str] = {
     f"{_VAE}.warmup_period": "the anchor floor the warm-up budget pairs with",
     f"{_VAE}.causal_reach_budget_s": "undefined on this dataset; the resolver refuses a value",
     f"{_VAE}.causal_warmup_budget_steps": "no two-sided counterpart",
+    f"{_VAE}.causal_align_reference": (
+        "no two-sided counterpart: the symmetric bank's channels already report one "
+        "instant, so there is no clock to move them onto"
+    ),
+    f"{_VAE}.causal_leg_alignment": "only a causal shard records a phase-harmonic operator",
     f"{_VAE}.anchor_stride": "no two-sided counterpart",
     f"{_VAE}.lag_floor": "no two-sided counterpart",
     "advanced_config.spike_breaker.additive_margin": (
@@ -213,6 +222,11 @@ SMOKE_HIE_DELTA_PATHS = frozenset(
 
 #: Surviving target channels at the shipped warm-up budget.
 KEPT_TARGET_CHANNELS = 98
+
+#: Surviving source channels at the shipped ALIGNMENT, which is the only rule that gates this
+#: stream: the warm-up budget keeps all $51$, and the reference drops the four ``up_st`` channels
+#: whose composed delay is above it, leaving every one of the fifteen ``up_ph``.
+KEPT_SOURCE_CHANNELS = 47
 
 
 def _flatten(node: Dict[str, Any], prefix: str = "") -> Dict[str, Any]:
@@ -364,7 +378,10 @@ def test_the_shipped_config_builds_a_decoder_as_wide_as_the_budget_keeps(tmp_pat
     assert "causal_warmup_budget_steps" not in kwargs
     assert len(kwargs["target_keep_index"]) == KEPT_TARGET_CHANNELS
     assert len(kwargs["target_warmup_steps"]) == KEPT_TARGET_CHANNELS
-    assert len(kwargs["source_keep_index"]) == CAUSAL_C_U
+    assert len(kwargs["source_keep_index"]) == KEPT_SOURCE_CHANNELS
+    assert len(kwargs["target_align_delays"]) == KEPT_TARGET_CHANNELS
+    assert len(kwargs["source_align_delays"]) == KEPT_SOURCE_CHANNELS
+    # The reach guard's keywords, which name a different mechanism and stay refused.
     assert "target_delays" not in kwargs and "source_delays" not in kwargs
 
     model = SeqVaeLagAttnTrfCfs(**kwargs)
@@ -374,11 +391,13 @@ def test_the_shipped_config_builds_a_decoder_as_wide_as_the_budget_keeps(tmp_pat
 
 
 def test_the_shipped_geometry_pairs_the_floor_with_the_budget(shipped):
-    r"""$F \ge B - 1$, and $B$ is the *survivors'* maximum rather than the configured threshold."""
+    r"""$F \ge \max(B - 1,\ \max_c(W'_c + d_c))$, and $B$ is the *survivors'* maximum rather than
+    the configured threshold. The alignment makes the second term bind, at exactly $B$."""
     vae = _get(shipped, _VAE)
 
-    assert vae["warmup_period"] == 133
+    assert vae["warmup_period"] == 134
     assert vae["causal_warmup_budget_steps"] == 134
+    assert vae["causal_align_reference"] == "target_max"
     assert vae["warmup_period"] >= vae["causal_warmup_budget_steps"] - 1
     assert vae["c_y"] == CAUSAL_C_Y
     assert vae["c_u"] == CAUSAL_C_U
@@ -459,6 +478,8 @@ def test_every_comparable_leaf_equals_the_target_siblings_value(shipped, target_
     # Five keys have no two-sided counterpart; nothing on the two-sided side is missing here.
     assert set(mine) - set(theirs) == {
         f"{_VAE}.causal_warmup_budget_steps",
+        f"{_VAE}.causal_align_reference",
+        f"{_VAE}.causal_leg_alignment",
         f"{_VAE}.anchor_stride",
         f"{_VAE}.lag_floor",
         # The per-block reconstruction weights. The two-sided cell scores its channels uniformly,

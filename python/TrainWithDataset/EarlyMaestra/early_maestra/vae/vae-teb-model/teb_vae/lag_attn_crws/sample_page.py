@@ -12,7 +12,7 @@ the reason is not the target domain -- the target *is* its target -- but the anc
 implementation tiles with :func:`~teb_vae.lag_attn.figure_primitives.concat_single_forecasts`, which
 walks ``range(warmup, t_valid, horizon)`` and reads ``mu_pred[t]`` at each **anchor** $t$; this
 model's forecast is $(A_{\max}, H, R)$ indexed by *position in the decoded set*. At the shipped
-geometry that is $137$ dense positions read at anchors $133 \dots 269$, so the first index is already
+geometry that is $136$ dense positions read at anchors $134 \dots 269$, so the first index is already
 out of range and the page dies inside a handler that warns and continues -- a whole run with an empty
 diagnostics directory and one log line. Where it does not raise it is worse: at a smaller floor it
 draws a real forecast at the wrong time, with no exception anywhere in it. The tiling is therefore
@@ -33,14 +33,21 @@ could only differ from the first by being wrong. The shipped builders cannot dra
 cell: both consult the production two-sided Morlet bank, which did not produce these coefficients and
 refuses these channel widths, inside handlers that warn and continue.
 
-**The lag axis is stored-coefficient time on the input side, and only on the input side.** This is
-where the pairing this cell exists for shows up in a caption. The target is a raw sample, so it has
-no warm-up and no group delay and the anchor is exact: anchor $t$ predicts raw samples
+**The lag axis is stored-coefficient time on the input side, and only on the input side -- and this
+is the one cell where that is a repairable statement.** The target is a raw sample, so it has no
+warm-up and no group delay and the anchor is exact: anchor $t$ predicts raw samples
 $[16(t+1), 16(t+1) + H R)$, which are those samples and no others. The *inputs* are one-sided
-coefficients and still lag by their own composed group delay, up to $791$ s, uncompensated. So a peak
-at lag $\ell$ carries a one-sided caveat rather than the causal-feature page's two-sided one, and the
-page states it as a footnote -- the two lag panels belong to the shared builder, and the six shipped
-models must not acquire a caption about a transform they do not use.
+coefficients and still lag by their own composed group delay, $13$ to $791$ s as the bank declares
+them. Unaligned, that bias is indexed by a channel *pair* and no single number labels the axis; with
+the source channels shifted onto one reference $\tau^u_{\mathrm{ref}}$ it collapses to a constant,
+and because $\tau^y \equiv 0$ here the lead time
+$\Delta(\ell + 1 + h) + \tau^u_{\mathrm{ref}} - 20$ s is a delay between *signals* rather than
+between two filters' reports of them. That is what the footnote states, and the arithmetic behind it
+is :func:`~teb_vae.lag_attn.nets.lag_report.physical_lag_seconds` rather than a second copy here.
+
+The footnote is where it is said because the two lag panels belong to the shared builder, and the
+six shipped models drawn by that builder must not acquire a caption about a transform they do not
+use.
 
 Like both sibling pages this module is matplotlib-only -- no Lightning, no MLflow, no config, no
 loader -- and it never re-runs the model or re-scores anything: it cuts and lays out arrays it is
@@ -66,6 +73,10 @@ from teb_vae.lag_attn.figure_primitives import (  # noqa: E402
     COLOR_VERMILLION,
     to_numpy,
 )
+from teb_vae.lag_attn.nets.lag_report import (  # noqa: E402
+    MECHANICAL_SHIFT_SECONDS,
+    SECONDS_PER_STEP,
+)
 from teb_vae.lag_attn_cfs.sample_page import (  # noqa: E402
     _draw_anchor_overlay,
     _tiling_anchors,
@@ -89,13 +100,31 @@ __all__ = ["LAG_TIME_CAVEAT", "causal_raw_forecast_rows"]
 #: It is deliberately **one-sided** where the causal-feature page's is two-sided: the correction to a
 #: physical delay has a term for each side of the attention, and this cell's target side contributes
 #: none -- a raw sample is at the instant it is at. What is left is the source channel's own
-#: uncompensated group delay, plus the shift the preprocessing already removed.
+#: composed group delay, plus the shift the preprocessing already removed.
+#:
+#: It states the **identity** and not a number, because $\tau^u_{\mathrm{ref}}$ is a decision of the
+#: run rather than a property of this module and nothing the page is handed carries it: the rows are
+#: given arrays, a geometry and the loader's statistics, and the model's own ``source_delay_steps``
+#: is the largest *stored-step* shift -- attained by the channel furthest from the reference -- and
+#: is emphatically not it. The resolved value travels in the run's own record instead, which the
+#: sentence names so a reader of a page can find the constant that completes it.
+#:
+#: $\Delta$ and the acquisition shift are interpolated from
+#: :mod:`~teb_vae.lag_attn.nets.lag_report` rather than typed, so the caption and the function a
+#: consumer would evaluate it with cannot state two different corrections.
 LAG_TIME_CAVEAT = (
-    "Lag axes are stored-coefficient time on the input side, not physical delay: the raw target "
-    "carries no group delay, so the anchor is exact, but a causal input coefficient still lags by "
-    "its own composed group delay (13-791 s), so the physical lag is $\\Delta\\ell$ plus a "
-    "channel-dependent $\\tau^u_c$ plus the $-20$ s preprocessing shift. The correction is "
-    "one-sided here: there is no target-side $\\tau^y$ term to subtract."
+    f"Lag axes are stored-coefficient time on the input side, not physical delay: the raw target "
+    f"carries no group delay, so $\\tau^y \\equiv 0$ and the anchor is exact, while a causal input "
+    f"coefficient lags by its own composed group delay (13-791 s as declared). Aligned onto one "
+    f"source reference $\\tau^u_{{\\mathrm{{ref}}}}$ -- the run's own, logged as "
+    f"source_reference_delay_s -- that bias is a single constant, and a peak at lag $\\ell$, "
+    f"horizon element $h$, is a physical lead time of "
+    f"${SECONDS_PER_STEP:.0f}(\\ell + 1 + h) + \\tau^u_{{\\mathrm{{ref}}}} - "
+    f"{MECHANICAL_SHIFT_SECONDS:.0f}$ s, the $-{MECHANICAL_SHIFT_SECONDS:.0f}$ s being the "
+    f"acquisition shift preprocessing already removed from the source trace. The correction is "
+    f"one-sided here: there is no target-side $\\tau^y$ term to subtract. Unaligned, "
+    f"$\\tau^u_{{\\mathrm{{ref}}}}$ is replaced by each channel's own $\\tau^u_c$ and no single "
+    f"number labels the axis."
 )
 
 

@@ -297,13 +297,18 @@ def test_the_forward_returns_the_anchors_it_decoded(model) -> None:
 # The shipped geometry
 # =================================================================================================
 def test_the_shipped_geometry_tiles_as_the_budget_predicts() -> None:
-    r"""$F = 133$, $S = H = 30$, $T_{\mathrm{valid}} = 270$: five tiles at $\varphi \le 16$ and four
-    otherwise, mean $137/30$; and the dense validation resolution is $137$."""
+    r"""$F = 134$, $S = H = 30$, $T_{\mathrm{valid}} = 270$: five tiles at $\varphi \le 15$ and four
+    otherwise, mean $136/30$; and the dense validation resolution is $136$.
+
+    The floor is the aligned one. Unaligned it was $133$, which put the five-tile boundary one phase
+    later and gave $137$ dense anchors: the one anchor the common clock costs, priced here rather
+    than argued about.
+    """
     kwargs = shipped_warmup_kwargs()
     torch.manual_seed(0)
     model = SeqVaeLagAttnCfs(**kwargs).eval()
     floor, t_valid, stride = _geometry(model)
-    assert (floor, t_valid, stride) == (133, 270, 30)
+    assert (floor, t_valid, stride) == (134, 270, 30)
 
     counts = []
     for phase in range(stride):
@@ -312,11 +317,11 @@ def test_the_shipped_geometry_tiles_as_the_budget_predicts() -> None:
         )
         assert tuple(valid.shape) == (1, 5)
         counts.append(int(valid.sum()))
-    assert counts[:17] == [5] * 17 and set(counts[17:]) == {4}
-    assert sum(counts) == t_valid - floor == 137
+    assert counts[:16] == [5] * 16 and set(counts[16:]) == {4}
+    assert sum(counts) == t_valid - floor == 136
 
     dense, valid = model._build_anchor_index(
         batch=1, device=torch.device("cpu"), anchor_stride=1
     )
-    assert tuple(dense.shape) == (1, 137) and bool(valid.all())
-    assert int(dense[0, 0]) == 133 and int(dense[0, -1]) == 269
+    assert tuple(dense.shape) == (1, 136) and bool(valid.all())
+    assert int(dense[0, 0]) == 134 and int(dense[0, -1]) == 269

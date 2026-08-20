@@ -46,6 +46,7 @@ from .conftest import (
     SHIPPED_BUDGET_STEPS,
     SHIPPED_TRIM_MINUTES,
     TWO_SIDED_SHARD,
+    ALIGN_MODEL_KWARGS,
     WARMUP_MODEL_KWARGS,
     causal_config,
     shipped_warmup_kwargs,
@@ -60,7 +61,7 @@ _PACKAGE_DIR = Path(__file__).resolve().parents[1]
 #: ``causal_warmup_quantile`` re-derives rather than passes stale; this one row is pinned so that a
 #: silent change to it fails here instead of quietly moving a training curve.
 _SHIPPED_TARGET_KEPT = 98
-_SHIPPED_SOURCE_KEPT = 51
+_SHIPPED_SOURCE_KEPT = 47
 
 
 def _rebased_vector(blocks: Tuple[str, ...]) -> np.ndarray:
@@ -92,7 +93,7 @@ class _WarmupModel:
         self,
         sequence_length: int = 300,
         horizon: int = 15,
-        warmup_period: int = 133,
+        warmup_period: int = 134,
         c_y: int = CAUSAL_C_Y,
         c_u: int = CAUSAL_C_U,
         use_up_st: bool = True,
@@ -100,6 +101,8 @@ class _WarmupModel:
         target_warmup_steps: Optional[Sequence[int]] = None,
         source_keep_index: Optional[Sequence[int]] = None,
         source_warmup_steps: Optional[Sequence[int]] = None,
+        target_align_delays: Optional[Sequence[int]] = None,
+        source_align_delays: Optional[Sequence[int]] = None,
     ) -> None:
         self.kwargs: Dict[str, Any] = dict(locals())
 
@@ -125,13 +128,24 @@ def test_this_package_ships_no_copy_of_the_resolver_or_the_mapping():
 # =================================================================================================
 # What the budget resolves to on the committed fixture
 # =================================================================================================
-def test_the_shipped_budget_keeps_ninety_eight_target_channels_and_all_fifty_one_source(budget):
-    """The shipped row, as literals, at the geometry this package's configuration declares."""
+def test_the_shipped_guard_keeps_ninety_eight_target_channels_and_forty_seven_source(
+    budget, unaligned_budget
+):
+    """The shipped row, as literals, at the geometry this package's configuration declares.
+
+    The two counts come from two different rules and both are stated. The **warm-up budget** takes
+    four channels off the target and none off the source, which the unaligned arm shows directly;
+    the **alignment reference** takes the four source channels slower than it and none off the
+    target, because the reference is the target's own maximum.
+    """
     assert budget.budget_steps == SHIPPED_BUDGET_STEPS
     assert budget.target.declared_width == CAUSAL_C_Y == 102
     assert budget.target.kept_width == _SHIPPED_TARGET_KEPT
-    assert budget.source.declared_width == budget.source.kept_width == CAUSAL_C_U
+    assert budget.source.declared_width == CAUSAL_C_U
     assert budget.source.kept_width == _SHIPPED_SOURCE_KEPT
+
+    assert unaligned_budget.target.kept_width == _SHIPPED_TARGET_KEPT
+    assert unaligned_budget.source.kept_width == CAUSAL_C_U
 
 
 def test_the_kept_set_is_exactly_the_channels_at_or_below_the_threshold(budget):
@@ -145,42 +159,59 @@ def test_the_kept_set_is_exactly_the_channels_at_or_below_the_threshold(budget):
     assert budget.target.warmup_steps == tuple(int(declared[index]) for index in expected)
 
 
-def test_the_source_is_never_gated_however_slow_its_channels_are(budget):
+def test_the_source_is_never_gated_by_the_budget_however_slow_its_channels_are(unaligned_budget):
     r"""Its keep-index is the identity by construction rather than by arithmetic that happens to
     keep everything. Its slowest channels carry the contraction envelope, and the check is only
     meaningful because that channel is genuinely slower than the target's slowest survivor -- an
-    ungated source that waited no longer would make it vacuous."""
+    ungated source that waited no longer would make it vacuous.
+
+    Read off the unaligned arm, because the alignment reference *does* drop four source channels,
+    for the unrelated reason that they are slower than the reference and could reach it only by
+    being read from a later stored step. Mixing the two would make a passing assertion about the
+    budget indistinguishable from one about the reference."""
     declared = _rebased_vector(SOURCE_BLOCKS)
 
-    assert budget.source.keep_index == tuple(range(len(declared)))
-    assert budget.source.declared_warmup_steps == tuple(int(step) for step in declared)
-    assert budget.source.max_warmup > budget.target.max_warmup
+    assert unaligned_budget.source.keep_index == tuple(range(len(declared)))
+    assert unaligned_budget.source.declared_warmup_steps == tuple(int(step) for step in declared)
+    assert unaligned_budget.source.max_warmup > unaligned_budget.target.max_warmup
 
 
-def test_the_floor_this_package_declares_clears_the_survivors_own_maximum(budget):
-    r"""The pairing the anchor floor is retained under. It is read off the **survivors'** maximum
-    rather than off the threshold -- a budget of $151$ keeps the identical channels -- and here it
-    is an input-warmth policy rather than a validity requirement: the first forecast step is
-    $t + 1$, so $F \ge B - 1$ says every kept **target-stream** channel is warm by it.
+def test_the_floor_this_package_declares_clears_both_streams_shifted_maxima(
+    budget, unaligned_budget
+):
+    r"""The pairing the anchor floor is retained under, and which of its two halves now binds.
 
-    The last assertion is what keeps that sentence from widening. The *source* stream is an input
-    too and is never gated, so the shipped floor leaves several of its channels cold for hundreds
-    of steps -- deliberately, since gating them would cost the contraction envelope, and measured by
-    ``source_lag_warmth_frac_st`` / ``_ph``. A policy read over every input channel would put the
-    floor at ``budget.source.max_warmup - 1``, which is asserted here to be a different and much
-    larger number, so the two readings cannot be confused for one.
+    Unaligned it was read off the target **survivors'** maximum -- a budget of $151$ keeps the
+    identical channels -- as an input-warmth policy rather than a validity requirement: the first
+    forecast step is $t + 1$, so $F \ge B - 1$ said every kept *target-stream* channel is warm by
+    it, and the source stream was left cold for hundreds of steps deliberately, since gating it
+    would cost the contraction envelope.
+
+    Under the alignment the source is no longer left behind: every channel slower than the
+    reference is dropped and every survivor is shifted onto it, so $\max_c(W'_c + d_c)$ is the same
+    number on both streams. The floor is therefore $\max(B - 1, 134) = 134$, and the second
+    assertion below states which half decided it.
     """
     assert budget.target.max_warmup == SHIPPED_BUDGET_STEPS
-    assert local.SHIPPED_KWARGS["warmup_period"] == budget.target.max_warmup - 1
-    assert local.SHIPPED_KWARGS["warmup_period"] < budget.source.max_warmup - 1
+    assert local.SHIPPED_KWARGS["warmup_period"] == SHIPPED_BUDGET_STEPS
+    for stream in (budget.target, budget.source):
+        assert max(stream.combined_steps) == SHIPPED_BUDGET_STEPS, stream.name
+        assert local.SHIPPED_KWARGS["warmup_period"] == max(stream.combined_steps), stream.name
+    # And the reading that was retired: over the UNALIGNED source, a policy read across every input
+    # channel would have put the floor at a much larger number, which is why it was not read there.
+    assert local.SHIPPED_KWARGS["warmup_period"] < unaligned_budget.source.max_warmup - 1
 
 
 # =================================================================================================
 # The mapping into constructor keywords
 # =================================================================================================
-def test_the_four_resolved_tuples_reach_a_constructor_that_accepts_them(budget):
+def test_the_four_resolved_tuples_reach_a_constructor_that_accepts_them(unaligned_budget):
     """The positive path, against the stub: the four tuples arrive under the warm-up names, paired
-    positionally, with no delay keyword anywhere near them."""
+    positionally, with no delay keyword anywhere near them.
+
+    Read off the unaligned arm so the set is exactly the four; the aligned arm adds the two shift
+    vectors under their own names, which the test below covers."""
+    budget = unaligned_budget
     mapped = warmup_model_kwargs(budget, _WarmupModel)
 
     assert set(mapped) == set(WARMUP_MODEL_KWARGS)
@@ -205,9 +236,21 @@ def test_the_shipped_keyword_set_carries_the_budget_and_the_declared_widths(budg
     assert kwargs["target_keep_index"] == budget.target.keep_index
     assert kwargs["c_y"] == CAUSAL_C_Y and kwargs["c_u"] == CAUSAL_C_U
     assert len(kwargs["target_keep_index"]) < kwargs["c_y"]
-    assert kwargs["horizon"] == 30 and kwargs["warmup_period"] == 133
+    assert kwargs["horizon"] == 30 and kwargs["warmup_period"] == 134
     # Applied last, which is what makes an arm expressible as one keyword at the call site.
     assert shipped_warmup_kwargs(_WarmupModel, horizon=15)["horizon"] == 15
+
+
+def test_the_two_shift_vectors_reach_the_same_constructor_under_their_own_names(budget):
+    """The alignment travels beside the warm-up rather than inside it, and is positionally paired
+    with the keep-index resolved beside it: a shift vector is one entry per SURVIVING channel."""
+    mapped = warmup_model_kwargs(budget, _WarmupModel)
+
+    assert set(WARMUP_MODEL_KWARGS) | set(ALIGN_MODEL_KWARGS) == set(mapped)
+    assert mapped["target_align_delays"] == budget.target.align_delays
+    assert mapped["source_align_delays"] == budget.source.align_delays
+    assert len(mapped["target_align_delays"]) == len(mapped["target_keep_index"])
+    assert len(mapped["source_align_delays"]) == len(mapped["source_keep_index"])
 
 
 def test_no_budget_adds_no_keys():

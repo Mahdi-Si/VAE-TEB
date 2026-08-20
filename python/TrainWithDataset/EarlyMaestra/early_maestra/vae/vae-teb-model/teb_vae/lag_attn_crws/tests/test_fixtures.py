@@ -45,7 +45,7 @@ _SIBLING_ALLOWED_CHANGES = ("teb_vae/lag_attn_cfs/tests/test_nets_are_framework_
 #: moves what every number this package reports is produced at.
 _SHIPPED_GEOMETRY = (
     ("horizon", 30),
-    ("warmup_period", 133),
+    ("warmup_period", 134),
     ("anchor_stride", 30),
     ("c_y", 102),
     ("c_u", 51),

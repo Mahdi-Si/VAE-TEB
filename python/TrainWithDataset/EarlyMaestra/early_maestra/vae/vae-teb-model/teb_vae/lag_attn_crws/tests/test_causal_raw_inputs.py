@@ -223,6 +223,49 @@ def test_the_floor_refusal_fires_through_the_constructor(tiny_warmup) -> None:
     assert build(dict(tiny_warmup, warmup_period=budget - 1)) is not None
 
 
+def test_the_shifted_half_of_the_policy_states_warm_at_the_anchor() -> None:
+    r"""The policy has two readings and the shift is what selects between them.
+
+    Unshifted, it is *warm by the first forecast step*: the input at $t$ is the stored coefficient
+    at $t$, a cold one is masked and announced, and $F = B - 1$ is admitted with the slowest kept
+    channel honest exactly at $t + 1$. Shifted, the channel vector at step $t$ asserts one physical
+    instant, and that assertion is false -- not partially true -- while any entry has not arrived,
+    so the reading becomes *warm at the anchor*. The message must say which one it is enforcing, or
+    an operator reads the first sentence and computes the wrong floor.
+    """
+    with pytest.raises(ValueError) as error:
+        CausalRawInputs._check_anchor_floor(6, (0, 3, 6), (2, 1, 1))
+    message = str(error.value)
+
+    assert "warm AT THE ANCHOR once those inputs are shifted onto a common clock" in message
+    assert "warmup_period=6" in message and "at least 7" in message
+    assert "channel 2" in message and "t - 1" in message
+    # The source-stream half of the policy is unchanged and still stated, because the alignment's
+    # own drops are a different thing from the warm-up policy's.
+    assert "source stream is never gated" in message
+    assert "source_lag_warmth_frac_st" in message
+
+
+def test_a_zero_shift_vector_is_the_unshifted_reading() -> None:
+    """An empty vector and an all-zero one must give one answer: the constructor hands the gate's
+    own delays to the check, and an unaligned gate's are all zeros, so a check that treated the two
+    differently would refuse the shipped configuration."""
+    assert CausalRawInputs._check_anchor_floor(5, (0, 3, 6), ()) is None
+    assert CausalRawInputs._check_anchor_floor(5, (0, 3, 6), (0, 0, 0)) is None
+    with pytest.raises(ValueError) as error:
+        CausalRawInputs._check_anchor_floor(4, (0, 3, 6), (0, 0, 0))
+    assert "warm by the first forecast step" in str(error.value)
+
+
+def test_the_shifted_floor_refusal_fires_through_the_constructor(tiny_align) -> None:
+    """Reached from ``_validate_causal_geometry``, which is inherited: the override is the check,
+    not the call site, so the stride-versus-span refusal beside it cannot drift."""
+    floor = int(tiny_align["warmup_period"])
+    with pytest.raises(ValueError, match="AT THE ANCHOR"):
+        build(dict(tiny_align, warmup_period=floor - 1))
+    assert build(dict(tiny_align, warmup_period=floor)) is not None
+
+
 def test_an_ungated_model_has_no_floor_to_check(tiny_kwargs) -> None:
     """No budget, no kept-channel vector, and therefore no policy to state -- the model with no
     guard rather than an identity one."""
@@ -238,13 +281,19 @@ def test_only_the_two_source_patterns_are_resolved(model) -> None:
 
     A raw block's last axis counts raw samples: they have no warm-up to be past, so
     ``target_warm_frac`` would be a vacuous $1.0$ in every row of every run's CSV, and no filter to
-    rank, so the tertile assignment would partition nothing. Both would read as measurements.
+    rank, so both tertile assignments would partition nothing. All three would read as measurements.
+
+    The novelty split is the strongest of the three cases. Every raw sample of a forecast window
+    lies strictly after the anchor, so a per-channel novelty share is not a smaller number here but
+    an undefined one -- and the mapping from a resolved budget emits the vector only to a class
+    whose signature accepts it, which this one does not.
     """
     names = dict(model.named_buffers())
 
     assert "source_block_warm_st" in names and "source_block_warm_ph" in names
-    assert "warm_tertile_id" not in names
+    assert "warm_tertile_id" not in names and "novelty_tertile_id" not in names
     assert not hasattr(model, "warm_tertile_id")
+    assert not hasattr(model, "novelty_tertile_id")
     assert not hasattr(model, "target_warm_frac")
 
 

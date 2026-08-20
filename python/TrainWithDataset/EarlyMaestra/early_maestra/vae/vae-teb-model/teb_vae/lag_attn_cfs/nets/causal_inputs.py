@@ -17,9 +17,17 @@ both. The vectors travel under **new** constructor keywords, ``target_warmup_ste
 ``source_warmup_steps``: ``target_delays`` reaches ``ChannelDelay``, which *shifts* rather than
 masks, and no model composing this mixin accepts it.
 
+**The channel alignment.** A one-sided filter is also *stale* by its own composed group delay, and
+those delays span thirteen minutes across a stream -- so reading the whole channel vector at one
+step index asserts an instant the entries do not share. When a reference is configured the gate
+stops being a pure gather and shifts each survivor by $d_c$ onto it, which is the one place in this
+family where ``ChannelDelay`` does anything. The mask must then move with it:
+:meth:`CausalWarmupInputs._build_adapter` announces $W'_c + d_c$, because a gathered-and-delayed
+channel is honest only once the step index has reached both.
+
 **The anchor tiling.** The forecast cannot begin at the model's own $30$-step warm-up, because the
 slowest kept target channel is not honest until step $134$; and once the floor is that high the
-dense anchor range costs a $(B, 137, H, C)$ tensor five times over for windows that overlap
+dense anchor range costs a $(B, 136, H, C)$ tensor five times over for windows that overlap
 $(H-1)/H$. The forward therefore decodes a *tiled* anchor set,
 
 $$\mathcal A(\varphi) = \{\, F + \varphi + kS \;:\; k \ge 0,\; F + \varphi + kS < T_{\mathrm{valid}} \,\},$$
@@ -52,11 +60,18 @@ from teb_vae.lag_attn.nets.delays import ChannelGate
 from teb_vae.lag_attn.nets.encoders import AvailabilityInputAdapter
 from teb_vae.lag_attn_rws.nets.model import SATURATION_FRAC
 
-#: The four constructor keywords this mixin owns, i.e. the ones a composing model must **not**
-#: forward to its base. Named once here rather than repeated in each cell's ``locals()`` filter: a
-#: keyword added to the mixin and forgotten in one cell's filter would be passed to a base that does
-#: not take it, which is loud -- but a keyword *removed* here and left in a filter would be dropped
-#: on the floor, which is not.
+#: The constructor keywords this mixin owns, i.e. the ones a composing model must **not** forward to
+#: its base under their own names. Named once here rather than repeated in each cell's ``locals()``
+#: filter: a keyword added to the mixin and forgotten in one cell's filter would be passed to a base
+#: that does not take it, which is loud -- but a keyword *removed* here and left in a filter would be
+#: dropped on the floor, which is not.
+#:
+#: The last two are the exception that proves the rule: they *are* forwarded, but **renamed** to the
+#: base's ``target_delays`` / ``source_delays``, which is why they must be excluded here or they
+#: would arrive twice. Their own names are new rather than the base's because a run configures a
+#: *reference* and gets shifts, while the base's names carry the two-sided reach guard's -- and
+#: these cells still refuse those by name, since the reach quantile is measured on a bank that did
+#: not produce these coefficients.
 CAUSAL_ONLY_KEYWORDS: Tuple[str, ...] = (
     "target_warmup_steps",
     "source_warmup_steps",
@@ -64,6 +79,9 @@ CAUSAL_ONLY_KEYWORDS: Tuple[str, ...] = (
     "lag_floor",
     "target_weight_st",
     "target_weight_ph",
+    "target_align_delays",
+    "source_align_delays",
+    "target_novelty_frac",
 )
 
 #: What a composing constructor removes from its own ``locals()`` before forwarding the rest to the
@@ -80,7 +98,8 @@ class CausalWarmupInputs:
     always composed alongside
     :class:`~teb_vae.lag_attn_cfs.nets.causal_feature_target.CausalFeatureForecastTarget`, whose
     ``_check_anchor_floor``, ``_resolve_target_warm_frac``, ``_resolve_warm_tertiles``,
-    ``_resolve_block_warm_steps`` and ``SOURCE_BLOCK_SPLIT`` the geometry resolution below calls --
+    ``_resolve_novelty_tertiles``, ``_resolve_block_warm_steps`` and ``SOURCE_BLOCK_SPLIT`` the
+    geometry resolution below calls --
     the two mixins are the two halves of one target domain and neither is meaningful without the
     other.
 
@@ -175,9 +194,14 @@ class CausalWarmupInputs:
 
         Called immediately after ``super().__init__``. Two refusals and one resolution, in that
         order: a stride wider than the anchor span leaves some phase with no anchor at all; a floor
-        below $B - 1$ scores assumed pre-recording history as signal; and the four readout constants
-        are functions of the resolved budget and the geometry, so they are resolved once here rather
-        than per batch.
+        below what the kept target channels require scores assumed pre-recording history as signal;
+        and the four readout constants are functions of the resolved budget and the geometry, so
+        they are resolved once here rather than per batch.
+
+        The floor check is given the gate's **shifts** as well as the warm-up, read off the built
+        gate rather than off a constructor argument for the reason :meth:`_build_adapter` gives.
+        An unaligned gate hands it a vector of zeros, which is the argument's inert value and
+        reproduces the refusal this cell has always made.
 
         Raises:
             ValueError: If the stride leaves a phase with no anchor, or if ``warmup_period`` is
@@ -192,20 +216,26 @@ class CausalWarmupInputs:
                 f"at that phase would contribute no forecast at all, and nothing downstream "
                 f"reports an empty anchor row."
             )
-        self._check_anchor_floor(self.warmup_period, self.target_warmup_steps or ())
+        self._check_anchor_floor(
+            self.warmup_period,
+            self.target_warmup_steps or (),
+            ()
+            if self.target_gate is None
+            else tuple(int(shift) for shift in self.target_gate.delay.delay_steps),
+        )
         self._resolve_warmup_readout_constants()
 
     def _resolve_warmup_readout_constants(self) -> None:
-        r"""Resolve the four constants the added readouts are computed against.
+        r"""Resolve the five constants the added readouts are computed against.
 
         Every one of them is a function of the resolved budget and the geometry alone, so resolving
         them here rather than per batch is not an optimisation: ``target_warm_frac`` is identically
         $1.0$ under the constructor's own pairing refusal, and a per-batch recomputation of it would
         be a tautology evaluated once a step against a four-dimensional density the objective
-        deliberately does not carry. The other three are partitions, and a partition recomputed per
+        deliberately does not carry. The other four are partitions, and a partition recomputed per
         batch is a partition that can differ between two batches of one run.
 
-        The three tensors are registered as **non-persistent** buffers, like every other
+        The four tensors are registered as **non-persistent** buffers, like every other
         budget-shaped tensor in the family: their contents follow the resolved budget, so a
         persistent copy would make a checkpoint trained at one budget fail to load at another and
         report it as misaligned keys rather than as a budget mismatch. Registering them at all --
@@ -217,9 +247,12 @@ class CausalWarmupInputs:
             self.geometry.t_valid,
             self.target_warmup_steps or (),
         )
-        kept_target = (
-            self.c_y if self.target_gate is None else self.target_gate.out_channels
+        declared_target = (
+            torch.arange(self.c_y)
+            if self.target_gate is None
+            else self.target_gate.keep_index.cpu()
         )
+        kept_target = int(declared_target.numel())
 
         self.register_buffer(
             "warm_tertile_id",
@@ -232,10 +265,47 @@ class CausalWarmupInputs:
             persistent=False,
         )
 
+        # The novelty split, gathered from a DECLARED-width vector through the same keep-index the
+        # channel weights use, rather than taken per survivor. It is a readout and not part of the
+        # guard, so the ungated comparison arm keeps it while dropping every resolved channel tuple
+        # -- and a survivors-length vector would then be positional against a width that arm no
+        # longer has.
+        #
+        # A model built without the vector at all -- the ungated arm, and every unit construction
+        # -- falls back to a constant, which ranks the channels by declared index. That is the same
+        # degenerate case the warm-up partition above is in on that arm, and it is a partition of
+        # the channel axis rather than a measurement of novelty; the three columns stay present, so
+        # the metric surface does not depend on the arm. A *gated* run cannot reach it: the mapping
+        # from a resolved budget refuses a feature-target model whose shards carry no novelty
+        # vector, rather than defaulting one.
+        novelty = self.target_novelty_frac
+        if novelty is not None and len(novelty) != int(self.c_y):
+            raise ValueError(
+                f"target_novelty_frac has {len(novelty)} entries against c_y={int(self.c_y)}. It "
+                f"is positional into the DECLARED channel axis and gathered through the gate's "
+                f"keep-index, so a survivors-length vector would be silently re-indexed and "
+                f"partition the wrong channels."
+            )
+        self.register_buffer(
+            "novelty_tertile_id",
+            torch.tensor(
+                self._resolve_novelty_tertiles(
+                    tuple(0.0 for _ in range(kept_target))
+                    if novelty is None
+                    else tuple(novelty[index] for index in declared_target.tolist())
+                ),
+                dtype=torch.long,
+            ),
+            persistent=False,
+        )
+
         # The source split is taken in DECLARED channel coordinates, through the gate's keep-index
-        # rather than positionally: the source is never gated in this family, so the two agree
-        # today, and a split that assumed they always would is one that starts naming the wrong
-        # block the first time they do not.
+        # rather than positionally: the alignment drops the four source channels above the
+        # reference, so the survivors' vector is 47 long against a declared 51 and the two no longer
+        # agree. A split taken positionally at the boundary would put eleven channels of the
+        # second stored source block into the first and report both warmth fractions against the
+        # wrong denominators, with nothing failing -- which is the failure this indirection was
+        # written for before it could happen.
         declared = (
             torch.arange(self.c_u)
             if self.source_gate is None
@@ -272,13 +342,24 @@ class CausalWarmupInputs:
     def _build_adapter(
         self, gate: Optional[ChannelGate], declared_width: int, dropout: float
     ) -> AvailabilityInputAdapter:
-        r"""Build one stream's adapter at its **warm-up**, not at its gate's delays.
+        r"""Build one stream's adapter at its **warm-up plus its shift**, not at either alone.
 
-        The base reads ``gate.delay.delay_steps``, which is the right source for a reach-budget
-        guard and all zeros here: this family's gate is a pure gather, built with ``delays=None``,
-        so ``max_delay`` would be $0$ and **neither** availability term would exist -- no mask, no
-        announcement, and a stream whose leading region is real values on no defined scale entering
-        the encoder as though it were signal.
+        $$\delta^{\mathrm{adapter}}_c \;=\; W'_c + d_c .$$
+
+        Two corrections to the base, one per term. The base reads ``gate.delay.delay_steps`` alone,
+        which is the right source for a reach-budget guard and is all zeros in every unaligned
+        configuration here: the gate is then a pure gather, so ``max_delay`` would be $0$ and
+        **neither** availability term would exist -- no mask, no announcement, and a stream whose
+        leading region is real values on no defined scale entering the encoder as though it were
+        signal. And the warm-up alone is right only while nothing is shifted: a channel gathered
+        from step $t - d_c$ is a function of the recording only once $t - d_c \ge W'_c$, so an
+        adapter told $W'_c$ against a shifted stream announces a channel warm by as much as $97$
+        steps before it is -- with no crash, no shape change and no metric moving.
+
+        Read off the **gate** rather than off a second copy of the shift, for the reason the base's
+        own version gives: the gate fills in a missing delay vector with zeros and a missing
+        keep-index with the identity, and either substitution would leave a separately-held vector
+        out of step with what the stream actually received.
 
         The two calls are told apart by which gate they were handed. That is sound because a
         resolved budget always produces both keep-indices, so a stream with a warm-up always has a
@@ -290,7 +371,9 @@ class CausalWarmupInputs:
             dropout: Dropout probability inside the projection stack.
 
         Returns:
-            The adapter, carrying whichever availability terms the warm-up calls for.
+            The adapter, carrying whichever availability terms the combined vector calls for --
+            which under alignment is both, because the minimum of $W'_c + d_c$ is $91$ steps where
+            the warm-up alone reaches $0$, so the start-of-record embedding comes into existence.
         """
         warmup = (
             self.target_warmup_steps
@@ -301,12 +384,17 @@ class CausalWarmupInputs:
             return super()._build_adapter(gate, declared_width, dropout)
 
         width = declared_width if gate is None else gate.out_channels
+        delays = list(warmup)
+        if gate is not None:
+            delays = [
+                wait + int(shift) for wait, shift in zip(delays, gate.delay.delay_steps)
+            ]
         return AvailabilityInputAdapter(
             in_dim=width,
             d_model=self.d_model,
             sequence_length=self.sequence_length,
             dropout=dropout,
-            delays=list(warmup),
+            delays=delays,
         )
 
     def build_lag_mask(

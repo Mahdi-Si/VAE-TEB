@@ -48,6 +48,15 @@ in a document beside them. It is deliberately **not** repeated down the two per-
 those are the input to a positional reading rather than a reading, they run to thousands of rows on
 the stratified axis, and a four-hundred-character sentence per row would be tens of megabytes of
 one sentence.
+
+**Under a channel alignment this analysis still needs $\delta$ and not the reference.** Every
+seconds column here is built through
+:func:`~teb_vae.lag_attn_cfs.eval.lag_axis.compensated_seconds_axis` or the scalar converter beside
+it, both of which produce the stored-coefficient axis; the alignment's own constant
+$\tau_{\mathrm{ref}}$ is a physical delay that would turn that axis into a physiological one, which
+is a claim this analysis does not make. It is recorded as ``source_reference_delay_s`` in the run's
+causality disclosure and its summary, where a reader who wants it can find it without any table
+here quietly having applied it.
 """
 from __future__ import annotations
 

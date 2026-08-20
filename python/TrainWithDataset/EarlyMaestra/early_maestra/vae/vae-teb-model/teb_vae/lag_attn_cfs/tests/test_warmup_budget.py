@@ -151,18 +151,27 @@ def test_the_budget_is_marked_and_the_forecast_window_is_shaded(shipped_budget):
 
 def test_no_kept_bar_is_cut_by_the_left_edge(shipped_budget):
     """The panel counts what runs past the *right* edge and reports it in the caption; a bar cut on
-    the left would be reported by nothing and would read as though it began at the axis. The source
-    is never gated and its slowest kept channel waits twice as long as the target's, so a limit
-    taken from the budget alone would do exactly that."""
+    the left would be reported by nothing and would read as though it began at the axis.
+
+    The guard against vacuity is that a kept bar actually **reaches** the stream's maximum: without
+    it a limit taken from anywhere at all would pass. It used to be "the source is ungated and its
+    slowest kept channel waits twice as long as the target's", and the alignment retired that -- the
+    reference drops every source channel above it, so the two streams' kept maxima are now equal, at
+    the budget, which is the zero-marginal-warm-up lemma showing up in a figure.
+    """
     figure = warmup_budget.build_warmup_budget_figure(shipped_budget, horizon=SHIPPED_HORIZON)
     try:
         for ax, stream in zip(figure.axes, (shipped_budget.target, shipped_budget.source)):
             left, _right = ax.get_xlim()
             assert left <= -_STEP_S * stream.max_warmup
             kept = _bars(ax)[0]
-            assert min(patch.get_x() for patch in kept.patches) >= left
-        assert shipped_budget.source.max_warmup > shipped_budget.target.max_warmup, (
-            "an ungated source that waits no longer than the target makes this vacuous"
+            longest = min(patch.get_x() for patch in kept.patches)
+            assert longest == pytest.approx(-_STEP_S * stream.max_warmup), stream.name
+            assert longest >= left, stream.name
+        assert (
+            shipped_budget.source.max_warmup
+            == shipped_budget.target.max_warmup
+            == SHIPPED_BUDGET_STEPS
         )
     finally:
         plt.close(figure)
@@ -170,8 +179,14 @@ def test_no_kept_bar_is_cut_by_the_left_edge(shipped_budget):
 
 def test_the_panel_titles_name_a_warm_up_rather_than_a_delay(shipped_budget):
     """The shared panel titles what it draws a *delay*, which is what it is on the two-sided figure
-    and is not what it is here: nothing is shifted, and the region behind the boundary holds real
-    values on no defined scale rather than a zero fill."""
+    and is not what it is here: what these bars measure is a settling length, and the region behind
+    the boundary holds real values on no defined scale rather than a zero fill.
+
+    The alignment does introduce a genuine per-channel delay, and this figure deliberately does not
+    draw it: the shift is a separate vector on the resolved budget, so a bar that silently became
+    $W'_c + d_c$ would make the two figures of this family measure different quantities under one
+    caption. The titles must therefore keep saying warm-up.
+    """
     figure = warmup_budget.build_warmup_budget_figure(shipped_budget, horizon=SHIPPED_HORIZON)
     try:
         target, source = (ax.get_title() for ax in figure.axes[:2])
@@ -179,7 +194,10 @@ def test_the_panel_titles_name_a_warm_up_rather_than_a_delay(shipped_budget):
         assert "delay" not in target and "delay" not in source
         assert f"{_KEPT_TARGET}/{_DECLARED_TARGET} channels kept" in target
         assert "fhr_st 32/36, fhr_ph 66/66" in target
-        assert "up_st 36/36, up_ph 15/15" in source
+        # The aligned source: the reference removes the four `up_st` channels above it and leaves
+        # every one of the fifteen `up_ph`, which is why that reference was chosen.
+        assert "up_st 32/36, up_ph 15/15" in source
+        assert "47/51 channels kept" in source
     finally:
         plt.close(figure)
 

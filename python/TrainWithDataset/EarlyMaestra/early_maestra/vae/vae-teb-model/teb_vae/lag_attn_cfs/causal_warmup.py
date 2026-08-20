@@ -5,10 +5,29 @@ of the assumed pre-recording history rather than of the recording. Per channel, 
 region is $W'_c$, the leading delay enclosing $95\%$ of the kernel's energy, rebased into the
 coordinates of the window the loader actually serves.
 
-This module answers one question: *given a warm-up budget, which channels may be used, and how long
-does each of them wait?* -- :func:`resolve_warmup_budget`, which reads the boundary off the
-configured shards, keeps the target channels whose warm-up fits the budget, and returns the four
-tuples the network constructor takes.
+This module answers two questions, both of them properties of the shards rather than of the run.
+
+*Given a warm-up budget, which channels may be used, and how long does each of them wait?* --
+:func:`resolve_warmup_budget`, which reads the boundary off the configured shards, keeps the target
+channels whose warm-up fits the budget, and returns the channel tuples the network constructor
+takes.
+
+*And on which clock does the encoder read them?* Every one-sided channel is stale by its own
+composed group delay $\tau_c$, which the shards record as ``causal_delay_s`` and which spans
+$13.3$ s to $791.0$ s across a stored block. Reading the whole vector at one step index therefore
+asserts that its entries describe one instant, and they do not: they span thirteen minutes. The
+repair is a per-channel shift onto a common reference,
+
+$$d_c \;=\; \operatorname{round}\!\Bigl(\frac{\tau_{\mathrm{ref}} - \tau_c}{\Delta}\Bigr),
+  \qquad \Delta = 4~\mathrm{s},$$
+
+resolved here from the same attribute and applied by ``ChannelGate(delays=...)``, which already
+exists and is built with ``delays=None`` when no reference is configured. A channel whose delay
+exceeds the reference would need $d_c < 0$ -- to be read from its own future -- and is **dropped**
+rather than advanced. The cost is provably nothing in warm-up: with $W_c \approx \rho\tau_c$,
+$W_c + \Delta d_c = \tau_{\mathrm{ref}} + (\rho - 1)\tau_c \le W_{\mathrm{ref}}$, so aligning a
+stream to its slowest kept channel costs no warm-up beyond that channel's own. That is checked on
+the resolved vectors rather than assumed, because $\rho$ is only approximately constant.
 
 **The budget and the anchor floor are one decision.** A forecast at anchor $t$, horizon step $\tau$,
 reads target time $t + 1 + \tau$; channel $c$ is valid there iff $t + 1 + \tau \ge W'_c$. Requiring
@@ -37,9 +56,18 @@ configuration setting both guards at once is refused below.
 The module reads HDF5 attributes and does arithmetic on integer vectors: no coefficient data, no
 filter bank, milliseconds. It is not torch-free -- ``hdf5_dataset`` imports torch at module scope --
 and does not need to be: the process that resolves a budget is about to build a network.
+
+**Why the alignment rule is restated here rather than imported.**
+``hdf5_dataset.causal_scattering.channel_alignment_delays`` is the canonical statement of $d_c$ and
+is what the writer and the fidelity harness call. It cannot be imported from here: that module
+imports ``kymatio`` at module scope, so importing it would build a filter-bank dependency into
+every training process -- exactly what the reach-guard paragraph above refuses. The arithmetic is
+one rounding and one refusal; ``tests/test_causal_warmup.py`` asserts the two agree entry for entry
+on the committed fixture, so the duplication cannot drift silently.
 """
 from __future__ import annotations
 
+import logging
 import os
 import sys
 from dataclasses import dataclass
@@ -58,7 +86,23 @@ if not __package__ and _REPO_ROOT not in sys.path:
 
 import numpy as np  # noqa: E402
 
-from hdf5_dataset.hdf5_dataset import CausalWarmup, read_causal_warmup  # noqa: E402
+from hdf5_dataset.hdf5_dataset import (  # noqa: E402
+    DECIMATION,
+    RAW_SAMPLING_HZ,
+    CausalWarmup,
+    read_causal_warmup,
+)
+
+logger = logging.getLogger(__name__)
+
+#: Seconds per decimated step, $\Delta$. Derived from the dataset's own two constants rather than
+#: restated as ``4.0``: the shift below converts a delay in seconds into a step index, and a
+#: hardcoded $\Delta$ would keep resolving shifts against a decimation the shards no longer have.
+STEP_SECONDS = float(DECIMATION) / float(RAW_SAMPLING_HZ)
+
+#: The alignment reference resolved from the data: the slowest **kept target** channel's composed
+#: delay. Written out because it appears in refusal messages and in the config.
+REFERENCE_TARGET_MAX = "target_max"
 
 #: Stored block names, in the channel order the model concatenates them into each input stream.
 #: Restated rather than imported from ``teb_vae.lag_attn.channel_reach``, which owns the same two
@@ -73,6 +117,8 @@ SOURCE_BLOCKS = ("up_st", "up_ph")
 #: the key the operator has to edit is the difference between a two-minute fix and a search.
 BUDGET_KEY = "model_config.VAE_model.causal_warmup_budget_steps"
 REACH_KEY = "model_config.VAE_model.causal_reach_budget_s"
+ALIGN_KEY = "model_config.VAE_model.causal_align_reference"
+LEG_ALIGNMENT_KEY = "model_config.VAE_model.causal_leg_alignment"
 SEQUENCE_KEY = "model_config.VAE_model.sequence_length"
 TRIM_KEY = "dataset_config.dataloader_config.dataset_kwargs.trim_minutes"
 
@@ -92,14 +138,33 @@ class StreamWarmup:
         block_spans: ``(name, start, stop)`` per stored block, half-open, in declared coordinates.
         declared_warmup_steps: $W'_c$ per declared channel, in decimated steps of the trimmed
             window, in the concatenated channel order.
+        declared_delay_s: $\tau_c$ per declared channel, in **seconds** and unrebased -- the
+            shard's own ``causal_delay_s``. Declared rather than kept for the same reason the
+            warm-up is, and one of its own: the channels the alignment drops are named in the
+            startup log *by their delay*, which a survivors-only vector could not do.
+        declared_novelty_frac: $\nu_c$ per declared channel -- the share of that coefficient drawn
+            from raw samples the anchor has not seen, at the horizon the writer measured it over --
+            or ``None`` when any of the stream's blocks was written before the attribute existed.
+            ``None`` for the whole stream rather than per block, because the vector is consumed as
+            one concatenated axis and a half-filled one would silently partition on the half that
+            is there. Declared rather than kept for the same reason as above, and one of its own:
+            the model gathers it through the keep-index, so a model built with no gate at all still
+            receives a vector of the right width.
         keep_index: Surviving channel indices into the declared width, strictly ascending -- the
             order ``ChannelGate``'s gather requires.
+        align_delays: $d_c$ per **survivor**, positional against :attr:`keep_index`, or ``None``
+            when no reference is configured -- which is the stream the gate gathers without
+            shifting. Stored rather than derived because the reference it was resolved against is
+            a run's decision, not a property of the vectors kept here.
     """
 
     name: str
     block_spans: Tuple[Tuple[str, int, int], ...]
     declared_warmup_steps: Tuple[int, ...]
+    declared_delay_s: Tuple[float, ...]
+    declared_novelty_frac: Optional[Tuple[float, ...]]
     keep_index: Tuple[int, ...]
+    align_delays: Optional[Tuple[int, ...]] = None
 
     @property
     def declared_width(self) -> int:
@@ -121,6 +186,38 @@ class StreamWarmup:
         """Declared channel indices the budget removed, ascending."""
         kept = set(self.keep_index)
         return tuple(index for index in range(self.declared_width) if index not in kept)
+
+    @property
+    def delay_s(self) -> Tuple[float, ...]:
+        r"""$\tau_c$ per survivor, in seconds, positional against :attr:`keep_index`."""
+        return tuple(self.declared_delay_s[index] for index in self.keep_index)
+
+    @property
+    def combined_steps(self) -> Tuple[int, ...]:
+        r"""When each survivor is honest **as the encoder reads it**: $W'_c + d_c$, in steps.
+
+        The shift moves a channel's content later, so a gathered-and-delayed channel is a function
+        of the recording only once the step index has reached *both* its own warm-up and its shift.
+        This is the vector the availability adapter masks and announces with, and the vector the
+        anchor floor's input-warmth half is taken over; the unshifted :attr:`warmup_steps` is
+        neither. Identical to it when no reference is configured.
+        """
+        if self.align_delays is None:
+            return self.warmup_steps
+        return tuple(
+            wait + shift for wait, shift in zip(self.warmup_steps, self.align_delays)
+        )
+
+    @property
+    def max_align_delay(self) -> int:
+        r"""The largest shift applied to any survivor, $\max_c d_c$, or $0$ with no reference.
+
+        Attained by the **fastest** kept channel, which is the one furthest from the reference --
+        so it is not an upper bound on how stale the stream is in physical time. It is the number
+        ``ChannelGate.max_delay`` reports, and the number the leading steps of the delayed stream
+        are zero-filled for.
+        """
+        return 0 if self.align_delays is None else max(self.align_delays, default=0)
 
     @property
     def max_warmup(self) -> int:
@@ -148,13 +245,24 @@ class StreamWarmup:
         )
 
     def summary(self) -> str:
-        """One line naming the surviving counts per block and the slowest survivor's wait."""
+        """One line naming the surviving counts per block, the slowest wait and the shift range."""
         blocks = ", ".join(
             f"{name} {kept}/{declared}" for name, kept, declared in self.block_counts()
         )
+        # Appended rather than always present: an unaligned run's line is the one every existing
+        # log and every existing test reads, and a trailing "shift 0-0" on it would be noise that
+        # says a mechanism ran when none did.
+        shift = (
+            ""
+            if self.align_delays is None
+            else (
+                f", shift {min(self.align_delays)}-{self.max_align_delay} steps, "
+                f"honest by 0-{max(self.combined_steps, default=0)}"
+            )
+        )
         return (
             f"{self.name}: {blocks}; {self.kept_width}/{self.declared_width} channels, "
-            f"warm-up 0-{self.max_warmup} steps"
+            f"warm-up 0-{self.max_warmup} steps{shift}"
         )
 
 
@@ -167,6 +275,15 @@ class WarmupBudget:
             survives when $W'_c \le B_{\mathrm{cfg}}$.
         trim_minutes: The trim the warm-up vectors are expressed against, which is the loader's own.
         quantile: The ``causal_warmup_quantile`` every configured shard was built at.
+        reference_delay_s: $\tau_{\mathrm{ref}}$, the common clock both streams were shifted onto,
+            in seconds; ``None`` when no reference is configured and neither stream is shifted.
+            **This -- not** ``source_delay_steps`` **-- is the physical constant a lag report
+            needs.** The two are different quantities: the model's scalar is the largest *stored
+            step* shift, attained by the fastest channel, while this is the physical instant every
+            aligned channel reports at step $t$, namely $\Delta t - \tau_{\mathrm{ref}}$.
+        leg_alignment: Which phase-harmonic operator built the configured shards' phase blocks, as
+            they record it. Carried so a run's startup log states which dataset variant it read;
+            the *expected* value is a config key, checked in :func:`resolve_warmup_budget`.
         target: The target stream, which the budget gates.
         source: The source stream, which it does not; see :func:`resolve_warmup_budget`.
     """
@@ -174,6 +291,8 @@ class WarmupBudget:
     budget_steps: int
     trim_minutes: Optional[float]
     quantile: Optional[float]
+    reference_delay_s: Optional[float]
+    leg_alignment: str
     target: StreamWarmup
     source: StreamWarmup
 
@@ -184,9 +303,15 @@ class WarmupBudget:
         stored as, and ``0.949999988079071`` in a log line is noise rather than provenance.
         """
         quantile = "unknown" if self.quantile is None else f"{self.quantile:.3g}"
+        reference = (
+            "unaligned"
+            if self.reference_delay_s is None
+            else f"reference {self.reference_delay_s:.4f} s"
+        )
         return (
             f"causal warm-up budget {self.budget_steps} steps "
-            f"(quantile {quantile}, trim_minutes {self.trim_minutes}): "
+            f"(quantile {quantile}, trim_minutes {self.trim_minutes}, "
+            f"leg alignment {self.leg_alignment}, {reference}): "
             f"{self.target.summary()}; {self.source.summary()}"
         )
 
@@ -220,8 +345,23 @@ def _require_int(vae_config: Mapping[str, Any], key: str) -> int:
 
 def _build_stream(
     name: str, blocks: Sequence[str], warmup: CausalWarmup, declared_width: int, declared_key: str
-) -> Tuple[Tuple[Tuple[str, int, int], ...], Tuple[int, ...]]:
-    """Concatenate a stream's blocks into one declared-width warm-up vector.
+) -> Tuple[
+    Tuple[Tuple[str, int, int], ...],
+    Tuple[int, ...],
+    Tuple[float, ...],
+    Optional[Tuple[float, ...]],
+]:
+    """Concatenate a stream's blocks into one declared-width warm-up, delay and novelty vector.
+
+    The three travel together because they are positional into the same width and are read off the
+    same blocks in the same order: a stream assembled with one of them out of step would gate on
+    one channel's warm-up and shift on another's, with every length still correct.
+
+    The novelty vector is the one that may be missing. It is written by a strictly later writer than
+    the other two, so a shard built before it exists carries neither the attribute nor any value
+    that could stand in for it -- and it is reported as ``None`` for the **whole stream** the moment
+    any one block lacks it, because a vector that is real over ``fhr_st`` and fabricated over
+    ``fhr_ph`` would partition cleanly and mean nothing.
 
     Args:
         name: ``'target'`` or ``'source'``, for the refusal messages.
@@ -231,11 +371,12 @@ def _build_stream(
         declared_key: The config key that declared it, for the refusal message.
 
     Returns:
-        ``(block_spans, declared_warmup_steps)``.
+        ``(block_spans, declared_warmup_steps, declared_delay_s, declared_novelty_frac)``, the last
+        of which is ``None`` when any block of the stream carries no novelty vector.
 
     Raises:
-        ValueError: If a block is absent from the shards, or if the concatenated width disagrees
-            with the declared one.
+        ValueError: If a block is absent from the shards, if the concatenated width disagrees with
+            the declared one, or if a stored novelty vector is not of its block's width.
     """
     missing = [block for block in blocks if block not in warmup.warmup_steps]
     if missing:
@@ -246,10 +387,31 @@ def _build_stream(
 
     spans: List[Tuple[str, int, int]] = []
     values: List[int] = []
+    delays: List[float] = []
+    novelty: Optional[List[float]] = [] if all(
+        block in warmup.novelty_frac for block in blocks
+    ) else None
     for block in blocks:
         vector = warmup.warmup_steps[block]
         spans.append((block, len(values), len(values) + int(vector.size)))
         values.extend(int(step) for step in vector)
+        # Required by ``read_causal_warmup`` on every causal shard, and of the block's own width:
+        # both are checked there, so an absent or mis-shaped vector never reaches this line.
+        delays.extend(float(delay) for delay in warmup.delay_s[block])
+        if novelty is not None:
+            stored = warmup.novelty_frac[block]
+            # Checked here rather than at the read, which takes the attribute as it finds it. A
+            # short vector would concatenate into a stream of the right total width whenever
+            # another block was long by the same amount, and every channel after the join would be
+            # attributed the wrong novelty with no length disagreeing.
+            if int(stored.size) != int(vector.size):
+                raise ValueError(
+                    f"the shards' '{block}' causal_novelty_frac has {int(stored.size)} entries "
+                    f"against {int(vector.size)} channels in causal_warmup_steps. The two are "
+                    f"positional into one channel axis, so a mismatch attributes one channel's "
+                    f"novelty to another rather than fail."
+                )
+            novelty.extend(float(share) for share in stored)
 
     if declared_width != len(values):
         raise ValueError(
@@ -258,25 +420,201 @@ def _build_stream(
             f"positional into the declared width, so the model would gather the wrong channels "
             f"and wait the wrong number of steps for each rather than fail."
         )
-    return tuple(spans), tuple(values)
+    return (
+        tuple(spans),
+        tuple(values),
+        tuple(delays),
+        None if novelty is None else tuple(novelty),
+    )
+
+
+def _check_leg_alignment(expected: Optional[Any], measured: str, paths: Sequence[str]) -> None:
+    """Refuse shards built by a phase-harmonic operator this run did not ask for.
+
+    The aligned and unaligned shard variants have **identical** widths, warm-ups, stored delays and
+    block names, so nothing else in the resolution can tell them apart -- and only one of them makes
+    the stored ``causal_delay_s`` true of the phase blocks. Under the unaligned operator the two
+    legs of a pair are multiplied at one stored index although they report the signal at two
+    different instants, so the composed delay the alignment below resolves its shifts from is a
+    misprediction there: the measured best lag misses it by a median of $60.5$ steps on ``fhr_ph``.
+    Shifting by a number the data does not have is worse than not shifting at all.
+
+    Args:
+        expected: The configured expectation, or ``None`` for no expectation at all -- which is
+            what a run comparing the two variants, or measuring the shift mechanism against a
+            legacy shard, wants.
+        measured: What the configured shards record, with absence already read as ``'none'``.
+        paths: The shards, for the refusal message.
+
+    Raises:
+        ValueError: If an expectation is configured and the shards disagree with it.
+    """
+    if expected is None:
+        return
+    if str(expected) != measured:
+        raise ValueError(
+            f"{LEG_ALIGNMENT_KEY}={str(expected)!r} but the configured shards record "
+            f"causal_leg_alignment={measured!r} ({', '.join(str(path) for path in paths)}). The "
+            f"two variants have identical widths, warm-ups and stored delays, so nothing else "
+            f"here can tell them apart -- and the stored causal_delay_s is only true of the phase "
+            f"blocks under 'envelope'. Point the run at the matching build, or set "
+            f"{LEG_ALIGNMENT_KEY}: null to state that this run does not care."
+        )
+
+
+def _resolve_reference_delay(
+    setting: Any, kept_target_delay_s: Sequence[float]
+) -> Optional[float]:
+    r"""Resolve ``causal_align_reference`` into $\tau_{\mathrm{ref}}$ in seconds.
+
+    Three settings, and the explicit float is the one that needs a guard. ``'target_max'`` resolves
+    the reference from the data -- the slowest channel the budget keeps, $402.1604$ s on the shipped
+    bank -- which is the only value that keeps every kept target channel. A float is admitted so the
+    every-lag-warm reference of $150.79$ s stays a one-key override, and it is checked against the
+    stream's own delays: the shift is a re-indexing onto *some channel's* clock, and a reference
+    landing between two of them is a clock no channel keeps, whose residual shows up as a fraction
+    of a step on every channel at once rather than as a failure.
+
+    **The matched channel's own delay is returned, not the configured number.** The drop rule
+    compares delays against the reference exactly, and the stored vector is ``float32``: a config
+    literal of ``150.78593`` sits $4\times10^{-6}$ s *below* the channel it names, which would drop
+    that channel -- and both its harmonic siblings, and the whole ``up_ph`` block behind it -- for a
+    rounding difference. Snapping removes the trap at its source rather than toleranced comparisons
+    at three later ones, and it is what makes the shift exactly zero at the reference.
+
+    Args:
+        setting: The configured value: ``None``, ``'target_max'``, or a number of seconds.
+        kept_target_delay_s: $\tau_c$ of the target channels the warm-up budget keeps, in seconds.
+
+    Returns:
+        The reference in seconds -- always one of ``kept_target_delay_s`` -- or ``None`` when no
+        alignment is configured.
+
+    Raises:
+        ValueError: If the setting is neither ``'target_max'`` nor a number, or if an explicit
+            float matches no kept target channel within half a step.
+    """
+    if setting is None:
+        return None
+
+    if isinstance(setting, str):
+        if setting != REFERENCE_TARGET_MAX:
+            raise ValueError(
+                f"{ALIGN_KEY}={setting!r} is not a reference this resolver knows. Use "
+                f"{REFERENCE_TARGET_MAX!r} to take the slowest kept target channel's delay from "
+                f"the shards, an explicit delay in seconds, or null for no alignment."
+            )
+        return float(max(kept_target_delay_s))
+
+    reference = float(setting)
+    nearest = float(min(kept_target_delay_s, key=lambda delay: abs(delay - reference)))
+    if abs(nearest - reference) > STEP_SECONDS / 2.0:
+        raise ValueError(
+            f"{ALIGN_KEY}={reference:g} s matches no target channel the budget keeps: the nearest "
+            f"is {nearest:.4f} s, {abs(nearest - reference):.4f} s away, against a half-step "
+            f"tolerance of {STEP_SECONDS / 2.0:g} s. The alignment re-indexes every channel onto "
+            f"one channel's clock, so a reference between two of them is a clock no channel keeps "
+            f"and leaves a residual on every channel at once. Use "
+            f"{REFERENCE_TARGET_MAX!r}, or name a stored delay."
+        )
+    return nearest
+
+
+def _align_stream(
+    name: str,
+    delay_s: Sequence[float],
+    keep_index: Sequence[int],
+    reference_s: Optional[float],
+) -> Tuple[Tuple[int, ...], Optional[Tuple[int, ...]]]:
+    r"""Drop a stream's above-reference channels and resolve the survivors' shifts.
+
+    $$d_c \;=\; \operatorname{round}\!\Bigl(\frac{\tau_{\mathrm{ref}} - \tau_c}{\Delta}\Bigr) \ge 0.$$
+
+    **Rounding, not ceiling**, and the reason is not the warm-up's. Both directions are causally
+    safe -- a shift only selects which *already-causal* stored step is read -- so the only criterion
+    is residual misalignment, which rounding minimises at $\Delta/2 = 2$ s. (Contrast the warm-up
+    itself, where the ceiling is load-bearing, because a step that is $40\%$ pad is not $40\%$
+    valid.)
+
+    **A channel above the reference is dropped, not advanced.** Its shift would be negative, i.e.
+    it would be read from a *later* stored step, which reads raw signal after the anchor and
+    destroys the one property the causal construction exists for. That is a correctness
+    requirement and is what distinguishes these drops from the warm-up budget's, which are a policy
+    about how much of a segment to spend waiting.
+
+    Args:
+        name: ``'target'`` or ``'source'``, for the log line.
+        delay_s: $\tau_c$ per **declared** channel, in seconds.
+        keep_index: The channels surviving everything before the alignment, ascending.
+        reference_s: $\tau_{\mathrm{ref}}$, or ``None`` for no alignment.
+
+    Returns:
+        ``(keep_index, align_delays)``: the keep-index narrowed to the channels at or below the
+        reference, and one shift per survivor -- or the keep-index unchanged and ``None`` when no
+        reference is configured.
+
+    Raises:
+        ValueError: If the reference drops every channel of the stream.
+    """
+    if reference_s is None:
+        return tuple(keep_index), None
+
+    kept: List[int] = []
+    dropped: List[int] = []
+    for index in keep_index:
+        (kept if delay_s[index] <= reference_s else dropped).append(int(index))
+
+    # One line each rather than a summary count: which channels a run stopped reading is the fact
+    # a reader of its log needs months later, and "4 dropped" does not survive a channel-plan
+    # change while an index and a delay do.
+    for index in dropped:
+        logger.info(
+            f"causal alignment drops {name} channel {index}: composed delay "
+            f"{delay_s[index]:.4f} s is above the reference {reference_s:.4f} s, so aligning it "
+            f"would need a negative shift, which reads the channel's own future."
+        )
+
+    if not kept:
+        raise ValueError(
+            f"{ALIGN_KEY} resolves to {reference_s:.4f} s, which is below every one of the "
+            f"{len(keep_index)} {name} channels reaching this point (the fastest is "
+            f"{min(delay_s[index] for index in keep_index):.4f} s). A stream with zero channels "
+            f"builds a model that trains to completion having never read it."
+        )
+
+    shifts = tuple(
+        int(round((reference_s - delay_s[index]) / STEP_SECONDS)) for index in kept
+    )
+    return tuple(kept), shifts
 
 
 def resolve_warmup_budget(config: Mapping[str, Any]) -> Optional[WarmupBudget]:
     r"""Resolve a run's configuration and its shards into concrete channel tuples.
 
-    Pure: it reads the configuration and the shards' attributes and touches nothing else, so the
-    experiment driver and the resolved-config record can each call it and cannot disagree.
+    Pure but for one ``INFO`` line per channel the alignment drops: it reads the configuration and
+    the shards' attributes and touches nothing else, so the experiment driver and the
+    resolved-config record can each call it and cannot disagree. The drops are logged rather than
+    returned quietly because which channels a run stopped reading is not recoverable from any
+    metric it emits.
 
-    **The source stream is never gated.** Its keep-index is the identity by construction. Its
-    slowest channels are the ones carrying the contraction envelope, and dropping them to make
-    every reachable lag warm would cost almost the whole ``up_ph`` block -- against a lag search
-    that exists to find the $20$ to $120$ s contraction-to-deceleration delay. They are kept, the
-    availability mechanism announces per step when each arrives, and the residual is measured
-    rather than resolved.
+    **The source stream is never gated by the budget.** Its slowest channels are the ones carrying
+    the contraction envelope, and dropping them to make every reachable lag warm would cost almost
+    the whole ``up_ph`` block -- against a lag search that exists to find the $20$ to $120$ s
+    contraction-to-deceleration delay. They are kept, the availability mechanism announces per step
+    when each arrives, and the residual is measured rather than resolved.
+
+    **The alignment drops for a different reason, and it is not a policy.** A channel whose composed
+    delay exceeds $\tau_{\mathrm{ref}}$ can only be brought onto that clock by a negative shift,
+    i.e. by being read from a later stored step, which reads raw signal after the anchor. Those
+    channels are refused rather than advanced -- four of the $51$ source channels at the shipped
+    reference, all fifteen ``up_ph`` surviving -- and the distinction from the paragraph above is
+    load-bearing: the budget's drops are how much of a segment this design is willing to spend
+    waiting, and these are a correctness requirement.
 
     Args:
         config: The resolved experiment config mapping. ``model_config.VAE_model`` supplies the
-            budget and the geometry; ``dataset_config`` supplies the shards and the trim.
+            budget, the alignment reference, the expected leg alignment and the geometry;
+            ``dataset_config`` supplies the shards and the trim.
 
     Returns:
         The resolved budget, or ``None`` when ``causal_warmup_budget_steps`` is absent or ``None``
@@ -287,8 +625,10 @@ def resolve_warmup_budget(config: Mapping[str, Any]) -> Optional[WarmupBudget]:
             configured; if the shards are not causal, do not agree, or leave a channel with no
             valid step; if the trim the vectors were rebased at does not produce the declared
             sequence length; if a declared stream width disagrees with the shards; if the budget
-            keeps no target channel; or if the floor and stride leave a phase with no anchor at
-            all.
+            keeps no target channel; if the shards' recorded leg alignment disagrees with the
+            configured expectation; if the alignment reference is neither ``'target_max'`` nor a
+            number, matches no kept target channel, or leaves a stream with no channel at all; or
+            if the floor and stride leave a phase with no anchor at all.
     """
     model_config = config.get("model_config") or {}
     vae_config = model_config.get("VAE_model") or {}
@@ -356,10 +696,10 @@ def resolve_warmup_budget(config: Mapping[str, Any]) -> Optional[WarmupBudget]:
 
     use_up_st = bool(vae_config.get("use_up_st", True))
     source_blocks = SOURCE_BLOCKS if use_up_st else SOURCE_BLOCKS[1:]
-    target_spans, target_warmup = _build_stream(
+    target_spans, target_warmup, target_delay_s, target_novelty = _build_stream(
         "target", TARGET_BLOCKS, warmup, _require_int(vae_config, "c_y"), "c_y"
     )
-    source_spans, source_warmup = _build_stream(
+    source_spans, source_warmup, source_delay_s, source_novelty = _build_stream(
         "source", source_blocks, warmup, _require_int(vae_config, "c_u"), "c_u"
     )
 
@@ -372,6 +712,32 @@ def resolve_warmup_budget(config: Mapping[str, Any]) -> Optional[WarmupBudget]:
             f"{len(target_warmup)} waits {min(target_warmup)} steps). A stream with zero channels "
             f"builds a model that trains to completion having never read it."
         )
+
+    # The shards' own record of which phase-harmonic operator built them, checked *before* any
+    # shift is resolved from the delays it makes true or false.
+    _check_leg_alignment(vae_config.get("causal_leg_alignment"), warmup.leg_alignment, paths)
+
+    # The reference is resolved from the target stream alone and applied to both, which is the
+    # whole point of it: a per-stream reference would keep every source channel and restore a
+    # known 389 s bias between the two streams' clocks, defeating the correction it looks like.
+    reference_delay_s = _resolve_reference_delay(
+        vae_config.get("causal_align_reference"),
+        tuple(target_delay_s[index] for index in target_keep),
+    )
+    target_keep, target_align = _align_stream(
+        "target", target_delay_s, target_keep, reference_delay_s
+    )
+    # The source keep-index is the identity **until** a reference is configured. It is not derived
+    # from the warm-up budget and must not be: the source's slowest channels carry the contraction
+    # envelope, and gating them on the budget would drop almost the whole ``up_ph`` block against a
+    # lag search that exists to find the 20 to 120 s contraction-to-deceleration delay. What the
+    # alignment removes is a different set for a different reason -- the four channels *above* the
+    # reference, which cannot be shifted onto it without reading their own future -- and that is a
+    # correctness requirement rather than a warm-up policy. All fifteen ``up_ph`` channels survive
+    # it at the shipped reference.
+    source_keep, source_align = _align_stream(
+        "source", source_delay_s, tuple(range(len(source_warmup))), reference_delay_s
+    )
 
     # The worst phase is the last one, whose first anchor is F + S - 1; if that anchor does not
     # exist there is a phase at which the sample contributes no forecast at all, and its share of
@@ -389,20 +755,25 @@ def resolve_warmup_budget(config: Mapping[str, Any]) -> Optional[WarmupBudget]:
         budget_steps=budget_steps,
         trim_minutes=trim_minutes,
         quantile=warmup.quantile,
+        reference_delay_s=reference_delay_s,
+        leg_alignment=warmup.leg_alignment,
         target=StreamWarmup(
             name="target",
             block_spans=target_spans,
             declared_warmup_steps=target_warmup,
+            declared_delay_s=target_delay_s,
+            declared_novelty_frac=target_novelty,
             keep_index=target_keep,
+            align_delays=target_align,
         ),
         source=StreamWarmup(
             name="source",
             block_spans=source_spans,
             declared_warmup_steps=source_warmup,
-            # Identity by construction, not by arithmetic that happens to keep everything: the
-            # source is not gated, and a keep-index derived from the budget would quietly start
-            # dropping the contraction envelope the moment the budget moved.
-            keep_index=tuple(range(len(source_warmup))),
+            declared_delay_s=source_delay_s,
+            declared_novelty_frac=source_novelty,
+            keep_index=source_keep,
+            align_delays=source_align,
         ),
     )
 

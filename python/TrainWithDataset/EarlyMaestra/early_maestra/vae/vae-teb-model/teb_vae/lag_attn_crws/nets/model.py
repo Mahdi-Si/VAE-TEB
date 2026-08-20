@@ -27,7 +27,10 @@ build an all-defaults model at $d_{model} = 128$ on a tiny smoke config.
 
 ``target_delays`` and ``source_delays`` are the only names removed from the base's list, and removing
 them is the point: a warm-up is a leading *mask*, ``ChannelDelay`` is a *shift*, and a warm-up routed
-under a delay name would train a different model with every shape intact.
+under a delay name would train a different model with every shape intact. The channel alignment *is*
+a shift and does reach that module -- under ``target_align_delays`` and ``source_align_delays``,
+which the constructor renames on the way through, so what a checkpoint records is which of the two
+quantities it was built with rather than a name that could be either.
 """
 from __future__ import annotations
 
@@ -76,7 +79,7 @@ class SeqVaeLagAttnCrws(CausalRawInputs, SeqVaeLagAttnRws):
         d_z: int = 48,
         horizon: int = 30,
         raw_per_step: int = 16,
-        warmup_period: int = 133,
+        warmup_period: int = 134,
         c_y: int = 102,
         c_u: int = 51,
         use_up_st: bool = True,
@@ -115,15 +118,17 @@ class SeqVaeLagAttnCrws(CausalRawInputs, SeqVaeLagAttnRws):
         target_warmup_steps: Optional[Sequence[int]] = None,
         source_keep_index: Optional[Sequence[int]] = None,
         source_warmup_steps: Optional[Sequence[int]] = None,
+        target_align_delays: Optional[Sequence[int]] = None,
+        source_align_delays: Optional[Sequence[int]] = None,
         anchor_stride: int = 1,
         lag_floor: int = 0,
         init_weights: bool = True,
     ) -> None:
         r"""Initialize the model.
 
-        Every keyword the base takes is forwarded unchanged; only the four below are this input
-        domain's, and only ``target_delays`` / ``source_delays`` are gone. The defaults that differ
-        from the base's -- ``horizon`` $15$, ``warmup_period`` $133$, ``c_y`` $102$, ``c_u`` $51$ --
+        Every keyword the base takes is forwarded unchanged or renamed; only the six below are
+        this input domain's, and only ``target_delays`` / ``source_delays`` are gone as names. The defaults that differ
+        from the base's -- ``horizon`` $15$, ``warmup_period`` $134$, ``c_y`` $102$, ``c_u`` $51$ --
         are the causal dataset's geometry rather than a preference, and a run that leaves them at
         the base's values would be describing a dataset that does not exist.
 
@@ -138,6 +143,12 @@ class SeqVaeLagAttnCrws(CausalRawInputs, SeqVaeLagAttnRws):
                 The stream is an *input* here, which is why the vector's own name says nothing about
                 a target block being forecast.
             source_warmup_steps: The same for the source stream.
+            target_align_delays: $d_c$ per **surviving** target channel, the shift that brings
+                every one of them onto a common reference clock. Forwarded to the base as
+                ``target_delays``, so it reaches ``ChannelDelay`` and the gate stops being a pure
+                gather. ``None`` -- the default and the shipped setting -- builds a model bitwise
+                identical to one constructed before the keyword existed.
+            source_align_delays: The same for the source stream.
             anchor_stride: $S$, the spacing between decoded anchors, in $[1, H]$. Defaults to $1$ --
                 the dense range every sibling decodes, and the inert value -- so a model constructed
                 without an opinion behaves like the rest of the family. The tiling is a
@@ -172,7 +183,16 @@ class SeqVaeLagAttnCrws(CausalRawInputs, SeqVaeLagAttnRws):
             lag_floor=lag_floor,
         )
 
-        super().__init__(**forwarded, target_delays=None, source_delays=None)
+        # The alignment shifts reach the base under ITS names, which is the one place in this
+        # family where ``ChannelDelay`` does any work. They arrive under names of their own because
+        # a run configures a *reference* and the resolver turns it into these vectors, while the
+        # base's names carry the two-sided reach guard -- a different quantity, measured on a bank
+        # that did not produce these coefficients, and still refused here as a constructor keyword.
+        super().__init__(
+            **forwarded,
+            target_delays=target_align_delays,
+            source_delays=source_align_delays,
+        )
 
         # After the base, which is what validates the geometry the anchor checks read.
         self._validate_causal_geometry()

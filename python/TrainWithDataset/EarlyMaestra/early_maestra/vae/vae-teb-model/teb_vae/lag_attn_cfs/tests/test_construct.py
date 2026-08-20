@@ -36,14 +36,23 @@ from teb_vae.lag_attn_cfs.tests.conftest import (
     CAUSAL_C_U,
     CAUSAL_C_Y,
     CAUSAL_ST_WIDTH,
+    TINY_SOURCE_ALIGN_DELAYS,
     TINY_SOURCE_WARMUP_STEPS,
+    TINY_TARGET_ALIGN_DELAYS,
     TINY_TARGET_KEEP_INDEX,
     TINY_TARGET_WARMUP_STEPS,
     build,
     make_streams,
     shipped_warmup_kwargs,
+    tiny_align_kwargs,
     tiny_warmup_kwargs,
 )
+
+
+@pytest.fixture
+def tiny_align():
+    """A fresh copy of the tiny kwargs carrying the guard and the alignment (safe to mutate)."""
+    return tiny_align_kwargs()
 from teb_vae.lag_attn_fs.nets.model import SeqVaeLagAttnFs
 from teb_vae.lag_attn_rws.nets.model import SeqVaeLagAttnRws
 
@@ -124,7 +133,7 @@ def test_the_geometry_defaults_are_the_causal_ones() -> None:
     assert defaults["c_y"] == CAUSAL_C_Y
     assert defaults["c_u"] == CAUSAL_C_U
     assert defaults["horizon"] == 30
-    assert defaults["warmup_period"] == 133
+    assert defaults["warmup_period"] == 134
     # The inert defaults: a model built with no opinion decodes densely and floors no lag, which is
     # what every sibling does. The tiling is a configuration decision and the config states it.
     assert defaults["anchor_stride"] == 1
@@ -202,17 +211,48 @@ def test_the_start_token_is_built_only_when_every_channel_waits(tiny_warmup) -> 
     assert narrowed.target_adapter.start_embed is None
 
 
-def test_the_shipped_budget_builds_neither_start_token() -> None:
-    """At the real budget both minima are $0$, and a change to either must be visible here."""
+def test_the_shipped_budget_builds_both_start_tokens() -> None:
+    r"""The alignment brings a parameter into existence that no shipped configuration had before.
+
+    The adapter builds ``start_embed`` only when every channel of its stream is still pre-warm-up at
+    step $0$. Unaligned, both minima are $0$ -- some channel is honest immediately on each stream --
+    so neither token existed. Under the shipped reference the adapter is fed $W'_c + d_c$, whose
+    minimum is $91$ on both streams, so both are constructed: a learned vector of width
+    $d_{\mathrm{model}}$ per stream, and a live "everything here is still pre-warm-up" token in the
+    forward pass. Asserted rather than discovered, because the alternative is finding it as a
+    parameter-count disagreement in ``test_docs.py``.
+    """
     kwargs = shipped_warmup_kwargs()
     assert min(kwargs["target_warmup_steps"]) == 0
     assert min(kwargs["source_warmup_steps"]) == 0
+    combined = [
+        min(warm + shift for warm, shift in zip(kwargs[f"{name}_warmup_steps"],
+                                                kwargs[f"{name}_align_delays"]))
+        for name in ("target", "source")
+    ]
+    assert combined == [91, 91]
+
+    model = build(kwargs)
+    assert model.target_adapter.start_embed is not None
+    assert model.source_adapter.start_embed is not None
+    assert model.target_adapter.start_embed.shape[-1] == model.d_model
+    assert model.source_adapter.start_embed.shape[-1] == model.d_model
+    assert model.target_gate is not None and model.target_gate.out_channels == 98
+    assert model.decoder_out_channels == 98
+    # The source loses the four channels above the reference, and only those.
+    assert model.source_gate is not None and model.source_gate.out_channels == 47
+
+
+def test_the_unaligned_budget_builds_neither_start_token() -> None:
+    """The comparison arm, and the assertion the test above replaced: with no reference the
+    adapter sees the warm-up alone, whose minimum is $0$ on both streams."""
+    kwargs = shipped_warmup_kwargs(align=False)
+    assert "target_align_delays" not in kwargs and "source_align_delays" not in kwargs
 
     model = build(kwargs)
     assert model.target_adapter.start_embed is None
     assert model.source_adapter.start_embed is None
-    assert model.target_gate is not None and model.target_gate.out_channels == 98
-    assert model.decoder_out_channels == 98
+    assert model.source_gate is not None and model.source_gate.out_channels == 51
 
 
 # =================================================================================================
@@ -397,3 +437,173 @@ def test_a_negative_lag_floor_is_refused_naming_it(tiny_warmup) -> None:
     """It would admit lags reading before the start of the sequence."""
     with pytest.raises(ValueError, match="-3"):
         SeqVaeLagAttnCfs(**dict(tiny_warmup, lag_floor=-3))
+
+
+# =================================================================================================
+# The channel alignment
+#
+# The gate stops being a pure gather. Three things follow, and exactly one of them is loud: the
+# widths move (loud), the anchor floor moves (loud, refused by name), and the availability mask has
+# to move with the shift (SILENT -- it would announce a channel warm by up to its own shift before
+# it is, with no crash, no shape change and no metric moving). The last is what most of the block
+# below is about.
+# =================================================================================================
+def test_omitting_the_alignment_keywords_builds_todays_model_bitwise(tiny_warmup) -> None:
+    """The path an old checkpoint's saved kwargs dict actually exercises.
+
+    A checkpoint written before these keywords existed carries neither, so construction from it
+    must produce the object graph and the tensor values of the model that was trained -- not an
+    equivalent one with an identity ``ChannelDelay`` in it. Asserted over the state dict *and* over
+    the buffer names, because an identity shift is numerically invisible and structurally is not.
+    """
+    without = build(tiny_warmup)
+    explicit = build(dict(tiny_warmup, target_align_delays=None, source_align_delays=None))
+
+    assert list(without.state_dict()) == list(explicit.state_dict())
+    for name, tensor in without.state_dict().items():
+        assert torch.equal(tensor, explicit.state_dict()[name]), name
+    assert sorted(dict(without.named_buffers())) == sorted(dict(explicit.named_buffers()))
+    assert without.target_gate.max_delay == explicit.target_gate.max_delay == 0
+    assert without.source_delay_steps == explicit.source_delay_steps == 0
+    # And neither adapter has a start-of-record token, because the warm-up alone reaches zero.
+    assert without.target_adapter.start_embed is None
+    assert without.source_adapter.start_embed is None
+
+
+def test_the_shift_reaches_the_gate_and_nothing_else_moves_the_keep_index(tiny_align) -> None:
+    """The keywords are renamed on the way to the base, so the gate is where they must land."""
+    model = build(tiny_align)
+
+    assert tuple(int(value) for value in model.target_gate.delay.delay_steps) == (
+        TINY_TARGET_ALIGN_DELAYS
+    )
+    assert tuple(int(value) for value in model.source_gate.delay.delay_steps) == (
+        TINY_SOURCE_ALIGN_DELAYS
+    )
+    assert tuple(int(value) for value in model.target_gate.keep_index) == TINY_TARGET_KEEP_INDEX
+    assert model.target_gate.out_channels == len(TINY_TARGET_KEEP_INDEX)
+
+
+def test_the_adapter_is_told_the_warm_up_plus_the_shift(tiny_align) -> None:
+    r"""The silent one. A gathered-and-delayed channel is honest only once the step index has
+    reached **both** $W'_c$ and $d_c$, so the vector the mask and the announcement are built from is
+    the sum. Fed the warm-up alone, the adapter would call a channel warm $d_c$ steps early and
+    every shape, every metric and every gradient would be exactly as they are now."""
+    model = build(tiny_align)
+    combined = tuple(
+        wait + shift
+        for wait, shift in zip(TINY_TARGET_WARMUP_STEPS, TINY_TARGET_ALIGN_DELAYS)
+    )
+
+    assert model.target_adapter.max_delay == max(combined)
+    assert model.target_adapter.min_delay == min(combined)
+    # The pattern itself, which is what the forward multiplies by.
+    pattern = model.target_adapter.availability
+    for channel, delay in enumerate(combined):
+        column = pattern[:, channel]
+        assert not bool(column[:delay].any()), channel
+        assert bool(column[delay:].all()), channel
+
+
+def test_the_availability_of_an_aligned_channel_is_the_unaligned_one_shifted_right(
+    tiny_warmup, tiny_align
+) -> None:
+    """Stated as the relation rather than as two independent patterns: the whole claim of the
+    alignment is that a channel's content moved later by $d_c$ steps and nothing else about it
+    changed, so its availability must be the same staircase translated by the same $d_c$."""
+    unaligned = build(tiny_warmup).target_adapter.availability
+    aligned = build(tiny_align).target_adapter.availability
+    steps = int(unaligned.shape[0])
+
+    for channel, shift in enumerate(TINY_TARGET_ALIGN_DELAYS):
+        expected = torch.zeros(steps, dtype=aligned.dtype)
+        expected[shift:] = unaligned[: steps - shift, channel]
+        assert torch.equal(aligned[:, channel], expected), channel
+
+
+def test_a_non_null_reference_builds_the_start_of_record_embedding(
+    tiny_warmup, tiny_align
+) -> None:
+    r"""A construction-time change that no shipped configuration has ever made before.
+
+    ``AvailabilityInputAdapter`` builds ``start_embed`` when $\min_c \delta_c > 0$ -- when *every*
+    channel of the stream is still absent for some leading steps, so the "nothing has arrived yet"
+    indicator is non-zero somewhere. Unaligned, both streams have a channel at $W' = 0$ and the
+    token is permanently inert, so it is not built. Under the shift the minimum of $W'_c + d_c$
+    lifts off zero on both streams and the token comes into existence: a new learned parameter of
+    width $d_{\mathrm{model}}$ per stream, and a live token in the forward pass. This is wanted,
+    and it must be asserted rather than discovered in a parameter total.
+    """
+    off = build(tiny_warmup)
+    on = build(tiny_align)
+
+    assert off.target_adapter.start_embed is None and off.source_adapter.start_embed is None
+    for adapter in (on.target_adapter, on.source_adapter):
+        assert adapter.start_embed is not None
+        assert adapter.start_embed.shape == (int(on.d_model),)
+        assert bool(adapter.start_indicator.any()), "an inert token is not a token"
+
+    # And it is the only structural addition: two vectors of the model width, nothing else.
+    assert sum(p.numel() for p in on.parameters()) - sum(
+        p.numel() for p in off.parameters()
+    ) == 2 * int(on.d_model)
+
+
+def test_the_anchor_floor_rises_to_the_shifted_warmth(tiny_align) -> None:
+    r"""Both requirements, and they do not move together.
+
+    The scored target is never shifted, so its half stays at $F \ge B - 1$. The *inputs* are, and an
+    aligned channel vector at step $t$ asserts one physical instant -- an assertion that is false,
+    not partially true, while any entry has not arrived. So the floor must clear
+    $\max_c(W'_c + d_c)$, which costs exactly one anchor here as it does at the shipped reference.
+    """
+    floor = int(tiny_align["warmup_period"])
+    assert floor == max(TINY_TARGET_WARMUP_STEPS), "the flat combined vector is what this pins"
+
+    with pytest.raises(ValueError) as error:
+        SeqVaeLagAttnCfs(**dict(tiny_align, warmup_period=floor - 1))
+    message = str(error.value)
+    assert "shifted inputs" in message
+    assert f"warmup_period={floor - 1}" in message and f"at least {floor}" in message
+
+    assert build(dict(tiny_align, warmup_period=floor)) is not None
+
+
+def test_the_unaligned_floor_is_unchanged_by_the_second_requirement(tiny_warmup) -> None:
+    r"""The negative control for the test above, and the reason the two cases are kept apart.
+
+    With no shift the input at step $t$ *is* the stored coefficient at $t$: a cold one is masked and
+    announced, which is the policy this family ships, and it is why $F = B - 1$ is admitted with the
+    slowest channel still cold at the anchor itself. A check that applied the input-warmth half
+    unconditionally would refuse the shipped configuration.
+    """
+    budget = max(TINY_TARGET_WARMUP_STEPS)
+    assert build(dict(tiny_warmup, warmup_period=budget - 1)) is not None
+    # And a zero-filled shift vector is the same case, not a shift that ran: the constructor hands
+    # the gate's own delays to the check, and an unaligned gate's are all zeros.
+    assert build(
+        dict(
+            tiny_warmup,
+            warmup_period=budget - 1,
+            target_align_delays=tuple(0 for _ in TINY_TARGET_WARMUP_STEPS),
+            source_align_delays=tuple(0 for _ in TINY_SOURCE_WARMUP_STEPS),
+        )
+    ) is not None
+
+
+def test_a_negative_shift_is_refused_by_name(tiny_align) -> None:
+    """A negative shift reads a channel from its own future, which is the property the whole causal
+    construction exists for. Refused by ``ChannelDelay``, which the alignment reaches through, so
+    the message names the offending entries rather than a shape."""
+    shifts = list(TINY_TARGET_ALIGN_DELAYS)
+    shifts[2] = -1
+    with pytest.raises(ValueError, match="own future"):
+        SeqVaeLagAttnCfs(**dict(tiny_align, target_align_delays=tuple(shifts)))
+
+
+def test_the_old_delay_keywords_are_still_refused(tiny_align) -> None:
+    """The alignment gaining its own names does not reopen the two that were removed: those carry
+    the two-sided reach guard, measured on a bank that did not produce these coefficients."""
+    for banned in ("target_delays", "source_delays"):
+        with pytest.raises(TypeError, match=banned):
+            SeqVaeLagAttnCfs(**dict(tiny_align, **{banned: TINY_TARGET_ALIGN_DELAYS}))

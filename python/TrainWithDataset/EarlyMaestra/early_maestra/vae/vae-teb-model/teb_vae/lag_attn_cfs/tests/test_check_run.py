@@ -18,7 +18,7 @@ asserted directly and are easy to lose in a rewrite:
 
 The anchor band is derived from the run's own resolved configuration rather than hard-coded, which
 the geometry test exercises with a configuration none of the shipped arms uses: a checker carrying
-the shipped $[4, 5]$ and $137$ as literals would pass a horizon arm for the wrong reason.
+the shipped $[4, 5]$ and $136$ as literals would pass a horizon arm for the wrong reason.
 """
 from __future__ import annotations
 
@@ -51,9 +51,11 @@ ROWS = 12
 
 #: The anchor counts the shipped geometry implies, written out **here** rather than imported, so
 #: the checker's own derivation is compared against a hand computation rather than against itself.
-#: $T_{\mathrm{valid}} = 300 - 30 = 270$, floor $133$, so $137$ anchors and
-#: $\lceil 137/30 \rceil = 5$ tiles at phase $0$ against $4$ at the last.
-SHIPPED_DENSE_ANCHORS = 137
+#: $T_{\mathrm{valid}} = 300 - 30 = 270$, floor $134$, so $136$ anchors and
+#: $\lceil 136/30 \rceil = 5$ tiles at phase $0$ against $4$ at the last. The floor is the aligned
+#: one: unaligned it was $133$ and the dense count $137$, and the one anchor between them is what
+#: the common clock costs.
+SHIPPED_DENSE_ANCHORS = 136
 SHIPPED_TILE_BAND = (4, 5)
 
 
@@ -255,7 +257,7 @@ def test_a_clean_run_passes_every_derivable_criterion(tmp_path, capsys):
         (1, "val/target_warm_frac", 0.999999),
         # The tiling is not the one the configuration states.
         (2, "train/anchors_per_sample", 3.0),
-        (2, "val/anchors_per_sample", 136.0),
+        (2, "val/anchors_per_sample", 135.0),
         # The loss went non-finite, which the breaker's own guard should have caught first.
         (3, "train/total_loss", float("nan")),
         # The breaker latched: the margin is mis-tuned for this objective.
@@ -338,7 +340,7 @@ def test_the_anchor_band_is_the_hand_computed_one_at_the_shipped_geometry():
 
 
 def test_the_band_follows_the_run_rather_than_the_shipped_numbers(tmp_path, capsys):
-    """A checker carrying $[4, 5]$ and $137$ as literals would pass an arm at another horizon,
+    """A checker carrying $[4, 5]$ and $136$ as literals would pass an arm at another horizon,
     floor or stride for the wrong reason -- and three shipped arms move one of the three. Here the
     history is the shipped one and the configuration is not, so the counts must be *rejected*.
 

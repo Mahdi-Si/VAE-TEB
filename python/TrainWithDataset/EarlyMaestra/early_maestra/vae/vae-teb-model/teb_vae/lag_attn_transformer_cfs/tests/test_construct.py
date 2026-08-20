@@ -47,21 +47,31 @@ from teb_vae.lag_attn_transformer_cfs.tests.conftest import (
     CONV_LSTM_ONLY_KEYS,
     SHIPPED_KWARGS,
     TINY_STRIDE,
+    TINY_TARGET_ALIGN_DELAYS,
     TINY_TARGET_KEEP_INDEX,
+    TINY_TARGET_WARMUP_STEPS,
+    build,
     shipped_warmup_kwargs,
 )
 from teb_vae.lag_attn_transformer_rws.nets.model import SeqVaeLagAttnTrfRws
 
-#: This model's measured totals at the shipped geometry, with and without the resolved warm-up
-#: budget. They differ for two reasons at once: a guarded run builds availability input adapters the
-#: unguarded one does not have, and the guarded decoder is $98$ channels wide against $102$.
-_SHIPPED_GATED = 5_055_760
+#: This model's measured totals at the shipped geometry, with and without the resolved guard. They
+#: differ for three reasons at once: a guarded run builds availability input adapters the unguarded
+#: one does not have, the guarded decoder is $98$ channels wide against $102$, and the shipped
+#: alignment narrows the source stream to $47$ while bringing both start-of-record embeddings into
+#: existence.
+_SHIPPED_GATED = 5_054_992
 _SHIPPED_UNGATED = 5_039_256
 
-#: The conv-LSTM causal cell's measured total at the same budget, and the difference. The encoder
+#: The same model with the alignment off, which is the named comparison arm one key away at
+#: ``causal_align_reference: null``. The $-768$ between the two factorises exactly: the source
+#: adapter loses four channels from two $128$-wide linears, and both adapters gain a start vector.
+_SHIPPED_GATED_UNALIGNED = 5_055_760
+
+#: The conv-LSTM causal cell's measured total at the same guard, and the difference. The encoder
 #: swap costs exactly what it costs in the two-sided pair, which is the sense in which the grid's
 #: two axes are independent.
-_CONV_LSTM_SHIPPED_GATED = 5_147_102
+_CONV_LSTM_SHIPPED_GATED = 5_146_334
 _ENCODER_EDGE_PARAMETERS = 91_342
 
 #: Surviving target channels at the shipped warm-up budget, and the declared width.
@@ -133,10 +143,17 @@ def test_the_parameter_total_is_the_architectures_plus_the_wider_head():
     channels plus whatever the availability adapters add -- and nothing else may move."""
     gated = _model(shipped_warmup_kwargs())
     ungated = _model(SHIPPED_KWARGS)
+    unaligned = _model(shipped_warmup_kwargs(align=False))
 
     assert _n_parameters(gated) == _SHIPPED_GATED
     assert _n_parameters(ungated) == _SHIPPED_UNGATED
     assert gated.decoder_out_channels + 4 == ungated.decoder_out_channels
+
+    # The alignment arm, measured rather than asserted absent: it narrows the source stream by the
+    # four channels above the reference and builds both start embeddings, which is $-768$ exactly.
+    assert _n_parameters(unaligned) == _SHIPPED_GATED_UNALIGNED
+    assert _n_parameters(gated) - _n_parameters(unaligned) == -4 * 128 * 2 + 2 * 128 == -768
+    assert gated.source_gate.out_channels + 4 == unaligned.source_gate.out_channels
 
 
 def test_the_encoder_edge_costs_the_same_as_it_does_in_the_two_sided_pair():
@@ -290,11 +307,21 @@ def test_the_signature_is_the_architecture_parents_with_the_delays_replaced():
         "source_warmup_steps",
         "anchor_stride",
         "lag_floor",
+        # The alignment shifts. Present under names of their own rather than reusing the two that
+        # were removed: they DO reach ``ChannelDelay``, so the distinction the removal draws is
+        # between a warm-up mask and a shift, not between shifting and not shifting -- and a
+        # checkpoint that recorded one under the other's name could not say which it was built at.
+        "target_align_delays",
+        "source_align_delays",
         # The per-block reconstruction weights. Keywords rather than a class constant because they
         # are a *run's* decision and must land in the checkpoint's ``model_kwargs``: a checkpoint
         # that did not record them would be a model whose objective could not be recovered.
         "target_weight_st",
         "target_weight_ph",
+        # The novelty vector: a readout alone, changing no width, no mask and no parameter. It is
+        # here rather than on the raw-target cells because a raw forecast window lies entirely
+        # after the anchor, so a per-channel novelty share is undefined there rather than small.
+        "target_novelty_frac",
     }
     assert not any(
         parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters.values()
@@ -313,7 +340,7 @@ def test_the_conv_lstm_only_keywords_are_refused(tiny_kwargs, key):
 
 def test_the_geometry_defaults_are_the_causal_ones():
     """A run left at the architecture parent's defaults would be describing a dataset that does not
-    exist: two-sided widths, a two-minute horizon and a floor $103$ steps below the one the kept
+    exist: two-sided widths, a two-minute horizon and a floor $104$ steps below the one the kept
     channels admit."""
     defaults = {
         name: parameter.default
@@ -322,7 +349,7 @@ def test_the_geometry_defaults_are_the_causal_ones():
 
     assert defaults["c_y"] == CAUSAL_C_Y
     assert defaults["horizon"] == 30
-    assert defaults["warmup_period"] == 133
+    assert defaults["warmup_period"] == 134
     # The inert defaults: a model built with no opinion decodes densely and floors no lag, which is
     # what every sibling does. The tiling is a configuration decision and the config states it.
     assert defaults["anchor_stride"] == 1
@@ -457,7 +484,7 @@ def test_no_recurrence_and_no_time_pooling_normaliser_on_a_history_path(tiny_kwa
 
 
 # ---------------------------------------------------------------------------------------
-# The four constants the readouts are computed against
+# The five constants the readouts are computed against
 # ---------------------------------------------------------------------------------------
 def test_the_warmup_readout_constants_are_resolved_at_construction(tiny_warmup):
     """Resolved once from the budget and the geometry, and registered as **non-persistent** buffers
@@ -467,11 +494,20 @@ def test_the_warmup_readout_constants_are_resolved_at_construction(tiny_warmup):
 
     assert model.target_warm_frac == 1.0
     assert model.warm_tertile_id.shape == (len(TINY_TARGET_KEEP_INDEX),)
+    # The second partition of the same kept axis, by how much of each coefficient the anchor has
+    # not seen. Shaped by the survivors although the vector it comes from is declared-width, which
+    # is the gather this cell inherits along with the mixin.
+    assert model.novelty_tertile_id.shape == (len(TINY_TARGET_KEEP_INDEX),)
     assert model.source_block_warm_st.shape == (model.sequence_length,)
     assert model.source_block_warm_ph.shape == (model.sequence_length,)
 
     state = model.state_dict()
-    for name in ("warm_tertile_id", "source_block_warm_st", "source_block_warm_ph"):
+    for name in (
+        "warm_tertile_id",
+        "novelty_tertile_id",
+        "source_block_warm_st",
+        "source_block_warm_ph",
+    ):
         assert name not in state, f"{name} is persistent; a budget change would read as key drift"
 
 
@@ -489,3 +525,120 @@ def test_the_tiling_geometry_is_the_configured_one(tiny_warmup):
     assert anchors[0].tolist() == list(
         range(model.warmup_period, model.geometry.t_valid, TINY_STRIDE)
     )
+
+
+# =================================================================================================
+# The channel alignment
+# =================================================================================================
+def test_omitting_the_alignment_keywords_builds_todays_model_bitwise(tiny_warmup) -> None:
+    """The path an old checkpoint's saved kwargs dict actually exercises.
+
+    A checkpoint written before these keywords existed carries neither, so construction from it
+    must produce the object graph and the tensor values of the model that was trained -- not an
+    equivalent one with an identity ``ChannelDelay`` in it. Asserted over the state dict *and* over
+    the buffer names, because an identity shift is numerically invisible and structurally is not.
+    """
+    without = build(tiny_warmup)
+    explicit = build(dict(tiny_warmup, target_align_delays=None, source_align_delays=None))
+
+    assert list(without.state_dict()) == list(explicit.state_dict())
+    for name, tensor in without.state_dict().items():
+        assert torch.equal(tensor, explicit.state_dict()[name]), name
+    assert sorted(dict(without.named_buffers())) == sorted(dict(explicit.named_buffers()))
+    assert without.target_gate.max_delay == explicit.target_gate.max_delay == 0
+    assert without.source_delay_steps == explicit.source_delay_steps == 0
+    assert without.target_adapter.start_embed is None
+    assert without.source_adapter.start_embed is None
+
+
+def test_the_shift_reaches_the_gate_and_the_adapter_carries_warm_up_plus_shift(
+    tiny_align,
+) -> None:
+    r"""The silent half of the alignment, on this cell's own composition.
+
+    The keywords are renamed on the way to the base, so the gate is where they land; and a
+    gathered-and-delayed channel is honest only once the step index has reached **both** $W'_c$ and
+    $d_c$, so the vector the availability mask and the announcement are built from is the sum. Fed
+    the warm-up alone, the adapter would call a channel warm $d_c$ steps early and every shape,
+    every metric and every gradient would be exactly as they are now.
+    """
+    model = build(tiny_align)
+    combined = tuple(
+        wait + shift
+        for wait, shift in zip(TINY_TARGET_WARMUP_STEPS, TINY_TARGET_ALIGN_DELAYS)
+    )
+
+    assert tuple(int(value) for value in model.target_gate.delay.delay_steps) == (
+        TINY_TARGET_ALIGN_DELAYS
+    )
+    assert model.target_adapter.max_delay == max(combined)
+    assert model.target_adapter.min_delay == min(combined)
+    pattern = model.target_adapter.availability
+    for channel, delay in enumerate(combined):
+        column = pattern[:, channel]
+        assert not bool(column[:delay].any()), channel
+        assert bool(column[delay:].all()), channel
+
+
+def test_the_availability_of_an_aligned_channel_is_the_unaligned_one_shifted_right(
+    tiny_warmup, tiny_align
+) -> None:
+    """Stated as the relation rather than as two independent patterns: the whole claim of the
+    alignment is that a channel's content moved later by $d_c$ steps and nothing else about it
+    changed, so its availability must be the same staircase translated by the same $d_c$."""
+    unaligned = build(tiny_warmup).target_adapter.availability
+    aligned = build(tiny_align).target_adapter.availability
+    steps = int(unaligned.shape[0])
+
+    for channel, shift in enumerate(TINY_TARGET_ALIGN_DELAYS):
+        expected = torch.zeros(steps, dtype=aligned.dtype)
+        expected[shift:] = unaligned[: steps - shift, channel]
+        assert torch.equal(aligned[:, channel], expected), channel
+
+
+def test_a_non_null_reference_builds_the_start_of_record_embedding(
+    tiny_warmup, tiny_align
+) -> None:
+    r"""A construction-time change no shipped configuration of this family has ever made.
+
+    ``AvailabilityInputAdapter`` builds ``start_embed`` when $\min_c \delta_c > 0$. Unaligned, both
+    streams have a channel at $W' = 0$, so the token is permanently inert and is not built. Under
+    the shift the minimum of $W'_c + d_c$ lifts off zero on both streams and it comes into
+    existence: a new learned parameter of width $d_{\mathrm{model}}$ per stream, and a live token in
+    the forward pass. This is wanted, and it must be asserted rather than discovered in a parameter
+    total.
+    """
+    off = build(tiny_warmup)
+    on = build(tiny_align)
+
+    assert off.target_adapter.start_embed is None and off.source_adapter.start_embed is None
+    for adapter in (on.target_adapter, on.source_adapter):
+        assert adapter.start_embed is not None
+        assert adapter.start_embed.shape == (int(on.d_model),)
+        assert bool(adapter.start_indicator.any()), "an inert token is not a token"
+
+    assert sum(p.numel() for p in on.parameters()) - sum(
+        p.numel() for p in off.parameters()
+    ) == 2 * int(on.d_model)
+
+
+def test_the_anchor_floor_rises_to_the_shifted_warmth(tiny_align, tiny_warmup) -> None:
+    r"""Both requirements, and they do not move together.
+
+    The scored target is never shifted, so its half stays where it was. The *inputs* are, and an
+    aligned channel vector at step $t$ asserts one physical instant -- an assertion that is false,
+    not partially true, while any entry has not arrived. So the floor must clear
+    $\max_c(W'_c + d_c)$, which costs exactly one anchor here as it does at the shipped reference.
+    The unaligned floor is unmoved, which is the control: a check applying the second half
+    unconditionally would refuse the shipped configuration.
+    """
+    floor = int(tiny_align["warmup_period"])
+    assert floor == max(TINY_TARGET_WARMUP_STEPS), "the flat combined vector is what this pins"
+
+    with pytest.raises(ValueError) as error:
+        build(dict(tiny_align, warmup_period=floor - 1))
+    assert f"warmup_period={floor - 1}" in str(error.value)
+    assert f"at least {floor}" in str(error.value)
+
+    assert build(dict(tiny_align, warmup_period=floor)) is not None
+    assert build(dict(tiny_warmup, warmup_period=floor - 1)) is not None

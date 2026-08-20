@@ -90,6 +90,10 @@ TASK_LEVEL_KEYS = (
     "free_bits",
     "causal_reach_budget_s",
     "causal_warmup_budget_steps",
+    # Both alignment keys are resolved against the SHARDS by the trainer and reach the
+    # constructor only as the two shift tuples, so neither names a constructor argument.
+    "causal_align_reference",
+    "causal_leg_alignment",
 )
 
 #: The seven keys this architecture adds, with one reason: they are the encoder, and the encoder is
@@ -384,13 +388,15 @@ def test_loss_only_keys_do_not_reach_the_constructor(tmp_path) -> None:
 
 
 def test_the_shipped_geometry_pairs_the_floor_with_the_budget(shipped) -> None:
-    r"""One decision, two keys. $F \ge B - 1$ is the declared input-warmth policy -- every kept input
-    channel warm by the first forecast step -- and the configuration exposes the pair so the floor
+    r"""One decision, three keys. The floor is the maximum of $B - 1$, the declared input-warmth
+    policy -- every kept input channel warm by the first forecast step -- and $\max_c(W'_c + d_c)$,
+    which the alignment makes bind at exactly $B$. The configuration exposes all three so the floor
     may exceed the minimum rather than being derived from the threshold."""
     vae = shipped["model_config"]["VAE_model"]
 
     assert vae["causal_warmup_budget_steps"] == 134
-    assert vae["warmup_period"] == 133 == vae["causal_warmup_budget_steps"] - 1
+    assert vae["causal_align_reference"] == "target_max"
+    assert vae["warmup_period"] == 134 == vae["causal_warmup_budget_steps"]
     assert vae["c_y"] == CAUSAL_C_Y
     assert vae["c_u"] == CAUSAL_C_U
 

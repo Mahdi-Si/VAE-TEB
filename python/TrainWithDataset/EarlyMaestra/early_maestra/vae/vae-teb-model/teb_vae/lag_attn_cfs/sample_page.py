@@ -360,6 +360,13 @@ def causal_stream_panels(
         warmup = np.asarray(getattr(model, f"{name}_warmup_steps") or (), dtype=int)
         if not warmup.size:
             warmup = np.zeros(keep_index.size, dtype=int)
+        # Plus the gate's own shift, which is the vector the adapter was built at. A gathered and
+        # delayed channel is honest only once the step index has reached both, so a staircase drawn
+        # from the warm-up alone would sit up to 97 steps left of the mask below it -- and the row
+        # would show a zeroed region the drawn boundary said was real. Zero on every unaligned
+        # model, where the gate is a pure gather.
+        if gate is not None:
+            warmup = warmup + to_numpy(gate.delay.delay_steps).astype(int).ravel()
 
         with torch.no_grad():
             gathered = values if gate is None else gate(values)
@@ -487,8 +494,8 @@ def _draw_anchor_overlay(
         floor * seconds_per_step, color=COLOR_BLUE, linewidth=1.0, linestyle="-",
         label=f"anchor floor $F$={floor}",
     )
-    # A rug rather than one line per anchor: at the validation resolution there are 137 of them,
-    # and 137 vertical lines is a shaded band that hides the forecast underneath it.
+    # A rug rather than one line per anchor: at the validation resolution there are 136 of them,
+    # and 136 vertical lines is a shaded band that hides the forecast underneath it.
     ax.plot(
         decoded * seconds_per_step,
         np.full(decoded.size, low + _RUG_POSITION * (high - low)),
@@ -570,7 +577,8 @@ def _prefix_boxes(
     at the first trained anchor and stops short of the recording's end, so its blank corner is the
     tail; this tiling starts at the anchor floor $F$ and runs to the end, so its blank corner is
     the *prefix*. The prefix is blank by construction rather than by luck -- no anchor exists below
-    $F$, and $F \ge B - 1$ is refused at construction -- and at the shipped geometry it is $133$ of
+    $F$, and a floor below either half of the pairing is refused at construction -- and at the
+    shipped geometry it is $134$ of
     $300$ steps, comfortably the widest empty span on the row.
 
     Args:

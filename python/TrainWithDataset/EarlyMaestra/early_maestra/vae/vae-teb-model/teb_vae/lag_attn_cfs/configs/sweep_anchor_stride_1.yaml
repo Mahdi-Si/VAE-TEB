@@ -8,14 +8,14 @@
 # stride 1 overlap (H-1)/H, so each target coefficient is scored by up to H anchors: the loss weights
 # every target sample H times and correlates the gradients within one batch element. At stride H the
 # windows partition the timeline, no coefficient is scored twice in a step, and every anchor is still
-# reached over epochs because the per-segment phase rotates. The arm also restores 137 decoded
-# anchors per step against the tiling's ~4.57, so the per-step loss variance falls by roughly an
+# reached over epochs because the per-segment phase rotates. The arm also restores 136 decoded
+# anchors per step against the tiling's ~4.53, so the per-step loss variance falls by roughly an
 # order and a half of magnitude -- which is why `gradient_clip_val` and `additive_margin` are
 # inherited rather than re-derived here: both were measured at the noisier setting and are therefore
 # loose, not tight, on this arm.
 #
 # The memory cost is the reason this is an arm rather than the default, and it grew with the
-# horizon: the four forecast tensors and the target go from (B, 5, 30, 98) to (B, 137, 30, 98),
+# horizon: the four forecast tensors and the target go from (B, 5, 30, 98) to (B, 136, 30, 98),
 # which at batch 128 is roughly 206 MB rather than 7.5 MB EACH. At the one-minute horizon the same
 # arm cost 114 MB against 8 MB, so doubling H nearly doubled the arm's price while leaving the
 # tiled default's almost unchanged.

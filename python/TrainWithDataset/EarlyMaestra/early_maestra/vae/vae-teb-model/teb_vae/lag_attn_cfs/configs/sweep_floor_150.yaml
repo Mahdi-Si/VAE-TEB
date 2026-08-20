@@ -1,25 +1,25 @@
 # Policy arm: withhold the forecast until ten minutes of recording have been observed.
 #
-# The shipped floor of 133 is a CAUSAL-VALIDITY boundary and nothing else: its only job is to make
-# t + 1 >= W'_c hold for every kept channel, and 134 is the smallest budget that keeps all 66 phase
-# channels. 133 steps is 532 s, i.e. 8.87 minutes; nothing physiological distinguishes it from step
-# 150, both are inside the same segment, and the model's own 30-step warm-up has long passed at
-# either.
+# The shipped floor of 134 is a CAUSAL-VALIDITY boundary and nothing else: its job is to make
+# t + 1 >= W'_c hold for every scored channel and t >= W'_c + d_c hold for every shifted input
+# channel, and 134 is where both land. 134 steps is 536 s, i.e. 8.93 minutes; nothing physiological
+# distinguishes it from step 150, both are inside the same segment, and the model's own 30-step
+# warm-up has long passed at either.
 #
 # This arm exists because "ten minutes" may be meant as a SCIENTIFIC POLICY -- that a forecast should
 # not be issued until ten minutes of recording have been observed, independent of filter validity --
 # and that is a decision about what the study claims rather than about the transform. The cost is
 # stated rather than argued: at H = 30 a floor of 150 keeps the IDENTICAL 98 channels, costs one
-# tile (4 against 5 at phase 0), and covers 17 fewer target steps. It buys nothing on the validity
+# tile (4 against 5 at phase 0), and covers 16 fewer target steps. It buys nothing on the validity
 # axis; it buys the policy.
 #
 # The tile cost HALVED when the horizon doubled, and that is arithmetic rather than a saving: the
-# floor still withholds the same 17 steps, but each tile now covers 30 of them instead of 15, so
+# floor still withholds the same 16 steps, but each tile now covers 30 of them instead of 15, so
 # the same withheld span costs fewer whole tiles. The covered-step figure is the one to read.
 #
-# The budget stays at 134. The pairing requires F >= B - 1, not equality, so a higher floor is always
-# admissible -- and lowering the budget alongside it would drop channels for a reason that has
-# nothing to do with the policy.
+# The budget and the alignment reference both stay put. The floor is a lower bound rather than an
+# equality, so a higher one is always admissible -- and lowering the budget alongside it would drop
+# channels for a reason that has nothing to do with the policy.
 #
 #   TEB_RUN_STAMP="$(date '+%Y-%m-%d--[%H-%M]')" torchrun --nproc_per_node=7 \
 #       -m teb_vae.lag_attn_cfs.trainer --config teb_vae/lag_attn_cfs/configs/sweep_floor_150.yaml

@@ -150,16 +150,20 @@ def build_warmup_budget_figure(budget: WarmupBudget, *, horizon: int) -> Any:
         clipped += _budget_panel(ax, stream, horizon_s=horizon_s, x_limits=x_limits)
         # The budget itself, on the axis the bars are drawn against: no kept target bar may start
         # left of it, which is the whole content of the guard and is otherwise something a reader
-        # has to measure off the figure. Drawn on the source panel too, where it is *not* a guard
-        # -- the source is never gated -- and where its being crossed is exactly the compromise
-        # section the design records.
+        # has to measure off the figure. Drawn on the source panel too, where it is *not* the
+        # guard that shaped that stream -- the budget gates no source channel; the alignment
+        # reference does -- and where its being crossed is exactly the compromise section the
+        # design records.
         ax.axvline(
             budget_s, color=COLOR_BLUE, linewidth=1.0, linestyle="--",
             label=f"budget $-\\Delta B$ = {budget_s:g} s",
         )
         # The shared panel titles this a *delay*, which is what it is on the two-sided figure and
-        # is not what it is here: nothing is shifted, and the region behind the boundary holds real
-        # values on no defined scale rather than a zero fill.
+        # is not what these bars measure: they are a settling length, and the region behind the
+        # boundary holds real values on no defined scale rather than a zero fill. The alignment
+        # does introduce a genuine per-channel delay, and this figure deliberately does not draw
+        # it -- a bar that silently became W' + d would make the two figures of this family measure
+        # different quantities under one caption.
         blocks = ", ".join(
             f"{name} {kept}/{declared}" for name, kept, declared in resolved.block_counts()
         )
@@ -257,6 +261,13 @@ def budget_tradeoff(
     Computed from a resolved vector rather than from constants, so it re-draws correctly against a
     dataset rebuilt at another ``causal_warmup_quantile`` -- which changes both the warm-ups and the
     stored channel count.
+
+    **The curve is drawn at the unaligned pairing** $F = B' - 1$, and a run with a channel alignment
+    configured decodes exactly one anchor fewer at every threshold, because a shifted channel is
+    honest at $W'_c + d_c$ and the floor must clear that too. The offset is a constant one step, so
+    the curve's shape -- which is what the budget is chosen from -- is unaffected; only its level is,
+    and it is stated here rather than folded in, because a curve that took the alignment as given
+    could no longer price the unaligned arm.
 
     Args:
         declared_warmup_steps: $W'_c$ per declared target channel, in decimated steps.

@@ -237,7 +237,7 @@ def test_the_geometry_and_the_encoder_block_reach_the_constructor(driver) -> Non
 
     assert kwargs["sequence_length"] == 300
     assert kwargs["horizon"] == 30
-    assert kwargs["warmup_period"] == 133
+    assert kwargs["warmup_period"] == 134
     assert kwargs["anchor_stride"] == 30
     assert kwargs["c_y"] == 102
     assert kwargs["c_u"] == 51
@@ -254,7 +254,7 @@ def test_the_warm_up_budget_reaches_the_constructor_as_the_four_channel_tuples(d
 
     assert "causal_warmup_budget_steps" not in kwargs
     assert len(kwargs["target_keep_index"]) == len(kwargs["target_warmup_steps"]) == 98
-    assert len(kwargs["source_keep_index"]) == len(kwargs["source_warmup_steps"]) == 51
+    assert len(kwargs["source_keep_index"]) == len(kwargs["source_warmup_steps"]) == 47
     assert "target_delays" not in kwargs and "source_delays" not in kwargs
     assert driver.resolved_warmup is not None
 
@@ -319,7 +319,7 @@ def test_the_startup_log_states_the_resolved_anchor_geometry(driver, caplog) -> 
 
     geometry = [line for line in messages if "resolved anchor geometry" in line]
     assert geometry, messages[-5:]
-    for field in ("H=30", "S=30", "F=133", "T_valid=270", "A_max=5", "H*R=480"):
+    for field in ("H=30", "S=30", "F=134", "T_valid=270", "A_max=5", "H*R=480"):
         assert field in geometry[0], field
 
 

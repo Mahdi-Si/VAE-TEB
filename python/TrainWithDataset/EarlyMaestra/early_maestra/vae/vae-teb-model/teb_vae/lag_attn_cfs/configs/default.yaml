@@ -158,9 +158,10 @@ model_config:
     # the far horizon step" reading is made along the same axis.
     #
     # It is paid for in anchors, and the tradeoff is geometric rather than clinical. Anchors live in
-    # [F, T - H), so doubling H shortens T_valid from 285 to 270 and the dense anchor count from 152
-    # to 137; with the stride moving to 30 the decoded tiles per sample fall from ~10.1 to ~4.57.
-    # The floor is unaffected -- F >= B - 1 = 133 comes from the channel warm-up, not the horizon --
+    # [F, T - H), so doubling H shortens T_valid from 285 to 270 and the dense anchor count from 151
+    # to 136; with the stride moving to 30 the decoded tiles per sample fall from ~10.1 to ~4.53.
+    # The floor is unaffected by the horizon -- it comes from the channel warm-up and the alignment
+    # shift, neither of which knows what H is --
     # but the interaction is worth stating: at the budget that would keep all 102 target channels
     # (W' = 278) there are 8 anchors at H = 15 and exactly ZERO at H = 30, so keeping every channel
     # is geometrically impossible at this horizon. The horizon remains one of the two levers on the
@@ -172,20 +173,30 @@ model_config:
     # stays; what each horizon token emits is the surviving TARGET CHANNEL count, taken from the
     # resolved warm-up budget rather than from any config key.
     raw_per_step: 16
-    # The ANCHOR FLOOR, and it is one decision with `causal_warmup_budget_steps` below rather than
-    # two settings. A forecast at anchor t, horizon step tau, reads target time t + 1 + tau, and
-    # channel c is honest there only from W'_c onwards; requiring every kept channel to be valid
-    # across every anchor's whole window collapses to F >= B - 1, with B the slowest SURVIVOR's
-    # wait. B = 134 here, so 133 is the smallest floor the pairing admits and is what ships. The
-    # constructor refuses a lower one by name; without that refusal the objective would score the
-    # assumed pre-recording history of the slowest kept channel as signal, with every shape correct
-    # and every warm-fraction readout still reporting 1.0.
+    # The ANCHOR FLOOR, and it is one decision with `causal_warmup_budget_steps` and
+    # `causal_align_reference` below rather than three settings. It is the maximum of TWO
+    # requirements, which bind on different halves of the model:
     #
-    # 133 steps is 532 s, i.e. 8.87 minutes. It is a CAUSAL-VALIDITY boundary, not a clinical
+    #   SCORED TARGET. A forecast at anchor t, horizon step tau, reads target time t + 1 + tau, and
+    #   channel c is honest there only from W'_c onwards; requiring every kept channel to be valid
+    #   across every anchor's whole window collapses to F >= B - 1, with B the slowest SURVIVOR's
+    #   wait. B = 134 here, so this half asks for 133.
+    #
+    #   SHIFTED INPUTS. Under the alignment a channel gathered with a shift of d_c steps is honest
+    #   only from W'_c + d_c, so the floor must additionally clear max_c(W'_c + d_c) on BOTH input
+    #   streams. The zero-marginal-warm-up lemma makes that exactly 134, on both.
+    #
+    # 134 = max(133, 134) is what ships, and the reference costs the one anchor between them. The
+    # constructor refuses a lower one by name, saying which of the two requirements it violated;
+    # without that refusal the objective would score the assumed pre-recording history of the
+    # slowest kept channel as signal, with every shape correct and every warm-fraction readout
+    # still reporting 1.0.
+    #
+    # 134 steps is 536 s, i.e. 8.93 minutes. It is a CAUSAL-VALIDITY boundary, not a clinical
     # policy: nothing physiological distinguishes it from step 150, and the model's own 30-step
     # warm-up has long passed at either. `sweep_floor_150.yaml` ships the ten-minute policy arm, at
     # a cost of two tiles and 17 covered target steps for the identical 98 channels.
-    warmup_period: 133
+    warmup_period: 134
     sequence_length: 300
     c_y: 102               # 36 (fhr_st) + 66 (fhr_ph); the two-sided widths are 43 and 66
     c_u: 51                # 36 (up_st) + 15 (up_ph); must be 15 when use_up_st=false
@@ -280,12 +291,58 @@ model_config:
     # the boundary lands on the ~0.008 Hz frequency edge both phase selections already use, rather
     # than on an arbitrary cut. The four dropped channels wait 162, 194, 233 and 278 steps.
     #
-    # The SOURCE is never gated by it: its slowest channels carry the contraction envelope, and
-    # dropping them to make every reachable lag warm would cost almost the whole `up_ph` block
+    # The SOURCE is never gated BY THIS BUDGET: its slowest channels carry the contraction envelope,
+    # and dropping them to make every reachable lag warm would cost almost the whole `up_ph` block
     # against a lag search that exists to find the 20-120 s contraction-to-deceleration delay. All
-    # 51 source channels are kept, the availability mechanism announces per step when each arrives,
-    # and the residual is MEASURED -- `source_lag_warmth_frac_st` and `_ph`.
+    # 51 survive it, the availability mechanism announces per step when each arrives, and the
+    # residual is MEASURED -- `source_lag_warmth_frac_st` and `_ph`.
+    #
+    # The ALIGNMENT below is a different rule and does drop four of them, for a different reason:
+    # a channel slower than the reference could only reach it by being read from a LATER stored
+    # step, which reads raw signal after the anchor. That is a correctness requirement, not a
+    # policy about how much of a segment to spend waiting, and it takes `up_st` 32-35 while leaving
+    # all fifteen `up_ph` standing.
     causal_warmup_budget_steps: 134
+
+    # --- Causal CHANNEL ALIGNMENT: one clock per input stream -------------------
+    # Every one-sided filter carries its own group delay, spanning 13.3 s to 791.0 s across a
+    # stored block, and the encoder reads a stream's channels as ONE VECTOR PER STEP -- which
+    # asserts that its entries describe one instant when they span thirteen minutes. This key
+    # re-indexes each channel by d_c = round((tau_ref - tau_c) / 4 s) so that they do.
+    #
+    # `target_max` resolves tau_ref from the SHARDS -- the slowest kept target channel, 402.1604 s,
+    # the filter at 0.008240 Hz that is simultaneously the maximum of `fhr_ph`, the maximum of
+    # `up_ph`, the channel `causal_warmup_budget_steps` already stands on, and the lower band edge
+    # both phase selections use. Never a YAML literal: a rebuilt bank moves every delay, and a
+    # number written here would keep resolving shifts against a transform the shards no longer
+    # have. An explicit float in seconds is admitted for the every-lag-warm arm at 150.79 s, and it
+    # is snapped to the channel it names because the stored vector is float32.
+    #
+    # WHAT IT COSTS. The anchor floor moves 133 -> 134 (one anchor, 137 -> 136) because a channel
+    # is honest at W'_c + d_c rather than at W'_c; the source loses the four channels above the
+    # reference, 51 -> 47; and the freshest uterine activity any channel reports moves from 13.3 s
+    # to 402.2 s before the anchor. That last one is the real price -- a common clock is bought
+    # with recency -- and it is why the pre-registered reading is that alignment should NOT improve
+    # the forecast gap and SHOULD improve lag-profile concentration if there is a real lag.
+    #
+    # WHAT IT COSTS IN WARM-UP: nothing. With W_c ~ rho * tau_c, W_c + delta*d_c = tau_ref +
+    # (rho-1)*tau_c <= W_ref, so max_c(W'_c + d_c) = 134 = max_c W'_c exactly, on BOTH streams.
+    # `null` is the unaligned arm and is bitwise the model that shipped before this key existed.
+    causal_align_reference: target_max
+
+    # Which phase-harmonic operator built the CONFIGURED SHARDS' two phase blocks, checked against
+    # their own `causal_leg_alignment` root attribute and refused by name on a disagreement.
+    #
+    # This is a SEPARATE mechanism from the reference above and is deliberately not derived from
+    # it. Under `none` the two legs of a phase pair are multiplied at one stored index although
+    # they report the signal at two different instants -- a skew reaching 291.6 s -- so the stored
+    # `causal_delay_s` the alignment resolves its shifts from is a MISPREDICTION there, missed by a
+    # median of 60.5 steps on `fhr_ph`. Shifting by a number the data does not have is worse than
+    # not shifting at all, which is what this key exists to prevent.
+    #
+    # Point the dataset paths below at the shards built with `--leg-alignment envelope`, or set
+    # this to null to state that the run does not care (which is what a two-variant comparison is).
+    causal_leg_alignment: envelope
 
     # --- Anchor tiling ---------------------------------------------------------
     # S, the spacing between decoded anchors, in [1, H]. At S = H consecutive forecast windows
@@ -300,7 +357,7 @@ model_config:
     # in every arm rather than leaving it to be noticed.
     #
     # Validation and test decode every valid anchor -- stride 1, phase 0 -- rather than one tile
-    # grid: a single phase is deterministic but PHASE-BIASED, sampling the same 5 of 137 anchors at
+    # grid: a single phase is deterministic but PHASE-BIASED, sampling the same 5 of 136 anchors at
     # a fixed offset from the segment start forever. There is no gradient there, so neither the
     # redundancy argument nor the memory argument applies. `sweep_anchor_stride_1.yaml` is the arm
     # that trains densely too.

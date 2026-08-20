@@ -47,14 +47,16 @@ Layout::
 anchor floor $F$ must clear the resolved budget $B$, because below it the objective would score
 assumed pre-recording history as though it were signal. A raw sample carries no such region, so the
 floor constrains nothing about the target and is retained as the declared *input-warmth* statement:
-every kept **target-stream** input channel is warm by the first forecast step. Both halves of that
-wording are exact and neither obvious paraphrase is. It is the *target stream* because that is the
-one the gate selects: the source is never gated, so it keeps channels waiting up to $278$ steps that
-are still cold hundreds of steps past this floor by design, and ``source_lag_warmth_frac_st`` /
-``_ph`` measure that residual instead of the floor refusing it. And it is *by the first forecast
-step* rather than at the anchor: at $F = 133$ against $B = 134$ the slowest kept target-stream
-channel is still cold at the anchor itself and becomes honest exactly at $t + 1$, which is the first
-step the forecast covers.
+every kept input channel of **both streams** is warm by the first forecast step. Every part of that
+wording is exact and no obvious paraphrase is. It is *both streams* because the channel alignment
+shifts both and the constructor checks both; before it, the source was ungated and kept channels
+waiting up to $278$ steps that were cold hundreds of steps past this floor by design, with
+``source_lag_warmth_frac_st`` / ``_ph`` measuring that residual instead of the floor refusing it.
+And it is *by the first forecast step* rather than at the anchor: at a floor of $133$ against
+$B = 134$ the slowest kept target-stream channel is still cold at the anchor itself and becomes
+honest exactly at $t + 1$, which is the first step the forecast covers -- so that half asks only for
+$F \ge 133$, and what puts the shipped floor at $134$ is the shifted-input half, which the
+zero-marginal-warm-up lemma makes bind at exactly $B$.
 
 **Stored causal time is still not physical time, on the input side.** One-sidedness and zero latency
 are different properties and only the first is bought by the causal transform. The target has no

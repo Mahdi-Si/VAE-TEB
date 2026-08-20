@@ -62,10 +62,26 @@ TWO_SIDED_SHARD = FIXTURES / "tiny_shard.hdf5"
 #: pipeline independently believes in rather than on an arbitrary cut.
 SHIPPED_BUDGET_STEPS = 134
 
-#: The shipped anchor floor. $F = B - 1$ is the smallest value the pairing admits: a forecast at
-#: anchor $t$ reads target time $t + 1$ at the earliest, so $t + 1 \ge W'_c$ for every kept channel
-#: needs $F \ge B - 1$ and nothing more.
-SHIPPED_WARMUP_PERIOD = 133
+#: The shipped anchor floor, which under the shipped alignment is the **input-warmth** requirement
+#: rather than the scored-target one. Unaligned, $F = B - 1 = 133$ is the smallest value the pairing
+#: admits: a forecast at anchor $t$ reads target time $t + 1$ at the earliest, so $t + 1 \ge W'_c$
+#: for every kept channel needs $F \ge B - 1$ and nothing more. Aligned, a channel is honest at
+#: $W'_c + d_c$ and the floor must additionally clear $\max_c(W'_c + d_c) = 134$ on both streams --
+#: the zero-marginal-warm-up lemma makes that exactly $B$, so the reference costs one anchor and
+#: never more.
+SHIPPED_WARMUP_PERIOD = 134
+
+#: The shipped alignment: every channel of both streams re-indexed onto the slowest kept target
+#: channel's clock, $402.1604$ s, resolved from the shards' own ``causal_delay_s`` rather than
+#: written here. ``None`` is the unaligned comparison arm, which stays reachable at one key and is
+#: what several tests below name explicitly.
+SHIPPED_ALIGN_REFERENCE = "target_max"
+
+#: The phase-harmonic operator the committed fixture was built by, and therefore the one a run
+#: reading it must declare. The two variants have identical widths, warm-ups and stored delays, so
+#: the stored ``causal_delay_s`` the alignment resolves its shifts from is only *true* of the phase
+#: blocks under ``'envelope'``; ``None`` is a run that does not care.
+SHIPPED_LEG_ALIGNMENT = "envelope"
 
 #: The shipped forecast horizon (two minutes) and the sequence length the loader's trim produces.
 #: Mirrors ``configs/default.yaml``; ``test_config_load.py`` reads the config independently, so the
@@ -115,6 +131,11 @@ def causal_config(
         "sequence_length": SHIPPED_SEQUENCE_LENGTH,
         "horizon": SHIPPED_HORIZON,
         "warmup_period": SHIPPED_WARMUP_PERIOD,
+        # The two shipped alignment keys. Stated here rather than defaulted in the resolver, and
+        # overridable per test: the unaligned arm is `causal_align_reference=None`, and a test
+        # planting a legacy shard names `causal_leg_alignment=None` or the value that shard has.
+        "causal_align_reference": SHIPPED_ALIGN_REFERENCE,
+        "causal_leg_alignment": SHIPPED_LEG_ALIGNMENT,
         # The shipped tiling, stated rather than defaulted: consecutive forecast windows partition
         # the timeline instead of overlapping, so no target coefficient is scored twice in a step.
         "anchor_stride": SHIPPED_HORIZON,
@@ -269,14 +290,68 @@ def tiny_warmup_kwargs(kwargs: Optional[Mapping[str, Any]] = None, **overrides: 
     return guarded
 
 
-def shipped_warmup_kwargs(**overrides: Any) -> Dict[str, Any]:
+#: The tiny alignment shifts, one per **surviving** channel of each stream.
+#:
+#: Built as $d_c = \max_c W'_c - W'_c$ rather than resolved from a delay vector, and that is the
+#: point: it reproduces the one property the real reference has and the model depends on -- the
+#: combined vector $W'_c + d_c$ is flat, so its maximum equals the unshifted maximum (the
+#: zero-marginal-warm-up lemma) and its minimum is strictly positive, which is what brings the
+#: availability adapter's start-of-record embedding into existence. The production shifts are
+#: resolved from ``causal_delay_s`` by ``resolve_warmup_budget`` and are asserted against the
+#: shipped bank in ``test_causal_warmup.py``; these exist so a $24$-step model can exercise the
+#: same construction-time consequences without a shard.
+TINY_TARGET_ALIGN_DELAYS = tuple(
+    max(TINY_TARGET_WARMUP_STEPS) - step for step in TINY_TARGET_WARMUP_STEPS
+)
+TINY_SOURCE_ALIGN_DELAYS = tuple(
+    max(TINY_SOURCE_WARMUP_STEPS) - step for step in TINY_SOURCE_WARMUP_STEPS
+)
+
+#: The anchor floor an aligned tiny model needs. Under a shift the floor must clear
+#: $\max_c(W'_c + d_c)$ rather than $\max_c W'_c - 1$, so it moves by exactly one step here -- the
+#: same one anchor the shipped reference costs.
+TINY_ALIGNED_WARMUP_PERIOD = max(TINY_TARGET_WARMUP_STEPS)
+
+
+def tiny_align_kwargs(kwargs: Optional[Mapping[str, Any]] = None, **overrides: Any) -> Dict[str, Any]:
+    """Add the tiny warm-up guard **and** the tiny alignment to a constructor keyword set.
+
+    The anchor floor moves with the shift, because the two are one decision: a floor left at the
+    unaligned value is refused by the constructor, which is itself asserted rather than worked
+    around.
+
+    Args:
+        kwargs: The keyword set to guard. Defaults to :data:`TINY_KWARGS`.
+        **overrides: Applied after the alignment, so a test can move one leaf of it.
+
+    Returns:
+        A fresh dict carrying the guard and the shift on both streams.
+    """
+    aligned = tiny_warmup_kwargs(
+        kwargs,
+        target_align_delays=TINY_TARGET_ALIGN_DELAYS,
+        source_align_delays=TINY_SOURCE_ALIGN_DELAYS,
+        warmup_period=TINY_ALIGNED_WARMUP_PERIOD,
+    )
+    aligned.update(overrides)
+    return aligned
+
+
+def shipped_warmup_kwargs(*, align: bool = True, **overrides: Any) -> Dict[str, Any]:
     """The production constructor call: the shipped geometry plus the budget the shards resolve to.
 
     Built through :func:`~teb_vae.lag_attn_cfs.causal_warmup.resolve_warmup_budget` against the
     committed causal fixture rather than written out, so the surviving-channel count comes from the
     data every time and a rebuilt fixture moves the model instead of failing an unrelated literal.
 
+    The ``align`` flag names the **unaligned comparison arm**: the same geometry resolved with
+    ``causal_align_reference`` removed, which is the model that shipped before the common clock and
+    is what every "what did the alignment cost" assertion is stated against. It is a flag rather
+    than a second builder because the two must not be allowed to drift in anything else.
+
     Args:
+        align: ``False`` resolves the budget with no alignment reference, so the two shift
+            vectors are absent and every source channel survives.
         **overrides: Applied last.
 
     Returns:
@@ -286,7 +361,9 @@ def shipped_warmup_kwargs(**overrides: Any) -> Dict[str, Any]:
     from teb_vae.lag_attn_cfs.model_kwargs import warmup_model_kwargs
     from teb_vae.lag_attn_cfs.nets.model import SeqVaeLagAttnCfs
 
-    resolved = resolve_warmup_budget(causal_config())
+    resolved = resolve_warmup_budget(
+        causal_config() if align else causal_config(causal_align_reference=None)
+    )
     assert resolved is not None
     kwargs = dict(
         sequence_length=SHIPPED_SEQUENCE_LENGTH,
@@ -793,10 +870,28 @@ def config() -> Dict[str, Any]:
 
 @pytest.fixture
 def budget():
-    """The resolved warm-up budget at the shipped threshold, against the committed fixture."""
+    """The resolved warm-up budget at the shipped threshold, against the committed fixture.
+
+    Shipped means **aligned**: both streams carry a shift, the source is $47$ channels wide, and
+    ``reference_delay_s`` is set. :func:`unaligned_budget` is the comparison arm.
+    """
     from teb_vae.lag_attn_cfs.causal_warmup import resolve_warmup_budget
 
     resolved = resolve_warmup_budget(causal_config())
+    assert resolved is not None
+    return resolved
+
+
+@pytest.fixture
+def unaligned_budget():
+    """The same budget with the alignment off: no shift, no reference, every source channel kept.
+
+    The comparison arm that stays reachable at one key, and what every assertion phrased as
+    "the warm-up budget alone decides this" is stated against.
+    """
+    from teb_vae.lag_attn_cfs.causal_warmup import resolve_warmup_budget
+
+    resolved = resolve_warmup_budget(causal_config(causal_align_reference=None))
     assert resolved is not None
     return resolved
 

@@ -290,18 +290,29 @@ def causal_transform() -> Dict[str, Any]:
     that happens to agree today. Module-scoped: the bank is the expensive part and both tests
     below want it.
     """
+    from hdf5_dataset.hdf5_dataset import resolve_leg_alignment
     from hdf5_dataset.smoke_check_channel_selection import _import_pipeline
 
     pipeline = _import_pipeline()
     with h5py.File(_FIXTURES / "tiny_shard_causal.hdf5", "r") as handle:
         signal_len = int(handle["fhr"].shape[1])
+        # Read off the shard rather than named here. The two phase-harmonic operators produce
+        # identical widths, warm-ups and stored delays and differ only in the coefficients
+        # themselves, so a mode written out in this file would silently rebuild the other variant
+        # and fail the binding test below with a numeric difference and no reason.
+        leg_alignment = resolve_leg_alignment(handle.attrs)
     masks = pipeline.compute_scattering_masks(
-        signal_len, scattering_T=_DECIMATION, device=torch.device("cpu"), transform="causal"
+        signal_len,
+        scattering_T=_DECIMATION,
+        device=torch.device("cpu"),
+        transform="causal",
+        leg_alignment=leg_alignment,
     )
     return {
         "pipeline": pipeline,
         "masks": masks,
         "signal_len": signal_len,
+        "leg_alignment": leg_alignment,
         "target_pairs": pipeline._selection_pairs(masks["fhr_ph_selection"]),
         "source_pairs": pipeline._selection_pairs(masks["up_ph_selection"]),
     }
@@ -335,6 +346,7 @@ def test_the_stored_blocks_are_the_transform_of_the_shards_own_raw_signals(
         causal_transform["target_pairs"],
         causal_transform["source_pairs"],
         plan=causal_transform["masks"]["channel_plan"],
+        leg_alignment=causal_transform["leg_alignment"],
     )
 
     for name, expected in stored.items():
@@ -378,6 +390,7 @@ def test_no_coefficient_depends_on_a_raw_sample_that_comes_after_it(causal_trans
             causal_transform["target_pairs"],
             causal_transform["source_pairs"],
             plan=causal_transform["masks"]["channel_plan"],
+            leg_alignment=causal_transform["leg_alignment"],
         )
 
     # Well inside the segment, and not on a decimation boundary: a perturbation at 16*s exactly
