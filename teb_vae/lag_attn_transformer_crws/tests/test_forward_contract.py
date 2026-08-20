@@ -141,9 +141,9 @@ def test_the_tiny_geometry_derives_its_anchor_count(outputs) -> None:
     assert tuple(out["mu_full"].shape) == (BATCH, 4, 4, 16)
 
 
-def test_the_shipped_geometry_forecasts_eleven_tiles() -> None:
-    r"""$(B, 5, 30, 16)$ at the production geometry: $\lceil (285 - 133)/15 \rceil = 11$ tiles of
-    $15$ steps of $16$ raw samples. Derived from the constructed model rather than asserted as four
+def test_the_shipped_geometry_forecasts_five_tiles() -> None:
+    r"""$(B, 5, 30, 16)$ at the production geometry: $\lceil (270 - 134)/30 \rceil = 5$ tiles of
+    $30$ steps of $16$ raw samples. Derived from the constructed model rather than asserted as four
     literals, then checked against them."""
     kwargs = shipped_warmup_kwargs()
     model = build(kwargs).eval()
@@ -151,7 +151,7 @@ def test_the_shipped_geometry_forecasts_eleven_tiles() -> None:
 
     a_max = -(-span // int(kwargs["anchor_stride"]))
     assert (a_max, model.horizon, model.raw_per_step) == (5, 30, 16)
-    assert span == 137
+    assert span == 136
 
 
 def test_the_ungated_model_keeps_the_same_forecast_width(tiny_kwargs) -> None:

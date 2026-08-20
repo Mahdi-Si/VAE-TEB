@@ -237,6 +237,12 @@ TRANSFORMS = (TWO_SIDED, CAUSAL)
 COEFFICIENT_BLOCKS = ("fhr_st", "fhr_ph", "fhr_up_ph", "up_st", "up_ph")
 CAUSAL_BLOCKS = ("fhr_st", "fhr_ph", "up_st", "up_ph")
 
+# How the test split is formed. ``'augmented'`` puts a test partition in every fold and augments
+# it; ``'holdout'`` fixes one test set across all folds.
+AUGMENTED = "augmented"
+HOLDOUT = "holdout"
+TEST_MODES = (AUGMENTED, HOLDOUT)
+
 # Forecast horizon, in decimated steps, the stored novelty fraction is measured over. It is the
 # horizon every shipped model config uses. Baked in here rather than configured, because the
 # number it produces is written into the file beside the geometry that produced it and a
@@ -267,6 +273,31 @@ def validate_transform(transform: str) -> str:
             f"bank or {CAUSAL!r} for the one-sided gammatone bank"
         )
     return transform
+
+
+def validate_test_mode(test_mode: str) -> str:
+    """Refuse an unknown test mode, naming both valid values.
+
+    Worth a validator rather than a branch because the consumer is an ``if test_mode ==
+    'holdout'`` with an implicit ``else``: a misspelling there does not fail, it silently produces
+    an **augmented** build. The command line is guarded by ``choices=``, but the launch dict is
+    not -- it never passes through the parser -- and the dict is the path an operator uses.
+
+    Args:
+        test_mode: The requested mode.
+
+    Returns:
+        The mode, unchanged, so this can wrap an assignment.
+
+    Raises:
+        ValueError: If it is not one of :data:`TEST_MODES`.
+    """
+    if test_mode not in TEST_MODES:
+        raise ValueError(
+            f"unknown test_mode {test_mode!r}; use {AUGMENTED!r} for a test partition in every "
+            f"fold plus augmentation, or {HOLDOUT!r} for one fixed test set across all folds"
+        )
+    return test_mode
 
 
 def validate_leg_alignment(leg_alignment: str) -> str:
@@ -3194,6 +3225,7 @@ def create_new_pipeline(
     # later leaves an output directory behind and reports a CSV problem instead of the real one.
     validate_transform(transform)
     validate_leg_alignment(leg_alignment)
+    validate_test_mode(test_mode)
 
     setup_verbosity(verbose)
     os.makedirs(output_base_path, exist_ok=True)
@@ -3631,48 +3663,75 @@ def _cli(argv: Optional[List[str]] = None) -> int:
 #: exactly what is written here. (The parser above exists so the same build is also scriptable and
 #: so a one-off can override a single value without editing the file; nothing requires using it.)
 #:
-#: **Fill in the four paths marked FILL IN.** The rest have working defaults.
-#:
-#: ``transform`` and ``leg_alignment`` choose the variant, and both are recorded as root
-#: attributes of every file written:
-#:
-#: * ``transform='two_sided'`` -- the shipped kymatio bank.
-#: * ``transform='causal'`` -- the one-sided gammatone bank. Scattering blocks narrow to 36
-#:   channels, ``fhr_up_ph`` is not produced, and every block carries its per-channel warm-up,
-#:   group delay and novelty fraction.
-#: * ``leg_alignment='envelope'`` -- causal only. Puts the two legs of every phase-harmonic pair on
-#:   one clock before multiplying them. Changes no width, no warm-up and no stored delay; only the
-#:   values inside ``fhr_ph`` and ``up_ph``.
+#: Each line below states the value's **type or allowed values**, and what ``None`` falls back to.
+#: The three enumerated keys are re-checked after the merge -- by :func:`validate_transform`,
+#: :func:`validate_leg_alignment` and :func:`validate_test_mode`, each of which names the valid
+#: values in its refusal. That re-check is not redundant: the parser's ``choices=`` guards the
+#: command line only, and a value set here never passes through the parser.
 #:
 #: **Point each variant at its own ``output_base_path``.** Nothing here modifies an existing
-#: dataset, and an aligned shard is indistinguishable from an unaligned one by shape alone -- the
-#: root attribute is the only thing that separates them, and the loader refuses a file list that
-#: mixes the two.
-#:
-#: **Set ``classification_pickle_path`` to the two-sided run's fold pickle.** That is what makes a
-#: causal or aligned build comparable to it segment for segment: the pickle pins the same GUIDs,
-#: folds, partitions and segments, and both shards then record the same GUID digest.
+#: dataset. A causal build narrows the scattering blocks to 36 channels, produces no
+#: ``fhr_up_ph``, and gives every block its per-channel warm-up, group delay and novelty fraction.
+#: An **aligned** build additionally puts the two legs of every phase-harmonic pair on one clock:
+#: it changes no width, no warm-up and no stored delay -- only the values inside ``fhr_ph`` and
+#: ``up_ph`` -- so the root attribute is the only thing separating it from an unaligned one, and
+#: the loader refuses a file list that mixes the two.
 RUN_ARGS: Dict[str, Any] = {
-    # ---- FILL IN: where the records are, where the output goes, and the labour-onset CSV ----
+    # =========================== FILL IN: the four paths ===========================
+    # str -- root directory holding the StudyGroup subfolders. Required.
     "records_base_path": r"/data/deid/datafabric/fetal-heart-tracing/StudyGroup2022_v4/",
+
+    # str -- output directory for every file this run writes. Required. Must be a NEW directory
+    #        for a causal or aligned build, never an existing dataset's.
     "output_base_path": r"/data1/fetal-heart-tracing/HDF5_Datasets/new_pipeline_6h_causal_aligned",
+
+    # str -- CSV carrying the labour-onset and second-stage columns. Required.
     "tlo_csv_path": r"/path/to/complete_labor_onset.csv",
-    # FILL IN: the two-sided run's pickle, so this build gets the same GUIDs, folds and segments.
-    # None runs the full pipeline from scratch and produces a dataset comparable to nothing.
+
+    # str | None -- the two-sided run's classification_dataset_records.pickle. Skips steps 1-3 and
+    #        pins the SAME GUIDs, folds, partitions and segments, which is what makes this build
+    #        comparable to that one segment for segment. None = run the full pipeline from
+    #        scratch, producing a dataset comparable to nothing.
     "classification_pickle_path": None,
 
-    # ---- The variant. As written: the envelope-aligned causal build. ----
-    # Blank both (None) for the shipped two-sided build.
+    # ============================= The variant to build =============================
+    # "two_sided" | "causal"        (None -> "two_sided")    -- see TRANSFORMS
+    #   "two_sided" : the shipped kymatio bank.
+    #   "causal"    : the one-sided gammatone bank.
     "transform": "causal",
+
+    # "none" | "envelope"           (None -> "none")         -- see LEG_ALIGNMENT_MODES
+    #   Causal builds only; ignored when transform is "two_sided".
+    #   "none"     : multiply a phase pair's two legs at one stored index, as every shard on disk
+    #                was built.
+    #   "envelope" : delay the faster leg onto the slower one's clock and de-rotate its carrier
+    #                first. Recorded as the root attribute causal_leg_alignment.
     "leg_alignment": "envelope",
 
-    # ---- Everything below has a working default ----
-    "device": None,                     # e.g. "cuda:3" to pin one GPU of eight; None autodetects
-    "test_mode": None,                  # "augmented" (default) or "holdout"
-    "verbose": False,                   # per-record progress output; the builder's default is True
-    "scatter_batch_size": 128,          # segments per forward pass of the transform
-    "num_workers": None,                # prescreening workers; default min(cpu_count, 8)
-    "screening_csv_path": None,         # skip step 1: e.g. r"/path/to/guid_screening_results.csv"
+    # ========================= Everything below has a default =========================
+    # str | None -- torch device for the transform, e.g. "cuda:3" to pin one GPU of eight.
+    #        (None -> the first CUDA device if one exists, else the CPU)
+    "device": None,
+
+    # "augmented" | "holdout"       (None -> "augmented")    -- see TEST_MODES
+    #   "augmented" : a test partition in every fold, plus augmentation.
+    #   "holdout"   : one fixed test set across all folds.
+    "test_mode": None,
+
+    # bool | None -- per-record progress output.  (None -> True)
+    #        False is what the shipped operator invocation has always used.
+    "verbose": False,
+
+    # int | None -- segments per forward pass of the transform; memory against speed.
+    #        (None -> 128)
+    "scatter_batch_size": 128,
+
+    # int | None -- parallel prescreening workers.  (None -> min(cpu_count, 8))
+    "num_workers": None,
+
+    # str | None -- a pre-computed guid_screening_results.csv to skip step 1 with.
+    #        (None -> run step 1)
+    "screening_csv_path": None,
 }
 
 

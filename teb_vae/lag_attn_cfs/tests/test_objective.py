@@ -49,8 +49,8 @@ _SHIPPED_KEPT_CHANNELS = 98
 _SHIPPED_BLOCK = 2940
 
 #: What this package's ``compute_loss`` adds to the raw-signal sibling's metric dict: the four
-#: resolved gaps it inherits from the two-sided feature target, plus the seven this family
-#: introduces. Declared as one set so an unannounced twelfth addition fails here rather than
+#: resolved gaps it inherits from the two-sided feature target, plus the ten this family
+#: introduces. Declared as one set so an unannounced fifteenth addition fails here rather than
 #: arriving in a CSV no callback collects.
 _ADDED_METRIC_KEYS = {
     "pred_gap_tau_first",
@@ -60,6 +60,9 @@ _ADDED_METRIC_KEYS = {
     "pred_gap_warm_lo",
     "pred_gap_warm_mid",
     "pred_gap_warm_hi",
+    "pred_gap_novel_lo",
+    "pred_gap_novel_mid",
+    "pred_gap_novel_hi",
     "target_warm_frac",
     "anchors_per_sample",
     "source_lag_warmth_frac_st",
@@ -297,8 +300,8 @@ def test_the_dense_stride_is_the_shared_objective_given_the_same_anchors(
     that forward through the **shared** objective with the same index supplied explicitly -- and a
     target built here rather than by the model -- reproduces every metric bitwise.
 
-    This is what isolates the tiling: the delegation adds the eleven readouts of this package and
-    changes nothing whatever about the objective it delegates to.
+    This is what isolates the tiling: the delegation adds the fourteen readouts of this package
+    and changes nothing whatever about the objective it delegates to.
     """
     model, streams, features = _tiled(stride=1)
     perturb_posterior(model)
@@ -357,10 +360,10 @@ def test_the_dense_range_is_not_the_none_anchor_set_and_the_objective_says_so() 
 # =================================================================================================
 # The metric surface
 # =================================================================================================
-def test_the_metric_key_set_is_the_raw_siblings_plus_this_packages_eleven() -> None:
+def test_the_metric_key_set_is_the_raw_siblings_plus_this_packages_fourteen() -> None:
     """Exact in both directions, against a declared addition rather than a free one. Every
     downstream reader is keyed by name, so a name in one model and not the other is a column that
-    silently empties -- and a twelfth addition arriving unannounced would be a readout no callback
+    silently empties -- and a fifteenth addition arriving unannounced would be a readout no callback
     collects."""
     model, streams, features = _tiled()
     out = _forward(model, streams, torch.tensor(_PHASES))

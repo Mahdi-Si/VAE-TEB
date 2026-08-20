@@ -14,7 +14,7 @@
 # across that edge survives.
 #
 # WHAT IT MEASURES. Anchors live in [F, T - H), so halving H lengthens T_valid from 270 to 285 and
-# the dense anchor count from 137 to 152 -- and with the stride following it down, the decoded tiles
+# the dense anchor count from 136 to 151 -- and with the stride following it down, the decoded tiles
 # per sample rise from ~4.57 to ~10.1, roughly 2.2x the forecast supervision per optimizer step at
 # the same batch size. Against that, each anchor is asked a strictly easier question. This arm is
 # what separates "the longer horizon hurt because the far steps are unpredictable" from "the longer

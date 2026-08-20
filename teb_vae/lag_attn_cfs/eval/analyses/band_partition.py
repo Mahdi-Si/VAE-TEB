@@ -36,11 +36,18 @@ composed group delay. Both are stamped per channel on every stored block, and bo
   exactly the trim.
 * ``causal_delay_s`` -- the composed one-sided group delay, which is what makes the lag axis
   stored-coefficient time rather than physical time.
-* ``kept`` -- whether the resolved warm-up budget retained the channel. The budget gates the
-  **target** stream only; the source stream's keep-index is the identity by construction, for the
-  reason ``causal_warmup.resolve_warmup_budget`` records: the source channels the budget would drop
-  are the ones carrying the contraction envelope, against a lag search that exists to find the
-  contraction-to-deceleration delay.
+* ``kept`` -- whether the resolved warm-up budget retained the channel. Computed for the **target**
+  stream alone, because the budget gates that stream only: the source channels the budget would
+  drop are the ones carrying the contraction envelope, against a lag search that exists to find the
+  contraction-to-deceleration delay, so ``causal_warmup.resolve_warmup_budget`` keeps them.
+
+  **Every source row is therefore written ``kept = 1``, and that is now slightly wider than the
+  truth.** A second and unrelated rule does remove source channels: the channel alignment drops the
+  ones whose composed delay exceeds the reference, since bringing them onto it would need a
+  negative shift. Those rows still read ``kept = 1`` here. Narrowing them needs
+  ``source_keep_index`` in the collection record -- a change to what the collection pass writes,
+  not to this analysis -- and until then the authoritative list is ``source_dropped_index`` in the
+  run's own preflight record.
 
 **A second map is emitted on the kept channel axis**, beside the declared-axis one. The per-channel
 readouts the collection pass writes are positional against the $C_{\mathrm{keep}}$ *surviving*
@@ -88,9 +95,11 @@ STREAM_DATASETS: Dict[str, Tuple[str, str]] = {
     "source": ("up_st", "up_ph"),
 }
 
-#: The stream the warm-up budget gates. The other one's keep-index is the identity by construction,
-#: which is a property of the resolver rather than of a configuration, so it is written out here
-#: rather than derived from a keep-index this layer does not have.
+#: The stream the warm-up **budget** gates, which is the only keep-index this layer is handed. It
+#: is written out rather than derived because it is a property of the resolver rather than of a
+#: configuration. See the ``kept`` bullet in the module docstring for what this misses: the channel
+#: alignment removes source channels for an unrelated reason, and no keep-index for that stream
+#: reaches here to record it.
 GATED_STREAM = "target"
 
 #: The per-channel causal attributes every stored block of a causal shard carries, and the column

@@ -17,6 +17,18 @@ correction is per channel *pair* while the lag map is per head over a pooled sou
 mapping would itself be an unvalidated construction (both ``DESIGN.md`` records carry the
 ``lean-limit:`` for it).
 
+**This module needs the stale-step number and only that one.** A run may additionally align its
+input channels onto a common reference $\tau_{\mathrm{ref}}$, at which point two quantities exist
+where one did: ``source_delay_steps``, the largest shift applied to any channel and therefore how
+far back in *stored steps* the source memory reaches, and ``reference_delay_s``, the physical
+instant every aligned channel reports at a step. $\tau_\ell$ is built from the first, because it is
+an axis in stored-coefficient time and a stored-step count is exactly what indexes it. The second
+belongs to a lag stated in *physical* seconds, which this package does not emit -- it appears in the
+run's causality disclosure and its summary as ``source_reference_delay_s``, beside the axis rather
+than inside it. Alignment does not remove the caveat below; it collapses the correction it names
+from a channel-pair-indexed quantity to a constant, and applying that constant is a decision made
+where a physical lag is reported, not here.
+
 So the axis is **stored-coefficient time**, :data:`COEFFICIENT_LAG_AXIS_LABEL` says so, and
 :data:`GROUP_DELAY_CAVEAT` is the sentence that travels on every lag-resolved artifact this
 package emits. The two constants live here rather than in each caption for the reason the axis
@@ -96,7 +108,8 @@ def compensated_seconds_axis(n_lags: int, delay_steps: int) -> np.ndarray:
     Args:
         n_lags: Lag window width $L$.
         delay_steps: The causal input delay $\delta$ in decimated steps, read from the model's own
-            accessor and from nowhere else.
+            accessor and from nowhere else. The **stored-step** figure, not the alignment
+            reference; see the module docstring for why this axis takes that one.
 
     Returns:
         The axis, $(L,)$, in seconds.

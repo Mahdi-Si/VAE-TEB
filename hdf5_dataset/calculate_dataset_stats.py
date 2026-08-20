@@ -1333,37 +1333,48 @@ def _cli(argv: Optional[List[str]] = None) -> int:
 #: exactly what is written here. (The parser above exists so the same build is also scriptable and
 #: so a one-off can override a single value without editing the file; nothing requires using it.)
 #:
-#: **Fill in the two paths marked FILL IN.** The rest have working defaults.
+#: Each line below states the value's **type or allowed values**, and what ``None`` falls back to.
 #:
-#: ``input_files`` takes **all** the shards of one dataset. Statistics computed over a subset
-#: normalise the rest with constants they never contributed to, and nothing downstream says so.
-#:
-#: ``trim_minutes`` **must match the loader's own setting.** Statistics are accumulated over the
-#: trimmed window only, so a mismatch normalises the data with constants drawn from a window
-#: nothing serves -- and it produces a ``warnings.warn`` at load time and nothing else. Production
-#: uses ``1.0``: 240 raw samples, 15 decimated steps per end, leaving the 300-step model input.
-#:
-#: A statistics file belongs to **one** variant. The transform and the phase-harmonic leg
-#: alignment of whatever ``input_files`` points at are both recorded here, and pairing this file
-#: with a dataset built at either other setting is refused by name at load time -- which matters
-#: most for the alignment, because an aligned shard and an unaligned one have identical widths and
-#: every other check passes.
+#: A statistics file belongs to **one** dataset variant. The transform and the phase-harmonic leg
+#: alignment of whatever ``input_files`` points at are both recorded into the output, and pairing
+#: the result with a dataset built at either other setting is refused by name at load time. That
+#: matters most for the alignment: an aligned shard and an unaligned one have identical widths and
+#: identical warm-ups, so every other pairing check passes on the wrong file.
 RUN_ARGS: Dict[str, Any] = {
-    # ---- FILL IN: every shard of one dataset, and where the statistics go ----
+    # ======================= FILL IN: the shards and the output =======================
+    # list[str] -- EVERY shard of one dataset, training and held-out alike. Required.
+    #        Statistics computed over a subset normalise the rest with constants they never
+    #        contributed to, and nothing downstream says so. One entry per file.
     "input_files": [
         r"C:\Users\mahdi\Desktop\McGill\data\acidosis_no_cs.hdf5",
     ],
+
+    # str -- path for the output statistics HDF5. Required. Overwritten if it exists.
     "output_file": r"C:\Users\mahdi\Desktop\McGill\data\stats.hdf5",
 
-    # ---- Must match the loader ----
+    # ============================ Must match the loader ============================
+    # float | None -- symmetric trim in minutes the statistics are accumulated over.
+    #        (None -> no trim at all)
+    #        MUST equal the loader's own trim_minutes. Production uses 1.0: 240 raw samples,
+    #        15 decimated steps per end, leaving the 300-step model input. A mismatch normalises
+    #        with constants drawn from a window nothing serves, and only warns at load time.
     "trim_minutes": 1.0,
 
-    # ---- Everything below has a working default ----
-    "device": None,                 # e.g. "cuda:0"; None autodetects
-    "batch_size": None,             # samples per read, memory only; default 100
-    "plot_histograms": None,        # default on
-    "histograms_dir": None,         # default beside the output file
-    "max_histogram_samples": None,  # default 50000
+    # ========================= Everything below has a default =========================
+    # str | None -- torch device, e.g. "cuda:0".  (None -> CUDA if available, else CPU)
+    "device": None,
+
+    # int | None -- samples per read. Affects memory only, never the result.  (None -> 100)
+    "batch_size": None,
+
+    # bool | None -- write per-field histogram plots beside the output.  (None -> True)
+    "plot_histograms": None,
+
+    # str | None -- directory for those plots.  (None -> beside output_file)
+    "histograms_dir": None,
+
+    # int | None -- cap on the samples drawn for the histograms.  (None -> 50000)
+    "max_histogram_samples": None,
 }
 
 

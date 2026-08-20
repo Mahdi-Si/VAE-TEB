@@ -53,11 +53,16 @@ _CONFIG_DIR = Path(__file__).resolve().parents[1] / "configs"
 _TINY = _CONFIG_DIR / "tiny.yaml"
 _MODULE_NAME = "teb_vae.lag_attn_crws.trainer"
 
-#: What the shipped warm-up budget resolves to against the committed causal fixture. Pinned so a
-#: "guarded" run cannot silently be the unguarded one -- which here changes the input adapters'
-#: widths and therefore what the encoders are shown, with no shape anywhere else moving.
+#: What the shipped guard resolves to against the committed causal fixture. Pinned so a "guarded"
+#: run cannot silently be the unguarded one -- which here changes the input adapters' widths and
+#: therefore what the encoders are shown, with no shape anywhere else moving.
+#:
+#: The two numbers come from two different rules. The **warm-up budget** takes four `fhr_st`
+#: channels off the target and never touches the source; the **alignment reference** takes the four
+#: `up_st` channels slower than it off the source and never touches the target, because the
+#: reference is the target's own maximum.
 GUARDED_TARGET_CHANNELS = 98
-GUARDED_SOURCE_CHANNELS = CAUSAL_C_U
+GUARDED_SOURCE_CHANNELS = 47
 
 #: The metric surface: the raw-signal sibling's, plus three suffixes on both stages, plus the
 #: source-null KL on validation. Pinned as a literal the way each sibling package pins its own.
@@ -298,7 +303,7 @@ def test_the_causal_standing_message_is_not_the_inherited_one(driver):
 
     assert "974" not in message
     assert "one-sided" in message
-    assert "98/102" in message and "51/51" in message
+    assert "98/102" in message and "47/51" in message
 
 
 def test_the_ungated_standing_message_says_what_is_being_read_unguarded(driver):
@@ -367,7 +372,7 @@ def test_create_model_logs_the_resolved_anchor_geometry(driver):
         logger.remove(sink)
 
     line = next(m for m in messages if "resolved anchor geometry" in m)
-    assert "H=30" in line and "S=30" in line and "F=133" in line
+    assert "H=30" in line and "S=30" in line and "F=134" in line
     assert "A_max=5" in line and "T_valid=270" in line
     assert "tiles per sample 4-5" in line
     assert "raw block width H*R=480" in line
@@ -574,7 +579,11 @@ def test_the_resolved_config_is_written_beside_the_checkpoints(tmp_path, monkeyp
     assert "base" not in reloaded
     vae = reloaded["model_config"]["VAE_model"]
     assert vae["causal_warmup_budget_steps"] == 134
-    assert vae["warmup_period"] == 133
+    assert vae["warmup_period"] == 134
+    # Both independently-toggleable mechanisms, so a run is reconstructable from its own artifacts:
+    # which clock its channels were put on, and which shard variant it expected to read.
+    assert vae["causal_align_reference"] == "target_max"
+    assert vae["causal_leg_alignment"] == "envelope"
     # The two-sided guard's record is null here, which is the correct record of "no reach budget
     # was resolved" rather than an omission.
     assert reloaded["model_config"][shared_trainer.RESOLVED_BUDGET_KEY] is None

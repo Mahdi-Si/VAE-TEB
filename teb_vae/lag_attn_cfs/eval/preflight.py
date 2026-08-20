@@ -72,14 +72,23 @@ from loguru import logger
 
 from teb_vae.lag_attn.nets.decoders import HORIZON_ATTENTION_GAIN_INIT
 from teb_vae.lag_attn.nets.lag_report import SECONDS_PER_STEP
-from teb_vae.lag_attn_cfs.causal_warmup import BUDGET_KEY, REACH_KEY, resolve_warmup_budget
+from teb_vae.lag_attn_cfs.causal_warmup import (
+    ALIGN_KEY,
+    BUDGET_KEY,
+    REACH_KEY,
+    resolve_warmup_budget,
+)
 from teb_vae.lag_attn_cfs.eval.lag_axis import (
     COEFFICIENT_LAG_AXIS_LABEL,
     GROUP_DELAY_CAVEAT,
     MAX_MEASURED_GROUP_DELAY_SECONDS,
     SHIPPED_LAG_SPAN_SECONDS,
 )
-from teb_vae.lag_attn_cfs.model_kwargs import WARMUP_MODEL_KWARGS, warmup_model_kwargs
+from teb_vae.lag_attn_cfs.model_kwargs import (
+    ALIGN_MODEL_KWARGS,
+    WARMUP_MODEL_KWARGS,
+    warmup_model_kwargs,
+)
 
 # The training entry point's own guards, imported rather than copied. Their messages name the exact
 # command that regenerates a stats file and the exact reason a width mismatch must not be "fixed" by
@@ -195,6 +204,7 @@ SHARED_CAUSALITY_KEYS: frozenset = frozenset({
     "source_delay_steps",
     "source_delay_seconds",
     "source_delay_is_max_over_channels",
+    "source_reference_delay_s",
     "horizon_seconds",
 })
 
@@ -607,7 +617,10 @@ def check_warmup_budget_matches_checkpoint(
 
     Two arms at two budgets have mutually unloadable checkpoints and the class stamp cannot separate
     them, so the failure this refuses is a run that reports one budget's channel axis under
-    another's.
+    another's. ``causal_align_reference`` is a key of exactly the same shape, resolving to two more
+    constructor tuples, and is compared here for the same reason with one difference worth stating:
+    two arms at two *references* have the same target width, so a mismatched pair loads cleanly and
+    only the numbers move.
 
     Args:
         config: The merged run config.
@@ -617,11 +630,12 @@ def check_warmup_budget_matches_checkpoint(
             carries which tuple.
 
     Returns:
-        The record: the threshold, the resolved widths, and the realised maximum warm-up.
+        The record: the threshold, the resolved widths, the realised maximum warm-up, and the
+        alignment reference with the channels and shifts it produced.
 
     Raises:
         EvalPreconditionUnmet: If the budget cannot be resolved at all, if one side has a budget and
-            the other does not, or if any of the four tuples disagrees -- naming both widths.
+            the other does not, or if any of the six tuples disagrees -- naming both widths.
     """
     view = config_view_for_budget(config)
     try:
@@ -632,7 +646,12 @@ def check_warmup_budget_matches_checkpoint(
             f"dataset_config.vae_test_datasets: {exc}"
         ) from exc
 
-    stamped = {name: _as_int_tuple(model_kwargs.get(name)) for name in WARMUP_MODEL_KWARGS}
+    # Both tuples, because both are constructor keywords and both change what the model reads. An
+    # alignment resolved against one reference and a checkpoint built at another have compatible
+    # SHAPES on the target stream -- the reference keeps every kept target channel -- so a
+    # comparison over the warm-up tuples alone would pass a run whose every lag is shifted.
+    compared = tuple(WARMUP_MODEL_KWARGS) + tuple(ALIGN_MODEL_KWARGS)
+    stamped = {name: _as_int_tuple(model_kwargs.get(name)) for name in compared}
     stamped_present = [name for name, value in stamped.items() if value is not None]
 
     if resolved is None:
@@ -652,27 +671,36 @@ def check_warmup_budget_matches_checkpoint(
         )
         return {"passed": True, "budget_steps": None, "gated": False}
 
-    expected = {
-        name: _as_int_tuple(value)
-        for name, value in warmup_model_kwargs(resolved, model_cls).items()
-    }
+    mapped = warmup_model_kwargs(resolved, model_cls)
+    # Defaulted to ``None`` before the mapping is folded in, because an unaligned budget emits no
+    # alignment keys at all: the comparison below reads every name in ``compared``, and a missing
+    # key must read as "this run resolves no such vector" rather than raise.
+    expected: Dict[str, Optional[Tuple[int, ...]]] = {name: None for name in compared}
+    # Restricted to ``compared`` rather than folding in every mapped key: the mapping also emits
+    # the declared novelty vector, which is a readout of shares in $[0, 1]$ rather than a channel
+    # tuple, and running it through ``_as_int_tuple`` would truncate every entry to zero and stamp
+    # a comparison nothing reads.
+    expected.update(
+        {name: _as_int_tuple(mapped[name]) for name in mapped if name in expected}
+    )
     disagreements = [
         f"{name}: the shards resolve to {len(expected[name] or ())} entries, the checkpoint was "
         f"built with "
         + ("none at all" if stamped[name] is None else f"{len(stamped[name] or ())}")
-        for name in WARMUP_MODEL_KWARGS
-        if expected[name] != stamped[name]
+        for name in compared
+        if expected.get(name) != stamped[name]
     ]
     if disagreements:
         raise EvalPreconditionUnmet(
             f"{BUDGET_KEY}={resolved.budget_steps} resolved against "
             f"dataset_config.vae_test_datasets disagrees with the checkpoint's own stamped "
             f"channel tuples:\n  " + "\n  ".join(disagreements)
-            + f"\n{resolved.summary()}\nThe four tuples are what the constructor takes, and the "
-            f"threshold that produced them is not: two arms at two budgets have mutually "
-            f"unloadable checkpoints and the class stamp cannot separate them. Either repoint the "
-            f"shards at the dataset this checkpoint was trained on, or set {BUDGET_KEY} to the "
-            f"value that run used."
+            + f"\n{resolved.summary()}\nThese tuples are what the constructor takes, and the "
+            f"threshold and reference that produced them are not: two arms at two budgets have "
+            f"mutually unloadable checkpoints and the class stamp cannot separate them, while two "
+            f"arms at two alignment references load cleanly and move every lag. Either repoint the "
+            f"shards at the dataset this checkpoint was trained on, or set {BUDGET_KEY} and "
+            f"{ALIGN_KEY} to the values that run used."
         )
 
     return {
@@ -685,6 +713,14 @@ def check_warmup_budget_matches_checkpoint(
         "source_declared_width": int(resolved.source.declared_width),
         "source_kept_width": int(resolved.source.kept_width),
         "target_dropped_index": list(resolved.target.dropped_index),
+        # The alignment's own record, beside the budget's rather than in place of it: the two drop
+        # rules coexist and remove different channels for different reasons, and a reader of this
+        # artifact cannot reconstruct either from the widths alone.
+        "reference_delay_s": resolved.reference_delay_s,
+        "leg_alignment": resolved.leg_alignment,
+        "source_dropped_index": list(resolved.source.dropped_index),
+        "target_max_align_delay": int(resolved.target.max_align_delay),
+        "source_max_align_delay": int(resolved.source.max_align_delay),
         "quantile": resolved.quantile,
         "summary": resolved.summary(),
     }
@@ -775,7 +811,7 @@ def reconcile_with_checkpoint(
             "beta and its ramp weight the training total only; no evaluated readout applies them, "
             "so a schedule that changed after the fit does not invalidate this run. The warm-up "
             "budget is absent for a different reason and is checked by its own guard: it is a "
-            "config key that names no constructor parameter, and the four tuples it resolves to are "
+            "config key that names no constructor parameter, and the tuples it resolves to are "
             "constructor parameters that name no config key, so neither side could be compared here"
         ),
     }
@@ -1160,6 +1196,16 @@ def causality_disclosure(
         # Per-channel delays have no single representative, so the maximum is used and every lag
         # computed from it is an upper bound. Recorded beside the number so the choice travels.
         "source_delay_is_max_over_channels": True,
+        # And the constant that is NOT that maximum, recorded beside it for exactly that reason.
+        # Under a channel alignment the two are both nonzero and mean different things: the
+        # maximum above is a count of stored steps, attained by the fastest channel, while this is
+        # the physical instant every aligned source channel reports at step t. A consumer computing
+        # a lag in physical seconds needs this one; a consumer describing how far back the source
+        # memory reaches needs the other. ``None`` on an unaligned run, where there is no common
+        # clock to name -- not zero, which would read as "aligned to the anchor itself".
+        "source_reference_delay_s": (
+            None if warmup is None else warmup.get("reference_delay_s")
+        ),
         "horizon_seconds": horizon_seconds,
     }
 

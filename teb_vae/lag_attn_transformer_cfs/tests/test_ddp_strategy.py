@@ -94,7 +94,12 @@ def test_no_buffer_is_a_running_statistic_so_the_broadcast_is_safe_to_skip():
     assert not any(
         isinstance(module, torch.nn.modules.batchnorm._BatchNorm) for module in model.modules()
     )
-    for name in ("warm_tertile_id", "source_block_warm_st", "source_block_warm_ph"):
+    for name in (
+        "warm_tertile_id",
+        "novelty_tertile_id",
+        "source_block_warm_st",
+        "source_block_warm_ph",
+    ):
         assert name in buffers, name
         assert name not in model.state_dict(), f"{name} reaches a checkpoint"
 

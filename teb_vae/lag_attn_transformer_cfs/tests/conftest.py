@@ -104,9 +104,12 @@ from teb_vae.lag_attn_cfs.tests.conftest import (  # noqa: E402,F401
     TASK_HPARAMS,
     TINY_HORIZON,
     TINY_SEQ_LEN,
+    TINY_ALIGNED_WARMUP_PERIOD,
+    TINY_SOURCE_ALIGN_DELAYS,
     TINY_SOURCE_KEEP_INDEX,
     TINY_SOURCE_WARMUP_STEPS,
     TINY_STRIDE,
+    TINY_TARGET_ALIGN_DELAYS,
     TINY_TARGET_KEEP_INDEX,
     TINY_TARGET_WARMUP_STEPS,
     TINY_WARMUP_PERIOD,
@@ -270,7 +273,35 @@ def tiny_warmup_kwargs(
     return guarded
 
 
-def shipped_warmup_kwargs(**overrides: Any) -> Dict[str, Any]:
+def tiny_align_kwargs(
+    kwargs: Optional[Mapping[str, Any]] = None, **overrides: Any
+) -> Dict[str, Any]:
+    """Add the tiny warm-up guard **and** the tiny alignment to a constructor keyword set.
+
+    The shift vectors are the causal-feature suite's own, bound above rather than rebuilt: every
+    cell of this grid gates the same two stored streams at the same tiny widths, and a second
+    definition of the same vectors is one that can drift. The anchor floor moves with the shift
+    because the two are one decision -- a floor left at the unaligned value is refused by the
+    constructor, which is itself asserted rather than worked around.
+
+    Args:
+        kwargs: The keyword set to guard. Defaults to :data:`TINY_KWARGS`.
+        **overrides: Applied after the alignment, so a test can move one leaf of it.
+
+    Returns:
+        A fresh dict carrying the guard and the shift on both streams.
+    """
+    aligned = tiny_warmup_kwargs(
+        kwargs,
+        target_align_delays=TINY_TARGET_ALIGN_DELAYS,
+        source_align_delays=TINY_SOURCE_ALIGN_DELAYS,
+        warmup_period=TINY_ALIGNED_WARMUP_PERIOD,
+    )
+    aligned.update(overrides)
+    return aligned
+
+
+def shipped_warmup_kwargs(*, align: bool = True, **overrides: Any) -> Dict[str, Any]:
     """The production constructor call: this architecture's set plus the budget the shards resolve.
 
     Resolved through :func:`~teb_vae.lag_attn_cfs.causal_warmup.resolve_warmup_budget` against the
@@ -281,7 +312,14 @@ def shipped_warmup_kwargs(**overrides: Any) -> Dict[str, Any]:
     **this** package's, which is what makes the "architecture cannot mask its inputs" refusal a
     check of this constructor rather than of the conv-LSTM cell's.
 
+    The ``align`` flag names the **unaligned comparison arm**: the same geometry resolved with
+    ``causal_align_reference`` removed, which is the model that shipped before the common clock and
+    is what every "what did the alignment cost" assertion is stated against. It is a flag rather
+    than a second builder because the two must not be allowed to drift in anything else.
+
     Args:
+        align: ``False`` resolves the budget with no alignment reference, so the two shift
+            vectors are absent and every source channel survives.
         **overrides: Applied last.
 
     Returns:
@@ -291,7 +329,9 @@ def shipped_warmup_kwargs(**overrides: Any) -> Dict[str, Any]:
     from teb_vae.lag_attn_cfs.model_kwargs import warmup_model_kwargs
     from teb_vae.lag_attn_transformer_cfs.nets.model import SeqVaeLagAttnTrfCfs
 
-    resolved = resolve_warmup_budget(causal_config())
+    resolved = resolve_warmup_budget(
+        causal_config() if align else causal_config(causal_align_reference=None)
+    )
     assert resolved is not None
     kwargs = dict(SHIPPED_KWARGS, **warmup_model_kwargs(resolved, SeqVaeLagAttnTrfCfs))
     # Updated rather than splatted into the call above: an override naming a key the set already
@@ -509,10 +549,28 @@ def config() -> Dict[str, Any]:
 
 @pytest.fixture
 def budget():
-    """The resolved warm-up budget at the shipped threshold, against the committed fixture."""
+    """The resolved warm-up budget at the shipped threshold, against the committed fixture.
+
+    Shipped means **aligned**: both streams carry a shift, the source is 47 channels wide, and
+    ``reference_delay_s`` is set. :func:`unaligned_budget` is the comparison arm.
+    """
     from teb_vae.lag_attn_cfs.causal_warmup import resolve_warmup_budget
 
     resolved = resolve_warmup_budget(causal_config())
+    assert resolved is not None
+    return resolved
+
+
+@pytest.fixture
+def unaligned_budget():
+    """The same budget with the alignment off: no shift, no reference, every source channel kept.
+
+    The comparison arm that stays reachable at one key, and what every assertion phrased as "the
+    warm-up budget alone decides this" is stated against.
+    """
+    from teb_vae.lag_attn_cfs.causal_warmup import resolve_warmup_budget
+
+    resolved = resolve_warmup_budget(causal_config(causal_align_reference=None))
     assert resolved is not None
     return resolved
 
@@ -533,6 +591,12 @@ def shipped_kwargs() -> Dict[str, Any]:
 def tiny_warmup() -> Dict[str, Any]:
     """A fresh copy of the tiny kwargs carrying the tiny warm-up guard (safe to mutate)."""
     return tiny_warmup_kwargs()
+
+
+@pytest.fixture
+def tiny_align() -> Dict[str, Any]:
+    """A fresh copy of the tiny kwargs carrying the guard and the alignment (safe to mutate)."""
+    return tiny_align_kwargs()
 
 
 @pytest.fixture

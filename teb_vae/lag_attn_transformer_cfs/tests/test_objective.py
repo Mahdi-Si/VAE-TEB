@@ -50,7 +50,7 @@ _SHIPPED_KEPT_CHANNELS = 98
 _SHIPPED_BLOCK = 2940
 
 #: What this target domain adds to the raw-signal sibling's metric dict: the four resolved gaps it
-#: inherits from the two-sided feature target, plus the seven this family introduces.
+#: inherits from the two-sided feature target, plus the ten this family introduces.
 _ADDED_METRIC_KEYS = {
     "pred_gap_tau_first",
     "pred_gap_tau_last",
@@ -59,6 +59,9 @@ _ADDED_METRIC_KEYS = {
     "pred_gap_warm_lo",
     "pred_gap_warm_mid",
     "pred_gap_warm_hi",
+    "pred_gap_novel_lo",
+    "pred_gap_novel_mid",
+    "pred_gap_novel_hi",
     "target_warm_frac",
     "anchors_per_sample",
     "source_lag_warmth_frac_st",
@@ -225,7 +228,7 @@ def test_a_gapped_step_moves_the_loss_by_exactly_zero() -> None:
 # =================================================================================================
 # The metric surface
 # =================================================================================================
-def test_the_metric_key_set_is_the_raw_siblings_plus_this_target_domains_eleven() -> None:
+def test_the_metric_key_set_is_the_raw_siblings_plus_this_target_domains_fourteen() -> None:
     """Exact in both directions, against a declared addition rather than a free one. Every
     downstream reader is keyed by name, so a name in one model and not the other is a column that
     silently empties."""

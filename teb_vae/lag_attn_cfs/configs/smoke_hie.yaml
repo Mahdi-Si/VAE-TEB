@@ -15,8 +15,11 @@
 # default.yaml's are: there is no committed causal HIE shard, and the two-sided `output/hie_cs.hdf5`
 # cannot stand in for one -- it carries no `transform` attribute, no per-block `causal_warmup_steps`
 # and the two-sided channel counts, and the pre-flight refuses it by name. Build a causal shard from
-# the same recordings through the causal variant of the pipeline, regenerate its statistics with
-# hdf5_dataset/calculate_dataset_stats.py at trim_minutes=1.0, and repoint both keys. The statistics
+# the same recordings through the causal variant of the pipeline AT `--leg-alignment envelope`,
+# which is what the inherited `causal_leg_alignment` declares and what makes the inherited
+# `causal_align_reference` resolve its shifts against delays the phase blocks actually have;
+# regenerate its statistics with hdf5_dataset/calculate_dataset_stats.py at trim_minutes=1.0, and
+# repoint both keys. The statistics
 # matter here more than anywhere else: they are accumulated EXCLUDING the warm-up region, which is
 # what makes zero the channel mean over the region the model reads -- and therefore what makes the
 # source-null control a floor rather than a leak.

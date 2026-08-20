@@ -158,6 +158,7 @@ def test_the_target_domain_attributes_come_from_the_causal_parent():
             "target_warm_frac", "anchors_per_sample",
             "source_lag_warmth_frac_st", "source_lag_warmth_frac_ph",
             "pred_gap_warm_lo", "pred_gap_warm_mid", "pred_gap_warm_hi",
+            "pred_gap_novel_lo", "pred_gap_novel_mid", "pred_gap_novel_hi",
         )
     } | {"val/kld_source_null"}
     assert set(_TRACKED_METRICS) - set(LagAttnTrfCfsTrainer.TRACKED_METRICS) == set()
@@ -216,7 +217,7 @@ def test_the_geometry_and_the_encoder_block_reach_the_constructor(driver):
 
     assert kwargs["sequence_length"] == 300
     assert kwargs["horizon"] == 30
-    assert kwargs["warmup_period"] == 133
+    assert kwargs["warmup_period"] == 134
     assert kwargs["anchor_stride"] == 30
     assert kwargs["c_y"] == 102
     assert kwargs["c_u"] == 51
@@ -233,7 +234,7 @@ def test_the_warm_up_budget_reaches_the_constructor_as_the_four_channel_tuples(d
 
     assert "causal_warmup_budget_steps" not in kwargs
     assert len(kwargs["target_keep_index"]) == len(kwargs["target_warmup_steps"]) == 98
-    assert len(kwargs["source_keep_index"]) == len(kwargs["source_warmup_steps"]) == 51
+    assert len(kwargs["source_keep_index"]) == len(kwargs["source_warmup_steps"]) == 47
     assert "target_delays" not in kwargs and "source_delays" not in kwargs
     assert driver.resolved_warmup is not None
 

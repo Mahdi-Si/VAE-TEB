@@ -16,7 +16,10 @@ forward four keys and silently build an all-defaults model.
 
 ``target_delays`` and ``source_delays`` are the only names removed from the base's list, and removing
 them is the point: a warm-up is a leading *mask*, ``ChannelDelay`` is a *shift*, and a warm-up routed
-under a delay name would train a different model with every shape intact.
+under a delay name would train a different model with every shape intact. The channel alignment *is*
+a shift and does reach that module -- under ``target_align_delays`` and ``source_align_delays``,
+which the constructor renames on the way through, so what a checkpoint records is which of the two
+quantities it was built with rather than a name that could be either.
 
 Everything else -- both encoders, the channel gates, the prior and posterior heads, the lag
 cross-attention, the shared decoder invoked twice, the paired reparameterisation and the seven-term
@@ -56,7 +59,7 @@ class SeqVaeLagAttnCfs(CausalWarmupInputs, CausalFeatureForecastTarget, SeqVaeLa
         d_z: int = 48,
         horizon: int = 30,
         raw_per_step: int = 16,
-        warmup_period: int = 133,
+        warmup_period: int = 134,
         c_y: int = 102,
         c_u: int = 51,
         use_up_st: bool = True,
@@ -95,17 +98,20 @@ class SeqVaeLagAttnCfs(CausalWarmupInputs, CausalFeatureForecastTarget, SeqVaeLa
         target_warmup_steps: Optional[Sequence[int]] = None,
         source_keep_index: Optional[Sequence[int]] = None,
         source_warmup_steps: Optional[Sequence[int]] = None,
+        target_align_delays: Optional[Sequence[int]] = None,
+        source_align_delays: Optional[Sequence[int]] = None,
         anchor_stride: int = 1,
         lag_floor: int = 0,
         target_weight_st: float = 1.0,
         target_weight_ph: float = 1.0,
+        target_novelty_frac: Optional[Sequence[float]] = None,
         init_weights: bool = True,
     ) -> None:
         r"""Initialize the model.
 
-        Every keyword the base takes is forwarded unchanged; only the four below are this target
-        domain's, and only ``target_delays`` / ``source_delays`` are gone. The defaults that differ
-        from the base's -- ``warmup_period`` $133$, ``c_y`` $102$, ``c_u`` $51$ -- are this target
+        Every keyword the base takes is forwarded unchanged or renamed; only the nine below are
+        this target domain's, and only ``target_delays`` / ``source_delays`` are gone as names. The defaults that differ
+        from the base's -- ``warmup_period`` $134$, ``c_y`` $102$, ``c_u`` $51$ -- are this target
         domain's geometry rather than a preference, and a run that leaves them at the base's values
         would be describing a dataset that does not exist. ``horizon`` is **no longer** among them:
         at $30$ it agrees with the base and with every other cell of the grid.
@@ -114,6 +120,12 @@ class SeqVaeLagAttnCfs(CausalWarmupInputs, CausalFeatureForecastTarget, SeqVaeLa
             target_warmup_steps: $W'_c$ per **surviving** target channel, positional against
                 ``target_keep_index``. ``None`` builds no warm-up mask, which is the ungated model.
             source_warmup_steps: The same for the source stream.
+            target_align_delays: $d_c$ per **surviving** target channel, the shift that brings
+                every one of them onto a common reference clock. Forwarded to the base as
+                ``target_delays``, so it reaches ``ChannelDelay`` and the gate stops being a pure
+                gather. ``None`` -- the default and the shipped setting -- builds a model bitwise
+                identical to one constructed before the keyword existed.
+            source_align_delays: The same for the source stream.
             anchor_stride: $S$, the spacing between decoded anchors, in $[1, H]$. Defaults to $1$
                 -- the dense range every sibling decodes, and the inert value -- so a model
                 constructed without an opinion behaves like the rest of the family. The tiling is a
@@ -127,6 +139,14 @@ class SeqVaeLagAttnCfs(CausalWarmupInputs, CausalFeatureForecastTarget, SeqVaeLa
                 coefficients. The pair is renormalised to leave the block scale unchanged, so what
                 the configuration states is a **ratio**: $(1.0, 0.1)$ and $(10.0, 1.0)$ describe
                 the same objective, agreeing to float32 rounding rather than bitwise.
+            target_novelty_frac: The share of each **declared** target channel's coefficient drawn
+                from raw samples the anchor has not seen, as the shards record it. A readout alone:
+                it ranks the kept channels into three groups that ``pred_gap`` is reported split by,
+                and changes no width, no mask and no parameter. Gathered through
+                ``target_keep_index`` rather than taken per survivor, so a model built with no gate
+                still receives a vector of the right width. ``None`` -- the ungated arm and every
+                unit construction -- reports the split over the declared channel order instead,
+                which is a partition of the axis and not a measurement.
 
         Raises:
             ValueError: If ``anchor_stride`` is outside $[1, H]$ or leaves a phase with no anchor;
@@ -159,8 +179,21 @@ class SeqVaeLagAttnCfs(CausalWarmupInputs, CausalFeatureForecastTarget, SeqVaeLa
         self._set_channel_weights(
             target_weight_st=target_weight_st, target_weight_ph=target_weight_ph
         )
+        # The third feature-target-only keyword, and the only one of them that is a pure readout:
+        # it changes no width, no mask and no parameter. Stashed before the base for the same
+        # reason the weights are -- the keep-index it is gathered through does not exist yet.
+        self._set_target_novelty(target_novelty_frac=target_novelty_frac)
 
-        super().__init__(**forwarded, target_delays=None, source_delays=None)
+        # The alignment shifts reach the base under ITS names, which is the one place in this
+        # family where ``ChannelDelay`` does any work. They arrive under names of their own because
+        # a run configures a *reference* and the resolver turns it into these vectors, while the
+        # base's names carry the two-sided reach guard -- a different quantity, measured on a bank
+        # that did not produce these coefficients, and still refused here as a constructor keyword.
+        super().__init__(
+            **forwarded,
+            target_delays=target_align_delays,
+            source_delays=source_align_delays,
+        )
 
         # After the base, which is what validates the geometry the anchor checks read.
         self._validate_causal_geometry()

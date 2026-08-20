@@ -305,13 +305,24 @@ def test_the_evaluation_reads_the_delay_off_the_model_and_from_nowhere_else():
 
     source = inspect.getsource(run_module)
 
-    assert "int(task.orig_model.source_delay_steps)" in source
+    assert source.count("int(task.orig_model.source_delay_steps)") == 1
     # And no other attribute name is reached for. ``_source_delay_steps`` is the plotting sibling's
     # accessor and is asserted equal to the model's own above; a second *name* in the runner would
     # be the guessed one.
-    assert source.count("source_delay_steps") == 2, (
-        "the runner must read the delay once and record it once; a third mention is a second read "
-        "site, which is how the two reports of one run came to disagree by two minutes"
+    #
+    # Three mentions, not two, and the third is a comment. The count moved when the alignment gave
+    # this cell a SECOND delay-like constant: ``source_delay_steps`` is a stored-step maximum
+    # attained by the fastest channel, while the alignment reference is the physical instant every
+    # aligned channel reports at a step, and the runner records both. The comment naming the
+    # distinction at the read site is worth a unit of this budget; a fourth mention, or a second
+    # read expression, is not.
+    assert source.count("source_delay_steps") == 3, (
+        "the runner must read the delay once and record it once; a further mention is a second "
+        "read site, which is how the two reports of one run came to disagree by two minutes"
+    )
+    assert source.count("source_reference_delay_s") >= 1, (
+        "the physical constant must travel beside the stored-step one, or a consumer wanting a lag "
+        "in seconds has only the wrong number to reach for"
     )
 
 

@@ -6,7 +6,7 @@ three failures are not the same failure.
 The forecast rows die *loudly* and are swallowed: the shipped raw rows tile through
 ``concat_single_forecasts``, which reads its per-anchor block at an **anchor** index, and this
 model's forecast is $(A_{\max}, H, R)$ indexed by position in the decoded set. At the shipped
-geometry that is $137$ positions read at anchors $133 \dots 269$, so the first read is out of range,
+geometry that is $136$ positions read at anchors $134 \dots 269$, so the first read is out of range,
 the page builder raises, and the callback's broad handler turns a whole run's diagnostics into one
 log line and an empty directory. At a smaller floor the same code does not raise at all -- it draws
 a real forecast at the wrong time, at the right shape, in the right colours, on the right axis.
@@ -588,7 +588,7 @@ def test_an_ungated_model_still_draws_every_row(task, stub_batch):
 
 def test_it_renders_at_the_shipped_geometry(task):
     r"""The tiny fixture is a $24$-step window with a floor of $5$; production is $300$ steps, a
-    floor of $133$ and $137$ decoded anchors tiled into $5$ windows of $480$ raw samples. A page
+    floor of $134$ and $136$ decoded anchors tiled into $5$ windows of $480$ raw samples. A page
     that renders only at the test geometry is not a page -- and the shipped floor is where the
     shipped raw rows do not merely draw at the wrong time but read past the end of the anchor
     axis."""
@@ -600,13 +600,13 @@ def test_it_renders_at_the_shipped_geometry(task):
         geometry = module.orig_model.geometry
         anchors, valid, positions = _drawn_tiling(pieces, module)
 
-        assert int(valid.sum()) == geometry.t_valid - geometry.warmup == 137
+        assert int(valid.sum()) == geometry.t_valid - geometry.warmup == 136
         assert [int(anchors[position]) for position in positions] == list(
             range(geometry.warmup, geometry.t_valid, geometry.horizon)
         )
         ax = _axes_titled(figure, "Forecast")
-        assert f"{len(positions)} of 137 decoded anchors drawn" in ax.get_title()
-        assert _labelled(ax, "decoded anchors")[0].get_xdata().size == 137
+        assert f"{len(positions)} of 136 decoded anchors drawn" in ax.get_title()
+        assert _labelled(ax, "decoded anchors")[0].get_xdata().size == 136
         assert len([child for child in figure.axes if child.get_title()]) == _PAGE_ROWS
     finally:
         plt.close(figure)

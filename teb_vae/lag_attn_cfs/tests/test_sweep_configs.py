@@ -203,23 +203,27 @@ def test_the_stride_arm_restores_the_dense_anchor_set():
     floor, stride, _horizon, t_valid = _geometry(_resolved("sweep_anchor_stride_1.yaml"))
 
     assert stride == 1
-    assert -(-(t_valid - floor) // stride) == t_valid - floor == 137
+    assert -(-(t_valid - floor) // stride) == t_valid - floor == 136
 
 
 def test_the_floor_arm_keeps_the_identical_channels_and_costs_exactly_one_tile():
     """The cost of the policy, stated as a number rather than as an argument: the same $98$ channels
-    (the budget did not move), one fewer tile at phase $0$, and $17$ fewer covered target steps.
+    (neither the budget nor the alignment reference moved), one fewer tile at phase $0$, and $16$
+    fewer covered target steps.
 
     The **withheld steps** are the invariant and the **tiles** are not. At the one-minute horizon
-    the same $17$-step floor cost two tiles; at two minutes each tile covers $30$ steps rather than
-    $15$, so the identical policy costs half as many whole tiles. Both numbers are asserted so that
-    a future horizon change fails here rather than quietly re-pricing the arm.
+    the same floor cost two tiles; at two minutes each tile covers $30$ steps rather than $15$, so
+    the identical policy costs half as many whole tiles. Both numbers are asserted so that a future
+    horizon change fails here rather than quietly re-pricing the arm.
+
+    The withheld span is $16$ rather than $17$ because the shipped floor moved with the alignment,
+    from $133$ to $134$; the arm's own floor is a round policy number and did not.
     """
     shipped_floor, stride, _horizon, t_valid = _geometry(load_config(str(_DEFAULT)))
     arm_floor, arm_stride, _h, arm_t_valid = _geometry(_resolved("sweep_floor_150.yaml"))
 
     assert (arm_stride, arm_t_valid) == (stride, t_valid)
-    assert arm_floor - shipped_floor == 17
+    assert arm_floor - shipped_floor == 16
     assert -(-(t_valid - shipped_floor) // stride) - -(-(t_valid - arm_floor) // stride) == 1
 
 

@@ -112,10 +112,17 @@ def test_the_tiny_geometry_leaves_room_for_more_than_one_tile():
 
 def test_the_tiny_geometry_reproduces_the_shipped_pairing_in_miniature():
     """Not a shrunken copy but the same *shape* of problem: a floor above the model's own warm-up, a
-    stride equal to the horizon, and a budget that drops the slowest channels."""
+    stride equal to the horizon, and a budget that drops the slowest channels.
+
+    The shipped floor is the **aligned** one, which is the budget itself rather than one below it:
+    a shifted input channel is honest at $W'_c + d_c$, whose maximum the zero-marginal-warm-up
+    lemma puts at exactly $B$. The scored-target half of the pairing still asks only for $B - 1$,
+    and both are asserted so a reference removed without the floor following it fails here.
+    """
     assert TINY_STRIDE == TINY_HORIZON
     assert TINY_WARMUP_PERIOD < TINY_SEQ_LEN - TINY_HORIZON
-    assert SHIPPED_WARMUP_PERIOD == SHIPPED_BUDGET_STEPS - 1
+    assert SHIPPED_WARMUP_PERIOD == SHIPPED_BUDGET_STEPS
+    assert SHIPPED_WARMUP_PERIOD >= SHIPPED_BUDGET_STEPS - 1
     assert SHIPPED_SEQUENCE_LENGTH - SHIPPED_HORIZON == 270
 
 

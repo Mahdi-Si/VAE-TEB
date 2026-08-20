@@ -237,6 +237,57 @@ def test_the_pairing_refusal_names_both_numbers() -> None:
     CausalFeatureForecastTarget._check_anchor_floor(0, ())
 
 
+def test_the_pairing_refusal_names_which_of_the_two_requirements_binds() -> None:
+    r"""The floor is $\max(B - 1, \max_c(W'_c + d_c))$, and the two halves come from different
+    places: the first from the **scored target**, which is never shifted, and the second from the
+    **inputs**, which are. A message that named only a number would leave an operator raising the
+    floor against the wrong one."""
+    with pytest.raises(ValueError) as error:
+        CausalFeatureForecastTarget._check_anchor_floor(10, (0, 4, 12))
+    assert "scored target" in str(error.value)
+
+    with pytest.raises(ValueError) as error:
+        CausalFeatureForecastTarget._check_anchor_floor(12, (0, 4, 12), (5, 3, 1))
+    message = str(error.value)
+    assert "shifted inputs" in message
+    assert "warmup_period=12" in message and "at least 13" in message
+    # The binding channel is named, and it is not the slowest one: channel 0 waits nothing and is
+    # shifted 5, channel 2 waits 12 and is shifted 1, so 13 comes from the last.
+    assert "channel 2" in message and "t - 1" in message
+
+
+def test_a_zero_shift_vector_is_the_unshifted_case_and_not_a_shift_that_ran() -> None:
+    r"""The distinction the second half rests on. With $d_c = 0$ the input at step $t$ *is* the
+    stored coefficient at $t$: a cold one is masked and announced inside the availability adapter,
+    which is the policy this family ships and is why $F = B - 1$ is admitted with the slowest kept
+    channel still cold at the anchor itself. Applying the input-warmth half unconditionally would
+    refuse the shipped configuration, so an empty vector and an all-zero one must give one answer.
+    """
+    CausalFeatureForecastTarget._check_anchor_floor(11, (0, 4, 12), ())
+    CausalFeatureForecastTarget._check_anchor_floor(11, (0, 4, 12), (0, 0, 0))
+    with pytest.raises(ValueError, match="scored target"):
+        CausalFeatureForecastTarget._check_anchor_floor(10, (0, 4, 12), (0, 0, 0))
+
+
+def test_any_shift_at_all_costs_exactly_the_one_anchor_the_boundary_step_bought() -> None:
+    r"""Once *anything* is shifted the floor is at least $B$, never $B - 1$, and no arrangement of
+    the shifts can avoid it.
+
+    $\max_c(W'_c + d_c) \ge \max_c W'_c = B$ because every $d_c \ge 0$, so the input-warmth half
+    always exceeds the scored half by at least one. That is the whole price of the alignment on the
+    anchor axis, it is the same one anchor at the shipped reference, and it is a structural
+    statement rather than a property of the vectors below -- which is why it is asserted over three
+    different shift arrangements including the one that puts the shift on the slowest channel.
+    """
+    waits = (0, 4, 12)
+    for shifts in ((8, 6, 0), (1, 1, 0), (0, 0, 3)):
+        required = max(wait + shift for wait, shift in zip(waits, shifts))
+        assert required >= max(waits), shifts
+        CausalFeatureForecastTarget._check_anchor_floor(required, waits, shifts)
+        with pytest.raises(ValueError, match="shifted inputs"):
+            CausalFeatureForecastTarget._check_anchor_floor(required - 1, waits, shifts)
+
+
 def test_the_shipped_tiny_guard_satisfies_its_own_pairing(tiny_warmup) -> None:
     """The fixture is not accidentally exempt from the rule it is meant to exercise."""
     assert max(TINY_TARGET_WARMUP_STEPS) > 0

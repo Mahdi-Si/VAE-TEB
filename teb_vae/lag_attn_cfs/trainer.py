@@ -86,7 +86,7 @@ PHASE_KEY_FIELDS: Tuple[str, ...] = ("guid", "epoch")
 
 #: Metric suffixes this model emits and the two-sided feature sibling does not, on **both** stages.
 #:
-#: Two of the seven are geometry *guards* rather than results. ``target_warm_frac`` is a stamped
+#: Two of the ten are geometry *guards* rather than results. ``target_warm_frac`` is a stamped
 #: provenance column that must read exactly $1.0$: it is resolved at construction and the
 #: constructor already refuses a violating budget-and-floor pairing, so any other value means the
 #: checkpoint was built by code predating that refusal. ``anchors_per_sample`` must sit at its
@@ -94,13 +94,21 @@ PHASE_KEY_FIELDS: Tuple[str, ...] = ("guid", "epoch")
 #: $T_{\mathrm{valid}} - F$ at the dense evaluation stride -- and a value off that band means the
 #: geometry broke rather than that the model learned something.
 #:
-#: The other five are results. The two ``source_lag_warmth_frac`` columns size the compromise the
+#: The other eight are results. The two ``source_lag_warmth_frac`` columns size the compromise the
 #: design makes on the source: lag attention searches back into a region where much of the source is
 #: still inside its own warm-up, and the design keeps every source channel rather than gating them,
 #: so the residual is measured instead of resolved. The three warm-up tertiles recompose to
 #: ``pred_gap`` over the same denominator exactly as the block split does, cutting the channel axis
 #: by filter speed rather than by stored block -- which the block split cannot, since both stored
 #: blocks span nearly the same rebased warm-up range.
+#:
+#: The three novelty tertiles recompose to the same number over the same denominator, and cut the
+#: same axis a third way: by $\nu_c$, the share of a scored coefficient drawn from raw samples the
+#: anchor has not seen. That split is what makes "forecast" readable per channel rather than assumed
+#: uniform -- the block score sums $H \cdot C_{\mathrm{keep}}$ coefficients whose novelty runs from
+#: $1.000$ to $0.026$, and a good score on the low end is the model inverting its own delayed
+#: history rather than predicting anything. Not a restatement of the warm-up split: a channel warm
+#: across the whole window can still be almost entirely history at the horizon.
 _CAUSAL_SUFFIXES: Tuple[str, ...] = (
     "target_warm_frac",
     "anchors_per_sample",
@@ -109,6 +117,9 @@ _CAUSAL_SUFFIXES: Tuple[str, ...] = (
     "pred_gap_warm_lo",
     "pred_gap_warm_mid",
     "pred_gap_warm_hi",
+    "pred_gap_novel_lo",
+    "pred_gap_novel_mid",
+    "pred_gap_novel_hi",
 )
 
 #: The one readout that runs on validation batches only, beside the permutation control's three.
@@ -132,7 +143,7 @@ class LagAttnCfsTrainer(LagAttnRwsTrainer):
     TARGET_FIELDS: Tuple[str, ...] = ("fhr_st", "fhr_ph")
 
     #: The inherited metric surface, plus the two-sided sibling's four forecast-gap columns, plus
-    #: this model's seven, plus the source-null KL on validation. An attribute rather than an
+    #: this model's ten, plus the source-null KL on validation. An attribute rather than an
     #: override of ``train_model``, which is 75 lines of callback assembly whose copy would be free
     #: to drift from the one the comparison model runs under.
     TRACKED_METRICS: Tuple[str, ...] = (
@@ -437,25 +448,33 @@ def _check_source_block_kept(config: Dict[str, Any]) -> None:
 def _check_floor_pairs_with_budget(
     config: Dict[str, Any], budget: Optional[WarmupBudget]
 ) -> None:
-    r"""Refuse an anchor floor the kept target channels' warm-up does not admit.
+    r"""Refuse an anchor floor the kept target channels do not admit.
 
-    The same inequality the constructor enforces, $F \\ge B - 1$ over the *survivors*, checked here
-    so a mis-paired configuration fails before a run directory exists. The distinction between the
+    The same two inequalities the constructor enforces, over the *survivors*, checked here so a
+    mis-paired configuration fails before a run directory exists. The distinction between the
     configured threshold and the survivors' own maximum is load-bearing: a threshold of $151$ keeps
     the identical $98$ channels whose slowest still waits $134$ steps, so a floor derived from the
     threshold would sit $17$ steps too high and cost two tiles for nothing.
+
+    The resolved **shifts** are passed as well as the warm-up, because the two requirements do not
+    move together: the target tile is never shifted, so its validity half stays at $F \\ge B - 1$,
+    while a shifted input stream must additionally have every kept channel warm at the anchor. An
+    unaligned budget carries ``None`` there, which is the inert value.
 
     Args:
         config: The resolved run config.
         budget: The resolved warm-up budget, or ``None`` when none is configured.
 
     Raises:
-        ValueError: Naming both numbers, from the constructor's own check.
+        ValueError: Naming which requirement binds and both numbers, from the constructor's own
+            check.
     """
     if budget is None:
         return
     CausalFeatureForecastTarget._check_anchor_floor(
-        int(_vae_config(config)["warmup_period"]), budget.target.warmup_steps
+        int(_vae_config(config)["warmup_period"]),
+        budget.target.warmup_steps,
+        budget.target.align_delays or (),
     )
 
 

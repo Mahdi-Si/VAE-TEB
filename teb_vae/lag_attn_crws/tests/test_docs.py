@@ -53,7 +53,7 @@ from typing import Any, Dict, List, Mapping, Set, Tuple
 import pytest
 import torch
 
-from teb_vae.lag_attn_cfs.model_kwargs import WARMUP_MODEL_KWARGS, warmup_model_kwargs
+from teb_vae.lag_attn_cfs.model_kwargs import ALIGN_MODEL_KWARGS, WARMUP_MODEL_KWARGS, warmup_model_kwargs
 from teb_vae.lag_attn_cfs.nets.causal_feature_target import CausalFeatureForecastTarget
 from teb_vae.lag_attn_cfs.nets.causal_inputs import CausalWarmupInputs
 from teb_vae.lag_attn_cfs.task import SeqVaeLagAttnCfsTask
@@ -124,6 +124,14 @@ DROPPED_READOUTS = (
     "pred_gap_warm_hi",
     "target_warm_frac",
 )
+
+#: Names that share the metric shape and belong to a run's *record* rather than to its metric
+#: surface. ``source_delay_steps`` is a model property -- how many stored steps back the source
+#: memory reaches -- and ``source_reference_delay_s`` is the physical constant the resolved-config
+#: dump and the preflight disclosure carry, which the lag caption names so a reader can complete
+#: it. Neither is a column any step logs, and neither may become one: the reference is a constant
+#: of the configuration, so a per-step column of it would be the same number in every row.
+RUN_RECORD_FIELDS = ("source_delay_steps", "source_reference_delay_s")
 
 #: The six bottleneck-health readouts. A headline number can look healthy while the bottleneck is
 #: not, and each of these is a different way for that to happen.
@@ -246,14 +254,21 @@ def _reach_gated(shipped: Mapping[str, Any]) -> Dict[str, Any]:
 
 
 def _ungated(kwargs: Mapping[str, Any]) -> Dict[str, Any]:
-    """The four resolved warm-up tuples removed and nothing else, so the guarded and ungated arms
-    differ in the guard alone rather than in a second hand-written keyword set."""
-    return {key: value for key, value in kwargs.items() if key not in WARMUP_MODEL_KWARGS}
+    """Every resolved tuple removed and nothing else, so the guarded and ungated arms differ in the
+    guard alone rather than in a second hand-written keyword set.
+
+    BOTH tuples, and that is forced rather than chosen: a shift vector is positional over the
+    SURVIVORS, so a stream that has lost its keep-index has no width for one to be positional
+    against and ``ChannelDelay`` refuses it by name. "Ungated" therefore means the whole guard --
+    the warm-up mask and the common clock -- which is also what the number is read as.
+    """
+    dropped = set(WARMUP_MODEL_KWARGS) | set(ALIGN_MODEL_KWARGS)
+    return {key: value for key, value in kwargs.items() if key not in dropped}
 
 
 @pytest.fixture(scope="module")
 def measured_models() -> Dict[str, torch.nn.Module]:
-    """The eight models the two records quote, constructed in one process.
+    """The ten models the two records quote, constructed in one process.
 
     Built from each suite's own production keyword set rather than from the configs, so this file
     binds the documents to the *architectures* while ``test_config_load.py`` binds the configs to
@@ -274,8 +289,10 @@ def measured_models() -> Dict[str, torch.nn.Module]:
 
     return {
         "crws_guarded": SeqVaeLagAttnCrws(**shipped_warmup_kwargs()),
+        "crws_guarded_unaligned": SeqVaeLagAttnCrws(**shipped_warmup_kwargs(align=False)),
         "crws_ungated": SeqVaeLagAttnCrws(**_ungated(shipped_warmup_kwargs())),
         "trf_crws_guarded": SeqVaeLagAttnTrfCrws(**trf_warmup_kwargs()),
+        "trf_crws_guarded_unaligned": SeqVaeLagAttnTrfCrws(**trf_warmup_kwargs(align=False)),
         "trf_crws_ungated": SeqVaeLagAttnTrfCrws(**_ungated(trf_warmup_kwargs())),
         "rws_guarded": SeqVaeLagAttnRws(**_reach_gated(RWS_SHIPPED)),
         "rws_ungated": SeqVaeLagAttnRws(**dict(RWS_SHIPPED)),
@@ -363,9 +380,10 @@ def _linearisation_stated_for(text: str, cls: type) -> List[str]:
 # DESIGN.md: the parameter arithmetic, pinned against constructed models
 # =================================================================================================
 def test_the_design_states_the_measured_totals(design, measured_totals):
-    """Eight totals -- both cells of this row and both raw-signal cells they are read against, each
-    guarded and ungated -- checked against ``sum(p.numel() ...)`` rather than against literals in a
-    test, so a legitimate change to a shared imported component re-costs the document."""
+    """Ten totals -- both cells of this row guarded, unaligned and ungated, and both raw-signal
+    cells they are read against guarded and ungated -- checked against ``sum(p.numel() ...)`` rather
+    than against literals in a test, so a legitimate change to a shared imported component re-costs
+    the document."""
     section = _markdown_section(design, "## 13. ")
     stated = _integers_stated_in(section)
 
@@ -395,18 +413,26 @@ def test_the_input_representation_delta_decomposes_into_the_two_terms_the_design
     wrong decomposition of it is the half a reader takes on trust.
 
     **The horizon embedding used to be the second term and is now exactly zero**, because this cell
-    forecasts $30$ steps like the raw-signal sibling it is compared against. It is computed rather
-    than deleted so that a future horizon divergence between the two reappears as a failing sum."""
+    forecasts $30$ steps like the raw-signal sibling it is compared against. **The two start
+    embeddings used to be a third and are now exactly zero too**: the reach guard builds both and
+    this cell built neither until the alignment made its shifted warm-up start above zero on both
+    streams. Both are computed rather than deleted so that either divergence reappears as a failing
+    sum."""
     section = _markdown_section(design, "## 13. ")
     delta = measured_totals["crws_guarded"] - measured_totals["rws_guarded"]
 
     horizon_embedding = (30 - 30) * 256
-    adapters = 128 * (98 - 78) * 2 + 128 * (51 - 29) * 2 - 256
+    start_embeddings = (2 - 2) * 128
+    adapters = 128 * (98 - 78) * 2 + 128 * (47 - 29) * 2
 
     assert horizon_embedding == 0, "the two horizons diverged; §13 needs its second term back"
-    assert delta == horizon_embedding + adapters, (
+    assert start_embeddings == 0, (
+        "one of the two cells stopped building both start embeddings; §13 needs that term back"
+    )
+    assert delta == horizon_embedding + start_embeddings + adapters, (
         f"the input-representation delta is {delta:+,}, which no longer decomposes into the "
-        f"horizon embedding ({horizon_embedding:+,}) and the two adapters ({adapters:+,})"
+        f"horizon embedding ({horizon_embedding:+,}), the start embeddings "
+        f"({start_embeddings:+,}) and the two adapters ({adapters:+,})"
     )
     # The same delta in the conv-Transformer pair, because every module outside the encoders is
     # shared -- which is the claim §13 makes and the reason both pairs are quoted.
@@ -436,7 +462,7 @@ def test_the_input_representation_delta_decomposes_into_the_two_terms_the_design
         int(cost) * (int(wide) - int(narrow))
         for cost, wide, narrow in _FACTORISATION_PATTERN.findall(section)
     }
-    assert {128 * (98 - 78), 128 * (51 - 29)} <= factorisations, (
+    assert {128 * (98 - 78), 128 * (47 - 29)} <= factorisations, (
         f"§13 does not factorise both adapter widths; it states {factorisations}"
     )
     for value in (delta, adapters):
@@ -475,14 +501,14 @@ def test_the_guard_delta_is_the_two_availability_projections_alone(
     design, measured_totals, measured_models
 ):
     """Unlike the feature cells nothing in this target domain widens a head, so every parameter the
-    budget adds is under an adapter -- asserted by name -- and the arithmetic §13 states for it is
+    guard adds is under an adapter -- asserted by name -- and the arithmetic §13 states for it is
     evaluated. The raw-signal sibling's smaller guard cost is stated beside it, so two correct numbers
-    a factor of three apart are not read as a contradiction."""
+    nearly a factor of three apart are not read as a contradiction."""
     section = _markdown_section(design, "## 13. ")
     guard = measured_totals["crws_guarded"] - measured_totals["crws_ungated"]
     sibling = measured_totals["rws_guarded"] - measured_totals["rws_ungated"]
 
-    assert guard == 128 * 98 + 128 * 51 - 128 * 4
+    assert guard == 128 * 98 + 128 * 47 + 2 * 128 - 128 * 4 - 128 * 4
     assert guard == measured_totals["trf_crws_guarded"] - measured_totals["trf_crws_ungated"]
     for name in _differing_names(measured_models["crws_guarded"], measured_models["crws_ungated"]):
         assert "adapter" in name, name
@@ -646,22 +672,31 @@ def test_the_geometry_section_states_the_policy_and_the_measured_channel_counts(
     assert "F \\ge B - 1" in section
     for name, kept, declared in budget.target.block_counts():
         assert f"`{name}` ${kept}/{declared}$" in section, name
-    assert budget.source.kept_width == budget.source.declared_width == 51
-    assert f"All ${budget.source.declared_width}$ source channels are kept" in section
+    # The source survives the BUDGET whole and loses four to the ALIGNMENT, and the section has to
+    # state both, because a reader who took either for the other would misread the warmth columns.
+    assert budget.source.declared_width == 51 and budget.source.kept_width == 47
+    assert f"All ${budget.source.declared_width}$ source channels survive the budget" in section
+    assert f"leaving ${budget.source.kept_width}$" in section
     assert "not a constraint" in section
-    assert "every kept **target-stream** input channel is warm **by the first forecast step**" in section
+    assert "every kept input channel of **both streams** is warm **by the first forecast step**" in section
     # The two costs, both stated as numbers: what the policy costs and what the horizon lever buys.
-    assert "$240$ anchors against $137$" in section
-    assert "$137$ anchors against $152$" in section
+    assert "$240$ anchors against $136$" in section
+    assert "$136$ anchors against $151$" in section
 
 
-def test_the_source_section_states_that_the_source_is_never_gated(design, budget):
-    """The compromise this design makes, and the reason the two warmth columns exist. Asserted
-    against the resolved budget: the source keep-index is the identity."""
+def test_the_source_section_states_which_rule_gates_the_source(design, budget, unaligned_budget):
+    """The compromise this design makes, and the reason the two warmth columns exist.
+
+    Asserted against both resolved budgets, because the two rules that could gate this stream do
+    different things: the **warm-up budget** gates it not at all, while the **alignment** removes
+    exactly the four channels slower than the reference, for the unrelated reason that they could
+    reach it only by a negative shift.
+    """
     section = _flat(_markdown_section(design, "## 8. "))
 
-    assert budget.source.kept_width == budget.source.declared_width
-    assert f"all {budget.source.declared_width} source channels are kept" in section
+    assert unaligned_budget.source.kept_width == unaligned_budget.source.declared_width
+    assert budget.source.kept_width == 47 == budget.source.declared_width - 4
+    assert "the warm-up budget gates no source channel at all" in section.lower()
     assert "small value there is the expected finding, not a failure" in section
     assert "the coupling readout is measuring a clock" in section
 
@@ -833,10 +868,10 @@ def test_the_documented_config_inventory_is_the_real_one(design):
         assert f"`{name}`" in section, name
     named = set(re.findall(r"`([\w.]+\.yaml)`", section))
     assert named <= set(shipped) | {"lag_attn_rws/configs/default.yaml"}, named - set(shipped)
-    assert "nineteen" in section  # the exemption count, matched against test_config_load's list
+    assert "twenty-one" in section  # the exemption count, matched against test_config_load's list
     from teb_vae.lag_attn_crws.tests.test_config_load import PARITY_EXEMPT_PATHS
 
-    assert len(PARITY_EXEMPT_PATHS) == 19
+    assert len(PARITY_EXEMPT_PATHS) == 21
 
 
 # =================================================================================================
@@ -935,10 +970,12 @@ def test_every_backticked_metric_name_in_the_record_is_one_the_run_emits(results
     """The general form of the two checks above, over the whole document. Restricted to names that
     look like metric identifiers, so config keys, file names and prose survive it.
 
-    Two namespaces share the shape and not the meaning and are admitted by name rather than by
-    shape: the two forward-dict keys the anchor axis returns, and the five causal-feature readouts
-    this record names as *dropped* -- which are asserted absent from the tracked surface elsewhere in
-    this file, so admitting them here cannot hide a column that crept back in.
+    Three namespaces share the shape and not the meaning and are admitted by name rather than by
+    shape: the two forward-dict keys the anchor axis returns; the five causal-feature readouts this
+    record names as *dropped* -- which are asserted absent from the tracked surface elsewhere in
+    this file, so admitting them here cannot hide a column that crept back in; and the two
+    run-record fields the lag caption names, which live in the resolved-config dump and the
+    preflight disclosure rather than in ``metrics_history.csv``.
     """
     candidates = set(re.findall(r"`([a-z][a-z0-9_]{4,})`", results))
     metric_shaped = {
@@ -957,6 +994,7 @@ def test_every_backticked_metric_name_in_the_record_is_one_the_run_emits(results
         if not any(tracked.startswith(name) for tracked in _TRACKED_SUFFIXES)
         and name not in FORWARD_DICT_KEYS
         and name not in DROPPED_READOUTS
+        and name not in RUN_RECORD_FIELDS
     )
     assert unknown == [], unknown
 

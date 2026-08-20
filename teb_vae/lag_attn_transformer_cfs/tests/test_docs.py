@@ -292,20 +292,25 @@ def test_the_target_axis_delta_decomposes_into_the_three_terms_the_design_states
     """The decoder head and the two adapters — and it must be the same delta the conv-LSTM pair
     shows, because every module outside the encoders is shared.
 
-    **The horizon embedding is no longer a term**, and its absence is the thing to notice. It used
-    to contribute $-15 \\times 256 = -3840$, the halved horizon at ``decoder_hidden``; both cells now
-    forecast $30$ steps, so the two embeddings are the same size and the term is exactly zero. It is
-    written out below rather than dropped so that a future horizon divergence reappears here as a
-    failing sum rather than as a silently wrong total.
+    **Two of the terms are no longer terms**, and their absence is the thing to notice. The horizon
+    embedding used to contribute $-15 \\times 256 = -3840$, the halved horizon at ``decoder_hidden``;
+    both cells now forecast $30$ steps, so the two embeddings are the same size. The start embeddings
+    used to contribute $-256$; the alignment makes this cell build both, as the two-sided one always
+    did. Both are written out below rather than dropped so that either divergence reappears here as
+    a failing sum rather than as a silently wrong total.
     """
     section = _markdown_section(design, "## 13. ")
     delta = measured_totals["trf_cfs_guarded"] - measured_totals["trf_fs_guarded"]
 
     head = 514 * (98 - 78)
     horizon_embedding = (30 - 30) * 256
-    adapters = 128 * (98 - 78) * 2 + 128 * (51 - 29) * 2 - 256
+    start_embeddings = (2 - 2) * 128
+    adapters = 128 * (98 - 78) * 2 + 128 * (47 - 29) * 2 + start_embeddings
 
     assert horizon_embedding == 0, "the two cells' horizons diverged; §13 needs its third term back"
+    assert start_embeddings == 0, (
+        "one of the two cells stopped building both start embeddings; §13 needs that term back"
+    )
     assert delta == head + horizon_embedding + adapters
     assert delta == measured_totals["cfs_guarded"] - measured_totals["fs_guarded"]
     for value in (delta, head, adapters):
@@ -314,13 +319,33 @@ def test_the_target_axis_delta_decomposes_into_the_three_terms_the_design_states
 
 def test_the_guard_delta_is_stated_with_the_sign_it_actually_has(design, measured_totals):
     """Two correct numbers that read as a contradiction unless the reason is written down: the
-    warm-up budget drops four channels so the availability projections dominate, while the two-sided
-    reach budget drops thirty-one so the narrowing does."""
+    warm-up budget drops four target channels and the alignment four source ones, so the machinery
+    the guard adds dominates, while the two-sided reach budget drops thirty-one so the narrowing
+    does."""
     section = _markdown_section(design, "## 13. ")
     causal = measured_totals["trf_cfs_guarded"] - measured_totals["trf_cfs_ungated"]
 
-    assert causal == 128 * 98 + 128 * 51 - 514 * 4 - 128 * 4
+    assert causal == 128 * 98 + 128 * 47 + 2 * 128 - 514 * 4 - 128 * 4 - 128 * 4
     assert str(causal) in _unseparated(section)
+    for factor in (r"128 \times 98", r"128 \times 47", r"2 \times 128"):
+        assert factor in section, factor
+
+
+def test_the_design_states_the_unaligned_arm_and_the_delta_between_them(design, measured_totals):
+    r"""The unaligned row is a comparison arm rather than history, so it is measured like the rest.
+
+    The delta is $-768$ and factorises exactly: the source adapter loses four channels from two
+    $d_{\mathrm{model}}$-wide linears, and both adapters gain a start-of-record vector.
+    """
+    section = _markdown_section(design, "## 13. ")
+    delta = (
+        measured_totals["trf_cfs_guarded"] - measured_totals["trf_cfs_guarded_unaligned"]
+    )
+
+    assert delta == -4 * 128 * 2 + 2 * 128 == -768
+    assert measured_totals["trf_cfs_guarded_unaligned"] in _integers_stated_in(section)
+    assert measured_totals["cfs_guarded_unaligned"] in _integers_stated_in(section)
+    assert str(abs(delta)) in _unseparated(section)
 
 
 def test_the_records_agree_on_the_parameter_table(design, results, measured_totals):
@@ -384,13 +409,18 @@ def test_the_mixin_section_states_why_neither_inheritance_works(design):
 
 def test_the_lean_limits_carry_their_replacement_triggers(design):
     """A ``lean-limit`` note without a measurable trigger is a permanent excuse. Exactly four here,
-    all inherited from the target domain: the per-segment warm-up, the uncorrected group delay, the
-    lag floor that never varies, and the availability-clock margin the evaluation ships unset."""
+    all inherited from the target domain: the per-segment warm-up, the residual pair-indexed lag
+    bias, the lag floor that never varies, and the availability-clock margin the evaluation ships
+    unset.
+
+    The second was "the uncorrected group delay" until the alignment corrected the per-channel half
+    of it; what is left is the pair-indexed remainder, so the note is narrowed rather than removed.
+    """
     flat = _flat(design)
 
     assert len(re.findall(r"^> lean-limit: ", design, re.MULTILINE)) == 4
     assert "when a measured run shows the anchor floor" in flat
-    assert "when a lag result is to be reported as a physiological delay" in flat
+    assert "when a nonzero target reference can be divided out" in flat
     assert "when a run's `source_lag_warmth_frac_ph` falls below" in flat
     assert "once the first production run on the causal holdout split has written" in flat
 

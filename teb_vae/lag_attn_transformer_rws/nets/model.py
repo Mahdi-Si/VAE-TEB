@@ -646,7 +646,18 @@ class SeqVaeLagAttnTrfRws(nn.Module):
         minutes at the $120$ s budget, with nothing failing.
 
         The source channels are delayed individually, so no single $\delta$ describes them all.
-        The maximum is reported, which makes a lag computed from it an upper bound. Exposed here,
+        The maximum is reported, which makes a lag computed from it an upper bound.
+
+        **Under a causal channel alignment the maximum means something narrower**, and a consumer
+        that wants the physical constant must not reach for this one. There the delays are
+        deliberately *equalised* rather than naturally graded -- every kept channel is shifted onto
+        one reference clock -- so the maximum is the shift applied to the **fastest** channel, i.e.
+        the one furthest from the reference and the least stale in physical time. It is still
+        exactly what its name says, how many stored steps back the source memory reaches, and it is
+        still what a stored-coefficient lag axis is built from. What it is **not** is
+        $\tau_{\mathrm{ref}}$: that constant is resolved from the shards rather than from the gate,
+        travels as ``reference_delay_s`` on the resolved budget and through the run's causality
+        disclosure, and is the number a lag in physical seconds is computed from. Exposed here,
         on the model, because the model is what was trained: the diagnostic figure reads this
         through a silent ``getattr(model, "source_delay_steps", 0)``, so a model that stopped
         exposing it would shift the figure's lag axis with no error at all.

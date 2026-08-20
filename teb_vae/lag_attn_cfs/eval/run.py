@@ -1232,11 +1232,27 @@ def main(
         # this cell, so the value is structurally zero here and is read rather than assumed: an
         # arm that acquired one would report it instead of quietly shifting every lag.
         delay_steps = 0 if task is None else int(task.orig_model.source_delay_steps)
+        # The reference is NOT source_delay_steps and is deliberately read from somewhere else.
+        # That scalar is the largest stored-step shift, which under a channel alignment belongs to
+        # the *fastest* channel; the reference is the physical instant every aligned source channel
+        # reports at a step, and is resolved from the shards rather than from the gate. Only the
+        # second is a constant a lag in seconds can be computed from, and only the first builds the
+        # stored-coefficient axis every figure here draws -- so both travel, and neither stands in
+        # for the other.
+        reference_delay_s = (
+            (preflight_record.get("causality") or {}).get("source_reference_delay_s")
+        )
         if delay_steps:
             logger.info(
                 f"source channels are delayed by up to {delay_steps} steps "
                 f"({delay_steps * SECONDS_PER_STEP:g} s); the reported lag adds this back as an "
                 f"upper bound."
+            )
+        if reference_delay_s is not None:
+            logger.info(
+                f"source channels are aligned onto a common reference of "
+                f"{float(reference_delay_s):g} s; the lag axis below stays in stored-coefficient "
+                f"time and does NOT apply it."
             )
 
         collection, probe_record, loader = load_or_collect_tables(
@@ -1335,6 +1351,10 @@ def main(
             # with it.
             "source_delay_steps": delay_steps,
             "source_delay_is_max_over_channels": True,
+            # The alignment reference, beside the maximum and not merged into it. See the comment
+            # at the read site: they are a physical constant and a stored-step count, and a reader
+            # who takes one for the other gets a lag wrong by minutes with nothing failing.
+            "source_reference_delay_s": reference_delay_s,
             "eval_config": eval_config,
             # Read back from global state rather than echoed from the assignments, so the record
             # is what was in force rather than what was asked for.

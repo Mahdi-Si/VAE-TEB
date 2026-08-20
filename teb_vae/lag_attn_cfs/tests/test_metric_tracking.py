@@ -161,7 +161,7 @@ def test_the_two_sided_siblings_four_gap_columns_are_inherited_rather_than_resta
     assert set(_FORECAST_GAP_SUFFIXES).isdisjoint(_CAUSAL_SUFFIXES)
 
 
-def test_the_seven_per_stage_columns_are_tracked_on_both_stages():
+def test_the_ten_per_stage_columns_are_tracked_on_both_stages():
     """They come out of ``compute_loss``, like every other term of the objective, so they exist on
     training and validation batches alike. A ``val/``-only entry would silently halve the evidence a
     run produces -- and for the two geometry guards it would remove the training rows entirely,

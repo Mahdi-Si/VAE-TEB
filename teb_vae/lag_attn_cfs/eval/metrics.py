@@ -2287,10 +2287,16 @@ def lag_summary(
 
     Args:
         aggregate: The aggregated readouts.
-        delay_steps: The causal input delay $\delta$ applied to the source channels. Zero on this
-            cell, whose source is warm-up **masked** rather than delayed -- ``target_delays`` and
-            ``source_delays`` are the only two constructor keywords the model removes -- and kept
-            as an argument so the lag report is one function across the grid.
+        delay_steps: The causal input delay $\delta$ applied to the source channels, in **stored
+            steps**. Zero on an unaligned run of this cell, whose source is warm-up **masked**
+            rather than delayed -- ``target_delays`` and ``source_delays`` are the only two
+            constructor keywords the model removes -- and kept as an argument so the lag report is
+            one function across the grid. Under a channel alignment it is the largest shift any
+            surviving source channel received, which is what a stored-coefficient axis is indexed
+            by; the alignment's physical constant $\tau_{\mathrm{ref}}$ is a **different number**
+            and is deliberately not taken here, because applying it would restate this axis as a
+            physiological latency, which is the claim the group-delay caveat refuses. It travels
+            beside these numbers as ``source_reference_delay_s`` in the run's summary.
         identity_residuals: The worst per-anchor residual of each structural identity over the
             whole pass, by name. Recorded here rather than recomputed downstream because it is a
             maximum over samples and the aggregation chain reports means.

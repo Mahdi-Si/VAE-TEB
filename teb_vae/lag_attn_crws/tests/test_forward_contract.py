@@ -151,7 +151,7 @@ def test_the_per_step_keys_keep_the_step_axis(outputs) -> None:
 def test_the_shipped_geometry_forecasts_five_tiles_of_two_minutes() -> None:
     r"""The shipped forecast shape: $(B, 5, 30, 16)$, from the budget the committed shard resolves.
 
-    Every factor is derived: five is $\lceil 137/30 \rceil$, thirty is the configured horizon,
+    Every factor is derived: five is $\lceil 136/30 \rceil$, thirty is the configured horizon,
     and sixteen is ``raw_per_step``. What is asserted as a literal is only that they resolve to
     those numbers, because that is the configuration every reported nat is produced at.
     """

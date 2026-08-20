@@ -48,6 +48,7 @@ from .conftest import (
     SHIPPED_HORIZON,
     SHIPPED_WARMUP_PERIOD,
     TINY_SOURCE_WARMUP_STEPS,
+    TINY_TARGET_ALIGN_DELAYS,
     TINY_TARGET_KEEP_INDEX,
     TINY_TARGET_WARMUP_STEPS,
     build,
@@ -365,3 +366,120 @@ def test_a_negative_lag_floor_is_refused_naming_it(tiny_warmup) -> None:
     """It would admit lags reading before the start of the sequence."""
     with pytest.raises(ValueError, match="-3"):
         SeqVaeLagAttnCrws(**dict(tiny_warmup, lag_floor=-3))
+
+
+# =================================================================================================
+# The channel alignment
+# =================================================================================================
+def test_omitting_the_alignment_keywords_builds_todays_model_bitwise(tiny_warmup) -> None:
+    """The path an old checkpoint's saved kwargs dict actually exercises.
+
+    A checkpoint written before these keywords existed carries neither, so construction from it
+    must produce the object graph and the tensor values of the model that was trained -- not an
+    equivalent one with an identity ``ChannelDelay`` in it. Asserted over the state dict *and* over
+    the buffer names, because an identity shift is numerically invisible and structurally is not.
+    """
+    without = build(tiny_warmup)
+    explicit = build(dict(tiny_warmup, target_align_delays=None, source_align_delays=None))
+
+    assert list(without.state_dict()) == list(explicit.state_dict())
+    for name, tensor in without.state_dict().items():
+        assert torch.equal(tensor, explicit.state_dict()[name]), name
+    assert sorted(dict(without.named_buffers())) == sorted(dict(explicit.named_buffers()))
+    assert without.target_gate.max_delay == explicit.target_gate.max_delay == 0
+    assert without.source_delay_steps == explicit.source_delay_steps == 0
+    assert without.target_adapter.start_embed is None
+    assert without.source_adapter.start_embed is None
+
+
+def test_the_shift_reaches_the_gate_and_the_adapter_carries_warm_up_plus_shift(
+    tiny_align,
+) -> None:
+    r"""The silent half of the alignment, on this cell's own composition.
+
+    The keywords are renamed on the way to the base, so the gate is where they land; and a
+    gathered-and-delayed channel is honest only once the step index has reached **both** $W'_c$ and
+    $d_c$, so the vector the availability mask and the announcement are built from is the sum. Fed
+    the warm-up alone, the adapter would call a channel warm $d_c$ steps early and every shape,
+    every metric and every gradient would be exactly as they are now.
+    """
+    model = build(tiny_align)
+    combined = tuple(
+        wait + shift
+        for wait, shift in zip(TINY_TARGET_WARMUP_STEPS, TINY_TARGET_ALIGN_DELAYS)
+    )
+
+    assert tuple(int(value) for value in model.target_gate.delay.delay_steps) == (
+        TINY_TARGET_ALIGN_DELAYS
+    )
+    assert model.target_adapter.max_delay == max(combined)
+    assert model.target_adapter.min_delay == min(combined)
+    pattern = model.target_adapter.availability
+    for channel, delay in enumerate(combined):
+        column = pattern[:, channel]
+        assert not bool(column[:delay].any()), channel
+        assert bool(column[delay:].all()), channel
+
+
+def test_the_availability_of_an_aligned_channel_is_the_unaligned_one_shifted_right(
+    tiny_warmup, tiny_align
+) -> None:
+    """Stated as the relation rather than as two independent patterns: the whole claim of the
+    alignment is that a channel's content moved later by $d_c$ steps and nothing else about it
+    changed, so its availability must be the same staircase translated by the same $d_c$."""
+    unaligned = build(tiny_warmup).target_adapter.availability
+    aligned = build(tiny_align).target_adapter.availability
+    steps = int(unaligned.shape[0])
+
+    for channel, shift in enumerate(TINY_TARGET_ALIGN_DELAYS):
+        expected = torch.zeros(steps, dtype=aligned.dtype)
+        expected[shift:] = unaligned[: steps - shift, channel]
+        assert torch.equal(aligned[:, channel], expected), channel
+
+
+def test_a_non_null_reference_builds_the_start_of_record_embedding(
+    tiny_warmup, tiny_align
+) -> None:
+    r"""A construction-time change no shipped configuration of this family has ever made.
+
+    ``AvailabilityInputAdapter`` builds ``start_embed`` when $\min_c \delta_c > 0$. Unaligned, both
+    streams have a channel at $W' = 0$, so the token is permanently inert and is not built. Under
+    the shift the minimum of $W'_c + d_c$ lifts off zero on both streams and it comes into
+    existence: a new learned parameter of width $d_{\mathrm{model}}$ per stream, and a live token in
+    the forward pass. This is wanted, and it must be asserted rather than discovered in a parameter
+    total.
+    """
+    off = build(tiny_warmup)
+    on = build(tiny_align)
+
+    assert off.target_adapter.start_embed is None and off.source_adapter.start_embed is None
+    for adapter in (on.target_adapter, on.source_adapter):
+        assert adapter.start_embed is not None
+        assert adapter.start_embed.shape == (int(on.d_model),)
+        assert bool(adapter.start_indicator.any()), "an inert token is not a token"
+
+    assert sum(p.numel() for p in on.parameters()) - sum(
+        p.numel() for p in off.parameters()
+    ) == 2 * int(on.d_model)
+
+
+def test_the_anchor_floor_rises_to_the_shifted_warmth(tiny_align, tiny_warmup) -> None:
+    r"""Both requirements, and they do not move together.
+
+    The scored target is never shifted, so its half stays where it was. The *inputs* are, and an
+    aligned channel vector at step $t$ asserts one physical instant -- an assertion that is false,
+    not partially true, while any entry has not arrived. So the floor must clear
+    $\max_c(W'_c + d_c)$, which costs exactly one anchor here as it does at the shipped reference.
+    The unaligned floor is unmoved, which is the control: a check applying the second half
+    unconditionally would refuse the shipped configuration.
+    """
+    floor = int(tiny_align["warmup_period"])
+    assert floor == max(TINY_TARGET_WARMUP_STEPS), "the flat combined vector is what this pins"
+
+    with pytest.raises(ValueError) as error:
+        build(dict(tiny_align, warmup_period=floor - 1))
+    assert f"warmup_period={floor - 1}" in str(error.value)
+    assert f"at least {floor}" in str(error.value)
+
+    assert build(dict(tiny_align, warmup_period=floor)) is not None
+    assert build(dict(tiny_warmup, warmup_period=floor - 1)) is not None

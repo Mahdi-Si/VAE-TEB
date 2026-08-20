@@ -466,18 +466,23 @@ def _check_source_block_kept(config: Dict[str, Any]) -> None:
 def _check_floor_pairs_with_budget(
     config: Dict[str, Any], budget: Optional[WarmupBudget]
 ) -> None:
-    r"""Refuse an anchor floor the kept **target-stream** channels' warm-up does not admit.
+    r"""Refuse an anchor floor the kept **target-stream** channels do not admit.
 
-    The same inequality the constructor enforces, $F \\ge B - 1$ over the *survivors*, and the same
-    code: delegated to :meth:`~teb_vae.lag_attn_crws.nets.causal_raw_inputs.CausalRawInputs._check_anchor_floor`
+    The same two inequalities the constructor enforces, over the *survivors*, and the same code:
+    delegated to :meth:`~teb_vae.lag_attn_crws.nets.causal_raw_inputs.CausalRawInputs._check_anchor_floor`
     so the pre-flight and the constructor cannot come to disagree about a policy that is stated in
-    one place. What it enforces here is the declared **input-warmth** policy rather than a validity
+    one place. What they enforce here is the declared **input-warmth** policy rather than a validity
     requirement -- a raw sample is honest at every step -- so the message it raises is that policy's.
 
     ``budget.target`` and not ``budget.source``, deliberately and not by omission. The source stream
-    is never gated in this family, so at the shipped budget it keeps channels waiting $162$ to $278$
-    steps; a floor that cleared those would sit at $277$ and cost about $144$ of the $152$ anchors,
-    to enforce a warmth this design measures instead -- see the ``source_lag_warmth_frac`` columns.
+    is never gated for its warm-up in this family, so unaligned it keeps channels waiting $162$ to
+    $278$ steps; a floor that cleared those would sit at $277$ and cost about $144$ of the $152$
+    anchors, to enforce a warmth this design measures instead -- see the ``source_lag_warmth_frac``
+    columns.
+
+    The resolved **shifts** travel with the warm-up because the two halves do not move together: a
+    shifted input stream must have every kept channel warm at the anchor, where an unshifted one is
+    masked and announced instead. An unaligned budget carries ``None`` there, the inert value.
 
     The distinction between the configured threshold and the survivors' own maximum is load-bearing:
     a threshold of $151$ keeps the identical $98$ channels whose slowest still waits $134$ steps, so
@@ -488,12 +493,15 @@ def _check_floor_pairs_with_budget(
         budget: The resolved warm-up budget, or ``None`` when none is configured.
 
     Raises:
-        ValueError: Naming both numbers, from the constructor's own check.
+        ValueError: Naming which requirement binds and both numbers, from the constructor's own
+            check.
     """
     if budget is None:
         return
     CausalRawInputs._check_anchor_floor(
-        int(_vae_config(config)["warmup_period"]), budget.target.warmup_steps
+        int(_vae_config(config)["warmup_period"]),
+        budget.target.warmup_steps,
+        budget.target.align_delays or (),
     )
 
 

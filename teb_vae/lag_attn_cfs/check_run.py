@@ -29,7 +29,7 @@ never a tier-2 value.
 
 **The anchor band is derived, never assumed.** ``anchors_per_sample`` is compared against
 $\lceil (T_{\mathrm{valid}} - F)/S \rceil$ and its phase-dependent floor, computed from the run's
-own ``resolved_config.yaml``. Hard-coding the shipped $[4, 5]$ and $137$ would make the checker
+own ``resolved_config.yaml``. Hard-coding the shipped $[4, 5]$ and $136$ would make the checker
 pass a run at another horizon, floor or stride for the wrong reason -- and the arms that move all
 three ship in ``configs/``.
 
