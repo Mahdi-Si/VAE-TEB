@@ -37,12 +37,14 @@
       "reason": "",
       "exercised_by": [
         "test_eval_sibling_agreement.py::test_the_cohort_order_is_one_ordering_in_both_packages",
-        "test_eval_sibling_agreement.py::test_the_time_axis_bins_identically_in_both_packages"
+        "test_eval_sibling_agreement.py::test_the_time_axis_bins_identically_in_both_packages",
+        "test_eval_sibling_agreement.py::test_the_second_clock_bins_identically_in_both_packages",
+        "test_eval_sibling_agreement.py::test_the_two_cohort_modules_are_one_file_with_one_import_line"
       ]
     },
     "collect.py": {
       "state": "divergent",
-      "reason": "Keys the per-anchor table on the forward's own anchor_index rather than on a row's position in the decoded set, because this cell gathers A_max anchors out of T_valid and a position is not the decimated step it scores. Retains four (136, 30, 98) forecast tensors per sample rather than blocks of a 4 Hz trace, records target_keep_index in collection.json for the kept-axis join, records what the pass cost and at what rate, and accumulates no cross-spectral sums because coherence is not ported."
+      "reason": "Keys the per-anchor table on the forward's own anchor_index rather than on a row's position in the decoded set, because this cell gathers A_max anchors out of T_valid and a position is not the decimated step it scores. Retains four (136, 30, 98) forecast tensors per sample rather than blocks of a 4 Hz trace, records target_keep_index in collection.json for the kept-axis join, records what the pass cost and at what rate, and accumulates no cross-spectral sums because coherence is not ported. Added since: second_stage_onset joins the identity columns immediately after time_from_labor_onset, so the second clinical clock reaches per_sample.csv as an identity rather than being reported in collection.json as a scored quantity. The sibling carries the same addition."
     },
     "config_schema.py": {
       "state": "divergent",
@@ -54,7 +56,7 @@
     },
     "figures_seam.py": {
       "state": "divergent",
-      "reason": "The palette, the style refinement and every bound panel are the sibling's. What differs is the lag-axis label: this seam binds lag_axis.COEFFICIENT_LAG_AXIS_LABEL and the group-delay caveat beside it rather than lag_report.COMPENSATED_LAG_AXIS_LABEL, because the axis here is stored-coefficient time. Binding the sibling's label would put the wrong claim on every lag figure while changing no arithmetic. Added since: caveat_note, which prints the group-delay caveat under a lag-resolved figure. One decision about wording and placement rather than one per analysis, because a figure is the artifact most likely to be shown without the directory it came from."
+      "reason": "The palette, the style refinement and every bound panel are the sibling's. What differs is the lag-axis label: this seam binds lag_axis.COEFFICIENT_LAG_AXIS_LABEL and the group-delay caveat beside it rather than lag_report.COMPENSATED_LAG_AXIS_LABEL, because the axis here is stored-coefficient time. Binding the sibling's label would put the wrong claim on every lag figure while changing no arithmetic. Added since: caveat_note, which prints the group-delay caveat under a lag-resolved figure. One decision about wording and placement rather than one per analysis, because a figure is the artifact most likely to be shown without the directory it came from. Added since: windowed_comparison_figure, the five-row page both clocks draw -- violins per (window, cohort) cell, the Holm-adjusted significance of each window directly beneath them on the same axis, and the effect sizes that survived -- plus the two shared panels it composes (binned_violin_panel, significance_strip). It lives in the seam rather than in an analysis because two analyses draw it and an analysis may not import another. The sibling carries the same builder; what differs between the two files is still only the lag-axis label."
     },
     "frames.py": {
       "state": "divergent",
@@ -87,11 +89,11 @@
     },
     "preflight.py": {
       "state": "divergent",
-      "reason": "The causal guard set: transform == 'causal' on every configured shard, the causal widths, causal_reach_budget_s refused outright, fhr_st/fhr_ph normalised in place of the raw 'fhr', guid added to the required load fields, the warm-up budget re-resolved against the evaluation shards and compared with the checkpoint's stamped tuples, and the lag-support margin measured and recorded rather than assumed. NOT_CAUSAL_STATEMENT is replaced -- the sibling's sentence says the inputs read their own future, which is false here and would be a false disclosure rather than a conservative one -- and the shared half of the causality record is wider, because the warm-up budget, the anchor geometry and the lag support belong to the target domain both cfs cells share rather than to either encoder. Also carries GUARD_RECOVERY, a machine-checked table the sibling keeps by hand in EVAL.md."
+      "reason": "The causal guard set: transform == 'causal' on every configured shard, the causal widths, causal_reach_budget_s refused outright, fhr_st/fhr_ph normalised in place of the raw 'fhr', guid added to the required load fields, the warm-up budget re-resolved against the evaluation shards and compared with the checkpoint's stamped tuples, and the lag-support margin measured and recorded rather than assumed. NOT_CAUSAL_STATEMENT is replaced -- the sibling's sentence says the inputs read their own future, which is false here and would be a false disclosure rather than a conservative one -- and the shared half of the causality record is wider, because the warm-up budget, the anchor geometry and the lag support belong to the target domain both cfs cells share rather than to either encoder. Also carries GUARD_RECOVERY, a machine-checked table the sibling keeps by hand in EVAL.md. Added since: second_stage_onset joins REQUIRED_EVAL_LOAD_FIELDS and is named in the refusal, which is the config half of the same guard the probe applies to a batch. No new guard function, so GUARD_RECOVERY is unchanged. The sibling carries the same addition."
     },
     "probe.py": {
       "state": "divergent",
-      "reason": "Two halves where the sibling has one. The population pass -- one loader iteration into loader_probe.json, and its four refusals -- is the sibling's, unchanged in behaviour, because it is what run.py and every population sanity check read. Added beside it is a forward-contract pass behind --checkpoint: this cell's forward takes five positional arguments and raises without a phase above stride 1, returns two keys the family's does not, and produces (B, A_max, H, C_keep) forecast tensors rather than (B, T_valid, H, R), so the readout module was written against a contract that was measured rather than read. It therefore loads a checkpoint, which makes this module layer 1 here and layer 0 in the sibling, and it refuses any geometry but the dense one so a contract measured at the training tiling cannot be reported."
+      "reason": "Two halves where the sibling has one. The population pass -- one loader iteration into loader_probe.json, and its four refusals -- is the sibling's, unchanged in behaviour, because it is what run.py and every population sanity check read. Added beside it is a forward-contract pass behind --checkpoint: this cell's forward takes five positional arguments and raises without a phase above stride 1, returns two keys the family's does not, and produces (B, A_max, H, C_keep) forecast tensors rather than (B, T_valid, H, R), so the readout module was written against a contract that was measured rather than read. It therefore loads a checkpoint, which makes this module layer 1 here and layer 0 in the sibling, and it refuses any geometry but the dense one so a contract measured at the training tiling cannot be reported. Added since: second_stage_onset is a required batch field in both halves, and the population pass reports its {n_values, n_nan} coverage beside time_from_labor_onset -- the loader skips a field it was asked for and the shard does not carry, silently, so without the requirement a missing field would present as a cohort with no second stage. The sibling carries the same addition."
     },
     "report_seam.py": {
       "state": "divergent",
@@ -175,6 +177,15 @@
       "state": "divergent",
       "reason": "Draws this cell's fifteen-row diagnostic page through the task's own page seams rather than the raw cells' nine-row one."
     },
+    "analyses/second_stage.py": {
+      "state": "equivalent",
+      "reason": "",
+      "exercised_by": [
+        "test_eval_second_stage.py::test_the_analysis_writes_its_five_tables_and_both_figures",
+        "test_eval_sibling_agreement.py::test_the_second_stage_clock_reaches_the_same_verdicts",
+        "test_eval_sibling_agreement.py::test_the_two_second_stage_modules_are_one_file_with_two_import_lines"
+      ]
+    },
     "analyses/sufficiency.py": {
       "state": "equivalent",
       "reason": "",
@@ -188,7 +199,8 @@
       "reason": "",
       "exercised_by": [
         "test_eval_sibling_agreement.py::test_the_time_before_delivery_grid_and_its_readouts_are_the_same_in_both_packages",
-        "test_eval_sibling_agreement.py::test_the_three_layers_of_inference_reach_the_same_verdicts"
+        "test_eval_sibling_agreement.py::test_the_three_layers_of_inference_reach_the_same_verdicts",
+        "test_eval_sibling_agreement.py::test_the_two_time_to_delivery_modules_are_one_file_with_two_import_lines"
       ]
     },
     "analyses/trajectory.py": {

@@ -430,5 +430,8 @@ def test_the_interpretation_rules_are_all_present(eval_doc):
         "per event",                       # deceleration rates
         "Lag ablation is absent",          # and necessity with it
         "/480 rescale",                    # the rescaled per-sample score
+        "corrected within a clock",           # two clocks, two Holm families
+        "a subset of the evaluated cohort",   # ...and why the second one is capped
+        "counted and never dropped",          # the two onset diagnostics that filter nothing
     ):
         assert rule in eval_doc, f"EVAL.md no longer states: {rule!r}"

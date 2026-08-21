@@ -198,10 +198,10 @@ RUN_ARGS: Dict[str, Any] = {
     # too, before the checkpoint is loaded, so a misspelling costs a parse rather than a first pass
     # over the shards.
     #
-    # The first sixteen are the sibling's, one implementation shared by both models; the
-    # seventeenth is this architecture's own and runs last, because the merge appends it after the
+    # The first seventeen are the sibling's, one implementation shared by both models; the
+    # eighteenth is this architecture's own and runs last, because the merge appends it after the
     # shared registry rather than reordering a run order both models share. `band_partition` makes
-    # eighteen steps in a full run and is the one that is not on this list.
+    # nineteen steps in a full run and is the one that is not on this list.
     #
     #   forecast:          Is the forecast any good. Skill against persistence, climatology and
     #                      the segment's own mean, in nats and in bpm, resolved by horizon step.
@@ -227,6 +227,10 @@ RUN_ARGS: Dict[str, Any] = {
     #                      whole delivery on the absolute time axis.
     #   time_to_delivery:  The readouts binned on a 0.5 h grid of time before delivery,
     #                      class-stratified, with Holm across windows.
+    #   second_stage:      The same two readouts on the *other* clinical clock -- signed hours from
+    #                      the onset of the second stage, negative before it and positive after --
+    #                      over the recordings that have a recorded onset. Its Holm family is this
+    #                      clock's own, and it declares itself capped because it scores a subset.
     #   events:            What the raw target unlocks. Deceleration forecast skill, the
     #                      contraction-triggered response, and contraction-conditioned coupling.
     #   sufficiency:       What the latent bottleneck costs, against an evaluation-only oracle

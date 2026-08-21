@@ -55,8 +55,12 @@ PER_RECORDING_FILENAME = "time_to_delivery_per_recording.csv"
 SIGNIFICANCE_FILENAME = "time_to_delivery_significance.csv"
 PAIRWISE_FILENAME = "time_to_delivery_pairwise.csv"
 
-#: The figure, named as ``FIGURE_GUIDE.md`` names it.
+#: The figures, named as ``FIGURE_GUIDE.md`` names them. The trajectory is the shape of the two
+#: readouts against the clock; the windows page is what that shape is made of -- the per-recording
+#: distribution in every window, the corrected significance of every window, and the effect size of
+#: every cohort pair that survived it.
 TRAJECTORY_FIGURE = "time_to_delivery_trajectory.pdf"
+WINDOWS_FIGURE = "time_to_delivery_windows.pdf"
 
 #: Width of a time-before-delivery window, in hours. Bound from the layer below rather than
 #: restated: the lag structure is cut on the same windows and an analysis may not import another,
@@ -69,24 +73,14 @@ TRAJECTORY_BIN_HOURS = cohort.TRAJECTORY_BIN_HOURS
 DEFAULT_ALPHA = 0.05
 
 #: The two readouts tracked, as ``(reported name, per-sample column, what it is)``. Both, because
-#: they fail differently -- see the module docstring.
-READOUTS: Tuple[Tuple[str, str, str], ...] = (
-    (
-        "pred_gap_mc_nats",
-        "mc_pred_gap",
-        "Monte Carlo marginalised D_base - D_full in nats per anchor; in the decoder's own units "
-        "and immune to the prior-variance inflation",
-    ),
-    (
-        "source_conditioned_kl_raw_nats",
-        "source_conditioned_kl_raw",
-        "the unfloored KL between the two latents; inflated by an arbitrary factor whenever the "
-        "prior variance sits on its clamp, which is why it is not read alone",
-    ),
-)
+#: they fail differently -- see the module docstring. Bound from the layer below rather than
+#: restated, for the reason the bin width is: the second clinical clock resolves exactly these two
+#: quantities as well, and two copies of the tuple would be two answers to what a clock figure
+#: shows.
+READOUTS: Tuple[Tuple[str, str, str], ...] = cohort.CLOCK_READOUTS
 
 #: The per-sample columns this analysis reduces, in the order the tables carry them.
-VALUE_COLUMNS: Tuple[str, ...] = tuple(column for _, column, _ in READOUTS)
+VALUE_COLUMNS: Tuple[str, ...] = cohort.CLOCK_VALUE_COLUMNS
 
 #: The method sentence written into every record, so a $p$-value here is readable without this
 #: module.
@@ -144,6 +138,30 @@ def build_trajectory_rows(per_recording: Dict[str, pd.DataFrame]) -> List[Dict[s
 # =============================================================================
 # Significance across the classes, window by window
 # =============================================================================
+def _class_values(frame: pd.DataFrame, column: str) -> Dict[str, np.ndarray]:
+    """Split one window's rows into per-class finite vectors, dropping none of them.
+
+    Args:
+        frame: One window's per-recording rows.
+        column: The value column.
+
+    Returns:
+        Every class present, in the canonical healthy / acidosis / HIE order, mapped to its finite
+        values. **Nothing is filtered here**: a class too small to test is still a class a figure
+        must show, because a cohort thinning out toward the edge of the axis is the explanation
+        for the window beside it and is invisible if the values are dropped this early.
+    """
+    values_by_class: Dict[str, np.ndarray] = {}
+    for group in cohort.ordered_groups(
+        sorted(set(frame["group"].astype(str))), labels.CLASS_COLUMN
+    ):
+        values = np.asarray(
+            frame.loc[frame["group"].astype(str) == group, column], dtype=np.float64
+        )
+        values_by_class[group] = values[np.isfinite(values)]
+    return values_by_class
+
+
 def _class_samples(frame: pd.DataFrame, column: str) -> Tuple[Dict[str, np.ndarray], Dict[str, int]]:
     """Split one window's rows into per-class finite vectors, dropping classes too small to test.
 
@@ -158,20 +176,82 @@ def _class_samples(frame: pd.DataFrame, column: str) -> Tuple[Dict[str, np.ndarr
         window" is the explanation for a window the test skipped, and a reader who cannot see it
         will assume the comparison was made.
     """
-    usable: Dict[str, np.ndarray] = {}
-    excluded: Dict[str, int] = {}
-    for group in cohort.ordered_groups(
-        sorted(set(frame["group"].astype(str))), labels.CLASS_COLUMN
-    ):
-        values = np.asarray(
-            frame.loc[frame["group"].astype(str) == group, column], dtype=np.float64
-        )
-        finite = values[np.isfinite(values)]
-        if finite.size < shared_stats.MIN_GROUP_SIZE:
-            excluded[group] = int(finite.size)
-            continue
-        usable[group] = finite
-    return usable, excluded
+    values_by_class = _class_values(frame, column)
+    return (
+        {
+            group: values for group, values in values_by_class.items()
+            if values.size >= shared_stats.MIN_GROUP_SIZE
+        },
+        {
+            group: int(values.size) for group, values in values_by_class.items()
+            if values.size < shared_stats.MIN_GROUP_SIZE
+        },
+    )
+
+
+def window_samples(
+    per_recording: pd.DataFrame, column: str
+) -> Tuple[Dict[int, Dict[str, np.ndarray]], Dict[int, Dict[str, Any]]]:
+    """Split a per-recording frame into the cells each window is tested and drawn from.
+
+    One function rather than two because the figure and the test must describe the *same* cells:
+    a violin drawn from one set of values under a $p$-value computed from another is a page that
+    disagrees with itself and looks entirely ordinary.
+
+    Args:
+        per_recording: The class-axis per-recording-per-window frame.
+        column: The value column.
+
+    Returns:
+        ``(samples, meta)`` keyed by window, in ascending window order. ``samples`` holds **every**
+        class present in that window, unfiltered -- :func:`testable_windows` is what applies the
+        floor, because the figure and the test want different halves of the same split: the test
+        may only run on the classes that clear it, and the figure must draw the ones that do not,
+        or a cohort thinning out toward the edge of the axis simply disappears. ``meta`` holds what
+        each window publishes beside its test -- the centre, the classes excluded as too small, and
+        the floor they were excluded at. Both empty when the frame carries no windows at all.
+    """
+    samples: Dict[int, Dict[str, np.ndarray]] = {}
+    meta: Dict[int, Dict[str, Any]] = {}
+    if per_recording.empty or cohort.BIN_COLUMN not in getattr(per_recording, "columns", []):
+        return samples, meta
+    for bin_index in sorted(int(value) for value in per_recording[cohort.BIN_COLUMN].unique()):
+        cell = per_recording[per_recording[cohort.BIN_COLUMN] == bin_index]
+        values_by_class = _class_values(cell, column)
+        samples[int(bin_index)] = values_by_class
+        meta[int(bin_index)] = {
+            "bin_center_h": float(cell[cohort.BIN_CENTER_COLUMN].iloc[0]),
+            "groups_excluded_as_too_small": {
+                group: int(values.size) for group, values in values_by_class.items()
+                if values.size < shared_stats.MIN_GROUP_SIZE
+            },
+            "min_group_size": shared_stats.MIN_GROUP_SIZE,
+        }
+    return samples, meta
+
+
+def testable_windows(
+    samples: Dict[int, Dict[str, np.ndarray]]
+) -> Dict[int, Dict[str, np.ndarray]]:
+    """Drop the classes too small to test, keeping every window.
+
+    The window itself is kept even when nothing in it survives: a window that could not be tested
+    has to reach the output as such, or a reader cannot tell it from a window nobody looked at.
+
+    Args:
+        samples: The unfiltered cells from :func:`window_samples`.
+
+    Returns:
+        The same windows, each holding only the classes with at least ``MIN_GROUP_SIZE``
+        recordings.
+    """
+    return {
+        window: {
+            group: values for group, values in cell.items()
+            if values.size >= shared_stats.MIN_GROUP_SIZE
+        }
+        for window, cell in samples.items()
+    }
 
 
 def analyse_windows(
@@ -212,49 +292,17 @@ def analyse_windows(
             "method": METHOD,
         }
 
-    per_window: List[Dict[str, Any]] = []
-    samples_by_window: Dict[int, Dict[str, np.ndarray]] = {}
-    for bin_index in sorted(int(value) for value in per_recording[cohort.BIN_COLUMN].unique()):
-        cell = per_recording[per_recording[cohort.BIN_COLUMN] == bin_index]
-        usable, excluded = _class_samples(cell, column)
-        record: Dict[str, Any] = {
-            "time_bin": int(bin_index),
-            "bin_center_h": float(cell[cohort.BIN_CENTER_COLUMN].iloc[0]),
-            "groups_excluded_as_too_small": excluded,
-            "min_group_size": shared_stats.MIN_GROUP_SIZE,
-        }
-        if len(usable) >= 2:
-            record.update(shared_stats.kruskal_across_groups(usable))
-            samples_by_window[int(bin_index)] = usable
-        else:
-            record.update(
-                {
-                    "test": "kruskal-wallis",
-                    "n_groups": len(usable),
-                    "n_per_group": {name: int(values.size) for name, values in usable.items()},
-                    "statistic": float("nan"),
-                    "p_value": float("nan"),
-                    "note": "fewer than two classes had enough recordings in this window",
-                }
-            )
-        per_window.append(record)
+    # The cohort half of the job is this analysis's own: which classes are in a window, in which
+    # order, and which were too small to enter the test. The arithmetic half -- the omnibus, Holm
+    # across the windows and the pairwise sweep on the survivors -- is
+    # ``stats.windowed_group_comparisons``, shared with every other trajectory analysis in the
+    # family, so that "significant" has one definition here rather than one per pipeline.
+    samples_by_window, meta_by_window = window_samples(per_recording, column)
 
-    adjusted = shared_stats.holm_adjust([record["p_value"] for record in per_window])
-    n_tested = sum(1 for record in per_window if np.isfinite(record["p_value"]))
-    for record, value in zip(per_window, adjusted):
-        record["p_holm"] = float(value)
-        record["alpha"] = float(alpha)
-        record["correction"] = "holm"
-        record["n_windows_in_family"] = n_tested
-        record["significant"] = bool(np.isfinite(value) and value < float(alpha))
-
-    pairwise = {
-        str(record["time_bin"]): shared_stats.pairwise_comparisons(
-            samples_by_window[int(record["time_bin"])]
-        )
-        for record in per_window
-        if record["significant"]
-    }
+    outcome = shared_stats.windowed_group_comparisons(
+        testable_windows(samples_by_window), meta_by_window=meta_by_window, alpha=alpha
+    )
+    per_window = outcome["per_window"]
     significant = [record for record in per_window if record["significant"]]
     return {
         "metric_column": column,
@@ -264,11 +312,11 @@ def analyse_windows(
         "bin_width_hours": float(TRAJECTORY_BIN_HOURS),
         "classes": groups,
         "n_windows": len(per_window),
-        "n_windows_tested": n_tested,
+        "n_windows_tested": outcome["n_windows_tested"],
         "n_significant_windows": len(significant),
         "significant_bin_centers_h": [record["bin_center_h"] for record in significant],
         "per_window": per_window,
-        "pairwise": pairwise,
+        "pairwise": outcome["pairwise"],
         "pooled": pooled,
         "method": METHOD,
     }
@@ -457,6 +505,50 @@ def _draw_panel(ax: Any, rows: Sequence[Dict[str, Any]], axis: str, *, title: st
     return len(groups)
 
 
+def build_windows_figure(
+    class_frame: pd.DataFrame, records: Sequence[Dict[str, Any]]
+) -> Any:
+    """Draw what the trajectory is made of: the distributions, their significance and the effects.
+
+    The trajectory figure draws one number per (window, class) cell and the tests were run on the
+    values behind it; this draws both, on one axis, so a reader is not asked to hold a median in
+    mind while opening a CSV. The cells come from :func:`window_samples`, which is also where the
+    tested cells come from -- a violin drawn from one set of values under a $p$-value computed
+    from another is a page that disagrees with itself and looks entirely ordinary.
+
+    Args:
+        class_frame: The class-axis per-recording-per-window frame.
+        records: The significance records, in :data:`READOUTS` order.
+
+    Returns:
+        The figure; the caller renders and closes it.
+    """
+    present = (
+        sorted(set(class_frame["group"].astype(str)))
+        if len(class_frame) and "group" in class_frame.columns
+        else []
+    )
+    readouts = []
+    for (name, column, _), record in zip(READOUTS, records):
+        samples, _ = window_samples(class_frame, column)
+        # Aligned with the record's own window list by construction rather than by agreement, so
+        # a window the test skipped cannot shift the cells drawn under the windows after it.
+        order = [int(row["time_bin"]) for row in record.get("per_window") or []]
+        readouts.append((name, [samples.get(key, {}) for key in order], record))
+
+    return figures.windowed_comparison_figure(
+        readouts,
+        groups=cohort.ordered_groups(present, labels.CLASS_COLUMN),
+        bin_width=TRAJECTORY_BIN_HOURS,
+        # The same floor the test excludes a cell at, passed rather than defaulted, so the page
+        # and the p-values beneath it agree about which cells carry evidence.
+        min_body_size=shared_stats.MIN_GROUP_SIZE,
+        xlabel="Time before delivery (hours)",
+        ylabel="nats per anchor",
+        delivery_orientation=True,
+    )
+
+
 def _skip(reason: str, n_segments: int) -> Dict[str, Any]:
     """Return the recorded skip, and log it.
 
@@ -544,6 +636,11 @@ def run_time_to_delivery_analysis(
             build_trajectory_figure(rows, labels.CLASS_COLUMN), directory / TRAJECTORY_FIGURE
         ).name
     )
+    windows_name = str(
+        figures.render_to_pdf(
+            build_windows_figure(class_frame, significance), directory / WINDOWS_FIGURE
+        ).name
+    )
 
     n_recordings = int(tall["guid"].nunique()) if "guid" in tall.columns else 0
     logger.info(
@@ -578,6 +675,6 @@ def run_time_to_delivery_analysis(
         # Fanning the by-class and by-subgroup emitter over it would resolve a cut by a cut.
         "files": [
             TRAJECTORY_FILENAME, PER_RECORDING_FILENAME, SIGNIFICANCE_FILENAME,
-            PAIRWISE_FILENAME, figure_name,
+            PAIRWISE_FILENAME, figure_name, windows_name,
         ],
     }

@@ -16,7 +16,7 @@ test actually runs rather than at module load.
 """
 from __future__ import annotations
 
-from typing import Any, Dict, Iterable, List, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -38,6 +38,12 @@ DELTA_THRESHOLDS: Tuple[Tuple[float, str], ...] = (
     (0.330, "small"),
     (0.474, "medium"),
 )
+
+#: Recorded on a window that could not be tested at all. Deliberately says *groups* and *values*
+#: rather than naming a cohort or a unit: which groups were dropped and how large each was is on
+#: the caller's own exclusion record, which is the half a reader needs, and a note that named the
+#: caller's unit would be wrong for every other caller.
+TOO_FEW_GROUPS_NOTE = "fewer than two groups had enough values in this window"
 
 
 def holm_adjust(p_values: Sequence[float]) -> List[float]:
@@ -353,3 +359,112 @@ def pairwise_comparisons(samples: Dict[str, np.ndarray]) -> List[Dict[str, Any]]
             "delta_orientation": "positive means the left group's values run higher",
         })
     return records
+
+
+def windowed_group_comparisons(
+    samples_by_window: Mapping[Any, Mapping[str, np.ndarray]],
+    *,
+    meta_by_window: Optional[Mapping[Any, Mapping[str, Any]]] = None,
+    window_field: str = "time_bin",
+    alpha: float = 0.05,
+) -> Dict[str, Any]:
+    r"""Test a metric across groups **inside each window**, then correct across the windows.
+
+    The three layers every trajectory analysis in this repository runs, in this order and for
+    these reasons:
+
+    * **Per window**, an omnibus :func:`kruskal_across_groups`. Per window rather than pooled is
+      what makes the result a statement about the *trajectory*: it localises where the groups
+      differ instead of collapsing the whole axis into one number.
+    * **Holm across the windows**, which form one family. Twenty-five windows at
+      $\alpha = 0.05$ produce a false positive with near certainty by construction, and
+      :func:`holm_adjust` passes a non-finite $p$ through unchanged, so a window that could not be
+      tested does not consume a rank in the correction.
+    * **Pairwise** :func:`pairwise_comparisons`, for the windows that survived Holm **only**.
+      Running $\binom{k}{2}$ pairwise tests on a window whose omnibus found nothing is the
+      multiple-comparison problem with extra steps.
+
+    It lives here rather than in the analysis that needed it first because **five** callers now
+    need it -- two clocks in each of two evaluation packages, plus the ancestor -- and an analysis
+    may never import another. That is the same argument that put :func:`holm_adjust` here, and it
+    is sharper for a whole procedure than for one of its steps: three copies of this loop are
+    three definitions of what "significant" means, and nothing would keep them equal.
+
+    **The caller owns the population, this function owns the arithmetic.** Which groups are in a
+    window, in which order, and which were dropped for being too small are decisions about a
+    cohort; they are made before the call and recorded through ``meta_by_window``. This function
+    applies no :data:`MIN_GROUP_SIZE` floor of its own -- a window arriving with one usable group
+    is recorded as untestable, not silently filtered.
+
+    Args:
+        samples_by_window: Ordered mapping from a window key to that window's
+            ``{group: finite values}``. **Every** window belongs here, including those with fewer
+            than two usable groups: they must appear in the output, or a reader cannot tell a
+            window that found nothing from a window that was never looked at. Iteration order is
+            preserved, so a caller passing windows in axis order gets them back in axis order.
+        meta_by_window: Per-window fields merged into that window's record before the test keys --
+            the window's centre, the caller's exclusion record, whatever the caller publishes.
+        window_field: The key each record carries its own window identifier under. A parameter
+            rather than a fixed name because three record schemas are already published on disk
+            and pinned by tests, and renaming a column a reader has is an output change with no
+            reader behind it.
+        alpha: Family-wise error rate the Holm correction controls.
+
+    Returns:
+        ``per_window`` -- one record per window, in input order, carrying the identifier, the
+        caller's metadata, the omnibus result, and then ``p_holm``, ``alpha``, ``correction``,
+        ``n_windows_in_family`` and ``significant``; ``pairwise`` -- the comparisons of the
+        surviving windows, keyed by ``str(window key)``; and the three counts ``n_windows``,
+        ``n_windows_tested`` and ``n_significant_windows``. A window that could not be tested
+        carries ``NaN`` statistics and :data:`TOO_FEW_GROUPS_NOTE` -- never an exception, because
+        an untestable window is an ordinary outcome on a thin cohort.
+    """
+    metadata = dict(meta_by_window or {})
+    windows = list(samples_by_window)
+    per_window: List[Dict[str, Any]] = []
+    # Only the windows a pairwise sweep may run on, keyed by the caller's own window key rather
+    # than by the record's -- so a `meta_by_window` entry that happened to carry `window_field`
+    # cannot silently repoint the sweep at another window's samples.
+    testable: Dict[Any, Dict[str, np.ndarray]] = {}
+
+    for window in windows:
+        usable = dict(samples_by_window[window])
+        record: Dict[str, Any] = {window_field: window}
+        record.update(dict(metadata.get(window) or {}))
+        if len(usable) >= 2:
+            record.update(kruskal_across_groups(usable))
+            testable[window] = usable
+        else:
+            record.update({
+                "test": "kruskal-wallis",
+                "n_groups": len(usable),
+                "n_per_group": {
+                    group: int(np.asarray(values).size) for group, values in usable.items()
+                },
+                "statistic": float("nan"),
+                "p_value": float("nan"),
+                "note": TOO_FEW_GROUPS_NOTE,
+            })
+        per_window.append(record)
+
+    adjusted = holm_adjust([record["p_value"] for record in per_window])
+    n_tested = sum(1 for record in per_window if np.isfinite(record["p_value"]))
+    for record, value in zip(per_window, adjusted):
+        record["p_holm"] = float(value)
+        record["alpha"] = float(alpha)
+        record["correction"] = "holm"
+        record["n_windows_in_family"] = n_tested
+        record["significant"] = bool(np.isfinite(value) and value < float(alpha))
+
+    pairwise = {
+        str(window): pairwise_comparisons(testable[window])
+        for window, record in zip(windows, per_window)
+        if record["significant"]
+    }
+    return {
+        "per_window": per_window,
+        "pairwise": pairwise,
+        "n_windows": len(per_window),
+        "n_windows_tested": n_tested,
+        "n_significant_windows": sum(1 for record in per_window if record["significant"]),
+    }

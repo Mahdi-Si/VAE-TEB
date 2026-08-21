@@ -39,7 +39,9 @@ put the wrong claim on every lag figure in this package while changing no arithm
 """
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence
+
+import numpy as np
 
 from teb_vae.lag_attn_cfs.eval._reuse import figures, labels
 from teb_vae.lag_attn_cfs.eval.lag_axis import (
@@ -189,10 +191,12 @@ def caveat_note(figure, text: str = GROUP_DELAY_CAVEAT) -> None:
 
 #: The generic panels. Each takes an axes and draws into it, so a figure builder composes them
 #: rather than each analysis owning a layout.
+binned_violin_panel = figures.binned_violin_panel
 heatmap_with_colorbar = figures.heatmap_with_colorbar
 histogram_panel = figures.histogram_panel
 multi_line_panel = figures.multi_line_panel
 ribbon_plot = figures.ribbon_plot
+significance_strip = figures.significance_strip
 violin_panel = figures.violin_panel
 
 #: The grouped violin figure the by-class and by-subgroup variants are drawn with. The colours it
@@ -335,6 +339,182 @@ def group_colors(groups: Sequence[str]) -> Dict[str, str]:
     return resolved
 
 
+# =============================================================================
+# The windowed comparison page
+# =============================================================================
+#: Width in inches of the page below, wider than every other figure this seam builds. Its x axis
+#: carries one window per half hour of a whole labour, three violins deep; at the shared default of
+#: $9$ in the bodies of a twenty-five-window profile come out narrower than the marks drawn inside
+#: them, and the page stops being a distribution figure at all.
+WINDOWS_FIGURE_WIDTH = 13.0
+
+#: Height per row of that page. Every row is the same height because ``new_figure`` allots one, and
+#: the significance strips are the rows that would be thinner if it did not.
+WINDOWS_ROW_HEIGHT = 3.0
+
+
+def windowed_comparison_figure(
+    readouts: Sequence[Any],
+    *,
+    groups: Sequence[str],
+    bin_width: float,
+    min_body_size: int,
+    xlabel: str,
+    ylabel: str,
+    delivery_orientation: bool,
+    window_field: str = "time_bin",
+) -> Any:
+    r"""Build one clock's page: the distributions per window, their significance, and the effects.
+
+    Three questions, one page and one $x$ axis, because they are read together and reading them
+    across two files means holding a window's coordinate in mind while changing pages:
+
+    * **What is the distribution** behind each point of the trajectory -- a violin per (window,
+      cohort) cell over one value per recording;
+    * **is it anything** -- the Holm-adjusted $p$ of that window's omnibus, against $\alpha$,
+      directly beneath the violins it describes and on their coordinate;
+    * **does it matter** -- Cliff's delta for every cohort pair that survived, in the bottom row.
+
+    Built here rather than in an analysis because **both clocks draw it** and an analysis may not
+    import another; and composed out of the shared panels rather than owning its own marks, so a
+    violin here is the same mark as a violin anywhere else in the run.
+
+    **The orientation is the caller's, and it is the difference between the two clocks.** Time
+    before delivery decreases toward the event, so that axis is inverted and delivery sits at the
+    right. Time relative to second-stage onset is signed and reads naturally left to right, with
+    the onset marked where it falls.
+
+    Args:
+        readouts: One ``(name, cells, record)`` per readout. ``cells`` is that readout's
+            ``{group: values}`` per window, **positionally aligned** with the record's own
+            ``per_window`` list; ``record`` is the significance record the analysis produced.
+        groups: Cohort labels in the order they should be dodged, left to right.
+        bin_width: Window width in the x coordinate's units.
+        min_body_size: Fewest recordings a cell may have and still be drawn as a density; the
+            caller passes the same floor its test excludes a cell at.
+        xlabel: X-axis label, naming the clock and its sign convention.
+        ylabel: Y-axis label for the violin panels.
+        delivery_orientation: ``True`` inverts the axis so delivery sits at the right; ``False``
+            keeps the natural direction and marks $x = 0$.
+        window_field: The key each per-window record carries its window identifier under, matching
+            what the analysis passed to the shared inference.
+
+    Returns:
+        The figure, unsaved and unclosed -- the caller renders and closes it.
+
+    Raises:
+        ValueError: If a readout's cells and its record's windows are of different lengths, which
+            would draw one window's distribution under another window's $p$-value.
+    """
+    figure, axes = new_figure(
+        2 * max(len(readouts), 1) + 1,
+        height_per_row=WINDOWS_ROW_HEIGHT,
+        width=WINDOWS_FIGURE_WIDTH,
+    )
+    order = list(groups)
+    colours = group_colors(order)
+    effects: List[Dict[str, Any]] = []
+
+    for index, (name, cells, record) in enumerate(readouts):
+        per_window = list(record.get("per_window") or [])
+        windows = list(cells)
+        if len(windows) != len(per_window):
+            raise ValueError(
+                f"readout {name!r} carries {len(windows)} window(s) of values against "
+                f"{len(per_window)} tested window(s); they are positionally aligned, so a "
+                f"mismatch would draw one window's distribution under another window's p-value."
+            )
+        centres = [float(row["bin_center_h"]) for row in per_window]
+
+        violins = axes[2 * index, 0]
+        binned_violin_panel(
+            violins, windows, centres,
+            groups=order, bin_width=bin_width, min_body_size=min_body_size, colors=colours,
+            title=f"{name} per window, by {labels.CLASS_COLUMN}",
+            ylabel=ylabel,
+        )
+        strip = axes[2 * index + 1, 0]
+        significance_strip(
+            strip, centres, [row.get("p_holm", float("nan")) for row in per_window],
+            alpha=float(record.get("alpha", 0.05)),
+            bin_width=bin_width,
+            title=f"{name}: cohort difference per window (Kruskal-Wallis, Holm)",
+            xlabel=xlabel,
+        )
+        for axis in (violins, strip):
+            if delivery_orientation:
+                axis.invert_xaxis()
+            else:
+                axis.axvline(
+                    0.0, color=COLOR_GRAY, linestyle=":", linewidth=LINE_REGULAR, zorder=0
+                )
+
+        centre_by_key = {
+            str(row.get(window_field)): float(row["bin_center_h"]) for row in per_window
+        }
+        for key, comparisons in (record.get("pairwise") or {}).items():
+            for item in comparisons:
+                effects.append({
+                    "row": f"{name}: {item['left']} vs {item['right']}",
+                    "centre": centre_by_key.get(str(key), float("nan")),
+                    "delta": float(item.get("cliffs_delta", float("nan"))),
+                })
+
+    _draw_effect_heatmap(
+        figure, axes[-1, 0], effects, xlabel=xlabel, descending=delivery_orientation
+    )
+    return figure
+
+
+def _draw_effect_heatmap(
+    figure: Any,
+    ax: Any,
+    effects: Sequence[Dict[str, Any]],
+    *,
+    xlabel: str,
+    descending: bool,
+) -> None:
+    """Draw Cliff's delta for every surviving cohort pair, windows across and pairs down.
+
+    The column order follows the panels above rather than the natural sort, so a column of this
+    heatmap sits under the window it describes; the ancestor's version does not, and reading it
+    against its own bar panel means reversing one of the two by eye.
+
+    Args:
+        figure: The parent figure, for the colourbar.
+        ax: Target axes.
+        effects: ``{'row', 'centre', 'delta'}`` per surviving comparison.
+        xlabel: X-axis label, matching the panels above.
+        descending: Whether the windows run right to left, as the delivery clock does.
+    """
+    rows = sorted({str(item["row"]) for item in effects})
+    columns = sorted(
+        {float(item["centre"]) for item in effects if np.isfinite(item["centre"])},
+        reverse=bool(descending),
+    )
+    if not rows or not columns:
+        heatmap_with_colorbar(
+            figure, ax, np.zeros((0, 0)),
+            title="Cliff's delta (no window survived Holm)",
+            symmetric=True, colorbar_label="Cliff's delta",
+        )
+        return
+
+    field = np.full((len(rows), len(columns)), np.nan)
+    for item in effects:
+        if np.isfinite(item["centre"]):
+            field[rows.index(str(item["row"])), columns.index(float(item["centre"]))] = item["delta"]
+    heatmap_with_colorbar(
+        figure, ax, field,
+        title="Cliff's delta for the surviving cohort pairs",
+        symmetric=True, colorbar_label="Cliff's delta",
+    )
+    figures.label_rows(ax, rows)
+    ax.set_xticks(np.arange(len(columns)))
+    ax.set_xticklabels([f"{value:g}" for value in columns], fontsize=FONT_SMALL)
+    ax.set_xlabel(xlabel)
+
+
 __all__ = [
     "CLINICAL_CLASS_COLORS",
     "COEFFICIENT_LAG_AXIS_LABEL",
@@ -360,6 +540,9 @@ __all__ = [
     "STYLE_REFINEMENT",
     "SUBGROUP_COLORS",
     "SUBGROUP_TINT_RANGE",
+    "WINDOWS_FIGURE_WIDTH",
+    "WINDOWS_ROW_HEIGHT",
+    "binned_violin_panel",
     "caveat_note",
     "configure_figure_style",
     "group_colors",
@@ -370,6 +553,8 @@ __all__ = [
     "new_figure",
     "render_to_pdf",
     "ribbon_plot",
+    "significance_strip",
     "style_axes",
     "violin_panel",
+    "windowed_comparison_figure",
 ]

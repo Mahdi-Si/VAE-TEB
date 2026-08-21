@@ -89,7 +89,7 @@ from train.graph_models_utils import check_model_class, load_checkpoint_strict  
 PROBE_FILENAME = "loader_probe.json"
 
 #: Fields every evaluation batch must carry. The first eight are the model's own data contract; the
-#: next five are what the clinical questions are asked in, and each is silently absent from a batch
+#: next six are what the clinical questions are asked in, and each is silently absent from a batch
 #: whose shard does not hold it. ``source_file_basename`` is stamped by the dataset itself rather
 #: than requested, and is checked here because every by-subgroup table is keyed on it.
 #:
@@ -112,6 +112,7 @@ REQUIRED_BATCH_FIELDS: Tuple[str, ...] = (
     "cs_label",
     "bg_label",
     "time_from_labor_onset",
+    "second_stage_onset",
     "source_file_basename",
 )
 
@@ -322,6 +323,7 @@ def run_probe(
     sources: List[str] = []
     epochs: List[float] = []
     onsets: List[float] = []
+    second_stage: List[float] = []
     fields_seen: List[str] = []
     n_samples = 0
     n_batches = 0
@@ -383,6 +385,9 @@ def run_probe(
         onset = _field(batch, "time_from_labor_onset")
         if onset is not None:
             onsets.extend(_to_numpy(onset).ravel().tolist())
+        stage = _field(batch, "second_stage_onset")
+        if stage is not None:
+            second_stage.extend(_to_numpy(stage).ravel().tolist())
 
         n_samples += batch_size
 
@@ -415,6 +420,16 @@ def run_probe(
             "n_values": len(onsets),
             "n_nan": (
                 int(np.sum(~np.isfinite(np.asarray(onsets, dtype=np.float64)))) if onsets else 0
+            ),
+        },
+        # The same counted-not-dropped rule, for the second clock. A run whose shards
+        # carry the field but never populated it is a run whose second-stage analysis
+        # records a skip, and this is where that is visible before the analysis says so.
+        "second_stage_onset": {
+            "n_values": len(second_stage),
+            "n_nan": (
+                int(np.sum(~np.isfinite(np.asarray(second_stage, dtype=np.float64))))
+                if second_stage else 0
             ),
         },
         "max_batches": max_batches,
@@ -525,7 +540,10 @@ def _check_required_fields(seen: Sequence[str], required: Sequence[str]) -> None
         f"the batch is missing required field(s): {missing}. The loader SKIPS a field a shard does "
         f"not carry, silently, so this is either an absent "
         f"dataloader_config.dataset_kwargs.load_fields entry or a shard written without the field. "
-        f"Fields seen: {list(seen)}."
+        f"Fields seen: {list(seen)}. A shard set built before a field existed has two recoveries "
+        f"and no third: rebuild it with hdf5_dataset/new_pipeline/create_new_pipeline.py, which "
+        f"creates every field named here in every build, or drop the field from load_fields and "
+        f"lose the readouts asked in it."
     )
 
 
@@ -1027,6 +1045,11 @@ def format_cohort_table(record: Dict[str, Any]) -> str:
     if onset:
         lines.append(
             f"time_from_labor_onset: {onset['n_nan']} of {onset['n_values']} absent (NaN)"
+        )
+    stage = record.get("second_stage_onset") or {}
+    if stage:
+        lines.append(
+            f"second_stage_onset: {stage['n_nan']} of {stage['n_values']} absent (NaN)"
         )
     return "\n".join(lines)
 

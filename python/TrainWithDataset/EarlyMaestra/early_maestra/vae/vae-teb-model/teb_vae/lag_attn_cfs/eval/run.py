@@ -131,6 +131,7 @@ from teb_vae.lag_attn_cfs.eval.analyses import (  # noqa: E402
 )
 from teb_vae.lag_attn_cfs.eval.analyses import residual as residual_analysis  # noqa: E402
 from teb_vae.lag_attn_cfs.eval.analyses import samples as samples_analysis  # noqa: E402
+from teb_vae.lag_attn_cfs.eval.analyses import second_stage as second_stage_analysis  # noqa: E402
 from teb_vae.lag_attn_cfs.eval.analyses import (  # noqa: E402
     sufficiency as sufficiency_analysis,
 )
@@ -230,6 +231,10 @@ ANALYSIS_FUNCTIONS: Dict[str, Any] = {
     "distributions": distributions_analysis.run_distributions_analysis,
     "trajectory": trajectory_analysis.run_trajectory_analysis,
     "time_to_delivery": time_to_delivery_analysis.run_time_to_delivery_analysis,
+    # Immediately after the clock it mirrors, because the two answer one question against two
+    # landmarks and a reader meets them in that order. It scores fewer recordings -- only those the
+    # labour-onset table places a second stage for -- and declares itself capped for that reason.
+    "second_stage": second_stage_analysis.run_second_stage_analysis,
     # One readout of the sibling's three: contraction-conditioned coupling. The two that scored a
     # bpm waveform are absent and the analysis's own record names them.
     "events": events_analysis.run_events_analysis,
@@ -244,8 +249,8 @@ ANALYSIS_FUNCTIONS: Dict[str, Any] = {
 #: The **shared** analysis names, in run order, for a reader and for the second cfs cell to merge
 #: its own onto. Deliberately not what ``--only`` and ``--skip`` accept: selection runs against the
 #: registry a *binding* merges (:func:`merged_analysis_functions`), and this cell's own three are
-#: registered on ``CFS_BINDING`` rather than above, so a run of this package selects from eighteen
-#: names while this tuple holds fifteen.
+#: registered on ``CFS_BINDING`` rather than above, so a run of this package selects from nineteen
+#: names while this tuple holds sixteen.
 ANALYSES: Tuple[str, ...] = tuple(ANALYSIS_FUNCTIONS)
 
 
@@ -1673,7 +1678,7 @@ def build_parser() -> argparse.ArgumentParser:
     #
     # Interpolated from the registry the *default binding* merges rather than from the shared
     # ANALYSES tuple, because that merged registry is what `main` selects against: this cell's own
-    # three analyses are registered on CFS_BINDING, so a help text built from the shared fifteen
+    # three analyses are registered on CFS_BINDING, so a help text built from the shared sixteen
     # would tell an operator that `--only warmup` is invalid while the run accepts it.
     selectable = ", ".join(merged_analysis_functions(CFS_BINDING)) or "(none registered yet)"
     parser.add_argument(
@@ -1807,6 +1812,8 @@ RUN_ARGS: Dict[str, Any] = {
     #                     whole delivery on the absolute time axis.
     #   time_to_delivery: The readouts binned on a 0.5 h grid of time before delivery,
     #                     class-stratified, with Holm across windows.
+    #   second_stage:     The same two readouts on the second clinical clock -- signed hours from
+    #                     second-stage onset -- over the recordings that have one. Its own family.
     #   events:           Contraction-conditioned coupling. One readout of the raw pipeline's
     #                     three; the two that scored a bpm waveform have no analogue here.
     #   sufficiency:      What the latent bottleneck costs, against an evaluation-only oracle

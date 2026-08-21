@@ -45,11 +45,16 @@
     "latent": [
       "kl_spectrum.pdf"
     ],
+    "second_stage": [
+      "second_stage_trajectory.pdf",
+      "second_stage_windows.pdf"
+    ],
     "sufficiency": [
       "sufficiency.pdf"
     ],
     "time_to_delivery": [
-      "time_to_delivery_trajectory.pdf"
+      "time_to_delivery_trajectory.pdf",
+      "time_to_delivery_windows.pdf"
     ],
     "trajectory": [
       "trajectory_profile.pdf"

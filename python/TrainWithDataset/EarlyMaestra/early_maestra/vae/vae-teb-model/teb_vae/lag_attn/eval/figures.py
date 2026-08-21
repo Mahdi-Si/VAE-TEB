@@ -69,6 +69,7 @@ __all__ = [
     "COLOR_VERMILLION",
     "SAVE_DPI",
     "attach_lag_seconds_axis",
+    "binned_violin_panel",
     "configure_figure_style",
     "frequency_scatter",
     "get_class_colors",
@@ -82,6 +83,7 @@ __all__ = [
     "safe_vabs",
     "save_figure",
     "shade_warmup",
+    "significance_strip",
     "style_axes",
     "to_numpy",
     "violin_panel",
@@ -354,6 +356,42 @@ INNER_BOX_MEDIAN_EDGE_RATIO = 0.55
 INNER_BOX_WHISKER_IQR = 1.5
 
 
+def _draw_inner_box(ax: Any, centre: float, values: np.ndarray) -> None:
+    """Draw one violin's interior box: the whisker, the quartile bar and the median dot.
+
+    Extracted rather than inlined because **two** panels draw this mark -- the categorical
+    :func:`violin_panel` and the binned :func:`binned_violin_panel` -- and the repository is
+    better served by one visual vocabulary for "these are quartiles" than by two implementations
+    that happen to agree today. The statistics come from the same function ``Axes.boxplot``
+    computes its own from, so the whisker rule here and on any box plot elsewhere cannot drift
+    apart; only the drawing is ours, and only because ``Axes.boxplot`` sizes its box in data
+    units. See the weight constants above for why the marks are weighted in points.
+
+    Args:
+        ax: Target axes.
+        centre: Where on the category or value axis the mark sits.
+        values: That cell's values, already reduced to the finite ones -- ``boxplot_stats``
+            propagates a ``NaN`` into every quantile it computes.
+    """
+    weight = float(plt.rcParams["lines.linewidth"])
+    box = cbook.boxplot_stats(
+        [np.asarray(values, dtype=np.float64)], whis=INNER_BOX_WHISKER_IQR
+    )[0]
+    ax.vlines(
+        centre, box["whislo"], box["whishi"], color=COLOR_BLACK,
+        linewidth=weight * INNER_BOX_WHISKER_WEIGHT_RATIO, zorder=3,
+    )
+    ax.vlines(
+        centre, box["q1"], box["q3"], color=COLOR_BLACK,
+        linewidth=weight * INNER_BOX_BAR_WEIGHT_RATIO, zorder=3,
+    )
+    ax.plot(
+        [centre], [box["med"]], marker="o", markersize=INNER_BOX_MEDIAN_MARKERSIZE,
+        markerfacecolor="white", markeredgecolor=COLOR_BLACK,
+        markeredgewidth=weight * INNER_BOX_MEDIAN_EDGE_RATIO, zorder=4,
+    )
+
+
 def violin_panel(
     ax: Any,
     samples: Any,
@@ -435,26 +473,10 @@ def violin_panel(
         body.set_edgecolor(COLOR_BLACK)
         body.set_linewidth(0.4)
 
-    # The interior. The statistics come from the same function ``Axes.boxplot`` computes its own
-    # from, so the whisker rule here and on any box plot elsewhere in the repository cannot drift
-    # apart -- it is a convention with an edge case worth not owning twice, ending at the most
-    # extreme *observation* inside the fence rather than at the fence. Only the drawing is ours,
-    # and only because ``Axes.boxplot`` sizes its box in data units; see the weights above.
-    weight = float(plt.rcParams["lines.linewidth"])
-    for centre, box in zip(centres, cbook.boxplot_stats(drawn, whis=INNER_BOX_WHISKER_IQR)):
-        ax.vlines(
-            centre, box["whislo"], box["whishi"], color=COLOR_BLACK,
-            linewidth=weight * INNER_BOX_WHISKER_WEIGHT_RATIO, zorder=3,
-        )
-        ax.vlines(
-            centre, box["q1"], box["q3"], color=COLOR_BLACK,
-            linewidth=weight * INNER_BOX_BAR_WEIGHT_RATIO, zorder=3,
-        )
-        ax.plot(
-            [centre], [box["med"]], marker="o", markersize=INNER_BOX_MEDIAN_MARKERSIZE,
-            markerfacecolor="white", markeredgecolor=COLOR_BLACK,
-            markeredgewidth=weight * INNER_BOX_MEDIAN_EDGE_RATIO, zorder=4,
-        )
+    # The interior, one mark per populated group, drawn by the helper the binned panel shares --
+    # a convention with an edge case worth not owning twice.
+    for centre, values in zip(centres, drawn):
+        _draw_inner_box(ax, centre, values)
 
     if reference is not None and np.isfinite(reference):
         ax.axhline(float(reference), color=COLOR_GRAY, linestyle=":", linewidth=plt.rcParams["lines.linewidth"],
@@ -462,6 +484,294 @@ def violin_panel(
         ax.legend(loc="best")
     style_axes(ax)
     return len(populated)
+
+
+#: How much of its slot a violin body occupies, leaving a gap between adjacent groups. The same
+#: fraction :func:`violin_panel` uses for its categorical bodies, so the two figures read alike.
+BINNED_BODY_FRACTION = 0.8
+
+
+def binned_violin_panel(
+    ax: Any,
+    samples_by_window: Sequence[Any],
+    centres: Sequence[float],
+    *,
+    groups: Sequence[str],
+    bin_width: float,
+    min_body_size: int,
+    colors: Optional[Any] = None,
+    color: str = COLOR_BLUE,
+    title: str = "",
+    xlabel: str = "",
+    ylabel: str = "",
+) -> int:
+    r"""Draw one violin per (window, group) cell on a **numeric** axis, dodged inside each window.
+
+    :func:`violin_panel` puts one violin per group on a category axis; this puts $k$ of them
+    inside every window of a continuous coordinate, which is what turns a trajectory of medians
+    into a trajectory of *distributions*. The median line a trajectory figure draws is one number
+    per cell, and three cohorts with the same median can be a uniform shift, a heavier tail, or a
+    handful of recordings the model fails on completely -- three different findings that only the
+    body shows.
+
+    **The dodge is computed from the group count of the whole figure, not of the window.** Group
+    $i$ of $k$ sits at
+
+    $$x = c + \left(i - \frac{k - 1}{2}\right)\frac{w}{k + 1}$$
+
+    with a body $0.8\,w/(k+1)$ wide. Taking $k$ from the figure is what makes a cohort absent from
+    one window leave a **gap** there rather than shift its neighbours into its place -- the same
+    rule :func:`violin_panel` follows when it keeps an empty group's slot, and for the same
+    reason: a mark that moves between windows cannot be compared across them.
+
+    **A cell too thin for a density draws its values instead.** Below ``min_body_size`` -- and
+    whenever a cell's values are all equal, which is a singular covariance the kernel estimator
+    cannot invert -- the points are plotted directly. matplotlib evaluates a violin's kernel
+    density between the data's own extremes, so a "distribution" over two values is a shape the
+    smoother invented; and the caller's test excludes exactly those cells, so the figure and the
+    test agree about which cells carry evidence.
+
+    **Every cell is annotated with its count.** That is what a violin hides at this size: a cell's
+    body can move because the population changed rather than because the quantity did, and the
+    only thing that says which is the number behind it.
+
+    Args:
+        ax: Target axes.
+        samples_by_window: One ``{group: values}`` mapping per window, **positionally aligned**
+            with ``centres`` -- the same per-window shape
+            :func:`~teb_vae.lag_attn.eval.stats.windowed_group_comparisons` takes, so a caller
+            builds it once and tests and draws the same cells.
+        centres: The window centres, in the order they should be drawn.
+        groups: The group labels in the order they should be dodged, left to right. A group with
+            no data anywhere still occupies its slot.
+        bin_width: Window width in the x coordinate's own units, which sets the dodge and the
+            body width.
+        min_body_size: Fewest values a cell may have and still be drawn as a density. **Required**
+            rather than defaulted, because it has to be the same number the caller excludes a cell
+            from its test at, and a default here would be a second definition of that threshold.
+        colors: Optional label-to-colour mapping, so a caller's own cohort palette reaches the
+            bodies rather than this module's default.
+        color: Body colour for a label the mapping does not cover.
+        title: Panel title.
+        xlabel: X-axis label.
+        ylabel: Y-axis label.
+
+    Returns:
+        The number of cells that had at least one finite value. Zero draws :data:`EMPTY_NOTE`
+        instead of an empty frame.
+
+    Raises:
+        ValueError: If ``samples_by_window`` and ``centres`` are of different lengths. Zipping the
+            shorter of the two would silently drop windows off the figure while every axis label
+            still said they were there.
+    """
+    windows = list(samples_by_window)
+    positions_x = [float(value) for value in centres]
+    if len(windows) != len(positions_x):
+        raise ValueError(
+            f"binned_violin_panel got {len(windows)} window(s) of samples and "
+            f"{len(positions_x)} centre(s); they are positionally aligned, so a mismatch would "
+            f"draw one window's values at another window's coordinate."
+        )
+
+    ax.set_title(title)
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
+
+    order = [str(group) for group in groups]
+    if not order or not windows:
+        _note_empty(ax)
+        style_axes(ax)
+        return 0
+
+    slot = float(bin_width) / float(len(order) + 1)
+    palette = dict(colors or {})
+    # Passed through rather than scaled: outside a styled run this rcParam is the string
+    # ``'medium'``, which matplotlib resolves for itself and arithmetic cannot.
+    label_size = plt.rcParams["xtick.labelsize"]
+    populated = 0
+    legend: list = []
+
+    for index, group in enumerate(order):
+        offset = (float(index) - (len(order) - 1) / 2.0) * slot
+        colour = palette.get(group, color)
+        bodies: list = []
+        body_positions: list = []
+        point_x: list = []
+        point_y: list = []
+        for centre, samples in zip(positions_x, windows):
+            values = _finite((samples or {}).get(group, []))
+            if values.size == 0:
+                continue
+            populated += 1
+            x = centre + offset
+            # A constant cell is not merely thin: ``gaussian_kde`` inverts a covariance that is
+            # singular there and raises, which would take down the figure at its final step.
+            if values.size >= int(min_body_size) and float(np.ptp(values)) > 0.0:
+                bodies.append(values)
+                body_positions.append(x)
+            else:
+                point_x.extend([x] * int(values.size))
+                point_y.extend(values.tolist())
+            ax.annotate(
+                str(int(values.size)), (x, float(values.max())),
+                textcoords="offset points", xytext=(0, 2), ha="center",
+                fontsize=label_size, color=colour,
+            )
+
+        if bodies:
+            parts = ax.violinplot(
+                bodies,
+                positions=body_positions,
+                widths=BINNED_BODY_FRACTION * slot,
+                showmedians=False,
+                showextrema=False,
+            )
+            for body in parts["bodies"]:
+                body.set_facecolor(colour)
+                body.set_alpha(0.65)
+                body.set_edgecolor(COLOR_BLACK)
+                body.set_linewidth(0.4)
+            for position, values in zip(body_positions, bodies):
+                _draw_inner_box(ax, position, values)
+        if point_x:
+            ax.plot(
+                point_x, point_y, marker="o", linestyle="none",
+                markersize=plt.rcParams["lines.markersize"], color=colour,
+                markeredgewidth=0.0, alpha=0.85,
+            )
+        legend.append((group, colour))
+
+    if populated == 0:
+        _note_empty(ax)
+        style_axes(ax)
+        return 0
+
+    # Proxy handles rather than the bodies themselves: a violin collection carries no usable
+    # legend entry, and a group drawn only as points would otherwise be missing from the key.
+    for group, colour in legend:
+        ax.plot([], [], marker="s", linestyle="none", color=colour, label=group)
+    ax.legend(loc="best")
+    # Half a window of padding, so the outermost bodies are not clipped by the data limits.
+    ax.set_xlim(min(positions_x) - float(bin_width), max(positions_x) + float(bin_width))
+    style_axes(ax)
+    return populated
+
+
+#: Smallest $p$ the strip below will take a logarithm of. A rank test returns an exact zero at
+#: large $n$, and $-\log_{10} 0$ is an infinite bar that rescales the axis until every other
+#: window is a flat line -- so the one window with the strongest evidence would erase the evidence
+#: everywhere else.
+P_VALUE_FLOOR = 1e-300
+
+#: How much of a window the significance bar occupies. Narrower than a violin body on purpose: the
+#: strip is read against its own threshold line, not compared bar to bar.
+SIGNIFICANCE_BAR_FRACTION = 0.4
+
+
+def significance_strip(
+    ax: Any,
+    centres: Sequence[float],
+    p_holm: Sequence[float],
+    *,
+    alpha: float,
+    bin_width: float,
+    title: str = "",
+    xlabel: str = "",
+) -> int:
+    r"""Draw the corrected significance of each window as $-\log_{10} p$ against its threshold.
+
+    $$-\log_{10}\tilde{p} \quad\text{against}\quad -\log_{10}\alpha$$
+
+    A bar above the line is a window that survived the correction. This is the repository's
+    established mark for "is there anything there" -- the cross-subgroup heatmap's upper panel and
+    the ancestor's trajectory significance figure both draw it -- and it is preferred to asterisk
+    codes because it shows *how far* past the threshold a window is, which a reader otherwise has
+    to fetch from the CSV.
+
+    **The adjusted $p$ is the one to pass.** The raw per-window $p$ drawn against $\alpha$ would
+    report a family of one for every window of a family of twenty-five.
+
+    Args:
+        ax: Target axes.
+        centres: The window centres, in drawing order.
+        p_holm: The Holm-adjusted $p$ per window, positionally aligned with ``centres``.
+            A non-finite entry is a window that could not be tested: it gets **no bar** -- a zero
+            height would read as a window with no evidence -- and a grey cross at zero instead,
+            so that "found nothing" and "never looked at" are distinguishable on the page and not
+            only in the table.
+        alpha: The family-wise error rate the correction controls; drawn as the threshold line.
+        bin_width: Window width in the x coordinate's own units, which sets the bar width.
+        title: Panel title.
+        xlabel: X-axis label.
+
+    Returns:
+        The number of bars drawn -- the count of windows that were testable at all. Zero draws
+        :data:`EMPTY_NOTE`.
+
+    Raises:
+        ValueError: If ``centres`` and ``p_holm`` are of different lengths, which would draw one
+            window's evidence at another window's coordinate.
+    """
+    positions = [float(value) for value in centres]
+    values = [float(value) for value in p_holm]
+    if len(positions) != len(values):
+        raise ValueError(
+            f"significance_strip got {len(positions)} centre(s) and {len(values)} p-value(s); "
+            f"they are positionally aligned, so a mismatch would draw one window's evidence at "
+            f"another window's coordinate."
+        )
+
+    ax.set_title(title)
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel("$-\\log_{10}$ Holm-adjusted $p$")
+
+    testable = [
+        (position, value) for position, value in zip(positions, values) if np.isfinite(value)
+    ]
+    # The windows that could not be tested, marked rather than left blank. A window whose bar is
+    # absent because its p is 1 and a window that was never tested are different statements, and
+    # at any realistic window count they are otherwise the same empty stretch of axis: on a
+    # twenty-two-window profile with eight surviving bars, a reader cannot tell whether the other
+    # fourteen found nothing or were never looked at.
+    untestable = [
+        position for position, value in zip(positions, values) if not np.isfinite(value)
+    ]
+    if untestable:
+        ax.plot(
+            untestable, np.zeros(len(untestable)), marker="x", linestyle="none",
+            markersize=plt.rcParams["lines.markersize"], color=COLOR_GRAY,
+            markeredgewidth=plt.rcParams["lines.linewidth"] * 0.6,
+            label="not testable", zorder=3,
+        )
+    if not testable:
+        _note_empty(ax)
+        if untestable:
+            ax.legend(loc="best")
+        style_axes(ax)
+        return 0
+
+    heights = -np.log10(
+        np.clip(np.array([value for _, value in testable], dtype=np.float64), P_VALUE_FLOOR, 1.0)
+    )
+    ax.bar(
+        [position for position, _ in testable],
+        heights,
+        width=SIGNIFICANCE_BAR_FRACTION * float(bin_width),
+        color=COLOR_BLUE,
+        alpha=0.85,
+    )
+    ax.axhline(
+        -np.log10(float(alpha)),
+        color=COLOR_VERMILLION,
+        linestyle="--",
+        linewidth=plt.rcParams["lines.linewidth"],
+        label=f"alpha = {float(alpha):g} (Holm-adjusted)",
+    )
+    ax.legend(loc="best")
+    ax.set_xlim(min(positions) - float(bin_width), max(positions) + float(bin_width))
+    style_axes(ax)
+    return len(testable)
 
 
 def group_colors(groups: Sequence[str]) -> dict:

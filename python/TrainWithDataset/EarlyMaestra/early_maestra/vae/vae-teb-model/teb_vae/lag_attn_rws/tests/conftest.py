@@ -372,6 +372,16 @@ MULTI_CLASS_SUBGROUPS: Dict[str, int] = {
 #: so at two recordings per shard every cohort is excluded and the by-subgroup and by-class tests
 #: could only ever be exercised as skips.
 MULTI_CLASS_GUIDS_PER_SHARD = 3
+
+#: Which of a shard's written segments the second stage begins at, and the shard whose first
+#: recording carries an onset equal to delivery itself. Both exist so that the second clock's
+#: two awkward cases -- a segment after onset, and the "onset at delivery" sentinel that passes
+#: a NaN filter -- are live in the fixture rather than only in hand-built frames.
+MULTI_CLASS_SECOND_STAGE_INDEX = 2
+#: Named from :data:`MULTI_CLASS_SUBGROUPS` rather than written out: this fixture carries four of
+#: the canonical eight, and a sentinel pointed at one of the other four would never fire while
+#: every assertion about it still passed.
+MULTI_CLASS_SECOND_STAGE_SENTINEL_SHARD = "acidosis_cs"
 MULTI_CLASS_SEGMENTS_PER_GUID = 2
 
 #: On-disk decimated length, and the decimated steps ``trim_minutes: 1.0`` removes from each end
@@ -653,6 +663,24 @@ def write_multi_class_shards(
         if subgroup == "hie_no_cs":
             onset[MULTI_CLASS_SEGMENTS_PER_GUID:] = np.nan
 
+        # The second clinical clock, stored as the real pipeline stores it: the signed
+        # `domain_start - t_sso`, negative before second-stage onset and positive after. The onset
+        # is placed INSIDE this shard's own epoch span so its segments land on both sides of it --
+        # the positive half of that axis is otherwise never exercised. Every shard uses the same
+        # index, so the eight of them put their recordings in the same few second-stage windows,
+        # which is what lets a per-class window reach the MIN_GROUP_SIZE floor at three recordings
+        # per shard.
+        second_stage = epochs - epochs[MULTI_CLASS_SECOND_STAGE_INDEX]
+        if subgroup == "hie_no_cs":
+            # The recordings the labour-onset table has never heard of, so one shard tells one
+            # story about a cohort with no clinical times rather than two.
+            second_stage = np.full((per_shard,), np.nan, dtype="f4")
+        elif subgroup == MULTI_CLASS_SECOND_STAGE_SENTINEL_SHARD:
+            # Implied onset = epoch - offset = 0: second stage recorded at delivery, which is what
+            # a pipeline writes when it substitutes zero for a missing time. Counted, never
+            # excluded -- so the count has to be non-zero somewhere.
+            second_stage[:MULTI_CLASS_SEGMENTS_PER_GUID] = epochs[:MULTI_CLASS_SEGMENTS_PER_GUID]
+
         # The drifting level, on the decimated grid, and the raw signal built around it. Off by
         # default: `level` is then identically zero and `fhr` is the white noise every plumbing
         # test has always seen.
@@ -706,6 +734,7 @@ def write_multi_class_shards(
             handle.create_dataset("target", data=(float(code) * weight).astype("f4"))
             handle.create_dataset("epoch", data=epochs)
             handle.create_dataset("time_from_labor_onset", data=onset.astype("f4"))
+            handle.create_dataset("second_stage_onset", data=second_stage.astype("f4"))
             cs_label, bg_label = subgroup_labels(subgroup)
             handle.create_dataset("cs_label", data=np.full((per_shard,), cs_label, dtype="u1"))
             handle.create_dataset("bg_label", data=np.full((per_shard,), bg_label, dtype="u1"))

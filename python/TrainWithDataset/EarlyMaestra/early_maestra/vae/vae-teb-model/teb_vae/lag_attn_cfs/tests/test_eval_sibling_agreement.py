@@ -40,6 +40,7 @@ from teb_vae.lag_attn_cfs.eval import run as run_module
 from teb_vae.lag_attn_cfs.eval._reuse import labels
 from teb_vae.lag_attn_cfs.eval.analyses import latent as latent_analysis
 from teb_vae.lag_attn_cfs.eval.analyses import perm_control as perm_control_analysis
+from teb_vae.lag_attn_cfs.eval.analyses import second_stage as second_stage_analysis
 from teb_vae.lag_attn_cfs.eval.analyses import sufficiency as sufficiency_analysis
 from teb_vae.lag_attn_cfs.eval.analyses import time_to_delivery as ttd_analysis
 from teb_vae.lag_attn_rws.eval import analyses as sibling_analyses
@@ -54,6 +55,9 @@ from teb_vae.lag_attn_rws.eval.analyses import (  # noqa: F401
 )
 from teb_vae.lag_attn_rws.eval.analyses import (
     perm_control as sibling_perm_control_analysis,
+)
+from teb_vae.lag_attn_rws.eval.analyses import (
+    second_stage as sibling_second_stage_analysis,
 )
 from teb_vae.lag_attn_rws.eval.analyses import time_to_delivery as sibling_ttd_analysis
 
@@ -166,6 +170,38 @@ def test_the_time_axis_bins_identically_in_both_packages(per_sample) -> None:
 
     pd.testing.assert_frame_equal(mine, theirs)
     assert mine[cohort.BIN_COLUMN].nunique() == 4
+
+
+def test_the_second_clock_bins_identically_in_both_packages() -> None:
+    """The second axis is the first one's mirror, and it has to be the *same* mirror in both: a
+    sign or a clip that drifted would put one package's second-stage windows on the other side of
+    onset from the other's, under the same labels."""
+    frame = pd.DataFrame(
+        {cohort.SECOND_STAGE_COLUMN: [-7200.0, -1800.0, 0.0, 1800.0, 7200.0, float("nan")]}
+    )
+
+    mine = cohort.add_second_stage_bins(frame)
+    theirs = sibling_cohort.add_second_stage_bins(frame)
+
+    pd.testing.assert_frame_equal(mine, theirs)
+    # Non-vacuity: the fixture spans both sides of onset and drops the one unusable row.
+    assert len(mine) == 5
+    assert min(mine[cohort.SECOND_STAGE_BIN_COLUMN]) < 0 < max(mine[cohort.SECOND_STAGE_BIN_COLUMN])
+
+
+def test_the_two_cohort_modules_are_one_file_with_one_import_line() -> None:
+    """The same guard the two ``time_to_delivery`` modules carry, for the module that defines what
+    a window *is* on either clock. The behavioural assertions around it compare one function at a
+    time; this is what makes the ``equivalent`` claim cover the file."""
+    mine = _comparable_source(cohort)
+    theirs = _comparable_source(sibling_cohort)
+
+    assert mine == theirs, (
+        "the two forks' cohort.py have drifted apart. Port the change to the other fork in the "
+        "same commit, or reclassify the module in divergences.json and delete this assertion "
+        "there and here together."
+    )
+    assert mine.replace("TRAJECTORY_BIN_HOURS", "BIN_HOURS", 1) != theirs
 
 
 def test_the_population_record_is_assembled_the_same_way(per_sample) -> None:
@@ -504,6 +540,45 @@ def test_the_time_before_delivery_grid_and_its_readouts_are_the_same_in_both_pac
     assert len(mine[labels.CLASS_COLUMN]) == 20
 
 
+def _comparable_source(module) -> str:
+    """One fork's module source, normalised so the other fork's copy can be compared with it.
+
+    Two normalisations and no more: the line endings, because the two files are written by
+    different tools at different times, and the package name on the import lines, which is the one
+    difference a fork of a target-domain-free module is *allowed* to have. Everything else --
+    a docstring, a constant, a panel, a filename -- compares literally.
+    """
+    import inspect
+    from pathlib import Path
+
+    text = Path(inspect.getfile(module)).read_text(encoding="utf-8").replace("\r\n", "\n")
+    return text.replace("lag_attn_rws", "<package>").replace("lag_attn_cfs", "<package>")
+
+
+def test_the_two_time_to_delivery_modules_are_one_file_with_two_import_lines() -> None:
+    """The assertion the behavioural ones cannot make.
+
+    Comparing records and frames catches an *arithmetic* divergence, and that is what the two
+    assertions around this one do. It cannot catch a figure, a filename or a returned ``files``
+    entry that exists in one fork and not the other -- and those are what a copy actually drifts
+    by, because they are added to whichever fork the work happened in. The modules are byte
+    copies of each other and the manifest classifies them ``equivalent``; this is what makes that
+    claim mean the whole file rather than the parts a test happens to reach.
+    """
+    mine = _comparable_source(ttd_analysis)
+    theirs = _comparable_source(sibling_ttd_analysis)
+
+    assert mine == theirs, (
+        "the two forks' time_to_delivery.py have drifted apart. Port the change to the other "
+        "fork in the same commit, or -- if the divergence is deliberate -- reclassify the module "
+        "in divergences.json and delete this assertion there and here together."
+    )
+    # Non-vacuity, exercised against a mutated copy rather than by editing a module: a normalisation
+    # that flattened the sources to nothing would satisfy the equality above.
+    assert mine.replace("READOUTS", "READOUT_S", 1) != theirs
+    assert len(mine.splitlines()) > 300
+
+
 def test_the_three_layers_of_inference_reach_the_same_verdicts(time_axis_frame) -> None:
     """Kruskal per window, Holm across the windows, pairwise on the survivors. Compared as whole
     records so a divergence in any layer -- the omnibus, the correction, or which windows the
@@ -520,6 +595,116 @@ def test_the_three_layers_of_inference_reach_the_same_verdicts(time_axis_frame) 
     assert my_record["n_windows_tested"] == 2
     assert my_record["n_significant_windows"] == 2
 
+
+
+
+# =================================================================================================
+# analyses/second_stage.py -- the second clinical clock, asked identically in both cells
+# =================================================================================================
+@pytest.fixture
+def second_stage_frame() -> pd.DataFrame:
+    """Two classes either side of an onset, with enough recordings per class for the tests to run.
+
+    A recording's implied onset is ``epoch - second_stage_onset`` and is a property of the
+    recording, so the two fields move together here rather than independently: a fixture whose
+    epochs stood still would report every recording's onset inconsistent, and the two packages
+    would agree about a diagnostic instead of about a trajectory.
+
+    The values are separated between the classes on purpose -- an implementation that binned or
+    reduced differently would still produce *a* trajectory on an undifferentiated frame.
+    """
+    rows = []
+    onset_epoch = -4.0 * 3600.0
+    for offset, name in ((0.0, "healthy"), (50.0, "acidosis")):
+        for recording in range(5):
+            for segment, hours in enumerate((-1.0, 1.0)):
+                rows.append(
+                    {
+                        "guid": f"{name}_{recording:02d}",
+                        "epoch": onset_epoch + hours * 3600.0,
+                        cohort.SECOND_STAGE_COLUMN: hours * 3600.0,
+                        labels.CLASS_COLUMN: name,
+                        labels.SUBGROUP_COLUMN: f"{name}_shard",
+                        "mc_pred_gap": offset + float(recording) + 0.1 * segment,
+                        "source_conditioned_kl_raw": offset + float(recording),
+                    }
+                )
+    # One recording the labour-onset table has never heard of, so the eligibility rule is exercised
+    # rather than merely present: both packages must drop it, and both must say so the same way.
+    rows.append(
+        {
+            "guid": "no_onset_00", "epoch": onset_epoch,
+            cohort.SECOND_STAGE_COLUMN: float("nan"),
+            labels.CLASS_COLUMN: "hie", labels.SUBGROUP_COLUMN: "hie_shard",
+            "mc_pred_gap": 1.0, "source_conditioned_kl_raw": 1.0,
+        }
+    )
+    return pd.DataFrame(rows)
+
+
+def test_the_second_stage_clock_reaches_the_same_verdicts(second_stage_frame) -> None:
+    """The eligibility rule, the signed binning, the per-recording reduction and all three layers of
+    inference. Compared as whole records so a divergence in any layer -- who was admitted, which
+    window a segment landed in, the omnibus, the correction, or which windows the pairwise tests
+    were allowed to run on -- fails here rather than in one run's summary."""
+    assert second_stage_analysis.TRAJECTORY_BIN_HOURS == (
+        sibling_second_stage_analysis.TRAJECTORY_BIN_HOURS
+    )
+    assert second_stage_analysis.DEFAULT_ALPHA == sibling_second_stage_analysis.DEFAULT_ALPHA
+    assert second_stage_analysis.READOUTS == sibling_second_stage_analysis.READOUTS
+    assert second_stage_analysis.METHOD == sibling_second_stage_analysis.METHOD
+    assert second_stage_analysis.AXIS_LABEL == sibling_second_stage_analysis.AXIS_LABEL
+
+    my_eligibility, mine = second_stage_analysis.eligible_rows(second_stage_frame)
+    their_eligibility, theirs = sibling_second_stage_analysis.eligible_rows(second_stage_frame)
+
+    pd.testing.assert_frame_equal(my_eligibility, their_eligibility)
+    assert second_stage_analysis.eligibility_summary(my_eligibility) == (
+        sibling_second_stage_analysis.eligibility_summary(their_eligibility)
+    )
+
+    my_frames = second_stage_analysis.build_per_recording(mine)
+    their_frames = sibling_second_stage_analysis.build_per_recording(theirs)
+    assert sorted(my_frames) == sorted(their_frames)
+    for axis in my_frames:
+        pd.testing.assert_frame_equal(my_frames[axis], their_frames[axis])
+
+    my_record = second_stage_analysis.analyse_windows(
+        my_frames[labels.CLASS_COLUMN], "mc_pred_gap"
+    )
+    their_record = sibling_second_stage_analysis.analyse_windows(
+        their_frames[labels.CLASS_COLUMN], "mc_pred_gap"
+    )
+
+    assert my_record == their_record
+    # Not vacuous: the one recording with no onset was dropped, the ten that remain landed either
+    # side of the onset, and both windows are fifty nats apart so both must survive Holm. Two
+    # implementations that both refused to test anything would otherwise compare equal.
+    assert second_stage_analysis.eligibility_summary(my_eligibility)["n_dropped_no_onset"] == 1
+    assert len(my_frames[labels.CLASS_COLUMN]) == 20
+    assert my_record["n_windows_tested"] == 2
+    assert my_record["n_significant_windows"] == 2
+    assert my_record["significant_bin_centers_h"] == pytest.approx([-0.75, 1.25])
+
+
+def test_the_two_second_stage_modules_are_one_file_with_two_import_lines() -> None:
+    """The same guard the two ``time_to_delivery`` modules carry, and for the same reason: the
+    behavioural assertion above catches an arithmetic divergence, and cannot catch a figure, a
+    filename or a returned ``files`` entry that exists in one fork and not the other -- which is
+    what a copy actually drifts by, because those are added to whichever fork the work happened in.
+    """
+    mine = _comparable_source(second_stage_analysis)
+    theirs = _comparable_source(sibling_second_stage_analysis)
+
+    assert mine == theirs, (
+        "the two forks' second_stage.py have drifted apart. Port the change to the other fork in "
+        "the same commit, or -- if the divergence is deliberate -- reclassify the module in "
+        "divergences.json and delete this assertion there and here together."
+    )
+    # Non-vacuity, exercised against a mutated copy rather than by editing a module: a normalisation
+    # that flattened the sources to nothing would satisfy the equality above.
+    assert mine.replace("AXIS_LABEL", "AXIS_LABLE", 1) != theirs
+    assert len(mine.splitlines()) > 300
 
 # =================================================================================================
 # analyses/sufficiency.py -- the same three scores, the same two gaps, the same join key
