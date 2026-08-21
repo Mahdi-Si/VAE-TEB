@@ -357,6 +357,207 @@ def test_the_figure_annotates_each_window_with_its_recording_count_in_the_cohort
     }
 
 
+def _window_rows(
+    *,
+    n_by_class=(("healthy", 5), ("acidosis", 5)),
+    window_offsets=((1.0, 0.0), (3.0, 50.0)),
+    segments: int = 1,
+) -> List[Dict[str, Any]]:
+    """Two classes over two windows, each window carrying its own separation between them.
+
+    Args:
+        n_by_class: ``(class, recordings)`` pairs. The first class is the reference; every other
+            is shifted by the window's offset.
+        window_offsets: ``(hours before delivery, separation)`` per window.
+        segments: Segments each recording contributes to each window, so a test can tell a count
+            of recordings from a count of segments.
+    """
+    rows: List[Dict[str, Any]] = []
+    for index, (name, count) in enumerate(n_by_class):
+        for recording in range(count):
+            for hours, offset in window_offsets:
+                for segment in range(segments):
+                    value = float(recording) + (float(offset) if index else 0.0)
+                    rows.append(
+                        {
+                            "guid": f"{name}_{recording:02d}",
+                            "epoch": -hours * _HOUR,
+                            labels.CLASS_COLUMN: name,
+                            labels.SUBGROUP_COLUMN: f"{name}_cs",
+                            "mc_pred_gap": value + 0.1 * segment,
+                            "source_conditioned_kl_raw": value,
+                        }
+                    )
+    return rows
+
+
+def _windows_figure(rows: List[Dict[str, Any]]):
+    """Build the windows page from a hand-made per-sample table, with its significance records."""
+    class_frame = analysis.build_per_recording(_per_sample(rows))[labels.CLASS_COLUMN]
+    records = [analysis.analyse_windows(class_frame, column) for column in analysis.VALUE_COLUMNS]
+    return analysis.build_windows_figure(class_frame, records), records
+
+
+def _violin_centres(ax) -> List[float]:
+    """The x coordinate of every violin body on one axes, ascending."""
+    from matplotlib.collections import PolyCollection
+
+    centres = []
+    for collection in ax.collections:
+        if isinstance(collection, PolyCollection):
+            for path in collection.get_paths():
+                x = np.asarray(path.vertices, dtype=np.float64)[:, 0]
+                centres.append((float(x.min()) + float(x.max())) / 2.0)
+    return sorted(centres)
+
+
+def test_the_windows_page_stacks_a_strip_under_each_readouts_violins() -> None:
+    """The layout is the content: the strip has to share the violins' x axis, or a reader is
+    asked to carry a window's coordinate between two pages."""
+    from teb_vae.lag_attn.eval import figures as shared_figures
+
+    figure, _ = _windows_figure(_window_rows())
+    try:
+        # Two readouts, each a violin row and a strip row, then the effect-size heatmap -- plus
+        # the colourbar axes the heatmap attaches.
+        assert len(figure.axes) == 6
+        for index in (0, 2):
+            assert figure.axes[index].get_xlim() == pytest.approx(
+                figure.axes[index + 1].get_xlim()
+            )
+        # Delivery at the right, on every panel that carries the clock.
+        for index in range(4):
+            low, high = figure.axes[index].get_xlim()
+            assert low > high, f"panel {index} is not inverted"
+    finally:
+        shared_figures.plt.close(figure)
+
+
+def test_the_strip_clears_alpha_in_the_window_the_classes_are_separated_in() -> None:
+    """A known answer in both directions on one page: the same two classes, apart in one window
+    and identical in the other. An implementation that drew significance unconditionally passes
+    the first half and fails the second."""
+    from teb_vae.lag_attn.eval import figures as shared_figures
+
+    figure, records = _windows_figure(_window_rows())
+    try:
+        strip = figure.axes[1]
+        bars = sorted(
+            [
+                (float(patch.get_x() + patch.get_width() / 2.0), float(patch.get_height()))
+                for patch in strip.patches
+            ]
+        )
+        threshold = float(-np.log10(analysis.DEFAULT_ALPHA))
+
+        assert [centre for centre, _ in bars] == pytest.approx([1.25, 3.25])
+        # 1.25 h: the classes coincide exactly. 3.25 h: fifty nats apart.
+        assert bars[0][1] < threshold
+        assert bars[1][1] > threshold
+    finally:
+        shared_figures.plt.close(figure)
+
+    assert records[0]["n_significant_windows"] == 1
+    assert records[0]["significant_bin_centers_h"] == pytest.approx([3.25])
+
+
+def test_the_violin_cells_are_drawn_in_the_canonical_order_and_the_cohort_colours() -> None:
+    r"""Healthy sits left of acidosis inside every window, and each is the colour this evaluation
+    paints it everywhere else. A figure whose classes are placed or coloured by whatever order
+    they arrived in cannot be compared with any other figure in the repository."""
+    from matplotlib.collections import PolyCollection
+    from matplotlib.colors import to_rgba
+
+    from teb_vae.lag_attn.eval import figures as shared_figures
+    from teb_vae.lag_attn_rws.eval import figures_seam
+
+    figure, _ = _windows_figure(_window_rows())
+    try:
+        violins = figure.axes[0]
+        # Two windows of two classes: the dodge puts each class a third of a window either side.
+        slot = analysis.TRAJECTORY_BIN_HOURS / 3.0
+        assert _violin_centres(violins) == pytest.approx(
+            sorted([1.25 - slot / 2, 1.25 + slot / 2, 3.25 - slot / 2, 3.25 + slot / 2])
+        )
+        faces = [
+            tuple(collection.get_facecolor()[0][:3])
+            for collection in violins.collections
+            if isinstance(collection, PolyCollection)
+        ]
+        palette = figures_seam.group_colors(["healthy", "acidosis"])
+        # Drawn cohort by cohort, so the first two bodies are healthy's and the last two acidosis's.
+        assert faces[:2] == [to_rgba(palette["healthy"])[:3]] * 2
+        assert faces[2:] == [to_rgba(palette["acidosis"])[:3]] * 2
+    finally:
+        shared_figures.plt.close(figure)
+
+
+def test_a_cohort_below_the_test_floor_is_drawn_as_its_own_values_and_carries_no_verdict() -> None:
+    """The two halves of one rule. A cell with two recordings is drawn -- a cohort thinning out is
+    the explanation for the window beside it -- but drawn as points rather than as a density the
+    smoother invented, and the window it sits in is marked untestable rather than tested."""
+    from teb_vae.lag_attn.eval import figures as shared_figures
+
+    figure, records = _windows_figure(
+        _window_rows(n_by_class=(("healthy", 5), ("acidosis", 2)))
+    )
+    try:
+        violins, strip = figure.axes[0], figure.axes[1]
+        bodies = _violin_centres(violins)
+        points = [
+            line for line in violins.lines
+            if line.get_linestyle() == "None" and len(line.get_xdata())
+        ]
+        # Healthy has five recordings per window and gets a body; acidosis has two and does not.
+        assert len(bodies) == 2
+        assert sum(len(np.atleast_1d(line.get_xdata())) for line in points) == 4
+        # And nothing was tested, so every window carries the untestable mark and no bar.
+        assert len(strip.patches) == 0
+        crosses = [line for line in strip.lines if line.get_marker() == "x"]
+        assert sorted(np.atleast_1d(crosses[0].get_xdata())) == pytest.approx([1.25, 3.25])
+    finally:
+        shared_figures.plt.close(figure)
+
+    assert records[0]["n_windows_tested"] == 0
+    assert all(
+        window["groups_excluded_as_too_small"] == {"acidosis": 2}
+        for window in records[0]["per_window"]
+    )
+
+
+def test_the_count_on_each_cell_is_recordings_rather_than_segments() -> None:
+    """The same rule the trajectory figure follows, and the reason the count is drawn at all: a
+    cell's body can move because the cohort changed rather than because the coupling did."""
+    from teb_vae.lag_attn.eval import figures as shared_figures
+
+    figure, _ = _windows_figure(_window_rows(segments=3))
+    try:
+        annotations = sorted(text.get_text() for text in figure.axes[0].texts)
+    finally:
+        shared_figures.plt.close(figure)
+
+    # Two classes of five recordings in each of two windows -- never the fifteen segments behind.
+    assert annotations == ["5"] * 4
+
+
+def test_the_windows_page_of_a_single_class_split_draws_notes_rather_than_raising() -> None:
+    """The ordinary outcome on the healthy-only pretraining split: nothing is tested, so there is
+    nothing to draw, and the page has to say so rather than fail at the run's final step."""
+    from teb_vae.lag_attn.eval import figures as shared_figures
+
+    rows = [row for row in _window_rows() if row[labels.CLASS_COLUMN] == "healthy"]
+    figure, records = _windows_figure(rows)
+    try:
+        notes = [
+            text.get_text() for axis in figure.axes for text in axis.texts
+        ]
+        assert notes.count(shared_figures.EMPTY_NOTE) >= 3
+    finally:
+        shared_figures.plt.close(figure)
+
+    assert records[0]["tested"] is False
+
+
 def test_a_single_cohort_population_draws_the_empty_note_rather_than_one_line() -> None:
     """One line invites a comparison there is nothing to compare against."""
     from teb_vae.lag_attn.eval import figures as shared_figures

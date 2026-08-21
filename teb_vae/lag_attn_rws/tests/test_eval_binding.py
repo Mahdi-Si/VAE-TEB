@@ -17,6 +17,17 @@ one full pipeline run against the tiny fixture, digested artifact by artifact, a
 captured before any of this code existed. It is a refactor-neutrality gate rather than an
 analysis test -- it asserts nothing about whether the numbers are *right*, only that they are the
 same ones.
+
+**Which tree the manifest describes, and what is currently red.** ``data/eval_reference_manifest.json``
+describes the tree at its own recorded ``generated_from`` commit, and it is **extended** when the
+pipeline gains an artifact that did not exist then -- never rewritten to make a comparison pass. Two
+of the three gate tests below are failing at the time of writing, and the manifest's own
+``_comment`` records why: 92 artifacts differ because the model, the objective and the default
+config all moved in commits after the capture, and nobody traced those moves against this file
+while making them. That is a backlog rather than a regression in the evaluation package, and the
+right way to clear it is to explain the 92 -- not to re-capture them. Until someone does, a **new**
+failure here is still a finding: compare the failing names against the two that are expected to
+fail, and treat anything else as a real move.
 """
 from __future__ import annotations
 

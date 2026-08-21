@@ -315,3 +315,346 @@ def test_render_to_pdf_writes_a_pdf_and_closes_the_figure(tmp_path) -> None:
     figures.render_to_pdf(fig, path)
     assert path.is_file() and path.stat().st_size > 0
     assert not plt.fignum_exists(fig.number)
+
+
+# ---------------------------------------------------------------------------
+# The binned violin panel
+# ---------------------------------------------------------------------------
+def _body_centres(ax) -> list:
+    """The x coordinate each violin body is centred on, in ascending order.
+
+    A violin body is the only ``PolyCollection`` these panels draw -- the interior marks are line
+    collections and the significance bars are patches -- and a kernel density is symmetric about
+    its position, so the midpoint of a body's vertex span **is** the position it was drawn at.
+    """
+    from matplotlib.collections import PolyCollection
+
+    centres = []
+    for collection in ax.collections:
+        if isinstance(collection, PolyCollection):
+            for path in collection.get_paths():
+                x = np.asarray(path.vertices, dtype=np.float64)[:, 0]
+                centres.append((float(x.min()) + float(x.max())) / 2.0)
+    return sorted(centres)
+
+
+def _plotted_points(ax) -> list:
+    """The ``(x, y)`` pairs drawn as bare markers, which is how a too-thin cell is shown.
+
+    Discriminated from the interior's median dot by its linestyle: the dot is drawn with the
+    default solid style and these with ``'none'``. The legend proxies share that style and carry
+    no data, so they are excluded by the emptiness check rather than by name.
+    """
+    points = []
+    for line in ax.lines:
+        if line.get_linestyle() == "None" and len(line.get_xdata()):
+            points.extend(zip(list(line.get_xdata()), list(line.get_ydata())))
+    return points
+
+
+def _samples(*, groups, per_window, spread: float = 1.0) -> list:
+    """One ``{group: values}`` mapping per window, each group's cell holding ``per_window`` values.
+
+    Args:
+        groups: Group labels.
+        per_window: Values per cell, per window. ``0`` leaves that cell out entirely.
+        spread: Multiplies the within-cell range, so a caller can make a cell constant.
+
+    Returns:
+        The sequence :func:`figures.binned_violin_panel` takes.
+    """
+    windows = []
+    for count in per_window:
+        cell = {}
+        for offset, group in enumerate(groups):
+            if count:
+                cell[group] = np.arange(float(count)) * spread + float(offset) * 10.0
+        windows.append(cell)
+    return windows
+
+
+def test_the_dodge_places_each_group_symmetrically_inside_its_window() -> None:
+    r"""$x = c + (i - \frac{k-1}{2})\frac{w}{k+1}$, for $k = 2$ and $k = 3$.
+
+    Asserted numerically rather than eyeballed: a dodge that drifted would put a cohort's body
+    over the neighbouring window's, and every value on the page would still be correct.
+    """
+    for groups, expected in (
+        (["a", "b"], [-1.0 / 6.0, 1.0 / 6.0]),
+        (["a", "b", "c"], [-0.25, 0.0, 0.25]),
+    ):
+        fig, axes = figures.new_figure(1)
+        try:
+            drawn = figures.binned_violin_panel(
+                axes[0, 0], _samples(groups=groups, per_window=[5]), [0.0],
+                groups=groups, bin_width=1.0, min_body_size=3,
+            )
+            assert drawn == len(groups)
+            assert _body_centres(axes[0, 0]) == pytest.approx(expected)
+        finally:
+            plt.close(fig)
+
+
+def test_a_group_absent_from_one_window_leaves_a_gap_rather_than_shifting_its_neighbours() -> None:
+    """The dodge is computed from the figure's group count, not the window's. Recentring the
+    survivors would make a cohort's position mean something different in different windows, and
+    the trajectory could no longer be read across them."""
+    groups = ["a", "b", "c"]
+    windows = _samples(groups=groups, per_window=[5])
+    del windows[0]["b"]
+
+    fig, axes = figures.new_figure(1)
+    try:
+        drawn = figures.binned_violin_panel(
+            axes[0, 0], windows, [0.0], groups=groups, bin_width=1.0, min_body_size=3
+        )
+        assert drawn == 2
+        # 'a' and 'c' keep the outer slots the three-group case gave them.
+        assert _body_centres(axes[0, 0]) == pytest.approx([-0.25, 0.25])
+    finally:
+        plt.close(fig)
+
+
+def test_a_cell_too_thin_for_a_density_is_drawn_as_its_own_values() -> None:
+    """matplotlib evaluates the kernel between the data's own extremes, so a body over two values
+    is a shape the smoother invented -- and the caller's test excludes that cell at the same
+    threshold, so the figure and the test agree about which cells carry evidence."""
+    fig, axes = figures.new_figure(1)
+    try:
+        figures.binned_violin_panel(
+            axes[0, 0], _samples(groups=["a"], per_window=[2]), [0.0],
+            groups=["a"], bin_width=1.0, min_body_size=3,
+        )
+        assert _body_centres(axes[0, 0]) == []
+        assert len(_plotted_points(axes[0, 0])) == 2
+    finally:
+        plt.close(fig)
+
+    fig, axes = figures.new_figure(1)
+    try:
+        figures.binned_violin_panel(
+            axes[0, 0], _samples(groups=["a"], per_window=[3]), [0.0],
+            groups=["a"], bin_width=1.0, min_body_size=3,
+        )
+        assert len(_body_centres(axes[0, 0])) == 1
+        assert _plotted_points(axes[0, 0]) == []
+    finally:
+        plt.close(fig)
+
+
+def test_a_constant_cell_draws_its_points_rather_than_raising() -> None:
+    """``gaussian_kde`` inverts a covariance that is singular when every value is equal, and
+    raises. Three recordings that happened to score identically would otherwise take the figure
+    down at the run's final step."""
+    fig, axes = figures.new_figure(1)
+    try:
+        drawn = figures.binned_violin_panel(
+            axes[0, 0], [{"a": np.full(5, 2.5)}], [0.0],
+            groups=["a"], bin_width=1.0, min_body_size=3,
+        )
+        assert drawn == 1
+        assert _body_centres(axes[0, 0]) == []
+        assert len(_plotted_points(axes[0, 0])) == 5
+    finally:
+        plt.close(fig)
+
+
+def test_every_cell_is_annotated_with_the_count_behind_it() -> None:
+    """A body can move because the population changed rather than because the quantity did, and
+    the count is the only thing that says which."""
+    fig, axes = figures.new_figure(1)
+    try:
+        figures.binned_violin_panel(
+            axes[0, 0], [{"a": np.arange(5.0), "b": np.arange(3.0)}], [0.0],
+            groups=["a", "b"], bin_width=1.0, min_body_size=3,
+        )
+        assert sorted(text.get_text() for text in axes[0, 0].texts) == ["3", "5"]
+    finally:
+        plt.close(fig)
+
+
+def test_the_bodies_take_the_callers_palette() -> None:
+    """A cohort keeps one colour across every figure of a run, and the palette that decides it is
+    the caller's package's rather than this module's default."""
+    from matplotlib.colors import to_rgba
+    from matplotlib.collections import PolyCollection
+
+    palette = {"a": "#2E8B57", "b": "#C0392B"}
+    fig, axes = figures.new_figure(1)
+    try:
+        figures.binned_violin_panel(
+            axes[0, 0], _samples(groups=["a", "b"], per_window=[5]), [0.0],
+            groups=["a", "b"], bin_width=1.0, min_body_size=3, colors=palette,
+        )
+        faces = [
+            tuple(collection.get_facecolor()[0][:3])
+            for collection in axes[0, 0].collections
+            if isinstance(collection, PolyCollection)
+        ]
+        assert faces == [to_rgba(palette["a"])[:3], to_rgba(palette["b"])[:3]]
+    finally:
+        plt.close(fig)
+
+
+@pytest.mark.parametrize(
+    "windows, groups",
+    [([], []), ([{}, {}], ["a"]), ([{"a": np.full(4, np.nan)}], ["a"])],
+)
+def test_the_binned_panel_survives_empty_and_all_nan_input(windows, groups) -> None:
+    """An analysis that legitimately found nothing must not take down a multi-hour run."""
+    fig, axes = figures.new_figure(1)
+    try:
+        drawn = figures.binned_violin_panel(
+            axes[0, 0], windows, [0.0] * len(windows),
+            groups=groups, bin_width=0.5, min_body_size=3,
+        )
+        assert drawn == 0
+        assert figures.EMPTY_NOTE in [text.get_text() for text in axes[0, 0].texts]
+    finally:
+        plt.close(fig)
+
+
+def test_the_binned_panel_refuses_misaligned_windows_and_centres() -> None:
+    """Zipping the shorter of the two would draw one window's values at another's coordinate,
+    with every axis label still saying they were where they belong."""
+    fig, axes = figures.new_figure(1)
+    try:
+        with pytest.raises(ValueError, match="positionally aligned"):
+            figures.binned_violin_panel(
+                axes[0, 0], _samples(groups=["a"], per_window=[5, 5]), [0.0],
+                groups=["a"], bin_width=1.0, min_body_size=3,
+            )
+    finally:
+        plt.close(fig)
+
+
+def test_the_binned_panel_counts_only_the_cells_that_had_data() -> None:
+    fig, axes = figures.new_figure(1)
+    try:
+        drawn = figures.binned_violin_panel(
+            axes[0, 0], _samples(groups=["a", "b"], per_window=[5, 0, 4]), [0.0, 0.5, 1.0],
+            groups=["a", "b"], bin_width=0.5, min_body_size=3,
+        )
+        assert drawn == 4
+    finally:
+        plt.close(fig)
+
+
+# ---------------------------------------------------------------------------
+# The significance strip
+# ---------------------------------------------------------------------------
+def _bars(ax) -> list:
+    """``(x centre, height, width)`` per drawn bar."""
+    return [
+        (patch.get_x() + patch.get_width() / 2.0, patch.get_height(), patch.get_width())
+        for patch in ax.patches
+    ]
+
+
+def test_the_strip_draws_one_bar_per_testable_window_against_the_threshold() -> None:
+    fig, axes = figures.new_figure(1)
+    try:
+        drawn = figures.significance_strip(
+            axes[0, 0], [0.25, 0.75, 1.25], [0.001, 0.5, 0.02], alpha=0.05, bin_width=0.5
+        )
+        assert drawn == 3
+        centres, heights, widths = zip(*_bars(axes[0, 0]))
+        assert list(centres) == pytest.approx([0.25, 0.75, 1.25])
+        assert list(heights) == pytest.approx([3.0, -np.log10(0.5), -np.log10(0.02)])
+        # A fraction of a window, so the bar sits inside the window it describes.
+        assert list(widths) == pytest.approx([0.5 * figures.SIGNIFICANCE_BAR_FRACTION] * 3)
+
+        threshold = [
+            line for line in axes[0, 0].lines
+            if len(np.atleast_1d(line.get_ydata())) == 2
+            and np.atleast_1d(line.get_ydata())[0] == np.atleast_1d(line.get_ydata())[1]
+        ]
+        assert threshold, "no threshold line was drawn"
+        assert float(np.atleast_1d(threshold[0].get_ydata())[0]) == pytest.approx(-np.log10(0.05))
+        assert "alpha = 0.05" in threshold[0].get_label()
+        assert "Holm" in threshold[0].get_label()
+    finally:
+        plt.close(fig)
+
+
+def test_a_p_value_of_exactly_zero_stays_on_the_page() -> None:
+    """A rank test returns an exact zero at large $n$, and an infinite bar would rescale the axis
+    until every other window read as a flat line -- so the strongest evidence would erase the
+    evidence everywhere else."""
+    fig, axes = figures.new_figure(1)
+    try:
+        figures.significance_strip(
+            axes[0, 0], [0.0, 1.0], [0.0, 0.04], alpha=0.05, bin_width=1.0
+        )
+        heights = [height for _, height, _ in _bars(axes[0, 0])]
+        assert np.isfinite(heights).all()
+        assert heights[0] == pytest.approx(-np.log10(figures.P_VALUE_FLOOR))
+        assert np.isfinite(axes[0, 0].get_ylim()).all()
+    finally:
+        plt.close(fig)
+
+
+def test_an_untestable_window_gets_a_mark_of_its_own_rather_than_a_bar() -> None:
+    """Zero height is "no evidence"; a window that could not be tested is a different statement.
+    It gets no bar -- and a mark at zero, because at any realistic window count an absent bar and
+    an absent window are otherwise the same empty stretch of axis."""
+    fig, axes = figures.new_figure(1)
+    try:
+        drawn = figures.significance_strip(
+            axes[0, 0], [0.0, 1.0, 2.0], [0.01, float("nan"), 0.2], alpha=0.05, bin_width=1.0
+        )
+        assert drawn == 2
+        assert [centre for centre, _, _ in _bars(axes[0, 0])] == pytest.approx([0.0, 2.0])
+
+        marks = [line for line in axes[0, 0].lines if line.get_marker() == "x"]
+        assert len(marks) == 1
+        assert list(np.atleast_1d(marks[0].get_xdata())) == pytest.approx([1.0])
+        assert list(np.atleast_1d(marks[0].get_ydata())) == pytest.approx([0.0])
+        assert marks[0].get_label() == "not testable"
+    finally:
+        plt.close(fig)
+
+
+def test_a_window_tested_at_p_one_is_distinguishable_from_an_untested_one() -> None:
+    """The pair the mark above exists to separate: both draw nothing visible at this scale, and
+    only the mark says which is which."""
+    fig, axes = figures.new_figure(1)
+    try:
+        figures.significance_strip(
+            axes[0, 0], [0.0, 1.0], [1.0, float("nan")], alpha=0.05, bin_width=1.0
+        )
+        bars = _bars(axes[0, 0])
+        marks = [line for line in axes[0, 0].lines if line.get_marker() == "x"]
+
+        # The tested window has a bar of zero height; the untested one has a mark and no bar.
+        assert [centre for centre, _, _ in bars] == pytest.approx([0.0])
+        assert [height for _, height, _ in bars] == pytest.approx([0.0])
+        assert list(np.atleast_1d(marks[0].get_xdata())) == pytest.approx([1.0])
+    finally:
+        plt.close(fig)
+
+
+def test_a_strip_with_nothing_testable_says_so_and_still_shows_where_the_windows_were() -> None:
+    fig, axes = figures.new_figure(1)
+    try:
+        drawn = figures.significance_strip(
+            axes[0, 0], [0.0, 1.0], [float("nan")] * 2, alpha=0.05, bin_width=1.0
+        )
+        assert drawn == 0
+        assert figures.EMPTY_NOTE in [text.get_text() for text in axes[0, 0].texts]
+        assert _bars(axes[0, 0]) == []
+        marks = [line for line in axes[0, 0].lines if line.get_marker() == "x"]
+        assert list(np.atleast_1d(marks[0].get_xdata())) == pytest.approx([0.0, 1.0])
+    finally:
+        plt.close(fig)
+
+
+def test_the_strip_refuses_misaligned_centres_and_p_values() -> None:
+    fig, axes = figures.new_figure(1)
+    try:
+        with pytest.raises(ValueError, match="positionally aligned"):
+            figures.significance_strip(
+                axes[0, 0], [0.0, 1.0], [0.01], alpha=0.05, bin_width=1.0
+            )
+    finally:
+        plt.close(fig)

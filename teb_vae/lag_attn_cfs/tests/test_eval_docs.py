@@ -552,6 +552,9 @@ def test_the_interpretation_rules_are_all_present(eval_doc) -> None:
         "expected finding",                  # a small source-lag warmth is not a fault
         "/2940 rescale",                     # the rescaled per-anchor score
         "band-resolved skill, not coherence",  # what the frequency readout is and is not
+        "corrected within a clock",           # two clocks, two Holm families
+        "a subset of the evaluated cohort",   # ...and why the second one is capped
+        "counted and never dropped",          # the two onset diagnostics that filter nothing
     ):
         assert rule in eval_doc, f"EVAL.md no longer states: {rule!r}"
 

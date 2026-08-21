@@ -71,7 +71,7 @@ CAUSAL_STATS = FIXTURES / "tiny_stats_causal.hdf5"
 #: make the assertion a comparison of one value with itself.
 EVAL_LOAD_FIELDS = [
     "fhr", "up", "fhr_st", "fhr_ph", "up_ph", "up_st", "weight", "guid", "epoch", "target",
-    "cs_label", "bg_label", "time_from_labor_onset",
+    "cs_label", "bg_label", "time_from_labor_onset", "second_stage_onset",
 ]
 
 #: The objective the tiny fixture's task carries, standing in for a checkpoint's own hyperparameters.

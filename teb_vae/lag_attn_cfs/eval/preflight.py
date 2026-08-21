@@ -143,6 +143,7 @@ REQUIRED_EVAL_LOAD_FIELDS: Tuple[str, ...] = (
     "cs_label",
     "bg_label",
     "time_from_labor_onset",
+    "second_stage_onset",
 )
 
 #: The loader fields this model's reconstruction target is built from. Both blocks, because the
@@ -408,8 +409,10 @@ def check_load_fields(config: Mapping[str, Any]) -> None:
             f"dataset_config.dataloader_config.dataset_kwargs.load_fields is missing {missing}. "
             f"Each is what a readout is asked in: 'target' recovers the class code (as a ratio "
             f"against 'weight'), 'epoch' is time before delivery, 'cs_label'/'bg_label' are the "
-            f"subgroup cuts, and 'time_from_labor_onset' is NaN wherever the recording is absent "
-            f"from the labour-onset table. 'guid' and 'epoch' additionally key the anchor tiling's "
+            f"subgroup cuts, 'time_from_labor_onset' is NaN wherever the recording is absent "
+            f"from the labour-onset table, and 'second_stage_onset' is the signed seconds from "
+            f"second-stage onset that the second clinical clock is resolved against. "
+            f"'guid' and 'epoch' additionally key the anchor tiling's "
             f"per-segment phase, and load_fields is honoured literally with no forced additions, so "
             f"dropping either leaves every segment on one tile grid with no shape, no count and no "
             f"metric differing. The evaluation override delta lists all of them; a config merged "

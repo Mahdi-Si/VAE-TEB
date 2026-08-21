@@ -146,6 +146,7 @@ IDENTITY_COLUMNS: Tuple[str, ...] = (
     "cs_label",
     "bg_label",
     "time_from_labor_onset",
+    "second_stage_onset",
     "source_file_basename",
     "n_anchors",
     "n_segments_in_guid",
@@ -575,6 +576,10 @@ class _Collector:
         self._extend(
             "time_from_labor_onset",
             _numeric_column(batch, "time_from_labor_onset", batch_size).tolist(),
+        )
+        self._extend(
+            "second_stage_onset",
+            _numeric_column(batch, "second_stage_onset", batch_size).tolist(),
         )
         self._extend("source_file_basename", basenames)
         self._extend("n_anchors", [int(value) for value in n_anchors])

@@ -84,6 +84,13 @@ dataset_config:
       # `weight`, never read directly), `cs_label`/`bg_label` are the subgroup cuts, and
       # `time_from_labor_onset` is NaN wherever the GUID is absent from the labour-onset table.
       #
+      # `second_stage_onset` is the second clinical clock, and it is stored **signed**: the shard
+      # writes `domain_start - t_sso`, so it is negative before second-stage onset and positive
+      # after it, in seconds. Unlike `epoch` it therefore needs no sign flip to read as an axis.
+      # It is NaN wherever the GUID is absent from the same labour-onset table, which is a fact
+      # about the cohort rather than a defect in a row: the recordings without one are counted and
+      # named in the analysis's own eligibility record rather than quietly dropped.
+      #
       # `guid` AND `epoch` are restated here rather than dropped, and on this cell that is
       # load-bearing twice over. They key the per-recording aggregation and the trajectory axis, as
       # in the raw cells — and they also key the anchor tiling's per-segment phase, which
@@ -124,6 +131,7 @@ dataset_config:
           'cs_label',
           'bg_label',
           'time_from_labor_onset',
+          'second_stage_onset',
         ]
 
       # 0, and it is already default.yaml's value — restated because this block is where a reader

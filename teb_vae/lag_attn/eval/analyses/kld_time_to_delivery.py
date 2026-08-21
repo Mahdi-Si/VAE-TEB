@@ -231,47 +231,29 @@ def analyse_class_trajectories(
             "method": method,
         }
 
-    per_bin: List[Dict[str, Any]] = []
+    # The cohort half of the job, which is this analysis's own: which classes are in a window, in
+    # which order, and which were too small to enter the test at all. The arithmetic half -- the
+    # omnibus, the correction across the windows and the pairwise sweep on the survivors -- is
+    # `stats.windowed_group_comparisons`, shared with every other trajectory analysis in the
+    # family so that "significant" has one definition rather than one per pipeline.
     samples_by_bin: Dict[int, Dict[str, np.ndarray]] = {}
+    meta_by_bin: Dict[int, Dict[str, Any]] = {}
     for bin_index in sorted(int(value) for value in frame["bin"].unique()):
         cell = frame[frame["bin"] == bin_index]
         usable, excluded = _class_samples(cell)
-        record: Dict[str, Any] = {
-            "bin": int(bin_index),
+        samples_by_bin[int(bin_index)] = usable
+        meta_by_bin[int(bin_index)] = {
             "bin_center_h": (int(bin_index) + 0.5) * float(width),
             "groups_excluded_as_too_small": excluded,
             "min_group_size": stats.MIN_GROUP_SIZE,
         }
-        if len(usable) >= 2:
-            record.update(stats.kruskal_across_groups(usable))
-            samples_by_bin[int(bin_index)] = usable
-        else:
-            record.update({
-                "test": "kruskal-wallis",
-                "n_groups": len(usable),
-                "n_per_group": {group: int(values.size) for group, values in usable.items()},
-                "statistic": float("nan"),
-                "p_value": float("nan"),
-                "note": "fewer than two classes had enough samples in this window",
-            })
-        per_bin.append(record)
 
-    adjusted = stats.holm_adjust([record["p_value"] for record in per_bin])
-    n_tested = sum(1 for record in per_bin if np.isfinite(record["p_value"]))
-    for record, value in zip(per_bin, adjusted):
-        record["p_holm"] = float(value)
-        record["alpha"] = float(alpha)
-        record["correction"] = "holm"
-        record["n_windows_in_family"] = n_tested
-        record["significant"] = bool(np.isfinite(value) and value < float(alpha))
-
-    pairwise: Dict[str, List[Dict[str, Any]]] = {}
-    for record in per_bin:
-        if record["significant"]:
-            pairwise[str(record["bin"])] = stats.pairwise_comparisons(
-                samples_by_bin[int(record["bin"])]
-            )
-
+    # ``window_field="bin"`` keeps this analysis's own published column name: its significance CSV
+    # and the figures beside it have been keyed on ``bin`` since before the procedure was shared.
+    outcome = stats.windowed_group_comparisons(
+        samples_by_bin, meta_by_window=meta_by_bin, window_field="bin", alpha=alpha
+    )
+    per_bin = outcome["per_window"]
     significant = [record for record in per_bin if record["significant"]]
     return {
         "group_column": labels.CLASS_COLUMN,
@@ -279,11 +261,11 @@ def analyse_class_trajectories(
         "alpha": float(alpha),
         "bin_width_hours": float(width),
         "classes": classes,
-        "n_bins_tested": n_tested,
+        "n_bins_tested": outcome["n_windows_tested"],
         "n_significant_bins": len(significant),
         "significant_bin_centers_h": [record["bin_center_h"] for record in significant],
         "per_bin": per_bin,
-        "pairwise": pairwise,
+        "pairwise": outcome["pairwise"],
         "pooled": _pooled_class_test(frame),
         "method": method,
     }
@@ -461,32 +443,28 @@ def _write_significance_figure(record: Dict[str, Any], directory: Path) -> str:
             axes[1, 0].axis("off")
             return str(figures.render_to_pdf(figure, directory / "significance.pdf"))
 
-        tested = [row for row in record["per_bin"] if np.isfinite(row["p_holm"])]
-        if tested:
-            centres = np.array([row["bin_center_h"] for row in tested], dtype=np.float64)
-            # Floored so a p of exactly 0 -- which a permutation-free rank test can return at large
-            # n -- does not become an infinite bar that rescales the axis.
-            heights = -np.log10(
-                np.clip(np.array([row["p_holm"] for row in tested], dtype=np.float64), 1e-300, 1.0)
-            )
-            axes[0, 0].bar(centres, heights, width=0.4 * float(record["bin_width_hours"]),
-                           color=figures.COLOR_BLUE, alpha=0.85)
-            axes[0, 0].axhline(
-                -np.log10(float(record["alpha"])), color=figures.COLOR_VERMILLION,
-                linestyle="--", linewidth=1.2,
-                label=f"alpha = {float(record['alpha']):g} (Holm-adjusted)",
-            )
-            axes[0, 0].legend(fontsize=7, loc="best")
+        # The mark itself is the shared one: the same bars against the same threshold line that
+        # every family in this repository is read against, so two figures of two different
+        # families cannot come to draw "is there anything there" two different ways. The strip
+        # filters the untestable windows out for itself, which is why the whole list goes in.
+        drawn = figures.significance_strip(
+            axes[0, 0],
+            [row["bin_center_h"] for row in record["per_bin"]],
+            [row["p_holm"] for row in record["per_bin"]],
+            alpha=float(record["alpha"]),
+            bin_width=float(record["bin_width_hours"]),
+            title="Class difference by time window (Kruskal-Wallis, Holm)",
+            xlabel="Time before delivery (hours)",
+        )
+        if drawn:
+            # Delivery sits at the right, so the eye reads left to right toward it.
             axes[0, 0].invert_xaxis()
         else:
-            axes[0, 0].text(
-                0.5, 0.5, "no window had two testable classes", transform=axes[0, 0].transAxes,
-                ha="center", va="center", fontsize=9, color=figures.COLOR_GRAY,
+            # The panel already says it has no finite value to draw; what only this analysis knows
+            # is *why*, and the title is where it fits without a second note beside the first.
+            axes[0, 0].set_title(
+                "Class difference by time window -- no window had two testable classes"
             )
-        axes[0, 0].set_title("Class difference by time window (Kruskal-Wallis, Holm)")
-        axes[0, 0].set_xlabel("Time before delivery (hours)")
-        axes[0, 0].set_ylabel("$-\\log_{10}$ Holm-adjusted $p$")
-        figures.style_axes(axes[0, 0])
 
         _draw_pairwise_heatmap(figure, axes[1, 0], record)
         return str(figures.render_to_pdf(figure, directory / "significance.pdf"))

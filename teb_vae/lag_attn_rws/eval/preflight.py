@@ -83,6 +83,7 @@ REQUIRED_EVAL_LOAD_FIELDS: Tuple[str, ...] = (
     "cs_label",
     "bg_label",
     "time_from_labor_onset",
+    "second_stage_onset",
 )
 
 #: Constructor keys reconciled against the checkpoint's own ``model_kwargs``. Every one of them
@@ -298,10 +299,11 @@ def check_load_fields(config: Mapping[str, Any]) -> None:
             f"dataset_config.dataloader_config.dataset_kwargs.load_fields is missing "
             f"{missing}. Each is what a clinical readout is asked in: 'target' recovers the class "
             f"code (as a ratio against 'weight'), 'epoch' is time before delivery, "
-            f"'cs_label'/'bg_label' are the subgroup cuts, and 'time_from_labor_onset' is NaN "
-            f"wherever the recording is absent from the labour-onset table. The evaluation "
-            f"override delta adds all five; a config merged without it carries only the eight "
-            f"fields the model itself consumes."
+            f"'cs_label'/'bg_label' are the subgroup cuts, 'time_from_labor_onset' is NaN "
+            f"wherever the recording is absent from the labour-onset table, and "
+            f"'second_stage_onset' is the signed seconds from second-stage onset that the second "
+            f"clinical clock is resolved against. The evaluation override delta adds all six; a "
+            f"config merged without it carries only the eight fields the model itself consumes."
         )
 
 

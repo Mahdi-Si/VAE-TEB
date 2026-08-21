@@ -111,6 +111,7 @@ from teb_vae.lag_attn_rws.eval.analyses import latent as latent_analysis  # noqa
 from teb_vae.lag_attn_rws.eval.analyses import perm_control as perm_control_analysis  # noqa: E402
 from teb_vae.lag_attn_rws.eval.analyses import residual as residual_analysis  # noqa: E402
 from teb_vae.lag_attn_rws.eval.analyses import samples as samples_analysis  # noqa: E402
+from teb_vae.lag_attn_rws.eval.analyses import second_stage as second_stage_analysis  # noqa: E402
 from teb_vae.lag_attn_rws.eval.analyses import sufficiency as sufficiency_analysis  # noqa: E402
 from teb_vae.lag_attn_rws.eval.analyses import time_to_delivery as time_to_delivery_analysis  # noqa: E402
 from teb_vae.lag_attn_rws.eval.analyses import trajectory as trajectory_analysis  # noqa: E402
@@ -195,6 +196,10 @@ ANALYSIS_FUNCTIONS: Dict[str, Any] = {
     "distributions": distributions_analysis.run_distributions_analysis,
     "trajectory": trajectory_analysis.run_trajectory_analysis,
     "time_to_delivery": time_to_delivery_analysis.run_time_to_delivery_analysis,
+    # Immediately after the clock it mirrors, because the two answer one question against two
+    # landmarks and a reader meets them in that order. It scores fewer recordings -- only those the
+    # labour-onset table places a second stage for -- and declares itself capped for that reason.
+    "second_stage": second_stage_analysis.run_second_stage_analysis,
     "events": events_analysis.run_events_analysis,
     # Last but for the two below, and deliberately so: it is the only analysis whose cost is a
     # training loop rather than a forward pass, so a run that fails earlier fails before paying
@@ -1709,6 +1714,8 @@ RUN_ARGS: Dict[str, Any] = {
     #                     whole delivery on the absolute time axis.
     #   time_to_delivery: The readouts binned on a 0.5 h grid of time before delivery,
     #                     class-stratified, with Holm across windows.
+    #   second_stage:     The same two readouts on the second clinical clock -- signed hours from
+    #                     second-stage onset -- over the recordings that have one. Its own family.
     #   events:           What the raw target unlocks. Deceleration forecast skill, the
     #                     contraction-triggered response, and contraction-conditioned coupling.
     #   sufficiency:      What the latent bottleneck costs, against an evaluation-only oracle

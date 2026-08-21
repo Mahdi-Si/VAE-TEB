@@ -1,37 +1,46 @@
-r"""Does the coupling change as delivery approaches, and does it change differently by class?
+r"""Does the coupling change around the onset of the second stage of labour?
 
-Every other reading of the coupling collapses a recording to one number. This one resolves the
-same two readouts against **time before delivery** and asks whether the trajectories differ
-between the clinical classes -- which is the form the clinical question is actually asked in.
+The same two readouts the delivery clock resolves, resolved against a **different clinical
+landmark**. Delivery is the end of a process; the onset of the second stage is the event inside it
+that a clinician actually acts on, and two recordings four hours before delivery can be at
+completely different points of labour. Nothing else in this pipeline aligns recordings on it.
 
-**Both readouts travel, not just the KL.** The sibling pipeline tracks the KL alone; here
-``pred_gap`` is tracked beside it, because the two fail differently. ``pred_gap`` is in the
-decoder's own units and is immune to the prior-variance inflation, while
-``source_conditioned_kl_raw`` is multiplied by an arbitrary factor whenever the prior variance
-sits on its clamp. A trajectory visible in one and absent from the other is a finding about which
-of the two is being read, and a run tracking only the KL cannot see it.
+**The axis is signed and is not negated.** The shard stores
+$\texttt{second\_stage\_onset} = \texttt{domain\_start} - t_{\mathrm{SSO}}$, so
+$h = \texttt{second\_stage\_onset}/3600$ is already negative before onset and positive after it --
+the mirror of ``epoch``, which is stored as time *before* delivery and therefore is negated. The
+arithmetic lives in :func:`~teb_vae.lag_attn_rws.eval.cohort.add_second_stage_bins` and is pinned
+there by a known-answer test, because negating this one as well would run every trajectory
+backwards through the second stage with nothing raising. For the same reason the figures are drawn
+in the **natural** orientation with a line at zero, rather than inverted the way the delivery
+clock's are, and the axis label names the sign convention outright.
 
-**The unit is the recording, inside a window as well as across the split.** A window's value for
-a recording is the mean over that recording's segments falling in it; the tests then run over one
-value per recording. Skipping that step would let a recording contributing eleven segments to a
-window outvote one contributing two.
+**This analysis scores a different population, and says so.** A recording with no recorded onset
+cannot be placed on this axis at all, so it is dropped and counted; the analysis therefore reports
+fewer segments than every analysis beside it and declares itself ``capped``, which is the existing
+mechanism for "excluded from the population comparison" rather than a disagreement about who was
+evaluated.
 
-**Three layers of inference, in this order.**
+**Two further ways a stored onset can be wrong are counted and filtered nowhere.** An onset falling
+at delivery itself is what a pipeline writes when it substitutes zero for a missing time, and an
+onset that moves across a recording's own segments can only come from a broken write. Both are
+reported per recording in the eligibility table and in the record; neither excludes anything,
+because excluding a recording changes the population every number is computed over and a count does
+not.
 
-* **Per window**, a Kruskal-Wallis across the classes present in it. Per window rather than
-  pooled is what makes this a statement about the *trajectory*: it localises where the classes
-  differ instead of collapsing gestation into one number. Non-parametric because these
-  distributions are skewed and heavy-tailed.
-* **Holm across the windows**, which form one family. Twenty-five windows at $\alpha = 0.05$
-  produce a false positive with near certainty by construction. Holm rather than Bonferroni
-  because it is uniformly more powerful at the same family-wise error rate.
-* **Pairwise Mann-Whitney with Cliff's delta**, for the windows that survived Holm only. Running
-  the pairwise tests on a window whose omnibus found nothing is the multiple-comparison problem
-  with extra steps.
+**Three layers of inference, and the family is this clock's own.** Kruskal-Wallis across the classes
+per window, Holm across *these* windows as one family, pairwise Mann-Whitney with Cliff's delta on
+the survivors. The correction is **not** joint with the delivery clock's: the two are different
+alignments of an overlapping population, so a window significant on one and not the other is a
+statement about alignment, and the family-wise error rate each correction controls is within its own
+clock. A reader combining a claim from both clocks is making two comparisons and is told so here.
 
-A **pooled** row is reported beside them and consumed by nothing: it ignores time, and the classes
-do not cover the time axis equally, so a pooled difference can be a coverage artifact rather than
-a difference in coupling. It carries ``confounded_by_time`` in the output for that reason.
+.. note::
+
+    lean-limit: the per-window cohort split below is written out here as well as in the
+    delivery clock's analysis, because an analysis may not import another and the two differ in the
+    window columns, the orientation and the eligibility rule; move it into ``cohort.py``,
+    parameterised on the clock, when a third clock needs it.
 """
 from __future__ import annotations
 
@@ -46,73 +55,138 @@ from teb_vae.lag_attn_rws.eval import cohort
 from teb_vae.lag_attn_rws.eval import figures_seam as figures
 from teb_vae.lag_attn_rws.eval._reuse import labels, stats as shared_stats
 
-#: This analysis's own subdirectory inside the results directory.
-ANALYSIS_DIRNAME = "time_to_delivery"
+#: This analysis's own subdirectory inside the results directory. Its own rather than a section of
+#: the delivery clock's, because it scores a *different population* and has to record who was
+#: dropped and why -- which is a directory rather than a footnote in one named for another clock.
+ANALYSIS_DIRNAME = "second_stage"
 
 #: What it writes.
-TRAJECTORY_FILENAME = "time_to_delivery_trajectory.csv"
-PER_RECORDING_FILENAME = "time_to_delivery_per_recording.csv"
-SIGNIFICANCE_FILENAME = "time_to_delivery_significance.csv"
-PAIRWISE_FILENAME = "time_to_delivery_pairwise.csv"
+TRAJECTORY_FILENAME = "second_stage_trajectory.csv"
+PER_RECORDING_FILENAME = "second_stage_per_recording.csv"
+SIGNIFICANCE_FILENAME = "second_stage_significance.csv"
+PAIRWISE_FILENAME = "second_stage_pairwise.csv"
+ELIGIBILITY_FILENAME = "second_stage_eligibility.csv"
 
 #: The figures, named as ``FIGURE_GUIDE.md`` names them. The trajectory is the shape of the two
-#: readouts against the clock; the windows page is what that shape is made of -- the per-recording
-#: distribution in every window, the corrected significance of every window, and the effect size of
-#: every cohort pair that survived it.
-TRAJECTORY_FIGURE = "time_to_delivery_trajectory.pdf"
-WINDOWS_FIGURE = "time_to_delivery_windows.pdf"
+#: readouts against this clock; the windows page is what that shape is made of.
+TRAJECTORY_FIGURE = "second_stage_trajectory.pdf"
+WINDOWS_FIGURE = "second_stage_windows.pdf"
 
-#: Width of a time-before-delivery window, in hours. Bound from the layer below rather than
-#: restated: the lag structure is cut on the same windows and an analysis may not import another,
-#: so one constant defines the grid both are read on. It is **not** an ``eval_config`` key -- an
-#: operator who could widen it could merge two windows until a difference appeared or disappeared.
+#: Width of a window, in hours. The **same** grid the delivery clock uses, bound from the layer
+#: below rather than restated, so a window on one clock's figure is the same duration as a window on
+#: the other's. It is not an ``eval_config`` key, for the reason it is not one there.
 TRAJECTORY_BIN_HOURS = cohort.TRAJECTORY_BIN_HOURS
 
-#: Family-wise error rate the Holm correction across the windows controls. Not configurable, for
-#: the reason the bin width is not.
+#: Family-wise error rate the Holm correction across **this clock's** windows controls.
 DEFAULT_ALPHA = 0.05
 
-#: The two readouts tracked, as ``(reported name, per-sample column, what it is)``. Both, because
-#: they fail differently -- see the module docstring. Bound from the layer below rather than
-#: restated, for the reason the bin width is: the second clinical clock resolves exactly these two
-#: quantities as well, and two copies of the tuple would be two answers to what a clock figure
-#: shows.
+#: The two readouts, bound from the layer below rather than restated: both clocks resolve exactly
+#: these, and two copies of the tuple would be two answers to what a clock figure shows.
 READOUTS: Tuple[Tuple[str, str, str], ...] = cohort.CLOCK_READOUTS
 
 #: The per-sample columns this analysis reduces, in the order the tables carry them.
 VALUE_COLUMNS: Tuple[str, ...] = cohort.CLOCK_VALUE_COLUMNS
 
+#: The x-axis label of both figures. It names the sign convention explicitly rather than leaving
+#: "hours from onset" to be read either way round: a reader who takes a negative value for "after"
+#: reads the whole trajectory backwards, and nothing on the page would contradict them.
+AXIS_LABEL = "Hours from second-stage onset (negative = before onset, positive = after)"
+
 #: The method sentence written into every record, so a $p$-value here is readable without this
-#: module.
+#: module -- including the fact that its family stops at this clock.
 METHOD = (
-    "Per time-before-delivery window: Kruskal-Wallis across clinical classes over one value per "
-    "recording, Holm step-down correction across the windows as one family, pairwise two-sided "
-    "Mann-Whitney U with Cliff's delta for the windows significant after Holm only. "
-    "Non-parametric throughout. Classes with fewer than "
-    f"{shared_stats.MIN_GROUP_SIZE} recordings in a window are excluded from it and recorded. The "
-    "pooled row ignores time and is confounded by unequal class coverage of the axis."
+    "Per window of signed hours from second-stage onset: Kruskal-Wallis across clinical classes "
+    "over one value per recording, Holm step-down correction across this clock's windows as one "
+    "family, pairwise two-sided Mann-Whitney U with Cliff's delta for the windows significant "
+    "after Holm only. Non-parametric throughout. Classes with fewer than "
+    f"{shared_stats.MIN_GROUP_SIZE} recordings in a window are excluded from it and recorded. "
+    "The Holm family is this clock's windows alone and is NOT corrected jointly with the "
+    "time-before-delivery clock's: the two clocks are different alignments of an overlapping "
+    "population, so a window significant on one and not the other is a statement about alignment, "
+    "and the family-wise error rate each correction controls is within its own clock. The pooled "
+    "row ignores the clock and is confounded by unequal class coverage of the axis."
 )
+
+
+# =============================================================================
+# Who can be placed on this clock at all
+# =============================================================================
+def eligible_rows(per_sample: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Split the per-sample table into its eligibility record and the rows that record admits.
+
+    Args:
+        per_sample: The collected per-sample table.
+
+    Returns:
+        ``(eligibility, rows)`` -- the per-recording eligibility table from
+        :func:`~teb_vae.lag_attn_rws.eval.cohort.second_stage_eligibility`, and the subset of
+        ``per_sample`` belonging to the recordings it marks eligible. **One rule drops a
+        recording: it has no onset.** The at-delivery and inconsistent-onset diagnostics travel on
+        the table and exclude nothing.
+    """
+    eligibility = cohort.second_stage_eligibility(per_sample)
+    if eligibility.empty or "guid" not in getattr(per_sample, "columns", []):
+        return eligibility, per_sample.iloc[:0]
+    admitted = sorted(set(eligibility.loc[eligibility["eligible"].astype(bool), "guid"].astype(str)))
+    return eligibility, per_sample[per_sample["guid"].astype(str).isin(admitted)]
+
+
+def eligibility_summary(eligibility: pd.DataFrame) -> Dict[str, Any]:
+    """Count the population this analysis kept, the one it dropped, and the two diagnostics.
+
+    Args:
+        eligibility: The per-recording eligibility table.
+
+    Returns:
+        Counts over **recordings**, never segments: how many there were, how many carry an onset,
+        how many were dropped for not carrying one, and how many of those kept are flagged by
+        either diagnostic. The tolerance the second diagnostic is measured at travels with them,
+        so the number is readable without this module.
+    """
+    if eligibility.empty:
+        kept = dropped = at_delivery = inconsistent = 0
+    else:
+        admitted = eligibility["eligible"].astype(bool)
+        kept = int(admitted.sum())
+        dropped = int((~admitted).sum())
+        at_delivery = int(eligibility.loc[admitted, "onset_at_delivery"].astype(bool).sum())
+        inconsistent = int(eligibility.loc[admitted, "inconsistent_onset"].astype(bool).sum())
+    return {
+        "n_recordings": int(len(eligibility)),
+        "n_eligible": kept,
+        "n_dropped_no_onset": dropped,
+        # Counted, never filtered -- see the module docstring.
+        "n_onset_at_delivery": at_delivery,
+        "n_inconsistent_onset": inconsistent,
+        "onset_consistency_tolerance_s": float(cohort.ONSET_CONSISTENCY_TOLERANCE_S),
+    }
 
 
 # =============================================================================
 # Binning and the trajectory tables
 # =============================================================================
 def build_per_recording(
-    per_sample: pd.DataFrame, *, width: float = TRAJECTORY_BIN_HOURS
+    frame: pd.DataFrame, *, width: float = TRAJECTORY_BIN_HOURS
 ) -> Dict[str, pd.DataFrame]:
-    """Reduce the per-sample table to one row per (cohort, window, recording), per axis.
+    """Reduce the eligible rows to one row per (cohort, window, recording), per axis.
 
     Args:
-        per_sample: The collected per-sample table.
+        frame: The eligible subset of the per-sample table.
         width: Window width in hours.
 
     Returns:
-        Cohort axis to its per-recording-per-window frame. Both axes are built because a reader
-        wants both cuts; only the class axis is tested.
+        Cohort axis to its per-recording-per-window frame, cut on **this clock's** window columns.
+        Both axes are built because a reader wants both cuts; only the class axis is tested.
     """
-    binned = cohort.add_time_bins(per_sample, width=width)
+    binned = cohort.add_second_stage_bins(frame, width=width)
     return {
-        axis: cohort.per_recording_in_bins(binned, VALUE_COLUMNS, group_column=axis)
+        axis: cohort.per_recording_in_bins(
+            binned,
+            VALUE_COLUMNS,
+            group_column=axis,
+            bin_column=cohort.SECOND_STAGE_BIN_COLUMN,
+            center_column=cohort.SECOND_STAGE_BIN_CENTER_COLUMN,
+        )
         for axis in labels.GROUP_COLUMNS
     }
 
@@ -125,12 +199,20 @@ def build_trajectory_rows(per_recording: Dict[str, pd.DataFrame]) -> List[Dict[s
 
     Returns:
         Long-form rows carrying the axis, the cohort, the window, the recording count and the
-        quartiles -- one table a reader can pivot rather than four.
+        quartiles. The window keys stay ``time_bin`` and ``bin_center_h`` on this clock too: they
+        name a window and its centre, which is what they are on either, and renaming them per clock
+        would fork every consumer of the table.
     """
     rows: List[Dict[str, Any]] = []
     for axis, frame in per_recording.items():
         for name, column, _ in READOUTS:
-            for row in cohort.trajectory_rows(frame, column, metric=name):
+            for row in cohort.trajectory_rows(
+                frame,
+                column,
+                metric=name,
+                bin_column=cohort.SECOND_STAGE_BIN_COLUMN,
+                center_column=cohort.SECOND_STAGE_BIN_CENTER_COLUMN,
+            ):
                 rows.append({"group_column": axis, "source_column": column, **row})
     return rows
 
@@ -148,8 +230,9 @@ def _class_values(frame: pd.DataFrame, column: str) -> Dict[str, np.ndarray]:
     Returns:
         Every class present, in the canonical healthy / acidosis / HIE order, mapped to its finite
         values. **Nothing is filtered here**: a class too small to test is still a class a figure
-        must show, because a cohort thinning out toward the edge of the axis is the explanation
-        for the window beside it and is invisible if the values are dropped this early.
+        must show, because a cohort thinning out toward the edge of the axis is the explanation for
+        the window beside it -- and on this clock the positive side is short by construction, so
+        that thinning is the common case rather than the exception.
     """
     values_by_class: Dict[str, np.ndarray] = {}
     for group in cohort.ordered_groups(
@@ -162,7 +245,9 @@ def _class_values(frame: pd.DataFrame, column: str) -> Dict[str, np.ndarray]:
     return values_by_class
 
 
-def _class_samples(frame: pd.DataFrame, column: str) -> Tuple[Dict[str, np.ndarray], Dict[str, int]]:
+def _class_samples(
+    frame: pd.DataFrame, column: str
+) -> Tuple[Dict[str, np.ndarray], Dict[str, int]]:
     """Split one window's rows into per-class finite vectors, dropping classes too small to test.
 
     Args:
@@ -171,10 +256,10 @@ def _class_samples(frame: pd.DataFrame, column: str) -> Tuple[Dict[str, np.ndarr
 
     Returns:
         ``(usable, excluded)`` -- the classes with at least ``MIN_GROUP_SIZE`` recordings, and the
-        sizes of those without, both in the canonical healthy / acidosis / HIE order. The
-        exclusion is returned rather than dropped because "this class had two recordings in this
-        window" is the explanation for a window the test skipped, and a reader who cannot see it
-        will assume the comparison was made.
+        sizes of those without, both in the canonical order. The exclusion is returned rather than
+        dropped because "this class had two recordings in this window" is the explanation for a
+        window the test skipped, and a reader who cannot see it will assume the comparison was
+        made.
     """
     values_by_class = _class_values(frame, column)
     return (
@@ -194,8 +279,8 @@ def window_samples(
 ) -> Tuple[Dict[int, Dict[str, np.ndarray]], Dict[int, Dict[str, Any]]]:
     """Split a per-recording frame into the cells each window is tested and drawn from.
 
-    One function rather than two because the figure and the test must describe the *same* cells:
-    a violin drawn from one set of values under a $p$-value computed from another is a page that
+    One function rather than two because the figure and the test must describe the *same* cells: a
+    violin drawn from one set of values under a $p$-value computed from another is a page that
     disagrees with itself and looks entirely ordinary.
 
     Args:
@@ -203,24 +288,26 @@ def window_samples(
         column: The value column.
 
     Returns:
-        ``(samples, meta)`` keyed by window, in ascending window order. ``samples`` holds **every**
-        class present in that window, unfiltered -- :func:`testable_windows` is what applies the
-        floor, because the figure and the test want different halves of the same split: the test
-        may only run on the classes that clear it, and the figure must draw the ones that do not,
-        or a cohort thinning out toward the edge of the axis simply disappears. ``meta`` holds what
-        each window publishes beside its test -- the centre, the classes excluded as too small, and
-        the floor they were excluded at. Both empty when the frame carries no windows at all.
+        ``(samples, meta)`` keyed by window, in ascending window order -- which on this clock runs
+        from before the onset to after it, because the bin index is signed rather than clipped.
+        ``samples`` holds **every** class present in that window, unfiltered;
+        :func:`testable_windows` is what applies the floor, because the figure and the test want
+        different halves of the same split. ``meta`` holds what each window publishes beside its
+        test -- the centre, the classes excluded as too small, and the floor they were excluded at.
     """
     samples: Dict[int, Dict[str, np.ndarray]] = {}
     meta: Dict[int, Dict[str, Any]] = {}
-    if per_recording.empty or cohort.BIN_COLUMN not in getattr(per_recording, "columns", []):
+    columns = getattr(per_recording, "columns", [])
+    if per_recording.empty or cohort.SECOND_STAGE_BIN_COLUMN not in columns:
         return samples, meta
-    for bin_index in sorted(int(value) for value in per_recording[cohort.BIN_COLUMN].unique()):
-        cell = per_recording[per_recording[cohort.BIN_COLUMN] == bin_index]
+    for bin_index in sorted(
+        int(value) for value in per_recording[cohort.SECOND_STAGE_BIN_COLUMN].unique()
+    ):
+        cell = per_recording[per_recording[cohort.SECOND_STAGE_BIN_COLUMN] == bin_index]
         values_by_class = _class_values(cell, column)
         samples[int(bin_index)] = values_by_class
         meta[int(bin_index)] = {
-            "bin_center_h": float(cell[cohort.BIN_CENTER_COLUMN].iloc[0]),
+            "bin_center_h": float(cell[cohort.SECOND_STAGE_BIN_CENTER_COLUMN].iloc[0]),
             "groups_excluded_as_too_small": {
                 group: int(values.size) for group, values in values_by_class.items()
                 if values.size < shared_stats.MIN_GROUP_SIZE
@@ -262,13 +349,12 @@ def analyse_windows(
     Args:
         per_recording: The class-axis per-recording-per-window frame.
         column: The value column to test.
-        alpha: Family-wise error rate the Holm correction controls.
+        alpha: Family-wise error rate the Holm correction controls, **within this clock**.
 
     Returns:
         The record: whether the test could run at all, the per-window omnibus results with their
         Holm-adjusted $p$-values, the pairwise comparisons for the windows that survived, and the
-        pooled context row. ``tested`` is ``False`` with a reason on a split carrying fewer than
-        two classes -- the ordinary outcome on the healthy-only pretraining split, not a failure.
+        pooled context row.
     """
     groups = (
         cohort.ordered_groups(
@@ -296,7 +382,8 @@ def analyse_windows(
     # order, and which were too small to enter the test. The arithmetic half -- the omnibus, Holm
     # across the windows and the pairwise sweep on the survivors -- is
     # ``stats.windowed_group_comparisons``, shared with every other trajectory analysis in the
-    # family, so that "significant" has one definition here rather than one per pipeline.
+    # family, so that "significant" has one definition across the repository rather than one per
+    # clock.
     samples_by_window, meta_by_window = window_samples(per_recording, column)
 
     outcome = shared_stats.windowed_group_comparisons(
@@ -323,7 +410,7 @@ def analyse_windows(
 
 
 def _pooled_test(per_recording: pd.DataFrame, column: str) -> Dict[str, Any]:
-    """One time-ignoring Kruskal-Wallis across the classes, flagged as confounded.
+    """One clock-ignoring Kruskal-Wallis across the classes, flagged as confounded.
 
     Args:
         per_recording: The class-axis per-recording-per-window frame.
@@ -336,18 +423,18 @@ def _pooled_test(per_recording: pd.DataFrame, column: str) -> Dict[str, Any]:
     if per_recording.empty or "group" not in per_recording.columns:
         usable: Dict[str, np.ndarray] = {}
     else:
-        # One value per recording first. The frame is keyed per (recording, window), so a
-        # recording spanning eleven windows would otherwise enter the test eleven times: the
-        # p-value would be pseudo-replicated by the windows-per-recording factor and the reported
-        # `n` would be a row count wearing a recording's name. It also lets duplicated rows clear
-        # the `MIN_GROUP_SIZE` floor that exists to keep tiny cohorts out.
+        # One value per recording first. The frame is keyed per (recording, window), so a recording
+        # spanning several windows would otherwise enter the test several times: the p-value would
+        # be pseudo-replicated by the windows-per-recording factor and the reported `n` would be a
+        # row count wearing a recording's name. It also lets duplicated rows clear the
+        # `MIN_GROUP_SIZE` floor that exists to keep tiny cohorts out.
         pooled_frame = per_recording.groupby(["group", "guid"], as_index=False)[column].mean()
         usable, _ = _class_samples(pooled_frame, column)
     record = shared_stats.kruskal_across_groups(usable)
     record["confounded_by_time"] = True
     record["note"] = (
         "pooled across every window, so a difference here can be an artifact of the classes "
-        "covering the time-to-delivery axis unequally rather than a difference in coupling; it is "
+        "covering the second-stage axis unequally rather than a difference in coupling; it is "
         "context and is consumed by nothing"
     )
     return record
@@ -418,12 +505,14 @@ def pairwise_frame(records: Sequence[Dict[str, Any]]) -> pd.DataFrame:
 
 
 def build_trajectory_figure(rows: Sequence[Dict[str, Any]], axis: str) -> Any:
-    """Draw one panel per readout: the class trajectories, with each window's $n$ annotated.
+    """Draw one panel per readout: the class trajectories against this clock, with each window's
+    $n$ annotated.
 
-    The count is annotated per window rather than reported once for the analysis because it is
-    what a trajectory hides: a window's median can move because the cohort changed rather than
-    because the coupling did, and the only thing that says which is the number of recordings
-    behind that point.
+    The count is annotated per window rather than reported once for the analysis because it is what
+    a trajectory hides -- and on this clock it hides more of it than on the other: in the sampled
+    onset table the second stage begins a couple of hours before delivery, so the windows after
+    onset hold far fewer recordings than the windows before it, and a median there will wander for
+    reasons that have nothing to do with the coupling.
 
     Args:
         rows: The long-form trajectory rows.
@@ -439,7 +528,7 @@ def build_trajectory_figure(rows: Sequence[Dict[str, Any]], axis: str) -> Any:
             axes[index, 0],
             [row for row in selected if row["metric"] == name],
             axis,
-            title=f"{name} against time before delivery, by {axis}",
+            title=f"{name} against time from second-stage onset, by {axis}",
         )
     return figure
 
@@ -466,8 +555,8 @@ def _draw_panel(ax: Any, rows: Sequence[Dict[str, Any]], axis: str, *, title: st
         figures.style_axes(ax)
         return 0
 
-    # From this package's one cohort palette, so a class is the same green / amber / red here as
-    # on every other figure this evaluation draws of it.
+    # From this package's one cohort palette, so a class is the same green / amber / red here as on
+    # every other figure this evaluation draws of it.
     colours = figures.group_colors(groups)
     for group in groups:
         cell = sorted(
@@ -496,25 +585,26 @@ def _draw_panel(ax: Any, rows: Sequence[Dict[str, Any]], axis: str, *, title: st
                 fontsize=figures.FONT_TINY, color=colour,
             )
     ax.set_title(title)
-    ax.set_xlabel("Time before delivery (hours)")
+    ax.set_xlabel(AXIS_LABEL)
     ax.set_ylabel("nats per anchor")
-    # Delivery sits at the right, so the eye reads left to right toward it.
-    ax.invert_xaxis()
+    # The axis is **not** inverted, which is the whole difference from the delivery clock: this
+    # coordinate is signed and reads naturally left to right, and the line marks the landmark
+    # itself so the two halves of the axis are told apart by the page rather than by the label.
+    ax.axvline(
+        0.0, color=figures.COLOR_GRAY, linestyle=":", linewidth=figures.LINE_REGULAR, zorder=0
+    )
     ax.legend(fontsize=figures.FONT_LABEL, loc="best")
     figures.style_axes(ax)
     return len(groups)
 
 
-def build_windows_figure(
-    class_frame: pd.DataFrame, records: Sequence[Dict[str, Any]]
-) -> Any:
+def build_windows_figure(class_frame: pd.DataFrame, records: Sequence[Dict[str, Any]]) -> Any:
     """Draw what the trajectory is made of: the distributions, their significance and the effects.
 
     The trajectory figure draws one number per (window, class) cell and the tests were run on the
     values behind it; this draws both, on one axis, so a reader is not asked to hold a median in
     mind while opening a CSV. The cells come from :func:`window_samples`, which is also where the
-    tested cells come from -- a violin drawn from one set of values under a $p$-value computed
-    from another is a page that disagrees with itself and looks entirely ordinary.
+    tested cells come from.
 
     Args:
         class_frame: The class-axis per-recording-per-window frame.
@@ -531,8 +621,8 @@ def build_windows_figure(
     readouts = []
     for (name, column, _), record in zip(READOUTS, records):
         samples, _ = window_samples(class_frame, column)
-        # Aligned with the record's own window list by construction rather than by agreement, so
-        # a window the test skipped cannot shift the cells drawn under the windows after it.
+        # Aligned with the record's own window list by construction rather than by agreement, so a
+        # window the test skipped cannot shift the cells drawn under the windows after it.
         order = [int(row["time_bin"]) for row in record.get("per_window") or []]
         readouts.append((name, [samples.get(key, {}) for key in order], record))
 
@@ -540,12 +630,13 @@ def build_windows_figure(
         readouts,
         groups=cohort.ordered_groups(present, labels.CLASS_COLUMN),
         bin_width=TRAJECTORY_BIN_HOURS,
-        # The same floor the test excludes a cell at, passed rather than defaulted, so the page
-        # and the p-values beneath it agree about which cells carry evidence.
+        # The same floor the test excludes a cell at, passed rather than defaulted, so the page and
+        # the p-values beneath it agree about which cells carry evidence.
         min_body_size=shared_stats.MIN_GROUP_SIZE,
-        xlabel="Time before delivery (hours)",
+        xlabel=AXIS_LABEL,
         ylabel="nats per anchor",
-        delivery_orientation=True,
+        # Natural orientation with the onset marked, not the delivery clock's inversion.
+        delivery_orientation=False,
     )
 
 
@@ -553,7 +644,7 @@ def _skip(reason: str, n_segments: int) -> Dict[str, Any]:
     """Return the recorded skip, and log it.
 
     Args:
-        reason: Why there is no trajectory.
+        reason: Why there is no second-stage trajectory.
         n_segments: How many segments the table held.
 
     Returns:
@@ -572,49 +663,83 @@ def _skip(reason: str, n_segments: int) -> Dict[str, Any]:
     }
 
 
-def run_time_to_delivery_analysis(
+def run_second_stage_analysis(
     context: Any,
     *,
     eval_config: Dict[str, Any],
     output_dir: Any,
     probe: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """Bin both coupling readouts against time before delivery and test the class trajectories.
+    """Bin both coupling readouts against signed hours from second-stage onset and test the classes.
 
     Args:
         context: The analysis context, read for the collected per-sample table.
         eval_config: The validated block. Unused: neither the window width nor the significance
             level is configurable, for the reason stated on each constant.
         output_dir: The results directory; this analysis writes into its own subdirectory.
-        probe: The loader probe's record. Unused: the population is the set of segments carrying a
-            finite ``epoch``, which only the table knows.
+        probe: The loader probe's record. Unused: the population is the set of recordings carrying
+            an onset on every segment, which only the table knows.
 
     Returns:
-        The protocol's keys plus the trajectory summary, the per-window significance of both
-        readouts, and the paths written. A recorded skip on a split with no ``epoch`` or no
-        cohort labels.
+        The protocol's keys plus the eligibility record, the trajectory summary, the per-window
+        significance of both readouts, and the paths written. A recorded skip -- naming its cause --
+        on an empty table, a table collected before the onset column existed, a cohort with no
+        onset at all, a cohort whose readouts are all non-finite, or a single-class split.
     """
     per_sample = context.collection.per_sample
     if per_sample.empty:
         return _skip("the collected per-sample table was empty", 0)
-    if "epoch" not in per_sample.columns:
+    if cohort.SECOND_STAGE_COLUMN not in per_sample.columns:
         return _skip(
-            "the batches carried no 'epoch' field, so time before delivery is unavailable",
+            f"the collected table carries no '{cohort.SECOND_STAGE_COLUMN}' column, so no "
+            f"recording can be placed on the second-stage clock; a run directory collected before "
+            f"that column existed has to be collected again to gain it",
             len(per_sample),
         )
 
-    per_recording = build_per_recording(per_sample)
+    eligibility, eligible = eligible_rows(per_sample)
+    population = eligibility_summary(eligibility)
+    if eligible.empty:
+        return _skip(
+            f"no recording carried a second-stage onset on every one of its segments "
+            f"({population['n_dropped_no_onset']} of {population['n_recordings']} recording(s) "
+            f"dropped), so this cohort cannot be placed on the second-stage clock",
+            len(per_sample),
+        )
+
+    per_recording = build_per_recording(eligible)
     rows = build_trajectory_rows(per_recording)
     if not rows:
         return _skip(
-            "no segment carried both a finite epoch and a cohort label, so there is no "
-            "trajectory to draw",
+            "no eligible segment carried both a finite readout and a cohort label, so there is no "
+            "second-stage trajectory to draw",
+            len(per_sample),
+        )
+
+    class_frame = per_recording.get(labels.CLASS_COLUMN, pd.DataFrame())
+    classes = (
+        cohort.ordered_groups(
+            sorted(set(class_frame["group"].astype(str))), labels.CLASS_COLUMN
+        )
+        if len(class_frame) and "group" in class_frame.columns
+        else []
+    )
+    if len(classes) < 2:
+        # A skip rather than an untested trajectory, unlike the delivery clock: this analysis
+        # exists for the class contrast on a subset population, and with one class it would report
+        # a shape the other clock already draws over more recordings.
+        return _skip(
+            f"fewer than two clinical classes among the recordings that carry a second-stage "
+            f"onset ({classes or 'none'})",
             len(per_sample),
         )
 
     directory = Path(output_dir) / ANALYSIS_DIRNAME
     directory.mkdir(parents=True, exist_ok=True)
 
+    # Written before anything else: it is the record of *who was dropped and why*, and it is the
+    # one table that describes the recordings this analysis does not otherwise mention.
+    eligibility.to_csv(directory / ELIGIBILITY_FILENAME, index=False)
     pd.DataFrame(rows).to_csv(directory / TRAJECTORY_FILENAME, index=False)
     # One frame, both axes, so a reader can recompute any cell of the tables above from the
     # per-recording values that produced it.
@@ -624,10 +749,7 @@ def run_time_to_delivery_analysis(
     )
     tall.to_csv(directory / PER_RECORDING_FILENAME, index=False)
 
-    class_frame = per_recording.get(labels.CLASS_COLUMN, pd.DataFrame())
-    significance = [
-        analyse_windows(class_frame, column) for _, column, _ in READOUTS
-    ]
+    significance = [analyse_windows(class_frame, column) for _, column, _ in READOUTS]
     significance_frame(significance).to_csv(directory / SIGNIFICANCE_FILENAME, index=False)
     pairwise_frame(significance).to_csv(directory / PAIRWISE_FILENAME, index=False)
 
@@ -642,20 +764,33 @@ def run_time_to_delivery_analysis(
         ).name
     )
 
-    n_recordings = int(tall["guid"].nunique()) if "guid" in tall.columns else 0
+    n_windows = int(tall[cohort.SECOND_STAGE_BIN_COLUMN].nunique()) if len(tall) else 0
+    binned = cohort.add_second_stage_bins(eligible)
     logger.info(
-        f"{ANALYSIS_DIRNAME}: {len(rows)} cell(s) over "
-        f"{int(tall[cohort.BIN_COLUMN].nunique()) if len(tall) else 0} window(s) of "
-        f"{TRAJECTORY_BIN_HOURS:g} h from {n_recordings} recording(s)"
+        f"{ANALYSIS_DIRNAME}: {population['n_eligible']} of {population['n_recordings']} "
+        f"recording(s) placed on the second-stage clock over {n_windows} window(s) of "
+        f"{TRAJECTORY_BIN_HOURS:g} h; {population['n_dropped_no_onset']} dropped for having no "
+        f"onset, {population['n_onset_at_delivery']} kept with an onset at delivery and "
+        f"{population['n_inconsistent_onset']} with an onset that moves within the recording"
     )
     return {
-        "n_samples": int(len(cohort.add_time_bins(per_sample))),
+        # The eligible segments, which is fewer than every other analysis scores -- hence `capped`
+        # below, so the coverage block reads this as a different population by design rather than
+        # as two analyses disagreeing about who was evaluated.
+        "n_samples": int(len(binned)),
         "composition": {
-            "n_recordings": n_recordings,
-            "n_windows": int(tall[cohort.BIN_COLUMN].nunique()) if len(tall) else 0,
+            "n_recordings": population["n_eligible"],
+            "n_windows": n_windows,
         },
-        "plan": {"capped": False},
+        "plan": {
+            "capped": True,
+            "reason": (
+                "scored over the recordings that carry a second-stage onset only, which is a "
+                "subset of the evaluated cohort"
+            ),
+        },
         "bin_width_hours": float(TRAJECTORY_BIN_HOURS),
+        "eligibility": population,
         "readouts": [
             {"metric": name, "source_column": column, "meaning": note}
             for name, column, note in READOUTS
@@ -674,7 +809,7 @@ def run_time_to_delivery_analysis(
         # already cut by cohort, so its frame carries one row per (cohort, window, recording).
         # Fanning the by-class and by-subgroup emitter over it would resolve a cut by a cut.
         "files": [
-            TRAJECTORY_FILENAME, PER_RECORDING_FILENAME, SIGNIFICANCE_FILENAME,
-            PAIRWISE_FILENAME, figure_name, windows_name,
+            ELIGIBILITY_FILENAME, TRAJECTORY_FILENAME, PER_RECORDING_FILENAME,
+            SIGNIFICANCE_FILENAME, PAIRWISE_FILENAME, figure_name, windows_name,
         ],
     }

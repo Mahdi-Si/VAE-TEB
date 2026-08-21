@@ -481,6 +481,23 @@ COHORT_ONSET_OFFSET = 5400.0
 #: trajectory test a skip.
 COHORT_ONSET_MISSING_SHARD = "hie_no_cs"
 
+#: Which of a shard's written segments the second stage begins at, as an index into its own epochs.
+#: Placed INSIDE the span rather than before it so each shard's segments land on **both** sides of
+#: onset: the positive half of that axis -- the part the second clock exists to show -- is
+#: otherwise never exercised, and every assertion about it would hold vacuously.
+#:
+#: Every shard uses the same index, so the eight of them put their recordings in the same few
+#: second-stage windows. That is deliberate: at three recordings per shard, per-class windows would
+#: otherwise never reach the `MIN_GROUP_SIZE` floor and the run-level significance path would be a
+#: skip on every window.
+COHORT_SECOND_STAGE_INDEX = 2
+
+#: The shard whose first recording carries an onset equal to delivery itself. That is what a
+#: pipeline writes when it substitutes zero for a missing time, it passes a NaN filter, and it is
+#: counted rather than excluded -- so the count has to be non-zero somewhere or the diagnostic that
+#: reports it is never exercised.
+COHORT_SECOND_STAGE_SENTINEL_SHARD = "hie_cs"
+
 
 def cohort_weight_profile(seq_len: int) -> np.ndarray:
     """Build the per-step validity profile every cohort sample shares.
@@ -577,6 +594,17 @@ def write_causal_cohort_shards(
         if subgroup == COHORT_ONSET_MISSING_SHARD:
             onset[COHORT_SEGMENTS_PER_GUID:] = np.nan
 
+        # The second clinical clock, stored exactly as the real pipeline stores it:
+        # `domain_start - t_sso`, signed, negative before second-stage onset and positive after.
+        second_stage = epochs - epochs[COHORT_SECOND_STAGE_INDEX]
+        if subgroup == COHORT_ONSET_MISSING_SHARD:
+            # The same recordings the labour-onset table has never heard of, so one shard tells one
+            # story about a cohort with no clinical times rather than two.
+            second_stage = np.full((per_shard,), np.nan, dtype="f4")
+        elif subgroup == COHORT_SECOND_STAGE_SENTINEL_SHARD:
+            # Implied onset = epoch - offset = 0: second stage recorded at delivery.
+            second_stage[:COHORT_SEGMENTS_PER_GUID] = epochs[:COHORT_SEGMENTS_PER_GUID]
+
         pipeline.append_samples_batch(
             path,
             fhr_batch=raw["fhr"][rows],
@@ -591,7 +619,7 @@ def write_causal_cohort_shards(
             cs_label_batch=np.full((per_shard,), meta["cs"], dtype="u1"),
             bg_label_batch=np.full((per_shard,), meta["bg"], dtype="u1"),
             tlo_batch=onset.astype("f4"),
-            second_stage_batch=np.full((per_shard,), np.nan, dtype="f4"),
+            second_stage_batch=second_stage.astype("f4"),
             up_st_batch=blocks["up_st"][rows].astype("f4"),
             up_ph_batch=blocks["up_ph"][rows].astype("f4"),
         )

@@ -202,3 +202,179 @@ def test_bootstrap_rejects_a_caller_error_rather_than_returning_a_degenerate_int
         stats.bootstrap_ci([1.0, 2.0, 3.0, 4.0], confidence=1.0)
     with pytest.raises(ValueError, match="resamples"):
         stats.bootstrap_ci([1.0, 2.0, 3.0, 4.0], resamples=0)
+
+
+# ---------------------------------------------------------------------------
+# The windowed procedure: omnibus per window, Holm across them, pairwise on the survivors
+# ---------------------------------------------------------------------------
+def _windows(offsets, *, n: int = 6, keys=None):
+    """Build ``{window: {group: values}}`` with the two groups a fixed distance apart per window.
+
+    Args:
+        offsets: One separation per window. Zero means the two groups coincide exactly.
+        n: Values per group. Six keeps a fully separated pair at $p \\approx 0.004$, so Holm over
+            a handful of windows still clears $0.05$ -- the test asserts a verdict, so the margin
+            has to be a property of the fixture rather than a hope.
+        keys: Window keys, defaulting to ``0, 1, 2, ...``.
+
+    Returns:
+        The mapping :func:`stats.windowed_group_comparisons` takes.
+    """
+    base = np.arange(float(n))
+    keys = list(range(len(offsets))) if keys is None else list(keys)
+    return {
+        key: {"low": base.copy(), "high": base + float(offset)}
+        for key, offset in zip(keys, offsets)
+    }
+
+
+def test_the_separated_windows_are_the_ones_that_survive_the_correction() -> None:
+    """A known answer in both directions. An implementation reporting significance
+    unconditionally passes the first half and fails the second."""
+    separated = stats.windowed_group_comparisons(_windows([50.0] * 4))
+    assert separated["n_windows"] == 4
+    assert separated["n_windows_tested"] == 4
+    assert separated["n_significant_windows"] == 4
+    assert set(separated["pairwise"]) == {"0", "1", "2", "3"}
+
+    overlapping = stats.windowed_group_comparisons(_windows([0.0] * 4))
+    assert overlapping["n_windows_tested"] == 4
+    assert overlapping["n_significant_windows"] == 0
+    assert overlapping["pairwise"] == {}
+
+
+def test_the_pairwise_sweep_runs_on_the_surviving_windows_only() -> None:
+    r"""Running $\binom{k}{2}$ tests on a window whose omnibus found nothing is the
+    multiple-comparison problem with extra steps."""
+    record = stats.windowed_group_comparisons(_windows([50.0, 0.0, 50.0, 0.0]))
+
+    surviving = {
+        str(window["time_bin"]) for window in record["per_window"] if window["significant"]
+    }
+    assert surviving == {"0", "2"}
+    assert set(record["pairwise"]) == surviving
+    assert record["pairwise"]["0"][0]["left"] == "high"  # sorted order, as the sweep names them
+
+
+def test_an_untestable_window_is_recorded_and_consumes_no_rank_in_the_family() -> None:
+    """Three testable windows beside two that are not: the correction is over three, and the two
+    are present in the output rather than dropped -- a window that found nothing and a window
+    nobody looked at are different statements."""
+    samples = _windows([50.0, 50.0, 50.0])
+    samples[3] = {"low": np.arange(6.0)}  # one group: the caller dropped the rest as too small
+    samples[4] = {}                       # none at all
+
+    record = stats.windowed_group_comparisons(samples)
+
+    assert record["n_windows"] == 5
+    assert record["n_windows_tested"] == 3
+    assert all(window["n_windows_in_family"] == 3 for window in record["per_window"])
+    for window in record["per_window"][3:]:
+        assert np.isnan(window["statistic"]) and np.isnan(window["p_value"])
+        assert window["note"] == stats.TOO_FEW_GROUPS_NOTE
+        assert window["significant"] is False
+    # And the three that were tested are corrected as a family of three, not of five.
+    tested = [window["p_value"] for window in record["per_window"][:3]]
+    assert [window["p_holm"] for window in record["per_window"][:3]] == pytest.approx(
+        stats.holm_adjust(tested)
+    )
+
+
+def test_no_minimum_group_size_is_applied_here() -> None:
+    """The floor belongs to the caller, which also has to *record* which groups it dropped. A
+    silent filter here would leave that record naming groups the test had quietly kept."""
+    record = stats.windowed_group_comparisons(
+        {0: {"low": np.array([1.0, 2.0]), "high": np.array([9.0, 10.0])}}
+    )
+
+    assert record["n_windows_tested"] == 1
+    assert record["per_window"][0]["n_per_group"] == {"low": 2, "high": 2}
+
+
+def test_the_omnibus_is_the_shared_one_and_matches_scipy() -> None:
+    from scipy import stats as sp
+
+    rng = np.random.default_rng(4)
+    samples = {name: rng.normal(centre, 0.4, 20) for name, centre in (("a", 1.0), ("b", 2.2))}
+    record = stats.windowed_group_comparisons({7: samples})
+
+    statistic, p_value = sp.kruskal(*samples.values())
+    assert record["per_window"][0]["statistic"] == pytest.approx(float(statistic))
+    assert record["per_window"][0]["p_value"] == pytest.approx(float(p_value))
+    assert record["per_window"][0]["test"] == "kruskal-wallis"
+
+
+def test_the_correction_never_reduces_a_p_value() -> None:
+    record = stats.windowed_group_comparisons(_windows([50.0, 3.0, 0.5, 0.0]))
+
+    for window in record["per_window"]:
+        assert window["correction"] == "holm"
+        assert window["alpha"] == pytest.approx(0.05)
+        assert window["p_holm"] >= window["p_value"]
+
+
+def test_alpha_decides_the_verdict_and_is_recorded_beside_it() -> None:
+    """The level is the caller's, and it travels in the record so a verdict is readable without
+    knowing which call produced it."""
+    samples = _windows([2.0] * 3)
+
+    strict = stats.windowed_group_comparisons(samples, alpha=1e-6)
+    permissive = stats.windowed_group_comparisons(samples, alpha=0.999)
+
+    assert strict["n_significant_windows"] == 0
+    assert permissive["n_significant_windows"] == 3
+    assert permissive["per_window"][0]["alpha"] == pytest.approx(0.999)
+
+
+def test_the_window_identifier_key_is_the_callers() -> None:
+    """Three record schemas are already published on disk under two different names for this
+    field, and renaming a column a reader has is an output change with no reader behind it."""
+    default = stats.windowed_group_comparisons(_windows([50.0]))
+    renamed = stats.windowed_group_comparisons(_windows([50.0]), window_field="bin")
+
+    assert "time_bin" in default["per_window"][0] and "bin" not in default["per_window"][0]
+    assert renamed["per_window"][0]["bin"] == 0 and "time_bin" not in renamed["per_window"][0]
+
+
+def test_the_callers_metadata_travels_into_each_windows_record() -> None:
+    """The window's centre and the caller's exclusion record are what make a skipped window
+    explicable, and they are known before the call rather than after it."""
+    record = stats.windowed_group_comparisons(
+        _windows([50.0, 0.0]),
+        meta_by_window={
+            0: {"bin_center_h": 0.25, "groups_excluded_as_too_small": {"hie": 2}},
+            1: {"bin_center_h": 0.75, "groups_excluded_as_too_small": {}},
+        },
+    )
+
+    assert [window["bin_center_h"] for window in record["per_window"]] == [0.25, 0.75]
+    assert record["per_window"][0]["groups_excluded_as_too_small"] == {"hie": 2}
+
+
+def test_the_windows_come_back_in_the_order_they_were_given() -> None:
+    """A caller passing windows in axis order draws them in axis order; sorting here would put a
+    negative window key -- which the second-stage axis has -- somewhere the caller did not choose.
+    """
+    keys = [-2, -1, 0, 1]
+    record = stats.windowed_group_comparisons(_windows([50.0] * 4, keys=keys))
+
+    assert [window["time_bin"] for window in record["per_window"]] == keys
+    assert set(record["pairwise"]) == {"-2", "-1", "0", "1"}
+
+
+def test_a_metadata_entry_named_like_the_identifier_cannot_repoint_the_pairwise_sweep() -> None:
+    """The sweep is keyed on the caller's own window key rather than on the record's, so a
+    metadata collision costs a wrong label at worst and never another window's comparisons."""
+    record = stats.windowed_group_comparisons(
+        _windows([50.0, 0.0]), meta_by_window={0: {"time_bin": 99}}
+    )
+
+    assert set(record["pairwise"]) == {"0"}
+    assert record["pairwise"]["0"][0]["n_left"] == 6
+
+
+def test_an_empty_family_is_an_empty_record_rather_than_an_exception() -> None:
+    record = stats.windowed_group_comparisons({})
+
+    assert record["per_window"] == [] and record["pairwise"] == {}
+    assert record["n_windows"] == 0 and record["n_windows_tested"] == 0
