@@ -33,6 +33,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, Mapping, Tuple
 
+from teb_vae.lag_attn_cfs.eval.analyses import lag_clocks as lag_clocks_analysis
 from teb_vae.lag_attn_cfs.eval.analyses import source_null as source_null_analysis
 from teb_vae.lag_attn_cfs.eval.analyses import spectral_skill as spectral_skill_analysis
 from teb_vae.lag_attn_cfs.eval.analyses import warmup as warmup_analysis
@@ -142,19 +143,30 @@ GEOMETRY_KEYS: Tuple[str, ...] = (
 
 #: Analyses only this cell can have, merged onto the shared registry in declaration order. They are
 #: registered **here rather than on the shared registry** so that the fork's run order stays
-#: readable as "the shared twelve, then this cell's three" -- and so that the second cfs cell picks
-#: all three up by binding this pipeline rather than by editing it.
+#: readable as "the shared twelve, then this cell's four" -- and so that the second cfs cell picks
+#: all four up by binding this pipeline rather than by editing it.
 #:
-#: The three are the questions only a causal cell can ask: where in the warm-up staircase the
-#: forecast gap lives and whether the run decoded the population its configuration describes
-#: (``warmup``); how much of the coupling readout survives zeroing the source, which is the
-#: availability-clock hazard no permutation control can see (``source_null``); and the forecast
-#: resolved by the frequency band of the target coefficient, which is the readout this target
-#: domain has instead of the raw pipeline's phase-domain pair (``spectral_skill``).
+#: Three are the questions only a causal cell can ask: where in the warm-up staircase the forecast
+#: gap lives and whether the run decoded the population its configuration describes (``warmup``);
+#: how much of the coupling readout survives zeroing the source, which is the availability-clock
+#: hazard no permutation control can see (``source_null``); and the forecast resolved by the
+#: frequency band of the target coefficient, which is the readout this target domain has instead of
+#: the raw pipeline's phase-domain pair (``spectral_skill``).
+#:
+#: The fourth is registered here for the mechanism rather than for causality: ``lag_clocks``
+#: resolves the lag structure against the two clinical clocks, which any lag-attention cell could
+#: ask, and it is an addition **this** package makes that the pipeline it was forked from does not
+#: have. The extras are exactly where such an addition goes -- the shared registry's order is the
+#: sibling's with the absent analyses left out, and an entry there that the sibling never had would
+#: make the two summaries stop being readable side by side.
 EXTRA_ANALYSES: Dict[str, Any] = {
     "warmup": warmup_analysis.run_warmup_analysis,
     "source_null": source_null_analysis.run_source_null_analysis,
-    # Last of the three: it is the only one whose input is a file another step wrote, the kept-axis
+    # Reads the collected tables and the vector sidecar only, so its position is a reading order
+    # rather than a dependency: the lag structure against time before delivery and against the
+    # second-stage onset, beside the two clocks that resolve the coupling magnitude.
+    "lag_clocks": lag_clocks_analysis.run_lag_clocks_analysis,
+    # Last of the four: it is the only one whose input is a file another step wrote, the kept-axis
     # channel map, so it reads rather than produces.
     "spectral_skill": spectral_skill_analysis.run_spectral_skill_analysis,
 }

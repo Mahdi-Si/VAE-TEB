@@ -301,6 +301,55 @@ def test_heatmap_gives_a_constant_field_a_usable_colour_range() -> None:
         plt.close(fig)
 
 
+def test_shared_limits_make_a_family_of_panels_comparable() -> None:
+    """Three cohort panels each scaled to its own extremes paint the same colour for three
+    different values, and the comparison the panels exist for is then the one thing they cannot
+    support -- while every colourbar stays correct, so nothing in the numbers gives it away.
+
+    Both directions: the derived limits genuinely differ per panel, and the shared ones do not.
+    """
+    fields = [np.full((3, 4), value) for value in (1.0, 5.0, 9.0)]
+    limits = (0.0, 9.0)
+    fig, axes = figures.new_figure(3)
+    try:
+        derived = [
+            figures.heatmap_with_colorbar(fig, axes[index, 0], field, symmetric=False).get_clim()
+            for index, field in enumerate(fields)
+        ]
+        shared = [
+            figures.heatmap_with_colorbar(
+                fig, axes[index, 0], field, symmetric=False, vlimits=limits
+            ).get_clim()
+            for index, field in enumerate(fields)
+        ]
+    finally:
+        plt.close(fig)
+
+    assert len(set(derived)) == 3, "the panels would be comparable without the shared limits"
+    assert shared == [limits] * 3
+
+
+def test_shared_limits_win_over_the_symmetric_default_and_cannot_collapse() -> None:
+    """Precedence, and the degenerate case: a caller whose panels all turned out constant hands
+    over ``vmin == vmax``, which matplotlib renders as one flat colour."""
+    fig, axes = figures.new_figure(2)
+    try:
+        signed = np.random.default_rng(5).normal(size=(6, 10))
+        overridden = figures.heatmap_with_colorbar(
+            fig, axes[0, 0], signed, symmetric=True, vlimits=(0.0, 2.0)
+        )
+        assert overridden is not None and overridden.get_clim() == (0.0, 2.0)
+
+        collapsed = figures.heatmap_with_colorbar(
+            fig, axes[1, 0], signed, symmetric=False, vlimits=(3.0, 3.0)
+        )
+        assert collapsed is not None
+        low, high = collapsed.get_clim()
+        assert high > low
+    finally:
+        plt.close(fig)
+
+
 def test_as_columns_refuses_a_name_count_that_does_not_match() -> None:
     """Silently zipping the shorter of the two would drop columns off every emitted CSV."""
     with pytest.raises(ValueError, match="column name"):

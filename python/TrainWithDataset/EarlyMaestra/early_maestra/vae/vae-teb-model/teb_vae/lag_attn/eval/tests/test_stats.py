@@ -92,11 +92,54 @@ def test_pairwise_compares_every_pair_with_a_signed_effect_size() -> None:
     records = stats.pairwise_comparisons(samples)
     assert len(records) == 1
     item = records[0]
-    assert item["left"] == "high" and item["right"] == "low"  # sorted order
-    # 'high' runs above 'low', so the left-vs-right delta is positive.
-    assert item["cliffs_delta"] > 0.9
+    # The caller's order, not ``sorted``: 'low' was inserted first, so it is the pair's left.
+    assert item["left"] == "low" and item["right"] == "high"
+    # 'high' runs above 'low', so the left-vs-right delta is negative.
+    assert item["cliffs_delta"] < -0.9
     assert item["magnitude"] == "large"
     assert "left group's values run higher" in item["delta_orientation"]
+
+
+def test_the_callers_order_decides_the_pair_order_and_its_orientation() -> None:
+    """The cohort axes run less severe to worst, and ``sorted`` would name the first clinical pair
+    ``acidosis vs healthy`` -- signing every delta against the reverse of the axis its figure draws
+    it on. The order is the caller's, so a comparison reads healthy vs acidosis, healthy vs HIE,
+    acidosis vs HIE, and a positive delta means the *less severe* cohort runs higher.
+
+    Asserted in both directions: a reversed mapping must reverse every pair, which an
+    implementation that sorted (or that happened to sort by construction) cannot do.
+    """
+    rng = np.random.default_rng(3)
+    values = {
+        name: rng.normal(centre, 0.4, 30)
+        for name, centre in (("healthy", 0.0), ("acidosis", 1.0), ("hie", 2.0))
+    }
+
+    severity = stats.pairwise_comparisons(
+        {name: values[name] for name in ("healthy", "acidosis", "hie")}
+    )
+    reversed_order = stats.pairwise_comparisons(
+        {name: values[name] for name in ("hie", "acidosis", "healthy")}
+    )
+
+    assert [(item["left"], item["right"]) for item in severity] == [
+        ("healthy", "acidosis"), ("healthy", "hie"), ("acidosis", "hie"),
+    ]
+    assert [(item["left"], item["right"]) for item in reversed_order] == [
+        ("hie", "acidosis"), ("hie", "healthy"), ("acidosis", "healthy"),
+    ]
+    # The same three comparisons either way, each delta signed against the orientation reported
+    # beside it -- so the sign is a statement about the pair as named, never about the pair as
+    # someone might have expected it to be named.
+    assert [item["p_value"] for item in severity] == pytest.approx(
+        [reversed_order[index]["p_value"] for index in (2, 1, 0)]
+    )
+    assert [item["cliffs_delta"] for item in severity] == pytest.approx(
+        [-reversed_order[index]["cliffs_delta"] for index in (2, 1, 0)]
+    )
+    # Healthy is the least severe of the three, so it runs lower on a metric that grows with
+    # severity: the left-vs-right delta of every healthy-first pair is negative.
+    assert severity[0]["cliffs_delta"] < 0 and severity[1]["cliffs_delta"] < 0
 
 
 # ---------------------------------------------------------------------------
@@ -253,7 +296,8 @@ def test_the_pairwise_sweep_runs_on_the_surviving_windows_only() -> None:
     }
     assert surviving == {"0", "2"}
     assert set(record["pairwise"]) == surviving
-    assert record["pairwise"]["0"][0]["left"] == "high"  # sorted order, as the sweep names them
+    # The caller's order, as the sweep names them: 'low' is the first key of every window.
+    assert record["pairwise"]["0"][0]["left"] == "low"
 
 
 def test_an_untestable_window_is_recorded_and_consumes_no_rank_in_the_family() -> None:

@@ -56,6 +56,7 @@ CELL_SPECIFIC_MODULES: Tuple[str, ...] = (
     "analyses/warmup.py",
     "analyses/source_null.py",
     "analyses/spectral_skill.py",
+    "analyses/lag_clocks.py",
 )
 
 #: Where this suite's tests live, for resolving the named assertions.

@@ -178,7 +178,7 @@ def test_the_causality_record_carries_this_encoders_disclosure_and_not_the_other
     assert causality["statement"] == preflight.CAUSALITY_STATEMENT
     assert causality["one_sided_inputs"] is True
     assert causality["transform"] == "causal"
-    assert causality["anchor_geometry"]["anchors_per_sample"] == 137
+    assert causality["anchor_geometry"]["anchors_per_sample"] == 136
     assert causality["lag_support"]["min_decoded_anchor"] == SHIPPED_WARMUP_PERIOD
     assert causality["lag_support"]["lag_support_margin_steps"] == SHIPPED_WARMUP_PERIOD - 90
     assert causality["warmup_budget"]["target_kept_width"] == 98

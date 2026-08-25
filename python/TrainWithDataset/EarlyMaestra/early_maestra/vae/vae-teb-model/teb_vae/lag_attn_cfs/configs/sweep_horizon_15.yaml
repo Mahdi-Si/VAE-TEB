@@ -7,7 +7,7 @@
 #
 # WHAT IT MEASURES. Anchors live in [F, T - H), so halving H lengthens T_valid from 270 to 285 and
 # the dense anchor count from 136 to 151 -- and with the stride following it down, the decoded tiles
-# per sample rise from ~4.57 to ~10.1, roughly 2.2x the forecast supervision per optimizer step at
+# per sample rise from ~4.53 to ~10.1, roughly 2.2x the forecast supervision per optimizer step at
 # the same batch size. Against that, each anchor is asked a strictly easier question: the block
 # falls from 30 * 98 = 2940 coefficients to 15 * 98 = 1470, and the far horizon steps that carry
 # almost no predictable signal are the ones dropped. This arm is what separates "the longer horizon

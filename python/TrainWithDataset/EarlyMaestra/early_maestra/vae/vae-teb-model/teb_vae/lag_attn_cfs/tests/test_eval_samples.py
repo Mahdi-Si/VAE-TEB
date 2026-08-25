@@ -38,6 +38,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
+from teb_vae.lag_attn_cfs.eval._reuse import labels
 from teb_vae.lag_attn_cfs.eval.analyses import AnalysisContext
 from teb_vae.lag_attn_cfs.eval.analyses import samples as samples_analysis
 from teb_vae.lag_attn_cfs.eval.collect import load_collection
@@ -249,6 +250,112 @@ def test_a_cap_at_the_shard_count_reaches_every_shard() -> None:
     assert drawn["source_file_basename"].nunique() == 8
 
 
+def _class_frame(counts: Dict[str, int]) -> pd.DataFrame:
+    """A per-sample table carrying nothing but identities and a clinical class.
+
+    Args:
+        counts: How many segments each class contributes.
+
+    Returns:
+        The frame, with the classes interleaved rather than blocked, so a draw that took a prefix
+        of the table would be visible as a class it missed.
+    """
+    rows = [(name, index) for name, count in counts.items() for index in range(count)]
+    rows.sort(key=lambda item: item[1])
+    return pd.DataFrame(
+        {
+            "guid": [f"{name}{index}" for name, index in rows],
+            labels.CLASS_COLUMN: [name for name, _ in rows],
+        }
+    )
+
+
+def test_the_class_draw_gives_every_class_the_same_number_of_pages() -> None:
+    """The whole difference from the stratified draw. On the shipped cohort the healthy class
+    carries most of the segments, so a proportional quota leaves ``hie`` a page or two against
+    healthy's dozen -- and two directories drawn that way cannot be compared, which is what these
+    pages are for."""
+    frame = _class_frame({"healthy": 50, "acidosis": 20, "hie": 12})
+
+    drawn = samples_analysis.per_class_rows(frame, per_class=10, seed=0)
+
+    assert dict(drawn[labels.CLASS_COLUMN].value_counts()) == {
+        "healthy": 10, "acidosis": 10, "hie": 10
+    }
+
+
+def test_a_class_with_fewer_segments_than_asked_for_contributes_all_of_them() -> None:
+    """The count is an upper bound, not a promise: a class the split barely carries is drawn in
+    full rather than refused, and the shortfall is visible in the page count."""
+    frame = _class_frame({"healthy": 50, "acidosis": 20, "hie": 3})
+
+    drawn = samples_analysis.per_class_rows(frame, per_class=10, seed=0)
+
+    assert dict(drawn[labels.CLASS_COLUMN].value_counts()) == {
+        "healthy": 10, "acidosis": 10, "hie": 3
+    }
+
+
+def test_the_class_draw_is_reproducible_and_is_not_the_stratified_draw() -> None:
+    """Two properties in one place because they are the same property twice: the draw is a function
+    of its seed, and the seed the analysis gives it is offset from the run's so the two draws are
+    independent rather than two reads of one permutation stream. A reader comparing
+    ``stratified/`` with ``by_class/`` would otherwise be shown the same segments twice without
+    being told."""
+    frame = _class_frame({"healthy": 40, "acidosis": 40, "hie": 40})
+
+    once = samples_analysis.per_class_rows(frame, per_class=10, seed=7)
+    again = samples_analysis.per_class_rows(frame, per_class=10, seed=7)
+    shifted = samples_analysis.per_class_rows(
+        frame, per_class=10, seed=7 + samples_analysis._CLASS_DRAW_SEED_OFFSET
+    )
+
+    assert list(once["guid"]) == list(again["guid"])
+    assert list(once["guid"]) != list(shifted["guid"])
+    assert samples_analysis._CLASS_DRAW_SEED_OFFSET != 0
+
+
+def test_the_class_draw_returns_the_rows_in_table_order() -> None:
+    """``page_loader`` refuses indices that are not ascending, and the pages of one class arriving
+    as a contiguous block is how a draw comes to visit the dataset out of order."""
+    frame = _class_frame({"healthy": 30, "acidosis": 30, "hie": 30})
+
+    drawn = samples_analysis.per_class_rows(frame, per_class=5, seed=3)
+
+    assert list(drawn.index) == sorted(drawn.index)
+    # Interleaved, not blocked -- which is what makes the ordering assertion above worth making.
+    assert len(set(drawn[labels.CLASS_COLUMN].head(6))) > 1
+
+
+def test_a_segment_with_no_clinical_class_is_skipped_rather_than_made_into_one() -> None:
+    """A missing class is an absence. Grouped on as a value it would fill a tenth of a directory
+    called ``by_class`` with segments that have no class, under a heading a reader would take for
+    a clinical group. An unrecognised *name* is a different case and is kept -- that is a labelling
+    this cell does not know about, not one that is not there."""
+    frame = pd.DataFrame(
+        {
+            "guid": list("abcdef"),
+            labels.CLASS_COLUMN: ["healthy", "hie", None, "acidosis", np.nan, "healthy"],
+        }
+    )
+
+    drawn = samples_analysis.per_class_rows(frame, per_class=2, seed=0)
+
+    assert list(drawn["guid"]) == ["a", "b", "d", "f"]
+    assert not drawn[labels.CLASS_COLUMN].isna().any()
+
+
+def test_a_table_with_no_clinical_class_draws_nothing_rather_than_something_else() -> None:
+    """A directory named ``by_class`` whose pages were not drawn by class is worse than one that is
+    empty: the summary records ``n_classes_reached == 0``, and nothing claims a balance it does not
+    have."""
+    frame = pd.DataFrame({"guid": list("abcde")})
+
+    drawn = samples_analysis.per_class_rows(frame, per_class=10, seed=0)
+
+    assert not len(drawn)
+
+
 def test_the_extremes_are_the_smallest_and_largest_finite_values() -> None:
     frame = pd.DataFrame({"guid": list("abcde"), "mc_pred_gap": [3.0, np.nan, 1.0, 5.0, 2.0]})
 
@@ -382,7 +489,11 @@ def test_a_rendered_page_has_fifteen_rows_and_logs_no_warning(tmp_path, caplog) 
     """The demo, and the assertion the acceptance criterion is stated as: the shipped input-row
     builder fails inside a handler that warns and continues, so a page that lost its two input rows
     would still be a page. The absence of the warning is therefore the property, and the row count
-    is read off the rendered figure rather than off a constant."""
+    is read off the rendered figure rather than off a constant.
+
+    One segment now produces **two** files -- the full page and the reduced one -- and both are
+    asserted here rather than only the count, because a reduced page that silently stopped being
+    written would leave every other assertion on this test passing."""
     module = make_task()
     module.eval()
     batch = make_stub_batch(seed=4)
@@ -404,10 +515,20 @@ def test_a_rendered_page_has_fifteen_rows_and_logs_no_warning(tmp_path, caplog) 
         )
 
     assert failures == [], failures
-    assert len(written) == 1
     assert n_input_rows == 2
     assert 2 + 6 + n_input_rows + 5 == samples_analysis.EXPECTED_PAGE_ROWS
     assert "warning" not in caplog.text.lower(), caplog.text
+
+    # One segment, both variants, and the reduced one named by the tail rather than by position:
+    # the pair is what a reader looks for in the directory.
+    assert [record["variant"] for record in written] == [
+        variant for variant, _, _ in samples_analysis.PAGE_VARIANTS
+    ]
+    full, compact = (record["file"] for record in written)
+    assert compact == full.replace(".pdf", f"{samples_analysis.COMPACT_SUFFIX}.pdf")
+    assert sorted(path.name for path in (tmp_path / "pages").glob("*.pdf")) == sorted(
+        [full, compact]
+    )
 
 
 def test_the_page_is_drawn_at_the_geometry_the_collection_pass_scored(tmp_path) -> None:
@@ -452,12 +573,19 @@ def test_the_page_is_drawn_at_the_geometry_the_collection_pass_scored(tmp_path) 
 def test_one_failing_page_is_recorded_by_index_and_the_rest_still_render(
     tmp_path, monkeypatch
 ) -> None:
-    """A page that cannot be drawn is a recorded absence, not a gap in the directory."""
+    """A page that cannot be drawn is a recorded absence, not a gap in the directory.
+
+    The failing call is the **reduced** page of the middle segment, which is the isolation that
+    matters most: the full page of that same segment has already been written by then, and a
+    handler around both variants at once would turn a segment that half-rendered into a segment
+    recorded as lost."""
+    variants = [variant for variant, _, _ in samples_analysis.PAGE_VARIANTS]
+    failing_call = len(variants) + variants.index(samples_analysis.COMPACT_VARIANT) + 1
     calls = {"n": 0}
 
     def flaky(**kwargs):
         calls["n"] += 1
-        if calls["n"] == 2:
+        if calls["n"] == failing_call:
             raise RuntimeError("deliberate page failure")
         from matplotlib.figure import Figure
 
@@ -480,10 +608,16 @@ def test_one_failing_page_is_recorded_by_index_and_the_rest_still_render(
         delay_steps=0, normalization=None, seams=_no_seams(),
     )
 
-    assert len(written) == 2 and len(failures) == 1
+    # Three segments times two variants, less the one that was made to fail.
+    assert len(written) == 3 * len(variants) - 1 and len(failures) == 1
     assert failures[0]["dataset_index"] == 1
+    assert failures[0]["variant"] == samples_analysis.COMPACT_VARIANT
     assert "deliberate page failure" in failures[0]["error"]
-    assert sorted(path.name for path in (tmp_path / "pages").glob("*.pdf")) == sorted(written)
+    # The full page of the segment whose reduced page failed is still there.
+    assert {"variant": "full", "file": "sample0001_g1_epoch-1000.pdf"} in written
+    assert sorted(path.name for path in (tmp_path / "pages").glob("*.pdf")) == sorted(
+        record["file"] for record in written
+    )
 
 
 # =================================================================================================
@@ -519,6 +653,10 @@ def test_the_pages_of_a_real_run_name_the_recordings_they_were_selected_from(
 
     This is what an off-by-one in the index mapping breaks, and it is the only place it would
     surface -- the pages themselves are perfectly plausible pictures either way.
+
+    The manifest is also asserted to index the **whole** directory: it carries one row per file
+    rather than per segment, so a variant that stopped being recorded would leave PDFs on disk
+    that nothing names.
     """
     directory = Path(collected_run["results_dir"]) / samples_analysis.ANALYSIS_DIRNAME
     manifest = pd.read_csv(directory / samples_analysis.MANIFEST_FILENAME)
@@ -528,11 +666,48 @@ def test_the_pages_of_a_real_run_name_the_recordings_they_were_selected_from(
     assert len(manifest) > 0
     for _, row in manifest.iterrows():
         match = re.fullmatch(
-            r"sample(\d{4})_([A-Za-z0-9_-]{1,32})_epoch(-?\d+|na)\.pdf", str(row["file"])
+            r"sample(\d{4})_([A-Za-z0-9_-]{1,32})_epoch(-?\d+|na)(_compact)?\.pdf",
+            str(row["file"]),
         )
         assert match, row["file"]
         assert match.group(2) in known
+        # The name's tail and the recorded variant are one fact, written twice.
+        expected = (
+            samples_analysis.COMPACT_VARIANT if match.group(4)
+            else samples_analysis.FULL_VARIANT
+        )
+        assert str(row["variant"]) == expected, row["file"]
         assert (directory / str(row["selection"]) / str(row["file"])).is_file()
+
+    # Nothing on disk that the manifest does not name.
+    on_disk = {
+        (path.parent.name, path.name) for path in directory.glob("*/*.pdf")
+    }
+    assert on_disk == {
+        (str(row["selection"]), str(row["file"])) for _, row in manifest.iterrows()
+    }
+
+
+@pytest.mark.slow
+def test_the_class_balanced_draw_of_a_real_run_reaches_every_class_present(
+    collected_run,
+) -> None:
+    """The point of the draw, on a real table. The count per class is not asserted against
+    ``pages_per_class``: the cohort fixture is small enough that a class can carry fewer
+    segments than the cap, which :func:`per_class_rows` draws in full by design. What must hold
+    is that no class present in the split is missing from the directory.
+    """
+    summary = collected_run["summary"]["results"][samples_analysis.ANALYSIS_DIRNAME]
+    collection = load_collection(collected_run["results_dir"])
+    present = collection.per_sample[labels.CLASS_COLUMN].nunique()
+
+    assert summary["composition"]["n_classes_reached"] == present
+    assert summary["plan"]["pages_per_class"] >= 1
+    directory = (
+        Path(collected_run["results_dir"]) / samples_analysis.ANALYSIS_DIRNAME
+        / samples_analysis.CLASS_DIRNAME
+    )
+    assert list(directory.glob("*.pdf"))
 
 
 @pytest.mark.slow
@@ -545,7 +720,13 @@ def test_a_real_run_renders_every_page_it_asked_for_at_fifteen_rows(collected_ru
     assert result["failures"] == []
     assert result["n_unlocatable_rows"] == 0
     assert result["plan"]["page_rows"] == samples_analysis.EXPECTED_PAGE_ROWS
+    assert result["plan"]["compact_page_rows"] == (
+        samples_analysis.EXPECTED_COMPACT_PAGE_ROWS
+    )
     assert all(result["plan"]["page_seams"].values())
+    # Two files per segment, so a variant that silently stopped being drawn shows up as a
+    # count rather than only as a directory somebody would have to open.
+    assert result["n_files"] == result["n_samples"] * len(samples_analysis.PAGE_VARIANTS)
 
 
 @pytest.mark.slow

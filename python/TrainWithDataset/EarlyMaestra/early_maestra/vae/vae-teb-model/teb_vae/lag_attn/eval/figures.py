@@ -253,6 +253,7 @@ def heatmap_with_colorbar(
     ylabel: str = "",
     cmap: Optional[str] = None,
     symmetric: bool = True,
+    vlimits: Optional[Tuple[float, float]] = None,
     colorbar_label: str = "",
     separator_row: Optional[int] = None,
     extent: Optional[Tuple[float, float, float, float]] = None,
@@ -277,6 +278,13 @@ def heatmap_with_colorbar(
         symmetric: Use a symmetric limit about zero, via
             :func:`~teb_vae.lag_attn.figure_primitives.safe_vabs`. Right for a signed field such
             as a residual; wrong for a non-negative one, which should pass ``False``.
+        vlimits: Optional ``(vmin, vmax)``, overriding the limits this field alone would give and
+            taking precedence over ``symmetric``. For a *family* of panels that must be read
+            against one another: three per-cohort panels each scaled to its own extremes paint the
+            same colour for three different values, and the comparison the panels exist for is
+            then the one thing they cannot support -- while every colourbar stays correct, so
+            nothing in the numbers gives it away. ``None`` derives the limits from the field,
+            which is what a single panel wants.
         colorbar_label: Label for the colourbar.
         separator_row: Row index of the last row of the upper feature block. A horizontal rule is
             drawn at ``separator_row + 0.5``, which is where the two blocks actually meet.
@@ -302,7 +310,15 @@ def heatmap_with_colorbar(
         style_axes(ax, grid="none")
         return None
 
-    if symmetric:
+    if vlimits is not None:
+        # The caller's own limits, so a family of panels shares one scale rather than each being
+        # scaled to its own extremes. Checked for collapse the same way a derived range is: a
+        # caller computing its limits over panels that all turned out constant would otherwise
+        # hand over vmin == vmax.
+        vmin, vmax = float(vlimits[0]), float(vlimits[1])
+        if vmin == vmax:
+            vmin, vmax = vmin - 0.5, vmax + 0.5
+    elif symmetric:
         limit = safe_vabs(field)
         vmin, vmax = -limit, limit
     else:

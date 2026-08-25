@@ -98,7 +98,9 @@ METHOD = (
     "Per window of signed hours from second-stage onset: Kruskal-Wallis across clinical classes "
     "over one value per recording, Holm step-down correction across this clock's windows as one "
     "family, pairwise two-sided Mann-Whitney U with Cliff's delta for the windows significant "
-    "after Holm only. Non-parametric throughout. Classes with fewer than "
+    "after Holm only. Every pair is oriented from the less severe class to the worse one, so a "
+    "positive Cliff's delta means the less severe class's values run higher. Non-parametric "
+    "throughout. Classes with fewer than "
     f"{shared_stats.MIN_GROUP_SIZE} recordings in a window are excluded from it and recorded. "
     "The Holm family is this clock's windows alone and is NOT corrected jointly with the "
     "time-before-delivery clock's: the two clocks are different alignments of an overlapping "
@@ -379,11 +381,14 @@ def analyse_windows(
         }
 
     # The cohort half of the job is this analysis's own: which classes are in a window, in which
-    # order, and which were too small to enter the test. The arithmetic half -- the omnibus, Holm
-    # across the windows and the pairwise sweep on the survivors -- is
-    # ``stats.windowed_group_comparisons``, shared with every other trajectory analysis in the
-    # family, so that "significant" has one definition across the repository rather than one per
-    # clock.
+    # order, and which were too small to enter the test. That order is load-bearing rather than
+    # cosmetic: the pairwise sweep names each pair in the order it receives, so passing the
+    # classes severity-ascending is what makes every comparison read healthy against acidosis,
+    # healthy against HIE, acidosis against HIE -- less severe against worse, never the reverse.
+    # The arithmetic half -- the omnibus, Holm across the windows and the pairwise sweep on the
+    # survivors -- is ``stats.windowed_group_comparisons``, shared with every other trajectory
+    # analysis in the family, so that "significant" has one definition across the repository
+    # rather than one per clock.
     samples_by_window, meta_by_window = window_samples(per_recording, column)
 
     outcome = shared_stats.windowed_group_comparisons(

@@ -84,7 +84,7 @@ HYPER_PARAMETERS: Dict[str, Any] = {
     "beta_schedule": None,
 }
 
-#: The lag-support margin the shipped geometry produces: the earliest decoded anchor $F = 133$, the
+#: The lag-support margin the shipped geometry produces: the earliest decoded anchor $F = 134$, the
 #: furthest searched lag $L - 1 = 90$, and a lag floor of $0$. Written out because it is the number
 #: the whole simplification in the per-lag analyses rests on.
 SHIPPED_LAG_SUPPORT_MARGIN = SHIPPED_WARMUP_PERIOD - 90 - 0
@@ -683,15 +683,15 @@ def test_the_disclosure_carries_the_reference_beside_the_stale_step_count(config
 # =================================================================================================
 # The measured geometry
 # =================================================================================================
-def test_the_lag_support_margin_is_measured_and_is_the_shipped_forty_three(model) -> None:
-    r"""$133 - 90 - 0 = 43$. Every per-lag simplification -- the absent support correction, the
+def test_the_lag_support_margin_is_measured_and_is_the_shipped_forty_four(model) -> None:
+    r"""$134 - 90 - 0 = 44$. Every per-lag simplification -- the absent support correction, the
     untruncated recomputation, the $\log L$ entropy ceiling -- holds exactly when this is $\ge 0$."""
     record = preflight.lag_support(model)
 
     assert record["min_decoded_anchor"] == SHIPPED_WARMUP_PERIOD
     assert record["max_lag"] == 90
     assert record["lag_floor"] == 0
-    assert record["lag_support_margin_steps"] == SHIPPED_LAG_SUPPORT_MARGIN == 43
+    assert record["lag_support_margin_steps"] == SHIPPED_LAG_SUPPORT_MARGIN == 44
     assert record["every_lag_valid_at_every_anchor"] is True
 
 
@@ -721,9 +721,9 @@ def test_the_anchor_geometry_records_both_strides(model) -> None:
     record = preflight.anchor_geometry(model)
 
     assert record["evaluation_stride"] == 1
-    assert record["anchors_per_sample"] == record["t_valid"] - record["anchor_floor"] == 137
+    assert record["anchors_per_sample"] == record["t_valid"] - record["anchor_floor"] == 136
     assert record["training_stride"] == SHIPPED_HORIZON
-    assert record["training_anchors_per_sample_max"] == -(-137 // SHIPPED_HORIZON)
+    assert record["training_anchors_per_sample_max"] == -(-136 // SHIPPED_HORIZON)
     assert record["block_width"] == SHIPPED_HORIZON * record["target_kept_width"]
 
 
@@ -860,7 +860,7 @@ def test_the_completed_record_carries_the_resolved_budget_beside_the_statement(
     assert causality["warmup_budget"]["budget_steps"] == 134
     assert causality["warmup_budget"]["target_kept_width"] == 98
     assert causality["lag_support"]["lag_support_margin_steps"] == SHIPPED_LAG_SUPPORT_MARGIN
-    assert causality["anchor_geometry"]["anchors_per_sample"] == 137
+    assert causality["anchor_geometry"]["anchors_per_sample"] == 136
     assert "stored-coefficient time" in causality["lag_axis"]["label"]
     assert "not a transfer entropy" in causality["lag_axis"]["caveat"]
 

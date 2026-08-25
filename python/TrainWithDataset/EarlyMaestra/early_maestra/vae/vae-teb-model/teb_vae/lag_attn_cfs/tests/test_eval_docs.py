@@ -237,7 +237,9 @@ def undocumented_figures(guide: str, manifest: Dict) -> List[str]:
 def test_the_manifest_is_not_empty(manifest) -> None:
     """A manifest with no figures would pass the binding below vacuously."""
     assert sum(len(names) for names in manifest["figures"].values()) >= 14
-    assert set(manifest.get("families", {})) == {"grouped_variants", "sample_pages"}
+    assert set(manifest.get("families", {})) == {
+        "grouped_variants", "sample_pages", "sample_pages_compact"
+    }
 
 
 def test_the_manifest_carries_this_cells_own_figures(manifest) -> None:
@@ -574,4 +576,4 @@ def test_the_dense_decoding_geometry_is_stated(eval_doc) -> None:
     tiling is not it. A document that did not say so would leave a reader reconciling an
     evaluation table against a training CSV computed over a different population."""
     assert "anchor_phase=0, anchor_stride=1" in eval_doc
-    assert "137" in eval_doc
+    assert "136" in eval_doc

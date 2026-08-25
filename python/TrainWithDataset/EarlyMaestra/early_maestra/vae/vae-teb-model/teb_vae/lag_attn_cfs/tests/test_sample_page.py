@@ -956,6 +956,135 @@ _UNGATED = dict(
 )
 
 
+# =================================================================================================
+# The reduced page
+# =================================================================================================
+#: The reduced page's rows by title prefix, in the order the layout draws them. Written out here
+#: rather than derived from :data:`~teb_vae.lag_attn_cfs.sample_page.COMPACT_PAGE_ROWS`, because a
+#: row *name* and the row a reader actually sees are what this file exists to keep equal: deriving
+#: the expectation from the same tuple the builder is given would assert only that the tuple equals
+#: itself.
+_COMPACT_ROW_TITLES = (
+    "Raw target FHR",
+    "Model input — target",
+    "Target-only latent state",
+    "$K_t$",
+    "Lag attention",
+)
+
+
+def test_the_reduced_page_is_the_five_rows_it_names_in_the_full_page_s_order(task, stub_batch):
+    """The reduced page is the full page with rows removed, not a second page: every row on it is a
+    row of the other, drawn by the same code, in the same order. That is what lets a reader who
+    knows one read the other -- and it is why the rows are *selected* rather than re-listed."""
+    figure = _render(module_page_rows(task), stub_batch, rows=sample_page.COMPACT_PAGE_ROWS)
+    try:
+        titled = [child for child in figure.axes if child.get_title()]
+        assert len(titled) == len(sample_page.COMPACT_PAGE_ROWS)
+        for ax, prefix in zip(titled, _COMPACT_ROW_TITLES):
+            assert ax.get_title().startswith(prefix), (ax.get_title(), prefix)
+            assert ax.has_data(), prefix
+    finally:
+        plt.close(figure)
+
+
+def test_the_reduced_page_drops_the_source_stream_and_every_forecast_row(task, stub_batch):
+    """The rows it does *not* have, named. The forecast rows come through a seam that swallows
+    exceptions to protect the fit, so a seam that ignored the row selection would draw into axes it
+    does not own -- or raise where nobody sees it -- and the symptom either way is a page, which is
+    why the absences are asserted rather than inferred from the count above."""
+    figure = _render(module_page_rows(task), stub_batch, rows=sample_page.COMPACT_PAGE_ROWS)
+    try:
+        titles = [child.get_title() for child in figure.axes if child.get_title()]
+        for absent in (_INPUT_ROWS[1], "Forecast", "true $Y^{+}$", "Source skill",
+                       "Per-window forecast score", "Per-dimension source-conditioned KL",
+                       "$\\widetilde K_{t,\\ell}$"):
+            assert not any(title.startswith(absent) for title in titles), absent
+    finally:
+        plt.close(figure)
+
+
+def test_the_reduced_page_still_carries_the_physical_delay_caveat(task, stub_batch):
+    """The caveat is what says a lag on this transform is not a physical delay, and the reduced
+    page is the one that leads with a lag axis. It is drawn by the forecast seam, which returns
+    early here -- so a page that kept the lag row and lost the caveat is the exact failure this
+    asserts against."""
+    figure = _render(module_page_rows(task), stub_batch, rows=sample_page.COMPACT_PAGE_ROWS)
+    try:
+        assert sample_page.LAG_TIME_CAVEAT in [text.get_text() for text in figure.texts]
+    finally:
+        plt.close(figure)
+
+
+def test_the_lag_attention_row_takes_a_log_colour_scale_only_when_asked(task, stub_batch):
+    """The log scale is the reduced page's, and the colour normalisation alone: the lag axis is the
+    same linear steps on both. The KL-by-lag row is deliberately left linear -- it is nats, read
+    against the KL panels -- so the flag is checked to reach one row and not the other."""
+    from matplotlib.colors import LogNorm
+
+    module = module_page_rows(task)
+    pieces = _forward(module, stub_batch)
+
+    linear = _render(module, stub_batch, pieces=pieces)
+    try:
+        for prefix in ("Lag attention", "$\\widetilde K_{t,\\ell}$"):
+            assert not isinstance(_axes_titled(linear, prefix).images[0].norm, LogNorm), prefix
+    finally:
+        plt.close(linear)
+
+    logged = _render(module, stub_batch, pieces=pieces, log_lag_attention=True)
+    try:
+        image = _axes_titled(logged, "Lag attention").images[0]
+        assert isinstance(image.norm, LogNorm)
+        assert image.norm.vmin > 0.0 and image.norm.vmin < image.norm.vmax
+        # The other lag row keeps the linear scale it is read on.
+        assert not isinstance(
+            _axes_titled(logged, "$\\widetilde K_{t,\\ell}$").images[0].norm, LogNorm
+        )
+    finally:
+        plt.close(logged)
+
+
+def test_the_log_normaliser_floors_the_range_and_declines_an_empty_panel():
+    """Two properties of the normaliser itself, neither reachable through a rendered page. The
+    floor is why one near-zero weight cannot stretch the colormap over decades that hold nothing;
+    the ``None`` is why a page whose attention is degenerate is still drawn, on a linear scale,
+    rather than lost to an exception inside a callback."""
+    values = np.full((4, 8), 1e-9, dtype=np.float64)
+    values[0, 0] = 1.0
+    norm = shared_page.log_attention_norm(values)
+    assert norm is not None
+    assert norm.vmax == pytest.approx(1.0)
+    assert norm.vmin == pytest.approx(shared_page._LOG_ATTENTION_FLOOR)
+
+    assert shared_page.log_attention_norm(np.zeros((4, 8))) is None
+    # A panel whose positive mass sits at one value has no range to stretch over.
+    assert shared_page.log_attention_norm(np.full((4, 8), 0.125)) is None
+
+
+def test_a_row_the_page_does_not_reserve_is_refused_by_name(task, stub_batch):
+    """A misspelled row must not produce a page that is quietly missing the panel it was rendered
+    for -- an absence nothing in the output reports. The message names both what was asked for and
+    what the page has, because the legal set depends on which seams the task declared."""
+    with pytest.raises(ValueError) as excinfo:
+        _render(module_page_rows(task), stub_batch, rows=("raw", "lag_atten"))
+    assert "lag_atten" in str(excinfo.value)
+    assert "lag_attn" in str(excinfo.value)
+
+
+def module_page_rows(task) -> Any:
+    """A task at the tiny geometry, for the row-selection tests.
+
+    Args:
+        task: The package's task fixture.
+
+    Returns:
+        The module. Named rather than inlined because five tests build the same one and the
+        selection, not the model, is what each of them varies.
+    """
+    return task(model_kwargs=tiny_warmup_kwargs())
+
+
 def test_the_shared_page_is_reached_rather_than_copied():
     """No ``lag_attn_cfs/plotting.py`` and no callback of this package's own: the seams exist so a
     sibling supplies rows and inherits the rest, and a second callback class would be a second

@@ -196,6 +196,13 @@ eval_config:
   #   pages      how many stratified per-sample diagnostic pages to render. Unlike the other two
   #              this retains nothing; it caps a figure count, and the pages are re-rendered from
   #              the loader rather than read off a retained array.
+  #   pages_per_class
+  #              how many pages the CLASS-BALANCED draw renders PER CLINICAL CLASS, into
+  #              `samples/by_class/`. Per class, not in total, and that is the whole point:
+  #              `pages` is allocated in proportion to shard size, so on this cohort it gives
+  #              the two rare classes a page or two against healthy's dozen -- pages that show
+  #              what the split CONTAINS, and cannot be compared across classes. This cap
+  #              retains nothing either.
   #   oracle     how many segments the sufficiency probe caches encoder states for.
   #              THE ONLY CAP HERE WHOSE ABSENCE DOES NOT MEAN ZERO: absent means every segment,
   #              because a probe fitted on nothing is not a cheaper measurement but no measurement.
@@ -214,6 +221,12 @@ eval_config:
   #   attention  64  unchanged; ~437 KB per sample at (T, M, L) = (300, 4, 91), which this cell
   #                  shares with the raw ones.
   #   pages      24  a figure count; retains nothing.
+  #   pages_per_class
+  #              10  a figure count, per clinical class; retains nothing. Ten rather than the
+  #                  stratified draw's 24-over-eight-shards, because these are read a class at
+  #                  a time and ten is what fits in one sitting. THREE classes ship, so this is
+  #                  30 further segments -- and every selected segment is drawn TWICE, as the
+  #                  full page and the reduced one beside it.
   #
   # `oracle` stays ABSENT on purpose, and that is not an oversight: it is the one cap whose absence
   # means EVERY segment, so naming a number here would REDUCE what the sufficiency probe is fitted
@@ -222,6 +235,7 @@ eval_config:
     waveforms: 64
     attention: 64
     pages: 24
+    pages_per_class: 10
 
   # How much worse, in nats per anchor, a forecast from a stranger's prior latent must be before
   # the prior is credited with carrying the target's predictive state. Explicitly provisional:

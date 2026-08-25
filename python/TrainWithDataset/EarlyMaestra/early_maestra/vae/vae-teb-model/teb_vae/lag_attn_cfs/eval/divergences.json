@@ -101,7 +101,7 @@
     },
     "run.py": {
       "state": "divergent",
-      "reason": "Registers nineteen analyses rather than seventeen, defaults to CFS_BINDING, records the dense anchor geometry and the training stride in run_context, and registers no coherence step."
+      "reason": "Registers twenty analyses rather than seventeen, defaults to CFS_BINDING, records the dense anchor geometry and the training stride in run_context, and registers no coherence step."
     },
     "spectra.py": {
       "state": "absent",
@@ -175,7 +175,7 @@
     },
     "analyses/samples.py": {
       "state": "divergent",
-      "reason": "Draws this cell's fifteen-row diagnostic page through the task's own page seams rather than the raw cells' nine-row one."
+      "reason": "Draws this cell's fifteen-row diagnostic page through the task's own page seams rather than the raw cells' nine-row one, and draws every selected segment twice: the full page and a reduced five-row one beside it, off a single forward, whose lag attention carries a logarithmic colour scale. Renders a third selection the sibling has none of -- a class-balanced by_class/ draw of caps.pages_per_class segments from every clinical class, beside the shard-proportional stratified/ one -- and records one manifest row per file with a variant column rather than one per segment."
     },
     "analyses/second_stage.py": {
       "state": "equivalent",

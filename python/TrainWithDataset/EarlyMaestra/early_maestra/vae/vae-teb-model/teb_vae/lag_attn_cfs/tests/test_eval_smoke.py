@@ -55,6 +55,13 @@ FAMILIES: Dict[str, Dict[str, str]] = {
         "pattern": "samples/<selection>/sample<index>_<guid>_epoch<epoch>.pdf",
         "guide_marker": "The per-recording pages",
     },
+    # The reduced page of the same segment, a family of its own rather than a note on the one
+    # above: it has its own row set, its own colour scale and its own way of being misread, so
+    # it needs its own guide section -- which is exactly what a family's marker binds to.
+    "sample_pages_compact": {
+        "pattern": "samples/<selection>/sample<index>_<guid>_epoch<epoch>_compact.pdf",
+        "guide_marker": "The reduced per-recording pages",
+    },
 }
 
 #: The durable artifact set, by name: the summary and its heartbeat, the two preflight-side

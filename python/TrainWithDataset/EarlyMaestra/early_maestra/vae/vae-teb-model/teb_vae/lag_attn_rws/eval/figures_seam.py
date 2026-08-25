@@ -386,6 +386,11 @@ def windowed_comparison_figure(
     )
     order = list(groups)
     colours = group_colors(order)
+    # Where each cohort sits on the axis. The effect rows below are laid out by it rather than by
+    # the alphabetical order of their labels, so a row reads in the same direction as the pair it
+    # names -- less severe against worse. A cohort the order does not know sorts after every one
+    # it does, exactly as ``cohort.ordered_groups`` places it.
+    position = {group: index for index, group in enumerate(order)}
     effects: List[Dict[str, Any]] = []
 
     for index, (name, cells, record) in enumerate(readouts):
@@ -429,6 +434,13 @@ def windowed_comparison_figure(
             for item in comparisons:
                 effects.append({
                     "row": f"{name}: {item['left']} vs {item['right']}",
+                    # Readout first, then the two cohorts' places on the axis: the row order the
+                    # heatmap draws, computed here because this is where both are known.
+                    "rank": (
+                        index,
+                        position.get(str(item["left"]), len(order)),
+                        position.get(str(item["right"]), len(order)),
+                    ),
                     "centre": centre_by_key.get(str(key), float("nan")),
                     "delta": float(item.get("cliffs_delta", float("nan"))),
                 })
@@ -451,16 +463,30 @@ def _draw_effect_heatmap(
 
     The column order follows the panels above rather than the natural sort, so a column of this
     heatmap sits under the window it describes; the ancestor's version does not, and reading it
-    against its own bar panel means reversing one of the two by eye.
+    against its own bar panel means reversing one of the two by eye. The **row** order is the
+    cohort order the pairs were tested in rather than the alphabetical order of their labels, so
+    ``healthy vs acidosis`` sits above ``acidosis vs hie`` here as it does in the pairwise CSV,
+    and the whole page -- violins, columns and rows alike -- runs less severe to worst.
 
     Args:
         figure: The parent figure, for the colourbar.
         ax: Target axes.
-        effects: ``{'row', 'centre', 'delta'}`` per surviving comparison.
+        effects: ``{'row', 'rank', 'centre', 'delta'}`` per surviving comparison, ``rank`` being
+            the caller's own (readout, left cohort, right cohort) position tuple.
         xlabel: X-axis label, matching the panels above.
         descending: Whether the windows run right to left, as the delivery clock does.
     """
-    rows = sorted({str(item["row"]) for item in effects})
+    # Keyed on the smallest rank a row was seen with, because one pair can survive in several
+    # windows and each of them carries the same rank anyway. A row the caller did not rank sorts
+    # after every one it did and then by its label -- never dropped, the convention every cohort
+    # order in this package follows for a label it does not know.
+    rank_by_row: Dict[str, Any] = {}
+    for item in effects:
+        label = str(item["row"])
+        rank = tuple(item.get("rank") or (float("inf"),))
+        if label not in rank_by_row or rank < rank_by_row[label]:
+            rank_by_row[label] = rank
+    rows = sorted(rank_by_row, key=lambda label: (rank_by_row[label], label))
     columns = sorted(
         {float(item["centre"]) for item in effects if np.isfinite(item["centre"])},
         reverse=bool(descending),
