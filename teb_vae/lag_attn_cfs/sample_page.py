@@ -127,6 +127,7 @@ from utils.style import style_axes  # noqa: E402
 
 __all__ = [
     "CAUSAL_EXTRA_ROWS",
+    "COMPACT_PAGE_ROWS",
     "LAG_TIME_CAVEAT",
     "WARMUP_STAIRCASE_LABEL",
     "causal_forecast_rows",
@@ -173,6 +174,24 @@ CAUSAL_EXTRA_ROWS: Tuple[Tuple[str, float], ...] = (
     # Taller than the page's other line rows: it carries two curves, the shaded gap between them,
     # and the two per-channel profiles as insets.
     ("pred_gap", 1.5),
+)
+
+#: The rows the **reduced** page keeps, in the full page's own order, handed to
+#: :func:`~teb_vae.lag_attn_rws.sample_page.build_diagnostic_figure` through its ``rows``
+#: argument. Everything a reader needs to answer "what did this recording's latent and
+#: attention do": the physiological context, the target block as the encoder receives it, the
+#: latent state and its source-derived shift, $K_t$, and the lag attention. What it drops is the
+#: forecast itself -- eight rows of what the model predicted, which is the other question.
+#:
+#: ``input_target`` is the name the layout derives from :func:`causal_stream_panels`'s first
+#: panel, which is why this constant lives here rather than beside the layout: the shared
+#: builder does not know what this cell's streams are called.
+COMPACT_PAGE_ROWS: Tuple[str, ...] = (
+    "raw",
+    "input_target",
+    "latent",
+    "kld_total",
+    "lag_attn",
 )
 
 #: Coverage a correctly calibrated $\mu \pm 2\sigma$ band attains under the Gaussian the
@@ -1020,6 +1039,11 @@ def causal_forecast_rows(
     :data:`CAUSAL_EXTRA_ROWS`, which the same seam reserves and which draw the same tiling over
     every kept channel.
 
+    On a page built for a subset of the rows -- see :data:`COMPACT_PAGE_ROWS` -- only the raw
+    context row and the lag footnote are drawn, and the function returns before the forecast is
+    stitched at all, so none of the per-window scoring below is paid for a page that has nowhere
+    to put it.
+
     Args:
         rows: The row inputs and the layout hooks. ``rows.outs`` must carry ``anchor_index`` and
             ``anchor_valid``: the forecast tensors are indexed by *position in the decoded set*,
@@ -1043,6 +1067,22 @@ def causal_forecast_rows(
     """
     index, geometry = rows.sample_index, rows.geometry
     _draw_context_row(rows)
+
+    # The footnote the lag panels are read under. Added here rather than to their titles because
+    # those panels are the shared builder's and are drawn for six other models whose transform
+    # this caveat is not about. Placed inside the GridSpec's bottom margin, so it costs no row --
+    # and written before the early return below, because a page that keeps the lag rows and drops
+    # the forecast rows is exactly the page that leads with a lag axis.
+    rows.figure.text(
+        0.5, 0.004, LAG_TIME_CAVEAT,
+        ha="center", va="bottom", fontsize=7, color=COLOR_GRAY, wrap=True,
+    )
+
+    # Everything below belongs to the forecast row and the six rows reserved under it. A page
+    # built without them has no axes for any of it, and ``row_axes`` raises rather than
+    # inventing one -- inside a callback that swallows exceptions, which would cost the page.
+    if not rows.wants(FORECAST_ROW):
+        return
 
     anchors = to_numpy(rows.outs["anchor_index"][index]).astype(int).ravel()
     valid = to_numpy(rows.outs["anchor_valid"][index]).astype(bool).ravel()
@@ -1182,12 +1222,4 @@ def causal_forecast_rows(
         likelihood=likelihood,
         coverage_floor=coverage_floor,
         seconds_per_step=seconds_per_step,
-    )
-
-    # The footnote the lag panels are read under. Added here rather than to their titles because
-    # those panels are the shared builder's and are drawn for six other models whose transform this
-    # caveat is not about. Placed inside the GridSpec's bottom margin, so it costs no row.
-    ax.figure.text(
-        0.5, 0.004, LAG_TIME_CAVEAT,
-        ha="center", va="bottom", fontsize=7, color=COLOR_GRAY, wrap=True,
     )

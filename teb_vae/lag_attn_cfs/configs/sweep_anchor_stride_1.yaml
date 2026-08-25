@@ -16,7 +16,7 @@
 #
 # The memory cost is the reason this is an arm rather than the default, and it grew with the
 # horizon: the four forecast tensors and the target go from (B, 5, 30, 98) to (B, 136, 30, 98),
-# which at batch 128 is roughly 206 MB rather than 7.5 MB EACH. At the one-minute horizon the same
+# which at batch 128 is roughly 205 MB rather than 7.5 MB EACH. At the one-minute horizon the same
 # arm cost 114 MB against 8 MB, so doubling H nearly doubled the arm's price while leaving the
 # tiled default's almost unchanged.
 #

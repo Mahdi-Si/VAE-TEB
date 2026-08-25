@@ -25,6 +25,12 @@
       "forecast_overlay.pdf",
       "horizon_skill.pdf"
     ],
+    "lag_clocks": [
+      "lag_second_stage.pdf",
+      "lag_second_stage_windows.pdf",
+      "lag_time_to_delivery.pdf",
+      "lag_time_to_delivery_windows.pdf"
+    ],
     "lag_kl": [
       "lag_kl_profile.pdf"
     ],
@@ -65,6 +71,10 @@
     "sample_pages": {
       "pattern": "samples/<selection>/sample<index>_<guid>_epoch<epoch>.pdf",
       "guide_marker": "The per-recording pages"
+    },
+    "sample_pages_compact": {
+      "pattern": "samples/<selection>/sample<index>_<guid>_epoch<epoch>_compact.pdf",
+      "guide_marker": "The reduced per-recording pages"
     }
   }
 }

@@ -313,14 +313,30 @@ def bootstrap_ci(
 
 
 def pairwise_comparisons(samples: Dict[str, np.ndarray]) -> List[Dict[str, Any]]:
-    """Run every pairwise Mann-Whitney test with its Cliff's delta.
+    r"""Run every pairwise Mann-Whitney test with its Cliff's delta, **in the caller's order**.
 
     Intended to be called only for a metric whose omnibus test survived the correction -- running
-    $\\binom{k}{2}$ pairwise tests on a metric whose omnibus test found nothing is the
+    $\binom{k}{2}$ pairwise tests on a metric whose omnibus test found nothing is the
     multiple-comparison problem with extra steps.
 
+    **The mapping's iteration order decides the sweep order and the orientation alike**, which is
+    the division of labour :func:`windowed_group_comparisons` states outright: the caller owns the
+    population, this function owns the arithmetic. The pair $(i, j)$ with $i$ before $j$ in that
+    order is reported as ``left`` against ``right``, and Cliff's delta is signed against it.
+
+    Deliberately **not** ``sorted``. Alphabetical is a different order from every cohort axis in
+    these pipelines, which run healthy, acidosis, HIE and the eight subgroups in their canonical
+    order -- so sorting would name a clinical pair ``acidosis vs healthy`` and sign $\delta$
+    against the reverse of the axis every figure draws it on. The callers pass severity-ascending
+    cohorts, so each comparison reads **less severe against worse** -- healthy vs acidosis,
+    healthy vs HIE, acidosis vs HIE -- and $\delta > 0$ means the *less severe* cohort's values
+    run higher, on every pair of every metric rather than on the ones whose names happened to
+    sort that way.
+
     Args:
-        samples: Group to its finite values.
+        samples: Group to its finite values, in the order the comparisons are to be reported and
+            oriented in. A ``dict`` preserves insertion order, so a caller that built it through
+            its own cohort ordering gets that ordering back rather than an alphabetical one.
 
     Returns:
         One record per unordered pair, carrying the test, its $p$-value, the effect size and its
@@ -332,7 +348,8 @@ def pairwise_comparisons(samples: Dict[str, np.ndarray]) -> List[Dict[str, Any]]
     from scipy import stats
 
     records: List[Dict[str, Any]] = []
-    for left, right in itertools.combinations(sorted(samples), 2):
+    # The caller's order rather than ``sorted``: it is what makes ``left`` the less severe cohort.
+    for left, right in itertools.combinations(samples, 2):
         x, y = samples[left], samples[right]
         try:
             statistic, p_value = stats.mannwhitneyu(x, y, alternative="two-sided")
@@ -395,6 +412,11 @@ def windowed_group_comparisons(
     cohort; they are made before the call and recorded through ``meta_by_window``. This function
     applies no :data:`MIN_GROUP_SIZE` floor of its own -- a window arriving with one usable group
     is recorded as untestable, not silently filtered.
+
+    That order is also the **orientation**: :func:`pairwise_comparisons` names each pair in the
+    order the window's own mapping carries it, so a caller passing severity-ascending cohorts gets
+    comparisons that read less severe against worse and a Cliff's delta signed the same way in
+    every window.
 
     Args:
         samples_by_window: Ordered mapping from a window key to that window's

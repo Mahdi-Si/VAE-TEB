@@ -204,8 +204,8 @@ def trf_cfs_encoder_disclosure(model: Any) -> Dict[str, Any]:
 #: ever come to differ from the one the comparison model runs under, and the two ``summary.json``
 #: files would stop being readable side by side long before anyone noticed.
 #:
-#: They carry the parent's three cfs-only analyses (``warmup``, ``source_null``,
-#: ``spectral_skill``) and their headline scalars, so the second cell reports the same nineteen
+#: They carry the parent's four cfs-only analyses (``warmup``, ``source_null``, ``lag_clocks``
+#: and ``spectral_skill``) and their headline scalars, so the second cell reports the same twenty
 #: analyses and the same headline surface as the first. That is what makes the cross-cell table
 #: possible: a column present on one side and missing on the other is not a comparison.
 #: ``tests/test_eval_binding.py`` asserts the identity, and that

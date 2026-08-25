@@ -194,22 +194,56 @@ def test_the_conditioned_coupling_violins_are_ordered_and_coloured_by_class() ->
 
 
 def test_the_effect_heatmap_columns_run_in_the_canonical_cohort_order() -> None:
-    """``cross_subgroup``'s x axis is cohort *pairs*, and the shared pairwise test names them
-    alphabetically. Only the column order is this analysis's to choose -- reorienting a pair would
-    flip the sign of the Cliff's delta printed for it -- so that is what is asserted."""
+    """``cross_subgroup``'s x axis is cohort *pairs*, and the shared pairwise test names each pair
+    in the order it receives the cohorts -- the canonical one, so a pair reads less severe against
+    worse. What this analysis chooses is the column order, keyed on where the two cohorts fall on
+    that same axis; a shuffled input must still come back healthy-first."""
     from teb_vae.lag_attn_rws.eval.analyses import cross_subgroup
 
     pairs = pd.DataFrame(
         {
-            "left": ["acidosis", "acidosis", "healthy"],
-            "right": ["healthy", "hie", "hie"],
+            "left": ["acidosis", "healthy", "healthy"],
+            "right": ["hie", "hie", "acidosis"],
         }
     )
 
     ordered = cross_subgroup._ordered_pair_labels(pairs, labels.CLASS_COLUMN)
 
     # Keyed on (position of left, position of right): healthy is 0, so its pairs come first.
-    assert ordered == ["healthy vs hie", "acidosis vs healthy", "acidosis vs hie"]
+    assert ordered == ["healthy vs acidosis", "healthy vs hie", "acidosis vs hie"]
+
+
+def test_every_comparison_runs_from_the_less_severe_cohort_to_the_worse_one() -> None:
+    """The orientation the column order above is read against, at the two functions that decide
+    it: this analysis picks the cohorts and their order, and the shared sweep names each pair in
+    the order it receives them. ``sorted`` would answer ``acidosis vs healthy`` first -- the same
+    comparison with its Cliff's delta reversed, and nothing in the output would say so.
+    """
+    from teb_vae.lag_attn_rws.eval.analyses import cross_subgroup
+    from teb_vae.lag_attn_rws.eval._reuse import stats as shared_stats
+
+    # Entered worst-first, and the metric grows with severity: neither a no-op nor a plain
+    # ``sorted`` reproduces the expected answer.
+    frame = pd.DataFrame(
+        [
+            {
+                "guid": f"{name}_{recording:02d}",
+                labels.CLASS_COLUMN: name,
+                "pred_gap": offset + float(recording),
+            }
+            for name, offset in (("hie", 20.0), ("acidosis", 10.0), ("healthy", 0.0))
+            for recording in range(4)
+        ]
+    )
+
+    usable, _ = cross_subgroup.usable_groups(frame, "pred_gap", labels.CLASS_COLUMN)
+    comparisons = shared_stats.pairwise_comparisons(usable)
+
+    assert [(item["left"], item["right"]) for item in comparisons] == [
+        ("healthy", "acidosis"), ("healthy", "hie"), ("acidosis", "hie"),
+    ]
+    # One sign convention across every pair: the less severe cohort of each runs lower here.
+    assert all(item["cliffs_delta"] < 0.0 for item in comparisons)
 
 
 # =============================================================================

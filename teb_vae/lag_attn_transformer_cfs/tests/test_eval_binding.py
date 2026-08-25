@@ -213,7 +213,9 @@ def test_the_extra_analyses_and_headline_scalars_are_the_parents_objects() -> No
     assert TRF_CFS_BINDING.headline_scalars is CFS_BINDING.headline_scalars
     # Non-vacuous now that the parent's registry is filled: identity between two empty objects
     # would be satisfied by two independent empty literals.
-    assert set(TRF_CFS_BINDING.extra_analyses) == {"warmup", "source_null", "spectral_skill"}
+    assert set(TRF_CFS_BINDING.extra_analyses) == {
+        "warmup", "source_null", "lag_clocks", "spectral_skill",
+    }
     assert TRF_CFS_BINDING.headline_scalars != ()
 
 
@@ -231,9 +233,9 @@ def test_the_two_cells_ask_the_same_questions_in_the_same_order() -> None:
     # And the same callables, not merely the same names: two registries agreeing on names while
     # disagreeing on implementations is the exact failure the shared registry exists to prevent.
     assert here == there
-    # Non-vacuity: the three cfs-only analyses are in there, and ``cross_subgroup`` still trails
+    # Non-vacuity: the four cfs-only analyses are in there, and ``cross_subgroup`` still trails
     # them, because it reads the per-recording CSVs the steps above it write.
-    assert {"warmup", "source_null", "spectral_skill"} <= set(here)
+    assert {"warmup", "source_null", "lag_clocks", "spectral_skill"} <= set(here)
     assert list(here)[-1] == "cross_subgroup"
 
 

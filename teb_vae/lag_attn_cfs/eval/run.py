@@ -248,8 +248,8 @@ ANALYSIS_FUNCTIONS: Dict[str, Any] = {
 
 #: The **shared** analysis names, in run order, for a reader and for the second cfs cell to merge
 #: its own onto. Deliberately not what ``--only`` and ``--skip`` accept: selection runs against the
-#: registry a *binding* merges (:func:`merged_analysis_functions`), and this cell's own three are
-#: registered on ``CFS_BINDING`` rather than above, so a run of this package selects from nineteen
+#: registry a *binding* merges (:func:`merged_analysis_functions`), and this cell's own four are
+#: registered on ``CFS_BINDING`` rather than above, so a run of this package selects from twenty
 #: names while this tuple holds sixteen.
 ANALYSES: Tuple[str, ...] = tuple(ANALYSIS_FUNCTIONS)
 
@@ -1678,7 +1678,7 @@ def build_parser() -> argparse.ArgumentParser:
     #
     # Interpolated from the registry the *default binding* merges rather than from the shared
     # ANALYSES tuple, because that merged registry is what `main` selects against: this cell's own
-    # three analyses are registered on CFS_BINDING, so a help text built from the shared sixteen
+    # four analyses are registered on CFS_BINDING, so a help text built from the shared sixteen
     # would tell an operator that `--only warmup` is invalid while the run accepts it.
     selectable = ", ".join(merged_analysis_functions(CFS_BINDING)) or "(none registered yet)"
     parser.add_argument(
@@ -1824,6 +1824,8 @@ RUN_ARGS: Dict[str, Any] = {
     #                     lag warmth, and the two FAIL-able geometry guards.
     #   source_null:      How much of the coupling readout survives zeroing the source -- the
     #                     availability-clock hazard no permutation of rows can see.
+    #   lag_clocks:       Where the informative past sits, against both clinical clocks: the
+    #                     centre of mass and the spread of the lag profile per window, tested.
     #   spectral_skill:   The forecast gap resolved by the frequency band of the target
     #                     coefficient, joined through the kept-axis channel map.
     #   cross_subgroup:   Do the cohorts actually differ. Kruskal, Holm, then Mann-Whitney, over

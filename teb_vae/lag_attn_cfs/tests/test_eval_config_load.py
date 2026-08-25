@@ -169,10 +169,15 @@ def test_the_waveform_cap_is_halved_and_the_oracle_cap_stays_absent(overrides) -
 
     ``oracle`` is the one cap whose ABSENCE means every segment, so naming a number would reduce
     what the sufficiency probe is fitted on. Absent is the complete setting, and this pins it.
+
+    The two page caps are figure counts and retain nothing. ``pages_per_class`` is PER CLASS, so
+    it is not comparable with ``pages`` and is pinned here beside it rather than derived from it.
     """
     caps = overrides["eval_config"]["caps"]
 
-    assert caps == {"waveforms": 64, "attention": 64, "pages": 24}
+    assert caps == {
+        "waveforms": 64, "attention": 64, "pages": 24, "pages_per_class": 10
+    }
     assert "oracle" not in caps
 
 

@@ -17,11 +17,22 @@ the dataset's own class codes and ``CANONICAL_SUBGROUPS`` is written in the inte
 subgroup added to the dataset appears in these figures without an edit here -- and this package and
 the raw cells' cannot come to disagree about what a cohort *is*.
 
+**And the order is not only presentational: it decides every comparison's orientation.**
+``stats.pairwise_comparisons`` names each pair in the order it receives the cohorts, so the same
+ordering that puts healthy leftmost on a figure makes every significance test read *less severe
+against worse* -- healthy vs acidosis, healthy vs HIE, acidosis vs HIE -- with Cliff's delta signed
+that way in every window of every readout. Alphabetical would name the first clinical pair
+``acidosis vs healthy`` and sign it against the axis its own figure draws it on, which is a sign
+error a reader has no way to see.
+
 **The time axis and the bin width are constants rather than settings.** An operator who could widen
 the trajectory bin could merge two windows until a difference appeared or disappeared, which is the
 same argument that keeps the significance level out of the configuration.
 """
 from __future__ import annotations
+
+import itertools
+from typing import Any, Dict, List
 
 import numpy as np
 import pandas as pd
@@ -29,7 +40,8 @@ import pytest
 
 from teb_vae.lag_attn.eval import figures as shared_figures
 from teb_vae.lag_attn_cfs.eval import cohort, figures_seam
-from teb_vae.lag_attn_cfs.eval._reuse import labels
+from teb_vae.lag_attn_cfs.eval._reuse import labels, stats as shared_stats
+from teb_vae.lag_attn_cfs.eval.analyses import cross_subgroup, time_to_delivery
 from teb_vae.lag_attn_cfs.eval.report_seam import emit_grouped_variants
 
 #: The order the two axes are read in, written out rather than derived, so this file states the
@@ -186,6 +198,133 @@ def test_the_grouped_table_is_written_in_the_same_order_as_its_figure(
         assert list(dict.fromkeys(table["group"])) == expected, axis
         # And the table is still the whole summary, not a reordered subset of it.
         assert len(table) == len(expected) * len(_METRICS)
+
+
+# =================================================================================================
+# The order, where the statistics meet it
+# =================================================================================================
+#: The three comparisons of the class axis, in the order every test must report them.
+EXPECTED_CLASS_PAIRS = [("healthy", "acidosis"), ("healthy", "hie"), ("acidosis", "hie")]
+
+#: Hours in the seconds ``epoch`` is stored in, for the clock frame below.
+_HOUR = 3600.0
+
+
+def _severity_ordered_recordings(classes=("hie", "acidosis", "healthy")) -> pd.DataFrame:
+    """A per-recording frame whose metric grows with severity, the classes entered worst-first.
+
+    Worst-first deliberately: a frame already in the intended order would pass the assertions
+    below with the ordering unimplemented, and alphabetical is a third order again -- so neither a
+    no-op nor a plain ``sorted`` reproduces the expected answer.
+    """
+    rows: List[Dict[str, Any]] = []
+    for name in classes:
+        offset = {"healthy": 0.0, "acidosis": 10.0, "hie": 20.0}[name]
+        for recording in range(4):
+            rows.append({
+                "guid": f"{name}_{recording:02d}",
+                labels.CLASS_COLUMN: name,
+                "pred_gap": offset + float(recording),
+            })
+    return pd.DataFrame(rows)
+
+
+def _clock_per_sample() -> pd.DataFrame:
+    """A per-sample table with the three classes separated in both windows of the delivery clock."""
+    rows: List[Dict[str, Any]] = []
+    for name, offset in (("hie", 100.0), ("acidosis", 50.0), ("healthy", 0.0)):
+        for recording in range(5):
+            for segment, hours in enumerate((1.0, 3.0)):
+                rows.append({
+                    "guid": f"{name}_{recording:02d}",
+                    "epoch": -hours * _HOUR,
+                    labels.CLASS_COLUMN: name,
+                    labels.SUBGROUP_COLUMN: f"{name}_no_cs",
+                    "mc_pred_gap": offset + float(recording) + 0.1 * segment,
+                    "source_conditioned_kl_raw": offset + float(recording),
+                })
+    return pd.DataFrame(rows)
+
+
+def test_every_comparison_runs_from_the_less_severe_cohort_to_the_worse_one() -> None:
+    """The class axis of ``cross_subgroup``, through the two functions that decide it: this
+    analysis picks the cohorts and their order, the shared sweep names each pair in that order.
+
+    ``sorted`` would answer ``acidosis vs healthy``, ``acidosis vs hie``, ``healthy vs hie`` --
+    the same three comparisons with one of them reversed, which is a *sign* difference in the
+    Cliff's delta beside it and nothing in the output would say so.
+    """
+    frame = _severity_ordered_recordings()
+
+    usable, _ = cross_subgroup.usable_groups(frame, "pred_gap", labels.CLASS_COLUMN)
+    pairs = shared_stats.pairwise_comparisons(usable)
+
+    assert [(item["left"], item["right"]) for item in pairs] == EXPECTED_CLASS_PAIRS
+    # The metric grows with severity, so the less severe cohort of every pair runs lower and each
+    # delta is negative. That is the property the orientation exists to make readable: one sign
+    # convention across every pair, rather than one per pair depending on how the names sorted.
+    assert all(item["cliffs_delta"] < 0.0 for item in pairs)
+    assert sorted(EXPECTED_CLASS_PAIRS) != EXPECTED_CLASS_PAIRS
+
+
+def test_the_subgroup_comparisons_run_in_the_canonical_order_too(eight_subgroup_frame) -> None:
+    """Twenty-eight pairs on the wider axis, and the canonical order decides all of them: the
+    healthy subgroups are the left of every pair they appear in, the HIE ones the right."""
+    usable, _ = cross_subgroup.usable_groups(
+        eight_subgroup_frame, "pred_gap", labels.SUBGROUP_COLUMN
+    )
+    pairs = shared_stats.pairwise_comparisons(usable)
+
+    assert [(item["left"], item["right"]) for item in pairs] == list(
+        itertools.combinations(EXPECTED_SUBGROUP_ORDER, 2)
+    )
+
+
+def test_the_clock_windows_orient_their_comparisons_the_same_way() -> None:
+    """The trajectory clocks reach the sweep through ``windowed_group_comparisons`` rather than
+    directly, so the orientation has to survive that layer as well -- and it is per window, which
+    is where a per-call ``sorted`` would be least visible."""
+    per_recording = time_to_delivery.build_per_recording(_clock_per_sample())[labels.CLASS_COLUMN]
+
+    record = time_to_delivery.analyse_windows(per_recording, "mc_pred_gap")
+
+    # Non-vacuity: the classes are fifty nats apart, so both windows must survive Holm and be
+    # swept. An implementation that tested nothing would satisfy the loop below trivially.
+    assert record["n_significant_windows"] == 2
+    for comparisons in record["pairwise"].values():
+        assert [(item["left"], item["right"]) for item in comparisons] == EXPECTED_CLASS_PAIRS
+        assert all(item["cliffs_delta"] < 0.0 for item in comparisons)
+
+
+def test_the_effect_heatmap_rows_follow_the_cohort_order_rather_than_their_labels() -> None:
+    """The page an operator actually reads. Sorting the row *labels* would put
+    ``acidosis vs hie`` above ``healthy vs acidosis`` while the violins above run healthy-first,
+    which is the configuration in which a reader compares a row against the wrong column."""
+    per_recording = time_to_delivery.build_per_recording(_clock_per_sample())[labels.CLASS_COLUMN]
+    records = [
+        time_to_delivery.analyse_windows(per_recording, column)
+        for _, column, _ in time_to_delivery.READOUTS
+    ]
+
+    figure = time_to_delivery.build_windows_figure(per_recording, records)
+    try:
+        # Found by content rather than by position: the colourbar is an axes of its own, so the
+        # heatmap is not reliably the figure's last.
+        drawn = [
+            [text.get_text() for text in axis.get_yticklabels()]
+            for axis in figure.axes
+            if any(" vs " in text.get_text() for text in axis.get_yticklabels())
+        ]
+    finally:
+        shared_figures.plt.close(figure)
+
+    expected = [
+        f"{name}: {left} vs {right}"
+        for name, _, _ in time_to_delivery.READOUTS
+        for left, right in EXPECTED_CLASS_PAIRS
+    ]
+    assert drawn == [expected]
+    assert sorted(expected) != expected
 
 
 # =================================================================================================

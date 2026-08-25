@@ -195,7 +195,7 @@ model_config:
     # 134 steps is 536 s, i.e. 8.93 minutes. It is a CAUSAL-VALIDITY boundary, not a clinical
     # policy: nothing physiological distinguishes it from step 150, and the model's own 30-step
     # warm-up has long passed at either. `sweep_floor_150.yaml` ships the ten-minute policy arm, at
-    # a cost of two tiles and 17 covered target steps for the identical 98 channels.
+    # a cost of one tile and 16 covered target steps for the identical 98 channels.
     warmup_period: 134
     sequence_length: 300
     c_y: 102               # 36 (fhr_st) + 66 (fhr_ph); the two-sided widths are 43 and 66
@@ -583,7 +583,7 @@ advanced_config:
     # RE-MEASURED AT H = 30, and it moved from 6000: q99 went 5742 -> 14181, a factor of 2.47 for a
     # block that doubled. Two effects compound. The block itself is now 2940 coefficients rather
     # than 1470, which scales the summed loss and therefore its gradient; and the anchor count fell
-    # from ~10.1 tiles per step to ~4.57, so that larger block is averaged over fewer than half as
+    # from ~10.1 tiles per step to ~4.53, so that larger block is averaged over fewer than half as
     # many anchors and the per-step gradient is noisier again. Against the two-sided comparison
     # model's ~240 dense anchors the second effect is the dominant one, which is why this key
     # diverges from that model at either horizon.

@@ -74,7 +74,7 @@ RESOLVED_WARMUP_KWARGS = (
 
 #: The analyses this cell registers on its binding, in run order. Written out for the same reason
 #: the geometry keys are: importing the registry and comparing it to itself would pass on any edit.
-CELL_SPECIFIC_ANALYSES = ("warmup", "source_null", "spectral_skill")
+CELL_SPECIFIC_ANALYSES = ("warmup", "source_null", "lag_clocks", "spectral_skill")
 
 #: The headline scalars those analyses add, in registration order. An arm table reads this block by
 #: name, so the set of names is a contract with every future comparison rather than a detail of
@@ -231,7 +231,7 @@ def test_the_encoder_disclosure_is_this_cells_and_refuses_a_model_it_cannot_read
         CFS_BINDING.encoder_disclosure(object())
 
 
-def test_this_cell_registers_exactly_its_three_own_analyses() -> None:
+def test_this_cell_registers_exactly_its_four_own_analyses() -> None:
     """Pinned by name rather than counted, so an analysis that stopped being registered is a
     failure here rather than one that silently never runs -- which is indistinguishable in a
     ``summary.json`` from one that ran and found nothing."""
@@ -240,12 +240,15 @@ def test_this_cell_registers_exactly_its_three_own_analyses() -> None:
     assert all(callable(function) for function in CFS_BINDING.extra_analyses.values())
 
 
-def test_the_three_registered_analyses_are_the_functions_their_modules_define() -> None:
+def test_the_four_registered_analyses_are_the_functions_their_modules_define() -> None:
     """A registry entry pointing at something else would run outside the analysis protocol."""
-    from teb_vae.lag_attn_cfs.eval.analyses import source_null, spectral_skill, warmup
+    from teb_vae.lag_attn_cfs.eval.analyses import (
+        lag_clocks, source_null, spectral_skill, warmup,
+    )
 
     assert CFS_BINDING.extra_analyses["warmup"] is warmup.run_warmup_analysis
     assert CFS_BINDING.extra_analyses["source_null"] is source_null.run_source_null_analysis
+    assert CFS_BINDING.extra_analyses["lag_clocks"] is lag_clocks.run_lag_clocks_analysis
     assert (
         CFS_BINDING.extra_analyses["spectral_skill"]
         is spectral_skill.run_spectral_skill_analysis

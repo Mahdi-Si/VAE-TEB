@@ -10,12 +10,25 @@ produce a **fifteen-row** page: the raw-context row, the forecast lanes, the six
 (truth, both branch means, the signed skill difference, $\sigma^q$, and the per-window score), two
 gated-input rows, and the five latent and lag rows the layout owns.
 
-Two draws, and they answer different questions:
+**Every selected segment is drawn twice**, from one forward pass -- see :data:`PAGE_VARIANTS`.
+The full page is the fifteen-row one above. The reduced page beside it, named with a ``_compact``
+tail, keeps :data:`~teb_vae.lag_attn_cfs.sample_page.COMPACT_PAGE_ROWS`: the raw context, the
+target block as the encoder receives it, the latent state, $K_t$, and the lag attention on a
+logarithmic colour scale. It answers what this recording's latent and attention did, which is a
+different question from what the model predicted, and eight rows of forecast between the two is
+what makes the full page slow to read for it.
+
+Three draws, and they answer different questions:
 
 * **A stratified sample.** Seeded, over the whole index space, quota-allocated per shard with a
   floor of one, so a cap at or above the shard count reaches every shard. A prefix would not: the
   loader is unshuffled over eight concatenated per-subgroup files, so the first $n$ samples are
-  one subgroup and one clinical class.
+  one subgroup and one clinical class. The quota follows shard size, so what this draw renders is
+  what the split mostly **contains**.
+* **A class-balanced sample.** The same number of segments from every clinical class, which the
+  stratified draw cannot give: its quota is proportional, and on the shipped cohort that leaves
+  the two rare classes with a page or two against healthy's dozen. Balanced pages are what two
+  classes can be **compared** across; the stratified ones are not.
 * **The extremes.** ``per_sample.csv`` sorted by each headline metric, head and tail. This is what
   turns an outlier in a distribution into a recording somebody can inspect, and it can only be
   done after the pass: the rows are chosen by a table that did not exist while the pass ran.
@@ -52,12 +65,13 @@ from loguru import logger
 from torch.utils.data import DataLoader, Subset
 
 from teb_vae.lag_attn_cfs.eval import figures_seam as figures
-from teb_vae.lag_attn_cfs.eval._reuse import subsample_indices
+from teb_vae.lag_attn_cfs.eval._reuse import labels, subsample_indices
 from teb_vae.lag_attn_cfs.eval.metrics import (
     DENSE_ANCHOR_GEOMETRY,
     batch_field,
     model_inputs,
 )
+from teb_vae.lag_attn_cfs.sample_page import COMPACT_PAGE_ROWS
 from teb_vae.lag_attn_rws.sample_page import build_diagnostic_figure
 
 #: This analysis's own subdirectory inside the results directory.
@@ -66,6 +80,14 @@ ANALYSIS_DIRNAME = "samples"
 #: Where the stratified pages go, relative to that directory. The extremes go into
 #: ``<metric>_low/`` and ``<metric>_high/`` beside it.
 STRATIFIED_DIRNAME = "stratified"
+
+#: Where the class-balanced pages go. Separate from :data:`STRATIFIED_DIRNAME` rather than
+#: replacing it, because the two draws answer different questions and neither substitutes for
+#: the other: the stratified draw is **representative** -- its quota follows shard size, so what
+#: it renders is what the split mostly contains -- and this one is **balanced**, so the two rare
+#: clinical classes get the same number of pages as the common one and can be compared against
+#: it. Read the first to see the split; read the second to see a class.
+CLASS_DIRNAME = "by_class"
 
 #: The manifest of what was rendered and what failed.
 MANIFEST_FILENAME = "sample_pages.csv"
@@ -80,6 +102,18 @@ MANIFEST_FILENAME = "sample_pages.csv"
 #: tails of one metric overlap.
 DEFAULT_STRATIFIED_PAGES = 10
 EXTREME_PAGES_PER_TAIL = 10
+
+#: How many pages the class-balanced draw renders **per clinical class** when
+#: ``eval_config.caps.pages_per_class`` says nothing. Per class, not in total: the whole point
+#: of this draw is that the number does not depend on how many segments the class has.
+DEFAULT_PAGES_PER_CLASS = 10
+
+#: Offset added to the run's seed for the class-balanced draw. Two draws over the same table
+#: from one seed would walk the same permutation stream, so the class draw's pages would be
+#: correlated with the stratified draw's rather than independent of them -- and a reader
+#: comparing the two directories would be looking at the same segments twice without being
+#: told. Any fixed non-zero value does the job; this one is the run's own convention.
+_CLASS_DRAW_SEED_OFFSET = 5
 
 #: The metrics the extremes are taken on, as ``(directory stem, column)``. One per axis a page
 #: could be worth opening for: the coupling readout, the forecast score and the KL. A metric absent
@@ -105,7 +139,39 @@ EXPECTED_PAGE_ROWS = 15
 #: What a rendered page is called. The pattern is asserted by test, because these filenames are
 #: the only index a reader has: a GUID carrying a path separator, a space or a non-ASCII character
 #: must not be able to write outside the directory or produce a name a shell cannot address.
-FILENAME_PATTERN = re.compile(r"sample\d{4}_[A-Za-z0-9_-]{1,32}_epoch(-?\d+|na)\.pdf")
+#:
+#: The optional ``_compact`` tail is the **reduced** page of the same segment, written beside the
+#: full one. A suffix rather than a directory on purpose: the two pages are one segment's, and a
+#: reader who has found the segment has found both.
+FILENAME_PATTERN = re.compile(
+    r"sample\d{4}_[A-Za-z0-9_-]{1,32}_epoch(-?\d+|na)(_compact)?\.pdf"
+)
+
+#: The ``variant`` values the manifest records, and the tail that distinguishes the reduced
+#: page's filename from the full one's. One source for both, so a directory listing and
+#: ``sample_pages.csv`` cannot come to disagree about which file is which.
+FULL_VARIANT = "full"
+COMPACT_VARIANT = "compact"
+COMPACT_SUFFIX = f"_{COMPACT_VARIANT}"
+
+#: The two pages rendered for every selected segment, as
+#: ``(variant, rows or None for the whole page, log lag attention)``. Both come off **one**
+#: forward pass -- see :func:`render_pages` -- so the reduced page costs drawing and nothing
+#: else, and the two cannot describe different states of the model.
+#:
+#: The reduced page is the one to open when the question is what the latent and the attention
+#: did; the full one carries the eight forecast rows as well. Its lag attention is drawn on a
+#: **logarithmic** colour scale, which the full page's is not: on a page that leads with the lag
+#: panel the small weights are the content, and a linear scale flattens them under whichever lag
+#: happens to dominate.
+PAGE_VARIANTS: Tuple[Tuple[str, Optional[Tuple[str, ...]], bool], ...] = (
+    (FULL_VARIANT, None, False),
+    (COMPACT_VARIANT, COMPACT_PAGE_ROWS, True),
+)
+
+#: How many rows the reduced page has. Recorded in the analysis's ``plan`` for the same reason
+#: :data:`EXPECTED_PAGE_ROWS` is: a row silently lost from a PDF is visible nowhere else.
+EXPECTED_COMPACT_PAGE_ROWS = len(COMPACT_PAGE_ROWS)
 
 #: Characters kept from a GUID; everything else becomes ``-``.
 _SAFE_GUID = re.compile(r"[^A-Za-z0-9_-]")
@@ -142,21 +208,25 @@ def epoch_stamp(epoch: Any) -> Optional[int]:
     return int(round(value)) if np.isfinite(value) else None
 
 
-def page_filename(index: int, guid: Any, epoch: Any) -> str:
+def page_filename(index: int, guid: Any, epoch: Any, *, compact: bool = False) -> str:
     """Return the filename one page is written as.
 
     Args:
         index: The sample's index in the evaluation dataset.
         guid: Its recording identifier.
         epoch: Its ``epoch``, or anything non-finite for a segment that carries none.
+        compact: Whether this is the reduced page. The two variants of one segment differ by
+            :data:`COMPACT_SUFFIX` alone, so they sort together in a directory listing and a
+            reader who has found one has found the other.
 
     Returns:
-        ``sample<index>_<guid>_epoch<epoch|na>.pdf``.
+        ``sample<index>_<guid>_epoch<epoch|na>[_compact].pdf``.
     """
     stamp = epoch_stamp(epoch)
     return (
         f"sample{int(index):04d}_{sanitise_guid(guid)}_"
-        f"epoch{'na' if stamp is None else stamp}.pdf"
+        f"epoch{'na' if stamp is None else stamp}"
+        f"{COMPACT_SUFFIX if compact else ''}.pdf"
     )
 
 
@@ -375,8 +445,8 @@ def render_pages(
     delay_steps: int,
     normalization: Optional[Dict[str, Any]],
     seams: Dict[str, Any],
-) -> Tuple[List[str], List[Dict[str, Any]], Optional[int]]:
-    """Render one page per row, recording any that fail rather than losing the rest.
+) -> Tuple[List[Dict[str, str]], List[Dict[str, Any]], Optional[int]]:
+    """Render every page variant of every row, recording any that fail rather than losing the rest.
 
     Args:
         task: The loaded task, in evaluation mode.
@@ -388,14 +458,17 @@ def render_pages(
         seams: The task's three page seams, from :func:`page_seams`.
 
     Returns:
-        ``(written filenames, failures, input rows drawn)``. A failure carries its dataset index
-        and the error, so a page that could not be drawn is a recorded absence rather than a gap in
-        the directory. The third element is how many gated-input rows the seam actually produced --
-        ``None`` when no page was rendered, and **measured rather than assumed**, because it is
-        what decides whether the page has the rows a reader expects.
+        ``(written, failures, input rows drawn)``. ``written`` carries one
+        ``{'variant', 'file'}`` entry per **file** -- every one of :data:`PAGE_VARIANTS` for
+        every row that rendered -- so the manifest indexes the whole directory rather than half
+        of it. A failure carries its dataset index, its variant and the error, so a page that
+        could not be drawn is a recorded absence rather than a gap nobody notices. The third
+        element is how many gated-input rows the seam actually produced -- ``None`` when no page
+        was rendered, and **measured rather than assumed**, because it is what decides whether
+        the page has the rows a reader expects.
     """
     directory.mkdir(parents=True, exist_ok=True)
-    written: List[str] = []
+    written: List[Dict[str, str]] = []
     failures: List[Dict[str, Any]] = []
     n_input_rows: Optional[int] = None
     if not len(rows):
@@ -407,6 +480,9 @@ def render_pages(
     for position, batch in enumerate(pages):
         row = rows.iloc[position]
         index = int(row["dataset_index"])
+        # The forward is separated from the drawing so that both variants come off **one** dict. A
+        # second forward would double this analysis's model time, and -- the real reason -- would
+        # let two pages of one segment disagree about what the model did.
         try:
             check_identity(batch, row)
             moved = task.transfer_batch_to_device(batch, task.device, dataloader_idx=0)
@@ -418,44 +494,71 @@ def render_pages(
             panels = input_stream_rows(
                 model, seams["input_stream_panels"], (y_st, y_ph, u_stream), 0
             )
-            figure = build_diagnostic_figure(
-                outs=outs,
-                kld_per_dim=model.kld_tensor(
-                    mu_prior=outs["mu_prior"], logvar_prior=outs["logvar_prior"],
-                    mu_post=outs["mu_post"], logvar_post=outs["logvar_post"],
-                ),
-                # The **feature** target, which is what this cell's forecast rows read as
-                # ``rows.target``. The argument keeps the family's name; the tensor is
-                # $(B, T, c_y)$ rather than a raw trace, and the raw traces reach the page
-                # through ``batch`` and ``up_raw`` below.
-                fhr_raw=target_features,
-                geometry=model.geometry,
-                sample_index=0,
-                epoch=int(round(float(row["epoch"]))) if np.isfinite(float(row["epoch"])) else 0,
-                guid=str(row["guid"]),
-                beta=float(task.hparams.get("kld_beta", 1.0)),
-                scalars=_page_scalars(row),
-                # Read off the batch rather than from `model_inputs`, which returns only what the
-                # net is fed: the raw source trace is never one of the model's inputs. `None` for
-                # a batch that does not carry it, which the page renders as an FHR-only first row.
-                up_raw=batch_field(moved, "up"),
-                normalization_stats=normalization or None,
-                delay_steps=int(delay_steps),
-                forecast_rows=seams["forecast_rows"],
-                # The batch itself, for the same reason: a task whose target is not the raw
-                # signal cannot recover the raw traces from what it returned.
-                batch=moved,
-                input_streams=panels,
-                forecast_extra_rows=seams["forecast_extra_rows"],
+            kld_per_dim = model.kld_tensor(
+                mu_prior=outs["mu_prior"], logvar_prior=outs["logvar_prior"],
+                mu_post=outs["mu_post"], logvar_post=outs["logvar_post"],
             )
-            name = page_filename(index, row["guid"], row["epoch"])
-            figures.render_to_pdf(figure, directory / name)
-            written.append(name)
-            n_input_rows = len(panels)
-        except Exception as error:  # noqa: BLE001 - one page is not worth the rest of them
-            logger.warning(f"{ANALYSIS_DIRNAME}: page for dataset index {index} failed: {error}")
+        except Exception as error:  # noqa: BLE001 - one segment is not worth the rest of them
+            logger.warning(
+                f"{ANALYSIS_DIRNAME}: forward for dataset index {index} failed: {error}"
+            )
             failures.append({"dataset_index": index, "guid": str(row["guid"]),
+                             "variant": "forward",
                              "error": f"{type(error).__name__}: {error}"})
+            continue
+        n_input_rows = len(panels)
+
+        # One try per variant rather than one around both: a reduced page that fails must not turn
+        # a full page that already wrote into a recorded failure. They are independent drawings of
+        # the same forward, and a run is better off with one of them than with neither.
+        for variant, page_rows, log_lag_attention in PAGE_VARIANTS:
+            name = page_filename(
+                index, row["guid"], row["epoch"], compact=variant == COMPACT_VARIANT
+            )
+            try:
+                figure = build_diagnostic_figure(
+                    outs=outs,
+                    kld_per_dim=kld_per_dim,
+                    # The **feature** target, which is what this cell's forecast rows read as
+                    # ``rows.target``. The argument keeps the family's name; the tensor is
+                    # $(B, T, c_y)$ rather than a raw trace, and the raw traces reach the page
+                    # through ``batch`` and ``up_raw`` below.
+                    fhr_raw=target_features,
+                    geometry=model.geometry,
+                    sample_index=0,
+                    epoch=(
+                        int(round(float(row["epoch"])))
+                        if np.isfinite(float(row["epoch"])) else 0
+                    ),
+                    guid=str(row["guid"]),
+                    beta=float(task.hparams.get("kld_beta", 1.0)),
+                    scalars=_page_scalars(row),
+                    # Read off the batch rather than from `model_inputs`, which returns only what
+                    # the net is fed: the raw source trace is never one of the model's inputs.
+                    # `None` for a batch that does not carry it, which the page renders as an
+                    # FHR-only first row.
+                    up_raw=batch_field(moved, "up"),
+                    normalization_stats=normalization or None,
+                    delay_steps=int(delay_steps),
+                    forecast_rows=seams["forecast_rows"],
+                    # The batch itself, for the same reason: a task whose target is not the raw
+                    # signal cannot recover the raw traces from what it returned.
+                    batch=moved,
+                    input_streams=panels,
+                    forecast_extra_rows=seams["forecast_extra_rows"],
+                    rows=page_rows,
+                    log_lag_attention=log_lag_attention,
+                )
+                figures.render_to_pdf(figure, directory / name)
+                written.append({"variant": variant, "file": name})
+            except Exception as error:  # noqa: BLE001 - one page is not worth the rest of them
+                logger.warning(
+                    f"{ANALYSIS_DIRNAME}: {variant} page for dataset index {index} failed: "
+                    f"{error}"
+                )
+                failures.append({"dataset_index": index, "guid": str(row["guid"]),
+                                 "variant": variant,
+                                 "error": f"{type(error).__name__}: {error}"})
     return written, failures, n_input_rows
 
 
@@ -494,6 +597,68 @@ def stratified_rows(per_sample: pd.DataFrame, *, cap: int, seed: int) -> pd.Data
     if drawn is None:
         return per_sample
     return per_sample.iloc[[int(value) for value in drawn.tolist()]]
+
+
+def per_class_rows(per_sample: pd.DataFrame, *, per_class: int, seed: int) -> pd.DataFrame:
+    r"""Draw up to ``per_class`` rows uniformly at random from **every** clinical class.
+
+    Equal $N$, not a proportional quota, and that is the whole difference from
+    :func:`stratified_rows`. :func:`subsample_indices` cannot express it: its ``groups``
+    argument splits a *total* cap in proportion to group size, which is the right rule for a
+    draw meant to represent the split and the wrong one for a draw meant to let two classes be
+    compared. On the shipped cohort the healthy class carries most of the segments, so a
+    proportional draw gives ``hie`` one or two pages against healthy's dozen.
+
+    Args:
+        per_sample: The per-sample table.
+        per_class: How many rows to draw from each class, as an upper bound -- a class with
+            fewer segments than that contributes all of them.
+        seed: The draw's seed. Offset from the run's by :data:`_CLASS_DRAW_SEED_OFFSET` by the
+            caller, so this draw and the stratified one are independent rather than two reads
+            of one permutation stream.
+
+    Returns:
+        The drawn rows, in table order, from every class the column names -- segments whose
+        class is missing are skipped. **Empty** when the table carries no
+        ``labels.CLASS_COLUMN`` at all, which is a recorded absence rather than a silent
+        fallback to some other grouping: a directory named ``by_class`` whose pages were not
+        drawn by class is worse than one that is empty and says why.
+    """
+    if per_sample.empty or labels.CLASS_COLUMN not in per_sample.columns:
+        return per_sample.head(0)
+
+    positions: Dict[Any, List[int]] = {}
+    for position, value in enumerate(per_sample[labels.CLASS_COLUMN]):
+        # A missing class is an absence, not a class. Drawn as one it would fill a tenth of a
+        # directory called ``by_class`` with segments that have none, under a heading a reader
+        # would take for a clinical group. An unrecognised *name* is kept, because that is a
+        # labelling this cell does not know about rather than one that is not there.
+        if pd.isna(value):
+            continue
+        positions.setdefault(value, []).append(position)
+
+    # Classes are visited in the labelling's own order, with anything unrecognised after it in
+    # sorted order. One generator walked in a fixed order is what makes the draw reproducible:
+    # dict insertion order here is the table's row order, which the collection pass shuffled.
+    known = [name for name in labels.CLASS_NAMES.values() if name in positions]
+    # The keys themselves, sorted by their text -- not their text. A table can carry a class
+    # value that is not one of the three names, including a missing one, and rebuilding the key
+    # from `str` would then look up something the mapping does not hold.
+    ordered = known + sorted((key for key in positions if key not in known), key=str)
+
+    generator = torch.Generator().manual_seed(int(seed))
+    picked: List[int] = []
+    for name in ordered:
+        members = positions[name]
+        take = min(int(per_class), len(members))
+        if take <= 0:
+            continue
+        member_index = torch.tensor(members, dtype=torch.long)
+        chosen = member_index[torch.randperm(len(members), generator=generator)[:take]]
+        picked.extend(int(value) for value in chosen.tolist())
+    # Sorted back into table order, so the pages of one class are not a contiguous block and the
+    # resolved dataset indices are ascending, which `page_loader` requires.
+    return per_sample.iloc[sorted(picked)]
 
 
 def extreme_rows(per_sample: pd.DataFrame, column: str, *, per_tail: int) -> Dict[str, pd.DataFrame]:
@@ -536,12 +701,15 @@ def run_samples_analysis(
     output_dir: Any,
     probe: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """Render a stratified draw of diagnostic pages, plus the extremes of each headline metric.
+    """Render the stratified and class-balanced draws, plus the extremes of each headline metric.
+
+    Every selected segment gets **two** pages -- see :data:`PAGE_VARIANTS` -- off one forward.
 
     Args:
         context: The analysis context, read for the per-sample table and -- with the sufficiency
             probe, uniquely -- for the task and the loader a page has to be re-rendered from.
-        eval_config: The validated block, for ``caps.pages`` and the draw's seed.
+        eval_config: The validated block, for ``caps.pages``, ``caps.pages_per_class`` and the
+            draw's seed.
         output_dir: The results directory; this analysis writes into its own subdirectory.
         probe: The loader probe's record. Unused.
 
@@ -562,11 +730,14 @@ def run_samples_analysis(
             "an offline re-run against a finished directory is"
         )
         logger.warning(f"{ANALYSIS_DIRNAME}: skipped -- {reason}")
-        return {"n_samples": None, "composition": {}, "plan": {"capped": True},
+        return {"n_samples": None, "n_files": None, "composition": {},
+                "plan": {"capped": True},
                 "skipped": True, "reason": reason, "files": []}
 
     seed = int(eval_config.get("seed", 0))
-    cap = int((eval_config.get("caps") or {}).get("pages") or DEFAULT_STRATIFIED_PAGES)
+    caps = eval_config.get("caps") or {}
+    cap = int(caps.get("pages") or DEFAULT_STRATIFIED_PAGES)
+    per_class = int(caps.get("pages_per_class") or DEFAULT_PAGES_PER_CLASS)
     delay_steps = int(((collection.results or {}).get("lag") or {}).get("delay_steps") or 0)
     seams = page_seams(task)
     normalization = raw_trace_normalization(loader)
@@ -578,17 +749,27 @@ def run_samples_analysis(
     n_input_rows: Optional[int] = None
 
     def _render(rows: pd.DataFrame, selection: str) -> int:
-        """Render one selection into its own directory and fold its outcome into the manifest."""
+        """Render one selection into its own directory and fold its outcome into the manifest.
+
+        Args:
+            rows: The resolved rows to draw, carrying ``dataset_index``.
+            selection: The subdirectory name, which is also the manifest's ``selection``.
+
+        Returns:
+            How many **segments** rendered, not how many files: a segment is what was selected,
+            and counting its variants would make the number depend on how many pages the run
+            happens to draw per segment. The file count is the manifest's length.
+        """
         nonlocal n_input_rows
-        names, failed, observed = render_pages(
+        records, failed, observed = render_pages(
             task, loader, rows, directory / selection,
             delay_steps=delay_steps, normalization=normalization, seams=seams,
         )
-        manifest.extend({"selection": selection, "file": name} for name in names)
+        manifest.extend({"selection": selection, **record} for record in records)
         failures.extend({"selection": selection, **entry} for entry in failed)
         if observed is not None:
             n_input_rows = observed
-        return len(names)
+        return sum(1 for record in records if record["variant"] == FULL_VARIANT)
 
     # Counted where the drop happens, over every frame that is actually resolved. A table-wide
     # subtraction cannot express this: the two row counts describe different populations -- scored
@@ -598,6 +779,15 @@ def run_samples_analysis(
     drawn = resolve_rows(drawn_rows, index_map)
     n_unlocatable = int(len(drawn_rows) - len(drawn))
     written += _render(drawn, STRATIFIED_DIRNAME)
+
+    # The balanced draw, beside the representative one rather than instead of it. Its own seed
+    # offset, so the two are independent rather than two reads of one permutation stream.
+    class_rows = per_class_rows(
+        per_sample, per_class=per_class, seed=seed + _CLASS_DRAW_SEED_OFFSET
+    )
+    by_class = resolve_rows(class_rows, index_map)
+    n_unlocatable += int(len(class_rows) - len(by_class))
+    written += _render(by_class, CLASS_DIRNAME)
 
     missing: List[str] = []
     for stem, column in EXTREME_METRICS:
@@ -610,22 +800,33 @@ def run_samples_analysis(
             n_unlocatable += int(len(frame) - len(rows))
             written += _render(rows, f"{stem}_{side}")
 
-    pd.DataFrame(manifest, columns=["selection", "file"]).to_csv(
+    pd.DataFrame(manifest, columns=["selection", "variant", "file"]).to_csv(
         directory / MANIFEST_FILENAME, index=False
     )
     logger.info(
-        f"{ANALYSIS_DIRNAME}: rendered {written} page(s), {len(failures)} failed, "
-        f"{len(index_map)} dataset row(s) locatable"
+        f"{ANALYSIS_DIRNAME}: rendered {written} segment(s) as {len(manifest)} page(s), "
+        f"{len(failures)} failed, {len(index_map)} dataset row(s) locatable"
     )
     return {
         "n_samples": int(written),
+        # Files, not segments: with two variants per page the two numbers differ, and a run
+        # that lost one variant everywhere would still report the full segment count.
+        "n_files": int(len(manifest)),
         "composition": {
             "n_stratified": int(len(drawn)),
             "n_shards_reached": int(drawn["source_file_basename"].nunique())
             if "source_file_basename" in drawn.columns and len(drawn) else 0,
+            "n_by_class": int(len(by_class)),
+            # How many classes the balanced draw actually reached. Zero means the table carried
+            # no clinical class at all, which is why the directory is empty -- a statement the
+            # page count alone cannot make.
+            "n_classes_reached": int(by_class[labels.CLASS_COLUMN].nunique())
+            if labels.CLASS_COLUMN in by_class.columns and len(by_class) else 0,
         },
         "plan": {
             "capped": True, "cap": int(cap), "seed": seed,
+            "pages_per_class": int(per_class),
+            "page_variants": [variant for variant, _, _ in PAGE_VARIANTS],
             "extreme_pages_per_tail": int(EXTREME_PAGES_PER_TAIL),
             "anchor_phase": DENSE_ANCHOR_GEOMETRY[0],
             "anchor_stride": DENSE_ANCHOR_GEOMETRY[1],
@@ -640,6 +841,8 @@ def run_samples_analysis(
             },
             "page_rows": _page_row_count(seams, n_input_rows),
             "expected_page_rows": EXPECTED_PAGE_ROWS,
+            "compact_page_rows": len(COMPACT_PAGE_ROWS),
+            "expected_compact_page_rows": EXPECTED_COMPACT_PAGE_ROWS,
         },
         # By index, so a failure is recoverable rather than merely counted.
         "failures": failures,
