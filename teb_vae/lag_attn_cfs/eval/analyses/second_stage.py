@@ -67,10 +67,30 @@ SIGNIFICANCE_FILENAME = "second_stage_significance.csv"
 PAIRWISE_FILENAME = "second_stage_pairwise.csv"
 ELIGIBILITY_FILENAME = "second_stage_eligibility.csv"
 
-#: The figures, named as ``FIGURE_GUIDE.md`` names them. The trajectory is the shape of the two
-#: readouts against this clock; the windows page is what that shape is made of.
+#: The figure stems, named as ``FIGURE_GUIDE.md`` names them. Each is a **stem**, not a filename:
+#: every readout gets both pages to itself, written as ``<stem>_<readout slug>``, exactly as
+#: the delivery clock's are and for the reason
+#: :class:`~teb_vae.lag_attn_cfs.eval.cohort.ClockReadout`
+#: gives. The trajectory is the shape of a readout against this clock; the windows page is what
+#: that shape is made of.
 TRAJECTORY_FIGURE = "second_stage_trajectory"
 WINDOWS_FIGURE = "second_stage_windows"
+
+
+def figure_stem(base: str, readout: cohort.ClockReadout) -> str:
+    """Return the filename stem one readout's copy of a figure is written under.
+
+    Written out here as well as on the delivery clock, because an analysis may not import another
+    and the two stems differ; the *rule* is one line either way.
+
+    Args:
+        base: :data:`TRAJECTORY_FIGURE` or :data:`WINDOWS_FIGURE`.
+        readout: The readout the figure resolves.
+
+    Returns:
+        ``'<base>_<slug>'``, without a suffix -- the renderer adds it.
+    """
+    return f"{base}_{readout.slug}"
 
 #: Width of a window, in hours. The **same** grid the delivery clock uses, bound from the layer
 #: below rather than restated, so a window on one clock's figure is the same duration as a window on
@@ -82,7 +102,7 @@ DEFAULT_ALPHA = 0.05
 
 #: The two readouts, bound from the layer below rather than restated: both clocks resolve exactly
 #: these, and two copies of the tuple would be two answers to what a clock figure shows.
-READOUTS: Tuple[Tuple[str, str, str], ...] = cohort.CLOCK_READOUTS
+READOUTS: Tuple[cohort.ClockReadout, ...] = cohort.CLOCK_READOUTS
 
 #: The per-sample columns this analysis reduces, in the order the tables carry them.
 VALUE_COLUMNS: Tuple[str, ...] = cohort.CLOCK_VALUE_COLUMNS
@@ -98,8 +118,9 @@ METHOD = (
     "Per window of signed hours from second-stage onset: Kruskal-Wallis across clinical classes "
     "over one value per recording, Holm step-down correction across this clock's windows as one "
     "family, pairwise two-sided Mann-Whitney U with Cliff's delta for the windows significant "
-    "after Holm only. Every pair is oriented from the less severe class to the worse one, so a "
-    "positive Cliff's delta means the less severe class's values run higher. Non-parametric "
+    "after Holm only. Every pair is oriented from the more severe class to the less severe one, "
+    "so a positive Cliff's delta means the more severe class's values run higher. "
+    "Non-parametric "
     "throughout. Classes with fewer than "
     f"{shared_stats.MIN_GROUP_SIZE} recordings in a window are excluded from it and recorded. "
     "The Holm family is this clock's windows alone and is NOT corrected jointly with the "
@@ -207,15 +228,17 @@ def build_trajectory_rows(per_recording: Dict[str, pd.DataFrame]) -> List[Dict[s
     """
     rows: List[Dict[str, Any]] = []
     for axis, frame in per_recording.items():
-        for name, column, _ in READOUTS:
+        for readout in READOUTS:
             for row in cohort.trajectory_rows(
                 frame,
-                column,
-                metric=name,
+                readout.column,
+                metric=readout.name,
                 bin_column=cohort.SECOND_STAGE_BIN_COLUMN,
                 center_column=cohort.SECOND_STAGE_BIN_CENTER_COLUMN,
             ):
-                rows.append({"group_column": axis, "source_column": column, **row})
+                rows.append(
+                    {"group_column": axis, "source_column": readout.column, **row}
+                )
     return rows
 
 
@@ -230,7 +253,7 @@ def _class_values(frame: pd.DataFrame, column: str) -> Dict[str, np.ndarray]:
         column: The value column.
 
     Returns:
-        Every class present, in the canonical healthy / acidosis / HIE order, mapped to its finite
+        Every class present, in the canonical HIE / acidosis / healthy order, mapped to its finite
         values. **Nothing is filtered here**: a class too small to test is still a class a figure
         must show, because a cohort thinning out toward the edge of the axis is the explanation for
         the window beside it -- and on this clock the positive side is short by construction, so
@@ -383,8 +406,9 @@ def analyse_windows(
     # The cohort half of the job is this analysis's own: which classes are in a window, in which
     # order, and which were too small to enter the test. That order is load-bearing rather than
     # cosmetic: the pairwise sweep names each pair in the order it receives, so passing the
-    # classes severity-ascending is what makes every comparison read healthy against acidosis,
-    # healthy against HIE, acidosis against HIE -- less severe against worse, never the reverse.
+    # classes severity-descending is what makes every comparison read HIE against acidosis, HIE
+    # against healthy, acidosis against healthy -- more severe against less severe, never the
+    # reverse.
     # The arithmetic half -- the omnibus, Holm across the windows and the pairwise sweep on the
     # survivors -- is ``stats.windowed_group_comparisons``, shared with every other trajectory
     # analysis in the family, so that "significant" has one definition across the repository
@@ -509,9 +533,13 @@ def pairwise_frame(records: Sequence[Dict[str, Any]]) -> pd.DataFrame:
     )
 
 
-def build_trajectory_figure(rows: Sequence[Dict[str, Any]], axis: str) -> Any:
-    """Draw one panel per readout: the class trajectories against this clock, with each window's
-    $n$ annotated.
+def build_trajectory_figure(
+    rows: Sequence[Dict[str, Any]], axis: str, readout: cohort.ClockReadout
+) -> Any:
+    """Draw one readout's class trajectories against this clock, with each window's $n$ annotated.
+
+    One readout per figure rather than one panel each on a shared page, exactly as the delivery
+    clock draws them: the two are both in nats per anchor and routinely orders of magnitude apart.
 
     The count is annotated per window rather than reported once for the analysis because it is what
     a trajectory hides -- and on this clock it hides more of it than on the other: in the sampled
@@ -520,21 +548,23 @@ def build_trajectory_figure(rows: Sequence[Dict[str, Any]], axis: str) -> Any:
     reasons that have nothing to do with the coupling.
 
     Args:
-        rows: The long-form trajectory rows.
+        rows: The long-form trajectory rows, of every readout; this selects its own.
         axis: The cohort axis to draw.
+        readout: The readout this figure resolves.
 
     Returns:
         The figure; the caller renders and closes it.
     """
-    figure, axes = figures.new_figure(len(READOUTS), height_per_row=3.2)
-    selected = [row for row in rows if row["group_column"] == axis]
-    for index, (name, _, _) in enumerate(READOUTS):
-        _draw_panel(
-            axes[index, 0],
-            [row for row in selected if row["metric"] == name],
-            axis,
-            title=f"{name} against time from second-stage onset, by {axis}",
-        )
+    figure, axes = figures.new_figure(1, height_per_row=3.2)
+    _draw_panel(
+        axes[0, 0],
+        [
+            row for row in rows
+            if row["group_column"] == axis and row["metric"] == readout.name
+        ],
+        axis,
+        title=f"{readout.name} against time from second-stage onset, by {axis}",
+    )
     return figure
 
 
@@ -603,17 +633,22 @@ def _draw_panel(ax: Any, rows: Sequence[Dict[str, Any]], axis: str, *, title: st
     return len(groups)
 
 
-def build_windows_figure(class_frame: pd.DataFrame, records: Sequence[Dict[str, Any]]) -> Any:
-    """Draw what the trajectory is made of: the distributions, their significance and the effects.
+def build_windows_figure(
+    class_frame: pd.DataFrame, record: Dict[str, Any], readout: cohort.ClockReadout
+) -> Any:
+    """Draw what one readout's trajectory is made of: the distributions, the significance, the
+    effects.
 
     The trajectory figure draws one number per (window, class) cell and the tests were run on the
     values behind it; this draws both, on one axis, so a reader is not asked to hold a median in
     mind while opening a CSV. The cells come from :func:`window_samples`, which is also where the
-    tested cells come from.
+    tested cells come from. One readout per page, for the reason the trajectory figure is one per
+    page.
 
     Args:
         class_frame: The class-axis per-recording-per-window frame.
-        records: The significance records, in :data:`READOUTS` order.
+        record: That readout's significance record.
+        readout: The readout this page resolves.
 
     Returns:
         The figure; the caller renders and closes it.
@@ -623,16 +658,13 @@ def build_windows_figure(class_frame: pd.DataFrame, records: Sequence[Dict[str, 
         if len(class_frame) and "group" in class_frame.columns
         else []
     )
-    readouts = []
-    for (name, column, _), record in zip(READOUTS, records):
-        samples, _ = window_samples(class_frame, column)
-        # Aligned with the record's own window list by construction rather than by agreement, so a
-        # window the test skipped cannot shift the cells drawn under the windows after it.
-        order = [int(row["time_bin"]) for row in record.get("per_window") or []]
-        readouts.append((name, [samples.get(key, {}) for key in order], record))
+    samples, _ = window_samples(class_frame, readout.column)
+    # Aligned with the record's own window list by construction rather than by agreement, so a
+    # window the test skipped cannot shift the cells drawn under the windows after it.
+    order = [int(row["time_bin"]) for row in record.get("per_window") or []]
 
     return figures.windowed_comparison_figure(
-        readouts,
+        [(readout.name, [samples.get(key, {}) for key in order], record)],
         groups=cohort.ordered_groups(present, labels.CLASS_COLUMN),
         bin_width=TRAJECTORY_BIN_HOURS,
         # The same floor the test excludes a cell at, passed rather than defaulted, so the page and
@@ -692,6 +724,12 @@ def run_second_stage_analysis(
         onset at all, a cohort whose readouts are all non-finite, or a single-class split.
     """
     per_sample = context.collection.per_sample
+    # The run's horizon, applied before anything is binned: it bounds the
+    # population on the segment's own start, so every clock in the run answers
+    # for the same segments. ``None`` leaves the frame untouched.
+    per_sample = cohort.within_horizon(
+        per_sample, eval_config.get("max_hours_before_delivery")
+    )
     if per_sample.empty:
         return _skip("the collected per-sample table was empty", 0)
     if cohort.SECOND_STAGE_COLUMN not in per_sample.columns:
@@ -754,20 +792,32 @@ def run_second_stage_analysis(
     )
     tall.to_csv(directory / PER_RECORDING_FILENAME, index=False)
 
-    significance = [analyse_windows(class_frame, column) for _, column, _ in READOUTS]
+    significance = [analyse_windows(class_frame, readout.column) for readout in READOUTS]
     significance_frame(significance).to_csv(directory / SIGNIFICANCE_FILENAME, index=False)
     pairwise_frame(significance).to_csv(directory / PAIRWISE_FILENAME, index=False)
 
-    figure_name = str(
-        figures.render_figure(
-            build_trajectory_figure(rows, labels.CLASS_COLUMN), directory / TRAJECTORY_FIGURE
-        ).name
-    )
-    windows_name = str(
-        figures.render_figure(
-            build_windows_figure(class_frame, significance), directory / WINDOWS_FIGURE
-        ).name
-    )
+    # Four figures rather than two: each readout gets its trajectory and its windows page to
+    # itself, so neither is drawn on the other's scale.
+    figure_names = [
+        str(
+            figures.render_figure(
+                builder(readout, record), directory / figure_stem(stem, readout)
+            ).name
+        )
+        for readout, record in zip(READOUTS, significance)
+        for stem, builder in (
+            (
+                TRAJECTORY_FIGURE,
+                lambda readout, _record: build_trajectory_figure(
+                    rows, labels.CLASS_COLUMN, readout
+                ),
+            ),
+            (
+                WINDOWS_FIGURE,
+                lambda readout, record: build_windows_figure(class_frame, record, readout),
+            ),
+        )
+    ]
 
     n_windows = int(tall[cohort.SECOND_STAGE_BIN_COLUMN].nunique()) if len(tall) else 0
     binned = cohort.add_second_stage_bins(eligible)
@@ -797,8 +847,12 @@ def run_second_stage_analysis(
         "bin_width_hours": float(TRAJECTORY_BIN_HOURS),
         "eligibility": population,
         "readouts": [
-            {"metric": name, "source_column": column, "meaning": note}
-            for name, column, note in READOUTS
+            {
+                "metric": readout.name,
+                "source_column": readout.column,
+                "meaning": readout.meaning,
+            }
+            for readout in READOUTS
         ],
         "significance": [
             {
@@ -815,6 +869,6 @@ def run_second_stage_analysis(
         # Fanning the by-class and by-subgroup emitter over it would resolve a cut by a cut.
         "files": [
             ELIGIBILITY_FILENAME, TRAJECTORY_FILENAME, PER_RECORDING_FILENAME,
-            SIGNIFICANCE_FILENAME, PAIRWISE_FILENAME, figure_name, windows_name,
+            SIGNIFICANCE_FILENAME, PAIRWISE_FILENAME, *figure_names,
         ],
     }

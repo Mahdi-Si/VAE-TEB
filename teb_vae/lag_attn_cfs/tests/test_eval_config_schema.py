@@ -285,3 +285,44 @@ def test_the_supported_set_is_the_installed_matplotlib_s_own() -> None:
         assert validate_eval_config(
             {"eval_config": {"figure_format": accepted}}
         )["figure_format"] == accepted
+
+
+# =================================================================================================
+# max_hours_before_delivery
+# =================================================================================================
+def test_the_horizon_defaults_to_none_so_a_run_evaluates_every_segment() -> None:
+    """``None`` is not a missing value here but the shipped setting: no bound."""
+    assert DEFAULTS["max_hours_before_delivery"] is None
+    assert validate_eval_config({"eval_config": {}})["max_hours_before_delivery"] is None
+
+
+def test_a_horizon_survives_as_a_float() -> None:
+    """An operator writing ``4`` means four hours, and an int must not stay an int downstream."""
+    resolved = validate_eval_config({"eval_config": {"max_hours_before_delivery": 4}})
+
+    assert resolved["max_hours_before_delivery"] == pytest.approx(4.0)
+    assert isinstance(resolved["max_hours_before_delivery"], float)
+
+
+@pytest.mark.parametrize("value", [0.25, 0.0, -1.0], ids=["under-a-bin", "zero", "negative"])
+def test_a_horizon_with_no_whole_window_in_it_is_refused(value: float) -> None:
+    """Below one trajectory bin the bound empties every clock rather than narrowing it, which
+    reads as "the analysis found nothing" instead of "you asked for less than one window"."""
+    with pytest.raises(ValueError, match=r"max_hours_before_delivery"):
+        validate_eval_config({"eval_config": {"max_hours_before_delivery": value}})
+
+
+def test_a_non_finite_or_boolean_horizon_is_refused() -> None:
+    """``True`` is an ``int`` in Python and would otherwise validate as a one-hour bound."""
+    for value in (float("nan"), float("inf"), True, "four"):
+        with pytest.raises(ValueError, match=r"max_hours_before_delivery"):
+            validate_eval_config({"eval_config": {"max_hours_before_delivery": value}})
+
+
+def test_the_horizon_floor_is_one_trajectory_bin() -> None:
+    """The floor restates ``cohort``'s bin width rather than importing it -- this module stays a
+    stdlib parse -- so the two are pinned together here instead."""
+    from teb_vae.lag_attn_cfs.eval.cohort import TRAJECTORY_BIN_HOURS
+    from teb_vae.lag_attn_cfs.eval.config_schema import _MIN_HORIZON_HOURS
+
+    assert _MIN_HORIZON_HOURS == TRAJECTORY_BIN_HOURS

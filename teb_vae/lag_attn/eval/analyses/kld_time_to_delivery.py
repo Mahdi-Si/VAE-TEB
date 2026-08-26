@@ -110,7 +110,10 @@ def _per_batch_kld(runner: EvalRunner, batch: Any) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 # Binning and trajectory (pure)
 # ---------------------------------------------------------------------------
-def bin_samples(frame: pd.DataFrame, *, width: float = BIN_WIDTH_HOURS) -> pd.DataFrame:
+def bin_samples(
+    frame: pd.DataFrame, *, width: float = BIN_WIDTH_HOURS,
+    max_hours: Optional[float] = None,
+) -> pd.DataFrame:
     r"""Add the time-before-delivery bin columns, dropping rows with no usable coordinate.
 
     ``epoch`` is seconds relative to delivery and negative before it, so
@@ -122,11 +125,22 @@ def bin_samples(frame: pd.DataFrame, *, width: float = BIN_WIDTH_HOURS) -> pd.Da
     Args:
         frame: The collected per-sample frame, carrying :data:`KLD_COLUMN` and ``epoch``.
         width: Bin width in hours.
+        max_hours: The run's horizon -- how far before delivery a segment may be recorded and
+            still be evaluated. ``None`` evaluates every segment. Applied *before* the finite
+            check so a segment beyond the horizon is out of scope rather than counted in
+            ``n_dropped_nonfinite``, which means something else entirely.
 
     Returns:
         A copy holding only the usable rows, with ``time_to_delivery_h``, ``bin`` and
         ``bin_center_h`` added. Empty when nothing is usable.
     """
+    if max_hours is not None and not frame.empty and "epoch" in frame.columns:
+        # ``~(hours > horizon)`` rather than ``hours <= horizon``: every comparison against NaN
+        # is False, so the negation keeps the non-finite rows for the check below to drop and
+        # count as what they are.
+        beyond = -frame["epoch"].to_numpy(dtype=np.float64) / _SECONDS_PER_HOUR
+        frame = frame[~(beyond > float(max_hours))]
+
     usable = frame[
         np.isfinite(frame[KLD_COLUMN].to_numpy(dtype=np.float64))
         & np.isfinite(frame["epoch"].to_numpy(dtype=np.float64))
@@ -279,12 +293,18 @@ def _class_samples(frame: pd.DataFrame):
 
     Returns:
         ``(usable, excluded)`` -- classes with at least :data:`stats.MIN_GROUP_SIZE` finite values,
-        and the sizes of those without. The exclusion is returned rather than dropped because "this
-        class had two segments in this window" is the explanation for a window the test skipped.
+        and the sizes of those without, both in the canonical **worst-first** order. That order is
+        the orientation as well as the presentation: the pairwise sweep names each pair in the
+        order it receives the classes, so this is what makes every comparison read HIE vs acidosis,
+        HIE vs healthy, acidosis vs healthy. The exclusion is returned rather than dropped because
+        "this class had two segments in this window" is the explanation for a window the test
+        skipped.
     """
     usable: Dict[str, np.ndarray] = {}
     excluded: Dict[str, int] = {}
-    for group in labels.distinct_groups(list(frame[labels.CLASS_COLUMN])):
+    for group in _ordered_groups(
+        labels.distinct_groups(list(frame[labels.CLASS_COLUMN])), labels.CLASS_COLUMN
+    ):
         values = np.asarray(
             frame.loc[frame[labels.CLASS_COLUMN].astype(str) == group, KLD_COLUMN],
             dtype=np.float64,
@@ -321,24 +341,21 @@ def _pooled_class_test(frame: pd.DataFrame) -> Dict[str, Any]:
 # Figures
 # ---------------------------------------------------------------------------
 def _ordered_groups(groups: List[str], axis: str) -> List[str]:
-    """Return the groups in a stable, human-meaningful order.
+    """Return the groups in the evaluation's one cohort order: worst first.
+
+    Bound to :func:`~teb_vae.lag_attn.eval.labels.ordered_groups` rather than reimplemented -- the
+    order decides which cohort is the ``left`` of every pairwise comparison as well as which
+    violin is drawn first, and two copies of it would be two answers to the same question.
 
     Args:
         groups: The group labels present.
         axis: The grouping column, choosing the canonical order.
 
     Returns:
-        Classes in ``healthy`` / ``acidosis`` / ``hie`` order, subgroups in canonical order, with
-        anything unrecognised appended alphabetically so nothing is silently dropped.
+        Classes in ``hie`` / ``acidosis`` / ``healthy`` order, subgroups in reversed canonical
+        order, with anything unrecognised appended alphabetically so nothing is silently dropped.
     """
-    present = set(groups)
-    if axis == labels.CLASS_COLUMN:
-        preferred = [labels.CLASS_NAMES[code] for code in sorted(labels.CLASS_NAMES)]
-    else:
-        preferred = list(labels.CANONICAL_SUBGROUPS)
-    ordered = [name for name in preferred if name in present]
-    ordered += sorted(present - set(ordered))
-    return ordered
+    return labels.ordered_groups(groups, axis)
 
 
 def _draw_trajectory_panel(ax: Any, trajectory: pd.DataFrame, axis: str, title: str) -> int:
@@ -523,6 +540,7 @@ def emit_analysis(
     plan: Optional[Dict[str, Any]] = None,
     alpha: float = DEFAULT_ALPHA,
     width: float = BIN_WIDTH_HOURS,
+    max_hours: Optional[float] = None,
 ) -> Dict[str, Any]:
     r"""Bin, summarise, test and emit -- everything after the forward pass, and model-free.
 
@@ -538,6 +556,8 @@ def emit_analysis(
         plan: The collection plan record, for the coverage record.
         alpha: Family-wise error rate.
         width: Bin width in hours.
+        max_hours: The run's ``max_hours_before_delivery`` horizon, passed through to
+            :func:`bin_samples`. ``None`` evaluates every segment.
 
     Returns:
         The JSON-safe summary for ``summary.json``. A ``skipped`` record -- leaving no directory --
@@ -550,7 +570,7 @@ def emit_analysis(
     if "epoch" not in frame.columns:
         return _skip("the batch carried no 'epoch' field, so time to delivery is unavailable", n_total)
 
-    binned = bin_samples(frame, width=width)
+    binned = bin_samples(frame, width=width, max_hours=max_hours)
     n_dropped = n_total - int(len(binned))
     if binned.empty:
         return _skip("no sample had a finite KL and a finite epoch", n_total)
@@ -770,4 +790,5 @@ def run_kld_time_to_delivery_analysis(
     return emit_analysis(
         collected.frame, output_dir,
         composition=collected.composition, plan=collected.plan,
+        max_hours=eval_config.get("max_hours_before_delivery"),
     )

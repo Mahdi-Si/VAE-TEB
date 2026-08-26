@@ -15,6 +15,7 @@ import numpy as np
 import pytest
 import torch
 
+from teb_vae.lag_attn_rws.eval.figures_seam import figure_filename
 from teb_vae.lag_attn_rws.eval import metrics, spectra
 from teb_vae.lag_attn_rws.nets.geometry import TrimmedRawGeometry
 from teb_vae.lag_attn_rws.nets.raw_masks import forecast_mask
@@ -999,8 +1000,8 @@ def test_the_real_run_renders_every_figure(analysed) -> None:
     from teb_vae.lag_attn_rws.eval.analyses import coherence as analysis
 
     for name in (
-        analysis.LEAD_TIME_FIGURE, analysis.SPECTRUM_FIGURE, analysis.BANDS_FIGURE,
-        analysis.DECOMPOSITION_FIGURE, analysis.SOURCE_FIGURE, analysis.SEAM_FIGURE,
+        figure_filename(analysis.LEAD_TIME_FIGURE), figure_filename(analysis.SPECTRUM_FIGURE), figure_filename(analysis.BANDS_FIGURE),
+        figure_filename(analysis.DECOMPOSITION_FIGURE), figure_filename(analysis.SOURCE_FIGURE), figure_filename(analysis.SEAM_FIGURE),
     ):
         path = analysed["directory"] / name
         assert path.is_file() and path.stat().st_size > 1000, f"{name} did not render"
@@ -1179,7 +1180,7 @@ def test_the_analysis_records_a_skip_when_the_tables_carry_no_spectra(tmp_path) 
     directory = tmp_path / analysis.ANALYSIS_DIRNAME
     rendered = sorted(path.name for path in directory.glob("*.pdf"))
     assert len(rendered) == 6
-    assert analysis.LEAD_TIME_FIGURE in rendered
+    assert figure_filename(analysis.LEAD_TIME_FIGURE) in rendered
 
     # And **no** CSVs. A placeholder would be a bare newline, which `pd.read_csv` refuses -- so it
     # would take down `cross_subgroup`, which reads this analysis's per-recording table off disk

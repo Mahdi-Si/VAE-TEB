@@ -563,7 +563,7 @@ def conditioned_rows(
         rows.append(_conditioned_row(name, column, cut, resamples=resamples, seed=seed))
         # Named ``class_name`` rather than ``cohort``, which is the module holding the canonical
         # order two lines below. The per-class rows follow that order rather than the alphabetical
-        # one ``groupby`` produces, so the CSV reads healthy, acidosis, HIE like every figure.
+        # one ``groupby`` produces, so the CSV reads HIE, acidosis, healthy like every figure.
         by_class = {
             str(class_name): cell
             for class_name, cell in cut.groupby(labels.CLASS_COLUMN, dropna=True)
@@ -682,7 +682,7 @@ def build_triggered_figure(record: Dict[str, Any]) -> Any:
 def build_conditioned_figure(per_recording: pd.DataFrame) -> Any:
     """Draw the event-versus-control comparison per readout, split by clinical class.
 
-    The classes run healthy, acidosis, HIE and are coloured green, amber, red -- the same order
+    The classes run HIE, acidosis, healthy and are coloured red, amber, green -- the same order
     and palette every other cohort figure in this evaluation uses, so two of them can be read
     side by side. ``groupby`` alone would order them alphabetically, putting acidosis first.
     """

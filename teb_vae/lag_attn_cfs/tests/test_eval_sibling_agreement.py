@@ -150,10 +150,10 @@ def test_the_cohort_order_is_one_ordering_in_both_packages() -> None:
 
     assert cohort.ordered_groups(classes, "clinical_class") == sibling_cohort.ordered_groups(
         classes, "clinical_class"
-    ) == ["healthy", "acidosis", "hie", "not_a_class"]
+    ) == ["hie", "acidosis", "healthy", "not_a_class"]
     assert cohort.ordered_groups(subgroups, "subgroup") == sibling_cohort.ordered_groups(
         subgroups, "subgroup"
-    )
+    ) == ["hie_cs", "acidosis_no_cs", "healthy_bg_cs", "not_a_subgroup"]
     # An empty cohort is the other end of the same function and must not raise in either.
     assert cohort.ordered_groups([], "clinical_class") == sibling_cohort.ordered_groups(
         [], "clinical_class"

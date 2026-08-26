@@ -37,6 +37,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
+from teb_vae.lag_attn_cfs.eval.figures_seam import figure_filename
 from teb_vae.lag_attn_cfs.eval import lag_axis, preflight, report_seam
 from teb_vae.lag_attn_cfs.eval.analyses import AnalysisContext
 from teb_vae.lag_attn_cfs.eval.analyses import lag_kl
@@ -517,7 +518,7 @@ def test_the_analysis_writes_every_table_and_carries_the_caveat(tmp_path) -> Non
     for name in (
         lag_kl.PROFILE_FILENAME, lag_kl.SUMMARY_FILENAME, lag_kl.PER_RECORDING_FILENAME,
         lag_kl.STRATIFIED_PROFILE_FILENAME, lag_kl.STRATIFIED_PEAKS_FILENAME,
-        lag_kl.PROFILE_FIGURE,
+        figure_filename(lag_kl.PROFILE_FIGURE),
     ):
         assert (directory / name).is_file(), name
     assert result["axis_caveat"] == lag_axis.GROUP_DELAY_CAVEAT
@@ -765,7 +766,7 @@ def test_the_real_run_writes_the_three_profiles_and_the_caveat(collected_run) ->
     block = collected_run["summary"]["results"]["lag_kl"]
     profile = pd.read_csv(directory / lag_kl.PROFILE_FILENAME)
 
-    assert (directory / lag_kl.PROFILE_FIGURE).is_file()
+    assert (directory / figure_filename(lag_kl.PROFILE_FIGURE)).is_file()
     assert len(profile) == block["composition"]["n_lags"]
     assert profile["compensated_seconds"].tolist() == [
         float(lag_compensated_seconds(lag, delay_steps=block["delay_steps"]))

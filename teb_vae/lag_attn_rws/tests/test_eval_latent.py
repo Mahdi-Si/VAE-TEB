@@ -33,6 +33,7 @@ import pandas as pd
 import pytest
 import torch
 
+from teb_vae.lag_attn_rws.eval.figures_seam import figure_filename
 from teb_vae.lag_attn_rws.eval import metrics as metrics_module
 from teb_vae.lag_attn_rws.eval.analyses import latent as latent_analysis
 from teb_vae.lag_attn_rws.eval.metrics import (
@@ -348,7 +349,7 @@ def test_the_analysis_writes_the_spectrum_the_diagnostics_and_the_figure(tmp_pat
         latent_analysis.SPECTRUM_FILENAME,
         latent_analysis.DIAGNOSTICS_FILENAME,
         latent_analysis.PER_RECORDING_FILENAME,
-        latent_analysis.SPECTRUM_FIGURE,
+        figure_filename(latent_analysis.SPECTRUM_FIGURE),
     ):
         assert (directory / name).is_file(), name
     reported = {row["metric"] for row in result["diagnostics"]}

@@ -20,6 +20,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
+from teb_vae.lag_attn_rws.eval.figures_seam import figure_filename
 from teb_vae.lag_attn_rws.eval import oracle
 from teb_vae.lag_attn_rws.eval.analyses import AnalysisContext
 from teb_vae.lag_attn_rws.eval.analyses import sufficiency
@@ -161,7 +162,7 @@ def test_every_declared_file_was_written(result, directory) -> None:
     missing = [name for name in result["files"] if not (directory / name).is_file()]
 
     assert missing == []
-    assert sufficiency.SUFFICIENCY_FIGURE in result["files"]
+    assert figure_filename(sufficiency.SUFFICIENCY_FIGURE) in result["files"]
 
 
 def test_the_grouped_variants_were_fanned_out_by_the_runner(result) -> None:

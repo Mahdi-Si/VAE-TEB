@@ -40,8 +40,10 @@
       "kl_spectrum.pdf"
     ],
     "second_stage": [
-      "second_stage_trajectory.pdf",
-      "second_stage_windows.pdf"
+      "second_stage_trajectory_kl.pdf",
+      "second_stage_trajectory_pred_gap.pdf",
+      "second_stage_windows_kl.pdf",
+      "second_stage_windows_pred_gap.pdf"
     ],
     "source_null": [
       "source_null_difference.pdf"
@@ -53,11 +55,14 @@
       "sufficiency.pdf"
     ],
     "time_to_delivery": [
-      "time_to_delivery_trajectory.pdf",
-      "time_to_delivery_windows.pdf"
+      "time_to_delivery_trajectory_kl.pdf",
+      "time_to_delivery_trajectory_pred_gap.pdf",
+      "time_to_delivery_windows_kl.pdf",
+      "time_to_delivery_windows_pred_gap.pdf"
     ],
     "trajectory": [
-      "trajectory_profile.pdf"
+      "trajectory_profile_kl.pdf",
+      "trajectory_profile_pred_gap.pdf"
     ],
     "warmup": [
       "causal_warmup_budget.pdf",

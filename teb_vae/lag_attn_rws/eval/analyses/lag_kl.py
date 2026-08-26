@@ -435,7 +435,7 @@ def _group_profiles(
             the absence.
         axis: The stratification axis, choosing the returned order. Both call sites lay the result
             straight into the emitted rows, so this is what puts the stratified table in the same
-            healthy-first cohort order every figure in this evaluation is drawn in; ``groupby``
+            worst-first cohort order every figure in this evaluation is drawn in; ``groupby``
             alone would order it alphabetically. On the time axis, which the canonical order does
             not know, the alphabetical order stands and ``bin_center_h`` carries the number a
             reader sorts on.
@@ -789,6 +789,12 @@ def run_lag_kl_analysis(
     """
     collection = context.collection
     per_sample = collection.per_sample
+    # The run's horizon, applied before anything is binned: it bounds the
+    # population on the segment's own start, so every clock in the run answers
+    # for the same segments. ``None`` leaves the frame untouched.
+    per_sample = cohort.within_horizon(
+        per_sample, eval_config.get("max_hours_before_delivery")
+    )
     results = dict(getattr(collection, "results", None) or {})
     lag = dict(results.get("lag") or {})
     directory = Path(output_dir) / ANALYSIS_DIRNAME

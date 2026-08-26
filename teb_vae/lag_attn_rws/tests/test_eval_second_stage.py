@@ -37,6 +37,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
+from teb_vae.lag_attn_rws.eval.figures_seam import figure_filename
 from teb_vae.lag_attn_rws.eval import cohort
 from teb_vae.lag_attn_rws.eval._reuse import labels
 from teb_vae.lag_attn_rws.eval.analyses import second_stage as analysis
@@ -567,7 +568,13 @@ def test_the_analysis_writes_its_five_tables_and_both_figures(tmp_path) -> None:
     for name in (
         analysis.ELIGIBILITY_FILENAME, analysis.TRAJECTORY_FILENAME,
         analysis.PER_RECORDING_FILENAME, analysis.SIGNIFICANCE_FILENAME,
-        analysis.PAIRWISE_FILENAME, analysis.TRAJECTORY_FIGURE, analysis.WINDOWS_FIGURE,
+        analysis.PAIRWISE_FILENAME,
+        # Four figures, not two: each readout gets its trajectory and its windows page to itself.
+        *(
+            figure_filename(analysis.figure_stem(stem, readout))
+            for readout in analysis.READOUTS
+            for stem in (analysis.TRAJECTORY_FIGURE, analysis.WINDOWS_FIGURE)
+        ),
     ):
         assert (directory / name).is_file(), name
         assert name in result["files"], name
@@ -644,10 +651,17 @@ def test_a_single_class_split_is_a_recorded_skip_naming_the_classes(tmp_path) ->
 # The two figures, and the orientation that is the whole difference
 # =============================================================================
 def _windows_figure(rows: List[Dict[str, Any]]):
-    """Build the windows page from a hand-made per-sample table, with its significance records."""
+    """Build the first readout's windows page from a hand-made per-sample table, with the
+    significance records of **both** readouts.
+
+    One readout per page is the emitted layout, so the page under test is the one an operator
+    opens; the second record travels beside it because several tests below assert on the record
+    rather than on the drawing.
+    """
     class_frame = _class_frame(rows)
     records = [analysis.analyse_windows(class_frame, column) for column in analysis.VALUE_COLUMNS]
-    return analysis.build_windows_figure(class_frame, records), records
+    figure = analysis.build_windows_figure(class_frame, records[0], analysis.READOUTS[0])
+    return figure, records
 
 
 def _zero_lines(ax) -> int:
@@ -667,20 +681,19 @@ def test_the_windows_page_is_not_inverted_and_marks_the_onset() -> None:
 
     figure, _ = _windows_figure(_clock_rows(window_offsets=((-1.0, 50.0), (1.0, 50.0))))
     try:
-        # Two readouts, each a violin row and a strip row, then the effect-size heatmap -- plus the
-        # colourbar axes the heatmap attaches.
-        assert len(figure.axes) == 6
-        for index in range(4):
+        # One readout: a violin row, its strip, then the effect-size heatmap -- plus the colourbar
+        # axes the heatmap attaches.
+        assert len(figure.axes) == 4
+        # The two panels that carry the clock itself; the heatmap below them is drawn on the same
+        # coordinate but marks nothing, and the colourbar carries no clock at all.
+        for index in range(2):
             low, high = figure.axes[index].get_xlim()
             assert low < high, f"panel {index} is inverted"
             assert _zero_lines(figure.axes[index]) == 1, f"panel {index} does not mark the onset"
-        for index in (0, 2):
-            assert figure.axes[index].get_xlim() == pytest.approx(
-                figure.axes[index + 1].get_xlim()
-            )
-        assert all(
-            "negative" in figure.axes[index].get_xlabel() for index in (1, 3)
-        ), "the strips do not name the sign convention"
+        assert figure.axes[0].get_xlim() == pytest.approx(figure.axes[1].get_xlim())
+        assert (
+            "negative" in figure.axes[1].get_xlabel()
+        ), "the strip does not name the sign convention"
     finally:
         shared_figures.plt.close(figure)
 
@@ -720,7 +733,7 @@ def test_the_trajectory_figure_names_the_sign_convention_and_marks_the_onset() -
     _, eligible = analysis.eligible_rows(_per_sample(_clock_rows()))
     rows = analysis.build_trajectory_rows(analysis.build_per_recording(eligible))
 
-    figure = analysis.build_trajectory_figure(rows, labels.CLASS_COLUMN)
+    figure = analysis.build_trajectory_figure(rows, labels.CLASS_COLUMN, analysis.READOUTS[0])
     try:
         for ax in figure.axes:
             low, high = ax.get_xlim()
@@ -742,9 +755,11 @@ def test_an_empty_population_draws_the_note_rather_than_raising(builder) -> None
     from teb_vae.lag_attn.eval import figures as shared_figures
 
     if builder == "trajectory":
-        figure = analysis.build_trajectory_figure([], labels.CLASS_COLUMN)
+        figure = analysis.build_trajectory_figure([], labels.CLASS_COLUMN, analysis.READOUTS[0])
     else:
-        figure = analysis.build_windows_figure(pd.DataFrame(), [])
+        figure = analysis.build_windows_figure(
+            pd.DataFrame(), {"per_window": []}, analysis.READOUTS[0]
+        )
     try:
         notes = [text.get_text() for axis in figure.axes for text in axis.texts]
         assert notes.count(shared_figures.EMPTY_NOTE) >= 1

@@ -207,3 +207,21 @@ eval_config:
   # `png` when something needs a bitmap. Note DPI only affects rasterised content, so the
   # heatmap-bearing pages stay raster inside an `svg` and those files get large.
   figure_format: null
+
+  # How far before delivery a segment may be recorded and still be evaluated, in hours. `4.0`
+  # keeps only the last four hours of each recording; `null` -- the shipped setting -- evaluates
+  # everything the split carries. Must be at least one 0.5 h trajectory bin.
+  #
+  # THE BOUND IS ON THE POPULATION, NOT ON AN AXIS. It is applied to the delivery clock
+  # (h = -epoch/3600) before anything is binned, and every clock then works from the same
+  # segments -- so the second-stage clock re-bins that population on its own signed axis rather
+  # than being cut at a second, differently-defined four hours. One setting, one meaning.
+  #
+  # It changes the population every downstream number is computed over: cohort sizes, window
+  # counts, and every trajectory and test move with it. A bounded run is NOT comparable with an
+  # unbounded one. This is a config key precisely so the resolved config dumped into the run
+  # directory is a durable record of which it was.
+  #
+  # Applies to the clocks: trajectory, time_to_delivery, second_stage, lag_kl and lag_clocks.
+  # Analyses with no time-before-delivery axis -- forecast, calibration, latent -- are unaffected.
+  max_hours_before_delivery: null

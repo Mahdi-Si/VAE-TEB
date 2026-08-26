@@ -41,7 +41,7 @@ travels in the record rather than in a document beside it.
 from __future__ import annotations
 
 import os
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, NamedTuple, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -72,8 +72,35 @@ SECOND_STAGE_HOURS_COLUMN = "hours_from_second_stage"
 SECOND_STAGE_BIN_COLUMN = "second_stage_bin"
 SECOND_STAGE_BIN_CENTER_COLUMN = "second_stage_bin_center_h"
 
-#: The two coupling readouts a clinical clock resolves, as
-#: ``(reported name, per-sample column, what it is)``. **Both** travel rather than the KL alone,
+
+class ClockReadout(NamedTuple):
+    """One quantity a clinical clock resolves against its landmark, and how it is named on disk.
+
+    A record rather than a bare tuple because the fourth field is a *filename*, and a positional
+    fourth string in a table of prose is the kind of thing that is read as more prose.
+
+    Attributes:
+        name: The reported name, carried into every row and every panel title.
+        column: The per-sample column it is reduced from.
+        meaning: What the number is, written into the emitted record so a reader does not need
+            this module to interpret it.
+        slug: The filename suffix of the figures this readout gets **to itself**. Its own files
+            rather than its own panel on a shared one: the two readouts are in nats per anchor but
+            not on the same scale -- the KL is multiplied by an arbitrary factor whenever the prior
+            variance sits on its clamp -- so a page carrying both invites reading a ``pred_gap``
+            trajectory against a y range the KL set, where a real movement of a tenth of a nat is a
+            flat line. Separate files also make each one quotable on its own, which is what a
+            reader lifting a figure out of a run directory actually does.
+    """
+
+    name: str
+    column: str
+    meaning: str
+    slug: str
+
+
+#: The two coupling readouts a clinical clock resolves, one :class:`ClockReadout` each.
+#: **Both** travel rather than the KL alone,
 #: because the two fail differently: ``pred_gap`` is in the decoder's own units and is immune to
 #: the prior-variance inflation, while ``source_conditioned_kl_raw`` is multiplied by an arbitrary
 #: factor whenever the prior variance sits on its clamp. A trajectory visible in one and absent
@@ -84,23 +111,29 @@ SECOND_STAGE_BIN_CENTER_COLUMN = "second_stage_bin_center_h"
 #: same reason :data:`TRAJECTORY_BIN_HOURS` does: **both** clocks resolve exactly these two
 #: quantities, an analysis may never import another, and a second copy of this tuple would be a
 #: second answer to "what is drawn against a clinical clock" with nothing keeping the two equal.
-CLOCK_READOUTS: Tuple[Tuple[str, str, str], ...] = (
-    (
-        "pred_gap_mc_nats",
-        "mc_pred_gap",
-        "Monte Carlo marginalised D_base - D_full in nats per anchor; in the decoder's own units "
-        "and immune to the prior-variance inflation",
+CLOCK_READOUTS: Tuple[ClockReadout, ...] = (
+    ClockReadout(
+        name="pred_gap_mc_nats",
+        column="mc_pred_gap",
+        meaning=(
+            "Monte Carlo marginalised D_base - D_full in nats per anchor; in the decoder's own "
+            "units and immune to the prior-variance inflation"
+        ),
+        slug="pred_gap",
     ),
-    (
-        "source_conditioned_kl_raw_nats",
-        "source_conditioned_kl_raw",
-        "the unfloored KL between the two latents; inflated by an arbitrary factor whenever the "
-        "prior variance sits on its clamp, which is why it is not read alone",
+    ClockReadout(
+        name="source_conditioned_kl_raw_nats",
+        column="source_conditioned_kl_raw",
+        meaning=(
+            "the unfloored KL between the two latents; inflated by an arbitrary factor whenever "
+            "the prior variance sits on its clamp, which is why it is not read alone"
+        ),
+        slug="kl",
     ),
 )
 
 #: The per-sample columns those readouts are reduced from, in the order the tables carry them.
-CLOCK_VALUE_COLUMNS: Tuple[str, ...] = tuple(column for _, column, _ in CLOCK_READOUTS)
+CLOCK_VALUE_COLUMNS: Tuple[str, ...] = tuple(readout.column for readout in CLOCK_READOUTS)
 
 #: How far a recording's implied onset may vary across its own segments before it is reported
 #: inconsistent, in seconds. Both operands are stored ``float32`` at magnitudes around
@@ -134,6 +167,45 @@ OUT_OF_DISTRIBUTION_SENTENCE = (
 # =============================================================================
 # The time axis
 # =============================================================================
+def within_horizon(frame: pd.DataFrame, max_hours: Optional[float]) -> pd.DataFrame:
+    r"""Restrict a per-sample table to the segments recorded within ``max_hours`` of delivery.
+
+    **The bound is on the population, not on an axis.** It is applied to the *delivery* clock --
+    $h = -\mathrm{epoch}/3600$ -- and the frame it returns is then binned on whichever clock the
+    caller is drawing. That is what lets one setting mean the same thing on both: the second-stage
+    clock re-bins the same segments on its own signed axis rather than being cut at a second,
+    differently-defined four hours. A run bounded at $4$ h therefore answers "what do the last
+    four hours before delivery look like", on every clock, rather than "what does the axis show
+    between two tick marks".
+
+    **It changes the population every downstream number is computed over**, which is why it is an
+    ``eval_config`` key that lands in the run's dumped config rather than a call-site default: a
+    trajectory from a bounded run is not comparable with one from an unbounded run, and the only
+    durable record of which it was is that file.
+
+    A segment with a non-finite ``epoch`` is **kept** here and dropped by the binner's own finite
+    check instead, so the horizon never removes a row for a reason the binner would have reported
+    differently -- the excluded counts stay attributable.
+
+    Args:
+        frame: A per-sample table carrying ``epoch``, in seconds relative to delivery and negative
+            before it.
+        max_hours: The horizon in hours before delivery, inclusive. ``None`` -- the shipped
+            setting -- returns the frame unchanged.
+
+    Returns:
+        The frame, or a filtered copy of it. Unchanged when ``max_hours`` is ``None``, when the
+        frame is empty, or when it carries no ``epoch`` column.
+    """
+    if max_hours is None or frame.empty or "epoch" not in frame.columns:
+        return frame
+
+    hours = -np.asarray(frame["epoch"], dtype=np.float64) / SECONDS_PER_HOUR
+    # ``~(hours > horizon)`` rather than ``hours <= horizon``: the negation keeps the non-finite
+    # rows, because every comparison against NaN is False. See the docstring.
+    return frame[~(hours > float(max_hours))]
+
+
 def add_time_bins(
     frame: pd.DataFrame, *, width: float = TRAJECTORY_BIN_HOURS
 ) -> pd.DataFrame:
@@ -331,41 +403,32 @@ def trajectory_rows(
 
 
 def ordered_groups(groups: Sequence[str], axis: str) -> List[str]:
-    """Return cohort labels in a stable, human-meaningful order.
+    """Return cohort labels in the evaluation's one cohort order: **worst first**.
 
-    **This is the evaluation's one cohort order**, and every table and figure that resolves a
-    quantity by cohort reads it: the grouped violin fan-out, the trajectories, the significance
-    tables, the stratified lag profiles and the conditioned-coupling violins alike. Alphabetical
-    is the default everywhere it is not called, and alphabetical is wrong in a specific way -- it
-    puts ``acidosis`` before ``healthy`` on every class figure, and on the subgroup axis it
-    interleaves the three classes (``acidosis_cs``, ``acidosis_no_cs``, ``healthy_bg_cs``, ...) so
-    that neither the severity ordering nor the background/caesarean structure is visible.
+    Every table and figure that resolves a quantity by cohort reads this: the grouped violin
+    fan-out, the trajectories, the significance tables, the stratified lag profiles and the
+    conditioned-coupling violins alike. It is also what orients every comparison -- the pairwise
+    sweep names each pair in the order it receives the cohorts, so this is what makes a test read
+    HIE vs acidosis, HIE vs healthy, acidosis vs healthy, more severe against less severe.
 
-    The order is severity-ascending on both axes, which is also the order the two source tables
-    already carry: :data:`~teb_vae.lag_attn.eval.labels.CLASS_NAMES` is keyed by the dataset's own
-    class codes $1, 2, 3$, and :data:`~teb_vae.lag_attn.eval.labels.CANONICAL_SUBGROUPS` is
-    written in the intended order. Neither is restated here, so a subgroup added to the dataset
-    appears in the figures without an edit to this module.
+    **Bound rather than reimplemented.** The order lives in
+    :func:`~teb_vae.lag_attn.eval.labels.ordered_groups`, which is the layer that already owns what
+    a cohort *is* -- and a fork of the order would be a fork of which recordings are compared
+    against which, in which direction, in a package whose summaries are meant to be read beside the
+    sibling's. This function exists only so that an analysis names its own package's ``cohort``
+    module rather than reaching across the seam for a presentation decision.
 
     Args:
         groups: The labels present.
         axis: The cohort axis, choosing the canonical order. An axis that is neither the class nor
             the subgroup column -- ``lag_kl``'s time-window axis is the one such caller -- matches
-            nothing and falls through to the alphabetical order, which is the previous behaviour
-            rather than a new one.
+            nothing and falls through to the alphabetical order.
 
     Returns:
-        Classes in healthy / acidosis / HIE order, subgroups in canonical order, with anything
-        unrecognised appended alphabetically so nothing is silently dropped.
+        Classes in HIE / acidosis / healthy order, subgroups in reversed canonical order, with
+        anything unrecognised appended alphabetically so nothing is silently dropped.
     """
-    present = {str(group) for group in groups}
-    preferred = (
-        [labels.CLASS_NAMES[code] for code in sorted(labels.CLASS_NAMES)]
-        if axis == labels.CLASS_COLUMN
-        else list(labels.CANONICAL_SUBGROUPS)
-    )
-    ordered = [name for name in preferred if name in present]
-    return ordered + sorted(present - set(ordered))
+    return labels.ordered_groups(groups, axis)
 
 
 # =============================================================================
@@ -639,6 +702,7 @@ def build_cohort_block(
 __all__ = [
     "BIN_CENTER_COLUMN",
     "BIN_COLUMN",
+    "ClockReadout",
     "CLOCK_READOUTS",
     "CLOCK_VALUE_COLUMNS",
     "HOURS_COLUMN",
@@ -654,6 +718,7 @@ __all__ = [
     "TRAJECTORY_BIN_HOURS",
     "add_second_stage_bins",
     "add_time_bins",
+    "within_horizon",
     "build_cohort_block",
     "cohort_counts",
     "labor_onset_readout",

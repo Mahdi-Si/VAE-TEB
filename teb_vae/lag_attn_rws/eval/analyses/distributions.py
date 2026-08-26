@@ -270,7 +270,7 @@ def cohorts_present(frame: pd.DataFrame, axis: str) -> List[str]:
         axis: The cohort column.
 
     Returns:
-        The labels present, healthy-first; empty when the frame does not carry the axis.
+        The labels present, worst-first; empty when the frame does not carry the axis.
     """
     if axis not in getattr(frame, "columns", []):
         return []

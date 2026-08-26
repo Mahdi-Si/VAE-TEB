@@ -33,6 +33,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
+from teb_vae.lag_attn_cfs.eval.figures_seam import figure_filename
 from teb_vae.lag_attn_cfs.eval._reuse import band_partition, labels
 from teb_vae.lag_attn_cfs.eval.analyses import cross_subgroup as analysis
 
@@ -211,7 +212,7 @@ def test_the_analysis_writes_its_tables_the_record_and_the_figure(tmp_path) -> N
     directory = tmp_path / analysis.ANALYSIS_DIRNAME
     for name in (
         analysis.SIGNIFICANCE_FILENAME, analysis.PAIRWISE_FILENAME, analysis.RESULT_FILENAME,
-        analysis.HEATMAP_FIGURE,
+        figure_filename(analysis.HEATMAP_FIGURE),
     ):
         assert (directory / name).is_file(), name
     significance = pd.read_csv(directory / analysis.SIGNIFICANCE_FILENAME)

@@ -182,6 +182,7 @@ raises (`True` would silently cap at 1), and a cap of `0` raises.
 | `bootstrap_resamples` | Resamples behind every bootstrap interval, drawn over recordings — never over anchors, whose forecast windows overlap 14/15. |
 | `clock_margin_min_nats` | **This cell's own, and it ships unset.** The margin $\Delta_{\mathrm{clock}}$ must clear for `coupling_exceeds_availability_clock` to PASS. Nullable exactly as `max_samples` is; at `null` the verdict is INCONCLUSIVE and the measurement is emitted anyway. See *`source_null`* below for why a guessed threshold would be worse than no threshold. |
 | `figure_format` | Image format every figure of the run is written in, as a matplotlib filetype (`pdf`, `svg`, `png`, `eps`, …); validated at config load against the installed matplotlib's own list. `null` — the shipped setting — keeps the `pdf` default, which is what `figure_manifest.json` and `FIGURE_GUIDE.md` record and what the smoke suite compares a real run against; a run that changes it writes filenames those files do not list. |
+| `max_hours_before_delivery` | How far before delivery a segment may be recorded and still be evaluated, in hours; `4.0` keeps the last four hours, `null` — the shipped setting — evaluates everything. **The bound is on the population, not on an axis**: it is applied to the delivery clock before anything is binned, so every clock answers for the same segments and the second-stage clock re-bins that population on its own signed axis rather than being cut at a second, differently-defined four hours. It moves cohort sizes, window counts and every trajectory, so a bounded run is not comparable with an unbounded one — which is why it is a key, recorded in the run's dumped config. Minimum one 0.5 h bin. |
 
 Deliberately **not** keys: the significance level and the trajectory bin width (an operator who could
 widen them could make a difference appear or disappear), any lag-band selection, and — the one this
@@ -205,18 +206,19 @@ preflight guard: $\beta$ and its ramp weight the training total and enter no eva
 Two presentation conventions every table and figure that resolves a quantity by cohort obeys.
 Neither is a setting, for the reason the significance level is not one.
 
-**The order is clinical, not alphabetical**, on both axes:
+**The order is clinical, not alphabetical, and it runs worst first**, on both axes:
 
 | Axis | Order, left to right |
 |---|---|
-| `clinical_class` | healthy, acidosis, HIE |
-| `subgroup` | `healthy_no_bg_no_cs`, `healthy_no_bg_cs`, `healthy_bg_no_cs`, `healthy_bg_cs`, `acidosis_no_cs`, `acidosis_cs`, `hie_no_cs`, `hie_cs` |
+| `clinical_class` | HIE, acidosis, healthy |
+| `subgroup` | `hie_cs`, `hie_no_cs`, `acidosis_cs`, `acidosis_no_cs`, `healthy_bg_cs`, `healthy_bg_no_cs`, `healthy_no_bg_cs`, `healthy_no_bg_no_cs` |
 
-`cohort.ordered_groups` is the one function that decides it, and both orders are read off
-`labels.CLASS_NAMES` and `labels.CANONICAL_SUBGROUPS` rather than restated — those tables are bound
-through `_reuse.py` and are deliberately **not** forked, because forking them would fork the
-definition of a cohort. A cohort the order does not know sorts **after** every one it does, and is
-never dropped.
+`labels.ordered_groups` is the one function that decides it — `cohort.ordered_groups` is a
+one-line binding of it, so this package and the sibling cannot come to disagree — and both orders
+are read off `labels.CLASS_NAMES` and `labels.CANONICAL_SUBGROUPS` in reverse rather than
+restated. Those tables are bound through `_reuse.py` and are deliberately **not** forked, because
+forking them would fork the definition of a cohort. A cohort the order does not know sorts
+**after** every one it does, and is never dropped.
 
 **The colour is the severity**: green for healthy, amber for acidosis, red for HIE, each subgroup a
 shade of its own class. The mapping is a *table* rather than an assignment pass, so a cohort keeps
@@ -227,12 +229,14 @@ cohort**, and the two are reconciled by legend rather than by hue.
 
 **The order is also the orientation of every significance test.** `stats.pairwise_comparisons`
 names each pair in the order it receives the cohorts, and every caller hands them over through
-`cohort.ordered_groups` — so a comparison always runs *less severe to worst*: healthy vs acidosis,
-healthy vs HIE, acidosis vs HIE on the class axis, and the canonical order pair by pair on the
-subgroup axis. Cliff's delta is signed against that naming, so **a positive $\delta$ means the less
-severe cohort's values run higher**, on every pair of every metric, window and clock rather than on
-the ones whose names happened to sort that way. A run directory written before this convention
-names the class pair `acidosis vs healthy` instead, with the opposite sign.
+`cohort.ordered_groups` — so a comparison always runs *more severe to less severe*: HIE vs
+acidosis, HIE vs healthy, acidosis vs healthy on the class axis, and the same order pair by pair on
+the subgroup axis. That is the direction the clinical question is asked in: the cohort a readout
+exists to detect is named first, and what it is read against second. Cliff's delta is signed
+against that naming, so **a positive $\delta$ means the more severe cohort's values run higher**, on
+every pair of every metric, window and clock rather than on the ones whose names happened to sort
+that way. A run directory written before this convention names the class pairs healthy-first
+instead, with the opposite sign.
 
 ## The analyses
 
@@ -563,7 +567,7 @@ Holm across windows as one family and pairwise tests on the survivors; the `pool
 
 `lag_clocks` resolves the **lag structure** against this same grid and the same classes, so a window here and a window there are the same duration over the same recordings: this one says how much coupling there is, that one says where in the past it came from.
 
-The analysis emits **two** figures. `time_to_delivery_trajectory.pdf` is the median line per class with its inter-quartile ribbon; `time_to_delivery_windows.pdf` is what that line is made of — a violin per (window, class) cell over one value per recording, the Holm-adjusted $p$ of each window directly beneath it on the same axis, and Cliff's delta for every class pair that survived. The tests were always run; until that page existed nothing drew them.
+The analysis emits **four** figures — two pages per readout, because `pred_gap` and the unfloored KL share a unit and not a scale, so a page carrying both draws the smaller as a flat line at the bottom of the larger's range. `time_to_delivery_trajectory_<readout>.pdf` is the median line per class with its inter-quartile ribbon; `time_to_delivery_windows_<readout>.pdf` is what that line is made of — a violin per (window, class) cell over one value per recording, the Holm-adjusted $p$ of each window directly beneath it on the same axis, and Cliff's delta for every class pair that survived. The tests were always run; until that page existed nothing drew them.
 
 ### second_stage
 
@@ -855,8 +859,8 @@ numbers, and some will look separated whether or not anything is there.
 
 Three layers, in order, and the order is the point: a Kruskal omnibus per metric, Holm **across
 metrics as one family**, and pairwise Mann–Whitney with Cliff's delta (Romano magnitudes) on the
-survivors only. Every pair is named less severe first — healthy vs acidosis, healthy vs HIE,
-acidosis vs HIE — so a positive $\delta$ means the less severe cohort's values run higher.
+survivors only. Every pair is named more severe first — HIE vs acidosis, HIE vs healthy,
+acidosis vs healthy — so a positive $\delta$ means the more severe cohort's values run higher.
 Every test consumes one value per **recording**, and a test asserts that no source
 names a `per_sample` file.
 

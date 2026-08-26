@@ -147,13 +147,18 @@ def _usable_groups(
 
     Returns:
         ``(usable, excluded)`` -- the groups large enough to test, and the sizes of those that
-        were not. The second is returned rather than discarded because "this subgroup had two
-        recordings" is the explanation for a missing comparison, and a reader who cannot see it
-        will assume the comparison was made.
+        were not, both in the canonical **worst-first** cohort order. That order is load-bearing
+        rather than presentational: :func:`~teb_vae.lag_attn.eval.stats.pairwise_comparisons` names
+        each pair in the order it receives them, so handing it severity-descending cohorts is what
+        makes every comparison read *more severe against less severe*. The exclusion is returned
+        rather than discarded because "this subgroup had two recordings" is the explanation for a
+        missing comparison, and a reader who cannot see it will assume the comparison was made.
     """
     usable: Dict[str, np.ndarray] = {}
     excluded: Dict[str, int] = {}
-    for group in labels.distinct_groups(list(frame[group_column])):
+    for group in labels.ordered_groups(
+        labels.distinct_groups(list(frame[group_column])), group_column
+    ):
         values = np.asarray(
             frame.loc[frame[group_column].astype(str) == group, column], dtype=np.float64
         )

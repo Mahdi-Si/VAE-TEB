@@ -198,12 +198,20 @@ _FIGURE_CONSTANTS = (
         ),
     ),
     ("distributions", ("CLASS_FIGURE", "SUBGROUP_FIGURE")),
-    ("trajectory", ("PROFILE_FIGURE",)),
-    ("time_to_delivery", ("TRAJECTORY_FIGURE", "WINDOWS_FIGURE")),
-    ("second_stage", ("TRAJECTORY_FIGURE", "WINDOWS_FIGURE")),
     ("events", ("DECELERATION_FIGURE", "TRIGGERED_FIGURE", "CONDITIONED_FIGURE")),
     ("sufficiency", ("SUFFICIENCY_FIGURE",)),
     ("cross_subgroup", ("HEATMAP_FIGURE",)),
+)
+
+#: The analyses whose constants are **stems of a family** rather than filenames: each writes one
+#: page per entry of its own ``READOUTS`` table, named ``<stem>_<slug>``, because ``pred_gap`` and
+#: the KL share a unit and not a scale and a page carrying both draws the smaller as a flat line.
+#: Listed apart from the table above because the expansion is the point -- a constant moved from
+#: one table to the other is a figure that changed from one file into several.
+_PER_READOUT_FIGURE_CONSTANTS = (
+    ("trajectory", ("PROFILE_FIGURE",)),
+    ("time_to_delivery", ("TRAJECTORY_FIGURE", "WINDOWS_FIGURE")),
+    ("second_stage", ("TRAJECTORY_FIGURE", "WINDOWS_FIGURE")),
 )
 
 #: The document every one of them must appear in.
@@ -228,6 +236,13 @@ def _emitted_figures() -> dict:
         module = importlib.import_module(f"teb_vae.lag_attn_rws.eval.analyses.{stem}")
         found[stem] = [
             f"{getattr(module, name)}.{DEFAULT_FIGURE_FORMAT}" for name in attributes
+        ]
+    for stem, attributes in _PER_READOUT_FIGURE_CONSTANTS:
+        module = importlib.import_module(f"teb_vae.lag_attn_rws.eval.analyses.{stem}")
+        found[stem] = [
+            f"{getattr(module, name)}_{readout.slug}.{DEFAULT_FIGURE_FORMAT}"
+            for readout in module.READOUTS
+            for name in attributes
         ]
     return found
 

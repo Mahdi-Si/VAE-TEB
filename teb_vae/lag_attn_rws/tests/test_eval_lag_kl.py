@@ -21,6 +21,7 @@ import numpy as np
 import pytest
 import torch
 
+from teb_vae.lag_attn_rws.eval.figures_seam import figure_filename
 from teb_vae.lag_attn_rws.eval import report_seam
 from teb_vae.lag_attn_rws.eval.analyses import lag_kl
 from teb_vae.lag_attn_rws.eval.metrics import identity_residual_per_sample
@@ -339,7 +340,7 @@ def test_the_analysis_writes_its_tables_and_reports_the_identity(evaluated) -> N
     directory = evaluated["results_dir"] / lag_kl.ANALYSIS_DIRNAME
     profile = pd.read_csv(directory / lag_kl.PROFILE_FILENAME)
 
-    assert (directory / lag_kl.PROFILE_FIGURE).is_file()
+    assert (directory / figure_filename(lag_kl.PROFILE_FIGURE)).is_file()
     assert len(profile) == block["composition"]["n_lags"]
     assert profile["compensated_seconds"].tolist() == [
         float(lag_compensated_seconds(lag, delay_steps=block["delay_steps"]))

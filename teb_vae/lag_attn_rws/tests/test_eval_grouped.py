@@ -328,13 +328,15 @@ def test_a_relative_declaration_resolves_against_the_results_directory(
 # =============================================================================
 #: The analyses expected to declare a per-recording frame, each with the file it declares.
 _PARTICIPATING = {
-    "forecast": "forecast_scores",
-    "coupling": "coupling_per_recording",
-    "perm_control": "perm_control_per_recording",
-    "latent": "latent_per_recording",
-    "lag_kl": "lag_kl_per_recording",
-    "attention": "attention_per_recording",
-    "residual": "residual_per_recording",
+    "forecast": ("forecast_scores",),
+    # Two stems, because a gap in nats and a KL in nats do not share a scale and so do not share
+    # a page.
+    "coupling": ("coupling_pred_gap", "coupling_kl"),
+    "perm_control": ("perm_control_per_recording",),
+    "latent": ("latent_per_recording",),
+    "lag_kl": ("lag_kl_per_recording",),
+    "attention": ("attention_per_recording",),
+    "residual": ("residual_per_recording",),
 }
 
 
@@ -343,10 +345,11 @@ def test_every_participating_analysis_emits_both_cuts_on_a_real_run(evaluated) -
     clinical classes and four subgroups, so neither axis is a degenerate one."""
     results = evaluated["summary"]["results"]
 
-    for analysis, stem in _PARTICIPATING.items():
+    for analysis, stems in _PARTICIPATING.items():
         grouped = results[analysis].get("grouped")
         assert grouped, f"{analysis} declared no grouped frame"
-        for axis in labels.GROUP_COLUMNS:
+        for stem, axis in ((stem, axis) for stem in stems for axis in labels.GROUP_COLUMNS):
+            assert stem in grouped, f"{analysis} declared no {stem!r} frame"
             record = grouped[stem][axis]
             assert record["skipped"] is False, f"{analysis}/{axis}: {record.get('reason')}"
             for kind in ("table", "figure"):
@@ -359,16 +362,24 @@ def test_every_participating_analysis_emits_both_cuts_on_a_real_run(evaluated) -
 
 def test_the_grouped_tables_are_summaries_of_per_recording_values(evaluated) -> None:
     """One row per (cohort, metric), with ``n`` counting recordings -- not the long-form frame."""
-    record = evaluated["summary"]["results"]["coupling"]["grouped"]["coupling_per_recording"]
-    table = pd.read_csv(
-        evaluated["results_dir"] / record[labels.CLASS_COLUMN]["files"]["table"]
-    )
-
     from teb_vae.lag_attn_rws.eval.analyses import coupling as coupling_analysis
 
-    groups = set(record[labels.CLASS_COLUMN]["groups"])
-    assert list(table.columns) == ["group", "metric", "n", "mean", "q25", "median", "q75"]
-    assert len(table) == len(groups) * len(coupling_analysis.GROUPED_METRICS)
-    assert int(table["n"].sum()) <= evaluated["summary"]["results"]["n_recordings"] * len(
-        coupling_analysis.GROUPED_METRICS
-    )
+    grouped = evaluated["summary"]["results"]["coupling"]["grouped"]
+    # Both fan-outs, because between them they must cover every metric the analysis resolves by
+    # cohort: a split that dropped one would leave the other's table looking perfectly correct.
+    for stem, metrics in (
+        (coupling_analysis.GROUPED_PRED_GAP_STEM, coupling_analysis.GROUPED_PRED_GAP_METRICS),
+        (coupling_analysis.GROUPED_KL_STEM, coupling_analysis.GROUPED_KL_METRICS),
+    ):
+        record = grouped[stem]
+        table = pd.read_csv(
+            evaluated["results_dir"] / record[labels.CLASS_COLUMN]["files"]["table"]
+        )
+
+        groups = set(record[labels.CLASS_COLUMN]["groups"])
+        assert list(table.columns) == ["group", "metric", "n", "mean", "q25", "median", "q75"]
+        assert len(table) == len(groups) * len(metrics)
+        assert set(table["metric"]) == set(metrics)
+        assert int(table["n"].sum()) <= evaluated["summary"]["results"]["n_recordings"] * len(
+            metrics
+        )

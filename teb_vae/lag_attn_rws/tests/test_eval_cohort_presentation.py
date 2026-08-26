@@ -3,13 +3,15 @@ r"""The two presentation conventions every cohort figure and table in this evalu
 Neither is visual polish, and both fail silently -- which is why they are pinned here rather than
 eyeballed on a rendered PDF.
 
-**The order.** Cohorts run healthy, acidosis, HIE, and the eight subgroups run in their canonical
-order. The default everywhere is alphabetical, and alphabetical is wrong in a *specific* way that
-looks fine: it puts ``acidosis`` left of ``healthy`` on every class figure, and on the subgroup
-axis it interleaves the three classes -- ``acidosis_cs``, ``acidosis_no_cs``, ``healthy_bg_cs``,
-... -- so neither the severity ordering nor the background/caesarean structure is visible. A
-reader comparing two figures drawn from different cohort subsets would be comparing different
-columns without either figure saying so.
+**The order.** Cohorts run HIE, acidosis, healthy -- worst first -- and the eight subgroups run
+in the reverse of their canonical order. That order is not only presentational: the shared pairwise
+sweep names each pair in the order it receives the cohorts, so it is also what makes every
+significance test read *more severe against less severe*. The default everywhere is alphabetical,
+and alphabetical is wrong in a *specific* way that looks fine: it puts ``acidosis`` left of ``hie``
+on every class figure, and on the subgroup axis it interleaves the three classes --
+``acidosis_cs``, ``acidosis_no_cs``, ``healthy_bg_cs``, ... -- so neither the severity ordering nor
+the background/caesarean structure is visible. A reader comparing two figures drawn from different
+cohort subsets would be comparing different columns without either figure saying so.
 
 **The palette.** Green for healthy, amber for acidosis, red for HIE, with each subgroup a shade of
 its class. Asserted twice over: by the literals, so a change is deliberate, and by the *property*
@@ -33,16 +35,16 @@ from teb_vae.lag_attn_rws.eval.report_seam import emit_grouped_variants
 
 #: The order the two axes are read in, written out rather than derived, so this file states the
 #: contract instead of restating the code that implements it.
-EXPECTED_CLASS_ORDER = ["healthy", "acidosis", "hie"]
+EXPECTED_CLASS_ORDER = ["hie", "acidosis", "healthy"]
 EXPECTED_SUBGROUP_ORDER = [
-    "healthy_no_bg_no_cs",
-    "healthy_no_bg_cs",
-    "healthy_bg_no_cs",
-    "healthy_bg_cs",
-    "acidosis_no_cs",
-    "acidosis_cs",
-    "hie_no_cs",
     "hie_cs",
+    "hie_no_cs",
+    "acidosis_cs",
+    "acidosis_no_cs",
+    "healthy_bg_cs",
+    "healthy_bg_no_cs",
+    "healthy_no_bg_cs",
+    "healthy_no_bg_no_cs",
 ]
 
 #: Two metrics, so a row count of ``n_groups x n_metrics`` cannot coincide with either factor.
@@ -74,7 +76,7 @@ def eight_subgroup_frame() -> pd.DataFrame:
 # =============================================================================
 def test_the_canonical_order_is_the_stated_one_on_both_axes() -> None:
     """Against a shuffled input, so a function returning its argument unchanged fails."""
-    shuffled_classes = ["hie", "healthy", "acidosis"]
+    shuffled_classes = ["healthy", "hie", "acidosis"]
     shuffled_subgroups = sorted(EXPECTED_SUBGROUP_ORDER)
 
     assert cohort.ordered_groups(shuffled_classes, labels.CLASS_COLUMN) == EXPECTED_CLASS_ORDER
@@ -93,7 +95,7 @@ def test_a_partial_cohort_keeps_the_order_of_the_ones_present() -> None:
     present = ["hie_cs", "healthy_bg_cs", "acidosis_no_cs"]
 
     assert cohort.ordered_groups(present, labels.SUBGROUP_COLUMN) == [
-        "healthy_bg_cs", "acidosis_no_cs", "hie_cs",
+        "hie_cs", "acidosis_no_cs", "healthy_bg_cs",
     ]
 
 
@@ -104,7 +106,7 @@ def test_an_unrecognised_cohort_is_appended_rather_than_dropped() -> None:
         ["zzz_unknown", "hie", "healthy", "aaa_unknown"], labels.CLASS_COLUMN
     )
 
-    assert ordered == ["healthy", "hie", "aaa_unknown", "zzz_unknown"]
+    assert ordered == ["hie", "healthy", "aaa_unknown", "zzz_unknown"]
 
 
 # =============================================================================
@@ -179,7 +181,7 @@ def test_the_conditioned_coupling_violins_are_ordered_and_coloured_by_class() ->
         {
             "guid": [f"g{index}" for index in range(9)],
             "metric": ["pred_gap_mc_nats"] * 9,
-            labels.CLASS_COLUMN: ["hie"] * 3 + ["healthy"] * 3 + ["acidosis"] * 3,
+            labels.CLASS_COLUMN: ["healthy"] * 3 + ["hie"] * 3 + ["acidosis"] * 3,
             "difference": np.linspace(-1.0, 1.0, 9),
         }
     )
@@ -195,34 +197,34 @@ def test_the_conditioned_coupling_violins_are_ordered_and_coloured_by_class() ->
 
 def test_the_effect_heatmap_columns_run_in_the_canonical_cohort_order() -> None:
     """``cross_subgroup``'s x axis is cohort *pairs*, and the shared pairwise test names each pair
-    in the order it receives the cohorts -- the canonical one, so a pair reads less severe against
-    worse. What this analysis chooses is the column order, keyed on where the two cohorts fall on
-    that same axis; a shuffled input must still come back healthy-first."""
+    in the order it receives the cohorts -- the canonical one, so a pair reads more severe against
+    less severe. What this analysis chooses is the column order, keyed on where the two cohorts
+    fall on that same axis; a shuffled input must still come back worst-first."""
     from teb_vae.lag_attn_rws.eval.analyses import cross_subgroup
 
     pairs = pd.DataFrame(
         {
-            "left": ["acidosis", "healthy", "healthy"],
-            "right": ["hie", "hie", "acidosis"],
+            "left": ["acidosis", "hie", "hie"],
+            "right": ["healthy", "healthy", "acidosis"],
         }
     )
 
     ordered = cross_subgroup._ordered_pair_labels(pairs, labels.CLASS_COLUMN)
 
-    # Keyed on (position of left, position of right): healthy is 0, so its pairs come first.
-    assert ordered == ["healthy vs acidosis", "healthy vs hie", "acidosis vs hie"]
+    # Keyed on (position of left, position of right): hie is 0, so its pairs come first.
+    assert ordered == ["hie vs acidosis", "hie vs healthy", "acidosis vs healthy"]
 
 
-def test_every_comparison_runs_from_the_less_severe_cohort_to_the_worse_one() -> None:
+def test_every_comparison_runs_from_the_more_severe_cohort_to_the_less_severe_one() -> None:
     """The orientation the column order above is read against, at the two functions that decide
     it: this analysis picks the cohorts and their order, and the shared sweep names each pair in
-    the order it receives them. ``sorted`` would answer ``acidosis vs healthy`` first -- the same
-    comparison with its Cliff's delta reversed, and nothing in the output would say so.
+    the order it receives them. ``sorted`` would answer ``acidosis vs hie`` -- the same comparison
+    with its Cliff's delta reversed, and nothing in the output would say so.
     """
     from teb_vae.lag_attn_rws.eval.analyses import cross_subgroup
     from teb_vae.lag_attn_rws.eval._reuse import stats as shared_stats
 
-    # Entered worst-first, and the metric grows with severity: neither a no-op nor a plain
+    # Entered healthy-first, and the metric grows with severity: neither a no-op nor a plain
     # ``sorted`` reproduces the expected answer.
     frame = pd.DataFrame(
         [
@@ -231,7 +233,7 @@ def test_every_comparison_runs_from_the_less_severe_cohort_to_the_worse_one() ->
                 labels.CLASS_COLUMN: name,
                 "pred_gap": offset + float(recording),
             }
-            for name, offset in (("hie", 20.0), ("acidosis", 10.0), ("healthy", 0.0))
+            for name, offset in (("healthy", 0.0), ("acidosis", 10.0), ("hie", 20.0))
             for recording in range(4)
         ]
     )
@@ -240,10 +242,10 @@ def test_every_comparison_runs_from_the_less_severe_cohort_to_the_worse_one() ->
     comparisons = shared_stats.pairwise_comparisons(usable)
 
     assert [(item["left"], item["right"]) for item in comparisons] == [
-        ("healthy", "acidosis"), ("healthy", "hie"), ("acidosis", "hie"),
+        ("hie", "acidosis"), ("hie", "healthy"), ("acidosis", "healthy"),
     ]
-    # One sign convention across every pair: the less severe cohort of each runs lower here.
-    assert all(item["cliffs_delta"] < 0.0 for item in comparisons)
+    # One sign convention across every pair: the more severe cohort of each runs higher here.
+    assert all(item["cliffs_delta"] > 0.0 for item in comparisons)
 
 
 # =============================================================================
@@ -282,9 +284,12 @@ def test_every_canonical_subgroup_is_a_shade_of_its_own_class() -> None:
 def test_the_subgroups_of_one_class_are_distinguishable_from_each_other() -> None:
     """A shading range that collapsed would give four identical green violins, which is worse
     than four unrelated hues: the figure would read as one cohort drawn four times."""
+    # Read in the *canonical* order rather than the reading order: the ramp is assigned along
+    # ``CANONICAL_SUBGROUPS``, so that -- not the worst-first order the figures are drawn in -- is
+    # the axis the luminance is monotone along.
     healthy = [
         figures_seam.SUBGROUP_COLORS[name]
-        for name in EXPECTED_SUBGROUP_ORDER
+        for name in labels.CANONICAL_SUBGROUPS
         if name.startswith("healthy")
     ]
 
@@ -313,3 +318,78 @@ def test_an_unknown_cohort_still_receives_a_colour() -> None:
 
     assert set(resolved) == {"healthy", "not_a_canonical_shard"}
     assert resolved["not_a_canonical_shard"].startswith("#")
+
+# =================================================================================================
+# The evaluation horizon
+# =================================================================================================
+def test_no_horizon_returns_the_frame_untouched() -> None:
+    """``None`` is the shipped setting, so this is the path every current run takes."""
+    frame = pd.DataFrame({"epoch": [-3600.0, -36000.0], "guid": ["a", "b"]})
+
+    assert cohort.within_horizon(frame, None) is frame
+
+
+def test_the_horizon_is_inclusive_at_its_own_boundary() -> None:
+    """A segment recorded exactly at the bound is inside it -- ``4.0`` means "the last four
+    hours", and a boundary segment falling out would be an off-by-one nobody could see."""
+    frame = pd.DataFrame({"epoch": [-4 * 3600.0, -4 * 3600.0 - 1.0], "guid": ["at", "beyond"]})
+
+    kept = cohort.within_horizon(frame, 4.0)
+
+    assert kept["guid"].tolist() == ["at"]
+
+
+def test_a_segment_at_or_after_delivery_is_never_cut_by_the_horizon() -> None:
+    """The horizon bounds the *far* side only. A non-negative ``epoch`` is at or after delivery,
+    which the binner clips into the first window; cutting it here would silently change which
+    segments that clip is applied to."""
+    frame = pd.DataFrame({"epoch": [0.0, 600.0], "guid": ["at", "after"]})
+
+    assert cohort.within_horizon(frame, 4.0)["guid"].tolist() == ["at", "after"]
+
+
+def test_a_non_finite_epoch_survives_the_horizon_and_is_dropped_by_the_binner() -> None:
+    """Two different reasons for a row to disappear, kept separable: the horizon means "out of
+    scope" and the binner's finite check means "no usable coordinate". A row removed here would be
+    attributed to the wrong one in the excluded counts."""
+    frame = pd.DataFrame({"epoch": [np.nan, -36000.0], "guid": ["nan", "far"]})
+
+    kept = cohort.within_horizon(frame, 4.0)
+
+    assert kept["guid"].tolist() == ["nan"]
+    assert cohort.add_time_bins(kept).empty
+
+
+def test_the_horizon_tolerates_a_frame_with_no_epoch_column() -> None:
+    """``add_second_stage_bins`` is handed frames assembled elsewhere; a missing column is not the
+    horizon's failure to report."""
+    frame = pd.DataFrame({"guid": ["a"]})
+
+    assert cohort.within_horizon(frame, 4.0) is frame
+    assert cohort.within_horizon(pd.DataFrame(), 4.0).empty
+
+
+def test_every_clock_analysis_reads_the_horizon_key() -> None:
+    """The anti-omission direction: a clock analysis added later that never reads the key would
+    silently evaluate the whole split while the run's config said otherwise, and no assertion on
+    the existing analyses would notice."""
+    import re
+    from pathlib import Path
+
+    root = Path(cohort.__file__).resolve().parent / "analyses"
+    clocks = [
+        name for name in ("trajectory.py", "time_to_delivery.py", "second_stage.py",
+                          "lag_kl.py", "lag_clocks.py")
+        if (root / name).is_file()
+    ]
+    assert clocks, "no clock analysis found to check"
+
+    missing = [
+        name for name in clocks
+        if not re.search(r"max_hours_before_delivery", (root / name).read_text(encoding="utf-8"))
+    ]
+
+    assert missing == [], (
+        f"{missing} bin on a clinical clock but never read "
+        f"eval_config.max_hours_before_delivery, so a bounded run would not bound them"
+    )

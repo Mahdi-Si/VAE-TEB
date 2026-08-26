@@ -170,6 +170,7 @@ def style_axes(ax, *, grid: str = "major") -> None:
 #: closes the figure and returns the path it wrote.
 new_figure = figures.new_figure
 render_figure = figures.render_figure
+figure_filename = figures.figure_filename
 
 #: The generic panels. Each takes an axes and draws into it, so a figure builder composes them
 #: rather than each analysis owning a layout.
@@ -397,7 +398,7 @@ def windowed_comparison_figure(
     colours = group_colors(order)
     # Where each cohort sits on the axis. The effect rows below are laid out by it rather than by
     # the alphabetical order of their labels, so a row reads in the same direction as the pair it
-    # names -- less severe against worse. A cohort the order does not know sorts after every one
+    # names -- more severe against less severe. A cohort the order does not know sorts after one
     # it does, exactly as ``cohort.ordered_groups`` places it.
     position = {group: index for index, group in enumerate(order)}
     effects: List[Dict[str, Any]] = []
@@ -474,8 +475,8 @@ def _draw_effect_heatmap(
     heatmap sits under the window it describes; the ancestor's version does not, and reading it
     against its own bar panel means reversing one of the two by eye. The **row** order is the
     cohort order the pairs were tested in rather than the alphabetical order of their labels, so
-    ``healthy vs acidosis`` sits above ``acidosis vs hie`` here as it does in the pairwise CSV,
-    and the whole page -- violins, columns and rows alike -- runs less severe to worst.
+    ``hie vs acidosis`` sits above ``acidosis vs healthy`` here as it does in the pairwise CSV,
+    and the whole page -- violins, columns and rows alike -- runs worst to least severe.
 
     Args:
         figure: The parent figure, for the colourbar.
@@ -551,6 +552,7 @@ __all__ = [
     "WINDOWS_ROW_HEIGHT",
     "binned_violin_panel",
     "configure_figure_style",
+    "figure_filename",
     "group_colors",
     "grouped_violin_figure",
     "heatmap_with_colorbar",

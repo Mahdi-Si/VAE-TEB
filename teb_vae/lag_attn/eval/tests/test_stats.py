@@ -101,13 +101,14 @@ def test_pairwise_compares_every_pair_with_a_signed_effect_size() -> None:
 
 
 def test_the_callers_order_decides_the_pair_order_and_its_orientation() -> None:
-    """The cohort axes run less severe to worst, and ``sorted`` would name the first clinical pair
+    """The cohort axes run worst to least severe, and ``sorted`` would name the first clinical pair
     ``acidosis vs healthy`` -- signing every delta against the reverse of the axis its figure draws
-    it on. The order is the caller's, so a comparison reads healthy vs acidosis, healthy vs HIE,
-    acidosis vs HIE, and a positive delta means the *less severe* cohort runs higher.
+    it on. The order is the caller's, so a comparison reads HIE vs acidosis, HIE vs healthy,
+    acidosis vs healthy, and a positive delta means the *more severe* cohort runs higher.
 
     Asserted in both directions: a reversed mapping must reverse every pair, which an
-    implementation that sorted (or that happened to sort by construction) cannot do.
+    implementation that sorted (or that happened to sort by construction) cannot do. The
+    healthy-first mapping is the *counter*-example here rather than the convention.
     """
     rng = np.random.default_rng(3)
     values = {
@@ -116,17 +117,17 @@ def test_the_callers_order_decides_the_pair_order_and_its_orientation() -> None:
     }
 
     severity = stats.pairwise_comparisons(
-        {name: values[name] for name in ("healthy", "acidosis", "hie")}
+        {name: values[name] for name in ("hie", "acidosis", "healthy")}
     )
     reversed_order = stats.pairwise_comparisons(
-        {name: values[name] for name in ("hie", "acidosis", "healthy")}
+        {name: values[name] for name in ("healthy", "acidosis", "hie")}
     )
 
     assert [(item["left"], item["right"]) for item in severity] == [
-        ("healthy", "acidosis"), ("healthy", "hie"), ("acidosis", "hie"),
+        ("hie", "acidosis"), ("hie", "healthy"), ("acidosis", "healthy"),
     ]
     assert [(item["left"], item["right"]) for item in reversed_order] == [
-        ("hie", "acidosis"), ("hie", "healthy"), ("acidosis", "healthy"),
+        ("healthy", "acidosis"), ("healthy", "hie"), ("acidosis", "hie"),
     ]
     # The same three comparisons either way, each delta signed against the orientation reported
     # beside it -- so the sign is a statement about the pair as named, never about the pair as
@@ -137,9 +138,9 @@ def test_the_callers_order_decides_the_pair_order_and_its_orientation() -> None:
     assert [item["cliffs_delta"] for item in severity] == pytest.approx(
         [-reversed_order[index]["cliffs_delta"] for index in (2, 1, 0)]
     )
-    # Healthy is the least severe of the three, so it runs lower on a metric that grows with
-    # severity: the left-vs-right delta of every healthy-first pair is negative.
-    assert severity[0]["cliffs_delta"] < 0 and severity[1]["cliffs_delta"] < 0
+    # HIE is the worst of the three, so it runs higher on a metric that grows with severity: the
+    # left-vs-right delta of every HIE-first pair -- the order every caller passes -- is positive.
+    assert severity[0]["cliffs_delta"] > 0 and severity[1]["cliffs_delta"] > 0
 
 
 # ---------------------------------------------------------------------------

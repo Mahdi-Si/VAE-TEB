@@ -283,9 +283,9 @@ def test_a_no_coupling_case_is_indistinguishable_from_its_control() -> None:
 
 
 def test_the_per_class_rows_follow_the_clinical_order_rather_than_the_alphabetical_one() -> None:
-    """``groupby`` orders alphabetically, which puts acidosis before healthy. Every figure and
-    every other table in this evaluation reads healthy, acidosis, HIE, and a CSV that did not
-    would be read against them."""
+    """``groupby`` orders alphabetically, which puts acidosis before hie. Every figure and every
+    other table in this evaluation reads HIE, acidosis, healthy -- worst first -- and a CSV that
+    did not would be read against them."""
     from teb_vae.lag_attn_cfs.eval._reuse import labels
 
     frame = _anchor_frame(guids=8, anchors=100, near_every=5, gap=1.0)
@@ -307,7 +307,7 @@ def test_the_per_class_rows_follow_the_clinical_order_rather_than_the_alphabetic
             ["acidosis", "healthy"], labels.CLASS_COLUMN
         )
     )
-    assert cohorts[1:] == ["healthy", "acidosis"]
+    assert cohorts[1:] == ["acidosis", "healthy"]
 
 
 # =================================================================================================

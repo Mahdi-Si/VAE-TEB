@@ -156,6 +156,23 @@ eval_config:
   # committed figure manifests record `.pdf` filenames and are compared against a real run.
   figure_format: null
 
+  # How far before delivery a segment may be recorded and still be evaluated, in hours. `4.0`
+  # keeps only the last four hours of each recording; `null` -- the shipped setting -- evaluates
+  # everything the split carries. Must be at least one 0.5 h trajectory bin.
+  #
+  # THE BOUND IS ON THE POPULATION, NOT ON AN AXIS. It is applied to the delivery clock
+  # (h = -epoch/3600) before anything is binned, and every clock then works from the same
+  # segments -- so the second-stage clock re-bins that population on its own signed axis rather
+  # than being cut at a second, differently-defined four hours. One setting, one meaning.
+  #
+  # It changes the population every downstream number is computed over: cohort sizes, window
+  # counts, and every trajectory and test move with it. A bounded run is NOT comparable with an
+  # unbounded one. This is a config key precisely so the resolved config dumped into the run
+  # directory is a durable record of which it was.
+  #
+  # Applies to `kld_time_to_delivery`, the one analysis here with a time-before-delivery axis.
+  max_hours_before_delivery: null
+
   # Lag bands for the ablation, as inclusive [lo, hi] pairs in model-lag units. At 4 s per
   # decimated step and max_lag: 90 the window spans about 6 minutes of UP history.
   # Validated against max_lag; lo > hi is an empty band and raises.

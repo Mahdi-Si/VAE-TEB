@@ -37,6 +37,7 @@ import pandas as pd
 import pytest
 import torch
 
+from teb_vae.lag_attn_cfs.eval.figures_seam import figure_filename
 from teb_vae.lag_attn_cfs.eval import metrics as metrics_module
 from teb_vae.lag_attn_cfs.eval.analyses import AnalysisContext
 from teb_vae.lag_attn_cfs.eval.analyses import calibration as calibration_analysis
@@ -294,8 +295,8 @@ def test_the_analysis_writes_its_tables_and_both_figures(tmp_path) -> None:
         calibration_analysis.PIT_FILENAME,
         calibration_analysis.LOGVAR_FILENAME,
         calibration_analysis.PER_RECORDING_FILENAME,
-        calibration_analysis.PIT_FIGURE,
-        calibration_analysis.LOGVAR_FIGURE,
+        figure_filename(calibration_analysis.PIT_FIGURE),
+        figure_filename(calibration_analysis.LOGVAR_FIGURE),
     ):
         assert (directory / name).is_file(), name
     coverage = pd.read_csv(directory / calibration_analysis.COVERAGE_FILENAME)

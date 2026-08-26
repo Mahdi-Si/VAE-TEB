@@ -76,6 +76,7 @@ __all__ = [
     "attach_lag_seconds_axis",
     "binned_violin_panel",
     "configure_figure_style",
+    "figure_filename",
     "frequency_scatter",
     "get_class_colors",
     "group_colors",
@@ -130,6 +131,22 @@ def active_figure_format() -> str:
         A matplotlib filetype such as ``"pdf"`` or ``"svg"``, without the leading dot.
     """
     return _ACTIVE_FIGURE_FORMAT
+
+
+def figure_filename(stem: str) -> str:
+    """Return the on-disk filename ``stem`` gets under the active format.
+
+    The counterpart to :func:`render_figure` for anything that needs to *name* a figure without
+    drawing it -- an analysis recording what it wrote, a test asserting the file exists. Both
+    would otherwise hardcode an extension that ``eval_config.figure_format`` can change.
+
+    Args:
+        stem: A figure-name constant, without an extension.
+
+    Returns:
+        ``"<stem>.<format>"``.
+    """
+    return f"{stem}.{_ACTIVE_FIGURE_FORMAT}"
 
 
 def set_figure_format(figure_format: str) -> str:

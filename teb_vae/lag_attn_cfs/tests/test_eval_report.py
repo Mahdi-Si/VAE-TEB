@@ -115,9 +115,9 @@ def test_the_grouped_emitter_delegates_rather_than_reimplementing(monkeypatch) -
     assert (seen["frame"], seen["directory"]) == ("frame", "dir")
     assert seen["value_columns"] == ["pred_gap"]
     assert seen["group_palette"] is figures_seam.group_colors
-    assert seen["order_groups"](["hie", "acidosis", "healthy"], "clinical_class") == (
-        cohort.ordered_groups(["hie", "acidosis", "healthy"], "clinical_class")
-    ) == ["healthy", "acidosis", "hie"]
+    assert seen["order_groups"](["healthy", "acidosis", "hie"], "clinical_class") == (
+        cohort.ordered_groups(["healthy", "acidosis", "hie"], "clinical_class")
+    ) == ["hie", "acidosis", "healthy"]
     assert set(seen) == {"frame", "directory", "value_columns", "order_groups", "group_palette"}
 
 

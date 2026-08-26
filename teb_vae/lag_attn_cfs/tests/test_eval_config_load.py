@@ -51,6 +51,8 @@ _SHIPPED_EVAL_KEYS = {
     "event_lag_window_s",
     "bootstrap_resamples",
     "clock_margin_min_nats",
+    "figure_format",
+    "max_hours_before_delivery",
 }
 
 

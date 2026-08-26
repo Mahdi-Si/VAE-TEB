@@ -34,6 +34,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
+from teb_vae.lag_attn_cfs.eval.figures_seam import figure_filename
 from teb_vae.lag_attn_cfs.eval.analyses import AnalysisContext
 from teb_vae.lag_attn_cfs.eval.analyses import forecast as forecast_analysis
 from teb_vae.lag_attn_cfs.eval.metrics import BASELINE_LOGVAR, BASELINE_NAMES, NORMALISED_UNIT
@@ -355,15 +356,15 @@ def test_no_block_retained_means_no_overlay_rather_than_an_empty_page(tmp_path) 
         output_dir=tmp_path, probe=None,
     )
 
-    assert forecast_analysis.OVERLAY_FIGURE not in result["files"]
+    assert figure_filename(forecast_analysis.OVERLAY_FIGURE) not in result["files"]
     assert not (
-        tmp_path / forecast_analysis.ANALYSIS_DIRNAME / forecast_analysis.OVERLAY_FIGURE
+        tmp_path / forecast_analysis.ANALYSIS_DIRNAME / figure_filename(forecast_analysis.OVERLAY_FIGURE)
     ).exists()
 
 
 def test_a_retained_block_is_drawn_and_recorded(emitted) -> None:
-    assert forecast_analysis.OVERLAY_FIGURE in emitted["result"]["files"]
-    assert (emitted["dir"] / forecast_analysis.OVERLAY_FIGURE).is_file()
+    assert figure_filename(forecast_analysis.OVERLAY_FIGURE) in emitted["result"]["files"]
+    assert (emitted["dir"] / figure_filename(forecast_analysis.OVERLAY_FIGURE)).is_file()
 
 
 def test_the_overlay_draws_one_panel_per_channel_against_lead_time() -> None:
@@ -425,9 +426,9 @@ def test_the_analysis_writes_its_four_tables_and_three_figures(emitted) -> None:
         forecast_analysis.SKILL_FILENAME,
         forecast_analysis.HORIZON_FILENAME,
         forecast_analysis.ANCHOR_FILENAME,
-        forecast_analysis.BASELINE_FIGURE,
-        forecast_analysis.ANCHOR_FIGURE,
-        forecast_analysis.HORIZON_FIGURE,
+        figure_filename(forecast_analysis.BASELINE_FIGURE),
+        figure_filename(forecast_analysis.ANCHOR_FIGURE),
+        figure_filename(forecast_analysis.HORIZON_FIGURE),
     ):
         assert (emitted["dir"] / name).is_file(), name
 

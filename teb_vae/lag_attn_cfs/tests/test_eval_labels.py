@@ -154,7 +154,7 @@ def test_an_unrecognised_cohort_would_be_reported_rather_than_dropped(batches) -
 
     ordered = ordered_groups([*present, "an_unnamed_shard"], labels.SUBGROUP_COLUMN)
 
-    assert ordered[:-1] == list(labels.CANONICAL_SUBGROUPS)
+    assert ordered[:-1] == list(reversed(labels.CANONICAL_SUBGROUPS))
     assert ordered[-1] == "an_unnamed_shard"
 
 
