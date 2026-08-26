@@ -78,11 +78,11 @@ PER_RECORDING_FILENAME = "encoder_attention_per_recording.csv"
 #: here rather than by the runner's violin fan-out: that fan-out resolves per-*recording* scalars,
 #: and these two are per-head and per-distance fields, which a violin cannot carry. The fan-out
 #: still runs, over :data:`PER_RECORDING_FILENAME`, and writes its own files beside these.
-ENTROPY_FIGURE = "encoder_attention_entropy.pdf"
-ENTROPY_CLASS_FIGURE = "encoder_attention_entropy_by_clinical_class.pdf"
-DISTANCE_FIGURE = "encoder_attention_distance.pdf"
-DISTANCE_CLASS_FIGURE = "encoder_attention_distance_by_clinical_class.pdf"
-HEATMAP_FIGURE = "encoder_attention_heatmap.pdf"
+ENTROPY_FIGURE = "encoder_attention_entropy"
+ENTROPY_CLASS_FIGURE = "encoder_attention_entropy_by_clinical_class"
+DISTANCE_FIGURE = "encoder_attention_distance"
+DISTANCE_CLASS_FIGURE = "encoder_attention_distance_by_clinical_class"
+HEATMAP_FIGURE = "encoder_attention_heatmap"
 
 #: The per-segment columns reduced per recording, and the ones the grouped fan-out resolves by
 #: cohort. Both streams' entropy ratio and mean distance: a class contrast on one stream alone
@@ -625,20 +625,20 @@ def run_encoder_attention_analysis(
     pooled_entropy = entropy[entropy[labels.CLASS_COLUMN] == POOLED_CLASS]
     pooled_distance = distance[distance[labels.CLASS_COLUMN] == POOLED_CLASS]
     written = [
-        str(figures.render_to_pdf(
+        str(figures.render_figure(
             build_entropy_figure(pooled_entropy), directory / ENTROPY_FIGURE
         ).name),
-        str(figures.render_to_pdf(
+        str(figures.render_figure(
             build_entropy_class_figure(entropy, cohorts), directory / ENTROPY_CLASS_FIGURE
         ).name),
-        str(figures.render_to_pdf(
+        str(figures.render_figure(
             build_distance_figure(pooled_distance, result.geometry), directory / DISTANCE_FIGURE
         ).name),
-        str(figures.render_to_pdf(
+        str(figures.render_figure(
             build_distance_class_figure(distance, cohorts, result.geometry),
             directory / DISTANCE_CLASS_FIGURE,
         ).name),
-        str(figures.render_to_pdf(build_heatmap_figure(result), directory / HEATMAP_FIGURE).name),
+        str(figures.render_figure(build_heatmap_figure(result), directory / HEATMAP_FIGURE).name),
     ]
 
     logger.info(

@@ -65,7 +65,7 @@ ANALYSIS_DIRNAME = "warmup"
 #: tertile columns out of, so it is a contract rather than a filename.
 PER_RECORDING_FILENAME = "warmup_per_recording.csv"
 SUMMARY_FILENAME = "warmup_summary.csv"
-TERTILE_FIGURE = "warmup_tertiles.pdf"
+TERTILE_FIGURE = "warmup_tertiles"
 
 #: The three tertile columns, in warm-up order, and the ``pred_gap`` they must sum to. Written out
 #: rather than derived from a prefix match: the recomposition below is only a check if the set of
@@ -472,7 +472,7 @@ def run_warmup_analysis(
     pd.DataFrame(rows).to_csv(directory / SUMMARY_FILENAME, index=False)
 
     figure_name = str(
-        figures.render_to_pdf(
+        figures.render_figure(
             build_tertile_figure(per_guid, rows), directory / TERTILE_FIGURE
         ).name
     )

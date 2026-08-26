@@ -305,7 +305,7 @@ def _write_figures(
             xlabel="nats", color=figures.COLOR_PURPLE,
             reference=0.0, reference_label="no penalty",
         )
-        paths.append(str(figures.render_to_pdf(figure, directory / "losses.pdf")))
+        paths.append(str(figures.render_figure(figure, directory / "losses")))
     finally:
         figures.plt.close(figure)
 
@@ -345,7 +345,7 @@ def _write_figures(
             color=figures.COLOR_VERMILLION, wrap=True,
         )
         figures.style_axes(ax)
-        paths.append(str(figures.render_to_pdf(figure, directory / "kl_overlay.pdf")))
+        paths.append(str(figures.render_figure(figure, directory / "kl_overlay")))
     finally:
         figures.plt.close(figure)
     return paths

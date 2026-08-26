@@ -116,7 +116,7 @@ def run_uplift_analysis(
             axes[1, 0], relative, title="Relative uplift", xlabel="uplift_rel",
             reference=0.0, reference_label="no uplift",
         )
-        figure_path = str(figures.render_to_pdf(figure, directory / "uplift.pdf"))
+        figure_path = str(figures.render_figure(figure, directory / "uplift"))
     finally:
         figures.plt.close(figure)
 

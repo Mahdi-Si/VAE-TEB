@@ -233,7 +233,7 @@ def test_three_figures_are_written_with_data(
     make_eval_runner, tiny_loader, tiny_eval_config, tmp_path, monkeypatch
 ) -> None:
     captured: dict = {}
-    original = figures.render_to_pdf
+    original = figures.render_figure
 
     def _capture(fig, path, **kwargs):
         captured[Path(path).name] = [
@@ -241,11 +241,11 @@ def test_three_figures_are_written_with_data(
         ]
         return original(fig, path, **kwargs)
 
-    monkeypatch.setattr(figures, "render_to_pdf", _capture)
+    monkeypatch.setattr(figures, "render_figure", _capture)
     runner = make_eval_runner(output_dir=tmp_path / "runner")
     summary = _run(runner, tiny_loader, tiny_eval_config["eval_config"], tmp_path / "figs")
 
-    assert set(captured) == {"reliability.pdf", "coverage.pdf", "sharpness.pdf"}
+    assert set(captured) == {"reliability", "coverage", "sharpness"}
     assert all(all(panels) for panels in captured.values())
     assert len(summary["figures"]) == 3
     for path in summary["figures"]:
@@ -257,16 +257,16 @@ def test_the_reliability_figure_marks_the_uniform_reference(
 ) -> None:
     """Without the reference line a PIT curve is a shape with no scale to read it against."""
     captured: dict = {}
-    original = figures.render_to_pdf
+    original = figures.render_figure
 
     def _capture(fig, path, **kwargs):
-        if Path(path).name == "reliability.pdf":
+        if Path(path).name == "reliability":
             captured["labels"] = [
                 line.get_label() for line in fig.axes[0].get_lines()
             ]
         return original(fig, path, **kwargs)
 
-    monkeypatch.setattr(figures, "render_to_pdf", _capture)
+    monkeypatch.setattr(figures, "render_figure", _capture)
     runner = make_eval_runner(output_dir=tmp_path / "runner")
     _run(runner, tiny_loader, tiny_eval_config["eval_config"], tmp_path / "relfig")
 

@@ -411,7 +411,7 @@ def _write_trajectory_figure(
             axes[1, 0], by_subgroup, labels.SUBGROUP_COLUMN,
             "Per-segment KL vs time before delivery, by subgroup",
         )
-        return str(figures.render_to_pdf(figure, directory / "trajectory.pdf"))
+        return str(figures.render_figure(figure, directory / "trajectory"))
     finally:
         figures.plt.close(figure)
 
@@ -441,7 +441,7 @@ def _write_significance_figure(record: Dict[str, Any], directory: Path) -> str:
             axes[0, 0].set_title("Class trajectory significance (not tested)")
             figures.style_axes(axes[0, 0])
             axes[1, 0].axis("off")
-            return str(figures.render_to_pdf(figure, directory / "significance.pdf"))
+            return str(figures.render_figure(figure, directory / "significance"))
 
         # The mark itself is the shared one: the same bars against the same threshold line that
         # every family in this repository is read against, so two figures of two different
@@ -467,7 +467,7 @@ def _write_significance_figure(record: Dict[str, Any], directory: Path) -> str:
             )
 
         _draw_pairwise_heatmap(figure, axes[1, 0], record)
-        return str(figures.render_to_pdf(figure, directory / "significance.pdf"))
+        return str(figures.render_figure(figure, directory / "significance"))
     finally:
         figures.plt.close(figure)
 

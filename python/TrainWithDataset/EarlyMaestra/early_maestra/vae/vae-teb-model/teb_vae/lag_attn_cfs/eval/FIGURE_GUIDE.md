@@ -348,7 +348,7 @@ The same eight metrics resolved by subgroup, **nested rather than flat**: one co
 
 **Axes.** Hours before delivery on the same $0.5$ h grid as the coupling clocks, inverted so delivery is at the right; lag in seconds of **stored-coefficient time**, lag $0$ at the bottom; colour is a share in $[0, 1]$.
 
-**How it is misread.** **The class panels share one colour scale, and that is what makes them comparable** — three panels each scaled to its own extremes would paint the same colour for three different shares while every colourbar stayed correct. **It is a share, not a magnitude**: every window is normalised to sum to one, so a band moving down means the attribution moved toward the anchor, not that there is more of it — how much there is is what `time_to_delivery_trajectory.pdf` draws. **A centroid is not a peak**: no argmax is reported anywhere in this analysis, because `entmax15` gives a flat profile a confident one; `lag_kl/lag_kl_stratified_peaks.csv` carries the positional reading with its degeneracy verdict. And the lag axis is stored-coefficient time, so a centroid that moves ninety seconds is a shift over the axis the coefficients are stored on rather than a physiological latency.
+**How it is misread.** **The class panels share one colour scale, and that is what makes them comparable** — three panels each scaled to its own extremes would paint the same colour for three different shares while every colourbar stayed correct. **It is a share, not a magnitude**: every window is normalised to sum to one, so a band moving down means the attribution moved toward the anchor, not that there is more of it — how much there is is what `time_to_delivery_trajectory.pdf` draws. **A centroid is not a peak**, and this page draws no peak: the argmax and the eleven other per-segment statistics are on `lag_time_to_delivery_features.pdf` beside the guard that says whether a peak may be read at all. And the lag axis is stored-coefficient time, so a centroid that moves ninety seconds is a shift over the axis the coefficients are stored on rather than a physiological latency.
 
 ## `lag_clocks/lag_time_to_delivery_windows.pdf`
 
@@ -359,6 +359,16 @@ The same eight metrics resolved by subgroup, **nested rather than flat**: one co
 **Axes.** Hours before delivery, inverted; lag in seconds of stored-coefficient time on the violins; $-\log_{10} p$ on the strips.
 
 **How it is misread.** **This clock's two families are its own** and are not corrected jointly with the second-stage clock's, nor with each other: four families across this analysis, and a reader quoting two of them is making two comparisons. **Every heatmap row reads less severe against worse**: `healthy vs acidosis`, `healthy vs hie`, `acidosis vs hie`, so a positive Cliff's delta means the *less severe* class's centroid sits further back in the past. A cell below `MIN_GROUP_SIZE` = 3 recordings is drawn as its own points rather than as a density the smoother invented, and those are the same cells the test excludes.
+
+## `lag_clocks/lag_time_to_delivery_features.pdf`
+
+**In plain terms.** *"The centroid is one number about the shape of the informative past. What do the other thirteen say?"* A centroid and a spread describe a single lump; they say nothing about whether the profile is one lump, which side its tail runs to, or where its tallest bin is.
+
+**What it shows.** Nine panels against the same clock, one per statistic, each the **median across recordings** with the attribution's inter-quartile ribbon: skewness, the median lag, the inter-quartile range, the entropy, the effective support, the near and far mass shares, the peak lag, and the share of segments whose peak is degenerate. On every panel the **solid line is the KL attribution and the dashed line is the attention profile**, in the same class colours as every other cohort figure. On the peak panel each point additionally carries that window's degenerate share as a percentage.
+
+**Axes.** Hours before delivery on the same $0.5$ h grid, inverted so delivery is at the right. The $y$ axis differs per panel and is labelled per panel: seconds of stored-coefficient time for the median, the inter-quartile range, the effective support and the peak; nats for the entropy; a dimensionless ratio for the skewness; a share in $[0, 1]$ for the three mass and segment shares.
+
+**How it is misread.** **Nothing on this page is tested.** These statistics are tabled and drawn only, which is what keeps each clock's Holm family at two; a trajectory here that looks separated is a hypothesis, and `lag_clocks_significance.csv` carries the only claims this analysis makes. **The peak panel must be read with the panel beneath it**: `entmax15` assigns lags exactly zero, so a flat or nearly empty profile still has a perfectly confident argmax, and a window whose degenerate share is high has a peak line that means nothing — the annotated percentage on each point is that number for the attribution, and the panel below carries it for both profiles. **Solid and dashed are two readings of the same recordings, not two cohorts**: the attribution is $K_t$ times the attention and inherits the prior-variance inflation the attention is immune to, so where the two diverge the divergence is the finding. **The near and far shares are measured from the shortest lag the axis carries**, not from zero, so they mean the same thing at any causal input delay — and they do not sum to one, because the middle of the axis belongs to neither.
 
 ## `lag_clocks/lag_second_stage.pdf`
 
@@ -379,6 +389,16 @@ The same eight metrics resolved by subgroup, **nested rather than flat**: one co
 **Axes.** Signed hours from second-stage onset, not inverted, onset at zero; lag in seconds of stored-coefficient time; $-\log_{10} p$ on the strips.
 
 **How it is misread.** **This clock's Holm family is its own**, per readout, and is not corrected jointly with the delivery clock's: the two are different alignments of an overlapping population, so a window significant on one and not the other is a statement about alignment. **Every heatmap row reads less severe against worse**, so a positive delta means the less severe class's centroid sits further back. A grey cross at zero on a strip means fewer than two classes had enough recordings in that window — which on the positive side of this axis is the common case rather than the exception.
+
+## `lag_clocks/lag_second_stage_features.pdf`
+
+**In plain terms.** *"The same thirteen other readings of the lag profile, against the second-stage landmark rather than against delivery."*
+
+**What it shows.** The same nine panels as the delivery clock's features page — skewness, median lag, inter-quartile range, entropy, effective support, near and far mass share, peak lag, degenerate share — solid for the KL attribution and dashed for the attention, median across recordings with the attribution's inter-quartile ribbon.
+
+**Axes.** Signed hours from second-stage onset, **negative before onset and positive after**, **not** inverted, with the onset marked at zero. The $y$ axis is per panel, as on the delivery clock's page.
+
+**How it is misread.** **The sign is the opposite convention from the delivery clock's**, and the population is a **subset**: recordings with no recorded onset are not on this axis at all, and the positive side is short by construction, so a statistic that looks unstable after onset is usually a statistic computed over very few recordings. **Nothing on this page is tested**, and the peak panel must be read with the degenerate share beneath it — both for the reasons the delivery clock's features page states.
 
 ## `cross_subgroup/subgroup_heatmap.pdf`
 

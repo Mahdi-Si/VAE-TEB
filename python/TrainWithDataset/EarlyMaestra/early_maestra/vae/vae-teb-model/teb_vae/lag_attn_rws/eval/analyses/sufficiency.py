@@ -55,7 +55,7 @@ SUMMARY_FILENAME = "sufficiency_summary.csv"
 CURVE_FILENAME = "oracle_training_curve.csv"
 
 #: The figure, named as ``FIGURE_GUIDE.md`` names it.
-SUFFICIENCY_FIGURE = "sufficiency.pdf"
+SUFFICIENCY_FIGURE = "sufficiency"
 
 #: The three block scores compared, as ``(column, label)``. All three are Monte Carlo marginalised
 #: where the model produced them, so the oracle -- which has no latent to marginalise over -- is
@@ -375,7 +375,7 @@ def run_sufficiency_analysis(
 
     curve = curve_frame(record)
     curve.to_csv(directory / CURVE_FILENAME, index=False)
-    figures.render_to_pdf(
+    figures.render_figure(
         build_sufficiency_figure(per_guid, curve, rows), directory / SUFFICIENCY_FIGURE
     )
 

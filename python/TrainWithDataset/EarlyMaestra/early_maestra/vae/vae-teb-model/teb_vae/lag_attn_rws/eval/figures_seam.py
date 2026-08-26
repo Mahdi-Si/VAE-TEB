@@ -24,7 +24,7 @@ package owning a second copy of the builder.
   ``rcParams``, so an import-time call would silently restyle every other figure in the process,
   including a test's. :func:`configure_figure_style` is called once at run start instead.
 
-:func:`render_to_pdf` *closes* the figure it saves. That is not tidiness: a production pass draws
+:func:`render_figure` *closes* the figure it saves. That is not tidiness: a production pass draws
 one figure per analysis per grouping axis, and matplotlib holds every unclosed figure alive in
 its global registry, so a leak is measured in hundreds of megabytes rather than in style.
 
@@ -119,16 +119,25 @@ STYLE_REFINEMENT = {
 }
 
 
-def configure_figure_style() -> None:
+def configure_figure_style(figure_format: Optional[str] = None) -> None:
     """Apply the repository's publication style, then this package's refinement over it.
 
     Called once at run start, and deliberately not an import side effect: ``rcParams`` are global
     to the process, so an import-time call would restyle every other figure drawn in it --
-    including a test's.
+    including a test's. The run's figure format rides along for the same reason -- it is one
+    property of the whole pass, fixed once, rather than an argument on every drawing call.
+
+    Args:
+        figure_format: The image format every figure of this run is written in, as a matplotlib
+            filetype. ``None`` leaves the active format alone, which is
+            :data:`~teb_vae.lag_attn.eval.figures.DEFAULT_FIGURE_FORMAT` in a fresh process.
+
+    Raises:
+        ValueError: If ``figure_format`` is not a format this matplotlib build can write.
     """
     import matplotlib.pyplot as plt
 
-    figures.configure_figure_style()
+    figures.configure_figure_style(figure_format)
     plt.rcParams.update(STYLE_REFINEMENT)
 
 
@@ -157,10 +166,10 @@ def style_axes(ax, *, grid: str = "major") -> None:
             color=figures.COLOR_LIGHT_GRAY,
         )
 
-#: Figure construction and output. ``render_to_pdf`` tight-layouts, saves at the repository's DPI,
+#: Figure construction and output. ``render_figure`` tight-layouts, saves at the repository's DPI,
 #: closes the figure and returns the path it wrote.
 new_figure = figures.new_figure
-render_to_pdf = figures.render_to_pdf
+render_figure = figures.render_figure
 
 #: The generic panels. Each takes an axes and draws into it, so a figure builder composes them
 #: rather than each analysis owning a layout.
@@ -548,7 +557,7 @@ __all__ = [
     "histogram_panel",
     "multi_line_panel",
     "new_figure",
-    "render_to_pdf",
+    "render_figure",
     "ribbon_plot",
     "significance_strip",
     "style_axes",

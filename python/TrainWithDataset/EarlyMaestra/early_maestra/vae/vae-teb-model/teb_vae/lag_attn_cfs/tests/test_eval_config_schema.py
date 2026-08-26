@@ -242,3 +242,46 @@ def test_importing_the_module_pulls_in_no_numeric_stack() -> None:
         f"importing config_schema pulled in {result.stdout.strip()}; it validates a run's settings "
         f"before a model, a loader or an output directory exists and must stay a stdlib parse"
     )
+
+
+# =================================================================================================
+# figure_format
+# =================================================================================================
+def test_the_figure_format_defaults_to_none_so_a_run_keeps_the_pdf_default() -> None:
+    """``None`` rather than ``"pdf"``: the default lives in ``figures``, and only there."""
+    assert DEFAULTS["figure_format"] is None
+    assert validate_eval_config({"eval_config": {}})["figure_format"] is None
+
+
+@pytest.mark.parametrize(
+    ("given", "expected"),
+    [("svg", "svg"), ("SVG", "svg"), (".png", "png"), ("  pdf  ", "pdf")],
+    ids=["plain", "upper", "dotted", "padded"],
+)
+def test_an_operator_typed_format_is_normalised(given: str, expected: str) -> None:
+    """A config value is hand-typed, so the shapes a hand produces all have to resolve."""
+    resolved = validate_eval_config({"eval_config": {"figure_format": given}})
+
+    assert resolved["figure_format"] == expected
+
+
+def test_a_format_matplotlib_cannot_write_is_refused_and_names_the_supported_set() -> None:
+    """The failure this key exists to prevent is a typo that would otherwise reach ``savefig``."""
+    with pytest.raises(ValueError, match=r"figure_format must be one of"):
+        validate_eval_config({"eval_config": {"figure_format": "docx"}})
+
+
+def test_a_non_string_format_is_refused_before_it_reaches_matplotlib() -> None:
+    with pytest.raises(ValueError, match=r"figure_format must be a string"):
+        validate_eval_config({"eval_config": {"figure_format": 3}})
+
+
+def test_the_supported_set_is_the_installed_matplotlib_s_own() -> None:
+    """Read from the live build rather than restated here, so it cannot go stale against it."""
+    from teb_vae.lag_attn.eval.figures import SUPPORTED_FIGURE_FORMATS
+
+    for accepted in ("pdf", "svg", "png"):
+        assert accepted in SUPPORTED_FIGURE_FORMATS
+        assert validate_eval_config(
+            {"eval_config": {"figure_format": accepted}}
+        )["figure_format"] == accepted

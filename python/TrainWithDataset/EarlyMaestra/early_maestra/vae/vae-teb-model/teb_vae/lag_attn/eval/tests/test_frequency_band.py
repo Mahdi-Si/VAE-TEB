@@ -298,10 +298,10 @@ def test_the_violin_figure_stacks_two_panels_with_hz_suffixed_ticks(
 ) -> None:
     """Structural assertions plus the label content, which is the point of the figure."""
     captured: Dict[str, Any] = {}
-    original = figures.render_to_pdf
+    original = figures.render_figure
 
     def _capture(fig, path, **kwargs):
-        if Path(path).name == "band_violins.pdf":
+        if Path(path).name == "band_violins":
             captured["titles"] = [ax.get_title() for ax in fig.axes if ax.get_title()]
             captured["ticks"] = [
                 label.get_text() for label in fig.axes[0].get_xticklabels()
@@ -309,7 +309,7 @@ def test_the_violin_figure_stacks_two_panels_with_hz_suffixed_ticks(
             captured["has_data"] = [ax.has_data() for ax in fig.axes if ax.get_title()]
         return original(fig, path, **kwargs)
 
-    monkeypatch.setattr(figures, "render_to_pdf", _capture)
+    monkeypatch.setattr(figures, "render_figure", _capture)
 
     _, directory, _ = analysis
     frame = pd.read_csv(directory / "clinical" / "per_sample.csv")

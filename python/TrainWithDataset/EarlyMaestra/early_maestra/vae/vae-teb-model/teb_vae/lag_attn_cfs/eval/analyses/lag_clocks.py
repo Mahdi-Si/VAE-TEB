@@ -6,26 +6,40 @@ Three analyses already stand next to this question and none of them answers it. 
 says whether the informative past is closer at delivery than it was six hours earlier, or whether
 it moves differently for a cohort that ends badly.
 
-**What is resolved.** Two attributes of a segment's own lag profile, on the compensated axis
-$\tau_\ell = 4(\ell + \delta)$ that :mod:`~teb_vae.lag_attn_cfs.eval.lag_axis` builds:
+**What is resolved.** Fourteen attributes of a segment's own lag profile, on the compensated axis
+$\tau_\ell = 4(\ell + \delta)$ that :mod:`~teb_vae.lag_attn_cfs.eval.lag_axis` builds, with
+$p_\ell = w_\ell / \sum_k w_k$. They fall into four families, and the families exist because each
+answers a question the others cannot:
 
-$$p_\ell = \frac{w_\ell}{\sum_k w_k},\qquad
-\bar\tau = \sum_\ell p_\ell \tau_\ell,\qquad
-\sigma_\tau = \sqrt{\sum_\ell p_\ell\,(\tau_\ell - \bar\tau)^2}$$
+* **The moments** -- $\bar\tau = \sum_\ell p_\ell \tau_\ell$ and
+  $\sigma_\tau = \sqrt{\sum_\ell p_\ell (\tau_\ell - \bar\tau)^2}$, the centre of mass and its
+  spread, plus the skewness that says which side the tail is on.
+* **The quantiles** -- the median lag and the inter-quartile range, read off the cumulative mass.
+  These profiles are skewed, and one distant bin moves $\bar\tau$ far more than it moves the
+  median; where the two disagree, the disagreement is the skew.
+* **The concentration** -- the entropy $H = -\sum_\ell p_\ell \log p_\ell$, the effective support
+  $\Delta e^{H}$ it implies, and the share of mass near the anchor and far from it. A bimodal
+  profile has an unremarkable centroid and an unremarkable spread; only these say it is not one
+  lump.
+* **The peak** -- where the tallest bin is, how wide it is at half height, how much mass it holds,
+  and the two statistics of the guard below.
 
--- the centre of mass of the attribution, and how concentrated it is around that centre. Each is
-computed twice, over the KL attribution and over the attention profile, for the reason
+Every one is computed twice, over the KL attribution and over the attention profile, for the reason
 :data:`~teb_vae.lag_attn_cfs.eval.cohort.CLOCK_READOUTS` carries two coupling readouts rather than
 one: the two fail differently. The attribution is $K_t$ times the attention and therefore inherits
 the prior-variance inflation; the attention profile is the model's own focus and does not. A shift
 visible in one and absent from the other is a finding about which of the two is being read.
 
-**Deliberately no argmax.** ``entmax15`` assigns lags exactly zero, so a profile that is flat or
-nearly empty still has a perfectly confident argmax -- and the mechanical degeneracy criterion that
-guards a positional claim lives in ``lag_kl``, which an analysis may not import. A per-window peak
-reported here would be a positional claim with the guard left behind, so the peak stays that
-analysis's to make and ``lag_kl_stratified_peaks.csv`` is where a reader goes for it. $\bar\tau$
-and $\sigma_\tau$ are defined on a flat profile and say something true about it.
+**The peak is reported, and it is reported with its guard.** ``entmax15`` assigns lags exactly
+zero, so a profile that is flat or nearly empty still has a perfectly confident argmax, and a
+position quoted without the mechanical criterion that says whether the profile has a shape at all
+is not a reading. That criterion used to live in ``lag_kl`` -- which an analysis may not import --
+and this analysis therefore reported no peak. It now lives in
+:mod:`~teb_vae.lag_attn_cfs.eval.lag_shape`, one layer down, so ``lag_peak_*_s`` travels beside
+``lag_peak_degenerate_*`` and ``lag_zero_fraction_*`` in the same row of the same table. A window
+whose degenerate share is high has a peak trajectory that means nothing, and the number saying so
+is on the page. ``lag_kl_stratified_peaks.csv`` remains where the *pooled* positional reading
+lives; this is the per-segment one.
 
 **Both clocks, one implementation.** The two differ in the column they bin on, the sign convention
 of their axis, the orientation their figures are drawn in and whether an eligibility rule applies;
@@ -77,6 +91,15 @@ from teb_vae.lag_attn_cfs.eval.lag_axis import (
     GROUP_DELAY_CAVEAT,
     compensated_seconds_axis,
     read_lag_support,
+)
+from teb_vae.lag_attn_cfs.eval.lag_shape import (
+    DEGENERATE_PEAK_TO_MEDIAN,
+    DEGENERATE_ZERO_FRACTION,
+    FAR_SECONDS,
+    NEAR_SECONDS,
+    PEAK_FRACTION,
+    STATISTIC_KEYS,
+    profile_statistics,
 )
 
 #: This analysis's own subdirectory inside the results directory.
@@ -141,46 +164,197 @@ PROFILE_SOURCES: Tuple[ProfileSource, ...] = (
 
 
 @dataclass(frozen=True)
+class Statistic:
+    """One scalar :func:`~teb_vae.lag_attn_cfs.eval.lag_shape.profile_statistics` returns.
+
+    A statistic is a *reduction*, not a column: it says nothing about which profile it was taken
+    over. Crossing it with :data:`PROFILE_SOURCES` is what makes a column, and writing the two
+    axes separately is what keeps them from drifting -- a statistic added here reaches both
+    profiles, and there is no way to add it to one and forget the other.
+
+    Attributes:
+        key: The name the reducer returns it under, one of
+            :data:`~teb_vae.lag_attn_cfs.eval.lag_shape.STATISTIC_KEYS`.
+        suffix: The unit, spelled into the column name -- ``"_s"`` for seconds, ``"_nats"`` for
+            an entropy, empty for a dimensionless share or ratio. A column whose unit a reader
+            has to infer is one they will infer wrongly.
+        unit: The $y$-axis label of a panel drawing it. ``None`` takes the shared lag axis label,
+            which is what every seconds-valued statistic is drawn on.
+        drawn: Whether the features page carries a panel for it. Five do not. The centroid and the
+            spread are already the two reduced panels of the *profile* page, and drawing them twice
+            would put one quantity on two pages under two ribbons. The peak's width and mass and
+            the zero fraction are each a second reading of a panel that is on this page -- the
+            peak, and the degenerate share it is guarded by -- and the page is nine rows as it
+            stands. All five reach both tables regardless.
+        tested: Whether the three-layer inference runs on it. Only the centroid is, which keeps
+            each clock's Holm family at two rather than at twenty-eight and the windows page at
+            five rows. Promoting a statistic is this flag and nothing else.
+        meaning: What the number is, written into every record.
+    """
+
+    key: str
+    suffix: str
+    unit: Optional[str]
+    drawn: bool
+    tested: bool
+    meaning: str
+
+
+#: The fourteen statistics, in the order every table carries them: the moments, the quantiles, the
+#: concentration, then the peak and the guard that says whether to read it.
+STATISTICS: Tuple[Statistic, ...] = (
+    Statistic(
+        "centroid", "_s", None, drawn=False, tested=True,
+        meaning=(
+            "centre of mass of the profile, in compensated seconds; smaller means the mass sits "
+            "nearer the anchor"
+        ),
+    ),
+    Statistic(
+        "spread", "_s", None, drawn=False, tested=False,
+        meaning=(
+            "mass-weighted spread about the centre, in seconds; smaller means the mass is "
+            "concentrated rather than diffuse"
+        ),
+    ),
+    Statistic(
+        "skewness", "", "skewness (dimensionless)", drawn=True, tested=False,
+        meaning=(
+            "third standardised moment; positive means the tail runs toward the longer "
+            "lags, so the centroid sits further from the anchor than the median does"
+        ),
+    ),
+    Statistic(
+        "median", "_s", None, drawn=True, tested=False,
+        meaning=(
+            "the lag at which half the mass has accumulated, in seconds; the robust centre, "
+            "which a single distant bin moves far less than it moves the centroid"
+        ),
+    ),
+    Statistic(
+        "iqr", "_s", None, drawn=True, tested=False,
+        meaning=(
+            "inter-quartile range of the mass, in seconds; the robust spread, and the width "
+            "a skewed profile is honestly described by"
+        ),
+    ),
+    Statistic(
+        "entropy", "_nats", "entropy (nats)", drawn=True, tested=False,
+        meaning=(
+            "Shannon entropy of the profile over the lags, in nats; higher means the mass is "
+            "spread over more lags, with no reference to where its centre sits"
+        ),
+    ),
+    Statistic(
+        "effective_support", "_s", None, drawn=True, tested=False,
+        meaning=(
+            "the width a uniform profile of the same entropy would occupy, in seconds; how "
+            "many lags the mass effectively covers, independent of where its centre is"
+        ),
+    ),
+    Statistic(
+        "near_mass", "", "share of the mass", drawn=True, tested=False,
+        meaning=(
+            f"share of the mass within {NEAR_SECONDS:g} s of the shortest lag the axis carries; "
+            "measured from the axis's own start, so it means the same thing at any causal delay"
+        ),
+    ),
+    Statistic(
+        "far_mass", "", "share of the mass", drawn=True, tested=False,
+        meaning=(
+            f"share of the mass beyond {FAR_SECONDS:g} s from the shortest lag the axis carries"
+        ),
+    ),
+    Statistic(
+        "peak", "_s", None, drawn=True, tested=False,
+        meaning=(
+            "the lag holding the most mass, in compensated seconds; read only where "
+            "lag_peak_degenerate is low, and see that column's meaning for why"
+        ),
+    ),
+    Statistic(
+        "peak_degenerate", "", "share of segments", drawn=True, tested=False,
+        meaning=(
+            "1 where the profile has no shape worth reading -- peak-to-median below "
+            f"{DEGENERATE_PEAK_TO_MEDIAN}, or more than {DEGENERATE_ZERO_FRACTION:.0%} of bins "
+            "exactly zero -- so the per-recording mean is the share of that recording's segments "
+            "whose peak names a bin rather than a lag"
+        ),
+    ),
+    Statistic(
+        "peak_width", "_s", None, drawn=False, tested=False,
+        meaning=(
+            f"full width of the peak at {PEAK_FRACTION:g} of its height, in seconds, over the "
+            "contiguous run of bins around it"
+        ),
+    ),
+    Statistic(
+        "peak_mass", "", "share of the mass", drawn=False, tested=False,
+        meaning=(
+            f"share of the mass in bins at or above {PEAK_FRACTION:g} of the peak; the "
+            "concentration the peak's position does not report"
+        ),
+    ),
+    Statistic(
+        "zero_fraction", "", "share of bins", drawn=False, tested=False,
+        meaning=(
+            "share of the profile's finite bins that are exactly zero; entmax15 sparsifies, "
+            "so this is expected to be non-zero and is the second half of the criterion above"
+        ),
+    ),
+)
+
+
+@dataclass(frozen=True)
 class Feature:
-    """One scalar summary of a lag profile, per segment.
+    """One scalar summary of one profile, per segment -- a :class:`Statistic` on a source.
 
     Attributes:
         column: The column it is carried under, which is also the name it is reported under --
             one vocabulary rather than a column name and a display name that can drift apart.
         source: Which of :data:`PROFILE_SOURCES` it is computed from.
-        tested: Whether the three-layer inference runs on it. Both centroids are tested; the
-            spreads are drawn and tabled, which keeps each clock's Holm family at two rather than
-            four and the pages at five panels rather than nine.
+        statistic: Which reduction it is.
+        tested: Whether the three-layer inference runs on it; see :class:`Statistic`.
         meaning: What the number is, written into every record.
     """
 
     column: str
     source: str
+    statistic: str
     tested: bool
     meaning: str
 
 
-#: The four features, in the order every table carries them.
-FEATURES: Tuple[Feature, ...] = (
+def _feature_column(source_key: str, statistic: Statistic) -> str:
+    """Build the column name one statistic is carried under for one profile.
+
+    Assembled in one place rather than formatted at each use, for the reason the lag axis is: a
+    name built its own way in a second file is how a writer and a reader come to disagree about
+    which column holds which number.
+
+    Args:
+        source_key: The profile's short name, ``"kl"`` or ``"attn"``.
+        statistic: The reduction.
+
+    Returns:
+        ``lag_<statistic>_<source><suffix>`` -- for example ``lag_centroid_kl_s``, which is the
+        name this analysis has always used for the first of them.
+    """
+    return f"lag_{statistic.key}_{source_key}{statistic.suffix}"
+
+
+#: The features: every statistic on every profile, source-major inside each statistic so the two
+#: readings of one quantity sit next to each other in every table.
+FEATURES: Tuple[Feature, ...] = tuple(
     Feature(
-        "lag_centroid_kl_s", "kl", True,
-        "centre of mass of the per-lag KL attribution, in compensated seconds; smaller means the "
-        "attribution sits nearer the anchor",
-    ),
-    Feature(
-        "lag_centroid_attn_s", "attn", True,
-        "centre of mass of the attention over the lags, in compensated seconds; the same reading "
-        "on the model's own focus, uninflated by the prior variance",
-    ),
-    Feature(
-        "lag_spread_kl_s", "kl", False,
-        "mass-weighted spread of the KL attribution about its centre, in seconds; smaller means "
-        "the attribution is concentrated rather than diffuse",
-    ),
-    Feature(
-        "lag_spread_attn_s", "attn", False,
-        "mass-weighted spread of the attention about its centre, in seconds",
-    ),
+        _feature_column(source.key, statistic),
+        source.key,
+        statistic.key,
+        statistic.tested,
+        f"{statistic.meaning} -- over {source.meaning}",
+    )
+    for statistic in STATISTICS
+    for source in PROFILE_SOURCES
 )
 
 #: The columns, in table order.
@@ -188,6 +362,11 @@ FEATURE_COLUMNS: Tuple[str, ...] = tuple(feature.column for feature in FEATURES)
 
 #: The features the inference runs on, in the order their panels are drawn.
 READOUTS: Tuple[Feature, ...] = tuple(feature for feature in FEATURES if feature.tested)
+
+#: The statistics the features page draws, in panel order.
+DRAWN_STATISTICS: Tuple[Statistic, ...] = tuple(
+    statistic for statistic in STATISTICS if statistic.drawn
+)
 
 
 @dataclass(frozen=True)
@@ -205,6 +384,10 @@ class Clock:
             which reads naturally left to right with the onset marked where it falls.
         figure: The profile page's filename.
         windows_figure: The tested page's filename.
+        features_figure: The untested statistics' page's filename. Its own page rather than more
+            rows on the profile one, because half of what it draws is not in seconds and a panel
+            sharing an axis with a quantity in different units is a panel that will be read
+            against it.
         eligible_only: Whether the second-stage eligibility rule applies before binning.
     """
 
@@ -216,6 +399,7 @@ class Clock:
     inverted: bool
     figure: str
     windows_figure: str
+    features_figure: str
     eligible_only: bool
 
 
@@ -231,8 +415,9 @@ CLOCKS: Tuple[Clock, ...] = (
         center_column=cohort.BIN_CENTER_COLUMN,
         axis_label="Time before delivery (hours)",
         inverted=True,
-        figure="lag_time_to_delivery.pdf",
-        windows_figure="lag_time_to_delivery_windows.pdf",
+        figure="lag_time_to_delivery",
+        windows_figure="lag_time_to_delivery_windows",
+        features_figure="lag_time_to_delivery_features",
         eligible_only=False,
     ),
     Clock(
@@ -242,8 +427,9 @@ CLOCKS: Tuple[Clock, ...] = (
         center_column=cohort.SECOND_STAGE_BIN_CENTER_COLUMN,
         axis_label="Hours from second-stage onset (negative = before onset, positive = after)",
         inverted=False,
-        figure="lag_second_stage.pdf",
-        windows_figure="lag_second_stage_windows.pdf",
+        figure="lag_second_stage",
+        windows_figure="lag_second_stage_windows",
+        features_figure="lag_second_stage_features",
         eligible_only=True,
     ),
 )
@@ -263,95 +449,32 @@ METHOD = (
     "two comparisons."
 )
 
-#: Where a positional reading of a profile belongs, named in the record rather than left for a
-#: reader to look for. This analysis reports no argmax on purpose; see the module docstring.
+#: How the peak reported here is guarded, in the record rather than left for a reader to look for.
+#: A position quoted without this sentence is the failure the sentence exists to prevent.
 PEAK_REFERENCE = (
-    "no per-window argmax is reported here: entmax15 assigns lags exactly zero, so a flat profile "
-    "still has a confident argmax, and the mechanical degeneracy criterion that guards a "
-    "positional claim lives in lag_kl -- see lag_kl/lag_kl_stratified_peaks.csv"
+    f"lag_peak_*_s is an argmax and must be read beside lag_peak_degenerate_*, never alone: "
+    f"entmax15 assigns lags exactly zero, so a flat or nearly empty profile still has a perfectly "
+    f"confident argmax. A segment counts as degenerate when its peak-to-median ratio is below "
+    f"{DEGENERATE_PEAK_TO_MEDIAN} or more than {DEGENERATE_ZERO_FRACTION:.0%} of its finite bins "
+    f"are exactly zero, and the per-recording mean of that flag is the share of a window's "
+    f"segments whose peak names a bin rather than a lag. The pooled positional reading, over whole "
+    f"recordings rather than per segment, remains lag_kl/lag_kl_stratified_peaks.csv"
 )
 
 
 # =================================================================================================
-# The two scalars, from one segment's profile
+# The scalars, from one segment's profile
 # =================================================================================================
-def centroid_and_spread(
-    rows: Any, seconds: np.ndarray
-) -> Tuple[np.ndarray, np.ndarray, Dict[str, Any]]:
-    r"""Reduce a stack of per-lag vectors to their centre of mass and their spread.
-
-    $$\bar\tau_i = \sum_\ell p_{i\ell}\,\tau_\ell, \qquad
-    \sigma_i = \sqrt{\sum_\ell p_{i\ell}\,\tau_\ell^2 - \bar\tau_i^2}, \qquad
-    p_{i\ell} = \frac{w_{i\ell}}{\sum_k w_{ik}}$$
-
-    computed from the second moment rather than from a second pass over the residuals, which is
-    the same number in exact arithmetic and one matrix product instead of two. Floating point can
-    drive that difference slightly negative on a profile concentrated in a single bin, so it is
-    clipped at zero rather than allowed to produce a ``NaN`` square root on a perfectly ordinary
-    profile.
-
-    **Non-finite bins are dropped from the mass, not treated as zero.** A lag whose value was
-    never measured and a lag the source never attended to are different statements, and the second
-    would pull the centroid toward a bin that carries no evidence.
-
-    A row is reported as ``NaN`` rather than as a number when it carries no mass at all -- a
-    segment that scored no anchors -- or when any bin is negative, which these profiles cannot be:
-    the attribution is a non-negative KL times a non-negative attention, so a negative bin is a
-    defect and is counted rather than averaged into a cohort.
-
-    Args:
-        rows: The per-segment vectors, $(n, L)$, in the per-sample table's row order.
-        seconds: The compensated lag axis, $(L,)$.
-
-    Returns:
-        ``(centroid, spread, record)`` -- two $(n,)$ arrays in seconds, and how many rows carried
-        usable mass, how many were empty and how many were rejected as negative. Both arrays are
-        all-``NaN`` when the matrix does not have the axis's width: a vector of another length is
-        a mis-assembled profile rather than a short one, and reshaping it into a plausible wrong
-        answer is what this refuses.
-    """
-    values = np.asarray(rows, dtype=np.float64)
-    empty = np.full(0, np.nan)
-    if seconds.size == 0 or values.ndim != 2 or values.shape[0] == 0:
-        return empty, empty, {"n_rows": 0, "n_usable": 0, "n_empty": 0, "n_negative": 0}
-    count = int(values.shape[0])
-    if values.shape[1] != int(seconds.size):
-        blank = np.full(count, np.nan)
-        return blank, blank, {
-            "n_rows": count, "n_usable": 0, "n_empty": 0, "n_negative": 0,
-            "note": (
-                f"the profile is {values.shape[1]} bins wide against a {seconds.size}-bin lag "
-                f"axis, so it is a mis-assembled vector rather than a short one"
-            ),
-        }
-
-    finite = np.isfinite(values)
-    weights = np.where(finite, values, 0.0)
-    negative = (weights < 0.0).any(axis=1)
-    total = weights.sum(axis=1)
-    usable = (total > 0.0) & ~negative
-    # Divided by one where the row is unusable, so the arithmetic below stays warning-free; those
-    # rows are overwritten with NaN immediately afterwards.
-    shares = weights / np.where(usable, total, 1.0)[:, None]
-    centroid = shares @ seconds
-    variance = np.maximum(shares @ (seconds ** 2) - centroid ** 2, 0.0)
-    spread = np.sqrt(variance)
-    return (
-        np.where(usable, centroid, np.nan),
-        np.where(usable, spread, np.nan),
-        {
-            "n_rows": count,
-            "n_usable": int(usable.sum()),
-            "n_empty": int((~usable & ~negative).sum()),
-            "n_negative": int(negative.sum()),
-        },
-    )
-
-
 def add_feature_columns(
     per_sample: pd.DataFrame, vectors: Dict[str, np.ndarray], seconds: np.ndarray
 ) -> Tuple[pd.DataFrame, Dict[str, Any]]:
-    """Attach the four per-segment features to a copy of the per-sample table.
+    """Attach every per-segment feature to a copy of the per-sample table.
+
+    The arithmetic itself is
+    :func:`~teb_vae.lag_attn_cfs.eval.lag_shape.profile_statistics`, called once per profile
+    rather than once per statistic: the fourteen share a normalisation, a cumulative sum and a
+    mask, and computing them in one pass is what keeps the reduction over tens of thousands of
+    segments a matter of a dozen matrix products.
 
     Args:
         per_sample: The collected per-sample table.
@@ -369,11 +492,12 @@ def add_feature_columns(
     record: Dict[str, Any] = {}
     for source in PROFILE_SOURCES:
         matrix = vectors.get(source.attribute)
-        centroid_column = f"lag_centroid_{source.key}_s"
-        spread_column = f"lag_spread_{source.key}_s"
+        columns = {
+            statistic.key: _feature_column(source.key, statistic) for statistic in STATISTICS
+        }
         if matrix is None or np.asarray(matrix).ndim != 2:
-            frame[centroid_column] = np.nan
-            frame[spread_column] = np.nan
+            for column in columns.values():
+                frame[column] = np.nan
             record[source.key] = {
                 "attribute": source.attribute,
                 "meaning": source.meaning,
@@ -382,9 +506,9 @@ def add_feature_columns(
             }
             continue
         rows = np.asarray(matrix, dtype=np.float64)[: len(frame)]
-        centroid, spread, counts = centroid_and_spread(rows, seconds)
-        frame[centroid_column] = _padded(centroid, len(frame))
-        frame[spread_column] = _padded(spread, len(frame))
+        statistics, counts = profile_statistics(rows, seconds)
+        for key, column in columns.items():
+            frame[column] = _padded(statistics[key], len(frame))
         record[source.key] = {
             "attribute": source.attribute,
             "meaning": source.meaning,
@@ -1111,6 +1235,197 @@ def build_windows_figure(
     return figure
 
 
+#: Statistics whose panel carries a second number annotated on each point, as
+#: ``{drawn: annotated}``.
+#: One entry, and it is the one that makes a positional claim readable: a peak trajectory with no
+#: statement of how often that peak was degenerate is a line a reader will take at face value.
+PANEL_ANNOTATIONS: Dict[str, str] = {"peak": "peak_degenerate"}
+
+
+def build_features_figure(clock: Clock, rows: Sequence[Dict[str, Any]]) -> Any:
+    r"""Draw the untested statistics against one clock, one panel each.
+
+    **Its own page rather than more rows on the profile one**, and the reason is units. Half of
+    what is drawn here is not in seconds -- an entropy in nats, three shares between zero and one,
+    a dimensionless skewness -- and a panel that shares a figure with a quantity in different units
+    is a panel that will be read against it. The profile page stays what it was: the share of the
+    attribution by lag and window, and the two tested centroid trajectories beneath it.
+
+    **The two profiles share each panel, solid for the attribution and dashed for the attention.**
+    That is the pairing the whole analysis rests on: the attribution is $K_t$ times the attention
+    and inherits the prior-variance inflation the attention is immune to, so a statistic that moves
+    in one and not the other is a finding about which of the two is being read -- and it is only
+    visible when the two are on one axis. The ribbon is the attribution's inter-quartile range
+    alone; a second ribbon would cover the lines it sits behind.
+
+    **Nothing on this page carries a $p$-value**, and that is not an omission. These statistics are
+    tabled and drawn rather than tested, which is what keeps each clock's Holm family at two; a
+    trajectory here that looks separated is a hypothesis, and ``lag_clocks_significance.csv``
+    carries the only claims this analysis makes.
+
+    Args:
+        clock: The clock being drawn.
+        rows: This clock's trajectory rows -- every feature and every cohort axis; the class axis
+            is selected per panel.
+
+    Returns:
+        The figure; the caller renders and closes it.
+    """
+    figure, axes = figures.new_figure(max(len(DRAWN_STATISTICS), 1), height_per_row=3.0)
+    for index, statistic in enumerate(DRAWN_STATISTICS):
+        _draw_feature_panel(
+            axes[index, 0],
+            clock,
+            rows,
+            statistic,
+            annotate=PANEL_ANNOTATIONS.get(statistic.key),
+            title=f"{statistic.key} against the clock, by {labels.CLASS_COLUMN}",
+        )
+    figures.caveat_note(figure)
+    return figure
+
+
+def _draw_feature_panel(
+    ax: Any,
+    clock: Clock,
+    rows: Sequence[Dict[str, Any]],
+    statistic: Statistic,
+    *,
+    annotate: Optional[str],
+    title: str,
+) -> int:
+    """Draw one statistic's class trajectories, both profiles on one axis.
+
+    Args:
+        ax: Target axes.
+        clock: The clock, for the orientation and the axis label.
+        rows: This clock's trajectory rows, every feature and every cohort axis.
+        statistic: The statistic to draw.
+        annotate: Key of a second statistic whose per-window median is written above each point of
+            the primary profile's line, or ``None``. Used for the peak, whose position means
+            nothing in a window where most segments were degenerate.
+        title: Panel title.
+
+    Returns:
+        The number of cohorts drawn. Zero draws the empty note instead.
+    """
+    selected = [
+        row for row in rows
+        if row["group_column"] == labels.CLASS_COLUMN and row["clock"] == clock.name
+    ]
+    primary, companion = PROFILE_SOURCES[0], PROFILE_SOURCES[1]
+    primary_rows = [
+        row for row in selected if row["metric"] == _feature_column(primary.key, statistic)
+    ]
+    companion_rows = [
+        row for row in selected if row["metric"] == _feature_column(companion.key, statistic)
+    ]
+    annotated_rows = (
+        [
+            row for row in selected
+            if row["metric"] == _feature_column(primary.key, _statistic_by_key(annotate))
+        ]
+        if annotate
+        else []
+    )
+    groups = cohort.ordered_groups(
+        [row["group"] for row in primary_rows], labels.CLASS_COLUMN
+    ) if primary_rows else []
+    if not groups:
+        ax.text(
+            0.5, 0.5, figures.EMPTY_NOTE, transform=ax.transAxes,
+            ha="center", va="center", fontsize=figures.FONT_NOTE, color=figures.COLOR_GRAY,
+        )
+        ax.set_title(title)
+        figures.style_axes(ax)
+        return 0
+
+    colours = figures.group_colors(groups)
+    # The dashed convention is named once rather than per cohort: three more legend entries saying
+    # the same thing would cover the lines the panel exists to show.
+    companion_labelled = False
+    for group in groups:
+        cell = sorted(
+            (row for row in primary_rows if row["group"] == group),
+            key=lambda row: row["bin_center_h"],
+        )
+        if not cell:
+            continue
+        x = np.array([row["bin_center_h"] for row in cell], dtype=np.float64)
+        colour = colours.get(group, figures.COLOR_BLUE)
+        ax.fill_between(
+            x,
+            np.array([row["q25"] for row in cell], dtype=np.float64),
+            np.array([row["q75"] for row in cell], dtype=np.float64),
+            color=colour, alpha=0.15, linewidth=0,
+        )
+        ax.plot(
+            x, np.array([row["median"] for row in cell], dtype=np.float64),
+            marker="o", markersize=3, color=colour, linewidth=figures.LINE_EMPHASIS,
+            label=f"{group} {primary.key} (n={int(sum(row['n_recordings'] for row in cell))})",
+        )
+        companion_cell = sorted(
+            (row for row in companion_rows if row["group"] == group),
+            key=lambda row: row["bin_center_h"],
+        )
+        if companion_cell:
+            ax.plot(
+                np.array([row["bin_center_h"] for row in companion_cell], dtype=np.float64),
+                np.array([row["median"] for row in companion_cell], dtype=np.float64),
+                linestyle="--", color=colour, linewidth=figures.LINE_THIN,
+                label=f"{companion.key} (dashed)" if not companion_labelled else "_nolegend_",
+            )
+            companion_labelled = True
+        if annotated_rows:
+            # Keyed on the window rather than zipped, so a window one statistic could not be
+            # computed in cannot shift every annotation after it onto the wrong point.
+            by_window = {
+                int(row["time_bin"]): float(row["median"])
+                for row in annotated_rows if row["group"] == group
+            }
+            for row in cell:
+                value = by_window.get(int(row["time_bin"]))
+                if value is None or not np.isfinite(value):
+                    continue
+                ax.annotate(
+                    f"{value:.0%}", (float(row["bin_center_h"]), float(row["median"])),
+                    textcoords="offset points", xytext=(0, 5), ha="center",
+                    fontsize=figures.FONT_TINY, color=colour,
+                )
+    ax.set_title(title)
+    ax.set_xlabel(clock.axis_label)
+    ax.set_ylabel(statistic.unit or figures.COEFFICIENT_LAG_AXIS_LABEL)
+    if clock.inverted:
+        # Delivery sits at the right, so the eye reads left to right toward it.
+        ax.invert_xaxis()
+    else:
+        ax.axvline(
+            0.0, color=figures.COLOR_GRAY, linestyle=":", linewidth=figures.LINE_REGULAR, zorder=0
+        )
+    ax.legend(fontsize=figures.FONT_LABEL, loc="best", ncol=2)
+    figures.style_axes(ax)
+    return len(groups)
+
+
+def _statistic_by_key(key: str) -> Statistic:
+    """Return the :class:`Statistic` registered under ``key``.
+
+    Args:
+        key: One of :data:`~teb_vae.lag_attn_cfs.eval.lag_shape.STATISTIC_KEYS`.
+
+    Returns:
+        Its registration.
+
+    Raises:
+        KeyError: If nothing is registered under that key, which is a typo in
+            :data:`PANEL_ANNOTATIONS` rather than a condition a run can reach.
+    """
+    for statistic in STATISTICS:
+        if statistic.key == key:
+            return statistic
+    raise KeyError(f"no statistic is registered under {key!r}; registered: {STATISTIC_KEYS}")
+
+
 # =================================================================================================
 # The analysis
 # =================================================================================================
@@ -1233,7 +1548,7 @@ def run_lag_clocks_analysis(
 
         written.append(
             str(
-                figures.render_to_pdf(
+                figures.render_figure(
                     build_profile_figure(
                         clock, drawn_windows, drawn_centres, drawn_fields, rows, seconds
                     ),
@@ -1243,9 +1558,17 @@ def run_lag_clocks_analysis(
         )
         written.append(
             str(
-                figures.render_to_pdf(
+                figures.render_figure(
                     build_windows_figure(clock, class_frame, records),
                     directory / clock.windows_figure,
+                ).name
+            )
+        )
+        written.append(
+            str(
+                figures.render_figure(
+                    build_features_figure(clock, rows),
+                    directory / clock.features_figure,
                 ).name
             )
         )
@@ -1333,10 +1656,25 @@ def run_lag_clocks_analysis(
         # Measured rather than assumed: what preflight computed from this run's own geometry.
         "lag_support": read_lag_support(output_dir),
         "profiles": sources,
+        # The constants three of the statistics are defined against. In the record rather than only
+        # in the module, because a share of the mass "near the anchor" is meaningless without the
+        # number that decided what near is, and ``summary.json`` is the artifact that gets quoted.
+        "statistic_thresholds": {
+            "near_seconds": float(NEAR_SECONDS),
+            "far_seconds": float(FAR_SECONDS),
+            "near_far_measured_from": (
+                "the shortest lag the axis carries, not zero, so the two shares mean the same "
+                "thing at any causal input delay"
+            ),
+            "peak_fraction": float(PEAK_FRACTION),
+            "degenerate_peak_to_median": float(DEGENERATE_PEAK_TO_MEDIAN),
+            "degenerate_zero_fraction": float(DEGENERATE_ZERO_FRACTION),
+        },
         "features": [
             {
                 "column": feature.column,
                 "profile": feature.source,
+                "statistic": feature.statistic,
                 "tested": feature.tested,
                 "meaning": feature.meaning,
             }

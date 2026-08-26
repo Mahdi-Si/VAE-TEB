@@ -181,6 +181,7 @@ raises (`True` would silently cap at 1), and a cap of `0` raises.
 | `event_lag_window_s` | Seconds after a detected contraction within which an anchor counts as event-conditioned. Still read here, because contraction-*conditioned* coupling ports even though the two readouts that scored a clinical trace do not. |
 | `bootstrap_resamples` | Resamples behind every bootstrap interval, drawn over recordings — never over anchors, whose forecast windows overlap 14/15. |
 | `clock_margin_min_nats` | **This cell's own, and it ships unset.** The margin $\Delta_{\mathrm{clock}}$ must clear for `coupling_exceeds_availability_clock` to PASS. Nullable exactly as `max_samples` is; at `null` the verdict is INCONCLUSIVE and the measurement is emitted anyway. See *`source_null`* below for why a guessed threshold would be worse than no threshold. |
+| `figure_format` | Image format every figure of the run is written in, as a matplotlib filetype (`pdf`, `svg`, `png`, `eps`, …); validated at config load against the installed matplotlib's own list. `null` — the shipped setting — keeps the `pdf` default, which is what `figure_manifest.json` and `FIGURE_GUIDE.md` record and what the smoke suite compares a real run against; a run that changes it writes filenames those files do not list. |
 
 Deliberately **not** keys: the significance level and the trajectory bin width (an operator who could
 widen them could make a difference appear or disappear), any lag-band selection, and — the one this
@@ -751,20 +752,36 @@ informed the future, pooled over a whole recording; `time_to_delivery` and `seco
 *much* coupling there is at each point of two clinical clocks. This says **where** the informative
 past sits at each point of both of them, and whether that differs by class.
 
-Two attributes of each segment's own profile, on the compensated axis: the **centre of mass**
-$\bar\tau = \sum_\ell p_\ell \tau_\ell$ and the **spread**
-$\sigma_\tau = \sqrt{\sum_\ell p_\ell (\tau_\ell - \bar\tau)^2}$ about it, with
-$p_\ell = w_\ell / \sum_k w_k$. Each is computed twice, over the untruncated KL attribution and
-over the support-corrected attention, for the reason both clocks carry two coupling readouts: the
-attribution is $K_t$ times the attention and inherits the prior-variance inflation the attention is
-immune to, so a shift visible in one and absent from the other is a finding about which is being
-read.
+**Fourteen attributes** of each segment's own profile, on the compensated axis, with
+$p_\ell = w_\ell / \sum_k w_k$, in four families:
 
-**No argmax is reported here, deliberately.** `entmax15` assigns lags exactly zero, so a flat profile
-still has a confident argmax, and the mechanical degeneracy criterion that guards a positional claim
-lives in `lag_kl` — which an analysis may not import. A per-window peak here would be that claim with
-its guard left behind; `lag_kl/lag_kl_stratified_peaks.csv` is where a positional reading belongs, and
-the record names it.
+| family | statistics | column |
+| --- | --- | --- |
+| moments | centre of mass $\bar\tau = \sum_\ell p_\ell \tau_\ell$, spread $\sigma_\tau = \sqrt{\sum_\ell p_\ell (\tau_\ell - \bar\tau)^2}$, skewness | `lag_centroid_*_s`, `lag_spread_*_s`, `lag_skewness_*` |
+| quantiles | median lag, inter-quartile range | `lag_median_*_s`, `lag_iqr_*_s` |
+| concentration | entropy $H = -\sum_\ell p_\ell \log p_\ell$, effective support $\Delta e^{H}$, near and far mass share | `lag_entropy_*_nats`, `lag_effective_support_*_s`, `lag_near_mass_*`, `lag_far_mass_*` |
+| peak | peak lag, its width at half height, its mass, the degeneracy flag and the zero fraction behind it | `lag_peak_*_s`, `lag_peak_width_*_s`, `lag_peak_mass_*`, `lag_peak_degenerate_*`, `lag_zero_fraction_*` |
+
+The families exist because each answers what the others cannot: a bimodal profile has an
+unremarkable centroid and an unremarkable spread, and only the concentration family says it is not
+one lump; these profiles are skewed, and one distant bin moves $\bar\tau$ far more than it moves the
+median, so where the two disagree the disagreement *is* the skew. Every one is computed twice, over
+the untruncated KL attribution and over the support-corrected attention — 28 columns — for the
+reason both clocks carry two coupling readouts: the attribution is $K_t$ times the attention and
+inherits the prior-variance inflation the attention is immune to, so a shift visible in one and
+absent from the other is a finding about which is being read. The arithmetic is
+`eval/lag_shape.py`'s, in one vectorised pass per profile.
+
+**The peak is reported, and it is reported with its guard.** `entmax15` assigns lags exactly zero,
+so a flat or nearly empty profile still has a perfectly confident argmax, and a position quoted
+without the mechanical criterion that says whether the profile has a shape at all is not a reading.
+That criterion used to live in `lag_kl` — which an analysis may not import — and this analysis
+therefore reported no peak. It now lives one layer down in `eval/lag_shape.py`, so `lag_peak_*_s`
+travels beside `lag_peak_degenerate_*` in the same row of the same table and on the same page: a
+segment is degenerate when its peak-to-median ratio is below `1.1` or more than `90%` of its finite
+bins are exactly zero, and the per-recording mean of that flag is the share of a window's segments
+whose peak names a bin rather than a lag. `lag_kl/lag_kl_stratified_peaks.csv` remains where the
+*pooled* positional reading lives; this is the per-segment one.
 
 Both clocks are cut on the same `TRAJECTORY_BIN_HOURS` grid the coupling clocks use, the unit is one
 value per **recording** inside a window as well as across it, and the second clock scores the
@@ -775,12 +792,18 @@ per-recording table this analysis carries counts from rather than rewriting. It 
 **Four Holm families, and none of them joint**: two clocks times two tested readouts, each
 correction controlling the family-wise error rate within its own clock and its own readout. A reader
 quoting a window from two of them is making two comparisons and the `method` string of each says so.
-The two spreads are drawn and tabled but not tested, which keeps each family at two rather than four.
+**Only the two centroids are tested.** The other twelve statistics are drawn and tabled but carry no
+$p$-value, which is what keeps each family at two rather than at fourteen and the tested page at
+five rows rather than twenty-nine; a trajectory on the features page that looks separated is a
+hypothesis, not a claim. Promoting one is a single `tested` flag in `STATISTICS`.
 
-It emits **four** figures, two per clock: `lag_<clock>.pdf`, the share of the attribution by lag and
-window with one panel per class on a shared colour scale and the centroid trajectories beneath it;
-and `lag_<clock>_windows.pdf`, the violins, the Holm-adjusted $p$ per window and Cliff's delta for
-every class pair that survived.
+It emits **six** figures, three per clock: `lag_<clock>.pdf`, the share of the attribution by lag and
+window with one panel per class on a shared colour scale and the two tested centroid trajectories
+beneath it; `lag_<clock>_windows.pdf`, the violins, the Holm-adjusted $p$ per window and Cliff's
+delta for every class pair that survived; and `lag_<clock>_features.pdf`, the untested statistics
+one panel each, solid for the attribution and dashed for the attention. The third is its own page
+rather than more rows on the first because half of what it draws is not in seconds, and a panel
+sharing a figure with a quantity in different units is a panel that will be read against it.
 
 ### spectral_skill
 

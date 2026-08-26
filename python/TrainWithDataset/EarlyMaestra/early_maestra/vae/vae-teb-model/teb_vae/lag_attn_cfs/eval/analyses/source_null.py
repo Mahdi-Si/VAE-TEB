@@ -61,7 +61,7 @@ ANALYSIS_DIRNAME = "source_null"
 #: ``cross_subgroup`` reads, so both are a contract rather than a filename and a label.
 PER_RECORDING_FILENAME = "source_null_per_recording.csv"
 SUMMARY_FILENAME = "source_null_summary.csv"
-DISTRIBUTION_FIGURE = "source_null_difference.pdf"
+DISTRIBUTION_FIGURE = "source_null_difference"
 
 #: The matched coupling readout and the null beside it, in the order the difference is taken.
 COUPLING_COLUMN = "source_conditioned_kl_raw"
@@ -292,7 +292,7 @@ def run_source_null_analysis(
     pd.DataFrame(rows).to_csv(directory / SUMMARY_FILENAME, index=False)
 
     figure_name = str(
-        figures.render_to_pdf(
+        figures.render_figure(
             build_difference_figure(per_guid, rows), directory / DISTRIBUTION_FIGURE
         ).name
     )

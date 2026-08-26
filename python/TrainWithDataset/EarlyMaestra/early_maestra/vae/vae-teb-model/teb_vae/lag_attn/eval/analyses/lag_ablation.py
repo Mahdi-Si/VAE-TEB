@@ -406,12 +406,12 @@ def _write_figures(frame: pd.DataFrame, directory: Path, up_shift_secs: float) -
     paths = []
     for filename, column, title, ylabel, color in (
         (
-            "forecast_degradation.pdf", "feat_mse_delta",
+            "forecast_degradation", "feat_mse_delta",
             "Forecast degradation with ONLY this lag band kept (lower = this band alone suffices)",
             "$\\Delta$ feature MSE vs unmasked", figures.COLOR_VERMILLION,
         ),
         (
-            "kl_change.pdf", "kld_delta",
+            "kl_change", "kld_delta",
             "Change in $K_t$ with ONLY this lag band kept, recomputed on the common support",
             "$\\Delta$ KL (nats)", figures.COLOR_PURPLE,
         ),
@@ -442,7 +442,7 @@ def _write_figures(frame: pd.DataFrame, directory: Path, up_shift_secs: float) -
                 color=figures.COLOR_GRAY,
             )
             figures.style_axes(ax)
-            paths.append(str(figures.render_to_pdf(figure, directory / filename)))
+            paths.append(str(figures.render_figure(figure, directory / filename)))
         finally:
             figures.plt.close(figure)
     return paths

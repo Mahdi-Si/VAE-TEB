@@ -253,7 +253,7 @@ def _write_figures(
         )
         ax.legend(fontsize=7, loc="best")
         figures.style_axes(ax)
-        paths.append(str(figures.render_to_pdf(figure, directory / "reliability.pdf")))
+        paths.append(str(figures.render_figure(figure, directory / "reliability")))
     finally:
         figures.plt.close(figure)
 
@@ -302,7 +302,7 @@ def _write_figures(
         )
         axes[1, 0].legend(fontsize=7, loc="best")
         figures.style_axes(axes[1, 0])
-        paths.append(str(figures.render_to_pdf(figure, directory / "coverage.pdf")))
+        paths.append(str(figures.render_figure(figure, directory / "coverage")))
     finally:
         figures.plt.close(figure)
 
@@ -325,7 +325,7 @@ def _write_figures(
             xlabel="nats", color=figures.COLOR_GREEN,
             reference=0.0, reference_label="no gain",
         )
-        paths.append(str(figures.render_to_pdf(figure, directory / "sharpness.pdf")))
+        paths.append(str(figures.render_figure(figure, directory / "sharpness")))
     finally:
         figures.plt.close(figure)
     return paths

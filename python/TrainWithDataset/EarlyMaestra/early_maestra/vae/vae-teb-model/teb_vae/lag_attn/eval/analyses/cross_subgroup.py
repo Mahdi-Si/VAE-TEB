@@ -391,7 +391,7 @@ def _write_figure(record: Dict[str, Any], directory: Path) -> Optional[str]:
                 title="Cliff's delta (no metric survived Holm)",
                 symmetric=True, colorbar_label="Cliff's delta",
             )
-        return str(figures.render_to_pdf(figure, directory / "cross_subgroup.pdf"))
+        return str(figures.render_figure(figure, directory / "cross_subgroup"))
     finally:
         figures.plt.close(figure)
 

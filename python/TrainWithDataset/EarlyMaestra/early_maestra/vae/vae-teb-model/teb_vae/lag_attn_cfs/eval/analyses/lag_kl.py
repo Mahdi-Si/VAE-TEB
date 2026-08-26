@@ -34,7 +34,10 @@ the geometry had stopped supporting it.
 ``entmax15`` -- which the shipped model uses -- assigns lags exactly zero, so a profile that is
 flat or nearly empty still has a perfectly confident argmax. So the peak is described rather than
 merely located: its width, the mass concentrated near it, whether a second peak exists, and
-whether the profile is degenerate by a stated mechanical criterion rather than by eye.
+whether the profile is degenerate by a stated mechanical criterion rather than by eye. That
+vocabulary now lives in :mod:`~teb_vae.lag_attn_cfs.eval.lag_shape` rather than here, because
+``lag_clocks`` reports a per-segment peak against the same criterion and an analysis may not import
+another; it is re-exported under its original names, so nothing about reading this module changed.
 
 **The lag is the compensated one, and the axis is stored-coefficient time.** $\tau = 4(\ell +
 \delta)$ seconds, with $\delta$ read from the model's own accessor and converted by the module both
@@ -81,8 +84,23 @@ from teb_vae.lag_attn_cfs.eval.lag_axis import (
     profile_column,
     read_lag_support,
 )
+# The peak vocabulary, bound rather than owned. It was defined here until ``lag_clocks`` needed to
+# report a per-segment peak and could not reach an analysis to get the guard that makes one
+# readable; it now lives one layer down and is re-exported under these names, so this module's own
+# call sites and every reader of ``lag_kl.degeneracy`` are unchanged. Two copies of a threshold
+# would be two definitions of what a positional claim is allowed to mean.
+from teb_vae.lag_attn_cfs.eval.lag_shape import (  # noqa: F401  (re-exported)
+    DEGENERATE_PEAK_TO_MEDIAN,
+    DEGENERATE_ZERO_FRACTION,
+    PEAK_FRACTION,
+    SECONDS_PER_LAG_STEP,
+    degeneracy,
+    mass_above,
+    peak_width,
+    secondary_peaks,
+)
 from teb_vae.lag_attn_cfs.eval.report_seam import IDENTITY_TOLERANCE, identity_tolerance_for
-from teb_vae.lag_attn.nets.lag_report import SECONDS_PER_STEP, lag_compensated_seconds
+from teb_vae.lag_attn.nets.lag_report import lag_compensated_seconds
 
 #: This analysis's own subdirectory inside the results directory.
 ANALYSIS_DIRNAME = "lag_kl"
@@ -95,26 +113,7 @@ STRATIFIED_PROFILE_FILENAME = "lag_kl_stratified_profile.csv"
 STRATIFIED_PEAKS_FILENAME = "lag_kl_stratified_peaks.csv"
 
 #: The figure, named as ``FIGURE_GUIDE.md`` names it.
-PROFILE_FIGURE = "lag_kl_profile.pdf"
-
-#: Fraction of the peak a bin must reach to count as part of it. Half, so the reported width is
-#: the familiar full width at half maximum and a reader does not have to learn a local convention.
-PEAK_FRACTION = 0.5
-
-#: A profile is **degenerate** below this peak-to-median ratio: the peak is not distinguishable
-#: from the bulk, so its argmax names a bin rather than a finding. Mechanical rather than
-#: eyeballed, because "the profile looked flat" is not a criterion a second reader can apply.
-DEGENERATE_PEAK_TO_MEDIAN = 1.1
-
-#: A profile is also degenerate above this exact-zero fraction. ``entmax15`` assigns exact zeros,
-#: so a profile can be sparse legitimately; one that is *this* sparse has a handful of live bins
-#: and its shape is set by which of them survived rather than by where the source informed.
-DEGENERATE_ZERO_FRACTION = 0.9
-
-#: Seconds per lag step, for quoting a peak *width* in the units its axis is drawn in. A width is
-#: a difference of lag indices, so the causal input delay cancels out of it -- which is why this
-#: is the step size rather than a call to the compensated converter.
-SECONDS_PER_LAG_STEP = SECONDS_PER_STEP
+PROFILE_FIGURE = "lag_kl_profile"
 
 #: The per-sample columns this analysis reduces per recording -- the identity residual, so a
 #: reader can see which recordings carry it, and the KL the profile decomposes.
@@ -123,163 +122,6 @@ VALUE_COLUMNS: Tuple[str, ...] = (
     "head_kl_identity_max_abs",
     "source_conditioned_kl_raw",
 )
-
-
-def peak_width(profile: Sequence[float], *, fraction: float = PEAK_FRACTION) -> Dict[str, Any]:
-    r"""Describe the peak by its extent rather than by its position alone.
-
-    The contiguous run of bins around the argmax that stay at or above ``fraction`` of the peak
-    -- the full width at half maximum when ``fraction`` is $0.5$. Contiguity is what makes it a
-    *width*: counting every bin above the threshold anywhere in the profile would report a bimodal
-    profile as one very wide peak, which is the opposite of what a second peak means.
-
-    Args:
-        profile: One value per lag.
-        fraction: Height, as a fraction of the peak, defining the peak's edge.
-
-    Returns:
-        The argmax, the peak value, the inclusive bin bounds of the peak, and its width in bins.
-        All ``None`` on an empty or non-finite profile.
-    """
-    values = np.asarray(list(profile), dtype=np.float64)
-    if values.size == 0 or not np.isfinite(values).any():
-        return {"argmax": None, "peak": None, "lo": None, "hi": None, "width_bins": None}
-    finite = np.where(np.isfinite(values), values, -np.inf)
-    argmax = int(np.argmax(finite))
-    peak = float(finite[argmax])
-    threshold = peak * float(fraction)
-    lo = argmax
-    while lo > 0 and finite[lo - 1] >= threshold:
-        lo -= 1
-    hi = argmax
-    while hi + 1 < finite.size and finite[hi + 1] >= threshold:
-        hi += 1
-    return {
-        "argmax": argmax,
-        "peak": peak,
-        "lo": int(lo),
-        "hi": int(hi),
-        "width_bins": int(hi - lo + 1),
-    }
-
-
-def mass_above(profile: Sequence[float], *, fraction: float = PEAK_FRACTION) -> Dict[str, Any]:
-    """How much of the profile's total sits in bins at or above a fraction of the peak.
-
-    The concentration the argmax does not report: a profile whose peak holds four fifths of the
-    attribution and one whose peak holds a twentieth have the same argmax and are different
-    findings.
-
-    Args:
-        profile: One value per lag.
-        fraction: Height threshold, as a fraction of the peak.
-
-    Returns:
-        The share of the total in those bins, how many bins they are, and the threshold used.
-    """
-    values = np.asarray(list(profile), dtype=np.float64)
-    finite = values[np.isfinite(values)]
-    total = float(finite.sum()) if finite.size else 0.0
-    if not finite.size or total <= 0.0:
-        return {"share": float("nan"), "n_bins": 0, "threshold": float("nan")}
-    threshold = float(finite.max()) * float(fraction)
-    selected = finite[finite >= threshold]
-    return {
-        "share": float(selected.sum() / total),
-        "n_bins": int(selected.size),
-        "threshold": threshold,
-    }
-
-
-def secondary_peaks(
-    profile: Sequence[float], *, fraction: float = PEAK_FRACTION, min_separation: int = 1
-) -> List[Dict[str, Any]]:
-    """Find local maxima other than the tallest, above a fraction of it.
-
-    A second peak is a finding rather than noise: it says the source informs the forecast at two
-    separated delays, which an argmax reports as one of them and a mean reports as neither.
-
-    Args:
-        profile: One value per lag.
-        fraction: How tall, relative to the global peak, a local maximum must be to count.
-        min_separation: How many bins a local maximum must stand clear of the global peak.
-
-    Returns:
-        One record per secondary peak -- its lag, its value and its share of the global peak --
-        ordered by height, tallest first.
-    """
-    values = np.asarray(list(profile), dtype=np.float64)
-    if values.size < 3 or not np.isfinite(values).any():
-        return []
-    finite = np.where(np.isfinite(values), values, -np.inf)
-    argmax = int(np.argmax(finite))
-    peak = float(finite[argmax])
-    if not np.isfinite(peak) or peak <= 0.0:
-        return []
-    threshold = peak * float(fraction)
-    found: List[Dict[str, Any]] = []
-    for index in range(1, finite.size - 1):
-        if abs(index - argmax) <= int(min_separation):
-            continue
-        value = float(finite[index])
-        if value >= threshold and value >= finite[index - 1] and value >= finite[index + 1]:
-            found.append({"lag_step": index, "value": value, "share_of_peak": value / peak})
-    return sorted(found, key=lambda record: -record["value"])
-
-
-def degeneracy(profile: Sequence[float]) -> Dict[str, Any]:
-    """Decide mechanically whether a profile has a shape worth reading at all.
-
-    Two ways it does not, and they are different failures. A **flat** profile -- peak barely above
-    the median -- has an argmax that names whichever bin won a coin toss. A profile that is almost
-    entirely **exact zeros** has a shape set by which handful of bins ``entmax15`` kept alive.
-
-    Args:
-        profile: One value per lag.
-
-    Returns:
-        The flag, the two measured statistics behind it, the thresholds they were judged against,
-        and the reasons that fired. An empty profile is degenerate, with that as its reason.
-    """
-    values = np.asarray(list(profile), dtype=np.float64)
-    finite = values[np.isfinite(values)]
-    if finite.size == 0:
-        return {
-            "degenerate": True,
-            "peak_to_median": float("nan"),
-            "zero_fraction": float("nan"),
-            "peak_to_median_threshold": DEGENERATE_PEAK_TO_MEDIAN,
-            "zero_fraction_threshold": DEGENERATE_ZERO_FRACTION,
-            "reasons": ["the profile carries no finite value"],
-        }
-    median = float(np.median(finite))
-    peak = float(finite.max())
-    # A zero median makes the ratio infinite rather than undefined, which is the right reading:
-    # a peak standing over an all-zero bulk is as far from flat as a profile gets.
-    ratio = float("inf") if median == 0.0 and peak > 0.0 else (
-        peak / median if median != 0.0 else float("nan")
-    )
-    zero_fraction = float((finite == 0.0).sum() / finite.size)
-    reasons: List[str] = []
-    if np.isfinite(ratio) and ratio < DEGENERATE_PEAK_TO_MEDIAN:
-        reasons.append(
-            f"peak-to-median {ratio:.3g} is below {DEGENERATE_PEAK_TO_MEDIAN}, so the peak is not "
-            f"distinguishable from the bulk and its argmax names a bin rather than a lag"
-        )
-    if zero_fraction > DEGENERATE_ZERO_FRACTION:
-        reasons.append(
-            f"{zero_fraction:.1%} of the bins are exactly zero, above "
-            f"{DEGENERATE_ZERO_FRACTION:.0%}, so the shape is set by which bins survived "
-            f"sparsification rather than by where the source informed"
-        )
-    return {
-        "degenerate": bool(reasons),
-        "peak_to_median": ratio,
-        "zero_fraction": zero_fraction,
-        "peak_to_median_threshold": DEGENERATE_PEAK_TO_MEDIAN,
-        "zero_fraction_threshold": DEGENERATE_ZERO_FRACTION,
-        "reasons": reasons,
-    }
 
 
 #: The three profiles, as ``(reported name, the lag block's key, the reported column, what it is)``.
@@ -955,7 +797,7 @@ def run_lag_kl_analysis(
     pd.DataFrame(stratified_peaks).to_csv(directory / STRATIFIED_PEAKS_FILENAME, index=False)
 
     figure_name = str(
-        figures.render_to_pdf(
+        figures.render_figure(
             build_profile_figure(profile, lag, delay_steps=delay_steps, n_lags=n_lags),
             directory / PROFILE_FIGURE,
         ).name

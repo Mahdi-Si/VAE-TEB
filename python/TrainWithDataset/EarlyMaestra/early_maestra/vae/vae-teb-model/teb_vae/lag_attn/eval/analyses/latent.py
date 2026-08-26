@@ -174,7 +174,7 @@ def _write_per_dim_figure(
         ax.set_ylabel("$\\overline{KL}_d$ (nats)")
         ax.legend(fontsize=7, loc="best")
         figures.style_axes(ax)
-        paths.append(str(figures.render_to_pdf(figure, directory / "per_dim_kl.pdf")))
+        paths.append(str(figures.render_figure(figure, directory / "per_dim_kl")))
     finally:
         figures.plt.close(figure)
 
@@ -209,7 +209,7 @@ def _write_per_dim_figure(
         ax.set_ylabel("$\\overline{KL}_d$ (nats)")
         ax.legend(fontsize=7, loc="best")
         figures.style_axes(ax)
-        paths.append(str(figures.render_to_pdf(figure, directory / "per_dim_violin.pdf")))
+        paths.append(str(figures.render_figure(figure, directory / "per_dim_violin")))
     finally:
         figures.plt.close(figure)
     return paths
@@ -261,7 +261,7 @@ def _write_kt_figure(
                 fontsize=6, color=figures.COLOR_GRAY,
             )
         figures.style_axes(ax)
-        return str(figures.render_to_pdf(figure, directory / "kt_curve.pdf"))
+        return str(figures.render_figure(figure, directory / "kt_curve"))
     finally:
         figures.plt.close(figure)
 

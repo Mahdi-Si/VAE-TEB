@@ -63,8 +63,8 @@ ENTROPY_FILENAME = "attention_entropy.csv"
 PER_RECORDING_FILENAME = "attention_per_recording.csv"
 
 #: The figures, named as ``FIGURE_GUIDE.md`` names them.
-PROFILE_FIGURE = "attention_profile.pdf"
-HEATMAP_FIGURE = "lag_heatmap.pdf"
+PROFILE_FIGURE = "attention_profile"
+HEATMAP_FIGURE = "lag_heatmap"
 
 #: The retained tensor the heatmap needs, and the cap that decides whether it exists.
 ATTENTION_TENSOR = "attn_weights"
@@ -469,7 +469,7 @@ def run_attention_analysis(
 
     written: List[str] = [
         str(
-            figures.render_to_pdf(
+            figures.render_figure(
                 build_profile_figure(
                     profile, per_head, delay_steps=delay_steps, n_lags=n_lags,
                     truncation=truncation,
@@ -563,4 +563,4 @@ def _emit_heatmap(
     figure = build_heatmap_figure(
         np.asarray(attention), row=0, delay_steps=delay_steps, geometry=geometry
     )
-    return str(figures.render_to_pdf(figure, directory / HEATMAP_FIGURE).name)
+    return str(figures.render_figure(figure, directory / HEATMAP_FIGURE).name)

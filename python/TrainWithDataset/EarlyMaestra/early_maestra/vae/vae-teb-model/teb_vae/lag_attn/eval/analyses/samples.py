@@ -83,11 +83,11 @@ def sample_filename(guid: str, epoch: Optional[float], index: int) -> str:
         index: The sample's global index in the loader.
 
     Returns:
-        The filename, including the ``.pdf`` suffix.
+        The filename **stem**; ``render_figure`` appends the run's configured format.
     """
     safe = "".join(char for char in str(guid) if char in _SAFE_GUID_CHARS)[:32] or "unknown"
     stamp = "na" if epoch is None or not np.isfinite(epoch) else f"{float(epoch):.2f}"
-    return f"sample{int(index):04d}_{safe}_epoch{stamp}.pdf"
+    return f"sample{int(index):04d}_{safe}_epoch{stamp}"
 
 
 def _epoch_of(batch: Any, offset: int) -> Optional[float]:
@@ -207,12 +207,12 @@ def _render_one(
         # tight=False: the page sets its own GridSpec margins, and tight_layout both warns that
         # it cannot handle the twinned and colorbar axes and would undo the alignment that is
         # the whole point of the reserved colorbar column.
-        figures.render_to_pdf(figure, directory / name, tight=False)
-        return name
+        page = figures.render_figure(figure, directory / name, tight=False)
+        return page.name
     finally:
         # The builder is inside the ``try`` because a failure *there* is exactly what the
         # caller's per-sample guard absorbs -- and a figure left open by it would never be
-        # reclaimed, one per selected sample. ``render_to_pdf`` closes on success; closing an
+        # reclaimed, one per selected sample. ``render_figure`` closes on success; closing an
         # already-closed figure is a no-op.
         if figure is not None:
             figures.plt.close(figure)

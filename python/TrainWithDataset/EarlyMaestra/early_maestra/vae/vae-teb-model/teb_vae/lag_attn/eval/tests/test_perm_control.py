@@ -258,7 +258,7 @@ def test_the_overlay_caption_states_that_a_higher_shuffled_kl_is_not_a_failure(
 ) -> None:
     """The caption is the mitigation for a high-likelihood misreading, so it is worth pinning."""
     captured: dict = {}
-    original = figures.render_to_pdf
+    original = figures.render_figure
 
     def _capture(fig, path, **kwargs):
         captured[Path(path).name] = {
@@ -268,17 +268,17 @@ def test_the_overlay_caption_states_that_a_higher_shuffled_kl_is_not_a_failure(
         }
         return original(fig, path, **kwargs)
 
-    monkeypatch.setattr(figures, "render_to_pdf", _capture)
+    monkeypatch.setattr(figures, "render_figure", _capture)
     runner = make_eval_runner(output_dir=tmp_path / "runner")
     perturb_full_pathway(runner.model)
     _run(runner, tiny_loader, tiny_eval_config["eval_config"], tmp_path / "caption")
 
-    caption = " ".join(captured["kl_overlay.pdf"]["texts"])
+    caption = " ".join(captured["kl_overlay"]["texts"])
     assert "NOT a failure" in caption
     assert "K_shuffled >= K_true is EXPECTED" in caption
-    assert all(captured["kl_overlay.pdf"]["has_data"])
+    assert all(captured["kl_overlay"]["has_data"])
 
-    losses = captured["losses.pdf"]
+    losses = captured["losses"]
     assert any(title.startswith("Source-specificity control") for title in losses["titles"])
     assert any("criterion" in text for text in losses["texts"])
     assert all(losses["has_data"])

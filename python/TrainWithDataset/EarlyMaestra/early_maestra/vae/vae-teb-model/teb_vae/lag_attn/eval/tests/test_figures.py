@@ -143,7 +143,7 @@ def test_importing_figures_does_not_mutate_global_rcparams() -> None:
     callable with a fresh function object for the rest of the session; the sibling seams bound
     the originals at *their* import time, so
     ``teb_vae/lag_attn_cfs/tests/test_eval_figures.py``'s
-    ``assert figures_seam.render_to_pdf is shared_figures.render_to_pdf`` then fails for a reason
+    ``assert figures_seam.render_figure is shared_figures.render_figure`` then fails for a reason
     that has nothing to do with the seam. A subprocess measures the true import and leaves this
     process's module graph untouched.
     """
@@ -356,14 +356,62 @@ def test_as_columns_refuses_a_name_count_that_does_not_match() -> None:
         figures.as_columns(np.zeros((4, 3)), ["a", "b"])
 
 
-def test_render_to_pdf_writes_a_pdf_and_closes_the_figure(tmp_path) -> None:
-    """PDF only, matching the repository convention and the existing figure tests."""
+def test_render_figure_appends_the_active_format_and_closes_the_figure(tmp_path) -> None:
+    """The caller passes a stem; the extension is the run's, and the figure is closed either way."""
     fig, axes = figures.new_figure(1)
     axes[0, 0].plot([0, 1], [0, 1])
-    path = tmp_path / "panel.pdf"
-    figures.render_to_pdf(fig, path)
-    assert path.is_file() and path.stat().st_size > 0
+
+    written = figures.render_figure(fig, tmp_path / "panel")
+
+    assert written == tmp_path / "panel.pdf"
+    assert written.is_file() and written.stat().st_size > 0
     assert not plt.fignum_exists(fig.number)
+
+
+def test_render_figure_follows_the_format_that_was_set(tmp_path) -> None:
+    """The whole point of the config key: the same call writes a different file.
+
+    Restored in a ``finally`` because the format is process-global -- leaving it on ``svg`` would
+    silently change what every later test in this session writes.
+    """
+    previous = figures.active_figure_format()
+    try:
+        figures.set_figure_format("svg")
+        fig, axes = figures.new_figure(1)
+        axes[0, 0].plot([0, 1], [0, 1])
+
+        written = figures.render_figure(fig, tmp_path / "panel")
+
+        assert written == tmp_path / "panel.svg"
+        assert written.read_text(encoding="utf-8").lstrip().startswith("<?xml")
+    finally:
+        figures.set_figure_format(previous)
+
+
+def test_a_leading_dot_and_upper_case_are_accepted_but_an_unknown_format_is_refused() -> None:
+    """A config value is operator-typed, so ``.SVG`` must work and ``docx`` must say why not."""
+    previous = figures.active_figure_format()
+    try:
+        assert figures.set_figure_format(".SVG") == "svg"
+        with pytest.raises(ValueError, match="unsupported figure format"):
+            figures.set_figure_format("docx")
+        assert figures.active_figure_format() == "svg", "a refused format must not take effect"
+    finally:
+        figures.set_figure_format(previous)
+
+
+def test_render_figure_refuses_a_path_that_already_carries_an_extension(tmp_path) -> None:
+    """Guards the one mistake the stem convention can leave behind: a surviving hardcoded suffix.
+
+    Appending to it would write ``panel.pdf.svg`` and the figure would go missing from every
+    listing that globs the run's format.
+    """
+    fig, _ = figures.new_figure(1)
+    try:
+        with pytest.raises(ValueError, match="stem without an extension"):
+            figures.render_figure(fig, tmp_path / "panel.pdf")
+    finally:
+        plt.close(fig)
 
 
 # ---------------------------------------------------------------------------

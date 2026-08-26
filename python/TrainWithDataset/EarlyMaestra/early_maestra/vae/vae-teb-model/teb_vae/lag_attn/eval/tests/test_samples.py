@@ -53,13 +53,13 @@ def _run(runner, loader, tmp_path, probe=None, **config_overrides):
 # ---------------------------------------------------------------------------
 def test_the_filename_carries_the_index_the_guid_and_the_epoch():
     name = samples_analysis.sample_filename("abc-123", 4.5, 12)
-    assert name == "sample0012_abc-123_epoch4.50.pdf"
+    assert name == "sample0012_abc-123_epoch4.50"
 
 
 def test_a_path_unsafe_guid_is_sanitised_rather_than_written_through():
     """A GUID is an opaque record identifier with no path-safety guarantee."""
     name = samples_analysis.sample_filename("a/b\\c:d", None, 0)
-    assert name == "sample0000_abcd_epochna.pdf"
+    assert name == "sample0000_abcd_epochna"
     assert "/" not in name and "\\" not in name and ":" not in name
 
 

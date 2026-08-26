@@ -218,7 +218,7 @@ def _write_figures(
             xlabel="Horizon step $h$", ylabel="Masked MSE", label="median over samples",
         )
         written["horizon_error"] = str(
-            figures.render_to_pdf(figure, directory / "horizon_error.pdf")
+            figures.render_figure(figure, directory / "horizon_error")
         )
     finally:
         figures.plt.close(figure)
@@ -233,7 +233,7 @@ def _write_figures(
             label="median over samples",
         )
         written["anchor_error"] = str(
-            figures.render_to_pdf(figure, directory / "anchor_error.pdf")
+            figures.render_figure(figure, directory / "anchor_error")
         )
     finally:
         figures.plt.close(figure)
@@ -250,7 +250,7 @@ def _write_figures(
             reference_label="$R^2 = 0$ (predicting the channel mean)",
         )
         written["distributions"] = str(
-            figures.render_to_pdf(figure, directory / "distributions.pdf")
+            figures.render_figure(figure, directory / "distributions")
         )
     finally:
         figures.plt.close(figure)
@@ -271,7 +271,7 @@ def _write_figures(
                 symmetric=symmetric, separator_row=separator,
                 colorbar_label="RMS" if key == "residual_rms" else "value",
             )
-        written["heatmaps"] = str(figures.render_to_pdf(figure, directory / "heatmaps.pdf"))
+        written["heatmaps"] = str(figures.render_figure(figure, directory / "heatmaps"))
     finally:
         figures.plt.close(figure)
 

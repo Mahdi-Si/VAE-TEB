@@ -167,7 +167,7 @@ def _write_heatmaps(
             fontsize=7,
             y=0.999,
         )
-        return str(figures.render_to_pdf(figure, directory / "attention_heatmaps.pdf"))
+        return str(figures.render_figure(figure, directory / "attention_heatmaps"))
     finally:
         figures.plt.close(figure)
 
@@ -240,7 +240,7 @@ def _write_summary_figure(
             fontsize=7,
             y=0.999,
         )
-        return str(figures.render_to_pdf(figure, directory / "attention.pdf"))
+        return str(figures.render_figure(figure, directory / "attention"))
     finally:
         figures.plt.close(figure)
 

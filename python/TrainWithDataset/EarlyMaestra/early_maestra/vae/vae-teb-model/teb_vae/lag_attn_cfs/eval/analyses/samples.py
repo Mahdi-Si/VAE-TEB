@@ -144,7 +144,7 @@ EXPECTED_PAGE_ROWS = 15
 #: full one. A suffix rather than a directory on purpose: the two pages are one segment's, and a
 #: reader who has found the segment has found both.
 FILENAME_PATTERN = re.compile(
-    r"sample\d{4}_[A-Za-z0-9_-]{1,32}_epoch(-?\d+|na)(_compact)?\.pdf"
+    r"sample\d{4}_[A-Za-z0-9_-]{1,32}_epoch(-?\d+|na)(_compact)?"
 )
 
 #: The ``variant`` values the manifest records, and the tail that distinguishes the reduced
@@ -220,13 +220,14 @@ def page_filename(index: int, guid: Any, epoch: Any, *, compact: bool = False) -
             reader who has found one has found the other.
 
     Returns:
-        ``sample<index>_<guid>_epoch<epoch|na>[_compact].pdf``.
+        ``sample<index>_<guid>_epoch<epoch|na>[_compact]``, a stem; ``render_figure``
+        appends the run's configured format.
     """
     stamp = epoch_stamp(epoch)
     return (
         f"sample{int(index):04d}_{sanitise_guid(guid)}_"
         f"epoch{'na' if stamp is None else stamp}"
-        f"{COMPACT_SUFFIX if compact else ''}.pdf"
+        f"{COMPACT_SUFFIX if compact else ''}"
     )
 
 
@@ -549,8 +550,8 @@ def render_pages(
                     rows=page_rows,
                     log_lag_attention=log_lag_attention,
                 )
-                figures.render_to_pdf(figure, directory / name)
-                written.append({"variant": variant, "file": name})
+                page = figures.render_figure(figure, directory / name)
+                written.append({"variant": variant, "file": page.name})
             except Exception as error:  # noqa: BLE001 - one page is not worth the rest of them
                 logger.warning(
                     f"{ANALYSIS_DIRNAME}: {variant} page for dataset index {index} failed: "

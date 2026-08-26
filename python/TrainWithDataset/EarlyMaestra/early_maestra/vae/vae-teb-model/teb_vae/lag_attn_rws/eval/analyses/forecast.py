@@ -77,10 +77,10 @@ HORIZON_FILENAME = "forecast_horizon.csv"
 ANCHOR_FILENAME = "forecast_anchor_profile.csv"
 
 #: The figures, named as ``FIGURE_GUIDE.md`` will name them.
-BASELINE_FIGURE = "baseline_comparison.pdf"
-ANCHOR_FIGURE = "anchor_profile.pdf"
-OVERLAY_FIGURE = "forecast_overlay.pdf"
-HORIZON_FIGURE = "horizon_skill.pdf"
+BASELINE_FIGURE = "baseline_comparison"
+ANCHOR_FIGURE = "anchor_profile"
+OVERLAY_FIGURE = "forecast_overlay"
+HORIZON_FIGURE = "horizon_skill"
 
 #: The model branches whose skill is reported. The two negative controls are the coupling
 #: analysis's subject, not the forecast's: a stranger's source is not a forecast of anything.
@@ -572,13 +572,13 @@ def run_forecast_analysis(
 
     unit = str(error_rows[0]["unit"]) if error_rows else NORMALISED_UNIT
     written: List[str] = [
-        str(figures.render_to_pdf(
+        str(figures.render_figure(
             build_baseline_figure(per_guid, skill_rows, unit=unit), directory / BASELINE_FIGURE
         ).name),
-        str(figures.render_to_pdf(
+        str(figures.render_figure(
             build_anchor_profile_figure(profile, geometry)[0], directory / ANCHOR_FIGURE
         ).name),
-        str(figures.render_to_pdf(
+        str(figures.render_figure(
             build_horizon_figure(curves, horizon_steps=int(geometry.get("horizon", 0))),
             directory / HORIZON_FIGURE,
         ).name),
@@ -653,4 +653,4 @@ def _emit_overlay(
     figure = build_overlay_figure(
         retained, row=0, anchor=anchor, geometry=geometry, normalization=normalization
     )
-    return str(figures.render_to_pdf(figure, directory / OVERLAY_FIGURE).name)
+    return str(figures.render_figure(figure, directory / OVERLAY_FIGURE).name)

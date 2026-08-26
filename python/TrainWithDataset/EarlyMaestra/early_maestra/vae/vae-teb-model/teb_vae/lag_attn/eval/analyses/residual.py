@@ -154,7 +154,7 @@ def run_residual_analysis(
             xlabel="Anchor $t$ (decimated steps)",
             ylabel="$\\mathrm{rms}(\\delta\\mu_{src})$", label="median over samples",
         )
-        figure_path = str(figures.render_to_pdf(figure, directory / "residual.pdf"))
+        figure_path = str(figures.render_figure(figure, directory / "residual"))
     finally:
         figures.plt.close(figure)
 

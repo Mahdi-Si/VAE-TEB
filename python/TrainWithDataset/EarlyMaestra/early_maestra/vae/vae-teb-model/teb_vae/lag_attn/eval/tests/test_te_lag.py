@@ -342,7 +342,7 @@ def test_both_figures_carry_a_physical_second_axis(
     make_eval_runner, tiny_loader, tiny_eval_config, tmp_path, monkeypatch, perturb_full_pathway
 ) -> None:
     captured: dict = {}
-    original = figures.render_to_pdf
+    original = figures.render_figure
 
     def _capture(fig, path, **kwargs):
         captured[Path(path).name] = {
@@ -357,14 +357,14 @@ def test_both_figures_carry_a_physical_second_axis(
         }
         return original(fig, path, **kwargs)
 
-    monkeypatch.setattr(figures, "render_to_pdf", _capture)
+    monkeypatch.setattr(figures, "render_figure", _capture)
     runner = make_eval_runner(output_dir=tmp_path / "runner")
     perturb_full_pathway(runner.model)
     _run(runner, tiny_loader, tiny_eval_config["eval_config"], tmp_path / "figures")
 
-    assert set(captured) == {"te_lag.pdf", "per_head_lag_profile.pdf"}
-    assert len(captured["te_lag.pdf"]["titles"]) == 3
-    assert captured["te_lag.pdf"]["secondary"] == ["Physical delay (s)"]
-    assert all(captured["te_lag.pdf"]["has_data"])
-    assert captured["per_head_lag_profile.pdf"]["secondary"] == ["Physical delay (s)"]
-    assert all(captured["per_head_lag_profile.pdf"]["has_data"])
+    assert set(captured) == {"te_lag", "per_head_lag_profile"}
+    assert len(captured["te_lag"]["titles"]) == 3
+    assert captured["te_lag"]["secondary"] == ["Physical delay (s)"]
+    assert all(captured["te_lag"]["has_data"])
+    assert captured["per_head_lag_profile"]["secondary"] == ["Physical delay (s)"]
+    assert all(captured["per_head_lag_profile"]["has_data"])

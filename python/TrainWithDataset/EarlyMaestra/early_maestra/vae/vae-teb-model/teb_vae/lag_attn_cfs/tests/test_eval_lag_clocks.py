@@ -40,7 +40,11 @@ from teb_vae.lag_attn.eval import figures as shared_figures
 from teb_vae.lag_attn_cfs.eval import cohort
 from teb_vae.lag_attn_cfs.eval._reuse import labels
 from teb_vae.lag_attn_cfs.eval.analyses import lag_clocks as analysis
-from teb_vae.lag_attn_cfs.eval.lag_axis import compensated_seconds_axis
+from teb_vae.lag_attn_cfs.eval.lag_axis import (
+    COEFFICIENT_LAG_AXIS_LABEL,
+    compensated_seconds_axis,
+)
+from teb_vae.lag_attn_cfs.eval.lag_shape import profile_statistics
 
 #: One hour, in the seconds both clock fields are stored in.
 _HOUR = 3600.0
@@ -147,7 +151,7 @@ def _run(context: Any, tmp_path: Any) -> Tuple[Dict[str, Any], Any]:
 
 
 # =================================================================================================
-# The two scalars
+# The per-segment scalars
 # =================================================================================================
 def test_the_centroid_and_spread_are_the_hand_computed_answer() -> None:
     r"""Three profiles whose answers can be written down.
@@ -164,16 +168,16 @@ def test_the_centroid_and_spread_are_the_hand_computed_answer() -> None:
     split = np.zeros(_N_LAGS)
     split[0] = split[10] = 1.0
 
-    centroid, spread, record = analysis.centroid_and_spread(np.stack([single, split]), seconds)
+    statistics, record = profile_statistics(np.stack([single, split]), seconds)
 
-    assert centroid == pytest.approx([12.0, 20.0])
-    assert spread == pytest.approx([0.0, 20.0])
+    assert statistics["centroid"] == pytest.approx([12.0, 20.0])
+    assert statistics["spread"] == pytest.approx([0.0, 20.0])
     assert (record["n_rows"], record["n_usable"]) == (2, 2)
 
-    delayed, _, _ = analysis.centroid_and_spread(
+    delayed, _ = profile_statistics(
         np.stack([single, split]), compensated_seconds_axis(_N_LAGS, 2)
     )
-    assert delayed == pytest.approx([20.0, 28.0])
+    assert delayed["centroid"] == pytest.approx([20.0, 28.0])
 
 
 def test_a_profile_carrying_no_evidence_is_nan_and_counted() -> None:
@@ -186,9 +190,8 @@ def test_a_profile_carrying_no_evidence_is_nan_and_counted() -> None:
     negative = good.copy()
     negative[7] = -1.0
 
-    centroid, spread, record = analysis.centroid_and_spread(
-        np.stack([good, empty, negative]), seconds
-    )
+    statistics, record = profile_statistics(np.stack([good, empty, negative]), seconds)
+    centroid, spread = statistics["centroid"], statistics["spread"]
 
     assert np.isfinite(centroid[0]) and np.isfinite(spread[0])
     assert not np.isfinite(centroid[1]) and not np.isfinite(centroid[2])
@@ -198,11 +201,11 @@ def test_a_profile_carrying_no_evidence_is_nan_and_counted() -> None:
 def test_a_profile_of_the_wrong_width_is_refused_rather_than_reshaped() -> None:
     """A vector that does not match the lag axis is a mis-assembled profile, and padding it into a
     plausible wrong answer is what this refuses."""
-    centroid, _, record = analysis.centroid_and_spread(
+    statistics, record = profile_statistics(
         np.ones((3, _N_LAGS - 2)), compensated_seconds_axis(_N_LAGS, 0)
     )
 
-    assert not np.isfinite(centroid).any()
+    assert not np.isfinite(statistics["centroid"]).any()
     assert record["n_usable"] == 0 and "mis-assembled" in record["note"]
 
 
@@ -304,8 +307,10 @@ def test_separated_classes_are_significant_in_the_windows_they_are_separated_in(
         analysis.SIGNIFICANCE_FILENAME,
         analysis.TRAJECTORY_FILENAME,
         "lag_second_stage.pdf",
+        "lag_second_stage_features.pdf",
         "lag_second_stage_windows.pdf",
         "lag_time_to_delivery.pdf",
+        "lag_time_to_delivery_features.pdf",
         "lag_time_to_delivery_windows.pdf",
     ]
 
@@ -382,21 +387,52 @@ def test_each_clock_and_readout_is_its_own_holm_family(tmp_path) -> None:
 # =================================================================================================
 # What the record and the page carry
 # =================================================================================================
-def test_the_record_carries_the_axis_caveat_and_refuses_the_peak(tmp_path) -> None:
+def test_the_record_carries_the_axis_caveat_and_guards_the_peak(tmp_path) -> None:
     """The caveat travels in ``summary.json`` as well as under the figures, because the summary is
-    the artifact that gets quoted. And the positional reading this analysis does not make is named
-    where it does live, rather than left as an absence a reader has to notice."""
+    the artifact that gets quoted.
+
+    And the peak this analysis *does* report cannot reach a table without its guard beside it.
+    ``entmax15`` assigns lags exactly zero, so a flat profile still has a perfectly confident
+    argmax; the mechanical criterion that says whether the position means anything is a column on
+    the same row, and the thresholds it was judged against are in the record. Asserted structurally
+    rather than as wording: a peak column emitted without its degeneracy column is the failure, and
+    it would read as an ordinary trajectory."""
     per_sample, vectors = _collection(n_recordings=3)
 
     record, directory = _run(_context(per_sample, vectors), tmp_path)
 
     assert "stored-coefficient time" in record["axis_caveat"]
+    assert "lag_peak_degenerate" in record["peak_reference"]
+    # The pooled positional reading still belongs to lag_kl, and the record still says so.
     assert "lag_kl_stratified_peaks.csv" in record["peak_reference"]
     assert record["plan"]["capped"] is True
-    # No argmax reaches any table: the refusal is mechanical rather than a matter of wording.
-    for name in (analysis.PER_RECORDING_FILENAME, analysis.TRAJECTORY_FILENAME):
-        columns = " ".join(pd.read_csv(directory / name).columns)
-        assert "argmax" not in columns and "peak" not in columns
+    thresholds = record["statistic_thresholds"]
+    assert thresholds["degenerate_peak_to_median"] == analysis.DEGENERATE_PEAK_TO_MEDIAN
+    assert thresholds["degenerate_zero_fraction"] == analysis.DEGENERATE_ZERO_FRACTION
+
+    for source in analysis.PROFILE_SOURCES:
+        columns = set(pd.read_csv(directory / analysis.PER_RECORDING_FILENAME).columns)
+        assert f"lag_peak_{source.key}_s" in columns
+        assert f"lag_peak_degenerate_{source.key}" in columns
+    metrics = set(pd.read_csv(directory / analysis.TRAJECTORY_FILENAME)["metric"])
+    for source in analysis.PROFILE_SOURCES:
+        assert f"lag_peak_{source.key}_s" in metrics
+        assert f"lag_peak_degenerate_{source.key}" in metrics
+
+
+def test_no_untested_statistic_reaches_the_significance_tables(tmp_path) -> None:
+    """Twelve of the fourteen are drawn and tabled but carry no $p$-value, and that is what keeps
+    each clock's Holm family at two. A statistic that quietly entered the inference would multiply
+    the families without anything on the page saying the correction had changed."""
+    per_sample, vectors = _collection(n_recordings=3)
+
+    _, directory = _run(_context(per_sample, vectors), tmp_path)
+
+    tested = {feature.column for feature in analysis.READOUTS}
+    assert tested == {"lag_centroid_kl_s", "lag_centroid_attn_s"}
+    for name in (analysis.SIGNIFICANCE_FILENAME, analysis.PAIRWISE_FILENAME):
+        frame = pd.read_csv(directory / name)
+        assert set(frame["metric_column"]) <= tested, name
 
 
 def test_the_share_field_is_a_distribution_over_lags_in_every_window() -> None:
@@ -448,6 +484,44 @@ def test_the_profile_page_draws_one_panel_per_class_on_one_colour_scale() -> Non
 
     assert len(images) == len(fields) == 3
     assert len(limits) == 1
+
+
+def test_the_features_page_draws_every_untested_statistic_with_both_profiles() -> None:
+    """One panel per drawn statistic, and on each of them the attribution *and* the attention.
+
+    Pairing the two profiles on one axis is the analysis's central argument -- the attribution is
+    $K_t$ times the attention and inherits an inflation the attention is immune to, so a statistic
+    that moves in one and not the other is a finding about which is being read, and it is only
+    visible when the two share an axis. A page drawing one of them would look entirely ordinary.
+    """
+    per_sample, vectors = _collection()
+    seconds = compensated_seconds_axis(_N_LAGS, 0)
+    featured, _ = analysis.add_feature_columns(per_sample, vectors, seconds)
+    clock = analysis.CLOCKS[0]
+    binned, _ = analysis.clock_rows(clock, featured)
+    rows = analysis.trajectory_rows(clock, analysis.per_recording_frames(clock, binned))
+
+    figure = analysis.build_features_figure(clock, rows)
+    try:
+        panels = [axis for axis in figure.axes if axis.get_title()]
+        styles = {
+            axis.get_title(): {line.get_linestyle() for line in axis.get_lines()}
+            for axis in panels
+        }
+        labelled = {axis.get_title(): axis.get_ylabel() for axis in panels}
+    finally:
+        shared_figures.plt.close(figure)
+
+    assert len(panels) == len(analysis.DRAWN_STATISTICS)
+    for title, dashes in styles.items():
+        assert "--" in dashes, title
+    # Every panel names its own unit: half of what is drawn here is not in seconds, and a panel
+    # inheriting the lag axis label would state the wrong one rather than none.
+    for statistic in analysis.DRAWN_STATISTICS:
+        title = f"{statistic.key} against the clock, by {labels.CLASS_COLUMN}"
+        assert labelled[title] == (
+            statistic.unit or COEFFICIENT_LAG_AXIS_LABEL
+        ), title
 
 
 def test_the_windows_page_rows_read_less_severe_against_worse() -> None:

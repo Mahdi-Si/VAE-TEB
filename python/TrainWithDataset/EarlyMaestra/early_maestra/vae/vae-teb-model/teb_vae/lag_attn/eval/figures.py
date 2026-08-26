@@ -24,6 +24,7 @@ an empty, labelled figure rather than take down a multi-hour run at its final st
 """
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any, Optional, Sequence, Tuple
 
 import numpy as np
@@ -33,6 +34,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 from matplotlib import cbook  # noqa: E402
+from matplotlib.backend_bases import FigureCanvasBase  # noqa: E402
 
 from teb_vae.lag_attn.figure_primitives import (  # noqa: E402
     COLOR_BLACK,
@@ -67,7 +69,10 @@ __all__ = [
     "COLOR_ORANGE",
     "COLOR_PURPLE",
     "COLOR_VERMILLION",
+    "DEFAULT_FIGURE_FORMAT",
     "SAVE_DPI",
+    "SUPPORTED_FIGURE_FORMATS",
+    "active_figure_format",
     "attach_lag_seconds_axis",
     "binned_violin_panel",
     "configure_figure_style",
@@ -79,9 +84,11 @@ __all__ = [
     "histogram_panel",
     "label_rows",
     "multi_line_panel",
+    "render_figure",
     "ribbon_plot",
     "safe_vabs",
     "save_figure",
+    "set_figure_format",
     "shade_warmup",
     "significance_strip",
     "style_axes",
@@ -93,12 +100,79 @@ __all__ = [
 EMPTY_NOTE = "no finite values"
 
 
-def configure_figure_style() -> None:
-    """Apply the repository's publication rcParams. Called once at pipeline start.
+#: The format a run writes when its config names none. PDF because every committed
+#: ``figure_manifest.json`` and ``FIGURE_GUIDE.md`` in this repository records ``.pdf`` names, and
+#: those are compared against a real run: changing this default would invalidate all of them at
+#: once. A run that wants another format says so in ``eval_config.figure_format``.
+DEFAULT_FIGURE_FORMAT = "pdf"
 
-    Deliberately not an import side effect -- see the module docstring.
+#: The formats a run may ask for, taken from the live matplotlib build rather than written out
+#: here. A hardcoded list is a list that goes stale against the installed backend -- and the point
+#: of validating the config key at all is to reject a typo against what this machine can actually
+#: write, not against what was true when the constant was typed.
+SUPPORTED_FIGURE_FORMATS = frozenset(FigureCanvasBase.get_supported_filetypes())
+
+#: The active format, set once per run by :func:`configure_figure_style` and read by
+#: :func:`render_figure`.
+#:
+#: **Module state rather than a threaded parameter**, and deliberately: the format is a property of
+#: the *run*, not of any one figure, and threading it would mean a new argument on roughly a
+#: hundred call sites and every ``build_*_figure`` between them -- for a value that is constant for
+#: the whole pass. This is the same shape ``apply_publication_style`` already has, which mutates
+#: global ``rcParams`` from the same one-call-at-run-start hook for the same reason.
+_ACTIVE_FIGURE_FORMAT = DEFAULT_FIGURE_FORMAT
+
+
+def active_figure_format() -> str:
+    """Return the format :func:`render_figure` currently writes.
+
+    Returns:
+        A matplotlib filetype such as ``"pdf"`` or ``"svg"``, without the leading dot.
+    """
+    return _ACTIVE_FIGURE_FORMAT
+
+
+def set_figure_format(figure_format: str) -> str:
+    """Set the format every subsequent :func:`render_figure` writes.
+
+    Args:
+        figure_format: A matplotlib filetype, with or without a leading dot; case-insensitive.
+
+    Returns:
+        The normalised format that was set.
+
+    Raises:
+        ValueError: If the format is not one this matplotlib build can write. The message names
+            the supported set, because the realistic error here is a typo in a config file.
+    """
+    global _ACTIVE_FIGURE_FORMAT
+    normalised = str(figure_format).strip().lstrip(".").lower()
+    if normalised not in SUPPORTED_FIGURE_FORMATS:
+        raise ValueError(
+            f"unsupported figure format {figure_format!r}; this matplotlib build writes "
+            f"{sorted(SUPPORTED_FIGURE_FORMATS)}."
+        )
+    _ACTIVE_FIGURE_FORMAT = normalised
+    return normalised
+
+
+def configure_figure_style(figure_format: Optional[str] = None) -> None:
+    """Apply the repository's publication rcParams and fix the run's figure format.
+
+    Called once at pipeline start. Deliberately not an import side effect -- see the module
+    docstring.
+
+    Args:
+        figure_format: The format every figure of this run is written in. ``None`` leaves the
+            active format alone, which is :data:`DEFAULT_FIGURE_FORMAT` in a process that has not
+            set one.
+
+    Raises:
+        ValueError: If ``figure_format`` is not a format this matplotlib build can write.
     """
     apply_publication_style()
+    if figure_format is not None:
+        set_figure_format(figure_format)
 
 
 def _finite(values: Any) -> np.ndarray:
@@ -1036,24 +1110,43 @@ def label_channel_blocks(ax: Any, n_scattering: int, n_total: int) -> None:
         )
 
 
-def render_to_pdf(fig: Any, path: Any, *, tight: bool = True) -> Any:
-    """Save a figure as PDF at the repository's DPI and close it.
+def render_figure(fig: Any, path: Any, *, tight: bool = True) -> Any:
+    """Save a figure in the run's configured format at the repository's DPI, and close it.
+
+    ``path`` is a **stem**: the extension is this run's, not the caller's. Every figure-name
+    constant in the eval packages is therefore extension-less, and the one place that decides
+    what is actually written is :func:`set_figure_format` -- so a run's format is a single config
+    key rather than a hundred literals that can disagree with each other.
 
     Args:
-        fig: The figure.
-        path: Destination path. The caller is responsible for the ``.pdf`` suffix.
+        fig: The figure. It is closed whether or not the save succeeds; matplotlib holds every
+            unclosed figure in a global registry, and a production pass draws hundreds.
+        path: Destination **without** an extension. A :class:`~pathlib.Path` or a string.
         tight: Apply ``tight_layout`` before saving.
 
     Returns:
-        The path written.
+        The path actually written, extension included.
+
+    Raises:
+        ValueError: If ``path`` already carries a format extension. That means a hardcoded suffix
+            survived somewhere, and appending to it would silently write ``figure.pdf.svg``;
+            failing here names the file so the stray literal can be found.
     """
+    destination = Path(str(path))
+    suffix = destination.suffix.lstrip(".").lower()
+    if suffix in SUPPORTED_FIGURE_FORMATS:
+        raise ValueError(
+            f"render_figure expects a stem without an extension, got {destination.name!r}. The "
+            f"format is the run's ({active_figure_format()!r}), set from eval_config.figure_format."
+        )
+    destination = destination.with_name(f"{destination.name}.{_ACTIVE_FIGURE_FORMAT}")
     if tight:
         try:
             fig.tight_layout()
         except Exception:  # noqa: BLE001 - a layout warning must not lose a completed figure
             pass
-    save_figure(fig, str(path), dpi=SAVE_DPI, close=True)
-    return path
+    save_figure(fig, str(destination), dpi=SAVE_DPI, close=True)
+    return destination
 
 
 def sequence_axis(length: int) -> np.ndarray:

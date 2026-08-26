@@ -138,7 +138,7 @@ def test_a_page_filename_is_always_addressable_whatever_the_guid_holds(guid) -> 
 def test_a_segment_with_no_epoch_is_named_na_rather_than_nan() -> None:
     name = samples_analysis.page_filename(3, "g0", float("nan"))
 
-    assert name == "sample0003_g0_epochna.pdf"
+    assert name == "sample0003_g0_epochna"
     assert samples_analysis.FILENAME_PATTERN.fullmatch(name)
 
 

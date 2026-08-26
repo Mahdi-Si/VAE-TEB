@@ -29,6 +29,10 @@ VALID_KEYS = frozenset(
         "health_probe_floor",
         "saturation_flag_threshold",
         "ablation_batch_size",
+        # The image format every figure of the run is written in. ``None`` -- the shipped
+        # setting -- leaves ``figures.DEFAULT_FIGURE_FORMAT`` standing, which is what every
+        # committed figure manifest records.
+        "figure_format",
     }
 )
 
@@ -44,6 +48,9 @@ DEFAULTS: Dict[str, Any] = {
     "health_probe_floor": 0.0,
     "saturation_flag_threshold": 0.05,
     "ablation_batch_size": None,
+    # Nullable on purpose: ``None`` means "whatever ``figures.DEFAULT_FIGURE_FORMAT`` is",
+    # so this file names no format of its own and the default lives in exactly one place.
+    "figure_format": None,
 }
 
 #: Upper bound on the seed: ``numpy.random.seed`` rejects anything outside $[0, 2^{32})$,
@@ -154,6 +161,40 @@ def _validate_bands(bands: Any, max_lag: int) -> Dict[str, tuple]:
     return validated
 
 
+def _require_figure_format(value: Any) -> str:
+    """Return ``value`` as a matplotlib filetype, raising if this build cannot write it.
+
+    The supported set is read from the **installed** matplotlib rather than written out here, so
+    the check cannot go stale against the backend that will actually do the writing. The import is
+    function-local to keep importing this module -- which ``probe.py`` does before it builds
+    anything -- free of matplotlib.
+
+    Args:
+        value: The configured value.
+
+    Returns:
+        The format without its leading dot, lowercased.
+
+    Raises:
+        ValueError: If the value is not a string, or names a format matplotlib cannot write. The
+            message lists the supported set, because the realistic error here is a typo.
+    """
+    from teb_vae.lag_attn.eval.figures import SUPPORTED_FIGURE_FORMATS
+
+    if not isinstance(value, str):
+        raise ValueError(
+            f"eval_config.figure_format must be a string, got {value!r} "
+            f"({type(value).__name__})."
+        )
+    normalised = value.strip().lstrip(".").lower()
+    if normalised not in SUPPORTED_FIGURE_FORMATS:
+        raise ValueError(
+            f"eval_config.figure_format must be one of {sorted(SUPPORTED_FIGURE_FORMATS)}, "
+            f"got {value!r}."
+        )
+    return normalised
+
+
 def validate_eval_config(config: Mapping[str, Any]) -> Dict[str, Any]:
     r"""Validate ``config['eval_config']`` and return it with defaults filled in.
 
@@ -258,5 +299,10 @@ def validate_eval_config(config: Mapping[str, Any]) -> Dict[str, Any]:
         resolved["ablation_batch_size"] = _require_int(
             resolved["ablation_batch_size"], "ablation_batch_size", minimum=1
         )
+
+    # Nullable, and validated only when set -- the ``max_samples`` shape. A run that names no
+    # format keeps the default, and the manifests, which record ``.pdf`` names, stay correct.
+    if resolved["figure_format"] is not None:
+        resolved["figure_format"] = _require_figure_format(resolved["figure_format"])
 
     return resolved

@@ -78,7 +78,7 @@ EXTREME_METRICS: Tuple[Tuple[str, str], ...] = (
 #: What a rendered page is called. The pattern is asserted by test, because these filenames are
 #: the only index a reader has: a GUID carrying a path separator, a space or a non-ASCII character
 #: must not be able to write outside the directory or produce a name a shell cannot address.
-FILENAME_PATTERN = re.compile(r"sample\d{4}_[A-Za-z0-9_-]{1,32}_epoch(-?\d+|na)\.pdf")
+FILENAME_PATTERN = re.compile(r"sample\d{4}_[A-Za-z0-9_-]{1,32}_epoch(-?\d+|na)")
 
 #: Characters kept from a GUID; everything else becomes ``-``.
 _SAFE_GUID = re.compile(r"[^A-Za-z0-9_-]")
@@ -124,12 +124,13 @@ def page_filename(index: int, guid: Any, epoch: Any) -> str:
         epoch: Its ``epoch``, or anything non-finite for a segment that carries none.
 
     Returns:
-        ``sample<index>_<guid>_epoch<epoch|na>.pdf``.
+        ``sample<index>_<guid>_epoch<epoch|na>``, a stem; ``render_figure`` appends the
+        run's configured format.
     """
     stamp = epoch_stamp(epoch)
     return (
         f"sample{int(index):04d}_{sanitise_guid(guid)}_"
-        f"epoch{'na' if stamp is None else stamp}.pdf"
+        f"epoch{'na' if stamp is None else stamp}"
     )
 
 
@@ -319,8 +320,8 @@ def render_pages(
                 delay_steps=int(delay_steps),
             )
             name = page_filename(index, row["guid"], row["epoch"])
-            figures.render_to_pdf(figure, directory / name)
-            written.append(name)
+            page = figures.render_figure(figure, directory / name)
+            written.append(page.name)
         except Exception as error:  # noqa: BLE001 - one page is not worth the rest of them
             logger.warning(f"{ANALYSIS_DIRNAME}: page for dataset index {index} failed: {error}")
             failures.append({"dataset_index": index, "guid": str(row["guid"]),

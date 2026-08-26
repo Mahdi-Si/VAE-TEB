@@ -1207,7 +1207,9 @@ def main(
         dump_resolved_config(config, results_dir)
         # Once, here, rather than as an import side effect: the publication style mutates global
         # rcParams, and an import that did it would restyle every other figure in the process.
-        configure_figure_style()
+        # The run's figure format is fixed in the same call and for the same reason -- it is a
+        # property of the pass, and every figure written after this line follows it.
+        configure_figure_style(eval_config["figure_format"])
 
         task = None
         blob: Optional[Dict[str, Any]] = None

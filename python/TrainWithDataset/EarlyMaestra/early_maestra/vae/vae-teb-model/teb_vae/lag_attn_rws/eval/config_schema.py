@@ -65,6 +65,10 @@ VALID_KEYS = frozenset(
         "min_active_dims",
         "event_lag_window_s",
         "bootstrap_resamples",
+        # The image format every figure of the run is written in. ``None`` -- the shipped
+        # setting -- leaves ``figures.DEFAULT_FIGURE_FORMAT`` standing, which is what every
+        # committed figure manifest records.
+        "figure_format",
     }
 )
 
@@ -85,6 +89,9 @@ DEFAULTS: Dict[str, Any] = {
     "min_active_dims": 2,
     "event_lag_window_s": 120.0,
     "bootstrap_resamples": 2000,
+    # Nullable on purpose: ``None`` means "whatever ``figures.DEFAULT_FIGURE_FORMAT`` is",
+    # so this file names no format of its own and the default lives in exactly one place.
+    "figure_format": None,
 }
 
 #: Upper bound on the seed: ``numpy.random.seed`` rejects anything outside $[0, 2^{32})$, and
@@ -302,6 +309,40 @@ def _require_positive_float(value: Any, name: str, *, minimum: float) -> float:
     return number
 
 
+def _require_figure_format(value: Any) -> str:
+    """Return ``value`` as a matplotlib filetype, raising if this build cannot write it.
+
+    The supported set is read from the **installed** matplotlib rather than written out here, so
+    the check cannot go stale against the backend that will actually do the writing. The import is
+    function-local to keep importing this module -- which ``probe.py`` does before it builds
+    anything -- free of matplotlib.
+
+    Args:
+        value: The configured value.
+
+    Returns:
+        The format without its leading dot, lowercased.
+
+    Raises:
+        ValueError: If the value is not a string, or names a format matplotlib cannot write. The
+            message lists the supported set, because the realistic error here is a typo.
+    """
+    from teb_vae.lag_attn.eval.figures import SUPPORTED_FIGURE_FORMATS
+
+    if not isinstance(value, str):
+        raise ValueError(
+            f"eval_config.figure_format must be a string, got {value!r} "
+            f"({type(value).__name__})."
+        )
+    normalised = value.strip().lstrip(".").lower()
+    if normalised not in SUPPORTED_FIGURE_FORMATS:
+        raise ValueError(
+            f"eval_config.figure_format must be one of {sorted(SUPPORTED_FIGURE_FORMATS)}, "
+            f"got {value!r}."
+        )
+    return normalised
+
+
 def validate_eval_config(config: Mapping[str, Any]) -> Dict[str, Any]:
     """Validate ``config['eval_config']`` and return it with defaults filled in.
 
@@ -364,5 +405,10 @@ def validate_eval_config(config: Mapping[str, Any]) -> Dict[str, Any]:
     resolved["bootstrap_resamples"] = _require_int(
         resolved["bootstrap_resamples"], "bootstrap_resamples", minimum=_MIN_BOOTSTRAP_RESAMPLES
     )
+
+    # Nullable, and validated only when set -- the ``max_samples`` shape. A run that names no
+    # format keeps the default, and the manifests, which record ``.pdf`` names, stay correct.
+    if resolved["figure_format"] is not None:
+        resolved["figure_format"] = _require_figure_format(resolved["figure_format"])
 
     return resolved
