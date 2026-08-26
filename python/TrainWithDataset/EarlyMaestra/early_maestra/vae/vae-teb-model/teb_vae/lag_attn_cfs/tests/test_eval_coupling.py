@@ -43,6 +43,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
+from teb_vae.lag_attn_cfs.eval.figures_seam import figure_filename
 from teb_vae.lag_attn_cfs.eval.analyses import coupling as coupling_analysis
 from teb_vae.lag_attn_cfs.eval.frames import positive_fraction
 
@@ -539,7 +540,7 @@ def test_the_analysis_writes_its_tables_and_figure(tmp_path) -> None:
     for name in (
         coupling_analysis.PER_RECORDING_FILENAME,
         coupling_analysis.SUMMARY_FILENAME,
-        coupling_analysis.DISTRIBUTION_FIGURE,
+        figure_filename(coupling_analysis.DISTRIBUTION_FIGURE),
     ):
         assert (directory / name).is_file(), name
     # One row per recording, not per segment.
@@ -570,7 +571,7 @@ def test_the_analysis_writes_the_percentages_it_can_compute(tmp_path) -> None:
     )
 
     directory = tmp_path / coupling_analysis.ANALYSIS_DIRNAME
-    assert (directory / coupling_analysis.PERCENT_FIGURE).is_file()
+    assert (directory / figure_filename(coupling_analysis.PERCENT_FIGURE)).is_file()
 
     per_recording = pd.read_csv(directory / coupling_analysis.PER_RECORDING_FILENAME)
     names = [name for name, _ in coupling_analysis.PERCENT_COLUMNS]

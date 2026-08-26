@@ -375,7 +375,7 @@ model_config:
     # WHAT IT COSTS IN WARM-UP: nothing. With W_c ~ rho * tau_c, W_c + delta*d_c = tau_ref +
     # (rho-1)*tau_c <= W_ref, so max_c(W'_c + d_c) = 134 = max_c W'_c exactly, on BOTH streams.
     # `null` is the unaligned arm and is bitwise the model that shipped before this key existed.
-    causal_align_reference: target_max
+    causal_align_reference: null
 
     # Which phase-harmonic operator built the CONFIGURED SHARDS' two phase blocks, checked against
     # their own `causal_leg_alignment` root attribute and refused by name on a disagreement.

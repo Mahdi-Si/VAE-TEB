@@ -151,7 +151,8 @@ METHOD = (
     "Kruskal-Wallis across cohorts per metric over one value per recording; Holm step-down "
     "correction across the metrics in the family; pairwise two-sided Mann-Whitney U with Cliff's "
     "delta for the metrics significant after Holm only. Every pair is oriented from the less "
-    "severe cohort to the worse one, so a positive Cliff's delta means the less severe cohort's "
+    "severe cohort to the less severe one, so a positive Cliff's delta means the more severe "
+    "cohort's "
     "values run higher. Non-parametric throughout because these distributions are skewed and "
     "heavy-tailed. Cohorts with fewer than "
     f"{shared_stats.MIN_GROUP_SIZE} finite recordings are excluded and recorded rather than "
@@ -208,12 +209,12 @@ def usable_groups(
     Returns:
         ``(usable, excluded)`` -- the cohorts large enough to test, and the sizes of those that
         were not, both in the canonical cohort order so every table and figure downstream reads
-        healthy-first rather than alphabetically. That order is load-bearing rather than
+        worst-first rather than alphabetically. That order is load-bearing rather than
         presentational: ``stats.pairwise_comparisons`` names each pair in the order it receives
-        them, so handing it severity-ascending cohorts is what makes every comparison read *less
-        severe against worse*. The exclusion is returned rather than discarded because "this
-        subgroup had two recordings" is the explanation for a missing comparison, and a reader who
-        cannot see it will assume the comparison was made.
+        them, so handing it severity-descending cohorts is what makes every comparison read
+        *more severe against less severe*. The exclusion is returned rather than discarded
+        because "this subgroup had two recordings" is the explanation for a missing comparison,
+        and a reader who cannot see it will assume the comparison was made.
     """
     usable: Dict[str, np.ndarray] = {}
     excluded: Dict[str, int] = {}
@@ -433,11 +434,11 @@ def _draw_effect_heatmap(figure: Any, ax: Any, record: Dict[str, Any]) -> None:
     """Draw Cliff's delta for every pair of every metric that survived Holm.
 
     The columns run in the canonical cohort order rather than alphabetically, so the pairs of one
-    cohort sit together and the healthy pairs sit left. The orientation *inside* a column is that
+    cohort sit together and the HIE pairs sit left. The orientation *inside* a column is that
     same order seen from the other side: ``usable_groups`` hands the cohorts to
-    ``pairwise_comparisons`` severity-ascending and that sweep names each pair in the order it
-    receives, so a column reads less severe against worse and its delta carries the sign
-    convention every other column carries -- positive means the less severe cohort runs higher.
+    ``pairwise_comparisons`` severity-descending and that sweep names each pair in the order it
+    receives, so a column reads more severe against less severe and its delta carries the sign
+    convention every other column carries -- positive means the more severe cohort runs higher.
     Reorienting a pair here would still flip its sign against the number in
     ``cross_subgroup_pairwise.csv``, and nothing about the column order asks for it any more.
 

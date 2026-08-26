@@ -385,9 +385,11 @@ def run_sufficiency_analysis(
 
     curve = curve_frame(record)
     curve.to_csv(directory / CURVE_FILENAME, index=False)
-    figures.render_figure(
+    # The written name, not the constant: the constant is a stem and the extension is the run's,
+    # so recording the constant in ``files`` below would name a file that does not exist.
+    figure_name = figures.render_figure(
         build_sufficiency_figure(per_guid, curve, rows), directory / SUFFICIENCY_FIGURE
-    )
+    ).name
 
     by_metric = {str(row["metric"]): row for row in rows}
     fit = record["fit"]
@@ -448,6 +450,6 @@ def run_sufficiency_analysis(
             grouped_frame_entry(ANALYSIS_DIRNAME, PER_RECORDING_FILENAME, GROUPED_METRICS)
         ],
         "files": [
-            PER_RECORDING_FILENAME, SUMMARY_FILENAME, CURVE_FILENAME, SUFFICIENCY_FIGURE
+            PER_RECORDING_FILENAME, SUMMARY_FILENAME, CURVE_FILENAME, figure_name
         ],
     }

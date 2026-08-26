@@ -33,6 +33,9 @@ VALID_KEYS = frozenset(
         # setting -- leaves ``figures.DEFAULT_FIGURE_FORMAT`` standing, which is what every
         # committed figure manifest records.
         "figure_format",
+        # How far before delivery a segment may be recorded and still be evaluated. ``None`` --
+        # the shipped setting -- evaluates every segment the split carries.
+        "max_hours_before_delivery",
     }
 )
 
@@ -51,11 +54,20 @@ DEFAULTS: Dict[str, Any] = {
     # Nullable on purpose: ``None`` means "whatever ``figures.DEFAULT_FIGURE_FORMAT`` is",
     # so this file names no format of its own and the default lives in exactly one place.
     "figure_format": None,
+    # Nullable for the same reason ``max_samples`` is: absence means "no bound", which is a
+    # different statement from any number and is the one the shipped runs make.
+    "max_hours_before_delivery": None,
 }
 
 #: Upper bound on the seed: ``numpy.random.seed`` rejects anything outside $[0, 2^{32})$,
 #: and torch's own seeding is unbounded, so this is the binding constraint of the three.
 _MAX_SEED = 2**32
+
+#: Floor on ``max_hours_before_delivery``, in hours: one trajectory bin width. Below it a run has
+#: no whole window to draw, so the bound would empty every clock rather than narrow it. Kept equal
+#: to the binning module's own width by test rather than by import -- this module validates a run's
+#: settings before anything is built and stays a stdlib parse.
+_MIN_HORIZON_HOURS = 0.5
 
 
 def _require_int(value: Any, name: str, *, minimum: int) -> int:
@@ -304,5 +316,21 @@ def validate_eval_config(config: Mapping[str, Any]) -> Dict[str, Any]:
     # format keeps the default, and the manifests, which record ``.pdf`` names, stay correct.
     if resolved["figure_format"] is not None:
         resolved["figure_format"] = _require_figure_format(resolved["figure_format"])
+
+    # Nullable, and validated only when set -- the ``max_samples`` shape. It bounds the population
+    # the time-to-delivery trajectory is computed over, so it is a config key and not a call-site
+    # default: the dumped config is the only durable record of which this run was.
+    horizon = resolved["max_hours_before_delivery"]
+    if horizon is not None:
+        if isinstance(horizon, bool) or not isinstance(horizon, (int, float))                 or not math.isfinite(float(horizon)):
+            raise ValueError(
+                f"eval_config.max_hours_before_delivery must be a finite number, got {horizon!r}."
+            )
+        if float(horizon) < _MIN_HORIZON_HOURS:
+            raise ValueError(
+                f"eval_config.max_hours_before_delivery must be >= {_MIN_HORIZON_HOURS} h "
+                f"(one trajectory bin), got {horizon}."
+            )
+        resolved["max_hours_before_delivery"] = float(horizon)
 
     return resolved

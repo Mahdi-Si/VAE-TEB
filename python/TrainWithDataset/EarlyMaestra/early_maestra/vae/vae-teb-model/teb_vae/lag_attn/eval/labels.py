@@ -180,6 +180,56 @@ def batch_labels(batch: Any, batch_size: int) -> Dict[str, List[Optional[str]]]:
     return {CLASS_COLUMN: classes, SUBGROUP_COLUMN: subgroups}
 
 
+def ordered_groups(groups: Sequence[Any], axis: str) -> List[str]:
+    """Return cohort labels in the evaluation's one cohort order: **worst first**.
+
+    This is the single definition of that order for every pipeline in the family, and it decides
+    two things at once rather than one:
+
+    * **Presentation.** The left-to-right order of a violin fan-out, the row order of a by-cohort
+      table, the series order of a trajectory legend. Alphabetical is the default everywhere this
+      is not called, and alphabetical is wrong in a specific way -- it puts ``acidosis`` before
+      ``healthy`` on the class axis, and on the subgroup axis it interleaves the three classes
+      (``acidosis_cs``, ``acidosis_no_cs``, ``healthy_bg_cs``, ...) so that neither the severity
+      ordering nor the background/caesarean structure is visible.
+    * **Every comparison's orientation.** :func:`~teb_vae.lag_attn.eval.stats.pairwise_comparisons`
+      names each pair in the order it receives the cohorts, so this order is what makes every
+      significance test in every pipeline read **more severe against less severe** -- HIE vs
+      acidosis, HIE vs healthy, acidosis vs healthy -- with Cliff's delta signed that way in every
+      window of every readout. A positive delta therefore means the *worse* cohort's values run
+      higher, on every pair of every metric, rather than on the ones whose names happened to sort
+      that way.
+
+    The direction is severity-**descending**, which is the order the clinical question is asked in:
+    the cohort a reading exists to detect is named first, and the comparison it is read against
+    second. Both source tables are read in reverse rather than restated -- :data:`CLASS_NAMES` is
+    keyed by the dataset's own class codes $1, 2, 3$ and :data:`CANONICAL_SUBGROUPS` is written
+    healthy-first -- so a subgroup added to the dataset reaches every figure and every pairwise
+    sweep without an edit here.
+
+    Args:
+        groups: The labels present. Duplicates and non-string labels are accepted; both are
+            normalised to distinct strings.
+        axis: The cohort axis, choosing the canonical order. An axis that is neither
+            :data:`CLASS_COLUMN` nor :data:`SUBGROUP_COLUMN` -- a time-window axis is the one such
+            caller -- matches nothing and falls through to the alphabetical order.
+
+    Returns:
+        Classes in HIE / acidosis / healthy order, subgroups in reversed canonical order, with
+        anything unrecognised appended alphabetically so nothing is silently dropped. An
+        unrecognised label lands after every label the order knows, which is the convention every
+        cohort order in this family follows.
+    """
+    present = {str(group) for group in groups}
+    preferred = (
+        [CLASS_NAMES[code] for code in sorted(CLASS_NAMES, reverse=True)]
+        if axis == CLASS_COLUMN
+        else list(reversed(CANONICAL_SUBGROUPS))
+    )
+    ordered = [name for name in preferred if name in present]
+    return ordered + sorted(present - set(ordered))
+
+
 def distinct_groups(values: Sequence[Any]) -> List[str]:
     """Return the distinct non-null group values, sorted.
 

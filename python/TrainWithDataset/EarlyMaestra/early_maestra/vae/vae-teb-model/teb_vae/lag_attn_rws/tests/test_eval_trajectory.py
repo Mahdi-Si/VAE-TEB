@@ -25,6 +25,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
+from teb_vae.lag_attn_rws.eval.figures_seam import figure_filename
 from teb_vae.lag_attn_rws.eval.analyses import trajectory as analysis
 from teb_vae.lag_attn.nets.lag_report import SECONDS_PER_STEP
 
@@ -125,7 +126,9 @@ def test_the_figure_leaves_the_gap_as_a_gap() -> None:
     )
     trajectory, _ = analysis.whole_delivery(per_anchor)
 
-    figure = analysis.build_profile_figure(analysis.within_segment_profile(per_anchor), trajectory)
+    figure = analysis.build_profile_figure(
+        analysis.within_segment_profile(per_anchor), trajectory, analysis.READOUTS[0]
+    )
     try:
         drawn = [
             np.asarray(line.get_ydata(), dtype=np.float64) for line in figure.axes[-1].lines
@@ -222,7 +225,12 @@ def test_the_analysis_writes_both_tables_the_boundaries_and_the_figure(tmp_path)
     directory = tmp_path / analysis.ANALYSIS_DIRNAME
     for name in (
         analysis.WITHIN_SEGMENT_FILENAME, analysis.WHOLE_DELIVERY_FILENAME,
-        analysis.BOUNDARIES_FILENAME, analysis.SUMMARY_FILENAME, analysis.PROFILE_FIGURE,
+        analysis.BOUNDARIES_FILENAME, analysis.SUMMARY_FILENAME,
+        # One page per readout, so neither is drawn on the other's scale.
+        *(
+            figure_filename(f"{analysis.PROFILE_FIGURE}_{readout.slug}")
+            for readout in analysis.READOUTS
+        ),
     ):
         assert (directory / name).is_file(), name
     assert result["whole_delivery"]["n_timesteps"] == 25

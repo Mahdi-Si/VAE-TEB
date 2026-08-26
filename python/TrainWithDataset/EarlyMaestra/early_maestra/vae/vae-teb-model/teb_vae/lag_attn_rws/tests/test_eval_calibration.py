@@ -30,6 +30,7 @@ import pandas as pd
 import pytest
 import torch
 
+from teb_vae.lag_attn_rws.eval.figures_seam import figure_filename
 from teb_vae.lag_attn_rws.eval import metrics as metrics_module
 from teb_vae.lag_attn_rws.eval.analyses import calibration as calibration_analysis
 from teb_vae.lag_attn_rws.eval.metrics import (
@@ -275,8 +276,8 @@ def test_the_analysis_writes_its_tables_and_both_figures(tmp_path) -> None:
         calibration_analysis.PIT_FILENAME,
         calibration_analysis.LOGVAR_FILENAME,
         calibration_analysis.PER_RECORDING_FILENAME,
-        calibration_analysis.PIT_FIGURE,
-        calibration_analysis.LOGVAR_FIGURE,
+        figure_filename(calibration_analysis.PIT_FIGURE),
+        figure_filename(calibration_analysis.LOGVAR_FIGURE),
     ):
         assert (directory / name).is_file(), name
     coverage = pd.read_csv(directory / calibration_analysis.COVERAGE_FILENAME)
@@ -437,8 +438,8 @@ def test_a_fitted_gaussian_checkpoint_produces_the_whole_block(fitted_evaluated)
     directory = fitted_evaluated["results_dir"] / calibration_analysis.ANALYSIS_DIRNAME
     for name in (
         calibration_analysis.COVERAGE_FILENAME,
-        calibration_analysis.PIT_FIGURE,
-        calibration_analysis.LOGVAR_FIGURE,
+        figure_filename(calibration_analysis.PIT_FIGURE),
+        figure_filename(calibration_analysis.LOGVAR_FIGURE),
     ):
         assert (directory / name).is_file(), name
 

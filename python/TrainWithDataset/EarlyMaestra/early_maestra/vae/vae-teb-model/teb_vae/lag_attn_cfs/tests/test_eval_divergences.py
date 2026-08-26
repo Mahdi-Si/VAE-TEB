@@ -57,6 +57,10 @@ CELL_SPECIFIC_MODULES: Tuple[str, ...] = (
     "analyses/source_null.py",
     "analyses/spectral_skill.py",
     "analyses/lag_clocks.py",
+    # The profile-shape reducer the clocks analysis is built on. Cell-specific rather than
+    # divergent: the sibling has no counterpart to classify it against, because the one-sided
+    # bank's compensated lag axis is this cell's alone.
+    "lag_shape.py",
 )
 
 #: Where this suite's tests live, for resolving the named assertions.

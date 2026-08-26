@@ -67,9 +67,9 @@ def test_the_grouped_emitter_delegates_rather_than_reimplementing(monkeypatch) -
     # The two additions, checked by what they *do* rather than by identity: the ordering is a
     # lambda over ``cohort.ordered_groups``, so only its result is comparable.
     assert seen["group_palette"] is figures_seam.group_colors
-    assert seen["order_groups"](["hie", "acidosis", "healthy"], "clinical_class") == (
-        cohort.ordered_groups(["hie", "acidosis", "healthy"], "clinical_class")
-    ) == ["healthy", "acidosis", "hie"]
+    assert seen["order_groups"](["healthy", "acidosis", "hie"], "clinical_class") == (
+        cohort.ordered_groups(["healthy", "acidosis", "hie"], "clinical_class")
+    ) == ["hie", "acidosis", "healthy"]
     assert set(seen) == {"frame", "directory", "value_columns", "order_groups", "group_palette"}
 
 

@@ -21,8 +21,9 @@ raising.
 readouts -- corrected within themselves and never jointly, on a known-answer separation in both
 directions.
 
-**Every comparison reads less severe against worse**, because the sweep names each pair in the
-order it receives the classes and this analysis hands them over in the canonical one.
+**Every comparison reads more severe against less severe**, because the sweep names each pair in
+the order it receives the classes and this analysis hands them over in the canonical one, which
+runs worst first.
 
 **And the page a reader opens shows the cells the test used**: one heatmap per class on a shared
 colour scale, the share summing to one within every window.
@@ -351,10 +352,11 @@ def test_the_centroid_moves_toward_the_anchor_as_the_landmark_approaches(tmp_pat
             assert far - near == pytest.approx(6.0, abs=0.5), (clock.name, group)
 
 
-def test_every_comparison_runs_from_the_less_severe_class_to_the_worse_one(tmp_path) -> None:
+def test_every_comparison_runs_from_the_more_severe_class_to_the_less_severe_one(tmp_path) -> None:
     """The sweep names each pair in the order it receives the classes, and this analysis hands them
-    over in the canonical one -- so a positive Cliff's delta means the less severe class's centroid
-    sits further back in the past, on every pair of every window of every family."""
+    over in the canonical one, worst first -- so a negative Cliff's delta means the *less* severe
+    class's centroid sits further back in the past, on every pair of every window of every
+    family."""
     per_sample, vectors = _collection()
 
     _, directory = _run(_context(per_sample, vectors), tmp_path)
@@ -363,11 +365,12 @@ def test_every_comparison_runs_from_the_less_severe_class_to_the_worse_one(tmp_p
     assert len(pairs)
     for _, cell in pairs.groupby(["clock", "metric_column", "time_bin"]):
         assert list(zip(cell["left"], cell["right"])) == [
-            ("healthy", "acidosis"), ("healthy", "hie"), ("acidosis", "hie"),
+            ("hie", "acidosis"), ("hie", "healthy"), ("acidosis", "healthy"),
         ]
-    # Healthy sits furthest back in this fixture, so every delta is positive: one sign convention
-    # across every pair rather than one per pair depending on how the names sorted.
-    assert (pairs["cliffs_delta"] > 0).all()
+    # Healthy sits furthest back in this fixture and is the *right* of every pair it appears in, so
+    # every delta is negative: one sign convention across every pair rather than one per pair
+    # depending on how the names sorted.
+    assert (pairs["cliffs_delta"] < 0).all()
 
 
 def test_each_clock_and_readout_is_its_own_holm_family(tmp_path) -> None:
@@ -451,7 +454,7 @@ def test_the_share_field_is_a_distribution_over_lags_in_every_window() -> None:
     )
 
     assert len(windows) == len(centres) == 2
-    assert [field.group for field in fields] == ["healthy", "acidosis", "hie"]
+    assert [field.group for field in fields] == ["hie", "acidosis", "healthy"]
     for field in fields:
         assert field.share.shape == (_N_LAGS, len(windows))
         assert np.nansum(field.share, axis=0) == pytest.approx([1.0, 1.0])
@@ -524,9 +527,9 @@ def test_the_features_page_draws_every_untested_statistic_with_both_profiles() -
         ), title
 
 
-def test_the_windows_page_rows_read_less_severe_against_worse() -> None:
+def test_the_windows_page_rows_read_more_severe_against_less_severe() -> None:
     """The page an operator opens beside the CSV. Sorting the row labels would put
-    ``acidosis vs hie`` above ``healthy vs acidosis`` while the violins above run healthy-first."""
+    ``acidosis vs healthy`` above ``hie vs acidosis`` while the violins above run worst-first."""
     per_sample, vectors = _collection()
     seconds = compensated_seconds_axis(_N_LAGS, 0)
     featured, _ = analysis.add_feature_columns(per_sample, vectors, seconds)
@@ -551,7 +554,7 @@ def test_the_windows_page_rows_read_less_severe_against_worse() -> None:
     expected = [
         f"{feature.column}: {left} vs {right}"
         for feature in analysis.READOUTS
-        for left, right in (("healthy", "acidosis"), ("healthy", "hie"), ("acidosis", "hie"))
+        for left, right in (("hie", "acidosis"), ("hie", "healthy"), ("acidosis", "healthy"))
     ]
     assert drawn == [expected]
 

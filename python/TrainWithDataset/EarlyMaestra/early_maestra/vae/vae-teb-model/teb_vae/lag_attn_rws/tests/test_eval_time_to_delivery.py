@@ -27,6 +27,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
+from teb_vae.lag_attn_rws.eval.figures_seam import figure_filename
 from teb_vae.lag_attn_rws.eval import cohort
 from teb_vae.lag_attn_rws.eval._reuse import labels
 from teb_vae.lag_attn_rws.eval.analyses import time_to_delivery as analysis
@@ -299,9 +300,16 @@ def test_the_analysis_writes_its_tables_and_its_figure(tmp_path) -> None:
     directory = tmp_path / analysis.ANALYSIS_DIRNAME
     for name in (
         analysis.TRAJECTORY_FILENAME, analysis.PER_RECORDING_FILENAME,
-        analysis.SIGNIFICANCE_FILENAME, analysis.PAIRWISE_FILENAME, analysis.TRAJECTORY_FIGURE,
+        analysis.SIGNIFICANCE_FILENAME, analysis.PAIRWISE_FILENAME,
+        # Four figures, not two: each readout gets its trajectory and its windows page to itself.
+        *(
+            figure_filename(analysis.figure_stem(stem, readout))
+            for readout in analysis.READOUTS
+            for stem in (analysis.TRAJECTORY_FIGURE, analysis.WINDOWS_FIGURE)
+        ),
     ):
         assert (directory / name).is_file(), name
+        assert name in result["files"], name
     trajectory = pd.read_csv(directory / analysis.TRAJECTORY_FILENAME)
     assert set(trajectory["metric"]) == {"pred_gap_mc_nats", "source_conditioned_kl_raw_nats"}
     assert result["bin_width_hours"] == pytest.approx(0.5)
@@ -337,7 +345,7 @@ def test_the_figure_annotates_each_window_with_its_recording_count_in_the_cohort
         analysis.build_per_recording(_per_sample(_cohort_rows(n_per_class=4)))
     )
 
-    figure = analysis.build_trajectory_figure(rows, labels.CLASS_COLUMN)
+    figure = analysis.build_trajectory_figure(rows, labels.CLASS_COLUMN, analysis.READOUTS[0])
     try:
         axis = figure.axes[0]
         annotations = sorted(text.get_text() for text in axis.texts)
@@ -392,10 +400,17 @@ def _window_rows(
 
 
 def _windows_figure(rows: List[Dict[str, Any]]):
-    """Build the windows page from a hand-made per-sample table, with its significance records."""
+    """Build the first readout's windows page from a hand-made per-sample table, with the
+    significance records of **both** readouts.
+
+    One readout per page is the emitted layout, so the page under test is the one an operator
+    opens; the second record travels beside it because several tests below assert on the record
+    rather than on the drawing.
+    """
     class_frame = analysis.build_per_recording(_per_sample(rows))[labels.CLASS_COLUMN]
     records = [analysis.analyse_windows(class_frame, column) for column in analysis.VALUE_COLUMNS]
-    return analysis.build_windows_figure(class_frame, records), records
+    figure = analysis.build_windows_figure(class_frame, records[0], analysis.READOUTS[0])
+    return figure, records
 
 
 def _violin_centres(ax) -> List[float]:
@@ -418,15 +433,12 @@ def test_the_windows_page_stacks_a_strip_under_each_readouts_violins() -> None:
 
     figure, _ = _windows_figure(_window_rows())
     try:
-        # Two readouts, each a violin row and a strip row, then the effect-size heatmap -- plus
-        # the colourbar axes the heatmap attaches.
-        assert len(figure.axes) == 6
-        for index in (0, 2):
-            assert figure.axes[index].get_xlim() == pytest.approx(
-                figure.axes[index + 1].get_xlim()
-            )
+        # One readout: a violin row, its strip, then the effect-size heatmap -- plus the colourbar
+        # axes the heatmap attaches.
+        assert len(figure.axes) == 4
+        assert figure.axes[0].get_xlim() == pytest.approx(figure.axes[1].get_xlim())
         # Delivery at the right, on every panel that carries the clock.
-        for index in range(4):
+        for index in range(2):
             low, high = figure.axes[index].get_xlim()
             assert low > high, f"panel {index} is not inverted"
     finally:
@@ -462,9 +474,10 @@ def test_the_strip_clears_alpha_in_the_window_the_classes_are_separated_in() -> 
 
 
 def test_the_violin_cells_are_drawn_in_the_canonical_order_and_the_cohort_colours() -> None:
-    r"""Healthy sits left of acidosis inside every window, and each is the colour this evaluation
-    paints it everywhere else. A figure whose classes are placed or coloured by whatever order
-    they arrived in cannot be compared with any other figure in the repository."""
+    r"""Acidosis sits left of healthy inside every window -- the cohort axis runs worst first --
+    and each is the colour this evaluation paints it everywhere else. A figure whose classes are
+    placed or coloured by whatever order they arrived in cannot be compared with any other figure
+    in the repository."""
     from matplotlib.collections import PolyCollection
     from matplotlib.colors import to_rgba
 
@@ -484,10 +497,11 @@ def test_the_violin_cells_are_drawn_in_the_canonical_order_and_the_cohort_colour
             for collection in violins.collections
             if isinstance(collection, PolyCollection)
         ]
-        palette = figures_seam.group_colors(["healthy", "acidosis"])
-        # Drawn cohort by cohort, so the first two bodies are healthy's and the last two acidosis's.
-        assert faces[:2] == [to_rgba(palette["healthy"])[:3]] * 2
-        assert faces[2:] == [to_rgba(palette["acidosis"])[:3]] * 2
+        palette = figures_seam.group_colors(["acidosis", "healthy"])
+        # Drawn cohort by cohort in the axis order, which runs worst first: the first two bodies
+        # are acidosis's and the last two healthy's.
+        assert faces[:2] == [to_rgba(palette["acidosis"])[:3]] * 2
+        assert faces[2:] == [to_rgba(palette["healthy"])[:3]] * 2
     finally:
         shared_figures.plt.close(figure)
 
@@ -551,7 +565,7 @@ def test_the_windows_page_of_a_single_class_split_draws_notes_rather_than_raisin
         notes = [
             text.get_text() for axis in figure.axes for text in axis.texts
         ]
-        assert notes.count(shared_figures.EMPTY_NOTE) >= 3
+        assert notes.count(shared_figures.EMPTY_NOTE) >= 2
     finally:
         shared_figures.plt.close(figure)
 
@@ -562,7 +576,7 @@ def test_a_single_cohort_population_draws_the_empty_note_rather_than_one_line() 
     """One line invites a comparison there is nothing to compare against."""
     from teb_vae.lag_attn.eval import figures as shared_figures
 
-    figure = analysis.build_trajectory_figure([], labels.CLASS_COLUMN)
+    figure = analysis.build_trajectory_figure([], labels.CLASS_COLUMN, analysis.READOUTS[0])
     try:
         notes = [text.get_text() for text in figure.axes[0].texts]
         n_lines = len(figure.axes[0].lines)

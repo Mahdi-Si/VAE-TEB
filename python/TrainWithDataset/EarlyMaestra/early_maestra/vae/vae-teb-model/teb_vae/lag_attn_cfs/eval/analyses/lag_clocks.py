@@ -440,8 +440,9 @@ METHOD = (
     "Per window of the named clock: Kruskal-Wallis across clinical classes over one value per "
     "recording, Holm step-down correction across that clock's windows as one family, pairwise "
     "two-sided Mann-Whitney U with Cliff's delta for the windows significant after Holm only. "
-    "Every pair is oriented from the less severe class to the worse one, so a positive Cliff's "
-    "delta means the less severe class's values run higher. Non-parametric throughout. Classes "
+    "Every pair is oriented from the more severe class to the less severe one, so a positive "
+    "Cliff's delta means the more severe class's values run higher. Non-parametric "
+    "throughout. Classes "
     f"with fewer than {shared_stats.MIN_GROUP_SIZE} recordings in a window are excluded from it "
     "and recorded. Each (clock, readout) is its own Holm family and the four are NOT corrected "
     "jointly: two clocks are different alignments of an overlapping population and the two "
@@ -645,11 +646,11 @@ def _class_values(frame: pd.DataFrame, column: str) -> Dict[str, np.ndarray]:
         column: The feature column.
 
     Returns:
-        Every class present, in the canonical healthy / acidosis / HIE order, mapped to its finite
+        Every class present, in the canonical HIE / acidosis / healthy order, mapped to its finite
         values. **Nothing is filtered here**: a class too small to test is still a class a figure
         must show. The order is load-bearing rather than presentational -- the pairwise sweep names
         each pair in the order it receives the classes, so this is what makes every comparison read
-        less severe against worse.
+        more severe against less severe.
     """
     values_by_class: Dict[str, np.ndarray] = {}
     if frame.empty or "group" not in frame.columns or column not in frame.columns:
@@ -774,8 +775,9 @@ def analyse_windows(
     # The cohort half of the job is this analysis's own: which classes are in a window, in which
     # order, and which were too small to enter the test. That order is load-bearing rather than
     # cosmetic: the pairwise sweep names each pair in the order it receives, so passing the
-    # classes severity-ascending is what makes every comparison read healthy against acidosis,
-    # healthy against HIE, acidosis against HIE -- less severe against worse, never the reverse.
+    # classes severity-descending is what makes every comparison read HIE against acidosis, HIE
+    # against healthy, acidosis against healthy -- more severe against less severe, never the
+    # reverse.
     # The arithmetic half -- the omnibus, Holm across the windows and the pairwise sweep on the
     # survivors -- is ``stats.windowed_group_comparisons``, shared with every other trajectory
     # analysis in the family, so that "significant" has one definition here rather than one per
@@ -1479,6 +1481,12 @@ def run_lag_clocks_analysis(
     """
     collection = context.collection
     per_sample = collection.per_sample
+    # The run's horizon, applied before anything is binned: it bounds the
+    # population on the segment's own start, so every clock in the run answers
+    # for the same segments. ``None`` leaves the frame untouched.
+    per_sample = cohort.within_horizon(
+        per_sample, eval_config.get("max_hours_before_delivery")
+    )
     if per_sample.empty:
         return _skip("the collected per-sample table was empty", 0)
 

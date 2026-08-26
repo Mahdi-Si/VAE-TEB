@@ -325,13 +325,14 @@ def pairwise_comparisons(samples: Dict[str, np.ndarray]) -> List[Dict[str, Any]]
     order is reported as ``left`` against ``right``, and Cliff's delta is signed against it.
 
     Deliberately **not** ``sorted``. Alphabetical is a different order from every cohort axis in
-    these pipelines, which run healthy, acidosis, HIE and the eight subgroups in their canonical
-    order -- so sorting would name a clinical pair ``acidosis vs healthy`` and sign $\delta$
-    against the reverse of the axis every figure draws it on. The callers pass severity-ascending
-    cohorts, so each comparison reads **less severe against worse** -- healthy vs acidosis,
-    healthy vs HIE, acidosis vs HIE -- and $\delta > 0$ means the *less severe* cohort's values
-    run higher, on every pair of every metric rather than on the ones whose names happened to
-    sort that way.
+    these pipelines, which run HIE, acidosis, healthy and the eight subgroups in the reverse of
+    their canonical order -- so sorting would name a clinical pair ``acidosis vs healthy`` and sign
+    $\delta$ against the reverse of the axis every figure draws it on. The callers pass
+    severity-**descending** cohorts, so each comparison reads **more severe against less severe**
+    -- HIE vs acidosis, HIE vs healthy, acidosis vs healthy -- and $\delta > 0$ means the *worse*
+    cohort's values run higher, on every pair of every metric rather than on the ones whose names
+    happened to sort that way. That direction is the clinical one: the cohort a readout exists to
+    detect is named first, and what it is read against second.
 
     Args:
         samples: Group to its finite values, in the order the comparisons are to be reported and
@@ -348,7 +349,7 @@ def pairwise_comparisons(samples: Dict[str, np.ndarray]) -> List[Dict[str, Any]]
     from scipy import stats
 
     records: List[Dict[str, Any]] = []
-    # The caller's order rather than ``sorted``: it is what makes ``left`` the less severe cohort.
+    # The caller's order rather than ``sorted``: it is what makes ``left`` the more severe cohort.
     for left, right in itertools.combinations(samples, 2):
         x, y = samples[left], samples[right]
         try:
@@ -414,9 +415,9 @@ def windowed_group_comparisons(
     is recorded as untestable, not silently filtered.
 
     That order is also the **orientation**: :func:`pairwise_comparisons` names each pair in the
-    order the window's own mapping carries it, so a caller passing severity-ascending cohorts gets
-    comparisons that read less severe against worse and a Cliff's delta signed the same way in
-    every window.
+    order the window's own mapping carries it, so a caller passing severity-descending cohorts gets
+    comparisons that read more severe against less severe and a Cliff's delta signed the same way
+    in every window.
 
     Args:
         samples_by_window: Ordered mapping from a window key to that window's

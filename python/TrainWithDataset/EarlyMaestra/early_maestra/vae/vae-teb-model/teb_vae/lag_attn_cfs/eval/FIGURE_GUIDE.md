@@ -288,57 +288,81 @@ A fourth is this cell's own: **a positive gap here is not yet a source finding.*
 
 The same eight metrics resolved by subgroup, **nested rather than flat**: one column per clinical class with that class's subgroups overlaid inside it, so a cell holds at most four curves and they are four tints of one hue. Each cohort is a faint fill under a hairline outline at full opacity, drawn in two passes so every outline sits above every fill — one pass per cohort would leave the first cohort's outline veiled by every later fill, and the first legend entry would be the hardest curve to trace.
 
-## `trajectory/trajectory_profile.pdf`
+## `trajectory/trajectory_profile_pred_gap.pdf`
 
-**In plain terms.** *"Does the coupling change through a recording?"* Two views: within one 20-minute segment, and across a whole delivery assembled from all of its segments.
+**In plain terms.** *"Does the predictive gain change through a recording?"* Two views of **one** readout: within one 20-minute segment, and across a whole delivery assembled from all of its segments.
 
-**What it shows.** The two coupling readouts against time in segment, and against absolute time $t_{\mathrm{abs}} = \mathrm{epoch} + 4t$ across a delivery, with overlapping steps averaged and `n_contributing` travelling beside them.
+**What it shows.** `mc_pred_gap` against time in segment, and against absolute time $t_{\mathrm{abs}} = \mathrm{epoch} + 4t$ across a delivery, with overlapping steps averaged and `n_contributing` travelling beside them.
 
 **Axes.** Anchor index or hours before delivery; nats per anchor.
 
 **How it is misread.** The within-segment panel **starts at the anchor floor**, for the same reason `forecast/anchor_profile.pdf` does. Across a delivery, a gap is drawn as a **break** rather than interpolated, so a discontinuity is missing data rather than a jump — and the averaging of overlapping steps is visible in `n_contributing` rather than inferred.
 
-## `time_to_delivery/time_to_delivery_trajectory.pdf`
+**Why it is one readout.** The lower panel is a single axis in nats per anchor, and the KL sitting on it beside `pred_gap` is routinely orders of magnitude larger — so a shared page draws the gap as a flat line at the bottom of the KL's range and reports a real movement of a tenth of a nat as nothing. The KL has its own page beside this one.
 
-**In plain terms.** *"Does the coupling change as delivery approaches, and differently for the sick babies?"* Both readouts binned on a half-hour grid of time before delivery, one series per clinical class.
+## `trajectory/trajectory_profile_kl.pdf`
 
-**What it shows.** `pred_gap` and the unfloored KL against `epoch / 3600`, class-stratified, on per-GUID values — per-GUID *inside* a window as well as across the split.
+The same two views of `kld_per_t`, on its own axis. Everything about the reading is the page above's; what differs is the quantity, and its one caveat: the KL is **inflated by an arbitrary factor whenever the prior variance sits on its clamp**, so its level is not comparable across checkpoints and a rise here is a rise only if the clamp state did not change. `pred_gap` carries no such factor, which is why the pair is reported and why neither is read alone.
+
+## `time_to_delivery/time_to_delivery_trajectory_pred_gap.pdf`
+
+**In plain terms.** *"Does the predictive gain change as delivery approaches, and differently for the sick babies?"* `pred_gap` binned on a half-hour grid of time before delivery, one series per clinical class.
+
+**What it shows.** `mc_pred_gap` against `epoch / 3600`, class-stratified, on per-GUID values — per-GUID *inside* a window as well as across the split.
 
 **Axes.** Hours before delivery (negative, increasing to the right); nats per anchor.
 
 **How it is misread.** Significance is tested **per window**, with Holm across windows as one family; the `pooled` row is flagged `confounded_by_time` and consumed by nothing, because a pooled difference between classes with different recording lengths is a difference in when they were recorded. The bin width is a module constant rather than a config key, for the same reason the significance level is not one.
 
-**Beside it.** `time_to_delivery_windows.pdf` draws the per-recording distribution behind every point of this figure, the Holm-adjusted significance of each window, and the effect size of every class pair that survived — on this same axis. Read that one before quoting a gap between two lines here.
+**Why it is one readout.** The KL is on the same nominal unit and not on the same scale — it is multiplied by an arbitrary factor whenever the prior variance sits on its clamp — so a page carrying both puts `pred_gap` on a range the KL set. It has its own page beside this one, and the two are compared in `time_to_delivery_trajectory.csv` rather than by eye.
 
-## `time_to_delivery/time_to_delivery_windows.pdf`
+**Beside it.** `time_to_delivery_windows_pred_gap.pdf` draws the per-recording distribution behind every point of this figure, the Holm-adjusted significance of each window, and the effect size of every class pair that survived — on this same axis. Read that one before quoting a gap between two lines here.
+
+## `time_to_delivery/time_to_delivery_trajectory_kl.pdf`
+
+The same figure for `source_conditioned_kl_raw`, on its own axis, with `time_to_delivery_windows_kl.pdf` beside it. Read exactly as the page above, with one addition: the unfloored KL is **inflated by an arbitrary factor whenever the prior variance sits on its clamp**, so a trajectory visible here and absent from the `pred_gap` page is a statement about which of the two is being read rather than about the coupling.
+
+## `time_to_delivery/time_to_delivery_windows_pred_gap.pdf`
 
 **In plain terms.** *"That trajectory has three lines on it — is the gap between them real, and where?"* The trajectory figure draws one number per class per window; this draws what that number was computed from, and the verdict on it, on the same axis.
 
-**What it shows.** Five panels. For each of the two coupling readouts, a violin per (window, clinical class) cell over one value per **recording**, and directly beneath it $-\log_{10}$ of that window's Holm-adjusted $p$ against the $\alpha$ line. Then one heatmap: Cliff's delta for every class pair that survived Holm, in any window, for either readout. Each cell is annotated with the number of recordings behind it; a cell below `MIN_GROUP_SIZE` = 3 recordings, or one whose values are all equal, is drawn as its own points rather than as a density the smoother invented — and those are the same cells the test excludes.
+**What it shows.** Three panels of `mc_pred_gap`. A violin per (window, clinical class) cell over one value per **recording**; directly beneath it, $-\log_{10}$ of that window's Holm-adjusted $p$ against the $\alpha$ line; then a heatmap of Cliff's delta for every class pair that survived Holm, in any window. Each cell is annotated with the number of recordings behind it; a cell below `MIN_GROUP_SIZE` = 3 recordings, or one whose values are all equal, is drawn as its own points rather than as a density the smoother invented — and those are the same cells the test excludes.
 
 **Axes.** Hours before delivery on the same $0.5$ h grid as the trajectory, inverted so delivery is at the right — on every panel including the heatmap, whose columns run in the same direction as the panels above it; nats per anchor on the violins; $-\log_{10} p$ on the strips.
 
-**How it is misread.** **A bar that is absent and a grey cross at zero are different statements**: no bar means the window was tested and its $p$ came out at or near 1, while a cross means fewer than two classes had enough recordings there and nothing was tested. **Every heatmap row reads less severe against worse**: `healthy vs acidosis`, `healthy vs hie`, `acidosis vs hie`, in that order down the axis and in the cohort order the violins above are drawn in — the pairwise sweep names each pair in the order it receives the classes. A positive Cliff's delta therefore means the *less severe* class runs higher, on every row; reorienting a pair by eye still flips its sign against the number in `time_to_delivery_pairwise.csv`. The correction is across the windows of this clock as one family, which is what makes "eight windows survived" a claim rather than an artefact of having asked twenty-two times; the two readouts are **not** jointly corrected, because they are two readings of the same recordings rather than two hypotheses.
+**How it is misread.** **A bar that is absent and a grey cross at zero are different statements**: no bar means the window was tested and its $p$ came out at or near 1, while a cross means fewer than two classes had enough recordings there and nothing was tested. **Every heatmap row reads more severe against less severe**: `hie vs acidosis`, `hie vs healthy`, `acidosis vs healthy`, in that order down the axis and in the cohort order the violins above are drawn in — the pairwise sweep names each pair in the order it receives the classes, and it receives them worst first. A positive Cliff's delta therefore means the *more severe* class runs higher, on every row; reorienting a pair by eye still flips its sign against the number in `time_to_delivery_pairwise.csv`. The correction is across the windows of this clock as one family, which is what makes "eight windows survived" a claim rather than an artefact of having asked twenty-two times; the two readouts are **not** jointly corrected, because they are two readings of the same recordings rather than two hypotheses.
 
-## `second_stage/second_stage_trajectory.pdf`
+## `time_to_delivery/time_to_delivery_windows_kl.pdf`
 
-**In plain terms.** *"Does the coupling change around the moment the second stage of labour begins?"* The same two readouts as the delivery clock, on the other clinical landmark — the one inside labour rather than at its end. Only the recordings the labour-onset table places a second stage for are on this figure.
+The same three panels for `source_conditioned_kl_raw`. Read exactly as the page above — including the row order and the sign of Cliff's delta — remembering that the KL's *level* is inflated wherever the prior variance is clamped. The Holm family is still this clock's windows: the two readouts are not corrected jointly, so a window significant on one page and not the other is one comparison each rather than one comparison twice.
 
-**What it shows.** `pred_gap` and the unfloored KL against `second_stage_onset / 3600`, class-stratified, as a median with an inter-quartile ribbon over **recordings** — one value per recording per window, averaged over that recording's own segments in it. Each point is annotated with the number of recordings behind it, and a dotted vertical marks the onset itself.
+## `second_stage/second_stage_trajectory_pred_gap.pdf`
+
+**In plain terms.** *"Does the predictive gain change around the moment the second stage of labour begins?"* The same readout as the delivery clock, on the other clinical landmark — the one inside labour rather than at its end. Only the recordings the labour-onset table places a second stage for are on this figure.
+
+**What it shows.** `mc_pred_gap` against `second_stage_onset / 3600`, class-stratified, as a median with an inter-quartile ribbon over **recordings** — one value per recording per window, averaged over that recording's own segments in it. Each point is annotated with the number of recordings behind it, and a dotted vertical marks the onset itself.
 
 **Axes.** Signed hours from second-stage onset, **negative before onset and positive after**, on the same $0.5$ h grid the delivery clock uses; **not** inverted, because this coordinate reads naturally left to right. Nats per anchor.
 
 **How it is misread.** **The sign is the opposite convention from the delivery clock's**, and the axis label says so: negative is *before* the onset. **The positive side is short by construction** — the second stage begins a couple of hours before delivery, so the windows after onset hold far fewer recordings than those before it, and the annotated $n$ is what says which is which. The population is a **subset**: recordings with no recorded onset are dropped and counted in `second_stage_eligibility.csv`, so this figure describes fewer recordings than any other in the run.
 
-## `second_stage/second_stage_windows.pdf`
+## `second_stage/second_stage_trajectory_kl.pdf`
+
+The same figure for `source_conditioned_kl_raw` on this clock, on its own axis. Read as the page above, with the KL's clamp caveat: its level is inflated by an arbitrary factor wherever the prior variance sits on its clamp, so the shape is readable and the height is not.
+
+## `second_stage/second_stage_windows_pred_gap.pdf`
 
 **In plain terms.** *"That second-stage trajectory has three lines on it — is the gap between them real, and where?"* The same page the delivery clock draws, on the other landmark.
 
-**What it shows.** Five panels. For each of the two coupling readouts, a violin per (window, clinical class) cell over one value per **recording**, and directly beneath it $-\log_{10}$ of that window's Holm-adjusted $p$ against the $\alpha$ line. Then one heatmap: Cliff's delta for every class pair that survived Holm, in any window, for either readout. Each cell is annotated with the number of recordings behind it; a cell below `MIN_GROUP_SIZE` = 3 recordings, or one whose values are all equal, is drawn as its own points rather than as a density the smoother invented — and those are the same cells the test excludes.
+**What it shows.** Three panels of `mc_pred_gap`. A violin per (window, clinical class) cell over one value per **recording**; directly beneath it, $-\log_{10}$ of that window's Holm-adjusted $p$ against the $\alpha$ line; then a heatmap of Cliff's delta for every class pair that survived Holm, in any window. Each cell is annotated with the number of recordings behind it; a cell below `MIN_GROUP_SIZE` = 3 recordings, or one whose values are all equal, is drawn as its own points rather than as a density the smoother invented — and those are the same cells the test excludes.
 
 **Axes.** Signed hours from second-stage onset, negative before and positive after, on the same $0.5$ h grid; not inverted, with the onset marked at zero on every panel that carries the clock. Nats per anchor on the violins; $-\log_{10} p$ on the strips.
 
-**How it is misread.** **This clock's Holm family is its own** and is not corrected jointly with `time_to_delivery`'s: the two are different alignments of an overlapping population, so a window significant on one and not the other is a statement about alignment, and a reader quoting both is making two comparisons. **Every heatmap row reads less severe against worse**: `healthy vs acidosis`, `healthy vs hie`, `acidosis vs hie`, in that order down the axis and in the cohort order the violins above are drawn in — the pairwise sweep names each pair in the order it receives the classes. A positive Cliff's delta therefore means the *less severe* class runs higher, on every row; reorienting a pair by eye still flips its sign against the number in `second_stage_pairwise.csv`. **A bar that is absent and a grey cross at zero are different statements**: no bar means the window was tested and its $p$ came out at or near 1, a cross means fewer than two classes had enough recordings there — which on the positive side of this axis is the common case rather than the exception.
+**How it is misread.** **This clock's Holm family is its own** and is not corrected jointly with `time_to_delivery`'s: the two are different alignments of an overlapping population, so a window significant on one and not the other is a statement about alignment, and a reader quoting both is making two comparisons. **Every heatmap row reads more severe against less severe**: `hie vs acidosis`, `hie vs healthy`, `acidosis vs healthy`, in that order down the axis and in the cohort order the violins above are drawn in — the pairwise sweep names each pair in the order it receives the classes, and it receives them worst first. A positive Cliff's delta therefore means the *more severe* class runs higher, on every row; reorienting a pair by eye still flips its sign against the number in `second_stage_pairwise.csv`. **A bar that is absent and a grey cross at zero are different statements**: no bar means the window was tested and its $p$ came out at or near 1, a cross means fewer than two classes had enough recordings there — which on the positive side of this axis is the common case rather than the exception.
+
+## `second_stage/second_stage_windows_kl.pdf`
+
+The same three panels for `source_conditioned_kl_raw` on this clock. Read exactly as the page above, including the row order and the sign of Cliff's delta, and with the KL's clamp caveat on the violins' heights.
 
 ## `lag_clocks/lag_time_to_delivery.pdf`
 
@@ -348,7 +372,7 @@ The same eight metrics resolved by subgroup, **nested rather than flat**: one co
 
 **Axes.** Hours before delivery on the same $0.5$ h grid as the coupling clocks, inverted so delivery is at the right; lag in seconds of **stored-coefficient time**, lag $0$ at the bottom; colour is a share in $[0, 1]$.
 
-**How it is misread.** **The class panels share one colour scale, and that is what makes them comparable** — three panels each scaled to its own extremes would paint the same colour for three different shares while every colourbar stayed correct. **It is a share, not a magnitude**: every window is normalised to sum to one, so a band moving down means the attribution moved toward the anchor, not that there is more of it — how much there is is what `time_to_delivery_trajectory.pdf` draws. **A centroid is not a peak**, and this page draws no peak: the argmax and the eleven other per-segment statistics are on `lag_time_to_delivery_features.pdf` beside the guard that says whether a peak may be read at all. And the lag axis is stored-coefficient time, so a centroid that moves ninety seconds is a shift over the axis the coefficients are stored on rather than a physiological latency.
+**How it is misread.** **The class panels share one colour scale, and that is what makes them comparable** — three panels each scaled to its own extremes would paint the same colour for three different shares while every colourbar stayed correct. **It is a share, not a magnitude**: every window is normalised to sum to one, so a band moving down means the attribution moved toward the anchor, not that there is more of it — how much there is is what `time_to_delivery_trajectory_pred_gap.pdf` draws. **A centroid is not a peak**, and this page draws no peak: the argmax and the eleven other per-segment statistics are on `lag_time_to_delivery_features.pdf` beside the guard that says whether a peak may be read at all. And the lag axis is stored-coefficient time, so a centroid that moves ninety seconds is a shift over the axis the coefficients are stored on rather than a physiological latency.
 
 ## `lag_clocks/lag_time_to_delivery_windows.pdf`
 

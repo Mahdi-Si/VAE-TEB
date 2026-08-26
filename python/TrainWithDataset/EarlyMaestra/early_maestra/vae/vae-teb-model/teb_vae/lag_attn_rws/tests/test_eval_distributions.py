@@ -21,6 +21,7 @@ import pytest
 from matplotlib.collections import LineCollection
 
 from teb_vae.lag_attn.eval import figures as shared_figures
+from teb_vae.lag_attn_rws.eval.figures_seam import figure_filename
 from teb_vae.lag_attn_rws.eval import figures_seam
 from teb_vae.lag_attn_rws.eval._reuse import labels
 from teb_vae.lag_attn_rws.eval.analyses import distributions
@@ -158,10 +159,10 @@ def test_the_summary_is_written_in_the_canonical_cohort_order(per_sample) -> Non
     table = pd.DataFrame(distributions.build_summary_rows(segment, recording, units))
 
     classes = table[table["group_column"] == labels.CLASS_COLUMN]
-    assert list(dict.fromkeys(classes["group"])) == ["healthy", "acidosis", "hie"]
+    assert list(dict.fromkeys(classes["group"])) == ["hie", "acidosis", "healthy"]
     subgroups = table[table["group_column"] == labels.SUBGROUP_COLUMN]
     assert list(dict.fromkeys(subgroups["group"])) == [
-        "healthy_no_bg_no_cs", "healthy_bg_cs", "acidosis_cs", "hie_no_cs",
+        "hie_no_cs", "acidosis_cs", "healthy_bg_cs", "healthy_no_bg_no_cs",
     ]
 
 
@@ -393,7 +394,7 @@ def test_the_class_figure_draws_one_row_per_metric_in_clinical_order(per_sample)
     finally:
         shared_figures.plt.close(figure)
 
-    assert drawn == ["healthy", "acidosis", "hie"]
+    assert drawn == ["hie", "acidosis", "healthy"]
 
 
 def test_the_class_figure_uses_the_clinical_palette(per_sample) -> None:
@@ -429,15 +430,16 @@ def test_the_subgroup_figure_nests_each_class_in_its_own_column(per_sample) -> N
     figure = distributions.build_subgroup_figure(segment, recording, units)
     try:
         assert len(figure.axes) == len(distributions.METRICS) * 3
-        # The first row's three cells, left to right.
+        # The first row's three cells, left to right. The cohort axis runs worst first, so the
+        # healthy column is the third rather than the first.
         titles = [figure.axes[index].get_title() for index in range(3)]
-        healthy_cell = figure.axes[0].get_legend()
+        healthy_cell = figure.axes[2].get_legend()
         healthy_labels = [text.get_text().split(" (")[0] for text in healthy_cell.get_texts()]
     finally:
         shared_figures.plt.close(figure)
 
-    assert [title.split(":")[0] for title in titles] == ["healthy", "acidosis", "hie"]
-    assert healthy_labels == ["healthy_no_bg_no_cs", "healthy_bg_cs"]
+    assert [title.split(":")[0] for title in titles] == ["hie", "acidosis", "healthy"]
+    assert healthy_labels == ["healthy_bg_cs", "healthy_no_bg_no_cs"]
 
 
 def test_a_subgroup_is_placed_under_the_class_its_own_rows_carry(per_sample) -> None:
@@ -446,7 +448,7 @@ def test_a_subgroup_is_placed_under_the_class_its_own_rows_carry(per_sample) -> 
     being evaluated."""
     assert distributions.subgroups_of_class(per_sample, "acidosis") == ["acidosis_cs"]
     assert distributions.subgroups_of_class(per_sample, "healthy") == [
-        "healthy_no_bg_no_cs", "healthy_bg_cs",
+        "healthy_bg_cs", "healthy_no_bg_no_cs",
     ]
     assert distributions.subgroups_of_class(per_sample, "not_a_class") == []
 
@@ -486,14 +488,14 @@ def test_the_analysis_writes_both_tables_and_both_figures(per_sample, tmp_path) 
 
     for name in (
         distributions.PER_SEGMENT_FILENAME, distributions.SUMMARY_FILENAME,
-        distributions.CLASS_FIGURE, distributions.SUBGROUP_FIGURE,
+        figure_filename(distributions.CLASS_FIGURE), figure_filename(distributions.SUBGROUP_FIGURE),
     ):
         assert (directory / name).is_file() and (directory / name).stat().st_size > 0
 
     assert result["composition"]["n_segments"] == len(per_sample)
     assert result["composition"]["n_recordings"] == 4
     assert result["plan"]["capped"] is False
-    assert result["cohorts"][labels.CLASS_COLUMN] == ["healthy", "acidosis", "hie"]
+    assert result["cohorts"][labels.CLASS_COLUMN] == ["hie", "acidosis", "healthy"]
 
 
 def test_the_derived_csv_is_the_figures_reproducible_from_disk(per_sample, tmp_path) -> None:
@@ -521,7 +523,7 @@ def test_the_figures_do_not_collide_with_the_grouped_variant_naming() -> None:
     """
     from teb_vae.lag_attn_rws.tests import test_eval_smoke
 
-    for filename in (distributions.CLASS_FIGURE, distributions.SUBGROUP_FIGURE):
+    for filename in (figure_filename(distributions.CLASS_FIGURE), figure_filename(distributions.SUBGROUP_FIGURE)):
         assert not filename.endswith(test_eval_smoke.GROUPED_SUFFIXES), filename
 
 
@@ -555,7 +557,7 @@ def test_a_single_cohort_split_still_draws_rather_than_skipping(tmp_path) -> Non
 
     assert result["cohorts"][labels.CLASS_COLUMN] == ["healthy"]
     assert (
-        tmp_path / distributions.ANALYSIS_DIRNAME / distributions.CLASS_FIGURE
+        tmp_path / distributions.ANALYSIS_DIRNAME / figure_filename(distributions.CLASS_FIGURE)
     ).stat().st_size > 0
 
 
@@ -587,7 +589,7 @@ def test_an_empty_table_produces_empty_figures_rather_than_raising(tmp_path) -> 
     assert result["composition"]["n_segments"] == 0
     assert result["cohorts"][labels.CLASS_COLUMN] == []
     assert (
-        tmp_path / distributions.ANALYSIS_DIRNAME / distributions.SUBGROUP_FIGURE
+        tmp_path / distributions.ANALYSIS_DIRNAME / figure_filename(distributions.SUBGROUP_FIGURE)
     ).stat().st_size > 0
 
 
@@ -638,7 +640,7 @@ def test_it_runs_offline_against_a_finished_directory_with_no_model(
     assert exit_code == 0 and summary["checkpoint"] is None
     for name in (
         distributions.PER_SEGMENT_FILENAME, distributions.SUMMARY_FILENAME,
-        distributions.CLASS_FIGURE, distributions.SUBGROUP_FIGURE,
+        figure_filename(distributions.CLASS_FIGURE), figure_filename(distributions.SUBGROUP_FIGURE),
     ):
         assert (directory / name).is_file() and (directory / name).stat().st_size > 0
 

@@ -29,7 +29,7 @@ delivery: ``epoch`` is the segment's own start on that axis and an anchor is $4$
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, NamedTuple, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -50,15 +50,40 @@ WHOLE_DELIVERY_FILENAME = "whole_delivery.parquet"
 BOUNDARIES_FILENAME = "whole_delivery_boundaries.csv"
 SUMMARY_FILENAME = "whole_delivery_summary.csv"
 
-#: The figure, named as ``FIGURE_GUIDE.md`` names it.
+#: The figure **stem**, named as ``FIGURE_GUIDE.md`` names it. Not a filename: each readout gets
+#: a page to itself, written as ``<stem>_<slug>``, because the whole-delivery panel overlays the
+#: readouts on one axis and the two are routinely orders of magnitude apart -- so the smaller of
+#: them is drawn as a flat line at the bottom of a range the larger set, which is the one reading
+#: this figure exists to make impossible.
 PROFILE_FIGURE = "trajectory_profile"
 
-#: The per-anchor columns profiled, as ``(reported name, column, axis label)``. Both readouts,
-#: because they fail differently -- the KL is inflated by an arbitrary factor whenever the prior
-#: variance sits on its clamp, and ``pred_gap`` is not.
-READOUTS: Tuple[Tuple[str, str, str], ...] = (
-    ("kld_per_t", "kld_per_t", "nats per anchor"),
-    ("pred_gap_mc_nats", "mc_pred_gap", "nats per anchor"),
+
+class Readout(NamedTuple):
+    """One per-anchor quantity this analysis profiles, and how it is named on disk.
+
+    Attributes:
+        name: The reported name, carried into the within-segment table and the panel titles.
+        column: The per-anchor column it is read from.
+        ylabel: The axis label of its panels.
+        slug: The filename suffix of the page this readout gets to itself. Its own page rather
+            than its own panel on a shared one: the whole-delivery panel is a single axis, and the
+            two readouts on it are routinely orders of magnitude apart, so the smaller of them is
+            drawn as a flat line along the bottom of a range the larger set.
+    """
+
+    name: str
+    column: str
+    ylabel: str
+    slug: str
+
+
+#: The per-anchor columns profiled, one :class:`Readout` each. Both readouts, because they fail
+#: differently -- the KL is inflated by an arbitrary factor whenever
+#: the prior variance sits on its clamp, and ``pred_gap`` is not -- and one page each, because
+#: that is exactly why they do not share an axis.
+READOUTS: Tuple[Readout, ...] = (
+    Readout("kld_per_t", "kld_per_t", "nats per anchor", "kl"),
+    Readout("pred_gap_mc_nats", "mc_pred_gap", "nats per anchor", "pred_gap"),
 )
 
 #: A join between two segments of one recording is a break when the gap exceeds one anchor step.
@@ -85,7 +110,10 @@ def within_segment_profile(per_anchor: pd.DataFrame) -> pd.DataFrame:
         present when the table carries no anchors.
     """
     columns = ["anchor", "seconds_in_segment", "metric", "n_recordings", "mean", "q25", "median", "q75"]
-    present = [column for _, column, _ in READOUTS if column in getattr(per_anchor, "columns", [])]
+    present = [
+        readout.column for readout in READOUTS
+        if readout.column in getattr(per_anchor, "columns", [])
+    ]
     if per_anchor.empty or "anchor" not in per_anchor.columns or not present:
         return pd.DataFrame(columns=columns)
 
@@ -93,7 +121,7 @@ def within_segment_profile(per_anchor: pd.DataFrame) -> pd.DataFrame:
     per_recording = per_anchor.groupby(keys)[present].mean().reset_index()
     rows: List[Dict[str, Any]] = []
     for anchor, cell in per_recording.groupby("anchor", sort=True):
-        for name, column, _ in READOUTS:
+        for name, column, _, _ in READOUTS:
             if column not in present:
                 continue
             values = np.asarray(cell[column], dtype=np.float64)
@@ -134,7 +162,10 @@ def whole_delivery(per_anchor: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame
     trajectory_columns = ["guid", "t_abs_sec", "hours_before_delivery", "n_contributing",
                           "gap_before_s"]
     boundary_columns = ["guid", "epoch", "index", "t_abs_sec"]
-    present = [column for _, column, _ in READOUTS if column in getattr(per_anchor, "columns", [])]
+    present = [
+        column for _, column, _, _ in READOUTS
+        if column in getattr(per_anchor, "columns", [])
+    ]
     required = {"guid", "epoch", "anchor"}
     if per_anchor.empty or not required.issubset(set(per_anchor.columns)) or not present:
         return (
@@ -226,25 +257,41 @@ def delivery_summary(trajectory: pd.DataFrame, boundaries: pd.DataFrame) -> pd.D
 # The figure
 # =============================================================================
 def build_profile_figure(
-    profile: pd.DataFrame, trajectory: pd.DataFrame, *, guid: Optional[str] = None
+    profile: pd.DataFrame,
+    trajectory: pd.DataFrame,
+    readout: Readout,
+    *,
+    guid: Optional[str] = None,
 ) -> Any:
-    """Draw the within-segment profiles and one recording's assembled trajectory.
+    """Draw one readout's within-segment profile and its assembled trajectory across a delivery.
+
+    Two panels of **one** readout rather than every readout's panels on one page: the lower panel
+    is a single axis in nats per anchor, and the KL and ``pred_gap`` are routinely orders of
+    magnitude apart there, so overlaying them draws the smaller as a flat line and reports it as
+    nothing.
 
     Args:
-        profile: The within-segment table.
+        profile: The within-segment table, of every readout; this selects its own.
         trajectory: The whole-delivery table.
+        readout: The entry of :data:`READOUTS` this page resolves.
         guid: Which recording to draw. The longest one when omitted, chosen because a short
             recording shows neither an overlap nor a break.
 
     Returns:
         The figure; the caller renders and closes it.
     """
-    figure, axes = figures.new_figure(len(READOUTS) + 1, height_per_row=2.8)
-    for index, (name, _, ylabel) in enumerate(READOUTS):
-        cell = profile[profile["metric"] == name] if len(profile) else profile
-        _draw_within_segment(axes[index, 0], cell, title=f"{name} against time in segment",
-                             ylabel=ylabel)
-    _draw_whole_delivery(axes[len(READOUTS), 0], trajectory, guid=guid)
+    figure, axes = figures.new_figure(2, height_per_row=2.8)
+    cell = (
+        profile[profile["metric"] == readout.name] if len(profile) else profile
+    )
+    _draw_within_segment(
+        axes[0, 0], cell,
+        title=f"{readout.name} against time in segment",
+        ylabel=readout.ylabel,
+    )
+    _draw_whole_delivery(
+        axes[1, 0], trajectory, name=readout.name, column=readout.column, guid=guid
+    )
     return figure
 
 
@@ -276,12 +323,21 @@ def _draw_within_segment(ax: Any, cell: pd.DataFrame, *, title: str, ylabel: str
     figures.style_axes(ax)
 
 
-def _draw_whole_delivery(ax: Any, trajectory: pd.DataFrame, *, guid: Optional[str]) -> None:
-    """Draw one recording's assembled trajectory, with its breaks left as breaks.
+def _draw_whole_delivery(
+    ax: Any, trajectory: pd.DataFrame, *, name: str, column: str, guid: Optional[str]
+) -> None:
+    """Draw one readout of one recording's assembled trajectory, with its breaks left as breaks.
 
     The gap is inserted as ``NaN`` rather than left to the line: matplotlib joins consecutive
     points whatever their spacing, so a recording missing an hour would otherwise be drawn as a
     straight interpolation across it and read as a slow trend.
+
+    Args:
+        ax: Target axes.
+        trajectory: The whole-delivery table.
+        name: The readout's reported name, for the legend.
+        column: The readout's column on that table.
+        guid: Which recording to draw, or ``None`` for the longest.
     """
     if trajectory.empty:
         ax.text(
@@ -304,12 +360,10 @@ def _draw_whole_delivery(ax: Any, trajectory: pd.DataFrame, *, guid: Optional[st
     # computed once here rather than per readout.
     breaks = np.flatnonzero(np.isfinite(gaps) & (gaps > BREAK_TOLERANCE_S))
     hours_with_breaks = np.insert(hours, breaks, np.nan)
-    for name, column, _ in READOUTS:
-        if column not in cell.columns:
-            continue
+    if column in cell.columns:
         values = np.insert(np.asarray(cell[column], dtype=np.float64), breaks, np.nan)
         ax.plot(hours_with_breaks, values, linewidth=figures.LINE_REGULAR, label=name)
-    ax.set_title(f"Whole-delivery trajectory: {chosen}")
+    ax.set_title(f"Whole-delivery trajectory: {chosen} ({name})")
     ax.set_xlabel("Time before delivery (hours)")
     ax.set_ylabel("nats per anchor")
     ax.invert_xaxis()
@@ -332,7 +386,8 @@ def run_trajectory_analysis(
     Args:
         context: The analysis context, read for the per-anchor table -- this analysis's only
             input, and the table's first general consumer.
-        eval_config: The validated block. Unused: nothing here is tunable.
+        eval_config: The validated block, read for the run's
+            ``max_hours_before_delivery`` horizon.
         output_dir: The results directory; this analysis writes into its own subdirectory.
         probe: The loader probe's record. Unused.
 
@@ -342,6 +397,14 @@ def run_trajectory_analysis(
         when the run carried no per-anchor table.
     """
     per_anchor = getattr(context.collection, "per_anchor", None)
+    if per_anchor is not None:
+        # The horizon bounds the population on the segment's own start, exactly as it
+        # does for every other clock, so an anchor kept here belongs to a segment that
+        # began within the bound. A bound that empties the table falls into the same
+        # recorded skip below as a run that carried no anchors at all.
+        per_anchor = cohort.within_horizon(
+            per_anchor, eval_config.get("max_hours_before_delivery")
+        )
     if per_anchor is None or per_anchor.empty:
         reason = (
             "the run carried no per-anchor rows, so there is neither a within-segment profile "
@@ -368,11 +431,17 @@ def run_trajectory_analysis(
     summary = delivery_summary(trajectory, boundaries)
     summary.to_csv(directory / SUMMARY_FILENAME, index=False)
 
-    figure_name = str(
-        figures.render_figure(
-            build_profile_figure(profile, trajectory), directory / PROFILE_FIGURE
-        ).name
-    )
+    # One page per readout rather than one carrying both, so neither is drawn on the other's
+    # scale on the shared whole-delivery axis.
+    figure_names = [
+        str(
+            figures.render_figure(
+                build_profile_figure(profile, trajectory, readout),
+                directory / f"{PROFILE_FIGURE}_{readout.slug}",
+            ).name
+        )
+        for readout in READOUTS
+    ]
 
     n_recordings = int(len(summary))
     logger.info(
@@ -401,6 +470,6 @@ def run_trajectory_analysis(
         },
         "files": [
             WITHIN_SEGMENT_FILENAME, WHOLE_DELIVERY_FILENAME, BOUNDARIES_FILENAME,
-            SUMMARY_FILENAME, figure_name,
+            SUMMARY_FILENAME, *figure_names,
         ],
     }

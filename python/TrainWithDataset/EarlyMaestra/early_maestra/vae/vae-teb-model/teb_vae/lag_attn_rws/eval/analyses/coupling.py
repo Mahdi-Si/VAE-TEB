@@ -189,12 +189,25 @@ HEADLINE_PERCENT = ERROR_SPACE_PERCENTS[0]
 #: One percentage joins them, not three. ``pred_gap_mse_pct`` is a monotone restatement of
 #: ``pred_gap_rmse_pct`` -- the same recordings in the same order -- so a second panel of it would
 #: cost a reader's attention and tell them nothing the first did not.
-GROUPED_METRICS: Tuple[str, ...] = (
-    "mc_pred_gap",
-    "pred_gap",
-    *KL_COLUMNS,
-    HEADLINE_PERCENT,
-)
+#:
+#: **Two fan-outs rather than one**, and the split is the same one the clinical clocks make: a gap
+#: in nats and a KL in nats are not on the same scale -- the KL is multiplied by an arbitrary
+#: factor whenever the prior variance sits on its clamp -- so a single page carrying both invites
+#: reading one against the other's range. Each group gets its own ``<stem>_by_<axis>`` pair.
+GROUPED_PRED_GAP_METRICS: Tuple[str, ...] = ("mc_pred_gap", "pred_gap", HEADLINE_PERCENT)
+GROUPED_KL_METRICS: Tuple[str, ...] = KL_COLUMNS
+
+#: The union, in the order the two pages are emitted. Kept as one name because "what this analysis
+#: resolves by cohort" is a single question, and a reader counting panels across both pages should
+#: not have to add two tuples together to answer it.
+GROUPED_METRICS: Tuple[str, ...] = (*GROUPED_PRED_GAP_METRICS, *GROUPED_KL_METRICS)
+
+#: The filename stems the two fan-outs are written under, yielding
+#: ``coupling_pred_gap_by_clinical_class`` and ``coupling_kl_by_clinical_class`` and their subgroup
+#: counterparts. Named rather than defaulted to the frame's own stem, which would give both the
+#: same name and let one overwrite the other.
+GROUPED_PRED_GAP_STEM = "coupling_pred_gap"
+GROUPED_KL_STEM = "coupling_kl"
 
 
 def build_gap_rows(
@@ -664,7 +677,14 @@ def run_coupling_analysis(
         # Declared, not emitted: the by-class and by-subgroup variants are the runner's fan-out
         # over this frame, which carries one row per recording and the cohort each belongs to.
         "grouped_frames": [
-            grouped_frame_entry(ANALYSIS_DIRNAME, PER_RECORDING_FILENAME, GROUPED_METRICS)
+            grouped_frame_entry(
+                ANALYSIS_DIRNAME, PER_RECORDING_FILENAME, GROUPED_PRED_GAP_METRICS,
+                stem=GROUPED_PRED_GAP_STEM,
+            ),
+            grouped_frame_entry(
+                ANALYSIS_DIRNAME, PER_RECORDING_FILENAME, GROUPED_KL_METRICS,
+                stem=GROUPED_KL_STEM,
+            ),
         ],
         "files": [PER_RECORDING_FILENAME, SUMMARY_FILENAME, *figure_names],
     }

@@ -31,6 +31,7 @@ import pandas as pd
 import pytest
 import torch
 
+from teb_vae.lag_attn_rws.eval.figures_seam import figure_filename
 from teb_vae.lag_attn_rws.eval import events
 from teb_vae.lag_attn_rws.eval.analyses import events as events_analysis
 from teb_vae.lag_attn_rws.eval.collect import CONTRACTION_AGE_COLUMN, Collection
@@ -657,9 +658,9 @@ def test_the_analysis_runs_end_to_end_against_a_finished_run(tmp_path, evaluated
     for key in ("n_samples", "composition", "plan"):
         assert key in result
     directory = tmp_path / events_analysis.ANALYSIS_DIRNAME
-    assert (directory / events_analysis.DECELERATION_FIGURE).is_file()
-    assert (directory / events_analysis.TRIGGERED_FIGURE).is_file()
-    assert (directory / events_analysis.CONDITIONED_FIGURE).is_file()
+    assert (directory / figure_filename(events_analysis.DECELERATION_FIGURE)).is_file()
+    assert (directory / figure_filename(events_analysis.TRIGGERED_FIGURE)).is_file()
+    assert (directory / figure_filename(events_analysis.CONDITIONED_FIGURE)).is_file()
 
 
 def test_a_real_run_over_the_event_shards_recovers_the_injected_events(event_evaluated) -> None:

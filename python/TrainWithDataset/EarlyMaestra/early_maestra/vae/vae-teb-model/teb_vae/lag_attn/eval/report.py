@@ -374,10 +374,13 @@ def emit_grouped_variants(
         stem: Filename stem, yielding ``<stem>_by_<group>.csv`` and ``.pdf``.
         references: Optional metric-to-reference-value mapping, drawn as a horizontal line.
         order_groups: Optional ``(groups, group_column) -> ordered groups``, deciding the
-            left-to-right violin order and the CSV's row order alike. ``None`` keeps the
-            alphabetical order :func:`~teb_vae.lag_attn.eval.labels.distinct_groups` returns. A
-            callable that drops or invents a label is ignored, because the counts and the values
-            below are keyed on the labels actually present.
+            left-to-right violin order and the CSV's row order alike. ``None`` uses
+            :func:`~teb_vae.lag_attn.eval.labels.ordered_groups`, the family's one cohort order --
+            worst first -- rather than the alphabetical order
+            :func:`~teb_vae.lag_attn.eval.labels.distinct_groups` returns, so a grouped variant
+            reads in the same direction as every significance table beside it. A callable that
+            drops or invents a label is ignored, because the counts and the values below are keyed
+            on the labels actually present.
         group_palette: Optional ``groups -> {label: colour}``. ``None`` uses the figure module's
             default. Supplied by a package that draws cohorts from a palette of its own.
 
@@ -426,8 +429,12 @@ def emit_grouped_variants(
         # The reporting order, applied once and used by the table and the figure alike. Filtered
         # back onto the labels actually present so a caller's ordering cannot add a cohort that
         # is not there or silently drop one that is.
-        if order_groups is not None:
-            requested = [str(name) for name in order_groups(list(groups), group_column)]
+        # Defaulted rather than left alphabetical: this emitter draws a cohort fan-out, and a
+        # fan-out drawn healthy-first beside a pairwise table oriented worst-first is the one
+        # configuration in which a reader compares a violin against the wrong column.
+        ordering = order_groups if order_groups is not None else labels.ordered_groups
+        if ordering is not None:
+            requested = [str(name) for name in ordering(list(groups), group_column)]
             groups = [name for name in requested if name in groups]
             groups += [name for name in labels.distinct_groups(list(frame[group_column]))
                        if name not in groups]

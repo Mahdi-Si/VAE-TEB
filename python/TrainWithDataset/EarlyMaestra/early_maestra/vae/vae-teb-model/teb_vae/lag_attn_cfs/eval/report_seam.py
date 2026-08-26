@@ -90,7 +90,8 @@ def emit_grouped_variants(frame: Any, directory: Any, **kwargs: Any) -> Dict[str
     this package makes and the sibling does not, supplied together because a figure whose violins
     are ordered one way and coloured by another convention is worse than either alone:
 
-    * cohorts run **healthy, acidosis, HIE** and the eight subgroups in their canonical order,
+    * cohorts run **HIE, acidosis, healthy** and the eight subgroups in the reverse of their
+      canonical order,
       from :func:`~teb_vae.lag_attn_cfs.eval.cohort.ordered_groups`, rather than alphabetically --
       which would put ``acidosis`` first on every class figure and interleave the classes on every
       subgroup one;

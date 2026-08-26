@@ -36,6 +36,7 @@ import pandas as pd
 import pytest
 import torch
 
+from teb_vae.lag_attn_cfs.eval.figures_seam import figure_filename
 from teb_vae.lag_attn_cfs.eval import lag_axis
 from teb_vae.lag_attn_cfs.eval.analyses import attention
 from teb_vae.lag_attn_cfs.eval.metrics import (
@@ -414,8 +415,8 @@ def test_the_heatmap_is_emitted_when_the_attention_was_retained(tmp_path) -> Non
         _Collection(), tmp_path, delay_steps=0, geometry=_shipped_geometry()
     )
 
-    assert written == attention.HEATMAP_FIGURE
-    assert (tmp_path / attention.HEATMAP_FIGURE).is_file()
+    assert written == figure_filename(attention.HEATMAP_FIGURE)
+    assert (tmp_path / figure_filename(attention.HEATMAP_FIGURE)).is_file()
 
 
 def test_an_empty_pass_draws_the_empty_note_rather_than_raising() -> None:
@@ -506,7 +507,7 @@ def test_the_analysis_writes_its_tables(collected_run) -> None:
     per_head = pd.read_csv(directory / attention.PER_HEAD_FILENAME)
     lag = collected_run["summary"]["results"]["lag"]
 
-    assert (directory / attention.PROFILE_FIGURE).is_file()
+    assert (directory / figure_filename(attention.PROFILE_FIGURE)).is_file()
     assert sorted(set(per_head["head"])) == list(range(lag["num_heads"]))
     assert len(per_head) == lag["num_heads"] * lag["n_lags"]
     assert per_head["compensated_seconds"].tolist()[: lag["n_lags"]] == [
@@ -533,5 +534,5 @@ def test_the_heatmap_is_emitted_because_the_shipped_delta_retains_the_attention(
     assert block["plan"]["heatmap_cap_value"] not in (None, "absent")
     assert (
         Path(collected_run["results_dir"]) / attention.ANALYSIS_DIRNAME
-        / attention.HEATMAP_FIGURE
+        / figure_filename(attention.HEATMAP_FIGURE)
     ).is_file()

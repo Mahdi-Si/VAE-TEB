@@ -30,6 +30,7 @@ import pandas as pd
 import pytest
 import torch
 
+from teb_vae.lag_attn_rws.eval.figures_seam import figure_filename
 from teb_vae.lag_attn_rws.eval.analyses import forecast as forecast_analysis
 from teb_vae.lag_attn_rws.eval.metrics import (
     BASELINE_LOGVAR,
@@ -491,9 +492,9 @@ def test_no_waveform_retained_means_no_overlay_rather_than_an_empty_page(tmp_pat
         output_dir=tmp_path, probe=None,
     )
 
-    assert forecast_analysis.OVERLAY_FIGURE not in result["files"]
+    assert figure_filename(forecast_analysis.OVERLAY_FIGURE) not in result["files"]
     directory = tmp_path / forecast_analysis.ANALYSIS_DIRNAME
-    assert not (directory / forecast_analysis.OVERLAY_FIGURE).exists()
+    assert not (directory / figure_filename(forecast_analysis.OVERLAY_FIGURE)).exists()
 
 
 def test_a_retained_waveform_is_drawn_and_recorded(tmp_path) -> None:
@@ -503,9 +504,9 @@ def test_a_retained_waveform_is_drawn_and_recorded(tmp_path) -> None:
         output_dir=tmp_path, probe=None,
     )
 
-    assert forecast_analysis.OVERLAY_FIGURE in result["files"]
+    assert figure_filename(forecast_analysis.OVERLAY_FIGURE) in result["files"]
     assert (
-        tmp_path / forecast_analysis.ANALYSIS_DIRNAME / forecast_analysis.OVERLAY_FIGURE
+        tmp_path / forecast_analysis.ANALYSIS_DIRNAME / figure_filename(forecast_analysis.OVERLAY_FIGURE)
     ).is_file()
 
 
@@ -559,9 +560,9 @@ def test_the_analysis_writes_its_tables_and_figures(evaluated) -> None:
         forecast_analysis.SKILL_FILENAME,
         forecast_analysis.HORIZON_FILENAME,
         forecast_analysis.ANCHOR_FILENAME,
-        forecast_analysis.BASELINE_FIGURE,
-        forecast_analysis.ANCHOR_FIGURE,
-        forecast_analysis.HORIZON_FIGURE,
+        figure_filename(forecast_analysis.BASELINE_FIGURE),
+        figure_filename(forecast_analysis.ANCHOR_FIGURE),
+        figure_filename(forecast_analysis.HORIZON_FIGURE),
     ):
         assert (directory / name).is_file(), name
     # Every row is a recording, not a segment: the fixture has more segments than recordings.

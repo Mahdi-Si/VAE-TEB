@@ -79,6 +79,9 @@ VALID_KEYS = frozenset(
         # setting -- leaves ``figures.DEFAULT_FIGURE_FORMAT`` standing, which is what every
         # committed figure manifest records.
         "figure_format",
+        # How far before delivery a segment may be recorded and still be evaluated. ``None`` --
+        # the shipped setting -- evaluates every segment the split carries.
+        "max_hours_before_delivery",
     }
 )
 
@@ -114,6 +117,9 @@ DEFAULTS: Dict[str, Any] = {
     # Nullable on purpose: ``None`` means "whatever ``figures.DEFAULT_FIGURE_FORMAT`` is",
     # so this file names no format of its own and the default lives in exactly one place.
     "figure_format": None,
+    # Nullable for the same reason ``max_samples`` is: absence means "no bound", which is a
+    # different statement from any number and is the one the shipped runs make.
+    "max_hours_before_delivery": None,
 }
 
 #: Upper bound on the seed: ``numpy.random.seed`` rejects anything outside $[0, 2^{32})$, and
@@ -310,6 +316,13 @@ def force_single_process_loader(config: Dict[str, Any]) -> Dict[str, Any]:
 # =============================================================================
 # The eval_config block
 # =============================================================================
+#: Floor on ``max_hours_before_delivery``, in hours: one trajectory bin width. Below it a run has
+#: no whole window to draw, so the bound would empty every clock rather than narrow it. Kept equal
+#: to the binning module's own width by test rather than by import -- this module validates a run's
+#: settings before anything is built and stays a stdlib parse.
+_MIN_HORIZON_HOURS = 0.5
+
+
 def _require_positive_float(value: Any, name: str, *, minimum: float) -> float:
     """Return ``value`` as a finite float, raising if it is not one or is below ``minimum``.
 
@@ -452,5 +465,16 @@ def validate_eval_config(config: Mapping[str, Any]) -> Dict[str, Any]:
     # format keeps the default, and the manifests, which record ``.pdf`` names, stay correct.
     if resolved["figure_format"] is not None:
         resolved["figure_format"] = _require_figure_format(resolved["figure_format"])
+
+    # Nullable, and validated only when set -- the ``max_samples`` shape. It bounds the population
+    # every clock is computed over, so it is a config key and not a call-site default: a bounded
+    # run's trajectory is not comparable with an unbounded one's, and the dumped config is the
+    # only durable record of which this run was.
+    if resolved["max_hours_before_delivery"] is not None:
+        resolved["max_hours_before_delivery"] = _require_positive_float(
+            resolved["max_hours_before_delivery"],
+            "max_hours_before_delivery",
+            minimum=_MIN_HORIZON_HOURS,
+        )
 
     return resolved
