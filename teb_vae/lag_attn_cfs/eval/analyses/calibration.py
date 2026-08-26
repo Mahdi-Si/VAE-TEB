@@ -69,8 +69,8 @@ LOGVAR_FILENAME = "calibration_logvar.csv"
 PER_RECORDING_FILENAME = "calibration_per_recording.csv"
 
 #: The figures, named as ``FIGURE_GUIDE.md`` names them.
-PIT_FIGURE = "pit_reliability.pdf"
-LOGVAR_FIGURE = "logvar_distribution.pdf"
+PIT_FIGURE = "pit_reliability"
+LOGVAR_FIGURE = "logvar_distribution"
 
 #: The likelihood this analysis is defined under. Anything else is a recorded skip.
 REQUIRED_LIKELIHOOD = "gaussian_nll"
@@ -488,9 +488,9 @@ def run_calibration_analysis(
     chained = {row["metric"]: float(row["mean"]) for row in clamp_rows}
 
     written = [
-        str(figures.render_to_pdf(build_pit_figure(pit, coverage), directory / PIT_FIGURE).name),
+        str(figures.render_figure(build_pit_figure(pit, coverage), directory / PIT_FIGURE).name),
         str(
-            figures.render_to_pdf(
+            figures.render_figure(
                 build_logvar_figure(histogram, bounds), directory / LOGVAR_FIGURE
             ).name
         ),

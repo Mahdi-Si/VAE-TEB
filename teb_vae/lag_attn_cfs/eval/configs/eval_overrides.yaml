@@ -286,3 +286,18 @@ eval_config:
   # it must be a finite number of at least 0.001 nats, because zero passes on any non-negative
   # difference and a negative value can never fail at all.
   clock_margin_min_nats: null
+
+  # Image format for every figure the run writes, as a matplotlib filetype: `pdf`, `svg`, `png`,
+  # `eps`, `webp`, ... The installed matplotlib's own list is what a value is checked against, so
+  # a typo is refused at config load with the supported set named, before the model is built.
+  #
+  # `null` -- the shipped setting -- keeps `figures.DEFAULT_FIGURE_FORMAT`, which is `pdf`. That
+  # default is load-bearing: the committed `figure_manifest.json` and `FIGURE_GUIDE.md` record
+  # `.pdf` filenames and the slow smoke suite compares them against a real run, so a run that
+  # changes this writes filenames those files do not list. Change it for a one-off export, not as
+  # the committed setting, unless you also reseed the manifest.
+  #
+  # `svg` is the one to reach for when a figure is going into a vector editor or a web page;
+  # `png` when something needs a bitmap. Note DPI only affects rasterised content, so the
+  # heatmap-bearing pages stay raster inside an `svg` and those files get large.
+  figure_format: null

@@ -308,10 +308,10 @@ def test_the_threshold_line_sits_at_exactly_the_models_own_epsilon(
 ) -> None:
     r"""$10^{-2}$, imported from the model rather than restated, and the axis is symlog about it."""
     captured: dict = {}
-    original = figures.render_to_pdf
+    original = figures.render_figure
 
     def _capture(fig, path, **kwargs):
-        if Path(path).name == "per_dim_kl.pdf":
+        if Path(path).name == "per_dim_kl":
             ax = fig.axes[0]
             captured["lines"] = [line.get_ydata()[0] for line in ax.get_lines()]
             captured["scale"] = ax.get_yscale()
@@ -319,7 +319,7 @@ def test_the_threshold_line_sits_at_exactly_the_models_own_epsilon(
             captured["has_data"] = ax.has_data()
         return original(fig, path, **kwargs)
 
-    monkeypatch.setattr(figures, "render_to_pdf", _capture)
+    monkeypatch.setattr(figures, "render_figure", _capture)
     runner = make_eval_runner(output_dir=tmp_path / "runner")
     perturb_posterior(runner.model)
     _run(runner, tiny_loader, tiny_eval_config["eval_config"], tmp_path / "line")
@@ -339,16 +339,16 @@ def test_only_the_dimension_driven_above_the_threshold_is_coloured_active(
     so the bar colours are forced to a known pattern that a hardcoded palette would not produce.
     """
     captured: dict = {}
-    original = figures.render_to_pdf
+    original = figures.render_figure
 
     def _capture(fig, path, **kwargs):
-        if Path(path).name == "per_dim_kl.pdf":
+        if Path(path).name == "per_dim_kl":
             bars = [patch for patch in fig.axes[0].patches]
             captured["colors"] = [patch.get_facecolor() for patch in bars]
             captured["heights"] = [patch.get_height() for patch in bars]
         return original(fig, path, **kwargs)
 
-    monkeypatch.setattr(figures, "render_to_pdf", _capture)
+    monkeypatch.setattr(figures, "render_figure", _capture)
     runner = make_eval_runner(perturb=False, output_dir=tmp_path / "runner")
 
     # An untouched model has mu_post == mu_prior exactly, so shifting one posterior dimension is
@@ -386,17 +386,17 @@ def test_the_kt_curve_shades_both_ends_under_anchor_support(
     recording rather than as a window with no supervised target.
     """
     captured: dict = {}
-    original = figures.render_to_pdf
+    original = figures.render_figure
 
     def _capture(fig, path, **kwargs):
-        if Path(path).name == "kt_curve.pdf":
+        if Path(path).name == "kt_curve":
             captured["spans"] = [
                 patch.get_x() for patch in fig.axes[0].patches if patch.get_width() > 0
             ]
             captured["notes"] = [text.get_text() for text in fig.axes[0].texts]
         return original(fig, path, **kwargs)
 
-    monkeypatch.setattr(figures, "render_to_pdf", _capture)
+    monkeypatch.setattr(figures, "render_figure", _capture)
     runner = make_eval_runner(output_dir=tmp_path / "runner")
     assert str(runner.model.kld_support) == "anchor", "the shipped kwargs must use anchor support"
     perturb_posterior(runner.model)

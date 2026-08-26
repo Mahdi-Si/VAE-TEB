@@ -65,7 +65,7 @@ STRATIFIED_PROFILE_FILENAME = "lag_kl_stratified_profile.csv"
 STRATIFIED_PEAKS_FILENAME = "lag_kl_stratified_peaks.csv"
 
 #: The figure, named as ``FIGURE_GUIDE.md`` names it.
-PROFILE_FIGURE = "lag_kl_profile.pdf"
+PROFILE_FIGURE = "lag_kl_profile"
 
 #: Fraction of the peak a bin must reach to count as part of it. Half, so the reported width is
 #: the familiar full width at half maximum and a reader does not have to learn a local convention.
@@ -818,7 +818,7 @@ def run_lag_kl_analysis(
     pd.DataFrame(stratified_peaks).to_csv(directory / STRATIFIED_PEAKS_FILENAME, index=False)
 
     figure_name = str(
-        figures.render_to_pdf(
+        figures.render_figure(
             build_profile_figure(profile, lag, delay_steps=delay_steps, n_lags=n_lags),
             directory / PROFILE_FIGURE,
         ).name

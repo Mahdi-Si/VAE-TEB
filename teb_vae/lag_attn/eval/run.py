@@ -601,7 +601,9 @@ def main(
 
     # Once, here, rather than as an import side effect: apply_publication_style mutates global
     # rcParams, and an import that did it would restyle any figure produced in the same process.
-    configure_figure_style()
+    # The run's figure format is fixed in the same call and for the same reason -- it is a
+    # property of the pass, and every figure written after this line follows it.
+    configure_figure_style(eval_config["figure_format"])
 
     # Each analysis under report.step, so one failure does not discard the rest of a multi-hour
     # run. The probe's record is threaded through because it carries the sample count and the

@@ -244,10 +244,10 @@ def test_the_summary_figure_stacks_three_panels_and_carries_a_second_lag_axis(
 ) -> None:
     """The dual axis is the figure's whole contract: model lag and physical seconds together."""
     captured: dict = {}
-    original = figures.render_to_pdf
+    original = figures.render_figure
 
     def _capture(fig, path, **kwargs):
-        if Path(path).name == "attention.pdf":
+        if Path(path).name == "attention":
             captured["titles"] = [ax.get_title() for ax in fig.axes if ax.get_title()]
             captured["has_data"] = [ax.has_data() for ax in fig.axes if ax.get_title()]
             # A secondary axis is a *child* of the axes that created it, not a figure-level
@@ -261,7 +261,7 @@ def test_the_summary_figure_stacks_three_panels_and_carries_a_second_lag_axis(
             captured["suptitle"] = fig._suptitle.get_text() if fig._suptitle else ""
         return original(fig, path, **kwargs)
 
-    monkeypatch.setattr(figures, "render_to_pdf", _capture)
+    monkeypatch.setattr(figures, "render_figure", _capture)
     runner = make_eval_runner(output_dir=tmp_path / "runner")
     _run(runner, tiny_loader, tiny_eval_config["eval_config"], tmp_path / "figure")
 
@@ -280,10 +280,10 @@ def test_the_heatmap_figure_draws_one_row_per_retained_sample(
 ) -> None:
     """The heatmap cap is the `samples` one, not the much larger `attention` retention cap."""
     captured: dict = {}
-    original = figures.render_to_pdf
+    original = figures.render_figure
 
     def _capture(fig, path, **kwargs):
-        if Path(path).name == "attention_heatmaps.pdf":
+        if Path(path).name == "attention_heatmaps":
             captured["titles"] = [ax.get_title() for ax in fig.axes if ax.get_title()]
             captured["secondary_y"] = [
                 child.get_ylabel()
@@ -293,7 +293,7 @@ def test_the_heatmap_figure_draws_one_row_per_retained_sample(
             ]
         return original(fig, path, **kwargs)
 
-    monkeypatch.setattr(figures, "render_to_pdf", _capture)
+    monkeypatch.setattr(figures, "render_figure", _capture)
     runner = make_eval_runner(output_dir=tmp_path / "runner")
     summary, _ = _run(runner, tiny_loader, tiny_eval_config["eval_config"], tmp_path / "heat")
 

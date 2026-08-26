@@ -254,7 +254,7 @@ def test_two_figures_are_written_with_dual_labels_and_exclusion_counts(
     make_eval_runner, tiny_loader, tiny_eval_config, tmp_path, monkeypatch, perturb_full_pathway
 ) -> None:
     captured: dict = {}
-    original = figures.render_to_pdf
+    original = figures.render_figure
 
     def _capture(fig, path, **kwargs):
         ax = fig.axes[0]
@@ -266,12 +266,12 @@ def test_two_figures_are_written_with_dual_labels_and_exclusion_counts(
         }
         return original(fig, path, **kwargs)
 
-    monkeypatch.setattr(figures, "render_to_pdf", _capture)
+    monkeypatch.setattr(figures, "render_figure", _capture)
     runner = make_eval_runner(output_dir=tmp_path / "runner")
     perturb_full_pathway(runner.model)
     summary, _ = _run(runner, tiny_loader, tiny_eval_config["eval_config"], tmp_path / "figs")
 
-    assert set(captured) == {"forecast_degradation.pdf", "kl_change.pdf"}
+    assert set(captured) == {"forecast_degradation", "kl_change"}
     for record in captured.values():
         assert record["has_data"]
         labels = " ".join(record["labels"])
@@ -329,14 +329,14 @@ def test_suppressing_one_bands_contribution_moves_that_bands_bar(
     the figure test passes on a chart that plots the same number four times.
     """
     captured: dict = {}
-    original = figures.render_to_pdf
+    original = figures.render_figure
 
     def _capture(fig, path, **kwargs):
-        if Path(path).name == "forecast_degradation.pdf":
+        if Path(path).name == "forecast_degradation":
             captured["heights"] = [patch.get_height() for patch in fig.axes[0].patches]
         return original(fig, path, **kwargs)
 
-    monkeypatch.setattr(figures, "render_to_pdf", _capture)
+    monkeypatch.setattr(figures, "render_figure", _capture)
     runner = make_eval_runner(output_dir=tmp_path / "runner")
     perturb_full_pathway(runner.model)
 

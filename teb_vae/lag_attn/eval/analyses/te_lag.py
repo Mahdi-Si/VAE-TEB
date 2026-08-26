@@ -272,7 +272,7 @@ def _write_te_figure(
             f"averaging them in would subtract mass from the profile.",
             fontsize=7, y=0.999,
         )
-        return str(figures.render_to_pdf(figure, directory / "te_lag.pdf"))
+        return str(figures.render_figure(figure, directory / "te_lag"))
     finally:
         figures.plt.close(figure)
 
@@ -328,7 +328,7 @@ def _write_per_head_figure(
             "because head_structured_latent is on -- under a flat latent this panel is refused.",
             fontsize=7, y=0.999,
         )
-        return str(figures.render_to_pdf(figure, directory / "per_head_lag_profile.pdf"))
+        return str(figures.render_figure(figure, directory / "per_head_lag_profile"))
     finally:
         figures.plt.close(figure)
 

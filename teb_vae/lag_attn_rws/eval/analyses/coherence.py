@@ -98,12 +98,12 @@ SOURCE_FILENAME = "coherence_source.csv"
 SEAM_FILENAME = "coherence_seam.csv"
 
 #: The figures, named as ``FIGURE_GUIDE.md`` names them.
-LEAD_TIME_FIGURE = "coherence_lead_time.pdf"
-SPECTRUM_FIGURE = "coherence_spectrum.pdf"
-BANDS_FIGURE = "coherence_bands.pdf"
-DECOMPOSITION_FIGURE = "coherence_decomposition.pdf"
-SOURCE_FIGURE = "coherence_source.pdf"
-SEAM_FIGURE = "coherence_seam.pdf"
+LEAD_TIME_FIGURE = "coherence_lead_time"
+SPECTRUM_FIGURE = "coherence_spectrum"
+BANDS_FIGURE = "coherence_bands"
+DECOMPOSITION_FIGURE = "coherence_decomposition"
+SOURCE_FIGURE = "coherence_source"
+SEAM_FIGURE = "coherence_seam"
 
 #: The two forecast branches, in the order every table and legend lists them.
 BRANCHES: Tuple[str, ...] = ("base", "full")
@@ -1290,7 +1290,7 @@ def run_coherence_analysis(
         # Figures yes, tables no -- see :data:`SKIP_WRITES_TABLES` for why an empty CSV here would
         # be worse than no CSV at all.
         for name, builder in figure_builders:
-            figures.render_to_pdf(builder(), directory / name)
+            figures.render_figure(builder(), directory / name)
         return {
             **skip_record(
                 "the tables carry no cross-spectral sums. They were collected before the "
@@ -1408,7 +1408,7 @@ def run_coherence_analysis(
         (SOURCE_FIGURE, lambda: build_source_figure(source_table)),
         (SEAM_FIGURE, lambda: build_seam_figure(seams)),
     ):
-        written.append(str(figures.render_to_pdf(builder(), directory / name).name))
+        written.append(str(figures.render_figure(builder(), directory / name).name))
 
     # Segments, not recordings: the coverage block compares this against every other analysis's
     # count, and a recording count here would read as a population disagreement with all of them.

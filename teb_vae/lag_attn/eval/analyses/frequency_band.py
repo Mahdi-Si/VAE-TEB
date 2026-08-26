@@ -405,7 +405,7 @@ def _write_partition_figures(
                 reference_label="$R^2 = 0$ (predicting the channel mean)",
             )
         written["band_violins"] = str(
-            figures.render_to_pdf(figure, directory / "band_violins.pdf")
+            figures.render_figure(figure, directory / "band_violins")
         )
     finally:
         figures.plt.close(figure)
@@ -439,7 +439,7 @@ def _write_partition_figures(
         )
         figures.label_rows(axes[2, 0], rendered)
         written["band_horizon"] = str(
-            figures.render_to_pdf(figure, directory / "band_horizon.pdf")
+            figures.render_figure(figure, directory / "band_horizon")
         )
     finally:
         figures.plt.close(figure)
@@ -494,7 +494,7 @@ def _write_channel_figure(
             )
         return {
             "per_channel_frequency": str(
-                figures.render_to_pdf(figure, directory / "per_channel_frequency.pdf")
+                figures.render_figure(figure, directory / "per_channel_frequency")
             )
         }
     finally:

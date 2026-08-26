@@ -87,8 +87,8 @@ PER_SEGMENT_FILENAME = "per_segment_metrics.csv"
 #: normalises those two suffixes out of the manifest as a *family*, so such a file is never
 #: recorded, never documented, and reads to an operator as one of the violin figures it is not.
 #: These are named the other way round for that reason.
-CLASS_FIGURE = "class_histograms.pdf"
-SUBGROUP_FIGURE = "subgroup_histograms.pdf"
+CLASS_FIGURE = "class_histograms"
+SUBGROUP_FIGURE = "subgroup_histograms"
 
 #: Bins per panel. A module constant rather than an ``eval_config`` key, for the reason
 #: ``TRAJECTORY_BIN_HOURS`` and the significance level are not keys either: an operator who could
@@ -685,10 +685,10 @@ def run_distributions_analysis(
     rows = build_summary_rows(segment, recording, units)
     pd.DataFrame(rows).to_csv(directory / SUMMARY_FILENAME, index=False)
 
-    # ``render_to_pdf`` closes the figure it saves, which is why nothing here does: a production
+    # ``render_figure`` closes the figure it saves, which is why nothing here does: a production
     # pass draws two figures per analysis and matplotlib holds every unclosed one alive.
     written = [
-        str(figures.render_to_pdf(builder(segment, recording, units), directory / filename).name)
+        str(figures.render_figure(builder(segment, recording, units), directory / filename).name)
         for filename, builder in (
             (CLASS_FIGURE, build_class_figure), (SUBGROUP_FIGURE, build_subgroup_figure),
         )

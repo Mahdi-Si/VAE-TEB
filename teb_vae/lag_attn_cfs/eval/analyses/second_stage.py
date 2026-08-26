@@ -69,8 +69,8 @@ ELIGIBILITY_FILENAME = "second_stage_eligibility.csv"
 
 #: The figures, named as ``FIGURE_GUIDE.md`` names them. The trajectory is the shape of the two
 #: readouts against this clock; the windows page is what that shape is made of.
-TRAJECTORY_FIGURE = "second_stage_trajectory.pdf"
-WINDOWS_FIGURE = "second_stage_windows.pdf"
+TRAJECTORY_FIGURE = "second_stage_trajectory"
+WINDOWS_FIGURE = "second_stage_windows"
 
 #: Width of a window, in hours. The **same** grid the delivery clock uses, bound from the layer
 #: below rather than restated, so a window on one clock's figure is the same duration as a window on
@@ -759,12 +759,12 @@ def run_second_stage_analysis(
     pairwise_frame(significance).to_csv(directory / PAIRWISE_FILENAME, index=False)
 
     figure_name = str(
-        figures.render_to_pdf(
+        figures.render_figure(
             build_trajectory_figure(rows, labels.CLASS_COLUMN), directory / TRAJECTORY_FIGURE
         ).name
     )
     windows_name = str(
-        figures.render_to_pdf(
+        figures.render_figure(
             build_windows_figure(class_frame, significance), directory / WINDOWS_FIGURE
         ).name
     )

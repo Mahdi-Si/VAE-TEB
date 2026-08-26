@@ -69,7 +69,7 @@ BOUNDARIES_FILENAME = "whole_delivery_boundaries.csv"
 SUMMARY_FILENAME = "whole_delivery_summary.csv"
 
 #: The figure, named as ``FIGURE_GUIDE.md`` names it.
-PROFILE_FIGURE = "trajectory_profile.pdf"
+PROFILE_FIGURE = "trajectory_profile"
 
 #: The per-anchor columns profiled, as ``(reported name, column, axis label)``. Both readouts,
 #: because they fail differently -- the KL is inflated by an arbitrary factor whenever the prior
@@ -413,7 +413,7 @@ def run_trajectory_analysis(
     summary.to_csv(directory / SUMMARY_FILENAME, index=False)
 
     figure_name = str(
-        figures.render_to_pdf(
+        figures.render_figure(
             build_profile_figure(profile, trajectory), directory / PROFILE_FIGURE
         ).name
     )

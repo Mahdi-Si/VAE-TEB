@@ -82,8 +82,8 @@ PER_RECORDING_FILENAME = "coupling_per_recording.csv"
 SUMMARY_FILENAME = "coupling_summary.csv"
 
 #: The figures, named as ``FIGURE_GUIDE.md`` names them.
-DISTRIBUTION_FIGURE = "pred_gap_distribution.pdf"
-PERCENT_FIGURE = "pred_gap_percent.pdf"
+DISTRIBUTION_FIGURE = "pred_gap_distribution"
+PERCENT_FIGURE = "pred_gap_percent"
 
 #: The two ``pred_gap`` estimators, each with the path it was computed on. The label travels with
 #: the column into every row this analysis writes: the block score difference is the same
@@ -637,12 +637,12 @@ def run_coupling_analysis(
 
     figure_names = [
         str(
-            figures.render_to_pdf(
+            figures.render_figure(
                 build_distribution_figure(per_guid, gap_rows), directory / DISTRIBUTION_FIGURE
             ).name
         ),
         str(
-            figures.render_to_pdf(
+            figures.render_figure(
                 build_percent_figure(per_guid, percent_rows), directory / PERCENT_FIGURE
             ).name
         ),

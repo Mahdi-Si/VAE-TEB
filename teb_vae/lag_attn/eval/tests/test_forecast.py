@@ -194,15 +194,15 @@ def test_the_figures_have_the_panels_and_titles_they_claim(tmp_path) -> None:
 def test_the_heatmap_figure_stacks_three_panels_in_order(tmp_path, monkeypatch) -> None:
     """Panel count and title order, asserted on the in-memory figure before it is saved."""
     captured: Dict[str, Any] = {}
-    original = figures.render_to_pdf
+    original = figures.render_figure
 
     def _capture(fig, path, **kwargs):
-        if Path(path).name == "heatmaps.pdf":
+        if Path(path).name == "heatmaps":
             captured["titles"] = [ax.get_title() for ax in fig.axes if ax.get_title()]
             captured["has_data"] = [ax.has_data() for ax in fig.axes if ax.get_title()]
         return original(fig, path, **kwargs)
 
-    monkeypatch.setattr(figures, "render_to_pdf", _capture)
+    monkeypatch.setattr(figures, "render_figure", _capture)
     triple = {
         "forecast": np.random.default_rng(1).normal(size=(8, 20)),
         "target": np.random.default_rng(2).normal(size=(8, 20)),

@@ -57,7 +57,7 @@ EXPECTED_SUBGROUP_ORDER = [
 def test_the_seam_binds_the_shared_panels_rather_than_copies() -> None:
     """Identity: a fork would pass every behavioural test below and still drift from the training
     figures it must stay colour-consistent with."""
-    assert figures_seam.render_to_pdf is shared_figures.render_to_pdf
+    assert figures_seam.render_figure is shared_figures.render_figure
     assert figures_seam.violin_panel is shared_figures.violin_panel
     assert figures_seam.grouped_violin_figure is shared_figures.grouped_violin_figure
     assert figures_seam.EMPTY_NOTE == shared_figures.EMPTY_NOTE
@@ -136,12 +136,12 @@ def test_a_grouped_violin_figure_draws_one_body_per_populated_group() -> None:
     assert len(bodies) == 2
 
 
-def test_render_to_pdf_writes_the_file_and_leaves_no_open_figure(tmp_path) -> None:
+def test_render_figure_writes_the_file_and_leaves_no_open_figure(tmp_path) -> None:
     shared_figures.plt.close("all")
     figure, axes = figures_seam.new_figure(1)
     figures_seam.histogram_panel(axes[0, 0], np.linspace(0.0, 1.0, 32), title="pred_gap")
 
-    path = figures_seam.render_to_pdf(figure, tmp_path / "pred_gap.pdf")
+    path = figures_seam.render_figure(figure, tmp_path / "pred_gap")
 
     assert Path(path).is_file() and Path(path).stat().st_size > 0
     assert shared_figures.plt.get_fignums() == []

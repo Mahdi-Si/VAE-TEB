@@ -59,8 +59,8 @@ PAIRWISE_FILENAME = "time_to_delivery_pairwise.csv"
 #: readouts against the clock; the windows page is what that shape is made of -- the per-recording
 #: distribution in every window, the corrected significance of every window, and the effect size of
 #: every cohort pair that survived it.
-TRAJECTORY_FIGURE = "time_to_delivery_trajectory.pdf"
-WINDOWS_FIGURE = "time_to_delivery_windows.pdf"
+TRAJECTORY_FIGURE = "time_to_delivery_trajectory"
+WINDOWS_FIGURE = "time_to_delivery_windows"
 
 #: Width of a time-before-delivery window, in hours. Bound from the layer below rather than
 #: restated: the lag structure is cut on the same windows and an analysis may not import another,
@@ -637,12 +637,12 @@ def run_time_to_delivery_analysis(
     pairwise_frame(significance).to_csv(directory / PAIRWISE_FILENAME, index=False)
 
     figure_name = str(
-        figures.render_to_pdf(
+        figures.render_figure(
             build_trajectory_figure(rows, labels.CLASS_COLUMN), directory / TRAJECTORY_FIGURE
         ).name
     )
     windows_name = str(
-        figures.render_to_pdf(
+        figures.render_figure(
             build_windows_figure(class_frame, significance), directory / WINDOWS_FIGURE
         ).name
     )

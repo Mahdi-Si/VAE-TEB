@@ -74,7 +74,7 @@ ANALYSIS_DIRNAME = "spectral_skill"
 PER_RECORDING_FILENAME = "spectral_skill_per_recording.csv"
 BAND_FILENAME = "spectral_skill_bands.csv"
 CHANNEL_FILENAME = "spectral_skill_channels.csv"
-BAND_FIGURE = "spectral_skill_bands.pdf"
+BAND_FIGURE = "spectral_skill_bands"
 
 #: The two channel maps this analysis joins through, both written into the results **root** by the
 #: unskippable channel-map step. Named here rather than imported from the module that writes them,
@@ -622,7 +622,7 @@ def run_spectral_skill_analysis(
     channels.to_csv(directory / CHANNEL_FILENAME, index=False)
 
     figure_name = str(
-        figures.render_to_pdf(
+        figures.render_figure(
             build_band_figure(per_guid, rows), directory / BAND_FIGURE
         ).name
     )

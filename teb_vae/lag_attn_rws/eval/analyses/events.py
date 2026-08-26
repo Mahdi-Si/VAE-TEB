@@ -70,9 +70,9 @@ CONDITIONED_FILENAME = "conditioned_coupling.csv"
 CONDITIONED_PER_RECORDING_FILENAME = "conditioned_coupling_per_recording.csv"
 
 #: The figures, named as ``FIGURE_GUIDE.md`` names them.
-DECELERATION_FIGURE = "deceleration_skill.pdf"
-TRIGGERED_FIGURE = "contraction_triggered.pdf"
-CONDITIONED_FIGURE = "conditioned_coupling.pdf"
+DECELERATION_FIGURE = "deceleration_skill"
+TRIGGERED_FIGURE = "contraction_triggered"
+CONDITIONED_FIGURE = "conditioned_coupling"
 
 #: The two model branches scored against the truth, and the difference reported beside them.
 BRANCHES: Tuple[str, ...] = ("base", "full")
@@ -764,14 +764,14 @@ def run_events_analysis(
         written.append(TRIGGERED_FILENAME)
 
     figure_names = [
-        str(figures.render_to_pdf(
+        str(figures.render_figure(
             build_deceleration_figure(pd.DataFrame(waveforms["skill"])),
             directory / DECELERATION_FIGURE,
         ).name),
-        str(figures.render_to_pdf(
+        str(figures.render_figure(
             build_triggered_figure(triggered), directory / TRIGGERED_FIGURE
         ).name),
-        str(figures.render_to_pdf(
+        str(figures.render_figure(
             build_conditioned_figure(conditioned["per_recording"]), directory / CONDITIONED_FIGURE
         ).name),
     ]

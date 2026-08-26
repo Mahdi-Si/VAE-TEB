@@ -62,7 +62,7 @@ PAIRWISE_FILENAME = "cross_subgroup_pairwise.csv"
 RESULT_FILENAME = "cross_subgroup.json"
 
 #: The figure, named as ``FIGURE_GUIDE.md`` names it.
-HEATMAP_FIGURE = "subgroup_heatmap.pdf"
+HEATMAP_FIGURE = "subgroup_heatmap"
 
 #: Family-wise error rate the Holm correction controls. Deliberately not an ``eval_config`` key:
 #: an operator who could raise it could make any metric significant.
@@ -554,7 +554,7 @@ def run_cross_subgroup_analysis(
     with open(directory / RESULT_FILENAME, "w", encoding="utf-8") as handle:
         json.dump(json_safe(record), handle, indent=2)
     figure_name = str(
-        figures.render_to_pdf(build_heatmap_figure(record), directory / HEATMAP_FIGURE).name
+        figures.render_figure(build_heatmap_figure(record), directory / HEATMAP_FIGURE).name
     )
 
     n_recordings = int(significance["n_recordings"].max()) if len(significance) else 0

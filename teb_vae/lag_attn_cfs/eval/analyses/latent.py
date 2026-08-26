@@ -60,7 +60,7 @@ DIAGNOSTICS_FILENAME = "latent_diagnostics.csv"
 PER_RECORDING_FILENAME = "latent_per_recording.csv"
 
 #: The figure, named as ``FIGURE_GUIDE.md`` names it.
-SPECTRUM_FIGURE = "kl_spectrum.pdf"
+SPECTRUM_FIGURE = "kl_spectrum"
 
 #: The per-sample diagnostics reduced per recording, each with what it is for. Ordered so the
 #: table reads prior first, then posterior, then the two bounds' saturation.
@@ -257,7 +257,7 @@ def run_latent_analysis(
     pd.DataFrame(diagnostic_rows).to_csv(directory / DIAGNOSTICS_FILENAME, index=False)
 
     figure_name = str(
-        figures.render_to_pdf(
+        figures.render_figure(
             build_spectrum_figure(spectrum), directory / SPECTRUM_FIGURE
         ).name
     )

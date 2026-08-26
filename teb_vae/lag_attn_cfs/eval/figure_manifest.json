@@ -27,8 +27,10 @@
     ],
     "lag_clocks": [
       "lag_second_stage.pdf",
+      "lag_second_stage_features.pdf",
       "lag_second_stage_windows.pdf",
       "lag_time_to_delivery.pdf",
+      "lag_time_to_delivery_features.pdf",
       "lag_time_to_delivery_windows.pdf"
     ],
     "lag_kl": [

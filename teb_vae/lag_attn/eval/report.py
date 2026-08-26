@@ -203,7 +203,14 @@ def build_manifest(output_dir: Any, since: Optional[float] = None) -> Dict[str, 
             n_stale += 1
             continue
         files[path.relative_to(root).as_posix()] = int(stat.st_size)
-    figures = sorted(name for name in files if name.endswith(".pdf"))
+    # The figure subset is whatever this run actually wrote, so it follows the run's format
+    # rather than a literal: a summary that counted only `.pdf` would report zero figures on
+    # an `svg` run and the documentation test would then cover nothing. Imported here rather
+    # than at module scope for the same reason the builder below is -- see `_grouped_figures`.
+    from teb_vae.lag_attn.eval.figures import active_figure_format
+
+    suffix = f".{active_figure_format()}"
+    figures = sorted(name for name in files if name.endswith(suffix))
     return {
         "files": files,
         "n_files": len(files),
@@ -455,7 +462,7 @@ def emit_grouped_variants(
             colors=None if group_palette is None else group_palette(groups),
         )
         try:
-            pdf_path = figures.render_to_pdf(figure, directory / f"{stem}_by_{group_column}.pdf")
+            pdf_path = figures.render_figure(figure, directory / f"{stem}_by_{group_column}")
         finally:
             figures.plt.close(figure)
 

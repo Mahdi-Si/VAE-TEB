@@ -54,7 +54,7 @@ CONDITIONED_FILENAME = "conditioned_coupling.csv"
 CONDITIONED_PER_RECORDING_FILENAME = "conditioned_coupling_per_recording.csv"
 
 #: The figure, named as ``FIGURE_GUIDE.md`` names it.
-CONDITIONED_FIGURE = "conditioned_coupling.pdf"
+CONDITIONED_FIGURE = "conditioned_coupling"
 
 #: Guards. Below either of these the conditioned comparison is a recorded skip rather than a
 #: number: a rate over a handful of anchors from one or two recordings is dominated by which
@@ -314,7 +314,7 @@ def run_events_analysis(
         collection, directory, window_s=window_s, resamples=resamples, seed=seed
     )
     pd.DataFrame(conditioned["rows"]).to_csv(directory / CONDITIONED_FILENAME, index=False)
-    figure_name = str(figures.render_to_pdf(
+    figure_name = str(figures.render_figure(
         build_conditioned_figure(conditioned["per_recording"]), directory / CONDITIONED_FIGURE
     ).name)
 
