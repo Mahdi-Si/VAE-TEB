@@ -250,7 +250,7 @@ def test_the_encoder_axis_delta_is_the_two_history_encoders(design, measured_tot
 
 
 def test_the_input_representation_delta_decomposes_into_the_two_terms_the_design_states(
-    design, measured_totals, measured_models
+    design, measured_totals, measured_models, budget
 ):
     """The two input adapters, with the decoder head contributing nothing -- and it must be the same
     delta the conv-LSTM pair shows, because every module outside the encoders is shared. Attributed
@@ -260,14 +260,24 @@ def test_the_input_representation_delta_decomposes_into_the_two_terms_the_design
     forecasts $30$ steps like the raw-signal sibling it is compared against. **The two start
     embeddings used to be a third and are now exactly zero too**: the reach guard builds both and
     this cell built neither until the alignment made its shifted warm-up start above zero on both
-    streams. Both are computed rather than deleted so either divergence reappears as a failing
-    sum."""
+    streams. Both are computed rather than deleted so either divergence reappears as a failing sum.
+
+    **The delta is negative at this row's own reference**, because the alignment leaves this cell
+    *narrower* on both streams than the reach guard leaves the two-sided sibling; it was positive
+    while this cell carried $98$ and $47$ channels. The surviving widths come from the resolved
+    ``budget`` so a future reference moves the expected decomposition with the model, while the
+    sibling's $78$ and $29$ stay literals -- they are the reach guard's, and belong to another cell.
+    """
     section = _markdown_section(design, "## 13. ")
     delta = measured_totals["trf_crws_guarded"] - measured_totals["trf_rws_guarded"]
 
     horizon_embedding = (30 - 30) * 256
     start_embeddings = (2 - 2) * 128
-    adapters = 128 * (98 - 78) * 2 + 128 * (47 - 29) * 2
+    # Two linears per adapter -- the input linear and the availability projection -- each narrowing
+    # from the sibling's reach-gated width to this cell's aligned one.
+    adapters = (
+        128 * (budget.target.kept_width - 78) * 2 + 128 * (budget.source.kept_width - 29) * 2
+    )
 
     assert horizon_embedding == 0, "the two horizons diverged; §13 needs its second term back"
     assert start_embeddings == 0, (
@@ -293,15 +303,33 @@ def test_the_input_representation_delta_decomposes_into_the_two_terms_the_design
 
 
 def test_the_guard_delta_is_the_two_availability_projections_alone(
-    design, measured_totals, measured_models
+    design, measured_totals, measured_models, budget
 ):
-    """Nothing in this target domain widens a head, so every parameter the guard adds is under an
-    adapter -- asserted by name -- and the arithmetic §13 states for it is evaluated."""
+    """Nothing in this target domain widens a head, so every parameter the guard moves is under an
+    adapter -- asserted by name -- and the arithmetic §13 states for it is evaluated.
+
+    **The guard is a net saving here and a net cost on the raw-signal sibling**, and §13 states both
+    beside each other so two correct figures that disagree even in *direction* are not read as a
+    contradiction: the guard adds one availability projection per stream at the surviving width plus
+    a start embedding each, and takes away the width the two input linears lose. At this reference
+    the narrowing dominates. Written against the resolved ``budget`` so a future reference moves the
+    expected arithmetic with the model.
+    """
     section = _markdown_section(design, "## 13. ")
     guard = measured_totals["trf_crws_guarded"] - measured_totals["trf_crws_ungated"]
     sibling = measured_totals["trf_rws_guarded"] - measured_totals["trf_rws_ungated"]
+    target, source = budget.target, budget.source
 
-    assert guard == 128 * 98 + 128 * 47 + 2 * 128 - 128 * 4 - 128 * 4
+    assert guard == (
+        # Added: an availability projection per stream at the SURVIVING width, and the one start
+        # embedding each adapter builds once the shifted warm-up starts above zero.
+        128 * target.kept_width
+        + 128 * source.kept_width
+        + 2 * 128
+        # Removed: each stream's input linear narrows from the stored width to the surviving one.
+        - 128 * (target.declared_width - target.kept_width)
+        - 128 * (source.declared_width - source.kept_width)
+    )
     for name in _differing_names(
         measured_models["trf_crws_guarded"], measured_models["trf_crws_ungated"]
     ):

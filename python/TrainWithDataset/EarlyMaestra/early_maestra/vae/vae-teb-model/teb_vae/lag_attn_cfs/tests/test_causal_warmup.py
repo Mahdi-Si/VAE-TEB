@@ -30,6 +30,8 @@ import pytest
 
 from hdf5_dataset.hdf5_dataset import decimated_trim_steps
 from teb_vae.lag_attn_cfs.causal_warmup import (
+    ALIGNMENT_DELAY_FACTOR,
+    GAMMATONE_ORDER,
     SOURCE_BLOCKS,
     STEP_SECONDS,
     TARGET_BLOCKS,
@@ -563,27 +565,40 @@ def test_target_max_resolves_the_shipped_reference_off_the_shards(aligned) -> No
     assert aligned.reference_delay_s in set(aligned.target.declared_delay_s)
 
 
-def test_the_shifts_span_zero_to_ninety_seven_on_both_streams(aligned) -> None:
-    """Zero at the reference channel, largest at the fastest one, and never negative."""
+def test_the_shifts_span_zero_to_eighty_five_on_both_streams(aligned) -> None:
+    r"""Zero at the reference channel, largest at the fastest one, and never negative.
+
+    $85$ rather than the $97$ this pinned before :data:`ALIGNMENT_DELAY_FACTOR` existed: the
+    shift carries $\kappa = 0.875$, so the span shrinks by exactly that factor while the
+    keep-index, which depends on $\tau_c \le \tau_{\mathrm{ref}}$ alone, does not move at all.
+    """
     for stream in (aligned.target, aligned.source):
         assert stream.align_delays is not None, stream.name
         assert min(stream.align_delays) == 0, stream.name
-        assert stream.max_align_delay == 97, stream.name
+        assert stream.max_align_delay == 85, stream.name
         assert all(shift >= 0 for shift in stream.align_delays), stream.name
         assert len(stream.align_delays) == stream.kept_width, stream.name
 
 
 def test_the_quantisation_residual_stays_inside_half_a_step(aligned) -> None:
     r"""Rounding, not ceiling: both directions are causally safe, so the only criterion is the
-    residual $\lvert\tau_{\mathrm{ref}} - \tau_c - \Delta d_c\rvert \le \Delta/2 = 2$ s. Measured at
-    $1.8932$ s on the shipped bank, which is the number the alignment is priced at."""
+    residual $\lvert\kappa(\tau_{\mathrm{ref}} - \tau_c) - \Delta d_c\rvert \le \Delta/2 = 2$ s.
+    Measured at $1.9865$ s on the shipped bank, which is the number the alignment is priced at.
+
+    The residual is taken against the **scaled** difference, because that is what the shift is
+    rounding: measuring it against the unscaled one would report the alignment error as
+    $\approx 50$ s and say nothing about the rounding.
+    """
     for stream in (aligned.target, aligned.source):
         residual = max(
-            abs(aligned.reference_delay_s - delay - STEP_SECONDS * shift)
+            abs(
+                ALIGNMENT_DELAY_FACTOR * (aligned.reference_delay_s - delay)
+                - STEP_SECONDS * shift
+            )
             for delay, shift in zip(stream.delay_s, stream.align_delays)
         )
         assert residual <= STEP_SECONDS / 2.0, stream.name
-        assert residual == pytest.approx(1.8932, abs=1e-3), stream.name
+        assert residual == pytest.approx(1.9865, abs=1e-3), stream.name
 
 
 def test_the_zero_marginal_warm_up_lemma_holds_exactly_on_both_streams(aligned) -> None:
@@ -602,7 +617,7 @@ def test_the_zero_marginal_warm_up_lemma_holds_exactly_on_both_streams(aligned) 
     # And the *minimum* crosses zero, which is the change that is easy to miss: it is what builds
     # the availability adapter's start-of-record token for the first time in this family.
     for stream in (aligned.target, aligned.source):
-        assert min(stream.combined_steps) == 91, stream.name
+        assert min(stream.combined_steps) == 80, stream.name
         assert min(stream.warmup_steps) == 0, stream.name
 
 
@@ -773,12 +788,30 @@ def test_the_expected_leg_alignment_may_be_left_unstated(aligned) -> None:
     assert unstated.target.align_delays == aligned.target.align_delays
 
 
+def test_the_alignment_factor_agrees_with_the_bank_that_defines_it() -> None:
+    r"""The resolver restates $\kappa$ rather than importing it, so pin the two together.
+
+    ``causal_warmup`` must stay free of ``hdf5_dataset.causal_scattering``, which builds the
+    two-sided filter bank at import; the cost of that isolation is a second copy of
+    :data:`ALIGNMENT_DELAY_FACTOR` and of the gammatone order it is derived from. This is the test
+    that makes the copy safe -- a bank rebuilt at another order fails here rather than silently
+    aligning every channel against the wrong constant.
+    """
+    from hdf5_dataset import causal_scattering
+
+    assert GAMMATONE_ORDER == causal_scattering.GAMMATONE_ORDER
+    assert ALIGNMENT_DELAY_FACTOR == pytest.approx(
+        causal_scattering.ALIGNMENT_DELAY_FACTOR, abs=0.0
+    )
+    assert ALIGNMENT_DELAY_FACTOR == pytest.approx(0.875, abs=0.0)
+
+
 def test_the_summary_names_the_reference_and_the_leg_alignment(aligned, unaligned) -> None:
     """The startup log is the only place a run states which clock it read its channels on."""
     aligned_summary = aligned.summary()
     assert "reference 402.1604 s" in aligned_summary
     assert "leg alignment envelope" in aligned_summary
-    assert "shift 0-97 steps" in aligned_summary
+    assert "shift 0-85 steps" in aligned_summary
     assert "up_st 32/36" in aligned_summary and "up_ph 15/15" in aligned_summary
 
     # And the unaligned line does not grow a "shift 0-0" that would read as a mechanism running.

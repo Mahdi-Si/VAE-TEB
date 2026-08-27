@@ -225,7 +225,7 @@ def test_the_table_carries_one_column_per_lag_plus_the_argmax_and_its_second(
     assert len(lag_columns) == num_lags == summary["num_lags"]
     assert {"argmax_lag", "argmax_lag_seconds"} <= set(frame.columns)
     assert frame["argmax_lag_seconds"].to_numpy() == pytest.approx(
-        4.0 * frame["argmax_lag"].to_numpy() - float(config["up_shift_secs"])
+        4.0 * frame["argmax_lag"].to_numpy() + float(config["up_shift_secs"])
     )
 
 

@@ -240,14 +240,29 @@ def test_the_anchor_count_reports_the_decoded_set_on_a_fully_masked_batch() -> N
 # source_lag_warmth_frac: the compromise, sized
 # =================================================================================================
 def test_the_source_warmth_split_is_taken_at_the_resolved_block_boundary() -> None:
-    """The split point is where the two stored source blocks meet, and the two patterns must
-    really differ -- the whole reason for splitting is that the first block is warm from step $0$
-    in its fastest channels while the second is not warm at all until far later, and a pooled
-    figure would let the first carry the fraction."""
+    r"""The split point is where the two stored source blocks meet, and the two patterns must
+    really differ -- the whole reason for splitting is that the first block warms far earlier than
+    the second, and a pooled figure would let the first carry the fraction.
+
+    The waits are $W'_c + d_c$, not $W'_c$. A gated channel is read from stored step $t - d_c$, so
+    the shift postpones the whole pattern; taking the unshifted vector here is what made
+    ``source_lag_warmth_frac_st`` identically $1.0$ on the shipped aligned configuration, because
+    the fastest ``up_st`` channel has $W'_c = 0$ and announced itself warm at step $0$ while the
+    gate was still reading before the start of the record.
+    """
     kwargs = shipped_warmup_kwargs()
     model = build(kwargs)
     split = CausalFeatureForecastTarget.SOURCE_BLOCK_SPLIT
-    waits = kwargs["source_warmup_steps"]
+    waits = [
+        wait + int(shift)
+        for wait, shift in zip(
+            kwargs["source_warmup_steps"], kwargs["source_align_delays"]
+        )
+    ]
+    # The shift is what this test exists to catch, so assert it is actually present rather than
+    # letting a zero vector make the assertion below vacuous.
+    assert max(kwargs["source_align_delays"]) > 0
+    assert min(waits) > 0
 
     # DECLARED coordinates, through the keep-index, and the alignment is what made that distinction
     # load-bearing: the reference drops four `up_st` channels, so the survivors' vector is 47 long
@@ -274,6 +289,31 @@ def test_the_source_warmth_split_is_taken_at_the_resolved_block_boundary() -> No
     first_warm = int(model.source_block_warm_st.to(torch.uint8).argmax())
     second_warm = int(model.source_block_warm_ph.to(torch.uint8).argmax())
     assert first_warm < second_warm
+
+
+def test_the_shipped_source_warmth_pattern_is_not_vacuous() -> None:
+    r"""The defect this guards: ``source_lag_warmth_frac_st`` was identically $1.0$.
+
+    Built from $W'_c$ alone, the ``st`` pattern was all-True at every step under the shipped
+    aligned configuration, because the fastest kept ``up_st`` channel has $W'_c = 0$ and announced
+    itself warm from step $0$ while the gate was still reading from before the start of the
+    record. An all-True pattern makes the reported fraction exactly $1.0$ for *any* attention
+    distribution -- a column that cannot vary and therefore measures nothing, while the design
+    cites it to justify leaving the source ungated. Built from $W'_c + d_c$ it varies.
+
+    Asserted on the pattern rather than on the fraction because the pattern is the mechanism: a
+    fraction below $1$ could also come from the lag mask, and would still pass if the buffer
+    regressed.
+    """
+    model = build(shipped_warmup_kwargs())
+
+    for name in ("source_block_warm_st", "source_block_warm_ph"):
+        pattern = getattr(model, name)
+        assert bool(pattern.any()), f"{name} is warm at no step"
+        assert not bool(pattern.all()), (
+            f"{name} is warm at every step, so its fraction is 1.0 for any attention "
+            f"distribution and the column measures nothing"
+        )
 
 
 def test_the_two_warmth_fractions_are_shares_of_the_attention_mass() -> None:

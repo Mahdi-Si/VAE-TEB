@@ -79,7 +79,7 @@ _ENCODER_KEYS = (
 #: differ for exactly one KIND of reason, unlike in the causal-feature pair: everything the guard
 #: adds or removes is under an input adapter. The decoder is $R = 16$ wide either way, because the
 #: raw block's width is geometry rather than a gate's survivor count.
-_SHIPPED_GATED = 5_012_844
+_SHIPPED_GATED = 4_989_804
 _SHIPPED_UNGATED = 4_995_052
 
 #: The same model with the alignment off, which is the named comparison arm one key away at
@@ -90,14 +90,14 @@ _SHIPPED_GATED_UNALIGNED = 5_013_612
 #: The conv-LSTM cell of this row at the same guard, and the difference. The encoder swap costs
 #: exactly what it costs in the causal-feature pair and in the two-sided pair, which is the sense in
 #: which the grid's two axes are independent.
-_CONV_LSTM_SHIPPED_GATED = 5_104_186
+_CONV_LSTM_SHIPPED_GATED = 5_081_146
 _ENCODER_EDGE_PARAMETERS = 91_342
 
 #: What the shipped budget keeps of the $102$ declared target-stream channels. A literal here rather
 #: than a resolved count, because the wrong-composition guard below is about a width that must *not*
 #: appear on this cell's decoder, and deriving it from the same resolution the model uses would let
 #: both move together.
-_KEPT_TARGET_CHANNELS = 98
+_KEPT_TARGET_CHANNELS = 38
 
 
 def _model(kwargs, cls=SeqVaeLagAttnTrfCrws, **overrides):
@@ -395,11 +395,23 @@ def test_the_budget_costs_only_the_two_availability_adapters() -> None:
     assert all("adapter" in name for name in added), sorted(added)
     assert ungated_names - gated_names == set()
 
-    # The alignment arm, measured rather than asserted absent: it narrows the source stream by the
-    # four channels above the reference and builds both start embeddings, which is $-768$ exactly.
+    # The alignment arm, measured rather than asserted absent. At this row's 42.21 s reference the
+    # cut is large on BOTH streams -- every channel slower than the reference goes, which takes the
+    # whole second stored source block -- so the sign is negative: the aligned model is the smaller
+    # one. Each dropped channel costs two projections at d_model, and both start embeddings are
+    # built because the shifted minimum is positive. Derived from the gates rather than written
+    # out, so a reference change moves the assertion with the model.
     assert _n_parameters(unaligned) == _SHIPPED_GATED_UNALIGNED
-    assert _n_parameters(gated) - _n_parameters(unaligned) == -4 * 128 * 2 + 2 * 128 == -768
-    assert gated.source_gate.out_channels + 4 == unaligned.source_gate.out_channels
+
+    target_narrowing = gated.target_gate.out_channels - unaligned.target_gate.out_channels
+    source_narrowing = gated.source_gate.out_channels - unaligned.source_gate.out_channels
+    assert (target_narrowing, source_narrowing) == (-60, -34)
+    assert (
+        _n_parameters(gated) - _n_parameters(unaligned)
+        == (target_narrowing + source_narrowing) * 128 * 2 + 2 * 128
+        == -23_808
+    )
+    assert gated.source_gate.out_channels - source_narrowing == unaligned.source_gate.out_channels
 
 
 def test_the_encoder_edge_costs_the_same_as_it_does_in_the_causal_feature_pair() -> None:
@@ -432,9 +444,12 @@ def test_the_encoder_edge_costs_the_same_as_it_does_in_the_causal_feature_pair()
 def test_the_adapter_is_built_at_the_warm_up_and_not_at_the_gates_delays(tiny_warmup) -> None:
     r"""The specific failure the inherited ``_build_adapter`` exists to prevent.
 
-    ``gate.delay.delay_steps`` is all zeros under a pure gather, so the architecture's own version
-    would give ``max_delay = 0`` -- no availability buffer, no mask projection, and a leading region
-    of real-valued pre-recording history entering the encoder as though it were signal.
+    ``gate.delay.delay_steps`` carries the alignment shifts $d_c$ and nothing about the warm-up:
+    all zeros under a pure gather, which is what the unaligned ``tiny_warmup`` fixture here builds,
+    and a vector unrelated to $W'_c$ under the shipped ``causal_align_reference``. Either way the
+    architecture's own version would build the guard from those -- ``max_delay = 0`` on this
+    fixture, so no availability buffer, no mask projection, and a leading region of real-valued
+    pre-recording history entering the encoder as though it were signal.
     """
     model = _model(tiny_warmup)
 

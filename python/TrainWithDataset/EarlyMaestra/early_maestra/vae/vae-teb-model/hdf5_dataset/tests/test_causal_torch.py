@@ -41,6 +41,7 @@ import pytest
 import torch
 
 from hdf5_dataset.causal_scattering import (
+    ALIGNMENT_DELAY_FACTOR,
     CAUSAL_KERNEL_TAPS,
     CAUSAL_WARMUP_QUANTILE,
     DECIMATION,
@@ -759,6 +760,12 @@ def test_the_channel_alignment_rounds_and_refuses_a_channel_above_the_reference(
     ``fhr_ph``, the maximum of ``up_ph`` and the lower band edge both phase selections already
     use. Both streams reach it, and both carry four scattering channels above it, which cannot be
     aligned at all: a negative shift reads a channel's own future.
+
+    The shift carries :data:`ALIGNMENT_DELAY_FACTOR`, $\kappa = 1 - 1/(2\gamma) = 0.875$, because
+    ``delay_s`` reports the envelope *mean* $\tau_g$ while a channel's content sits at the energy
+    centroid $\kappa\tau_g$. Only the *difference* is scaled, so the reference channel still takes
+    shift $0$ and the four refusals are unchanged -- $\tau_c \le \tau_{\mathrm{ref}}$ is
+    scale-invariant. The span is $85$ rather than the $97$ this pinned before the factor existed.
     """
     reference = float(channel_plan["fhr_ph"].delay_s.max())
     assert reference == pytest.approx(402.1604, abs=5e-4)
@@ -771,12 +778,16 @@ def test_the_channel_alignment_rounds_and_refuses_a_channel_above_the_reference(
 
         shifts = channel_alignment_delays(delay[~above], reference, STEP_SECONDS)
         assert (shifts >= 0).all(), stream
-        assert (int(shifts.min()), int(shifts.max())) == (0, 97), stream
+        assert (int(shifts.min()), int(shifts.max())) == (0, 85), stream
         # Rounding, not ceiling: both directions are causally safe, so the only criterion is the
         # residual, and it is bounded by half a step rather than by a whole one.
-        residual = np.abs(reference - delay[~above] - STEP_SECONDS * shifts)
+        # Taken against the SCALED difference, because that is what the shift rounds; measured
+        # against the unscaled one it would report ~50 s and say nothing about the rounding.
+        residual = np.abs(
+            ALIGNMENT_DELAY_FACTOR * (reference - delay[~above]) - STEP_SECONDS * shifts
+        )
         assert residual.max() <= STEP_SECONDS / 2.0, stream
-        assert float(residual.max()) == pytest.approx(1.89, abs=0.01), stream
+        assert float(residual.max()) == pytest.approx(1.99, abs=0.01), stream
         # Zero at the reference itself, which is a channel of both streams.
         assert int(shifts[np.argmin(np.abs(delay[~above] - reference))]) == 0, stream
 

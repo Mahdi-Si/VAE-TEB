@@ -393,7 +393,7 @@ def test_the_shipped_geometry_pairs_the_floor_with_the_budget(shipped):
     vae = shipped["model_config"]["VAE_model"]
 
     assert vae["causal_warmup_budget_steps"] == 134
-    assert vae["causal_align_reference"] == "target_max"
+    assert vae["causal_align_reference"] == 42.21
     assert vae["warmup_period"] == 134 == vae["causal_warmup_budget_steps"]
     assert vae["c_y"] == CAUSAL_C_Y
     assert vae["c_u"] == CAUSAL_C_U
@@ -422,7 +422,11 @@ def test_the_shipped_config_builds_a_decoder_as_wide_as_the_raw_grid(tmp_path):
     kwargs = _model_kwargs_from(load_config(str(_TINY)), LagAttnCrwsTrainer, tmp_path)
     model = SeqVaeLagAttnCrws(**kwargs)
 
-    assert len(kwargs["target_keep_index"]) == 98  # the budget's reach: the INPUTS, not the target
+    # 38, not the budget's 98: this cell forecasts the RAW signal, so nothing on the target side
+    # cancels the source reference out of the physical-lag identity and both streams drop to the
+    # 42.21 s reference that puts the 20-120 s coupling band inside the lag axis.
+    assert len(kwargs["target_keep_index"]) == 38
+    assert len(kwargs["source_keep_index"]) == 17
     assert model.decoder_out_channels == model.raw_per_step == 16
     assert model.horizon * model.geometry.r == 480
 
@@ -813,7 +817,7 @@ def test_the_resolved_tiny_variant_validates_and_builds(tmp_path, loguru_warning
     # The smoke model is small everywhere except where it must not be: the input adapters still read
     # the production channel set and the forward still decodes the production tile count.
     assert model.d_model == 32
-    assert model.target_adapter.linear.in_features == 98
+    assert model.target_adapter.linear.in_features == 38
     assert model.anchor_stride == 30
 
 

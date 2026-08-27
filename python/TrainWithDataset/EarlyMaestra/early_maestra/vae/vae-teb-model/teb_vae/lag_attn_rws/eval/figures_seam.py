@@ -30,8 +30,9 @@ its global registry, so a leak is measured in hundreds of megabytes rather than 
 
 **The lag axis is this package's own.** A lag index $\ell$ is not seconds, and the two seconds
 figures it maps onto are different quantities -- $\tau_{\mathrm{compensated}} = 4(\ell + \delta)$
-is the residual physiological delay, and only the *sensor* figure adds back the $20$ s the
-preprocessing already removed. :data:`COMPENSATED_LAG_AXIS_LABEL` names the first, and it is bound
+is the residual physiological delay, and only the *sensor* figure undoes the $20$ s the
+preprocessing already removed, which it does by **subtracting** it: the preprocessing *advanced*
+the source trace, so reaching the uncorrected timeline moves the figure down. :data:`COMPENSATED_LAG_AXIS_LABEL` names the first, and it is bound
 here so that a figure drawn through this seam and the number reported beside it cannot disagree
 about which of the two is shown.
 """

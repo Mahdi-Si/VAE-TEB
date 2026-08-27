@@ -146,6 +146,40 @@ from teb_vae.lag_attn_cfs.tests.conftest import (  # noqa: E402,F401
     stored_warmup,
 )
 
+#: This cell's own alignment reference, in seconds, as ``configs/default.yaml`` ships it.
+#:
+#: The sibling's :func:`causal_config` defaults to ``target_max`` (402.1604 s), which is right for a
+#: FEATURE target and wrong here. With a raw target $\tau^y \equiv 0$, so nothing cancels the source
+#: reference out of the physical-lag identity
+#: $\tau_{\mathrm{phys}}(\ell,h) = \Delta(\ell+1+h) + \kappa\tau_{\mathrm{ref}} - 20$ s, which is
+#: minimised at $\ell = h = 0$ and grows with the lag -- so at ``target_max`` the smallest expressible
+#: lead is $335.9$ s and the $20$-$120$ s coupling band is off the axis at every lag index.
+#:
+#: Wrapping the sibling's builder rather than editing it keeps "no edit to any existing package"
+#: true; wrapping it rather than passing the override at each call site is what makes this suite
+#: measure the geometry **this cell's own documents describe**, which is what ``test_docs.py``
+#: exists to check. A suite resolving the sibling's reference would re-measure the sibling's model
+#: and report the difference as a documentation error.
+SHIPPED_ALIGN_REFERENCE = 42.21
+
+_sibling_causal_config = causal_config
+
+
+def causal_config(**overrides: Any) -> Dict[str, Any]:
+    """The sibling's causal config at **this** cell's alignment reference.
+
+    Args:
+        **overrides: Applied over the defaults, so a test wanting the unaligned arm still passes
+            ``causal_align_reference=None`` and a test wanting the sibling's clock still passes
+            ``causal_align_reference="target_max"``.
+
+    Returns:
+        A fresh config dict.
+    """
+    return _sibling_causal_config(
+        **{"causal_align_reference": SHIPPED_ALIGN_REFERENCE, **overrides}
+    )
+
 # Bound by reference rather than copied, which is what keeps "no edit to any existing package" true
 # while leaving no second definition to drift: the threshold names no constructor argument, so what
 # the network takes is the four concrete channel tuples it resolves to, and there is exactly one
@@ -423,7 +457,7 @@ def config() -> Dict[str, Any]:
 def budget():
     """The resolved warm-up budget at the shipped threshold, against the committed fixture.
 
-    Shipped means **aligned**: both streams carry a shift, the source is 47 channels wide, and
+    Shipped means **aligned**: both streams carry a shift, the source is 17 channels wide, and
     ``reference_delay_s`` is set. :func:`unaligned_budget` is the comparison arm.
     """
     from teb_vae.lag_attn_cfs.causal_warmup import resolve_warmup_budget

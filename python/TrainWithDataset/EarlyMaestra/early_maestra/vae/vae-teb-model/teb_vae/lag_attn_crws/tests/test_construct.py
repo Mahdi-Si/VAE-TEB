@@ -21,8 +21,10 @@ mixin is excluded becomes a passing test rather than a comment.
 
 The warm-up half is the causal-feature cell's machinery reached by identity -- ``_build_adapter`` is
 asserted to be that mixin's own function object in ``test_causal_raw_inputs.py`` -- so what is
-checked here is that it was *reached*: the adapter is built at the warm-up rather than at the gate's
-delays, which are all zero under a pure gather, and no gradient flows from inside the masked region.
+checked here is that it was *reached*: the adapter is built at $W'_c + d_c$ rather than at the
+gate's own ``delay_steps``, which carry the alignment shifts $d_c$ alone -- all zero on an unaligned
+config, where the gate is a pure gather, and under an alignment reference a different vector from
+the warm-up rather than a smaller one -- and no gradient flows from inside the masked region.
 """
 from __future__ import annotations
 
@@ -60,7 +62,7 @@ from .conftest import (
 #: than a resolved count, because the wrong-composition guard below is about a width that must *not*
 #: appear on this cell's decoder, and deriving it from the same resolution the model uses would let
 #: both move together.
-_KEPT_TARGET_CHANNELS = 98
+_KEPT_TARGET_CHANNELS = 38
 
 
 # =================================================================================================

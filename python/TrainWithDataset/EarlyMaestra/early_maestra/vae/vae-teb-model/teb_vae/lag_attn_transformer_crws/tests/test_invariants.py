@@ -369,7 +369,7 @@ def test_the_invariants_hold_at_the_production_geometry_and_budget() -> None:
         resampled = model(y_st, y_ph, noise, phase)
 
     assert model.decoder_out_channels == 16
-    assert model.target_gate is not None and model.target_gate.out_channels == 98
+    assert model.target_gate is not None and model.target_gate.out_channels == 38
     assert reference["anchor_index"].shape[1] == 5
     for key in ("mu_prior", "z_prior", "mu_base"):
         assert torch.equal(reference[key], resampled[key]), key

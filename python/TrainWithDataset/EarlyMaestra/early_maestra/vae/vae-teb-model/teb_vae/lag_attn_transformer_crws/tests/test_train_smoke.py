@@ -303,10 +303,16 @@ def test_the_run_trains_at_the_budgets_width_and_the_configs_tiling(fit) -> None
 
 
 def test_the_input_adapters_carry_the_availability_terms_the_warm_up_needs(fit) -> None:
-    """The mechanism the whole package exists for, on the model a real launch built. Without the
-    ``_build_adapter`` override the gate's delays are all zero -- it is a pure gather -- so
-    ``max_delay`` would be $0$ and **neither** availability term would exist, and the leading region
-    of every channel would enter the encoder as though it were signal."""
+    r"""The mechanism the whole package exists for, on the model a real launch built.
+
+    The architecture parent builds its adapter from ``gate.delay.delay_steps``, which carries the
+    alignment shift $d_c$ and knows nothing of the warm-up $W'_c$. On an unaligned config those are
+    all zeros -- the gate is then a pure gather -- so ``max_delay`` would be $0$, **neither**
+    availability term would exist, and the leading region of every channel would enter the encoder
+    as though it were signal. Under an alignment reference they are nonzero and still the wrong
+    vector: the mask would read $\mathbb 1[t \ge d_c]$ where the honest one is
+    $\mathbb 1[t \ge W'_c + d_c]$, announcing every channel warm $W'_c$ steps before it is. The
+    override passes $W'_c + d_c$, which is the boundary asserted below."""
     driver, _ = fit
     model = driver.pytorch_model
 

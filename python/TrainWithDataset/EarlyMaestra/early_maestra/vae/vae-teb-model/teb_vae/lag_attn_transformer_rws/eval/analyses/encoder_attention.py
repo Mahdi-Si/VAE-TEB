@@ -119,8 +119,8 @@ def cohort_order(per_segment: pd.DataFrame) -> List[str]:
 
     Returns:
         :data:`POOLED_CLASS`, then the clinical classes in the evaluation's one cohort order --
-        healthy, acidosis, HIE -- rather than alphabetically, which would put ``acidosis`` first
-        on every figure.
+        HIE, acidosis, healthy, worst first -- rather than alphabetically, which would put
+        ``acidosis`` first on every figure.
     """
     if per_segment.empty or labels.CLASS_COLUMN not in per_segment.columns:
         return [POOLED_CLASS]

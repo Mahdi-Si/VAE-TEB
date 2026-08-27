@@ -5,11 +5,12 @@ that pull in opposite directions and are easy to conflate.
 
 **The mechanical shift.** The preprocessing pipeline advances the uterine-pressure channel by
 $20$ s to compensate a *known sensor* delay, so the streams the model sees are already
-mechanically aligned. On that compensated timeline the residual delay the attention discovers is
-the physiological one, and reporting it with the $20$ s added back would double-count a
-correction that was made deliberately. The uncorrected figure is still worth storing -- it is
-what maps a finding back to the original sensor files -- but it is a *different quantity* and is
-named as such.
+mechanically aligned: stored position $g$ holds what the sensor recorded at $g + 20$ s. On that
+compensated timeline the residual delay the attention discovers is the physiological one, and
+adding the $20$ s back would double-count a correction that was made deliberately. The
+uncorrected figure is still worth storing -- it is what maps a finding back to the original sensor
+files -- but it is a *different quantity*, and it is reached by **subtracting** the shift rather
+than adding it, because the shift pulled UP earlier.
 
 **The causal input delay.** When a channel is read at $t - \delta$ rather than at $t$ (the guard
 that bounds how far an input feature reads into its own future), the source memory the attention
@@ -20,7 +21,7 @@ Together, with $\Delta = 4$ s per decimated step:
 
 $$
 \tau_{\mathrm{compensated}} = \Delta\,(\ell + \delta), \qquad
-\tau_{\mathrm{sensor}} = \tau_{\mathrm{compensated}} + 20\ \mathrm{s}.
+\tau_{\mathrm{sensor}} = \tau_{\mathrm{compensated}} - 20\ \mathrm{s}.
 $$
 
 **The group delay, when both streams are on one clock.** The two figures above are lags between
@@ -54,7 +55,9 @@ import torch
 SECONDS_PER_STEP = 4.0
 
 #: The mechanical sensor delay the preprocessing pipeline already removes from the source
-#: channel, in seconds. Added back only to map a lag onto the *uncorrected* sensor files.
+#: channel, in seconds. Used only to map a lag onto the *uncorrected* sensor files, and
+#: **subtracted** there rather than added: the preprocessing *advanced* UP, so undoing it moves the
+#: reported figure down. See :func:`lag_original_sensor_seconds`.
 MECHANICAL_SHIFT_SECONDS = 20.0
 
 #: Axis label for a lag axis drawn in compensated seconds. A constant rather than a string in
@@ -121,16 +124,24 @@ def lag_original_sensor_seconds(
     seconds_per_step: float = SECONDS_PER_STEP,
     mechanical_shift_seconds: float = MECHANICAL_SHIFT_SECONDS,
 ) -> LagValue:
-    r"""The same lag on the **uncorrected** sensor timeline: $\Delta\,(\ell + \delta) + 20$ s.
+    r"""The same lag on the **uncorrected** sensor timeline: $\Delta\,(\ell + \delta) - 20$ s.
 
     Use this only to locate a finding in the original sensor files. It is not the physiological
-    lag: it carries the $20$ s mechanical delay that preprocessing deliberately removed.
+    lag: it carries the $20$ s mechanical shift that preprocessing deliberately removed.
+
+    **Subtracted, not added.** Preprocessing *advanced* UP by $20$ s -- ``mimo_adaptor.py`` pulls
+    the trace 80 samples earlier -- so stored position $g$ holds what the sensor recorded at
+    $g + 20$ s. Undoing that to reach the sensor timeline moves the lag *down*. This returned
+    ``compensated + 20`` until it was corrected, which put it $40$ s away from
+    :func:`physical_lag_seconds` in this same module, with the sign reversed.
 
     Args:
         lag_step: Attention lag index $\ell$, a scalar or a whole axis as a tensor.
         delay_steps: The causal input delay $\delta$, in decimated steps.
         seconds_per_step: Seconds per decimated step $\Delta$.
-        mechanical_shift_seconds: The sensor delay preprocessing removed, added back here.
+        mechanical_shift_seconds: The sensor delay preprocessing removed, **subtracted** here to
+            undo it. Preprocessing advanced UP, so reaching the uncorrected timeline moves the
+            lag down; see the note above.
 
     Returns:
         The uncorrected-timeline lag in seconds, of the same kind as ``lag_step``.
@@ -141,7 +152,7 @@ def lag_original_sensor_seconds(
     compensated = lag_compensated_seconds(
         lag_step, delay_steps=delay_steps, seconds_per_step=seconds_per_step
     )
-    return compensated + float(mechanical_shift_seconds)
+    return compensated - float(mechanical_shift_seconds)
 
 
 def _validate_reference(reference_s: float, name: str) -> float:
@@ -214,10 +225,11 @@ def physical_lag_seconds(
             Zero is the first predicted step, $\Delta$ seconds past the anchor.
         seconds_per_step: Seconds per decimated step $\Delta$.
         mechanical_shift_seconds: $\tau_{\mathrm{pre}}$, the sensor delay preprocessing already
-            removed from the source trace. **Subtracted** here, where
-            :func:`lag_original_sensor_seconds` adds it: there the question is where a finding sits
-            in the uncorrected files, here it is how far apart two physical epochs are on the
-            corrected timeline the model was trained on.
+            removed from the source trace. **Subtracted** here, exactly as
+            :func:`lag_original_sensor_seconds` subtracts it -- the two agree on the sign because
+            they undo the same advance. They remain different quantities: there the question is
+            where a finding sits in the uncorrected files, here it is how far apart two physical
+            epochs are on the corrected timeline the model was trained on.
 
     Returns:
         The physical lead time in seconds, of the same kind as ``lag_step``.

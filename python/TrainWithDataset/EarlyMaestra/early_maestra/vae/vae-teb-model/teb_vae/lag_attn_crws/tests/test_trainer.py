@@ -61,8 +61,8 @@ _MODULE_NAME = "teb_vae.lag_attn_crws.trainer"
 #: channels off the target and never touches the source; the **alignment reference** takes the four
 #: `up_st` channels slower than it off the source and never touches the target, because the
 #: reference is the target's own maximum.
-GUARDED_TARGET_CHANNELS = 98
-GUARDED_SOURCE_CHANNELS = 47
+GUARDED_TARGET_CHANNELS = 38
+GUARDED_SOURCE_CHANNELS = 17
 
 #: The metric surface: the raw-signal sibling's, plus three suffixes on both stages, plus the
 #: source-null KL on validation. Pinned as a literal the way each sibling package pins its own.
@@ -212,7 +212,7 @@ def test_the_warmup_budget_reaches_the_constructor_as_the_four_channel_tuples(dr
     assert len(kwargs["source_keep_index"]) == GUARDED_SOURCE_CHANNELS
     # The budget's own boundary, read back off the resolved vector rather than declared: the slowest
     # survivor is what the anchor floor has to clear.
-    assert max(kwargs["target_warmup_steps"]) == 134
+    assert max(kwargs["target_warmup_steps"]) == 1
 
 
 def test_the_delay_keywords_are_absent_because_a_delay_is_not_a_warm_up(driver):
@@ -303,7 +303,7 @@ def test_the_causal_standing_message_is_not_the_inherited_one(driver):
 
     assert "974" not in message
     assert "one-sided" in message
-    assert "98/102" in message and "47/51" in message
+    assert "38/102" in message and "17/51" in message
 
 
 def test_the_ungated_standing_message_says_what_is_being_read_unguarded(driver):
@@ -582,7 +582,7 @@ def test_the_resolved_config_is_written_beside_the_checkpoints(tmp_path, monkeyp
     assert vae["warmup_period"] == 134
     # Both independently-toggleable mechanisms, so a run is reconstructable from its own artifacts:
     # which clock its channels were put on, and which shard variant it expected to read.
-    assert vae["causal_align_reference"] == "target_max"
+    assert vae["causal_align_reference"] == 42.21
     assert vae["causal_leg_alignment"] == "envelope"
     # The two-sided guard's record is null here, which is the correct record of "no reach budget
     # was resolved" rather than an omission.

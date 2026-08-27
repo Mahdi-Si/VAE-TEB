@@ -27,8 +27,8 @@ whether the profile is degenerate by a stated mechanical criterion rather than b
 
 **The lag is the compensated one.** $\tau = 4(\ell + \delta)$ seconds, with $\delta$ read from the
 model's own accessor and converted by the module both the training figure and this analysis
-share. The original-sensor figure -- which adds back the $20$ s preprocessing already removed --
-appears nowhere here: it locates a finding in the raw files and is not the physiological delay.
+share. The original-sensor figure -- which undoes the $20$ s preprocessing already removed, by
+*subtracting* it, because the preprocessing advanced the source trace -- appears nowhere here: it locates a finding in the raw files and is not the physiological delay.
 """
 from __future__ import annotations
 

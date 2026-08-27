@@ -355,7 +355,11 @@ model_config:
     # Every one-sided filter carries its own group delay, spanning 13.3 s to 791.0 s across a
     # stored block, and the encoder reads a stream's channels as ONE VECTOR PER STEP -- which
     # asserts that its entries describe one instant when they span thirteen minutes. This key
-    # re-indexes each channel by d_c = round((tau_ref - tau_c) / 4 s) so that they do.
+    # re-indexes each channel by d_c = round(kappa * (tau_ref - tau_c) / 4 s) so that they do,
+    # with kappa = 1 - 1/(2*gamma) = 0.875 the energy-centroid factor: `causal_delay_s` stores
+    # the envelope MEAN tau_g, while a channel's content actually sits at kappa * tau_g. Only
+    # the DIFFERENCE is scaled, so the reference channel still takes shift 0 and the drop rule
+    # does not move; d_c spans 0-85 rather than 0-97 and the worst residual is 1.9865 s.
     #
     # `target_max` resolves tau_ref from the SHARDS -- the slowest kept target channel, 402.1604 s,
     # the filter at 0.008240 Hz that is simultaneously the maximum of `fhr_ph`, the maximum of
@@ -368,14 +372,17 @@ model_config:
     # WHAT IT COSTS. The anchor floor moves 133 -> 134 (one anchor, 137 -> 136) because a channel
     # is honest at W'_c + d_c rather than at W'_c; the source loses the four channels above the
     # reference, 51 -> 47; and the freshest uterine activity any channel reports moves from 13.3 s
-    # to 402.2 s before the anchor. That last one is the real price -- a common clock is bought
-    # with recency -- and it is why the pre-registered reading is that alignment should NOT improve
-    # the forecast gap and SHOULD improve lag-profile concentration if there is a real lag.
+    # to 402.2 s before the anchor as the shards report it -- kappa * 402.1604 = 351.9 s of
+    # realised delay, which is the number a physical reading takes. That last one is the real
+    # price -- a common clock is bought with recency -- and it is why the pre-registered
+    # reading is that alignment should NOT improve the forecast gap and SHOULD improve
+    # lag-profile concentration if there is a real lag.
     #
-    # WHAT IT COSTS IN WARM-UP: nothing. With W_c ~ rho * tau_c, W_c + delta*d_c = tau_ref +
-    # (rho-1)*tau_c <= W_ref, so max_c(W'_c + d_c) = 134 = max_c W'_c exactly, on BOTH streams.
+    # WHAT IT COSTS IN WARM-UP: nothing. With W_c ~ rho * tau_c, W_c + delta*d_c =
+    # kappa*tau_ref + (rho-kappa)*tau_c <= rho*tau_ref, so max_c(W'_c + d_c) = 134 = max_c W'_c
+    # exactly, on BOTH streams.
     # `null` is the unaligned arm and is bitwise the model that shipped before this key existed.
-    causal_align_reference: null
+    causal_align_reference: target_max
 
     # Which phase-harmonic operator built the CONFIGURED SHARDS' two phase blocks, checked against
     # their own `causal_leg_alignment` root attribute and refused by name on a disagreement.

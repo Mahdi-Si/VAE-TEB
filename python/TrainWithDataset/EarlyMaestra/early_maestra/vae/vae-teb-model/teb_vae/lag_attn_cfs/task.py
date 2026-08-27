@@ -167,8 +167,8 @@ class SeqVaeLagAttnCfsTask(SeqVaeLagAttnFsTask):
         That builder is welded to the production two-sided Morlet bank: it refuses these channel
         widths, and it raises inside a handler that warns and continues -- so leaving it in place
         costs two page rows and one log line, with a green suite. It also draws ``gate(values)``,
-        and on this model the gate is a pure gather with the warm-up mask one layer further on,
-        inside the availability adapter.
+        and on this model the gate gathers and then shifts, with the warm-up mask one layer
+        further on, inside the availability adapter.
 
         No binding is needed. Everything the replacement reads -- the gates, the adapters' own
         availability buffers, the warm-up vectors and the block splits -- is on the net it is

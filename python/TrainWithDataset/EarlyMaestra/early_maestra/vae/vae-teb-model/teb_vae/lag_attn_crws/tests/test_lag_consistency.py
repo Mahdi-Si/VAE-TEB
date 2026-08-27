@@ -11,10 +11,17 @@ inherited from a sibling that carries it.
 The input rows fill ``InputStreamPanel.delays`` with $W'_c$, a **warm-up**, through an attribute
 whose name says delay. The two quantities are not the same thing and only one of them belongs on the
 lag axis: a warm-up is a leading region a channel is not honest in, and it shifts nothing, whereas a
-delay means the source memory the attention queries is itself $\delta$ steps stale. This family
-applies no delay at all -- its gate is a pure gather -- so the honest axis is $4\ell$, and a consumer
-that took the panel's staircase for a delay would report every lag up to $200$ s too long on the
-tiny geometry and $536$ s too long at the shipped one, with nothing failing.
+delay means the source memory the attention queries is itself $\delta$ steps stale. **The
+fixtures below are built unaligned on purpose** -- ``tiny_warmup_kwargs`` passes no
+``*_align_delays``, so the gate is a pure gather, $\delta = 0$ and the honest axis is $4\ell$. That
+is the arm in which the confusion is visible at all: a consumer that took the panel's staircase for
+a delay would report every lag up to $200$ s too long on the tiny geometry and $536$ s too long at
+the shipped one, with nothing failing.
+
+Under the **shipped** ``causal_align_reference`` the gate is *not* a pure gather -- it carries the
+per-channel alignment shifts $d_c$ and $\delta = \max_c d_c > 0$ -- and the honest axis is then
+$\Delta(\ell + \delta)$. The distinction survives either way: $d_c$ is a shift and belongs on the
+axis, $W'_c$ is a warm-up and does not.
 
 And ``lag_floor`` introduces a second offset on the same axis, which is the more tempting mistake
 because it *is* a lag-domain quantity. It is not a shift either: the floor generalises the mask from
@@ -151,9 +158,11 @@ def _axis_limits(figure: Any) -> Dict[str, Any]:
 
 
 def test_this_family_applies_no_delay_so_the_probe_reads_zero():
-    r"""The gate is a pure gather here -- a warm-up masks a leading region and leaves every step at
-    its own index -- so there is no staleness to compensate and $4\ell$ is the honest axis. Stated
-    as its own assertion because every equality below rests on it, and because a model that had
+    r"""**On this unaligned fixture** the gate is a pure gather -- a warm-up masks a leading
+    region and leaves every step at its own index -- so there is no staleness to compensate and
+    $4\ell$ is the honest axis. ``tiny_warmup_kwargs`` passes no ``*_align_delays``, which is what
+    makes this hold; the shipped config *does* align and its $\delta$ is positive. Stated as its own
+    assertion because every equality below rests on it, and because a model that had quietly
     acquired a delay would make them all pass while meaning something else."""
     module, _batch = _module_and_batch()
     model = module.orig_model

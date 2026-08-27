@@ -405,7 +405,7 @@ def test_the_headline_paragraph_carries_the_measured_total_and_both_comparisons(
 
 
 def test_the_input_representation_delta_decomposes_into_the_two_terms_the_design_states(
-    design, measured_totals, measured_models
+    design, measured_totals, measured_models, budget
 ):
     r"""The two input adapters -- and **not** the decoder head, which is ``raw_per_step`` wide in
     both cells. Evaluated from the document's own factorisation rather than merely searched for, and
@@ -417,13 +417,24 @@ def test_the_input_representation_delta_decomposes_into_the_two_terms_the_design
     embeddings used to be a third and are now exactly zero too**: the reach guard builds both and
     this cell built neither until the alignment made its shifted warm-up start above zero on both
     streams. Both are computed rather than deleted so that either divergence reappears as a failing
-    sum."""
+    sum.
+
+    **The delta is negative at this row's own reference**, because the alignment leaves this cell
+    *narrower* on both streams than the reach guard leaves the two-sided sibling; it was positive
+    while this cell carried $98$ and $47$ channels. The surviving widths are therefore taken from
+    the resolved ``budget`` rather than written out, so a future reference moves the expected
+    decomposition with the model, while the sibling's $78$ and $29$ stay literals -- they are the
+    reach guard's, and belong to another cell."""
     section = _markdown_section(design, "## 13. ")
     delta = measured_totals["crws_guarded"] - measured_totals["rws_guarded"]
 
     horizon_embedding = (30 - 30) * 256
     start_embeddings = (2 - 2) * 128
-    adapters = 128 * (98 - 78) * 2 + 128 * (47 - 29) * 2
+    # Two linears per adapter -- the input linear and the availability projection -- each narrowing
+    # from the sibling's reach-gated width to this cell's aligned one.
+    adapters = (
+        128 * (budget.target.kept_width - 78) * 2 + 128 * (budget.source.kept_width - 29) * 2
+    )
 
     assert horizon_embedding == 0, "the two horizons diverged; §13 needs its second term back"
     assert start_embeddings == 0, (
@@ -462,7 +473,10 @@ def test_the_input_representation_delta_decomposes_into_the_two_terms_the_design
         int(cost) * (int(wide) - int(narrow))
         for cost, wide, narrow in _FACTORISATION_PATTERN.findall(section)
     }
-    assert {128 * (98 - 78), 128 * (47 - 29)} <= factorisations, (
+    assert {
+        128 * (budget.target.kept_width - 78),
+        128 * (budget.source.kept_width - 29),
+    } <= factorisations, (
         f"§13 does not factorise both adapter widths; it states {factorisations}"
     )
     for value in (delta, adapters):
@@ -498,17 +512,38 @@ def test_the_encoder_axis_delta_is_the_two_history_encoders(design, measured_tot
 
 
 def test_the_guard_delta_is_the_two_availability_projections_alone(
-    design, measured_totals, measured_models
+    design, measured_totals, measured_models, budget
 ):
     """Unlike the feature cells nothing in this target domain widens a head, so every parameter the
-    guard adds is under an adapter -- asserted by name -- and the arithmetic §13 states for it is
-    evaluated. The raw-signal sibling's smaller guard cost is stated beside it, so two correct numbers
-    nearly a factor of three apart are not read as a contradiction."""
+    guard moves is under an adapter -- asserted by name -- and the arithmetic §13 states for it is
+    evaluated.
+
+    **The guard is now a net saving here and still a net cost on the raw-signal sibling**, and both
+    numbers are stated beside each other so two correct figures that disagree even in *direction*
+    are not read as a contradiction. The sign is decided by how much the guard narrows: it adds one
+    availability projection per stream at the surviving width and a start embedding each, and takes
+    away the width the two input linears lose. At this reference the narrowing dominates, so the
+    guarded model is the smaller one; under the reach guard's gentler cut it does not.
+
+    Written against the resolved ``budget`` rather than against widths, so a future reference moves
+    the expected arithmetic with the model.
+    """
     section = _markdown_section(design, "## 13. ")
     guard = measured_totals["crws_guarded"] - measured_totals["crws_ungated"]
     sibling = measured_totals["rws_guarded"] - measured_totals["rws_ungated"]
+    target, source = budget.target, budget.source
 
-    assert guard == 128 * 98 + 128 * 47 + 2 * 128 - 128 * 4 - 128 * 4
+    assert guard == (
+        # What the guard adds: an availability projection per stream, at the SURVIVING width, and
+        # the one start embedding each adapter builds once the shifted warm-up starts above zero.
+        128 * target.kept_width
+        + 128 * source.kept_width
+        + 2 * 128
+        # What it takes away: the input linear of each stream narrows from the stored width to the
+        # surviving one.
+        - 128 * (target.declared_width - target.kept_width)
+        - 128 * (source.declared_width - source.kept_width)
+    )
     assert guard == measured_totals["trf_crws_guarded"] - measured_totals["trf_crws_ungated"]
     for name in _differing_names(measured_models["crws_guarded"], measured_models["crws_ungated"]):
         assert "adapter" in name, name
@@ -672,11 +707,16 @@ def test_the_geometry_section_states_the_policy_and_the_measured_channel_counts(
     assert "F \\ge B - 1" in section
     for name, kept, declared in budget.target.block_counts():
         assert f"`{name}` ${kept}/{declared}$" in section, name
-    # The source survives the BUDGET whole and loses four to the ALIGNMENT, and the section has to
-    # state both, because a reader who took either for the other would misread the warmth columns.
-    assert budget.source.declared_width == 51 and budget.source.kept_width == 47
+    # The source survives the BUDGET whole and loses most of itself to the ALIGNMENT, and the
+    # section has to state both, because a reader who took either for the other would misread the
+    # warmth columns. The stored width is the shard schema's and stays a literal; what survives is
+    # read off the budget, and is attributed per block rather than only in total -- `up_ph` $0/15$
+    # is the whole-block drop §8 turns on, and a total alone would not show it.
+    assert budget.source.declared_width == 51
     assert f"All ${budget.source.declared_width}$ source channels survive the budget" in section
     assert f"leaving ${budget.source.kept_width}$" in section
+    for name, kept, declared in budget.source.block_counts():
+        assert f"`{name}` ${kept}/{declared}$" in section, name
     assert "not a constraint" in section
     assert "every kept input channel of **both streams** is warm **by the first forecast step**" in section
     # The two costs, both stated as numbers: what the policy costs and what the horizon lever buys.
@@ -689,13 +729,25 @@ def test_the_source_section_states_which_rule_gates_the_source(design, budget, u
 
     Asserted against both resolved budgets, because the two rules that could gate this stream do
     different things: the **warm-up budget** gates it not at all, while the **alignment** removes
-    exactly the four channels slower than the reference, for the unrelated reason that they could
-    reach it only by a negative shift.
+    every channel slower than the reference, for the unrelated reason that they could reach it only
+    by a negative shift.
+
+    At this row's own reference that second rule takes $34$ of the $51$ and the whole of the second
+    stored block -- `up_ph`'s fastest channel is $150.79$ s, above every band-reachable reference --
+    so both the count it removes and the per-block survivors are read off the budgets and asserted
+    to be the numbers §8 states, rather than compared against literals that would not move with a
+    future reference.
     """
     section = _flat(_markdown_section(design, "## 8. "))
 
+    # The budget alone gates nothing: unaligned, every stored source channel survives it.
     assert unaligned_budget.source.kept_width == unaligned_budget.source.declared_width
-    assert budget.source.kept_width == 47 == budget.source.declared_width - 4
+    # The alignment is what cuts, and §8 must state both sides of that cut by number.
+    removed_by_alignment = budget.source.declared_width - budget.source.kept_width
+    assert f"the alignment removes the ${removed_by_alignment}$ channels" in section
+    assert f"${budget.source.kept_width}$ are kept" in section
+    for name, kept, declared in budget.source.block_counts():
+        assert f"`{name}` ${kept}/{declared}$" in section, name
     assert "the warm-up budget gates no source channel at all" in section.lower()
     assert "small value there is the expected finding, not a failure" in section
     assert "the coupling readout is measuring a clock" in section

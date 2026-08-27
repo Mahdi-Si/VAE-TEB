@@ -60,8 +60,14 @@ _PACKAGE_DIR = Path(__file__).resolve().parents[1]
 #: else below is derived from the shard's own attributes so a rebuild at another
 #: ``causal_warmup_quantile`` re-derives rather than passes stale; this one row is pinned so that a
 #: silent change to it fails here instead of quietly moving a training curve.
-_SHIPPED_TARGET_KEPT = 98
-_SHIPPED_SOURCE_KEPT = 47
+#: What the ALIGNMENT leaves, at this cell's own 42.21 s reference.
+_SHIPPED_TARGET_KEPT = 38
+_SHIPPED_SOURCE_KEPT = 17
+
+#: What the WARM-UP BUDGET alone leaves, which is the unaligned arm's target width. Split from
+#: the constant above because the two rules cut by different amounts once the reference moved
+#: off `target_max`: the budget still keeps 98, the alignment then takes a further 60.
+_BUDGET_TARGET_KEPT = 98
 
 
 def _rebased_vector(blocks: Tuple[str, ...]) -> np.ndarray:
@@ -144,19 +150,36 @@ def test_the_shipped_guard_keeps_ninety_eight_target_channels_and_forty_seven_so
     assert budget.source.declared_width == CAUSAL_C_U
     assert budget.source.kept_width == _SHIPPED_SOURCE_KEPT
 
-    assert unaligned_budget.target.kept_width == _SHIPPED_TARGET_KEPT
+    assert unaligned_budget.target.kept_width == _BUDGET_TARGET_KEPT
     assert unaligned_budget.source.kept_width == CAUSAL_C_U
 
 
-def test_the_kept_set_is_exactly_the_channels_at_or_below_the_threshold(budget):
+def test_the_kept_set_is_exactly_the_channels_at_or_below_the_threshold(
+    unaligned_budget, budget
+):
     """Derived from the shard's own stored attributes, so a fixture rebuilt at another quantile
-    re-derives the expectation instead of failing against a stale constant."""
+    re-derives the expectation instead of failing against a stale constant.
+
+    Read off the UNALIGNED arm, for the reason the source test below gives: **two** rules narrow
+    this stream and only one of them is the threshold. The alignment's further cut is asserted
+    separately, so a passing threshold assertion can never stand in for a passing alignment one --
+    which is exactly what would have happened had this kept reading the aligned budget once the
+    reference moved off `target_max`.
+    """
     declared = _rebased_vector(TARGET_BLOCKS)
     expected = np.flatnonzero(declared <= SHIPPED_BUDGET_STEPS)
 
-    assert budget.target.declared_warmup_steps == tuple(int(step) for step in declared)
-    assert budget.target.keep_index == tuple(int(index) for index in expected)
-    assert budget.target.warmup_steps == tuple(int(declared[index]) for index in expected)
+    assert unaligned_budget.target.declared_warmup_steps == tuple(
+        int(step) for step in declared
+    )
+    assert unaligned_budget.target.keep_index == tuple(int(index) for index in expected)
+    assert unaligned_budget.target.warmup_steps == tuple(
+        int(declared[index]) for index in expected
+    )
+
+    # The alignment keeps a strict subset of what the threshold keeps, and strictly fewer.
+    assert set(budget.target.keep_index) < set(unaligned_budget.target.keep_index)
+    assert budget.target.kept_width == _SHIPPED_TARGET_KEPT < _BUDGET_TARGET_KEPT
 
 
 def test_the_source_is_never_gated_by_the_budget_however_slow_its_channels_are(unaligned_budget):
@@ -189,14 +212,20 @@ def test_the_floor_this_package_declares_clears_both_streams_shifted_maxima(
 
     Under the alignment the source is no longer left behind: every channel slower than the
     reference is dropped and every survivor is shifted onto it, so $\max_c(W'_c + d_c)$ is the same
-    number on both streams. The floor is therefore $\max(B - 1, 134) = 134$, and the second
-    assertion below states which half decided it.
+    number on both streams.
+
+    At this cell's $42.21$ s reference that number is small. The alignment keeps only fast
+    channels, so $B = \max_c W'_c$ over the survivors is $1$ and $\max_c(W'_c + d_c)$ is $6$,
+    giving a requirement of $\max(B - 1, 6) = 6$ against a shipped ``warmup_period`` of $134$.
+    **The floor is therefore no longer a constraint but a retained anchor-cost policy**, which is
+    what the assertions below state: the requirement is a lower bound the shipped value clears by
+    more than twenty times, not an equality, because nothing now binds it.
     """
-    assert budget.target.max_warmup == SHIPPED_BUDGET_STEPS
+    assert budget.target.max_warmup == 1
     assert local.SHIPPED_KWARGS["warmup_period"] == SHIPPED_BUDGET_STEPS
     for stream in (budget.target, budget.source):
-        assert max(stream.combined_steps) == SHIPPED_BUDGET_STEPS, stream.name
-        assert local.SHIPPED_KWARGS["warmup_period"] == max(stream.combined_steps), stream.name
+        assert max(stream.combined_steps) == 6, stream.name
+        assert local.SHIPPED_KWARGS["warmup_period"] > max(stream.combined_steps), stream.name
     # And the reading that was retired: over the UNALIGNED source, a policy read across every input
     # channel would have put the floor at a much larger number, which is why it was not read there.
     assert local.SHIPPED_KWARGS["warmup_period"] < unaligned_budget.source.max_warmup - 1

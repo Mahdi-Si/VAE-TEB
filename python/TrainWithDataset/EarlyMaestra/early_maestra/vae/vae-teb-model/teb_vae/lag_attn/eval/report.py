@@ -429,15 +429,16 @@ def emit_grouped_variants(
         # The reporting order, applied once and used by the table and the figure alike. Filtered
         # back onto the labels actually present so a caller's ordering cannot add a cohort that
         # is not there or silently drop one that is.
-        # Defaulted rather than left alphabetical: this emitter draws a cohort fan-out, and a
-        # fan-out drawn healthy-first beside a pairwise table oriented worst-first is the one
-        # configuration in which a reader compares a violin against the wrong column.
-        ordering = order_groups if order_groups is not None else labels.ordered_groups
-        if ordering is not None:
-            requested = [str(name) for name in ordering(list(groups), group_column)]
-            groups = [name for name in requested if name in groups]
-            groups += [name for name in labels.distinct_groups(list(frame[group_column]))
-                       if name not in groups]
+        #
+        # It defaults to the family's own cohort order rather than to alphabetical: this emitter
+        # draws a cohort fan-out, and a fan-out drawn healthy-first beside a pairwise table
+        # oriented worst-first is the one configuration in which a reader compares a violin
+        # against the wrong column.
+        ordering = order_groups or labels.ordered_groups
+        requested = [str(name) for name in ordering(list(groups), group_column)]
+        groups = [name for name in requested if name in groups]
+        groups += [name for name in labels.distinct_groups(list(frame[group_column]))
+                   if name not in groups]
 
         directory.mkdir(parents=True, exist_ok=True)
         summary = summarise_by_group(frame, group_column, present)

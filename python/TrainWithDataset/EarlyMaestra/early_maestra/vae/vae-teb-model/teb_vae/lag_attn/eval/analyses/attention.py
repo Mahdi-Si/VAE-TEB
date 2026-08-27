@@ -22,7 +22,7 @@ the same lag are one head with four times the parameters, and the per-head KL de
 attribute across them regardless -- producing four confident, identical numbers.
 
 **Every lag figure carries two axes.** The model-lag index is what the tensors are indexed by;
-physical seconds is what a reader wants. The conversion is $s\ell - \Delta_{UP}$ with
+physical seconds is what a reader wants. The conversion is $s\ell + \Delta_{UP}$ with
 $\Delta_{UP}$ from ``eval_config.up_shift_secs``, and its value is stated on every figure rather
 than left implicit, because that offset has never actually been applied anywhere in this
 repository before -- ``plotting.py`` reads it from a model attribute that does not exist -- so a
@@ -158,12 +158,12 @@ def _write_heatmaps(
             )
             figures.shade_warmup(ax, warmup, float(seq_len), seq_len)
             figures.attach_lag_seconds_axis(
-                ax, metrics.STEP_SECONDS, -float(up_shift_secs)
+                ax, metrics.STEP_SECONDS, float(up_shift_secs)
             )
         figure.suptitle(
-            f"Lag axis: seconds = {metrics.STEP_SECONDS:g}$\\ell$ - "
-            f"({up_shift_secs:g}) s, i.e. the delay in the original recording after undoing "
-            f"the dataset's UP shift of {up_shift_secs:g} s. Shaded: warm-up.",
+            f"Lag axis: seconds = {metrics.STEP_SECONDS:g}$\\ell$ + "
+            f"({up_shift_secs:g}) s, i.e. the lead in the original recording: the "
+            f"dataset ADVANCED UP by {-up_shift_secs:g} s. Shaded: warm-up.",
             fontsize=7,
             y=0.999,
         )
@@ -219,7 +219,7 @@ def _write_summary_figure(
             "top",
             functions=(
                 lambda lag: metrics.lag_to_seconds(lag, up_shift_secs=up_shift_secs),
-                lambda sec: (sec + float(up_shift_secs)) / metrics.STEP_SECONDS,
+                lambda sec: (sec - float(up_shift_secs)) / metrics.STEP_SECONDS,
             ),
         )
         seconds.set_xlabel("Physical delay (s)", fontsize=8)
@@ -233,8 +233,9 @@ def _write_summary_figure(
             reference_label="all heads identical",
         )
         figure.suptitle(
-            f"Physical delay = {metrics.STEP_SECONDS:g}$\\ell$ - ({up_shift_secs:g}) s, "
-            f"undoing the dataset's UP shift of {up_shift_secs:g} s. Read argmax_lag only "
+            f"Physical delay = {metrics.STEP_SECONDS:g}$\\ell$ + ({up_shift_secs:g}) s, "
+            f"the lead in the original recording: the dataset ADVANCED UP by "
+            f"{-up_shift_secs:g} s. Read argmax_lag only "
             f"against the entropy: near the attainable ceiling the row is flat and its peak "
             f"is noise.",
             fontsize=7,

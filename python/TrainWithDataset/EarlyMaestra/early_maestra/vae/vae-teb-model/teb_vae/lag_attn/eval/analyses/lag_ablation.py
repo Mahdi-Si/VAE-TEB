@@ -437,7 +437,7 @@ def _write_figures(frame: pd.DataFrame, directory: Path, up_shift_secs: float) -
                 0.5, 0.98,
                 f"All bands and the unmasked baseline scored on the same "
                 f"{int(ablated['anchors_scored'].iloc[0]) if len(ablated) else 0} anchors; "
-                f"lag axis undoes the dataset UP shift of {up_shift_secs:g} s.",
+                f"lag axis carries the dataset UP advance of {-up_shift_secs:g} s.",
                 transform=ax.transAxes, ha="center", va="top", fontsize=6,
                 color=figures.COLOR_GRAY,
             )

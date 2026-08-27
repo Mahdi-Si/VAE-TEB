@@ -244,7 +244,7 @@ def _write_te_figure(
             "top",
             functions=(
                 lambda lag: metrics.lag_to_seconds(lag, up_shift_secs=up_shift_secs),
-                lambda sec: (sec + float(up_shift_secs)) / metrics.STEP_SECONDS,
+                lambda sec: (sec - float(up_shift_secs)) / metrics.STEP_SECONDS,
             ),
         )
         seconds.set_xlabel("Physical delay (s)", fontsize=8)
@@ -267,7 +267,7 @@ def _write_te_figure(
             reference=IDENTITY_TOLERANCE, reference_label="tolerance",
         )
         figure.suptitle(
-            f"Physical delay = {metrics.STEP_SECONDS:g}$\\ell$ - ({up_shift_secs:g}) s. "
+            f"Physical delay = {metrics.STEP_SECONDS:g}$\\ell$ + ({up_shift_secs:g}) s. "
             f"Dead anchors are excluded: their attention rows are zeroed, not renormalised, so "
             f"averaging them in would subtract mass from the profile.",
             fontsize=7, y=0.999,
@@ -307,7 +307,7 @@ def _write_per_head_figure(
             "top",
             functions=(
                 lambda lag: metrics.lag_to_seconds(lag, up_shift_secs=up_shift_secs),
-                lambda sec: (sec + float(up_shift_secs)) / metrics.STEP_SECONDS,
+                lambda sec: (sec - float(up_shift_secs)) / metrics.STEP_SECONDS,
             ),
         )
         top.set_xlabel("Physical delay (s)", fontsize=8)

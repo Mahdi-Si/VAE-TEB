@@ -9,10 +9,15 @@ assumed pre-recording history, and the normalisation constants were accumulated 
 excluding exactly that region -- so those numbers are on no defined scale, and a model that reads
 them is training on pad with nothing raising.
 
-**The gate does not mask it.** This family's ``ChannelGate`` is built with ``delays=None``, a pure
-gather, so ``gate.delay.delay_steps`` is all zeros. A model that built its adapter from that -- as
-the base does, correctly, for a reach-budget guard -- would get ``max_delay = 0`` and **neither**
-availability term: no mask, no announcement, and the encoder would see the region as signal.
+**The gate does not mask it.** ``ChannelGate`` here selects channels and -- under an alignment
+reference -- shifts them; it never masks. On an unaligned config it is built with ``delays=None``, a
+pure gather, so ``gate.delay.delay_steps`` is all zeros; under the shipped ``causal_align_reference``
+those entries are the alignment shifts $d_c$, a different quantity from $W'_c$ and unrelated to it.
+A model that built its adapter from them -- as the base does, correctly, for a reach-budget guard --
+would mask at $\mathbb 1[t \ge d_c]$ rather than at $\mathbb 1[t \ge W'_c + d_c]$: ``max_delay = 0``
+and **neither** availability term in the unaligned case, and in the aligned one a mask that
+announces every channel warm $W'_c$ steps before it is. Either way the encoder sees the warm-up
+region as signal.
 
 **A warm-up under a delay name would shift instead of masking.** ``target_delays`` reaches
 ``ChannelDelay``, whose output at step $t$ is the input at $t - \delta_c$; the content is then
@@ -230,7 +235,7 @@ def test_the_shipped_budget_builds_both_start_tokens() -> None:
                                                 kwargs[f"{name}_align_delays"]))
         for name in ("target", "source")
     ]
-    assert combined == [91, 91]
+    assert combined == [80, 80]
 
     model = build(kwargs)
     assert model.target_adapter.start_embed is not None

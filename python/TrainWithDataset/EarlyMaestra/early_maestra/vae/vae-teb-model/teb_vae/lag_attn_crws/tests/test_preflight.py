@@ -121,18 +121,21 @@ def test_a_floor_that_does_not_pair_with_the_budget_is_refused_naming_both_numbe
     configuration fails before a run directory exists rather than inside the constructor after every
     rank initialised.
 
-    At the shipped configuration the second half binds: the aligned inputs are honest at the anchor
-    only from $B = 134$, so the floor is $134$ rather than the $133$ the scored-target half alone
-    would admit. The requirement is asserted beside the number, because the two halves differ by one
-    step and a message naming the wrong one would still name a plausible integer."""
-    _vae(config)["warmup_period"] = 132
+    The second half binds, and by a wide margin. At this cell's $42.21$ s reference the alignment
+    drops every channel slower than it, so the survivors are fast ones: $B = 1$ and
+    $\max_c(W'_c + d_c) = 6$, giving a requirement of $6$ against the $0$ the scored-target half
+    alone would admit. The shipped ``warmup_period`` of $134$ therefore clears it more than twenty
+    times over -- the floor has become a retained anchor-cost policy rather than a constraint, which
+    is exactly why it is asserted here: a requirement nothing binds is one a later edit can silently
+    violate."""
+    _vae(config)["warmup_period"] = 5
 
     with pytest.raises(ValueError) as excinfo:
         LagAttnCrwsTrainer.preflight(config)
 
     message = str(excinfo.value)
-    assert "warmup_period=132" in message
-    assert "134" in message
+    assert "warmup_period=5" in message
+    assert "at least 6" in message
     assert "shifted onto a common clock" in message
 
 
@@ -142,7 +145,7 @@ def test_the_floor_refusal_is_the_constructors_own_and_states_the_input_warmth_p
     actually enforces: the raw target is honest at every step, so a lower floor would not corrupt the
     objective -- it would decode anchors whose *inputs* are still partly pre-recording history, which
     is a different claim about the run rather than a wrong number in it."""
-    _vae(config)["warmup_period"] = 100
+    _vae(config)["warmup_period"] = 5
     resolved = resolve_warmup_budget(config)
     assert resolved is not None
 
@@ -153,7 +156,7 @@ def test_the_floor_refusal_is_the_constructors_own_and_states_the_input_warmth_p
     # against an unaligned one and fail on the wording rather than on the delegation.
     with pytest.raises(ValueError) as constructor_error:
         CausalRawInputs._check_anchor_floor(
-            100, resolved.target.warmup_steps, resolved.target.align_delays or ()
+            5, resolved.target.warmup_steps, resolved.target.align_delays or ()
         )
 
     assert str(preflight_error.value) == str(constructor_error.value)

@@ -614,15 +614,16 @@ def test_every_declared_file_was_written(analysis_run) -> None:
 
 
 def test_the_class_resolved_rows_are_in_clinical_order(analysis_run) -> None:
-    """Pooled first, then healthy / acidosis / HIE. Alphabetical would put ``acidosis`` first on
-    every table, and the figure beside it reads its order from the same list."""
+    """Pooled first, then HIE / acidosis / healthy -- the evaluation's one cohort order, worst
+    first. Alphabetical would put ``acidosis`` first on every table, and the figure beside it reads
+    its order from the same list."""
     for frame in ("entropy", "distance", "reach"):
         seen: List[str] = []
         for value in analysis_run[frame][labels.CLASS_COLUMN]:
             if not seen or seen[-1] != value:
                 seen.append(str(value))
         expected = [
-            name for name in [recompute.POOLED_CLASS, "healthy", "acidosis", "hie"]
+            name for name in [recompute.POOLED_CLASS, "hie", "acidosis", "healthy"]
             if name in set(seen)
         ]
         assert seen == expected, frame

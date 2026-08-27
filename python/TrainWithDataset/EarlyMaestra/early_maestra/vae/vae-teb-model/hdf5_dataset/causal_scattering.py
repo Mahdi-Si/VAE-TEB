@@ -124,6 +124,19 @@ SOURCE_PHASE_BAND_HZ = (0.008, 0.05)
 #: concentrated enough to be a usable band-pass, low enough that $\tau_g = n/(2\pi b)$ stays finite.
 GAMMATONE_ORDER = 4
 
+#: Fraction of $\tau_g$ a channel's content actually sits at: $1 - 1/(2\gamma) = 0.875$ at
+#: :data:`GAMMATONE_ORDER`. :attr:`CausalBank.group_delay_samples` ships the phase group delay
+#: $\tau_g = \gamma/(2\pi b)$, the envelope's *mean*, which is the right number to REPORT as a
+#: channel's staleness. It is not the right number to ALIGN on: the realised lag is the
+#: spectrum-weighted average group delay, equivalently the impulse response's energy centroid
+#: $(2\gamma-1)/(4\pi b)$, because $\tau_g(\nu) = \tau_g(\xi)\,b^2/(b^2+(\nu-\xi)^2)$ is *maximal*
+#: at the centre frequency and a channel's own passband can therefore only pull the realised lag
+#: down. The spread is one-sided and does not average out. Measured over 30 segments of the aligned
+#: shard, causal ``fhr_st`` against the centred block: median realised/reported $0.903$ over all 30
+#: resolved channels, $0.882$ over the nine slow ones where the $4$ s grid quantises by under
+#: $2.5\%$ -- against $0.875$ predicted here and $1.000$ predicted by $\tau_g$.
+ALIGNMENT_DELAY_FACTOR = 1.0 - 1.0 / (2.0 * GAMMATONE_ORDER)
+
 #: Causal kernel length in taps. Measured requirement, not a guess: at the corrected rate
 #: $b = 1.914\,\sigma$ the slowest kernel retains only $70.7\%$ of its $L^1$ mass inside $2^{13}$
 #: taps and $98.6\%$ inside $2^{14}$, against $99.999\%$ at $2^{15}$. Enlarging the kernel is
@@ -1617,8 +1630,15 @@ def channel_alignment_delays(
 ) -> np.ndarray:
     r"""Per-channel step shift that brings a whole stored block onto one reference clock.
 
-    $$d_c \;=\; \operatorname{round}\!\Bigl(\frac{\tau_{\mathrm{ref}} - \tau_c}{\Delta}\Bigr),
-      \qquad \Delta = \texttt{step\_s} .$$
+    $$d_c \;=\; \operatorname{round}\!\Bigl(\kappa\,\frac{\tau_{\mathrm{ref}} - \tau_c}{\Delta}\Bigr),
+      \qquad \Delta = \texttt{step\_s},
+      \qquad \kappa = 1 - \frac{1}{2\gamma} = 0.875 .$$
+
+    **Why the difference is scaled.** *delay_s* is the reported $\tau_g$; a channel's content sits
+    at $\kappa\tau_g$ (:data:`ALIGNMENT_DELAY_FACTOR`). Only the *difference* carries the factor, so
+    the reference channel still takes shift $0$ and the drop rule is untouched -- $\tau_c \le
+    \tau_{\mathrm{ref}}$ is scale-invariant -- while every survivor lands on the common effective
+    clock $\kappa\tau_{\mathrm{ref}}$ rather than $\tau_{\mathrm{ref}}$.
 
     Reading channel $c$ at step $t - d_c$ instead of $t$ makes every entry of the vector describe
     one physical instant. It is a re-indexing of the lag origin, not a loss of information:
@@ -1666,7 +1686,9 @@ def channel_alignment_delays(
             f"would need a negative shift, which reads the channel's own future; a channel above "
             f"the reference must be dropped, not advanced."
         )
-    return np.round((float(reference_s) - delay) / float(step_s)).astype(np.int64)
+    return np.round(
+        ALIGNMENT_DELAY_FACTOR * (float(reference_s) - delay) / float(step_s)
+    ).astype(np.int64)
 
 
 def novelty_fraction(

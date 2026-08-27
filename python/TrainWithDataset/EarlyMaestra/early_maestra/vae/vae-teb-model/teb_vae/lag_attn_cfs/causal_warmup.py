@@ -100,6 +100,29 @@ logger = logging.getLogger(__name__)
 #: hardcoded $\Delta$ would keep resolving shifts against a decimation the shards no longer have.
 STEP_SECONDS = float(DECIMATION) / float(RAW_SAMPLING_HZ)
 
+#: Fraction of a channel's reported group delay that its content actually sits at, $1 - 1/(2\gamma)$
+#: $= 0.875$ at the shipped gammatone order $\gamma = 4$.
+#:
+#: ``causal_delay_s`` ships the phase group delay $\tau_g = \gamma/(2\pi b)$, which is the
+#: envelope's *mean* and the right number to REPORT as a channel's staleness. It is not the right
+#: number to ALIGN on. The delay a stored channel actually exhibits is the spectrum-weighted average
+#: group delay -- equivalently the impulse response's energy centroid, $(2\gamma-1)/(4\pi b)$ --
+#: because $\tau_g(\nu) = \tau_g(\xi)\,b^2/(b^2 + (\nu-\xi)^2)$ is *maximal* at the centre frequency,
+#: so a channel's own passband contributes only downward departures. The spread is one-sided, not
+#: the symmetric jitter it was long recorded as, and it therefore does not average out.
+#:
+#: Measured on the shipped bank over 30 segments, causal ``fhr_st`` against the centred block: the
+#: median ratio of realised to reported lag is $0.903$ over all 30 resolved channels and $0.882$
+#: over the nine slow ones where the $4$ s grid quantises by under $2.5\%$ -- against $0.875$
+#: predicted here and $1.000$ predicted by $\tau_g$.
+#:
+#: Restated rather than imported, like :data:`TARGET_BLOCKS` above: deriving it from
+#: ``hdf5_dataset.causal_scattering.GAMMATONE_ORDER`` would build the two-sided filter bank at
+#: import and cost this module the torch-free, kymatio-free property the resolver depends on.
+#: ``test_causal_warmup.py`` asserts the two agree, so they cannot drift.
+GAMMATONE_ORDER = 4
+ALIGNMENT_DELAY_FACTOR = 1.0 - 1.0 / (2.0 * GAMMATONE_ORDER)
+
 #: The alignment reference resolved from the data: the slowest **kept target** channel's composed
 #: delay. Written out because it appears in refusal messages and in the config.
 REFERENCE_TARGET_MAX = "target_max"
@@ -528,7 +551,16 @@ def _align_stream(
 ) -> Tuple[Tuple[int, ...], Optional[Tuple[int, ...]]]:
     r"""Drop a stream's above-reference channels and resolve the survivors' shifts.
 
-    $$d_c \;=\; \operatorname{round}\!\Bigl(\frac{\tau_{\mathrm{ref}} - \tau_c}{\Delta}\Bigr) \ge 0.$$
+    $$d_c \;=\; \operatorname{round}\!\Bigl(\kappa\,\frac{\tau_{\mathrm{ref}} - \tau_c}{\Delta}\Bigr)
+      \ge 0, \qquad \kappa = 1 - \frac{1}{2\gamma} = 0.875 .$$
+
+    **The factor $\kappa$ is not a fudge.** ``causal_delay_s`` reports $\tau_g$, the envelope mean,
+    which is the honest staleness of a channel; the delay a channel's content actually sits at is
+    the energy centroid $\kappa\,\tau_g$, because the group delay is maximal at the centre frequency
+    and the passband can only pull the realised lag *down*. See
+    :data:`ALIGNMENT_DELAY_FACTOR` for the measurement. Only the *difference* is scaled, so the
+    reference channel still takes shift $0$ and the keep-index is untouched -- $\tau_c \le
+    \tau_{\mathrm{ref}}$ is scale-invariant.
 
     **Rounding, not ceiling**, and the reason is not the warm-up's. Both directions are causally
     safe -- a shift only selects which *already-causal* stored step is read -- so the only criterion
@@ -583,7 +615,8 @@ def _align_stream(
         )
 
     shifts = tuple(
-        int(round((reference_s - delay_s[index]) / STEP_SECONDS)) for index in kept
+        int(round(ALIGNMENT_DELAY_FACTOR * (reference_s - delay_s[index]) / STEP_SECONDS))
+        for index in kept
     )
     return tuple(kept), shifts
 
