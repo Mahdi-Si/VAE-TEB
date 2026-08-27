@@ -3,8 +3,9 @@ r"""The lag axis, and reading a per-lag vector against it. One implementation, t
 A lag index $\ell$ is not seconds. The figure to report is the **compensated** one,
 $\tau_\ell = 4(\ell + \delta)$, where $\delta$ is the causal input delay the source channels are
 read with -- so a peak at lag $\ell$ refers to source content $\ell + \delta$ steps back. The
-other seconds figure, which adds the $20$ s the preprocessing already removed, exists only to
-locate a finding in the original sensor files and appears in no analysis.
+other seconds figure, which *subtracts* the $20$ s the preprocessing already removed -- it advanced
+the source trace, so undoing that moves the figure down -- exists only to locate a finding in the
+original sensor files and appears in no analysis.
 
 **What that axis is time *in* is where this module differs from the raw cells', and the
 arithmetic is not what differs.** $\tau_\ell$ is computed here by the identical shared converter.

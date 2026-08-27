@@ -119,8 +119,9 @@ def test_render_figure_writes_the_file_and_leaves_no_open_figure(tmp_path) -> No
 
 def test_the_lag_axis_label_is_the_models_own_compensated_one() -> None:
     r"""There are two seconds figures for one lag index and they are different quantities. The
-    sensor figure adds back the $20$ s the preprocessing already removed and exists only to map a
-    finding onto the original files; a figure that drew it under this name would double-count a
+    sensor figure undoes the $20$ s the preprocessing already removed -- *subtracting* it, since the
+    preprocessing advanced the source trace -- and exists only to map a finding onto the original
+    files; a figure that drew it under this name would double-count a
     deliberate correction."""
     from teb_vae.lag_attn.nets import lag_report
 

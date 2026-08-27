@@ -55,9 +55,9 @@ box unedited put the panel over the last windows of the very forecast it is a de
 **The input rows**, through ``input_stream_panels``. The shipped builder calls
 ``describe_streams``, which raises on this family's channel widths -- inside a handler that warns
 and continues, so the cost of not replacing it is a green suite and a page missing two rows. It also
-draws ``gate(values)``, and on this model the gate is a pure gather: the warm-up mask lives one
-layer further on, inside the availability adapter, so the gate's output is *not* what the encoder
-reads. What is drawn here is the adapter's own availability buffer applied to the gated stream, so
+draws ``gate(values)``, and on this model the gate gathers the survivors and then shifts each onto
+the common clock, while the warm-up mask lives one layer further on, inside the availability
+adapter -- so the gate's output is *not* what the encoder reads. What is drawn here is the adapter's own availability buffer applied to the gated stream, so
 the zeros on the row and the staircase over them are one tensor rather than two that agree.
 
 **What the staircase means here is not what it means on a two-sided page.** There it is a delay: the
@@ -322,8 +322,9 @@ def causal_stream_panels(
     be reused for two independent reasons. It calls ``describe_streams``, which builds the
     production two-sided Morlet bank and refuses a model whose declared width disagrees with it --
     and these widths do, because seven scattering channels per block were dropped at write time. And
-    it draws ``gate(values)``: on this model the gate is a pure gather and the warm-up mask lives
-    inside the availability adapter, so the gate's output is one layer short of the encoder's input.
+    it draws ``gate(values)``: on this model the gate gathers and then shifts, and the warm-up mask
+    lives inside the availability adapter, so the gate's output is one layer short of the encoder's
+    input.
 
     What is drawn is the gated stream multiplied by the **adapter's own** availability buffer -- the
     same tensor the adapter masks and announces with -- so the zeros on the row and the staircase
@@ -381,7 +382,8 @@ def causal_stream_panels(
             warmup = np.zeros(keep_index.size, dtype=int)
         # Plus the gate's own shift, which is the vector the adapter was built at. A gathered and
         # delayed channel is honest only once the step index has reached both, so a staircase drawn
-        # from the warm-up alone would sit up to 97 steps left of the mask below it -- and the row
+        # from the warm-up alone would sit up to max_c d_c steps left of the mask below it -- 85 at
+        # this cell's shipped `target_max` reference, 6 at the raw cells' 42.21 s -- and the row
         # would show a zeroed region the drawn boundary said was real. Zero on every unaligned
         # model, where the gate is a pure gather.
         if gate is not None:

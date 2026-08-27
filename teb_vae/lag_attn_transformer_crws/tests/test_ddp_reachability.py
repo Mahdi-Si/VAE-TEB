@@ -119,19 +119,30 @@ def test_the_attention_projection_is_frozen_out_of_the_expectation_set(task) -> 
 # --------------------------------------------------------------------------------------
 # The start embedding: a construction-time hazard rather than a width
 # --------------------------------------------------------------------------------------
-def test_the_shipped_budget_builds_no_start_embedding_on_either_stream() -> None:
-    """The property the shipped configuration depends on, asserted so a budget change that flipped
-    it is visible. Both streams reach warm-up zero at the shipped budget -- the target-feature
-    stream because ``fhr_st``'s fastest channels are honest from step $0$, the source because
-    ``up_st``'s are -- so neither adapter builds the start indicator, and there is no parameter
-    reached only by the leading steps of a segment."""
+def test_the_shipped_budget_builds_a_start_embedding_on_both_streams() -> None:
+    r"""Both adapters build the start indicator, and that is a DDP hazard the design carries.
+
+    This asserted the OPPOSITE until the channel alignment shipped, on the reasoning that both
+    streams reach warm-up zero -- ``fhr_st`` and ``up_st`` are both honest from step $0$ -- so no
+    parameter would be reached only by the leading steps of a segment. The warm-up vectors still
+    reach zero, which is why the first two assertions are unchanged; but the adapter is fed
+    $W'_c + d_c$, not $W'_c$, and every channel but the reference carries a strictly positive
+    shift. So the minimum is $1$ rather than $0$, the leading step of every segment has no
+    available channel at all, and both adapters build the parameter.
+
+    The consequence is the one the module's other tests exist for: under
+    ``find_unused_parameters=False`` a rank whose batch never reaches those leading steps marks the
+    embedding unready and the reducer raises. It is a *construction-time* change, so no shape and
+    no width anywhere says it happened.
+    """
     torch.manual_seed(0)
     model = SeqVaeLagAttnTrfCrws(**shipped_warmup_kwargs())
 
     assert min(model.target_warmup_steps) == 0
     assert min(model.source_warmup_steps) == 0
     for adapter in (model.target_adapter, model.source_adapter):
-        assert getattr(adapter, "start_embed", None) is None
+        assert getattr(adapter, "start_embed", None) is not None
+        assert adapter.min_delay > 0
 
 
 def test_dropping_the_first_source_block_would_build_one() -> None:
@@ -149,6 +160,9 @@ def test_dropping_the_first_source_block_would_build_one() -> None:
     keep = [
         index for index, step in enumerate(source_only["source_warmup_steps"]) if step > 0
     ]
+    # The shift vector is positional -- one entry per SURVIVING channel -- so it has to be
+    # narrowed alongside the warm-up. Leaving it at full width made `ChannelDelay` refuse by
+    # length rather than letting the model build, which hid what this control is measuring.
     model = SeqVaeLagAttnTrfCrws(
         **dict(
             source_only,
@@ -157,6 +171,9 @@ def test_dropping_the_first_source_block_would_build_one() -> None:
             source_keep_index=tuple(range(len(keep))),
             source_warmup_steps=tuple(
                 source_only["source_warmup_steps"][index] for index in keep
+            ),
+            source_align_delays=tuple(
+                source_only["source_align_delays"][index] for index in keep
             ),
         )
     )

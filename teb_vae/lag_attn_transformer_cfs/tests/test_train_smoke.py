@@ -237,9 +237,14 @@ def test_the_step_granular_ramp_was_live_during_the_fit(fit):
 
 
 def test_the_input_adapters_carry_the_availability_terms_the_warm_up_needs(fit):
-    """The failure ``_build_adapter`` exists to prevent, checked on the model a real run built: the
-    gate here is a pure gather, so the architecture parent's version would give ``max_delay = 0``
-    and neither availability term."""
+    r"""The failure ``_build_adapter`` exists to prevent, checked on the model a real run built.
+
+    The architecture parent sizes the guard from ``gate.delay.delay_steps``, which carries only the
+    alignment shifts $d_c$ and nothing of the warm-up: $0$ on an unaligned config, where the gate is
+    a pure gather, and $\max_c d_c$ under this cell's shipped
+    ``causal_align_reference: target_max``. The override passes $W'_c + d_c$ per channel, and the
+    zero-marginal-warm-up lemma makes $\max_c(W'_c + d_c) = \max_c W'_c$ -- which is why the
+    equality asserted below survives the alignment unchanged."""
     driver, _trainer = fit
     model = driver.pytorch_model
 

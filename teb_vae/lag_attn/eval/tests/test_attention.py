@@ -86,7 +86,10 @@ def test_the_lag_column_pair_holds_its_arithmetic_relationship(
     config = tiny_eval_config["eval_config"]
     _, frame = _run(runner, tiny_loader, config, tmp_path / "pair")
 
-    expected = metrics.STEP_SECONDS * frame["argmax_lag"].to_numpy() - float(
+    # `+ up_shift_secs`, not `-`: the dataset ADVANCED the UP trace by 20 s, so a peak at lag l is
+    # a lead of 4l - 20 s in the original recording. This asserted the subtraction until the sign
+    # was corrected -- the same arithmetic the function had, which is why it could not catch it.
+    expected = metrics.STEP_SECONDS * frame["argmax_lag"].to_numpy() + float(
         config["up_shift_secs"]
     )
     assert frame["lag_seconds_physical"].to_numpy() == pytest.approx(expected)
@@ -146,7 +149,7 @@ def test_attention_concentrated_at_a_known_lag_is_reported_at_that_lag(
 
     assert set(frame["argmax_lag"]) == {target_lag}
     assert frame["lag_seconds_physical"].to_numpy() == pytest.approx(
-        metrics.STEP_SECONDS * target_lag - float(config["up_shift_secs"])
+        metrics.STEP_SECONDS * target_lag + float(config["up_shift_secs"])
     )
     # A one-hot row has zero entropy: the peak is real, not the argmax of a flat profile.
     assert summary["mean_entropy_nats"] == pytest.approx(0.0, abs=1e-6)

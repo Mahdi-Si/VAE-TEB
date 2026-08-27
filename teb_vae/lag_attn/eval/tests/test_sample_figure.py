@@ -292,10 +292,15 @@ def test_a_sabotaged_channel_shows_up_in_the_residual_row():
 def test_the_lag_seconds_axis_agrees_with_the_pipelines_own_conversion():
     r"""Two figures in one run must not label the same lag differently.
 
-    ``attach_lag_seconds_axis`` maps $\ell \mapsto s\ell + d$ while the pipeline's convention --
-    ``metrics.lag_to_seconds`` -- is $s\ell - \Delta_{UP}$, so the shift has to be negated on the
-    way in. At the shipped $\Delta_{UP} = -20$ s the two conventions disagree by 40 s, which is
-    large enough to turn a causal lag into an acausal one.
+    ``attach_lag_seconds_axis`` maps $\ell \mapsto s\ell + d$ and the pipeline's convention --
+    ``metrics.lag_to_seconds`` -- is $s\ell + \Delta_{UP}$, so the shift is forwarded **un-negated**.
+    The negation that used to stand at both call sites matched a ``lag_to_seconds`` that then
+    computed $s\ell - \Delta_{UP}$, so the two agreed -- on a number 40 s too large. **This test
+    pins agreement, not the sign**: it compares the forwarded offset against ``lag_to_seconds``,
+    and a matched pair of sign errors passes it. The sign itself is pinned in ``metrics.py``
+    against ``mimo_adaptor.py``, which advances UP by 20 s. What this test rules out is the other
+    failure -- one call site corrected and the other not -- which would label the same lag two
+    ways inside one page.
     """
     from teb_vae.lag_attn.eval import metrics
 

@@ -8,8 +8,9 @@ target-domain-free and are inherited untouched:
 
 * ``_set_causal_inputs`` and ``_validate_causal_geometry`` -- pure writers over the four keywords
   this domain owns, and the stride-versus-span refusal;
-* ``_build_adapter`` -- one stream's availability adapter at its warm-up rather than at its gate's
-  delays, which are all zero under a pure gather;
+* ``_build_adapter`` -- inherited unchanged from the sibling, which builds one stream's
+  availability adapter at $W'_c + d_c$: its warm-up plus its gate's shift, so a gathered-and-delayed
+  channel is announced honest only once both have passed;
 * ``build_lag_mask`` -- the floored $\mathbb 1[t - \ell \ge F_u]$ mask;
 * ``_build_anchor_index`` and ``forward`` -- the tiled anchor set and the decode at it. Their
   independence from the target is the load-bearing fact of this package: these cells take the
@@ -219,21 +220,27 @@ class CausalRawInputs(CausalWarmupInputs):
         $136$ anchors to enforce something this design deliberately does not want.
 
         **The alignment's own drops are a different thing and do not change that.** When a
-        reference is configured the source stream loses the four channels whose composed delay
-        exceeds it -- not because they are slow, but because bringing them onto the reference would
+        reference is configured the source stream loses every channel whose composed delay
+        exceeds it -- four at the feature cells' ``target_max``, thirty-four at this cell's
+        shipped $42.21$ s, which is the whole ``up_ph`` block and nineteen ``up_st`` channels --
+        not because they are slow, but because bringing them onto the reference would
         need a negative shift, i.e. would read those channels' own future. That is a correctness
         requirement resolved in ``causal_warmup.py``, and the remaining source channels are still
         colder than this floor by design and still measured rather than refused.
 
-        The first half's wording is exact and its obvious paraphrase is not. Unaligned, at the
-        shipped $F = 133$ against $B = 134$, the slowest kept target-stream channel is still cold
+        The first half's wording is exact and its obvious paraphrase is not. Unaligned, at
+        $F = 133$ -- the smallest floor that pairing admits -- against $B = 134$, the slowest kept
+        target-stream channel is still cold
         *at the anchor itself* and becomes honest exactly at $t + 1$, which is the first step the
         forecast covers; a policy stated as "warm at the anchor" would require $F \ge B$ and cost a
         tile boundary for nothing. Under a **shift** that stronger statement is the one that has to
         hold, for a reason the unaligned stream does not have: the aligned channel vector at step
         $t$ asserts that its entries describe one physical instant, and it is not a partial
         assertion -- it is false while any entry has not arrived. At the shipped reference that
-        puts the floor at $134$ and costs exactly one anchor.
+        puts the floor at $134$ in the feature cells and costs exactly one anchor. At this cell's
+        shipped $42.21$ s reference the survivors are the fast channels, so $B = 1$ and
+        $\max_c(W'_c + d_c) = 6$: the requirement is $6$ steps and the shipped $F = 134$ clears it
+        more than twenty times over, so nothing here binds the floor any more.
 
         Overridden rather than ``_validate_causal_geometry``, which would re-copy the
         stride-versus-span refusal and its message and let the two drift.
@@ -333,7 +340,33 @@ class CausalRawInputs(CausalWarmupInputs):
             else self.source_gate.keep_index.cpu()
         )
         split = self.SOURCE_BLOCK_SPLIT if self.use_up_st else 0
+
+        # A channel is honest from step $W'_c + d_c$, not from $W'_c$: ``ChannelDelay`` makes
+        # encoder step $t$ read stored step $t - d_c$, so the shift postpones the whole pattern.
+        # The availability mask in ``_build_adapter`` and the floor in ``_check_anchor_floor``
+        # both already add it; this was the third site and the only one that *reported* rather
+        # than enforced, which is why nothing failed. Because $d_c \ge 0$ always, the omission
+        # could only ever report the source as WARMER than it is -- and on the shipped aligned
+        # configuration it made ``source_lag_warmth_frac_st`` identically $1.0$ for any attention
+        # distribution, i.e. a column that could not vary and therefore measured nothing.
         waits = self.source_warmup_steps
+        if waits is not None and self.source_gate is not None:
+            waits = tuple(
+                wait + int(shift)
+                for wait, shift in zip(waits, self.source_gate.delay.delay_steps)
+            )
+
+        # Refused rather than zipped: ``declared`` is the gate's keep-index when there is a gate
+        # and the full declared range when there is not, so a stream carrying a warm-up without a
+        # gate would pair 47 waits against 51 indices and ``zip`` would silently drop the tail,
+        # reporting both fractions against the wrong denominators with every shape still correct.
+        if waits is not None and len(waits) != int(declared.numel()):
+            raise ValueError(
+                f"{len(waits)} source warm-up steps against {int(declared.numel())} declared "
+                f"channel indices. These must agree: a stream with a warm-up must carry the gate "
+                f"whose keep-index names the channels that warm-up belongs to."
+            )
+
         for name, in_block in (
             ("st", declared < split),
             ("ph", declared >= split),

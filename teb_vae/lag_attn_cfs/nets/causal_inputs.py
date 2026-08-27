@@ -312,7 +312,33 @@ class CausalWarmupInputs:
             else self.source_gate.keep_index.cpu()
         )
         split = self.SOURCE_BLOCK_SPLIT if self.use_up_st else 0
+
+        # A channel is honest from step $W'_c + d_c$, not from $W'_c$: ``ChannelDelay`` makes
+        # encoder step $t$ read stored step $t - d_c$, so the shift postpones the whole pattern.
+        # The availability mask in ``_build_adapter`` and the floor in ``_check_anchor_floor``
+        # both already add it; this was the third site and the only one that *reported* rather
+        # than enforced, which is why nothing failed. Because $d_c \ge 0$ always, the omission
+        # could only ever report the source as WARMER than it is -- and on the shipped aligned
+        # configuration it made ``source_lag_warmth_frac_st`` identically $1.0$ for any attention
+        # distribution, i.e. a column that could not vary and therefore measured nothing.
         waits = self.source_warmup_steps
+        if waits is not None and self.source_gate is not None:
+            waits = tuple(
+                wait + int(shift)
+                for wait, shift in zip(waits, self.source_gate.delay.delay_steps)
+            )
+
+        # Refused rather than zipped: ``declared`` is the gate's keep-index when there is a gate
+        # and the full declared range when there is not, so a stream carrying a warm-up without a
+        # gate would pair 47 waits against 51 indices and ``zip`` would silently drop the tail,
+        # reporting both fractions against the wrong denominators with every shape still correct.
+        if waits is not None and len(waits) != int(declared.numel()):
+            raise ValueError(
+                f"{len(waits)} source warm-up steps against {int(declared.numel())} declared "
+                f"channel indices. These must agree: a stream with a warm-up must carry the gate "
+                f"whose keep-index names the channels that warm-up belongs to."
+            )
+
         for name, in_block in (
             ("st", declared < split),
             ("ph", declared >= split),
@@ -353,7 +379,7 @@ class CausalWarmupInputs:
         leading region is real values on no defined scale entering the encoder as though it were
         signal. And the warm-up alone is right only while nothing is shifted: a channel gathered
         from step $t - d_c$ is a function of the recording only once $t - d_c \ge W'_c$, so an
-        adapter told $W'_c$ against a shifted stream announces a channel warm by as much as $97$
+        adapter told $W'_c$ against a shifted stream announces a channel warm by as much as $85$
         steps before it is -- with no crash, no shape change and no metric moving.
 
         Read off the **gate** rather than off a second copy of the shift, for the reason the base's
@@ -372,8 +398,10 @@ class CausalWarmupInputs:
 
         Returns:
             The adapter, carrying whichever availability terms the combined vector calls for --
-            which under alignment is both, because the minimum of $W'_c + d_c$ is $91$ steps where
-            the warm-up alone reaches $0$, so the start-of-record embedding comes into existence.
+            which under alignment is both, because the minimum of $W'_c + d_c$ is nonzero where the
+            warm-up alone reaches $0$ -- $80$ steps at the causal-feature cells' shipped
+            reference and $1$ at the raw-target cells' -- so the start-of-record embedding comes
+            into existence.
         """
         warmup = (
             self.target_warmup_steps
@@ -572,9 +600,9 @@ class CausalWarmupInputs:
         )
 
         # Concatenate at the declared widths, then gate: the surviving-channel indices are
-        # positional into the full stream. The gate is a pure gather here -- the warm-up is a
-        # leading mask, not a shift -- and the masking happens inside the adapter, which holds the
-        # same vector it announces with.
+        # positional into the full stream. The gate gathers the survivors and then delays each by
+        # its own d_c, while the warm-up stays a leading mask rather than part of the gate -- and
+        # the masking happens inside the adapter, which holds the same vector it announces with.
         target = torch.cat([y_st, y_ph], dim=-1)
         if self.target_gate is not None:
             target = self.target_gate(target)

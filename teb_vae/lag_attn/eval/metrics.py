@@ -1126,19 +1126,22 @@ def lag_to_seconds(
 ) -> Any:
     r"""Convert a model lag index to the physical delay it implies, in seconds.
 
-    $$\mathrm{seconds}(\ell) = s\,\ell - \Delta_{UP}$$
+    $$\mathrm{seconds}(\ell) = s\,\ell + \Delta_{UP}$$
 
-    The subtraction is not a sign slip. ``up_shift_secs`` records how far the UP stream was
-    shifted *during dataset construction*; recovering the delay in the original recording means
-    undoing that shift. The pipeline builds its adaptor with $\Delta_{UP} = -20$ s, so a peak at
-    lag $\ell$ reads as $4\ell + 20 = 4(\ell + 5)$ s, which is what the model documentation
-    states.
+    **The addition corrects a sign error, settled from the source rather than argued.**
+    ``mimo_adaptor.py`` runs ``up_shifted[:-80] = up_signal[80:]`` at $\Delta_{UP} = -20$ s, so
+    stored grid position $g$ holds uterine activity the sensor recorded at $g + 20$ s -- the UP
+    stream was *advanced*, pulled earlier. Attention at anchor $t$ reading source $t - \ell$
+    therefore compares fetal heart rate at $\Delta t$ against uterine activity recorded at
+    $\Delta(t-\ell) + 20$, a lead in the original recording of $4\ell - 20$ s.
 
-    The default is $0$, i.e. no offset -- the same axis the training plots have always drawn,
-    since ``plotting.py`` reads its offset from a model attribute that does not exist. A caller
-    that passes a non-zero shift is asserting the sign has been checked against the pipeline
-    documentation, and the value used is recorded in ``preflight.json`` so the figure is
-    self-documenting.
+    This returned $s\,\ell - \Delta_{UP} = 4\ell + 20$ until it was corrected, overstating every
+    published lead by $40$ s -- in the direction that made the model look as though it had found a
+    longer, more physiological delay than it had. A peak at $\ell = 0$ was captioned $+20$ s when
+    the two epochs are $20$ s apart in the opposite order.
+
+    The default is $0$, i.e. no offset. The value used is recorded in ``preflight.json`` so the
+    figure is self-documenting.
 
     Args:
         lag: A lag index, or an array or tensor of them.
@@ -1148,7 +1151,7 @@ def lag_to_seconds(
     Returns:
         The physical delay, in the same shape as ``lag``.
     """
-    return float(step_seconds) * lag - float(up_shift_secs)
+    return float(step_seconds) * lag + float(up_shift_secs)
 
 
 def lag_seconds_physical(
@@ -1162,7 +1165,8 @@ def lag_seconds_physical(
     are a ``DataFrame`` column and a matplotlib axis and neither wants a torch tensor.
 
     The arithmetic is :func:`lag_to_seconds`'s, unchanged; see it for why the shift is
-    *subtracted* and why the default is $0$.
+    *added* -- the dataset advanced the UP stream, so undoing that advance adds a negative
+    $\Delta_{UP}$ -- and why the default is $0$.
 
     Args:
         lags: Lag indices, any shape.

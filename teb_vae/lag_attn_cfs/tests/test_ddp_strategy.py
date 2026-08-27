@@ -279,7 +279,7 @@ def test_the_shipped_aligned_budget_builds_a_start_embedding_on_both_streams():
     assert min(model.source_warmup_steps) == 0
     for adapter in (model.target_adapter, model.source_adapter):
         assert adapter.start_embed is not None
-        assert adapter.min_delay == 91
+        assert adapter.min_delay == 80
         # Live on the leading region of every segment, and only there.
         indicator = adapter.start_indicator.squeeze(-1)
         assert bool(indicator[: adapter.min_delay].all())

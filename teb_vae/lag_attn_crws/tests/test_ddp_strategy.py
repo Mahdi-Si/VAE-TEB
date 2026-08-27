@@ -264,16 +264,22 @@ def test_the_shipped_aligned_budget_builds_a_start_embedding_on_both_streams():
     Both streams reach warm-up zero on their own -- the target because ``fhr_st``'s fastest channels
     are honest from step $0$, the source because ``up_st``'s are -- but the adapter is fed
     $W'_c + d_c$, and the alignment shifts every channel of both streams onto one clock. The
-    combined minimum is therefore the fastest channel's *shift*, $91$ steps, and the adapter builds
+    combined minimum is therefore the fastest channel's *shift*, $80$ steps, and the adapter builds
     a start indicator on each stream: a learned $d_{\mathrm{model}}$-wide vector per stream, live
     on the leading region where no channel of that stream has arrived at all.
 
     **Why ``find_unused_parameters=False`` still holds.** A parameter reached only by *some* batches
-    is the hazard; this one is reached by every batch of every rank, because the leading $91$ steps
+    is the hazard; this one is reached by every batch of every rank, because the leading $80$ steps
     are the leading steps of every segment the loader serves and the term is added unconditionally
     in the forward -- the branch is ``self.start_embed is not None``, a test on a module built in
     ``__init__``, never on tensor content. The two facts are asserted together, because the first
     without the second reads as a regression.
+
+    **Which reference "shipped" means here.** ``shipped_warmup_kwargs`` reaches the causal-feature
+    package's ``causal_config``, whose ``SHIPPED_ALIGN_REFERENCE`` is ``target_max``, so the budget
+    built below is the $402.1604$ s one and $80$ is its combined minimum. This cell's own
+    ``configs/default.yaml`` ships $42.21$ s, where the same minimum is $1$; the property under test
+    -- a positive combined minimum builds the indicator on both streams -- holds at either.
     """
     torch.manual_seed(0)
     model = SeqVaeLagAttnCrws(**shipped_warmup_kwargs())
@@ -282,7 +288,7 @@ def test_the_shipped_aligned_budget_builds_a_start_embedding_on_both_streams():
     assert min(model.source_warmup_steps) == 0
     for adapter in (model.target_adapter, model.source_adapter):
         assert adapter.start_embed is not None
-        assert adapter.min_delay == 91
+        assert adapter.min_delay == 1
         # Live on the leading region of every segment, and only there.
         indicator = adapter.start_indicator.squeeze(-1)
         assert bool(indicator[: adapter.min_delay].all())

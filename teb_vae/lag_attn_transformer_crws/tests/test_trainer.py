@@ -253,8 +253,8 @@ def test_the_warm_up_budget_reaches_the_constructor_as_the_four_channel_tuples(d
     kwargs = driver._build_model_kwargs()
 
     assert "causal_warmup_budget_steps" not in kwargs
-    assert len(kwargs["target_keep_index"]) == len(kwargs["target_warmup_steps"]) == 98
-    assert len(kwargs["source_keep_index"]) == len(kwargs["source_warmup_steps"]) == 47
+    assert len(kwargs["target_keep_index"]) == len(kwargs["target_warmup_steps"]) == 38
+    assert len(kwargs["source_keep_index"]) == len(kwargs["source_warmup_steps"]) == 17
     assert "target_delays" not in kwargs and "source_delays" not in kwargs
     assert driver.resolved_warmup is not None
 

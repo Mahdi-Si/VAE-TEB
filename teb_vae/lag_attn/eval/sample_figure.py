@@ -471,12 +471,12 @@ def build_sample_figure(
         ax.plot(time_dec, mean_alpha.argmax(axis=-1), color=COLOR_VERMILLION, linewidth=0.9,
                 alpha=0.9, label="argmax lag")
         ax.set_ylabel(r"Lag $\ell$ (0 = current)", fontsize=8)
-        # Negated, matching every other lag figure. ``attach_lag_seconds_axis`` maps
-        # $\ell \mapsto s\ell + d$, while the pipeline's convention -- ``metrics.lag_to_seconds`` --
-        # is $s\ell - \Delta_{UP}$, because recovering the delay in the original recording means
-        # *undoing* the shift the dataset applied. Passing the shift through un-negated would label
-        # the same lag 40 s differently here than in ``attention/attention_heatmaps.pdf``.
-        attach_lag_seconds_axis(ax, step_seconds, -float(up_shift_secs))
+        # Un-negated. ``attach_lag_seconds_axis`` maps $\ell \mapsto s\ell + \Delta_{UP}$, which IS
+        # the raw-recording lead: the dataset ADVANCED UP by 20 s, so a peak at lag $\ell$ is a lead
+        # of $4\ell - 20$ s. The negation that stood here reproduced the sign error in
+        # ``metrics.lag_to_seconds`` rather than compensating for it, so the two moved together and
+        # every lag figure in the repository agreed on a number 40 s too large.
+        attach_lag_seconds_axis(ax, step_seconds, float(up_shift_secs))
         ax.legend(loc="upper right", fontsize=7, framealpha=0.95)
         _style_heatmap(ax)
         grid.colorbar(cax, image, "attn prob")
@@ -504,12 +504,12 @@ def build_sample_figure(
             extent=[0.0, t_max, -0.5, n_lags - 0.5], interpolation="none",
         )
         ax.set_ylabel(r"Lag $\ell$ (0 = current)", fontsize=8)
-        # Negated, matching every other lag figure. ``attach_lag_seconds_axis`` maps
-        # $\ell \mapsto s\ell + d$, while the pipeline's convention -- ``metrics.lag_to_seconds`` --
-        # is $s\ell - \Delta_{UP}$, because recovering the delay in the original recording means
-        # *undoing* the shift the dataset applied. Passing the shift through un-negated would label
-        # the same lag 40 s differently here than in ``attention/attention_heatmaps.pdf``.
-        attach_lag_seconds_axis(ax, step_seconds, -float(up_shift_secs))
+        # Un-negated. ``attach_lag_seconds_axis`` maps $\ell \mapsto s\ell + \Delta_{UP}$, which IS
+        # the raw-recording lead: the dataset ADVANCED UP by 20 s, so a peak at lag $\ell$ is a lead
+        # of $4\ell - 20$ s. The negation that stood here reproduced the sign error in
+        # ``metrics.lag_to_seconds`` rather than compensating for it, so the two moved together and
+        # every lag figure in the repository agreed on a number 40 s too large.
+        attach_lag_seconds_axis(ax, step_seconds, float(up_shift_secs))
         _style_heatmap(ax)
         grid.colorbar(cax, image, "column-norm")
         grid.finalise(

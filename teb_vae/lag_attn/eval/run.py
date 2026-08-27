@@ -555,18 +555,19 @@ def main(
     )
     # Every lag figure converts its axis with this offset, and ``metrics.lag_to_seconds`` says the
     # value used is recorded here -- so record it, rather than leaving the claim to be checked
-    # against a key that was never written. The sign is carried forward unverified on purpose:
-    # the dataset adaptor is built with up_shift_secs=-20 and DESIGN.md reads a peak at lag l as a
-    # delay of 4(l + 5) seconds, which agree, but plotting.py's own axis applies no offset at all,
-    # so no figure in this repository has ever actually used one.
+    # against a key that was never written. The sign is no longer carried forward unverified: it
+    # was settled against mimo_adaptor.py, which runs up_shifted[:-80] = up_signal[80:] at
+    # up_shift_secs=-20, so stored grid position g holds UA the sensor recorded at g + 20 s and a
+    # peak at lag l is a LEAD of 4l - 20 s, i.e. 4l + up_shift_secs. plotting.py's own training
+    # axis still applies no offset at all, so the training figures and these disagree by 20 s.
     preflight_record["lag_seconds_convention"] = {
         "up_shift_secs": float(eval_config["up_shift_secs"]),
         "step_seconds": float(metrics.STEP_SECONDS),
-        "formula": "seconds = step_seconds * lag - up_shift_secs",
-        "sign_verified": False,
+        "formula": "seconds = step_seconds * lag + up_shift_secs",
+        "sign_verified": True,
         "note": (
-            "the physical-seconds axis is provisional until the sign is pinned against the "
-            "dataset pipeline documentation; the model-lag axis is exact regardless."
+            "pinned against mimo_adaptor.py, which advances UP by 20 s -- stored position g "
+            "holds UA recorded at g + 20 s, so a peak at lag l is a lead of 4l - 20 s."
         ),
     }
     preflight.write_preflight(preflight_record, results_dir)

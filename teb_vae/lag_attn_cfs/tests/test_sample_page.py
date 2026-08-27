@@ -222,8 +222,12 @@ def test_the_callback_draws_both_input_rows_and_warns_about_nothing(tmp_path, ta
 def test_the_drawn_stream_is_the_encoders_own_input_gate_then_warm_up_mask(task, stub_batch):
     r"""Not ``gate(values)``, which is what the shipped builder draws and is one layer short here.
 
-    This family's gate is a pure gather -- the warm-up is a leading mask, not a shift -- and the
-    masking happens inside the availability adapter. Compared against the adapter's **own** buffer
+    On this fixture the gate is a pure gather -- no ``*_align_delays`` are passed, so the warm-up
+    is a leading mask and nothing shifts -- and the masking happens inside the availability adapter,
+    which is the layer the shipped builder is short of. Under the shipped ``causal_align_reference``
+    the gate additionally *shifts*, and the composition asserted below is unchanged by that:
+    ``gate(values)`` first, the adapter's availability second. Compared against the adapter's **own**
+    buffer
     rather than against a mask rebuilt from $W'$, because a second construction of "the same"
     pattern is exactly how a figure comes to draw a region the model did not mask.
     """

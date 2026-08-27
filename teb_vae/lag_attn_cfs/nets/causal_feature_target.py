@@ -482,9 +482,15 @@ class CausalFeatureForecastTarget(FeatureForecastTarget):
 
         An **empty** block is warm at every step, vacuously: a constraint over no channels holds,
         and the alternative -- reporting a block that does not exist as permanently cold -- would
-        put a zero in the CSV that reads as a measurement rather than as an absence. The only
-        configuration that produces one is a source built without its first stored block, where the
-        second is the whole stream.
+        put a zero in the CSV that reads as a measurement rather than as an absence.
+
+        **Two configurations produce one**, and the second is now the common one. A source built
+        without its first stored block leaves the second as the whole stream; and an alignment
+        reference below every channel of a block drops that block entirely, which is what the
+        raw-target cells do -- their reference sits far below the second block's fastest channel,
+        so that block keeps no channels at all and its warmth fraction is $1.0$ over none of them.
+        That is an absence, not a measurement, and it is why the fraction is read beside the
+        block's kept width rather than alone.
 
         Args:
             block_warmup_steps: $W'_c$ for the block's channels.

@@ -439,27 +439,48 @@ model_config:
     # Every one-sided filter carries its own group delay, spanning 13.3 s to 791.0 s across a
     # stored block, and the encoder reads a stream's channels as ONE VECTOR PER STEP -- which
     # asserts that its entries describe one instant when they span thirteen minutes. This key
-    # re-indexes each channel by d_c = round((tau_ref - tau_c) / 4 s) so that they do.
+    # re-indexes each channel by d_c = round(kappa * (tau_ref - tau_c) / 4 s) so that they do,
+    # kappa = 1 - 1/(2*gamma) = 0.875 being the energy-centroid factor: `causal_delay_s` stores the
+    # envelope MEAN tau_g, while a channel's content actually sits at kappa * tau_g. Only the
+    # DIFFERENCE is scaled, so the reference channel still takes shift 0 and the drop rule does not
+    # move.
     #
-    # `target_max` resolves tau_ref from the SHARDS -- the slowest kept target channel, 402.1604 s,
-    # the filter at 0.008240 Hz that is simultaneously the maximum of `fhr_ph`, the maximum of
-    # `up_ph`, the channel `causal_warmup_budget_steps` already stands on, and the lower band edge
-    # both phase selections use. Never a YAML literal: a rebuilt bank moves every delay, and a
-    # number written here would keep resolving shifts against a transform the shards no longer
-    # have. An explicit float in seconds is admitted for the every-lag-warm arm at 150.79 s, and it
-    # is snapped to the channel it names because the stored vector is float32.
+    # THIS CELL FORECASTS THE RAW SIGNAL, so tau^y == 0 and there is nothing on the target side to
+    # cancel the source reference out of the physical-lag identity
     #
-    # WHAT IT COSTS. The anchor floor moves 133 -> 134 (one anchor, 137 -> 136) because a channel
-    # is honest at W'_c + d_c rather than at W'_c; the source loses the four channels above the
-    # reference, 51 -> 47; and the freshest uterine activity any channel reports moves from 13.3 s
-    # to 402.2 s before the anchor. That last one is the real price -- a common clock is bought
-    # with recency -- and it is why the pre-registered reading is that alignment should NOT improve
-    # the forecast gap and SHOULD improve lag-profile concentration if there is a real lag.
+    #     tau_phys(l, h) = 4 s * (l + 1 + h) + kappa * tau_ref - 20 s,
     #
-    # WHAT IT COSTS IN WARM-UP: nothing. With W_c ~ rho * tau_c, W_c + delta*d_c = tau_ref +
-    # (rho-1)*tau_c <= W_ref, so max_c(W'_c + d_c) = 134 = max_c W'_c exactly, on BOTH streams.
+    # which is MINIMISED at l = h = 0 and grows with the lag. At `target_max` (402.1604 s) the
+    # smallest lead the attention can express is 335.9 s, so the 20-120 s contraction-to-
+    # deceleration band is unreachable at EVERY lag index -- and raising `max_lag` cannot help,
+    # because it only makes the lead longer. The feature-target cells do not have this problem:
+    # there the same reference appears on both sides of the identity and cancels, so they keep
+    # `target_max` and reach the band at l + h in [9, 34].
+    #
+    # 42.21 s is the composed delay of the filter at 0.1109 Hz. The resolver snaps it to the
+    # shard's own float32 value 42.206562 and refuses a literal further than 4 s / 2 from any kept
+    # channel, so this stays a NAME FOR A CHANNEL rather than a number that would keep resolving
+    # shifts against a transform the shards no longer have.
+    #
+    # WHAT IT BUYS. The alignment shift carries the centroid factor kappa = 0.875, so the aligned
+    # stream's common effective delay is kappa * 42.2066 = 36.93 s, not 42.21 s. Reachable lead
+    # [20.9, 496.9] s, so 99 of the 100 s band sits inside the lag axis: l + h = 0 lands at 20.9 s
+    # and l + h = 24 at 116.9 s, with l + h = 25 the first index past the band at 120.9 s.
+    #
+    # WHAT IT COSTS. Both streams drop hard: target-input 102 -> 38 (17 fhr_st + 21 fhr_ph),
+    # source 51 -> 17 (17 up_st + 0 up_ph). EVERY band-reachable reference loses all fifteen
+    # `up_ph` channels, whose fastest is 150.79 s -- contraction morphology leaves the source
+    # stream entirely, and that is the price of a lag axis that can express the coupling at all.
+    #
+    # WHAT IT COSTS IN WARM-UP: nothing. max_c(W'_c + d_c) = 6 on BOTH streams against an anchor
+    # floor of 134, so every reachable lag is fully warm -- the opposite of the `target_max` arm,
+    # which pays one anchor. `warmup_period` is left at 134 deliberately: the floor it must now
+    # clear is 6 (= max(B - 1, max_c(W'_c + d_c)) with B = max kept W'_c = 1), which it exceeds more
+    # than twenty times over, and lowering it would roughly double the anchors per sample, which is
+    # a training-cost change that belongs with a run rather than with this key.
+    #
     # `null` is the unaligned arm and is bitwise the model that shipped before this key existed.
-    causal_align_reference: target_max
+    causal_align_reference: 42.21
 
     # Which phase-harmonic operator built the CONFIGURED SHARDS' two phase blocks, checked against
     # their own `causal_leg_alignment` root attribute and refused by name on a disagreement.
