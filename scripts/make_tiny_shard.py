@@ -5,7 +5,7 @@ advertised smoke command cannot run at all on a fresh clone, and the entry point
 call order is never exercised end to end. This writes 4-sample shards carrying the real field
 names, channel counts and decimation geometry -- only the sample count is small.
 
-Three variants, and the first two are built very differently on purpose.
+Four variants, and the first two are built very differently on purpose.
 
 **Two-sided** (``tiny_shard.hdf5``) is deliberately NOT built through
 ``hdf5_dataset/new_pipeline/create_new_pipeline.py``: that module imports ``early_maestra`` and a
@@ -47,6 +47,21 @@ denominators and refusals -- and it is why no test may assert the sign, magnitud
 of any clinical effect on it. These shards are generated per test session rather than committed,
 so ``causal_cohort`` is deliberately absent from the default variant list.
 
+**Planted** (``tiny_shard_causal_planted.hdf5``) is the causal mode over segments this script
+synthesises rather than reads, in which the FHR modulation is a deterministic function of the UP
+envelope a known number of steps earlier. It exists because real signal cannot answer one question:
+whether a lag readout can recover a delay it is known to be looking at. The plant is at the RAW
+level and nowhere else -- the same real bank, the same production writer, the same statistics
+calculator -- because a hand-written coefficient block would carry a fabricated warm-up boundary,
+which is the one thing no mode here does. The build re-measures its own coupling from the written
+coefficients and refuses to report success without it, so an instrument the bank did not carry is
+found while the file is being written rather than after a model has been trained against it. The
+invocation that produced the committed binaries is
+
+    python scripts/make_tiny_shard.py --variants planted
+
+and ``--check-planted <path>`` re-runs that measurement alone against a shard already on disk.
+
 The *stats* file is produced by the real calculator in every mode: the dataset reader silently
 disables normalization on any stats-schema mismatch, so hand-rolling that half is the one shortcut
 with a genuinely bad failure mode. On the causal variants the calculator additionally excludes each
@@ -66,7 +81,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import h5py
 import numpy as np
@@ -78,12 +93,17 @@ if _REPO_ROOT not in sys.path:
 
 from hdf5_dataset.calculate_dataset_stats import calculate_and_save_dataset_stats  # noqa: E402
 from hdf5_dataset.causal_scattering import LEG_ALIGNMENT_MODES  # noqa: E402
+from hdf5_dataset.hdf5_dataset import RAW_SAMPLING_HZ  # noqa: E402
+from teb_vae.lag_attn_rws.eval.launch import resolve_launch_args  # noqa: E402
 
 #: Minutes trimmed from each end. Matches the shipped config, so the fixture exercises the real
 #: trim path rather than a geometry no production run uses.
 TRIM_MINUTES = 1.0
 
-#: Decimation factor from the 4 Hz raw grid to the feature grid.
+#: Decimation factor from the 4 Hz raw grid to the feature grid. The grid itself is
+#: ``RAW_SAMPLING_HZ``, imported rather than restated as ``4.0``: the synthesised segments below are
+#: written in seconds and a hardcoded rate would keep placing their frequencies against a grid the
+#: shards no longer have.
 DECIMATION = 16
 
 #: Channel counts, all real: FHR scattering, FHR phase-harmonic, UP scattering, UP self-phase, and
@@ -250,26 +270,34 @@ def read_causal_source(n_samples: int, signal_len: int) -> Dict[str, np.ndarray]
 
 
 def causal_transform(
-    n_samples: int, seq_len: int, leg_alignment: str = LEG_ALIGNMENT_MODES[0]
+    raw: Dict[str, np.ndarray], seq_len: int, leg_alignment: str = LEG_ALIGNMENT_MODES[0]
 ) -> Dict[str, Any]:
-    """Run the real causal bank over the committed raw segments, once.
+    """Run the real causal bank over a batch of raw segments, once.
 
-    Shared by both causal modes rather than written twice, and the sharing is the point: what a
+    Shared by every causal mode rather than written once each, and the sharing is the point: what a
     causal shard claims about itself is a property of *this* bank, so a second description of the
-    filter bank would be a second warm-up boundary. Both callers therefore get their coefficients,
-    their channel plan and their widths from one place.
+    filter bank would be a second warm-up boundary. Every caller therefore gets its coefficients,
+    its channel plan and its widths from one place.
 
-    There is no seed: the result is a deterministic function of the committed raw segments, the
-    filter bank and the leg alignment, which is what makes it re-derivable rather than merely
-    reproducible.
+    **The segments are an argument rather than a read**, which is the one difference from how this
+    began. Two of the three modes below transform the committed raw fixture and one synthesises its
+    own pair, and the two halves are separable: where the signal came from decides nothing about
+    the transform, while the transform decides everything about what the file may claim. Fusing
+    them would have made the synthesised mode either re-implement the bank or write its segments to
+    disk first.
+
+    There is no seed: the result is a deterministic function of the segments handed in, the filter
+    bank and the leg alignment, which is what makes it re-derivable rather than merely reproducible.
 
     The alignment is threaded into the mask resolution *and* the transform from one argument, so
     the coefficients a caller writes and the ``causal_leg_alignment`` the writer stamps beside them
     cannot describe two different operators.
 
     Args:
-        n_samples: Segments to take from the committed raw fixture.
-        seq_len: On-disk (untrimmed) feature-grid length.
+        raw: ``{'fhr': (n, L) float32, 'up': (n, L) float32}`` on the $4$ Hz grid, from
+            :func:`read_causal_source` or :func:`planted_raw_pair`.
+        seq_len: On-disk (untrimmed) feature-grid length. The bank is sized from
+            ``seq_len * DECIMATION``, so the segments must already be that long.
         leg_alignment: The phase-harmonic leg alignment, one of
             :data:`~hdf5_dataset.causal_scattering.LEG_ALIGNMENT_MODES`.
 
@@ -277,6 +305,11 @@ def causal_transform(
         ``{'pipeline', 'masks', 'widths', 'raw', 'blocks', 'signal_len'}`` -- the production
         pipeline module reached through the import shim, the resolved masks and channel plan, the
         per-block widths, the raw segments and their four coefficient blocks.
+
+    Raises:
+        ValueError: If the segments are not ``seq_len * DECIMATION`` samples long. The bank is
+            sized from the signal length, so the two cannot differ -- and the mismatch would
+            otherwise surface as a shape error several frames deeper.
     """
     import torch
 
@@ -285,7 +318,13 @@ def causal_transform(
 
     pipeline = _import_pipeline()
     signal_len = seq_len * DECIMATION
-    raw = read_causal_source(n_samples, signal_len)
+    for name in ("fhr", "up"):
+        if int(raw[name].shape[1]) != signal_len:
+            raise ValueError(
+                f"the {name!r} segments are {int(raw[name].shape[1])} samples long but the "
+                f"requested geometry needs {signal_len}; the causal bank is sized from the signal "
+                f"length, so the two cannot differ"
+            )
 
     device = torch.device("cpu")
     masks = pipeline.compute_scattering_masks(
@@ -365,7 +404,9 @@ def write_causal_shard(
     Returns:
         The resolved per-block widths, so a caller can report what it wrote.
     """
-    transformed = causal_transform(n_samples, seq_len, leg_alignment)
+    transformed = causal_transform(
+        read_causal_source(n_samples, seq_len * DECIMATION), seq_len, leg_alignment
+    )
     blocks, raw = transformed["blocks"], transformed["raw"]
     create_causal_file(path, transformed, seq_len)
 
@@ -557,7 +598,9 @@ def write_causal_cohort_shards(
             f"WITHIN one is not, because it would make that shard's per-recording aggregation an "
             f"average of identical rows."
         )
-    transformed = causal_transform(available, seq_len, leg_alignment)
+    transformed = causal_transform(
+        read_causal_source(available, seq_len * DECIMATION), seq_len, leg_alignment
+    )
     blocks, raw = transformed["blocks"], transformed["raw"]
     pipeline = transformed["pipeline"]
 
@@ -627,45 +670,550 @@ def write_causal_cohort_shards(
     return written
 
 
-#: Everything the two entry points below can be pointed at, with the two-sided defaults applied
-#: after the merge rather than by argparse -- an argparse default would make the dict entry
-#: unreachable and the operator's edit silent. Nothing here has to be filled in: the file runs as
-#: it stands and writes the two COMMITTED variants into the committed fixtures directory.
+# =================================================================================================
+# The planted-delay mode
+#
+# The two causal modes above transform REAL signal, which is what makes their coefficients honest --
+# and it is exactly why neither can answer "can this architecture recover a delay it is known to be
+# looking at". Real FHR and UP have no ground-truth lag written down anywhere, so a lag readout run
+# over them has nothing to be scored against and a null result is unattributable: the architecture
+# may be blind, or the delay may not be there.
+#
+# This mode plants one. The FHR modulation is a deterministic function of the UP envelope
+# PLANTED_DELAY_STEPS * DECIMATION raw samples earlier, and nothing else about the build changes:
+# the same real bank produces the coefficients, the same production writer stamps the schema and the
+# warm-up attributes, and the same statistics calculator excludes the same warm-up region. The plant
+# is at the RAW level and only there. A coefficient block written by hand would carry a fabricated
+# warm-up boundary -- a second boundary, which is the one thing this generator refuses everywhere.
+#
+# WHAT THE DELAY MEANS ON THE LAG AXIS, since the two numbers differ and both are load-bearing.
+# Target content at stored step s is a function of source content at s - delta, so the SERIES lag
+# between the two stored streams is delta, and that is what the cross-correlation self-check below
+# measures. A model at anchor t forecasts target step t + 1 + h, whose source content sits at
+# t + 1 + h - delta, i.e. at attention lag l = delta - 1 - h. Across h in [0, H) that is the band
+# [delta - H, delta - 1], which is what a lag profile's peak must fall inside. Choosing
+# delta in (H, L - 1) is exactly what makes that band non-empty, strictly inside the searched
+# window, and clear of lag 0 -- so a profile pinned at the near edge is a failure rather than an
+# ambiguity.
+#
+# THE PLANT IS NOT A SIMULATION. One delay, one direction, linear in the envelope. It is an
+# identifiability instrument, and no test may read a physiological claim off it.
+# =================================================================================================
+#: The planted source-to-target delay, in decimated steps. $45$ against the shipped $H = 30$ and
+#: $L - 1 = 90$ puts the readable band at lags $[15, 44]$: non-empty, clear of both censoring edges,
+#: and clear of lag $0$ by fifteen bins.
+PLANTED_DELAY_STEPS = 45
+
+#: Segments the planted shard carries. Its own constant rather than the ``samples`` argument, like
+#: the cohort mode's counts and for the same reason: the recovery check is stated over this
+#: population, so a shard built at another count would answer a different question under the same
+#: filename. Eight matches the committed raw fixture's count, so the two causal fixtures put the
+#: same number of recordings in front of a model.
+PLANTED_SAMPLES = 8
+
+#: The slow envelope's components, in Hz. Four incommensurate frequencies rather than one, so the
+#: envelope is APERIODIC: a periodic drive would put a cross-correlation peak at $\delta$ and
+#: another at every $\delta \pm kP$, and a lag search wide enough to contain two of them could not
+#: say which one it found. They sit in $0.004$-$0.013$ Hz, i.e. $75$-$270$ s, which is slow enough
+#: to be an envelope and fast enough that its own smearing through a channel's group delay is small
+#: against the planted $180$ s.
+PLANTED_ENVELOPE_HZ: Tuple[float, ...] = (0.00375, 0.00611, 0.00893, 0.01249)
+
+#: Frequency the envelope additionally amplitude-modulates, and how deeply. The envelope enters the
+#: stored coefficients twice over: through the signal *level*, which the order-0 low-pass carries,
+#: and through the modulus of this carrier's band, which the order-1 channels around it carry. Two
+#: routes rather than one because which stored channel a scattering bank puts a given content in is
+#: the bank's decision and not this generator's -- and the check below reports which channels
+#: actually received it rather than assuming.
+PLANTED_CARRIER_HZ = 0.09
+PLANTED_CARRIER_DEPTH = 0.25
+
+#: The uncoupled components of the target, in Hz, and the amplitude each carries in bpm. They exist
+#: so the shard carries CONTROLS: a stored target channel in one of these bands is a function of
+#: nothing the source has, so a cross-correlation that peaked there would be measuring the check
+#: rather than the plant.
+#:
+#: Five of them, spread across the bank's fast half rather than one tone, and the spread is the
+#: point twice over. A single tone leaves every other fast channel with almost no content at all,
+#: and a correlation taken on a channel carrying nothing is noise reported at three decimal places;
+#: and one control channel is a control that could itself be the accident. None of the five is a
+#: harmonic of :data:`PLANTED_CARRIER_HZ` or of an envelope component, so a channel that hears one
+#: of them hears nothing the source is modulating.
+PLANTED_CONTROL_HZ: Tuple[float, ...] = (0.047, 0.076, 0.123, 0.199, 0.322)
+PLANTED_CONTROL_AMPLITUDE = 4.0
+
+#: Signal levels, in the units of the real fixture: UP in mmHg over a resting tone, FHR in bpm about
+#: a baseline that the envelope *decelerates* -- so the coupling is negative, which is why the check
+#: below ranks by absolute correlation.
+PLANTED_UP_BASE = 5.0
+PLANTED_UP_GAIN = 70.0
+PLANTED_FHR_BASE = 145.0
+PLANTED_FHR_GAIN = 35.0
+
+#: Golden-ratio conjugate, used to spread the per-segment phases. A deterministic low-discrepancy
+#: sequence rather than an RNG draw: :func:`causal_transform` has no seed because it is a function
+#: of its inputs, and a generator feeding it would be the one part of the fixture that could not be
+#: re-derived from the constants in this file.
+_GOLDEN = 0.6180339887498949
+
+#: On-disk steps skipped before the self-check correlates anything. The stored leading region is a
+#: function of assumed pre-recording history on the slow channels, so a correlation taken across it
+#: would be a correlation with the bank's own transient. $150$ clears the shipped anchor floor of
+#: $134$ in trimmed coordinates plus the $15$-step trim itself.
+PLANTED_SKIP_STEPS = 150
+
+#: How far a measured series lag may sit from :data:`PLANTED_DELAY_STEPS` and still count as
+#: recovery, in steps. Non-zero because a channel's modulus is smoothed by its own group delay, so
+#: the peak of a smeared envelope moves by a fraction of it.
+PLANTED_LAG_TOLERANCE_STEPS = 4
+
+#: How strong the correlation at that lag must be for a channel to be called coupled, and how weak
+#: it must be for one to be called a control. The gap between them is deliberate: a channel in
+#: neither class is reported and belongs to neither, which is the honest reading of a partial
+#: coupling.
+PLANTED_MIN_ABS_CORRELATION = 0.5
+PLANTED_CONTROL_MAX_ABS_CORRELATION = 0.2
+
+#: The two stored blocks the self-check correlates. They are produced by the SAME one-sided bank
+#: applied to the two signals, so channel $c$ of one has exactly channel $c$ of the other's composed
+#: group delay -- which is what lets a matched-index pair measure the planted lag directly, with the
+#: two group delays cancelling instead of biasing the peak by their difference.
+PLANTED_SOURCE_BLOCK = "up_st"
+PLANTED_TARGET_BLOCK = "fhr_st"
+
+
+def planted_raw_pair(n_samples: int, signal_len: int, delay_steps: int) -> Dict[str, np.ndarray]:
+    r"""Synthesise raw FHR/UP segments in which FHR follows UP at a known delay.
+
+    $$e_n(t) = \frac{1}{K}\sum_k \tfrac12\bigl(1 + \sin(2\pi f_k t + \varphi_{k,n})\bigr)
+      \in [0, 1],$$
+
+    $$u_n(t) = u_0 + g_u\, e_n(t)\bigl(1 + m\cos(2\pi f_{\mathrm{car}} t)\bigr), \qquad
+      y_n(t) = y_0 - g_y\, e_n(t - \Delta_{\mathrm{raw}})
+             + a\cos(2\pi f_{\mathrm{ctl}} t + \psi_n).$$
+
+    The envelope is evaluated at $t - \Delta_{\mathrm{raw}}$ **as a function**, not shifted out of a
+    buffer, so the coupling holds from the first sample and the record carries no seam. A shifted
+    buffer would need a fill for its leading region, and that fill would be a boundary the shard
+    does not declare -- the same objection that keeps every coefficient here coming from the bank.
+
+    There is no random number anywhere: the per-segment phases are a golden-ratio sequence in the
+    segment index, so the whole fixture is a function of the constants above and re-derivable from
+    them rather than from a seed.
+
+    Args:
+        n_samples: How many segments to synthesise.
+        signal_len: Raw samples per segment, on the $4$ Hz grid.
+        delay_steps: $\delta$, the planted delay in **decimated** steps; the raw shift is
+            ``delay_steps * DECIMATION``.
+
+    Returns:
+        ``{'fhr': (n_samples, signal_len) float32, 'up': (n_samples, signal_len) float32}``.
+
+    Raises:
+        ValueError: If the delay is not positive, or if it reaches beyond the segment -- a plant
+            longer than the record is one no lag search inside the record could find.
+    """
+    if int(delay_steps) <= 0:
+        raise ValueError(
+            f"delay_steps={delay_steps} must be positive: the plant is a source-to-target delay, "
+            f"and a non-positive one asks the target to lead the source."
+        )
+    raw_shift = int(delay_steps) * DECIMATION
+    if raw_shift >= signal_len:
+        raise ValueError(
+            f"delay_steps={delay_steps} is {raw_shift} raw samples against a {signal_len}-sample "
+            f"segment, so the coupled source content lies outside every segment the model sees."
+        )
+
+    seconds = np.arange(signal_len, dtype=np.float64) / RAW_SAMPLING_HZ
+    delayed = seconds - float(raw_shift) / RAW_SAMPLING_HZ
+
+    fhr = np.empty((n_samples, signal_len), dtype=np.float64)
+    up = np.empty((n_samples, signal_len), dtype=np.float64)
+    for index in range(n_samples):
+        envelope_now = _planted_envelope(seconds, index)
+        envelope_then = _planted_envelope(delayed, index)
+        carrier = 1.0 + PLANTED_CARRIER_DEPTH * np.cos(
+            2.0 * np.pi * PLANTED_CARRIER_HZ * seconds
+        )
+        control = np.zeros_like(seconds)
+        for order, frequency in enumerate(PLANTED_CONTROL_HZ):
+            phase = 2.0 * np.pi * (((order + 2) * (index + 1) * _GOLDEN) % 1.0)
+            control += PLANTED_CONTROL_AMPLITUDE * np.cos(
+                2.0 * np.pi * frequency * seconds + phase
+            )
+        up[index] = PLANTED_UP_BASE + PLANTED_UP_GAIN * envelope_now * carrier
+        fhr[index] = PLANTED_FHR_BASE - PLANTED_FHR_GAIN * envelope_then + control
+    return {"fhr": fhr.astype("f4"), "up": up.astype("f4")}
+
+
+def _planted_envelope(seconds: np.ndarray, index: int) -> np.ndarray:
+    """The slow drive of one segment, in $[0, 1]$, at the given times.
+
+    Args:
+        seconds: Times to evaluate at. May be negative, which is what lets the delayed copy be
+            evaluated rather than shifted.
+        index: The segment index, which sets the component phases.
+
+    Returns:
+        The envelope, same shape as ``seconds``.
+    """
+    total = np.zeros_like(seconds, dtype=np.float64)
+    for order, frequency in enumerate(PLANTED_ENVELOPE_HZ):
+        phase = 2.0 * np.pi * (((order + 1) * (index + 1) * _GOLDEN) % 1.0)
+        total += 0.5 * (1.0 + np.sin(2.0 * np.pi * frequency * seconds + phase))
+    return total / float(len(PLANTED_ENVELOPE_HZ))
+
+
+def _lag_correlations(source: np.ndarray, target: np.ndarray, max_lag: int) -> np.ndarray:
+    r"""Pearson correlation of ``target`` against ``source`` shifted back, one value per lag.
+
+    $$\rho_\ell = \operatorname{mean}_n \operatorname{corr}
+      \bigl(y_n[\ell:],\; x_n[:T-\ell]\bigr), \qquad \ell = 0 \dots L-1 .$$
+
+    Averaged over segments rather than pooled across them, so one long segment cannot decide the
+    peak on its own; the segments are the same length here, so the two agree, and the mean is what
+    generalises if they ever do not.
+
+    Args:
+        source: $(n, T)$ source series.
+        target: $(n, T)$ target series, same shape.
+        max_lag: The furthest lag to evaluate, inclusive.
+
+    Returns:
+        $(max\_lag + 1,)$ correlations. A lag whose overlap has zero variance in either series --
+        a constant channel -- contributes ``NaN`` and is skipped by the mean.
+    """
+    length = int(source.shape[1])
+    values = np.full(int(max_lag) + 1, np.nan, dtype=np.float64)
+    for lag in range(int(max_lag) + 1):
+        left, right = source[:, : length - lag], target[:, lag:]
+        if left.shape[1] < 2:
+            continue
+        left = left - left.mean(axis=1, keepdims=True)
+        right = right - right.mean(axis=1, keepdims=True)
+        scale = np.linalg.norm(left, axis=1) * np.linalg.norm(right, axis=1)
+        with np.errstate(invalid="ignore", divide="ignore"):
+            per_sample = np.where(scale > 0.0, (left * right).sum(axis=1) / scale, np.nan)
+        if np.isfinite(per_sample).any():
+            values[lag] = float(np.nanmean(per_sample))
+    return values
+
+
+def planted_lag_report(
+    blocks: Dict[str, np.ndarray],
+    *,
+    delay_steps: int = PLANTED_DELAY_STEPS,
+    max_lag: int = 2 * PLANTED_DELAY_STEPS,
+    skip_steps: int = PLANTED_SKIP_STEPS,
+) -> List[Dict[str, Any]]:
+    r"""Measure, per matched channel pair, where the stored coefficients say the delay is.
+
+    This is the check that separates *the instrument is broken* from *the architecture cannot
+    recover it*, and it runs before any model exists. The plant is at the raw level; whether it
+    survives a strictly one-sided bank -- whose composed group delays reach the same order as the
+    delay itself -- is a property of the transform rather than of the plant, and asserting it
+    without measuring it would make every later use of the fixture unfalsifiable.
+
+    The pairing is by **matched index**, not by search: :data:`PLANTED_SOURCE_BLOCK` and
+    :data:`PLANTED_TARGET_BLOCK` are the same bank over the two signals, so channel $c$ of each has
+    the same composed delay and the pair's group delays cancel out of the measured lag. A pair drawn
+    across blocks would measure $\delta + \kappa(\tau^y_{c'} - \tau^u_c)/\Delta$ and report the
+    difference as though it were the plant.
+
+    Args:
+        blocks: The bank's output, as :func:`causal_transform` returns it.
+        delay_steps: The delay that was planted, for the in-band verdict.
+        max_lag: Furthest lag searched. Twice the plant by default, so a peak at the plant is
+            interior rather than pinned at an edge of the *search*.
+        skip_steps: Leading stored steps excluded; see :data:`PLANTED_SKIP_STEPS`.
+
+    Returns:
+        One record per channel: its index, the lag of its strongest absolute correlation, that
+        correlation with its sign, and whether the channel is coupled, a control, or neither.
+
+    Raises:
+        ValueError: If the two blocks do not have the same channel count -- matched-index pairing
+            would then compare two different filters and the cancellation argument would not hold.
+    """
+    source = np.asarray(blocks[PLANTED_SOURCE_BLOCK], dtype=np.float64)[:, :, skip_steps:]
+    target = np.asarray(blocks[PLANTED_TARGET_BLOCK], dtype=np.float64)[:, :, skip_steps:]
+    if source.shape[1] != target.shape[1]:
+        raise ValueError(
+            f"{PLANTED_SOURCE_BLOCK} has {source.shape[1]} channels against "
+            f"{PLANTED_TARGET_BLOCK}'s {target.shape[1]}. The self-check pairs them by index on "
+            f"the ground that they are one bank over two signals, and unequal widths mean they "
+            f"are not."
+        )
+
+    records: List[Dict[str, Any]] = []
+    for channel in range(int(source.shape[1])):
+        correlations = _lag_correlations(source[:, channel], target[:, channel], max_lag)
+        if not np.isfinite(correlations).any():
+            records.append(
+                {
+                    "channel": channel, "lag": None, "correlation": float("nan"),
+                    "coupled": False, "control": False,
+                }
+            )
+            continue
+        lag = int(np.nanargmax(np.abs(correlations)))
+        peak = float(correlations[lag])
+        records.append(
+            {
+                "channel": channel,
+                "lag": lag,
+                "correlation": peak,
+                "coupled": bool(
+                    abs(lag - int(delay_steps)) <= PLANTED_LAG_TOLERANCE_STEPS
+                    and abs(peak) >= PLANTED_MIN_ABS_CORRELATION
+                ),
+                "control": bool(abs(peak) <= PLANTED_CONTROL_MAX_ABS_CORRELATION),
+            }
+        )
+    return records
+
+
+def planted_geometry(records: Sequence[Dict[str, Any]], delay_steps: int) -> Dict[str, Any]:
+    """Reduce the per-channel report to the geometry a shard stamps and a check script reads.
+
+    Args:
+        records: The report from :func:`planted_lag_report`.
+        delay_steps: The planted delay in decimated steps.
+
+    Returns:
+        The stamped geometry: the delay, the matched channel indices found coupled and found
+        control, and the strongest coupled correlation with the lag it sat at. Every entry is
+        **measured** on the written coefficients rather than declared, so a bank change that stopped
+        carrying the plant would move these numbers instead of leaving a stale claim on the file.
+    """
+    coupled = [record for record in records if record["coupled"]]
+    controls = [record for record in records if record["control"]]
+    best = max(coupled, key=lambda record: abs(record["correlation"]), default=None)
+    return {
+        "planted_delay_steps": int(delay_steps),
+        "planted_delay_seconds": float(delay_steps) * DECIMATION / RAW_SAMPLING_HZ,
+        "planted_coupled_channels": np.asarray(
+            [record["channel"] for record in coupled], dtype="i4"
+        ),
+        "planted_control_channels": np.asarray(
+            [record["channel"] for record in controls], dtype="i4"
+        ),
+        "planted_best_channel": -1 if best is None else int(best["channel"]),
+        "planted_best_lag_steps": -1 if best is None else int(best["lag"]),
+        "planted_best_correlation": float("nan") if best is None else float(best["correlation"]),
+        "planted_source_block": PLANTED_SOURCE_BLOCK,
+        "planted_target_block": PLANTED_TARGET_BLOCK,
+    }
+
+
+def format_planted_report(
+    records: Sequence[Dict[str, Any]], geometry: Dict[str, Any]
+) -> str:
+    """Render the self-check as the lines an operator reads, with its pass/fail verdict.
+
+    Args:
+        records: The report from :func:`planted_lag_report`.
+        geometry: The stamped geometry from :func:`planted_geometry`.
+
+    Returns:
+        One line per channel that is coupled or a control, then the verdict. Channels in neither
+        class are counted rather than listed: they are the partially coupled middle, and a line
+        each would bury the two classes the check is about.
+    """
+    delay = int(geometry["planted_delay_steps"])
+    coupled = list(geometry["planted_coupled_channels"])
+    controls = list(geometry["planted_control_channels"])
+    lines = [
+        f"planted-delay self-check: delta = {delay} steps "
+        f"({geometry['planted_delay_seconds']:g} s), "
+        f"{PLANTED_TARGET_BLOCK} against {PLANTED_SOURCE_BLOCK} at matched channel index, "
+        f"tolerance +/-{PLANTED_LAG_TOLERANCE_STEPS} steps",
+        f"  {'channel':>8}  {'lag':>5}  {'corr':>7}  class",
+    ]
+    for record in records:
+        if not (record["coupled"] or record["control"]):
+            continue
+        lines.append(
+            f"  {record['channel']:>8}  {str(record['lag']):>5}  {record['correlation']:>+7.3f}  "
+            + ("coupled" if record["coupled"] else "control")
+        )
+    neither = len(records) - len(coupled) - len(controls)
+    lines.append(
+        f"  ({neither} channel(s) in neither class: correlation between "
+        f"{PLANTED_CONTROL_MAX_ABS_CORRELATION} and {PLANTED_MIN_ABS_CORRELATION}, or peaking "
+        f"outside the planted band)"
+    )
+    passed = bool(coupled) and bool(controls)
+    lines.append(
+        f"VERDICT: {'PASS' if passed else 'FAIL'} -- {len(coupled)} coupled channel(s) peaking "
+        f"within {PLANTED_LAG_TOLERANCE_STEPS} steps of {delay}, {len(controls)} flat control "
+        f"channel(s). "
+        + (
+            f"Strongest: channel {geometry['planted_best_channel']} at lag "
+            f"{geometry['planted_best_lag_steps']}, r = {geometry['planted_best_correlation']:+.3f}."
+            if passed
+            else "The instrument does not carry the plant; nothing may be concluded from a model "
+            "run against it."
+        )
+    )
+    return "\n".join(lines)
+
+
+def write_planted_shard(
+    path: str,
+    *,
+    seq_len: int,
+    n_samples: int = PLANTED_SAMPLES,
+    delay_steps: int = PLANTED_DELAY_STEPS,
+    leg_alignment: str = LEG_ALIGNMENT_MODES[0],
+) -> Dict[str, Any]:
+    """Write the planted-delay causal shard and stamp what was planted on it.
+
+    Args:
+        path: Destination ``.hdf5`` path. Overwritten if present.
+        seq_len: On-disk (untrimmed) feature-grid length.
+        n_samples: Segments to synthesise.
+        delay_steps: The planted delay, in decimated steps.
+        leg_alignment: The phase-harmonic leg alignment the phase blocks are built with.
+
+    Returns:
+        ``{'widths', 'records', 'geometry'}`` -- the resolved per-block widths, the per-channel
+        self-check report and the geometry stamped on the file.
+    """
+    transformed = causal_transform(
+        planted_raw_pair(n_samples, seq_len * DECIMATION, delay_steps), seq_len, leg_alignment
+    )
+    blocks, raw = transformed["blocks"], transformed["raw"]
+    create_causal_file(path, transformed, seq_len)
+
+    ones = np.ones((n_samples, seq_len), dtype="f4")
+    transformed["pipeline"].append_samples_batch(
+        path,
+        fhr_batch=raw["fhr"],
+        up_batch=raw["up"],
+        fhr_st_batch=blocks["fhr_st"].astype("f4"),
+        fhr_ph_batch=blocks["fhr_ph"].astype("f4"),
+        # All-valid, like the other causal fixtures: a masking bug then shows up as a shape or
+        # dtype error rather than as a plausible-looking number.
+        target_batch=np.zeros((n_samples, seq_len), dtype="f4"),
+        weight_batch=ones,
+        # Distinct per segment, and they must be: the evaluation's controls pair a sample with a
+        # STRANGER's source, and a shard whose rows all name one recording offers no stranger.
+        guid_batch=[f"PLANTED_{index:03d}" for index in range(n_samples)],
+        epoch_batch=np.full((n_samples,), EPOCH_SECONDS, dtype="f4"),
+        cs_label_batch=np.zeros((n_samples,), dtype="u1"),
+        bg_label_batch=np.zeros((n_samples,), dtype="u1"),
+        tlo_batch=np.full((n_samples,), np.nan, dtype="f4"),
+        second_stage_batch=np.full((n_samples,), np.nan, dtype="f4"),
+        up_st_batch=blocks["up_st"].astype("f4"),
+        up_ph_batch=blocks["up_ph"].astype("f4"),
+    )
+
+    records = planted_lag_report(blocks, delay_steps=delay_steps)
+    geometry = planted_geometry(records, delay_steps)
+    # Stamped after the writer has finished, as extra ROOT attributes beside the ones it wrote.
+    # Nothing the pipeline stamps is touched: the schema, the warm-up vectors and the leg alignment
+    # stay exactly what the bank and the writer said, and these sit alongside them so a check script
+    # reads the planted geometry off the file rather than assuming it.
+    with h5py.File(path, "r+") as handle:
+        for name, value in geometry.items():
+            handle.attrs[name] = value
+    return {"widths": transformed["widths"], "records": records, "geometry": geometry}
+
+
+def read_planted_geometry(path: str) -> Dict[str, Any]:
+    """Read back the planted geometry a shard was stamped with.
+
+    Args:
+        path: The planted shard.
+
+    Returns:
+        The stamped attributes, with the two channel lists as ``numpy`` arrays.
+
+    Raises:
+        ValueError: If the file carries no planted geometry, which means it is one of the other
+            causal variants and no delay was planted in it at all.
+    """
+    with h5py.File(path, "r") as handle:
+        if "planted_delay_steps" not in handle.attrs:
+            raise ValueError(
+                f"{path} carries no 'planted_delay_steps' root attribute, so no delay was planted "
+                f"in it. The recovery check is scored against a stamped plant; run this script "
+                f"with --variants planted to build one."
+            )
+        return {name: handle.attrs[name] for name in handle.attrs if name.startswith("planted_")}
+
+
+def self_check_planted_shard(path: str) -> Tuple[str, bool]:
+    """Re-measure a written planted shard's coupling from its stored coefficients alone.
+
+    Reads the blocks back off disk rather than re-transforming, so what is checked is the file a
+    model will actually be given -- including the ``float32`` round trip the writer applies.
+
+    Args:
+        path: The planted shard.
+
+    Returns:
+        ``(report, passed)``.
+    """
+    geometry = read_planted_geometry(path)
+    with h5py.File(path, "r") as handle:
+        blocks = {
+            name: np.asarray(handle[name][:], dtype=np.float64)
+            for name in (PLANTED_SOURCE_BLOCK, PLANTED_TARGET_BLOCK)
+        }
+    records = planted_lag_report(blocks, delay_steps=int(geometry["planted_delay_steps"]))
+    measured = planted_geometry(records, int(geometry["planted_delay_steps"]))
+    passed = bool(len(measured["planted_coupled_channels"])) and bool(
+        len(measured["planted_control_channels"])
+    )
+    return format_planted_report(records, measured), passed
+
+
+#: Everything the entry point below can be pointed at, with the real defaults applied after the
+#: merge rather than by argparse -- an argparse default would make the dict entry unreachable and
+#: the operator's edit silent. Nothing here has to be filled in: the file runs as it stands and
+#: writes the three COMMITTED variants into the committed fixtures directory.
 RUN_ARGS: Dict[str, Any] = {
     # Directory receiving the files; None -> teb_vae/lag_attn/tests/fixtures. Point this at a
     # temporary directory before asking for 'causal_cohort': those eight shards are generated per
     # test session and are deliberately not committed.
     "out_dir": None,
-    # Which variants to write: any of 'two_sided', 'causal', 'causal_cohort'; None -> the two
-    # committed ones. 'causal_cohort' is not in that default: it writes eight files that no test
-    # reads from disk, because the evaluation suite generates them into tmp_path_factory.
+    # Which variants to write: any of VARIANT_CHOICES; None -> the three committed ones.
+    # 'causal_cohort' is not in that default: it writes eight files that no test reads from disk,
+    # because the evaluation suite generates them into tmp_path_factory.
     "variants": None,
-    # Samples per shard; None -> 4. Read by 'two_sided' and 'causal' only: 'causal_cohort' derives
-    # its own count from COHORT_GUIDS_PER_SHARD * COHORT_SEGMENTS_PER_GUID, which is what its
-    # cohort assertions are stated in.
+    # Samples per shard; None -> 4. Read by 'two_sided' and 'causal' only: 'causal_cohort' and
+    # 'planted' derive their own counts from their own constants, which is what their assertions
+    # are stated in.
     "samples": None,
     # On-disk feature length before trimming; None -> 330, which trims to 300.
     "seq_len": None,
-    # Seed for the two-sided shard's synthesised values; None -> 0. Neither causal mode has a seed:
-    # both are deterministic functions of the committed raw segments and the filter bank.
+    # Seed for the two-sided shard's synthesised values; None -> 0. No causal mode has a seed: all
+    # three are deterministic functions of their segments and the filter bank.
     "seed": None,
-    # Phase-harmonic leg alignment for the two causal variants: 'envelope' or 'none'; None ->
+    # Phase-harmonic leg alignment for the causal variants: 'envelope' or 'none'; None ->
     # 'envelope', which is what the committed binaries carry and what the shipped model configs
     # expect. Ignored by 'two_sided', which has no causal phase block at all.
     "leg_alignment": None,
+    # Re-measure an already-written planted shard's coupling instead of writing anything, given its
+    # path. This is the self-check run on its own, for a fixture already on disk.
+    "check_planted": None,
 }
 
 #: Defaults applied after the merge, so every key above stays reachable from the dict.
 _DEFAULTS: Dict[str, Any] = {
     "out_dir": os.path.join(_REPO_ROOT, "teb_vae", "lag_attn", "tests", "fixtures"),
-    "variants": ["two_sided", "causal"],
+    "variants": ["two_sided", "causal", "planted"],
     "samples": 4,
     "seq_len": 330,
     "seed": 0,
     "leg_alignment": "envelope",
 }
 
-VARIANT_CHOICES = ("two_sided", "causal", "causal_cohort")
+VARIANT_CHOICES = ("two_sided", "causal", "causal_cohort", "planted")
 
 #: Where each variant's shards and statistics file land, relative to ``out_dir``. The cohort mode
 #: names no shard stem: it writes one file per entry of :data:`COHORT_SUBGROUPS`.
@@ -673,7 +1221,11 @@ _STATS_STEM: Dict[str, str] = {
     "two_sided": "tiny_stats.hdf5",
     "causal": "tiny_stats_causal.hdf5",
     "causal_cohort": "tiny_stats_causal_cohort.hdf5",
+    "planted": "tiny_stats_causal_planted.hdf5",
 }
+
+#: The planted variant's shard stem, written out because the recovery check's configs name it.
+PLANTED_SHARD_STEM = "tiny_shard_causal_planted.hdf5"
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -693,7 +1245,7 @@ def build_parser() -> argparse.ArgumentParser:
         nargs="+",
         choices=VARIANT_CHOICES,
         help=(
-            "Which shards to write; the two committed ones by default. 'causal_cohort' writes "
+            "Which shards to write; the three committed ones by default. 'causal_cohort' writes "
             "eight subgroup shards and is meant for a temporary --out-dir."
         ),
     )
@@ -714,54 +1266,79 @@ def build_parser() -> argparse.ArgumentParser:
             "is what the committed binaries carry. 'none' builds the legacy comparison arm."
         ),
     )
+    parser.add_argument(
+        "--check-planted",
+        dest="check_planted",
+        help=(
+            "Re-measure the coupling of an already-written planted shard and exit, writing "
+            "nothing. Takes the shard's path."
+        ),
+    )
     return parser
 
 
-def main(argv: Optional[List[str]] = None) -> int:
-    """Write the requested shards and their stats files.
+def main(
+    *,
+    out_dir: str,
+    variants: Sequence[str],
+    samples: int,
+    seq_len: int,
+    seed: int,
+    leg_alignment: str,
+    check_planted: Optional[str] = None,
+) -> int:
+    """Write the requested shards and their stats files, or run the planted self-check alone.
 
     Args:
-        argv: Command-line arguments, or ``None`` to read ``sys.argv``.
+        out_dir: Directory receiving the files.
+        variants: Which variants to write.
+        samples: Samples per shard, for the two variants that take one.
+        seq_len: On-disk feature length before trimming.
+        seed: Seed for the two-sided shard's synthesised values.
+        leg_alignment: Phase-harmonic leg alignment for the causal variants.
+        check_planted: An existing planted shard to re-measure instead of writing anything.
 
     Returns:
-        The process exit code.
+        The process exit code. Non-zero only when a planted shard fails its own coupling check,
+        which is the one outcome here that means a fixture must not be used.
     """
-    parsed = vars(build_parser().parse_args(argv))
-    # Per key: a value on the command line wins, then the dict, then the real default. Merging per
-    # key rather than wholesale is what lets one flag override one value and leave the rest of the
-    # dict standing.
-    values = {
-        key: parsed[key] if parsed[key] is not None else RUN_ARGS.get(key)
-        for key in _DEFAULTS
-    }
-    values = {
-        key: _DEFAULTS[key] if value is None else value for key, value in values.items()
-    }
+    if check_planted is not None:
+        report, passed = self_check_planted_shard(check_planted)
+        print(report)
+        return 0 if passed else 1
 
-    for variant in values["variants"]:
-        stats = os.path.join(values["out_dir"], _STATS_STEM[variant])
+    failed = False
+    for variant in variants:
+        stats = os.path.join(out_dir, _STATS_STEM[variant])
         if variant == "two_sided":
-            shards = [os.path.join(values["out_dir"], "tiny_shard.hdf5")]
-            write_shard(
-                shards[0],
-                n_samples=values["samples"],
-                seq_len=values["seq_len"],
-                seed=values["seed"],
-            )
+            shards = [os.path.join(out_dir, "tiny_shard.hdf5")]
+            write_shard(shards[0], n_samples=samples, seq_len=seq_len, seed=seed)
         elif variant == "causal":
-            shards = [os.path.join(values["out_dir"], "tiny_shard_causal.hdf5")]
+            shards = [os.path.join(out_dir, "tiny_shard_causal.hdf5")]
             widths = write_causal_shard(
                 shards[0],
-                n_samples=values["samples"],
-                seq_len=values["seq_len"],
-                leg_alignment=values["leg_alignment"],
+                n_samples=samples,
+                seq_len=seq_len,
+                leg_alignment=leg_alignment,
             )
-            print(f"  causal widths: {widths}, leg alignment: {values['leg_alignment']}")
+            print(f"  causal widths: {widths}, leg alignment: {leg_alignment}")
+        elif variant == "planted":
+            shards = [os.path.join(out_dir, PLANTED_SHARD_STEM)]
+            written = write_planted_shard(
+                shards[0], seq_len=seq_len, leg_alignment=leg_alignment
+            )
+            print(f"  planted widths: {written['widths']}, leg alignment: {leg_alignment}")
+            # Reported at build time, not only on demand: a shard whose plant the bank did not
+            # carry is an instrument that would make every later model result unattributable, and
+            # the moment to find that out is while the file is being written.
+            print(format_planted_report(written["records"], written["geometry"]))
+            failed = failed or not (
+                len(written["geometry"]["planted_coupled_channels"])
+                and len(written["geometry"]["planted_control_channels"])
+            )
         else:
             shards = write_causal_cohort_shards(
-                values["out_dir"],
-                seq_len=values["seq_len"],
-                leg_alignment=values["leg_alignment"],
+                out_dir, seq_len=seq_len, leg_alignment=leg_alignment
             )
         for path in shards:
             print(f"wrote {path}")
@@ -777,8 +1354,33 @@ def main(argv: Optional[List[str]] = None) -> int:
             shards, stats, trim_minutes=TRIM_MINUTES, plot_histograms=False, device="cpu"
         )
         print(f"wrote {stats}")
-    return 0
+    return 1 if failed else 0
+
+
+def _cli(argv: Optional[List[str]] = None) -> int:
+    """Merge the command line over :data:`RUN_ARGS`, then write what was asked for.
+
+    Args:
+        argv: Command-line arguments, or ``None`` to read ``sys.argv``.
+
+    Returns:
+        The process exit code.
+    """
+    values, sources = resolve_launch_args(build_parser(), RUN_ARGS, argv)
+    # Per key, and only where nothing supplied a value: the merge above already preferred the
+    # command line over the dict, and this is the third and last layer.
+    values = {key: (_DEFAULTS.get(key) if value is None else value) for key, value in values.items()}
+    # Relative paths -- an --out-dir above all -- resolve against the repository root rather than
+    # whatever working directory an IDE chose, which is where every other path in this tree is
+    # rooted.
+    if os.path.abspath(os.getcwd()) != _REPO_ROOT:
+        os.chdir(_REPO_ROOT)
+    print(
+        "resolved arguments: "
+        + ", ".join(f"{key}={values[key]!r} (from {sources[key]})" for key in sorted(values))
+    )
+    return main(**values)
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(_cli())

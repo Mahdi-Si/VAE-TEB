@@ -1,12 +1,17 @@
-r"""Lint for the one arm: a single axis, a closed inventory, and a stride that follows the horizon.
+r"""Lint for the arms: a single axis each, a closed inventory, and a stride that follows the horizon.
 
-This package ships **one** arm, and the omission is a decision rather than an oversight. The floor,
-horizon and depth arms answer questions about the target domain, which
-``teb_vae/lag_attn_cfs/configs`` already asks; the encoder arms answer questions about the encoder,
-which ``teb_vae/lag_attn_transformer_rws/configs`` already asks. The tiling arm is the only one whose
-answer could differ between the two encoders, because what it moves is the per-step gradient noise --
-$136$ decoded anchors against $\approx 4.53$ -- and a pre-normalised attention stack is exactly the
-architecture whose stability is sensitive to that.
+The **tiling** arm is this package's own long-standing one, and the arms it does *not* carry are a
+decision rather than an oversight. The floor, horizon and depth arms answer questions about the
+target domain, which ``teb_vae/lag_attn_cfs/configs`` already asks; the encoder arms answer
+questions about the encoder, which ``teb_vae/lag_attn_transformer_rws/configs`` already asks. The
+tiling arm is the only one of those whose answer could differ between the two encoders, because
+what it moves is the per-step gradient noise -- $136$ decoded anchors against $\approx 4.53$ -- and
+a pre-normalised attention stack is exactly the architecture whose stability is sensitive to that.
+
+The **lag** arms beside it exist in both feature-target cells, because every gate that produced
+them was read per parent: the two encoders answer the same question differently and a result on one
+is not a result on the other. The **source-dropout** pair exists here alone, which is the mirror of
+the rule above -- it regularises the source map, and this is the encoder that map is built from.
 
 These tests are a lint, not a fit. They exist so a malformed arm is caught on the development box --
 a key that does not resolve, a stray second delta, a stride left behind by a horizon change, a file
@@ -27,14 +32,75 @@ _DEFAULT = _CONFIG_DIR / "default.yaml"
 
 _VAE = "model_config.VAE_model"
 
+#: Where a run says which arm it is. Both paths, because either alone is recoverable from a
+#: half-configured run: the name is what an operator reads and the tag is what an arm table groups
+#: on, and a run whose two disagree is the drift this guard exists to make visible.
+_RUN_NAME = "advanced_config.tracking.mlflow.run_name"
+_VARIANT = "advanced_config.tracking.mlflow.tags.variant"
+
 #: Every arm: file name -> the exact leaf delta it declares. Written out rather than derived, so a
 #: file whose keys disagree fails against a stated intention instead of against an expression that
 #: would derive the same mistake twice.
+#:
+#: The six declared after the tiling arm carry **three** paths each rather than one: their own
+#: axis, and the two identity keys. The identity pair is not a second delta -- it is the same
+#: delta, written where a finished run can still be asked which side of the axis it trained on.
+#: Two of them exist in this cell alone: ``source_dropout`` is the one seam that regularises the
+#: source map without touching the target pathway, and this is the encoder whose attention stack
+#: is what it regularises.
 _ARMS: Dict[str, Dict[str, Any]] = {
     # The tiling ablation. 1 is the INERT stride -- the dense range every other cell of the grid
     # decodes -- so this arm is the control that says what the tiling costs or buys.
     "sweep_anchor_stride_1.yaml": {f"{_VAE}.anchor_stride": 1},
+    # The lag-bias seed. The default seeds the learnable (num_heads, L) bias FLAT; this restores
+    # the decaying seed, which predicts a lag-0 peak on its own. `lag_bias_init` deliberately does
+    # not move with it -- `normal` builds no bias parameter at all, so it is a different object.
+    "sweep_lag_bias_decay.yaml": {
+        f"{_VAE}.alibi_slope_scale": 1.0,
+        _RUN_NAME: "lag_attn_trf_cfs_alibi_decay",
+        _VARIANT: "lag_attn_trf_cfs_alibi_decay",
+    },
+    # One clock rather than two: the source key null restores the single-reference resolution, so
+    # both streams read on the target's 402.1604 s and the lag axis carries no inter-stream offset.
+    "sweep_align_target_max.yaml": {
+        f"{_VAE}.causal_align_reference_source": None,
+        _RUN_NAME: "lag_attn_trf_cfs_align_target_max",
+        _VARIANT: "lag_attn_trf_cfs_align_target_max",
+    },
+    # No clock at all -- the unaligned end of the pre-registered pair. The SECOND model key is
+    # forced rather than a second axis: a source reference is one half of a pair of clocks, and the
+    # resolver refuses it against an unaligned target by name, so an arm moving only the first
+    # would not launch.
+    "sweep_align_unaligned.yaml": {
+        f"{_VAE}.causal_align_reference": None,
+        f"{_VAE}.causal_align_reference_source": None,
+        _RUN_NAME: "lag_attn_trf_cfs_unaligned",
+        _VARIANT: "lag_attn_trf_cfs_unaligned",
+    },
+    # The sharp lag memory: keys and values from the adapter output, one step of reach, against the
+    # default's conv stem. The smallest of the three K/V models.
+    "sweep_lag_kv_adapter.yaml": {
+        f"{_VAE}.lag_kv_source": "adapter",
+        _RUN_NAME: "lag_attn_trf_cfs_kv_adapter",
+        _VARIANT: "lag_attn_trf_cfs_kv_adapter",
+    },
+    # The source-regularisation pair. Two points on one axis rather than two axes, which is why
+    # they are two files and not one with two keys.
+    "sweep_source_dropout_02.yaml": {
+        f"{_VAE}.source_dropout": 0.2,
+        _RUN_NAME: "lag_attn_trf_cfs_source_dropout_02",
+        _VARIANT: "lag_attn_trf_cfs_source_dropout_02",
+    },
+    "sweep_source_dropout_03.yaml": {
+        f"{_VAE}.source_dropout": 0.3,
+        _RUN_NAME: "lag_attn_trf_cfs_source_dropout_03",
+        _VARIANT: "lag_attn_trf_cfs_source_dropout_03",
+    },
 }
+
+#: The two paths excluded from the "one axis" reading above: what they move is how a finished run
+#: is identified, not what it computes.
+_IDENTITY_PATHS = (_RUN_NAME, _VARIANT)
 
 
 def _flatten(node: Dict[str, Any], prefix: str = "") -> Dict[str, Any]:
@@ -73,6 +139,25 @@ def test_the_config_directory_holds_exactly_the_declared_arms():
     """Both directions: a declared arm whose file is missing, and a stray ``sweep_*.yaml`` nobody
     declared -- which would be launchable, and would run outside every assertion below."""
     assert {path.name for path in _CONFIG_DIR.glob("sweep_*.yaml")} == set(_ARMS)
+
+
+@pytest.mark.parametrize("name", sorted(_ARMS))
+def test_an_arm_that_declares_an_identity_names_itself_on_both_keys(name):
+    """The drift guard, checked where it can be: a run's own records must say which arm trained.
+
+    A config is a file on one machine and a run is an artifact directory on another; the two have
+    been separated before, and a run whose artifacts cannot name its arm gets attributed to the
+    default by whoever reads it later. So the arm goes in the name AND in the variant tag, and the
+    two must agree -- a mismatch is the one failure that would otherwise survive both halves.
+    """
+    intended = _ARMS[name]
+    if not any(path in intended for path in _IDENTITY_PATHS):
+        pytest.skip(f"{name} predates the identity convention and inherits the default's name")
+
+    flat = _flatten(_resolved(name))
+    assert flat[_RUN_NAME] == flat[_VARIANT], "the name and the tag name different arms"
+    assert flat[_RUN_NAME] == intended[_RUN_NAME]
+    assert flat[_RUN_NAME] != _flatten(load_config(str(_DEFAULT)))[_RUN_NAME]
 
 
 @pytest.mark.parametrize("name", sorted(_ARMS))

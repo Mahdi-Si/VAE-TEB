@@ -315,8 +315,10 @@ _CONSTRUCTOR_PARAMETERS = (
     "head_init_calibration", "a_head_gain", "encoder_conv_kernels", "encoder_conv_dilations",
     "encoder_num_heads", "encoder_d_ff", "target_attention_blocks", "source_attention_blocks",
     "source_attention_window", "logvar_clamp", "mu_scale", "delta_mu_scale", "delta_logvar_scale",
-    "posterior_logvar_mode", "source_dropout", "use_entmax", "attention_grad_checkpoint",
-    "lag_bias_init", "alibi_slope_scale", "query_uses_logvar", "coverage_floor", "base_decode",
+    "posterior_logvar_mode", "source_dropout", "lag_kv_source", "use_entmax",
+    "attention_grad_checkpoint",
+    "lag_bias_init", "alibi_slope_scale", "query_uses_logvar", "prior_availability_input",
+    "coverage_floor", "base_decode", "persistence_residual", "horizon_weight_halflife_steps",
     "target_keep_index", "target_delays", "source_keep_index", "source_delays", "init_weights",
 )
 

@@ -854,15 +854,26 @@ def test_the_page_section_states_the_row_count_and_the_one_sided_caveat(design):
 
 
 def test_the_lean_limits_carry_their_replacement_triggers(design):
-    """A ``lean-limit`` note without a measurable trigger is a permanent excuse. Exactly three here:
-    the anchor floor that is a policy, the members written out rather than shared, and the absent
-    evaluation package."""
+    """A ``lean-limit`` note without a measurable trigger is a permanent excuse. Exactly five here:
+    the anchor floor that is a policy, the members written out rather than shared, the absent
+    evaluation package, the clock the prior cannot cancel, and the persistence residual this row
+    declines.
+
+    The last is the one worth reading as a *decline* rather than an omission. The residual persists
+    the target's own stored coefficient; this row's target is the raw signal, so there is nothing
+    of the same kind to persist and the mechanism is refused at the constructor instead of shipping
+    off. The trigger names what would change that -- this row's own fast-step NLL showing the
+    suppression signature the feature-target residual answers -- so the decline is revisitable on a
+    measurement rather than on an opinion.
+    """
     flat = _flat(design)
 
-    assert len(re.findall(r"^> lean-limit: ", design, re.MULTILINE)) == 3
+    assert len(re.findall(r"^> lean-limit: ", design, re.MULTILINE)) == 5
     assert "when a run shows the anchor count rather than the source pathway" in flat
     assert "when a third consumer of any of them appears" in flat
     assert "when a result from these cells is to be reported as a measurement" in flat
+    assert "when the owner accepts a change to the posterior parameterisation" in flat
+    assert "when this cell's fast-step NLL shows on a trained revised run" in flat
 
 
 def test_the_design_states_that_there_is_no_evaluation_package(design):
@@ -920,10 +931,10 @@ def test_the_documented_config_inventory_is_the_real_one(design):
         assert f"`{name}`" in section, name
     named = set(re.findall(r"`([\w.]+\.yaml)`", section))
     assert named <= set(shipped) | {"lag_attn_rws/configs/default.yaml"}, named - set(shipped)
-    assert "twenty-one" in section  # the exemption count, matched against test_config_load's list
+    assert "twenty-eight" in section  # the exemption count, matched against test_config_load's list
     from teb_vae.lag_attn_crws.tests.test_config_load import PARITY_EXEMPT_PATHS
 
-    assert len(PARITY_EXEMPT_PATHS) == 21
+    assert len(PARITY_EXEMPT_PATHS) == 28
 
 
 # =================================================================================================

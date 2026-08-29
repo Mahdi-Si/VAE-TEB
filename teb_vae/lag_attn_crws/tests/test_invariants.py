@@ -346,3 +346,136 @@ def test_the_invariants_hold_at_the_production_geometry_and_budget() -> None:
     assert not torch.equal(reference["source_state"], resampled["source_state"])
     assert float(_closed_form_kl(reference).abs().max()) == 0.0
     assert tuple(reference["mu_base"].shape) == (BATCH, 5, 30, 16)
+
+
+# =================================================================================================
+# Source purity, restated: the prior sees no function of the source's VALUES
+#
+# The invariant above is asserted on a model whose prior conditions on the target history alone. The
+# shipped model's prior additionally conditions on a CLOCK, and the invariant is therefore restated
+# rather than weakened: what the prior may not see is a function of the source's *values*, and the
+# clock is a function of $t$ and the configuration alone.
+#
+# The clock is the encode of a stream that is exactly zero -- identical for every recording, under
+# every intervention on the source, and by construction carrying nothing the source said. What it
+# does depend on is the source pathway's own parameters, which is why it is detached: gradient must
+# not couple the two pathways either.
+#
+# So the restatement is checked in four parts, each of which a plausible implementation could fail
+# on its own: the prior does not move when the source's values do; the clock is not identically the
+# same row at every scored step (which is what made the availability staircase inert); it is the
+# same tensor in train mode and in eval mode; and no gradient reaches the source pathway through it.
+#
+# Run on this cell's class alone, unlike the invariants above: the class it is paired against is
+# the two-sided parent, whose stream is present from the first step and which therefore has no
+# availability to announce and takes no clock keyword at all.
+# =================================================================================================
+def test_the_prior_does_not_move_when_the_sources_values_do_even_with_the_clock_on() -> None:
+    """The restated invariant, measured. This is the same comparison as the purity test above and
+    it is not redundant with it: there the prior takes one input, here it takes two, and the second
+    is built from the source pathway. If the clock were an encode of the *actual* source rather
+    than of silence, every tensor below would move and every shape would be unchanged."""
+    model = _model(SeqVaeLagAttnCrws, prior_availability_input=True).eval()
+    y_st, y_ph, u_stream = make_streams(_kwargs_for(SeqVaeLagAttnCrws))
+
+    torch.manual_seed(0)
+    with torch.no_grad():
+        reference = model(y_st, y_ph, u_stream, 1, TINY_STRIDE)
+    noise = torch.randn(u_stream.shape, generator=torch.Generator().manual_seed(99))
+    torch.manual_seed(0)
+    with torch.no_grad():
+        resampled = model(y_st, y_ph, noise, 1, TINY_STRIDE)
+
+    for key in (
+        "mu_prior", "logvar_prior", "raw_logvar_prior", "target_state", "z_prior",
+        "mu_base", "logvar_base",
+    ):
+        assert torch.equal(reference[key], resampled[key]), key
+    assert not torch.equal(reference["source_state"], resampled["source_state"])
+
+
+def test_the_prior_clock_is_the_encode_of_silence_and_of_nothing_else() -> None:
+    """What the clock *is*, asserted against the tensor the source-null control feeds the posterior.
+
+    The two have to be the same object for the cancellation argument to hold at all: the prior and
+    the null posterior are supposed to receive the same input, so their divergence is learnable to
+    zero rather than floored by an asymmetry. Built here by hand -- gate, then the configured
+    key/value pathway, over an exactly zero stream -- rather than read off the model, so a clock
+    that started encoding something else would fail rather than agree with itself.
+    """
+    model = _model(SeqVaeLagAttnCrws, prior_availability_input=True).eval()
+    _, _, u_stream = make_streams(_kwargs_for(SeqVaeLagAttnCrws))
+
+    clock = model._prior_clock(u_stream)
+    zeros = u_stream.new_zeros((1, *u_stream.shape[1:]))
+    with torch.no_grad():
+        expected = model.encode_source_kv(
+            zeros if model.source_gate is None else model.source_gate(zeros)
+        )
+
+    assert torch.equal(clock, expected)
+    assert clock.shape == (1, model.sequence_length, model.d_model)
+
+
+def test_the_prior_clock_is_not_the_same_row_at_every_scored_step() -> None:
+    r"""The failure the availability staircase had, and the reason the clock is an encode.
+
+    $\mathbb 1[t \ge W'_c + d_c]$ is provably constant over every *scored* anchor -- the constructor
+    refuses any floor below $\max_c(W'_c + d_c)$, which is the last step at which it changes -- so a
+    prior conditioned on it gains an offset its biases already span. A clock that had quietly become
+    constant again would still be the right shape, still be detached, still pass every test above,
+    and condition the prior on nothing. So the live row count over the scored range is asserted
+    directly.
+    """
+    model = _model(SeqVaeLagAttnCrws, prior_availability_input=True).eval()
+    _, _, u_stream = make_streams(_kwargs_for(SeqVaeLagAttnCrws))
+
+    clock = model._prior_clock(u_stream)[0, model.warmup_period :]
+    # Rounded before the distinct count: these are float activations, and two rows differing in the
+    # last bit are "distinct" to `unique`, which would report an inert clock as a live one.
+    distinct = torch.unique(clock.round(decimals=4), dim=0).shape[0]
+
+    assert clock.shape[0] > 1, "the fixture has no scored range to measure over"
+    assert distinct > 1, "the prior's clock is constant over every scored anchor"
+
+
+def test_the_prior_clock_is_the_same_tensor_in_train_mode_and_in_eval_mode() -> None:
+    """It is defined as a function of $t$ and the configuration, so it must not follow the dropout
+    switch. Under live dropout it would be a fresh draw every step, and the prior's input
+    distribution would differ between the mode the objective runs in and the mode every readout is
+    measured in -- which is the sort of difference that shows up as an unexplained gap between a
+    training curve and an evaluation."""
+    model = _model(SeqVaeLagAttnCrws, prior_availability_input=True, dropout=0.3, source_dropout=0.3)
+    _, _, u_stream = make_streams(_kwargs_for(SeqVaeLagAttnCrws))
+
+    model.train()
+    torch.manual_seed(0)
+    in_train = model._prior_clock(u_stream)
+    model.eval()
+    torch.manual_seed(1)
+    in_eval = model._prior_clock(u_stream)
+
+    assert torch.equal(in_train, in_eval)
+    # And the pathway is left in the mode it was found in, so a clock cannot silently disable
+    # dropout for the forward that follows it.
+    model.train()
+    model._prior_clock(u_stream)
+    assert all(module.training for module in model.source_kv_modules())
+
+
+def test_no_gradient_reaches_the_source_pathway_through_the_prior() -> None:
+    """The clock depends on the source pathway's *parameters*, which the announcement did not, so
+    detaching it is what keeps the two pathways' gradients uncoupled -- the same reason the prior's
+    projection is not shared with the adapter's ``mask_proj``.
+
+    The source modules still receive gradient from the matched forward in the same step, so nothing
+    leaves the distributed run's expectation set; what must not exist is a path from the *prior's*
+    input back into them.
+    """
+    model = _model(SeqVaeLagAttnCrws, prior_availability_input=True).eval()
+    _, _, u_stream = make_streams(_kwargs_for(SeqVaeLagAttnCrws))
+
+    clock = model._prior_clock(u_stream)
+
+    assert not clock.requires_grad
+    assert clock.grad_fn is None

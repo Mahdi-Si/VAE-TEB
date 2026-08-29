@@ -68,8 +68,30 @@ def _train_mode_forward(kwargs, stride: int, perturb=None):
     return model, model(*make_streams(kwargs), phase, stride)
 
 
+#: The shipped architecture switches, at the values this row's configs carry. The zero-KL start is
+#: what makes every KL number in the records comparable, and two of these could break it on their
+#: own: the prior's clock adds a term to the prior's input, and the local key/value memory changes
+#: what the posterior's fusion reads. Each is zero-impact at initialisation for a *different*
+#: reason -- a zero-initialised projection, and a pathway the posterior delta is still seeded to
+#: ignore -- so a state carrying both at once is the one that says the two reasons compose.
+#: ``persistence_residual`` is absent because this row declines it: the residual persists the
+#: target's own stored coefficient and this row's target is the raw signal.
+_SHIPPED_SWITCHES = dict(
+    lag_kv_source="conv_stem",
+    prior_availability_input=True,
+    horizon_weight_halflife_steps=5.0,
+    alibi_slope_scale=0.0,
+)
+
+
 def _guard_states():
-    """The guarded and the unguarded keyword sets, so the identity is checked at both."""
+    """The keyword sets the identity is checked at: guarded, unguarded, and the shipped switches.
+
+    The third is not a variation on the first two. They ask whether the *anchor gather* preserved
+    the identity; it asks whether the mechanisms this family added did -- and it is run through
+    every assertion in this file rather than through a construction check, because a projection
+    refilled by a later initialisation pass is invisible at construction and fatal here.
+    """
     guarded = tiny_warmup_kwargs()
     unguarded = {
         name: value
@@ -82,7 +104,11 @@ def _guard_states():
             "source_warmup_steps",
         )
     }
-    return (("gated", guarded), ("ungated", unguarded))
+    return (
+        ("gated", guarded),
+        ("ungated", unguarded),
+        ("gated_switches_on", dict(guarded, **_SHIPPED_SWITCHES)),
+    )
 
 
 _GUARDS = _guard_states()

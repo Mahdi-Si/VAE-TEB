@@ -13,19 +13,27 @@ module is that reading, executed.
 
 From an IDE's Run button, with no command line: fill in ``RUN_ARGS`` near the bottom of this file.
 
-**Why a module and not an eye.** Three of the five tier-1 criteria are statements about *every
+**Why a module and not an eye.** Three of the six tier-1 criteria are statements about *every
 logged row* -- one of them a $10^{-6}$ relative recomposition of two channel-axis splits against
-each other -- and a multi-thousand-row CSV cannot honestly be checked by inspection. The two that
-could be read off a chart are here anyway, because a checker that covered four criteria would leave
+each other -- and a multi-thousand-row CSV cannot honestly be checked by inspection. The ones that
+could be read off a chart are here anyway, because a checker that covered five criteria would leave
 the reader to remember which one it did not.
 
-**Every tier-1 criterion is a geometry statement, not a quality one.** ``target_warm_frac`` is a
-stamped provenance column that must read exactly $1.0$; ``anchors_per_sample`` must sit at the value
-this run's own resolved geometry implies; the loss must be finite and the spike breaker must never
-have latched; and the two channel-axis splits of the forecast gap must recompose to each other. A
+**Every tier-1 criterion is a geometry or provenance statement, not a quality one.**
+``target_warm_frac`` is a stamped provenance column that must read exactly $1.0$;
+``anchors_per_sample`` must sit at the value this run's own resolved geometry implies; the loss must
+be finite and the spike breaker must never have latched; the two channel-axis splits of the forecast
+gap must recompose to each other; and the run's own artifacts must state which **arm** it trained. A
 value outside any of them means the run measured something other than what its configuration says,
-so no tier-2 number from it is worth reading -- which is why the exit code follows tier 1 alone and
-never a tier-2 value.
+or cannot be attributed to a configuration at all, so no tier-2 number from it is worth reading --
+which is why the exit code follows tier 1 alone and never a tier-2 value.
+
+**The arm criterion exists because the failure it catches has happened.** The driver builds a run's
+model kwargs by sweeping ``inspect.signature(MODEL_CLS.__init__)`` and silently drops any key the
+class does not re-list, and a run whose config named one arm has already been read afterwards as
+another. Nothing in a metric history distinguishes the two, so the only defence is that the resolved
+configuration state every switch and that the run's identity keys name the arm -- which is what this
+criterion asserts, and it asserts it while the run is still going, when relaunching is still cheap.
 
 **The anchor band is derived, never assumed.** ``anchors_per_sample`` is compared against
 $\lceil (T_{\mathrm{valid}} - F)/S \rceil$ and its phase-dependent floor, computed from the run's
@@ -115,13 +123,57 @@ TIER_TWO_METRICS: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
     ("source_lag_warmth_frac_ph", STAGES),
 )
 
-#: The three warm-up tertile columns, whose *spread* is what tier-2 criterion 9 asks about: they
-#: recompose to the gap by construction whether or not they differ from each other, so the
-#: recomposition says nothing about whether the split distinguishes anything.
-TERTILE_SUFFIXES: Tuple[str, ...] = (
-    "pred_gap_warm_lo",
-    "pred_gap_warm_mid",
-    "pred_gap_warm_hi",
+#: The two checkpoint criteria, by the metric each selects on. The composite optimum and the best
+#: conditioned forecast are different epochs -- $336$ against $278$ on the diagnosed run -- so a run
+#: that writes only one of them is keeping the wrong weights for one of the two questions. Reported
+#: as the epoch each is minimised at, which is what says whether the two really did diverge and by
+#: how much; not gated, because how far apart they *should* sit is exactly what has no prior.
+CHECKPOINT_MONITORS: Tuple[str, ...] = (
+    "val/total_loss",
+    "val/nll_full_block",
+)
+
+#: The two three-way partitions of the kept target channels, each of which recomposes to the gap by
+#: construction whether or not its parts differ from each other -- so the recomposition says nothing
+#: about whether either split distinguishes anything, and the *spread* is what tier 2 asks about.
+#: The first partitions by warm-up rank and the second by the shard's stored novelty fraction; they
+#: cut the same axis two different ways and neither is the other renamed.
+TERTILE_FAMILIES: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
+    ("pred_gap_warm", ("pred_gap_warm_lo", "pred_gap_warm_mid", "pred_gap_warm_hi")),
+    ("pred_gap_novel", ("pred_gap_novel_lo", "pred_gap_novel_mid", "pred_gap_novel_hi")),
+)
+
+#: The warm-up partition alone, which is the one the recomposition criterion compares against the
+#: block split. Kept as its own name because that criterion is about *these three* summing to the
+#: same total as ``pred_gap_st + pred_gap_ph``, and the novelty triple sums to the same total again
+#: without being the same statement.
+TERTILE_SUFFIXES: Tuple[str, ...] = TERTILE_FAMILIES[0][1]
+
+#: Every configuration leaf whose value decides which **arm** a run trained, as a dotted path under
+#: ``model_config.VAE_model``. Five are constructor switches and two are the alignment references;
+#: all seven are leaves of the resolved configuration the driver dumps beside the checkpoints.
+#:
+#: Written out rather than discovered, and required to be *present* rather than to hold any
+#: particular value: what makes a run readable afterwards is that its own artifacts say which arm it
+#: was, and every one of these has a comparison arm on the other side of it. A run whose resolved
+#: config is silent about one of them was launched from a configuration that predates the key, and
+#: nothing in its metric history distinguishes the two arms.
+ARM_KEYS: Tuple[str, ...] = (
+    "lag_kv_source",
+    "prior_availability_input",
+    "persistence_residual",
+    "horizon_weight_halflife_steps",
+    "alibi_slope_scale",
+    "causal_align_reference",
+    "causal_align_reference_source",
+)
+
+#: Where the run's own identity is looked for, in order. One of these must be present and non-empty,
+#: because the arm belongs in the run's *name* as well as in its config: a resolved config can be
+#: read only by someone who already found the run, while the name is what is quoted in a table.
+IDENTITY_PATHS: Tuple[str, ...] = (
+    "advanced_config.tracking.mlflow.run_name",
+    "advanced_config.tracking.mlflow.tags.variant",
 )
 
 #: Verdict strings. ``NOT_EVALUATED`` is not a pass: criterion 5 needs two run directories, and a
@@ -443,6 +495,74 @@ def check_two_evaluations(
     return Verdict(5, title, PASS, f"{len(rows)} rows identical")
 
 
+def _lookup(config: Dict[str, Any], dotted: str) -> Tuple[bool, Any]:
+    """Resolve a dotted path in a nested mapping.
+
+    Args:
+        config: The resolved run configuration.
+        dotted: The path, e.g. ``model_config.VAE_model.lag_kv_source``.
+
+    Returns:
+        ``(found, value)``. ``found`` is ``False`` when any step is missing or is not a mapping,
+        which is a different state from a key present and set to ``None`` -- and the difference is
+        the whole point here, because ``null`` is a *value* several of these keys legitimately take.
+    """
+    node: Any = config
+    for part in dotted.split("."):
+        if not isinstance(node, dict) or part not in node:
+            return False, None
+        node = node[part]
+    return True, node
+
+
+def check_arm_is_stated(config: Optional[Dict[str, Any]]) -> Verdict:
+    """Criterion 6: the run's own artifacts state which arm it trained.
+
+    Every key in :data:`ARM_KEYS` must be **present** in the resolved configuration, and at least
+    one of :data:`IDENTITY_PATHS` must carry a non-empty name. Presence rather than value: each of
+    these keys has a comparison arm on the other side of it, so no single value is the right one --
+    what is not acceptable is a run whose artifacts cannot say which side it was on.
+
+    A missing key is not a cosmetic gap. The driver builds a run's model kwargs by sweeping the
+    constructor's signature and drops anything the class does not re-list, so an arm can train as
+    the baseline with nothing in the metric history saying so; and a config predating a key is
+    indistinguishable afterwards from one that set it to the default. Both read as "the resolved
+    configuration is silent", which is what this criterion refuses.
+
+    Args:
+        config: The resolved run configuration, or ``None`` when none was found.
+
+    Returns:
+        The verdict.
+    """
+    title = "the resolved configuration states the arm"
+    if config is None:
+        return Verdict(6, title, FAIL,
+                       "no resolved configuration was found, so the arm this run trained is not "
+                       "recoverable from its artifacts; pass --config")
+
+    stated: List[str] = []
+    missing: List[str] = []
+    for key in ARM_KEYS:
+        found, value = _lookup(config, f"model_config.VAE_model.{key}")
+        (stated if found else missing).append(f"{key}={value!r}" if found else key)
+
+    named = [
+        str(value)
+        for path in IDENTITY_PATHS
+        for found, value in [_lookup(config, path)]
+        if found and str(value or "").strip()
+    ]
+    if missing or not named:
+        problems = []
+        if missing:
+            problems.append(f"{len(missing)} arm key(s) absent: {missing}")
+        if not named:
+            problems.append(f"no run identity at any of {list(IDENTITY_PATHS)}")
+        return Verdict(6, title, FAIL, "; ".join(problems))
+    return Verdict(6, title, PASS, f"{named[0]}; {', '.join(stated)}")
+
+
 # =================================================================================================
 # Tier 2: reported and interpreted, never gated
 # =================================================================================================
@@ -503,14 +623,38 @@ def tier_two_readings(rows: Sequence[Dict[str, str]]) -> List[Tuple[str, str]]:
         )
 
     for stage in STAGES:
-        finals = [_floats(rows, f"{stage}/{name}") for name in TERTILE_SUFFIXES]
-        if all(finals):
-            last = [series[-1] for series in finals]
-            readings.append(
-                (f"{stage}/pred_gap_warm spread",
-                 f"lo {last[0]:.6g}, mid {last[1]:.6g}, hi {last[2]:.6g}; "
-                 f"max-min {max(last) - min(last):.6g}")
-            )
+        for family, suffixes in TERTILE_FAMILIES:
+            finals = [_floats(rows, f"{stage}/{name}") for name in suffixes]
+            if all(finals):
+                last = [series[-1] for series in finals]
+                readings.append(
+                    (f"{stage}/{family} spread",
+                     f"lo {last[0]:.6g}, mid {last[1]:.6g}, hi {last[2]:.6g}; "
+                     f"max-min {max(last) - min(last):.6g}")
+                )
+
+    # The two checkpoint criteria, as the epoch each is minimised at. A run keeps two sets of
+    # weights because the composite optimum and the best conditioned forecast are different epochs;
+    # how far apart they sit is what says whether keeping both was worth the disk.
+    argmins: Dict[str, int] = {}
+    for monitor in CHECKPOINT_MONITORS:
+        values = _floats(rows, monitor)
+        if not values:
+            readings.append((f"{monitor} best epoch", "absent"))
+            continue
+        index = min(range(len(values)), key=values.__getitem__)
+        argmins[monitor] = index
+        readings.append(
+            (f"{monitor} best epoch",
+             f"row {index} of {len(values)} at {values[index]:.6g}; final {values[-1]:.6g}")
+        )
+    if len(argmins) == len(CHECKPOINT_MONITORS):
+        first, second = (argmins[monitor] for monitor in CHECKPOINT_MONITORS)
+        readings.append(
+            ("the two checkpoint criteria",
+             f"{second - first:+d} rows apart"
+             + (" -- one set of weights answers both" if first == second else ""))
+        )
     return readings
 
 
@@ -576,12 +720,16 @@ def main(
 
     config_path = Path(config) if config else _first_existing(root, RESOLVED_CONFIG_CANDIDATES)
     band: Optional[AnchorBand] = None
+    resolved: Optional[Dict[str, Any]] = None
     if config_path is not None and config_path.is_file():
         try:
-            band = resolve_anchor_band(_load_config(config_path))
+            resolved = _load_config(config_path)
+            band = resolve_anchor_band(resolved)
         except (KeyError, TypeError, ValueError) as error:
-            # Reported through criterion 2's own FAIL rather than raised: the other four criteria
-            # are readable without it, and a checker that died here would report nothing at all.
+            # Reported through criteria 2 and 6's own FAILs rather than raised: the other four are
+            # readable without it, and a checker that died here would report nothing at all. A
+            # parsed-but-incomplete document still reaches criterion 6, which asks a different
+            # question of it than the geometry does.
             print(f"could not derive the anchor geometry from {config_path}: {error}")
 
     second_rows: Optional[List[Dict[str, str]]] = None
@@ -598,6 +746,7 @@ def main(
         check_loss_and_breaker(rows),
         check_gap_recomposition(rows),
         check_two_evaluations(rows, second_rows),
+        check_arm_is_stated(resolved),
     ]
 
     print(f"run directory: {root}")

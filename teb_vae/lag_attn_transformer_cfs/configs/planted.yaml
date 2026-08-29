@@ -1,0 +1,61 @@
+# The lag-identifiability fixture's configuration for the conv-Transformer encoder: a tiny model at
+# the PRODUCTION lag geometry, fitted on the committed planted-delay shard.
+#
+# The conv-LSTM twin's `planted.yaml` carries the full rationale; what follows is only what differs.
+# The two files must stay leaf-for-leaf identical outside the encoder block, because the whole point
+# of running the check on both parents is that the ENCODER is the only thing that differs between
+# the two readings.
+#
+# WHAT THIS CONFIG IS FOR. `tiny.yaml` beside it exists to run the machinery cheaply and asserts
+# nothing about what the model learns. This one is a MEASUREMENT: the shard it reads carries a
+# source-to-target delay planted at the raw level and stamped on the file, so the lag readout has a
+# ground truth to be scored against. ITS GEOMETRY IS PINNED -- `max_lag`, `horizon`,
+# `warmup_period`, `anchor_stride`, `causal_align_reference`, `causal_align_reference_source` and
+# the shard paths do not move, or two measurements taken against it are not a comparison.
+#
+#   `max_lag: 90` -- the production lag window, restored. At tiny.yaml's 8 the band a planted delay
+#   of 45 steps is readable in ([delta - H, delta - 1] = [15, 44]) lies entirely outside the search.
+#   `anchor_stride: 1` -- every valid anchor decoded, so a lag can form in the minutes this check
+#   is allowed.
+#   `likelihood: gaussian_nll` -- the production objective, restored; the KL this check reads is
+#   shaped by the objective the decoder trains under.
+#
+#   python teb_vae/lag_attn_cfs/lag_recovery_check.py --config \
+#       teb_vae/lag_attn_transformer_cfs/configs/planted.yaml
+base: tiny.yaml
+
+general_config:
+  tag: lag_attn_trf_cfs_planted
+  cuda_devices: [0]
+  epochs: 40
+  lr: 0.001
+  plot_frequency: 100
+  folders_config: {out_dir_base: output/teb_vae_trf_cfs_planted}
+
+model_config:
+  VAE_model:
+    max_lag: 90
+    anchor_stride: 1
+    likelihood: gaussian_nll
+    causal_align_reference: target_max
+    # ONE clock for both streams, PINNED. The shipped configuration moves the source onto a faster
+    # reference of its own, which shifts the source content 25 stored steps earlier and would turn
+    # the plant's readable band [15, 44] into [-10, 19] -- half of it off the near edge of the
+    # window. The shard's planted delay is 45 STORED steps only while the two streams read on one
+    # clock, so this null is what keeps the instrument measuring the architecture.
+    causal_align_reference_source: null
+    beta_schedule:
+      kind: linear_warmup
+      start: 0.0
+      end: 1.0
+      warmup_epochs: 5
+
+dataset_config:
+  vae_train_datasets: [teb_vae/lag_attn/tests/fixtures/tiny_shard_causal_planted.hdf5]
+  vae_test_datasets: [teb_vae/lag_attn/tests/fixtures/tiny_shard_causal_planted.hdf5]
+  stat_path: teb_vae/lag_attn/tests/fixtures/tiny_stats_causal_planted.hdf5
+
+advanced_config:
+  callbacks:
+    lag_attn_rws_plotting:
+      enabled: false

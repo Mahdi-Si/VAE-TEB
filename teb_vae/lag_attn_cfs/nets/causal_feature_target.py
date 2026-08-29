@@ -28,6 +28,12 @@ three-way partitions of the same per-channel gap -- by warm-up rank and by the s
 novelty share -- which recompose to ``pred_gap`` over one denominator and answer two different
 questions about the same channels.
 
+**The persistence residual's input is gathered here**, and only here, because it is the same
+question ``_build_forecast_target`` answers one step later: which channels, in which order, off
+which stream. ``_anchor_target_values`` returns the anchor's own target vector, and
+``_check_persistence_target`` is what admits the mechanism at all -- the architecture parents refuse
+it, since a raw block's last axis has no per-channel level to carry forward.
+
 **What is deliberately not here.** ``_default_decoder_out_channels``, ``compute_loss`` and
 ``_build_forecast_target`` are the parent's, unmodified: the anchor set reaches all three through
 ``forward_outputs['anchor_index']``, so the seam is expressed once in the shared code rather than
@@ -506,6 +512,66 @@ class CausalFeatureForecastTarget(FeatureForecastTarget):
         past = (steps[:, None] >= waits[None, :]).sum(dim=-1)
         return past.to(torch.float64) >= WARM_BLOCK_FRACTION * float(waits.numel())
 
+    # ------------------------------------------------------------------
+    # The decoder's persistence input
+    # ------------------------------------------------------------------
+    def _check_persistence_target(self) -> None:
+        """Admit the persistence residual: this target domain supplies its input.
+
+        The architecture parents refuse the flag by name, for the reason their own version of this
+        method gives -- their forecast block's last axis counts raw samples of one signal, so there
+        is no per-channel level for a persistence term to carry. Overridden here to a no-op because
+        the block this domain forecasts *is* the target's own channel vector, and
+        :meth:`_anchor_target_values` is what hands it to the decoder.
+
+        A method rather than a flag on the parents for the same reason ``_prior_clock_dim`` is one:
+        the question is what the target domain is, the answer is known only to a composing mixin,
+        and the decoder that needs it is built by the parent's constructor before that mixin's own
+        resolution runs.
+        """
+
+    def _anchor_target_values(
+        self, target_features: torch.Tensor, anchors: torch.Tensor
+    ) -> torch.Tensor:
+        r"""The target's stored value **at** each decoded anchor: the persistence input.
+
+        $$Y^{0}[b, a, k] = Y[b,\, t_a,\, \mathrm{keep}[k]],$$
+
+        against :meth:`~teb_vae.lag_attn_fs.nets.feature_target.FeatureForecastTarget._build_forecast_target`'s
+        $Y[b, t_a + 1 + \tau, \mathrm{keep}[k]]$ -- the same stream, the same channels, one step
+        earlier and with no horizon axis. Written beside nothing else because it *is* the same
+        gather with the window removed, and the two must select the same channels in the same order
+        or the residual would carry one channel's level into another's forecast.
+
+        **The keep-index only, never the gate's delay**, for exactly the reason the forecast target
+        gives: the delay reads channel $c$ at step $t - d_c$, which is the guard that keeps an
+        *input* channel's forward reach behind the anchor's causal endpoint. What the residual
+        carries is the value the anchor is asked to continue, and shifting it would make the term a
+        stale channel-dependent mixture rather than the anchor's own vector.
+
+        **At the anchor step, not at the last valid step before it.** The evaluation's persistence
+        baseline gathers the last *observed* step, which it can because it holds the decimated
+        validity weight; no validity signal enters the training forward, and the at-anchor
+        definition is sound there without one -- an anchor is target-warm by the constructor's own
+        floor refusal, and an anchor invalid at its own step is fully masked in the loss, so the
+        residual scores nothing on it.
+
+        Args:
+            target_features: The concatenated target stream $(B, T, c_y)$ in **declared** channel
+                order, before the gate -- the same tensor the forecast target is gathered from.
+            anchors: The decoded anchor index $(B, A)$, as ``_build_anchor_index`` returned it.
+
+        Returns:
+            The anchor's own target vector $(B, A, C_{\mathrm{keep}})$.
+        """
+        gathered = (
+            target_features
+            if self.target_gate is None
+            else torch.index_select(target_features, -1, self.target_gate.keep_index)
+        )
+        index = anchors.to(torch.long)[:, :, None].expand(-1, -1, gathered.shape[-1])
+        return gathered.gather(1, index)
+
     @torch.no_grad()
     def _gap_by_kept_channel(
         self,
@@ -544,10 +610,13 @@ class CausalFeatureForecastTarget(FeatureForecastTarget):
                 target,
                 likelihood=likelihood,
                 logvar=forward_outputs[f"logvar_{branch}"],
-                # The objective's own weight, so this vector still sums to the ``pred_gap``
+                # The objective's own weights, so this vector still sums to the ``pred_gap``
                 # printed beside it. Left out, every channel split would be a decomposition of a
-                # quantity the objective does not optimise.
+                # quantity the objective does not optimise -- which is as true of the horizon
+                # weighting as of the channel one, since both enter the same two reconstruction
+                # terms.
                 channel_weight=self.target_channel_weight,
+                horizon_weight=getattr(self, "horizon_weight", None),
             ) * mask[..., None]
             return score.sum(dim=(0, 1, 2))
 

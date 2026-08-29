@@ -528,20 +528,31 @@ def test_the_design_records_why_the_latent_gap_readout_is_re_pointed(design):
 
 
 def test_the_lean_limits_carry_their_replacement_triggers(design):
-    """A ``lean-limit`` note without a measurable trigger is a permanent excuse. Exactly four here:
+    """A ``lean-limit`` note without a measurable trigger is a permanent excuse. Exactly five here:
     the per-segment warm-up, the residual pair-indexed lag bias, the lag floor that never varies,
-    and the availability-clock margin the evaluation ships unset.
+    the clock the prior cannot cancel, and the persistence residual this row has and the raw-target
+    row does not.
 
     The second was "the uncorrected group delay" until the alignment corrected the per-channel half
     of it; what is left is the pair-indexed remainder, so the note is narrowed rather than removed.
+
+    **The availability-clock margin left this list rather than being renamed**, and that is the
+    shape a retired note takes: it recorded a threshold the evaluation shipped unset, the threshold
+    is now set from an observed spread, and a `lean-limit` whose limitation no longer exists would
+    be worse than none -- a reader would go looking for a gap that was closed. The two notes added
+    beside it are the ones this revision opened, and each names the measurement that would close
+    it rather than a intention to revisit.
     """
     flat = _flat(design)
 
-    assert len(re.findall(r"^> lean-limit: ", design, re.MULTILINE)) == 4
+    assert len(re.findall(r"^> lean-limit: ", design, re.MULTILINE)) == 5
     assert "when a measured run shows the anchor floor" in flat
     assert "when a nonzero target reference can be divided out" in flat
     assert "when a run's `source_lag_warmth_frac_ph` falls below" in flat
-    assert "once the first production run on the causal holdout split has written" in flat
+    assert "when the owner accepts a change to the posterior parameterisation" in flat
+    assert "when the raw-target cells' fast-step NLL shows the same" in flat
+    # Retired rather than restated: the trigger it named has fired.
+    assert "the causal holdout split has written" not in flat
 
 
 def test_the_design_records_what_the_evaluation_closed_and_what_it_did_not(design):
@@ -602,10 +613,16 @@ def test_every_companion_document_the_design_defers_to_exists(design):
 
 def test_every_launch_line_in_the_design_names_a_config_that_exists(design):
     """A launch line is copied and pasted; one naming a moved file fails at the shell with a
-    message about a path rather than about a run."""
+    message about a path rather than about a run.
+
+    Four rather than three: the production config, the tiny variant, the local smoke variant, and
+    the identifiability instrument's own delta -- which earns a launch line because it is a
+    *runnable check* an operator invokes between architecture changes, not a training arm.
+    """
     referenced = sorted(set(re.findall(r"teb_vae/lag_attn_cfs/configs/[\w.]+\.yaml", design)))
 
-    assert len(referenced) == 3, f"DESIGN.md §16 names {referenced}, not all three launch configs"
+    assert len(referenced) == 4, f"DESIGN.md §16 names {referenced}, not all four launch configs"
+    assert "teb_vae/lag_attn_cfs/configs/planted.yaml" in referenced
     missing = [path for path in referenced if not (_REPO_ROOT / path).is_file()]
     assert missing == [], missing
 
@@ -791,14 +808,27 @@ def test_the_record_maps_every_criterion_onto_the_verdict_that_re_asks_it(result
     assert "None. This is a property of the optimisation trajectory" in section
 
 
-def test_the_unset_clock_margin_is_recorded_as_an_open_item(results):
-    """The one criterion whose verdict cannot be decided yet. Recorded with the run that resolves
-    it, because an open item with no owner and no trigger is a permanent one."""
+def test_the_clock_margin_is_recorded_as_set_with_its_provenance(results):
+    """The criterion that used to be undecidable, and the shape of the record now that it decides.
+
+    This asserted the *open item* while the threshold was unset: an open item with no owner and no
+    trigger is a permanent one, so the record had to name the run that would resolve it. That run
+    happened, the threshold is set from its observed spread, and the record's obligation inverts --
+    what has to be on the page is now the **number and where it came from**, because a threshold
+    without a provenance is a guess that outlives the person who made it.
+
+    The value is asserted alongside the interval it was read off, so a later edit that moves one
+    without the other fails here rather than leaving a bar whose stated derivation no longer
+    produces it.
+    """
     flat = _flat(results)
 
-    assert "clock_margin_min_nats` is unset" in flat
-    assert "INCONCLUSIVE" in flat
-    assert "first production evaluation of a causal holdout split" in flat
+    assert "clock_margin_min_nats` is unset" not in flat
+    assert "0.15" in flat
+    assert "[0.157, 0.164]" in flat
+    # The bar's provenance is the UNALIGNED arm while the gated quantity is right on both, and the
+    # asymmetry is the part a reader has to carry rather than the number.
+    assert "unaligned" in flat
 
 
 def test_the_record_states_that_the_nats_are_comparable_to_no_other_target_domain(results):

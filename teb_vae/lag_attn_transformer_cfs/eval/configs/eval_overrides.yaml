@@ -252,6 +252,12 @@ eval_config:
     attention: 64
     pages: 24
     pages_per_class: 10
+    # NOT a retention cap: it bounds how many segments the input-level occlusion readout
+    # re-encodes. That analysis costs one encode plus one single-anchor decode PER BAND per batch,
+    # and it scores one anchor per segment, so the honest denominator is segments rather than
+    # anchors. 512 is a few thousand scored anchor-band pairs, which is enough for a per-horizon
+    # mean and small beside the collection pass. Removing the key means "every segment".
+    occlusion: 512
 
   # How much worse, in nats per anchor, a forecast from a stranger's prior latent must be before
   # the prior is credited with carrying the target's predictive state. Explicitly provisional:
@@ -290,18 +296,64 @@ eval_config:
   # per recording, bootstrapped over recordings, and `coupling_exceeds_availability_clock` FAILs
   # when the lower end of that interval does not clear this key.
   #
-  # null is the SETTING, not an omission. Where the boundary belongs is exactly what the first
-  # production runs on the causal holdout split are supposed to measure, and a provisional number
-  # would decide a FAIL on that run — a gate whose threshold is a guess either fails a healthy
-  # model or passes a broken one, and nobody can tell which from the output. Unset, the verdict is
-  # INCONCLUSIVE and the analysis still emits the measured difference, both interval ends and the
-  # positive fraction; `coupling_minus_clock_nats` is a headline scalar whatever this key says, so
-  # the arm tables carry it from the first run and the threshold can be set from them.
+  # SET, from the diagnosed run rather than chosen. It shipped null for one release while there
+  # was no measurement to set it from: a provisional number would have decided a FAIL on exactly
+  # the run that was supposed to measure it, and nobody could have told a healthy model failing
+  # from a broken one passing.
   #
-  # Setting it is therefore a deliberate act with a value someone can defend. Validated when set:
-  # it must be a finite number of at least 0.001 nats, because zero passes on any non-negative
-  # difference and a negative value can never fail at all.
-  clock_margin_min_nats: null
+  # PROVENANCE. The H = 15 diagnosed run measured Delta_clock = 0.160 nats per anchor with a
+  # bootstrap interval of [0.157, 0.164] over recordings — an interval 0.007 nats wide, two orders
+  # below its own centre, so the spread this threshold has to sit outside is small and known. 0.15
+  # sits just below the measured lower end: a run reproducing that coupling passes, and a run whose
+  # difference has collapsed toward the clock fails rather than reporting a smaller positive number
+  # as a success.
+  #
+  # WHOSE ARM THE PROVENANCE IS. The 0.160 was measured on the UNALIGNED arm — that is what the
+  # diagnosed run turned out to have trained, which is the config drift the run identity keys now
+  # guard against. The gated quantity itself, `coupling_minus_clock`, is right on both arms: it is
+  # a difference of two KLs taken on one support, and neither the alignment reference nor the
+  # source clock enters that arithmetic. So the threshold is defensible across the alignment arms
+  # while its calibrating measurement came from one of them, and that is stated here rather than
+  # left for a reader to reconstruct from a run directory.
+  #
+  # Validated when set: a finite number of at least 0.001 nats, because zero passes on any
+  # non-negative difference and a negative value can never fail at all. Setting it back to null
+  # restores the INCONCLUSIVE verdict with the measured difference still emitted.
+  clock_margin_min_nats: 0.15
+
+  # THE LAG BANDS THE INPUT-LEVEL OCCLUSION READOUT REMOVES, in stored steps back from the anchor.
+  #
+  # Each band is zeroed out of the SOURCE STREAM's values -- the availability announcement is left
+  # exactly where it was, so the intervention moves what the source said and not when it arrived --
+  # the model re-encodes, and the change in the forecast's block score is reported PER HORIZON
+  # STEP. That is the axis this readout exists for: the lag axis is censored at both ends by the
+  # alignment geometry and no model-side change reaches it, while a band that informs the first
+  # predicted step and not the last is a statement the window carries whatever the references say.
+  #
+  # THE FOUR SHIPPED BANDS PARTITION THE WINDOW at the boundaries the geometry already draws, so a
+  # reader comparing two arms compares the same four intervals:
+  #   anchor    [0, 14]   the anchor's own neighbourhood, 0-60 s back. Under `lag_kv_source:
+  #                       conv_stem` this is roughly the K/V receptive field, so it is the band a
+  #                       local memory can resolve at all.
+  #   near      [15, 44]  60-180 s back. On the shipped dual reference the 20-60 s physiological
+  #                       band lands at lags 8.5-47.5, so this is where a contraction-to-
+  #                       deceleration delay is expected to be readable.
+  #   mid       [45, 67]  180-272 s back.
+  #   far       [68, 90]  272-364 s back, up to the window's far edge.
+  #
+  # A band reaching into the warm-up region occludes steps the availability mechanism had already
+  # zeroed, so its delta is zero for a reason that is about the geometry. The analysis reports each
+  # band's LIVE FRACTION beside its delta for exactly that, and a near-zero live fraction is read
+  # as "there was no source there to remove" rather than as "the source did not matter".
+  #
+  # An empty band (lo > hi) and a band above the model's own `max_lag` are both refused by name at
+  # config load: the first would report a row of zeros as a finding, the second would name a wider
+  # band than it measured. `{}` -- the schema default -- records the analysis as a skip.
+  occlusion_bands:
+    anchor: [0, 14]
+    near: [15, 44]
+    mid: [45, 67]
+    far: [68, 90]
 
   # Image format for every figure the run writes, as a matplotlib filetype: `pdf`, `svg`, `png`,
   # `eps`, `webp`, ... The installed matplotlib's own list is what a value is checked against, so

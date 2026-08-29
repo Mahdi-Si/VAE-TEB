@@ -229,12 +229,19 @@ def test_the_geometry_and_the_encoder_block_reach_the_constructor(driver):
 def test_the_warm_up_budget_reaches_the_constructor_as_the_four_channel_tuples(driver):
     """The causal half of the chain. ``causal_warmup_budget_steps`` names no constructor argument at
     all: the driver resolves it against the configured shards into the four tuples the network
-    takes, and those are what land in every checkpoint."""
+    takes, and those are what land in every checkpoint.
+
+    The two widths are decided by different rules and, now, by different clocks: the target's by
+    the warm-up budget, the source's by an alignment reference of its own that is faster than the
+    target's. $39$ rather than $47$ is what that costs, and it is a width every module on the
+    source side is built at rather than a preference -- which is why it is pinned here, where the
+    resolution that produces it is what is under test.
+    """
     kwargs = driver._build_model_kwargs()
 
     assert "causal_warmup_budget_steps" not in kwargs
     assert len(kwargs["target_keep_index"]) == len(kwargs["target_warmup_steps"]) == 98
-    assert len(kwargs["source_keep_index"]) == len(kwargs["source_warmup_steps"]) == 47
+    assert len(kwargs["source_keep_index"]) == len(kwargs["source_warmup_steps"]) == 39
     assert "target_delays" not in kwargs and "source_delays" not in kwargs
     assert driver.resolved_warmup is not None
 
@@ -281,3 +288,106 @@ def test_the_built_model_is_this_packages_and_carries_both_halves(driver):
     assert model.decoder_out_channels == 98
     assert model.anchor_stride == 30
     assert not any(isinstance(module, torch.nn.LSTM) for module in model.modules())
+
+
+# =================================================================================================
+# The training controls
+#
+# Two decisions about when a run stops and which epochs it keeps, and both are configuration rather
+# than code -- which is exactly why they need a test. A flag that reaches nothing raises nothing:
+# `enabled: false` and a monitor the framework never emits are indistinguishable from the outside,
+# and the run simply trains its whole budget out with no line saying the control was inert.
+#
+# The shipped config is read here rather than the tiny one, because these are production settings:
+# the tiny variant runs two epochs and a patience of fifty would be inert there for a reason that
+# says nothing about the arm.
+# =================================================================================================
+def _shipped_callbacks_block():
+    """The shipped config's ``advanced_config.callbacks`` block, read off the committed file."""
+    from teb_vae.lag_attn.config import load_config
+
+    shipped = Path(__file__).resolve().parents[1] / "configs" / "default.yaml"
+    return load_config(str(shipped))["advanced_config"]["callbacks"]
+
+
+def test_early_stopping_is_on_and_monitors_a_metric_this_task_emits(
+    task, stub_batch, perturb_posterior
+) -> None:
+    """Both halves of one guarantee, and the second is what makes the first worth having.
+
+    On, because a run of this family has been observed to reach its composite optimum hundreds of
+    epochs before its budget ends, and every epoch after that is compute spent on a checkpoint
+    nothing will select. And monitoring a name the task actually emits, because Lightning treats a
+    monitor it cannot find as nothing to stop on: the flag would read as enabled in every artifact
+    and the run would train to its budget anyway.
+
+    The patience is asserted as a *band* rather than a value. What it has to be is long enough that
+    a plateau in a noisy validation curve is not read as convergence and short enough to save real
+    time; the exact number inside that band is a choice, and pinning it would make a retune a test
+    edit rather than a decision.
+    """
+    block = _shipped_callbacks_block()["early_stopping"]
+    module = task()
+    perturb_posterior(module.orig_model)
+    _loss, val_metrics = module.compute_loss_and_metrics(stub_batch, 0, "val")
+
+    assert block["enabled"] is True
+    assert block["monitor"] == "val/total_loss"
+    assert block["monitor"].split("/", 1)[1] in val_metrics
+    assert 40 <= int(block["patience"]) <= 60
+    assert float(block["min_delta"]) > 0.0, (
+        "a zero min_delta stops on any improvement at all, which on a noisy validation curve is "
+        "never"
+    )
+
+
+def test_the_second_checkpoint_criterion_names_a_metric_this_task_emits(
+    task, stub_batch, perturb_posterior
+) -> None:
+    """The composite optimum and the best conditioned forecast are different epochs -- fifty-odd
+    apart on a measured run of this family -- and one criterion makes the other epoch's weights
+    unrecoverable afterwards.
+
+    The monitor has to be a name the task emits for the same reason early stopping's does: a
+    ``ModelCheckpoint`` whose monitor never appears in ``callback_metrics`` saves nothing and says
+    nothing, so the second criterion would be a config line and an empty directory.
+    """
+    block = _shipped_callbacks_block()["model_checkpoint"]
+    module = task()
+    perturb_posterior(module.orig_model)
+    _loss, val_metrics = module.compute_loss_and_metrics(stub_batch, 0, "val")
+
+    assert block["secondary_monitor"] == "val/nll_full_block"
+    assert block["secondary_monitor"].split("/", 1)[1] in val_metrics
+    # A different criterion from the primary one, which is the whole point: two callbacks on one
+    # monitor would keep the same epochs twice and cost twice the disk for nothing.
+    assert block["secondary_monitor"] != block["monitor"]
+
+
+def test_a_config_naming_no_second_monitor_builds_no_second_callback(driver) -> None:
+    """The key is absent-by-default on the shared driver, which is what keeps the two-sided cells at
+    one criterion until their own configs opt in. Exercised by removing it rather than by reading
+    another cell's config, so what is under test is this driver's branch."""
+    from lightning.pytorch.callbacks import ModelCheckpoint
+
+    driver.config["advanced_config"]["callbacks"]["model_checkpoint"].pop(
+        "secondary_monitor", None
+    )
+    captured = {}
+
+    def _capture(callbacks, model=None):
+        captured["callbacks"] = callbacks
+
+        class _StubTrainer:
+            def fit(self, *args, **kwargs):
+                pass
+
+        return _StubTrainer()
+
+    driver.build_trainer = staticmethod(_capture)  # type: ignore[method-assign]
+    driver.create_model()
+    driver.train_model(object(), object())
+
+    checkpoints = [cb for cb in captured["callbacks"] if isinstance(cb, ModelCheckpoint)]
+    assert len(checkpoints) == 1
+    assert driver.secondary_checkpoint_callback is None

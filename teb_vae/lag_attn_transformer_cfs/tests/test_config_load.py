@@ -56,7 +56,21 @@ _TARGET_SIBLING = (
 #: Every YAML this package may hold. A file that arrived undeclared is one nothing here checks, and
 #: configs are launchable by path.
 DECLARED_CONFIG_FILES = frozenset(
-    {"default.yaml", "tiny.yaml", "smoke_hie.yaml", "sweep_anchor_stride_1.yaml"}
+    {
+        "default.yaml",
+        "tiny.yaml",
+        "smoke_hie.yaml",
+        # The identifiability instrument's own delta: tiny widths at the PRODUCTION lag window and
+        # a single clock, both pinned so that a later default flip cannot move the instrument.
+        "planted.yaml",
+        "sweep_anchor_stride_1.yaml",
+        "sweep_lag_bias_decay.yaml",
+        "sweep_align_target_max.yaml",
+        "sweep_align_unaligned.yaml",
+        "sweep_lag_kv_adapter.yaml",
+        "sweep_source_dropout_02.yaml",
+        "sweep_source_dropout_03.yaml",
+    }
 )
 
 #: Keys that must exist. Some are checked by ``validate_config``; the rest are read with a bare
@@ -91,9 +105,13 @@ TASK_LEVEL_KEYS = (
     "lambda_deriv",
     "lambda_boundary",
     "causal_warmup_budget_steps",
-    # Both alignment keys are resolved against the SHARDS by the trainer and reach the
-    # constructor only as the two shift tuples, so neither names a constructor argument.
+    # All three alignment keys are resolved against the SHARDS by the trainer and reach the
+    # constructor only as the shift tuples, so none of them names a constructor argument.
     "causal_align_reference",
+    # The source stream's own clock, snapped against the SOURCE's stored delays rather than the
+    # target's. Task-level for the same reason as the key above and for one more: what it produces
+    # is a second keep-index and a second shift tuple on one stream, which is a resolution result.
+    "causal_align_reference_source",
     "causal_leg_alignment",
     "causal_reach_budget_s",
 )
@@ -168,6 +186,18 @@ TARGET_EDGE_EXEMPT_PATHS: Dict[str, str] = {
     "advanced_config.trainer.gradient_clip_val": (
         "measured at this block and anchor count, which the target domain moves"
     ),
+    # The training controls. Only these two appear here: the comparison config has no
+    # `secondary_monitor` key at all and the six architecture switches are absent from it too, and
+    # this edge compares the paths the two files SHARE -- so a key one side does not have is not a
+    # divergence it could declare.
+    "advanced_config.callbacks.early_stopping.enabled": (
+        "stops on val/total_loss where the comparison model runs its epoch budget out; enabled "
+        "because a run of this cell reaches its composite optimum well before its budget ends"
+    ),
+    "advanced_config.callbacks.early_stopping.patience": (
+        "the second half of the control above, in validation epochs; inheriting the comparison "
+        "model's value would make the flag above inert rather than merely different"
+    ),
 }
 
 #: The tiny variant's declared delta, and the local variant's. Written out so a stray override is a
@@ -224,9 +254,17 @@ SMOKE_HIE_DELTA_PATHS = frozenset(
 KEPT_TARGET_CHANNELS = 98
 
 #: Surviving source channels at the shipped ALIGNMENT, which is the only rule that gates this
-#: stream: the warm-up budget keeps all $51$, and the reference drops the four ``up_st`` channels
-#: whose composed delay is above it, leaving every one of the fifteen ``up_ph``.
-KEPT_SOURCE_CHANNELS = 47
+#: stream: the warm-up budget keeps all $51$, and the reference drops every channel whose composed
+#: delay is above it.
+#:
+#: **The number moved when the source gained a clock of its own.** Under one reference at the
+#: target's $402.1604$ s it was $47$ -- four ``up_st`` casualties and every one of the fifteen
+#: ``up_ph``. The shipped source reference is $288.2672$ s, a hundred and fourteen seconds faster,
+#: and it costs eight more: $30$ of $36$ ``up_st`` and $9$ of $15$ ``up_ph``. That is the trade the
+#: reference was pinned on -- a physiological delay lands mid-window on the lag axis instead of
+#: below its near edge -- and it is priced here rather than argued, because a source width is what
+#: every attended summary in this cell is built from.
+KEPT_SOURCE_CHANNELS = 39
 
 
 def _flatten(node: Dict[str, Any], prefix: str = "") -> Dict[str, Any]:
@@ -475,7 +513,7 @@ def test_every_comparable_leaf_equals_the_target_siblings_value(shipped, target_
         differing - set(TARGET_EDGE_EXEMPT_PATHS)
     )
 
-    # Five keys have no two-sided counterpart; nothing on the two-sided side is missing here.
+    # The keys with no two-sided counterpart; nothing on the two-sided side is missing here.
     assert set(mine) - set(theirs) == {
         f"{_VAE}.causal_warmup_budget_steps",
         f"{_VAE}.causal_align_reference",
@@ -486,6 +524,23 @@ def test_every_comparable_leaf_equals_the_target_siblings_value(shipped, target_
         # so it has no counterpart to compare against rather than a differing value.
         f"{_VAE}.target_weight_st",
         f"{_VAE}.target_weight_ph",
+        # The second half of the dual clock. Present here and nowhere else for the same reason
+        # `causal_align_reference` is: a symmetric bank's channels already report one instant.
+        f"{_VAE}.causal_align_reference_source",
+        # The four architecture switches whose off-state is bitwise the two-sided model. They are
+        # ABSENT from that config rather than set to their off-values, which is the stronger
+        # statement: the two-sided cells never take these keys, so no config of theirs can drift
+        # onto an arm, and the comparison stays a transform comparison.
+        f"{_VAE}.lag_kv_source",
+        f"{_VAE}.prior_availability_input",
+        f"{_VAE}.persistence_residual",
+        f"{_VAE}.horizon_weight_halflife_steps",
+        # The lag-bias seed's slope multiplier. Shipped FLAT here, where a decaying seed would
+        # predict the lag-0 peak this cell exists to measure; the two-sided cell reads no
+        # physiological delay off its lag axis and leaves the constructor default standing.
+        f"{_VAE}.alibi_slope_scale",
+        # The second checkpoint criterion. Absent there, and absence builds no second callback.
+        "advanced_config.callbacks.model_checkpoint.secondary_monitor",
     }
     assert set(theirs) - set(mine) == set()
 
@@ -719,15 +774,31 @@ def test_the_resolved_tiny_variant_validates_and_builds(tmp_path, loguru_warning
     assert model.anchor_stride == 30
 
 
-def test_the_local_variant_names_a_causal_shard_that_does_not_yet_exist(smoke_hie):
-    """Stated as a test rather than as a comment, so the day a causal HIE shard is built this fails
-    and someone reads the header. The two-sided ``output/hie_cs.hdf5`` cannot stand in for one."""
+def test_the_local_variant_names_a_built_and_leg_aligned_causal_shard(smoke_hie):
+    """The tripwire this replaces asserted the shard's *absence*, so that the day one was built it
+    would fail and someone would re-read the header. That day came; the header now records what was
+    built, and this asserts the config names it.
+
+    ``output/`` is gitignored, so the shard is a dev-box artefact rather than a committed fixture:
+    the config contract is checked everywhere, the file's own attributes only where it is present.
+    The two-sided ``output/hie_cs.hdf5`` still cannot stand in for one."""
     for key in ("vae_train_datasets", "vae_test_datasets"):
         for path in _get(smoke_hie, f"dataset_config.{key}"):
-            assert path.endswith("_causal.hdf5"), path
-            assert not (_REPO_ROOT / path).exists(), (
-                f"{path} now exists; re-read configs/smoke_hie.yaml's header and drop this test"
-            )
+            assert "causal" in path, path
+    assert "PREREQUISITE, AND IT IS NOW SATISFIED" in _SMOKE_HIE.read_text(encoding="utf-8")
+
+    shard = _REPO_ROOT / _get(smoke_hie, "dataset_config.vae_train_datasets")[0]
+    if not shard.is_file():
+        pytest.skip(f"{shard} is a gitignored dev-box artefact and is absent here")
+
+    import h5py
+
+    expected = _get(smoke_hie, "model_config.VAE_model.causal_leg_alignment")
+    with h5py.File(shard, "r") as handle:
+        assert handle.attrs["transform"] == "causal"
+        # An aligned shard and an unaligned one share every width, warm-up and stored delay, so
+        # this attribute is the only thing on the file that could disagree with the config.
+        assert handle.attrs["causal_leg_alignment"] == expected
 
 
 def test_the_local_variant_scales_the_step_warmup_into_its_own_budget(smoke_hie, shipped):

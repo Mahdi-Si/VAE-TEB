@@ -8,8 +8,10 @@ predictive target state.
 
 The machinery, per $4$-second anchor $t$:
 
-1. Two causal encoders build history states $H^y_t$ and $H^u_t$ from the target and source
-   feature streams.
+1. A causal encoder builds the target history state $H^y_t$; the source stream is projected
+   and then read through whichever memory ``lag_kv_source`` selects -- its own deep encoder by
+   default, or a bounded local representation, which is what the lag readout needs it to be.
+   Call the result $H^u_t$.
 2. A full-latent target-only **prior** $p_\theta(z_t \mid Y_{\le t}) =
    \mathcal{N}(\mu^p_t, \operatorname{diag} e^{\ell^p_t})$ is read off $H^y$.
 3. Lag cross-attention, queried by a projection of $\mu^p_t$, looks back over
@@ -22,10 +24,13 @@ The machinery, per $4$-second anchor $t$:
 
 Three structural properties carry the design, each enforced here rather than by convention:
 
-* **No decoder bypass.** The decoder's forward accepts exactly one tensor, $z$. There is no
-  ``decoder_state``; gradient reaches the decoder only through the latent, so
-  $\mu^p_t$ must carry the target's predictive state and $\mu^q_t - \mu^p_t$ is the additional
-  source-derived predictive information.
+* **No decoder bypass.** The decoder's forward accepts $z$ and, on a cell that builds the
+  persistence residual, the **target's own value at the anchor** -- and nothing else. There is no
+  ``decoder_state``, so every *source*-derived quantity reaching the decoder passes through the
+  latent: $\mu^p_t$ must carry the target's predictive state and $\mu^q_t - \mu^p_t$ is the
+  additional source-derived predictive information. The persistence input does not weaken that.
+  It is target-only, both invocations receive the identical tensor, and it enters the mean head
+  alone -- so it cancels exactly out of the base-minus-full gap the coupling is read from.
 * **Source purity.** The source pathway never sees a target tensor, and the prior never sees the
   source, so $\mathrm{KL}(q_t \Vert p_t)$ measures what the source added.
 * **Exact zero at init.** The posterior deltas are zero-initialised *after* the generic weight
@@ -49,7 +54,12 @@ from torch import nn
 from teb_vae.lag_attn.nets.attention import LagCrossAttention
 from teb_vae.lag_attn.nets.blocks import causalize_norms, initialization, validate_choice
 from teb_vae.lag_attn.nets.decoders import BaselineFutureDecoder, HorizonDecoderCore
-from teb_vae.lag_attn.nets.encoders import AvailabilityInputAdapter, CausalConvLstmEncoder
+from teb_vae.lag_attn.nets.encoders import (
+    LAG_KV_SOURCE_CHOICES,
+    AvailabilityInputAdapter,
+    CausalConvLstmEncoder,
+    CausalConvStem,
+)
 from teb_vae.lag_attn.nets.heads import POSTERIOR_LOGVAR_MODES, PosteriorHead, TEAnalysisHead
 from teb_vae.lag_attn.nets.delays import ChannelGate
 from teb_vae.lag_attn_rws.nets.geometry import TrimmedRawGeometry
@@ -60,6 +70,7 @@ from teb_vae.lag_attn_rws.nets.losses import (
 from teb_vae.lag_attn_rws.nets.losses import (
     compute_loss as compute_raw_objective,
 )
+from teb_vae.lag_attn_rws.nets.losses import horizon_decay_weight
 from teb_vae.lag_attn_rws.nets.losses import (
     kld_tensor as closed_form_kld,
 )
@@ -93,6 +104,16 @@ class SeqVaeLagAttnRws(nn.Module):
     #: The cached raw-target index grid, declared for the same reason: it is handed to the
     #: objective as a tensor argument.
     future_index: torch.Tensor
+
+    #: The resolved horizon weighting $(H,)$, or absent on a model built without a halflife.
+    #:
+    #: **Declared without a value on purpose**, exactly as ``target_channel_weight`` is: a model
+    #: that configures one registers this name as a *buffer*, and ``register_buffer`` refuses a name
+    #: that already exists on the class -- which a ``= None`` default here would create. The
+    #: delegation sites read it through :func:`getattr` with a ``None`` default, which is the whole
+    #: cost of keeping it a buffer, and ``None`` there means the score skips the multiplication
+    #: rather than multiplying by ones.
+    horizon_weight: Optional[torch.Tensor]
 
     def __init__(
         self,
@@ -129,14 +150,18 @@ class SeqVaeLagAttnRws(nn.Module):
         delta_logvar_scale: float = 2.0,
         posterior_logvar_mode: str = "residual",
         source_dropout: Optional[float] = None,
+        lag_kv_source: str = "encoder",
         use_entmax: bool = False,
         attention_grad_checkpoint: bool = False,
         lag_bias_init: str = "normal",
         alibi_slope_scale: float = 1.0,
         query_uses_logvar: bool = False,
+        prior_availability_input: bool = False,
         causal_norm: bool = False,
         coverage_floor: float = 0.9,
         base_decode: str = "sample",
+        persistence_residual: bool = False,
+        horizon_weight_halflife_steps: Optional[float] = None,
         target_keep_index: Optional[Sequence[int]] = None,
         target_delays: Optional[Sequence[int]] = None,
         source_keep_index: Optional[Sequence[int]] = None,
@@ -233,6 +258,18 @@ class SeqVaeLagAttnRws(nn.Module):
                 $D_1$ drags the prior's scale down alongside its own -- the second of the two
                 paths driving the prior-variance collapse, and the one that survives turning
                 off the base branch's noise. See :class:`PosteriorHead` for what it costs.
+            lag_kv_source: Which source representation the lag attention's keys **and** values are
+                built from. ``'encoder'`` (the default) is the deep history state $H^u$ -- the
+                model this family has always been -- and is bitwise what was built before the
+                keyword existed. ``'conv_stem'`` builds a
+                :class:`~teb_vae.lag_attn.nets.encoders.CausalConvStem` over the same convolution
+                schedule instead, so a key at lag $\ell$ summarises a bounded neighbourhood of
+                $\ell$; ``'adapter'`` uses the projected stream itself, one step of reach. Under
+                either local arm the deep source encoder is **not built at all** -- nothing else in
+                the model consumes it -- so those arms are smaller than the default rather than
+                larger. Why a deep state is the wrong memory to attend over, and why keys
+                and values must move together, is in
+                :data:`~teb_vae.lag_attn.nets.encoders.LAG_KV_SOURCE_CHOICES`.
             use_entmax: Use ``entmax15`` attention, which can assign a lag exactly zero weight.
             attention_grad_checkpoint: Recompute the attention in the backward pass.
             lag_bias_init: ``'normal'`` or ``'alibi_decay'``.
@@ -242,10 +279,21 @@ class SeqVaeLagAttnRws(nn.Module):
                 $[\mu^p \,\|\, \ell^p]$ (``query_proj`` widens to $2 d_z$ in), so the query can also
                 condition on how certain the prior belief is. Both are target-only, so source
                 purity is untouched.
-            causal_norm: Replace every ``GroupNorm`` inside the two encoders with
-                ``CausalGroupNorm``, restoring strict causality of $H^y$ and $H^u$. The horizon
-                core is deliberately left alone: its normalisers pool over the forecast axis of
-                a single anchor, not across input time.
+            prior_availability_input: Condition the prior head on the input-availability clock as
+                well as on $H^y$. ``False`` -- the default and the only value this architecture
+                accepts -- builds no clock projection and is bitwise the model built before the
+                keyword existed. The keyword is on this signature so that a composing cell whose
+                inputs *have* a warm-up can reach it through the driver's ``inspect.signature``
+                sweep; :meth:`_prior_clock_dim` is what such a cell overrides and is what refuses
+                the flag here, and the cell also decides what the clock actually is. Why a
+                target-only head may condition on one without seeing the source is in
+                :mod:`~teb_vae.lag_attn_rws.nets.heads`.
+            causal_norm: Replace every ``GroupNorm`` on a history path with ``CausalGroupNorm``,
+                restoring strict causality of $H^y$ and $H^u$ -- the target encoder, and whichever
+                module ``lag_kv_source`` put on the source side, so the guard follows the modules
+                the forward actually runs rather than an encoder an arm may not have built. The
+                horizon core is deliberately left alone: its normalisers pool over the forecast
+                axis of a single anchor, not across input time.
             base_decode: How the base branch's latent is obtained -- ``'sample'`` draws
                 $z^p = \mu^p + \sigma^p \epsilon$ under the shared $\epsilon$, ``'mean'``
                 decodes at $z^p = \mu^p$. ``'mean'`` is shipped, and it is the only change that
@@ -256,6 +304,25 @@ class SeqVaeLagAttnRws(nn.Module):
                 which pulls it *up* to cover $q$, and to the scale anchor. The posterior branch
                 stays stochastic either way, so the latent the coupling is read from is still
                 sampled.
+            persistence_residual: Add a target-only persistence term to the shared decoder's
+                **mean**: $\mu_{\tau,c} = w_{\tau,c}\,y_{t,c} + f_\theta(z_t)_{\tau,c}$, with $w$ a
+                learnable $(H, C)$ weight seeded to decay in $\tau$. ``False`` -- the default, and
+                the only value **this** architecture accepts -- builds no parameter and is bitwise
+                the model built before the keyword existed. The keyword is on this signature so a
+                composing cell whose target *is* a per-channel level can reach it through the
+                driver's ``inspect.signature`` sweep; :meth:`_check_persistence_target` is what such
+                a cell overrides and is what refuses the flag here, and the cell also decides what
+                $y_t$ is and gathers it.
+            horizon_weight_halflife_steps: Half-life $\lambda$, in horizon steps, of a decaying
+                weight $w_\tau \propto 2^{-\tau/\lambda}$ applied to **both** reconstruction terms
+                on the horizon axis, normalised to sum to $H$ so the block's scale is unchanged.
+                ``None`` -- the default -- builds no weight and leaves the objective bitwise the
+                horizon-uniform one. It answers a cost the uniform score has: the far steps are the
+                majority of the block and are the ones a fast channel cannot forecast, so the
+                cheapest way to lower the sum is to widen the variance everywhere and stop
+                predicting the level. What it costs is stated where it lands
+                (:func:`~teb_vae.lag_attn_rws.nets.losses.raw_sample_score`) -- a weighted block
+                score is not a log-density, so $\beta = 1$ stops being the exact ELBO.
             coverage_floor: Minimum valid fraction of an anchor's forecast window for the
                 anchor to enter the loss at all. A half-masked anchor's summed NLL covers half
                 a window, and the base-minus-full gap read off it is spuriously small. A config
@@ -352,6 +419,13 @@ class SeqVaeLagAttnRws(nn.Module):
         self.logvar_clamp = (float(logvar_clamp[0]), float(logvar_clamp[1]))
         self.coverage_floor = float(coverage_floor)
         self.base_decode = validate_choice(base_decode, BASE_DECODE_CHOICES, "base_decode")
+        # Refused here rather than at the decoder, so the failure names the target domain instead
+        # of a shape: this architecture's block is R raw samples of one signal, which has no
+        # per-channel level for a persistence term to carry forward. A composing target mixin
+        # overrides the check and supplies the input.
+        self.persistence_residual = bool(persistence_residual)
+        if self.persistence_residual:
+            self._check_persistence_target()
         # Init-policy bundle (zero-parameter, applied in the post-init block below). Each stores
         # its configured value here and re-initialises after the generic init; the recorded
         # defaults are exact no-ops, so a default-flag model is bitwise the pre-bundle one.
@@ -366,6 +440,30 @@ class SeqVaeLagAttnRws(nn.Module):
         self.register_buffer(
             "future_index", build_future_index(self.geometry), persistent=False
         )
+
+        # The horizon weighting, resolved once: it is a function of the halflife and H alone, so a
+        # per-batch rebuild would be the same vector computed a thousand times a second. A buffer
+        # rather than a plain tensor so it follows the module onto its device, and NON-persistent
+        # for the reason every other geometry-shaped tensor here is -- its length is H, so a
+        # persistent copy would make a checkpoint trained at one horizon fail to load at another and
+        # report it as a missing key rather than as a geometry mismatch. The halflife itself reaches
+        # the checkpoint through ``model_kwargs``, which is what keeps a run's objective recoverable.
+        #
+        # Registered only when configured, so ``getattr(self, 'horizon_weight', None)`` at the
+        # delegation sites is None on an unweighted model and the score skips the multiplication
+        # entirely -- the same contract ``target_channel_weight`` has, and the reason the uniform
+        # objective stays bitwise rather than merely close.
+        self.horizon_weight_halflife_steps = (
+            None
+            if horizon_weight_halflife_steps is None
+            else float(horizon_weight_halflife_steps)
+        )
+        if self.horizon_weight_halflife_steps is not None:
+            self.register_buffer(
+                "horizon_weight",
+                horizon_decay_weight(self.horizon_weight_halflife_steps, self.horizon),
+                persistent=False,
+            )
 
         # The causal input guard, if one is configured. Applied inside the forward, between the
         # data boundary (which sees the full declared widths) and the input adapters (which see
@@ -424,24 +522,54 @@ class SeqVaeLagAttnRws(nn.Module):
             post_residual_activation=False,
             conv_norm_groups=conv_norm_groups,
         )
-        self.source_encoder = CausalConvLstmEncoder(
-            d_model=d_model,
-            cnn_kernels=(3, 5, 11) + extra_kernels,
-            cnn_dilations=encoder_dilations,
-            lstm_layers=lstm_layers,
-            lstm_dropout=self.source_dropout,
-            conv_dropout=self.source_dropout,
-            stack_skip_connection=False,
-            post_residual_activation=False,
-            conv_norm_groups=conv_norm_groups,
+        # The source side builds ONLY the module its K/V arm needs. Under a local arm the deep
+        # encoder is not constructed at all -- nothing else in the model reads it, so building one
+        # would be a starved parameter block in DDP's expectation set and a claim in the manifest
+        # that the model attends over a state it does not have.
+        self.lag_kv_source = validate_choice(
+            lag_kv_source, LAG_KV_SOURCE_CHOICES, "lag_kv_source"
         )
+        if self.lag_kv_source == "encoder":
+            self.source_encoder = CausalConvLstmEncoder(
+                d_model=d_model,
+                cnn_kernels=(3, 5, 11) + extra_kernels,
+                cnn_dilations=encoder_dilations,
+                lstm_layers=lstm_layers,
+                lstm_dropout=self.source_dropout,
+                conv_dropout=self.source_dropout,
+                stack_skip_connection=False,
+                post_residual_activation=False,
+                conv_norm_groups=conv_norm_groups,
+            )
+        elif self.lag_kv_source == "conv_stem":
+            # The same schedule as the encoder's convolution branch, so the two arms differ in what
+            # is *removed* rather than in two independently chosen front ends.
+            #
+            # Which means the stem is only as local as that schedule is, and on this architecture
+            # that is a configuration rather than a guarantee: the shipped
+            # `encoder_extra_dilations` tail at kernel 15 puts the reach at 387 steps, past both
+            # the lag window and the sequence. `CausalConvStem.receptive_field` reports it, and a
+            # lag profile read off this arm should be read beside that number -- dropping the LSTM
+            # removes unbounded recurrence, not necessarily a whole-prefix key.
+            self.source_kv_stem = CausalConvStem(
+                d_model=d_model,
+                cnn_kernels=(3, 5, 11) + extra_kernels,
+                cnn_dilations=encoder_dilations,
+                conv_dropout=self.source_dropout,
+                conv_norm_groups=conv_norm_groups,
+            )
 
+        # Built AFTER the gates and the adapters, which is what makes the clock width readable:
+        # ``_prior_clock_dim`` resolves it from the source stream's own resolved warm-up, and a
+        # composing cell's override has the gate to read that off only once the base has built it.
+        self.prior_availability_input = bool(prior_availability_input)
         self.prior_head = FullLatentPriorHead(
             d_model=d_model,
             d_z=d_z,
             logvar_clamp=logvar_clamp,
             dropout=dropout,
             mu_scale=self.mu_scale,
+            clock_dim=self._prior_clock_dim() if self.prior_availability_input else None,
         )
 
         # The attention query is a projection of the prior belief, not of H^y: the question asked
@@ -485,9 +613,9 @@ class SeqVaeLagAttnRws(nn.Module):
         )
         self.te_analysis = TEAnalysisHead()
 
-        # ONE shared decoder, invoked twice per forward -- on z^p and on z^q -- and receiving
-        # nothing else. Its input width is d_z (the latent, not an encoder state), and
-        # out_channels here counts RAW SAMPLES PER HORIZON TOKEN, not feature channels: each of
+        # ONE shared decoder, invoked twice per forward -- on z^p and on z^q -- and receiving no
+        # SOURCE-derived tensor besides. Its input width is d_z (the latent, not an encoder state),
+        # and out_channels here counts RAW SAMPLES PER HORIZON TOKEN, not feature channels: each of
         # the H horizon tokens emits R = 16 raw samples. It is resolved from raw_per_step unless
         # a subclass overrides it, so this model cannot be configured onto a width its target
         # does not have. Dropout must be zero, not stylistic:
@@ -523,12 +651,20 @@ class SeqVaeLagAttnRws(nn.Module):
             d_hidden=decoder_hidden,
             dropout=0.0,
             logvar_clamp=logvar_clamp,
+            # Built here and refused above on this architecture, so the (H, C) weight exists only
+            # where a forward supplies the anchor's own target vector to pair it with.
+            persistence_residual=self.persistence_residual,
         )
 
         self.causal_norm = bool(causal_norm)
         if self.causal_norm:
-            self.n_causalized_norms = causalize_norms(self.target_encoder) + causalize_norms(
-                self.source_encoder
+            # The source half follows the K/V arm rather than naming the encoder: under
+            # ``conv_stem`` the GroupNorms that would pool across time are the stem's, and under
+            # ``adapter`` there are none -- the adapter normalises per token. Applying it to the
+            # module the forward actually runs is what keeps the guard describing the built model.
+            source_body = self.source_kv_body()
+            self.n_causalized_norms = causalize_norms(self.target_encoder) + (
+                0 if source_body is None else causalize_norms(source_body)
             )
         else:
             self.n_causalized_norms = 0
@@ -544,6 +680,11 @@ class SeqVaeLagAttnRws(nn.Module):
         # After the generic init, never before: initialization xavier-fills every nn.Linear and
         # would otherwise undo the zeroing -- and with it the exact zero-KL start.
         self._zero_init_delta_heads()
+        # The same undoing, and the same repair, for the prior's clock projection: the head zeroes
+        # it in its own constructor and `initialization` xavier-refills it, which would put a
+        # non-zero availability term into the prior at step 0 and end the exact zero-KL start. A
+        # no-op on a head built without a clock path.
+        self.prior_head.zero_init_clock()
         # The same undoing hits the per-block FiLM generators: the core zero-inits them for an
         # identity-at-init, and `initialization` xavier-refills them. Re-zeroing here is what makes
         # the identity actually true -- at step 0 the per-block-FiLM decoder is bitwise the
@@ -645,6 +786,54 @@ class SeqVaeLagAttnRws(nn.Module):
             delays=delays,
         )
 
+    def source_kv_body(self) -> Optional[nn.Module]:
+        """The module the projected source passes through on its way to the lag attention.
+
+        The **one** place the ``lag_kv_source`` arm is resolved into a module. Every other consumer
+        -- the forward, the two source controls, the causal cells' prior clock and the
+        ``causal_norm`` guard -- goes through here or through :meth:`encode_source_kv`, so an arm
+        cannot come to mean one thing in the forward and another in a readout of it.
+
+        Returns:
+            The deep source encoder under ``'encoder'``, the local stem under ``'conv_stem'``, and
+            ``None`` under ``'adapter'``, where the adapter's own output *is* the representation.
+        """
+        if self.lag_kv_source == "encoder":
+            return self.source_encoder
+        if self.lag_kv_source == "conv_stem":
+            return self.source_kv_stem
+        return None
+
+    def source_kv_modules(self) -> Tuple[nn.Module, ...]:
+        """The source pathway's modules, in the order the K/V representation passes through them.
+
+        A tuple rather than a single composed callable because a caller sometimes needs the modules
+        themselves and not the computation: the causal cells' prior clock forces exactly these into
+        eval mode for the duration of one encode, since a clock drawn under live dropout would be a
+        fresh random draw per step rather than a function of $t$.
+
+        Returns:
+            ``(source_adapter,)`` under ``'adapter'``, and ``(source_adapter, body)`` otherwise.
+        """
+        body = self.source_kv_body()
+        return (self.source_adapter,) if body is None else (self.source_adapter, body)
+
+    def encode_source_kv(self, source: torch.Tensor) -> torch.Tensor:
+        """Build the representation the lag attention uses as **both** keys and values.
+
+        Args:
+            source: The source stream **after** the channel gate, ``(B, T, c_kept)`` -- the gate is
+                applied by the caller, which is also what lets the two controls re-encode a stream
+                the forward never saw.
+
+        Returns:
+            The K/V representation, ``(B, T, d_model)``.
+        """
+        encoded = source
+        for module in self.source_kv_modules():
+            encoded = module(encoded)
+        return encoded
+
     def build_lag_mask(
         self, seq_len: int, device: Optional[torch.device] = None
     ) -> torch.Tensor:
@@ -700,6 +889,64 @@ class SeqVaeLagAttnRws(nn.Module):
         nn.init.zeros_(layer.weight)
         if layer.bias is not None:
             nn.init.zeros_(layer.bias)
+
+    def _prior_clock_dim(self) -> int:
+        r"""Width of the availability announcement the prior head conditions on.
+
+        A hook rather than a literal, and it is the same kind of decision
+        :meth:`_default_decoder_out_channels` is: what the announcement *is* depends on the input
+        domain, and only a composing mixin that owns a warm-up can answer it -- while the head that
+        needs the answer is built here, by this constructor, before that mixin's own resolution
+        runs. A cell placing such a mixin first in its bases wins method resolution and supplies it.
+
+        This architecture's inputs carry no warm-up: its streams are honest at every step, so
+        nothing arrives late, there is no transient for an encoder to carry forward, and there is no
+        clock in the KL to cancel. Setting the flag here is therefore a configuration error rather
+        than an arm, and it is refused by name.
+
+        Returns:
+            Never; see below.
+
+        Raises:
+            ValueError: Always. A silent $0$ would build a projection no forward can reach, and a
+                silent fabricated width would condition the prior on a constant -- both of which
+                would leave every KL readout describing a mechanism that is not there.
+        """
+        raise ValueError(
+            f"prior_availability_input=True on {type(self).__name__}, whose input streams carry no "
+            f"warm-up: every channel is honest at every step, so nothing arrives late and there is "
+            f"no availability term in the KL to cancel. The flag belongs to the causal cells, whose "
+            f"one-sided inputs arrive over the first steps of a segment."
+        )
+
+    def _check_persistence_target(self) -> None:
+        r"""Refuse the decoder's persistence residual on a target that has no per-channel level.
+
+        A hook rather than a literal, and the same kind of decision :meth:`_prior_clock_dim` and
+        :meth:`_default_decoder_out_channels` are: what the forecast block's last axis *counts*
+        depends on the target domain, and only a composing mixin that owns that domain can answer
+        it -- while the decoder that would carry the weight is built by this constructor, before
+        that mixin's own resolution runs. A cell placing such a mixin first in its bases wins method
+        resolution and admits the mechanism.
+
+        This architecture's block is $R$ raw samples of one signal per horizon token. The anchor's
+        "own value" there is a scalar sample, not a channel vector, so $w_{\tau,c}\,y_{t,c}$ has no
+        $c$ to range over and a persistence term would be a different mechanism wearing this one's
+        name. Setting the flag here is therefore a configuration error rather than an arm.
+
+        Raises:
+            ValueError: Always. Silently ignoring the flag would build the model the configuration
+                did *not* ask for while every metric column stayed present; silently building the
+                weight would leave a parameter no forward reaches, which under
+                ``find_unused_parameters=False`` is a distributed run that stops rather than a
+                readout that is wrong.
+        """
+        raise ValueError(
+            f"persistence_residual=True on {type(self).__name__}, whose forecast block is R raw "
+            f"samples of one signal per horizon token: there is no per-channel level for a "
+            f"persistence term to carry forward. The flag belongs to the feature-target cells, "
+            f"whose block's last axis counts stored coefficients of the target itself."
+        )
 
     def _zero_init_delta_heads(self) -> None:
         r"""Zero the posterior delta heads, so the model starts asserting the source says nothing.
@@ -933,8 +1180,12 @@ class SeqVaeLagAttnRws(nn.Module):
               a caller computing a prior-sample statistic off it gets the mean instead, and
               an in-place write to it corrupts ``mu_prior`` for every other consumer of this
               dict. Read ``self.base_decode`` before treating it as a draw.
-            * ``target_state``, ``source_state`` -- encoder history states,
-              ``(B, T, d_model)``.
+            * ``target_state`` -- the target encoder's history state, ``(B, T, d_model)``.
+            * ``source_state`` -- the source representation the lag attention actually reads as
+              keys and values, ``(B, T, d_model)``. Under ``lag_kv_source='encoder'`` that is the
+              deep source history state; under the local arms it is the stem's or the adapter's
+              output, and it is that tensor rather than a deep state nothing consumes, so the two
+              source controls keep probing what the model reads.
             * ``attended_source_heads`` -- per-head attended summaries
               ``(B, T, num_heads, d_head)``.
             * ``attn_weights`` -- attention probabilities ``(B, T, num_heads, L)`` in lag
@@ -959,7 +1210,7 @@ class SeqVaeLagAttnRws(nn.Module):
         source = u_stream if self.source_gate is None else self.source_gate(u_stream)
 
         h_y = self.target_encoder(self.target_adapter(target))
-        h_u = self.source_encoder(self.source_adapter(source))
+        h_u = self.encode_source_kv(source)
 
         mu_prior, logvar_prior, raw_logvar_prior = self.prior_head(h_y)
 
@@ -1160,4 +1411,9 @@ class SeqVaeLagAttnRws(nn.Module):
             lambda_ms=lambda_ms,
             lambda_deriv=lambda_deriv,
             lambda_boundary=lambda_boundary,
+            # ``None`` on a model built without a halflife, where the buffer does not exist at all
+            # and the score is bitwise the horizon-uniform one. A ``getattr`` rather than an
+            # attribute read for the reason ``target_channel_weight`` is one: the name is a buffer
+            # where it exists, and ``register_buffer`` refuses a name the class already carries.
+            horizon_weight=getattr(self, "horizon_weight", None),
         )

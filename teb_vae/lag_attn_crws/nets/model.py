@@ -16,6 +16,15 @@ mistake would build the decoder at $C_{\mathrm{keep}} = 98$ against a $(B, A, H,
 first symptom would be ``raw_sample_score`` computing $(\text{target} - \mu)^2$ on shapes that do not
 broadcast, three frames below the decision that caused it.
 
+**Which is also why ``persistence_residual`` is not on the signature below.** The decoder's
+persistence term carries the anchor's own value forward per *channel*, and this block's last axis
+counts raw samples of one signal -- there is no per-channel level for it to carry. Leaving the
+keyword off is what makes the exclusion structural: the driver's ``inspect.signature`` sweep can
+reach only what a cell re-lists, so no configuration of this cell can set the flag, and the
+architecture parent would refuse it by name if one could. The *other* half of horizon-aware
+decoding, ``horizon_weight_halflife_steps``, **is** here: a decaying weight reads the forecast's own
+$\tau$ axis, which this block has exactly as a feature block does.
+
 **The base order is load-bearing.** The mixin comes first, so its ``forward`` -- the tiled one --
 wins method resolution over the architecture's dense one, and its ``_build_adapter`` builds each
 stream's availability terms from the warm-up rather than from a gate whose delays are all zero.
@@ -106,14 +115,17 @@ class SeqVaeLagAttnCrws(CausalRawInputs, SeqVaeLagAttnRws):
         delta_logvar_scale: float = 2.0,
         posterior_logvar_mode: str = "residual",
         source_dropout: Optional[float] = None,
+        lag_kv_source: str = "encoder",
         use_entmax: bool = False,
         attention_grad_checkpoint: bool = False,
         lag_bias_init: str = "normal",
         alibi_slope_scale: float = 1.0,
         query_uses_logvar: bool = False,
+        prior_availability_input: bool = False,
         causal_norm: bool = False,
         coverage_floor: float = 0.9,
         base_decode: str = "sample",
+        horizon_weight_halflife_steps: Optional[float] = None,
         target_keep_index: Optional[Sequence[int]] = None,
         target_warmup_steps: Optional[Sequence[int]] = None,
         source_keep_index: Optional[Sequence[int]] = None,

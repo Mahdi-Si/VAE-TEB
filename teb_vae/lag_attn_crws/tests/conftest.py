@@ -98,9 +98,13 @@ IMPORTED_FROM_CAUSAL = (
     "TINY_TARGET_KEEP_INDEX",
     "TINY_TARGET_WARMUP_STEPS",
     "TINY_WARMUP_PERIOD",
+    # `causal_config` is deliberately ABSENT: this package wraps it (see SHIPPED_ALIGN_REFERENCE
+    # below) rather than binding it by identity, because the sibling's default reference is
+    # `target_max` and this row ships 42.21 s. The wrapper delegates to the sibling's object, so
+    # the "no local copy" property the list exists for still holds -- and
+    # `test_the_wrapped_config_delegates_to_the_siblings_own_builder` is what keeps it holding.
     "TWO_SIDED_SHARD",
     "absolutize_dataset_paths",
-    "causal_config",
     "hand_seeding_offenders",
     "make_stub_batch",
     "make_streams",

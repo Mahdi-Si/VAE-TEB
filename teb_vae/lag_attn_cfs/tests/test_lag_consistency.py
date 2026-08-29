@@ -319,15 +319,19 @@ def test_the_evaluation_reads_the_delay_off_the_model_and_from_nowhere_else():
     # accessor and is asserted equal to the model's own above; a second *name* in the runner would
     # be the guessed one.
     #
-    # Three mentions, not two, and the third is a comment. The count moved when the alignment gave
-    # this cell a SECOND delay-like constant: ``source_delay_steps`` is a stored-step maximum
-    # attained by the fastest channel, while the alignment reference is the physical instant every
-    # aligned channel reports at a step, and the runner records both. The comment naming the
-    # distinction at the read site is worth a unit of this budget; a fourth mention, or a second
-    # read expression, is not.
-    assert source.count("source_delay_steps") == 3, (
-        "the runner must read the delay once and record it once; a further mention is a second "
-        "read site, which is how the two reports of one run came to disagree by two minutes"
+    # Five mentions, and exactly one of them is a read. The budget is spent as: the read expression
+    # asserted above; a comment at that site naming what the value is NOT, which is the whole
+    # confusion this test exists about; the summary key it is recorded under; and a key-and-lookup
+    # pair in the arm block, which re-reads it off the PREFLIGHT record rather than off the model.
+    #
+    # That last pair is the one worth stating, because it looks like a second read site and is the
+    # opposite of one: the arm block reports what the run RESOLVED, which an offline pass with no
+    # model still has, and taking it from the model there would leave the block empty on exactly
+    # the pass it is most needed on. What must stay unique is the expression that asks the model.
+    assert source.count("source_delay_steps") == 5, (
+        "the runner must read the delay off the model once; a further occurrence of the "
+        "expression is a second read site, which is how the two reports of one run came to "
+        "disagree by two minutes"
     )
     assert source.count("source_reference_delay_s") >= 1, (
         "the physical constant must travel beside the stored-step one, or a consumer wanting a lag "

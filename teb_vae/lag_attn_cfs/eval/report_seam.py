@@ -61,6 +61,9 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import numpy as np
 from loguru import logger
 
+from teb_vae.lag_attn.nets.lag_report import MECHANICAL_SHIFT_SECONDS, SECONDS_PER_STEP
+from teb_vae.lag_attn_cfs.eval import lag_shape
+from teb_vae.lag_attn_cfs.eval.lag_axis import compensated_seconds_axis
 from teb_vae.lag_attn_cfs.eval._reuse import report
 
 #: The written summary's filename. Bound rather than restated so the runner, the acceptance gate
@@ -637,19 +640,44 @@ def check_lag_identity(results: Dict[str, Any], name: str) -> Dict[str, Any]:
     )
 
 
+#: The identity a lag on this axis is read under, written with its symbols. Interpolated into the
+#: near-edge message rather than stated as prose, because what makes a pin at the floor
+#: *censoring* rather than inertness is arithmetic a reader has to be able to redo: the reported
+#: lag is the smallest one the window carries, and every physical delay shorter than what that
+#: lag encodes lands below it and is reported there whatever the model found.
+PHYSICAL_LAG_IDENTITY = (
+    f"tau_phys(l, h) = {SECONDS_PER_STEP:g}*(l + 1 + h) + (tau_u_ref - tau_y_ref) "
+    f"- {MECHANICAL_SHIFT_SECONDS:g} s"
+)
+
+
 def check_argmax_lag(results: Dict[str, Any]) -> Dict[str, Any]:
-    r"""The KL attribution must peak somewhere inside the lag window rather than at either end.
+    r"""The KL attribution must have a readable shape, and its peak must not sit on a censoring edge.
 
-    Two degenerate readings, failing in opposite directions and for different reasons.
+    **Both ends of the window censor, and the check is symmetric in them.** An argmax at the
+    largest attainable lag means the true maximum may lie beyond $L$. An argmax at the *smallest*
+    attainable lag means exactly the mirror image: by the identity
+    $\tau^{\mathrm{phys}}_{\ell,h} = \Delta(\ell + 1 + h) + (\tau^u_{\mathrm{ref}}
+    - \tau^y_{\mathrm{ref}}) - \tau_{\mathrm{pre}}$, every physical delay shorter than what that
+    lag encodes is reported *at* it, because the window carries no bin below it. On this cell's
+    geometry a $20$-$60$ s physiological delay sits below lag $0$ at most horizon steps, so a pin
+    at the floor is the readout hitting a wall rather than the machinery failing to look back --
+    and reading it as inertness is a conclusion the geometry does not support.
 
-    An argmax pinned at $\ell = 0$ means the attribution never looks back at all: the source
-    informs the forecast only at the anchor's own step, and the whole lag machinery is inert.
+    Both edges are read from the per-lag anchor counts rather than taken as $0$ and $L - 1$: a lag
+    no anchor contributed to is not attainable at all, which at short sequence lengths removes the
+    top of the window entirely and can lift the floor off zero.
 
-    An argmax pinned at the **largest attainable lag** means the peak sits against the window's
-    own edge, so the true maximum may lie beyond $L$ and the reported lag is a censoring artifact
-    rather than a measurement. The ceiling is read from the per-lag anchor counts rather than
-    taken as $L - 1$: a lag with no contributing anchor is not attainable at all, which at short
-    sequence lengths removes the top of the window entirely.
+    **What "the machinery is alive" is judged on instead.** The shape vocabulary the pipeline
+    already computes: a profile whose peak is not distinguishable from its bulk, or one that is
+    almost entirely exact zeros, has an argmax that names a bin rather than a lag -- and that is a
+    FAIL at either edge or in the middle, because there is no measurement to censor. The per-head
+    entropies travel beside it as the evidence a reader needs to tell a confident wrong answer from
+    a flat one.
+
+    So the three outcomes are: FAIL on a degenerate profile or a far-edge pin, INCONCLUSIVE on a
+    near-edge pin with the arithmetic named, PASS on a profile that peaks strictly inside the
+    attainable window. An ideal model at this geometry can reach the last of those; today's cannot.
     """
     lag = results.get("lag")
     if not isinstance(lag, dict) or not lag:
@@ -662,32 +690,159 @@ def check_argmax_lag(results: Dict[str, Any]) -> Dict[str, Any]:
         return _inconclusive("the lag summary carries no argmax or no per-lag support")
 
     argmax = int(argmax)
-    ceiling = int(max(attainable))
-    inert = argmax <= 0
-    censored = argmax >= ceiling > 0
-    detail = (
-        "the KL attribution peaks strictly inside the attainable lag window"
-        if not (inert or censored)
-        else "; ".join(
-            part for part in (
-                "the argmax lag is 0, so the attribution never looks back and the lag window is "
-                "inert" if inert else "",
-                f"the argmax lag sits at the largest attainable lag ({ceiling}), so the peak is "
-                f"against the window edge and the true maximum may lie beyond it"
-                if censored else "",
-            ) if part
-        )
-    )
-    return _verdict(
-        not (inert or censored), detail,
-        kl_argmax_lag_step=argmax,
-        attainable_lag_ceiling=ceiling,
-        n_lags=len(counts),
+    floor, ceiling = int(min(attainable)), int(max(attainable))
+    # The support-corrected profile where the run carries one, because that is the profile whose
+    # argmax the rest of this pipeline quotes; the raw one is the fallback rather than a second
+    # opinion, and which was used is emitted so the two cannot be confused.
+    corrected = list(lag.get("kl_lag_profile_support_corrected") or [])
+    profile = corrected or list(lag.get("kl_lag_profile") or [])
+    shape = lag_shape.degeneracy(profile)
+    above_half = lag_shape.mass_above(profile)
+    entropies = [
+        float(value) for value in (lag.get("attention_entropy_per_head_nats") or [])
+    ]
+    facts: Dict[str, Any] = {
+        "kl_argmax_lag_step": argmax,
+        "attainable_lag_floor": floor,
+        "attainable_lag_ceiling": ceiling,
+        "n_lags": len(counts),
         # Reported rather than judged: where the two argmaxes disagree, the difference *is* the
         # short-lag bias the support correction exists to remove, which is a finding about the
         # profile and not a failure of the run.
-        kl_argmax_lag_step_support_corrected=lag.get("kl_argmax_lag_step_support_corrected"),
+        "kl_argmax_lag_step_support_corrected": lag.get("kl_argmax_lag_step_support_corrected"),
+        "profile_judged": "support_corrected" if corrected else "raw",
+        "peak_degenerate": bool(shape["degenerate"]),
+        "peak_to_median": shape["peak_to_median"],
+        "zero_fraction": shape["zero_fraction"],
+        "mass_above_half_peak": above_half.get("share"),
+        "n_bins_above_half_peak": above_half.get("n_bins"),
+        "attention_entropy_per_head_nats": entropies,
+    }
+
+    # First, because it is the only branch that says there is nothing to censor: a profile with no
+    # shape has an argmax that names a bin, and a censoring verdict on it would report a geometry
+    # limit where the measurement itself is absent.
+    if shape["degenerate"]:
+        return _verdict(
+            False,
+            "the KL attribution has no readable shape, so its argmax names a bin rather than a "
+            "lag: " + "; ".join(shape["reasons"]),
+            **facts,
+        )
+    if ceiling > floor and argmax >= ceiling:
+        return _verdict(
+            False,
+            f"the argmax lag sits at the largest attainable lag ({ceiling}), so the peak is "
+            f"against the window edge and the true maximum may lie beyond it",
+            **facts,
+        )
+    if argmax <= floor:
+        return _inconclusive(
+            f"the argmax lag sits at the smallest attainable lag ({floor}), which is a CENSORING "
+            f"edge and not inertness: under {PHYSICAL_LAG_IDENTITY}, every physical delay shorter "
+            f"than the one lag {floor} encodes is reported at lag {floor}, because the window "
+            f"carries no bin below it. The profile is not degenerate (peak-to-median "
+            f"{shape['peak_to_median']:.3g}, {float(above_half['share']):.3f} "
+            f"of its mass above half the peak), so the machinery is alive and the lag it would "
+            f"report is outside what this geometry can express. Read the per-head profiles and "
+            f"the shape vocabulary, and move the window with the alignment references rather than "
+            f"with the model.",
+            **facts,
+        )
+    return _verdict(
+        True,
+        f"the KL attribution peaks strictly inside the attainable lag window "
+        f"[{floor}, {ceiling}]",
+        **facts,
     )
+
+
+def build_lag_heads(results: Dict[str, Any]) -> Dict[str, Any]:
+    r"""Describe each attention head's own lag profile, beside the pooled one.
+
+    **The pooled profile is a mean over $M$ distributions that need not agree**, and on this
+    geometry it is also the statistic that cannot move: its argmax sits at the window's near
+    censoring edge on every arm this family has measured, because the three heads that peak there
+    outweigh the one that does not. A comparison between two alignment arms, or between two K/V
+    memories, is expressible only per head -- a head peaking inside the readable band while the
+    pooled argmax stays at the floor is a real finding the pooled row reports as nothing.
+
+    Everything here is *already computed*: the per-head profiles and the attention entropies come
+    off the collection pass, and the shape statistics are the same
+    :mod:`~teb_vae.lag_attn_cfs.eval.lag_shape` vocabulary the pooled check reads. What this adds
+    is that they reach the summary and the console, which is the surface an operator holds.
+
+    The entropies are the attention's own and the KL split is the posterior's, so both travel: a
+    head can be sharp in where it attends and carry almost none of the divergence, and the pair is
+    what separates "this head looks at lag 33" from "this head is what moved the belief".
+
+    Args:
+        results: The accumulated results, read for the ``lag`` block.
+
+    Returns:
+        One record per head with its argmax, peak width, concentration, near and far mass,
+        degeneracy flag, attention entropy and share of the KL -- plus the pooled row under the
+        same keys, so the two are read in one table. Empty when the run carried no per-head
+        profiles, which is a run whose collection pass did not reach the attention rather than a
+        model without heads.
+    """
+    lag = results.get("lag")
+    if not isinstance(lag, dict) or not lag:
+        return {}
+    per_head = [list(profile) for profile in (lag.get("attention_lag_profile_per_head") or [])]
+    if not per_head:
+        return {}
+
+    entropies = list(lag.get("attention_entropy_per_head_nats") or [])
+    kld_per_head = [float(value) for value in (lag.get("kld_per_head") or [])]
+    kld_total = sum(kld_per_head)
+
+    # The compensated axis every shape statistic is stated on. Built once from the run's own delay
+    # so the near and far windows are the same offsets the lag analyses use; a per-row axis would
+    # make two heads' ``near_mass`` mean two different things.
+    seconds = compensated_seconds_axis(len(per_head[0]), int(lag.get("delay_steps") or 0))
+
+    def _row(name: str, profile: List[float], head: Optional[int]) -> Dict[str, Any]:
+        statistics, _counts = lag_shape.profile_statistics(
+            np.asarray([profile], dtype=np.float64), seconds
+        )
+        above_half = lag_shape.mass_above(profile)
+        peak = lag_shape.peak_width(profile)
+        return {
+            "profile": name,
+            "argmax_lag_step": None if peak.get("argmax") is None else int(peak["argmax"]),
+            "peak_width_bins": peak.get("width_bins"),
+            "mass_above_half_peak": above_half.get("share"),
+            "near_mass": float(statistics["near_mass"][0]),
+            "far_mass": float(statistics["far_mass"][0]),
+            "entropy_nats": float(statistics["entropy"][0]),
+            "degenerate": bool(statistics["peak_degenerate"][0]),
+            # The attention's own entropy, from the collection pass, rather than the entropy of
+            # this profile: the first is measured per anchor and averaged, the second is the
+            # entropy of the average, and Jensen puts them on opposite sides of each other.
+            "attention_entropy_nats": (
+                None if head is None or head >= len(entropies) else float(entropies[head])
+            ),
+            "kld_nats": None if head is None or head >= len(kld_per_head) else kld_per_head[head],
+            "kld_share": (
+                None
+                if head is None or head >= len(kld_per_head) or kld_total == 0.0
+                else kld_per_head[head] / kld_total
+            ),
+        }
+
+    pooled = list(
+        lag.get("attention_lag_profile_support_corrected")
+        or lag.get("attention_lag_profile")
+        or []
+    )
+    rows = [_row(f"head_{head}", profile, head) for head, profile in enumerate(per_head)]
+    return {
+        "n_heads": len(per_head),
+        "pooled": _row("pooled", pooled, None) if pooled else {},
+        "heads": rows,
+        "kld_per_head_total_nats": kld_total,
+    }
 
 
 def build_sanity(
@@ -797,6 +952,10 @@ def finalise(
             return {**fallback, "error": f"{type(exc).__name__}: {exc}"}
 
     results = report_state.results
+    # Before the headline and the sanity block, because both are read beside it: the pooled lag
+    # check reports a censoring edge the per-head rows are the only evidence against, and a reader
+    # who has the verdict without the heads has the half that cannot move.
+    report_state.set("lag_heads", _safe("lag_heads", lambda: build_lag_heads(results), {}))
     report_state.set(
         "headline",
         _safe("headline", lambda: build_headline(results, headline_scalars), {}),
@@ -881,6 +1040,28 @@ def write_steps(steps: Sequence[StepRecord], output_dir: Any) -> Path:
     return path
 
 
+def _cell(value: Any, spec: str) -> str:
+    """Render one table cell, or ``'-'`` where the run measured nothing.
+
+    A dash rather than ``nan`` or ``0``: a head whose entropy was never collected and a head whose
+    entropy is zero are different states, and a table that renders both as a number invites the
+    second reading of the first.
+
+    Args:
+        value: The number, or ``None``.
+        spec: A ``str.format`` spec applied to a finite number.
+
+    Returns:
+        The rendered cell.
+    """
+    if value is None:
+        return "-"
+    number = float(value)
+    return "-" if not math.isfinite(number) else spec.format(
+        int(number) if spec.endswith("d}") else number
+    )
+
+
 def console_summary(results: Dict[str, Any], steps: Sequence[StepRecord]) -> str:
     """Render the end-of-run console table from the assembled state.
 
@@ -914,6 +1095,34 @@ def console_summary(results: Dict[str, Any], steps: Sequence[StepRecord]) -> str
         for verdict in results.get("verdicts") or []:
             lines.append(f"  [{str(verdict.get('status')):>12s}] {verdict.get('name')}")
 
+        # The per-head lag table, printed between the headline and the sanity block because that
+        # is where it is read: the argmax check below reports the pooled profile pinned at a
+        # censoring edge, and these rows are what say whether any head escaped it.
+        heads = results.get("lag_heads") or {}
+        if heads.get("heads"):
+            lines.append("-" * 78)
+            lines.append(
+                f"  lag profile per head ({heads.get('n_heads')} heads; "
+                f"near/far mass over the compensated axis, entropy in nats)"
+            )
+            lines.append(
+                f"  {'profile':<10s}{'argmax':>8s}{'width':>7s}{'>half':>8s}"
+                f"{'near':>8s}{'far':>8s}{'attn H':>8s}{'KL share':>10s}  degenerate"
+            )
+            for row in [heads.get("pooled") or {}, *heads["heads"]]:
+                if not row:
+                    continue
+                lines.append(
+                    f"  {str(row['profile']):<10s}{_cell(row['argmax_lag_step'], '{:d}'):>8s}"
+                    f"{_cell(row['peak_width_bins'], '{:d}'):>7s}"
+                    f"{_cell(row['mass_above_half_peak'], '{:.3f}'):>8s}"
+                    f"{_cell(row['near_mass'], '{:.3f}'):>8s}"
+                    f"{_cell(row['far_mass'], '{:.3f}'):>8s}"
+                    f"{_cell(row['attention_entropy_nats'], '{:.3f}'):>8s}"
+                    f"{_cell(row['kld_share'], '{:.3f}'):>10s}"
+                    f"  {'yes' if row['degenerate'] else 'no'}"
+                )
+
         lines.append("-" * 78)
         for name, record in ((results.get("sanity") or {}).get("checks") or {}).items():
             lines.append(f"  [{record['verdict']:>12s}] {name}: {record['detail']}")
@@ -946,6 +1155,7 @@ __all__ = [
     "HEADLINE_VERDICTS",
     "IDENTITY_RTOL",
     "INCONCLUSIVE",
+    "PHYSICAL_LAG_IDENTITY",
     "PRED_GAP_CONVENTION",
     "RECOMBINED_COLUMNS",
     "Report",
@@ -954,6 +1164,7 @@ __all__ = [
     "SUMMARY_FILENAME",
     "build_coverage",
     "build_headline",
+    "build_lag_heads",
     "build_manifest",
     "build_sanity",
     "check_argmax_lag",

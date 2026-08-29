@@ -1,0 +1,101 @@
+# The lag-identifiability fixture's configuration: a tiny model at the PRODUCTION lag geometry,
+# fitted on the committed planted-delay shard.
+#
+# WHAT THIS CONFIG IS FOR. `tiny.yaml` beside it exists to run the machinery cheaply and asserts
+# nothing about what the model learns. This one is a MEASUREMENT: the shard it reads carries a
+# source-to-target delay planted at the raw level and stamped on the file, so the lag readout has a
+# ground truth to be scored against. It is read by `lag_recovery_check.py`, and the numbers it
+# produces are only comparable across runs while this file does not move -- so ITS GEOMETRY IS
+# PINNED. Do not retune `max_lag`, `horizon`, `warmup_period`, `anchor_stride`,
+# `causal_align_reference`, `causal_align_reference_source` or the shard paths to make a run look
+# better; a check whose instrument moves between two measurements is not a comparison.
+#
+# THREE DELTAS AGAINST tiny.yaml, and each is load-bearing rather than a preference.
+#
+#   `max_lag: 90` -- the PRODUCTION lag window, restored. tiny.yaml shrinks it to 8 so a CPU
+#   forward is fast, and at L - 1 = 8 the band a planted delay of 45 steps is readable in
+#   ([delta - H, delta - 1] = [15, 44]) is entirely outside the searched window. The check would
+#   then report a failure that is a property of the window rather than of the architecture. The lag
+#   window is the one width that may not shrink here.
+#
+#   `anchor_stride: 1` -- every valid anchor decoded at every step, rather than one tile grid of
+#   five. Eight segments at ~4.5 tiles apiece is a few dozen supervised anchors per epoch, which is
+#   not enough for a lag to form in the minutes this check is allowed; densely it is ~1088. The
+#   evaluation pass decodes densely regardless, so this also removes the training/evaluation stride
+#   difference from the reading.
+#
+#   `likelihood: gaussian_nll` -- the PRODUCTION objective, restored. tiny.yaml ships `mse` to
+#   starve the decoder log-variance heads on purpose; the quantity this check reads is the
+#   source-conditioned KL, which is shaped by the objective the decoder is trained under, so the
+#   instrument must run the objective the finding is about.
+#
+# The beta ramp and the learning rate are shortened because the fit is forty epochs rather than
+# five thousand, and BOTH are stated here rather than inherited silently: at the shipped 50-epoch
+# ramp beta would still be climbing when the check stopped, and a KL that never turned on has no
+# lag structure to read for reasons that have nothing to do with the architecture.
+#
+#   python teb_vae/lag_attn_cfs/lag_recovery_check.py
+base: tiny.yaml
+
+general_config:
+  tag: lag_attn_cfs_planted
+  cuda_devices: [0]
+  # Enough for the KL to turn on after the ramp and to earn structure afterwards, and few enough
+  # that the whole check is minutes on one local device.
+  epochs: 40
+  # Ten times the tiny model's, because the fit is a thousand times shorter. The spike breaker's
+  # margins are inherited unchanged: the block is still H * C_keep = 30 * 98 coefficients.
+  lr: 0.001
+  # Far above `epochs`: the loss-curve HTML and the per-epoch diagnostic figure are renders this
+  # check has no reader for, and at plot_frequency 1 they cost more than the fit does.
+  plot_frequency: 100
+  folders_config: {out_dir_base: output/teb_vae_cfs_planted}
+
+model_config:
+  VAE_model:
+    # The three pinned deltas. See the header.
+    max_lag: 90
+    anchor_stride: 1
+    likelihood: gaussian_nll
+
+    # The aligned arm, PINNED. Both streams are re-indexed onto one clock, so the lag between a
+    # stored source step and a stored target step is the lag between the physical epochs they
+    # summarise -- which is what makes the planted raw delay of 45 steps a planted STORED delay of
+    # 45 steps. On the unaligned arm the two are separated by a channel-pair-indexed bias spanning
+    # over a thousand seconds, and the plant would be smeared across the window by the transform
+    # rather than sitting at one lag. Restated here rather than inherited because it is the
+    # instrument's own geometry.
+    causal_align_reference: target_max
+
+    # ONE clock for both streams, PINNED, and this null is load-bearing rather than inherited. The
+    # shipped configuration moves the source onto a faster reference of its own, which subtracts a
+    # constant from every lag the source reports: at the shipped 288.2672 s the source content
+    # shifts 25 stored steps earlier, so the plant's readable band [15, 44] would become [-10, 19]
+    # and half of it would fall off the near edge of the window. The check would then report a
+    # failure that is a property of the instrument's alignment rather than of the architecture --
+    # which is exactly what pinning the instrument exists to prevent. The shard's planted delay is
+    # 45 STORED steps only while the two streams read on one clock.
+    causal_align_reference_source: null
+
+    # Five epochs, not fifty: beta must reach its endpoint early enough that the remaining epochs
+    # are spent earning coupling rather than waiting for the term that rewards it.
+    beta_schedule:
+      kind: linear_warmup
+      start: 0.0
+      end: 1.0
+      warmup_epochs: 5
+
+dataset_config:
+  # The PLANTED pair, and only it. Repo-root-relative, like every other config in this tree. The
+  # shard carries `planted_delay_steps` and the measured coupled/control channel indices as root
+  # attributes, so the check reads the geometry off the file rather than assuming it.
+  vae_train_datasets: [teb_vae/lag_attn/tests/fixtures/tiny_shard_causal_planted.hdf5]
+  vae_test_datasets: [teb_vae/lag_attn/tests/fixtures/tiny_shard_causal_planted.hdf5]
+  stat_path: teb_vae/lag_attn/tests/fixtures/tiny_stats_causal_planted.hdf5
+
+advanced_config:
+  callbacks:
+    # The per-epoch validation diagnostic figure, off. It draws two PDFs per rendered epoch and
+    # nothing here reads them; the check's own output is the lag profile.
+    lag_attn_rws_plotting:
+      enabled: false

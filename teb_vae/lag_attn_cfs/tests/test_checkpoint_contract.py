@@ -76,6 +76,29 @@ def blob():
     return _lightning_style_checkpoint(_wrapped(SeqVaeLagAttnCfs, _kwargs()))
 
 
+@pytest.fixture
+def blob_with_switches():
+    """A checkpoint written at the shipped switches rather than at their off-states.
+
+    A second fixture rather than a change to the first: the tests above are about what a checkpoint
+    carries at *any* configuration, and moving the base arm under them would make each of them a
+    test of this arm instead.
+    """
+    return _lightning_style_checkpoint(
+        _wrapped(SeqVaeLagAttnCfs, _kwargs(**_SHIPPED_SWITCHES))
+    )
+
+
+#: The architecture switches this cell ships, at the values its config carries.
+_SHIPPED_SWITCHES = dict(
+    lag_kv_source="conv_stem",
+    prior_availability_input=True,
+    persistence_residual=True,
+    horizon_weight_halflife_steps=5.0,
+    alibi_slope_scale=0.0,
+)
+
+
 # ---------------------------------------------------------------------------------------
 # What the blob carries
 # ---------------------------------------------------------------------------------------
@@ -278,3 +301,38 @@ def test_a_checkpoint_from_another_warm_up_budget_is_refused():
     rebuilt = SeqVaeLagAttnCfs(**other_blob["model_kwargs"])
     assert rebuilt.decoder_out_channels == len(_OTHER_KEEP_INDEX)
     assert load_checkpoint_strict(rebuilt, other_blob) is not None
+
+
+def test_the_switches_the_revision_added_survive_and_carry_their_values(blob_with_switches):
+    """The same rule as above for the six architecture switches, and one they need more.
+
+    A missing width shows up as a shape mismatch on load. A missing **switch** does not: the
+    constructor has a default for every one of them, so a checkpoint that dropped one would rebuild
+    at the OFF value -- a different architecture, loading cleanly, reporting numbers under the arm's
+    name. The evaluation reconciles three of them against the config for exactly this reason, and
+    that reconciliation can only work if they are on the blob.
+
+    The values are asserted, not only the keys: a stamp carrying ``lag_kv_source`` at whatever the
+    default is would satisfy a presence check and still describe the wrong model.
+    """
+    stamped = blob_with_switches["model_kwargs"]
+
+    for flag, value in _SHIPPED_SWITCHES.items():
+        assert flag in stamped, f"{flag} missing from model_kwargs"
+        assert stamped[flag] == value, flag
+
+
+def test_the_horizon_weight_is_absent_from_the_state_dict_and_present_in_the_kwargs(
+    blob_with_switches,
+):
+    r"""The one switch whose tensor deliberately does not travel, and why both halves matter.
+
+    ``horizon_weight_halflife_steps`` is a **number** the constructor turns into an $(H,)$ buffer,
+    and the buffer is non-persistent. So the half-life is recoverable from the checkpoint -- an
+    arm's objective is part of what it was -- while the tensor is not, which is what keeps a
+    checkpoint loadable at another horizon. A persistent buffer would put $H$ into the state dict
+    and make every cross-horizon reload a shape error for a tensor that is a pure function of two
+    numbers already on the blob.
+    """
+    assert "horizon_weight_halflife_steps" in blob_with_switches["model_kwargs"]
+    assert not any("horizon_weight" in key for key in blob_with_switches["state_dict"])

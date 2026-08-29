@@ -31,14 +31,28 @@ def test_exactly_one_decoder_instance_exists(tiny_kwargs):
     assert not any(isinstance(m, ResidualFutureDecoder) for m in model.modules())
 
 
-def test_the_decoder_forward_accepts_exactly_one_tensor(tiny_kwargs):
-    """Signature introspection, so a later edit cannot quietly add a bypass argument."""
-    forward = type(_model(tiny_kwargs).decoder).forward
+def test_the_decoder_forward_accepts_exactly_the_state_and_a_target_only_persistence(tiny_kwargs):
+    """Signature introspection, so a later edit cannot quietly add a bypass argument.
+
+    The admitted set is exactly two names. ``decoder_state`` is the latent path. ``persistence`` is
+    the target's own value at the anchor -- a tensor this cell's raw-target composition never
+    supplies, since :attr:`persistence_weight` is absent unless the decoder was built for it, and
+    the decoder refuses a call that disagrees with how it was built. It is admitted here rather
+    than forbidden because it carries no source content by construction and the caller hands the
+    **same** tensor to both invocations, so the base-minus-full gap stays a pure source readout;
+    a third name would be a bypass and is what this pin exists to catch.
+    """
+    decoder = _model(tiny_kwargs).decoder
+    forward = type(decoder).forward
     parameters = list(inspect.signature(forward).parameters.values())
-    assert [p.name for p in parameters] == ["self", "decoder_state"]
+    assert [p.name for p in parameters] == ["self", "decoder_state", "persistence"]
     assert all(
         p.kind is inspect.Parameter.POSITIONAL_OR_KEYWORD for p in parameters
     ), "no *args/**kwargs escape hatch either"
+    # Off on this cell, and off means the parameter is not built rather than merely unused -- so
+    # the second name cannot carry anything here even if a call site started passing it.
+    assert decoder.persistence_weight is None
+    assert inspect.signature(forward).parameters["persistence"].default is None
 
 
 def test_both_invocations_emit_raw_shaped_forecasts(tiny_kwargs, inputs):

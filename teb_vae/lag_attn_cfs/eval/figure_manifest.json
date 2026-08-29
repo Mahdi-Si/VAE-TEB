@@ -39,6 +39,9 @@
     "latent": [
       "kl_spectrum.pdf"
     ],
+    "occlusion": [
+      "occlusion_horizon_delta.pdf"
+    ],
     "second_stage": [
       "second_stage_trajectory_kl.pdf",
       "second_stage_trajectory_pred_gap.pdf",

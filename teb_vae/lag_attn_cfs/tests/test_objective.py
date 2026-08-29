@@ -425,3 +425,79 @@ def test_the_shipped_block_is_comparable_to_no_sibling() -> None:
     assert model.horizon == 30
     assert model.horizon * model.decoder_out_channels == _SHIPPED_BLOCK
     assert _SHIPPED_BLOCK != 30 * 78
+
+
+# =================================================================================================
+# The horizon weighting, where it touches the block arithmetic
+#
+# The reconstruction is a SUM over the block, and the two loss-scale constants a run is guarded by
+# -- `gradient_clip_val` and the spike breaker's `additive_margin` -- are both stated in nats of
+# that sum. So a horizon weight is a change to the objective's units unless it is renormalised, and
+# it is: the weight sums to H, so what moves is the distribution across horizon steps and not the
+# scale. What is checked here is that the block arithmetic above survives it.
+# =================================================================================================
+def test_the_weighted_block_still_divides_by_the_same_cardinality() -> None:
+    r"""The sample score is the block over $H \cdot C_{\mathrm{keep}}$, and that denominator is a
+    count of coefficients rather than a sum of weights.
+
+    Which is the right choice and also the one that could silently be made wrong: dividing by
+    $\sum_\tau w_\tau \cdot C_{\mathrm{keep}}$ would give the same number today, because the weight
+    sums to $H$ -- and would start giving a different one the day the renormalisation moved. So the
+    relation is asserted under the weight, against the same hand-written cardinality.
+    """
+    kwargs = shipped_warmup_kwargs(horizon_weight_halflife_steps=15.0)
+    model = build(kwargs).eval()
+    streams = make_streams(kwargs)
+    out = _forward(model, streams, torch.zeros(BATCH, dtype=torch.long))
+
+    metrics = model.compute_loss(
+        out, torch.cat(streams[:2], dim=-1), weight=_weight(model)
+    )["metrics"]
+
+    assert model.horizon * model.decoder_out_channels == _SHIPPED_BLOCK
+    for branch in ("full", "base"):
+        assert float(metrics[f"nll_{branch}_sample"]) == pytest.approx(
+            float(metrics[f"nll_{branch}_block"]) / _SHIPPED_BLOCK, rel=1e-6
+        )
+
+
+def test_the_weight_moves_the_block_by_far_less_than_it_moves_a_horizon_step() -> None:
+    r"""The property both loss-scale constants rest on, measured on the real objective rather than
+    on the weight vector alone.
+
+    Two claims, and the second is what makes the first non-vacuous. The weighted block is close to
+    the unweighted one, so a run's clip and margin do not go out of date. And the weight is a real
+    reweighting -- the per-horizon-step partial sums move substantially -- so the first is not the
+    trivial statement that the weight did nothing.
+
+    The tolerance is loose on purpose. Exact equality would hold only on a score that is flat in
+    $\tau$, and this one is not: a forecast is worse at the far steps, so redistributing mass
+    towards the near ones moves the total a little. What is refused is a factor, not a percent.
+    """
+    kwargs = shipped_warmup_kwargs()
+    streams = make_streams(kwargs)
+    features = torch.cat(streams[:2], dim=-1)
+
+    scores = {}
+    for name, halflife in (("uniform", None), ("weighted", 15.0)):
+        model = build(dict(kwargs, horizon_weight_halflife_steps=halflife)).eval()
+        out = _forward(model, streams, torch.zeros(BATCH, dtype=torch.long))
+        scores[name] = float(
+            model.compute_loss(out, features, weight=_weight(model))["metrics"][
+                "nll_full_block"
+            ]
+        )
+
+    ratio = scores["weighted"] / scores["uniform"]
+    assert 0.9 < ratio < 1.1, (
+        f"the horizon weight moved the block by {ratio:.3f}x, so gradient_clip_val and the spike "
+        f"breaker's additive_margin -- both stated in nats of this sum -- are out of date"
+    )
+
+    # Non-vacuity: the weight itself is far from flat, so the ratio above is a property of the
+    # renormalisation rather than of a mechanism that is not running.
+    from teb_vae.lag_attn_rws.nets.losses import horizon_decay_weight
+
+    weight = horizon_decay_weight(15.0, int(kwargs["horizon"]))
+    assert float(weight[0]) / float(weight[-1]) > 3.0
+    assert float(weight.sum()) == pytest.approx(float(kwargs["horizon"]), rel=1e-6)

@@ -204,3 +204,47 @@ def test_the_raw_grid_moves_no_forecast_shape(tiny_warmup) -> None:
 
     assert first["mu_base"].shape == second["mu_base"].shape
     assert torch.equal(first["anchor_index"], second["anchor_index"])
+
+
+# =================================================================================================
+# The one key the persistence residual adds
+#
+# `persistence` is the target's own stored value at each anchor, and it is on the forward dict for a
+# reason the shape alone does not say: three consumers need the SAME tensor. Both decoder calls take
+# it, or the base-minus-full gap stops being a pure source readout; and the permutation control's
+# re-decode takes it, or the shuffle gap shifts for a reason that has nothing to do with the source.
+# Recomputing it at each site would be three chances to gather a different row.
+# =================================================================================================
+def test_the_forward_returns_no_persistence_key_when_the_residual_is_off(outputs) -> None:
+    """The off-state on the contract itself. A key present and ``None`` would be indistinguishable
+    from a mechanism that ran and produced nothing, and every consumer would have to test for it."""
+    _model, out = outputs
+
+    assert "persistence" not in out
+
+
+def test_the_persistence_key_is_the_targets_own_value_at_each_anchor() -> None:
+    r"""$(B, A_{\max}, C_{\mathrm{keep}})$, gathered from the TARGET stream on the kept axis.
+
+    Target-only is the invariant: the residual adds $w_{	au,c}\, y_{t,c}$ to the decoder mean, and
+    if $y_t$ carried any source content the no-bypass argument would fail and ``pred_gap`` would
+    stop being a source readout. Asserted against a hand-built gather of the target features, so a
+    tensor that had come to be built from anything else fails rather than merely being the right
+    shape.
+    """
+    kwargs = tiny_warmup_kwargs(anchor_stride=TINY_STRIDE, persistence_residual=True)
+    model = build(kwargs).eval()
+    y_st, y_ph, u_stream = make_streams(kwargs)
+    torch.manual_seed(0)
+    with torch.no_grad():
+        out = model(y_st, y_ph, u_stream, 1)
+
+    features = torch.cat([y_st, y_ph], dim=-1)
+    keep = model.target_gate.keep_index.to(torch.long)
+    anchors = out["anchor_index"]
+    expected = features[:, :, keep].gather(
+        1, anchors[:, :, None].expand(-1, -1, keep.numel())
+    )
+
+    assert out["persistence"].shape == (BATCH, anchors.shape[1], keep.numel())
+    assert torch.equal(out["persistence"], expected)

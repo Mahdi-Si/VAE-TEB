@@ -415,15 +415,24 @@ def test_the_mixin_section_states_why_inheritance_does_not_work(design):
 
 
 def test_the_lean_limits_carry_their_replacement_triggers(design):
-    """A ``lean-limit`` note without a measurable trigger is a permanent excuse. Exactly three here,
+    """A ``lean-limit`` note without a measurable trigger is a permanent excuse. Exactly four here,
     all inherited from the conv-LSTM cell of this row: the anchor floor that is a policy, the members
-    written out rather than shared, and the absent evaluation package."""
+    written out rather than shared, the absent evaluation package, and the clock the prior cannot
+    cancel.
+
+    The persistence-residual decline the conv-LSTM cell of this row records as a fifth note is
+    **not** repeated here, and that is the same rule the other three follow: this record cites its
+    row-mate rather than restating it, so a limitation lives in one place and is revised in one
+    place. What is here is the note this cell has to carry itself, because the mechanism it limits
+    is built here.
+    """
     flat = _flat(design)
 
-    assert len(re.findall(r"^> lean-limit: ", design, re.MULTILINE)) == 3
+    assert len(re.findall(r"^> lean-limit: ", design, re.MULTILINE)) == 4
     assert "when a run shows the anchor count rather than the source pathway" in flat
     assert "when a third consumer of any of them appears" in flat
     assert "when a result from these cells is to be reported as a measurement" in flat
+    assert "when the owner accepts a change to the posterior parameterisation" in flat
 
 
 def test_the_design_states_that_there_is_no_evaluation_package(design):

@@ -35,6 +35,9 @@ from loguru import logger  # noqa: E402
 
 from teb_vae.lag_attn import figure_primitives  # noqa: E402
 from teb_vae.lag_attn_cfs import sample_page  # noqa: E402
+from teb_vae.lag_attn_cfs import causal_warmup  # noqa: E402
+from teb_vae.lag_attn_cfs import task as task_module  # noqa: E402
+from teb_vae.lag_attn_crws import task as raw_task_module  # noqa: E402
 from teb_vae.lag_attn_cfs.causal_warmup import SOURCE_BLOCKS  # noqa: E402
 from teb_vae.lag_attn_fs import sample_page as feature_page  # noqa: E402
 from teb_vae.lag_attn_rws import plotting  # noqa: E402
@@ -853,17 +856,116 @@ def test_every_reserved_extra_row_is_drawn_and_every_drawn_row_is_reserved(task,
 def test_the_page_carries_the_physical_delay_caveat(task, stub_batch):
     r"""One-sidedness and zero latency are different properties and this family buys only the
     first. The forecast claim needs no correction -- a coefficient at $t$ is a function of the past
-    -- but a peak at lag $\ell$ is an attribution over stored coefficients, and the correction to a
-    physical delay is channel-dependent and of the same order as the lag search itself. Asserted as
-    a string, so it cannot be dropped by an edit that keeps the figure rendering."""
+    -- but every time axis on the page is stored-coefficient time, the lag panels' vertical one and
+    the horizontal one the input rows share with the raw rows alike. The caveat must therefore name
+    both axes and state what alignment does to the correction: it collapses a channel-dependent
+    $\tau_c$ into one constant $\kappa\tau_{\mathrm{ref}}$ per stream. Asserted as a string, so it
+    cannot be dropped by an edit that keeps the figure rendering."""
     figure = _render(task(), stub_batch)
     try:
         drawn = [text.get_text() for text in figure.texts]
         assert sample_page.LAG_TIME_CAVEAT in drawn
         for token in ("stored-coefficient time", "group delay", "$-20$ s"):
             assert token in sample_page.LAG_TIME_CAVEAT
+        # The alignment half. Without these the sentence is the pre-alignment one, which tells a
+        # reader the correction is per channel and unrecoverable when it is one logged number.
+        for token in (
+            "input rows",
+            "reference_delay_s",
+            "source_reference_delay_s",
+            r"\kappa",
+        ):
+            assert token in sample_page.LAG_TIME_CAVEAT
+        # The constant is interpolated from the shift's own factor, never typed.
+        assert f"{causal_warmup.ALIGNMENT_DELAY_FACTOR:g}" in sample_page.LAG_TIME_CAVEAT
     finally:
         plt.close(figure)
+
+
+def test_the_x_label_states_the_clock_the_rows_content_sits_on(task, stub_batch):
+    r"""The row is drawn at the model's step index while the raw rows it shares a column with are
+    in physical time, so its content sits $\kappa\tau_{\mathrm{ref}}$ to the left of where the
+    column puts it -- $352$ s on the shipped target clock, over a quarter of the drawn window.
+    Named on the axis it is about rather than in the title, which already renders wider than its
+    own axes; and the number must come from the same factor the shift does."""
+    module = task()
+    model = module.orig_model
+    inputs = module._build_forward_inputs(stub_batch)
+
+    reference = {"target": 402.1604, "source": 288.2672}
+    panels = sample_page.causal_stream_panels(
+        model, inputs, sample_index=0, reference_delay_s=reference
+    )
+    for panel in panels:
+        expected = causal_warmup.ALIGNMENT_DELAY_FACTOR * reference[panel.name]
+        assert f"content at $t-{expected:.0f}$ s" in panel.time_label
+        assert "step index" in panel.time_label
+
+    # An unaligned run has no single constant, and the clause is omitted rather than filled with a
+    # number that would be wrong on every channel but one.
+    plain = sample_page.causal_stream_panels(model, inputs, sample_index=0)
+    for panel in plain:
+        assert panel.time_label == "Time (s)"
+
+
+def test_the_clock_label_reaches_the_drawn_axis(task, stub_batch):
+    """The label is a panel field, and a field the shared row does not read is a field that says
+    nothing. Drawn rather than inspected, because the failure this guards is the row keeping its
+    hardcoded ``'Time (s)'``."""
+    module = task()
+    model = module.orig_model
+    inputs = module._build_forward_inputs(stub_batch)
+    panels = sample_page.causal_stream_panels(
+        model, inputs, sample_index=0,
+        reference_delay_s={"target": 402.1604, "source": 288.2672},
+    )
+
+    figure, ax = plt.subplots(figsize=(14, 3))
+    try:
+        shared_page._input_stream_row(
+            ax, panels[0], t_max=1200.0, seconds_per_step=figure_primitives_step()
+        )
+        assert ax.get_xlabel() == panels[0].time_label
+    finally:
+        plt.close(figure)
+
+
+def figure_primitives_step() -> float:
+    """The decimated step in seconds, from the one module that defines it."""
+    from teb_vae.lag_attn.nets.lag_report import SECONDS_PER_STEP
+
+    return float(SECONDS_PER_STEP)
+
+
+def test_the_task_hands_the_builder_the_budgets_own_clocks():
+    r"""The net carries the per-channel shifts and not $\tau_{\mathrm{ref}}$, so the clock can only
+    come from the resolved budget the task holds. Bound as a keyword on the builder rather than
+    threaded through the shared page hook, whose signature is the two-sided family's and describes a
+    guard with no reference at all -- and read through the *class* attribute, because the raw cell
+    binds this very descriptor and would otherwise need a second copy of the same plumbing."""
+    from types import SimpleNamespace
+
+    hook = task_module.SeqVaeLagAttnCfsTask.input_stream_panels
+    assert raw_task_module.SeqVaeLagAttnCrwsTask.input_stream_panels is hook, (
+        "the raw cell binds this descriptor; a divergence here is two pages drifting apart"
+    )
+
+    unaligned = hook.fget(SimpleNamespace(warmup_budget=None))
+    assert unaligned is sample_page.causal_stream_panels
+    assert not hasattr(unaligned, "keywords")
+
+    aligned = hook.fget(
+        SimpleNamespace(
+            warmup_budget=SimpleNamespace(
+                reference_delay_s=402.1604, source_clock_delay_s=288.2672
+            )
+        )
+    )
+    assert aligned.func is sample_page.causal_stream_panels
+    assert aligned.keywords["reference_delay_s"] == {
+        "target": 402.1604,
+        "source": 288.2672,
+    }
 
 
 def test_the_channel_rule_and_the_keep_index_mapping_are_the_siblings(task, stub_batch):

@@ -41,9 +41,21 @@ from .conftest import _REPO_ROOT
 #: **ordered** sequence, not a set -- the order is what the reconciliation record is built in and
 #: what a reader of two runs' preflight files compares down.
 #:
-#: Fourteen of the sixteen are the raw cells'. The two this cell adds are the two that decide the
+#: Fourteen of the nineteen are the raw cells'. Two this cell adds are the ones that decide the
 #: population and the lag support: ``anchor_stride`` sets how many anchors a forward scores, and
 #: ``lag_floor`` is one of the three quantities the lag-support margin is made of.
+#:
+#: The last three are architecture switches, and they are here for the same reason the widths are:
+#: the evaluation rebuilds the model from the **checkpoint's** own ``model_kwargs``, so a config
+#: disagreeing about one of them would not fail -- it would report one architecture's numbers under
+#: another's stated description. ``lag_kv_source`` changes what the lag attention reads and
+#: therefore what every lag readout means; ``prior_availability_input`` changes what the KL is a
+#: divergence between; ``persistence_residual`` changes the predictor every ``nll_*`` and every
+#: skill comparison is measured on.
+#:
+#: ``horizon_weight_halflife_steps`` is deliberately NOT here, on the same ground as the objective
+#: weights: it re-weights the *training* criterion's horizon axis and this pipeline scores every
+#: block unweighted, so a half-life edited after the fit contradicts no number the run reports.
 CFS_GEOMETRY_KEYS = (
     "sequence_length",
     "d_model",
@@ -61,6 +73,9 @@ CFS_GEOMETRY_KEYS = (
     "causal_norm",
     "anchor_stride",
     "lag_floor",
+    "prior_availability_input",
+    "lag_kv_source",
+    "persistence_residual",
 )
 
 #: What the driver resolves the budget into and stamps on the checkpoint. Constructor parameters,
@@ -74,7 +89,18 @@ RESOLVED_WARMUP_KWARGS = (
 
 #: The analyses this cell registers on its binding, in run order. Written out for the same reason
 #: the geometry keys are: importing the registry and comparing it to itself would pass on any edit.
-CELL_SPECIFIC_ANALYSES = ("warmup", "source_null", "lag_clocks", "spectral_skill")
+#: ``occlusion`` sits between the two cheap causal readouts and the two that only read tables,
+#: which is a cost ordering rather than a dependency: it re-encodes and decodes once per band
+#: per batch, and it is the second analysis in this package permitted to reach for the model on
+#: the context, because an intervention on the model's INPUT cannot be served by any table a
+#: forward already wrote.
+CELL_SPECIFIC_ANALYSES = (
+    "warmup",
+    "source_null",
+    "occlusion",
+    "lag_clocks",
+    "spectral_skill",
+)
 
 #: The headline scalars those analyses add, in registration order. An arm table reads this block by
 #: name, so the set of names is a contract with every future comparison rather than a detail of
@@ -96,6 +122,16 @@ CFS_HEADLINE_SCALARS = [
     "spectral_gap_variability_nats",
     "spectral_gap_beat_to_beat_nats",
     "spectral_gap_unknown_nats",
+    # The interventional readout's own four, and the shape of the block is the finding: a band NAME
+    # first, because what the analysis reports is which lag range mattered most rather than a
+    # magnitude on a fixed axis; then the delta it cost, the horizon step it peaked at, and the
+    # fraction of that band's positions that were live at all. The last is what separates "the
+    # source did not matter at those lags" from "there was less source there to remove", and an arm
+    # table carrying the delta without it would confuse the two.
+    "occlusion_peak_band",
+    "occlusion_peak_band_delta_nats",
+    "occlusion_peak_band_horizon_step",
+    "occlusion_peak_band_live_fraction",
 ]
 
 
@@ -344,6 +380,19 @@ def test_every_registered_headline_path_resolves_against_the_blocks_the_analyses
                              "beat_to_beat", "unknown")
             }
         },
+        # The interventional readout's block. Its first entry is a band NAME rather than a number,
+        # which the stub carries deliberately: the headline builder must pass a string through
+        # untouched, and a builder that coerced every value to a float would turn the one entry
+        # saying WHICH lag range mattered into a NaN and resolve it as absent.
+        "occlusion": {
+            "headline": {
+                "band": "near",
+                "delta_total_nats": 14.94,
+                "peak_horizon_step": 5,
+                "live_fraction": 1.0,
+                "n_bands": 4,
+            }
+        },
         "verdicts": [],
     }
 
@@ -355,6 +404,7 @@ def test_every_registered_headline_path_resolves_against_the_blocks_the_analyses
     assert unresolved == []
     assert headline["coupling_minus_clock_nats"] == 1.75
     assert headline["anchors_per_sample"] == 152.0
+    assert headline["occlusion_peak_band"] == "near"
 
 
 def test_the_headline_block_is_unchanged_when_a_binding_registers_nothing() -> None:

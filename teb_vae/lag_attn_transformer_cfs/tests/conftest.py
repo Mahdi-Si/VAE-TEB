@@ -485,15 +485,29 @@ def trf_cohort_overrides(cohort_shards, cohort_stats, tmp_path_factory) -> Path:
     the other cell's file here would make the check unable to fail.
 
     Session-scoped and written once; treat as read-only.
+
+    Three leaves are repointed rather than two, and the third is not a placeholder. The occlusion
+    bands are stated in **production lag indices** and the schema refuses a band reaching past the
+    model's own ``max_lag`` -- correctly, because a band whose top the attention cannot read would
+    score nothing there while its name claimed otherwise. The tiny geometry these fixtures run at
+    shrinks that window, so the bands are rescaled to it rather than the refusal being loosened.
+    Rescaled through the causal cell's own helper, because the two cells' deltas are asserted equal
+    key for key and a second rescaling rule here could make them disagree.
     """
     import yaml
 
+    from teb_vae.lag_attn.config import load_config
     from teb_vae.lag_attn_cfs.eval.config_schema import load_eval_overrides
+    from teb_vae.lag_attn_cfs.tests.conftest import _tiny_occlusion_bands
     from teb_vae.lag_attn_transformer_cfs.eval.binding import TRF_CFS_BINDING
 
     overrides = load_eval_overrides(TRF_CFS_BINDING.overrides_path)
     overrides["dataset_config"]["vae_test_datasets"] = list(cohort_shards)
     overrides["dataset_config"]["stat_path"] = cohort_stats
+    tiny = Path(_REPO_ROOT) / "teb_vae" / "lag_attn_transformer_cfs" / "configs" / "tiny.yaml"
+    overrides["eval_config"]["occlusion_bands"] = _tiny_occlusion_bands(
+        int(load_config(str(tiny))["model_config"]["VAE_model"]["max_lag"])
+    )
     path = tmp_path_factory.mktemp("trf_eval_overrides") / "eval_overrides_repointed.yaml"
     path.write_text(yaml.safe_dump(overrides, sort_keys=False), encoding="utf-8")
     return path

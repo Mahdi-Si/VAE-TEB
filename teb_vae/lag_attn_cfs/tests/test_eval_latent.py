@@ -109,8 +109,11 @@ def pinned_prior_task(task, perturb_posterior):
     lo, _hi = module.orig_model.logvar_clamp
     original = head.forward
 
-    def _pinned(h_y):
-        mu_prior, _logvar_prior, raw_logvar_prior = original(h_y)
+    # ``clock`` is forwarded rather than dropped: the prior head takes it whenever the model was
+    # built with `prior_availability_input`, and a stub that swallowed it would make this fixture
+    # silently untestable on exactly the arm the family ships.
+    def _pinned(h_y, clock=None):
+        mu_prior, _logvar_prior, raw_logvar_prior = original(h_y, clock)
         # Just above the asymptote, which is where a saturated sigmoid actually lands -- the bound
         # is never reached exactly, and a test that placed it *at* lo would be testing a value the
         # model cannot produce.
@@ -275,8 +278,9 @@ def test_the_masked_saturation_framing_can_disagree_with_the_raw_one(
     head = model.prior_head
     original = head.forward
 
-    def _saturated_prefix(h_y):
-        mu_prior, logvar_prior, raw_logvar_prior = original(h_y)
+    # ``clock`` is forwarded rather than dropped; see `pinned_prior_task` for why.
+    def _saturated_prefix(h_y, clock=None):
+        mu_prior, logvar_prior, raw_logvar_prior = original(h_y, clock)
         mu_prior = mu_prior.clone()
         mu_prior[:, :warmup] = model.mu_scale
         return mu_prior, logvar_prior, raw_logvar_prior

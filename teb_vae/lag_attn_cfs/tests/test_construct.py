@@ -612,3 +612,210 @@ def test_the_old_delay_keywords_are_still_refused(tiny_align) -> None:
     for banned in ("target_delays", "source_delays"):
         with pytest.raises(TypeError, match=banned):
             SeqVaeLagAttnCfs(**dict(tiny_align, **{banned: TINY_TARGET_ALIGN_DELAYS}))
+
+
+# =================================================================================================
+# The revision's five switches, and the off-state of each
+#
+# Every mechanism this family added is a keyword whose off-state must reproduce the model that was
+# trained before it existed -- not approximately, and not "equivalently": bitwise, key for key. That
+# is what makes an arm comparable to a record, and it is what a checkpoint written under one
+# setting and read under another silently violates. So the off-states are pinned against a model
+# built with none of the keywords at all, which is the object graph an old saved kwargs dict
+# actually produces.
+#
+# Two of the five cannot be pinned by construction and are pinned where they live instead. The
+# horizon weighting is a loss-side switch, so its null state is an equality between loss VALUES and
+# is asserted in the objective owner's own file; the flat lag bias moves a seeded value rather than
+# a structure, so what is asserted here is the shape and the seeding rather than an absence.
+# =================================================================================================
+#: The five keywords the revision added to this constructor, at their off-values. Written out
+#: rather than derived from the signature's defaults: comparing the defaults against themselves
+#: would pass on any edit, and what has to hold is that these particular values are the ones that
+#: reproduce the pre-revision model.
+_SWITCHES_OFF = dict(
+    lag_kv_source="encoder",
+    prior_availability_input=False,
+    persistence_residual=False,
+    horizon_weight_halflife_steps=None,
+    alibi_slope_scale=1.0,
+)
+
+
+def test_the_switch_defaults_are_the_off_values() -> None:
+    """The defaults themselves, read off the signature. A default that moved would make every
+    "bitwise off" claim below true of a model nobody builds -- the configs all set these keys
+    explicitly, so the constructor's default is what an old checkpoint's kwargs dict falls back to
+    and is the only thing standing between it and a different architecture."""
+    defaults = {
+        name: parameter.default
+        for name, parameter in inspect.signature(SeqVaeLagAttnCfs.__init__).parameters.items()
+        if name in _SWITCHES_OFF
+    }
+
+    assert defaults == _SWITCHES_OFF
+
+
+def test_every_switch_at_its_off_value_is_bitwise_the_model_without_the_keywords(
+    tiny_warmup,
+) -> None:
+    """The whole off-state claim in one comparison, over the state dict and the buffer names.
+
+    Values as well as keys, because a switch that added a zero-initialised parameter would leave
+    the totals standing and change the object; and buffer names as well as parameters, because a
+    non-persistent buffer is invisible to a ``state_dict`` comparison and is exactly how the
+    horizon weight and the availability announcement are carried.
+    """
+    without = build(tiny_warmup)
+    explicit = build(dict(tiny_warmup, **_SWITCHES_OFF))
+
+    assert list(without.state_dict()) == list(explicit.state_dict())
+    for name, tensor in without.state_dict().items():
+        assert torch.equal(tensor, explicit.state_dict()[name]), name
+    assert sorted(dict(without.named_buffers())) == sorted(dict(explicit.named_buffers()))
+
+
+@pytest.mark.parametrize(
+    "keyword, absent",
+    [
+        ("prior_availability_input", "prior_head.clock_proj.weight"),
+        ("persistence_residual", "decoder.persistence_weight"),
+    ],
+)
+def test_an_off_switch_builds_no_parameter_at_all(tiny_warmup, keyword, absent) -> None:
+    """Absent rather than present-and-zero, and the difference is a distributed run's.
+
+    A parameter built and left inert has no gradient path, which is what
+    ``find_unused_parameters=False`` refuses -- so an off switch that built its tensor anyway would
+    turn every multi-GPU run of the baseline into an error, or into a flag that tolerates real dead
+    parameters as well. Both directions are checked: absent when off, present when on.
+    """
+    off = build(dict(tiny_warmup, **{keyword: False}))
+    on = build(dict(tiny_warmup, **{keyword: True}))
+
+    assert absent not in dict(off.named_parameters())
+    assert absent in dict(on.named_parameters())
+
+
+def test_the_horizon_weight_is_a_non_persistent_buffer_or_nothing(tiny_warmup) -> None:
+    r"""Null builds no buffer; a half-life builds one that a checkpoint does not carry.
+
+    Non-persistent is the load-bearing half. The weight is $(H,)$, so a persistent one would put
+    the horizon into the state dict and make a checkpoint unloadable at any other horizon -- for a
+    tensor that is a pure function of two numbers the constructor already has.
+    """
+    off = build(dict(tiny_warmup, horizon_weight_halflife_steps=None))
+    on = build(dict(tiny_warmup, horizon_weight_halflife_steps=5.0))
+
+    # Not registered at all when unset, rather than registered as None: the delegation sites read
+    # it with a default, so an absent buffer is what "no weighting" is spelled as.
+    assert "horizon_weight" not in dict(off.named_buffers())
+    assert "horizon_weight" in dict(on.named_buffers())
+    assert on.horizon_weight.shape == (on.horizon,)
+    assert float(on.horizon_weight.sum()) == pytest.approx(float(on.horizon), rel=1e-6)
+    assert not any("horizon_weight" in name for name in on.state_dict())
+
+
+def test_the_flat_lag_bias_seed_is_a_learnable_parameter_of_the_shipped_shape(
+    tiny_warmup,
+) -> None:
+    r"""The one switch whose off-state is a *value* rather than a structure, pinned as such.
+
+    ``alibi_slope_scale`` multiplies the seed of ``lag_score_bias``. At $0$ the seed is flat and at
+    $1$ it is $-s_h \ell$, and **both build the same learnable $(M, L)$ parameter** -- which is the
+    whole reason the flat arm is this key rather than ``lag_bias_init: 'normal'``, a mode that
+    registers no bias parameter at all. So what is asserted is that the two arms differ in the
+    tensor's values and in nothing else about it.
+    """
+    # `lag_bias_init` is named explicitly because the two are one decision and the tiny fixture
+    # leaves the mode at the constructor's default: the seed only exists under `alibi_decay`, so a
+    # scale set against any other mode reaches nothing.
+    flat = build(dict(tiny_warmup, lag_bias_init="alibi_decay", alibi_slope_scale=0.0))
+    decaying = build(dict(tiny_warmup, lag_bias_init="alibi_decay", alibi_slope_scale=1.0))
+    normal = build(dict(tiny_warmup, lag_bias_init="normal"))
+
+    seed_flat = dict(flat.named_parameters())["lag_attn.lag_score_bias"]
+    seed_decay = dict(decaying.named_parameters())["lag_attn.lag_score_bias"]
+
+    assert seed_flat.shape == seed_decay.shape
+    assert seed_flat.requires_grad and seed_decay.requires_grad
+    assert torch.equal(seed_flat, torch.zeros_like(seed_flat)), "the flat seed is not flat"
+    # Monotone in the lag on every head, which is what makes it a prior for lag 0.
+    assert torch.all(seed_decay[:, :-1] > seed_decay[:, 1:])
+    # And the mode that is NOT the flat arm, stated so the two cannot be confused: `normal` builds
+    # no bias parameter at all, so it is a third arm about a different object.
+    assert "lag_attn.lag_score_bias" not in dict(normal.named_parameters())
+
+
+# =================================================================================================
+# The lag attention's key/value memory
+# =================================================================================================
+def test_an_unknown_kv_source_is_refused_naming_the_choices(tiny_warmup) -> None:
+    """By name, with the admitted set in the message. The value reaches a branch that would
+    otherwise fall through to one of the arms, so an unrecognised string would silently train the
+    fall-through arm under the misspelt one's name."""
+    with pytest.raises(ValueError, match=r"lag_kv_source must be one of"):
+        build(dict(tiny_warmup, lag_kv_source="conv-stem"))
+
+
+@pytest.mark.parametrize("arm", ["conv_stem", "adapter"])
+def test_a_local_kv_arm_does_not_build_the_deep_source_encoder(tiny_warmup, arm) -> None:
+    """The deep encoder leaves the *model*, not just the lag path.
+
+    Nothing else consumes the source state, so under a local arm the encoder would be a whole stack
+    of parameters no forward reaches -- the same distributed hazard as an inert switch, at hundreds
+    of thousands of parameters rather than one matrix. Asserted by state-dict prefix rather than by
+    a total, because a total cannot say *which* stack went.
+    """
+    deep = build(dict(tiny_warmup, lag_kv_source="encoder"))
+    local = build(dict(tiny_warmup, lag_kv_source=arm))
+
+    assert [name for name in deep.state_dict() if name.startswith("source_encoder.")]
+    assert [name for name in local.state_dict() if name.startswith("source_encoder.")] == []
+    assert getattr(local, "source_encoder", None) is None
+
+
+def test_the_conv_stem_arm_builds_a_stem_and_the_adapter_arm_builds_nothing(
+    tiny_warmup,
+) -> None:
+    """What each local arm puts in the encoder's place, and what resolves the arm.
+
+    ``source_kv_body`` is the single place the arm becomes a module, and every consumer -- the
+    forward, both source controls, the prior clock, the norm-causalisation guard -- goes through it
+    or through ``encode_source_kv``. Pinning it here is pinning that they cannot disagree.
+    """
+    stem = build(dict(tiny_warmup, lag_kv_source="conv_stem"))
+    adapter = build(dict(tiny_warmup, lag_kv_source="adapter"))
+    deep = build(dict(tiny_warmup, lag_kv_source="encoder"))
+
+    assert stem.source_kv_body() is stem.source_kv_stem
+    assert adapter.source_kv_body() is None
+    assert deep.source_kv_body() is deep.source_encoder
+
+    # The adapter's own output IS the representation there, so the pathway is one module.
+    assert adapter.source_kv_modules() == (adapter.source_adapter,)
+    assert stem.source_kv_modules() == (stem.source_adapter, stem.source_kv_stem)
+
+
+@pytest.mark.parametrize("arm", ["encoder", "conv_stem", "adapter"])
+def test_the_kv_representation_is_the_pathway_composed_in_order(tiny_warmup, arm) -> None:
+    """``encode_source_kv`` is what the forward and both controls call, so what it computes has to
+    be exactly the pathway's modules in order -- a helper that dropped or reordered one would move
+    the keys, the values, the null control's re-encode and the prior's clock together, and every
+    one of them would still be the right shape."""
+    model = build(dict(tiny_warmup, lag_kv_source=arm)).eval()
+    gated = torch.randn(
+        2,
+        model.sequence_length,
+        model.source_gate.keep_index.numel(),
+        generator=torch.Generator().manual_seed(3),
+    )
+
+    with torch.no_grad():
+        encoded = model.encode_source_kv(gated)
+        expected = gated
+        for module in model.source_kv_modules():
+            expected = module(expected)
+
+    assert torch.equal(encoded, expected)
+    assert encoded.shape == (2, model.sequence_length, model.d_model)

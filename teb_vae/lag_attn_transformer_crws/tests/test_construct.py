@@ -207,14 +207,25 @@ def test_the_signature_is_the_architecture_parents_with_the_delays_replaced() ->
     A narrowed signature would forward no configuration at all and silently build an all-defaults
     model -- no error, no shape mismatch, a run at the wrong widths.
 
-    The two delay keywords are the only removals, and removing them is the point: a warm-up routed
-    under a delay name would reach ``ChannelDelay``, which shifts rather than masks, and would train
-    a different model with every shape intact.
+    Removing the two delay keywords is the point: a warm-up routed under a delay name would reach
+    ``ChannelDelay``, which shifts rather than masks, and would train a different model with every
+    shape intact.
+
+    The third removal is a different kind of decision and is stated as one. ``persistence_residual``
+    adds a term in the **target's** own stored value to the decoder mean; this row's target is the
+    raw signal, so there is no stored coefficient to persist and the mechanism is declined rather
+    than defaulted off. Absence from the signature is what makes it unreachable: the driver's
+    signature sweep cannot forward a key that is not here, so a config carrying it is refused by
+    name instead of training a model its own config does not describe.
     """
     parameters = inspect.signature(SeqVaeLagAttnTrfCrws.__init__).parameters
     base = inspect.signature(SeqVaeLagAttnTrfRws.__init__).parameters
 
-    assert set(base) - set(parameters) == {"target_delays", "source_delays"}
+    assert set(base) - set(parameters) == {
+        "target_delays",
+        "source_delays",
+        "persistence_residual",
+    }
     assert set(parameters) - set(base) == {
         "target_warmup_steps",
         "source_warmup_steps",
@@ -238,12 +249,17 @@ def test_the_forwarded_set_is_this_signature_minus_the_mixins_own_keywords() -> 
     Forty explicit ``name=name`` pairs would be the same dict with one silent failure mode: a
     keyword added to the architecture parent and forgotten here would be forwarded at its default,
     with nothing raising and no shape differing.
+
+    The right-hand union names the three the parent has and this row does not: the two delay
+    keywords the warm-ups replace, and the target-only persistence residual this row declines.
     """
     parameters = set(inspect.signature(SeqVaeLagAttnTrfCrws.__init__).parameters)
     base = set(inspect.signature(SeqVaeLagAttnTrfRws.__init__).parameters)
 
     forwarded = parameters - set(FORWARDED_EXCLUSIONS)
-    assert forwarded | {"self", "target_delays", "source_delays"} == base
+    assert (
+        forwarded | {"self", "target_delays", "source_delays", "persistence_residual"} == base
+    )
 
     source = Path(inspect.getfile(SeqVaeLagAttnTrfCrws)).read_text(encoding="utf-8")
     assert "locals().items()" in source and "FORWARDED_EXCLUSIONS" in source
@@ -763,3 +779,155 @@ def test_the_anchor_floor_rises_to_the_shifted_warmth(tiny_align, tiny_warmup) -
 
     assert build(dict(tiny_align, warmup_period=floor)) is not None
     assert build(dict(tiny_warmup, warmup_period=floor - 1)) is not None
+
+
+#: This cell's own class, bound once: half of the block below asserts a property of the *signature*
+#: and needs no model at all, and the other half builds through the package's own ``build`` helper
+#: so two builds differ only where a keyword made them.
+_CELL_CLS = SeqVaeLagAttnTrfCrws
+
+
+# =================================================================================================
+# The revision's switches: the four this row takes, and the one it declines
+#
+# Pinned per cell rather than once on the parent, because the failure this catches is *this* cell's:
+# the driver builds a run's kwargs by sweeping the constructor's signature and silently drops any
+# key the class does not re-list, so a switch threaded through the parent and forgotten here would
+# train the baseline under the arm's name with no error and no metric saying so.
+#
+# The decline is the mirror image and is asserted the same way. ``persistence_residual`` adds a term
+# in the TARGET's own stored coefficient to the decoder mean; this row's target is the raw signal,
+# whose per-step samples are a different object, so the mechanism is refused at the constructor
+# rather than shipped off. Absence from the signature is what makes it unreachable -- the sweep
+# cannot forward a key that is not there.
+# =================================================================================================
+#: The four keywords the revision added to this constructor, at their off-values. Written out
+#: rather than derived from the signature's defaults: comparing the defaults against themselves
+#: would pass on any edit, and what has to hold is that these particular values reproduce the
+#: pre-revision model.
+_SWITCHES_OFF = dict(
+    lag_kv_source="encoder",
+    prior_availability_input=False,
+    horizon_weight_halflife_steps=None,
+    alibi_slope_scale=1.0,
+)
+
+
+def test_every_switch_is_a_keyword_of_this_cell_at_its_off_default() -> None:
+    """Both halves of the sweep hazard: present, and defaulting off.
+
+    Present, because a key absent here is a key the driver cannot forward -- the arm would train as
+    the baseline. Defaulting off, because the default is what an old checkpoint's saved kwargs dict
+    falls back to, and a default that moved would silently rebuild an old run as a new architecture.
+    """
+    defaults = {
+        name: parameter.default
+        for name, parameter in inspect.signature(_CELL_CLS.__init__).parameters.items()
+        if name in _SWITCHES_OFF
+    }
+
+    assert defaults == _SWITCHES_OFF
+
+
+def test_the_persistence_residual_is_declined_rather_than_defaulted_off(tiny_warmup) -> None:
+    """The decline, asserted where it is enforced. The keyword is not on this signature at all, so
+    a config carrying it is refused by name instead of training a model its own config does not
+    describe -- and the parent's own guard refuses the mechanism on a raw-target architecture even
+    if the keyword were reached some other way."""
+    assert "persistence_residual" not in inspect.signature(_CELL_CLS.__init__).parameters
+
+    with pytest.raises(TypeError, match="persistence_residual"):
+        build(dict(tiny_warmup, persistence_residual=True))
+
+
+def test_every_switch_at_its_off_value_is_bitwise_the_model_without_the_keywords(
+    tiny_warmup,
+) -> None:
+    """The whole off-state claim in one comparison, over the state dict and the buffer names.
+
+    Values as well as keys, because a switch that added a zero-initialised parameter would leave
+    the totals standing and change the object; and buffer names as well as parameters, because a
+    non-persistent buffer is invisible to a ``state_dict`` comparison and is exactly how the
+    horizon weight and the availability announcement are carried.
+    """
+    without = build(tiny_warmup)
+    explicit = build(dict(tiny_warmup, **_SWITCHES_OFF))
+
+    assert list(without.state_dict()) == list(explicit.state_dict())
+    for name, tensor in without.state_dict().items():
+        assert torch.equal(tensor, explicit.state_dict()[name]), name
+    assert sorted(dict(without.named_buffers())) == sorted(dict(explicit.named_buffers()))
+
+
+def test_the_prior_clock_builds_no_parameter_when_it_is_off(tiny_warmup) -> None:
+    """Absent rather than present-and-zero, and the difference is a distributed run's: a parameter
+    built and left inert has no gradient path, which is what ``find_unused_parameters=False``
+    refuses. Both directions, so the absence is not the absence of a working mechanism."""
+    off = build(dict(tiny_warmup, prior_availability_input=False))
+    on = build(dict(tiny_warmup, prior_availability_input=True))
+
+    assert "prior_head.clock_proj.weight" not in dict(off.named_parameters())
+    assert "prior_head.clock_proj.weight" in dict(on.named_parameters())
+
+
+def test_the_horizon_weight_is_a_non_persistent_buffer_or_nothing(tiny_warmup) -> None:
+    r"""Null builds no buffer; a half-life builds one that a checkpoint does not carry.
+
+    Non-persistent is the load-bearing half. The weight is $(H,)$, so a persistent one would put
+    the horizon into the state dict and make a checkpoint unloadable at any other horizon -- for a
+    tensor that is a pure function of two numbers the constructor already has.
+    """
+    off = build(dict(tiny_warmup, horizon_weight_halflife_steps=None))
+    on = build(dict(tiny_warmup, horizon_weight_halflife_steps=5.0))
+
+    assert "horizon_weight" not in dict(off.named_buffers())
+    assert "horizon_weight" in dict(on.named_buffers())
+    assert on.horizon_weight.shape == (on.horizon,)
+    assert float(on.horizon_weight.sum()) == pytest.approx(float(on.horizon), rel=1e-6)
+    assert not any("horizon_weight" in name for name in on.state_dict())
+
+
+def test_an_unknown_kv_source_is_refused_naming_the_choices(tiny_warmup) -> None:
+    """By name, with the admitted set in the message. The value reaches a branch that would
+    otherwise fall through to one of the arms, so an unrecognised string would silently train the
+    fall-through arm under the misspelt one's name."""
+    with pytest.raises(ValueError, match=r"lag_kv_source must be one of"):
+        build(dict(tiny_warmup, lag_kv_source="conv-stem"))
+
+
+@pytest.mark.parametrize("arm", ["conv_stem", "adapter"])
+def test_a_local_kv_arm_does_not_build_the_deep_source_encoder(tiny_warmup, arm) -> None:
+    """The deep source encoder leaves the *model*, not just the lag path: nothing else consumes the
+    source state, so under a local arm it would be a whole stack of parameters no forward reaches.
+    Asserted by state-dict prefix rather than by a total, because a total cannot say which stack
+    went."""
+    deep = build(dict(tiny_warmup, lag_kv_source="encoder"))
+    local = build(dict(tiny_warmup, lag_kv_source=arm))
+
+    assert [name for name in deep.state_dict() if name.startswith("source_encoder.")]
+    assert [name for name in local.state_dict() if name.startswith("source_encoder.")] == []
+    assert getattr(local, "source_encoder", None) is None
+
+
+@pytest.mark.parametrize("arm", ["encoder", "conv_stem", "adapter"])
+def test_the_kv_representation_is_the_pathway_composed_in_order(tiny_warmup, arm) -> None:
+    """``encode_source_kv`` is what the forward and both controls call, so what it computes has to
+    be exactly the pathway's modules in order -- a helper that dropped or reordered one would move
+    the keys, the values, the null control's re-encode and the prior's clock together, and every
+    one of them would still be the right shape."""
+    model = build(dict(tiny_warmup, lag_kv_source=arm)).eval()
+    gated = torch.randn(
+        2,
+        model.sequence_length,
+        model.source_gate.keep_index.numel(),
+        generator=torch.Generator().manual_seed(3),
+    )
+
+    with torch.no_grad():
+        encoded = model.encode_source_kv(gated)
+        expected = gated
+        for module in model.source_kv_modules():
+            expected = module(expected)
+
+    assert torch.equal(encoded, expected)
+    assert encoded.shape == (2, model.sequence_length, model.d_model)

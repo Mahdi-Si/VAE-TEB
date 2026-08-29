@@ -1,0 +1,36 @@
+# Source-pathway regularisation arm: dropout 0.3 on the source map alone.
+#
+# `source_dropout` is the one seam that regularises the source pathway WITHOUT touching the target
+# pathway: it sets the dropout of the source adapter and encoder and, uniquely, of the attended
+# source summary inside the posterior fusion -- a site that exists only because this key introduced
+# it, and which null leaves off entirely. The target encoder, the prior head and the decoder all
+# keep `dropout: 0.1`, so a difference between this arm and the default is attributable to the
+# source map and to nothing else.
+#
+# WHY REGULARISE THAT PATHWAY. The coupling readout is the KL between a target-only prior and a
+# source-conditioned posterior, and it is measured on validation. A source map that fits the
+# training source stream too closely inflates that KL on data it has seen and not on data it has
+# not, which is a coupling number that does not generalise -- and no other key reaches the source
+# map without also reaching the branch it is compared against.
+#
+# TWO ARMS, 0.2 AND 0.3, because the quantity is a rate and one point does not say which direction
+# is better. They are separate files rather than one swept key for the reason every arm here is:
+# one axis per file, so a config is launchable by path and its delta is stated rather than derived.
+#
+#   TEB_RUN_STAMP="$(date '+%Y-%m-%d--[%H-%M]')" torchrun --nproc_per_node=7 \
+#       -m teb_vae.lag_attn_transformer_cfs.trainer \
+#       --config teb_vae/lag_attn_transformer_cfs/configs/sweep_source_dropout_03.yaml
+base: default.yaml
+
+model_config:
+  VAE_model:
+    source_dropout: 0.3
+
+advanced_config:
+  tracking:
+    mlflow:
+      # IDENTITY: the arm in the name, on both keys, so a run's own records say which arm trained
+      # even if the config it was launched from cannot be recovered.
+      run_name: lag_attn_trf_cfs_source_dropout_03
+      tags:
+        variant: lag_attn_trf_cfs_source_dropout_03

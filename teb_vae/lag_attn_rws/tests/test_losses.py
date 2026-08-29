@@ -23,6 +23,7 @@ from teb_vae.lag_attn_rws.nets.geometry import TrimmedRawGeometry
 from teb_vae.lag_attn_rws.nets.losses import (
     MS_RATES,
     compute_loss,
+    horizon_decay_weight,
     masked_boundary_gap,
     masked_derivative_huber,
     masked_multiscale_l1,
@@ -30,6 +31,7 @@ from teb_vae.lag_attn_rws.nets.losses import (
     masked_raw_block_per_anchor,
     masked_raw_likelihood,
     masked_source_kl,
+    raw_sample_score,
 )
 from teb_vae.lag_attn_rws.nets.raw_masks import forecast_mask
 
@@ -86,6 +88,140 @@ def test_the_gaussian_carries_its_full_constant():
         likelihood="gaussian_nll", logvar=torch.zeros_like(mu),
     )
     assert torch.allclose(d_block, torch.tensor(_BLOCK * 0.5 * math.log(2.0 * math.pi)))
+
+
+# =======================================================================================
+# The horizon weighting
+# =======================================================================================
+@pytest.mark.parametrize("likelihood", ["mse", "gaussian_nll"])
+def test_an_absent_horizon_weight_leaves_every_score_bitwise_where_it_was(likelihood):
+    """The off-state, pinned as **loss equality** rather than as a construction fact.
+
+    A horizon weighting is a loss-side switch: nothing about it is visible in a state dict, so a
+    construction pin would be vacuous. What has to hold is that a model shipping the weight null
+    computes the identical number to one built before the weight existed -- which is what makes an
+    arm at ``horizon_weight_halflife_steps: null`` comparable to every run in the records.
+
+    ``torch.equal`` rather than ``allclose``: the claim is that the multiplication does not happen,
+    not that it happens with ones, and a float32 multiply by exactly $1$ is bit-preserving anyway,
+    so a tolerance here would admit a code path that ran and merely rounded back.
+    """
+    mu, target, logvar, mask = _tensors()
+    variance = logvar if likelihood == "gaussian_nll" else None
+
+    absent = masked_raw_likelihood(mu, target, mask, likelihood=likelihood, logvar=variance)
+    explicit_none = masked_raw_likelihood(
+        mu, target, mask, likelihood=likelihood, logvar=variance, horizon_weight=None
+    )
+
+    for left, right in zip(absent, explicit_none):
+        assert torch.equal(left, right)
+
+
+def test_a_uniform_horizon_weight_is_the_unweighted_score():
+    """The mechanism's own fixed point, which is what makes the normalisation checkable.
+
+    :func:`horizon_decay_weight` renormalises its decay to sum to $H$, so the all-ones vector is
+    what an infinitely long half-life resolves to -- and multiplying by it must return the score
+    the null path returns. A weight that summed to $1$ instead would pass every shape assertion and
+    silently shrink the block by $H$ against an unmoved KL.
+    """
+    mu, target, logvar, mask = _tensors()
+
+    plain = masked_raw_likelihood(mu, target, mask, likelihood="gaussian_nll", logvar=logvar)
+    weighted = masked_raw_likelihood(
+        mu, target, mask, likelihood="gaussian_nll", logvar=logvar,
+        horizon_weight=torch.ones(_H),
+    )
+
+    for left, right in zip(plain, weighted):
+        assert torch.allclose(left, right, rtol=0.0, atol=1e-6)
+
+
+def test_the_horizon_weight_lands_on_the_horizon_axis_and_not_the_channel_one():
+    r"""Which axis it multiplies, checked by a weight that could not be mistaken for uniform.
+
+    $(H,)$ and $(R,)$ are both 1-D and both broadcast against a $(B, T, H, R)$ score, so a weight
+    applied one axis too late would be silently accepted whenever $H = R$ and would silently
+    reweight the *channel* axis whenever it broadcast at all. The score is compared against the
+    hand-built product with the weight explicitly unsqueezed onto the horizon axis.
+    """
+    mu, target, logvar, mask = _tensors()
+    weight = torch.tensor([0.25, 0.75, 1.5, 1.5])  # sums to H = 4, and no two entries agree
+
+    unweighted, _ = masked_raw_block_per_anchor(
+        mu, target, mask, likelihood="gaussian_nll", logvar=logvar
+    )
+    weighted, _ = masked_raw_block_per_anchor(
+        mu, target, mask, likelihood="gaussian_nll", logvar=logvar, horizon_weight=weight
+    )
+
+    per_sample = raw_sample_score(mu, target, likelihood="gaussian_nll", logvar=logvar)
+    expected = (per_sample * weight[:, None]).sum(dim=(2, 3))
+
+    assert torch.allclose(weighted, expected, rtol=1e-6)
+    assert not torch.allclose(weighted, unweighted), "the weight did not reach the score at all"
+
+
+def test_the_two_weights_compose_as_a_product_of_the_two_axes():
+    """Channel and horizon are independent axes of one score, so applying both must be the same as
+    applying their outer product -- not an order-dependent pair of reductions. Asserted because the
+    two land at the same site and a reduction taken between them would make the objective depend on
+    which was threaded first."""
+    mu, target, logvar, mask = _tensors()
+    channel = torch.linspace(0.5, 1.5, _R)
+    horizon = torch.tensor([0.25, 0.75, 1.5, 1.5])
+
+    both, _ = masked_raw_block_per_anchor(
+        mu, target, mask, likelihood="gaussian_nll", logvar=logvar,
+        channel_weight=channel, horizon_weight=horizon,
+    )
+    per_sample = raw_sample_score(mu, target, likelihood="gaussian_nll", logvar=logvar)
+    expected = (per_sample * horizon[:, None] * channel[None, :]).sum(dim=(2, 3))
+
+    assert torch.allclose(both, expected, rtol=1e-6)
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        pytest.param(torch.ones(_H, 1), id="two-dimensional"),
+        pytest.param(torch.ones(_H + 1), id="wrong length"),
+        pytest.param(torch.ones(_R), id="the channel axis's length"),
+    ],
+)
+def test_a_misshaped_horizon_weight_is_refused_by_name(bad):
+    """Refused rather than broadcast. Each of these would broadcast against a $(B, T, H, R)$ score
+    without raising -- the $(H, 1)$ onto the channel axis, the $(R,)$ onto it as well -- and the
+    result would be a differently weighted objective with every shape intact and no number saying
+    so. The message names the argument and the length it wanted."""
+    mu, target, logvar, mask = _tensors()
+
+    with pytest.raises(ValueError, match=r"horizon_weight must be 1-D of length H"):
+        masked_raw_likelihood(
+            mu, target, mask, likelihood="gaussian_nll", logvar=logvar, horizon_weight=bad
+        )
+
+
+@pytest.mark.parametrize("halflife", [5.0, 15.0, 100.0])
+def test_the_decay_weight_sums_to_the_horizon_and_decreases(halflife):
+    r"""The two properties the mechanism rests on, at three half-lives.
+
+    **Summing to $H$** is what makes a weighted block comparable in scale to an unweighted one, and
+    therefore what leaves ``gradient_clip_val`` and the spike breaker's margin -- both stated in
+    nats of the summed block -- standing. Without it the block would shrink against a KL that did
+    not move, which is an increase in the effective $\beta$ wearing a horizon weight's name.
+
+    **Decreasing in $\tau$** is the mechanism itself: the near steps are where a persistent
+    coefficient's motion is predictable, and a weight that did not fall would be a rescaling rather
+    than a reweighting.
+    """
+    weight = horizon_decay_weight(halflife, _H)
+
+    assert weight.shape == (_H,)
+    assert float(weight.sum()) == pytest.approx(float(_H), rel=1e-6)
+    assert torch.all(weight[:-1] > weight[1:]), "the weight does not decay in tau"
+    assert float(weight[0]) > 1.0 > float(weight[-1])
 
 
 @pytest.mark.parametrize("likelihood", ["mse", "gaussian_nll"])

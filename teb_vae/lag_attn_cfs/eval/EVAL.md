@@ -734,20 +734,85 @@ the part of the coupling readout attributable to source variation. The null arm 
 gate, adapter and encoder from a **zeroed** source stream — not a permutation, because both the
 adapter and the encoder are nonlinear and a zeroed stream is not a rearrangement of a real one.
 
-**The threshold ships unset, and that is the point.** `clock_margin_min_nats` defaults to `null`,
-under which `coupling_exceeds_availability_clock` is **INCONCLUSIVE** and still emits the measured
-difference, both interval ends and the positive fraction. A provisional number would otherwise decide
-a FAIL on the first production runs — the runs that are supposed to *measure* it — and a gate whose
-threshold is a guess either fails a healthy model or passes a broken one with nothing in the output
-to tell which. What is **not** conditional on the threshold is the number:
-`coupling_minus_clock_nats` is a headline scalar whatever the key says, so the arm tables carry it
-from the first run and the threshold can eventually be set from the observed spread rather than from
-judgement.
+**The threshold is set, at `clock_margin_min_nats: 0.15`, and both cfs cells' override files carry
+the same value and the same provenance comment.** It comes from the diagnosed unaligned run's
+observed spread of $\Delta_{\mathrm{clock}}$ across recordings — $0.160$, interval
+$[0.157, 0.164]$ — so `coupling_exceeds_availability_clock` decides rather than returning
+INCONCLUSIVE, and the acceptance gate is ten criteria rather than nine. Its provenance is the
+unaligned arm; the gated quantity is right on both arms, which is why one number serves both. It was
+deliberately left `null` until a run had measured the spread: a threshold guessed before then would
+have decided a FAIL on exactly the runs that were supposed to set it. What was never conditional on
+the threshold is the number — `coupling_minus_clock_nats` is a headline scalar whatever the key says,
+so the arm tables carried it from the first run, which is what let the threshold be set from data.
 
-One thing the emitted record states because it weakens the claim in the model's favour and nothing
-else would surface it: **zeroing floors no source variation**, and the encoder's response to a flat
+**The null arm re-encodes through whichever module `lag_kv_source` selected**, not through a deep
+source encoder the model may not have built. That is what keeps it a control: it probes the tensor
+the lag attention actually reads.
+
+Two things the emitted record states because each weakens the claim in the model's favour and nothing
+else would surface it. **Zeroing floors no source variation**, and the encoder's response to a flat
 trajectory is not literally the availability pattern's response — so $\Delta_{\mathrm{clock}}$ is a
-slightly *weaker* statement than "the clock alone".
+slightly *weaker* statement than "the clock alone". And **`kld_source_null` is not expected to
+collapse to zero even under `prior_availability_input`**: the posterior is a bounded residual on the
+prior, so the mean half of $\mathrm{KL}(q^\varnothing \Vert p)$ is a function of the delta head alone
+and no prior-side clock can appear in it. The informative quantity is therefore the difference and
+its interval, not the ratio.
+
+### occlusion
+
+**When did the source matter?** — asked by intervening rather than by reading attention weights. The
+observational readouts (`lag_kl`, `attention`) report where a *distribution over lags* puts its mass,
+which the window's near edge can pin for reasons that are about the geometry (see `argmax_lag` under
+*How the output is misread*). This one removes source content at a chosen lag band and measures what
+the forecast loses.
+
+For each band named in `occlusion_bands`, the stored source coefficients in
+$[t_a - \ell_{\mathrm{hi}},\ t_a - \ell_{\mathrm{lo}}]$ are set to **zero** — the channel mean, by
+the statistics convention every causal shard is built under — the stream is re-encoded through the
+run's own K/V path, and the block NLL is re-scored. The reported quantity is the per-horizon-step
+change against a reference forward in which nothing was removed.
+
+**Four properties make the number readable, and each is a decision rather than an economy.**
+
+- **The announcement is untouched.** The intervention moves the source's *values* and not its
+  arrival clock, which is the exact confound the analysis exists to avoid; the invariance is
+  **measured** on every occluded encode and reported, not asserted.
+- **The band is occluded after the channel gate.** The gate shifts each channel onto the run's
+  common clock, so a band of gated steps is one lag range for every kept channel at once. The same
+  band applied before the gate would land at $\ell + d_c$ for channel $c$ and re-smear precisely the
+  axis the alignment exists to un-smear.
+- **One scored anchor per segment, drawn from a seeded generator over the anchors the forward marked
+  valid, and held fixed across every band and the reference.** The source pathway has memory, so a
+  band occluded relative to anchor $a$ contaminates the state of every anchor after it, and a second
+  anchor scored in the same forward would attribute one anchor's loss to another's band. Holding the
+  anchor fixed is what makes the difference *paired*.
+- **Common random numbers.** The reference and every band are scored under the same reseeded latent
+  noise, so the difference is not a draw apart. Repeated collection is bit-identical.
+
+**The live fraction earns its own column.** A band reaching into the warm-up region, where the
+availability mechanism has already zeroed the source, has less source in it to remove — so a small
+delta there means "there was nothing there" rather than "the source did not matter". Four headline
+scalars therefore reach every arm table rather than one: the winning band's name, its delta, its peak
+horizon step and its live fraction.
+
+**It has no verdict, deliberately.** What a healthy per-band delta is has never been measured, and a
+threshold guessed before the first production runs would decide a pass or a fail on exactly the run
+that was going to measure it — the same argument that kept `clock_margin_min_nats` unset until a run
+set it.
+
+Three outputs: `occlusion_per_recording.csv`, `occlusion_per_horizon.csv` and
+`occlusion_summary.csv`, plus the per-horizon figure. `occlusion_bands` names the bands as
+`{name: [lo, hi]}` in **lag** units; an empty band (`lo > hi`) and a band above the model's own
+`max_lag` are both refused by name at config load, the first because a row of zeros would be
+reported as a finding and the second because it would name a wider band than it measured. `{}` — the
+schema default — records the analysis as a skip. `caps.occlusion` bounds how many **segments** are
+re-encoded rather than how many anchors are retained, because this analysis scores one anchor per
+segment; removing the key means every segment.
+
+Like `samples` and `sufficiency`, this analysis reaches for `context.task` and `context.loader`, and
+records a skip without them. That is structural rather than a convenience: an intervention on the
+model's *input* cannot be served by any table, because the tables record a forward the source was
+fully present in.
 
 ### lag_clocks
 
@@ -890,7 +955,34 @@ $\tau = 4(\ell + \delta)$ corrects only the model's own input delay $\delta$, re
 `model.source_delay_steps` and nowhere else. The per-channel composed group delay is *not* corrected
 for, and cannot be from this readout: the correction is per channel **pair** while the lag map is per
 head over a pooled source state, so the mapping would itself be an unvalidated construction. Both
-`DESIGN.md` records keep that limitation open.
+`DESIGN.md` records keep that limitation open. What the dual alignment reference *does* remove is the
+inter-stream part of that bias: with both streams on their own clocks the residual between them is a
+single known constant, printed on the console block beside the delay.
+
+**`argmax_lag` at the smallest attainable lag is a censoring reading, not an inertness reading.** The
+lag window has two censoring edges and not one. A profile pinned at the **far** edge means the model
+would report a lag the window is too short to express, and that is a FAIL; a profile pinned at the
+**near** edge means it would report a lag *shorter* than the window's own arithmetic can express,
+which at this geometry is where any delay below roughly $30$ s lands — and that is INCONCLUSIVE, with
+the physical-lag identity stated in the message so a reader can check the arithmetic rather than
+trust the verdict. The near edge is `min(attainable)` read from the per-lag anchor counts, symmetric
+with the far edge, so a window whose lowest bins carry no anchor lifts the floor off zero rather than
+being read as inertness.
+
+**Whether the machinery is alive is judged from the shape vocabulary, not from the argmax.** A
+degenerate profile — one whose peak is not distinguishable from its bulk — FAILs at either edge or in
+the middle, because its argmax names a bin rather than a lag; that is decided first, from
+`lag_shape`'s degeneracy flag, the peak's width and the mass above half the peak, with the per-head
+entropies beside them. An ideal model at this geometry, peaking strictly inside the attainable range,
+PASSes. **The pooled argmax is not the surface an arm comparison is read on**: the per-head profiles
+are, and they are printed under the pooled row with each head's argmax, peak width, mass above half
+peak, near and far mass, attention entropy and KL share.
+
+**The run's arm is printed beside the delay, and in three readings rather than one.** The console
+block and `summary.run_arm` carry the *configured* `causal_align_reference` label and source
+reference, the *built* `lag_kv_source`, and the *resolved* target clock, source clock and
+inter-stream offset in seconds. Three readings because a config naming one arm while the checkpoint
+carries another is exactly the failure this line exists to catch, and merging them would hide it.
 
 **Specificity is read in prediction space, not in KL space.** See `perm_control`:
 $K_{\mathrm{shuffled}} > K_{\mathrm{true}}$ is what a healthy model does, so a KL-space criterion

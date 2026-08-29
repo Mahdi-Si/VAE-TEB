@@ -56,12 +56,21 @@ def test_absent_keys_are_filled_from_the_defaults() -> None:
     assert partial["num_mc_samples"] == DEFAULTS["num_mc_samples"]
 
 
-def test_the_key_set_diverges_from_the_siblings_by_exactly_the_clock_margin() -> None:
+def test_the_key_set_diverges_from_the_siblings_by_exactly_its_two_causal_readouts() -> None:
     """The fork's key set is not free to drift. Anything else added or dropped here is a divergence
-    in the run's configuration surface that nothing else in the output would record."""
+    in the run's configuration surface that nothing else in the output would record.
+
+    Both additions belong to readouts only a causal cell has. ``clock_margin_min_nats`` is the bar
+    the availability-clock verdict decides on, and the sibling has no clock to decide about;
+    ``occlusion_bands`` partitions the lag window for the interventional readout, and the sibling
+    has no lag window that a source's own values can be removed from a band of.
+
+    Nothing is *dropped*, and that direction matters more than the additions: a key the sibling
+    validates and this fork does not would be silently ignored on a config merged from theirs.
+    """
     from teb_vae.lag_attn_rws.eval.config_schema import VALID_KEYS as SIBLING_KEYS
 
-    assert VALID_KEYS - SIBLING_KEYS == {"clock_margin_min_nats"}
+    assert VALID_KEYS - SIBLING_KEYS == {"clock_margin_min_nats", "occlusion_bands"}
     assert SIBLING_KEYS - VALID_KEYS == set()
 
 

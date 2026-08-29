@@ -42,6 +42,23 @@ where much of the source is still inside its own warm-up. ``lag_floor`` generali
 $\mathbb 1[t - \ell \ge 0]$ to $\mathbb 1[t - \ell \ge F_u]$; it ships at $0$, where it is bitwise
 the sibling's, and exists so the residual is measurable rather than argued about.
 
+**And a fourth, which is about the KL rather than about the inputs.** The warm-up is announced to
+the source pathway, so the *posterior* is told which source channels have arrived -- and the prior,
+conditioning on the target alone, was not. That asymmetry puts a term in the KL that neither branch
+could have learned from the data: a deterministic function of $t$, identical for every recording,
+arriving in the readout as though the source had informed the forecast. Under
+``prior_availability_input`` the prior is given it too, so it cancels rather than being measured and
+subtracted afterwards.
+
+**What the prior is given is not the announcement itself**, and the distinction is the whole of
+:meth:`CausalWarmupInputs._prior_clock`. The staircase $\mathbb 1[t \ge W'_c + d_c]$ is *constant on
+every scored anchor* -- the constructor refuses any floor below $\max_c(W'_c + d_c)$, which is
+exactly the last step at which it changes -- so a prior conditioned on it gains an offset its biases
+already span. What survives past the floor is the source **encoder's memory** of the arrivals, and
+the prior is therefore conditioned on the encode of a **zeroed** source stream: the same tensor the
+source-null control feeds the posterior, carrying no information about the source's values, detached
+so no gradient couples the two pathways.
+
 **Why the constructor is not here.** Every other member below is identical text for both cells, but
 ``__init__`` cannot be: the experiment driver builds a run's kwargs by sweeping
 ``inspect.signature(MODEL_CLS.__init__)``, so each cell has to write out *its own* architecture's
@@ -225,6 +242,118 @@ class CausalWarmupInputs:
         )
         self._resolve_warmup_readout_constants()
 
+    def _combined_source_steps(self) -> Optional[Tuple[int, ...]]:
+        r"""When each surviving source channel is honest **as the encoder reads it**: $W'_c + d_c$.
+
+        The one place this vector is computed, because both source-warmth partitions read it -- in
+        this mixin and in the raw-target cells' override of the same method -- and they must be the
+        same vector. It is also what :meth:`_build_adapter` announces with, so the region a channel
+        is reported cold over and the region it is masked over cannot disagree.
+
+        The shift is not optional arithmetic. ``ChannelDelay`` makes encoder step $t$ read stored
+        step $t - d_c$, so a channel gathered with a shift is a function of the recording only once
+        $t$ has reached **both** its own warm-up and its shift; a vector carrying $W'_c$ alone
+        reports the source warm by as much as $85$ steps before it is, with no crash, no shape
+        change and no metric moving.
+
+        Returns:
+            One entry per survivor, positional against the gate's keep-index, or ``None`` for a
+            stream with no warm-up at all -- which is the ungated arm, where every step is warm and
+            there is nothing to wait out.
+        """
+        waits = self.source_warmup_steps
+        if waits is None or self.source_gate is None:
+            return waits
+        return tuple(
+            wait + int(shift)
+            for wait, shift in zip(waits, self.source_gate.delay.delay_steps)
+        )
+
+    def _prior_clock(self, u_stream: torch.Tensor) -> torch.Tensor:
+        r"""The source pathway's response to a source that says nothing: the prior's clock.
+
+        $$h^{u,\varnothing} = \mathrm{Enc}_u\bigl(\mathrm{Adapt}_u(\mathrm{Gate}_u(\mathbf 0))\bigr)
+          \in \mathbb R^{1 \times T \times d_{\mathrm{model}}} .$$
+
+        **Why this and not the announcement itself.** The obvious clock is the availability
+        staircase $\mathbb 1[t \ge W'_c + d_c]$ the adapter masks and announces with. It is inert:
+        the constructor refuses any anchor floor below $\max_c (W'_c + d_c)$, which is exactly the
+        last step at which that staircase changes, so **every scored anchor sees an all-ones
+        vector** -- a constant, which a ``LayerNorm`` and a linear map turn into an offset the
+        prior head's biases already span. Measured on the planted fixture: eighteen distinct rows
+        over $t \in [0, 300)$ and exactly one over the scored $[134, 270)$, with the resulting
+        projection learning to a weight RMS fifty times below every other matrix in the head and
+        ``kld_source_null`` unmoved.
+
+        What actually reaches the KL past the floor is the source **pathway's memory** of the
+        warm-up transient: $h^u_t$ at $t \ge F$ still carries the pattern of channels arriving one
+        by one over the first $F$ steps, for as far back as the pathway reaches -- the whole prefix
+        where it is the convolutional-recurrent encoder, its receptive field where
+        ``lag_kv_source`` has made it a bounded stem. This tensor is that memory, isolated, and it
+        is the encode of whichever pathway the model actually runs: the same one
+        ``source_null_forward_outputs`` feeds the posterior when it removes the source's values, so
+        the prior and the null posterior receive **the same input** and the divergence between them
+        is learnable to zero rather than floored by an asymmetry.
+
+        **It carries no information about the source's values**, which is the invariant: the stream
+        it encodes is exactly zero, identical for every recording and under every intervention on
+        the source. What it does depend on -- and this is the cost the announcement did not have --
+        is the source pathway's own *parameters*. It is therefore **detached and computed under
+        no-grad**: no gradient flows from the prior into the source adapter or encoder, so the two
+        pathways' gradients stay uncoupled, exactly as §the prior's own projection stays unshared
+        with the adapter's ``mask_proj``. Those modules still receive gradient from the matched
+        forward in the same step, so nothing leaves DDP's expectation set.
+
+        **Forced into eval mode for the duration**, rather than following ``self.training``. The
+        clock is defined as a deterministic function of $t$ and the configuration; with dropout
+        live it would be a fresh random draw every step, and the prior's input distribution would
+        differ between the mode the objective runs in and the mode every readout is measured in.
+        The restore is in a ``finally``, so an exception cannot leave the source pathway in eval.
+
+        **Encoded at batch 1 and broadcast.** With $x \equiv 0$ the adapter's output is a function
+        of the availability pattern alone and therefore identical in every batch element, so one
+        row is the whole answer -- the same economy ``source_null_forward_outputs`` already makes.
+        The returned $(1, T, d)$ tensor broadcasts against $h^y$'s $(B, T, d)$ in the head.
+
+        Args:
+            u_stream: The source stream the matched forward was given, at the **declared** width.
+                Read for its shape, dtype and device only.
+
+        Returns:
+            The null source state, $(1, T, d_{\mathrm{model}})$, detached.
+        """
+        zeros = u_stream.new_zeros((1, *u_stream.shape[1:]))
+        gated = zeros if self.source_gate is None else self.source_gate(zeros)
+        # The configured key/value path, resolved on the model, rather than the deep encoder by
+        # name: the clock must be the encode the source-null control feeds the posterior, and that
+        # control follows the same path. Naming the encoder here would leave the prior conditioned
+        # on a tensor nothing else in the model computes the moment the K/V arm is local.
+        modules = self.source_kv_modules()
+        was_training = [module.training for module in modules]
+        for module in modules:
+            module.eval()
+        try:
+            with torch.no_grad():
+                encoded = self.encode_source_kv(gated)
+        finally:
+            for module, flag in zip(modules, was_training):
+                module.train(flag)
+        return encoded.detach()
+
+    def _prior_clock_dim(self) -> int:
+        r"""Width of the clock the prior head conditions on, for the head the base is building.
+
+        The source pathway's own output width, because :meth:`_prior_clock` is an encode of that
+        pathway: whatever it emits, the prior reads. It is $d_{\mathrm{model}}$ on every key/value
+        arm -- the adapter, the local stem and the deep encoder all export the model width -- and it
+        is resolved from ``d_model`` rather than from a module, none of which exists yet at the
+        moment the head is built.
+
+        Returns:
+            $d_{\mathrm{model}}$.
+        """
+        return int(self.d_model)
+
     def _resolve_warmup_readout_constants(self) -> None:
         r"""Resolve the five constants the added readouts are computed against.
 
@@ -313,20 +442,13 @@ class CausalWarmupInputs:
         )
         split = self.SOURCE_BLOCK_SPLIT if self.use_up_st else 0
 
-        # A channel is honest from step $W'_c + d_c$, not from $W'_c$: ``ChannelDelay`` makes
-        # encoder step $t$ read stored step $t - d_c$, so the shift postpones the whole pattern.
-        # The availability mask in ``_build_adapter`` and the floor in ``_check_anchor_floor``
-        # both already add it; this was the third site and the only one that *reported* rather
-        # than enforced, which is why nothing failed. Because $d_c \ge 0$ always, the omission
-        # could only ever report the source as WARMER than it is -- and on the shipped aligned
-        # configuration it made ``source_lag_warmth_frac_st`` identically $1.0$ for any attention
-        # distribution, i.e. a column that could not vary and therefore measured nothing.
-        waits = self.source_warmup_steps
-        if waits is not None and self.source_gate is not None:
-            waits = tuple(
-                wait + int(shift)
-                for wait, shift in zip(waits, self.source_gate.delay.delay_steps)
-            )
+        # A channel is honest from step $W'_c + d_c$, not from $W'_c$, and that vector is now
+        # resolved in one place -- see :meth:`_combined_source_steps`, which the availability
+        # announcement reads too. Because $d_c \ge 0$ always, omitting the shift could only ever
+        # report the source as WARMER than it is: on the shipped aligned configuration it made
+        # ``source_lag_warmth_frac_st`` identically $1.0$ for any attention distribution, i.e. a
+        # column that could not vary and therefore measured nothing.
+        waits = self._combined_source_steps()
 
         # Refused rather than zipped: ``declared`` is the gate's keep-index when there is a gate
         # and the full declared range when there is not, so a stream carrying a warm-up without a
@@ -591,6 +713,9 @@ class CausalWarmupInputs:
             * ``anchor_index`` -- the decoded anchors $(B, A_{\max})$, ``torch.long``.
             * ``anchor_valid`` -- which of them are real $(B, A_{\max})$, ``torch.bool``. Padded
               slots repeat the row's last real anchor and are ``False`` here.
+            * ``persistence`` -- the anchor's own target vector $(B, A_{\max}, C_{\mathrm{keep}})$,
+              **only** under ``persistence_residual``. Present so a control re-decoding this
+              forward's latents carries the same target-only tensor the forward decoded with.
         """
         anchor_index, anchor_valid = self._build_anchor_index(
             batch=int(y_st.shape[0]),
@@ -604,14 +729,42 @@ class CausalWarmupInputs:
         # its own d_c, while the warm-up stays a leading mask rather than part of the gate -- and
         # the masking happens inside the adapter, which holds the same vector it announces with.
         target = torch.cat([y_st, y_ph], dim=-1)
+        # The decoder's persistence input, taken BEFORE the gate's shift and never after it: the
+        # gate delays each survivor by its own $d_c$, which is the guard on an *input* channel's
+        # reach, while this tensor is the value the anchor is asked to continue. It is target-only
+        # -- the same stream both branches already condition on -- so it opens no source bypass, and
+        # the two decoder calls below receive the identical tensor so ``pred_gap`` stays a pure
+        # source readout. Only the feature-target cells resolve the gather; on the raw-target cells
+        # the flag cannot be set, which is what makes the deliberate exclusion structural rather
+        # than a convention this line has to remember.
+        persistence = (
+            self._anchor_target_values(target, anchor_index)
+            if self.persistence_residual
+            else None
+        )
         if self.target_gate is not None:
             target = self.target_gate(target)
         source = u_stream if self.source_gate is None else self.source_gate(u_stream)
 
         h_y = self.target_encoder(self.target_adapter(target))
-        h_u = self.source_encoder(self.source_adapter(source))
+        # Keys AND values for the lag attention, from whichever source representation
+        # ``lag_kv_source`` selects. Localising the keys alone would leave the lag-0 value
+        # informationally dominant and the degeneracy standing under a better-looking map, so the
+        # one tensor serves both by construction rather than by convention.
+        h_u = self.encode_source_kv(source)
 
-        mu_prior, logvar_prior, raw_logvar_prior = self.prior_head(h_y)
+        # The prior is conditioned on the source pathway's response to a source that says nothing,
+        # when the flag is on, and on nothing else new. That tensor is a deterministic function of
+        # $t$ and of the configuration -- identical for every recording, and unchanged by any
+        # intervention on the source's values -- so this is not the source entering the target-only
+        # branch: it is the warm-up transient the posterior was already receiving, given to both
+        # branches so that it cancels out of the KL instead of being attributed to the source by
+        # every readout downstream. Computed after `h_u` so the matched encode is the one that
+        # holds the graph; see ``_prior_clock`` for why it is detached and forced out of train mode.
+        mu_prior, logvar_prior, raw_logvar_prior = self.prior_head(
+            h_y,
+            clock=self._prior_clock(u_stream) if self.prior_availability_input else None,
+        )
 
         # The attended output (W_o's fused projection) is discarded: the head-structured posterior
         # consumes the per-head summaries, and W_o is frozen. The query is posed from the prior
@@ -644,8 +797,12 @@ class CausalWarmupInputs:
         # longer a contiguous prefix; and the same index for both branches, so base and full are
         # two latents through one decoder at one anchor set.
         gather_index = anchor_index[:, :, None].expand(-1, -1, self.d_z)
-        mu_base, logvar_base = self.decoder(z_prior.gather(1, gather_index))
-        mu_full, logvar_full = self.decoder(z_post.gather(1, gather_index))
+        mu_base, logvar_base = self.decoder(
+            z_prior.gather(1, gather_index), persistence=persistence
+        )
+        mu_full, logvar_full = self.decoder(
+            z_post.gather(1, gather_index), persistence=persistence
+        )
 
         # The per-lag attribution: K_t says how much the source moved the belief, the attention
         # weights say from which lag. Head-structured, so the split is an additive decomposition
@@ -660,7 +817,7 @@ class CausalWarmupInputs:
             kld_btd, alpha, head_structured=True
         )
 
-        return {
+        outputs = {
             "mu_prior": mu_prior,
             "logvar_prior": logvar_prior,
             "raw_logvar_prior": raw_logvar_prior,
@@ -684,6 +841,14 @@ class CausalWarmupInputs:
             "anchor_index": anchor_index,
             "anchor_valid": anchor_valid,
         }
+        if persistence is not None:
+            # Returned so the permutation control's re-decode carries the SAME matched, target-only
+            # tensor: a shuffled forecast decoded without the residual would differ from the matched
+            # one by the residual as well as by the source, and the shuffle gap would shift for a
+            # reason that has nothing to do with the source. Present only under the flag, like every
+            # other key whose mechanism a model may not have built.
+            outputs["persistence"] = persistence
+        return outputs
 
 
 __all__ = ["CAUSAL_ONLY_KEYWORDS", "FORWARDED_EXCLUSIONS", "CausalWarmupInputs"]

@@ -12,17 +12,26 @@ there. The comparison is total rather than schema-limited: this model's net is a
 comparison model's whose constructor schema gains three keys and loses none, so every key means the
 same thing in both files and every key is comparable.
 
-The nineteen exemptions fall into four kinds, and the split is the record rather than bookkeeping.
-**Five are identity** -- the run tag, the output directory, the MLflow experiment, the run name and
-the variant tag -- and inheriting any of them writes these runs into the other model's tree. **Four
+The exemptions fall into five kinds, and the split is the record rather than bookkeeping. **Five
+are identity** -- the run tag, the output directory, the MLflow experiment, the run name and the
+variant tag -- and inheriting any of them writes these runs into the other model's tree. **Four
 are the dataset**: causal shards and the statistics accumulated from them, plus the two loader keys
-the tile phase is derived from. **Seven are the geometry the transform forces**: the channel widths
-the one-sided cascade leaves, the anchor floor the warm-up budget pairs with, the three keys that
-have no two-sided counterpart, and the reach budget this dataset makes undefined. **Three are
-numbers re-derived at this objective's own scale**, and they are the ones worth reading twice: of
-the four loss-scale constants measured, only two moved. ``ema_floor`` and ``horizon_embed_std``
-landed on the comparison model's values and live in :data:`MEASURED_TO_MATCH_PATHS`, whose test
-asserts the equality so that it reads as a measurement rather than as an oversight.
+the tile phase is derived from. **Nine are the geometry the transform forces**: the channel widths
+the one-sided cascade leaves, the anchor floor the warm-up budget pairs with, the keys that have no
+two-sided counterpart, the per-block reconstruction weights, and the reach budget this dataset
+makes undefined. **Two are numbers re-derived at this objective's own scale**, and they are the
+ones worth reading twice: of the four loss-scale constants measured, only two moved. ``ema_floor``
+and ``horizon_embed_std`` landed on the comparison model's values and live in
+:data:`MEASURED_TO_MATCH_PATHS`, whose test asserts the equality so that it reads as a measurement
+rather than as an oversight.
+
+**The last nine are mechanisms rather than values**, and they are the newest kind. Six are
+architecture switches -- the lag attention's K/V memory, the prior's availability clock, the
+target-only persistence residual, the decaying horizon weighting, the flat lag-bias seed and the
+source stream's own alignment clock -- and three are the training controls that go with them.
+Every one of the six ships with an off-state that is bitwise the comparison model's behaviour,
+which is what keeps two runs comparable across a divergence about whether a mechanism exists at
+all; only the source reference is a chosen *number* as well as a chosen mechanism.
 
 **The horizon left this list when it stopped being a divergence.** This cell shipped at $H = 15$
 against the comparison model's $30$, and that was its eighth geometry exemption; both now forecast
@@ -93,9 +102,14 @@ TASK_LEVEL_KEYS = (
     "free_bits",
     "causal_reach_budget_s",
     "causal_warmup_budget_steps",
-    # Both alignment keys are resolved against the SHARDS by the trainer and reach the
-    # constructor only as the two shift tuples, so neither names a constructor argument.
+    # All three alignment keys are resolved against the SHARDS by the trainer and reach the
+    # constructor only as the shift tuples, so none of them names a constructor argument.
     "causal_align_reference",
+    # The source stream's own clock, snapped against the SOURCE's stored delays rather than the
+    # target's. It is task-level for the same reason as the key above and for one more: what it
+    # produces is a second keep-index and a second shift tuple on one stream only, which is a
+    # resolution result and not an architecture choice.
+    "causal_align_reference_source",
     "causal_leg_alignment",
 )
 
@@ -171,6 +185,54 @@ PARITY_EXEMPT_PATHS: Dict[str, str] = {
         "RETUNED: the margin is stated in nats of the summed block, and this block is 2940 "
         "coefficients against 2340; measured against the breaker's own excursion-above-EMA "
         "statistic rather than against the epoch-to-epoch movement"
+    ),
+    # The six architecture switches and the two training controls this revision added. Every one is
+    # a key the comparison model's constructor does not have and its config never carries, so the
+    # divergence is "this mechanism exists here" rather than "this number was chosen differently" --
+    # and each ships at a value whose OFF-state is bitwise the comparison model's behaviour, which
+    # is what keeps the two runs comparable at all.
+    "model_config.VAE_model.lag_kv_source": (
+        "the lag attention's key/value memory, which has no two-sided counterpart: it selects "
+        "between the deep source encoder and a local source representation, and only a stream "
+        "read through an availability gate has the second"
+    ),
+    "model_config.VAE_model.prior_availability_input": (
+        "the prior's availability clock, which has no two-sided counterpart: it announces which "
+        "source channels have arrived, and a two-sided stream announces nothing because every "
+        "channel is present from the first step"
+    ),
+    "model_config.VAE_model.persistence_residual": (
+        "the target-only persistence term in the decoder mean, which the comparison model's "
+        "constructor does not take; off there, and off is bitwise its current decoder"
+    ),
+    "model_config.VAE_model.horizon_weight_halflife_steps": (
+        "the decaying horizon weighting of the reconstruction, which the comparison model's "
+        "constructor does not take; null there, and null is the uniform sum it already computes"
+    ),
+    "model_config.VAE_model.alibi_slope_scale": (
+        "the lag-bias seed's slope multiplier. Shipped at 0.0 here -- a FLAT learnable per-lag "
+        "bias -- because a decaying seed predicts a lag-0 peak before the model has read anything, "
+        "which is a hazard only a cell reading a physiological delay off the lag axis has"
+    ),
+    "model_config.VAE_model.causal_align_reference_source": (
+        "the SOURCE stream's own clock, the second half of a dual reference. It has no two-sided "
+        "counterpart for the same reason causal_align_reference does not, and it is the one "
+        "divergence of this pair that is a chosen number: 288.2672 s, snapped to a stored source "
+        "delay, at a known -113.8932 s offset against the target's clock"
+    ),
+    "advanced_config.callbacks.early_stopping.enabled": (
+        "the training controls: this row stops on val/total_loss where the comparison model runs "
+        "its epoch budget out. Enabled here because a run of this cell has been observed to reach "
+        "its composite optimum hundreds of epochs before its budget ends"
+    ),
+    "advanced_config.callbacks.early_stopping.patience": (
+        "the second half of the control above, in validation epochs; inheriting the comparison "
+        "model's value would make the flag above inert rather than merely different"
+    ),
+    "advanced_config.callbacks.model_checkpoint.secondary_monitor": (
+        "the second checkpoint criterion, on val/nll_full_block. Absent in the comparison config, "
+        "where absence builds no second callback: the composite optimum and the best conditioned "
+        "forecast are different epochs, and only one of them is recoverable without this"
     ),
 }
 
@@ -846,21 +908,35 @@ def test_the_local_variant_ramps_beta_inside_its_own_epoch_budget(smoke_hie):
     assert warmup * 10 <= epochs
 
 
-def test_the_local_variant_names_a_causal_shard_that_does_not_yet_exist(smoke_hie):
-    """Deliberately a placeholder, and the reason is stated rather than left as an omission: there
-    is no committed causal HIE shard, and the two-sided one beside it cannot stand in -- it carries
-    no ``transform`` attribute, no per-block warm-up vectors and the two-sided channel counts, and
-    the pre-flight refuses it by name. The header says what to build and how."""
+def test_the_local_variant_names_a_built_and_leg_aligned_causal_shard(smoke_hie):
+    """The causal HIE shard this config used to only ask for has been built, so the assertion is now
+    its presence rather than its absence.
+
+    Split in two on purpose. ``output/`` is gitignored, so the shard is a dev-box artefact and not a
+    committed fixture: the *config contract* is checked everywhere, and the shard's own attributes
+    only where the file is actually present. The two-sided ``output/hie_cs.hdf5`` still cannot stand
+    in -- it carries no ``transform`` attribute, no per-block warm-up vectors and the two-sided
+    channel counts, and the pre-flight refuses it by name."""
     dataset = smoke_hie["dataset_config"]
 
     assert dataset["vae_train_datasets"] == dataset["vae_test_datasets"]  # in-sample, deliberately
     for path in (*dataset["vae_train_datasets"], dataset["stat_path"]):
         assert "causal" in path, path
-        assert not (_REPO_ROOT / path).is_file(), (
-            f"{path} now exists -- if a causal HIE shard has been built, this test should assert "
-            f"its presence instead, and the config header's build instructions can go"
-        )
-    assert "PREREQUISITE" in _SMOKE_HIE.read_text(encoding="utf-8")
+    assert "PREREQUISITE, AND IT IS NOW SATISFIED" in _SMOKE_HIE.read_text(encoding="utf-8")
+
+    shard = _REPO_ROOT / dataset["vae_train_datasets"][0]
+    if not shard.is_file():
+        pytest.skip(f"{shard} is a gitignored dev-box artefact and is absent here")
+
+    import h5py
+
+    expected = smoke_hie["model_config"]["VAE_model"]["causal_leg_alignment"]
+    with h5py.File(shard, "r") as handle:
+        assert handle.attrs["transform"] == "causal"
+        # The one attribute worth reading here: an aligned shard and an unaligned one share every
+        # width, every warm-up vector and every stored delay, so nothing else on the file could
+        # disagree with the config -- which is exactly why the resolver checks it by name.
+        assert handle.attrs["causal_leg_alignment"] == expected
 
 
 def test_the_local_variant_runs_on_one_device_with_tracking_off(smoke_hie):

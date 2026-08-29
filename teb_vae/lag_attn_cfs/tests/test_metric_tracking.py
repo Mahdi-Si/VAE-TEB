@@ -238,24 +238,50 @@ def test_the_metrics_history_writer_is_wired_to_the_collector(built):
     assert writer.source is collector
 
 
-def test_the_checkpoint_callback_writes_to_the_run_checkpoint_directory(built):
+def test_both_checkpoint_callbacks_write_to_the_run_checkpoint_directory(built):
     """The framework hardcodes ``enable_checkpointing=True``, so a missing ``ModelCheckpoint`` means
-    Lightning adds its own -- writing into the train-results directory instead."""
+    Lightning adds its own -- writing into the train-results directory instead.
+
+    **Two rather than one**, because the composite optimum and the best conditioned forecast are
+    different epochs: a run of this family has been observed to minimise ``val/total_loss`` and
+    ``val/nll_full_block`` fifty-odd epochs apart, and a single criterion makes the other epoch's
+    weights unrecoverable afterwards. The second is built only where the config names a monitor for
+    it, which is what keeps the two-sided cells at one.
+    """
     checkpoints = [cb for cb in built["callbacks"] if isinstance(cb, ModelCheckpoint)]
+    configured = built["driver"].config["advanced_config"]["callbacks"]["model_checkpoint"]
 
-    assert len(checkpoints) == 1
-    assert checkpoints[0].dirpath == built["driver"].model_checkpoint_dir
+    assert configured.get("secondary_monitor"), "this cell's config names no second criterion"
+    assert len(checkpoints) == 2
+    for checkpoint in checkpoints:
+        assert checkpoint.dirpath == built["driver"].model_checkpoint_dir
+    assert {checkpoint.monitor for checkpoint in checkpoints} == {
+        configured["monitor"],
+        configured["secondary_monitor"],
+    }
 
 
-def test_the_checkpoint_filename_carries_this_models_stem_and_no_double_prefix(built):
+def test_the_two_checkpoint_criteria_write_under_distinct_stems(built):
     """Lightning prefixes each placeholder with its own name, so a stem containing ``epoch=``
     renders as ``epoch=epoch=00``. And the stem must be this model's: three models writing
-    ``lag-attn-rws-epoch=00.ckpt`` into a shared directory would be indistinguishable by name."""
-    checkpoint = next(cb for cb in built["callbacks"] if isinstance(cb, ModelCheckpoint))
-    filename = str(checkpoint.filename)
+    ``lag-attn-rws-epoch=00.ckpt`` into a shared directory would be indistinguishable by name.
 
-    assert "epoch=" not in filename
-    assert filename == "lag-attn-cfs-{epoch:02d}"
+    The two criteria's stems must additionally differ from each other, and that is not cosmetic:
+    with one stem Lightning would have each criterion overwrite the other's file at the same epoch,
+    leaving one criterion's best silently unsaved -- the exact failure the second criterion exists
+    to prevent. The second stem is derived from its monitor, so a config naming a third could not
+    collide either.
+    """
+    checkpoints = [cb for cb in built["callbacks"] if isinstance(cb, ModelCheckpoint)]
+    configured = built["driver"].config["advanced_config"]["callbacks"]["model_checkpoint"]
+    primary = next(cb for cb in checkpoints if cb.monitor == configured["monitor"])
+    secondary = next(cb for cb in checkpoints if cb.monitor == configured["secondary_monitor"])
+
+    assert str(primary.filename) == "lag-attn-cfs-{epoch:02d}"
+    assert str(secondary.filename) != str(primary.filename)
+    for checkpoint in checkpoints:
+        assert "epoch=" not in str(checkpoint.filename)
+        assert str(checkpoint.filename).startswith("lag-attn-cfs-")
 
 
 def test_the_checkpoint_monitor_comes_from_config_and_is_a_metric_the_task_emits(

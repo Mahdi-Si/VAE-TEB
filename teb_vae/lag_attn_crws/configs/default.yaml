@@ -483,18 +483,148 @@ model_config:
     # measurement that would justify a non-zero value.
     lag_floor: 0
 
+    # --- Horizon weighting of the reconstruction --------------------------------
+    # Half-life, in horizon steps, of a decaying weight w_tau ~ 0.5^(tau/halflife) applied to BOTH
+    # reconstruction terms on the horizon axis. 15.0 is half of this cell's H = 30.
+    #
+    # WHY. The objective was uniform over horizon steps, and uniform was never neutral: the far
+    # steps are the majority of the block and are the part the target's own past says least about,
+    # so the cheapest way to lower a uniform sum over them is to widen the conditional variance
+    # everywhere and stop predicting the level anywhere. Weighting the near steps up removes that
+    # payment without removing the far steps from the objective.
+    #
+    # RENORMALISED: the vector is scaled by H / sum(w), so the weighted block sums to the same
+    # magnitude the uniform one did. Without it the reconstruction would shrink 1.81x against a KL
+    # that did not move -- a 1.81x rise in the effective beta wearing a horizon weight's name, and
+    # `gradient_clip_val` and `additive_margin` would both be out of date. Only the DISTRIBUTION
+    # across horizon steps moves. At 15.0 and H = 30 the resolved weights run from 1.8063 at tau = 0
+    # to 0.4729 at tau = 29, a 3.8x spread.
+    #
+    # THE COST, stated because it is not recoverable from the columns. A weighted reconstruction is
+    # not a log-density, so beta = 1 is no longer the exact ELBO of the source-conditioned branch and
+    # any e^(delta/block) rescaling of a gap is no longer a probability statement about the TRAINING
+    # objective.
+    #
+    # THE ONE HALF OF HORIZON-AWARE DECODING THIS CELL TAKES. The paired feature-target cells also
+    # ship a persistence residual in the decoder's mean, which carries the anchor's own value forward
+    # per CHANNEL; this block's last axis counts raw samples of one signal, so there is no
+    # per-channel level for it to carry and the key is absent from this cell's constructor entirely.
+    # A decaying weight, by contrast, reads the forecast's own tau axis, which this block has exactly
+    # as a feature block does.
+    #
+    # `null` builds no weight at all and is bitwise the horizon-uniform objective. The two-sided
+    # cells never carry this key.
+    horizon_weight_halflife_steps: 15.0
+
     # --- Attention -------------------------------------------------------------
     max_lag: 90            # L = 91 (~6 minutes of UP history at 4 s/step)
     num_heads: 4
     d_head: 32
     use_entmax: true       # exact zeros in the lag distribution, not merely small weights
     attention_grad_checkpoint: false
+
+    # --- What the lag attention reads: the source key/value memory ---------------
+    # `conv_stem` builds the attention's keys AND values from the source input adapter followed by
+    # the causal convolution stem alone -- the same (3, 5, 11) x (1, 2, 4) + (8, 16) schedule the
+    # source encoder's convolution branch uses -- instead of from the deep source history state.
+    # The deep encoder is then NOT BUILT AT ALL: nothing else in the model consumes it.
+    #
+    # WHY. A deep causal state at lag 0 already contains a processed image of the states at every
+    # larger lag, so by the data-processing inequality the near lags dominate the searched window
+    # whatever the attention would prefer -- and a lag readout taken over such keys and values
+    # cannot express a delay it is looking straight at. Measured on the planted-delay fixture, where
+    # the informative lags are known and are [15, 44] and nowhere else, both architectures put their
+    # support-corrected argmax at lag 0 with the deep state as memory. A bounded stem makes a key at
+    # lag l a summary of a neighbourhood of l, which is what an attention over lags needs it to be.
+    #
+    # BOTH K AND V MOVE, and that is not a detail. Localising the keys alone would leave the lag-0
+    # value informationally dominant and the degeneracy standing under a better-looking attention
+    # map -- the same failure with a nicer picture.
+    #
+    # WHAT IT COSTS AND WHAT IT CANNOT FIX. The arm is SMALLER than the default, by the whole LSTM
+    # branch and the fusion. What no model-side change reaches is the resolution floor beneath it:
+    # the stem's own receptive field, and under that the transform's group delay -- a stored
+    # coefficient is a causal integral over its channel's own window. That is the alignment
+    # reference's territory, not this key's.
+    #
+    # READ THE REACH BEFORE READING A LAG PROFILE OFF THIS ARM. The stem inherits this encoder's
+    # own convolution schedule, `encoder_extra_dilations` and `encoder_extra_kernel` included, so
+    # at the shipped (3, 5, 11, 15, 15) x (1, 2, 4, 8, 16) its receptive field is 387 steps --
+    # LONGER than the 91-step lag window and longer than the 300-step sequence. Dropping the LSTM
+    # therefore removes unbounded recurrence and leaves a convolution memory that is still not
+    # local, so on THIS architecture the arm does not yet separate a lag-0 key from a whole-prefix
+    # one. The conv-Transformer cell's stem is 21 steps and is local; this one is not, and the
+    # measured lag profile is to be read with that in front of it.
+    #
+    # `encoder` is the deep source state and is bitwise the model that shipped before this key
+    # existed; `adapter` is the sharpest arm, the projected stream itself at one step of reach, and
+    # ships as a named sweep arm rather than as the default.
+    lag_kv_source: conv_stem
     # 'alibi_decay' seeds a learnable per-head short-lag prior on the attention scores.
     lag_bias_init: alibi_decay
+
+    # ...and this SCALES that prior's slope, which at 0.0 makes the seed FLAT. The parameter is
+    # still built and still learnable -- it is a (num_heads, L) tensor either way -- so this is not
+    # "no bias": `lag_bias_init: normal` is the setting that registers no parameter at all, and it
+    # is a different arm entirely.
+    #
+    # WHY FLAT SHIPS. At scale 1.0 the seed is -slope_h * ell, a monotone penalty in the lag, so a
+    # freshly built model already prefers lag 0 by construction and the reported argmax cannot
+    # distinguish "the data says lag 0" from "the initialisation says lag 0". Every profile this
+    # family has measured on ground truth peaks at 0, and a decaying seed is one of the several
+    # causes that predicts that on its own. Flat removes the initialisation from the list, at no
+    # cost in expressiveness: the same parameter, reached by the same gradient, starting from a
+    # position that asserts nothing about which lag matters.
+    #
+    # 1.0 remains the named comparison arm, and the pair is what separates the two explanations on
+    # a fixture whose informative lag is known.
+    alibi_slope_scale: 0.0
     # Whether the attention query reads the prior log-variance alongside its mean. false = query
     # from mu^p alone; the query-logvar sweep arm sets true (query_proj widens to 2*d_z in). Both
     # inputs are target-only, so source purity holds either way.
     query_uses_logvar: false
+
+    # --- Clock-symmetric conditioning ------------------------------------------
+    # Give the PRIOR head the same input-timing information the posterior already receives, so the
+    # availability clock cancels out of the KL instead of being attributed to the source.
+    #
+    # WHAT THE PRIOR IS GIVEN, and it is not the obvious thing. The intuitive clock is the
+    # availability staircase the source adapter masks and announces with -- which channels have
+    # arrived by step t. That is PROVABLY INERT here: the constructor refuses any anchor floor below
+    # max_c(W'_c + d_c), which is exactly the last step at which the staircase changes, so every
+    # SCORED anchor sees the same all-ones vector and a constant through a LayerNorm and a linear
+    # map is an offset the head's biases already span. Measured: 18 distinct rows over t in [0, 300)
+    # and exactly ONE over the scored [134, 270), with the resulting projection learning to a weight
+    # RMS fifty times below every other matrix in the head and kld_source_null unmoved.
+    #
+    # What survives past the floor is the source ENCODER'S MEMORY of the warm-up transient -- h_u at
+    # t >= F still carries the pattern of channels arriving one by one, because the encoder is
+    # convolutional-recurrent. So the prior is conditioned on the encode of a ZEROED source stream:
+    # the same tensor the source-null control feeds the posterior. It varies at every scored anchor
+    # (136 of 136), and it carries ZERO information about the source's VALUES -- the stream it
+    # encodes is exactly zero, identical for every recording and under every intervention.
+    #
+    # WHY IT IS ON. kld_source_null -- the KL that survives zeroing the source -- measured 3.72 of
+    # 4.56 nats on the conv-LSTM cell and 11.48 of 12.48 on the conv-Transformer cell over the
+    # planted fixture, i.e. four fifths to nine tenths of the attributed coupling. With both branches
+    # given the same deterministic input the divergence between them is learnable to zero, and
+    # kld_source_null becomes the check that the cancellation worked rather than the estimate of the
+    # contamination.
+    #
+    # WHAT IT COSTS. One LayerNorm and one bias-free d_model x d_model projection on the prior head's
+    # own input, plus one extra source encode per forward -- at BATCH 1, since a zero stream encodes
+    # identically in every batch element, then broadcast. The encode is DETACHED and forced out of
+    # train mode: detached so no gradient couples the prior to the source pathway, and out of train
+    # mode so dropout cannot make the clock a fresh random draw every step (it must be a function of
+    # t, or the prior's input distribution differs between the mode the objective runs in and the
+    # mode every readout is measured in). The projection is zero-initialised and re-zeroed after the
+    # generic init pass, so the model is bitwise the unconditioned one at step 0 and the exact
+    # zero-KL start survives.
+    #
+    # `false` builds no projection at all and is bitwise the model that shipped before this key
+    # existed. The two-sided cells never carry this key: their inputs are honest at every step, so
+    # nothing arrives late, and their constructors refuse it by name.
+    prior_availability_input: true
 
     # --- Shared horizon decoder core -------------------------------------------
     # Four dilated refine blocks, so the dilations are (1, 2, 4, 8) and the receptive field over the
@@ -780,7 +910,14 @@ advanced_config:
       # model's runs into the comparison model's experiment, which is unrecoverable afterwards
       # because the two are then indistinguishable by every field anything indexes on.
       experiment_name: seqvae-teb-lag-attn-crws
-      run_name: lag_attn_crws_baseline
+      # THE ARM IS IN THE NAME, both here and in the variant tag below, and that is a second
+      # guard rather than a label. A run whose config drifted between machines trains one arm
+      # while its records name another, and no metric says so -- which is exactly how a
+      # headline evaluation came to be read as the aligned arm having trained unaligned. The
+      # alignment arm is the axis that failure ran along, so it is the axis the name carries: one
+      # reference of 42.21 s, which is already source-only here because this cell's target is
+      # the raw signal and carries no delay to align.
+      run_name: lag_attn_crws_ref42
       artifact_location: null
       # Logs and registers the final eager model at fit end, via the run-logging callback the
       # trainer builder attaches automatically.
@@ -793,19 +930,39 @@ advanced_config:
       tags:
         project: teb_vae
         stage: dev
-        variant: lag_attn_crws
+        variant: lag_attn_crws_ref42
 
   callbacks:
+    # ON, and the patience is the number rather than the flag. A 5000-epoch budget against a run
+    # whose composite optimum landed at epoch 336 of 709 spends most of its wall clock past the
+    # point where the criterion stopped improving, and every epoch after it is a fresh chance for
+    # the source pathway to drift while nothing is being learned. 50 VALIDATION epochs is wide
+    # enough that the beta ramp's plateau and the milestone LR drops both pass inside it -- both
+    # are stretches where `val/total_loss` legitimately stalls -- and narrow enough to end a run
+    # that has stopped moving. `min_delta` is inherited: at a total loss of order 10^3 a 1e-4
+    # threshold is effectively "any improvement at all", which is what patience is for.
     early_stopping:
-      enabled: false
+      enabled: true
       monitor: "val/total_loss"
-      patience: 300
+      patience: 50
       min_delta: 0.0001
 
     model_checkpoint:
       monitor: "val/total_loss"
       save_top_k: 3
       mode: "min"
+      # A SECOND criterion, and it exists because the two optima are not the same epoch: on the
+      # diagnosed H = 15 run the composite `val/total_loss` bottomed at epoch 336 and
+      # `val/nll_full_block` -- the conditioned forecast alone, the quantity every forecast readout
+      # is built on -- at epoch 278. Keeping only the first means the weights that forecast best are
+      # not on disk and nothing recovers them once the epoch has passed, while the run's own metrics
+      # record that they existed.
+      #
+      # One key rather than a second block: `save_top_k` and `mode` above serve both criteria, and a
+      # duplicated surface would be two places for them to disagree. Absent by default, so the
+      # two-sided cells build exactly the one callback they always have. The files are distinguished
+      # by a stem derived from this monitor.
+      secondary_monitor: "val/nll_full_block"
 
     # The per-epoch validation diagnostic figure. The trainer imports the plotter only when this is
     # on, so it costs nothing when off.

@@ -1,0 +1,33 @@
+# Lag-bias initialisation arm: the decaying seed the shipped flat one replaced.
+#
+# `alibi_slope_scale` multiplies the per-head ALiBi slopes that seed `lag_score_bias`. At the
+# shipped 0.0 the seed is FLAT -- a learnable (num_heads, L) parameter that asserts nothing about
+# which lag matters. At 1.0 it is -slope_h * ell, a monotone penalty in the lag, so a freshly built
+# model prefers lag 0 before it has read anything.
+#
+# THIS ARM IS ONE HALF OF A TWO-SIDED QUESTION, and it is the only way to answer it. Every lag
+# profile this family has measured peaks at lag 0, and a decaying seed predicts exactly that on its
+# own -- independently of the data, of the K/V memory and of the alignment. Run against the default,
+# on a fixture whose informative lag is known, the pair separates "the data says lag 0" from "the
+# initialisation says lag 0"; neither run alone can.
+#
+# `lag_bias_init` does NOT move, and the distinction is load-bearing: `normal` registers no bias
+# parameter at all, so it is a third arm about a different object rather than the flat end of this
+# axis.
+#
+#   TEB_RUN_STAMP="$(date '+%Y-%m-%d--[%H-%M]')" torchrun --nproc_per_node=7 \
+#       -m teb_vae.lag_attn_cfs.trainer --config teb_vae/lag_attn_cfs/configs/sweep_lag_bias_decay.yaml
+base: default.yaml
+
+model_config:
+  VAE_model:
+    alibi_slope_scale: 1.0
+
+advanced_config:
+  tracking:
+    mlflow:
+      # IDENTITY: the arm in the name, on both keys, so a run's own records say which arm trained
+      # even if the config it was launched from cannot be recovered.
+      run_name: lag_attn_cfs_alibi_decay
+      tags:
+        variant: lag_attn_cfs_alibi_decay

@@ -179,6 +179,46 @@ PARITY_EXEMPT_PATHS: Dict[str, str] = {
         "block size nor the anchor count, both of which this cell moves; measured against the "
         "breaker's own excursion-above-EMA statistic on the instrumented run"
     ),
+    # The four architecture switches and the three training controls this row takes. Each names a
+    # key the comparison model's constructor does not have and its config never carries, so the
+    # divergence is "this mechanism exists here" rather than "this number was chosen differently".
+    # Two of the six causal switches are DELIBERATELY ABSENT from this list because they are
+    # absent from this row: `persistence_residual` persists a stored target coefficient and this
+    # row's target is the raw signal, and `causal_align_reference_source` is the second half of a
+    # pair of clocks that a zero-delay raw target does not need -- one reference is already
+    # source-only here. Both declines are stated in the design record rather than defaulted off.
+    "model_config.VAE_model.lag_kv_source": (
+        "the lag attention's key/value memory, which has no two-sided counterpart: it selects "
+        "between the deep source encoder and a local source representation, and only a stream "
+        "read through an availability gate has the second"
+    ),
+    "model_config.VAE_model.prior_availability_input": (
+        "the prior's availability clock, which has no two-sided counterpart: it announces which "
+        "source channels have arrived, and a two-sided stream announces nothing because every "
+        "channel is present from the first step"
+    ),
+    "model_config.VAE_model.horizon_weight_halflife_steps": (
+        "the decaying horizon weighting of the reconstruction, which the comparison model's "
+        "constructor does not take; null there, and null is the uniform sum it already computes"
+    ),
+    "model_config.VAE_model.alibi_slope_scale": (
+        "the lag-bias seed's slope multiplier. Shipped at 0.0 here -- a FLAT learnable per-lag "
+        "bias -- because a decaying seed predicts a lag-0 peak before the model has read anything, "
+        "which is a hazard only a cell reading a physiological delay off the lag axis has"
+    ),
+    "advanced_config.callbacks.early_stopping.enabled": (
+        "the training controls: this row stops on val/total_loss where the comparison model runs "
+        "its epoch budget out"
+    ),
+    "advanced_config.callbacks.early_stopping.patience": (
+        "the second half of the control above, in validation epochs; inheriting the comparison "
+        "model's value would make the flag above inert rather than merely different"
+    ),
+    "advanced_config.callbacks.model_checkpoint.secondary_monitor": (
+        "the second checkpoint criterion, on val/nll_full_block. Absent in the comparison config, "
+        "where absence builds no second callback: the composite optimum and the best conditioned "
+        "forecast are different epochs, and only one of them is recoverable without this"
+    ),
 }
 
 #: The exemptions that were **measured** rather than merely permitted. Named as a separate list for
