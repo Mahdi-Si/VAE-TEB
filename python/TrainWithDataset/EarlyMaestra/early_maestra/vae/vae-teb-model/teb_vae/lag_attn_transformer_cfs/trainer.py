@@ -103,7 +103,7 @@ class LagAttnTrfCfsTrainer(LagAttnCfsTrainer, LagAttnTrfRwsTrainer):
     CHECKPOINT_STEM = "lag-attn-trf-cfs"
 
 
-def main(config_path: str) -> None:
+def main(config_path: str) -> LagAttnTrfCfsTrainer:
     """Resolve the config, build everything, and run the fit.
 
     Delegates to the shared entry point with this package's driver. The pre-flight guards, the
@@ -113,8 +113,11 @@ def main(config_path: str) -> None:
 
     Args:
         config_path: Path to the YAML config. Its ``base:`` chain is resolved first.
+
+    Returns:
+        The driver, after the fit -- the only handle on where the run's checkpoints went.
     """
-    run_training(config_path, trainer_cls=LagAttnTrfCfsTrainer)
+    return run_training(config_path, trainer_cls=LagAttnTrfCfsTrainer)
 
 
 def _resolve_cli_config_path(config_path: str) -> str:

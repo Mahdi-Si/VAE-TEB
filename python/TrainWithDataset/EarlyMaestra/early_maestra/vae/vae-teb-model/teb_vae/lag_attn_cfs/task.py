@@ -179,9 +179,26 @@ class SeqVaeLagAttnCfsTask(SeqVaeLagAttnFsTask):
             A builder with the signature of
             :func:`~teb_vae.lag_attn_rws.input_budget.stream_panels`.
         """
+        from functools import partial
+
         from teb_vae.lag_attn_cfs.sample_page import causal_stream_panels
 
-        return causal_stream_panels
+        # The clocks come from the resolved budget rather than from the net, which carries only
+        # the per-channel shifts: tau_ref cannot be recovered from those without the stored
+        # delays the net does not keep. Bound here rather than passed through the shared page
+        # builder, whose hook signature is the two-sided family's and describes a guard that has
+        # no reference at all. A task with no budget -- every hand-built one -- returns the plain
+        # builder, and the rows then omit the clock clause instead of stating a wrong one.
+        budget = self.warmup_budget
+        if budget is None or budget.reference_delay_s is None:
+            return causal_stream_panels
+        return partial(
+            causal_stream_panels,
+            reference_delay_s={
+                "target": budget.reference_delay_s,
+                "source": budget.source_clock_delay_s,
+            },
+        )
 
     def input_budget_figure(self, directory: Any, *, file_format: str = "pdf") -> Path:
         r"""Write the run-level figure: every declared channel's warm-up against the window.

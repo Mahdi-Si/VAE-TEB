@@ -33,6 +33,17 @@ is what makes them legible: their bar runs *forward* from the anchor for as long
 warming up, straight through the forecast window. That is exactly why they were dropped, stated in
 the same units as the forecast.
 
+**And one table, from the same resolved budget**, via :func:`source_reference_tradeoff` -- what
+each candidate clock for the *source* stream buys and costs. The budget figures above price the
+warm-up guard; this prices the **alignment reference**, which is a different decision made against
+the same vectors: a reference is a clock, every source channel slower than it is dropped rather
+than advanced, and the reference itself is how stale the freshest surviving source channel is at
+the anchor. The third column is the one neither figure can draw -- where a physiological
+uterine-activity-to-heart-rate delay lands on the lag axis, which follows from the inter-stream
+offset and is therefore a property of the *pair* of references rather than of either. It is a
+table rather than a figure because its three quantities are counts, one duration and a pair of lag
+bounds, and the decision it feeds is a single pinned float.
+
 This module may depend on ``numpy`` and ``matplotlib``: it is model-layer, like ``plotting.py``,
 imported by the task's figure seam rather than by ``nets/``. It builds no filter bank -- but reusing
 the shipped panel means importing the module that owns it, which pulls ``kymatio`` at module scope
@@ -42,12 +53,25 @@ every process that resolves a warm-up budget.
 """
 from __future__ import annotations
 
+import argparse
+import os
+import sys
 from pathlib import Path
-from typing import Any, List, NamedTuple, Optional, Sequence
+from typing import Any, Dict, List, NamedTuple, Optional, Sequence, Tuple
 
-import numpy as np
+#: Repository root: ``teb_vae/lag_attn_cfs/warmup_budget.py`` -> up three.
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import matplotlib
+# Launched as a script -- from an IDE's Run button, to print the source-reference table at the
+# bottom of this file -- Python puts *this directory* on ``sys.path`` rather than the repository
+# root, and every absolute import below fails before ``__main__`` is ever reached. Guarded rather
+# than unconditional: as an imported module ``__package__`` is set and none of this is needed.
+if not __package__ and _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
+import numpy as np  # noqa: E402
+
+import matplotlib  # noqa: E402
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
@@ -59,18 +83,32 @@ from teb_vae.lag_attn.figure_primitives import (  # noqa: E402
     COLOR_ORANGE,
     COLOR_VERMILLION,
 )
-from teb_vae.lag_attn.nets.lag_report import SECONDS_PER_STEP  # noqa: E402
-from teb_vae.lag_attn_cfs.causal_warmup import StreamWarmup, WarmupBudget  # noqa: E402
+from teb_vae.lag_attn.nets.lag_report import (  # noqa: E402
+    MECHANICAL_SHIFT_SECONDS,
+    SECONDS_PER_STEP,
+)
+from teb_vae.lag_attn_cfs.causal_warmup import (  # noqa: E402
+    ALIGNMENT_DELAY_FACTOR,
+    StreamWarmup,
+    WarmupBudget,
+)
+from teb_vae.lag_attn_rws.eval.launch import resolve_launch_args  # noqa: E402
 from teb_vae.lag_attn_rws.input_budget import _budget_panel  # noqa: E402
 from utils.style import style_axes  # noqa: E402
 
 __all__ = [
     "BUDGET_FIGURE_STEM",
+    "CANDIDATE_FLOOR_SECONDS",
+    "MIN_UP_PH_KEPT",
+    "PHYSIOLOGICAL_BAND_SECONDS",
     "TRADEOFF_FIGURE_STEM",
     "BudgetPoint",
+    "SourceReferencePoint",
     "build_tradeoff_figure",
     "build_warmup_budget_figure",
     "budget_tradeoff",
+    "format_source_reference_table",
+    "source_reference_tradeoff",
     "write_tradeoff_figure",
     "write_warmup_budget_figure",
 ]
@@ -393,3 +431,412 @@ def write_tradeoff_figure(
     return path
 
 
+# =================================================================================================
+# The source alignment reference: what each candidate clock buys, and what it costs
+# =================================================================================================
+#: The uterine-activity-to-heart-rate delay the lag axis exists to resolve, in seconds. Written as
+#: a band rather than a number because it is one: the contraction-to-deceleration interval is not a
+#: constant, and a reference chosen to put a single value inside the window would put half the band
+#: outside it.
+#:
+#: These two numbers are a **measurement setting** and not a launch convenience, which is why they
+#: are a module constant rather than an argument of the entry point below: every candidate row is
+#: read against them, and a value injected from a command line would appear in no artifact.
+PHYSIOLOGICAL_BAND_SECONDS: Tuple[float, float] = (20.0, 60.0)
+
+#: Fastest source channel a candidate reference may be taken from, in seconds. Below it the
+#: envelope block is priced out entirely -- its fastest channel waits $150.786$ s on the shipped
+#: bank -- so a faster candidate keeps no contraction channel at all and there is nothing left for
+#: the lag search to find.
+CANDIDATE_FLOOR_SECONDS = 150.0
+
+#: The stored source block carrying the contraction envelope, and how many of its channels a
+#: candidate must keep. The criterion is the whole reason for pricing the reference rather than
+#: picking one: a faster clock improves the lag axis and pays for it in exactly this block, so a
+#: candidate that reads well on every other column while dropping the envelope has improved the
+#: axis by discarding the signal the axis exists to locate.
+ENVELOPE_BLOCK = "up_ph"
+MIN_UP_PH_KEPT = 8
+
+
+class SourceReferencePoint(NamedTuple):
+    r"""One candidate source clock $\tau^u_{\mathrm{ref}}$, and the three things it decides.
+
+    Attributes:
+        reference_s: The candidate itself, always one of the stream's own stored delays -- a
+            reference between two of them is a clock no channel keeps.
+        kept: Source channels at or below it, i.e. the ones a shift can reach without reading their
+            own future.
+        declared: The stream's declared width, so ``kept`` is readable without a second lookup.
+        block_counts: ``(name, kept, declared)`` per stored source block, which is the resolution
+            the envelope question is actually asked at.
+        envelope_kept: Survivors of :data:`ENVELOPE_BLOCK`, pulled out of ``block_counts`` because
+            it is the one the decision criterion is stated over.
+        offset_s: $\tau^u_{\mathrm{ref}} - \tau^y_{\mathrm{ref}}$, the constant inter-stream bias
+            a dual reference puts on the lag axis in place of the unaligned arm's pair-indexed
+            smear. Zero under today's single reference; negative for every faster candidate.
+        recency_s: How stale the freshest surviving source channel is at the anchor, as the shards
+            report it -- which is the reference itself: every aligned channel reports the physical
+            instant $\Delta t - \tau^u_{\mathrm{ref}}$.
+        realised_recency_s: The same, at the energy centroid $\kappa\,\tau^u_{\mathrm{ref}}$ the
+            channels' content actually sits at. Both are reported because
+            :data:`~teb_vae.lag_attn_cfs.causal_warmup.ALIGNMENT_DELAY_FACTOR` is exactly why they
+            differ and neither alone is the honest figure.
+        band_lag_lo: The **smallest** lag index at which the physiological band is reported, which
+            is the fastest delay at the furthest horizon step. Below $0$ it is censored at the near
+            edge -- the geometry the whole revision starts from.
+        band_lag_hi: The **largest**, i.e. the slowest delay at the first horizon step. Above
+            $L - 1$ it is censored at the far edge.
+        readable: Whether the whole band sits inside $[0, L-1]$ at every horizon step.
+        meets_envelope_criterion: Whether ``envelope_kept`` reaches :data:`MIN_UP_PH_KEPT`.
+    """
+
+    reference_s: float
+    kept: int
+    declared: int
+    block_counts: Tuple[Tuple[str, int, int], ...]
+    envelope_kept: int
+    offset_s: float
+    recency_s: float
+    realised_recency_s: float
+    band_lag_lo: float
+    band_lag_hi: float
+    readable: bool
+    meets_envelope_criterion: bool
+
+
+def _lag_for_physical_delay(
+    delay_s: float,
+    *,
+    offset_s: float,
+    horizon_element: int,
+    seconds_per_step: float = SECONDS_PER_STEP,
+    mechanical_shift_seconds: float = MECHANICAL_SHIFT_SECONDS,
+) -> float:
+    r"""Which lag index reports a physiological delay of ``delay_s`` at horizon step $h$.
+
+    The inverse of :func:`~teb_vae.lag_attn.nets.lag_report.physical_lag_seconds`, solved for
+    $\ell$:
+
+    $$\tau^{\mathrm{phys}}_{\ell,h} = \Delta(\ell + 1 + h) + \bigl(\tau^u_{\mathrm{ref}}
+      - \tau^y_{\mathrm{ref}}\bigr) - \tau_{\mathrm{pre}}
+    \quad\Longleftrightarrow\quad
+    \ell = \frac{\tau^{\mathrm{phys}} + \tau_{\mathrm{pre}} - \mathrm{offset}}{\Delta} - 1 - h .$$
+
+    Returned as a **float** rather than rounded to a bin: what this answers is whether the band
+    clears the window's two censoring edges, and rounding first would turn a delay sitting $0.4$
+    steps below lag $0$ into one sitting exactly on it.
+
+    Args:
+        delay_s: The physiological delay $\tau^{\mathrm{phys}}$ in seconds.
+        offset_s: $\tau^u_{\mathrm{ref}} - \tau^y_{\mathrm{ref}}$, in seconds.
+        horizon_element: $h$, which forecast step the delay is reported against.
+        seconds_per_step: Seconds per decimated step $\Delta$.
+        mechanical_shift_seconds: $\tau_{\mathrm{pre}}$, the sensor delay preprocessing removed.
+
+    Returns:
+        The lag index, unrounded and possibly negative.
+    """
+    return (
+        (float(delay_s) + float(mechanical_shift_seconds) - float(offset_s))
+        / float(seconds_per_step)
+        - 1.0
+        - float(horizon_element)
+    )
+
+
+def source_reference_tradeoff(
+    source: StreamWarmup,
+    *,
+    target_reference_s: float,
+    horizon: int,
+    max_lag: int,
+    band_seconds: Tuple[float, float] = PHYSIOLOGICAL_BAND_SECONDS,
+    candidate_floor_s: float = CANDIDATE_FLOOR_SECONDS,
+) -> List[SourceReferencePoint]:
+    r"""Price every candidate clock for the source stream against the target's own.
+
+    Three quantities move against each other and the choice is where they cross, exactly as they do
+    for the warm-up budget above -- but they are different quantities and the direction is
+    reversed. A **faster** reference brings the freshest source content closer to the anchor and
+    pulls the physiological band up off the near censoring edge; it pays for both by dropping every
+    source channel slower than itself, and the slow source channels are the contraction envelope.
+
+    The drop rule is not a policy restated here: a channel above the reference could only be brought
+    onto it by a negative shift, i.e. by being read from a *later* stored step, which reads raw
+    signal after the anchor. That is
+    :func:`~teb_vae.lag_attn_cfs.causal_warmup._align_stream`'s correctness requirement, and the
+    survivor counts below are the same comparison it makes.
+
+    **Candidates are the stream's own stored delays**, for the reason
+    :func:`~teb_vae.lag_attn_cfs.causal_warmup._resolve_reference_delay` snaps an explicit float to
+    one: the shift re-indexes a channel onto *some channel's* clock, and a reference landing between
+    two of them is a clock no channel keeps, whose residual shows up as a fraction of a step on
+    every channel at once rather than as a failure.
+
+    Args:
+        source: The resolved source stream, read for its declared delays and its block spans.
+        target_reference_s: $\tau^y_{\mathrm{ref}}$, the clock the target keeps. It is also the
+            slowest candidate: a source reference above it would move the source *later* than the
+            target and push the band toward the far censoring edge instead of away from the near
+            one.
+        horizon: $H$ in decimated steps. The band is checked at every horizon step, because the lag
+            reporting a fixed physiological delay moves one bin per step of $h$ -- which is what
+            makes a delay readable at $h = 0$ and censored at $h = H - 1$.
+        max_lag: The lag window's furthest searched lag, $L - 1$.
+        band_seconds: The physiological delay band, ``(fastest, slowest)``.
+        candidate_floor_s: Fastest stored delay a candidate may be taken from.
+
+    Returns:
+        One :class:`SourceReferencePoint` per candidate, ascending in the reference. The row at
+        ``target_reference_s`` is today's single-reference behaviour and is always included, so
+        every other row is read against it.
+
+    Raises:
+        ValueError: If the band is not ``(fastest, slowest)`` with both non-negative, or if no
+            stored source delay falls in the candidate range at all -- the second being a stream
+            this measurement has nothing to say about rather than an empty answer.
+    """
+    band_lo, band_hi = (float(band_seconds[0]), float(band_seconds[1]))
+    if not 0.0 <= band_lo <= band_hi:
+        raise ValueError(
+            f"band_seconds={band_seconds} must be (fastest, slowest) with both >= 0. The band is "
+            f"read as a closed interval of physiological delays, so a reversed pair would report "
+            f"the lag bounds inverted and every readability verdict with them."
+        )
+
+    delays = np.asarray(source.declared_delay_s, dtype=np.float64)
+    reference = float(target_reference_s)
+    candidates = np.unique(
+        delays[(delays >= float(candidate_floor_s)) & (delays <= reference)]
+    )
+    if not candidates.size:
+        raise ValueError(
+            f"no stored {source.name} delay falls in [{float(candidate_floor_s):g}, "
+            f"{reference:.4f}] s, so there is no candidate reference to price: the stream's "
+            f"delays run {float(delays.min()):.4f}-{float(delays.max()):.4f} s. A reference must "
+            f"be one of them, so it is the range that is empty rather than the answer."
+        )
+
+    points: List[SourceReferencePoint] = []
+    for candidate in candidates.tolist():
+        # The alignment's own comparison, exactly: at or below the reference is reachable by a
+        # non-negative shift, above it is not.
+        keep = np.flatnonzero(delays <= candidate)
+        blocks = tuple(
+            (name, int(np.count_nonzero((keep >= start) & (keep < stop))), stop - start)
+            for name, start, stop in source.block_spans
+        )
+        envelope = next((kept for name, kept, _ in blocks if name == ENVELOPE_BLOCK), 0)
+        offset = candidate - reference
+        # The fastest delay at the furthest horizon step is the smallest lag the band ever occupies,
+        # and the slowest delay at the first step is the largest: the lag is affine, decreasing in
+        # $h$ and increasing in the delay, so those two corners bracket the whole rectangle.
+        lag_lo = _lag_for_physical_delay(
+            band_lo, offset_s=offset, horizon_element=int(horizon) - 1
+        )
+        lag_hi = _lag_for_physical_delay(band_hi, offset_s=offset, horizon_element=0)
+        points.append(
+            SourceReferencePoint(
+                reference_s=float(candidate),
+                kept=int(keep.size),
+                declared=int(delays.size),
+                block_counts=blocks,
+                envelope_kept=int(envelope),
+                offset_s=float(offset),
+                recency_s=float(candidate),
+                realised_recency_s=float(ALIGNMENT_DELAY_FACTOR * candidate),
+                band_lag_lo=float(lag_lo),
+                band_lag_hi=float(lag_hi),
+                readable=bool(lag_lo >= 0.0 and lag_hi <= float(max_lag)),
+                meets_envelope_criterion=bool(envelope >= MIN_UP_PH_KEPT),
+            )
+        )
+    return points
+
+
+def format_source_reference_table(
+    points: Sequence[SourceReferencePoint],
+    *,
+    max_lag: int,
+    horizon: int,
+    band_seconds: Tuple[float, float] = PHYSIOLOGICAL_BAND_SECONDS,
+) -> str:
+    """Lay the candidates out as one row each, with both decision criteria applied.
+
+    Args:
+        points: The candidates, from :func:`source_reference_tradeoff`.
+        max_lag: The furthest searched lag $L - 1$, which is the far censoring edge.
+        horizon: $H$, stated in the header because the lag bounds are taken across it.
+        band_seconds: The band the bounds were computed for, stated for the same reason.
+
+    Returns:
+        The table, then the candidate the two criteria select and the number that goes into a
+        config -- at the precision the resolver snaps at -- or the statement that none does.
+    """
+    band_lo, band_hi = (float(band_seconds[0]), float(band_seconds[1]))
+    blocks = tuple(name for name, _, _ in points[0].block_counts) if points else ()
+    lines = [
+        f"source alignment reference: {len(points)} candidate(s), band {band_lo:g}-{band_hi:g} s "
+        f"across h in [0, {int(horizon) - 1}], lag window [0, {int(max_lag)}]",
+        f"  {'reference':>12}  {'kept':>10}  "
+        + "  ".join(f"{name:>12}" for name in blocks)
+        + f"  {'offset':>9}  {'recency':>16}  {'band lags':>18}  verdict",
+    ]
+    for point in points:
+        counts = "  ".join(
+            f"{kept:>5}/{declared:<6}" for _, kept, declared in point.block_counts
+        )
+        verdict = ("readable" if point.readable else "CENSORED") + (
+            "" if point.meets_envelope_criterion else f", {ENVELOPE_BLOCK} short"
+        )
+        lines.append(
+            f"  {point.reference_s:>12.4f}  {point.kept:>4}/{point.declared:<5}  {counts}  "
+            f"{point.offset_s:>+9.2f}  {point.recency_s:>6.1f} ({point.realised_recency_s:>5.1f})"
+            f"  {point.band_lag_lo:>8.1f} - {point.band_lag_hi:<6.1f}  {verdict}"
+        )
+
+    winners = [point for point in points if point.readable and point.meets_envelope_criterion]
+    lines.append("")
+    if winners:
+        # The slowest survivor, not the fastest: every criterion is satisfied by all of them, and
+        # among equals the one that discards the fewest source channels is the one to pin.
+        chosen = winners[-1]
+        declared_envelope = next(
+            (declared for name, _, declared in chosen.block_counts if name == ENVELOPE_BLOCK), 0
+        )
+        lines.append(
+            f"pinned: causal_align_reference_source = {chosen.reference_s:.4f} s -- "
+            f"{chosen.kept}/{chosen.declared} source channels, {ENVELOPE_BLOCK} "
+            f"{chosen.envelope_kept}/{declared_envelope} kept against {MIN_UP_PH_KEPT} required, "
+            f"recency {chosen.recency_s:.1f} s reported / {chosen.realised_recency_s:.1f} s "
+            f"realised, band at lags {chosen.band_lag_lo:.1f}-{chosen.band_lag_hi:.1f}"
+        )
+    else:
+        lines.append(
+            f"no candidate satisfies both criteria: the band must sit inside [0, {int(max_lag)}] "
+            f"at every horizon step AND at least {MIN_UP_PH_KEPT} {ENVELOPE_BLOCK} channels must "
+            f"survive. Widen the lag window, shorten the horizon, or accept a censored band."
+        )
+    return "\n".join(lines)
+
+
+# =================================================================================================
+# Entry point
+# =================================================================================================
+def build_parser() -> argparse.ArgumentParser:
+    """The command line, with every default left at ``None``.
+
+    A non-``None`` argparse default would be indistinguishable from a value the operator typed,
+    which would make the matching :data:`RUN_ARGS` entry unreachable: the dict would be edited,
+    nothing would change, and nothing would say why.
+
+    Returns:
+        The parser.
+    """
+    parser = argparse.ArgumentParser(
+        description="Price every candidate alignment reference for the source stream."
+    )
+    parser.add_argument(
+        "--config",
+        help=(
+            "Config carrying the warm-up budget and the shards to resolve it against. A relative "
+            "path is resolved against the repository root, not the working directory."
+        ),
+    )
+    return parser
+
+
+def main(config: str) -> int:
+    """Resolve a config's budget and print the source-reference table.
+
+    Args:
+        config: Path to the config, absolute or repository-root-relative.
+
+    Returns:
+        The process exit code: $0$ on a printed table, $2$ on a configuration that has none.
+    """
+    from teb_vae.lag_attn.config import load_config
+    from teb_vae.lag_attn_cfs.causal_warmup import BUDGET_KEY, resolve_warmup_budget
+
+    path = config if os.path.isabs(config) else os.path.join(_REPO_ROOT, config)
+    if not os.path.exists(path):
+        print(
+            f"--config {config!r} does not resolve to a file. Pass a path, or edit RUN_ARGS near "
+            f"the bottom of {os.path.basename(__file__)}."
+        )
+        return 2
+
+    loaded = load_config(path)
+    resolved = resolve_warmup_budget(loaded)
+    if resolved is None:
+        print(f"{path} sets no {BUDGET_KEY}; there is no stream description to price against.")
+        return 2
+    if resolved.reference_delay_s is None:
+        print(
+            f"{path} runs unaligned (causal_align_reference: null), so there is no target "
+            f"reference for a source reference to be offset against. The scheme is a pair of "
+            f"clocks; price it against a config that configures the first one."
+        )
+        return 2
+
+    vae_config = (loaded.get("model_config") or {}).get("VAE_model") or {}
+    horizon, max_lag = int(vae_config["horizon"]), int(vae_config["max_lag"])
+    print(resolved.summary())
+    print()
+    print(
+        format_source_reference_table(
+            source_reference_tradeoff(
+                resolved.source,
+                target_reference_s=resolved.reference_delay_s,
+                horizon=horizon,
+                max_lag=max_lag,
+            ),
+            max_lag=max_lag,
+            horizon=horizon,
+        )
+    )
+    return 0
+
+
+#: Values used for arguments absent from the command line -- i.e. an IDE's Run button. Keyed by
+#: argparse ``dest``, and merged per key, so a flag overrides one value and leaves the rest of the
+#: dict standing.
+#:
+#: Nothing here has to be filled in: the file runs as it stands. ``planted.yaml`` is the default
+#: for two reasons and both are load-bearing. Its shards are **committed**, and they carry the
+#: production channel plan -- every causal fixture here is transformed by the real bank, so its
+#: delay staircase is the production staircase -- which makes this table the table the pinning
+#: decision is made from at no cost in shards. And it is the only committed config carrying the
+#: production **lag window**: ``tiny.yaml`` shrinks ``max_lag`` to $8$, and every readability
+#: verdict below is a statement about $[0, L-1]$, so a table drawn at that window would report
+#: every candidate censored for a reason that is the config's rather than the geometry's.
+RUN_ARGS: Dict[str, Any] = {
+    "config": "teb_vae/lag_attn_cfs/configs/planted.yaml",
+}
+
+
+def _cli(argv: Optional[Sequence[str]] = None) -> int:
+    """Merge the command line over :data:`RUN_ARGS`, then print the table.
+
+    Args:
+        argv: Command-line arguments, or ``None`` to read ``sys.argv``.
+
+    Returns:
+        The process exit code.
+    """
+    values, sources = resolve_launch_args(build_parser(), RUN_ARGS, argv)
+    # The shard paths inside a config are repo-root-relative, and under an IDE Run button the
+    # working directory is whatever the IDE chose -- where a relative path resolves to nothing and
+    # the read fails as "no samples match the specified filters" with no mention of the real cause.
+    if os.path.abspath(os.getcwd()) != _REPO_ROOT:
+        os.chdir(_REPO_ROOT)
+    print(
+        "resolved arguments: "
+        + ", ".join(f"{key}={values[key]!r} (from {sources[key]})" for key in sorted(values))
+    )
+    return main(values["config"])
+
+
+if __name__ == "__main__":
+    sys.exit(_cli())

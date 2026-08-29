@@ -109,3 +109,47 @@ def test_the_shared_sibling_forward_fingerprints_are_unchanged():
             atol=1e-3,
             msg=f"{key} magnitude drifted -- a shared-class forward changed",
         )
+
+
+#: The mechanisms the causal family's revision added, and where each one's off-state is guarded
+#: **for this sibling**. Four are absent from this constructor entirely, which is the strongest form
+#: the guard takes: a flag that cannot be passed cannot leak, whatever its default becomes.
+#:
+#: ``alibi_slope_scale`` is the exception and is the reason this is a mapping rather than a list. It
+#: is an old keyword of the shared attention, not a new one -- what the revision changed is which
+#: value the causal configs ship. So it is guarded by its DEFAULT here: the fingerprints above are
+#: measured at $1.0$, and a default moved to the causal family's flat $0.0$ would silently reseed
+#: this sibling's lag bias and every number it reports.
+_REVISION_KEYWORDS: dict = {
+    "lag_kv_source": None,
+    "prior_availability_input": None,
+    "persistence_residual": None,
+    "horizon_weight_halflife_steps": None,
+    "alibi_slope_scale": 1.0,
+}
+
+
+def test_no_revision_keyword_reaches_this_sibling_except_by_its_old_default():
+    """The construction half of the same guard the fingerprints make behaviourally.
+
+    A parameter count and two fingerprints say the sibling's numbers did not move; this says *why*
+    it is structurally hard for them to. Four of the five mechanisms are not keywords of this class
+    at all, so no config and no default can reach them here, and the fifth is pinned at the value
+    the fingerprints were measured under.
+
+    Both halves matter and neither implies the other: a keyword could be added here with a
+    behaviour-preserving default and pass the fingerprints while opening a route for a later
+    default change; and the fifth keyword's default could move while the four stayed absent.
+    """
+    import inspect
+
+    parameters = inspect.signature(SeqVaeLagAttn.__init__).parameters
+
+    for name, expected in _REVISION_KEYWORDS.items():
+        if expected is None:
+            assert name not in parameters, (
+                f"{name} became a keyword of the two-sided model; the causal family's mechanisms "
+                f"are gated so that this sibling never takes them"
+            )
+        else:
+            assert parameters[name].default == expected, name

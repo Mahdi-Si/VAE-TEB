@@ -268,3 +268,91 @@ def test_the_anchor_tensor_shape_is_a_geometry_constant_at_every_phase(phase) ->
         assert len(set(real.tolist())) == int(valid[row].sum())
         if not bool(valid[row].all()):
             assert int(index[row][~valid[row]][0]) == int(real[-1])
+
+
+# =================================================================================================
+# The revision's new parameters, and the same claim re-earned on each
+#
+# Three of the mechanisms this family added build a parameter, and every one of them is exactly the
+# shape ``find_unused_parameters=False`` refuses: a tensor whose gradient path is easy to lose and
+# whose absence changes no shape. The prior's clock projection is fed by a DETACHED encode, so a
+# forward that used the clock and nothing else would starve it; the persistence weight enters the
+# mean head alone, so a decode that dropped it would starve it while every forecast stayed correctly
+# shaped; and the flat lag bias is seeded to exact zeros, which is the state in which a multiply
+# that had been dropped is invisible.
+#
+# Re-earned rather than argued, on the arm the configs ship, because a starved parameter makes the
+# reducer raise on the first production step and on no development-box run.
+# =================================================================================================
+#: The shipped architecture switches, at the values the causal configs carry.
+_SHIPPED_SWITCHES = dict(
+    lag_kv_source="conv_stem",
+    prior_availability_input=True,
+    horizon_weight_halflife_steps=5.0,
+    alibi_slope_scale=0.0,
+    lag_bias_init="alibi_decay",
+)
+
+
+#: The parameters those switches build, by state-dict name. Written out rather than discovered: a
+#: reachability test over whatever a model happened to build would pass on a model that built
+#: nothing, which is the state every one of these keys is one config line away from. The
+#: persistence weight is absent because this row declines the residual: its target is the raw
+#: signal, so there is no stored coefficient to persist.
+_EXPECTED_NEW_PARAMETERS = (
+    "prior_head.clock_proj.weight",
+    "lag_attn.lag_score_bias",
+)
+
+
+@pytest.mark.parametrize("beta_prior", [0.0, 0.1], ids=["unanchored", "anchored"])
+def test_no_parameter_the_revision_added_is_left_without_a_gradient(
+    task, perturb_posterior, beta_prior
+):
+    """The same claim as above at the shipped switches, and the three parameters it is about.
+
+    Asserted in two halves. The starved set must be empty, which is what the reducer checks; and
+    the three new parameters must be *present*, because an empty starved set is also what a model
+    that built none of them would report.
+    """
+    module = task(
+        model_kwargs=tiny_warmup_kwargs(anchor_stride=TINY_STRIDE, **_SHIPPED_SWITCHES),
+        hparams={"likelihood": "gaussian_nll", "beta_prior": beta_prior},
+    )
+    perturb_posterior(module.orig_model)
+    names = dict(module.orig_model.named_parameters())
+    for expected in _EXPECTED_NEW_PARAMETERS:
+        assert expected in names, expected
+
+    starved = _starved_parameters(module, 0)
+
+    assert not starved, (
+        f"parameters expecting a gradient but not receiving one: {starved}. Under "
+        f"find_unused_parameters=False the reducer raises on exactly these."
+    )
+
+
+def test_the_detached_prior_clock_does_not_starve_the_source_pathway(task, perturb_posterior):
+    """The interaction the clock introduces, and the one that would be easy to get backwards.
+
+    ``_prior_clock`` is detached, so no gradient flows from the prior into the source adapter or
+    whichever body ``lag_kv_source`` built. Those modules are not starved by that -- they still
+    receive gradient from the matched forward in the same step -- and this is what says so. The
+    failure it catches is a K/V arm whose pathway reaches the graph ONLY through the clock, which
+    would leave every one of its parameters in the reducer's expectation set and out of the graph.
+    """
+    module = task(
+        model_kwargs=tiny_warmup_kwargs(anchor_stride=TINY_STRIDE, **_SHIPPED_SWITCHES),
+        hparams={"likelihood": "gaussian_nll"},
+    )
+    perturb_posterior(module.orig_model)
+
+    starved = set(_starved_parameters(module, 0))
+    pathway = [
+        name
+        for name, _ in module.orig_model.named_parameters()
+        if name.startswith("source_adapter.") or name.startswith("source_kv_stem.")
+    ]
+
+    assert pathway, "the source pathway built no parameters, so this proves nothing"
+    assert starved.isdisjoint(pathway)

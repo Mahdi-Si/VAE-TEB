@@ -34,6 +34,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Mapping, Tuple
 
 from teb_vae.lag_attn_cfs.eval.analyses import lag_clocks as lag_clocks_analysis
+from teb_vae.lag_attn_cfs.eval.analyses import occlusion as occlusion_analysis
 from teb_vae.lag_attn_cfs.eval.analyses import source_null as source_null_analysis
 from teb_vae.lag_attn_cfs.eval.analyses import spectral_skill as spectral_skill_analysis
 from teb_vae.lag_attn_cfs.eval.analyses import warmup as warmup_analysis
@@ -112,6 +113,18 @@ class ModelBinding:
 #: of the three quantities the lag-support margin is made of, and a non-zero one silently
 #: reintroduces the truncation the shipped geometry does not have.
 #:
+#: ``prior_availability_input`` is here because it changes **what the KL means**. With it off, the
+#: source-conditioned KL contains an availability-clock term the posterior alone was told about;
+#: with it on, that term cancels by construction. A checkpoint and a config disagreeing about it
+#: would put two different quantities in one column named ``source_conditioned_kl_raw``, and the
+#: source-null control -- the one readout that would show it -- is a tier-2 number nobody gates on.
+#:
+#: ``lag_kv_source`` is here for the same reason: it changes **what the lag axis is**. The keys and
+#: values the attention scores are a deep history state under ``encoder`` and a bounded local one
+#: under the local arms, so the same profile shape means two different things -- and the resolution
+#: floor of every lag readout moves with it. A checkpoint and a config disagreeing about it would
+#: put two incomparable profiles in one column.
+#:
 #: **``causal_warmup_budget_steps`` is deliberately absent, and so are the four resolved tuples.**
 #: The budget is a config key but **not** a constructor parameter: the driver resolves it against
 #: the shards into ``target_keep_index``, ``target_warmup_steps``, ``source_keep_index`` and
@@ -122,6 +135,20 @@ class ModelBinding:
 #: tuples -- the only comparison that can actually fail. ``decoder_out_channels`` is absent for the
 #: mirror-image reason: a parameter of this constructor but of no config, and recoverable from the
 #: stamped ``target_keep_index`` anyway.
+#:
+#: ``persistence_residual`` **is** here, because it changes what the forecast is: with it on the
+#: decoder's mean carries a weighted copy of the anchor's own target vector, so every ``nll_*``,
+#: every skill comparison against the persistence baseline and every per-channel error is measured
+#: on a different predictor. The rebuild takes the checkpoint's value, so a config disagreeing about
+#: it would not fail -- it would report the residual model's numbers under the residual-free model's
+#: stated architecture.
+#:
+#: **``horizon_weight_halflife_steps`` is deliberately absent**, on the same ground as
+#: ``SCHEDULE_KEYS`` and the objective weights: it re-weights the *training* criterion's horizon
+#: axis and no evaluated readout applies it -- this pipeline scores every block unweighted, so its
+#: ``nll_*`` and ``pred_gap`` are true log-densities in nats whatever the fit optimised. A half-life
+#: edited after the fit therefore changes nothing this run measures, and refusing the run for it
+#: would refuse a config that contradicts no reported number.
 GEOMETRY_KEYS: Tuple[str, ...] = (
     "sequence_length",
     "d_model",
@@ -139,6 +166,9 @@ GEOMETRY_KEYS: Tuple[str, ...] = (
     "causal_norm",
     "anchor_stride",
     "lag_floor",
+    "prior_availability_input",
+    "lag_kv_source",
+    "persistence_residual",
 )
 
 #: Analyses only this cell can have, merged onto the shared registry in declaration order. They are
@@ -162,6 +192,12 @@ GEOMETRY_KEYS: Tuple[str, ...] = (
 EXTRA_ANALYSES: Dict[str, Any] = {
     "warmup": warmup_analysis.run_warmup_analysis,
     "source_null": source_null_analysis.run_source_null_analysis,
+    # The interventional half of the lag question, beside the observational one. It costs a
+    # re-encode and a decode per band per batch, so it is registered after the two cheap causal
+    # readouts and before the two that only read tables -- and it is the second analysis in this
+    # package permitted to reach for the model on the context, because an intervention on the
+    # model's INPUT cannot be served by any table a forward already wrote.
+    "occlusion": occlusion_analysis.run_occlusion_analysis,
     # Reads the collected tables and the vector sidecar only, so its position is a reading order
     # rather than a dependency: the lag structure against time before delivery and against the
     # second-stage onset, beside the two clocks that resolve the coupling magnitude.
@@ -223,6 +259,20 @@ HEADLINE_SCALARS: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
         ("spectral_skill", "headline", "pred_gap_beat_to_beat_nats"),
     ),
     ("spectral_gap_unknown_nats", ("spectral_skill", "headline", "pred_gap_unknown_nats")),
+    # The interventional readout's own, and deliberately a **scalar rather than a verdict**: how
+    # much a forecast loses without a band of source is a measurement whose healthy range nothing
+    # has established, and a threshold guessed before the first production runs would decide a
+    # pass or a fail on exactly the run that was going to measure it. Registered so the number
+    # reaches every arm table from the first run, which is what lets a threshold be set from data.
+    #
+    # Four entries rather than one, because the winning band's delta is unreadable alone: the band
+    # NAME says which lags it was, the peak horizon step says where over the forecast it landed,
+    # and the live fraction says whether there was any source in the band to remove -- a band deep
+    # in the warm-up scores near zero for a reason that is about the geometry.
+    ("occlusion_peak_band", ("occlusion", "headline", "band")),
+    ("occlusion_peak_band_delta_nats", ("occlusion", "headline", "delta_total_nats")),
+    ("occlusion_peak_band_horizon_step", ("occlusion", "headline", "peak_horizon_step")),
+    ("occlusion_peak_band_live_fraction", ("occlusion", "headline", "live_fraction")),
 )
 
 

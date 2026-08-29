@@ -34,9 +34,21 @@ _DEFAULT = _CONFIG_DIR / "default.yaml"
 
 _VAE = "model_config.VAE_model"
 
+#: Where a run says which arm it is. Both paths, because either alone is recoverable from a
+#: half-configured run: the name is what an operator reads and the tag is what an arm table groups
+#: on, and a run whose two disagree is the drift this guard exists to make visible.
+_RUN_NAME = "advanced_config.tracking.mlflow.run_name"
+_VARIANT = "advanced_config.tracking.mlflow.tags.variant"
+
 #: Every arm: file name -> the exact leaf delta it declares. Written out rather than derived, so a
 #: file whose keys disagree fails against a stated intention instead of against an expression that
 #: would derive the same mistake twice.
+#:
+#: The four arms declared last carry **three** paths each rather than one: their own axis, and the
+#: two identity keys. The identity pair is not a second delta -- it is the same delta, written
+#: where a finished run can still be asked which side of the axis it trained on. The four arms
+#: above them predate that convention and inherit the default's name; they are left as they are
+#: rather than renamed under a task about the inventory.
 _ARMS: Dict[str, Dict[str, Any]] = {
     # The tiling ablation. 1 is the INERT stride -- the dense range every other cell of the grid
     # decodes -- so this arm is the control that says what the tiling costs or buys.
@@ -50,7 +62,44 @@ _ARMS: Dict[str, Dict[str, Any]] = {
     # Parameter economy against parity: the receptive-field argument is moot in both directions,
     # because the horizon attention blocks mix every token unmasked after the refine stack.
     "sweep_horizon_depth_3.yaml": {f"{_VAE}.horizon_depth": 3},
+    # The lag-bias seed. The default seeds the learnable (num_heads, L) bias FLAT; this restores
+    # the decaying seed, which predicts a lag-0 peak on its own. `lag_bias_init` deliberately does
+    # not move with it -- `normal` builds no bias parameter at all, so it is a different object.
+    "sweep_lag_bias_decay.yaml": {
+        f"{_VAE}.alibi_slope_scale": 1.0,
+        _RUN_NAME: "lag_attn_cfs_alibi_decay",
+        _VARIANT: "lag_attn_cfs_alibi_decay",
+    },
+    # One clock rather than two: the source key null restores the single-reference resolution, so
+    # both streams read on the target's 402.1604 s and the lag axis carries no inter-stream offset.
+    "sweep_align_target_max.yaml": {
+        f"{_VAE}.causal_align_reference_source": None,
+        _RUN_NAME: "lag_attn_cfs_align_target_max",
+        _VARIANT: "lag_attn_cfs_align_target_max",
+    },
+    # No clock at all -- the unaligned end of the pre-registered pair. The SECOND model key is
+    # forced rather than a second axis: a source reference is one half of a pair of clocks, and the
+    # resolver refuses it against an unaligned target by name, so an arm moving only the first
+    # would not launch. The same shape as `sweep_horizon_15.yaml`'s stride.
+    "sweep_align_unaligned.yaml": {
+        f"{_VAE}.causal_align_reference": None,
+        f"{_VAE}.causal_align_reference_source": None,
+        _RUN_NAME: "lag_attn_cfs_unaligned",
+        _VARIANT: "lag_attn_cfs_unaligned",
+    },
+    # The sharp lag memory: keys and values from the adapter output, one step of reach, against the
+    # default's conv stem. The smallest of the three K/V models.
+    "sweep_lag_kv_adapter.yaml": {
+        f"{_VAE}.lag_kv_source": "adapter",
+        _RUN_NAME: "lag_attn_cfs_kv_adapter",
+        _VARIANT: "lag_attn_cfs_kv_adapter",
+    },
 }
+
+#: The arms whose delta is one *model* axis plus the identity pair, and the value each names. The
+#: identity keys are excluded here on purpose: what this checks is that the arm's own axis is a key
+#: the constructor or the task actually reads, which the tracking block is not.
+_IDENTITY_PATHS = (_RUN_NAME, _VARIANT)
 
 #: The arms whose stride is expected to equal their horizon. ``sweep_anchor_stride_1.yaml`` is the
 #: exception BY CONSTRUCTION -- decoupling the two is the whole content of that arm -- which is why
@@ -119,7 +168,35 @@ def test_the_config_directory_holds_exactly_the_declared_files():
     is one nothing here checks, and configs are launchable by path."""
     present = {path.name for path in _CONFIG_DIR.glob("*.yaml")}
 
-    assert present == set(_ARMS) | {"default.yaml", "tiny.yaml", "smoke_hie.yaml"}
+    assert present == set(_ARMS) | {
+        "default.yaml",
+        "tiny.yaml",
+        "smoke_hie.yaml",
+        # The identifiability instrument's own delta. Not an arm and deliberately not linted as
+        # one: it pins a geometry (the production lag window at tiny widths, a single clock) that
+        # is held fixed against the default so a later default flip cannot move the instrument,
+        # which is exactly the property the one-axis lint would refuse.
+        "planted.yaml",
+    }
+
+
+@pytest.mark.parametrize("name", sorted(_ARMS))
+def test_an_arm_that_declares_an_identity_names_itself_on_both_keys(name):
+    """The drift guard, checked where it can be: a run's own records must say which arm trained.
+
+    A config is a file on one machine and a run is an artifact directory on another; the two have
+    been separated before, and a run whose artifacts cannot name its arm gets attributed to the
+    default by whoever reads it later. So the arm goes in the name AND in the variant tag, and the
+    two must agree -- a mismatch is the one failure that would otherwise survive both halves.
+    """
+    intended = _ARMS[name]
+    if not any(path in intended for path in _IDENTITY_PATHS):
+        pytest.skip(f"{name} predates the identity convention and inherits the default's name")
+
+    flat = _flatten(_resolved(name))
+    assert flat[_RUN_NAME] == flat[_VARIANT], "the name and the tag name different arms"
+    assert flat[_RUN_NAME] == intended[_RUN_NAME]
+    assert flat[_RUN_NAME] != _flatten(load_config(str(_DEFAULT)))[_RUN_NAME]
 
 
 # --------------------------------------------------------------------------------------

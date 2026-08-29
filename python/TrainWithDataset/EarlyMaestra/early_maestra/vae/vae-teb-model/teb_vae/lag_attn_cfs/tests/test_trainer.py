@@ -53,11 +53,17 @@ _MODULE_NAME = "teb_vae.lag_attn_cfs.trainer"
 #: width and therefore the units of every number the run reports.
 #:
 #: The two numbers come from two different rules. The **warm-up budget** takes four ``fhr_st``
-#: channels off the target and never touches the source; the **alignment reference** takes the four
-#: ``up_st`` channels slower than it off the source and never touches the target, because the
-#: reference is the target's own maximum.
+#: channels off the target and never touches the source; the **alignment references** take every
+#: channel slower than their own stream's reference and never touch the other stream.
+#:
+#: **The source number moved when the two streams stopped sharing one clock.** Under a single
+#: reference at the target's own maximum it was $47$: four ``up_st`` casualties and all fifteen
+#: ``up_ph``. The shipped source reference is faster than the target's by a known offset, and it
+#: costs eight more -- $30$ of $36$ ``up_st`` and $9$ of $15$ ``up_ph``. That is the trade the
+#: reference was pinned on, and it is a *width* rather than a preference: the source adapter, the
+#: gate and the availability announcement are all built at it.
 GUARDED_TARGET_CHANNELS = 98
-GUARDED_SOURCE_CHANNELS = 47
+GUARDED_SOURCE_CHANNELS = 39
 
 #: Callables and class attributes this driver may define. A set rather than a count: a count passes
 #: a subclass that overrode ``train_model`` in 75 lines while dropping the plot callback.
@@ -270,14 +276,23 @@ def test_the_causal_standing_message_is_not_the_inherited_one(driver):
     """The inherited sentence is the most misleading line a causal run could carry: it says the
     stored features let step $t$ read up to $974$ s into its own future, which is the property this
     dataset variant removes. What is true here is the pair -- one-sidedness, and what the budget did
-    about the region where one-sidedness costs something."""
+    about the region where one-sidedness costs something.
+
+    The two survivor counts are asserted separately because they are decided by different rules and
+    now by different clocks: the target's by the warm-up budget, the source's by a reference of its
+    own that is faster than the target's. Both clocks are named on the same line, with the offset
+    between them, which is what makes the line reconstructable rather than merely reassuring.
+    """
     driver._build_model_kwargs()
 
     message = driver.causal_standing_message()
 
     assert "974" not in message
     assert "one-sided" in message
-    assert "98/102" in message and "47/51" in message
+    assert f"{GUARDED_TARGET_CHANNELS}/102" in message
+    assert f"{GUARDED_SOURCE_CHANNELS}/51" in message
+    assert "target reference" in message and "source reference" in message
+    assert "inter-stream offset" in message
 
 
 def test_the_ungated_standing_message_says_what_is_being_read_unguarded(driver):
@@ -604,3 +619,106 @@ def test_the_seeding_scan_still_reports_an_unforked_seed(tmp_path):
     offenders = hand_seeding_offenders(package)
 
     assert offenders == ["bare.py: torch.manual_seed("]
+
+
+# =================================================================================================
+# The training controls
+#
+# Two decisions about when a run stops and which epochs it keeps, and both are configuration rather
+# than code -- which is exactly why they need a test. A flag that reaches nothing raises nothing:
+# `enabled: false` and a monitor the framework never emits are indistinguishable from the outside,
+# and the run simply trains its whole budget out with no line saying the control was inert.
+#
+# The shipped config is read here rather than the tiny one, because these are production settings:
+# the tiny variant runs two epochs and a patience of fifty would be inert there for a reason that
+# says nothing about the arm.
+# =================================================================================================
+def _shipped_callbacks_block():
+    """The shipped config's ``advanced_config.callbacks`` block, read off the committed file."""
+    from teb_vae.lag_attn.config import load_config
+
+    shipped = Path(__file__).resolve().parents[1] / "configs" / "default.yaml"
+    return load_config(str(shipped))["advanced_config"]["callbacks"]
+
+
+def test_early_stopping_is_on_and_monitors_a_metric_this_task_emits(
+    task, stub_batch, perturb_posterior
+) -> None:
+    """Both halves of one guarantee, and the second is what makes the first worth having.
+
+    On, because a run of this family has been observed to reach its composite optimum hundreds of
+    epochs before its budget ends, and every epoch after that is compute spent on a checkpoint
+    nothing will select. And monitoring a name the task actually emits, because Lightning treats a
+    monitor it cannot find as nothing to stop on: the flag would read as enabled in every artifact
+    and the run would train to its budget anyway.
+
+    The patience is asserted as a *band* rather than a value. What it has to be is long enough that
+    a plateau in a noisy validation curve is not read as convergence and short enough to save real
+    time; the exact number inside that band is a choice, and pinning it would make a retune a test
+    edit rather than a decision.
+    """
+    block = _shipped_callbacks_block()["early_stopping"]
+    module = task()
+    perturb_posterior(module.orig_model)
+    _loss, val_metrics = module.compute_loss_and_metrics(stub_batch, 0, "val")
+
+    assert block["enabled"] is True
+    assert block["monitor"] == "val/total_loss"
+    assert block["monitor"].split("/", 1)[1] in val_metrics
+    assert 40 <= int(block["patience"]) <= 60
+    assert float(block["min_delta"]) > 0.0, (
+        "a zero min_delta stops on any improvement at all, which on a noisy validation curve is "
+        "never"
+    )
+
+
+def test_the_second_checkpoint_criterion_names_a_metric_this_task_emits(
+    task, stub_batch, perturb_posterior
+) -> None:
+    """The composite optimum and the best conditioned forecast are different epochs -- fifty-odd
+    apart on a measured run of this family -- and one criterion makes the other epoch's weights
+    unrecoverable afterwards.
+
+    The monitor has to be a name the task emits for the same reason early stopping's does: a
+    ``ModelCheckpoint`` whose monitor never appears in ``callback_metrics`` saves nothing and says
+    nothing, so the second criterion would be a config line and an empty directory.
+    """
+    block = _shipped_callbacks_block()["model_checkpoint"]
+    module = task()
+    perturb_posterior(module.orig_model)
+    _loss, val_metrics = module.compute_loss_and_metrics(stub_batch, 0, "val")
+
+    assert block["secondary_monitor"] == "val/nll_full_block"
+    assert block["secondary_monitor"].split("/", 1)[1] in val_metrics
+    # A different criterion from the primary one, which is the whole point: two callbacks on one
+    # monitor would keep the same epochs twice and cost twice the disk for nothing.
+    assert block["secondary_monitor"] != block["monitor"]
+
+
+def test_a_config_naming_no_second_monitor_builds_no_second_callback(driver) -> None:
+    """The key is absent-by-default on the shared driver, which is what keeps the two-sided cells at
+    one criterion until their own configs opt in. Exercised by removing it rather than by reading
+    another cell's config, so what is under test is this driver's branch."""
+    from lightning.pytorch.callbacks import ModelCheckpoint
+
+    driver.config["advanced_config"]["callbacks"]["model_checkpoint"].pop(
+        "secondary_monitor", None
+    )
+    captured = {}
+
+    def _capture(callbacks, model=None):
+        captured["callbacks"] = callbacks
+
+        class _StubTrainer:
+            def fit(self, *args, **kwargs):
+                pass
+
+        return _StubTrainer()
+
+    driver.build_trainer = staticmethod(_capture)  # type: ignore[method-assign]
+    driver.create_model()
+    driver.train_model(object(), object())
+
+    checkpoints = [cb for cb in captured["callbacks"] if isinstance(cb, ModelCheckpoint)]
+    assert len(checkpoints) == 1
+    assert driver.secondary_checkpoint_callback is None

@@ -18,6 +18,15 @@ Both decoders share one :class:`HorizonDecoderCore`. The horizon dynamics are th
 for both, so learning them twice would cost parameters and, worse, let the two forecasts drift
 into different representation spaces -- at which point their difference stops being a correction
 and becomes a comparison of strangers.
+
+**The optional persistence residual, and why it opens no bypass.** The baseline decoder can be
+built to add $w_{\tau,c}\, y_{t,c}$ to its mean, where $y_t$ is the *target's* own value at the
+anchor step. It is target-only by construction, the caller hands the **same** tensor to both
+invocations of the shared decoder, and it touches the mean head alone -- so the base-minus-full
+gap it is read through stays a pure source readout and the log-variance path is untouched. What it
+buys is that the mean head stops having to synthesise the level of a strongly autocorrelated
+coefficient out of $z$ before it can say anything about its motion, which is what a horizon-uniform
+objective was paying it to do at the near steps.
 """
 from __future__ import annotations
 
@@ -35,6 +44,20 @@ from teb_vae.lag_attn.nets.blocks import ResidualMLP, geometric_schedule, smooth
 #: have moved -- which is what makes the gains usable as a load witness in the evaluation
 #: pipeline's preflight.
 HORIZON_ATTENTION_GAIN_INIT = 1.0e-2
+
+#: Half-life, in horizon steps, of the persistence residual's **seeded** weight decay:
+#: $w_{\tau,c} = 2^{-\tau / \text{halflife}}$ at construction, so $w_{0,c} = 1$ (the near step
+#: starts as plain persistence) and $w_{29,c} \approx 0.017$.
+#:
+#: Short against the $30$-step horizon on purpose. The weight is a raw parameter and is learned, so
+#: this is where the search starts rather than where it ends -- but a stored coefficient's own
+#: autocorrelation is short, and the fast channels this residual exists for lose their persistence
+#: skill within a handful of steps. Seeding a long tail there would start the mean head correcting a
+#: term that is mostly wrong at the far steps, which is the opposite of the point.
+#:
+#: $5$ steps is $20$ s on the family's $4$ s grid. A named construction constant rather than a
+#: configuration key: no arm varies it, and what an arm would vary is whether the residual exists.
+PERSISTENCE_DECAY_HALFLIFE = 5.0
 
 
 class _HorizonRefine(nn.Module):
@@ -370,6 +393,11 @@ class BaselineFutureDecoder(nn.Module):
     cannot win by re-deriving what it already knows.
     """
 
+    #: Declared so the optional persistence weight types as its own class rather than as the
+    #: ``Tensor | Module`` ``nn.Module.__getattr__`` otherwise gives it. ``None`` on a decoder built
+    #: without the residual, matching the convention every other optional term in this file uses.
+    persistence_weight: Optional[nn.Parameter]
+
     def __init__(
         self,
         core: HorizonDecoderCore,
@@ -378,17 +406,25 @@ class BaselineFutureDecoder(nn.Module):
         d_hidden: int = 128,
         dropout: float = 0.1,
         logvar_clamp: Tuple[float, float] = (-5.0, 3.0),
+        persistence_residual: bool = False,
     ) -> None:
-        """Initialize the baseline decoder.
+        r"""Initialize the baseline decoder.
 
         Args:
             core: The shared horizon core. Passed in rather than constructed so both decoders
-                provably hold the same one.
+                provably hold the same one. Its ``horizon`` is also where the persistence weight's
+                first axis comes from, so the weight cannot be sized against a horizon the core
+                does not emit.
             d_model: Width of the incoming decoder state.
             out_channels: Number of target feature channels $C$.
             d_hidden: Decoder hidden width.
             dropout: Dropout inside the projection MLP.
             logvar_clamp: ``(lo, hi)`` effective range of the log-variance bound.
+            persistence_residual: Build the target-only persistence term, so the mean becomes
+                $\mu_{\tau,c} = w_{\tau,c}\, y_{t,c} + f_\theta(\cdot)_{\tau,c}$ and
+                :meth:`forward` requires the anchor's target vector. ``False`` -- the default --
+                builds **no** parameter at all, so the decoder is bitwise the one built before this
+                keyword existed rather than one carrying an inert tensor.
         """
         super().__init__()
         self.core = core
@@ -408,18 +444,64 @@ class BaselineFutureDecoder(nn.Module):
         self.mean_head = nn.Linear(d_hidden, out_channels)
         self.logvar_head = nn.Linear(d_hidden, out_channels)
 
-    def forward(self, decoder_state: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Forecast the horizon from the target-only state.
+        # A raw nn.Parameter, and that is what makes the seeded decay survive: the generic
+        # `initialization` pass fills Linear and Conv1d weights and re-inits LayerNorm, and ignores
+        # loose parameters -- the same reason the horizon attention's residual gain and the
+        # attention's `lag_score_bias` keep the values their constructors gave them. A Linear here
+        # would be xavier-refilled after construction and the decay would silently not exist.
+        #
+        # Per (tau, c) rather than per tau: how long a coefficient persists is a property of the
+        # channel's own filter, and the objective's gradient is the cheapest estimate of it.
+        if persistence_residual:
+            steps = torch.arange(self.core.horizon, dtype=torch.float32)
+            decay = torch.pow(0.5, steps / PERSISTENCE_DECAY_HALFLIFE)
+            self.persistence_weight = nn.Parameter(
+                decay[:, None].repeat(1, self.out_channels)
+            )
+        else:
+            self.persistence_weight = None
+
+    def forward(
+        self,
+        decoder_state: torch.Tensor,
+        persistence: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        r"""Forecast the horizon from the target-only state.
 
         Args:
             decoder_state: Target-only conditioning ``(B, T, d_model)``.
+            persistence: The target's own value at each anchor ``(B, T, C)`` -- required exactly
+                when the decoder was built with ``persistence_residual`` and refused otherwise. The
+                caller owns what it is; this module owns only the weighting. It enters the **mean**
+                head's output and nothing else, so the log-variance path is the one it was without
+                the residual.
 
         Returns:
             ``(mu_base, logvar_base)``, both ``(B, T, H_d, C)``.
+
+        Raises:
+            ValueError: If the decoder and the call disagree about whether there is a persistence
+                input. Both directions are refused rather than tolerated: a decoder built with the
+                weight and called without one would leave that parameter out of the graph on that
+                step -- the ``find_unused_parameters=False`` hazard -- and a tensor handed to a
+                decoder that cannot use it would be silently discarded while the configuration said
+                the residual was on.
         """
+        if (self.persistence_weight is None) != (persistence is None):
+            built = "with" if self.persistence_weight is not None else "without"
+            called = "with" if persistence is not None else "without"
+            raise ValueError(
+                f"the decoder was built {built} a persistence residual and was called {called} a "
+                f"persistence input. The two are one decision: persistence_residual builds the "
+                f"weight and the forward that supplies it, and half of that is a model whose mean "
+                f"forecast is not the one its configuration describes."
+            )
         h = self.proj(decoder_state)
         feat = self.core.decode(h)
         mu_base = self.mean_head(feat)
+        if self.persistence_weight is not None and persistence is not None:
+            # (B, T, 1, C) against (H_d, C): the anchor's own vector, weighted per horizon step.
+            mu_base = mu_base + self.persistence_weight * persistence[..., None, :]
         logvar_base = smooth_bound(self.logvar_head(feat), *self.logvar_clamp)
         return mu_base, logvar_base
 

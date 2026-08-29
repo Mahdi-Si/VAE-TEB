@@ -377,3 +377,128 @@ def test_the_three_tuples_stay_separate_and_disjoint() -> None:
     assert sum(len(group) for group in names) == len(set().union(*map(set, names)))
     assert not set(DELAY_KWARGS) & set(NOVELTY_MODEL_KWARGS)
     assert len(NOVELTY_MODEL_KWARGS) == 1
+
+
+# =================================================================================================
+# The dual reference, and what it does and does not put on the constructor
+#
+# The source stream can be aligned onto a clock of its own, faster than the target's by a known
+# constant. Everything that reaches the model from that decision arrives through the SAME two
+# vectors the single-reference scheme used: a shift per kept channel, per stream. The second
+# reference itself is a resolution input, like the threshold and the first reference, and names no
+# constructor argument -- which is what lets the signature sweep drop it with no exclusion list.
+#
+# What the dual scheme changes is therefore *values*, not keys: fewer source channels survive, and
+# their shifts are taken against a different clock. Both are asserted below, because a translation
+# that resolved the second reference and then handed the model the single-reference vectors would
+# produce a correctly shaped model reading a stream aligned to a clock its config does not name.
+# =================================================================================================
+#: The pinned source clock, and the target's own. Written out rather than resolved twice: what is
+#: under test is that a *stated* pair of clocks reaches the model, and resolving the expectation
+#: through the same code that produces it would compare a value with itself.
+_SOURCE_REFERENCE = 288.2672
+_TARGET_REFERENCE = 402.1604
+
+
+@pytest.fixture
+def dual_reference_kwargs() -> Dict[str, Any]:
+    """The constructor kwargs the shipped dual-clock configuration produces."""
+    return _StubTrainer(
+        causal_config(
+            causal_align_reference="target_max",
+            causal_align_reference_source=_SOURCE_REFERENCE,
+        )
+    ).build_model_kwargs()
+
+
+def test_the_second_reference_names_no_constructor_argument(dual_reference_kwargs) -> None:
+    """Task-level, like the threshold and the first reference beside it.
+
+    What the model takes is the shift vectors the reference resolved to; the reference is what
+    resolved them, and it is resolved against the shards. A constructor that took the reference
+    instead would have to re-read the data to know what it meant.
+    """
+    assert "causal_align_reference_source" not in inspect.signature(
+        _AlignedModel.__init__
+    ).parameters
+    assert "causal_align_reference_source" not in dual_reference_kwargs
+    assert set(ALIGN_MODEL_KWARGS) <= set(dual_reference_kwargs)
+
+
+def test_the_second_reference_narrows_the_source_stream_and_leaves_the_target_alone(
+    dual_reference_kwargs, aligned_kwargs
+) -> None:
+    """The whole cost of the faster clock, and the property that makes it safe.
+
+    A shift can only delay, so a reference is bounded below by the slowest channel it keeps: moving
+    the source onto a faster clock drops every source channel above it. What must NOT happen is the
+    target moving with it -- the resolver applies one reference to both streams unless told
+    otherwise, and a faster float in the single key would re-align and decimate the *scored*
+    stream, which is a massive unintended change with every shape still correct.
+
+    Asserted field for field against the single-clock resolution rather than by width alone: a
+    target keep-index of the same length drawn at a different reference would pass a count check.
+    """
+    assert dual_reference_kwargs["target_keep_index"] == aligned_kwargs["target_keep_index"]
+    assert dual_reference_kwargs["target_warmup_steps"] == aligned_kwargs["target_warmup_steps"]
+    assert dual_reference_kwargs["target_align_delays"] == aligned_kwargs["target_align_delays"]
+
+    source = dual_reference_kwargs["source_keep_index"]
+    assert len(source) < len(aligned_kwargs["source_keep_index"])
+    assert set(source) < set(aligned_kwargs["source_keep_index"]), (
+        "the faster clock kept a channel the slower one dropped, which no shift can do"
+    )
+    assert len(dual_reference_kwargs["source_align_delays"]) == len(source)
+
+
+def test_the_two_streams_shifts_are_taken_against_their_own_clocks(
+    dual_reference_kwargs, aligned_kwargs
+) -> None:
+    r"""The point of the pair: each stream is re-indexed onto ITS reference, and the constant
+    between the two travels separately.
+
+    The source shifts must therefore move -- every kept source channel is now aligned to a clock a
+    hundred-odd seconds faster -- while the target's do not. A translation that resolved two clocks
+    and then applied one would leave these equal, and the run would report a lag axis biased by the
+    offset with nothing failing.
+    """
+    shared = set(dual_reference_kwargs["source_keep_index"])
+    single = {
+        channel: shift
+        for channel, shift in zip(
+            aligned_kwargs["source_keep_index"], aligned_kwargs["source_align_delays"]
+        )
+        if channel in shared
+    }
+    dual = dict(
+        zip(
+            dual_reference_kwargs["source_keep_index"],
+            dual_reference_kwargs["source_align_delays"],
+        )
+    )
+
+    assert set(single) == set(dual)
+    assert dual != single, "the source shifts did not move onto the source's own clock"
+    # A faster clock is a smaller shift for every channel that survives both: the shift is the
+    # distance from the channel's own delay up to the reference.
+    assert all(dual[channel] <= single[channel] for channel in single)
+    assert all(shift >= 0 for shift in dual.values()), (
+        "a negative shift reads a channel's own future, which is what the drop rule prevents"
+    )
+
+
+def test_the_pair_of_clocks_is_a_pair_and_the_resolver_refuses_a_half_of_one() -> None:
+    """The combination that cannot mean anything, refused by name rather than resolved.
+
+    A source reference is one half of a *pair*: its whole content is the constant offset against the
+    target's. Against an unaligned target that offset is channel-pair-indexed and spans over a
+    thousand seconds, so there is no single number for the lag arithmetic to carry -- which is why
+    the unaligned sweep arm moves two keys rather than one.
+    """
+    with pytest.raises(ValueError, match="causal_align_reference"):
+        _StubTrainer(
+            causal_config(
+                causal_align_reference=None,
+                causal_align_reference_source=_SOURCE_REFERENCE,
+            )
+        ).build_model_kwargs()

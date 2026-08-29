@@ -464,6 +464,11 @@ def test_the_budget_figures_are_drawn_from_the_resolver_the_driver_itself_calls(
     assert record["target_dropped_warmup_steps"] == [162, 194, 233, 278]
     # The survivors' own maximum, which is what the anchor floor must clear -- not the threshold.
     assert record["realised_max_warmup_steps"] == 134
-    assert record["source_kept_width"] == record["source_declared_width"] == 51
+    # The source stream's two widths differ under the shipped alignment, and the difference is the
+    # ALIGNMENT's rather than the budget's: the warm-up budget never touches this stream, and the
+    # four channels missing here are the ones whose composed delay is above the reference, which a
+    # shift cannot reach without reading their own future.
+    assert record["source_declared_width"] == 51
+    assert record["source_kept_width"] == 47
     for name in record["files"]:
         assert (tmp_path / name).is_file(), name

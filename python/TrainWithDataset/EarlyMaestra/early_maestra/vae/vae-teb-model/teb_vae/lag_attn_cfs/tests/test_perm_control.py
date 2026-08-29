@@ -200,7 +200,7 @@ def test_re_scoring_the_permuted_dict_reproduces_the_base_score_exactly(perturb_
     """The consequence the acceptance ordering rests on: the "no source" reference has not moved,
     checked by re-scoring the feature block at the same anchors rather than by identity alone."""
     model = _model(perturb_posterior)
-    batch = make_stub_batch(_BATCH, TINY_SEQ_LEN)
+    batch = make_stub_batch(*_STUB_ARGS)
     out = _forward(model, batch)
 
     permuted = _permute(model, out)
@@ -214,7 +214,7 @@ def test_scoring_the_permuted_dict_yields_a_different_nonzero_kl(perturb_posteri
     """``compute_loss`` recomputes the KL from the distribution parameters, so the permuted
     posterior yields a genuinely different KL against the same prior."""
     model = _model(perturb_posterior)
-    batch = make_stub_batch(_BATCH, TINY_SEQ_LEN)
+    batch = make_stub_batch(*_STUB_ARGS)
     out = _forward(model, batch)
 
     permuted = _permute(model, out)
@@ -255,7 +255,7 @@ def test_the_three_readouts_appear_on_validation_only(task, perturb_posterior):
     down and invert the ordering the control exists to check."""
     module = task()
     perturb_posterior(module.orig_model)
-    batch = make_stub_batch(_BATCH, TINY_SEQ_LEN)
+    batch = make_stub_batch(*_STUB_ARGS)
 
     _, train_metrics = module.compute_loss_and_metrics(batch, 0, "train")
     _, val_metrics = module.compute_loss_and_metrics(batch, 0, "val")
@@ -308,7 +308,7 @@ def test_the_shuffled_penalty_is_the_gap_against_the_matched_full_score(task, pe
     *same* anchors, or the negative control measures the geometry rather than the source pathway."""
     module = task()
     perturb_posterior(module.orig_model)
-    batch = make_stub_batch(_BATCH, TINY_SEQ_LEN)
+    batch = make_stub_batch(*_STUB_ARGS)
 
     _, metrics = module.compute_loss_and_metrics(batch, 0, "val")
 
@@ -329,7 +329,7 @@ def test_the_control_leaves_the_prior_and_base_branch_bitwise_unchanged(task, pe
     """
     module = task()
     perturb_posterior(module.orig_model)
-    batch = make_stub_batch(_BATCH, TINY_SEQ_LEN)
+    batch = make_stub_batch(*_STUB_ARGS)
 
     torch.manual_seed(11)
     _, with_control = module.compute_loss_and_metrics(batch, 0, "val")
@@ -344,3 +344,108 @@ def test_the_control_leaves_the_prior_and_base_branch_bitwise_unchanged(task, pe
         "target_warm_frac", "kld_source_null",
     ):
         assert torch.equal(with_control[name], without_control[name]), name
+
+
+# ---------------------------------------------------------------------------------------
+# The controls follow the key/value arm
+#
+# Both source controls exist to describe the tensor the lag attention actually reads. That tensor
+# is `lag_kv_source`'s to choose, and the failure this section catches is silent in the worst way:
+# a control that named the deep source encoder would keep working under a local arm, keep returning
+# correctly shaped tensors, and describe a pathway with no consumer. `source_specificity` and
+# `kld_source_null` would then be measurements of something the model does not read, with nothing
+# in any artifact saying so.
+#
+# Run on all three arms rather than on the shipped one, because what is asserted is that the
+# controls resolve the arm from the model rather than assuming it -- a claim only a disagreement
+# between arms could falsify.
+# ---------------------------------------------------------------------------------------
+_KV_ARMS = ("encoder", "conv_stem", "adapter")
+
+#: This suite's own stub-batch argument list, bound once so the block below reads the same
+#: on both cells of this pair -- the two builders differ in whether the sequence length is an
+#: argument or a constant of the fixture.
+_STUB_ARGS = (_BATCH, TINY_SEQ_LEN)
+
+
+@pytest.mark.parametrize("arm", _KV_ARMS)
+def test_the_null_controls_re_encode_path_is_the_forwards_own(arm, perturb_posterior):
+    """The null arm re-encodes a zeroed stream through the model's own key/value pathway, so on
+    every arm its posterior must be the one a **real forward over a zero source** produces.
+
+    Compared against that forward rather than against a hand-built encode, because the encode is
+    only half the claim: the tensor also has to reach the attention, and a control that re-encoded
+    correctly and then attended over the matched state would agree with a hand-built encode and
+    disagree with the model. The two posteriors are deterministic in eval mode, so this is an
+    equality rather than a sampled comparison.
+
+    The tolerance is float32 batch-1-against-batch-$B$ noise: the control encodes one row and
+    broadcasts it, which is exactly the economy that makes it cheap and the reason this is not bitwise.
+    """
+    model = _model(perturb_posterior, lag_kv_source=arm)
+    batch = make_stub_batch(*_STUB_ARGS)
+    source = torch.cat([batch.up_st, batch.up_ph], -1)
+    out = _forward(model, batch)
+
+    null = controls.source_null_forward_outputs(model, out, source)
+    torch.manual_seed(0)
+    with torch.no_grad():
+        silent = model(
+            batch.fhr_st, batch.fhr_ph, torch.zeros_like(source), 0, TINY_STRIDE
+        )
+
+    for key in ("mu_post", "logvar_post", "attn_weights"):
+        assert null[key].shape == out[key].shape, key
+        assert float((null[key] - silent[key]).abs().max()) < 1e-5, key
+
+
+@pytest.mark.parametrize("arm", _KV_ARMS)
+def test_the_permutation_control_permutes_the_tensor_the_attention_reads(
+    arm, perturb_posterior
+):
+    """The permuted arm starts from the matched forward's ``source_state``, and that key has to be
+    the key/value representation on every arm rather than a deeper state the attention may not read.
+
+    Asserted as an identity between two things that are equal only if the key names the right
+    tensor: the control's own permuted state, and the matched state permuted by hand under the same
+    index. Under a control that permuted a different tensor the shapes would still agree.
+    """
+    model = _model(perturb_posterior, lag_kv_source=arm)
+    batch = make_stub_batch(*_STUB_ARGS)
+    out = _forward(model, batch)
+    perm_index = controls.make_derangement(_BATCH)
+
+    permuted = controls.perm_forward_outputs(
+        model, out, perm_index=perm_index, anchors=out["anchor_index"]
+    )
+
+    assert torch.equal(out["source_state"], permuted["source_state"]), (
+        "the control rebuilt the source state instead of reusing the matched one"
+    )
+    # The attention it rebuilt is the one over the PERMUTED representation, which is what makes the
+    # readout a source readout: a control that permuted nothing would return the matched weights.
+    assert not torch.equal(out["attn_weights"], permuted["attn_weights"])
+
+
+@pytest.mark.parametrize("arm", _KV_ARMS)
+def test_no_control_call_site_moves_with_the_arm(arm, perturb_posterior):
+    """The controls' signatures are frozen: they resolve the pathway from model attributes, so the
+    task layer and the evaluation call them identically whatever ``lag_kv_source`` says.
+
+    This is what makes the arm a config key rather than a code change. Exercised through the same
+    argument lists the shared task and the evaluation use, on every arm.
+    """
+    model = _model(perturb_posterior, lag_kv_source=arm)
+    batch = make_stub_batch(*_STUB_ARGS)
+    out = _forward(model, batch)
+
+    permuted = controls.perm_forward_outputs(
+        model, out, perm_index=controls.make_derangement(_BATCH), anchors=out["anchor_index"]
+    )
+    null = controls.source_null_forward_outputs(
+        model, out, torch.cat([batch.up_st, batch.up_ph], -1)
+    )
+
+    for rebuilt in (permuted, null):
+        for key in ("mu_post", "logvar_post", "attn_weights"):
+            assert rebuilt[key].shape == out[key].shape, key

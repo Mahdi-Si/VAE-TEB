@@ -256,15 +256,21 @@ def test_no_second_decoder_and_no_decoder_state_head_exist(tiny_kwargs):
 
 
 def test_the_decoder_takes_the_latent_and_nothing_else(tiny_kwargs):
-    """The no-bypass contract, stated where it can be checked: **one** tensor argument, at $d_z$
-    in-features. A decoder that also took an encoder state would let gradient reach the forecast
-    without passing through the latent, and $\\mu^q - \\mu^p$ would stop being the source's
-    contribution.
+    """The no-bypass contract, stated where it can be checked: one tensor **through the latent
+    path**, at $d_z$ in-features. A decoder that also took an encoder state would let gradient
+    reach the forecast without passing through the latent, and $\\mu^q - \\mu^p$ would stop being
+    the source's contribution.
 
     Asserted by arity and by width rather than by the argument's name. That name is
     ``decoder_state``, from when the decoder was conditioned on one -- the residual decoder beside
     it still takes ``(decoder_state, z)`` -- so what distinguishes the two is how many tensors enter,
     and what the first linear is wide enough to hold.
+
+    The shared decoder's second admitted name, ``persistence``, is a **target-only** term that
+    exists for the feature-target cells alone, and this cell never builds it. So the admitted set
+    is pinned by name here, and the arity that matters on *this* model -- how many tensors it can
+    actually be handed -- is pinned by the weight being absent, which is what makes the decoder
+    refuse the second argument outright.
     """
     model = _model(tiny_kwargs)
     parameters = [
@@ -273,7 +279,12 @@ def test_the_decoder_takes_the_latent_and_nothing_else(tiny_kwargs):
         if name != "self" and parameter.kind is not inspect.Parameter.VAR_KEYWORD
     ]
 
-    assert len(parameters) == 1, f"the decoder takes more than the latent: {parameters}"
+    assert parameters == ["decoder_state", "persistence"], (
+        f"the decoder takes more than the latent and the target-only residual: {parameters}"
+    )
+    assert model.decoder.persistence_weight is None, (
+        "this cell built the persistence residual, which is a feature-target mechanism"
+    )
     assert model.decoder.proj.body[0].in_features == model.d_z
 
 

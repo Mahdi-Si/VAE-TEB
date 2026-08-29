@@ -558,3 +558,144 @@ class CausalConvLstmEncoder(nn.Module):
 
         fused = torch.cat([conv_out, lstm_out], dim=-1)
         return self.output_norm(self.fusion(fused))
+
+
+#: Where the lag attention's keys and values come from, as a config-visible choice.
+#:
+#: ``'encoder'`` is the deep source history state -- the representation the two-sided models have
+#: always attended over, and the value at which every model in this family is bitwise what it was
+#: before the key existed. The other two are **local** representations, and the reason they exist is
+#: an informational one rather than a capacity one: a deep causal state at lag $0$ already contains
+#: a processed image of the states at every larger lag, so by the data-processing inequality the
+#: near lags dominate the window whatever the attention would prefer, and a lag readout taken over
+#: such keys and values cannot express a delay it is looking straight at.
+#:
+#: ``'conv_stem'`` keeps only the causal convolution front -- a bounded receptive field, so a key at
+#: lag $\ell$ summarises a neighbourhood of $\ell$ and not the whole prefix. ``'adapter'`` is the
+#: sharpest arm: the projected stream itself, one step of receptive field and purely position-wise
+#: content.
+#:
+#: Both keys **and** values move together under the local arms. Localising the keys alone would
+#: leave the lag-$0$ value informationally dominant and the degeneracy standing under a
+#: better-looking attention map.
+LAG_KV_SOURCE_CHOICES: Tuple[str, ...] = ("encoder", "conv_stem", "adapter")
+
+
+class CausalConvStem(nn.Module):
+    r"""The dilated causal convolution front of :class:`CausalConvLstmEncoder`, on its own.
+
+    Same blocks, same schedule, same single-residual chain and the same closing normalisation as
+    that encoder's convolution branch -- with the recurrent branch, the fusion and the front-end
+    MLP absent. What is left is a *bounded* summary: the output at $t$ is a function of
+    $[t - R + 1,\ t]$ with $R = 1 + \sum_b (k_b - 1) r_b$ steps, where the encoder's LSTM makes the
+    state a function of the whole prefix.
+
+    It exists because neither encoder class in this family can be built without its deep stage --
+    the recurrent one has no LSTM-free mode and the conv-Transformer one refuses zero attention
+    blocks, both by design -- so a bounded source representation is a small wrapper over the blocks
+    rather than a configuration of the encoder. The blocks' own validation is therefore untouched.
+
+    The front-end MLP is deliberately not reproduced: it is position-wise, so it changes no reach,
+    and the input adapter that feeds this stem already ends in a residual MLP of its own.
+
+    Shapes:
+        Input:  ``(B, T, d_model)``
+        Output: ``(B, T, d_model)``
+    """
+
+    def __init__(
+        self,
+        *,
+        d_model: int,
+        cnn_kernels: Tuple[int, ...],
+        cnn_dilations: Tuple[int, ...],
+        conv_dropout: float,
+        conv_norm_groups: Optional[int] = None,
+    ) -> None:
+        """Build the convolution stack and its closing normalisation.
+
+        Args:
+            d_model: Internal model width, held constant through every block.
+            cnn_kernels: Kernel width per convolution block.
+            cnn_dilations: Dilation per convolution block; parallel to ``cnn_kernels``.
+            conv_dropout: Dropout inside the convolution blocks.
+            conv_norm_groups: Group count for every block's pre-norm ``GroupNorm``. ``None`` keeps
+                each block's ``min(8, d_model)``; threaded through so a stem and the encoder it
+                replaces normalise the same way.
+
+        Raises:
+            ValueError: If the kernel and dilation schedules disagree in length, or if no
+                convolution block is requested -- a stem of no blocks is the adapter output, which
+                is a different arm and is selected by name rather than by an empty schedule.
+        """
+        super().__init__()
+        if len(cnn_kernels) != len(cnn_dilations):
+            raise ValueError(
+                "cnn_kernels and cnn_dilations must have equal length, got "
+                f"{len(cnn_kernels)} and {len(cnn_dilations)}"
+            )
+        if len(cnn_kernels) < 1:
+            raise ValueError(
+                "need at least one causal conv block; a stem of zero blocks is the identity, and "
+                "the identity representation is the 'adapter' arm, which is chosen by name"
+            )
+
+        self.d_model = int(d_model)
+        self.cnn_kernels = tuple(int(kernel) for kernel in cnn_kernels)
+        self.cnn_dilations = tuple(int(dilation) for dilation in cnn_dilations)
+        self.convs = nn.ModuleList(
+            [
+                CausalMultiChannelConvBlock(
+                    in_channels=d_model,
+                    out_channels=d_model,
+                    filter_size=kernel,
+                    dilation=dilation,
+                    dropout=conv_dropout,
+                    activation=nn.GELU,
+                    norm_groups=conv_norm_groups,
+                )
+                for kernel, dilation in zip(self.cnn_kernels, self.cnn_dilations)
+            ]
+        )
+        # The encoder closes its convolution branch by normalising the stack's output added back to
+        # the branch input; the same seam is kept here so the exported scale is the one every
+        # downstream module -- the lag attention's key/value normalisation above all -- is
+        # calibrated to.
+        self.output_norm = nn.LayerNorm(d_model)
+
+    @property
+    def receptive_field(self) -> int:
+        r"""Steps of history the stem's output at $t$ can reach, itself included.
+
+        $$R = 1 + \sum_b (k_b - 1) r_b.$$
+
+        Reported because it is the resolution floor of the lag readout taken over this
+        representation: two lags closer together than $R$ are summaries of overlapping windows,
+        and no attention over them can separate the two.
+        """
+        return 1 + sum(
+            (kernel - 1) * dilation
+            for kernel, dilation in zip(self.cnn_kernels, self.cnn_dilations)
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Run the convolution stack over a projected stream.
+
+        Args:
+            x: Projected stream ``(B, T, d_model)``.
+
+        Returns:
+            The bounded local representation ``(B, T, d_model)``.
+        """
+        # The conv blocks work in (B, C, T); the rest of the model works in (B, T, C).
+        out = x.transpose(1, 2).contiguous()
+        for block in self.convs:
+            out = block(out)
+        return self.output_norm(out.transpose(1, 2).contiguous() + x)
+
+    def extra_repr(self) -> str:
+        """Report the width, the schedule and the resulting reach."""
+        return (
+            f"d_model={self.d_model}, kernels={self.cnn_kernels}, "
+            f"dilations={self.cnn_dilations}, receptive_field={self.receptive_field} steps"
+        )

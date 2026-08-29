@@ -58,6 +58,29 @@ ROWS = 12
 SHIPPED_DENSE_ANCHORS = 136
 SHIPPED_TILE_BAND = (4, 5)
 
+#: A stated arm, in the shape criterion 6 asks for: every key in :data:`check_run.ARM_KEYS` present
+#: under ``model_config.VAE_model``, whatever its value. Written out here rather than imported from
+#: the checker, so the criterion is compared against an independent statement of what it wants --
+#: a fixture built from ``ARM_KEYS`` itself would pass any list the checker happened to hold.
+#:
+#: The values are the shipped defaults, but no test reads them: presence is the criterion, because
+#: each of these keys has a comparison arm on the other side of it and no single value is the right
+#: one. What is refused is a run whose artifacts cannot say which side it was on.
+STATED_ARM: Dict[str, Any] = {
+    "lag_kv_source": "conv_stem",
+    "prior_availability_input": True,
+    "persistence_residual": True,
+    "horizon_weight_halflife_steps": 15.0,
+    "alibi_slope_scale": 0.0,
+    "causal_align_reference": "target_max",
+    "causal_align_reference_source": 288.2672,
+}
+
+#: The other half of criterion 6: the run's own name. One of the checker's identity paths must
+#: carry a non-empty value, because a resolved config can be read only by someone who already found
+#: the run, while the name is what gets quoted in a table.
+STATED_IDENTITY = "lag_attn_cfs_dualref288"
+
 
 def _row(epoch: int) -> Dict[str, Any]:
     """One passing epoch of a synthetic metric history.
@@ -103,6 +126,8 @@ def write_run(
     rows: Optional[Sequence[Dict[str, Any]]] = None,
     geometry: Optional[Dict[str, Any]] = None,
     with_config: bool = True,
+    arm: Optional[Dict[str, Any]] = None,
+    identity: Optional[str] = STATED_IDENTITY,
 ) -> Path:
     """Write a synthetic run directory in the layout the training entry point produces.
 
@@ -113,6 +138,10 @@ def write_run(
         with_config: Whether to write the resolved configuration at all. A run can legitimately
             lack it -- the driver's write of that file is non-fatal -- which is the case the
             ``--config`` argument exists for.
+        arm: The arm keys to state, defaulting to :data:`STATED_ARM`. Passed explicitly by the
+            tests that plant a criterion-6 failure, which is a key going *absent* rather than a
+            value going wrong -- so this takes a whole mapping instead of one leaf.
+        identity: The run name to write, or ``None`` to write no identity block at all.
 
     Returns:
         The run root.
@@ -126,17 +155,23 @@ def write_run(
         writer.writerows(history)
 
     if with_config:
-        vae = dict(
+        vae: Dict[str, Any] = dict(
             sequence_length=SHIPPED_SEQUENCE_LENGTH,
             horizon=SHIPPED_HORIZON,
             warmup_period=SHIPPED_WARMUP_PERIOD,
             anchor_stride=SHIPPED_HORIZON,
         )
+        vae.update(STATED_ARM if arm is None else arm)
         vae.update(geometry or {})
+        document: Dict[str, Any] = {"model_config": {"VAE_model": vae}}
+        if identity is not None:
+            document["advanced_config"] = {
+                "tracking": {"mlflow": {"run_name": identity, "tags": {"variant": identity}}}
+            }
         checkpoints = directory / "model_checkpoints"
         checkpoints.mkdir(parents=True, exist_ok=True)
         (checkpoints / "resolved_config.yaml").write_text(
-            yaml.safe_dump({"model_config": {"VAE_model": vae}}), encoding="utf-8"
+            yaml.safe_dump(document), encoding="utf-8"
         )
     return directory
 
@@ -239,14 +274,26 @@ def test_the_refusal_names_both_ways_to_supply_the_run_directory(capsys):
 # Tier 1: one planted failure at a time
 # =================================================================================================
 def test_a_clean_run_passes_every_derivable_criterion(tmp_path, capsys):
-    """The baseline the planted-failure tests are read against. Four criteria pass and the fifth is
-    reported as not evaluated, which is not a pass."""
+    """The baseline the planted-failure tests are read against. Five criteria pass and the sixth --
+    numbered fifth in the record -- is reported as not evaluated, which is not a pass.
+
+    The dict is compared for equality rather than by lookup, so a criterion **added** to the
+    checker without a test lands here rather than passing unremarked: a criterion nobody exercises
+    is a verdict nobody should trust, which is this file's opening claim.
+    """
     write_run(tmp_path)
 
     code = check_run.main(run_dir=str(tmp_path))
 
     assert code == 0
-    assert statuses(capsys) == {1: PASS, 2: PASS, 3: PASS, 4: PASS, 5: NOT_EVALUATED}
+    assert statuses(capsys) == {
+        1: PASS,
+        2: PASS,
+        3: PASS,
+        4: PASS,
+        5: NOT_EVALUATED,
+        6: PASS,
+    }
 
 
 @pytest.mark.parametrize(
@@ -280,6 +327,76 @@ def test_each_tier_one_criterion_catches_its_own_planted_failure(
     assert code == 1
     assert found[number] == FAIL, f"{column} did not trip criterion {number}"
     assert [key for key, status in found.items() if status == FAIL] == [number]
+
+
+@pytest.mark.parametrize("absent", sorted(STATED_ARM))
+def test_one_absent_arm_key_fails_the_arm_criterion(tmp_path, capsys, absent):
+    """The failure this criterion exists for, and it is an **absence** rather than a wrong value.
+
+    The driver builds a run's model kwargs by sweeping the constructor's signature and silently
+    drops anything the class does not re-list. So an arm can train as the baseline with no error
+    and nothing in the metric history saying so, and afterwards a config that predates the key is
+    indistinguishable from one that set it to the default. Both read as "the resolved configuration
+    is silent", and both are what this refuses.
+
+    One key at a time, over all seven, because a checker written against ``any(...)`` or against a
+    single representative key would pass six of these.
+    """
+    write_run(tmp_path, arm={key: value for key, value in STATED_ARM.items() if key != absent})
+
+    code = check_run.main(run_dir=str(tmp_path))
+
+    found = statuses(capsys)
+    assert code == 1
+    assert found[6] == FAIL, f"{absent} going absent did not trip criterion 6"
+    assert [key for key, status in found.items() if status == FAIL] == [6]
+
+
+def test_a_run_that_states_every_key_but_names_no_arm_still_fails(tmp_path, capsys):
+    """The second half of the criterion, and it is not redundant with the first.
+
+    A resolved configuration can be read only by someone who has already found the run directory;
+    the run's *name* is what is quoted in an arm table, printed in a log line and typed into a
+    question about which fit produced a number. A run whose config is complete and whose name is
+    the default one is exactly the misattribution this criterion was added after -- so the identity
+    is required as well, and a whole config with no name is a fail rather than a warning.
+    """
+    write_run(tmp_path, identity=None)
+
+    code = check_run.main(run_dir=str(tmp_path))
+
+    found = statuses(capsys)
+    assert code == 1
+    assert found[6] == FAIL
+    assert [key for key, status in found.items() if status == FAIL] == [6]
+
+
+def test_the_arm_criterion_reads_presence_rather_than_value(tmp_path, capsys):
+    """Presence rather than value, and the reason is that there is no right value to check against.
+
+    Each arm key has a comparison arm on the other side of it -- the flat lag bias against the
+    decaying one, the dual clock against the single one, the local K/V against the deep encoder --
+    so a criterion asserting any particular value would refuse every arm that is not the default.
+    Exercised with the *opposite* of every shipped value, which must pass.
+    """
+    write_run(
+        tmp_path,
+        arm={
+            "lag_kv_source": "adapter",
+            "prior_availability_input": False,
+            "persistence_residual": False,
+            "horizon_weight_halflife_steps": None,
+            "alibi_slope_scale": 1.0,
+            "causal_align_reference": None,
+            "causal_align_reference_source": None,
+        },
+        identity="lag_attn_cfs_unaligned",
+    )
+
+    code = check_run.main(run_dir=str(tmp_path))
+
+    assert code == 0
+    assert statuses(capsys)[6] == PASS
 
 
 @pytest.mark.parametrize(

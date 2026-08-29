@@ -222,8 +222,9 @@ class CausalRawInputs(CausalWarmupInputs):
         **The alignment's own drops are a different thing and do not change that.** When a
         reference is configured the source stream loses every channel whose composed delay
         exceeds it -- four at the feature cells' ``target_max``, thirty-four at this cell's
-        shipped $42.21$ s, which is the whole ``up_ph`` block and nineteen ``up_st`` channels --
-        not because they are slow, but because bringing them onto the reference would
+        shipped $42.21$ s, which is the whole of the source stream's *second* stored block and
+        nineteen channels of its first -- not because they are slow, but because bringing them
+        onto the reference would
         need a negative shift, i.e. would read those channels' own future. That is a correctness
         requirement resolved in ``causal_warmup.py``, and the remaining source channels are still
         colder than this floor by design and still measured rather than refused.
@@ -341,20 +342,13 @@ class CausalRawInputs(CausalWarmupInputs):
         )
         split = self.SOURCE_BLOCK_SPLIT if self.use_up_st else 0
 
-        # A channel is honest from step $W'_c + d_c$, not from $W'_c$: ``ChannelDelay`` makes
-        # encoder step $t$ read stored step $t - d_c$, so the shift postpones the whole pattern.
-        # The availability mask in ``_build_adapter`` and the floor in ``_check_anchor_floor``
-        # both already add it; this was the third site and the only one that *reported* rather
-        # than enforced, which is why nothing failed. Because $d_c \ge 0$ always, the omission
-        # could only ever report the source as WARMER than it is -- and on the shipped aligned
-        # configuration it made ``source_lag_warmth_frac_st`` identically $1.0$ for any attention
-        # distribution, i.e. a column that could not vary and therefore measured nothing.
-        waits = self.source_warmup_steps
-        if waits is not None and self.source_gate is not None:
-            waits = tuple(
-                wait + int(shift)
-                for wait, shift in zip(waits, self.source_gate.delay.delay_steps)
-            )
+        # A channel is honest from step $W'_c + d_c$, not from $W'_c$, and that vector is resolved
+        # in one place -- ``CausalWarmupInputs._combined_source_steps``, which the availability
+        # announcement below reads too. Because $d_c \ge 0$ always, omitting the shift could only
+        # ever report the source as WARMER than it is: on the shipped aligned configuration it made
+        # ``source_lag_warmth_frac_st`` identically $1.0$ for any attention distribution, i.e. a
+        # column that could not vary and therefore measured nothing.
+        waits = self._combined_source_steps()
 
         # Refused rather than zipped: ``declared`` is the gate's keep-index when there is a gate
         # and the full declared range when there is not, so a stream carrying a warm-up without a
@@ -483,6 +477,11 @@ class CausalRawInputs(CausalWarmupInputs):
             lambda_ms=lambda_ms,
             lambda_deriv=lambda_deriv,
             lambda_boundary=lambda_boundary,
+            # The decaying horizon weighting, ``None`` unless a halflife was configured. It is the
+            # one half of horizon-aware decoding this raw-target cell takes: the weight reads the
+            # forecast's own $\tau$ axis, which a raw block has exactly as a feature block does,
+            # while the persistence residual reads a per-channel level a raw block has not.
+            horizon_weight=getattr(self, "horizon_weight", None),
         )
         # Merged here rather than inside the objective, whose metric dict is pinned bitwise for the
         # four shipped forecasters; both readouts are this input domain's rather than the target's.

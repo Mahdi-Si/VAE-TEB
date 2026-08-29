@@ -11,12 +11,17 @@ to hold for that to be sound, and neither is visible from either side alone:
 * every imported name must still be exported by that suite -- an ``ImportError`` in whichever test
   happened to collect first names a symbol rather than the splice, and the obvious fix for it is an
   edit to a package this one may not touch;
-* nothing under that package may change. It is reached by reference precisely so that it does not
-  have to, and the only registered exception is the family's hand-kept import guard, which builds
-  forbidden dotted-prefix strings and imports nothing.
+* nothing under that package may change **for this package**. It is reached by reference precisely
+  so that it does not have to, and the only registered exception is the family's hand-kept import
+  guard, which builds forbidden dotted-prefix strings and imports nothing. Its own modules do move
+  -- they are the family's causal propagation channel, and a change to the source pathway or the
+  objective is meant to land there and reach every causal cell at once -- so what is checked is
+  whether a changed module names *this* package, and, on a clean tree where that scan sees nothing,
+  that no module there imports back.
 """
 from __future__ import annotations
 
+import re
 import subprocess
 from pathlib import Path
 from typing import List
@@ -30,13 +35,29 @@ from . import conftest as local
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 _PACKAGE_DIR = Path(__file__).resolve().parents[1]
 
-#: The sibling this package reaches into, and the only file under it whose arrival may change. The
-#: family's import guard must name every package a net could reach into, so a new package has to be
-#: registered in it; the constant it is registered in builds forbidden dotted-prefix **strings** and
-#: imports nothing, which is what makes registering a name long before the package exists inert
-#: rather than merely harmless.
+#: The sibling this package reaches into, and the only file under it that may name this package
+#: back. The family's import guard must name every package a net could reach into, so a new package
+#: has to be registered in it; the constant it is registered in builds forbidden dotted-prefix
+#: **strings** and imports nothing, which is what makes registering a name long before the package
+#: exists inert rather than merely harmless.
+#:
+#: **What the guard asks has been narrowed, and the narrowing is a correction rather than a
+#: relaxation.** It used to ask that nothing under the sibling move at all, which was true of this
+#: package's own arrival and is not a property of the sibling: the causal mixin there is the
+#: propagation channel every causal cell in the family is built through, so a family-wide change to
+#: the source pathway, the objective or the alignment lands in those files *by design* and reaches
+#: this package through them. Stillness was never the invariant. The invariant is the **direction**
+#: -- a member needed from that package is bound by reference or imported by name, and nothing
+#: there moves *for* this package -- and what a sibling edit made for this package would carry, in
+#: an import or a branch or a comment, is this package's own name.
 _SIBLING = "teb_vae/lag_attn_cfs"
 _SIBLING_ALLOWED_CHANGES = ("teb_vae/lag_attn_cfs/tests/test_nets_are_framework_free.py",)
+
+#: The token a sibling module edited to accommodate this package would carry. Searched in source
+#: only: the sibling's own records cite the whole grid by name, as records should, and a guard that
+#: read a cross-reference in a design document as a code dependency would be turned off rather than
+#: fixed.
+_THIS_PACKAGE = "lag_attn_crws"
 
 #: The production geometry this package declares, as literals. Every one of them is a *choice*
 #: rather than a constraint -- a raw sample is honest at every step, so nothing about the target ties
@@ -77,6 +98,25 @@ def _is_sibling_edit(code: str, path: str) -> bool:
     if code == "??":
         return path.endswith(".py")
     return any(letter in _TRACKED_CHANGE_LETTERS for letter in code)
+
+
+def _names_this_package(path: str) -> bool:
+    """Whether a changed sibling module carries this package's name.
+
+    A file that no longer exists counts, and deliberately: a deleted sibling module cannot be
+    cleared by reading it, and the safe reading of an unreadable change is that it has to be looked
+    at rather than that it is fine.
+
+    Args:
+        path: A repo-root-relative path with forward slashes.
+
+    Returns:
+        ``True`` if the file names this package, or could not be read to find out.
+    """
+    source = _REPO_ROOT / path
+    if not source.is_file():
+        return True
+    return _THIS_PACKAGE in source.read_text(encoding="utf-8", errors="ignore")
 
 
 def _sibling_changes(package: str) -> List[str]:
@@ -157,6 +197,32 @@ def test_each_imported_name_is_the_causal_cells_own_object(name):
     assert getattr(local, name) is getattr(causal_conftest, name)
 
 
+def test_the_wrapped_config_delegates_to_the_siblings_own_builder():
+    """The one imported name this package wraps rather than binds, and the property that keeps the
+    wrap honest.
+
+    ``causal_config`` is absent from :data:`IMPORTED_FROM_CAUSAL` because this row's alignment
+    reference is $42.21$ s where the sibling's is ``target_max`` -- a raw target leaves the source
+    reference uncancelled in the physical-lag identity, so the two rows cannot share a default.
+    What must NOT happen is a second builder: the wrapper has to call the sibling's object, so a
+    change to the shard, the widths or the schema still reaches this suite. Asserted by both
+    halves -- the wrapper is a different object, and it produces the sibling's own output when
+    handed the sibling's reference.
+    """
+    assert local.causal_config is not causal_conftest.causal_config
+
+    mine = local.causal_config()
+    theirs = causal_conftest.causal_config()
+    vae = "model_config"
+
+    # Differs in exactly one leaf: the reference.
+    assert mine[vae]["VAE_model"]["causal_align_reference"] == local.SHIPPED_ALIGN_REFERENCE
+    assert theirs[vae]["VAE_model"]["causal_align_reference"] == "target_max"
+
+    # And in nothing else: handed the sibling's reference, the wrapper reproduces it exactly.
+    assert local.causal_config(causal_align_reference="target_max") == theirs
+
+
 def test_the_keyword_sets_are_local_objects_rather_than_the_siblings():
     """The other half of the splice. The geometry below is a choice this package makes -- nothing
     about a raw target forces it -- so an arm moving one leaf of it must not move the sibling's."""
@@ -182,19 +248,55 @@ def test_the_shipped_set_leaves_the_decoder_width_to_the_architecture():
 # =================================================================================================
 # The sibling is reached by reference, not edited
 # =================================================================================================
-def test_the_causal_sibling_carries_no_change_but_the_registered_one():
+def test_no_changed_module_under_the_causal_sibling_names_this_package():
     """The standing rule of this package's arrival, checked from the working tree.
 
     A member needed from that package is bound by reference in a class body or imported by name, so
     that nothing there has to move; the failure this catches is the tempting one, where a missing
     export or an inconvenient signature is "fixed" by editing a package six shipped cells score
     through.
+
+    Read as *changed files that name this package* rather than as *changed files*. The sibling's
+    modules do move -- they are the family's causal propagation channel, and a change to the source
+    pathway or the objective is supposed to land there and reach every causal cell at once -- so
+    their stillness was never the property worth guarding. What an edit made **for this package**
+    carries is this package's name, in an import, a branch or a comment, and that is what is
+    refused. One file is registered as an exception because it must name every package in the
+    family: the import guard's forbidden-prefix list.
     """
     unexpected = [
-        path for path in _sibling_changes(_SIBLING) if path not in _SIBLING_ALLOWED_CHANGES
+        path
+        for path in _sibling_changes(_SIBLING)
+        if path.endswith(".py")
+        and path not in _SIBLING_ALLOWED_CHANGES
+        and _names_this_package(path)
     ]
 
     assert unexpected == [], unexpected
+
+
+def test_the_causal_sibling_never_imports_this_package():
+    """The other half of the same rule, and the half that does not need a dirty tree to be true.
+
+    The scan above sees only what this working tree changed, so on a clean checkout it asserts
+    nothing at all. This one is a property of the code as it stands: the dependency runs one way,
+    from here into the sibling, and a sibling module importing back would make the two packages one
+    -- a change on either side could then break the other, and the sibling is scored through by six
+    shipped cells.
+
+    ``tests/`` is excluded on the sibling's side for the reason the allow-list exists: its import
+    guard has to enumerate every package in the family by name, and a test that reads its own
+    subject as a violation is a test nobody keeps.
+    """
+    importers = [
+        str(path.relative_to(_REPO_ROOT)).replace("\\", "/")
+        for path in sorted((_REPO_ROOT / _SIBLING).rglob("*.py"))
+        if "tests" not in path.parts
+        and re.search(rf"^\s*(from|import)\s+.*{_THIS_PACKAGE}", path.read_text(encoding="utf-8"),
+                      re.MULTILINE)
+    ]
+
+    assert importers == [], importers
 
 
 @pytest.mark.parametrize(

@@ -293,8 +293,11 @@ class FeatureForecastTarget:
                 logvar=forward_outputs[f"logvar_{branch}"],
                 # ``None`` on every cell that does not weight its channels, which is all of them
                 # except the causal pair; see :attr:`target_channel_weight` for why this is a
-                # ``getattr`` rather than an attribute read.
+                # ``getattr`` rather than an attribute read. Both weights the objective applies are
+                # applied here too, or these four stop being partial sums of the ``pred_gap`` they
+                # are printed beside -- which is the only property that makes them worth reporting.
                 channel_weight=getattr(self, "target_channel_weight", None),
+                horizon_weight=getattr(self, "horizon_weight", None),
             ) * mask[..., None]
             return score.sum(dim=(0, 1, 3)), score.sum(dim=(0, 1, 2))
 
@@ -420,6 +423,9 @@ class FeatureForecastTarget:
             # weight. It reaches the two reconstruction terms and therefore ``pred_gap``; the gap
             # splits below apply the same vector, so each stays a partial sum of it.
             channel_weight=getattr(self, "target_channel_weight", None),
+            # The same contract on the horizon axis: ``None`` unless a halflife was configured, and
+            # applied at the same site, so the gap splits below must carry it for the same reason.
+            horizon_weight=getattr(self, "horizon_weight", None),
         )
         # Added here rather than inside the objective: the raw-signal models' block has one
         # physical channel and thirty horizon steps of one signal, so neither split says anything

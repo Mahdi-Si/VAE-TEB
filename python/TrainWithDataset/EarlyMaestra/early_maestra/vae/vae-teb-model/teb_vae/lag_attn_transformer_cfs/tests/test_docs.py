@@ -408,21 +408,29 @@ def test_the_mixin_section_states_why_neither_inheritance_works(design):
 
 
 def test_the_lean_limits_carry_their_replacement_triggers(design):
-    """A ``lean-limit`` note without a measurable trigger is a permanent excuse. Exactly four here,
+    """A ``lean-limit`` note without a measurable trigger is a permanent excuse. Exactly five here,
     all inherited from the target domain: the per-segment warm-up, the residual pair-indexed lag
-    bias, the lag floor that never varies, and the availability-clock margin the evaluation ships
-    unset.
+    bias, the lag floor that never varies, the clock the prior cannot cancel, and the persistence
+    residual this row has and the raw-target row does not.
 
     The second was "the uncorrected group delay" until the alignment corrected the per-channel half
     of it; what is left is the pair-indexed remainder, so the note is narrowed rather than removed.
+
+    **The availability-clock margin left this list rather than being renamed**, and that is the
+    shape a retired note takes: it recorded a threshold the evaluation shipped unset, the threshold
+    is now set from an observed spread, and a `lean-limit` whose limitation no longer exists sends
+    a reader looking for a gap that was closed.
     """
     flat = _flat(design)
 
-    assert len(re.findall(r"^> lean-limit: ", design, re.MULTILINE)) == 4
+    assert len(re.findall(r"^> lean-limit: ", design, re.MULTILINE)) == 5
     assert "when a measured run shows the anchor floor" in flat
     assert "when a nonzero target reference can be divided out" in flat
     assert "when a run's `source_lag_warmth_frac_ph` falls below" in flat
-    assert "once the first production run on the causal holdout split has written" in flat
+    assert "when the owner accepts a change to the posterior parameterisation" in flat
+    assert "when the raw-target cells' fast-step NLL shows the same" in flat
+    # Retired rather than restated: the trigger it named has fired.
+    assert "the causal holdout split has written" not in flat
 
 
 def test_the_design_records_what_the_evaluation_closed_and_what_it_did_not(design):
@@ -478,12 +486,18 @@ def test_every_companion_document_the_design_defers_to_exists(design):
 
 def test_every_launch_line_in_the_design_names_a_config_that_exists(design):
     """A launch line is copied and pasted; one naming a moved file fails at the shell with a message
-    about a path rather than about a run."""
+    about a path rather than about a run.
+
+    Four rather than three: the production config, the tiny variant, the local smoke variant, and
+    the identifiability instrument's own delta -- which earns a launch line because it is a
+    *runnable check* an operator invokes between architecture changes, not a training arm.
+    """
     referenced = sorted(
         set(re.findall(r"teb_vae/lag_attn_transformer_cfs/configs/[\w.]+\.yaml", design))
     )
 
-    assert len(referenced) == 3, f"DESIGN.md §16 names {referenced}, not all three launch configs"
+    assert len(referenced) == 4, f"DESIGN.md §16 names {referenced}, not all four launch configs"
+    assert "teb_vae/lag_attn_transformer_cfs/configs/planted.yaml" in referenced
     missing = [path for path in referenced if not (_REPO_ROOT / path).is_file()]
     assert missing == [], missing
 
@@ -658,13 +672,21 @@ def test_the_record_maps_its_criteria_onto_the_verdicts_that_re_ask_them(results
         assert verdict in section, verdict
 
 
-def test_the_unset_clock_margin_is_recorded_as_an_open_item_owned_by_the_parent(results):
+def test_the_clock_margin_is_recorded_as_set_and_still_owned_by_the_parent(results):
     """The threshold is one key for two cells, deliberately: set per cell it would gate the two
-    architectures this record's own edge table exists to compare against two different bars."""
+    architectures this record's own edge table exists to compare against two different bars.
+
+    This asserted the *open item* while the threshold was unset. It is now set, so what the record
+    has to carry is the number, the spread it was read off, and -- unchanged, and the reason this
+    test exists at all -- that the key belongs to the parent's override delta rather than to this
+    cell's. A margin set independently here would silently make the edge table a comparison of two
+    verdicts taken against different bars.
+    """
     flat = _flat(results)
 
-    assert "clock_margin_min_nats` is unset" in flat
-    assert "INCONCLUSIVE" in flat
+    assert "clock_margin_min_nats` is unset" not in flat
+    assert "0.15" in flat
+    assert "[0.157, 0.164]" in flat
     assert "set there once, for both cells" in flat
 
 

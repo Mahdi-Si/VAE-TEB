@@ -44,6 +44,7 @@ from teb_vae.lag_attn_transformer_rws.nets.blocks import (
 __all__ = [
     "AvailabilityInputAdapter",
     "CausalConvTransformerEncoder",
+    "GatedCausalConvStem",
     "START_EMBED_STD",
     "conv_receptive_field",
 ]
@@ -229,6 +230,111 @@ class CausalConvTransformerEncoder(nn.Module):
             f"d_model={self.d_model}, conv_blocks={len(self.conv_blocks)}, "
             f"attention_blocks={self.num_attention_blocks}, context={context}, "
             f"receptive_field={bound}"
+        )
+
+
+class GatedCausalConvStem(nn.Module):
+    r"""The convolution stem of :class:`CausalConvTransformerEncoder`, on its own.
+
+    The same :class:`~teb_vae.lag_attn_transformer_rws.nets.blocks.GatedCausalConvBlock` stack at
+    the same schedule, closed by the same :class:`RMSNorm` -- with the attention stack absent. The
+    output at $t$ is therefore a function of $[t - R_{\mathrm{conv}} + 1,\ t]$ alone, where the
+    encoder's blocks additionally reach $N_s (W_s - 1)$ steps further and, unwindowed, the whole
+    causal prefix.
+
+    It exists because :class:`CausalConvTransformerEncoder` refuses fewer than one attention block
+    by design -- an encoder with no attention is the convolution stack that architecture replaces --
+    so a stem-only source representation is a small wrapper over the blocks rather than a setting on
+    the encoder, and that refusal stays exactly as it is.
+
+    The closing normalisation is kept for the encoder's own reason: a pre-norm residual stack
+    without one exports an unnormalised stream whose scale grows with depth, and the lag attention's
+    key-value normalisation, like every other downstream consumer, is calibrated to a normalised
+    state.
+
+    Shapes:
+        Input:  ``(B, T, d)``
+        Output: ``(B, T, d)``
+    """
+
+    def __init__(
+        self,
+        *,
+        d_model: int,
+        conv_kernels: Sequence[int],
+        conv_dilations: Sequence[int],
+        dropout: float = 0.0,
+        layer_scale_init: float = LAYER_SCALE_INIT,
+    ) -> None:
+        r"""Build the stem and its closing normalisation.
+
+        Args:
+            d_model: Model width $d$, held constant end to end.
+            conv_kernels: Kernel width per stem block.
+            conv_dilations: Dilation per stem block; parallel to ``conv_kernels``.
+            dropout: Dropout probability on every residual branch output.
+            layer_scale_init: Initial LayerScale gain on every branch.
+
+        Raises:
+            ValueError: If the two schedules disagree in length, or if no block is requested -- a
+                stem of no blocks is the identity, and the identity representation is a differently
+                named arm rather than an empty schedule.
+        """
+        super().__init__()
+        self.d_model = int(d_model)
+        self.conv_kernels = tuple(int(kernel) for kernel in conv_kernels)
+        self.conv_dilations = tuple(int(dilation) for dilation in conv_dilations)
+        # Raises if the two schedules disagree, naming them.
+        self.conv_reach = conv_receptive_field(self.conv_kernels, self.conv_dilations)
+        if not self.conv_kernels:
+            raise ValueError(
+                "need at least one stem block; a stem of zero blocks is the identity, and the "
+                "identity representation is chosen by name rather than by an empty schedule"
+            )
+
+        self.conv_blocks = nn.ModuleList(
+            [
+                GatedCausalConvBlock(
+                    d_model,
+                    kernel_size=kernel,
+                    dilation=dilation,
+                    dropout=dropout,
+                    layer_scale_init=layer_scale_init,
+                )
+                for kernel, dilation in zip(self.conv_kernels, self.conv_dilations)
+            ]
+        )
+        self.output_norm = RMSNorm(d_model)
+
+    @property
+    def receptive_field(self) -> int:
+        r"""Steps of history the stem's output at $t$ can reach, itself included.
+
+        An ``int`` rather than the encoder's ``Optional[int]``: a stem is bounded by construction,
+        so "unbounded" is not a state this module can be in. It is the resolution floor of any lag
+        readout taken over this representation -- two lags closer together than this are summaries
+        of overlapping windows.
+        """
+        return self.conv_reach
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Run the stem and the final normalisation.
+
+        Args:
+            x: Projected stream ``(B, T, d_model)``.
+
+        Returns:
+            The bounded local representation ``(B, T, d_model)``.
+        """
+        for block in self.conv_blocks:
+            x = block(x)
+        return self.output_norm(x)
+
+    def extra_repr(self) -> str:
+        """Report the width, the schedule and the resulting reach."""
+        return (
+            f"d_model={self.d_model}, conv_blocks={len(self.conv_blocks)}, "
+            f"receptive_field={self.receptive_field} steps"
         )
 
 

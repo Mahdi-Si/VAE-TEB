@@ -478,7 +478,7 @@ def _check_floor_pairs_with_budget(
     )
 
 
-def main(config_path: str) -> None:
+def main(config_path: str) -> LagAttnCfsTrainer:
     """Resolve the config, build everything, and run the fit.
 
     Delegates to the shared entry point with this package's driver. The pre-flight guards, the
@@ -488,8 +488,11 @@ def main(config_path: str) -> None:
 
     Args:
         config_path: Path to the YAML config. Its ``base:`` chain is resolved first.
+
+    Returns:
+        The driver, after the fit -- the only handle on where the run's checkpoints went.
     """
-    run_training(config_path, trainer_cls=LagAttnCfsTrainer)
+    return run_training(config_path, trainer_cls=LagAttnCfsTrainer)
 
 
 def _resolve_cli_config_path(config_path: str) -> str:

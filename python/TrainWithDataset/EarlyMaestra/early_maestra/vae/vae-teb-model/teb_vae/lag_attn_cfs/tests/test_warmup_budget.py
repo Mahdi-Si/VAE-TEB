@@ -451,3 +451,180 @@ def test_the_entry_point_refuses_a_config_with_no_budget_by_name(tmp_path, monke
     monkeypatch.setattr(causal_warmup, "RUN_CONFIG", str(tmp_path / "absent.yaml"))
 
     assert causal_warmup._cli() == 2
+
+
+# =================================================================================================
+# The identifiability check's own lag geometry, which the tradeoff below is priced at.
+#
+# Written out rather than loaded from `configs/planted.yaml`: reading both from the config the check
+# also reads would make the band arithmetic agree with itself. These are the two leaves that config
+# pins and refuses to retune, so they are stated here as the claim.
+# =================================================================================================
+_PLANTED_HORIZON = 30
+_PLANTED_MAX_LAG = 90
+
+
+# =================================================================================================
+# The source-reference tradeoff
+#
+# The measurement that priced the shipped source clock, and the properties that make its table
+# readable. Three quantities move against each other -- how many source channels survive, how fresh
+# the freshest survivor is, and where a physiological delay lands on the lag axis -- and the pin was
+# chosen where they cross. What is checked here is not the pin (a number is a decision, and it lives
+# in the config) but that the table computing it says what it claims to say.
+#
+# Every one of these could be wrong in a way a table still prints. A candidate between two stored
+# delays is a clock no channel keeps. A "kept" count that included a channel above the reference
+# would be counting a shift that reads the channel's own future. And the band arithmetic is an
+# inverse of an identity with three constants in it, where a sign error moves the whole answer and
+# nothing looks odd.
+# =================================================================================================
+@pytest.fixture(scope="module")
+def source_points():
+    """The tradeoff over the shipped source stream, at the identifiability check's lag geometry."""
+    resolved = resolve_warmup_budget(causal_config())
+    assert resolved is not None
+    return warmup_budget.source_reference_tradeoff(
+        resolved.source,
+        target_reference_s=float(resolved.reference_delay_s),
+        horizon=_PLANTED_HORIZON,
+        max_lag=_PLANTED_MAX_LAG,
+    )
+
+
+#: The shipped source stream's own stored delays, one per DECLARED channel. Every candidate has to
+#: be one of these: the resolver snaps an explicit float against them and refuses one that matches
+#: none, so a table offering an unsnappable candidate would be offering a value the config cannot
+#: carry -- and the operator would find that out at launch rather than here.
+def _stored_source_delays():
+    resolved = resolve_warmup_budget(causal_config())
+    assert resolved is not None
+    return [float(delay) for delay in resolved.source.declared_delay_s]
+
+
+def test_every_candidate_is_a_delay_some_source_channel_actually_keeps(source_points):
+    """A reference between two stored delays is a clock no channel reports on."""
+    delays = {round(delay, 4) for delay in _stored_source_delays()}
+
+    assert source_points, "the tradeoff produced no candidates at all"
+    for point in source_points:
+        assert round(point.reference_s, 4) in delays, point.reference_s
+
+
+def test_the_candidates_are_ordered_and_span_the_floor_to_the_targets_own_clock(source_points):
+    """Ordered, because the table is read down a column; and bounded above by the target's own
+    reference, because a source clock slower than the target's buys nothing the single-reference
+    scheme did not already have."""
+    references = [point.reference_s for point in source_points]
+    resolved = resolve_warmup_budget(causal_config())
+
+    assert references == sorted(references)
+    assert references[0] >= warmup_budget.CANDIDATE_FLOOR_SECONDS
+    assert references[-1] == pytest.approx(float(resolved.reference_delay_s))
+
+
+def test_a_faster_clock_keeps_fewer_channels_and_a_fresher_one(source_points):
+    """The trade itself, as a monotone property rather than as two numbers.
+
+    This is the whole content of the measurement: a shift can only delay, so the reference is
+    bounded below by the slowest channel it keeps, and buying recency means dropping channels.
+    A table where the two moved together would be describing a free lunch, which is the shape a
+    sign error takes here.
+    """
+    for slower, faster in zip(source_points[1:], source_points):
+        assert faster.reference_s < slower.reference_s
+        assert faster.kept <= slower.kept
+        assert faster.recency_s < slower.recency_s
+
+
+def test_the_kept_count_is_the_channels_at_or_below_the_reference(source_points):
+    """Counted against the stream's own delays rather than taken from the point, because "kept" is
+    the whole cost side of the trade: a count that admitted a channel above the reference would be
+    counting a shift that reads that channel's own future, which is the property the alignment
+    exists to preserve."""
+    delays = _stored_source_delays()
+
+    for point in source_points:
+        expected = sum(1 for delay in delays if float(delay) <= point.reference_s + 1e-6)
+        assert point.kept == expected, point.reference_s
+        assert point.declared == len(delays)
+        assert sum(kept for _, kept, _ in point.block_counts) == point.kept
+
+
+def test_the_envelope_survivors_are_the_criterion_the_pin_was_taken_on(source_points):
+    """The decision criterion is stated over one block, and the point carries that block's count
+    beside the total for exactly that reason: a fast clock that kept a healthy total while pricing
+    the contraction envelope out would improve the lag axis by discarding the physiological signal
+    path, which is the failure the criterion exists to refuse."""
+    for point in source_points:
+        by_name = {name: kept for name, kept, _ in point.block_counts}
+        assert point.envelope_kept == by_name[warmup_budget.ENVELOPE_BLOCK]
+        assert point.meets_envelope_criterion == (
+            point.envelope_kept >= warmup_budget.MIN_UP_PH_KEPT
+        )
+
+
+def test_the_offset_is_the_two_clocks_difference_and_is_zero_at_the_targets_own(source_points):
+    r"""$\tau^u_{\mathrm{ref}} - \tau^y_{\mathrm{ref}}$, which is the single constant a dual
+    reference puts on the lag axis in place of the unaligned arm's pair-indexed smear. It is
+    negative for every faster candidate and exactly zero at the target's own clock, which is the
+    single-reference scheme -- so the last row of the table is the arm the revision moved away
+    from, priced beside the ones it moved to."""
+    resolved = resolve_warmup_budget(causal_config())
+    target = float(resolved.reference_delay_s)
+
+    for point in source_points:
+        assert point.offset_s == pytest.approx(point.reference_s - target, abs=1e-6)
+        assert point.offset_s <= 1e-6
+    assert source_points[-1].offset_s == pytest.approx(0.0, abs=1e-6)
+
+
+def test_the_band_lags_are_the_physical_lag_identity_solved_for_the_lag(source_points):
+    r"""The arithmetic, against the identity written out here rather than against the function that
+    computes it.
+
+    $\ell = (\tau^{\mathrm{phys}} + \tau_{\mathrm{pre}} - \mathrm{offset}) / \Delta - 1 - h$. The
+    low end is the *fastest* delay at the *furthest* horizon step and the high end is the slowest
+    at the first, because $\ell$ falls with $h$ -- getting that pairing backwards would report a
+    band that clears both edges when it does not, and the whole reference decision rests on which
+    edges it clears.
+    """
+    lo_s, hi_s = warmup_budget.PHYSIOLOGICAL_BAND_SECONDS
+    delta = warmup_budget.SECONDS_PER_STEP
+    pre = warmup_budget.MECHANICAL_SHIFT_SECONDS
+
+    for point in source_points:
+        expected_lo = (lo_s + pre - point.offset_s) / delta - 1.0 - (_PLANTED_HORIZON - 1)
+        expected_hi = (hi_s + pre - point.offset_s) / delta - 1.0 - 0.0
+        assert point.band_lag_lo == pytest.approx(expected_lo, abs=1e-6)
+        assert point.band_lag_hi == pytest.approx(expected_hi, abs=1e-6)
+        assert point.readable == (0.0 <= point.band_lag_lo and point.band_lag_hi <= _PLANTED_MAX_LAG)
+
+
+def test_the_targets_own_clock_censors_the_band_and_a_faster_one_does_not(source_points):
+    """The finding the whole measurement was taken for, as a property of the table rather than as a
+    recorded number: at the single reference the physiological band falls below lag 0 for most of
+    the horizon, and some faster candidate clears both edges at every horizon step. A table on
+    which no candidate was readable would price nothing."""
+    assert not source_points[-1].readable, "the single-reference arm is not censored"
+    assert any(point.readable for point in source_points)
+    # And the readable ones are the fast end: readability is monotone in the clock, so a readable
+    # candidate slower than an unreadable one would mean the band arithmetic is not monotone in the
+    # offset -- which it is, by inspection of the identity above.
+    readable = [point.reference_s for point in source_points if point.readable]
+    unreadable = [point.reference_s for point in source_points if not point.readable]
+    assert max(readable) < min(unreadable)
+
+
+def test_the_table_prints_every_candidate_with_its_verdict(source_points):
+    """The operator-facing half. The table is what the pin was read off, so every row has to carry
+    the three quantities and a verdict -- a table that printed only the winner would leave the
+    decision unreproducible from its own output."""
+    table = warmup_budget.format_source_reference_table(
+        source_points, max_lag=_PLANTED_MAX_LAG, horizon=_PLANTED_HORIZON
+    )
+
+    assert table.count("\n") >= len(source_points)
+    for point in source_points:
+        assert f"{point.reference_s:.4f}" in table
+    assert "CENSORED" in table and "readable" in table

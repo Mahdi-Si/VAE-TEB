@@ -251,6 +251,12 @@ class InputStreamPanel:
             :data:`DELAY_STAIRCASE_LABEL`, the reach guard's reading; a builder whose staircase is
             some other per-channel boundary supplies its own, because the label is the only thing
             on the row that says which quantity the step function is.
+        time_label: The row's x-axis label. Defaults to the bare ``'Time (s)'``, which is exact for
+            a stream whose coefficients are stamped with the instant they describe. A builder whose
+            stream is *not* -- a one-sided bank shifted onto a common clock reports content
+            $\kappa\tau_{\mathrm{ref}}$ before the step it is drawn at -- supplies a label saying
+            so, because this row shares its horizontal axis with the raw traces above it and the
+            offset is otherwise invisible.
     """
 
     name: str
@@ -260,6 +266,7 @@ class InputStreamPanel:
     blocks: Tuple[Tuple[str, int, int], ...]
     title: str
     delay_label: str = DELAY_STAIRCASE_LABEL
+    time_label: str = "Time (s)"
 
 
 def annotate_channel_frequencies(ax: Any, center_hz: np.ndarray, *, count: int = 8) -> Any:
@@ -369,7 +376,7 @@ def _input_stream_row(ax: Any, panel: InputStreamPanel, *, t_max: float, seconds
         ax.legend(loc="lower right", fontsize=6, framealpha=0.9)
 
     ax.set_title(panel.title, fontsize=9, pad=6)
-    ax.set_xlabel("Time (s)", fontsize=8)
+    ax.set_xlabel(panel.time_label, fontsize=8)
     ax.set_ylabel("Input channel", fontsize=8)
     return image
 

@@ -21,7 +21,7 @@ import copy
 import importlib
 import sys
 from pathlib import Path
-from typing import Any, Dict, Mapping, Optional, Sequence
+from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 import pytest
 import torch
@@ -675,9 +675,16 @@ def write_cohort_shards(directory: Path) -> Sequence[str]:
 
     Driven through ``scripts/make_tiny_shard.py``'s own entry point rather than by calling its
     writers directly, so the script stays load-bearing: a change to how a causal shard is written
-    reaches this suite without anything here being updated. ``--seq-len`` is passed explicitly
-    because the merge lets that script's ``RUN_ARGS`` supply it otherwise, and a fixture whose
-    geometry depended on a hand-edited dict would move under the tests silently.
+    reaches this suite without anything here being updated.
+
+    Entered through ``_cli`` with an explicit argument list, which is the surface the launch
+    convention gives it: ``main`` is keyword-only and takes no argv, because the merge that turns a
+    command line and a ``RUN_ARGS`` dict into one keyword set lives in ``_cli``. Going through the
+    merge is also what keeps this honest -- the fixture exercises the same path an operator does.
+
+    ``--variants``, ``--out-dir`` and ``--seq-len`` are all stated explicitly because everything
+    else comes from that dict: a fixture whose geometry or destination depended on a hand-edited
+    dict would move under the tests silently.
 
     Args:
         directory: Destination directory.
@@ -685,9 +692,9 @@ def write_cohort_shards(directory: Path) -> Sequence[str]:
     Returns:
         The eight shard paths, in canonical subgroup order.
     """
-    from scripts.make_tiny_shard import COHORT_SUBGROUPS, main as make_tiny_shard_main
+    from scripts.make_tiny_shard import COHORT_SUBGROUPS, _cli as make_tiny_shard_cli
 
-    exit_code = make_tiny_shard_main(
+    exit_code = make_tiny_shard_cli(
         [
             "--variants", "causal_cohort",
             "--out-dir", str(directory),
@@ -717,6 +724,28 @@ def cohort_stats(cohort_shards) -> str:
     return str(Path(cohort_shards[0]).parent / COHORT_STATS_FILENAME)
 
 
+def _tiny_occlusion_bands(max_lag: int) -> Dict[str, List[int]]:
+    r"""The shipped four-band partition of the lag window, rescaled to a tiny ``max_lag``.
+
+    The shipped bands are stated in production lag indices and the schema refuses one that reaches
+    past the window, so a tiny model needs its own. Derived from the window rather than written out
+    so that a geometry change moves them: what the analysis needs is four **contiguous, non-empty**
+    bands covering $[0, L]$ exactly once, and their widths are a reading convenience rather than a
+    property anything asserts.
+
+    Args:
+        max_lag: The model's ``max_lag``, so lags run over $[0, \mathrm{max\_lag}]$.
+
+    Returns:
+        The bands, in the shipped names and the shipped order.
+    """
+    edges = [round(index * (max_lag + 1) / 4) for index in range(5)]
+    names = ("anchor", "near", "mid", "far")
+    return {
+        name: [edges[index], edges[index + 1] - 1] for index, name in enumerate(names)
+    }
+
+
 @pytest.fixture(scope="session")
 def cohort_config(cohort_shards, cohort_stats) -> Dict[str, Any]:
     """The tiny training config with the committed evaluation delta merged over it, repointed.
@@ -742,6 +771,15 @@ def cohort_config(cohort_shards, cohort_stats) -> Dict[str, Any]:
     dataset["stat_path"] = cohort_stats
     # Four per batch: enough batches that a per-batch bug cannot hide in a single pass.
     config["general_config"]["batch_size"]["test"] = 4
+    # The occlusion bands are the one override leaf pinned to the PRODUCTION lag window, and the
+    # tiny geometry shrinks that window to nine bins for a CPU run. The schema refuses a band
+    # reaching past `max_lag` -- correctly, because a band whose top the attention cannot read
+    # would score nothing there while its name claimed otherwise -- so they are rescaled here
+    # rather than the refusal being loosened. The partition's SHAPE is what the fixture needs:
+    # four contiguous bands covering the whole window with the anchor band at the near edge.
+    config["eval_config"]["occlusion_bands"] = _tiny_occlusion_bands(
+        int(config["model_config"]["VAE_model"]["max_lag"])
+    )
     force_single_process_loader(config)
     config["eval_config"] = validate_eval_config(config)
     return config
@@ -807,14 +845,26 @@ def cohort_overrides(cohort_shards, cohort_stats, tmp_path_factory) -> Path:
     a field it was not asked for, silently.
 
     Session-scoped and written once; treat as read-only.
+
+    Three leaves are repointed rather than two, and the third is not a placeholder. The occlusion
+    bands are stated in **production lag indices** and the schema refuses a band reaching past the
+    model's own ``max_lag`` -- correctly, because a band whose top the attention cannot read would
+    score nothing there while its name claimed otherwise. The tiny geometry these fixtures run at
+    shrinks that window to nine bins, so the bands are rescaled to it rather than the refusal being
+    loosened. What the run needs is the partition's *shape*; see :func:`_tiny_occlusion_bands`.
     """
     import yaml
 
+    from teb_vae.lag_attn.config import load_config
     from teb_vae.lag_attn_cfs.eval.config_schema import load_eval_overrides
 
     overrides = load_eval_overrides()
     overrides["dataset_config"]["vae_test_datasets"] = list(cohort_shards)
     overrides["dataset_config"]["stat_path"] = cohort_stats
+    tiny = Path(_REPO_ROOT) / "teb_vae" / "lag_attn_cfs" / "configs" / "tiny.yaml"
+    overrides["eval_config"]["occlusion_bands"] = _tiny_occlusion_bands(
+        int(load_config(str(tiny))["model_config"]["VAE_model"]["max_lag"])
+    )
     path = tmp_path_factory.mktemp("eval_overrides") / "eval_overrides_repointed.yaml"
     path.write_text(yaml.safe_dump(overrides, sort_keys=False), encoding="utf-8")
     return path

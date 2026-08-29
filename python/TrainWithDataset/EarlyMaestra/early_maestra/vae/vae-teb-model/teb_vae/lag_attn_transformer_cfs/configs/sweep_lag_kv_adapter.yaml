@@ -1,0 +1,33 @@
+# Lag-attention memory arm: keys and values from the ADAPTER output, at one step of reach.
+#
+# The default builds K and V from the causal conv stem, whose receptive field is many lag steps
+# wide; this arm takes the availability adapter's output directly, which is a per-step linear map of
+# the gated source stream and carries no memory at all. It is the sharpest arm the key admits and
+# the smallest model of the three.
+#
+# WHY IT IS AN ARM. A deep source state at lag 0 already contains, by the data-processing
+# inequality, most of what the whole window contains, so the attention can report lag 0 without the
+# data saying anything about lags. Shortening the K/V memory is what removes that degeneracy, and
+# `adapter` removes it entirely -- the value at lag ell is a function of stored step t - ell alone.
+#
+# WHAT IT COSTS, and it is not only parameters. The prior's availability clock is an encode of this
+# same pathway, so with no memory in the pathway the clock collapses to the constant staircase and
+# `prior_availability_input` becomes provably inert on this arm. The two keys are not independent,
+# and a reading of this arm's KL has to carry that.
+#
+#   TEB_RUN_STAMP="$(date '+%Y-%m-%d--[%H-%M]')" torchrun --nproc_per_node=7 \
+#       -m teb_vae.lag_attn_transformer_cfs.trainer --config teb_vae/lag_attn_transformer_cfs/configs/sweep_lag_kv_adapter.yaml
+base: default.yaml
+
+model_config:
+  VAE_model:
+    lag_kv_source: adapter
+
+advanced_config:
+  tracking:
+    mlflow:
+      # IDENTITY: the arm in the name, on both keys, so a run's own records say which arm trained
+      # even if the config it was launched from cannot be recovered.
+      run_name: lag_attn_trf_cfs_kv_adapter
+      tags:
+        variant: lag_attn_trf_cfs_kv_adapter

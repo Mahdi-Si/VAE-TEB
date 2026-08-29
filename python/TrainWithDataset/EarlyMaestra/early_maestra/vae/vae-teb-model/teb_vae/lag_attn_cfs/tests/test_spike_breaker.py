@@ -23,6 +23,7 @@ from __future__ import annotations
 import math
 from pathlib import Path
 
+import pytest
 import torch
 
 from teb_vae.lag_attn.config import load_config
@@ -345,3 +346,67 @@ def test_a_skipped_step_still_touches_every_parameter(task):
         if parameter.grad is not None and torch.count_nonzero(parameter.grad) > 0
     ]
     assert not poisoned_grads, f"non-zero gradients survived a skipped step: {poisoned_grads}"
+
+
+# --------------------------------------------------------------------------------------
+# The horizon weighting, and why it leaves these two constants alone
+# --------------------------------------------------------------------------------------
+def test_the_horizon_weight_redistributes_the_block_rather_than_rescaling_it():
+    r"""The one mechanism that could have invalidated both constants above, and the property that
+    stops it.
+
+    ``additive_margin`` and ``gradient_clip_val`` are both stated in nats of the **summed block**,
+    so anything that changes the block's scale puts both out of date at once -- and silently, since
+    a shrunken block is a perfectly healthy-looking loss curve at a smaller number. A decaying
+    horizon weight is exactly such a thing: $2^{-\tau/\lambda}$ over $H$ steps sums to far less than
+    $H$, so an un-renormalised weight would shrink the reconstruction against a KL that did not
+    move -- an increase in the effective $\beta$ wearing a horizon weight's name.
+
+    :func:`~teb_vae.lag_attn_rws.nets.losses.horizon_decay_weight` renormalises to $\sum_\tau w_\tau
+    = H$, so only the *distribution* across horizon steps moves. Asserted as a ratio against the
+    unweighted sum on a symmetric per-step score: what has to hold is that the two are the same
+    number, not that the weight is uniform -- it is emphatically not, and the spread is asserted
+    beside the ratio so a weight that had quietly become flat would fail here too.
+    """
+    from teb_vae.lag_attn_rws.nets.losses import horizon_decay_weight
+
+    vae = load_config(str(_CONFIG))["model_config"]["VAE_model"]
+    horizon = int(vae["horizon"])
+    halflife = float(vae["horizon_weight_halflife_steps"])
+    weight = horizon_decay_weight(halflife, horizon)
+
+    # A per-step score that is the same at every horizon step, so the two block sums differ by the
+    # weight alone. Any constant would do; one is the one that makes the ratio readable.
+    per_step = torch.ones(horizon, dtype=torch.float64)
+    unweighted = float(per_step.sum())
+    weighted = float((per_step * weight.to(torch.float64)).sum())
+
+    assert weighted == pytest.approx(unweighted, rel=1e-4)
+    # And it is a real reweighting rather than a no-op: the near steps carry several times what the
+    # far ones do, which is the whole mechanism.
+    assert float(weight[0]) / float(weight[-1]) > 3.0
+
+
+def test_an_un_renormalised_decay_would_have_moved_the_block_enough_to_matter():
+    r"""Non-vacuity for the ratio above, and the number that says why the renormalisation is not a
+    detail.
+
+    Without it the block would shrink by $H / \sum_\tau 2^{-\tau/\lambda}$ -- a factor near two at
+    the shipped half-life -- which is a change of the same order as the gap between the measured
+    worst excursion and the shipped margin. So the admissible band this file brackets would have
+    moved out from under both constants, with no column in any run's CSV saying so.
+    """
+    from teb_vae.lag_attn_rws.nets.losses import horizon_decay_weight
+
+    vae = load_config(str(_CONFIG))["model_config"]["VAE_model"]
+    horizon = int(vae["horizon"])
+    halflife = float(vae["horizon_weight_halflife_steps"])
+
+    raw = torch.tensor(
+        [2.0 ** (-step / halflife) for step in range(horizon)], dtype=torch.float64
+    )
+    shrinkage = horizon / float(raw.sum())
+    normalised = horizon_decay_weight(halflife, horizon).to(torch.float64)
+
+    assert shrinkage > 1.5
+    assert torch.allclose(normalised, raw * shrinkage, rtol=1e-5)

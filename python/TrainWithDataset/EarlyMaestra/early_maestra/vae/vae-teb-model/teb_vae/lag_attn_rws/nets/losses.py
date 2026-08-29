@@ -84,6 +84,51 @@ LOGVAR_FLOOR_MARGIN_FRAC = 0.05
 KLD_ACTIVE_EPS = 1e-2
 
 
+def horizon_decay_weight(halflife_steps: float, horizon: int) -> torch.Tensor:
+    r"""The decaying horizon weighting, normalised to leave the block's scale alone.
+
+    $$\tilde w_\tau = 2^{-\tau / \lambda}, \qquad
+      w_\tau = H\,\frac{\tilde w_\tau}{\sum_{\tau'} \tilde w_{\tau'}} .$$
+
+    **The normalisation is the load-bearing part**, exactly as it is for the channel weights: the
+    raw decay sums to far less than $H$, so without the rescaling a weighted block score would
+    shrink against a KL that did not move -- an increase in the effective $\beta$ wearing a horizon
+    weight's name, which would put ``gradient_clip_val`` and the spike breaker's constants out of
+    date at the same time. Only the *distribution* across horizon steps moves.
+
+    What it buys is the finding it answers: under a horizon-uniform score the far steps are the
+    majority of the block and are the ones a fast channel cannot forecast at all, so the cheapest
+    way to lower the sum is to widen the variance everywhere and stop predicting the level -- the
+    model is paid to discard exactly the channels whose near steps it could forecast. Weighting the
+    near steps up removes that payment without removing the far steps from the objective.
+
+    Args:
+        halflife_steps: $\lambda$, the horizon step at which the raw weight has halved. Must be
+            positive: at $0$ every step but the first would carry weight $0$, and a negative value
+            would weight the far steps *up*, which is the opposite mechanism under the same name.
+        horizon: $H$, the number of horizon steps the block carries.
+
+    Returns:
+        A ``(H,)`` float32 tensor summing to $H$.
+
+    Raises:
+        ValueError: If ``halflife_steps`` is not positive or ``horizon`` is not at least $1$.
+    """
+    if not float(halflife_steps) > 0.0:  # catches NaN as well as zero and negatives
+        raise ValueError(
+            f"horizon weight halflife must be > 0 and not NaN, got {halflife_steps!r}. At 0 every "
+            f"horizon step but the first carries weight 0; a negative value weights the FAR steps "
+            f"up, which is a different mechanism under the same name. Pass None for the uniform "
+            f"objective, which is bitwise the unweighted one."
+        )
+    if int(horizon) < 1:
+        raise ValueError(f"horizon must be >= 1, got {horizon}")
+
+    steps = torch.arange(int(horizon), dtype=torch.float32)
+    weights = torch.pow(0.5, steps / float(halflife_steps))
+    return weights * (float(int(horizon)) / float(weights.sum()))
+
+
 def raw_sample_score(
     mu: torch.Tensor,
     target: torch.Tensor,
@@ -91,6 +136,7 @@ def raw_sample_score(
     likelihood: str,
     logvar: Optional[torch.Tensor] = None,
     channel_weight: Optional[torch.Tensor] = None,
+    horizon_weight: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     r"""The unmasked, unsummed score of every raw forecast sample.
 
@@ -113,14 +159,21 @@ def raw_sample_score(
     tensor and a fixed observation variance as a scalar; the returned score is the broadcast
     shape, which ``target`` always fixes to the full grid.
 
-    **``channel_weight`` makes the result a weighted score rather than a log-density**, and that
-    is the whole of what it costs. Passed, the per-element term becomes $w_c \cdot(-\log p)$, so a
+    **Either weight makes the result a weighted score rather than a log-density**, and that is the
+    whole of what they cost. Passed, the per-element term becomes $w_c w_\tau \cdot(-\log p)$, so a
     sum over the block is no longer a negative log-likelihood in nats: $\beta = 1$ stops being the
     exact ELBO and any $e^{\Delta/\text{block}}$ rescaling of a gap stops being a probability
-    statement. It exists because a feature block's last axis counts *channels* produced by two
+    statement. ``None`` leaves the term bitwise the unweighted one, in both cases -- no weighting at
+    all rather than a vector of ones.
+
+    ``channel_weight`` exists because a feature block's last axis counts *channels* produced by two
     different transforms, and weighting them equally is a choice rather than a neutral default --
     which the raw-signal cells, whose last axis counts raw samples of one signal, have no analogue
-    of. ``None`` leaves the term bitwise the unweighted one.
+    of. ``horizon_weight`` exists because the horizon axis is not neutral either: the far steps are
+    the majority of the block and are the ones a fast channel cannot forecast at all, so a uniform
+    score pays the model to widen its variance everywhere rather than predict the level anywhere.
+    Both normalise to leave the block's magnitude alone, so what each states is a *distribution*
+    over its axis; see :func:`horizon_decay_weight` and the causal cells' channel-weight resolver.
 
     Args:
         mu: Forecast mean, broadcastable to $(B, T_{\mathrm{valid}}, H, R)$.
@@ -132,24 +185,45 @@ def raw_sample_score(
             shape -- $(C,)$ for a feature block. ``None`` applies no weighting at all rather than
             a vector of ones, so an unweighted model's arithmetic is untouched rather than
             multiplied by one.
+        horizon_weight: Per-step weight on the **horizon** axis, strictly $(H,)$ and unsqueezed
+            here rather than broadcast by the caller. A $(H,)$ tensor broadcast as it stands would
+            land on the *channel* axis and silently weight the wrong thing wherever $H$ and the
+            block width agree, so the one axis this argument may occupy is fixed here.
 
     Returns:
         The per-raw-sample score $(B, T_{\mathrm{valid}}, H, R)$.
 
     Raises:
-        ValueError: On an unknown ``likelihood``, or ``'gaussian_nll'`` without ``logvar``.
+        ValueError: On an unknown ``likelihood``, ``'gaussian_nll'`` without ``logvar``, or a
+            ``horizon_weight`` that is not a 1-D tensor of the score's own horizon length.
     """
     validate_choice(likelihood, LIKELIHOOD_CHOICES, "likelihood")
 
     diff2 = (target - mu) ** 2
     if likelihood == "mse":
-        return diff2 if channel_weight is None else diff2 * channel_weight
-    if logvar is None:
+        score = diff2
+    elif logvar is None:
         raise ValueError(
             "likelihood='gaussian_nll' requires logvar; only 'mse' works without one"
         )
-    score = 0.5 * (_LOG_2PI + logvar + diff2 * torch.exp(-logvar))
-    return score if channel_weight is None else score * channel_weight
+    else:
+        score = 0.5 * (_LOG_2PI + logvar + diff2 * torch.exp(-logvar))
+
+    # Applied one after the other rather than multiplied together first: each is optional on its
+    # own, and a model carrying neither must reach the return with the tensor it computed above
+    # untouched rather than multiplied by ones.
+    if channel_weight is not None:
+        score = score * channel_weight
+    if horizon_weight is not None:
+        if horizon_weight.dim() != 1 or horizon_weight.shape[0] != score.shape[-2]:
+            raise ValueError(
+                f"horizon_weight must be 1-D of length H = {score.shape[-2]}, got shape "
+                f"{tuple(horizon_weight.shape)}. It names the horizon axis, and a tensor of any "
+                f"other shape would broadcast onto the channel axis instead -- weighting the wrong "
+                f"axis wherever the two lengths happen to agree."
+            )
+        score = score * horizon_weight[:, None]
+    return score
 
 
 def masked_raw_block_per_anchor(
@@ -160,6 +234,7 @@ def masked_raw_block_per_anchor(
     likelihood: str,
     logvar: Optional[torch.Tensor] = None,
     channel_weight: Optional[torch.Tensor] = None,
+    horizon_weight: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     r"""Each anchor's own masked block score, before any averaging.
 
@@ -186,16 +261,24 @@ def masked_raw_block_per_anchor(
         channel_weight: Per-channel weight on the block's last axis; see
             :func:`raw_sample_score`, which is where it is applied. ``None`` is the unweighted
             block every raw-signal cell scores.
+        horizon_weight: Per-step weight on the horizon axis, applied at the same site. ``None`` is
+            the horizon-uniform block.
 
     Returns:
         ``(block_per_anchor, contributing)``, both $(B, T_{\mathrm{valid}})$: the summed block
         score of each anchor, and a $0/1$ indicator of whether the anchor contributes at all.
 
     Raises:
-        ValueError: On an unknown ``likelihood``, or ``'gaussian_nll'`` without ``logvar``.
+        ValueError: On an unknown ``likelihood``, ``'gaussian_nll'`` without ``logvar``, or a
+            mis-shaped ``horizon_weight``.
     """
     per_sample = raw_sample_score(
-        mu, target, likelihood=likelihood, logvar=logvar, channel_weight=channel_weight
+        mu,
+        target,
+        likelihood=likelihood,
+        logvar=logvar,
+        channel_weight=channel_weight,
+        horizon_weight=horizon_weight,
     )
 
     block_per_anchor = (per_sample * mask[..., None]).sum(dim=(2, 3))  # (B, T_valid)
@@ -215,6 +298,7 @@ def masked_raw_likelihood(
     likelihood: str,
     logvar: Optional[torch.Tensor] = None,
     channel_weight: Optional[torch.Tensor] = None,
+    horizon_weight: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     r"""Masked reconstruction loss, summed over the forecast block, averaged over anchors.
 
@@ -232,6 +316,8 @@ def masked_raw_likelihood(
             :func:`raw_sample_score`. Under a non-``None`` weight ``d_sample`` divides by the
             element *count* rather than by the weight sum, so it stays the same fixed rescaling of
             ``d_block`` it always was rather than becoming a weighted mean.
+        horizon_weight: Per-step weight on the horizon axis, under the same contract: ``d_sample``
+            still divides by $H \cdot R$, so it remains a fixed rescaling of ``d_block``.
 
     Returns:
         ``(d_block, d_sample)``: the per-anchor block value (summed over the $H \cdot R$
@@ -239,10 +325,17 @@ def masked_raw_likelihood(
         ``d_sample = d_block / (H * R)``.
 
     Raises:
-        ValueError: On an unknown ``likelihood``, or ``'gaussian_nll'`` without ``logvar``.
+        ValueError: On an unknown ``likelihood``, ``'gaussian_nll'`` without ``logvar``, or a
+            mis-shaped ``horizon_weight``.
     """
     block_per_anchor, contributing = masked_raw_block_per_anchor(
-        mu, target, mask, likelihood=likelihood, logvar=logvar, channel_weight=channel_weight
+        mu,
+        target,
+        mask,
+        likelihood=likelihood,
+        logvar=logvar,
+        channel_weight=channel_weight,
+        horizon_weight=horizon_weight,
     )
 
     # Average over the anchors that contribute at all: a fully masked anchor (warm-up, gap,
@@ -602,6 +695,7 @@ def compute_loss(
     lambda_deriv: float = 0.0,
     lambda_boundary: float = 0.0,
     channel_weight: Optional[torch.Tensor] = None,
+    horizon_weight: Optional[torch.Tensor] = None,
 ) -> Dict[str, Any]:
     r"""Compute the seven-term objective, per anchor.
 
@@ -697,6 +791,18 @@ def compute_loss(
             computation and reports the metric as exact ``0.0``.
         lambda_deriv: Weight on the derivative Huber term, same zeros-when-off contract.
         lambda_boundary: Weight on the boundary-continuity term, same zeros-when-off contract.
+        channel_weight: Per-channel weight on the block's last axis, reaching both reconstruction
+            terms and therefore ``pred_gap``. ``None`` is the uniform objective, bitwise.
+        horizon_weight: Per-step weight on the horizon axis, reaching the same two terms. ``None``
+            is the horizon-uniform objective, bitwise. **The caution above applies where this
+            lands**: a weighted block score is not a log-density, so $\beta = 1$ is no longer the
+            exact ELBO of the source-conditioned branch and the ``nll_*`` columns of a weighted run
+            are not comparable in nats with an unweighted one's. The weight normalises to sum to
+            $H$, so the block's *scale* -- and with it the spike breaker's constants and
+            ``gradient_clip_val`` -- is left where it was; what moves is the distribution across
+            horizon steps. The three shape terms are deliberately not weighted: they are $L_1$ and
+            Huber quantities over the mean rather than parts of the likelihood, and every causal
+            cell ships them at $0.0$.
 
     Returns:
         ``{'metrics': ..., 'likelihood': ...}``. ``metrics`` maps names to scalar tensors -- the
@@ -742,6 +848,7 @@ def compute_loss(
         likelihood=likelihood,
         logvar=forward_outputs["logvar_full"],
         channel_weight=channel_weight,
+        horizon_weight=horizon_weight,
     )
     nll_base_block, nll_base_sample = masked_raw_likelihood(
         forward_outputs["mu_base"],
@@ -750,6 +857,7 @@ def compute_loss(
         likelihood=likelihood,
         logvar=forward_outputs["logvar_base"],
         channel_weight=channel_weight,
+        horizon_weight=horizon_weight,
     )
 
     kld_btd = kld_tensor(

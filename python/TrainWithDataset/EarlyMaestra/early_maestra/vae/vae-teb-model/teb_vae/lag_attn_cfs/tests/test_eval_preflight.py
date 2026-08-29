@@ -499,7 +499,12 @@ def test_the_resolved_budget_is_recorded_with_both_streams_widths(
     ]
     assert record["target_declared_width"] == 102
     assert record["target_kept_width"] == len(model_kwargs["target_keep_index"])
-    assert record["source_kept_width"] == record["source_declared_width"] == 51
+    # The source stream's two widths differ, and the difference is the ALIGNMENT's rather than the
+    # budget's: the warm-up budget never touches this stream, and the four channels missing here
+    # are the ones whose composed delay is above the reference, which a shift cannot reach without
+    # reading their own future. Both are recorded so the drop rule is readable from the artifact.
+    assert record["source_declared_width"] == 51
+    assert record["source_kept_width"] == 47
     # The realised maximum is not the configured threshold, and the distinction is load-bearing: a
     # threshold of 151 keeps the identical channels whose slowest still waits 134 steps.
     assert record["realised_max_warmup_steps"] <= record["budget_steps"]
@@ -587,15 +592,38 @@ def test_a_budget_that_cannot_be_resolved_at_all_is_refused_carrying_the_reason(
     assert "sequence_length" in message and "299" in message
 
 
-def test_the_unaligned_record_says_so_rather_than_omitting_it(config, model, model_kwargs) -> None:
+def test_the_unaligned_record_says_so_rather_than_omitting_it(config) -> None:
     """A run reading a shard variant is a fact about the run, so it is recorded even when it is the
-    legacy one -- an absent key would read as an older artifact rather than as an unaligned run."""
-    record = _run(config, model, model_kwargs)["checks"]["warmup_budget_matches_checkpoint"]
+    legacy one -- an absent key would read as an older artifact rather than as an unaligned run.
+
+    Driven on an explicitly unaligned config rather than on the fixture's own, which ships the
+    alignment: what is under test is the *branch*, and a branch exercised by whichever arm the
+    fixture happens to carry stops being exercised the day that arm moves.
+
+    The three inter-stream keys are ``None`` rather than zero on this arm, and that is the point of
+    checking them here. Unaligned, the bias between the two streams is channel-pair-indexed and
+    spans over a thousand seconds; a zero would state a single known offset that does not exist.
+    """
+    config["model_config"]["VAE_model"]["causal_align_reference"] = None
+    resolved = resolve_warmup_budget(preflight.config_view_for_budget(config))
+    assert resolved is not None
+
+    record = preflight.check_warmup_budget_matches_checkpoint(
+        config,
+        model_kwargs=warmup_model_kwargs(resolved, SeqVaeLagAttnCfs),
+        model_cls=SeqVaeLagAttnCfs,
+    )
 
     assert record["reference_delay_s"] is None
-    assert record["leg_alignment"] == "none"
+    # The phase-harmonic operator the SHARD was built by, which is a different question from
+    # whether this run aligns its channels: the committed fixture is an `envelope` shard either
+    # way, and a record that reported "none" here would be describing the data rather than the arm.
+    assert record["leg_alignment"] == "envelope"
     assert record["source_dropped_index"] == []
+    assert record["source_kept_width"] == record["source_declared_width"] == 51
     assert record["target_max_align_delay"] == record["source_max_align_delay"] == 0
+    assert record["source_clock_delay_s"] is None
+    assert record["inter_stream_offset_s"] is None
 
 
 def test_the_alignment_record_names_the_reference_and_the_channels_it_dropped(config) -> None:
@@ -616,7 +644,14 @@ def test_the_alignment_record_names_the_reference_and_the_channels_it_dropped(co
     assert record["source_dropped_index"] == [32, 33, 34, 35]
     assert record["source_kept_width"] == 47
     assert record["target_kept_width"] == 98
-    assert record["target_max_align_delay"] == record["source_max_align_delay"] == 97
+    assert record["target_max_align_delay"] == record["source_max_align_delay"] == 85
+    # One clock, so the source's own is the target's and the bias on the lag axis is exactly zero.
+    # Recorded rather than omitted where it is trivial: an artifact that left the offset out at
+    # zero would leave a reader unable to tell a run that measured zero from one that never
+    # resolved the quantity at all.
+    assert record["source_reference_delay_s"] is None
+    assert record["source_clock_delay_s"] == record["reference_delay_s"]
+    assert record["inter_stream_offset_s"] == 0.0
 
 
 def test_a_checkpoint_built_at_another_reference_is_refused(config) -> None:
@@ -674,10 +709,15 @@ def test_the_disclosure_carries_the_reference_beside_the_stale_step_count(config
 
     record = preflight.causality_disclosure(config, aligned_model, warmup=warmup)
 
-    assert record["source_delay_steps"] == 97
+    assert record["source_delay_steps"] == 85
     assert record["source_reference_delay_s"] == pytest.approx(402.1604, abs=5e-4)
-    assert record["source_delay_seconds"] == pytest.approx(97 * 4.0)
+    assert record["source_delay_seconds"] == pytest.approx(85 * 4.0)
     assert record["source_reference_delay_s"] != record["source_delay_seconds"]
+    # The pair the dual scheme adds, at their single-clock values. `source_reference_delay_s` is
+    # the SOURCE stream's own clock -- here the target's, because one reference drives both -- and
+    # the two entries beside it are what make that recoverable rather than assumed.
+    assert record["target_reference_delay_s"] == record["source_reference_delay_s"]
+    assert record["inter_stream_offset_s"] == 0.0
 
 
 # =================================================================================================
@@ -814,10 +854,18 @@ def test_the_disclosure_is_assembled_exactly_as_it_is_written_down(config, model
         "source_delay_steps",
         "source_delay_seconds",
         "source_delay_is_max_over_channels",
-        # The alignment reference, beside the stored-step maximum and never merged into it: under a
-        # channel alignment both are nonzero and they are different quantities, so a reader who
+        # The alignment references, beside the stored-step maximum and never merged into it: under
+        # a channel alignment both are nonzero and they are different quantities, so a reader who
         # took one for the other would state a lag wrong by minutes with nothing failing.
+        #
+        # THREE entries rather than one, because the two streams no longer have to share a clock.
+        # The first is the SOURCE stream's own, which is what every consumer computing a physical
+        # lag needs and what that name has always meant; the second is the target's; the third is
+        # the constant bias the pair puts on the lag axis, which under one clock is exactly zero
+        # and unaligned is `None` because no single number stands in for it.
         "source_reference_delay_s",
+        "target_reference_delay_s",
+        "inter_stream_offset_s",
         "horizon_seconds",
     ]
     assert record["one_sided_inputs"] is True
@@ -827,6 +875,8 @@ def test_the_disclosure_is_assembled_exactly_as_it_is_written_down(config, model
     # ``None`` rather than zero on a record with no resolved budget beside it: there is no common
     # clock to name, and zero would read as "aligned to the anchor itself".
     assert record["source_reference_delay_s"] is None
+    assert record["target_reference_delay_s"] is None
+    assert record["inter_stream_offset_s"] is None
     assert record["horizon_seconds"] == float(model.horizon) * 4.0
     # And the same record when the callable is passed explicitly, which is how a run reaches it.
     assert preflight.causality_disclosure(config, model, preflight.cfs_encoder_disclosure) == record

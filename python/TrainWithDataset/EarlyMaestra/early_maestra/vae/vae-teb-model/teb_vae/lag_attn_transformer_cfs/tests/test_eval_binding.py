@@ -48,8 +48,19 @@ from .conftest import CONV_LSTM_ONLY_KEYS, _REPO_ROOT, tiny_warmup_kwargs
 #: sequence, not a set -- the order is what the reconciliation record is built in and what a reader of
 #: two runs' preflight files compares down.
 #:
-#: Fifteen of the twenty-two are the conv-LSTM cell's, minus ``causal_norm``, which is not a keyword
-#: of this constructor at all. The seven this architecture adds are its encoders'.
+#: Eighteen of the twenty-five are the conv-LSTM cell's, minus ``causal_norm``, which is not a
+#: keyword of this constructor at all. The seven this architecture adds are its encoders'.
+#:
+#: Three of the eighteen are the architecture switches this family's revision added, and each is
+#: here for the same reason the widths are: the evaluation rebuilds the model from the
+#: **checkpoint's** own ``model_kwargs``, so a config disagreeing about one of them would not fail
+#: -- it would report one architecture's numbers under another's stated description.
+#: ``lag_kv_source`` changes what the lag attention reads and therefore what every lag readout
+#: means; ``prior_availability_input`` changes what the KL is a divergence between;
+#: ``persistence_residual`` changes the predictor every ``nll_*`` and every skill comparison is
+#: measured on. ``horizon_weight_halflife_steps`` is deliberately **not** here -- it reweights the
+#: training criterion's horizon axis and this pipeline scores every block unweighted, so a
+#: half-life edited after the fit contradicts no number the run reports.
 TRF_CFS_GEOMETRY_KEYS = (
     "sequence_length",
     "d_model",
@@ -66,6 +77,9 @@ TRF_CFS_GEOMETRY_KEYS = (
     "horizon_attention_blocks",
     "anchor_stride",
     "lag_floor",
+    "prior_availability_input",
+    "lag_kv_source",
+    "persistence_residual",
     "encoder_conv_kernels",
     "encoder_conv_dilations",
     "encoder_num_heads",
@@ -100,10 +114,10 @@ def model() -> Any:
 # =================================================================================================
 # The geometry keys
 # =================================================================================================
-def test_the_geometry_keys_are_exactly_the_twenty_two_declared_here() -> None:
+def test_the_geometry_keys_are_exactly_the_twenty_five_declared_here() -> None:
     assert GEOMETRY_KEYS == TRF_CFS_GEOMETRY_KEYS
     assert TRF_CFS_BINDING.geometry_keys is GEOMETRY_KEYS
-    assert len(GEOMETRY_KEYS) == 22
+    assert len(GEOMETRY_KEYS) == 25
     assert len(set(GEOMETRY_KEYS)) == len(GEOMETRY_KEYS), "a duplicate would be compared twice"
 
 
@@ -212,9 +226,12 @@ def test_the_extra_analyses_and_headline_scalars_are_the_parents_objects() -> No
     assert TRF_CFS_BINDING.extra_analyses is CFS_BINDING.extra_analyses
     assert TRF_CFS_BINDING.headline_scalars is CFS_BINDING.headline_scalars
     # Non-vacuous now that the parent's registry is filled: identity between two empty objects
-    # would be satisfied by two independent empty literals.
+    # would be satisfied by two independent empty literals. `occlusion` is the interventional half
+    # of the lag question and is inherited exactly like the other four -- it edits the model's
+    # INPUT, which is a question about the source pathway rather than about the encoder that reads
+    # it, so a second registration here would be a second copy of one question.
     assert set(TRF_CFS_BINDING.extra_analyses) == {
-        "warmup", "source_null", "lag_clocks", "spectral_skill",
+        "warmup", "source_null", "occlusion", "lag_clocks", "spectral_skill",
     }
     assert TRF_CFS_BINDING.headline_scalars != ()
 

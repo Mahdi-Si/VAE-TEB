@@ -39,7 +39,6 @@ from teb_vae.lag_attn_transformer_cfs.trainer import LagAttnTrfCfsTrainer
 from train.graph_models_utils import check_model_class, load_checkpoint_strict
 
 from .conftest import (
-    CAUSAL_C_U,
     SHIPPED_HORIZON,
     SHIPPED_WARMUP_PERIOD,
     absolutize_dataset_paths,
@@ -55,8 +54,15 @@ SMOKE_EPOCHS = 2
 #: What the shipped warm-up budget resolves to, pinned so a "guarded" fit cannot silently be the
 #: unguarded one -- which here would also silently change the decoder's width and therefore the
 #: units of every number the run reports.
+#:
+#: The two come from different rules and, since the two streams stopped sharing a clock, from
+#: different references. The **budget** takes four ``fhr_st`` channels off the target and never
+#: touches the source; the **alignment references** take every channel above their own stream's
+#: reference and never touch the other stream. The source number is therefore neither ``c_u`` --
+#: which it was while nothing gated that stream -- nor the target's survivor count: it is what the
+#: shipped source clock, a hundred-odd seconds faster than the target's, leaves standing.
 GUARDED_TARGET_CHANNELS = 98
-GUARDED_SOURCE_CHANNELS = CAUSAL_C_U
+GUARDED_SOURCE_CHANNELS = 39
 
 #: The anchor counts the two stages must produce, derived here the way the model derives them so a
 #: geometry change re-derives them rather than failing a literal.
@@ -379,6 +385,29 @@ def test_the_checkpoint_is_written_under_this_models_stem(fit):
     assert written, "no checkpoint was written"
     for path in written:
         assert path.name.startswith(LagAttnTrfCfsTrainer.CHECKPOINT_STEM), path.name
+
+
+def test_both_checkpoint_criteria_wrote_a_file_under_distinct_stems(fit):
+    """The second criterion, end to end, which is the only place its filename is decided.
+
+    The composite optimum and the best conditioned forecast are different epochs, so a run keeps
+    both -- and the two callbacks must not write the same name. With one stem Lightning would have
+    each overwrite the other's file at the same epoch, leaving one criterion's best silently
+    unsaved: two ``ModelCheckpoint``s in the callback list, one set of files on disk, and nothing
+    in the log about it. That is a construction-time property nothing but a real fit exercises.
+    """
+    driver, _trainer = fit
+    configured = driver.config["advanced_config"]["callbacks"]["model_checkpoint"]
+    stem = LagAttnTrfCfsTrainer.CHECKPOINT_STEM
+    names = {path.name for path in Path(driver.model_checkpoint_dir).glob("*.ckpt")}
+
+    assert configured.get("secondary_monitor"), "this run kept only one criterion"
+    primary = {name for name in names if name.startswith(f"{stem}-epoch=")}
+    secondary = names - primary
+
+    assert primary, f"the primary criterion wrote nothing: {sorted(names)}"
+    assert secondary, f"the second criterion wrote nothing: {sorted(names)}"
+    assert all("nll" in name for name in secondary), sorted(secondary)
 
 
 def test_the_checkpoint_carries_its_contract_and_reloads_at_its_own_width(fit):

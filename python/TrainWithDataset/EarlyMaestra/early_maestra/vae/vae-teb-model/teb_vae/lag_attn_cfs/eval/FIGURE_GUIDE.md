@@ -498,8 +498,25 @@ Two readouts the raw-target pipeline draws here are **absent**, and the emitted 
 
 - **A large difference between two large numbers is not the same as a large coupling.** The violins are drawn so that case is visible rather than inferred from one subtraction.
 - **The reference line means "the clock accounts for all of it"**, not "no coupling". Mass at or below zero says the coupling readout is measuring an availability pattern.
-- **The verdict is INCONCLUSIVE until a threshold is set**, and that is deliberate: `eval_config.clock_margin_min_nats` ships `null`, because the first production runs are the ones that are supposed to measure the spread it should be set from. The *number* on this figure is the reading, not the status beside it.
+- **The verdict decides, at `eval_config.clock_margin_min_nats: 0.15`.** It was left unset until a run had measured the spread it should be set from; the shipped value is that run's, and its provenance is the unaligned arm. The *number* on this figure is still the reading, and the status beside it is now a gate rather than a placeholder.
 - **Zeroing floors no source variation.** The encoder's response to a flat trajectory is not literally the availability pattern's own response, so this difference is a slightly **weaker** statement than "the clock alone" — it errs in the model's favour, and the emitted record says so.
+- **A large `kld_source_null` is not a defect.** Giving the prior the same clock cannot drive it to zero: the posterior is a bounded residual on the prior, so the mean half of the divergence at a silent source is a function of the delta head alone and no prior-side clock appears in it. The bottom panel's two violins overlapping heavily is the expected picture; the top panel is where the finding is.
+
+## `occlusion/occlusion_horizon_delta.pdf`
+
+**In plain terms.** *"When did the source actually matter?"* — asked by taking the source away rather than by reading attention weights. For each band of lags, the stored source values in that band are set to zero (the channel mean), the stream is re-encoded and the forecast is re-scored. A band whose removal costs the forecast nats is a band the forecast was using. This is the interventional half of the lag question; the lag profile is the observational half, and the two can disagree — on the fixture whose informative lags are known, they did.
+
+**What it shows.** One curve per configured band: the change in block NLL against an un-occluded reference, resolved by **horizon step**. Positive is worse without the band, which means the band mattered.
+
+**Axes.** Horizon step $0 \ldots H-1$ across; nats per anchor up, with zero marked.
+
+**How it is misread.** Five ways.
+
+- **A near-zero band is not always an uninformative band.** A band reaching into the warm-up has less source in it to remove; the summary's **live fraction** column is what separates "the source did not matter there" from "there was no source there". Read the two together, never the curve alone.
+- **The bands are lag ranges relative to each segment's own scored anchor**, not absolute step ranges. One anchor is drawn per segment and held fixed across every band and the reference, because the source pathway has memory and a second anchor scored in the same forward would attribute one anchor's loss to another's band.
+- **A negative curve is a real state, not a defect.** Removing source the model was mildly misusing improves the forecast. Whether a small negative value means anything is a question about the spread across segments, which the per-recording table carries and this figure does not.
+- **The availability announcement does not move.** The intervention edits values and leaves the arrival clock exactly where it was, and that invariance is *measured* on every occluded encode rather than assumed — which is what stops this being a second reading of the clock the `source_null` figure already reports.
+- **There is no threshold and no verdict here on purpose.** What a healthy per-band delta is has never been measured; a bar guessed before the first production runs would decide a pass or a fail on exactly the run that was going to set it.
 
 ## `spectral_skill/spectral_skill_bands.pdf`
 

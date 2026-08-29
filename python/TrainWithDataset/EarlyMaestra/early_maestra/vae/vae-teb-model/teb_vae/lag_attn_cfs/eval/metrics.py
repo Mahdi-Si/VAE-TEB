@@ -392,6 +392,7 @@ def mc_predictive_block(
     likelihood: str,
     num_samples: int = DEFAULT_NUM_SAMPLES,
     generator: Optional[torch.Generator] = None,
+    persistence: Optional[torch.Tensor] = None,
 ) -> Tuple[Dict[str, torch.Tensor], torch.Tensor]:
     r"""Score every branch's forecast under common random numbers, at the decoded anchors.
 
@@ -421,6 +422,12 @@ def mc_predictive_block(
             an explicit stream rather than the global one: two runs of a checkpoint must report
             the same numbers, and a global draw makes that a property of whatever else in the
             process happened to draw first. ``None`` falls back to the global generator.
+        persistence: The matched forward's own persistence input $(B, A_{\max}, C_{\mathrm{keep}})$
+            on a model whose decoder was built with the residual, and ``None`` otherwise -- which is
+            exactly what the decoder then expects, since it refuses either mismatch by name. Taken
+            from ``forward_outputs['persistence']`` by the caller rather than re-gathered here: it
+            is target-only and identical across branches and draws, so re-deriving it would be a
+            second definition of a tensor the forward already produced.
 
     Returns:
         ``(scores, contributing)``: the marginalised per-anchor score of each branch, and the
@@ -454,7 +461,13 @@ def mc_predictive_block(
         )
         for name, (mu, logvar) in branches.items():
             latent = mu + epsilon * torch.exp(0.5 * logvar)
-            forecast_mu, forecast_logvar = model.decoder(latent.gather(1, gather_index))
+            # The same persistence tensor for every branch and every draw, as the matched forward
+            # decoded with: it is target-only, so it is a property of the anchor rather than of the
+            # latent, and a branch decoded without it would differ from the others by the residual
+            # instead of by its own latent.
+            forecast_mu, forecast_logvar = model.decoder(
+                latent.gather(1, gather_index), persistence=persistence
+            )
             block, contributing = masked_raw_block_per_anchor(
                 forecast_mu, target, mask, likelihood=likelihood, logvar=forecast_logvar
             )
@@ -1364,9 +1377,11 @@ def source_null_kld_per_sample(
 
     The re-encode itself is **not** recomputed -- :func:`controls.source_null_forward_outputs` is
     called -- because that is where the arm's content lives: a zeroed stream is not a permutation
-    of a real one, and both the input adapter and the source encoder are nonlinear, so
-    ``source_gate``, ``source_adapter`` and ``source_encoder`` must all be re-run. It draws no
-    ``randn_like``, so it does not move the reparameterisation stream for the rest of the run.
+    of a real one, and every stage of the source pathway is nonlinear, so the gate and then the
+    model's own key/value path must all be re-run. That function resolves the path off the model
+    rather than naming a module, so this column measures whatever representation the lag attention
+    actually reads. It draws no ``randn_like``, so it does not move the reparameterisation stream
+    for the rest of the run.
 
     Args:
         model: The model the matched forward came from.
@@ -1633,6 +1648,10 @@ def evaluate_batch(
     scores, contributing = mc_predictive_block(
         model, branches, target, mask, anchors=anchors, likelihood=likelihood,
         num_samples=num_samples, generator=mc_generator,
+        # Absent on a model built without the decoder's persistence residual, which is the state
+        # the decoder is then also in; present, it is the forward's own tensor rather than a
+        # second gather of the same target.
+        persistence=outputs.get("persistence"),
     )
 
     # The training-path score: one latent draw, the same functions the objective uses. Reported

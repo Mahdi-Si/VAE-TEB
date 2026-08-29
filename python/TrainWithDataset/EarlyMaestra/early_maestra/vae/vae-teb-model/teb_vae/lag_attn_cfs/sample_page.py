@@ -83,7 +83,7 @@ handed.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -106,7 +106,11 @@ from teb_vae.lag_attn.figure_primitives import (  # noqa: E402
     to_numpy,
 )
 from teb_vae.lag_attn.nets.lag_report import SECONDS_PER_STEP  # noqa: E402
-from teb_vae.lag_attn_cfs.causal_warmup import SOURCE_BLOCKS, TARGET_BLOCKS  # noqa: E402
+from teb_vae.lag_attn_cfs.causal_warmup import (  # noqa: E402
+    ALIGNMENT_DELAY_FACTOR,
+    SOURCE_BLOCKS,
+    TARGET_BLOCKS,
+)
 from teb_vae.lag_attn_fs.sample_page import (  # noqa: E402
     FORECAST_CHANNELS,
     _batch_field,
@@ -138,14 +142,26 @@ __all__ = [
 #: the region behind it holds real values on no defined scale rather than a zero fill.
 WARMUP_STAIRCASE_LABEL = "warm-up: first honest step, $W'_c$"
 
-#: The caveat every lag-resolved panel on this page is read under. Stated once, as a page footnote,
-#: because the two lag panels are the shared builder's and the four shipped models must not gain a
-#: caption about a transform they do not use. Asserted as a string by the suite, so it cannot be
-#: dropped by an edit that keeps the figure rendering.
+#: The caveat every time-resolved panel on this page is read under -- the lag panels' vertical
+#: axis and, equally, the horizontal axis the input rows share with the raw rows above them.
+#: Stated once, as a page footnote, because the two lag panels are the shared builder's and the
+#: four shipped models must not gain a caption about a transform they do not use. $\kappa$ is
+#: interpolated from :data:`~teb_vae.lag_attn_cfs.causal_warmup.ALIGNMENT_DELAY_FACTOR` rather
+#: than typed, so the sentence and the shift it describes cannot state two different constants.
+#: Asserted as a string by the suite, so it cannot be dropped by an edit that keeps the figure
+#: rendering.
 LAG_TIME_CAVEAT = (
-    "Lag axes are stored-coefficient time, not physical delay: a causal channel still lags by its "
-    "own composed group delay (13-791 s), so the physical lag is $\\Delta\\ell$ plus a "
-    "channel-dependent $\\tau^u_c - \\tau^y_{c'}$ plus the $-20$ s preprocessing shift."
+    "Time axes are stored-coefficient time, not physical time. A causal channel lags by its own "
+    "composed group delay (13-791 s as declared); aligning a stream replaces that per-channel lag "
+    "with one constant, so every kept channel drawn at step $t$ carries content centred at "
+    f"$t-\\kappa\\tau_{{\\mathrm{{ref}}}}$, $\\kappa={ALIGNMENT_DELAY_FACTOR:g}$ -- each input "
+    "row states its own, and the run logs them as reference_delay_s and source_reference_delay_s. "
+    "The input rows therefore sit that constant to the right of the raw rows above them, and under "
+    "a dual reference the two differ from each other by "
+    "$\\kappa(\\tau^y_{\\mathrm{ref}}-\\tau^u_{\\mathrm{ref}})$. Converting a lag peak to a "
+    "physical lead time needs the same constants and the $-20$ s acquisition shift, and is done "
+    "where a physical lag is reported. Unaligned, each $\\tau_{\\mathrm{ref}}$ becomes the "
+    "channel's own $\\tau_c$ and no single number labels either axis."
 )
 
 #: Lane spacing as a multiple of the widest lane's own drawn extent, the two-sided page's rule and
@@ -274,6 +290,29 @@ def _stream_blocks(
     return tuple(spans)
 
 
+def _time_label(reference_delay_s: Optional[float]) -> str:
+    r"""The row's x-axis label, naming the clock its content sits on.
+
+    The row is drawn at the model's **step index** while the raw rows it shares a column with are
+    in physical time, so an aligned channel's content sits $\kappa\tau_{\mathrm{ref}}$ to the left
+    of where the column puts it -- $352$ s on this cell's shipped target clock, over a quarter of
+    the drawn window. Naming it on the axis is what closes that at the point of use; the page
+    footnote states the rule the number comes from.
+
+    Args:
+        reference_delay_s: $\tau_{\mathrm{ref}}$, the clock this stream was shifted onto, in
+            seconds, or ``None`` on an unaligned run.
+
+    Returns:
+        The label. Bare ``'Time (s)'`` when there is no reference, because an unaligned stream has
+        no single constant and a stated one would be wrong on every channel but one.
+    """
+    if reference_delay_s is None:
+        return "Time (s)"
+    offset = ALIGNMENT_DELAY_FACTOR * float(reference_delay_s)
+    return f"Time (s) — step index; content at $t-{offset:.0f}$ s"
+
+
 def _stream_title(
     name: str,
     blocks: Tuple[Tuple[str, int, int], ...],
@@ -281,7 +320,12 @@ def _stream_title(
     declared: int,
     warmup: np.ndarray,
 ) -> str:
-    """One line stating what the budget kept, what it dropped, and how long the survivors wait.
+    r"""One line stating what the budget kept, what it dropped, and how long the survivors wait.
+
+    The clock the row's content sits on is **not** here: measured at the page's real width this
+    title already renders at $106\%$ of its own axes, and a clock clause took it past the figure
+    edge. It goes on the x label instead, through :attr:`InputStreamPanel.time_label`, which is
+    the axis the statement is about.
 
     Args:
         name: ``'target'`` or ``'source'``.
@@ -315,6 +359,7 @@ def causal_stream_panels(
     forward_inputs: Sequence[torch.Tensor],
     *,
     sample_index: int = 0,
+    reference_delay_s: Optional[Mapping[str, Optional[float]]] = None,
 ) -> List[InputStreamPanel]:
     r"""Build the per-sample input rows from the tensors the net was actually fed.
 
@@ -335,6 +380,11 @@ def causal_stream_panels(
         forward_inputs: The task's forward inputs, ``(y_st, y_ph, u_stream, ...)``. Only the first
             three are read; the tiling arguments beyond them carry no channels.
         sample_index: Which sample of the batch to draw.
+        reference_delay_s: The clock each stream was aligned onto, keyed ``'target'`` /
+            ``'source'``, in seconds. Supplied by the task, which holds the resolved budget; the
+            net carries only the shifts, and $\tau_{\mathrm{ref}}$ cannot be recovered from those
+            alone. ``None`` -- or a stream mapped to ``None`` -- omits the clock clause, which is
+            the honest outcome for an unaligned run.
 
     Returns:
         One panel per stream, target first.
@@ -414,6 +464,9 @@ def causal_stream_panels(
                 center_hz=np.empty(0, dtype=float),
                 blocks=spans,
                 title=_stream_title(name, spans, keep_index.size, declared, warmup),
+                time_label=_time_label(
+                    None if reference_delay_s is None else reference_delay_s.get(name)
+                ),
                 delay_label=WARMUP_STAIRCASE_LABEL,
             )
         )

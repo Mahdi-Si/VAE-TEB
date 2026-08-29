@@ -11,15 +11,22 @@
 # over, and the decoded anchor count is what it is averaged over. Only the run's *scale* is local:
 # one device, one shard, hundreds of epochs instead of thousands.
 #
-# PREREQUISITE, AND IT DOES NOT YET EXIST. The shard paths below are placeholders in the same sense
-# default.yaml's are: there is no committed causal HIE shard, and the two-sided `output/hie_cs.hdf5`
-# cannot stand in for one -- it carries no `transform` attribute, no per-block `causal_warmup_steps`
-# and the two-sided channel counts, and the pre-flight refuses it by name. Build a causal shard from
-# the same recordings through the causal variant of the pipeline AT `--leg-alignment envelope`,
-# which is what the inherited `causal_leg_alignment` declares and what makes the inherited
-# `causal_align_reference` resolve its shifts against delays the phase blocks actually have;
-# regenerate its statistics with hdf5_dataset/calculate_dataset_stats.py at trim_minutes=1.0, and
-# repoint both keys. The statistics
+# PREREQUISITE, AND IT IS NOW SATISFIED. The shard below was built through the causal variant of
+# the pipeline AT `--leg-alignment envelope`, which is what the inherited `causal_leg_alignment`
+# declares and what makes the inherited `causal_align_reference` resolve its shifts against delays
+# the phase blocks actually have. Verified from its own root attributes: `transform: causal`,
+# `causal_leg_alignment: envelope`, 2617 segments, block widths 36/66/36/15.
+#
+# Two files on disk look like candidates and are not. The two-sided `output/hie_cs.hdf5` carries no
+# `transform` attribute, no per-block `causal_warmup_steps` and the two-sided channel counts, and
+# the pre-flight refuses it by name. `output/causal_scattering/hie_cs_causal.hdf5` IS causal, but it
+# predates the leg-alignment repair and carries no `causal_leg_alignment` attribute at all, so it
+# resolves to `none` and the warm-up resolver refuses it against this config's `envelope` -- which
+# is the guard doing its job, because the two variants share every width, warm-up and stored delay
+# and nothing else on the file could tell them apart.
+#
+# The statistics beside the shard were regenerated with hdf5_dataset/calculate_dataset_stats.py at
+# trim_minutes=1.0 and carry the same `transform` and `causal_leg_alignment`. They
 # matter here more than anywhere else: they are accumulated EXCLUDING the warm-up region, which is
 # what makes zero the channel mean over the region the model reads -- and therefore what makes the
 # source-null control a floor rather than a leak.
@@ -58,9 +65,9 @@ model_config:
 dataset_config:
   # Repo-root-relative: entry points run from the repo root. Both splits are the same shard; see
   # the header for why, and for what that does and does not license.
-  vae_train_datasets: [output/hie_cs_causal.hdf5]
-  vae_test_datasets: [output/hie_cs_causal.hdf5]
-  stat_path: output/hie_cs_causal_stats.hdf5
+  vae_train_datasets: [output/causal_scattering/hie_cs_alighned/hie_cs_alighned.hdf5]
+  vae_test_datasets: [output/causal_scattering/hie_cs_alighned/hie_cs_alighned.hdf5]
+  stat_path: output/causal_scattering/hie_cs_alighned/hie_cs_alighned_stats.hdf5
   dataloader_config:
     num_workers: 2       # a few hundred samples; worker spawn dominates beyond this on Windows
     prefetch_factor: 2

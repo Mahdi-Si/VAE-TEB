@@ -51,6 +51,10 @@ _SHIPPED_EVAL_KEYS = {
     "event_lag_window_s",
     "bootstrap_resamples",
     "clock_margin_min_nats",
+    # The interventional readout's own lag partition. It is a geometry key rather than a cap or a
+    # threshold: the bands are stated in lag indices and the schema refuses one that reaches past
+    # the model's own window, so a delta written for one lag geometry cannot be merged over another.
+    "occlusion_bands",
     "figure_format",
     "max_hours_before_delivery",
 }
@@ -155,14 +159,21 @@ def test_the_block_carries_exactly_the_specified_keys(overrides) -> None:
     assert validate_eval_config(overrides)["seed"] == overrides["eval_config"]["seed"]
 
 
-def test_the_clock_margin_is_shipped_explicitly_unset(overrides) -> None:
-    """Present and null rather than absent: the two resolve identically, and writing it out is
-    what tells a reader the INCONCLUSIVE verdict is a decision rather than an oversight."""
+def test_the_clock_margin_is_shipped_set_from_a_measured_spread(overrides) -> None:
+    r"""Set rather than null, which is what turns the tenth verdict from a report into a gate.
+
+    This asserted the *unset* state while there was no spread to read a bar off: a threshold
+    guessed before the first runs would have decided a pass or a fail on exactly the run that was
+    going to measure it. The diagnosed unaligned run supplied one -- $\Delta = 0.160$ over the
+    interval $[0.157, 0.164]$ -- and the shipped bar sits just below it.
+
+    Pinned as a number here rather than as "not None", because the value is the whole content: a
+    margin an order of magnitude out would still be set, and would gate every arm against a bar
+    nothing measured."""
     block = overrides["eval_config"]
 
-    assert "clock_margin_min_nats" in block
-    assert block["clock_margin_min_nats"] is None
-    assert validate_eval_config(overrides)["clock_margin_min_nats"] is None
+    assert block["clock_margin_min_nats"] == 0.15
+    assert validate_eval_config(overrides)["clock_margin_min_nats"] == 0.15
 
 
 def test_the_waveform_cap_is_halved_and_the_oracle_cap_stays_absent(overrides) -> None:
@@ -174,11 +185,21 @@ def test_the_waveform_cap_is_halved_and_the_oracle_cap_stays_absent(overrides) -
 
     The two page caps are figure counts and retain nothing. ``pages_per_class`` is PER CLASS, so
     it is not comparable with ``pages`` and is pinned here beside it rather than derived from it.
+
+    ``occlusion`` is a segment cap rather than a retention one, and it is the largest for that
+    reason: what it bounds is how many segments the interventional readout re-encodes and decodes,
+    which costs time and no memory. It is set well above what the shipped test split holds, so on a
+    production run it binds nothing and is there to stop a much larger split from turning one
+    analysis into the run.
     """
     caps = overrides["eval_config"]["caps"]
 
     assert caps == {
-        "waveforms": 64, "attention": 64, "pages": 24, "pages_per_class": 10
+        "waveforms": 64,
+        "attention": 64,
+        "pages": 24,
+        "pages_per_class": 10,
+        "occlusion": 512,
     }
     assert "oracle" not in caps
 
@@ -243,7 +264,7 @@ def test_the_run_s_own_contract_survives_the_merge(merged, resolved) -> None:
     # The threshold the whole channel axis follows from, and the floor paired with it.
     vae = merged["model_config"]["VAE_model"]
     assert vae["causal_warmup_budget_steps"] == 134
-    assert vae["warmup_period"] == 133
+    assert vae["warmup_period"] == 134
 
 
 def test_the_target_blocks_are_still_normalised_after_the_merge(merged) -> None:

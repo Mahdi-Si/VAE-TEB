@@ -44,7 +44,7 @@ CAUSAL_STATS = Path(CAUSAL_SHARD).parent / "tiny_stats_causal.hdf5"
 #: rather than of architecture.
 EVAL_LOAD_FIELDS = [
     "fhr", "up", "fhr_st", "fhr_ph", "up_ph", "up_st", "weight", "guid", "epoch", "target",
-    "cs_label", "bg_label", "time_from_labor_onset",
+    "cs_label", "bg_label", "time_from_labor_onset", "second_stage_onset",
 ]
 HYPER_PARAMETERS: Dict[str, Any] = {
     "likelihood": "gaussian_nll",

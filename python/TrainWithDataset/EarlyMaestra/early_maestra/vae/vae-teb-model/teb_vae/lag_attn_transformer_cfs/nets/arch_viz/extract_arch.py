@@ -733,7 +733,13 @@ def model_geometry(model: nn.Module) -> Dict[str, Any]:
         "d_z": int(model.d_z),
         "num_heads": int(model.num_heads),
         "target_encoder_receptive_field": model.target_encoder.receptive_field,
-        "source_encoder_receptive_field": model.source_encoder.receptive_field,
+        # Read off whichever module `lag_kv_source` put on the source side, because that is what
+        # the lag attention scores. Under a local arm there is no source encoder to read at all,
+        # and the adapter alone reaches exactly one step.
+        "lag_kv_source": model.lag_kv_source,
+        "source_encoder_receptive_field": (
+            1 if model.source_kv_body() is None else model.source_kv_body().receptive_field
+        ),
         "conv_reach": int(model.target_encoder.conv_reach),
         "target_warmup_max": max(model.target_warmup_steps or (0,)),
         "source_warmup_max": max(model.source_warmup_steps or (0,)),

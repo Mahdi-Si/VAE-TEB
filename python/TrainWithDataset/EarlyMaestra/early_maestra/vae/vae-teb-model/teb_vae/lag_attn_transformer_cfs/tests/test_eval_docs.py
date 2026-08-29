@@ -139,12 +139,20 @@ def test_the_one_declaration_that_differs_is_stated_with_its_arithmetic(eval_doc
     """``geometry_keys`` is the only field whose value is this package's own, and the document
     states how it is reached rather than only what it is -- because the rule it obeys (both a
     constructor parameter and a config key, or the reconciliation silently never happens) is what
-    makes a wrong entry invisible instead of loud."""
-    assert len(TRF_CFS_BINDING.geometry_keys) == 22
+    makes a wrong entry invisible instead of loud.
+
+    **The count is deliberately not in the document.** It was, and it went stale the first time the
+    tuple grew: a number stated in prose has to be edited in step with a tuple it cannot see, and
+    the failure is a record that reads as authoritative while being wrong. What the document states
+    is the *derivation* -- the parent's tuple, minus one key, plus the seven this architecture adds
+    -- which a reader can check against the code and which stays true as the parent's tuple moves.
+    So this asserts the names on both sides and leaves the count to the code.
+    """
+    assert len(TRF_CFS_BINDING.geometry_keys) == 25
     assert "causal_norm" not in TRF_CFS_BINDING.geometry_keys
-    assert "Twenty-two" in eval_doc
     assert "`causal_norm`" in eval_doc
     assert "silently skips" in eval_doc
+    assert "The count is left to the code" in eval_doc
     for key in (
         "encoder_conv_kernels",
         "encoder_conv_dilations",
@@ -156,6 +164,14 @@ def test_the_one_declaration_that_differs_is_stated_with_its_arithmetic(eval_doc
     ):
         assert key in TRF_CFS_BINDING.geometry_keys, key
         assert f"`{key}`" in eval_doc, key
+    # The three architecture switches the revision added to both cells' tuples, and the one it
+    # deliberately left out. Both halves, because absence is the half a reader would otherwise
+    # read as an oversight rather than as the decision it is.
+    for key in ("prior_availability_input", "lag_kv_source", "persistence_residual"):
+        assert key in TRF_CFS_BINDING.geometry_keys, key
+        assert f"`{key}`" in eval_doc, key
+    assert "horizon_weight_halflife_steps" not in TRF_CFS_BINDING.geometry_keys
+    assert "`horizon_weight_halflife_steps` is **absent**" in eval_doc
 
 
 # =================================================================================================

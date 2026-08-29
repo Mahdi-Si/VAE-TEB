@@ -77,7 +77,7 @@ import sys
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 #: Repository root: ``teb_vae/lag_attn_cfs/eval/run.py`` -> up four.
 _REPO_ROOT = os.path.dirname(
@@ -951,6 +951,89 @@ def warmup_budget_record(model: Any) -> Dict[str, Any]:
     }
 
 
+#: The three keys that decide which **arm** a run is, as ``(config key, model attribute)``.
+#:
+#: The two references are task-level and reach no constructor, so their model side is ``None`` and
+#: what the run actually resolved them to comes off the causality record instead. ``lag_kv_source``
+#: is a constructor key and is read from the rebuilt model, which is what was trained -- a config
+#: naming one arm while the checkpoint carries another is exactly the drift this block exists to
+#: make visible, and ``GEOMETRY_KEYS`` refuses that pair besides.
+ARM_KEYS: Tuple[Tuple[str, Optional[str]], ...] = (
+    ("causal_align_reference", None),
+    ("causal_align_reference_source", None),
+    ("lag_kv_source", "lag_kv_source"),
+)
+
+
+def arm_record(
+    config: Mapping[str, Any], task: Optional[Any], causality: Mapping[str, Any]
+) -> Dict[str, Any]:
+    """Record which arm this run is, as configured, as built, and as resolved.
+
+    Three columns because they answer three different questions and have disagreed in practice.
+    *Configured* is what the merged config asks for. *Built* is what the rebuilt checkpoint
+    carries, which is what was trained. *Resolved* is what the alignment references became against
+    the shards -- the two clocks in seconds and the constant offset between them, which is the term
+    a lag in physical seconds carries and which no config value states.
+
+    Args:
+        config: The merged run config, read for ``model_config.VAE_model``.
+        task: The loaded task, or ``None`` on a pass that rebuilt no model.
+        causality: The preflight causality record, for the resolved references.
+
+    Returns:
+        The block promoted into ``summary.json`` beside the delay, with ``None`` wherever this pass
+        could not read a value rather than a substituted default -- an offline re-run genuinely
+        does not know what the checkpoint was built with, and a filled-in guess would read as one.
+    """
+    vae_config = (config.get("model_config") or {}).get("VAE_model") or {}
+    model = None if task is None else getattr(task, "orig_model", None)
+    configured = {key: vae_config.get(key) for key, _attribute in ARM_KEYS}
+    built = {
+        key: (None if model is None or attribute is None else getattr(model, attribute, None))
+        for key, attribute in ARM_KEYS
+    }
+    return {
+        "configured": configured,
+        "built": {key: value for key, value in built.items() if value is not None},
+        "resolved": {
+            "target_reference_delay_s": causality.get("target_reference_delay_s"),
+            "source_reference_delay_s": causality.get("source_reference_delay_s"),
+            "inter_stream_offset_s": causality.get("inter_stream_offset_s"),
+            "source_delay_steps": causality.get("source_delay_steps"),
+        },
+    }
+
+
+def describe_arm(record: Mapping[str, Any]) -> str:
+    """Render the arm block as the one console line that says which arm trained.
+
+    Args:
+        record: What :func:`arm_record` returned.
+
+    Returns:
+        A single line naming the alignment arm, both resolved clocks with their offset, and the
+        lag-attention K/V source as built.
+    """
+    configured = dict(record.get("configured") or {})
+    resolved = dict(record.get("resolved") or {})
+    built = dict(record.get("built") or {})
+
+    def _seconds(value: Any) -> str:
+        return "-" if value is None else f"{float(value):.4f} s"
+
+    return (
+        "run arm: causal_align_reference="
+        f"{configured.get('causal_align_reference')!r}, causal_align_reference_source="
+        f"{configured.get('causal_align_reference_source')!r} -> target clock "
+        f"{_seconds(resolved.get('target_reference_delay_s'))}, source clock "
+        f"{_seconds(resolved.get('source_reference_delay_s'))}, inter-stream offset "
+        f"{_seconds(resolved.get('inter_stream_offset_s'))}; lag_kv_source="
+        f"{(built.get('lag_kv_source') or configured.get('lag_kv_source'))!r}"
+        f"{'' if built.get('lag_kv_source') else ' (configured; no model was rebuilt)'}"
+    )
+
+
 def build_run_context(
     *,
     # Whichever task the binding named; every read below is through the shared interface.
@@ -1246,9 +1329,15 @@ def main(
         # second is a constant a lag in seconds can be computed from, and only the first builds the
         # stored-coefficient axis every figure here draws -- so both travel, and neither stands in
         # for the other.
-        reference_delay_s = (
-            (preflight_record.get("causality") or {}).get("source_reference_delay_s")
-        )
+        causality = preflight_record.get("causality") or {}
+        reference_delay_s = causality.get("source_reference_delay_s")
+        # Which arm this run actually is, on the same block as the delay and in the summary. The
+        # drift this guards is not hypothetical: a headline evaluation of this family was read as
+        # the aligned arm for months while the run it described had trained unaligned, and no
+        # metric in the summary said so. The arm is a property of the *run*, so it is read from the
+        # merged config for what was asked and from the rebuilt model for what was built -- the two
+        # agreeing is the check, and the K/V source is reconciled against the checkpoint besides.
+        run_arm = arm_record(config, task, causality)
         if delay_steps:
             logger.info(
                 f"source channels are delayed by up to {delay_steps} steps "
@@ -1261,6 +1350,7 @@ def main(
                 f"{float(reference_delay_s):g} s; the lag axis below stays in stored-coefficient "
                 f"time and does NOT apply it."
             )
+        logger.info(describe_arm(run_arm))
 
         collection, probe_record, loader = load_or_collect_tables(
             results_dir,
@@ -1362,6 +1452,9 @@ def main(
             # at the read site: they are a physical constant and a stored-step count, and a reader
             # who takes one for the other gets a lag wrong by minutes with nothing failing.
             "source_reference_delay_s": reference_delay_s,
+            # Which arm this is, on the page rather than to be reconstructed from a config file
+            # that may no longer exist. The console prints the same block as one line.
+            "run_arm": run_arm,
             "eval_config": eval_config,
             # Read back from global state rather than echoed from the assignments, so the record
             # is what was in force rather than what was asked for.
@@ -1826,6 +1919,8 @@ RUN_ARGS: Dict[str, Any] = {
     #                     lag warmth, and the two FAIL-able geometry guards.
     #   source_null:      How much of the coupling readout survives zeroing the source -- the
     #                     availability-clock hazard no permutation of rows can see.
+    #   occlusion:        When the source mattered, asked by removing it: the per-horizon-step
+    #                     forecast cost of zeroing each configured lag band. Needs a checkpoint.
     #   lag_clocks:       Where the informative past sits, against both clinical clocks: the
     #                     centre of mass and the spread of the lag profile per window, tested.
     #   spectral_skill:   The forecast gap resolved by the frequency band of the target

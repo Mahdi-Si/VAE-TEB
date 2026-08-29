@@ -70,6 +70,13 @@ TIME_POOLING_PROOF = (
 #: parameter, and the tuples are constructor parameters that name no config key, so
 #: ``preflight.check_warmup_budget_matches_checkpoint`` re-resolves the budget against the configured
 #: shards instead -- the only comparison that can actually fail.
+#:
+#: **``horizon_weight_halflife_steps`` is deliberately absent**, on the same ground as
+#: ``SCHEDULE_KEYS`` and the objective weights: it re-weights the *training* criterion's horizon
+#: axis and no evaluated readout applies it -- this pipeline scores every block unweighted, so its
+#: ``nll_*`` and ``pred_gap`` are true log-densities in nats whatever the fit optimised. A
+#: half-life edited after the fit therefore changes nothing this run measures, and refusing the run
+#: for it would refuse a config that contradicts no reported number.
 GEOMETRY_KEYS: Tuple[str, ...] = (
     "sequence_length",
     "d_model",
@@ -86,6 +93,24 @@ GEOMETRY_KEYS: Tuple[str, ...] = (
     "horizon_attention_blocks",
     "anchor_stride",
     "lag_floor",
+    # Here because it changes **what the KL means**: with it off the source-conditioned KL contains
+    # an availability-clock term the posterior alone was told about, and with it on that term
+    # cancels by construction. A checkpoint and a config disagreeing about it would put two
+    # different quantities in one column named ``source_conditioned_kl_raw``.
+    "prior_availability_input",
+    # Here because it changes **what the lag axis is**: the keys and values the attention scores
+    # are a deep history state under `encoder` and a bounded local one under the local arms, so the
+    # same profile shape means two different things and the resolution floor of every lag readout
+    # moves with it. It also decides whether the three source-encoder keys below describe anything
+    # that was built.
+    "lag_kv_source",
+    # Here because it changes **what the forecast is**: with it on the decoder's mean carries a
+    # weighted copy of the anchor's own target vector, so every `nll_*`, every skill comparison
+    # against the persistence baseline and every per-channel error is measured on a different
+    # predictor. The rebuild takes the checkpoint's value, so a config disagreeing about it would
+    # not fail -- it would report the residual model's numbers under the residual-free model's
+    # stated architecture.
+    "persistence_residual",
     "encoder_conv_kernels",
     "encoder_conv_dilations",
     "encoder_num_heads",
@@ -120,13 +145,22 @@ def trf_cfs_encoder_disclosure(model: Any) -> Dict[str, Any]:
         depthwise $(C, 1, k)$ weight's fan wrongly and starts the stem an order of magnitude too
         quiet. A stem-free arm legitimately reports $0$.
 
+    ``lag_kv_source``
+        Which source representation the lag attention scores as keys and values, and therefore what
+        the three ``source_*`` numbers below describe. It is reported first among them because on a
+        local arm the deep encoder those numbers are named for **does not exist**, and a record that
+        restated its configured block count would describe a stack the run never built.
+
     ``source_receptive_field_steps``
-        The structural bound $R_U = R_{\mathrm{conv}} + N_U (W_U - 1)$, capped at $T$, or ``None`` for
-        the unbounded arm -- absent rather than $T$, because "no bound" and "a bound that happens to
-        equal the sequence length" are different statements. Compared against the furthest searched
-        lag, which the shared record's ``lag_support`` block carries in full: an encoder whose reach
-        exceeded the lag range would already be doing the alignment the lag cross-attention exists to
-        do, so the comparison is the point rather than the two numbers.
+        The structural bound of the representation the attention reads: $R_U = R_{\mathrm{conv}} +
+        N_U (W_U - 1)$ capped at $T$ under ``lag_kv_source='encoder'``, the stem's own
+        $R_{\mathrm{conv}}$ under ``'conv_stem'``, and $1$ under ``'adapter'``, where the
+        representation is position-wise. ``None`` is the unbounded arm -- absent rather than $T$,
+        because "no bound" and "a bound that happens to equal the sequence length" are different
+        statements. Compared against the furthest searched lag, which the shared record's
+        ``lag_support`` block carries in full: an encoder whose reach exceeded the lag range would
+        already be doing the alignment the lag cross-attention exists to do, so the comparison is
+        the point rather than the two numbers.
 
     Args:
         model: The rebuilt net, which is what was trained and is therefore the authority on the
@@ -141,9 +175,26 @@ def trf_cfs_encoder_disclosure(model: Any) -> Dict[str, Any]:
             come to word the refusal differently.
     """
     target_encoder = disclosed_attribute(model, "target_encoder")
-    source_encoder = disclosed_attribute(model, "source_encoder")
-    window = disclosed_attribute(source_encoder, "attention_window")
-    reach_steps = disclosed_attribute(source_encoder, "receptive_field")
+    # The source half is read off whatever the K/V arm actually built, because that is what the lag
+    # attention scores. Under a local arm there is no source encoder to read and reporting its
+    # configured block count would describe a stack the model does not carry -- the failure this
+    # record exists to make impossible.
+    kv_source = str(disclosed_attribute(model, "lag_kv_source"))
+    if kv_source == "encoder":
+        source_encoder = disclosed_attribute(model, "source_encoder")
+        window = disclosed_attribute(source_encoder, "attention_window")
+        reach_steps = disclosed_attribute(source_encoder, "receptive_field")
+        source_blocks = int(disclosed_attribute(source_encoder, "num_attention_blocks"))
+    else:
+        # No attention over the source at all, and a reach that is bounded by construction rather
+        # than by a window: the stem's receptive field, or one step where the representation is the
+        # adapter's own output.
+        window, source_blocks = None, 0
+        if kv_source == "conv_stem":
+            stem = disclosed_attribute(model, "source_kv_stem")
+            reach_steps = int(disclosed_attribute(stem, "receptive_field"))
+        else:
+            reach_steps = 1
     # The furthest lag searched, which is what a reach is compared against. The lag *count* and the
     # floor are not restated here: the shared record's ``lag_support`` block owns them, and a second
     # copy is a second thing to keep true.
@@ -160,9 +211,12 @@ def trf_cfs_encoder_disclosure(model: Any) -> Dict[str, Any]:
         "target_attention_blocks": int(
             disclosed_attribute(target_encoder, "num_attention_blocks")
         ),
-        "source_attention_blocks": int(
-            disclosed_attribute(source_encoder, "num_attention_blocks")
-        ),
+        # What the lag attention scores as keys and values, beside the reach of that
+        # representation. The three source numbers below are read off it and not off a configured
+        # encoder, so on a local arm they report zero blocks and the stem's bound rather than a
+        # stack that was never constructed.
+        "lag_kv_source": kv_source,
+        "source_attention_blocks": source_blocks,
         "source_attention_window": None if window is None else int(window),
         "source_receptive_field_steps": None if reach_steps is None else int(reach_steps),
         "source_receptive_field_seconds": (

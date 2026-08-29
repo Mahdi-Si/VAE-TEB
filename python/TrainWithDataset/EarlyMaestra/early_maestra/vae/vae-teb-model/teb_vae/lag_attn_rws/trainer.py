@@ -32,7 +32,7 @@ import os
 import sys
 import tempfile
 import time
-from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, List, Optional, Sequence, Tuple, TypeVar, Union
 
 #: Repository root: ``teb_vae/lag_attn_rws/trainer.py`` -> up three.
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -194,6 +194,12 @@ class LagAttnRwsTrainer(GraphModelBase):
     #: The causal guard this run resolved, populated by :meth:`_build_model_kwargs` and read by
     #: :meth:`create_model` for the startup log. ``None`` means no reach budget is configured.
     resolved_budget: Optional[ChannelBudget] = None
+
+    #: The second checkpoint criterion's callback, built by :meth:`train_model` only when the
+    #: config names a ``secondary_monitor``. Declared here rather than left to appear on the
+    #: instance so a caller asking whether a run kept two criteria reads ``None`` instead of an
+    #: ``AttributeError`` on every run that kept one.
+    secondary_checkpoint_callback: Optional[ModelCheckpoint] = None
 
     @classmethod
     def plot_callback_cls(cls) -> type[Callback]:
@@ -516,6 +522,30 @@ class LagAttnRwsTrainer(GraphModelBase):
             self.checkpoint_callback,
         ]
 
+        # A SECOND checkpoint criterion, built only when a config names one. The composite optimum
+        # and the best conditioned forecast are different epochs -- 336 against 278 on the H = 15
+        # diagnosed run -- so a run keeping only the first has no copy of the weights that forecast
+        # best, and nothing in its metrics recovers them once the epoch has passed.
+        #
+        # One optional key rather than a second full block: `save_top_k` and `mode` do not vary
+        # between the two criteria (both are minimised nats, both keep three), and a duplicated
+        # surface would be two places for them to disagree. The stem is derived from the monitor
+        # rather than fixed, so the two ModelCheckpoints can never write the same filename however
+        # many criteria a config eventually names -- Lightning would otherwise have each overwrite
+        # the other's file at the same epoch, leaving one criterion's best silently unsaved.
+        secondary_monitor = checkpoint_config.get("secondary_monitor")
+        if secondary_monitor:
+            self.secondary_checkpoint_callback = ModelCheckpoint(
+                dirpath=self.model_checkpoint_dir,
+                monitor=str(secondary_monitor),
+                filename=(
+                    f"{self.CHECKPOINT_STEM}-{_monitor_stem(secondary_monitor)}-{{epoch:02d}}"
+                ),
+                save_top_k=checkpoint_config.get("save_top_k", 3),
+                mode=checkpoint_config.get("mode", "min"),
+            )
+            callback_list.append(self.secondary_checkpoint_callback)
+
         # The diagnostic plotter is opt-in and pulls matplotlib, so the class -- and with it the
         # import -- is resolved only when the config asks for it.
         plot_config = callbacks_config.get(self.PLOT_CONFIG_KEY, {}) or {}
@@ -544,7 +574,32 @@ class LagAttnRwsTrainer(GraphModelBase):
         return trainer
 
 
-def main(config_path: str, trainer_cls: type[LagAttnRwsTrainer] = LagAttnRwsTrainer) -> None:
+def _monitor_stem(monitor: str) -> str:
+    """Turn a monitored metric name into a filename fragment.
+
+    ``val/nll_full_block`` becomes ``val-nll_full_block``. Only the stage separator is rewritten:
+    a checkpoint filename is what an operator reads to decide which of two files to evaluate, and a
+    fragment that dropped the stage or abbreviated the metric would need the config open beside it
+    to be read at all.
+
+    Args:
+        monitor: The metric name, as Lightning receives it.
+
+    Returns:
+        The fragment, safe on every filesystem this trains on.
+    """
+    return str(monitor).replace("/", "-")
+
+
+#: The driver a call to :func:`main` returns, which is the class it was handed rather than this
+#: module's own -- a sibling cell's entry point delegates here with its own driver and gets that
+#: driver back.
+_TrainerT = TypeVar("_TrainerT", bound=LagAttnRwsTrainer)
+
+
+def main(
+    config_path: str, trainer_cls: type[_TrainerT] = LagAttnRwsTrainer
+) -> _TrainerT:
     """Resolve the config, build everything, and run the fit.
 
     The call order is load-bearing and nothing chains it. ``setup_config`` is what seeds the
@@ -562,6 +617,14 @@ def main(config_path: str, trainer_cls: type[LagAttnRwsTrainer] = LagAttnRwsTrai
     Args:
         config_path: Path to the YAML config. Its ``base:`` chain is resolved first.
         trainer_cls: The driver class to construct. Defaults to this module's.
+
+    Returns:
+        The driver, after the fit. Returned rather than discarded because it is the only handle on
+        where the run went: ``model_checkpoint_dir``, ``train_results_dir`` and the
+        ``ModelCheckpoint`` callback's ``best_model_path`` are all decided inside ``setup_config``
+        from a timestamped directory name, so a caller that needs the checkpoint it just produced
+        would otherwise have to guess it by scanning the output tree for the newest directory --
+        which is wrong the moment two runs land in the same second.
     """
     start_time = time.time()
 
@@ -596,6 +659,7 @@ def main(config_path: str, trainer_cls: type[LagAttnRwsTrainer] = LagAttnRwsTrai
     graph_model.create_model()
     graph_model.train_model(data_module.train_dataloader(), data_module.val_dataloader())
     logger.info(f"Training completed in {(time.time() - start_time) / 60:.2f} minutes.")
+    return graph_model
 
 
 def _persist_resolved_config(resolved_path: str, checkpoint_dir: str) -> None:

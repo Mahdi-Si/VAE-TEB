@@ -75,6 +75,10 @@ VALID_KEYS = frozenset(
         "bootstrap_resamples",
         # This package's own, and the only divergence from the sibling's key set.
         "clock_margin_min_nats",
+        # The lag bands the input-level occlusion readout scores, as ``{name: [lo, hi]}`` in
+        # stored steps back from the anchor. Empty -- the shipped default -- runs the analysis as
+        # a recorded skip rather than as a zero-band pass, which is a different statement.
+        "occlusion_bands",
         # The image format every figure of the run is written in. ``None`` -- the shipped
         # setting -- leaves ``figures.DEFAULT_FIGURE_FORMAT`` standing, which is what every
         # committed figure manifest records.
@@ -114,6 +118,10 @@ DEFAULTS: Dict[str, Any] = {
     "event_lag_window_s": 120.0,
     "bootstrap_resamples": 2000,
     "clock_margin_min_nats": None,
+    # An empty mapping rather than ``None``, matching ``caps``: a partial override should be able
+    # to add one band without restating the rest, and the analysis reads "no bands configured" as
+    # a skip it records rather than as a measurement of nothing.
+    "occlusion_bands": {},
     # Nullable on purpose: ``None`` means "whatever ``figures.DEFAULT_FIGURE_FORMAT`` is",
     # so this file names no format of its own and the default lives in exactly one place.
     "figure_format": None,
@@ -138,6 +146,70 @@ _MIN_BOOTSTRAP_RESAMPLES = 100
 #: arrived at more slowly. An operator who has no defensible number leaves the key ``null`` and
 #: gets an explicit INCONCLUSIVE with the measurement beside it.
 _MIN_CLOCK_MARGIN_NATS = 1e-3
+
+
+def _validate_occlusion_bands(bands: Any, max_lag: Optional[int]) -> Dict[str, Tuple[int, int]]:
+    r"""Validate the occlusion bands against the model's own lag window.
+
+    A band is an inclusive ``[lo, hi]`` pair of **lags** -- stored steps back from the anchor -- so
+    the intervention zeroes source steps $[t - \mathrm{hi},\, t - \mathrm{lo}]$ and the band is
+    empty exactly when ``lo > hi``.
+
+    Both refusals guard a band that would measure something other than what it says. An **empty**
+    band occludes nothing, so its arm is the reference arm and its delta is identically zero -- a
+    row of zeros that reads as "the source did not matter there" rather than as a configuration
+    mistake. A band reaching **beyond** ``max_lag`` covers steps the attention cannot read at any
+    anchor, so the part of it above the window contributes nothing and the reported band is wider
+    than the one that was measured.
+
+    Written here rather than bound to the shared lag-ablation validator: that one's refusals are
+    stated in terms of a keep mask leaving the attention with no valid support, which is a
+    different mechanism and a message that would send a reader to the wrong place.
+
+    Args:
+        bands: The ``eval_config.occlusion_bands`` mapping.
+        max_lag: The model's ``max_lag``, so lags run over $[0, \mathrm{max\_lag}]$; ``None`` when
+            the config carries no geometry to check against, where the upper bound is skipped and
+            the analysis refuses a too-wide band against the model it actually rebuilt.
+
+    Returns:
+        The bands as ``{name: (lo, hi)}``.
+
+    Raises:
+        ValueError: If the block is not a mapping, a band is not a pair of non-negative integers,
+            a band is empty, or a band exceeds the lag window.
+    """
+    if not isinstance(bands, Mapping):
+        raise ValueError(
+            f"eval_config.occlusion_bands must be a mapping of band name to an inclusive "
+            f"[lo, hi] lag pair, got {type(bands).__name__}."
+        )
+    validated: Dict[str, Tuple[int, int]] = {}
+    for name, span in bands.items():
+        if not isinstance(span, (list, tuple)) or len(span) != 2:
+            raise ValueError(
+                f"eval_config.occlusion_bands.{name} must be an inclusive [lo, hi] lag pair, got "
+                f"{span!r}."
+            )
+        low = _require_int(span[0], f"occlusion_bands.{name}[0]", minimum=0)
+        high = _require_int(span[1], f"occlusion_bands.{name}[1]", minimum=0)
+        if low > high:
+            raise ValueError(
+                f"eval_config.occlusion_bands.{name} = [{low}, {high}] is empty (lo > hi), so it "
+                f"would occlude nothing and report a delta of exactly zero -- which reads as 'the "
+                f"source did not matter at these lags' rather than as a band nobody meant to "
+                f"write."
+            )
+        if max_lag is not None and high > int(max_lag):
+            raise ValueError(
+                f"eval_config.occlusion_bands.{name} = [{low}, {high}] reaches past the model's "
+                f"max_lag={int(max_lag)}; lags run over [0, {int(max_lag)}]. The attention cannot "
+                f"read a step above the window at any anchor, so the part of the band above it "
+                f"would be occluded and score nothing, and the band's name would overstate what "
+                f"was measured."
+            )
+        validated[str(name)] = (low, high)
+    return validated
 
 
 # =============================================================================
@@ -418,6 +490,7 @@ def validate_eval_config(config: Mapping[str, Any]) -> Dict[str, Any]:
 
     resolved: Dict[str, Any] = dict(DEFAULTS)
     resolved["caps"] = dict(DEFAULTS["caps"])
+    resolved["occlusion_bands"] = dict(DEFAULTS["occlusion_bands"])
     resolved.update(block)
 
     resolved["seed"] = _require_int(resolved["seed"], "seed", minimum=0)
@@ -460,6 +533,19 @@ def validate_eval_config(config: Mapping[str, Any]) -> Dict[str, Any]:
             "clock_margin_min_nats",
             minimum=_MIN_CLOCK_MARGIN_NATS,
         )
+
+    # Checked against the run's own geometry rather than against a constant, because the lag
+    # window is a config key: a band that fits the shipped 91-bin search does not fit the tiny
+    # geometry, and a validator with a literal here would admit a band that measures nothing on
+    # exactly the configuration a fixture runs at. Absent geometry skips the upper bound, which is
+    # the offline-merge case where the model block was never carried.
+    _vae = (config.get("model_config") or {}).get("VAE_model") or {}
+    resolved["occlusion_bands"] = _validate_occlusion_bands(
+        resolved["occlusion_bands"],
+        None
+        if _vae.get("max_lag") is None
+        else _require_int(_vae["max_lag"], "max_lag", minimum=0),
+    )
 
     # Nullable, and validated only when set -- the ``max_samples`` shape. A run that names no
     # format keeps the default, and the manifests, which record ``.pdf`` names, stay correct.

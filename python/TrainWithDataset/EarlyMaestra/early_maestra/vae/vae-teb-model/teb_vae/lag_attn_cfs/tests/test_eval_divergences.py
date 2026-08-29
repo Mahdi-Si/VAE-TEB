@@ -46,15 +46,22 @@ STATES = frozenset({"equivalent", "divergent", "absent"})
 #: register -- the manifest is keyed by the *sibling's* modules by construction, so a cell-specific
 #: addition can only be tracked from this side.
 #:
-#: The three analyses this target domain has and the raw one cannot: where in the warm-up staircase
+#: The analyses this target domain has and the raw one cannot: where in the warm-up staircase
 #: the forecast gap lives and whether the run decoded the population its configuration describes
 #: (``warmup``); how much of the coupling readout survives zeroing the source, which is the
-#: availability-clock hazard no permutation control can see (``source_null``); and the forecast
-#: resolved by the frequency band of the target coefficient, which is what this domain's channel
-#: axis can answer in place of the sibling's phase-domain pair (``spectral_skill``).
+#: availability-clock hazard no permutation control can see (``source_null``); what the forecast
+#: loses when the source's own values are removed from a band of the lag window, which is the
+#: interventional half of the same question (``occlusion``); and the forecast resolved by the
+#: frequency band of the target coefficient, which is what this domain's channel axis can answer in
+#: place of the sibling's phase-domain pair (``spectral_skill``).
 CELL_SPECIFIC_MODULES: Tuple[str, ...] = (
     "analyses/warmup.py",
     "analyses/source_null.py",
+    # Cell-specific rather than divergent for a reason worth separating from the others: the
+    # sibling has a lag window too, but its source stream is present from the first step, so a
+    # band of it removed is not a band of a *delayed* channel set and the readout would answer a
+    # different question there. The intervention is the causal cells' alone.
+    "analyses/occlusion.py",
     "analyses/spectral_skill.py",
     "analyses/lag_clocks.py",
     # The profile-shape reducer the clocks analysis is built on. Cell-specific rather than

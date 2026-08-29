@@ -76,16 +76,21 @@ def _recorded(margin: int) -> Dict[str, Any]:
 # Truncated support
 # =================================================================================================
 def test_no_decoded_anchor_is_truncated_at_the_shipped_geometry() -> None:
-    r"""$F = 133$ against $L - 1 = 90$, so the correction has nothing to correct.
+    r"""$F = 134$ against $L - 1 = 90$, so the correction has nothing to correct.
 
     Derived from the shipped configuration's own numbers rather than written down, so a
     ``sweep_floor_*`` arm moves the count instead of leaving a stale zero in every summary.
+
+    The count is $136$ rather than $137$, and the one anchor is what the channel alignment costs:
+    unaligned the floor is $B - 1 = 133$, because a forecast at anchor $t$ reads target time
+    $t + 1$ at the earliest; aligned, a channel is honest at $W'_c + d_c$ and the floor must
+    additionally clear $\max_c(W'_c + d_c) = B$ on both streams.
     """
     accounting = attention.truncated_anchor_accounting(_shipped_geometry(), _SHIPPED_N_LAGS)
 
     assert _SHIPPED_MARGIN >= 0
     assert accounting["decoded_anchor_range"] == [SHIPPED_WARMUP_PERIOD, _SHIPPED_T_VALID]
-    assert accounting["n_decoded_anchors"] == 137
+    assert accounting["n_decoded_anchors"] == 136
     assert accounting["first_untruncated_anchor"] == _SHIPPED_N_LAGS - 1
     assert accounting["n_truncated_anchors"] == 0
     assert accounting["truncated_fraction"] == pytest.approx(0.0)

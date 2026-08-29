@@ -1,0 +1,34 @@
+# Alignment arm: NO clock at all -- the unaligned end of the pre-registered pair.
+#
+# Neither stream is shifted, so each channel is read at its own stored index and a step's channel
+# vector describes instants spanning thirteen minutes. This is bitwise the model that shipped before
+# `causal_align_reference` existed, and it completes the aligned/unaligned comparison the alignment
+# work registered.
+#
+# TWO KEYS RATHER THAN ONE, and the second is forced rather than a second delta. The source
+# reference is one half of a PAIR of clocks: its whole content is the constant offset against the
+# target's, and against an unaligned target that offset is channel-pair-indexed and spans over a
+# thousand seconds. The resolver refuses the combination by name, so an arm that moved only the
+# first key would not launch.
+#
+# WHAT IT COSTS TO READ. Unaligned, no single number labels the lag axis: a peak at lag ell means a
+# different physical delay for every channel pair contributing to it. That is the whole reason the
+# aligned arms exist, and it is why this one is a control rather than a candidate.
+#
+#   TEB_RUN_STAMP="$(date '+%Y-%m-%d--[%H-%M]')" torchrun --nproc_per_node=7 \
+#       -m teb_vae.lag_attn_transformer_cfs.trainer --config teb_vae/lag_attn_transformer_cfs/configs/sweep_align_unaligned.yaml
+base: default.yaml
+
+model_config:
+  VAE_model:
+    causal_align_reference: null
+    causal_align_reference_source: null
+
+advanced_config:
+  tracking:
+    mlflow:
+      # IDENTITY: the arm in the name, on both keys, so a run's own records say which arm trained
+      # even if the config it was launched from cannot be recovered.
+      run_name: lag_attn_trf_cfs_unaligned
+      tags:
+        variant: lag_attn_trf_cfs_unaligned

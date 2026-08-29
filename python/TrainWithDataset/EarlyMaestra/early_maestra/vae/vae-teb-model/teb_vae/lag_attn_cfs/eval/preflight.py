@@ -206,6 +206,8 @@ SHARED_CAUSALITY_KEYS: frozenset = frozenset({
     "source_delay_seconds",
     "source_delay_is_max_over_channels",
     "source_reference_delay_s",
+    "target_reference_delay_s",
+    "inter_stream_offset_s",
     "horizon_seconds",
 })
 
@@ -620,10 +622,12 @@ def check_warmup_budget_matches_checkpoint(
 
     Two arms at two budgets have mutually unloadable checkpoints and the class stamp cannot separate
     them, so the failure this refuses is a run that reports one budget's channel axis under
-    another's. ``causal_align_reference`` is a key of exactly the same shape, resolving to two more
-    constructor tuples, and is compared here for the same reason with one difference worth stating:
-    two arms at two *references* have the same target width, so a mismatched pair loads cleanly and
-    only the numbers move.
+    another's. ``causal_align_reference`` and ``causal_align_reference_source`` are keys of exactly
+    the same shape, resolving to the same two constructor tuples, and are compared here for the same
+    reason with one difference worth stating: two arms at two *references* have the same target
+    width, so a mismatched pair loads cleanly and only the numbers move. The source key is caught
+    through the same tuples -- it moves the source keep-index and shifts and nothing else -- so it
+    needs no comparison of its own.
 
     Args:
         config: The merged run config.
@@ -720,6 +724,14 @@ def check_warmup_budget_matches_checkpoint(
         # rules coexist and remove different channels for different reasons, and a reader of this
         # artifact cannot reconstruct either from the widths alone.
         "reference_delay_s": resolved.reference_delay_s,
+        # The second clock, and the constant it puts on the lag axis. Both recorded even where they
+        # are the trivial values -- ``None`` and $0.0$ under the single-reference scheme -- because
+        # the whole point of the pair is that the bias between the streams is a KNOWN number, and an
+        # artifact that omitted it where it is zero would leave a reader unable to tell a run that
+        # measured zero from one that never resolved the quantity.
+        "source_reference_delay_s": resolved.source_reference_delay_s,
+        "source_clock_delay_s": resolved.source_clock_delay_s,
+        "inter_stream_offset_s": resolved.inter_stream_offset_s,
         "leg_alignment": resolved.leg_alignment,
         "source_dropped_index": list(resolved.source.dropped_index),
         "target_max_align_delay": int(resolved.target.max_align_delay),
@@ -1206,8 +1218,24 @@ def causality_disclosure(
         # a lag in physical seconds needs this one; a consumer describing how far back the source
         # memory reaches needs the other. ``None`` on an unaligned run, where there is no common
         # clock to name -- not zero, which would read as "aligned to the anchor itself".
+        #
+        # It is the SOURCE stream's own clock, which under the single-reference scheme is the
+        # target's and under the dual one is not. Recorded under this name rather than a new one
+        # because that is what the name has always meant and what every consumer computing
+        # `physical_lag_seconds(source_reference_s=...)` needs; the target's own clock and the
+        # difference between them are the two entries below, so the pair is recoverable.
         "source_reference_delay_s": (
+            None if warmup is None else warmup.get("source_clock_delay_s")
+        ),
+        "target_reference_delay_s": (
             None if warmup is None else warmup.get("reference_delay_s")
+        ),
+        # The bias the pair puts on the lag axis, which is the term `physical_lag_seconds` carries
+        # as (source_reference_s - target_reference_s). Zero under one clock, negative under a
+        # faster source clock, ``None`` unaligned -- where it is channel-pair-indexed and no single
+        # number stands in for it.
+        "inter_stream_offset_s": (
+            None if warmup is None else warmup.get("inter_stream_offset_s")
         ),
         "horizon_seconds": horizon_seconds,
     }

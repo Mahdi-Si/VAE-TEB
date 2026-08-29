@@ -39,11 +39,12 @@ ANALYSES_ROOT = Path(run_module.__file__).resolve().parent / "analyses"
 EXPECTED_POSITIONAL = ("context",)
 EXPECTED_KEYWORD_ONLY = ("eval_config", "output_dir", "probe")
 
-#: The only analyses permitted to read ``task`` or ``loader`` off the context, both for structural
-#: reasons the docstring of ``test_only_the_stated_analyses_reach_for_the_model_on_the_context``
-#: gives. Neither has landed yet, so the permitted set is currently not exercised at all --
-#: which is why that test also asserts the walk found modules to check.
-MODEL_READING_ANALYSES = frozenset({"samples", "sufficiency"})
+#: The only analyses permitted to read ``task`` or ``loader`` off the context, each for a
+#: structural reason the docstring of ``test_only_the_stated_analyses_reach_for_the_model_on_the_context``
+#: gives. Three rather than two, and the third is the strongest case of the same rule: an
+#: INTERVENTION on the model's input cannot be served by any table a forward already wrote, because
+#: the forward it needs is one that never happened.
+MODEL_READING_ANALYSES = frozenset({"samples", "sufficiency", "occlusion"})
 
 
 def _analysis_functions() -> Dict[str, Any]:
@@ -287,11 +288,13 @@ def test_an_offline_run_without_tables_says_what_is_missing(tmp_path) -> None:
 def test_only_the_stated_analyses_reach_for_the_model_on_the_context() -> None:
     """The context carries ``task`` and ``loader``, and exactly two analyses may read them.
 
-    Both reasons are structural rather than conveniences. A diagnostic page is the whole forward
+    Every reason is structural rather than a convenience. A diagnostic page is the whole forward
     output of one segment, and the pages for the *extreme* rows are chosen by sorting a table that
     did not exist while the pass ran, so neither retention nor a wider table can serve them. The
     oracle probe is fitted on every segment's **encoder state**, which is on neither durable table
-    and is not a per-segment scalar that could be put on one.
+    and is not a per-segment scalar that could be put on one. And the occlusion readout scores a
+    forward that never ran: it zeroes a band of the source's own values and re-encodes, so what it
+    needs is not a number some pass forgot to record but a model to ask a counterfactual of.
 
     Everything else must not so much as mention the two fields. In this target domain that rule
     has one consequence worth naming: the band-resolved skill readout has an obvious reason to

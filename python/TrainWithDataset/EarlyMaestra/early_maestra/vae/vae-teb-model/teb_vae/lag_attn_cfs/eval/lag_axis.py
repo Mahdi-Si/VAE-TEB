@@ -22,7 +22,9 @@ mapping would itself be an unvalidated construction (both ``DESIGN.md`` records 
 input channels onto a common reference $\tau_{\mathrm{ref}}$, at which point two quantities exist
 where one did: ``source_delay_steps``, the largest shift applied to any channel and therefore how
 far back in *stored steps* the source memory reaches, and ``reference_delay_s``, the physical
-instant every aligned channel reports at a step. $\tau_\ell$ is built from the first, because it is
+instant every aligned channel of that stream reports at a step -- one per stream, and under a dual
+reference the two differ by a constant the record carries as ``inter_stream_offset_s``.
+$\tau_\ell$ is built from the first, because it is
 an axis in stored-coefficient time and a stored-step count is exactly what indexes it. The second
 belongs to a lag stated in *physical* seconds, which this package does not emit -- it appears in the
 run's causality disclosure and its summary as ``source_reference_delay_s``, beside the axis rather

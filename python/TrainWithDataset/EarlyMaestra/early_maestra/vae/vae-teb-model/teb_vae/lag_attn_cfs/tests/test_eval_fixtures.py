@@ -148,6 +148,17 @@ def test_every_shard_carries_the_per_block_warm_up_and_delay_attributes(cohort_s
         assert "sel_xi_i_hz" in handle["up_ph"].attrs
 
 
+#: Surviving source channels under the SINGLE-reference resolution these fixtures build -- the
+#: alignment drops the four channels above the target's own clock, and the warm-up budget touches
+#: this stream not at all.
+_KEPT_SOURCE_CHANNELS = 47
+
+#: And under the shipped config's DUAL clock, which the real fit below resolves at: a source
+#: reference faster than the target's by a known offset, costing eight more channels. Two numbers
+#: rather than one because these fixtures deliberately read the two arms in two places.
+_SHIPPED_CLOCK_SOURCE_CHANNELS = 39
+
+
 def test_the_shipped_budget_resolves_against_the_generated_shards(cohort_shards) -> None:
     r"""The whole binding, on generated data: shard attributes -> channel tuples -> decoder width.
 
@@ -160,10 +171,15 @@ def test_the_shipped_budget_resolves_against_the_generated_shards(cohort_shards)
     assert resolved.budget_steps == SHIPPED_BUDGET_STEPS
     assert resolved.target.declared_width == CAUSAL_C_Y
     assert resolved.target.kept_width == _KEPT_TARGET_CHANNELS
-    # The source is never gated: its keep-index is the identity by construction, not by arithmetic
-    # that happens to keep everything.
-    assert resolved.source.kept_width == CAUSAL_C_U
-    assert resolved.source.keep_index == tuple(range(CAUSAL_C_U))
+    # The source is never gated by the BUDGET -- every source channel is honest well inside it --
+    # and it is gated by the ALIGNMENT: four channels sit above the reference, and a shift cannot
+    # reach them without reading their own future. The two rules are separate and the survivors
+    # here are the second's, so the keep-index is a prefix of the identity rather than the whole of
+    # it: the dropped channels are the last four, which is what "the slowest" means on this stream.
+    assert resolved.source.kept_width == _KEPT_SOURCE_CHANNELS
+    assert resolved.source.keep_index == tuple(
+        index for index in range(CAUSAL_C_U) if index not in resolved.source.dropped_index
+    )
 
 
 def test_the_four_dropped_target_channels_are_the_ones_the_design_names(cohort_shards) -> None:
@@ -216,16 +232,21 @@ def test_the_channel_widths_match_the_models_data_contract(batches) -> None:
 
 
 def test_the_dense_anchor_set_the_evaluation_decodes_at_is_the_full_one(batches) -> None:
-    r"""$[F, T - H) = [133, 270)$ is 137 anchors, and the evaluation decodes every one of them.
+    r"""$[F, T - H) = [134, 270)$ is 136 anchors, and the evaluation decodes every one of them.
 
     Derived from the length the LOADER yields rather than from the config constant, because a
     fixture written at a shorter window would leave the evaluation with no anchors at all and the
     symptom would be an empty table rather than an error.
+
+    $136$ rather than $137$, and the one anchor is what the channel alignment costs: unaligned the
+    floor is $B - 1 = 133$, because a forecast at anchor $t$ reads target time $t + 1$ at the
+    earliest; aligned, a channel is honest at $W'_c + d_c$ and the floor must additionally clear
+    $\max_c(W'_c + d_c) = B$ on both streams.
     """
     served = int(batches[0]["fhr_st"].shape[1])
 
     assert served == SHIPPED_SEQUENCE_LENGTH
-    assert served - SHIPPED_HORIZON - SHIPPED_WARMUP_PERIOD == 137
+    assert served - SHIPPED_HORIZON - SHIPPED_WARMUP_PERIOD == 136
 
 
 def test_all_the_clinical_fields_arrive_in_the_batch(batches) -> None:
@@ -414,8 +435,12 @@ def test_the_checkpoint_stamps_the_four_tuples_the_budget_resolved(cohort_run) -
 
     assert len(model_kwargs["target_keep_index"]) == _KEPT_TARGET_CHANNELS
     assert len(model_kwargs["target_warmup_steps"]) == _KEPT_TARGET_CHANNELS
-    assert len(model_kwargs["source_keep_index"]) == CAUSAL_C_U
-    assert len(model_kwargs["source_warmup_steps"]) == CAUSAL_C_U
+    # The SHIPPED source clock, which is a hundred-odd seconds faster than the target's and costs
+    # eight more channels than the single-reference arm the resolutions above are read at. Written
+    # out rather than derived, because what a checkpoint carries is the width every module on the
+    # source side was built at, and that has to be recoverable from the blob alone.
+    assert len(model_kwargs["source_keep_index"]) == _SHIPPED_CLOCK_SOURCE_CHANNELS
+    assert len(model_kwargs["source_warmup_steps"]) == _SHIPPED_CLOCK_SOURCE_CHANNELS
     # The declared widths are untouched, which is what the data boundary checks against.
     assert (model_kwargs["c_y"], model_kwargs["c_u"]) == (CAUSAL_C_Y, CAUSAL_C_U)
 

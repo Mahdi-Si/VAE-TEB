@@ -441,33 +441,139 @@ def test_the_three_warm_up_tertiles_are_on_the_recombination_list() -> None:
     assert report_seam.RECOMBINED_COLUMNS["kld_per_t"] == "source_conditioned_kl_raw"
 
 
+#: A profile with a readable shape: one clear peak and a bulk well below it. Used wherever the
+#: check's *edge* logic is what is under test, so that degeneracy -- which is judged first -- cannot
+#: be what produced the verdict.
+_SHAPED_PROFILE = [1.0, 1.0, 1.0, 9.0, 1.0, 1.0]
+
+#: Per-lag anchor counts where the top two lags of an eight-bin window are attainable by no anchor.
+#: The ceiling is therefore 5 rather than 7, which is the correction the check exists to make: a lag
+#: no anchor contributed to is not a lag the peak could have sat at.
+_COUNTS = [8.0, 7.0, 6.0, 5.0, 4.0, 3.0, 0.0, 0.0]
+
+
+def _lag_summary(argmax, profile=None, counts=None):
+    """A ``lag`` block shaped like the one the collection pass writes."""
+    return {
+        "lag": {
+            "kl_argmax_lag_step": argmax,
+            "kl_lag_anchor_counts": list(_COUNTS if counts is None else counts),
+            "kl_lag_profile_support_corrected": list(
+                _SHAPED_PROFILE if profile is None else profile
+            ),
+            "attention_entropy_per_head_nats": [1.3, 2.0, 2.3, 2.5],
+        }
+    }
+
+
 @pytest.mark.parametrize(
     "argmax, expected, reason",
     [
-        (0, "fail", "the attribution never looks back and the lag window is inert"),
+        (0, report_seam.INCONCLUSIVE, "CENSORING"),
         (5, "fail", "the peak is against the window edge"),
-        (3, "pass", ""),
+        (3, "pass", "strictly inside"),
     ],
 )
-def test_the_argmax_lag_is_judged_against_the_attainable_ceiling(argmax, expected, reason) -> None:
-    r"""The ceiling is read from the per-lag anchor counts rather than taken as $L - 1$: a lag no
-    anchor contributes to is not attainable. At this cell's anchor floor every lag is attainable at
-    every scored anchor, which makes the correction inert -- but inert because the geometry says
-    so, measured per run, rather than because this check stopped looking."""
-    record = report_seam.check_argmax_lag(
-        {
-            "lag": {
-                "kl_argmax_lag_step": argmax,
-                # Lags 6 and 7 exist in the window but no anchor reaches them.
-                "kl_lag_anchor_counts": [8.0, 7.0, 6.0, 5.0, 4.0, 3.0, 0.0, 0.0],
-            }
-        }
-    )
+def test_the_argmax_lag_is_judged_against_both_attainable_edges(argmax, expected, reason) -> None:
+    r"""Both ends of the window censor, and the check is symmetric in them.
+
+    The **far** edge has always been read as censoring: a peak at the largest attainable lag means
+    the true maximum may lie beyond $L$. The **near** edge is the mirror image and used to be read
+    as inertness -- "the attribution never looks back" -- which is a conclusion the geometry does
+    not support. By the identity
+    $\tau^{\mathrm{phys}}_{\ell,h} = \Delta(\ell + 1 + h) + (\tau^u_{\mathrm{ref}}
+    - \tau^y_{\mathrm{ref}}) - \tau_{\mathrm{pre}}$, every physical delay shorter than the one lag
+    $0$ encodes is reported *at* lag $0$, because the window carries no bin below it. On this
+    family's geometry a $20$-$60$ s physiological delay is below lag $0$ at most horizon steps, so
+    a pin at the floor is the readout hitting a wall.
+
+    The verdicts differ in kind for that reason. A far-edge pin still FAILs, because a peak against
+    the far edge is a model whose readout the window truncated and the run could have been
+    configured otherwise. A near-edge pin is INCONCLUSIVE: the measurement happened and the answer
+    is outside what this geometry can express.
+
+    Both edges are read from the per-lag anchor counts rather than taken as $0$ and $L - 1$: a lag
+    no anchor contributed to is not attainable at all.
+    """
+    record = report_seam.check_argmax_lag(_lag_summary(argmax))
 
     assert record["verdict"] == expected
     assert record["attainable_lag_ceiling"] == 5
-    if reason:
-        assert reason in record["detail"]
+    assert record["attainable_lag_floor"] == 0
+    assert reason in record["detail"]
+
+
+def test_a_near_edge_pin_states_the_arithmetic_and_the_evidence_the_machinery_is_alive() -> None:
+    """What the INCONCLUSIVE verdict has to carry, because it is not a pass and must not read as
+    one: the identity that says why the lag is unreachable, and the shape statistics that say the
+    measurement was real.
+
+    Without the second half a reader cannot tell a censored answer from a model that reported
+    nothing -- which is precisely the confusion the old FAIL made, in the other direction.
+    """
+    record = report_seam.check_argmax_lag(_lag_summary(0))
+
+    assert record["verdict"] == report_seam.INCONCLUSIVE
+    assert "tau_phys" in record["detail"] or "\\tau" in record["detail"]
+    assert "not degenerate" in record["detail"]
+    assert record["peak_degenerate"] is False
+    assert record["mass_above_half_peak"] is not None
+    assert record["attention_entropy_per_head_nats"] == [1.3, 2.0, 2.3, 2.5]
+
+
+@pytest.mark.parametrize("argmax", [0, 3, 5])
+def test_a_degenerate_profile_fails_at_either_edge_and_in_the_middle(argmax) -> None:
+    """Degeneracy is judged **first**, and that ordering is the whole reason the near edge can be
+    reported as censoring at all.
+
+    A profile whose peak is not distinguishable from its bulk has an argmax that names a bin rather
+    than a lag: there is no measurement to censor, so a censoring verdict on it would report a
+    geometry limit where the readout is simply absent. Asserted at all three positions, because a
+    check that only guarded the middle would let a flat profile pass as censored at the edge that
+    every arm of this family pins at.
+    """
+    record = report_seam.check_argmax_lag(_lag_summary(argmax, profile=[1.0] * 6))
+
+    assert record["verdict"] == "fail"
+    assert record["peak_degenerate"] is True
+    assert "names a bin rather than a lag" in record["detail"]
+
+
+def test_an_ideal_model_at_this_geometry_can_pass() -> None:
+    """The property that makes the check a check rather than a description. A re-scoping that
+    turned every outcome into INCONCLUSIVE would be unfalsifiable, so the passing case is asserted
+    as reachable: a shaped profile peaking strictly inside the attainable window PASSes."""
+    record = report_seam.check_argmax_lag(_lag_summary(3))
+
+    assert record["verdict"] == "pass"
+    assert record["attainable_lag_floor"] < 3 < record["attainable_lag_ceiling"]
+
+
+def test_the_floor_lifts_off_zero_when_the_lowest_lags_carry_no_anchor() -> None:
+    """The near edge is ``min(attainable)`` and not the literal $0$, which is what makes it
+    symmetric with the far edge.
+
+    At a short sequence length the lowest bins can carry no anchor at all, and a check reading the
+    floor as $0$ would then call a pin at the real floor an interior peak -- reporting a censored
+    readout as a clean pass, which is the failure this symmetry removes.
+    """
+    counts = [0.0, 0.0, 6.0, 5.0, 4.0, 3.0, 0.0, 0.0]
+    record = report_seam.check_argmax_lag(_lag_summary(2, counts=counts))
+
+    assert record["attainable_lag_floor"] == 2
+    assert record["verdict"] == report_seam.INCONCLUSIVE
+
+
+def test_a_run_with_no_per_lag_support_is_inconclusive_rather_than_judged() -> None:
+    """No anchor counts means no attainable set, so neither edge is defined. Reported as
+    unevaluated rather than as an interior peak, which is what an empty ``max`` would otherwise
+    have to be defended against."""
+    record = report_seam.check_argmax_lag(
+        {"lag": {"kl_argmax_lag_step": 0, "kl_lag_anchor_counts": []}}
+    )
+
+    assert record["verdict"] == report_seam.INCONCLUSIVE
+    assert "support" in record["detail"]
 
 
 def test_a_run_with_no_lag_summary_is_inconclusive_rather_than_failed() -> None:

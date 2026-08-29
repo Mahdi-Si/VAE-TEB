@@ -29,6 +29,20 @@ $W_c + \Delta d_c = \tau_{\mathrm{ref}} + (\rho - 1)\tau_c \le W_{\mathrm{ref}}$
 stream to its slowest kept channel costs no warm-up beyond that channel's own. That is checked on
 the resolved vectors rather than assumed, because $\rho$ is only approximately constant.
 
+*And may the two streams read on different clocks?* Yes, deliberately, through a second key. One
+reference for both streams puts the source's freshest content $\tau_{\mathrm{ref}}$ before the
+anchor, which at the target's own slowest kept channel is $402.2$ s -- far enough back that a
+$20$-$60$ s physiological delay is reported **below lag $0$** at most horizon steps and is censored
+rather than found. ``causal_align_reference_source`` aligns the source onto a chosen faster clock
+$\tau^u_{\mathrm{ref}}$ while the target keeps its own $\tau^y_{\mathrm{ref}}$, which lifts the
+readable band clear of that edge and pays for it in the source channels above the faster clock. The
+price is a constant inter-stream bias $\tau^u_{\mathrm{ref}} - \tau^y_{\mathrm{ref}}$ on the lag
+axis, and it is a **known** constant: it is carried on :class:`WarmupBudget`, stated in the startup
+log, recorded in the run's causality disclosure, and is exactly the term
+:func:`~teb_vae.lag_attn.nets.lag_report.physical_lag_seconds` already takes. That is what
+distinguishes it from the per-stream *maximum* references this module rejects below, whose bias is
+whatever the two streams happen to declare.
+
 **The budget and the anchor floor are one decision.** A forecast at anchor $t$, horizon step $\tau$,
 reads target time $t + 1 + \tau$; channel $c$ is valid there iff $t + 1 + \tau \ge W'_c$. Requiring
 every kept channel to be valid across every anchor's whole window collapses to one inequality,
@@ -141,6 +155,7 @@ SOURCE_BLOCKS = ("up_st", "up_ph")
 BUDGET_KEY = "model_config.VAE_model.causal_warmup_budget_steps"
 REACH_KEY = "model_config.VAE_model.causal_reach_budget_s"
 ALIGN_KEY = "model_config.VAE_model.causal_align_reference"
+ALIGN_SOURCE_KEY = "model_config.VAE_model.causal_align_reference_source"
 LEG_ALIGNMENT_KEY = "model_config.VAE_model.causal_leg_alignment"
 SEQUENCE_KEY = "model_config.VAE_model.sequence_length"
 TRIM_KEY = "dataset_config.dataloader_config.dataset_kwargs.trim_minutes"
@@ -298,12 +313,19 @@ class WarmupBudget:
             survives when $W'_c \le B_{\mathrm{cfg}}$.
         trim_minutes: The trim the warm-up vectors are expressed against, which is the loader's own.
         quantile: The ``causal_warmup_quantile`` every configured shard was built at.
-        reference_delay_s: $\tau_{\mathrm{ref}}$, the common clock both streams were shifted onto,
-            in seconds; ``None`` when no reference is configured and neither stream is shifted.
+        reference_delay_s: $\tau^y_{\mathrm{ref}}$, the clock the **target** stream was shifted
+            onto, in seconds; ``None`` when no reference is configured and neither stream is
+            shifted. It is also the source's clock unless :attr:`source_reference_delay_s` names
+            another one.
             **This -- not** ``source_delay_steps`` **-- is the physical constant a lag report
             needs.** The two are different quantities: the model's scalar is the largest *stored
             step* shift, attained by the fastest channel, while this is the physical instant every
             aligned channel reports at step $t$, namely $\Delta t - \tau_{\mathrm{ref}}$.
+        source_reference_delay_s: $\tau^u_{\mathrm{ref}}$ where the source stream was aligned onto
+            a clock of its own, in seconds; ``None`` where it was not, which is the single-reference
+            scheme and is what every run before this key existed did. Never read on its own by a
+            consumer computing a physical lag: use :attr:`source_clock_delay_s`, which resolves the
+            fallback, since a ``None`` here means "the target's clock" rather than "unaligned".
         leg_alignment: Which phase-harmonic operator built the configured shards' phase blocks, as
             they record it. Carried so a run's startup log states which dataset variant it read;
             the *expected* value is a config key, checked in :func:`resolve_warmup_budget`.
@@ -315,15 +337,54 @@ class WarmupBudget:
     trim_minutes: Optional[float]
     quantile: Optional[float]
     reference_delay_s: Optional[float]
+    source_reference_delay_s: Optional[float]
     leg_alignment: str
     target: StreamWarmup
     source: StreamWarmup
+
+    @property
+    def source_clock_delay_s(self) -> Optional[float]:
+        r"""$\tau^u_{\mathrm{ref}}$, the clock the source stream was actually shifted onto.
+
+        The dual reference where one is configured, the target's own where it is not, ``None`` on an
+        unaligned run. This is the quantity a physical lag is computed from -- it is what
+        :func:`~teb_vae.lag_attn.nets.lag_report.physical_lag_seconds` calls ``source_reference_s``
+        -- and it exists as a property so no consumer has to re-derive the fallback and get it
+        wrong in one place out of four.
+        """
+        if self.reference_delay_s is None:
+            return None
+        return (
+            self.reference_delay_s
+            if self.source_reference_delay_s is None
+            else self.source_reference_delay_s
+        )
+
+    @property
+    def inter_stream_offset_s(self) -> Optional[float]:
+        r"""$\tau^u_{\mathrm{ref}} - \tau^y_{\mathrm{ref}}$, the dual clock's bias on the lag axis.
+
+        Exactly $0$ under the single-reference scheme, which is a *measured* zero rather than an
+        absent quantity -- the two clocks coincide -- so it is reported as $0.0$ there and as
+        ``None`` only on an unaligned run, where the bias is channel-pair-indexed and no single
+        number stands in for it.
+        """
+        target_clock = self.reference_delay_s
+        source_clock = self.source_clock_delay_s
+        if target_clock is None or source_clock is None:
+            return None
+        return float(source_clock) - float(target_clock)
 
     def summary(self) -> str:
         """One line for the startup log, naming both streams and the threshold that produced them.
 
         The quantile is rounded for reading: it comes back from the shard as the ``float32`` it was
         stored as, and ``0.949999988079071`` in a log line is noise rather than provenance.
+
+        The reference clause names **one** clock where one is configured, and the pair plus their
+        offset where the source keeps its own -- rather than always printing the pair, because the
+        single-reference line is the one every existing run's log carries and a trailing
+        ``, source reference ... (offset +0.00 s)`` on it would report a mechanism that did not run.
         """
         quantile = "unknown" if self.quantile is None else f"{self.quantile:.3g}"
         reference = (
@@ -331,6 +392,12 @@ class WarmupBudget:
             if self.reference_delay_s is None
             else f"reference {self.reference_delay_s:.4f} s"
         )
+        if self.source_reference_delay_s is not None:
+            reference = (
+                f"target reference {self.reference_delay_s:.4f} s, source reference "
+                f"{self.source_reference_delay_s:.4f} s, inter-stream offset "
+                f"{self.inter_stream_offset_s:+.4f} s"
+            )
         return (
             f"causal warm-up budget {self.budget_steps} steps "
             f"(quantile {quantile}, trim_minutes {self.trim_minutes}, "
@@ -543,6 +610,80 @@ def _resolve_reference_delay(
     return nearest
 
 
+def _resolve_source_reference_delay(
+    setting: Any,
+    target_reference_s: Optional[float],
+    source_delay_s: Sequence[float],
+) -> Optional[float]:
+    r"""Resolve ``causal_align_reference_source`` into $\tau^u_{\mathrm{ref}}$ in seconds.
+
+    Two settings rather than three, and the missing one is deliberate: there is no ``'source_max'``
+    here. A per-stream *maximum* was rejected in the alignment work itself, because it restores a
+    bias between the two streams' clocks that nothing knows the size of. What this key admits is a
+    reference **chosen** by the measurement that priced it, whose offset against the target's is one
+    constant carried explicitly through the lag arithmetic -- a different object from the stream's
+    own maximum, arrived at for the opposite reason.
+
+    ``None`` is the single-reference scheme: the source is aligned onto the target's clock, which is
+    what every run before this key existed did and is byte-for-byte the resolution it produced.
+
+    Args:
+        setting: The configured value: ``None``, or a number of seconds.
+        target_reference_s: $\tau^y_{\mathrm{ref}}$ as already resolved, or ``None`` on an unaligned
+            run.
+        source_delay_s: $\tau_c$ per declared source channel, in seconds. The whole declared width,
+            because the warm-up budget deliberately gates no source channel: what the alignment is
+            about to drop is decided by this reference and nothing before it.
+
+    Returns:
+        The reference in seconds -- always one of ``source_delay_s`` -- or ``None`` when the source
+        keeps the target's clock.
+
+    Raises:
+        ValueError: If the setting is not a number; if it is set while the target stream is
+            unaligned; or if it matches no stored source delay within half a step.
+    """
+    if setting is None:
+        return None
+
+    if isinstance(setting, str):
+        raise ValueError(
+            f"{ALIGN_SOURCE_KEY}={setting!r} is not a reference this resolver knows. It takes an "
+            f"explicit delay in seconds, or null for the source to keep the target's clock. There "
+            f"is deliberately no 'source_max': a stream's own maximum restores an inter-stream "
+            f"bias of unknown size, which is the scheme this key was built to replace rather "
+            f"than one of its settings."
+        )
+
+    if target_reference_s is None:
+        raise ValueError(
+            f"{ALIGN_SOURCE_KEY}={float(setting):g} s is set but {ALIGN_KEY} is null, so the "
+            f"target stream is not aligned at all. The dual scheme is a PAIR of clocks whose "
+            f"difference is the constant this run would put on the lag axis; against an "
+            f"unaligned target that "
+            f"difference is channel-pair-indexed and spans over a thousand seconds, so the source "
+            f"reference would name a precision the run does not have. Set {ALIGN_KEY} to the "
+            f"target's clock, or set this key to null."
+        )
+
+    reference = float(setting)
+    nearest = float(min(source_delay_s, key=lambda delay: abs(delay - reference)))
+    if abs(nearest - reference) > STEP_SECONDS / 2.0:
+        raise ValueError(
+            f"{ALIGN_SOURCE_KEY}={reference:g} s matches no stored source channel: the nearest is "
+            f"{nearest:.4f} s, {abs(nearest - reference):.4f} s away, against a half-step "
+            f"tolerance of {STEP_SECONDS / 2.0:g} s. The alignment re-indexes every channel onto one "
+            f"channel's clock, so a reference between two of them is a clock no channel keeps and "
+            f"leaves a residual on every source channel at once. Name a stored source delay, or "
+            f"set this key to null."
+        )
+    # The matched channel's own delay, not the configured literal, for the reason
+    # ``_resolve_reference_delay`` snaps: the drop rule compares delays against the reference
+    # exactly and the stored vector is float32, so a literal sitting microseconds below the channel
+    # it names would drop that channel and every harmonic sibling behind it.
+    return nearest
+
+
 def _align_stream(
     name: str,
     delay_s: Sequence[float],
@@ -639,14 +780,21 @@ def resolve_warmup_budget(config: Mapping[str, Any]) -> Optional[WarmupBudget]:
     **The alignment drops for a different reason, and it is not a policy.** A channel whose composed
     delay exceeds $\tau_{\mathrm{ref}}$ can only be brought onto that clock by a negative shift,
     i.e. by being read from a later stored step, which reads raw signal after the anchor. Those
-    channels are refused rather than advanced -- four of the $51$ source channels at the shipped
-    reference, all fifteen ``up_ph`` surviving -- and the distinction from the paragraph above is
+    channels are refused rather than advanced -- four of the $51$ source channels on the target's
+    own clock, all fifteen ``up_ph`` surviving -- and the distinction from the paragraph above is
     load-bearing: the budget's drops are how much of a segment this design is willing to spend
     waiting, and these are a correctness requirement.
 
+    **Which clock the source reads on is the one thing that is a decision**, and it is priced rather
+    than picked: ``causal_align_reference_source`` moves the source onto a faster reference than the
+    target's, which lifts a $20$-$60$ s physiological delay off the near censoring edge of the lag
+    window and pays for it in exactly the channels above it -- twelve of $51$ at the shipped
+    $288.2672$ s, nine of fifteen ``up_ph`` surviving. Null keeps the single clock and resolves
+    byte-for-byte what it did before the key existed.
+
     Args:
         config: The resolved experiment config mapping. ``model_config.VAE_model`` supplies the
-            budget, the alignment reference, the expected leg alignment and the geometry;
+            budget, both alignment references, the expected leg alignment and the geometry;
             ``dataset_config`` supplies the shards and the trim.
 
     Returns:
@@ -660,8 +808,9 @@ def resolve_warmup_budget(config: Mapping[str, Any]) -> Optional[WarmupBudget]:
             sequence length; if a declared stream width disagrees with the shards; if the budget
             keeps no target channel; if the shards' recorded leg alignment disagrees with the
             configured expectation; if the alignment reference is neither ``'target_max'`` nor a
-            number, matches no kept target channel, or leaves a stream with no channel at all; or
-            if the floor and stride leave a phase with no anchor at all.
+            number, matches no kept target channel, or leaves a stream with no channel at all; if
+            the source reference is not a number, is set against an unaligned target, or matches no
+            stored source channel; or if the floor and stride leave a phase with no anchor at all.
     """
     model_config = config.get("model_config") or {}
     vae_config = model_config.get("VAE_model") or {}
@@ -750,12 +899,24 @@ def resolve_warmup_budget(config: Mapping[str, Any]) -> Optional[WarmupBudget]:
     # shift is resolved from the delays it makes true or false.
     _check_leg_alignment(vae_config.get("causal_leg_alignment"), warmup.leg_alignment, paths)
 
-    # The reference is resolved from the target stream alone and applied to both, which is the
-    # whole point of it: a per-stream reference would keep every source channel and restore a
-    # known 389 s bias between the two streams' clocks, defeating the correction it looks like.
+    # The target's reference is resolved from the target stream alone. Under the single-reference
+    # scheme it is applied to both streams, which is the whole point of it: a per-stream reference
+    # taken as each stream's own MAXIMUM would keep every source channel and restore a known 389 s
+    # bias between the two clocks, defeating the correction it looks like.
     reference_delay_s = _resolve_reference_delay(
         vae_config.get("causal_align_reference"),
         tuple(target_delay_s[index] for index in target_keep),
+    )
+    # The dual scheme differs from that rejection in kind rather than in degree, and the difference
+    # is what makes it admissible: this reference is CHOSEN -- priced against channel survival, the
+    # freshest-source recency and where a physiological delay lands in the (lag, horizon) window --
+    # rather than read off the stream, and the bias it puts on the lag axis is one constant that
+    # travels explicitly through the summary, the causality disclosure and the physical-lag
+    # identity. A stream's own maximum carries a bias nothing states.
+    source_reference_delay_s = _resolve_source_reference_delay(
+        vae_config.get("causal_align_reference_source"),
+        reference_delay_s,
+        source_delay_s,
     )
     target_keep, target_align = _align_stream(
         "target", target_delay_s, target_keep, reference_delay_s
@@ -764,12 +925,19 @@ def resolve_warmup_budget(config: Mapping[str, Any]) -> Optional[WarmupBudget]:
     # from the warm-up budget and must not be: the source's slowest channels carry the contraction
     # envelope, and gating them on the budget would drop almost the whole ``up_ph`` block against a
     # lag search that exists to find the 20 to 120 s contraction-to-deceleration delay. What the
-    # alignment removes is a different set for a different reason -- the four channels *above* the
+    # alignment removes is a different set for a different reason -- the channels *above* the
     # reference, which cannot be shifted onto it without reading their own future -- and that is a
-    # correctness requirement rather than a warm-up policy. All fifteen ``up_ph`` channels survive
-    # it at the shipped reference.
+    # correctness requirement rather than a warm-up policy.
+    #
+    # WHICH reference is the dual scheme's one decision, and it is priced in exactly this line. On
+    # the target's clock all fifteen ``up_ph`` channels survive and four of 51 source channels drop;
+    # on a faster source clock the survivors fall and the readable lag band lifts off the near
+    # censoring edge. The drop is logged per channel below either way.
     source_keep, source_align = _align_stream(
-        "source", source_delay_s, tuple(range(len(source_warmup))), reference_delay_s
+        "source",
+        source_delay_s,
+        tuple(range(len(source_warmup))),
+        reference_delay_s if source_reference_delay_s is None else source_reference_delay_s,
     )
 
     # The worst phase is the last one, whose first anchor is F + S - 1; if that anchor does not
@@ -789,6 +957,7 @@ def resolve_warmup_budget(config: Mapping[str, Any]) -> Optional[WarmupBudget]:
         trim_minutes=trim_minutes,
         quantile=warmup.quantile,
         reference_delay_s=reference_delay_s,
+        source_reference_delay_s=source_reference_delay_s,
         leg_alignment=warmup.leg_alignment,
         target=StreamWarmup(
             name="target",
