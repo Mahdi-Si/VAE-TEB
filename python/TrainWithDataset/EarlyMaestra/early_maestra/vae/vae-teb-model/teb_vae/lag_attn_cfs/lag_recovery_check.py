@@ -528,10 +528,15 @@ def planted_band(delay_steps: int, horizon: int) -> Tuple[int, int]:
 def band_share(profile: Sequence[float], band: Tuple[int, int]) -> float:
     """What fraction of a profile's total mass sits inside the band.
 
-    A plain sum over an interval rather than anything from the shape vocabulary, and deliberately:
-    the band is a property of the **plant**, which no production profile has, while ``peak_width``,
-    ``mass_above`` and ``degeneracy`` describe a profile against itself and are taken from the
-    evaluation's own module so that they mean one thing everywhere.
+    **The arithmetic is the evaluation's own**,
+    :func:`~teb_vae.lag_attn_cfs.eval.lag_shape.band_mass`, exactly as the peak vocabulary beside
+    it is. It was a local copy while this check was the only consumer; the clock-excess band
+    shares now report the same quantity from an analysis, and two implementations of "the mass
+    inside a band" is precisely the shape of drift this module's docstring says it exists to
+    avoid -- a gate and a report disagreeing about one profile.
+
+    What stays local is the *choice of band*: the plant's own interval is a property of the
+    fixture, which no production profile has.
 
     Args:
         profile: One value per lag.
@@ -540,19 +545,70 @@ def band_share(profile: Sequence[float], band: Tuple[int, int]) -> float:
     Returns:
         The share in $[0, 1]$, or ``NaN`` when the profile carries no positive mass.
     """
-    import numpy as np
+    from teb_vae.lag_attn_cfs.eval import lag_shape
 
-    values = np.asarray(list(profile), dtype=np.float64)
-    finite = np.where(np.isfinite(values), values, 0.0)
-    total = float(finite.sum())
-    if not finite.size or total <= 0.0:
-        return float("nan")
-    low, high = band
-    return float(finite[max(low, 0) : min(high + 1, finite.size)].sum() / total)
+    return float(lag_shape.band_mass(profile, band)["share"])
+
+
+def occlusion_bands(binding: Any) -> Dict[str, Tuple[int, int]]:
+    """The lag-window partition the cell's committed evaluation delta names.
+
+    Read off ``binding.overrides_path`` rather than restated here, because it is the **same**
+    partition the interventional readout removes source from: stating the clock-excess profile's
+    mass on one axis and the occlusion deltas on another would leave a reader aligning two
+    four-way splits by eye, and a band renamed on one side would go unnoticed.
+
+    Args:
+        binding: The cell's :class:`~teb_vae.lag_attn_cfs.eval.binding.ModelBinding`.
+
+    Returns:
+        ``{name: (lo, hi)}``, inclusive. Empty when the delta names none, which is a configuration
+        state rather than a failure -- the planted band's own share is reported either way.
+    """
+    from teb_vae.lag_attn_cfs.eval.config_schema import load_eval_overrides
+
+    delta = load_eval_overrides(getattr(binding, "overrides_path", None))
+    configured = ((delta or {}).get("eval_config") or {}).get("occlusion_bands") or {}
+    return {
+        str(name): (int(span[0]), int(span[1]))
+        for name, span in configured.items()
+        if isinstance(span, (list, tuple)) and len(span) == 2
+    }
+
+
+def _in_band(
+    argmax: Optional[int], band: Tuple[int, int], degenerate: Optional[bool]
+) -> bool:
+    """Whether one readout's peak names a lag inside the planted band.
+
+    The pass clause ``recovered`` uses, plus the degeneracy guard the pooled criterion does not
+    carry. The guard belongs on every *secondary* readout because ``entmax15`` assigns lags exactly
+    zero: a profile that is flat or nearly empty still has a perfectly confident argmax, and one
+    landing inside the band by arithmetic accident would report a recovery.
+
+    Args:
+        argmax: The readout's peak lag, or ``None`` when it has none.
+        band: The inclusive planted band.
+        degenerate: Whether the profile has a shape worth reading. ``None`` -- unmeasured -- is
+            treated as degenerate, because a recovery nobody could check is not one.
+
+    Returns:
+        Whether this readout found the plant.
+    """
+    return bool(
+        argmax is not None
+        and band[0] <= int(argmax) <= band[1]
+        and int(argmax) != 0
+        and degenerate is False
+    )
 
 
 def recovery_record(
-    results: Dict[str, Any], *, band: Tuple[int, int], delay_steps: int
+    results: Dict[str, Any],
+    *,
+    band: Tuple[int, int],
+    delay_steps: int,
+    bands: Optional[Dict[str, Tuple[int, int]]] = None,
 ) -> Dict[str, Any]:
     """Score the evaluated lag block against the planted band.
 
@@ -561,6 +617,8 @@ def recovery_record(
         band: The inclusive lag band the plant occupies.
         delay_steps: The planted delay, carried into the record so a reader of the JSON alone has
             the geometry the verdict was reached at.
+        bands: The evaluation's own lag-window partition, from :func:`occlusion_bands`. ``None``
+            reports the planted band's share alone rather than inventing a partition.
 
     Returns:
         The verdict, the argmax of every profile the evaluation reports with the peak description
@@ -578,8 +636,15 @@ def recovery_record(
 
     heads: List[Dict[str, Any]] = []
     entropies = list(lag.get("attention_entropy_per_head_nats") or [])
+    kl_per_head_profiles = list(lag.get("kl_lag_profile_per_head") or [])
     for index, profile in enumerate(lag.get("attention_lag_profile_per_head") or []):
         peak = lag_shape.peak_width(profile)
+        # The SAME head's KL attribution, beside its attention rather than instead of it. A head
+        # can attend inside the band while carrying almost none of the KL -- on this family one
+        # latent dimension has carried 95% of it -- so an in-band attention peak from a head with
+        # no KL behind it is not the plant being recovered.
+        kl_profile = kl_per_head_profiles[index] if index < len(kl_per_head_profiles) else []
+        kl_peak = lag_shape.peak_width(kl_profile) if kl_profile else {}
         heads.append(
             {
                 "head": index,
@@ -590,8 +655,48 @@ def recovery_record(
                 "entropy_nats": (
                     float(entropies[index]) if index < len(entropies) else float("nan")
                 ),
+                "kl_argmax_lag_step": kl_peak.get("argmax"),
+                "kl_band_share": band_share(kl_profile, band) if kl_profile else float("nan"),
+                "kl_degenerate": (
+                    lag_shape.degeneracy(kl_profile)["degenerate"] if kl_profile else None
+                ),
             }
         )
+
+    # The clock-excess profile, which is the readout this fixture now also has to qualify. The
+    # matched attribution was 67.5% availability clock on the diagnosed run, and the clock is a
+    # deterministic function of $t$ readable from the source state at ANY lag -- so the matched
+    # profile is not expected to find the plant, and whether the clock-EXCESS one does is the
+    # open question this block exists to answer.
+    #
+    # Rectified before any share is taken: the published vector is signed, because that is what
+    # makes it sum to ``coupling_minus_clock``, and a share of a signed vector is not a share.
+    excess = [float(value) for value in (lag.get("kl_lag_profile_clock_excess") or [])]
+    positive = [max(value, 0.0) for value in excess]
+    positive_nats = float(sum(positive))
+    negative_nats = float(sum(value for value in excess if value < 0.0))
+    clock_excess: Dict[str, Any] = {
+        "measured": bool(excess),
+        "argmax_lag_step": lag.get("kl_argmax_lag_step_clock_excess"),
+        "band_share": band_share(positive, band) if excess else float("nan"),
+        "occlusion_band_shares": (
+            {name: band_share(positive, span) for name, span in (bands or {}).items()}
+            if excess
+            else {}
+        ),
+        "degenerate": lag_shape.degeneracy(positive)["degenerate"] if excess else None,
+        "net_nats": float(sum(excess)) if excess else float("nan"),
+        "positive_nats": positive_nats if excess else float("nan"),
+        # What rectification threw away, against what it kept. A large value means the two arms'
+        # attentions point in materially different directions, so the difference is not a small
+        # correction to the matched profile and the rectified total is a loose upper bound on
+        # ``coupling_minus_clock`` rather than a near-equal one.
+        "rectified_frac": (
+            abs(negative_nats) / positive_nats
+            if excess and positive_nats > 0.0
+            else float("nan")
+        ),
+    }
 
     # The pass criterion, stated once: inside the band AND not at the near edge. The second clause
     # is not implied by the first only because a band that reached lag 0 would make it so -- which
@@ -605,6 +710,24 @@ def recovery_record(
         "recovered": bool(recovered),
         "argmax_support_corrected": None if argmax is None else int(argmax),
         "band_share_support_corrected": band_share(corrected, band),
+        # Per readout, so a reader sees WHICH instrument found the plant rather than only whether
+        # the one the exit code is wired to did. Deliberately not part of ``recovered`` and
+        # deliberately not asserted by the suite: the pass line is unchanged so that every gate
+        # already recorded in RESULTS.md stays comparable across this change.
+        "recovered_by": {
+            "kl_support_corrected": bool(recovered),
+            "clock_excess": _in_band(
+                clock_excess["argmax_lag_step"], band, clock_excess["degenerate"]
+            ),
+            "any_head_attention": any(
+                _in_band(head["argmax_lag_step"], band, head["degenerate"]) for head in heads
+            ),
+            "any_head_kl": any(
+                _in_band(head["kl_argmax_lag_step"], band, head["kl_degenerate"])
+                for head in heads
+            ),
+        },
+        "clock_excess": clock_excess,
         # The evaluation's own peak vocabulary, over all three profiles it reports.
         "peaks": lag_kl.build_summary_rows(lag, delay),
         "heads": heads,
@@ -645,13 +768,51 @@ def format_recovery(record: Dict[str, Any]) -> str:
             f"  {row['profile']:>18}  {str(row['argmax_lag_step']):>6}  {str(width):>6}  "
             f"{'nan' if mass is None else format(float(mass), '.3f'):>9}  {row['degenerate']}"
         )
-    lines.append("attention per head:")
-    lines.append(f"  {'head':>6}  {'argmax':>6}  {'width':>6}  {'in band':>8}  {'entropy':>8}")
+    # Attention and KL side by side per head, because they answer different halves of one
+    # question: where the head looked, and how much of the belief movement it carried.
+    lines.append("per head (attention | KL attribution):")
+    lines.append(
+        f"  {'head':>6}  {'argmax':>6}  {'width':>6}  {'in band':>8}  {'entropy':>8}"
+        f"  {'kl argmax':>9}  {'kl in band':>10}"
+    )
     for head in record["heads"]:
+        kl_share = head.get("kl_band_share", float("nan"))
         lines.append(
             f"  {head['head']:>6}  {str(head['argmax_lag_step']):>6}  "
             f"{str(head['peak_width_bins']):>6}  {head['band_share']:>8.3f}  "
-            f"{head['entropy_nats']:>8.3f}"
+            f"{head['entropy_nats']:>8.3f}  "
+            f"{str(head.get('kl_argmax_lag_step')):>9}  {kl_share:>10.3f}"
+        )
+
+    excess = record.get("clock_excess") or {}
+    if excess.get("measured"):
+        shares = excess.get("occlusion_band_shares") or {}
+        rendered = ", ".join(f"{name} {share:.3f}" for name, share in shares.items())
+        lines.append(
+            f"clock-excess (KL net of the availability clock): argmax "
+            f"{excess['argmax_lag_step']}, {excess['band_share']:.3f} of its positive mass inside "
+            f"the band, degenerate={excess['degenerate']}"
+        )
+        lines.append(
+            f"  net {excess['net_nats']:.4g} nats over the lags "
+            f"(= coupling_minus_clock), positive part {excess['positive_nats']:.4g}, "
+            f"rectified away {excess['rectified_frac']:.3f} of it"
+        )
+        if rendered:
+            lines.append(f"  positive mass by occlusion band: {rendered}")
+    else:
+        lines.append(
+            "clock-excess: not measured -- this run carries no source-null lag profile, so the "
+            "only lag readouts above are the ones the availability clock is still inside"
+        )
+
+    # Which instruments found the plant, spelled out. The exit code follows the pooled criterion
+    # alone and is unchanged; this line is what says whether a different readout would have.
+    found = record.get("recovered_by") or {}
+    if found:
+        lines.append(
+            "recovered by: "
+            + ", ".join(f"{name}={value}" for name, value in found.items())
         )
     lines.append(
         f"controls: kld_source_null = {record['kld_source_null']!r}, "
@@ -847,7 +1008,14 @@ def _score(
     results = metrics.evaluate(
         task, loader, delay_steps=int(model.source_delay_steps)
     )
-    record = recovery_record(results, band=band, delay_steps=delay_steps)
+    # The evaluation's own band partition, so the clock-excess mass and the interventional
+    # deltas are reported on one axis rather than on two a reader has to align by eye.
+    record = recovery_record(
+        results,
+        band=band,
+        delay_steps=delay_steps,
+        bands=occlusion_bands(cell.binding),
+    )
     record["switches"] = header
     record["kl_at_initialisation"] = initialisation
     record["checkpoint"] = str(checkpoint)

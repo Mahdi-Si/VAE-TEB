@@ -502,6 +502,42 @@ Two readouts the raw-target pipeline draws here are **absent**, and the emitted 
 - **Zeroing floors no source variation.** The encoder's response to a flat trajectory is not literally the availability pattern's own response, so this difference is a slightly **weaker** statement than "the clock alone" — it errs in the model's favour, and the emitted record says so.
 - **A large `kld_source_null` is not a defect.** Giving the prior the same clock cannot drive it to zero: the posterior is a bounded residual on the prior, so the mean half of the divergence at a silent source is a function of the delta head alone and no prior-side clock appears in it. The bottom panel's two violins overlapping heavily is the expected picture; the top panel is where the finding is.
 
+## `source_null/source_null_lag_profile.pdf`
+
+**In plain terms.** *"Where in the past did the coupling exceed the availability clock?"* The
+matched coupling readout and the source-null arm are both attributions over the same lag axis, and
+their **difference** is the only lag profile in this run with the availability staircase removed.
+That matters because the staircase is a deterministic function of $t$ and is readable from the
+source state at *any* lag, so it enters the matched attribution wherever the attention happens to
+sit — and no renormalisation of the matched profile can take it out. Only subtracting an arm that
+carries the clock and no source content can.
+
+**What it shows.** Top: the matched attribution and the null arm, both in nats per anchor, on the
+compensated lag axis. Bottom: their signed difference with zero drawn, the four `occlusion_bands`
+shaded and labelled, and the delta mask marked where one was emitted.
+
+**Axes.** Compensated lag seconds across, on the shared stored-coefficient axis; nats per anchor
+up on both panels. Two panels because a $0.16$-nat excess drawn against a $0.49$-nat total is a
+flat line.
+
+**How it is misread.** Four ways.
+
+- **The difference is signed, and only the signed sum is the gated scalar.** It sums over lags to
+  `coupling_minus_clock` exactly — that identity is what makes this a decomposition of the quantity
+  `clock_margin_min_nats` gates rather than a second lag reading. Every *share* on this page is
+  taken of the **positive part**, because a share of a signed vector is not a share, so the
+  rectified total is an **upper bound** on the gated scalar and not a partition of it. The gap is
+  `rectified_frac`.
+- **A negative bin is a real state.** The null arm re-poses the posterior against a zeroed source,
+  so its attention is its own and can exceed the matched arm's at a lag. That means no
+  clock-exceeding coupling there; it does not mean negative information.
+- **The delta mask is withheld when the profile is degenerate, and that is the expected outcome.**
+  `entmax15` assigns lags exactly zero, so a flat or nearly empty profile still has a perfectly
+  confident argmax. A withheld mask is a measurement — the geometry-fixed bands remain the
+  selection that needs no estimate.
+- **This is still stored-coefficient time.** A peak's position here is not a physiological latency,
+  for the reason every lag page in this run carries.
+
 ## `occlusion/occlusion_horizon_delta.pdf`
 
 **In plain terms.** *"When did the source actually matter?"* — asked by taking the source away rather than by reading attention weights. For each band of lags, the stored source values in that band are set to zero (the channel mean), the stream is re-encoded and the forecast is re-scored. A band whose removal costs the forecast nats is a band the forecast was using. This is the interventional half of the lag question; the lag profile is the observational half, and the two can disagree — on the fixture whose informative lags are known, they did.
@@ -517,6 +553,72 @@ Two readouts the raw-target pipeline draws here are **absent**, and the emitted 
 - **A negative curve is a real state, not a defect.** Removing source the model was mildly misusing improves the forecast. Whether a small negative value means anything is a question about the spread across segments, which the per-recording table carries and this figure does not.
 - **The availability announcement does not move.** The intervention edits values and leaves the arrival clock exactly where it was, and that invariance is *measured* on every occluded encode rather than assumed — which is what stops this being a second reading of the clock the `source_null` figure already reports.
 - **There is no threshold and no verdict here on purpose.** What a healthy per-band delta is has never been measured; a bar guessed before the first production runs would decide a pass or a fail on exactly the run that was going to set it.
+
+## `occlusion/occlusion_clock_delta.pdf`
+
+**In plain terms.** *"Did the lags that mattered change as delivery approached?"* — asked
+interventionally. Each band's cost is placed on the time-before-delivery axis, so a band whose cost
+rises while the others hold is that part of the past becoming more informative.
+
+**What it shows.** One panel per band, one line per clinical class: the mean per-recording delta in
+that band, window by window, with zero marked.
+
+**Axes.** Hours before delivery across, drawn with delivery at the right; nats per anchor up.
+
+**How it is misread.** Three ways.
+
+- **Nothing on this page is tested.** No Kruskal-Wallis, no Holm correction, no new family. This
+  analysis scores one anchor per segment and is capped in segments, so a half-hour window holds
+  tens at best and most (class, window) cells fall below the minimum group size a test needs. A
+  $p$-value here would be a correction over cells that mostly could not be tested.
+- **The line is thin where the cap is binding.** Read `n_recordings` in `occlusion_clocks.csv`
+  before reading a movement; the cap is chosen from the cost block and the per-band standard
+  errors, and `EVAL.md`'s occlusion section carries the arithmetic.
+- **This is the interventional half of a two-part question.** The observational half is
+  `lag_kld_scaled`'s band trajectories, on the same partition and the same grid. Where the two
+  disagree, that disagreement is the finding — on the fixture whose informative lags are known,
+  they did.
+
+## `lag_kld_scaled/lag_kld_scaled_time_to_delivery.pdf`
+
+**In plain terms.** *"How many nats of coupling sat in each part of the past, hour by hour before
+delivery?"* `lag_clocks` answers where the mass sits, through statistics that divide the magnitude
+out — so a window whose coupling collapsed and a window whose coupling merely moved reduce to the
+same number. This page keeps the nats.
+
+**What it shows.** One panel per `occlusion_bands` band, one line per clinical class: the mean
+per-recording `total_nats` of the KL attribution restricted to that band, window by window.
+
+**Axes.** Hours before delivery across, drawn with delivery at the right; nats per anchor up. Each
+panel's title carries its lag range and the seconds it spans.
+
+**How it is misread.** Four ways.
+
+- **Nothing on this page is tested.** Every feature in this analysis ships untested, so it adds no
+  Holm family to the four `lag_clocks` carries and writes no significance table at all. A
+  trajectory quoted from here is a description, not a claim.
+- **The bands are geometry-fixed, and that is what makes them readable.** They are not chosen from
+  the KL, so a statistic on one is free of the circularity that makes a top-$K$-by-KL selection
+  test its own selector. They are the same bands the interventional page removes source from.
+- **A line moving *between* panels is the informative past moving; a line moving *within* one is
+  that band's coupling changing magnitude.** Neither is visible on a scale-free statistic over the
+  whole window, which is what `lag_clocks` draws — the two pages answer different halves.
+- **`near_mass` and `far_mass` are absent from banded sources on purpose.** Both are measured from
+  the axis's own start, so on a band they would re-base onto the band's start and `far_mass` would
+  be identically zero on three of the four. Their absence is a measurement.
+
+## `lag_kld_scaled/lag_kld_scaled_second_stage.pdf`
+
+**In plain terms.** The same reading against the second clinical clock: signed hours from
+second-stage onset, negative before and positive after.
+
+**What it shows and its axes.** As the delivery-clock page above, on the second-stage axis drawn
+left to right with the onset where it falls.
+
+**How it is misread.** As above, plus one. **The population is a strict subset**: a recording with
+no recorded onset cannot be placed on this axis at all, so this page and the delivery-clock page
+answer for different recordings by design. The analysis declares itself capped for that reason, and
+the eligibility rule is the shared one — the same the `second_stage` analysis applies.
 
 ## `spectral_skill/spectral_skill_bands.pdf`
 

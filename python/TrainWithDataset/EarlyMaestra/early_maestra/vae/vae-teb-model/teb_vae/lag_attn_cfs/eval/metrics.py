@@ -770,6 +770,9 @@ VECTOR_READOUTS: Tuple[str, ...] = (
     "lag_profile",
     "lag_profile_support_corrected",
     "lag_profile_untruncated",
+    "lag_profile_null",
+    "lag_profile_null_untruncated",
+    "lag_profile_per_head",
     "lag_support",
     "attention_profile",
     "attention_profile_support_corrected",
@@ -816,6 +819,24 @@ class BatchReadout:
             floor, and not at a lowered one.
         lag_support: Contributing anchors per lag, $(B, L)$ -- the denominator above, carried so
             the correction can be checked and re-derived rather than trusted.
+        lag_profile_null: The same attribution built from the **source-null** arm -- the
+            posterior re-posed against a zeroed source stream, against its own attention over the
+            lags, $(B, L)$. Sums over lags to ``kld_source_null``, so the difference against
+            ``lag_profile`` sums to ``coupling_minus_clock``: it is the per-lag decomposition of
+            the clock-excess coupling, which is the quantity the availability-clock verdict gates
+            and the only lag readout here with the availability staircase removed.
+        lag_profile_null_untruncated: The null attribution over the anchors at which **every** lag
+            exists -- the partner of ``lag_profile_untruncated``, so a clock-excess formed against
+            the untruncated matched profile is a difference of two profiles reduced over one
+            anchor set rather than a mixture of two.
+        lag_profile_per_head: The KL attribution **before** the sum over heads, flattened
+            head-major to $(B, M \cdot L)$ so it travels the one-trailing-axis chain every other
+            vector readout does; reshaped once, in the consumer. Summing it over $m$ returns
+            ``lag_profile``'s numerator exactly, so it refines the shipped decomposition rather
+            than restating it. It is **not** the product of ``kld_per_head`` and
+            ``attention_profile_per_head``: those are two anchor means and this is the anchor mean
+            of their product, and the gap between them is the within-segment covariance of a
+            head's KL with its own attention.
         attention_profile: Per-sample head-averaged attention per lag, $(B, L)$.
         attention_profile_support_corrected: The same attention divided by each lag's own
             contributing-anchor count, $(B, L)$.
@@ -874,6 +895,9 @@ class BatchReadout:
     lag_profile: torch.Tensor
     lag_profile_support_corrected: torch.Tensor
     lag_profile_untruncated: torch.Tensor
+    lag_profile_null: torch.Tensor
+    lag_profile_null_untruncated: torch.Tensor
+    lag_profile_per_head: torch.Tensor
     lag_support: torch.Tensor
     attention_profile: torch.Tensor
     attention_profile_support_corrected: torch.Tensor
@@ -1356,7 +1380,7 @@ def source_null_kld_per_sample(
     outputs: Mapping[str, torch.Tensor],
     u_stream: torch.Tensor,
     kl_support: torch.Tensor,
-) -> torch.Tensor:
+) -> Dict[str, torch.Tensor]:
     r"""The KL a source carrying **no variation** induces, per sample, on the run's own support.
 
     $$\texttt{kld\_source\_null}_b \;=\;
@@ -1389,8 +1413,41 @@ def source_null_kld_per_sample(
         u_stream: The source stream it was given, $(B, T, c_u)$, at the **declared** width.
         kl_support: The KL anchor mask $(B, T)$ this run reduced its matched KL over.
 
+    **The arm is also resolved by lag, and that costs no second re-encode.** The null forward
+    already returns its own attention over the lags -- the query is the prior's mean, unchanged,
+    but the keys are the null encode's -- so the same head-structured attribution the matched
+    forward builds can be built here from tensors already in hand:
+
+    $$\widetilde K^{\mathrm{null}}_{t,\ell}
+    = \sum_m K^{(m),\mathrm{null}}_t\,\alpha^{(m),\mathrm{null}}_{t,\ell},
+    \qquad \sum_\ell \widetilde K^{\mathrm{null}}_{t,\ell} = K^{\mathrm{null}}_t.$$
+
+    The difference against the matched profile is the **clock-excess** attribution, and its lag sum
+    is exactly ``coupling_minus_clock`` -- the scalar this whole arm exists to produce and the one
+    ``clock_margin_min_nats`` gates. That identity is what makes a per-lag clock-excess a
+    decomposition of the gated quantity rather than a second, differently-normalised reading of it,
+    and :data:`IDENTITY_RESIDUAL_COLUMNS` measures it on every run rather than assuming it.
+
+    **Why the difference is the right object and the null profile alone is not.** The availability
+    staircase is a deterministic function of $t$ and is readable from the source state at *any*
+    lag, so it enters the matched attribution at whatever lag the attention happens to sit on. Only
+    subtracting an arm that carries the clock and no source content removes it, and no
+    renormalisation of the matched profile can.
+
+    ``te_analysis`` is invoked with ``head_structured=True``, which is what both causal cells' own
+    forwards pass: under a flat latent the per-head split is an arbitrary slice of a shared latent
+    and the product would be a diagnostic rather than a decomposition. Passing the model's own flag
+    instead would let this arm and the matched forward disagree about what the attribution means.
+
     Returns:
-        The per-sample null KL $(B,)$, in nats per anchor.
+        A mapping, because the arm produces four quantities off one re-encode and returning the
+        scalar alone would mean paying for the encode again to get the rest:
+
+        * ``kld_source_null`` -- the per-sample null KL $(B,)$, in nats per anchor;
+        * ``lag_profile_null`` -- its per-lag decomposition $(B, L)$, which sums over lags to it;
+        * ``lag_profile_null_untruncated`` -- the same over the anchors whose lag support is
+          complete, the partner of ``lag_profile_untruncated``;
+        * ``lag_map_null_identity_max_abs`` -- the worst per-anchor violation of the sum above.
     """
     nulled = controls.source_null_forward_outputs(model, dict(outputs), u_stream)
     kld_btd = model.kld_tensor(
@@ -1399,7 +1456,34 @@ def source_null_kld_per_sample(
         mu_post=nulled["mu_post"],
         logvar_post=nulled["logvar_post"],
     )
-    return _per_sample_mean(kld_btd.sum(dim=-1), kl_support)
+    # The null arm's own attribution, from the null arm's own attention. Head-structured, matching
+    # both cells' forwards, so the split is a decomposition rather than a slice of a shared latent.
+    kld_per_t_null, lag_map_null, _ = model.te_analysis(
+        kld_btd, nulled["attn_weights"], head_structured=True
+    )
+
+    # The identical masks the matched profiles are reduced over, rebuilt here rather than passed:
+    # this function runs before the lag block of ``evaluate_batch`` and reordering the two to share
+    # a local would put the cheap re-encode after the expensive decode for no gain. ``build_lag_mask``
+    # is the MODEL's, which is the floored one the attention was actually computed under.
+    seq_len = int(kl_support.shape[1])
+    n_lags = int(nulled["attn_weights"].shape[-1])
+    lag_validity = model.build_lag_mask(seq_len, device=kl_support.device)
+    untruncated = untruncated_anchor_mask(
+        seq_len, n_lags, device=kl_support.device
+    ).to(kl_support.dtype)
+    profile_null, _, _ = lag_profiles(lag_map_null, kl_support, lag_validity)
+
+    return {
+        "kld_source_null": _per_sample_mean(kld_btd.sum(dim=-1), kl_support),
+        "lag_profile_null": profile_null,
+        "lag_profile_null_untruncated": _per_sample_vector_mean(
+            lag_map_null, kl_support * untruncated
+        ),
+        "lag_map_null_identity_max_abs": identity_residual_per_sample(
+            lag_map_null, kld_per_t_null, kl_support
+        ),
+    }
 
 
 @torch.no_grad()
@@ -1722,9 +1806,12 @@ def evaluate_batch(
     # The availability-clock arm. Unconditional -- unlike the permutation controls it needs no
     # second sample in the batch, because the null is a zeroed stream rather than a stranger's --
     # so ``coupling_minus_clock`` is on every row of every run.
-    columns["kld_source_null"] = source_null_kld_per_sample(
-        model, outputs, u_stream, kl_support
-    )
+    # One re-encode, four quantities: the scalar the clock verdict gates, its per-lag
+    # decomposition, that profile's untruncated partner, and the residual of the identity binding
+    # the first two. The three lag tensors are held for the vector block below.
+    null_arm = source_null_kld_per_sample(model, outputs, u_stream, kl_support)
+    columns["kld_source_null"] = null_arm["kld_source_null"]
+    columns["lag_map_null_identity_max_abs"] = null_arm["lag_map_null_identity_max_abs"]
     columns["coupling_minus_clock"] = (
         columns["source_conditioned_kl_raw"] - columns["kld_source_null"]
     )
@@ -1892,6 +1979,17 @@ def evaluate_batch(
         attention.reshape(attention.shape[0], seq_len, -1), kl_support
     )
     per_head_entropy = _per_sample_vector_mean(attention_entropy(attention), kl_support)
+    # The KL attribution BEFORE the sum over heads, on the same head-major layout. Summing this
+    # over $m$ returns ``source_kl_lag_map`` exactly, so it refines the shipped decomposition
+    # rather than restating it -- and it is not recoverable from the two vectors beside it: the
+    # product of the per-head KL's anchor mean with the per-head attention's anchor mean differs
+    # from the anchor mean of their product by the within-segment covariance of the two, which is
+    # precisely the quantity a head that concentrates its KL where it also concentrates its
+    # attention would show.
+    per_head_lag_map = outputs["kld_per_t_per_head"].unsqueeze(-1) * attention
+    per_head_lag_profile = _per_sample_vector_mean(
+        per_head_lag_map.reshape(per_head_lag_map.shape[0], seq_len, -1), kl_support
+    )
 
     # The two lag-structure identities, measured on this run rather than assumed from the model
     # tests. Both hold anchor by anchor -- the lag map sums over lags to $K_t$ because each head's
@@ -1996,6 +2094,9 @@ def evaluate_batch(
         lag_profile=lag_profile,
         lag_profile_support_corrected=lag_profile_corrected,
         lag_profile_untruncated=lag_profile_untruncated,
+        lag_profile_null=null_arm["lag_profile_null"],
+        lag_profile_null_untruncated=null_arm["lag_profile_null_untruncated"],
+        lag_profile_per_head=per_head_lag_profile,
         lag_support=lag_support,
         attention_profile=attention_profile,
         attention_profile_support_corrected=attention_profile_corrected,
@@ -2060,6 +2161,13 @@ class Aggregate:
             complete -- every scored anchor at the shipped floor.
         lag_support: Contributing anchors per lag, averaged on the same chain -- the correction's
             denominator, in anchors per segment.
+        lag_profile_null: The source-null arm's per-lag attribution on the same chain; sums
+            to ``kld_source_null``, so the difference against ``lag_profile`` sums to
+            ``coupling_minus_clock``.
+        lag_profile_null_untruncated: The null attribution restricted to the anchors whose lag
+            support is complete, the partner of ``lag_profile_untruncated``.
+        lag_profile_per_head: The per-head KL attribution, head-major and $M \cdot L$ wide;
+            reshaped in :func:`lag_summary` and nowhere else.
         attention_profile: Per-lag attention on the same chain.
         attention_profile_support_corrected: The same attention on each lag's own denominator.
         attention_profile_untruncated: The same attention over the anchors whose lag support is
@@ -2082,6 +2190,9 @@ class Aggregate:
     lag_profile: List[float] = field(default_factory=list)
     lag_profile_support_corrected: List[float] = field(default_factory=list)
     lag_profile_untruncated: List[float] = field(default_factory=list)
+    lag_profile_null: List[float] = field(default_factory=list)
+    lag_profile_null_untruncated: List[float] = field(default_factory=list)
+    lag_profile_per_head: List[float] = field(default_factory=list)
     lag_support: List[float] = field(default_factory=list)
     attention_profile: List[float] = field(default_factory=list)
     attention_profile_support_corrected: List[float] = field(default_factory=list)
@@ -2253,6 +2364,13 @@ def _seconds_of(lag: Optional[int], delay_steps: int) -> Optional[float]:
 IDENTITY_RESIDUAL_COLUMNS: Dict[str, str] = {
     "lag_map_identity_max_abs": "lag_map_sums_to_kl_max_abs_nats",
     "head_kl_identity_max_abs": "per_head_kl_sums_to_kl_max_abs_nats",
+    # The same identity on the source-null arm. It is measured rather than inherited from the
+    # matched one because it is a DIFFERENT attention: the null forward re-poses the posterior
+    # against a zeroed source, so its attention over the lags is its own and its rows summing to
+    # one is its own property. The clock-excess profile is the difference of the two attributions,
+    # so a violation here would silently make that difference something other than the per-lag
+    # decomposition of ``coupling_minus_clock``.
+    "lag_map_null_identity_max_abs": "null_lag_map_sums_to_kl_max_abs_nats",
 }
 
 
@@ -2346,6 +2464,30 @@ def lag_summary(
         if num_heads and len(flat_per_head) == num_heads * n_lags
         else []
     )
+    # The KL attribution on the same layout and through the same guard. A second reshape rather
+    # than a shared helper because there are exactly two of them and the guard is three lines; a
+    # third consumer is what would earn the helper.
+    flat_kl_per_head = list(aggregate.lag_profile_per_head)
+    kl_per_head_profiles = (
+        [flat_kl_per_head[head * n_lags:(head + 1) * n_lags] for head in range(num_heads)]
+        if num_heads and len(flat_kl_per_head) == num_heads * n_lags
+        else []
+    )
+    # The clock-excess attribution: the matched profile less the source-null one, bin by bin.
+    # **Signed, and published raw.** A lag at which the null exceeds the matched arm carries no
+    # clock-exceeding coupling, and rectifying here would make the published vector stop summing
+    # to ``coupling_minus_clock`` -- which is the one property that makes it a decomposition of
+    # the gated scalar rather than a differently normalised profile. Whoever rectifies states the
+    # rule and reports what it clipped.
+    null_profile = list(aggregate.lag_profile_null)
+    clock_excess = (
+        [float(matched) - float(null) for matched, null in zip(aggregate.lag_profile, null_profile)]
+        if len(null_profile) == n_lags
+        else []
+    )
+    # The argmax of the POSITIVE part, because an argmax over a signed vector is a lag where the
+    # excess is least negative wherever the profile is everywhere negative -- a bin, not a finding.
+    clock_excess_argmax = _argmax_of([max(value, 0.0) for value in clock_excess])
     return {
         "delay_steps": int(delay_steps),
         # The source channels are masked individually and the maximum is what the model reports,
@@ -2388,6 +2530,22 @@ def lag_summary(
         "kl_lag_profile": list(aggregate.lag_profile),
         "kl_lag_profile_support_corrected": list(corrected),
         "kl_lag_profile_untruncated": list(aggregate.lag_profile_untruncated),
+        # The source-null arm, resolved by lag. Sums over lags to ``kld_source_null``.
+        "kl_lag_profile_null": null_profile,
+        "kl_lag_profile_null_untruncated": list(aggregate.lag_profile_null_untruncated),
+        # ... and the difference, which sums to ``coupling_minus_clock``. This is the only lag
+        # profile in this record with the availability staircase removed: the staircase is a
+        # deterministic function of $t$, readable from the source state at ANY lag, so it enters
+        # the matched attribution wherever the attention happens to sit and no renormalisation of
+        # the matched profile can take it out. Signed; see the comment where it is built.
+        "kl_lag_profile_clock_excess": clock_excess,
+        "kl_argmax_lag_step_clock_excess": clock_excess_argmax,
+        "kl_lag_compensated_seconds_clock_excess": _seconds_of(
+            clock_excess_argmax, delay_steps
+        ),
+        # The KL attribution before the sum over heads. Reshaped here and nowhere else, exactly as
+        # the attention's per-head profile is.
+        "kl_lag_profile_per_head": kl_per_head_profiles,
         # Anchors per segment behind each corrected bin. Emitted beside the profile so a reader
         # can see which lags were averaged over how much, and re-derive either profile from the
         # other rather than taking the correction on trust.

@@ -122,7 +122,7 @@ def test_the_per_sample_column_recombines_into_the_shared_functions_scalar(
 
     per_sample = source_null_kld_per_sample(
         trained_task.orig_model, outputs, u_stream, support
-    )
+    )["kld_source_null"]
     shared = controls.source_null_kld(trained_task.orig_model, outputs, u_stream, weight)
 
     counts = support.sum(dim=1)
@@ -158,9 +158,71 @@ def test_the_null_and_the_matched_readout_share_one_anchor_support(
     )
     assert torch.allclose(
         readout.columns["kld_source_null"],
-        source_null_kld_per_sample(model, outputs, u_stream, support),
+        source_null_kld_per_sample(model, outputs, u_stream, support)["kld_source_null"],
         rtol=1e-6,
     )
+
+
+def test_the_null_profile_decomposes_the_null_scalar_over_the_lags(trained_task, stub_batch):
+    r"""The identity that makes a per-lag clock-excess a decomposition rather than a second
+    reading.
+
+    $$\sum_\ell \widetilde K^{\mathrm{null}}_{b,\ell} = K^{\mathrm{null}}_b$$
+
+    holds because each head's null attention sums to one over its valid lags and the latent groups
+    are head-aligned, exactly as it does on the matched arm. Its consequence is the one that
+    matters: since the matched profile sums to ``source_conditioned_kl_raw``, the difference of the
+    two profiles sums to ``coupling_minus_clock`` -- so the clock-excess attribution is a
+    decomposition of the very scalar ``clock_margin_min_nats`` gates, rather than a differently
+    normalised quantity that happens to be lag-resolved.
+    """
+    outputs, u_stream, _weight, support = _dense_forward(trained_task, stub_batch)
+
+    arm = source_null_kld_per_sample(trained_task.orig_model, outputs, u_stream, support)
+
+    assert torch.allclose(
+        arm["lag_profile_null"].sum(dim=-1), arm["kld_source_null"], rtol=1e-5, atol=1e-6
+    )
+    # The residual the sanity block reads, measured on this batch rather than assumed. Attention
+    # dropout is the one mechanism that breaks it, and the model builds its attention at zero
+    # dropout for exactly this reason.
+    assert float(arm["lag_map_null_identity_max_abs"].max()) < 1e-4
+
+
+def test_the_clock_excess_profile_sums_to_the_gated_scalar(trained_task, stub_batch):
+    """The whole point of the lag-resolved null, asserted end to end through ``evaluate_batch``
+    rather than through the arm alone: what a reader subtracts is the *emitted* pair of profiles,
+    and a reduction that put the two on different anchor supports would leave both identities
+    above intact while making their difference meaningless."""
+    readout = evaluate_batch(trained_task, stub_batch, num_samples=1)
+
+    excess = readout.lag_profile - readout.lag_profile_null
+    assert torch.allclose(
+        excess.sum(dim=-1),
+        readout.columns["coupling_minus_clock"],
+        rtol=1e-5,
+        atol=1e-6,
+    )
+
+
+def test_the_per_head_attribution_sums_over_heads_to_the_pooled_one(trained_task, stub_batch):
+    r"""$\sum_m K^{(m)}_t \alpha^{(m)}_{t,\ell} = \widetilde K_{t,\ell}$, at the segment level.
+
+    This is the ``TEAnalysisHead`` identity with the head axis kept open, and it is what makes the
+    per-head profile a refinement of the shipped decomposition rather than a second quantity
+    wearing its name. It is also the check that the head-major flattening agrees with the reshape
+    every consumer applies -- a transposed layout would still sum to the same total, so the sum is
+    asserted per lag rather than in aggregate.
+    """
+    readout = evaluate_batch(trained_task, stub_batch, num_samples=1)
+
+    n_lags = readout.lag_profile.shape[-1]
+    per_head = readout.lag_profile_per_head
+    num_heads = per_head.shape[-1] // n_lags
+    assert per_head.shape[-1] == num_heads * n_lags
+
+    stacked = per_head.reshape(per_head.shape[0], num_heads, n_lags)
+    assert torch.allclose(stacked.sum(dim=1), readout.lag_profile, rtol=1e-5, atol=1e-6)
 
 
 def test_a_source_that_already_carries_no_variation_leaves_no_difference(
@@ -212,7 +274,9 @@ def test_the_null_encode_is_one_broadcast_row_and_the_divergence_still_varies(
     gated = zeros if model.source_gate is None else model.source_gate(zeros)
     with torch.no_grad():
         encoded = model.source_encoder(model.source_adapter(gated))
-    per_sample = source_null_kld_per_sample(model, outputs, u_stream, support)
+    per_sample = source_null_kld_per_sample(model, outputs, u_stream, support)[
+        "kld_source_null"
+    ]
 
     assert torch.allclose(encoded[0], encoded[1], rtol=0.0, atol=1e-5), (
         "a zeroed source must encode to one row up to batched-GEMM rounding; if it does not, the "

@@ -93,6 +93,44 @@ def test_the_vectorised_reducer_agrees_with_the_scalar_helpers_row_by_row(reduce
         assert statistics["zero_fraction"][index] == pytest.approx(
             verdict["zero_fraction"]
         ), index
+        # The scale-carrying pair, and the second assertion is the one that pins the name
+        # collision: ``peak_width``'s "peak" is the peak's VALUE while the reducer's "peak" is its
+        # POSITION in seconds. Until ``peak_nats`` existed there was nothing to compare the value
+        # against, so the two meanings of one word were never checked against each other.
+        assert statistics["total_nats"][index] == pytest.approx(
+            profile[np.isfinite(profile)].sum()
+        ), index
+        assert statistics["peak_nats"][index] == pytest.approx(peak["peak"]), index
+        assert statistics["peak"][index] != pytest.approx(statistics["peak_nats"][index]) or (
+            _SECONDS[peak["argmax"]] == peak["peak"]
+        ), index
+
+
+def test_the_scale_carrying_pair_is_what_the_other_twelve_divide_out() -> None:
+    r"""Two profiles of identical shape and tenfold different magnitude.
+
+    Every statistic formed from $p_\ell = w_\ell / \sum_k w_k$ must agree between them -- that is
+    the convention, and it is the right one for a question about *where* the mass sits. It is the
+    wrong one for a trajectory: a window whose coupling collapsed and a window whose coupling
+    merely moved would reduce identically. ``total_nats`` and ``peak_nats`` are what separate them,
+    and this test is the statement that they and only they carry the scale.
+    """
+    small = np.array([[0.1, 0.9, 0.2, 0.05, 0.05, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]])
+    large = small * 10.0
+
+    reduced_small, _ = lag_shape.profile_statistics(small, _SECONDS)
+    reduced_large, _ = lag_shape.profile_statistics(large, _SECONDS)
+
+    scale_free = [key for key in lag_shape.STATISTIC_KEYS if not key.endswith("_nats")]
+    for key in scale_free:
+        assert reduced_small[key][0] == pytest.approx(
+            reduced_large[key][0], nan_ok=True
+        ), key
+
+    assert reduced_large["total_nats"][0] == pytest.approx(
+        10.0 * reduced_small["total_nats"][0]
+    )
+    assert reduced_large["peak_nats"][0] == pytest.approx(10.0 * reduced_small["peak_nats"][0])
 
 
 def test_a_row_the_reducer_refuses_is_one_the_scalar_helpers_would_still_describe(reduced) -> None:
@@ -293,6 +331,108 @@ def test_an_input_with_nothing_to_reduce_returns_the_full_mapping_and_a_zeroed_r
     statistics, record = lag_shape.profile_statistics(rows, seconds)
     assert set(statistics) == set(lag_shape.STATISTIC_KEYS)
     assert record["n_usable"] == 0
+
+
+# =================================================================================================
+# Restricting a profile, and reading a signed one
+# =================================================================================================
+def test_a_band_restriction_carries_its_axis_with_it() -> None:
+    """The profile and the seconds axis are cut together, because a statistic in seconds taken on
+    a restricted profile against the full axis would be a centroid of the wrong window."""
+    rows = np.arange(2 * _N_LAGS, dtype=np.float64).reshape(2, _N_LAGS)
+
+    sliced, axis = lag_shape.restrict_to_band(rows, _SECONDS, (3, 6))
+
+    assert sliced.shape == (2, 4)
+    assert list(axis) == list(_SECONDS[3:7])
+    assert list(sliced[0]) == list(rows[0, 3:7])
+
+
+@pytest.mark.parametrize(
+    "band, fragment",
+    [
+        ((6, 3), "empty"),
+        ((-1, 4), "reaches past"),
+        ((3, _N_LAGS), "reaches past"),
+    ],
+)
+def test_a_band_that_names_more_than_it_measures_is_refused(band, fragment: str) -> None:
+    """Clipped rather than refused, a band would be reported under a name that overstates the lags
+    it covered; empty, it would report a row of zeros as a finding. Both are the refusals
+    ``_validate_occlusion_bands`` already makes at config load, restated here because this function
+    is also reachable from a band nobody validated."""
+    with pytest.raises(ValueError, match=fragment):
+        lag_shape.restrict_to_band(np.zeros((1, _N_LAGS)), _SECONDS, band)
+
+
+def test_the_band_mass_is_one_definition_the_planted_gate_now_binds() -> None:
+    """Known-answer, and then the delegation.
+
+    The gate had its own copy of this arithmetic while it was the only consumer. The clock-excess
+    band shares report the same quantity from an analysis now, so the copy is gone and the gate
+    calls this -- which is what keeps a share quoted in a recovery record and a share quoted in a
+    report from being two implementations that merely agree today.
+    """
+    from teb_vae.lag_attn_cfs import lag_recovery_check
+
+    profile = [5.0, 1.0, 0.5, 0.6, 0.7, 0.6, 0.5, 0.2, 0.1, 0.1, 0.1]
+
+    record = lag_shape.band_mass(profile, (3, 6))
+
+    # 0.6 + 0.7 + 0.6 + 0.5 = 2.4 of a 9.4 total.
+    assert record["n_bins"] == 4
+    assert record["nats"] == pytest.approx(2.4)
+    assert record["share"] == pytest.approx(2.4 / 9.4)
+    # And the gate reports that number rather than one of its own.
+    assert lag_recovery_check.band_share(profile, (3, 6)) == pytest.approx(2.4 / 9.4)
+
+
+def test_a_band_of_an_empty_profile_reports_nan_rather_than_a_zero_share() -> None:
+    """Zero would read as a band that was measured and found empty. Nothing was measured."""
+    record = lag_shape.band_mass([0.0] * _N_LAGS, (3, 6))
+
+    assert np.isnan(record["share"])
+    assert record["nats"] == 0.0
+
+
+def test_rectifying_a_signed_profile_reports_what_it_discarded() -> None:
+    r"""$\Delta^+_\ell = \max(\Delta_\ell, 0)$, and the census that keeps it honest.
+
+    The rectified total is an **upper bound** on $\sum_\ell \Delta_\ell$, never a partition of
+    it, so a reader quoting it as ``coupling_minus_clock`` would overstate by exactly
+    ``negative_nats``. Both totals are therefore returned, and ``rectified_frac`` says how large
+    the gap is relative to what survived.
+    """
+    positive, record = lag_shape.rectified_profile(np.array([[-0.2, 0.5, -0.3, 1.0]]))
+
+    assert list(positive[0]) == [0.0, 0.5, 0.0, 1.0]
+    assert record["positive_nats"] == pytest.approx(1.5)
+    assert record["negative_nats"] == pytest.approx(-0.5)
+    # The signed sum survives rectification as a reported number even though the vector does not.
+    assert record["net_nats"] == pytest.approx(1.0)
+    assert record["rectified_frac"] == pytest.approx(0.5 / 1.5)
+    assert record["n_rows_with_negative_bin"] == 1
+
+
+def test_the_reducer_still_refuses_the_signed_profile_it_was_always_going_to_refuse() -> None:
+    """The load-bearing pair, asserted together in one test because the whole design rests on the
+    relationship between them: ``profile_statistics`` rejects a negative bin outright -- which is
+    the precondition for its entropy, its quantiles and its mass shares, not a defensive check --
+    and rectification is what makes a signed clock-excess profile reducible **without** touching
+    that refusal. If a later change relaxed the reducer instead, this test is what fails."""
+    signed = np.array([[-0.2, 0.5, -0.3, 1.0]])
+    axis = np.arange(4, dtype=np.float64) * 4.0
+
+    _, refused = lag_shape.profile_statistics(signed, axis)
+    assert refused["n_negative"] == 1
+    assert refused["n_usable"] == 0
+
+    positive, _ = lag_shape.rectified_profile(signed)
+    statistics, accepted = lag_shape.profile_statistics(positive, axis)
+    assert accepted["n_negative"] == 0
+    assert accepted["n_usable"] == 1
+    # And the centroid it now yields is the mass-weighted mean of the surviving bins.
+    assert statistics["centroid"][0] == pytest.approx((0.5 * 4.0 + 1.0 * 12.0) / 1.5)
 
 
 def test_every_key_the_module_advertises_is_one_the_reducer_returns() -> None:

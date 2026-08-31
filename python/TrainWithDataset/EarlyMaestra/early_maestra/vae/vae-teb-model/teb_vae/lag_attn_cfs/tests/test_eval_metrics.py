@@ -921,6 +921,88 @@ def test_the_lag_report_carries_the_group_delay_caveat() -> None:
     assert summary["attention_argmax_lag_step"] == 0
 
 
+def test_the_clock_excess_profile_is_the_matched_profile_less_the_null() -> None:
+    r"""The published clock-excess vector, bin by bin, and the argmax rule that guards it.
+
+    Two properties, and the second is the one a reader would get wrong. It is **signed**: a lag at
+    which the null arm exceeds the matched one carries no clock-exceeding coupling, and publishing
+    a rectified vector would break the sum that makes this a decomposition of
+    ``coupling_minus_clock``. But its **argmax is taken over the positive part**, because an argmax
+    over a signed vector on a profile that is everywhere negative returns the least-negative bin --
+    a bin, not a finding.
+    """
+    summary = lag_summary(
+        Aggregate(
+            lag_profile=[0.1, 0.9, 0.2],
+            lag_profile_null=[0.3, 0.4, 0.5],
+            attention_profile=[0.5, 0.2, 0.3],
+        )
+    )
+
+    # Signed, and bin by bin: the middle lag gains, the outer two lose.
+    assert summary["kl_lag_profile_clock_excess"] == pytest.approx([-0.2, 0.5, -0.3])
+    # The one positive bin wins, and the two negative ones cannot.
+    assert summary["kl_argmax_lag_step_clock_excess"] == 1
+
+
+def test_the_clock_excess_profile_sums_to_the_scalar_the_clock_verdict_gates() -> None:
+    """The identity the whole lag-resolved null exists for, at the aggregate level a run reports.
+
+    ``coupling_minus_clock`` is ``source_conditioned_kl_raw - kld_source_null``, and the two
+    profiles sum over lags to those two scalars respectively -- so their difference sums to it.
+    That is what makes a per-lag clock-excess a decomposition of the gated quantity rather than a
+    second, differently normalised lag reading that happens to have the clock subtracted.
+    """
+    matched = [0.10, 0.90, 0.20]
+    null = [0.30, 0.40, 0.05]
+
+    summary = lag_summary(
+        Aggregate(lag_profile=matched, lag_profile_null=null, attention_profile=[0.5, 0.2, 0.3])
+    )
+
+    coupling_minus_clock = sum(matched) - sum(null)
+    assert sum(summary["kl_lag_profile_clock_excess"]) == pytest.approx(
+        coupling_minus_clock, abs=1e-6
+    )
+
+
+def test_a_run_without_the_null_profile_reports_no_clock_excess_rather_than_a_wrong_one() -> None:
+    """A directory collected before the null profile existed is a partial input, not a broken one.
+    An empty list rather than a copy of the matched profile: the second would read as a run whose
+    availability clock accounted for exactly nothing, which is the opposite of what was measured
+    on every arm so far."""
+    summary = lag_summary(Aggregate(lag_profile=[0.1, 0.9, 0.2], attention_profile=[0.5, 0.2]))
+
+    assert summary["kl_lag_profile_clock_excess"] == []
+    assert summary["kl_argmax_lag_step_clock_excess"] is None
+
+
+def test_the_per_head_kl_attribution_is_reshaped_or_dropped_whole() -> None:
+    """Head-major, reshaped exactly once here. A flat vector whose length does not factor into
+    ``num_heads * n_lags`` is a mis-assembled profile rather than a short one, so it is dropped
+    rather than reshaped into a plausible wrong answer -- the same guard the attention's per-head
+    profile has carried since it was added."""
+    good = lag_summary(
+        Aggregate(
+            lag_profile=[0.1, 0.9, 0.2],
+            attention_profile=[0.5, 0.2, 0.3],
+            kld_per_head=[1.0, 2.0],
+            lag_profile_per_head=[1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+        )
+    )
+    assert good["kl_lag_profile_per_head"] == [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]
+
+    ragged = lag_summary(
+        Aggregate(
+            lag_profile=[0.1, 0.9, 0.2],
+            attention_profile=[0.5, 0.2, 0.3],
+            kld_per_head=[1.0, 2.0],
+            lag_profile_per_head=[1.0, 2.0, 3.0, 4.0, 5.0],
+        )
+    )
+    assert ragged["kl_lag_profile_per_head"] == []
+
+
 def test_the_lag_report_is_empty_when_nothing_was_collected() -> None:
     assert lag_summary(Aggregate()) == {}
 

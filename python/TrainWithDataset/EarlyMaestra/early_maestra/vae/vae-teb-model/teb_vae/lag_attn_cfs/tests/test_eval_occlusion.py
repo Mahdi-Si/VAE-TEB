@@ -36,12 +36,14 @@ import types
 from typing import Any, Dict
 
 import numpy as np
+import pandas as pd
+import pytest
 import torch
 
 from teb_vae.lag_attn_cfs.eval.analyses import REQUIRED_RESULT_KEYS, AnalysisContext
 from teb_vae.lag_attn_cfs.eval.analyses import occlusion as occlusion_analysis
 
-from .conftest import TINY_SEQ_LEN, make_stub_batch
+from .conftest import BATCH, TINY_SEQ_LEN, make_stub_batch
 
 #: A four-band partition of the tiny model's lag window, in the shipped band names. Contiguous and
 #: covering $[0, 8]$ exactly once, which is the shape the production delta has at the production
@@ -61,9 +63,33 @@ EVAL_CONFIG: Dict[str, Any] = {
 }
 
 
-def _context(task=None, loader=None) -> AnalysisContext:
-    """An analysis context carrying only what this analysis reads."""
-    return AnalysisContext(collection=types.SimpleNamespace(), config={}, task=task, loader=loader)
+def _context(task=None, loader=None, collection=None) -> AnalysisContext:
+    """An analysis context carrying only what this analysis reads.
+
+    ``collection`` is the collected per-sample table the clock half joins onto. Absent -- the
+    default, and what most tests here need -- the join records that it had nothing to match
+    against rather than raising.
+    """
+    return AnalysisContext(
+        collection=collection if collection is not None else types.SimpleNamespace(),
+        config={},
+        task=task,
+        loader=loader,
+    )
+
+
+def _collected(guids, epochs, *, classes=None):
+    """A stand-in collection carrying the clinical coordinates the clock half joins for."""
+    frame = pd.DataFrame(
+        {
+            "guid": [str(value) for value in guids],
+            "epoch": [float(value) for value in epochs],
+            "clinical_class": list(classes) if classes is not None else ["hie"] * len(guids),
+            "subgroup": ["hie_severe"] * len(guids),
+            "second_stage_onset": [-1800.0] * len(guids),
+        }
+    )
+    return types.SimpleNamespace(per_sample=frame)
 
 
 class _OneBatchLoader:
@@ -343,6 +369,259 @@ def test_the_analysis_writes_its_tables_and_its_headline(task, tmp_path) -> None
     invariance = record["announcement_invariance"]
     assert invariance["n_batches_checked"] == 1
     assert invariance["max_abs_change"] == 0.0
+
+
+def _horizon_frame(delta_per_step: float = 1.0, n_steps: int = 2):
+    """A per-``(band, horizon step)`` table carrying one known delta per step per band."""
+    return pd.DataFrame(
+        [
+            {
+                "band": name,
+                "lag_lo": span[0],
+                "lag_hi": span[1],
+                "horizon_step": step,
+                "n_anchors": 4,
+                "delta_nats": delta_per_step,
+                "delta_nats_sd": 0.0,
+                "live_fraction": 1.0,
+            }
+            for name, span in TINY_BANDS.items()
+            for step in range(n_steps)
+        ]
+    )
+
+
+def test_each_band_reports_the_spread_a_cap_is_chosen_from() -> None:
+    r"""A band delta quoted alone cannot be compared against another band. The identifiability
+    record separates its winning band by $14.9$ nats against per-band standard deviations of
+    $1.9$--$2.3$ at eight segments, and whether a separation survives is a question only a
+    spread answers -- so the delta and its uncertainty are emitted together.
+
+    Hand-computed here rather than compared against a second implementation: the standard
+    error is what the cap arithmetic $n' = n\,(s/s')^2$ consumes, and a test that recomputed
+    it the same way the code does would agree with a wrong formula.
+    """
+    # Four recordings, chosen so the mean and the sample standard deviation are exact in
+    # binary: mean 5.0, deviations -3, -1, +1, +3, so s = sqrt(20/3).
+    values = [2.0, 4.0, 6.0, 8.0]
+    per_recording = pd.DataFrame(
+        {
+            occlusion_analysis._band_column(name): values
+            for name in TINY_BANDS
+        },
+        index=[f"REC{index}" for index in range(len(values))],
+    )
+
+    summary = occlusion_analysis.build_summary(
+        _horizon_frame(),
+        TINY_BANDS,
+        per_recording=per_recording,
+        n_segments=9,
+        resamples=200,
+        seed=0,
+    )
+
+    expected_se = np.sqrt(20.0 / 3.0) / np.sqrt(4.0)
+    for row in summary.to_dict(orient="records"):
+        assert row["delta_total_se"] == pytest.approx(expected_se), row["band"]
+        # The interval is over RECORDINGS while the cap is in SEGMENTS, so both counts travel
+        # -- a reader converting one into the other cannot do it from either alone.
+        assert row["n_recordings"] == len(values), row["band"]
+        assert row["n_segments"] == 9, row["band"]
+        # A percentile bootstrap of the mean cannot leave the sample's own range.
+        assert min(values) <= row["delta_total_ci_lo"] <= row["delta_total_ci_hi"] <= max(values)
+
+
+def test_a_band_whose_spread_nobody_measured_does_not_report_one() -> None:
+    """``None`` for the per-recording frame is the offline and empty-pass state, and it must
+    read as absent rather than as a spread that was measured and found to be zero. A $0.0$
+    standard error here would say the delta is exact."""
+    summary = occlusion_analysis.build_summary(_horizon_frame(), TINY_BANDS)
+
+    for row in summary.to_dict(orient="records"):
+        assert np.isnan(row["delta_total_se"]), row["band"]
+        assert np.isnan(row["delta_total_ci_lo"]), row["band"]
+        assert np.isnan(row["delta_total_ci_hi"]), row["band"]
+        assert row["n_recordings"] == 0, row["band"]
+        assert row["n_segments"] is None, row["band"]
+        # The delta itself is unaffected: two horizon steps at 1.0 nat each.
+        assert row["delta_total_nats"] == pytest.approx(2.0), row["band"]
+
+
+def test_the_cost_block_says_what_a_larger_cap_would_buy(task, tmp_path) -> None:
+    """The cap on this analysis is the one number in the eval config an operator cannot pick from
+    first principles: it trades wall-clock against the per-band standard error, and both sides are
+    properties of the machine and the checkpoint. So the pass measures its own rate.
+
+    Two of the keys are this analysis's own and they are the ones that matter here. The work is one
+    encode and one single-anchor decode per *arm*, so a cap chosen from a per-sample rate alone
+    would be wrong the moment the band partition changed; ``seconds_per_arm_per_segment`` divides
+    the band count out and ``n_arms`` says what it was divided by.
+
+    The rest of the vocabulary is the collection pass's, to the letter, so that a reader holding
+    both records compares two numbers rather than two conventions.
+    """
+    module = _running_task(task)
+    record = occlusion_analysis.run_occlusion_analysis(
+        _context(task=module, loader=_OneBatchLoader(make_stub_batch(seed=1))),
+        eval_config=EVAL_CONFIG,
+        output_dir=tmp_path,
+    )
+
+    cost = record["cost"]
+
+    # The reference arm plus one per band. The reference is scored through the same function with
+    # no occlusion, so it costs an arm like any other -- an n_arms of len(TINY_BANDS) would mean
+    # the extrapolation forgot the arm every run pays whatever its bands are.
+    assert cost["n_arms"] == 1 + len(TINY_BANDS)
+    assert cost["n_batches"] == 1
+    # One anchor per segment, so the sample count is the batch's own -- not the anchor count
+    # and not the arm count.
+    assert cost["n_samples"] == BATCH
+
+    # Every rate is a positive real. A zero here would not be a fast pass, it would be a timer
+    # that never started or a denominator that was empty.
+    for key in (
+        "elapsed_s",
+        "seconds_per_batch",
+        "samples_per_second",
+        "hours_per_1000_samples",
+        "seconds_per_arm_per_segment",
+        "mean_batch_size",
+    ):
+        assert np.isfinite(cost[key]), key
+        assert cost[key] > 0.0, key
+
+    # The identity the extrapolation rule rests on, which is what makes the two rates one
+    # measurement rather than two independent numbers that could drift.
+    assert cost["seconds_per_arm_per_segment"] == pytest.approx(
+        cost["elapsed_s"] / (cost["n_samples"] * cost["n_arms"])
+    )
+    assert cost["samples_per_second"] == pytest.approx(cost["n_samples"] / cost["elapsed_s"])
+
+    # None rather than 0 off CUDA: the allocator that reports it does not exist here, and a zero
+    # would read as "measured, and the pass used nothing".
+    assert cost["device"] == "cpu"
+    assert cost["peak_allocated_bytes"] is None
+
+    # The note names the other half of the cap decision, so a reader of summary.json alone is not
+    # left choosing a cap on time with no mention of precision.
+    assert "caps.occlusion" in cost["note"]
+
+
+# =================================================================================================
+# The clock half: placing a delta on a clinical axis
+# =================================================================================================
+def test_a_segment_is_identified_by_its_recording_AND_its_start(task, tmp_path) -> None:
+    """``guid`` alone does not identify a segment -- a recording contributes many, which is why
+    the collection pass keys its per-anchor table on ``(guid, epoch, anchor)``. Without ``epoch``
+    a delta here can be reduced per recording and placed on no clock at all."""
+    module = _running_task(task)
+    record = occlusion_analysis.run_occlusion_analysis(
+        _context(task=module, loader=_OneBatchLoader(make_stub_batch(seed=1))),
+        eval_config=EVAL_CONFIG,
+        output_dir=tmp_path,
+    )
+
+    frame = pd.read_csv(
+        tmp_path / occlusion_analysis.ANALYSIS_DIRNAME
+        / occlusion_analysis.PER_RECORDING_FILENAME
+    )
+    assert len(frame)
+    per_sample = pd.read_csv(
+        tmp_path / occlusion_analysis.ANALYSIS_DIRNAME / occlusion_analysis.CLOCK_FILENAME
+    )
+    assert list(occlusion_analysis.JOIN_KEYS) == ["guid", "epoch"]
+    assert record["clocks"]["joined"] is False
+    # Nothing to join against is a recorded state, not a raise: this pass built no collection.
+    assert "empty" in record["clocks"]["reason"]
+    # ... and the table is written with its header regardless.
+    assert list(per_sample.columns)
+
+
+def test_a_batch_with_no_epoch_yields_an_absent_column_rather_than_a_zero_one(task) -> None:
+    """Zero would place every segment at the moment of delivery, which is a coordinate rather than
+    an absence. All-``NaN`` of the right length is what an absent field means everywhere else in
+    this pipeline."""
+    module = _running_task(task)
+    batch = make_stub_batch(seed=1)
+    delattr(batch, "epoch")
+
+    record = occlusion_analysis.collect_batch(
+        module,
+        module.transfer_batch_to_device(batch, module.device, dataloader_idx=0),
+        bands=TINY_BANDS,
+        seed=0,
+    )
+
+    assert len(record["epochs"]) == BATCH
+    assert np.isnan(record["epochs"]).all()
+
+
+def test_the_join_matches_every_scored_segment_and_counts_any_that_did_not(task, tmp_path):
+    """The tripwire. A segment scored here that the collected table does not carry means the two
+    passes drew different populations, and a silently shorter table is exactly how that would go
+    unnoticed -- so it is counted rather than dropped."""
+    module = _running_task(task)
+    batch = make_stub_batch(seed=1)
+    guids = [str(value) for value in batch.guid]
+    epochs = [float(value) for value in batch.epoch]
+
+    matched = occlusion_analysis.run_occlusion_analysis(
+        _context(
+            task=module,
+            loader=_OneBatchLoader(make_stub_batch(seed=1)),
+            collection=_collected(guids, epochs),
+        ),
+        eval_config=EVAL_CONFIG,
+        output_dir=tmp_path / "matched",
+    )
+    assert matched["clocks"]["joined"] is True
+    assert matched["clocks"]["n_scored"] == BATCH
+    assert matched["clocks"]["n_unjoined"] == 0
+
+    # One epoch moved: that segment can no longer be matched, and the census says so rather than
+    # the table simply being one row shorter.
+    moved = list(epochs)
+    moved[0] = moved[0] - 12345.0
+    mismatched = occlusion_analysis.run_occlusion_analysis(
+        _context(
+            task=module,
+            loader=_OneBatchLoader(make_stub_batch(seed=1)),
+            collection=_collected(guids, moved),
+        ),
+        eval_config=EVAL_CONFIG,
+        output_dir=tmp_path / "mismatched",
+    )
+    assert mismatched["clocks"]["n_unjoined"] == 1
+
+
+def test_the_clock_page_makes_no_claim_and_says_so(task, tmp_path) -> None:
+    """One anchor per segment, capped in segments, binned on a half-hour grid: most (class,
+    window) cells fall below the minimum group size a test needs. Means and quartiles are what the
+    data supports, and the record states that rather than leaving a reader to wonder why there is
+    no p-value."""
+    module = _running_task(task)
+    batch = make_stub_batch(seed=1)
+
+    record = occlusion_analysis.run_occlusion_analysis(
+        _context(
+            task=module,
+            loader=_OneBatchLoader(make_stub_batch(seed=1)),
+            collection=_collected(
+                [str(value) for value in batch.guid],
+                [float(value) for value in batch.epoch],
+            ),
+        ),
+        eval_config=EVAL_CONFIG,
+        output_dir=tmp_path,
+    )
+
+    note = record["clocks"]["note"]
+    assert "descriptive only" in note
+    assert "no Kruskal-Wallis" in note
+    assert "no new family" in note
+    assert [name for name in record["files"] if "significance" in name] == []
 
 
 def test_the_caveat_travels_with_the_number(task, tmp_path) -> None:

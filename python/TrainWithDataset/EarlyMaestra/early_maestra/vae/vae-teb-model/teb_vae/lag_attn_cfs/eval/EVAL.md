@@ -758,6 +758,37 @@ prior, so the mean half of $\mathrm{KL}(q^\varnothing \Vert p)$ is a function of
 and no prior-side clock can appear in it. The informative quantity is therefore the difference and
 its interval, not the ratio.
 
+**The same difference, resolved by lag.** The null arm already produces its own attention over the
+lags — the query is the prior's mean, unchanged, but the keys are the null encode's — so the
+head-structured attribution can be built for it from tensors the matched pass already had, at no
+extra forward. Subtracting it from the matched attribution bin by bin gives the **clock-excess**
+profile, and
+
+$$\sum_\ell \Delta_\ell \;=\; \texttt{coupling\_minus\_clock},$$
+
+which is the scalar `clock_margin_min_nats` gates. That identity is what makes this a decomposition
+of the gated quantity rather than a second lag reading that happens to have a clock subtracted, and
+it is **measured** on every run: `null_lag_map_sums_to_kl` is a third structural identity in the
+sanity block, checked separately from the matched one because the null arm's attention is its own.
+
+This is the only lag profile in a run with the availability staircase removed. The staircase is a
+deterministic function of $t$ and is readable from the source state at *any* lag, so it enters the
+matched attribution wherever the attention happens to sit; no renormalisation of the matched
+profile removes it, and only an arm carrying the clock and no source content can.
+
+`source_null_lag_profile.csv` carries one row per lag — both arms, their signed difference, its
+rectified part, the band each lag falls in and whether the delta mask kept it. The `lag` block adds
+the run-level selection: the clock-excess argmax and its peak share, the degeneracy verdict, the
+rectified fraction, the per-band shares, and the mask — or, where the profile is degenerate, no
+mask and the sentence saying why. Four of those reach the headline.
+
+**Two things a reader must carry.** The profile is **signed**, so only the signed sum is the gated
+scalar and the rectified total is an *upper bound* on it, larger by exactly the negative mass;
+`rectified_frac` is that gap. And the delta mask is **withheld** whenever the clock-excess profile
+is degenerate — `entmax15` assigns lags exactly zero, so a flat profile still has a confident
+argmax, and a mask cut from one would name a band the run has no evidence for. A withheld mask is
+a measurement; the geometry-fixed `occlusion_bands` remain the selection that needs no estimate.
+
 ### occlusion
 
 **When did the source matter?** — asked by intervening rather than by reading attention weights. The
@@ -808,6 +839,48 @@ reported as a finding and the second because it would name a wider band than it 
 schema default — records the analysis as a skip. `caps.occlusion` bounds how many **segments** are
 re-encoded rather than how many anchors are retained, because this analysis scores one anchor per
 segment; removing the key means every segment.
+
+**Choosing `caps.occlusion` from a measurement rather than a guess.** The cap trades wall-clock
+against the per-band standard error, and both sides are properties of the machine and the
+checkpoint rather than of this pipeline — so the pass measures its own. Two blocks carry it: `cost`
+holds the rates, and every row of `bands` now holds `n_segments`, `n_recordings`, `delta_total_se`
+and `delta_total_ci_lo`/`delta_total_ci_hi`.
+
+1. Run once against the real checkpoint with `caps: {occlusion: 64}`.
+2. Read `results.occlusion.cost.hours_per_1000_samples` and
+   `results.occlusion.bands[*].delta_total_se`.
+3. Take whichever of the two binds:
+   * **time** — `cap_time = target_hours * 1000 / hours_per_1000_samples`;
+   * **precision** — `cap_precision = 64 * (se_observed / se_wanted)^2`, because the standard error
+     falls as $1/\sqrt{n}$, so halving it costs four times the segments.
+4. Set the result in the committed override delta, **never** in `RUN_ARGS`: a value injected from
+   Python appears in no artifact and cannot be recovered from the run afterwards.
+
+`cost.seconds_per_arm_per_segment` is the rate to extrapolate with whenever the **band count**
+changes, because the work is one encode and one single-anchor decode per *arm* and an arm is the
+reference plus one per band; `hours_per_1000_samples` alone would make a band count look like a
+property of the dataset. The two counts beside it differ in unit and both are needed: the interval
+is taken over **recordings**, for the reason `bootstrap_resamples` states for every other interval
+here, while the cap bounds **segments**, because segments are what the loop consumes.
+
+**The deltas are also placed on the two clinical clocks.** `occlusion_clocks.csv` carries, per
+band and per window, the mean per-recording delta with its quartiles — the interventional answer to
+"did the informative past move", against `lag_kld_scaled`'s observational one on the same partition
+and the same grid.
+
+The clinical coordinates come from a **join** onto the collected per-sample table on
+`(guid, epoch)`, not from a second read off the batch. `guid` alone does not identify a segment — a
+recording contributes many, which is why the collection pass keys its per-anchor table on
+`(guid, epoch, anchor)` — and joining picks up the class, the subgroup and the second-stage offset
+at once while guaranteeing this analysis cannot disagree with any other about which class a segment
+belongs to. Both sides read `epoch` through `metrics.batch_field` and the same `float64` cast, so
+the equality is exact; `clocks.n_unjoined` is the tripwire and is zero on a healthy run.
+
+**That page is descriptive only** — no Kruskal-Wallis, no Holm correction, no new family. One
+anchor per segment and a cap in segments means a half-hour window holds tens at best, and most
+(class, window) cells fall below the minimum group size a test needs; a $p$-value there would be a
+correction over cells that mostly could not be tested. Raising `caps.occlusion` is what makes those
+cells readable, which is the second reason the cap procedure above matters.
 
 Like `samples` and `sufficiency`, this analysis reaches for `context.task` and `context.loader`, and
 records a skip without them. That is structural rather than a convenience: an intervention on the
@@ -873,6 +946,60 @@ delta for every class pair that survived; and `lag_<clock>_features.pdf`, the un
 one panel each, solid for the attribution and dashed for the attention. The third is its own page
 rather than more rows on the first because half of what it draws is not in seconds, and a panel
 sharing a figure with a quantity in different units is a panel that will be read against it.
+
+### lag_kld_scaled
+
+**The same lag structure, read on the lags that carry the coupling and with its magnitude kept.**
+`lag_clocks` resolves the profile against both clocks over **all** $L$ lags and through statistics
+that are functions of $p_\ell = w_\ell / \sum_k w_k$ alone. On this family both are limitations
+rather than conventions: two thirds of the attribution is an availability clock readable at every
+lag, the scale that would distinguish "the informative past moved" from "there is less of it" is
+divided out, and the heads are averaged into one profile that one latent group dominates. This
+analysis is those three answers, on the same $0.5$ h grid, **beside** `lag_clocks` rather than
+replacing it — that analysis's columns are untouched.
+
+**Four families of source, and the first two are the selection.**
+
+- **The geometry-fixed bands**, from `occlusion_bands`. Nothing about them is estimated from the
+  KL, so a statistic on a band is free of the circularity that makes a top-$K$-by-KL selection test
+  its own selector. They are also the *same* partition `occlusion` removes source from, so a band
+  names one lag range across the run and the observational and interventional pages are read
+  against each other by filtering rather than by aligning two four-way splits by eye.
+- **The soft weight**, $\omega_\ell = \Delta^+_\ell / \max_k \Delta^+_k$, from the pooled
+  clock-excess profile `source_null` reports. Computed **once at run level** and applied
+  identically to every segment, window and class — a per-segment weight would let each segment
+  choose its own lag axis, and a comparison across segments would then compare different axes.
+  Withheld entirely when that profile is degenerate.
+- **The full support**, carrying `total_nats` and `peak_nats` only. The twelve scale-free
+  statistics on the full support are `lag_clocks`' own columns and are not restated here.
+- **The heads**, each head's own $K^{(m)}\alpha^{(m)}_\ell$, which sums over $m$ to the pooled
+  attribution exactly.
+
+**`near_mass` and `far_mass` are absent from every banded source, and the absence is a
+measurement.** Both are measured from the axis's own start, so on a band they would silently mean
+"within `NEAR_SECONDS` of *the band's* start", and `far_mass` would be identically zero on any band
+narrower than `FAR_SECONDS` — three of the four shipped ones. Four columns of structural zeros
+presented as measurements is worse than four absent columns.
+
+**Nothing here is tested.** Every feature ships untested, so this analysis adds **no** Holm family
+to the four `lag_clocks` carries, and it writes no significance or pairwise table at all. At the
+clock-exceeding coupling this family has measured — $0.160$ nats over $91$ lags on the diagnosed
+run — per-segment restricted centroids are very likely noise, and correcting eight new families
+over noise is how a family-wise correction stops being believed. The record says so in
+`no_inference_note` rather than leaving a reader to infer that a $p$-value was withheld; promoting
+a feature is one flag.
+
+**The emission is long-form**: `source` and `statistic` are row keys, not columns. That is what
+lets `num_heads` be a run property and a band be added without widening a table.
+
+Three outputs — `lag_kld_scaled_per_recording.csv`, `lag_kld_scaled_trajectory.csv` and
+`lag_kld_scaled_selection.csv` — plus one figure per clock. The selection table is the run's
+durable record of which lags were kept and with what weight: a selection reconstructed later from
+a re-run is not the selection the numbers beside it were chosen with.
+
+`occlusion_bands` is therefore read by **two** analyses. Emptying it to skip the interventional
+pass also removes this analysis's selection, and this one records a named skip rather than
+silently emitting its unrestricted half.
 
 ### spectral_skill
 

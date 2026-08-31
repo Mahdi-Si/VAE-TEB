@@ -366,6 +366,7 @@ def test_the_sanity_block_carries_the_checks_this_cell_can_actually_evaluate() -
         "argmax_lag",
         "lag_map_sums_to_kl",
         "per_head_kl_sums_to_kl",
+        "null_lag_map_sums_to_kl",
         "per_file_counts",
         "classes_present",
         "target_not_truncated",

@@ -34,6 +34,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Mapping, Tuple
 
 from teb_vae.lag_attn_cfs.eval.analyses import lag_clocks as lag_clocks_analysis
+from teb_vae.lag_attn_cfs.eval.analyses import lag_kld_scaled as lag_kld_scaled_analysis
 from teb_vae.lag_attn_cfs.eval.analyses import occlusion as occlusion_analysis
 from teb_vae.lag_attn_cfs.eval.analyses import source_null as source_null_analysis
 from teb_vae.lag_attn_cfs.eval.analyses import spectral_skill as spectral_skill_analysis
@@ -202,6 +203,11 @@ EXTRA_ANALYSES: Dict[str, Any] = {
     # rather than a dependency: the lag structure against time before delivery and against the
     # second-stage onset, beside the two clocks that resolve the coupling magnitude.
     "lag_clocks": lag_clocks_analysis.run_lag_clocks_analysis,
+    # Immediately after it, because it is the same question asked of a selection rather than of
+    # the whole window and the two pages are read together: the scale the clocks' statistics
+    # divide out, the lags a geometry-fixed partition says are worth asking about, and the heads
+    # the pooled profile averages. Reads the tables and the vector sidecar only.
+    "lag_kld_scaled": lag_kld_scaled_analysis.run_lag_kld_scaled_analysis,
     # Last of the four: it is the only one whose input is a file another step wrote, the kept-axis
     # channel map, so it reads rather than produces.
     "spectral_skill": spectral_skill_analysis.run_spectral_skill_analysis,
@@ -235,6 +241,25 @@ HEADLINE_SCALARS: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
     ("coupling_minus_clock_nats", ("source_null", "difference", "coupling_minus_clock_nats")),
     ("coupling_minus_clock_ci_lo", ("source_null", "difference", "ci_lo")),
     ("coupling_minus_clock_ci_hi", ("source_null", "difference", "ci_hi")),
+    # ... and the same quantity resolved by lag. Four scalars rather than one, because a peak
+    # position is unreadable alone on this axis: the share says how concentrated the peak is, the
+    # degeneracy flag says whether the position means anything at all -- entmax15 assigns lags
+    # exactly zero, so a flat profile still has a confident argmax -- and the rectified fraction
+    # says how much signed mass had to be discarded to take a share in the first place.
+    #
+    # Band-INDEPENDENT paths on purpose: the band shares are keyed by a name an operator chooses
+    # in `occlusion_bands`, so a headline path into them would break on any run that renamed one.
+    # The shares stay in the analysis block, where a reader has the partition beside them.
+    (
+        "clock_excess_argmax_lag_step",
+        ("source_null", "lag", "clock_excess_argmax_lag_step"),
+    ),
+    ("clock_excess_peak_share", ("source_null", "lag", "clock_excess_peak_share")),
+    ("clock_excess_degenerate", ("source_null", "lag", "clock_excess_degenerate")),
+    (
+        "clock_excess_rectified_frac",
+        ("source_null", "lag", "clock_excess_rectified_frac"),
+    ),
     ("pred_gap_warm_lo_nats", ("warmup", "headline", "pred_gap_warm_lo_nats")),
     ("pred_gap_warm_mid_nats", ("warmup", "headline", "pred_gap_warm_mid_nats")),
     ("pred_gap_warm_hi_nats", ("warmup", "headline", "pred_gap_warm_hi_nats")),

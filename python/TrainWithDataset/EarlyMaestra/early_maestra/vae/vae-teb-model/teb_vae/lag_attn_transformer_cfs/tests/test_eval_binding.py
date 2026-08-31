@@ -231,7 +231,7 @@ def test_the_extra_analyses_and_headline_scalars_are_the_parents_objects() -> No
     # INPUT, which is a question about the source pathway rather than about the encoder that reads
     # it, so a second registration here would be a second copy of one question.
     assert set(TRF_CFS_BINDING.extra_analyses) == {
-        "warmup", "source_null", "occlusion", "lag_clocks", "spectral_skill",
+        "warmup", "source_null", "occlusion", "lag_clocks", "lag_kld_scaled", "spectral_skill",
     }
     assert TRF_CFS_BINDING.headline_scalars != ()
 

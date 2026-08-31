@@ -395,6 +395,12 @@ LAG_IDENTITIES: Dict[str, Tuple[str, str]] = {
         "per_head_kl_sums_to_kl_max_abs_nats",
         "the per-head KL sums over heads to the per-step KL it decomposes",
     ),
+    "null_lag_map_sums_to_kl": (
+        "null_lag_map_sums_to_kl_max_abs_nats",
+        "the source-null arm's per-lag attribution sums over lags to the null per-step KL, "
+        "which is what makes the clock-excess profile the per-lag decomposition of "
+        "coupling_minus_clock rather than a difference of two differently normalised readings",
+    ),
 }
 
 #: Named in the failure message of both checks above. Attention dropout is the one mechanism that
@@ -596,13 +602,20 @@ def identity_tolerance_for(scale: Optional[float]) -> float:
 
 
 def check_lag_identity(results: Dict[str, Any], name: str) -> Dict[str, Any]:
-    r"""One of the two structural lag identities, measured on this run's own worst anchor.
+    r"""One of the structural lag identities, measured on this run's own worst anchor.
 
-    Both hold exactly in real arithmetic -- $\sum_\ell \widetilde K_{t,\ell} = K_t$ because each
-    head's attention sums to one, and $\sum_m K^{(m)}_t = K_t$ because the latent groups are
-    head-aligned -- so the residual reported here is float32 accumulation and nothing else. A
-    residual above :data:`IDENTITY_TOLERANCE` means one of the two structural facts stopped being
-    true, and the message names the mechanism that would do it.
+    All of them hold exactly in real arithmetic -- $\sum_\ell \widetilde K_{t,\ell} = K_t$ because
+    each head's attention sums to one, $\sum_m K^{(m)}_t = K_t$ because the latent groups are
+    head-aligned, and the same pair on the source-null arm because that arm re-poses the posterior
+    through the identical head-structured attribution -- so the residual reported here is float32
+    accumulation and nothing else. A residual above :data:`IDENTITY_TOLERANCE` means one of those
+    structural facts stopped being true, and the message names the mechanism that would do it.
+
+    The null arm's identity is checked separately from the matched one rather than assumed to
+    follow from it: it is a **different** attention, computed against a zeroed source encode, so
+    its rows summing to one is its own property. The clock-excess profile is the difference of the
+    two attributions, and a violation on either side would leave that difference something other
+    than the per-lag decomposition of ``coupling_minus_clock``.
 
     Args:
         results: The accumulated results, read for the lag block's residuals.
