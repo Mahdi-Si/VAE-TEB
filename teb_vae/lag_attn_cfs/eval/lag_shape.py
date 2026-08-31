@@ -91,6 +91,14 @@ STATISTIC_KEYS: Tuple[str, ...] = (
     "peak_mass",
     "peak_degenerate",
     "zero_fraction",
+    # The two scale-carrying ones, and they are last because they are a different KIND of
+    # statistic: the twelve above are computed from $p_\ell = w_\ell / \sum_k w_k$ and are
+    # therefore invariant to the profile's magnitude, so two windows with identical shape and
+    # ten-fold different coupling reduce identically. These two carry the magnitude the others
+    # divide out, which is what lets "the informative past moved closer" be told apart from
+    # "there is less of it".
+    "total_nats",
+    "peak_nats",
 )
 
 
@@ -112,6 +120,14 @@ def peak_width(profile: Sequence[float], *, fraction: float = PEAK_FRACTION) -> 
     Returns:
         The argmax, the peak value, the inclusive bin bounds of the peak, and its width in bins.
         All ``None`` on an empty or non-finite profile.
+
+    .. warning::
+
+        ``"peak"`` here is the peak's **value**. :func:`profile_statistics` returns ``"peak"`` as
+        the peak's **position in seconds**, and ``"peak_nats"`` for this value. The two meanings
+        of one word are a live trap -- nothing raises if they are swapped, and the row-by-row
+        equality test between the two functions did not compare them until ``peak_nats`` existed
+        to compare against.
     """
     values = np.asarray(list(profile), dtype=np.float64)
     if values.size == 0 or not np.isfinite(values).any():
@@ -255,6 +271,142 @@ def degeneracy(profile: Sequence[float]) -> Dict[str, Any]:
 
 
 # =================================================================================================
+# Restricting a profile, and reading a signed one
+# =================================================================================================
+def restrict_to_band(
+    rows: Any, seconds: np.ndarray, band: Tuple[int, int]
+) -> Tuple[np.ndarray, np.ndarray]:
+    r"""Cut a profile and its axis down to one inclusive lag band.
+
+    The point of restricting is that a statistic taken over the whole window is diluted by the
+    lags that carry nothing: at the shipped geometry $91$ bins are reduced together, and the
+    diagnosed run put $67.5\%$ of the KL in a clock that is readable at every one of them. A
+    statistic on a band is the same reduction asked of the lags a partition says are worth asking
+    about.
+
+    **Two statistics must not be taken on the result, and this function cannot stop them.**
+    ``near_mass`` and ``far_mass`` are measured from ``seconds[0]``, so on a band they silently
+    become "within $60$ s of *the band's* start" and, for any band narrower than
+    :data:`FAR_SECONDS`, an identically zero column. The caller decides which statistics a
+    restricted source carries; see the ``restrictable`` flag on the analysis that does.
+
+    Args:
+        rows: The profiles, $(n, L)$ or $(L,)$.
+        seconds: The compensated axis, $(L,)$.
+        band: The inclusive lag band $[\ell_{\mathrm{lo}}, \ell_{\mathrm{hi}}]$.
+
+    Returns:
+        ``(restricted_rows, restricted_seconds)``, the second $(\ell_{hi} - \ell_{lo} + 1,)$.
+
+    Raises:
+        ValueError: If the band is empty or reaches past the axis. Both are refused rather than
+            clipped, and for the reason
+            :func:`~teb_vae.lag_attn_cfs.eval.config_schema._validate_occlusion_bands` refuses
+            them at config load: a silently clipped band would be reported under a name that
+            overstates what it measured, and an empty one would report a row of zeros as a finding.
+    """
+    values = np.asarray(rows, dtype=np.float64)
+    axis = np.asarray(seconds, dtype=np.float64)
+    low, high = int(band[0]), int(band[1])
+    if low > high:
+        raise ValueError(
+            f"the lag band [{low}, {high}] is empty (lo > hi), so it would restrict to no bins "
+            f"and report a row of zeros as a measurement."
+        )
+    if low < 0 or high >= axis.size:
+        raise ValueError(
+            f"the lag band [{low}, {high}] reaches past the {axis.size}-bin lag axis, which runs "
+            f"over [0, {axis.size - 1}]. A clipped band would be reported under a name that "
+            f"overstates the lags it measured."
+        )
+    sliced = values[..., low : high + 1]
+    return sliced, axis[low : high + 1]
+
+
+def band_mass(profile: Sequence[float], band: Tuple[int, int]) -> Dict[str, Any]:
+    r"""How much of a profile's mass sits inside one inclusive lag band.
+
+    A plain sum over an interval, and deliberately not part of the shape vocabulary above: those
+    functions describe a profile against *itself*, while a band is a statement made from outside it
+    -- a partition of the window, or the lags a planted delay is known to occupy. The two are read
+    together and must not be confused, which is why the band is an argument rather than a property.
+
+    Non-finite bins are dropped from both the numerator and the denominator, for the reason every
+    other function here drops them: a lag that was never measured and a lag the source never
+    attended to are different statements.
+
+    Args:
+        profile: One value per lag.
+        band: The inclusive lag band.
+
+    Returns:
+        The mass inside the band, its share of the profile's total, and how many bins it spans.
+        The share is ``NaN`` when the profile carries no positive total -- never $0$, which would
+        read as a band that was measured and found empty.
+    """
+    values = np.asarray(list(profile), dtype=np.float64)
+    finite = np.where(np.isfinite(values), values, 0.0)
+    low, high = max(int(band[0]), 0), min(int(band[1]) + 1, finite.size)
+    inside = finite[low:high] if high > low else finite[:0]
+    total = float(finite.sum())
+    return {
+        "nats": float(inside.sum()),
+        "share": float(inside.sum() / total) if finite.size and total > 0.0 else float("nan"),
+        "n_bins": int(inside.size),
+    }
+
+
+def rectified_profile(rows: Any) -> Tuple[np.ndarray, Dict[str, Any]]:
+    r"""Split a **signed** profile into its positive part and a record of what that discarded.
+
+    The clock-excess attribution
+    $\Delta_\ell = \widetilde K_\ell - \widetilde K^{\mathrm{null}}_\ell$ is signed: the null
+    arm re-poses the posterior against a zeroed source, so its attention is its own and can exceed
+    the matched arm's at a lag. :func:`profile_statistics` refuses a negative bin outright, and
+    that refusal is not defensive -- $p_\ell = w_\ell / \sum_k w_k$ is the precondition for the
+    entropy, the quantiles and the mass shares, and a negative bin makes the cumulative sum
+    non-monotone and the entropy a log of a negative number. So the reducer is left alone and the
+    signed profile is rectified before it reaches one.
+
+    $\Delta^+_\ell = \max(\Delta_\ell, 0)$ is the honest reading rather than a convenience: a
+    lag at which the null exceeds the matched arm carries no clock-exceeding coupling, and zero is
+    "none here", not "a negative amount of information".
+
+    **What is lost is reported rather than dropped.** $\sum_\ell \Delta^+_\ell$ is an *upper
+    bound* on $\sum_\ell \Delta_\ell = $ ``coupling_minus_clock``, not a partition of it, so a
+    rectified total quoted as though it were the gated scalar would overstate it by exactly
+    ``negative_nats``. ``rectified_frac`` is how large that overstatement is relative to what
+    survived, and a large value means the two arms' attentions point in materially different
+    directions.
+
+    Args:
+        rows: The signed profiles, $(n, L)$ or $(L,)$.
+
+    Returns:
+        ``(positive, record)`` -- the rectified profiles at the input's own shape, and the census:
+        ``positive_nats``, ``negative_nats`` (signed, so it is $\le 0$), ``net_nats``,
+        ``rectified_frac`` and ``n_rows_with_negative_bin``.
+    """
+    values = np.asarray(rows, dtype=np.float64)
+    finite = np.where(np.isfinite(values), values, 0.0)
+    positive = np.maximum(finite, 0.0)
+    positive_nats = float(positive.sum())
+    negative_nats = float(np.minimum(finite, 0.0).sum())
+    matrix = finite if finite.ndim == 2 else finite.reshape(1, -1)
+    return np.where(np.isfinite(values), positive, np.nan), {
+        "positive_nats": positive_nats,
+        "negative_nats": negative_nats,
+        "net_nats": positive_nats + negative_nats,
+        # Against what survived rather than against the net, so it stays finite and readable when
+        # the net is near zero -- which is exactly the case a reader most needs it in.
+        "rectified_frac": (
+            abs(negative_nats) / positive_nats if positive_nats > 0.0 else float("nan")
+        ),
+        "n_rows_with_negative_bin": int((matrix < 0.0).any(axis=1).sum()),
+    }
+
+
+# =================================================================================================
 # A stack of profiles at once: every statistic, one pass
 # =================================================================================================
 def _blank(count: int) -> Dict[str, np.ndarray]:
@@ -289,6 +441,13 @@ def profile_statistics(
     all -- a bimodal profile has an ordinary centroid and an ordinary spread, and only $H_i$ says it
     is not a single lump. The peak family says where the tallest bin is, and is reported only beside
     :data:`STATISTIC_KEYS`' ``peak_degenerate``, which says whether that position means anything.
+
+    **A fourth family carries the scale the other three divide out.** Every statistic above is a
+    function of $p_{i\ell}$ alone, so a profile and ten times that profile reduce identically --
+    which is the right convention for a question about *where* the mass sits and the wrong one for
+    a trajectory, where a window whose coupling collapsed and a window whose coupling merely moved
+    are different findings. ``total_nats`` $= \sum_\ell w_{i\ell}$ and ``peak_nats``
+    $= \max_\ell w_{i\ell}$ are those two readings, in the profile's own units.
 
     **Non-finite bins are dropped from the mass, not treated as zero.** A lag whose value was never
     measured and a lag the source never attended to are different statements, and the second would
@@ -440,6 +599,13 @@ def profile_statistics(
         "peak_mass": peak_mass,
         "peak_degenerate": degenerate,
         "zero_fraction": zero_fraction,
+        # The magnitude the twelve above divide out. ``total`` is the finite mass before
+        # normalisation -- the same sum the shares were formed against -- so on the KL attribution
+        # it is that segment's own contribution in nats and not a re-derived quantity.
+        "total_nats": total,
+        # The peak's HEIGHT, in the profile's own units. ``peak`` above is its POSITION in
+        # seconds; see the warning on :func:`peak_width`, whose ``"peak"`` is this value.
+        "peak_nats": np.where(np.isfinite(peak_value), peak_value, np.nan),
     }
     statistics = {
         key: np.where(usable, np.asarray(value, dtype=np.float64), np.nan)

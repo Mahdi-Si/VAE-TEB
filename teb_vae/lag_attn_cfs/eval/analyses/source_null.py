@@ -39,12 +39,27 @@ its interval crosses zero, so the mean is precisely the statistic that cannot de
 """
 from __future__ import annotations
 
+import math
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+import numpy as np
 import pandas as pd
 
+from teb_vae.lag_attn_cfs.eval import figures_seam
 from teb_vae.lag_attn_cfs.eval._reuse import figures, stats as shared_stats
+from teb_vae.lag_attn_cfs.eval.lag_axis import (
+    COEFFICIENT_LAG_AXIS_LABEL,
+    GROUP_DELAY_CAVEAT,
+    compensated_seconds_axis,
+)
+from teb_vae.lag_attn_cfs.eval.lag_shape import (
+    PEAK_FRACTION,
+    band_mass,
+    degeneracy,
+    peak_width,
+    rectified_profile,
+)
 from teb_vae.lag_attn_cfs.eval.frames import (
     describe,
     finite_column,
@@ -62,6 +77,35 @@ ANALYSIS_DIRNAME = "source_null"
 PER_RECORDING_FILENAME = "source_null_per_recording.csv"
 SUMMARY_FILENAME = "source_null_summary.csv"
 DISTRIBUTION_FIGURE = "source_null_difference"
+
+#: The lag-resolved half. One row per lag, and the run's durable record of which lags the
+#: clock-excess selection kept -- a mask reconstructed later from a re-run is not the mask the
+#: numbers beside it were chosen with.
+LAG_PROFILE_FILENAME = "source_null_lag_profile.csv"
+LAG_PROFILE_FIGURE = "source_null_lag_profile"
+
+#: The statement every rectified total carries. It is the one thing a reader can get wrong here
+#: and the arithmetic does not announce: rectification only ever adds, so the positive total is an
+#: upper bound on the signed one, and the signed one is the gated scalar.
+RECTIFICATION_CAVEAT = (
+    "the clock-excess profile is SIGNED -- the null arm re-poses the posterior against a zeroed "
+    "source, so its attention is its own and can exceed the matched arm's at a lag. Only the "
+    "signed sum equals coupling_minus_clock; the rectified (positive) total is an UPPER BOUND on "
+    "it, larger by exactly the negative mass. A band share is taken of the positive part, because "
+    "a share of a signed vector is not a share -- so the shares below partition the positive mass "
+    "and not the gated scalar. rectified_frac is how much was discarded relative to what survived"
+)
+
+#: Why the mask is guarded rather than always emitted, in the record beside the mask itself.
+MASK_GUARD_NOTE = (
+    "the delta mask is the contiguous run of bins around the clock-excess peak at or above "
+    f"{PEAK_FRACTION:g} of it -- lag_shape.peak_width's own definition, so no threshold is "
+    "invented here. It is withheld entirely when the clock-excess profile is degenerate, because "
+    "entmax15 assigns lags exactly zero and a flat or nearly empty profile still has a perfectly "
+    "confident argmax: a mask cut from one would name a band the run has no evidence for. A "
+    "withheld mask is a measurement, not a failure -- the geometry-fixed bands remain the "
+    "selection that needs no estimate"
+)
 
 #: The matched coupling readout and the null beside it, in the order the difference is taken.
 COUPLING_COLUMN = "source_conditioned_kl_raw"
@@ -260,6 +304,273 @@ def build_difference_figure(
     return figure
 
 
+# =================================================================================================
+# The lag-resolved half: where in the past the coupling exceeded the availability clock
+# =================================================================================================
+def _finite_or_none(value: Any) -> Optional[float]:
+    """A float for the headline, or ``None`` where there is no number.
+
+    ``None`` and not ``NaN``, and the distinction is enforced rather than stylistic: the headline
+    finiteness check treats a non-finite *number* as a failed run and ``None`` as an analysis that
+    did not report. A ``NaN`` here would fail every run whose clock-excess profile was not
+    measured, which is a configuration state rather than a defect.
+    """
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def delta_mask(positive: Sequence[float], shape: Dict[str, Any]) -> Tuple[
+    Optional[Tuple[int, int]], str
+]:
+    r"""The lag band the clock-excess profile itself nominates, or a stated refusal.
+
+    The contiguous run around the peak at or above :data:`PEAK_FRACTION` of it -- which is exactly
+    :func:`~teb_vae.lag_attn_cfs.eval.lag_shape.peak_width`, reused rather than reimplemented so
+    that "the peak" means one thing across this package and no threshold is invented here.
+
+    **Withheld entirely when the profile is degenerate**, and that is the load-bearing half. This
+    family's diagnosed run put $67.5\%$ of its KL in an availability clock and $0.160$ nats of
+    source content across $91$ lags; a mask cut from a profile that flat would name a band on
+    arithmetic accident, and it would look exactly like a finding. The guard firing is a result to
+    report, not a failure to route around.
+
+    Args:
+        positive: The rectified clock-excess profile.
+        shape: What :func:`~teb_vae.lag_attn_cfs.eval.lag_shape.degeneracy` said about it.
+
+    Returns:
+        ``(band, reason)`` -- the inclusive band and an empty reason, or ``None`` and the sentence
+        saying why there is none.
+    """
+    if not len(positive):
+        return None, "the run carries no clock-excess profile to cut a mask from"
+    if shape.get("degenerate"):
+        reasons = "; ".join(shape.get("reasons") or []) or "the profile has no readable shape"
+        return None, (
+            f"the clock-excess profile is degenerate, so no mask is emitted: {reasons}. "
+            f"The geometry-fixed bands remain the selection that needs no estimate"
+        )
+    peak = peak_width(positive)
+    if peak.get("lo") is None or peak.get("hi") is None:
+        return None, "the clock-excess profile has no readable peak"
+    return (int(peak["lo"]), int(peak["hi"])), ""
+
+
+def lag_profile_frame(
+    lag: Dict[str, Any],
+    seconds: np.ndarray,
+    positive: np.ndarray,
+    mask: Optional[Tuple[int, int]],
+    bands: Dict[str, Tuple[int, int]],
+) -> pd.DataFrame:
+    """Lay the matched arm, the null arm and their difference out as one table, keyed by lag.
+
+    One table rather than three, and keyed by lag rather than by arm, because the question a reader
+    brings to it is always about a *lag*: what did the coupling say here, what did the clock
+    account for here, and what was left.
+
+    Args:
+        lag: The collection pass's lag block.
+        seconds: The compensated axis.
+        positive: The rectified clock-excess profile.
+        mask: The band the profile nominated, or ``None``.
+        bands: The geometry-fixed partition, for the band each lag falls in.
+
+    Returns:
+        One row per lag.
+    """
+    matched = list(lag.get("kl_lag_profile") or [])
+    null = list(lag.get("kl_lag_profile_null") or [])
+    excess = list(lag.get("kl_lag_profile_clock_excess") or [])
+    rows: List[Dict[str, Any]] = []
+    for index, second in enumerate(seconds):
+        # The band a lag belongs to, or empty. Written per row rather than left to a join, so the
+        # observational table and the interventional one can be read against each other directly.
+        member = next(
+            (name for name, span in bands.items() if span[0] <= index <= span[1]), ""
+        )
+        rows.append(
+            {
+                "lag_step": int(index),
+                "compensated_seconds": float(second),
+                "kl_nats": float(matched[index]) if index < len(matched) else float("nan"),
+                "kl_null_nats": float(null[index]) if index < len(null) else float("nan"),
+                "clock_excess_nats": (
+                    float(excess[index]) if index < len(excess) else float("nan")
+                ),
+                "clock_excess_positive_nats": (
+                    float(positive[index]) if index < len(positive) else float("nan")
+                ),
+                "in_delta_mask": bool(mask is not None and mask[0] <= index <= mask[1]),
+                "band": member,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def lag_record(
+    lag: Dict[str, Any], bands: Dict[str, Tuple[int, int]]
+) -> Tuple[Dict[str, Any], np.ndarray, np.ndarray, Optional[Tuple[int, int]]]:
+    """Reduce the clock-excess profile to the block the headline resolves.
+
+    Args:
+        lag: The collection pass's lag block, read off ``collection.results``.
+        bands: The geometry-fixed lag partition.
+
+    Returns:
+        ``(record, seconds, positive, mask)``. The record carries every key on every run --
+        ``None`` where nothing was measured, never ``NaN``, because the headline finiteness check
+        reads a non-finite number as a broken run and a ``None`` as an analysis that did not
+        report.
+    """
+    excess = [float(value) for value in (lag.get("kl_lag_profile_clock_excess") or [])]
+    n_lags = int(lag.get("n_lags") or len(lag.get("kl_lag_profile") or []) or 0)
+    delay_steps = int(lag.get("delay_steps") or 0)
+    seconds = compensated_seconds_axis(n_lags, delay_steps) if n_lags else np.zeros(0)
+
+    if not excess:
+        return (
+            {
+                "measured": False,
+                "reason": (
+                    "the collection pass reported no clock-excess profile, so this run predates "
+                    "the lag-resolved source-null arm or scored no anchors"
+                ),
+                "n_lags": n_lags,
+                "delay_steps": delay_steps,
+                "clock_excess_argmax_lag_step": None,
+                "clock_excess_compensated_seconds": None,
+                "clock_excess_peak_share": None,
+                "clock_excess_degenerate": None,
+                "clock_excess_rectified_frac": None,
+                "net_nats": None,
+                "positive_nats": None,
+                "negative_nats": None,
+                "band_shares": {},
+                "delta_mask": None,
+                "delta_mask_reason": "there is no clock-excess profile to cut a mask from",
+                "mask_guard": MASK_GUARD_NOTE,
+                "rectification_caveat": RECTIFICATION_CAVEAT,
+                "axis_caveat": GROUP_DELAY_CAVEAT,
+            },
+            seconds,
+            np.zeros(0),
+            None,
+        )
+
+    positive, census = rectified_profile(np.asarray(excess, dtype=np.float64))
+    shape = degeneracy(positive)
+    mask, mask_reason = delta_mask(positive, shape)
+    above = peak_width(positive)
+    argmax = above.get("argmax")
+    # The share of the POSITIVE mass in the peak, which is the concentration a positional claim
+    # rests on. Taken through the shared reducer rather than recomputed.
+    from teb_vae.lag_attn_cfs.eval.lag_shape import mass_above
+
+    peak_share = mass_above(positive).get("share")
+    return (
+        {
+            "measured": True,
+            "n_lags": n_lags,
+            "delay_steps": delay_steps,
+            "clock_excess_argmax_lag_step": None if argmax is None else int(argmax),
+            "clock_excess_compensated_seconds": (
+                None if argmax is None or argmax >= seconds.size else float(seconds[argmax])
+            ),
+            "clock_excess_peak_share": _finite_or_none(peak_share),
+            "clock_excess_degenerate": bool(shape["degenerate"]),
+            "clock_excess_rectified_frac": _finite_or_none(census["rectified_frac"]),
+            # The signed sum, which is the gated scalar, beside the two halves it is made of.
+            "net_nats": _finite_or_none(census["net_nats"]),
+            "positive_nats": _finite_or_none(census["positive_nats"]),
+            "negative_nats": _finite_or_none(census["negative_nats"]),
+            # Shares of the POSITIVE mass, on the same partition the interventional readout
+            # removes source from -- so the two instruments' answers are stated on one axis.
+            "band_shares": {
+                name: _finite_or_none(band_mass(positive, span)["share"])
+                for name, span in bands.items()
+            },
+            "delta_mask": None if mask is None else [int(mask[0]), int(mask[1])],
+            "delta_mask_reason": mask_reason,
+            "mask_guard": MASK_GUARD_NOTE,
+            "rectification_caveat": RECTIFICATION_CAVEAT,
+            "axis_caveat": GROUP_DELAY_CAVEAT,
+        },
+        seconds,
+        positive,
+        mask,
+    )
+
+
+def build_lag_figure(
+    frame: pd.DataFrame,
+    record: Dict[str, Any],
+    bands: Dict[str, Tuple[int, int]],
+    seconds: np.ndarray,
+) -> Any:
+    """Draw the two arms in nats and their signed difference beneath, on the compensated axis.
+
+    Two panels rather than one, because the two quantities are on different scales and share only
+    an axis: the arms are totals in nats and the difference is a residual around zero, and drawing
+    them together would make a $0.16$-nat excess a flat line under a $0.49$-nat total.
+
+    Args:
+        frame: The per-lag table.
+        record: The lag record, for the mask and the degeneracy verdict.
+        bands: The geometry-fixed partition, shaded and labelled.
+        seconds: The compensated axis.
+
+    Returns:
+        The figure.
+    """
+    import matplotlib.pyplot as plt
+
+    figure, (top, bottom) = plt.subplots(
+        2, 1, figsize=(9.0, 6.0), sharex=True, gridspec_kw={"height_ratios": [2, 1]}
+    )
+    axis = np.asarray(frame["compensated_seconds"], dtype=np.float64)
+    top.plot(axis, frame["kl_nats"], label="matched: KL(q(z|Y,U) || p(z|Y))")
+    top.plot(axis, frame["kl_null_nats"], label="source-null: the availability clock")
+    top.set_ylabel("nats per anchor")
+    top.legend(loc="upper right", fontsize="small")
+    top.set_title("Where the coupling exceeded the availability clock")
+
+    bottom.axhline(0.0, linewidth=0.8, color="0.4")
+    bottom.plot(axis, frame["clock_excess_nats"], color="C3", label="clock-excess (signed)")
+    bottom.set_ylabel("nats per anchor")
+    bottom.set_xlabel(COEFFICIENT_LAG_AXIS_LABEL)
+
+    # The geometry-fixed partition, shaded on both panels so a reader can place a feature in the
+    # same vocabulary the interventional readout reports its deltas in.
+    for index, (name, span) in enumerate(bands.items()):
+        lo = float(seconds[max(span[0], 0)]) if seconds.size else 0.0
+        hi = float(seconds[min(span[1], seconds.size - 1)]) if seconds.size else 0.0
+        for panel in (top, bottom):
+            panel.axvspan(lo, hi, color="0.9" if index % 2 else "0.95", zorder=0)
+        top.annotate(
+            name, xy=((lo + hi) / 2.0, top.get_ylim()[1]), ha="center", va="top",
+            fontsize="x-small", color="0.35",
+        )
+
+    mask = record.get("delta_mask")
+    if mask and seconds.size:
+        bottom.axvspan(
+            float(seconds[mask[0]]), float(seconds[mask[1]]),
+            color="C3", alpha=0.15, zorder=1, label="delta mask",
+        )
+    bottom.legend(loc="upper right", fontsize="small")
+    if record.get("clock_excess_degenerate"):
+        bottom.annotate(
+            "clock-excess profile is degenerate: no mask emitted",
+            xy=(0.02, 0.05), xycoords="axes fraction", fontsize="small", color="C3",
+        )
+    figures_seam.caveat_note(figure)
+    return figure
+
+
 def run_source_null_analysis(
     context: Any,
     *,
@@ -277,7 +588,8 @@ def run_source_null_analysis(
 
     Returns:
         The protocol's keys, the three metric rows, the flat difference block the acceptance
-        verdict resolves, the two caveats, and the paths written.
+        verdict resolves, the lag-resolved decomposition of that same difference, the two caveats,
+        and the paths written.
     """
     per_sample = context.collection.per_sample
     directory = Path(output_dir) / ANALYSIS_DIRNAME
@@ -296,11 +608,43 @@ def run_source_null_analysis(
             build_difference_figure(per_guid, rows), directory / DISTRIBUTION_FIGURE
         ).name
     )
+
+    # The lag-resolved half. Read off the collection pass's own lag block, which round-trips
+    # through ``collection.json`` -- so this works on an offline re-run against a finished
+    # directory, exactly as the scalar half above does.
+    lag = dict(dict(getattr(context.collection, "results", None) or {}).get("lag") or {})
+    # The geometry-fixed partition, read from the same key the interventional readout removes
+    # source from. Not a second setting: one partition per run means ``near`` names one lag range
+    # in the observational table and in the interventional one.
+    bands = {
+        str(name): (int(span[0]), int(span[1]))
+        for name, span in (eval_config.get("occlusion_bands") or {}).items()
+        if isinstance(span, (list, tuple)) and len(span) == 2
+    }
+    lag_block, seconds, positive, mask = lag_record(lag, bands)
+    written = [PER_RECORDING_FILENAME, SUMMARY_FILENAME, figure_name]
+    if lag_block["measured"]:
+        frame = lag_profile_frame(lag, seconds, positive, mask, bands)
+        frame.to_csv(directory / LAG_PROFILE_FILENAME, index=False)
+        written.append(LAG_PROFILE_FILENAME)
+        written.append(
+            str(
+                figures.render_figure(
+                    build_lag_figure(frame, lag_block, bands, seconds),
+                    directory / LAG_PROFILE_FIGURE,
+                ).name
+            )
+        )
+
     return {
         "n_samples": scored_sample_count(per_sample, DIFFERENCE_COLUMN),
         "composition": {"n_recordings": int(len(per_guid))},
         "plan": {"capped": False, "bootstrap_resamples": resamples, "seed": seed},
         "metrics": rows,
+        # Where in the past the coupling exceeded the availability clock, and which lags a
+        # selection built from it would keep. Every key is present on every run so the headline
+        # paths resolve; see ``lag_record`` for why the unmeasured ones are None and not NaN.
+        "lag": lag_block,
         # The block the availability-clock verdict is decided from; see difference_record for why
         # it is promoted out of the list rather than filtered back out of it.
         "difference": difference_record(rows),
@@ -310,5 +654,5 @@ def run_source_null_analysis(
         "grouped_frames": [
             grouped_frame_entry(ANALYSIS_DIRNAME, PER_RECORDING_FILENAME, GROUPED_METRICS)
         ],
-        "files": [PER_RECORDING_FILENAME, SUMMARY_FILENAME, figure_name],
+        "files": written,
     }

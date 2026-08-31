@@ -1923,6 +1923,11 @@ RUN_ARGS: Dict[str, Any] = {
     #                     forecast cost of zeroing each configured lag band. Needs a checkpoint.
     #   lag_clocks:       Where the informative past sits, against both clinical clocks: the
     #                     centre of mass and the spread of the lag profile per window, tested.
+    #   lag_kld_scaled:   The same lag structure read on the lags that carry the coupling,
+    #                     and with its magnitude kept: the two nats-scale statistics on the
+    #                     full support, every statistic on each geometry-fixed band and on
+    #                     each head, and a run-level clock-excess weighting. Untested by
+    #                     design -- it adds no Holm family and writes no significance table.
     #   spectral_skill:   The forecast gap resolved by the frequency band of the target
     #                     coefficient, joined through the kept-axis channel map.
     #   cross_subgroup:   Do the cohorts actually differ. Kruskal, Holm, then Mann-Whitney, over

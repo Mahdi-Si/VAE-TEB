@@ -52,6 +52,145 @@ SWITCH_KEYS = (
 WRAPPER_EPOCHS = 2
 
 
+#: A synthetic lag block shaped like the finding this fixture exists to qualify: the matched
+#: attribution pinned at the near edge, and a source-null arm that accounts for almost all of it
+#: there -- so the CLOCK-EXCESS profile peaks inside the planted band while the pooled one does
+#: not. Hand-built rather than fitted, because what is asserted below is that the record reports
+#: each readout separately, which is a property of the code and not of any run.
+_SYNTHETIC_N_LAGS = 11
+_SYNTHETIC_BAND = (3, 6)
+_SYNTHETIC_MATCHED = [5.0, 1.0, 0.5, 0.6, 0.7, 0.6, 0.5, 0.2, 0.1, 0.1, 0.1]
+_SYNTHETIC_NULL = [4.9, 0.9, 0.4, 0.1, 0.1, 0.1, 0.1, 0.2, 0.1, 0.1, 0.1]
+
+
+def _synthetic_results():
+    """An ``evaluate``-shaped dict carrying every lag key the record reads."""
+    excess = [m - n for m, n in zip(_SYNTHETIC_MATCHED, _SYNTHETIC_NULL)]
+    return {
+        "lag": {
+            "delay_steps": 0,
+            "n_lags": _SYNTHETIC_N_LAGS,
+            "num_heads": 2,
+            "kl_lag_profile": _SYNTHETIC_MATCHED,
+            "kl_lag_profile_support_corrected": _SYNTHETIC_MATCHED,
+            "kl_lag_profile_untruncated": _SYNTHETIC_MATCHED,
+            "kl_argmax_lag_step_support_corrected": 0,
+            "kl_lag_profile_null": _SYNTHETIC_NULL,
+            "kl_lag_profile_clock_excess": excess,
+            "kl_argmax_lag_step_clock_excess": max(
+                range(_SYNTHETIC_N_LAGS), key=lambda index: max(excess[index], 0.0)
+            ),
+            "kl_lag_anchor_counts": [10.0] * _SYNTHETIC_N_LAGS,
+            "attention_lag_profile_per_head": [
+                [0.5, 0.1, 0.1, 0.05, 0.05, 0.05, 0.05, 0.02, 0.03, 0.03, 0.02],
+                [0.02, 0.03, 0.05, 0.30, 0.25, 0.15, 0.10, 0.04, 0.03, 0.02, 0.01],
+            ],
+            "kl_lag_profile_per_head": [
+                [2.5, 0.5, 0.3, 0.2, 0.2, 0.2, 0.2, 0.1, 0.1, 0.1, 0.1],
+                [0.1, 0.1, 0.2, 0.9, 0.8, 0.5, 0.3, 0.1, 0.1, 0.1, 0.1],
+            ],
+            "attention_entropy_per_head_nats": [1.2, 2.0],
+            "identity_residuals": {},
+        },
+        "readouts": {
+            "source_conditioned_kl_raw": sum(_SYNTHETIC_MATCHED),
+            "kld_source_null": sum(_SYNTHETIC_NULL),
+            "coupling_minus_clock": sum(_SYNTHETIC_MATCHED) - sum(_SYNTHETIC_NULL),
+        },
+        "n_samples": 8,
+        "n_recordings": 8,
+    }
+
+
+def test_the_record_scores_every_lag_readout_and_not_only_the_gated_one() -> None:
+    """The record grew a clock-excess block and a per-head KL column; this asserts they are
+    populated and self-consistent.
+
+    **It does not assert which readout recovered the plant.** That is a measurement, exactly as
+    this file's header says of the pass line itself -- a suite requiring ``recovered_by`` to hold
+    would be red for a real finding or be loosened until it was not.
+    """
+    record = lag_recovery_check.recovery_record(
+        _synthetic_results(),
+        band=_SYNTHETIC_BAND,
+        delay_steps=7,
+        bands={"anchor": (0, 2), "near": (3, 6), "mid": (7, 8), "far": (9, 10)},
+    )
+
+    excess = record["clock_excess"]
+    assert excess["measured"] is True
+    # The identity the whole lag-resolved null exists for, restated at the record's own level: the
+    # signed profile sums to the scalar the availability-clock verdict gates.
+    assert excess["net_nats"] == pytest.approx(
+        _synthetic_results()["readouts"]["coupling_minus_clock"]
+    )
+    # Shares are taken of the POSITIVE part, so they are shares.
+    assert 0.0 <= excess["band_share"] <= 1.0
+    assert set(excess["occlusion_band_shares"]) == {"anchor", "near", "mid", "far"}
+    assert sum(excess["occlusion_band_shares"].values()) == pytest.approx(1.0)
+
+    # Every head carries both readings, so a reader can tell an in-band attention peak from a head
+    # with no KL behind it from one that actually carried the belief movement.
+    assert record["heads"]
+    for head in record["heads"]:
+        assert "kl_argmax_lag_step" in head
+        assert "kl_band_share" in head
+        assert "kl_degenerate" in head
+
+    assert set(record["recovered_by"]) == {
+        "kl_support_corrected",
+        "clock_excess",
+        "any_head_attention",
+        "any_head_kl",
+    }
+
+
+def test_the_pass_line_is_the_one_the_recorded_gates_were_measured_on() -> None:
+    """``recovered`` and the exit code stay wired to the pooled support-corrected argmax alone.
+
+    The new readouts are reported beside it, never folded into it: every gate already written into
+    ``RESULTS.md``'s identifiability table was read on this criterion, and widening it would make
+    those rows incomparable with the next ones rather than extending them.
+    """
+    record = lag_recovery_check.recovery_record(
+        _synthetic_results(), band=_SYNTHETIC_BAND, delay_steps=7
+    )
+
+    # The matched profile peaks at lag 0 -- the near-edge pin -- so the gate fails ...
+    assert record["argmax_support_corrected"] == 0
+    assert record["recovered"] is False
+    # ... and it fails even though another readout on the same block did find the band.
+    assert record["recovered_by"]["kl_support_corrected"] is False
+    assert record["recovered"] is record["recovered_by"]["kl_support_corrected"]
+
+    # With no band partition passed, the planted band's own share is still reported: the partition
+    # is a reading convenience, not a precondition.
+    assert record["clock_excess"]["occlusion_band_shares"] == {}
+    assert record["clock_excess"]["measured"] is True
+
+
+def test_a_run_predating_the_null_profile_reports_it_absent_rather_than_recovered() -> None:
+    """A run directory collected before the source-null arm was lag-resolved is a partial input.
+    ``measured`` false and a NaN share, never a zero share -- a zero would read as a clock-excess
+    profile that was computed and found to put nothing in the band."""
+    import math
+
+    results = _synthetic_results()
+    del results["lag"]["kl_lag_profile_clock_excess"]
+    del results["lag"]["kl_argmax_lag_step_clock_excess"]
+
+    record = lag_recovery_check.recovery_record(
+        results, band=_SYNTHETIC_BAND, delay_steps=7
+    )
+
+    assert record["clock_excess"]["measured"] is False
+    assert math.isnan(record["clock_excess"]["band_share"])
+    assert record["clock_excess"]["degenerate"] is None
+    assert record["recovered_by"]["clock_excess"] is False
+    # And the rendering says so in words rather than printing a NaN table.
+    assert "not measured" in lag_recovery_check.format_recovery(record)
+
+
 @pytest.mark.parametrize("config", PLANTED_CONFIGS)
 def test_both_planted_configs_resolve_and_pin_the_instruments_geometry(config) -> None:
     r"""The instrument's geometry is pinned and must stay pinned, on both cells.

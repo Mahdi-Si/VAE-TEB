@@ -73,13 +73,198 @@ def _per_sample(
     )
 
 
-def _context(per_sample: pd.DataFrame) -> AnalysisContext:
-    """An analysis context with no task and no loader, as an offline re-run has."""
+def _context(per_sample: pd.DataFrame, lag: Optional[dict] = None) -> AnalysisContext:
+    """An analysis context with no task and no loader, as an offline re-run has.
+
+    ``lag`` populates ``collection.results['lag']``, which is where the lag-resolved half reads
+    the two profiles from -- that block round-trips through ``collection.json``, so the lag half
+    works offline exactly as the scalar half does.
+    """
     collection = types.SimpleNamespace(
         per_sample=per_sample, per_anchor=pd.DataFrame(), record={}, retained={},
-        results={}, vectors={},
+        results={"lag": dict(lag)} if lag else {}, vectors={},
     )
     return AnalysisContext(collection=collection, config={})
+
+
+#: A lag block shaped like the finding the lag-resolved null exists to expose: the matched
+#: attribution pinned at the near edge, and a null arm accounting for nearly all of it there, so
+#: the CLOCK-EXCESS profile peaks inside [3, 6] where the matched one does not. Lag 7 is the one
+#: bin where the null exceeds the matched arm, which is what makes the profile signed.
+_MATCHED = [5.0, 1.0, 0.5, 0.6, 0.7, 0.6, 0.5, 0.20, 0.1, 0.1, 0.1]
+_NULL = [4.9, 0.9, 0.4, 0.1, 0.1, 0.1, 0.1, 0.25, 0.1, 0.1, 0.1]
+
+#: The geometry-fixed partition, at the tiny width. The same key the interventional readout reads,
+#: because one partition per run is what makes ``near`` name one lag range in both tables.
+_BANDS = {"anchor": [0, 2], "near": [3, 6], "mid": [7, 8], "far": [9, 10]}
+
+
+def _lag_block(matched=None, null=None) -> dict:
+    """A collection lag block carrying the three profiles the lag half reads."""
+    matched = list(_MATCHED if matched is None else matched)
+    null = list(_NULL if null is None else null)
+    return {
+        "n_lags": len(matched),
+        "delay_steps": 0,
+        "kl_lag_profile": matched,
+        "kl_lag_profile_null": null,
+        "kl_lag_profile_clock_excess": [m - n for m, n in zip(matched, null)],
+    }
+
+
+def _LAG_PER_SAMPLE() -> pd.DataFrame:
+    """Six segments over three recordings, enough for a bootstrap interval to be real.
+
+    The scalar half is not what these tests are about, so the values only have to be finite and
+    to give a positive difference; the lag half reads the collection block, not this table.
+    """
+    # The differences must VARY: the difference figure histograms them, and a constant column
+    # cannot be binned.
+    return _per_sample(
+        [1.0, 1.1, 0.9, 1.2, 1.05, 0.95], [0.60, 0.75, 0.45, 0.70, 0.60, 0.50]
+    )
+
+
+def _lag_config() -> dict:
+    """The eval block the lag half reads: the bootstrap settings plus the band partition."""
+    return {"bootstrap_resamples": 200, "seed": 0, "occlusion_bands": _BANDS}
+
+
+# =================================================================================================
+# The lag-resolved half
+# =================================================================================================
+def test_the_lag_table_decomposes_the_gated_scalar_over_the_lags(tmp_path) -> None:
+    r"""The identity the lag-resolved null exists for, at the table a reader actually opens.
+
+    $\sum_\ell \Delta_\ell = \texttt{coupling\_minus\_clock}$, because the matched profile sums
+    to ``source_conditioned_kl_raw`` and the null one to ``kld_source_null``. That is what makes
+    the per-lag clock-excess a decomposition of the very scalar ``clock_margin_min_nats`` gates,
+    rather than a second lag reading that happens to have a clock subtracted from it.
+    """
+    lag = _lag_block()
+    record = source_null_analysis.run_source_null_analysis(
+        _context(_LAG_PER_SAMPLE(), lag),
+        eval_config=_lag_config(),
+        output_dir=tmp_path,
+    )
+
+    frame = pd.read_csv(
+        tmp_path / source_null_analysis.ANALYSIS_DIRNAME
+        / source_null_analysis.LAG_PROFILE_FILENAME
+    )
+    expected = sum(lag["kl_lag_profile"]) - sum(lag["kl_lag_profile_null"])
+    assert frame["clock_excess_nats"].sum() == pytest.approx(expected, abs=1e-6)
+    assert record["lag"]["net_nats"] == pytest.approx(expected, abs=1e-6)
+
+    # The rectified column is a rectification: never negative, and never larger than the signed
+    # one at any bin.
+    assert (frame["clock_excess_positive_nats"] >= 0.0).all()
+    assert (frame["clock_excess_positive_nats"] >= frame["clock_excess_nats"] - 1e-12).all()
+    # ... and its total is an UPPER bound on the gated scalar, by exactly the discarded mass.
+    assert record["lag"]["positive_nats"] > record["lag"]["net_nats"]
+    assert record["lag"]["positive_nats"] + record["lag"]["negative_nats"] == pytest.approx(
+        record["lag"]["net_nats"]
+    )
+
+
+def test_every_lag_is_labelled_with_the_band_the_intervention_removes_it_in(tmp_path) -> None:
+    """One partition per run. The observational table names the same four bands the occlusion
+    readout scores, so the two pages are read against each other by filtering rather than by
+    aligning two four-way splits by eye."""
+    record = source_null_analysis.run_source_null_analysis(
+        _context(_LAG_PER_SAMPLE(), _lag_block()),
+        eval_config=_lag_config(),
+        output_dir=tmp_path,
+    )
+
+    frame = pd.read_csv(
+        tmp_path / source_null_analysis.ANALYSIS_DIRNAME
+        / source_null_analysis.LAG_PROFILE_FILENAME
+    )
+    assert set(frame["band"]) == set(_BANDS)
+    for name, span in _BANDS.items():
+        assert list(frame.loc[frame["band"] == name, "lag_step"]) == list(
+            range(span[0], span[1] + 1)
+        )
+    # The shares are of the POSITIVE mass, so they partition it.
+    assert sum(record["lag"]["band_shares"].values()) == pytest.approx(1.0)
+
+
+def test_a_readable_clock_excess_profile_nominates_the_band_around_its_peak(tmp_path) -> None:
+    """The secondary selection: the contiguous run at or above half the peak, which is
+    ``lag_shape.peak_width``'s own definition rather than a threshold invented here."""
+    record = source_null_analysis.run_source_null_analysis(
+        _context(_LAG_PER_SAMPLE(), _lag_block()),
+        eval_config=_lag_config(),
+        output_dir=tmp_path,
+    )
+
+    assert record["lag"]["clock_excess_degenerate"] is False
+    assert record["lag"]["delta_mask"] == [3, 6]
+    assert record["lag"]["delta_mask_reason"] == ""
+
+
+def test_a_degenerate_clock_excess_profile_nominates_nothing_and_says_why(tmp_path) -> None:
+    """The guard that matters most, and the one expected to fire on the runs measured so far.
+
+    The diagnosed run put 67.5% of its KL in an availability clock and 0.160 nats of source
+    content across 91 lags. ``entmax15`` assigns lags exactly zero, so a profile that flat still
+    has a perfectly confident argmax -- and a mask cut from it would name a band on arithmetic
+    accident while looking exactly like a finding. A withheld mask is the measurement.
+    """
+    flat = [1.0] * 11
+    record = source_null_analysis.run_source_null_analysis(
+        # A null arm a hair below the matched one at every lag: a positive, perfectly flat excess.
+        _context(_LAG_PER_SAMPLE(), _lag_block(matched=flat, null=[0.9] * 11)),
+        eval_config=_lag_config(),
+        output_dir=tmp_path,
+    )
+
+    assert record["lag"]["clock_excess_degenerate"] is True
+    assert record["lag"]["delta_mask"] is None
+    assert "degenerate" in record["lag"]["delta_mask_reason"]
+    # The refusal names the alternative rather than leaving a reader with nothing.
+    assert "geometry-fixed bands" in record["lag"]["delta_mask_reason"]
+
+
+def test_a_run_predating_the_lag_resolved_null_reports_absent_rather_than_zero(tmp_path) -> None:
+    """A finished directory collected before the null arm was lag-resolved is a partial input.
+
+    Every key is still present, because the headline paths must resolve on every run -- and the
+    unmeasured ones are ``None`` rather than ``NaN``, because the headline finiteness check reads
+    a non-finite NUMBER as a broken run and a ``None`` as an analysis that did not report.
+    """
+    record = source_null_analysis.run_source_null_analysis(
+        _context(_LAG_PER_SAMPLE()), eval_config=_lag_config(), output_dir=tmp_path
+    )
+
+    block = record["lag"]
+    assert block["measured"] is False
+    for key in (
+        "clock_excess_argmax_lag_step",
+        "clock_excess_peak_share",
+        "clock_excess_degenerate",
+        "clock_excess_rectified_frac",
+    ):
+        assert block[key] is None, key
+    # No table and no figure are written for a half that was not measured.
+    assert source_null_analysis.LAG_PROFILE_FILENAME not in record["files"]
+
+
+def test_the_rectification_caveat_travels_with_the_shares_it_qualifies(tmp_path) -> None:
+    """The one thing a reader can get wrong here that the arithmetic does not announce: the
+    positive total is an upper bound on the gated scalar, and the band shares partition the
+    positive mass rather than the scalar."""
+    record = source_null_analysis.run_source_null_analysis(
+        _context(_LAG_PER_SAMPLE(), _lag_block()),
+        eval_config=_lag_config(),
+        output_dir=tmp_path,
+    )
+
+    caveat = record["lag"]["rectification_caveat"]
+    assert "UPPER BOUND" in caveat
+    assert "coupling_minus_clock" in caveat
+    assert "signed" in caveat.lower()
 
 
 # =================================================================================================

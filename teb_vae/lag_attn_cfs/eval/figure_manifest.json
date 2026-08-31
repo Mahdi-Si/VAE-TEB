@@ -36,10 +36,15 @@
     "lag_kl": [
       "lag_kl_profile.pdf"
     ],
+    "lag_kld_scaled": [
+      "lag_kld_scaled_second_stage.pdf",
+      "lag_kld_scaled_time_to_delivery.pdf"
+    ],
     "latent": [
       "kl_spectrum.pdf"
     ],
     "occlusion": [
+      "occlusion_clock_delta.pdf",
       "occlusion_horizon_delta.pdf"
     ],
     "second_stage": [
@@ -49,7 +54,8 @@
       "second_stage_windows_pred_gap.pdf"
     ],
     "source_null": [
-      "source_null_difference.pdf"
+      "source_null_difference.pdf",
+      "source_null_lag_profile.pdf"
     ],
     "spectral_skill": [
       "spectral_skill_bands.pdf"

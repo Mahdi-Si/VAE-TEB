@@ -64,6 +64,10 @@ CELL_SPECIFIC_MODULES: Tuple[str, ...] = (
     "analyses/occlusion.py",
     "analyses/spectral_skill.py",
     "analyses/lag_clocks.py",
+    # The KLD-scaled, band-restricted and per-head reading of the same lag structure. Cell
+    # specific for lag_clocks' reason and one of its own: the sibling has no availability
+    # clock, so it has no clock-excess profile to weight or to select on.
+    "analyses/lag_kld_scaled.py",
     # The profile-shape reducer the clocks analysis is built on. Cell-specific rather than
     # divergent: the sibling has no counterpart to classify it against, because the one-sided
     # bank's compensated lag axis is this cell's alone.

@@ -244,14 +244,21 @@ def test_the_summary_describes_every_profile() -> None:
 # =================================================================================================
 # The identity
 # =================================================================================================
-def test_a_violated_identity_names_dropout_as_the_likely_cause() -> None:
-    """A residual with no explanation beside it costs an afternoon of reading the wrong module."""
+@pytest.mark.parametrize("identity", sorted(report_seam.LAG_IDENTITIES))
+def test_a_violated_identity_names_dropout_as_the_likely_cause(identity: str) -> None:
+    """A residual with no explanation beside it costs an afternoon of reading the wrong module.
+
+    Parametrised over the registry rather than written for one identity: the set grows -- the
+    source-null arm's attribution is the third -- and an identity added without a case here would
+    reach the sanity block with nothing checking that its failure message is readable.
+    """
+    residual_key = report_seam.LAG_IDENTITIES[identity][0]
     record = report_seam.check_lag_identity(
         {
-            "lag": {"identity_residuals": {_MAP_RESIDUAL: 0.5}},
+            "lag": {"identity_residuals": {residual_key: 0.5}},
             "readouts": {"source_conditioned_kl_raw": 1.0},
         },
-        "lag_map_sums_to_kl",
+        identity,
     )
 
     assert record["verdict"] == "fail"

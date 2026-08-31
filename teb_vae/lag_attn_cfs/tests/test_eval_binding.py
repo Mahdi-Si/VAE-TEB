@@ -99,6 +99,7 @@ CELL_SPECIFIC_ANALYSES = (
     "source_null",
     "occlusion",
     "lag_clocks",
+    "lag_kld_scaled",
     "spectral_skill",
 )
 
@@ -110,6 +111,10 @@ CFS_HEADLINE_SCALARS = [
     "coupling_minus_clock_nats",
     "coupling_minus_clock_ci_lo",
     "coupling_minus_clock_ci_hi",
+    "clock_excess_argmax_lag_step",
+    "clock_excess_peak_share",
+    "clock_excess_degenerate",
+    "clock_excess_rectified_frac",
     "pred_gap_warm_lo_nats",
     "pred_gap_warm_mid_nats",
     "pred_gap_warm_hi_nats",
@@ -371,7 +376,17 @@ def test_every_registered_headline_path_resolves_against_the_blocks_the_analyses
                 "coupling_minus_clock_nats": 1.75,
                 "ci_lo": 1.1,
                 "ci_hi": 2.4,
-            }
+            },
+            # The same difference resolved by lag. ``clock_excess_degenerate`` is a BOOL and the
+            # stub carries it as one deliberately: the headline finiteness check exempts bools
+            # explicitly, so a builder that coerced it to a float would turn "this profile has no
+            # readable shape" into a 0.0 that reads as a measured share.
+            "lag": {
+                "clock_excess_argmax_lag_step": 33,
+                "clock_excess_peak_share": 0.42,
+                "clock_excess_degenerate": False,
+                "clock_excess_rectified_frac": 0.07,
+            },
         },
         "spectral_skill": {
             "headline": {
@@ -405,6 +420,10 @@ def test_every_registered_headline_path_resolves_against_the_blocks_the_analyses
     assert headline["coupling_minus_clock_nats"] == 1.75
     assert headline["anchors_per_sample"] == 152.0
     assert headline["occlusion_peak_band"] == "near"
+    assert headline["clock_excess_argmax_lag_step"] == 33
+    # Passed through as a bool rather than coerced: the finiteness check exempts bools, and a
+    # degenerate profile reported as 0.0 would read as a share that was measured.
+    assert headline["clock_excess_degenerate"] is False
 
 
 def test_the_headline_block_is_unchanged_when_a_binding_registers_nothing() -> None:
