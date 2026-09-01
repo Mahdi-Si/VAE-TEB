@@ -86,6 +86,7 @@ from teb_vae.lag_attn_cfs.eval.lag_axis import (
 )
 from teb_vae.lag_attn_cfs.model_kwargs import (
     ALIGN_MODEL_KWARGS,
+    FORECAST_ALIGN_MODEL_KWARGS,
     WARMUP_MODEL_KWARGS,
     warmup_model_kwargs,
 )
@@ -653,11 +654,17 @@ def check_warmup_budget_matches_checkpoint(
             f"dataset_config.vae_test_datasets: {exc}"
         ) from exc
 
-    # Both tuples, because both are constructor keywords and both change what the model reads. An
-    # alignment resolved against one reference and a checkpoint built at another have compatible
-    # SHAPES on the target stream -- the reference keeps every kept target channel -- so a
-    # comparison over the warm-up tuples alone would pass a run whose every lag is shifted.
-    compared = tuple(WARMUP_MODEL_KWARGS) + tuple(ALIGN_MODEL_KWARGS)
+    # All three tuples, because all are constructor keywords and all change what the model reads
+    # or is scored on. An alignment resolved against one reference and a checkpoint built at
+    # another have compatible SHAPES on the target stream -- the reference keeps every kept target
+    # channel -- so a comparison over the warm-up tuples alone would pass a run whose every lag is
+    # shifted; and a forecast clock resolved against one setting and a checkpoint built at another
+    # load cleanly too, scoring one clock's question under the other's name.
+    compared = (
+        tuple(WARMUP_MODEL_KWARGS)
+        + tuple(ALIGN_MODEL_KWARGS)
+        + tuple(FORECAST_ALIGN_MODEL_KWARGS)
+    )
     stamped = {name: _as_int_tuple(model_kwargs.get(name)) for name in compared}
     stamped_present = [name for name, value in stamped.items() if value is not None]
 
@@ -736,6 +743,11 @@ def check_warmup_budget_matches_checkpoint(
         "source_dropped_index": list(resolved.source.dropped_index),
         "target_max_align_delay": int(resolved.target.max_align_delay),
         "source_max_align_delay": int(resolved.source.max_align_delay),
+        # The forecast clock, beside the input clocks: which stored step each target channel was
+        # SCORED at is as much a property of the run as which step it was read at.
+        "target_forecast_clock": resolved.target_forecast_clock,
+        "target_forecast_reference_s": resolved.target_forecast_reference_s,
+        "max_forecast_advance": int(resolved.max_forecast_advance),
         "quantile": resolved.quantile,
         "summary": resolved.summary(),
     }
@@ -961,15 +973,19 @@ def anchor_geometry(model: Any) -> Dict[str, Any]:
     """
     floor = int(model.warmup_period)
     t_valid = int(model.geometry.t_valid)
+    # The EFFECTIVE ceiling: an advancing forecast clock's trailing anchors are never decoded,
+    # so both anchor counts are taken over the span a run of this checkpoint actually produces.
+    ceiling = int(getattr(model, "anchor_ceiling", t_valid))
     stride = int(model.anchor_stride)
     return {
         "anchor_floor": floor,
         "t_valid": t_valid,
+        "anchor_ceiling": ceiling,
         "horizon": int(model.horizon),
         "evaluation_stride": 1,
-        "anchors_per_sample": t_valid - floor,
+        "anchors_per_sample": ceiling - floor,
         "training_stride": stride,
-        "training_anchors_per_sample_max": -(-(t_valid - floor) // stride),
+        "training_anchors_per_sample_max": -(-(ceiling - floor) // stride),
         "target_kept_width": int(model.decoder_out_channels),
         "block_width": int(model.horizon) * int(model.decoder_out_channels),
     }

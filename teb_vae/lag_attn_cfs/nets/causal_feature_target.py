@@ -2,10 +2,22 @@ r"""The one-sided feature target: what changes when the coefficients contain no 
 
 :class:`CausalFeatureForecastTarget` is
 :class:`~teb_vae.lag_attn_fs.nets.feature_target.FeatureForecastTarget` with two channel-layout
-constants, one refusal, and the readouts one anchor set of its own makes possible. What it does
-**not** override is the point: the decoder's width, the gathered-never-delayed target block and the
-delegation that hands the shared objective both are inherited unchanged, and so is the anchor seam,
-which lives in the shared objective and the shared masks rather than in any subclass.
+constants, one refusal, the readouts one anchor set of its own makes possible, and -- since the
+forecast clock exists -- the one gather the clock changes. The decoder's width and the delegation
+that hands the shared objective the gathered block are inherited unchanged, and so is the anchor
+seam, which lives in the shared objective and the shared masks rather than in any subclass.
+
+**The forecast clock.** ``target_forecast_shift`` re-indexes the *question*: the scored element at
+anchor $t$, horizon step $\tau$, kept channel $c$ reads stored step $t + 1 + \tau + s_c$. Under
+the resolver's ``physical`` clock $s_c \ge 0$ advances every channel onto one physical future
+instant; under ``input`` $s_c = -d_c \le 0$ scores the continuation of the encoder's own aligned
+stream; absent, the parent's gather runs untouched and the cell is byte for byte what it was. The
+clock therefore lives in this mixin's override of ``_build_forecast_target`` -- the two-sided
+cells never see it -- together with the three consequences it drags along: the persistence gather
+clamps to $\min(s_c, 0)$ so it can never read past the anchor, the floor's scored-target half
+becomes $\max_c(W'_c - s_c) - 1$, and every mask is built from :meth:`scored_weight`, the
+validity signal pooled conservatively over the shift span so a shifted element inside a signal
+gap is dropped rather than scored.
 
 **The block split moves.** The one-sided cascade drops the seven slowest scattering channels per
 block at write time -- their warm-up outruns the stored segment at every trim -- so the first stored
@@ -34,18 +46,20 @@ which stream. ``_anchor_target_values`` returns the anchor's own target vector, 
 ``_check_persistence_target`` is what admits the mechanism at all -- the architecture parents refuse
 it, since a raw block's last axis has no per-channel level to carry forward.
 
-**What is deliberately not here.** ``_default_decoder_out_channels``, ``compute_loss`` and
-``_build_forecast_target`` are the parent's, unmodified: the anchor set reaches all three through
-``forward_outputs['anchor_index']``, so the seam is expressed once in the shared code rather than
-three times in a subclass. And nothing here mentions an encoder, an adapter or a lag mask -- the
-input-side half of causality lives on the model, which is what lets a second architecture compose
-this same mixin.
+**What is deliberately not here.** ``_default_decoder_out_channels`` is the parent's, unmodified,
+and the two overrides that do exist are thin: ``_build_forecast_target`` delegates to the parent
+whenever no forecast shift is set, and ``compute_loss`` only substitutes the pooled validity
+before handing everything to the parent -- the anchor set still reaches the objective through
+``forward_outputs['anchor_index']``, so the seam stays expressed once in the shared code. And
+nothing here mentions an encoder, an adapter or a lag mask -- the input-side half of causality
+lives on the model, which is what lets a second architecture compose this same mixin.
 """
 from __future__ import annotations
 
-from typing import Dict, Optional, Sequence, Tuple
+from typing import Any, Dict, Optional, Sequence, Tuple
 
 import torch
+import torch.nn.functional as F
 
 from teb_vae.lag_attn_fs.nets.feature_target import FeatureForecastTarget
 from teb_vae.lag_attn_rws.nets.losses import raw_sample_score
@@ -63,6 +77,40 @@ WARM_TERTILES = 3
 #: is almost never true, and its fastest channel is warm at step $0$, so "any" is almost always
 #: true.
 WARM_BLOCK_FRACTION = 0.5
+
+
+def pooled_scored_weight(
+    weight: torch.Tensor, shift: Optional[Sequence[int]]
+) -> torch.Tensor:
+    r"""The validity signal, pooled conservatively over a forecast clock's shift span.
+
+    $$\tilde w_u \;=\; \min_{j \in [u + s_{\min},\; u + s_{\max}]} w_j ,$$
+
+    with out-of-range steps read as valid ($1.0$) -- they are never among the actually scored
+    indices, which the anchor ceiling and floor keep inside the record. A module-level function
+    rather than only a method, because the diagnostic page scores windows without a model in hand
+    and a second statement of this pooling is the one that could come to disagree with the
+    objective's. See :meth:`CausalFeatureForecastTarget.scored_weight` for why the projection is
+    2-D and conservative.
+
+    Args:
+        weight: Decimated validity signal $(B, T)$.
+        shift: $s_c$ per kept target channel, or ``None`` / empty / all-zero for the stored
+            clock -- where ``weight`` itself is returned, the same object.
+
+    Returns:
+        The pooled signal $(B, T)$, or ``weight`` under the stored clock.
+    """
+    if not shift:
+        return weight
+    low, high = min(0, min(shift)), max(0, max(shift))
+    if low == 0 and high == 0:
+        return weight
+    # Left pad -low and right pad +high with 1.0, then a sliding min of width high - low + 1:
+    # output u covers exactly stored steps [u + low, u + high].
+    padded = F.pad(weight.unsqueeze(1), (-low, high), value=1.0)
+    pooled = -F.max_pool1d(-padded, kernel_size=high - low + 1, stride=1)
+    return pooled.squeeze(1)
 
 
 class CausalFeatureForecastTarget(FeatureForecastTarget):
@@ -131,22 +179,26 @@ class CausalFeatureForecastTarget(FeatureForecastTarget):
         warmup_period: int,
         kept_warmup_steps: Sequence[int],
         kept_align_delays: Sequence[int] = (),
+        target_forecast_shift: Sequence[int] = (),
     ) -> None:
         r"""Refuse an anchor floor the kept channels do not admit, on either of two counts.
 
-        $$F \;\ge\; \max\Bigl(\underbrace{B - 1}_{\text{scored target}},\;
-          \underbrace{\max_c\bigl(W'_c + d_c\bigr)}_{\text{input warmth}}\Bigr),
-          \qquad B = \max_{c \in \mathrm{kept}} W'_c .$$
+        $$F \;\ge\; \max\Bigl(\underbrace{\max_c\bigl(W'_c - s_c\bigr) - 1}_{\text{scored target}},\;
+          \underbrace{\max_c\bigl(W'_c + d_c\bigr)}_{\text{input warmth}}\Bigr) .$$
 
         **The scored-target requirement**, which is the one this cell has always enforced. A
-        forecast at anchor $t$, horizon step $\tau$, reads target time $t + 1 + \tau$, and channel
-        $c$ is honest there only from $W'_c$ onwards; requiring every kept channel to be valid
-        across every anchor's whole window collapses to $t + 1 \ge W'_c$ for all $t \ge F$, i.e.
-        $F \ge B - 1$. The inequality is $\ge B - 1$ rather than $\ge B$ because the earliest
-        target step an anchor reads is $t + 1$, not $t$; a floor of exactly $B - 1$ is the shipped
-        configuration and must be admitted. The **target tile is never shifted** -- an aligned
-        feature-domain forecast cannot be a strict forecast at its first horizon element -- so this
-        half is taken over the unshifted warm-up whatever the input stream does.
+        forecast at anchor $t$, horizon step $\tau$, kept channel $c$, reads stored step
+        $t + 1 + \tau + s_c$ -- where $s_c$ is the forecast clock's shift, identically $0$ on the
+        stored clock -- and the channel is honest there only from $W'_c$ onwards; requiring every
+        kept channel to be valid across every anchor's whole window collapses to
+        $t + 1 + s_c \ge W'_c$ for all $t \ge F$, i.e. $F \ge \max_c(W'_c - s_c) - 1$. With no
+        shift that is the historical $F \ge B - 1$, $B = \max_c W'_c$: the inequality is
+        $\ge B - 1$ rather than $\ge B$ because the earliest target step an anchor reads is
+        $t + 1$, not $t$, and a floor of exactly $B - 1$ is a shipped configuration that must be
+        admitted. The **input** alignment's $d_c$ never enters this half -- on the stored and
+        physical clocks the target tile is not delayed at all, and on the input clock the delay
+        arrives through $s_c = -d_c$ itself -- so the two halves stay two separate statements
+        whatever the input stream does.
 
         **The input-warmth requirement**, which binds only once the inputs are *shifted*. With
         $d_c = 0$ the input at step $t$ is the stored coefficient at $t$, a cold one is masked and
@@ -169,6 +221,9 @@ class CausalFeatureForecastTarget(FeatureForecastTarget):
             kept_align_delays: $d_c$ per surviving target channel, positional against
                 ``kept_warmup_steps``. Empty, or all zeros, is the unaligned stream -- where the
                 second requirement does not apply at all, not where it happens to be satisfied.
+            target_forecast_shift: $s_c$ per surviving target channel, positional against
+                ``kept_warmup_steps``. Empty, or all zeros, is the stored clock, where the first
+                requirement reads $F \ge B - 1$ exactly as it always has.
 
         Raises:
             ValueError: If the floor is below either requirement, naming which one binds, the
@@ -185,6 +240,14 @@ class CausalFeatureForecastTarget(FeatureForecastTarget):
                 f"mismatch would pair one channel's wait with another's shift and refuse -- or "
                 f"admit -- a floor computed for a stream that does not exist."
             )
+        fshifts = [int(shift) for shift in target_forecast_shift]
+        if fshifts and len(fshifts) != len(waits):
+            raise ValueError(
+                f"target_forecast_shift has {len(fshifts)} entries against {len(waits)} kept "
+                f"warm-up steps. Both are positional over the same surviving channels, so a "
+                f"length mismatch would pair one channel's wait with another's clock and refuse "
+                f"-- or admit -- a floor computed for a stream that does not exist."
+            )
 
         budget = max(waits)
         required = budget - 1
@@ -197,6 +260,20 @@ class CausalFeatureForecastTarget(FeatureForecastTarget):
             "Below it the objective scores assumed pre-recording history as signal, on "
             "coefficients normalised with constants that excluded exactly that region"
         )
+
+        # Emptiness and all-zeros are one case, exactly as for the input shifts below: a
+        # stored-clock caller that passes the resolver's absent vector must get the same answer --
+        # and the same refusal sentence -- as one that passes explicit zeros.
+        if fshifts and any(fshifts):
+            scored = [wait - shift for wait, shift in zip(waits, fshifts)]
+            index = max(range(len(scored)), key=scored.__getitem__)
+            required = scored[index] - 1
+            detail = (
+                f"kept target channel {index} is scored at stored step t + 1 "
+                f"{fshifts[index]:+d} on the configured forecast clock and its own warm-up is "
+                f"{waits[index]} steps, so its first horizon element is honest only from anchor "
+                f"{required}"
+            )
 
         # Emptiness and all-zeros are one case on purpose: an unshifted stream is exactly the one
         # whose channels are masked and announced rather than waited for, and a caller that passes
@@ -231,12 +308,15 @@ class CausalFeatureForecastTarget(FeatureForecastTarget):
         horizon: int,
         t_valid: int,
         kept_warmup_steps: Sequence[int],
+        target_forecast_shift: Sequence[int] = (),
     ) -> float:
         r"""The share of scored target coefficients whose channel is past its own warm-up.
 
         Over the triples the objective can ever score -- anchors $t \in [F, T_{\mathrm{valid}})$,
-        horizon steps $\tau \in [0, H)$, kept channels $c$ -- the fraction satisfying
-        $t + 1 + \tau \ge W'_c$.
+        with $T_{\mathrm{valid}}$ the caller's **effective** anchor ceiling, horizon steps
+        $\tau \in [0, H)$, kept channels $c$ -- the fraction satisfying
+        $t + 1 + \tau + s_c \ge W'_c$, where $s_c$ is the forecast clock's shift and identically
+        $0$ on the stored clock.
 
         **Resolved once, from the geometry, and emitted as a constant column.** Given the
         constructor's pairing refusal and the anchor range this is identically $1.0$, so
@@ -252,9 +332,12 @@ class CausalFeatureForecastTarget(FeatureForecastTarget):
         Args:
             warmup_period: The anchor floor $F$.
             horizon: $H$, forecast steps per anchor.
-            t_valid: $T_{\mathrm{valid}} = T - H$, one past the last anchor.
+            t_valid: One past the last anchor -- the model's ``anchor_ceiling``, which is
+                $T - H$ less the forecast clock's largest advance.
             kept_warmup_steps: $W'_c$ per surviving target channel. Empty -- the ungated model --
                 gives $1.0$, which is right: with no warm-up every coefficient is honest.
+            target_forecast_shift: $s_c$ per surviving target channel, positional against
+                ``kept_warmup_steps``; empty is the stored clock.
 
         Returns:
             The fraction, in $[0, 1]$.
@@ -263,12 +346,17 @@ class CausalFeatureForecastTarget(FeatureForecastTarget):
         horizon = int(horizon)
         if not kept_warmup_steps or horizon <= 0 or len(anchors) == 0:
             return 1.0
+        shifts = (
+            [int(shift) for shift in target_forecast_shift]
+            if target_forecast_shift
+            else [0] * len(kept_warmup_steps)
+        )
         warm = 0
-        for step in kept_warmup_steps:
+        for step, shift in zip(kept_warmup_steps, shifts):
             for anchor in anchors:
-                # Horizon step tau reads target step t + 1 + tau, so the cold ones are exactly
-                # tau < W'_c - t - 1, clipped into [0, H].
-                warm += horizon - min(horizon, max(0, int(step) - anchor - 1))
+                # Horizon step tau reads stored step t + 1 + tau + s_c, so the cold ones are
+                # exactly tau < W'_c - s_c - t - 1, clipped into [0, H].
+                warm += horizon - min(horizon, max(0, int(step) - shift - anchor - 1))
         return warm / float(len(anchors) * horizon * len(kept_warmup_steps))
 
     @staticmethod
@@ -530,24 +618,205 @@ class CausalFeatureForecastTarget(FeatureForecastTarget):
         resolution runs.
         """
 
+    def _build_forecast_target(
+        self, target_features: torch.Tensor, anchors: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        r"""The parent's gather, re-indexed by the forecast clock where one is configured.
+
+        $$Y^{+}[b, a, \tau, k] = Y[b,\, t_a + 1 + \tau + s_k,\, \mathrm{keep}[k]],$$
+
+        against the parent's $s_k \equiv 0$. With no shift -- the stored clock, and every
+        two-sided cell -- this method **is** the parent's, by delegation, so the historical cells
+        stay bitwise what they were.
+
+        With a shift, the gather runs per **unique shift value** rather than per element: the
+        resolved vectors carry long runs of equal shifts (a few dozen distinct values over 98
+        channels), so grouping keeps the index tensors at $(B, A \cdot H)$ instead of the
+        $(B, A \cdot H, C_{\mathrm{keep}})$ ``int64`` block a per-element index would materialise
+        at the dense evaluation stride.
+
+        The dense branch (``anchors=None``) enumerates $[0, \texttt{anchor\_ceiling})$ rather than
+        the parent's $[0, T_{\mathrm{valid}})$: under an advancing clock the trailing anchors'
+        windows read past the stored record, so the rows the parent would build do not exist here.
+
+        Args:
+            target_features: The caller's target stream $(B, T, c_y)$, on the decimated grid.
+            anchors: Optional anchor index $(B, A)$, integer, in $[0, \texttt{anchor\_ceiling})$.
+                ``None`` builds every valid anchor's window.
+
+        Returns:
+            The forecast target $(B, A, H, C_{\mathrm{keep}})$.
+
+        Raises:
+            ValueError: On the parent's three shape refusals -- rank, trimmed length, declared
+                width -- which apply unchanged here.
+        """
+        shift = getattr(self, "target_forecast_shift", None)
+        if not shift or not any(shift):
+            return super()._build_forecast_target(target_features, anchors)
+
+        # The parent's three refusals, restated because this path does not reach its gather. Same
+        # conditions, same consequences.
+        if target_features.dim() != 3:
+            raise ValueError(
+                f"target stream must be 3-D (B, T, c_y), got shape {tuple(target_features.shape)}"
+            )
+        if target_features.size(1) != self.geometry.t:
+            raise ValueError(
+                f"target stream length {target_features.size(1)} != geometry.t "
+                f"{self.geometry.t}; this geometry assumes the trimmed loader "
+                f"(trim_minutes: 1.0 -> T = {self.geometry.t} decimated steps), so a mismatch "
+                f"means the loader ran at a different trim_minutes"
+            )
+        if target_features.size(2) != self.c_y:
+            raise ValueError(
+                f"target stream has {target_features.size(2)} channels but the model declares "
+                f"c_y={self.c_y}; the surviving-channel index is positional into the declared "
+                f"width, so a mismatch would gather the wrong channels rather than fail"
+            )
+
+        gathered = (
+            target_features
+            if self.target_gate is None
+            else torch.index_select(target_features, -1, self.target_gate.keep_index)
+        )
+        if anchors is None:
+            # The dense EFFECTIVE range. Materialised through the same grouped gather as the
+            # sparse case rather than the parent's unfold view, because an unfold cannot carry a
+            # per-channel offset; the extra copy exists only on this diagnostic path -- the
+            # objective and the evaluation always pass explicit anchors.
+            anchors = (
+                torch.arange(self.anchor_ceiling, device=gathered.device)
+                .unsqueeze(0)
+                .expand(gathered.shape[0], -1)
+            )
+
+        batch, channels = gathered.shape[0], gathered.shape[-1]
+        steps = torch.arange(self.horizon, device=gathered.device)
+        # (B, A, H): anchor a's horizon step tau reads decimated step t_a + 1 + tau, before the
+        # per-channel clock shift below.
+        base_index = anchors.to(torch.long)[:, :, None] + 1 + steps[None, None, :]
+        out = gathered.new_empty(batch, anchors.shape[1], self.horizon, channels)
+        for value in sorted(set(shift)):
+            columns = torch.tensor(
+                [index for index, s in enumerate(shift) if s == value],
+                dtype=torch.long,
+                device=gathered.device,
+            )
+            block = torch.index_select(gathered, -1, columns)
+            time_index = (
+                (base_index + int(value))
+                .reshape(batch, -1, 1)
+                .expand(-1, -1, columns.numel())
+            )
+            window = block.gather(1, time_index).reshape(
+                batch, anchors.shape[1], self.horizon, columns.numel()
+            )
+            out.index_copy_(-1, columns, window)
+        return out
+
+    def scored_weight(self, weight: torch.Tensor) -> torch.Tensor:
+        r"""The validity signal, pooled conservatively over the forecast clock's shift span.
+
+        $$\tilde w_u \;=\; \min_{j \in [u + s_{\min},\; u + s_{\max}]} w_j ,$$
+
+        with out-of-range steps read as valid ($1.0$) -- they are never among the actually scored
+        indices, which the anchor ceiling and floor keep inside the record.
+
+        **Why a pooled 2-D signal and not a per-channel mask.** The scored element at stored step
+        $u = t + 1 + \tau$ on channel $c$ actually reads $u + s_c$, so its exact validity is
+        per-channel -- a $(B, A, H, C)$ mask. Every loss denominator in this family is an *anchor
+        count*, and the shared masks are deliberately $(B, A, H)$, broadcast over channels; a
+        four-dimensional mask would make nats-per-anchor shrink silently with mask density, which
+        is the failure the mask module's own docstring rejects. The pooled minimum is the
+        conservative 2-D projection: an element is scored only if the whole shift span around it
+        is valid, so nothing invalid is ever scored, at the price of dropping some valid elements
+        whose span straddles a signal gap.
+
+        lean-limit: the pooling also tightens the anchor's own-validity and warm factors, and
+        ``coverage_frac`` reads lower near gaps; replace with a per-channel mask and per-channel
+        denominators when a measured coverage loss on real shards exceeds a few percent.
+
+        Identity -- the same object, not an equal one -- with no shift or an all-zero one, so
+        every stored-clock caller is bitwise untouched.
+
+        Args:
+            weight: Decimated validity signal $(B, T)$.
+
+        Returns:
+            The pooled signal $(B, T)$, or ``weight`` itself under the stored clock.
+        """
+        return pooled_scored_weight(
+            weight, getattr(self, "target_forecast_shift", None)
+        )
+
+    def compute_loss(
+        self,
+        forward_outputs: Dict[str, torch.Tensor],
+        target_features: torch.Tensor,
+        *,
+        weight: torch.Tensor,
+        beta: float = 1.0,
+        beta_prior: float = 0.0,
+        lambda_full: float = 1.0,
+        lambda_base: float = 1.0,
+        likelihood: str = "gaussian_nll",
+        free_bits: float = 0.0,
+        lambda_ms: float = 0.0,
+        lambda_deriv: float = 0.0,
+        lambda_boundary: float = 0.0,
+    ) -> Dict[str, Any]:
+        r"""The parent's seven-term objective, scored under the forecast clock's pooled validity.
+
+        One substitution and nothing else: ``weight`` is replaced by :meth:`scored_weight` before
+        the parent runs, so the objective's mask, its coverage floor, and every gap readout the
+        parent merges from :meth:`_resolved_forecast_gaps` are built from one signal. Substituted
+        here rather than inside each mask call because the parent threads the same ``weight``
+        through all of them -- one seam, or the KL support and the reconstruction mask drift
+        apart. Under the stored clock the substitution is the identity object and the call is the
+        parent's, bitwise.
+
+        Args: see the parent; ``weight`` is the raw loader validity $(B, T)$.
+
+        Returns:
+            The parent's ``{'metrics': ..., 'likelihood': ...}``.
+        """
+        return super().compute_loss(
+            forward_outputs,
+            target_features,
+            weight=self.scored_weight(weight),
+            beta=beta,
+            beta_prior=beta_prior,
+            lambda_full=lambda_full,
+            lambda_base=lambda_base,
+            likelihood=likelihood,
+            free_bits=free_bits,
+            lambda_ms=lambda_ms,
+            lambda_deriv=lambda_deriv,
+            lambda_boundary=lambda_boundary,
+        )
+
     def _anchor_target_values(
         self, target_features: torch.Tensor, anchors: torch.Tensor
     ) -> torch.Tensor:
-        r"""The target's stored value **at** each decoded anchor: the persistence input.
+        r"""The target's stored value **at** each decoded anchor, on the scored clock: the persistence input.
 
-        $$Y^{0}[b, a, k] = Y[b,\, t_a,\, \mathrm{keep}[k]],$$
+        $$Y^{0}[b, a, k] = Y[b,\, t_a + \min(s_k, 0),\, \mathrm{keep}[k]],$$
 
-        against :meth:`~teb_vae.lag_attn_fs.nets.feature_target.FeatureForecastTarget._build_forecast_target`'s
-        $Y[b, t_a + 1 + \tau, \mathrm{keep}[k]]$ -- the same stream, the same channels, one step
-        earlier and with no horizon axis. Written beside nothing else because it *is* the same
-        gather with the window removed, and the two must select the same channels in the same order
-        or the residual would carry one channel's level into another's forecast.
+        against :meth:`_build_forecast_target`'s $Y[b, t_a + 1 + \tau + s_k, \mathrm{keep}[k]]$ --
+        the same stream, the same channels, one step earlier **on the same clock** and with no
+        horizon axis. Written beside nothing else because it *is* the same gather with the window
+        removed, and the two must select the same channels in the same order or the residual would
+        carry one channel's level into another's forecast.
 
-        **The keep-index only, never the gate's delay**, for exactly the reason the forecast target
-        gives: the delay reads channel $c$ at step $t - d_c$, which is the guard that keeps an
-        *input* channel's forward reach behind the anchor's causal endpoint. What the residual
-        carries is the value the anchor is asked to continue, and shifting it would make the term a
-        stale channel-dependent mixture rather than the anchor's own vector.
+        **The clamp $\min(s_k, 0)$ is load-bearing on both signs.** On the ``input`` clock
+        ($s_k = -d_k$) the un-clamped anchor value would *equal* the scored element at horizon
+        step $\tau = d_k - 1$ -- a per-channel free copy that corrupts ``pred_gap`` exactly where
+        the delay is largest -- so the residual must sit on the scored clock, one step behind its
+        own first element. On the ``physical`` clock ($s_k \ge 0$) the scored clock's own anchor
+        value would be stored step $t_a + s_k$, which is **future data**; the clamp keeps the
+        residual at the anchor's own stored step, the freshest causal value the stream has. The
+        stored clock is both at once, and bitwise the historical gather.
 
         **At the anchor step, not at the last valid step before it.** The evaluation's persistence
         baseline gathers the last *observed* step, which it can because it holds the decimated
@@ -569,7 +838,16 @@ class CausalFeatureForecastTarget(FeatureForecastTarget):
             if self.target_gate is None
             else torch.index_select(target_features, -1, self.target_gate.keep_index)
         )
-        index = anchors.to(torch.long)[:, :, None].expand(-1, -1, gathered.shape[-1])
+        shift = getattr(self, "target_forecast_shift", None)
+        if not shift or min(shift) >= 0:
+            index = anchors.to(torch.long)[:, :, None].expand(-1, -1, gathered.shape[-1])
+            return gathered.gather(1, index)
+        # Only a delaying clock moves this gather, and the offsets are safe by the floor: the
+        # constructor refuses any anchor below max_c(W'_c + d_c), which bounds t_a - d_c >= 0.
+        offsets = torch.tensor(
+            [min(int(s), 0) for s in shift], dtype=torch.long, device=gathered.device
+        )
+        index = anchors.to(torch.long)[:, :, None] + offsets[None, None, :]
         return gathered.gather(1, index)
 
     @torch.no_grad()

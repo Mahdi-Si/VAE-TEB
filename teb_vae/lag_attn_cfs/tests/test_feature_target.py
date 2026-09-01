@@ -1,10 +1,12 @@
 r"""The causal target domain: the block split, and the gaps computed where the loss was.
 
-:class:`~teb_vae.lag_attn_cfs.nets.causal_feature_target.CausalFeatureForecastTarget` overrides
-exactly two members plus the pairing refusal, and what it *inherits* matters as much: the decoder's
-width, the gathered-never-delayed target block and the objective's delegation are the parent's, and
-the anchor seam reaches all three through ``forward_outputs['anchor_index']``. Tested here because
-an override appearing in this class is a fork of shared code that would then be free to drift.
+:class:`~teb_vae.lag_attn_cfs.nets.causal_feature_target.CausalFeatureForecastTarget` inherits the
+decoder's width unchanged, and its overrides of ``_build_forecast_target`` and ``compute_loss``
+exist only for the forecast clock: with no ``target_forecast_shift`` both delegate to the parent
+-- the gather bitwise, the loss under the identical ``weight`` object -- and the anchor seam still
+reaches the objective through ``forward_outputs['anchor_index']``. Tested here because a
+delegation that stopped delegating would be a fork of shared code free to drift, with every shape
+unchanged.
 
 The gap override is the load-bearing one. The parent builds its mask with no anchor set, so on a
 tiled model all four splits would be averaged over $T_{\mathrm{valid}}$ anchors while the
@@ -22,10 +24,12 @@ from teb_vae.lag_attn_cfs.tests.conftest import (
     BATCH,
     CAUSAL_ST_WIDTH,
     TINY_STRIDE,
+    TINY_TARGET_ALIGN_DELAYS,
     TINY_TARGET_KEEP_INDEX,
     TINY_TARGET_WARMUP_STEPS,
     build,
     make_streams,
+    tiny_align_kwargs,
     tiny_warmup_kwargs,
 )
 from teb_vae.lag_attn_fs.nets.feature_target import FeatureForecastTarget
@@ -66,19 +70,44 @@ def test_the_block_split_is_the_causal_scattering_width() -> None:
     assert CausalFeatureForecastTarget.TARGET_BLOCK_SPLIT != FeatureForecastTarget.TARGET_BLOCK_SPLIT
 
 
-@pytest.mark.parametrize(
-    "member", ("_default_decoder_out_channels", "compute_loss", "_build_forecast_target")
-)
-def test_the_inherited_members_are_not_redefined(member: str) -> None:
+def test_the_decoder_width_is_not_redefined() -> None:
     """The anchor seam is expressed once, in the shared objective and the shared masks.
 
-    A subclass copy of any of these would be a second place the anchor set has to be threaded, and
-    the second place is the one that goes stale.
+    A subclass copy would be a second place the gate's width has to be threaded, and the second
+    place is the one that goes stale.
     """
+    member = "_default_decoder_out_channels"
     assert member not in vars(CausalFeatureForecastTarget), member
     assert getattr(CausalFeatureForecastTarget, member) is getattr(
         FeatureForecastTarget, member
     )
+
+
+def test_the_stored_clock_gather_is_the_parents_bitwise(tiny_warmup) -> None:
+    """With no forecast shift, ``_build_forecast_target`` is the parent's, by delegation.
+
+    The override exists only for the forecast clock; on the stored clock it must hand back
+    exactly what the parent hands back, or every historical cell's target moved silently.
+    """
+    model = build(tiny_warmup)
+    assert model.target_forecast_shift is None
+    stream = _patterned(BATCH, model.geometry.t, model.c_y)
+    anchors = torch.tensor([[5, 9], [6, 10]])
+    assert torch.equal(
+        model._build_forecast_target(stream, anchors),
+        FeatureForecastTarget._build_forecast_target(model, stream, anchors),
+    )
+
+
+def test_the_stored_clock_scored_weight_is_the_same_object(tiny_warmup) -> None:
+    """``scored_weight`` is the identity object -- not an equal tensor -- on the stored clock.
+
+    ``compute_loss``'s one substitution is this call, so identity here is what makes the
+    stored-clock objective bitwise the parent's.
+    """
+    model = build(tiny_warmup)
+    weight = _weight(BATCH, model.geometry.t)
+    assert model.scored_weight(weight) is weight
 
 
 def test_the_resolved_gaps_are_redefined() -> None:
@@ -125,6 +154,127 @@ def test_the_dense_and_anchored_targets_agree_where_they_overlap(tiny_warmup) ->
 
     for position, anchor in enumerate((3, 7, 11)):
         assert torch.equal(gathered[:, position], dense[:, anchor])
+
+
+# =================================================================================================
+# The forecast clock
+# =================================================================================================
+#: A tiny all-advance shift, one per surviving channel: the shape the resolver's ``physical``
+#: clock produces (min exactly 0, staircase upward), small enough that the tiny ceiling
+#: $T_{\mathrm{valid}} - 3 = 17$ leaves the stride-4 tiling feasible.
+TINY_FORECAST_ADVANCE = tuple(
+    min(slot // 8, 3) for slot in range(len(TINY_TARGET_KEEP_INDEX))
+)
+
+#: The tiny ``input`` clock: the alignment's own delays, negated -- exactly what the resolver
+#: emits for ``causal_target_forecast_clock: input``.
+TINY_FORECAST_DELAY = tuple(-delay for delay in TINY_TARGET_ALIGN_DELAYS)
+
+
+def test_the_physical_clock_advances_each_channel_by_its_own_shift() -> None:
+    r"""$Y^{+}[b, a, \tau, k] = Y[b,\, t_a + 1 + \tau + s_k,\, \mathrm{keep}[k]]$, position by position."""
+    model = build(tiny_warmup_kwargs(target_forecast_shift=TINY_FORECAST_ADVANCE))
+    stream = _patterned(BATCH, model.geometry.t, model.c_y)
+    anchors = torch.tensor([[5, 9], [6, 10]])
+
+    block = model._build_forecast_target(stream, anchors)
+    assert tuple(block.shape) == (BATCH, 2, model.horizon, len(TINY_TARGET_KEEP_INDEX))
+
+    for sample in range(BATCH):
+        for position in range(2):
+            anchor = int(anchors[sample, position])
+            for tau in range(model.horizon):
+                for slot, declared in enumerate(TINY_TARGET_KEEP_INDEX):
+                    assert float(block[sample, position, tau, slot]) == float(
+                        stream[sample, anchor + 1 + tau + TINY_FORECAST_ADVANCE[slot], declared]
+                    )
+
+
+def test_the_input_clock_delays_each_channel_like_the_encoder_input() -> None:
+    r"""Under ``input``, the scored element reads $t + 1 + \tau - d_c$: the aligned stream's own continuation."""
+    model = build(tiny_align_kwargs(target_forecast_shift=TINY_FORECAST_DELAY))
+    stream = _patterned(BATCH, model.geometry.t, model.c_y)
+    anchors = torch.tensor([[7, 11], [8, 12]])
+
+    block = model._build_forecast_target(stream, anchors)
+    for sample in range(BATCH):
+        for position in range(2):
+            anchor = int(anchors[sample, position])
+            for tau in range(model.horizon):
+                for slot, declared in enumerate(TINY_TARGET_KEEP_INDEX):
+                    assert float(block[sample, position, tau, slot]) == float(
+                        stream[sample, anchor + 1 + tau + TINY_FORECAST_DELAY[slot], declared]
+                    )
+
+
+def test_the_persistence_gather_clamps_to_the_scored_clocks_past() -> None:
+    r"""$Y^{0}$ reads $t_a + \min(s_c, 0)$: the anchor's own step advancing, the aligned step delaying.
+
+    An unclamped advance would hand the decoder stored steps after the anchor -- future data --
+    and an unclamped delay would hand horizon element $\tau = d_c - 1$ its own answer.
+    """
+    anchors = torch.tensor([[7, 11], [8, 12]])
+
+    advanced = build(tiny_warmup_kwargs(target_forecast_shift=TINY_FORECAST_ADVANCE))
+    stream = _patterned(BATCH, advanced.geometry.t, advanced.c_y)
+    values = advanced._anchor_target_values(stream, anchors)
+    for sample in range(BATCH):
+        for position in range(2):
+            anchor = int(anchors[sample, position])
+            for slot, declared in enumerate(TINY_TARGET_KEEP_INDEX):
+                assert float(values[sample, position, slot]) == float(
+                    stream[sample, anchor, declared]
+                )
+
+    delayed = build(tiny_align_kwargs(target_forecast_shift=TINY_FORECAST_DELAY))
+    values = delayed._anchor_target_values(stream, anchors)
+    for sample in range(BATCH):
+        for position in range(2):
+            anchor = int(anchors[sample, position])
+            for slot, declared in enumerate(TINY_TARGET_KEEP_INDEX):
+                assert float(values[sample, position, slot]) == float(
+                    stream[sample, anchor + TINY_FORECAST_DELAY[slot], declared]
+                )
+
+
+def test_the_anchor_ceiling_moves_by_the_largest_advance_and_only_then() -> None:
+    """An advancing clock loses exactly its largest advance in trailing anchors; a delaying one none."""
+    stored = build(tiny_warmup_kwargs())
+    assert stored.anchor_ceiling == stored.geometry.t_valid
+
+    advanced = build(tiny_warmup_kwargs(target_forecast_shift=TINY_FORECAST_ADVANCE))
+    assert advanced.anchor_ceiling == advanced.geometry.t_valid - max(TINY_FORECAST_ADVANCE)
+    anchors, valid = advanced._build_anchor_index(
+        batch=1, device=torch.device("cpu"), anchor_phase=0, anchor_stride=1
+    )
+    assert int(anchors[0, valid[0]].max()) == advanced.anchor_ceiling - 1
+
+    delayed = build(tiny_align_kwargs(target_forecast_shift=TINY_FORECAST_DELAY))
+    assert delayed.anchor_ceiling == delayed.geometry.t_valid
+
+
+def test_the_pooled_weight_is_conservative_over_the_shift_span() -> None:
+    """A gap poisons exactly the steps whose shift span reaches it, and nothing else."""
+    model = build(tiny_warmup_kwargs(target_forecast_shift=TINY_FORECAST_ADVANCE))
+    span = max(TINY_FORECAST_ADVANCE)
+    weight = _weight(1, model.geometry.t)
+    gap = 12
+    weight[0, gap] = 0.0
+
+    pooled = model.scored_weight(weight)
+    for step in range(model.geometry.t):
+        expected = 0.0 if gap - span <= step <= gap else 1.0
+        assert float(pooled[0, step]) == expected, step
+
+
+def test_a_mixed_sign_forecast_shift_is_refused() -> None:
+    """No resolver clock produces one, so a mixed vector is two clocks spliced together."""
+    mixed = tuple(
+        1 if slot == 0 else -1 if slot == 1 else 0
+        for slot in range(len(TINY_TARGET_KEEP_INDEX))
+    )
+    with pytest.raises(ValueError, match="mixes signs"):
+        build(tiny_warmup_kwargs(target_forecast_shift=mixed))
 
 
 # =================================================================================================

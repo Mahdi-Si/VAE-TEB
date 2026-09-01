@@ -37,7 +37,9 @@ gradient decorrelation and activation memory, neither of which applies where the
 pass. The evaluation calls
 `model(y_st, y_ph, u_stream, anchor_phase=0, anchor_stride=1)`, which is exactly what
 `SeqVaeLagAttnCfsTask.resolve_anchor_geometry('test', batch)` returns and therefore what `val` and
-`test` already use, and it decodes all **136** anchors of every segment. The training stride is
+`test` already use, and it decodes **every valid anchor** of every segment — the checkpoint's own
+`anchor_ceiling - warmup_period`: 136 on the stored forecast clock, 51 under the shipped
+`physical` one, whose 85-step largest advance removes the trailing anchors. The training stride is
 recorded in `run_context` beside the decoded geometry, because a table that did not say which
 geometry it was produced at cannot be read against the training CSV.
 
@@ -706,8 +708,10 @@ searched lag window is a region where the source coefficient is not yet honest, 
 attends there is reading what the data offers rather than misbehaving.
 
 **Two geometry guards, and they are the FAIL-able part.** `target_warm_frac` must read exactly $1.0$
-and `anchors_per_sample` exactly $136$ at the dense set, both computed from the checkpoint's own
-geometry rather than from a constant, so a legitimate arm states its own expectation. A value off
+and `anchors_per_sample` exactly the checkpoint's own `anchor_ceiling - warmup_period` at the dense
+set ($136$ on the stored forecast clock, $51$ under the shipped `physical` one), both computed from
+the checkpoint's own geometry rather than from a constant, so a legitimate arm states its own
+expectation. A value off
 either means the checkpoint predates the constructor's budget-and-floor pairing refusal, or the
 anchor geometry is not the one the configuration states — and then every number in the run was
 computed over a different population, which is why this fails rather than warns.

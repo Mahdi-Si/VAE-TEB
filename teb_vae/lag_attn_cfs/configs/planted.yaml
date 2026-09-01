@@ -77,6 +77,13 @@ model_config:
     # 45 STORED steps only while the two streams read on one clock.
     causal_align_reference_source: null
 
+    # The STORED forecast clock, PINNED, and against the shipped 'physical' default rather than
+    # inherited. The planted band's arithmetic is stated in stored steps -- the shard stamps a
+    # stored delay of 45 and `planted_band` reads the readable lags off it -- so a clock that
+    # re-indexes the scored element per channel would move the band this check scores against
+    # while the stamp stayed put. lag_recovery_check refuses any other clock by name.
+    causal_target_forecast_clock: stored
+
     # Five epochs, not fifty: beta must reach its endpoint early enough that the remaining epochs
     # are spent earning coupling rather than waiting for the term that rewards it.
     beta_schedule:

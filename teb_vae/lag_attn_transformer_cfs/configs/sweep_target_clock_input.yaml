@@ -1,0 +1,36 @@
+# Forecast-clock arm: the INPUT clock -- score the continuation of the encoder's own aligned stream.
+#
+# Every kept channel is scored at the same delayed index the encoder reads it at (s_c = -d_c), so
+# the model predicts the next steps of exactly the stream it consumes. Self-consistent, and the
+# scored content sits up to ~350 s in the past: the source's 288.2672 s clock is then ~100 s
+# FRESHER than the scored target content, so `pred_gap` on this arm measures contemporaneous
+# inference rather than directed prediction. That is why it is an arm and not the default -- it
+# isolates how much of the physical arm's movement comes from re-clocking the question at all,
+# as against making every element strictly future.
+#
+# The stride travels with the clock for the reason the stored arm's does: a delaying clock moves
+# no ceiling (T_valid stays 270), so stride 30 restores the horizon-partitioning tiling and the
+# arm differs from `sweep_target_clock_stored.yaml` in the clock alone. Requires the aligned
+# target (`causal_align_reference` above in the base); the resolver refuses it unaligned.
+#
+# The persistence residual reads the aligned anchor value (t_a - d_c) on this arm -- the clamp
+# min(s_c, 0) -- because the anchor's own stored value IS the scored element at horizon step
+# d_c - 1, and handing it to the decoder would be a per-channel free copy.
+#
+#   TEB_RUN_STAMP="$(date '+%Y-%m-%d--[%H-%M]')" torchrun --nproc_per_node=7 \
+#       -m teb_vae.lag_attn_transformer_cfs.trainer --config teb_vae/lag_attn_transformer_cfs/configs/sweep_target_clock_input.yaml
+base: default.yaml
+
+model_config:
+  VAE_model:
+    causal_target_forecast_clock: input
+    anchor_stride: 30
+
+advanced_config:
+  tracking:
+    mlflow:
+      # IDENTITY: the arm in the name, on both keys, so a run's own records say which arm trained
+      # even if the config it was launched from cannot be recovered.
+      run_name: lag_attn_trf_cfs_clock_input
+      tags:
+        variant: lag_attn_trf_cfs_clock_input

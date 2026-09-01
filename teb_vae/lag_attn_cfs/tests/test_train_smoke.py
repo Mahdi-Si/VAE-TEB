@@ -95,9 +95,27 @@ _DRIFT_ATOL = 1.0e-1
 _DRIFT_RTOL = 1.0e-3
 
 #: The anchor counts the two stages must produce, derived here the way the model derives them so a
-#: geometry change re-derives them rather than failing a literal.
-DENSE_ANCHORS = 300 - SHIPPED_HORIZON - SHIPPED_WARMUP_PERIOD
-TILE_COUNT = -(-DENSE_ANCHORS // SHIPPED_HORIZON)
+#: geometry change re-derives them rather than failing a literal. The dense count is taken over
+#: the EFFECTIVE ceiling: the shipped physical forecast clock's largest advance, resolved against
+#: the committed shard exactly as the run resolves it, removes the trailing anchors before
+#: anything is decoded -- and the tiling divides by the shipped stride of 10, which travels with
+#: that clock rather than with the horizon.
+SHIPPED_ANCHOR_STRIDE = 10
+
+
+def _physical_advance() -> int:
+    """The shipped clock's largest advance, resolved from the committed shard's own delays."""
+    from teb_vae.lag_attn_cfs.causal_warmup import resolve_warmup_budget
+
+    from .conftest import causal_config
+
+    budget = resolve_warmup_budget(causal_config(causal_target_forecast_clock="physical"))
+    assert budget is not None
+    return budget.max_forecast_advance
+
+
+DENSE_ANCHORS = 300 - SHIPPED_HORIZON - SHIPPED_WARMUP_PERIOD - _physical_advance()
+TILE_COUNT = -(-DENSE_ANCHORS // SHIPPED_ANCHOR_STRIDE)
 
 
 def _run_fit(tmp_path, seed=None):
@@ -261,7 +279,12 @@ def test_the_run_trains_at_the_budgets_width_and_the_configs_tiling(fit):
     assert model.decoder_out_channels == GUARDED_TARGET_CHANNELS
     assert model.target_adapter.linear.in_features == GUARDED_TARGET_CHANNELS
     assert model.source_adapter.linear.in_features == GUARDED_SOURCE_CHANNELS
-    assert model.anchor_stride == model.horizon == SHIPPED_HORIZON
+    assert model.anchor_stride == SHIPPED_ANCHOR_STRIDE
+    assert model.horizon == SHIPPED_HORIZON
+    # The forecast clock the config states, applied: the ceiling is T_valid less the largest
+    # advance, which is where the dense anchor count above comes from.
+    assert model.target_forecast_shift is not None
+    assert model.anchor_ceiling == model.geometry.t_valid - max(model.target_forecast_shift)
     assert model.warmup_period == SHIPPED_WARMUP_PERIOD
     assert model.raw_per_step == 16
     # The declared widths are untouched, which is what the data boundary checks against.
@@ -453,7 +476,7 @@ def test_the_resolved_config_records_the_budget_the_run_actually_got(fit):
     vae = reloaded["model_config"]["VAE_model"]
     assert vae["causal_warmup_budget_steps"] == 134
     assert vae["warmup_period"] == SHIPPED_WARMUP_PERIOD
-    assert vae["anchor_stride"] == SHIPPED_HORIZON
+    assert vae["anchor_stride"] == SHIPPED_ANCHOR_STRIDE
     assert vae["causal_reach_budget_s"] is None
 
 

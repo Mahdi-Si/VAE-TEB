@@ -76,6 +76,7 @@ from teb_vae.lag_attn_cfs.eval.metrics import (
     DENSE_ANCHOR_GEOMETRY,
     batch_field,
     batch_guids,
+    expected_anchors_per_sample,
     model_inputs,
 )
 from teb_vae.lag_attn_rws.nets.controls import NoCrossGroupPartner, make_derangement
@@ -599,10 +600,11 @@ def _batch_tensors(
     anchor_valid = cache.anchor_valid[target_rows].to(device=device)
 
     # The model's own gather, at the anchors the forward returned. Not a second implementation:
-    # this is the method ``compute_loss`` builds its own target with.
+    # this is the method ``compute_loss`` builds its own target with -- and the model's own
+    # pooled validity beside it, so the probe scores exactly the elements the objective scored.
     target = model._build_forecast_target(features, anchors)
     mask, _coverage = forecast_mask(
-        weight,
+        model.scored_weight(weight),
         model.geometry,
         coverage_floor=float(model.coverage_floor),
         anchors=anchors,
@@ -1004,7 +1006,10 @@ def activation_elements_per_segment(model: Any, *, width_multiplier: int = 1) ->
     Returns:
         The per-segment element count.
     """
-    anchors = int(model.geometry.t_valid) - int(model.warmup_period)
+    # The effective ceiling, not geometry.t_valid: an advancing forecast clock decodes fewer
+    # anchors, and a bound sized for the longer set would only waste memory headroom -- but the
+    # two must not be allowed to drift, so the count is the evaluation's own expectation.
+    anchors = expected_anchors_per_sample(model)
     return int(
         max(1, anchors)
         * int(model.horizon)

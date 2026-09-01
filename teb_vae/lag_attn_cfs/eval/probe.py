@@ -897,8 +897,8 @@ def format_forward_contract(record: Dict[str, Any]) -> str:
         f"  first / last      {anchors['first']} / {anchors['last']}",
         f"  valid per row     {anchors['n_valid_min']}-{anchors['n_valid_max']} "
         f"({anchors['n_distinct_valid_first_row']} distinct in row 0)",
-        f"  floor F           {geometry['anchor_floor']}   T_valid {geometry['t_valid']}   "
-        f"training stride {geometry['training_stride']}",
+        f"  floor F           {geometry['anchor_floor']}   ceiling {geometry['anchor_ceiling']}"
+        f"   T_valid {geometry['t_valid']}   training stride {geometry['training_stride']}",
         "forecast block",
         f"  H x C_keep        {block['horizon']} x {block['decoder_out_channels']} = "
         f"{block['block_width']}",

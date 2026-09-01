@@ -1670,8 +1670,10 @@ def evaluate_batch(
     # disagreement would be a wrong number rather than an exception.
     anchors, anchor_valid = outputs["anchor_index"], outputs["anchor_valid"]
     target = model._build_forecast_target(target_features, anchors)
+    # The forecast clock's pooled validity -- the identity object on the stored clock -- so every
+    # readout in this pass is scored under exactly the mask the training objective used.
     mask, coverage = forecast_mask(
-        weight,
+        model.scored_weight(weight),
         model.geometry,
         coverage_floor=model.coverage_floor,
         anchors=anchors,
@@ -2882,7 +2884,8 @@ def anchor_geometry_verdict(
 
     Two exact numbers, and both are structural rather than statistical:
 
-    * ``anchors_per_sample`` must be $T_{\mathrm{valid}} - F$ -- $137$ at the shipped geometry --
+    * ``anchors_per_sample`` must be $\texttt{anchor\_ceiling} - F$ -- $137$ at the shipped
+      stored-clock geometry, less the forecast clock's largest advance on a ``physical`` arm --
       because the evaluation decodes densely. A different count means the forward ran at the
       *training* tiling, and every number in the run was then computed over a different population
       with nothing else in the summary saying so.
@@ -2906,7 +2909,7 @@ def anchor_geometry_verdict(
         The verdict, carrying both measurements and the expectation.
     """
     criterion = (
-        "anchors_per_sample == T_valid - warmup_period"
+        "anchors_per_sample == anchor_ceiling - warmup_period"
         f"{'' if expected_anchors_per_sample is None else f' ({int(expected_anchors_per_sample)})'}"
         " and target_warm_frac == 1.0"
     )
@@ -3388,19 +3391,26 @@ def _calibration_verdict(
 # Top level
 # =============================================================================
 def expected_anchors_per_sample(model: Any) -> int:
-    r"""The dense anchor count a run of this checkpoint must decode: $T_{\mathrm{valid}} - F$.
+    r"""The dense anchor count a run of this checkpoint must decode.
 
-    Derived from the checkpoint's own geometry rather than stated, so a legitimate arm --
-    ``sweep_horizon_15``, ``sweep_floor_150`` -- moves the expectation with the model instead of
-    failing a guard written against the shipped one.
+    $\texttt{anchor\_ceiling} - F$: the ceiling is $T_{\mathrm{valid}}$ less the forecast clock's
+    largest advance, so a ``physical``-clock checkpoint expects fewer anchors than a stored-clock
+    one of the same geometry -- and a guard that read ``geometry.t_valid`` would fail every one of
+    its rows for a reason that is not a defect. Derived from the checkpoint's own geometry rather
+    than stated, so a legitimate arm -- ``sweep_horizon_15``, ``sweep_floor_150``, a forecast-clock
+    arm -- moves the expectation with the model instead of failing a guard written against the
+    shipped one.
 
     Args:
         model: The rebuilt net.
 
     Returns:
-        The count, $137$ at the shipped geometry.
+        The count, $137$ at the shipped stored-clock geometry.
     """
-    return int(model.geometry.t_valid) - int(model.warmup_period)
+    ceiling = getattr(model, "anchor_ceiling", None)
+    if ceiling is None:
+        ceiling = model.geometry.t_valid
+    return int(ceiling) - int(model.warmup_period)
 
 
 @torch.no_grad()

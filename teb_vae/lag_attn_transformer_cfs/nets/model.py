@@ -131,12 +131,13 @@ class SeqVaeLagAttnTrfCfs(
         target_weight_st: float = 1.0,
         target_weight_ph: float = 1.0,
         target_novelty_frac: Optional[Sequence[float]] = None,
+        target_forecast_shift: Optional[Sequence[int]] = None,
         init_weights: bool = True,
     ) -> None:
         r"""Initialize the model.
 
         Every keyword the architecture parent takes is forwarded unchanged or renamed; only the
-        nine below are
+        ten below are
         this target domain's. The defaults that differ from the parent's -- ``warmup_period`` $134$,
         ``c_y`` $102$, ``c_u`` $51$ -- are this target domain's geometry rather than a preference,
         and a run that left them at the parent's values would be describing a dataset that does not
@@ -175,16 +176,23 @@ class SeqVaeLagAttnTrfCfs(
                 still receives a vector of the right width. ``None`` -- the ungated arm and every
                 unit construction -- reports the split over the declared channel order instead,
                 which is a partition of the axis and not a measurement.
+            target_forecast_shift: $s_c$ per **surviving** target channel, the forecast clock's
+                signed re-indexing of the scored element: anchor $t$, horizon step $\tau$, channel
+                $c$ is scored against stored step $t + 1 + \tau + s_c$. Resolved from
+                ``causal_target_forecast_clock`` -- all-advance under ``physical``, all-delay
+                ($-d_c$) under ``input`` -- and ``None`` under the stored clock, where the model
+                is bitwise one constructed before the keyword existed.
 
         Raises:
             ValueError: If ``anchor_stride`` is outside $[1, H]$ or leaves a phase with no anchor;
                 if ``lag_floor`` is negative; if a warm-up vector arrives without its keep-index;
-                or if ``warmup_period`` is below the floor the kept channels require. Everything
+                if a forecast shift arrives without its keep-index or mixes signs; or if
+                ``warmup_period`` is below the floor the kept channels require. Everything
                 else is the architecture parent's own validation, including the five encoder
                 refusals a conv-LSTM cell has no analogue of.
         """
         # Captured before anything else runs, so the forwarded set is exactly this signature minus
-        # the four keywords the mixin owns. Written out as forty explicit `name=name` pairs it would
+        # the keywords the mixin owns. Written out as forty explicit `name=name` pairs it would
         # be the same dict with one silent failure mode: a keyword added to the architecture parent
         # and forgotten here would be forwarded at its default with nothing raising.
         forwarded = {
@@ -202,6 +210,7 @@ class SeqVaeLagAttnTrfCfs(
             source_warmup_steps=source_warmup_steps,
             anchor_stride=anchor_stride,
             lag_floor=lag_floor,
+            target_forecast_shift=target_forecast_shift,
         )
         # Separate from the call above because the RAW-target causal cells compose that mixin too
         # and have no stored-block split to weight; this half is the feature target's own.

@@ -111,6 +111,9 @@ from teb_vae.lag_attn_cfs.causal_warmup import (  # noqa: E402
     SOURCE_BLOCKS,
     TARGET_BLOCKS,
 )
+from teb_vae.lag_attn_cfs.nets.causal_feature_target import (  # noqa: E402
+    pooled_scored_weight,
+)
 from teb_vae.lag_attn_fs.sample_page import (  # noqa: E402
     FORECAST_CHANNELS,
     _batch_field,
@@ -817,12 +820,42 @@ def _draw_field_rows(rows: ForecastRowInputs, stitched: _Stitched) -> None:
     )
 
 
+def _scored_clock_view(gathered: np.ndarray, shift: Optional[Sequence[int]]) -> np.ndarray:
+    r"""Re-index a kept-channel stream onto the forecast clock: ``view[u, c] = stream[u + s_c, c]``.
+
+    The model's forecast at anchor $t$, horizon step $\tau$, kept channel $c$ is scored against
+    stored step $t + 1 + \tau + s_c$, so a page that draws truth and forecast on one time axis
+    must draw the truth on the same clock or every shifted channel's window reads as a per-channel
+    misalignment of the model. Steps whose re-indexed source falls outside the record are ``NaN``,
+    which every drawing site here already treats as absence.
+
+    Args:
+        gathered: The stream restricted to the kept channels, $(T, C_{\mathrm{keep}})$.
+        shift: $s_c$ per kept channel, or ``None`` / empty for the stored clock -- returned
+            as-is.
+
+    Returns:
+        The re-indexed stream $(T, C_{\mathrm{keep}})$.
+    """
+    if not shift or not any(shift):
+        return gathered
+    view = np.full_like(gathered, np.nan)
+    steps = gathered.shape[0]
+    for column, value in enumerate(int(s) for s in shift):
+        if value >= 0:
+            view[: steps - value, column] = gathered[value:, column]
+        else:
+            view[-value:, column] = gathered[:value, column]
+    return view
+
+
 def _window_block_scores(
     rows: ForecastRowInputs,
     stitched: _Stitched,
     *,
     likelihood: str,
     coverage_floor: float,
+    target_forecast_shift: Optional[Sequence[int]] = None,
 ) -> Optional[Dict[str, np.ndarray]]:
     r"""Each drawn window's own block score, under the objective's likelihood and its mask.
 
@@ -851,8 +884,10 @@ def _window_block_scores(
     index, geometry = rows.sample_index, rows.geometry
     horizon = int(geometry.horizon)
     with torch.no_grad():
+        # The objective's own pooled validity: under a forecast clock a shifted element inside a
+        # signal gap is dropped there, so it must be dropped from this curve too.
         mask, _coverage = forecast_mask(
-            weight,
+            pooled_scored_weight(weight, target_forecast_shift),
             geometry,
             coverage_floor=float(coverage_floor),
             anchors=rows.outs["anchor_index"],
@@ -860,6 +895,15 @@ def _window_block_scores(
         )
         stream = rows.target[index]
         keep = torch.as_tensor(stitched.keep, dtype=torch.long, device=stream.device)
+        # The kept stream on the scored clock, so `[anchor+1 : anchor+1+H]` below reads exactly
+        # the block the objective scored -- the identity re-indexing on the stored clock.
+        gathered = torch.as_tensor(
+            _scored_clock_view(
+                stream.index_select(1, keep).cpu().numpy(), target_forecast_shift
+            ),
+            dtype=stream.dtype,
+            device=stream.device,
+        )
 
         scores: Dict[str, np.ndarray] = {}
         for branch in ("base", "full"):
@@ -869,8 +913,8 @@ def _window_block_scores(
             for position in stitched.positions:
                 anchor = int(stitched.anchors[position])
                 # The anchor's own target block, gathered to the decoder's lanes: anchor $t$
-                # predicts decimated steps $t+1 \dots t+H$, the forward's own convention.
-                target = stream[anchor + 1 : anchor + 1 + horizon].index_select(1, keep)
+                # predicts scored-clock steps $t+1 \dots t+H$, the forward's own convention.
+                target = gathered[anchor + 1 : anchor + 1 + horizon]
                 per_element = raw_sample_score(
                     mean[position], target, likelihood=likelihood, logvar=logvar[position]
                 )
@@ -979,6 +1023,7 @@ def _draw_gap_row(
     likelihood: str,
     coverage_floor: float,
     seconds_per_step: float,
+    target_forecast_shift: Optional[Sequence[int]] = None,
 ) -> None:
     r"""Draw ``pred_gap``: each drawn window's block score, base against full, plus the profiles.
 
@@ -988,6 +1033,7 @@ def _draw_gap_row(
         likelihood: The objective's own likelihood.
         coverage_floor: The model's own anchor coverage floor.
         seconds_per_step: $\Delta$ in seconds, for placing a window in physical time.
+        target_forecast_shift: The model's own forecast clock, for the window scorer.
     """
     ax, cax = rows.row_axes("pred_gap")
     cax.set_visible(False)
@@ -997,7 +1043,11 @@ def _draw_gap_row(
     style_axes(ax, grid="both")
 
     scores = _window_block_scores(
-        rows, stitched, likelihood=likelihood, coverage_floor=coverage_floor
+        rows,
+        stitched,
+        likelihood=likelihood,
+        coverage_floor=coverage_floor,
+        target_forecast_shift=target_forecast_shift,
     )
     if scores is None:
         # The row keeps its title, its axis and its place, so the rows below stay column-aligned
@@ -1083,6 +1133,7 @@ def causal_forecast_rows(
     training_stride: int = 1,
     likelihood: str = "gaussian_nll",
     coverage_floor: float = 0.0,
+    target_forecast_shift: Optional[Sequence[int]] = None,
 ) -> None:
     r"""Draw the causal-feature page's forecast rows, over the anchors the forward decoded.
 
@@ -1115,6 +1166,9 @@ def causal_forecast_rows(
             curve and the scalar beside it in the title are the same quantity.
         coverage_floor: The model's own anchor coverage floor, so a window the objective dropped
             is dropped from the score row too.
+        target_forecast_shift: $s_c$ per kept channel, the model's own forecast clock, so the
+            truth every row draws and the block every window scores are the ones the objective
+            saw. ``None`` -- the stored clock -- draws the stream as stored.
 
     Raises:
         KeyError: If the forward dict carries no anchor set.
@@ -1147,10 +1201,15 @@ def causal_forecast_rows(
     full_mean, full_sigma = _tiled_branch(rows, "full", anchors, positions)
     keep = _resolved_keep_index(keep_index, full_mean.shape[-1])
 
-    # The truth on the decimated grid, gathered to the channels the decoder emits and restricted to
-    # the drawn windows, so an uncovered span reads as absent rather than as unpredicted.
+    # The truth on the decimated grid, gathered to the channels the decoder emits, re-indexed
+    # onto the model's own forecast clock, and restricted to the drawn windows, so an uncovered
+    # span reads as absent rather than as unpredicted.
     stream = to_numpy(rows.target[index])
-    truth = np.where(np.isfinite(full_mean), stream[:, keep], np.nan)
+    truth = np.where(
+        np.isfinite(full_mean),
+        _scored_clock_view(stream[:, keep], target_forecast_shift),
+        np.nan,
+    )
 
     # The one resolved description of what this page draws, shared by the lane row, the error map
     # and the six rows below: a second walk of the anchor set, or a second count of the surviving
@@ -1277,4 +1336,5 @@ def causal_forecast_rows(
         likelihood=likelihood,
         coverage_floor=coverage_floor,
         seconds_per_step=seconds_per_step,
+        target_forecast_shift=target_forecast_shift,
     )

@@ -907,6 +907,21 @@ def main(
         merged = load_config(str(merged_path))
         budget = resolve_warmup_budget(merged)
 
+        # The planted band's arithmetic is stated in STORED steps -- the shard stamps a stored
+        # delay of delta and ``planted_band`` reads the readable lags off it -- so a forecast
+        # clock that re-indexes the scored element would move the band this check scores against
+        # while the stamp stayed put. Refused rather than corrected: the fixture's whole value is
+        # that its expected answer is derivable by hand.
+        if budget is not None and budget.target_forecast_shift is not None:
+            print(
+                f"the planted-delay check is only meaningful on the stored forecast clock: the "
+                f"shard stamps its delay in stored steps, and "
+                f"causal_target_forecast_clock={budget.target_forecast_clock!r} re-indexes the "
+                f"scored element per channel, moving the readable band away from the stamped "
+                f"one. Pin causal_target_forecast_clock: stored in the planted config."
+            )
+            return 1
+
         if mode == "manifest":
             driver, _ = build_model(cell, merged_path)
             record = manifest(driver.pytorch_model)

@@ -238,14 +238,18 @@ class LagAttnCfsTrainer(LagAttnRwsTrainer):
         stride = int(model.anchor_stride)
         floor = int(model.warmup_period)
         t_valid, horizon = int(model.geometry.t_valid), int(model.horizon)
-        # ceil((T_valid - F) / S) is both the geometry constant every rank agrees on and the tile
+        # The EFFECTIVE ceiling, which is T_valid less the forecast clock's largest advance and
+        # T_valid itself on the stored clock: the counts below must be the ones the forward
+        # produces, or the run's own first lines mis-state the population every metric is over.
+        ceiling = int(model.anchor_ceiling)
+        # ceil((ceiling - F) / S) is both the geometry constant every rank agrees on and the tile
         # count at phase 0, which is the most a sample can get; the last phase gets the fewest.
-        a_max = -(-(t_valid - floor) // stride)
-        fewest = -(-(t_valid - floor - (stride - 1)) // stride)
+        a_max = -(-(ceiling - floor) // stride)
+        fewest = -(-(ceiling - floor - (stride - 1)) // stride)
         receptive_field = _horizon_receptive_field(model)
         logger.info(
             f"resolved anchor geometry: horizon H={horizon}, stride S={stride}, "
-            f"floor F={floor}, T_valid={t_valid}, A_max={a_max}, "
+            f"floor F={floor}, T_valid={t_valid}, ceiling={ceiling}, A_max={a_max}, "
             f"tiles per sample {fewest}-{a_max} (phase 0 gets the most), "
             f"block width H*C_keep={horizon * int(model.decoder_out_channels)}, "
             f"horizon receptive field={receptive_field} tokens against H+1={horizon + 1}"
@@ -456,10 +460,12 @@ def _check_floor_pairs_with_budget(
     the identical $98$ channels whose slowest still waits $134$ steps, so a floor derived from the
     threshold would sit $17$ steps too high and cost two tiles for nothing.
 
-    The resolved **shifts** are passed as well as the warm-up, because the two requirements do not
-    move together: the target tile is never shifted, so its validity half stays at $F \\ge B - 1$,
-    while a shifted input stream must additionally have every kept channel warm at the anchor. An
-    unaligned budget carries ``None`` there, which is the inert value.
+    The resolved **input shifts** are passed as well as the warm-up, because the two requirements
+    do not move together: the scored-target half is taken over $W'_c - s_c$ -- the forecast
+    clock's own shift, identically zero on the stored clock, where it reads the historical
+    $F \\ge B - 1$ -- while a shifted input stream must additionally have every kept channel warm
+    at the anchor. An unaligned budget carries ``None`` for the input shifts and a stored-clock
+    one carries ``None`` for the forecast shifts; both are the inert value.
 
     Args:
         config: The resolved run config.
@@ -475,6 +481,7 @@ def _check_floor_pairs_with_budget(
         int(_vae_config(config)["warmup_period"]),
         budget.target.warmup_steps,
         budget.target.align_delays or (),
+        budget.target_forecast_shift or (),
     )
 
 
