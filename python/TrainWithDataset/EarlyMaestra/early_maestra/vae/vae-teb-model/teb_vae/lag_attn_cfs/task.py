@@ -140,6 +140,9 @@ class SeqVaeLagAttnCfsTask(SeqVaeLagAttnFsTask):
             training_stride=int(model.anchor_stride),
             likelihood=str(self.hparams.get("likelihood", "gaussian_nll")),
             coverage_floor=float(model.coverage_floor),
+            # The model's own forecast clock, so the page's truth, its window scores and its mask
+            # are the objective's -- None on the stored clock, where the page is what it was.
+            target_forecast_shift=model.target_forecast_shift,
         )
 
     @property
@@ -407,8 +410,10 @@ class SeqVaeLagAttnCfsTask(SeqVaeLagAttnFsTask):
             model = self.orig_model
             anchors = forward_outputs.get("anchor_index")
             anchor_valid = forward_outputs.get("anchor_valid")
+            # The forecast clock's pooled validity, so this mask is the one the objective scored
+            # under -- the identity object on the stored clock.
             forecast, _coverage = forecast_mask(
-                weight,
+                model.scored_weight(weight),
                 model.geometry,
                 coverage_floor=model.coverage_floor,
                 anchors=anchors,

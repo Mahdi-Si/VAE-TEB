@@ -94,19 +94,29 @@ _ARMS: Dict[str, Dict[str, Any]] = {
         _RUN_NAME: "lag_attn_cfs_kv_adapter",
         _VARIANT: "lag_attn_cfs_kv_adapter",
     },
+    # The forecast-clock pair. Each moves TWO model keys, and the second travels with the first
+    # for the reason `sweep_horizon_15.yaml`'s stride does: the shipped stride of 10 exists to
+    # recover tiles under the physical clock's shortened ceiling, so an arm that restored the
+    # stored or input clock at stride 10 would compare two tilings as well as two clocks. 30
+    # restores the horizon-partitioning tiling every historical run trained at.
+    "sweep_target_clock_stored.yaml": {
+        f"{_VAE}.causal_target_forecast_clock": "stored",
+        f"{_VAE}.anchor_stride": 30,
+        _RUN_NAME: "lag_attn_cfs_clock_stored",
+        _VARIANT: "lag_attn_cfs_clock_stored",
+    },
+    "sweep_target_clock_input.yaml": {
+        f"{_VAE}.causal_target_forecast_clock": "input",
+        f"{_VAE}.anchor_stride": 30,
+        _RUN_NAME: "lag_attn_cfs_clock_input",
+        _VARIANT: "lag_attn_cfs_clock_input",
+    },
 }
 
 #: The arms whose delta is one *model* axis plus the identity pair, and the value each names. The
 #: identity keys are excluded here on purpose: what this checks is that the arm's own axis is a key
 #: the constructor or the task actually reads, which the tracking block is not.
 _IDENTITY_PATHS = (_RUN_NAME, _VARIANT)
-
-#: The arms whose stride is expected to equal their horizon. ``sweep_anchor_stride_1.yaml`` is the
-#: exception BY CONSTRUCTION -- decoupling the two is the whole content of that arm -- which is why
-#: the invariant is stated as a set rather than as a rule over every file.
-_STRIDE_FOLLOWS_HORIZON = tuple(
-    name for name in _ARMS if name != "sweep_anchor_stride_1.yaml"
-)
 
 
 def _flatten(node: Dict[str, Any], prefix: str = "") -> Dict[str, Any]:
@@ -224,14 +234,19 @@ def test_an_arm_differs_from_the_default_in_exactly_its_declared_keys(name, defa
         assert arm_flat[path] == value
 
 
-@pytest.mark.parametrize("name", _STRIDE_FOLLOWS_HORIZON)
-def test_an_arm_moves_the_stride_with_the_horizon(name):
-    """The two are one decision everywhere except in the arm whose content is decoupling them. A
-    horizon change that left the stride behind would either overlap the windows again or leave
-    target steps no phase ever covers, and neither would change a shape."""
+@pytest.mark.parametrize("name", sorted(_ARMS))
+def test_an_arm_keeps_the_default_tiling_unless_its_delta_moves_it(name, default_flat):
+    """The tiling travels with the forecast clock, so the invariant is the PAIRING rather than
+    stride-equals-horizon: an arm that does not declare `anchor_stride` inherits the shipped
+    stride-10 tiling with the shipped physical clock, and an arm that declares it states its own
+    pairing in its delta -- where the one-axis test already pins it. Either way the stride must
+    stay inside $[1, H]$, where the constructor admits it."""
+    intended = _ARMS[name]
     _floor, stride, horizon, _t_valid = _geometry(_resolved(name))
 
-    assert stride == horizon
+    assert 1 <= stride <= horizon
+    if f"{_VAE}.anchor_stride" not in intended:
+        assert stride == default_flat[f"{_VAE}.anchor_stride"] == 10
 
 
 @pytest.mark.parametrize("name", sorted(_ARMS))
@@ -283,25 +298,37 @@ def test_the_stride_arm_restores_the_dense_anchor_set():
     assert -(-(t_valid - floor) // stride) == t_valid - floor == 136
 
 
-def test_the_floor_arm_keeps_the_identical_channels_and_costs_exactly_one_tile():
+def test_the_floor_arm_keeps_the_identical_channels_and_costs_exactly_two_tiles():
     """The cost of the policy, stated as a number rather than as an argument: the same $98$ channels
-    (neither the budget nor the alignment reference moved), one fewer tile at phase $0$, and $16$
+    (neither the budget nor the alignment reference moved), two fewer tiles at phase $0$, and $16$
     fewer covered target steps.
 
-    The **withheld steps** are the invariant and the **tiles** are not. At the one-minute horizon
-    the same floor cost two tiles; at two minutes each tile covers $30$ steps rather than $15$, so
-    the identical policy costs half as many whole tiles. Both numbers are asserted so that a future
-    horizon change fails here rather than quietly re-pricing the arm.
+    The **withheld steps** are the invariant and the **tiles** are not. At the horizon-partitioning
+    stride of $30$ the same floor cost one tile; at the shipped physical-clock tiling of stride
+    $10$ the identical $16$-step policy spans two tile boundaries. Both numbers are asserted so
+    that a future tiling change fails here rather than quietly re-pricing the arm -- and the tile
+    count is taken over the EFFECTIVE ceiling, resolved against the committed shards, because the
+    physical clock's trailing anchors do not exist to be withheld.
 
     The withheld span is $16$ rather than $17$ because the shipped floor moved with the alignment,
     from $133$ to $134$; the arm's own floor is a round policy number and did not.
     """
+    from teb_vae.lag_attn_cfs.causal_warmup import resolve_warmup_budget
+
+    from .conftest import causal_config
+
     shipped_floor, stride, _horizon, t_valid = _geometry(load_config(str(_DEFAULT)))
     arm_floor, arm_stride, _h, arm_t_valid = _geometry(_resolved("sweep_floor_150.yaml"))
 
+    budget = resolve_warmup_budget(
+        causal_config(causal_target_forecast_clock="physical", anchor_stride=10)
+    )
+    assert budget is not None
+    ceiling = t_valid - budget.max_forecast_advance
+
     assert (arm_stride, arm_t_valid) == (stride, t_valid)
     assert arm_floor - shipped_floor == 16
-    assert -(-(t_valid - shipped_floor) // stride) - -(-(t_valid - arm_floor) // stride) == 1
+    assert -(-(ceiling - shipped_floor) // stride) - -(-(ceiling - arm_floor) // stride) == 2
 
 
 @pytest.mark.parametrize("name", sorted(_ARMS))

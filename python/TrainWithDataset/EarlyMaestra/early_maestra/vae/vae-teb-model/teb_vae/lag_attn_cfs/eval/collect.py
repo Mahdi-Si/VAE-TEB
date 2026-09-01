@@ -922,6 +922,7 @@ def geometry_record(model: Any) -> Dict[str, Any]:
     """
     keep_index = getattr(getattr(model, "target_gate", None), "keep_index", None)
     geometry = model.geometry
+    anchor_ceiling = int(getattr(model, "anchor_ceiling", geometry.t_valid))
     anchor_phase, anchor_stride = DENSE_ANCHOR_GEOMETRY
     return {
         "t": int(geometry.t),
@@ -932,7 +933,10 @@ def geometry_record(model: Any) -> Dict[str, Any]:
         "anchor_floor": int(model.warmup_period),
         "anchors_per_sample": int(expected_anchors_per_sample(model)),
         "anchor_first": int(model.warmup_period),
-        "anchor_last": int(geometry.t_valid) - 1,
+        # The EFFECTIVE ceiling, not t_valid: an advancing forecast clock's trailing anchors are
+        # never decoded, and a profile axis built to t_valid - 1 would end in columns no run of
+        # this checkpoint can populate.
+        "anchor_last": anchor_ceiling - 1,
         "anchor_phase": int(anchor_phase),
         "anchor_stride": int(anchor_stride),
         # What the checkpoint was *trained* at. A table read against the training CSV would be

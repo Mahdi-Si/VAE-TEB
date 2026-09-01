@@ -458,6 +458,62 @@ CANDIDATE_FLOOR_SECONDS = 150.0
 ENVELOPE_BLOCK = "up_ph"
 MIN_UP_PH_KEPT = 8
 
+#: The delay band the lag axis can be about under the **physical** forecast clock: the previous
+#: contraction's recurrence, one cycle of the $2$-$5$ minute IUP rhythm back from the predicted
+#: instant.
+#:
+#: The proximate $20$-$60$ s band is **structurally unpriceable** there, and this is arithmetic
+#: rather than a tooling gap. A strictly-future target puts the scored instant after the anchor,
+#: so the offset the identity subtracts becomes $\tau^u_{\mathrm{ref}} - \tau_{\min}$ -- and for
+#: the whole band to clear lag $0$ at the far horizon step the source clock would have to sit at
+#: $\tau^u_{\mathrm{ref}} < 34$ s, below every stored source delay and $116$ s below the floor
+#: that keeps any envelope channel at all. The proximate driver of a predicted instant is simply
+#: unrecorded at the anchor, for every reference; what past UP can carry about future FHR is the
+#: contraction cycle's phase, and the recurrence band is where that lives. Priced like the
+#: proximate band -- same table, same two criteria -- and read with
+#: :func:`readable_window_seconds` beside it, because at $H = 30$ the band slides $116$ s across
+#: the horizon and the every-step window is the honest statement of what a candidate covers.
+RECURRENCE_BAND_SECONDS: Tuple[float, float] = (120.0, 300.0)
+
+
+def readable_window_seconds(
+    offset_s: float,
+    *,
+    horizon: int,
+    max_lag: int,
+    seconds_per_step: float = SECONDS_PER_STEP,
+    mechanical_shift_seconds: float = MECHANICAL_SHIFT_SECONDS,
+) -> Tuple[float, float]:
+    r"""The physical-delay window readable at **every** horizon step, for one clock offset.
+
+    $$\bigl[\Delta H + \mathrm{offset} - \tau_{\mathrm{pre}},\;
+      \Delta L + \mathrm{offset} - \tau_{\mathrm{pre}}\bigr],$$
+
+    the intersection over $h \in [0, H)$ of the per-step windows
+    $[\Delta(1{+}h) + \mathrm{offset} - \tau_{\mathrm{pre}},\,
+    \Delta(L{+}h) + \mathrm{offset} - \tau_{\mathrm{pre}}]$: the lower edge is lag $0$ at the far
+    step, the upper is lag $L - 1$ at the first. A band inside this window is what the table's
+    ``readable`` verdict asserts, and printing the window itself is what lets an operator see
+    *which* delays a censored candidate still covers rather than only that the named band is not
+    among them.
+
+    Args:
+        offset_s: $\tau^u_{\mathrm{ref}} - \tau^y_{\mathrm{ref}}$ in seconds, against whichever
+            target clock the run scores on.
+        horizon: $H$ in decimated steps.
+        max_lag: The furthest searched lag, $L - 1$.
+        seconds_per_step: Seconds per decimated step $\Delta$.
+        mechanical_shift_seconds: $\tau_{\mathrm{pre}}$, the sensor delay preprocessing removed.
+
+    Returns:
+        ``(lo, hi)`` in seconds.
+    """
+    base = float(offset_s) - float(mechanical_shift_seconds)
+    return (
+        float(seconds_per_step) * float(horizon) + base,
+        float(seconds_per_step) * (float(max_lag) + 1.0) + base,
+    )
+
 
 class SourceReferencePoint(NamedTuple):
     r"""One candidate source clock $\tau^u_{\mathrm{ref}}$, and the three things it decides.
@@ -553,6 +609,7 @@ def source_reference_tradeoff(
     max_lag: int,
     band_seconds: Tuple[float, float] = PHYSIOLOGICAL_BAND_SECONDS,
     candidate_floor_s: float = CANDIDATE_FLOOR_SECONDS,
+    candidate_ceiling_s: Optional[float] = None,
 ) -> List[SourceReferencePoint]:
     r"""Price every candidate clock for the source stream against the target's own.
 
@@ -576,21 +633,26 @@ def source_reference_tradeoff(
 
     Args:
         source: The resolved source stream, read for its declared delays and its block spans.
-        target_reference_s: $\tau^y_{\mathrm{ref}}$, the clock the target keeps. It is also the
-            slowest candidate: a source reference above it would move the source *later* than the
-            target and push the band toward the far censoring edge instead of away from the near
-            one.
+        target_reference_s: $\tau^y_{\mathrm{ref}}$, the clock the target is **scored** on --
+            the input alignment's reference on the stored clock this table historically priced,
+            the forecast reference $\tau_{\min}$ under a ``physical`` forecast clock. Every
+            offset below is a candidate minus this.
         horizon: $H$ in decimated steps. The band is checked at every horizon step, because the lag
             reporting a fixed physiological delay moves one bin per step of $h$ -- which is what
             makes a delay readable at $h = 0$ and censored at $h = H - 1$.
         max_lag: The lag window's furthest searched lag, $L - 1$.
         band_seconds: The physiological delay band, ``(fastest, slowest)``.
         candidate_floor_s: Fastest stored delay a candidate may be taken from.
+        candidate_ceiling_s: Slowest, or ``None`` for ``target_reference_s`` -- the historical
+            cap, there because a source clock above the target's own would push the band toward
+            the far censoring edge instead of away from the near one. A caller pricing against a
+            forecast reference **must** pass the input clock here instead: every stored source
+            delay is above $\tau_{\min}$, so the default would leave no candidate at all.
 
     Returns:
         One :class:`SourceReferencePoint` per candidate, ascending in the reference. The row at
-        ``target_reference_s`` is today's single-reference behaviour and is always included, so
-        every other row is read against it.
+        the ceiling is the no-second-clock behaviour and is included whenever it is a stored
+        delay, so every other row is read against it.
 
     Raises:
         ValueError: If the band is not ``(fastest, slowest)`` with both non-negative, or if no
@@ -607,13 +669,14 @@ def source_reference_tradeoff(
 
     delays = np.asarray(source.declared_delay_s, dtype=np.float64)
     reference = float(target_reference_s)
+    ceiling = reference if candidate_ceiling_s is None else float(candidate_ceiling_s)
     candidates = np.unique(
-        delays[(delays >= float(candidate_floor_s)) & (delays <= reference)]
+        delays[(delays >= float(candidate_floor_s)) & (delays <= ceiling)]
     )
     if not candidates.size:
         raise ValueError(
             f"no stored {source.name} delay falls in [{float(candidate_floor_s):g}, "
-            f"{reference:.4f}] s, so there is no candidate reference to price: the stream's "
+            f"{ceiling:.4f}] s, so there is no candidate reference to price: the stream's "
             f"delays run {float(delays.min()):.4f}-{float(delays.max()):.4f} s. A reference must "
             f"be one of them, so it is the range that is empty rather than the answer."
         )
@@ -784,18 +847,47 @@ def main(config: str) -> int:
     horizon, max_lag = int(vae_config["horizon"]), int(vae_config["max_lag"])
     print(resolved.summary())
     print()
-    print(
-        format_source_reference_table(
-            source_reference_tradeoff(
-                resolved.source,
-                target_reference_s=resolved.reference_delay_s,
-                horizon=horizon,
-                max_lag=max_lag,
-            ),
-            max_lag=max_lag,
-            horizon=horizon,
-        )
+
+    # Which clock the target is SCORED on decides the offset every row is priced with, and with
+    # it the band the table can be about: against a physical forecast clock the proximate band is
+    # structurally censored (see RECURRENCE_BAND_SECONDS), so the recurrence band is priced and
+    # each candidate's every-step readable window is printed beside the table -- the number a
+    # config header quotes when no candidate covers the named band whole.
+    physical = resolved.target_forecast_reference_s is not None
+    target_reference_s = (
+        resolved.target_forecast_reference_s if physical else resolved.reference_delay_s
     )
+    assert target_reference_s is not None  # both branches are guarded above
+    band = RECURRENCE_BAND_SECONDS if physical else PHYSIOLOGICAL_BAND_SECONDS
+    points = source_reference_tradeoff(
+        resolved.source,
+        target_reference_s=target_reference_s,
+        horizon=horizon,
+        max_lag=max_lag,
+        band_seconds=band,
+        candidate_ceiling_s=resolved.reference_delay_s if physical else None,
+    )
+    print(format_source_reference_table(points, max_lag=max_lag, horizon=horizon, band_seconds=band))
+    if physical:
+        print()
+        print(
+            f"forecast clock {resolved.target_forecast_clock!r} (reference "
+            f"{target_reference_s:.4f} s): every-step readable physical-delay window per "
+            f"candidate, at H={horizon}, L-1={max_lag}:"
+        )
+        for point in points:
+            lo, hi = readable_window_seconds(
+                point.offset_s, horizon=horizon, max_lag=max_lag
+            )
+            # The intersection over horizon steps is empty whenever the lag window is narrower
+            # than the horizon (max_lag < H - 1): no delay is readable at EVERY step, at any
+            # clock, and printing an inverted interval would read as a bug rather than a fact.
+            window = (
+                f"[{lo:7.1f}, {hi:7.1f}] s"
+                if lo <= hi
+                else f"empty (max_lag {max_lag} < horizon reach {horizon - 1})"
+            )
+            print(f"  {point.reference_s:>12.4f}  {window}")
     return 0
 
 

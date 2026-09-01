@@ -373,6 +373,48 @@ model_config:
     # of clocks, and against an unaligned target the offset does not exist.
     causal_align_reference_source: 288.2672
 
+    # --- Which clock the forecast target is SCORED on ---------------------------
+    # The two keys above align the INPUTS; this one re-indexes the QUESTION. The scored element at
+    # anchor t, horizon step tau, kept channel c reads stored step t + 1 + tau + s_c:
+    #
+    #   'physical'  s_c = round(kappa * (tau_c - tau_min) / 4s) >= 0: every channel advanced so
+    #               that horizon step tau describes signal content at ONE physical future instant.
+    #               Every element is a strict forecast for every channel -- on the stored clock the
+    #               slowest kept channel draws 2.6% of its value from the horizon window and its
+    #               "forecast" is near-copyable, so the latent was never forced to encode
+    #               genuinely predictive information at the slow scales. This is the default.
+    #   'input'     s_c = -d_c: the continuation of the encoder's own aligned stream. Scored
+    #               content sits up to ~350 s in the past and the source clock is ~100 s FRESHER
+    #               than it, so pred_gap loses its directed reading there; kept as an arm, not a
+    #               default. Requires causal_align_reference above.
+    #   'stored'    s_c = 0 (also the absent key): every run before this key existed.
+    #
+    # WHAT 'physical' COSTS AND MOVES. The largest advance is 85 steps (the slowest kept channel,
+    # round(0.875*(402.1604-13.3405)/4)), so the anchor ceiling drops from T_valid = 270 to 185:
+    # dense anchors 136 -> 51, and `anchor_stride` below moves to 10 to keep ~5-6 training tiles
+    # per sample. The floor does NOT move -- the scored-target half relaxes to
+    # max_c(W'_c - s_c) - 1 while the shifted-inputs half still binds at 134. Validity is pooled
+    # conservatively over the shift span (see CausalFeatureForecastTarget.scored_weight), and the
+    # novelty-tertile split keeps its stored-clock ranking (readout only; its interpretation note
+    # lives with the buffer).
+    #
+    # WHAT 'physical' MEANS FOR THE LAG AXIS. The 20-60 s proximate UP->FHR band is STRUCTURALLY
+    # censored under a strictly-future target: the offset the lag identity subtracts becomes
+    # tau_u_ref - tau_min, and clearing lag 0 at the far horizon step would need tau_u_ref < 34 s
+    # -- below every stored source delay. That is arithmetic, not tooling: the proximate driver of
+    # a predicted instant is unrecorded at the anchor, for every reference. What past UP carries
+    # about future FHR is the contraction cycle's phase, so the axis is re-registered to the
+    # RECURRENCE window: at the retained source clock 288.2672 and max_lag 90 the every-step
+    # readable physical-delay window is [374.9, 618.9] s -- the previous one-to-two contractions
+    # of the 2-5 min IUP cycle. Re-price with warmup_budget.py (it prints this window per
+    # candidate under a physical-clock config); a faster source clock cannot help, because
+    # reaching even 240 s at every step keeps at most one `up_ph` channel.
+    #
+    # `sweep_target_clock_stored.yaml` restores today's target and tiling exactly;
+    # `sweep_target_clock_input.yaml` is the aligned-continuation arm. planted.yaml PINS 'stored':
+    # its planted delay is stamped in stored steps and lag_recovery_check refuses any other clock.
+    causal_target_forecast_clock: physical
+
     # Which phase-harmonic operator built the CONFIGURED SHARDS' two phase blocks, checked against
     # their own `causal_leg_alignment` root attribute and refused by name on a disagreement.
     #
@@ -388,23 +430,24 @@ model_config:
     causal_leg_alignment: envelope
 
     # --- Anchor tiling ---------------------------------------------------------
-    # S, the spacing between decoded anchors, in [1, H]. At S = H consecutive forecast windows
-    # PARTITION the timeline instead of overlapping (H-1)/H, so no target coefficient is scored
-    # twice in one step and the gradients of one batch element stop being correlated across H
-    # anchors. Over epochs every anchor in [F, T_valid) is still used, because the per-segment phase
-    # rotates with the epoch.
+    # S, the spacing between decoded anchors, in [1, H]. Over epochs every anchor in
+    # [F, anchor_ceiling) is used, because the per-segment phase rotates with the epoch.
     #
-    # 30 = `horizon`, and the two must move together: a horizon change that left the stride behind
-    # would either overlap the windows again (S < H) or leave target steps that no phase ever covers
-    # (S > H, which the constructor refuses). tests/test_config_load.py asserts the equality here and
-    # in every arm rather than leaving it to be noticed.
+    # 10, down from the horizon-partitioning 30, and the physical forecast clock is why: its
+    # ceiling leaves a 51-anchor span, which at S = 30 is 1-2 tiles per sample -- too little
+    # training signal per epoch. S = 10 restores ~5-6 tiles at the same A_max (6 against the old
+    # 5), i.e. at memory parity. The windows overlap 2/3 again; every loss denominator is an
+    # anchor count, and the KL support is a set either way, so overlap changes correlation between
+    # tiles rather than any denominator. The stored-clock arm restores S = 30 with its clock, so
+    # the historical geometry stays one file away. tests/test_config_load.py pins the pairing
+    # (clock, stride) here and in every arm rather than leaving it to be noticed.
     #
     # Validation and test decode every valid anchor -- stride 1, phase 0 -- rather than one tile
-    # grid: a single phase is deterministic but PHASE-BIASED, sampling the same 5 of 136 anchors at
+    # grid: a single phase is deterministic but PHASE-BIASED, sampling the same few anchors at
     # a fixed offset from the segment start forever. There is no gradient there, so neither the
     # redundancy argument nor the memory argument applies. `sweep_anchor_stride_1.yaml` is the arm
     # that trains densely too.
-    anchor_stride: 30
+    anchor_stride: 10
     # F_u, the earliest source step lag attention may read: the lag mask generalises from
     # 1[t - l >= 0] to 1[t - l >= F_u]. Ships at 0, where it is BITWISE the two-sided sibling's mask,
     # and exists so the source compromise above is measurable rather than argued about. No arm moves
@@ -915,9 +958,10 @@ advanced_config:
       # while its records name another, and no metric says so -- which is exactly how a
       # headline evaluation came to be read as the aligned arm having trained unaligned. The
       # alignment arm is the axis that failure ran along, so it is the axis the name carries: the
-      # target keeps 402.1604 s and the source reads on 288.2672 s. Every sweep arm below
-      # renames both keys after its own delta.
-      run_name: lag_attn_cfs_dualref288
+      # target keeps 402.1604 s, the source reads on 288.2672 s, and the forecast target is
+      # scored on the physical clock at stride 10. Every sweep arm below renames both keys after
+      # its own delta.
+      run_name: lag_attn_cfs_dualref288_physclock
       artifact_location: null
       # Logs and registers the final eager model at fit end, via the run-logging callback the
       # trainer builder attaches automatically.
@@ -929,7 +973,7 @@ advanced_config:
       tags:
         project: teb_vae
         stage: dev
-        variant: lag_attn_cfs_dualref288
+        variant: lag_attn_cfs_dualref288_physclock
 
   callbacks:
     # ON, and the patience is the number rather than the flag. A 5000-epoch budget against a run

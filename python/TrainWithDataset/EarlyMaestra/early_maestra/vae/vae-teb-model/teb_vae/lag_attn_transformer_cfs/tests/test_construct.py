@@ -261,8 +261,13 @@ def test_the_reversed_base_order_builds_a_raw_decoder(tiny_kwargs):
         ("TARGET_BLOCK_SPLIT", CausalFeatureForecastTarget),
         ("SOURCE_BLOCK_SPLIT", CausalFeatureForecastTarget),
         ("_default_decoder_out_channels", FeatureForecastTarget),
-        ("_build_forecast_target", FeatureForecastTarget),
-        ("compute_loss", FeatureForecastTarget),
+        # Both owned by the causal target mixin since the forecast clock exists -- thin overrides
+        # that delegate to the parent whenever no shift is set, so the stored clock stays bitwise
+        # the parent's. The identity pin below still holds against the OWNER, which is the point:
+        # a fork of either that stopped delegating would fail the delegation tests in the
+        # conv-LSTM cell's suite, and a copy here would fail this one.
+        ("_build_forecast_target", CausalFeatureForecastTarget),
+        ("compute_loss", CausalFeatureForecastTarget),
         ("_reparameterize_shared", SeqVaeLagAttnTrfRws),
         ("kld_tensor", SeqVaeLagAttnTrfRws),
         ("_build_channel_gate", SeqVaeLagAttnTrfRws),
@@ -322,6 +327,10 @@ def test_the_signature_is_the_architecture_parents_with_the_delays_replaced():
         # here rather than on the raw-target cells because a raw forecast window lies entirely
         # after the anchor, so a per-channel novelty share is undefined there rather than small.
         "target_novelty_frac",
+        # The forecast clock's signed shift: which stored step each kept channel is SCORED at. On
+        # the feature-target cells only, for the reason the novelty vector is -- a raw sample has
+        # no per-channel clock to re-index.
+        "target_forecast_shift",
     }
     assert not any(
         parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters.values()

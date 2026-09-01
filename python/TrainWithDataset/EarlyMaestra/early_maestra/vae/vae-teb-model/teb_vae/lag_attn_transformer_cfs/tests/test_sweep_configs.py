@@ -96,6 +96,23 @@ _ARMS: Dict[str, Dict[str, Any]] = {
         _RUN_NAME: "lag_attn_trf_cfs_source_dropout_03",
         _VARIANT: "lag_attn_trf_cfs_source_dropout_03",
     },
+    # The forecast-clock pair. Each moves TWO model keys, and the second travels with the first:
+    # the shipped stride of 10 exists to recover tiles under the physical clock's shortened
+    # ceiling, so an arm that restored the stored or input clock at stride 10 would compare two
+    # tilings as well as two clocks. 30 restores the horizon-partitioning tiling every historical
+    # run trained at.
+    "sweep_target_clock_stored.yaml": {
+        f"{_VAE}.causal_target_forecast_clock": "stored",
+        f"{_VAE}.anchor_stride": 30,
+        _RUN_NAME: "lag_attn_trf_cfs_clock_stored",
+        _VARIANT: "lag_attn_trf_cfs_clock_stored",
+    },
+    "sweep_target_clock_input.yaml": {
+        f"{_VAE}.causal_target_forecast_clock": "input",
+        f"{_VAE}.anchor_stride": 30,
+        _RUN_NAME: "lag_attn_trf_cfs_clock_input",
+        _VARIANT: "lag_attn_trf_cfs_clock_input",
+    },
 }
 
 #: The two paths excluded from the "one axis" reading above: what they move is how a finished run
@@ -215,11 +232,17 @@ def test_the_stride_arm_restores_the_dense_anchor_set():
     assert -(-(t_valid - floor) // stride) == t_valid - floor == 136
 
 
-def test_the_default_moves_the_stride_with_the_horizon():
-    """The two are one decision everywhere except in the arm whose content is decoupling them."""
-    _floor, stride, horizon, _t_valid = _geometry(load_config(str(_DEFAULT)))
+def test_the_default_pairs_the_stride_with_the_forecast_clock():
+    """The tiling travels with the forecast clock: the physical clock's ceiling leaves a 51-anchor
+    span, and stride 10 is what keeps ~5-6 training tiles per sample there at the old A_max. The
+    stored-clock arm restores the horizon-partitioning 30 with its clock, where its own delta
+    test pins the pairing."""
+    default = load_config(str(_DEFAULT))
+    _floor, stride, horizon, _t_valid = _geometry(default)
 
-    assert stride == horizon
+    assert default["model_config"]["VAE_model"]["causal_target_forecast_clock"] == "physical"
+    assert stride == 10
+    assert horizon == 30
 
 
 @pytest.mark.parametrize("name", sorted(_ARMS))

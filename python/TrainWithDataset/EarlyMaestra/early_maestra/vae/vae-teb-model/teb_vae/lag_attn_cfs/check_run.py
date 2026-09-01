@@ -280,6 +280,12 @@ def resolve_anchor_band(config: Dict[str, Any]) -> AnchorBand:
     $\lceil (T_{\mathrm{valid}} - F - \varphi)/S \rceil$ -- a **ceiling**, so it varies by one across
     phases. Both evaluation stages decode the dense set instead.
 
+    Under a ``physical`` forecast clock the anchor ceiling is $T_{\mathrm{valid}}$ less the
+    largest advance, which is a property of the shards' delay vectors rather than of the config --
+    so that one clock re-resolves the budget to read it. Where the shards are unreachable the
+    resolver's own ``ValueError`` propagates, and the caller already reads that as "criterion 2
+    cannot be evaluated here" rather than as a failure.
+
     Args:
         config: The resolved run configuration.
 
@@ -288,6 +294,8 @@ def resolve_anchor_band(config: Dict[str, Any]) -> AnchorBand:
 
     Raises:
         KeyError: If the configuration carries no ``model_config.VAE_model`` geometry.
+        ValueError: If a ``physical`` forecast clock is configured and the budget cannot be
+            resolved against the configured shards.
     """
     vae = (config.get("model_config") or {}).get("VAE_model") or {}
     sequence_length = int(vae["sequence_length"])
@@ -297,7 +305,15 @@ def resolve_anchor_band(config: Dict[str, Any]) -> AnchorBand:
     # inert value the whole family shares, and the one an arm config restores deliberately.
     stride = int(vae.get("anchor_stride") or 1)
 
-    dense = max(sequence_length - horizon - floor, 0)
+    advance = 0
+    if vae.get("causal_target_forecast_clock") == "physical":
+        from teb_vae.lag_attn_cfs.causal_warmup import resolve_warmup_budget
+
+        budget = resolve_warmup_budget(config)
+        if budget is not None:
+            advance = budget.max_forecast_advance
+
+    dense = max(sequence_length - horizon - floor - advance, 0)
     return AnchorBand(
         train_low=-(-max(dense - (stride - 1), 0) // stride),
         train_high=-(-dense // stride),

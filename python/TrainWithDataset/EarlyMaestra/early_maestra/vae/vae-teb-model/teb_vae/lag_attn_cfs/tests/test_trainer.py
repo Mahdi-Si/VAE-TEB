@@ -221,7 +221,7 @@ def test_the_two_new_geometry_keys_reach_the_constructor(driver):
     defaults with nothing raising."""
     kwargs = driver._build_model_kwargs()
 
-    assert kwargs["anchor_stride"] == 30
+    assert kwargs["anchor_stride"] == 10
     assert kwargs["lag_floor"] == 0
 
 
@@ -249,7 +249,12 @@ def test_the_resolved_kwargs_actually_build_the_model_the_config_describes(drive
     assert model.target_adapter.linear.in_features == GUARDED_TARGET_CHANNELS
     assert model.source_adapter.linear.in_features == GUARDED_SOURCE_CHANNELS
     assert model.raw_per_step == 16
-    assert model.anchor_stride == model.horizon == 30
+    assert model.anchor_stride == 10
+    assert model.horizon == 30
+    # The forecast clock the config states, resolved and applied: the physical advance costs the
+    # trailing 85 anchors of the valid span.
+    assert model.target_forecast_shift is not None
+    assert model.anchor_ceiling == model.geometry.t_valid - max(model.target_forecast_shift)
     # The declared widths are untouched, which is what the data boundary checks against.
     assert (model.c_y, model.c_u) == (CAUSAL_C_Y, CAUSAL_C_U)
     # The unconditional freeze the DDP strategy relies on.
@@ -341,8 +346,10 @@ def test_create_model_logs_the_resolved_anchor_geometry(driver, caplog):
         logger.remove(sink)
 
     line = next(m for m in messages if "resolved anchor geometry" in m)
-    assert "H=30" in line and "S=30" in line and "F=134" in line
-    assert "A_max=5" in line and "T_valid=270" in line
+    assert "H=30" in line and "S=10" in line and "F=134" in line
+    # The counts are taken over the EFFECTIVE ceiling -- T_valid less the physical forecast
+    # clock's 85-step advance -- because those are the anchors the forward actually builds.
+    assert "A_max=6" in line and "T_valid=270" in line and "ceiling=185" in line
     assert "block width H*C_keep=2940" in line
     assert "receptive field=31" in line
 

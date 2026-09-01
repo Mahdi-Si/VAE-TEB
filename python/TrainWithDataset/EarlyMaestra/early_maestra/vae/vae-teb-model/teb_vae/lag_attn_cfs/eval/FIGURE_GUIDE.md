@@ -110,7 +110,7 @@ Four warnings this pipeline repeats because each has cost a result somewhere:
 | `causal_warmup_steps` | per channel: the leading delay, in 4-second steps, before that channel's coefficients are honest |
 | `causal_delay_s` | per channel: the composed one-sided group delay, in seconds. What makes the lag axis coefficient time. |
 | `target_warm_frac` | the fraction of scored anchors at which every kept target channel is warm. Must be exactly $1.0$. |
-| `anchors_per_sample` | anchors decoded per segment. Must be exactly $136$ at the dense set. |
+| `anchors_per_sample` | anchors decoded per segment. Must be exactly the checkpoint's own `anchor_ceiling - warmup_period` at the dense set: $136$ on the stored forecast clock, $51$ under the shipped `physical` one (the ceiling is $T_{\mathrm{valid}}$ less the clock's largest advance, 85). |
 | `source_lag_warmth_frac_st` / `_ph` | the fraction of attention mass landing on lags at which that stored source block is warm. **A small value is the expected finding.** |
 | band | one of `slow_baseline`, `deceleration`, `variability`, `beat_to_beat`, `unknown` — the band of the **analysing filter** that produced the coefficient, not a bin of the forecast's own spectrum |
 | `unknown` | a channel whose centre frequency is not recoverable, because no selected phase-harmonic pair named its filter. Never bucketed into a neighbour. |

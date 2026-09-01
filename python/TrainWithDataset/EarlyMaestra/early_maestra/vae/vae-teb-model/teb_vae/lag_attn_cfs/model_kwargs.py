@@ -48,6 +48,13 @@ WARMUP_MODEL_KWARGS = (
 #: when a reference is configured, so an unaligned run's kwargs dict is byte for byte what it was.
 ALIGN_MODEL_KWARGS = ("target_align_delays", "source_align_delays")
 
+#: The forecast clock's signed shift, in a fourth tuple for a fourth reason: it moves neither an
+#: input (the two tuples above) nor a readout (the one below) but the **question itself** -- which
+#: stored step each kept target channel is scored at. Emitted only when the configured clock is not
+#: ``'stored'``, so a stored-clock run's kwargs dict -- and therefore every checkpoint written
+#: before the key existed -- is byte for byte what it was.
+FORECAST_ALIGN_MODEL_KWARGS = ("target_forecast_shift",)
+
 #: The readout vector, in a third tuple for a third reason: it is neither a guard nor a shift. It
 #: partitions the *scored target* by how much of each coefficient is genuinely new at the anchor's
 #: horizon, and it changes no width, no mask and no parameter -- which is exactly why the ungated
@@ -125,6 +132,22 @@ def warmup_model_kwargs(
                 f"as a novelty split."
             )
         mapped["target_novelty_frac"] = budget.target.declared_novelty_frac
+
+    # The forecast clock's shift, before the alignment gate below: the two are independent -- the
+    # physical clock is resolvable on an unaligned run -- so its emission cannot sit behind the
+    # reference check. Refused rather than dropped for the reason both refusals above give: a model
+    # without the keyword would score every channel at its stored index while the run's config
+    # states another clock, with every shape correct and the anchor count the only witness.
+    if budget.target_forecast_shift is not None:
+        if FORECAST_ALIGN_MODEL_KWARGS[0] not in accepted:
+            raise ValueError(
+                f"a {budget.target_forecast_clock!r} forecast clock is configured but "
+                f"{model_cls.__module__}.{model_cls.__qualname__} does not accept "
+                f"{FORECAST_ALIGN_MODEL_KWARGS[0]!r}. That architecture can only score each "
+                f"target channel at its own stored index, so it would silently answer the stored "
+                f"clock's question while the run records another one."
+            )
+        mapped["target_forecast_shift"] = budget.target_forecast_shift
 
     if budget.reference_delay_s is None:
         return mapped

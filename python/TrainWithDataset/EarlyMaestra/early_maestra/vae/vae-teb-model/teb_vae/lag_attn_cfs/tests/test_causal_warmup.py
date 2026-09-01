@@ -884,3 +884,136 @@ def test_a_novelty_vector_of_the_wrong_width_is_refused_naming_the_block(tmp_pat
     mangled = write_variant(CAUSAL_SHARD, tmp_path / "short_novelty.hdf5", _shorten)
     with pytest.raises(ValueError, match="fhr_st.*causal_novelty_frac"):
         resolve_warmup_budget(causal_config(paths=[mangled]))
+
+
+# =================================================================================================
+# The forecast clock
+# =================================================================================================
+@pytest.fixture(scope="module")
+def physical_clock():
+    """The shipped aligned configuration scored on the physical clock, resolved once."""
+    resolved = resolve_warmup_budget(
+        causal_config(causal_target_forecast_clock="physical")
+    )
+    assert resolved is not None
+    return resolved
+
+
+def test_the_absent_and_stored_clocks_resolve_to_exactly_todays_object(aligned) -> None:
+    """``stored`` and the absent key are one case, and neither carries a shift vector at all.
+
+    Whole-object identity against a separately resolved budget, so a run written before the key
+    existed resolves byte for byte what it did then -- including its ``model_kwargs``.
+    """
+    stored = resolve_warmup_budget(causal_config(causal_target_forecast_clock="stored"))
+    assert stored is not None
+    assert stored == resolve_warmup_budget(causal_config())
+    assert stored.target_forecast_clock == "stored"
+    assert stored.target_forecast_shift is None
+    assert stored.target_forecast_reference_s is None
+    assert stored.max_forecast_advance == 0
+    assert stored == aligned
+
+    from teb_vae.lag_attn_cfs.model_kwargs import warmup_model_kwargs
+    from teb_vae.lag_attn_cfs.nets.model import SeqVaeLagAttnCfs
+
+    assert "target_forecast_shift" not in warmup_model_kwargs(stored, SeqVaeLagAttnCfs)
+
+
+def test_the_physical_clock_advances_onto_the_fastest_kept_channel(physical_clock) -> None:
+    r"""$s_c = \mathrm{round}(\kappa(\tau_c - \tau_{\min})/\Delta) \ge 0$, entry for entry.
+
+    The reference is the fastest kept channel's own stored delay -- whose shift is exactly zero --
+    so the advance of the slowest channel equals the input alignment's largest delay: both are
+    $\mathrm{round}(\kappa(\tau_{\max} - \tau_{\min})/\Delta)$.
+    """
+    shifts = physical_clock.target_forecast_shift
+    assert shifts is not None
+    assert physical_clock.target_forecast_clock == "physical"
+
+    reference = physical_clock.target_forecast_reference_s
+    assert reference == min(physical_clock.target.delay_s)
+    assert reference in set(physical_clock.target.declared_delay_s)
+
+    expected = tuple(
+        int(round(ALIGNMENT_DELAY_FACTOR * (delay - reference) / STEP_SECONDS))
+        for delay in physical_clock.target.delay_s
+    )
+    assert shifts == expected
+    assert min(shifts) == 0
+    assert physical_clock.max_forecast_advance == max(shifts)
+    assert physical_clock.max_forecast_advance == physical_clock.target.max_align_delay
+
+    # The clock changes the question, never the streams: every channel tuple is the shipped one.
+    stored = resolve_warmup_budget(causal_config())
+    assert physical_clock.target.keep_index == stored.target.keep_index
+    assert physical_clock.source.keep_index == stored.source.keep_index
+
+
+def test_the_input_clock_negates_the_alignment_delays(aligned) -> None:
+    r"""$s_c = -d_c$: the scored element delayed exactly as the encoder input is."""
+    resolved = resolve_warmup_budget(
+        causal_config(causal_target_forecast_clock="input")
+    )
+    assert resolved is not None
+    assert resolved.target_forecast_clock == "input"
+    assert resolved.target_forecast_shift == tuple(
+        -delay for delay in aligned.target.align_delays
+    )
+    assert resolved.max_forecast_advance == 0
+    assert resolved.target_forecast_reference_s is None
+
+
+def test_the_input_clock_is_refused_against_an_unaligned_target() -> None:
+    """With no $d_c$ there is no input clock to score on, and the refusal names both keys."""
+    with pytest.raises(ValueError, match="causal_target_forecast_clock.*causal_align_reference"):
+        resolve_warmup_budget(
+            causal_config(
+                causal_align_reference=None, causal_target_forecast_clock="input"
+            )
+        )
+
+
+def test_an_unknown_forecast_clock_is_refused_naming_the_three() -> None:
+    """The refusal lists every clock the resolver knows, so the fix is a copy rather than a search."""
+    with pytest.raises(ValueError, match="physical.*input.*stored"):
+        resolve_warmup_budget(causal_config(causal_target_forecast_clock="aligned"))
+
+
+def test_the_advance_shrinks_the_feasible_floor_and_stride_pairings(physical_clock) -> None:
+    r"""A pairing the stored clock admits is refused when the advance eats its last anchor.
+
+    The ceiling is $T_{\mathrm{valid}}$ less the largest advance, so the same floor and stride
+    must clear a shorter span -- and the refusal names the clock that shortened it.
+    """
+    t_valid = SHIPPED_SEQUENCE_LENGTH - SHIPPED_HORIZON
+    ceiling = t_valid - physical_clock.max_forecast_advance
+    floor = ceiling - SHIPPED_HORIZON + 1
+
+    # Admitted on the stored clock...
+    assert resolve_warmup_budget(causal_config(warmup_period=floor)) is not None
+    # ...refused on the physical one, naming the clock.
+    with pytest.raises(ValueError, match="physical"):
+        resolve_warmup_budget(
+            causal_config(
+                warmup_period=floor, causal_target_forecast_clock="physical"
+            )
+        )
+    # One step lower is the last floor that works, so the boundary is where it is claimed to be.
+    assert (
+        resolve_warmup_budget(
+            causal_config(
+                warmup_period=floor - 1, causal_target_forecast_clock="physical"
+            )
+        )
+        is not None
+    )
+
+
+def test_the_kwargs_carry_the_shift_only_when_a_clock_is_configured(physical_clock) -> None:
+    """The vector reaches the constructor under its own name, and only when it exists."""
+    from teb_vae.lag_attn_cfs.model_kwargs import warmup_model_kwargs
+    from teb_vae.lag_attn_cfs.nets.model import SeqVaeLagAttnCfs
+
+    mapped = warmup_model_kwargs(physical_clock, SeqVaeLagAttnCfs)
+    assert mapped["target_forecast_shift"] == physical_clock.target_forecast_shift

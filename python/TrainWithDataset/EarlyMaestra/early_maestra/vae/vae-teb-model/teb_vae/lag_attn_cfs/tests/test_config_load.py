@@ -110,6 +110,10 @@ TASK_LEVEL_KEYS = (
     # produces is a second keep-index and a second shift tuple on one stream only, which is a
     # resolution result and not an architecture choice.
     "causal_align_reference_source",
+    # The forecast clock: resolved against the shards' delay vectors into the signed
+    # `target_forecast_shift` tuple the constructor takes, exactly as the alignment references
+    # resolve into theirs.
+    "causal_target_forecast_clock",
     "causal_leg_alignment",
 )
 
@@ -219,6 +223,11 @@ PARITY_EXEMPT_PATHS: Dict[str, str] = {
         "counterpart for the same reason causal_align_reference does not, and it is the one "
         "divergence of this pair that is a chosen number: 288.2672 s, snapped to a stored source "
         "delay, at a known -113.8932 s offset against the target's clock"
+    ),
+    "model_config.VAE_model.causal_target_forecast_clock": (
+        "which clock the forecast target is SCORED on, which has no two-sided counterpart: a "
+        "symmetric bank's coefficients already describe the instant they are stored at, so there "
+        "is no per-channel staleness for a clock to correct on the question side"
     ),
     "advanced_config.callbacks.early_stopping.enabled": (
         "the training controls: this row stops on val/total_loss where the comparison model runs "
@@ -454,13 +463,17 @@ def test_the_shipped_geometry_pairs_the_floor_with_the_budget(shipped):
     assert vae["c_u"] == CAUSAL_C_U
 
 
-def test_the_anchor_stride_equals_the_configured_horizon(shipped):
-    """The two are one decision: below the horizon the forecast windows overlap again, above it
-    there are target steps no phase ever covers. Asserted rather than defaulted, so a horizon change
-    that left the stride behind fails here rather than training a different objective."""
+def test_the_anchor_stride_pairs_with_the_forecast_clock(shipped):
+    """The two travel together: the physical clock's ceiling leaves a 51-anchor span, and the
+    stride of 10 is what keeps ~5-6 training tiles per sample there at the old A_max. Asserted
+    rather than defaulted, so a clock change that left the stride behind -- 1-2 tiles per sample,
+    silently -- fails here rather than training a different objective. The stored-clock arm
+    restores the horizon-partitioning 30 with its clock."""
     vae = shipped["model_config"]["VAE_model"]
 
-    assert vae["anchor_stride"] == vae["horizon"] == 30
+    assert vae["causal_target_forecast_clock"] == "physical"
+    assert vae["anchor_stride"] == 10
+    assert vae["horizon"] == 30
 
 
 def test_the_shipped_config_builds_a_decoder_as_wide_as_the_budget_keeps(tmp_path):
@@ -842,10 +855,13 @@ def test_the_resolved_tiny_variant_validates_and_builds(tmp_path, loguru_warning
         **_model_kwargs_from(load_config(str(_TINY)), LagAttnCfsTrainer, tmp_path)
     )
     # The smoke model is small everywhere except where it must not be: the decoder still emits the
-    # production width and the forward still decodes the production tile count.
+    # production width and the forward still decodes the production tiling, forecast clock
+    # included -- the ceiling below is T_valid less the physical clock's 85-step advance.
     assert model.d_model == 32
     assert model.decoder_out_channels == 98
-    assert model.anchor_stride == 30
+    assert model.anchor_stride == 10
+    assert model.target_forecast_shift is not None
+    assert model.anchor_ceiling == model.geometry.t_valid - max(model.target_forecast_shift)
 
 
 # --------------------------------------------------------------------------------------

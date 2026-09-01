@@ -99,6 +99,7 @@ CAUSAL_ONLY_KEYWORDS: Tuple[str, ...] = (
     "target_align_delays",
     "source_align_delays",
     "target_novelty_frac",
+    "target_forecast_shift",
 )
 
 #: What a composing constructor removes from its own ``locals()`` before forwarding the rest to the
@@ -128,12 +129,17 @@ class CausalWarmupInputs:
         source_warmup_steps: The same for the source stream.
         anchor_stride: $S$, the spacing between decoded anchors.
         lag_floor: $F_u$, the earliest source step lag attention may read.
+        target_forecast_shift: $s_c$ per surviving target channel -- which stored step each scored
+            element reads, relative to its own index -- or ``None`` for the stored clock. Public
+            for the reason the warm-up vectors are: the target-side mixin's gather, the mask
+            pooling and the diagnostic figures must all read the one the model was built with.
     """
 
     target_warmup_steps: Optional[Tuple[int, ...]]
     source_warmup_steps: Optional[Tuple[int, ...]]
     anchor_stride: int
     lag_floor: int
+    target_forecast_shift: Optional[Tuple[int, ...]]
 
     # ------------------------------------------------------------------
     # Construction
@@ -148,8 +154,9 @@ class CausalWarmupInputs:
         source_warmup_steps: Optional[Sequence[int]],
         anchor_stride: int,
         lag_floor: int,
+        target_forecast_shift: Optional[Sequence[int]] = None,
     ) -> None:
-        r"""Validate this mixin's four keywords and set them, **before** the base constructor runs.
+        r"""Validate this mixin's keywords and set them, **before** the base constructor runs.
 
         Before, and not after, because the base's constructor builds the input adapters and
         :meth:`_build_adapter` reads two of these to do it. Everything checked here is checkable
@@ -167,10 +174,18 @@ class CausalWarmupInputs:
             source_warmup_steps: The same for the source stream.
             anchor_stride: $S$, the spacing between decoded anchors, in $[1, H]$.
             lag_floor: $F_u$, the earliest source step lag attention may read.
+            target_forecast_shift: $s_c$ per surviving target channel, positional against
+                ``target_keep_index``: the forecast target's element at anchor $t$, horizon step
+                $\tau$, reads stored step $t + 1 + \tau + s_c$. Signed and single-signed -- the
+                resolver's ``physical`` clock is all-advance, its ``input`` clock all-delay -- and
+                ``None`` (or all zeros) is each channel's own stored index, which every run before
+                the keyword existed scored. A tuple rather than a buffer because it is set before
+                the module machinery exists; the target-side mixin turns it into indices per call.
 
         Raises:
-            ValueError: If ``anchor_stride`` is outside $[1, H]$, if ``lag_floor`` is negative, or
-                if a warm-up vector arrives without its keep-index.
+            ValueError: If ``anchor_stride`` is outside $[1, H]$, if ``lag_floor`` is negative, if
+                a warm-up vector arrives without its keep-index, or if a forecast shift arrives
+                without its keep-index or mixes signs.
         """
         if not 1 <= int(anchor_stride) <= int(horizon):
             raise ValueError(
@@ -197,6 +212,29 @@ class CausalWarmupInputs:
                     f"is still an explicit keep-index."
                 )
 
+        # The same misrouting refusal as the warm-up's: the shift is positional against the
+        # surviving channels, so without the keep-index there is no axis it could be positional
+        # into. Mixed signs are refused because no resolver clock produces them -- the physical
+        # clock is all-advance and the input clock all-delay -- so a mixed vector is two clocks
+        # spliced together, and every downstream formula (floor, ceiling, persistence clamp) would
+        # quietly evaluate each half against the other's geometry.
+        if target_forecast_shift is not None:
+            if target_keep_index is None:
+                raise ValueError(
+                    "target_forecast_shift was given without target_keep_index. The shift is "
+                    "positional against the surviving target channels, so the two are resolved "
+                    "together and travel together."
+                )
+            shifts = tuple(int(step) for step in target_forecast_shift)
+            if shifts and min(shifts) < 0 < max(shifts):
+                raise ValueError(
+                    f"target_forecast_shift mixes signs (min {min(shifts)}, max {max(shifts)}). "
+                    f"Each forecast clock is single-signed -- 'physical' advances, 'input' delays "
+                    f"-- so a mixed vector names no clock and its two halves would be checked "
+                    f"against each other's geometry."
+                )
+            target_forecast_shift = shifts
+
         self.target_warmup_steps = None if target_warmup_steps is None else tuple(
             int(step) for step in target_warmup_steps
         )
@@ -205,6 +243,26 @@ class CausalWarmupInputs:
         )
         self.anchor_stride = int(anchor_stride)
         self.lag_floor = int(lag_floor)
+        self.target_forecast_shift = target_forecast_shift
+
+    @property
+    def anchor_ceiling(self) -> int:
+        r"""One past the last decodable anchor: $T_{\mathrm{valid}} - \max(0, \max_c s_c)$.
+
+        The geometry's own ceiling is $T_{\mathrm{valid}} = T - H$, one past the last anchor whose
+        window fits the stored grid. Under an **advancing** forecast clock the window's far element
+        reads stored step $t + H - 1 + s_c$, so the last $\max_c s_c$ of those anchors read past
+        the end of the record and do not exist; a delaying or absent shift moves nothing. A
+        property rather than a stored int so it can never disagree with the shift it is derived
+        from, and read by everything that used to read ``geometry.t_valid`` as the anchor bound --
+        the anchor builder, the stride-feasibility refusal and the dense forecast-target range.
+        ``geometry`` itself is untouched: its $T_{\mathrm{valid}}$ still bounds the mask shapes
+        and the raw cells' dense decode, which know nothing of a forecast clock.
+        """
+        shift = getattr(self, "target_forecast_shift", None)
+        if not shift:
+            return int(self.geometry.t_valid)
+        return int(self.geometry.t_valid) - max(0, max(shift))
 
     def _validate_causal_geometry(self) -> None:
         r"""Check what only the base's resolved geometry can decide, and resolve the readouts.
@@ -218,28 +276,49 @@ class CausalWarmupInputs:
         The floor check is given the gate's **shifts** as well as the warm-up, read off the built
         gate rather than off a constructor argument for the reason :meth:`_build_adapter` gives.
         An unaligned gate hands it a vector of zeros, which is the argument's inert value and
-        reproduces the refusal this cell has always made.
+        reproduces the refusal this cell has always made. The forecast clock's shift is passed
+        too, because it moves the *scored-target* half of the same floor.
+
+        Both anchor checks run against :attr:`anchor_ceiling` rather than ``geometry.t_valid``:
+        under an advancing forecast clock the trailing anchors do not exist, and a stride admitted
+        against the longer span could still leave a phase with no anchor.
 
         Raises:
             ValueError: If the stride leaves a phase with no anchor, or if ``warmup_period`` is
                 below the floor the kept channels require.
         """
-        if self.anchor_stride > self.geometry.t_valid - self.warmup_period:
+        if self.anchor_stride > self.anchor_ceiling - self.warmup_period:
+            advance = (
+                ""
+                if self.anchor_ceiling == self.geometry.t_valid
+                else (
+                    f" (T_valid {self.geometry.t_valid} less the forecast clock's largest "
+                    f"advance {self.geometry.t_valid - self.anchor_ceiling})"
+                )
+            )
             raise ValueError(
                 f"anchor_stride={self.anchor_stride} leaves no anchor at phase "
                 f"{self.anchor_stride - 1}: the first would be "
-                f"{self.warmup_period + self.anchor_stride - 1}, against T_valid="
-                f"{self.geometry.t_valid} and warmup_period={self.warmup_period}. A sample drawn "
-                f"at that phase would contribute no forecast at all, and nothing downstream "
-                f"reports an empty anchor row."
+                f"{self.warmup_period + self.anchor_stride - 1}, against an anchor ceiling of "
+                f"{self.anchor_ceiling}{advance} and warmup_period={self.warmup_period}. A "
+                f"sample drawn at that phase would contribute no forecast at all, and nothing "
+                f"downstream reports an empty anchor row."
             )
-        self._check_anchor_floor(
+        floor_args = [
             self.warmup_period,
             self.target_warmup_steps or (),
             ()
             if self.target_gate is None
             else tuple(int(shift) for shift in self.target_gate.delay.delay_steps),
-        )
+        ]
+        # Appended only when a forecast clock exists, not as an empty default: the raw-target
+        # cells override ``_check_anchor_floor`` with the three-argument signature -- a raw sample
+        # has no clock to re-index -- and only the feature cells' constructors can produce a
+        # shift, whose override takes it. Passing an inert fourth argument would force a keyword
+        # onto an override whose whole point is that the concept does not apply there.
+        if self.target_forecast_shift:
+            floor_args.append(self.target_forecast_shift)
+        self._check_anchor_floor(*floor_args)
         self._resolve_warmup_readout_constants()
 
     def _combined_source_steps(self) -> Optional[Tuple[int, ...]]:
@@ -373,8 +452,12 @@ class CausalWarmupInputs:
         self.target_warm_frac = self._resolve_target_warm_frac(
             self.warmup_period,
             self.horizon,
-            self.geometry.t_valid,
+            # The EFFECTIVE ceiling: the anchors an advancing forecast clock removes are not part
+            # of "the triples the objective can ever score", so counting them would dilute the
+            # guard with elements no run produces.
+            self.anchor_ceiling,
             self.target_warmup_steps or (),
+            self.target_forecast_shift or (),
         )
         declared_target = (
             torch.arange(self.c_y)
@@ -626,7 +709,10 @@ class CausalWarmupInputs:
                 f"anchor_stride must be in [1, horizon] = [1, {self.horizon}], got {stride}"
             )
 
-        floor, t_valid = self.warmup_period, self.geometry.t_valid
+        # The EFFECTIVE ceiling, not geometry.t_valid: under an advancing forecast clock the
+        # trailing anchors' windows read past the stored record, so they are never built rather
+        # than built and masked -- a masked anchor would still gather out-of-range target indices.
+        floor, t_valid = self.warmup_period, self.anchor_ceiling
         span = t_valid - floor
 
         if anchor_phase is None:
@@ -729,14 +815,15 @@ class CausalWarmupInputs:
         # its own d_c, while the warm-up stays a leading mask rather than part of the gate -- and
         # the masking happens inside the adapter, which holds the same vector it announces with.
         target = torch.cat([y_st, y_ph], dim=-1)
-        # The decoder's persistence input, taken BEFORE the gate's shift and never after it: the
-        # gate delays each survivor by its own $d_c$, which is the guard on an *input* channel's
-        # reach, while this tensor is the value the anchor is asked to continue. It is target-only
-        # -- the same stream both branches already condition on -- so it opens no source bypass, and
-        # the two decoder calls below receive the identical tensor so ``pred_gap`` stays a pure
-        # source readout. Only the feature-target cells resolve the gather; on the raw-target cells
-        # the flag cannot be set, which is what makes the deliberate exclusion structural rather
-        # than a convention this line has to remember.
+        # The decoder's persistence input, taken BEFORE the gate rather than from its output: the
+        # gather is the target-side mixin's own, which reads each channel at the latest stored step
+        # on or behind the anchor that lies on the scored clock -- the anchor's own value on the
+        # stored and physical clocks, the aligned value $t_a - d_c$ on the input clock. It is
+        # target-only -- the same stream both branches already condition on -- so it opens no
+        # source bypass, and the two decoder calls below receive the identical tensor so
+        # ``pred_gap`` stays a pure source readout. Only the feature-target cells resolve the
+        # gather; on the raw-target cells the flag cannot be set, which is what makes the
+        # deliberate exclusion structural rather than a convention this line has to remember.
         persistence = (
             self._anchor_target_values(target, anchor_index)
             if self.persistence_residual

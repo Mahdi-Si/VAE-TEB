@@ -70,6 +70,10 @@ DECLARED_CONFIG_FILES = frozenset(
         "sweep_lag_kv_adapter.yaml",
         "sweep_source_dropout_02.yaml",
         "sweep_source_dropout_03.yaml",
+        # The forecast-clock pair: the stored arm restores today's target and tiling exactly, the
+        # input arm scores the continuation of the encoder's own aligned stream.
+        "sweep_target_clock_stored.yaml",
+        "sweep_target_clock_input.yaml",
     }
 )
 
@@ -112,6 +116,10 @@ TASK_LEVEL_KEYS = (
     # target's. Task-level for the same reason as the key above and for one more: what it produces
     # is a second keep-index and a second shift tuple on one stream, which is a resolution result.
     "causal_align_reference_source",
+    # The forecast clock: resolved against the shards' delay vectors into the signed
+    # `target_forecast_shift` tuple the constructor takes, exactly as the alignment references
+    # resolve into theirs.
+    "causal_target_forecast_clock",
     "causal_leg_alignment",
     "causal_reach_budget_s",
 )
@@ -441,12 +449,17 @@ def test_the_shipped_geometry_pairs_the_floor_with_the_budget(shipped):
     assert vae["c_u"] == CAUSAL_C_U
 
 
-def test_the_anchor_stride_equals_the_configured_horizon(shipped):
-    """At $S = H$ the windows partition the timeline. Below it they overlap again; above it the
-    constructor refuses, because target steps between two tiles would never be scored."""
+def test_the_anchor_stride_pairs_with_the_forecast_clock(shipped):
+    """The two travel together: the physical clock's ceiling leaves a 51-anchor span, and the
+    stride of 10 is what keeps ~5-6 training tiles per sample there at the old A_max. Asserted
+    rather than defaulted, so a clock change that left the stride behind -- 1-2 tiles per sample,
+    silently -- fails here rather than training a different objective. The stored-clock arm
+    restores the horizon-partitioning 30 with its clock."""
     vae = _get(shipped, _VAE)
 
-    assert vae["anchor_stride"] == vae["horizon"] == 30
+    assert vae["causal_target_forecast_clock"] == "physical"
+    assert vae["anchor_stride"] == 10
+    assert vae["horizon"] == 30
     assert vae["lag_floor"] == 0
 
 
@@ -527,6 +540,10 @@ def test_every_comparable_leaf_equals_the_target_siblings_value(shipped, target_
         # The second half of the dual clock. Present here and nowhere else for the same reason
         # `causal_align_reference` is: a symmetric bank's channels already report one instant.
         f"{_VAE}.causal_align_reference_source",
+        # The forecast clock, absent from the two-sided cell for the same reason: its stored
+        # coefficients already describe the instant they are stored at, so there is no per-channel
+        # staleness for a clock to correct on the question side.
+        f"{_VAE}.causal_target_forecast_clock",
         # The four architecture switches whose off-state is bitwise the two-sided model. They are
         # ABSENT from that config rather than set to their off-values, which is the stronger
         # statement: the two-sided cells never take these keys, so no config of theirs can drift
@@ -768,10 +785,13 @@ def test_the_resolved_tiny_variant_validates_and_builds(tmp_path, loguru_warning
     assert [message for message in loguru_warnings if "config:" in message] == []
     model = SeqVaeLagAttnTrfCfs(**_model_kwargs_from(load_config(str(_TINY)), tmp_path))
     # The smoke model is small everywhere except where it must not be: the decoder still emits the
-    # production width and the forward still decodes the production tile count.
+    # production width and the forward still decodes the production tiling, forecast clock
+    # included -- the ceiling below is T_valid less the physical clock's 85-step advance.
     assert model.d_model == 32
     assert model.decoder_out_channels == KEPT_TARGET_CHANNELS
-    assert model.anchor_stride == 30
+    assert model.anchor_stride == 10
+    assert model.target_forecast_shift is not None
+    assert model.anchor_ceiling == model.geometry.t_valid - max(model.target_forecast_shift)
 
 
 def test_the_local_variant_names_a_built_and_leg_aligned_causal_shard(smoke_hie):

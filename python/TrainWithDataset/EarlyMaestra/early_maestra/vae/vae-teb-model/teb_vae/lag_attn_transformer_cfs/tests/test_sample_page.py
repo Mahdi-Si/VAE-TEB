@@ -74,7 +74,9 @@ def test_the_forecast_rows_resolve_to_the_causal_cells_builder(task):
     assert rows.func is causal_page.causal_forecast_rows
     assert set(rows.keywords) == {
         "keep_index", "block_split", "training_stride", "likelihood", "coverage_floor",
+        "target_forecast_shift",
     }
+    assert rows.keywords["target_forecast_shift"] == module.orig_model.target_forecast_shift
     assert rows.keywords["block_split"] == 36
     assert rows.keywords["training_stride"] == module.orig_model.anchor_stride == TINY_STRIDE
     # The score row's two: the objective's own likelihood, and the net's own floor. Bound from

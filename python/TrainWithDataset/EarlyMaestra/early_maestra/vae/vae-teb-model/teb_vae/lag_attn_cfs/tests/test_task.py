@@ -137,18 +137,21 @@ def test_the_page_rows_are_this_packages_and_carry_the_tiling(task):
 
     module = task()
     rows = module.forecast_rows
-    # Five bound values, and each is something the page cannot recover from the arrays it is
-    # handed. The last two are the per-window score row's: taken from where the objective takes
+    # Six bound values, and each is something the page cannot recover from the arrays it is
+    # handed. Two are the per-window score row's: taken from where the objective takes
     # them -- the hyperparameter for the likelihood, the net for the coverage floor -- so a
     # window's height on that row is the block score this run computed rather than one drawn under
-    # some other assumption.
+    # some other assumption. The forecast clock travels for the same reason: the truth the page
+    # draws and the block each window scores must be the objective's own re-indexing.
     assert set(rows.keywords) == {
         "keep_index", "block_split", "training_stride", "likelihood", "coverage_floor",
+        "target_forecast_shift",
     }
     assert rows.keywords["block_split"] == 36
     assert rows.keywords["training_stride"] == module.orig_model.anchor_stride == TINY_STRIDE
     assert rows.keywords["likelihood"] == module.hparams["likelihood"]
     assert rows.keywords["coverage_floor"] == float(module.orig_model.coverage_floor)
+    assert rows.keywords["target_forecast_shift"] == module.orig_model.target_forecast_shift
 
 
 def test_the_input_panel_builder_is_a_module_level_function(task):

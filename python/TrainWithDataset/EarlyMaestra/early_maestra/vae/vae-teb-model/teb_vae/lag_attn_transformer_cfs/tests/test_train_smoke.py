@@ -66,8 +66,25 @@ GUARDED_SOURCE_CHANNELS = 39
 
 #: The anchor counts the two stages must produce, derived here the way the model derives them so a
 #: geometry change re-derives them rather than failing a literal.
-DENSE_ANCHORS = 300 - SHIPPED_HORIZON - SHIPPED_WARMUP_PERIOD
-TILE_COUNT = -(-DENSE_ANCHORS // SHIPPED_HORIZON)
+#: The dense count is taken over the EFFECTIVE ceiling: the shipped physical forecast clock's
+#: largest advance, resolved against the committed shard exactly as the run resolves it, removes
+#: the trailing anchors before anything is decoded -- and the tiling divides by the shipped
+#: stride of 10, which travels with that clock rather than with the horizon.
+SHIPPED_ANCHOR_STRIDE = 10
+
+
+def _physical_advance() -> int:
+    """The shipped clock's largest advance, resolved from the committed shard's own delays."""
+    from teb_vae.lag_attn_cfs.causal_warmup import resolve_warmup_budget
+    from teb_vae.lag_attn_cfs.tests.conftest import causal_config
+
+    budget = resolve_warmup_budget(causal_config(causal_target_forecast_clock="physical"))
+    assert budget is not None
+    return budget.max_forecast_advance
+
+
+DENSE_ANCHORS = 300 - SHIPPED_HORIZON - SHIPPED_WARMUP_PERIOD - _physical_advance()
+TILE_COUNT = -(-DENSE_ANCHORS // SHIPPED_ANCHOR_STRIDE)
 
 
 def _run_fit(tmp_path, seed=None):
@@ -225,7 +242,7 @@ def test_the_run_trains_at_the_budgets_width_and_the_configs_tiling(fit):
 
     assert isinstance(model, SeqVaeLagAttnTrfCfs)
     assert model.decoder_out_channels == GUARDED_TARGET_CHANNELS
-    assert model.anchor_stride == SHIPPED_HORIZON
+    assert model.anchor_stride == SHIPPED_ANCHOR_STRIDE
     assert model.warmup_period == SHIPPED_WARMUP_PERIOD
     assert driver.resolved_warmup is not None
 
@@ -423,7 +440,7 @@ def test_the_checkpoint_carries_its_contract_and_reloads_at_its_own_width(fit):
     assert load_checkpoint_strict(rebuilt, blob) is not None
     assert rebuilt.decoder_out_channels == GUARDED_TARGET_CHANNELS
     assert len(rebuilt.source_warmup_steps) == GUARDED_SOURCE_CHANNELS
-    assert rebuilt.anchor_stride == SHIPPED_HORIZON
+    assert rebuilt.anchor_stride == SHIPPED_ANCHOR_STRIDE
 
 
 # --------------------------------------------------------------------------------------

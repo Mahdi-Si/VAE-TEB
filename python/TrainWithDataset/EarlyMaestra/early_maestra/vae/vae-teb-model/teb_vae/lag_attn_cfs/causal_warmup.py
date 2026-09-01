@@ -141,6 +141,20 @@ ALIGNMENT_DELAY_FACTOR = 1.0 - 1.0 / (2.0 * GAMMATONE_ORDER)
 #: delay. Written out because it appears in refusal messages and in the config.
 REFERENCE_TARGET_MAX = "target_max"
 
+#: The three clocks a forecast target may be scored on. ``stored`` is every run before the key
+#: existed: channel $c$ is scored at its own stored index, $s_c = 0$. ``physical`` advances each
+#: kept channel by $s_c = \mathrm{round}(\kappa(\tau_c - \tau_{\min})/\Delta) \ge 0$ so that every
+#: horizon step scores content at one physical future instant; every element is then a strict
+#: forecast for every channel, at the price of the trailing $\max_c s_c$ anchors. ``input`` delays
+#: the scored element exactly as the encoder input is delayed, $s_c = -d_c \le 0$ -- the
+#: continuation of the model's own aligned stream -- and is only resolvable against an aligned
+#: target. The vector is signed and single-signed by construction, which is what lets one gather,
+#: one floor formula and one ceiling serve all three.
+FORECAST_CLOCK_STORED = "stored"
+FORECAST_CLOCK_PHYSICAL = "physical"
+FORECAST_CLOCK_INPUT = "input"
+FORECAST_CLOCKS = (FORECAST_CLOCK_STORED, FORECAST_CLOCK_PHYSICAL, FORECAST_CLOCK_INPUT)
+
 #: Stored block names, in the channel order the model concatenates them into each input stream.
 #: Restated rather than imported from ``teb_vae.lag_attn.channel_reach``, which owns the same two
 #: tuples: that module builds the two-sided filter bank at import, and it is the guard this family
@@ -156,6 +170,7 @@ BUDGET_KEY = "model_config.VAE_model.causal_warmup_budget_steps"
 REACH_KEY = "model_config.VAE_model.causal_reach_budget_s"
 ALIGN_KEY = "model_config.VAE_model.causal_align_reference"
 ALIGN_SOURCE_KEY = "model_config.VAE_model.causal_align_reference_source"
+TARGET_FORECAST_CLOCK_KEY = "model_config.VAE_model.causal_target_forecast_clock"
 LEG_ALIGNMENT_KEY = "model_config.VAE_model.causal_leg_alignment"
 SEQUENCE_KEY = "model_config.VAE_model.sequence_length"
 TRIM_KEY = "dataset_config.dataloader_config.dataset_kwargs.trim_minutes"
@@ -331,6 +346,15 @@ class WarmupBudget:
             the *expected* value is a config key, checked in :func:`resolve_warmup_budget`.
         target: The target stream, which the budget gates.
         source: The source stream, which it does not; see :func:`resolve_warmup_budget`.
+        target_forecast_clock: Which clock the forecast target is scored on -- one of
+            :data:`FORECAST_CLOCKS`. ``'stored'`` is every run before the key existed.
+        target_forecast_shift: $s_c$ per **kept** target channel, positional against
+            ``target.keep_index``: the scored element at anchor $t$, horizon step $\tau$, reads
+            stored step $t + 1 + \tau + s_c$. ``None`` under the stored clock, where the vector is
+            identically zero and carrying it would make a byte-identical run's record differ.
+        target_forecast_reference_s: The clock's reference in seconds -- $\tau_{\min}$ of the kept
+            target channels under ``'physical'`` -- or ``None`` where the clock is another field's
+            (``'input'`` reads :attr:`reference_delay_s`) or there is no shift at all.
     """
 
     budget_steps: int
@@ -341,6 +365,21 @@ class WarmupBudget:
     leg_alignment: str
     target: StreamWarmup
     source: StreamWarmup
+    target_forecast_clock: str = FORECAST_CLOCK_STORED
+    target_forecast_shift: Optional[Tuple[int, ...]] = None
+    target_forecast_reference_s: Optional[float] = None
+
+    @property
+    def max_forecast_advance(self) -> int:
+        r"""$\max(0, \max_c s_c)$: how many trailing anchors the forecast clock costs.
+
+        The anchor ceiling is $T_{\mathrm{valid}} - $ this, because the last scored element of an
+        advanced channel reads stored step $t + H - 1 + s_c$ and must stay inside the window.
+        $0$ under the stored clock and under ``'input'``, whose shifts are all $\le 0$.
+        """
+        if self.target_forecast_shift is None:
+            return 0
+        return max(0, max(self.target_forecast_shift, default=0))
 
     @property
     def source_clock_delay_s(self) -> Optional[float]:
@@ -398,10 +437,20 @@ class WarmupBudget:
                 f"{self.source_reference_delay_s:.4f} s, inter-stream offset "
                 f"{self.inter_stream_offset_s:+.4f} s"
             )
+        # Appended only when a shift exists, for the reason the stream summaries append theirs: a
+        # stored-clock run's line is the one every existing log carries, and a trailing "forecast
+        # clock stored" on it would report a mechanism that did not run.
+        forecast = ""
+        if self.target_forecast_shift is not None:
+            forecast = (
+                f", forecast clock {self.target_forecast_clock} "
+                f"(shift {min(self.target_forecast_shift)}..{max(self.target_forecast_shift)} "
+                f"steps, ceiling -{self.max_forecast_advance})"
+            )
         return (
             f"causal warm-up budget {self.budget_steps} steps "
             f"(quantile {quantile}, trim_minutes {self.trim_minutes}, "
-            f"leg alignment {self.leg_alignment}, {reference}): "
+            f"leg alignment {self.leg_alignment}, {reference}{forecast}): "
             f"{self.target.summary()}; {self.source.summary()}"
         )
 
@@ -762,6 +811,74 @@ def _align_stream(
     return tuple(kept), shifts
 
 
+def _resolve_target_forecast_shift(
+    setting: Any,
+    kept_delay_s: Sequence[float],
+    align_delays: Optional[Sequence[int]],
+) -> Tuple[str, Optional[Tuple[int, ...]], Optional[float]]:
+    r"""Resolve ``causal_target_forecast_clock`` into the signed per-channel shift $s_c$.
+
+    The scored element at anchor $t$, horizon step $\tau$, kept channel $c$ reads stored step
+    $t + 1 + \tau + s_c$. Three clocks:
+
+    * ``'stored'`` (and the absent key): $s_c = 0$ and **no vector at all**, so a run written
+      before the key existed resolves byte for byte what it did then.
+    * ``'physical'``: $s_c = \mathrm{round}(\kappa(\tau_c - \tau_{\min})/\Delta) \ge 0$, the
+      advance that puts every channel's scored content at one physical future instant --
+      $\tau_{\min}$ being the fastest kept channel, whose own shift is exactly $0$. Advancing is
+      admissible on a *target* where it is refused on an input: a target element is what the
+      anchor is asked to predict, so reading a later stored step asks a strictly harder question
+      rather than leaking anything.
+    * ``'input'``: $s_c = -d_c \le 0$, the same delay the encoder input receives, so the model is
+      scored on the continuation of its own aligned stream. Only resolvable against an aligned
+      target -- with no $d_c$ there is no clock to copy.
+
+    Args:
+        setting: The configured value: ``None`` or one of :data:`FORECAST_CLOCKS`.
+        kept_delay_s: $\tau_c$ per target channel surviving budget **and** alignment, in seconds,
+            positional against the final keep-index.
+        align_delays: $d_c$ per kept target channel as :func:`_align_stream` resolved them, or
+            ``None`` on an unaligned run.
+
+    Returns:
+        ``(clock, shifts, reference_s)``: the normalised clock name; the signed shift vector, or
+        ``None`` under the stored clock; and the physical clock's reference $\tau_{\min}$ in
+        seconds, or ``None`` where the clock is not the physical one.
+
+    Raises:
+        ValueError: If the setting names no clock this resolver knows, or if ``'input'`` is set
+            while the target stream is unaligned.
+    """
+    if setting is None or setting == FORECAST_CLOCK_STORED:
+        return FORECAST_CLOCK_STORED, None, None
+
+    if setting == FORECAST_CLOCK_PHYSICAL:
+        reference_s = float(min(kept_delay_s))
+        shifts = tuple(
+            int(round(ALIGNMENT_DELAY_FACTOR * (delay - reference_s) / STEP_SECONDS))
+            for delay in kept_delay_s
+        )
+        return FORECAST_CLOCK_PHYSICAL, shifts, reference_s
+
+    if setting == FORECAST_CLOCK_INPUT:
+        if align_delays is None:
+            raise ValueError(
+                f"{TARGET_FORECAST_CLOCK_KEY}={FORECAST_CLOCK_INPUT!r} is set but {ALIGN_KEY} is "
+                f"null, so the target stream is not aligned and there is no input clock to score "
+                f"on: the 'input' clock delays each scored channel by the same $d_c$ the encoder "
+                f"input receives, and an unaligned gate has none. Set {ALIGN_KEY}, or use "
+                f"{FORECAST_CLOCK_STORED!r} / {FORECAST_CLOCK_PHYSICAL!r}."
+            )
+        return FORECAST_CLOCK_INPUT, tuple(-int(delay) for delay in align_delays), None
+
+    raise ValueError(
+        f"{TARGET_FORECAST_CLOCK_KEY}={setting!r} is not a clock this resolver knows. Use "
+        f"{FORECAST_CLOCK_PHYSICAL!r} to score every channel at one physical future instant, "
+        f"{FORECAST_CLOCK_INPUT!r} to score the continuation of the encoder's own aligned "
+        f"stream, or {FORECAST_CLOCK_STORED!r} (or null) for each channel's own stored index."
+    )
+
+
 def resolve_warmup_budget(config: Mapping[str, Any]) -> Optional[WarmupBudget]:
     r"""Resolve a run's configuration and its shards into concrete channel tuples.
 
@@ -940,15 +1057,38 @@ def resolve_warmup_budget(config: Mapping[str, Any]) -> Optional[WarmupBudget]:
         reference_delay_s if source_reference_delay_s is None else source_reference_delay_s,
     )
 
+    # The forecast clock is resolved AFTER the alignment, over the channels that survived it: the
+    # physical clock's reference is the fastest channel the model actually scores, and the input
+    # clock copies the shifts the alignment just resolved.
+    forecast_clock, forecast_shift, forecast_reference_s = _resolve_target_forecast_shift(
+        vae_config.get("causal_target_forecast_clock"),
+        tuple(target_delay_s[index] for index in target_keep),
+        target_align,
+    )
+    # A positive shift reads stored step t + H - 1 + s_c at the window's far end, so the anchor
+    # ceiling moves down by the largest advance; a negative or absent shift moves nothing.
+    max_advance = 0 if forecast_shift is None else max(0, max(forecast_shift, default=0))
+
     # The worst phase is the last one, whose first anchor is F + S - 1; if that anchor does not
     # exist there is a phase at which the sample contributes no forecast at all, and its share of
-    # the epoch is silently dropped.
-    if warmup_period + anchor_stride > t_valid:
+    # the epoch is silently dropped. Checked against the EFFECTIVE ceiling: under an advancing
+    # forecast clock the last max_advance anchors do not exist either, and a feasibility check
+    # taken over T_valid would admit a pairing the model itself refuses.
+    if warmup_period + anchor_stride > t_valid - max_advance:
+        advance = (
+            ""
+            if max_advance == 0
+            else (
+                f", less the {forecast_clock!r} forecast clock's largest advance "
+                f"{max_advance}, whose trailing anchors read past the record"
+            )
+        )
         raise ValueError(
             f"warmup_period={warmup_period} with anchor_stride={anchor_stride} leaves no anchor "
             f"at phase {anchor_stride - 1}: the first would be "
-            f"{warmup_period + anchor_stride - 1}, against T_valid={t_valid} "
-            f"(sequence_length {sequence_length} - horizon {horizon}). Lower the floor, shorten "
+            f"{warmup_period + anchor_stride - 1}, against an anchor ceiling of "
+            f"{t_valid - max_advance} (T_valid={t_valid}, sequence_length {sequence_length} - "
+            f"horizon {horizon}{advance}). Lower the floor, shorten "
             f"the stride, or shorten the horizon, which lengthens T_valid."
         )
 
@@ -959,6 +1099,9 @@ def resolve_warmup_budget(config: Mapping[str, Any]) -> Optional[WarmupBudget]:
         reference_delay_s=reference_delay_s,
         source_reference_delay_s=source_reference_delay_s,
         leg_alignment=warmup.leg_alignment,
+        target_forecast_clock=forecast_clock,
+        target_forecast_shift=forecast_shift,
+        target_forecast_reference_s=forecast_reference_s,
         target=StreamWarmup(
             name="target",
             block_spans=target_spans,
