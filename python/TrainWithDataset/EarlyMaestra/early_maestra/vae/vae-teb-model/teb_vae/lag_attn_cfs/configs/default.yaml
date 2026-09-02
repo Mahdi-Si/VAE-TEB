@@ -66,7 +66,7 @@ general_config:
   epochs: 5000
   accumulate_grad_batches: 1
   # Held at the comparison model's 128 deliberately: the anchor tiling already cuts the five
-  # anchor-axis tensors by roughly 14x at the shipped stride, and spending that saving on a larger
+  # anchor-axis tensors by ~5x at the shipped stride (A_max 11 against the dense 51), and spending that saving on a larger
   # batch would confound the comparison with a different gradient-noise scale.
   batch_size:
     train: 128
@@ -391,7 +391,7 @@ model_config:
     #
     # WHAT 'physical' COSTS AND MOVES. The largest advance is 85 steps (the slowest kept channel,
     # round(0.875*(402.1604-13.3405)/4)), so the anchor ceiling drops from T_valid = 270 to 185:
-    # dense anchors 136 -> 51, and `anchor_stride` below moves to 10 to keep ~5-6 training tiles
+    # dense anchors 136 -> 51, and `anchor_stride` below moves to 5 to keep ~10 training tiles
     # per sample. The floor does NOT move -- the scored-target half relaxes to
     # max_c(W'_c - s_c) - 1 while the shifted-inputs half still binds at 134. Validity is pooled
     # conservatively over the shift span (see CausalFeatureForecastTarget.scored_weight), and the
@@ -433,12 +433,14 @@ model_config:
     # S, the spacing between decoded anchors, in [1, H]. Over epochs every anchor in
     # [F, anchor_ceiling) is used, because the per-segment phase rotates with the epoch.
     #
-    # 10, down from the horizon-partitioning 30, and the physical forecast clock is why: its
+    # 5, down from the horizon-partitioning 30, and the physical forecast clock is why: its
     # ceiling leaves a 51-anchor span, which at S = 30 is 1-2 tiles per sample -- too little
-    # training signal per epoch. S = 10 restores ~5-6 tiles at the same A_max (6 against the old
-    # 5), i.e. at memory parity. The windows overlap 2/3 again; every loss denominator is an
-    # anchor count, and the KL support is a set either way, so overlap changes correlation between
-    # tiles rather than any denominator. The stored-clock arm restores S = 30 with its clock, so
+    # training signal per epoch. S = 5 puts ~10 tiles per sample on that span (A_max = 11, mean
+    # 51/5 = 10.2), the supervision density the H = 15 geometry trained at. The windows overlap
+    # 5/6; every loss denominator is an anchor count, and the KL support is a set either way, so
+    # overlap changes correlation between tiles rather than any denominator. Memory stays bounded
+    # by validation, which decodes all 51 anchors densely every epoch -- the training tensors at
+    # A_max = 11 are still ~5x smaller. The stored-clock arm restores S = 30 with its clock, so
     # the historical geometry stays one file away. tests/test_config_load.py pins the pairing
     # (clock, stride) here and in every arm rather than leaving it to be noticed.
     #
@@ -447,7 +449,7 @@ model_config:
     # a fixed offset from the segment start forever. There is no gradient there, so neither the
     # redundancy argument nor the memory argument applies. `sweep_anchor_stride_1.yaml` is the arm
     # that trains densely too.
-    anchor_stride: 10
+    anchor_stride: 5
     # F_u, the earliest source step lag attention may read: the lag mask generalises from
     # 1[t - l >= 0] to 1[t - l >= F_u]. Ships at 0, where it is BITWISE the two-sided sibling's mask,
     # and exists so the source compromise above is measurable rather than argued about. No arm moves

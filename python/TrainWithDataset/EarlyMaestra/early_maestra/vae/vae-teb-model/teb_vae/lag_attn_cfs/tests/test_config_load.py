@@ -465,14 +465,14 @@ def test_the_shipped_geometry_pairs_the_floor_with_the_budget(shipped):
 
 def test_the_anchor_stride_pairs_with_the_forecast_clock(shipped):
     """The two travel together: the physical clock's ceiling leaves a 51-anchor span, and the
-    stride of 10 is what keeps ~5-6 training tiles per sample there at the old A_max. Asserted
+    stride of 5 is what keeps ~10 training tiles per sample there (A_max = 11). Asserted
     rather than defaulted, so a clock change that left the stride behind -- 1-2 tiles per sample,
     silently -- fails here rather than training a different objective. The stored-clock arm
     restores the horizon-partitioning 30 with its clock."""
     vae = shipped["model_config"]["VAE_model"]
 
     assert vae["causal_target_forecast_clock"] == "physical"
-    assert vae["anchor_stride"] == 10
+    assert vae["anchor_stride"] == 5
     assert vae["horizon"] == 30
 
 
@@ -859,7 +859,7 @@ def test_the_resolved_tiny_variant_validates_and_builds(tmp_path, loguru_warning
     # included -- the ceiling below is T_valid less the physical clock's 85-step advance.
     assert model.d_model == 32
     assert model.decoder_out_channels == 98
-    assert model.anchor_stride == 10
+    assert model.anchor_stride == 5
     assert model.target_forecast_shift is not None
     assert model.anchor_ceiling == model.geometry.t_valid - max(model.target_forecast_shift)
 

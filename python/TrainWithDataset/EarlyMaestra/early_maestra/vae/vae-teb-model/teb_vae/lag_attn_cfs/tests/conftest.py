@@ -136,8 +136,10 @@ def causal_config(
         # planting a legacy shard names `causal_leg_alignment=None` or the value that shard has.
         "causal_align_reference": SHIPPED_ALIGN_REFERENCE,
         "causal_leg_alignment": SHIPPED_LEG_ALIGNMENT,
-        # The shipped tiling, stated rather than defaulted: consecutive forecast windows partition
-        # the timeline instead of overlapping, so no target coefficient is scored twice in a step.
+        # The horizon-partitioning tiling, stated rather than defaulted: consecutive forecast
+        # windows partition the timeline instead of overlapping, so no target coefficient is
+        # scored twice in a step. Not the shipped stride -- tests that assert the shipped tiling
+        # pass it explicitly -- but the partitioning geometry the resolver's own tests read best.
         "anchor_stride": SHIPPED_HORIZON,
         "c_y": CAUSAL_C_Y,
         "c_u": CAUSAL_C_U,

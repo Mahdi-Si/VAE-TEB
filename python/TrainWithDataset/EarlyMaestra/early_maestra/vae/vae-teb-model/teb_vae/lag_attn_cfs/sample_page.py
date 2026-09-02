@@ -544,8 +544,9 @@ def _draw_anchor_overlay(
     valid: np.ndarray,
     seconds_per_step: float,
     training_stride: int,
+    anchor_ceiling: int,
 ) -> None:
-    r"""Mark the floor, the anchors this page decoded, and the tile grid training would use.
+    r"""Mark the floor, the ceiling, the decoded anchors, and the tile grid training would use.
 
     Two anchor sets are drawn because two exist and they are not the same one. The page is produced
     at the validation resolution -- every valid anchor, at stride $1$ -- which is what makes it
@@ -561,6 +562,11 @@ def _draw_anchor_overlay(
         valid: Which of them are real.
         seconds_per_step: $\Delta$ in seconds, for placing an anchor in physical time.
         training_stride: $S$, the stride a training step would tile at.
+        anchor_ceiling: One past the last anchor that exists -- the model's own
+            ``anchor_ceiling``, which under an advancing forecast clock sits $\max_c s_c$ steps
+            below ``geometry.t_valid``. The tile grid must stop here: drawn to ``t_valid`` it
+            marks training tiles over a span no anchor can occupy, and the figure then shows a
+            grid extending far past both the decoded rug and every drawn forecast.
     """
     geometry = rows.geometry
     floor = int(geometry.warmup)
@@ -571,6 +577,14 @@ def _draw_anchor_overlay(
         floor * seconds_per_step, color=COLOR_BLUE, linewidth=1.0, linestyle="-",
         label=f"anchor floor $F$={floor}",
     )
+    # Only under an advancing forecast clock, where the ceiling is a fact of the model rather
+    # than the edge of the grid: without the line, the region past the last anchor reads as a
+    # forecast the page failed to draw rather than one that cannot exist.
+    if anchor_ceiling < int(geometry.t_valid):
+        ax.axvline(
+            anchor_ceiling * seconds_per_step, color=COLOR_BLUE, linewidth=1.0, linestyle="--",
+            label=f"anchor ceiling {anchor_ceiling}",
+        )
     # A rug rather than one line per anchor: at the validation resolution there are 136 of them,
     # and 136 vertical lines is a shaded band that hides the forecast underneath it.
     ax.plot(
@@ -581,8 +595,9 @@ def _draw_anchor_overlay(
     )
     # The training grid at phase 0, which is the one a reader can check against the geometry; the
     # phase a given segment gets in a given epoch is derived from its own identity and is not a
-    # property of this figure.
-    edges = range(floor, geometry.t_valid, training_stride)
+    # property of this figure. Bounded by the ceiling, not geometry.t_valid, exactly as the
+    # model's own anchor builder bounds it.
+    edges = range(floor, anchor_ceiling, training_stride)
     for position, anchor in enumerate(edges):
         ax.axvline(
             anchor * seconds_per_step, color=COLOR_GRAY, linewidth=0.5, linestyle=":",
@@ -1203,12 +1218,19 @@ def causal_forecast_rows(
 
     # The truth on the decimated grid, gathered to the channels the decoder emits, re-indexed
     # onto the model's own forecast clock, and restricted to the drawn windows, so an uncovered
-    # span reads as absent rather than as unpredicted.
+    # span reads as absent rather than as unpredicted. Re-indexed ONCE and shared with the error
+    # map below: a second gather from the stored clock is how the inset came to score a
+    # physical-clock forecast against stored-clock truth.
     stream = to_numpy(rows.target[index])
-    truth = np.where(
-        np.isfinite(full_mean),
-        _scored_clock_view(stream[:, keep], target_forecast_shift),
-        np.nan,
+    scored_stream = _scored_clock_view(stream[:, keep], target_forecast_shift)
+    truth = np.where(np.isfinite(full_mean), scored_stream, np.nan)
+
+    # The model's own anchor ceiling, re-derived exactly as the net derives it: under an advancing
+    # forecast clock the trailing max_c(s_c) anchors of [F, T_valid) read past the stored record
+    # and are never built, so the overlay's tile grid and ceiling mark must stop where the
+    # anchors do.
+    anchor_ceiling = int(geometry.t_valid) - max(
+        [0, *(int(shift) for shift in target_forecast_shift or ())]
     )
 
     # The one resolved description of what this page draws, shared by the lane row, the error map
@@ -1310,12 +1332,16 @@ def causal_forecast_rows(
     ax.set_ylabel("target coefficient (normalised)", fontsize=8)
     style_axes(ax, grid="both")
     rows.finalise_time_axis(ax)
-    _draw_anchor_overlay(ax, rows, anchors, valid, seconds_per_step, int(training_stride))
+    _draw_anchor_overlay(
+        ax, rows, anchors, valid, seconds_per_step, int(training_stride), anchor_ceiling
+    )
     ax.legend(loc="upper left", fontsize=6, framealpha=0.95, ncol=2)
 
     # $(C, H)$ rather than $(H, C)$: imshow's first axis is the vertical one, and the channel is
-    # what a reader scans for a failure.
-    anchor_truth = stream[anchor + 1 : anchor + 1 + geometry.horizon, keep]
+    # what a reader scans for a failure. From the SCORED stream, not the stored one: the forecast
+    # being subtracted is on the model's own clock, and under a physical clock the stored gather
+    # showed every shifted channel a phantom error of truth-minus-differently-timed-truth.
+    anchor_truth = scored_stream[anchor + 1 : anchor + 1 + geometry.horizon]
     anchor_mean = to_numpy(rows.outs["mu_full"][index, position])
     _draw_error_map(
         ax,

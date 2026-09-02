@@ -98,9 +98,9 @@ _DRIFT_RTOL = 1.0e-3
 #: geometry change re-derives them rather than failing a literal. The dense count is taken over
 #: the EFFECTIVE ceiling: the shipped physical forecast clock's largest advance, resolved against
 #: the committed shard exactly as the run resolves it, removes the trailing anchors before
-#: anything is decoded -- and the tiling divides by the shipped stride of 10, which travels with
+#: anything is decoded -- and the tiling divides by the shipped stride of 5, which travels with
 #: that clock rather than with the horizon.
-SHIPPED_ANCHOR_STRIDE = 10
+SHIPPED_ANCHOR_STRIDE = 5
 
 
 def _physical_advance() -> int:

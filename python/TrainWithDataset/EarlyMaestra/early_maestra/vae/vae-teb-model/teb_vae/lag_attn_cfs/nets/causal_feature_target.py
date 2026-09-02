@@ -906,9 +906,11 @@ class CausalFeatureForecastTarget(FeatureForecastTarget):
     ) -> torch.Tensor:
         r"""How many anchors this step actually decoded, per batch element.
 
-        A geometry guard, not a result: at the shipped $F = 134$, $S = H = 30$ and
-        $T_{\mathrm{valid}} = 270$ it is $5$ for $\varphi \le 15$ and $4$ otherwise, mean
-        $136/30$; at the validation stride of $1$ it is exactly $136$. A value off that band means
+        A geometry guard, not a result: the band is
+        $\lceil (\mathrm{ceiling} - F - \varphi)/S \rceil$ over $\varphi \in [0, S)$, with the
+        ceiling the model's own :attr:`anchor_ceiling`. At the shipped physical-clock geometry
+        ($F = 134$, $S = 5$, ceiling $185$) that is $11$ at phase $0$ and $10$ otherwise, mean
+        $51/5$; at the validation stride of $1$ it is exactly $51$. A value off that band means
         the tiling is not the one the configuration states.
 
         Counted off ``anchor_valid`` rather than off the mask, deliberately: this must report the

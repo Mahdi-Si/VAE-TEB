@@ -90,9 +90,9 @@ PHASE_KEY_FIELDS: Tuple[str, ...] = ("guid", "epoch")
 #: provenance column that must read exactly $1.0$: it is resolved at construction and the
 #: constructor already refuses a violating budget-and-floor pairing, so any other value means the
 #: checkpoint was built by code predating that refusal. ``anchors_per_sample`` must sit at its
-#: geometry-derived value -- $[4, 5]$ at the shipped training tiling and exactly
-#: $T_{\mathrm{valid}} - F$ at the dense evaluation stride -- and a value off that band means the
-#: geometry broke rather than that the model learned something.
+#: geometry-derived value -- $[10, 11]$ at the shipped training tiling and exactly the effective
+#: anchor span at the dense evaluation stride ($51$ under the shipped forecast clock) -- and a
+#: value off that band means the geometry broke rather than that the model learned something.
 #:
 #: The other eight are results. The two ``source_lag_warmth_frac`` columns size the compromise the
 #: design makes on the source: lag attention searches back into a region where much of the source is

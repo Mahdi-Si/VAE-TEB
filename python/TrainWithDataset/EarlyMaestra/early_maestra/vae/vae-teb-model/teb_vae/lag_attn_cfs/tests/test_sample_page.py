@@ -492,6 +492,10 @@ def test_the_overlay_draws_the_decoded_anchors_and_the_training_tiling(task, stu
         floor = _labelled(ax, "anchor floor")
         assert len(floor) == 1
         assert floor[0].get_xdata()[0] == pytest.approx(geometry.warmup * seconds_per_step)
+
+        # On the stored clock the ceiling IS the grid's edge, so no mark is drawn for it: a line
+        # there would state a forecast-clock fact about a model that has no forecast clock.
+        assert not _labelled(ax, "anchor ceiling")
     finally:
         plt.close(figure)
 
@@ -552,6 +556,98 @@ def test_the_error_map_describes_the_anchor_the_row_shades(task, stub_batch):
             pieces["target"][0, anchor + 1 : anchor + 1 + geometry.horizon, keep].numpy()
             - pieces["outs"]["mu_full"][0, position].numpy()
         ).T
+        inset = ax.child_axes[0]
+        assert np.allclose(inset.images[0].get_array(), expected, atol=1e-5)
+    finally:
+        plt.close(figure)
+
+
+def _shifted_task(task):
+    r"""A task whose model runs an advancing forecast clock, at the tiny geometry.
+
+    The shift is the shape the resolver's ``physical`` clock produces -- min exactly $0$,
+    staircase upward, max $3$ -- so the tiny ceiling is $T_{\mathrm{valid}} - 3 = 17$ and the
+    stride-$4$ tiling stays feasible. Built here rather than shared from ``conftest`` because
+    only these two tests need a clocked page.
+    """
+    kwargs = tiny_warmup_kwargs(anchor_stride=TINY_STRIDE)
+    advance = tuple(min(slot // 8, 3) for slot in range(len(kwargs["target_keep_index"])))
+    return task(model_kwargs=dict(kwargs, target_forecast_shift=advance))
+
+
+def test_the_overlay_stops_the_tile_grid_at_the_forecast_clocks_ceiling(task, stub_batch):
+    r"""Under an advancing clock the trailing $\max_c s_c$ anchors of $[F, T_{\mathrm{valid}})$
+    are never built (``anchor_ceiling`` on the net), so a tile grid drawn to ``geometry.t_valid``
+    marks training tiles over a span no anchor can occupy -- at the shipped geometry, 85 steps of
+    grid past both the decoded rug and every drawn forecast. The overlay must bound the grid the
+    way the model's own anchor builder does, and mark the ceiling so the undrawn span reads as
+    "cannot exist" rather than "failed to draw"."""
+    module = _shifted_task(task)
+    figure = _render(module, stub_batch)
+    try:
+        model = module.orig_model
+        geometry = model.geometry
+        seconds_per_step = stub_batch.fhr.shape[1] / _FS_RAW / geometry.t
+        ceiling = int(model.anchor_ceiling)
+        assert ceiling < geometry.t_valid  # the premise: this model advances its target
+
+        ax = _axes_titled(figure, "Forecast")
+        mark = _labelled(ax, "anchor ceiling")
+        assert len(mark) == 1
+        assert mark[0].get_xdata()[0] == pytest.approx(ceiling * seconds_per_step)
+
+        # The dotted vertical lines are the training tile grid; the model tiles [F, ceiling).
+        tiles = [
+            line for line in ax.lines
+            if line.get_linestyle() == ":"
+            and np.asarray(line.get_xdata()).size == 2
+            and line.get_xdata()[0] == line.get_xdata()[1]
+        ]
+        expected = list(range(int(geometry.warmup), ceiling, TINY_STRIDE))
+        assert len(tiles) == len(expected)
+        assert max(line.get_xdata()[0] for line in tiles) == pytest.approx(
+            expected[-1] * seconds_per_step
+        )
+    finally:
+        plt.close(figure)
+
+
+def test_the_error_map_reads_truth_on_the_models_own_forecast_clock(task, stub_batch):
+    r"""The forecast at anchor $t$, step $\tau$, kept channel $c$ is scored against stored step
+    $t + 1 + \tau + s_c$, so the error map must gather the truth through the same shift. Gathered
+    from the stored clock instead, every shifted channel shows
+    $|Y[t{+}1{+}\tau] - \mu(t{+}1{+}\tau{+}s_c)|$ -- a phantom error that is largest exactly on
+    the slow channels the physical clock exists to make honest."""
+    module = _shifted_task(task)
+    pieces = _forward(module, stub_batch)
+    figure = _render(module, stub_batch, pieces=pieces)
+    try:
+        model = module.orig_model
+        geometry = model.geometry
+        anchors = pieces["outs"]["anchor_index"][0].numpy()
+        valid = pieces["outs"]["anchor_valid"][0].numpy().astype(bool)
+        positions = sample_page._tiling_anchors(anchors, valid, geometry.horizon)
+        position = positions[len(positions) // 2]
+        anchor = int(anchors[position])
+
+        keep = [int(value) for value in model.target_gate.keep_index]
+        shifts = [int(shift) for shift in model.target_forecast_shift]
+        target = pieces["target"][0].numpy()
+        mu_full = pieces["outs"]["mu_full"][0, position].numpy()
+        # (C_keep, H), the imshow's own orientation: each lane's truth gathered at its own shift.
+        expected = np.stack(
+            [
+                np.abs(
+                    target[
+                        anchor + 1 + shift : anchor + 1 + shift + geometry.horizon, declared
+                    ]
+                    - mu_full[:, slot]
+                )
+                for slot, (declared, shift) in enumerate(zip(keep, shifts))
+            ]
+        )
+
+        ax = _axes_titled(figure, "Forecast")
         inset = ax.child_axes[0]
         assert np.allclose(inset.images[0].get_array(), expected, atol=1e-5)
     finally:
