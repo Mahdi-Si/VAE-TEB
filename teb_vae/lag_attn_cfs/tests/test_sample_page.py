@@ -151,6 +151,13 @@ def _labelled(ax: Any, prefix: str) -> List[Any]:
     return [line for line in ax.lines if str(line.get_label()).startswith(prefix)]
 
 
+def _drawn_positions(anchors: np.ndarray, valid: np.ndarray, horizon: int) -> List[int]:
+    """The windows the page stitches: the abutting tiling plus the clipped tail window."""
+    return sample_page._tail_anchor(
+        anchors, valid, sample_page._tiling_anchors(anchors, valid, horizon), horizon
+    )
+
+
 def _trainer_with_batch(batch: Any, **kwargs) -> FakeTrainer:
     """A fake trainer whose validation loader yields ``batch`` once."""
     trainer = FakeTrainer(**kwargs)
@@ -532,7 +539,7 @@ def test_the_error_map_describes_the_anchor_the_row_shades(task, stub_batch):
         geometry = module.orig_model.geometry
         anchors = pieces["outs"]["anchor_index"][0].numpy()
         valid = pieces["outs"]["anchor_valid"][0].numpy().astype(bool)
-        positions = sample_page._tiling_anchors(anchors, valid, geometry.horizon)
+        positions = _drawn_positions(anchors, valid, geometry.horizon)
         position = positions[len(positions) // 2]
         anchor = int(anchors[position])
         seconds_per_step = stub_batch.fhr.shape[1] / _FS_RAW / geometry.t
@@ -626,7 +633,7 @@ def test_the_error_map_reads_truth_on_the_models_own_forecast_clock(task, stub_b
         geometry = model.geometry
         anchors = pieces["outs"]["anchor_index"][0].numpy()
         valid = pieces["outs"]["anchor_valid"][0].numpy().astype(bool)
-        positions = sample_page._tiling_anchors(anchors, valid, geometry.horizon)
+        positions = _drawn_positions(anchors, valid, geometry.horizon)
         position = positions[len(positions) // 2]
         anchor = int(anchors[position])
 
@@ -802,7 +809,7 @@ def test_the_per_window_score_is_the_objectives_own_number(task, stub_batch):
         geometry = model.geometry
         anchors = pieces["outs"]["anchor_index"][0].numpy()
         valid = pieces["outs"]["anchor_valid"][0].numpy().astype(bool)
-        positions = sample_page._tiling_anchors(anchors, valid, geometry.horizon)
+        positions = _drawn_positions(anchors, valid, geometry.horizon)
         keep = torch.as_tensor(
             [int(value) for value in model.target_gate.keep_index], dtype=torch.long
         )
@@ -1082,8 +1089,8 @@ def test_the_channel_rule_and_the_keep_index_mapping_are_the_siblings(task, stub
 
 def test_the_lanes_carry_the_truth_and_both_forecasts_with_their_bands(task, stub_batch):
     r"""Three lanes, each with the true coefficient, the base ($z^p$) and full ($z^q$) means and
-    both $\pm 2\sigma$ bands, one legend entry per role rather than per lane, plus the overlay's
-    three. The counts are what catch a band silently dropped or a lane drawn twice."""
+    both $\pm 2\sigma$ bands, the training-tile fan, one legend entry per role rather than per
+    lane, plus the overlay's three. The counts are what catch a band silently dropped or a lane drawn twice."""
     figure = _render(task(), stub_batch)
     try:
         ax = _axes_titled(figure, "Forecast")
@@ -1092,6 +1099,7 @@ def test_the_lanes_carry_the_truth_and_both_forecasts_with_their_bands(task, stu
             "true $Y^{+}$",
             "base ($z^p$, target-only)",
             "full ($z^q$, source-conditioned)",
+            "training-tile forecasts ($\\mu^q$, $S$=4, $\\varphi$=0)",
             "anchor floor $F$=5",
             "decoded anchors (15)",
             "training tiles, $S$=4, $\\varphi$=0",
