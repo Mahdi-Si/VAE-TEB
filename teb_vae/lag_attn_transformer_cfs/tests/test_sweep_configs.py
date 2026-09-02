@@ -97,8 +97,8 @@ _ARMS: Dict[str, Dict[str, Any]] = {
         _VARIANT: "lag_attn_trf_cfs_source_dropout_03",
     },
     # The forecast-clock pair. Each moves TWO model keys, and the second travels with the first:
-    # the shipped stride of 10 exists to recover tiles under the physical clock's shortened
-    # ceiling, so an arm that restored the stored or input clock at stride 10 would compare two
+    # the shipped stride of 5 exists to recover tiles under the physical clock's shortened
+    # ceiling, so an arm that restored the stored or input clock at stride 5 would compare two
     # tilings as well as two clocks. 30 restores the horizon-partitioning tiling every historical
     # run trained at.
     "sweep_target_clock_stored.yaml": {
@@ -234,14 +234,14 @@ def test_the_stride_arm_restores_the_dense_anchor_set():
 
 def test_the_default_pairs_the_stride_with_the_forecast_clock():
     """The tiling travels with the forecast clock: the physical clock's ceiling leaves a 51-anchor
-    span, and stride 10 is what keeps ~5-6 training tiles per sample there at the old A_max. The
+    span, and stride 5 is what keeps ~10 training tiles per sample there (A_max = 11). The
     stored-clock arm restores the horizon-partitioning 30 with its clock, where its own delta
     test pins the pairing."""
     default = load_config(str(_DEFAULT))
     _floor, stride, horizon, _t_valid = _geometry(default)
 
     assert default["model_config"]["VAE_model"]["causal_target_forecast_clock"] == "physical"
-    assert stride == 10
+    assert stride == 5
     assert horizon == 30
 
 

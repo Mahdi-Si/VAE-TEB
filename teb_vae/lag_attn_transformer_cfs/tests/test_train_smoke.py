@@ -69,8 +69,8 @@ GUARDED_SOURCE_CHANNELS = 39
 #: The dense count is taken over the EFFECTIVE ceiling: the shipped physical forecast clock's
 #: largest advance, resolved against the committed shard exactly as the run resolves it, removes
 #: the trailing anchors before anything is decoded -- and the tiling divides by the shipped
-#: stride of 10, which travels with that clock rather than with the horizon.
-SHIPPED_ANCHOR_STRIDE = 10
+#: stride of 5, which travels with that clock rather than with the horizon.
+SHIPPED_ANCHOR_STRIDE = 5
 
 
 def _physical_advance() -> int:
@@ -318,7 +318,9 @@ def test_the_anchor_count_sits_at_its_geometry_derived_value_on_both_stages(fit)
     produce; validation decodes densely, so it is exactly $T_{\\mathrm{valid}} - F$."""
     frame = _metrics(fit[0])
 
-    fewest = -(-(DENSE_ANCHORS - (SHIPPED_HORIZON - 1)) // SHIPPED_HORIZON)
+    # The last phase's tile count: the stride divides the span, not the horizon -- the two were
+    # interchangeable only while the tiling partitioned at S = H.
+    fewest = -(-(DENSE_ANCHORS - (SHIPPED_ANCHOR_STRIDE - 1)) // SHIPPED_ANCHOR_STRIDE)
     train = frame["train/anchors_per_sample"].dropna()
     assert not train.empty
     assert train.between(fewest, TILE_COUNT).all(), sorted(set(train))
@@ -390,7 +392,7 @@ def test_the_resolved_config_records_the_budget_the_run_actually_got(fit):
 
     vae = resolved["model_config"]["VAE_model"]
     assert vae["causal_warmup_budget_steps"] == 134
-    assert vae["anchor_stride"] == SHIPPED_HORIZON
+    assert vae["anchor_stride"] == SHIPPED_ANCHOR_STRIDE
     assert vae["causal_reach_budget_s"] is None
 
 

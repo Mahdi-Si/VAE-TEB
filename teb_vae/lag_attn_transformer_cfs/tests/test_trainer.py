@@ -218,7 +218,7 @@ def test_the_geometry_and_the_encoder_block_reach_the_constructor(driver):
     assert kwargs["sequence_length"] == 300
     assert kwargs["horizon"] == 30
     assert kwargs["warmup_period"] == 134
-    assert kwargs["anchor_stride"] == 10
+    assert kwargs["anchor_stride"] == 5
     assert kwargs["c_y"] == 102
     assert kwargs["c_u"] == 51
     assert kwargs["target_attention_blocks"] == 2  # the tiny variant's own override
@@ -286,7 +286,7 @@ def test_the_built_model_is_this_packages_and_carries_both_halves(driver):
 
     assert isinstance(model, SeqVaeLagAttnTrfCfs)
     assert model.decoder_out_channels == 98
-    assert model.anchor_stride == 10
+    assert model.anchor_stride == 5
     # The forecast clock the config states, resolved and applied: the physical advance costs the
     # trailing 85 anchors of the valid span.
     assert model.target_forecast_shift is not None
