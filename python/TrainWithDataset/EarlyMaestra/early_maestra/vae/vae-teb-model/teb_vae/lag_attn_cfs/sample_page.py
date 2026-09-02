@@ -532,9 +532,43 @@ def _tiled_branch(
     for position in positions:
         start = int(anchors[position]) + 1
         stop = min(start + horizon, geometry.t)
+        # First writer wins: the abutting windows never overlap, and the clipped tail window
+        # :func:`_tail_anchor` appends contributes only the steps no earlier window covered --
+        # so every drawn step still comes from exactly one latent.
+        fresh = np.isnan(tiled[0][start:stop, 0])
         for target, source in zip(tiled, (mean, sigma)):
-            target[start:stop] = source[position][: stop - start]
+            target[start:stop][fresh] = source[position][: stop - start][fresh]
     return tiled[0], tiled[1]
+
+
+def _tail_anchor(
+    anchors: np.ndarray, valid: np.ndarray, positions: Sequence[int], horizon: int
+) -> List[int]:
+    r"""Append the last decoded anchor when its window reaches past the abutting tiling.
+
+    Under an advancing forecast clock the decodable span is short -- $51$ anchors at the shipped
+    geometry, whose windows cover $80$ scored steps -- and whole non-overlapping windows leave
+    the last $\mathrm{span} \bmod H$ of them undrawn. The final anchor's window is drawn over
+    that remainder alone (first writer wins in :func:`_tiled_branch`), so the page shows every
+    step any decoded anchor forecast rather than stopping a partial window short.
+
+    Args:
+        anchors: The decoded anchor indices $(A_{\max},)$.
+        valid: Which of them are real.
+        positions: The abutting tiling from :func:`_tiling_anchors`.
+        horizon: $H$.
+
+    Returns:
+        ``positions`` plus the last valid position when it extends the coverage, else unchanged.
+    """
+    live = np.flatnonzero(valid.astype(bool))
+    if not live.size or not positions:
+        return list(positions)
+    last = int(live[-1])
+    covered_to = int(anchors[positions[-1]]) + horizon
+    if last not in positions and int(anchors[last]) + horizon > covered_to:
+        return [*positions, last]
+    return list(positions)
 
 
 def _draw_anchor_overlay(
@@ -634,7 +668,7 @@ class _Stitched:
             caller declared no split, which draws no divider.
         anchors: The decoded anchor indices of this sample $(A_{\max},)$.
         positions: Positions into that axis whose windows are drawn, ascending and
-            non-overlapping.
+            first anchor wins where windows overlap.
     """
 
     truth: np.ndarray
@@ -789,7 +823,7 @@ def _draw_field_rows(rows: ForecastRowInputs, stitched: _Stitched) -> None:
             rows, row_name, field, stitched,
             title=(
                 f"{quantity} over all {kept} target channels — {windows} consecutive "
-                f"non-overlapping windows, shared colour scale with the two rows beside it; grey: "
+                f"windows (first anchor wins), shared colour scale with the two rows beside it; grey: "
                 f"no drawn window"
             ),
             cmap="viridis",
@@ -1210,7 +1244,10 @@ def causal_forecast_rows(
 
     anchors = to_numpy(rows.outs["anchor_index"][index]).astype(int).ravel()
     valid = to_numpy(rows.outs["anchor_valid"][index]).astype(bool).ravel()
-    positions = _tiling_anchors(anchors, valid, int(geometry.horizon))
+    positions = _tail_anchor(
+        anchors, valid, _tiling_anchors(anchors, valid, int(geometry.horizon)),
+        int(geometry.horizon),
+    )
 
     base_mean, base_sigma = _tiled_branch(rows, "base", anchors, positions)
     full_mean, full_sigma = _tiled_branch(rows, "full", anchors, positions)
@@ -1301,6 +1338,32 @@ def causal_forecast_rows(
                 label=label if lane == 0 else None,
             )
 
+    # The forecasts a TRAINING step would have scored, as a fan: the full-branch mean of every
+    # decoded anchor on the phase-0 tile grid, each over its own window. The stitched lanes above
+    # can show at most one latent per step, which under the physical clock's short span is two or
+    # three windows of the ~ten a training step tiles; the fan is where the rest become visible,
+    # and where a forecast's drift with lead time can be read against the same truth.
+    tile_positions = [
+        position for position, (anchor, is_valid) in enumerate(zip(anchors, valid))
+        if is_valid and (int(anchor) - int(geometry.warmup)) % int(training_stride) == 0
+    ]
+    fan_mean = to_numpy(rows.outs["mu_full"][index])
+    for lane, channel in enumerate(int(value) for value in lanes):
+        offset = lane * stride
+        for count, position in enumerate(tile_positions):
+            start = int(anchors[position]) + 1
+            stop = min(start + int(geometry.horizon), geometry.t)
+            ax.plot(
+                time_dec[start:stop], fan_mean[position, : stop - start, channel] + offset,
+                color=COLOR_VERMILLION, linewidth=0.5, alpha=0.45, zorder=1.5,
+                label=(
+                    f"training-tile forecasts ($\\mu^q$, $S$={int(training_stride)}, "
+                    f"$\\varphi$=0)"
+                    if lane == 0 and count == 0
+                    else None
+                ),
+            )
+
     # Each lane named by its **declared** channel, so the number on the axis survives a change of
     # budget: the positional index among the survivors would not.
     ax.set_yticks([lane * stride for lane in range(len(lanes))])
@@ -1323,7 +1386,7 @@ def causal_forecast_rows(
         f"Forecast — {len(lanes)} of {len(keep)} target channels by "
         f"{BAND_SIGMAS:.0f}$\\sigma$ calibration (worst, middle, best), lanes offset by "
         f"{stride:.3g}, mean $\\pm$ {BAND_SIGMAS:.0f}$\\sigma$; {len(positions)} of "
-        f"{int(valid.sum())} decoded anchors drawn, non-overlapping; shaded: the anchor the error "
+        f"{int(valid.sum())} decoded anchors stitched, first anchor wins; shaded: the anchor the error "
         f"map draws.\nDrawn at the evaluation resolution — every valid anchor — so the ticks are "
         f"what this page decoded; the dotted grid is the sparser set a training step tiles.",
         fontsize=9, pad=6,
