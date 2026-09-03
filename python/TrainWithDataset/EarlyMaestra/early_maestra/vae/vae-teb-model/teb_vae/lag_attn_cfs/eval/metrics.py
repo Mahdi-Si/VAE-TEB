@@ -876,6 +876,14 @@ class BatchReadout:
             joined against anything else in the run. Carried on the readout rather than recomputed
             because recomputing them means a second decoder pass, and released by :func:`evaluate`
             as soon as a sink has consumed them.
+        per_anchor_vectors: Per-anchor **vector** quantities, each $(B, A_{\max}, L)$, gathered
+            at the decoded anchors exactly as ``per_anchor`` is: ``kl_lag_map``, the pooled KL
+            attribution $\widetilde K_{t,\ell} = \sum_m K^{(m)}_t lpha^{(m)}_{t,\ell}$ at
+            every anchor, and ``attention_lag_map``, the head-averaged attention at the same
+            anchors. They are what lets an analysis select anchors by their own $K_t$ and read
+            the lag structure of the selection -- a question the per-sample profiles, which
+            average every anchor together, cannot answer. Released by :func:`evaluate` with
+            ``per_anchor`` once a sink has consumed them.
         retained: Whole model tensors a caller asked to keep, by their forward-output name.
             Empty unless ``retain`` named them: a retained forecast set here is four
             $(A_{\max}, H, C_{\mathrm{keep}})$ tensors, about $3.4$ MiB per sample.
@@ -911,6 +919,7 @@ class BatchReadout:
     n_control_pairs: int = 0
     n_same_recording_pairs: int = 0
     per_anchor: Dict[str, torch.Tensor] = field(default_factory=dict)
+    per_anchor_vectors: Dict[str, torch.Tensor] = field(default_factory=dict)
     retained: Dict[str, torch.Tensor] = field(default_factory=dict)
     horizon_sums: Dict[str, torch.Tensor] = field(default_factory=dict)
     calibration_sums: Dict[str, torch.Tensor] = field(default_factory=dict)
@@ -2044,6 +2053,17 @@ def evaluate_batch(
         .gather(1, anchors[:, :, None].expand(-1, -1, n_lags))
         .argmax(dim=-1),
     }
+    # The two per-anchor lag maps, gathered at the same anchors as the scalars above so a row of
+    # the per-anchor table and a row of the per-anchor vector sidecar describe one anchor. The
+    # pooled attribution rather than the per-head one: an anchor selection by $K_t$ is a selection
+    # on the pooled KL, and the head split of the selected anchors is a second question. The
+    # attention travels beside it for the reason every lag readout carries both -- the attribution
+    # inherits the prior-variance inflation the attention is immune to.
+    lag_gather = anchors[:, :, None].expand(-1, -1, n_lags)
+    per_anchor_vectors: Dict[str, torch.Tensor] = {
+        "kl_lag_map": outputs["source_kl_lag_map"].gather(1, lag_gather),
+        "attention_lag_map": head_averaged_attention.gather(1, lag_gather),
+    }
     # The three tertile gaps per anchor, so the per-anchor table recombines into the per-sample
     # columns of the same name -- which is what ``report_seam.RECOMBINED_COLUMNS`` checks.
     for group, name in enumerate(tertile_names):
@@ -2121,6 +2141,7 @@ def evaluate_batch(
         n_control_pairs=n_control_pairs,
         n_same_recording_pairs=n_same_recording_pairs,
         per_anchor=per_anchor,
+        per_anchor_vectors=per_anchor_vectors,
         retained=retained,
         horizon_sums={
             f"{branch}_{statistic}": value
@@ -3493,6 +3514,7 @@ def evaluate(
             # columns beside them -- keeping those alive for a full split would cost gigabytes for
             # values nothing reads again.
             readout.per_anchor = {}
+            readout.per_anchor_vectors = {}
             readout.retained = {}
             if max_batches is not None and len(readouts) >= int(max_batches):
                 break

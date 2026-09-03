@@ -249,8 +249,8 @@ ANALYSIS_FUNCTIONS: Dict[str, Any] = {
 #: The **shared** analysis names, in run order, for a reader and for the second cfs cell to merge
 #: its own onto. Deliberately not what ``--only`` and ``--skip`` accept: selection runs against the
 #: registry a *binding* merges (:func:`merged_analysis_functions`), and this cell's own four are
-#: registered on ``CFS_BINDING`` rather than above, so a run of this package selects from twenty
-#: names while this tuple holds sixteen.
+#: registered on ``CFS_BINDING`` rather than above, so a run of this package selects from
+#: twenty-one names while this tuple holds sixteen.
 ANALYSES: Tuple[str, ...] = tuple(ANALYSIS_FUNCTIONS)
 
 
@@ -1928,6 +1928,18 @@ RUN_ARGS: Dict[str, Any] = {
     #                     full support, every statistic on each geometry-fixed band and on
     #                     each head, and a run-level clock-excess weighting. Untested by
     #                     design -- it adds no Holm family and writes no significance table.
+    #   lag_high_kl:      The lag structure of the anchors that CARRY the coupling: anchors are
+    #                     selected by a quantile band of the pooled per-anchor KL (upper 30%,
+    #                     its complement, upper 10%), their restricted lag profiles and their
+    #                     share per segment are resolved against both clocks, the high band's
+    #                     centroid and share are tested, and the argmax-by-KL-decile and the
+    #                     contraction enrichment of high anchors travel beside them. Then the
+    #                     usefulness half: the forecast gain of each band's anchors, the high
+    #                     band's gain against the rest band's paired within recording, a
+    #                     gain-selected band and its overlap with the high band, and the
+    #                     attribution share per geometry band against the occlusion cost when
+    #                     that pass ran. Reads the per-anchor vector sidecar; skips on a
+    #                     directory collected before it.
     #   spectral_skill:   The forecast gap resolved by the frequency band of the target
     #                     coefficient, joined through the kept-axis channel map.
     #   cross_subgroup:   Do the cohorts actually differ. Kruskal, Holm, then Mann-Whitney, over

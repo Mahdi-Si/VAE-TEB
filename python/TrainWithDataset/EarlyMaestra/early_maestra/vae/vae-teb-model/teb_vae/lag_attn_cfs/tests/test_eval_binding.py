@@ -100,6 +100,7 @@ CELL_SPECIFIC_ANALYSES = (
     "occlusion",
     "lag_clocks",
     "lag_kld_scaled",
+    "lag_high_kl",
     "spectral_skill",
 )
 
@@ -137,6 +138,17 @@ CFS_HEADLINE_SCALARS = [
     "occlusion_peak_band_delta_nats",
     "occlusion_peak_band_horizon_step",
     "occlusion_peak_band_live_fraction",
+    # The high-KL selection's five: the pooled threshold, the high band's centroid and total over
+    # recordings, and the hot-lag set's size and share.
+    "high_kl_threshold_nats",
+    "high_kl_centroid_kl_s",
+    "high_kl_total_nats",
+    "hot_lag_count",
+    "hot_lag_share_kl",
+    "high_kl_pred_gap_nats",
+    "high_minus_rest_pred_gap_nats",
+    "high_gain_overlap_share",
+
 ]
 
 
@@ -406,6 +418,19 @@ def test_every_registered_headline_path_resolves_against_the_blocks_the_analyses
                 "peak_horizon_step": 5,
                 "live_fraction": 1.0,
                 "n_bands": 4,
+            }
+        },
+        # The high-KL selection's block, shaped as ``lag_high_kl.headline_block`` returns it.
+        "lag_high_kl": {
+            "headline": {
+                "high_kl_threshold_nats": 0.92,
+                "high_kl_centroid_kl_s": 118.0,
+                "high_kl_total_nats": 1.3,
+                "hot_lag_count": 27,
+                "hot_lag_share_kl": 0.55,
+                "high_kl_pred_gap_nats": 0.8,
+                "high_minus_rest_pred_gap_nats": 0.4,
+                "high_gain_overlap_share": 0.61,
             }
         },
         "verdicts": [],

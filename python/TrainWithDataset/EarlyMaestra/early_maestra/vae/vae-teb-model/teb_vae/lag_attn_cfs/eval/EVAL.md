@@ -99,6 +99,7 @@ Everything lands in `<run>/eval_results/`:
 | `eval.log` | The run's log, including any refusal. |
 | `per_sample.csv`, `per_sample_vectors.npz` | One row per segment: every scalar readout plus labels and provenance; the vector readouts in row order. |
 | `per_anchor.parquet` | Per-anchor scores, KL, argmax lag, coverage, `seconds_since_contraction`, keyed on the forward's own `anchor_index`. |
+| `per_anchor_vectors.npz` | The per-anchor lag maps — the pooled KL attribution and the head-averaged attention over the lags at every contributing anchor — row for row with `per_anchor.parquet`, in `float16`. Read by `lag_high_kl` alone. |
 | `retained_arrays.npz` | The opt-in retention: per-anchor forecast blocks and attention maps for the capped sample set. |
 | `collection.json` | The collection record: readouts, provenance sidecar, denominators, retention plan, the measured cost of the pass, and `target_keep_index` — the kept-channel axis the band-resolved readout joins through. |
 | `band_partition.json`, `band_channel_map.csv`, `band_channel_map_kept.csv` | The input channel map (the unskippable data-side step), on the declared axis and on the kept one. |
@@ -180,7 +181,7 @@ raises (`True` would silently cap at 1), and a cap of `0` raises.
 | `caps` | Per-quantity retention caps (`waveforms`, `attention`, `pages`, `pages_per_class`, `oracle`). Retention is opt-in: a quantity absent from `caps` is retained for no samples — except `oracle`, where absence means every segment, because a probe fitted on nothing is not a cheaper measurement but no measurement. The first cap ships **halved** against the raw cells, at 64: a retained forecast set here is four $(136, 30, 98)$ fp32 tensors, about 6.1 MiB per segment against their 2.0 MiB. |
 | `prior_shuffle_min_nats` | The provisional margin the prior-shuffle degradation must clear; the verdict always reports the measured number beside it. |
 | `min_active_dims` | Active latent dimensions below which the latent counts as collapsed. |
-| `event_lag_window_s` | Seconds after a detected contraction within which an anchor counts as event-conditioned. Still read here, because contraction-*conditioned* coupling ports even though the two readouts that scored a clinical trace do not. |
+| `event_lag_window_s` | Seconds after a detected contraction within which an anchor counts as event-conditioned. Still read here, because contraction-*conditioned* coupling ports even though the two readouts that scored a clinical trace do not; `lag_high_kl` reads the same window for its contraction enrichment of high-KL anchors, so the two analyses agree about what "near a contraction" means. |
 | `bootstrap_resamples` | Resamples behind every bootstrap interval, drawn over recordings — never over anchors, whose forecast windows overlap 14/15. |
 | `clock_margin_min_nats` | **This cell's own, and it ships unset.** The margin $\Delta_{\mathrm{clock}}$ must clear for `coupling_exceeds_availability_clock` to PASS. Nullable exactly as `max_samples` is; at `null` the verdict is INCONCLUSIVE and the measurement is emitted anyway. See *`source_null`* below for why a guessed threshold would be worse than no threshold. |
 | `figure_format` | Image format every figure of the run is written in, as a matplotlib filetype (`pdf`, `svg`, `png`, `eps`, …); validated at config load against the installed matplotlib's own list. `null` — the shipped setting — keeps the `pdf` default, which is what `figure_manifest.json` and `FIGURE_GUIDE.md` record and what the smoke suite compares a real run against; a run that changes it writes filenames those files do not list. |
@@ -1005,6 +1006,112 @@ a re-run is not the selection the numbers beside it were chosen with.
 pass also removes this analysis's selection, and this one records a named skip rather than
 silently emitting its unrestricted half.
 
+### lag_high_kl
+
+**The lag structure of the anchors that carry the coupling, selected by their own $K_t$.** Every
+other lag readout averages a segment's anchors together before it reads a lag position, and on this
+family that average is dominated by anchors whose KL is the availability clock and little else: the
+diagnosed runs put $67$–$92\%$ of the coupling readout in a term that survives zeroing the source,
+spread over every anchor. The anchors at which the source actually informed the future are the
+minority with a large $K_t$, and their lag profile is what the pooled one dilutes.
+
+The selection is a **quantile band of the pooled per-anchor KL** — pooled over every scored anchor
+of every clinical class within the run's horizon, so one run has one threshold in nats and every
+segment, window and class is cut by the same number. Three bands ship, as module constants rather
+than `eval_config` keys for the reason the significance level is not one: `high`, the upper $30\%$
+($q \in [0.7, 1]$); `rest`, its complement, so the two recompose to every anchor and a contrast is
+against everything unselected; and `top`, the upper $10\%$. Per segment and per band: the **share
+of the segment's anchors** in the band, and the **lag profile restricted to those anchors** — the
+mean per-anchor KL attribution $\widetilde K_{t,\ell} = \sum_m K^{(m)}_t \alpha^{(m)}_{t,\ell}$ over
+the selected anchors, and the head-averaged attention over the same anchors — reduced through the
+shared shape vocabulary of `lag_shape.py` (centroid, spread, median, IQR, entropy, effective
+support, near and far mass, peak with its guard, and the two nats-scale totals). Both are resolved
+against **both clinical clocks** on the same $0.5$ h grid, by class.
+
+**It reads a third sidecar the collection pass writes for it.** `per_anchor_vectors.npz` carries the
+pooled KL attribution and the head-averaged attention at every contributing anchor, row for row with
+`per_anchor.parquet`, in `float16`. No per-sample profile can stand in for it — a per-sample profile
+*is* the average over anchors this analysis exists to undo — and the per-anchor `argmax_lag` column
+cannot either once a profile is flat. A directory collected before the sidecar existed records a
+named skip; re-collect to produce it.
+
+**Exactly two readouts are tested, on two clocks: four Holm families, none joint.** The high band's
+KL centroid `high_lag_centroid_kl_s` and the high-anchor share `high_anchor_frac`, per window with
+Kruskal–Wallis across classes, Holm across that clock's windows, and pairwise Mann–Whitney with
+Cliff's delta on the survivors — the same three layers and the same severity orientation every clock
+analysis uses — plus the one run-level paired usefulness test below. Everything else ships
+**untested** and the record says so: the `rest`, `top` and `gain` bands' clock trajectories, every
+attention-profile statistic, the hot-lag shares, the decile, argmax and occlusion-join tables and
+the contraction enrichment.
+
+**Three further readings come from the same selection.**
+
+- **Hot lags.** The lags whose *pooled* attribution — over every anchor of the population — sits in
+  the upper $30\%$ across the $91$ lags. A run-level set, recorded lag by lag in
+  `lag_high_kl_selection.csv`, and the per-segment share of attribution landing on it is placed on
+  both clocks beside the band readouts. **This is the top-$K$-by-KL selection `lag_kld_scaled`
+  declines for its own bands, taken here deliberately and with the circularity stated on every
+  artifact**: the set is chosen from the same attribution it then summarises, so a share on it
+  describes the run's own selection and is not an independent test of it. The selection is pooled
+  over every class, which is what keeps a *class contrast* on it honest — no class chose its own
+  lags. The geometry-fixed bands and the occlusion readout remain the selections that need no
+  estimate.
+- **Where the KL sits on the lag axis, by KL magnitude.** The per-anchor `argmax_lag` against the KL
+  decile of the same anchor, pooled and per class (`lag_high_kl_argmax_by_quantile.csv`). A flat
+  picture across deciles says the argmax is a property of the geometry rather than of the coupling;
+  a picture that moves says which lags the coupling actually lives at.
+- **Contraction enrichment.** Whether high-KL anchors are more common within `event_lag_window_s` of
+  a detected contraction than outside it, per recording (`lag_high_kl_contraction.csv`) and
+  summarised by class — the coupling-magnitude counterpart of `events`, on the same per-anchor
+  contraction age and with no extra pass. A recording's difference is reported only with at least
+  five anchors in **each** arm; below that a share is a coin toss and the row says `reportable =
+  False`.
+
+**Whether any of it is *useful* is asked directly, in forecast space, and it is the question the
+analysis exists to settle.** A large $K_t$ says the source moved the belief; it does not say the
+forecast got better. The per-anchor table carries the Monte Carlo forecast gain of the same anchor,
+`mc_pred_gap` $= D_{\mathrm{base}} - D_{\mathrm{full}}$ in nats (the single-draw `pred_gap` on a
+pass without it), and the selection is scored by it four ways:
+
+- **Per band, the mean gain of its anchors** — `high_pred_gap_nats`, `rest_pred_gap_nats`, … — per
+  segment, per recording and on both clocks. The high band's against the rest band's is tested
+  **once, paired within recording** by a Wilcoxon signed-rank test over recordings with a bootstrap
+  interval on the mean difference; it is its own family of one and is not corrected with the four
+  clock families. Positive means the anchors carrying the coupling are the anchors where the source
+  bought forecast; zero or negative means the KL is not where the usefulness is.
+- **A fourth band, `gain`** — the anchors in the upper $30\%$ of the pooled forecast gain, selected
+  on usefulness rather than on KL — with its own lag profile and statistics, and its **overlap with
+  the high band** against the $30\%$ that independence would give (`share_of_high_in_gain`,
+  Jaccard). Two selections naming the same anchors is the finding; two that do not is the other one.
+- **The gain resolved by KL decile** (`lag_high_kl_gain_by_kl_quantile.csv`, per recording then by
+  class) **and by the anchor's argmax lag** (`lag_high_kl_gain_by_argmax.csv`, pooled and per band):
+  whether more coupling buys more forecast, and whether the lag the attribution names is a lag the
+  forecast profits from.
+- **A gain-weighted attention profile**, $\sum_t \max(g_t, 0)\,\alpha_{t\ell} / \sum_t \max(g_t,
+  0)$ — where the source looks *when it helps* — beside the KL-weighted one on the selection table.
+
+**Observational against interventional, on one partition.** When the `occlusion` analysis has run in
+the directory, `lag_high_kl_occlusion_consistency.csv` joins, per recording and per geometry band of
+`occlusion_bands`, the share of the recording's KL attribution inside the band (all anchors, and the
+high band's) with the forecast cost of occluding that band, and records a descriptive Spearman's
+$\rho$ per band. Positive means the lags the attribution names are the lags the forecast used; near
+zero means the two readings disagree about where the source mattered. The dependency is on the file,
+so `--only lag_high_kl` against a directory whose interventional pass never ran records a skip.
+
+**Eight headline scalars reach every arm table**: the pooled high threshold in nats, the high band's
+centroid and total nats as means over recordings, the hot-lag count and the hot-lag share; and the
+usefulness three — the high band's mean forecast gain, its paired difference against the rest band's,
+and the high–gain overlap share. The threshold comes first because every other number is conditional
+on it — two arms with different thresholds selected different anchors. `lag_high_kl_recordings.csv`,
+one row per recording over the whole population, is the source `cross_subgroup` reads
+`high_anchor_frac` from.
+
+**It is `capped`**, for the reason `lag_clocks` is: the second-stage half scores the recordings that
+carry an onset only, by the shared eligibility rule. Both clocks' per-recording and trajectory
+tables, the per-window restricted profiles, the significance and pairwise tables, and six figures
+— a run-level selection page, a run-level usefulness page and, per clock, a profile-and-trajectory
+page and a tested page — are the outputs. The axis is stored-coefficient time and every one of them carries the caveat.
+
 ### spectral_skill
 
 The forecast gap resolved by the frequency band of the target coefficient. **The channel axis of this
@@ -1246,7 +1353,7 @@ catch, because nobody notices a paragraph that was never written.
 - **`preflight.py`** (*divergent*) The causal guard set: transform == 'causal' on every configured shard, the causal widths, causal_reach_budget_s refused outright, fhr_st/fhr_ph normalised in place of the raw 'fhr', guid added to the required load fields, the warm-up budget re-resolved against the evaluation shards and compared with the checkpoint's stamped tuples, and the lag-support margin measured and recorded rather than assumed. NOT_CAUSAL_STATEMENT is replaced -- the sibling's sentence says the inputs read their own future, which is false here and would be a false disclosure rather than a conservative one -- and the shared half of the causality record is wider, because the warm-up budget, the anchor geometry and the lag support belong to the target domain both cfs cells share rather than to either encoder. Also carries GUARD_RECOVERY, a machine-checked table the sibling keeps by hand in EVAL.md. Added since: second_stage_onset joins REQUIRED_EVAL_LOAD_FIELDS and is named in the refusal, which is the config half of the same guard the probe applies to a batch. No new guard function, so GUARD_RECOVERY is unchanged. The sibling carries the same addition.
 - **`probe.py`** (*divergent*) Two halves where the sibling has one. The population pass -- one loader iteration into loader_probe.json, and its four refusals -- is the sibling's, unchanged in behaviour, because it is what run.py and every population sanity check read. Added beside it is a forward-contract pass behind --checkpoint: this cell's forward takes five positional arguments and raises without a phase above stride 1, returns two keys the family's does not, and produces (B, A_max, H, C_keep) forecast tensors rather than (B, T_valid, H, R), so the readout module was written against a contract that was measured rather than read. It therefore loads a checkpoint, which makes this module layer 1 here and layer 0 in the sibling, and it refuses any geometry but the dense one so a contract measured at the training tiling cannot be reported. Added since: second_stage_onset is a required batch field in both halves, and the population pass reports its {n_values, n_nan} coverage beside time_from_labor_onset -- the loader skips a field it was asked for and the shard does not carry, silently, so without the requirement a missing field would present as a cohort with no second stage. The sibling carries the same addition.
 - **`report_seam.py`** (*divergent*) The mechanism is the sibling's, bound object for bound object. Three content differences: the headline registry drops the three coherence entries and reports the calibration gain per coefficient rather than per element of a 4 Hz trace; HEADLINE_VERDICTS carries ten rather than eight, adding coupling_exceeds_availability_clock and anchor_geometry_intact; and the sanity block drops the two cross-spectral checks, which describe an estimator this package does not have. PRED_GAP_CONVENTION states the 2940-coefficient block and that the likelihood percentage is budget-local.
-- **`run.py`** (*divergent*) Registers twenty analyses rather than seventeen, defaults to CFS_BINDING, records the dense anchor geometry and the training stride in run_context, and registers no coherence step.
+- **`run.py`** (*divergent*) Registers twenty-one analyses rather than seventeen, defaults to CFS_BINDING, records the dense anchor geometry and the training stride in run_context, and registers no coherence step.
 - **`spectra.py`** (*absent*) Not ported at all. It estimates cross-spectra from a 4 Hz raw residual; here a tau-slice gives 136 samples at 0.25 Hz per channel over band-limited envelopes, and the analysing filter's phase was discarded before the coefficient was stored. The frequency-resolved question is answered instead by spectral_skill, on the frequency axis the channels already carry.
 - **`verify.py`** (*divergent*) Gates the ten-verdict registry rather than eight, adding coupling_exceeds_availability_clock -- which ships INCONCLUSIVE because its threshold ships unset -- and anchor_geometry_intact. Its arm axes are this cell's four sweep arms (anchor_stride, warmup_period, horizon, horizon_depth) rather than the sibling's five, the horizon section carries a refusal rather than a reading rule because a block score is per anchor over H*C_keep coefficients, and it renders a cross-cell table against the transformer cfs cell where the sibling renders none. Two smaller divergences: the kept-channel column is dropped, because the warm-up budget is fixed across all four arms and the column would be constant -- the anchor count and the warm fraction are what these arms move -- and the collapse verdict is reported UNKNOWN unless both per-epoch series are present, where the sibling answers with clause 1 alone and renders the result as 'no'.
 - **`analyses/attention.py`** (*divergent*) The attainable entropy ceiling is MEASURED against preflight's own lag_support_margin_steps rather than assumed: three readings of one property -- the recorded margin, the geometry record's truncated-anchor count and the accumulated ceiling against log L -- are compared and their agreement recorded. The truncation accounting is keyed on anchor_floor rather than on a warm-up prefix, because nothing below the floor is decoded at all here; the lag axis is relabelled stored-coefficient time and the group-delay caveat is printed under both figures.

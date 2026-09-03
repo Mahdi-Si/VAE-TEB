@@ -171,6 +171,15 @@ METRIC_SOURCES: Tuple[MetricSource, ...] = (
         "spectral_skill", "spectral_skill_per_recording.csv", "pred_gap_variability",
         higher_is_better=True,
     ),
+    # The share of a recording's anchors whose KL clears the POOLED high threshold. One column
+    # rather than the band's whole profile vocabulary, for the reason the list is short at all;
+    # and this one rather than the centroid because it is the readout the selection defines
+    # without a further reduction: a cohort with more high-KL anchors is a cohort the source
+    # informed more often, whichever lags it informed at. The threshold is pooled over every
+    # class, so no cohort chose its own.
+    MetricSource(
+        "lag_high_kl", "lag_high_kl_recordings.csv", "high_anchor_frac", higher_is_better=True
+    ),
 )
 
 #: The band :data:`METRIC_SOURCES` registers its band-resolved entry in. Named here so the

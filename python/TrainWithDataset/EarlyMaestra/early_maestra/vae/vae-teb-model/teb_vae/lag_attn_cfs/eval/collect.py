@@ -55,10 +55,17 @@ $C_{\mathrm{keep}} = 98$, $L = 91$, $M = 4$, fp32):
   shipped cap is halved to $64$.
 * **The attention weights** ($T \times M \times L$, $427$ KiB per sample) -- **retained under
   ``caps.attention``**, unchanged from the raw cells, whose lag geometry this cell shares.
-* **The per-anchor lag map** ($T \times L$, $107$ KiB per sample) -- **not retained**. The
-  per-anchor table carries its argmax and the vectors sidecar carries its per-sample profile;
-  lean-limit: the per-anchor $\times$ lag heatmap needs a second pass, which is worth adding when
-  an analysis actually draws one.
+* **The per-anchor lag map** -- **written as a third sidecar**, ``per_anchor_vectors.npz``, at
+  the *decoded* anchors only ($A_{\max} \times L$ rather than $T \times L$) and in ``float16``:
+  the pooled KL attribution and the head-averaged attention at every contributing anchor, row for
+  row with ``per_anchor.parquet``. It exists for one consumer, ``lag_high_kl``, which selects
+  anchors by their own $K_t$ and reads the lag structure of the selection -- a question the
+  per-sample profiles, which average every anchor of a segment together, cannot answer, and the
+  per-anchor ``argmax_lag`` column cannot either once a profile is flat. Half precision because
+  the sidecar is a *reading* of the map rather than its accounting copy: the per-anchor
+  ``kld_per_t`` column and the per-sample profiles keep the exact sums, and a relative
+  $2^{-11}$ on a per-lag share moves no statistic taken from it. At the shipped geometry it is
+  $51 \times 91 \times 2$ bytes $\approx 9$ KiB per segment per map before compression.
 
 A cap is **opt-in**: a quantity absent from ``eval_config.caps`` is retained for *no* samples.
 The alternative default -- retain everything unless capped -- is $3.8$ MiB per sample, which is
@@ -118,8 +125,15 @@ PER_SAMPLE_FLOAT_PRECISION = "round_trip"
 PER_SAMPLE_FILENAME = "per_sample.csv"
 PER_ANCHOR_FILENAME = "per_anchor.parquet"
 VECTORS_FILENAME = "per_sample_vectors.npz"
+PER_ANCHOR_VECTORS_FILENAME = "per_anchor_vectors.npz"
 RETAINED_FILENAME = "retained_arrays.npz"
 COLLECTION_FILENAME = "collection.json"
+
+#: Storage precision of the per-anchor vector sidecar. Half precision, deliberately: the sidecar
+#: is a reading of the per-anchor lag map rather than its accounting copy (``kld_per_t`` on the
+#: per-anchor table and the per-sample profiles keep the exact sums), and at a real split's
+#: million-plus anchor rows a ``float32`` copy of two $L$-wide maps is a gigabyte on disk.
+PER_ANCHOR_VECTOR_DTYPE = np.float16
 
 #: Why no cross-spectral sidecar is written, recorded in ``collection.json`` beside the numbers a
 #: reader does get. An absent file is indistinguishable from a pass that failed to write one, and
@@ -458,6 +472,9 @@ class Collection:
         per_sample: One row per segment.
         per_anchor: One row per contributing anchor.
         vectors: Per-sample vector readouts, aligned with ``per_sample``'s row order.
+        anchor_vectors: Per-anchor vector readouts -- the two $L$-wide lag maps -- aligned row
+            for row with ``per_anchor``. Empty on a directory collected before the sidecar
+            existed, which the one analysis reading it records as a skip.
         retained: Heavy arrays kept under the retention plan, each with a matching
             ``<name>_sample_index`` array so a row can be traced back to its segment.
         results: The readouts, verdicts and control accounting the pass computed.
@@ -468,6 +485,7 @@ class Collection:
     per_sample: pd.DataFrame
     per_anchor: pd.DataFrame
     vectors: Dict[str, np.ndarray] = field(default_factory=dict)
+    anchor_vectors: Dict[str, np.ndarray] = field(default_factory=dict)
     retained: Dict[str, np.ndarray] = field(default_factory=dict)
     results: Dict[str, Any] = field(default_factory=dict)
     record: Dict[str, Any] = field(default_factory=dict)
@@ -499,6 +517,7 @@ class _Collector:
         self._rows: Dict[str, List[Any]] = {}
         self._vectors: Dict[str, List[np.ndarray]] = {name: [] for name in VECTOR_READOUTS}
         self._anchor_blocks: List[Dict[str, np.ndarray]] = []
+        self._anchor_vector_blocks: Dict[str, List[np.ndarray]] = {}
         self._retained: Dict[str, List[np.ndarray]] = {}
         self._retained_index: Dict[str, List[int]] = {}
         self._horizon: Dict[str, np.ndarray] = {}
@@ -649,6 +668,15 @@ class _Collector:
         ages = self._contraction_ages(batch, batch_size, anchor_index)
         block[CONTRACTION_AGE_COLUMN] = ages[sample_positions, anchor_positions]
         self._anchor_blocks.append(block)
+        # The per-anchor lag maps, selected by the SAME contributing mask in the SAME order, so
+        # row $i$ of the sidecar is row $i$ of the table. Cast to half precision here, per batch,
+        # rather than at the end: the float32 blocks of a real split would otherwise be held for
+        # the whole pass only to be narrowed once.
+        for name, values in readout.per_anchor_vectors.items():
+            array = values.detach().cpu().numpy()
+            self._anchor_vector_blocks.setdefault(name, []).append(
+                array[sample_positions, anchor_positions].astype(PER_ANCHOR_VECTOR_DTYPE)
+            )
 
     def _contraction_ages(
         self, batch: Any, batch_size: int, anchor_index: np.ndarray
@@ -774,13 +802,19 @@ class _Collector:
             for name, blocks in self._vectors.items()
         }
         per_anchor = _concatenate_blocks(self._anchor_blocks)
+        anchor_vectors = {
+            name: np.concatenate(blocks, axis=0)
+            for name, blocks in self._anchor_vector_blocks.items()
+            if blocks
+        }
         retained = self._finish_retained()
         return Collection(
             per_sample=per_sample,
             per_anchor=per_anchor,
             vectors=vectors,
+            anchor_vectors=anchor_vectors,
             retained=retained,
-            record=self._build_record(per_sample, per_anchor, retained),
+            record=self._build_record(per_sample, per_anchor, retained, anchor_vectors),
         )
 
     def _finish_retained(self) -> Dict[str, np.ndarray]:
@@ -793,7 +827,11 @@ class _Collector:
         return stacked
 
     def _build_record(
-        self, per_sample: pd.DataFrame, per_anchor: pd.DataFrame, retained: Dict[str, np.ndarray]
+        self,
+        per_sample: pd.DataFrame,
+        per_anchor: pd.DataFrame,
+        retained: Dict[str, np.ndarray],
+        anchor_vectors: Optional[Dict[str, np.ndarray]] = None,
     ) -> Dict[str, Any]:
         """Assemble the accounting: exclusions, denominators, retention and the accumulators."""
         readout_columns = [
@@ -813,6 +851,17 @@ class _Collector:
         return {
             "n_per_sample_rows": int(len(per_sample)),
             "n_per_anchor_rows": int(len(per_anchor)),
+            # The per-anchor vector sidecar's shape and cost, so a reader of the record knows the
+            # maps are there -- and at what precision -- without opening the file.
+            "per_anchor_vectors": {
+                name: {
+                    "n_rows": int(array.shape[0]),
+                    "width": int(array.shape[1]) if array.ndim == 2 else None,
+                    "dtype": str(array.dtype),
+                    "bytes": int(array.nbytes),
+                }
+                for name, array in (anchor_vectors or {}).items()
+            },
             "n_recordings": int(per_sample["guid"].nunique()) if not per_sample.empty else 0,
             # Excluded from every average and counted here. A run where this is large measured
             # far less than its segment count suggests, and no other number says so.
@@ -1267,6 +1316,8 @@ def write_collection(collection: Collection, results_dir: Any) -> Path:
     # format-negotiation branch would be an untested second path for no gain.
     collection.per_anchor.to_parquet(results_dir / PER_ANCHOR_FILENAME, index=False)
     np.savez_compressed(results_dir / VECTORS_FILENAME, **collection.vectors)
+    if collection.anchor_vectors:
+        np.savez_compressed(results_dir / PER_ANCHOR_VECTORS_FILENAME, **collection.anchor_vectors)
     if collection.retained:
         np.savez_compressed(results_dir / RETAINED_FILENAME, **collection.retained)
 
@@ -1361,6 +1412,11 @@ def load_collection(results_dir: Any) -> Collection:
     if vectors_path.is_file():
         with np.load(vectors_path) as handle:
             vectors = {name: handle[name] for name in handle.files}
+    anchor_vectors: Dict[str, np.ndarray] = {}
+    anchor_vectors_path = results_dir / PER_ANCHOR_VECTORS_FILENAME
+    if anchor_vectors_path.is_file():
+        with np.load(anchor_vectors_path) as handle:
+            anchor_vectors = {name: handle[name] for name in handle.files}
     retained: Dict[str, np.ndarray] = {}
     retained_path = results_dir / RETAINED_FILENAME
     if retained_path.is_file():
@@ -1368,10 +1424,12 @@ def load_collection(results_dir: Any) -> Collection:
             retained = {name: handle[name] for name in handle.files}
 
     _check_row_counts(record, per_sample, per_anchor, results_dir)
+    _check_anchor_vector_rows(anchor_vectors, per_anchor, results_dir)
     return Collection(
         per_sample=per_sample,
         per_anchor=per_anchor,
         vectors=vectors,
+        anchor_vectors=anchor_vectors,
         retained=retained,
         results=dict(record.get("results") or {}),
         record=record,
@@ -1403,6 +1461,33 @@ def _check_row_counts(
                 f"{results_dir / name} holds {len(frame)} row(s) but {COLLECTION_FILENAME} "
                 f"records {int(expected)}. The table is truncated -- a run killed mid-write "
                 f"leaves this -- and reading it would report a silently narrower population."
+            )
+
+
+def _check_anchor_vector_rows(
+    anchor_vectors: Dict[str, np.ndarray], per_anchor: pd.DataFrame, results_dir: Path
+) -> None:
+    """Raise when a per-anchor vector sidecar is not row-aligned with the per-anchor table.
+
+    The sidecar carries no key of its own -- row $i$ *is* row $i$ of the table -- so a length
+    mismatch is the one corruption that would otherwise pass silently: every row would still be
+    a well-formed profile, attributed to the wrong anchor.
+
+    Args:
+        anchor_vectors: The sidecar's arrays as read.
+        per_anchor: The per-anchor table as read.
+        results_dir: The directory, for the message.
+
+    Raises:
+        TablesProvenanceMismatch: Naming the array, its row count and the table's.
+    """
+    for name, array in anchor_vectors.items():
+        if int(array.shape[0]) != len(per_anchor):
+            raise TablesProvenanceMismatch(
+                f"{results_dir / PER_ANCHOR_VECTORS_FILENAME}[{name!r}] holds "
+                f"{int(array.shape[0])} row(s) against {len(per_anchor)} in "
+                f"{PER_ANCHOR_FILENAME}. The sidecar is aligned with the table by row position "
+                f"alone, so a mismatch would attribute every lag map to the wrong anchor."
             )
 
 
