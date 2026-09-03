@@ -34,6 +34,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Mapping, Tuple
 
 from teb_vae.lag_attn_cfs.eval.analyses import lag_clocks as lag_clocks_analysis
+from teb_vae.lag_attn_cfs.eval.analyses import lag_high_kl as lag_high_kl_analysis
 from teb_vae.lag_attn_cfs.eval.analyses import lag_kld_scaled as lag_kld_scaled_analysis
 from teb_vae.lag_attn_cfs.eval.analyses import occlusion as occlusion_analysis
 from teb_vae.lag_attn_cfs.eval.analyses import source_null as source_null_analysis
@@ -208,8 +209,14 @@ EXTRA_ANALYSES: Dict[str, Any] = {
     # divide out, the lags a geometry-fixed partition says are worth asking about, and the heads
     # the pooled profile averages. Reads the tables and the vector sidecar only.
     "lag_kld_scaled": lag_kld_scaled_analysis.run_lag_kld_scaled_analysis,
-    # Last of the four: it is the only one whose input is a file another step wrote, the kept-axis
-    # channel map, so it reads rather than produces.
+    # Third of the lag-against-the-clocks trio: the same two clocks, read on the ANCHORS that carry
+    # the coupling rather than on all of them. It selects anchors by a quantile band of the pooled
+    # per-anchor KL and reads the lag structure of the selection off the per-anchor vector sidecar
+    # the collection pass writes -- the one input none of the per-sample profiles can stand in
+    # for. Reads the tables and both sidecars only; needs no checkpoint.
+    "lag_high_kl": lag_high_kl_analysis.run_lag_high_kl_analysis,
+    # Last of the extras: it is the only one whose input is a file another step wrote, the
+    # kept-axis channel map, so it reads rather than produces.
     "spectral_skill": spectral_skill_analysis.run_spectral_skill_analysis,
 }
 
@@ -298,6 +305,25 @@ HEADLINE_SCALARS: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
     ("occlusion_peak_band_delta_nats", ("occlusion", "headline", "delta_total_nats")),
     ("occlusion_peak_band_horizon_step", ("occlusion", "headline", "peak_horizon_step")),
     ("occlusion_peak_band_live_fraction", ("occlusion", "headline", "live_fraction")),
+    # The high-KL selection's own. The threshold first, because every other number in the block is
+    # conditional on it and two arms with different thresholds selected different anchors; then
+    # the high band's centroid and total over recordings, and the hot-lag set's size and the share
+    # of the attribution that lands on it. All five are means over RECORDINGS of whole-recording
+    # values, the unit every arm-table comparison is made in.
+    ("high_kl_threshold_nats", ("lag_high_kl", "headline", "high_kl_threshold_nats")),
+    ("high_kl_centroid_kl_s", ("lag_high_kl", "headline", "high_kl_centroid_kl_s")),
+    ("high_kl_total_nats", ("lag_high_kl", "headline", "high_kl_total_nats")),
+    ("hot_lag_count", ("lag_high_kl", "headline", "hot_lag_count")),
+    ("hot_lag_share_kl", ("lag_high_kl", "headline", "hot_lag_share_kl")),
+    # ... and whether any of it is USEFUL, in forecast space: the high band's mean forecast gain
+    # over recordings, its paired difference against the rest band's, and the share of high-KL
+    # anchors that are also high-gain anchors (0.3 is what independence would give).
+    ("high_kl_pred_gap_nats", ("lag_high_kl", "headline", "high_kl_pred_gap_nats")),
+    (
+        "high_minus_rest_pred_gap_nats",
+        ("lag_high_kl", "headline", "high_minus_rest_pred_gap_nats"),
+    ),
+    ("high_gain_overlap_share", ("lag_high_kl", "headline", "high_gain_overlap_share")),
 )
 
 

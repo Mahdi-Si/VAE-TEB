@@ -620,6 +620,167 @@ no recorded onset cannot be placed on this axis at all, so this page and the del
 answer for different recordings by design. The analysis declares itself capped for that reason, and
 the eligibility rule is the shared one — the same the `second_stage` analysis applies.
 
+## `lag_high_kl/lag_high_kl_selection.pdf`
+
+**In plain terms.** *"Which anchors were counted as carrying the coupling, and what do their lags
+look like pooled?"* Every other lag figure averages a segment's anchors together; this page shows
+the cut that separates the high-KL anchors from the rest, and what the two look like once apart.
+
+**What it shows.** Four panels. **Top:** the pooled per-anchor KL, one step histogram per clinical
+class on a $\log_{10}$ axis, with the band thresholds drawn as dashed lines and labelled with their
+quantile and their value in nats — the histogram the bands were cut on. **Second:** the pooled KL
+attribution per lag for the `high`, `rest` and `top` anchor bands, with the **hot lags** — the lags
+whose pooled attribution sits in the upper $30\%$ across the lag axis — shaded behind them.
+**Third:** a heatmap of where each anchor's attribution peaks, by KL decile (lowest at the bottom)
+and lag: the share of that decile's anchors whose `argmax_lag` falls at each lag. **Bottom:** one
+violin per class of the per-recording contraction enrichment — the high-anchor share within
+`event_lag_window_s` of a contraction minus the share outside it — over recordings with at least
+five anchors in each arm, zero marked.
+
+**Axes.** Panel 1: $\log_{10}$ nats across, density of anchors up. Panels 2 and 3: stored-coefficient
+lag in seconds across; nats per anchor up in panel 2, KL decile up in panel 3. Panel 4: class
+across, share difference up.
+
+**How it is misread.** Five ways.
+
+- **The thresholds are one number per run, pooled over every class.** A class whose histogram sits
+  to the right has more high anchors *under the same cut*; nothing here re-cuts per class, and that
+  is what makes the class shares comparable.
+- **The hot-lag set is selected from the attribution it shades.** A pooled profile that is high on
+  the hot lags is a tautology, not a finding; what the set is for is the per-segment share placed
+  on the clocks, and even there it describes the run's own selection. The geometry-fixed bands on
+  the `lag_kld_scaled` page and the `occlusion` page need no such estimate.
+- **A decile heatmap that is flat across rows is the geometry talking.** If the top decile peaks at
+  the same lags as the bottom one, the argmax is a property of the window's censoring edges and the
+  K/V receptive field rather than of the coupling; read the `attention` and `source_null` pages
+  before reading a peak position off this one.
+- **The enrichment violin is descriptive.** No test is run on it, and a recording enters it only
+  with enough anchors in both arms, so its population is a subset that the record counts.
+- **The lag axis is stored-coefficient time**, as the foot of the page says: a lag here is not a
+  physiological delay.
+
+## `lag_high_kl/lag_high_kl_time_to_delivery.pdf`
+
+**In plain terms.** *"Where in the past did the high-KL anchors look, hour by hour before delivery,
+and how many of them were there?"* The `lag_clocks` page asks the first half of every anchor; this
+one asks it of the anchors in the upper $30\%$ of the pooled KL alone.
+
+**What it shows.** One heatmap per class — lag down, window across, colour the **share** of the high
+band's KL attribution in that lag bin, every window normalised to one and the three classes on one
+colour scale — then three trajectory panels, each the median per class with its inter-quartile
+ribbon and the recording count on every point: the **high-anchor share** of a segment's anchors,
+with the `top` band's share dashed; the **high band's KL centroid** in seconds, with the `rest`
+band's centroid dashed beside it; and the **hot-lag share** of the attribution, with the attention's
+dashed. The first two are the tested readouts and their titles say so; the third is untested.
+
+**Axes.** Hours before delivery across, drawn with delivery at the right; stored-coefficient lag in
+seconds up on the heatmaps and the centroid panel; a share of anchors, or of the attribution, up on
+the other two.
+
+**How it is misread.** Four ways.
+
+- **The heatmap is a share, not a magnitude.** It answers *where* the high anchors' attribution sat,
+  never how much of it there was; the high band's `total_nats` is on the trajectory table and the
+  amount of coupling is what `time_to_delivery` draws.
+- **A centroid that separates the classes is a hypothesis until the windows page says otherwise.**
+  The ribbon is a quartile range over recordings, not an interval on the median, and the test lives
+  on `lag_high_kl_time_to_delivery_windows.pdf`.
+- **The high-anchor share is measured against a pooled threshold.** A class whose share rises toward
+  delivery has more anchors clearing the *run's* cut, not a cut of its own; and the pooled share
+  over the whole population is $30\%$ by construction, so only its distribution over classes and
+  windows carries information.
+- **The `rest` centroid beside the `high` one is the contrast that matters.** If the two move
+  together the lag structure is not specific to the coupling; if only the `high` one moves, the
+  anchors carrying the coupling looked somewhere the others did not.
+
+## `lag_high_kl/lag_high_kl_time_to_delivery_windows.pdf`
+
+**In plain terms.** *"Is the difference between the classes real, window by window?"* — for the two
+tested readouts of the page above.
+
+**What it shows.** For each of `high_lag_centroid_kl_s` and `high_anchor_frac`: one violin per
+(window, class) cell over one value per recording, the Holm-adjusted $p$ of each window directly
+beneath it on the same axis, and — at the foot — Cliff's delta for every class pair that survived,
+oriented more severe against less severe so a positive value means the more severe class runs
+higher.
+
+**Axes.** Hours before delivery across, delivery at the right. The violin rows share one $y$ label
+because the page carries two readouts in two units: seconds for the centroid, a share of anchors for
+the fraction; each row's title names which it is.
+
+**How it is misread.** Two ways. **Each (clock, readout) is its own Holm family** — two here, two on
+the second-stage page, none joint — so a reader quoting a window from two of them has made two
+comparisons. And **a cell too small to test is still drawn**: classes with fewer than three
+recordings in a window are excluded from the test and recorded, but their violins stay on the page
+so a cohort thinning toward the edge of the axis does not simply vanish.
+
+## `lag_high_kl/lag_high_kl_second_stage.pdf`
+
+**In plain terms.** The same page as `lag_high_kl_time_to_delivery.pdf` against the second clinical
+clock: signed hours from second-stage onset, negative before and positive after.
+
+**What it shows and its axes.** As the delivery-clock page, on the second-stage axis drawn left to
+right with the onset marked where it falls.
+
+**How it is misread.** As above, plus one. **The population is a strict subset**: a recording with no
+recorded onset cannot be placed on this axis at all, so this page and the delivery-clock page answer
+for different recordings by design, under the shared eligibility rule the `second_stage` analysis
+applies.
+
+## `lag_high_kl/lag_high_kl_second_stage_windows.pdf`
+
+**In plain terms.** The tested page for the second clock: the same two readouts, the same three
+layers of inference, its own two Holm families.
+
+**What it shows and its axes.** As `lag_high_kl_time_to_delivery_windows.pdf`, on the signed
+second-stage axis with the onset marked at zero.
+
+**How it is misread.** As that page, and with the same population caveat as the second-stage profile
+page above.
+
+## `lag_high_kl/lag_high_kl_usefulness.pdf`
+
+**In plain terms.** *"Is the model learning anything useful from the lags?"* — asked in forecast
+space rather than in KL space. A large $K_t$ says the source moved the belief; this page asks whether
+the forecast got better where it did, and whether the lags the attribution names are the lags the
+forecast profits from.
+
+**What it shows.** Four panels. **Top:** the forecast gain $D_{\mathrm{base}} - D_{\mathrm{full}}$
+of an anchor against the KL decile of the same anchor — the median per recording with its
+inter-quartile ribbon, pooled in black and one line per class, zero marked. The title carries the
+run-level paired test: the high band's mean gain minus the rest band's within recording, its
+Wilcoxon $p$ and the share of recordings in which it is positive. **Second:** the mean gain by the lag
+the anchor's KL attribution peaks at, for every anchor and for the `high`, `rest` and `gain` bands.
+**Third:** the pooled lag profiles as shares — the all-anchor KL attribution, the attention weighted
+by positive forecast gain (where the source looks *when it helps*), and the `gain` and `high` bands'
+attributions — with the high–gain overlap in the title against the $30\%$ independence would give.
+**Bottom:** per recording and per `occlusion_bands` band, the share of KL attribution inside the band
+against the forecast cost of occluding it, one colour per band, zero marked; or the note that the
+interventional pass did not run in this directory.
+
+**Axes.** Panel 1: KL decile across (0 = lowest), nats per anchor up. Panel 2: stored-coefficient lag
+in seconds across, nats per anchor up. Panel 3: lag across, share of the profile up. Panel 4: share
+of the recording's attribution across, occlusion delta in nats up.
+
+**How it is misread.** Five ways.
+
+- **A rising top panel is the finding, a flat one is the other finding.** If the gain does not rise
+  with the KL decile — or the high-minus-rest difference is not positive — the coupling readout is
+  measuring something the forecast does not use, however sharp the lag profile looks. The
+  availability clock is the standing candidate for what it is measuring instead; read `source_null`.
+- **The paired test is one test, its own family.** It is not corrected with the four clock families,
+  and it says nothing about *which* lags helped; panels 2 to 4 are where that is read, and they are
+  descriptive.
+- **Panel 2 conditions on the argmax, which the near edge can pin.** A lag with many anchors and a
+  small gain is a censoring artefact as readily as a finding; read it beside `n_anchors` in
+  `lag_high_kl_gain_by_argmax.csv` and beside the degeneracy share on the clock pages.
+- **The gain-weighted profile is not a second lag detector.** It weights the same attention by the
+  same run's forecast gain, so it can only redistribute mass the model already put somewhere; a
+  profile identical to the KL-weighted one means the useful anchors look where all anchors look.
+- **The bottom panel's agreement is a property of the run, not of the method.** On the planted-delay
+  fixture the two readings disagreed; a positive $\rho$ here says the observational and the
+  interventional answers coincide for this checkpoint, and nothing more.
+
 ## `spectral_skill/spectral_skill_bands.pdf`
 
 **In plain terms.** *"Which frequencies does the model forecast well?"* The channel axis of this target domain **is** a frequency axis — a scattering coefficient is the envelope of the signal filtered at one centre frequency — so the forecast can be resolved by band without estimating a spectrum at all.

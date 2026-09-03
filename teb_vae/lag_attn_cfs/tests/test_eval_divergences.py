@@ -64,6 +64,10 @@ CELL_SPECIFIC_MODULES: Tuple[str, ...] = (
     "analyses/occlusion.py",
     "analyses/spectral_skill.py",
     "analyses/lag_clocks.py",
+    # The lag structure of the anchors selected by their own pooled-KL quantile band. Cell
+    # specific for lag_clocks' reason, and because it reads the per-anchor vector sidecar this
+    # cell's collection pass writes and the sibling's does not.
+    "analyses/lag_high_kl.py",
     # The KLD-scaled, band-restricted and per-head reading of the same lag structure. Cell
     # specific for lag_clocks' reason and one of its own: the sibling has no availability
     # clock, so it has no clock-excess profile to weight or to select on.

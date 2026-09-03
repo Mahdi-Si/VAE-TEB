@@ -33,6 +33,14 @@
       "lag_time_to_delivery_features.pdf",
       "lag_time_to_delivery_windows.pdf"
     ],
+    "lag_high_kl": [
+      "lag_high_kl_second_stage.pdf",
+      "lag_high_kl_second_stage_windows.pdf",
+      "lag_high_kl_selection.pdf",
+      "lag_high_kl_time_to_delivery.pdf",
+      "lag_high_kl_time_to_delivery_windows.pdf",
+      "lag_high_kl_usefulness.pdf"
+    ],
     "lag_kl": [
       "lag_kl_profile.pdf"
     ],

@@ -101,7 +101,7 @@
     },
     "run.py": {
       "state": "divergent",
-      "reason": "Registers twenty analyses rather than seventeen, defaults to CFS_BINDING, records the dense anchor geometry and the training stride in run_context, and registers no coherence step."
+      "reason": "Registers twenty-one analyses rather than seventeen, defaults to CFS_BINDING, records the dense anchor geometry and the training stride in run_context, and registers no coherence step."
     },
     "spectra.py": {
       "state": "absent",

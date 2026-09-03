@@ -705,6 +705,58 @@ def test_the_vectors_sidecar_is_row_aligned_with_the_per_sample_table(trained_ta
         assert np.array_equal(rows, collection.vectors[name], equal_nan=True), name
 
 
+def test_the_per_anchor_vector_sidecar_is_row_aligned_with_the_per_anchor_table(
+    trained_task, tmp_path
+):
+    r"""The third sidecar: the two $L$-wide lag maps at every contributing anchor, row for row
+    with ``per_anchor.parquet``, in half precision.
+
+    Aligned by row position alone -- the sidecar carries no key -- so three things are asserted
+    rather than one: the row count is the table's, the KL map sums over lags to the table's own
+    ``kld_per_t`` on every row (to half precision, because that is what the sidecar is stored
+    at), and the round trip through disk is exact. A sidecar one row short is refused by name on
+    the read.
+    """
+    from teb_vae.lag_attn_cfs.eval.collect import (
+        PER_ANCHOR_VECTORS_FILENAME,
+        TablesProvenanceMismatch,
+    )
+
+    collection = _collect(
+        trained_task, [_labelled_batch(["a", "b"]), _labelled_batch(["c", "d"], seed=1)]
+    )
+
+    assert set(collection.anchor_vectors) == {"kl_lag_map", "attention_lag_map"}
+    n_lags = int(trained_task.orig_model.max_lag) + 1
+    for name, rows in collection.anchor_vectors.items():
+        assert rows.dtype == np.float16, name
+        assert rows.shape == (len(collection.per_anchor), n_lags), name
+    kl_map = collection.anchor_vectors["kl_lag_map"].astype(np.float64)
+    summed = kl_map.sum(axis=1)
+    table = collection.per_anchor["kld_per_t"].to_numpy(dtype=np.float64)
+    # Half precision on each of L bins, summed: a relative tolerance a few times $2^{-11}$.
+    assert np.allclose(summed, table, rtol=5e-3, atol=1e-3)
+    # The attention is a distribution over the lags at every anchor.
+    attention = collection.anchor_vectors["attention_lag_map"].astype(np.float64)
+    assert np.allclose(attention.sum(axis=1), 1.0, atol=5e-3)
+    # And the record says what was written.
+    assert collection.record["per_anchor_vectors"]["kl_lag_map"]["n_rows"] == len(
+        collection.per_anchor
+    )
+
+    write_collection(collection, tmp_path)
+    assert (tmp_path / PER_ANCHOR_VECTORS_FILENAME).is_file()
+    reloaded = load_collection(tmp_path)
+    for name, rows in reloaded.anchor_vectors.items():
+        assert np.array_equal(rows, collection.anchor_vectors[name], equal_nan=True), name
+
+    # Truncated by one row: refused on the read, naming the array.
+    short = {name: rows[:-1] for name, rows in collection.anchor_vectors.items()}
+    np.savez_compressed(tmp_path / PER_ANCHOR_VECTORS_FILENAME, **short)
+    with pytest.raises(TablesProvenanceMismatch, match="kl_lag_map"):
+        load_collection(tmp_path)
+
+
 # =================================================================================================
 # Discovery and provenance
 # =================================================================================================
