@@ -521,7 +521,7 @@ def _draw_panel(ax: Any, rows: Sequence[Dict[str, Any]], axis: str, *, title: st
         ax.plot(
             x, np.array([row["median"] for row in cell], dtype=np.float64),
             marker="o", markersize=3, color=colour, linewidth=figures.LINE_EMPHASIS,
-            label=f"{group} (n={int(sum(row['n_recordings'] for row in cell))})",
+            label=f"{group} (n={int(cell[0].get('n_recordings_total', 0))} deliveries)",
         )
         for row in cell:
             ax.annotate(

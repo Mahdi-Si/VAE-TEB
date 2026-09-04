@@ -110,6 +110,7 @@ from teb_vae.lag_attn_cfs.eval.lag_axis import (
 from teb_vae.lag_attn_cfs.eval.lag_shape import (
     DEGENERATE_PEAK_TO_MEDIAN,
     DEGENERATE_ZERO_FRACTION,
+    SECONDS_PER_LAG_STEP,
     STATISTIC_KEYS,
     profile_statistics,
 )
@@ -915,8 +916,8 @@ def gain_by_kl_quantile(
         positive gain; and the bin edges in nats. Empty when the table carries no gain.
     """
     columns = [
-        "group", "kl_bin", "kl_lo_nats", "kl_hi_nats", "n_recordings", "n_anchors",
-        "mean_gain_nats", "q25", "median", "q75", "positive_anchor_share",
+        "group", "kl_bin", "kl_lo_nats", "kl_hi_nats", "n_recordings", "n_recordings_total",
+        "n_anchors", "mean_gain_nats", "q25", "median", "q75", "positive_anchor_share",
     ]
     finite = np.isfinite(population.gain)
     if not finite.any():
@@ -940,6 +941,7 @@ def gain_by_kl_quantile(
     for name in cohorts:
         subset = table if name == "all" else table[table["group"] == name]
         per_guid = subset.groupby(["bin", "guid"])["gain"].mean()
+        n_total = int(subset["guid"].nunique())
         for index in range(int(n_bins)):
             values = (
                 per_guid.loc[index].to_numpy(dtype=np.float64)
@@ -953,6 +955,7 @@ def gain_by_kl_quantile(
                     "kl_lo_nats": edges[index],
                     "kl_hi_nats": edges[index + 1],
                     "n_recordings": int(values.size),
+                    "n_recordings_total": n_total,
                     "n_anchors": int(anchors.size),
                     "mean_gain_nats": float(values.mean()) if values.size else float("nan"),
                     "q25": float(np.percentile(values, 25)) if values.size else float("nan"),
@@ -1079,8 +1082,8 @@ def usefulness_test(recordings: pd.DataFrame, *, resamples: int, seed: int) -> D
         "n_pairs": int(difference.size),
         "mean_difference_nats": float(difference.mean()),
         "median_difference_nats": float(np.median(difference)),
-        "ci_lo": interval.get("ci_lo"),
-        "ci_hi": interval.get("ci_hi"),
+        "ci_lo": interval.get("lo"),
+        "ci_hi": interval.get("hi"),
         "positive_fraction": float((difference > 0.0).mean()),
         "wilcoxon": wilcoxon,
     }
@@ -1410,12 +1413,13 @@ def analyse_windows(
 
 def window_profiles(
     clock: Clock, binned: pd.DataFrame, matrix: Optional[np.ndarray], n_lags: int
-) -> Tuple[List[int], List[float], List[Tuple[str, np.ndarray, np.ndarray, np.ndarray]]]:
+) -> Tuple[List[int], List[float], List[Tuple[str, np.ndarray, np.ndarray, np.ndarray, int]]]:
     """Average a per-segment profile within each recording, then within each (class, window).
 
     Returns:
-        ``(windows, centres, fields)`` with one ``(group, mean, share, counts)`` per class in the
-        canonical order, every class on the same window axis with NaN where it has no recording.
+        ``(windows, centres, fields)`` with one ``(group, mean, share, counts, n_recordings)`` per
+        class in the canonical order -- the last being the cohort's distinct recordings over the
+        whole axis -- every class on the same window axis with NaN where it has no recording.
     """
     if matrix is None:
         return [], [], []
@@ -1436,9 +1440,12 @@ def window_profiles(
     per_guid = table.groupby(["group", "window", "guid"], sort=True)[columns].mean()
     per_cell = per_guid.groupby(["group", "window"], sort=True)[columns].mean()
     counted = per_guid.notna().any(axis=1).groupby(["group", "window"], sort=True).sum()
-    windows = sorted({int(value) for value in table["window"]})
-    centres = [float(table.loc[table["window"] == window, "centre"].iloc[0]) for window in windows]
-    fields: List[Tuple[str, np.ndarray, np.ndarray, np.ndarray]] = []
+    # Every window between the first and the last, so an empty interior window is a blank
+    # column rather than a shift of every later column onto the wrong hour.
+    lowest, highest = int(table["window"].min()), int(table["window"].max())
+    windows = list(range(lowest, highest + 1))
+    centres = [(window + 0.5) * float(TRAJECTORY_BIN_HOURS) for window in windows]
+    fields: List[Tuple[str, np.ndarray, np.ndarray, np.ndarray, int]] = []
     for group in cohort.ordered_groups(sorted(set(table["group"])), labels.CLASS_COLUMN):
         mean = np.full((int(n_lags), len(windows)), np.nan)
         counts = np.zeros(len(windows), dtype=np.int64)
@@ -1451,7 +1458,12 @@ def window_profiles(
             mean, np.where(totals > 0.0, totals, np.nan)[None, :],
             out=np.full_like(mean, np.nan), where=np.isfinite(mean),
         )
-        fields.append((group, mean, share, counts))
+        fields.append(
+            (
+                group, mean, share, counts,
+                int(per_guid.loc[group].index.get_level_values("guid").nunique()),
+            )
+        )
     return windows, centres, fields
 
 
@@ -1460,12 +1472,12 @@ def profile_frame(
     band_key: str,
     windows: Sequence[int],
     centres: Sequence[float],
-    fields: Sequence[Tuple[str, np.ndarray, np.ndarray, np.ndarray]],
+    fields: Sequence[Tuple[str, np.ndarray, np.ndarray, np.ndarray, int]],
     seconds: np.ndarray,
 ) -> pd.DataFrame:
     """Lay the per-cell mean restricted profiles out long-form: one row per (class, window, lag)."""
     rows: List[Dict[str, Any]] = []
-    for group, mean, share, counts in fields:
+    for group, mean, share, counts, _ in fields:
         for index, window in enumerate(windows):
             for lag in range(int(seconds.size)):
                 rows.append(
@@ -1568,6 +1580,7 @@ def _empty_panel(ax: Any, title: str) -> None:
 def build_selection_figure(
     population: AnchorPopulation,
     classes: np.ndarray,
+    guids: np.ndarray,
     thresholds: Dict[str, Dict[str, float]],
     profiles: Dict[str, np.ndarray],
     hot: np.ndarray,
@@ -1586,6 +1599,8 @@ def build_selection_figure(
     Args:
         population: The anchor population.
         classes: Each anchor's class, or ``None``.
+        guids: Each per-sample row's recording, in per-sample row order, so a count on this page
+            can be stated in deliveries rather than in anchors or segments.
         thresholds: The bands' thresholds.
         profiles: The restricted profile matrices.
         hot: The hot-lag mask.
@@ -1610,12 +1625,16 @@ def build_selection_figure(
         )
         colours = figures.group_colors(groups)
         bins = np.linspace(float(log_kl.min()), float(log_kl.max()) + 1e-9, 60)
+        anchor_guids = np.asarray(guids, dtype=object)[population.sample_rows[positive]]
         for group in groups:
             member = np.asarray([str(value) == group for value in classes[positive]], dtype=bool)
             ax.hist(
                 log_kl[member], bins=bins, density=True, histtype="step",
                 color=colours.get(group, figures.COLOR_BLUE), linewidth=figures.LINE_REGULAR,
-                label=f"{group} (n={int(member.sum())} anchors)",
+                label=(
+                    f"{group} (n={len(set(anchor_guids[member]))} deliveries, "
+                    f"{int(member.sum())} anchors)"
+                ),
             )
         for band in ANCHOR_BANDS:
             # Only the bands cut on the KL belong on a KL histogram.
@@ -1645,7 +1664,8 @@ def build_selection_figure(
     if hot.any():
         for index in np.nonzero(hot)[0]:
             ax.axvspan(
-                float(seconds[index]) - 2.0, float(seconds[index]) + 2.0,
+                float(seconds[index]) - SECONDS_PER_LAG_STEP / 2.0,
+                float(seconds[index]) + SECONDS_PER_LAG_STEP / 2.0,
                 color=figures.COLOR_LIGHT_GRAY, alpha=0.5, linewidth=0,
             )
     styles = {"high": (figures.COLOR_VERMILLION, "-"), "top": (figures.COLOR_ORANGE, "-"),
@@ -1655,10 +1675,14 @@ def build_selection_figure(
         if matrix is None or not np.isfinite(matrix).any():
             continue
         colour, style = styles.get(band.key, (figures.COLOR_GRAY, "-"))
+        with_rows = np.isfinite(matrix).any(axis=1)
         ax.plot(
             seconds, np.nanmean(matrix, axis=0), color=colour, linestyle=style,
             linewidth=figures.LINE_EMPHASIS,
-            label=f"{band.key} anchors (n={int(np.isfinite(matrix).any(axis=1).sum())} segments)",
+            label=(
+                f"{band.key} anchors (n={len(set(np.asarray(guids, dtype=object)[with_rows]))} "
+                f"deliveries)"
+            ),
         )
         drawn += 1
     if drawn:
@@ -1676,7 +1700,11 @@ def build_selection_figure(
     # --- Panel 3: the argmax by KL decile -------------------------------------------------------
     ax = axes[2, 0]
     if field.size and np.isfinite(field).any():
-        extent = (float(seconds[0]) - 2.0, float(seconds[-1]) + 2.0, -0.5, field.shape[0] - 0.5)
+        extent = (
+            float(seconds[0]) - SECONDS_PER_LAG_STEP / 2.0,
+            float(seconds[-1]) + SECONDS_PER_LAG_STEP / 2.0,
+            -0.5, field.shape[0] - 0.5,
+        )
         figures.heatmap_with_colorbar(
             figure, ax, field[::-1], title=(
                 "share of anchors whose KL attribution peaks at each lag, by KL decile "
@@ -1686,11 +1714,13 @@ def build_selection_figure(
             symmetric=False, colorbar_label="share of the decile's anchors", extent=extent,
             interpolation="none",
         )
+        # ``field[::-1]`` under ``origin='upper'`` already puts decile 0 at the bottom, where
+        # tick 0 sits; the labels are therefore in natural order, not reversed a second time.
         ax.set_yticks(range(field.shape[0]))
         ax.set_yticklabels([
             f"{index}: {edges[index]:.2g}-{edges[index + 1]:.2g}"
             for index in range(field.shape[0])
-        ][::-1], fontsize=figures.FONT_TINY)
+        ], fontsize=figures.FONT_TINY)
     else:
         _empty_panel(ax, "argmax lag by KL decile")
 
@@ -1777,7 +1807,7 @@ def build_usefulness_figure(
             ax.plot(
                 x, cell["median"], marker="o", markersize=3, color=colour,
                 linewidth=figures.LINE_EMPHASIS if group == "all" else figures.LINE_REGULAR,
-                label=f"{group} (n={int(cell['n_recordings'].max())} recordings)",
+                label=f"{group} (n={int(cell['n_recordings_total'].iloc[0])} deliveries)",
             )
         ax.axhline(0.0, color=figures.COLOR_GRAY, linestyle=":", linewidth=figures.LINE_REGULAR)
         headline = usefulness if usefulness.get("tested") else {}
@@ -1871,7 +1901,7 @@ def build_usefulness_figure(
                 cell["attribution_share_all"], cell["occlusion_delta_nats"], s=9,
                 color=palette[index % len(palette)], alpha=0.7,
                 label=f"{name} (lags {int(cell['lag_lo'].iloc[0])}-{int(cell['lag_hi'].iloc[0])}, "
-                      f"n={len(cell)})",
+                      f"n={len(cell)} deliveries)",
             )
         ax.axhline(0.0, color=figures.COLOR_GRAY, linestyle=":", linewidth=figures.LINE_REGULAR)
         ax.set_title(
@@ -1928,7 +1958,7 @@ def _draw_trajectory_panel(
         ax.plot(
             x, np.array([row["median"] for row in cell]), marker="o", markersize=3, color=colour,
             linewidth=figures.LINE_EMPHASIS,
-            label=f"{group} (n={int(sum(row['n_recordings'] for row in cell))})",
+            label=f"{group} (n={int(cell[0].get('n_recordings_total', 0))} deliveries)",
         )
         for row in cell:
             ax.annotate(
@@ -1961,11 +1991,11 @@ def build_clock_figure(
     clock: Clock,
     windows: Sequence[int],
     centres: Sequence[float],
-    fields: Sequence[Tuple[str, np.ndarray, np.ndarray, np.ndarray]],
+    fields: Sequence[Tuple[str, np.ndarray, np.ndarray, np.ndarray, int]],
     rows: Sequence[Dict[str, Any]],
     seconds: np.ndarray,
 ) -> Any:
-    """One clock's page: the high band's lag share by window per class, then three trajectories.
+    """One clock's page: the high band's lag share by window per class, then four trajectories.
 
     The heatmaps share one colour scale across the classes, for the reason ``lag_clocks`` gives:
     three panels each scaled to their own extremes paint one colour for three different shares.
@@ -1975,21 +2005,23 @@ def build_clock_figure(
     n_trajectories = 4
     figure, axes = figures.new_figure(max(len(fields), 1) + n_trajectories, height_per_row=3.0)
     limit = max(
-        (float(np.nanmax(share)) for _, _, share, _ in fields if np.isfinite(share).any()),
+        (float(np.nanmax(share)) for _, _, share, _, _ in fields if np.isfinite(share).any()),
         default=0.0,
     )
     half = float(TRAJECTORY_BIN_HOURS) / 2.0
+    half_lag = SECONDS_PER_LAG_STEP / 2.0
     extent = (
-        (float(centres[0]) - half, float(centres[-1]) + half, float(seconds[0]), float(seconds[-1]))
+        (float(centres[0]) - half, float(centres[-1]) + half,
+         float(seconds[0]) - half_lag, float(seconds[-1]) + half_lag)
         if centres and seconds.size else None
     )
-    for index, (group, _, share, counts) in enumerate(fields):
+    for index, (group, _, share, _, n_recordings) in enumerate(fields):
         ax = axes[index, 0]
         figures.heatmap_with_colorbar(
             figure, ax, share[::-1],
             title=(
                 f"{group}: share of the HIGH-band KL attribution by lag and window "
-                f"(n={int(counts.max()) if counts.size else 0} recordings at most)"
+                f"(n={int(n_recordings)} deliveries)"
             ),
             ylabel=figures.COEFFICIENT_LAG_AXIS_LABEL, symmetric=False,
             vlimits=(0.0, limit) if limit > 0.0 else None,
@@ -2324,7 +2356,8 @@ def run_lag_high_kl_analysis(
     # --- The run-level pages and the tables ------------------------------------------------------
     written.append(str(figures.render_figure(
         build_selection_figure(
-            population, classes, thresholds, profiles, hot, field, edges, enrichment, seconds
+            population, classes, np.asarray(per_sample["guid"].astype(str)), thresholds,
+            profiles, hot, field, edges, enrichment, seconds,
         ),
         directory / SELECTION_FIGURE,
     ).name))

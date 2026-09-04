@@ -255,8 +255,15 @@ class InputStreamPanel:
             a stream whose coefficients are stamped with the instant they describe. A builder whose
             stream is *not* -- a one-sided bank shifted onto a common clock reports content
             $\kappa\tau_{\mathrm{ref}}$ before the step it is drawn at -- supplies a label saying
-            so, because this row shares its horizontal axis with the raw traces above it and the
-            offset is otherwise invisible.
+            so, because this row shares its horizontal axis with the raw traces above it.
+        content_offset_s: How far **before** its step index the content of a column physically
+            sits, in seconds: the value at step $t$ describes the raw signal centred at
+            $t\Delta - \mathrm{offset}$. The row is drawn shifted left by exactly this, so a
+            feature lands under the raw trace it was computed from rather than
+            $\mathrm{offset}$ seconds to its right, and the last $\mathrm{offset}$ seconds of the
+            axis are marked as content the encoder has not received by the segment's end.
+            Defaults to $0$ -- a two-sided bank's coefficients are stamped with the instant they
+            describe -- which draws the row exactly as it was drawn before the field existed.
     """
 
     name: str
@@ -267,6 +274,7 @@ class InputStreamPanel:
     title: str
     delay_label: str = DELAY_STAIRCASE_LABEL
     time_label: str = "Time (s)"
+    content_offset_s: float = 0.0
 
 
 def annotate_channel_frequencies(ax: Any, center_hz: np.ndarray, *, count: int = 8) -> Any:
@@ -315,6 +323,13 @@ def _input_stream_row(ax: Any, panel: InputStreamPanel, *, t_max: float, seconds
     the block dividers, the per-channel centre frequency on a right-hand axis, and the staircase
     at $t = \\delta_c$ before which the channel carries the guard's zero fill rather than data.
 
+    The whole row -- the image and the staircase alike -- is shifted left by
+    :attr:`InputStreamPanel.content_offset_s`, so a column sits at the physical instant its
+    content describes rather than at the step index the encoder reads it at. The page's axis is
+    physical time (the raw traces above set it), and a stream whose coefficients trail their
+    content by a constant would otherwise sit that constant to the right of the trace it was
+    computed from. Zero for the two-sided pages, where the two clocks coincide.
+
     Args:
         ax: The row's main axes.
         panel: The stream to draw.
@@ -326,6 +341,7 @@ def _input_stream_row(ax: Any, panel: InputStreamPanel, *, t_max: float, seconds
     """
     values = np.asarray(panel.values, dtype=float)
     n_channels = values.shape[1]
+    offset = float(panel.content_offset_s)
 
     # Robust limits rather than min/max: these are z-scored wavelet coefficients, and one
     # heavy-tailed channel otherwise sets the scale for all of them and flattens the rest to a
@@ -341,10 +357,12 @@ def _input_stream_row(ax: Any, panel: InputStreamPanel, *, t_max: float, seconds
 
     # Channel $0$ at the **top** -- see :func:`top_down_extent`. Nothing else on the row moves:
     # the dividers, the block ticks and the staircase below are all in channel coordinates, and
-    # only the direction of the axis changes.
+    # only the direction of the axis changes. The horizontal extent starts at ``-offset``: step
+    # $t$ is drawn at $t\Delta - \mathrm{offset}$, the instant its content is centred on, and the
+    # leading columns that fall before $0$ are clipped by the shared axis limits.
     image = ax.imshow(
         values.T, aspect="auto", cmap="viridis", origin="upper",
-        vmin=low, vmax=high, extent=top_down_extent(0.0, t_max, n_channels),
+        vmin=low, vmax=high, extent=top_down_extent(-offset, t_max - offset, n_channels),
         interpolation=_IMSHOW_INTERPOLATION,
     )
 
@@ -366,13 +384,27 @@ def _input_stream_row(ax: Any, panel: InputStreamPanel, *, t_max: float, seconds
     # have no source and are emitted as zero, and the whole staircase must sit inside the shaded
     # warm-up -- that requirement is what `resolve_channel_budget` enforces, and this is where a
     # reader can see that it holds.
+    # The staircase is a step index, so it moves with the image: a boundary drawn at
+    # $\delta_c \Delta$ over an image shifted by ``offset`` would sit ``offset`` seconds to the
+    # right of the zero fill it is meant to bound.
     if n_channels and int(np.max(panel.delays)) > 0:
         ax.step(
-            np.asarray(panel.delays, dtype=float) * seconds_per_step,
+            np.asarray(panel.delays, dtype=float) * seconds_per_step - offset,
             np.arange(n_channels), where="mid",
             color=COLOR_ORANGE, linewidth=0.9,
             label=panel.delay_label,
         )
+    # The last ``offset`` seconds hold no column at all: the content there reaches the encoder
+    # only ``offset`` seconds after the segment's last step. Hatched rather than left as bare
+    # axes background, so the blank reads as "not yet observable" and not as a row that stopped
+    # short of the recording's end.
+    if offset > 0.0:
+        ax.axvspan(
+            t_max - offset, t_max, facecolor=COLOR_LIGHT_GRAY, alpha=0.35, hatch="//",
+            edgecolor=COLOR_GRAY, linewidth=0, zorder=0,
+            label=f"not yet received by the encoder: arrives {offset:.0f} s later",
+        )
+    if ax.get_legend_handles_labels()[0]:
         ax.legend(loc="lower right", fontsize=6, framealpha=0.9)
 
     ax.set_title(panel.title, fontsize=9, pad=6)
@@ -909,10 +941,13 @@ def build_diagnostic_figure(
             heatmap_spines(ax)
             secondary = attach_lag_seconds_axis(
                 ax,
-                step_seconds=SECONDS_PER_STEP,
+                # The run's own step, derived from the raw length and the decimated length above
+                # (raw_len / fs_raw / T), rather than the module constant: the primary axis is
+                # in decimated steps and the secondary one must be the same steps in seconds.
+                step_seconds=seconds_per_step,
                 # The whole compensation, expressed as the axis offset: lag 0 already sits at
-                # 4*delta seconds once the source channels are read delta steps stale.
-                delta_up_seconds=float(lag_compensated_seconds(0, delay_steps=delay_steps)),
+                # delta steps once the source channels are read delta steps stale.
+                delta_up_seconds=float(delay_steps) * seconds_per_step,
             )
             if secondary is not None:
                 # Overriding the primitive's generic label: which of the two lag quantities is drawn
@@ -1066,7 +1101,10 @@ def build_diagnostic_figure(
 
         readouts = "  ".join(
             f"{name}={float(scalars[name]):.4g}"
-            for name in ("nll_base_block", "nll_full_block", "pred_gap", "source_conditioned_kl_raw")
+            for name in (
+                "nll_base_block", "nll_full_block", "pred_gap", "mc_pred_gap",
+                "source_conditioned_kl_raw",
+            )
             if name in scalars
         )
         fig.suptitle(

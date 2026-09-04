@@ -442,7 +442,9 @@ def _shade_truncated(axis: Any, seconds: np.ndarray, truncation: Dict[str, Any])
     # A lag beyond the earliest decoded anchor's own index exists at *some* decoded anchors and
     # not at others; that band is where the truncation acts. At this cell's shipped floor there is
     # no such band and this function returns above -- an unshaded figure is then the honest one.
-    first = min(max(floor, 0), seconds.size - 1)
+    # A lag exists at anchor t iff it is at most t, so at the floor the first truncated lag is
+    # floor + 1, not the floor itself.
+    first = min(max(floor + 1, 0), seconds.size - 1)
     axis.axvspan(
         float(seconds[first]), float(seconds[-1]),
         color=figures.COLOR_LIGHT_GRAY, alpha=0.35, zorder=0,
@@ -492,8 +494,12 @@ def build_heatmap_figure(
         ylabel=figures.COEFFICIENT_LAG_AXIS_LABEL,
         symmetric=False,
         colorbar_label="attention weight",
+        # Bin edges on the lag axis: L cells centred on ``seconds`` span half a step past
+        # both ends, and an extent from centre to centre drifts every mid-axis lag.
         extent=(
-            (0.0, steps * step_seconds, float(seconds[0]), float(seconds[-1]))
+            (0.0, steps * step_seconds,
+             float(seconds[0]) - SECONDS_PER_STEP / 2.0,
+             float(seconds[-1]) + SECONDS_PER_STEP / 2.0)
             if seconds.size
             else None
         ),

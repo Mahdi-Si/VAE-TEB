@@ -76,6 +76,23 @@ peak at lag $\ell$ is an attribution over stored coefficients, not a physiologic
 carries that caveat as a footnote, because the two lag panels belong to the shared builder and the
 four shipped models must not acquire a caption about a transform they do not use.
 
+**The horizontal axis is physical time, and every re-clocked stream is drawn on it.** The raw row
+sets the axis. An aligned input stream at step $t$ carries content centred at
+$t\Delta - \kappa\tau_{\mathrm{ref}}$ -- $352$ s earlier on the shipped target clock, $252$ s on
+the source's -- so drawn at its step index it sits over a quarter of the recording to the right of
+the trace it was computed from, and a deceleration in the raw FHR appears in the ``fhr_st`` row six
+minutes later. The scored target has a clock of its own: under the shipped ``physical`` forecast
+clock every scored element sits $\kappa\tau_{\min} \approx 12$ s behind its stored step, under
+``input`` it is the aligned stream's continuation. Both the input rows and the forecast rows are
+therefore shifted left by their own $\kappa\tau$ -- the input rows through
+:attr:`~teb_vae.lag_attn_rws.sample_page.InputStreamPanel.content_offset_s`, the forecast rows
+through :func:`causal_forecast_rows`'s ``forecast_clock_delay_s`` -- so the same channel is at the
+same instant on every row that draws it, and the $\kappa\tau$ the encoder has to wait shows as the
+hatched tail of each input row. The latent, KL and lag rows stay at the anchor step: they are
+statements about the state a forecast is made *from*, and the anchor is that instant. Both
+$\tau$ come from the resolved budget, which is why the task binds them; the net stamps only the
+per-channel step shifts, from which no $\tau_{\mathrm{ref}}$ is recoverable.
+
 Like both sibling pages this module is matplotlib-only -- no Lightning, no MLflow, no config, no
 loader -- and it never re-runs the model or re-scores anything: it cuts and lays out arrays it is
 handed.
@@ -146,7 +163,7 @@ __all__ = [
 WARMUP_STAIRCASE_LABEL = "warm-up: first honest step, $W'_c$"
 
 #: The caveat every time-resolved panel on this page is read under -- the lag panels' vertical
-#: axis and, equally, the horizontal axis the input rows share with the raw rows above them.
+#: axis, and the horizontal axis the input and forecast rows share with the raw rows above them.
 #: Stated once, as a page footnote, because the two lag panels are the shared builder's and the
 #: four shipped models must not gain a caption about a transform they do not use. $\kappa$ is
 #: interpolated from :data:`~teb_vae.lag_attn_cfs.causal_warmup.ALIGNMENT_DELAY_FACTOR` rather
@@ -154,17 +171,19 @@ WARMUP_STAIRCASE_LABEL = "warm-up: first honest step, $W'_c$"
 #: Asserted as a string by the suite, so it cannot be dropped by an edit that keeps the figure
 #: rendering.
 LAG_TIME_CAVEAT = (
-    "Time axes are stored-coefficient time, not physical time. A causal channel lags by its own "
-    "composed group delay (13-791 s as declared); aligning a stream replaces that per-channel lag "
-    "with one constant, so every kept channel drawn at step $t$ carries content centred at "
-    f"$t-\\kappa\\tau_{{\\mathrm{{ref}}}}$, $\\kappa={ALIGNMENT_DELAY_FACTOR:g}$ -- each input "
-    "row states its own, and the run logs them as reference_delay_s and source_reference_delay_s. "
-    "The input rows therefore sit that constant to the right of the raw rows above them, and under "
-    "a dual reference the two differ from each other by "
-    "$\\kappa(\\tau^y_{\\mathrm{ref}}-\\tau^u_{\\mathrm{ref}})$. Converting a lag peak to a "
-    "physical lead time needs the same constants and the $-20$ s acquisition shift, and is done "
-    "where a physical lag is reported. Unaligned, each $\\tau_{\\mathrm{ref}}$ becomes the "
-    "channel's own $\\tau_c$ and no single number labels either axis."
+    "Lag axes are stored-coefficient time, not physical delay: a causal channel lags by its own "
+    "composed group delay (13-791 s as declared), and aligning a stream replaces that per-channel "
+    f"lag with one constant, $\\kappa\\tau_{{\\mathrm{{ref}}}}$, $\\kappa={ALIGNMENT_DELAY_FACTOR:g}$. "
+    "The horizontal axis is physical time. The input rows and the forecast rows are drawn on it: "
+    "each column is shifted left by its stream's own $\\kappa\\tau$, so a coefficient sits under "
+    "the raw signal it was computed from, and the hatched tail of an input row is the content the "
+    "encoder has not yet received at the segment's end. The run logs the input clocks as "
+    "reference_delay_s and source_reference_delay_s; the forecast rows use the scored clock's own "
+    "reference, which each row's x label states. The latent, KL and lag rows stay at the anchor "
+    "step -- the instant a forecast is made from. Converting a lag peak to a physical lead time "
+    "needs the same constants and the $-20$ s acquisition shift, and is done where a physical lag "
+    "is reported. Unaligned, each $\\tau_{\\mathrm{ref}}$ becomes the channel's own $\\tau_c$, no "
+    "single constant exists, and those rows are drawn at step index."
 )
 
 #: Lane spacing as a multiple of the widest lane's own drawn extent, the two-sided page's rule and
@@ -293,27 +312,54 @@ def _stream_blocks(
     return tuple(spans)
 
 
-def _time_label(reference_delay_s: Optional[float]) -> str:
-    r"""The row's x-axis label, naming the clock its content sits on.
+def _content_offset_s(clock_delay_s: Optional[float]) -> float:
+    r"""How far before its stored step a re-clocked channel's content sits: $\kappa\tau$ in seconds.
 
-    The row is drawn at the model's **step index** while the raw rows it shares a column with are
-    in physical time, so an aligned channel's content sits $\kappa\tau_{\mathrm{ref}}$ to the left
-    of where the column puts it -- $352$ s on this cell's shipped target clock, over a quarter of
-    the drawn window. Naming it on the axis is what closes that at the point of use; the page
-    footnote states the rule the number comes from.
+    The one place the page turns a clock's $\tau$ into a drawing offset, for the input rows and
+    the forecast rows alike, so the two cannot apply different factors.
 
     Args:
-        reference_delay_s: $\tau_{\mathrm{ref}}$, the clock this stream was shifted onto, in
-            seconds, or ``None`` on an unaligned run.
+        clock_delay_s: $\tau$ of the clock the stream sits on -- $\tau_{\mathrm{ref}}$ for an
+            aligned input, the forecast clock's own reference for the scored target -- in seconds,
+            or ``None`` where no single clock exists.
 
     Returns:
-        The label. Bare ``'Time (s)'`` when there is no reference, because an unaligned stream has
-        no single constant and a stated one would be wrong on every channel but one.
+        The offset in seconds; $0$ for ``None``, which draws the stream at its step index.
     """
-    if reference_delay_s is None:
-        return "Time (s)"
-    offset = ALIGNMENT_DELAY_FACTOR * float(reference_delay_s)
-    return f"Time (s) — step index; content at $t-{offset:.0f}$ s"
+    if clock_delay_s is None:
+        return 0.0
+    return ALIGNMENT_DELAY_FACTOR * float(clock_delay_s)
+
+
+def _time_label(clock_delay_s: Optional[float], *, stream: str = "input") -> str:
+    r"""A re-clocked row's x-axis label, naming the shift its columns were drawn under.
+
+    The row is drawn on the page's physical axis: each column moved $\kappa\tau$ to the left of
+    its step index, so its content sits under the raw trace it was computed from -- $352$ s on
+    this cell's shipped target input clock, $12$ s on its shipped forecast clock. The axis is
+    where a reader checks a column against the raw row, so the axis is where the shift is stated;
+    the page footnote states the rule the number comes from.
+
+    Args:
+        clock_delay_s: $\tau$ of the stream's clock, in seconds, or ``None`` where there is no
+            single one -- an unaligned input, or the stored forecast clock.
+        stream: ``'input'`` or ``'forecast'``, which names who is waiting for the content.
+
+    Returns:
+        The label. For ``None`` it says the row is at step index and why, because a stream with
+        no single constant cannot be shifted and a bare ``'Time (s)'`` would read as physical time.
+    """
+    if clock_delay_s is None:
+        return (
+            "Time (s) — step index: no single clock, each channel's content sits its own "
+            "$\\kappa\\tau_c$ earlier"
+        )
+    offset = _content_offset_s(clock_delay_s)
+    waiting = "reaches the encoder" if stream == "input" else "is scored at stored step"
+    return (
+        f"Time (s) — physical: content drawn at its own instant, {waiting} "
+        f"{offset:.0f} s later ($\\kappa\\tau$ = {offset:.0f} s)"
+    )
 
 
 def _stream_title(
@@ -455,6 +501,11 @@ def causal_stream_panels(
                 gathered = gathered * available.to(gathered.dtype)
 
         spans = _stream_blocks(blocks, split, keep_index, declared)
+        # The clock this stream was shifted onto. An aligned channel at step t carries content
+        # centred kappa*tau_ref earlier, and the row is drawn shifted by exactly that so the
+        # content lands under the raw trace above it rather than 352 s (target) or 252 s (source)
+        # to its right. None -- unaligned -- draws the row at step index and says so on the axis.
+        clock = None if reference_delay_s is None else reference_delay_s.get(name)
         panels.append(
             InputStreamPanel(
                 name=name,
@@ -467,10 +518,9 @@ def causal_stream_panels(
                 center_hz=np.empty(0, dtype=float),
                 blocks=spans,
                 title=_stream_title(name, spans, keep_index.size, declared, warmup),
-                time_label=_time_label(
-                    None if reference_delay_s is None else reference_delay_s.get(name)
-                ),
+                time_label=_time_label(clock, stream="input"),
                 delay_label=WARMUP_STAIRCASE_LABEL,
+                content_offset_s=_content_offset_s(clock),
             )
         )
     return panels
@@ -669,6 +719,12 @@ class _Stitched:
         anchors: The decoded anchor indices of this sample $(A_{\max},)$.
         positions: Positions into that axis whose windows are drawn, ascending and
             first anchor wins where windows overlap.
+        forecast_clock_delay_s: $\tau$ of the clock the scored target sits on, in seconds --
+            :attr:`~teb_vae.lag_attn_cfs.causal_warmup.WarmupBudget.target_forecast_clock_delay_s`
+            -- or ``None`` under the stored clock, where no single constant exists. Every row
+            that draws the scored stream on the page's physical axis shifts by
+            :attr:`content_offset_s`, so the truth, the two means, the skill map, $\sigma^q$, the
+            lanes and the window scores all move together.
     """
 
     truth: np.ndarray
@@ -680,6 +736,17 @@ class _Stitched:
     block_split: int
     anchors: np.ndarray
     positions: Sequence[int]
+    forecast_clock_delay_s: Optional[float] = None
+
+    @property
+    def content_offset_s(self) -> float:
+        r"""$\kappa\tau$ of the forecast clock in seconds; $0$ where there is no single clock."""
+        return _content_offset_s(self.forecast_clock_delay_s)
+
+    @property
+    def time_label(self) -> str:
+        """The x label every row drawing the scored stream carries, naming its shift."""
+        return _time_label(self.forecast_clock_delay_s, stream="forecast")
 
     @property
     def block_spans(self) -> Tuple[Tuple[str, int, int], ...]:
@@ -773,6 +840,9 @@ def _field_row(
     """
     ax, cax = rows.row_axes(row_name)
     n_channels = int(stitched.keep.size)
+    # On the physical axis: scored step u is drawn at u*Delta - offset, the instant its content is
+    # centred on, so the same channel is at the same place here and on the input rows below.
+    offset = float(stitched.content_offset_s)
     image = ax.imshow(
         field.T,
         aspect="auto",
@@ -780,7 +850,7 @@ def _field_row(
         origin="upper",
         vmin=limits[0],
         vmax=limits[1],
-        extent=top_down_extent(0.0, rows.t_max, n_channels),
+        extent=top_down_extent(-offset, rows.t_max - offset, n_channels),
         interpolation=_IMSHOW_INTERPOLATION,
     )
 
@@ -794,7 +864,7 @@ def _field_row(
     ax.set_yticklabels(labels, fontsize=7)
 
     ax.set_title(title, fontsize=9, pad=6)
-    ax.set_xlabel("Time (s)", fontsize=8)
+    ax.set_xlabel(stitched.time_label, fontsize=8)
     ax.set_ylabel("Target channel", fontsize=8)
     rows.heatmap_spines(ax)
     rows.attach_cbar(cax, image, cbar_label)
@@ -1086,7 +1156,7 @@ def _draw_gap_row(
     """
     ax, cax = rows.row_axes("pred_gap")
     cax.set_visible(False)
-    ax.set_xlabel("Time (s)", fontsize=8)
+    ax.set_xlabel(stitched.time_label, fontsize=8)
     ax.set_ylabel(f"block score ({'nats' if likelihood == 'gaussian_nll' else 'sq. error'})",
                   fontsize=8)
     style_axes(ax, grid="both")
@@ -1110,10 +1180,12 @@ def _draw_gap_row(
         return
 
     horizon = int(rows.geometry.horizon)
-    # A window's mark sits at the centre of the span it scores, $[t+1, t+H]$, so it lands over
-    # the same columns the field rows above drew it in.
+    # A window's mark sits at the centre of the span it scores, $[t+1, t+H]$, shifted onto the
+    # physical axis exactly as the field rows are, so it lands over the same columns they drew
+    # the window in.
     centres = np.asarray(
         [(int(stitched.anchors[p]) + 1 + 0.5 * horizon) * seconds_per_step
+         - stitched.content_offset_s
          for p in stitched.positions],
         dtype=float,
     )
@@ -1183,6 +1255,7 @@ def causal_forecast_rows(
     likelihood: str = "gaussian_nll",
     coverage_floor: float = 0.0,
     target_forecast_shift: Optional[Sequence[int]] = None,
+    forecast_clock_delay_s: Optional[float] = None,
 ) -> None:
     r"""Draw the causal-feature page's forecast rows, over the anchors the forward decoded.
 
@@ -1218,6 +1291,14 @@ def causal_forecast_rows(
         target_forecast_shift: $s_c$ per kept channel, the model's own forecast clock, so the
             truth every row draws and the block every window scores are the ones the objective
             saw. ``None`` -- the stored clock -- draws the stream as stored.
+        forecast_clock_delay_s: $\tau$ of that clock in seconds -- the resolved budget's
+            ``target_forecast_clock_delay_s`` -- so the scored stream can be placed on the page's
+            physical axis: every element is drawn $\kappa\tau$ before its stored step, where its
+            content sits, and therefore under the raw trace and level with the input rows. The
+            anchor marks stay at the anchor step, which is the instant the forecast is made from.
+            ``None`` draws the scored stream at step index, which is exact only where the clock
+            is ``'stored'`` and no single constant exists; a task with no resolved budget cannot
+            supply one, since the net stamps step shifts and not $\tau$.
 
     Raises:
         KeyError: If the forward dict carries no anchor set.
@@ -1285,6 +1366,7 @@ def causal_forecast_rows(
         ),
         anchors=anchors,
         positions=positions,
+        forecast_clock_delay_s=forecast_clock_delay_s,
     )
 
     lanes, coverage = select_forecast_channels(
@@ -1294,6 +1376,12 @@ def causal_forecast_rows(
     ax, cax = rows.row_axes(FORECAST_ROW)
     _, time_dec, _ = time_axes(geometry.t, geometry.raw_len)
     seconds_per_step = rows.t_max / float(geometry.t)
+    # The scored stream on the physical axis: scored step u is drawn at u*Delta - kappa*tau, the
+    # instant its content is centred on. Applied to every artist that draws the stream -- the
+    # lanes, the fan, the shaded window -- and to none that marks an anchor, which is a decision
+    # instant and stays where the step index puts it.
+    content_offset = stitched.content_offset_s
+    time_content = time_dec - content_offset
 
     def lane_extent(channel: int) -> float:
         """Total vertical span the widest artist of one lane needs.
@@ -1320,7 +1408,7 @@ def causal_forecast_rows(
     for lane, channel in enumerate(int(value) for value in lanes):
         offset = lane * stride
         ax.plot(
-            time_dec, truth[:, channel] + offset, color=COLOR_BLACK, linewidth=0.7,
+            time_content, truth[:, channel] + offset, color=COLOR_BLACK, linewidth=0.7,
             label="true $Y^{+}$" if lane == 0 else None,
         )
         for mean_all, sigma_all, colour, alpha, style, label in (
@@ -1331,10 +1419,10 @@ def causal_forecast_rows(
             mean = mean_all[:, channel] + offset
             half = BAND_SIGMAS * sigma_all[:, channel]
             ax.fill_between(
-                time_dec, mean - half, mean + half, color=colour, alpha=alpha, linewidth=0
+                time_content, mean - half, mean + half, color=colour, alpha=alpha, linewidth=0
             )
             ax.plot(
-                time_dec, mean, color=colour, linewidth=0.8, linestyle=style,
+                time_content, mean, color=colour, linewidth=0.8, linestyle=style,
                 label=label if lane == 0 else None,
             )
 
@@ -1354,7 +1442,7 @@ def causal_forecast_rows(
             start = int(anchors[position]) + 1
             stop = min(start + int(geometry.horizon), geometry.t)
             ax.plot(
-                time_dec[start:stop], fan_mean[position, : stop - start, channel] + offset,
+                time_content[start:stop], fan_mean[position, : stop - start, channel] + offset,
                 color=COLOR_VERMILLION, linewidth=0.5, alpha=0.45, zorder=1.5,
                 label=(
                     f"training-tile forecasts ($\\mu^q$, $S$={int(training_stride)}, "
@@ -1377,21 +1465,31 @@ def causal_forecast_rows(
     position = positions[len(positions) // 2] if positions else 0
     anchor = int(anchors[position])
     anchor_start = float(anchor + 1) * seconds_per_step
+    # The shaded span marks the drawn window's content, so it moves with the lanes; the inset's
+    # own label below still names the anchor step, which is what "t=" means on this page.
     ax.axvspan(
-        anchor_start, anchor_start + geometry.horizon * seconds_per_step,
+        anchor_start - content_offset,
+        anchor_start - content_offset + geometry.horizon * seconds_per_step,
         color=COLOR_ORANGE, alpha=0.14, zorder=0,
     )
 
+    clock_clause = (
+        f" Content drawn on the physical axis, {content_offset:.0f} s before its scored step; "
+        f"the anchor marks stay at the anchor step."
+        if content_offset > 0.0
+        else ""
+    )
     ax.set_title(
         f"Forecast — {len(lanes)} of {len(keep)} target channels by "
         f"{BAND_SIGMAS:.0f}$\\sigma$ calibration (worst, middle, best), lanes offset by "
         f"{stride:.3g}, mean $\\pm$ {BAND_SIGMAS:.0f}$\\sigma$; {len(positions)} of "
         f"{int(valid.sum())} decoded anchors stitched, first anchor wins; shaded: the anchor the error "
         f"map draws.\nDrawn at the evaluation resolution — every valid anchor — so the ticks are "
-        f"what this page decoded; the dotted grid is the sparser set a training step tiles.",
+        f"what this page decoded; the dotted grid is the sparser set a training step tiles."
+        f"{clock_clause}",
         fontsize=9, pad=6,
     )
-    ax.set_xlabel("Time (s)", fontsize=8)
+    ax.set_xlabel(stitched.time_label, fontsize=8)
     ax.set_ylabel("target coefficient (normalised)", fontsize=8)
     style_axes(ax, grid="both")
     rows.finalise_time_axis(ax)

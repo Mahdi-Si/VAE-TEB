@@ -791,9 +791,18 @@ def run_lag_kl_analysis(
     per_guid = per_recording_means(per_sample, VALUE_COLUMNS)
     per_guid.to_csv(directory / PER_RECORDING_FILENAME)
 
+    # The sidecar is in the collected table's row order; the horizon-bounded frame keeps that
+    # table's index, so its index values are the rows to take. Without this, a bounded run's
+    # per-cohort profiles would be the first N collected segments' under the wrong recordings.
+    positions = np.asarray(per_sample.index, dtype=np.int64)
+    vectors_in_order = {
+        name: np.asarray(array)[positions[positions < np.asarray(array).shape[0]]]
+        if np.asarray(array).ndim == 2 else array
+        for name, array in dict(getattr(collection, "vectors", None) or {}).items()
+    }
     stratified, skipped_axes = stratified_profiles(
         per_sample,
-        dict(getattr(collection, "vectors", None) or {}),
+        vectors_in_order,
         delay_steps=delay_steps,
         n_lags=n_lags,
         num_heads=int(lag.get("num_heads") or 0),
@@ -812,6 +821,15 @@ def run_lag_kl_analysis(
         "n_samples": scored_sample_count(per_sample, "source_conditioned_kl_raw"),
         "composition": {"n_recordings": int(len(per_guid)), "n_lags": n_lags},
         "plan": {"capped": False},
+        # Stated because the two halves of this analysis answer for different populations once a
+        # horizon is set: the pooled profile, its peaks and the figure come from the collection
+        # pass's lag block over EVERY scored segment, while the per-recording and stratified
+        # tables above are bounded by ``max_hours_before_delivery``.
+        "pooled_profile_population": (
+            "the pooled profile, its argmax and the figure are over every segment the collection "
+            "pass scored, unbounded by max_hours_before_delivery; the per-recording and "
+            "stratified tables are bounded by it"
+        ),
         # Every reported lag carries both, because a lag index is not seconds and the delay it is
         # compensated by is a per-channel maximum rather than a single figure.
         "delay_steps": delay_steps,

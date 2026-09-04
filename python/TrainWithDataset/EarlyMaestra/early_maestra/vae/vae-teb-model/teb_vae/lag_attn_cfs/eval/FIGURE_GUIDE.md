@@ -218,11 +218,11 @@ A fourth is this cell's own: **a positive gap here is not yet a source finding.*
 
 **In plain terms.** *"Is the model using its whole memory, or one corner of it?"* The latent is 64 numbers per anchor; this shows how much of the source information each one carries.
 
-**What it shows.** The per-dimension KL, sorted, with the active-dimension count and the top dimension's share annotated.
+**What it shows.** The per-dimension KL, sorted. The active-dimension count, the top dimension's share and the total are in the analysis record beside it rather than annotated on the panel.
 
 **Axes.** Latent dimension rank; nats per anchor.
 
-**How it is misread.** A tall first bar is not automatically a fault — one dimension carrying most of a small total is a different finding from one carrying most of a large one, and the total is on the panel for that reason. What *is* a fault is a spectrum read without checking `prior_variance_not_pinned` first: a prior variance on its clamp multiplies every bar by an arbitrary factor while every decoder-side diagnostic stays healthy.
+**How it is misread.** A tall first bar is not automatically a fault — one dimension carrying most of a small total is a different finding from one carrying most of a large one, and the total is in the record for that reason. What *is* a fault is a spectrum read without checking `prior_variance_not_pinned` first: a prior variance on its clamp multiplies every bar by an arbitrary factor while every decoder-side diagnostic stays healthy.
 
 ## `lag_kl/lag_kl_profile.pdf`
 
@@ -238,9 +238,9 @@ A fourth is this cell's own: **a positive gap here is not yet a source finding.*
 
 **In plain terms.** *"Where is each attention head looking?"* Four heads, four curves, because the posterior is head-structured — latent group $m$ is written by head $m$ alone — and averaging them before profiling would make four heads at four delays indistinguishable from one head attending everywhere.
 
-**What it shows.** The per-head attention profile over lags, with the head-averaged curve beside them **named as such**, and each head's entropy against the ceiling it can actually reach.
+**What it shows.** Two panels: the head-averaged attention profile over lags, and the per-head profiles beside it, one curve per head. Each head's entropy against the ceiling it can actually reach is **not on the page**; it is in `attention_per_recording.csv` and the analysis record.
 
-**Axes.** Lag in steps, with compensated seconds beside it; attention probability.
+**Axes.** Lag in seconds (stored-coefficient time); attention weight.
 
 **How it is misread.** The entropy is quoted against the **attainable** ceiling $\operatorname{mean}_t \log \min(t+1, L)$, which at this floor equals $\log L$ exactly — measured, not substituted. Reading a head's entropy against a hand-computed $\log L$ on an arm with a lower floor would report a model attending uniformly over what exists as increasingly concentrated. And the entropy is taken per anchor and then averaged, never as the entropy of the averaged profile: a mixture's entropy is at least the mean of the entropies mixed, so the second reports a model whose lag focus *shifts* as one that has none.
 
@@ -248,11 +248,11 @@ A fourth is this cell's own: **a positive gap here is not yet a source finding.*
 
 **In plain terms.** *"Did the model look at the same place all the way through the recording, or did it move?"* The profile figure averages over anchors; this one does not.
 
-**What it shows.** Attention mass as a heat map over (anchor, lag) for a retained sample, per head.
+**What it shows.** Head-averaged attention as a heat map over (time in segment, lag) for one retained sample, with the anchor floor marked.
 
-**Axes.** Anchor index across, lag down; colour is attention probability on a shared scale.
+**Axes.** Time in segment (s) across; lag in seconds (stored-coefficient time) down, each lag row spanning its own 4 s bin; colour is attention weight.
 
-**How it is misread.** It is **one retained segment**, drawn only where `eval_config.caps.attention` asked for retention — an absent figure is silence, not failure. The colour scale is shared across heads so they can be compared, which means a head with little structure looks flat rather than noisy. The vertical axis is the same coefficient-time lag as everywhere else.
+**How it is misread.** It is **one retained segment**, drawn only where `eval_config.caps.attention` asked for retention — an absent figure is silence, not failure. It is head-averaged, so a single head's structure can be hidden under three flat ones; the per-head profiles are on `attention_profile.pdf`. The vertical axis is the same coefficient-time lag as everywhere else.
 
 ## `calibration/pit_reliability.pdf`
 
@@ -268,9 +268,9 @@ A fourth is this cell's own: **a positive gap here is not yet a source finding.*
 
 **In plain terms.** *"Is the model's own uncertainty estimate pinned against a wall?"* The decoder's log-variance is clamped at both ends, and a single mean is equally consistent with a healthy spread and with half the mass sitting on each clamp.
 
-**What it shows.** The distribution of the decoder's log-variance with both clamp bounds marked, and the floor and ceiling fractions annotated.
+**What it shows.** The distribution of the decoder's log-variance with both clamp bounds marked. The floor and ceiling fractions are in the analysis record and `summary.json`, not annotated on the panel.
 
-**Axes.** Log-variance; density.
+**Axes.** Log-variance; fraction of coefficients.
 
 **How it is misread.** This is the one figure whose reading changes a config value — the analysis states a recommended `logvar_clamp` revision **per coefficient**, which is the axis the objective's block score reduces over, and says *no change* when neither end binds. A recommendation emitted unconditionally would be applied unconditionally.
 
@@ -294,9 +294,9 @@ The same eight metrics resolved by subgroup, **nested rather than flat**: one co
 
 **What it shows.** `mc_pred_gap` against time in segment, and against absolute time $t_{\mathrm{abs}} = \mathrm{epoch} + 4t$ across a delivery, with overlapping steps averaged and `n_contributing` travelling beside them.
 
-**Axes.** Anchor index or hours before delivery; nats per anchor.
+**Axes.** Time in segment (s) on the within-segment panel; hours before delivery on the whole-delivery panel; nats per anchor.
 
-**How it is misread.** The within-segment panel **starts at the anchor floor**, for the same reason `forecast/anchor_profile.pdf` does. Across a delivery, a gap is drawn as a **break** rather than interpolated, so a discontinuity is missing data rather than a jump — and the averaging of overlapping steps is visible in `n_contributing` rather than inferred.
+**How it is misread.** The within-segment panel **starts at the anchor floor**, for the same reason `forecast/anchor_profile.pdf` does. Across a delivery the line is **lifted wherever nothing was decoded** — and on this cell that includes the undecoded warm-up prefix of every segment, so the whole-delivery line is a run of short pieces one segment apart by construction, not a recording full of gaps. A **break** in `trajectory_delivery_summary.csv` is only a gap longer than one segment stride, i.e. a missing segment. The averaging of overlapping steps is visible in `n_contributing` rather than inferred.
 
 **Why it is one readout.** The lower panel is a single axis in nats per anchor, and the KL sitting on it beside `pred_gap` is routinely orders of magnitude larger — so a shared page draws the gap as a flat line at the bottom of the KL's range and reports a real movement of a tenth of a nat as nothing. The KL has its own page beside this one.
 
@@ -382,7 +382,7 @@ The same three panels for `source_conditioned_kl_raw` on this clock. Read exactl
 
 **Axes.** Hours before delivery, inverted; lag in seconds of stored-coefficient time on the violins; $-\log_{10} p$ on the strips.
 
-**How it is misread.** **This clock's two families are its own** and are not corrected jointly with the second-stage clock's, nor with each other: four families across this analysis, and a reader quoting two of them is making two comparisons. **Every heatmap row reads less severe against worse**: `healthy vs acidosis`, `healthy vs hie`, `acidosis vs hie`, so a positive Cliff's delta means the *less severe* class's centroid sits further back in the past. A cell below `MIN_GROUP_SIZE` = 3 recordings is drawn as its own points rather than as a density the smoother invented, and those are the same cells the test excludes.
+**How it is misread.** **This clock's two families are its own** and are not corrected jointly with the second-stage clock's, nor with each other: four families across this analysis, and a reader quoting two of them is making two comparisons. **Every heatmap row reads more severe against less severe**: `hie vs acidosis`, `hie vs healthy`, `acidosis vs healthy`, so a positive Cliff's delta means the *more severe* class's centroid sits further back in the past. A cell below `MIN_GROUP_SIZE` = 3 recordings is drawn as its own points rather than as a density the smoother invented, and those are the same cells the test excludes.
 
 ## `lag_clocks/lag_time_to_delivery_features.pdf`
 
@@ -412,7 +412,7 @@ The same three panels for `source_conditioned_kl_raw` on this clock. Read exactl
 
 **Axes.** Signed hours from second-stage onset, not inverted, onset at zero; lag in seconds of stored-coefficient time; $-\log_{10} p$ on the strips.
 
-**How it is misread.** **This clock's Holm family is its own**, per readout, and is not corrected jointly with the delivery clock's: the two are different alignments of an overlapping population, so a window significant on one and not the other is a statement about alignment. **Every heatmap row reads less severe against worse**, so a positive delta means the less severe class's centroid sits further back. A grey cross at zero on a strip means fewer than two classes had enough recordings in that window — which on the positive side of this axis is the common case rather than the exception.
+**How it is misread.** **This clock's Holm family is its own**, per readout, and is not corrected jointly with the delivery clock's: the two are different alignments of an overlapping population, so a window significant on one and not the other is a statement about alignment. **Every heatmap row reads more severe against less severe**, so a positive delta means the more severe class's centroid sits further back. A grey cross at zero on a strip means fewer than two classes had enough recordings in that window — which on the positive side of this axis is the common case rather than the exception.
 
 ## `lag_clocks/lag_second_stage_features.pdf`
 
@@ -432,7 +432,7 @@ The same three panels for `source_conditioned_kl_raw` on this clock. Read exactl
 
 **Axes.** Metrics down, cohort **pairs** across; colour is the effect size, signed.
 
-**How it is misread.** **The column order and the sign convention are both clinical.** Each column is one cohort pair named less severe first — the shared pairwise helper names a pair in the order it receives the cohorts, and this analysis hands them over in the canonical order — so a positive Cliff's delta means the less severe cohort's values run higher, in every column. Reorienting a column by eye still flips its sign against the number in the CSV. Every test here consumes one value per **recording**; a source naming a per-segment file would test segments while reading as though it tested recordings.
+**How it is misread.** **The column order and the sign convention are both clinical.** Each column is one cohort pair named more severe first — the shared pairwise helper names a pair in the order it receives the cohorts, and this analysis hands them over worst first — so a positive Cliff's delta means the more severe cohort's values run higher, in every column. Reorienting a column by eye still flips its sign against the number in the CSV. Every test here consumes one value per **recording**; a source naming a per-segment file would test segments while reading as though it tested recordings.
 
 ## `events/conditioned_coupling.pdf`
 
@@ -667,11 +667,13 @@ one asks it of the anchors in the upper $30\%$ of the pooled KL alone.
 
 **What it shows.** One heatmap per class — lag down, window across, colour the **share** of the high
 band's KL attribution in that lag bin, every window normalised to one and the three classes on one
-colour scale — then three trajectory panels, each the median per class with its inter-quartile
+colour scale — then four trajectory panels, each the median per class with its inter-quartile
 ribbon and the recording count on every point: the **high-anchor share** of a segment's anchors,
 with the `top` band's share dashed; the **high band's KL centroid** in seconds, with the `rest`
-band's centroid dashed beside it; and the **hot-lag share** of the attribution, with the attention's
-dashed. The first two are the tested readouts and their titles say so; the third is untested.
+band's centroid dashed beside it; the **hot-lag share** of the attribution, with the attention's
+dashed; and the **high band's forecast gain** in nats per anchor, with the `rest` band's dashed. The
+first two are the tested readouts and their titles say so; the last two are untested per window (the
+gain's one paired run-level test is on the usefulness page).
 
 **Axes.** Hours before delivery across, drawn with delivery at the right; stored-coefficient lag in
 seconds up on the heatmaps and the centroid panel; a share of anchors, or of the attribution, up on
@@ -801,6 +803,8 @@ of the recording's attribution across, occlusion delta in nats up.
 **In plain terms.** *"Show me one, in full."* Every other figure reduces the split to a distribution; these render individual segments so that a number nobody believes can be looked at.
 
 **What it shows.** This cell's **fifteen-row** diagnostic page, drawn through the task's own page seams — the same layout the training callback draws, rather than a second builder that could disagree with it. The rows are: the raw context, the forecast lanes, six causal extra rows (truth, both branch means, the signed skill difference, the posterior's own $\sigma$, and the per-window score), two gated-input rows, and the five latent and lag rows the layout owns.
+
+**Clocks.** The horizontal axis is physical time, set by the raw row. The two input rows and the eight forecast rows are drawn on it: each column is shifted left by its stream's own $\kappa\tau$ — $352$ s for the target input, $252$ s for the source input, $12$ s for the scored target under the shipped `physical` forecast clock — so a coefficient sits under the raw signal it was computed from rather than that far to its right, and the hatched tail of an input row is the content the encoder has not received by the segment's end. The anchor marks and the latent, KL and lag rows stay at the anchor step, the instant a forecast is made from. Each shifted row's x label states its shift; the constants come from the resolved budget, which the runner attaches to the loaded task after preflight.
 
 **Directories.** `stratified/` is a seeded, shard-stratified draw over the whole split, so a cap at or above the shard count reaches every shard. `by_class/` is a **class-balanced** draw: the same number of segments from every clinical class, `eval_config.caps.pages_per_class` of them. Beside them, one directory per headline metric and tail holds the segments at the extremes of that metric.
 

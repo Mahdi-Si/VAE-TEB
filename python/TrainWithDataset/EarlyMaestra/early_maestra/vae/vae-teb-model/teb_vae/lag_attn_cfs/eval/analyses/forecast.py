@@ -41,9 +41,12 @@ denominator is the per-$\tau$ masked anchor count rather than the per-anchor con
 indicator, which is an ``amax`` over $\tau$ and would count masked late-horizon steps as scored
 zeros -- flattering exactly the horizons that fall in gaps.
 
-**Everything here is per recording.** Anchors overlap in $14$ of their $15$ horizon steps and one
-recording contributes tens of segments, so every statistic is averaged within a recording first
-and the bootstrap resamples recordings, never anchors.
+**Everything here is per recording**, with one stated exception. Anchors overlap in $14$ of their
+$15$ horizon steps and one recording contributes tens of segments, so every statistic is averaged
+within a recording first and the bootstrap resamples recordings, never anchors. The exception is
+the anchor profile, which averages the retained segments' per-anchor scores directly -- it is a
+picture of where in the segment the score sits, not a cohort statistic, and `FIGURE_GUIDE.md` says
+so.
 """
 from __future__ import annotations
 

@@ -103,6 +103,7 @@ from teb_vae.lag_attn_cfs.eval import (  # noqa: E402
     preflight,
     probe as probe_module,
 )
+from teb_vae.lag_attn_cfs.causal_warmup import WarmupBudget, resolve_warmup_budget  # noqa: E402
 from teb_vae.lag_attn_cfs.eval._reuse import configure_numerics, subsample_indices  # noqa: E402
 from teb_vae.lag_attn_cfs.eval.analyses import (  # noqa: E402
     GROUPED_FRAMES_KEY,
@@ -918,6 +919,34 @@ def _max_or_none(values: Any) -> Optional[int]:
     return None if not values else int(max(int(step) for step in values))
 
 
+def attach_warmup_budget(task: Any, config: Mapping[str, Any]) -> Optional[WarmupBudget]:
+    r"""Give the loaded task the resolved budget, exactly as the training driver does.
+
+    The diagnostic page's seams read it off the task: the input rows take the two input clocks
+    $\tau^y_{\mathrm{ref}}$, $\tau^u_{\mathrm{ref}}$ and the forecast rows the scored clock's
+    $\tau$ from it, and shift their columns by $\kappa\tau$ so a coefficient sits at the physical
+    instant its content describes rather than up to $352$ s to the right of the raw trace it was
+    computed from. The net cannot supply those constants -- it stamps the per-channel *step*
+    shifts, from which no $\tau$ is recoverable -- and :func:`load_task` builds the task from the
+    checkpoint alone, so without this call every page of an evaluation was drawn at step index.
+
+    Called **after** preflight, which has already refused any budget that does not re-resolve to
+    the checkpoint's own stamped tuples; what is attached here is therefore the budget the
+    checkpoint was built at, re-resolved against the same view preflight used. ``None`` on an
+    ungated run, where there is no budget and the seams draw the rows unshifted.
+
+    Args:
+        task: The loaded task, whose ``warmup_budget`` attribute the seams read.
+        config: The merged run config.
+
+    Returns:
+        The attached budget, for the caller's log line.
+    """
+    budget = resolve_warmup_budget(preflight.config_view_for_budget(config))
+    task.warmup_budget = budget
+    return budget
+
+
 def warmup_budget_record(model: Any) -> Dict[str, Any]:
     r"""Record what the warm-up budget resolved to on the checkpoint being evaluated.
 
@@ -1313,6 +1342,11 @@ def main(
                 binding=binding,
             )
             preflight.write_preflight(preflight_record, results_dir)
+            # After preflight, which is what makes the re-resolved budget the checkpoint's own.
+            # The page seams place every re-clocked row on the physical axis through it.
+            attached = attach_warmup_budget(task, config)
+            if attached is not None:
+                logger.info(f"page clocks from the resolved budget: {attached.summary()}")
         else:
             preflight_record = read_preflight(results_dir)
 

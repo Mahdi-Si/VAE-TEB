@@ -406,11 +406,25 @@ def channel_profile(
         columns[f"sq_error_{branch}"] = values
 
     means: Dict[str, np.ndarray] = {}
+    per_recording: Dict[str, pd.DataFrame] = {}
     for name, values in columns.items():
         frame = pd.DataFrame(values)
         frame["guid"] = list(guids)
         per_guid = frame.groupby("guid").mean()
+        per_recording[name] = per_guid
         means[name] = np.asarray(per_guid.mean(axis=0), dtype=np.float64)
+    # The per-channel skill on the same chain as the band rows and the figure: skill PER
+    # RECORDING, then averaged -- not one minus the ratio of two recording means, which is a
+    # different statistic under the same name.
+    channel_skill = np.full(len(means.get("sq_error_full", [])), np.nan)
+    if "sq_error_full" in per_recording and "sq_error_base" in per_recording:
+        full = per_recording["sq_error_full"].to_numpy(dtype=np.float64)
+        base = per_recording["sq_error_base"].to_numpy(dtype=np.float64)
+        per_recording_skill = np.column_stack(
+            [skill_against(full[:, c], base[:, c]) for c in range(full.shape[1])]
+        ) if full.size else np.zeros((0, 0))
+        if per_recording_skill.size:
+            channel_skill = np.nanmean(per_recording_skill, axis=0)
 
     ordered = kept.sort_values("kept_channel")
     rows: List[Dict[str, Any]] = []
@@ -431,11 +445,8 @@ def channel_profile(
         }
         for name, values in means.items():
             row[name] = float(values[position]) if position < values.size else float("nan")
-        row["mse_skill"] = float(
-            skill_against(
-                np.asarray([row.get("sq_error_full", float("nan"))]),
-                np.asarray([row.get("sq_error_base", float("nan"))]),
-            )[0]
+        row["mse_skill"] = (
+            float(channel_skill[position]) if position < channel_skill.size else float("nan")
         )
         rows.append(row)
     return pd.DataFrame(rows)

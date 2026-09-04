@@ -556,6 +556,31 @@ def test_an_ungated_pair_passes_and_says_so(config) -> None:
     assert record == {"passed": True, "budget_steps": None, "gated": False}
 
 
+def test_the_loaded_task_is_handed_the_budget_the_page_clocks_come_from(config) -> None:
+    """The diagnostic page's seams read the resolved budget off the task, as the training driver
+    sets it: the input and forecast rows take their clocks from it and shift onto the physical
+    axis. The net stamps step shifts and no tau, so an evaluation that never attached the budget
+    drew every page at step index with no clock stated. Attached after preflight, which has
+    already refused any budget that is not the checkpoint's own."""
+    from types import SimpleNamespace
+
+    from teb_vae.lag_attn_cfs.eval import run as run_module
+
+    task = SimpleNamespace(warmup_budget=None)
+    attached = run_module.attach_warmup_budget(task, config)
+
+    assert attached is not None
+    assert task.warmup_budget is attached
+    assert attached == resolve_warmup_budget(preflight.config_view_for_budget(config))
+    assert attached.reference_delay_s is not None
+
+    # An ungated run has no budget, and the seams then draw the rows unshifted rather than
+    # against a stale one left over from another checkpoint.
+    config["model_config"]["VAE_model"]["causal_warmup_budget_steps"] = None
+    assert run_module.attach_warmup_budget(task, config) is None
+    assert task.warmup_budget is None
+
+
 def test_the_budget_is_re_resolved_against_the_evaluation_shards_alone(config) -> None:
     """``resolve_warmup_budget`` reads both shard lists, which is right for a training driver over
     one dataset and wrong here: the training shards are whatever the checkpoint's resolved config

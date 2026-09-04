@@ -565,7 +565,10 @@ def render_pages(
 
 def _page_scalars(row: Any) -> Dict[str, float]:
     """Return the readouts the page's title carries, from the row rather than from a re-scoring."""
-    names = ("nll_base_block", "nll_full_block", "pred_gap", "source_conditioned_kl_raw")
+    names = (
+        "nll_base_block", "nll_full_block", "pred_gap", "mc_pred_gap",
+        "source_conditioned_kl_raw",
+    )
     return {
         name: float(row[name])
         for name in names

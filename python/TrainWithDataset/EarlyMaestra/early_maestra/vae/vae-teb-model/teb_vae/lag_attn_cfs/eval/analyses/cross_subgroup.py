@@ -191,7 +191,7 @@ SPECTRAL_SKILL_BAND = "variability"
 METHOD = (
     "Kruskal-Wallis across cohorts per metric over one value per recording; Holm step-down "
     "correction across the metrics in the family; pairwise two-sided Mann-Whitney U with Cliff's "
-    "delta for the metrics significant after Holm only. Every pair is oriented from the less "
+    "delta for the metrics significant after Holm only. Every pair is oriented from the more "
     "severe cohort to the less severe one, so a positive Cliff's delta means the more severe "
     "cohort's "
     "values run higher. Non-parametric throughout because these distributions are skewed and "

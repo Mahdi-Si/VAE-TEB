@@ -372,12 +372,21 @@ def trajectory_rows(
 
     Returns:
         One row per non-empty cell: the cohort, the window and its centre, the count of
-        **recordings** behind it, the mean and the quartiles. Quartiles rather than a standard
-        deviation because these distributions are skewed, matching the grouped-variant convention.
+        **recordings** behind it, the cohort's distinct-recording total across every window, the
+        mean and the quartiles. Quartiles rather than a standard deviation because these
+        distributions are skewed, matching the grouped-variant convention.
     """
     rows: List[Dict[str, Any]] = []
     if per_recording.empty or column not in per_recording.columns:
         return rows
+    # Distinct recordings per cohort over the WHOLE axis, for a legend: summing the per-window
+    # counts would count a recording once per window it appears in, which is not a number of
+    # deliveries.
+    finite = per_recording[np.isfinite(np.asarray(per_recording[column], dtype=np.float64))]
+    totals = (
+        finite.groupby(finite["group"].astype(str))["guid"].nunique().to_dict()
+        if "guid" in finite.columns and len(finite) else {}
+    )
     for (group, bin_index, centre), cell in per_recording.groupby(
         ["group", bin_column, center_column], sort=True
     ):
@@ -393,6 +402,7 @@ def trajectory_rows(
                 "bin_center_h": float(centre),
                 # Recordings, not segments: the unit every statistic on this table is computed on.
                 "n_recordings": int(values.size),
+                "n_recordings_total": int(totals.get(str(group), 0)),
                 "mean": float(values.mean()),
                 "q25": float(np.percentile(values, 25)),
                 "median": float(np.percentile(values, 50)),
