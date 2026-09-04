@@ -565,6 +565,29 @@ def test_target_max_resolves_the_shipped_reference_off_the_shards(aligned) -> No
     assert aligned.reference_delay_s in set(aligned.target.declared_delay_s)
 
 
+def test_the_scored_targets_clock_follows_the_forecast_clock(aligned) -> None:
+    """The forecast-side twin of ``source_clock_delay_s``: the tau a page shifts the scored stream
+    by. Physical is the fastest kept channel's own delay, input is the target's input reference,
+    and stored has no single constant at all -- ``None``, not zero, because zero would draw the
+    stream as though its content were stamped with the step it is stored at."""
+    from dataclasses import replace
+
+    from teb_vae.lag_attn_cfs import causal_warmup
+
+    physical = replace(
+        aligned,
+        target_forecast_clock=causal_warmup.FORECAST_CLOCK_PHYSICAL,
+        target_forecast_reference_s=13.3405,
+    )
+    assert physical.target_forecast_clock_delay_s == 13.3405
+
+    inputs = replace(aligned, target_forecast_clock=causal_warmup.FORECAST_CLOCK_INPUT)
+    assert inputs.target_forecast_clock_delay_s == aligned.reference_delay_s
+
+    stored = replace(aligned, target_forecast_clock=causal_warmup.FORECAST_CLOCK_STORED)
+    assert stored.target_forecast_clock_delay_s is None
+
+
 def test_the_shifts_span_zero_to_eighty_five_on_both_streams(aligned) -> None:
     r"""Zero at the reference channel, largest at the fastest one, and never negative.
 

@@ -70,6 +70,7 @@ import numpy as np
 import pandas as pd
 import torch
 
+from teb_vae.lag_attn.nets.lag_report import SECONDS_PER_STEP
 from teb_vae.lag_attn_cfs.eval import cohort
 from teb_vae.lag_attn_cfs.eval import figures_seam as figures
 from teb_vae.lag_attn_cfs.eval._reuse import labels, stats as shared_stats
@@ -458,7 +459,15 @@ def build_frames(
     n_steps = int(records[0]["reference"].shape[1])
     for name, band in bands.items():
         stacked = np.concatenate([record["deltas"][name] for record in records], axis=0)
-        live = float(np.nanmean([record["live_fraction"][name] for record in records]))
+        # Weighted by batch size: an unweighted mean of per-batch fractions lets the short
+        # last batch count as much as a full one.
+        sizes = np.asarray([len(record["guids"]) for record in records], dtype=np.float64)
+        fractions = np.asarray([record["live_fraction"][name] for record in records], dtype=np.float64)
+        usable = np.isfinite(fractions) & (sizes > 0)
+        live = (
+            float(np.sum(fractions[usable] * sizes[usable]) / np.sum(sizes[usable]))
+            if usable.any() else float("nan")
+        )
         for step in range(n_steps):
             column = stacked[:, step]
             finite = column[np.isfinite(column)]
@@ -509,6 +518,7 @@ def _precision(
     absent = {
         "n_segments": None if n_segments is None else int(n_segments),
         "n_recordings": 0,
+        "delta_total_recording_mean_nats": float("nan"),
         "delta_total_se": float("nan"),
         "delta_total_ci_lo": float("nan"),
         "delta_total_ci_hi": float("nan"),
@@ -522,6 +532,11 @@ def _precision(
     return {
         "n_segments": None if n_segments is None else int(n_segments),
         "n_recordings": int(finite.size),
+        # The point estimate the SE and the interval below describe: the mean over RECORDINGS
+        # of the horizon-summed delta. ``delta_total_nats`` beside it is the segment-pooled sum
+        # of per-step means, a different reduction of the same deltas, so the interval is not
+        # guaranteed to contain it -- read the interval against this column.
+        "delta_total_recording_mean_nats": float(finite.mean()) if finite.size else float("nan"),
         # ``ddof=1``: the spread being estimated is the population's rather than this
         # sample's own, and at the handful of recordings this analysis is capped to the
         # difference between the two is not cosmetic.
@@ -591,13 +606,21 @@ def build_summary(
             else np.asarray([], dtype=np.float64)
         )
         finite = values[np.isfinite(values)]
-        peak = int(np.argmax(finite)) if finite.size else None
+        # The horizon step the peak sits at, read off the row rather than off the position in
+        # the finite-filtered vector, which is not a step once any per-step mean is NaN.
+        peak = (
+            int(np.asarray(subset["horizon_step"])[int(np.nanargmax(values))])
+            if finite.size else None
+        )
         rows.append(
             {
                 "band": name,
                 "lag_lo": int(band[0]),
                 "lag_hi": int(band[1]),
-                "unit": NATS_PER_ANCHOR_STEP,
+                # The total is summed over the horizon, so it is in nats per anchor like
+                # pred_gap; only the mean and the max beside it are per horizon step.
+                "unit": "delta_total_nats: nats per anchor; delta_mean/max_nats: "
+                        + NATS_PER_ANCHOR_STEP,
                 # Summed over the horizon rather than averaged, so it is on the block score's own
                 # scale and comparable with ``pred_gap`` directly.
                 "delta_total_nats": float(finite.sum()) if finite.size else float("nan"),
@@ -961,7 +984,9 @@ def build_clock_figure(frame: pd.DataFrame, bands: Dict[str, Tuple[int, int]]) -
             )
         span = bands[name]
         panel.set_title(
-            f"{name}: lags {span[0]}-{span[1]}", fontsize=figures.FONT_SMALL
+            f"{name}: lags {span[0]}-{span[1]} steps "
+            f"({span[0] * SECONDS_PER_STEP:g}-{(span[1] + 1) * SECONDS_PER_STEP:g} s back)",
+            fontsize=figures.FONT_SMALL,
         )
         panel.set_ylabel("nats per anchor")
         panel.invert_xaxis()

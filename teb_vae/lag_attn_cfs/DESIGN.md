@@ -1696,3 +1696,35 @@ partition by stored-clock novelty rather than as a measurement on the scored clo
 `lag_recovery_check` refuses any other clock by name. The arms are
 `sweep_target_clock_stored.yaml` (today's target *and* tiling, exactly) and
 `sweep_target_clock_input.yaml`.
+
+## Amendment (2026-09): the diagnostic page's clocks
+
+§11.1 describes the input rows as "the streams as the encoders receive them", and the page's
+footnote as first written stated that those rows sit $\kappa\tau_{\mathrm{ref}}$ to the *right* of
+the raw traces. That was a labelled misalignment rather than a corrected one: an aligned channel at
+step $t$ carries content centred at $t\Delta - \kappa\tau_{\mathrm{ref}}$ — $351.9$ s earlier on
+the shipped target clock, $252.2$ s on the source's — so a deceleration in the raw FHR appeared in
+the `fhr_st` row six minutes later, and the same channel sat at two different places on the
+`input_target` row and the `pred_truth` row. The page now draws every re-clocked stream on the
+physical axis the raw row sets:
+
+- **The input rows** are shifted left by $\kappa\tau^y_{\mathrm{ref}}$ and
+  $\kappa\tau^u_{\mathrm{ref}}$ (`InputStreamPanel.content_offset_s`, zero on the two-sided pages,
+  whose coefficients are stamped with the instant they describe), the warm-up staircase with them,
+  and the last $\kappa\tau$ seconds are hatched: content the encoder has not received by the
+  segment's end.
+- **The forecast rows** — the lanes, the five field rows and the per-window score — are shifted by
+  $\kappa\tau$ of the *scored* clock, `WarmupBudget.target_forecast_clock_delay_s`: $\tau_{\min} =
+  13.34$ s under the shipped `physical` clock ($11.7$ s, under three steps), $\tau^y_{\mathrm{ref}}$
+  under `input`, and none under `stored`, where no constant exists and the rows stay at step index
+  with the axis saying so.
+- **The anchor marks and the latent, KL and lag rows stay at the anchor step**, which is the
+  instant a forecast is made from. The gap between an input row's hatched tail and the anchor
+  floor is the staleness §3 prices, now visible rather than footnoted.
+
+Both $\tau$ come from the resolved budget, which the task binds into the page seams; the net stamps
+only the per-channel step shifts, from which no $\tau$ is recoverable. The evaluation runner
+therefore attaches the re-resolved budget to the loaded task after preflight
+(`eval/run.py::attach_warmup_budget`). Before this amendment it never did, so every evaluation page
+was drawn at step index with no clock stated on it, while the training callback's pages carried
+the footnote.

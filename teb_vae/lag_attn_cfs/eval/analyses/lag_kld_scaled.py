@@ -87,6 +87,7 @@ from teb_vae.lag_attn_cfs.eval.lag_axis import (
     compensated_seconds_axis,
 )
 from teb_vae.lag_attn_cfs.eval.lag_shape import (
+    SECONDS_PER_LAG_STEP,
     STATISTIC_KEYS,
     degeneracy,
     profile_statistics,
@@ -506,7 +507,10 @@ def add_feature_columns(
         many segments it reduced.
     """
     frame = per_sample.copy()
-    frame[ROW_COLUMN] = np.arange(len(frame), dtype=np.int64)
+    # Row positions into the sidecar are the frame's index values: the frame may be the
+    # horizon-bounded subset of the collected table, and the sidecar is in the collected order.
+    positions = np.asarray(frame.index, dtype=np.int64)
+    frame[ROW_COLUMN] = positions
     columns: List[str] = []
     record: Dict[str, Any] = {}
     # Accumulated and attached in ONE concat at the end. Assigned column by column this builds
@@ -514,7 +518,9 @@ def add_feature_columns(
     # block manager once per assignment -- which it warns about, loudly, once per column.
     built: Dict[str, np.ndarray] = {}
     for source in sources:
-        rows = matrices[source.key][: len(frame)]
+        matrix = matrices[source.key]
+        inside = positions[positions < matrix.shape[0]]
+        rows = matrix[inside] if inside.size == len(frame) else matrix[:0]
         statistics, counts = profile_statistics(rows, axes[source.key])
         for statistic in source.statistics:
             column = feature_column(source.key, statistic)
@@ -756,8 +762,11 @@ def build_band_figure(
     for index, name in enumerate(names):
         panel = axes[index][0]
         span = bands[name]
-        lo = float(seconds[max(span[0], 0)]) if seconds.size else 0.0
-        hi = float(seconds[min(span[1], seconds.size - 1)]) if seconds.size else 0.0
+        # The band's EDGES: an inclusive lag range spans half a step past its first and last
+        # centre, so "lags 0-14" is 0-60 s rather than 0-56 s.
+        half_lag = SECONDS_PER_LAG_STEP / 2.0
+        lo = float(seconds[max(span[0], 0)]) - half_lag if seconds.size else 0.0
+        hi = float(seconds[min(span[1], seconds.size - 1)]) + half_lag if seconds.size else 0.0
         band_rows = subset[subset["source"] == f"kl_{name}"] if len(subset) else subset
         if not len(band_rows):
             panel.text(
@@ -774,7 +783,8 @@ def build_band_figure(
                 linewidth=figures.LINE_REGULAR, label=group,
             )
         panel.set_title(
-            f"{name}: lags {span[0]}-{span[1]} ({lo:g}-{hi:g} s)", fontsize=figures.FONT_SMALL
+            f"{name}: lags {span[0]}-{span[1]} steps ({max(lo, 0.0):g}-{hi:g} s)",
+            fontsize=figures.FONT_SMALL,
         )
         panel.set_ylabel("nats per anchor")
         if clock.inverted:

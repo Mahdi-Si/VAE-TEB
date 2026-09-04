@@ -453,11 +453,19 @@ def test_the_share_field_is_a_distribution_over_lags_in_every_window() -> None:
         clock, binned, vectors["lag_profile_untruncated"], _N_LAGS
     )
 
-    assert len(windows) == len(centres) == 2
+    # Every window between the first and the last is laid out, populated or not, so an empty
+    # interior window is a blank column rather than a shift of every later column: the fixture
+    # occupies two windows and the axis runs over the whole range between them.
+    assert windows == list(range(min(windows), max(windows) + 1))
+    assert len(windows) == len(centres)
+    assert centres == pytest.approx([(w + 0.5) * analysis.TRAJECTORY_BIN_HOURS for w in windows])
     assert [field.group for field in fields] == ["hie", "acidosis", "healthy"]
     for field in fields:
         assert field.share.shape == (_N_LAGS, len(windows))
-        assert np.nansum(field.share, axis=0) == pytest.approx([1.0, 1.0])
+        populated = field.counts > 0
+        assert int(populated.sum()) == 2
+        assert np.nansum(field.share, axis=0)[populated] == pytest.approx(1.0)
+        assert np.isnan(field.share[:, ~populated]).all()
         # The mean is the un-normalised quantity and is emitted beside the share: a recording with
         # a large total attribution must not be able to move the share field.
         assert np.nansum(field.mean, axis=0).max() > 1.0

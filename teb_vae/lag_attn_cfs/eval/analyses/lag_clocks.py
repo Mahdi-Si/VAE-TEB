@@ -98,6 +98,7 @@ from teb_vae.lag_attn_cfs.eval.lag_shape import (
     FAR_SECONDS,
     NEAR_SECONDS,
     PEAK_FRACTION,
+    SECONDS_PER_LAG_STEP,
     STATISTIC_KEYS,
     profile_statistics,
 )
@@ -489,7 +490,12 @@ def add_feature_columns(
         directory collected before that readout existed is a partial input, not a broken one.
     """
     frame = per_sample.copy()
-    frame[ROW_COLUMN] = np.arange(len(frame), dtype=np.int64)
+    # The sidecar is aligned with the COLLECTED table's row order, and the frame handed in may
+    # be the horizon-bounded subset of it (``cohort.within_horizon`` keeps the original index).
+    # The row positions are therefore the index values, never a fresh ``arange`` -- which would
+    # attach the first surviving segment's profile to whichever segment the pass wrote first.
+    positions = np.asarray(frame.index, dtype=np.int64)
+    frame[ROW_COLUMN] = positions
     record: Dict[str, Any] = {}
     for source in PROFILE_SOURCES:
         matrix = vectors.get(source.attribute)
@@ -506,7 +512,9 @@ def add_feature_columns(
                 "reason": f"the vector sidecar carries no 2-D {source.attribute!r}",
             }
             continue
-        rows = np.asarray(matrix, dtype=np.float64)[: len(frame)]
+        array = np.asarray(matrix, dtype=np.float64)
+        inside = positions[positions < array.shape[0]]
+        rows = array[inside] if inside.size == len(frame) else array[:0]
         statistics, counts = profile_statistics(rows, seconds)
         for key, column in columns.items():
             frame[column] = _padded(statistics[key], len(frame))
@@ -814,12 +822,16 @@ class ProfileField:
             a distribution over lags rather than a picture of the coupling magnitude the clocks
             already draw.
         counts: Recordings behind each window, $(W,)$.
+        n_recordings: Distinct recordings of the cohort across every window -- the number a
+            legend or title reports, since summing ``counts`` would count a recording once per
+            window it appears in.
     """
 
     group: str
     mean: np.ndarray
     share: np.ndarray
     counts: np.ndarray
+    n_recordings: int = 0
 
 
 def window_profiles(
@@ -876,10 +888,12 @@ def window_profiles(
     # with evidence that did not go into it.
     counted = per_guid.notna().any(axis=1).groupby(["group", "window"], sort=True).sum()
 
-    windows = sorted({int(value) for value in table["window"]})
-    centres = [
-        float(table.loc[table["window"] == window, "centre"].iloc[0]) for window in windows
-    ]
+    # Every window between the first and the last, populated or not: the heatmap lays its
+    # columns out uniformly, so a skipped empty window would shift every later column onto the
+    # wrong hour. An empty window is a NaN column, which the panel leaves blank.
+    lowest, highest = int(table["window"].min()), int(table["window"].max())
+    windows = list(range(lowest, highest + 1))
+    centres = [(window + 0.5) * float(TRAJECTORY_BIN_HOURS) for window in windows]
     present = cohort.ordered_groups(
         sorted({str(value) for value in table["group"]}), labels.CLASS_COLUMN
     )
@@ -897,7 +911,12 @@ def window_profiles(
             mean, np.where(totals > 0.0, totals, np.nan)[None, :],
             out=np.full_like(mean, np.nan), where=np.isfinite(mean),
         )
-        fields.append(ProfileField(group=group, mean=mean, share=share, counts=counts))
+        fields.append(
+            ProfileField(
+                group=group, mean=mean, share=share, counts=counts,
+                n_recordings=int(per_guid.loc[group].index.get_level_values("guid").nunique()),
+            )
+        )
     return windows, centres, fields
 
 
@@ -1049,9 +1068,13 @@ def build_profile_figure(
         default=0.0,
     )
     half = float(TRAJECTORY_BIN_HOURS) / 2.0
+    # Bin EDGES on both axes: the lag axis holds L cells centred on ``seconds``, so an extent
+    # from the first centre to the last squeezes L cells into L - 1 steps and drifts every
+    # mid-axis lag by up to half a step.
+    half_lag = SECONDS_PER_LAG_STEP / 2.0
     extent = (
         (float(centres[0]) - half, float(centres[-1]) + half,
-         float(seconds[0]), float(seconds[-1]))
+         float(seconds[0]) - half_lag, float(seconds[-1]) + half_lag)
         if centres and seconds.size
         else None
     )
@@ -1065,7 +1088,7 @@ def build_profile_figure(
             field.share[::-1],
             title=(
                 f"{field.group}: share of the KL attribution by lag and window "
-                f"(n={int(field.counts.max()) if field.counts.size else 0} recordings at most)"
+                f"(n={int(field.n_recordings)} deliveries)"
             ),
             ylabel=figures.COEFFICIENT_LAG_AXIS_LABEL,
             symmetric=False,
@@ -1160,7 +1183,7 @@ def _draw_trajectory_panel(
         ax.plot(
             x, np.array([row["median"] for row in cell], dtype=np.float64),
             marker="o", markersize=3, color=colour, linewidth=figures.LINE_EMPHASIS,
-            label=f"{group} centroid (n={int(sum(row['n_recordings'] for row in cell))})",
+            label=f"{group} centroid (n={int(cell[0].get('n_recordings_total', 0))} deliveries)",
         )
         for row in cell:
             ax.annotate(
@@ -1364,7 +1387,7 @@ def _draw_feature_panel(
         ax.plot(
             x, np.array([row["median"] for row in cell], dtype=np.float64),
             marker="o", markersize=3, color=colour, linewidth=figures.LINE_EMPHASIS,
-            label=f"{group} {primary.key} (n={int(sum(row['n_recordings'] for row in cell))})",
+            label=f"{group} {primary.key} (n={int(cell[0].get('n_recordings_total', 0))} deliveries)",
         )
         companion_cell = sorted(
             (row for row in companion_rows if row["group"] == group),
@@ -1381,8 +1404,11 @@ def _draw_feature_panel(
         if annotated_rows:
             # Keyed on the window rather than zipped, so a window one statistic could not be
             # computed in cannot shift every annotation after it onto the wrong point.
+            # The mean, not the median: the annotated statistic is a 0/1 flag per segment,
+            # averaged per recording, and the share of a window's segments that were degenerate
+            # is its mean -- a median of it reads 0% or 100% and little else.
             by_window = {
-                int(row["time_bin"]): float(row["median"])
+                int(row["time_bin"]): float(row["mean"])
                 for row in annotated_rows if row["group"] == group
             }
             for row in cell:

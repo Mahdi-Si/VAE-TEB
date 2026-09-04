@@ -44,7 +44,7 @@ from teb_vae.lag_attn_cfs.eval.metrics import (
     attention_entropy,
     untruncated_anchor_mask,
 )
-from teb_vae.lag_attn.nets.lag_report import lag_compensated_seconds
+from teb_vae.lag_attn.nets.lag_report import lag_compensated_seconds, SECONDS_PER_STEP
 
 from .conftest import SHIPPED_HORIZON, SHIPPED_SEQUENCE_LENGTH, SHIPPED_WARMUP_PERIOD
 
@@ -373,9 +373,12 @@ def test_the_heatmap_uses_no_interpolation_and_the_coefficient_time_axis() -> No
         plt.close(figure)
 
     assert interpolation == "none"
-    # The y extent is the compensated lag axis, which at a delay of 30 starts at 4*30 seconds.
-    assert extent[2] == pytest.approx(float(lag_compensated_seconds(0, delay_steps=30)))
-    assert extent[3] == pytest.approx(float(lag_compensated_seconds(8, delay_steps=30)))
+    # The y extent is the compensated lag axis, which at a delay of 30 starts at 4*30 seconds --
+    # spanning the BINS, half a step past the first and the last lag centre, so the L rows are
+    # not squeezed into L - 1 steps.
+    half = SECONDS_PER_STEP / 2.0
+    assert extent[2] == pytest.approx(float(lag_compensated_seconds(0, delay_steps=30)) - half)
+    assert extent[3] == pytest.approx(float(lag_compensated_seconds(8, delay_steps=30)) + half)
     assert label == lag_axis.COEFFICIENT_LAG_AXIS_LABEL
 
 

@@ -400,6 +400,25 @@ class WarmupBudget:
         )
 
     @property
+    def target_forecast_clock_delay_s(self) -> Optional[float]:
+        r"""$\tau$ of the clock the **scored** target sits on, the forecast-side twin of
+        :attr:`source_clock_delay_s`.
+
+        A scored element at stored step $u$ carries content centred $\kappa\tau$ seconds earlier,
+        and which $\tau$ that is depends on the forecast clock: $\tau_{\min}$ of the kept target
+        channels under ``'physical'``, where every channel is advanced onto the fastest one's
+        clock; the target's own input reference $\tau^y_{\mathrm{ref}}$ under ``'input'``, where
+        the scored stream is the continuation of the aligned one; and ``None`` under ``'stored'``,
+        where each channel keeps its own $\tau_c$ and no single constant stands in. A page that
+        draws the scored target on the physical time axis shifts it by $\kappa$ times this.
+        """
+        if self.target_forecast_clock == FORECAST_CLOCK_PHYSICAL:
+            return self.target_forecast_reference_s
+        if self.target_forecast_clock == FORECAST_CLOCK_INPUT:
+            return self.reference_delay_s
+        return None
+
+    @property
     def inter_stream_offset_s(self) -> Optional[float]:
         r"""$\tau^u_{\mathrm{ref}} - \tau^y_{\mathrm{ref}}$, the dual clock's bias on the lag axis.
 

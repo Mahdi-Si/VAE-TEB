@@ -120,11 +120,38 @@ def test_a_gap_produces_a_break_rather_than_an_interpolation() -> None:
     trajectory, _ = analysis.whole_delivery(per_anchor)
 
     gaps = np.asarray(trajectory["gap_before_s"], dtype=np.float64)
-    breaks = np.isfinite(gaps) & (gaps > analysis.BREAK_TOLERANCE_S)
-    assert int(breaks.sum()) == 1
-    assert float(gaps[breaks][0]) == pytest.approx(7200.0 - 3600.0 - 4 * SECONDS_PER_STEP)
-    # Contiguous anchors are exactly one step apart and are not breaks.
+    lifted = np.isfinite(gaps) & (gaps > analysis.LINE_GAP_S)
+    assert int(lifted.sum()) == 1
+    assert float(gaps[lifted][0]) == pytest.approx(7200.0 - 3600.0 - 4 * SECONDS_PER_STEP)
+    # Contiguous anchors are exactly one step apart and are not lifted.
     assert float(gaps[1]) == pytest.approx(SECONDS_PER_STEP)
+
+
+def test_a_break_is_a_missing_segment_not_the_undecoded_prefix_of_the_next_one() -> None:
+    """Consecutive segments tile at $T\Delta$ seconds and anchors start at the floor, so every
+    join carries a gap of roughly $4F$ seconds with nothing decoded in it. The drawn line is lifted
+    there, but a *break* -- the count a reader takes as missing recording -- needs a gap longer
+    than one segment stride, read off the run's own geometry."""
+    stride = 300 * SECONDS_PER_STEP
+    tolerance = analysis.break_tolerance_s({"geometry": {"t": 300}})
+    assert tolerance == pytest.approx(stride + 1.5 * SECONDS_PER_STEP)
+    # No geometry on the record: the shipped 300-step segment is assumed rather than zero.
+    assert analysis.break_tolerance_s({}) == pytest.approx(tolerance)
+
+    # Two segments one stride apart with a 100-step undecoded prefix in the second: not a break.
+    contiguous = _anchors(
+        _segment("a", -2 * stride, range(100, 105), value=1.0)
+        + _segment("a", -stride, range(100, 105), value=2.0)
+    )
+    # Two segments TWO strides apart: the missing middle segment is one break.
+    missing = _anchors(
+        _segment("b", -3 * stride, range(100, 105), value=1.0)
+        + _segment("b", -stride, range(100, 105), value=2.0)
+    )
+    for anchors, expected in ((contiguous, 0), (missing, 1)):
+        trajectory, boundaries = analysis.whole_delivery(anchors)
+        summary = analysis.delivery_summary(trajectory, boundaries, break_after_s=tolerance)
+        assert int(summary["n_breaks"].iloc[0]) == expected
 
 
 def test_the_figure_leaves_the_gap_as_a_gap() -> None:

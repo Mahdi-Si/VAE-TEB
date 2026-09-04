@@ -104,9 +104,21 @@ READOUTS: Tuple[Readout, ...] = (
     Readout("pred_gap_mc_nats", "mc_pred_gap", "nats per anchor", "pred_gap"),
 )
 
-#: A join between two segments of one recording is a break when the gap exceeds one anchor step.
-#: Equality is not a break: consecutive anchors are exactly ``SECONDS_PER_STEP`` apart.
-BREAK_TOLERANCE_S = SECONDS_PER_STEP * 1.5
+#: Within a segment, consecutive anchors are exactly ``SECONDS_PER_STEP`` apart; a larger gap
+#: is where the drawn line is lifted, because nothing was decoded in between.
+LINE_GAP_S = SECONDS_PER_STEP * 1.5
+
+#: A **break** in the assembled trajectory is a missing segment, not the undecoded prefix of the
+#: next one. Consecutive segments tile at $T\Delta$ seconds and anchors exist only from the floor
+#: $F$ onward, so the gap between one segment's last anchor and the next's first is roughly
+#: $4F$ seconds on every join; counting those as breaks would report one per segment. A gap is
+#: a break when it exceeds one segment stride, read off the run's own geometry, plus a step.
+def break_tolerance_s(record: Dict[str, Any]) -> float:
+    """Seconds a gap must exceed to count as a missing segment, from the collection record."""
+    geometry = dict(record.get("geometry") or {})
+    steps = int(geometry.get("t") or 0)
+    stride = steps * SECONDS_PER_STEP if steps > 0 else 300 * SECONDS_PER_STEP
+    return float(stride + SECONDS_PER_STEP * 1.5)
 
 
 def anchor_floor(record: Dict[str, Any]) -> Optional[int]:
@@ -198,7 +210,7 @@ def whole_delivery(per_anchor: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame
         ``(trajectory, boundaries)``. The trajectory holds one row per ``(guid, t_abs_sec)`` --
         overlapping anchors from adjacent segments **averaged** into that one row and counted in
         ``n_contributing`` -- with ``gap_before_s`` giving the distance to the previous timestep,
-        so a break is visible as a value above :data:`BREAK_TOLERANCE_S` rather than being drawn
+        so a break is visible as a value above :func:`break_tolerance_s` rather than being drawn
         through. The boundaries name, per segment, the row index its first anchor landed on.
     """
     trajectory_columns = ["guid", "t_abs_sec", "hours_before_delivery", "n_contributing",
@@ -260,12 +272,16 @@ def whole_delivery(per_anchor: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame
     return trajectory, pd.DataFrame(boundaries, columns=boundary_columns)
 
 
-def delivery_summary(trajectory: pd.DataFrame, boundaries: pd.DataFrame) -> pd.DataFrame:
+def delivery_summary(
+    trajectory: pd.DataFrame, boundaries: pd.DataFrame, *, break_after_s: float
+) -> pd.DataFrame:
     """Summarise each recording's assembled trajectory.
 
     Args:
         trajectory: The whole-delivery table.
         boundaries: The segment joins.
+        break_after_s: Seconds a gap must exceed to count as a break -- a missing segment, from
+            :func:`break_tolerance_s`; the undecoded prefix between two tiled segments is not one.
 
     Returns:
         One row per recording: how many timesteps it holds, how many of them merged an overlap,
@@ -286,7 +302,7 @@ def delivery_summary(trajectory: pd.DataFrame, boundaries: pd.DataFrame) -> pd.D
                 "guid": str(guid),
                 "n_timesteps": int(len(cell)),
                 "n_overlapping": int((np.asarray(cell["n_contributing"]) > 1).sum()),
-                "n_breaks": int(np.sum(np.isfinite(gaps) & (gaps > BREAK_TOLERANCE_S))),
+                "n_breaks": int(np.sum(np.isfinite(gaps) & (gaps > float(break_after_s)))),
                 "span_hours": float((times.max() - times.min()) / cohort.SECONDS_PER_HOUR)
                 if times.size else float("nan"),
                 "n_segments": int(segments.get(guid, 0)),
@@ -400,7 +416,9 @@ def _draw_whole_delivery(
     # discards a measured value -- the first point after every gap was never drawn. Inserting the
     # NaN instead breaks the line between the two samples and keeps both. Loop-invariant, so it is
     # computed once here rather than per readout.
-    breaks = np.flatnonzero(np.isfinite(gaps) & (gaps > BREAK_TOLERANCE_S))
+    # Lifted wherever nothing was decoded in between -- the undecoded prefix of every segment
+    # included -- because drawing across it would read as a measured trend.
+    breaks = np.flatnonzero(np.isfinite(gaps) & (gaps > LINE_GAP_S))
     hours_with_breaks = np.insert(hours, breaks, np.nan)
     if column in cell.columns:
         values = np.insert(np.asarray(cell[column], dtype=np.float64), breaks, np.nan)
@@ -472,7 +490,8 @@ def run_trajectory_analysis(
     trajectory, boundaries = whole_delivery(per_anchor)
     trajectory.to_parquet(directory / WHOLE_DELIVERY_FILENAME, index=False)
     boundaries.to_csv(directory / BOUNDARIES_FILENAME, index=False)
-    summary = delivery_summary(trajectory, boundaries)
+    break_after_s = break_tolerance_s(dict(getattr(context.collection, "record", None) or {}))
+    summary = delivery_summary(trajectory, boundaries, break_after_s=break_after_s)
     summary.to_csv(directory / SUMMARY_FILENAME, index=False)
 
     # One page per readout rather than one carrying both, so neither is drawn on the other's
@@ -519,7 +538,13 @@ def run_trajectory_analysis(
             "n_timesteps": int(len(trajectory)),
             "n_overlapping_timesteps": int(summary["n_overlapping"].sum()) if n_recordings else 0,
             "n_breaks": int(summary["n_breaks"].sum()) if n_recordings else 0,
-            "break_tolerance_s": float(BREAK_TOLERANCE_S),
+            "break_tolerance_s": float(break_after_s),
+            "line_gap_s": float(LINE_GAP_S),
+            "break_meaning": (
+                "a break is a gap longer than one segment stride, i.e. a missing segment; the "
+                "undecoded warm-up prefix between two tiled segments lifts the drawn line but is "
+                "not counted as a break"
+            ),
             "n_boundaries": int(len(boundaries)),
             "max_span_hours": float(summary["span_hours"].max()) if n_recordings else float("nan"),
         },

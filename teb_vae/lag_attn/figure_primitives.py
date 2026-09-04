@@ -148,11 +148,16 @@ def attach_lag_seconds_axis(ax: Any, step_seconds: float, delta_up_seconds: floa
     if s <= 0.0:
         return None
     try:
+        from matplotlib.ticker import MultipleLocator
+
         sec = ax.secondary_yaxis(
             "right",
             functions=(lambda l: s * l + d, lambda v: (v - d) / s),
         )
         sec.set_ylabel("Lag (s)", fontsize=8)
+        # Whole minutes rather than matplotlib's default, which lands on values like 37.5 s
+        # that read as though the lag grid were finer than the decimated step it is drawn on.
+        sec.yaxis.set_major_locator(MultipleLocator(60.0))
         return sec
     except Exception:  # noqa: BLE001 — plotting must never crash training
         return None

@@ -46,6 +46,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import numpy as np
 import pandas as pd
 
+from teb_vae.lag_attn.nets.lag_report import SECONDS_PER_STEP
 from teb_vae.lag_attn_cfs.eval import figures_seam
 from teb_vae.lag_attn_cfs.eval._reuse import figures, stats as shared_stats
 from teb_vae.lag_attn_cfs.eval.lag_axis import (
@@ -194,11 +195,13 @@ def build_rows(per_guid: pd.DataFrame, *, resamples: int, seed: int) -> List[Dic
         }
         if column == DIFFERENCE_COLUMN:
             positive = positive_fraction(values)
+            # Matched first, null second: the shared test reports the median of left minus
+            # right, and this row IS coupling minus clock, so the sign must read the same way.
             paired = shared_stats.wilcoxon_paired(
-                finite_column(per_guid, NULL_COLUMN),
                 finite_column(per_guid, COUPLING_COLUMN),
-                label_left="source-null KL",
-                label_right="matched coupling KL",
+                finite_column(per_guid, NULL_COLUMN),
+                label_left="matched coupling KL",
+                label_right="source-null KL",
             )
             row.update(
                 {
@@ -545,9 +548,12 @@ def build_lag_figure(
 
     # The geometry-fixed partition, shaded on both panels so a reader can place a feature in the
     # same vocabulary the interventional readout reports its deltas in.
+    # Bin EDGES: the bands are inclusive lag ranges, so a shade from centre to centre would be
+    # one bin short at each end, adjacent bands would leave a gap, and a one-lag band would vanish.
+    half_lag = SECONDS_PER_STEP / 2.0
     for index, (name, span) in enumerate(bands.items()):
-        lo = float(seconds[max(span[0], 0)]) if seconds.size else 0.0
-        hi = float(seconds[min(span[1], seconds.size - 1)]) if seconds.size else 0.0
+        lo = float(seconds[max(span[0], 0)]) - half_lag if seconds.size else 0.0
+        hi = float(seconds[min(span[1], seconds.size - 1)]) + half_lag if seconds.size else 0.0
         for panel in (top, bottom):
             panel.axvspan(lo, hi, color="0.9" if index % 2 else "0.95", zorder=0)
         top.annotate(
@@ -558,7 +564,7 @@ def build_lag_figure(
     mask = record.get("delta_mask")
     if mask and seconds.size:
         bottom.axvspan(
-            float(seconds[mask[0]]), float(seconds[mask[1]]),
+            float(seconds[mask[0]]) - half_lag, float(seconds[mask[1]]) + half_lag,
             color="C3", alpha=0.15, zorder=1, label="delta mask",
         )
     bottom.legend(loc="upper right", fontsize="small")

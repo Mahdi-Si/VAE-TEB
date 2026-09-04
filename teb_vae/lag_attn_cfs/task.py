@@ -133,6 +133,11 @@ class SeqVaeLagAttnCfsTask(SeqVaeLagAttnFsTask):
 
         model = self.orig_model
         gate = model.target_gate
+        # The forecast clock's tau in seconds comes from the resolved budget, as the input clocks
+        # do in `input_stream_panels`: the net stamps the per-channel step shifts and nothing
+        # from which tau can be recovered. Without it the scored stream is drawn at step index,
+        # which is exact only on the stored clock.
+        budget = self.warmup_budget
         return partial(
             causal_forecast_rows,
             keep_index=None if gate is None else gate.keep_index,
@@ -143,6 +148,9 @@ class SeqVaeLagAttnCfsTask(SeqVaeLagAttnFsTask):
             # The model's own forecast clock, so the page's truth, its window scores and its mask
             # are the objective's -- None on the stored clock, where the page is what it was.
             target_forecast_shift=model.target_forecast_shift,
+            forecast_clock_delay_s=(
+                None if budget is None else budget.target_forecast_clock_delay_s
+            ),
         )
 
     @property
