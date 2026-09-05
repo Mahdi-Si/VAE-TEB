@@ -114,21 +114,20 @@ logger = logging.getLogger(__name__)
 #: hardcoded $\Delta$ would keep resolving shifts against a decimation the shards no longer have.
 STEP_SECONDS = float(DECIMATION) / float(RAW_SAMPLING_HZ)
 
-#: Fraction of a channel's reported group delay that its content actually sits at, $1 - 1/(2\gamma)$
-#: $= 0.875$ at the shipped gammatone order $\gamma = 4$.
+#: The CONVENTION for the fraction of a channel's reported group delay its content is taken to sit
+#: at: $1 - 1/(2\gamma) = 0.875$ at the shipped gammatone order $\gamma = 4$, the impulse
+#: response's energy centroid against $\tau_g$, the envelope's mean.
 #:
-#: ``causal_delay_s`` ships the phase group delay $\tau_g = \gamma/(2\pi b)$, which is the
-#: envelope's *mean* and the right number to REPORT as a channel's staleness. It is not the right
-#: number to ALIGN on. The delay a stored channel actually exhibits is the spectrum-weighted average
-#: group delay -- equivalently the impulse response's energy centroid, $(2\gamma-1)/(4\pi b)$ --
-#: because $\tau_g(\nu) = \tau_g(\xi)\,b^2/(b^2 + (\nu-\xi)^2)$ is *maximal* at the centre frequency,
-#: so a channel's own passband contributes only downward departures. The spread is one-sided, not
-#: the symmetric jitter it was long recorded as, and it therefore does not average out.
-#:
-#: Measured on the shipped bank over 30 segments, causal ``fhr_st`` against the centred block: the
-#: median ratio of realised to reported lag is $0.903$ over all 30 resolved channels and $0.882$
-#: over the nine slow ones where the $4$ s grid quantises by under $2.5\%$ -- against $0.875$
-#: predicted here and $1.000$ predicted by $\tau_g$.
+#: ``causal_delay_s`` ships $\tau_g = \gamma/(2\pi b)$, the number to REPORT as a channel's
+#: staleness; the alignment shift and the physical forecast clock scale DIFFERENCES of delays by
+#: this factor. It is a convention rather than a measured universal (2026-09-05 review, CFS-05):
+#: a ramp through the actual low-pass realises the mean delay, and a slow narrowband modulation
+#: through the slow wavelet realises the full composed group delay, $49.5$ s later than
+#: $\kappa\tau_g$ -- both pinned in ``hdf5_dataset/tests/test_phase_operator.py``. The
+#: $0.903$ median realised/reported ratio once measured on 30 aligned-shard segments is an
+#: empirical average over that content, not a property of every channel or input. Every
+#: consumer therefore states the results as approximate content leads, never as exact
+#: physiological timestamps.
 #:
 #: Restated rather than imported, like :data:`TARGET_BLOCKS` above: deriving it from
 #: ``hdf5_dataset.causal_scattering.GAMMATONE_ORDER`` would build the two-sided filter bank at
@@ -172,7 +171,30 @@ ALIGN_KEY = "model_config.VAE_model.causal_align_reference"
 ALIGN_SOURCE_KEY = "model_config.VAE_model.causal_align_reference_source"
 TARGET_FORECAST_CLOCK_KEY = "model_config.VAE_model.causal_target_forecast_clock"
 LEG_ALIGNMENT_KEY = "model_config.VAE_model.causal_leg_alignment"
+PHASE_OPERATOR_KEY = "model_config.VAE_model.causal_phase_operator"
 SEQUENCE_KEY = "model_config.VAE_model.sequence_length"
+
+#: The checkpoint key under which a causal run stamps its representation identity -- the
+#: :meth:`WarmupBudget.representation` record. The stamped channel tuples in ``model_kwargs`` say
+#: how WIDE the model is; this says WHAT the channels are: which phase operator, leg alignment,
+#: forecast clock and references produced them. Two representations can coincide in every width
+#: and differ in every value, which is why a width comparison cannot stand in for it.
+REPRESENTATION_KEY = "causal_representation"
+
+#: The fields of that record a checkpoint and a re-resolved budget must agree on before the
+#: checkpoint is evaluated. Widths and tuples are compared separately by the preflight; these are
+#: the identities the tuples cannot carry.
+REPRESENTATION_IDENTITY_FIELDS = ("phase_operator", "leg_alignment", "target_forecast_clock")
+
+#: Where a resolved budget's novelty vector came from. ``'curve'``: looked up in the shards'
+#: horizon-free ``causal_novelty_curve`` at THIS run's horizon and each kept channel's forecast
+#: advance, so it describes the scored gather. ``'legacy_scalar'``: the shards predate the curve
+#: and carry only ``causal_novelty_frac``, a scalar written at one fixed horizon on the stored
+#: clock, so under another horizon or clock the vector ranks by a gather this run does not score.
+#: ``'none'``: the shards carry neither, and a feature-target model is refused a split.
+NOVELTY_SOURCE_CURVE = "curve"
+NOVELTY_SOURCE_LEGACY = "legacy_scalar"
+NOVELTY_SOURCE_NONE = "none"
 TRIM_KEY = "dataset_config.dataloader_config.dataset_kwargs.trim_minutes"
 
 
@@ -195,9 +217,13 @@ class StreamWarmup:
             shard's own ``causal_delay_s``. Declared rather than kept for the same reason the
             warm-up is, and one of its own: the channels the alignment drops are named in the
             startup log *by their delay*, which a survivors-only vector could not do.
-        declared_novelty_frac: $\nu_c$ per declared channel -- the share of that coefficient drawn
-            from raw samples the anchor has not seen, at the horizon the writer measured it over --
-            or ``None`` when any of the stream's blocks was written before the attribute existed.
+        declared_novelty_frac: $\nu_c$ per declared channel -- the envelope-mass share of that
+            coefficient lying after the anchor at the LAST scored element, a readout label and not
+            an exact value fraction (CFS-08). On a current shard it is looked up in the stored
+            horizon-free ``causal_novelty_curve`` at this run's ``horizon`` and each kept channel's
+            forecast advance $s_c$, so it describes the scored gather; on a legacy shard it is the
+            stored fixed-horizon scalar ``causal_novelty_frac``; ``None`` when the shards carry
+            neither. Which one it is travels as ``WarmupBudget.novelty_source``.
             ``None`` for the whole stream rather than per block, because the vector is consumed as
             one concatenated axis and a half-filled one would silently partition on the half that
             is there. Declared rather than kept for the same reason as above, and one of its own:
@@ -341,11 +367,21 @@ class WarmupBudget:
             scheme and is what every run before this key existed did. Never read on its own by a
             consumer computing a physical lag: use :attr:`source_clock_delay_s`, which resolves the
             fallback, since a ``None`` here means "the target's clock" rather than "unaligned".
-        leg_alignment: Which phase-harmonic operator built the configured shards' phase blocks, as
-            they record it. Carried so a run's startup log states which dataset variant it read;
-            the *expected* value is a config key, checked in :func:`resolve_warmup_budget`.
+        leg_alignment: Which phase-harmonic leg alignment built the configured shards' phase
+            blocks, as they record it. Carried so a run's startup log states which dataset variant
+            it read; the *expected* value is a config key, checked in :func:`resolve_warmup_budget`.
+        phase_operator: Which phase-harmonic operator VERSION built them, as the shards record it
+            (``'ratio_power_v0'`` for every shard predating the version). Checked against
+            ``causal_phase_operator`` in the config the same way, and carried into the run's
+            record so a checkpoint's representation is named rather than inferred from a width.
         target: The target stream, which the budget gates.
         source: The source stream, which it does not; see :func:`resolve_warmup_budget`.
+        novelty_source: One of :data:`NOVELTY_SOURCE_CURVE`, :data:`NOVELTY_SOURCE_LEGACY` or
+            :data:`NOVELTY_SOURCE_NONE` -- whether the streams' ``declared_novelty_frac`` was
+            looked up in the shards' horizon-free curve for this run's own gather, read off a
+            legacy fixed-horizon scalar, or is absent.
+        novelty_horizon_steps: The horizon $H$ the curve lookup used (this run's ``horizon``);
+            ``None`` unless the source is the curve.
         target_forecast_clock: Which clock the forecast target is scored on -- one of
             :data:`FORECAST_CLOCKS`. ``'stored'`` is every run before the key existed.
         target_forecast_shift: $s_c$ per **kept** target channel, positional against
@@ -368,6 +404,9 @@ class WarmupBudget:
     target_forecast_clock: str = FORECAST_CLOCK_STORED
     target_forecast_shift: Optional[Tuple[int, ...]] = None
     target_forecast_reference_s: Optional[float] = None
+    phase_operator: str = "ratio_power_v0"
+    novelty_source: str = NOVELTY_SOURCE_NONE
+    novelty_horizon_steps: Optional[int] = None
 
     @property
     def max_forecast_advance(self) -> int:
@@ -409,8 +448,8 @@ class WarmupBudget:
         channels under ``'physical'``, where every channel is advanced onto the fastest one's
         clock; the target's own input reference $\tau^y_{\mathrm{ref}}$ under ``'input'``, where
         the scored stream is the continuation of the aligned one; and ``None`` under ``'stored'``,
-        where each channel keeps its own $\tau_c$ and no single constant stands in. A page that
-        draws the scored target on the physical time axis shifts it by $\kappa$ times this.
+        where each channel keeps its own $\tau_c$ and no single constant stands in. The diagnostic
+        page states it on the forecast rows' time axis.
         """
         if self.target_forecast_clock == FORECAST_CLOCK_PHYSICAL:
             return self.target_forecast_reference_s
@@ -420,7 +459,14 @@ class WarmupBudget:
 
     @property
     def inter_stream_offset_s(self) -> Optional[float]:
-        r"""$\tau^u_{\mathrm{ref}} - \tau^y_{\mathrm{ref}}$, the dual clock's bias on the lag axis.
+        r"""$\tau^u_{\mathrm{ref}} - \tau^y_{\mathrm{ref}}$, the difference of the two clocks.
+
+        The bias the pair puts on the lag axis is $\kappa$ times this
+        (:data:`ALIGNMENT_DELAY_FACTOR`): an aligned channel's content sits at $\kappa$ of its
+        reference, so the two streams are $\kappa(\tau^u_{\mathrm{ref}} - \tau^y_{\mathrm{ref}})$
+        apart in physical time -- $-99.66$ s at the shipped pair, against the $-113.89$ s
+        difference recorded here. The unscaled difference is what is stored because it is the
+        pair itself; a consumer stating a physical lag scales it, as ``warmup_budget.py`` does.
 
         Exactly $0$ under the single-reference scheme, which is a *measured* zero rather than an
         absent quantity -- the two clocks coincide -- so it is reported as $0.0$ there and as
@@ -432,6 +478,41 @@ class WarmupBudget:
         if target_clock is None or source_clock is None:
             return None
         return float(source_clock) - float(target_clock)
+
+    def representation(self) -> dict:
+        """The representation identity a checkpoint stamps under :data:`REPRESENTATION_KEY`.
+
+        Plain scalars only, so the record survives ``torch.save`` and reads back as itself: which
+        phase-harmonic operator version and leg alignment built the shards, which forecast clock
+        the target was scored on, the two alignment references, and the budget and quantile the
+        channel tuples were resolved under. It names the representation; it does not repeat the
+        channel tuples, which ``model_kwargs`` already carries.
+
+        Returns:
+            ``{'phase_operator', 'leg_alignment', 'target_forecast_clock', 'reference_delay_s',
+            'source_reference_delay_s', 'target_forecast_reference_s', 'budget_steps',
+            'quantile'}``.
+        """
+        return {
+            "phase_operator": str(self.phase_operator),
+            "leg_alignment": str(self.leg_alignment),
+            "target_forecast_clock": str(self.target_forecast_clock),
+            "reference_delay_s": (
+                None if self.reference_delay_s is None else float(self.reference_delay_s)
+            ),
+            "source_reference_delay_s": (
+                None
+                if self.source_reference_delay_s is None
+                else float(self.source_reference_delay_s)
+            ),
+            "target_forecast_reference_s": (
+                None
+                if self.target_forecast_reference_s is None
+                else float(self.target_forecast_reference_s)
+            ),
+            "budget_steps": int(self.budget_steps),
+            "quantile": None if self.quantile is None else float(self.quantile),
+        }
 
     def summary(self) -> str:
         """One line for the startup log, naming both streams and the threshold that produced them.
@@ -469,7 +550,8 @@ class WarmupBudget:
         return (
             f"causal warm-up budget {self.budget_steps} steps "
             f"(quantile {quantile}, trim_minutes {self.trim_minutes}, "
-            f"leg alignment {self.leg_alignment}, {reference}{forecast}): "
+            f"leg alignment {self.leg_alignment}, phase operator {self.phase_operator}, "
+            f"{reference}{forecast}): "
             f"{self.target.summary()}; {self.source.summary()}"
         )
 
@@ -508,18 +590,20 @@ def _build_stream(
     Tuple[int, ...],
     Tuple[float, ...],
     Optional[Tuple[float, ...]],
+    Optional[np.ndarray],
 ]:
-    """Concatenate a stream's blocks into one declared-width warm-up, delay and novelty vector.
+    """Concatenate a stream's blocks into one declared-width warm-up, delay and novelty record.
 
-    The three travel together because they are positional into the same width and are read off the
+    The pieces travel together because they are positional into the same width and are read off the
     same blocks in the same order: a stream assembled with one of them out of step would gate on
     one channel's warm-up and shift on another's, with every length still correct.
 
-    The novelty vector is the one that may be missing. It is written by a strictly later writer than
-    the other two, so a shard built before it exists carries neither the attribute nor any value
-    that could stand in for it -- and it is reported as ``None`` for the **whole stream** the moment
-    any one block lacks it, because a vector that is real over ``fhr_st`` and fabricated over
-    ``fhr_ph`` would partition cleanly and mean nothing.
+    The novelty record is the part that may be missing, in either of two forms. A current shard
+    carries the horizon-free curve ``causal_novelty_curve``; a legacy shard carries the scalar
+    ``causal_novelty_frac`` written at one fixed horizon; a shard older than both carries neither.
+    Each is reported as ``None`` for the **whole stream** the moment any one block lacks it,
+    because a vector that is real over ``fhr_st`` and fabricated over ``fhr_ph`` would partition
+    cleanly and mean nothing.
 
     Args:
         name: ``'target'`` or ``'source'``, for the refusal messages.
@@ -529,12 +613,13 @@ def _build_stream(
         declared_key: The config key that declared it, for the refusal message.
 
     Returns:
-        ``(block_spans, declared_warmup_steps, declared_delay_s, declared_novelty_frac)``, the last
-        of which is ``None`` when any block of the stream carries no novelty vector.
+        ``(block_spans, declared_warmup_steps, declared_delay_s, legacy_novelty_frac,
+        novelty_curve)``: the legacy scalar vector, or ``None`` when any block lacks it, and the
+        declared-width ``(C, W + 1)`` curve, or ``None`` when any block lacks that.
 
     Raises:
         ValueError: If a block is absent from the shards, if the concatenated width disagrees with
-            the declared one, or if a stored novelty vector is not of its block's width.
+            the declared one, or if a stored novelty vector or curve is not of its block's width.
     """
     missing = [block for block in blocks if block not in warmup.warmup_steps]
     if missing:
@@ -548,6 +633,9 @@ def _build_stream(
     delays: List[float] = []
     novelty: Optional[List[float]] = [] if all(
         block in warmup.novelty_frac for block in blocks
+    ) else None
+    curve_rows: Optional[List[np.ndarray]] = [] if all(
+        block in warmup.novelty_curve for block in blocks
     ) else None
     for block in blocks:
         vector = warmup.warmup_steps[block]
@@ -570,6 +658,22 @@ def _build_stream(
                     f"novelty to another rather than fail."
                 )
             novelty.extend(float(share) for share in stored)
+        if curve_rows is not None:
+            table = np.asarray(warmup.novelty_curve[block], dtype=np.float64)
+            if table.ndim != 2 or int(table.shape[0]) != int(vector.size):
+                raise ValueError(
+                    f"the shards' '{block}' causal_novelty_curve has shape {table.shape} against "
+                    f"{int(vector.size)} channels in causal_warmup_steps. The two are positional "
+                    f"into one channel axis, so a mismatch attributes one channel's curve to "
+                    f"another rather than fail."
+                )
+            if curve_rows and int(table.shape[1]) != int(curve_rows[0].shape[1]):
+                raise ValueError(
+                    f"the shards' '{block}' causal_novelty_curve is tabulated to "
+                    f"{int(table.shape[1]) - 1} steps where '{blocks[0]}' is tabulated to "
+                    f"{int(curve_rows[0].shape[1]) - 1}; one file wrote two extents."
+                )
+            curve_rows.append(table)
 
     if declared_width != len(values):
         raise ValueError(
@@ -583,7 +687,40 @@ def _build_stream(
         tuple(values),
         tuple(delays),
         None if novelty is None else tuple(novelty),
+        None if curve_rows is None else np.concatenate(curve_rows, axis=0),
     )
+
+
+def _novelty_from_curve(
+    curve: np.ndarray,
+    horizon: int,
+    keep_index: Sequence[int],
+    forecast_shift: Optional[Sequence[int]],
+) -> Tuple[float, ...]:
+    r"""Look each declared channel's novelty up in the stored curve for THIS run's gather.
+
+    The scored element at anchor $t$, last horizon step, kept channel $c$ reads stored step
+    $t + H + s_c$, so the share of that coefficient's envelope mass lying after the anchor is
+    $N_c(H + s_c)$ -- the stored curve at window $H + s_c$. A channel the budget drops is never
+    scored and is looked up unadvanced, so the declared vector stays positional; a window past the
+    tabulated extent reads the last entry, and a negative window (the ``input`` clock, whose labels
+    can precede the anchor) reads $N_c(0) = 0$.
+
+    Args:
+        curve: ``(C_declared, W + 1)`` from :func:`_build_stream`.
+        horizon: This run's ``horizon`` $H$ in decimated steps.
+        keep_index: The stream's kept declared indices, which the shift is positional against.
+        forecast_shift: $s_c$ per kept channel, or ``None`` for the stored clock.
+
+    Returns:
+        $\nu_c$ per declared channel.
+    """
+    advance = np.zeros(int(curve.shape[0]), dtype=int)
+    if forecast_shift is not None:
+        for kept, shift in zip(keep_index, forecast_shift):
+            advance[int(kept)] = int(shift)
+    window = np.clip(int(horizon) + advance, 0, int(curve.shape[1]) - 1)
+    return tuple(float(value) for value in curve[np.arange(curve.shape[0]), window])
 
 
 def _check_leg_alignment(expected: Optional[Any], measured: str, paths: Sequence[str]) -> None:
@@ -617,6 +754,36 @@ def _check_leg_alignment(expected: Optional[Any], measured: str, paths: Sequence
             f"here can tell them apart -- and the stored causal_delay_s is only true of the phase "
             f"blocks under 'envelope'. Point the run at the matching build, or set "
             f"{LEG_ALIGNMENT_KEY}: null to state that this run does not care."
+        )
+
+
+def _check_phase_operator(expected: Optional[Any], measured: str, paths: Sequence[str]) -> None:
+    """Refuse shards built by a phase-harmonic operator version this run did not ask for.
+
+    The integer operator narrows the phase blocks, so a mismatch usually also fails the declared
+    width -- but a width is a count and not a version, and a run that declares no expectation
+    would otherwise load a legacy shard's fractional-power phase blocks under a config written for
+    the corrected ones with nothing saying so. Checked by name, like the leg alignment.
+
+    Args:
+        expected: The configured expectation, or ``None`` for no expectation at all.
+        measured: What the configured shards record, with absence already read as the legacy
+            operator.
+        paths: The shards, for the refusal message.
+
+    Raises:
+        ValueError: If an expectation is configured and the shards disagree with it.
+    """
+    if expected is None:
+        return
+    if str(expected) != measured:
+        raise ValueError(
+            f"{PHASE_OPERATOR_KEY}={str(expected)!r} but the configured shards record "
+            f"causal_phase_operator={measured!r} ({', '.join(str(path) for path in paths)}). "
+            f"The two operator versions apply different exponents and select different pair "
+            f"families, so their phase channels are different representations. Point the run at "
+            f"the matching build, or set {PHASE_OPERATOR_KEY}: null to state that this run does "
+            f"not care."
         )
 
 
@@ -943,6 +1110,7 @@ def resolve_warmup_budget(config: Mapping[str, Any]) -> Optional[WarmupBudget]:
             valid step; if the trim the vectors were rebased at does not produce the declared
             sequence length; if a declared stream width disagrees with the shards; if the budget
             keeps no target channel; if the shards' recorded leg alignment disagrees with the
+            configured expectation; if the shards' recorded phase operator disagrees with the
             configured expectation; if the alignment reference is neither ``'target_max'`` nor a
             number, matches no kept target channel, or leaves a stream with no channel at all; if
             the source reference is not a number, is set against an unaligned target, or matches no
@@ -1014,11 +1182,11 @@ def resolve_warmup_budget(config: Mapping[str, Any]) -> Optional[WarmupBudget]:
 
     use_up_st = bool(vae_config.get("use_up_st", True))
     source_blocks = SOURCE_BLOCKS if use_up_st else SOURCE_BLOCKS[1:]
-    target_spans, target_warmup, target_delay_s, target_novelty = _build_stream(
-        "target", TARGET_BLOCKS, warmup, _require_int(vae_config, "c_y"), "c_y"
+    target_spans, target_warmup, target_delay_s, target_legacy_novelty, target_curve = (
+        _build_stream("target", TARGET_BLOCKS, warmup, _require_int(vae_config, "c_y"), "c_y")
     )
-    source_spans, source_warmup, source_delay_s, source_novelty = _build_stream(
-        "source", source_blocks, warmup, _require_int(vae_config, "c_u"), "c_u"
+    source_spans, source_warmup, source_delay_s, source_legacy_novelty, source_curve = (
+        _build_stream("source", source_blocks, warmup, _require_int(vae_config, "c_u"), "c_u")
     )
 
     target_keep = tuple(
@@ -1034,6 +1202,7 @@ def resolve_warmup_budget(config: Mapping[str, Any]) -> Optional[WarmupBudget]:
     # The shards' own record of which phase-harmonic operator built them, checked *before* any
     # shift is resolved from the delays it makes true or false.
     _check_leg_alignment(vae_config.get("causal_leg_alignment"), warmup.leg_alignment, paths)
+    _check_phase_operator(vae_config.get("causal_phase_operator"), warmup.phase_operator, paths)
 
     # The target's reference is resolved from the target stream alone. Under the single-reference
     # scheme it is applied to both streams, which is the whole point of it: a per-stream reference
@@ -1088,6 +1257,31 @@ def resolve_warmup_budget(config: Mapping[str, Any]) -> Optional[WarmupBudget]:
     # ceiling moves down by the largest advance; a negative or absent shift moves nothing.
     max_advance = 0 if forecast_shift is None else max(0, max(forecast_shift, default=0))
 
+    # The novelty split's vector, resolved AFTER the clocks because it depends on them: on a
+    # current shard it is the stored horizon-free curve at this run's horizon and each kept
+    # channel's advance -- the dataset bakes no horizon in, the model chooses it here -- and on a
+    # legacy shard it is the fixed-horizon scalar the builder wrote, labelled as such.
+    if target_curve is not None and source_curve is not None:
+        novelty_source = NOVELTY_SOURCE_CURVE
+        novelty_horizon: Optional[int] = horizon
+        target_novelty: Optional[Tuple[float, ...]] = _novelty_from_curve(
+            target_curve, horizon, target_keep, forecast_shift
+        )
+        # The source is never scored, so its vector is the unadvanced lookup at the same horizon.
+        source_novelty: Optional[Tuple[float, ...]] = _novelty_from_curve(
+            source_curve, horizon, tuple(range(len(source_warmup))), None
+        )
+    elif target_legacy_novelty is not None and source_legacy_novelty is not None:
+        novelty_source = NOVELTY_SOURCE_LEGACY
+        novelty_horizon = None
+        target_novelty = target_legacy_novelty
+        source_novelty = source_legacy_novelty
+    else:
+        novelty_source = NOVELTY_SOURCE_NONE
+        novelty_horizon = None
+        target_novelty = None
+        source_novelty = None
+
     # The worst phase is the last one, whose first anchor is F + S - 1; if that anchor does not
     # exist there is a phase at which the sample contributes no forecast at all, and its share of
     # the epoch is silently dropped. Checked against the EFFECTIVE ceiling: under an advancing
@@ -1121,6 +1315,9 @@ def resolve_warmup_budget(config: Mapping[str, Any]) -> Optional[WarmupBudget]:
         target_forecast_clock=forecast_clock,
         target_forecast_shift=forecast_shift,
         target_forecast_reference_s=forecast_reference_s,
+        phase_operator=warmup.phase_operator,
+        novelty_source=novelty_source,
+        novelty_horizon_steps=novelty_horizon,
         target=StreamWarmup(
             name="target",
             block_spans=target_spans,

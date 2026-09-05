@@ -97,7 +97,6 @@ import torch
 
 from teb_vae.lag_attn.nets.lag_report import (
     lag_compensated_seconds,
-    lag_original_sensor_seconds,
 )
 from teb_vae.lag_attn_cfs.eval.lag_axis import GROUP_DELAY_CAVEAT
 from teb_vae.lag_attn_rws.nets import controls
@@ -123,7 +122,11 @@ from teb_vae.lag_attn_rws.nets.raw_masks import VALID_THRESHOLD, forecast_mask, 
 DENSE_ANCHOR_GEOMETRY: Tuple[int, int] = (0, 1)
 
 #: Monte Carlo draws per anchor. The specification's starting value; more may be used for a
-#: final analysis, and $K = 1$ reduces the estimator exactly to the training-path score.
+#: final analysis. $K = 1$ is one draw of the same estimator, NOT the training-path score: the
+#: training path decodes the base branch at the prior MEAN under ``base_decode: mean`` (the
+#: shipped setting) while this estimator samples every branch, so the two agree only on a branch
+#: whose log-variance is pinned at $-\infty$ and only for the same $\epsilon$. Convergence in $K$
+#: (8, 32, 128 on a fixed validation subset) is an open CFS-10 measurement, not a settled default.
 DEFAULT_NUM_SAMPLES = 8
 
 #: How much worse, in nats per anchor, a forecast from a *stranger's* prior latent must be before
@@ -415,8 +418,12 @@ def mc_predictive_block(
         mask: The forecast mask $(B, A_{\max}, H)$.
         anchors: The decoded anchor index $(B, A_{\max})$, as the forward returned it.
         likelihood: ``'mse'`` or ``'gaussian_nll'``.
-        num_samples: Monte Carlo draws $K$. At $K = 1$ the result is exactly the training-path
-            per-anchor score for the same draw.
+        num_samples: Monte Carlo draws $K$. At $K = 1$ the result is one sampled-latent score per
+            branch. It equals the training path's own per-anchor score only for a branch the
+            training path also SAMPLES and only under the same $\epsilon$; under
+            ``base_decode: mean`` the training path decodes the base branch at $\mu^p$, which this
+            estimator never does, so the base column here and ``nll_base_block`` are two different
+            quantities at every $K$.
         generator: Generator for $\epsilon$, on the same device as the latent parameters. The
             estimator is the only place an evaluation *adds* randomness of its own, so it takes
             an explicit stream rather than the global one: two runs of a checkpoint must report
@@ -1749,8 +1756,11 @@ def evaluate_batch(
         persistence=outputs.get("persistence"),
     )
 
-    # The training-path score: one latent draw, the same functions the objective uses. Reported
-    # alongside the marginalised one so the cost of the Monte Carlo marginalisation is visible.
+    # The training-path score: the forward's own decoded latents, the same functions the objective
+    # uses. Under ``base_decode: mean`` ``mu_base`` was decoded at the prior MEAN while ``mu_full``
+    # was decoded at one posterior sample, so ``nll_base_block - nll_full_block`` mixes a source
+    # comparison with a decoding-policy difference; it is reported for objective parity only, and
+    # the matched common-random-numbers scores above are the ones a source-gain claim reads.
     training_block, _ = masked_raw_block_per_anchor(
         outputs["mu_full"], target, mask, likelihood=likelihood, logvar=outputs["logvar_full"]
     )
@@ -2527,9 +2537,8 @@ def lag_summary(
         "kl_lag_compensated_seconds": float(
             lag_compensated_seconds(kl_argmax, delay_steps=delay_steps)
         ),
-        "kl_lag_original_sensor_seconds": float(
-            lag_original_sensor_seconds(kl_argmax, delay_steps=delay_steps)
-        ),
+        # No sensor-timeline twin of the figure above: the stored UP/FHR timeline is canonical
+        # and the builder's shift is never undone downstream.
         "kl_argmax_lag_step_support_corrected": corrected_argmax,
         "kl_lag_compensated_seconds_support_corrected": (
             None

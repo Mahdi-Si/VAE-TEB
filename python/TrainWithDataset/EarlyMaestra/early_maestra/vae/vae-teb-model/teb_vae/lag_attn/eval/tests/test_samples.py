@@ -36,7 +36,7 @@ def probe_record(runner, tiny_loader):
 
 def _config(**overrides):
     """A minimal validated-shape ``eval_config`` for the analysis."""
-    config = {"seed": 7, "max_samples": None, "caps": {}, "up_shift_secs": -20.0}
+    config = {"seed": 7, "max_samples": None, "caps": {}}
     config.update(overrides)
     return config
 

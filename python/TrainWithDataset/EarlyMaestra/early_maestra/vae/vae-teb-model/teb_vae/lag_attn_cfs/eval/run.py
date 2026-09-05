@@ -103,7 +103,11 @@ from teb_vae.lag_attn_cfs.eval import (  # noqa: E402
     preflight,
     probe as probe_module,
 )
-from teb_vae.lag_attn_cfs.causal_warmup import WarmupBudget, resolve_warmup_budget  # noqa: E402
+from teb_vae.lag_attn_cfs.causal_warmup import (  # noqa: E402
+    REPRESENTATION_KEY,
+    WarmupBudget,
+    resolve_warmup_budget,
+)
 from teb_vae.lag_attn_cfs.eval._reuse import configure_numerics, subsample_indices  # noqa: E402
 from teb_vae.lag_attn_cfs.eval.analyses import (  # noqa: E402
     GROUPED_FRAMES_KEY,
@@ -1340,6 +1344,9 @@ def main(
                 model_kwargs=blob.get("model_kwargs") or {},
                 hyper_parameters=dict(task.hparams),
                 binding=binding,
+                # The representation stamp, where the training run wrote one; a blob predating it
+                # compares on the channel tuples alone.
+                representation=blob.get(REPRESENTATION_KEY),
             )
             preflight.write_preflight(preflight_record, results_dir)
             # After preflight, which is what makes the re-resolved budget the checkpoint's own.

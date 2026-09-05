@@ -41,9 +41,10 @@ coefficients and still lag by their own composed group delay, $13$ to $791$ s as
 them. Unaligned, that bias is indexed by a channel *pair* and no single number labels the axis; with
 the source channels shifted onto one reference $\tau^u_{\mathrm{ref}}$ it collapses to a constant,
 and because $\tau^y \equiv 0$ here the lead time
-$\Delta(\ell + 1 + h) + \tau^u_{\mathrm{ref}} - 20$ s is a delay between *signals* rather than
-between two filters' reports of them. That is what the footnote states, and the arithmetic behind it
-is :func:`~teb_vae.lag_attn.nets.lag_report.physical_lag_seconds` rather than a second copy here.
+$\Delta(\ell + 1 + h) + \kappa\tau^u_{\mathrm{ref}}$ s is a delay between *signals* rather than
+between two filters' reports of them, stated on the canonical stored timeline with no dataset-shift
+term. That is what the footnote states, and the arithmetic behind it is
+:func:`~teb_vae.lag_attn.nets.lag_report.physical_lag_seconds` rather than a second copy here.
 
 The footnote is where it is said because the two lag panels belong to the shared builder, and the
 six shipped models drawn by that builder must not acquire a caption about a transform they do not
@@ -73,10 +74,8 @@ from teb_vae.lag_attn.figure_primitives import (  # noqa: E402
     COLOR_VERMILLION,
     to_numpy,
 )
-from teb_vae.lag_attn.nets.lag_report import (  # noqa: E402
-    MECHANICAL_SHIFT_SECONDS,
-    SECONDS_PER_STEP,
-)
+from teb_vae.lag_attn.nets.lag_report import SECONDS_PER_STEP  # noqa: E402
+from teb_vae.lag_attn_cfs.causal_warmup import ALIGNMENT_DELAY_FACTOR  # noqa: E402
 from teb_vae.lag_attn_cfs.sample_page import (  # noqa: E402
     _draw_anchor_overlay,
     _tiling_anchors,
@@ -100,7 +99,8 @@ __all__ = ["LAG_TIME_CAVEAT", "causal_raw_forecast_rows"]
 #: It is deliberately **one-sided** where the causal-feature page's is two-sided: the correction to a
 #: physical delay has a term for each side of the attention, and this cell's target side contributes
 #: none -- a raw sample is at the instant it is at. What is left is the source channel's own
-#: composed group delay, plus the shift the preprocessing already removed.
+#: composed group delay. There is no dataset-shift term: the stored UP/FHR timeline is canonical,
+#: and the builder's UP shift is part of the signal rather than something a caption undoes.
 #:
 #: It states the **identity** and not a number, because $\tau^u_{\mathrm{ref}}$ is a decision of the
 #: run rather than a property of this module and nothing the page is handed carries it: the rows are
@@ -109,19 +109,18 @@ __all__ = ["LAG_TIME_CAVEAT", "causal_raw_forecast_rows"]
 #: is emphatically not it. The resolved value travels in the run's own record instead, which the
 #: sentence names so a reader of a page can find the constant that completes it.
 #:
-#: $\Delta$ and the acquisition shift are interpolated from
-#: :mod:`~teb_vae.lag_attn.nets.lag_report` rather than typed, so the caption and the function a
-#: consumer would evaluate it with cannot state two different corrections.
+#: $\Delta$ and $\kappa$ are interpolated from :mod:`~teb_vae.lag_attn.nets.lag_report` and
+#: :data:`~teb_vae.lag_attn_cfs.causal_warmup.ALIGNMENT_DELAY_FACTOR` rather than typed, so the
+#: caption and the function a consumer would evaluate it with cannot state two different constants.
 LAG_TIME_CAVEAT = (
     f"Lag axes are stored-coefficient time on the input side, not physical delay: the raw target "
     f"carries no group delay, so $\\tau^y \\equiv 0$ and the anchor is exact, while a causal input "
     f"coefficient lags by its own composed group delay (13-791 s as declared). Aligned onto one "
     f"source reference $\\tau^u_{{\\mathrm{{ref}}}}$ -- the run's own, logged as "
     f"source_reference_delay_s -- that bias is a single constant, and a peak at lag $\\ell$, "
-    f"horizon element $h$, is a physical lead time of "
-    f"${SECONDS_PER_STEP:.0f}(\\ell + 1 + h) + \\tau^u_{{\\mathrm{{ref}}}} - "
-    f"{MECHANICAL_SHIFT_SECONDS:.0f}$ s, the $-{MECHANICAL_SHIFT_SECONDS:.0f}$ s being the "
-    f"acquisition shift preprocessing already removed from the source trace. The correction is "
+    f"horizon element $h$, is an approximate content lead time of "
+    f"${SECONDS_PER_STEP:.0f}(\\ell + 1 + h) + \\kappa\\tau^u_{{\\mathrm{{ref}}}}$ s with "
+    f"$\\kappa={ALIGNMENT_DELAY_FACTOR:g}$, on the stored timeline as recorded. The correction is "
     f"one-sided here: there is no target-side $\\tau^y$ term to subtract. Unaligned, "
     f"$\\tau^u_{{\\mathrm{{ref}}}}$ is replaced by each channel's own $\\tau^u_c$ and no single "
     f"number labels the axis."

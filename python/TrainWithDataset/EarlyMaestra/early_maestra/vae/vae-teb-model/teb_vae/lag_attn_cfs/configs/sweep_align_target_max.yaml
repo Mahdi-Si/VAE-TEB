@@ -1,18 +1,8 @@
-# Alignment arm: ONE clock for both streams, which is what this family shipped before the source
-# gained a reference of its own.
-#
-# The default puts the target on 402.1604 s and the source on 288.2672 s, so the two streams read
-# on different clocks separated by a known -113.8932 s. This arm sets the source key to null, which
-# restores the single-reference resolution byte for byte -- every source channel at or below
-# 402.1604 s kept (47 of 51, all fifteen `up_ph`), no inter-stream offset on the lag axis.
-#
-# WHAT IT MEASURES. The dual reference buys a readable lag window and pays for it in source
-# channels: at 288.2672 s the envelope block goes 15 -> 9 and the whole source stream 47 -> 39. This
-# arm is what prices that trade on a trained run rather than on the geometry alone. The
-# pre-registered reading is unchanged from the alignment work: an alignment arm should NOT improve
-# `pred_gap`, and SHOULD improve lag-profile concentration if a real lag exists -- read on the
-# per-head profiles and the shape vocabulary rather than on the pooled argmax, which the lag
-# window's near censoring edge pins at 0 on every arm this family has measured.
+# Input-alignment arm: every input channel delayed onto the slowest kept target channel's clock
+# (target_max = 402.16 s), on BOTH streams -- the single-reference scheme. Against the promoted
+# default, which reads every channel at its own availability time, this is the arm that asks what
+# imposing one approximate input clock costs or buys: it withholds up to 340 s of the fastest
+# channels' trajectories from the encoder and drops the source channels above the reference.
 #
 #   TEB_RUN_STAMP="$(date '+%Y-%m-%d--[%H-%M]')" torchrun --nproc_per_node=7 \
 #       -m teb_vae.lag_attn_cfs.trainer --config teb_vae/lag_attn_cfs/configs/sweep_align_target_max.yaml
@@ -20,7 +10,7 @@ base: default.yaml
 
 model_config:
   VAE_model:
-    causal_align_reference_source: null
+    causal_align_reference: target_max
 
 advanced_config:
   tracking:

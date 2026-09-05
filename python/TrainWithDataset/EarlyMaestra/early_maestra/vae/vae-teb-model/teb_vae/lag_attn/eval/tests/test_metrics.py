@@ -574,43 +574,32 @@ def test_latent_health_reports_nan_for_a_readout_the_forward_did_not_carry() -> 
 # ---------------------------------------------------------------------------
 # Lag conversion
 # ---------------------------------------------------------------------------
-def test_lag_to_seconds_defaults_to_the_axis_the_training_plots_draw() -> None:
-    r"""$4\ell$ with no offset -- what ``plotting.py`` has always produced."""
+def test_lag_to_seconds_is_the_stored_timeline_with_no_shift_term() -> None:
+    r"""$4\ell$ and nothing else: the stored timeline is canonical.
+
+    The dataset builder's UP shift is part of the stored signal, so no lag quantity adds it back
+    or subtracts it. The removed ``up_shift_secs`` keyword is refused, so a caller that tried to
+    reintroduce the term fails here rather than drawing a shifted axis.
+    """
     assert metrics.lag_to_seconds(0) == pytest.approx(0.0)
     assert metrics.lag_to_seconds(10) == pytest.approx(40.0)
-
-
-def test_lag_to_seconds_carries_the_datasets_up_advance() -> None:
-    r"""With $\Delta_{UP} = -20$ s a peak at lag $\ell$ reads as $4(\ell - 5)$ s.
-
-    The dataset ADVANCED the uterine-pressure trace by $20$ s -- ``mimo_adaptor.py`` runs
-    ``up_shifted[:-80] = up_signal[80:]`` -- so stored position $g$ holds what the sensor recorded
-    at $g + 20$ s. Attention at anchor $t$ reading source $t - \ell$ therefore compares fetal
-    heart rate at $4t$ against uterine activity recorded at $4(t-\ell) + 20$: a lead of
-    $4\ell - 20$ s, which is **negative** for the first five lags.
-
-    This asserted $+20 / +60 / 4(90+5)$ until the sign was corrected. That is the same arithmetic
-    the function had, so the test could not have caught it -- it is pinned here in the corrected
-    direction precisely so a revert fails.
-    """
-    assert metrics.lag_to_seconds(0, up_shift_secs=-20.0) == pytest.approx(-20.0)
-    assert metrics.lag_to_seconds(5, up_shift_secs=-20.0) == pytest.approx(0.0)
-    assert metrics.lag_to_seconds(10, up_shift_secs=-20.0) == pytest.approx(20.0)
-    assert metrics.lag_to_seconds(90, up_shift_secs=-20.0) == pytest.approx(4.0 * (90 - 5))
+    assert metrics.lag_to_seconds(90) == pytest.approx(360.0)
+    with pytest.raises(TypeError):
+        metrics.lag_to_seconds(5, up_shift_secs=-20.0)  # type: ignore[call-arg]
 
 
 def test_lag_to_seconds_maps_an_array_elementwise() -> None:
     """A figure converts a whole axis at once."""
     lags = np.arange(4)
-    seconds = metrics.lag_to_seconds(lags, up_shift_secs=-20.0)
-    assert seconds.tolist() == pytest.approx([-20.0, -16.0, -12.0, -8.0])
+    seconds = metrics.lag_to_seconds(lags)
+    assert seconds.tolist() == pytest.approx([0.0, 4.0, 8.0, 12.0])
 
 
 def test_lag_seconds_physical_returns_a_float_column_from_a_tensor() -> None:
     """Its consumers are a DataFrame column and a matplotlib axis; neither takes a tensor."""
-    seconds = metrics.lag_seconds_physical(torch.arange(3), up_shift_secs=-20.0)
+    seconds = metrics.lag_seconds_physical(torch.arange(3))
     assert isinstance(seconds, np.ndarray) and seconds.dtype == np.float64
-    assert seconds.tolist() == pytest.approx([-20.0, -16.0, -12.0])
+    assert seconds.tolist() == pytest.approx([0.0, 4.0, 8.0])
 
 
 # ---------------------------------------------------------------------------

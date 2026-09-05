@@ -157,7 +157,8 @@ from teb_vae.lag_attn_cfs.tests.conftest import (  # noqa: E402,F401
 #: reference out of the physical-lag identity
 #: $\tau_{\mathrm{phys}}(\ell,h) = \Delta(\ell+1+h) + \kappa\tau_{\mathrm{ref}} - 20$ s, which is
 #: minimised at $\ell = h = 0$ and grows with the lag -- so at ``target_max`` the smallest expressible
-#: lead is $335.9$ s and the $20$-$120$ s coupling band is off the axis at every lag index.
+#: lead is $355.9$ s (canonical stored timeline, no dataset-shift term) and the $20$-$120$ s
+#: coupling band is off the axis at every lag index.
 #:
 #: Wrapping the sibling's builder rather than editing it keeps "no edit to any existing package"
 #: true; wrapping it rather than passing the override at each call site is what makes this suite

@@ -124,18 +124,33 @@ SOURCE_PHASE_BAND_HZ = (0.008, 0.05)
 #: concentrated enough to be a usable band-pass, low enough that $\tau_g = n/(2\pi b)$ stays finite.
 GAMMATONE_ORDER = 4
 
-#: Fraction of $\tau_g$ a channel's content actually sits at: $1 - 1/(2\gamma) = 0.875$ at
-#: :data:`GAMMATONE_ORDER`. :attr:`CausalBank.group_delay_samples` ships the phase group delay
-#: $\tau_g = \gamma/(2\pi b)$, the envelope's *mean*, which is the right number to REPORT as a
-#: channel's staleness. It is not the right number to ALIGN on: the realised lag is the
-#: spectrum-weighted average group delay, equivalently the impulse response's energy centroid
-#: $(2\gamma-1)/(4\pi b)$, because $\tau_g(\nu) = \tau_g(\xi)\,b^2/(b^2+(\nu-\xi)^2)$ is *maximal*
-#: at the centre frequency and a channel's own passband can therefore only pull the realised lag
-#: down. The spread is one-sided and does not average out. Measured over 30 segments of the aligned
-#: shard, causal ``fhr_st`` against the centred block: median realised/reported $0.903$ over all 30
-#: resolved channels, $0.882$ over the nine slow ones where the $4$ s grid quantises by under
-#: $2.5\%$ -- against $0.875$ predicted here and $1.000$ predicted by $\tau_g$.
+#: The CONVENTION for where a channel's content is taken to sit, as a fraction of $\tau_g$:
+#: $1 - 1/(2\gamma) = 0.875$ at :data:`GAMMATONE_ORDER`, the impulse response's energy centroid
+#: $(2\gamma-1)/(4\pi b)$ against the phase group delay $\tau_g = \gamma/(2\pi b)$ (the
+#: envelope's mean). :attr:`CausalBank.group_delay_samples` ships $\tau_g$, the number to REPORT
+#: as a channel's staleness; the alignment shift and the forecast clock scale differences by this
+#: factor.
+#:
+#: **It is a convention, not a universal content delay** (2026-09-05 review, CFS-05). Which
+#: summary a filtered signal realises depends on the signal: a steady ramp through the actual
+#: low-pass is delayed by the tap-weighted MEAN ($13.30$ s, not the centroid's $11.64$ s), and a
+#: $1/8000$ Hz amplitude modulation through the slow wavelet and low-pass is delayed by
+#: $401.4$ s -- the full composed group delay $402.16$ s, $49.5$ s later than $\kappa\tau_g$
+#: predicts. Both are pinned in ``tests/test_phase_operator.py``. The earlier justification
+#: (the passband can only pull the realised lag down; a median realised/reported ratio of
+#: $0.903$ over 30 aligned-shard segments) describes an empirical average over particular
+#: real-data content and does not establish the factor for every channel or every input.
+#: Consumers must state it as an approximate content-delay summary and never as an exact
+#: physiological timestamp; calibrating it against measured probes is CFS-05's open item.
 ALIGNMENT_DELAY_FACTOR = 1.0 - 1.0 / (2.0 * GAMMATONE_ORDER)
+
+#: Forecast horizon, in decimated steps, at which LEGACY shards' ``causal_novelty_frac`` attribute
+#: was written, on the stored clock with no per-channel advance. No current build writes that
+#: attribute: a shard now stores the horizon-free ``causal_novelty_curve`` (:func:`novelty_curve`)
+#: and the model side looks its own horizon and clock up in it, because a forecast horizon is a
+#: model-side choice and a dataset must not bake one in. Kept so a consumer of an old shard can
+#: name the gather its scalar was computed for (CFS-08).
+LEGACY_NOVELTY_HORIZON_STEPS = 30
 
 #: Causal kernel length in taps. Measured requirement, not a guess: at the corrected rate
 #: $b = 1.914\,\sigma$ the slowest kernel retains only $70.7\%$ of its $L^1$ mass inside $2^{13}$
@@ -147,6 +162,139 @@ CAUSAL_KERNEL_TAPS = 1 << 15
 #: Harmonic steps and tolerance of the stored phase selections, as the shard writer sets them.
 PHASE_K_STEPS = (4, 6, 8)
 PHASE_REL_TOL = 0.05
+
+#: The two phase-harmonic OPERATOR versions a shard can be built with, recorded on every causal
+#: file as ``causal_phase_operator`` and on every phase block as ``sel_phase_operator``.
+#:
+#: ``'ratio_power_v0'`` is every shard on disk: $[y]^p = |y| e^{i p \operatorname{Arg} y}$ with
+#: $p = \xi_j/\xi_i$ taken as the *floating-point ratio*, so the $k = 6$ family carries
+#: $p = 2^{3/2}$. For non-integer $p$ that operator is **discontinuous** across the principal-angle
+#: branch: two inputs $re^{i(\pi-\epsilon)}$ and $re^{i(-\pi+\epsilon)}$ converge to one complex
+#: number as $\epsilon \to 0$ while their images stay $2r|\sin(\pi p)| \approx 1.03r$ apart at
+#: $p = 2^{3/2}$. Forming the power in polar coordinates avoids exponentiating the modulus; it
+#: does nothing for the angle, so the 2026-09-05 review's finding stands and the legacy operator
+#: is retained ONLY so existing shards, statistics and checkpoints keep their original meaning.
+#:
+#: ``'integer_harmonic_v1'`` is the corrected operator: the harmonic index $k \in \{2, 4\}$ is an
+#: explicit **integer** stored per pair (``sel_harmonic``), the exponent is that integer, and the
+#: $k = 6$ family is dropped -- $44$ ``fhr_ph`` and $10$ ``up_ph`` pairs at the production band
+#: edges. $|y|e^{ik\operatorname{Arg}y} = |y|^{1-k} y^k$ is continuous for integer $k$, which is
+#: the property the phase-harmonic construction (Zhang & Mallat) actually establishes. A future
+#: integer $k = 3$ or $(m, n)$ family is a separate version, not a relaxation of this one.
+PHASE_OPERATOR_LEGACY = "ratio_power_v0"
+PHASE_OPERATOR_INTEGER = "integer_harmonic_v1"
+PHASE_OPERATORS = (PHASE_OPERATOR_LEGACY, PHASE_OPERATOR_INTEGER)
+
+#: Harmonic steps admitted under the integer operator: $p = 2^{k/Q}$ at $k \in \{4, 8\}$, i.e.
+#: the integer harmonics $2$ and $4$. The $k = 6$ ($p = 2^{3/2}$) family is excluded by design.
+PHASE_K_STEPS_INTEGER = (4, 8)
+
+
+def validate_phase_operator(phase_operator: str) -> str:
+    """Refuse an unknown phase-operator version, naming both that ship.
+
+    Args:
+        phase_operator: The requested version.
+
+    Returns:
+        The version, unchanged, so this can wrap an assignment.
+
+    Raises:
+        ValueError: If it is not one of :data:`PHASE_OPERATORS`.
+    """
+    if phase_operator not in PHASE_OPERATORS:
+        raise ValueError(
+            f"unknown phase_operator {phase_operator!r}; use {PHASE_OPERATOR_LEGACY!r} for the "
+            f"stored ratio-power operator every shard on disk was built with, or "
+            f"{PHASE_OPERATOR_INTEGER!r} for the corrected integer-harmonic operator"
+        )
+    return phase_operator
+
+
+def phase_k_steps_for(phase_operator: str) -> Tuple[int, ...]:
+    """The harmonic steps a phase selection admits under one operator version.
+
+    Args:
+        phase_operator: One of :data:`PHASE_OPERATORS`.
+
+    Returns:
+        :data:`PHASE_K_STEPS` for the legacy operator, :data:`PHASE_K_STEPS_INTEGER` for the
+        integer one.
+
+    Raises:
+        ValueError: On an unknown version.
+    """
+    validate_phase_operator(phase_operator)
+    return PHASE_K_STEPS if phase_operator == PHASE_OPERATOR_LEGACY else PHASE_K_STEPS_INTEGER
+
+
+def harmonic_index(
+    pairs: np.ndarray, xi: np.ndarray, *, rel_tol: float = PHASE_REL_TOL
+) -> np.ndarray:
+    r"""The integer harmonic $k$ of each pair, refusing any pair whose ratio is not near an integer.
+
+    $$k_{ij} = \operatorname{round}(\xi_j/\xi_i), \qquad
+      \bigl|\xi_j/\xi_i - k_{ij}\bigr| < \mathrm{rel\_tol}\cdot k_{ij}, \quad k_{ij} \ge 2 .$$
+
+    The index is derived once and stored as an integer; the operator then uses the stored
+    integer rather than recomputing a floating-point ratio, so a rounding of the bank cannot
+    silently turn an integer harmonic back into a fractional power.
+
+    Args:
+        pairs: ``(n_pairs, 2)`` of $(i, j)$, column $0$ indexing the lower frequency.
+        xi: Centre frequencies in cycles per sample, indexed by filter.
+        rel_tol: Relative tolerance on the integer match -- the selection's own.
+
+    Returns:
+        ``(n_pairs,)`` ``int64`` harmonic indices.
+
+    Raises:
+        ValueError: If any pair's ratio is not within tolerance of an integer $\ge 2$, naming the
+            first offender and its ratio.
+    """
+    index = np.asarray(pairs, dtype=int).reshape(-1, 2)
+    ratio = np.asarray(xi, dtype=np.float64)[index[:, 1]] / np.asarray(xi, dtype=np.float64)[index[:, 0]]
+    k = np.rint(ratio).astype(np.int64)
+    bad = np.flatnonzero((k < 2) | (np.abs(ratio - k) >= rel_tol * np.maximum(k, 1)))
+    if bad.size:
+        row = int(bad[0])
+        raise ValueError(
+            f"phase pair {row} = ({int(index[row, 0])}, {int(index[row, 1])}) has ratio "
+            f"{float(ratio[row]):.6f}, which is not within {rel_tol:g} of an integer harmonic "
+            f">= 2 ({bad.size} of {index.shape[0]} pairs are). The integer operator refuses a "
+            f"fractional exponent rather than silently reintroducing the branch discontinuity."
+        )
+    return k
+
+
+def resolve_phase_power(
+    pairs: np.ndarray, xi: np.ndarray, phase_operator: str = PHASE_OPERATOR_LEGACY
+) -> np.ndarray:
+    r"""The exponent $p_{ij}$ each pair's accelerated leg is raised to, under one operator version.
+
+    One resolution shared by the numpy chain and its torch twin, exactly as
+    :func:`resolve_leg_alignment` is, so the two implementations cannot disagree about what
+    exponent a pair carries.
+
+    Args:
+        pairs: ``(n_pairs, 2)`` of $(i, j)$, column $0$ indexing the lower frequency.
+        xi: Centre frequencies in cycles per sample, indexed by filter.
+        phase_operator: One of :data:`PHASE_OPERATORS`.
+
+    Returns:
+        ``(n_pairs,)`` ``float64``: the raw ratio $\xi_j/\xi_i$ under the legacy operator, the
+        integer harmonic (as a float, exactly representable) under the integer one.
+
+    Raises:
+        ValueError: On an unknown version, or -- under the integer operator -- on a pair whose
+            ratio is not an integer harmonic.
+    """
+    validate_phase_operator(phase_operator)
+    index = np.asarray(pairs, dtype=int).reshape(-1, 2)
+    if phase_operator == PHASE_OPERATOR_INTEGER:
+        return harmonic_index(index, xi).astype(np.float64)
+    xi = np.asarray(xi, dtype=np.float64)
+    return xi[index[:, 1]] / xi[index[:, 0]]
 
 #: Energy fraction a causal kernel's leading taps must enclose for its output to be counted as a
 #: function of the recording rather than of the assumed pre-recording history. Defined once and
@@ -1218,14 +1366,22 @@ def phase_products(
     xi: np.ndarray,
     *,
     leg_shift: Optional[Tuple[np.ndarray, np.ndarray]] = None,
+    phase_operator: str = PHASE_OPERATOR_LEGACY,
 ) -> np.ndarray:
     r"""The un-smoothed phase-harmonic products $[y_i]^{p_{ij}}\,\overline{y_j}$.
 
-    $$[y]^p = |y|\,e^{\,i p \arg y}, \qquad p_{ij} = \xi_j/\xi_i \ge 1,$$
+    $$[y]^p = |y|\,e^{\,i p \operatorname{Arg} y},$$
 
-    magnitude to the **first** power, so $\big|[y_i]^p \overline{y_j}\big| = |y_i||y_j|$. Formed in
-    polar coordinates, exactly as ``_accelerate_phase`` does, to avoid the branch cut a complex
-    power would cross.
+    magnitude to the **first** power, so $\big|[y_i]^p \overline{y_j}\big| = |y_i||y_j|$. The
+    exponent comes from :func:`resolve_phase_power`: the floating-point ratio $\xi_j/\xi_i$ under
+    the legacy operator, the stored integer harmonic under the corrected one.
+
+    **Polar construction avoids exponentiating the modulus; it does not remove the branch
+    discontinuity.** $\operatorname{Arg}$ jumps by $2\pi$ across the negative real axis, so for a
+    non-integer $p$ the image jumps by $2|y|\,|\sin \pi p|$ there -- $1.03|y|$ at the legacy
+    $p = 2^{3/2}$ -- while for an integer $p$ the jump is $2\pi p$, i.e. nothing. This is the
+    defect the integer operator exists to remove; the legacy branch is kept only so shards already
+    on disk keep their meaning.
 
     Split out from the smoothing so the two ``phi_mode`` variants operate on one identical product
     -- which is what makes their ratio a measurement of the smoothing operator alone.
@@ -1235,6 +1391,7 @@ def phase_products(
         responses_high: ``(n_filters, n_signal)``, supplying the conjugated leg $y_j$.
         pairs: ``(n_pairs, 2)`` of $(i, j)$, $i$ indexing the lower frequency.
         xi: Centre frequencies in cycles per sample.
+        phase_operator: One of :data:`PHASE_OPERATORS`; decides the exponent per pair.
         leg_shift: ``None`` for the unaligned product, or the ``(shift, phasor)`` pair
             :func:`leg_alignment_shift` returns, which delays the conjugated leg onto the slow
             leg's clock. Applied **after** the per-pair gather below, which is the only correct
@@ -1248,10 +1405,11 @@ def phase_products(
         ``(n_pairs, n_signal)``, complex.
 
     Raises:
-        ValueError: If *leg_shift*'s two vectors do not carry one entry per pair.
+        ValueError: If *leg_shift*'s two vectors do not carry one entry per pair, or on an
+            unknown operator, or on a fractional pair under the integer operator.
     """
     index_low, index_high = pairs[:, 0], pairs[:, 1]
-    power = (xi[index_high] / xi[index_low])[:, None]
+    power = resolve_phase_power(pairs, xi, phase_operator)[:, None]
     y_low = responses_low[index_low]
     accelerated = np.abs(y_low) * np.exp(1j * power * np.angle(y_low))
 
@@ -1385,6 +1543,7 @@ def phase_block_causal(
     decimation: int = DECIMATION,
     pad: str = "edge",
     leg_alignment: str = "none",
+    phase_operator: str = PHASE_OPERATOR_LEGACY,
 ) -> np.ndarray:
     r"""Phase-harmonic correlations on a causal bank -- arm C.
 
@@ -1393,12 +1552,12 @@ def phase_block_causal(
     transplanting production's deviation onto a causal chain would silently reintroduce future
     dependence.
 
-    **The default is ``'none'``, and that is a compatibility decision rather than a preference.**
-    :func:`transform_sample` and the torch twin's batch entry point call this with no mode
-    argument, and the committed causal fixture's blocks are rebuilt through that path and diffed
-    against the stored bytes. A default of ``'envelope'`` would therefore turn a shared contract
-    test red, and would let an ad hoc build produce aligned data carrying no attribute that says
-    so. The writer passes the mode explicitly.
+    **The defaults are ``'none'`` and the legacy operator, and that is a compatibility decision
+    rather than a preference.** :func:`transform_sample` and the torch twin's batch entry point
+    call this with no mode argument, and the committed causal fixture's blocks are rebuilt through
+    that path and diffed against the stored bytes. A default of ``'envelope'`` or of the integer
+    operator would therefore turn a shared contract test red, and would let an ad hoc build produce
+    data carrying no attribute that says how it was built. The writer passes both explicitly.
 
     Note:
         A pair's warm-up is set by its **slower** leg, and its delay compounds both legs plus the
@@ -1417,23 +1576,28 @@ def phase_block_causal(
         leg_alignment: ``'none'`` to multiply the legs at one stored index, as every shard on disk
             was built, or ``'envelope'`` to put them on one clock first. See
             :data:`LEG_ALIGNMENT_MODES`.
+        phase_operator: One of :data:`PHASE_OPERATORS`. The pair list must have been selected
+            under the same version -- the integer operator refuses a fractional pair by name.
 
     Returns:
         ``(n_pairs, n_signal // decimation)``, real.
 
     Raises:
-        ValueError: On an unknown *leg_alignment*.
+        ValueError: On an unknown *leg_alignment* or *phase_operator*, or on a pair list the
+            operator refuses.
     """
     # Resolved before the early return and before any convolution, so an unknown mode is refused
     # whatever the pair list holds and without paying for the chain first.
     leg_shift = resolve_leg_alignment(bank, pairs, leg_alignment)
+    validate_phase_operator(phase_operator)
     if len(pairs) == 0:
         return np.zeros((0, int(x_low.shape[-1]) // decimation))
 
     responses_low = causal_convolve(x_low, bank.psi, pad=pad)
     responses_high = responses_low if x_high is x_low else causal_convolve(x_high, bank.psi, pad=pad)
     products = phase_products(
-        responses_low, responses_high, pairs, bank.xi, leg_shift=leg_shift
+        responses_low, responses_high, pairs, bank.xi,
+        leg_shift=leg_shift, phase_operator=phase_operator,
     )
     smoothed = causal_smooth(products, bank.phi, pad=pad)
     return smoothed.real[:, ::decimation]
@@ -1691,40 +1855,38 @@ def channel_alignment_delays(
     ).astype(np.int64)
 
 
-def novelty_fraction(
+def novelty_curve(
     bank: CausalBank,
     plan: Dict[str, CausalChannelPlan],
     target_pairs: np.ndarray,
     source_pairs: np.ndarray,
-    horizon_steps: int,
+    max_window_steps: int,
     *,
     decimation: int = DECIMATION,
 ) -> Dict[str, np.ndarray]:
-    r"""Share of each stored channel drawn from raw samples an anchor has not yet seen.
+    r"""Cumulative envelope-mass curve per stored channel, on the decimated grid.
 
-    A target coefficient stamped at $\Delta(t + 1 + h)$ is a weighted average over the past of
-    *that* instant, and the group delay puts most of that weight before the anchor at $\Delta t$.
-    With composed envelope $g_c = \lvert\psi_k\rvert \star \phi$,
+    **What it is.** With composed envelope $g_c = \lvert\psi_k\rvert \star \phi$ (the low-pass
+    alone for $S_0$; the slow leg's envelope for a phase pair),
 
-    $$\nu_c(h) \;=\; \frac{\int_0^{\Delta(1+h)} g_c(\tau)\,\mathrm d\tau}
-                          {\int_0^{\infty} g_c(\tau)\,\mathrm d\tau}$$
+    $$N_c(w) \;=\; \frac{\int_0^{\Delta w} g_c(\tau)\,\mathrm d\tau}
+                        {\int_0^{\infty} g_c(\tau)\,\mathrm d\tau},
+    \qquad w = 0, \ldots, W,$$
 
-    is the share of it that is genuinely new. This is **not** a leak -- every one of those
-    coefficients still depends on raw samples after the anchor, so the forecast claim is exact.
-    What it says is that the effective forecast horizon is **per channel**: the slowest kept
-    target channel draws $2.6\%$ of its value from the two minutes it is being asked to predict,
-    while a fast channel draws all of it. A block score summed over both mixes two different
-    claims, which is why the number is stored rather than assumed uniform.
+    is the share of the envelope's mass that lies within $w$ stored steps of a coefficient's own
+    timestamp. It is a property of the filter bank alone: no forecast horizon, no target clock and
+    no label advance enters it, which is why it is what a shard stores (``causal_novelty_curve``)
+    and why a model may choose its horizon and clock afterwards. A label scored at stored step
+    $t + 1 + h + s_c$ from anchor $t$ draws $N_c(1 + h + s_c)$ of its envelope mass from samples
+    after the anchor; :func:`novelty_fraction` is that lookup at the last horizon element.
 
-    **Phase channels take the slower leg.** A phase coefficient's sensitivity is a mixture of both
-    legs' envelopes, weighted by a product this function does not model; the slow leg's fraction
-    is the smaller of the two, so reporting it is the conservative choice and cannot overstate how
-    much of a channel is forecast. Column $0$ of a pair list is the slow leg by construction.
-
-    $S_0$ is $\phi$ alone -- no wavelet, no modulus -- so its composed envelope is the low-pass
-    itself. The scattering composition is written out here rather than delegated to
-    :func:`_compose_scattering`, which *adds* the low-pass term and is right for a support or a
-    delay but not for a fraction.
+    **What it is not** (2026-09-05 review, CFS-08). Not an exact decomposition of a nonlinear
+    coefficient into "known" and "new" value fractions -- the modulus and the phase product are
+    nonlinear in the raw samples, so envelope mass bounds sensitivity only up to the amplitude and
+    cancellation of the actual signal -- and not a measured prediction error. For a phase channel
+    only the slow leg's envelope is used; the coefficient's sensitivity depends on both legs, their
+    amplitudes, their leg-alignment shifts and the smoothing, so the slow-leg curve is a convention
+    rather than a universal conservative bound. Column $0$ of a pair list is the slow leg.
 
     The convolution is done by FFT: the two kernels are $2^{15}$ taps each and a direct
     convolution of $42$ such pairs takes minutes.
@@ -1739,23 +1901,21 @@ def novelty_fraction(
         plan: The stored channel plan, one entry per block of :data:`CAUSAL_BLOCKS`.
         target_pairs: ``(n_pairs, 2)`` phase pairs for ``fhr_ph``, in stored channel order.
         source_pairs: ``(n_pairs, 2)`` phase pairs for ``up_ph``.
-        horizon_steps: Forecast horizon $H$ in decimated steps; the window is
-            ``horizon_steps * decimation`` raw samples.
+        max_window_steps: $W$, the largest window in decimated steps the curve is tabulated to.
+            A shard tabulates its stored segment length, since no label can sit further from an
+            anchor than that; beyond the kernel's own reach the curve is simply $1$.
         decimation: Raw samples per stored step.
 
     Returns:
-        ``{block: (C,) float64}`` in the unit interval, on the stored channel axis.
+        ``{block: (C, W + 1) float64}`` on the stored channel axis, non-decreasing in $w$ from
+        $N_c(0) = 0$, inside the unit interval.
 
     Raises:
-        ValueError: If *horizon_steps* is not positive, which would make the fraction meaningless
-            rather than merely small.
+        ValueError: If *max_window_steps* is negative.
     """
-    if int(horizon_steps) <= 0:
-        raise ValueError(
-            f"horizon_steps must be positive, got {horizon_steps}. A zero-length horizon has no "
-            f"novel samples in it by definition, which measures nothing about the bank."
-        )
-    horizon_samples = int(horizon_steps) * int(decimation)
+    if int(max_window_steps) < 0:
+        raise ValueError(f"max_window_steps must be >= 0, got {max_window_steps}")
+    n_windows = int(max_window_steps) + 1
 
     # Linear (not circular) convolution of every wavelet modulus with the low-pass: the FFT is
     # taken at the next power of two above the 2n-1 output length, so nothing wraps around into
@@ -1765,20 +1925,114 @@ def novelty_fraction(
     spectrum = np.fft.rfft(np.abs(bank.psi), n=size, axis=-1) * np.fft.rfft(bank.phi, n=size)
     composed = np.fft.irfft(spectrum, n=size, axis=-1)[:, : 2 * n_taps - 1]
     # Both factors are non-negative, so the true convolution is; anything below zero is FFT
-    # round-off, and clipping it keeps the cumulative fraction inside [0, 1] and non-decreasing.
+    # round-off, and clipping it keeps the cumulative share inside [0, 1] and non-decreasing.
     composed = np.maximum(composed, 0.0)
 
-    per_filter = composed[:, :horizon_samples].sum(axis=-1) / composed.sum(axis=-1)
-    low_pass = float(bank.phi[:horizon_samples].sum() / bank.phi.sum())
+    def cumulative_share(envelope: np.ndarray) -> np.ndarray:
+        # Share of the envelope's mass within w decimated steps, w = 0..W; a window past the
+        # kernel's end holds all of it.
+        cumulative = np.concatenate([[0.0], np.cumsum(envelope)]) / float(envelope.sum())
+        sample_index = np.minimum(np.arange(n_windows) * int(decimation), envelope.size)
+        return np.clip(cumulative[sample_index], 0.0, 1.0)
 
-    scattering = np.concatenate([[low_pass], per_filter])
-    per_block = {
-        "fhr_st": scattering,
-        "up_st": scattering,
-        "fhr_ph": per_filter[np.asarray(target_pairs, dtype=int).reshape(-1, 2)[:, 0]],
-        "up_ph": per_filter[np.asarray(source_pairs, dtype=int).reshape(-1, 2)[:, 0]],
+    # Row -1 is the low-pass alone, which is what S_0 is: no wavelet, no modulus.
+    per_filter = np.stack(
+        [cumulative_share(bank.phi)] + [cumulative_share(row) for row in composed], axis=0
+    )
+
+    # The filter each STORED channel of each block reads its envelope from: a scattering block
+    # stores S_0 at channel 0 (row 0 here) and filter k at channel k + 1; a phase channel takes
+    # its slow leg, column 0 of the pair list (row k + 1).
+    n_filters = int(composed.shape[0])
+    stored_row = {
+        "fhr_st": np.arange(0, n_filters + 1),
+        "up_st": np.arange(0, n_filters + 1),
+        "fhr_ph": np.asarray(target_pairs, dtype=int).reshape(-1, 2)[:, 0] + 1,
+        "up_ph": np.asarray(source_pairs, dtype=int).reshape(-1, 2)[:, 0] + 1,
     }
-    return {name: per_block[name][plan[name].kept] for name in CAUSAL_BLOCKS}
+    return {
+        name: per_filter[stored_row[name][plan[name].kept]].astype(np.float64)
+        for name in CAUSAL_BLOCKS
+    }
+
+
+def novelty_fraction(
+    bank: CausalBank,
+    plan: Dict[str, CausalChannelPlan],
+    target_pairs: np.ndarray,
+    source_pairs: np.ndarray,
+    horizon_steps: int,
+    *,
+    decimation: int = DECIMATION,
+    advance_steps: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, np.ndarray]:
+    r"""Envelope-mass share after the anchor at the last horizon element, per stored channel.
+
+    The lookup $\nu_c = N_c(H + s_c)$ into :func:`novelty_curve`, where $H$ is ``horizon_steps``
+    and $s_c$ the per-channel label advance (``advance_steps``; $0$ on the stored clock): the
+    window between the anchor and the last scored label, $t + H + s_c$. Everything the curve is
+    and is not applies here unchanged; see :func:`novelty_curve`.
+
+    Legacy shards carry this number as the attribute ``causal_novelty_frac``, written at
+    :data:`LEGACY_NOVELTY_HORIZON_STEPS` on the stored clock. Current builds store the curve
+    instead, so the model side takes its own horizon and clock into the lookup rather than reading
+    a number computed for another gather.
+
+    Args:
+        bank: The causal bank the plan was built from.
+        plan: The stored channel plan, one entry per block of :data:`CAUSAL_BLOCKS`.
+        target_pairs: ``(n_pairs, 2)`` phase pairs for ``fhr_ph``, in stored channel order.
+        source_pairs: ``(n_pairs, 2)`` phase pairs for ``up_ph``.
+        horizon_steps: Forecast horizon $H$ in decimated steps; the window is
+            ``(horizon_steps + advance) * decimation`` raw samples per channel.
+        decimation: Raw samples per stored step.
+        advance_steps: Optional ``{block: (C_kept,) int}`` per-channel label advance $s_c \ge 0$ in
+            decimated steps, on the block's **kept** axis (the axis this function returns on), for
+            the actual target gather $t + 1 + h + s_c$. ``None`` is the stored clock, $s_c = 0$ for
+            every channel. A block absent from the mapping reads as unadvanced.
+
+    Returns:
+        ``{block: (C,) float64}`` in the unit interval, on the stored channel axis.
+
+    Raises:
+        ValueError: If *horizon_steps* is not positive, which would make the fraction meaningless
+            rather than merely small; if an advance vector is negative or not of its block's kept
+            width, which would silently attribute one channel's window to another.
+    """
+    if int(horizon_steps) <= 0:
+        raise ValueError(
+            f"horizon_steps must be positive, got {horizon_steps}. A zero-length horizon has no "
+            f"novel samples in it by definition, which measures nothing about the bank."
+        )
+    # One validated advance vector per block, on the kept axis, before any kernel is touched.
+    advances: Dict[str, np.ndarray] = {}
+    for name in CAUSAL_BLOCKS:
+        kept_width = int(plan[name].n_channels)
+        if advance_steps is None or name not in advance_steps:
+            advances[name] = np.zeros(kept_width, dtype=int)
+            continue
+        vector = np.asarray(advance_steps[name], dtype=int).reshape(-1)
+        if vector.shape != (kept_width,):
+            raise ValueError(
+                f"advance_steps['{name}'] has {vector.size} entries but the block keeps "
+                f"{kept_width} channels; the advance is per KEPT channel, positional against the "
+                f"returned axis."
+            )
+        if (vector < 0).any():
+            raise ValueError(
+                f"advance_steps['{name}'] must be >= 0 (a label read before the anchor is not a "
+                f"forecast), got minimum {int(vector.min())}."
+            )
+        advances[name] = vector
+
+    max_window = int(horizon_steps) + max(int(vector.max(initial=0)) for vector in advances.values())
+    curve = novelty_curve(
+        bank, plan, target_pairs, source_pairs, max_window, decimation=decimation
+    )
+    return {
+        name: curve[name][np.arange(curve[name].shape[0]), int(horizon_steps) + advances[name]]
+        for name in CAUSAL_BLOCKS
+    }
 
 
 # =================================================================================================
@@ -1787,23 +2041,29 @@ def novelty_fraction(
 def selected_pairs(
     band_hz: Tuple[float, float],
     reference: Optional[FilterBank] = None,
+    phase_operator: str = PHASE_OPERATOR_LEGACY,
 ) -> np.ndarray:
     r"""Phase-harmonic pair selection for a stored band, in the stored channel order.
 
     Delegates to :func:`select_phase_pairs` rather than restating the rule, so the two callers of
     a selection -- the measurement code here and the shard verification in
-    :func:`assert_matches_shard` -- cannot drift apart on what channel $c$ means.
+    :func:`assert_matches_shard` -- cannot drift apart on what channel $c$ means. The harmonic
+    steps come from :func:`phase_k_steps_for`, so the operator version and the selection it admits
+    are one decision.
 
     Args:
         band_hz: ``(f_min, f_max)`` in Hz -- :data:`TARGET_PHASE_BAND_HZ` for ``fhr_ph``,
             :data:`SOURCE_PHASE_BAND_HZ` for ``up_ph``.
         reference: The production bank. Defaults to :func:`build_filter_bank`.
+        phase_operator: One of :data:`PHASE_OPERATORS`; the legacy one keeps the $k = 6$ family.
 
     Returns:
         ``(n_pairs, 2)`` of $(i, j)$, column $0$ indexing the lower frequency.
     """
     reference = reference if reference is not None else build_filter_bank()
-    pairs = select_phase_pairs(reference, band_hz[0], band_hz[1], PHASE_K_STEPS, PHASE_REL_TOL)
+    pairs = select_phase_pairs(
+        reference, band_hz[0], band_hz[1], phase_k_steps_for(phase_operator), PHASE_REL_TOL
+    )
     return np.asarray(pairs, dtype=int).reshape(-1, 2)
 
 
@@ -1854,6 +2114,15 @@ def assert_matches_shard(
         stored = np.asarray(attrs["sel_power"], dtype=float)
         if not np.allclose(stored, hz[stored_j] / hz[stored_i], rtol=1e-5):
             raise ValueError(f"{name}: sel_power disagrees with the rebuilt bank")
+    # The integer operator's provenance: the stored harmonic must be the integer the ratio rounds
+    # to, and a legacy selection must not masquerade as an integer one.
+    if "sel_harmonic" in attrs:
+        stored = np.asarray(attrs["sel_harmonic"], dtype=int)
+        if not np.array_equal(stored, harmonic_index(pairs, reference.xi)):
+            raise ValueError(
+                f"{name}: sel_harmonic disagrees with the integer harmonic of the rebuilt pairs; "
+                f"the exponent the operator applied is not the one the provenance records"
+            )
 
 
 def transform_sample(
@@ -1866,6 +2135,7 @@ def transform_sample(
     decimation_mode: str = "full_rate",
     pad: str = "edge",
     reference: Optional[FilterBank] = None,
+    phase_operator: str = PHASE_OPERATOR_LEGACY,
 ) -> Dict[str, np.ndarray]:
     r"""All four feature blocks the model consumes, for one segment, on either arm.
 
@@ -1888,23 +2158,41 @@ def transform_sample(
         decimation_mode: Two-sided arm only; see :func:`scattering_block_two_sided`.
         pad: Causal arm only; see :func:`causal_convolve`.
         reference: The production bank, for pair selection. Defaults to :func:`build_filter_bank`.
+        phase_operator: Causal arm only; one of :data:`PHASE_OPERATORS`. The two-sided arm
+            reproduces production, which is the legacy operator by definition, and refuses the
+            integer one rather than producing a block no shard on disk has.
 
     Returns:
-        ``{'fhr_st': (43, T), 'fhr_ph': (66, T), 'up_st': (43, T), 'up_ph': (15, T)}``.
+        ``{'fhr_st': (43, T), 'fhr_ph': (66 or 44, T), 'up_st': (43, T), 'up_ph': (15 or 10, T)}``.
+
+    Raises:
+        ValueError: On an unknown operator, or the integer operator on the two-sided arm.
     """
+    validate_phase_operator(phase_operator)
     reference = reference if reference is not None else build_filter_bank()
-    target_pairs = selected_pairs(TARGET_PHASE_BAND_HZ, reference)
-    source_pairs = selected_pairs(SOURCE_PHASE_BAND_HZ, reference)
+    target_pairs = selected_pairs(TARGET_PHASE_BAND_HZ, reference, phase_operator)
+    source_pairs = selected_pairs(SOURCE_PHASE_BAND_HZ, reference, phase_operator)
 
     if isinstance(bank, CausalBank):
         return {
             "fhr_st": scattering_block_causal(fhr, bank, decimation=decimation, pad=pad),
             "fhr_ph": phase_block_causal(
-                fhr, fhr, target_pairs, bank, decimation=decimation, pad=pad
+                fhr, fhr, target_pairs, bank, decimation=decimation, pad=pad,
+                phase_operator=phase_operator,
             ),
             "up_st": scattering_block_causal(up, bank, decimation=decimation, pad=pad),
-            "up_ph": phase_block_causal(up, up, source_pairs, bank, decimation=decimation, pad=pad),
+            "up_ph": phase_block_causal(
+                up, up, source_pairs, bank, decimation=decimation, pad=pad,
+                phase_operator=phase_operator,
+            ),
         }
+
+    if phase_operator != PHASE_OPERATOR_LEGACY:
+        raise ValueError(
+            f"phase_operator={phase_operator!r} is a causal-arm version; the two-sided arm "
+            f"reproduces the production kymatio operator, which is {PHASE_OPERATOR_LEGACY!r} by "
+            f"definition, and a two-sided integer block would match no shard on disk"
+        )
 
     return {
         "fhr_st": scattering_block_two_sided(

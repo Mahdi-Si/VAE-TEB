@@ -559,8 +559,11 @@ def test_the_page_carries_the_one_sided_delay_caveat(task, stub_batch):
     figure = _render(task(), stub_batch)
     try:
         assert sample_page.LAG_TIME_CAVEAT in [text.get_text() for text in figure.texts]
-        for token in ("stored-coefficient time", "group delay", "one-sided", "$-20$ s"):
+        for token in ("stored-coefficient time", "group delay", "one-sided", r"\kappa"):
             assert token in sample_page.LAG_TIME_CAVEAT, token
+        # The stored timeline is canonical: no dataset-shift term may appear in the caption.
+        for forbidden in ("$-20$", "acquisition shift", "sensor"):
+            assert forbidden not in sample_page.LAG_TIME_CAVEAT, forbidden
         # The two pages say different things, and the sibling's is untouched.
         assert sample_page.LAG_TIME_CAVEAT != causal_feature_page.LAG_TIME_CAVEAT
     finally:

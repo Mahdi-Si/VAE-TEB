@@ -63,6 +63,12 @@ general_config:
 
 model_config:
   VAE_model:
+    # This shard was built under the LEGACY phase operator (66 / 15 phase channels), so the
+    # operator and the declared widths are pinned back to it here; the promoted default's
+    # unaligned inputs and stored clock apply unchanged.
+    causal_phase_operator: ratio_power_v0
+    c_y: 102
+    c_u: 51
     # ONLY the ramp length. The endpoint is inherited, deliberately: this config must track whatever
     # weight default.yaml ships, or the dev-box reading stops being a reading of the shipped model.
     # The ramp itself cannot be inherited -- 50 epochs is 1% of a 5,000-epoch production run and a

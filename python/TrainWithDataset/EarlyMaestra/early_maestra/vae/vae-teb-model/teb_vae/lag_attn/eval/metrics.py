@@ -1121,63 +1121,46 @@ def _head_diversity(alpha_bar: torch.Tensor) -> torch.Tensor:
 # ---------------------------------------------------------------------------
 # Lag conversion
 # ---------------------------------------------------------------------------
-def lag_to_seconds(
-    lag: Any, *, step_seconds: float = STEP_SECONDS, up_shift_secs: float = 0.0
-) -> Any:
-    r"""Convert a model lag index to the physical delay it implies, in seconds.
+def lag_to_seconds(lag: Any, *, step_seconds: float = STEP_SECONDS) -> Any:
+    r"""Convert a model lag index to seconds on the stored timeline.
 
-    $$\mathrm{seconds}(\ell) = s\,\ell + \Delta_{UP}$$
+    $$\mathrm{seconds}(\ell) = s\,\ell$$
 
-    **The addition corrects a sign error, settled from the source rather than argued.**
-    ``mimo_adaptor.py`` runs ``up_shifted[:-80] = up_signal[80:]`` at $\Delta_{UP} = -20$ s, so
-    stored grid position $g$ holds uterine activity the sensor recorded at $g + 20$ s -- the UP
-    stream was *advanced*, pulled earlier. Attention at anchor $t$ reading source $t - \ell$
-    therefore compares fetal heart rate at $\Delta t$ against uterine activity recorded at
-    $\Delta(t-\ell) + 20$, a lead in the original recording of $4\ell - 20$ s.
-
-    This returned $s\,\ell - \Delta_{UP} = 4\ell + 20$ until it was corrected, overstating every
-    published lead by $40$ s -- in the direction that made the model look as though it had found a
-    longer, more physiological delay than it had. A peak at $\ell = 0$ was captioned $+20$ s when
-    the two epochs are $20$ s apart in the opposite order.
-
-    The default is $0$, i.e. no offset. The value used is recorded in ``preflight.json`` so the
-    figure is self-documenting.
+    **The stored timeline is canonical.** The dataset builder shifts the UP channel when it writes
+    the shards; that shift is part of how the stored signals are, and no downstream quantity adds
+    it back or subtracts it. An earlier revision carried an ``up_shift_secs`` term here that undid
+    the builder's shift; it was removed on purpose and must not return under another name.
 
     Args:
         lag: A lag index, or an array or tensor of them.
         step_seconds: Duration of one decimated step, $s$.
-        up_shift_secs: The dataset's UP shift, $\Delta_{UP}$.
 
     Returns:
-        The physical delay, in the same shape as ``lag``.
+        The lag in seconds, in the same shape as ``lag``.
     """
-    return float(step_seconds) * lag + float(up_shift_secs)
+    return float(step_seconds) * lag
 
 
-def lag_seconds_physical(
-    lags: Any, *, step_seconds: float = STEP_SECONDS, up_shift_secs: float = 0.0
-) -> "np.ndarray":
-    r"""The ``lag_seconds_physical`` column: lag indices as physical seconds, as a float array.
+def lag_seconds_physical(lags: Any, *, step_seconds: float = STEP_SECONDS) -> "np.ndarray":
+    r"""The ``lag_seconds_physical`` column: lag indices as seconds, as a float array.
 
     The one name under which the converted lag appears in every CSV and every figure axis in the
     pipeline, so a reader never has to work out which of two lag columns is which. It accepts a
     tensor, an array, a list or a scalar and always returns ``float64``, because its consumers
     are a ``DataFrame`` column and a matplotlib axis and neither wants a torch tensor.
 
-    The arithmetic is :func:`lag_to_seconds`'s, unchanged; see it for why the shift is
-    *added* -- the dataset advanced the UP stream, so undoing that advance adds a negative
-    $\Delta_{UP}$ -- and why the default is $0$.
+    The arithmetic is :func:`lag_to_seconds`'s, unchanged: $s\ell$ on the canonical stored
+    timeline, with no dataset-shift term.
 
     Args:
         lags: Lag indices, any shape.
         step_seconds: Duration of one decimated step, $s$.
-        up_shift_secs: The dataset's UP shift, $\Delta_{UP}$, from ``eval_config.up_shift_secs``.
 
     Returns:
-        The physical delays in seconds, ``float64``, same shape as ``lags``.
+        The lags in seconds, ``float64``, same shape as ``lags``.
     """
     indices = np.asarray(
         lags.detach().cpu().numpy() if isinstance(lags, torch.Tensor) else lags,
         dtype=np.float64,
     )
-    return lag_to_seconds(indices, step_seconds=step_seconds, up_shift_secs=up_shift_secs)
+    return lag_to_seconds(indices, step_seconds=step_seconds)

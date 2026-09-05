@@ -77,9 +77,9 @@ REMOVED_READOUTS: Tuple[Dict[str, str], ...] = (
         "readout": "deceleration_skill",
         "reason": (
             "it runs a deceleration detector over each branch's forecast block in bpm; this "
-            "model forecasts 98 wavelet-modulus and phase-harmonic coefficients in the loader's z "
-            "units, and defining a deceleration on that axis is a new construction rather than a "
-            "port of this one"
+            "model forecasts the kept wavelet-modulus and phase-harmonic coefficients in the "
+            "loader's z units, and defining a deceleration on that axis is a new construction "
+            "rather than a port of this one"
         ),
     },
     {

@@ -13,10 +13,10 @@ and the conversion is the whole content of the claim a lag panel makes -- a peak
 nothing until the axis says what second bin $3$ is.
 
 The delay is a **maximum over channels** (the source channels are delayed individually, so no
-single $\delta$ describes them all), which is why the page's axis label says *mechanically
+single $\delta$ describes them all), which is why the page's axis label says *input-delay
 compensated* rather than naming an exact physiological lag; the label is asserted here too,
-because an axis reading "Lag (s)" is ambiguous between the compensated lag and the uncorrected
-sensor one, and those differ by the $20$ s the pipeline already removed.
+because an axis reading "Lag (s)" does not say whether $\delta$ was added back. The stored
+timeline is canonical: no other correction is ever applied to a lag axis.
 
 The secondary axis is read **after a draw**. Matplotlib defers a secondary axis's limits to draw
 time, so an assertion made before one passes against the default $(0, 1)$ whatever the transform

@@ -968,8 +968,11 @@ def test_the_page_carries_the_physical_delay_caveat(task, stub_batch):
     try:
         drawn = [text.get_text() for text in figure.texts]
         assert sample_page.LAG_TIME_CAVEAT in drawn
-        for token in ("stored-coefficient time", "group delay", "$-20$ s"):
+        for token in ("stored-coefficient time", "group delay"):
             assert token in sample_page.LAG_TIME_CAVEAT
+        # The stored timeline is canonical: no dataset-shift term may appear in the caption.
+        for forbidden in ("$-20$", "acquisition shift", "sensor"):
+            assert forbidden not in sample_page.LAG_TIME_CAVEAT, forbidden
         # The alignment half. Without these the sentence is the pre-alignment one, which tells a
         # reader the correction is per channel and unrecoverable when it is one logged number.
         for token in (
@@ -985,13 +988,12 @@ def test_the_page_carries_the_physical_delay_caveat(task, stub_batch):
         plt.close(figure)
 
 
-def test_the_input_rows_carry_the_shift_that_puts_them_on_the_physical_clock(task, stub_batch):
-    r"""An aligned channel at step $t$ carries content centred $\kappa\tau_{\mathrm{ref}}$
-    earlier -- $352$ s on the shipped target clock, over a quarter of the drawn window -- while
-    the raw row it shares a column with is in physical time. Drawn at step index the row sat that
-    far to the right of the trace it was computed from, so the panel carries the offset as the
-    shift the row is drawn under, and its axis names it. Both from the same factor the alignment
-    shift uses, never typed."""
+def test_the_x_label_states_the_clock_the_rows_content_sits_on(task, stub_batch):
+    r"""The row is drawn at the model's step index while the raw rows it shares a column with are
+    in physical time, so its content sits $\kappa\tau_{\mathrm{ref}}$ to the left of where the
+    column puts it -- $352$ s on the shipped target clock, over a quarter of the drawn window.
+    Named on the axis it is about rather than in the title, which already renders wider than its
+    own axes; and the number must come from the same factor the shift does."""
     module = task()
     model = module.orig_model
     inputs = module._build_forward_inputs(stub_batch)
@@ -1002,86 +1004,31 @@ def test_the_input_rows_carry_the_shift_that_puts_them_on_the_physical_clock(tas
     )
     for panel in panels:
         expected = causal_warmup.ALIGNMENT_DELAY_FACTOR * reference[panel.name]
-        assert panel.content_offset_s == pytest.approx(expected)
-        assert "physical" in panel.time_label
-        assert f"{expected:.0f} s later" in panel.time_label
-
-    # An unaligned run has no single constant: the row stays at step index, and the axis says so
-    # rather than claiming physical time with a number wrong on every channel but one.
-    plain = sample_page.causal_stream_panels(model, inputs, sample_index=0)
-    for panel in plain:
-        assert panel.content_offset_s == 0.0
+        assert f"content at $t-{expected:.0f}$ s" in panel.time_label
         assert "step index" in panel.time_label
 
-
-def test_the_shift_and_the_label_reach_the_drawn_row(task, stub_batch):
-    """Both are panel fields, and a field the shared row does not read says nothing. Drawn rather
-    than inspected, because the failures this guards are the row keeping its hardcoded
-    ``'Time (s)'`` and drawing the image from $0$ under a label claiming a shift. The image, the
-    warm-up staircase and the not-yet-received tail must all move by the same constant, or the
-    staircase bounds a zero fill that is no longer where it says."""
-    module = task()
-    model = module.orig_model
-    inputs = module._build_forward_inputs(stub_batch)
-    panels = sample_page.causal_stream_panels(
-        model, inputs, sample_index=0,
-        reference_delay_s={"target": 402.1604, "source": 288.2672},
-    )
-    step, t_max = figure_primitives_step(), 1200.0
-
-    figure, ax = plt.subplots(figsize=(14, 3))
-    try:
-        panel = panels[0]
-        offset = float(panel.content_offset_s)
-        assert offset > 0.0
-        shared_page._input_stream_row(ax, panel, t_max=t_max, seconds_per_step=step)
-        assert ax.get_xlabel() == panel.time_label
-
-        left, right, _bottom, _top = ax.images[0].get_extent()
-        assert left == pytest.approx(-offset)
-        assert right == pytest.approx(t_max - offset)
-
-        staircase = _labelled(ax, sample_page.WARMUP_STAIRCASE_LABEL)
-        assert len(staircase) == 1
-        assert np.allclose(
-            staircase[0].get_xdata(), np.asarray(panel.delays, dtype=float) * step - offset
-        )
-
-        tails = [
-            patch for patch in ax.patches
-            if str(patch.get_label()).startswith("not yet received")
-        ]
-        assert len(tails) == 1
-        # Through the display transform, so the assertion holds whichever patch class
-        # ``axvspan`` returns: the tail spans exactly the content the encoder never receives.
-        span = tails[0].get_extents().transformed(ax.transData.inverted())
-        assert span.x0 == pytest.approx(t_max - offset, rel=1e-6)
-        assert span.x1 == pytest.approx(t_max, rel=1e-6)
-    finally:
-        plt.close(figure)
-
-    # Unshifted -- no reference -- the row is exactly the one it was: drawn from 0, no tail.
-    figure, ax = plt.subplots(figsize=(14, 3))
-    try:
-        plain = sample_page.causal_stream_panels(model, inputs, sample_index=0)[0]
-        shared_page._input_stream_row(ax, plain, t_max=t_max, seconds_per_step=step)
-        assert ax.images[0].get_extent()[0] == 0.0
-        assert not [
-            patch for patch in ax.patches
-            if str(patch.get_label()).startswith("not yet received")
-        ]
-    finally:
-        plt.close(figure)
+    # An unaligned run has no single constant, and the clause is omitted rather than filled with a
+    # number that would be wrong on every channel but one.
+    plain = sample_page.causal_stream_panels(model, inputs, sample_index=0)
+    for panel in plain:
+        assert "unaligned" in panel.time_label
+        assert "step index" in panel.time_label
+        assert "\\kappa\\tau_c" in panel.time_label
 
 
-def test_the_forecast_rows_draw_the_scored_stream_on_the_physical_clock(task, stub_batch):
-    r"""Under an advancing forecast clock every scored element sits $\kappa\tau_{\min}$ before its
-    stored step, so the truth, both means and every field row must be drawn shifted by that
-    constant -- level with the input rows, under the raw trace -- while the anchor marks stay at
-    the anchor step, which is the instant the forecast is made from. The constant comes from the
-    resolved budget the task holds, as the input clocks do; without a budget the rows stay at
-    step index, because the net stamps step shifts and no $\tau$."""
+def test_the_forecast_rows_axis_names_the_scored_clock(task, stub_batch):
+    r"""The lane row, the five field rows and the score row share one column with the input
+    rows, and are drawn at the scored step: under the physical clock their content sits
+    $\kappa\tau_{\min}$ = 12 s before it, under the stored clock each channel's own
+    $\kappa\tau_c$. A bare ``'Time (s)'`` there reads as the raw row's physical time, so every
+    one of those rows states its clock, from the same factor and the same resolved budget the
+    input rows use."""
     from types import SimpleNamespace
+
+    forecast_rows = (
+        "Forecast", "true $Y^{+}$ over", "base $\\mu^p$", "full $\\mu^q$", "Source skill",
+        "Predicted $\\sigma^q$", "Per-window forecast score",
+    )
 
     module = _shifted_task(task)
     clock_s = 13.3405
@@ -1089,43 +1036,130 @@ def test_the_forecast_rows_draw_the_scored_stream_on_the_physical_clock(task, st
         reference_delay_s=None, source_clock_delay_s=None,
         target_forecast_clock_delay_s=clock_s,
     )
-    offset = causal_warmup.ALIGNMENT_DELAY_FACTOR * clock_s
-    pieces = _forward(module, stub_batch)
-    geometry = module.orig_model.geometry
-    _, time_dec, t_max = figure_primitives.time_axes(
-        geometry.t, geometry.raw_len, fs_raw=_FS_RAW
-    )
-    field_rows = (
-        "true $Y^{+}$ over", "base $\\mu^p$", "full $\\mu^q$", "Source skill",
-        "Predicted $\\sigma^q$",
-    )
-
-    figure = _render(module, stub_batch, pieces=pieces)
+    expected = causal_warmup.ALIGNMENT_DELAY_FACTOR * clock_s
+    figure = _render(module, stub_batch)
     try:
-        ax = _axes_titled(figure, "Forecast")
-        truth = _labelled(ax, "true $Y^{+}$")
-        assert len(truth) == 1
-        assert np.allclose(truth[0].get_xdata(), time_dec - offset)
-        assert "physical" in ax.get_xlabel()
-        # A decision instant: the floor does not move with the content.
-        floor = _labelled(ax, "anchor floor")
-        assert floor[0].get_xdata()[0] == pytest.approx(geometry.warmup * t_max / geometry.t)
-        for prefix in field_rows:
-            left, right, _bottom, _top = _axes_titled(figure, prefix).images[0].get_extent()
-            assert left == pytest.approx(-offset), prefix
-            assert right == pytest.approx(t_max - offset), prefix
-        assert "physical" in _axes_titled(figure, field_rows[0]).get_xlabel()
+        for prefix in forecast_rows:
+            label = _axes_titled(figure, prefix).get_xlabel()
+            assert "scored step" in label, prefix
+            assert f"$t-{expected:.0f}$ s" in label, prefix
     finally:
         plt.close(figure)
 
-    module.warmup_budget = None
-    figure = _render(module, stub_batch, pieces=pieces)
+    # The stored clock: no shift, no constant, and the axis says per channel.
+    plain = task()
+    figure = _render(plain, stub_batch)
     try:
-        ax = _axes_titled(figure, "Forecast")
-        assert np.allclose(_labelled(ax, "true $Y^{+}$")[0].get_xdata(), time_dec)
-        assert "step index" in ax.get_xlabel()
-        for prefix in field_rows:
-            assert _axes_titled(figure, prefix).images[0].get_extent()[0] == 0.0, prefix
+        for prefix in forecast_rows:
+            label = _axes_titled(figure, prefix).get_xlabel()
+            assert "stored step" in label, prefix
+            assert "\\kappa\\tau_c" in label, prefix
+    finally:
+        plt.close(figure)
+
+
+def test_the_clock_label_reaches_the_drawn_axis(task, stub_batch):
+    """The label is a panel field, and a field the shared row does not read is a field that says
+    nothing. Drawn rather than inspected, because the failure this guards is the row keeping its
+    hardcoded ``'Time (s)'``."""
+    module = task()
+    model = module.orig_model
+    inputs = module._build_forward_inputs(stub_batch)
+    panels = sample_page.causal_stream_panels(
+        model, inputs, sample_index=0,
+        reference_delay_s={"target": 402.1604, "source": 288.2672},
+    )
+
+    figure, ax = plt.subplots(figsize=(14, 3))
+    try:
+        shared_page._input_stream_row(
+            ax, panels[0], t_max=1200.0, seconds_per_step=figure_primitives_step()
+        )
+        assert ax.get_xlabel() == panels[0].time_label
+    finally:
+        plt.close(figure)
+
+
+def test_each_input_row_names_its_raw_signal_and_the_delay_that_puts_it_on_the_rows_clock(
+    task, stub_batch
+):
+    r"""An aligned channel at step $t$ carries content centred $\kappa\tau_{\mathrm{ref}}$ earlier,
+    so against the raw row the coefficients sit that far to the right and a misaligned channel is
+    indistinguishable from the design. The panel therefore names the raw field its stream was
+    computed from and the delay that puts that trace on the row's own clock -- the target's FHR
+    at $\kappa\tau^y_{\mathrm{ref}}$, the source's UP at $\kappa\tau^u_{\mathrm{ref}}$, from the
+    same factor the alignment shift uses. Unaligned there is no single constant, and no delay is
+    the honest answer rather than any one channel's."""
+    module = task()
+    model = module.orig_model
+    inputs = module._build_forward_inputs(stub_batch)
+
+    reference = {"target": 402.1604, "source": 288.2672}
+    panels = sample_page.causal_stream_panels(
+        model, inputs, sample_index=0, reference_delay_s=reference
+    )
+    assert [panel.raw_field for panel in panels] == ["fhr", "up"]
+    for panel in panels:
+        assert panel.raw_delay_s == pytest.approx(
+            causal_warmup.ALIGNMENT_DELAY_FACTOR * reference[panel.name]
+        )
+
+    plain = sample_page.causal_stream_panels(model, inputs, sample_index=0)
+    assert [panel.raw_field for panel in plain] == ["fhr", "up"]
+    assert all(panel.raw_delay_s is None for panel in plain)
+
+
+def test_the_raw_trace_is_drawn_over_each_input_row_delayed_onto_its_clock(task, stub_batch):
+    r"""Drawn rather than inspected, through the whole page: the layout resolves the trace from
+    the batch, inverts the loader's scaling, and the shared row draws it on a twin axis shifted
+    right by the panel's delay. Both streams are asserted, because the two delays differ under the
+    dual clock and a row overlaying the other stream's signal -- or the right signal at the other
+    stream's delay -- would look exactly as plausible."""
+    from types import SimpleNamespace
+
+    module = task()
+    module.warmup_budget = SimpleNamespace(
+        reference_delay_s=402.1604, source_clock_delay_s=288.2672,
+        target_forecast_clock_delay_s=None,
+    )
+    figure = _render(module, stub_batch)
+    try:
+        raw_len = stub_batch.fhr.shape[1]
+        time_raw = np.arange(raw_len) / _FS_RAW
+        for prefix, field, reference in (
+            (_INPUT_ROWS[0], "fhr", 402.1604),
+            (_INPUT_ROWS[1], "up", 288.2672),
+        ):
+            delay = causal_warmup.ALIGNMENT_DELAY_FACTOR * reference
+            traces = [
+                line
+                for ax in figure.axes
+                for line in ax.lines
+                if str(line.get_label()).startswith(f"raw {field} as the encoder receives it")
+            ]
+            assert len(traces) == 1, prefix
+            assert np.allclose(traces[0].get_xdata(), time_raw + delay)
+            stats = _STATS[field]
+            expected = getattr(stub_batch, field)[0].numpy() * stats["std"] + stats["mean"]
+            assert np.allclose(traces[0].get_ydata(), expected, atol=1e-4)
+            # The overlay shares the row's axes position, not the raw row's: it is drawn ON the
+            # input row, which is the whole point.
+            row = _axes_titled(figure, prefix)
+            assert traces[0].axes.get_position().bounds == pytest.approx(
+                row.get_position().bounds
+            )
+            assert f"delayed {delay:.0f} s" in str(traces[0].get_label())
+    finally:
+        plt.close(figure)
+
+    # No budget, no clock, no overlay: the row is exactly the one it was.
+    module.warmup_budget = None
+    figure = _render(module, stub_batch)
+    try:
+        assert not [
+            line for ax in figure.axes for line in ax.lines
+            if str(line.get_label()).startswith("raw ")
+        ]
     finally:
         plt.close(figure)
 

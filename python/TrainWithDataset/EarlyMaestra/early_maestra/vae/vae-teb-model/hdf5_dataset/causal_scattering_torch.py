@@ -45,9 +45,11 @@ from .causal_scattering import (
     CAUSAL_BLOCKS,
     DECIMATION,
     N_RAW,
+    PHASE_OPERATOR_LEGACY,
     CausalBank,
     CausalChannelPlan,
     resolve_leg_alignment,
+    resolve_phase_power,
 )
 
 #: Pad modes offering an assumed pre-recording history. ``'edge'`` replicates $x(0)$, asserting
@@ -319,12 +321,17 @@ class CausalTorchBank:
         decimation: int = DECIMATION,
         pad: str = "edge",
         leg_alignment: str = "none",
+        phase_operator: str = PHASE_OPERATOR_LEGACY,
     ) -> torch.Tensor:
         r"""Phase-harmonic correlations $\Phi_{ij} = \Re\{([y_i]^{p_{ij}}\overline{y_j}) \star \phi\}$.
 
-        $[y]^p = |y| e^{\,i p \arg y}$ with $p_{ij} = \xi_j/\xi_i \ge 1$, formed in **polar
-        coordinates** exactly as the numpy reference does -- a complex power would cross the branch
-        cut and produce a different function. The magnitude is taken to the first power, so
+        $[y]^p = |y| e^{\,i p \operatorname{Arg} y}$, formed in polar coordinates exactly as the
+        numpy reference does, with the exponent per pair taken from the shared
+        :func:`~hdf5_dataset.causal_scattering.resolve_phase_power` -- the floating-point ratio
+        under the legacy operator, the stored integer harmonic under the corrected one. Polar
+        construction avoids exponentiating the modulus and does **not** remove the principal-angle
+        branch discontinuity, which is why a non-integer exponent is a defect and the integer
+        operator exists. The magnitude is taken to the first power, so
         $\big|[y_i]^p \overline{y_j}\big| = |y_i||y_j|$.
 
         Only the documented smoothing operator is available. Production's spectral truncation is
@@ -347,17 +354,23 @@ class CausalTorchBank:
                 a tidiness argument: the phasor's angle reaches $9.6$ turns, so evaluating
                 $e^{\,i2\pi\xi_j s}$ in this module's single precision would lose four digits that
                 a float64 evaluation rounded once does not.
+            phase_operator: One of
+                :data:`~hdf5_dataset.causal_scattering.PHASE_OPERATORS`. The exponent vector is
+                resolved by the shared numpy function, for the reason the alignment is: one
+                definition, so the two implementations cannot disagree about a pair's exponent.
 
         Returns:
             ``(B, n_pairs, n_signal // decimation)`` real.
 
         Raises:
-            ValueError: On an unknown *leg_alignment*.
+            ValueError: On an unknown *leg_alignment* or *phase_operator*, or on a pair list the
+                integer operator refuses.
         """
         index = torch.as_tensor(np.asarray(pairs, dtype=np.int64).reshape(-1, 2),
                                 device=self.device)
         # Resolved before the empty-pair return, so an unknown mode is refused either way.
         leg_shift = resolve_leg_alignment(self.bank, pairs, leg_alignment)
+        power_np = resolve_phase_power(pairs, self.bank.xi, phase_operator)
         if index.shape[0] == 0:
             return torch.zeros(
                 (x_low.shape[0], 0, self.n_signal // decimation),
@@ -372,7 +385,10 @@ class CausalTorchBank:
         high = responses_high[:, index[:, 1], :]
         if leg_shift is not None:
             high = self._align_leg(high, *leg_shift)
-        power = (self._xi[index[:, 1]] / self._xi[index[:, 0]])[None, :, None]
+        # The exponent per pair, from the shared float64 resolver and cast once: under the legacy
+        # operator this is the same ratio the old in-place division produced, to single precision;
+        # under the integer operator it is an exactly representable integer.
+        power = torch.as_tensor(power_np, device=self.device).to(self._real_dtype)[None, :, None]
         accelerated = torch.polar(torch.abs(low), power * torch.angle(low))
         smoothed = self.smooth_complex(accelerated * torch.conj(high), pad)
         return smoothed.real[..., ::decimation]
@@ -415,6 +431,7 @@ class CausalTorchBank:
         decimation: int = DECIMATION,
         pad: str = "edge",
         leg_alignment: str = "none",
+        phase_operator: str = PHASE_OPERATOR_LEGACY,
     ) -> Dict[str, torch.Tensor]:
         r"""All four stored blocks for a batch of segments, dropped to the plan's channels.
 
@@ -434,13 +451,16 @@ class CausalTorchBank:
             leg_alignment: Applied to **both** phase blocks; it is a property of the transform a
                 shard was built with, not of one block. Defaults to ``'none'``, so a caller that
                 does not ask for the alignment gets bit-for-bit what every shard on disk holds.
+            phase_operator: Applied to **both** phase blocks, for the same reason. Defaults to
+                the legacy operator so an unlabelled call reproduces every shard on disk; the
+                pair lists must have been selected under the same version.
 
         Returns:
             ``{'fhr_st', 'fhr_ph', 'up_st', 'up_ph'}``, each ``(B, C, n_signal // decimation)``.
 
         Raises:
             ValueError: If a signal's length is not the length this bank was sized for, or on an
-                unknown *leg_alignment*.
+                unknown *leg_alignment* or *phase_operator*.
         """
         for name, signal in (("fhr", fhr), ("up", up)):
             if int(signal.shape[-1]) != self.n_signal:
@@ -452,10 +472,12 @@ class CausalTorchBank:
         blocks = {
             "fhr_st": self.scattering_block(fhr, decimation=decimation, pad=pad),
             "fhr_ph": self.phase_block(fhr, fhr, target_pairs, decimation=decimation, pad=pad,
-                                       leg_alignment=leg_alignment),
+                                       leg_alignment=leg_alignment,
+                                       phase_operator=phase_operator),
             "up_st": self.scattering_block(up, decimation=decimation, pad=pad),
             "up_ph": self.phase_block(up, up, source_pairs, decimation=decimation, pad=pad,
-                                      leg_alignment=leg_alignment),
+                                      leg_alignment=leg_alignment,
+                                      phase_operator=phase_operator),
         }
         if plan is None:
             return blocks
@@ -500,6 +522,7 @@ def transform_batch_numpy(
     decimation: int = DECIMATION,
     pad: str = "edge",
     leg_alignment: str = "none",
+    phase_operator: str = PHASE_OPERATOR_LEGACY,
 ) -> Dict[str, np.ndarray]:
     """Transform a numpy batch and return numpy, for callers that never see a tensor.
 
@@ -516,6 +539,7 @@ def transform_batch_numpy(
         decimation: Subsampling factor.
         pad: History supplied before $t = 0$.
         leg_alignment: Passed through to both phase blocks, defaulting to ``'none'``.
+        phase_operator: Passed through to both phase blocks, defaulting to the legacy operator.
 
     Returns:
         The four blocks as numpy arrays, in the bank's real precision.
@@ -530,6 +554,7 @@ def transform_batch_numpy(
             decimation=decimation,
             pad=pad,
             leg_alignment=leg_alignment,
+            phase_operator=phase_operator,
         )
     return {name: value.detach().cpu().numpy() for name, value in blocks.items()}
 

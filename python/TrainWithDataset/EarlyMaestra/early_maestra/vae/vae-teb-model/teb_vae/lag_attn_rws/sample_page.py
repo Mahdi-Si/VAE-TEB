@@ -45,8 +45,9 @@ particular is *not* how the model forecasts -- the forward pass decodes every va
 stride $1$, and the objective and every reported number are computed over all of them.
 
 Both lag panels carry a secondary axis in **compensated** seconds -- $4\,(\ell + \delta)$, the
-residual physiological lag on the mechanically aligned timeline -- and say so in the label. The
-uncorrected sensor-file figure is $20$ s larger and is deliberately not what a figure shows.
+lag on the stored timeline with the causal input delay $\delta$ added back -- and say so in the
+label. The stored timeline is canonical: the dataset builder's UP shift is part of the signal and
+no figure adds it back or subtracts it.
 
 **Why this lives at the package root.** Two consumers draw this page and they sit on opposite
 sides of the layering: the training callback in :mod:`~teb_vae.lag_attn_rws.plotting`, which is a
@@ -255,15 +256,18 @@ class InputStreamPanel:
             a stream whose coefficients are stamped with the instant they describe. A builder whose
             stream is *not* -- a one-sided bank shifted onto a common clock reports content
             $\kappa\tau_{\mathrm{ref}}$ before the step it is drawn at -- supplies a label saying
-            so, because this row shares its horizontal axis with the raw traces above it.
-        content_offset_s: How far **before** its step index the content of a column physically
-            sits, in seconds: the value at step $t$ describes the raw signal centred at
-            $t\Delta - \mathrm{offset}$. The row is drawn shifted left by exactly this, so a
-            feature lands under the raw trace it was computed from rather than
-            $\mathrm{offset}$ seconds to its right, and the last $\mathrm{offset}$ seconds of the
-            axis are marked as content the encoder has not received by the segment's end.
-            Defaults to $0$ -- a two-sided bank's coefficients are stamped with the instant they
-            describe -- which draws the row exactly as it was drawn before the field existed.
+            so, because this row shares its horizontal axis with the raw traces above it and the
+            offset is otherwise invisible.
+        raw_field: The loader field of the raw signal this stream was computed from -- ``'fhr'``
+            or ``'up'`` -- or ``None`` for no overlay. When set, the layout draws that raw trace
+            over the heatmap on a twin axis, **delayed by** :attr:`raw_delay_s`, so the trace
+            and the coefficients computed from it sit on one clock and a reader checks the
+            alignment on the row itself rather than against the raw row several rows up.
+        raw_delay_s: How far behind the raw signal the stream's content sits, in seconds -- the
+            $\kappa\tau_{\mathrm{ref}}$ of an aligned one-sided stream -- i.e. the shift that puts
+            the raw trace on the stream's own clock. ``None`` draws no overlay even when
+            :attr:`raw_field` is set: an unaligned stream has no single constant, and a trace
+            drawn at any one of them would be wrong on every channel but one.
     """
 
     name: str
@@ -274,7 +278,8 @@ class InputStreamPanel:
     title: str
     delay_label: str = DELAY_STAIRCASE_LABEL
     time_label: str = "Time (s)"
-    content_offset_s: float = 0.0
+    raw_field: Optional[str] = None
+    raw_delay_s: Optional[float] = None
 
 
 def annotate_channel_frequencies(ax: Any, center_hz: np.ndarray, *, count: int = 8) -> Any:
@@ -316,32 +321,41 @@ def annotate_channel_frequencies(ax: Any, center_hz: np.ndarray, *, count: int =
     return secondary
 
 
-def _input_stream_row(ax: Any, panel: InputStreamPanel, *, t_max: float, seconds_per_step: float):
+def _input_stream_row(
+    ax: Any,
+    panel: InputStreamPanel,
+    *,
+    t_max: float,
+    seconds_per_step: float,
+    overlay: Optional[Tuple[Any, Any, str]] = None,
+):
     """Draw one gated input stream as a channel-by-time heatmap, and return the image.
 
     Three things are marked on it, and each is a property of the guard rather than of the sample:
     the block dividers, the per-channel centre frequency on a right-hand axis, and the staircase
     at $t = \\delta_c$ before which the channel carries the guard's zero fill rather than data.
 
-    The whole row -- the image and the staircase alike -- is shifted left by
-    :attr:`InputStreamPanel.content_offset_s`, so a column sits at the physical instant its
-    content describes rather than at the step index the encoder reads it at. The page's axis is
-    physical time (the raw traces above set it), and a stream whose coefficients trail their
-    content by a constant would otherwise sit that constant to the right of the trace it was
-    computed from. Zero for the two-sided pages, where the two clocks coincide.
+    A fourth is drawn when the caller supplies one: the raw signal the stream was computed from,
+    as a thin trace on a twin axis and **delayed by** :attr:`InputStreamPanel.raw_delay_s`. The row
+    is at the model's step index, and on a one-sided aligned stream a column's content sits
+    $\\kappa\\tau_{\\mathrm{ref}}$ before that index; delaying the raw trace by the same constant
+    puts the two on one clock, so a deceleration and the coefficients it produced are drawn in the
+    same column and the alignment is checked on the row itself.
 
     Args:
         ax: The row's main axes.
         panel: The stream to draw.
         t_max: The recording's length in seconds, so the row shares the page's time axis.
         seconds_per_step: $\\Delta$, for placing the delay staircase in physical time.
+        overlay: ``(time_s, values, unit)`` -- the raw trace on its own physical-time axis, or
+            ``None`` for no overlay. Resolved by the layout, which holds the batch; this function
+            only draws it.
 
     Returns:
         The ``AxesImage``, for the caller's colorbar.
     """
     values = np.asarray(panel.values, dtype=float)
     n_channels = values.shape[1]
-    offset = float(panel.content_offset_s)
 
     # Robust limits rather than min/max: these are z-scored wavelet coefficients, and one
     # heavy-tailed channel otherwise sets the scale for all of them and flattens the rest to a
@@ -357,12 +371,10 @@ def _input_stream_row(ax: Any, panel: InputStreamPanel, *, t_max: float, seconds
 
     # Channel $0$ at the **top** -- see :func:`top_down_extent`. Nothing else on the row moves:
     # the dividers, the block ticks and the staircase below are all in channel coordinates, and
-    # only the direction of the axis changes. The horizontal extent starts at ``-offset``: step
-    # $t$ is drawn at $t\Delta - \mathrm{offset}$, the instant its content is centred on, and the
-    # leading columns that fall before $0$ are clipped by the shared axis limits.
+    # only the direction of the axis changes.
     image = ax.imshow(
         values.T, aspect="auto", cmap="viridis", origin="upper",
-        vmin=low, vmax=high, extent=top_down_extent(-offset, t_max - offset, n_channels),
+        vmin=low, vmax=high, extent=top_down_extent(0.0, t_max, n_channels),
         interpolation=_IMSHOW_INTERPOLATION,
     )
 
@@ -384,33 +396,100 @@ def _input_stream_row(ax: Any, panel: InputStreamPanel, *, t_max: float, seconds
     # have no source and are emitted as zero, and the whole staircase must sit inside the shaded
     # warm-up -- that requirement is what `resolve_channel_budget` enforces, and this is where a
     # reader can see that it holds.
-    # The staircase is a step index, so it moves with the image: a boundary drawn at
-    # $\delta_c \Delta$ over an image shifted by ``offset`` would sit ``offset`` seconds to the
-    # right of the zero fill it is meant to bound.
     if n_channels and int(np.max(panel.delays)) > 0:
         ax.step(
-            np.asarray(panel.delays, dtype=float) * seconds_per_step - offset,
+            np.asarray(panel.delays, dtype=float) * seconds_per_step,
             np.arange(n_channels), where="mid",
             color=COLOR_ORANGE, linewidth=0.9,
             label=panel.delay_label,
         )
-    # The last ``offset`` seconds hold no column at all: the content there reaches the encoder
-    # only ``offset`` seconds after the segment's last step. Hatched rather than left as bare
-    # axes background, so the blank reads as "not yet observable" and not as a row that stopped
-    # short of the recording's end.
-    if offset > 0.0:
-        ax.axvspan(
-            t_max - offset, t_max, facecolor=COLOR_LIGHT_GRAY, alpha=0.35, hatch="//",
-            edgecolor=COLOR_GRAY, linewidth=0, zorder=0,
-            label=f"not yet received by the encoder: arrives {offset:.0f} s later",
+
+    # The raw trace, delayed onto the stream's own clock. On its own y-axis: the heatmap's y is
+    # the channel index and the trace is in bpm or mmHg. The trace's last ``raw_delay_s`` seconds
+    # fall past the right edge -- the encoder has not received them by the segment's end -- and
+    # its first column starts ``raw_delay_s`` in, where the pre-segment raw signal is not held.
+    twin = None
+    if overlay is not None and panel.raw_delay_s is not None:
+        time_s, raw_values, unit = overlay
+        twin = ax.twinx()
+        twin.plot(
+            np.asarray(time_s, dtype=float) + float(panel.raw_delay_s),
+            np.asarray(raw_values, dtype=float),
+            color=COLOR_BLACK, linewidth=0.5, alpha=0.75,
+            label=(
+                f"raw {panel.raw_field} as the encoder receives it "
+                f"(delayed {float(panel.raw_delay_s):.0f} s)"
+            ),
         )
-    if ax.get_legend_handles_labels()[0]:
-        ax.legend(loc="lower right", fontsize=6, framealpha=0.9)
+        twin.set_ylabel(f"raw {panel.raw_field} ({unit})", fontsize=7)
+        twin.tick_params(axis="y", labelsize=6)
+        twin.grid(False)
+        twin.set_xlim(0.0, t_max)
+    # Labelled artists only: the block divider is an unlabelled ``axhline`` on the same axes and
+    # would otherwise appear as ``_child1``. Lower *left*, inside the warm-up prefix, which is the
+    # one span of the row the overlay never reaches.
+    handles = [
+        handle
+        for handle in list(ax.get_lines()) + ([] if twin is None else list(twin.get_lines()))
+        if not str(handle.get_label()).startswith("_")
+    ]
+    if handles:
+        ax.legend(
+            handles, [handle.get_label() for handle in handles],
+            loc="lower left", fontsize=6, framealpha=0.9,
+        )
 
     ax.set_title(panel.title, fontsize=9, pad=6)
     ax.set_xlabel(panel.time_label, fontsize=8)
     ax.set_ylabel("Input channel", fontsize=8)
     return image
+
+
+def _raw_overlay(
+    panel: InputStreamPanel,
+    *,
+    batch: Any,
+    fhr_raw: Optional[torch.Tensor],
+    up_raw: Optional[torch.Tensor],
+    sample_index: int,
+    time_raw: np.ndarray,
+    normalization_stats: Optional[Dict[str, Any]],
+) -> Optional[Tuple[np.ndarray, np.ndarray, str]]:
+    """Resolve the raw trace an input row overlays, from wherever this page carries it.
+
+    The batch first: a feature-domain page's ``fhr_raw`` is the feature block, and the raw
+    trace it wants is only in the batch. Then the two raw arguments, which is where a raw-target
+    page holds them. A trace that is absent, or on another grid than ``time_raw``, means no
+    overlay rather than a wrong one.
+
+    Args:
+        panel: The stream, for its ``raw_field`` and ``raw_delay_s``.
+        batch: The loader batch, or ``None``.
+        fhr_raw: The builder's target argument -- the raw FHR on a raw-target page.
+        up_raw: The raw source, or ``None``.
+        sample_index: Which sample of the batch to draw.
+        time_raw: The raw-grid time axis in seconds.
+        normalization_stats: The loader's statistics, so the trace renders in bpm or mmHg.
+
+    Returns:
+        ``(time_s, values, unit)``, or ``None`` when the panel asks for no overlay or the trace is
+        unavailable.
+    """
+    field = panel.raw_field
+    if field is None or panel.raw_delay_s is None:
+        return None
+    values: Any = None
+    if batch is not None:
+        values = batch.get(field) if isinstance(batch, dict) else getattr(batch, field, None)
+    if values is None:
+        values = {"fhr": fhr_raw, "up": up_raw}.get(field)
+    if values is None:
+        return None
+    trace, unit = _denormalised(values[sample_index], field, normalization_stats)
+    trace = np.asarray(trace).ravel()
+    if trace.size != time_raw.size:
+        return None
+    return time_raw, trace, unit
 
 
 @dataclass(frozen=True)
@@ -947,7 +1026,7 @@ def build_diagnostic_figure(
                 step_seconds=seconds_per_step,
                 # The whole compensation, expressed as the axis offset: lag 0 already sits at
                 # delta steps once the source channels are read delta steps stale.
-                delta_up_seconds=float(delay_steps) * seconds_per_step,
+                offset_seconds=float(delay_steps) * seconds_per_step,
             )
             if secondary is not None:
                 # Overriding the primitive's generic label: which of the two lag quantities is drawn
@@ -989,7 +1068,11 @@ def build_diagnostic_figure(
                 continue
             ax, cax = row_axes(f"input_{panel.name}")
             image = _input_stream_row(
-                ax, panel, t_max=t_max, seconds_per_step=seconds_per_step
+                ax, panel, t_max=t_max, seconds_per_step=seconds_per_step,
+                overlay=_raw_overlay(
+                    panel, batch=batch, fhr_raw=fhr_raw, up_raw=up_raw,
+                    sample_index=i, time_raw=time_raw, normalization_stats=normalization_stats,
+                ),
             )
             heatmap_spines(ax)
             attach_cbar(cax, image, "value")

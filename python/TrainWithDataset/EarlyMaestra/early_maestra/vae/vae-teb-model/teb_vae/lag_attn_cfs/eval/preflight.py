@@ -70,12 +70,14 @@ import numpy as np
 import torch
 from loguru import logger
 
+from hdf5_dataset.causal_scattering import LEGACY_NOVELTY_HORIZON_STEPS
 from teb_vae.lag_attn.nets.decoders import HORIZON_ATTENTION_GAIN_INIT
 from teb_vae.lag_attn.nets.lag_report import SECONDS_PER_STEP
 from teb_vae.lag_attn_cfs.causal_warmup import (
     ALIGN_KEY,
     BUDGET_KEY,
     REACH_KEY,
+    REPRESENTATION_IDENTITY_FIELDS,
     resolve_warmup_budget,
 )
 from teb_vae.lag_attn_cfs.eval.lag_axis import (
@@ -608,8 +610,154 @@ def _as_int_tuple(values: Any) -> Optional[Tuple[int, ...]]:
     return tuple(int(value) for value in values)
 
 
+#: Human-facing statement of each forecast clock, carried into the record beside the raw value so
+#: no report has to reconstruct what 'physical' means (CFS-05).
+_FORECAST_CLOCK_LABELS: Dict[str, str] = {
+    "stored": (
+        "stored: each target channel scored at its own later stored coefficient, available "
+        "4-120 s after the anchor (exact coefficient availability)"
+    ),
+    "physical": (
+        "physical: APPROXIMATE delay compensation -- each channel advanced by "
+        "round(kappa (tau_c - tau_min) / 4 s) stored steps under the kappa = 0.875 energy-centroid "
+        "convention; not an exact physical instant, and labels read up to 4 (H + max_advance) s "
+        "after the anchor"
+    ),
+    "input": (
+        "input: the continuation of the delayed input stream; some labels are already available "
+        "at the anchor (a diagnostic task, not a forecast of unavailable observations)"
+    ),
+}
+
+
+def _budget_geometry(view: Mapping[str, Any]) -> Dict[str, int]:
+    """The three geometry keys the budget record's label-endpoint fields are derived from.
+
+    Args:
+        view: The budget's config view.
+
+    Returns:
+        ``{'horizon', 'sequence_length', 'warmup_period', 'max_lag'}`` as ints; ``max_lag`` is
+        ``-1`` when the config carries none.
+    """
+    vae = (view.get("model_config") or {}).get("VAE_model") or {}
+    return {
+        "horizon": int(vae.get("horizon", 0)),
+        "sequence_length": int(vae.get("sequence_length", 0)),
+        "warmup_period": int(vae.get("warmup_period", 0)),
+        "max_lag": int(vae.get("max_lag", -1)),
+    }
+
+
+def _content_lag_record(resolved: Any, geometry: Mapping[str, int]) -> Optional[Dict[str, Any]]:
+    """The gather-derived content-lag summary, or ``None`` without a lag window to summarise over.
+
+    Imported lazily: ``warmup_budget`` draws the budget figures and pulls matplotlib at import,
+    which a preflight that only reads attributes should not pay for unless it records this.
+
+    Args:
+        resolved: The resolved budget.
+        geometry: From :func:`_budget_geometry`.
+
+    Returns:
+        ``{'nearest_s', 'union_s', 'every_horizon_s', 'pair_spread_s', 'convention'}`` or ``None``.
+    """
+    if geometry["horizon"] <= 0 or geometry["max_lag"] < 0:
+        return None
+    from teb_vae.lag_attn_cfs.warmup_budget import summarise_content_lag
+
+    summary = summarise_content_lag(
+        resolved, horizon=geometry["horizon"], max_lag=geometry["max_lag"]
+    )
+    return {
+        "nearest_s": summary.nearest_s,
+        "union_s": list(summary.union_s),
+        "every_horizon_s": list(summary.every_horizon_s),
+        "pair_spread_s": summary.pair_spread_s,
+        "convention": (
+            "L = 4 (l + 1 + h + s_c + d_j) + 0.875 (tau_j - tau_c) on the canonical stored "
+            "timeline, from the actual gathers; approximate content lead, not a physiological delay"
+        ),
+    }
+
+
+def _novelty_proxy_record(resolved: Any, geometry: Mapping[str, int]) -> Dict[str, Any]:
+    r"""Name what the novelty vector the tertiles rank by is, beside the gather this run scores.
+
+    Two sources (CFS-08). A current shard stores the horizon-free ``causal_novelty_curve`` and the
+    resolver looks this run's own horizon and each kept channel's forecast advance up in it, so the
+    vector describes the scored gather by construction. A legacy shard stores only the scalar
+    ``causal_novelty_frac``, an envelope-mass share within
+    :data:`~hdf5_dataset.causal_scattering.LEGACY_NOVELTY_HORIZON_STEPS` stored steps on the
+    stored clock with no advance; under another horizon or clock the ``pred_gap_novel_lo/mid/hi``
+    columns then rank by a gather this run does not score, and the record says so. Either way the
+    share is $\lvert\psi_k\rvert \star \phi$ mass -- the slow leg, for a phase pair -- and not
+    an exact known/new value fraction of a nonlinear coefficient.
+
+    Args:
+        resolved: The resolved budget.
+        geometry: From :func:`_budget_geometry`.
+
+    Returns:
+        The vector's source and definition, the gather it was computed for, this run's horizon,
+        clock and maximum label advance, and whether the two gathers coincide.
+    """
+    clock = str(resolved.target_forecast_clock)
+    horizon = int(geometry["horizon"])
+    source = str(getattr(resolved, "novelty_source", "none"))
+    caveat = (
+        "Not an exact known/new value fraction of a nonlinear coefficient and not a measured "
+        "prediction error; the phase-pair value ignores the fast leg, the leg-alignment shift "
+        "and the smoothing."
+    )
+    record: Dict[str, Any] = {
+        "source": source,
+        "run_horizon_steps": horizon,
+        "run_target_forecast_clock": clock,
+        "run_max_forecast_advance_steps": int(resolved.max_forecast_advance),
+    }
+    if source == "curve":
+        record["definition"] = (
+            "envelope-mass proxy looked up in the shards' horizon-free causal_novelty_curve at "
+            "this run's own horizon H and each kept channel's forecast advance s_c: the share of "
+            "|psi_k| * phi (the slow leg for a phase pair) within Delta * (H + s_c) after the "
+            f"anchor, i.e. on the scored gather. {caveat}"
+        )
+        record["lookup_horizon_steps"] = int(resolved.novelty_horizon_steps)
+        record["matches_scored_gather"] = True
+        return record
+    if source == "none":
+        record["definition"] = "the shards carry no novelty vector or curve; no split is reported"
+        record["matches_scored_gather"] = False
+        return record
+    matches = clock == "stored" and horizon == int(LEGACY_NOVELTY_HORIZON_STEPS)
+    record.update({
+        "definition": (
+            "LEGACY fixed-horizon, stored-clock envelope-mass proxy (causal_novelty_frac): the "
+            "share of |psi_k| * phi (the slow leg for a phase pair) within Delta * H_stored after "
+            f"the anchor, with no per-channel label advance. {caveat}"
+        ),
+        "stored_horizon_steps": int(LEGACY_NOVELTY_HORIZON_STEPS),
+        "stored_clock": "stored",
+        "matches_scored_gather": bool(matches),
+    })
+    if not matches:
+        record["tertile_note"] = (
+            "pred_gap_novel_lo / _mid / _hi partition the kept channels by the LEGACY stored-clock "
+            f"proxy at H = {int(LEGACY_NOVELTY_HORIZON_STEPS)}, not by envelope novelty on this "
+            f"run's scored gather ({clock}, H = {horizon}, labels advanced by up to "
+            f"{int(resolved.max_forecast_advance)} steps); rebuild the shards, which then store the "
+            "horizon-free curve the resolver looks this run's gather up in."
+        )
+    return record
+
+
 def check_warmup_budget_matches_checkpoint(
-    config: Mapping[str, Any], *, model_kwargs: Mapping[str, Any], model_cls: type
+    config: Mapping[str, Any],
+    *,
+    model_kwargs: Mapping[str, Any],
+    model_cls: type,
+    representation: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, Any]:
     r"""Refuse a config whose warm-up budget does not resolve to the checkpoint's stamped tuples.
 
@@ -636,16 +784,26 @@ def check_warmup_budget_matches_checkpoint(
         model_cls: The network class, for the translation from a resolved budget to constructor
             keywords -- reused rather than restated, so the two cannot disagree about which keyword
             carries which tuple.
+        representation: The checkpoint's stamped representation identity
+            (``WarmupBudget.representation()`` under ``causal_representation``), or ``None`` for a
+            checkpoint written before the stamp existed. Where present its phase operator, leg
+            alignment and forecast clock must equal the re-resolved budget's: two representations
+            can coincide in every width and tuple and differ in every value, which the tuple
+            comparison below cannot see.
 
     Returns:
-        The record: the threshold, the resolved widths, the realised maximum warm-up, and the
-        alignment reference with the channels and shifts it produced.
+        The record: the threshold, the resolved widths, the realised maximum warm-up, the
+        alignment reference with the channels and shifts it produced, and the stamped
+        representation (or ``None``).
 
     Raises:
         EvalPreconditionUnmet: If the budget cannot be resolved at all, if one side has a budget and
-            the other does not, or if any of the six tuples disagrees -- naming both widths.
+            the other does not, if any of the six tuples disagrees -- naming both widths -- or if
+            the stamped representation names another operator, alignment or clock than the shards
+            and config resolve to.
     """
     view = config_view_for_budget(config)
+    geometry = _budget_geometry(view)
     try:
         resolved = resolve_warmup_budget(view)
     except ValueError as exc:
@@ -717,9 +875,33 @@ def check_warmup_budget_matches_checkpoint(
             f"{ALIGN_KEY} to the values that run used."
         )
 
+    # The identity comparison the tuples cannot make. Only where the checkpoint carries the stamp:
+    # a blob written before it existed compares on tuples alone, as it always did, and says so in
+    # the record by carrying ``None`` here.
+    if representation is not None:
+        expected_identity = resolved.representation()
+        mismatched = [
+            f"{name}: checkpoint={representation.get(name)!r}, shards/config="
+            f"{expected_identity[name]!r}"
+            for name in REPRESENTATION_IDENTITY_FIELDS
+            if str(representation.get(name)) != str(expected_identity[name])
+        ]
+        if mismatched:
+            raise EvalPreconditionUnmet(
+                "the checkpoint's stamped representation disagrees with the one this config "
+                "resolves against dataset_config.vae_test_datasets:\n  " + "\n  ".join(mismatched)
+                + "\nThe channel tuples may agree in every width and the weights still describe "
+                "another representation: another phase-harmonic operator applies other exponents "
+                "to the same pair indices, another leg alignment holds other values under the same "
+                "channel names, and another forecast clock scores another question. Point the run "
+                "at the shards this checkpoint was trained on, or at the checkpoint this config "
+                "describes."
+            )
+
     return {
         "passed": True,
         "gated": True,
+        "stamped_representation": None if representation is None else dict(representation),
         "budget_steps": int(resolved.budget_steps),
         "realised_max_warmup_steps": int(resolved.target.max_warmup),
         "target_declared_width": int(resolved.target.declared_width),
@@ -740,6 +922,41 @@ def check_warmup_budget_matches_checkpoint(
         "source_clock_delay_s": resolved.source_clock_delay_s,
         "inter_stream_offset_s": resolved.inter_stream_offset_s,
         "leg_alignment": resolved.leg_alignment,
+        # The representation version, named rather than inferred: a checkpoint's stamped channel
+        # tuples cannot distinguish two operator versions whose kept widths happen to coincide.
+        "phase_operator": resolved.phase_operator,
+        # The SCORED target's clock, stated as what it is. 'physical' is an approximate delay
+        # compensation under the kappa convention -- labels are later stored coefficients advanced
+        # per channel by round(kappa (tau_c - tau_min) / Delta) -- not an exact physical instant;
+        # 'stored' is exact coefficient availability; 'input' scores already-available values
+        # relative to the delayed input stream.
+        "target_forecast_clock": resolved.target_forecast_clock,
+        "target_forecast_clock_label": _FORECAST_CLOCK_LABELS[resolved.target_forecast_clock],
+        "target_forecast_reference_s": resolved.target_forecast_reference_s,
+        # Where the labels actually sit: the last scored element of the most-advanced channel reads
+        # stored step t + H - 1 + max_advance, i.e. Delta (H + max_advance) seconds past the anchor
+        # (460 s under the shipped physical clock, 120 s under stored), which costs the trailing
+        # max_advance anchors: the dense span is T_valid - max_advance - F (51 against 136).
+        "max_forecast_advance_steps": int(resolved.max_forecast_advance),
+        "label_availability_endpoint_s": float(
+            SECONDS_PER_STEP * (geometry["horizon"] + resolved.max_forecast_advance)
+        ),
+        "dense_anchor_span": int(
+            geometry["sequence_length"] - geometry["horizon"]
+            - resolved.max_forecast_advance - geometry["warmup_period"]
+        ),
+        # The input shifts, so a reader can see how much fresh trajectory the alignment withheld
+        # (340 s at the shipped target reference) without re-resolving the budget.
+        "max_target_input_shift_s": float(SECONDS_PER_STEP * resolved.target.max_align_delay),
+        "max_source_input_shift_s": float(SECONDS_PER_STEP * resolved.source.max_align_delay),
+        # The source-to-label content separation from the ACTUAL gathers, on the canonical stored
+        # timeline: nearest, union over lags and horizon elements, and the every-horizon window,
+        # all in seconds, plus the per-pair rounding spread. Approximate content leads under the
+        # kappa convention, never exact physiological timestamps.
+        "content_lag_s": _content_lag_record(resolved, geometry),
+        # What the stored novelty vector -- and the tertile columns ranked by it -- actually is,
+        # beside the clock and horizon this run scores under (CFS-08).
+        "novelty_proxy": _novelty_proxy_record(resolved, geometry),
         "source_dropped_index": list(resolved.source.dropped_index),
         "target_max_align_delay": int(resolved.target.max_align_delay),
         "source_max_align_delay": int(resolved.source.max_align_delay),
@@ -1117,6 +1334,52 @@ def disclosed_attribute(model: Any, name: str) -> Any:
     return getattr(model, name)
 
 
+def objective_channel_weights(model: Any) -> Dict[str, Any]:
+    r"""Disclose how the training objective's channel-weight mass splits across the stored blocks.
+
+    The objective weights every kept target channel by ``target_weight_st`` or ``target_weight_ph``
+    and renormalises so the weighted block keeps the unweighted block's scale
+    (``_resolve_channel_weights``). The share of that mass each block receives is what says how
+    secondary phase forecasting is in the objective: at the legacy shipped geometry ($32$ scattering
+    and $66$ phase channels kept, ratio $1:0.1$) phase receives $6.6 / 38.6 \approx 17.1\%$ of the
+    mass while occupying two thirds of the output coordinates (CFS-10). Read off the run's own model
+    rather than restated, so it follows every schema change -- the integer-phase representation
+    keeps $44$ phase channels and moves the number. The evaluation scores apply no channel weight;
+    this records the objective the checkpoint was trained under.
+
+    Args:
+        model: The rebuilt net, which carries the resolved ``target_channel_weight`` buffer and the
+            gate whose keep-index says which declared channel each entry is.
+
+    Returns:
+        The two configured weights, the kept count per block, and each block's share of the
+        renormalised weight mass.
+
+    Raises:
+        AttributeError: If the model does not carry the buffer, naming the class.
+    """
+    weights = disclosed_attribute(model, "target_channel_weight").detach().cpu().to(torch.float64)
+    gate = getattr(model, "target_gate", None)
+    declared = (
+        torch.arange(int(model.c_y)) if gate is None else gate.keep_index.detach().cpu()
+    )
+    is_scattering = declared < int(disclosed_attribute(model, "TARGET_BLOCK_SPLIT"))
+    total = float(weights.sum())
+    return {
+        "target_weight_st": float(disclosed_attribute(model, "target_weight_st")),
+        "target_weight_ph": float(disclosed_attribute(model, "target_weight_ph")),
+        "n_scattering_kept": int(is_scattering.sum()),
+        "n_phase_kept": int((~is_scattering).sum()),
+        "scattering_mass_frac": float(weights[is_scattering].sum() / total),
+        "phase_mass_frac": float(weights[~is_scattering].sum() / total),
+        "note": (
+            "share of the renormalised per-channel loss weight each stored block receives in the "
+            "TRAINING objective, from this run's own model; the evaluation scores apply no "
+            "channel weight. Retune rather than transfer the ratio after a schema change (CFS-14)."
+        ),
+    }
+
+
 def cfs_encoder_disclosure(model: Any) -> Dict[str, Any]:
     """Return the encoder-specific half of the causality record for the recurrent encoder.
 
@@ -1246,10 +1509,12 @@ def causality_disclosure(
         "target_reference_delay_s": (
             None if warmup is None else warmup.get("reference_delay_s")
         ),
-        # The bias the pair puts on the lag axis, which is the term `physical_lag_seconds` carries
-        # as (source_reference_s - target_reference_s). Zero under one clock, negative under a
-        # faster source clock, ``None`` unaligned -- where it is channel-pair-indexed and no single
-        # number stands in for it.
+        # The difference of the two references. The bias the pair puts on the lag axis is kappa
+        # (ALIGNMENT_DELAY_FACTOR, 0.875) times this: content sits at kappa of its reported delay,
+        # which is what `physical_lag_seconds` scales the difference by and what the reference
+        # pricing in `warmup_budget.py` prices with. Zero under one clock, negative under a faster
+        # source clock, ``None`` unaligned -- where it is channel-pair-indexed and no single number
+        # stands in for it.
         "inter_stream_offset_s": (
             None if warmup is None else warmup.get("inter_stream_offset_s")
         ),
@@ -1368,6 +1633,7 @@ def run_preflight(
     model_kwargs: Mapping[str, Any],
     hyper_parameters: Mapping[str, Any],
     binding: "ModelBinding",
+    representation: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Run every guard, then record the run's causal standing.
 
@@ -1390,6 +1656,8 @@ def run_preflight(
             reconciliation compares, the class the warm-up tuples are translated for, and the encoder
             half of the causality record. Passed in rather than imported, so this module still names
             no model class.
+        representation: The checkpoint's stamped ``causal_representation`` record, or ``None`` for
+            a checkpoint written before the stamp existed.
 
     Returns:
         The preflight record, ready for :func:`write_preflight`.
@@ -1414,7 +1682,8 @@ def run_preflight(
         geometry_keys=binding.geometry_keys,
     )
     warmup = check_warmup_budget_matches_checkpoint(
-        config, model_kwargs=model_kwargs, model_cls=binding.model_cls
+        config, model_kwargs=model_kwargs, model_cls=binding.model_cls,
+        representation=representation,
     )
     load_check = verify_weights_loaded(model)
 
@@ -1450,6 +1719,9 @@ def run_preflight(
             "weights_loaded": load_check,
         },
         "causality": causality_disclosure(config, model, binding.encoder_disclosure, warmup=warmup),
+        # The objective's block-weight split, from the model rather than from the config's two
+        # scalars, so the phase share is the kept-width-specific number (CFS-10).
+        "objective_weights": objective_channel_weights(model),
     }
 
 

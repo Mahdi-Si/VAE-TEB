@@ -1,27 +1,26 @@
-r"""The two lag quantities, pinned.
+r"""The stored-timeline lag quantity, pinned.
 
 The failure this guards against is not a crash: it is a figure axis or a reported number that
-silently carries -- or silently drops -- one of the two corrections. Both arms are asserted with
-literal expected values rather than by re-deriving the formula, because a test that recomputes
-the arithmetic under test passes whatever the arithmetic happens to be.
+silently carries -- or silently drops -- the input-delay term, or that reintroduces a dataset
+shift the stored timeline does not have. Both arms are asserted with literal expected values rather
+than by re-deriving the formula, because a test that recomputes the arithmetic under test passes
+whatever the arithmetic happens to be.
 """
 from __future__ import annotations
 
 import pytest
 import torch
 
-from teb_vae.lag_attn.nets.lag_report import (
-    MECHANICAL_SHIFT_SECONDS,
-    SECONDS_PER_STEP,
-    lag_compensated_seconds,
-    lag_original_sensor_seconds,
-)
+from teb_vae.lag_attn.nets import lag_report
+from teb_vae.lag_attn.nets.lag_report import SECONDS_PER_STEP, lag_compensated_seconds
 
 
-def test_the_step_and_shift_constants_are_the_pipelines():
-    """$4$ s per decimated step and the $20$ s mechanical correction preprocessing removes."""
+def test_the_step_constant_is_the_pipelines_and_there_is_no_shift_constant():
+    """$4$ s per decimated step, and no dataset-shift constant at all: the stored UP/FHR timeline
+    is canonical, so the builder's shift is never undone downstream."""
     assert SECONDS_PER_STEP == pytest.approx(4.0)
-    assert MECHANICAL_SHIFT_SECONDS == pytest.approx(20.0)
+    assert not hasattr(lag_report, "MECHANICAL_SHIFT_SECONDS")
+    assert not hasattr(lag_report, "lag_original_sensor_seconds")
 
 
 @pytest.mark.parametrize(
@@ -39,18 +38,6 @@ def test_a_nonzero_input_delay_lengthens_the_reported_lag(lag_step, delay_steps,
     """A source memory read $\\delta$ steps stale puts the true lag $\\delta$ steps further back;
     dropping the term would report a delayed channel as if it were prompt."""
     assert lag_compensated_seconds(lag_step, delay_steps=delay_steps) == pytest.approx(expected)
-
-
-@pytest.mark.parametrize(("lag_step", "delay_steps"), [(0, 0), (5, 0), (5, 3), (90, 30)])
-def test_the_sensor_timeline_is_the_compensated_one_plus_the_mechanical_shift(
-    lag_step, delay_steps
-):
-    """The two quantities differ by exactly $20$ s, always -- which is the whole reason they must
-    not be reported interchangeably."""
-    compensated = lag_compensated_seconds(lag_step, delay_steps=delay_steps)
-    sensor = lag_original_sensor_seconds(lag_step, delay_steps=delay_steps)
-
-    assert sensor - compensated == pytest.approx(20.0)
 
 
 def test_a_whole_lag_axis_converts_elementwise():

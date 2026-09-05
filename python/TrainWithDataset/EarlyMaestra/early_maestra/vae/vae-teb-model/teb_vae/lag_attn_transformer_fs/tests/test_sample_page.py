@@ -363,8 +363,8 @@ def test_both_lag_panels_carry_the_axis_this_models_reported_delay_implies(task,
     Three things must hold at once: the map must be the one the *model's* own $\delta$ gives -- not a
     zero-offset one, which is what an unresolved delay silently produces -- the two panels must carry
     the same map, since they are read together, and the label must say *compensated* rather than a bare
-    "Lag (s)", which is ambiguous between the mechanically compensated lag and the uncorrected sensor
-    one.
+    "Lag (s)", which does not say whether the input delay $\delta$ was added back. The stored timeline
+    is canonical, so that is the only correction a lag axis ever carries.
 
     Read **after a draw**: matplotlib defers a secondary axis's limits to draw time, so an assertion
     made before one passes against the default $(0, 1)$ whatever the transform is -- which would make

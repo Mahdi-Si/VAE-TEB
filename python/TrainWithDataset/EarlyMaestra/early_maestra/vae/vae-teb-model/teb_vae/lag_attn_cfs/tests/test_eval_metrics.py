@@ -67,6 +67,7 @@ from teb_vae.lag_attn_rws.nets.raw_masks import forecast_mask, kl_mask
 from .conftest import (
     BATCH,
     TINY_KWARGS,
+    TINY_STRIDE,
     build,
     make_stub_batch,
     tiny_warmup_kwargs,
@@ -1167,3 +1168,57 @@ def test_the_tiny_geometry_exercises_the_gated_model(trained_task) -> None:
 
     assert model.target_gate is not None
     assert int(model.decoder_out_channels) < int(TINY_KWARGS["c_y"])
+
+
+def test_at_one_draw_the_base_branch_is_not_the_training_path_under_mean_decoding(
+    task, perturb_posterior, stub_batch
+) -> None:
+    r"""The correction of a claim the estimator's docstring used to make (CFS-10).
+
+    Under the shipped ``base_decode: mean`` the forward decodes the base branch at $\mu^p$ and
+    the full branch at one posterior sample. The Monte Carlo estimator samples EVERY branch, so at
+    $K = 1$ its base score is one sampled-latent score and not the training path's
+    ``nll_base_block`` -- the two agree only once the log-variance is pinned at $-\infty$, which
+    turns the sample back into the mean. The same call also pins the common-random-numbers
+    property the matched gap rests on: two branches with identical latent parameters score
+    bitwise identically, whatever the draw.
+    """
+    module = task(model_kwargs=tiny_warmup_kwargs(anchor_stride=TINY_STRIDE, base_decode="mean"))
+    perturb_posterior(module.orig_model)
+    module.eval()
+    outputs, _tf, _weight, target, mask, _support = _dense_pieces(module, stub_batch)
+    model = module.orig_model
+    assert model.base_decode == "mean"
+    # The forward's own base latent IS the prior mean: that is what the training path decoded.
+    assert torch.equal(outputs["z_prior"], outputs["mu_prior"])
+    training_base, _ = masked_raw_block_per_anchor(
+        outputs["mu_base"], target, mask, likelihood="gaussian_nll", logvar=outputs["logvar_base"]
+    )
+
+    prior = (outputs["mu_prior"], outputs["logvar_prior"])
+    scores, _contributing = mc_predictive_block(
+        model,
+        {"base": prior, "twin": prior},
+        target,
+        mask,
+        anchors=outputs["anchor_index"],
+        likelihood="gaussian_nll",
+        num_samples=1,
+        generator=torch.Generator().manual_seed(0),
+    )
+    # Common random numbers: identical latent distributions, identical matched scores.
+    assert torch.equal(scores["base"], scores["twin"])
+    # One sampled draw is not the mean-decoded training path.
+    assert not torch.allclose(scores["base"], training_base)
+
+    pinned = torch.full_like(outputs["logvar_prior"], -1.0e30)
+    recovered, _ = mc_predictive_block(
+        model,
+        {"base": (outputs["mu_prior"], pinned)},
+        target,
+        mask,
+        anchors=outputs["anchor_index"],
+        likelihood="gaussian_nll",
+        num_samples=1,
+    )
+    assert torch.equal(recovered["base"], training_base)

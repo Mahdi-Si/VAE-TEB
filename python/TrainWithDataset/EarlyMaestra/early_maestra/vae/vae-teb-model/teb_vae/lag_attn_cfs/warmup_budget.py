@@ -84,7 +84,6 @@ from teb_vae.lag_attn.figure_primitives import (  # noqa: E402
     COLOR_VERMILLION,
 )
 from teb_vae.lag_attn.nets.lag_report import (  # noqa: E402
-    MECHANICAL_SHIFT_SECONDS,
     SECONDS_PER_STEP,
 )
 from teb_vae.lag_attn_cfs.causal_warmup import (  # noqa: E402
@@ -482,36 +481,160 @@ def readable_window_seconds(
     horizon: int,
     max_lag: int,
     seconds_per_step: float = SECONDS_PER_STEP,
-    mechanical_shift_seconds: float = MECHANICAL_SHIFT_SECONDS,
 ) -> Tuple[float, float]:
-    r"""The physical-delay window readable at **every** horizon step, for one clock offset.
+    r"""The content-delay window readable at **every** horizon step, for one clock offset.
 
-    $$\bigl[\Delta H + \mathrm{offset} - \tau_{\mathrm{pre}},\;
-      \Delta L + \mathrm{offset} - \tau_{\mathrm{pre}}\bigr],$$
+    $$\bigl[\Delta H + \mathrm{offset},\; \Delta L + \mathrm{offset}\bigr],$$
 
     the intersection over $h \in [0, H)$ of the per-step windows
-    $[\Delta(1{+}h) + \mathrm{offset} - \tau_{\mathrm{pre}},\,
-    \Delta(L{+}h) + \mathrm{offset} - \tau_{\mathrm{pre}}]$: the lower edge is lag $0$ at the far
-    step, the upper is lag $L - 1$ at the first. A band inside this window is what the table's
-    ``readable`` verdict asserts, and printing the window itself is what lets an operator see
-    *which* delays a censored candidate still covers rather than only that the named band is not
-    among them.
+    $[\Delta(1{+}h) + \mathrm{offset},\, \Delta(L{+}h) + \mathrm{offset}]$: the lower edge is lag
+    $0$ at the far step, the upper is lag $L - 1$ at the first. A band inside this window is what
+    the table's ``readable`` verdict asserts, and printing the window itself is what lets an
+    operator see *which* delays a censored candidate still covers rather than only that the named
+    band is not among them.
+
+    Stated on the canonical stored timeline: there is no dataset-shift term. The window is an
+    approximate coefficient-content lead (the offset carries the $\kappa$ convention), not an
+    exact physiological delay.
 
     Args:
-        offset_s: $\tau^u_{\mathrm{ref}} - \tau^y_{\mathrm{ref}}$ in seconds, against whichever
+        offset_s: $\kappa\,(\tau^u_{\mathrm{ref}} - \tau^y_{\mathrm{ref}})$ in seconds -- the
+            realised bias, as :class:`SourceReferencePoint` carries it -- against whichever
             target clock the run scores on.
         horizon: $H$ in decimated steps.
         max_lag: The furthest searched lag, $L - 1$.
         seconds_per_step: Seconds per decimated step $\Delta$.
-        mechanical_shift_seconds: $\tau_{\mathrm{pre}}$, the sensor delay preprocessing removed.
 
     Returns:
         ``(lo, hi)`` in seconds.
     """
-    base = float(offset_s) - float(mechanical_shift_seconds)
+    base = float(offset_s)
     return (
         float(seconds_per_step) * float(horizon) + base,
         float(seconds_per_step) * (float(max_lag) + 1.0) + base,
+    )
+
+
+class ContentLagSummary(NamedTuple):
+    r"""What the actual gathers put on the lag axis, in seconds, on the canonical stored timeline.
+
+    Attributes:
+        nearest_s: The smallest source-to-label content separation any (source channel, target
+            channel) pair reaches, at $\ell = h = 0$.
+        union_s: ``(lo, hi)``, the range of separations over every pair, lag and horizon element.
+        every_horizon_s: ``(lo, hi)``, the intersection over horizon elements of the per-element
+            ranges -- the separations readable at EVERY horizon step, for every pair.
+        pair_spread_s: The spread of the per-pair separation at $\ell = h = 0$, i.e. the
+            rounding jitter under an aligned run and the channel-pair smear under an unaligned one.
+    """
+
+    nearest_s: float
+    union_s: Tuple[float, float]
+    every_horizon_s: Tuple[float, float]
+    pair_spread_s: float
+
+
+def content_lag_seconds(
+    budget: WarmupBudget,
+    *,
+    lag_step: int,
+    horizon_element: int,
+    seconds_per_step: float = SECONDS_PER_STEP,
+    delay_factor: float = ALIGNMENT_DELAY_FACTOR,
+) -> np.ndarray:
+    r"""The source-to-label content separation from the ACTUAL gathers, per channel pair.
+
+    $$L_{j,c}(\ell, h) \;=\; \Delta\,(\ell + 1 + h + s_c + d^u_j) \;+\; \delta^u_j - \delta^y_c,
+      \qquad \delta = \kappa\,	au ,$$
+
+    with $s_c$ the scored target channel's forecast shift (zero under the stored clock), $d^u_j$
+    the source channel's input shift (zero unaligned), and $\delta$ the explicitly approximate
+    content-delay summary of each channel's composed group delay. Stated on the canonical stored
+    timeline: no dataset-shift term. It is the general identity the reference-based
+    :func:`~teb_vae.lag_attn.nets.lag_report.physical_lag_seconds` reduces to on an aligned run,
+    computed here from the gathers themselves rather than from the two references, so the target
+    side is automatically the SCORED clock -- $	au_{\min}$ under ``'physical'``, each channel's
+    own $	au_c$ under ``'stored'`` -- and the per-channel rounding is visible rather than
+    assumed away.
+
+    Args:
+        budget: The resolved budget, whose kept indices, shifts and declared delays are read.
+        lag_step: $\ell$.
+        horizon_element: $h$.
+        seconds_per_step: $\Delta$.
+        delay_factor: $\kappa$, the content-delay convention. A convention, not a measured
+            universal: a narrowband modulation realises close to the full group delay.
+
+    Returns:
+        ``(n_source_kept, n_target_kept)`` separations in seconds.
+    """
+    target, source = budget.target, budget.source
+    target_delay = np.asarray([target.declared_delay_s[index] for index in target.keep_index])
+    source_delay = np.asarray([source.declared_delay_s[index] for index in source.keep_index])
+    forecast_shift = (
+        np.zeros(len(target.keep_index), dtype=np.int64)
+        if budget.target_forecast_shift is None
+        else np.asarray(budget.target_forecast_shift, dtype=np.int64)
+    )
+    input_shift = (
+        np.zeros(len(source.keep_index), dtype=np.int64)
+        if source.align_delays is None
+        else np.asarray(source.align_delays, dtype=np.int64)
+    )
+    grid = float(seconds_per_step) * (
+        float(lag_step) + 1.0 + float(horizon_element)
+        + forecast_shift[None, :] + input_shift[:, None]
+    )
+    return grid + float(delay_factor) * (source_delay[:, None] - target_delay[None, :])
+
+
+def summarise_content_lag(
+    budget: WarmupBudget,
+    *,
+    horizon: int,
+    max_lag: int,
+    seconds_per_step: float = SECONDS_PER_STEP,
+    delay_factor: float = ALIGNMENT_DELAY_FACTOR,
+) -> ContentLagSummary:
+    r"""The nearest, union and every-horizon content-lag windows from the actual gathers.
+
+    The identity is affine in $\ell$ and $h$ with unit slope in both, so each range is bracketed by
+    its corners: the union runs from the smallest pair separation at $\ell = h = 0$ to the largest
+    at $\ell = L - 1$, $h = H - 1$; the every-horizon window is the intersection over $h$, i.e.
+    from the smallest separation at $\ell = 0$, $h = H - 1$ to the largest at $\ell = L - 1$,
+    $h = 0$, and is empty when the lag window is narrower than the horizon reach.
+
+    Args:
+        budget: The resolved budget.
+        horizon: $H$ in decimated steps.
+        max_lag: $L - 1$, the furthest searched lag.
+        seconds_per_step: $\Delta$.
+        delay_factor: $\kappa$.
+
+    Returns:
+        The summary; ``every_horizon_s`` is ``(lo, hi)`` with ``lo > hi`` when empty.
+    """
+    first = content_lag_seconds(
+        budget, lag_step=0, horizon_element=0,
+        seconds_per_step=seconds_per_step, delay_factor=delay_factor,
+    )
+    last = content_lag_seconds(
+        budget, lag_step=max_lag, horizon_element=horizon - 1,
+        seconds_per_step=seconds_per_step, delay_factor=delay_factor,
+    )
+    far_step_near_lag = content_lag_seconds(
+        budget, lag_step=0, horizon_element=horizon - 1,
+        seconds_per_step=seconds_per_step, delay_factor=delay_factor,
+    )
+    first_step_far_lag = content_lag_seconds(
+        budget, lag_step=max_lag, horizon_element=0,
+        seconds_per_step=seconds_per_step, delay_factor=delay_factor,
+    )
+    return ContentLagSummary(
+        nearest_s=float(first.min()),
+        union_s=(float(first.min()), float(last.max())),
+        every_horizon_s=(float(far_step_near_lag.min()), float(first_step_far_lag.max())),
+        pair_spread_s=float(first.max() - first.min()),
     )
 
 
@@ -528,9 +651,11 @@ class SourceReferencePoint(NamedTuple):
             the envelope question is actually asked at.
         envelope_kept: Survivors of :data:`ENVELOPE_BLOCK`, pulled out of ``block_counts`` because
             it is the one the decision criterion is stated over.
-        offset_s: $\tau^u_{\mathrm{ref}} - \tau^y_{\mathrm{ref}}$, the constant inter-stream bias
-            a dual reference puts on the lag axis in place of the unaligned arm's pair-indexed
-            smear. Zero under today's single reference; negative for every faster candidate.
+        offset_s: $\kappa\,(\tau^u_{\mathrm{ref}} - \tau^y_{\mathrm{ref}})$, the constant
+            inter-stream bias a dual reference puts on the lag axis in place of the unaligned
+            arm's pair-indexed smear -- at the energy centroid the channels' content actually sits
+            at, which is why the factor is here as it is in ``realised_recency_s``. Zero under
+            today's single reference; negative for every faster candidate.
         recency_s: How stale the freshest surviving source channel is at the anchor, as the shards
             report it -- which is the reference itself: every aligned channel reports the physical
             instant $\Delta t - \tau^u_{\mathrm{ref}}$.
@@ -567,17 +692,20 @@ def _lag_for_physical_delay(
     offset_s: float,
     horizon_element: int,
     seconds_per_step: float = SECONDS_PER_STEP,
-    mechanical_shift_seconds: float = MECHANICAL_SHIFT_SECONDS,
 ) -> float:
     r"""Which lag index reports a physiological delay of ``delay_s`` at horizon step $h$.
 
     The inverse of :func:`~teb_vae.lag_attn.nets.lag_report.physical_lag_seconds`, solved for
-    $\ell$:
+    $\ell$ on the canonical stored timeline:
 
-    $$\tau^{\mathrm{phys}}_{\ell,h} = \Delta(\ell + 1 + h) + \bigl(\tau^u_{\mathrm{ref}}
-      - \tau^y_{\mathrm{ref}}\bigr) - \tau_{\mathrm{pre}}
+    $$\tau^{\mathrm{phys}}_{\ell,h} = \Delta(\ell + 1 + h) + \kappa\bigl(\tau^u_{\mathrm{ref}}
+      - \tau^y_{\mathrm{ref}}\bigr)
     \quad\Longleftrightarrow\quad
-    \ell = \frac{\tau^{\mathrm{phys}} + \tau_{\mathrm{pre}} - \mathrm{offset}}{\Delta} - 1 - h .$$
+    \ell = \frac{\tau^{\mathrm{phys}} - \mathrm{offset}}{\Delta} - 1 - h ,$$
+
+    with $\mathrm{offset} = \kappa(\tau^u_{\mathrm{ref}} - \tau^y_{\mathrm{ref}})$ the realised
+    bias the caller has already scaled. There is no dataset-shift term: the builder's UP shift is
+    part of the stored signal.
 
     Returned as a **float** rather than rounded to a bin: what this answers is whether the band
     clears the window's two censoring edges, and rounding first would turn a delay sitting $0.4$
@@ -585,17 +713,15 @@ def _lag_for_physical_delay(
 
     Args:
         delay_s: The physiological delay $\tau^{\mathrm{phys}}$ in seconds.
-        offset_s: $\tau^u_{\mathrm{ref}} - \tau^y_{\mathrm{ref}}$, in seconds.
+        offset_s: $\kappa\,(\tau^u_{\mathrm{ref}} - \tau^y_{\mathrm{ref}})$, in seconds.
         horizon_element: $h$, which forecast step the delay is reported against.
         seconds_per_step: Seconds per decimated step $\Delta$.
-        mechanical_shift_seconds: $\tau_{\mathrm{pre}}$, the sensor delay preprocessing removed.
 
     Returns:
         The lag index, unrounded and possibly negative.
     """
     return (
-        (float(delay_s) + float(mechanical_shift_seconds) - float(offset_s))
-        / float(seconds_per_step)
+        (float(delay_s) - float(offset_s)) / float(seconds_per_step)
         - 1.0
         - float(horizon_element)
     )
@@ -691,7 +817,13 @@ def source_reference_tradeoff(
             for name, start, stop in source.block_spans
         )
         envelope = next((kept for name, kept, _ in blocks if name == ENVELOPE_BLOCK), 0)
-        offset = candidate - reference
+        # The REALISED offset. An aligned channel at step t carries content centred kappa*tau_ref
+        # earlier -- the energy centroid the alignment shift itself is computed at, and the lag
+        # the aligned shard measures (aligned channel 0 lags the raw signal by kappa*tau_ref on
+        # both streams) -- so the bias between the two clocks on the lag axis is kappa times the
+        # difference of the references, not the difference itself. Priced unscaled, every window
+        # below sits (1 - kappa) * offset too far: 14 s on the stored clock, 34 s on the physical.
+        offset = ALIGNMENT_DELAY_FACTOR * (candidate - reference)
         # The fastest delay at the furthest horizon step is the smallest lag the band ever occupies,
         # and the slowest delay at the first step is the largest: the lag is affine, decreasing in
         # $h$ and increasing in the delay, so those two corners bracket the whole rectangle.

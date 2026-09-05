@@ -56,9 +56,10 @@ ALIGN_MODEL_KWARGS = ("target_align_delays", "source_align_delays")
 FORECAST_ALIGN_MODEL_KWARGS = ("target_forecast_shift",)
 
 #: The readout vector, in a third tuple for a third reason: it is neither a guard nor a shift. It
-#: partitions the *scored target* by how much of each coefficient is genuinely new at the anchor's
-#: horizon, and it changes no width, no mask and no parameter -- which is exactly why the ungated
-#: comparison arm keeps it while dropping the two tuples above.
+#: partitions the *scored target* by the shard's stored novelty proxy -- the fixed-horizon,
+#: stored-clock envelope-mass share of each channel after the anchor, a label rather than an exact
+#: value fraction (CFS-08) -- and it changes no width, no mask and no parameter, which is exactly
+#: why the ungated comparison arm keeps it while dropping the two tuples above.
 #:
 #: Emitted only to a class that accepts it, which is the **feature**-target pair. The two
 #: raw-target cells forecast a raw signal: its last axis counts samples of one trace, every one of

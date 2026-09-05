@@ -34,6 +34,8 @@ from teb_vae.lag_attn_transformer_cfs.nets.model import SeqVaeLagAttnTrfCfs
 from teb_vae.lag_attn_transformer_cfs.trainer import LagAttnTrfCfsTrainer
 from train.test_utils import make_graph_model
 
+from teb_vae.lag_attn_cfs.tests.conftest import INT_C_U, INT_C_Y
+
 from .conftest import (
     CAUSAL_C_U,
     CAUSAL_C_Y,
@@ -66,14 +68,14 @@ DECLARED_CONFIG_FILES = frozenset(
         "sweep_anchor_stride_1.yaml",
         "sweep_lag_bias_decay.yaml",
         "sweep_align_target_max.yaml",
-        "sweep_align_unaligned.yaml",
         "sweep_lag_kv_adapter.yaml",
         "sweep_source_dropout_02.yaml",
         "sweep_source_dropout_03.yaml",
         # The forecast-clock pair: the stored arm restores today's target and tiling exactly, the
         # input arm scores the continuation of the encoder's own aligned stream.
-        "sweep_target_clock_stored.yaml",
         "sweep_target_clock_input.yaml",
+        # The configuration this cell shipped before the 2026-09-05 promotion, as a comparator.
+        "sweep_legacy_dualref_physclock.yaml",
     }
 )
 
@@ -121,6 +123,9 @@ TASK_LEVEL_KEYS = (
     # resolve into theirs.
     "causal_target_forecast_clock",
     "causal_leg_alignment",
+    # The phase-harmonic operator VERSION the shards were built with, checked against their root
+    # attribute exactly as the leg alignment is; a resolver expectation, not a constructor key.
+    "causal_phase_operator",
     "causal_reach_budget_s",
 )
 
@@ -185,6 +190,7 @@ TARGET_EDGE_EXEMPT_PATHS: Dict[str, str] = {
         "instant, so there is no clock to move them onto"
     ),
     f"{_VAE}.causal_leg_alignment": "only a causal shard records a phase-harmonic operator",
+    f"{_VAE}.causal_phase_operator": "only a causal shard records a phase-operator version",
     f"{_VAE}.anchor_stride": "no two-sided counterpart",
     f"{_VAE}.lag_floor": "no two-sided counterpart",
     "advanced_config.spike_breaker.additive_margin": (
@@ -240,6 +246,10 @@ TINY_DELTA_PATHS = frozenset(
 
 SMOKE_HIE_DELTA_PATHS = frozenset(
     {
+        # The local shard is a LEGACY build, so the smoke pins the operator and widths back to it.
+        "model_config.VAE_model.causal_phase_operator",
+        "model_config.VAE_model.c_y",
+        "model_config.VAE_model.c_u",
         "general_config.tag",
         "general_config.cuda_devices",
         "general_config.epochs",
@@ -258,21 +268,15 @@ SMOKE_HIE_DELTA_PATHS = frozenset(
     }
 )
 
-#: Surviving target channels at the shipped warm-up budget.
-KEPT_TARGET_CHANNELS = 98
+#: Surviving target channels at the shipped warm-up budget, on the integer-operator shard:
+#: $32$ of $36$ ``fhr_st`` plus every one of the $44$ ``fhr_ph``.
+KEPT_TARGET_CHANNELS = 76
 
-#: Surviving source channels at the shipped ALIGNMENT, which is the only rule that gates this
-#: stream: the warm-up budget keeps all $51$, and the reference drops every channel whose composed
-#: delay is above it.
-#:
-#: **The number moved when the source gained a clock of its own.** Under one reference at the
-#: target's $402.1604$ s it was $47$ -- four ``up_st`` casualties and every one of the fifteen
-#: ``up_ph``. The shipped source reference is $288.2672$ s, a hundred and fourteen seconds faster,
-#: and it costs eight more: $30$ of $36$ ``up_st`` and $9$ of $15$ ``up_ph``. That is the trade the
-#: reference was pinned on -- a physiological delay lands mid-window on the lag axis instead of
-#: below its near edge -- and it is priced here rather than argued, because a source width is what
-#: every attended summary in this cell is built from.
-KEPT_SOURCE_CHANNELS = 39
+#: Surviving source channels. The promoted default reads every channel at its own availability
+#: time (no alignment reference), and the warm-up budget never gates this stream, so all $46$
+#: of the integer-operator shard's source channels survive; the legacy dual-reference arm
+#: kept $39$ of $51$.
+KEPT_SOURCE_CHANNELS = 46
 
 
 def _flatten(node: Dict[str, Any], prefix: str = "") -> Dict[str, Any]:
@@ -425,15 +429,15 @@ def test_the_shipped_config_builds_a_decoder_as_wide_as_the_budget_keeps(tmp_pat
     assert len(kwargs["target_keep_index"]) == KEPT_TARGET_CHANNELS
     assert len(kwargs["target_warmup_steps"]) == KEPT_TARGET_CHANNELS
     assert len(kwargs["source_keep_index"]) == KEPT_SOURCE_CHANNELS
-    assert len(kwargs["target_align_delays"]) == KEPT_TARGET_CHANNELS
-    assert len(kwargs["source_align_delays"]) == KEPT_SOURCE_CHANNELS
+    # Unaligned: the mapping emits no shift vectors at all rather than zeros.
+    assert "target_align_delays" not in kwargs and "source_align_delays" not in kwargs
     # The reach guard's keywords, which name a different mechanism and stay refused.
     assert "target_delays" not in kwargs and "source_delays" not in kwargs
 
     model = SeqVaeLagAttnTrfCfs(**kwargs)
     assert model.decoder.mean_head.out_features == KEPT_TARGET_CHANNELS
     assert model.raw_per_step == 16  # untouched by the width
-    assert model.horizon * model.decoder_out_channels == 2940
+    assert model.horizon * model.decoder_out_channels == 2280
 
 
 def test_the_shipped_geometry_pairs_the_floor_with_the_budget(shipped):
@@ -443,10 +447,10 @@ def test_the_shipped_geometry_pairs_the_floor_with_the_budget(shipped):
 
     assert vae["warmup_period"] == 134
     assert vae["causal_warmup_budget_steps"] == 134
-    assert vae["causal_align_reference"] == "target_max"
+    assert vae["causal_align_reference"] is None
     assert vae["warmup_period"] >= vae["causal_warmup_budget_steps"] - 1
-    assert vae["c_y"] == CAUSAL_C_Y
-    assert vae["c_u"] == CAUSAL_C_U
+    assert vae["c_y"] == INT_C_Y
+    assert vae["c_u"] == INT_C_U
 
 
 def test_the_anchor_stride_pairs_with_the_forecast_clock(shipped):
@@ -457,8 +461,8 @@ def test_the_anchor_stride_pairs_with_the_forecast_clock(shipped):
     restores the horizon-partitioning 30 with its clock."""
     vae = _get(shipped, _VAE)
 
-    assert vae["causal_target_forecast_clock"] == "physical"
-    assert vae["anchor_stride"] == 5
+    assert vae["causal_target_forecast_clock"] == "stored"
+    assert vae["anchor_stride"] == 13
     assert vae["horizon"] == 30
     assert vae["lag_floor"] == 0
 
@@ -531,6 +535,7 @@ def test_every_comparable_leaf_equals_the_target_siblings_value(shipped, target_
         f"{_VAE}.causal_warmup_budget_steps",
         f"{_VAE}.causal_align_reference",
         f"{_VAE}.causal_leg_alignment",
+        f"{_VAE}.causal_phase_operator",
         f"{_VAE}.anchor_stride",
         f"{_VAE}.lag_floor",
         # The per-block reconstruction weights. The two-sided cell scores its channels uniformly,
@@ -766,10 +771,10 @@ def test_the_tiny_variant_points_at_the_committed_causal_shard(tiny):
     attribute and no warm-up vectors, and the pre-flight refuses it by name."""
     for key in ("vae_train_datasets", "vae_test_datasets"):
         paths = _get(tiny, f"dataset_config.{key}")
-        assert paths == ["teb_vae/lag_attn/tests/fixtures/tiny_shard_causal.hdf5"], key
+        assert paths == ["teb_vae/lag_attn/tests/fixtures/tiny_shard_causal_int.hdf5"], key
         assert (_REPO_ROOT / paths[0]).exists()
     stats = _get(tiny, "dataset_config.stat_path")
-    assert stats.endswith("tiny_stats_causal.hdf5")
+    assert stats.endswith("tiny_stats_causal_int.hdf5")
     assert (_REPO_ROOT / stats).exists()
 
 
@@ -789,9 +794,10 @@ def test_the_resolved_tiny_variant_validates_and_builds(tmp_path, loguru_warning
     # included -- the ceiling below is T_valid less the physical clock's 85-step advance.
     assert model.d_model == 32
     assert model.decoder_out_channels == KEPT_TARGET_CHANNELS
-    assert model.anchor_stride == 5
-    assert model.target_forecast_shift is not None
-    assert model.anchor_ceiling == model.geometry.t_valid - max(model.target_forecast_shift)
+    assert model.anchor_stride == 13
+    # The stored clock advances nothing: every anchor up to T_valid is decoded.
+    assert model.target_forecast_shift is None
+    assert model.anchor_ceiling == model.geometry.t_valid
 
 
 def test_the_local_variant_names_a_built_and_leg_aligned_causal_shard(smoke_hie):

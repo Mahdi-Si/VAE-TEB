@@ -17,9 +17,11 @@ Run from the repository root, which is what puts ``teb_vae``, ``train`` and ``ut
         --config teb_vae/lag_attn_transformer_cfs/configs/default.yaml
 
 From an IDE's Run button, with no command line: ``RUN_CONFIG`` at the bottom of this file names the
-config to use. Note a Run-button launch of ``default.yaml`` is a *single* process whose seven
-``cuda_devices`` make Lightning spawn DDP workers underneath it; for a single-device smoke run point
-``RUN_CONFIG`` at ``configs/tiny.yaml``.
+config to use -- ``configs/default.yaml``, which since 2026-09-05 carries the corrected representation
+(integer phase operator, unaligned inputs, stored clock) and needs the integer-operator shards. Note a
+Run-button launch of a production config is a *single* process whose seven ``cuda_devices`` make
+Lightning spawn DDP workers underneath it; for a single-device smoke run point ``RUN_CONFIG`` at
+``configs/tiny.yaml``.
 
 **Everything here is inherited, from two parents at once, and the three class attributes are the
 entire difference between building this architecture and building either model it is compared

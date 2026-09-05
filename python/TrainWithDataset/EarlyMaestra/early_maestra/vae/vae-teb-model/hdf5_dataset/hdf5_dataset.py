@@ -9,7 +9,7 @@ import pickle
 import atexit
 import threading
 import warnings
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import lru_cache
 import gc
 from torch.utils.data.dataloader import default_collate
@@ -96,6 +96,34 @@ def resolve_leg_alignment(attrs: Any) -> str:
     return str(value)
 
 
+#: Which phase-harmonic OPERATOR VERSION built a causal file's phase blocks. ``'ratio_power_v0'``
+#: raised the accelerated leg to the floating-point ratio $\xi_j/\xi_i$ (fractional $2^{3/2}$
+#: family included, principal-angle branch discontinuity included); ``'integer_harmonic_v1'``
+#: applies a stored integer harmonic and admits only $k \in \{2, 4\}$. Restated rather than
+#: imported from ``hdf5_dataset.causal_scattering``, which builds a kymatio filter bank at import;
+#: ``tests/test_phase_operator.py`` asserts the two strings agree. Absence means the legacy
+#: operator: every causal shard written before the version existed was built with it.
+PHASE_OPERATOR_LEGACY = 'ratio_power_v0'
+
+
+def resolve_phase_operator(attrs: Any) -> str:
+    """Which phase-harmonic operator version produced a causal file, with the legacy default.
+
+    Args:
+        attrs: The file's root HDF5 attributes.
+
+    Returns:
+        The stored ``causal_phase_operator``, or :data:`PHASE_OPERATOR_LEGACY` when the
+        attribute is absent -- the state of every causal shard written before the integer
+        operator existed. Absence is an answer rather than a gap, exactly as it is for the leg
+        alignment.
+    """
+    value = attrs.get('causal_phase_operator', PHASE_OPERATOR_LEGACY)
+    if isinstance(value, bytes):
+        value = value.decode('utf-8')
+    return str(value)
+
+
 @dataclass(frozen=True)
 class _FileLayout:
     """What one shard says about itself, read from attributes and shapes alone.
@@ -123,9 +151,14 @@ class _FileLayout:
             :func:`read_causal_warmup`, because nothing in the loading path
             compensates for a delay and refusing it here would take a shard
             offline for a field no sample read uses.
-        novelty_frac: Per-channel novelty fraction, per block, or ``None`` for
-            a two-sided file. Carries only the blocks that have the attribute,
-            for the same reason ``delay_s`` does.
+        novelty_frac: Per-channel LEGACY novelty scalar (``causal_novelty_frac``,
+            written at one fixed horizon by older builders), per block, or
+            ``None`` for a two-sided file. Carries only the blocks that have the
+            attribute, for the same reason ``delay_s`` does.
+        novelty_curve: Per-channel horizon-free novelty curve
+            (``causal_novelty_curve``, ``(C, W + 1)``), per block, or ``None``
+            for a two-sided file. Carries only the blocks that have it; a current
+            build writes it on every block and no legacy scalar.
         leg_alignment: Which phase-harmonic operator built the two phase
             blocks, or ``None`` for a two-sided file. **Absent is read as**
             :data:`LEG_ALIGNMENT_NONE`, so every shard written before the
@@ -134,6 +167,12 @@ class _FileLayout:
             exactly the widths, warm-ups and delays of an unaligned one: this
             is the only thing that tells them apart, so a file list and a stats
             pairing must both be able to see it.
+        phase_operator: Which phase-harmonic operator version built the two
+            phase blocks, or ``None`` for a two-sided file. **Absent is read
+            as** :data:`PHASE_OPERATOR_LEGACY`. The integer version also
+            changes the phase widths, but a width is not a version: two
+            selections could coincide in count and differ in exponent, so the
+            string is what is compared.
         quantile: The ``causal_warmup_quantile`` the warm-up was measured at, or
             ``None`` for a two-sided file. Read here rather than where it is
             compared because it describes the same boundary
@@ -152,6 +191,8 @@ class _FileLayout:
     novelty_frac: Optional[Dict[str, np.ndarray]]
     leg_alignment: Optional[str]
     quantile: Optional[float]
+    phase_operator: Optional[str] = None
+    novelty_curve: Optional[Dict[str, np.ndarray]] = None
 
 
 def _read_file_layout(path: str) -> _FileLayout:
@@ -182,12 +223,16 @@ def _read_file_layout(path: str) -> _FileLayout:
         warmup: Optional[Dict[str, np.ndarray]] = None
         delay: Optional[Dict[str, np.ndarray]] = None
         novelty: Optional[Dict[str, np.ndarray]] = None
+        curve: Optional[Dict[str, np.ndarray]] = None
         leg_alignment: Optional[str] = None
+        phase_operator: Optional[str] = None
         if transform == CAUSAL:
             leg_alignment = resolve_leg_alignment(f.attrs)
+            phase_operator = resolve_phase_operator(f.attrs)
             warmup = {}
             delay = {}
             novelty = {}
+            curve = {}
             for name, width in widths.items():
                 if 'causal_delay_s' in f[name].attrs:
                     delay[name] = np.asarray(
@@ -197,6 +242,16 @@ def _read_file_layout(path: str) -> _FileLayout:
                     novelty[name] = np.asarray(
                         f[name].attrs['causal_novelty_frac'], dtype=np.float64
                     )
+                if 'causal_novelty_curve' in f[name].attrs:
+                    table = np.asarray(f[name].attrs['causal_novelty_curve'], dtype=np.float64)
+                    if table.ndim != 2 or table.shape[0] != width:
+                        raise ValueError(
+                            f"{path}: '{name}' stores {width} channels but its "
+                            f"causal_novelty_curve has shape {table.shape}. The curve is read "
+                            f"back as a parallel array to the warm-up, so a row-count "
+                            f"disagreement would attribute one channel's curve to another."
+                        )
+                    curve[name] = table
                 if 'causal_warmup_steps' not in f[name].attrs:
                     raise ValueError(
                         f"{path} declares transform='causal' but its '{name}' block carries no "
@@ -222,6 +277,8 @@ def _read_file_layout(path: str) -> _FileLayout:
         novelty_frac=novelty,
         leg_alignment=leg_alignment,
         quantile=None if quantile is None else float(quantile),
+        phase_operator=phase_operator,
+        novelty_curve=curve,
     )
 
 
@@ -255,6 +312,14 @@ def _check_layouts_agree(layout: _FileLayout, reference: _FileLayout) -> None:
             f"An aligned shard has exactly the widths, warm-ups and delays of an unaligned one, "
             f"so nothing else here can tell them apart -- and the two hold different phase "
             f"coefficients under the same channel names."
+        )
+    if layout.phase_operator != reference.phase_operator:
+        raise ValueError(
+            f"Mixed causal phase operators in one dataset: {layout.path} is "
+            f"'{layout.phase_operator}' but {reference.path} is '{reference.phase_operator}'. "
+            f"The two apply different exponents to the accelerated leg and select different "
+            f"pair families, so their phase channels are different representations under the "
+            f"same block names; build one dataset per operator version."
         )
     if set(layout.widths) != set(reference.widths):
         missing = sorted(set(reference.widths) - set(layout.widths))
@@ -425,15 +490,24 @@ class CausalWarmup:
             in seconds for the same reason — it is a constant of the filter
             bank, and expressing it in steps would bake one decimation into a
             number that does not depend on one.
-        novelty_frac: ``{block: (C,) float64}``, the share of each channel's
-            coefficient drawn from raw samples an anchor has not yet seen, at
-            the horizon the writer measured it over. Empty for a shard written
-            before the attribute existed; a consumer that needs it must say so
-            rather than assume a default, because there is no value a missing
-            novelty vector could safely stand in as.
-        leg_alignment: Which phase-harmonic operator built the phase blocks of
-            every shard in the list, all of which agree on it.
+        novelty_frac: ``{block: (C,) float64}``, the LEGACY scalar novelty proxy
+            ``causal_novelty_frac`` -- the share of each channel's composed
+            envelope mass within the writer's one fixed horizon on the stored
+            clock. Empty for a shard written before that attribute existed or
+            after it was superseded by the curve; a consumer that needs a novelty
+            vector must say so rather than assume a default, because there is no
+            value a missing one could safely stand in as.
+        novelty_curve: ``{block: (C, W + 1) float64}``, the horizon-free
+            ``causal_novelty_curve`` of every current build: the share of each
+            channel's composed envelope mass within $w$ stored steps, for
+            $w = 0, \ldots, W$. A consumer looks its own horizon and per-channel
+            label advance up in it. Empty on a legacy shard.
+        leg_alignment: Which phase-harmonic leg alignment built the phase
+            blocks of every shard in the list, all of which agree on it.
         kept_steps: ``{block: T}``, the steps the trimmed window leaves.
+        phase_operator: Which phase-harmonic operator version built the phase
+            blocks of every shard in the list, all of which agree on it;
+            :data:`PHASE_OPERATOR_LEGACY` for every shard predating the version.
     """
 
     paths: Tuple[str, ...]
@@ -445,6 +519,8 @@ class CausalWarmup:
     novelty_frac: Dict[str, np.ndarray]
     leg_alignment: str
     kept_steps: Dict[str, int]
+    phase_operator: str = PHASE_OPERATOR_LEGACY
+    novelty_curve: Dict[str, np.ndarray] = field(default_factory=dict)
 
 
 def read_causal_warmup(
@@ -574,6 +650,22 @@ def read_causal_warmup(
                     f"bank and a channel alignment resolved from one of them is the wrong shift "
                     f"on the other."
                 )
+        # The curve is a constant of the bank too, and a novelty vector resolved from one shard's
+        # curve must describe every shard in the list; a shard that carries none where the
+        # reference does is a legacy build mixed into a current one.
+        layout_curve = layout.novelty_curve or {}
+        reference_curve = reference.novelty_curve or {}
+        if set(layout_curve) != set(reference_curve) or any(
+            not np.array_equal(layout_curve[name], reference_curve[name])
+            for name in reference_curve
+        ):
+            raise ValueError(
+                f"Mismatched causal_novelty_curve: {layout.path} disagrees with "
+                f"{reference.path} (blocks carrying it: {sorted(layout_curve)} against "
+                f"{sorted(reference_curve)}). The curve is a constant of the filter bank, so two "
+                f"shards that disagree were not built by the same bank, or one predates the "
+                f"attribute; a novelty split resolved from one of them mislabels the other."
+            )
 
     _, trim_steps = decimated_trim_steps(trim_minutes)
     rebased = rebase_causal_warmup(reference, trim_steps, trim_minutes)
@@ -599,6 +691,16 @@ def read_causal_warmup(
         leg_alignment=reference.leg_alignment,
         kept_steps={
             name: reference.lengths[name] - 2 * trim_steps for name in sorted(rebased)
+        },
+        phase_operator=(
+            PHASE_OPERATOR_LEGACY if reference.phase_operator is None else reference.phase_operator
+        ),
+        # Verbatim, like the delay: the trim moves where a window starts, not how a coefficient's
+        # envelope mass accumulates behind it. Empty on a legacy shard.
+        novelty_curve={
+            name: reference.novelty_curve[name]
+            for name in sorted(rebased)
+            if reference.novelty_curve is not None and name in reference.novelty_curve
         },
     )
 
@@ -1330,6 +1432,7 @@ class CombinedHDF5Dataset(Dataset):
             with h5py.File(self.stats_path, 'r') as f:
                 stats_transform = resolve_transform(f.attrs)
                 stats_alignment = resolve_leg_alignment(f.attrs)
+                stats_operator = resolve_phase_operator(f.attrs)
                 stats_widths = {
                     field: int(f[field].attrs['n_channels'])
                     for field in f.keys()
@@ -1357,6 +1460,16 @@ class CombinedHDF5Dataset(Dataset):
                     f"'{self._layout.leg_alignment}'. The two hold different phase coefficients "
                     f"at identical widths, so the width check below cannot see this and the "
                     f"phase blocks would be normalised with another transform's mean and scale."
+                )
+
+        if self._layout is not None and self._layout.phase_operator is not None:
+            if stats_operator != self._layout.phase_operator:
+                raise ValueError(
+                    f"Statistics/dataset phase-operator mismatch: {self.stats_path} was computed "
+                    f"over a '{stats_operator}' dataset but these files are "
+                    f"'{self._layout.phase_operator}'. The two operators apply different "
+                    f"exponents and select different pair families, so the phase blocks would be "
+                    f"normalised with constants accumulated over another representation."
                 )
 
         if self._layout is not None:

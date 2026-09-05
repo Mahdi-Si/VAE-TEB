@@ -214,9 +214,11 @@ $$\tau^y_{\mathrm{ref}} = 402.1604\ \mathrm{s}, \qquad
 **Where the shipped source value comes from, and what it was priced against.** It is not chosen
 here; it is the unique candidate — drawn from the source stream's own stored delays — satisfying
 both criteria of the tradeoff `warmup_budget.py` prints. A $20$–$60$ s physiological delay must land
-**mid-window at every horizon step**: under the shipped pair it occupies lags $8.5$–$47.5$ of
-$[0, 90]$, clear of both censoring edges, against $-20.0$–$19.0$ under the single reference, which
-is censored below lag $0$ for $h > 9$. And at least $8$ of the $15$ `up_ph` channels must survive:
+**mid-window at every horizon step**: under the shipped pair it occupies lags $-0.1$–$38.9$ of
+$[0, 90]$ on the canonical stored timeline — clear of the far edge at every step and grazing the
+near edge by $0.1$ lag at $h = 29$ (the $8.5$–$47.5$ first quoted here carried an unscaled offset
+and a $-20$ s dataset-shift term, both since removed; see the 2026-09-05 amendment in §17) —
+against $-25.0$–$14.0$ under the single reference, which is censored below lag $0$ for $h > 4$. And at least $8$ of the $15$ `up_ph` channels must survive:
 $9$ do, where the next faster candidate ($244.5197$ s) keeps only $6$ and is refused on that
 criterion alone. What it buys is recency — the freshest surviving source channel moves from $402.2$
 s to $288.3$ s of reported staleness before the anchor, $351.9$ s to $252.2$ s realised at the
@@ -845,9 +847,13 @@ block boundary. The partition is by **rank** of $W'_c$ rather than by its value,
 move when the budget moves rather than sitting at step counts a rebuilt dataset would invalidate.
 
 **The three novelty tertile columns cut the same axis a third way, and answer the question the
-pooled block score cannot.** $\nu_c$ is the share of a target coefficient drawn from raw samples the
-anchor has not seen — a property of the bank, computed at write time and stored per block as
-`causal_novelty_frac`. On the shipped kept set it runs from $1.000$ on the fastest channels to
+pooled block score cannot.** $\nu_c$ is the share of a target coefficient's composed envelope mass
+lying after the anchor at the last scored element — an envelope-mass proxy, not an exact value
+fraction (CFS-08). Since 2026-09-05 the shard stores the horizon-free curve `causal_novelty_curve`
+($N_c(w)$ for every window $w$) and the budget resolver looks this run's own horizon and each kept
+channel's forecast advance up in it, $\nu_c = N_c(H + s_c)$, so no forecast horizon is baked into
+the dataset; legacy shards carry the scalar `causal_novelty_frac` at $H = 30$ and are labelled
+`legacy_scalar`. At $H = 30$ on the shipped kept set it runs from $1.000$ on the fastest channels to
 $0.026$ on filter $30$, the slowest one the budget keeps: over the whole $120$ s horizon, $97.4\%$ of
 that coefficient is determined by fetal heart rate the anchor has already observed. `pred_gap` sums
 $H \cdot C_{\mathrm{keep}} = 2940$ coefficients without distinguishing the two, so a good score on
@@ -1689,42 +1695,110 @@ per candidate when run against a physical-clock config. The pre-registered readi
 should not improve `pred_gap`" holds only within stored-clock arms; re-clocking the question is
 expected to move it.
 
-**What is deliberately unchanged.** The novelty- and warm-tertile partitions keep their
-stored-clock rankings (readouts, not losses; under `physical` the novelty split reads as a
-partition by stored-clock novelty rather than as a measurement on the scored clock).
+**What is deliberately unchanged.** The warm-tertile partition keeps its ranking (a readout, not
+a loss). The novelty partition follows the scored gather since 2026-09-05: on a shard carrying the
+horizon-free curve it is looked up at $H + s_c$, so under `physical` it is a partition by novelty
+on the scored clock; on a legacy shard it stays the stored-clock ranking and the evaluation preflight
+labels it so.
 `planted.yaml` pins `stored` — its planted delay is stamped in stored steps, and
 `lag_recovery_check` refuses any other clock by name. The arms are
-`sweep_target_clock_stored.yaml` (today's target *and* tiling, exactly) and
-`sweep_target_clock_input.yaml`.
+`sweep_legacy_dualref_physclock.yaml` (the pre-2026-09-05 default: physical clock, dual reference
+and stride-5 tiling, exactly) and `sweep_target_clock_input.yaml`; since the 2026-09-05 promotion
+the default itself scores the stored clock (see the amendment at the end of this document).
 
-## Amendment (2026-09): the diagnostic page's clocks
+## Amendment (2026-09): the raw overlay on the input rows
 
-§11.1 describes the input rows as "the streams as the encoders receive them", and the page's
-footnote as first written stated that those rows sit $\kappa\tau_{\mathrm{ref}}$ to the *right* of
-the raw traces. That was a labelled misalignment rather than a corrected one: an aligned channel at
-step $t$ carries content centred at $t\Delta - \kappa\tau_{\mathrm{ref}}$ — $351.9$ s earlier on
-the shipped target clock, $252.2$ s on the source's — so a deceleration in the raw FHR appeared in
-the `fhr_st` row six minutes later, and the same channel sat at two different places on the
-`input_target` row and the `pred_truth` row. The page now draws every re-clocked stream on the
-physical axis the raw row sets:
+The page keeps one convention: every model row is at the anchor step, so a column is the same
+anchor on the forecast, input, latent and lag rows alike, and only the raw row is in physical
+time. Under the alignment that leaves the input rows $\kappa\tau_{\mathrm{ref}}$ to the *right*
+of the raw traces — an aligned channel at step $t$ carries content centred at
+$t\Delta - \kappa\tau_{\mathrm{ref}}$, $351.9$ s earlier on the shipped target clock and $252.2$ s
+on the source's. Measured on the aligned shard, the stored `fhr_st` channel 0 lags the raw FHR by
+$16$ s and the aligned channel by $356$ s (correlation $0.96$ at that lag, $0.03$ at lag zero, over
+29 segments), so the offset is real and a reader comparing the two rows could not tell a
+misaligned channel from the design. Rather than move the rows off the anchor step, **each input
+row now overlays the raw signal it was computed from, delayed onto the row's own clock**: the raw
+FHR shifted right by $\kappa\tau^y_{\mathrm{ref}}$ on the target row, the raw UP by
+$\kappa\tau^u_{\mathrm{ref}}$ on the source row, as a thin trace on a twin axis
+(`InputStreamPanel.raw_field` / `raw_delay_s`, resolved by the layout from the batch). A
+deceleration and the columns it produced coincide on the row itself. An unaligned run has no
+single constant and draws no overlay.
 
-- **The input rows** are shifted left by $\kappa\tau^y_{\mathrm{ref}}$ and
-  $\kappa\tau^u_{\mathrm{ref}}$ (`InputStreamPanel.content_offset_s`, zero on the two-sided pages,
-  whose coefficients are stamped with the instant they describe), the warm-up staircase with them,
-  and the last $\kappa\tau$ seconds are hatched: content the encoder has not received by the
-  segment's end.
-- **The forecast rows** — the lanes, the five field rows and the per-window score — are shifted by
-  $\kappa\tau$ of the *scored* clock, `WarmupBudget.target_forecast_clock_delay_s`: $\tau_{\min} =
-  13.34$ s under the shipped `physical` clock ($11.7$ s, under three steps), $\tau^y_{\mathrm{ref}}$
-  under `input`, and none under `stored`, where no constant exists and the rows stay at step index
-  with the axis saying so.
-- **The anchor marks and the latent, KL and lag rows stay at the anchor step**, which is the
-  instant a forecast is made from. The gap between an input row's hatched tail and the anchor
-  floor is the staleness §3 prices, now visible rather than footnoted.
+**How a column of the page reads, top to bottom**, at $x = t\Delta$:
 
-Both $\tau$ come from the resolved budget, which the task binds into the page seams; the net stamps
-only the per-channel step shifts, from which no $\tau$ is recoverable. The evaluation runner
-therefore attaches the re-resolved budget to the loaded task after preflight
-(`eval/run.py::attach_warmup_budget`). Before this amendment it never did, so every evaluation page
-was drawn at step index with no clock stated on it, while the training callback's pages carried
-the footnote.
+| rows | what column $x$ holds | content's physical instant |
+|---|---|---|
+| raw | the raw FHR and UP at $x$ | $x$ |
+| forecast, truth, $\mu^p$, $\mu^q$, skill, $\sigma^q$, score | the element scored at step $t$ | $x - \kappa\tau_{\min}$ ($12$ s) under `physical`; $x - \kappa\tau_c$ per channel ($12$–$352$ s) under `stored`; $x - \kappa\tau^y_{\mathrm{ref}}$ under `input` |
+| input target / source | the aligned vector the encoder reads at step $t$ | $x - \kappa\tau^y_{\mathrm{ref}}$ ($352$ s) / $x - \kappa\tau^u_{\mathrm{ref}}$ ($252$ s); the overlaid raw trace is delayed by the same |
+| latent, KL, $K_t$ | the state at anchor $t$ | the decision instant $x$ |
+| lag attention, KL by lag | anchor $t$ over lag $\ell$, i.e. the source state at step $t - \ell$ | $x - \ell\Delta - \kappa\tau^u_{\mathrm{ref}}$ |
+
+Every row that is not on the raw clock states its own constant on its x axis: the input rows
+theirs, and the eight forecast rows the scored clock's, resolved from the budget's
+`target_forecast_clock_delay_s` and bound by the task beside the shift vector.
+
+### Correction: the physical-lag identity carries $\kappa$
+
+§14 writes the identity with $\kappa$ and the realised constant $\kappa \cdot (-113.8932) =
+-99.65$ s, but the tool that priced the source reference (`warmup_budget.py`) and
+`lag_report.physical_lag_seconds` subtracted the **unscaled** difference of the references, and
+every number derived from them — §3.1's "lags $8.5$–$47.5$", the config headers, and the
+amendment above's every-step window $[374.9, 618.9]$ s — is $(1-\kappa)$ times the offset too
+far: $14$ s ($3.6$ lags) on the stored and input clocks, $34$ s ($8.6$ lags) under `physical`.
+Measured on the aligned shard, an aligned channel lags its raw signal by $\kappa\tau_{\mathrm{ref}}$
+on both streams ($356$ s and $256$ s at channel 0, against $\kappa \cdot 402.16 = 351.9$ and
+$\kappa \cdot 288.27 = 252.2$ plus one decimation step), so the realised bias between the two
+clocks is $\kappa$ times their difference. Both now scale by `ALIGNMENT_DELAY_FACTOR`
+(`physical_lag_seconds` through its `realised_delay_factor` argument), and the corrected figures
+are: the $20$–$60$ s band at lags $4.9$–$43.9$ under the shipped pair (still readable, still $9$
+of $15$ `up_ph`; no verdict in §3.1's table moves), and the every-step readable window under the
+`physical` clock $[340.6, 584.6]$ s. `inter_stream_offset_s` in the causality record remains the
+unscaled difference of the references, which is the pair itself; the lag-axis bias is $\kappa$
+times it.
+
+**Amendment, 2026-09-05 — the stored timeline is canonical.** Every number in the two paragraphs
+above still subtracted a $20$ s "acquisition shift" ($\tau_{\mathrm{pre}}$) from the identity.
+The stored UP/FHR timeline is canonical: the dataset builder shifts the UP channel when it writes the shards, that shift is part of how the stored signals are, and nothing downstream adds it back, subtracts it, budgets it or interprets it. The term was removed from `lag_report.physical_lag_seconds`, from
+`warmup_budget.py` and from every caption; the canonical figures are: the $20$–$60$ s band at
+lags $-0.1$–$38.9$ under the shipped pair (grazing lag $0$ by $0.1$ at $h = 29$ — whether that
+warrants re-pricing the $288.2672$ s pin is a CFS-12 question) and $-25.0$–$14.0$ under the
+single reference; the every-step readable content-delay window under the `physical` clock is
+$[360.6, 604.6]$ s, with nearest source-to-label separation $244.6$ s and union
+$[244.6, 720.6]$ s. These are approximate coefficient-content leads under the $\kappa$
+convention, not exact physiological timestamps.
+
+The delays come from the resolved budget the task binds into the seam; the net stamps only the
+per-channel step shifts. The evaluation runner never attached that budget to the task it loads
+from a checkpoint, so its pages carried neither the clock label nor, now, the overlay;
+`eval/run.py::attach_warmup_budget` does so after preflight, which has already refused any budget
+that is not the checkpoint's own.
+
+
+## Amendment (2026-09-05): the corrected representation is the shipped default
+
+`default.yaml` now carries what the CFS review recommended and the task list CFS-09 built as a
+baseline: the integer phase operator (`causal_phase_operator: integer_harmonic_v1`, so the phase
+blocks are $44$ `fhr_ph` and $10$ `up_ph` and the declared widths are $c_y = 80$, $c_u = 46$), **no**
+input-channel alignment (`causal_align_reference: null`, `causal_align_reference_source: null`:
+every channel is read at its own availability time), the **stored** forecast clock (labels are the
+next $H = 30$ stored coefficients, exact availability time, ceiling $T_{\mathrm{valid}} = 270$, dense
+span $136$) and `anchor_stride: 13`, which tiles that span into the same $A_{\max} = 11$ tiles the
+physical-clock geometry had at stride $5$. At the shipped budget the kept widths are $76/80$ target
+($32$ `fhr_st` + $44$ `fhr_ph`) and $46/46$ source, so the block is $30 \times 76 = 2280$
+coefficients; no nat from this default is comparable to a $2940$-coefficient row above. The scattering
+coefficients themselves are unchanged by the operator.
+
+The reasons are mathematical rather than empirical: the fractional $2^{3/2}$ phase family is
+discontinuous at the principal-angle branch; the $0.875$ input-alignment convention is not an exact
+content clock and withholds up to $340$ s of the fastest channels' trajectories from the encoder;
+and the `physical` clock is an approximate delay compensation that costs $85$ trailing anchors. The
+configuration this file shipped before is preserved verbatim as `sweep_legacy_dualref_physclock.yaml`
+(legacy shards, `REPOINT_ME_causal`); `sweep_align_unaligned.yaml` and `sweep_target_clock_stored.yaml`
+were deleted because the default now is them, and `tiny.yaml` reads the committed integer-operator
+fixture. `sweep_align_target_max.yaml` now *adds* the single-reference alignment and
+`sweep_target_clock_input.yaml` carries that alignment with it, since the `input` clock copies an
+input shift. The guard bands above that read `anchors_per_sample` $\in [10, 11]$ train / $51$ val
+are the legacy arm's; the promoted default's are $[10, 11]$ train / $136$ val. Shards for the default
+are built with `create_new_pipeline.py` under `phase_operator=integer_harmonic_v1`
+(`REPOINT_ME_causal_int`); they also carry the horizon-free `causal_novelty_curve`.

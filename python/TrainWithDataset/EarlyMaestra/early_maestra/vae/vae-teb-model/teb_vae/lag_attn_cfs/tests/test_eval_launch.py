@@ -59,6 +59,7 @@ ENTRY_POINTS: Tuple[str, ...] = (
     "teb_vae.lag_attn_cfs.lag_recovery_check",
     "teb_vae.lag_attn_cfs.warmup_budget",
     "scripts.make_tiny_shard",
+    "scripts.plot_alignment_versions",
 )
 
 #: The runners that use the **single-constant** variant of the convention rather than a launch
@@ -79,7 +80,10 @@ RUN_CONFIG_ENTRY_POINTS: Tuple[Tuple[str, str], ...] = (
 EVAL_ROOT = Path(__file__).resolve().parents[1] / "eval"
 PACKAGE_ROOT = Path(__file__).resolve().parents[1]
 REPO_ROOT = Path(__file__).resolve().parents[3]
-EXTERNAL_RUNNERS = (REPO_ROOT / "scripts" / "make_tiny_shard.py",)
+EXTERNAL_RUNNERS = (
+    REPO_ROOT / "scripts" / "make_tiny_shard.py",
+    REPO_ROOT / "scripts" / "plot_alignment_versions.py",
+)
 
 
 def _module(name: str) -> Any:

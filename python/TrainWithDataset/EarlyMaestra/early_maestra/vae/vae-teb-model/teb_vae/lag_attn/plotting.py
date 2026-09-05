@@ -141,7 +141,6 @@ def _build_diagnostic_figure(
     base_loss: float,
     kld_loss: float,
     step_seconds: float = 4.0,
-    delta_up_seconds: float = 0.0,
 ) -> Any:
     """Build the full diagnostic figure for one validation sample.
 
@@ -168,7 +167,6 @@ def _build_diagnostic_figure(
         base_loss: Current ``L_base`` (baseline-forecast reconstruction).
         kld_loss: Current ``L_KL`` (mean KL).
         step_seconds: Decimated step duration in seconds (for the lag second-axis).
-        delta_up_seconds: Fixed preprocessing UP shift in seconds.
 
     Returns:
         The constructed :class:`matplotlib.figure.Figure`. The caller is responsible for saving and
@@ -490,7 +488,7 @@ def _build_diagnostic_figure(
     )
     ax.set_xlabel("Time (s)", fontsize=8)
     ax.set_ylabel("Lag ℓ (0 = current)", fontsize=8)
-    attach_lag_seconds_axis(ax, step_seconds, delta_up_seconds)
+    attach_lag_seconds_axis(ax, step_seconds)
     ax.legend(loc="upper right", fontsize=7, framealpha=0.95)
     _style_heatmap_spines(ax)
     _attach_cbar(cax, im, "Attn prob")
@@ -525,7 +523,7 @@ def _build_diagnostic_figure(
     )
     ax.set_xlabel("Time (s)", fontsize=8)
     ax.set_ylabel("Lag ℓ (0 = current)", fontsize=8)
-    attach_lag_seconds_axis(ax, step_seconds, delta_up_seconds)
+    attach_lag_seconds_axis(ax, step_seconds)
     _style_heatmap_spines(ax)
     _attach_cbar(cax, im, "KL weight")
     _finalise_time_axis(ax)
@@ -548,7 +546,7 @@ def _build_diagnostic_figure(
     )
     ax.set_xlabel("Time (s)", fontsize=8)
     ax.set_ylabel("Lag ℓ (0 = current)", fontsize=8)
-    attach_lag_seconds_axis(ax, step_seconds, delta_up_seconds)
+    attach_lag_seconds_axis(ax, step_seconds)
     _style_heatmap_spines(ax)
     _attach_cbar(cax, im, "Column-norm")
     _finalise_time_axis(ax)
@@ -908,7 +906,6 @@ class LagAttnPlotCallback(Callback):
             warmup = int(getattr(model, "warmup_period", 0))
             horizon = int(getattr(model, "horizon", 30))
             step_seconds = float(getattr(model, "step_seconds", 4.0))
-            delta_up_seconds = float(getattr(model, "delta_up_seconds", 0.0))
 
             # Negative control, reusing the states the forward above already computed -- no
             # re-encode. Only meaningful when the batch is large enough to derange.
@@ -925,7 +922,7 @@ class LagAttnPlotCallback(Callback):
                     fhr_raw=_get_field(batch, "fhr"), up_raw=_get_field(batch, "up"),
                     sample_idx=s, epoch=epoch, guid=guid, warmup=warmup, horizon=horizon,
                     beta=beta, feat_loss=feat_loss, base_loss=base_loss, kld_loss=kld_loss,
-                    step_seconds=step_seconds, delta_up_seconds=delta_up_seconds,
+                    step_seconds=step_seconds,
                 )
                 path = self.output_dir / (
                     f"lag_attn_epoch{epoch:04d}_sample{s}_{guid[:16]}.{self.file_format}"

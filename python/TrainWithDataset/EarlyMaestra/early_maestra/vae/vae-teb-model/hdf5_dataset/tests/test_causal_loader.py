@@ -575,7 +575,9 @@ def test_files_of_different_stored_length_are_refused_naming_the_block(
     path = tmp_path / "shorter_segments.hdf5"
     with h5py.File(causal_shard, "r") as source:
         block = np.asarray(source["fhr_ph"][:])
-    with h5py.File(causal_shard, "r") as source, h5py.File(path, "w") as handle:
+    # libver="latest", as the production writer: the per-block novelty curve is a dense attribute
+    # past the 64 KB object-header limit, which the earliest file format cannot hold.
+    with h5py.File(causal_shard, "r") as source, h5py.File(path, "w", libver="latest") as handle:
         for name, item in source.items():
             handle.create_dataset(
                 name, data=item[..., :-1] if name == "fhr_ph" else item[...]

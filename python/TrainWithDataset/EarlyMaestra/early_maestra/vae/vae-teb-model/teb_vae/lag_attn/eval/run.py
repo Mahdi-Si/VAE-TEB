@@ -553,21 +553,17 @@ def main(
     preflight_record["health_probe"] = preflight.probe_load_health(
         runner, runner.to_device(health_batch), floor=float(eval_config["health_probe_floor"])
     )
-    # Every lag figure converts its axis with this offset, and ``metrics.lag_to_seconds`` says the
-    # value used is recorded here -- so record it, rather than leaving the claim to be checked
-    # against a key that was never written. The sign is no longer carried forward unverified: it
-    # was settled against mimo_adaptor.py, which runs up_shifted[:-80] = up_signal[80:] at
-    # up_shift_secs=-20, so stored grid position g holds UA the sensor recorded at g + 20 s and a
-    # peak at lag l is a LEAD of 4l - 20 s, i.e. 4l + up_shift_secs. plotting.py's own training
-    # axis still applies no offset at all, so the training figures and these disagree by 20 s.
+    # Every lag figure converts its axis with this convention, recorded here so a run states it
+    # rather than leaving it to be reconstructed. The stored UP/FHR timeline is canonical: the
+    # dataset builder's UP shift is part of the stored signal and no downstream quantity undoes it,
+    # so there is no offset term at all. A run written before this was settled carries an
+    # ``up_shift_secs`` entry here; its seconds axes are on a timeline this pipeline no longer uses.
     preflight_record["lag_seconds_convention"] = {
-        "up_shift_secs": float(eval_config["up_shift_secs"]),
         "step_seconds": float(metrics.STEP_SECONDS),
-        "formula": "seconds = step_seconds * lag + up_shift_secs",
-        "sign_verified": True,
-        "note": (
-            "pinned against mimo_adaptor.py, which advances UP by 20 s -- stored position g "
-            "holds UA recorded at g + 20 s, so a peak at lag l is a lead of 4l - 20 s."
+        "formula": "seconds = step_seconds * lag",
+        "timeline": (
+            "stored (canonical): the dataset builder's UP shift is part of the signal and is "
+            "never undone downstream"
         ),
     }
     preflight.write_preflight(preflight_record, results_dir)

@@ -77,7 +77,7 @@ def test_the_three_tables_are_written(
 def test_the_lag_column_pair_holds_its_arithmetic_relationship(
     make_eval_runner, tiny_loader, tiny_eval_config, tmp_path
 ) -> None:
-    r"""$\mathrm{seconds} = s\ell - \Delta_{UP}$, with $\Delta_{UP}$ from the config.
+    r"""$\mathrm{seconds} = s\ell$ on the stored timeline, with no dataset-shift term.
 
     Emitted as a pair rather than derived downstream, so this is the assertion that keeps the two
     columns describing the same lag.
@@ -86,18 +86,8 @@ def test_the_lag_column_pair_holds_its_arithmetic_relationship(
     config = tiny_eval_config["eval_config"]
     _, frame = _run(runner, tiny_loader, config, tmp_path / "pair")
 
-    # `+ up_shift_secs`, not `-`: the dataset ADVANCED the UP trace by 20 s, so a peak at lag l is
-    # a lead of 4l - 20 s in the original recording. This asserted the subtraction until the sign
-    # was corrected -- the same arithmetic the function had, which is why it could not catch it.
-    expected = metrics.STEP_SECONDS * frame["argmax_lag"].to_numpy() + float(
-        config["up_shift_secs"]
-    )
+    expected = metrics.STEP_SECONDS * frame["argmax_lag"].to_numpy()
     assert frame["lag_seconds_physical"].to_numpy() == pytest.approx(expected)
-    # The fixture ships up_shift_secs=-20, so the pair must not be a plain 4*lag axis.
-    assert not np.allclose(
-        frame["lag_seconds_physical"].to_numpy(),
-        metrics.STEP_SECONDS * frame["argmax_lag"].to_numpy(),
-    )
 
 
 def test_the_mass_table_carries_one_row_per_sample_and_lag(
@@ -149,7 +139,7 @@ def test_attention_concentrated_at_a_known_lag_is_reported_at_that_lag(
 
     assert set(frame["argmax_lag"]) == {target_lag}
     assert frame["lag_seconds_physical"].to_numpy() == pytest.approx(
-        metrics.STEP_SECONDS * target_lag + float(config["up_shift_secs"])
+        metrics.STEP_SECONDS * target_lag
     )
     # A one-hot row has zero entropy: the peak is real, not the argmax of a flat profile.
     assert summary["mean_entropy_nats"] == pytest.approx(0.0, abs=1e-6)
@@ -274,8 +264,8 @@ def test_the_summary_figure_stacks_three_panels_and_carries_a_second_lag_axis(
     assert captured["titles"][2].startswith("Head diversity")
     assert all(captured["has_data"])
     assert captured["secondary_x"], "the lag panel has no physical-second axis"
-    # The offset has never been applied anywhere in this repository, so the figure states it.
-    assert "-20" in captured["suptitle"]
+    # The figure states the seconds convention: the stored timeline, with no shift term.
+    assert "stored timeline" in captured["suptitle"]
 
 
 def test_the_heatmap_figure_draws_one_row_per_retained_sample(

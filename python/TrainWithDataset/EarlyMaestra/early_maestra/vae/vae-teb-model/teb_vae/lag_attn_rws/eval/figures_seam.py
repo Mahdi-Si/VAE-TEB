@@ -28,13 +28,12 @@ package owning a second copy of the builder.
 one figure per analysis per grouping axis, and matplotlib holds every unclosed figure alive in
 its global registry, so a leak is measured in hundreds of megabytes rather than in style.
 
-**The lag axis is this package's own.** A lag index $\ell$ is not seconds, and the two seconds
-figures it maps onto are different quantities -- $\tau_{\mathrm{compensated}} = 4(\ell + \delta)$
-is the residual physiological delay, and only the *sensor* figure undoes the $20$ s the
-preprocessing already removed, which it does by **subtracting** it: the preprocessing *advanced*
-the source trace, so reaching the uncorrected timeline moves the figure down. :data:`COMPENSATED_LAG_AXIS_LABEL` names the first, and it is bound
-here so that a figure drawn through this seam and the number reported beside it cannot disagree
-about which of the two is shown.
+**The lag axis is this package's own.** A lag index $\ell$ is not seconds: the seconds figure is
+$\tau_{\mathrm{compensated}} = 4(\ell + \delta)$, the lag on the canonical stored timeline with
+the causal input delay $\delta$ added back. There is no second, "sensor-timeline" figure: the
+dataset builder's UP shift is part of the stored signal and is never undone downstream.
+:data:`COMPENSATED_LAG_AXIS_LABEL` names the quantity, and it is bound here so that a figure drawn
+through this seam and the number reported beside it cannot disagree about what is shown.
 """
 from __future__ import annotations
 

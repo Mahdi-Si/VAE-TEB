@@ -109,7 +109,7 @@ Three summary blocks matter more than the rest. The **headline** is a flat regis
 verdict statuses; a number not registered there is invisible to the acceptance gate and the arm
 tables, which read it and nothing else. It carries two `pred_gap` columns under names that say which
 is which — `pred_gap_mc_nats` (the headline, the log of the average likelihood over $K$ draws) and
-`pred_gap_train_path_nats` (the single-draw objective-parity column) — and three percentage columns
+`pred_gap_train_path_nats` (the objective-parity column: base decoded at the prior mean under `base_decode: mean`, full at one sampled latent, so not a second estimate of the headline) — and three percentage columns
 restating the same finding proportionally. `pred_gap_convention` says in the artifact itself which is
 which, what a block is here, and which of the three is budget-local. The **sanity** block is the
 run's three-valued self-consistency record (the KL identity, the cross-table recombination, the lag
@@ -176,7 +176,7 @@ raises (`True` would silently cap at 1), and a cap of `0` raises.
 | Key | Meaning |
 |---|---|
 | `seed` | Seeds `random`/`numpy`/`torch` and derives the loader-shuffle, derangement, stratified-cap and Monte Carlo generators by fixed offsets. Two runs of one checkpoint at one seed compare byte-identical on `results`. |
-| `num_mc_samples` | Monte Carlo draws $K$ per anchor for the marginalised score, under common random numbers across branches. $K = 1$ reduces it exactly to the training-path score. |
+| `num_mc_samples` | Monte Carlo draws $K$ per anchor for the marginalised score, under common random numbers across branches. $K = 1$ is one draw of the same estimator, not the training-path score: under `base_decode: mean` the training path decodes the base branch at the prior mean, which the estimator never does. Convergence in $K$ is unmeasured (CFS-10). |
 | `max_samples` | Seeded **stratified** global sample cap; `null` evaluates the whole split. |
 | `caps` | Per-quantity retention caps (`waveforms`, `attention`, `pages`, `pages_per_class`, `oracle`). Retention is opt-in: a quantity absent from `caps` is retained for no samples — except `oracle`, where absence means every segment, because a probe fitted on nothing is not a cheaper measurement but no measurement. The first cap ships **halved** against the raw cells, at 64: a retained forecast set here is four $(136, 30, 98)$ fp32 tensors, about 6.1 MiB per segment against their 2.0 MiB. |
 | `prior_shuffle_min_nats` | The provisional margin the prior-shuffle degradation must clear; the verdict always reports the measured number beside it. |
@@ -276,8 +276,9 @@ channels** the decoder actually emits. That second file exists for one reason: i
 `--only spectral_skill` against a finished directory works with no checkpoint and no GPU.
 
 **The two attributes the aligned shard variant added are deliberately not read here, and this says
-which and why.** A causal shard now also carries `causal_leg_alignment` at the root and
-`causal_novelty_frac` per block.
+which and why.** A causal shard now also carries `causal_leg_alignment` at the root and a novelty
+record per block (`causal_novelty_curve`, the horizon-free table; `causal_novelty_frac` on legacy
+shards).
 
 * `causal_leg_alignment` names which phase-harmonic operator built the phase blocks. It is a
   property of the **file**, not of a channel, and it is already refused at resolution time: a run
@@ -286,7 +287,7 @@ which and why.** A causal shard now also carries `causal_leg_alignment` at the r
   could be stale, and neither `band_partition` nor `spectral_skill` needs it — every column both
   emit means the same thing under either operator, because the alignment changes what a phase
   coefficient *is* and not what channel it is.
-* `causal_novelty_frac` is genuinely per channel and would fit both maps. It is not added, and the
+* The novelty record is genuinely per channel and would fit both maps. It is not added, and the
   reason is that it would be a second, offline copy of a split the **training** path already reports
   per epoch as `pred_gap_novel_lo` / `_mid` / `_hi` — computed against the model's own gathered
   channel axis rather than against a positional join. Add the column here when a band-resolved

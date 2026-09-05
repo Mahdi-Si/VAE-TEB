@@ -213,16 +213,13 @@ def _lag_columns(frame: pd.DataFrame) -> list:
     )
 
 
-def _write_te_figure(
-    frame: pd.DataFrame, lag_columns: list, directory: Path, up_shift_secs: float
-) -> str:
+def _write_te_figure(frame: pd.DataFrame, lag_columns: list, directory: Path) -> str:
     """Draw the lag attribution ribbon, the argmax histogram and the identity residual.
 
     Args:
         frame: The per-sample frame.
         lag_columns: The per-lag column names, in lag order.
         directory: The analysis directory.
-        up_shift_secs: The dataset's UP shift.
 
     Returns:
         The path written.
@@ -243,8 +240,8 @@ def _write_te_figure(
         seconds = axes[0, 0].secondary_xaxis(
             "top",
             functions=(
-                lambda lag: metrics.lag_to_seconds(lag, up_shift_secs=up_shift_secs),
-                lambda sec: (sec - float(up_shift_secs)) / metrics.STEP_SECONDS,
+                lambda lag: metrics.lag_to_seconds(lag),
+                lambda sec: sec / metrics.STEP_SECONDS,
             ),
         )
         seconds.set_xlabel("Physical delay (s)", fontsize=8)
@@ -267,7 +264,7 @@ def _write_te_figure(
             reference=IDENTITY_TOLERANCE, reference_label="tolerance",
         )
         figure.suptitle(
-            f"Physical delay = {metrics.STEP_SECONDS:g}$\\ell$ + ({up_shift_secs:g}) s. "
+            f"Lag axis: seconds = {metrics.STEP_SECONDS:g}$\\ell$ on the stored timeline. "
             f"Dead anchors are excluded: their attention rows are zeroed, not renormalised, so "
             f"averaging them in would subtract mass from the profile.",
             fontsize=7, y=0.999,
@@ -277,16 +274,13 @@ def _write_te_figure(
         figures.plt.close(figure)
 
 
-def _write_per_head_figure(
-    profile: np.ndarray, frame: pd.DataFrame, directory: Path, up_shift_secs: float
-) -> str:
+def _write_per_head_figure(profile: np.ndarray, frame: pd.DataFrame, directory: Path) -> str:
     r"""Draw the head-resolved lag profile and the per-head shares of $K_t$.
 
     Args:
         profile: The $(M, L)$ head-resolved lag profile.
         frame: The per-sample frame, for the share bars.
         directory: The analysis directory.
-        up_shift_secs: The dataset's UP shift.
 
     Returns:
         The path written.
@@ -306,8 +300,8 @@ def _write_per_head_figure(
         top = axes[0, 0].secondary_xaxis(
             "top",
             functions=(
-                lambda lag: metrics.lag_to_seconds(lag, up_shift_secs=up_shift_secs),
-                lambda sec: (sec - float(up_shift_secs)) / metrics.STEP_SECONDS,
+                lambda lag: metrics.lag_to_seconds(lag),
+                lambda sec: sec / metrics.STEP_SECONDS,
             ),
         )
         top.set_xlabel("Physical delay (s)", fontsize=8)
@@ -369,7 +363,6 @@ def run_te_lag_analysis(
 
     caps = eval_config.get("caps") or {}
     max_samples = eval_config.get("max_samples")
-    up_shift_secs = float(eval_config.get("up_shift_secs", 0.0))
     n_total = int((probe or {}).get("n_samples") or 0)
     plan = (
         CollectionPlan.build(
@@ -390,7 +383,7 @@ def run_te_lag_analysis(
     if "argmax_lag" in frame:
         frame = frame.assign(
             argmax_lag_seconds=metrics.lag_seconds_physical(
-                frame["argmax_lag"].to_numpy(), up_shift_secs=up_shift_secs
+                frame["argmax_lag"].to_numpy()
             )
         )
     # The table carries its own interpretation marker rather than relying on the reader still
@@ -426,7 +419,8 @@ def run_te_lag_analysis(
         "composition": collected.composition,
         "plan": collected.plan,
         "num_lags": len(lag_columns),
-        "up_shift_secs": up_shift_secs,
+        # The seconds convention of every lag column and axis here: the stored timeline.
+        "step_seconds": float(metrics.STEP_SECONDS),
         "te_lag_map_label": label,
         "identity": {
             "holds": identity_holds,
@@ -450,14 +444,14 @@ def run_te_lag_analysis(
         argmax = argmax[argmax >= 0]
         summary["median_argmax_lag"] = float(np.median(argmax)) if argmax.size else float("nan")
         summary["median_argmax_lag_seconds"] = (
-            float(metrics.lag_seconds_physical(np.median(argmax), up_shift_secs=up_shift_secs))
+            float(metrics.lag_seconds_physical(np.median(argmax)))
             if argmax.size
             else float("nan")
         )
 
-    summary["figures"].append(_write_te_figure(frame, lag_columns, directory, up_shift_secs))
+    summary["figures"].append(_write_te_figure(frame, lag_columns, directory))
     summary["per_head"] = _per_head_section(
-        runner, loader, frame, directory, max_samples, up_shift_secs, summary
+        runner, loader, frame, directory, max_samples, summary
     )
 
     logger.info(
@@ -473,7 +467,6 @@ def _per_head_section(
     frame: pd.DataFrame,
     directory: Path,
     max_samples: Optional[int],
-    up_shift_secs: float,
     summary: Dict[str, Any],
 ) -> Dict[str, Any]:
     """Emit the per-head decomposition, or record why it was refused.
@@ -488,7 +481,6 @@ def _per_head_section(
         frame: The per-sample frame.
         directory: The analysis directory.
         max_samples: Prefix cap on iteration.
-        up_shift_secs: The dataset's UP shift.
         summary: The analysis summary, extended with the figure path on success.
 
     Returns:
@@ -517,9 +509,7 @@ def _per_head_section(
             ["sample_index", "head", "quantity"]
         ).to_csv(directory / "per_head.csv", index=False)
 
-    summary["figures"].append(
-        _write_per_head_figure(profile, frame, directory, up_shift_secs)
-    )
+    summary["figures"].append(_write_per_head_figure(profile, frame, directory))
 
     undefined = int(frame["kld_mean"].le(0).sum()) if "kld_mean" in frame else 0
     if undefined:

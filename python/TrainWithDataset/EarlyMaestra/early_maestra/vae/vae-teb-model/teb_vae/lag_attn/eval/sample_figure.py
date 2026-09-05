@@ -298,7 +298,6 @@ def build_sample_figure(
     guid: str = "unknown",
     epoch: Optional[int] = None,
     step_seconds: float = 4.0,
-    up_shift_secs: float = 0.0,
     te_lag_label: str = "attribution",
 ) -> Any:
     r"""Build the multi-row diagnostic page for one sample.
@@ -319,7 +318,6 @@ def build_sample_figure(
         guid: Record identifier, for the page title.
         epoch: The recording's epoch, for the page title.
         step_seconds: Decimated step duration, for the lag second-axis.
-        up_shift_secs: Dataset UP shift, for the lag second-axis.
         te_lag_label: ``'attribution'`` when ``head_structured_latent`` makes the TE lag map a
             rigorous attribution, ``'diagnostic'`` otherwise. Stated in the row title because a
             reader cannot tell the two apart from the picture.
@@ -471,12 +469,9 @@ def build_sample_figure(
         ax.plot(time_dec, mean_alpha.argmax(axis=-1), color=COLOR_VERMILLION, linewidth=0.9,
                 alpha=0.9, label="argmax lag")
         ax.set_ylabel(r"Lag $\ell$ (0 = current)", fontsize=8)
-        # Un-negated. ``attach_lag_seconds_axis`` maps $\ell \mapsto s\ell + \Delta_{UP}$, which IS
-        # the raw-recording lead: the dataset ADVANCED UP by 20 s, so a peak at lag $\ell$ is a lead
-        # of $4\ell - 20$ s. The negation that stood here reproduced the sign error in
-        # ``metrics.lag_to_seconds`` rather than compensating for it, so the two moved together and
-        # every lag figure in the repository agreed on a number 40 s too large.
-        attach_lag_seconds_axis(ax, step_seconds, float(up_shift_secs))
+        # Zero offset: the stored timeline is canonical and no dataset-shift term is ever applied
+        # to a lag axis. This page reads no input-delay guard, so the offset is exactly 0.
+        attach_lag_seconds_axis(ax, step_seconds, 0.0)
         ax.legend(loc="upper right", fontsize=7, framealpha=0.95)
         _style_heatmap(ax)
         grid.colorbar(cax, image, "attn prob")
@@ -504,12 +499,9 @@ def build_sample_figure(
             extent=[0.0, t_max, -0.5, n_lags - 0.5], interpolation="none",
         )
         ax.set_ylabel(r"Lag $\ell$ (0 = current)", fontsize=8)
-        # Un-negated. ``attach_lag_seconds_axis`` maps $\ell \mapsto s\ell + \Delta_{UP}$, which IS
-        # the raw-recording lead: the dataset ADVANCED UP by 20 s, so a peak at lag $\ell$ is a lead
-        # of $4\ell - 20$ s. The negation that stood here reproduced the sign error in
-        # ``metrics.lag_to_seconds`` rather than compensating for it, so the two moved together and
-        # every lag figure in the repository agreed on a number 40 s too large.
-        attach_lag_seconds_axis(ax, step_seconds, float(up_shift_secs))
+        # Zero offset: the stored timeline is canonical and no dataset-shift term is ever applied
+        # to a lag axis. This page reads no input-delay guard, so the offset is exactly 0.
+        attach_lag_seconds_axis(ax, step_seconds, 0.0)
         _style_heatmap(ax)
         grid.colorbar(cax, image, "column-norm")
         grid.finalise(

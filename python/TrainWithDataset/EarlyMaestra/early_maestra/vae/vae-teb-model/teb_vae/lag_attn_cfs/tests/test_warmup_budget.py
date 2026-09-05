@@ -564,9 +564,14 @@ def test_the_envelope_survivors_are_the_criterion_the_pin_was_taken_on(source_po
         )
 
 
-def test_the_offset_is_the_two_clocks_difference_and_is_zero_at_the_targets_own(source_points):
-    r"""$\tau^u_{\mathrm{ref}} - \tau^y_{\mathrm{ref}}$, which is the single constant a dual
-    reference puts on the lag axis in place of the unaligned arm's pair-indexed smear. It is
+def test_the_offset_is_the_two_clocks_realised_difference_and_is_zero_at_the_targets_own(
+    source_points,
+):
+    r"""$\kappa\,(\tau^u_{\mathrm{ref}} - \tau^y_{\mathrm{ref}})$, which is the single constant a
+    dual reference puts on the lag axis in place of the unaligned arm's pair-indexed smear. The
+    factor is the alignment's own: a channel's content sits at $\kappa$ of its reported delay, so
+    the shift cancels $\kappa$ times the difference and the residual bias between two clocks is
+    $\kappa$ times theirs -- priced unscaled, the band lags read $3.6$ steps too high. It is
     negative for every faster candidate and exactly zero at the target's own clock, which is the
     single-reference scheme -- so the last row of the table is the arm the revision moved away
     from, priced beside the ones it moved to."""
@@ -574,7 +579,9 @@ def test_the_offset_is_the_two_clocks_difference_and_is_zero_at_the_targets_own(
     target = float(resolved.reference_delay_s)
 
     for point in source_points:
-        assert point.offset_s == pytest.approx(point.reference_s - target, abs=1e-6)
+        assert point.offset_s == pytest.approx(
+            warmup_budget.ALIGNMENT_DELAY_FACTOR * (point.reference_s - target), abs=1e-6
+        )
         assert point.offset_s <= 1e-6
     assert source_points[-1].offset_s == pytest.approx(0.0, abs=1e-6)
 
@@ -583,19 +590,19 @@ def test_the_band_lags_are_the_physical_lag_identity_solved_for_the_lag(source_p
     r"""The arithmetic, against the identity written out here rather than against the function that
     computes it.
 
-    $\ell = (\tau^{\mathrm{phys}} + \tau_{\mathrm{pre}} - \mathrm{offset}) / \Delta - 1 - h$. The
-    low end is the *fastest* delay at the *furthest* horizon step and the high end is the slowest
-    at the first, because $\ell$ falls with $h$ -- getting that pairing backwards would report a
-    band that clears both edges when it does not, and the whole reference decision rests on which
-    edges it clears.
+    $\ell = (\tau^{\mathrm{phys}} - \mathrm{offset}) / \Delta - 1 - h$, on the canonical stored
+    timeline with no dataset-shift term. The low end is the *fastest* delay at the *furthest*
+    horizon step and the high end is the slowest at the first, because $\ell$ falls with $h$ --
+    getting that pairing backwards would report a band that clears both edges when it does not,
+    and the whole reference decision rests on which edges it clears.
     """
     lo_s, hi_s = warmup_budget.PHYSIOLOGICAL_BAND_SECONDS
     delta = warmup_budget.SECONDS_PER_STEP
-    pre = warmup_budget.MECHANICAL_SHIFT_SECONDS
+    assert not hasattr(warmup_budget, "MECHANICAL_SHIFT_SECONDS")
 
     for point in source_points:
-        expected_lo = (lo_s + pre - point.offset_s) / delta - 1.0 - (_PLANTED_HORIZON - 1)
-        expected_hi = (hi_s + pre - point.offset_s) / delta - 1.0 - 0.0
+        expected_lo = (lo_s - point.offset_s) / delta - 1.0 - (_PLANTED_HORIZON - 1)
+        expected_hi = (hi_s - point.offset_s) / delta - 1.0 - 0.0
         assert point.band_lag_lo == pytest.approx(expected_lo, abs=1e-6)
         assert point.band_lag_hi == pytest.approx(expected_hi, abs=1e-6)
         assert point.readable == (0.0 <= point.band_lag_lo and point.band_lag_hi <= _PLANTED_MAX_LAG)
@@ -628,3 +635,77 @@ def test_the_table_prints_every_candidate_with_its_verdict(source_points):
     for point in source_points:
         assert f"{point.reference_s:.4f}" in table
     assert "CENSORED" in table and "readable" in table
+
+
+# =================================================================================================
+# The content lag from the ACTUAL gathers (CFS-05)
+# =================================================================================================
+def test_the_gather_derived_content_lag_reproduces_the_reference_identity_up_to_rounding():
+    r"""$L_{j,c}(\ell,h) = \Delta(\ell+1+h+s_c+d^u_j) + \kappa(	au_j - 	au_c)$ on the canonical
+    stored timeline, computed from the resolved shifts rather than from the two references.
+
+    Under the shipped dual reference and physical clock the reference identity gives a nearest
+    separation of $244.6$ s, a union of $[244.6, 720.6]$ s and an every-horizon window of
+    $[360.6, 604.6]$ s. The gathers themselves round $s_c$ and $d^u_j$ to the $4$ s grid per
+    channel, so the actual pair separations spread by up to two steps around those figures: the
+    reference values must sit inside the gather-derived spread, and the gather-derived corners must
+    sit within that spread of the reference corners. No dataset-shift term appears anywhere.
+    """
+    from teb_vae.lag_attn_cfs.causal_warmup import ALIGNMENT_DELAY_FACTOR, resolve_warmup_budget
+    from teb_vae.lag_attn_cfs.tests.conftest import causal_config
+
+    shipped = resolve_warmup_budget(
+        causal_config(
+            causal_align_reference_source=288.2672,
+            causal_target_forecast_clock="physical",
+            anchor_stride=5,
+        )
+    )
+    assert shipped is not None
+    summary = warmup_budget.summarise_content_lag(shipped, horizon=30, max_lag=90)
+
+    # The reference identity, from the two resolved clocks: the SCORED target clock is tau_min.
+    offset = ALIGNMENT_DELAY_FACTOR * (
+        float(shipped.source_clock_delay_s) - float(shipped.target_forecast_reference_s)
+    )
+    reference_nearest = 4.0 * 1.0 + offset
+    reference_union = (reference_nearest, 4.0 * (90 + 1 + 29) + offset)
+    reference_every = (4.0 * 30 + offset, 4.0 * 91 + offset)
+    assert reference_nearest == pytest.approx(244.6, abs=0.1)
+    assert reference_union[1] == pytest.approx(720.6, abs=0.1)
+    assert reference_every == pytest.approx((360.6, 604.6), abs=0.1)
+
+    # Rounding to the step grid on both sides spreads a pair by at most one step each way.
+    spread = summary.pair_spread_s
+    assert 0.0 < spread <= 2.0 * 4.0
+    assert summary.nearest_s <= reference_nearest <= summary.nearest_s + spread
+    assert abs(summary.union_s[0] - reference_union[0]) <= spread
+    assert abs(summary.union_s[1] - reference_union[1]) <= spread
+    assert abs(summary.every_horizon_s[0] - reference_every[0]) <= spread
+    assert abs(summary.every_horizon_s[1] - reference_every[1]) <= spread
+    # The measured figures, pinned so a change in the shifts moves this rather than only the
+    # tolerance: nearest 240.8 s, every-horizon [356.8, 608.5] s.
+    assert summary.nearest_s == pytest.approx(240.75, abs=0.05)
+    assert summary.every_horizon_s == pytest.approx((356.75, 608.50), abs=0.05)
+
+
+def test_the_stored_clock_and_the_unaligned_run_put_labels_before_the_source_content():
+    """The same identity on the other two clocks, which is why absolute NLLs across clocks are not
+    comparable: under the dual reference on the stored clock the nearest label content precedes
+    the freshest source content by ~98 s, and unaligned the pair smear exceeds 1000 s."""
+    from teb_vae.lag_attn_cfs.causal_warmup import resolve_warmup_budget
+    from teb_vae.lag_attn_cfs.tests.conftest import causal_config
+
+    stored = resolve_warmup_budget(
+        causal_config(causal_align_reference_source=288.2672, anchor_stride=5)
+    )
+    assert stored is not None and stored.target_forecast_shift is None
+    stored_summary = warmup_budget.summarise_content_lag(stored, horizon=30, max_lag=90)
+    assert stored_summary.nearest_s == pytest.approx(-97.6, abs=0.5)
+    assert stored_summary.pair_spread_s == pytest.approx(344.2, abs=0.5)
+
+    unaligned = resolve_warmup_budget(causal_config(causal_align_reference=None))
+    assert unaligned is not None
+    unaligned_summary = warmup_budget.summarise_content_lag(unaligned, horizon=30, max_lag=90)
+    assert unaligned_summary.pair_spread_s > 1000.0
+    assert unaligned_summary.union_s[0] < 0.0 < unaligned_summary.union_s[1]

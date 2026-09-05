@@ -195,6 +195,20 @@ def test_the_phase_selections_are_pinned_by_value() -> None:
     assert np.array_equal(selected_pairs(TARGET_PHASE_BAND_HZ, bank), np.asarray(target))
     assert np.array_equal(selected_pairs(SOURCE_PHASE_BAND_HZ, bank), np.asarray(source))
 
+    # The corrected integer operator keeps the same band edges and drops the k = 6 family: 44 and
+    # 10 pairs, every one of them also a legacy pair, at harmonics 2 and 4 only. The legacy
+    # selection above is unchanged by its existence, which is what keeps every shard on disk
+    # describable.
+    from hdf5_dataset.causal_scattering import PHASE_OPERATOR_INTEGER, harmonic_index
+
+    target_int = selected_pairs(TARGET_PHASE_BAND_HZ, bank, PHASE_OPERATOR_INTEGER)
+    source_int = selected_pairs(SOURCE_PHASE_BAND_HZ, bank, PHASE_OPERATOR_INTEGER)
+    assert target_int.shape == (44, 2) and source_int.shape == (10, 2)
+    assert set(map(tuple, target_int.tolist())) <= set(target)
+    assert set(map(tuple, source_int.tolist())) <= set(source)
+    assert set(harmonic_index(target_int, bank.xi).tolist()) == {2, 4}
+    assert set(harmonic_index(source_int, bank.xi).tolist()) == {2, 4}
+
 
 def test_the_causal_bank_is_matched_to_the_absorbed_bank(
     bank: FilterBank, causal_bank: CausalBank
@@ -1575,3 +1589,118 @@ def test_an_absolute_intra_package_import_would_fail_under_the_production_name()
     """)
     assert result.returncode != 0
     assert "not importable here" in result.stderr
+
+
+def test_the_novelty_proxy_follows_the_target_gather_when_the_labels_are_advanced(
+    causal_bank: CausalBank,
+    phase_pairs: Dict[str, np.ndarray],
+    channel_plan: Dict[str, CausalChannelPlan],
+) -> None:
+    r"""CFS-08: the stored vector is a STORED-CLOCK proxy, and the physical clock is another gather.
+
+    The physical clock advances channel $c$'s labels by
+    $s_c = \operatorname{round}(\kappa(\tau_c - \tau_{\min}) / \Delta)$ stored steps, so its last
+    label sits $\Delta(H + s_c)$ after the anchor rather than $\Delta H$. Recomputed for that
+    gather the envelope-mass share is a different vector: it can only grow, the slowest scattering
+    channel goes from under one percent of its mass inside the window to over half, the spread the
+    tertiles cut collapses by more than half, and the scattering block's order is not preserved --
+    which is why the tertiles a physical-clock run reports are labelled as the legacy stored-clock
+    ranking rather than as novelty on the scored gather.
+    """
+    stored = novelty_fraction(
+        causal_bank, channel_plan, phase_pairs["fhr_ph"], phase_pairs["up_ph"], HORIZON_STEPS
+    )
+    seconds_per_step = DECIMATION / FS
+    delay = np.concatenate([channel_plan["fhr_st"].delay_s, channel_plan["fhr_ph"].delay_s])
+    advance = np.rint(
+        ALIGNMENT_DELAY_FACTOR * (delay - delay.min()) / seconds_per_step
+    ).astype(int)
+    n_st = channel_plan["fhr_st"].n_channels
+    advance_steps = {"fhr_st": advance[:n_st], "fhr_ph": advance[n_st:]}
+    advanced = novelty_fraction(
+        causal_bank, channel_plan, phase_pairs["fhr_ph"], phase_pairs["up_ph"], HORIZON_STEPS,
+        advance_steps=advance_steps,
+    )
+
+    # No advance reproduces the stored attribute to the bit, and a block absent from the mapping
+    # is unadvanced.
+    unadvanced = novelty_fraction(
+        causal_bank, channel_plan, phase_pairs["fhr_ph"], phase_pairs["up_ph"], HORIZON_STEPS,
+        advance_steps=None,
+    )
+    for name in channel_plan:
+        assert np.array_equal(stored[name], unadvanced[name]), name
+    assert np.array_equal(advanced["up_st"], stored["up_st"])
+    assert np.array_equal(advanced["up_ph"], stored["up_ph"])
+
+    # S_0 is never advanced (tau_min is its own delay); every other share can only grow.
+    assert advance_steps["fhr_st"][0] == 0
+    assert advanced["fhr_st"][0] == stored["fhr_st"][0]
+    for name in ("fhr_st", "fhr_ph"):
+        assert (advanced[name] >= stored[name] - 1e-12).all(), name
+        assert np.ptp(advanced[name]) < 0.5 * np.ptp(stored[name]), name
+    assert float(stored["fhr_st"][-1]) < 0.01
+    assert float(advanced["fhr_st"][-1]) > 0.5
+    assert not np.array_equal(
+        np.argsort(stored["fhr_st"], kind="stable"), np.argsort(advanced["fhr_st"], kind="stable")
+    )
+
+    # The advance is per KEPT channel and is a label read after the anchor, never before it.
+    with pytest.raises(ValueError, match="per KEPT channel"):
+        novelty_fraction(
+            causal_bank, channel_plan, phase_pairs["fhr_ph"], phase_pairs["up_ph"],
+            HORIZON_STEPS, advance_steps={"fhr_st": advance[: n_st - 1]},
+        )
+    with pytest.raises(ValueError, match=">= 0"):
+        novelty_fraction(
+            causal_bank, channel_plan, phase_pairs["fhr_ph"], phase_pairs["up_ph"],
+            HORIZON_STEPS, advance_steps={"fhr_st": -np.ones(n_st, dtype=int)},
+        )
+
+
+def test_the_novelty_curve_is_horizon_free_and_the_fraction_is_a_lookup_into_it(
+    causal_bank: CausalBank,
+    phase_pairs: Dict[str, np.ndarray],
+    channel_plan: Dict[str, CausalChannelPlan],
+) -> None:
+    r"""The shard stores $N_c(w)$ for every window; the model chooses $H$ and $s_c$ afterwards.
+
+    A forecast horizon is a model-side choice, so the dataset must not bake one in (the legacy
+    ``causal_novelty_frac`` did, at $H = 30$). The curve is non-decreasing from $N_c(0) = 0$, stays
+    inside the unit interval, reaches every fast channel's whole mass well inside the tabulated
+    extent, and :func:`novelty_fraction` at any horizon and advance is exactly a column read of it.
+    """
+    from hdf5_dataset.causal_scattering import novelty_curve
+
+    # The stored segment length in steps, which is the extent a shard tabulates to.
+    segment_steps = N_RAW // DECIMATION
+    curve = novelty_curve(
+        causal_bank, channel_plan, phase_pairs["fhr_ph"], phase_pairs["up_ph"], segment_steps
+    )
+    for name, plan in channel_plan.items():
+        table = curve[name]
+        assert table.shape == (plan.n_channels, segment_steps + 1), name
+        assert (table[:, 0] == 0.0).all(), name
+        assert (np.diff(table, axis=1) >= -1e-15).all(), name
+        assert (table >= 0.0).all() and (table <= 1.0).all(), name
+    # S_0 (the low-pass alone, 13.3 s mean delay) holds almost all of its mass inside ten steps and
+    # all of it well inside the segment; its long thin tail is the 15% L^1 mass past the energy
+    # threshold that CFS-01 pins.
+    assert float(curve["fhr_st"][0, 10]) > 0.99
+    assert float(curve["fhr_st"][0, segment_steps]) == pytest.approx(1.0, abs=1e-6)
+    # The slowest stored wavelet is still accumulating mass at the far end of the segment.
+    assert float(curve["fhr_st"][-1, segment_steps]) < 1.0
+
+    for horizon in (15, 30, 60):
+        fraction = novelty_fraction(
+            causal_bank, channel_plan, phase_pairs["fhr_ph"], phase_pairs["up_ph"], horizon
+        )
+        for name in channel_plan:
+            assert np.allclose(fraction[name], curve[name][:, horizon], atol=1e-12), (name, horizon)
+    n_st = channel_plan["fhr_st"].n_channels
+    advance = np.arange(n_st) % 7
+    advanced = novelty_fraction(
+        causal_bank, channel_plan, phase_pairs["fhr_ph"], phase_pairs["up_ph"], 30,
+        advance_steps={"fhr_st": advance},
+    )
+    assert np.allclose(advanced["fhr_st"], curve["fhr_st"][np.arange(n_st), 30 + advance])

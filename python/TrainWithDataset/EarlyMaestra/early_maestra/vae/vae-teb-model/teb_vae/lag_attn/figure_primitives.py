@@ -126,11 +126,14 @@ def time_axes(T: int, R: int, fs_raw: float = 4.0) -> Tuple[np.ndarray, np.ndarr
 # =============================================================================
 # Axes decoration
 # =============================================================================
-def attach_lag_seconds_axis(ax: Any, step_seconds: float, delta_up_seconds: float) -> Any:
-    r"""Add a right-hand secondary y-axis in physical seconds.
+def attach_lag_seconds_axis(ax: Any, step_seconds: float, offset_seconds: float = 0.0) -> Any:
+    r"""Add a right-hand secondary y-axis in seconds.
 
-    Maps a decimated lag index $\ell$ to $\mathrm{lag}_{\mathrm{phys}}(\ell) = s\,\ell +
-    \Delta_{UP}$, so the lag panels read in both model-lag and physical-second coordinates.
+    Maps a decimated lag index $\ell$ to $s\,\ell + o$, so the lag panels read in both model-lag
+    and second coordinates. The offset $o$ exists for one legitimate use: a page whose source
+    channels are read $\delta$ steps stale passes $o = \Delta\delta$ so lag $0$ is labelled at
+    the delay it already carries. It is **never** a dataset UP shift: the stored timeline is
+    canonical and the builder's shift is part of the signal, so no caller may pass one.
 
     Non-fatal by design: any matplotlib error is swallowed, because this is called from a
     training callback where a failed axis decoration must not take down a run.
@@ -138,13 +141,13 @@ def attach_lag_seconds_axis(ax: Any, step_seconds: float, delta_up_seconds: floa
     Args:
         ax: The lag-panel axes, whose primary y is the decimated lag $\ell$.
         step_seconds: Decimated step duration $s$ in seconds.
-        delta_up_seconds: Fixed preprocessing UP shift $\Delta_{UP}$ in seconds.
+        offset_seconds: Axis offset $o$ in seconds; the input-delay compensation or $0$.
 
     Returns:
         The created secondary axis, or ``None`` if it could not be attached.
     """
     s = float(step_seconds)
-    d = float(delta_up_seconds)
+    d = float(offset_seconds)
     if s <= 0.0:
         return None
     try:

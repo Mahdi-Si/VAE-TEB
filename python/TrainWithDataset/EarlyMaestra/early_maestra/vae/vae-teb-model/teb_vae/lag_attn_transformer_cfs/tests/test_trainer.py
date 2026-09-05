@@ -218,9 +218,9 @@ def test_the_geometry_and_the_encoder_block_reach_the_constructor(driver):
     assert kwargs["sequence_length"] == 300
     assert kwargs["horizon"] == 30
     assert kwargs["warmup_period"] == 134
-    assert kwargs["anchor_stride"] == 5
-    assert kwargs["c_y"] == 102
-    assert kwargs["c_u"] == 51
+    assert kwargs["anchor_stride"] == 13
+    assert kwargs["c_y"] == 80
+    assert kwargs["c_u"] == 46
     assert kwargs["target_attention_blocks"] == 2  # the tiny variant's own override
     assert kwargs["source_attention_window"] == 8
     assert kwargs["encoder_conv_kernels"] == [5, 9]
@@ -240,8 +240,8 @@ def test_the_warm_up_budget_reaches_the_constructor_as_the_four_channel_tuples(d
     kwargs = driver._build_model_kwargs()
 
     assert "causal_warmup_budget_steps" not in kwargs
-    assert len(kwargs["target_keep_index"]) == len(kwargs["target_warmup_steps"]) == 98
-    assert len(kwargs["source_keep_index"]) == len(kwargs["source_warmup_steps"]) == 39
+    assert len(kwargs["target_keep_index"]) == len(kwargs["target_warmup_steps"]) == 76
+    assert len(kwargs["source_keep_index"]) == len(kwargs["source_warmup_steps"]) == 46
     assert "target_delays" not in kwargs and "source_delays" not in kwargs
     assert driver.resolved_warmup is not None
 
@@ -285,12 +285,11 @@ def test_the_built_model_is_this_packages_and_carries_both_halves(driver):
     model = driver.MODEL_CLS(**driver._build_model_kwargs())
 
     assert isinstance(model, SeqVaeLagAttnTrfCfs)
-    assert model.decoder_out_channels == 98
-    assert model.anchor_stride == 5
-    # The forecast clock the config states, resolved and applied: the physical advance costs the
-    # trailing 85 anchors of the valid span.
-    assert model.target_forecast_shift is not None
-    assert model.anchor_ceiling == model.geometry.t_valid - max(model.target_forecast_shift)
+    assert model.decoder_out_channels == 76
+    assert model.anchor_stride == 13
+    # The stored clock advances nothing: every anchor up to T_valid is decoded.
+    assert model.target_forecast_shift is None
+    assert model.anchor_ceiling == model.geometry.t_valid
     assert not any(isinstance(module, torch.nn.LSTM) for module in model.modules())
 
 

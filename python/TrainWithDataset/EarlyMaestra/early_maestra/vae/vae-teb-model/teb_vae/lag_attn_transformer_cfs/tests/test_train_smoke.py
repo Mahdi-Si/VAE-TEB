@@ -61,8 +61,8 @@ SMOKE_EPOCHS = 2
 #: reference and never touch the other stream. The source number is therefore neither ``c_u`` --
 #: which it was while nothing gated that stream -- nor the target's survivor count: it is what the
 #: shipped source clock, a hundred-odd seconds faster than the target's, leaves standing.
-GUARDED_TARGET_CHANNELS = 98
-GUARDED_SOURCE_CHANNELS = 39
+GUARDED_TARGET_CHANNELS = 76
+GUARDED_SOURCE_CHANNELS = 46
 
 #: The anchor counts the two stages must produce, derived here the way the model derives them so a
 #: geometry change re-derives them rather than failing a literal.
@@ -70,20 +70,11 @@ GUARDED_SOURCE_CHANNELS = 39
 #: largest advance, resolved against the committed shard exactly as the run resolves it, removes
 #: the trailing anchors before anything is decoded -- and the tiling divides by the shipped
 #: stride of 5, which travels with that clock rather than with the horizon.
-SHIPPED_ANCHOR_STRIDE = 5
+SHIPPED_ANCHOR_STRIDE = 13
 
 
-def _physical_advance() -> int:
-    """The shipped clock's largest advance, resolved from the committed shard's own delays."""
-    from teb_vae.lag_attn_cfs.causal_warmup import resolve_warmup_budget
-    from teb_vae.lag_attn_cfs.tests.conftest import causal_config
-
-    budget = resolve_warmup_budget(causal_config(causal_target_forecast_clock="physical"))
-    assert budget is not None
-    return budget.max_forecast_advance
-
-
-DENSE_ANCHORS = 300 - SHIPPED_HORIZON - SHIPPED_WARMUP_PERIOD - _physical_advance()
+# The stored clock advances no label, so the dense span is T_valid - F = 136.
+DENSE_ANCHORS = 300 - SHIPPED_HORIZON - SHIPPED_WARMUP_PERIOD
 TILE_COUNT = -(-DENSE_ANCHORS // SHIPPED_ANCHOR_STRIDE)
 
 

@@ -73,19 +73,9 @@ _ARMS: Dict[str, Dict[str, Any]] = {
     # One clock rather than two: the source key null restores the single-reference resolution, so
     # both streams read on the target's 402.1604 s and the lag axis carries no inter-stream offset.
     "sweep_align_target_max.yaml": {
-        f"{_VAE}.causal_align_reference_source": None,
+        f"{_VAE}.causal_align_reference": "target_max",
         _RUN_NAME: "lag_attn_cfs_align_target_max",
         _VARIANT: "lag_attn_cfs_align_target_max",
-    },
-    # No clock at all -- the unaligned end of the pre-registered pair. The SECOND model key is
-    # forced rather than a second axis: a source reference is one half of a pair of clocks, and the
-    # resolver refuses it against an unaligned target by name, so an arm moving only the first
-    # would not launch. The same shape as `sweep_horizon_15.yaml`'s stride.
-    "sweep_align_unaligned.yaml": {
-        f"{_VAE}.causal_align_reference": None,
-        f"{_VAE}.causal_align_reference_source": None,
-        _RUN_NAME: "lag_attn_cfs_unaligned",
-        _VARIANT: "lag_attn_cfs_unaligned",
     },
     # The sharp lag memory: keys and values from the adapter output, one step of reach, against the
     # default's conv stem. The smallest of the three K/V models.
@@ -94,22 +84,34 @@ _ARMS: Dict[str, Dict[str, Any]] = {
         _RUN_NAME: "lag_attn_cfs_kv_adapter",
         _VARIANT: "lag_attn_cfs_kv_adapter",
     },
-    # The forecast-clock pair. Each moves TWO model keys, and the second travels with the first
-    # for the reason `sweep_horizon_15.yaml`'s stride does: the shipped stride of 5 exists to
-    # recover tiles under the physical clock's shortened ceiling, so an arm that restored the
-    # stored or input clock at stride 5 would compare two tilings as well as two clocks. 30
-    # restores the horizon-partitioning tiling every historical run trained at.
-    "sweep_target_clock_stored.yaml": {
-        f"{_VAE}.causal_target_forecast_clock": "stored",
-        f"{_VAE}.anchor_stride": 30,
-        _RUN_NAME: "lag_attn_cfs_clock_stored",
-        _VARIANT: "lag_attn_cfs_clock_stored",
-    },
     "sweep_target_clock_input.yaml": {
+        f"{_VAE}.causal_align_reference": "target_max",
         f"{_VAE}.causal_target_forecast_clock": "input",
-        f"{_VAE}.anchor_stride": 30,
         _RUN_NAME: "lag_attn_cfs_clock_input",
         _VARIANT: "lag_attn_cfs_clock_input",
+    },
+    # The configuration this cell shipped before 2026-09-05, kept as the comparator the promoted
+    # default replaced: legacy fractional-phase representation, the dual input reference, the
+    # approximate physical clock and its stride-5 tiling, on the LEGACY shards.
+    "sweep_legacy_dualref_physclock.yaml": {
+        f"{_VAE}.c_y": 102,
+        f"{_VAE}.c_u": 51,
+        f"{_VAE}.causal_phase_operator": "ratio_power_v0",
+        f"{_VAE}.causal_align_reference": "target_max",
+        f"{_VAE}.causal_align_reference_source": 288.2672,
+        f"{_VAE}.causal_target_forecast_clock": "physical",
+        f"{_VAE}.anchor_stride": 5,
+        "dataset_config.vae_train_datasets": [
+            "/data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_causal/pre_training_dataset/train_dataset_cs.hdf5",
+            "/data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_causal/pre_training_dataset/train_dataset_no_cs.hdf5",
+        ],
+        "dataset_config.vae_test_datasets": [
+            "/data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_causal/pre_training_dataset/test_dataset_cs.hdf5",
+            "/data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_causal/pre_training_dataset/test_dataset_no_cs.hdf5",
+        ],
+        "dataset_config.stat_path": "/data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_causal/stats.hdf5",
+        _RUN_NAME: "lag_attn_cfs_dualref288_physclock",
+        _VARIANT: "lag_attn_cfs_dualref288_physclock",
     },
 }
 
@@ -246,7 +248,7 @@ def test_an_arm_keeps_the_default_tiling_unless_its_delta_moves_it(name, default
 
     assert 1 <= stride <= horizon
     if f"{_VAE}.anchor_stride" not in intended:
-        assert stride == default_flat[f"{_VAE}.anchor_stride"] == 5
+        assert stride == default_flat[f"{_VAE}.anchor_stride"] == 13
 
 
 @pytest.mark.parametrize("name", sorted(_ARMS))
@@ -280,10 +282,10 @@ def test_the_horizon_arm_halves_the_block_and_buys_back_the_anchors_that_costs()
     doubles -- and what it costs is forecast reach. The block halves with the horizon, to
     $15 \\times 98$, so no nat from this arm is comparable to a shipped one."""
     floor, stride, horizon, t_valid = _geometry(_resolved("sweep_horizon_15.yaml"))
-    kept = 98
+    kept = 76
 
     assert horizon == 15
-    assert horizon * kept == 1470  # against the shipped 2940
+    assert horizon * kept == 1140  # against the shipped 2280
     assert t_valid == 285  # against the shipped 270: the anchors the shorter horizon buys back
     assert -(-(t_valid - floor) // stride) == 11  # A_max, from the geometry rather than a literal
 
@@ -298,7 +300,7 @@ def test_the_stride_arm_restores_the_dense_anchor_set():
     assert -(-(t_valid - floor) // stride) == t_valid - floor == 136
 
 
-def test_the_floor_arm_keeps_the_identical_channels_and_costs_exactly_four_tiles():
+def test_the_floor_arm_keeps_the_identical_channels_and_costs_exactly_one_tile():
     """The cost of the policy, stated as a number rather than as an argument: the same $98$ channels
     (neither the budget nor the alignment reference moved), four fewer tiles at phase $0$, and $16$
     fewer covered target steps.
@@ -321,14 +323,14 @@ def test_the_floor_arm_keeps_the_identical_channels_and_costs_exactly_four_tiles
     arm_floor, arm_stride, _h, arm_t_valid = _geometry(_resolved("sweep_floor_150.yaml"))
 
     budget = resolve_warmup_budget(
-        causal_config(causal_target_forecast_clock="physical", anchor_stride=5)
+        causal_config(causal_target_forecast_clock="stored", anchor_stride=13)
     )
     assert budget is not None
     ceiling = t_valid - budget.max_forecast_advance
 
     assert (arm_stride, arm_t_valid) == (stride, t_valid)
     assert arm_floor - shipped_floor == 16
-    assert -(-(ceiling - shipped_floor) // stride) - -(-(ceiling - arm_floor) // stride) == 4
+    assert -(-(ceiling - shipped_floor) // stride) - -(-(ceiling - arm_floor) // stride) == 1
 
 
 @pytest.mark.parametrize("name", sorted(_ARMS))
