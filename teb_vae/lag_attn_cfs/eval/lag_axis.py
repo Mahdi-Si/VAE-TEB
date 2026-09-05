@@ -61,8 +61,8 @@ import pandas as pd
 from teb_vae.lag_attn.nets.lag_report import SECONDS_PER_STEP, lag_compensated_seconds
 
 #: Axis label for a lag axis in this target domain. Deliberately **not**
-#: ``lag_report.COMPENSATED_LAG_AXIS_LABEL``: that one says "mechanically compensated", which is
-#: true here too and is not the caveat that matters. What matters is that the quantity being
+#: ``lag_report.COMPENSATED_LAG_AXIS_LABEL``: that one names the input-delay compensation, which
+#: is true here too and is not the caveat that matters. What matters is that the quantity being
 #: lagged is a stored coefficient rather than a signal sample, and no other label says so.
 #:
 #: It contains no "bpm" and no "physiological": the first has no meaning in a domain of wavelet

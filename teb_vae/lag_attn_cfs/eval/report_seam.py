@@ -61,7 +61,8 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import numpy as np
 from loguru import logger
 
-from teb_vae.lag_attn.nets.lag_report import MECHANICAL_SHIFT_SECONDS, SECONDS_PER_STEP
+from teb_vae.lag_attn.nets.lag_report import SECONDS_PER_STEP
+from teb_vae.lag_attn_cfs.causal_warmup import ALIGNMENT_DELAY_FACTOR
 from teb_vae.lag_attn_cfs.eval import lag_shape
 from teb_vae.lag_attn_cfs.eval.lag_axis import compensated_seconds_axis
 from teb_vae.lag_attn_cfs.eval._reuse import report
@@ -280,10 +281,14 @@ HEADLINE_VERDICTS: Tuple[str, ...] = (
 PRED_GAP_CONVENTION = (
     "pred_gap_mc_nats is the headline: the Monte Carlo marginalised block score difference "
     "D_base - D_full in nats per anchor, where D = -[logsumexp_r(-D_r) - log K] is the log of "
-    "the average likelihood over K latent draws. pred_gap_train_path_nats is the single-draw "
-    "training-path difference, reported beside it as the objective-parity column. "
-    "A block here is H*C_keep target coefficients -- 15 horizon steps by the 98 channels the "
-    "warm-up budget kept, 2940 at the shipped geometry -- and not a 480-sample raw window: the "
+    "the average likelihood over K latent draws. pred_gap_train_path_nats is the training-path "
+    "difference the objective itself sees, reported beside it for objective parity only: under "
+    "base_decode: mean the training path decodes the base branch at the prior MEAN and the full "
+    "branch at one sampled latent, so that column mixes a source comparison with a "
+    "decoding-policy difference and is not a second estimate of pred_gap_mc_nats. "
+    "A block here is H*C_keep target coefficients -- H horizon steps by the C_keep channels the "
+    "warm-up budget kept, 30 x 98 = 2940 at the legacy shipped geometry; preflight.json records "
+    "this run's own horizon and target_kept_width -- and not a 480-sample raw window: the "
     "forecast is over wavelet-modulus and phase-harmonic coefficients in the loader's z units, "
     "and there is no bpm anywhere in this pipeline. "
     "Three percentage columns restate the same finding as a proportion, each computed per "
@@ -658,9 +663,13 @@ def check_lag_identity(results: Dict[str, Any], name: str) -> Dict[str, Any]:
 #: *censoring* rather than inertness is arithmetic a reader has to be able to redo: the reported
 #: lag is the smallest one the window carries, and every physical delay shorter than what that
 #: lag encodes lands below it and is reported there whatever the model found.
+#:
+#: Written on the canonical stored timeline: there is no dataset-shift term, and ``tau_y_ref`` is
+#: the clock of the SCORED target (``tau_min`` under a physical forecast clock), not the target
+#: encoder's input reference.
 PHYSICAL_LAG_IDENTITY = (
-    f"tau_phys(l, h) = {SECONDS_PER_STEP:g}*(l + 1 + h) + (tau_u_ref - tau_y_ref) "
-    f"- {MECHANICAL_SHIFT_SECONDS:g} s"
+    f"tau_phys(l, h) = {SECONDS_PER_STEP:g}*(l + 1 + h) "
+    f"+ {ALIGNMENT_DELAY_FACTOR:g}*(tau_u_ref - tau_y_ref)"
 )
 
 
@@ -670,10 +679,12 @@ def check_argmax_lag(results: Dict[str, Any]) -> Dict[str, Any]:
     **Both ends of the window censor, and the check is symmetric in them.** An argmax at the
     largest attainable lag means the true maximum may lie beyond $L$. An argmax at the *smallest*
     attainable lag means exactly the mirror image: by the identity
-    $\tau^{\mathrm{phys}}_{\ell,h} = \Delta(\ell + 1 + h) + (\tau^u_{\mathrm{ref}}
-    - \tau^y_{\mathrm{ref}}) - \tau_{\mathrm{pre}}$, every physical delay shorter than what that
-    lag encodes is reported *at* it, because the window carries no bin below it. On this cell's
-    geometry a $20$-$60$ s physiological delay sits below lag $0$ at most horizon steps, so a pin
+    $\tau^{\mathrm{phys}}_{\ell,h} = \Delta(\ell + 1 + h) + \kappa(\tau^u_{\mathrm{ref}}
+    - \tau^y_{\mathrm{ref}})$ on the canonical stored timeline, every physical delay shorter than
+    what that lag encodes is reported *at* it, because the window carries no bin below it. On this
+    cell's geometry a $20$-$60$ s physiological delay sits below lag $0$ at most horizon steps
+    under the single reference and grazes lag $0$ at the far horizon step under the shipped dual
+    reference ($\ell = -0.1$ at $h = 29$), so a pin
     at the floor is the readout hitting a wall rather than the machinery failing to look back --
     and reading it as inertness is a conclusion the geometry does not support.
 

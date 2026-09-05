@@ -74,8 +74,11 @@ def test_the_forecast_rows_resolve_to_the_causal_cells_builder(task):
     assert rows.func is causal_page.causal_forecast_rows
     assert set(rows.keywords) == {
         "keep_index", "block_split", "training_stride", "likelihood", "coverage_floor",
-        "target_forecast_shift",
+        "target_forecast_shift", "forecast_clock_delay_s",
     }
+    # No resolved budget on a hand-built task, so the forecast rows' axis cannot state a
+    # constant; the shift is still bound, because it is a fact of the net.
+    assert rows.keywords["forecast_clock_delay_s"] is None
     assert rows.keywords["target_forecast_shift"] == module.orig_model.target_forecast_shift
     assert rows.keywords["block_split"] == 36
     assert rows.keywords["training_stride"] == module.orig_model.anchor_stride == TINY_STRIDE

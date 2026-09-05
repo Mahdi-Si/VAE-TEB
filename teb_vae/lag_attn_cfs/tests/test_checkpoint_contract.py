@@ -336,3 +336,34 @@ def test_the_horizon_weight_is_absent_from_the_state_dict_and_present_in_the_kwa
     """
     assert "horizon_weight_halflife_steps" in blob_with_switches["model_kwargs"]
     assert not any("horizon_weight" in key for key in blob_with_switches["state_dict"])
+
+
+# =================================================================================================
+# The representation stamp (CFS-03)
+# =================================================================================================
+def test_a_task_carrying_a_budget_stamps_the_representation_and_one_without_stamps_nothing():
+    """The channel tuples say how wide the model is; ``causal_representation`` says what its
+    channels ARE. Stamped by the shared base hook off the task's resolved budget, so the cfs task
+    overrides nothing (its member set is pinned) and a hand-built task without a budget writes the
+    blob every pre-stamp checkpoint has."""
+    from teb_vae.lag_attn_cfs.causal_warmup import (
+        REPRESENTATION_IDENTITY_FIELDS,
+        REPRESENTATION_KEY,
+        resolve_warmup_budget,
+    )
+
+    from .conftest import causal_config
+
+    module = _wrapped(SeqVaeLagAttnCfs, _kwargs())
+    assert REPRESENTATION_KEY not in _lightning_style_checkpoint(module)
+
+    module.warmup_budget = resolve_warmup_budget(causal_config())
+    stamped = _lightning_style_checkpoint(module)[REPRESENTATION_KEY]
+    assert set(REPRESENTATION_IDENTITY_FIELDS) <= set(stamped)
+    assert stamped["phase_operator"] == "ratio_power_v0"
+    assert stamped["leg_alignment"] == "envelope"
+    assert stamped["target_forecast_clock"] == "stored"
+    assert stamped["reference_delay_s"] == pytest.approx(402.1604, abs=1e-3)
+    assert stamped["budget_steps"] == 134
+    # Plain scalars only, so the record survives torch.save and reads back as itself.
+    assert all(value is None or isinstance(value, (str, int, float)) for value in stamped.values())

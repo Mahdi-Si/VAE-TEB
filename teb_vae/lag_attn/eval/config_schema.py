@@ -25,7 +25,9 @@ VALID_KEYS = frozenset(
         "max_samples",
         "caps",
         "bands",
-        "up_shift_secs",
+        # ``up_shift_secs`` was REMOVED, not defaulted: the stored UP/FHR timeline is canonical
+        # and the dataset builder's shift is never undone downstream, so a config naming the
+        # key is refused as unknown rather than quietly honoured.
         "health_probe_floor",
         "saturation_flag_threshold",
         "ablation_batch_size",
@@ -47,7 +49,6 @@ DEFAULTS: Dict[str, Any] = {
     "max_samples": None,
     "caps": {},
     "bands": {},
-    "up_shift_secs": 0.0,
     "health_probe_floor": 0.0,
     "saturation_flag_threshold": 0.05,
     "ablation_batch_size": None,
@@ -265,13 +266,6 @@ def validate_eval_config(config: Mapping[str, Any]) -> Dict[str, Any]:
     vae_config = (config.get("model_config") or {}).get("VAE_model") or {}
     max_lag = _require_int(vae_config.get("max_lag", 0), "bands (model_config.VAE_model.max_lag)", minimum=0)
     resolved["bands"] = _validate_bands(resolved["bands"], max_lag)
-
-    shift = resolved["up_shift_secs"]
-    if isinstance(shift, bool) or not isinstance(shift, (int, float)) or not math.isfinite(float(shift)):
-        raise ValueError(
-            f"eval_config.up_shift_secs must be a finite number of seconds, got {shift!r}."
-        )
-    resolved["up_shift_secs"] = float(shift)
 
     floor = resolved["health_probe_floor"]
     if isinstance(floor, bool) or not isinstance(floor, (int, float)) or not math.isfinite(float(floor)):

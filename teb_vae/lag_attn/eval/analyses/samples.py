@@ -154,7 +154,6 @@ def _render_one(
     index: int,
     *,
     runner: EvalRunner,
-    up_shift_secs: float,
     te_lag_label: str,
 ) -> str:
     """Render and save one sample's page, returning the filename written.
@@ -166,7 +165,6 @@ def _render_one(
         offset: Position within the batch.
         index: The sample's global index in the loader.
         runner: The loaded runner, for the geometry.
-        up_shift_secs: Dataset UP shift, for the lag second-axis.
         te_lag_label: Whether the TE lag map is an attribution or a diagnostic.
 
     Returns:
@@ -200,7 +198,6 @@ def _render_one(
             guid=guid,
             epoch=epoch,
             step_seconds=metrics.STEP_SECONDS,
-            up_shift_secs=up_shift_secs,
             te_lag_label=te_lag_label,
         )
         name = sample_filename(guid, epoch, index)
@@ -246,7 +243,6 @@ def run_samples_analysis(
     cap = caps.get(CAP_NAME, DEFAULT_CAP)
     seed = int(eval_config.get("seed", 0))
     max_samples = eval_config.get("max_samples")
-    up_shift_secs = float(eval_config.get("up_shift_secs", 0.0))
     n_total = int((probe or {}).get("n_samples") or 0)
     groups = (probe or {}).get("source_files")
 
@@ -291,7 +287,7 @@ def run_samples_analysis(
                 try:
                     row["figure"] = _render_one(
                         directory, outputs, batch, offset, index,
-                        runner=runner, up_shift_secs=up_shift_secs,
+                        runner=runner,
                         te_lag_label=te_lag_label,
                     )
                     written.append(row["figure"])

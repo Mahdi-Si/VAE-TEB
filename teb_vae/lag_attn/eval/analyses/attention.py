@@ -22,11 +22,8 @@ the same lag are one head with four times the parameters, and the per-head KL de
 attribute across them regardless -- producing four confident, identical numbers.
 
 **Every lag figure carries two axes.** The model-lag index is what the tensors are indexed by;
-physical seconds is what a reader wants. The conversion is $s\ell + \Delta_{UP}$ with
-$\Delta_{UP}$ from ``eval_config.up_shift_secs``, and its value is stated on every figure rather
-than left implicit, because that offset has never actually been applied anywhere in this
-repository before -- ``plotting.py`` reads it from a model attribute that does not exist -- so a
-reader has good reason to want to see which number produced the axis.
+seconds is what a reader wants. The conversion is $s\ell$ on the stored timeline, which is
+canonical: the dataset builder's UP shift is part of the stored signal and is never undone here.
 """
 from __future__ import annotations
 
@@ -110,7 +107,6 @@ def _write_heatmaps(
     plan: Optional[CollectionPlan],
     max_samples: Optional[int],
     directory: Path,
-    up_shift_secs: float,
 ) -> Optional[str]:
     r"""Draw one head-averaged $(L, T)$ attention heatmap per retained sample.
 
@@ -126,7 +122,6 @@ def _write_heatmaps(
         plan: Which samples to draw.
         max_samples: Prefix cap on iteration.
         directory: The analysis directory.
-        up_shift_secs: The dataset's UP shift, for the second axis and the caption.
 
     Returns:
         The path written, or ``None`` when no sample was retained.
@@ -157,13 +152,10 @@ def _write_heatmaps(
                 extent=(0.0, float(seq_len), float(num_lags) - 0.5, -0.5),
             )
             figures.shade_warmup(ax, warmup, float(seq_len), seq_len)
-            figures.attach_lag_seconds_axis(
-                ax, metrics.STEP_SECONDS, float(up_shift_secs)
-            )
+            figures.attach_lag_seconds_axis(ax, metrics.STEP_SECONDS, 0.0)
         figure.suptitle(
-            f"Lag axis: seconds = {metrics.STEP_SECONDS:g}$\\ell$ + "
-            f"({up_shift_secs:g}) s, i.e. the lead in the original recording: the "
-            f"dataset ADVANCED UP by {-up_shift_secs:g} s. Shaded: warm-up.",
+            f"Lag axis: seconds = {metrics.STEP_SECONDS:g}$\\ell$ on the stored timeline "
+            f"(canonical; no dataset-shift term). Shaded: warm-up.",
             fontsize=7,
             y=0.999,
         )
@@ -172,16 +164,13 @@ def _write_heatmaps(
         figures.plt.close(figure)
 
 
-def _write_summary_figure(
-    frame: pd.DataFrame, lag_columns: list, directory: Path, up_shift_secs: float
-) -> str:
+def _write_summary_figure(frame: pd.DataFrame, lag_columns: list, directory: Path) -> str:
     """Draw the argmax histogram, the lag-mass ribbon and the head-diversity histogram.
 
     Args:
         frame: The per-sample frame.
         lag_columns: The per-lag mass column names, in lag order.
         directory: The analysis directory.
-        up_shift_secs: The dataset's UP shift, for the second axis and the caption.
 
     Returns:
         The path written.
@@ -218,8 +207,8 @@ def _write_summary_figure(
         seconds = axes[1, 0].secondary_xaxis(
             "top",
             functions=(
-                lambda lag: metrics.lag_to_seconds(lag, up_shift_secs=up_shift_secs),
-                lambda sec: (sec - float(up_shift_secs)) / metrics.STEP_SECONDS,
+                lambda lag: metrics.lag_to_seconds(lag),
+                lambda sec: sec / metrics.STEP_SECONDS,
             ),
         )
         seconds.set_xlabel("Physical delay (s)", fontsize=8)
@@ -233,9 +222,8 @@ def _write_summary_figure(
             reference_label="all heads identical",
         )
         figure.suptitle(
-            f"Physical delay = {metrics.STEP_SECONDS:g}$\\ell$ + ({up_shift_secs:g}) s, "
-            f"the lead in the original recording: the dataset ADVANCED UP by "
-            f"{-up_shift_secs:g} s. Read argmax_lag only "
+            f"Lag axis: seconds = {metrics.STEP_SECONDS:g}$\\ell$ on the stored timeline "
+            f"(canonical; no dataset-shift term). Read argmax_lag only "
             f"against the entropy: near the attainable ceiling the row is flat and its peak "
             f"is noise.",
             fontsize=7,
@@ -272,7 +260,6 @@ def run_attention_analysis(
     caps = eval_config.get("caps") or {}
     seed = int(eval_config.get("seed", 0))
     max_samples = eval_config.get("max_samples")
-    up_shift_secs = float(eval_config.get("up_shift_secs", 0.0))
     n_total = int((probe or {}).get("n_samples") or 0)
     groups = (probe or {}).get("source_files")
 
@@ -291,13 +278,12 @@ def run_attention_analysis(
     identity = ["sample_index", "guid", "source_file"]
 
     per_sample = frame.drop(columns=lag_columns)
-    # Emitted beside argmax_lag rather than derived by the reader: the offset's sign has never
-    # been applied anywhere in this repository, so a CSV that shipped only the index would leave
-    # every downstream consumer to rediscover the convention.
+    # Emitted beside argmax_lag rather than derived by the reader, so a CSV carries the seconds
+    # convention it was written under (stored timeline, 4 s per lag).
     if "argmax_lag" in per_sample:
         per_sample = per_sample.assign(
             lag_seconds_physical=metrics.lag_seconds_physical(
-                per_sample["argmax_lag"].to_numpy(), up_shift_secs=up_shift_secs
+                per_sample["argmax_lag"].to_numpy()
             )
         )
     per_sample.to_csv(directory / "per_sample.csv", index=False)
@@ -308,7 +294,7 @@ def run_attention_analysis(
         )
         mass["lag"] = mass["lag"].str[len(_LAG_PREFIX):].astype(int)
         mass["lag_seconds_physical"] = metrics.lag_seconds_physical(
-            mass["lag"].to_numpy(), up_shift_secs=up_shift_secs
+            mass["lag"].to_numpy()
         )
         mass.sort_values(["sample_index", "lag"]).to_csv(
             directory / "mass_by_lag.csv", index=False
@@ -328,11 +314,9 @@ def run_attention_analysis(
             }
         ).to_csv(directory / "head_entropy.csv", index=False)
 
-    summary_figure = _write_summary_figure(frame, lag_columns, directory, up_shift_secs)
+    summary_figure = _write_summary_figure(frame, lag_columns, directory)
     heatmap_plan = _plan(HEATMAP_CAP_NAME)
-    heatmap_figure = _write_heatmaps(
-        runner, loader, heatmap_plan, max_samples, directory, up_shift_secs
-    )
+    heatmap_figure = _write_heatmaps(runner, loader, heatmap_plan, max_samples, directory)
 
     # Two ceilings, and only one of them is a ceiling any anchor can reach. $\log L$ is the width
     # of the window; the attainable bound is $\log\min(t+1, L)$ averaged over the same support the
@@ -354,7 +338,9 @@ def run_attention_analysis(
         "plan": collected.plan,
         "heatmap_plan": None if heatmap_plan is None else heatmap_plan.describe(),
         "num_lags": len(lag_columns),
-        "up_shift_secs": up_shift_secs,
+        # The seconds convention every lag figure and column of this analysis uses: the stored
+        # timeline, with no dataset-shift term.
+        "step_seconds": float(metrics.STEP_SECONDS),
         "mean_entropy_nats": mean_entropy,
         # The bound the uniformity check must divide by: the support-weighted mean of
         # log min(t+1, L), averaged over samples exactly as mean_entropy_nats is, so the ratio
@@ -376,7 +362,7 @@ def run_attention_analysis(
         argmax = argmax[argmax >= 0]
         summary["median_argmax_lag"] = float(np.median(argmax)) if argmax.size else float("nan")
         summary["median_argmax_lag_seconds"] = (
-            float(metrics.lag_seconds_physical(np.median(argmax), up_shift_secs=up_shift_secs))
+            float(metrics.lag_seconds_physical(np.median(argmax)))
             if argmax.size
             else float("nan")
         )

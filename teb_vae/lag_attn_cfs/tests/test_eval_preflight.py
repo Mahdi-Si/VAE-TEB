@@ -1159,3 +1159,166 @@ def test_a_real_checkpoint_against_another_budget_is_refused(
         )
 
     assert "target_keep_index" in str(excinfo.value)
+
+
+# =================================================================================================
+# The representation stamp (CFS-03): refused by identity, not by width
+# =================================================================================================
+def test_a_checkpoint_stamped_with_another_representation_is_refused_though_its_tuples_agree(
+    config, model, model_kwargs
+) -> None:
+    """Two operator versions, two leg alignments or two forecast clocks can coincide in every
+    width and tuple; only the stamp tells them apart, and it is compared by name."""
+    from teb_vae.lag_attn_cfs.causal_warmup import resolve_warmup_budget
+
+    honest = resolve_warmup_budget(preflight.config_view_for_budget(config)).representation()
+    record = preflight.check_warmup_budget_matches_checkpoint(
+        config, model_kwargs=model_kwargs, model_cls=SeqVaeLagAttnCfs, representation=honest
+    )
+    assert record["passed"] and record["stamped_representation"] == honest
+
+    for field, other in (
+        ("phase_operator", "integer_harmonic_v1"),
+        ("leg_alignment", "none"),
+        ("target_forecast_clock", "physical"),
+    ):
+        stamped = dict(honest, **{field: other})
+        with pytest.raises(EvalPreconditionUnmet) as excinfo:
+            preflight.check_warmup_budget_matches_checkpoint(
+                config, model_kwargs=model_kwargs, model_cls=SeqVaeLagAttnCfs,
+                representation=stamped,
+            )
+        message = str(excinfo.value)
+        assert field in message and repr(other) in message and repr(honest[field]) in message
+
+    # A blob written before the stamp existed compares on tuples alone and records the absence.
+    legacy = preflight.check_warmup_budget_matches_checkpoint(
+        config, model_kwargs=model_kwargs, model_cls=SeqVaeLagAttnCfs
+    )
+    assert legacy["passed"] and legacy["stamped_representation"] is None
+
+
+# =================================================================================================
+# CFS-08 / CFS-10: what the novelty tertiles rank by, and what the objective weights
+# =================================================================================================
+def test_the_budget_record_names_the_stored_novelty_as_a_stored_clock_proxy(
+    config, model, model_kwargs
+) -> None:
+    """The record names what the stored vector is -- the stored clock at the written horizon --
+    beside the clock and horizon this run scores under, and says whether the two coincide, so a
+    reader cannot take ``pred_gap_novel_*`` as novelty on a scored gather it was not computed
+    for. Read against the record's own clock rather than a literal: the fixture resolves the
+    stored clock, the shipped delta the physical one, and the statement must hold for both."""
+    record = _run(config, model, model_kwargs)["checks"]["warmup_budget_matches_checkpoint"]
+    proxy = record["novelty_proxy"]
+
+    # The committed fixture predates the curve, so this is the legacy branch.
+    assert proxy["source"] == "legacy_scalar"
+    assert proxy["stored_clock"] == "stored"
+    assert proxy["stored_horizon_steps"] == 30
+    assert proxy["run_target_forecast_clock"] == record["target_forecast_clock"]
+    assert proxy["run_horizon_steps"] == SHIPPED_HORIZON
+    assert proxy["run_max_forecast_advance_steps"] == record["max_forecast_advance_steps"]
+    assert proxy["matches_scored_gather"] is (
+        record["target_forecast_clock"] == "stored" and SHIPPED_HORIZON == 30
+    )
+    assert ("tertile_note" in proxy) is (not proxy["matches_scored_gather"])
+    assert "envelope-mass proxy" in proxy["definition"]
+    assert "not an exact" in proxy["definition"].lower()
+
+
+def test_the_novelty_proxy_matches_the_gather_only_on_the_stored_clock_at_the_written_horizon(
+    config,
+) -> None:
+    """Two ways to leave the written gather -- the physical clock, another horizon -- and the one
+    way to be on it. Exercised on the resolved budget directly, since the fixture's checkpoint
+    kwargs pin the clock the full record is built under."""
+    vae = config["model_config"]["VAE_model"]
+    vae["causal_target_forecast_clock"] = "stored"
+    view = preflight.config_view_for_budget(config)
+    resolved = resolve_warmup_budget(view)
+    geometry = preflight._budget_geometry(view)
+
+    on_gather = preflight._novelty_proxy_record(resolved, geometry)
+    assert on_gather["matches_scored_gather"] is True
+    assert "tertile_note" not in on_gather
+    assert on_gather["run_max_forecast_advance_steps"] == 0
+
+    other_horizon = preflight._novelty_proxy_record(resolved, dict(geometry, horizon=15))
+    assert other_horizon["matches_scored_gather"] is False
+    assert "H = 15" in other_horizon["tertile_note"]
+
+    # The shipped physical clock advances the slow channels' labels, which is the case the note
+    # exists for: the tertiles then rank by the legacy stored-clock proxy.
+    vae["causal_target_forecast_clock"] = "physical"
+    physical = resolve_warmup_budget(preflight.config_view_for_budget(config))
+    off_gather = preflight._novelty_proxy_record(physical, geometry)
+    assert off_gather["run_target_forecast_clock"] == "physical"
+    assert off_gather["run_max_forecast_advance_steps"] == physical.max_forecast_advance > 0
+    assert off_gather["matches_scored_gather"] is False
+    assert "LEGACY stored-clock proxy" in off_gather["tertile_note"]
+    assert "physical" in off_gather["tertile_note"]
+
+
+def test_a_current_shard_reports_the_curve_lookup_on_the_scored_gather_under_any_clock() -> None:
+    """With the horizon-free curve on the shard the resolver looks this run's own horizon and
+    per-channel advance up, so the record says the split describes the scored gather even under
+    the physical clock -- no legacy note, no stored horizon to compare against."""
+    from teb_vae.lag_attn_cfs.tests.conftest import INT_C_U, INT_C_Y, INT_CAUSAL_SHARD
+
+    assert INT_CAUSAL_SHARD.exists(), "regenerate with scripts/make_tiny_shard.py --variants causal_int"
+    config = causal_config(
+        paths=[INT_CAUSAL_SHARD],
+        c_y=INT_C_Y,
+        c_u=INT_C_U,
+        causal_phase_operator="integer_harmonic_v1",
+        causal_align_reference=None,
+        causal_align_reference_source=None,
+        causal_target_forecast_clock="physical",
+        anchor_stride=5,
+    )
+    view = preflight.config_view_for_budget(config)
+    resolved = resolve_warmup_budget(view)
+    proxy = preflight._novelty_proxy_record(resolved, preflight._budget_geometry(view))
+
+    assert proxy["source"] == "curve"
+    assert proxy["run_target_forecast_clock"] == "physical"
+    assert proxy["run_max_forecast_advance_steps"] > 0
+    assert proxy["lookup_horizon_steps"] == SHIPPED_HORIZON
+    assert proxy["matches_scored_gather"] is True
+    assert "tertile_note" not in proxy and "stored_horizon_steps" not in proxy
+    assert "this run's own horizon" in proxy["definition"]
+
+
+def test_the_objective_weights_are_disclosed_from_the_model(config, model, model_kwargs) -> None:
+    """The phase share of the objective's channel-weight mass is a property of the kept widths and
+    the two configured weights, read off the model rather than restated (CFS-10)."""
+    record = _run(config, model, model_kwargs)
+    weights = record["objective_weights"]
+    kept = record["checks"]["warmup_budget_matches_checkpoint"]["target_kept_width"]
+    n_st, n_ph = weights["n_scattering_kept"], weights["n_phase_kept"]
+    w_st, w_ph = weights["target_weight_st"], weights["target_weight_ph"]
+
+    assert n_st + n_ph == kept
+    assert (n_st, n_ph) == (32, 66), "the fixture at the shipped budget keeps 32 + 66"
+    assert (w_st, w_ph) == (model.target_weight_st, model.target_weight_ph)
+    expected_phase = n_ph * w_ph / (n_st * w_st + n_ph * w_ph)
+    assert weights["phase_mass_frac"] == pytest.approx(expected_phase, rel=1e-9)
+    assert weights["scattering_mass_frac"] + weights["phase_mass_frac"] == pytest.approx(1.0)
+    assert "TRAINING objective" in weights["note"]
+
+
+def test_the_shipped_weight_ratio_gives_phase_seventeen_percent_of_the_mass() -> None:
+    r"""The number the review quotes, from the disclosure itself: at $32 + 66$ kept channels and
+    the shipped $1 : 0.1$ ratio, phase receives $6.6 / 38.6 \approx 17.1\%$ of the renormalised
+    weight mass while occupying two thirds of the output coordinates."""
+    kwargs = shipped_warmup_kwargs(target_weight_st=1.0, target_weight_ph=0.1)
+    torch.manual_seed(0)
+    built = SeqVaeLagAttnCfs(**kwargs)
+
+    weights = preflight.objective_channel_weights(built)
+
+    assert (weights["n_scattering_kept"], weights["n_phase_kept"]) == (32, 66)
+    # The buffer is float32 (renormalised in the model), so the tolerance is float32-wide.
+    assert weights["phase_mass_frac"] == pytest.approx(6.6 / 38.6, rel=1e-6)
+    assert weights["phase_mass_frac"] == pytest.approx(0.171, abs=1e-3)

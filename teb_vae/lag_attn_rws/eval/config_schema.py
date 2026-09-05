@@ -396,7 +396,8 @@ def validate_eval_config(config: Mapping[str, Any]) -> Dict[str, Any]:
             f"eval_config.seed must be < {_MAX_SEED} (numpy's bound), got {resolved['seed']}."
         )
 
-    # K = 1 is legitimate: it reduces the marginalised score exactly to the training-path one.
+    # K = 1 is admitted: one draw of the marginalised estimator. It is NOT the training-path score
+    # under base_decode: mean, where the training path decodes the base branch at the prior mean.
     resolved["num_mc_samples"] = _require_int(resolved["num_mc_samples"], "num_mc_samples", minimum=1)
 
     if resolved["max_samples"] is not None:

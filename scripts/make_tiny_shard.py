@@ -92,7 +92,12 @@ if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
 from hdf5_dataset.calculate_dataset_stats import calculate_and_save_dataset_stats  # noqa: E402
-from hdf5_dataset.causal_scattering import LEG_ALIGNMENT_MODES  # noqa: E402
+from hdf5_dataset.causal_scattering import (  # noqa: E402
+    LEG_ALIGNMENT_MODES,
+    PHASE_OPERATOR_INTEGER,
+    PHASE_OPERATOR_LEGACY,
+    PHASE_OPERATORS,
+)
 from hdf5_dataset.hdf5_dataset import RAW_SAMPLING_HZ  # noqa: E402
 from teb_vae.lag_attn_rws.eval.launch import resolve_launch_args  # noqa: E402
 
@@ -270,7 +275,10 @@ def read_causal_source(n_samples: int, signal_len: int) -> Dict[str, np.ndarray]
 
 
 def causal_transform(
-    raw: Dict[str, np.ndarray], seq_len: int, leg_alignment: str = LEG_ALIGNMENT_MODES[0]
+    raw: Dict[str, np.ndarray],
+    seq_len: int,
+    leg_alignment: str = LEG_ALIGNMENT_MODES[0],
+    phase_operator: str = PHASE_OPERATOR_LEGACY,
 ) -> Dict[str, Any]:
     """Run the real causal bank over a batch of raw segments, once.
 
@@ -300,6 +308,11 @@ def causal_transform(
             ``seq_len * DECIMATION``, so the segments must already be that long.
         leg_alignment: The phase-harmonic leg alignment, one of
             :data:`~hdf5_dataset.causal_scattering.LEG_ALIGNMENT_MODES`.
+        phase_operator: The phase-harmonic operator version, one of
+            :data:`~hdf5_dataset.causal_scattering.PHASE_OPERATORS`. Threaded into the mask
+            resolution AND the transform from this one argument, for the reason the alignment is:
+            the coefficients written and the ``causal_phase_operator`` stamped beside them must
+            describe one operator.
 
     Returns:
         ``{'pipeline', 'masks', 'widths', 'raw', 'blocks', 'signal_len'}`` -- the production
@@ -333,6 +346,7 @@ def causal_transform(
         device=device,
         transform="causal",
         leg_alignment=leg_alignment,
+        phase_operator=phase_operator,
     )
     blocks = transform_batch_numpy(
         CausalTorchBank(masks["causal_bank"], device, n_signal=signal_len),
@@ -342,6 +356,7 @@ def causal_transform(
         pipeline._selection_pairs(masks["up_ph_selection"]),
         plan=masks["channel_plan"],
         leg_alignment=leg_alignment,
+        phase_operator=phase_operator,
     )
     return {
         "pipeline": pipeline,
@@ -356,10 +371,10 @@ def causal_transform(
 def create_causal_file(path: str, transformed: Dict[str, Any], seq_len: int) -> None:
     """Create one empty causal HDF5 through the production writer.
 
-    The schema, the root constants and the per-block warm-up, delay and novelty attributes are all
+    The schema, the root constants and the per-block warm-up, delay and novelty-curve attributes are all
     the production writer's, reached through the import shim that stubs the prod-only adaptor.
     Nothing about the file's self-description is restated here, because a second description of a
-    warm-up boundary is a second boundary. The leg alignment and the novelty vectors travel in the
+    warm-up boundary is a second boundary. The leg alignment and the novelty curves travel in the
     resolved masks for the same reason: they come from the bank that produced the coefficients.
 
     Args:
@@ -385,12 +400,18 @@ def create_causal_file(path: str, transformed: Dict[str, Any], seq_len: int) -> 
         transform="causal",
         channel_plan=masks["channel_plan"],
         leg_alignment=masks["causal_leg_alignment"],
-        novelty_frac=masks["causal_novelty_frac"],
+        novelty_curve=masks["causal_novelty_curve"],
+        phase_operator=masks["causal_phase_operator"],
     )
 
 
 def write_causal_shard(
-    path: str, *, n_samples: int, seq_len: int, leg_alignment: str = LEG_ALIGNMENT_MODES[0]
+    path: str,
+    *,
+    n_samples: int,
+    seq_len: int,
+    leg_alignment: str = LEG_ALIGNMENT_MODES[0],
+    phase_operator: str = PHASE_OPERATOR_LEGACY,
 ) -> Dict[str, Any]:
     """Write the single-file causal shard, transforming real raw segments with the real causal bank.
 
@@ -400,12 +421,15 @@ def write_causal_shard(
         seq_len: On-disk (untrimmed) feature-grid length.
         leg_alignment: The phase-harmonic leg alignment the phase blocks are built with, recorded
             on the file as ``causal_leg_alignment``.
+        phase_operator: The phase-harmonic operator version, recorded on the file as
+            ``causal_phase_operator``. The integer operator writes 44/10 phase channels.
 
     Returns:
         The resolved per-block widths, so a caller can report what it wrote.
     """
     transformed = causal_transform(
-        read_causal_source(n_samples, seq_len * DECIMATION), seq_len, leg_alignment
+        read_causal_source(n_samples, seq_len * DECIMATION), seq_len, leg_alignment,
+        phase_operator,
     )
     blocks, raw = transformed["blocks"], transformed["raw"]
     create_causal_file(path, transformed, seq_len)
@@ -1198,6 +1222,11 @@ RUN_ARGS: Dict[str, Any] = {
     # 'envelope', which is what the committed binaries carry and what the shipped model configs
     # expect. Ignored by 'two_sided', which has no causal phase block at all.
     "leg_alignment": None,
+    # Phase-harmonic operator version for the 'causal' variant only: 'ratio_power_v0' (the legacy
+    # operator every shard on disk shares; the committed tiny_shard_causal.hdf5) or
+    # 'integer_harmonic_v1'. The 'causal_int' variant ignores this and always writes the integer
+    # operator into its own file, tiny_shard_causal_int.hdf5. None -> 'ratio_power_v0'.
+    "phase_operator": None,
     # Re-measure an already-written planted shard's coupling instead of writing anything, given its
     # path. This is the self-check run on its own, for a fixture already on disk.
     "check_planted": None,
@@ -1206,20 +1235,24 @@ RUN_ARGS: Dict[str, Any] = {
 #: Defaults applied after the merge, so every key above stays reachable from the dict.
 _DEFAULTS: Dict[str, Any] = {
     "out_dir": os.path.join(_REPO_ROOT, "teb_vae", "lag_attn", "tests", "fixtures"),
-    "variants": ["two_sided", "causal", "planted"],
+    "variants": ["two_sided", "causal", "causal_int", "planted"],
     "samples": 4,
     "seq_len": 330,
     "seed": 0,
     "leg_alignment": "envelope",
+    "phase_operator": PHASE_OPERATOR_LEGACY,
 }
 
-VARIANT_CHOICES = ("two_sided", "causal", "causal_cohort", "planted")
+VARIANT_CHOICES = ("two_sided", "causal", "causal_int", "causal_cohort", "planted")
 
 #: Where each variant's shards and statistics file land, relative to ``out_dir``. The cohort mode
 #: names no shard stem: it writes one file per entry of :data:`COHORT_SUBGROUPS`.
 _STATS_STEM: Dict[str, str] = {
     "two_sided": "tiny_stats.hdf5",
     "causal": "tiny_stats_causal.hdf5",
+    # The corrected integer-operator fixture keeps its own statistics: its phase channel axis is
+    # a different one (44/10), and the loader refuses a stats file built under another operator.
+    "causal_int": "tiny_stats_causal_int.hdf5",
     "causal_cohort": "tiny_stats_causal_cohort.hdf5",
     "planted": "tiny_stats_causal_planted.hdf5",
 }
@@ -1267,6 +1300,16 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--phase-operator",
+        dest="phase_operator",
+        choices=PHASE_OPERATORS,
+        help=(
+            "Phase-harmonic operator version for the 'causal' variant; 'ratio_power_v0' by "
+            "default, which is what the committed binary carries. The 'causal_int' variant always "
+            "writes 'integer_harmonic_v1'."
+        ),
+    )
+    parser.add_argument(
         "--check-planted",
         dest="check_planted",
         help=(
@@ -1285,6 +1328,7 @@ def main(
     seq_len: int,
     seed: int,
     leg_alignment: str,
+    phase_operator: str = PHASE_OPERATOR_LEGACY,
     check_planted: Optional[str] = None,
 ) -> int:
     """Write the requested shards and their stats files, or run the planted self-check alone.
@@ -1296,6 +1340,7 @@ def main(
         seq_len: On-disk feature length before trimming.
         seed: Seed for the two-sided shard's synthesised values.
         leg_alignment: Phase-harmonic leg alignment for the causal variants.
+        phase_operator: Phase-harmonic operator version for the ``'causal'`` variant.
         check_planted: An existing planted shard to re-measure instead of writing anything.
 
     Returns:
@@ -1320,8 +1365,28 @@ def main(
                 n_samples=samples,
                 seq_len=seq_len,
                 leg_alignment=leg_alignment,
+                phase_operator=phase_operator,
             )
-            print(f"  causal widths: {widths}, leg alignment: {leg_alignment}")
+            print(
+                f"  causal widths: {widths}, leg alignment: {leg_alignment}, "
+                f"phase operator: {phase_operator}"
+            )
+        elif variant == "causal_int":
+            # The corrected representation, always under the integer operator and always into its
+            # own file: the legacy fixture stays byte-identical, which is what keeps every existing
+            # contract test meaningful, and the two are never confusable by name.
+            shards = [os.path.join(out_dir, "tiny_shard_causal_int.hdf5")]
+            widths = write_causal_shard(
+                shards[0],
+                n_samples=samples,
+                seq_len=seq_len,
+                leg_alignment=leg_alignment,
+                phase_operator=PHASE_OPERATOR_INTEGER,
+            )
+            print(
+                f"  causal_int widths: {widths}, leg alignment: {leg_alignment}, "
+                f"phase operator: {PHASE_OPERATOR_INTEGER}"
+            )
         elif variant == "planted":
             shards = [os.path.join(out_dir, PLANTED_SHARD_STEM)]
             written = write_planted_shard(

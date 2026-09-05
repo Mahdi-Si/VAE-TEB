@@ -63,19 +63,9 @@ _ARMS: Dict[str, Dict[str, Any]] = {
     # One clock rather than two: the source key null restores the single-reference resolution, so
     # both streams read on the target's 402.1604 s and the lag axis carries no inter-stream offset.
     "sweep_align_target_max.yaml": {
-        f"{_VAE}.causal_align_reference_source": None,
+        f"{_VAE}.causal_align_reference": "target_max",
         _RUN_NAME: "lag_attn_trf_cfs_align_target_max",
         _VARIANT: "lag_attn_trf_cfs_align_target_max",
-    },
-    # No clock at all -- the unaligned end of the pre-registered pair. The SECOND model key is
-    # forced rather than a second axis: a source reference is one half of a pair of clocks, and the
-    # resolver refuses it against an unaligned target by name, so an arm moving only the first
-    # would not launch.
-    "sweep_align_unaligned.yaml": {
-        f"{_VAE}.causal_align_reference": None,
-        f"{_VAE}.causal_align_reference_source": None,
-        _RUN_NAME: "lag_attn_trf_cfs_unaligned",
-        _VARIANT: "lag_attn_trf_cfs_unaligned",
     },
     # The sharp lag memory: keys and values from the adapter output, one step of reach, against the
     # default's conv stem. The smallest of the three K/V models.
@@ -96,22 +86,34 @@ _ARMS: Dict[str, Dict[str, Any]] = {
         _RUN_NAME: "lag_attn_trf_cfs_source_dropout_03",
         _VARIANT: "lag_attn_trf_cfs_source_dropout_03",
     },
-    # The forecast-clock pair. Each moves TWO model keys, and the second travels with the first:
-    # the shipped stride of 5 exists to recover tiles under the physical clock's shortened
-    # ceiling, so an arm that restored the stored or input clock at stride 5 would compare two
-    # tilings as well as two clocks. 30 restores the horizon-partitioning tiling every historical
-    # run trained at.
-    "sweep_target_clock_stored.yaml": {
-        f"{_VAE}.causal_target_forecast_clock": "stored",
-        f"{_VAE}.anchor_stride": 30,
-        _RUN_NAME: "lag_attn_trf_cfs_clock_stored",
-        _VARIANT: "lag_attn_trf_cfs_clock_stored",
-    },
     "sweep_target_clock_input.yaml": {
+        f"{_VAE}.causal_align_reference": "target_max",
         f"{_VAE}.causal_target_forecast_clock": "input",
-        f"{_VAE}.anchor_stride": 30,
         _RUN_NAME: "lag_attn_trf_cfs_clock_input",
         _VARIANT: "lag_attn_trf_cfs_clock_input",
+    },
+    # The configuration this cell shipped before 2026-09-05, kept as the comparator the promoted
+    # default replaced: legacy fractional-phase representation, the dual input reference, the
+    # approximate physical clock and its stride-5 tiling, on the LEGACY shards.
+    "sweep_legacy_dualref_physclock.yaml": {
+        f"{_VAE}.c_y": 102,
+        f"{_VAE}.c_u": 51,
+        f"{_VAE}.causal_phase_operator": "ratio_power_v0",
+        f"{_VAE}.causal_align_reference": "target_max",
+        f"{_VAE}.causal_align_reference_source": 288.2672,
+        f"{_VAE}.causal_target_forecast_clock": "physical",
+        f"{_VAE}.anchor_stride": 5,
+        "dataset_config.vae_train_datasets": [
+            "/data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_causal/pre_training_dataset/train_dataset_cs.hdf5",
+            "/data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_causal/pre_training_dataset/train_dataset_no_cs.hdf5",
+        ],
+        "dataset_config.vae_test_datasets": [
+            "/data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_causal/pre_training_dataset/test_dataset_cs.hdf5",
+            "/data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_causal/pre_training_dataset/test_dataset_no_cs.hdf5",
+        ],
+        "dataset_config.stat_path": "/data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_causal/stats.hdf5",
+        _RUN_NAME: "lag_attn_trf_cfs_dualref288_physclock",
+        _VARIANT: "lag_attn_trf_cfs_dualref288_physclock",
     },
 }
 
@@ -240,8 +242,8 @@ def test_the_default_pairs_the_stride_with_the_forecast_clock():
     default = load_config(str(_DEFAULT))
     _floor, stride, horizon, _t_valid = _geometry(default)
 
-    assert default["model_config"]["VAE_model"]["causal_target_forecast_clock"] == "physical"
-    assert stride == 5
+    assert default["model_config"]["VAE_model"]["causal_target_forecast_clock"] == "stored"
+    assert stride == 13
     assert horizon == 30
 
 

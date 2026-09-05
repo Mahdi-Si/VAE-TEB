@@ -250,7 +250,6 @@ def run_lag_ablation_analysis(
 
     seq_len = int(runner.model.sequence_length)
     num_lags = int(runner.num_lags)
-    up_shift_secs = float(eval_config.get("up_shift_secs", 0.0))
     micro_batch = eval_config.get("ablation_batch_size")
 
     scoring_start = masks.common_scoring_start(runner.model, bands, seq_len)
@@ -300,12 +299,12 @@ def run_lag_ablation_analysis(
                 "lag_lo": int(band[0]) if band is not None else -1,
                 "lag_hi": int(band[1]) if band is not None else -1,
                 "seconds_lo": (
-                    float(metrics.lag_seconds_physical(band[0], up_shift_secs=up_shift_secs))
+                    float(metrics.lag_seconds_physical(band[0]))
                     if band is not None
                     else float("nan")
                 ),
                 "seconds_hi": (
-                    float(metrics.lag_seconds_physical(band[1], up_shift_secs=up_shift_secs))
+                    float(metrics.lag_seconds_physical(band[1]))
                     if band is not None
                     else float("nan")
                 ),
@@ -322,7 +321,7 @@ def run_lag_ablation_analysis(
     frame = pd.DataFrame(rows)
     frame.to_csv(directory / "per_band.csv", index=False)
 
-    figure_paths = _write_figures(frame, directory, up_shift_secs)
+    figure_paths = _write_figures(frame, directory)
 
     ablated_rows = [row for row in rows if row["band"] != BASELINE_NAME]
     finite = [row for row in ablated_rows if np.isfinite(row["feat_mse_delta"])]
@@ -381,13 +380,12 @@ def run_lag_ablation_analysis(
     return summary
 
 
-def _write_figures(frame: pd.DataFrame, directory: Path, up_shift_secs: float) -> list:
+def _write_figures(frame: pd.DataFrame, directory: Path) -> list:
     """Draw the per-band forecast-degradation and KL-change bar charts.
 
     Args:
         frame: The per-band table, including the unmasked baseline row.
         directory: The analysis directory.
-        up_shift_secs: The dataset's UP shift, for the second line of each tick label.
 
     Returns:
         The two paths written.
@@ -437,7 +435,7 @@ def _write_figures(frame: pd.DataFrame, directory: Path, up_shift_secs: float) -
                 0.5, 0.98,
                 f"All bands and the unmasked baseline scored on the same "
                 f"{int(ablated['anchors_scored'].iloc[0]) if len(ablated) else 0} anchors; "
-                f"lag axis carries the dataset UP advance of {-up_shift_secs:g} s.",
+                f"lag axis is the stored timeline, {metrics.STEP_SECONDS:g} s per lag.",
                 transform=ax.transAxes, ha="center", va="top", fontsize=6,
                 color=figures.COLOR_GRAY,
             )

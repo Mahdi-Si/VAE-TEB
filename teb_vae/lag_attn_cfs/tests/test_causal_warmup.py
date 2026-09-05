@@ -566,10 +566,10 @@ def test_target_max_resolves_the_shipped_reference_off_the_shards(aligned) -> No
 
 
 def test_the_scored_targets_clock_follows_the_forecast_clock(aligned) -> None:
-    """The forecast-side twin of ``source_clock_delay_s``: the tau a page shifts the scored stream
-    by. Physical is the fastest kept channel's own delay, input is the target's input reference,
-    and stored has no single constant at all -- ``None``, not zero, because zero would draw the
-    stream as though its content were stamped with the step it is stored at."""
+    """The forecast-side twin of ``source_clock_delay_s``: the tau the page states on the forecast
+    rows' axis. Physical is the fastest kept channel's own delay, input is the target's input
+    reference, and stored has no single constant at all -- ``None``, not zero, because zero would
+    read as content stamped with the step it is stored at."""
     from dataclasses import replace
 
     from teb_vae.lag_attn_cfs import causal_warmup
@@ -1040,3 +1040,188 @@ def test_the_kwargs_carry_the_shift_only_when_a_clock_is_configured(physical_clo
 
     mapped = warmup_model_kwargs(physical_clock, SeqVaeLagAttnCfs)
     assert mapped["target_forecast_shift"] == physical_clock.target_forecast_shift
+
+
+# =================================================================================================
+# The phase-harmonic operator VERSION (CFS-02/03)
+# =================================================================================================
+def test_a_shard_whose_phase_operator_disagrees_with_the_config_is_refused() -> None:
+    """The committed legacy fixture is the ratio-power operator; a config expecting the corrected
+    integer operator must be refused by name rather than load fractional-power phase blocks under
+    a configuration written for integer ones. The refusal names the key, both values and the
+    shard, exactly as the leg-alignment refusal does."""
+    from teb_vae.lag_attn_cfs.tests.conftest import SHIPPED_PHASE_OPERATOR
+
+    assert SHIPPED_PHASE_OPERATOR == "ratio_power_v0"
+    with pytest.raises(ValueError) as error:
+        resolve_warmup_budget(causal_config(causal_phase_operator="integer_harmonic_v1"))
+    message = str(error.value)
+    assert "causal_phase_operator" in message
+    assert "'integer_harmonic_v1'" in message and "'ratio_power_v0'" in message
+    assert str(CAUSAL_SHARD) in message
+
+
+def test_the_expected_phase_operator_may_be_left_unstated(aligned) -> None:
+    """``null`` is a run that does not care, and it resolves the identical budget."""
+    unstated = resolve_warmup_budget(causal_config(causal_phase_operator=None))
+    assert unstated is not None
+    assert unstated.phase_operator == "ratio_power_v0"
+    assert unstated.target.keep_index == aligned.target.keep_index
+    assert unstated.target.align_delays == aligned.target.align_delays
+    assert "phase operator ratio_power_v0" in unstated.summary()
+
+
+def test_the_corrected_fixture_resolves_at_its_own_widths_under_the_transparent_baseline() -> None:
+    """The integer-operator fixture: 36 + 44 target and 36 + 10 source, resolved unaligned on the
+    stored clock -- the CFS-09 baseline's clocks -- with every phase channel surviving the shipped
+    budget and the scattering drops unchanged from the legacy fixture (CFS-03)."""
+    from teb_vae.lag_attn_cfs.tests.conftest import (
+        INT_C_U,
+        INT_C_Y,
+        INT_CAUSAL_SHARD,
+        INT_PH_WIDTH,
+        INT_SOURCE_PH_WIDTH,
+    )
+
+    assert INT_CAUSAL_SHARD.exists(), "regenerate with scripts/make_tiny_shard.py --variants causal_int"
+    resolved = resolve_warmup_budget(
+        causal_config(
+            paths=[INT_CAUSAL_SHARD],
+            c_y=INT_C_Y,
+            c_u=INT_C_U,
+            causal_phase_operator="integer_harmonic_v1",
+            causal_align_reference=None,
+            causal_align_reference_source=None,
+            causal_target_forecast_clock="stored",
+        )
+    )
+    assert resolved is not None
+    assert resolved.phase_operator == "integer_harmonic_v1"
+    assert resolved.target.declared_width == INT_C_Y == 80
+    assert resolved.source.declared_width == INT_C_U == 46
+    counts = {name: (kept, declared) for name, kept, declared in resolved.target.block_counts()}
+    assert counts["fhr_ph"] == (INT_PH_WIDTH, INT_PH_WIDTH) == (44, 44)
+    # The scattering block's budget drops are the legacy fixture's: the operator changes phase
+    # channels only.
+    legacy = resolve_warmup_budget(causal_config(causal_align_reference=None))
+    assert legacy is not None
+    assert counts["fhr_st"] == dict(
+        (name, (kept, declared)) for name, kept, declared in legacy.target.block_counts()
+    )["fhr_st"] == (32, 36)
+    source_counts = {name: (kept, declared) for name, kept, declared in resolved.source.block_counts()}
+    assert source_counts["up_ph"] == (INT_SOURCE_PH_WIDTH, INT_SOURCE_PH_WIDTH) == (10, 10)
+    assert resolved.target.align_delays is None and resolved.target_forecast_shift is None
+    # And the legacy widths declared against the corrected shard are refused: a width is checked
+    # against the shard, so the old 102/51 cannot be transplanted onto the new representation.
+    with pytest.raises(ValueError, match="c_y=102 disagrees"):
+        resolve_warmup_budget(
+            causal_config(paths=[INT_CAUSAL_SHARD], causal_phase_operator="integer_harmonic_v1")
+        )
+
+
+# =================================================================================================
+# The novelty vector is looked up in the shards' horizon-free curve at THIS run's gather
+# =================================================================================================
+def _int_config(**overrides):
+    """The integer-operator fixture resolved unaligned, with the named leaves moved."""
+    from teb_vae.lag_attn_cfs.tests.conftest import INT_C_U, INT_C_Y, INT_CAUSAL_SHARD
+
+    assert INT_CAUSAL_SHARD.exists(), "regenerate with scripts/make_tiny_shard.py --variants causal_int"
+    leaves = dict(
+        paths=[INT_CAUSAL_SHARD],
+        c_y=INT_C_Y,
+        c_u=INT_C_U,
+        causal_phase_operator="integer_harmonic_v1",
+        causal_align_reference=None,
+        causal_align_reference_source=None,
+        causal_target_forecast_clock="stored",
+    )
+    leaves.update(overrides)
+    return causal_config(**leaves)
+
+
+def test_a_current_shard_stores_a_novelty_curve_and_no_fixed_horizon_scalar() -> None:
+    """The dataset bakes no forecast horizon in: it tabulates the envelope-mass share for every
+    window over the stored segment, and carries no ``causal_novelty_frac``."""
+    import h5py
+
+    from hdf5_dataset.hdf5_dataset import read_causal_warmup
+    from teb_vae.lag_attn_cfs.tests.conftest import INT_CAUSAL_SHARD
+
+    warmup = read_causal_warmup([str(INT_CAUSAL_SHARD)], SHIPPED_TRIM_MINUTES)
+    assert warmup.novelty_frac == {}
+    assert sorted(warmup.novelty_curve) == sorted(TARGET_BLOCKS + SOURCE_BLOCKS)
+    with h5py.File(INT_CAUSAL_SHARD, "r") as handle:
+        for block, table in warmup.novelty_curve.items():
+            assert "causal_novelty_frac" not in handle[block].attrs, block
+            assert table.shape == (handle[block].shape[1], handle[block].shape[2] + 1), block
+
+
+def test_the_novelty_vector_is_the_curve_at_this_runs_horizon_on_the_stored_clock() -> None:
+    from hdf5_dataset.hdf5_dataset import read_causal_warmup
+    from teb_vae.lag_attn_cfs.causal_warmup import NOVELTY_SOURCE_CURVE
+    from teb_vae.lag_attn_cfs.tests.conftest import INT_CAUSAL_SHARD
+
+    warmup = read_causal_warmup([str(INT_CAUSAL_SHARD)], SHIPPED_TRIM_MINUTES)
+    for horizon in (SHIPPED_HORIZON, 15):
+        resolved = resolve_warmup_budget(_int_config(horizon=horizon, anchor_stride=horizon))
+        assert resolved is not None
+        assert resolved.novelty_source == NOVELTY_SOURCE_CURVE
+        assert resolved.novelty_horizon_steps == horizon
+        for stream, blocks in ((resolved.target, TARGET_BLOCKS), (resolved.source, SOURCE_BLOCKS)):
+            expected = [
+                float(value)
+                for block in blocks
+                for value in warmup.novelty_curve[block][:, horizon]
+            ]
+            assert stream.declared_novelty_frac == pytest.approx(expected), (stream.name, horizon)
+    # Two horizons, two vectors: the number moves with the model-side choice, as it must.
+    at_30 = resolve_warmup_budget(_int_config()).target.declared_novelty_frac
+    at_15 = resolve_warmup_budget(_int_config(horizon=15, anchor_stride=15)).target.declared_novelty_frac
+    assert at_30 != at_15
+    assert all(a >= b for a, b in zip(at_30, at_15))
+
+
+def test_the_physical_clock_looks_each_kept_channel_up_at_its_own_advance() -> None:
+    r"""Under ``physical`` the last label of kept channel $c$ sits at $t + H + s_c$, so its share
+    is $N_c(H + s_c)$; a channel the budget drops is never scored and is looked up unadvanced."""
+    from hdf5_dataset.hdf5_dataset import read_causal_warmup
+    from teb_vae.lag_attn_cfs.tests.conftest import INT_CAUSAL_SHARD
+
+    warmup = read_causal_warmup([str(INT_CAUSAL_SHARD)], SHIPPED_TRIM_MINUTES)
+    stored = resolve_warmup_budget(_int_config())
+    physical = resolve_warmup_budget(
+        _int_config(causal_target_forecast_clock="physical", anchor_stride=5)
+    )
+    assert physical is not None and stored is not None
+    assert physical.target_forecast_shift is not None
+    assert physical.max_forecast_advance > 0
+
+    curve = np.concatenate([warmup.novelty_curve[block] for block in TARGET_BLOCKS], axis=0)
+    kept = physical.target.keep_index
+    for position, declared in enumerate(kept):
+        shift = physical.target_forecast_shift[position]
+        window = min(SHIPPED_HORIZON + shift, curve.shape[1] - 1)
+        assert physical.target.declared_novelty_frac[declared] == pytest.approx(
+            float(curve[declared, window])
+        ), declared
+        assert physical.target.declared_novelty_frac[declared] >= (
+            stored.target.declared_novelty_frac[declared] - 1e-12
+        )
+    dropped = sorted(set(range(curve.shape[0])) - set(kept))
+    for declared in dropped:
+        assert physical.target.declared_novelty_frac[declared] == pytest.approx(
+            stored.target.declared_novelty_frac[declared]
+        ), declared
+    # The advance is real: the slowest kept channel's share moved by more than rounding.
+    slowest = max(kept, key=lambda index: physical.target.declared_delay_s[index])
+    assert physical.target.declared_novelty_frac[slowest] > (
+        stored.target.declared_novelty_frac[slowest] + 0.1
+    )
+
+
+def test_a_legacy_shard_resolves_its_fixed_horizon_scalar_and_says_so(budget) -> None:
+    from teb_vae.lag_attn_cfs.causal_warmup import NOVELTY_SOURCE_LEGACY
+
+    assert budget.novelty_source == NOVELTY_SOURCE_LEGACY
+    assert budget.novelty_horizon_steps is None

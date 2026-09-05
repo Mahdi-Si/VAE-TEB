@@ -182,20 +182,11 @@ eval_config:
     lag_31_60: [31, 60]
     lag_61_90: [61, 90]
 
-  # Offset between a model lag index and physical seconds, for the second axis on every lag
-  # figure: seconds = 4 * lag + up_shift_secs, i.e. the raw-file lead a peak at lag l implies.
-  #
-  # PINNED AGAINST THE PIPELINE SOURCE, not the documentation. mimo_adaptor.py runs
-  # `up_shifted[:-80] = up_signal[80:]` at up_shift_secs=-20, so stored grid position g holds
-  # uterine activity the sensor recorded at g + 20 s: UP was ADVANCED, pulled earlier. Attention
-  # at anchor t reading source t-l therefore compares FHR at 4t against UA recorded at
-  # 4(t-l) + 20, a lead of 4l - 20 s.
-  #
-  # This key read `- up_shift_secs` until it was corrected, which put every published lead 40 s
-  # high -- in the direction that made the model look as though it had found a longer, more
-  # physiological delay than it had. A peak at l = 0 was captioned +20 s when the two epochs are
-  # 20 s apart in the opposite order.
-  up_shift_secs: -20
+  # There is deliberately NO `up_shift_secs` key. The stored UP/FHR timeline is canonical: the
+  # dataset builder shifts the UP channel when it writes the shards, that shift is part of how the
+  # stored signals are, and no lag axis, column or record downstream adds it back or subtracts it.
+  # Every lag figure reads seconds = 4 * lag. A config that names the removed key is refused as an
+  # unknown key rather than silently honoured.
 
   # Floor on the load health probe's `residual_ratio` -- the masked RMS of delta_mu_src relative
   # to the full forecast. Below it the probe WARNS and records; it never raises. A genuinely

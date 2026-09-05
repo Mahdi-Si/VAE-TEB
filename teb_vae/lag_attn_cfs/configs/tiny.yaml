@@ -44,9 +44,9 @@ dataset_config:
   # model in the family reads the same shards through the same loader -- and the CAUSAL pair is what
   # this package reads: the two-sided `tiny_shard.hdf5` beside it carries no `transform` attribute
   # and no warm-up vectors, and the pre-flight refuses it by name.
-  vae_train_datasets: [teb_vae/lag_attn/tests/fixtures/tiny_shard_causal.hdf5]
-  vae_test_datasets: [teb_vae/lag_attn/tests/fixtures/tiny_shard_causal.hdf5]
-  stat_path: teb_vae/lag_attn/tests/fixtures/tiny_stats_causal.hdf5
+  vae_train_datasets: [teb_vae/lag_attn/tests/fixtures/tiny_shard_causal_int.hdf5]
+  vae_test_datasets: [teb_vae/lag_attn/tests/fixtures/tiny_shard_causal_int.hdf5]
+  stat_path: teb_vae/lag_attn/tests/fixtures/tiny_stats_causal_int.hdf5
   dataloader_config:
     num_workers: 0       # no worker spawn for 4 samples
 

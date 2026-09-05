@@ -56,7 +56,7 @@ from teb_vae.lag_attn.config import load_config, resolve_config_file
 from teb_vae.lag_attn_cfs.nets.model import SeqVaeLagAttnCfs
 from train.test_utils import make_graph_model
 
-from .conftest import CAUSAL_C_U, CAUSAL_C_Y, absolutize_dataset_paths
+from .conftest import CAUSAL_C_U, CAUSAL_C_Y, INT_C_U, INT_C_Y, absolutize_dataset_paths
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 _CONFIG_DIR = Path(__file__).resolve().parents[1] / "configs"
@@ -115,6 +115,9 @@ TASK_LEVEL_KEYS = (
     # resolve into theirs.
     "causal_target_forecast_clock",
     "causal_leg_alignment",
+    # The phase-harmonic operator VERSION the shards were built with, checked against their root
+    # attribute exactly as the leg alignment is; a resolver expectation, not a constructor key.
+    "causal_phase_operator",
 )
 
 #: Shared by the four geometry entries below, because it is one reason rather than four: the
@@ -161,6 +164,10 @@ PARITY_EXEMPT_PATHS: Dict[str, str] = {
     "model_config.VAE_model.causal_leg_alignment": (
         "which phase-harmonic operator built the configured shards, which only a causal shard "
         "records at all"
+    ),
+    "model_config.VAE_model.causal_phase_operator": (
+        "which phase-harmonic operator VERSION built the configured shards, which only a causal "
+        "shard records at all"
     ),
     "model_config.VAE_model.causal_warmup_budget_steps": (
         "the guard this dataset needs, which has no two-sided counterpart at all"
@@ -305,6 +312,10 @@ SMOKE_HIE_DELTA_PATHS = frozenset(
         "general_config.batch_size.test",
         "general_config.folders_config.out_dir_base",
         "model_config.VAE_model.beta_schedule.warmup_epochs",
+        # The local shard is a LEGACY build, so the smoke pins the operator and widths back to it.
+        "model_config.VAE_model.causal_phase_operator",
+        "model_config.VAE_model.c_y",
+        "model_config.VAE_model.c_u",
         "dataset_config.vae_train_datasets",
         "dataset_config.vae_test_datasets",
         "dataset_config.stat_path",
@@ -457,10 +468,10 @@ def test_the_shipped_geometry_pairs_the_floor_with_the_budget(shipped):
     vae = shipped["model_config"]["VAE_model"]
 
     assert vae["causal_warmup_budget_steps"] == 134
-    assert vae["causal_align_reference"] == "target_max"
+    assert vae["causal_align_reference"] is None
     assert vae["warmup_period"] == 134 == vae["causal_warmup_budget_steps"]
-    assert vae["c_y"] == CAUSAL_C_Y
-    assert vae["c_u"] == CAUSAL_C_U
+    assert vae["c_y"] == INT_C_Y
+    assert vae["c_u"] == INT_C_U
 
 
 def test_the_anchor_stride_pairs_with_the_forecast_clock(shipped):
@@ -471,8 +482,8 @@ def test_the_anchor_stride_pairs_with_the_forecast_clock(shipped):
     restores the horizon-partitioning 30 with its clock."""
     vae = shipped["model_config"]["VAE_model"]
 
-    assert vae["causal_target_forecast_clock"] == "physical"
-    assert vae["anchor_stride"] == 5
+    assert vae["causal_target_forecast_clock"] == "stored"
+    assert vae["anchor_stride"] == 13
     assert vae["horizon"] == 30
 
 
@@ -489,10 +500,10 @@ def test_the_shipped_config_builds_a_decoder_as_wide_as_the_budget_keeps(tmp_pat
     kwargs = _model_kwargs_from(load_config(str(_TINY)), LagAttnCfsTrainer, tmp_path)
     model = SeqVaeLagAttnCfs(**kwargs)
 
-    assert len(kwargs["target_keep_index"]) == 98
-    assert model.decoder_out_channels == 98
+    assert len(kwargs["target_keep_index"]) == 76
+    assert model.decoder_out_channels == 76
     assert model.raw_per_step == 16  # untouched by the width
-    assert model.horizon * model.decoder_out_channels == 2940
+    assert model.horizon * model.decoder_out_channels == 2280
 
 
 # --------------------------------------------------------------------------------------
@@ -858,10 +869,11 @@ def test_the_resolved_tiny_variant_validates_and_builds(tmp_path, loguru_warning
     # production width and the forward still decodes the production tiling, forecast clock
     # included -- the ceiling below is T_valid less the physical clock's 85-step advance.
     assert model.d_model == 32
-    assert model.decoder_out_channels == 98
-    assert model.anchor_stride == 5
-    assert model.target_forecast_shift is not None
-    assert model.anchor_ceiling == model.geometry.t_valid - max(model.target_forecast_shift)
+    assert model.decoder_out_channels == 76
+    assert model.anchor_stride == 13
+    # The stored clock advances nothing: every anchor up to T_valid is decoded.
+    assert model.target_forecast_shift is None
+    assert model.anchor_ceiling == model.geometry.t_valid
 
 
 # --------------------------------------------------------------------------------------

@@ -32,7 +32,8 @@ axes differ only in which column they read. The pooled output is never touched.
   its constraint: a number that is not registered here is invisible to the acceptance gate and to
   the arm tables, which read this block and nothing else. It carries **two** ``pred_gap`` columns
   under names that say which is which, because the Monte Carlo marginalised score and the
-  training-path single-draw score are different estimators of the same quantity and a bare
+  training-path score are different quantities -- under ``base_decode: mean`` the training path
+  decodes the base branch at the prior mean and samples only the full one -- and a bare
   ``pred_gap`` would leave a reader to guess.
 * The **sanity** block is the run's self-consistency checks, three-valued, with a ``warning``
   flag. It deliberately does **not** change the exit code: the exit code says a *step* raised,
@@ -258,8 +259,11 @@ HEADLINE_VERDICTS: Tuple[str, ...] = (
 PRED_GAP_CONVENTION = (
     "pred_gap_mc_nats is the headline: the Monte Carlo marginalised block score difference "
     "D_base - D_full in nats per anchor, where D = -[logsumexp_r(-D_r) - log K] is the log of "
-    "the average likelihood over K latent draws. pred_gap_train_path_nats is the single-draw "
-    "training-path difference, reported beside it as the objective-parity column. "
+    "the average likelihood over K latent draws. pred_gap_train_path_nats is the training-path "
+    "difference the objective itself sees, reported beside it for objective parity only: under "
+    "base_decode: mean the training path decodes the base branch at the prior MEAN and the full "
+    "branch at one sampled latent, so that column mixes a source comparison with a "
+    "decoding-policy difference and is not a second estimate of pred_gap_mc_nats. "
     "Three percentage columns restate the same finding as a proportion, each computed per "
     "recording and then averaged: pred_gap_rmse_pct and pred_gap_mse_pct are the percentage of "
     "the target-only branch's point-forecast error the source removed, in root-mean-square and "

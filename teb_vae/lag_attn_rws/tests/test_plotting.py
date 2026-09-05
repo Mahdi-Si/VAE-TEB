@@ -255,8 +255,8 @@ def test_the_first_row_draws_the_source_trace_beside_the_target(task, stub_batch
 
 
 def test_both_lag_panels_name_the_compensated_lag_quantity(task, stub_batch):
-    """A lag axis reading "Lag (s)" is ambiguous between the physiological lag and the
-    uncorrected sensor one, which differ by the 20 s the pipeline already removed."""
+    """A lag axis reading "Lag (s)" does not say whether the causal input delay was added back;
+    the label names the one quantity every lag figure draws, on the canonical stored timeline."""
     figure = _build(task(), stub_batch)
     try:
         for prefix in ("Lag attention", "$\\widetilde K"):

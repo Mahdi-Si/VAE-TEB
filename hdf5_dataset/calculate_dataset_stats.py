@@ -25,11 +25,13 @@ from teb_vae.lag_attn_rws.eval.launch import (  # noqa: E402
 )
 from hdf5_dataset.hdf5_dataset import (  # noqa: E402
     LEG_ALIGNMENT_NONE,
+    PHASE_OPERATOR_LEGACY,
     TWO_SIDED,
     _resolve_dataset_layout,
     normalize_tensor_data,
     rebase_causal_warmup,
     resolve_leg_alignment,
+    resolve_phase_operator,
     resolve_transform,
 )
 
@@ -106,6 +108,11 @@ class DatasetStatsCalculator:
         # identical warm-ups, so this attribute is the only thing that stops a
         # stats file computed over one being used to normalise the other.
         self.source_leg_alignment = LEG_ALIGNMENT_NONE
+
+        # And which phase-harmonic operator VERSION built them. The integer
+        # operator changes the phase widths, so the width check usually fires
+        # first -- but a width is not a version, and this is what is compared.
+        self.source_phase_operator = PHASE_OPERATOR_LEGACY
 
         if device is None:
             self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -241,6 +248,11 @@ class DatasetStatsCalculator:
             LEG_ALIGNMENT_NONE
             if layout is None or layout.leg_alignment is None
             else layout.leg_alignment
+        )
+        self.source_phase_operator = (
+            PHASE_OPERATOR_LEGACY
+            if layout is None or layout.phase_operator is None
+            else layout.phase_operator
         )
         warmup = (
             None
@@ -585,6 +597,9 @@ class DatasetStatsCalculator:
             # dataset paired with these constants would pass every width and
             # variant check there is.
             f.attrs['causal_leg_alignment'] = self.source_leg_alignment
+            # And the operator version, for the same reason: constants accumulated
+            # over one operator's phase blocks must not normalise the other's.
+            f.attrs['causal_phase_operator'] = self.source_phase_operator
             
             # Save information about log transformation
             f.attrs['log_epsilon'] = 1e-6
@@ -673,6 +688,7 @@ class DatasetStatsCalculator:
             # state of every stats file currently on disk, not a defect.
             self.source_transform = resolve_transform(f.attrs)
             self.source_leg_alignment = resolve_leg_alignment(f.attrs)
+            self.source_phase_operator = resolve_phase_operator(f.attrs)
 
             for field in f.keys():
                 if field == 'metadata':

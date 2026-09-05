@@ -1,3 +1,14 @@
+# PROMOTED 2026-09-05: this file now carries the corrected representation and the exact-clock
+# task the CFS review recommended -- integer phase operator (44 fhr_ph / 10 up_ph, so c_y = 80 and
+# c_u = 46), NO input-channel alignment (every channel read at its own availability time), the
+# STORED forecast clock (labels are the next 30 stored coefficients), and the stride that keeps the
+# shipped ~11 tiles per sample on that clock's 136-anchor span. The legacy dual-reference,
+# physical-clock, fractional-phase configuration this file used to ship is preserved verbatim as
+# `sweep_legacy_dualref_physclock.yaml`. Prose below that describes the reference clocks and the
+# physical clock describes those mechanisms as they are still available through the sweep arms; the
+# shipped leaves are the ones set at each key. Shards for this config are built with
+# `create_new_pipeline.py` under `phase_operator=integer_harmonic_v1`; see REPOINT_ME_causal_int.
+#
 # Causal-feature conv-Transformer lag-attention VAE-TEB: the production training configuration.
 #
 # The sixth cell of the encoder-by-target grid, and the one that closes it. The model forecasts the
@@ -215,8 +226,8 @@ model_config:
     # warm-up has long passed at either.
     warmup_period: 134
     sequence_length: 300
-    c_y: 102               # 36 (fhr_st) + 66 (fhr_ph); the two-sided widths are 43 and 66
-    c_u: 51                # 36 (up_st) + 15 (up_ph); must be 15 when use_up_st=false
+    c_y: 80                # 36 (fhr_st) + 44 (fhr_ph) under integer_harmonic_v1; legacy 36 + 66 = 102
+    c_u: 46                # 36 (up_st) + 10 (up_ph) under integer_harmonic_v1; legacy 36 + 15 = 51
     use_up_st: true
     dropout: 0.1
     # Dropout for the SOURCE pathway alone -- its adapter/front end, its encoder, and the attended
@@ -390,15 +401,17 @@ model_config:
     # kappa*tau_ref + (rho-kappa)*tau_c <= rho*tau_ref, so max_c(W'_c + d_c) = 134 = max_c W'_c
     # exactly, on BOTH streams.
     # `null` is the unaligned arm and is bitwise the model that shipped before this key existed.
-    causal_align_reference: target_max
+    causal_align_reference: null
 
     # --- The SOURCE stream's own clock ------------------------------------------
     # The key above puts BOTH streams on 402.1604 s, which means the freshest uterine activity any
     # channel reports sits 402.2 s before the anchor. That is not a recency complaint: it decides
     # WHERE A PHYSIOLOGICAL DELAY IS READABLE AT ALL. The lag reporting a delay of tau seconds at
-    # horizon step h is ell = (tau + 20 - offset)/4 - 1 - h, so at offset 0 a 20-60 s
-    # contraction-to-deceleration delay lands at lags -20.0 to 19.0 across h in [0, 29] -- below
-    # lag 0, i.e. CENSORED at the near edge of the window, for every horizon step past h = 9. A
+    # horizon step h is ell = (tau - offset)/4 - 1 - h on the CANONICAL STORED TIMELINE (the
+    # dataset builder's UP shift is part of the stored signal; no term ever undoes it), so at
+    # offset 0 a 20-60 s contraction-to-deceleration delay lands at lags -25.0 to 14.0 across
+    # h in [0, 29] -- below lag 0, i.e. CENSORED at the near edge of the window, for every
+    # horizon step past h = 4 at the 20 s end. A
     # model cannot report a lag the window does not contain, and no amount of training moves it.
     #
     # This key aligns the source onto a faster clock of its own while the target keeps 402.1604 s,
@@ -410,8 +423,14 @@ model_config:
     #
     # PINNED BY MEASUREMENT, not chosen. `python teb_vae/lag_attn_cfs/warmup_budget.py` prices every
     # candidate drawn from the stored source delays against three quantities. At 288.2672 s:
-    #   * the 20-60 s band sits at lags 8.5-47.5 of [0, 90] at EVERY horizon step -- clear of both
-    #     censoring edges, against today's -20.0-19.0;
+    #   * the 20-60 s band sits at lags -0.1 to 38.9 of [0, 90] (realised offset
+    #     kappa*(tau_u - tau_y) = -99.66 s, canonical timeline): clear of the far edge at every
+    #     horizon step and clear of the near edge at all but the last, where the 20 s end sits
+    #     0.1 lag (0.3 s) below lag 0 at h = 29. Earlier printouts quoted 8.5-47.5 (unscaled
+    #     offset AND a -20 s dataset-shift term) and 4.9-43.9 (scaled, still with the shift
+    #     term); both are superseded. Against the single reference's -25.0 to 14.0. Whether
+    #     this marginal graze warrants re-pricing the pin is a CFS-12 experiment question, not
+    #     a comment edit;
     #   * `up_ph` keeps 9 of 15 channels, above the 8 required. The four casualties are the slowest
     #     harmonic siblings (three at 402.160 s, three at 340.292 s), and the criterion exists
     #     because a faster clock buys the lag axis by discarding exactly the contraction-envelope
@@ -426,7 +445,7 @@ model_config:
     # the single-clock scheme and resolves byte for byte what it did before this key existed; it is
     # a named sweep arm. Requires `causal_align_reference` above to be set -- the scheme is a pair
     # of clocks, and against an unaligned target the offset does not exist.
-    causal_align_reference_source: 288.2672
+    causal_align_reference_source: null
 
     # --- Which clock the forecast target is SCORED on ---------------------------
     # The two keys above align the INPUTS; this one re-indexes the QUESTION. The scored element at
@@ -460,7 +479,10 @@ model_config:
     # a predicted instant is unrecorded at the anchor, for every reference. What past UP carries
     # about future FHR is the contraction cycle's phase, so the axis is re-registered to the
     # RECURRENCE window: at the retained source clock 288.2672 and max_lag 90 the every-step
-    # readable physical-delay window is [374.9, 618.9] s -- the previous one-to-two contractions
+    # readable content-delay window is [360.6, 604.6] s at the realised offset
+    # kappa*(288.2672 - 13.3047) = 240.6 s on the canonical stored timeline (earlier printouts
+    # quoted [374.9, 618.9] s from the unscaled offset and [340.6, 584.6] s with a -20 s
+    # dataset-shift term; both superseded) -- the previous one-to-two contractions
     # of the 2-5 min IUP cycle. This also amends the pre-registered reading above: with the
     # question itself re-clocked, alignment and clock arms are EXPECTED to move pred_gap.
     # Re-price with lag_attn_cfs's warmup_budget.py (it prints this window per candidate under a
@@ -470,7 +492,7 @@ model_config:
     # `sweep_target_clock_stored.yaml` restores today's target and tiling exactly;
     # `sweep_target_clock_input.yaml` is the aligned-continuation arm. planted.yaml PINS 'stored':
     # its planted delay is stamped in stored steps and lag_recovery_check refuses any other clock.
-    causal_target_forecast_clock: physical
+    causal_target_forecast_clock: stored
 
     # Which phase-harmonic operator built the CONFIGURED SHARDS' two phase blocks, checked against
     # their own `causal_leg_alignment` root attribute and refused by name on a disagreement.
@@ -485,6 +507,22 @@ model_config:
     # Point the dataset paths below at the shards built with `--leg-alignment envelope`, or set
     # this to null to state that the run does not care (which is what a two-variant comparison is).
     causal_leg_alignment: envelope
+
+    # Which phase-harmonic OPERATOR VERSION built the configured shards' phase blocks, checked
+    # against their `causal_phase_operator` root attribute (absent = ratio_power_v0) and refused
+    # by name on a disagreement.
+    #   ratio_power_v0      : every shard on disk. The accelerated leg is raised to the floating-
+    #                         point ratio xi_j/xi_i, so the k = 6 family (p = 2^(3/2), 22 of 66
+    #                         fhr_ph and 5 of 15 up_ph channels) is DISCONTINUOUS across the
+    #                         principal-angle branch (jump 2|y||sin(pi p)| ~ 1.03|y|). Retained so
+    #                         this configuration keeps describing the shards, stats and checkpoints
+    #                         it was trained on; it is NOT the corrected representation.
+    #   integer_harmonic_v1 : integer harmonics k in {2, 4} only, applied as stored integers;
+    #                         44 fhr_ph / 10 up_ph, so c_y = 80 and c_u = 46 and the widths above
+    #                         must be re-declared. Needs its own shards and statistics; see the
+    #                         baseline arm `configs/baseline_int_stored.yaml`.
+    # `null` states that the run does not care (a two-version comparison).
+    causal_phase_operator: integer_harmonic_v1
 
     # --- Anchor tiling ---------------------------------------------------------
     # S, the spacing between decoded anchors, in [1, H]. Over epochs every anchor in
@@ -506,7 +544,7 @@ model_config:
     # a fixed offset from the segment start forever. There is no gradient there, so neither the
     # redundancy argument nor the memory argument applies. `sweep_anchor_stride_1.yaml` is the arm
     # that trains densely too.
-    anchor_stride: 5
+    anchor_stride: 13
     # F_u, the earliest source step lag attention may read: the lag mask generalises from
     # 1[t - l >= 0] to 1[t - l >= F_u]. Ships at 0, where it is BITWISE the two-sided siblings' mask,
     # and exists so the source compromise above is measurable rather than argued about. No arm moves
@@ -788,18 +826,18 @@ dataset_config:
   # channels would not, and it would train to completion on coefficients containing their own
   # future while every number below reported a causal model.
   vae_train_datasets:
-    - /data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_causal/pre_training_dataset/train_dataset_cs.hdf5
-    - /data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_causal/pre_training_dataset/train_dataset_no_cs.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_causal_int/pre_training_dataset/train_dataset_cs.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_causal_int/pre_training_dataset/train_dataset_no_cs.hdf5
   vae_test_datasets:
-    - /data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_causal/pre_training_dataset/test_dataset_cs.hdf5
-    - /data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_causal/pre_training_dataset/test_dataset_no_cs.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_causal_int/pre_training_dataset/test_dataset_cs.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_causal_int/pre_training_dataset/test_dataset_no_cs.hdf5
 
   # Note the key is `stat_path` while the loader parameter is `stats_path`. A typo'd `stats_path:`
   # here yields None and silently disables normalization, so the entry point guards it explicitly.
   # It must be generated from the SAME causal shards: the statistics exclude the warm-up region, and
   # a two-sided stats file would both mis-normalise the target and destroy the source-null control's
   # premise that zero is the channel mean over the region the model reads.
-  stat_path: /data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_causal/stats.hdf5
+  stat_path: /data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_causal_int/stats.hdf5
 
   dataloader_config:
     # 8 per rank: the prod box has 128 cores against 7 ranks (56 persistent workers), so the
@@ -1013,7 +1051,7 @@ advanced_config:
       # target keeps 402.1604 s, the source reads on 288.2672 s, and the forecast target is
       # scored on the physical clock at stride 10. Every sweep arm below renames both keys after
       # its own delta.
-      run_name: lag_attn_trf_cfs_dualref288_physclock
+      run_name: lag_attn_trf_cfs_intphase_unaligned_stored
       artifact_location: null
       # Logs and registers the final eager model at fit end, via the run-logging callback the
       # trainer builder attaches automatically.
@@ -1025,7 +1063,7 @@ advanced_config:
       tags:
         project: teb_vae
         stage: dev
-        variant: lag_attn_trf_cfs_dualref288_physclock
+        variant: lag_attn_trf_cfs_intphase_unaligned_stored
 
   callbacks:
     # ON, and the patience is the number rather than the flag. A 5000-epoch budget against a run

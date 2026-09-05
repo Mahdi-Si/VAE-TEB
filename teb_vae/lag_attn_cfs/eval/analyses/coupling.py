@@ -109,7 +109,8 @@ PRED_GAP_COLUMNS: Tuple[Tuple[str, str, str], ...] = (
     (
         "pred_gap_train_path_nats",
         "pred_gap",
-        "single-draw training path: the objective's own reduction, reported as the parity column",
+        "training path: the objective's own reduction (base decoded at the prior mean under "
+        "base_decode: mean, full at one sampled latent), reported as the parity column only",
     ),
 )
 

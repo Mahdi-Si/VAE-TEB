@@ -64,7 +64,7 @@ eval_config:
   bands:
     lag_0_2: [0, 2]
     lag_3_8: [3, 8]
-  up_shift_secs: -20
+  # No up_shift_secs: the key was removed (the stored timeline is canonical).
   health_probe_floor: 0.01
   saturation_flag_threshold: 0.05
   # Left whole: the fixture's batches are two samples and the suite exercises the split path

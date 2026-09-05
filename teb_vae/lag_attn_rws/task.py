@@ -767,3 +767,15 @@ class SeqVaeLagAttnRwsTask(LightningModelBase):
         """
         super().on_save_checkpoint(checkpoint)  # stamps model_class; must run first
         checkpoint["model_kwargs"] = dict(self._model_kwargs)
+        # The representation identity, where a task carries a resolved causal budget (the four
+        # one-sided cells, whose drivers set ``warmup_budget``). The channel tuples above say how
+        # wide the model is; this says what its channels ARE -- which phase-harmonic operator, leg
+        # alignment, forecast clock and references produced them -- so the evaluation preflight
+        # can refuse a checkpoint evaluated against another representation whose widths happen to
+        # coincide. Duck-typed rather than imported: this base names no causal module, and a task
+        # without a budget (every two-sided cell, and a hand-built task) stamps nothing, which is
+        # exactly what every checkpoint written before the key existed looks like.
+        budget = getattr(self, "warmup_budget", None)
+        representation = getattr(budget, "representation", None)
+        if callable(representation):
+            checkpoint["causal_representation"] = representation()

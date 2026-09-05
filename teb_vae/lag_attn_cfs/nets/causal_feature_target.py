@@ -410,12 +410,18 @@ class CausalFeatureForecastTarget(FeatureForecastTarget):
     def _resolve_novelty_tertiles(cls, kept_novelty_frac: Sequence[float]) -> Tuple[int, ...]:
         r"""Assign each kept target channel to a novelty tertile: group $0$ is the least new.
 
-        $\nu_c$ is the share of a target coefficient drawn from raw samples the anchor has **not**
-        seen, measured on the composed kernel at the shipped horizon and stored on the shard. It is
-        not a restatement of the warm-up split even though both descend from the same filter
-        ladder: the warm-up says when a channel became a function of the recording at all, and the
-        novelty says how much of what it reports at a *scored* step is still ahead of the anchor.
-        A channel can be warm for the whole window and carry $\nu = 0.026$.
+        $\nu_c$ is the shard's stored **fixed-horizon, stored-clock envelope-mass proxy**: the share
+        of the composed envelope $\lvert\psi_k\rvert \star \phi$ (slow leg for a phase pair) that
+        falls within $H = 30$ stored steps after the anchor, with no per-channel label advance
+        (``hdf5_dataset.causal_scattering.novelty_fraction``). It is not an exact "known/new" value
+        fraction of a nonlinear coefficient, and it is computed for the stored clock: under the
+        ``physical`` clock, or at another horizon, this ranking is the LEGACY proxy's rather than a
+        measurement on the scored gather, and the evaluation preflight records it as such
+        (``novelty_proxy`` in the budget record; CFS-08). It is not a restatement of the warm-up
+        split even though both descend from the same filter ladder: the warm-up says when a channel
+        became a function of the recording at all, and the novelty says how much of the envelope
+        mass behind a *scored* step is still ahead of the anchor. A channel can be warm for the
+        whole window and carry $\nu = 0.026$.
 
         What the split is for. ``pred_gap`` is an unweighted sum over $H \cdot C_{\mathrm{keep}}$
         coefficients that mixes two different claims: on a high-$\nu$ channel a good score is a

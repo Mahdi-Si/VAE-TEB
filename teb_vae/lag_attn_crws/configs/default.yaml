@@ -410,10 +410,11 @@ model_config:
     # THIS CELL FORECASTS THE RAW SIGNAL, so tau^y == 0 and there is nothing on the target side to
     # cancel the source reference out of the physical-lag identity
     #
-    #     tau_phys(l, h) = 4 s * (l + 1 + h) + kappa * tau_ref - 20 s,
+    #     tau_phys(l, h) = 4 s * (l + 1 + h) + kappa * tau_ref,
     #
-    # which is MINIMISED at l = h = 0 and grows with the lag. At `target_max` (402.1604 s) the
-    # smallest lead the attention can express is 335.9 s, so the 20-120 s contraction-to-
+    # on the canonical stored timeline (the dataset builder's UP shift is part of the signal and
+    # no term undoes it), which is MINIMISED at l = h = 0 and grows with the lag. At `target_max`
+    # (402.1604 s) the smallest lead the attention can express is 355.9 s, so the 20-120 s contraction-to-
     # deceleration band is unreachable at EVERY lag index -- and raising `max_lag` cannot help,
     # because it only makes the lead longer. The feature-target cells do not have this problem:
     # there the same reference appears on both sides of the identity and cancels, so they keep
@@ -426,8 +427,10 @@ model_config:
     #
     # WHAT IT BUYS. The alignment shift carries the centroid factor kappa = 0.875, so the aligned
     # stream's common effective delay is kappa * 42.2066 = 36.93 s, not 42.21 s. Reachable lead
-    # [20.9, 496.9] s, so 99 of the 100 s band sits inside the lag axis: l + h = 0 lands at 20.9 s
-    # and l + h = 24 at 116.9 s, with l + h = 25 the first index past the band at 120.9 s.
+    # [40.9, 516.9] s on the canonical stored timeline, so 79 of the 100 s band sits inside the lag
+    # axis: l + h = 0 lands at 40.9 s and l + h = 19 at 116.9 s, with l + h = 20 the first index
+    # past the band at 120.9 s. (Earlier text quoted [20.9, 496.9] s with a -20 s dataset-shift
+    # term; that term is gone -- the builder's UP shift is part of the signal.)
     #
     # WHAT IT COSTS. Both streams drop hard: target-input 102 -> 38 (17 fhr_st + 21 fhr_ph),
     # source 51 -> 17 (17 up_st + 0 up_ph). EVERY band-reachable reference loses all fifteen

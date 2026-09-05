@@ -190,9 +190,11 @@ def test_bad_health_probe_floor_raises(floor):
         validate_eval_config(_config_with({"health_probe_floor": floor}))
 
 
-def test_bad_up_shift_raises():
-    with pytest.raises(ValueError, match="up_shift_secs"):
-        validate_eval_config(_config_with({"up_shift_secs": float("nan")}))
+def test_the_removed_up_shift_key_is_refused_as_unknown():
+    """``up_shift_secs`` undid the dataset builder's UP shift and was removed: the stored timeline
+    is canonical. An old config naming it must fail loudly rather than be honoured or ignored."""
+    with pytest.raises(ValueError, match="unknown eval_config key"):
+        validate_eval_config(_config_with({"up_shift_secs": -20.0}))
 
 
 def test_missing_block_falls_back_to_defaults():

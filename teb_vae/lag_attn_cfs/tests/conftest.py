@@ -83,6 +83,11 @@ SHIPPED_ALIGN_REFERENCE = "target_max"
 #: blocks under ``'envelope'``; ``None`` is a run that does not care.
 SHIPPED_LEG_ALIGNMENT = "envelope"
 
+#: The phase-harmonic operator VERSION the committed fixture was built by: the legacy ratio-power
+#: operator, which every shard on disk shares. The corrected integer operator has its own fixture
+#: (``tiny_shard_causal_int.hdf5``) and its own widths; see :data:`INT_C_Y` / :data:`INT_C_U`.
+SHIPPED_PHASE_OPERATOR = "ratio_power_v0"
+
 #: The shipped forecast horizon (two minutes) and the sequence length the loader's trim produces.
 #: Mirrors ``configs/default.yaml``; ``test_config_load.py`` reads the config independently, so the
 #: two routes disagreeing is what catches one of them going stale.
@@ -100,6 +105,15 @@ CAUSAL_ST_WIDTH = 36
 CAUSAL_PH_WIDTH = 66
 CAUSAL_C_Y = CAUSAL_ST_WIDTH + CAUSAL_PH_WIDTH
 CAUSAL_C_U = CAUSAL_ST_WIDTH + 15
+
+#: The corrected integer-operator widths: the $k = 6$ family leaves, $66 \to 44$ and $15 \to 10$,
+#: with the scattering blocks unchanged. Declared here so a test naming the corrected fixture
+#: states the geometry it expects rather than reading it back off the file under test.
+INT_PH_WIDTH = 44
+INT_SOURCE_PH_WIDTH = 10
+INT_C_Y = CAUSAL_ST_WIDTH + INT_PH_WIDTH
+INT_C_U = CAUSAL_ST_WIDTH + INT_SOURCE_PH_WIDTH
+INT_CAUSAL_SHARD = FIXTURES / "tiny_shard_causal_int.hdf5"
 
 
 def causal_config(
@@ -136,6 +150,7 @@ def causal_config(
         # planting a legacy shard names `causal_leg_alignment=None` or the value that shard has.
         "causal_align_reference": SHIPPED_ALIGN_REFERENCE,
         "causal_leg_alignment": SHIPPED_LEG_ALIGNMENT,
+        "causal_phase_operator": SHIPPED_PHASE_OPERATOR,
         # The horizon-partitioning tiling, stated rather than defaulted: consecutive forecast
         # windows partition the timeline instead of overlapping, so no target coefficient is
         # scored twice in a step. Not the shipped stride -- tests that assert the shipped tiling

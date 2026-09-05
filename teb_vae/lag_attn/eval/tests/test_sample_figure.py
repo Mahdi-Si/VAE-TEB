@@ -292,15 +292,11 @@ def test_a_sabotaged_channel_shows_up_in_the_residual_row():
 def test_the_lag_seconds_axis_agrees_with_the_pipelines_own_conversion():
     r"""Two figures in one run must not label the same lag differently.
 
-    ``attach_lag_seconds_axis`` maps $\ell \mapsto s\ell + d$ and the pipeline's convention --
-    ``metrics.lag_to_seconds`` -- is $s\ell + \Delta_{UP}$, so the shift is forwarded **un-negated**.
-    The negation that used to stand at both call sites matched a ``lag_to_seconds`` that then
-    computed $s\ell - \Delta_{UP}$, so the two agreed -- on a number 40 s too large. **This test
-    pins agreement, not the sign**: it compares the forwarded offset against ``lag_to_seconds``,
-    and a matched pair of sign errors passes it. The sign itself is pinned in ``metrics.py``
-    against ``mimo_adaptor.py``, which advances UP by 20 s. What this test rules out is the other
-    failure -- one call site corrected and the other not -- which would label the same lag two
-    ways inside one page.
+    ``attach_lag_seconds_axis`` maps $\ell \mapsto s\ell + o$ and the pipeline's convention --
+    ``metrics.lag_to_seconds`` -- is $s\ell$ on the stored timeline, so both call sites must hand
+    the helper an offset of exactly $0$: the dataset builder's UP shift is part of the stored signal
+    and is never applied to an axis. What this test rules out is one call site carrying an offset
+    and the other not, which would label the same lag two ways inside one page.
     """
     from teb_vae.lag_attn.eval import metrics
 
@@ -313,19 +309,19 @@ def test_the_lag_seconds_axis_agrees_with_the_pipelines_own_conversion():
         captured.append((float(step_seconds), float(offset)))
         return real(ax, step_seconds, offset)
 
-    shift = -20.0
     with pytest.MonkeyPatch.context() as patch:
         patch.setattr(sample_figure, "attach_lag_seconds_axis", recording)
-        figure = _build(up_shift_secs=shift, step_seconds=4.0)
+        figure = _build(step_seconds=4.0)
         plt.close(figure)
 
     assert len(captured) == 2, "both lag rows must carry a seconds axis"
     for step_seconds, offset in captured:
+        assert offset == 0.0
         # attach_lag_seconds_axis maps l -> s*l + offset, so the offset it is handed must make
         # that identical to the pipeline's own conversion.
         for lag in (0.0, 5.0, float(N_LAGS - 1)):
             assert step_seconds * lag + offset == pytest.approx(
-                metrics.lag_to_seconds(lag, step_seconds=4.0, up_shift_secs=shift)
+                metrics.lag_to_seconds(lag, step_seconds=4.0)
             )
 
 

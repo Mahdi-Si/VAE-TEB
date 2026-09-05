@@ -135,8 +135,8 @@ class SeqVaeLagAttnCfsTask(SeqVaeLagAttnFsTask):
         gate = model.target_gate
         # The forecast clock's tau in seconds comes from the resolved budget, as the input clocks
         # do in `input_stream_panels`: the net stamps the per-channel step shifts and nothing
-        # from which tau can be recovered. Without it the scored stream is drawn at step index,
-        # which is exact only on the stored clock.
+        # from which tau can be recovered. It reaches the page as a statement on the forecast
+        # rows' time axis, not as a shift of anything drawn.
         budget = self.warmup_budget
         return partial(
             causal_forecast_rows,
@@ -523,7 +523,10 @@ class SeqVaeLagAttnCfsTask(SeqVaeLagAttnFsTask):
     #: hyperparameter: the four channel tuples the network needs are already in the checkpoint's
     #: ``model_kwargs``, and a second copy of them under another name is a second thing to keep
     #: true. ``None`` -- the default, so a hand-built task needs no budget to exist -- costs
-    #: exactly the run-level figure and nothing else on the page.
+    #: exactly the run-level figure and nothing else on the page. The base task's
+    #: ``on_save_checkpoint`` stamps its :meth:`~WarmupBudget.representation` into the blob under
+    #: ``causal_representation`` when it is set, so a checkpoint names the representation its
+    #: channel tuples were resolved under (CFS-03); no override here, by the member pin.
     warmup_budget: Optional[WarmupBudget] = None
 
 

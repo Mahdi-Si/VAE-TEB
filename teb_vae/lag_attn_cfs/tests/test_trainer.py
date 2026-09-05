@@ -36,6 +36,8 @@ from teb_vae.lag_attn_rws.trainer import _TRACKED_METRICS, LagAttnRwsTrainer
 from train.graph_model_base import GraphModelBase
 
 from .conftest import (
+    INT_C_U,
+    INT_C_Y,
     CAUSAL_C_U,
     CAUSAL_C_Y,
     absolutize_dataset_paths,
@@ -62,8 +64,8 @@ _MODULE_NAME = "teb_vae.lag_attn_cfs.trainer"
 #: costs eight more -- $30$ of $36$ ``up_st`` and $9$ of $15$ ``up_ph``. That is the trade the
 #: reference was pinned on, and it is a *width* rather than a preference: the source adapter, the
 #: gate and the availability announcement are all built at it.
-GUARDED_TARGET_CHANNELS = 98
-GUARDED_SOURCE_CHANNELS = 39
+GUARDED_TARGET_CHANNELS = 76
+GUARDED_SOURCE_CHANNELS = 46
 
 #: Callables and class attributes this driver may define. A set rather than a count: a count passes
 #: a subclass that overrode ``train_model`` in 75 lines while dropping the plot callback.
@@ -221,7 +223,7 @@ def test_the_two_new_geometry_keys_reach_the_constructor(driver):
     defaults with nothing raising."""
     kwargs = driver._build_model_kwargs()
 
-    assert kwargs["anchor_stride"] == 5
+    assert kwargs["anchor_stride"] == 13
     assert kwargs["lag_floor"] == 0
 
 
@@ -249,14 +251,13 @@ def test_the_resolved_kwargs_actually_build_the_model_the_config_describes(drive
     assert model.target_adapter.linear.in_features == GUARDED_TARGET_CHANNELS
     assert model.source_adapter.linear.in_features == GUARDED_SOURCE_CHANNELS
     assert model.raw_per_step == 16
-    assert model.anchor_stride == 5
+    assert model.anchor_stride == 13
     assert model.horizon == 30
-    # The forecast clock the config states, resolved and applied: the physical advance costs the
-    # trailing 85 anchors of the valid span.
-    assert model.target_forecast_shift is not None
-    assert model.anchor_ceiling == model.geometry.t_valid - max(model.target_forecast_shift)
+    # The stored clock advances nothing: every anchor up to T_valid is decoded.
+    assert model.target_forecast_shift is None
+    assert model.anchor_ceiling == model.geometry.t_valid
     # The declared widths are untouched, which is what the data boundary checks against.
-    assert (model.c_y, model.c_u) == (CAUSAL_C_Y, CAUSAL_C_U)
+    assert (model.c_y, model.c_u) == (INT_C_Y, INT_C_U)
     # The unconditional freeze the DDP strategy relies on.
     assert not any(parameter.requires_grad for parameter in model.lag_attn.W_o.parameters())
 
@@ -271,7 +272,7 @@ def test_a_config_without_a_budget_builds_the_ungated_model(driver):
 
     assert "target_keep_index" not in kwargs
     assert driver.resolved_warmup is None
-    assert SeqVaeLagAttnCfs(**kwargs).decoder_out_channels == CAUSAL_C_Y
+    assert SeqVaeLagAttnCfs(**kwargs).decoder_out_channels == INT_C_Y
 
 
 # --------------------------------------------------------------------------------------
@@ -294,10 +295,12 @@ def test_the_causal_standing_message_is_not_the_inherited_one(driver):
 
     assert "974" not in message
     assert "one-sided" in message
-    assert f"{GUARDED_TARGET_CHANNELS}/102" in message
-    assert f"{GUARDED_SOURCE_CHANNELS}/51" in message
-    assert "target reference" in message and "source reference" in message
-    assert "inter-stream offset" in message
+    assert f"{GUARDED_TARGET_CHANNELS}/{INT_C_Y}" in message
+    assert f"{GUARDED_SOURCE_CHANNELS}/{INT_C_U}" in message
+    # The promoted default reads every channel at its own availability time and scores the stored
+    # clock, so the summary carries neither a reference clause nor a forecast-shift clause.
+    assert "reference" not in message and "forecast clock" not in message
+    assert "warm-up 0-134 steps" in message
 
 
 def test_the_ungated_standing_message_says_what_is_being_read_unguarded(driver):
@@ -346,11 +349,11 @@ def test_create_model_logs_the_resolved_anchor_geometry(driver, caplog):
         logger.remove(sink)
 
     line = next(m for m in messages if "resolved anchor geometry" in m)
-    assert "H=30" in line and "S=5" in line and "F=134" in line
-    # The counts are taken over the EFFECTIVE ceiling -- T_valid less the physical forecast
-    # clock's 85-step advance -- because those are the anchors the forward actually builds.
-    assert "A_max=11" in line and "T_valid=270" in line and "ceiling=185" in line
-    assert "block width H*C_keep=2940" in line
+    assert "H=30" in line and "S=13" in line and "F=134" in line
+    # The stored clock advances nothing, so the ceiling is T_valid itself and stride 13 tiles its
+    # 136-anchor span into the same 11 tiles the legacy physical-clock geometry had.
+    assert "A_max=11" in line and "T_valid=270" in line and "ceiling=270" in line
+    assert "block width H*C_keep=2280" in line
     assert "receptive field=31" in line
 
 
@@ -533,7 +536,7 @@ def test_the_resolved_config_is_written_beside_the_checkpoints(tmp_path, monkeyp
     assert vae["warmup_period"] == 134
     # Both independently-toggleable mechanisms, so a run is reconstructable from its own artifacts:
     # which clock its channels were put on, and which shard variant it expected to read.
-    assert vae["causal_align_reference"] == "target_max"
+    assert vae["causal_align_reference"] is None
     assert vae["causal_leg_alignment"] == "envelope"
     # The two-sided guard's record is null here, which is the correct record of "no reach budget
     # was resolved" rather than an omission.

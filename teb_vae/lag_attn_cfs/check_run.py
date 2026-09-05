@@ -136,8 +136,10 @@ CHECKPOINT_MONITORS: Tuple[str, ...] = (
 #: The two three-way partitions of the kept target channels, each of which recomposes to the gap by
 #: construction whether or not its parts differ from each other -- so the recomposition says nothing
 #: about whether either split distinguishes anything, and the *spread* is what tier 2 asks about.
-#: The first partitions by warm-up rank and the second by the shard's stored novelty fraction; they
-#: cut the same axis two different ways and neither is the other renamed.
+#: The first partitions by warm-up rank and the second by the shard's stored novelty proxy (the
+#: fixed-horizon, stored-clock envelope-mass share; under the physical clock a legacy ranking, not
+#: a measurement on the scored gather -- CFS-08); they cut the same axis two different ways and
+#: neither is the other renamed.
 TERTILE_FAMILIES: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
     ("pred_gap_warm", ("pred_gap_warm_lo", "pred_gap_warm_mid", "pred_gap_warm_hi")),
     ("pred_gap_novel", ("pred_gap_novel_lo", "pred_gap_novel_mid", "pred_gap_novel_hi")),

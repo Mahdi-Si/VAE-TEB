@@ -54,11 +54,17 @@ from Variational_AutoEncoder.seqvae_teb.hdf5_dataset.causal_scattering import (
     CAUSAL_WARMUP_QUANTILE,
     GAMMATONE_ORDER,
     LEG_ALIGNMENT_MODES,
+    PHASE_OPERATOR_INTEGER,
+    PHASE_OPERATOR_LEGACY,
+    PHASE_OPERATORS,
     CausalChannelPlan,
     build_causal_bank,
     build_channel_plan,
     build_filter_bank,
-    novelty_fraction,
+    harmonic_index,
+    novelty_curve,
+    phase_k_steps_for,
+    validate_phase_operator,
 )
 from Variational_AutoEncoder.seqvae_teb.hdf5_dataset.causal_scattering_torch import (
     CausalTorchBank,
@@ -243,17 +249,6 @@ AUGMENTED = "augmented"
 HOLDOUT = "holdout"
 TEST_MODES = (AUGMENTED, HOLDOUT)
 
-# Forecast horizon, in decimated steps, the stored novelty fraction is measured over. It is the
-# horizon every shipped model config uses. Baked in here rather than configured, because the
-# number it produces is written into the file beside the geometry that produced it and a
-# configuration key would let the two disagree with nothing to say so.
-#
-# lean-limit: the novelty fraction is stored at this one horizon as a (C,) vector, so a model
-# trained at a different horizon reads a stale number with nothing on the file to reveal it;
-# replace with a (C, H) table, or a stored horizon attribute to check against, when a second
-# horizon actually ships.
-CAUSAL_NOVELTY_HORIZON_STEPS = 30
-
 
 def validate_transform(transform: str) -> str:
     """Refuse an unknown transform variant, naming both valid values.
@@ -354,9 +349,18 @@ class PhaseChannelSelection:
         j: Higher-frequency filter index per channel, shape ``(n_channels,)``.
         xi_i_hz: $\xi_i$ in Hz, shape ``(n_channels,)``.
         xi_j_hz: $\xi_j$ in Hz, shape ``(n_channels,)``.
-        power: Harmonic ratio $p = \xi_j / \xi_i$, shape ``(n_channels,)``.
+        power: Harmonic ratio $p = \xi_j / \xi_i$, shape ``(n_channels,)``. Under the legacy
+            operator this floating-point ratio IS the exponent applied; under the integer one it
+            is provenance only and the exponent is :attr:`harmonic`.
         band_hz: The $(\min, \max)$ Hz band the mask was built from.
         k_steps: The harmonic steps $k$ the mask was built from.
+        phase_operator: Which phase-harmonic operator version the selection is for, one of
+            :data:`~hdf5_dataset.causal_scattering.PHASE_OPERATORS`. It decides ``k_steps`` and
+            whether :attr:`harmonic` exists, so it travels with the selection rather than beside it.
+        harmonic: The integer harmonic index $k_{ij}$ per channel, shape ``(n_channels,)``
+            ``int32``, under the integer operator; ``None`` under the legacy one, whose $k = 6$
+            family has no integer index. Stored as ``sel_harmonic`` and used as the exponent, so
+            the operator never recomputes it from a floating-point ratio.
     """
 
     mask: torch.Tensor
@@ -367,6 +371,8 @@ class PhaseChannelSelection:
     power: np.ndarray
     band_hz: Tuple[float, float]
     k_steps: Tuple[int, ...]
+    phase_operator: str = PHASE_OPERATOR_LEGACY
+    harmonic: Optional[np.ndarray] = None
 
     @property
     def n_channels(self) -> int:
@@ -605,12 +611,18 @@ def _write_selection_attrs(dataset, selection: PhaseChannelSelection) -> None:
     dataset.attrs["sel_power"] = selection.power
     dataset.attrs["sel_band_hz"] = np.asarray(selection.band_hz, dtype=np.float32)
     dataset.attrs["sel_k_steps"] = np.asarray(selection.k_steps, dtype=np.int32)
+    # Which operator version the block's exponents follow, and -- under the integer one -- the
+    # integer harmonic the operator actually applied. Written on the block as well as on the root
+    # so a block read on its own still says what its values mean.
+    dataset.attrs["sel_phase_operator"] = selection.phase_operator
+    if selection.harmonic is not None:
+        dataset.attrs["sel_harmonic"] = np.asarray(selection.harmonic, dtype=np.int32)
 
 
 def _write_causal_attrs(
-    dataset, plan: CausalChannelPlan, novelty: Optional[np.ndarray] = None
+    dataset, plan: CausalChannelPlan, novelty_curve: Optional[np.ndarray] = None
 ) -> None:
-    r"""Attach per-channel warm-up, delay and novelty to a causal coefficient dataset.
+    r"""Attach per-channel warm-up, delay and novelty curve to a causal coefficient dataset.
 
     ``causal_warmup_steps`` is the leading region in which a channel's output
     is a function of the assumed pre-recording history rather than of the
@@ -624,14 +636,17 @@ def _write_causal_attrs(
     per-sample $(C, T)$ boolean mask would replicate one constant array tens of
     thousands of times, about 76 KB per sample against about 600 bytes per file.
 
-    ``causal_novelty_frac`` is the share of each channel's coefficient drawn
-    from raw samples an anchor has not yet seen, over the horizon named by
-    :data:`CAUSAL_NOVELTY_HORIZON_STEPS`. It is a property of the filter bank
-    and therefore an attribute for the same reason the warm-up is. What it is
-    *for*: "forecast" means something different per channel — the slowest kept
-    target channel draws $2.6\%$ of its value from the window it is asked to
-    predict, a fast one draws all of it — and a block score summed over both
-    mixes two claims unless the split is available.
+    ``causal_novelty_curve`` is :func:`~hdf5_dataset.causal_scattering.novelty_curve`:
+    per channel, the share of its composed envelope $\lvert\psi\rvert \star \phi$
+    (slow leg for a phase pair) within $w$ stored steps of the coefficient's own
+    timestamp, tabulated for $w = 0, \ldots, T$ over the stored segment length. A
+    property of the filter bank alone, and deliberately free of any forecast
+    horizon or target clock: those are model-side choices, and the model looks
+    its own $H + s_c$ up in this table rather than reading a number the dataset
+    computed for a horizon it may not use (CFS-08). It is an envelope-mass proxy
+    and not an exact "known/new" value fraction of a nonlinear coefficient.
+    Older shards carry the scalar ``causal_novelty_frac`` instead, written at
+    one fixed horizon; the loader reads either.
 
     Note:
         ``causal_delay_s`` — the composed group delay each channel is stale by —
@@ -644,26 +659,29 @@ def _write_causal_attrs(
     Args:
         dataset: Target HDF5 coefficient dataset.
         plan: The block's channel plan, which the dataset was sized from.
-        novelty: The block's ``(C,)`` novelty fraction, on the same stored
-            channel axis. ``None`` omits the attribute, which is what a caller
-            with no bank to measure it from writes.
+        novelty_curve: The block's ``(C, W + 1)`` novelty curve, on the same
+            stored channel axis. ``None`` omits the attribute, which is what a
+            caller with no bank to measure it from writes.
 
     Raises:
-        ValueError: If *novelty* does not describe the plan's channel axis. It
-            and the warm-up are read back as parallel vectors, so a length
-            disagreement would silently attribute one channel's novelty to
+        ValueError: If *novelty_curve* does not describe the plan's channel
+            axis. It and the warm-up are read back as parallel arrays, so a row
+            count disagreement would silently attribute one channel's curve to
             another.
     """
     dataset.attrs["causal_warmup_steps"] = plan.warmup_steps.astype(np.int32)
     dataset.attrs["causal_delay_s"] = plan.delay_s.astype(np.float32)
-    if novelty is not None:
-        if np.shape(novelty) != (plan.n_channels,):
+    if novelty_curve is not None:
+        curve = np.asarray(novelty_curve)
+        if curve.ndim != 2 or curve.shape[0] != plan.n_channels:
             raise ValueError(
-                f"novelty fraction for '{plan.name}' has {np.size(novelty)} entries but the "
-                f"block stores {plan.n_channels} channels; the attribute would describe a "
-                f"different channel axis than the warm-up beside it"
+                f"novelty curve for '{plan.name}' has shape {curve.shape} but the block stores "
+                f"{plan.n_channels} channels; the attribute would describe a different channel "
+                f"axis than the warm-up beside it"
             )
-        dataset.attrs["causal_novelty_frac"] = np.asarray(novelty, dtype=np.float32)
+        # The file is written with libver='latest', whose dense attribute storage admits an
+        # attribute past the 64 KB object-header limit; a (66, 331) float32 curve is 87 KB.
+        dataset.attrs["causal_novelty_curve"] = curve.astype(np.float32)
 
 
 def create_initial_hdf5(
@@ -678,9 +696,10 @@ def create_initial_hdf5(
     transform: str = TWO_SIDED,
     channel_plan: Optional[Dict[str, CausalChannelPlan]] = None,
     leg_alignment: str = LEG_ALIGNMENT_MODES[0],
-    novelty_frac: Optional[Dict[str, np.ndarray]] = None,
+    novelty_curve: Optional[Dict[str, np.ndarray]] = None,
     source_pickle_path: Optional[str] = None,
     source_guid_digest: Optional[str] = None,
+    phase_operator: str = PHASE_OPERATOR_LEGACY,
 ) -> None:
     """Create a new empty HDF5 file with the full dataset schema.
 
@@ -725,22 +744,45 @@ def create_initial_hdf5(
             consumer that mixed the two, or normalised one with the other's
             statistics, would get no error and no warning. Absent on a file
             written before the attribute existed, which is read as unaligned.
-        novelty_frac: Causal only. ``{block: (C,)}`` from
-            :func:`~hdf5_dataset.causal_scattering.novelty_fraction`, written
-            per block beside the warm-up. ``None`` omits it.
+        novelty_curve: Causal only. ``{block: (C, W + 1)}`` from
+            :func:`~hdf5_dataset.causal_scattering.novelty_curve`, written per
+            block beside the warm-up. ``None`` omits it.
         source_pickle_path: The fold pickle this build resumed from, recorded
             so comparability with the dataset that produced it is checkable
             afterwards. ``None`` records :data:`NO_SOURCE_PICKLE`.
         source_guid_digest: Digest of the GUID set written here, from
             :func:`guid_set_digest`. ``None`` records the digest of the empty
             set, which is what a file created without a records list contains.
+        phase_operator: Causal only. Which phase-harmonic operator version the
+            two phase blocks are built with; recorded as the root attribute
+            ``causal_phase_operator``. The integer operator changes the phase
+            widths (44/10 at the production bands), so unlike the leg
+            alignment it is also visible in the shape -- but a width is not a
+            version, and the attribute is what a consumer checks. Must agree
+            with both selections' own ``phase_operator``.
 
     Raises:
-        ValueError: On an unknown *transform*; on a causal file with no channel
-            plan, with a cross-phase width, or whose widths disagree with the
-            plan.
+        ValueError: On an unknown *transform* or *phase_operator*; on a causal
+            file with no channel plan, with a cross-phase width, or whose
+            widths disagree with the plan; on a selection built under another
+            operator than the one being recorded; on the integer operator on a
+            two-sided file.
     """
     validate_transform(transform)
+    validate_phase_operator(phase_operator)
+    if transform != CAUSAL and phase_operator != PHASE_OPERATOR_LEGACY:
+        raise ValueError(
+            f"phase_operator={phase_operator!r} on a {transform!r} file: the two-sided variant "
+            f"reproduces the production kymatio operator, which is {PHASE_OPERATOR_LEGACY!r} by "
+            f"definition, so an integer two-sided file would describe a transform nothing built"
+        )
+    for label, selection in (("fhr_ph", fhr_ph_selection), ("up_ph", up_ph_selection)):
+        if selection is not None and selection.phase_operator != phase_operator:
+            raise ValueError(
+                f"the {label} selection was built under phase_operator="
+                f"{selection.phase_operator!r} but the file is being recorded as "
+                f"{phase_operator!r}; the root attribute would then misdescribe the block"
+            )
     if transform == CAUSAL:
         validate_leg_alignment(leg_alignment)
         if channel_plan is None:
@@ -802,6 +844,10 @@ def create_initial_hdf5(
             # constant here it changes no width and no warm-up, so it is the one property of an
             # aligned file that nothing else on it reveals.
             h5f.attrs["causal_leg_alignment"] = leg_alignment
+            # Which phase-harmonic OPERATOR VERSION built the phase blocks. Absent on every file
+            # written before the integer operator existed, all of which are the legacy ratio-power
+            # operator; the loader reads absence as exactly that.
+            h5f.attrs["causal_phase_operator"] = phase_operator
         h5f.create_dataset(
             "fhr",
             shape=(0, len_signal),
@@ -885,7 +931,7 @@ def create_initial_hdf5(
                 _write_causal_attrs(
                     dataset,
                     channel_plan[name],
-                    None if novelty_frac is None else novelty_frac[name],
+                    None if novelty_curve is None else novelty_curve[name],
                 )
         h5f.create_dataset(
             "target",
@@ -995,9 +1041,10 @@ def create_hdf5_for_masks(
         transform=masks.get("transform", TWO_SIDED),
         channel_plan=masks.get("channel_plan"),
         leg_alignment=masks.get("causal_leg_alignment", LEG_ALIGNMENT_MODES[0]),
-        novelty_frac=masks.get("causal_novelty_frac"),
+        novelty_curve=masks.get("causal_novelty_curve"),
         source_pickle_path=source_pickle_path,
         source_guid_digest=guid_set_digest(records_list),
+        phase_operator=masks.get("causal_phase_operator", PHASE_OPERATOR_LEGACY),
     )
 
 
@@ -1180,23 +1227,37 @@ def _build_phase_selection(
     k_steps: Tuple[int, ...],
     fs: Optional[float] = None,
     label: str = "phase",
+    phase_operator: str = PHASE_OPERATOR_LEGACY,
 ) -> PhaseChannelSelection:
     r"""Build a phase mask and its per-channel metadata in one pass.
 
     Args:
         model: Constructed transform.
         band_hz: $(\min, \max)$ band edges in Hz.
-        k_steps: Harmonic steps $k$ to admit.
+        k_steps: Harmonic steps $k$ to admit. Must be the steps the operator
+            version admits (:func:`~hdf5_dataset.causal_scattering.phase_k_steps_for`).
         fs: Sampling rate in Hz, used to express the metadata in Hz; ``None``
             reads ``SAMPLING_RATE_HZ``.
         label: Field name used in the empty-selection error message.
+        phase_operator: Which operator version the selection is for. Under the
+            integer one the integer harmonic is derived here, once, from the
+            bank's centre frequencies and refused if any admitted pair is not
+            an integer harmonic.
 
     Returns:
         The selection, with metadata ordered to match the stored channel axis.
 
     Raises:
-        ValueError: If the band and $k$-steps admit no pair at all.
+        ValueError: If the band and $k$-steps admit no pair at all, on an
+            unknown operator, or if the steps are not the operator's own.
     """
+    validate_phase_operator(phase_operator)
+    if tuple(k_steps) != tuple(phase_k_steps_for(phase_operator)):
+        raise ValueError(
+            f"k_steps={tuple(k_steps)} are not the steps phase_operator={phase_operator!r} "
+            f"admits, {phase_k_steps_for(phase_operator)}; a selection and the exponent applied "
+            f"to it must come from one version"
+        )
     fs = SAMPLING_RATE_HZ if fs is None else fs
     mask = _phase_pair_mask(model, band_hz[0], band_hz[1], k_steps, fs=fs)
 
@@ -1219,6 +1280,14 @@ def _build_phase_selection(
     i = model.i_idx[mask].cpu().numpy().astype(np.int32)
     j = model.j_idx[mask].cpu().numpy().astype(np.int32)
     cf = model.center_freqs.cpu().numpy()
+    # The integer harmonic, derived from the same centre frequencies the pairs were selected on
+    # and refused if any admitted pair is fractional. ``None`` under the legacy operator, whose
+    # k = 6 family has no integer index.
+    harmonic = (
+        harmonic_index(np.stack([i, j], axis=1), cf).astype(np.int32)
+        if phase_operator == PHASE_OPERATOR_INTEGER
+        else None
+    )
 
     return PhaseChannelSelection(
         mask=mask,
@@ -1228,7 +1297,9 @@ def _build_phase_selection(
         xi_j_hz=(cf[j] * fs).astype(np.float32),
         power=model.powers[mask].cpu().numpy().astype(np.float32),
         band_hz=band_hz,
-        k_steps=k_steps,
+        k_steps=tuple(k_steps),
+        phase_operator=phase_operator,
+        harmonic=harmonic,
     )
 
 
@@ -1238,6 +1309,7 @@ def compute_scattering_masks(
     device=None,
     transform: str = TWO_SIDED,
     leg_alignment: str = LEG_ALIGNMENT_MODES[0],
+    phase_operator: str = PHASE_OPERATOR_LEGACY,
 ) -> Dict[str, Any]:
     r"""Compute every coefficient selection once, up front.
 
@@ -1270,6 +1342,13 @@ def compute_scattering_masks(
             threaded separately, exactly as ``transform`` is, so the transform
             that computes a coefficient and the attribute that records what
             computed it are read from one object.
+        phase_operator: Causal only. Which phase-harmonic operator version
+            the two self-phase selections are built for; it fixes their
+            harmonic steps (the integer operator drops the $k = 6$ family:
+            44 ``fhr_ph`` / 10 ``up_ph`` at the production bands) and is
+            carried in the returned dict as ``causal_phase_operator``. The
+            two-sided variant is the production operator by definition and
+            refuses any other value.
 
     Returns:
         Dict with two :class:`PhaseChannelSelection` objects
@@ -1277,13 +1356,23 @@ def compute_scattering_masks(
         (``cross_mask``), its channel count (``n_cross``), its selector
         metadata (``cross_metadata``), the scattering-block width
         (``n_scattering``) and the resolved ``transform``; plus
-        ``causal_bank``, ``channel_plan``, ``causal_leg_alignment`` and
-        ``causal_novelty_frac`` on the causal variant.
+        ``causal_bank``, ``channel_plan``, ``causal_leg_alignment``,
+        ``causal_phase_operator`` and ``causal_novelty_curve`` on the causal
+        variant.
 
     Raises:
-        ValueError: On an unknown *transform* or *leg_alignment*.
+        ValueError: On an unknown *transform*, *leg_alignment* or
+            *phase_operator*, or a non-legacy operator on the two-sided variant.
     """
     validate_transform(transform)
+    validate_phase_operator(phase_operator)
+    if transform != CAUSAL and phase_operator != PHASE_OPERATOR_LEGACY:
+        raise ValueError(
+            f"phase_operator={phase_operator!r} with transform={transform!r}: the two-sided "
+            f"variant reproduces the production kymatio operator, which is "
+            f"{PHASE_OPERATOR_LEGACY!r} by definition"
+        )
+    k_steps = phase_k_steps_for(phase_operator)
     tmp_model = KymatioPhaseScattering1D(
         J=11,
         Q=SCATTERING_Q,
@@ -1294,10 +1383,10 @@ def compute_scattering_masks(
         max_order=1,
     )
     fhr_ph_selection = _build_phase_selection(
-        tmp_model, FHR_PHASE_BAND_HZ, PHASE_HARMONIC_K_STEPS, label="fhr_ph"
+        tmp_model, FHR_PHASE_BAND_HZ, k_steps, label="fhr_ph", phase_operator=phase_operator
     )
     up_ph_selection = _build_phase_selection(
-        tmp_model, UP_PHASE_BAND_HZ, PHASE_HARMONIC_K_STEPS, label="up_ph"
+        tmp_model, UP_PHASE_BAND_HZ, k_steps, label="up_ph", phase_operator=phase_operator
     )
 
     # fhr_up_ph is unchanged: still the two-band cross-channel selector with
@@ -1337,11 +1426,14 @@ def compute_scattering_masks(
         masks["causal_bank"] = causal_bank
         masks["channel_plan"] = plan
         masks["causal_leg_alignment"] = leg_alignment
-        # Measured here, from the same bank and the same plan the widths come from, so the vector
+        masks["causal_phase_operator"] = phase_operator
+        # Measured here, from the same bank and the same plan the widths come from, so the curve
         # written beside a block's warm-up describes that block's channels by construction.
-        masks["causal_novelty_frac"] = novelty_fraction(
-            causal_bank, plan, target_pairs, source_pairs, CAUSAL_NOVELTY_HORIZON_STEPS,
-            decimation=scattering_T,
+        # Tabulated to the stored segment length: no label can sit further from an anchor than
+        # that, and no forecast horizon is baked in -- the model side looks its own up (CFS-08).
+        masks["causal_novelty_curve"] = novelty_curve(
+            causal_bank, plan, target_pairs, source_pairs,
+            max_window_steps=signal_length // scattering_T, decimation=scattering_T,
         )
     return masks
 
@@ -1449,6 +1541,9 @@ def describe_layout(masks: Dict[str, Any], device: Optional[Any] = None) -> Dict
     layout["causal_leg_alignment"] = str(
         masks.get("causal_leg_alignment", LEG_ALIGNMENT_MODES[0])
     )
+    layout["causal_phase_operator"] = str(
+        masks.get("causal_phase_operator", PHASE_OPERATOR_LEGACY)
+    )
     dropped: Dict[str, Dict[str, Optional[int]]] = {}
     warmup_range: Dict[str, Tuple[int, int]] = {}
     delay_range: Dict[str, Tuple[float, float]] = {}
@@ -1486,7 +1581,8 @@ def format_layout(layout: Dict[str, Any]) -> List[str]:
             f"Transform: {layout['transform']} (gammatone n={layout['gammatone_order']}, "
             f"{layout['causal_kernel_taps']} taps, "
             f"warm-up quantile {layout['causal_warmup_quantile']:g}, "
-            f"leg alignment {layout['causal_leg_alignment']})"
+            f"leg alignment {layout['causal_leg_alignment']}, "
+            f"phase operator {layout['causal_phase_operator']})"
         )
     else:
         lines.append(f"Transform: {layout['transform']}")
@@ -1685,6 +1781,9 @@ def _run_mimo_pipeline(
         signal_indices=range(0, 2),
         n_input_chan=2,
         labels=["HIE", "ACIDOSIS", "HEALTHY"],
+        # The UP channel is shifted 20 s earlier HERE, at dataset creation, and the shifted
+        # timeline is canonical: every consumer treats the stored signals as recorded this way.
+        # Nothing downstream may add this back, subtract it, budget it or interpret it.
         up_shift_secs=-20,
         default_target_index=0,
     )
@@ -2610,6 +2709,7 @@ def _transform_causal_record(
     channel_plan: Dict[str, CausalChannelPlan],
     scatter_batch_size: int,
     leg_alignment: str = LEG_ALIGNMENT_MODES[0],
+    phase_operator: str = PHASE_OPERATOR_LEGACY,
 ) -> Tuple[List[Optional[Dict[str, np.ndarray]]], Dict[int, str]]:
     """Transform one record's segments causally, in batches, isolating any that fail.
 
@@ -2632,6 +2732,8 @@ def _transform_causal_record(
         scatter_batch_size: Segments per forward pass.
         leg_alignment: The phase-harmonic leg alignment the two phase blocks are built with. It
             must be the one recorded on the file, which is why both come from the same masks.
+        phase_operator: The phase-harmonic operator version, from the same masks for the same
+            reason.
 
     Returns:
         ``(blocks, failures)``: one ``{block: (C, T)}`` dict per segment — ``None`` where the
@@ -2644,7 +2746,7 @@ def _transform_causal_record(
     def _run(start: int, stop: int) -> Dict[str, np.ndarray]:
         return transform_batch_numpy(
             torch_bank, fhr[start:stop], up[start:stop], target_pairs, source_pairs,
-            plan=channel_plan, leg_alignment=leg_alignment,
+            plan=channel_plan, leg_alignment=leg_alignment, phase_operator=phase_operator,
         )
 
     for batch_start in range(0, n_valid, scatter_batch_size):
@@ -2745,6 +2847,7 @@ def create_hdf5_dataset_from_records_list(
         leg_alignment = precomputed_masks.get(
             "causal_leg_alignment", LEG_ALIGNMENT_MODES[0]
         )
+        phase_operator = precomputed_masks.get("causal_phase_operator", PHASE_OPERATOR_LEGACY)
         # No pair-axis check: this path indexes responses by pair *index* rather than masking a
         # pair axis, so there is no mask length that could disagree with a transform.
         _validate_geometry(hdf5_path, resolve_channel_layout(precomputed_masks))
@@ -2789,6 +2892,8 @@ def create_hdf5_dataset_from_records_list(
                 signal_indices=range(0, 2),
                 n_input_chan=2,
                 labels=["HIE", "ACIDOSIS", "HEALTHY"],
+                # Same build-time shift as the prescreen adaptor; the stored timeline it produces
+                # is canonical and is never undone downstream.
                 up_shift_secs=-20,
                 default_target_index=default_ti,
             )
@@ -2906,7 +3011,7 @@ def create_hdf5_dataset_from_records_list(
             if causal:
                 causal_blocks, causal_failures = _transform_causal_record(
                     torch_bank, valid_fhr, valid_up, target_pairs, source_pairs,
-                    channel_plan, scatter_batch_size, leg_alignment,
+                    channel_plan, scatter_batch_size, leg_alignment, phase_operator,
                 )
                 for seg_j, message in causal_failures.items():
                     orig_idx = valid_indices[seg_j]
@@ -3176,6 +3281,7 @@ def create_new_pipeline(
     transform: str = TWO_SIDED,
     leg_alignment: str = LEG_ALIGNMENT_MODES[0],
     device: Optional[str] = None,
+    phase_operator: str = PHASE_OPERATOR_LEGACY,
 ):
     """Run the complete new dataset creation pipeline.
 
@@ -3216,15 +3322,24 @@ def create_new_pipeline(
         device: Torch device for the transform, e.g. ``'cuda:3'`` to pin one
             GPU of eight. ``None`` keeps today's behaviour: the first CUDA
             device if one exists, else the CPU.
+        phase_operator: Causal only. ``'ratio_power_v0'`` is the operator
+            every shard on disk was built with (fractional $2^{3/2}$ family
+            included, branch discontinuity included); ``'integer_harmonic_v1'``
+            is the corrected integer-harmonic operator, which narrows the
+            phase blocks to 44/10 and stores each pair's integer index.
+            Written into every causal file as ``causal_phase_operator``. Write
+            an integer build to a **separate** output path with its own
+            statistics: its channel axis is a different one.
 
     Raises:
-        ValueError: On an unknown *transform* or *leg_alignment*, before
-            anything is created.
+        ValueError: On an unknown *transform*, *leg_alignment* or
+            *phase_operator*, before anything is created.
     """
     # First statements, before os.makedirs and before the CSV is read: a refusal that arrives
     # later leaves an output directory behind and reports a CSV problem instead of the real one.
     validate_transform(transform)
     validate_leg_alignment(leg_alignment)
+    validate_phase_operator(phase_operator)
     validate_test_mode(test_mode)
 
     setup_verbosity(verbose)
@@ -3238,7 +3353,7 @@ def create_new_pipeline(
     logger.info("Computing scattering masks (v3)...")
     masks = compute_scattering_masks(
         SIGNAL_LENGTH, scattering_T=16, device=torch_device, transform=transform,
-        leg_alignment=leg_alignment,
+        leg_alignment=leg_alignment, phase_operator=phase_operator,
     )
     # Log the resolved layout and the active selection parameters: this is the
     # operator's confirmation that the intended variant is running, and it
@@ -3248,7 +3363,8 @@ def create_new_pipeline(
     for line in format_layout(describe_layout(masks, torch_device)):
         logger.info(line)
     logger.info(
-        f"Phase selection: k_steps={PHASE_HARMONIC_K_STEPS}, "
+        f"Phase selection: operator={phase_operator}, "
+        f"k_steps={phase_k_steps_for(phase_operator)}, "
         f"fhr_band={FHR_PHASE_BAND_HZ} Hz, up_band={UP_PHASE_BAND_HZ} Hz"
     )
 
@@ -3569,6 +3685,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--device", dest="device",
                         help="Torch device for the transform, e.g. 'cuda:3' to pin one GPU of "
                              "eight. Default: the first CUDA device if one exists, else the CPU.")
+    parser.add_argument("--phase-operator", dest="phase_operator", choices=PHASE_OPERATORS,
+                        help="Causal only: the phase-harmonic operator version. "
+                             f"'{PHASE_OPERATOR_LEGACY}' is every shard on disk (fractional "
+                             f"2^(3/2) family, branch discontinuity); '{PHASE_OPERATOR_INTEGER}' "
+                             "stores integer harmonics k in {2, 4} and applies them exactly "
+                             f"(44/10 phase channels). Default: {PHASE_OPERATOR_LEGACY}.")
     return parser
 
 
@@ -3585,6 +3707,7 @@ def main(
     transform: Optional[str] = None,
     leg_alignment: Optional[str] = None,
     device: Optional[str] = None,
+    phase_operator: Optional[str] = None,
 ) -> int:
     """Apply the defaults the parser is not allowed to carry, then run the build.
 
@@ -3603,8 +3726,9 @@ def main(
         screening_csv_path: Pre-computed screening CSV to resume from.
         classification_pickle_path: Fold pickle to resume from.
         transform: Wavelet bank.
-        leg_alignment: Causal phase-harmonic operator.
+        leg_alignment: Causal phase-harmonic leg alignment.
         device: Torch device for the transform.
+        phase_operator: Causal phase-harmonic operator version.
 
     Returns:
         The process exit code.
@@ -3624,6 +3748,7 @@ def main(
         transform=transform or TWO_SIDED,
         leg_alignment=leg_alignment or LEG_ALIGNMENT_MODES[0],
         device=device,
+        phase_operator=phase_operator or PHASE_OPERATOR_LEGACY,
     )
     return 0
 
@@ -3664,14 +3789,14 @@ def _cli(argv: Optional[List[str]] = None) -> int:
 #: so a one-off can override a single value without editing the file; nothing requires using it.)
 #:
 #: Each line below states the value's **type or allowed values**, and what ``None`` falls back to.
-#: The three enumerated keys are re-checked after the merge -- by :func:`validate_transform`,
-#: :func:`validate_leg_alignment` and :func:`validate_test_mode`, each of which names the valid
-#: values in its refusal. That re-check is not redundant: the parser's ``choices=`` guards the
+#: The four enumerated keys are re-checked after the merge -- by :func:`validate_transform`,
+#: :func:`validate_leg_alignment`, :func:`validate_phase_operator` and :func:`validate_test_mode`,
+#: each of which names the valid values in its refusal. That re-check is not redundant: the parser's ``choices=`` guards the
 #: command line only, and a value set here never passes through the parser.
 #:
 #: **Point each variant at its own ``output_base_path``.** Nothing here modifies an existing
 #: dataset. A causal build narrows the scattering blocks to 36 channels, produces no
-#: ``fhr_up_ph``, and gives every block its per-channel warm-up, group delay and novelty fraction.
+#: ``fhr_up_ph``, and gives every block its per-channel warm-up, group delay and novelty curve.
 #: An **aligned** build additionally puts the two legs of every phase-harmonic pair on one clock:
 #: it changes no width, no warm-up and no stored delay -- only the values inside ``fhr_ph`` and
 #: ``up_ph`` -- so the root attribute is the only thing separating it from an unaligned one, and
@@ -3707,6 +3832,16 @@ RUN_ARGS: Dict[str, Any] = {
     #   "envelope" : delay the faster leg onto the slower one's clock and de-rotate its carrier
     #                first. Recorded as the root attribute causal_leg_alignment.
     "leg_alignment": "envelope",
+
+    # "ratio_power_v0" | "integer_harmonic_v1"   (None -> "ratio_power_v0")  -- see PHASE_OPERATORS
+    #   Causal builds only; ignored when transform is "two_sided".
+    #   "ratio_power_v0"      : the operator every shard on disk was built with. Its k = 6 family
+    #                           (p = 2^(3/2)) is discontinuous across the principal-angle branch.
+    #   "integer_harmonic_v1" : integer harmonics k in {2, 4} only, applied as integers and stored
+    #                           per pair as sel_harmonic; 44 fhr_ph / 10 up_ph channels. Needs its
+    #                           OWN output path and its own statistics file.
+    #   Recorded as the root attribute causal_phase_operator.
+    "phase_operator": "integer_harmonic_v1",
 
     # ========================= Everything below has a default =========================
     # str | None -- torch device for the transform, e.g. "cuda:3" to pin one GPU of eight.

@@ -47,6 +47,8 @@ from teb_vae.lag_attn_rws.trainer import RESOLVED_CONFIG_FILENAME
 from train.graph_models_utils import check_model_class, load_checkpoint_strict
 
 from .conftest import (
+    INT_C_U,
+    INT_C_Y,
     CAUSAL_C_U,
     CAUSAL_C_Y,
     CAUSAL_PH_WIDTH,
@@ -73,8 +75,8 @@ SMOKE_EPOCHS = 2
 #: reference and never touch the other stream. The source number is therefore neither ``c_u`` --
 #: which it was while nothing gated that stream -- nor the target's survivor count: it is what the
 #: shipped source clock, a hundred-odd seconds faster than the target's, leaves standing.
-GUARDED_TARGET_CHANNELS = 98
-GUARDED_SOURCE_CHANNELS = 39
+GUARDED_TARGET_CHANNELS = 76
+GUARDED_SOURCE_CHANNELS = 46
 
 #: How far two identical fits may disagree, per column, under the shipped autotuning settings:
 #: ``atol + rtol * (that column's own largest magnitude)``.
@@ -100,21 +102,11 @@ _DRIFT_RTOL = 1.0e-3
 #: the committed shard exactly as the run resolves it, removes the trailing anchors before
 #: anything is decoded -- and the tiling divides by the shipped stride of 5, which travels with
 #: that clock rather than with the horizon.
-SHIPPED_ANCHOR_STRIDE = 5
+SHIPPED_ANCHOR_STRIDE = 13
 
 
-def _physical_advance() -> int:
-    """The shipped clock's largest advance, resolved from the committed shard's own delays."""
-    from teb_vae.lag_attn_cfs.causal_warmup import resolve_warmup_budget
-
-    from .conftest import causal_config
-
-    budget = resolve_warmup_budget(causal_config(causal_target_forecast_clock="physical"))
-    assert budget is not None
-    return budget.max_forecast_advance
-
-
-DENSE_ANCHORS = 300 - SHIPPED_HORIZON - SHIPPED_WARMUP_PERIOD - _physical_advance()
+# The stored clock advances no label, so the dense span is T_valid - F = 136.
+DENSE_ANCHORS = 300 - SHIPPED_HORIZON - SHIPPED_WARMUP_PERIOD
 TILE_COUNT = -(-DENSE_ANCHORS // SHIPPED_ANCHOR_STRIDE)
 
 
@@ -211,6 +203,11 @@ def _run_fit_in_subprocess(tmp_path, hash_seed: str) -> pd.DataFrame:
             **dict(os.environ),
             "PYTHONHASHSEED": hash_seed,
             "CUDA_VISIBLE_DEVICES": "",
+            # One thread, so CPU reductions sum in one order in both processes: with the
+            # 80-channel adapter oneDNN was seen to differ at the 1e-8 level between two
+            # otherwise identical runs, which is thread scheduling and not what this test guards.
+            "OMP_NUM_THREADS": "1",
+            "MKL_NUM_THREADS": "1",
         },
         cwd=str(repo_root),
         capture_output=True,
@@ -283,12 +280,13 @@ def test_the_run_trains_at_the_budgets_width_and_the_configs_tiling(fit):
     assert model.horizon == SHIPPED_HORIZON
     # The forecast clock the config states, applied: the ceiling is T_valid less the largest
     # advance, which is where the dense anchor count above comes from.
-    assert model.target_forecast_shift is not None
-    assert model.anchor_ceiling == model.geometry.t_valid - max(model.target_forecast_shift)
+    # The stored clock advances nothing: every anchor up to T_valid is decoded.
+    assert model.target_forecast_shift is None
+    assert model.anchor_ceiling == model.geometry.t_valid
     assert model.warmup_period == SHIPPED_WARMUP_PERIOD
     assert model.raw_per_step == 16
     # The declared widths are untouched, which is what the data boundary checks against.
-    assert (model.c_y, model.c_u) == (CAUSAL_C_Y, CAUSAL_C_U)
+    assert (model.c_y, model.c_u) == (INT_C_Y, INT_C_U)
 
 
 def test_the_input_adapters_carry_the_availability_terms_the_warm_up_needs(fit):

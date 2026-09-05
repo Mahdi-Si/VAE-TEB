@@ -34,6 +34,12 @@ general_config:
 
 model_config:
   VAE_model:
+    # This shard was built under the LEGACY phase operator (66 / 15 phase channels), so the
+    # operator and the declared widths are pinned back to it here; the promoted default's
+    # unaligned inputs and stored clock apply unchanged.
+    causal_phase_operator: ratio_power_v0
+    c_y: 102
+    c_u: 51
     max_lag: 90
     anchor_stride: 1
     likelihood: gaussian_nll
