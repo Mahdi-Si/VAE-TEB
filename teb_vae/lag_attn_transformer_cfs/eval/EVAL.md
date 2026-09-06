@@ -101,6 +101,11 @@ must be read knowing that the two cells' local K/V stems are not the same size, 
 387 there, so a difference in a lag profile across this edge is about the stems as much as about the
 encoders. Both `DESIGN.md` records say so at the point where the difference is priced.
 
+*Amendment (2026-09-05).* The figures above describe the edge as built. Since this date both cfs
+cells forecast $H = 10$ steps over $156$ dense anchors (block $10 \times 76 = 760$) under the same
+weights, so the condition still holds and the level comparison stands; `preflight.json` records a
+run's own `horizon`, `anchors_per_sample` and `block_width`.
+
 **Against `lag_attn_transformer_fs`, a loss level is *not* comparable**, and the asymmetry is
 structural rather than a matter of care. That cell is the same architecture over the **two-sided**
 transform: its blocks are 2340 coefficients against this cell's 2940, at the same horizon of 30 steps against

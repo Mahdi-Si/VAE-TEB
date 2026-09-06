@@ -53,7 +53,6 @@ from .conftest import (
     CAUSAL_C_Y,
     CAUSAL_PH_WIDTH,
     CAUSAL_ST_WIDTH,
-    SHIPPED_HORIZON,
     SHIPPED_WARMUP_PERIOD,
     absolutize_dataset_paths,
 )
@@ -97,16 +96,19 @@ _DRIFT_ATOL = 1.0e-1
 _DRIFT_RTOL = 1.0e-3
 
 #: The anchor counts the two stages must produce, derived here the way the model derives them so a
-#: geometry change re-derives them rather than failing a literal. The dense count is taken over
-#: the EFFECTIVE ceiling: the shipped physical forecast clock's largest advance, resolved against
-#: the committed shard exactly as the run resolves it, removes the trailing anchors before
-#: anything is decoded -- and the tiling divides by the shipped stride of 5, which travels with
-#: that clock rather than with the horizon.
-SHIPPED_ANCHOR_STRIDE = 13
+#: geometry change re-derives them rather than failing a literal. The stride is the one literal:
+#: it is what the config states, and the run's stride equalling it is what is asserted.
+SHIPPED_ANCHOR_STRIDE = 5
 
 
-# The stored clock advances no label, so the dense span is T_valid - F = 136.
-DENSE_ANCHORS = 300 - SHIPPED_HORIZON - SHIPPED_WARMUP_PERIOD
+#: The horizon the CONFIG ships, read off the tiny variant the fit runs on rather than off the
+#: fixture-level ``SHIPPED_HORIZON`` (30), which describes the legacy unit-test geometry the
+#: parameter totals were measured at: since 2026-09-05 this cell forecasts 10 steps, so the two
+#: constants no longer agree and the fit must be checked against the one it actually trains at.
+CONFIG_HORIZON = int(load_config(str(_TINY))["model_config"]["VAE_model"]["horizon"])
+
+# The stored clock advances no label, so the dense span is T_valid - F = 300 - 10 - 134 = 156.
+DENSE_ANCHORS = 300 - CONFIG_HORIZON - SHIPPED_WARMUP_PERIOD
 TILE_COUNT = -(-DENSE_ANCHORS // SHIPPED_ANCHOR_STRIDE)
 
 
@@ -277,7 +279,7 @@ def test_the_run_trains_at_the_budgets_width_and_the_configs_tiling(fit):
     assert model.target_adapter.linear.in_features == GUARDED_TARGET_CHANNELS
     assert model.source_adapter.linear.in_features == GUARDED_SOURCE_CHANNELS
     assert model.anchor_stride == SHIPPED_ANCHOR_STRIDE
-    assert model.horizon == SHIPPED_HORIZON
+    assert model.horizon == CONFIG_HORIZON == 10
     # The forecast clock the config states, applied: the ceiling is T_valid less the largest
     # advance, which is where the dense anchor count above comes from.
     # The stored clock advances nothing: every anchor up to T_valid is decoded.
@@ -335,7 +337,7 @@ def test_the_zero_kl_init_invariant_survives_the_whole_stack(fit):
 
     assert float(outputs["kld_per_t"].abs().max()) == 0.0
     assert torch.equal(outputs["z_prior"], outputs["mu_prior"])
-    assert outputs["mu_base"].shape == (batch_size, TILE_COUNT, SHIPPED_HORIZON,
+    assert outputs["mu_base"].shape == (batch_size, TILE_COUNT, CONFIG_HORIZON,
                                         GUARDED_TARGET_CHANNELS)
     assert not torch.equal(outputs["mu_base"], outputs["mu_full"])
 

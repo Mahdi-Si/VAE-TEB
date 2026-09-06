@@ -257,7 +257,7 @@ def check_trim_minutes(config: Mapping[str, Any]) -> None:
     r"""Refuse a run on a grid the raw-index geometry is not valid on.
 
     The forecast of anchor $t$ starts at raw sample $16(t+1)$ *on the trimmed grid*. Untrimmed it
-    starts at $16(t+16)$, so anchor $0$'s two-minute block begins one full minute later than
+    starts at $16(t+16)$, so anchor $0$'s $H$-step block begins one full minute later than
     every mask, every event index and every bpm overlay assumes. A mismatch against the
     statistics file's own trim only ``warnings.warn``.
 

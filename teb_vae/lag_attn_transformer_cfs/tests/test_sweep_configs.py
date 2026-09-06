@@ -5,7 +5,7 @@ decision rather than an oversight. The floor, horizon and depth arms answer ques
 target domain, which ``teb_vae/lag_attn_cfs/configs`` already asks; the encoder arms answer
 questions about the encoder, which ``teb_vae/lag_attn_transformer_rws/configs`` already asks. The
 tiling arm is the only one of those whose answer could differ between the two encoders, because
-what it moves is the per-step gradient noise -- $136$ decoded anchors against $\approx 4.53$ -- and
+what it moves is the per-step gradient noise -- $156$ decoded anchors against $\approx 31$ -- and
 a pre-normalised attention stack is exactly the architecture whose stability is sensitive to that.
 
 The **lag** arms beside it exist in both feature-target cells, because every gate that produced
@@ -94,7 +94,8 @@ _ARMS: Dict[str, Dict[str, Any]] = {
     },
     # The configuration this cell shipped before 2026-09-05, kept as the comparator the promoted
     # default replaced: legacy fractional-phase representation, the dual input reference, the
-    # approximate physical clock and its stride-5 tiling, on the LEGACY shards.
+    # approximate physical clock and its stride-5 tiling, on the LEGACY shards. The horizon is NOT
+    # part of its delta: it follows the default's H = 10 so the comparison holds the horizon equal.
     "sweep_legacy_dualref_physclock.yaml": {
         f"{_VAE}.c_y": 102,
         f"{_VAE}.c_u": 51,
@@ -231,20 +232,23 @@ def test_the_stride_arm_restores_the_dense_anchor_set():
     floor, stride, _horizon, t_valid = _geometry(_resolved("sweep_anchor_stride_1.yaml"))
 
     assert stride == 1
-    assert -(-(t_valid - floor) // stride) == t_valid - floor == 136
+    assert -(-(t_valid - floor) // stride) == t_valid - floor == 156
 
 
 def test_the_default_pairs_the_stride_with_the_forecast_clock():
-    """The tiling travels with the forecast clock: the physical clock's ceiling leaves a 51-anchor
-    span, and stride 5 is what keeps ~10 training tiles per sample there (A_max = 11). The
-    stored-clock arm restores the horizon-partitioning 30 with its clock, where its own delta
-    test pins the pairing."""
+    """The tiling travels with the horizon: on the stored clock the ceiling is T_valid = 300 - H,
+    so H = 10 leaves the 156-anchor span [134, 290), and S = H / 2 = 5 tiles it into 32 tiles at
+    phase 0 and 31 at every other phase. Pinned here as well as in test_config_load.py because
+    this file is where a stride left behind by a horizon change is meant to be caught."""
     default = load_config(str(_DEFAULT))
-    _floor, stride, horizon, _t_valid = _geometry(default)
+    floor, stride, horizon, t_valid = _geometry(default)
 
     assert default["model_config"]["VAE_model"]["causal_target_forecast_clock"] == "stored"
-    assert stride == 13
-    assert horizon == 30
+    assert horizon == 10
+    assert stride == 5 == horizon // 2
+    assert t_valid - floor == 156
+    assert -(-(t_valid - floor) // stride) == 32
+    assert -(-(t_valid - floor - (stride - 1)) // stride) == 31
 
 
 @pytest.mark.parametrize("name", sorted(_ARMS))

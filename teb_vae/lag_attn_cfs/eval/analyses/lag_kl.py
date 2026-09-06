@@ -20,8 +20,8 @@ to them. The support-corrected profile divides each bin by its own contributing-
 untruncated one restricts to the anchors at which every lag exists. Where two argmaxes disagree,
 the difference *is* the corresponding bias.
 
-**At this cell's shipped geometry all three coincide, and that is measured rather than assumed.**
-The anchor floor is $F = 133$ while the furthest searched lag is $L - 1 = 90$, so every lag is
+**Wherever the anchor floor clears the furthest lag all three coincide, and that is measured rather
+than assumed.** With $F \ge L - 1$ every lag is
 causally valid at every scored anchor and all three corrections collapse to no-ops. But the three
 quantities behind that -- the floor, ``max_lag`` and ``lag_floor`` -- move independently, and a
 ``sweep_floor_*`` arm would reintroduce truncation with nothing saying so. So this analysis reads

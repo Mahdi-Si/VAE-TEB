@@ -17,8 +17,8 @@ label to mean different things in two trees.
 What is this model's, and therefore what is written here, is the **shape of its input**: two
 streams rather than one target vector.
 
-* the target stream, $c_y = 36\ (\texttt{fhr\_st}) + 66\ (\texttt{fhr\_ph}) = 102$;
-* the source stream, $c_u = 36\ (\texttt{up\_st}) + 15\ (\texttt{up\_ph}) = 51$, or $15$ alone
+* the target stream, $c_y = |\texttt{fhr\_st}| + |\texttt{fhr\_ph}|$ as the shards declare the blocks;
+* the source stream, $c_u = |\texttt{up\_st}| + |\texttt{up\_ph}|$, or the phase block alone
   when ``use_up_st`` is false.
 
 Both blocks are laid out exactly as the model receives them -- ``cat([st, ph])`` -- so a channel
@@ -331,7 +331,7 @@ def coverage_counts(
     r"""Count what the band map does and does not cover, on both axes.
 
     Five counts rather than one ratio, because the declared and scored numerators can coincide by
-    arithmetic accident -- on the shipped dataset both are $95$, since $102 - 7 = 98 - 3$ -- and
+    arithmetic accident -- $102 - 7 = 98 - 3 = 95$ on one dataset -- and
     quoting "95 of 102" would imply the analysis banded channels the decoder never emitted.
 
     Args:

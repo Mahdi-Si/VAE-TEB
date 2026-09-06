@@ -25,7 +25,7 @@ shipped geometry $240 \times 16 = 3840$ samples, $960$ s.
 Three properties follow, and all three are why this module exists rather than a Welch call inside
 one forecast block:
 
-1. **The resolution is the slice's, not the block's.** A single $480$-sample block supports
+1. **The resolution is the slice's, not the block's.** A single $H \cdot R$-sample block supports
    ``nperseg = 64`` at best, which puts the whole $[0, 0.04)$ Hz deceleration span in the DC bin
    that the detrend has already removed -- the documented reason spectral analysis was deferred.
    A $960$ s slice supports ``nperseg = 512``, giving $\Delta f = 7.8125$ mHz and four bins below
@@ -681,7 +681,7 @@ def estimate_delay(
     :func:`delay_alias_period`, so the search runs over $[-P/2, +P/2]$ and a wider request is
     *refused* rather than served: outside that interval the grid holds exact ties, and which one an
     ``argmax`` returns is an implementation detail rather than a measurement. At the shipped
-    geometry the interval is $\pm 64$ s, which is far wider than a two-minute forecast can
+    geometry the interval is $\pm 64$ s, which is far wider than a horizon-long forecast can
     plausibly be mis-timed by and still be recognisable as the same event.
 
     **A search rather than a fit to the unwrapped phase.** Not for range -- unwrapping has the same

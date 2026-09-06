@@ -34,12 +34,15 @@ base constructor and
 :meth:`~teb_vae.lag_attn_cfs.nets.causal_inputs.CausalWarmupInputs._validate_causal_geometry` after
 it, both shared with the conv-LSTM cell.
 
-The unit consequence, restated where a reader will look for it: the reconstruction is summed over
-$H \cdot C_{\mathrm{keep}} = 30 \times 98 = 2940$ coefficients at the shipped budget, against the
-raw variant's $H \cdot R$ samples and against the two-sided feature variant's
-$30 \times 78 = 2340$, so the nats are comparable to neither -- nor across warm-up budgets within
-this model, since $C_{\mathrm{keep}}$ moves with the budget. The *horizon* now agrees with every
-other cell of the grid; only $C_{\mathrm{keep}}$ separates this block from the two-sided one.
+The unit consequence, restated where a reader will look for it: under the shipped
+``configs/default.yaml`` the reconstruction is summed over
+$H \cdot C_{\mathrm{keep}} = 10 \times 76 = 760$ coefficients -- the same block the conv-LSTM causal
+cell sums, so a nat is comparable across the encoder edge -- against the raw variant's $H \cdot R$
+samples and the two-sided feature variant's $30 \times 78 = 2340$, so the nats are comparable to
+neither of those, nor across warm-up budgets within this model, since $C_{\mathrm{keep}}$ moves
+with the budget. Since 2026-09-05 the *horizon* separates this block from the two-sided cells' as
+well as $C_{\mathrm{keep}}$ does: both cfs configs forecast $10$ steps where the two-sided cells forecast $30$. The constructor default below stays the architecture parent's $30$; the horizon is
+a configuration decision and the config states it.
 """
 from __future__ import annotations
 
@@ -141,9 +144,10 @@ class SeqVaeLagAttnTrfCfs(
         this target domain's. The defaults that differ from the parent's -- ``warmup_period`` $134$,
         ``c_y`` $102$, ``c_u`` $51$ -- are this target domain's geometry rather than a preference,
         and a run that left them at the parent's values would be describing a dataset that does not
-        exist. ``horizon`` is **no longer** among them: at $30$ it agrees with the architecture
-        parent and with every other cell of the grid, so the forecast question is shared even though
-        the block is not.
+        exist. ``horizon`` is not among them: the constructor default stays the architecture
+        parent's $30$, and the shipped ``configs/default.yaml`` sets $10$ -- a configuration
+        decision rather than a property of the target domain, so it is stated in the config and
+        not here.
 
         Args:
             target_warmup_steps: $W'_c$ per **surviving** target channel, positional against

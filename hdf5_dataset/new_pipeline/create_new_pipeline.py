@@ -3807,8 +3807,11 @@ RUN_ARGS: Dict[str, Any] = {
     "records_base_path": r"/data/deid/datafabric/fetal-heart-tracing/StudyGroup2022_v4/",
 
     # str -- output directory for every file this run writes. Required. Must be a NEW directory
-    #        for a causal or aligned build, never an existing dataset's.
-    "output_base_path": r"/data1/fetal-heart-tracing/HDF5_Datasets/new_pipeline_6h_causal_aligned",
+    #        for a causal or aligned build, never an existing dataset's. This is the
+    #        integer-operator build both CFS default.yaml files expect: after the build, replace
+    #        their REPOINT_ME_causal_int placeholders (four shard paths + stat_path, and the k-fold
+    #        test paths in eval/configs/eval_overrides.yaml) with this directory.
+    "output_base_path": r"/data1/fetal-heart-tracing/HDF5_Datasets/new_pipeline_6h_causal_int",
 
     # str -- CSV carrying the labour-onset and second-stage columns. Required.
     "tlo_csv_path": r"/path/to/complete_labor_onset.csv",
@@ -3816,8 +3819,10 @@ RUN_ARGS: Dict[str, Any] = {
     # str | None -- the two-sided run's classification_dataset_records.pickle. Skips steps 1-3 and
     #        pins the SAME GUIDs, folds, partitions and segments, which is what makes this build
     #        comparable to that one segment for segment. None = run the full pipeline from
-    #        scratch, producing a dataset comparable to nothing.
-    "classification_pickle_path": None,
+    #        scratch, producing a dataset comparable to nothing. The path below is the one the
+    #        existing causal shards record in their source_pickle_path root attribute, so the
+    #        integer build covers exactly the segments the legacy build did.
+    "classification_pickle_path": r"/data1/fetal-heart-tracing/HDF5_Datasets/last_12_hours_new_up_channels_tlo/classification_dataset_records.pickle",
 
     # ============================= The variant to build =============================
     # "two_sided" | "causal"        (None -> "two_sided")    -- see TRANSFORMS

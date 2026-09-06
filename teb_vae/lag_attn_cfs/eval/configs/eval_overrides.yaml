@@ -19,8 +19,8 @@ general_config:
   batch_size:
     # 32, not the training 128. Under no_grad the activation retention that dominates training is
     # gone, but the transients are not: the pass decodes four scored branches over
-    # A = 137 anchors x H = 30 steps x C_keep = 98 channels at K Monte Carlo draws, which is two
-    # ~894 KB tensors per branch per draw — about 1.8 MB per batch element — plus the (T, M, L)
+    # A x H x C_keep coefficients at K Monte Carlo draws (156 x 10 x 76 at the shipped geometry),
+    # which is two ~463 KB tensors per branch per draw — about 0.9 MB per batch element — plus the (T, M, L)
     # attention weights at (300, 4, 91). That is roughly 1.7x the raw cells' per-sample decode, and
     # 32 still leaves the transient under 60 MB, so the sibling's value transfers rather than being
     # halved on an argument nobody measured.
@@ -256,13 +256,14 @@ eval_config:
   # Seconds after a detected contraction within which an anchor counts as event-conditioned.
   # Kept at the raw cells' 120.0 rather than halved with this cell's horizon: the window is the
   # interval over which a contraction could still influence what is being predicted, which is a
-  # property of the physiology rather than of a 15-step forecast block. Halving it would also make
+  # property of the physiology rather than of an H-step forecast block. Shortening it would also make
   # the contraction-conditioned readouts non-comparable across cells for a reason that has nothing
-  # to do with the target domain. Two of this cell's horizons (15 steps x 4 s = 60 s) fit in it.
+  # to do with the target domain. It spans 120 / (4 H) of this cell's horizons -- three at
+  # the shipped H = 10.
   event_lag_window_s: 120.0
 
   # Resamples behind every bootstrap interval, drawn over RECORDINGS. Recordings, not anchors: at
-  # the dense anchor set consecutive forecast windows overlap in 14 of their 15 steps, so
+  # the dense anchor set consecutive forecast windows overlap in H - 1 of their H steps, so
   # resampling anchors would report an interval narrower than the data supports by that factor.
   bootstrap_resamples: 2000
 

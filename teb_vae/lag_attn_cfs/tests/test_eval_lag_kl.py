@@ -371,7 +371,7 @@ def test_the_seconds_axis_is_the_compensated_one_elementwise() -> None:
 
 def test_a_nonzero_input_delay_shifts_every_second_by_four_delta() -> None:
     """The historical bug, in the shape it took: one consumer read the delay and the other read
-    zero, and the two reports of one run disagreed by two minutes with nothing raising."""
+    zero, and the two reports of one run disagreed by a whole horizon with nothing raising."""
     delay = 30
     base = lag_kl.compensated_seconds_axis(9, delay_steps=0)
 

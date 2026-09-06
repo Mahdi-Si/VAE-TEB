@@ -216,9 +216,9 @@ def test_the_geometry_and_the_encoder_block_reach_the_constructor(driver):
     kwargs = driver._build_model_kwargs()
 
     assert kwargs["sequence_length"] == 300
-    assert kwargs["horizon"] == 30
+    assert kwargs["horizon"] == 10
     assert kwargs["warmup_period"] == 134
-    assert kwargs["anchor_stride"] == 13
+    assert kwargs["anchor_stride"] == 5
     assert kwargs["c_y"] == 80
     assert kwargs["c_u"] == 46
     assert kwargs["target_attention_blocks"] == 2  # the tiny variant's own override
@@ -286,7 +286,8 @@ def test_the_built_model_is_this_packages_and_carries_both_halves(driver):
 
     assert isinstance(model, SeqVaeLagAttnTrfCfs)
     assert model.decoder_out_channels == 76
-    assert model.anchor_stride == 13
+    assert model.horizon == 10
+    assert model.anchor_stride == 5
     # The stored clock advances nothing: every anchor up to T_valid is decoded.
     assert model.target_forecast_shift is None
     assert model.anchor_ceiling == model.geometry.t_valid

@@ -1,7 +1,7 @@
 r"""Physiological event detection on the raw traces: contractions and decelerations.
 
-The raw forecast target is what makes this pipeline able to ask a clinical question at all. A
-$480$-sample block is two minutes of fetal heart rate; it can be inverted to bpm, searched for
+The raw forecast target is what makes this pipeline able to ask a clinical question at all. An
+$H \cdot R$-sample block is $4H$ seconds of fetal heart rate; it can be inverted to bpm, searched for
 decelerations, and lined up against the uterine activity that preceded it. No earlier evaluation
 in this repository could do any of that, because no earlier model forecast a raw signal.
 
@@ -497,15 +497,15 @@ def detect_decelerations(
 
 
 # =============================================================================
-# Block mode: what a 480-sample forecast can and cannot be searched for
+# Block mode: what an H*R-sample forecast can and cannot be searched for
 # =============================================================================
 def usable_interval(
     n_samples: int, *, fs: float = FS_RAW, edge_seconds: float = DECELERATION_EDGE_S
 ) -> Tuple[int, int]:
     r"""Return the half-open sample interval a detection may land in, inside one block.
 
-    The detector drops events within ``edge_seconds`` of either end, so a block of $HR = 480$
-    samples ($120\,$s) leaves a $240$-sample interior -- $60\,$s of the two minutes forecast. That
+    The detector drops events within ``edge_seconds`` of either end, so a block of $HR$
+    samples ($4H$ s) leaves an interior two ``edge_seconds`` shorter than the forecast. That
     is a property of the ported detector rather than of the model, and it is what every rate
     computed on blocks is a rate *over*, so it is computed here and reported rather than being
     left implicit.

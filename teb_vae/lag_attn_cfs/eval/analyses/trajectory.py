@@ -13,13 +13,13 @@ loss term, the lag support is truncated until $t \ge L - 1$, and the final $H$ a
 fully observed future. Here, only the last of those three is still visible:
 
 * **Nothing below the anchor floor exists at all.** The causal front end forces
-  $F = 133$ of $T = 300$, and the forward decodes *no* anchor below it -- there is no row on the
+  a floor $F$ deep into the $T$ steps, and the forward decodes *no* anchor below it -- there is no row on the
   per-anchor table to profile, rather than a row scoring a warm-up value. So the profile **starts
   at $F$** and the reader sees no warm-up droop, because the region a droop would live in was never
   decoded. The emitted record carries the floor read off the run's own geometry beside the first
   anchor actually observed, so "the profile starts here" is checkable rather than asserted.
-* **The lag truncation is inert.** The furthest searched lag is $L - 1 = 90$ and the floor is
-  $133$, so every lag is causally valid at every scored anchor and there is no early-anchor
+* **The lag truncation is inert.** The furthest searched lag is $L - 1$ and the floor
+  $F$ clears it, so every lag is causally valid at every scored anchor and there is no early-anchor
   truncation to see. This is a consequence of the floor rather than of the lag axis, and an arm
   that lowered the floor below $90$ would reintroduce it.
 * **The final $H$ anchors are still never scored**, exactly as in the raw cells, and $H$ is $15$

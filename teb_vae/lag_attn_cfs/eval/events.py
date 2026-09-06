@@ -1,6 +1,6 @@
 r"""Contraction detection on the raw UP trace. One detector, and deliberately only one.
 
-This model forecasts $98$ wavelet coefficients rather than a heart-rate waveform, so the raw
+This model forecasts $C_{\mathrm{keep}}$ wavelet coefficients rather than a heart-rate waveform, so the raw
 traces are here for one job: locating the uterine activity a forecast can be *conditioned* on.
 :func:`detect_contractions` finds contraction events on the UP trace, its output becomes
 ``seconds_since_contraction`` on the per-anchor table, and contraction-conditioned coupling reads

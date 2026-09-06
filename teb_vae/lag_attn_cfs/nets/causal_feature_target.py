@@ -412,7 +412,7 @@ class CausalFeatureForecastTarget(FeatureForecastTarget):
 
         $\nu_c$ is the shard's stored **fixed-horizon, stored-clock envelope-mass proxy**: the share
         of the composed envelope $\lvert\psi_k\rvert \star \phi$ (slow leg for a phase pair) that
-        falls within $H = 30$ stored steps after the anchor, with no per-channel label advance
+        falls within $H$ stored steps after the anchor, with no per-channel label advance
         (``hdf5_dataset.causal_scattering.novelty_fraction``). It is not an exact "known/new" value
         fraction of a nonlinear coefficient, and it is computed for the stored clock: under the
         ``physical`` clock, or at another horizon, this ranking is the LEGACY proxy's rather than a
@@ -914,9 +914,9 @@ class CausalFeatureForecastTarget(FeatureForecastTarget):
 
         A geometry guard, not a result: the band is
         $\lceil (\mathrm{ceiling} - F - \varphi)/S \rceil$ over $\varphi \in [0, S)$, with the
-        ceiling the model's own :attr:`anchor_ceiling`. At the shipped physical-clock geometry
-        ($F = 134$, $S = 5$, ceiling $185$) that is $11$ at phase $0$ and $10$ otherwise, mean
-        $51/5$; at the validation stride of $1$ it is exactly $51$. A value off that band means
+        ceiling the model's own :attr:`anchor_ceiling`. For example, at $F = 134$, $S = 5$ and a
+        ceiling of $185$ that is $11$ at phase $0$ and $10$ otherwise, mean $51/5$; at the
+        validation stride of $1$ it is exactly $\mathrm{ceiling} - F$. A value off that band means
         the tiling is not the one the configuration states.
 
         Counted off ``anchor_valid`` rather than off the mask, deliberately: this must report the

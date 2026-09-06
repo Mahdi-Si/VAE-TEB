@@ -1802,3 +1802,46 @@ input shift. The guard bands above that read `anchors_per_sample` $\in [10, 11]$
 are the legacy arm's; the promoted default's are $[10, 11]$ train / $136$ val. Shards for the default
 are built with `create_new_pipeline.py` under `phase_operator=integer_harmonic_v1`
 (`REPOINT_ME_causal_int`); they also carry the horizon-free `causal_novelty_curve`.
+
+## Amendment (2026-09-05, later the same day): the horizon moves to 10 steps, the tiling to stride 5
+
+`default.yaml` now forecasts $H = 10$ stored steps ($40$ s) instead of $30$, together with
+`teb_vae/lag_attn_transformer_cfs/configs/default.yaml`, so the encoder edge still differs in the
+encoder alone; the two-sided cells still forecast $30$. The change is a configuration decision and is
+stated in the config; no network code moved.
+
+**What follows from it, and was re-derived rather than left behind.** On the stored clock the anchor
+ceiling is $T_{\mathrm{valid}} = 300 - H = 290$, so the dense span $[134, 290)$ holds $156$ anchors
+(against $136$). `anchor_stride` moves $13 \to 5 = H/2$, which tiles that span into $A_{\max} = 32$ tiles at phase $0$ and $31$ at every other phase (mean $31.2$, against $10$–$11$ before); consecutive
+windows overlap by exactly half a horizon, so every scored coefficient is seen from two anchors per
+step, and the per-step training tensors do not grow — $(B, 32, 10, 76)$ is $320$ anchor-steps per
+sample against $(B, 11, 30, 76)$ at $330$, while the dense validation decode falls from $136 \times 30$
+to $156 \times 10$. `horizon_weight_halflife_steps` moves $15.0 \to 5.0$, keeping the $H/2$ rule
+(weights $1.7260 \to 0.4957$, a $3.5\times$ spread). `horizon_depth` stays $4$: the criterion is
+$\mathrm{RF} \ge H + 1 = 21$ and $\mathrm{RF} = 31$ clears it by ten tokens, while depth $3$
+($\mathrm{RF} = 15$) still misses. The block is $10 \times 76 = 760$ coefficients, so the two
+loss-scale constants stated in nats of the block were **scaled by $760/2940$ from the recorded
+$H = 30$ measurement rather than re-measured**: `gradient_clip_val` $15000 \to 4000$ (the same
+rounding rule on the scaled quantiles; the conv-Transformer cell lands on $3500$ from its own
+measurement) and `additive_margin` $9.0 \times 10^{3} \to 2.2 \times 10^{3}$, held equal across the
+encoder edge as before and now under the $\approx 2.4 \times 10^{3}$ magnitude the objective can reach
+at this block — the previous margin had already exceeded the $\approx 7.2 \times 10^{3}$ bound of the
+promoted $2280$-coefficient block, so the additive spike test had silently become inert. Both are to
+be re-derived from the headline run's own `train/grad_norm` and `main_loss` columns.
+
+**The arms.** `sweep_horizon_15.yaml` lengthens the horizon to $15$, and follows the $S = H/2$
+rule to stride $7$ ($151$ anchors, $A_{\max} = 22$, block $1140$). `sweep_floor_150.yaml` still
+withholds $16$ anchors, which at $S = 5$ costs four tiles at phase $0$ rather than one.
+`sweep_horizon_depth_3.yaml` now halves a reach that clears the criterion by twenty, to one that still clears it by four. `sweep_legacy_dualref_physclock.yaml` deliberately does *not* pin the horizon: under $H = 20$
+its physical-clock ceiling is $205$, its span $71$ anchors and its stride-$5$ tiling $14$–$15$ tiles.
+`planted.yaml` **pins** `horizon: 30` and `horizon_weight_halflife_steps: 15.0`, because the planted
+delay of $45$ stored steps makes the readable band $[\delta - H, \delta - 1] = [15, 44]$ only at
+$H = 30$; both twins pin the pair.
+
+**What does not move.** The diagnostic page derives everything it draws from the model —
+`geometry.horizon`, `anchor_stride`, the anchor ceiling and the decoded anchor set — and the evaluation
+pipeline reads `horizon`, `anchor_ceiling - warmup_period` and `block_width` off the checkpoint, so
+neither needed a code change; comments and guides that quoted the old geometry as fixed numbers were
+made symbolic instead. The guard bands for `anchors_per_sample` are now $[31, 32]$ train / $156$ val.
+The target edge, against `lag_attn_fs`, now differs in the horizon as well as the block, and `horizon`
+is back on that edge's exemption list.

@@ -227,7 +227,7 @@ HEADLINE_SCALARS: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
     #   delta      what the source added, which is `pred_gap` resolved by frequency.
     #
     # LF rather than any other band: VLF is four bins wide, MF carries the decoder's token-seam
-    # frequency, and HF is mostly beyond what a two-minute forecast can speak to. Unlike the
+    # frequency, and HF is mostly beyond what a horizon-long forecast can speak to. Unlike the
     # calibration entries above these resolve under every likelihood, because the cross-spectra
     # read only the forecast means and the truth.
     ("coherence_msc_lf_full", ("coherence", "headline", "coherence_full_lf")),

@@ -8,7 +8,7 @@ used it".
 
 So this module fits an **oracle**: the same decoder, at the same capacity, reading the target
 encoder's own state $h^y_t$ instead of the $d_z$-wide latent $z_t$. It forecasts the identical
-$H \cdot R = 480$-sample block, against the identical target and the identical mask, under the
+$H \cdot R$-sample block, against the identical target and the identical mask, under the
 identical likelihood. The only thing that differs is what it is conditioned on, so
 
 $$\Delta_{\mathrm{suff}} = D_{\mathrm{base}} - D_{\mathrm{oracle}}$$
@@ -426,7 +426,7 @@ def guid_split(
     """Partition segment positions into a fit half and a held-out half, **by recording**.
 
     At the level of the recording rather than the segment, and that is the whole point: one
-    delivery contributes tens of segments whose forecast windows overlap in 29 of their 30 steps,
+    delivery contributes tens of segments whose forecast windows overlap in $H - 1$ of their $H$ steps,
     so a segment-level split leaves the probe scoring what it was fitted on under another name.
 
     Args:

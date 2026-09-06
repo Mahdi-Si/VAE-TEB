@@ -8,7 +8,7 @@ used it".
 
 So this module fits an **oracle**: the same decoder, at the same capacity, reading the target
 encoder's own state $h^y_t$ instead of the $d_z$-wide latent $z_t$. It forecasts the identical
-$H \cdot C_{\mathrm{keep}} = 2940$-coefficient block, at the identical anchors, against the
+$H \cdot C_{\mathrm{keep}}$-coefficient block, at the identical anchors, against the
 identical target and the identical mask, under the identical likelihood. The only thing that
 differs is what it is conditioned on, so
 
@@ -41,7 +41,7 @@ partitioned once, from the run's own seed, and the membership counts travel into
 rest of the pipeline holds that the shared collection pass is the only model-touching cost. A
 probe fit is thousands of passes over the same segments, so re-running the encoder for each would
 be the dominant cost of the whole evaluation; instead one encoder pass writes
-:class:`StateCache` -- at the shipped geometry roughly $146$ KiB of ``target_state`` per segment
+:class:`StateCache` -- at the geometry this was sized at, roughly $146$ KiB of ``target_state`` per segment
 in fp32, plus $120$ KiB of target feature stream, plus the validity signal and the anchor set at
 under $4$ KiB between them -- and every fit step reads it. The extra pass is recorded in the
 analysis's ``plan`` rather than left as a surprise in a profile.
@@ -116,7 +116,8 @@ DEFAULT_LEARNING_RATE = 1e-3
 #: $(B \cdot A_{\max}, H, d_{\mathrm{hidden}})$ tensor alive per refine block and per attention
 #: block for the backward pass, so what a step costs is that product -- not the segment count the
 #: batch names. At this cell's shipped decoder ($d_{\mathrm{hidden}} = 256$, doubled again by the
-#: capacity refit) sixteen segments of $137 \times 30$ anchors-by-horizon is $33.7$ M elements per
+#: capacity refit) sixteen segments of $A_{\max} \times H$ anchors-by-horizon -- $137 \times 30$ at the
+#: geometry this was sized at -- is $33.7$ M elements per
 #: block, and the fit peaks near $3.8$ GiB **measured** -- inside an evaluation that has already
 #: retained its waveforms and is about to read them back.
 #:
@@ -168,7 +169,7 @@ CAPACITY_WIDTH_MULTIPLIER = 2
 #: number is read, so calling it a capacity limitation would be reporting fit noise.
 #:
 #: Deliberately **not** rescaled by the block width. It is a threshold on a nats-per-anchor
-#: quantity, and this cell's anchor sums $2940$ coefficients against the raw cells' $480$ samples
+#: quantity, and this cell's anchor sums $H \cdot C_{\mathrm{keep}}$ coefficients against the raw cells' $H \cdot R$ samples
 #: -- so the same number is a *stricter* test here in relative terms. Left as it is because the
 #: quantity it is compared against, ``prior_shuffle_min_nats``, was not rescaled either, and two
 #: thresholds on the same scale must move together or not at all.

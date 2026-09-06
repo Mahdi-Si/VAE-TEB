@@ -3,7 +3,7 @@ r"""Is the forecast any good, in units a clinician reads, and where in the horiz
 Every other readout in this pipeline is about the *coupling* -- what the source adds. This one is
 about the forecast itself, and it exists because a block score alone cannot answer the question.
 $D_{\mathrm{full}} = 674$ nats per anchor is not a number anybody can judge: it is a negative log
-density summed over $H \cdot R = 480$ raw samples, so it is large under every predictor and its
+density summed over $H \cdot R$ raw samples, so it is large under every predictor and its
 scale is set by the block size rather than by the model. Three things make it readable.
 
 **Baselines.** The same loss function, the same mask, the same anchors, applied to three
@@ -29,7 +29,7 @@ questioned. :func:`~teb_vae.lag_attn_rws.eval.metrics.sigma_to_bpm` is that conv
 without the loader's statistics the numbers stay labelled ``normalised``.
 
 **The horizon axis.** $D(\tau)$ answers whether the forecast -- and the source's contribution to
-it -- holds up at two minutes or only at four seconds, and neither predecessor pipeline computes
+it -- holds up at the far end of the horizon or only at its first step, and neither predecessor pipeline computes
 it. Two properties are load-bearing. It is built on the **single-draw** path, because the Monte
 Carlo marginalisation does not commute with the sum over $\tau$: by Jensen,
 $\sum_\tau -\log \frac{1}{K}\sum_r e^{-D_r(\tau)} \neq -\log \frac{1}{K}\sum_r e^{-\sum_\tau
@@ -38,7 +38,7 @@ denominator is the per-$\tau$ masked anchor count rather than the per-anchor con
 indicator, which is an ``amax`` over $\tau$ and would count masked late-horizon steps as scored
 zeros -- flattering exactly the horizons that fall in gaps.
 
-**Everything here is per recording.** Anchors overlap in $29$ of their $30$ horizon steps and one
+**Everything here is per recording.** Anchors overlap in $H - 1$ of their $H$ horizon steps and one
 recording contributes tens of segments, so every statistic is averaged within a recording first
 and the bootstrap resamples recordings, never anchors.
 """
@@ -424,7 +424,7 @@ def build_horizon_figure(curves: pd.DataFrame, *, horizon_steps: int) -> Any:
     r"""Draw $D(\tau)$, the gap, and the RMSE against lead time in **seconds**.
 
     Seconds rather than horizon steps, on every panel: the question the curve answers -- "does the
-    source still help two minutes out?" -- is asked in seconds, and a reader who has to multiply
+    source still help at the far end of the horizon?" -- is asked in seconds, and a reader who has to multiply
     by four is a reader who will eventually forget to.
 
     Args:

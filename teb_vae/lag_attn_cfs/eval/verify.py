@@ -61,11 +61,12 @@ closing a specific failure:
 
 **Two arms at different horizons are not compared on a loss level**, and
 :data:`HORIZON_LEVEL_RULE` says so in the emitted document rather than only here: the block a score
-is per-anchor over is $H \cdot C_{\mathrm{keep}}$ coefficients, so a run at $H = 30$ scores twice
-the block a run at $H = 15$ does and its nats are larger for that reason alone.
+is per-anchor over is $H \cdot C_{\mathrm{keep}}$ coefficients, so a run at a longer horizon scores a
+proportionally wider block and its nats are larger for that reason alone.
 
-There is deliberately **no cross-target table against** ``lag_attn_fs``. The blocks differ (2940
-against 2340 coefficients) even though the horizons no longer do, so a level comparison would invite
+There is deliberately **no cross-target table against** ``lag_attn_fs``. The blocks differ (a
+budget-gated $H \cdot C_{\mathrm{keep}}$ against the two-sided cell's full channel set, and the
+horizons may differ as well), so a level comparison would invite
 exactly the reading both ``DESIGN.md`` records forbid.
 """
 from __future__ import annotations
@@ -433,12 +434,12 @@ _ABSENT = object()
 
 #: Emitted into the horizon section of the document rather than only stated here, because the
 #: comparison it forbids is the one a reader makes by reflex. A block score is per anchor over
-#: $H \cdot C_{\mathrm{keep}}$ coefficients, so a run at $H = 30$ scores a block twice as wide as a
-#: run at $H = 15$ and its nats are larger for that reason alone; and the anchor count falls with
+#: $H \cdot C_{\mathrm{keep}}$ coefficients, so a run at a longer horizon scores a proportionally
+#: wider block and its nats are larger for that reason alone; and the anchor count falls with
 #: $H$, so the two arms are not even scored over the same population of anchors.
 HORIZON_LEVEL_RULE = (
     "Do not compare two horizons on a loss level. A block score is per anchor over H*C_keep "
-    "target coefficients, so an arm at H = 30 scores twice the block an arm at H = 15 does and "
+    "target coefficients, so an arm at a longer horizon scores a proportionally wider block and "
     "its nats are larger for that reason alone -- and anchors live in [F, T - H), so the two arms "
     "are scored over different anchor counts as well. What is comparable across this axis is the "
     "SIGN and the ORDERING of `pred_gap`, and the scale-free percentage columns beside it."
@@ -838,7 +839,8 @@ def build_sweep_tables(arms: Sequence[Dict[str, Any]]) -> List[str]:
     # survived it, which is the axis the floor does NOT buy anything on.
     lines += ["", "## Anchor floor sweep (`warmup_period`)", ""]
     lines += [
-        "The floor is a policy choice rather than a validity boundary above 133: it keeps the "
+        "The floor is a policy choice rather than a validity boundary above B - 1 (the slowest "
+        "kept channel's warm-up less one): it keeps the "
         f"identical channel set -- `{TARGET_WARM_FRAC_COLUMN}` reads 1.0 either way -- and buys "
         "its policy with anchors. So the two columns are read together, and a difference in the "
         "warm fraction means the checkpoint predates the constructor's pairing refusal rather "

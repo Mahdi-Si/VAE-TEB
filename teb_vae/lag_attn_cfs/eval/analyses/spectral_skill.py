@@ -39,8 +39,8 @@ cross-cohort analysis already has on the per-recording tables above it, and a ma
 disagrees with the vectors' width is a **raise** rather than a truncation, because a silently
 shortened join gives every band statement a silently wrong denominator.
 
-**Coverage is emitted as five counts rather than one ratio.** On the shipped dataset the declared
-and scored numerators coincide at $95$ by arithmetic accident ($102 - 7 = 98 - 3$), and quoting
+**Coverage is emitted as five counts rather than one ratio.** The declared
+and scored numerators can coincide by arithmetic accident ($102 - 7 = 98 - 3 = 95$ on one dataset), and quoting
 "95 of 102" would imply this analysis scored channels the decoder never emitted. The channels no
 selected filter pair named are reported as their own ``unknown`` row with their count, never
 bucketed into a neighbouring band whose skill they do not share and never dropped.
@@ -216,7 +216,7 @@ def coverage_counts(
     r"""The five counts of the covered axis, never one ratio.
 
     Five rather than one because the declared and scored numerators can coincide by arithmetic
-    accident -- on the shipped dataset both are $95$, since $102 - 7 = 98 - 3$ -- and "95 of 102"
+    accident -- $102 - 7 = 98 - 3 = 95$ on one dataset -- and "95 of 102"
     would imply this analysis scored channels the decoder never emitted.
 
     Args:

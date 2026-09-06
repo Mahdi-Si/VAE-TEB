@@ -30,7 +30,7 @@ identically. So: a percentile bootstrap over *recordings*, and a paired signed-r
 per-recording block scores, which is the paired form because each recording contributes both.
 
 **The same answer as a percentage.** Nats are the objective's units and say nothing about
-proportion: whether $3$ nats over a $2940$-coefficient block is a large improvement or a negligible
+proportion: whether $3$ nats over an $H \cdot C_{\mathrm{keep}}$-coefficient block is a large improvement or a negligible
 one is not readable off the number, and two checkpoints whose block scores differ in scale cannot be
 compared on it at all. Three percentages are reported beside it, in the two spaces where a ratio
 has a natural zero:
@@ -51,8 +51,8 @@ has a natural zero:
 
 **The likelihood percentage is budget-local, and the emitted record says so.** Its denominator is
 $H \cdot C_{\mathrm{keep}}$, and $C_{\mathrm{keep}}$ is whatever the warm-up budget left standing --
-$98$ of $102$ declared channels at the shipped ``causal_warmup_budget_steps``, but a different
-number under a different budget. So the *same model* re-evaluated under a looser budget would report
+a subset of the $c_y$ declared channels at the configured ``causal_warmup_budget_steps``, and a
+different number under a different budget. So the *same model* re-evaluated under a looser budget would report
 a different percentage from the same nats, and two runs' percentages are comparable only where their
 block widths are. The nats are not budget-local in that sense and neither are the two error-space
 percentages, which is why all three are reported rather than the percentage alone.

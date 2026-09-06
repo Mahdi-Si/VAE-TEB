@@ -7,7 +7,8 @@
 # where the decoder's log-variance sits inside its clamp, and whether `kld_source_null` sits close to
 # `source_conditioned_kl_raw`) is a property of the objective at the real widths, the real block
 # cardinality and the real anchor count. A shrunken model would not reproduce it -- and the block is
-# the one thing that must not shrink, because H * C_keep = 2940 is what every reported nat is summed
+# the one thing that must not shrink, because H * C_keep (10 x 98 = 980 on this legacy
+# 102-channel shard, against the default's 10 x 76 = 760) is what every reported nat is summed
 # over, and the decoded anchor count is what it is averaged over. Only the run's *scale* is local:
 # one device, one shard, hundreds of epochs instead of thousands.
 #
