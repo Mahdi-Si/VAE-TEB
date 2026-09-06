@@ -4,8 +4,8 @@ Self-contained script that:
   1. Prescreens all GUIDs for valid signal in the last 6 hours.
   2. Selects GUIDs for classification with class balancing + TLO constraints.
   3. Creates 10-fold stratified CV splits (80/10/10).
-  4. Builds classification HDF5 datasets (12.4h range, v3 scattering).
-  5. Builds pretraining HDF5 datasets from BG subgroup leftovers.
+  4. Builds pretraining (unsupervised) HDF5 datasets from BG subgroup leftovers.
+  5. Builds classification k-fold HDF5 datasets (12.4h range, v3 scattering).
 """
 
 import argparse
@@ -3291,8 +3291,16 @@ def create_new_pipeline(
            population-proportional test).
         3. Create 10-fold stratified CV splits (stratified by labour
            duration within each subgroup).
-        4. Build classification HDF5 datasets.
-        5. Build pretraining HDF5 datasets from BG subgroup leftovers.
+        4. Build pretraining (unsupervised) HDF5 datasets from BG subgroup
+           leftovers.
+        5. Build classification k-fold HDF5 datasets.
+
+    Steps 4 and 5 are independent: both consume only the masks, the CSV maps
+    and the GUID lists that steps 1-3 (or the resumed pickle) already fixed,
+    and neither reads what the other writes. The pretraining set is built
+    first because it is what VAE pretraining needs, and the k-fold build is
+    the far longer of the two -- an interrupted run then still leaves a
+    complete unsupervised dataset behind.
 
     Args:
         records_base_path: Root dir with StudyGroup subfolders.
@@ -3483,7 +3491,69 @@ def create_new_pipeline(
         pretrain_bg_no_cs = selection_result["pretraining_bg_no_cs"]
 
     # ------------------------------------------------------------------
-    # Step 4: Classification HDF5 creation
+    # Step 4: Pretraining (unsupervised) HDF5 creation
+    # ------------------------------------------------------------------
+    # Runs before the k-fold build, not after it. The GUID lists both steps consume are already
+    # fixed above, so the order changes nothing either one writes -- it only decides which
+    # dataset exists first, and the unsupervised one is both the smaller build and the one
+    # pretraining waits on.
+    pretrain_path = os.path.join(output_base_path, "pre_training_dataset")
+    os.makedirs(pretrain_path, exist_ok=True)
+
+    logger.info(
+        f"Pretraining leftovers: BG_CS={len(pretrain_bg_cs)}, "
+        f"BG_NoCS={len(pretrain_bg_no_cs)}"
+    )
+
+    random.shuffle(pretrain_bg_cs)
+    split_cs = int(len(pretrain_bg_cs) * 0.9)
+    train_cs = pretrain_bg_cs[:split_cs]
+    test_cs = pretrain_bg_cs[split_cs:]
+
+    random.shuffle(pretrain_bg_no_cs)
+    split_no_cs = int(len(pretrain_bg_no_cs) * 0.9)
+    train_no_cs = pretrain_bg_no_cs[:split_no_cs]
+    test_no_cs = pretrain_bg_no_cs[split_no_cs:]
+
+    pretrain_sets = [
+        ("train_dataset_cs.hdf5", train_cs, True, True),
+        ("train_dataset_no_cs.hdf5", train_no_cs, False, True),
+        ("test_dataset_cs.hdf5", test_cs, True, True),
+        ("test_dataset_no_cs.hdf5", test_no_cs, False, True),
+    ]
+
+    # These four bypass _build_hdf5_for_partition entirely, which is exactly why they go through
+    # the same create_hdf5_for_masks: a variant threaded into the partition path alone would
+    # produce a directory whose classification and pre-training files disagree.
+    for fname, records, cs, bg in pretrain_sets:
+        hdf5_file = os.path.join(pretrain_path, fname)
+        logger.info(f"Creating {fname} ({len(records)} GUIDs)...")
+        create_hdf5_for_masks(
+            hdf5_file, masks, len_sequence=sequence_length,
+            records_list=records, source_pickle_path=classification_pickle_path,
+        )
+        create_hdf5_dataset_from_records_list(
+            hdf5_path=hdf5_file,
+            records_list=records,
+            cs_label=cs,
+            bg_label=bg,
+            pre_defined_target=1,  # all healthy
+            precomputed_masks=masks,
+            labor_onset_map=labor_onset_map,
+            second_stage_map=second_stage_map,
+            base_block_size=BASE_BLOCK_SIZE,
+            overlap_percentage=OVERLAP_PERCENTAGE,
+            device=torch_device,
+            run_guid_analysis=False,
+            scatter_batch_size=scatter_batch_size,
+            verbose=verbose,
+            transform=transform,
+        )
+
+    logger.info("Pretraining datasets complete.")
+
+    # ------------------------------------------------------------------
+    # Step 5: Classification (k-fold) HDF5 creation
     # ------------------------------------------------------------------
     actual_mode = cv_result["test_mode"]
     kfold_path = os.path.join(output_base_path, "k_fold_cross_validation_dataset")
@@ -3553,64 +3623,6 @@ def create_new_pipeline(
             run_ga = False
 
     logger.info("Classification datasets complete.")
-
-    # ------------------------------------------------------------------
-    # Step 5: Pretraining HDF5 creation
-    # ------------------------------------------------------------------
-    pretrain_path = os.path.join(output_base_path, "pre_training_dataset")
-    os.makedirs(pretrain_path, exist_ok=True)
-
-    logger.info(
-        f"Pretraining leftovers: BG_CS={len(pretrain_bg_cs)}, "
-        f"BG_NoCS={len(pretrain_bg_no_cs)}"
-    )
-
-    random.shuffle(pretrain_bg_cs)
-    split_cs = int(len(pretrain_bg_cs) * 0.9)
-    train_cs = pretrain_bg_cs[:split_cs]
-    test_cs = pretrain_bg_cs[split_cs:]
-
-    random.shuffle(pretrain_bg_no_cs)
-    split_no_cs = int(len(pretrain_bg_no_cs) * 0.9)
-    train_no_cs = pretrain_bg_no_cs[:split_no_cs]
-    test_no_cs = pretrain_bg_no_cs[split_no_cs:]
-
-    pretrain_sets = [
-        ("train_dataset_cs.hdf5", train_cs, True, True),
-        ("train_dataset_no_cs.hdf5", train_no_cs, False, True),
-        ("test_dataset_cs.hdf5", test_cs, True, True),
-        ("test_dataset_no_cs.hdf5", test_no_cs, False, True),
-    ]
-
-    # These four bypass _build_hdf5_for_partition entirely, which is exactly why they go through
-    # the same create_hdf5_for_masks: a variant threaded into the partition path alone would
-    # produce a directory whose classification and pre-training files disagree.
-    for fname, records, cs, bg in pretrain_sets:
-        hdf5_file = os.path.join(pretrain_path, fname)
-        logger.info(f"Creating {fname} ({len(records)} GUIDs)...")
-        create_hdf5_for_masks(
-            hdf5_file, masks, len_sequence=sequence_length,
-            records_list=records, source_pickle_path=classification_pickle_path,
-        )
-        create_hdf5_dataset_from_records_list(
-            hdf5_path=hdf5_file,
-            records_list=records,
-            cs_label=cs,
-            bg_label=bg,
-            pre_defined_target=1,  # all healthy
-            precomputed_masks=masks,
-            labor_onset_map=labor_onset_map,
-            second_stage_map=second_stage_map,
-            base_block_size=BASE_BLOCK_SIZE,
-            overlap_percentage=OVERLAP_PERCENTAGE,
-            device=torch_device,
-            run_guid_analysis=False,
-            scatter_batch_size=scatter_batch_size,
-            verbose=verbose,
-            transform=transform,
-        )
-
-    logger.info("Pretraining datasets complete.")
     logger.info("Pipeline finished.")
 
 
