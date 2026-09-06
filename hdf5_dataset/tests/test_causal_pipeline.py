@@ -24,6 +24,7 @@ they need production data and touch no coefficient.
 from __future__ import annotations
 
 import inspect
+import pickle
 import sys
 import types
 from pathlib import Path
@@ -379,6 +380,74 @@ def test_an_unknown_transform_is_refused_before_anything_is_created(
         )
     assert "two_sided" in str(error.value) and "causal" in str(error.value)
     assert not output.exists(), "the refusal left an output directory behind"
+
+
+def test_the_pre_training_dataset_is_built_before_the_folds(
+    pipeline: Any,
+    masks: Dict[str, Any],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Every pre-training file is written before the first fold partition.
+
+    Steps 4 and 5 are independent -- neither reads what the other writes -- so nothing inside
+    either one would notice if they swapped back, and the order is observable only from outside.
+    It is worth pinning because the k-fold half is by far the longer one in a run that takes
+    hours: with the folds first, an interruption leaves no usable unsupervised dataset at all,
+    and that is the dataset VAE pre-training waits on.
+    """
+    order: List[str] = []
+    # Both write paths reduced to a name in one call log; what is under test is which runs
+    # first, not what either writes. ``setup_verbosity`` is stubbed too -- it calls
+    # ``logging.basicConfig(force=True)``, which would otherwise outlive this test.
+    monkeypatch.setattr(pipeline, "setup_verbosity", lambda verbose: None)
+    monkeypatch.setattr(pipeline, "load_csv_metadata", lambda *a, **k: ({}, {}))
+    monkeypatch.setattr(pipeline, "compute_scattering_masks", lambda *a, **k: masks)
+    monkeypatch.setattr(
+        pipeline,
+        "create_hdf5_for_masks",
+        lambda path, *a, **k: order.append(f"pre_training:{Path(path).name}"),
+    )
+    monkeypatch.setattr(pipeline, "create_hdf5_dataset_from_records_list", lambda *a, **k: None)
+    monkeypatch.setattr(
+        pipeline,
+        "_build_hdf5_for_partition",
+        lambda part_dir, **k: order.append(f"classification:{Path(part_dir).name}"),
+    )
+
+    # Resuming from a pickle skips steps 1-3, which need the production ``.mat`` tree; steps 4
+    # and 5 -- the pair being ordered -- both run in full. Empty GUID lists are enough: the call
+    # sequence is what is being read, not the contents of any file.
+    empty_subgroups = {"healthy_bg_cs": [], "healthy_bg_no_cs": []}
+    pickle_path = tmp_path / "classification_dataset_records.pickle"
+    pickle_path.write_bytes(
+        pickle.dumps(
+            {
+                "test_mode": "augmented",
+                "folds": {
+                    "fold_1": {
+                        partition: dict(empty_subgroups)
+                        for partition in ("train", "val", "test")
+                    }
+                },
+                "test_augmentation": {},
+            }
+        )
+    )
+
+    pipeline.create_new_pipeline(
+        records_base_path=str(tmp_path),
+        output_base_path=str(tmp_path / "out"),
+        tlo_csv_path=str(tmp_path / "unused.csv"),
+        classification_pickle_path=str(pickle_path),
+    )
+
+    pre_training = [i for i, name in enumerate(order) if name.startswith("pre_training:")]
+    classification = [i for i, name in enumerate(order) if name.startswith("classification:")]
+    # Four pre-training files -- train/test crossed with cs/no_cs -- and one partition per fold.
+    assert len(pre_training) == 4, order
+    assert classification, order
+    assert max(pre_training) < min(classification), order
 
 
 def test_the_writer_refuses_masks_from_the_other_variant(
