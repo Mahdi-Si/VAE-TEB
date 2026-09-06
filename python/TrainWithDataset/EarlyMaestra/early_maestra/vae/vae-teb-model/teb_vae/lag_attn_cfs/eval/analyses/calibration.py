@@ -17,7 +17,7 @@ Four readings, over the scored coefficients themselves:
 * **CRPS**, in closed form for a Gaussian. Proper, bounded, and in the units of what is being
   scored -- which here is a $z$-scored wavelet coefficient and stays labelled ``normalised``. The
   raw cells quote this one in bpm; there is no clinical unit to quote it in here, and inverting the
-  per-channel statistics would put the $98$ scored channels on scales spanning orders of magnitude,
+  per-channel statistics would put the $C_{\mathrm{keep}}$ scored channels on scales spanning orders of magnitude,
   which is exactly what a single pooled CRPS cannot survive.
 * **The gain over the homoscedastic MLE**, one constant variance fitted to *the very residuals
   being scored*. That is deliberately the strongest form of the baseline: the comparison then says

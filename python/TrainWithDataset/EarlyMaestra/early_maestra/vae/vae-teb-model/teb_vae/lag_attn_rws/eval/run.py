@@ -1479,7 +1479,7 @@ def load_or_collect_tables(
     # On the model's device, because the draw it seeds is ``normal_`` into a tensor there.
     mc_generator = torch.Generator(device=device).manual_seed(seed + _SEED_OFFSET_MC)
     # One pass, two durable tables, and the readouts. Every later analysis reads the tables
-    # rather than the model, so the decoder pass -- four branches over 480 raw samples per
+    # rather than the model, so the decoder pass -- four branches over H*R raw samples per
     # anchor at K draws -- happens exactly once per run directory.
     def _collect() -> collect.Collection:
         """Run the pass and record what the sample cap did, before the tables are written."""

@@ -223,7 +223,7 @@ def test_the_two_new_geometry_keys_reach_the_constructor(driver):
     defaults with nothing raising."""
     kwargs = driver._build_model_kwargs()
 
-    assert kwargs["anchor_stride"] == 13
+    assert kwargs["anchor_stride"] == 5
     assert kwargs["lag_floor"] == 0
 
 
@@ -251,8 +251,8 @@ def test_the_resolved_kwargs_actually_build_the_model_the_config_describes(drive
     assert model.target_adapter.linear.in_features == GUARDED_TARGET_CHANNELS
     assert model.source_adapter.linear.in_features == GUARDED_SOURCE_CHANNELS
     assert model.raw_per_step == 16
-    assert model.anchor_stride == 13
-    assert model.horizon == 30
+    assert model.anchor_stride == 5
+    assert model.horizon == 10
     # The stored clock advances nothing: every anchor up to T_valid is decoded.
     assert model.target_forecast_shift is None
     assert model.anchor_ceiling == model.geometry.t_valid
@@ -349,11 +349,12 @@ def test_create_model_logs_the_resolved_anchor_geometry(driver, caplog):
         logger.remove(sink)
 
     line = next(m for m in messages if "resolved anchor geometry" in m)
-    assert "H=30" in line and "S=13" in line and "F=134" in line
-    # The stored clock advances nothing, so the ceiling is T_valid itself and stride 13 tiles its
-    # 136-anchor span into the same 11 tiles the legacy physical-clock geometry had.
-    assert "A_max=11" in line and "T_valid=270" in line and "ceiling=270" in line
-    assert "block width H*C_keep=2280" in line
+    assert "H=10" in line and "S=5" in line and "F=134" in line
+    # The stored clock advances nothing, so the ceiling is T_valid itself and stride 5 tiles its
+    # 156-anchor span into 32 tiles at phase 0.
+    assert "A_max=32" in line and "T_valid=290" in line and "ceiling=290" in line
+    assert "tiles per sample 31-32" in line
+    assert "block width H*C_keep=760" in line
     assert "receptive field=31" in line
 
 

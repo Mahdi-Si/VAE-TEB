@@ -9,13 +9,15 @@
 # This arm exists because "ten minutes" may be meant as a SCIENTIFIC POLICY -- that a forecast should
 # not be issued until ten minutes of recording have been observed, independent of filter validity --
 # and that is a decision about what the study claims rather than about the transform. The cost is
-# stated rather than argued: at H = 30 a floor of 150 keeps the IDENTICAL 98 channels, costs one
-# tile (4 against 5 at phase 0), and covers 16 fewer target steps. It buys nothing on the validity
-# axis; it buys the policy.
+# stated rather than argued: a floor of 150 keeps the IDENTICAL channel set (neither the budget nor
+# the alignment moved), withholds 16 anchors, and at the shipped H = 10 / S = 5 tiling costs four
+# tiles at phase 0 (28 against 32). It buys nothing on the validity axis; it buys the policy.
 #
-# The tile cost HALVED when the horizon doubled, and that is arithmetic rather than a saving: the
-# floor still withholds the same 16 steps, but each tile now covers 30 of them instead of 15, so
-# the same withheld span costs fewer whole tiles. The covered-step figure is the one to read.
+# The withheld 16 anchors are the invariant and the tile count is not: the same span costs
+# ceil(16 / S) tiles, so it re-prices with every tiling change (one tile at the old S = 13 or the
+# horizon-partitioning S = 30, two at S = 10, four at the shipped S = 5, which the legacy tiling
+# also used). tests/test_sweep_configs.py
+# pins the current figure so a tiling change fails there rather than quietly re-pricing the arm.
 #
 # The budget and the alignment reference both stay put. The floor is a lower bound rather than an
 # equality, so a higher one is always admissible -- and lowering the budget alongside it would drop

@@ -12,12 +12,12 @@ head-averaged profile is emitted beside them **named as such** rather than as "t
 **Against the attainable ceiling, which is measured rather than assumed.** A distribution over $n$
 outcomes has entropy at most $\log n$, and at anchor $t$ only $\min(t + 1, L)$ lags exist at all,
 so the attainable ceiling is $\operatorname{mean}_t \log \min(t + 1, L)$ over the anchors actually
-scored. On the raw cells that is strictly below $\log L$: their trained anchors start at $30$
-against $L = 91$, so a quarter of them are structurally truncated and a model attending uniformly
+scored. On the raw cells that is strictly below $\log L$: their trained anchors start at a
+warm-up $F < L - 1$, so the first $L - 1 - F$ of them are structurally truncated and a model attending uniformly
 over everything available to it reads as increasingly *concentrated* the earlier the anchor.
 
-**Here it is not, and the difference is the anchor floor.** This cell decodes from $F = 133$ while
-the furthest searched lag is $L - 1 = 90$, so every scored anchor sees the whole lag window and the
+**Here it is not, and the difference is the anchor floor.** This cell decodes from a floor $F \ge L - 1$ (the
+warm-up budget puts it far above the furthest searched lag), so every scored anchor sees the whole lag window and the
 attainable ceiling is exactly $\log L$. That is a property of $F \ge L - 1$ rather than of the
 domain: the floor, ``max_lag`` and ``lag_floor`` move independently, and a ``sweep_floor_*`` arm
 would reintroduce truncation. So both ceilings are still computed and still reported distinctly,
@@ -106,8 +106,9 @@ GROUPED_METRICS: Tuple[str, ...] = VALUE_COLUMNS
 #: $10^{8}$ -- so an exact test fails on arithmetic rather than on geometry.
 #:
 #: $10^{-6}$ discriminates with room to spare. The smallest truncation this could hide is one
-#: anchor of the shipped $137$ seeing $L - 1$ lags instead of $L$, which moves the mean by
-#: $(\log L - \log(L-1))/137 \approx 7 \times 10^{-5}$ -- two orders of magnitude above the bound.
+#: anchor of $A$ seeing $L - 1$ lags instead of $L$, which moves the mean by
+#: $(\log L - \log(L-1))/A$ -- about $7 \times 10^{-5}$ at $A = 137$, $L = 91$: two orders of
+#: magnitude above the bound.
 CEILING_TOLERANCE = 1e-6
 
 
@@ -119,8 +120,8 @@ def truncated_anchor_accounting(geometry: Dict[str, Any], n_lags: int) -> Dict[s
     $t = L - 1$ on. The decoded range is $[F, T_{\mathrm{valid}})$: nothing below the anchor floor
     is decoded at all, and the tail $H$ anchors have no fully observed future to score against.
 
-    At this cell's shipped geometry -- $F = 133$, $T_{\mathrm{valid}} = 285$, $L = 91$ -- the count
-    is **zero**, because the floor already exceeds $L - 1$. The number is derived here rather than
+    Wherever the anchor floor clears the furthest lag, $F \ge L - 1$, the count
+    is **zero**, because no scored anchor is truncated. The number is derived here rather than
     written down, so a ``sweep_floor_*`` arm moves it instead of silently invalidating every
     ceiling read against it.
 

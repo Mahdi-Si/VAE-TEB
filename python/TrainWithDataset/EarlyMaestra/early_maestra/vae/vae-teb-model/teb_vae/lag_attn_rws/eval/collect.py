@@ -1,7 +1,7 @@
 r"""The shared collection pass, and the durable tables every later analysis reads.
 
 One forward over the split is the dominant cost of an evaluation -- four latent branches decoded
-over $H \cdot R = 480$ raw samples per anchor at $K$ Monte Carlo draws -- and almost every
+over $H \cdot R$ raw samples per anchor at $K$ Monte Carlo draws -- and almost every
 analysis wants the same forward. So the pass runs **once**, and what it produces is written down:
 
 * ``per_sample.csv`` -- one row per segment, carrying every scalar readout beside the identity a
@@ -26,7 +26,7 @@ analysis wants the same forward. So the pass runs **once**, and what it produces
 
 **A segment that scored no anchors measured nothing, and its columns are NaN rather than zero.**
 The per-sample mean divides by a denominator clamped to $1$, so an empty numerator reads as
-exactly ``0.0`` -- a fabricated score, not a small one. Averaged into a summed-$480$-sample block
+exactly ``0.0`` -- a fabricated score, not a small one. Averaged into a summed-$H \cdot R$-sample block
 figure of hundreds of nats it drags the headline toward zero and shrinks ``pred_gap`` with no
 other symptom. NaN is the representation that makes every downstream ``mean()`` skip it by
 default, and the exclusions are counted per recording and per subgroup rather than merely
@@ -34,8 +34,8 @@ dropped.
 
 **Heavy quantities, one decision each.** Three things several later analyses want are on neither
 table, and each gets a different treatment rather than a blanket one. Per retained sample at the
-shipped geometry ($T = 300$, $T_{\mathrm{valid}} = 270$, $H = 30$, $R = 16$, $L = 91$, $M = 4$,
-fp32):
+geometry these figures were sized at ($T = 300$, $T_{\mathrm{valid}} = 270$, $H = 30$, $R = 16$,
+$L = 91$, $M = 4$, fp32) -- every figure below scales with a run's own $H$ and anchor count:
 
 * **Per-raw-sample residuals and log-variances** ($T_{\mathrm{valid}} \times H \times R$,
   $506$ KiB per tensor) -- **streamed as an exact accumulator**, resolved by horizon step. What

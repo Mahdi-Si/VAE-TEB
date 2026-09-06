@@ -145,7 +145,7 @@
     },
     "analyses/forecast.py": {
       "state": "divergent",
-      "reason": "The three trivial baselines are rebuilt in feature space on the decimated grid and the horizon curve runs over 30 steps. Every column in a clinical unit is removed rather than repointed -- a wavelet modulus has no clinical unit and inverting the per-channel statistics would put the 98 scored channels on scales spanning orders of magnitude, which destroys the pooled mean squared error and the skill ratio -- so the error table reports the z-unit columns alone. The forecast overlay draws three kept channels against lead time rather than one trace, because what is forecast is an H x C_keep block, and it indexes the retained anchor axis by position rather than by decimated step: this model gathers its anchors, so the floor of 134 is not a valid index into a 136-long axis."
+      "reason": "The three trivial baselines are rebuilt in feature space on the decimated grid and the horizon curve runs over the checkpoint's own H steps. Every column in a clinical unit is removed rather than repointed -- a wavelet modulus has no clinical unit and inverting the per-channel statistics would put the C_keep scored channels on scales spanning orders of magnitude, which destroys the pooled mean squared error and the skill ratio -- so the error table reports the z-unit columns alone. The forecast overlay draws three kept channels against lead time rather than one trace, because what is forecast is an H x C_keep block, and it indexes the retained anchor axis by position rather than by decimated step: this model gathers its anchors, so the anchor floor F is not a valid index into an axis of length anchor_ceiling - F."
     },
     "analyses/lag_kl.py": {
       "state": "divergent",

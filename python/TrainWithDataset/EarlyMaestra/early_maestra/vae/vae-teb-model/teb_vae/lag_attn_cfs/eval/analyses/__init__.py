@@ -25,8 +25,8 @@ layering test forbids ``analyses/*`` from importing Lightning, ``model.*``, or t
 ``task`` / ``trainer`` / ``sample_page``.
 
 One consequence of that rule is load-bearing in this target domain and is easy to trip over. The
-per-channel readouts are indexed on the **98 kept** target channels while the channel-to-band map
-is over the **102 declared** ones, and ``analyses/*`` may not ask ``model.target_gate`` which is
+per-channel readouts are indexed on the **$C_{\mathrm{keep}}$ kept** target channels while the channel-to-band map
+is over the **$c_y$ declared** ones, and ``analyses/*`` may not ask ``model.target_gate`` which is
 which. So the kept-axis map is *persisted* -- the collection pass records ``target_keep_index``,
 ``band_partition`` emits the kept-axis channel map, and ``spectral_skill`` reads that CSV off disk
 -- exactly the file-on-disk dependency ``cross_subgroup`` already has on the per-recording tables

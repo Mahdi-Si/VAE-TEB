@@ -24,7 +24,7 @@ KL it is read beside.
 
 **Everything stays in $z$ units.** There is no conversion out of them and the omission is
 deliberate: a wavelet modulus has no clinical unit, and inverting the per-channel statistics would
-put the $98$ scored channels on scales spanning orders of magnitude -- which is exactly what a
+put the $C_{\mathrm{keep}}$ scored channels on scales spanning orders of magnitude -- which is exactly what a
 single pooled RMS cannot survive.
 
 **Every RMS accumulates unrooted and roots once.** An RMS is the square root of a mean, and by

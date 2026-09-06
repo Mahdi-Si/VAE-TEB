@@ -24,7 +24,7 @@ Every name that appears on an axis, in a legend, in a panel title or in a CSV co
 
 The recording is a fetal heart-rate trace and a uterine-pressure trace, both sampled at 4 Hz, but the model never sees either directly. Both have been passed through a **strictly one-sided** scattering and phase-harmonic transform, so what the model reads and forecasts are 4-second-step **coefficients**: 102 target channels from the heart rate (36 scattering + 66 phase-harmonic) and 51 source channels from the pressure. The warm-up budget drops the four slowest target channels, leaving **98** the decoder emits.
 
-At each anchor $t$ the model forecasts the next **30 steps** — two minutes — of all 98 channels, and it does this **twice**: the **base** forecast, from a belief built out of the target history alone; and the **full** forecast, from a belief that also read the source history. Everything this evaluation reports is some version of *how much better was the second one*.
+At each anchor $t$ the model forecasts the next **$H$ steps** — $4H$ seconds, with $H$ the checkpoint's own `horizon` — of all $C_{\mathrm{keep}}$ kept channels, and it does this **twice**: the **base** forecast, from a belief built out of the target history alone; and the **full** forecast, from a belief that also read the source history. Everything this evaluation reports is some version of *how much better was the second one*.
 
 Two things about the geometry are worth carrying:
 
@@ -40,7 +40,7 @@ Two things about the geometry are worth carrying:
 | `shuffled` | the negative control: the *same* model fed **another recording's** source |
 | `null` | the second control: the same model fed a **zeroed** source stream |
 | `mc_` prefix | **Monte Carlo**: averaged over $K$ latent draws instead of one. The headline form. |
-| `_block` suffix | summed over the whole $15 \times 98 = 2940$-coefficient forecast block, then averaged over anchors |
+| `_block` suffix | summed over the whole $H \times C_{\mathrm{keep}}$-coefficient forecast block (`block_width` in `preflight.json`), then averaged over anchors |
 | `_raw` suffix (on a KL) | **unfloored** — no free-bits floor applied. The only form readable as a rate. |
 | `_sq` suffix | left **unrooted** (a mean square). Its `_rms` partner is the rooted version. |
 
@@ -61,7 +61,7 @@ A **score** here is always a negative log-likelihood: **lower is better**, and i
 | `nll_segment_mean_block` | baseline: predict this segment's own per-channel mean | nats per anchor |
 | `nll_oracle_block` | an evaluation-only decoder reading the encoder state **directly**, bypassing the latent bottleneck | nats per anchor |
 
-**"Nats per anchor" is the unit to internalise.** One score is a sum over all 2940 coefficients of one forecast block, then averaged across the anchors that were scored. So it is a *large* number under every predictor including a perfect one, because it is 2940 terms added up. Its absolute size says nothing; only differences and ratios between predictors are readable. Dividing by 2940 gives a per-coefficient figure, but that is a flat rescale rather than a mean over the coefficients actually scored, so it under-reports on any anchor with masked forecast steps.
+**"Nats per anchor" is the unit to internalise.** One score is a sum over all $H \cdot C_{\mathrm{keep}}$ coefficients of one forecast block, then averaged across the anchors that were scored. So it is a *large* number under every predictor including a perfect one, because it is $H \cdot C_{\mathrm{keep}}$ terms added up. Its absolute size says nothing; only differences and ratios between predictors are readable. Dividing by $H \cdot C_{\mathrm{keep}}$ gives a per-coefficient figure, but that is a flat rescale rather than a mean over the coefficients actually scored, so it under-reports on any anchor with masked forecast steps.
 
 ### Gaps — what the source added
 
@@ -75,11 +75,11 @@ A **score** here is always a negative log-likelihood: **lower is better**, and i
 | `mse_skill` | $1 - \mathrm{MSE}_{\mathrm{model}}/\mathrm{MSE}_{\mathrm{baseline}}$. $1$ = perfect, $0$ = no better than the baseline, negative = worse. | dimensionless |
 | `advantage_nats_per_anchor` | the NLL-space analogue of skill, and a **difference**, not $1 -$ a ratio — a log score has no natural zero | nats per anchor |
 | `pred_gap_rmse_pct`, `pred_gap_mse_pct` | the percentage of the target-only branch's point-forecast error the source removed, rooted and unrooted. **Scale-free.** | percent |
-| `pred_gap_mc_likelihood_pct` | $100(e^{\texttt{mc\_pred\_gap}/2940} - 1)$: the extra probability density the source-informed forecast puts on each observed coefficient. **Budget-local.** | percent |
+| `pred_gap_mc_likelihood_pct` | $100(e^{\texttt{mc\_pred\_gap}/(H \cdot C_{\mathrm{keep}})} - 1)$: the extra probability density the source-informed forecast puts on each observed coefficient. **Budget-local.** | percent |
 
 `pred_gap` and `mc_pred_gap` are two estimators of *one* quantity, not two findings. Wherever both are drawn, their difference is the price of the Monte Carlo marginalisation.
 
-None of the three percentages is `pred_gap` divided by a block score. $D_{\mathrm{base}}$ is a negative log *density* summed over 2940 coefficients: it has no natural zero and is legitimately negative for a sharp forecast, so that ratio would change sign with its own denominator. The two spaces that do have a natural zero are used instead. The likelihood one exists only under `gaussian_nll`, and it divides by the **fixed** 2940 — which is what the warm-up budget decided, so two arms of this model at two budgets divide by two different numbers.
+None of the three percentages is `pred_gap` divided by a block score. $D_{\mathrm{base}}$ is a negative log *density* summed over $H \cdot C_{\mathrm{keep}}$ coefficients: it has no natural zero and is legitimately negative for a sharp forecast, so that ratio would change sign with its own denominator. The two spaces that do have a natural zero are used instead. The likelihood one exists only under `gaussian_nll`, and it divides by the **fixed** $H \cdot C_{\mathrm{keep}}$ — which is what the horizon and the warm-up budget decided, so two arms of this model at two budgets divide by two different numbers.
 
 ### The KL family — how much the belief moved
 
@@ -110,7 +110,7 @@ Four warnings this pipeline repeats because each has cost a result somewhere:
 | `causal_warmup_steps` | per channel: the leading delay, in 4-second steps, before that channel's coefficients are honest |
 | `causal_delay_s` | per channel: the composed one-sided group delay, in seconds. What makes the lag axis coefficient time. |
 | `target_warm_frac` | the fraction of scored anchors at which every kept target channel is warm. Must be exactly $1.0$. |
-| `anchors_per_sample` | anchors decoded per segment. Must be exactly the checkpoint's own `anchor_ceiling - warmup_period` at the dense set: $136$ on the stored forecast clock, $51$ under the shipped `physical` one (the ceiling is $T_{\mathrm{valid}}$ less the clock's largest advance, 85). |
+| `anchors_per_sample` | anchors decoded per segment. Must be exactly the checkpoint's own `anchor_ceiling - warmup_period` at the dense set: $T_{\mathrm{valid}} - F$ on the stored forecast clock, less the clock's largest label advance under a `physical` one (`anchors_per_sample` in `preflight.json` is the expected value). |
 | `source_lag_warmth_frac_st` / `_ph` | the fraction of attention mass landing on lags at which that stored source block is warm. **A small value is the expected finding.** |
 | band | one of `slow_baseline`, `deceleration`, `variability`, `beat_to_beat`, `unknown` — the band of the **analysing filter** that produced the coefficient, not a bin of the forecast's own spectrum |
 | `unknown` | a channel whose centre frequency is not recoverable, because no selected phase-harmonic pair named its filter. Never bucketed into a neighbour. |
@@ -122,9 +122,9 @@ Four warnings this pipeline repeats because each has cost a result somewhere:
 | $T$ | 300 | steps per segment |
 | $H$ | 30 | horizon steps = 2 minutes |
 | $F$ | 134 | anchor floor: nothing below it is decoded at all; $\max(B - 1, \max_c(W'_c + d_c))$ |
-| anchors | 136 | decoded per segment, at the dense set |
+| anchors | `anchor_ceiling - warmup_period` | decoded per segment, at the dense set; `preflight.json` records the run's own |
 | $C_{\mathrm{keep}}$ | 98 | target channels the warm-up budget kept, of 102 declared |
-| $H \cdot C_{\mathrm{keep}}$ | 2940 | coefficients in one forecast block |
+| $H \cdot C_{\mathrm{keep}}$ | `block_width` | coefficients in one forecast block; `preflight.json` records the run's own |
 | $d_z$ | 64 | latent dimensions |
 | $L$ | 91 | lag bins = ~6 minutes of source history |
 | $M$ | 4 | attention heads |
@@ -160,7 +160,7 @@ These have no entry of their own because they are not one figure. Every analysis
 - **climatology** is exactly $0$ per channel, which is the z-scored population mean — and it is a meaningful baseline only because the normalisation statistics were accumulated *excluding* the warm-up region.
 - The baselines are scored at a fixed `BASELINE_LOGVAR = 0.0`, recorded rather than fitted: a point predictor has no variance of its own, and the whole score would otherwise be decided by whatever $\sigma$ it was handed.
 
-**How it is misread.** The block score is a *sum over 2940 coefficients*, so it is large under every predictor and its scale says nothing about the model. Only the comparison is readable. The skill drawn here is the MSE-space one; the NLL-space column beside it in the CSV is a **difference** in nats, not $1 -$ a ratio.
+**How it is misread.** The block score is a *sum over $H \cdot C_{\mathrm{keep}}$ coefficients*, so it is large under every predictor and its scale says nothing about the model. Only the comparison is readable. The skill drawn here is the MSE-space one; the NLL-space column beside it in the CSV is a **difference** in nats, not $1 -$ a ratio.
 
 ## `forecast/anchor_profile.pdf`
 
@@ -212,7 +212,7 @@ A fourth is this cell's own: **a positive gap here is not yet a source finding.*
 
 **Axes.** Percent on every panel; the histogram's height is a count of recordings.
 
-**How it is misread.** The bottom panel is **budget-local**: it divides by $H \cdot C_{\mathrm{keep}} = 2940$, and $C_{\mathrm{keep}}$ is whatever the warm-up budget decided, so it cannot be compared across two arms at two budgets — nor, for that matter, against any other cell of the grid. The two error-space panels are scale-free and do not carry that caveat.
+**How it is misread.** The bottom panel is **budget-local**: it divides by $H \cdot C_{\mathrm{keep}}$, and $C_{\mathrm{keep}}$ is whatever the warm-up budget decided, so it cannot be compared across two arms at two budgets — nor, for that matter, against any other cell of the grid. The two error-space panels are scale-free and do not carry that caveat.
 
 ## `latent/kl_spectrum.pdf`
 

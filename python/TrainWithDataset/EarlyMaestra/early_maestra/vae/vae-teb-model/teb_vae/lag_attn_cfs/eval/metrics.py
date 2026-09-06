@@ -19,7 +19,7 @@ likelihoods, which is a different and larger number.
 
 **The baselines.** Persistence, climatology and the segment's own mean, rebuilt **in feature
 space** (:func:`baseline_forecasts`) and scored through the same loss function over the same mask
-at the same anchors. A summed-$2940$-coefficient block score is a large number under every
+at the same anchors. A summed-$H \cdot C_{\mathrm{keep}}$-coefficient block score is a large number under every
 predictor -- its scale is set by the block, not by the model -- so it is only readable against
 predictors that know nothing. Their observation variance is fixed at $\sigma = 1$ in the loader's
 $z$ units and stated, because under a Gaussian likelihood a point predictor has no variance of its
@@ -47,7 +47,7 @@ cannot check. Ten here against the sibling's eight; the two additions are
 
 One aggregation decision runs through all of it: **quantities are averaged per recording, then
 across recordings.** Anchors are not independent samples of anything -- consecutive anchors'
-forecast windows overlap in $14$ of their $15$ horizon steps at the dense evaluation geometry, and
+forecast windows overlap in $H - 1$ of their $H$ horizon steps at the dense evaluation geometry, and
 a single long recording holds hundreds of them -- so a flat anchor mean weights recordings by their
 length and reports an effective sample size far larger than the data supports. That chain --
 support-weighted within a segment, unweighted over a recording's segments, unweighted across
@@ -81,9 +81,8 @@ would have produced a wrong number rather than an exception:
 Two lag quantities are reported side by side, and they answer different questions. The **raw**
 attribution divides every lag bin by the same anchor support, so it keeps summing to $\bar K$ and
 is the decomposition the identity test pins. The **support-corrected** profile divides each bin by
-its own contributing-anchor count. At the shipped geometry both corrections are inert -- the
-earliest decoded anchor is $F = 133$ against a furthest lag of $L - 1 = 90$, so every lag exists at
-every scored anchor -- and that is a fact to **measure** rather than assume: an arm lowering the
+its own contributing-anchor count. Wherever the anchor floor clears the furthest lag, $F \ge L - 1$,
+both corrections are inert -- every lag exists at every scored anchor -- and that is a fact to **measure** rather than assume: an arm lowering the
 floor below $90$ reintroduces truncation, and these are what would catch it.
 """
 from __future__ import annotations
@@ -500,7 +499,7 @@ def baseline_forecasts(
     r"""Build the three trivial forecasts, each constant over its anchor's block, per channel.
 
     They exist to answer the question a block NLL alone cannot: is the forecast *good*, or merely
-    arithmetically fine? A summed-$2940$-coefficient log-density is a large number under any
+    arithmetically fine? A summed-$H \cdot C_{\mathrm{keep}}$-coefficient log-density is a large number under any
     predictor, so the only readable form of it is a comparison against predictors that know
     nothing.
 
@@ -522,8 +521,8 @@ def baseline_forecasts(
     **Every baseline is built on the gathered kept channels, never on the declared width.** The
     history each reads is ``index_select(target_features, -1, target_gate.keep_index)`` -- the same
     gather ``_build_forecast_target`` applies -- so a baseline block is positionally identical to
-    the target it is scored against. Built on the declared $c_y = 102$ it would be scored against a
-    $98$-channel target on a channel axis that is **not** aligned: the four dropped channels are
+    the target it is scored against. Built on the declared $c_y$ it would be scored against a
+    $C_{\mathrm{keep}}$-channel target on a channel axis that is **not** aligned: the dropped channels are
     interior to the declared order, so the mismatch would be a silent mis-pairing of channels
     wherever the shapes happened to survive rather than a clean shape error.
 
@@ -1023,8 +1022,8 @@ def lag_profiles(
     sample's own KL, and the identity is a pinned property. The corrected form is the per-anchor
     mean each lag actually earned, and sums to nothing in particular.
 
-    **At the shipped geometry the two coincide**, because the earliest decoded anchor is $F = 133$
-    against a furthest lag of $L - 1 = 90$, so every lag is valid at every scored anchor and every
+    **Wherever the anchor floor clears the furthest lag, $F \ge L - 1$, the two coincide**: every
+    lag is then valid at every scored anchor and every
     per-lag count is the common total. Both are still emitted: the equality is a property of this
     floor rather than of the domain, and an arm that lowers it makes them differ again.
 
@@ -1053,8 +1052,8 @@ def untruncated_anchor_mask(
     the short ones, so the short bins are inflated by an amount no per-lag anchor count knows
     about. Restricting the anchor set is what removes that, at the cost of the anchors it drops.
 
-    At the shipped geometry it drops **nothing**: $L = 91$ and the earliest decoded anchor is
-    $F = 133$, so the restriction is a no-op and the restricted profile equals the unrestricted
+    Wherever $F \ge L - 1$ it drops **nothing**: every searched lag is warm at the earliest decoded
+    anchor, so the restriction is a no-op and the restricted profile equals the unrestricted
     one. That is measured rather than assumed -- see ``eval/preflight.py::lag_support`` for the
     margin, and the ``attention`` and ``lag_kl`` analyses for the assertion.
 
@@ -1633,7 +1632,7 @@ def evaluate_batch(
 
     Three latent-free forecasts are scored beside the four -- persistence, climatology and the
     segment mean (:func:`baseline_forecasts`), all in **feature space** -- through the same loss
-    function and the same mask, because a summed-$2940$-coefficient block score is a large number
+    function and the same mask, because a summed-$H \cdot C_{\mathrm{keep}}$-coefficient block score is a large number
     under any predictor and only a comparison says whether the model is good or merely
     arithmetically fine.
 
@@ -2290,7 +2289,7 @@ def aggregate_by_recording(readouts: Sequence[BatchReadout]) -> Aggregate:
             # A segment that scored no anchors -- every anchor gapped or below the coverage
             # floor -- measured nothing. Its columns are not small, they are absent: the
             # per-sample mean divides by a denominator clamped to 1, so an empty numerator
-            # reads as exactly 0.0. Averaging that in would pull a summed-2940-coefficient block
+            # reads as exactly 0.0. Averaging that in would pull a summed-(H*C_keep)-coefficient block
             # score (hundreds of nats) toward zero and shrink pred_gap, with no other symptom.
             if float(readout.n_anchors[position]) <= 0.0:
                 aggregate.n_samples_without_anchors += 1
@@ -2914,8 +2913,8 @@ def anchor_geometry_verdict(
 
     Two exact numbers, and both are structural rather than statistical:
 
-    * ``anchors_per_sample`` must be $\texttt{anchor\_ceiling} - F$ -- $137$ at the shipped
-      stored-clock geometry, less the forecast clock's largest advance on a ``physical`` arm --
+    * ``anchors_per_sample`` must be $\texttt{anchor\_ceiling} - F$ -- $T_{\mathrm{valid}} - F$ on the
+      stored clock, less the forecast clock's largest advance on a ``physical`` arm --
       because the evaluation decodes densely. A different count means the forward ran at the
       *training* tiling, and every number in the run was then computed over a different population
       with nothing else in the summary saying so.
@@ -3435,7 +3434,7 @@ def expected_anchors_per_sample(model: Any) -> int:
         model: The rebuilt net.
 
     Returns:
-        The count, $137$ at the shipped stored-clock geometry.
+        The count, $T_{\mathrm{valid}} - F$ on the stored clock.
     """
     ceiling = getattr(model, "anchor_ceiling", None)
     if ceiling is None:

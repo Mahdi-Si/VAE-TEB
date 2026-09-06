@@ -25,9 +25,10 @@ family where ``ChannelDelay`` does anything. The mask must then move with it:
 :meth:`CausalWarmupInputs._build_adapter` announces $W'_c + d_c$, because a gathered-and-delayed
 channel is honest only once the step index has reached both.
 
-**The anchor tiling.** The forecast cannot begin at the model's own $30$-step warm-up, because the
-slowest kept target channel is not honest until step $134$; and once the floor is that high the
-dense anchor range costs a $(B, 136, H, C)$ tensor five times over for windows that overlap
+**The anchor tiling.** The forecast cannot begin at the model's own short warm-up, because the
+slowest kept target channel is not honest until its own warm-up $B$ has passed; and once the floor
+is that high the dense anchor range costs a $(B, T_{\mathrm{valid}} - F, H, C)$ tensor five times over
+for windows that overlap
 $(H-1)/H$. The forward therefore decodes a *tiled* anchor set,
 
 $$\mathcal A(\varphi) = \{\, F + \varphi + kS \;:\; k \ge 0,\; F + \varphi + kS < T_{\mathrm{valid}} \,\},$$

@@ -3,7 +3,7 @@ r"""What the causal front end's warm-up cost this run, per recording and with in
 Three readings, and they are this cell's own because no other cell in the encoder-by-target grid
 has a channel axis whose members become honest at different times:
 
-* **The forecast gap split by warm-up tertile.** ``pred_gap`` is a sum over the $98$ surviving
+* **The forecast gap split by warm-up tertile.** ``pred_gap`` is a sum over the $C_{\mathrm{keep}}$ surviving
   target channels, and those channels differ enormously in how long their one-sided filter needs
   before its output is a function of the recording rather than of assumed pre-recording history.
   Cutting the gap by that speed says *where* the model's advantage lives: on the fast channels the

@@ -3,7 +3,7 @@ r"""Contraction-conditioned coupling: does the source matter more when the uteru
 One readout, where the raw pipeline's ``events`` has three, and the two that are gone are gone for
 one reason: **they score a bpm waveform**. Deceleration forecasting skill runs a deceleration
 detector over each branch's forecast *block*, and the contraction-triggered response averages that
-block around a trigger. This model's forecast block is $15 \times 98$ wavelet-modulus and
+block around a trigger. This model's forecast block is $H \times C_{\mathrm{keep}}$ wavelet-modulus and
 phase-harmonic coefficients in the loader's $z$ units, and "a deceleration in coefficient space" is
 a new construction rather than a port -- one that would have to define what a deceleration *is* on
 a channel axis with no order and no clinical unit, and then defend the definition. Neither is

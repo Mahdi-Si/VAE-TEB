@@ -9,8 +9,8 @@ forecast, both in bpm, block by block, and the two detections are matched. Two t
 geometry have to be stated rather than discovered:
 
 * The ported detector needs the event to sit at least ``edge_seconds`` from either end of what it
-  is given, so a $480$-sample block ($120\,$s) leaves a $240$-sample usable interior. Half the
-  forecast horizon is not searchable at all, and every rate here is a rate over that interior.
+  is given, so an $H \cdot R$-sample block ($4H$ s) leaves an interior two ``edge_seconds`` shorter.
+  Part of the forecast horizon is not searchable at all, and every rate here is a rate over that interior.
 * Consecutive anchors' blocks overlap in $H - 1$ of their $H$ steps, so one physiological
   deceleration is re-detected once per anchor -- roughly fifteen times over the usable interior.
   An anchor-level hit rate is pseudo-replicated by that factor. **Fixing the horizon step $\tau$
@@ -933,7 +933,7 @@ def _trigger_entry(
     pre = int(round(TRIGGER_BASELINE_S * events.FS_RAW))
     # A trigger needs a full baseline behind it, and an anchor whose block is carried. Anchor $t$'s
     # block is held whole in `blocks`, so the last trigger is the last anchor's own block start:
-    # subtracting the block width instead would discard real contractions in the final two minutes
+    # subtracting the block width instead would discard real contractions in the final horizon
     # whose blocks are entirely in range.
     first_trigger = int(decimation + pre)
     last_trigger = int(decimation * blocks["truth"].shape[0])

@@ -17,7 +17,7 @@ the forward returns for exactly this reason: the figure and the objective read o
 they are two pictures of two models.
 
 **Six rows beyond the sibling's two**, reserved through :data:`CAUSAL_EXTRA_ROWS` and drawn from
-the same stitched tiling, because three of $98$ channels drawn as offset lanes is not a picture of
+the same stitched tiling, because three of $C_{\mathrm{keep}}$ channels drawn as offset lanes is not a picture of
 this forecast. A model that predicts a handful of easy low-frequency coefficients well and the
 rest not at all is indistinguishable, in the lane row and in every scalar the run reports, from
 one that is uniformly mediocre. The six are the truth, the two branches' means, their signed
@@ -498,8 +498,8 @@ def causal_stream_panels(
             warmup = np.zeros(keep_index.size, dtype=int)
         # Plus the gate's own shift, which is the vector the adapter was built at. A gathered and
         # delayed channel is honest only once the step index has reached both, so a staircase drawn
-        # from the warm-up alone would sit up to max_c d_c steps left of the mask below it -- 85 at
-        # this cell's shipped `target_max` reference, 6 at the raw cells' 42.21 s -- and the row
+        # from the warm-up alone would sit up to max_c d_c steps left of the mask below it -- tens of
+        # steps under a slow alignment reference, a handful under a fast one -- and the row
         # would show a zeroed region the drawn boundary said was real. Zero on every unaligned
         # model, where the gate is a pure gather.
         if gate is not None:
@@ -614,8 +614,8 @@ def _tail_anchor(
 ) -> List[int]:
     r"""Append the last decoded anchor when its window reaches past the abutting tiling.
 
-    Under an advancing forecast clock the decodable span is short -- $51$ anchors at the shipped
-    geometry, whose windows cover $80$ scored steps -- and whole non-overlapping windows leave
+    Under an advancing forecast clock the decodable span is short -- $T_{\mathrm{valid}} - \max_c s_c - F$
+    anchors, whose windows cover that span plus $H$ scored steps -- and whole non-overlapping windows leave
     the last $\mathrm{span} \bmod H$ of them undrawn. The final anchor's window is drawn over
     that remainder alone (first writer wins in :func:`_tiled_branch`), so the page shows every
     step any decoded anchor forecast rather than stopping a partial window short.
@@ -652,8 +652,8 @@ def _draw_anchor_overlay(
 
     Two anchor sets are drawn because two exist and they are not the same one. The page is produced
     at the validation resolution -- every valid anchor, at stride $1$ -- which is what makes it
-    reproducible; training decodes $\mathcal A(\varphi) = \{F + \varphi + kS\}$, roughly a
-    fifteenth as many, at a phase derived per segment per epoch. A page showing only the dense set
+    reproducible; training decodes $\mathcal A(\varphi) = \{F + \varphi + kS\}$, about $1/S$
+    as many, at a phase derived per segment per epoch. A page showing only the dense set
     would say nothing about the geometry the gradients were computed at, and one showing only a
     tile grid would be a picture of a phase this page did not draw.
 
@@ -687,8 +687,9 @@ def _draw_anchor_overlay(
             anchor_ceiling * seconds_per_step, color=COLOR_BLUE, linewidth=1.0, linestyle="--",
             label=f"anchor ceiling {anchor_ceiling}",
         )
-    # A rug rather than one line per anchor: at the validation resolution there are 136 of them,
-    # and 136 vertical lines is a shaded band that hides the forecast underneath it.
+    # A rug rather than one line per anchor: at the validation resolution there are T_valid - F of
+    # them, well over a hundred, and that many vertical lines is a shaded band that hides the
+    # forecast underneath it.
     ax.plot(
         decoded * seconds_per_step,
         np.full(decoded.size, low + _RUG_POSITION * (high - low)),
@@ -776,9 +777,8 @@ def _prefix_boxes(
     at the first trained anchor and stops short of the recording's end, so its blank corner is the
     tail; this tiling starts at the anchor floor $F$ and runs to the end, so its blank corner is
     the *prefix*. The prefix is blank by construction rather than by luck -- no anchor exists below
-    $F$, and a floor below either half of the pairing is refused at construction -- and at the
-    shipped geometry it is $134$ of
-    $300$ steps, comfortably the widest empty span on the row.
+    $F$, and a floor below either half of the pairing is refused at construction -- and the warm-up
+    budget puts it deep into the $T$ steps, comfortably the widest empty span on the row.
 
     Args:
         rows: The row inputs, for the geometry the prefix is read off.

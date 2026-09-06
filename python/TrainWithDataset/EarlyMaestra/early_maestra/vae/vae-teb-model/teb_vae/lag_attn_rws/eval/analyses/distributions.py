@@ -1,7 +1,7 @@
 r"""What each metric's distribution over 20-minute segments looks like, cohort by cohort.
 
 Every other analysis in this pipeline reduces to **one value per recording** before it reports
-anything, and for good reason: consecutive anchors' forecast windows overlap in 29 of their 30
+anything, and for good reason: consecutive anchors' forecast windows overlap in $H - 1$ of their $H$
 steps and one GUID contributes up to ~37 segments, so a per-segment $p$-value is anticonservative
 by roughly that factor. What that reduction hides is the *shape* -- whether a cohort's higher mean
 forecast error is a uniform shift, a heavier tail, or a handful of segments the model fails on
@@ -165,7 +165,7 @@ METRICS: Tuple[Metric, ...] = (
     Metric(
         "nll_full_block", "nll_full_block", False, "nats per anchor", None,
         "the source-conditioned block score: accuracy and confidence together, summed over the "
-        "480-sample block",
+        "whole forecast block",
     ),
     # --- Coupling ------------------------------------------------------------
     Metric(

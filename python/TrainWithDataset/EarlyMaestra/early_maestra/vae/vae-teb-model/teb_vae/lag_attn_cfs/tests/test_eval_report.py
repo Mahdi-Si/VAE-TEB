@@ -300,19 +300,21 @@ def test_the_calibration_gain_is_registered_per_coefficient_rather_than_per_raw_
 
 
 def test_the_pred_gap_convention_states_the_block_this_cell_actually_scores() -> None:
-    """A reader of two runs has to know what a nat is per. Here a block is $30 \\times 98 = 2940$
-    coefficients rather than 480 raw samples, and the percentage that divides by it is therefore
-    budget-local -- two arms at two warm-up budgets divide by two different numbers."""
+    """A reader of two runs has to know what a nat is per. Here a block is $H \\cdot C_{\\mathrm{keep}}$
+    coefficients rather than $H \\cdot R$ raw samples, and the percentage that divides by it is
+    therefore budget-local -- two arms at two warm-up budgets divide by two different numbers. The
+    convention names the quantity and the ``preflight.json`` key that records a run's own value
+    rather than any one geometry's number, so it stays true when the horizon or the budget moves."""
     convention = report_seam.PRED_GAP_CONVENTION
 
     assert "H*C_keep" in convention
-    assert "2940" in convention
+    assert "block_width" in convention
     assert "BUDGET-LOCAL" in convention
     assert "bpm" in convention and "no bpm anywhere in this pipeline" in convention
-    # The raw cells' block size appears once, in the clause that says this is not it: a reader
-    # arriving from a raw run has that number in mind and needs it contradicted, not omitted.
-    assert convention.count("480") == 1
-    assert "not a 480-sample raw window" in convention
+    # The raw cells' block appears once, in the clause that says this is not it: a reader arriving
+    # from a raw run has that block in mind and needs it contradicted, not omitted.
+    assert convention.count("H*R") == 1
+    assert "not an H*R-sample raw window" in convention
 
 
 def test_the_convention_travels_inside_the_artifact_rather_than_beside_it() -> None:

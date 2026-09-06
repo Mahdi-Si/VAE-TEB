@@ -287,8 +287,8 @@ PRED_GAP_CONVENTION = (
     "branch at one sampled latent, so that column mixes a source comparison with a "
     "decoding-policy difference and is not a second estimate of pred_gap_mc_nats. "
     "A block here is H*C_keep target coefficients -- H horizon steps by the C_keep channels the "
-    "warm-up budget kept, 30 x 98 = 2940 at the legacy shipped geometry; preflight.json records "
-    "this run's own horizon and target_kept_width -- and not a 480-sample raw window: the "
+    "warm-up budget kept; preflight.json records this run's own horizon, target_kept_width and "
+    "block_width -- and not an H*R-sample raw window: the "
     "forecast is over wavelet-modulus and phase-harmonic coefficients in the loader's z units, "
     "and there is no bpm anywhere in this pipeline. "
     "Three percentage columns restate the same finding as a proportion, each computed per "
@@ -430,7 +430,7 @@ _IDENTITY_LIKELY_CAUSE = (
 #: construction -- and this check is what would notice if a later edit made them two rules again.
 #:
 #: The three warm-up tertiles are on the list for a second reason beside recombination, and it is
-#: this cell's own: they are a **decomposition** of ``pred_gap`` over the 98 kept channels, so
+#: this cell's own: they are a **decomposition** of ``pred_gap`` over the $C_{\mathrm{keep}}$ kept channels, so
 #: they must both average back per anchor (checked here) and sum to ``pred_gap`` over the same
 #: denominator (checked by the ``warmup`` analysis). Only the second makes them three
 #: parts of one number rather than three unrelated readouts; only the first makes each of them a

@@ -15,7 +15,7 @@ $\operatorname{logsumexp}_r \log p_r - \log K$ -- an average of *likelihoods*, n
 likelihoods, which is a different and larger number.
 
 **The baselines.** Persistence, climatology and the segment's own mean, scored through the same
-loss function over the same mask. A summed-$480$-sample block score is a large number under every
+loss function over the same mask. A summed-$H \cdot R$-sample block score is a large number under every
 predictor -- its scale is set by the block, not by the model -- so it is only readable against
 predictors that know nothing. Their observation variance is fixed at $\sigma = 1$ in the loader's
 $z$ units and stated, because under a Gaussian likelihood a point predictor has no variance of its
@@ -42,7 +42,7 @@ cannot check.
 
 One aggregation decision runs through all of it: **quantities are averaged per recording, then
 across recordings.** Anchors are not independent samples of anything -- consecutive anchors'
-forecast windows overlap in $29$ of their $30$ horizon steps, and a single long recording holds
+forecast windows overlap in $H - 1$ of their $H$ horizon steps, and a single long recording holds
 hundreds of them -- so a flat anchor mean weights recordings by their length and reports an
 effective sample size far larger than the data supports. That chain -- support-weighted within a
 segment, unweighted over a recording's segments, unweighted across recordings -- applies to the
@@ -136,7 +136,7 @@ PASS, FAIL, INCONCLUSIVE = "PASS", "FAIL", "INCONCLUSIVE"
 
 #: The trivial forecast baselines, in reporting order. Every one is a *constant* over the anchor's
 #: forecast block, which is what makes them trivial: they say nothing about the shape of the next
-#: two minutes, only about its level.
+#: horizon, only about its level.
 BASELINE_NAMES: Tuple[str, ...] = ("persistence", "climatology", "segment_mean")
 
 #: Every point forecast the run scores, model branches first.
@@ -513,7 +513,7 @@ def baseline_forecasts(
     r"""Build the three trivial forecasts, each constant over its anchor's block.
 
     They exist to answer the question a block NLL alone cannot: is the forecast *good*, or merely
-    arithmetically fine? A summed-$480$-sample log-density is a large number under any predictor,
+    arithmetically fine? A summed-$H \cdot R$-sample log-density is a large number under any predictor,
     so the only readable form of it is a comparison against predictors that know nothing.
 
     * **persistence** -- hold the last *observed* raw sample forward across the whole block.
@@ -688,8 +688,8 @@ def tau_slices(block: torch.Tensor, *, warmup: int) -> torch.Tensor:
 
     This is the construction the whole coherence analysis rests on, and it is what makes a spectral
     reading of the forecast possible at all. Adjacent anchors' forecast *blocks* overlap in $H - 1$
-    of their $H$ steps, so a spectrum taken over blocks would count almost every sample thirty
-    times; and a single $H \cdot R$ block is two minutes, far too short to resolve the frequencies
+    of their $H$ steps, so a spectrum taken over blocks would count almost every sample $H$
+    times; and a single $H \cdot R$ block is $4H$ seconds, far too short to resolve the frequencies
     a fetal heart rate trace is read for. One $\tau$-slice is $A \cdot R$ samples -- $960$ s at the
     shipped geometry -- with every raw sample appearing exactly once.
 
@@ -1570,7 +1570,7 @@ def evaluate_batch(
 
     Three latent-free forecasts are scored beside them -- persistence, climatology and the
     segment mean (:func:`baseline_forecasts`) -- through the same loss function and the same
-    mask, because a summed-$480$-sample block score is a large number under any predictor and
+    mask, because a summed-$H \cdot R$-sample block score is a large number under any predictor and
     only a comparison says whether the model is good or merely arithmetically fine.
 
     The bound-variance diagnostics travel here rather than being left to the trainer's log,
@@ -2078,7 +2078,7 @@ def aggregate_by_recording(readouts: Sequence[BatchReadout]) -> Aggregate:
             # A segment that scored no anchors -- every anchor gapped or below the coverage
             # floor -- measured nothing. Its columns are not small, they are absent: the
             # per-sample mean divides by a denominator clamped to 1, so an empty numerator
-            # reads as exactly 0.0. Averaging that in would pull a summed-480-sample block
+            # reads as exactly 0.0. Averaging that in would pull a summed-(H*R)-sample block
             # score (hundreds of nats) toward zero and shrink pred_gap, with no other symptom.
             if float(readout.n_anchors[position]) <= 0.0:
                 aggregate.n_samples_without_anchors += 1

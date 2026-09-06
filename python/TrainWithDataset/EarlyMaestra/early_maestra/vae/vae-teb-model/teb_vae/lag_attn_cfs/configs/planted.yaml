@@ -61,6 +61,13 @@ model_config:
     c_u: 51
     # The three pinned deltas. See the header.
     max_lag: 90
+    # The horizon and its half-life, PINNED at the values every recorded gate was measured under.
+    # default.yaml moved to H = 10 on 2026-09-05; the shard's planted delay of 45 stored steps
+    # makes the readable band [delta - H, delta - 1] = [15, 44] only at H = 30, so a horizon that
+    # followed the default would move the band this check scores against while the stamp stayed
+    # put. Both twins pin the pair; tests/test_lag_recovery.py asserts it.
+    horizon: 30
+    horizon_weight_halflife_steps: 15.0
     anchor_stride: 1
     likelihood: gaussian_nll
 

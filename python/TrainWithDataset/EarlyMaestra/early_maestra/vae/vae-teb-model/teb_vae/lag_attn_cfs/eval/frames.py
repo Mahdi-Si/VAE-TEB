@@ -28,7 +28,7 @@ Two properties are worth stating, because both are choices:
 **Every value on this chain is in the loader's $z$ units, and there is no conversion anywhere.**
 The forecast target here is $98$ wavelet-modulus and phase-harmonic coefficients, which have no
 clinical unit to convert to, so the raw pipeline's ``to_bpm`` has no analogue here and is removed
-rather than repointed. Inverting the per-channel statistics instead would put the $98$ channels on
+rather than repointed. Inverting the per-channel statistics instead would put the $C_{\mathrm{keep}}$ channels on
 scales spanning orders of magnitude, which destroys every pooled statistic this module computes --
 the mean, the quartiles and the positive fraction alike.
 

@@ -33,14 +33,13 @@ Every one of the six ships with an off-state that is bitwise the comparison mode
 which is what keeps two runs comparable across a divergence about whether a mechanism exists at
 all; only the source reference is a chosen *number* as well as a chosen mechanism.
 
-**The horizon left this list when it stopped being a divergence.** This cell shipped at $H = 15$
-against the comparison model's $30$, and that was its eighth geometry exemption; both now forecast
-two minutes, so the exemption would be a permission that outlived its reason and
-``test_every_declared_parity_exemption_is_a_real_divergence`` would report it. What the move did
-*not* do is make the nats comparable -- the block is $30 \times 98 = 2940$ against $30 \times 78 =
-2340$, because $C_{\mathrm{keep}}$ is what the warm-up budget decides -- and it reversed the sign of
-the margin's retune, which ``test_each_retuned_value_is_a_real_move_with_a_measured_reason``
-records.
+**The horizon is back on this list since 2026-09-05.** This cell shipped at $H = 15$ against the
+comparison model's $30$, then moved to $30$ with it -- at which point the exemption was a permission
+that had outlived its reason and was removed -- and now forecasts $10$ (together with the
+conv-Transformer causal cell, so the encoder edge stays leaf-for-leaf) while the two-sided cell still
+forecasts $30$. Both moves changed the block, which is what the two loss-scale constants are stated
+in, so ``test_each_retuned_value_is_a_real_move_with_a_measured_reason`` asserts the *sign* of each
+retune against the block ratio rather than a direction carried over from an earlier geometry.
 """
 from __future__ import annotations
 
@@ -130,7 +129,7 @@ GEOMETRY_REASON = (
 )
 
 #: Every leaf allowed to differ from the comparison config, with the reason. Anything else differing
-#: is drift, and drift is a confound. Twenty entries and no wildcards: the list names its contents
+#: is drift, and drift is a confound. Twenty-one entries and no wildcards: the list names its contents
 #: so that adding a twenty-first is a decision rather than an omission.
 PARITY_EXEMPT_PATHS: Dict[str, str] = {
     "general_config.tag": "the run tag names the target domain",
@@ -187,15 +186,20 @@ PARITY_EXEMPT_PATHS: Dict[str, str] = {
     "model_config.VAE_model.target_weight_ph": (
         "the second of the pair; see target_weight_st"
     ),
+    "model_config.VAE_model.horizon": (
+        "this cell forecasts 10 steps since 2026-09-05 (with the conv-Transformer causal cell); "
+        "the two-sided cell still forecasts 30"
+    ),
     "advanced_config.trainer.gradient_clip_val": (
-        "RETUNED: re-derived from a 600-step instrumented run at this geometry, where q99 of the "
-        "pre-clip norm is 14181 against the comparison model's 4421 -- this cell averages a LARGER "
-        "summed block over ~4.57 anchors per step rather than ~240"
+        "RETUNED: measured on a 600-step instrumented run at the H = 30 geometry (q99 of the "
+        "pre-clip norm 14181 against the comparison model's 4421 -- this cell averages its block "
+        "over far fewer anchors per step than the dense ~240) and scaled by the block ratio to the "
+        "H = 10 block"
     ),
     "advanced_config.spike_breaker.additive_margin": (
-        "RETUNED: the margin is stated in nats of the summed block, and this block is 2940 "
+        "RETUNED: the margin is stated in nats of the summed block, and this block is 760 "
         "coefficients against 2340; measured against the breaker's own excursion-above-EMA "
-        "statistic rather than against the epoch-to-epoch movement"
+        "statistic at H = 30 and scaled by the block ratio, held under the reachable magnitude"
     ),
     # The six architecture switches and the two training controls this revision added. Every one is
     # a key the comparison model's constructor does not have and its config never carries, so the
@@ -475,16 +479,20 @@ def test_the_shipped_geometry_pairs_the_floor_with_the_budget(shipped):
 
 
 def test_the_anchor_stride_pairs_with_the_forecast_clock(shipped):
-    """The two travel together: the physical clock's ceiling leaves a 51-anchor span, and the
-    stride of 5 is what keeps ~10 training tiles per sample there (A_max = 11). Asserted
-    rather than defaulted, so a clock change that left the stride behind -- 1-2 tiles per sample,
-    silently -- fails here rather than training a different objective. The stored-clock arm
-    restores the horizon-partitioning 30 with its clock."""
+    """The three travel together: the stored clock's ceiling is T_valid = 300 - H, so at H = 10 the
+    anchor span [134, 290) holds 156 anchors, and S = H / 2 = 5 tiles it into 31-32 training tiles
+    per sample. Asserted rather than defaulted, so a horizon change that left the stride or the
+    half-life behind -- a different tile count and a different weight profile, silently -- fails
+    here rather than training a different objective."""
     vae = shipped["model_config"]["VAE_model"]
 
     assert vae["causal_target_forecast_clock"] == "stored"
-    assert vae["anchor_stride"] == 13
-    assert vae["horizon"] == 30
+    assert vae["horizon"] == 10
+    assert vae["anchor_stride"] == 5 == vae["horizon"] // 2
+    assert vae["horizon_weight_halflife_steps"] == 5.0 == vae["horizon"] / 2
+    span = vae["sequence_length"] - vae["horizon"] - vae["warmup_period"]
+    assert span == 156
+    assert -(-span // vae["anchor_stride"]) == 32
 
 
 def test_the_shipped_config_builds_a_decoder_as_wide_as_the_budget_keeps(tmp_path):
@@ -503,7 +511,8 @@ def test_the_shipped_config_builds_a_decoder_as_wide_as_the_budget_keeps(tmp_pat
     assert len(kwargs["target_keep_index"]) == 76
     assert model.decoder_out_channels == 76
     assert model.raw_per_step == 16  # untouched by the width
-    assert model.horizon * model.decoder_out_channels == 2280
+    # 10 x 76: the horizon both cfs cells moved to on 2026-09-05 over the integer operator's survivors.
+    assert model.horizon * model.decoder_out_channels == 760
 
 
 # --------------------------------------------------------------------------------------
@@ -577,25 +586,32 @@ def test_the_two_weights_hold_the_anchor_ratio_the_design_fixes(shipped, sibling
 
 @pytest.mark.parametrize("path", RETUNED_PATHS)
 def test_each_retuned_value_is_a_real_move_with_a_measured_reason(shipped, sibling, path):
-    r"""Both moved, and at this horizon both moved **up** -- which is a change from the one-minute
-    configuration and is the thing to read here.
+    r"""Both moved, and the two move for different reasons, so their signs are asserted separately.
 
     The clip is up for the reason it always was: this cell averages the same objective over roughly
-    a thirtieth of the anchors per step (${\approx}4.57$ tiles against ${\approx}240$ dense
+    an eighth of the anchors per step (${\approx}31$ tiles against ${\approx}240$ dense
     anchors), so the per-step gradient is far noisier whatever the horizon.
 
-    The margin is stated in nats of the summed block, and the block is what the horizon moved. At
+    The margin is stated in nats of the summed block, and the block is what the horizon moves. At
     $H = 15$ it was $1470$ coefficients against the comparison model's $2340$, so the margin shrank;
-    at $H = 30$ it is $2940$ against $2340$, so it grows instead. The sign of this comparison is
-    therefore a direct readout of which side has the larger block, and asserting it pins that the
-    retune followed the block rather than being carried over.
+    at $H = 30$ it was $2940$ against $2340$, so it grew; at the shipped $H = 10$ over $76$ kept
+    channels it is $760$ against $2340$, so it shrinks again. The sign of this comparison is
+    therefore a direct readout of which side has the larger block, and asserting it against the
+    block ratio pins that the retune followed the block rather than being carried over.
     """
     assert float(_get(shipped, path)) != float(_get(sibling, path))
     assert "RETUNED" in PARITY_EXEMPT_PATHS[path]
 
-    # Both up, for two different reasons: the clip because of the anchor count, the margin because
-    # this block is now the larger of the two.
-    assert float(_get(shipped, path)) > float(_get(sibling, path))
+    mine, theirs = shipped["model_config"]["VAE_model"], sibling["model_config"]["VAE_model"]
+    my_block = mine["horizon"] * 76
+    their_block = theirs["horizon"] * theirs["c_y"]
+    if path.endswith("gradient_clip_val"):
+        # Up because of the anchor count, whatever the block.
+        assert float(_get(shipped, path)) > float(_get(sibling, path))
+    else:
+        # The margin follows the block, and the block is currently the smaller of the two.
+        assert my_block < their_block
+        assert float(_get(shipped, path)) < float(_get(sibling, path))
 
 
 @pytest.mark.parametrize("path", MEASURED_TO_MATCH_PATHS)
@@ -870,7 +886,8 @@ def test_the_resolved_tiny_variant_validates_and_builds(tmp_path, loguru_warning
     # included -- the ceiling below is T_valid less the physical clock's 85-step advance.
     assert model.d_model == 32
     assert model.decoder_out_channels == 76
-    assert model.anchor_stride == 13
+    assert model.anchor_stride == 5
+    assert model.horizon == 10
     # The stored clock advances nothing: every anchor up to T_valid is decoded.
     assert model.target_forecast_shift is None
     assert model.anchor_ceiling == model.geometry.t_valid

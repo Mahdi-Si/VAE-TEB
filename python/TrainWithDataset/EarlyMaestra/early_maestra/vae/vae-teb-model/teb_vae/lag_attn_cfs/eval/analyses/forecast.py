@@ -3,7 +3,7 @@ r"""Is the forecast any good, against predictors that know nothing, and where in
 Every other readout in this pipeline is about the *coupling* -- what the source adds. This one is
 about the forecast itself, and it exists because a block score alone cannot answer the question. A
 block score of several hundred nats per anchor is not a number anybody can judge: it is a negative
-log density summed over $H \cdot C_{\mathrm{keep}} = 2940$ coefficients, so it is large under every
+log density summed over $H \cdot C_{\mathrm{keep}}$ coefficients, so it is large under every
 predictor and its scale is set by the block size rather than by the model. Two things make it
 readable, and a third says where in the forecast window the answer holds.
 
@@ -41,8 +41,8 @@ denominator is the per-$\tau$ masked anchor count rather than the per-anchor con
 indicator, which is an ``amax`` over $\tau$ and would count masked late-horizon steps as scored
 zeros -- flattering exactly the horizons that fall in gaps.
 
-**Everything here is per recording**, with one stated exception. Anchors overlap in $14$ of their
-$15$ horizon steps and one recording contributes tens of segments, so every statistic is averaged
+**Everything here is per recording**, with one stated exception. Anchors overlap in $H - 1$ of their
+$H$ horizon steps and one recording contributes tens of segments, so every statistic is averaged
 within a recording first and the bootstrap resamples recordings, never anchors. The exception is
 the anchor profile, which averages the retained segments' per-anchor scores directly -- it is a
 picture of where in the segment the score sits, not a cohort statistic, and `FIGURE_GUIDE.md` says

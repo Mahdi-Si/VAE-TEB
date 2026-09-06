@@ -1,7 +1,7 @@
 r"""What each metric's distribution over 20-minute segments looks like, cohort by cohort.
 
 Every other analysis in this pipeline reduces to **one value per recording** before it reports
-anything, and for good reason: consecutive anchors' forecast windows overlap in 14 of their 15
+anything, and for good reason: consecutive anchors' forecast windows overlap in $H - 1$ of their $H$
 steps and one GUID contributes many segments, so a per-segment $p$-value is anticonservative
 by roughly that factor. What that reduction hides is the *shape* -- whether a cohort's higher mean
 forecast error is a uniform shift, a heavier tail, or a handful of segments the model fails on
@@ -54,11 +54,11 @@ for.
 
 **Nothing here is converted into a clinical unit, and there is no unit to convert into.** The
 sibling pipeline's fourth presentation choice was rooting *and* a $z$-to-bpm conversion, because
-its target is a heart rate and a clinician thinks in heartbeats. This one forecasts $98$
+its target is a heart rate and a clinician thinks in heartbeats. This one forecasts $C_{\mathrm{keep}}$
 wavelet-modulus and phase-harmonic coefficients: there is no bpm for one of them, and inverting
 the loader's per-channel statistics would put the channels on scales spanning orders of magnitude
 -- which would destroy the pooled distribution this analysis is entirely about, since every panel
-here draws one metric pooled over all $98$. So every axis is labelled ``normalised``,
+here draws one metric pooled over all $C_{\mathrm{keep}}$. So every axis is labelled ``normalised``,
 :mod:`~teb_vae.lag_attn_cfs.eval.metrics` exports no conversion to reach for, and
 ``tests/test_eval_units.py`` asserts the absence rather than the repointing.
 """

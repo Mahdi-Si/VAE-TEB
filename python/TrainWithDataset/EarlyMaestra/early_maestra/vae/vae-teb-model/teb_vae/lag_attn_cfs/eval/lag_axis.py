@@ -41,8 +41,8 @@ gets quoted.
 
 This module exists because two analyses draw that axis and a third will. The historical failure
 was exactly this shape: two consumers computed the same quantity their own way, one of them read
-the delay under a name that did not exist, and the two reports of one run disagreed by up to $30$
-steps -- two minutes -- with nothing raising. The conversion itself lives in ``nets/lag_report``
+the delay under a name that did not exist, and the two reports of one run disagreed by up to a
+whole horizon -- $H$ steps -- with nothing raising. The conversion itself lives in ``nets/lag_report``
 and is shared with the training figure; what lives here is the *axis* built from it, and the two
 helpers for laying a per-lag vector alongside that axis.
 

@@ -28,7 +28,7 @@ How it is possible at all
 =========================
 
 Spectral analysis of this forecast was deliberately deferred, for a correct reason: a single
-forecast block is $H \cdot R = 480$ samples at $4\,$Hz, and a Welch window that fits inside it puts
+forecast block is $H \cdot R$ samples at $4\,$Hz, and a Welch window that fits inside it puts
 the whole $[0, 0.04)$ Hz deceleration span into the DC bin that detrending has already removed.
 
 The **$\tau$-slice** answers it. Fixing a horizon step $\tau$ and concatenating over consecutive
@@ -161,7 +161,7 @@ def pooled_for(pooled: Dict[str, np.ndarray], cohort: str) -> Dict[str, np.ndarr
 
 #: The band whose numbers reach the headline. LF is where genuinely forecastable structure lives at
 #: this horizon -- VLF is only four bins wide, MF carries the token-seam frequency, and HF is
-#: mostly beyond what a two-minute forecast can say anything about.
+#: mostly beyond what a horizon-long forecast can say anything about.
 HEADLINE_BAND = "lf"
 
 #: The metrics resolved by cohort. The three that answer different questions: how much of the truth

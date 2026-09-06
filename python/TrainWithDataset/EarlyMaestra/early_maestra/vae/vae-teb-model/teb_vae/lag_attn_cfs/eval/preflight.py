@@ -935,8 +935,8 @@ def check_warmup_budget_matches_checkpoint(
         "target_forecast_reference_s": resolved.target_forecast_reference_s,
         # Where the labels actually sit: the last scored element of the most-advanced channel reads
         # stored step t + H - 1 + max_advance, i.e. Delta (H + max_advance) seconds past the anchor
-        # (460 s under the shipped physical clock, 120 s under stored), which costs the trailing
-        # max_advance anchors: the dense span is T_valid - max_advance - F (51 against 136).
+        # (4 s x (H + max_advance): the horizon plus the clock's largest advance), which costs the
+        # trailing max_advance anchors: the dense span is T_valid - max_advance - F.
         "max_forecast_advance_steps": int(resolved.max_forecast_advance),
         "label_availability_endpoint_s": float(
             SECONDS_PER_STEP * (geometry["horizon"] + resolved.max_forecast_advance)
@@ -1214,8 +1214,8 @@ def lag_support(model: Any) -> Dict[str, Any]:
     $$\texttt{lag\_support\_margin\_steps} = \min_t \mathcal A - (L - 1) - F_u,$$
 
     where $\min_t \mathcal A = F$ is the earliest decoded anchor, $L - 1 = \texttt{max\_lag}$ is the
-    furthest searched lag and $F_u$ is the lag floor. At the shipped configuration it is
-    $133 - 90 - 0 = 43$.
+    furthest searched lag and $F_u$ is the lag floor. At a floor of $133$, $L = 91$ and no lag
+    floor it is $133 - 90 - 0 = 43$.
 
     Everything the per-lag analyses simplify away holds exactly when this is $\ge 0$: the raw
     pipeline's per-lag support correction, its untruncated recomputation over the anchors where every

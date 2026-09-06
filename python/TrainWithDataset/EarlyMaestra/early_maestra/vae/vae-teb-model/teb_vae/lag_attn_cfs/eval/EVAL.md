@@ -32,14 +32,15 @@ the summary. Preflight then refuses the run outright when the merged result cont
 checkpoint.
 
 **The forward is called densely, once per run directory, and that is not the geometry the model was
-trained at.** Training tiles the anchor set — `anchor_stride: 15` on the shipped configuration — for
+trained at.** Training tiles the anchor set — at the configured `anchor_stride`, $H/2$ on the shipped configuration — for
 gradient decorrelation and activation memory, neither of which applies where there is no backward
 pass. The evaluation calls
 `model(y_st, y_ph, u_stream, anchor_phase=0, anchor_stride=1)`, which is exactly what
 `SeqVaeLagAttnCfsTask.resolve_anchor_geometry('test', batch)` returns and therefore what `val` and
 `test` already use, and it decodes **every valid anchor** of every segment — the checkpoint's own
-`anchor_ceiling - warmup_period`: 136 on the stored forecast clock, 51 under the shipped
-`physical` one, whose 85-step largest advance removes the trailing anchors. The training stride is
+`anchor_ceiling - warmup_period`: $T_{\mathrm{valid}} - F$ on the stored forecast clock (156 at the
+shipped $H = 10$, $F = 134$), less the clock's largest label advance under a `physical` one, which
+removes the trailing anchors. The training stride is
 recorded in `run_context` beside the decoded geometry, because a table that did not say which
 geometry it was produced at cannot be read against the training CSV.
 
@@ -711,7 +712,7 @@ attends there is reading what the data offers rather than misbehaving.
 
 **Two geometry guards, and they are the FAIL-able part.** `target_warm_frac` must read exactly $1.0$
 and `anchors_per_sample` exactly the checkpoint's own `anchor_ceiling - warmup_period` at the dense
-set ($136$ on the stored forecast clock, $51$ under the shipped `physical` one), both computed from
+set ($136$ on the stored forecast clock, which the promoted default scores; $51$ under the legacy arm's `physical` one), both computed from
 the checkpoint's own geometry rather than from a constant, so a legitimate arm states its own
 expectation. A value off
 either means the checkpoint predates the constructor's budget-and-floor pairing refusal, or the
@@ -1264,7 +1265,7 @@ sharp forecast, and the ratio therefore changes sign with its own denominator. T
 pipeline emits live in the two spaces that have a natural zero — error space and likelihood space.
 
 **Anchors are not independent, and every statistic is per recording.** Consecutive anchors' forecast
-windows overlap in 14 of their 15 horizon steps and one GUID contributes many segments, so per-segment
+windows overlap in $H - 1$ of their $H$ horizon steps and one GUID contributes many segments, so per-segment
 $p$-values are anticonservative by that factor. The chain is: per anchor → support-weighted mean
 within a segment → unweighted mean over a GUID's segments → across GUIDs. A segment scoring zero
 anchors is excluded and **counted**, never averaged in as `0.0`.
@@ -1365,7 +1366,7 @@ catch, because nobody notices a paragraph that was never written.
 - **`analyses/cross_subgroup.py`** (*divergent*) METRIC_SOURCES gains the cfs-only per-recording CSVs -- the warm-up tertiles, the source-null difference and the band-resolved skill.
 - **`analyses/distributions.py`** (*divergent*) Eight metrics with every conversion out of z units removed; the unit is the loader's z units, labelled normalised.
 - **`analyses/events.py`** (*divergent*) One readout of three. Contraction detection and seconds_since_contraction port unchanged and contraction-conditioned coupling with them; deceleration forecast skill and the contraction-triggered response are removed, because both score a clinical heart-rate trace in beats per minute.
-- **`analyses/forecast.py`** (*divergent*) The three trivial baselines are rebuilt in feature space on the decimated grid and the horizon curve runs over 30 steps. Every column in a clinical unit is removed rather than repointed -- a wavelet modulus has no clinical unit and inverting the per-channel statistics would put the 98 scored channels on scales spanning orders of magnitude, which destroys the pooled mean squared error and the skill ratio -- so the error table reports the z-unit columns alone. The forecast overlay draws three kept channels against lead time rather than one trace, because what is forecast is an H x C_keep block, and it indexes the retained anchor axis by position rather than by decimated step: this model gathers its anchors, so the floor of 134 is not a valid index into a 136-long axis.
+- **`analyses/forecast.py`** (*divergent*) The three trivial baselines are rebuilt in feature space on the decimated grid and the horizon curve runs over the checkpoint's own H steps. Every column in a clinical unit is removed rather than repointed -- a wavelet modulus has no clinical unit and inverting the per-channel statistics would put the C_keep scored channels on scales spanning orders of magnitude, which destroys the pooled mean squared error and the skill ratio -- so the error table reports the z-unit columns alone. The forecast overlay draws three kept channels against lead time rather than one trace, because what is forecast is an H x C_keep block, and it indexes the retained anchor axis by position rather than by decimated step: this model gathers its anchors, so the anchor floor F is not a valid index into an axis of length anchor_ceiling - F.
 - **`analyses/lag_kl.py`** (*divergent*) All three profiles are kept -- raw, support-corrected and untruncated -- and the analysis MEASURES the truncation rather than asserting it inert: it reads preflight's own lag_support_margin_steps, measures the per-lag contributing-anchor counts, compares the three profiles, and records whether the computed and observed readings agree. The axis is relabelled stored-coefficient time and the group-delay caveat travels on every artifact that states a lag position and under the figure.
 - **`analyses/latent.py`** (*equivalent*) Behaviour-equivalent to the sibling module, exercised by `test_eval_sibling_agreement.py::test_the_latent_spectrum_is_laid_out_the_same_way_in_both_packages`, `test_eval_sibling_agreement.py::test_the_latent_diagnostics_are_the_same_thirteen_reductions_in_both_packages`, `test_eval_sibling_agreement.py::test_the_only_gloss_that_differs_is_the_one_naming_this_target_domains_unit`.
 - **`analyses/perm_control.py`** (*equivalent*) Behaviour-equivalent to the sibling module, exercised by `test_eval_sibling_agreement.py::test_the_specificity_outcome_is_named_the_same_way_in_both_packages`, `test_eval_sibling_agreement.py::test_the_three_paired_controls_keep_the_same_sign_convention_in_both_packages`, `test_eval_sibling_agreement.py::test_the_branch_summary_and_the_kl_description_agree_in_both_packages`.
