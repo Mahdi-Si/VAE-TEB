@@ -1,0 +1,9 @@
+# Generated run artifacts. A run directory holds extracted latents, a pilot checkpoint, metrics,
+# figures and the measured report -- outputs of an execution machine, not source. The committed
+# YAML templates under configs/ are source and are deliberately NOT covered by this file.
+runs/
+cache/
+tests/fixtures/generated/
+
+__pycache__/
+*.pyc
