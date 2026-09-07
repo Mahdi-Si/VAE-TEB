@@ -51,6 +51,8 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 
+from teb_vae.lag_attn.figure_primitives import sample_cell_edges
+
 from teb_vae.lag_attn_cfs.eval import figures_seam as figures
 from teb_vae.lag_attn_cfs.eval.frames import (
     describe,
@@ -498,7 +500,7 @@ def build_heatmap_figure(
         # Bin edges on the lag axis: L cells centred on ``seconds`` span half a step past
         # both ends, and an extent from centre to centre drifts every mid-axis lag.
         extent=(
-            (0.0, steps * step_seconds,
+            (*sample_cell_edges(steps, step_seconds),
              float(seconds[0]) - SECONDS_PER_STEP / 2.0,
              float(seconds[-1]) + SECONDS_PER_STEP / 2.0)
             if seconds.size

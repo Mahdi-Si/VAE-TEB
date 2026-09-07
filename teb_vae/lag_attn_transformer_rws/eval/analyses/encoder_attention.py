@@ -52,6 +52,7 @@ from teb_vae.lag_attn_rws.eval._reuse import labels
 from teb_vae.lag_attn_rws.eval.cohort import ordered_groups
 from teb_vae.lag_attn_rws.eval.frames import grouped_frame_entry, per_recording_means
 from teb_vae.lag_attn.nets.lag_report import SECONDS_PER_STEP
+from teb_vae.lag_attn.figure_primitives import sample_cell_edges
 from teb_vae.lag_attn_transformer_rws.eval.encoder_attention import (
     POOLED_CLASS,
     REACH_QUANTILES,
@@ -543,9 +544,9 @@ def build_heatmap_figure(result: Any) -> Any:
     """
     panels = sorted(result.heatmaps)
     figure, axes = figures.new_figure(max(len(panels), 1))
-    span = float(result.seq_len * SECONDS_PER_STEP)
     for position, key in enumerate(panels):
         stream, block = key
+        left, right = sample_cell_edges(result.seq_len, SECONDS_PER_STEP)
         figures.heatmap_with_colorbar(
             figure, axes[position, 0], np.asarray(result.heatmaps[key], dtype=np.float64),
             title=f"{stream} encoder, block {block}: one segment's attention, head-averaged",
@@ -553,7 +554,7 @@ def build_heatmap_figure(result: Any) -> Any:
             ylabel="anchor step t (s)",
             symmetric=False,
             colorbar_label="attention weight",
-            extent=(0.0, span, span, 0.0),
+            extent=(left, right, right, left),
             interpolation="none",
         )
     return figure

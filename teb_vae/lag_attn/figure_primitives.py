@@ -103,9 +103,10 @@ def kld_per_dim_np(
 def time_axes(T: int, R: int, fs_raw: float = 4.0) -> Tuple[np.ndarray, np.ndarray, float]:
     """Return ``(time_raw_sec, time_dec_sec, t_max_sec)`` for unified alignment.
 
-    All diagnostic rows share a single physical-time axis. The raw FHR/UP trace lives on
+    All diagnostic rows share a stored-timestamp axis. The raw FHR/UP trace lives on
     ``time_raw`` (step ``1/fs_raw``); decimated features and latents live on ``time_dec`` (step
-    ``t_max / T``). The imshow ``extent`` and every ``ax.set_xlim`` call use ``(0.0, t_max_sec)``.
+    ``t_max / T``). Axis limits use ``(0.0, t_max_sec)``; image edges come from
+    :func:`sample_cell_edges` so cell centres coincide with the line timestamps.
 
     Args:
         T: Number of decimated steps (e.g. 300).
@@ -121,6 +122,36 @@ def time_axes(T: int, R: int, fs_raw: float = 4.0) -> Tuple[np.ndarray, np.ndarr
     time_raw = np.arange(R, dtype=np.float64) / float(fs_raw)
     time_dec = np.arange(T, dtype=np.float64) * (t_max / float(T))
     return time_raw, time_dec, t_max
+
+
+def sample_cell_edges(
+    count: int, spacing: float, *, first: float = 0.0
+) -> Tuple[float, float]:
+    r"""Return image edges for uniformly spaced sample centres.
+
+    For centres $x_i=x_0+i\Delta$, the edges are
+    $x_0-\Delta/2$ and $x_0+(N-1/2)\Delta$. Using the recording's interval
+    endpoints as image edges instead moves every cell centre by half a sample.
+    This helper changes display coordinates only, not signal or model indexing.
+
+    Args:
+        count: Positive number $N$ of samples along the image axis.
+        spacing: Positive finite centre spacing $\Delta$, in the axis's units.
+        first: Finite coordinate $x_0$ of the first sample centre, including any crop.
+
+    Returns:
+        The left and right edges, in the same units as the spacing and first centre.
+        A single sample occupies one full cell of width $\Delta$.
+
+    Raises:
+        ValueError: If the sample count is not a positive integer, the spacing is
+            not positive and finite, or the first coordinate is not finite.
+    """
+    if count < 1 or int(count) != count:
+        raise ValueError(f"count must be a positive integer, got {count!r}")
+    if not np.isfinite(spacing) or spacing <= 0.0 or not np.isfinite(first):
+        raise ValueError("spacing must be positive and finite, and first must be finite")
+    return float(first - spacing / 2.0), float(first + (count - 0.5) * spacing)
 
 
 # =============================================================================

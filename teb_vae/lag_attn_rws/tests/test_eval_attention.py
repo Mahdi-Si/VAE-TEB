@@ -270,8 +270,8 @@ def test_the_heatmap_uses_no_interpolation_and_the_compensated_lag_axis() -> Non
 
     assert interpolation == "none"
     # The y extent is the compensated lag axis, which at a delay of 30 starts at 4*30 seconds.
-    assert extent[2] == pytest.approx(float(lag_compensated_seconds(0, delay_steps=30)))
-    assert extent[3] == pytest.approx(float(lag_compensated_seconds(8, delay_steps=30)))
+    assert extent[2] == pytest.approx(float(lag_compensated_seconds(0, delay_steps=30)) - 2.0)
+    assert extent[3] == pytest.approx(float(lag_compensated_seconds(8, delay_steps=30)) + 2.0)
 
 
 def test_the_heatmaps_lag_axis_is_not_upside_down() -> None:
