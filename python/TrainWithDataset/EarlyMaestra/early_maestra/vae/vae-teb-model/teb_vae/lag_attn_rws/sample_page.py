@@ -89,6 +89,7 @@ from teb_vae.lag_attn.figure_primitives import (  # noqa: E402
     attach_lag_seconds_axis,
     concat_single_forecasts,
     safe_vabs,
+    sample_cell_edges,
     shade_warmup,
     time_axes,
     to_numpy,
@@ -144,7 +145,7 @@ _HEADER_INCHES = 0.75
 #: a FLOOR on the fractional margin, which is what keeps every full-length page byte-identical:
 #: at fifteen rows the existing 3% is 1.44 in and already wider than this, and only a short page
 #: -- where 3% is under half an inch and the caveat lands on top of the axis label -- is moved.
-_FOOTER_INCHES = 1.05
+_FOOTER_INCHES = 1.3
 
 #: Interpolation for every heatmap on the page. ``'none'`` rather than matplotlib's default
 #: ``'antialiased'``: a resampled heatmap invents intermediate values between two anchors or two
@@ -372,9 +373,10 @@ def _input_stream_row(
     # Channel $0$ at the **top** -- see :func:`top_down_extent`. Nothing else on the row moves:
     # the dividers, the block ticks and the staircase below are all in channel coordinates, and
     # only the direction of the axis changes.
+    time_left, time_right = sample_cell_edges(values.shape[0], seconds_per_step)
     image = ax.imshow(
         values.T, aspect="auto", cmap="viridis", origin="upper",
-        vmin=low, vmax=high, extent=top_down_extent(0.0, t_max, n_channels),
+        vmin=low, vmax=high, extent=top_down_extent(time_left, time_right, n_channels),
         interpolation=_IMSHOW_INTERPOLATION,
     )
 
@@ -979,7 +981,7 @@ def build_diagnostic_figure(
 
             Returns:
                 ``(cut, stop_seconds)`` -- the surviving columns and the second the last one ends at,
-                which is the right edge of the ``imshow`` extent that draws them.
+                which is an interval endpoint, not the right edge of a sample-centred image.
             """
             stop = t_valid if drop_tail else t_steps
             return values[warmup:stop], (tail_sec if drop_tail else t_max)
@@ -1001,7 +1003,10 @@ def build_diagnostic_figure(
             Returns:
                 The image, for the caller's colorbar.
             """
-            trained, stop_sec = trained_columns(values, drop_tail=drop_tail)
+            trained, _ = trained_columns(values, drop_tail=drop_tail)
+            time_left, time_right = sample_cell_edges(
+                trained.shape[0], seconds_per_step, first=warmup_sec
+            )
             colormap: Any = cmap
             if norm is not None:
                 # A log normaliser masks the non-positive cells, and on an attention panel a
@@ -1011,7 +1016,7 @@ def build_diagnostic_figure(
                 colormap = matplotlib.colormaps[cmap].with_extremes(bad=COLOR_LIGHT_GRAY)
             image = ax.imshow(
                 trained.T, aspect="auto", cmap=colormap, origin="lower", norm=norm,
-                extent=[warmup_sec, stop_sec, -0.5, n_lags - 0.5],
+                extent=[time_left, time_right, -0.5, n_lags - 0.5],
                 interpolation=_IMSHOW_INTERPOLATION,
             )
             ax.set_title(title, fontsize=9, pad=6)
@@ -1083,13 +1088,17 @@ def build_diagnostic_figure(
             ax, cax = row_axes("latent")
             # Stacked time-first so the cut below is one slice of one axis, then transposed
             # for imshow.
-            latent_stack, latent_stop = trained_columns(
+            latent_stack, _ = trained_columns(
                 np.concatenate([mu_prior_np, delta_mu_np], axis=1), drop_tail=True
             )
             vabs = safe_vabs(latent_stack)
+            time_left, time_right = sample_cell_edges(
+                latent_stack.shape[0], seconds_per_step, first=warmup_sec
+            )
             image = ax.imshow(
                 latent_stack.T, aspect="auto", cmap="bwr", origin="upper",
-                vmin=-vabs, vmax=vabs, extent=[warmup_sec, latent_stop, 2 * d_z - 0.5, -0.5],
+                vmin=-vabs, vmax=vabs,
+                extent=[time_left, time_right, 2 * d_z - 0.5, -0.5],
                 interpolation=_IMSHOW_INTERPOLATION,
             )
             ax.axhline(d_z - 0.5, color="white", linewidth=1.2, linestyle="--")
@@ -1108,7 +1117,10 @@ def build_diagnostic_figure(
         # ---- Row: per-dimension KL --------------------------------------------
         if "kld_dims" in included:
             ax, cax = row_axes("kld_dims")
-            kld_dims_trained, kld_dims_stop = trained_columns(kld_dims_np, drop_tail=True)
+            kld_dims_trained, _ = trained_columns(kld_dims_np, drop_tail=True)
+            time_left, time_right = sample_cell_edges(
+                kld_dims_trained.shape[0], seconds_per_step, first=warmup_sec
+            )
             # Top-down, matching the ``latent`` row directly above and every other channel axis on
             # the page: both rows are indexed by the same latent dimension $d$, and drawing
             # $d = 0$ at the top on one and at the bottom on the other makes the two rows
@@ -1116,7 +1128,7 @@ def build_diagnostic_figure(
             # ``origin='upper'`` so the axis flips rather than the data -- see its docstring.
             image = ax.imshow(
                 kld_dims_trained.T, aspect="auto", cmap="magma", origin="upper",
-                extent=top_down_extent(warmup_sec, kld_dims_stop, d_z),
+                extent=top_down_extent(time_left, time_right, d_z),
                 interpolation=_IMSHOW_INTERPOLATION,
             )
             ax.set_title(

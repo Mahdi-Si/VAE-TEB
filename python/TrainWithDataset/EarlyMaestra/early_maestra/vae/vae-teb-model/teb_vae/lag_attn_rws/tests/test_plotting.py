@@ -218,7 +218,9 @@ def test_the_untrained_anchors_are_cut_from_the_maps_rather_than_shaded_over(tas
         for prefix, (left, right, columns) in expected.items():
             ax = _axes_titled(figure, prefix)
             image = ax.images[0]
-            assert image.get_extent()[:2] == pytest.approx((left, right)), prefix
+            assert image.get_extent()[:2] == pytest.approx(
+                (left - step / 2.0, right - step / 2.0)
+            ), prefix
             assert image.get_array().shape[1] == columns, prefix
             # One grey span per margin the row leaves empty, so a blank strip reads as "cut
             # deliberately" rather than as a panel that failed to draw.

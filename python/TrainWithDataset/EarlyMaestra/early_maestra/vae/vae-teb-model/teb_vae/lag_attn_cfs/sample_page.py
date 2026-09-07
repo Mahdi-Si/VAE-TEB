@@ -116,6 +116,7 @@ from teb_vae.lag_attn.figure_primitives import (  # noqa: E402
     COLOR_ORANGE,
     COLOR_VERMILLION,
     select_forecast_channels,
+    sample_cell_edges,
     time_axes,
     to_numpy,
 )
@@ -846,6 +847,9 @@ def _field_row(
     """
     ax, cax = rows.row_axes(row_name)
     n_channels = int(stitched.keep.size)
+    time_left, time_right = sample_cell_edges(
+        field.shape[0], rows.t_max / float(rows.geometry.t)
+    )
     image = ax.imshow(
         field.T,
         aspect="auto",
@@ -853,7 +857,7 @@ def _field_row(
         origin="upper",
         vmin=limits[0],
         vmax=limits[1],
-        extent=top_down_extent(0.0, rows.t_max, n_channels),
+        extent=top_down_extent(time_left, time_right, n_channels),
         interpolation=_IMSHOW_INTERPOLATION,
     )
 

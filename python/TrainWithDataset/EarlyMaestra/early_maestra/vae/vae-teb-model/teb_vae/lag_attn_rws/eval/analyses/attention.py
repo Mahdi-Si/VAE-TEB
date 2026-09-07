@@ -38,6 +38,8 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 
+from teb_vae.lag_attn.figure_primitives import sample_cell_edges
+
 from teb_vae.lag_attn_rws.eval import figures_seam as figures
 from teb_vae.lag_attn_rws.eval.frames import (
     describe,
@@ -406,7 +408,8 @@ def build_heatmap_figure(
         symmetric=False,
         colorbar_label="attention weight",
         extent=(
-            (0.0, steps * step_seconds, float(seconds[0]), float(seconds[-1]))
+            (*sample_cell_edges(steps, step_seconds),
+             *sample_cell_edges(n_lags, step_seconds, first=float(seconds[0])))
             if seconds.size
             else None
         ),
