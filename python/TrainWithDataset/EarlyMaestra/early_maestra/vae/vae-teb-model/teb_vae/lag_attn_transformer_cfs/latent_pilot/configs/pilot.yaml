@@ -1,0 +1,107 @@
+# Production configuration for the latent-class fine-tuning pilot.
+#
+# WHAT TO FILL IN: the five entries under `paths` marked REPOINT_ME, and -- where they exist -- the
+# optional entries under `provenance`. Nothing else has to be edited to run the experiment; every
+# other setting already carries the declared protocol value, and the commented block at the bottom
+# shows what those values are. A commented line is not a setting: uncomment one only to depart from
+# the protocol, and record the reason.
+#
+# The alternative to editing this file is the `overrides` block of RUN_ARGS in run.py, which takes
+# the same nested keys and wins over what is written here.
+#
+# Relative paths resolve against the REPOSITORY ROOT, never the working directory, so this file
+# works unchanged from an IDE Run button. Absolute paths pass through untouched, which is what the
+# checkpoint, the statistics file and the shards will be on the execution machine.
+#
+# WHERE A RUN WRITES: `<run_root>/<fold>/seed_<seed>/<run_id>/`, and nowhere else -- a run root
+# resolving outside this package is refused. That directory holds the protocol and stage state, the
+# cohort tables, the extracted latents and the frozen scaler, the fits and the pilot checkpoint, the
+# selection lock, the metrics and per-recording tables, the figures and `report.md`. The full list
+# is in the design document's execution guide.
+#
+# Nothing here may reconfigure the checkpoint. The architecture, the channel contract, the trim, the
+# forecast clock, the horizon, the latent width and the anchor stride are read from the checkpoint's
+# own saved kwargs and the resolved config beside it; this file carries no key for any of them, and
+# an added one is refused as unknown rather than silently ignored.
+
+latent_pilot:
+  # Declared before extraction. Both appear in the run directory, so a second fold or a second seed
+  # cannot land on top of this one.
+  fold: fold_1
+  seed: 42
+
+  # null chooses cuda:0 when available and cpu otherwise. RUN_ARGS["device"] overrides this.
+  device: null
+
+  paths:
+    # REPOINT_ME: the pretrained checkpoint to adapt. It is opened read-only and never rewritten;
+    # the adapted weights are saved separately inside the run directory.
+    checkpoint: null
+    # REPOINT_ME: the statistics file the checkpoint was trained under. A different one mis-scales
+    # every input and invalidates the comparison, so it is a required setting rather than a default.
+    statistics: null
+    # REPOINT_ME: the fold's three splits, as lists of HDF5 shards. They are fixed splits and must
+    # be disjoint -- a shard in two lists is refused. Keep the canonical subgroup basenames
+    # (healthy_bg_cs, acidosis_no_cs, hie_cs, ...), which is how each shard's subgroup is recovered.
+    train_shards: []
+    val_shards: []
+    test_shards: []
+    # Where runs are written. Must stay inside the pilot package.
+    run_root: teb_vae/lag_attn_transformer_cfs/latent_pilot/runs
+
+  provenance:
+    # Optional, and worth supplying if they exist: text files listing the GUIDs the checkpoint was
+    # pretrained on and selected on. Left null, exposure of the test population is recorded as
+    # UNKNOWN -- which is not the same statement as "disjoint", and blocks a clean-holdout claim.
+    pretraining_guids: null
+    selection_guids: null
+    # Optional GUID -> patient/delivery mapping. Left null, grouping is GUID-only and the bootstrap
+    # resamples GUIDs; the report discloses that repeated recordings of one patient may then be
+    # treated as independent.
+    patient_map: null
+    # Free text naming the population the statistics file was fitted on. Recorded verbatim, never
+    # inferred from the filename.
+    statistics_population: null
+
+# ---------------------------------------------------------------------------------------------
+# The rest of the protocol, shown at its default value. These lines are COMMENTED OUT on purpose:
+# the defaults live in config.py, and a copy of them here would go stale the day one changed while
+# still looking authoritative. Uncomment a key only to depart from the declared protocol.
+#
+#   figure_format: pdf               # any filetype the installed matplotlib writes, e.g. png
+#   windows:
+#     supervised_hours: 1.0            # the supervised bag: the final hour before delivery
+#     preservation_hours: 3.0          # teacher preservation and trajectory support
+#     bin_hours: 0.5                   # six fixed half-hour trajectory bins over three hours
+#     early_window_hours: [2.0, 3.0]   # early half of the paired within-recording comparison
+#     segment_span_seconds: null       # null derives the stored segment span from the shards
+#   eligibility:
+#     min_late_segments: 2             # contributing segments required inside the final hour
+#     final_anchor_within_minutes: 30.0
+#   bag:
+#     halflife_hours: 0.5              # recency weighting inside the supervised hour
+#   optim:
+#     mean_head_lr: 0.0001             # posterior mean-output layers
+#     classifier_lr: 0.001             # the linear binary classifier
+#     weight_decay: 0.0001
+#     grad_clip: 1.0
+#     recordings_per_class: 4          # the batch is twice this: 4 per binary class
+#     max_epochs: 10
+#     patience: 3                      # epochs without improved eligible validation AUROC
+#     classification_weight: 1.0
+#     preservation_weight: 0.1
+#   baseline:
+#     lr: 0.001
+#     max_steps: 2000                  # a finite, logged budget for the cached-vector fit
+#     patience: 20
+#   gates:
+#     forecast_mse_max_increase: 0.10  # at most +10% full-branch forecast MSE over baseline
+#     saturation_max_increase_pp: 5.0  # at most +5 percentage points of posterior-delta saturation
+#     subset_recordings: 24            # validation recordings the gate is measured on, drawn once
+#   bootstrap:
+#     resamples: 1000                  # outcome-stratified GUID resamples
+#   mc:
+#     draws: 8                         # common random draws for the matched-policy NLL
+#     large_draws: null                # null skips the larger-draw convergence check
+#   prior_probe: true                  # the frozen mu_prior probe; required for any claim that the
+#                                      # combined branch helps, so switching it off drops that claim
