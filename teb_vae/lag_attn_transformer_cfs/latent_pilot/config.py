@@ -730,19 +730,18 @@ def _assign(settings: Dict[str, Any], path: str, value: Any) -> None:
     node[parts[-1]] = value
 
 
-def require_inputs(settings: Mapping[str, Any], stages: Sequence[str]) -> None:
-    """Refuse before anything runs if a requested stage's inputs are missing.
+def missing_inputs(settings: Mapping[str, Any], stages: Sequence[str]) -> List[str]:
+    """Which of a stage set's inputs are unset or absent, described one per line.
 
-    Every missing setting is collected and reported together: an operator filling in four paths
-    should learn that in one message rather than in four runs.
+    Split out from :func:`require_inputs` so a caller that can *fix* the absence -- the smoke
+    stage, whose fixtures it writes itself -- can ask the question without catching the refusal.
 
     Args:
         settings: The resolved settings.
         stages: The stages about to run.
 
-    Raises:
-        PilotConfigError: If a stage needs a setting that is unset, empty, or names a file that is
-            not there. The message names the dotted setting, never only the file.
+    Returns:
+        One line per problem, each naming the dotted setting. Empty when every input is present.
     """
     needed: List[str] = []
     for stage in stages:
@@ -762,14 +761,31 @@ def require_inputs(settings: Mapping[str, Any], stages: Sequence[str]) -> None:
         for item in value if isinstance(value, list) else [value]:
             if not Path(item).exists():
                 problems.append(f"  {PILOT_KEY}.{name} names {item!r}, which does not exist.")
+    return problems
 
+
+def require_inputs(settings: Mapping[str, Any], stages: Sequence[str]) -> None:
+    """Refuse before anything runs if a requested stage's inputs are missing.
+
+    Every missing setting is collected and reported together: an operator filling in four paths
+    should learn that in one message rather than in four runs.
+
+    Args:
+        settings: The resolved settings.
+        stages: The stages about to run.
+
+    Raises:
+        PilotConfigError: If a stage needs a setting that is unset, empty, or names a file that is
+            not there. The message names the dotted setting, never only the file.
+    """
+    problems = missing_inputs(settings, stages)
     if problems:
         raise PilotConfigError(
             "the requested stage(s) "
             f"{', '.join(repr(stage) for stage in stages)} cannot run:\n"
             + "\n".join(problems)
-            + "\n'tests' and 'smoke' need none of these and can be run on a checkout with no "
-            "clinical data on it."
+            + "\n'tests' needs none of these, and 'smoke' writes its own non-clinical fixtures, "
+            "so both run on a checkout carrying no clinical data at all."
         )
 
 
