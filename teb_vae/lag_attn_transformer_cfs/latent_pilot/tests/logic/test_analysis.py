@@ -198,6 +198,9 @@ def test_a_band_is_reported_per_group_and_bin_with_the_count_it_rests_on():
 
     assert len(bands) == 4
     assert set(bands["n_recordings"]) == {6}
+    # Text, so the outcome grouping and the class grouping can share one table -- and one parquet
+    # file, which is what the evaluate stage writes them to.
+    assert bands["group"].map(type).eq(str).all()
     assert bands[bands[data.BIN_COLUMN] == 0]["supervised_window"].all()
     assert not bands[bands[data.BIN_COLUMN] == 3]["supervised_window"].any()
     for _index, row in bands.iterrows():

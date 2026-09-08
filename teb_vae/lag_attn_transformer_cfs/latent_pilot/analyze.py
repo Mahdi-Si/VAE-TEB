@@ -221,7 +221,8 @@ def group_bands(
 
     Returns:
         One row per ``(group, bin)``: the mean, the band, the recording count and whether the bin
-        lies inside the supervised window.
+        lies inside the supervised window. ``group`` is text in every case, because one table holds
+        the bands of both groupings and the column has to have a single type.
     """
     inside = set(int(value) for value in supervised)
     rows: List[Dict[str, Any]] = []
@@ -233,7 +234,11 @@ def group_bands(
             values, confidence=confidence, resamples=resamples, seed=seed
         )
         rows.append({
-            "group": group,
+            # As text, whatever the grouping column holds. ``stage_evaluate`` stacks the outcome
+            # grouping (0/1) and the class grouping ("healthy", "acidosis", "hie") into one table
+            # under one ``group`` column, and a column holding both is an object column that
+            # parquet refuses to write. The reader already reads it as text.
+            "group": str(group),
             data.BIN_COLUMN: int(index),
             data.BIN_LABEL_COLUMN: (
                 block[data.BIN_LABEL_COLUMN].iloc[0]

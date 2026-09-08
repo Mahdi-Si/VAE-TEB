@@ -55,6 +55,10 @@ from typing import Any, Dict, List, Mapping, Sequence
 #: Where the artifacts land. The path ``configs/smoke.yaml`` names, and one ``.gitignore`` covers.
 GENERATED_ROOT = Path(__file__).resolve().parent / "generated"
 
+#: Prefix of the build's scratch directory under :data:`GENERATED_ROOT`. Named so a leftover is
+#: recognisable as scratch and can be swept by the next build.
+_BUILD_PREFIX = "_build_"
+
 #: The three splits, in the order the pilot reads them.
 SPLITS: Sequence[str] = ("train", "val", "test")
 
@@ -196,9 +200,18 @@ def write_checkpoint(
 ) -> Dict[str, str]:
     """Run one real tiny fit and copy its checkpoint and resolved config into the fixture root.
 
-    The base is this package's shipped ``tiny.yaml`` with exactly three leaves moved -- both shard
-    lists, the statistics file, and the output directory, because the shipped one is a path inside
-    the repository and a fixture must not write there.
+    The base is this package's shipped ``tiny.yaml``. Four leaves are moved because the fixture
+    chose them -- both shard lists, the statistics file, and the output directory, since the
+    shipped one is a path inside the repository and a fixture must not write there -- and three
+    more are **read off the shard**, because they are not choices at all.
+
+    Those three are the channel widths and the phase operator. The shipped configuration declares
+    the *integer* operator (44 ``fhr_ph`` + 10 ``up_ph``, so ``c_y`` 80 and ``c_u`` 46), while
+    ``write_causal_cohort_shards`` writes the *legacy* one (66 + 15, so 102 and 51) and takes no
+    operator argument. Declaring the config's numbers over these shards is refused by the trainer
+    before the first batch, and rightly: a width is a property of the HDF5. Reading them here
+    rather than pinning the legacy triple keeps this correct if the cohort generator ever gains an
+    operator switch -- the fixture then fits whatever it was handed.
 
     Args:
         shards: The shards to fit on. The **source** cohort shards: the fit only has to produce a
@@ -216,14 +229,19 @@ def write_checkpoint(
             means the driver's layout changed and the copy would silently produce an unloadable
             fixture.
     """
+    import h5py
     import yaml
 
+    from hdf5_dataset.causal_scattering import PHASE_OPERATOR_LEGACY
     from teb_vae.lag_attn.config import load_config
     from teb_vae.lag_attn_cfs.tests.conftest import absolutize_dataset_paths
     from teb_vae.lag_attn_transformer_cfs import trainer as trainer_module
 
     root = Path(out_root)
     work = Path(work_directory)
+    # Created here rather than assumed: the driver makes its own run directory underneath, but the
+    # configuration written just below is the first thing to land in this one.
+    work.mkdir(parents=True, exist_ok=True)
     tiny = Path(__file__).resolve().parents[3] / "configs" / "tiny.yaml"
     config = absolutize_dataset_paths(load_config(str(tiny)))
     dataset = config["dataset_config"]
@@ -231,6 +249,23 @@ def write_checkpoint(
     dataset["vae_test_datasets"] = list(shards)
     dataset["stat_path"] = str(statistics)
     config["general_config"]["folders_config"]["out_dir_base"] = str(work)
+
+    # The shard's own geometry, in the config's three corresponding leaves. Stored layout is
+    # ``(N, C, T)``, and an absent operator attribute means the legacy one, which is the same
+    # reading the loader and the trainer's own pre-flight check apply.
+    vae = config["model_config"]["VAE_model"]
+    with h5py.File(str(shards[0]), "r") as handle:
+        widths = {
+            name: int(handle[name].shape[1])
+            for name in ("fhr_st", "fhr_ph", "up_st", "up_ph")
+        }
+        operator = str(handle.attrs.get("causal_phase_operator", PHASE_OPERATOR_LEGACY))
+    vae["c_y"] = widths["fhr_st"] + widths["fhr_ph"]
+    vae["c_u"] = (
+        widths["up_st"] + widths["up_ph"] if bool(vae.get("use_up_st", True))
+        else widths["up_ph"]
+    )
+    vae["causal_phase_operator"] = operator
 
     config_path = work / "fixture_fit.yaml"
     config_path.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
@@ -273,7 +308,8 @@ def generate(out_root: Any = None) -> Dict[str, Any]:
 
     Args:
         out_root: Destination. ``None`` uses :data:`GENERATED_ROOT`, which is what the smoke
-            configuration points at.
+            configuration points at. The build's scratch directory is made underneath it and
+            removed again, so nothing is written outside this tree.
 
     Returns:
         The manifest: the checkpoint, the statistics file and the three split shard lists, plus the
@@ -285,7 +321,24 @@ def generate(out_root: Any = None) -> Dict[str, Any]:
     root = Path(GENERATED_ROOT if out_root is None else out_root)
     root.mkdir(parents=True, exist_ok=True)
 
-    with tempfile.TemporaryDirectory(prefix="latent_pilot_fixture_") as work:
+    # Anything a previous build could not remove. Swept on the way in rather than left to
+    # accumulate, which is the price of the tolerant cleanup below.
+    for stale in root.glob(f"{_BUILD_PREFIX}*"):
+        shutil.rmtree(stale, ignore_errors=True)
+
+    # Scratch under the fixture root rather than under the system temp. Three reasons, in order of
+    # how much they cost when ignored: an operator watching a run should not have to guess that the
+    # minutes are being spent in /tmp; the source shards and the fit can be large, and a system
+    # temp is the likeliest filesystem to be small or noexec; and the copies below then stay on one
+    # filesystem.
+    #
+    # ``ignore_cleanup_errors`` because the fit leaves its own log sink open, and on Windows an
+    # open file cannot be unlinked -- without it a fit that finished and wrote every artifact
+    # raises PermissionError on the way out and reports itself as a failure. The sweep above is
+    # what keeps that tolerance from turning into litter.
+    with tempfile.TemporaryDirectory(
+        prefix=_BUILD_PREFIX, dir=str(root), ignore_cleanup_errors=True
+    ) as work:
         source = Path(work) / "shards"
         source.mkdir(parents=True, exist_ok=True)
         shards = list(write_cohort_shards(source))
