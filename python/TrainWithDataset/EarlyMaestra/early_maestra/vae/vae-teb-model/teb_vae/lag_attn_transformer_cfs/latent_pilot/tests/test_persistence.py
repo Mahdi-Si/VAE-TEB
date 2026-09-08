@@ -222,12 +222,16 @@ def test_the_export_loads_through_the_repository_s_own_strict_loader(bundle, kwa
 
 def test_the_export_carries_no_classifier_key(bundle, tmp_path):
     """The classifier is not part of the architecture, so it never travels in this file."""
-    _fit(bundle)
+    fit = _fit(bundle)
     blob = torch.load(
         train.export_base_checkpoint(bundle, tmp_path), map_location="cpu", weights_only=False
     )
 
-    assert not any("linear" in key or "center" in key for key in blob["state_dict"])
+    # Checked against the classifier's own key names and the net's own, rather than against a
+    # substring: the net carries a ``target_adapter.linear.weight`` of its own, so "linear" in a
+    # key says nothing about where that key came from.
+    assert not set(fit.classifier.state_dict()) & set(blob["state_dict"])
+    assert set(blob["state_dict"]) == set(bundle.model.state_dict())
     assert "classifier" not in blob
     assert blob["model_kwargs"] == bundle.blob["model_kwargs"]
     assert blob["hyper_parameters"] == bundle.blob["hyper_parameters"]

@@ -120,7 +120,9 @@ def test_the_pass_is_deterministic_without_the_monte_carlo_columns(loaded):
     first = _measure(loaded)
     second = _measure(loaded)
 
-    assert np.array_equal(first.values, second.values)
+    # equal_nan, because the Monte Carlo columns are absent-as-NaN in this pass by design and a
+    # plain comparison would report a bit-identical reading as a difference.
+    assert np.array_equal(first.values, second.values, equal_nan=True)
     assert first.record["support_digest"] == second.record["support_digest"]
     assert first.record["mse_full"] == second.record["mse_full"]
 

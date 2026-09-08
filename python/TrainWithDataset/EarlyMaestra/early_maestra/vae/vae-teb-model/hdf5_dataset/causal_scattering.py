@@ -97,13 +97,30 @@ channel plan, the geometry) is torch-free and batch-free by design.
 from __future__ import annotations
 
 import math
+import os
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import Any, Dict, Mapping, Optional, Tuple
 
 import numpy as np
+from kymatio.scattering1d import filter_bank as _kymatio_filter_bank
 from kymatio.scattering1d.filter_bank import scattering_filter_factory
 from kymatio.scattering1d.utils import compute_minimum_support_to_pad
+
+from hdf5_dataset import VENDORED_KYMATIO
+
+# The bank below is the one the stored coefficients were built on. Importing this package pins the
+# vendored checkout to the front of sys.path, but a process that imported kymatio before reaching
+# it would already hold another copy -- so what was actually loaded is checked here rather than
+# assumed. Silence would mean a filter bank swapped underneath identical file names.
+if not os.path.abspath(_kymatio_filter_bank.__file__).startswith(VENDORED_KYMATIO + os.sep):
+    raise ImportError(
+        f"kymatio was imported from {_kymatio_filter_bank.__file__!r}, outside this repository's "
+        f"vendored checkout at {VENDORED_KYMATIO!r}. The stored scattering coefficients are "
+        f"projections onto the vendored filter bank and another build would change them silently. "
+        f"Uninstall the other kymatio from this environment (pip uninstall kymatio), or import "
+        f"hdf5_dataset before it."
+    )
 
 #: Production geometry, as ``hdf5_dataset/new_pipeline/create_new_pipeline.py`` sets it: raw
 #: sampling rate in Hz, the wavelet bank's octaves / wavelets-per-octave / low-pass width, the
