@@ -113,6 +113,12 @@ from teb_vae.lag_attn_transformer_cfs.latent_pilot import config as pilot_config
 #: The pilot configuration used when nothing names another one.
 DEFAULT_CONFIG_PATH = "teb_vae/lag_attn_transformer_cfs/latent_pilot/configs/pilot.yaml"
 
+#: Where a smoke run lands inside the operator's configured run root. A sibling of the production
+#: folds rather than a directory inside one: a smoke run is its own run, with its own protocol and
+#: its own stage state, and burying it in a production run directory would put two runs' records in
+#: one place.
+SMOKE_SUBDIR = "smoke"
+
 #: The fixture configuration the ``smoke`` stage runs under. Never the production one: a smoke run
 #: must not be able to read production shards or write into a production run directory.
 SMOKE_CONFIG_PATH = "teb_vae/lag_attn_transformer_cfs/latent_pilot/configs/smoke.yaml"
@@ -599,11 +605,16 @@ def stage_tests(context: Dict[str, Any]) -> Dict[str, Any]:
 def stage_smoke(context: Dict[str, Any]) -> Dict[str, Any]:
     """Run the whole pipeline on the small non-clinical fixtures, in its own output subtree.
 
-    Isolated in three ways, all deliberate: its own configuration, which names its own fixture
-    shards and its own ``fold``; its own run directory under the smoke root; and its own settings,
-    resolved from that file rather than inherited -- the outer run's device, overrides and paths
-    never reach it. It dispatches :data:`PIPELINE_STAGES` directly and so cannot recurse into
-    ``all``, and it cannot write into the production run whose sequence invoked it.
+    Isolated in what it measures: its own configuration, which names its own fixture shards and its
+    own ``fold``, and its own settings resolved from that file rather than inherited -- the outer
+    run's device, checkpoint, statistics, shards and protocol overrides never reach it. It
+    dispatches :data:`PIPELINE_STAGES` directly and so cannot recurse into ``all``.
+
+    **One leaf is inherited, and only one: the destination.** The outer run's ``paths.run_root``
+    becomes this run's, under :data:`SMOKE_SUBDIR`, because where a run writes is the operator's
+    choice and a stage that ignored it would scatter output between the configured location and
+    this package. Nothing that shapes a measurement travels with it, and the smoke run still gets a
+    directory of its own, so it cannot overwrite the production run that invoked it.
 
     The fixtures it runs on are **written here when they are absent**, rather than being an
     operator step this stage assumes has happened. They are generated, git-ignored and reproducible,
@@ -628,9 +639,12 @@ def stage_smoke(context: Dict[str, Any]) -> Dict[str, Any]:
     """
     from teb_vae.lag_attn_transformer_cfs.latent_pilot.tests.fixtures import generate as fixtures
 
+    destination = Path(context["settings"]["paths"]["run_root"]) / SMOKE_SUBDIR
+    overrides = {"paths": {"run_root": str(destination)}}
     # Resolved here rather than taken from the outer run, for the same reason the pipeline below
-    # re-resolves it: the smoke configuration is what these fixtures have to satisfy.
-    settings = pilot_config.resolve_settings(SMOKE_CONFIG_PATH)
+    # re-resolves it: the smoke configuration is what these fixtures have to satisfy. The one
+    # override is the destination, so this reading and the pipeline's agree on where output goes.
+    settings = pilot_config.resolve_settings(SMOKE_CONFIG_PATH, overrides=overrides)
     generated = bool(pilot_config.missing_inputs(settings, list(PIPELINE_STAGES)))
     if generated:
         logger.info(
@@ -647,12 +661,20 @@ def stage_smoke(context: Dict[str, Any]) -> Dict[str, Any]:
                 + f", which {SMOKE_CONFIG_PATH} names. The configuration and the generator have "
                 f"drifted apart: one of them names a subgroup or a directory the other does not."
             )
-        logger.info(f"smoke: fixtures written under {manifest['root']}")
+        logger.info(
+            f"smoke: fixtures written under {manifest['root']}. They stay there rather than "
+            f"following the run root: they are a per-checkout cache, and re-rooting them would "
+            f"re-run the fit every time an operator changed where output goes."
+        )
 
-    logger.info(f"smoke: dispatching {', '.join(PIPELINE_STAGES)} under {SMOKE_CONFIG_PATH}")
-    smoke = run_pipeline(SMOKE_CONFIG_PATH)
+    logger.info(
+        f"smoke: dispatching {', '.join(PIPELINE_STAGES)} under {SMOKE_CONFIG_PATH}, "
+        f"writing to {destination}"
+    )
+    smoke = run_pipeline(SMOKE_CONFIG_PATH, overrides=overrides)
     return {
         "config_path": SMOKE_CONFIG_PATH,
+        "run_root": str(destination),
         "run_dir": str(smoke["run_dir"]),
         "stages": list(PIPELINE_STAGES),
         "fixtures_generated": generated,

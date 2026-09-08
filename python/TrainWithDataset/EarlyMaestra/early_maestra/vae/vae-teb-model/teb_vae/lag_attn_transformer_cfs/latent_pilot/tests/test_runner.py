@@ -236,22 +236,31 @@ def test_a_production_stage_without_paths_names_the_setting(tmp_path):
     assert sorted(Path(tmp_path).iterdir()) == [config]
 
 
-def _smoke_without_the_pipeline(monkeypatch, *, absent):
+def _smoke_without_the_pipeline(monkeypatch, run_root, *, absent):
     """Drive ``stage_smoke`` with its two expensive halves replaced.
 
     The generator runs a real one-epoch fit and the pipeline runs seven stages; neither is what the
-    decision under test does. What is under test is which of them runs, and what the record says.
+    decisions under test are. Under test are which of them runs, where the run is pointed, and what
+    the record says.
 
     Args:
         monkeypatch: The pytest fixture.
+        run_root: The invoking run's configured destination.
         absent: Whether the fixtures should look absent.
 
     Returns:
-        ``(result, calls)``: the stage record and the names of the halves that were reached.
+        ``(result, calls, dispatched)``: the stage record, the names of the halves that were
+        reached, and the keyword arguments the pipeline was dispatched with.
     """
     from teb_vae.lag_attn_transformer_cfs.latent_pilot.tests.fixtures import generate as fixtures
 
     calls = []
+    dispatched = {}
+
+    def _pipeline(*args, **kwargs):
+        calls.append("pipeline")
+        dispatched.update(kwargs)
+        return {"run_dir": "/smoke-run"}
 
     monkeypatch.setattr(
         pilot_config, "missing_inputs",
@@ -262,28 +271,45 @@ def _smoke_without_the_pipeline(monkeypatch, *, absent):
         lambda *a, **k: calls.append("generate") or {"root": "/generated"},
     )
     monkeypatch.setattr(fixtures, "manifest_matches", lambda manifest, settings: [])
-    monkeypatch.setattr(
-        pilot_run, "run_pipeline",
-        lambda *a, **k: calls.append("pipeline") or {"run_dir": "/smoke-run"},
-    )
-    return pilot_run.stage_smoke({}), calls
+    monkeypatch.setattr(pilot_run, "run_pipeline", _pipeline)
+    context = {"settings": {"paths": {"run_root": str(run_root)}}}
+    return pilot_run.stage_smoke(context), calls, dispatched
 
 
-def test_the_smoke_stage_writes_its_fixtures_when_they_are_absent(monkeypatch):
+def test_the_smoke_stage_writes_its_fixtures_when_they_are_absent(monkeypatch, tmp_path):
     """A checkout that has never generated them is the ordinary case, not a refusal."""
-    result, calls = _smoke_without_the_pipeline(monkeypatch, absent=True)
+    result, calls, _dispatched = _smoke_without_the_pipeline(
+        monkeypatch, tmp_path, absent=True
+    )
 
     assert calls == ["generate", "pipeline"]
     assert result["fixtures_generated"] is True
     assert result["clinical"] is False
 
 
-def test_the_smoke_stage_leaves_fixtures_that_are_already_there(monkeypatch):
+def test_the_smoke_stage_leaves_fixtures_that_are_already_there(monkeypatch, tmp_path):
     """Regenerating would spend the fit again and move the ground under a run that read them."""
-    result, calls = _smoke_without_the_pipeline(monkeypatch, absent=False)
+    result, calls, _dispatched = _smoke_without_the_pipeline(
+        monkeypatch, tmp_path, absent=False
+    )
 
     assert calls == ["pipeline"]
     assert result["fixtures_generated"] is False
+
+
+def test_the_smoke_run_is_written_under_the_invoking_run_s_root(monkeypatch, tmp_path):
+    """Where output goes is the operator's choice, and the smoke stage is not an exception to it.
+
+    Its own subtree, though: the smoke run has a protocol and a stage state of its own, and they do
+    not belong in a production run's directory.
+    """
+    result, _calls, dispatched = _smoke_without_the_pipeline(
+        monkeypatch, tmp_path, absent=False
+    )
+
+    expected = tmp_path / pilot_run.SMOKE_SUBDIR
+    assert result["run_root"] == str(expected)
+    assert dispatched["overrides"] == {"paths": {"run_root": str(expected)}}
 
 
 def test_a_set_override_reaches_the_settings_the_same_way_the_dictionary_does():
