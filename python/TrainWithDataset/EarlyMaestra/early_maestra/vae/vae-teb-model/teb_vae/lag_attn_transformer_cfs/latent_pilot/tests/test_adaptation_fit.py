@@ -36,6 +36,7 @@ from teb_vae.lag_attn_transformer_cfs.tests.conftest import (
 #: Two segments of one recording, an hour and two hours before delivery.
 EPOCHS = (-3600.0, -7200.0)
 SUPERVISED_HOURS = 1.0
+PRESERVATION_HOURS = 3.0
 HALFLIFE_HOURS = 0.5
 
 
@@ -392,6 +393,7 @@ def test_plans_built_from_an_extraction_name_anchors_the_model_can_be_read_at(ta
         recordings,
         split="train",
         supervised_hours=SUPERVISED_HOURS,
+        preservation_hours=PRESERVATION_HOURS,
         halflife_hours=HALFLIFE_HOURS,
     )
     plan = plans["SYNTH-0"]

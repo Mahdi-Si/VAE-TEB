@@ -58,7 +58,7 @@ def _cohort(n_healthy=4, n_adverse=3, scores=None):
 # =============================================================================
 def test_signed_hours_put_delivery_at_zero_on_the_right():
     """Six half-hour bins over three hours, bin 0 nearest delivery, every coordinate negative."""
-    x = report.signed_bin_hours(bin_hours=0.5, preservation_hours=3.0)
+    x = report.signed_bin_hours(bin_hours=0.5, window_hours=3.0)
     assert x.size == 6
     assert x[0] == pytest.approx(-0.25)
     assert x[-1] == pytest.approx(-2.75)
@@ -69,7 +69,7 @@ def test_signed_hours_put_delivery_at_zero_on_the_right():
 def test_bin_axis_matches_the_data_module_edges():
     """The figure's x coordinate is the midpoint of the bin the data module defines, not a guess."""
     edges = data.bin_edges(bin_hours=0.5, preservation_hours=3.0)
-    x = report.signed_bin_hours(bin_hours=0.5, preservation_hours=3.0)
+    x = report.signed_bin_hours(bin_hours=0.5, window_hours=3.0)
     for index, (low, high) in enumerate(edges):
         assert x[index] == pytest.approx(-0.5 * (low + high))
 
@@ -132,7 +132,7 @@ def test_selection_without_a_class_column_still_works_as_one_stratum():
 def test_an_unoccupied_bin_stays_a_gap_rather_than_becoming_a_zero():
     """A bin a group never occupied is ``nan`` in the curve, which matplotlib draws as a break.
     Filling it with zero would draw a measurement that was never made."""
-    x = report.signed_bin_hours(bin_hours=0.5, preservation_hours=3.0)
+    x = report.signed_bin_hours(bin_hours=0.5, window_hours=3.0)
     bands = pd.DataFrame([
         {"group": "healthy", data.BIN_COLUMN: 0, "mean": 1.0, "lo": 0.5, "hi": 1.5,
          "n_recordings": 4},
@@ -150,7 +150,7 @@ def test_an_unoccupied_bin_stays_a_gap_rather_than_becoming_a_zero():
 def test_a_bin_outside_the_axis_is_dropped_rather_than_wrapped():
     """A negative bin index is the data module's "outside the window" marker; drawing it at
     position -1 would put an out-of-window summary on the last bin."""
-    x = report.signed_bin_hours(bin_hours=0.5, preservation_hours=3.0)
+    x = report.signed_bin_hours(bin_hours=0.5, window_hours=3.0)
     bands = pd.DataFrame([
         {"group": "healthy", data.BIN_COLUMN: -1, "mean": 9.0, "lo": 8.0, "hi": 10.0,
          "n_recordings": 3},
@@ -207,7 +207,28 @@ def test_every_figure_has_a_caption():
         report.FIGURE_COVERAGE_SPACE,
         report.FIGURE_SUPERVISED_AXIS,
         report.FIGURE_TRAJECTORIES,
+        report.FIGURE_ROC_PR,
+        report.FIGURE_CONFUSION,
+        report.FIGURE_METRICS_TIME,
+        report.FIGURE_ROC_BINS,
+        report.FIGURE_COUNTS_TIME,
     }
+
+
+def test_no_caption_states_a_window_the_configuration_can_move():
+    """A caption naming a number would go stale the day that number was configured away.
+
+    Figure 3's is the one deliberate exception: it is a format template, filled by its own drawing
+    function from the run's settings. Every classification caption states the rule and leaves the
+    numbers to the figure's title, which reads them from the settings.
+    """
+    for name in (
+        report.FIGURE_ROC_PR, report.FIGURE_CONFUSION, report.FIGURE_METRICS_TIME,
+        report.FIGURE_ROC_BINS, report.FIGURE_COUNTS_TIME,
+    ):
+        caption = report.CAPTIONS[name]
+        assert "{" not in caption, name
+        assert not any(character.isdigit() for character in caption), name
 
 
 # =============================================================================
@@ -445,3 +466,26 @@ def test_the_report_is_written_where_it_is_asked_for(tmp_path):
     target = report.write_report({}, tmp_path)
     assert target.name == report.REPORT_FILENAME
     assert target.read_text(encoding="utf-8").startswith("# Latent-class fine-tuning pilot")
+
+
+def test_the_axis_spans_the_analysis_window_when_it_is_wider_than_the_preserved_one():
+    """Twelve half-hour bins over six hours, and the far edge is the analysis window's."""
+    x = report.signed_bin_hours(bin_hours=0.5, window_hours=6.0)
+    assert x.size == 12
+    assert x[0] == pytest.approx(-0.25)
+    assert x[-1] == pytest.approx(-5.75)
+
+
+def test_the_temporal_heading_follows_the_analysis_window_where_one_was_set():
+    """A run that analysed six hours must not head its temporal section with three.
+
+    ``analysis_hours`` is null on every run that did not separate the two windows, and the heading
+    then falls back to ``preservation_hours``, which is what those runs analysed.
+    """
+    settings = {"windows": {"preservation_hours": 3.0, "analysis_hours": 6.0}}
+    lines = report._temporal_section({"protocol": {"settings": settings}, "temporal": {}})
+    assert lines[0] == "## Change over the last 6 hours"
+
+    settings["windows"]["analysis_hours"] = None
+    lines = report._temporal_section({"protocol": {"settings": settings}, "temporal": {}})
+    assert lines[0] == "## Change over the last 3 hours"

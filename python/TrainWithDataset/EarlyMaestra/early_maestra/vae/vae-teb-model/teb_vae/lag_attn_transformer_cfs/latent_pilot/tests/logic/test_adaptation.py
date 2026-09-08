@@ -71,7 +71,12 @@ def _recordings(outcomes, *, split="train", eligible=True):
 
 def _plans(rows, outcomes, **overrides):
     """Build plans at the protocol's windows unless a test moves them."""
-    arguments = {"supervised_hours": 1.0, "halflife_hours": 0.5, "split": "train"}
+    arguments = {
+        "supervised_hours": 1.0,
+        "preservation_hours": 3.0,
+        "halflife_hours": 0.5,
+        "split": "train",
+    }
     arguments.update(overrides)
     return train.build_plans(_extraction(rows), _recordings(outcomes), **arguments)
 
@@ -179,7 +184,8 @@ def test_an_ineligible_or_unlabelled_recording_never_reaches_the_adaptation():
     ], ignore_index=True)
 
     plans = train.build_plans(
-        extraction, recordings, split="train", supervised_hours=1.0, halflife_hours=0.5
+        extraction, recordings, split="train",
+        supervised_hours=1.0, preservation_hours=3.0, halflife_hours=0.5,
     )
 
     assert set(plans) == {"KEEP"}
@@ -192,6 +198,7 @@ def test_plans_are_refused_for_a_split_the_extraction_does_not_hold():
             _recordings({"ONE": 1}, split="val"),
             split="val",
             supervised_hours=1.0,
+            preservation_hours=3.0,
             halflife_hours=0.5,
         )
 
@@ -308,3 +315,33 @@ def test_the_reference_gate_passes_without_comparing_the_baseline_to_itself():
     assert gate.record["rule"] == "reference"
     # A zero baseline is the case where comparing it to itself would say least.
     assert gate.record["baseline_mse_full"] == 0.0
+
+
+def test_the_teacher_term_stops_at_the_preservation_window_however_wide_the_extraction():
+    """A wider analysis window must not widen the loss.
+
+    The extraction spans ``windows.analysis_hours``, which a six-hour analysis sets past the
+    three-hour preservation window. The plan is what the teacher term is computed over, so an
+    anchor outside the preservation window has to be absent from it -- otherwise widening the
+    analysis would silently change the objective while every artifact still claimed the declared
+    protocol.
+    """
+    rows = [
+        ("ONE", -1800.0, 0, 0.4),    # inside the supervised hour
+        ("ONE", -1800.0, 1, 2.5),    # inside preservation, outside supervision
+        ("ONE", -1800.0, 2, 4.5),    # inside a six-hour analysis, outside preservation
+        ("ONE", -1800.0, 3, 5.9),
+    ]
+    wide = _plans(rows, {"ONE": 1}, preservation_hours=6.0)
+    narrow = _plans(rows, {"ONE": 1}, preservation_hours=3.0)
+
+    assert wide["ONE"].n_anchors == 4
+    assert narrow["ONE"].n_anchors == 2
+    kept = np.concatenate([segment.hours for segment in narrow["ONE"].segments])
+    assert kept.max() <= 3.0
+
+    # And the supervised half is untouched by the narrowing: the same anchors carry the
+    # classification loss either way.
+    for plans in (wide, narrow):
+        late = np.concatenate([segment.late for segment in plans["ONE"].segments])
+        assert int(late.sum()) == 1

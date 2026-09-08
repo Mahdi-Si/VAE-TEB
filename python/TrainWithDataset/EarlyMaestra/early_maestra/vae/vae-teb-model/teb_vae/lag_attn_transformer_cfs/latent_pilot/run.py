@@ -167,6 +167,14 @@ BAG_VALUES_FILENAME = "figure_bags.npz"
 #: paired change stays auditable from the run directory rather than only from the report.
 PAIRED_TABLE_FILENAME = "per_recording_paired_windows.parquet"
 
+#: Artifacts the **report** stage writes. They are derived presentation tables -- every number in
+#: them is recomputed from the held-out scores and the locked thresholds the evaluation stage
+#: already wrote -- which is what lets a run finished before these existed gain them by
+#: regenerating its report, with nothing refitted and no shard reopened.
+CLASSIFICATION_FILENAME = "classification_metrics.csv"
+BIN_METRICS_FILENAME = "per_bin_metrics.parquet"
+ROC_CURVES_FILENAME = "roc_curves_by_bin.parquet"
+
 def build_parser() -> argparse.ArgumentParser:
     """Build the command-line parser. Every ``dest`` is also a :data:`RUN_ARGS` key.
 
@@ -432,9 +440,11 @@ def _loader_config(settings: Mapping[str, Any], loaded: Any, split: str) -> Dict
         loaded.config,
         shards=settings["paths"][f"{split}_shards"],
         statistics=settings["paths"]["statistics"],
-        epoch_min=data.coarse_epoch_min(
-            float(settings["windows"]["preservation_hours"]), span
-        ),
+        # The analysis window, not the preservation one: the extraction has to see every segment
+        # any analysed anchor can come from, and a segment crossing the far edge is admitted by a
+        # bound widened by a whole stored span. The teacher term narrows back to
+        # ``preservation_hours`` where it is computed, not here.
+        epoch_min=data.coarse_epoch_min(pilot_config.analysis_hours(settings), span),
     )
 
 
@@ -553,7 +563,9 @@ def _bin_summaries(extraction: Any, recordings: Any, *, split: str, settings: Ma
         recordings,
         split=split,
         bin_hours=float(settings["windows"]["bin_hours"]),
-        preservation_hours=float(settings["windows"]["preservation_hours"]),
+        # ``bin_summaries`` names this parameter for the window it tiles, which for a run that
+        # separates the two is the analysis window rather than the preservation one.
+        preservation_hours=pilot_config.analysis_hours(settings),
     )
 
 
@@ -835,7 +847,7 @@ def stage_extract(context: Dict[str, Any]) -> Dict[str, Any]:
             loaded,
             _loader(settings, loaded, split),
             split=split,
-            preservation_hours=float(settings["windows"]["preservation_hours"]),
+            preservation_hours=pilot_config.analysis_hours(settings),
             bin_hours=float(settings["windows"]["bin_hours"]),
         )
         extract.save_extraction(
@@ -972,6 +984,7 @@ def stage_finetune(context: Dict[str, Any]) -> Dict[str, Any]:
         plans=pilot_train.build_plans(
             train_extraction, recordings, split="train",
             supervised_hours=float(settings["windows"]["supervised_hours"]),
+            preservation_hours=float(settings["windows"]["preservation_hours"]),
             halflife_hours=float(settings["bag"]["halflife_hours"]),
         ),
         val_loader=val_loader,
@@ -996,7 +1009,7 @@ def stage_finetune(context: Dict[str, Any]) -> Dict[str, Any]:
             loaded,
             _loader(settings, loaded, split),
             split=split,
-            preservation_hours=float(settings["windows"]["preservation_hours"]),
+            preservation_hours=pilot_config.analysis_hours(settings),
             bin_hours=float(settings["windows"]["bin_hours"]),
         )
         extract.assert_same_keys(
@@ -1150,7 +1163,7 @@ def stage_evaluate(context: Dict[str, Any]) -> Dict[str, Any]:
             loaded,
             _loader(settings, loaded, "test"),
             split="test",
-            preservation_hours=float(settings["windows"]["preservation_hours"]),
+            preservation_hours=pilot_config.analysis_hours(settings),
             bin_hours=float(settings["windows"]["bin_hours"]),
             allow_test=allow_test,
         )
@@ -1482,7 +1495,7 @@ def stage_report(context: Dict[str, Any]) -> Dict[str, Any]:
     import pandas as pd
 
     from teb_vae.lag_attn.eval import labels as eval_labels
-    from teb_vae.lag_attn_transformer_cfs.latent_pilot import analyze
+    from teb_vae.lag_attn_transformer_cfs.latent_pilot import analyze, data, evaluate
     from teb_vae.lag_attn_transformer_cfs.latent_pilot import report as pilot_report
 
     settings, directory = context["settings"], Path(context["run_dir"])
@@ -1507,6 +1520,30 @@ def stage_report(context: Dict[str, Any]) -> Dict[str, Any]:
             version: stored[version] for version in (PRETRAINED, ADAPTED) if version in stored.files
         }
 
+    # Hoisted out of the figure dictionary: the classification readout below reads the same
+    # thresholds and the same held-out logits, and two expressions producing them would eventually
+    # be two different populations wearing one name.
+    window_hours = pilot_config.analysis_hours(settings)
+    bin_hours = float(settings["windows"]["bin_hours"])
+    supervised_hours = float(settings["windows"]["supervised_hours"])
+    model_metrics = dict(dict(results.get("metrics") or {}).get("models") or {})
+    thresholds = {
+        name: float(measured["threshold"])
+        for name, measured in model_metrics.items()
+        if measured.get("threshold") is not None
+    }
+    logit_columns = {
+        column[len("logit_"):]: test_frame[column].to_numpy()
+        for column in test_frame.columns if str(column).startswith("logit_")
+    }
+    unthresholded = sorted(set(logit_columns) - set(thresholds))
+    if unthresholded:
+        logger.warning(
+            f"model(s) {', '.join(unthresholded)} carry held-out logits but no recorded threshold, "
+            f"so they are left out of every threshold-dependent panel. A threshold invented here "
+            f"would not be the one the held-out table was read at."
+        )
+
     figures = {
         pilot_report.FIGURE_LATENT_SPACE: str(pilot_report.figure_latent_space(
             {
@@ -1518,19 +1555,10 @@ def stage_report(context: Dict[str, Any]) -> Dict[str, Any]:
         )),
         pilot_report.FIGURE_SUPERVISED_AXIS: str(pilot_report.figure_supervised_axis(
             test_frame,
-            {
-                column[len("logit_"):]: test_frame[column].to_numpy()
-                for column in test_frame.columns if str(column).startswith("logit_")
-            },
+            logit_columns,
             directory,
-            metrics=dict(results.get("metrics", {}).get("models") or {}),
-            thresholds={
-                name: float(measured.get("threshold"))
-                for name, measured in (
-                    results.get("metrics", {}).get("models") or {}
-                ).items()
-                if measured.get("threshold") is not None
-            },
+            metrics=model_metrics,
+            thresholds=thresholds,
         )),
         pilot_report.FIGURE_COVERAGE_SPACE: str(pilot_report.figure_coverage_space(
             test_frame, bag_values[PRETRAINED], projection, directory,
@@ -1548,15 +1576,92 @@ def stage_report(context: Dict[str, Any]) -> Dict[str, Any]:
                 if version in set(str(value) for value in scored_bins["model"])
             },
             directory,
-            bin_hours=float(settings["windows"]["bin_hours"]),
-            preservation_hours=float(settings["windows"]["preservation_hours"]),
-            supervised_hours=float(settings["windows"]["supervised_hours"]),
+            bin_hours=bin_hours,
+            window_hours=window_hours,
+            supervised_hours=supervised_hours,
             seed=int(settings["seed"]),
         )),
     }
+    # ------------------------------------------------------------------ the classification readout
+    # Recomputed here rather than read out of ``results.json``: a run finished before these figures
+    # existed carries none of these keys, and this stage is the one an operator re-runs on such a
+    # directory. Nothing is refitted -- the labels, the held-out logits and the per-bin scores are
+    # the ones already on disk, and the thresholds are the ones the selection lock froze.
+    outcomes = test_frame[data.OUTCOME_COLUMN].to_numpy()
+    patients = None
+    if (
+        dict(results.get("grouping") or {}).get("grouping") == "patient"
+        and data.PATIENT_COLUMN in test_frame.columns
+    ):
+        patients = {
+            str(row[data.GUID_COLUMN]): str(row[data.PATIENT_COLUMN])
+            for _index, row in test_frame.iterrows()
+        }
+    curves, classification = {}, {}
+    for name in sorted(set(logit_columns) & set(thresholds)):
+        values = logit_columns[name]
+        curves[name] = {
+            "roc": evaluate.roc_points(outcomes, values),
+            "pr": evaluate.pr_points(outcomes, values),
+        }
+        classification[name] = evaluate.recording_metrics(
+            outcomes, values, threshold=thresholds[name]
+        )
+    intervals = dict(dict(results.get("metrics") or {}).get("bootstrap") or {}).get("models") or {}
+
+    bin_metrics = analyze.bin_classification(
+        scored_bins,
+        thresholds=thresholds,
+        bin_hours=bin_hours,
+        resamples=int(settings["bootstrap"]["resamples"]),
+        seed=int(settings["seed"]),
+        patients=patients,
+        supervised=analyze.supervised_bins(
+            bin_hours=bin_hours, supervised_hours=supervised_hours
+        ),
+    )
+    bin_curves = analyze.bin_roc_points(
+        scored_bins, thresholds=thresholds, bin_hours=bin_hours
+    )
+
+    pd.DataFrame(
+        [{"model": name, **measured} for name, measured in classification.items()]
+    ).to_csv(directory / CLASSIFICATION_FILENAME, index=False)
+    bin_metrics.to_parquet(directory / BIN_METRICS_FILENAME, index=False)
+    bin_curves.to_parquet(directory / ROC_CURVES_FILENAME, index=False)
+
+    figures.update({
+        pilot_report.FIGURE_ROC_PR: str(pilot_report.figure_roc_pr(
+            curves, classification, directory, intervals=intervals,
+        )),
+        pilot_report.FIGURE_CONFUSION: str(pilot_report.figure_confusion(
+            classification, directory, intervals=intervals,
+        )),
+        pilot_report.FIGURE_METRICS_TIME: str(pilot_report.figure_metrics_vs_time(
+            bin_metrics, directory,
+            bin_hours=bin_hours, window_hours=window_hours,
+            supervised_hours=supervised_hours,
+        )),
+        pilot_report.FIGURE_ROC_BINS: str(pilot_report.figure_roc_by_bin(
+            bin_curves, bin_metrics, directory,
+        )),
+        pilot_report.FIGURE_COUNTS_TIME: str(pilot_report.figure_counts_vs_time(
+            bin_metrics, directory,
+            bin_hours=bin_hours, window_hours=window_hours,
+            supervised_hours=supervised_hours,
+        )),
+    })
+    metrics_record = dict(results.get("metrics") or {})
+    metrics_record["classification"] = classification
+    metrics_record["per_bin"] = bin_metrics.to_dict(orient="records")
+    results["metrics"] = metrics_record
+
     results["figures"] = figures
     written = pilot_report.write_report(results, directory)
-    logger.info(f"report: {written}")
+    logger.info(
+        f"report: {written}; {len(classification)} model(s) scored, "
+        f"{int(bin_metrics['estimable'].sum()) if not bin_metrics.empty else 0} estimable bin cell(s)"
+    )
     return {"report": str(written), "figures": figures}
 
 

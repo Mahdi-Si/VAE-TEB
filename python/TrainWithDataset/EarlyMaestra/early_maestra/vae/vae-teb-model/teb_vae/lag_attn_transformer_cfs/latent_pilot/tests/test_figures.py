@@ -1,4 +1,4 @@
-r"""The three figures actually render, on hand-built frames.
+r"""Every figure actually renders, on hand-built frames.
 
 **Execution-machine test**, because it draws: it needs matplotlib and writes files, which the
 minimal logic subset does neither of. It needs no model, no checkpoint, no fixtures and no GPU --
@@ -194,7 +194,7 @@ def test_the_trajectory_figure_renders_with_gaps_and_counts(tmp_path):
         {"frozen": (bands, scored)},
         tmp_path,
         bin_hours=BIN_HOURS,
-        preservation_hours=PRESERVATION_HOURS,
+        window_hours=PRESERVATION_HOURS,
         supervised_hours=SUPERVISED_HOURS,
         n_traces=3,
         seed=0,
@@ -214,7 +214,7 @@ def test_the_trajectory_figure_draws_a_raw_excerpt_when_one_is_supplied(tmp_path
         {"frozen": (bands, scored)},
         tmp_path,
         bin_hours=BIN_HOURS,
-        preservation_hours=PRESERVATION_HOURS,
+        window_hours=PRESERVATION_HOURS,
         supervised_hours=SUPERVISED_HOURS,
         n_traces=2,
         seed=0,
@@ -233,11 +233,167 @@ def test_an_empty_band_table_still_produces_a_figure(tmp_path):
                                           analyze.SCORE_COLUMN]))},
         tmp_path,
         bin_hours=BIN_HOURS,
-        preservation_hours=PRESERVATION_HOURS,
+        window_hours=PRESERVATION_HOURS,
         supervised_hours=SUPERVISED_HOURS,
         n_traces=0,
     )
     assert Path(written).is_file()
+
+
+# =============================================================================
+# Figures 4-8 -- the classification readout
+# =============================================================================
+ANALYSIS_HOURS = 6.0
+
+
+def _classification_bins(*, n: int = 10, empty_bins=(10, 11), single_class_bins=(8, 9)):
+    """A per-bin score table over a six-hour analysis window with the absences a real one has.
+
+    Coverage thins with distance from delivery, so the far bins are the ones that lose their
+    adverse recordings first and then lose every recording -- which is the shape the figures have
+    to survive, rather than a full grid that exercises none of their gap handling.
+    """
+    generator = np.random.default_rng(3)
+    rows = []
+    n_bins = int(ANALYSIS_HOURS / BIN_HOURS)
+    for model in ("pretrained", "adapted"):
+        for index in range(n_bins):
+            if index in empty_bins:
+                continue
+            for recording in range(n):
+                outcome = int(recording % 2)
+                if index in single_class_bins and outcome == 1:
+                    continue
+                rows.append({
+                    "model": model,
+                    data.GUID_COLUMN: f"R{recording}",
+                    data.BIN_COLUMN: index,
+                    data.BIN_LABEL_COLUMN:
+                        f"({index * BIN_HOURS:g}, {(index + 1) * BIN_HOURS:g}]",
+                    data.OUTCOME_COLUMN: outcome,
+                    labels.CLASS_COLUMN: "healthy" if outcome == 0 else "acidosis",
+                    analyze.SCORE_COLUMN: float(
+                        1.5 * outcome + generator.normal(0.0, 0.7)
+                    ),
+                })
+    return pd.DataFrame(rows)
+
+
+def _classification_inputs(frame: pd.DataFrame):
+    """The final-hour curves and metrics both overall figures take."""
+    from teb_vae.lag_attn_transformer_cfs.latent_pilot import evaluate
+
+    late = frame[frame[data.BIN_COLUMN] == 0]
+    curves, metrics = {}, {}
+    for model in sorted({str(value) for value in late["model"]}):
+        block = late[late["model"] == model]
+        outcomes = block[data.OUTCOME_COLUMN].to_numpy()
+        scores = block[analyze.SCORE_COLUMN].to_numpy()
+        curves[model] = {
+            "roc": evaluate.roc_points(outcomes, scores),
+            "pr": evaluate.pr_points(outcomes, scores),
+        }
+        metrics[model] = evaluate.recording_metrics(outcomes, scores, threshold=0.5)
+    return curves, metrics
+
+
+def _bin_tables(frame: pd.DataFrame):
+    """The per-bin metric table and its ROC points, at one threshold per model."""
+    thresholds = {model: 0.5 for model in sorted({str(v) for v in frame["model"]})}
+    metrics = analyze.bin_classification(
+        frame, thresholds=thresholds, bin_hours=BIN_HOURS, resamples=100, seed=0,
+        supervised=analyze.supervised_bins(
+            bin_hours=BIN_HOURS, supervised_hours=SUPERVISED_HOURS
+        ),
+    )
+    curves = analyze.bin_roc_points(frame, thresholds=thresholds, bin_hours=BIN_HOURS)
+    return metrics, curves
+
+
+def test_the_roc_and_pr_figure_renders_both_models(tmp_path):
+    curves, metrics = _classification_inputs(_classification_bins())
+    written = pilot_report.figure_roc_pr(curves, metrics, tmp_path)
+    assert Path(written).is_file() and Path(written).stat().st_size > 0
+
+
+def test_the_roc_figure_renders_when_no_population_carried_both_classes(tmp_path):
+    """A cohort too degenerate to draw is a result, not a lost run."""
+    from teb_vae.lag_attn_transformer_cfs.latent_pilot import evaluate
+
+    labels_only_healthy = [0, 0, 0]
+    curves = {
+        "pretrained": {
+            "roc": evaluate.roc_points(labels_only_healthy, [0.1, 0.2, 0.3]),
+            "pr": evaluate.pr_points(labels_only_healthy, [0.1, 0.2, 0.3]),
+        }
+    }
+    metrics = {
+        "pretrained": evaluate.recording_metrics(
+            labels_only_healthy, [0.1, 0.2, 0.3], threshold=0.15
+        )
+    }
+    assert Path(pilot_report.figure_roc_pr(curves, metrics, tmp_path)).is_file()
+
+
+def test_the_confusion_figure_renders_one_panel_per_model_and_a_rates_panel(tmp_path):
+    _curves, metrics = _classification_inputs(_classification_bins())
+    written = pilot_report.figure_confusion(metrics, tmp_path)
+    assert Path(written).is_file() and Path(written).stat().st_size > 0
+
+
+def test_the_confusion_figure_renders_with_one_model(tmp_path):
+    """The rates panel occupies a column of its own, so a single model must not lose it."""
+    frame = _classification_bins()
+    _curves, metrics = _classification_inputs(frame[frame["model"] == "pretrained"])
+    assert Path(pilot_report.figure_confusion(metrics, tmp_path)).is_file()
+
+
+def test_the_metrics_over_time_figure_renders_with_gaps(tmp_path):
+    bin_metrics, _curves = _bin_tables(_classification_bins())
+    written = pilot_report.figure_metrics_vs_time(
+        bin_metrics, tmp_path,
+        bin_hours=BIN_HOURS, window_hours=ANALYSIS_HOURS,
+        supervised_hours=SUPERVISED_HOURS,
+    )
+    assert Path(written).is_file() and Path(written).stat().st_size > 0
+
+
+def test_an_empty_bin_table_still_produces_the_time_figures(tmp_path):
+    empty = pd.DataFrame(columns=[
+        "model", data.BIN_COLUMN, data.BIN_LABEL_COLUMN, "estimable",
+        "n_recordings", "n_adverse", "auroc", "tp", "fp", "fn", "tn",
+    ])
+    assert Path(pilot_report.figure_metrics_vs_time(
+        empty, tmp_path, bin_hours=BIN_HOURS, window_hours=ANALYSIS_HOURS,
+        supervised_hours=SUPERVISED_HOURS,
+    )).is_file()
+    assert Path(pilot_report.figure_counts_vs_time(
+        empty, tmp_path, bin_hours=BIN_HOURS, window_hours=ANALYSIS_HOURS,
+        supervised_hours=SUPERVISED_HOURS,
+    )).is_file()
+    assert Path(pilot_report.figure_roc_by_bin(
+        pd.DataFrame(columns=["model", data.BIN_COLUMN, "fpr", "tpr"]), empty, tmp_path
+    )).is_file()
+
+
+def test_the_roc_grid_draws_one_panel_per_estimable_bin(tmp_path):
+    frame = _classification_bins()
+    bin_metrics, bin_curves = _bin_tables(frame)
+    written = pilot_report.figure_roc_by_bin(bin_curves, bin_metrics, tmp_path)
+    assert Path(written).is_file() and Path(written).stat().st_size > 0
+    # The single-class and unoccupied bins contribute no curve, so the grid is smaller than the
+    # window: that count is the coverage statement the figure is partly there to make.
+    assert bin_curves[data.BIN_COLUMN].nunique() == 8
+
+
+def test_the_confusion_counts_figure_renders_one_row_per_model(tmp_path):
+    bin_metrics, _curves = _bin_tables(_classification_bins())
+    written = pilot_report.figure_counts_vs_time(
+        bin_metrics, tmp_path,
+        bin_hours=BIN_HOURS, window_hours=ANALYSIS_HOURS,
+        supervised_hours=SUPERVISED_HOURS,
+    )
+    assert Path(written).is_file() and Path(written).stat().st_size > 0
 
 
 # =============================================================================

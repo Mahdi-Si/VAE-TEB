@@ -121,6 +121,55 @@ def test_a_bin_width_that_does_not_divide_the_window_is_refused(tmp_path):
         pilot_config.resolve_settings(_write(tmp_path, {"windows": {"bin_hours": 0.4}}))
 
 
+def test_the_analysis_window_defaults_to_the_preservation_window(tmp_path):
+    """Unset, the new key changes nothing -- which is what makes it safe to add.
+
+    Every run written before ``windows.analysis_hours`` existed analysed exactly the window it
+    preserved, and a default that did anything else would silently redescribe those runs.
+    """
+    settings = pilot_config.resolve_settings(_write(tmp_path, {}))
+    assert settings["windows"]["analysis_hours"] is None
+    assert pilot_config.analysis_hours(settings) == settings["windows"]["preservation_hours"]
+
+
+def test_a_wider_analysis_window_is_accepted_and_leaves_preservation_alone(tmp_path):
+    settings = pilot_config.resolve_settings(
+        _write(tmp_path, {"windows": {"analysis_hours": 6.0}})
+    )
+    assert pilot_config.analysis_hours(settings) == 6.0
+    assert settings["windows"]["preservation_hours"] == 3.0
+    assert settings["windows"]["supervised_hours"] == 1.0
+
+
+def test_an_analysis_window_inside_the_preservation_window_is_refused(tmp_path):
+    with pytest.raises(PilotConfigError, match="analysis_hours"):
+        pilot_config.resolve_settings(
+            _write(tmp_path, {"windows": {"analysis_hours": 2.0}})
+        )
+
+
+def test_the_bin_width_must_divide_the_analysis_window_not_the_preserved_one(tmp_path):
+    """0.5 h divides three hours and not five, so a five-hour analysis at 0.4 h is refused."""
+    pilot_config.resolve_settings(_write(tmp_path, {"windows": {"analysis_hours": 6.0}}))
+    with pytest.raises(PilotConfigError, match="divide the analysis window"):
+        pilot_config.resolve_settings(
+            _write(tmp_path, {"windows": {"analysis_hours": 5.0, "bin_hours": 0.4}})
+        )
+
+
+def test_the_early_window_may_reach_into_the_wider_analysis_window(tmp_path):
+    settings = pilot_config.resolve_settings(
+        _write(tmp_path, {"windows": {
+            "analysis_hours": 6.0, "early_window_hours": [5.0, 6.0],
+        }})
+    )
+    assert settings["windows"]["early_window_hours"] == [5.0, 6.0]
+    with pytest.raises(PilotConfigError, match="analysis window"):
+        pilot_config.resolve_settings(
+            _write(tmp_path, {"windows": {"early_window_hours": [2.0, 4.0]}})
+        )
+
+
 def test_an_early_window_overlapping_the_supervised_bag_is_refused(tmp_path):
     with pytest.raises(PilotConfigError, match="overlaps"):
         pilot_config.resolve_settings(

@@ -278,6 +278,199 @@ def group_bands(
 
 
 # =============================================================================
+# Discrimination as a function of time before delivery
+# =============================================================================
+#: Columns identifying one cell of the per-bin table, before the measurements.
+BIN_METRIC_KEYS: Tuple[str, ...] = (
+    "model", data.BIN_COLUMN, data.BIN_LABEL_COLUMN, "hours_mid", "supervised_window",
+)
+
+
+def _bin_cells(scored: pd.DataFrame) -> List[Tuple[str, int, pd.DataFrame]]:
+    """Every ``(model, bin)`` block of a scored trajectory table, in a deterministic order.
+
+    ``sort=True`` so the table a figure is drawn from and the table a report prints are in the same
+    order whatever order the caller concatenated the models in.
+    """
+    return [
+        (str(model), int(index), block)
+        for (model, index), block in scored.groupby(
+            ["model", data.BIN_COLUMN], sort=True
+        )
+    ]
+
+
+def bin_classification(
+    scored: pd.DataFrame,
+    *,
+    thresholds: Mapping[str, float],
+    bin_hours: float,
+    resamples: int = 1000,
+    seed: int = 0,
+    confidence: float = CONFIDENCE,
+    patients: Optional[Mapping[str, str]] = None,
+    supervised: Sequence[int] = (),
+) -> pd.DataFrame:
+    """Discrimination measured separately in every trajectory bin, for every model.
+
+    The counterpart of :func:`group_bands`, which reports where each group's *score* sits. This
+    reports how well the score **separates the two groups** there: AUROC, average precision, the
+    confusion cells at the model's own validation threshold, and every rate derived from them, each
+    with a clustered percentile interval from :func:`~...evaluate.metric_intervals`.
+
+    Three things this cannot be read as, all of them recorded on the row rather than left to a
+    caption:
+
+    * **The head is frozen.** :func:`score_frame` applies each model's final-hour classifier
+      unchanged at every bin, so a bin outside ``supervised`` is that head evaluated outside the
+      window its loss was defined on. ``supervised_window`` marks which is which.
+    * **The threshold came from validation**, chosen on final-hour bags. Every count in an earlier
+      bin is that rule applied where it was not tuned, which is the honest thing to do and not the
+      same as a rule tuned there.
+    * **The cohort is whoever was observed in that bin.** A recording contributes to a bin only
+      where it has retained anchors, so ``n_recordings``, ``n_healthy`` and ``n_adverse`` differ
+      from bin to bin and a change in a metric across bins mixes a trend with a change in who
+      contributed. The counts travel with every row and every figure prints them.
+
+    A bin carrying one class, or too few units to resample, yields its counts, ``estimable`` false
+    and ``nan`` measurements with the estimator's own reason -- never an exception, because an
+    unoccupied bin five hours before delivery is expected.
+
+    Args:
+        scored: The concatenated per-bin score table, carrying ``model``, the GUID, the bin index
+            and label, the outcome and :data:`SCORE_COLUMN`.
+        thresholds: Each model's validation-selected decision threshold. A model absent here is
+            skipped, and the skip is logged by name.
+        bin_hours: Bin width, used only to report each bin's midpoint in hours before delivery.
+        resamples: Bootstrap draws per cell.
+        seed: Seeds every cell identically, so the table is reproducible from the record.
+        confidence: Interval coverage.
+        patients: GUID -> patient, or ``None`` for GUID-only grouping.
+        supervised: The bins inside the supervised window, from :func:`supervised_bins`.
+
+    Returns:
+        One row per ``(model, bin)``: the identifying columns, the counts, ``estimable``, every
+        :func:`~...evaluate.recording_metrics` key, ``<metric>_lo`` / ``<metric>_hi`` for the
+        resampled metrics, the grouping that was resampled and any note.
+    """
+    inside = {int(value) for value in supervised}
+    rows: List[Dict[str, Any]] = []
+    skipped: List[str] = []
+    for model, index, block in _bin_cells(scored):
+        if model not in thresholds:
+            if model not in skipped:
+                skipped.append(model)
+            continue
+        guids = [str(value) for value in block[data.GUID_COLUMN].tolist()]
+        record = evaluate.metric_intervals(
+            block[data.OUTCOME_COLUMN].to_numpy(),
+            block[SCORE_COLUMN].to_numpy(),
+            guids=guids,
+            threshold=float(thresholds[model]),
+            patients=(
+                {guid: patients[guid] for guid in guids if guid in patients}
+                if patients else None
+            ),
+            resamples=resamples,
+            seed=seed,
+            confidence=confidence,
+        )
+        row: Dict[str, Any] = {
+            "model": model,
+            data.BIN_COLUMN: index,
+            data.BIN_LABEL_COLUMN: (
+                str(block[data.BIN_LABEL_COLUMN].iloc[0])
+                if data.BIN_LABEL_COLUMN in block.columns else ""
+            ),
+            # The bin's nominal midpoint, not the median of the anchors that landed in it: the
+            # figure places every model's cell at the same x, and two models whose anchors differ
+            # slightly must not be drawn a hair apart as though that meant something.
+            "hours_mid": (float(index) + 0.5) * float(bin_hours),
+            "supervised_window": index in inside,
+            "estimable": bool(record["estimable"]),
+            "grouping": record["grouping"],
+            "n_units": int(record["n_units"]),
+            "note": str(record.get("note", "")),
+        }
+        # Every measurement, whether or not it was resampled: the counts and ``bce`` have no
+        # interval but still belong in the table a report prints.
+        row.update(record["full"])
+        for name, interval in record["metrics"].items():
+            row[f"{name}_lo"] = float(interval["lo"])
+            row[f"{name}_hi"] = float(interval["hi"])
+        rows.append(row)
+
+    if skipped:
+        logger.warning(
+            f"per-bin classification skipped model(s) {', '.join(sorted(skipped))}: no "
+            f"validation threshold was recorded for them, and a threshold invented here would "
+            f"not be the one the held-out table was read at"
+        )
+    table = pd.DataFrame(rows)
+    if not table.empty:
+        logger.info(
+            f"per-bin classification: {len(table)} (model, bin) cell(s); "
+            f"{int((~table['estimable']).sum())} not estimable"
+        )
+    return table
+
+
+def bin_roc_points(
+    scored: pd.DataFrame,
+    *,
+    thresholds: Mapping[str, float],
+    bin_hours: float,
+) -> pd.DataFrame:
+    """The ROC curve of every estimable ``(model, bin)`` cell, as a long table.
+
+    Long rather than one array per cell because it is written to parquet and read back by a figure
+    that draws one panel per bin; a ragged set of arrays would need its own container format for no
+    gain.
+
+    Cells that carry one class produce no rows at all -- :func:`~...evaluate.roc_points` returns
+    empty arrays there -- so the grid simply has no panel for them rather than a panel showing a
+    diagonal that was never measured.
+
+    Args:
+        scored: The concatenated per-bin score table, as :func:`bin_classification` takes.
+        thresholds: Each model's threshold, used only to place the operating point on the curve.
+        bin_hours: Bin width, for the midpoint column.
+
+    Returns:
+        ``model``, the bin index and label, ``hours_mid``, ``point`` (the position along the
+        curve), ``fpr``, ``tpr``, and the cell's ``auroc`` and counts repeated on every row.
+    """
+    rows: List[Dict[str, Any]] = []
+    for model, index, block in _bin_cells(scored):
+        if model not in thresholds:
+            continue
+        curve = evaluate.roc_points(
+            block[data.OUTCOME_COLUMN].to_numpy(), block[SCORE_COLUMN].to_numpy()
+        )
+        label = (
+            str(block[data.BIN_LABEL_COLUMN].iloc[0])
+            if data.BIN_LABEL_COLUMN in block.columns else ""
+        )
+        for position, (false_positive, true_positive) in enumerate(
+            zip(curve["fpr"], curve["tpr"])
+        ):
+            rows.append({
+                "model": model,
+                data.BIN_COLUMN: index,
+                data.BIN_LABEL_COLUMN: label,
+                "hours_mid": (float(index) + 0.5) * float(bin_hours),
+                "point": position,
+                "fpr": float(false_positive),
+                "tpr": float(true_positive),
+                "auroc": float(curve["auroc"]),
+                "n_recordings": int(curve["n_recordings"]),
+                "n_healthy": int(curve["n_healthy"]),
+                "n_adverse": int(curve["n_adverse"]),
+            })
+    return pd.DataFrame(rows)
+
+
+# =============================================================================
 # The paired early/late comparison
 # =============================================================================
 def window_scores(
@@ -921,10 +1114,13 @@ def load_projection(directory: Any) -> Projection:
 
 
 __all__ = [
+    "BIN_METRIC_KEYS",
     "CONFIDENCE",
     "PROJECTION_FILENAME",
     "SCORE_COLUMN",
     "Projection",
+    "bin_classification",
+    "bin_roc_points",
     "bin_summaries",
     "class_centroids",
     "covariance_summary",
