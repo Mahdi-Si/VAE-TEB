@@ -89,6 +89,7 @@ import torch
 from loguru import logger
 from tqdm import tqdm
 
+from teb_vae.lag_attn_transformer_cfs.latent_pilot import config as pilot_config
 from teb_vae.lag_attn_transformer_cfs.latent_pilot import data, evaluate, extract
 from teb_vae.lag_attn_transformer_cfs.latent_pilot import model as pilot_model
 from teb_vae.lag_attn_transformer_cfs.latent_pilot.config import PilotConfigError
@@ -853,6 +854,7 @@ def build_plans(
     *,
     split: str,
     supervised_hours: float,
+    preservation_hours: float,
     halflife_hours: float,
 ) -> Dict[str, RecordingPlan]:
     r"""Precompute every recording's support, weights and teacher values from one extraction.
@@ -870,12 +872,24 @@ def build_plans(
     student's own first forward, before any update, must reproduce these values -- see
     :func:`fit_adaptation`.
 
+    **The plan is narrowed to the preservation window, which the extraction need not be.** The
+    extraction spans ``windows.analysis_hours``, which a run may set wider than
+    ``windows.preservation_hours`` in order to draw trajectories and per-bin discrimination further
+    back than the objective reaches. The teacher term is defined on the preservation window, so the
+    anchors it holds still are selected here rather than taken to be every anchor the extraction
+    happened to keep -- otherwise widening the analysis would silently widen the loss, and the two
+    runs would not be comparable while looking as though they were. When the two windows are equal,
+    which is the default, this filter removes nothing.
+
     Args:
         extraction: The **pretrained** extraction of the split.
         recordings: The recording table, with outcomes and eligibility attached.
         split: The split being planned, checked against the extraction.
         supervised_hours: The supervised window's upper edge.
-        halflife_hours: The recency half-life inside it.
+        preservation_hours: The preservation window's upper edge: the anchors the teacher term is
+            computed over. Anchors outside it are dropped from the plan even when the extraction
+            kept them.
+        halflife_hours: The recency half-life inside the supervised window.
 
     Returns:
         GUID -> plan, for the eligible recordings that reach the supervised window.
@@ -888,6 +902,17 @@ def build_plans(
     if present != [str(split)]:
         raise PilotConfigError(
             f"the extraction carries split(s) {present} but plans were requested for {split!r}."
+        )
+    inside = data.in_window(
+        frame[data.HOURS_COLUMN].to_numpy(dtype=np.float64), 0.0, float(preservation_hours)
+    )
+    n_outside = int((~inside).sum())
+    frame = frame[inside]
+    if n_outside:
+        logger.info(
+            f"{split} plans: {n_outside} extracted anchor(s) lie outside the preservation window "
+            f"(0, {preservation_hours}] h and carry no teacher term; they remain in every analysis "
+            f"table, which spans the wider analysis window"
         )
 
     _eligible, outcomes = data.eligible_anchors(frame, recordings, split=split)
@@ -1228,7 +1253,10 @@ def fit_adaptation(
             loaded,
             val_loader,
             split="val",
-            preservation_hours=float(windows["preservation_hours"]),
+            # The analysis window, matching the saved validation extraction this is the per-epoch
+            # equivalent of; the gate below stays on ``preservation_hours``, which is the window
+            # the forecast tolerance was declared over.
+            preservation_hours=pilot_config.analysis_hours(settings),
             bin_hours=float(windows["bin_hours"]),
         )
         bags = build_bags(

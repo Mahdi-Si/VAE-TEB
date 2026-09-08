@@ -1230,6 +1230,97 @@ def balanced_accuracy(labels: Any, logits: Any, *, threshold: float) -> float:
     return float(np.mean(rates))
 
 
+#: The four cells of the confusion matrix, in the order ``sklearn.metrics.confusion_matrix``
+#: ravels them, so a reader comparing against that function finds the same sequence.
+CONFUSION_CELLS: Tuple[str, ...] = ("tn", "fp", "fn", "tp")
+
+#: The rates derived from those cells, in a fixed reporting order.
+RATE_NAMES: Tuple[str, ...] = (
+    "sensitivity", "specificity", "precision", "npv", "f1", "accuracy",
+)
+
+
+def confusion_counts(labels: Any, logits: Any, *, threshold: float) -> Dict[str, int]:
+    """The four confusion cells at one threshold.
+
+    The predicate is ``logit >= threshold``, the same one :func:`balanced_accuracy` and
+    :func:`select_threshold` already use -- one decision rule in this module, not three.
+
+    Written out rather than taken from ``sklearn.metrics.confusion_matrix``, which returns a
+    one-by-one matrix when the population carries one class and would need the same four cells
+    reassembled from it anyway. This always returns four integers, so a caller never has to know
+    whether a stratum was degenerate before it can read the table.
+
+    Args:
+        labels: Binary outcomes, one per recording.
+        logits: The classifier's logits.
+        threshold: Predict positive where ``logit >= threshold``.
+
+    Returns:
+        ``{'tn', 'fp', 'fn', 'tp'}`` as counts of recordings.
+    """
+    y = np.asarray(labels, dtype=np.int64).reshape(-1)
+    predicted = np.asarray(logits, dtype=np.float64).reshape(-1) >= float(threshold)
+    positive = y == 1
+    return {
+        "tn": int((~positive & ~predicted).sum()),
+        "fp": int((~positive & predicted).sum()),
+        "fn": int((positive & ~predicted).sum()),
+        "tp": int((positive & predicted).sum()),
+    }
+
+
+def derived_rates(counts: Mapping[str, Any]) -> Dict[str, float]:
+    r"""Sensitivity, specificity, precision, NPV, $F_1$ and accuracy from the four cells.
+
+    $$\mathrm{sens}=\frac{tp}{tp+fn},\quad \mathrm{spec}=\frac{tn}{tn+fp},\quad
+    \mathrm{prec}=\frac{tp}{tp+fp},\quad \mathrm{npv}=\frac{tn}{tn+fn},\quad
+    F_1=\frac{2\,tp}{2\,tp+fp+fn}.$$
+
+    **Two different zero denominators, two different answers, deliberately.**
+
+    * A denominator that counts a *class* -- actual positives for sensitivity, actual negatives for
+      specificity, any recording at all for accuracy -- is zero only when that class is absent from
+      the population, where the rate is **undefined**: ``nan``, never $0$, because a zero would
+      read as a measured failure rather than as an unmeasurable quantity.
+    * A denominator that counts a *prediction* -- predicted positives for precision, predicted
+      negatives for NPV -- is zero when the rule never fires, which is a decision rule this data
+      can describe. Those return $0.0$, the convention ``scikit-learn`` reports under
+      ``zero_division=0``. $F_1$ follows the same convention.
+
+    The consequence for the bootstrap is exact rather than incidental: sensitivity is ``nan``
+    precisely when there are no positives and specificity precisely when there are no negatives, so
+    the draws these two make non-finite are **exactly** the draws :func:`auroc` already makes
+    non-finite. Adding them to :data:`METRIC_NAMES` therefore excludes no draw that was previously
+    kept.
+
+    Args:
+        counts: A mapping carrying :data:`CONFUSION_CELLS`, as :func:`confusion_counts` returns.
+
+    Returns:
+        The six rates, in :data:`RATE_NAMES` order.
+    """
+    tn, fp = float(counts["tn"]), float(counts["fp"])
+    fn, tp = float(counts["fn"]), float(counts["tp"])
+
+    def _defined(numerator: float, denominator: float) -> float:
+        """A rate whose denominator counts a class: absent class means undefined."""
+        return numerator / denominator if denominator > 0.0 else float("nan")
+
+    def _convention(numerator: float, denominator: float) -> float:
+        """A rate whose denominator counts a prediction: a rule that never fires scores zero."""
+        return numerator / denominator if denominator > 0.0 else 0.0
+
+    return {
+        "sensitivity": _defined(tp, tp + fn),
+        "specificity": _defined(tn, tn + fp),
+        "precision": _convention(tp, tp + fp),
+        "npv": _convention(tn, tn + fn),
+        "f1": _convention(2.0 * tp, 2.0 * tp + fp + fn),
+        "accuracy": _defined(tp + tn, tp + tn + fp + fn),
+    }
+
+
 def select_threshold(labels: Any, logits: Any) -> Dict[str, Any]:
     """Choose the decision threshold that maximises balanced accuracy, deterministically.
 
@@ -1296,7 +1387,9 @@ def select_threshold(labels: Any, logits: Any) -> Dict[str, Any]:
 # One observation per held-out recording
 # =============================================================================
 #: Metrics reported for every model on every population, in a fixed order.
-METRIC_NAMES: Tuple[str, ...] = ("auroc", "average_precision", "balanced_accuracy")
+METRIC_NAMES: Tuple[str, ...] = (
+    "auroc", "average_precision", "balanced_accuracy", "f1", "sensitivity", "specificity",
+)
 
 #: Confidence level of every interval this package reports.
 CONFIDENCE = 0.95
@@ -1324,6 +1417,107 @@ def average_precision(labels: Any, scores: Any) -> float:
     return float(average_precision_score(y, np.asarray(scores, dtype=np.float64).reshape(-1)))
 
 
+#: What a curve function returns when the population cannot support one.
+SINGLE_CLASS_NOTE = (
+    "the population carries one binary class, so the curve is undefined rather than degenerate; "
+    "no points are returned and the figure draws a gap"
+)
+
+
+def _class_counts(y: np.ndarray) -> Dict[str, int]:
+    """The two class counts, reported beside every curve so a reader sees what it rests on."""
+    return {
+        "n_recordings": int(y.size),
+        "n_healthy": int((y == 0).sum()),
+        "n_adverse": int((y == 1).sum()),
+    }
+
+
+def roc_points(labels: Any, scores: Any) -> Dict[str, Any]:
+    """The ROC curve itself, not just the area under it.
+
+    ``drop_intermediate=False`` for the same reason :func:`select_threshold` sets it: the default
+    thins points that are collinear in both axes, which leaves the drawn curve identical but makes
+    the point count describe a thinned curve rather than every distinct split of the scores.
+
+    A population carrying one class returns **empty arrays and a note** rather than raising: a bin
+    five hours before delivery with no adverse recording in it is a fact about the cohort, and the
+    figure draws a gap there.
+
+    Args:
+        labels: Binary outcomes, one per recording.
+        scores: Any monotone score, typically the classifier's logit.
+
+    Returns:
+        ``fpr``, ``tpr`` and ``thresholds`` as lists, the ``auroc`` they integrate to, the class
+        counts, and ``note`` when the curve could not be formed.
+    """
+    from sklearn.metrics import roc_curve
+
+    y = np.asarray(labels, dtype=np.int64).reshape(-1)
+    values = np.asarray(scores, dtype=np.float64).reshape(-1)
+    record: Dict[str, Any] = {
+        "fpr": [], "tpr": [], "thresholds": [],
+        "auroc": float("nan"), "chance_auroc": 0.5, **_class_counts(y),
+    }
+    if y.size == 0 or len(set(y.tolist())) < 2:
+        record["note"] = SINGLE_CLASS_NOTE
+        return record
+    false_positive, true_positive, thresholds = roc_curve(
+        y, values, drop_intermediate=False
+    )
+    record["fpr"] = [float(value) for value in false_positive]
+    record["tpr"] = [float(value) for value in true_positive]
+    # The leading threshold is ``+inf`` -- the rule that calls nothing positive. It is a legal
+    # point of the curve and is kept, unlike in ``select_threshold`` where it was a candidate
+    # decision rule no finite score could meet.
+    record["thresholds"] = [float(value) for value in thresholds]
+    record["auroc"] = auroc(y, values)
+    return record
+
+
+def pr_points(labels: Any, scores: Any) -> Dict[str, Any]:
+    """The precision-recall curve, with the prevalence that sets its chance level.
+
+    Unlike the ROC, this curve has no fixed baseline: a useless ranker traces a horizontal line at
+    the adverse-outcome prevalence, so the prevalence travels with the curve and every figure draws
+    it. See :func:`average_precision`.
+
+    Args:
+        labels: Binary outcomes.
+        scores: Any monotone score.
+
+    Returns:
+        ``recall``, ``precision`` and ``thresholds`` as lists, the ``average_precision``, the
+        ``prevalence`` that is its chance level, the class counts, and ``note`` when the curve
+        could not be formed.
+    """
+    from sklearn.metrics import precision_recall_curve
+
+    y = np.asarray(labels, dtype=np.int64).reshape(-1)
+    values = np.asarray(scores, dtype=np.float64).reshape(-1)
+    prevalence = float(y.mean()) if y.size else float("nan")
+    record: Dict[str, Any] = {
+        "recall": [], "precision": [], "thresholds": [],
+        "average_precision": float("nan"),
+        "prevalence": prevalence,
+        "chance_average_precision": prevalence,
+        **_class_counts(y),
+    }
+    if y.size == 0 or len(set(y.tolist())) < 2:
+        record["note"] = SINGLE_CLASS_NOTE
+        return record
+    precision, recall, thresholds = precision_recall_curve(y, values)
+    record["recall"] = [float(value) for value in recall]
+    record["precision"] = [float(value) for value in precision]
+    # ``precision_recall_curve`` returns one fewer threshold than points: the final point is the
+    # (recall 0, precision 1) corner that no threshold produces. Carried as-is rather than padded,
+    # so the arrays keep the library's own contract.
+    record["thresholds"] = [float(value) for value in thresholds]
+    record["average_precision"] = average_precision(y, values)
+    return record
+
+
 def recording_metrics(labels: Any, logits: Any, *, threshold: float) -> Dict[str, Any]:
     """The recording-level readout of one model on one population.
 
@@ -1337,16 +1531,20 @@ def recording_metrics(labels: Any, logits: Any, *, threshold: float) -> Dict[str
             this population is the test split.
 
     Returns:
-        AUROC, average precision, balanced accuracy at the threshold, the prevalence average
-        precision must be read against, and the counts behind all of them.
+        The threshold-free ranking metrics (AUROC, average precision), the confusion cells at the
+        threshold and every rate derived from them, the prevalence average precision must be read
+        against, and the counts behind all of them.
     """
     y = np.asarray(labels, dtype=np.int64).reshape(-1)
     values = np.asarray(logits, dtype=np.float64).reshape(-1)
+    counts = confusion_counts(y, values, threshold=float(threshold))
     return {
         "auroc": auroc(y, values),
         "average_precision": average_precision(y, values),
         "balanced_accuracy": balanced_accuracy(y, values, threshold=float(threshold)),
         "bce": binary_cross_entropy(y, values),
+        **counts,
+        **derived_rates(counts),
         "threshold": float(threshold),
         "prevalence": float(y.mean()) if y.size else float("nan"),
         "n_recordings": int(y.size),
@@ -1400,6 +1598,81 @@ def _strata(
         signature = tuple(sorted({int(labels[index]) for index in rows[unit]}))
         strata.setdefault(signature, []).append(unit)
     return strata
+
+
+def _draw_rows(
+    strata: Mapping[Tuple[int, ...], Sequence[str]],
+    rows: Mapping[str, Sequence[int]],
+    generator: Any,
+) -> np.ndarray:
+    """One stratified cluster resample, as row positions into the aligned arrays.
+
+    Every stratum keeps its own size, so a draw cannot silently become one in which a class is
+    absent and the ranking metrics undefined; and a unit enters with **all** of its rows, which is
+    what makes this a cluster bootstrap rather than a row bootstrap wearing the name.
+
+    Shared by :func:`paired_bootstrap` and :func:`metric_intervals` rather than written twice: a
+    per-bin interval and a headline interval that resampled differently would not be comparable,
+    and the difference would be invisible in the report.
+
+    Args:
+        strata: Unit names grouped by their outcome signature, from :func:`_strata`.
+        rows: Unit name -> the row positions it owns, from :func:`bootstrap_units`.
+        generator: The seeded ``numpy`` generator; advanced in place, so consecutive calls give
+            consecutive draws.
+
+    Returns:
+        The drawn row positions, in stratum order.
+    """
+    drawn: List[int] = []
+    for members in strata.values():
+        picked = generator.integers(0, len(members), size=len(members))
+        for position in picked.tolist():
+            drawn.extend(rows[members[position]])
+    return np.asarray(drawn, dtype=np.int64)
+
+
+def _percentile_interval(
+    sample: Sequence[float], estimate: float, *, confidence: float
+) -> Dict[str, Any]:
+    r"""A percentile interval around a point estimate that was **not** taken from the draws.
+
+    $$\left[\hat\theta^{*}_{(\alpha/2)},\ \hat\theta^{*}_{(1-\alpha/2)}\right],
+    \qquad \alpha = 1 - \mathrm{confidence},$$
+
+    with the point being the metric on the full sample. The draws estimate the spread; the value is
+    the value. Percentile rather than a normal approximation, matching
+    :func:`~teb_vae.lag_attn.eval.stats.bootstrap_ci`, so an interval means the same thing
+    everywhere in this repository.
+
+    Args:
+        sample: The usable draws of this metric.
+        estimate: The metric on the full sample.
+        confidence: Interval coverage.
+
+    Returns:
+        ``point``, ``lo``, ``hi`` and ``n_draws``; the bounds are ``NaN`` with a ``note`` -- never
+        an exception -- below :data:`MIN_UNITS` usable draws.
+    """
+    finite = np.asarray(sample, dtype=np.float64)
+    if finite.size < MIN_UNITS:
+        return {
+            "point": float(estimate),
+            "lo": float("nan"),
+            "hi": float("nan"),
+            "n_draws": int(finite.size),
+            "note": (
+                f"only {finite.size} usable draw(s); no interval is reported rather than one "
+                f"decided by two order statistics of a tiny sample"
+            ),
+        }
+    alpha = 1.0 - float(confidence)
+    return {
+        "point": float(estimate),
+        "lo": float(np.quantile(finite, alpha / 2.0)),
+        "hi": float(np.quantile(finite, 1.0 - alpha / 2.0)),
+        "n_draws": int(finite.size),
+    }
 
 
 def paired_bootstrap(
@@ -1507,13 +1780,7 @@ def paired_bootstrap(
     n_undefined = 0
 
     for _draw in range(int(resamples)):
-        drawn: List[int] = []
-        for members in strata.values():
-            picked = generator.integers(0, len(members), size=len(members))
-            for position in picked.tolist():
-                drawn.extend(rows[members[position]])
-        index = np.asarray(drawn, dtype=np.int64)
-        values = _metrics(index)
+        values = _metrics(_draw_rows(strata, rows, generator))
         if any(
             not np.isfinite(values[name][metric])
             for name in values for metric in METRIC_NAMES
@@ -1529,41 +1796,22 @@ def paired_bootstrap(
                     values[after][metric] - values[before][metric]
                 )
 
-    alpha = 1.0 - float(confidence)
-
-    def _interval(sample: Sequence[float], estimate: float) -> Dict[str, Any]:
-        finite = np.asarray(sample, dtype=np.float64)
-        if finite.size < MIN_UNITS:
-            return {
-                "point": float(estimate),
-                "lo": float("nan"),
-                "hi": float("nan"),
-                "n_draws": int(finite.size),
-                "note": (
-                    f"only {finite.size} usable draw(s); no interval is reported rather than one "
-                    f"decided by two order statistics of a tiny sample"
-                ),
-            }
-        return {
-            "point": float(estimate),
-            "lo": float(np.quantile(finite, alpha / 2.0)),
-            "hi": float(np.quantile(finite, 1.0 - alpha / 2.0)),
-            "n_draws": int(finite.size),
-        }
-
     record = {
         "models": {
             name: {
-                metric: _interval(draws[name][metric], point[name][metric])
+                metric: _percentile_interval(
+                    draws[name][metric], point[name][metric], confidence=confidence
+                )
                 for metric in METRIC_NAMES
             }
             for name in scores
         },
         "paired": {
             label: {
-                metric: _interval(
+                metric: _percentile_interval(
                     deltas[label][metric],
                     point[label.split(" - ")[0]][metric] - point[label.split(" - ")[1]][metric],
+                    confidence=confidence,
                 )
                 for metric in METRIC_NAMES
             }
@@ -1599,6 +1847,115 @@ def paired_bootstrap(
         f"paired bootstrap: {resamples} draw(s) over {len(units)} {grouping}(s) in "
         f"{len(strata)} stratum/strata; {n_undefined} undefined draw(s)"
     )
+    return record
+
+
+def metric_intervals(
+    labels: Any,
+    scores: Any,
+    *,
+    guids: Sequence[str],
+    threshold: float,
+    patients: Optional[Mapping[str, str]] = None,
+    resamples: int = 1000,
+    seed: int = 0,
+    confidence: float = CONFIDENCE,
+    metrics: Sequence[str] = METRIC_NAMES,
+) -> Dict[str, Any]:
+    """One population, one model: every metric with a clustered percentile interval.
+
+    The single-population sibling of :func:`paired_bootstrap`, sharing its units
+    (:func:`bootstrap_units`), its strata (:func:`_strata`), its draw (:func:`_draw_rows`) and its
+    interval (:func:`_percentile_interval`). Written for the per-time-bin readout, where there is
+    no pairing to preserve because each bin is its own population.
+
+    **It refuses nothing.** A bin carrying one class, or fewer than :data:`MIN_UNITS` units, is a
+    fact about the cohort five hours before delivery rather than a software failure: the record
+    comes back with its counts, ``estimable`` false, ``nan`` points and the reason, and the figure
+    draws a gap there. That is the opposite of :func:`paired_bootstrap`, which raises -- because a
+    headline held-out comparison that cannot be estimated is a result the report must not quietly
+    omit, while an unoccupied trajectory bin is expected.
+
+    Args:
+        labels: Binary outcomes, one per recording in this population.
+        scores: The model's logits, aligned with ``labels``.
+        guids: One GUID per row, for the clustering.
+        threshold: The model's decision threshold, chosen on validation and never here.
+        patients: GUID -> patient, or ``None`` for GUID-only grouping.
+        resamples: Draws.
+        seed: Seeds the draws, so the interval is reproducible from the record.
+        confidence: Interval coverage.
+        metrics: Which metrics to resample. Defaults to :data:`METRIC_NAMES`.
+
+    Returns:
+        ``point`` estimates on the full sample under ``metrics``, each with ``lo``/``hi``, plus the
+        full :func:`recording_metrics` readout under ``full``, the counts, what was resampled, and
+        ``estimable`` with a ``note`` when no interval could be formed.
+    """
+    y = np.asarray(labels, dtype=np.int64).reshape(-1)
+    values = np.asarray(scores, dtype=np.float64).reshape(-1)
+    if values.size != y.size or len(guids) != y.size:
+        raise GateEvaluationError(
+            f"metric_intervals received {y.size} label(s), {values.size} score(s) and "
+            f"{len(guids)} GUID(s); all three describe the same recordings and must align."
+        )
+    wanted = tuple(str(name) for name in metrics)
+    full = recording_metrics(y, values, threshold=float(threshold))
+    units, rows, grouping = bootstrap_units(guids, patients)
+    record: Dict[str, Any] = {
+        "full": full,
+        "metrics": {
+            name: {"point": float(full.get(name, float("nan"))), "lo": float("nan"),
+                   "hi": float("nan"), "n_draws": 0}
+            for name in wanted
+        },
+        "grouping": grouping,
+        "n_units": len(units),
+        "n_recordings": int(y.size),
+        "n_healthy": int((y == 0).sum()),
+        "n_adverse": int((y == 1).sum()),
+        "resamples": int(resamples),
+        "n_undefined_draws": 0,
+        "seed": int(seed),
+        "confidence": float(confidence),
+        "estimable": True,
+        "method": (
+            f"outcome-stratified percentile bootstrap over {grouping}s"
+        ),
+    }
+    if len(set(y.tolist())) < 2:
+        record["estimable"] = False
+        record["note"] = SINGLE_CLASS_NOTE
+        return record
+    if len(units) < MIN_UNITS:
+        record["estimable"] = False
+        record["note"] = (
+            f"only {len(units)} {grouping}(s) contribute here; below {MIN_UNITS} a bootstrap "
+            f"reproduces the sample rather than estimating its spread, so the point estimates "
+            f"stand without intervals"
+        )
+        return record
+
+    strata = _strata(units, rows, y)
+    generator = np.random.default_rng(int(seed))
+    draws: Dict[str, List[float]] = {name: [] for name in wanted}
+    n_undefined = 0
+    for _draw in range(int(resamples)):
+        index = _draw_rows(strata, rows, generator)
+        drawn = recording_metrics(y[index], values[index], threshold=float(threshold))
+        if any(not np.isfinite(drawn[name]) for name in wanted):
+            n_undefined += 1
+            continue
+        for name in wanted:
+            draws[name].append(float(drawn[name]))
+    record["n_undefined_draws"] = n_undefined
+    record["n_strata"] = len(strata)
+    record["metrics"] = {
+        name: _percentile_interval(
+            draws[name], full.get(name, float("nan")), confidence=confidence
+        )
+        for name in wanted
+    }
     return record
 
 
@@ -1807,13 +2164,21 @@ __all__ = [
     "GateResult",
     "PreservationReading",
     "CONFIDENCE",
+    "CONFUSION_CELLS",
     "METRIC_NAMES",
     "MIN_UNITS",
+    "RATE_NAMES",
+    "SINGLE_CLASS_NOTE",
     "SUBGROUPS",
     "auroc",
     "average_precision",
     "balanced_accuracy",
     "bootstrap_units",
+    "confusion_counts",
+    "derived_rates",
+    "metric_intervals",
+    "pr_points",
+    "roc_points",
     "control_disclosure",
     "coverage_contrast",
     "binary_cross_entropy",

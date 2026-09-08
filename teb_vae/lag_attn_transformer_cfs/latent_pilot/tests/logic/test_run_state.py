@@ -249,3 +249,79 @@ def test_a_run_cannot_be_locked_twice(scratch):
 
     # And the first record is the one that stands.
     assert pilot_config.read_selection_lock(opened["run_dir"])["selected_epoch"] == 0
+
+
+# =============================================================================
+# A schema addition is not a changed choice
+# =============================================================================
+def test_a_setting_added_since_the_run_at_its_default_is_not_a_difference():
+    """Otherwise the first new key makes every finished run directory unreadable.
+
+    ``open_run`` compares the resolved settings against the ones the protocol recorded, and refuses
+    on any difference. A key the schema gained afterwards is absent from every stored protocol, so
+    without this it would refuse ``report`` on a run whose artifacts are entirely valid -- which is
+    exactly the operation an operator performs to regenerate figures from a finished run.
+    """
+    stored = {"windows": {"preservation_hours": 3.0, "bin_hours": 0.5}}
+    current = {
+        "windows": {
+            "preservation_hours": 3.0,
+            "bin_hours": 0.5,
+            "analysis_hours": pilot_config.DEFAULTS["windows"]["analysis_hours"],
+        }
+    }
+    assert pilot_config.settings_differences(stored, current) == {}
+
+
+def test_a_setting_added_since_the_run_and_then_set_still_refuses():
+    stored = {"windows": {"preservation_hours": 3.0}}
+    current = {"windows": {"preservation_hours": 3.0, "analysis_hours": 6.0}}
+    assert pilot_config.settings_differences(stored, current) == {
+        "windows.analysis_hours": (None, 6.0),
+    }
+
+
+def test_a_changed_value_still_refuses():
+    assert pilot_config.settings_differences(
+        {"windows": {"preservation_hours": 3.0}},
+        {"windows": {"preservation_hours": 6.0}},
+    ) == {"windows.preservation_hours": (3.0, 6.0)}
+
+
+def test_a_key_the_schema_does_not_know_is_still_a_difference():
+    """The tolerance is for *schema* additions, not for anything absent from the stored record."""
+    assert pilot_config.settings_differences(
+        {"windows": {}}, {"windows": {"invented_key": 1.0}}
+    ) == {"windows.invented_key": (None, 1.0)}
+
+
+def test_the_selection_flag_survives_the_stage_that_set_it(tmp_path):
+    """Two writers, one file: the runner's record must not undo the lock written under it.
+
+    ``lock_selection`` runs in the middle of the evaluation stage and writes the flag from a record
+    it reads itself; the runner then persists the copy it has held since ``open_run``, which
+    predates the lock. Without the carry-forward the directory ends up claiming the selection was
+    never locked while ``selection_lock.json`` sits beside it.
+    """
+    state = pilot_config.new_stage_state(["evaluate"])
+    pilot_config.write_stage_state(state, tmp_path)
+    assert state["selection_locked"] is False
+
+    pilot_config.lock_selection(tmp_path, {"models": {}})
+    assert pilot_config.read_stage_state(tmp_path)["selection_locked"] is True
+
+    # The runner's own record is the stale one, and it is what gets written back.
+    pilot_config.mark_completed(state, "evaluate", tmp_path)
+    assert pilot_config.read_stage_state(tmp_path)["selection_locked"] is True
+    assert state["selection_locked"] is True
+
+
+def test_a_failed_stage_does_not_withdraw_the_lock(tmp_path):
+    state = pilot_config.new_stage_state(["evaluate"])
+    pilot_config.write_stage_state(state, tmp_path)
+    pilot_config.lock_selection(tmp_path, {"models": {}})
+
+    pilot_config.mark_failed(state, "evaluate", tmp_path, reason="boom")
+    stored = pilot_config.read_stage_state(tmp_path)
+    assert stored["selection_locked"] is True
+    assert stored["failed"]["stage"] == "evaluate"

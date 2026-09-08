@@ -174,10 +174,24 @@ DEFAULTS: Dict[str, Any] = {
     "windows": {
         # The supervised bag: the final hour before delivery.
         "supervised_hours": 1.0,
-        # Preservation and trajectory support: the final three hours.
+        # Teacher preservation: the window the fine-tuning objective holds the latent still over,
+        # and the window the forecast gate is measured on. This is a TRAINING setting.
         "preservation_hours": 3.0,
-        # Trajectory bin width; must divide ``preservation_hours`` exactly, giving the six fixed
-        # half-hour bins the trajectory figure is drawn over.
+        # How far back the analysis reaches: the window latents are extracted over, the trajectory
+        # bins tile, and every figure axis spans. ``None`` means "the same as preservation_hours",
+        # which is what every run before this key existed did, so leaving it unset changes nothing.
+        #
+        # Setting it LARGER separates the two: the objective still supervises the final
+        # ``supervised_hours`` and still preserves ``preservation_hours``, while the trajectories,
+        # the per-bin discrimination and the figures reach further back. It may not be smaller --
+        # the teacher term is computed on extracted anchors, so an analysis window inside the
+        # preservation window would leave the loss without the support it is defined on.
+        #
+        # It is not free: the extraction is the long pass of a run and it also runs once per epoch
+        # on validation, so doubling this roughly doubles the per-epoch cost of the fit.
+        "analysis_hours": None,
+        # Trajectory bin width; must divide the analysis window exactly, so the bins tile it with
+        # no partial trailing bin drawn beside full ones.
         "bin_hours": 0.5,
         # The early window of the paired within-recording temporal comparison, in hours before
         # delivery. The late window is the supervised bag itself and is therefore not a separate
@@ -256,6 +270,7 @@ _NULLABLE_TYPES: Dict[str, Any] = {
     "provenance.selection_guids": str,
     "provenance.patient_map": str,
     "provenance.statistics_population": str,
+    "windows.analysis_hours": (int, float),
     "windows.segment_span_seconds": (int, float),
     "mc.large_draws": int,
 }
@@ -274,6 +289,7 @@ _LIST_ITEM_TYPES: Dict[str, Any] = {
 _POSITIVE: frozenset = frozenset({
     "windows.supervised_hours",
     "windows.preservation_hours",
+    "windows.analysis_hours",
     "windows.bin_hours",
     "windows.segment_span_seconds",
     "eligibility.final_anchor_within_minutes",
@@ -514,6 +530,26 @@ def _validate_tree(
     return resolved
 
 
+def analysis_hours(settings: Mapping[str, Any]) -> float:
+    """How far back this run analyses, in hours before delivery.
+
+    The fallback lives here and nowhere else: ``windows.analysis_hours`` is ``None`` by default and
+    means "the same as ``windows.preservation_hours``", and a call site repeating that ``or`` would
+    eventually be the one call site that forgot it.
+
+    Args:
+        settings: The resolved settings.
+
+    Returns:
+        ``windows.analysis_hours`` when set, otherwise ``windows.preservation_hours``.
+    """
+    windows = settings["windows"]
+    configured = windows.get("analysis_hours")
+    if configured is None:
+        return float(windows["preservation_hours"])
+    return float(configured)
+
+
 def _cross_check(settings: Mapping[str, Any], source: str) -> None:
     """Refuse combinations that are individually valid and jointly incoherent.
 
@@ -535,12 +571,20 @@ def _cross_check(settings: Mapping[str, Any], source: str) -> None:
             f"({preservation}) (from {source}): the supervised bag must sit inside the window the "
             f"teacher preserves, or the classification loss would move anchors nothing anchors."
         )
-    bins = preservation / windows["bin_hours"]
+    analysis = analysis_hours(settings)
+    if analysis < preservation:
+        raise PilotConfigError(
+            f"{PILOT_KEY}.windows.analysis_hours ({analysis}) is inside preservation_hours "
+            f"({preservation}) (from {source}): the teacher term is computed on the anchors the "
+            f"extraction kept, so a narrower analysis window would leave the preservation loss "
+            f"without the support it is defined on. Widen it, or lower preservation_hours."
+        )
+    bins = analysis / windows["bin_hours"]
     if abs(bins - round(bins)) > 1e-9:
         raise PilotConfigError(
-            f"{PILOT_KEY}.windows.bin_hours ({windows['bin_hours']}) does not divide "
-            f"preservation_hours ({preservation}) a whole number of times (from {source}); a "
-            f"partial trailing bin would be drawn beside full ones and read as a real difference."
+            f"{PILOT_KEY}.windows.bin_hours ({windows['bin_hours']}) does not divide the analysis "
+            f"window ({analysis}) a whole number of times (from {source}); a partial trailing bin "
+            f"would be drawn beside full ones and read as a real difference."
         )
 
     early = windows["early_window_hours"]
@@ -549,10 +593,10 @@ def _cross_check(settings: Mapping[str, Any], source: str) -> None:
             f"{PILOT_KEY}.windows.early_window_hours (from {source}) must be an increasing pair "
             f"[low, high] in hours before delivery, got {early!r}."
         )
-    if early[0] < 0 or early[1] > preservation:
+    if early[0] < 0 or early[1] > analysis:
         raise PilotConfigError(
             f"{PILOT_KEY}.windows.early_window_hours {early!r} (from {source}) falls outside the "
-            f"preserved window (0, {preservation}] h, where no latents are extracted."
+            f"analysis window (0, {analysis}] h, where no latents are extracted."
         )
     if early[0] < supervised:
         raise PilotConfigError(
@@ -1028,6 +1072,15 @@ def settings_differences(
 ) -> Dict[str, Tuple[Any, Any]]:
     """Which settings a resumed run would change, as dotted paths.
 
+    **A key this schema has gained since the run was written is not a difference**, provided the
+    current value is that key's own default. The stored record describes the choices its artifacts
+    were made under, and a setting that did not exist then was not a choice anyone made; refusing
+    on it would make every finished run directory unreadable the first time a key was added --
+    including for ``report``, which rewrites presentation and fits nothing. A path present in both
+    with different values, and a path added and then *set* to something other than its default,
+    both still refuse: those are choices, and continuing under them would leave a directory whose
+    protocol describes a run that never happened.
+
     Args:
         stored: The settings the run directory was created under.
         current: The settings this invocation resolved.
@@ -1036,10 +1089,20 @@ def settings_differences(
         Path -> ``(stored, current)`` for every leaf that differs. Empty when they agree.
     """
     left, right = _flatten(stored), _flatten(current)
+    defaults = _flatten(DEFAULTS)
+    added_at_default = {
+        path for path in set(right) - set(left)
+        if path in defaults and right[path] == defaults[path]
+    }
+    if added_at_default:
+        logger.info(
+            f"settings key(s) {sorted(added_at_default)} are absent from the stored protocol and "
+            f"carry their default value; treated as a schema addition rather than a changed choice"
+        )
     return {
         path: (left.get(path), right.get(path))
         for path in sorted(set(left) | set(right))
-        if left.get(path) != right.get(path)
+        if path not in added_at_default and left.get(path) != right.get(path)
     }
 
 
@@ -1122,6 +1185,32 @@ def read_stage_state(directory: Any) -> Dict[str, Any]:
     return state
 
 
+def _carry_forward_flags(state: Dict[str, Any], directory: Any) -> Dict[str, Any]:
+    """Refresh the flags a *different* writer may have set since this record was read.
+
+    ``stage_state.json`` has two writers. The runner holds one record for the length of a stage and
+    persists it when the stage ends; :func:`lock_selection` writes ``selection_locked`` into the
+    file in the middle of the evaluation stage, from a record it read itself. Without this, the
+    runner's copy -- read before the lock existed -- is written back over it, and the run directory
+    ends up claiming the selection was never locked while ``selection_lock.json`` sits beside it.
+
+    Only ``selection_locked`` is carried, and only from false to true: it is the one field this
+    module sets outside the runner's own record, and a lock is never withdrawn.
+
+    Args:
+        state: The runner's record, updated in place.
+        directory: The run directory.
+
+    Returns:
+        The updated record.
+    """
+    if not state.get("selection_locked"):
+        state["selection_locked"] = bool(
+            read_stage_state(directory).get("selection_locked", False)
+        )
+    return state
+
+
 def mark_completed(state: Dict[str, Any], stage: str, directory: Any) -> Dict[str, Any]:
     """Record that a stage finished, and persist the record.
 
@@ -1136,7 +1225,7 @@ def mark_completed(state: Dict[str, Any], stage: str, directory: Any) -> Dict[st
     if stage not in state["completed"]:
         state["completed"].append(stage)
     state["failed"] = None
-    write_stage_state(state, directory)
+    write_stage_state(_carry_forward_flags(state, directory), directory)
     return state
 
 
@@ -1157,7 +1246,7 @@ def mark_failed(state: Dict[str, Any], stage: str, directory: Any, *, reason: st
         The updated record.
     """
     state["failed"] = {"stage": stage, "reason": str(reason)}
-    write_stage_state(state, directory)
+    write_stage_state(_carry_forward_flags(state, directory), directory)
     return state
 
 
@@ -1415,6 +1504,7 @@ __all__ = [
     "REPO_ROOT",
     "RERUNNABLE_STAGES",
     "SELECTION_LOCK_FILENAME",
+    "analysis_hours",
     "STAGES",
     "STAGE_INPUTS",
     "STAGE_STATE_FILENAME",

@@ -76,6 +76,17 @@ FIGURE_TRAJECTORIES = "figure3_trajectories"
 #: away.
 FIGURE_COVERAGE_SPACE = "figure1b_latent_space_by_coverage"
 
+#: The classification readout. Not part of the original three: those answer whether the latent
+#: moved and where the cohort sits in it, while these answer how well the score separates the two
+#: outcome groups -- overall on the final-hour bags, and separately in every trajectory bin. They
+#: are drawn from tables the evaluation stage already wrote, so they can be produced for a finished
+#: run without refitting anything.
+FIGURE_ROC_PR = "figure4_roc_pr"
+FIGURE_CONFUSION = "figure5_confusion"
+FIGURE_METRICS_TIME = "figure6_metrics_vs_time"
+FIGURE_ROC_BINS = "figure7_roc_by_time_bin"
+FIGURE_COUNTS_TIME = "figure8_confusion_counts_vs_time"
+
 #: The class axis, in the order every panel draws it, taken from the repository's own class table
 #: rather than restated -- a class added there reaches these figures without an edit here.
 PLOT_CLASSES: Tuple[str, ...] = tuple(labels.CLASS_NAMES.values())
@@ -127,6 +138,37 @@ CAPTIONS: Dict[str, str] = {
         "each bin are the recordings the band rests on; gaps are real absences and no line is "
         "extended to delivery without data. Raw FHR/UP excerpts are not produced by this "
         "pipeline."
+    ),
+    FIGURE_ROC_PR: (
+        "Held-out ROC and precision-recall for the final-hour recording bags. The curves are "
+        "threshold-free and therefore comparable between two models whose logit scales are not; "
+        "the dots are the operating point of each model's threshold, which was chosen on "
+        "validation and never here. PR chance is the adverse-outcome prevalence, not one half."
+    ),
+    FIGURE_CONFUSION: (
+        "Confusion counts at each model's validation-selected threshold, on the same held-out "
+        "recordings, with every rate derived from them. All panels share one colour scale, so a "
+        "cell of the same colour is the same count. Counts are recordings, not segments or "
+        "anchors, and a rate resting on a handful of them is not a smaller version of the same "
+        "measurement."
+    ),
+    FIGURE_METRICS_TIME: (
+        "Discrimination measured separately in each trajectory bin. The head is the frozen "
+        "final-hour classifier and the threshold is the one selected on validation, so every bin "
+        "outside the shaded supervised window is that rule applied where it was not fitted. The "
+        "cohort is whoever was observed in a bin, so the adverse/total counts under each bin are "
+        "part of the reading: a metric that moves towards delivery may be a trend or a change in "
+        "who was still recorded. Bins carrying one class are gaps, not zeros."
+    ),
+    FIGURE_ROC_BINS: (
+        "The ROC of every time bin that carried both outcome groups, nearest delivery first. A "
+        "bin with no adverse recording has no panel rather than a diagonal that was never "
+        "measured, so the panel count is itself a statement about coverage."
+    ),
+    FIGURE_COUNTS_TIME: (
+        "What the rates of the previous figure are rates of: the four confusion cells per bin at "
+        "each model's validation threshold. A sensitivity measured on two adverse recordings and "
+        "one measured on thirty read identically as a rate and differently here."
     ),
 }
 
@@ -694,18 +736,23 @@ def figure_supervised_axis(
 # =============================================================================
 # Figure 3 -- the last three hours
 # =============================================================================
-def signed_bin_hours(*, bin_hours: float, preservation_hours: float) -> np.ndarray:
+def signed_bin_hours(*, bin_hours: float, window_hours: float) -> np.ndarray:
     """The x coordinate of each trajectory bin, signed so delivery sits at zero on the right.
+
+    Named for the **analysis** window rather than the preservation one: a run may analyse further
+    back than its objective preserves, and an argument named after the narrower setting would
+    describe an axis it does not span.
 
     Args:
         bin_hours: Bin width.
-        preservation_hours: The window's upper edge.
+        window_hours: The analysis window's upper edge, from
+            :func:`~latent_pilot.config.analysis_hours`.
 
     Returns:
         One negative midpoint per bin, indexed the way
         :func:`~latent_pilot.data.bin_edges` indexes them -- entry 0 is the bin nearest delivery.
     """
-    edges = data.bin_edges(bin_hours=bin_hours, preservation_hours=preservation_hours)
+    edges = data.bin_edges(bin_hours=bin_hours, preservation_hours=window_hours)
     return np.asarray([-0.5 * (low + high) for low, high in edges], dtype=np.float64)
 
 
@@ -748,7 +795,7 @@ def figure_trajectories(
     directory: Any,
     *,
     bin_hours: float,
-    preservation_hours: float,
+    window_hours: float,
     supervised_hours: float,
     n_traces: int = DEFAULT_N_TRACES,
     seed: int = 0,
@@ -762,7 +809,7 @@ def figure_trajectories(
             :func:`~latent_pilot.analyze.score_frame`, per model.
         directory: The run directory.
         bin_hours: Bin width, for the x axis.
-        preservation_hours: The window's upper edge; the left end of the axis.
+        window_hours: The analysis window's upper edge; the left end of the axis.
         supervised_hours: The supervised window, shaded and labelled -- every bin outside it is an
             application of the head outside the window it was fitted on.
         n_traces: How many individual recordings to overlay. The **same** recordings in every
@@ -777,7 +824,7 @@ def figure_trajectories(
         The written path.
     """
     figures = _figures()
-    x = signed_bin_hours(bin_hours=bin_hours, preservation_hours=preservation_hours)
+    x = signed_bin_hours(bin_hours=bin_hours, window_hours=window_hours)
     names = list(versions)
     palette = _palette(
         [group for name in names for group in versions[name][0].get("group", [])]
@@ -841,7 +888,7 @@ def figure_trajectories(
                     ha="center", fontsize=5.5, color=colour,
                 )
 
-        ax.set_xlim(-float(preservation_hours), 0.0)
+        ax.set_xlim(-float(window_hours), 0.0)
         ax.set_title(f"{name}: frozen final-hour head applied to every occupied bin")
         ax.set_xlabel(
             f"hours before delivery (delivery at 0) -- {score_scale_note(name, short=True)}"
@@ -862,14 +909,14 @@ def figure_trajectories(
             twin = ax.twinx()
             twin.plot(hours, up, color=figures.COLOR_ORANGE, linewidth=0.6, label="UP")
             twin.set_ylabel("UP")
-        ax.set_xlim(-float(preservation_hours), 0.0)
+        ax.set_xlim(-float(window_hours), 0.0)
         ax.set_title(f"raw excerpt -- {guid}")
         ax.set_xlabel("hours before delivery (delivery at 0)")
         ax.set_ylabel("FHR")
         figures.style_axes(ax)
 
     fig.suptitle(
-        f"Score over the last {float(preservation_hours):g} hours, "
+        f"Score over the last {float(window_hours):g} hours, "
         f"with per-bin recording counts"
     )
     fig.text(
@@ -884,6 +931,621 @@ def figure_trajectories(
         f"{len(excerpt_guids)} raw excerpt(s)"
     )
     return figures.render_figure(fig, _figure_dir(directory) / FIGURE_TRAJECTORIES)
+
+
+# =============================================================================
+# Figures 4-8 -- the classification result, overall and against time
+# =============================================================================
+#: How many small-multiple ROC panels are placed on one row.
+ROC_GRID_COLUMNS = 4
+
+#: The metrics Figure 6 draws against time, one panel each, in this order.
+TIME_METRICS: Tuple[str, ...] = ("auroc", "average_precision", "f1", "balanced_accuracy")
+
+#: How each of those panels marks the level a useless ranker would reach. ``prevalence`` names the
+#: per-bin column to read, because average precision has no fixed chance level; ``None`` means the
+#: metric has no meaningful chance line and drawing one would invent a reference.
+TIME_METRIC_CHANCE: Dict[str, Any] = {
+    "auroc": 0.5,
+    "average_precision": "prevalence",
+    "f1": None,
+    "balanced_accuracy": 0.5,
+}
+
+#: The confusion cells Figure 8 stacks, outermost first, with the label each carries.
+COUNT_STACK: Tuple[Tuple[str, str], ...] = (
+    ("tp", "true positive"),
+    ("fn", "false negative"),
+    ("fp", "false positive"),
+    ("tn", "true negative"),
+)
+
+
+#: Share of the figure height reserved below the axes for the caption. Figures 1-3 are single
+#: columns of tall panels, where a caption at the very bottom clears the last x-label on its own.
+#: These are grids, whose bottom row of x-labels sits far lower, so the space is reserved
+#: explicitly rather than left to collide.
+CAPTION_BAND = 0.05
+
+
+def _render_with_caption(fig: Any, directory: Any, stem: str) -> Path:
+    """Lay the figure out above its caption, write the caption, and save.
+
+    ``tight_layout`` knows nothing about a ``fig.text`` placed in figure coordinates, so it is
+    given an explicit rectangle to lay the axes into and :func:`render_figure` is asked not to run
+    it a second time -- which would undo the reservation.
+
+    Args:
+        fig: The figure.
+        directory: The run directory.
+        stem: The figure-name constant, which is also its :data:`CAPTIONS` key.
+
+    Returns:
+        The path written, extension included.
+    """
+    figures = _figures()
+    try:
+        fig.tight_layout(rect=(0.0, CAPTION_BAND, 1.0, 1.0))
+    except Exception:  # noqa: BLE001 - a layout warning must not lose a completed figure
+        pass
+    fig.text(0.01, 0.005, CAPTIONS[stem], fontsize=6.0, wrap=True)
+    return figures.render_figure(fig, _figure_dir(directory) / stem, tight=False)
+
+
+def _empty_panel(ax: Any, message: str) -> None:
+    """Say why a panel is blank, rather than leaving a reader to guess.
+
+    Args:
+        ax: Target axes.
+        message: The reason, short enough to sit inside the frame.
+    """
+    figures = _figures()
+    ax.text(
+        0.5, 0.5, message, transform=ax.transAxes, ha="center", va="center",
+        fontsize=6.0, color=figures.COLOR_GRAY, wrap=True,
+    )
+    figures.style_axes(ax)
+
+
+def _interval_text(
+    intervals: Optional[Mapping[str, Any]], model: str, metric: str, digits: int = 3
+) -> str:
+    """The bracketed interval for one model and metric, or an empty string when there is none.
+
+    Args:
+        intervals: ``paired_bootstrap``'s ``models`` block, or ``None``.
+        model: The model name.
+        metric: The metric name.
+        digits: Decimals.
+
+    Returns:
+        ``' [lo, hi]'`` or ``''``. Never a bracket around ``nan``: an interval the estimator
+        declined to form is absent from the legend rather than printed as an empty range.
+    """
+    record = dict((intervals or {}).get(model) or {}).get(metric)
+    if not isinstance(record, Mapping):
+        return ""
+    low, high = record.get("lo"), record.get("hi")
+    if low is None or high is None or not (np.isfinite(float(low)) and np.isfinite(float(high))):
+        return ""
+    return f" [{float(low):.{digits}f}, {float(high):.{digits}f}]"
+
+
+def figure_roc_pr(
+    curves: Mapping[str, Mapping[str, Any]],
+    metrics: Mapping[str, Mapping[str, Any]],
+    directory: Any,
+    *,
+    intervals: Optional[Mapping[str, Any]] = None,
+) -> Path:
+    """ROC and precision-recall for the held-out final-hour bags, both models on one pair of axes.
+
+    Two panels rather than two figures: the models are compared, and a comparison split across
+    files is one a reader has to assemble. Both panels carry the level a useless ranker reaches --
+    the diagonal for the ROC, the adverse-outcome prevalence for the PR curve, which unlike the
+    diagonal moves with the cohort and is therefore drawn from the data rather than assumed.
+
+    Each model's **validation-selected operating point** is marked on both curves, at
+    ``(1 - specificity, sensitivity)`` and ``(sensitivity, precision)``. That point is the only
+    place a threshold enters this figure; the curves themselves are threshold-free, which is why
+    they can be compared between two models whose logit scales are not comparable.
+
+    Args:
+        curves: ``{model: {'roc': ..., 'pr': ...}}`` as
+            :func:`~latent_pilot.evaluate.roc_points` and
+            :func:`~latent_pilot.evaluate.pr_points` return them.
+        metrics: ``{model: recording_metrics}``, for the operating point and the counts.
+        directory: The run directory; the figure lands in its ``figures`` subdirectory.
+        intervals: ``paired_bootstrap``'s ``models`` block, for the legend intervals. Optional --
+            a run whose bootstrap could not be estimated still gets the curves.
+
+    Returns:
+        The path written.
+    """
+    figures = _figures()
+    names = [str(name) for name in curves]
+    palette = _palette(names)
+    fig, axes = figures.new_figure(1, 2, height_per_row=3.4, width=9.0)
+
+    roc_ax, pr_ax = axes[0, 0], axes[0, 1]
+    roc_ax.plot([0.0, 1.0], [0.0, 1.0], color=figures.COLOR_GRAY, linewidth=0.8, linestyle="--")
+    drawn_roc = 0
+    for name in names:
+        record = dict(dict(curves[name]).get("roc") or {})
+        false_positive = np.asarray(record.get("fpr", []), dtype=np.float64)
+        true_positive = np.asarray(record.get("tpr", []), dtype=np.float64)
+        if false_positive.size == 0:
+            continue
+        colour = palette.get(name, figures.COLOR_GRAY)
+        label = (
+            f"{name}: AUROC {float(record.get('auroc', float('nan'))):.3f}"
+            f"{_interval_text(intervals, name, 'auroc')}"
+        )
+        roc_ax.plot(false_positive, true_positive, color=colour, linewidth=1.2, label=label)
+        measured = dict(metrics.get(name) or {})
+        specificity, sensitivity = measured.get("specificity"), measured.get("sensitivity")
+        if specificity is not None and sensitivity is not None and np.isfinite(
+            float(specificity)
+        ) and np.isfinite(float(sensitivity)):
+            roc_ax.plot(
+                [1.0 - float(specificity)], [float(sensitivity)],
+                marker="o", markersize=4.0, color=colour, linestyle="none",
+            )
+        drawn_roc += 1
+    if not drawn_roc:
+        _empty_panel(roc_ax, "no held-out population carried both classes")
+    else:
+        roc_ax.set_xlim(0.0, 1.0)
+        roc_ax.set_ylim(0.0, 1.0)
+        roc_ax.set_title("ROC, held-out final-hour bags")
+        roc_ax.set_xlabel("false positive rate (1 - specificity)")
+        roc_ax.set_ylabel("true positive rate (sensitivity)")
+        roc_ax.legend(loc="lower right", fontsize=6.0)
+        figures.style_axes(roc_ax)
+
+    drawn_pr = 0
+    prevalence = float("nan")
+    for name in names:
+        record = dict(dict(curves[name]).get("pr") or {})
+        recall = np.asarray(record.get("recall", []), dtype=np.float64)
+        precision = np.asarray(record.get("precision", []), dtype=np.float64)
+        if recall.size == 0:
+            continue
+        prevalence = float(record.get("prevalence", float("nan")))
+        colour = palette.get(name, figures.COLOR_GRAY)
+        label = (
+            f"{name}: AP {float(record.get('average_precision', float('nan'))):.3f}"
+            f"{_interval_text(intervals, name, 'average_precision')}"
+        )
+        # ``post`` because precision-recall is a step function of the threshold: joining the
+        # points with straight lines draws interpolated operating rules that do not exist.
+        pr_ax.step(recall, precision, where="post", color=colour, linewidth=1.2, label=label)
+        measured = dict(metrics.get(name) or {})
+        sensitivity, positive_predictive = measured.get("sensitivity"), measured.get("precision")
+        if sensitivity is not None and positive_predictive is not None and np.isfinite(
+            float(sensitivity)
+        ) and np.isfinite(float(positive_predictive)):
+            pr_ax.plot(
+                [float(sensitivity)], [float(positive_predictive)],
+                marker="o", markersize=4.0, color=colour, linestyle="none",
+            )
+        drawn_pr += 1
+    if not drawn_pr:
+        _empty_panel(pr_ax, "no held-out population carried both classes")
+    else:
+        if np.isfinite(prevalence):
+            pr_ax.axhline(
+                prevalence, color=figures.COLOR_GRAY, linewidth=0.8, linestyle="--",
+                label=f"chance = prevalence {prevalence:.3f}",
+            )
+        pr_ax.set_xlim(0.0, 1.0)
+        pr_ax.set_ylim(0.0, 1.0)
+        pr_ax.set_title("Precision-recall, held-out final-hour bags")
+        pr_ax.set_xlabel("recall (sensitivity)")
+        pr_ax.set_ylabel("precision")
+        pr_ax.legend(loc="best", fontsize=6.0)
+        figures.style_axes(pr_ax)
+
+    counts = dict(metrics.get(names[0]) or {}) if names else {}
+    fig.suptitle(
+        f"Held-out discrimination: {int(counts.get('n_recordings', 0))} recording(s), "
+        f"{int(counts.get('n_adverse', 0))} adverse; dots mark the validation-selected threshold"
+    )
+    logger.info(f"figure 4: {drawn_roc} ROC curve(s), {drawn_pr} PR curve(s)")
+    return _render_with_caption(fig, directory, FIGURE_ROC_PR)
+
+
+def figure_confusion(
+    metrics: Mapping[str, Mapping[str, Any]],
+    directory: Any,
+    *,
+    intervals: Optional[Mapping[str, Any]] = None,
+) -> Path:
+    """The confusion matrix of every model at its validation threshold, and the rates beside it.
+
+    The counts and the rates share a figure because neither is readable alone: four cells without
+    the rates hide how the two classes were traded off, and rates without the cells hide that a
+    sensitivity of one may rest on two recordings.
+
+    All panels share one colour scale, so a cell of the same colour is the same count in every
+    matrix -- two matrices each scaled to their own maximum would paint two different counts
+    identically and make the comparison the figure exists for the one thing it cannot support.
+
+    Args:
+        metrics: ``{model: recording_metrics}``.
+        directory: The run directory.
+        intervals: ``paired_bootstrap``'s ``models`` block, for the rate intervals. Optional.
+
+    Returns:
+        The path written.
+    """
+    figures = _figures()
+    names = [str(name) for name in metrics]
+    fig, axes = figures.new_figure(1, max(len(names) + 1, 2), height_per_row=3.2, width=9.0)
+
+    fields = {
+        name: np.asarray(
+            [
+                [float(dict(metrics[name]).get("tn", np.nan)),
+                 float(dict(metrics[name]).get("fp", np.nan))],
+                [float(dict(metrics[name]).get("fn", np.nan)),
+                 float(dict(metrics[name]).get("tp", np.nan))],
+            ],
+            dtype=np.float64,
+        )
+        for name in names
+    }
+    finite = np.concatenate([field[np.isfinite(field)].ravel() for field in fields.values()]) \
+        if fields else np.asarray([], dtype=np.float64)
+    limits = (0.0, float(finite.max())) if finite.size and finite.max() > 0 else None
+
+    for column, name in enumerate(names):
+        ax = axes[0, column]
+        field = fields[name]
+        figures.heatmap_with_colorbar(
+            fig, ax, field,
+            title=f"{name} at threshold {float(dict(metrics[name]).get('threshold', np.nan)):.3f}",
+            xlabel="predicted", ylabel="actual",
+            symmetric=False, vlimits=limits, colorbar_label="recordings",
+        )
+        ax.set_xticks([0, 1])
+        ax.set_xticklabels(["healthy", "adverse"])
+        ax.set_yticks([0, 1])
+        ax.set_yticklabels(["healthy", "adverse"])
+        for row in range(2):
+            for cell in range(2):
+                value = field[row, cell]
+                ax.text(
+                    cell, row, "-" if not np.isfinite(value) else str(int(value)),
+                    ha="center", va="center", fontsize=8.0, color=figures.COLOR_BLACK,
+                )
+
+    ax = axes[0, len(names)]
+    lines: List[str] = []
+    for name in names:
+        measured = dict(metrics[name])
+        lines.append(name)
+        for metric in (
+            "sensitivity", "specificity", "precision", "npv", "f1", "accuracy",
+            "balanced_accuracy",
+        ):
+            value = measured.get(metric)
+            text = (
+                MISSING if value is None or not np.isfinite(float(value))
+                else f"{float(value):.3f}"
+            )
+            lines.append(f"  {metric}: {text}{_interval_text(intervals, name, metric)}")
+        lines.append("")
+    ax.axis("off")
+    ax.text(
+        0.0, 1.0, "\n".join(lines) or MISSING, transform=ax.transAxes,
+        ha="left", va="top", fontsize=6.0, family="monospace",
+    )
+
+    for column in range(len(names) + 1, axes.shape[1]):
+        axes[0, column].axis("off")
+
+    fig.suptitle("Confusion counts and derived rates at the validation-selected threshold")
+    logger.info(f"figure 5: {len(names)} confusion matrix panel(s)")
+    return _render_with_caption(fig, directory, FIGURE_CONFUSION)
+
+
+def _metric_curve(
+    block: pd.DataFrame, metric: str, x: np.ndarray
+) -> Dict[str, np.ndarray]:
+    """One model's curve for one metric over the full bin axis, absences left absent.
+
+    A bin the model has no estimable cell in stays ``nan``, which matplotlib draws as a break.
+    Filling it would draw a discrimination that was never measured -- and the bins most likely to
+    be unestimable are the early ones, which is exactly where a filled line would invent a trend.
+
+    Args:
+        block: One model's rows of the per-bin table.
+        metric: The metric column.
+        x: The bin axis, whose length fixes the array length.
+
+    Returns:
+        ``{'mean', 'lo', 'hi', 'n', 'n_adverse', 'chance'}``, all of length ``x.size``.
+    """
+    curve = {
+        "mean": np.full(x.size, np.nan),
+        "lo": np.full(x.size, np.nan),
+        "hi": np.full(x.size, np.nan),
+        "chance": np.full(x.size, np.nan),
+        "n": np.zeros(x.size, dtype=np.int64),
+        "n_adverse": np.zeros(x.size, dtype=np.int64),
+    }
+    for _index, row in block.iterrows():
+        position = int(row[data.BIN_COLUMN])
+        if not 0 <= position < x.size:
+            continue
+        curve["n"][position] = int(row.get("n_recordings", 0))
+        curve["n_adverse"][position] = int(row.get("n_adverse", 0))
+        if not bool(row.get("estimable", False)):
+            # The chance level stays absent here too. A bin with no adverse recording has a
+            # prevalence of exactly zero, and a reference line dropping to zero beside a curve
+            # that was not drawn reads as a measurement rather than as a missing one.
+            continue
+        curve["chance"][position] = float(row.get("prevalence", np.nan))
+        curve["mean"][position] = float(row.get(metric, np.nan))
+        curve["lo"][position] = float(row.get(f"{metric}_lo", np.nan))
+        curve["hi"][position] = float(row.get(f"{metric}_hi", np.nan))
+    return curve
+
+
+def figure_metrics_vs_time(
+    bin_metrics: pd.DataFrame,
+    directory: Any,
+    *,
+    bin_hours: float,
+    window_hours: float,
+    supervised_hours: float,
+    metrics: Sequence[str] = TIME_METRICS,
+) -> Path:
+    """Discrimination as a function of time before delivery, one panel per metric.
+
+    The frozen final-hour head is applied to every bin, so only the bins inside the shaded window
+    are the rule evaluated where its loss was defined; everything left of it is an application
+    outside that window, which is the interesting part and also the part a reader must not mistake
+    for a fitted result.
+
+    Counts sit under every bin because the cohort is **whoever was observed there**: a metric that
+    rises towards delivery may be a real trend or a change in who was still being recorded, and
+    only the counts let a reader tell the two apart.
+
+    Args:
+        bin_metrics: The table from :func:`~latent_pilot.analyze.bin_classification`.
+        directory: The run directory.
+        bin_hours: Bin width.
+        window_hours: The analysis window's upper edge, which fixes the axis.
+        supervised_hours: The supervised window, shaded.
+        metrics: Which metrics get a panel.
+
+    Returns:
+        The path written.
+    """
+    figures = _figures()
+    wanted = [str(metric) for metric in metrics]
+    x = signed_bin_hours(bin_hours=bin_hours, window_hours=window_hours)
+    names = (
+        sorted({str(value) for value in bin_metrics["model"]})
+        if not bin_metrics.empty else []
+    )
+    palette = _palette(names)
+    columns = 2 if len(wanted) > 1 else 1
+    rows = int(np.ceil(len(wanted) / columns))
+    fig, axes = figures.new_figure(rows, columns, height_per_row=2.8, width=9.0)
+
+    for position, metric in enumerate(wanted):
+        ax = axes[position // columns, position % columns]
+        ax.axvspan(
+            -float(supervised_hours), 0.0, color=figures.COLOR_LIGHT_GRAY, alpha=0.5,
+            linewidth=0.0,
+        )
+        drawn = 0
+        for offset, name in enumerate(names):
+            block = bin_metrics[bin_metrics["model"] == name]
+            curve = _metric_curve(block, metric, x)
+            if not np.isfinite(curve["mean"]).any():
+                continue
+            colour = palette.get(name, figures.COLOR_GRAY)
+            ax.fill_between(
+                x, curve["lo"], curve["hi"], color=colour, alpha=0.2, linewidth=0.0,
+            )
+            ax.plot(x, curve["mean"], color=colour, marker="o", markersize=3.0, label=name)
+            for index, count in enumerate(curve["n"].tolist()):
+                if not count:
+                    continue
+                ax.annotate(
+                    f"{int(curve['n_adverse'][index])}/{int(count)}",
+                    xy=(x[index], 0.03 + 0.06 * offset),
+                    xycoords=("data", "axes fraction"),
+                    ha="center", fontsize=5.0, color=colour,
+                )
+            drawn += 1
+        chance = TIME_METRIC_CHANCE.get(metric)
+        if isinstance(chance, (int, float)):
+            ax.axhline(
+                float(chance), color=figures.COLOR_GRAY, linewidth=0.8, linestyle="--",
+            )
+        elif chance == "prevalence" and names:
+            reference = _metric_curve(
+                bin_metrics[bin_metrics["model"] == names[0]], metric, x
+            )["chance"]
+            ax.plot(
+                x, reference, color=figures.COLOR_GRAY, linewidth=0.8, linestyle="--",
+                label="chance = prevalence",
+            )
+        if not drawn:
+            _empty_panel(ax, f"no bin carried both classes for {metric}")
+            continue
+        ax.set_xlim(-float(window_hours), 0.0)
+        ax.set_title(metric.replace("_", " "))
+        ax.set_xlabel("hours before delivery (delivery at 0)")
+        ax.set_ylabel(metric.replace("_", " "))
+        ax.legend(loc="best", fontsize=6.0)
+        figures.style_axes(ax)
+
+    for position in range(len(wanted), rows * columns):
+        axes[position // columns, position % columns].axis("off")
+
+    fig.suptitle(
+        f"Discrimination over the last {float(window_hours):g} hours; "
+        f"counts are adverse/total recordings per bin"
+    )
+    logger.info(f"figure 6: {len(wanted)} metric panel(s) over {len(names)} model(s)")
+    return _render_with_caption(fig, directory, FIGURE_METRICS_TIME)
+
+
+def figure_roc_by_bin(
+    bin_curves: pd.DataFrame,
+    bin_metrics: pd.DataFrame,
+    directory: Any,
+    *,
+    n_cols: int = ROC_GRID_COLUMNS,
+) -> Path:
+    """One ROC panel per time bin, both models overlaid, nearest delivery first.
+
+    Only bins that carried both classes appear: a bin with no adverse recording has no ROC, and a
+    panel drawn for it would show a diagonal that was never measured. The panel count is therefore
+    itself a statement about coverage, and the title of each panel carries the counts it rests on.
+
+    Args:
+        bin_curves: The long curve table from :func:`~latent_pilot.analyze.bin_roc_points`.
+        bin_metrics: The per-bin table, read for each panel's counts and label.
+        directory: The run directory.
+        n_cols: Panels per row.
+
+    Returns:
+        The path written.
+    """
+    figures = _figures()
+    if bin_curves.empty:
+        fig, axes = figures.new_figure(1, 1, height_per_row=3.0, width=9.0)
+        _empty_panel(axes[0, 0], "no time bin carried both binary classes")
+        fig.suptitle("ROC by time bin")
+        return _render_with_caption(fig, directory, FIGURE_ROC_BINS)
+
+    bins = sorted({int(value) for value in bin_curves[data.BIN_COLUMN]})
+    names = sorted({str(value) for value in bin_curves["model"]})
+    palette = _palette(names)
+    columns = int(min(max(n_cols, 1), len(bins)))
+    rows = int(np.ceil(len(bins) / columns))
+    fig, axes = figures.new_figure(rows, columns, height_per_row=2.4, width=9.0)
+
+    for position, index in enumerate(bins):
+        ax = axes[position // columns, position % columns]
+        ax.plot([0.0, 1.0], [0.0, 1.0], color=figures.COLOR_GRAY, linewidth=0.7, linestyle="--")
+        label = ""
+        counts = ""
+        for name in names:
+            block = bin_curves[
+                (bin_curves["model"] == name) & (bin_curves[data.BIN_COLUMN] == index)
+            ].sort_values("point")
+            if block.empty:
+                continue
+            label = str(block[data.BIN_LABEL_COLUMN].iloc[0])
+            counts = (
+                f"{int(block['n_adverse'].iloc[0])}/{int(block['n_recordings'].iloc[0])}"
+            )
+            ax.plot(
+                block["fpr"].to_numpy(), block["tpr"].to_numpy(),
+                color=palette.get(name, figures.COLOR_GRAY), linewidth=1.0,
+                label=f"{name} {float(block['auroc'].iloc[0]):.2f}",
+            )
+        ax.set_xlim(0.0, 1.0)
+        ax.set_ylim(0.0, 1.0)
+        ax.set_title(f"{label} h before delivery, {counts}", fontsize=7.0)
+        ax.set_xlabel("false positive rate")
+        ax.set_ylabel("true positive rate")
+        ax.legend(loc="lower right", fontsize=5.5)
+        figures.style_axes(ax)
+
+    for position in range(len(bins), rows * columns):
+        axes[position // columns, position % columns].axis("off")
+
+    supervised = ""
+    if not bin_metrics.empty and "supervised_window" in bin_metrics.columns:
+        inside = sorted({
+            int(row[data.BIN_COLUMN]) for _index, row in bin_metrics.iterrows()
+            if bool(row["supervised_window"])
+        })
+        supervised = f"; bins {inside} lie inside the supervised window" if inside else ""
+    fig.suptitle(
+        f"ROC in each time bin, nearest delivery first; titles carry adverse/total{supervised}"
+    )
+    logger.info(f"figure 7: {len(bins)} estimable bin panel(s)")
+    return _render_with_caption(fig, directory, FIGURE_ROC_BINS)
+
+
+def figure_counts_vs_time(
+    bin_metrics: pd.DataFrame,
+    directory: Any,
+    *,
+    bin_hours: float,
+    window_hours: float,
+    supervised_hours: float,
+) -> Path:
+    """The four confusion cells per time bin, stacked, one row per model.
+
+    Where Figure 6 shows rates, this shows what they are rates **of**. A sensitivity that improves
+    towards delivery while the adverse count falls to two is a different finding from one measured
+    on thirty, and a stacked count is the least interpretable-away way to show it.
+
+    Args:
+        bin_metrics: The table from :func:`~latent_pilot.analyze.bin_classification`.
+        directory: The run directory.
+        bin_hours: Bin width, which also fixes the bar width.
+        window_hours: The analysis window's upper edge.
+        supervised_hours: The supervised window, shaded.
+
+    Returns:
+        The path written.
+    """
+    figures = _figures()
+    names = (
+        sorted({str(value) for value in bin_metrics["model"]})
+        if not bin_metrics.empty else []
+    )
+    x = signed_bin_hours(bin_hours=bin_hours, window_hours=window_hours)
+    palette = _palette([label for _cell, label in COUNT_STACK])
+    fig, axes = figures.new_figure(max(len(names), 1), 1, height_per_row=2.6, width=9.0)
+
+    if not names:
+        _empty_panel(axes[0, 0], "no model produced a per-bin cell")
+    for row, name in enumerate(names):
+        ax = axes[row, 0]
+        ax.axvspan(
+            -float(supervised_hours), 0.0, color=figures.COLOR_LIGHT_GRAY, alpha=0.5,
+            linewidth=0.0,
+        )
+        block = bin_metrics[bin_metrics["model"] == name]
+        heights = {cell: np.zeros(x.size, dtype=np.float64) for cell, _label in COUNT_STACK}
+        for _index, entry in block.iterrows():
+            position = int(entry[data.BIN_COLUMN])
+            if not 0 <= position < x.size:
+                continue
+            for cell, _label in COUNT_STACK:
+                heights[cell][position] = float(entry.get(cell, 0.0))
+        bottom = np.zeros(x.size, dtype=np.float64)
+        for cell, label in COUNT_STACK:
+            ax.bar(
+                x, heights[cell], bottom=bottom, width=0.8 * float(bin_hours),
+                color=palette.get(label, figures.COLOR_GRAY), label=label, linewidth=0.0,
+            )
+            bottom = bottom + heights[cell]
+        ax.set_xlim(-float(window_hours), 0.0)
+        ax.set_title(f"{name}: confusion cells per bin at its validation threshold")
+        ax.set_xlabel("hours before delivery (delivery at 0)")
+        ax.set_ylabel("recordings")
+        ax.legend(loc="upper left", fontsize=6.0, ncol=4)
+        figures.style_axes(ax)
+
+    fig.suptitle(
+        f"What the rates are rates of, over the last {float(window_hours):g} hours"
+    )
+    logger.info(f"figure 8: {len(names)} model panel(s)")
+    return _render_with_caption(fig, directory, FIGURE_COUNTS_TIME)
 
 
 # =============================================================================
@@ -1359,6 +2021,85 @@ def _metrics_section(record: Mapping[str, Any]) -> List[str]:
     return lines
 
 
+#: The classification columns the held-out table prints, in reporting order. The ranking metrics
+#: first, then the threshold-dependent rates, then the cells they are computed from.
+CLASSIFICATION_COLUMNS: Tuple[str, ...] = (
+    "model", "auroc", "average_precision", "balanced_accuracy", "f1",
+    "sensitivity", "specificity", "precision", "npv", "accuracy",
+    "tp", "fp", "fn", "tn", "threshold", "prevalence",
+    "n_recordings", "n_healthy", "n_adverse",
+)
+
+#: The per-bin columns, with the identity of the cell first and the counts last, because the counts
+#: are what a per-bin number has to be read against.
+BIN_COLUMNS: Tuple[str, ...] = (
+    "model", "time_bin", "time_bin_label", "supervised_window", "estimable",
+    "auroc", "auroc_lo", "auroc_hi", "average_precision", "f1", "balanced_accuracy",
+    "sensitivity", "specificity", "tp", "fp", "fn", "tn",
+    "n_recordings", "n_healthy", "n_adverse",
+)
+
+
+def _classification_section(record: Mapping[str, Any]) -> List[str]:
+    """The held-out confusion counts and every rate derived from them."""
+    measured = dict(dict(record.get("metrics") or {}).get("classification") or {})
+    lines = ["## Held-out classification"]
+    if not measured:
+        lines.append(_missing(
+            "the classification table",
+            "the report stage did not produce one; it is derived from "
+            "`per_recording_test.parquet` and the locked thresholds.",
+        ))
+        return lines
+    rows = [{"model": name, **dict(values)} for name, values in measured.items()]
+    lines.append(_table(rows, CLASSIFICATION_COLUMNS))
+    lines.extend([
+        "",
+        "Counts are **recordings**, one per held-out recording, at each model's own threshold. "
+        "That threshold was chosen on validation to maximise balanced accuracy and is never "
+        "re-chosen here; AUROC and average precision do not depend on it, and are the two numbers "
+        "to compare between models whose logit scales are not comparable.",
+        "",
+        "`precision`, `npv` and `accuracy` carry no interval: the paired bootstrap resamples the "
+        "metrics named in `evaluate.METRIC_NAMES`, and these three are reported as point estimates "
+        "rather than given an interval the run did not compute.",
+    ])
+    return lines
+
+
+def _time_section(record: Mapping[str, Any]) -> List[str]:
+    """Discrimination bin by bin, with what each bin rests on."""
+    rows = _rows(dict(record.get("metrics") or {}).get("per_bin"))
+    lines = ["## Discrimination over time before delivery"]
+    if not rows:
+        lines.append(_missing(
+            "the per-bin table",
+            "no trajectory bin produced a scored cell.",
+        ))
+        return lines
+    lines.append(_table(rows, BIN_COLUMNS))
+    estimable = sum(1 for row in rows if bool(row.get("estimable")))
+    lines.extend([
+        "",
+        f"{estimable} of {len(rows)} (model, bin) cells carried both outcome groups and could be "
+        f"measured; the rest report their counts and no metric rather than a number standing in "
+        f"for one. A cell marked `estimable` false still carries its four confusion cells and the "
+        f"rates a single class leaves defined -- specificity and NPV on a bin with no adverse "
+        f"recording, and precision and F1 at zero under the never-fires convention -- because "
+        f"those are measured facts about that bin. It is *discrimination between the two groups* "
+        f"that is undefined there, which is why the figures draw a gap rather than a point.",
+        "",
+        "Three things this table is not. The head is the **frozen final-hour classifier**, so "
+        "every row with `supervised_window` false is that head applied outside the window its loss "
+        "was defined on. The **threshold came from validation**, on final-hour bags, so an earlier "
+        "bin's counts are that rule applied where it was not tuned. And the **cohort is whoever "
+        "was observed in that bin** -- a recording contributes only where it has retained anchors "
+        "-- so a metric moving towards delivery may be a trend or a change in who was still being "
+        "recorded, and `n_recordings` beside it is the only thing that separates the two.",
+    ])
+    return lines
+
+
 def _controls_section(record: Mapping[str, Any]) -> List[str]:
     """The shuffled-label control, the prior probe, and what neither establishes."""
     lines = ["## Controls"]
@@ -1395,7 +2136,7 @@ def _temporal_section(record: Mapping[str, Any]) -> List[str]:
     windows = dict(
         dict(dict(record.get("protocol") or {}).get("settings") or {}).get("windows") or {}
     )
-    hours = windows.get("preservation_hours")
+    hours = windows.get("analysis_hours") or windows.get("preservation_hours")
     lines = [
         f"## Change over the last {float(hours):g} hours" if hours is not None
         else "## Change before delivery"
@@ -1546,7 +2287,11 @@ def build_report(record: Mapping[str, Any]) -> str:
         ``{'gate': GateResult.record, 'nll': ..., 'convergence': ...}``.
     ``metrics``
         ``{'models': {name: recording_metrics}, 'bootstrap': paired_bootstrap record,
-        'nearest_centroid': {name: recording_metrics}}``.
+        'nearest_centroid': {name: recording_metrics}}``, and optionally ``'classification'``
+        (``{name: recording_metrics}`` on the held-out final-hour bags) and ``'per_bin'`` (the rows
+        of :func:`~latent_pilot.analyze.bin_classification`). Those two are added by the report
+        stage rather than the evaluation stage, so a run finished before they existed gains them
+        the next time its report is regenerated.
     ``geometry``
         ``{'movement': ..., 'covariance': {name: ...}}``.
     ``controls``
@@ -1586,6 +2331,8 @@ def build_report(record: Mapping[str, Any]) -> str:
         _selection_section(record),
         _preservation_section(record),
         _metrics_section(record),
+        _classification_section(record),
+        _time_section(record),
         _controls_section(record),
         _temporal_section(record),
         _subgroup_section(record),
@@ -1619,8 +2366,13 @@ __all__ = [
     "DEFAULT_N_ARROWS",
     "DEFAULT_N_TRACES",
     "FIGURE_DIRNAME",
+    "FIGURE_CONFUSION",
+    "FIGURE_COUNTS_TIME",
     "FIGURE_COVERAGE_SPACE",
     "FIGURE_LATENT_SPACE",
+    "FIGURE_METRICS_TIME",
+    "FIGURE_ROC_BINS",
+    "FIGURE_ROC_PR",
     "FIGURE_SUPERVISED_AXIS",
     "FIGURE_TRAJECTORIES",
     "MISSING",
@@ -1632,8 +2384,13 @@ __all__ = [
     "class_palette",
     "configure_figures",
     "coverage_groupings",
+    "figure_confusion",
+    "figure_counts_vs_time",
     "figure_coverage_space",
     "figure_latent_space",
+    "figure_metrics_vs_time",
+    "figure_roc_by_bin",
+    "figure_roc_pr",
     "figure_supervised_axis",
     "figure_trajectories",
     "reproduction_commands",

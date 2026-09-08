@@ -93,8 +93,10 @@ latent_pilot:
 #   figure_format: pdf               # any filetype the installed matplotlib writes, e.g. png
 #   windows:
 #     supervised_hours: 1.0            # the supervised bag: the final hour before delivery
-#     preservation_hours: 3.0          # teacher preservation and trajectory support
-#     bin_hours: 0.5                   # six fixed half-hour trajectory bins over three hours
+#     preservation_hours: 3.0          # TRAINING: the teacher term and the forecast gate
+#     analysis_hours: null             # ANALYSIS: extraction, bins and every figure axis;
+#                                      # null means the same as preservation_hours
+#     bin_hours: 0.5                   # half-hour trajectory bins, tiling the analysis window
 #     early_window_hours: [2.0, 3.0]   # early half of the paired within-recording comparison
 #     segment_span_seconds: null       # null derives the stored segment span from the shards
 #   eligibility:
@@ -127,3 +129,25 @@ latent_pilot:
 #     large_draws: null                # null skips the larger-draw convergence check
 #   prior_probe: true                  # the frozen mu_prior probe; required for any claim that the
 #                                      # combined branch helps, so switching it off drops that claim
+#
+# ---------------------------------------------------------------------------------------------
+# ANALYSING FURTHER BACK THAN THE OBJECTIVE REACHES
+#
+# `windows.analysis_hours` is the one knob that separates what the fit optimises from what the run
+# measures. Left null it changes nothing, and a run written before the key existed keeps behaving
+# exactly as it did. Set it larger and the extraction, the trajectory bins, the per-bin
+# discrimination and every figure axis reach that far back, while the classification loss still
+# supervises the final `supervised_hours` and the teacher term still holds only the final
+# `preservation_hours` -- so the fitted model is the same experiment, seen over a longer window.
+#
+#   latent_pilot:
+#     windows:
+#       analysis_hours: 6.0            # twelve half-hour bins; training unchanged at 1 h / 3 h
+#
+# Two consequences worth knowing before launching. `bin_hours` must divide `analysis_hours`
+# exactly, which 0.5 does for 6.0. And the extraction is the long pass of a run and also runs once
+# per epoch on validation, so doubling this roughly doubles the per-epoch cost of the fit -- which
+# at the 200 epochs configured above is the dominant term.
+#
+# Setting `preservation_hours: 6.0` instead is a different experiment, not a longer view of this
+# one: it widens the teacher term, so the adapted model is not the model a three-hour run produces.
