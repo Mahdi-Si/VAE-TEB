@@ -79,46 +79,51 @@ latent_pilot:
     # Free text naming the population the statistics file was fitted on. Recorded verbatim, never
     # inferred from the filename.
     statistics_population: null
+    # Optional but asked for by the protocol: "holdout" or "augmented", whichever mode the dataset
+    # builder wrote these shards in. Holdout fixes one test set across every fold; augmented gives
+    # each fold its own partition with extra healthy recordings added. Left null it is recorded as
+    # unknown, and no run guesses it from a path.
+    dataset_build_mode: null
 
 # ---------------------------------------------------------------------------------------------
 # The rest of the protocol, shown at its default value. These lines are COMMENTED OUT on purpose:
 # the defaults live in config.py, and a copy of them here would go stale the day one changed while
 # still looking authoritative. Uncomment a key only to depart from the declared protocol.
 #
-  figure_format: pdf               # any filetype the installed matplotlib writes, e.g. png
-  windows:
-    supervised_hours: 1.0            # the supervised bag: the final hour before delivery
-    preservation_hours: 3.0          # teacher preservation and trajectory support
-    bin_hours: 0.5                   # six fixed half-hour trajectory bins over three hours
-    early_window_hours: [2.0, 3.0]   # early half of the paired within-recording comparison
-    segment_span_seconds: null       # null derives the stored segment span from the shards
-  eligibility:
-    min_late_segments: 2             # contributing segments required inside the final hour
-    final_anchor_within_minutes: 30.0
-  bag:
-    halflife_hours: 0.5              # recency weighting inside the supervised hour
-  optim:
-    mean_head_lr: 0.0001             # posterior mean-output layers
-    classifier_lr: 0.001             # the linear binary classifier
-    weight_decay: 0.0001
-    grad_clip: 1.0
-    recordings_per_class: 4          # the batch is twice this: 4 per binary class
-    max_epochs: 10
-    patience: 3                      # epochs without improved eligible validation AUROC
-    classification_weight: 1.0
-    preservation_weight: 0.1
-  baseline:
-    lr: 0.001
-    max_steps: 2000                  # a finite, logged budget for the cached-vector fit
-    patience: 20
-  gates:
-    forecast_mse_max_increase: 0.10  # at most +10% full-branch forecast MSE over baseline
-    saturation_max_increase_pp: 5.0  # at most +5 percentage points of posterior-delta saturation
-    subset_recordings: 24            # validation recordings the gate is measured on, drawn once
-  bootstrap:
-    resamples: 1000                  # outcome-stratified GUID resamples
-  mc:
-    draws: 8                         # common random draws for the matched-policy NLL
-    large_draws: null                # null skips the larger-draw convergence check
-  prior_probe: true                  # the frozen mu_prior probe; required for any claim that the
-                                     # combined branch helps, so switching it off drops that claim
+#   figure_format: pdf               # any filetype the installed matplotlib writes, e.g. png
+#   windows:
+#     supervised_hours: 1.0            # the supervised bag: the final hour before delivery
+#     preservation_hours: 3.0          # teacher preservation and trajectory support
+#     bin_hours: 0.5                   # six fixed half-hour trajectory bins over three hours
+#     early_window_hours: [2.0, 3.0]   # early half of the paired within-recording comparison
+#     segment_span_seconds: null       # null derives the stored segment span from the shards
+#   eligibility:
+#     min_late_segments: 2             # contributing segments required inside the final hour
+#     final_anchor_within_minutes: 30.0
+#   bag:
+#     halflife_hours: 0.5              # recency weighting inside the supervised hour
+#   optim:
+#     mean_head_lr: 0.0001             # posterior mean-output layers
+#     classifier_lr: 0.001             # the linear binary classifier
+#     weight_decay: 0.0001
+#     grad_clip: 1.0
+#     recordings_per_class: 4          # the batch is twice this: 4 per binary class
+#     max_epochs: 10
+#     patience: 3                      # epochs without improved eligible validation AUROC
+#     classification_weight: 1.0
+#     preservation_weight: 0.1
+#   baseline:
+#     lr: 0.001
+#     max_steps: 2000                  # a finite, logged budget for the cached-vector fit
+#     patience: 20
+#   gates:
+#     forecast_mse_max_increase: 0.10  # at most +10% full-branch forecast MSE over baseline
+#     saturation_max_increase_pp: 5.0  # at most +5 percentage points of posterior-delta saturation
+#     subset_recordings: 24            # validation recordings the gate is measured on, drawn once
+#   bootstrap:
+#     resamples: 1000                  # outcome-stratified GUID resamples
+#   mc:
+#     draws: 8                         # common random draws for the matched-policy NLL
+#     large_draws: null                # null skips the larger-draw convergence check
+#   prior_probe: true                  # the frozen mu_prior probe; required for any claim that the
+#                                      # combined branch helps, so switching it off drops that claim

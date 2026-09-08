@@ -84,6 +84,7 @@ import numpy as np
 import pandas as pd
 import torch
 from loguru import logger
+from tqdm import tqdm
 
 from teb_vae.lag_attn_cfs.eval.metrics import mc_predictive_block, model_inputs
 from teb_vae.lag_attn_rws.nets.losses import (
@@ -112,8 +113,9 @@ from teb_vae.lag_attn_transformer_cfs.latent_pilot.config import PilotConfigErro
 #: normalized block. ``mse_base`` is the same for $\mu^p$ and moves only if the freeze broke, so it
 #: is an invariant beside the measurement rather than a second result. ``delta_mu_sat`` is the
 #: fraction of an anchor's latent coordinates whose $|\Delta\mu|$ sits at the model's own bound.
-#: The two Monte Carlo columns and the KL are diagnostics reported beside the gates and are filled
-#: only when a draw count is requested; they are ``nan`` otherwise, never zero.
+#: The two Monte Carlo columns (``nll_full``, ``nll_base``) are filled only when a draw count is
+#: requested and are ``nan`` otherwise, never zero. ``kl`` is not one of them: it is the
+#: deterministic closed-form per-anchor KL and is always filled, draws or no draws.
 SCORE_COLUMNS: Tuple[str, ...] = (
     "mse_full",
     "mse_base",
@@ -480,7 +482,9 @@ def preservation_pass(
     model.eval()
     try:
         with torch.no_grad():
-            for batch in loader:
+            # ``leave=False``: this pass runs once per adaptation epoch, and two hundred finished
+            # bars would bury the epoch lines that carry the run's actual result.
+            for batch in tqdm(loader, desc="preservation", unit="batch", leave=False):
                 if max_batches is not None and n_batches >= max_batches:
                     break
                 n_batches += 1
@@ -546,11 +550,19 @@ def preservation_pass(
                 )
                 scores["kl"] = kld_btd.sum(dim=-1).gather(1, anchor_index)
 
-                # The pooled readouts, through the objective's own reduction and over the objective's
-                # own KL support -- derived from the forecast mask rather than restated, so the KL
-                # and the reconstruction are averaged over one anchor set. ``free_bits=0`` because
-                # this is a diagnostic: the floored variant is a training quantity and reporting it
-                # as a measurement would report the floor.
+                # The pooled readouts, through the objective's own reduction and over the
+                # objective's own KL support -- derived from the forecast mask rather than
+                # restated, so that within a batch the KL and the reconstruction are paired over
+                # one anchor set, which is what makes this comparable with the training objective.
+                #
+                # That support is NOT the run's `retained` set: it is taken before the preservation
+                # window filter and before de-duplication, so a segment whose anchors all fall
+                # outside the window still contributes here. `mse_full`, `record["kl"]` and
+                # `support_digest` describe the narrower retained set. The record's `note` says so;
+                # do not read these three pooled numbers as being over the digested support.
+                #
+                # ``free_bits=0`` because this is a diagnostic: the floored variant is a training
+                # quantity and reporting it as a measurement would report the floor.
                 kl_support = kl_mask(
                     mask, model.geometry, anchors=anchor_index, anchor_valid=anchor_valid
                 )
@@ -808,7 +820,10 @@ def _preservation_record(
             "mse_* are deterministic mean-decoded forecasts per coefficient of the normalized "
             "block; nll_* are marginal predictive block scores in nats per anchor and are nan when "
             "no draws were requested; the training path's pred_gap is a different quantity and is "
-            "not this measurement"
+            "not this measurement. source_conditioned_kl, prior_rate and kld_active_frac are "
+            "pooled over the n_kl_anchors forecast-contributing anchors of every scored batch, "
+            "which is a wider set than the window-filtered, de-duplicated support that mse_*, "
+            "n_retained_anchors and support_digest describe"
         ),
     }
     for position, name in enumerate(SCORE_COLUMNS):
@@ -1254,7 +1269,11 @@ def select_threshold(labels: Any, logits: Any) -> Dict[str, Any]:
             f"{int((y == 1).sum())} adverse), so balanced accuracy and the threshold that "
             f"maximises it are both undefined."
         )
-    false_positive, true_positive, thresholds = roc_curve(y, values)
+    # ``drop_intermediate=False``: the default drops points collinear in both fps and tps, which
+    # leaves the selected threshold unchanged -- balanced accuracy is linear in (fpr, tpr) and
+    # thresholds decrease along the curve -- but makes the candidate and tie counts reported below
+    # describe a thinned curve rather than the every-distinct-split one the docstring promises.
+    false_positive, true_positive, thresholds = roc_curve(y, values, drop_intermediate=False)
     finite = np.isfinite(thresholds)
     scores = 0.5 * (true_positive + (1.0 - false_positive))
     scores, thresholds = scores[finite], thresholds[finite]
@@ -1724,9 +1743,17 @@ def control_disclosure(*, n_control_fits: int, prior_probe: bool) -> Dict[str, A
     Two claims this package refuses to let a report make by omission:
 
     * **One shuffled-label fit is not a permutation p-value.** It is a leakage and overfitting
-      sanity check: a single draw from the null, run through the same selection. A p-value would
-      need many full refits *including* selection, and calling one fit by that name would put a
-      significance claim on a sample of size one.
+      sanity check: a single draw from the null. A p-value would need many full refits *including*
+      selection, and calling one fit by that name would put a significance claim on a sample of
+      size one.
+    * **This control does not rerun the adaptation.** It permutes the outcomes at GUID level and
+      refits the linear classifier on the frozen pretrained latents, so it exercises the
+      cached-vector fit and its step selection -- and not the posterior mean-head update, nor the
+      per-epoch gate-then-AUROC selection over the fine-tuning budget, which is the stage with the
+      most room to manufacture a held-out gain. It bounds what a linear head can extract from the
+      frozen representation under permuted labels; it does not bound what the fine-tuning loop can.
+      Section 7.3 asks for the stronger version, and the difference is disclosed here rather than
+      left to be inferred from the value.
     * **Better ``mu_post`` discrimination alone does not establish UP-specific information.** The
       frozen ``mu_prior`` probe is what makes any combined-branch claim admissible at all, and when
       it is switched off the claim is excluded rather than left implied.
@@ -1741,9 +1768,19 @@ def control_disclosure(*, n_control_fits: int, prior_probe: bool) -> Dict[str, A
     return {
         "n_shuffled_label_fits": int(n_control_fits),
         "permutation_p_value": False,
+        # What the fit actually was, in the emitted record and not only in this function's
+        # docstring: the report prints the record.
+        "shuffled_label_scope": "linear probe on frozen pretrained latents",
+        "adaptation_rerun_under_permutation": False,
         "shuffled_label_note": (
-            f"{int(n_control_fits)} shuffled-label fit(s): a leakage and overfitting sanity check, "
-            f"not a permutation p-value, which would require many full refits including selection"
+            f"{int(n_control_fits)} shuffled-label fit(s): the outcomes were permuted at GUID "
+            f"level and the LINEAR CLASSIFIER was refitted on the frozen pretrained latents. The "
+            f"adaptation was NOT rerun under the permutation, so this does not exercise the "
+            f"posterior mean-head update or the per-epoch gate/AUROC selection -- it bounds what "
+            f"a linear head can extract from the frozen representation under permuted labels, not "
+            f"what the fine-tuning loop can. It is a leakage and overfitting sanity check, and it "
+            f"is not a permutation p-value, which would require many full refits including "
+            f"selection"
         ),
         "prior_probe_run": bool(prior_probe),
         "combined_branch_claim_supported": bool(prior_probe),

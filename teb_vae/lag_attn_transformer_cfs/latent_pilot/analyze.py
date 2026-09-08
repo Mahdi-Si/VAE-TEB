@@ -50,6 +50,7 @@ test.
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
@@ -145,10 +146,16 @@ def score_frame(frame: pd.DataFrame, values: np.ndarray, classifier: Any) -> pd.
 
     $$s = w^\top S(v) + b,$$
 
-    the same head, unchanged, at every time bin. Bins outside the supervised final hour are marked
-    as such on the row: the loss was defined on the last hour, so a score two hours out is an
-    application of that head outside the window it was fitted on, and the figure caption has to say
-    so. The head is not refitted per bin, which would make each bin's score a different quantity.
+    the same head, unchanged, at every time bin. The head is not refitted per bin, which would make
+    each bin's score a different quantity.
+
+    Marking a bin as inside or outside the supervised final hour is the **caller's** job, not this
+    function's: it needs the bin width and the supervised edge, neither of which is passed here.
+    :func:`group_bands` does it from its ``supervised`` argument (filled from
+    :func:`supervised_bins`), and the paired early/late comparison does it by construction. The
+    distinction matters because the loss was defined on the last hour, so a score two hours out is
+    an application of that head outside the window it was fitted on, and every figure and caption
+    that draws one has to say so.
 
     Args:
         frame: Any table of recording summaries, from :func:`bin_summaries` or
@@ -182,12 +189,11 @@ def supervised_bins(*, bin_hours: float, supervised_hours: float) -> List[int]:
         The bin indices, nearest delivery first. Every other bin is an exploratory application of
         the head outside its own window, and is labelled that way wherever it is drawn.
     """
-    return [
-        index
-        for index, (_low, high) in enumerate(
-            data.bin_edges(bin_hours=bin_hours, preservation_hours=supervised_hours)
-        )
-    ]
+    # Floor, not round: ``data.bin_edges`` rounds the count, so a supervised window of 0.75 h at
+    # a 0.5 h bin width would report bin 1 -- (0.5, 1.0] h -- as supervised when half of it lies
+    # outside the window the loss was defined on. A partly-inside bin is an application outside.
+    count = int(math.floor(float(supervised_hours) / float(bin_hours) + 1e-9))
+    return list(range(count))
 
 
 def group_bands(
@@ -226,8 +232,11 @@ def group_bands(
     """
     inside = set(int(value) for value in supervised)
     rows: List[Dict[str, Any]] = []
+    # ``dropna=False``: a recording whose grouping value is missing -- an unrecovered class, say
+    # -- would otherwise leave the table without appearing anywhere, so the counts printed under
+    # the figure would not add up to the cohort. It gets its own labelled group instead.
     for (group, index), block in scored.groupby(
-        [group_column, data.BIN_COLUMN], sort=True
+        [group_column, data.BIN_COLUMN], sort=True, dropna=False
     ):
         values = np.asarray(block[SCORE_COLUMN], dtype=np.float64)
         band = bootstrap_ci(
@@ -238,14 +247,21 @@ def group_bands(
             # grouping (0/1) and the class grouping ("healthy", "acidosis", "hie") into one table
             # under one ``group`` column, and a column holding both is an object column that
             # parquet refuses to write. The reader already reads it as text.
-            "group": str(group),
+            "group": "unlabelled" if pd.isna(group) else str(group),
             data.BIN_COLUMN: int(index),
             data.BIN_LABEL_COLUMN: (
                 block[data.BIN_LABEL_COLUMN].iloc[0]
                 if data.BIN_LABEL_COLUMN in block.columns else ""
             ),
             "n_recordings": int(len(block)),
-            "mean": band["point"],
+            # ``bootstrap_ci`` leaves ``point`` at NaN below MIN_GROUP_SIZE, which drops the
+            # descriptive mean along with the band it could not estimate. The band stays absent
+            # -- that is honest -- but a cell with two recordings still has a mean worth drawing
+            # beside its printed count.
+            "mean": (
+                band["point"] if np.isfinite(band["point"])
+                else (float(values.mean()) if values.size else float("nan"))
+            ),
             "lo": band["lo"],
             "hi": band["hi"],
             "supervised_window": int(index) in inside,
@@ -255,7 +271,8 @@ def group_bands(
     logger.info(
         f"trajectory bands: {len(table)} (group, bin) cell(s) over "
         f"{scored[data.GUID_COLUMN].nunique()} recording(s); "
-        f"{int((table['n_recordings'] < MIN_GROUP_SIZE).sum())} cell(s) too small for a band"
+        f"{int((table['n_recordings'] < MIN_GROUP_SIZE).sum()) if not table.empty else 0} "
+        f"cell(s) too small for a band"
     )
     return table
 
@@ -319,6 +336,21 @@ def window_scores(
             eligible, extraction.arrays[key], low=float(window[0]), high=float(window[1])
         )
         scored[name] = score_frame(rows, values, classifier)
+
+    # Refused, not carried through as an empty merge. Eligibility constrains only the supervised
+    # window, so a fold whose recordings never reach back into the early window is admissible --
+    # and it has no paired difference at all. Letting it through would put a row of NaN into the
+    # report under the same heading a measured contrast uses.
+    for name, window in (("early", early), ("late", late)):
+        other = "late" if name == "early" else "early"
+        if scored[name].empty:
+            raise PilotConfigError(
+                f"no eligible {split!r} recording contributed a retained anchor to the {name} "
+                f"window ({float(window[0]):g}, {float(window[1]):g}] h, so no paired difference "
+                f"exists; the {other} window holds {len(scored[other])} recording(s). Eligibility "
+                f"constrains the supervised window only, so a cohort can be fully eligible and "
+                f"still be unobserved here."
+            )
 
     paired = scored["early"].merge(
         scored["late"], on=data.GUID_COLUMN, suffixes=("_early", "_late")

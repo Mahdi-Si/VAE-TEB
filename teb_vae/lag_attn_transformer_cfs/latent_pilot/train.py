@@ -58,7 +58,8 @@ recordings, 4 per binary class, with every available late segment in a bag; a cl
 four training recordings reduces the batch and accumulates instead. Repeated segments are never
 presented as distinct patients.
 
-At most ten epochs, stopping after three without an improved eligible validation AUROC. A candidate
+At most ``optim.max_epochs`` epochs, stopping after ``optim.patience`` without an improved
+eligible validation AUROC. A candidate
 is eligible only if it **passes the preservation gates first**; selection is then the highest
 recording-level validation AUROC, ties broken by lower validation BCE and then by the earlier epoch.
 The pretrained model is kept as candidate epoch zero: if no adapted candidate improves selection, the
@@ -86,6 +87,7 @@ import numpy as np
 import pandas as pd
 import torch
 from loguru import logger
+from tqdm import tqdm
 
 from teb_vae.lag_attn_transformer_cfs.latent_pilot import data, evaluate, extract
 from teb_vae.lag_attn_transformer_cfs.latent_pilot import model as pilot_model
@@ -364,6 +366,10 @@ def fit_baseline(
     patience: int,
     weight_decay: float,
     seed: int,
+    # The pipeline's shuffled-label control does NOT come through here: `fit_control_baseline`
+    # permutes the recording TABLE and lets `build_bags` carry the permuted outcomes, so the
+    # control walks the same code path as the run it controls. This argument is the direct-mapping
+    # equivalent, used by the contract tests, and it sets the same `labels_permuted` flag.
     labels: Optional[Mapping[str, Mapping[str, int]]] = None,
 ) -> BaselineFit:
     r"""Fit the frozen baseline's linear classifier on cached pretrained bags.
@@ -454,7 +460,9 @@ def fit_baseline(
     since_improvement = 0
     stopped = "budget_exhausted"
 
-    for step in range(1, int(max_steps) + 1):
+    # The budget is finite and the bar states how much of it is left; early stopping ends it sooner
+    # and the bar closes where it stopped, which is itself the useful fact.
+    for step in tqdm(range(1, int(max_steps) + 1), desc="baseline", unit="step"):
         classifier.train()
         optimizer.zero_grad(set_to_none=True)
         loss = balanced_bce(classifier(train_x), train_labels)
@@ -1235,23 +1243,29 @@ def fit_adaptation(
             logits = classifier(
                 torch.as_tensor(np.asarray(bags.values, dtype=np.float32), device=device)
             ).detach().cpu().numpy()
-        reading = evaluate.preservation_pass(
-            loaded,
-            val_loader,
-            guids=gate_guids,
-            outcomes=outcomes,
-            preservation_hours=float(windows["preservation_hours"]),
-        )
-        gate = (
-            _reference_gate(reading.record)
-            if epoch == 0
-            else evaluate.gate_decision(
+        if epoch == 0:
+            # The caller measured this exact reading to obtain `gate_baseline`: same bundle, same
+            # loader, same gate subset, same window, and no optimizer step has run yet -- only the
+            # classifier has been loaded, which the preservation pass does not touch. Taking it
+            # again would spend one full validation forward to recompute a number already in hand.
+            record = dict(gate_baseline)
+            reading = None
+            gate = _reference_gate(record)
+        else:
+            reading = evaluate.preservation_pass(
+                loaded,
+                val_loader,
+                guids=gate_guids,
+                outcomes=outcomes,
+                preservation_hours=float(windows["preservation_hours"]),
+            )
+            record = reading.record
+            gate = evaluate.gate_decision(
                 gate_baseline,
-                reading.record,
+                record,
                 forecast_mse_max_increase=float(gates["forecast_mse_max_increase"]),
                 saturation_max_increase_pp=float(gates["saturation_max_increase_pp"]),
             )
-        )
         entry = {
             "epoch": epoch,
             "val_auroc": evaluate.auroc(bags.labels, logits),
@@ -1259,8 +1273,8 @@ def fit_adaptation(
             "gate_passed": bool(gate.passed),
             "gate_reasons": "; ".join(gate.reasons),
             "gate_warnings": "; ".join(gate.warnings),
-            "mse_full": reading.record["mse_full"],
-            "delta_mu_sat_pp": reading.record["delta_mu_sat_pp"],
+            "mse_full": record["mse_full"],
+            "delta_mu_sat_pp": record["delta_mu_sat_pp"],
             "n_val_recordings": int(len(bags.frame)),
         }
         return entry, bags, (logits, gate, reading)
@@ -1278,7 +1292,7 @@ def fit_adaptation(
 
     # Epoch zero: the frozen model and the baseline classifier, kept as a candidate so a run in
     # which nothing improves has something honest to report.
-    entry, bags, (logits, _gate, _reading) = _validate(0)
+    entry, bags, (logits, _gate, _reading) = _validate(0)  # _reading is None here by construction
     entry["train_loss"] = float("nan")
     entry["cls_loss"] = float("nan")
     entry["keep_loss"] = float("nan")
@@ -1292,7 +1306,14 @@ def fit_adaptation(
     best_auroc = float(entry["val_auroc"]) if np.isfinite(entry["val_auroc"]) else -float("inf")
 
     verified = False
-    for epoch in range(1, int(optim["max_epochs"]) + 1):
+    # Two bars, because the two questions are different: the outer one is how much of the budget is
+    # spent, and it carries the numbers that decide the run -- validation AUROC, the epoch selected
+    # so far -- so the answer to "where are we" and the answer to "is it working" are on one line.
+    # The inner one is within-epoch and does not survive the epoch.
+    epochs = tqdm(
+        range(1, int(optim["max_epochs"]) + 1), desc="adaptation", unit="epoch",
+    )
+    for epoch in epochs:
         batches = epoch_batches(
             plans,
             per_class=int(optim["recordings_per_class"]),
@@ -1300,7 +1321,9 @@ def fit_adaptation(
             epoch=epoch,
         )
         totals = {"loss": 0.0, "cls": 0.0, "keep": 0.0}
-        for guids in batches:
+        for guids in tqdm(
+            batches, desc=f"epoch {epoch}", unit="batch", leave=False
+        ):
             pilot_model.check_pilot_mode(model)
             optimizer.zero_grad(set_to_none=True)
             classifier.train()
@@ -1339,6 +1362,13 @@ def fit_adaptation(
             f"{'passed' if entry['gate_passed'] else 'FAILED: ' + entry['gate_reasons']}"
         )
 
+        epochs.set_postfix(
+            auroc=f"{entry['val_auroc']:.3f}",
+            loss=f"{entry['train_loss']:.3f}",
+            gate="ok" if entry["gate_passed"] else "FAIL",
+            best=best_epoch,
+        )
+
         eligible = bool(entry["gate_passed"])
         if eligible and is_better(entry, best):
             best, best_epoch = dict(entry), epoch
@@ -1356,6 +1386,10 @@ def fit_adaptation(
             if since_improvement >= int(optim["patience"]):
                 stopped = "patience_exhausted"
                 break
+
+    # Closed explicitly: the loop above leaves by ``break`` whenever patience runs out, and an
+    # unclosed bar keeps the cursor on its own line for everything logged afterwards.
+    epochs.close()
 
     _load_mean_head_state(model, best_state)
     classifier.load_state_dict(best_classifier)
@@ -1495,7 +1529,9 @@ class PilotCheckpoint:
     Attributes:
         mean_head_state: The adapted ``delta_mu_head`` weights. **Only** those -- the rest of the
             net is the pretrained checkpoint's, and writing it out as though it had been trained
-            would misdescribe a 2,112-parameter change as a whole model.
+            would misdescribe a change confined to ``posterior_head.delta_mu_head`` -- whose size
+            this run derives and records in ``record["trainable"]["mean_head"]["n_parameters"]``
+            -- as a whole model.
         classifier_state: The classifier's state dict, its frozen scaler travelling inside it as
             buffers.
         threshold: The decision threshold, chosen on validation.
@@ -1562,7 +1598,10 @@ def save_adapted(
         loaded: The loaded checkpoint bundle, for the source identity.
         directory: The run directory. Created if absent.
         fingerprint: The support fingerprint the fit's latents were read under.
-        name: The filename, for a control that writes beside the main fit.
+        name: The filename. The pipeline always writes the default: the shuffled-label control is
+            a linear probe on the frozen pretrained latents and produces no adapted checkpoint to
+            file beside this one. The parameter exists for a control adaptation that this pilot
+            deliberately does not run -- see :func:`~latent_pilot.evaluate.control_disclosure`.
 
     Returns:
         The written path.
@@ -1713,7 +1752,9 @@ def _refuse_source_path(target: Path, loaded: Any) -> None:
             )
 
 
-def export_base_checkpoint(loaded: Any, directory: Any) -> Path:
+def export_base_checkpoint(
+    loaded: Any, directory: Any, *, selected_epoch: Optional[int] = None
+) -> Path:
     """Export the adapted net as a checkpoint the ordinary evaluator can load.
 
     The model's **own** state dict, with the adapted mean heads already in it and no classifier key
@@ -1726,6 +1767,10 @@ def export_base_checkpoint(loaded: Any, directory: Any) -> Path:
     Args:
         loaded: The bundle, holding the model at the weights to export.
         directory: The run directory; the export lands in a subdirectory of it.
+        selected_epoch: Which candidate the fit selected, stamped into the payload. ``0`` means
+            the frozen model was retained, in which case this file holds the PRETRAINED weights
+            under an "adapted" name -- a reader who has only the file needs to be told that.
+            ``None`` records the selection as unknown rather than asserting one.
 
     Returns:
         The exported checkpoint's path.
@@ -1752,10 +1797,17 @@ def export_base_checkpoint(loaded: Any, directory: Any) -> Path:
         "pilot": {
             "source_checkpoint": str(loaded.checkpoint_path),
             "source_digest": loaded.digest,
-            "adapted": pilot_model.MEAN_HEAD_PATH,
+            # Named for what it holds: the module path whose weights were replaced. The fit
+            # record's own "adapted" key is a boolean, and two keys of one name holding two types
+            # is how a reader ends up trusting the wrong one.
+            "adapted_module": pilot_model.MEAN_HEAD_PATH,
+            "selected_epoch": None if selected_epoch is None else int(selected_epoch),
+            "adapted": None if selected_epoch is None else bool(int(selected_epoch) > 0),
             "note": (
                 "the pretrained net with this pilot's posterior mean-output weights in place; "
-                "no classifier key is present, and the classifier lives in the pilot checkpoint"
+                "no classifier key is present, and the classifier lives in the pilot checkpoint. "
+                "selected_epoch 0 means the frozen model was retained, so these weights are the "
+                "pretrained ones and nothing here was adapted"
             ),
         },
     }
@@ -1789,6 +1841,13 @@ def permute_outcomes(
     * **At GUID level.** The outcome is a property of a recording, so permuting the recording table
       is what makes every segment keep its own recording's assigned label. A shuffle applied per
       segment would test something that does not exist in the data.
+    * **Within the fitted population.** Only the recordings that are eligible on that split are
+      shuffled among themselves; excluded and ineligible recordings keep their outcome. Shuffling
+      across that boundary would move adverse labels into and out of the eligible subset, so the
+      control would be fitted and selected at a different class prevalence from the run it
+      controls -- and where eligibility correlates with outcome, which is exactly the coverage
+      confound the controls exist to describe, the draw can leave a split with one class and abort
+      the stage after the real fit has already spent its whole epoch budget.
     * **Independently per split.** Validation's labels are permuted on their own draw, so the
       control's selection is driven by a null that the training permutation does not determine.
     * **The test split is untouched.** True held-out labels are used once, at the final evaluation,
@@ -1817,12 +1876,21 @@ def permute_outcomes(
         )
     out = recordings.copy()
     outcomes = out[data.OUTCOME_COLUMN].to_numpy(dtype=object).copy()
+    guids = out[data.GUID_COLUMN].astype(str).to_numpy(dtype=object)
     per_split: Dict[str, Any] = {}
     for split in splits:
-        rows = np.flatnonzero(
-            (out[data.SPLIT_COLUMN].astype(str) == str(split)).to_numpy(dtype=bool)
-            & np.array([value is not None and not pd.isna(value) for value in outcomes], dtype=bool)
+        # The eligible recordings of this split, which is the population the real fit sees. If
+        # eligibility has not been attached yet the mapping is empty and every labelled row of the
+        # split is shuffled, which is the old behaviour and the right one when there is no
+        # eligibility to respect.
+        fitted = set(data.eligible_outcomes(out, split=split))
+        in_split = (out[data.SPLIT_COLUMN].astype(str) == str(split)).to_numpy(dtype=bool)
+        labelled = np.array(
+            [value is not None and not pd.isna(value) for value in outcomes], dtype=bool
         )
+        if fitted:
+            in_split = in_split & np.array([guid in fitted for guid in guids], dtype=bool)
+        rows = np.flatnonzero(in_split & labelled)
         if rows.size == 0:
             per_split[split] = {"n_recordings": 0, "n_changed": 0}
             continue
@@ -1833,9 +1901,13 @@ def permute_outcomes(
         permuted = original[generator.permutation(rows.size)]
         outcomes[rows] = permuted
         per_split[split] = {
+            # The population that was shuffled, which is the population the fit sees -- not the
+            # split's total. `n_adverse` is therefore invariant under the permutation, which is
+            # the property that makes the control the same experiment under the null.
             "n_recordings": int(rows.size),
             "n_changed": int((original != permuted).sum()),
             "n_adverse": int((original == 1).sum()),
+            "population": "eligible" if fitted else "all labelled (eligibility not attached)",
         }
         if per_split[split]["n_changed"] == 0:
             logger.warning(
@@ -1850,8 +1922,9 @@ def permute_outcomes(
         "per_split": per_split,
         "test_split_permuted": False,
         "note": (
-            "one fixed permutation per split, drawn independently; a single control fit is a "
-            "leakage and overfitting check and is never a permutation p-value"
+            "one fixed permutation per split, drawn independently, confined to the eligible "
+            "recordings the real fit sees so the class marginal is unchanged; a single control "
+            "fit is a leakage and overfitting check and is never a permutation p-value"
         ),
     }
     logger.info(f"shuffled-label control: permuted outcomes {per_split}")

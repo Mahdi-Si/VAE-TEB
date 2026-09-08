@@ -66,7 +66,9 @@ PILOT_KEY = "latent_pilot"
 #: which an IDE chooses and a shell does not have to agree with.
 REPO_ROOT = Path(__file__).resolve().parents[3]
 
-#: This package's own directory. Every run artifact must land inside it.
+#: This package's own directory. Used to locate the package's own test suite and its smoke fixture
+#: cache; it does NOT constrain where runs are written -- see :func:`_check_run_root`, which allows
+#: any writable destination and refuses only a root that encloses one of the run's own inputs.
 PILOT_ROOT = Path(__file__).resolve().parent
 
 #: The stages, in the order ``all`` runs them. Selection is locked between ``control`` and
@@ -162,6 +164,12 @@ DEFAULTS: Dict[str, Any] = {
         # Free text naming the population the input statistics were fitted on, or ``None`` for
         # unknown. Recorded, never inferred.
         "statistics_population": None,
+        # Free text naming the builder mode the shards were written in -- "holdout" or
+        # "augmented". Section 4.1 requires it because the two partition differently: holdout
+        # fixes one test set across every fold, augmented gives each fold its own partition and
+        # adds extra healthy recordings to it, so what a held-out result generalizes to differs.
+        # ``None`` records it as unknown, which is what it is; it is never guessed from a path.
+        "dataset_build_mode": None,
     },
     "windows": {
         # The supervised bag: the final hour before delivery.
@@ -1203,7 +1211,9 @@ def open_run(
     beginning rather than from its last epoch: exact mid-fit resume would have to persist the
     optimizer's moments, the sampler's stream and the RNG state every epoch, and would still not
     reproduce a run bit for bit across a device change -- so it would be a promise this package
-    could not keep. The fits here are at most ten epochs over two small heads; restarting one is
+    could not keep. The fits here are at most ``optim.max_epochs`` epochs over two small heads --
+    short relative to the machinery exact resume would need at the protocol's own budget, though a
+    large ``max_epochs`` makes a stage-level restart correspondingly expensive; restarting one is
     cheaper than the machinery that would avoid it, and the semantics are stated rather than
     implied.
 

@@ -245,6 +245,21 @@ def test_auroc_is_one_on_a_perfect_ranking_and_a_half_on_a_constant_one():
     assert evaluate.auroc([0, 0, 1, 1], [1.0, 1.0, 1.0, 1.0]) == pytest.approx(0.5)
 
 
+def test_auroc_pins_the_rank_offset_and_the_tie_rule_away_from_the_degenerate_values():
+    """Every other case here sits at 0, 0.5 or 1, where a rank offset or a tie rule cannot show.
+
+    Two hand-checkable cases that can:
+
+    * ``[0, 1, 0, 1]`` scored ``[4, 3, 2, 1]`` has four (healthy, adverse) pairs, of which exactly
+      one is ranked correctly, so the area is 1/4. A one-position rank offset would move it.
+    * ``[0, 0, 1, 1]`` scored ``[1, 2, 2, 3]`` has four pairs: three concordant and one TIED, which
+      the mid-rank rule counts as a half. 3.5/4 = 0.875. Counting a tie as a win gives 1.0 and as
+      a loss gives 0.75, so this value is the tie rule and nothing else.
+    """
+    assert evaluate.auroc([0, 1, 0, 1], [4.0, 3.0, 2.0, 1.0]) == pytest.approx(0.25)
+    assert evaluate.auroc([0, 0, 1, 1], [1.0, 2.0, 2.0, 3.0]) == pytest.approx(0.875)
+
+
 def test_auroc_is_undefined_rather_than_zero_when_a_class_is_absent():
     """A split carrying one class cannot estimate discrimination, and nan is what says so."""
     assert np.isnan(evaluate.auroc([1, 1, 1], [0.0, 1.0, 2.0]))

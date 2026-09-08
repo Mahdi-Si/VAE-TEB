@@ -72,6 +72,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+import time
 from copy import deepcopy
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
@@ -160,6 +161,11 @@ BIN_TABLE_FILENAME = "per_recording_bin.parquet"
 BAND_TABLE_FILENAME = "trajectory_bands.parquet"
 TEST_TABLE_FILENAME = "per_recording_test.parquet"
 BAG_VALUES_FILENAME = "figure_bags.npz"
+
+#: One row per held-out recording observed in both the early and the late window, per model: the
+#: two scores, their difference and the class behind it. Written so the acidosis/HIE split of the
+#: paired change stays auditable from the run directory rather than only from the report.
+PAIRED_TABLE_FILENAME = "per_recording_paired_windows.parquet"
 
 def build_parser() -> argparse.ArgumentParser:
     """Build the command-line parser. Every ``dest`` is also a :data:`RUN_ARGS` key.
@@ -711,6 +717,21 @@ def stage_preflight(context: Dict[str, Any]) -> Dict[str, Any]:
     from teb_vae.lag_attn_transformer_cfs.latent_pilot import model as pilot_model
 
     settings, directory = context["settings"], Path(context["run_dir"])
+
+    # Eligibility is decided by `extract` and lives in the same table this stage writes. Rewriting
+    # that table after extraction has run would drop the `eligible` column, and a missing column
+    # reads downstream as "no eligibility rule at all" -- so the baseline, the fit and the gate
+    # subset would quietly be taken over recordings the declared coverage rules excluded, with
+    # normal-looking counts and nothing logged. Refuse instead; the operator can start a new run.
+    if "extract" in pilot_config.read_stage_state(directory).get("completed", []):
+        raise pilot_config.RunStateError(
+            f"{directory} already has a completed 'extract' stage, whose eligibility columns live "
+            f"in the same recording table this stage rewrites. Re-running 'preflight' here would "
+            f"drop them, and every later stage reads a missing 'eligible' column as no "
+            f"eligibility rule -- fitting on recordings the coverage rules excluded. Start a new "
+            f"run directory, or re-run from 'extract' onwards."
+        )
+
     loaded = _load_checkpoint(settings)
     statistics = pilot_model.statistics_record(
         settings["paths"]["statistics"],
@@ -764,6 +785,11 @@ def stage_preflight(context: Dict[str, Any]) -> Dict[str, Any]:
         "statistics": statistics,
         "exposure": exposure,
         "grouping": grouping,
+        # Section 4.1: whether the shards were built in holdout or augmented mode. Recorded from
+        # the operator's setting and left as null when they did not supply it -- the two modes
+        # partition differently, so an unrecorded one is a gap in what a held-out claim rests on
+        # rather than something a run may infer from a path.
+        "dataset_build_mode": settings["provenance"]["dataset_build_mode"],
         "n_segments": int(len(segments)),
         "n_recordings": int(len(recordings)),
         "exclusions": data.exclusion_counts(recordings),
@@ -960,7 +986,7 @@ def stage_finetune(context: Dict[str, Any]) -> Dict[str, Any]:
     pilot_train.save_adapted(
         fit, loaded, directory, fingerprint=train_extraction.fingerprint
     )
-    pilot_train.export_base_checkpoint(loaded, directory)
+    pilot_train.export_base_checkpoint(loaded, directory, selected_epoch=fit.selected_epoch)
 
     # The bundle now holds the selected epoch's weights, so this is the adapted reading -- and it is
     # taken here, where that is true by construction, rather than reconstructed later.
@@ -1243,7 +1269,6 @@ def stage_evaluate(context: Dict[str, Any]) -> Dict[str, Any]:
             version: analyze.covariance_summary(scaler.apply(bags.values))
             for version, bags in test_bags.items()
         },
-        "invariants": applied,
     }
 
     # ---------------------------------------------------------------- preservation, side by side
@@ -1290,7 +1315,7 @@ def stage_evaluate(context: Dict[str, Any]) -> Dict[str, Any]:
         bin_hours=float(settings["windows"]["bin_hours"]),
         supervised_hours=float(settings["windows"]["supervised_hours"]),
     )
-    scored_bins, bands, temporal = [], [], {}
+    scored_bins, bands, temporal, paired_frames = [], [], {}, []
     for version, extraction in test_extractions.items():
         frame, values = _bin_summaries(
             extraction, recordings, split="test", settings=settings
@@ -1317,6 +1342,22 @@ def stage_evaluate(context: Dict[str, Any]) -> Dict[str, Any]:
             resamples=int(settings["bootstrap"]["resamples"]),
             seed=int(settings["seed"]),
         )
+        # The two subgroups against the same healthy controls, computed together so neither can be
+        # promoted to the headline afterwards. Training is binary; these are descriptive, and a
+        # stratum with no paired recording yields a nan point with the bootstrap's own note rather
+        # than an exception.
+        for stratum in ("acidosis", "hie"):
+            temporal[f"{version} ({stratum} vs healthy)"] = analyze.paired_contrast(
+                paired,
+                group_column=eval_labels.CLASS_COLUMN,
+                adverse=stratum,
+                healthy="healthy",
+                resamples=int(settings["bootstrap"]["resamples"]),
+                seed=int(settings["seed"]),
+            )
+        # Persisted: the run directory is how a later process re-reads what a stage established,
+        # and without this the subgroup split could not be audited after the fact.
+        paired_frames.append(paired.assign(model=version))
 
     # ---------------------------------------------------------------- the one shared projection
     training_bins = {}
@@ -1333,6 +1374,9 @@ def stage_evaluate(context: Dict[str, Any]) -> Dict[str, Any]:
     scored_bins = pd.concat(scored_bins, ignore_index=True)
     scored_bins.to_parquet(directory / BIN_TABLE_FILENAME, index=False)
     pd.concat(bands, ignore_index=True).to_parquet(directory / BAND_TABLE_FILENAME, index=False)
+    pd.concat(paired_frames, ignore_index=True).to_parquet(
+        directory / PAIRED_TABLE_FILENAME, index=False
+    )
     test_frame.to_parquet(directory / TEST_TABLE_FILENAME, index=False)
     np.savez_compressed(
         directory / BAG_VALUES_FILENAME,
@@ -1346,9 +1390,17 @@ def stage_evaluate(context: Dict[str, Any]) -> Dict[str, Any]:
     results = {
         "protocol": context["protocol"],
         "checkpoint": dict(preflight.get("checkpoint") or {}),
+        # Deliberately NOT filed under `geometry` as "invariants": this is `apply_adapted`'s
+        # record of which tensors were copied into the bundle -- names, count, selected epoch,
+        # source digest -- and not a measurement of the section 5.1 invariance of `mu_prior`, the
+        # two log-variances and the attention weights. Those are checked by
+        # `model.assert_invariants` in the contract tests; no stage of a run measures them, and a
+        # key named for them here would imply one did.
+        "adaptation_applied": applied,
         "exposure": dict(preflight.get("exposure") or {}),
         "statistics": dict(preflight.get("statistics") or {}),
         "grouping": dict(preflight.get("grouping") or {}),
+        "dataset_build_mode": preflight.get("dataset_build_mode"),
         "cohort": {
             "coverage": pd.read_csv(directory / data.COVERAGE_FILENAME).to_dict(
                 orient="records"
@@ -1548,12 +1600,14 @@ def run_pipeline(
         The run directory and each stage's result.
     """
     ordered = list(stages)
+    logger.info(f"pipeline stage 1/{len(ordered)}: {ordered[0]}")
     context = main(
         config_path=config_path, stage=ordered[0], device=device, overrides=overrides
     )
     directory = context["run_dir"]
     results = dict(context["results"])
-    for stage in ordered[1:]:
+    for position, stage in enumerate(ordered[1:], start=2):
+        logger.info(f"pipeline stage {position}/{len(ordered)}: {stage}")
         finished = main(
             config_path=config_path, stage=stage, device=device, overrides=overrides,
             run_dir=directory, resume=True,
@@ -1647,13 +1701,24 @@ def main(
         f"stages={', '.join(context['stages']) or '(none, all complete)'} run_dir={directory}"
     )
 
-    for name in context["stages"]:
+    # Counted, because the stages are wildly uneven -- `extract` and `finetune` are most of a run
+    # and the rest are seconds -- so "which of how many" is the only cheap answer to where a run
+    # has got to. The per-stage bars inside answer the rest.
+    #
+    # Only when this call was handed more than one stage, which is the ``--stage all`` shape.
+    # ``run_pipeline`` calls this function once per stage and counts the sequence itself, and a
+    # "1/1" printed seven times underneath that would say the opposite of the truth.
+    total_stages = len(context["stages"])
+    for position, name in enumerate(context["stages"], start=1):
+        counted = f"stage {position}/{total_stages}" if total_stages > 1 else f"stage {name}"
         handler = STAGE_HANDLERS.get(name)
         if handler is None:
             raise NotImplementedError(
                 f"stage {name!r} has no registered handler. Registered stages: "
                 f"{', '.join(sorted(STAGE_HANDLERS)) or '(none)'}."
             )
+        logger.info(f"{counted}: {name} starting" if total_stages > 1 else f"{counted} starting")
+        started = time.perf_counter()
         # Each stage reads what it needs from the context and writes its own result back, so the
         # sequence has one shared record rather than a chain of positional hand-offs. The state is
         # persisted as each one finishes: a run interrupted after the fit must not look, to the
@@ -1664,8 +1729,10 @@ def main(
             pilot_config.mark_failed(
                 context["state"], name, directory, reason=f"{type(error).__name__}: {error}"
             )
+            logger.info(f"{counted}: FAILED after {time.perf_counter() - started:.1f}s")
             raise
         pilot_config.mark_completed(context["state"], name, directory)
+        logger.info(f"{counted}: finished in {time.perf_counter() - started:.1f}s")
 
     return context
 

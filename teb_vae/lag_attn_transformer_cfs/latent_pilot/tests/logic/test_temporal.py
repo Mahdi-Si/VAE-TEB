@@ -342,6 +342,35 @@ def test_paired_windows_only_return_recordings_observed_in_them():
     assert paired == {"SYNTH-BOTH"}
 
 
+def test_a_window_with_no_anchor_returns_an_empty_frame_carrying_its_columns():
+    """An unobserved window is a legitimate answer, and it must look like one to the caller.
+
+    Eligibility constrains the SUPERVISED window only, so a fully eligible cohort can still have
+    no anchor in the early window at all. Returning a column-less frame there turned that into a
+    ``KeyError: 'guid'`` several calls away -- inside the merge that builds the paired table, after
+    the checkpoint reload, both extractions and the bootstrap had already run.
+    """
+    frame, values = _anchors([_at_hours("SYNTH-LATE-ONLY", -2000.0, 0.4, 5.0)])
+
+    early, early_values = data.window_means(frame, values, low=2.0, high=3.0)
+
+    assert early.empty
+    assert data.GUID_COLUMN in early.columns
+    assert data.HOURS_COLUMN in early.columns
+    assert early_values.shape == (0, values.shape[1])
+
+    # The same holds for the supervised bag, which shares both reductions.
+    bags, bag_values = data.recording_bags(
+        frame, values, supervised_hours=1.0, halflife_hours=0.5
+    )
+    assert not bags.empty  # this recording IS in the late window
+    empty_bags, empty_values = data.recording_bags(
+        frame[frame[data.HOURS_COLUMN] > 2.0], values, supervised_hours=1.0, halflife_hours=0.5
+    )
+    assert empty_bags.empty and data.GUID_COLUMN in empty_bags.columns
+    assert empty_values.shape == (0, values.shape[1])
+
+
 # =============================================================================
 # Late eligibility
 # =============================================================================

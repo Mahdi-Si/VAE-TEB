@@ -68,6 +68,17 @@ def test_the_readout_reports_the_prevalence_average_precision_must_be_read_again
     assert (measured["n_healthy"], measured["n_adverse"]) == (9, 3)
 
 
+def test_average_precision_pins_the_step_interpolation_convention():
+    """The two conventions disagree here, and the report's chance level assumes this one.
+
+    ``[0, 1, 0, 1]`` scored ``[4, 3, 2, 1]``: precision is 1/2 at the first positive (rank 2) and
+    1/2 at the second (rank 4), so the step-interpolated average is 1/2. The trapezoidal
+    convention gives 1/3 for the same input, so this value is the convention itself -- not a
+    property of the ranking.
+    """
+    assert evaluate.average_precision([0, 1, 0, 1], [4.0, 3.0, 2.0, 1.0]) == pytest.approx(0.5)
+
+
 def test_average_precision_is_the_prevalence_for_a_useless_ranker():
     """Its chance level moves with the cohort, which is why it never travels alone."""
     outcomes = [0] * 9 + [1] * 3
@@ -291,6 +302,21 @@ def test_one_shuffled_fit_is_never_called_a_permutation_p_value():
 
     assert disclosure["permutation_p_value"] is False
     assert "not a permutation p-value" in disclosure["shuffled_label_note"]
+
+
+def test_the_disclosure_states_that_the_control_did_not_rerun_the_adaptation():
+    """The record is what the report prints, so the scope has to be in the record.
+
+    The shuffled-label control refits the linear classifier on the frozen pretrained latents; it
+    never calls ``fit_adaptation``. A note saying only "sanity check, not a p-value" leaves a
+    reader to assume the fine-tuning loop was rerun under the null, which is the stage with the
+    most room to manufacture a held-out gain.
+    """
+    disclosure = evaluate.control_disclosure(n_control_fits=1, prior_probe=True)
+
+    assert disclosure["adaptation_rerun_under_permutation"] is False
+    assert disclosure["shuffled_label_scope"] == "linear probe on frozen pretrained latents"
+    assert "NOT rerun under the permutation" in disclosure["shuffled_label_note"]
 
 
 def test_switching_off_the_prior_probe_withdraws_the_combined_branch_claim():

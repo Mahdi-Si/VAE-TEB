@@ -238,6 +238,35 @@ def test_a_pair_from_two_checkpoints_is_refused_before_the_keys_are_compared():
 
 
 # =============================================================================
+# Unusable fitting populations
+# =============================================================================
+def test_a_non_finite_latent_refuses_the_fit_rather_than_writing_a_nan_constant():
+    """A NaN constant would reach every standardized number in the run without failing anywhere.
+
+    It survives the collapse guard and the floor (both are ``>`` comparisons, and every
+    comparison against NaN is False), lands in ``latent_scaler.json``, and turns the classifier
+    logits and the validation AUROC into NaN -- which the fit reads as "not better", so it
+    retains epoch zero and finishes with a report no stage of which names the cause.
+    """
+    frame = _frame([("SYNTH-A", -2000.0, 0), ("SYNTH-B", -2000.0, 0)])
+    values = np.array([[1.0, 2.0], [float("nan"), 4.0]])
+
+    with pytest.raises(PilotConfigError, match="not finite at coordinate"):
+        extract.fit_scaler(frame, values)
+
+    # Coordinate 1 is fine on its own; the refusal names the offending coordinate, not the run.
+    finite = np.array([[1.0, 2.0], [3.0, 4.0]])
+    assert float(extract.fit_scaler(frame, finite).center[0]) == pytest.approx(2.0)
+
+
+def test_an_empty_training_frame_is_named_as_empty_not_as_split_contamination():
+    """The empty frame's split set is ``[]``, which the split check would otherwise reject."""
+    frame = _frame([]).iloc[0:0]
+    with pytest.raises(PilotConfigError, match="no retained training anchor"):
+        extract.fit_scaler(frame, np.zeros((0, 2)))
+
+
+# =============================================================================
 # The test-split guard
 # =============================================================================
 def test_the_test_split_cannot_be_extracted_outside_the_evaluation_stage():

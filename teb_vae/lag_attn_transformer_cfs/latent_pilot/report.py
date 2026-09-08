@@ -117,11 +117,16 @@ CAPTIONS: Dict[str, str] = {
         "outcome result. Colouring is descriptive: nothing here is adjusted for, and no stratum was "
         "fitted separately."
     ),
+    # A format template, filled by :func:`figure_trajectories` from the run's own window settings.
+    # ``CAPTIONS`` stays a plain ``Dict[str, str]``, which ``_figures_section`` and the logic tests
+    # both index; what changes is that the sentence cannot state a geometry the config can move.
     FIGURE_TRAJECTORIES: (
-        "Each model's FROZEN final-hour classifier applied to every occupied half-hour bin. Bins "
-        "outside the shaded supervised hour are applications of that head outside the window it "
-        "was fitted on. Counts at the foot of each bin are the recordings the band rests on; gaps are "
-        "real absences and no line is extended to delivery without data."
+        "Each model's FROZEN classifier, fitted on the final {supervised_hours:g} h, applied to "
+        "every occupied {bin_hours:g} h bin. Bins outside the shaded supervised window are "
+        "applications of that head outside the window it was fitted on. Counts at the foot of "
+        "each bin are the recordings the band rests on; gaps are real absences and no line is "
+        "extended to delivery without data. Raw FHR/UP excerpts are not produced by this "
+        "pipeline."
     ),
 }
 
@@ -863,8 +868,17 @@ def figure_trajectories(
         ax.set_ylabel("FHR")
         figures.style_axes(ax)
 
-    fig.suptitle("Score over the last three hours, with per-bin recording counts")
-    fig.text(0.01, 0.005, CAPTIONS[FIGURE_TRAJECTORIES], fontsize=6.0, wrap=True)
+    fig.suptitle(
+        f"Score over the last {float(preservation_hours):g} hours, "
+        f"with per-bin recording counts"
+    )
+    fig.text(
+        0.01, 0.005,
+        CAPTIONS[FIGURE_TRAJECTORIES].format(
+            supervised_hours=float(supervised_hours), bin_hours=float(bin_hours)
+        ),
+        fontsize=6.0, wrap=True,
+    )
     logger.info(
         f"figure 3: {len(names)} model panel(s), {len(traces)} seeded individual trace(s), "
         f"{len(excerpt_guids)} raw excerpt(s)"
@@ -1027,19 +1041,26 @@ def reproduction_commands(protocol: Optional[Mapping[str, Any]]) -> List[str]:
         protocol: The run's protocol record, or ``None``.
 
     Returns:
-        One command per line. Empty when the protocol did not record its arguments, which is
-        reported as a gap rather than filled with a plausible-looking command line.
+        One command per line, carrying the run's own ``--set`` overrides and its device. Empty
+        when the protocol did not record its arguments, which is reported as a gap rather than
+        filled with a plausible-looking command line.
     """
     run_args = dict((protocol or {}).get("run_args") or {})
     if not run_args:
         return []
     config_path = _text(run_args.get("config_path"))
     directory = (protocol or {}).get("run_directory")
-    commands = [f"python -m {RUNNER_MODULE} --config {config_path} --stage all"]
+    # The overrides are part of the run's identity, not decoration. Without them the first command
+    # reproduces a different run, and the second is actively refused: re-entering a run directory
+    # compares the resolved settings against the stored ones and raises on any difference.
+    flags = "".join(f" --set {value}" for value in (run_args.get("set_overrides") or []))
+    if run_args.get("device"):
+        flags += f" --device {run_args['device']}"
+    commands = [f"python -m {RUNNER_MODULE} --config {config_path} --stage all{flags}"]
     if directory:
         commands.append(
             f"python -m {RUNNER_MODULE} --config {config_path} --stage report "
-            f"--run-dir {directory}"
+            f"--run-dir {directory}{flags}"
         )
     return commands
 
@@ -1073,6 +1094,9 @@ def _provenance_section(record: Mapping[str, Any]) -> List[str]:
         {"field": "statistics", "value": _text(paths.get("statistics"))},
         {"field": "software", "value": _text(protocol.get("software"))},
         {"field": "settings digest", "value": _text(protocol.get("settings_digest"))},
+        # Section 4.1 asks for it because holdout and augmented builds partition differently, so
+        # an unrecorded mode is a gap in what the held-out result generalizes to.
+        {"field": "dataset build mode", "value": _text(record.get("dataset_build_mode"))},
     ], columns=["field", "value"]))
 
     exposure = dict(record.get("exposure") or {})
@@ -1262,6 +1286,16 @@ def _metrics_section(record: Mapping[str, Any]) -> List[str]:
     lines.append("### Paired differences")
     if not bootstrap:
         lines.append(_missing("paired bootstrap"))
+    elif bootstrap.get("error"):
+        # A cohort too small to resample is a result about this fold, and the run wrote down why.
+        # Falling through to the measured branch below would render that reason as six separate
+        # "not measured" placeholders -- the one thing the record actually knows, discarded.
+        lines.append(
+            _missing(
+                "paired intervals",
+                f"{bootstrap['error']} ({_int(bootstrap.get('n_recordings'))} recording(s))",
+            )
+        )
     else:
         paired = dict(bootstrap.get("paired") or {})
         lines.append(_table([
@@ -1298,30 +1332,30 @@ def _metrics_section(record: Mapping[str, Any]) -> List[str]:
         for name, measured in centroid.items()
     ]) if centroid else _missing("nearest-centroid metrics"))
 
+    # The heading is unconditional: a section that renders nothing where a measurement was
+    # expected reads as "there was nothing to say", which is the one thing this report must not
+    # let a reader conclude. Absent records become a named gap instead, as everywhere else here.
     geometry = dict(record.get("geometry") or {})
-    if geometry:
-        lines.append("")
-        lines.append("### Latent movement and spread")
-        movement = dict(geometry.get("movement") or {})
-        if movement:
-            lines.append(_table([
-                {"field": key, "value": value}
-                for key, value in sorted(movement.items())
-                if not isinstance(value, (list, dict))
-            ], columns=["field", "value"]))
-        covariance = dict(geometry.get("covariance") or {})
-        if covariance:
-            lines.append("")
-            lines.append(_table([
-                {
-                    "model": name,
-                    "n recordings": dict(values).get("n_recordings"),
-                    "total variance": dict(values).get("total_variance"),
-                    "effective rank": dict(values).get("effective_rank"),
-                    "leading share": dict(values).get("leading_share"),
-                }
-                for name, values in covariance.items()
-            ]))
+    lines.append("")
+    lines.append("### Latent movement and spread")
+    movement = dict(geometry.get("movement") or {})
+    lines.append(_table([
+        {"field": key, "value": value}
+        for key, value in sorted(movement.items())
+        if not isinstance(value, (list, dict))
+    ], columns=["field", "value"]) if movement else _missing("latent movement"))
+    covariance = dict(geometry.get("covariance") or {})
+    lines.append("")
+    lines.append(_table([
+        {
+            "model": name,
+            "n recordings": dict(values).get("n_recordings"),
+            "total variance": dict(values).get("total_variance"),
+            "effective rank": dict(values).get("effective_rank"),
+            "leading share": dict(values).get("leading_share"),
+        }
+        for name, values in covariance.items()
+    ]) if covariance else _missing("latent covariance and effective rank"))
     return lines
 
 
@@ -1356,7 +1390,16 @@ def _controls_section(record: Mapping[str, Any]) -> List[str]:
 
 def _temporal_section(record: Mapping[str, Any]) -> List[str]:
     """The paired early/late change, per model, with the sentence it supports."""
-    lines = ["## Change over the last three hours"]
+    # From the run's own settings where they were recorded; a geometry-free heading otherwise,
+    # rather than a default invented here that a moved window would silently contradict.
+    windows = dict(
+        dict(dict(record.get("protocol") or {}).get("settings") or {}).get("windows") or {}
+    )
+    hours = windows.get("preservation_hours")
+    lines = [
+        f"## Change over the last {float(hours):g} hours" if hours is not None
+        else "## Change before delivery"
+    ]
     temporal = dict(record.get("temporal") or {})
     if not temporal:
         lines.append(_missing("temporal analysis"))
@@ -1436,9 +1479,22 @@ def _limitations_section(record: Mapping[str, Any]) -> List[str]:
         "calibrated clinical risk.",
         "The stored class codes are categories, not an ordinal severity scale; the acidosis and "
         "HIE contrasts are descriptive and were not fitted separately.",
+        "Eligibility requires late coverage -- a minimum number of contributing segments inside "
+        "the supervised window and a retained anchor near delivery (counts by reason are in the "
+        "Cohort section). Every metric, band and figure here describes that coverage-selected "
+        "subset, which is not a random sample of the cohort; pairing and stratification do not "
+        "remove that selection.",
     ]
     conditional: List[str] = []
-    if exposure and not exposure.get("clean_holdout_supported"):
+    if not exposure:
+        # The guard used to require a record to exist, so the case with no provenance at all --
+        # the least certain one there is -- was the single case that produced no caveat.
+        conditional.append(
+            "No exposure record was produced for this run, so pretraining and checkpoint-selection "
+            "overlap with the held-out recordings is UNKNOWN. Unknown is not disjoint: treat this "
+            "as exploratory reuse rather than a pristine final test."
+        )
+    elif not exposure.get("clean_holdout_supported"):
         conditional.append(
             "Pretraining/selection exposure of the held-out recordings is not established, so "
             "this is exploratory reuse of that population rather than a pristine final test."
