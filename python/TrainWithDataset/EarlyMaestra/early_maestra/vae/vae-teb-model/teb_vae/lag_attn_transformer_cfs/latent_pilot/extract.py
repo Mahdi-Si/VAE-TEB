@@ -54,6 +54,7 @@ import numpy as np
 import pandas as pd
 import torch
 from loguru import logger
+from tqdm import tqdm
 
 from teb_vae.lag_attn_transformer_cfs.latent_pilot import data, model as pilot_model
 from teb_vae.lag_attn_transformer_cfs.latent_pilot.config import PilotConfigError
@@ -313,7 +314,10 @@ def extract_split(
     model.eval()
     try:
         with torch.no_grad():
-            for batch in loader:
+            # tqdm rather than a log line every N batches: this is the longest silent stretch of a
+            # run, and a percentage is what an operator actually wants from it. It reads the
+            # loader's length itself and falls back to a plain counter when there is none.
+            for batch in tqdm(loader, desc=f"extract:{split}", unit="batch"):
                 if max_batches is not None and n_batches >= max_batches:
                     break
                 n_batches += 1
@@ -610,11 +614,22 @@ def fit_scaler(
         The scaler, immutable and with its fitting population recorded.
 
     Raises:
-        PilotConfigError: If the frame carries any split other than training. The constants must be
-            a property of the training population alone; fitting them on anything else leaks the
-            evaluation distribution into every standardized number the run reports.
+        PilotConfigError: If the frame is empty, if it carries any split other than training, or
+            if the fitted moments are not finite. The constants must be a property of the training
+            population alone -- fitting them on anything else leaks the evaluation distribution
+            into every standardized number the run reports -- and they must be finite, since a NaN
+            constant propagates silently into every later number rather than failing anywhere.
         LatentCollapse: If no coordinate varies at all.
     """
+    # Emptiness first: an empty frame's split set is ``[]``, which is not ``["train"]``, so the
+    # split check below would fire on it and blame contamination for a cohort that retained
+    # nothing at all.
+    if frame.empty:
+        raise PilotConfigError(
+            "no retained training anchor to fit the scaler on: every in-window training anchor "
+            "was excluded by the support, delivery or duplication rules. The extraction record's "
+            "'exclusions' counts say which rule removed them."
+        )
     splits = sorted({str(value) for value in frame[data.SPLIT_COLUMN].tolist()})
     if splits != ["train"]:
         raise PilotConfigError(
@@ -622,10 +637,23 @@ def fit_scaler(
             f"{splits}. Standardizing constants fitted on validation or test would carry those "
             f"populations into every comparison this run makes."
         )
-    if frame.empty:
-        raise PilotConfigError("no retained training anchor to fit the scaler on.")
 
     first, second, counts = _hierarchical_moments(frame, values)
+    # Finiteness before anything derived from these moments. A NaN reaches every later number in
+    # the run: it survives ``maximum(..., 0.0)``, compares False against the collapse guard and
+    # against the floor, and lands in latent_scaler.json, after which every standardized value in
+    # that coordinate is NaN for both models and all three splits. The classifier logits go NaN,
+    # the validation AUROC goes NaN, and a non-finite AUROC counts as "not better", so the fit
+    # quietly retains epoch zero and the run finishes with no stage naming the cause.
+    unusable = ~np.isfinite(first) | ~np.isfinite(second)
+    if bool(unusable.any()):
+        raise PilotConfigError(
+            f"{key} is not finite at coordinate(s) {np.flatnonzero(unusable).tolist()} over the "
+            f"{counts['n_recordings']} training recording(s), so the standardizing constants "
+            f"would be NaN and so would every number standardized by them. The extraction is what "
+            f"has to be fixed, not the scaler: check the checkpoint's input statistics and the "
+            f"shards behind those recordings."
+        )
     variance = np.maximum(second - first ** 2, 0.0)
     raw_scale = np.sqrt(variance)
 

@@ -314,11 +314,23 @@ def test_a_table_escapes_a_pipe_so_one_cell_cannot_become_two():
 # =============================================================================
 # The written report
 # =============================================================================
+def test_the_temporal_heading_follows_the_recorded_window_not_the_shipped_one():
+    """The window is a config value, so a report that names three hours must have measured them."""
+    record = {"protocol": {"settings": {"windows": {"preservation_hours": 3.0}}}, "temporal": {}}
+    assert "## Change over the last 3 hours" in report.build_report(record)
+
+    record["protocol"]["settings"]["windows"]["preservation_hours"] = 4.5
+    assert "## Change over the last 4.5 hours" in report.build_report(record)
+
+    # And with nothing recorded, a geometry-free heading rather than an invented default.
+    assert "## Change before delivery" in report.build_report({"temporal": {}})
+
+
 def test_an_empty_run_reports_nothing_measured_rather_than_zeros():
     text = report.build_report({})
     for heading in (
         "## Provenance", "## Cohort", "## Fitting and selection", "## Preservation",
-        "## Held-out discrimination", "## Controls", "## Change over the last three hours",
+        "## Held-out discrimination", "## Controls", "## Change before delivery",
         "## Prespecified subgroups", "## Figures", "## Limitations", "## Reproduction",
     ):
         assert heading in text

@@ -62,8 +62,13 @@ Mode and gradients
 The backbone stays in ``eval()`` for the whole head-only fit, which disables dropout -- including the
 posterior head's own ``a_dropout`` on the attended source summary -- and makes the frozen forward
 deterministic. ``eval()`` does not disable autograd, so the trainable heads still receive gradients
-in that mode; the student's heads are never placed under ``no_grad()``. The teacher is the same
-architecture at the original weights with its outputs detached.
+in that mode; the student's heads are never placed under ``no_grad()``.
+
+The preservation teacher the *fit* uses is the pretrained extraction's own cached ``mu_post``,
+verified against the student's first forward before any optimizer step, rather than a second live
+model: the upstream is frozen, so the cached value and a live forward are the same number, and
+holding one model instead of two halves the memory a fit needs. :func:`frozen_teacher` is the live
+equivalent, and it is what the contract tests compare that cache against.
 
 The optional frozen-fusion cache is a speed optimisation and nothing else: it is valid only with
 every upstream parameter fixed and dropout disabled, it must be shown to reproduce the full forward's
@@ -714,7 +719,10 @@ def deterministic_outputs(
         seed: The draw to pin.
 
     Returns:
-        Detached clones of the requested outputs.
+        Detached clones of the requested outputs, one per requested key.
+
+    Raises:
+        PilotConfigError: If the forward did not return every requested key.
     """
     model = task.orig_model
     was_training = model.training
@@ -728,7 +736,17 @@ def deterministic_outputs(
         torch.random.set_rng_state(state)
         if was_training:
             model.train()
-    return {key: outputs[key].detach().clone() for key in keys if key in outputs}
+    absent = [key for key in keys if key not in outputs]
+    if absent:
+        # Filtering the miss away instead would let ``assert_invariants`` return an empty
+        # difference map and raise nothing -- an invariant check that passes having checked
+        # nothing. The forward's key set is fixed, so an absent key is a contract break.
+        raise PilotConfigError(
+            f"the forward did not return {absent}, so the requested invariant(s) cannot be "
+            f"measured. It returned {sorted(outputs)}. Check that the loaded checkpoint is the "
+            f"CFS model this package was written against."
+        )
+    return {key: outputs[key].detach().clone() for key in keys}
 
 
 def compare_outputs(

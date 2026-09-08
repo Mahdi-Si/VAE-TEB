@@ -248,8 +248,10 @@ def pilot_loader_config(
 
     Raises:
         PilotConfigError: If the checkpoint's configuration does not load one of
-            :data:`REQUIRED_LOAD_FIELDS`. The loader skips a field a shard does not carry without a
-            word, so an absent one surfaces much later as a missing tensor.
+            :data:`REQUIRED_LOAD_FIELDS` -- the loader skips a field a shard does not carry
+            without a word, so an absent one surfaces much later as a missing tensor -- or if it
+            carries a cohort-shaping filter (``epoch_max``, ``cs_label``, ``bg_label``,
+            ``allowed_guids``), which would silently restrict the cohort the manifest describes.
     """
     config = deepcopy(dict(resolved_config))
     dataset = config.setdefault("dataset_config", {})
@@ -280,6 +282,25 @@ def pilot_loader_config(
     # weight-scaled target, so it matches only fully valid steps and silently drops every
     # partially masked segment; the class is recovered from the target/weight ratio instead.
     kwargs["label"] = None
+
+    # Refused, not cleared. A checkpoint's resolved config may carry filters that decide WHO is in
+    # the cohort -- an upper epoch bound, a Caesarean or blood-gas restriction, an explicit GUID
+    # allowlist. Copying them through would measure a subset of the split the manifest claims to
+    # describe; silently setting them to None would change the cohort with nothing recording that
+    # it changed. Both are wrong in the same way, so the run stops and the operator decides.
+    shaping = [
+        name for name in ("epoch_max", "cs_label", "bg_label", "allowed_guids")
+        if kwargs.get(name) is not None
+    ]
+    if shaping:
+        raise PilotConfigError(
+            f"the checkpoint's resolved config carries cohort-shaping loader filter(s) "
+            f"{shaping}, which would restrict this pilot's cohort to a subset of the configured "
+            f"shards without appearing in the manifest or the coverage table. Remove them from "
+            f"the resolved config the pilot reads, or point the pilot at a config that does not "
+            f"carry them; the pilot will not clear them silently."
+        )
+
     if epoch_min is not None:
         kwargs["epoch_min"] = float(epoch_min)
     if batch_size is not None:
@@ -423,12 +444,19 @@ def segment_frame(loader: Any, *, split: str, max_batches: Optional[int] = None)
         for index in range(size):
             code: Optional[int] = None
             if targets is not None:
+                if weights is None:
+                    # Substituting all-ones here would read the class off a weight-SCALED target:
+                    # a half-valid acidosis segment stores 2.0 * 0.5 = 1.0 and would be recorded
+                    # as healthy, with no exclusion and no warning. The shards this repository
+                    # builds always carry ``weight``; a batch without it is a contract break.
+                    raise PilotConfigError(
+                        f"the {split!r} loader yielded a batch with no 'weight' field, so the "
+                        f"stored target cannot be unscaled and the clinical class cannot be read "
+                        f"from it. Check that the shards carry a 'weight' dataset and that "
+                        f"'weight' survives into the loader's load_fields."
+                    )
                 target_row = np.atleast_1d(targets[index]).ravel()
-                weight_row = (
-                    np.atleast_1d(weights[index]).ravel()
-                    if weights is not None and index < len(weights)
-                    else np.ones_like(target_row)
-                )
+                weight_row = np.atleast_1d(weights[index]).ravel()
                 # The ratio, never the raw target: a partially valid acidosis step stores 1.0 and
                 # is otherwise indistinguishable from a fully valid healthy one, and a zero means
                 # "no class" rather than healthy.
@@ -462,7 +490,8 @@ def segment_frame(loader: Any, *, split: str, max_batches: Optional[int] = None)
         raise PilotConfigError(
             f"the {split!r} loader yielded no samples. Either the shard list resolves to nothing, "
             f"or a loader filter (epoch_min / epoch_max / cs_label / bg_label / label) excluded "
-            f"every segment. The resolved loader configuration is recorded with the run."
+            f"every segment. The checkpoint's own resolved_config.yaml is the source of those "
+            f"filters, and preflight.json identifies it by path and digest."
         )
     frame = pd.DataFrame(rows)
     logger.info(
@@ -835,7 +864,7 @@ def require_both_classes(
     if eligible_only:
         frame = frame[frame[EXCLUSION_COLUMN].astype(str) == ""]
         if "eligible" in frame.columns:
-            frame = frame[frame["eligible"].astype(bool)]
+            frame = frame[frame["eligible"].fillna(False).astype(bool)]
     for split in splits:
         rows = frame[frame[SPLIT_COLUMN].astype(str) == split]
         present = {
@@ -884,14 +913,25 @@ def coverage_summary(segments: pd.DataFrame, recordings: pd.DataFrame) -> pd.Dat
     subgroup contrast. Every canonical subgroup therefore gets a row on every split, whether or not
     the cohort has one.
 
+    Each stratum kind also carries an ``unknown`` row holding the recordings that matched none of
+    its named strata -- a non-canonical shard basename, a class code that could not be recovered,
+    an absent CS or blood-gas flag -- so every kind's rows sum to the split's ``all`` row and a
+    reader can see how much of the split each contrast actually describes.
+
     Args:
         segments: The segment table for all splits.
         recordings: The recording table for all splits.
 
     Returns:
         One row per ``(split, stratum kind, stratum)``, with recording and segment counts, the
-        eligible count where eligibility has been computed, and the distribution of last observed
-        segment starts in hours before delivery.
+        eligible count where eligibility has been computed, and the distribution of the last
+        segment START in hours before delivery, over the usable recordings of that stratum.
+
+        The distribution is deliberately NOT called a last-observed time. ``epoch`` is the
+        untrimmed start of a segment, and the last anchor inside it sits later by the trim and by
+        four seconds per anchor step, so a segment start overstates how long before delivery the
+        recording stopped being observed. The anchor-based quantity is ``last_anchor_hours``, which
+        :func:`late_eligibility` attaches once anchors exist -- after this table is first written.
     """
     rows: List[Dict[str, Any]] = []
 
@@ -899,8 +939,13 @@ def coverage_summary(segments: pd.DataFrame, recordings: pd.DataFrame) -> pd.Dat
         chosen = recordings[recordings[GUID_COLUMN].isin(list(guids))]
         usable = chosen[chosen[EXCLUSION_COLUMN].astype(str) == ""]
         if "eligible" in usable.columns:
-            usable = usable[usable["eligible"].astype(bool)]
-        last = np.asarray(chosen.get("last_epoch", pd.Series(dtype=float)), dtype=np.float64)
+            # ``fillna(False)``: a split that has not been judged yet carries NaN here, and
+            # ``astype(bool)`` alone maps NaN to True -- reporting an unjudged split as fully
+            # eligible. Not-yet-judged and not-eligible are both "not eligible" for a count.
+            usable = usable[usable["eligible"].fillna(False).astype(bool)]
+        # Over ``usable``, not ``chosen``: a row that reports a usable count and a time
+        # distribution drawn from a wider population invites the reader to combine them.
+        last = np.asarray(usable.get("last_epoch", pd.Series(dtype=float)), dtype=np.float64)
         last = -last[np.isfinite(last)] / 3600.0
         rows.append({
             SPLIT_COLUMN: split,
@@ -911,13 +956,13 @@ def coverage_summary(segments: pd.DataFrame, recordings: pd.DataFrame) -> pd.Dat
             "n_segments": int(
                 segments[segments[GUID_COLUMN].isin(list(guids))].shape[0]
             ),
-            "last_observed_hours_before_delivery_median": (
+            "last_segment_start_hours_before_delivery_median": (
                 float(np.median(last)) if last.size else float("nan")
             ),
-            "last_observed_hours_before_delivery_min": (
+            "last_segment_start_hours_before_delivery_min": (
                 float(last.min()) if last.size else float("nan")
             ),
-            "last_observed_hours_before_delivery_max": (
+            "last_segment_start_hours_before_delivery_max": (
                 float(last.max()) if last.size else float("nan")
             ),
         })
@@ -930,28 +975,42 @@ def coverage_summary(segments: pd.DataFrame, recordings: pd.DataFrame) -> pd.Dat
             continue
         guids = [str(value) for value in in_split[GUID_COLUMN].tolist()]
         _emit(split, "all", "all", guids)
-        for name in ("healthy", "acidosis", "hie"):
-            _emit(split, labels.CLASS_COLUMN, name, [
-                str(row[GUID_COLUMN]) for _, row in in_split.iterrows()
-                if row[labels.CLASS_COLUMN] == name
-            ])
-        for outcome, name in ((0, "healthy"), (1, "adverse")):
-            _emit(split, OUTCOME_COLUMN, name, [
-                str(row[GUID_COLUMN]) for _, row in in_split.iterrows()
-                if row[OUTCOME_COLUMN] == outcome
-            ])
+        # Each stratum kind emits its named strata and then one "unknown" row holding whatever
+        # matched none of them, so every kind's rows sum to the split's "all" row. Without it a
+        # non-canonical shard basename, a rejected class code or an absent CS/BG flag simply
+        # vanishes between the total and the strata, and section 4.1's missingness requirement
+        # goes unanswered by the one table that reports coverage.
+        all_guids = set(guids)
+
+        def _emit_kind(kind: str, named: Sequence[Tuple[str, Any]]) -> None:
+            covered: Set[str] = set()
+            for name, predicate in named:
+                matched = [
+                    str(row[GUID_COLUMN]) for _, row in in_split.iterrows() if predicate(row)
+                ]
+                covered.update(matched)
+                _emit(split, kind, name, matched)
+            missing = sorted(all_guids - covered)
+            _emit(split, kind, "unknown", missing)
+
+        _emit_kind(labels.CLASS_COLUMN, [
+            (name, (lambda name: lambda row: row[labels.CLASS_COLUMN] == name)(name))
+            for name in ("healthy", "acidosis", "hie")
+        ])
+        _emit_kind(OUTCOME_COLUMN, [
+            (name, (lambda value: lambda row: row[OUTCOME_COLUMN] == value)(outcome))
+            for outcome, name in ((0, "healthy"), (1, "adverse"))
+        ])
         # Every canonical subgroup, present or not.
-        for name in labels.CANONICAL_SUBGROUPS:
-            _emit(split, labels.SUBGROUP_COLUMN, name, [
-                str(row[GUID_COLUMN]) for _, row in in_split.iterrows()
-                if row[labels.SUBGROUP_COLUMN] == name
-            ])
+        _emit_kind(labels.SUBGROUP_COLUMN, [
+            (name, (lambda name: lambda row: row[labels.SUBGROUP_COLUMN] == name)(name))
+            for name in labels.CANONICAL_SUBGROUPS
+        ])
         for column in ("cs_label", "bg_label"):
-            for flag in (True, False):
-                _emit(split, column, str(flag), [
-                    str(row[GUID_COLUMN]) for _, row in in_split.iterrows()
-                    if _flag_is(row[column], flag)
-                ])
+            _emit_kind(column, [
+                (str(flag), (lambda column, flag: lambda row: _flag_is(row[column], flag))(column, flag))
+                for flag in (True, False)
+            ])
     return pd.DataFrame(rows)
 
 
@@ -1092,9 +1151,11 @@ INELIGIBLE_FEW_LATE_SEGMENTS = "fewer_late_segments_than_required"
 INELIGIBLE_NO_FINAL_ANCHOR = "no_retained_anchor_within_final_minutes"
 
 #: Comparisons on the hour axis are made to this tolerance, so an anchor landing exactly on a bin
-#: or window edge falls on the closed side rather than wherever float rounding sends it. Four
-#: seconds is one decimated step, and this is nine orders of magnitude below that: it separates
-#: representation error from any real time difference.
+#: or window edge falls on the closed side rather than wherever float rounding sends it. One
+#: decimated step is 4 s = 1.1e-3 h, and this tolerance is 1e-9 h (3.6 us) -- six orders of
+#: magnitude below one step, which separates representation error from any real time difference.
+#: Both quantities are in HOURS; comparing the constant against 4 *seconds* is what makes the
+#: margin look larger than it is.
 _HOUR_TOLERANCE = 1e-9
 
 
@@ -1413,11 +1474,20 @@ def deduplicate_anchors(frame: pd.DataFrame) -> pd.DataFrame:
         out[EXCLUSION_COLUMN] = ""
     reasons = out[EXCLUSION_COLUMN].astype(str).to_numpy(dtype=object)
 
+    # The four columns are pulled out once as flat arrays. The rules below are unchanged; what
+    # changes is that a row is read from a numpy array rather than boxed into a Series by
+    # ``out.iloc[position]``. The sort key alone called ``.iloc`` four times per comparison, which
+    # made this superlinear in the split's size -- and ``extract_split`` calls it once per
+    # validation epoch, so the cost was paid ``optim.max_epochs`` times over.
+    guids = out[GUID_COLUMN].to_numpy(dtype=object)
+    epochs = out[EPOCH_COLUMN].to_numpy(dtype=np.float64)
+    anchors = out[ANCHOR_COLUMN].to_numpy(dtype=np.int64)
+    stamps = out[ANCHOR_SECONDS_COLUMN].to_numpy(dtype=np.float64)
+
     live = [index for index, reason in enumerate(reasons) if reason == ""]
     seen_keys: Set[Tuple[str, float, int]] = set()
     for position in live:
-        row = out.iloc[position]
-        key = (str(row[GUID_COLUMN]), float(row[EPOCH_COLUMN]), int(row[ANCHOR_COLUMN]))
+        key = (str(guids[position]), float(epochs[position]), int(anchors[position]))
         if key in seen_keys:
             reasons[position] = EXCLUDED_DUPLICATE_KEY
         else:
@@ -1428,16 +1498,15 @@ def deduplicate_anchors(frame: pd.DataFrame) -> pd.DataFrame:
     contenders = sorted(
         (position for position in live if reasons[position] == ""),
         key=lambda position: (
-            str(out.iloc[position][GUID_COLUMN]),
-            float(out.iloc[position][ANCHOR_SECONDS_COLUMN]),
-            -int(out.iloc[position][ANCHOR_COLUMN]),
-            float(out.iloc[position][EPOCH_COLUMN]),
+            str(guids[position]),
+            float(stamps[position]),
+            -int(anchors[position]),
+            float(epochs[position]),
         ),
     )
     seen_times: Set[Tuple[str, float]] = set()
     for position in contenders:
-        row = out.iloc[position]
-        stamp = (str(row[GUID_COLUMN]), float(row[ANCHOR_SECONDS_COLUMN]))
+        stamp = (str(guids[position]), float(stamps[position]))
         if stamp in seen_times:
             reasons[position] = EXCLUDED_DUPLICATE_TIME
         else:
@@ -1537,11 +1606,6 @@ def assign_time_bins(
 # =============================================================================
 # Reductions: anchors -> segments -> recordings
 # =============================================================================
-def _gathered_mean(values: np.ndarray, rows: Sequence[int]) -> np.ndarray:
-    """Mean of the selected rows of a value matrix."""
-    return np.asarray(values, dtype=np.float64)[list(rows)].mean(axis=0)
-
-
 def segment_means(
     frame: pd.DataFrame, values: np.ndarray, *, group_columns: Sequence[str] = ()
 ) -> Tuple[pd.DataFrame, np.ndarray]:
@@ -1564,6 +1628,9 @@ def segment_means(
         so the next reduction chains without a join.
     """
     keys = [GUID_COLUMN, EPOCH_COLUMN, *group_columns]
+    # Hoisted, not converted per group: the caller passes the whole extraction matrix every time,
+    # and re-casting it once per segment made this reduction quadratic in the split's size.
+    matrix = np.asarray(values, dtype=np.float64)
     rows: List[Dict[str, Any]] = []
     means: List[np.ndarray] = []
     for key, group in frame.groupby(keys, sort=True):
@@ -1576,9 +1643,12 @@ def segment_means(
             "n_anchors": int(len(group)),
             ROW_COLUMN: len(means),
         })
-        means.append(_gathered_mean(values, group[ROW_COLUMN].tolist()))
-    matrix = np.stack(means) if means else np.zeros((0, np.asarray(values).shape[-1]))
-    return pd.DataFrame(rows), matrix
+        means.append(matrix[group[ROW_COLUMN].tolist()].mean(axis=0))
+    stacked = np.stack(means) if means else np.zeros((0, matrix.shape[-1]))
+    # ``columns=`` unconditionally: an empty window is a legitimate answer here (a recording with
+    # no anchor in the requested bin or window), and a column-less frame would turn it into a
+    # KeyError several calls away instead of an empty result the caller can test.
+    return pd.DataFrame(rows, columns=[*keys, HOURS_COLUMN, "n_anchors", ROW_COLUMN]), stacked
 
 
 def recency_weights(hours: Any, *, halflife_hours: float) -> np.ndarray:
@@ -1648,7 +1718,13 @@ def recording_means(
         })
         means.append(mean)
     stacked = np.stack(means) if means else np.zeros((0, matrix.shape[-1]))
-    return pd.DataFrame(rows), stacked
+    # Same reason as :func:`segment_means`: the empty case keeps the populated case's columns.
+    return (
+        pd.DataFrame(
+            rows, columns=[*keys, HOURS_COLUMN, "n_segments", "n_anchors", ROW_COLUMN]
+        ),
+        stacked,
+    )
 
 
 def recording_bags(
@@ -1764,7 +1840,7 @@ def eligible_outcomes(recordings: pd.DataFrame, *, split: str) -> Dict[str, int]
     frame = recordings[recordings[SPLIT_COLUMN].astype(str) == str(split)]
     frame = frame[frame[EXCLUSION_COLUMN].astype(str) == ""]
     if "eligible" in frame.columns:
-        frame = frame[frame["eligible"].astype(bool)]
+        frame = frame[frame["eligible"].fillna(False).astype(bool)]
     return {
         str(row[GUID_COLUMN]): int(row[OUTCOME_COLUMN])
         for _index, row in frame.iterrows()

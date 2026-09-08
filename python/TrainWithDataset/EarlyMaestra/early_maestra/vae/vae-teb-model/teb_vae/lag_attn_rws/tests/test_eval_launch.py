@@ -42,7 +42,20 @@ ENTRY_POINTS: Tuple[str, ...] = (
     # mistyped setting is a gate that measures the wrong thing for hours before saying so.
     "hdf5_dataset.new_pipeline.create_new_pipeline",
     "hdf5_dataset.calculate_dataset_stats",
+    # The latent-class fine-tuning pilot's runner. Same convention, one declared alias below.
+    "teb_vae.lag_attn_transformer_cfs.latent_pilot.run",
 )
+
+#: ``RUN_ARGS`` key -> parser ``dest`` for the one runner where the two surfaces of a single
+#: setting are spelled differently on purpose. The pilot's structured config override is a nested
+#: mapping in the dictionary (``overrides``) and a repeatable ``--set a.b=c`` flag on the command
+#: line (``set_overrides``); ``resolve_run_args`` pops the parsed entries and folds them into
+#: ``overrides``, so the two are one setting and the invariant this file protects -- a dictionary
+#: key that reaches nothing -- still holds. Declaring the pair here keeps the check strict for
+#: every other key rather than exempting the module.
+_DEST_ALIASES = {
+    "teb_vae.lag_attn_transformer_cfs.latent_pilot.run": {"overrides": "set_overrides"},
+}
 
 #: Entry points whose module imports two packages that exist only on the production box. Importing
 #: them here goes through the repository's own shim, which stubs the prod-only adaptor and aliases
@@ -85,11 +98,13 @@ def test_every_launch_dict_key_is_an_argument(name: str) -> None:
     dests = {
         action.dest for action in module.build_parser()._actions if action.dest != "help"
     }
+    aliases = _DEST_ALIASES.get(name, {})
+    keys = {aliases.get(key, key) for key in module.RUN_ARGS}
 
-    assert set(module.RUN_ARGS) == dests, (
+    assert keys == dests, (
         f"{name}: RUN_ARGS keys and parser dests disagree; "
-        f"only in RUN_ARGS: {sorted(set(module.RUN_ARGS) - dests)}, "
-        f"only on the parser: {sorted(dests - set(module.RUN_ARGS))}"
+        f"only in RUN_ARGS: {sorted(keys - dests)}, "
+        f"only on the parser: {sorted(dests - keys)}"
     )
 
 

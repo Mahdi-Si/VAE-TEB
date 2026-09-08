@@ -309,20 +309,44 @@ def test_coverage_reports_empty_strata_explicitly():
     coverage = data.coverage_summary(segments, recordings)
 
     subgroups = coverage[coverage["stratum_kind"] == labels.SUBGROUP_COLUMN]
-    assert set(subgroups["stratum"]) == set(labels.CANONICAL_SUBGROUPS)
+    assert set(subgroups["stratum"]) == set(labels.CANONICAL_SUBGROUPS) | {"unknown"}
     absent = subgroups[subgroups["stratum"] == "hie_cs"].iloc[0]
     assert absent["n_recordings"] == 0
 
     overall = coverage[coverage["stratum_kind"] == "all"].iloc[0]
     assert overall["n_recordings"] == 2
     assert overall["n_segments"] == 2
-    # Both segments start an hour before delivery, so that is where the last observed time sits.
-    assert overall["last_observed_hours_before_delivery_median"] == pytest.approx(1.0)
+    # The column names what it holds: `epoch` is the untrimmed SEGMENT START, and both segments
+    # start an hour before delivery. The last anchor inside them lands later than that.
+    assert overall["last_segment_start_hours_before_delivery_median"] == pytest.approx(1.0)
+
+    # Every stratum kind accounts for the whole split: named strata plus one `unknown` row.
+    for kind in (labels.CLASS_COLUMN, labels.SUBGROUP_COLUMN, "outcome", "cs_label", "bg_label"):
+        rows = coverage[coverage["stratum_kind"] == kind]
+        assert "unknown" in set(rows["stratum"])
+        assert int(rows["n_recordings"].sum()) == int(overall["n_recordings"])
 
 
 # =============================================================================
 # Loader assembly
 # =============================================================================
+def test_a_cohort_shaping_filter_in_the_checkpoint_config_stops_the_run():
+    """These decide WHO is in the cohort, and neither copying nor clearing them can be recorded."""
+    for name, value in (
+        ("epoch_max", -1000.0), ("cs_label", True), ("bg_label", False),
+        ("allowed_guids", ["SYNTH-A"]),
+    ):
+        config = _resolved_config()
+        config["dataset_config"]["dataloader_config"]["dataset_kwargs"][name] = value
+        with pytest.raises(PilotConfigError, match="cohort-shaping loader filter"):
+            data.pilot_loader_config(config, shards=["a.hdf5"], statistics="s.hdf5")
+
+    # And the unfiltered config still resolves, so the guard is the filter and not the shape.
+    assert data.pilot_loader_config(
+        _resolved_config(), shards=["a.hdf5"], statistics="s.hdf5"
+    )["dataset_config"]["stat_path"] == "s.hdf5"
+
+
 def _resolved_config():
     """A minimal stand-in for the configuration a training run writes beside its checkpoint."""
     return {
