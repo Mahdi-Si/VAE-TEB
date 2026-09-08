@@ -28,9 +28,10 @@ Nothing is mutated in place. Every entry point deep-copies before merging, so a 
 
 Paths resolve against the **repository root** rather than the working directory, because an IDE's
 Run button chooses that directory and a relative shard path resolved against it surfaces much later
-as an empty dataset. Absolute paths pass through untouched. Output paths are additionally contained:
-:func:`run_directory` refuses a destination outside this package, so a mistyped run directory cannot
-write into the checkpoint's own tree.
+as an empty dataset. Absolute paths pass through untouched. The run destination is free -- a scratch
+disk or a results share is the normal case on an execution machine -- with one refusal:
+:func:`run_directory` will not write under a root that *encloses* one of the run's own inputs, so a
+mistyped destination cannot write into the checkpoint's own tree.
 
 Unknown keys are refused at every depth, and every declared tolerance in :data:`DEFAULTS` is an
 engineering threshold rather than a clinically validated one -- the protocol record written at run
@@ -144,7 +145,9 @@ DEFAULTS: Dict[str, Any] = {
         "train_shards": [],
         "val_shards": [],
         "test_shards": [],
-        # Runtime output. Contained inside this package by :func:`run_directory`.
+        # Runtime output. Free to point anywhere the machine can write -- a scratch disk or a
+        # results share is the normal case on an execution machine. The one rule, enforced by
+        # :func:`_check_run_root`, is that it must not enclose the run's own inputs.
         "run_root": "teb_vae/lag_attn_transformer_cfs/latent_pilot/runs",
     },
     "provenance": {
@@ -675,18 +678,47 @@ def resolve_settings(
 
     _cross_check(settings, source)
 
-    run_root = Path(_dig(settings, "paths.run_root"))
-    if not _contained(run_root, PILOT_ROOT):
-        raise PilotConfigError(
-            f"{PILOT_KEY}.paths.run_root resolves to {str(run_root)!r}, outside this package "
-            f"({PILOT_ROOT}). Every run artifact stays inside the pilot folder, so a mistyped "
-            f"destination cannot write into the checkpoint's own tree."
-        )
+    _check_run_root(Path(_dig(settings, "paths.run_root")), settings)
     # Not a setting -- it is absent from the schema and would be refused as unknown on the way
     # in. It rides out with the resolved block so the protocol record and the settings digest both
     # say which file this run was configured from, which a directory name does not.
     settings["config_path"] = str(path)
     return settings
+
+
+def _check_run_root(root: Path, settings: Mapping[str, Any]) -> None:
+    """Refuse a run destination that would write over the run's own inputs.
+
+    The destination itself is unconstrained: runs may be written to a scratch disk, a results
+    share, or anywhere else the machine can write. What is refused is a root that *encloses* an
+    input this run reads -- the checkpoint, the statistics file or a shard -- because a run
+    creates, and on resume rewrites, directories underneath it, and the checkpoint is opened
+    read-only precisely so that a pilot run cannot damage the model it is adapting.
+
+    Args:
+        root: The resolved, absolute run root (or an explicit run directory).
+        settings: The resolved settings, read for the input paths.
+
+    Raises:
+        PilotConfigError: If any configured input lies inside ``root``. The message names the
+            input, not only the root, because that is the half the operator has to move.
+    """
+    inputs: List[Tuple[str, str]] = []
+    for name in ("paths.checkpoint", "paths.statistics"):
+        value = _dig(settings, name)
+        if value is not None:
+            inputs.append((name, value))
+    for name in _PATH_LIST_SETTINGS:
+        for item in _dig(settings, name):
+            inputs.append((name, item))
+    for name, value in inputs:
+        if _contained(Path(value), root):
+            raise PilotConfigError(
+                f"{PILOT_KEY}.paths.run_root resolves to {str(root)!r}, which contains the "
+                f"input {PILOT_KEY}.{name} ({value!r}). A run writes and, on resume, rewrites "
+                f"directories under its root; it must not be pointed at the tree holding the "
+                f"checkpoint, the statistics file or the shards."
+            )
 
 
 def _assign(settings: Dict[str, Any], path: str, value: Any) -> None:
@@ -836,7 +868,7 @@ def run_directory(
     Args:
         settings: The resolved settings.
         run_dir: An explicit directory -- a resumed or re-reported run. Relative paths resolve
-            against the repository root.
+            against the repository root; absolute ones are taken as given.
         identifier: The run identifier for a new run. Defaults to a fresh :func:`run_id`.
 
     Returns:
@@ -844,17 +876,11 @@ def run_directory(
         directory.
 
     Raises:
-        PilotConfigError: If an explicit directory falls outside this package. Runtime output stays
-            in the pilot folder whatever the settings say.
+        PilotConfigError: If an explicit directory encloses one of the run's own inputs.
     """
     if run_dir is not None:
         resolved = resolve_path(run_dir)
-        if not _contained(resolved, PILOT_ROOT):
-            raise PilotConfigError(
-                f"run_dir {str(resolved)!r} is outside this package ({PILOT_ROOT}). A pilot run "
-                f"writes latents, a checkpoint, metrics and figures; it does not write outside "
-                f"its own folder."
-            )
+        _check_run_root(resolved, settings)
         return resolved
     root = Path(_dig(settings, "paths.run_root"))
     return root / str(settings["fold"]) / f"seed_{int(settings['seed'])}" / (
