@@ -138,10 +138,30 @@ def test_one_shard_in_two_splits_is_refused(tmp_path):
         )
 
 
-def test_a_run_root_outside_the_package_is_refused(tmp_path):
-    with pytest.raises(PilotConfigError, match="outside this package"):
+def test_a_run_root_outside_the_package_is_accepted(tmp_path):
+    settings = pilot_config.resolve_settings(
+        _write(tmp_path, {"paths": {"run_root": str(tmp_path / "elsewhere")}})
+    )
+    assert settings["paths"]["run_root"] == str((tmp_path / "elsewhere").resolve())
+
+
+def test_a_run_root_containing_an_input_is_refused(tmp_path):
+    with pytest.raises(PilotConfigError, match="contains the input"):
         pilot_config.resolve_settings(
-            _write(tmp_path, {"paths": {"run_root": str(tmp_path)}})
+            _write(tmp_path, {"paths": {
+                "run_root": str(tmp_path),
+                "checkpoint": str(tmp_path / "model" / "best.ckpt"),
+            }})
+        )
+
+
+def test_a_run_root_containing_a_shard_is_refused(tmp_path):
+    with pytest.raises(PilotConfigError, match="contains the input"):
+        pilot_config.resolve_settings(
+            _write(tmp_path, {"paths": {
+                "run_root": str(tmp_path),
+                "train_shards": [str(tmp_path / "shards" / "healthy_bg_cs.hdf5")],
+            }})
         )
 
 

@@ -2,9 +2,9 @@ r"""The run directory: what it records, what may be re-run into it, and what the
 
 Small files and dictionaries throughout. Nothing here builds a model, opens a checkpoint or reads a
 shard: a stage record is JSON, a protocol record is YAML, and the resume decision is a comparison
-between the two and a request. Run directories are created under this package's own ``runs/`` tree,
-which is what :func:`config.run_directory` requires and what ``.gitignore`` covers, and each test
-removes its own.
+between the two and a request. Run directories are created under this package's own ``runs/`` tree
+because that is the one ``.gitignore`` covers -- a run root may point anywhere writable -- and each
+test removes its own.
 
 The pilot checkpoint and the base-model export write tensors and are checked separately, on the
 execution machine.
@@ -23,8 +23,8 @@ from teb_vae.lag_attn_transformer_cfs.latent_pilot.config import (
     RunStateError,
 )
 
-#: Where these tests put their run directories. Inside the package, because run containment is one
-#: of the rules under test; under ``runs/``, because that is the ignored tree.
+#: Where these tests put their run directories. Under this package's ``runs/``, because that is the
+#: ignored tree; the location itself is not what these tests are about.
 SCRATCH = pilot_config.PILOT_ROOT / "runs" / "logic_tests"
 
 
@@ -83,10 +83,14 @@ def test_a_new_run_creates_its_directory_and_writes_what_it_was_launched_with(sc
     assert pilot_config.read_stage_state(opened["run_dir"])["completed"] == []
 
 
-def test_a_run_directory_outside_the_package_is_refused(scratch):
-    """Runtime output stays in the pilot folder whatever the settings say."""
-    with pytest.raises(PilotConfigError, match="outside this package"):
-        _open(scratch, run_dir="/tmp/not-in-the-pilot-folder")
+def test_a_run_directory_holding_an_input_is_refused(scratch):
+    """A run may be written anywhere writable, but never over the tree holding its own inputs."""
+    settings = pilot_config.resolve_settings(TEMPLATE, overrides={"paths": {
+        "run_root": str(scratch / "runs"),
+        "checkpoint": str(scratch / "model" / "best.ckpt"),
+    }})
+    with pytest.raises(PilotConfigError, match="contains the input"):
+        _open(scratch, settings=settings, run_dir=scratch)
 
 
 def test_naming_a_directory_that_does_not_exist_is_not_a_new_run(scratch):

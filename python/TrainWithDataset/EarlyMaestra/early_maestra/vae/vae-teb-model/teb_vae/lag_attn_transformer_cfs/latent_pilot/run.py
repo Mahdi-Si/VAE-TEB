@@ -1512,7 +1512,8 @@ def main(
 
     Raises:
         PilotConfigError: If a setting or run argument is unknown, ill-typed, out of range, or
-            jointly incoherent with another; if the run directory falls outside this package; or if
+            jointly incoherent with another; if the run directory encloses one of the run's own
+            inputs; or if
             a requested stage's inputs are unset or missing.
         RunStateError: If the run directory disagrees with the request -- a resume under changed
             settings, or a finished fitting stage asked to run again in place.

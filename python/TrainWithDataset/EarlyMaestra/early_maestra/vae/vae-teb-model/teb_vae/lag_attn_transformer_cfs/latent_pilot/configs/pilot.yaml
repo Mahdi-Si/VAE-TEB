@@ -13,8 +13,8 @@
 # works unchanged from an IDE Run button. Absolute paths pass through untouched, which is what the
 # checkpoint, the statistics file and the shards will be on the execution machine.
 #
-# WHERE A RUN WRITES: `<run_root>/<fold>/seed_<seed>/<run_id>/`, and nowhere else -- a run root
-# resolving outside this package is refused. That directory holds the protocol and stage state, the
+# WHERE A RUN WRITES: `<run_root>/<fold>/seed_<seed>/<run_id>/`, and nowhere else. That
+# directory holds the protocol and stage state, the
 # cohort tables, the extracted latents and the frozen scaler, the fits and the pilot checkpoint, the
 # selection lock, the metrics and per-recording tables, the figures and `report.md`. The full list
 # is in the design document's execution guide.
@@ -46,7 +46,12 @@ latent_pilot:
     train_shards: []
     val_shards: []
     test_shards: []
-    # Where runs are written. Must stay inside the pilot package.
+    # Where runs are written. Any writable location: a path relative to the repository root,
+    # or an absolute one on a scratch disk or results share. The only refusal is a root that
+    # *contains* an input of this run (the checkpoint, the statistics file or a shard), since a
+    # run creates and on resume rewrites directories underneath it. The default below is the
+    # one location .gitignore already covers; point it elsewhere and the artifacts are yours to
+    # keep out of the repository.
     run_root: teb_vae/lag_attn_transformer_cfs/latent_pilot/runs
 
   provenance:
