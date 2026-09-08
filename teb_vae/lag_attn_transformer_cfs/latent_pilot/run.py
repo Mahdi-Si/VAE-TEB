@@ -84,8 +84,24 @@ _REPO_ROOT = os.path.dirname(
 # Launched as a script (an IDE's Run button) this file's own directory goes on sys.path instead of
 # the repository root, and every absolute import below fails before __main__ is reached. Launching
 # as `python -m teb_vae.lag_attn_transformer_cfs.latent_pilot.run` sets __package__ and needs none
-# of this, which is why the insert is guarded rather than unconditional.
-if not __package__ and _REPO_ROOT not in sys.path:
+# of this, which is why the whole block is guarded rather than unconditional.
+#
+# Two things have to be true, and adding the root is only the first of them. This package's own
+# modules are named `train`, `model`, `data`, `config`, `report`, `evaluate` and `run`, and the
+# repository has a top-level `train` package -- so while the script's directory stays on the path
+# ahead of the root, `import train.graph_models_utils` finds `latent_pilot/train.py` and fails as
+# "No module named 'train.pl_model_base'; 'train' is not a package", several stages into a run.
+# Merely testing `_REPO_ROOT not in sys.path` is not enough either: an inherited PYTHONPATH (which
+# is what a PyCharm remote interpreter sets) already carries the root further down the list, where
+# it loses to the script's directory at position zero.
+if not __package__:
+    _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+    sys.path[:] = [
+        entry for entry in sys.path
+        if os.path.abspath(entry or os.getcwd()) != _SCRIPT_DIR
+    ]
+    if _REPO_ROOT in sys.path:
+        sys.path.remove(_REPO_ROOT)
     sys.path.insert(0, _REPO_ROOT)
 
 import yaml  # noqa: E402

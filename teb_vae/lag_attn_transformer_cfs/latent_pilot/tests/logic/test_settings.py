@@ -18,7 +18,6 @@ Three properties are worth naming, because each of them fails silently rather th
 from __future__ import annotations
 
 import ast
-import os
 from copy import deepcopy
 from pathlib import Path
 
@@ -392,14 +391,21 @@ def test_the_smoke_configuration_is_never_the_production_one():
 
 def test_the_shipped_configurations_both_resolve_without_production_files():
     """An operator must be able to check a configuration before the data is mounted, and the smoke
-    configuration must never point at production paths."""
+    configuration must never share the production one's inputs or its destination.
+
+    Nothing here asserts that the production template's paths are still unset, and that is
+    deliberate: filling them in is exactly what the file asks the operator to do, so a test that
+    failed on a filled-in template would fail the ``tests`` stage of every real run -- the stage
+    that gates all the others. Nor is the smoke root asserted to sit *under* the production root,
+    which stopped being true the moment a run root was allowed to point anywhere writable.
+    """
     production = pilot_config.resolve_settings(
         pilot_config.REPO_ROOT / pilot_run.DEFAULT_CONFIG_PATH
     )
     smoke = pilot_config.resolve_settings(pilot_config.REPO_ROOT / pilot_run.SMOKE_CONFIG_PATH)
-    assert production["paths"]["checkpoint"] is None
     assert smoke["fold"] != production["fold"]
-    assert os.path.commonpath(
-        [smoke["paths"]["run_root"], production["paths"]["run_root"]]
-    ) == production["paths"]["run_root"]
     assert smoke["paths"]["run_root"] != production["paths"]["run_root"]
+    for name in ("checkpoint", "statistics"):
+        assert smoke["paths"][name] != production["paths"][name]
+    for name in ("train_shards", "val_shards", "test_shards"):
+        assert not set(smoke["paths"][name]) & set(production["paths"][name])

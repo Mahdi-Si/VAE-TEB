@@ -56,6 +56,36 @@ def batch():
     return stub
 
 
+def _in_plan_order(batch, epochs):
+    """The stub batch with its rows in the order a plan names them.
+
+    :func:`train.recording_terms` gathers row ``i`` of the forward for segment ``i`` of the plan,
+    so the two orders have to agree. In a real fit they do by construction --
+    ``RecordingSource.batch(guid, plan.epochs)`` collates in exactly that order -- but a plan built
+    by :func:`train.build_plans` is sorted by segment start, which need not be the order a fixture
+    happened to stack its rows in.
+
+    Args:
+        batch: The stub batch.
+        epochs: The plan's segment starts, in the plan's own order.
+
+    Returns:
+        A batch whose rows follow ``epochs``.
+    """
+    import types
+
+    positions = [batch.epoch.tolist().index(float(epoch)) for epoch in epochs]
+    fields = {}
+    for name, value in vars(batch).items():
+        if isinstance(value, torch.Tensor):
+            fields[name] = value[positions]
+        elif isinstance(value, list):
+            fields[name] = [value[index] for index in positions]
+        else:
+            fields[name] = value
+    return types.SimpleNamespace(**fields)
+
+
 def _teacher(task, batch, anchors_by_row):
     """The pretrained ``mu_post`` at the anchors a plan names, straight off a forward."""
     model = task.orig_model
@@ -366,6 +396,8 @@ def test_plans_built_from_an_extraction_name_anchors_the_model_can_be_read_at(ta
     )
     plan = plans["SYNTH-0"]
 
-    _bag, keep, gap = train.recording_terms(task, plan, batch, scale=_scale(task))
+    _bag, keep, gap = train.recording_terms(
+        task, plan, _in_plan_order(batch, plan.epochs), scale=_scale(task)
+    )
     assert float(gap) == pytest.approx(0.0, abs=1e-6)
     assert float(keep) == pytest.approx(0.0, abs=1e-10)

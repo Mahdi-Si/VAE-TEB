@@ -52,6 +52,18 @@ RUNNER_FILE = Path(pilot_run.__file__).resolve()
 MISSING_RUN_DIR = pilot_config.PILOT_ROOT / "runs" / "no-such-run"
 
 
+def _pythonpath() -> str:
+    """The repository root ahead of whatever PYTHONPATH already holds.
+
+    Returns:
+        The value to pass to a subprocess. Prepending rather than assigning matters: an execution
+        machine may need its own entries to import the environment at all.
+    """
+    return os.pathsep.join(
+        [str(pilot_config.REPO_ROOT), os.environ.get("PYTHONPATH", "")]
+    ).rstrip(os.pathsep)
+
+
 def _launch(arguments, *, cwd, module: bool = False) -> subprocess.CompletedProcess:
     """Run the pilot runner in a subprocess and return the finished process.
 
@@ -71,9 +83,7 @@ def _launch(arguments, *, cwd, module: bool = False) -> subprocess.CompletedProc
     # The module form needs the root importable; the file form must not, which is the point of the
     # guarded bootstrap inside run.py.
     if module:
-        environment["PYTHONPATH"] = os.pathsep.join(
-            [str(pilot_config.REPO_ROOT), environment.get("PYTHONPATH", "")]
-        ).rstrip(os.pathsep)
+        environment["PYTHONPATH"] = _pythonpath()
     return subprocess.run(
         command + list(arguments),
         cwd=str(cwd), env=environment, capture_output=True, text=True, timeout=600,
@@ -92,7 +102,10 @@ def test_importing_the_runner_creates_nothing_and_prints_nothing(tmp_path):
             "assert isinstance(r.RUN_ARGS, dict)",
         ],
         cwd=str(tmp_path),
-        env={**os.environ, "PYTHONPATH": str(pilot_config.REPO_ROOT)},
+        # Prepended, not assigned: replacing PYTHONPATH drops whatever the execution environment
+        # put there -- a remote interpreter sets it -- and the import failure that follows is that
+        # environment's, not this package's.
+        env={**os.environ, "PYTHONPATH": _pythonpath()},
         capture_output=True, text=True, timeout=600,
     )
     assert finished.returncode == 0, finished.stderr
@@ -117,7 +130,10 @@ def test_importing_every_pilot_module_starts_no_work(tmp_path):
             ),
         ],
         cwd=str(tmp_path),
-        env={**os.environ, "PYTHONPATH": str(pilot_config.REPO_ROOT)},
+        # Prepended, not assigned: replacing PYTHONPATH drops whatever the execution environment
+        # put there -- a remote interpreter sets it -- and the import failure that follows is that
+        # environment's, not this package's.
+        env={**os.environ, "PYTHONPATH": _pythonpath()},
         capture_output=True, text=True, timeout=600,
     )
     assert finished.returncode == 0, finished.stderr
@@ -136,6 +152,36 @@ def test_direct_file_execution_bootstraps_the_repository_root(tmp_path):
     assert finished.returncode != 0
     assert "does not exist" in finished.stderr
     assert "ModuleNotFoundError" not in finished.stderr
+
+
+def test_the_file_form_does_not_shadow_the_repositorys_own_packages(tmp_path):
+    """This package's modules are named ``train``, ``model``, ``data``, ``config`` and ``report``.
+
+    Running the file puts their directory at ``sys.path[0]``, where ``train.py`` shadows the
+    repository's top-level ``train`` package -- and the import that then fails,
+    ``train.graph_models_utils``, is reached several stages into a run, long after the launch has
+    looked successful. So the bootstrap has to drop its own directory as well as add the root, and
+    it has to do that even when an inherited PYTHONPATH already carries the root further down the
+    list, which is the condition this subprocess reproduces.
+    """
+    program = (
+        "import importlib.util, sys\n"
+        f"sys.path.insert(0, r'{RUNNER_FILE.parent}')\n"
+        f"spec = importlib.util.spec_from_file_location('run', r'{RUNNER_FILE}')\n"
+        "module = importlib.util.module_from_spec(spec)\n"
+        "spec.loader.exec_module(module)\n"
+        "import train.graph_models_utils\n"
+        "print('imported the repository package')\n"
+    )
+    finished = subprocess.run(
+        [sys.executable, "-c", program],
+        cwd=str(tmp_path),
+        env={**os.environ, "PYTHONPATH": _pythonpath()},
+        capture_output=True, text=True, timeout=600,
+    )
+
+    assert finished.returncode == 0, finished.stderr
+    assert "imported the repository package" in finished.stdout
 
 
 def test_module_execution_refuses_identically(tmp_path):

@@ -195,8 +195,27 @@ def test_the_control_reads_its_labels_through_the_ordinary_bag_path(extractions)
 
 
 def test_the_control_cannot_be_fitted_on_a_permuted_held_out_split():
+    """The refusal is on the *request*, not on the table.
+
+    A production recording table always carries test rows -- it is the cohort -- so refusing one
+    would refuse every real control run. What must be impossible is asking for the held-out labels
+    to be shuffled, and what must hold for the ordinary call is that those labels come back
+    untouched.
+    """
     with pytest.raises(PilotConfigError, match="never permuted"):
-        train.control_recordings(_recordings(("train", "test")), seed=7)
+        train.permute_outcomes(
+            _recordings(("train", "test")), seed=7, splits=("train", "test")
+        )
+
+    frame = _recordings(("train", "val", "test"))
+    permuted, record = train.control_recordings(frame, seed=7)
+    held_out = frame[data.SPLIT_COLUMN].astype(str) == "test"
+    assert (
+        permuted.loc[held_out, data.OUTCOME_COLUMN].tolist()
+        == frame.loc[held_out, data.OUTCOME_COLUMN].tolist()
+    )
+    assert "test" not in record["per_split"]
+    assert record["test_split_permuted"] is False
 
 
 # =============================================================================

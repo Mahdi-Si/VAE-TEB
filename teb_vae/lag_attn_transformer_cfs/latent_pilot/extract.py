@@ -300,7 +300,7 @@ def extract_split(
     geometry = dict(loaded.geometry)
     trim_minutes = geometry.get("trim_minutes")
     horizon = int(geometry["horizon"])
-    shift = pilot_model.max_forecast_shift(model)
+    shift = data.max_forecast_shift(model)
 
     rows: List[Dict[str, Any]] = []
     collected: Dict[str, List[np.ndarray]] = {key: [] for key in LATENT_KEYS}
