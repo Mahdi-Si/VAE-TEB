@@ -236,6 +236,56 @@ def test_a_production_stage_without_paths_names_the_setting(tmp_path):
     assert sorted(Path(tmp_path).iterdir()) == [config]
 
 
+def _smoke_without_the_pipeline(monkeypatch, *, absent):
+    """Drive ``stage_smoke`` with its two expensive halves replaced.
+
+    The generator runs a real one-epoch fit and the pipeline runs seven stages; neither is what the
+    decision under test does. What is under test is which of them runs, and what the record says.
+
+    Args:
+        monkeypatch: The pytest fixture.
+        absent: Whether the fixtures should look absent.
+
+    Returns:
+        ``(result, calls)``: the stage record and the names of the halves that were reached.
+    """
+    from teb_vae.lag_attn_transformer_cfs.latent_pilot.tests.fixtures import generate as fixtures
+
+    calls = []
+
+    monkeypatch.setattr(
+        pilot_config, "missing_inputs",
+        lambda settings, stages: ["  a fixture is absent."] if absent else [],
+    )
+    monkeypatch.setattr(
+        fixtures, "generate",
+        lambda *a, **k: calls.append("generate") or {"root": "/generated"},
+    )
+    monkeypatch.setattr(fixtures, "manifest_matches", lambda manifest, settings: [])
+    monkeypatch.setattr(
+        pilot_run, "run_pipeline",
+        lambda *a, **k: calls.append("pipeline") or {"run_dir": "/smoke-run"},
+    )
+    return pilot_run.stage_smoke({}), calls
+
+
+def test_the_smoke_stage_writes_its_fixtures_when_they_are_absent(monkeypatch):
+    """A checkout that has never generated them is the ordinary case, not a refusal."""
+    result, calls = _smoke_without_the_pipeline(monkeypatch, absent=True)
+
+    assert calls == ["generate", "pipeline"]
+    assert result["fixtures_generated"] is True
+    assert result["clinical"] is False
+
+
+def test_the_smoke_stage_leaves_fixtures_that_are_already_there(monkeypatch):
+    """Regenerating would spend the fit again and move the ground under a run that read them."""
+    result, calls = _smoke_without_the_pipeline(monkeypatch, absent=False)
+
+    assert calls == ["pipeline"]
+    assert result["fixtures_generated"] is False
+
+
 def test_a_set_override_reaches_the_settings_the_same_way_the_dictionary_does():
     """Not a subprocess: what matters is that the two sources land in one resolved value."""
     from_dictionary = pilot_run.resolve_run_args(

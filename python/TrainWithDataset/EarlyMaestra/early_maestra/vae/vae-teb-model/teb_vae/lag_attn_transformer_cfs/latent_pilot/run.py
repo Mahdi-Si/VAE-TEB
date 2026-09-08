@@ -605,19 +605,57 @@ def stage_smoke(context: Dict[str, Any]) -> Dict[str, Any]:
     never reach it. It dispatches :data:`PIPELINE_STAGES` directly and so cannot recurse into
     ``all``, and it cannot write into the production run whose sequence invoked it.
 
+    The fixtures it runs on are **written here when they are absent**, rather than being an
+    operator step this stage assumes has happened. They are generated, git-ignored and reproducible,
+    so a checkout that has never run them is the ordinary case rather than an error -- and the
+    alternative was the failure this replaced: a missing-input refusal listing six fixture paths,
+    from a stage whose whole claim is that it needs no data. Present fixtures are never rewritten:
+    regenerating them would spend the fit again and would move the ground under a smoke run that
+    already read them.
+
     Args:
         context: The run context. Read for nothing but the log line: a smoke run that inherited a
             production argument would not be a wiring check of the shipped configuration.
 
     Returns:
-        Where the fixture run was written, and the stages it ran.
+        Where the fixture run was written, the stages it ran, and whether the fixtures were written
+        by this call.
+
+    Raises:
+        PilotConfigError: If generation finishes without producing something the smoke
+            configuration names -- a drift between that file and the generator, which is what
+            :func:`~...tests.fixtures.generate.manifest_matches` exists to name.
     """
+    from teb_vae.lag_attn_transformer_cfs.latent_pilot.tests.fixtures import generate as fixtures
+
+    # Resolved here rather than taken from the outer run, for the same reason the pipeline below
+    # re-resolves it: the smoke configuration is what these fixtures have to satisfy.
+    settings = pilot_config.resolve_settings(SMOKE_CONFIG_PATH)
+    generated = bool(pilot_config.missing_inputs(settings, list(PIPELINE_STAGES)))
+    if generated:
+        logger.info(
+            "smoke: the fixtures this stage runs on are absent, writing them now. They are "
+            "artificial and git-ignored, and the checkpoint among them is a real one-epoch fit -- "
+            "expect minutes, once per checkout."
+        )
+        manifest = fixtures.generate()
+        undelivered = fixtures.manifest_matches(manifest, settings)
+        if undelivered:
+            raise pilot_config.PilotConfigError(
+                "the fixture generator finished without writing "
+                + ", ".join(repr(path) for path in undelivered)
+                + f", which {SMOKE_CONFIG_PATH} names. The configuration and the generator have "
+                f"drifted apart: one of them names a subgroup or a directory the other does not."
+            )
+        logger.info(f"smoke: fixtures written under {manifest['root']}")
+
     logger.info(f"smoke: dispatching {', '.join(PIPELINE_STAGES)} under {SMOKE_CONFIG_PATH}")
     smoke = run_pipeline(SMOKE_CONFIG_PATH)
     return {
         "config_path": SMOKE_CONFIG_PATH,
         "run_dir": str(smoke["run_dir"]),
         "stages": list(PIPELINE_STAGES),
+        "fixtures_generated": generated,
         "clinical": False,
         "note": (
             "artificial identities, times and labels; a finished smoke run is evidence that the "
