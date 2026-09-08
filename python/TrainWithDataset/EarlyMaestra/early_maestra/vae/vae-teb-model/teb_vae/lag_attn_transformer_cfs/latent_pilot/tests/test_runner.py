@@ -216,11 +216,24 @@ def test_an_unknown_stage_is_refused_before_anything_is_created(tmp_path):
 
 
 def test_a_production_stage_without_paths_names_the_setting(tmp_path):
-    """The shipped production configuration ships its paths unset, and a stage that needs one must
-    say which -- before a first pass over any shard."""
-    finished = _launch(["--stage", "extract"], cwd=tmp_path)
+    """A stage that needs an input it was not given names the dotted setting, before a first pass
+    over any shard.
+
+    Against a configuration of this test's own, never the shipped template. Filling that template
+    in is exactly what it asks an operator to do, so a test that depended on its paths still being
+    unset would pass on a fresh checkout and fail on every machine actually set up to run the
+    pilot -- and it would fail *there*, in the ``tests`` stage that gates all the others. An empty
+    ``latent_pilot`` block resolves to the declared defaults, whose production paths are unset.
+    """
+    config = tmp_path / "paths_unset.yaml"
+    config.write_text("latent_pilot: {}\n", encoding="utf-8")
+
+    finished = _launch(["--config", str(config), "--stage", "extract"], cwd=tmp_path)
+
     assert finished.returncode != 0
     assert "paths.checkpoint" in finished.stderr
+    # Refused before ``open_run``, so the refusal costs no run directory anywhere.
+    assert sorted(Path(tmp_path).iterdir()) == [config]
 
 
 def test_a_set_override_reaches_the_settings_the_same_way_the_dictionary_does():
