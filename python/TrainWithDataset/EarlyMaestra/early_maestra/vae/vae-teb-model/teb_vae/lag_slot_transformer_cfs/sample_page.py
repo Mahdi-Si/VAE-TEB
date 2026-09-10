@@ -44,6 +44,7 @@ by whoever owns the process.
 """
 from __future__ import annotations
 
+import textwrap
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, FrozenSet, List, Optional, Sequence, Tuple
 
@@ -123,6 +124,7 @@ __all__ = [
     "causal_stream_panels",
     "residual_forecast_rows",
     "residual_lag_panels",
+    "wrapped_caption",
 ]
 
 #: Raw sampling rate of the stored record, in Hz. The page's own $\Delta$ is re-derived from it and
@@ -145,6 +147,22 @@ _FOOTER_INCHES = 1.7
 _CAVEAT_INCHES = 0.65
 _QUALIFICATION_INCHES = 0.12
 
+#: Characters per line of a footnote, and the reason this page wraps its own captions rather than
+#: asking matplotlib to.
+#:
+#: ``Text(wrap=True)`` finds its break points by **measuring**: it re-measures the line so far once
+#: per word, and every one of those measurements re-parses whatever mathtext the line contains, so
+#: the cost grows with the square of the caption's length. MEASURED at the production geometry:
+#: the two captions below cost $7.9$ s of a $20.7$ s page, for two blocks of prose. Wrapped here
+#: they cost nothing measurable.
+#:
+#: Whitespace is a safe break point for these two strings and stays safe: no ``$...$`` span in
+#: either contains a space, so a break can never land inside one, and
+#: :func:`_test_captions_break_only_between_math_spans` in the package's page tests holds that.
+#: The count suits $7$ pt over this page's $14$ inch width with a margin for the mathtext, which
+#: sets wider than the prose around it.
+_CAPTION_CHARS = 235
+
 #: Never interpolate a heatmap on this page: a cell is one anchor by one channel or one lag, and a
 #: smoothed edge invents a value between two the model produced.
 _IMSHOW_INTERPOLATION = "none"
@@ -164,6 +182,21 @@ PROPOSAL_ROWS: Tuple[Tuple[str, float], ...] = (
     ("kld_dims", 1.1),
     ("kld_total", 0.85),
 )
+
+
+def wrapped_caption(text: str) -> str:
+    """Break one caption into lines here, rather than leaving it to the renderer.
+
+    See :data:`_CAPTION_CHARS` for why. Breaking on whitespace cannot split a ``$...$`` span in
+    either caption this page draws, because neither contains one with a space in it.
+
+    Args:
+        text: The caption, as one paragraph.
+
+    Returns:
+        The same text with newlines at the break points.
+    """
+    return "\n".join(textwrap.wrap(text, width=_CAPTION_CHARS))
 
 
 @dataclass(frozen=True)
@@ -506,8 +539,9 @@ def residual_forecast_rows(
     # own height rather than at a fixed fraction, because this page's row count depends on the arm
     # and a fraction that clears the last row on one lands inside it on another.
     rows.figure.text(
-        0.5, _CAVEAT_INCHES / float(rows.figure.get_figheight()), LAG_TIME_CAVEAT,
-        ha="center", va="bottom", fontsize=7, color=COLOR_GRAY, wrap=True,
+        0.5, _CAVEAT_INCHES / float(rows.figure.get_figheight()),
+        wrapped_caption(LAG_TIME_CAVEAT),
+        ha="center", va="bottom", fontsize=7, color=COLOR_GRAY,
     )
 
     if not rows.wants(FORECAST_ROW):
@@ -744,7 +778,11 @@ def build_residual_page(
         epoch: For the title.
         guid: For the title.
         beta: The divergence weight **resolved for this epoch**, not the raw hyperparameter.
-        scalars: Loss readouts for the title; missing keys are skipped.
+        scalars: The **epoch's** own loss readouts for the title, keyed as the objective names
+            them, and not this sample's: the caller takes them from what the run already logged
+            rather than recomputing them, because this architecture's objective ends in a
+            collective and the page is drawn on one rank. Missing keys are skipped, and an empty
+            mapping leaves the title's second line off entirely.
         up_raw: The raw source in loader units, or ``None``.
         normalization_stats: The loader's statistics, so the raw row renders in physical units.
         delay_steps: The causal input delay $\delta$, for the lag rows' compensated axis.
@@ -1128,8 +1166,9 @@ def build_residual_page(
             # caveat that lives in a planning document is one edit away from being dropped from
             # the thing a reader actually opens.
             fig.text(
-                0.5, _QUALIFICATION_INCHES / figure_height, SUPPRESSION_QUALIFICATION,
-                ha="center", va="bottom", fontsize=7, color=COLOR_GRAY, wrap=True,
+                0.5, _QUALIFICATION_INCHES / figure_height,
+                wrapped_caption(SUPPRESSION_QUALIFICATION),
+                ha="center", va="bottom", fontsize=7, color=COLOR_GRAY,
             )
 
         readouts = "  ".join(
@@ -1140,8 +1179,12 @@ def build_residual_page(
             )
             if name in scalars
         )
+        # Labelled, because these are the epoch's own readouts over the whole validation set and
+        # the rows below are one recording's. Unlabelled, a reader would take them for this
+        # sample's and find that the gap row does not average to the gap printed above it.
         fig.suptitle(
-            f"epoch {epoch} — sample {index} — guid {guid} — beta={beta:.4g}\n{readouts}",
+            f"epoch {epoch} — sample {index} — guid {guid} — beta={beta:.4g}"
+            + (f"\nvalidation epoch: {readouts}" if readouts else ""),
             fontsize=10, y=1.0 - 0.1 / figure_height, va="top",
         )
         return fig
