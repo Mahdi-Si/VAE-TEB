@@ -22,11 +22,15 @@ so a page that stopped being drawn would otherwise be visible only as one log li
 """
 from __future__ import annotations
 
+import ast
+import inspect
+import textwrap
 from typing import Any, List, Tuple
 
 import numpy as np
 import pytest
 import torch
+import torch.distributed as dist
 
 import matplotlib
 
@@ -35,6 +39,7 @@ import matplotlib.pyplot as plt  # noqa: E402
 
 from teb_vae.lag_attn_cfs.sample_page import (  # noqa: E402
     CAUSAL_EXTRA_ROWS,
+    LAG_TIME_CAVEAT,
     _Stitched,
     _window_block_scores,
 )
@@ -45,6 +50,7 @@ from teb_vae.lag_attn_rws.nets.raw_masks import (  # noqa: E402
 from teb_vae.lag_attn_rws.sample_page import ForecastRowInputs  # noqa: E402
 from teb_vae.lag_slot_transformer_cfs import plotting, sample_page  # noqa: E402
 from teb_vae.lag_slot_transformer_cfs.nets.controls import (  # noqa: E402
+    SUPPRESSION_QUALIFICATION,
     suppressed_parameters,
 )
 from teb_vae.lag_slot_transformer_cfs.plotting import (  # noqa: E402
@@ -60,6 +66,7 @@ from teb_vae.lag_slot_transformer_cfs.tests.test_task import (  # noqa: E402
     build_task,
 )
 from train.test_utils import FakeMLflowLogger, FakeTrainer  # noqa: E402
+from utils.style import SAVE_DPI  # noqa: E402
 
 #: Rows the page reserves on the fully populated arm, as arithmetic over the constants that name
 #: them rather than as a literal. A row added to the drawing and not to a constant, or the reverse,
@@ -609,3 +616,209 @@ def test_the_cancellation_row_carries_both_parts_of_the_ratio() -> None:
     assert panels.cancellation_denominator == pytest.approx(
         outs["cancellation_denominator_mean"][0].cpu().numpy(), rel=1e-6
     )
+
+
+# =================================================================================================
+# What the page costs the fit
+# =================================================================================================
+def test_the_captions_break_only_between_maths() -> None:
+    """This page wraps its own captions on whitespace, which is safe only while this holds.
+
+    ``Text(wrap=True)`` re-measures once per word and re-parses the line's mathtext on every one
+    of those measurements, which cost two blocks of prose a third of the page's whole render.
+    Wrapping here removes that, at the price of breaking on whitespace rather than on measured
+    width -- so a ``$...$`` span containing a space would be split across two lines and render as
+    literal dollar signs and backslashes.
+    """
+    for caption in (LAG_TIME_CAVEAT, SUPPRESSION_QUALIFICATION):
+        assert caption.count("$") % 2 == 0, "unbalanced maths in a caption"
+        # Splitting on the delimiter puts the maths in the odd segments and the prose between
+        # them in the even ones, which is the only way to ask the question about the spans
+        # themselves rather than about the sentences separating two of them.
+        spans = caption.split("$")[1::2]
+        for span in spans:
+            assert " " not in span, (
+                f"the maths span {span!r} contains a space, so a whitespace wrap can split it"
+            )
+        for line in sample_page.wrapped_caption(caption).splitlines():
+            assert line.count("$") % 2 == 0, f"the wrap split a maths span: {line!r}"
+
+
+def test_the_captions_stay_inside_the_page() -> None:
+    """A character count is not a measurement, so the rendered width is asserted rather than
+    assumed: too generous and the caption runs off the page, which no exception reports."""
+    figure = _render(build_task(), StubBatch())
+    try:
+        figure.canvas.draw()
+        renderer = figure.canvas.get_renderer()
+        # Every figure-level text except the two-line suptitle, which is placed by its own rule.
+        footnotes = [text for text in figure.texts if text is not figure._suptitle]
+        assert len(footnotes) == 2, "both captions must be on the page"
+        width = figure.get_size_inches()[0] * figure.dpi
+        for text in footnotes:
+            assert text.get_window_extent(renderer).width <= width
+    finally:
+        plt.close(figure)
+
+
+def test_the_page_is_not_saved_at_the_publication_resolution() -> None:
+    """The single most expensive thing this callback could do, and it is not worth anything.
+
+    Every heatmap here is a small array -- one column per decoded anchor -- and matplotlib
+    resamples each to the axes' size in device pixels. At the family's publication resolution
+    those few hundred columns become eight thousand, once per row, and the written file is the
+    same size to within a few percent. MEASURED at the production geometry: a plotted epoch cost
+    $49.6$ s through the shared helper and $12.7$ s through this one. On rank zero inside a
+    distributed fit, that is time every other rank spends waiting at the next collective.
+    """
+    assert plotting.PAGE_DPI < SAVE_DPI
+
+    # Read as syntax rather than as text: the method's own docstring names both of the things
+    # being ruled out, so a substring search over the source would fail on the explanation.
+    tree = ast.parse(textwrap.dedent(inspect.getsource(LagResidualTrfCfsPlotCallback._save)))
+    calls = [node for node in ast.walk(tree) if isinstance(node, ast.Call)]
+    called = {node.func.attr for node in calls if isinstance(node.func, ast.Attribute)}
+    called |= {node.func.id for node in calls if isinstance(node.func, ast.Name)}
+    keywords = {keyword.arg for node in calls for keyword in node.keywords}
+
+    assert "savefig" in called, "the page must be written directly"
+    assert "close" in called, "the figure must be closed even when the save raises"
+    assert "save_figure" not in called, "the shared helper always passes the tight bounding box"
+    assert "bbox_inches" not in keywords, (
+        "a tight bounding box costs a second full draw, and this page has explicit margins"
+    )
+
+
+def test_a_save_that_raises_still_closes_the_figure(tmp_path, monkeypatch) -> None:
+    """pyplot holds every unclosed figure in a global registry, and the caller has let go of it.
+
+    A page-per-epoch leak would grow the process for the length of the run.
+    """
+    callback = LagResidualTrfCfsPlotCallback(tmp_path, num_examples=1, file_format="png")
+    figure = plt.figure()
+
+    def explode(*_args: Any, **_kwargs: Any) -> None:
+        """Fail the way a full disk would.
+
+        Raises:
+            OSError: Always.
+        """
+        raise OSError("no space left on device")
+
+    monkeypatch.setattr(figure, "savefig", explode)
+    before = len(plt.get_fignums())
+    with pytest.raises(OSError):
+        callback._save(figure, tmp_path / "page.png", None)
+    assert len(plt.get_fignums()) == before - 1
+
+
+# =================================================================================================
+# What the page must never do to a distributed fit
+# =================================================================================================
+def _pretend_distributed(monkeypatch, *, world: int = 7) -> List[str]:
+    """Make this one process look like rank zero of a live process group.
+
+    Every collective is replaced by one that refuses. That is the whole instrument: a collective
+    entered from here would, in a real run, block until the watchdog killed the job, and a test
+    that waited for that would hang the suite instead.
+
+    Args:
+        monkeypatch: pytest's patcher.
+        world: The process count to report.
+
+    Returns:
+        A list that records the name of any collective that was reached.
+    """
+    reached: List[str] = []
+
+    def refuse(name: str):
+        """Build a stand-in for one collective."""
+
+        def call(*_args: Any, **_kwargs: Any) -> None:
+            """Record and refuse.
+
+            Raises:
+                AssertionError: Always.
+            """
+            reached.append(name)
+            raise AssertionError(f"the diagnostic page reached torch.distributed.{name}")
+
+        return call
+
+    monkeypatch.setattr(dist, "is_available", lambda: True)
+    monkeypatch.setattr(dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(dist, "get_world_size", lambda *a, **k: world)
+    monkeypatch.setattr(dist, "get_rank", lambda *a, **k: 0)
+    for name in ("all_reduce", "barrier", "broadcast", "all_gather", "reduce"):
+        if hasattr(dist, name):
+            monkeypatch.setattr(dist, name, refuse(name))
+    return reached
+
+
+def test_the_instrument_catches_a_collective() -> None:
+    """The guard below is only worth anything if this model really does synchronise.
+
+    Written first and separately, because a test that patched nothing reachable would pass for
+    the wrong reason for as long as it existed.
+    """
+    with pytest.MonkeyPatch.context() as patch:
+        _pretend_distributed(patch)
+        task, batch = build_task(), StubBatch()
+        outs, target, weight, _inputs = _forward(task, batch)
+        with pytest.raises(AssertionError, match="all_reduce"):
+            task.orig_model.compute_loss(
+                outs, target, weight=weight, beta=1.0, beta_prior=0.1,
+                lambda_full=1.0, lambda_base=1.0, likelihood="gaussian_nll", free_bits=0.0,
+            )
+
+
+def test_the_page_reaches_no_collective_on_rank_zero(tmp_path, monkeypatch) -> None:
+    """The defect that stopped a seven-rank fit dead at its first plotted epoch.
+
+    The inherited handler returns early on every rank but zero, so everything this callback does
+    is done by one process. This architecture's objective ends in an ``all_reduce``; the shared
+    callback calls it to put the loss on the page, and here that call blocked rank zero on six
+    peers that had already moved on. Nothing was written, nothing raised, and the run stopped.
+
+    The page's title takes what the epoch logged instead, so this path must now be collective-free
+    end to end -- forward, lag panels, window scores and all.
+    """
+    reached = _pretend_distributed(monkeypatch)
+    task, batch = build_task(), StubBatch()
+    trainer = _trainer_with_batch(batch)
+    trainer.callback_metrics = {  # type: ignore[attr-defined]
+        "val/nll_full_block": torch.tensor(537.9),
+        "val/nll_base_block": torch.tensor(538.4),
+        "val/pred_gap": torch.tensor(0.427),
+    }
+    callback = LagResidualTrfCfsPlotCallback(tmp_path, num_examples=1, file_format="png")
+
+    callback._generate_plots(trainer, batch, task, epoch=0)
+
+    assert reached == [], f"the page synchronised through {reached}"
+    assert len(_pages(callback)) == 1
+
+
+def test_the_title_carries_the_epochs_own_readouts(tmp_path) -> None:
+    """Taken from the run rather than recomputed, so the figure and the curve cannot disagree.
+
+    They are also labelled as the epoch's on the page: they cover the whole validation set, while
+    every row below them is one recording, and an unlabelled ``pred_gap`` would be read as this
+    sample's and found not to match the row that resolves it in time.
+    """
+    trainer = _trainer_with_batch(StubBatch())
+    trainer.callback_metrics = {  # type: ignore[attr-defined]
+        "val/pred_gap": torch.tensor(0.25),
+        "train/pred_gap": torch.tensor(9.0),
+        "val/not_a_number": "text",
+        "lr": torch.tensor(1e-3),
+    }
+    readouts = plotting._epoch_readouts(trainer)
+    assert readouts == {"pred_gap": 0.25}, "only finite validation metrics, unprefixed"
+    assert plotting._epoch_readouts(FakeTrainer(is_global_zero=True, current_epoch=0)) == {}
+
+    figure = _render(build_task(), StubBatch(), scalars={"pred_gap": 0.25})
+    try:
+        assert "validation epoch:" in figure._suptitle.get_text()
+    finally:
+        plt.close(figure)

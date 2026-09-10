@@ -468,10 +468,19 @@ advanced_config:
     # magnitude, how much source each lag actually had, what removing each lag alone does to the
     # divergence, and the cancellation ratio with both of its parts.
     #
-    # The page costs one extra forward per plotted epoch, on rank zero, over the drawn samples
-    # alone rather than the whole validation batch -- the per-lag proposals it needs are the
-    # largest tensor this architecture holds. Its cadence is `general_config.plot_frequency`,
-    # shared with the loss curve so the two are read together.
+    # WHAT IT COSTS, because it is paid on rank zero and every other rank waits at the next
+    # collective while it is paid. MEASURED at this geometry: about 13 s per plotted epoch for
+    # the two pages below, of which under 2 s is the model -- one forward over the drawn samples
+    # alone, since the per-lag proposals it needs are the largest tensor this architecture holds.
+    # The rest is matplotlib, and it is already the cheap version: the page is written at its own
+    # resolution rather than the family's publication one and with no tight bounding box, and its
+    # two captions are wrapped before they are handed over. Together those took the same page
+    # from 50 s. Raising `num_examples` or lowering `plot_frequency` scales that time directly.
+    #
+    # The cadence is `general_config.plot_frequency`, shared with the loss curve so the two are
+    # read together. The run logs a line when it starts drawing and a line with the elapsed time
+    # when it finishes, because a page's file does not exist until its save returns and a fit
+    # that is drawing otherwise looks exactly like a fit that has stopped.
     lag_attn_rws_plotting:
       enabled: true
       num_examples: 2
