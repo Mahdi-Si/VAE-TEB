@@ -282,17 +282,26 @@ def merged_analysis_functions(binding: ModelBinding) -> Dict[str, Any]:
     second cfs cell registers appear in its help text, its selection and its ``summary.json``
     record from one place.
 
+    A binding's ``excluded_analyses`` are removed **after** the merge rather than filtered out of
+    the shared mapping first, so an exclusion naming an analysis that is not registered at all --
+    a rename, a typo -- refuses instead of quietly doing nothing. An analysis a binding excludes is
+    one the model structurally cannot produce, and the alternative to removing it is handing it a
+    tensor the architecture does not compute.
+
     Args:
-        binding: The model binding whose ``extra_analyses`` are merged.
+        binding: The model binding whose ``extra_analyses`` are merged and whose
+            ``excluded_analyses`` are then removed.
 
     Returns:
         A new ordered mapping: every shared analysis but the trailing ones, then the binding's own
-        in declaration order, then :data:`TRAILING_ANALYSES`.
+        in declaration order, then :data:`TRAILING_ANALYSES`, less anything the binding excluded.
 
     Raises:
         ValueError: If an extra analysis reuses a shared name. Replacing a shared implementation
             silently would leave two models reporting different things under one name, which is
-            indistinguishable in the output from them agreeing.
+            indistinguishable in the output from them agreeing. Or if an excluded name is not in
+            the merged registry, which would leave the binding claiming a removal that never
+            happened.
     """
     collisions = sorted(set(binding.extra_analyses) & set(ANALYSIS_FUNCTIONS))
     if collisions:
@@ -312,7 +321,18 @@ def merged_analysis_functions(binding: ModelBinding) -> Dict[str, Any]:
         for name in TRAILING_ANALYSES
         if name in ANALYSIS_FUNCTIONS
     }
-    return {**leading, **binding.extra_analyses, **trailing}
+    registry = {**leading, **binding.extra_analyses, **trailing}
+
+    excluded = tuple(binding.excluded_analyses)
+    unknown = sorted(set(excluded) - set(registry))
+    if unknown:
+        raise ValueError(
+            f"binding for {binding.model_cls.__name__} excludes analyses that are not in the "
+            f"merged registry: {unknown}. Registered names are: {sorted(registry)}. An exclusion "
+            f"that names nothing is worse than none at all -- the analysis still runs while the "
+            f"binding, and the summary it writes, both say it was removed."
+        )
+    return {name: function for name, function in registry.items() if name not in excluded}
 
 
 #: Offsets applied to ``eval_config.seed`` for the four explicit generators. All non-zero and
@@ -1979,8 +1999,12 @@ RUN_ARGS: Dict[str, Any] = {
     #                     band's gain against the rest band's paired within recording, a
     #                     gain-selected band and its overlap with the high band, and the
     #                     attribution share per geometry band against the occlusion cost when
-    #                     that pass ran. Reads the per-anchor vector sidecar; skips on a
-    #                     directory collected before it.
+    #                     that pass ran. Then the same selection read as a DISTRIBUTION: the
+    #                     per-recording lag histogram of the high and top bands, per class and
+    #                     per window on both clocks, its shape features, and the
+    #                     Jensen-Shannon and 1-Wasserstein distances between cells -- all
+    #                     untested. Reads the per-anchor vector sidecar; skips on a directory
+    #                     collected before it.
     #   spectral_skill:   The forecast gap resolved by the frequency band of the target
     #                     coefficient, joined through the kept-axis channel map.
     #   cross_subgroup:   Do the cohorts actually differ. Kruskal, Holm, then Mann-Whitney, over

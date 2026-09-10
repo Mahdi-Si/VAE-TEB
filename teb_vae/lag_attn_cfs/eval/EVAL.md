@@ -1069,6 +1069,51 @@ the contraction enrichment.
   five anchors in **each** arm; below that a share is a coin toss and the row says `reportable =
   False`.
 
+**The selection is also read as a distribution rather than as a handful of scalars.** At every
+anchor the attention over the lags already *is* a distribution saying which lags contributed, and
+every readout above collapses it — to a centroid, a share, a mass fraction inside the fixed $60$ s
+and $240$ s windows — before anything is compared. The histogram half compares the distributions
+themselves, for the `high` and `top` bands, per class and per time window, on both clocks.
+
+The aggregation chain is the pipeline's, and it is not shortened: the selected anchors' lag map is
+averaged **within a recording**, that average is **normalised** to sum to one over the lags, and the
+normalised distributions are averaged over the recordings of a (class, window) cell. Every recording
+therefore counts once however much coupling it carried. **This is a different normalisation order
+from `lag_high_kl_profile.csv` and the difference is deliberate**: that table normalises *after* the
+cell mean, so it reports where a cohort's coupling mass sits; this one normalises per recording
+*before* it, so it reports what a typical recording looks like. Both sources travel, for the reason
+they travel everywhere else here — `attn` counts every selected timestep once, `kl` weights each by
+how far the source moved the belief — so a shift visible in one and absent from the other is a
+finding about which readout is being read.
+
+Three tables and two figures:
+
+- `lag_high_kl_histogram.csv` — one row per (clock, band, source, class, window, lag): the cell's
+  mean density and its inter-quartile range over recordings. Each cell sums to one across the lags.
+- `lag_high_kl_histogram_features.csv` — the same shape vocabulary of `lag_shape.py`, taken of each
+  **recording's own histogram** rather than of each segment's profile with the scalars then
+  averaged; the mean of a centroid is not the centroid of the mean, and this is the one that
+  describes the object the figure draws. `total_nats` and `peak_nats` are omitted: the first is
+  identically $1$ on a normalised histogram and the second is a share the column suffix would spell
+  in nats.
+- `lag_high_kl_histogram_distance.csv` — how far apart two cells are, two ways, because neither
+  subsumes the other. **Jensen–Shannon distance** (base $2$, bounded by $1$) is blind to the axis
+  and reads as overlap; **$1$-Wasserstein in seconds** on the compensated axis reads as "the
+  distribution moved this far" and keeps measuring once two supports separate, where Jensen–Shannon
+  has already saturated. A signed centroid difference travels beside them, oriented worst class
+  first, because both distances are non-negative and neither says which way. Two comparisons: every
+  class pair within a window, and every window against its own class pooled over the whole clock —
+  the pooled cell rather than the first window, because "first" means opposite things on the two
+  clocks and a reference defined by window order would silently differ between them.
+
+**Every histogram readout ships untested** and the record says so. A distance between two *estimated*
+distributions is positive almost surely even when the two populations coincide, so a value here
+describes two cells rather than showing that they differ; the recording counts travel on every row,
+and a cell below the shared minimum of three recordings is emitted with its counts and a `NaN`
+distance rather than the zero that would read as agreement. **No peak-lag histogram ships**: the
+per-anchor argmax is already resolved by KL decile above, and on a flat profile NumPy's
+first-maximum rule pins it at lag $0$, so a histogram of it would be a picture of that rule.
+
 **Whether any of it is *useful* is asked directly, in forecast space, and it is the question the
 analysis exists to settle.** A large $K_t$ says the source moved the belief; it does not say the
 forecast got better. The per-anchor table carries the Monte Carlo forecast gain of the same anchor,
@@ -1110,9 +1155,10 @@ one row per recording over the whole population, is the source `cross_subgroup` 
 
 **It is `capped`**, for the reason `lag_clocks` is: the second-stage half scores the recordings that
 carry an onset only, by the shared eligibility rule. Both clocks' per-recording and trajectory
-tables, the per-window restricted profiles, the significance and pairwise tables, and six figures
-— a run-level selection page, a run-level usefulness page and, per clock, a profile-and-trajectory
-page and a tested page — are the outputs. The axis is stored-coefficient time and every one of them carries the caveat.
+tables, the per-window restricted profiles, the three histogram tables, the significance and
+pairwise tables, and eight figures — a run-level selection page, a run-level usefulness page and,
+per clock, a profile-and-trajectory page, a tested page and a lag-distribution page — are the
+outputs. The axis is stored-coefficient time and every one of them carries the caveat.
 
 ### spectral_skill
 

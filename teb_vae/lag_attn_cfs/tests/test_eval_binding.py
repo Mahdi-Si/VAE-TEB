@@ -21,6 +21,7 @@ configured shards instead.
 """
 from __future__ import annotations
 
+import dataclasses
 import inspect
 from pathlib import Path
 from typing import Any, Dict
@@ -346,6 +347,39 @@ def test_an_extra_analysis_may_not_take_a_shared_name() -> None:
         run_module.merged_analysis_functions(clashing)
 
 
+def test_this_cell_excludes_no_analysis_and_the_registry_is_therefore_the_merge() -> None:
+    """The field exists for an architecture that cannot run part of the registry, and this cell is
+    not one. Pinned as an empty declaration so that a future exclusion here is a decision rather
+    than a diff nobody read: a run of this cell with a column missing and no record of why is
+    indistinguishable from an analysis that failed and was fail-softed."""
+    assert CFS_BINDING.excluded_analyses == ()
+    registry = run_module.merged_analysis_functions(CFS_BINDING)
+    assert set(registry) == set(run_module.ANALYSIS_FUNCTIONS) | set(CFS_BINDING.extra_analyses)
+
+
+def test_an_excluded_analysis_leaves_the_rest_of_the_registry_in_order() -> None:
+    """The removal is by name and nothing else moves, which is what keeps two cells' summaries
+    readable side by side: one has a column fewer, in the same order, rather than a reordering."""
+    removed = next(iter(run_module.ANALYSIS_FUNCTIONS))
+    narrowed = dataclasses.replace(CFS_BINDING, excluded_analyses=(removed,))
+
+    full = list(run_module.merged_analysis_functions(CFS_BINDING))
+    reduced = list(run_module.merged_analysis_functions(narrowed))
+
+    assert removed in full and removed not in reduced
+    assert reduced == [name for name in full if name != removed]
+
+
+def test_an_exclusion_naming_nothing_refuses_rather_than_doing_nothing() -> None:
+    """A misspelt exclusion is the failure worth catching: the analysis still runs, its columns
+    still appear, and the binding -- and every summary written from it -- says it was removed."""
+    narrowed = dataclasses.replace(
+        CFS_BINDING, excluded_analyses=("attentoin",)
+    )
+    with pytest.raises(ValueError, match="attentoin"):
+        run_module.merged_analysis_functions(narrowed)
+
+
 def test_this_cells_headline_scalars_are_the_ones_its_analyses_produce() -> None:
     """Every path in the *shared* headline registry must resolve on a run of every model that uses
     this pipeline, so a scalar produced by an analysis only this cell has cannot go there and has
@@ -510,5 +544,5 @@ def test_the_dataclass_itself_still_names_no_model() -> None:
 
     assert list(fields) == [
         "model_cls", "task_cls", "tag", "geometry_keys", "encoder_disclosure", "overrides_path",
-        "extra_analyses", "headline_scalars",
+        "extra_analyses", "headline_scalars", "excluded_analyses",
     ]

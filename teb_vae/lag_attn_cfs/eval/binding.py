@@ -86,6 +86,22 @@ class ModelBinding:
             would read as a number every other model failed to produce. A number that stays out of
             the headline stays out of every arm table too, which is why an extra analysis with a
             scalar worth comparing declares it here.
+        excluded_analyses: Shared analyses this model's binding removes from the merged registry,
+            by name. Empty for every model that can run the whole registry, which is the common
+            case and says so by omission.
+
+            It exists because :attr:`extra_analyses` can only *add*, and an architecture without a
+            lag attention has no attention distribution to report -- so the alternative to removing
+            an analysis by name is feeding it a tensor the model does not compute. That is the one
+            outcome worth ruling out here: a proposal norm or a per-lag divergence share reported
+            under an attention column is a number a reader would take for an attention allocation,
+            and nothing in the output would say otherwise.
+
+            A name that is not in the merged registry raises rather than being ignored, because a
+            misspelt exclusion is an analysis that still runs while the binding says it does not.
+            The removal shows up in a run's recorded ``analyses_selected``, which is what a reader
+            comparing two directories reads; a binding whose exclusions need a *reason* on record
+            states it where it declares them.
     """
 
     model_cls: type
@@ -96,6 +112,7 @@ class ModelBinding:
     overrides_path: Path
     extra_analyses: Mapping[str, Any] = field(default_factory=dict)
     headline_scalars: Tuple[Tuple[str, Tuple[str, ...]], ...] = ()
+    excluded_analyses: Tuple[str, ...] = ()
 
 
 # =================================================================================================

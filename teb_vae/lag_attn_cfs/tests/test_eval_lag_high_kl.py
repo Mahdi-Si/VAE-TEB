@@ -341,7 +341,7 @@ def test_the_headline_block_resolves_on_the_fixture(tmp_path) -> None:
 # The artifacts, and the refusals
 # =================================================================================================
 def test_every_table_and_figure_is_written(tmp_path) -> None:
-    """Thirteen tables and six figures, each named in the record's ``files``."""
+    """Sixteen tables and eight figures, each named in the record's ``files``."""
     record, directory = _run(_context(), tmp_path)
 
     tables = {
@@ -350,12 +350,15 @@ def test_every_table_and_figure_is_written(tmp_path) -> None:
         analysis.SIGNIFICANCE_FILENAME, analysis.PAIRWISE_FILENAME, analysis.ARGMAX_FILENAME,
         analysis.CONTRACTION_FILENAME, analysis.GAIN_BY_QUANTILE_FILENAME,
         analysis.GAIN_BY_ARGMAX_FILENAME, analysis.OCCLUSION_CONSISTENCY_FILENAME,
+        analysis.HISTOGRAM_FILENAME, analysis.HISTOGRAM_FEATURES_FILENAME,
+        analysis.HISTOGRAM_DISTANCE_FILENAME,
     }
     figures = {
         f"{analysis.SELECTION_FIGURE}.pdf",
         f"{analysis.USEFULNESS_FIGURE}.pdf",
         *(f"{clock.figure}.pdf" for clock in analysis.CLOCKS),
         *(f"{clock.windows_figure}.pdf" for clock in analysis.CLOCKS),
+        *(f"{clock.histogram_figure}.pdf" for clock in analysis.CLOCKS),
     }
     assert set(record["files"]) == tables | figures
     for name in tables | figures:
@@ -536,3 +539,265 @@ def test_a_table_without_a_gain_column_leaves_the_gain_band_empty_and_the_test_u
     per_recording = pd.read_csv(directory / analysis.PER_RECORDING_FILENAME)
     assert per_recording["high_pred_gap_nats"].isna().all()
     assert per_recording["high_lag_centroid_kl_s"].notna().any()
+
+
+# =================================================================================================
+# The selection read as a distribution
+# =================================================================================================
+#: A second fixture, and it exists for one reason the first cannot serve: the shipped one puts two
+#: recordings in each (class, window) cell, which is below ``stats.MIN_GROUP_SIZE``, so every
+#: distance on it is a withheld ``NaN`` by design. This one puts six recordings and twelve segments
+#: in each cell -- deliberately different numbers, so a per-segment denominator cannot pass a test
+#: written for a per-recording one.
+_WIDE_GUIDS = 12
+_WIDE_HOURS = (1.0, 2.0, 3.0)
+_WIDE_SEGMENTS_PER_CELL = 2
+_WIDE_RECORDINGS_PER_CELL = _WIDE_GUIDS // 2
+
+
+def _wide_fixture(shift: int = 0, seed: int = 1):
+    """Two classes whose high anchors sit at the same lags, or a rigid ``shift`` apart.
+
+    Args:
+        shift: Lag steps by which the *healthy* class's high anchors are moved to a longer lag.
+            Zero makes the two classes' distributions the same construction, so their distance is
+            a known near-zero; a positive value makes the transport distance a known answer in
+            seconds.
+        seed: The generator seed.
+
+    Returns:
+        ``(per_sample, per_anchor, vectors)``, as :func:`_fixture` returns them.
+    """
+    rng = np.random.default_rng(seed)
+    rows, kl_map, attn_map, samples = [], [], [], []
+    segment = 0
+    for guid_index in range(_WIDE_GUIDS):
+        group = "hie" if guid_index < _WIDE_GUIDS // 2 else "healthy"
+        low, high = (HIGH_LAGS if group == "hie" else (HIGH_LAGS[0] + shift, HIGH_LAGS[1] + shift))
+        for hours in _WIDE_HOURS:
+            for _ in range(_WIDE_SEGMENTS_PER_CELL):
+                samples.append(
+                    {
+                        "sample_index": segment,
+                        "guid": f"WIDE{guid_index:02d}",
+                        "epoch": -(3600.0 * hours),
+                        "clinical_class": group,
+                        "subgroup": "hie_cs" if group == "hie" else "healthy_bg_no_cs",
+                        "second_stage_onset": -1800.0,
+                        "source_conditioned_kl_raw": 1.0,
+                    }
+                )
+                for anchor in range(ANCHORS_PER_SEGMENT):
+                    # Three of ten, so the pooled 0.7 quantile falls in the gap between the two
+                    # KL populations and the ``high`` band is exactly the constructed set.
+                    is_high = anchor < 3
+                    kl = rng.uniform(2.0, 3.0) if is_high else rng.uniform(0.05, 0.2)
+                    profile = rng.uniform(0.001, 0.01, N_LAGS)
+                    profile[low : high + 1] += 1.0 if is_high else 0.0
+                    profile[0] += 0.0 if is_high else 1.0
+                    profile = profile / profile.sum() * kl
+                    rows.append(
+                        {
+                            "guid": f"WIDE{guid_index:02d}",
+                            "epoch": -(3600.0 * hours),
+                            "anchor": 100 + anchor,
+                            "sample_index": segment,
+                            "kld_per_t": kl,
+                            "mc_pred_gap": rng.uniform(1.0, 2.0) if is_high else 0.0,
+                            "argmax_lag": int(np.argmax(profile)),
+                            "seconds_since_contraction": 30.0 if anchor % 2 == 0 else 600.0,
+                        }
+                    )
+                    kl_map.append(profile)
+                    attn_map.append(profile / kl)
+                segment += 1
+    vectors = {
+        "kl_lag_map": np.asarray(kl_map, dtype=np.float16),
+        "attention_lag_map": np.asarray(attn_map, dtype=np.float16),
+    }
+    return pd.DataFrame(samples), pd.DataFrame(rows), vectors
+
+
+def _wide_run(tmp_path_factory, shift: int):
+    """Run the analysis once on the wide fixture and return ``(record, directory)``."""
+    per_sample, per_anchor, vectors = _wide_fixture(shift=shift)
+    context = AnalysisContext(
+        collection=types.SimpleNamespace(
+            per_sample=per_sample,
+            per_anchor=per_anchor,
+            record={},
+            retained={},
+            vectors={},
+            anchor_vectors=vectors,
+            results={"lag": {"n_lags": N_LAGS, "delay_steps": 0}},
+        ),
+        config={},
+    )
+    directory = tmp_path_factory.mktemp(f"wide{shift}")
+    record = analysis.run_lag_high_kl_analysis(
+        context, eval_config=EVAL_CONFIG, output_dir=directory
+    )
+    return record, directory / analysis.ANALYSIS_DIRNAME
+
+
+@pytest.fixture(scope="module")
+def aligned_run(tmp_path_factory):
+    """The wide fixture with both classes' high anchors at the same lags."""
+    return _wide_run(tmp_path_factory, shift=0)
+
+
+@pytest.fixture(scope="module")
+def shifted_run(tmp_path_factory):
+    """The same, with the healthy class's high anchors moved two lag steps later."""
+    return _wide_run(tmp_path_factory, shift=2)
+
+
+def test_every_histogram_cell_is_a_distribution_over_the_lags(tmp_path) -> None:
+    """The property that makes the table a histogram: each cell sums to one across the lags.
+
+    A cell built by averaging un-normalised profiles would sum to a coupling magnitude instead, and
+    would still draw as a plausible shape and still move across the classes.
+    """
+    _, directory = _run(_context(), tmp_path)
+
+    table = pd.read_csv(directory / analysis.HISTOGRAM_FILENAME)
+    assert len(table)
+    totals = table.groupby(["clock", "band", "source", "group", "time_bin"])["density"].sum()
+    assert totals.to_numpy() == pytest.approx(1.0)
+    # Every lag of the axis is present in every cell, so a gap is a blank rather than a shift.
+    counts = table.groupby(["clock", "band", "source", "group", "time_bin"])["lag_step"].nunique()
+    assert set(counts.to_numpy().tolist()) == {N_LAGS}
+
+
+def test_both_bands_and_both_sources_reach_the_histogram_tables(tmp_path) -> None:
+    """The two selections and the two readings are one file set, filtered rather than joined."""
+    _, directory = _run(_context(), tmp_path)
+
+    table = pd.read_csv(directory / analysis.HISTOGRAM_FILENAME)
+    assert set(table["band"]) == set(analysis.HISTOGRAM_BANDS)
+    assert set(table["source"]) == {key for key, _, _ in analysis.PROFILE_SOURCES}
+    assert set(table["clock"]) == {clock.name for clock in analysis.CLOCKS}
+
+
+def test_the_high_band_histogram_sits_where_the_selected_anchors_mass_is(tmp_path) -> None:
+    """Known answer: the fixture's high anchors carry their mass in :data:`HIGH_LAGS`.
+
+    A histogram built over every anchor rather than the selected ones would put most of its
+    density at lag $0$, where the fixture's low-KL anchors sit.
+    """
+    _, directory = _run(_context(), tmp_path)
+
+    table = pd.read_csv(directory / analysis.HISTOGRAM_FILENAME)
+    high = table[(table["band"] == "high") & (table["source"] == "attn")]
+    inside = high[high["lag_step"].between(*HIGH_LAGS)]
+    share = (
+        inside.groupby(["clock", "group", "time_bin"])["density"].sum().to_numpy()
+    )
+    assert len(share)
+    assert (share > 0.9).all()
+    # And the lag the unselected anchors sit at carries almost nothing.
+    at_zero = high[high["lag_step"] == 0]["density"].to_numpy()
+    assert (at_zero < 0.05).all()
+
+
+def test_the_feature_table_carries_every_statistic_and_agrees_on_the_denominator(tmp_path) -> None:
+    """The features describe the drawn histogram, and both tables count the same recordings."""
+    _, directory = _run(_context(), tmp_path)
+
+    features = pd.read_csv(directory / analysis.HISTOGRAM_FEATURES_FILENAME)
+    table = pd.read_csv(directory / analysis.HISTOGRAM_FILENAME)
+    assert set(features["metric"]) == set(analysis.HISTOGRAM_FEATURE_COLUMNS)
+    # The two magnitude-carrying statistics are omitted rather than reported meaninglessly.
+    assert not any("total_nats" in metric for metric in set(features["metric"]))
+    keys = ["clock", "band", "source", "group", "time_bin"]
+    from_features = features.groupby(keys)["n_recordings"].max()
+    from_table = table.groupby(keys)["n_recordings"].max()
+    joined = from_features.to_frame("features").join(from_table.to_frame("table"), how="inner")
+    assert len(joined)
+    assert (joined["features"] == joined["table"]).all()
+
+
+def test_a_cell_below_the_minimum_reports_its_counts_and_withholds_the_distance(tmp_path) -> None:
+    """The shipped fixture puts two recordings in each cell, one below the floor.
+
+    The row is emitted with its counts rather than dropped, so a reader meets the pair and can see
+    why there is no number, and the distance is NaN rather than the zero that would read as
+    agreement.
+    """
+    _, directory = _run(_context(), tmp_path)
+
+    distances = pd.read_csv(directory / analysis.HISTOGRAM_DISTANCE_FILENAME)
+    assert len(distances)
+    assert set(distances["comparison"]) == {
+        analysis.CLASS_PAIR_COMPARISON, analysis.WINDOW_DRIFT_COMPARISON
+    }
+    thin = distances[distances["n_left"] < 3]
+    assert len(thin)
+    assert thin["jensen_shannon"].isna().all()
+    assert thin["wasserstein_s"].isna().all()
+
+
+def test_the_histogram_counts_recordings_rather_than_segments(aligned_run) -> None:
+    """The pseudo-replication guard, on a fixture where the two numbers differ.
+
+    Each cell holds six recordings and twelve segments, so a denominator that counted segments
+    would report twelve and would let a chatty recording outvote a quiet one in every cell.
+    """
+    _, directory = aligned_run
+
+    table = pd.read_csv(directory / analysis.HISTOGRAM_FILENAME)
+    delivery = table[(table["clock"] == "time_to_delivery") & (table["band"] == "high")]
+    counts = set(delivery["n_recordings"].to_numpy().tolist())
+    assert counts == {_WIDE_RECORDINGS_PER_CELL}
+    assert _WIDE_RECORDINGS_PER_CELL * _WIDE_SEGMENTS_PER_CELL not in counts
+
+
+def test_two_classes_with_the_same_lag_placement_are_a_near_zero_distance(aligned_run) -> None:
+    """Both classes built the same way: the distance is the noise floor, not a separation."""
+    _, directory = aligned_run
+
+    distances = pd.read_csv(directory / analysis.HISTOGRAM_DISTANCE_FILENAME)
+    pairs = distances[
+        (distances["comparison"] == analysis.CLASS_PAIR_COMPARISON)
+        & (distances["band"] == "high")
+        & (distances["source"] == "attn")
+        & (distances["clock"] == "time_to_delivery")
+    ]
+    assert len(pairs)
+    assert pairs["wasserstein_s"].notna().all()
+    assert (pairs["wasserstein_s"].to_numpy() < SECONDS_PER_STEP / 2.0).all()
+    assert (pairs["jensen_shannon"].to_numpy() < 0.2).all()
+
+
+def test_a_rigid_shift_of_one_class_is_reported_in_seconds(shifted_run) -> None:
+    """The known answer that pins the unit end to end: two lag steps apart is $2\\Delta$ seconds.
+
+    A pipeline transporting over lag indices would report a quarter of this and would still
+    separate the classes in the right direction, in the right windows.
+    """
+    _, directory = shifted_run
+
+    distances = pd.read_csv(directory / analysis.HISTOGRAM_DISTANCE_FILENAME)
+    pairs = distances[
+        (distances["comparison"] == analysis.CLASS_PAIR_COMPARISON)
+        & (distances["band"] == "high")
+        & (distances["source"] == "attn")
+        & (distances["clock"] == "time_to_delivery")
+    ]
+    assert len(pairs)
+    moved = pairs["wasserstein_s"].to_numpy()
+    assert moved == pytest.approx(2.0 * SECONDS_PER_STEP, abs=1.0)
+    # Oriented worst first, and it is the healthy class that was moved to the longer lag, so the
+    # severe class sits at the shorter one and the signed difference is negative.
+    assert (pairs["group_left"] == "hie").all()
+    assert (pairs["centroid_delta_s"].to_numpy() < 0.0).all()
+
+
+def test_the_record_declares_the_histogram_half_untested(tmp_path) -> None:
+    """No new Holm family: the four the analysis defends are still four."""
+    record, _ = _run(_context(), tmp_path)
+
+    assert record["lag_histogram"]["distance"]["tested"] is False
+    assert set(record["lag_histogram"]["bands"]) == set(analysis.HISTOGRAM_BANDS)
+    assert "histogram" in record["untested_note"]
+    assert len(record["significance"]) == len(analysis.CLOCKS) * len(analysis.READOUTS)

@@ -1,0 +1,71 @@
+# POINTWISE SOURCE PLUS ATTENTION: the recommended representation, aggregated by attention.
+#
+# WHAT IT ISOLATES. The FUSION. Against `joint.yaml` this file differs in one leaf: how the per-lag
+# source vectors become the latent update. The representation is the same pointwise one, the prior
+# is the same, the residual equations and their bounds are the same, the paired sampling is the
+# same, the decoder is the same and the objective and its reduction are the same. A difference
+# between the two evaluated gaps is therefore the fusion.
+#
+# ITS OTHER HALF. Against `attention_reference.yaml`, which differs from this file only in the
+# source stem, the pair isolates the temporal convolution. The two comparisons share this arm, which
+# is why it exists rather than being a diagonal nobody runs.
+#
+# WHAT THE ATTENTION HERE IS AND IS NOT. A query is posed from the anchor's conditioning state --
+# the same tensor the prior heads read -- and scored against every lag's source vector with a
+# learned per-lag key bias carrying lag identity. The weights are normalised over lags with plain
+# softmax and read out through one projection into the full latent width.
+#
+# It is NOT head-structured: nothing partitions the latent by attention head, so `lag_attention_heads`
+# splits the attention alone and the sibling's `num_heads` stays refused. It carries no sparsifying
+# normaliser and no seeded long-lag penalty, deliberately: both change what the distribution over
+# lags looks like, so switching either on would be a second declared change inside a comparison
+# built to isolate one.
+#
+# THE ATTENTION DISTRIBUTION IS NOT EXPORTED, and that is a decision rather than an omission. The
+# weights are real on this arm, unlike anything the recommended arm could offer under that name --
+# and published beside a predictive comparison they would be read as a lag readout, which is exactly
+# the claim the evidence behind this design shows cannot be supported. Both arms are interrogated
+# the same way instead: suppress a band through the selector and rescore.
+#
+# ONE THING THAT DOES NOT COMPARE ACROSS THE PAIR. A band-suppression margin. Removing a lag from an
+# explicit sum leaves every other term standing; removing it from a normalised distribution grows
+# the survivors to fill it. Both answer "what does this model do when it cannot read these lags",
+# and the two numbers are not on one scale. Read each against its own matched branch. The run's
+# summary records the fusion beside every margin so that a reader cannot difference them by
+# accident.
+#
+# MEMORY. This arm projects keys and values at the model width for every anchor and lag, where the
+# recommended arm holds proposals at the latent width. Measure before launching rather than
+# assuming the candidate's batch size carries over:
+#   python -m teb_vae.lag_slot_transformer_cfs.eval.memory \
+#       --config teb_vae/lag_slot_transformer_cfs/configs/pointwise_attention.yaml
+#
+# RUNNING IT
+#   python -m teb_vae.lag_slot_transformer_cfs.trainer \
+#       --config teb_vae/lag_slot_transformer_cfs/configs/pointwise_attention.yaml
+
+base: joint.yaml
+
+general_config:
+  tag: lag_residual_trf_cfs_pointwise_attention
+
+  seed: 17
+
+model_config:
+  # REPOINT THIS at the same target-only checkpoint `joint.yaml` starts from. The transfer copies
+  # the target encoder, the prior, the clock projection and the decoder, all of which this arm
+  # shares with the candidate, and leaves the fusion at exactly zero.
+  target_warm_start_checkpoint: REPOINT_ME_target_only_a_checkpoint.ckpt
+
+  VAE_model:
+    # The arm. Everything above follows from it.
+    lag_fusion: attention
+
+    # There is no summation convention to apply to a normalised aggregation, and an explicit value
+    # here is refused rather than ignored. Left null, it resolves to one and the run records that.
+    lag_scale: null
+
+    # A lag chunk would renormalise the distribution within each chunk and compute a different
+    # model rather than the same one in a different order, so it is refused on this arm. Chunk the
+    # anchor axis instead, which is exact.
+    lag_chunk: null

@@ -1,0 +1,50 @@
+# The CAPACITY CONTROL: the candidate's source pathway, built whole, with the values withheld.
+#
+# WHAT IT ISOLATES. Whether an enabled residual head of the candidate's own trainable capacity can
+# produce a predictive gain from lag identity and the availability announcement ALONE. If it can,
+# then a gain on the candidate is not evidence about uterine activity: it is evidence that the
+# target-only baseline had a shortfall which any extra nonlinear head conditioned on the anchor
+# state could close.
+#
+# WHY IT IS AN ARM AND NOT AN INTERVENTION. An intervention substitutes the values at scoring time
+# on a model that was TRAINED with them, and it therefore measures a fitted computation asked a
+# question it never saw. The question here is what a head of this size LEARNS when no value ever
+# reaches it, which only a trained arm can answer.
+#
+# WHY IT IS NOT `source_disabled`. The target-only arm removes the pathway; this one holds it and
+# starves it. The two answer different questions and their parameter budgets differ by the whole
+# source half, which is exactly the confound this file exists to remove: the encoder emits
+# [0, m] instead of [x_safe, m], so the widths, the head, the optimizer state and the checkpoint's
+# key set are the candidate's exactly.
+#
+# WHAT THE EVALUATION DOES DIFFERENTLY ON IT, and why. The replacement and permutation controls are
+# skipped by name with the reason recorded rather than reported as margins of zero. Substituting a
+# stream the fusion never reads is the matched forward, and a zero margin would read as "replacing
+# the source changed nothing" when the truth is that nothing was replaced. Band suppression still
+# runs and still means something: lag identity and availability are real inputs and removing a band
+# removes them.
+#
+# WHAT TO READ. This arm's gap against the frozen target-only reference, beside the candidate's. A
+# candidate whose advantage over this arm is small has not shown that its source values did the
+# work, whatever its own gap against its internal base says.
+#
+# RUNNING IT
+#   python -m teb_vae.lag_slot_transformer_cfs.trainer \
+#       --config teb_vae/lag_slot_transformer_cfs/configs/capacity_control.yaml
+
+base: joint.yaml
+
+general_config:
+  tag: lag_residual_trf_cfs_capacity_control
+
+  seed: 13
+
+model_config:
+  # REPOINT THIS at the same target-only checkpoint `joint.yaml` starts from.
+  target_warm_start_checkpoint: REPOINT_ME_target_only_a_checkpoint.ckpt
+
+  VAE_model:
+    # The arm. It is refused alongside `source_scalar_lift`, whose lift of a withheld value is a
+    # learned per-channel constant, and alongside the convolution stem, over which a value-free
+    # stream is a constant the stem's own bias already provides.
+    source_values_withheld: true
