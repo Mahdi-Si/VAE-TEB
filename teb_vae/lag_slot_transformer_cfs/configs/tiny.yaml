@@ -57,3 +57,11 @@ advanced_config:
   tracking:
     mlflow:
       enabled: false     # a smoke run is not a result
+
+  callbacks:
+    # On, at one sample in a raster format. A smoke run that never drew the page would leave the
+    # one path most likely to break -- the forward with the proposals retained, and the anchor
+    # arithmetic behind every lag row -- exercised by nothing.
+    lag_attn_rws_plotting:
+      num_examples: 1
+      file_format: "png"

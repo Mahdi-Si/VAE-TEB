@@ -459,11 +459,20 @@ advanced_config:
       # the weights that forecast best are not on disk.
       secondary_monitor: "val/nll_full_block"
 
-    # THE PER-EPOCH DIAGNOSTIC PAGE IS DELIBERATELY ABSENT. The shared page draws a lag-attention
-    # matrix and a divergence-by-lag map, and this architecture computes neither: there is no
-    # attention distribution, and no nonnegative per-lag allocation of the divergence exists for it,
-    # because the cross terms in the summed update can reinforce or cancel. Enabling the block would
-    # raise inside a handler that warns and continues, costing two rows and one log line with a
-    # green suite. A page whose lag rows draw proposal suppression and the cancellation ratio is
-    # separate work, and it wants the evaluation package's readouts to have been run on a real arm
-    # first so the layout is settled.
+    # THE PER-EPOCH DIAGNOSTIC PAGE. The block name is the shared driver's literal and must stay
+    # it: the callback assembly reads that key, and a name matching this package would get no
+    # figure, no error and nothing in the log saying why. What differs from the sibling cells is
+    # the callback the driver builds, not the key -- `plot_callback_cls` re-points it, because the
+    # shared page reads an attention matrix and a divergence-by-lag map this architecture computes
+    # neither of. Its rows are replaced by four this one can compute: the per-lag proposal
+    # magnitude, how much source each lag actually had, what removing each lag alone does to the
+    # divergence, and the cancellation ratio with both of its parts.
+    #
+    # The page costs one extra forward per plotted epoch, on rank zero, over the drawn samples
+    # alone rather than the whole validation batch -- the per-lag proposals it needs are the
+    # largest tensor this architecture holds. Its cadence is `general_config.plot_frequency`,
+    # shared with the loss curve so the two are read together.
+    lag_attn_rws_plotting:
+      enabled: true
+      num_examples: 2
+      file_format: "pdf"

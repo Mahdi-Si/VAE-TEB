@@ -41,7 +41,8 @@ been run on a real arm and their layout is settled.
 """
 from __future__ import annotations
 
-from typing import Any, Dict, Tuple
+from functools import partial
+from typing import Any, Callable, Dict, Tuple
 
 import torch
 
@@ -82,6 +83,53 @@ class SeqVaeLagResidualTrfCfsTask(SeqVaeLagAttnCfsTask, SeqVaeLagAttnTrfRwsTask)
     ``main_loss`` keeps its exact, unprefixed name, which is what the loss-spike breaker watches;
     the framework falls back to the returned loss when that key is missing, silently.
     """
+
+    @property
+    def forecast_rows(self) -> Callable[..., None]:
+        r"""The page's forecast rows, bound to this net's channel facts, tiling and weights.
+
+        The causal parent's seven bindings, plus four this cell needs and that cell does not.
+        **The extra four exist because this objective weights the block score** -- by channel,
+        stating a ratio between the two stored target blocks, and by horizon step under a decaying
+        half-life -- and the parent's per-window score row applies neither. Left inherited, the
+        row would draw curves whose units are not the ``nll_base_block``, ``nll_full_block`` and
+        ``pred_gap`` printed in the same figure's title and plotted on the training curve: a
+        diagnostic disagreeing with the run it diagnoses about the very number it is drawing.
+
+        The gather and the pooled validity are bound as the model's own **bound methods** rather
+        than reconstructed on the page, so the block scored on the row is the block the objective
+        scored. Both are read with ``getattr`` on the weights for the reason the model reads them
+        that way: each is a buffer where it exists and absent otherwise, and ``None`` means the
+        score skips the multiplication rather than multiplying by ones.
+
+        Returns:
+            A callable taking one
+            :class:`~teb_vae.lag_attn_rws.sample_page.ForecastRowInputs` and drawing into it.
+        """
+        from teb_vae.lag_slot_transformer_cfs.sample_page import residual_forecast_rows
+
+        model = self.orig_model
+        gate = model.target_gate
+        # The forecast clock's tau in seconds comes from the resolved budget, as the input clocks
+        # do: the net stamps the per-channel step shifts and nothing from which tau can be
+        # recovered. It reaches the page as a statement on the axis, not as a shift of anything.
+        budget = self.warmup_budget
+        return partial(
+            residual_forecast_rows,
+            keep_index=None if gate is None else gate.keep_index,
+            block_split=int(model.TARGET_BLOCK_SPLIT),
+            training_stride=int(model.anchor_stride),
+            likelihood=str(self.hparams.get("likelihood", "gaussian_nll")),
+            coverage_floor=float(model.coverage_floor),
+            target_forecast_shift=model.target_forecast_shift,
+            forecast_clock_delay_s=(
+                None if budget is None else budget.target_forecast_clock_delay_s
+            ),
+            forecast_target=model._build_forecast_target,
+            scored_weight=model.scored_weight,
+            channel_weight=getattr(model, "target_channel_weight", None),
+            horizon_weight=getattr(model, "horizon_weight", None),
+        )
 
     def _mu_gap_rms(
         self, forward_outputs: Dict[str, torch.Tensor], weight: torch.Tensor

@@ -15,6 +15,7 @@ run doing both has a starting point that neither key describes.
 """
 from __future__ import annotations
 
+import ast
 import inspect
 from pathlib import Path
 
@@ -85,13 +86,40 @@ def test_the_target_fields_come_from_the_causal_parent() -> None:
 def test_the_plot_config_key_stays_the_shared_literal() -> None:
     """The callback assembly reads it, so renaming it to match this package disables the figure.
 
-    This model does not enable the block, but the key must still be the one the assembly looks for
-    or a future arm that wanted a figure would get none, with no error and nothing in the log.
+    What this driver re-points is the callback class, never the key: a key matching the package
+    name would get no figure, no error and nothing in the log saying why.
     """
     assert (
         LagResidualTrfCfsTrainer.PLOT_CONFIG_KEY
         == LagAttnTrfRwsTrainer.PLOT_CONFIG_KEY
     )
+    assert "PLOT_CONFIG_KEY" not in vars(LagResidualTrfCfsTrainer)
+
+
+def test_the_driver_builds_this_packages_own_page_callback() -> None:
+    """The family's callback runs a forward without the per-lag proposals and draws another page.
+
+    Left inherited it would raise inside a handler that warns and continues, so the figure would
+    never appear and the suite would stay green.
+    """
+    from teb_vae.lag_slot_transformer_cfs.plotting import LagResidualTrfCfsPlotCallback
+
+    assert LagResidualTrfCfsTrainer.plot_callback_cls() is LagResidualTrfCfsPlotCallback
+
+
+def test_the_page_import_happens_only_when_the_figure_is_asked_for() -> None:
+    """The page pulls matplotlib, which a run drawing nothing should not carry.
+
+    Checked against the module's own syntax tree rather than against ``sys.modules``, which by
+    this point in a suite says only that some other test imported matplotlib first.
+    """
+    tree = ast.parse(Path(inspect.getfile(LagResidualTrfCfsTrainer)).read_text(encoding="utf-8"))
+    top_level = [node for node in tree.body if isinstance(node, (ast.Import, ast.ImportFrom))]
+    names = {
+        alias.name for node in top_level if isinstance(node, ast.Import) for alias in node.names
+    } | {node.module or "" for node in top_level if isinstance(node, ast.ImportFrom)}
+    assert not any("plotting" in name or "matplotlib" in name for name in names)
+    assert "plotting" in inspect.getsource(LagResidualTrfCfsTrainer.plot_callback_cls)
 
 
 @pytest.mark.parametrize("name", INHERITED_ONLY)
