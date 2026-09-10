@@ -1,0 +1,158 @@
+# The evaluation override delta, merged OVER a checkpoint's own resolved_config.yaml.
+#
+# This is not a config: it has no `base:` key and it does not stand alone. A training run writes its
+# fully resolved configuration beside its checkpoints, and that file is the record of what the model
+# was trained on — the geometry, the warm-up budget it resolved to, the normalisation statistics,
+# the objective. The evaluation reads it and deep-merges this delta on top, so the run's own
+# contract stays authoritative and everything that genuinely differs is one small reviewable file.
+#
+# A `base:` chain cannot do that job: `base:` resolves relative to the file naming it, and the
+# checkpoint's resolved config is a runtime path no committed file can reference. Pointing it at the
+# shipped default.yaml instead would evaluate against what a config file currently says rather than
+# what the run trained under. `load_eval_overrides` refuses a `base:` key here.
+#
+# Run from the repo root:
+#   python -m teb_vae.lag_slot_transformer_cfs.eval.run --checkpoint <run>/model_checkpoints/<f>.ckpt
+
+general_config:
+  batch_size:
+    # `test` is the key the data module reads for the evaluation loader. A batch size placed under
+    # `eval_config` would be a dead key and the loader would quietly run at the training value.
+    #
+    # Results are batch-size-invariant here — the model uses LayerNorm and GroupNorm, no BatchNorm —
+    # with ONE exception that is a property of the controls rather than of the model: the
+    # cross-recording pairing is drawn WITHIN a batch, so a batch too small, or one a single
+    # recording dominates, has no cross-recording partner and is excluded from that arm and counted.
+    # A larger batch therefore makes the permutation margin rest on more segments, not on different
+    # arithmetic. 32 leaves room for several recordings in almost every batch of a shuffled split.
+    test: 32
+
+dataset_config:
+  # REPOINT THESE. The placeholder paths do not exist, so a misconfigured run fails on a missing
+  # file rather than on something further downstream that somebody might "fix" by dropping the
+  # warm-up budget.
+  #
+  # They must be the CAUSAL INTEGER-OPERATOR variant, which is what this architecture's first
+  # experiment is defined on. The two-sided files carry every one of these field names and dtypes
+  # and differ only in a root attribute and in the stored widths, so evaluating one would report a
+  # causal model on coefficients that contain their own future.
+  vae_test_datasets:
+    - /data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_causal_int/k_fold_cross_validation_dataset/test/healthy_no_bg_no_cs.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_causal_int/k_fold_cross_validation_dataset/test/healthy_no_bg_cs.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_causal_int/k_fold_cross_validation_dataset/test/healthy_bg_no_cs.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_causal_int/k_fold_cross_validation_dataset/test/healthy_bg_cs.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_causal_int/k_fold_cross_validation_dataset/test/acidosis_no_cs.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_causal_int/k_fold_cross_validation_dataset/test/acidosis_cs.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_causal_int/k_fold_cross_validation_dataset/test/hie_no_cs.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_causal_int/k_fold_cross_validation_dataset/test/hie_cs.hdf5
+
+  # REPOINTED, and this one is load-bearing rather than a convenience. The causal statistics are
+  # accumulated EXCLUDING each channel's warm-up region, so a standardized zero is the channel mean
+  # over the region the model actually reads — which is exactly what makes the observed-zeros
+  # replacement arm the least informative value on the coefficient's own scale rather than an
+  # arbitrary one. A statistics file accumulated over the warm-up breaks that silently: every shape
+  # is right and every number is wrong.
+  #
+  # Regenerate it with `hdf5_dataset/calculate_dataset_stats.py` from THESE shards at the run's own
+  # `trim_minutes`. Note the key is `stat_path` while the loader parameter is `stats_path`: a
+  # typo'd `stats_path:` here yields None and silently disables normalization.
+  stat_path: /data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_causal_int/k_fold_cross_validation_dataset/stats.hdf5
+
+  dataloader_config:
+    dataset_kwargs:
+      # A list replaces wholesale on merge, so the inherited fields are restated rather than
+      # extended. `guid` keys the per-recording aggregation AND the cross-recording pairing, so a
+      # split loaded without it collapses every segment into one recording and the permutation arm
+      # is excluded from every batch. `weight` is the only trustworthy validity signal: these
+      # coefficients carry no gap sentinel of their own, so it gates every mask.
+      load_fields:
+        [
+          'fhr_st',
+          'fhr_ph',
+          'up_ph',
+          'up_st',
+          'weight',
+          'guid',
+          'epoch',
+        ]
+
+      # 0. Under training the cache is per-worker; at num_workers: 0 it becomes main-process RAM,
+      # and it is FIFO with no reuse policy, so against a test split larger than the cache it
+      # thrashes and buys nothing.
+      cache_size: 0
+
+      # `num_workers` is not restated: it is forced to 0 in code with a warning, because spawned
+      # workers over a multi-file HDF5 dataset silently truncate every pass after the first.
+      #
+      # `trim_minutes` is inherited and NOT restated, and it decides more than normalisation here:
+      # the stored per-channel warm-up vectors are rebased by exactly this trim, so it places every
+      # channel's availability boundary and therefore every lag's exposure.
+
+# Evaluation-only settings, validated at load against a closed key set: an unknown key raises and
+# names the valid set, so a misspelling cannot silently mean "no cap". Everything that shapes what a
+# run measures lives here rather than in argv, because this block is dumped into the run directory
+# and is the durable record.
+eval_config:
+  # Seeds random, numpy and torch, and is recorded in the summary. The predictive scores draw the
+  # latent, and the cross-recording pairing is drawn too, so an unseeded run reports different
+  # numbers for the same checkpoint.
+  seed: 42
+
+  # Monte Carlo draws per anchor for the marginalised predictive score, under common random numbers
+  # across every scored arm. The specification's starting value rather than a measured optimum. The
+  # negative logarithm of an average likelihood is upward biased at finite K and the arms' biases
+  # need not cancel, so a finalist is rescored at 32 and 128 and the effective draw count is
+  # reported beside every gap.
+  num_mc_samples: 8
+
+  # Global cap on the segments the pass sees. null evaluates the whole split.
+  max_samples: null
+
+  # No retention cap is read by this package's pass: it holds no per-sample forecast arrays and
+  # renders no per-sample pages. The block stays present and empty rather than absent, so a reader
+  # comparing this delta against a lag-attentive cell's sees an explicit "nothing retained" instead
+  # of wondering which caps were forgotten.
+  caps: {}
+
+  # Resamples behind every interval, drawn over RECORDINGS. Recordings, not anchors: at the dense
+  # anchor set consecutive forecast windows overlap in all but one of their steps, so resampling
+  # anchors would report an interval narrower than the data supports.
+  bootstrap_resamples: 2000
+
+  # THE LAG BANDS THE SUPPRESSION READOUT REMOVES, in stored steps back from the anchor, inclusive.
+  #
+  # The key is named for the lag-attentive cells' input-level occlusion because the schema's key set
+  # is shared and closed. The PARTITION is the same one and is deliberately so — a reader comparing
+  # two arms compares the same four intervals — but the INTERVENTION is not: there the source
+  # stream's values are zeroed and the model re-encodes; here the selectors s_{t,l} are set to zero
+  # over the band with the target state, the metadata, the original per-channel masks, the remaining
+  # proposals and c_L all held fixed. The two answer different questions and this package reports
+  # its own under its own name, `band_suppression`.
+  #
+  # The four partition the searched window at the boundaries the geometry already draws:
+  #   anchor    [0, 14]   the anchor's own neighbourhood
+  #   near      [15, 44]
+  #   mid       [45, 67]
+  #   far       [68, 90]  up to the window's far edge
+  #
+  # A band whose lags are largely unavailable — deep in the warm-up staircase — has little to
+  # remove, and its margin is small for a reason that is about the schedule rather than about the
+  # source. Every band's usable anchor count and available-channel exposure are reported beside its
+  # margin for exactly that, and a bin with no support is recorded as MISSING rather than as a
+  # measured zero.
+  #
+  # An empty band (lo > hi) and a band above the model's own `max_lag` are both refused by name at
+  # config load. `{}` records the readout as a skip, which is a different statement from a run whose
+  # bands all measured nothing.
+  occlusion_bands:
+    anchor: [0, 14]
+    near: [15, 44]
+    mid: [45, 67]
+    far: [68, 90]
+
+  # UNSET, and that is the setting. It gates the lag-attentive cells' availability-clock verdict,
+  # whose null arm re-encodes a zeroed stream through a source pathway with parameters. This
+  # architecture's source encoder holds none, so that arm does not exist here and no verdict reads
+  # this key. It is left at its default rather than deleted because the key set is shared: a value
+  # here would look like a threshold this run was gated on.
+  clock_margin_min_nats: null

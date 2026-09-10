@@ -90,6 +90,7 @@ second clock's is the subset that carries a second-stage onset, by the shared el
 """
 from __future__ import annotations
 
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
@@ -107,6 +108,7 @@ from teb_vae.lag_attn_cfs.eval.lag_axis import (
     compensated_seconds_axis,
     read_lag_support,
 )
+from teb_vae.lag_attn_cfs.eval.lag_hist import cell_distances, normalise
 from teb_vae.lag_attn_cfs.eval.lag_shape import (
     DEGENERATE_PEAK_TO_MEDIAN,
     DEGENERATE_ZERO_FRACTION,
@@ -133,6 +135,12 @@ CONTRACTION_FILENAME = "lag_high_kl_contraction.csv"
 GAIN_BY_QUANTILE_FILENAME = "lag_high_kl_gain_by_kl_quantile.csv"
 GAIN_BY_ARGMAX_FILENAME = "lag_high_kl_gain_by_argmax.csv"
 OCCLUSION_CONSISTENCY_FILENAME = "lag_high_kl_occlusion_consistency.csv"
+#: The lag *distribution* of the selected anchors, its per-recording shape features and the
+#: distances between cells. Long form on the band and the profile source, so the two selections and
+#: the two readings are one file set and a comparison across them is a filter rather than a join.
+HISTOGRAM_FILENAME = "lag_high_kl_histogram.csv"
+HISTOGRAM_FEATURES_FILENAME = "lag_high_kl_histogram_features.csv"
+HISTOGRAM_DISTANCE_FILENAME = "lag_high_kl_histogram_distance.csv"
 SELECTION_FIGURE = "lag_high_kl_selection"
 USEFULNESS_FIGURE = "lag_high_kl_usefulness"
 
@@ -321,6 +329,73 @@ READOUTS: Tuple[str, ...] = tuple(
     )
 )
 
+#: The bands whose selection is read as a **distribution** rather than as a handful of scalars.
+#: The two the request names -- the upper $30\%$ and the upper $10\%$ of the pooled per-anchor KL --
+#: and not ``rest`` or ``gain``: the first is the complement rather than a selection and the second
+#: is cut on a different quantity, so neither answers "where do the coupling-carrying timesteps
+#: look". Both keep every column they already have on every other table of this analysis.
+HISTOGRAM_BANDS: Tuple[str, ...] = ("high", "top")
+
+#: The shape statistics reported of a **normalised** histogram, which is every one of
+#: :data:`~teb_vae.lag_attn_cfs.eval.lag_shape.STATISTIC_KEYS` except the two that carry the
+#: magnitude the others divide out. On a distribution ``total_nats`` is identically $1$ -- a column
+#: constant by construction, which reads in a table as a measurement -- and ``peak_nats`` is the
+#: modal *share*, which :data:`STATISTIC_SUFFIX` would spell with a nats unit it does not have.
+#: ``peak_mass`` already reports the concentration those two would have carried.
+HISTOGRAM_STATISTICS: Tuple[str, ...] = tuple(
+    statistic for statistic in STATISTIC_KEYS if statistic not in ("total_nats", "peak_nats")
+)
+
+
+def histogram_feature_column(statistic: str) -> str:
+    """The column one shape statistic of a histogram is carried under.
+
+    No band or source prefix, unlike :func:`feature_column`: the histogram tables are **long form**
+    on both, so a band and a source are values in their own columns rather than fragments of a
+    column name. One statistic therefore has one spelling across every band, source and clock.
+
+    Args:
+        statistic: One of :data:`HISTOGRAM_STATISTICS`.
+
+    Returns:
+        ``hist_<statistic><unit suffix>`` -- for example ``hist_centroid_s``.
+    """
+    return f"hist_{statistic}{STATISTIC_SUFFIX.get(statistic, '')}"
+
+
+#: Every per-recording histogram feature, in table order.
+HISTOGRAM_FEATURE_COLUMNS: Tuple[str, ...] = tuple(
+    histogram_feature_column(statistic) for statistic in HISTOGRAM_STATISTICS
+)
+
+#: The two comparisons the distance table carries. The first asks whether the classes attend to
+#: different lags in the same window; the second asks whether a class's own distribution moves
+#: across the clock, each window against that class's distribution pooled over every window.
+#:
+#: The reference is the pooled cell rather than the first window deliberately: "first" has opposite
+#: meanings on the two clocks -- the delivery axis counts *backwards* from delivery while the
+#: second-stage axis is signed through its landmark -- so a reference defined by window order would
+#: silently be a different reference on each, and the two clocks' columns would stop being
+#: comparable. The pooled cell needs no orientation.
+CLASS_PAIR_COMPARISON = "class_pair"
+WINDOW_DRIFT_COMPARISON = "window_vs_class_pooled"
+
+#: Columns of the three histogram tables, written out so a consumer can lay out its reader before
+#: calling and an added field fails there rather than going silently unemitted.
+HISTOGRAM_COLUMNS: Tuple[str, ...] = (
+    "clock", "band", "source", "group_column", "group", "time_bin", "bin_center_h",
+    "n_recordings", "lag_step", "compensated_seconds", "density", "density_q25", "density_q75",
+)
+HISTOGRAM_FEATURE_TABLE_COLUMNS: Tuple[str, ...] = (
+    "clock", "band", "source", "group_column", "metric", "group", "time_bin", "bin_center_h",
+    "n_recordings", "n_recordings_total", "mean", "q25", "median", "q75",
+)
+HISTOGRAM_DISTANCE_COLUMNS: Tuple[str, ...] = (
+    "clock", "band", "source", "group_column", "comparison", "group_left", "group_right",
+    "time_bin_left", "time_bin_right", "bin_center_h_left", "bin_center_h_right",
+    "n_left", "n_right", "jensen_shannon", "wasserstein_s", "centroid_delta_s",
+)
+
 #: The method sentence written into every record, so a $p$-value here is readable without this
 #: module.
 METHOD = (
@@ -341,8 +416,30 @@ METHOD = (
 UNTESTED_NOTE = (
     "the rest, top and gain bands' clock trajectories, every attention-profile statistic, the "
     "hot-lag shares, the argmax-by-KL-decile table, the gain-by-decile and gain-by-argmax tables, "
-    "the occlusion-consistency join and the contraction enrichment are tabled and drawn with no "
-    "p-value. They add no Holm family; a trajectory quoted from them is a description, not a claim."
+    "the occlusion-consistency join, the contraction enrichment and EVERY histogram readout -- the "
+    "per-cell lag distributions, their per-recording shape features and both distances between "
+    "cells -- are tabled and drawn with no p-value. They add no Holm family; a trajectory quoted "
+    "from them is a description, not a claim."
+)
+
+#: What the histogram half is, in the record, so a reader of one table knows which object it
+#: describes without this module. The normalisation order is stated because two tables of this
+#: analysis normalise at different points on purpose and would otherwise read as disagreeing.
+HISTOGRAM_NOTE = (
+    "the selected anchors' lag structure read as a DISTRIBUTION rather than as a handful of "
+    "scalars. At every anchor the attention over the lags is already a distribution saying which "
+    "lags contributed, so the histogram of a cell is those distributions aggregated: within a "
+    "recording, then normalised, then averaged over the recordings of the (class, window) cell -- "
+    "so every recording counts once however much coupling it carried, and every shape feature "
+    "describes the same object the figure draws. Two sources travel: 'attn' counts every selected "
+    "timestep once, 'kl' weights each by how far the source moved the belief there, and a shift "
+    "visible in one and absent from the other is a finding about which readout is being read. "
+    "NOTE the difference from lag_high_kl_profile.csv, which is not a disagreement: that table "
+    "normalises AFTER the (class, window) mean, so it reports where a cohort's coupling mass sits; "
+    "this one normalises per recording BEFORE it, so it reports what a typical recording looks "
+    "like. No peak-lag histogram ships: the per-anchor argmax is already resolved by KL decile in "
+    "lag_high_kl_argmax_by_quantile.csv, and on a flat profile numpy's first-maximum rule pins it "
+    "at lag 0, so a histogram of it would be a picture of that rule."
 )
 
 #: What the usefulness block answers and how, in the record.
@@ -385,6 +482,7 @@ class Clock:
         inverted: Whether the axis is drawn with the landmark at the right.
         figure: This clock's profile-and-trajectory page.
         windows_figure: This clock's tested page.
+        histogram_figure: This clock's lag-distribution page.
         eligible_only: Whether the second-stage eligibility rule applies before binning.
     """
 
@@ -396,6 +494,7 @@ class Clock:
     inverted: bool
     figure: str
     windows_figure: str
+    histogram_figure: str
     eligible_only: bool
 
 
@@ -410,6 +509,7 @@ CLOCKS: Tuple[Clock, ...] = (
         inverted=True,
         figure="lag_high_kl_time_to_delivery",
         windows_figure="lag_high_kl_time_to_delivery_windows",
+        histogram_figure="lag_high_kl_time_to_delivery_histogram",
         eligible_only=False,
     ),
     Clock(
@@ -421,6 +521,7 @@ CLOCKS: Tuple[Clock, ...] = (
         inverted=False,
         figure="lag_high_kl_second_stage",
         windows_figure="lag_high_kl_second_stage_windows",
+        histogram_figure="lag_high_kl_second_stage_histogram",
         eligible_only=True,
     ),
 )
@@ -1411,6 +1512,58 @@ def analyse_windows(
     }
 
 
+def lag_columns(n_lags: int) -> List[int]:
+    """The integer column labels a per-lag matrix is laid out under inside a frame."""
+    return list(range(int(n_lags)))
+
+
+def recording_profiles(
+    clock: Clock, binned: pd.DataFrame, matrix: Optional[np.ndarray], n_lags: int
+) -> pd.DataFrame:
+    """Average a per-segment profile within each recording, inside each window of one clock.
+
+    The aggregation chain's middle step, and the reason it is a function of its own: two readouts
+    are built from it -- the per-cell field :func:`window_profiles` draws, and the per-recording
+    histogram whose shape features are compared -- and a second copy of this groupby is a second
+    definition of what a recording's profile in a window *is*.
+
+    Args:
+        clock: The clock whose window and centre columns the frame is binned on.
+        binned: The featured per-sample table after that clock's binner.
+        matrix: The $(n_{\\mathrm{segments}}, L)$ restricted profiles, in the per-sample row order
+            :data:`ROW_COLUMN` indexes; ``None`` where the source is absent from the sidecar.
+        n_lags: The lag axis width.
+
+    Returns:
+        One row per ``(group, window, centre, guid)`` with the $L$ lag columns labelled $0 \\ldots
+        L-1$. Empty with those columns present when there is nothing usable -- an absent source, a
+        matrix of another width, or a table carrying no class label.
+    """
+    columns = lag_columns(n_lags)
+    empty = pd.DataFrame(columns=["group", "window", "centre", "guid", *columns])
+    if matrix is None:
+        return empty
+    values = np.asarray(matrix, dtype=np.float64)
+    needed = {labels.CLASS_COLUMN, "guid", clock.bin_column, clock.center_column, ROW_COLUMN}
+    if binned.empty or values.ndim != 2 or values.shape[1] != int(n_lags) or not needed <= set(binned.columns):
+        return empty
+    frame = binned[binned[labels.CLASS_COLUMN].notna()]
+    if frame.empty:
+        return empty
+    positions = np.asarray(frame[ROW_COLUMN], dtype=np.int64)
+    table = pd.DataFrame(values[positions], columns=columns)
+    table["group"] = [str(value) for value in frame[labels.CLASS_COLUMN]]
+    table["window"] = [int(value) for value in frame[clock.bin_column]]
+    table["centre"] = [float(value) for value in frame[clock.center_column]]
+    table["guid"] = list(frame["guid"].astype(str))
+    # The centre joins the keys rather than being carried separately: it is a function of the
+    # window, so it does not change the partition, and grouping on it keeps it on every row --
+    # which is what ``cohort.per_recording_in_bins`` does with the same two columns.
+    return (
+        table.groupby(["group", "window", "centre", "guid"], sort=True)[columns].mean().reset_index()
+    )
+
+
 def window_profiles(
     clock: Clock, binned: pd.DataFrame, matrix: Optional[np.ndarray], n_lags: int
 ) -> Tuple[List[int], List[float], List[Tuple[str, np.ndarray, np.ndarray, np.ndarray, int]]]:
@@ -1421,32 +1574,22 @@ def window_profiles(
         class in the canonical order -- the last being the cohort's distinct recordings over the
         whole axis -- every class on the same window axis with NaN where it has no recording.
     """
-    if matrix is None:
+    recordings = recording_profiles(clock, binned, matrix, n_lags)
+    if recordings.empty:
         return [], [], []
-    values = np.asarray(matrix, dtype=np.float64)
-    needed = {labels.CLASS_COLUMN, "guid", clock.bin_column, clock.center_column, ROW_COLUMN}
-    if binned.empty or values.ndim != 2 or values.shape[1] != int(n_lags) or not needed <= set(binned.columns):
-        return [], [], []
-    frame = binned[binned[labels.CLASS_COLUMN].notna()]
-    if frame.empty:
-        return [], [], []
-    positions = np.asarray(frame[ROW_COLUMN], dtype=np.int64)
-    columns = list(range(int(n_lags)))
-    table = pd.DataFrame(values[positions], columns=columns)
-    table["group"] = [str(value) for value in frame[labels.CLASS_COLUMN]]
-    table["window"] = [int(value) for value in frame[clock.bin_column]]
-    table["centre"] = [float(value) for value in frame[clock.center_column]]
-    table["guid"] = list(frame["guid"].astype(str))
-    per_guid = table.groupby(["group", "window", "guid"], sort=True)[columns].mean()
-    per_cell = per_guid.groupby(["group", "window"], sort=True)[columns].mean()
-    counted = per_guid.notna().any(axis=1).groupby(["group", "window"], sort=True).sum()
+    columns = lag_columns(n_lags)
+    per_cell = recordings.groupby(["group", "window"], sort=True)[columns].mean()
+    counted = (
+        recordings[columns].notna().any(axis=1)
+        .groupby([recordings["group"], recordings["window"]], sort=True).sum()
+    )
     # Every window between the first and the last, so an empty interior window is a blank
     # column rather than a shift of every later column onto the wrong hour.
-    lowest, highest = int(table["window"].min()), int(table["window"].max())
+    lowest, highest = int(recordings["window"].min()), int(recordings["window"].max())
     windows = list(range(lowest, highest + 1))
     centres = [(window + 0.5) * float(TRAJECTORY_BIN_HOURS) for window in windows]
     fields: List[Tuple[str, np.ndarray, np.ndarray, np.ndarray, int]] = []
-    for group in cohort.ordered_groups(sorted(set(table["group"])), labels.CLASS_COLUMN):
+    for group in cohort.ordered_groups(sorted(set(recordings["group"])), labels.CLASS_COLUMN):
         mean = np.full((int(n_lags), len(windows)), np.nan)
         counts = np.zeros(len(windows), dtype=np.int64)
         for index, window in enumerate(windows):
@@ -1461,7 +1604,7 @@ def window_profiles(
         fields.append(
             (
                 group, mean, share, counts,
-                int(per_guid.loc[group].index.get_level_values("guid").nunique()),
+                int(recordings.loc[recordings["group"] == group, "guid"].nunique()),
             )
         )
     return windows, centres, fields
@@ -1502,6 +1645,392 @@ def profile_frame(
             "lag_step", "compensated_seconds", "mean_nats", "share",
         ],
     )
+
+
+# =================================================================================================
+# The lag distribution of the selection, and how far apart two of them are
+# =================================================================================================
+def _cell_mean(rows: np.ndarray) -> np.ndarray:
+    """Mean a stack of per-lag rows down to one, ignoring bins no row measured.
+
+    A lag every recording of a cell left unmeasured stays ``NaN`` rather than becoming zero, which
+    is the convention every per-lag function in this pipeline holds and the reason the mean is
+    ``nanmean``. NumPy warns rather than raising on such a column, and the warning is suppressed
+    because the column is a legitimate outcome here, not a defect -- the same handling
+    ``figures.ribbon_plot`` gives the identical case.
+    """
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", category=RuntimeWarning)
+        return np.nanmean(rows, axis=0)
+
+
+def _cell_quantile(rows: np.ndarray, quantile: float) -> np.ndarray:
+    """One quantile of a stack of per-lag rows, bin by bin, on the same convention as :func:`_cell_mean`."""
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", category=RuntimeWarning)
+        return np.nanquantile(rows, quantile, axis=0)
+
+
+@dataclass(frozen=True)
+class HistogramCells:
+    r"""The pooled lag distributions of one (clock, band, source), by class and by window.
+
+    Attributes:
+        groups: The classes present, worst first -- :func:`~teb_vae.lag_attn_cfs.eval.cohort.
+            ordered_groups`' order, which is also what orients every pair the distance table names.
+        windows: Every window index present, ascending.
+        centres: Window index to its centre in hours on this clock.
+        cell: ``(group, window)`` to the mean of that cell's per-recording distributions.
+        cell_counts: ``(group, window)`` to how many recordings that mean is over.
+        pooled: Group to its distribution pooled over every window, which is what each of its
+            windows is compared against.
+        pooled_counts: Group to its distinct recordings over the whole axis.
+    """
+
+    groups: List[str]
+    windows: List[int]
+    centres: Dict[int, float]
+    cell: Dict[Tuple[str, int], np.ndarray]
+    cell_counts: Dict[Tuple[str, int], int]
+    pooled: Dict[str, np.ndarray]
+    pooled_counts: Dict[str, int]
+
+
+def recording_densities(
+    clock: Clock, binned: pd.DataFrame, matrix: Optional[np.ndarray], n_lags: int
+) -> pd.DataFrame:
+    r"""Each recording's own lag **distribution** in each window: normalised, then compared.
+
+    :func:`recording_profiles` averages the selected anchors' lag map within a recording; this
+    normalises that average so each recording contributes a distribution summing to one over the
+    lags rather than a magnitude.
+
+    **The normalisation order is the whole point and it differs deliberately from
+    ``lag_high_kl_profile.csv``.** That table's ``share`` column normalises the (class, window) mean
+    *after* averaging, so a recording carrying ten times the coupling of its neighbours moves the
+    cell ten times as far. Here each recording is normalised *before* the average, so every
+    recording of a cell counts once -- which is what makes the histogram, and the per-recording
+    shape features compared across classes, describe the same object. Both tables ship, and neither
+    is a re-derivation of the other: one says where a cohort's *coupling mass* sits, the other what
+    a *typical recording* of it looks like.
+
+    Args:
+        clock: The clock the table is binned on.
+        binned: The featured per-sample table after that clock's binner.
+        matrix: The restricted profiles for one band and one source, or ``None``.
+        n_lags: The lag axis width.
+
+    Returns:
+        :func:`recording_profiles`' frame with the lag columns replaced by their normalised form.
+        A recording with no selected anchor in a window stays all-``NaN`` rather than becoming a
+        uniform row.
+    """
+    recordings = recording_profiles(clock, binned, matrix, n_lags)
+    if recordings.empty:
+        return recordings
+    columns = lag_columns(n_lags)
+    densities = recordings.copy()
+    densities[columns] = normalise(recordings[columns].to_numpy(dtype=np.float64))
+    return densities
+
+
+def histogram_cells(densities: pd.DataFrame, n_lags: int) -> HistogramCells:
+    """Pool the per-recording distributions into the cells the figure draws and the table compares.
+
+    Args:
+        densities: :func:`recording_densities`' frame.
+        n_lags: The lag axis width.
+
+    Returns:
+        The cells. Empty throughout when nothing is usable; a cell whose every recording is
+        ``NaN`` is absent rather than present and blank, so a consumer meets "no cell here" rather
+        than a row of zeros.
+    """
+    columns = lag_columns(n_lags)
+    if densities.empty:
+        return HistogramCells([], [], {}, {}, {}, {}, {})
+    groups = cohort.ordered_groups(sorted(set(densities["group"])), labels.CLASS_COLUMN)
+    windows = sorted({int(value) for value in densities["window"]})
+    centres = {
+        int(window): float(centre)
+        for window, centre in zip(densities["window"], densities["centre"])
+    }
+    cell: Dict[Tuple[str, int], np.ndarray] = {}
+    cell_counts: Dict[Tuple[str, int], int] = {}
+    for (group, window), block in densities.groupby(["group", "window"], sort=True):
+        rows = block[columns].to_numpy(dtype=np.float64)
+        usable = np.isfinite(rows).any(axis=1)
+        if not usable.any():
+            continue
+        cell[(str(group), int(window))] = _cell_mean(rows[usable])
+        # One row per recording by construction, so the usable count *is* the recording count.
+        cell_counts[(str(group), int(window))] = int(usable.sum())
+    pooled: Dict[str, np.ndarray] = {}
+    pooled_counts: Dict[str, int] = {}
+    for group, block in densities.groupby("group", sort=True):
+        rows = block[columns].to_numpy(dtype=np.float64)
+        usable = np.isfinite(rows).any(axis=1)
+        if not usable.any():
+            continue
+        pooled[str(group)] = _cell_mean(rows[usable])
+        # Distinct recordings rather than rows: a recording appearing in six windows is one
+        # delivery, and summing the per-window counts would report six.
+        pooled_counts[str(group)] = int(np.unique(block["guid"].to_numpy()[usable]).size)
+    return HistogramCells(groups, windows, centres, cell, cell_counts, pooled, pooled_counts)
+
+
+def histogram_frame(
+    clock: Clock,
+    band_key: str,
+    source_key: str,
+    densities: pd.DataFrame,
+    seconds: np.ndarray,
+) -> pd.DataFrame:
+    """Lay the per-cell lag distributions out long-form: one row per (class, window, lag).
+
+    Args:
+        clock: The clock, named on every row.
+        band_key: The selection band.
+        source_key: ``"attn"`` or ``"kl"``.
+        densities: :func:`recording_densities`' frame.
+        seconds: The compensated lag axis.
+
+    Returns:
+        The table, carrying the cell mean and the inter-quartile range **over recordings** at each
+        lag -- quartiles rather than a standard deviation, matching every other cell summary in
+        this package, because these distributions are skewed.
+    """
+    n_lags = int(seconds.size)
+    columns = lag_columns(n_lags)
+    rows: List[Dict[str, Any]] = []
+    if not densities.empty:
+        for (group, window, centre), block in densities.groupby(
+            ["group", "window", "centre"], sort=True
+        ):
+            values = block[columns].to_numpy(dtype=np.float64)
+            usable = np.isfinite(values).any(axis=1)
+            if not usable.any():
+                continue
+            used = values[usable]
+            mean = _cell_mean(used)
+            low = _cell_quantile(used, 0.25)
+            high = _cell_quantile(used, 0.75)
+            for lag in range(n_lags):
+                rows.append(
+                    {
+                        "clock": clock.name,
+                        "band": band_key,
+                        "source": source_key,
+                        "group_column": labels.CLASS_COLUMN,
+                        "group": str(group),
+                        "time_bin": int(window),
+                        "bin_center_h": float(centre),
+                        "n_recordings": int(usable.sum()),
+                        "lag_step": int(lag),
+                        "compensated_seconds": float(seconds[lag]),
+                        "density": float(mean[lag]),
+                        "density_q25": float(low[lag]),
+                        "density_q75": float(high[lag]),
+                    }
+                )
+    return pd.DataFrame(rows, columns=list(HISTOGRAM_COLUMNS))
+
+
+def histogram_feature_frame(
+    densities: pd.DataFrame, seconds: np.ndarray
+) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    """Reduce each recording's own histogram to the shared shape vocabulary.
+
+    The features are taken of the **per-recording histogram**, not of each segment's profile with
+    the resulting scalars then averaged. The two are different numbers -- the mean of a centroid is
+    not the centroid of the mean -- and this is the one that describes the object the figure draws.
+    The per-segment reduction remains on the ``<band>_lag_<statistic>_<source>`` columns, unchanged.
+
+    Args:
+        densities: :func:`recording_densities`' frame.
+        seconds: The compensated lag axis.
+
+    Returns:
+        ``(frame, census)`` -- the frame's key columns plus :data:`HISTOGRAM_FEATURE_COLUMNS`, and
+        the reducer's own census of how many rows carried usable mass.
+    """
+    columns = lag_columns(int(seconds.size))
+    keys = ["group", "window", "centre", "guid"]
+    if densities.empty:
+        return (
+            pd.DataFrame(columns=[*keys, *HISTOGRAM_FEATURE_COLUMNS]),
+            {"n_rows": 0, "n_usable": 0, "n_empty": 0, "n_negative": 0},
+        )
+    statistics, census = profile_statistics(
+        densities[columns].to_numpy(dtype=np.float64), seconds
+    )
+    frame = densities[keys].copy()
+    for statistic in HISTOGRAM_STATISTICS:
+        frame[histogram_feature_column(statistic)] = statistics[statistic]
+    return frame, census
+
+
+def histogram_feature_rows(
+    clock: Clock, band_key: str, source_key: str, features: pd.DataFrame
+) -> List[Dict[str, Any]]:
+    """Summarise every histogram feature within each (class, window) cell, over its recordings.
+
+    Reuses :func:`~teb_vae.lag_attn_cfs.eval.cohort.trajectory_rows` rather than restating its
+    arithmetic, so the shape of this table -- the recording count, the cohort's distinct-delivery
+    total, the mean and the quartiles -- is the shape of every other trajectory table in the run.
+
+    Args:
+        clock: The clock, named on every row.
+        band_key: The selection band.
+        source_key: ``"attn"`` or ``"kl"``.
+        features: :func:`histogram_feature_frame`'s frame.
+
+    Returns:
+        One row per (feature, class, window) cell that carries at least one finite value.
+    """
+    rows: List[Dict[str, Any]] = []
+    for statistic in HISTOGRAM_STATISTICS:
+        column = histogram_feature_column(statistic)
+        for row in cohort.trajectory_rows(
+            features, column, metric=column, bin_column="window", center_column="centre"
+        ):
+            rows.append(
+                {
+                    "clock": clock.name,
+                    "band": band_key,
+                    "source": source_key,
+                    "group_column": labels.CLASS_COLUMN,
+                    **row,
+                }
+            )
+    return rows
+
+
+#: What a comparison reports when it could not be made. Explicit rather than an omitted row, so a
+#: reader meets the pair and its counts and can see *why* there is no number.
+_BLANK_DISTANCE: Dict[str, float] = {
+    "jensen_shannon": float("nan"),
+    "wasserstein_s": float("nan"),
+    "centroid_delta_s": float("nan"),
+}
+
+
+def _concat_tables(tables: Sequence[pd.DataFrame], columns: Sequence[str]) -> pd.DataFrame:
+    """Concatenate the non-empty frames of a list, or return the empty table with its schema.
+
+    An empty frame is dropped rather than concatenated, which is what pandas asks for: an all-NA
+    entry is currently excluded from the result's dtype resolution and a future version will let it
+    participate. The schema is preserved either way, so a run where one source was absent writes a
+    table a reader can open rather than a headerless file.
+    """
+    usable = [table for table in tables if len(table)]
+    return (
+        pd.concat(usable, ignore_index=True) if usable else pd.DataFrame(columns=list(columns))
+    )
+
+
+def distance_frame(
+    clock: Clock,
+    band_key: str,
+    source_key: str,
+    cells: HistogramCells,
+    seconds: np.ndarray,
+) -> pd.DataFrame:
+    r"""How far apart the lag distributions are: across classes, and across the clock.
+
+    Two comparisons, and they answer the two halves of the question this analysis was extended for:
+
+    * :data:`CLASS_PAIR_COMPARISON` -- every class pair within a window, oriented worst first, so a
+      positive ``centroid_delta_s`` means the more severe class sits at the longer lag. The same
+      orientation Cliff's delta carries everywhere else in this package.
+    * :data:`WINDOW_DRIFT_COMPARISON` -- each window of a class against that class's own
+      distribution pooled over every window, so the column reads as how far this window departs
+      from that cohort's overall lag structure.
+
+    Both are **descriptive and carry no $p$-value**. A distance between two estimated histograms is
+    positive almost surely even when the two populations coincide, so a value here is a
+    description of two cells rather than evidence that they differ; the recording counts travel on
+    every row for exactly that reason.
+
+    Args:
+        clock: The clock, named on every row.
+        band_key: The selection band.
+        source_key: ``"attn"`` or ``"kl"``.
+        cells: :func:`histogram_cells`' pooled cells.
+        seconds: The compensated lag axis.
+
+    Returns:
+        The table. A comparison either of whose cells holds fewer than
+        ``shared_stats.MIN_GROUP_SIZE`` recordings is emitted with its counts and ``NaN`` distances
+        -- the same floor every other cell-level statement in this pipeline is held to.
+    """
+    minimum = int(shared_stats.MIN_GROUP_SIZE)
+    rows: List[Dict[str, Any]] = []
+    base = {
+        "clock": clock.name,
+        "band": band_key,
+        "source": source_key,
+        "group_column": labels.CLASS_COLUMN,
+    }
+    for window in cells.windows:
+        centre = cells.centres.get(window, float("nan"))
+        for index, left in enumerate(cells.groups):
+            for right in cells.groups[index + 1:]:
+                left_cell = cells.cell.get((left, window))
+                right_cell = cells.cell.get((right, window))
+                if left_cell is None or right_cell is None:
+                    continue
+                n_left = cells.cell_counts.get((left, window), 0)
+                n_right = cells.cell_counts.get((right, window), 0)
+                measured = min(n_left, n_right) >= minimum
+                rows.append(
+                    {
+                        **base,
+                        "comparison": CLASS_PAIR_COMPARISON,
+                        "group_left": left,
+                        "group_right": right,
+                        "time_bin_left": float(window),
+                        "time_bin_right": float(window),
+                        "bin_center_h_left": float(centre),
+                        "bin_center_h_right": float(centre),
+                        "n_left": n_left,
+                        "n_right": n_right,
+                        **(
+                            cell_distances(left_cell, right_cell, seconds)
+                            if measured else _BLANK_DISTANCE
+                        ),
+                    }
+                )
+    for group in cells.groups:
+        reference = cells.pooled.get(group)
+        if reference is None:
+            continue
+        for window in cells.windows:
+            cell = cells.cell.get((group, window))
+            if cell is None:
+                continue
+            count = cells.cell_counts.get((group, window), 0)
+            rows.append(
+                {
+                    **base,
+                    "comparison": WINDOW_DRIFT_COMPARISON,
+                    "group_left": group,
+                    "group_right": group,
+                    "time_bin_left": float(window),
+                    # The reference is the pooled cell, which is not a window; NaN rather than a
+                    # sentinel index, which a reader would have to be told how to decode.
+                    "time_bin_right": float("nan"),
+                    "bin_center_h_left": float(cells.centres.get(window, float("nan"))),
+                    "bin_center_h_right": float("nan"),
+                    "n_left": count,
+                    "n_right": cells.pooled_counts.get(group, 0),
+                    **(
+                        cell_distances(cell, reference, seconds)
+                        if count >= minimum else _BLANK_DISTANCE
+                    ),
+                }
+            )
+    return pd.DataFrame(rows, columns=list(HISTOGRAM_DISTANCE_COLUMNS))
 
 
 def significance_frame(records: Sequence[Dict[str, Any]]) -> pd.DataFrame:
@@ -2090,6 +2619,282 @@ def build_windows_figure(
     return figure
 
 
+#: Line styles a class *pair* is distinguished by on the between-class panel, where a single colour
+#: cannot name two cohorts. Cycled in :func:`~teb_vae.lag_attn_cfs.eval.cohort.ordered_groups`'
+#: pair order, so the same pair draws the same way on both clocks.
+_PAIR_STYLES: Tuple[str, ...] = ("-", "--", ":", "-.")
+
+
+def _draw_distribution_overlay(
+    ax: Any,
+    profiles: Dict[str, np.ndarray],
+    counts: Dict[str, int],
+    groups: Sequence[str],
+    seconds: np.ndarray,
+    *,
+    title: str,
+) -> int:
+    """Overlay one class's lag distribution per line, on the lag axis.
+
+    Drawn as a step rather than a line: the quantity is a share per lag *bin*, and a line between
+    bin centres draws mass at positions no bin covers. Class colour rather than a sequential
+    palette, because severity is what the reader is comparing.
+
+    Args:
+        ax: Target axes.
+        profiles: Class to its pooled distribution over the lags.
+        counts: Class to the recordings behind it, for the legend.
+        groups: The classes, worst first.
+        seconds: The compensated lag axis.
+        title: Panel title.
+
+    Returns:
+        How many classes were drawn.
+    """
+    drawn = [group for group in groups if group in profiles]
+    if not drawn:
+        _empty_panel(ax, title)
+        return 0
+    colours = figures.group_colors(list(drawn))
+    for group in drawn:
+        colour = colours.get(group, figures.COLOR_BLUE)
+        ax.step(
+            seconds, profiles[group], where="mid", color=colour,
+            linewidth=figures.LINE_EMPHASIS,
+            label=f"{group} (n={int(counts.get(group, 0))} deliveries)",
+        )
+        ax.fill_between(
+            seconds, np.zeros_like(profiles[group]), profiles[group], step="mid",
+            color=colour, alpha=0.12, linewidth=0,
+        )
+    ax.set_title(title)
+    ax.set_xlabel(figures.COEFFICIENT_LAG_AXIS_LABEL)
+    ax.set_ylabel("share of the distribution")
+    ax.legend(fontsize=figures.FONT_LABEL, loc="best")
+    figures.style_axes(ax)
+    return len(drawn)
+
+
+def _draw_window_overlay(
+    ax: Any,
+    cells: HistogramCells,
+    group: str,
+    seconds: np.ndarray,
+    *,
+    title: str,
+) -> int:
+    """Overlay one class's lag distribution once per window, graded along the clock.
+
+    The colour ramp is the clock, so "the distribution moved" is a systematic drift of the ramp
+    across the lag axis rather than something a reader must reconstruct from a table. Windows
+    holding fewer than ``shared_stats.MIN_GROUP_SIZE`` recordings are drawn hairline and dashed and
+    are marked as such: they are shown because a gap would read as no data, and marked because
+    a cell of one recording is not a cohort.
+
+    Args:
+        ax: Target axes.
+        cells: The pooled cells.
+        group: The class this panel is for.
+        seconds: The compensated lag axis.
+        title: Panel title.
+
+    Returns:
+        How many windows were drawn.
+    """
+    import matplotlib.pyplot as plt
+
+    windows = [window for window in cells.windows if (group, window) in cells.cell]
+    if not windows:
+        _empty_panel(ax, title)
+        return 0
+    palette = plt.get_cmap("viridis")
+    minimum = int(shared_stats.MIN_GROUP_SIZE)
+    span = max(len(windows) - 1, 1)
+    for index, window in enumerate(windows):
+        count = cells.cell_counts.get((group, window), 0)
+        thin = count < minimum
+        ax.step(
+            seconds, cells.cell[(group, window)], where="mid", color=palette(index / span),
+            linewidth=figures.LINE_HAIRLINE if thin else figures.LINE_REGULAR,
+            linestyle="--" if thin else "-",
+        )
+    ax.set_title(title)
+    ax.set_xlabel(figures.COEFFICIENT_LAG_AXIS_LABEL)
+    ax.set_ylabel("share of the distribution")
+    # The ramp is named at its two ends rather than by a legend: a full clock axis is dozens of
+    # windows, and a legend entry per window would take the panel and leave nothing to read.
+    ax.text(
+        0.98, 0.95,
+        f"{cells.centres.get(windows[0], float('nan')):.2g} h (lightest) to "
+        f"{cells.centres.get(windows[-1], float('nan')):.2g} h (darkest), "
+        f"{len(windows)} window(s); dashed = fewer than {minimum} recordings",
+        transform=ax.transAxes, ha="right", va="top",
+        fontsize=figures.FONT_LABEL, color=figures.COLOR_GRAY,
+    )
+    figures.style_axes(ax)
+    return len(windows)
+
+
+def _draw_distance_panel(
+    ax: Any,
+    clock: Clock,
+    distances: pd.DataFrame,
+    *,
+    comparison: str,
+    column: str,
+    ylabel: str,
+    title: str,
+) -> int:
+    """Draw one distance column against the clock, one line per class or per class pair.
+
+    Args:
+        ax: Target axes.
+        clock: The clock, for the axis label and its orientation.
+        distances: The distance table, already filtered to one band and one source.
+        comparison: Which comparison to draw.
+        column: The distance column.
+        ylabel: The y-axis label, naming the metric and its unit.
+        title: Panel title.
+
+    Returns:
+        How many series were drawn.
+    """
+    selected = (
+        distances[distances["comparison"] == comparison]
+        if len(distances) and "comparison" in distances.columns else distances.iloc[:0]
+    )
+    if selected.empty or not np.isfinite(np.asarray(selected[column], dtype=np.float64)).any():
+        _empty_panel(ax, title)
+        return 0
+    pairs = list(dict.fromkeys(zip(selected["group_left"], selected["group_right"])))
+    colours = figures.group_colors([str(left) for left, _ in pairs])
+    drawn = 0
+    for index, (left, right) in enumerate(pairs):
+        cell = selected[
+            (selected["group_left"] == left) & (selected["group_right"] == right)
+        ].sort_values("bin_center_h_left")
+        values = np.asarray(cell[column], dtype=np.float64)
+        if not np.isfinite(values).any():
+            continue
+        ax.plot(
+            np.asarray(cell["bin_center_h_left"], dtype=np.float64), values,
+            marker="o", markersize=3, color=colours.get(str(left), figures.COLOR_BLUE),
+            linestyle=_PAIR_STYLES[index % len(_PAIR_STYLES)],
+            linewidth=figures.LINE_EMPHASIS,
+            label=str(left) if left == right else f"{left} vs {right}",
+        )
+        drawn += 1
+    ax.set_title(title)
+    ax.set_xlabel(clock.axis_label)
+    ax.set_ylabel(ylabel)
+    if clock.inverted:
+        ax.invert_xaxis()
+    else:
+        ax.axvline(
+            0.0, color=figures.COLOR_GRAY, linestyle=":", linewidth=figures.LINE_REGULAR, zorder=0
+        )
+    ax.legend(fontsize=figures.FONT_LABEL, loc="best", ncol=2)
+    figures.style_axes(ax)
+    return drawn
+
+
+def build_histogram_figure(
+    clock: Clock,
+    cells: Dict[Tuple[str, str], HistogramCells],
+    distances: pd.DataFrame,
+    seconds: np.ndarray,
+) -> Any:
+    """One clock's lag-distribution page: the selection read as a distribution rather than a scalar.
+
+    Four blocks, and each answers one half of the question the page exists for.
+
+    1. Per band, the classes overlaid, pooled over the whole clock axis -- **do the classes attend
+       to different lags at all**, before any time conditioning.
+    2. Per class, every window overlaid and graded along the clock -- **does a class's distribution
+       move**, read directly rather than through a scalar trajectory.
+    3. The two distances against the clock: each class against its own pooled distribution, and the
+       class pairs within each window.
+
+    Both profile sources are drawn side by side in every row, and that is the point rather than
+    symmetry: the attention counts every selected timestep once while the attribution weights each
+    by how far it moved the belief, so a shift visible in one column and absent from the other is a
+    finding about which readout is being read.
+
+    Args:
+        clock: The clock.
+        cells: ``(band, source)`` to that combination's pooled cells.
+        distances: This clock's distance table, every band and source.
+        seconds: The compensated lag axis.
+
+    Returns:
+        The figure, for :func:`~teb_vae.lag_attn_cfs.eval.figures_seam.render_figure`.
+    """
+    # The classes come from whichever source of the high band has them, not from a named one: a
+    # sidecar carrying no attention map would otherwise collapse the per-class block of a page
+    # whose KL column is fully populated.
+    groups: List[str] = []
+    for source_key, _, _ in PROFILE_SOURCES:
+        block = cells.get((HIGH_BAND_KEY, source_key))
+        if block is not None and block.groups:
+            groups = list(block.groups)
+            break
+    n_rows = len(HISTOGRAM_BANDS) + max(len(groups), 1) + 1
+    figure, axes = figures.new_figure(n_rows, 2, height_per_row=3.0, width=13.0)
+
+    for row, band_key in enumerate(HISTOGRAM_BANDS):
+        for column, (source_key, _, meaning) in enumerate(PROFILE_SOURCES):
+            block = cells.get((band_key, source_key))
+            title = f"{band_key} band, {source_key}: {meaning}, pooled over the whole clock"
+            if block is None:
+                _empty_panel(axes[row, column], title)
+                continue
+            _draw_distribution_overlay(
+                axes[row, column], block.pooled, block.pooled_counts, block.groups, seconds,
+                title=title,
+            )
+
+    base = len(HISTOGRAM_BANDS)
+    if not groups:
+        for column in range(2):
+            _empty_panel(
+                axes[base, column],
+                f"{HIGH_BAND_KEY} band by window: no class could be placed on this clock",
+            )
+    for offset, group in enumerate(groups):
+        for column, (source_key, _, _) in enumerate(PROFILE_SOURCES):
+            block = cells.get((HIGH_BAND_KEY, source_key))
+            title = f"{group}: {HIGH_BAND_KEY}-band {source_key} distribution, window by window"
+            if block is None:
+                _empty_panel(axes[base + offset, column], title)
+                continue
+            _draw_window_overlay(
+                axes[base + offset, column], block, group, seconds, title=title
+            )
+
+    last = base + max(len(groups), 1)
+    drawn_distances = (
+        distances[(distances["band"] == HIGH_BAND_KEY) & (distances["source"] == "attn")]
+        if len(distances) else distances
+    )
+    _draw_distance_panel(
+        axes[last, 0], clock, drawn_distances,
+        comparison=WINDOW_DRIFT_COMPARISON, column="jensen_shannon",
+        ylabel="Jensen-Shannon distance (base 2)",
+        title=(
+            f"{HIGH_BAND_KEY} band, attn: each window against its own class pooled over the clock "
+            f"(untested)"
+        ),
+    )
+    _draw_distance_panel(
+        axes[last, 1], clock, drawn_distances,
+        comparison=CLASS_PAIR_COMPARISON, column="wasserstein_s",
+        ylabel="1-Wasserstein (s, stored-coefficient time)",
+        title=f"{HIGH_BAND_KEY} band, attn: between classes, window by window (untested)",
+    )
+    figures.caveat_note(figure)
+    return figure
+
+
 # =================================================================================================
 # The whole-recording table and the headline
 # =================================================================================================
@@ -2299,6 +3104,10 @@ def run_lag_high_kl_analysis(
     per_recording_tables: List[pd.DataFrame] = []
     trajectory: List[Dict[str, Any]] = []
     profile_tables: List[pd.DataFrame] = []
+    histogram_tables: List[pd.DataFrame] = []
+    histogram_features: List[Dict[str, Any]] = []
+    distance_tables: List[pd.DataFrame] = []
+    histogram_census: Dict[str, Any] = {}
     written: List[str] = []
     for clock in CLOCKS:
         binned, record = clock_rows(clock, featured)
@@ -2338,6 +3147,43 @@ def run_lag_high_kl_analysis(
                 ).name))
         written.append(str(figures.render_figure(
             build_windows_figure(clock, class_frame, records), directory / clock.windows_figure
+        ).name))
+
+        # --- The same selection read as a distribution rather than as a handful of scalars --------
+        # Both profile sources, because the two weight the selected timesteps differently: the
+        # attention counts each once, the attribution in proportion to how far it moved the belief.
+        # No extra pass over the sidecar -- the restricted profiles were built in
+        # ``add_feature_columns`` and this is a second reading of them.
+        clock_cells: Dict[Tuple[str, str], HistogramCells] = {}
+        clock_distances: List[pd.DataFrame] = []
+        for band_key in HISTOGRAM_BANDS:
+            for source_key, _, _ in PROFILE_SOURCES:
+                densities = recording_densities(
+                    clock, binned, profiles.get(f"{band_key}_{source_key}"), n_lags
+                )
+                cells = histogram_cells(densities, n_lags)
+                clock_cells[(band_key, source_key)] = cells
+                histogram_tables.append(
+                    histogram_frame(clock, band_key, source_key, densities, seconds)
+                )
+                features, census = histogram_feature_frame(densities, seconds)
+                histogram_features.extend(
+                    histogram_feature_rows(clock, band_key, source_key, features)
+                )
+                clock_distances.append(
+                    distance_frame(clock, band_key, source_key, cells, seconds)
+                )
+                histogram_census[f"{clock.name}/{band_key}/{source_key}"] = {
+                    **census,
+                    "n_cells": len(cells.cell),
+                    "n_windows": len(cells.windows),
+                    "n_classes": len(cells.groups),
+                }
+        clock_distance = _concat_tables(clock_distances, HISTOGRAM_DISTANCE_COLUMNS)
+        distance_tables.append(clock_distance)
+        written.append(str(figures.render_figure(
+            build_histogram_figure(clock, clock_cells, clock_distance, seconds),
+            directory / clock.histogram_figure,
         ).name))
         record.update(
             {
@@ -2415,6 +3261,18 @@ def run_lag_high_kl_analysis(
         pd.concat(profile_tables, ignore_index=True)
         if profile_tables else profile_frame(CLOCKS[0], "high", [], [], [], seconds)
     ).to_csv(directory / PROFILE_FILENAME, index=False)
+    # Empty frames are dropped before the concat rather than passed to it: a source the sidecar
+    # does not carry contributes a frame with the right columns and no rows, and pandas warns that
+    # a future version will let such a frame decide the result's dtypes.
+    _concat_tables(histogram_tables, HISTOGRAM_COLUMNS).to_csv(
+        directory / HISTOGRAM_FILENAME, index=False
+    )
+    pd.DataFrame(
+        histogram_features, columns=list(HISTOGRAM_FEATURE_TABLE_COLUMNS)
+    ).to_csv(directory / HISTOGRAM_FEATURES_FILENAME, index=False)
+    _concat_tables(distance_tables, HISTOGRAM_DISTANCE_COLUMNS).to_csv(
+        directory / HISTOGRAM_DISTANCE_FILENAME, index=False
+    )
     significance_frame(significance).to_csv(directory / SIGNIFICANCE_FILENAME, index=False)
     pairwise_frame(significance).to_csv(directory / PAIRWISE_FILENAME, index=False)
     argmax_table.to_csv(directory / ARGMAX_FILENAME, index=False)
@@ -2424,7 +3282,8 @@ def run_lag_high_kl_analysis(
         THRESHOLDS_FILENAME, SELECTION_FILENAME, RECORDINGS_FILENAME, PER_RECORDING_FILENAME,
         TRAJECTORY_FILENAME, PROFILE_FILENAME, SIGNIFICANCE_FILENAME, PAIRWISE_FILENAME,
         ARGMAX_FILENAME, CONTRACTION_FILENAME, GAIN_BY_QUANTILE_FILENAME,
-        GAIN_BY_ARGMAX_FILENAME, OCCLUSION_CONSISTENCY_FILENAME, *written,
+        GAIN_BY_ARGMAX_FILENAME, OCCLUSION_CONSISTENCY_FILENAME, HISTOGRAM_FILENAME,
+        HISTOGRAM_FEATURES_FILENAME, HISTOGRAM_DISTANCE_FILENAME, *written,
     ]
     drawn = [record for record in clocks if record.get("drawn")]
     logger.info(
@@ -2484,6 +3343,34 @@ def run_lag_high_kl_analysis(
         "contraction_enrichment": {
             **enrichment_summary(enrichment),
             "event_lag_window_s": float(eval_config.get("event_lag_window_s", 120.0)),
+        },
+        "lag_histogram": {
+            "note": HISTOGRAM_NOTE,
+            "bands": list(HISTOGRAM_BANDS),
+            "sources": [key for key, _, _ in PROFILE_SOURCES],
+            "statistics": list(HISTOGRAM_STATISTICS),
+            "omitted_statistics": {
+                "total_nats": "identically 1 on a normalised histogram",
+                "peak_nats": (
+                    "the modal share, which the column suffix would spell in nats; peak_mass "
+                    "reports the same concentration in the right unit"
+                ),
+            },
+            "distance": {
+                "comparisons": [CLASS_PAIR_COMPARISON, WINDOW_DRIFT_COMPARISON],
+                "jensen_shannon": "distance, base 2, bounded in [0, 1] -- do the cells overlap",
+                "wasserstein_s": (
+                    "1-Wasserstein in seconds on the compensated axis -- how far the distribution "
+                    "moved"
+                ),
+                "centroid_delta_s": (
+                    "left minus right, worst cohort first, so positive means the more severe class "
+                    "sits at the longer lag"
+                ),
+                "min_recordings_per_cell": int(shared_stats.MIN_GROUP_SIZE),
+                "tested": False,
+            },
+            "census": histogram_census,
         },
         "bin_width_hours": float(TRAJECTORY_BIN_HOURS),
         "n_lags": n_lags,

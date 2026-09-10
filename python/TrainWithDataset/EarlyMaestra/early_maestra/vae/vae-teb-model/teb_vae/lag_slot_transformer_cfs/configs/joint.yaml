@@ -1,0 +1,58 @@
+# The JOINT CANDIDATE: the full architecture, warm-started from the target-only arm.
+#
+# The third of the three runs. Its base branch begins where a competitively trained target-only
+# forecaster ended, and its source pathway begins at exactly zero — so on its first optimizer step
+# the full distribution IS the prior and the divergence is 0.0, and every nat of coupling it later
+# reports was earned during this run rather than inherited from the transfer.
+#
+# WHY THE WARM START MATTERS RATHER THAN BEING A CONVENIENCE. A jointly trained model whose base
+# branch is weak makes the residual branch look informative by letting it correct a failure that had
+# nothing to do with the source. Starting the base at a trained target-only optimum is what removes
+# the cheapest version of that confound; the external reference below is what detects the rest of
+# it, because the internal base can still degrade during joint training and an improved internal gap
+# would then say nothing.
+#
+# WHAT TO READ FIRST, AND IN WHICH ORDER:
+#   1. `val/source_conditioned_kl_raw` at the first validation epoch. It must be ~0.0. Anything else
+#      means the transfer did not leave the source pathway at zero.
+#   2. `val/pred_gap` against zero across training. Positive means the source-conditioned branch
+#      scores better than this run's OWN base branch.
+#   3. The evaluated gap against the FROZEN reference arm's own score. Only this comparison
+#      distinguishes "the source helped" from "the internal base got worse".
+#
+# RUNNING IT
+#   python -m teb_vae.lag_slot_transformer_cfs.trainer \
+#       --config teb_vae/lag_slot_transformer_cfs/configs/joint.yaml
+
+base: default.yaml
+
+general_config:
+  tag: lag_residual_trf_cfs_joint
+
+  # Distinct from both target-only seeds, so the candidate shares no training randomness with the
+  # baseline it starts from or with the reference it is compared against.
+  seed: 7
+
+model_config:
+  # REPOINT THIS at the `-a` target-only run's best checkpoint, e.g.
+  #   output/<stamp>-lag_residual_trf_cfs_target_only_a/model_checkpoints/<name>.ckpt
+  #
+  # A PARTIAL, AUDITED TRANSFER, and deliberately not `core_model_checkpoint`. That key is a strict
+  # load of this exact model kind and restores the source pathway with everything else; this one
+  # copies the target encoder, the prior, the metadata clock projection, the horizon core and the
+  # decoder, lists every tensor it transferred, could not find and left as constructed, and leaves
+  # the source pathway at zero. Setting both keys is refused, because a run doing both would have a
+  # starting point that neither describes.
+  #
+  # The transfer refuses a checkpoint whose kept-channel order or task geometry disagrees, rather
+  # than skipping the tensors that do not fit — a half-initialised model trained to completion is
+  # the failure this guard exists for.
+  target_warm_start_checkpoint: REPOINT_ME_target_only_a_checkpoint.ckpt
+
+  VAE_model:
+    # OFF, and this is the leaf a warm-started run is most likely to get wrong. The calibrated
+    # initialisation places the decoder's mean and log-variance heads and the prior's scale on the
+    # trivial predictor; applied after a transfer it would overwrite exactly the trained tensors the
+    # transfer just copied, and the run would train from a half-calibrated state that neither the
+    # baseline nor a fresh model ever occupied.
+    head_init_calibration: false

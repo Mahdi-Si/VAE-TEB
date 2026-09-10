@@ -1,0 +1,59 @@
+# A single-device smoke run of the lag-residual causal-feature forecaster.
+#
+# The production config with every width and count shrunk, pointed at the committed
+# integer-operator tiny shard. Its purpose is to exercise the whole path -- loader, warm-up budget
+# resolution, tiling, forward, objective, checkpoint -- in a minute rather than to learn anything.
+#
+# WHAT IS NOT SHRUNK, and must not be. The channel widths, the sequence length, the warm-up budget,
+# the anchor floor, the horizon and the stride all come from the parent: they describe the DATA, and
+# a smoke run at a different geometry would exercise a model no production config builds. What
+# changes below is capacity, batch size, epoch count and where the output goes.
+
+base: default.yaml
+
+general_config:
+  tag: lag_residual_trf_cfs_tiny
+  cuda_devices: [0]
+  epochs: 1
+  plot_frequency: 1
+  lr_warmup_steps: 4
+  batch_size: {train: 2, test: 2}
+  folders_config: {out_dir_base: output/teb_vae_lag_residual_cfs_tiny}
+
+model_config:
+  VAE_model:
+    d_model: 32          # even, so the metadata clock's sine and cosine pairs are complete
+    d_z: 8               # unconstrained by any head count: nothing partitions this latent
+    max_lag: 8
+    dropout: 0.0
+    encoder_d_ff: 64
+    target_attention_blocks: 2
+    decoder_hidden: 32
+    horizon_depth: 2
+    horizon_attention_blocks: 1
+
+    # Exercised at the smoke size, because an unchunked-only smoke run would leave the chunked
+    # accumulation untested on the real path. Both are small enough that several chunks exist.
+    anchor_chunk: 8
+    lag_chunk: 4
+
+    # The Gaussian score the design specifies, NOT a squared error, and this is a correctness
+    # requirement rather than fidelity for its own sake. Under `mse` the decoder's observation
+    # log-variance head is outside the graph on every batch: harmless on one device and a starved
+    # parameter under a distributed run, and it would leave the smoke fit exercising an objective no
+    # production configuration uses. It is also what makes the fit's checkpoint scorable at all --
+    # the evaluation's predictive density and its calibration census both read that head, and a
+    # squared error never trains it.
+    likelihood: gaussian_nll
+
+dataset_config:
+  vae_train_datasets: [teb_vae/lag_attn/tests/fixtures/tiny_shard_causal_int.hdf5]
+  vae_test_datasets: [teb_vae/lag_attn/tests/fixtures/tiny_shard_causal_int.hdf5]
+  stat_path: teb_vae/lag_attn/tests/fixtures/tiny_stats_causal_int.hdf5
+  dataloader_config:
+    num_workers: 0       # no worker spawn for a handful of samples
+
+advanced_config:
+  tracking:
+    mlflow:
+      enabled: false     # a smoke run is not a result

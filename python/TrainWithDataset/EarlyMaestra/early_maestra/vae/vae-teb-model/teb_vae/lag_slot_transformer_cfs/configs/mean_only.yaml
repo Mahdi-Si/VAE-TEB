@@ -1,0 +1,48 @@
+# The MEAN-ONLY arm: the candidate with no scale half of the residual update.
+#
+# WHAT IT ISOLATES. Whether changing the latent's UNCERTAINTY helps, as opposed to changing its
+# location. Against `joint.yaml` this file differs in exactly one leaf, so a difference between the
+# two evaluated gaps is the variance update and nothing else.
+#
+# WHAT CHANGES, EXACTLY. The proposal head emits one d_z-wide vector per lag instead of two and
+# constructs no scale parameters at all, so the arm is a different module tree and a different
+# checkpoint rather than a flag consulted in the forward. Downstream:
+#
+#   * the full scale IS the prior scale, so the divergence reduces to half the squared bounded mean
+#     update and its variance term is identically zero;
+#   * the paired sample difference is sigma_prior * a, deterministic given the anchor, where the
+#     full arm's carries an epsilon-dependent term;
+#   * `update_logsigma`, `raw_update_logsigma` and `cancellation_*_scale` are ABSENT from the
+#     forward rather than reported as zeros, so a reader cannot mistake an arm that cannot make a
+#     scale update for one that chose not to.
+#
+# WHAT IT IS NOT. A mean-only latent update is not an assumption that the source affects only the
+# predicted mean. The decoder's observation log-variance head reads the latent sample, so the
+# predicted variance still moves; what is restricted is the Gaussian encoder family, not the
+# forecast.
+#
+# RUNNING IT
+#   python -m teb_vae.lag_slot_transformer_cfs.trainer \
+#       --config teb_vae/lag_slot_transformer_cfs/configs/mean_only.yaml
+#
+# It warm-starts from the SAME target-only checkpoint every other arm does. That is what lets one
+# frozen reference serve all of them: the target half of every arm here is the identical
+# architecture, so a base branch is comparable across arms and each arm's gap is read against the
+# same external number.
+
+base: joint.yaml
+
+general_config:
+  tag: lag_residual_trf_cfs_mean_only
+
+  # Distinct from every other arm's, so no two arms share training randomness.
+  seed: 11
+
+model_config:
+  # REPOINT THIS at the same target-only checkpoint `joint.yaml` starts from. An arm warm-started
+  # from a different baseline is not comparable with the candidate on anything.
+  target_warm_start_checkpoint: REPOINT_ME_target_only_a_checkpoint.ckpt
+
+  VAE_model:
+    # The arm. Everything above follows from it.
+    mean_only_residual: true

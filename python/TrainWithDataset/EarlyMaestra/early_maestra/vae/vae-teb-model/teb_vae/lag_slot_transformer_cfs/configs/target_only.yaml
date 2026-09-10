@@ -1,0 +1,65 @@
+# The TARGET-ONLY arm: the same architecture with no source pathway built at all.
+#
+# This is the baseline the jointly trained candidate is warm-started from, and — trained a second
+# time at a different seed and then frozen — the external reference its gap has to be read against.
+# Both roles use this file; only `general_config.seed` and `general_config.tag` differ between them.
+#
+# WHY AN ARM OF THIS PACKAGE RATHER THAN A SIBLING FORECASTER. The comparison the design asks for is
+# "does uterine activity improve prediction beyond a capable target-only model", and that question
+# is only answerable if the two models differ in the source pathway and in nothing else: the same
+# target encoder, the same prior, the same decoder, the same anchors, the same mask, the same
+# objective reduction and the same scoring estimator. A sibling package's target-only forecaster
+# differs in all of those at once.
+#
+# WHAT `source_disabled` DOES. It builds no pointwise encoder, no lag embeddings and no proposal
+# head — not a model that holds them and leaves them idle. The consequences are exact rather than
+# approximate, and each is a self-check an operator can read off the run:
+#
+#   * the full distribution IS the prior, bitwise;
+#   * the divergence is exactly zero, so `val/source_conditioned_kl_raw` is 0.0 in every row;
+#   * the two decoded forecasts are bitwise identical, so `val/nll_full_block` and
+#     `val/nll_base_block` agree in every row and `val/pred_gap` is exactly 0.0.
+#
+# A run labelled target-only whose divergence is not identically zero did not build this arm.
+#
+# TWO COLUMNS ARE EMPTY ON THIS ARM AND THAT IS NOT A DEFECT. `cancellation_ratio_scale` has no
+# scale channel to report on, and the checkpoint carries no source tensors, so the evaluation's lag
+# readouts and source controls are absent rather than zero. The scoring pass records the arm and
+# names every intervention it skipped.
+
+base: default.yaml
+
+general_config:
+  # CHANGE THIS PER ROLE. `-a` is the checkpoint the candidate warm-starts from; `-b` is the
+  # independently trained reference held frozen for comparison. Two tags, two directories, two
+  # seeds — the reference is only a reference if it shares no training randomness with the base.
+  tag: lag_residual_trf_cfs_target_only_a
+
+  # AND THIS. The reference arm runs the identical file at a different seed; anything else that
+  # differed between them would confound the comparison the reference exists to make.
+  seed: 42
+
+model_config:
+  VAE_model:
+    # The arm. Everything above follows from it.
+    source_disabled: true
+
+    # INHERITED AT 1.0 DELIBERATELY, and the alternative is worth stating because it is one leaf.
+    #
+    # On this arm the full and base reconstruction terms are bitwise identical, so the objective
+    # weights the reconstruction twice: the gradient on every shared parameter is 2*grad(D_base).
+    # Setting `lambda_full: 0.0` would make the objective literally the target-only one, a single
+    # reconstruction term against the prior rate.
+    #
+    # It is left at 1.0 because the candidate this baseline is compared against also carries two
+    # reconstruction terms, so the effective optimisation scale matches — which is what "same
+    # optimization" asks for, and the thing that would otherwise differ between the two runs for a
+    # reason that has nothing to do with the source.
+    #
+    # Nothing rests on the choice for MODEL SELECTION: `nll_full_block` is one branch's unweighted
+    # block score and is directly comparable across arms whatever the loss weights were.
+    lambda_full: 1.0
+
+    # FRESH, so the calibrated initialisation applies: this arm is trained from scratch, unlike the
+    # candidate that starts from its checkpoint.
+    head_init_calibration: true

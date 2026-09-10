@@ -1,0 +1,469 @@
+# The lag-residual causal-feature forecaster: the production training configuration.
+#
+# The model forecasts the next H stored steps of the one-sided FHR feature future -- the target
+# channels surviving `causal_warmup_budget_steps` under the integer phase operator -- from a single
+# shared latent. A target-only prior defines that latent; uterine activity makes a bounded residual
+# correction to the parameters of a second Gaussian over the same space; one decoder is invoked on a
+# paired sample from each, and the divergence between the two is the source-conditioned coupling
+# readout.
+#
+# WHAT IS DIFFERENT FROM THE LAG-ATTENTIVE SIBLING, since every key below has to be read against it.
+# The source pathway is replaced entirely: a pointwise representation of each available coefficient,
+# one local proposal per lag, and an explicit sum at the latent-parameter boundary. There is no
+# attention over the source, no head-structured posterior and no independently bounded posterior
+# log-variance, so every key naming one of those is ABSENT here and the constructor refuses it by
+# name rather than ignoring it. The metadata clock is explicit and unconditional, so there is no
+# `prior_availability_input` arm. Both branches are always sampled under one shared noise draw, so
+# there is no `base_decode` arm.
+#
+# STANDALONE, with no `base:` chain, and that is deliberate. Basing this on the sibling's default
+# would inherit exactly the keys this architecture refuses, and the run would fail at construction
+# with a message about a key the operator never wrote.
+#
+# SEVERAL SETTINGS BELOW ARE PROPOSED STARTING VALUES RATHER THAN MEASURED OPTIMA. Each is marked.
+# Nothing here has been trained.
+
+general_config:
+  tag: lag_residual_trf_cfs_baseline
+
+  seed: 42
+  cuda_devices: [0, 1, 2, 3, 4, 5, 6]
+
+  # AdamW, matching the family's optimizer builder: betas (0.9, 0.95), eps 1e-8, and this weight
+  # decay applied to every trainable parameter.
+  lr: 0.0003
+  weight_decay: 0.0001
+
+  # Epoch milestones, each multiplying the learning rate by 0.1. PROPOSED, not measured: the run
+  # they were chosen against is the sibling's, and this architecture's optimisation has not been
+  # observed. Record the resolved scheduler state with the run; a config key is not evidence that a
+  # schedule executed.
+  lr_milestone: [400, 800]
+
+  # A step-granular linear ramp from a tenth of the learning rate to all of it, over this many
+  # optimizer steps. A pre-normalised attention stack needs it in exactly its first few hundred
+  # steps, which an epoch-granularity schedule cannot address at all.
+  lr_warmup_steps: 2000
+
+  # The diagnostic figure's cadence, and the loss curve's. The per-epoch page is NOT enabled for
+  # this model (see `advanced_config.callbacks`), so this drives the loss curve alone.
+  plot_frequency: 5
+
+  epochs: 5000
+  accumulate_grad_batches: 1
+
+  # Reduce if a training step does not fit. MEASURED at the production geometry: one training step
+  # peaks at about 8145 MiB per device here, and it scales very nearly linearly -- 4094 MiB at 64,
+  # 2059 MiB at 32. `anchor_chunk` / `lag_chunk` below do NOT help a training step, which is a
+  # measurement rather than an expectation, so this is the setting to reach for first.
+  batch_size:
+    train: 128
+    test: 128
+
+  folders_config:
+    out_dir_base: /data/deid/isilon/MS_model/new_vae_teb_cross_attention/lag_slot_transformer_cfs
+
+model_config:
+  VAE_model:
+    # ---------------------------------------------------------------------------------------
+    # The objective
+    # ---------------------------------------------------------------------------------------
+    # The divergence ramp. Linear from zero to one over the first 50 joint-training epochs, so the
+    # reconstruction establishes a forecast before the information penalty binds. Record the epoch
+    # origin and the resume position with the run: a ramp is a function of the epoch counter, and a
+    # resume that restarts it trains a different objective from the one the config describes.
+    beta_schedule:
+      kind: linear_warmup
+      start: 0.0
+      end: 1.0
+      warmup_epochs: 50
+
+    # No floor. A positive value makes the trained divergence exceed the raw one by construction,
+    # and only the raw one may be read as a rate.
+    free_bits: 0.0
+
+    # The prior's scale rate. Nothing else in the objective penalises a NARROW prior: the
+    # reconstruction strictly prefers a deterministic latent, and the divergence constrains the full
+    # distribution against the prior without constraining the prior's own scale. Without this term
+    # the prior log-variance falls onto its bound and the divergence stops being a rate.
+    beta_prior: 0.1
+
+    likelihood: gaussian_nll
+
+    # Both reconstruction terms at one. The base branch must be good on its own, or the residual
+    # branch can win by re-deriving what a weak baseline failed to learn -- which is a positive
+    # predictive gain with no source information in it.
+    lambda_full: 1.0
+    lambda_base: 1.0
+
+    # ---------------------------------------------------------------------------------------
+    # Geometry
+    # ---------------------------------------------------------------------------------------
+    d_model: 128
+    d_z: 64
+
+    # Ten stored steps of future, on the stored clock.
+    horizon: 10
+
+    # Raw samples per stored step. Carried for the trimmed-grid geometry every mask is built
+    # against; this target domain scores coefficients rather than raw samples.
+    raw_per_step: 16
+
+    warmup_period: 134
+    sequence_length: 300
+
+    # Declared widths under the integer phase operator, before the warm-up gate.
+    c_y: 80                # 36 scattering + 44 phase
+    c_u: 46                # 36 scattering + 10 phase
+    use_up_st: true
+
+    dropout: 0.1
+    logvar_clamp: [-5.0, 3.0]
+    mu_scale: 5.0
+    coverage_floor: 0.9
+
+    # ---------------------------------------------------------------------------------------
+    # The source pathway
+    # ---------------------------------------------------------------------------------------
+    # Candidate lags 0..90, so L = 91.
+    max_lag: 90
+
+    # The mean bound, IN PRIOR STANDARD DEVIATIONS. Not the sibling's raw-latent-unit bound, which
+    # is why that key is refused rather than reused: the same number would mean a different model.
+    # PROPOSED starting value.
+    residual_mu_scale: 3.0
+
+    # The bound on the log-standard-deviation residual, so the full scale stays within a factor of
+    # e of the prior's in either direction. Both signs are permitted: extra evidence can raise or
+    # lower conditional uncertainty for a particular observation, and requiring a reduction would be
+    # an assumption about the physiology rather than a numerical guard. PROPOSED starting value.
+    residual_logsigma_scale: 1.0
+
+    # The summation convention. Null resolves to L raised to the power minus one half, once, from
+    # the CONFIGURED lag count. It is never renormalised by the number of currently available lags:
+    # that would make the same evidence weigh differently at two anchors, and the resulting drift
+    # would read as a physiological gradient.
+    lag_scale: null
+
+    lag_embed_dim: 8
+
+    # Body width of the shared proposal head. Null uses d_model, which is the shape the
+    # architecture is specified at.
+    proposal_hidden: null
+
+    # ---------------------------------------------------------------------------------------
+    # THE ARMS
+    #
+    # Every one of them changes the module tree rather than a branch in the forward, so an arm is a
+    # different checkpoint rather than a flag read at runtime -- which is what stops a run from
+    # quietly being one arm while its configuration describes another, and what makes a strict load
+    # across two arms refuse instead of silently reshaping.
+    #
+    # All off here, so this file is the recommended joint candidate. Each comparator arm ships as
+    # its own file, a delta on this one, and each changes ONE of the leaves below so that a
+    # difference between two of them is attributable to that leaf:
+    #
+    #   target_only.yaml          source_disabled          the whole source pathway
+    #   capacity_control.yaml     source_values_withheld   the source VALUES, capacity held
+    #   mean_only.yaml            mean_only_residual       the variance half of the update
+    #   pointwise_attention.yaml  lag_fusion               the fusion, representation held
+    #   attention_reference.yaml  source_stem              the temporal convolution, fusion held
+    #
+    # Read as a chain: attention_reference -> pointwise_attention isolates the convolution stem,
+    # pointwise_attention -> this file isolates the fusion, and this file -> the remaining three
+    # isolates the variance update, the source values and the pathway.
+    # ---------------------------------------------------------------------------------------
+    mean_only_residual: false
+    source_scalar_lift: false
+
+    # TRUE builds no source pathway at all -- no pointwise encoder, no lag embeddings, no proposal
+    # head -- giving the target-only forecaster this candidate is warm-started from and measured
+    # against. On that arm the full distribution IS the prior, the divergence is exactly zero, and
+    # `nll_full_block` and `nll_base_block` are identical in every row, which is the self-check that
+    # a run labelled target-only really was one. See `target_only.yaml`, which sets it.
+    source_disabled: false
+
+    # TRUE builds the source pathway whole and emits an exact zero in place of every source
+    # coefficient, so the fusion reads lag identity and the availability announcement and no value.
+    # The parameter count, the optimizer state and the checkpoint key set are this file's exactly,
+    # which is what makes a predictive gain on that arm evidence about extra nonlinear target
+    # capacity rather than about the source. See `capacity_control.yaml`.
+    source_values_withheld: false
+
+    # How each lag's source vector is formed. `pointwise` is the recommended representation: value
+    # and availability per coefficient, nothing mixing two stored times, and an additional neural
+    # source receptive field of one stored sample. `conv` is the comparator that keeps the causal
+    # convolution stack this design replaced, so that its removal can be measured on its own. Note
+    # that the comparator's reach is the stem's, which is the resolution floor of any lag readout
+    # taken over it, and the run discloses that number rather than assuming it.
+    source_stem: pointwise
+
+    # How the per-lag vectors become the latent update. `local` is the recommended explicit sum of
+    # one proposal per lag. `attention` is the comparator's learned distribution over lags;
+    # everything downstream of it -- the bound, the residual parameters, the divergence, the paired
+    # sampling, the decoder, the objective -- is identical, which is the condition that makes a
+    # difference between the two attributable to the fusion.
+    #
+    # It also changes what a band-suppression margin MEANS: removing a lag from a sum leaves the
+    # other terms standing, and removing it from a normalised distribution grows them. Each arm's
+    # margin is read against its own matched branch and never against another arm's.
+    lag_fusion: local
+
+    # Attention heads on the comparator's fusion; it must divide d_model. Inert under `local`. It
+    # splits the attention and nothing else -- no arm here has a head-structured latent, which is
+    # why the sibling's `num_heads` is refused rather than reused.
+    lag_attention_heads: 4
+
+    # Peak-memory settings. Null evaluates every anchor and every lag in one pass.
+    #
+    # MEASURED at the production geometry, 2026-09-09, on one 12 GiB device, ungated at the declared
+    # widths (an upper bound on the gated model). The finding is that these two bound the peak of an
+    # EVALUATION step and do essentially nothing for a TRAINING step:
+    #
+    #   train, batch 128:         8145 MiB unchunked, 8147 MiB at (39, 22) -- flat
+    #   dense evaluation, 128:    4447 MiB unchunked, 2309 MiB at (39, 22) -- down 48%
+    #   dense with proposals:     4447 MiB unchunked, 3277 MiB at (39, 22) -- down 26%
+    #
+    # The reason is that chunking changes the ORDER the proposals are computed in and not whether
+    # their activations are retained: under backward every chunk stays in the graph until the
+    # gradient has flowed, so the training peak is set by the batch size and by nothing here. Reach
+    # for `batch_size.train` first when a training step does not fit, and for these when a dense
+    # evaluation does not.
+    #
+    # They change floating-point summation order, so a run that sets them must record them -- which
+    # the resolved config does. Measured at the production widths, the bounded update moves by
+    # 1.2e-05 and the decoder output by 2.4e-07 against an unchunked pass, on a repeat-run floor of
+    # exactly zero.
+    anchor_chunk: null
+    lag_chunk: null
+
+    # ---------------------------------------------------------------------------------------
+    # The target encoder
+    # ---------------------------------------------------------------------------------------
+    encoder_conv_kernels: [5, 9]
+    encoder_conv_dilations: [1, 2]
+    encoder_num_heads: 4
+    encoder_d_ff: 512
+    target_attention_blocks: 6
+
+    # ---------------------------------------------------------------------------------------
+    # The causal representation
+    # ---------------------------------------------------------------------------------------
+    # The two-sided reach budget, refused alongside the warm-up budget: the reach quantile is
+    # measured on a bank that did not produce these coefficients.
+    causal_reach_budget_s: null
+
+    # The warm-up budget, in stored steps. Resolves the four channel tuples the network takes and
+    # the novelty vector its readouts split by. It names no constructor argument itself, so the
+    # driver's signature sweep drops it and the resolver reads it instead.
+    causal_warmup_budget_steps: 134
+
+    # No input-channel alignment: every channel is read at its own availability time.
+    causal_align_reference: null
+    causal_align_reference_source: null
+
+    # The stored clock. Labels are the next H stored coefficients of each kept channel, at its own
+    # stored index.
+    causal_target_forecast_clock: stored
+
+    causal_leg_alignment: envelope
+    causal_phase_operator: integer_harmonic_v1
+
+    # ---------------------------------------------------------------------------------------
+    # Anchors and the scored block
+    # ---------------------------------------------------------------------------------------
+    # Training tiles at this stride with a per-segment phase keyed on the recording, the segment
+    # start, the epoch and the seed. Validation and test decode the dense range.
+    anchor_stride: 5
+
+    lag_floor: 0
+
+    # The channel weighting states a RATIO between the two stored target blocks and is renormalised
+    # to leave the block's scale alone, so (1.0, 0.1) and (10.0, 1.0) describe one objective. With
+    # the kept channel set this arm resolves, the phase block takes about a twelfth of the total
+    # channel weight.
+    #
+    # A weighted block score is NOT a log density in nats, so a weighted run's reconstruction
+    # columns are not comparable in nats with an unweighted run's.
+    target_weight_st: 1.0
+    target_weight_ph: 0.1
+
+    # The horizon weighting's half-life, in stored steps, normalised to leave the block's magnitude
+    # alone. The far steps are the majority of the block and are the ones a fast channel cannot
+    # forecast at all, so a uniform score pays the model to widen its variance everywhere rather
+    # than predict the level anywhere.
+    horizon_weight_halflife_steps: 5.0
+
+    # ---------------------------------------------------------------------------------------
+    # The shared decoder
+    # ---------------------------------------------------------------------------------------
+    decoder_hidden: 256
+    horizon_depth: 4
+    horizon_kernel: 3
+    horizon_film: true
+    horizon_attention_blocks: 2
+
+    # Permitted because it operates on forecast tokens generated from the latent, never on source
+    # history: no future observed value reaches the decoder.
+
+    horizon_embed_std: 0.8
+
+    # Place the decoder and the prior scale on the trivial predictor at initialisation. For a
+    # FRESHLY trained model only -- a run warm-started from a target-only checkpoint must turn this
+    # off, or the transfer is discarded by the calibration that follows it.
+    head_init_calibration: true
+
+    # The decoder's mean carries a weighted copy of the anchor's own target vector. Target-only,
+    # identical in both branches, and it enters the mean head alone, so it cancels from the
+    # difference of predicted means. Turn it off only in a named strict latent-only arm, alongside
+    # an equally configured source-free comparator.
+    persistence_residual: true
+
+  # A STRICT load of a checkpoint of this exact model kind -- every key must align, the source
+  # pathway included -- or null for a fresh model. It is a resume, not a warm start.
+  core_model_checkpoint: null
+
+  # A PARTIAL, audited transfer from a TARGET-ONLY checkpoint: the target encoder, the prior, the
+  # metadata clock projection, the horizon core and the decoder are copied, and the source pathway
+  # is left at exactly zero so a jointly trained run begins by asserting that the source says
+  # nothing. Null here; `joint.yaml` is the arm that sets it.
+  #
+  # The two keys are refused TOGETHER, because one restores the source pathway and the other
+  # deliberately leaves it at zero, so a run setting both has a starting point neither describes.
+  # When this is set, turn `head_init_calibration` off -- the calibration would overwrite the very
+  # tensors the transfer just copied.
+  target_warm_start_checkpoint: null
+
+
+dataset_config:
+  vae_train_datasets:
+    - /data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_causal_int/pre_training_dataset/train_dataset_cs.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_causal_int/pre_training_dataset/train_dataset_no_cs.hdf5
+  vae_test_datasets:
+    - /data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_causal_int/pre_training_dataset/test_dataset_cs.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_causal_int/pre_training_dataset/test_dataset_no_cs.hdf5
+
+  stat_path: /data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_causal_int/stats.hdf5
+
+  dataloader_config:
+    num_workers: 8
+    prefetch_factor: 4
+
+    # Both target blocks must be here. Without them the target arrives at its stored scale, the
+    # Gaussian score is computed against a standardized variance model, and the run trains a
+    # meaningless objective to completion with nothing raising.
+    normalize_fields: ['fhr', 'up', 'fhr_st', 'fhr_ph', 'up_st', 'up_ph']
+
+    dataset_kwargs:
+      pin_memory: false
+
+      # `guid` and `epoch` are not optional: the anchor tiling's phase is keyed on them, and
+      # without either every segment sits on one tile grid forever with no shape or count differing.
+      load_fields:
+        [
+          'fhr',
+          'up',
+          'fhr_st',
+          'fhr_ph',
+          'up_ph',
+          'up_st',
+          'weight',
+          'guid',
+          'epoch',
+        ]
+      allowed_guids: null
+      cs_label: null
+      bg_label: null
+      epoch_min: -48000
+      epoch_max: null
+      label: null
+      cache_size: 0
+      trim_minutes: 1.0
+
+
+advanced_config:
+  trainer:
+    precision: "32-true"
+
+    # INHERITED STARTING GUARDS, not validated thresholds for this head. The clip was measured
+    # against the sibling's gradient distribution over a block of the same width; this
+    # architecture's has not been observed. Re-measure the pre-clip gradient-norm distribution and
+    # the skipped-batch rate on a training-only pilot before treating either number as tuned.
+    gradient_clip_val: 3500.0
+    gradient_clip_algorithm: "norm"
+
+    sync_batchnorm: false     # there is no BatchNorm anywhere in this model
+    deterministic: false
+    benchmark: true
+
+    # Off, and it must stay off: the objective performs a data-dependent boolean mask indexing for
+    # the active-coordinate fraction and the prior-floor watch.
+    compile: false
+
+    log_every_n_steps: 25
+    num_sanity_val_steps: 0
+    use_distributed_sampler: true
+    profiler: simple
+
+  logging:
+    console_level: INFO
+    file_level: INFO
+    json_log: true
+    console_diagnose: false
+    rotation: "100 MB"
+    retention: "14 days"
+
+  spike_breaker:
+    enabled: true
+    multiplier: 5.0
+    ema_decay: 0.02
+    warmup_batches: 100
+    comparison_metric: main_loss
+    ema_floor: 1.0e+9
+
+    # INHERITED, like the clip above. The Gaussian negative log likelihood is not bounded below by
+    # zero, which a spike detector configured on an assumption of non-negativity gets wrong.
+    additive_margin: 2.2e+3
+
+    max_consecutive_skips: 25
+
+  tracking:
+    mlflow:
+      enabled: true
+      tracking_uri: "http://localhost:5000"
+      experiment_name: seqvae-teb-lag-residual-trf-cfs
+      run_name: lag_residual_trf_cfs_intphase_unaligned_stored
+      artifact_location: null
+      log_model: true
+      log_checkpoints: false
+      log_config_artifact: true
+      tags:
+        project: teb_vae
+        stage: dev
+        variant: lag_residual_trf_cfs_intphase_unaligned_stored
+
+  callbacks:
+    early_stopping:
+      enabled: true
+      monitor: "val/total_loss"
+      patience: 50
+      min_delta: 0.0001
+
+    model_checkpoint:
+      monitor: "val/total_loss"
+      save_top_k: 3
+      mode: "min"
+
+      # A SECOND criterion, because the two optima are not the same epoch: the composite total and
+      # the conditioned forecast alone bottom at different points, and keeping only the first means
+      # the weights that forecast best are not on disk.
+      secondary_monitor: "val/nll_full_block"
+
+    # THE PER-EPOCH DIAGNOSTIC PAGE IS DELIBERATELY ABSENT. The shared page draws a lag-attention
+    # matrix and a divergence-by-lag map, and this architecture computes neither: there is no
+    # attention distribution, and no nonnegative per-lag allocation of the divergence exists for it,
+    # because the cross terms in the summed update can reinforce or cancel. Enabling the block would
+    # raise inside a handler that warns and continues, costing two rows and one log line with a
+    # green suite. A page whose lag rows draw proposal suppression and the cancellation ratio is
+    # separate work, and it wants the evaluation package's readouts to have been run on a real arm
+    # first so the layout is settled.

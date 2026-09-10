@@ -740,6 +740,58 @@ second-stage axis with the onset marked at zero.
 **How it is misread.** As that page, and with the same population caveat as the second-stage profile
 page above.
 
+## `lag_high_kl/lag_high_kl_time_to_delivery_histogram.pdf`
+
+**In plain terms.** *"For the timesteps that carry the coupling, what does the spread of attention
+across the lags actually look like — and does that shape differ between the classes, or move as
+delivery approaches?"* Every other `lag_high_kl` page reduces that spread to a centroid or a share
+before showing it. This one draws the distribution.
+
+**What it shows.** Four blocks, both profile sources side by side in every row — `attn` on the left,
+`kl` on the right. **Rows 1–2:** the classes overlaid, one step curve each, for the `high` band and
+then the `top` band, pooled over every window of the clock; the legend carries each class's delivery
+count. **Rows 3 onward, one per class:** that class's `high`-band distribution drawn once per time
+window, coloured light-to-dark along the clock, the legend naming each window's centre in hours and
+its recording count; windows below three recordings are drawn hairline-dashed and left out of the
+legend. **Bottom left:** the Jensen–Shannon distance of each window against its own class's
+distribution pooled over the whole clock — a class whose lag structure is stationary sits flat and
+low. **Bottom right:** the $1$-Wasserstein distance between the classes in each window, in seconds.
+
+**Axes.** Stored-coefficient lag in seconds across on every distribution panel, share of the
+distribution up. Hours before delivery across on the two bottom panels, drawn with delivery at the
+right; Jensen–Shannon (base $2$, bounded by $1$) and seconds up respectively.
+
+**How it is misread.** Five ways.
+
+- **It is a distribution per recording, then averaged — not a pooled histogram.** Each recording is
+  normalised before the cell mean, so a recording carrying ten times the coupling of its neighbours
+  counts once, not ten times. This is why the shape here can differ from the heatmap on
+  `lag_high_kl_time_to_delivery.pdf`, which normalises after averaging and therefore reports where a
+  cohort's coupling *mass* sits. Neither is wrong; they answer different questions.
+- **Nothing on this page carries a $p$-value.** Both distances are descriptive. A distance between
+  two estimated distributions is positive almost surely even when the two populations coincide, so a
+  non-zero value is not evidence of a difference — read it beside the recording counts on the row.
+- **The two columns are not a consistency check, they are the finding.** `attn` counts every
+  selected timestep once; `kl` weights each by how far the source moved the belief there. A shift
+  visible in one column and absent from the other says which readout is carrying it.
+- **A blank in the colour ramp is a window with no scored recording**, not a window where the
+  distribution collapsed.
+- **The lag axis is stored-coefficient time.** A distance quoted in seconds is a displacement on
+  that axis and not a change in physiological latency; the caveat at the foot of the page applies to
+  every number on it.
+
+## `lag_high_kl/lag_high_kl_second_stage_histogram.pdf`
+
+**In plain terms.** The same page against the second clinical landmark: does the lag distribution of
+the coupling-carrying timesteps change around second-stage onset?
+
+**What it shows and its axes.** As `lag_high_kl_time_to_delivery_histogram.pdf`, with the two bottom
+panels on the signed second-stage axis and the onset marked at zero.
+
+**How it is misread.** As that page, and with the same population caveat as the second-stage profile
+page above: the recordings scored here are those carrying an onset, a strict subset of the cohort,
+so a class's distribution on this page and on the delivery page are over different populations.
+
 ## `lag_high_kl/lag_high_kl_usefulness.pdf`
 
 **In plain terms.** *"Is the model learning anything useful from the lags?"* — asked in forecast

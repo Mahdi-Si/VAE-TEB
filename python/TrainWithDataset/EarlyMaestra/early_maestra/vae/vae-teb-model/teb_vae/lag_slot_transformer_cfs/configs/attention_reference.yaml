@@ -1,0 +1,70 @@
+# THE RETRAINED ATTENTION REFERENCE: the convolution stem and the lag attention, under this
+# architecture's own sampling policy, clock, residual equations and objective.
+#
+# WHAT IT IS FOR. The evidence that motivated this design is a checkpoint of a different package,
+# and it differs from the candidate in the source stem, the lag fusion, the residual
+# parameterisation, the metadata encoding and the sampling policy ALL AT ONCE. A comparison against
+# it measures that package. This file holds four of those five fixed and moves the source stem
+# alone, so that "removing the source temporal convolution changed the gap by this much" is a
+# statement about the stem.
+#
+# WHY IT IS AN ARM OF THIS PACKAGE RATHER THAN A CONFIGURATION OF THE SHIPPED FORECASTER. Because
+# the four things it has to hold fixed are things the shipped forecaster does not have. It decodes
+# its base branch at the prior mean rather than under a shared draw, so its base and full columns
+# are two estimators; it encodes a zeroed source through the source network to form its prior clock
+# rather than reading an explicit function of stored position; and its posterior log-variance is an
+# independently bounded head rather than a bounded residual on the prior's, so its divergence is a
+# different quantity with a different range. Making it a configuration arm there would change the
+# shipped model, and the numbers of four trained forecasters with it.
+#
+# WHAT THIS ARM AND `pointwise_attention.yaml` DIFFER IN. One leaf, `source_stem`. Everything else
+# in both files is identical, including the fusion. That is the pair that isolates the convolution.
+#
+# WHAT THE STEM DOES TO A LAG READOUT, and it is the reason this arm's disclosure carries a number
+# the recommended arm's does not. Its output at one stored step summarises a bounded window ending
+# there, so two lags closer together than that reach are summaries of overlapping windows. The
+# resolution floor of every band margin on this arm is that reach, the run discloses it read off the
+# module rather than written down, and a band narrower than it is not resolving what its name says.
+#
+# THE ADAPTER IS THE SAME ONE THE TARGET STREAM USES, resolved by the same rule: each channel's
+# warm-up wait combined with whatever shift the gate applied. The per-channel availability is
+# resolved before the stem runs and travels beside the state, so the exposure readout reports the
+# same counts on this arm as on the pointwise ones and two arms' exposure tables are comparable.
+#
+# MEMORY. Measure before launching:
+#   python -m teb_vae.lag_slot_transformer_cfs.eval.memory \
+#       --config teb_vae/lag_slot_transformer_cfs/configs/attention_reference.yaml
+#
+# RUNNING IT
+#   python -m teb_vae.lag_slot_transformer_cfs.trainer \
+#       --config teb_vae/lag_slot_transformer_cfs/configs/attention_reference.yaml
+
+base: pointwise_attention.yaml
+
+general_config:
+  tag: lag_residual_trf_cfs_attention_reference
+
+  seed: 19
+
+model_config:
+  # REPOINT THIS at the same target-only checkpoint every other arm starts from.
+  #
+  # The transfer copies the target encoder, the prior, the clock projection and the decoder and
+  # leaves the source pathway at zero. This arm's source pathway is larger than the candidate's --
+  # it carries an adapter and a convolution stack the pointwise arms do not -- and every tensor of
+  # it is reported as left-as-constructed in the transfer log, which is the expected reading here
+  # rather than a warning.
+  target_warm_start_checkpoint: REPOINT_ME_target_only_a_checkpoint.ckpt
+
+  VAE_model:
+    # The arm. Everything above follows from it.
+    source_stem: conv
+
+    # The stem's schedule is the target encoder's, above: the same kernels and dilations the
+    # evaluated source path used, so its reach is that path's reach and this arm reproduces the
+    # representation being compared against rather than a differently shaped one.
+
+    # Refused alongside the convolution stem, and named here so a reader does not have to discover
+    # it at launch: the scalar lift is a per-coefficient widening of a representation this stem does
+    # not produce.
+    source_scalar_lift: false

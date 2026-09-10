@@ -1,0 +1,121 @@
+# THE PREDECLARATION. Written before any arm was trained, and its whole value is that it was.
+#
+# An acceptance record names the digest of this file. A comparison added after a result has been
+# seen, a band added to a search that had already peaked somewhere else, a seed minimum lowered
+# until an arm qualified -- each is invisible in the numbers it produces and each changes the
+# digest. That is the only mechanism here: nothing stops the file being edited, and everything
+# says that it was.
+#
+# The three settings most worth not moving are the seed minimum, the draw count the primary
+# comparisons are read at, and the band list. Moving the first turns a two-seed accident into
+# evidence; moving the second reads two arms under two estimators; moving the third is a search
+# whose family is chosen after its peak.
+#
+# Read by `teb_vae/lag_slot_transformer_cfs/eval/acceptance.py`, whose key set is closed: a key
+# that is not below raises and names the valid set, so a misspelling cannot silently mean "no
+# minimum".
+
+declared_on: 2026-09-09
+
+# Bumped by hand whenever anything below changes, so two records naming two digests also name two
+# revisions rather than leaving a reader to diff them.
+revision: 1
+
+
+protocol:
+  # Training seeds a shortlisted arm needs before its comparisons are read. Three is the design's
+  # floor. An arm with fewer is reported with its count and its comparisons stay INCONCLUSIVE:
+  # a single seed's result is a draw from the optimiser as much as a property of the architecture.
+  minimum_training_seeds: 3
+
+  # Monte Carlo draws the PRIMARY comparisons are read at. Every run in one comparison must have
+  # been scored at this count: the negative logarithm of an average likelihood is upward biased at
+  # finite K and two arms' biases need not cancel, so a comparison across two draw counts is a
+  # comparison of two estimators.
+  primary_draws: 32
+
+  # Draw counts a finalist is rescored at, to show the conclusion does not move with the estimator.
+  # Reported rather than gated: a conclusion that survives 8 to 128 is evidence, and where the
+  # boundary of "stable enough" sits is what the first real runs measure.
+  stability_draws: [8, 32, 128]
+
+  # Resamples behind every interval in the record, drawn over RECORDINGS. The same count the
+  # scoring pass uses, deliberately: an interval here and an interval in a summary must be
+  # comparable, and two resample counts would make the acceptance interval the narrower one for a
+  # reason that is about this file.
+  bootstrap_resamples: 2000
+
+  # Seed for the resampling, so an acceptance record is reproducible from its own inputs.
+  bootstrap_seed: 42
+
+  # Coverage of every interval reported at the nominal level. The exploratory band family is
+  # additionally reported at a family-adjusted level, which the pass derives from this and from
+  # how many bands were actually searched.
+  confidence: 0.95
+
+
+# THE PRIMARY COMPARISONS, and each is one declared change.
+#
+# `left` and `right` name arms, resolved from each run's own recorded leaves rather than from a
+# directory name. Every column below is a negative log density in nats per anchor, so a NEGATIVE
+# difference favours the left arm; the pass reports the difference and the improvement it implies
+# under that one convention rather than carrying a direction on each entry.
+#
+# The chain is the one the arm configurations were built as, and the order matters: each adjacent
+# pair differs in exactly one constructor leaf, so a difference between them is attributable to
+# that leaf and to nothing else. A comparison between two arms further apart in the chain measures
+# a package of changes, which is why none is declared here.
+primary_comparisons:
+  - name: source_temporal_convolution
+    left: pointwise_attention
+    right: attention_reference
+    column: nll_full
+    isolates: >-
+      the source temporal convolution. Both arms aggregate over lags by attention; only the
+      right-hand one reaches past a single stored source time before doing so.
+
+  - name: attention_against_the_explicit_sum
+    left: candidate
+    right: pointwise_attention
+    column: nll_full
+    isolates: >-
+      how the per-lag updates are combined. Both read one stored source time per proposal; the
+      left sums them under a fixed scale and the right normalises a distribution over them.
+
+  - name: the_variance_update
+    left: candidate
+    right: mean_only
+    column: nll_full
+    isolates: >-
+      whether changing the latent's scale helps. The right-hand arm builds no scale head at all,
+      so its posterior scale is the prior's exactly.
+
+  - name: the_source_values
+    left: candidate
+    right: capacity_control
+    column: nll_full
+    isolates: >-
+      the source VALUES rather than the source pathway. The right-hand arm holds the whole
+      pathway, its lag identities and its masks, and withholds only what the coefficients say.
+
+  - name: the_pathway_entire
+    left: candidate
+    right: target_only
+    column: nll_full
+    isolates: >-
+      the source pathway and its parameter budget together. The widest of the five and the only
+      one whose right-hand arm has no source pathway to intervene on.
+
+
+# THE EXPLORATORY LAG BANDS. A search, and declared as one.
+#
+# The band carrying the largest suppression margin is chosen on the same data its interval is built
+# from, so a nominal interval on the winner would cover less than it claims. Every band here is
+# additionally reported at a family-adjusted level whose family is the bands actually searched,
+# which gives all of them simultaneous coverage -- and a member selected out of a simultaneously
+# covered family keeps that coverage however it was selected.
+#
+# These are the production partition's names. A run that searched FEWER is read with the smaller
+# family and the record says so. A run that searched a band this list does not name is a search
+# whose family was chosen after the fact, and the pass fails it by name.
+exploratory_bands: [anchor, near, mid, far]
