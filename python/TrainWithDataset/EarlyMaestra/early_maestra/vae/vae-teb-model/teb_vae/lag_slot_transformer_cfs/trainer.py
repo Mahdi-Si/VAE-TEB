@@ -279,8 +279,9 @@ class LagResidualTrfCfsTrainer(LagAttnCfsTrainer, LagAttnTrfRwsTrainer):
 
     ``PLOT_CONFIG_KEY`` deliberately stays the shared driver's literal. The callback assembly reads
     it, and a sibling that renames it to match its own package gets no figure, no error and nothing
-    in the log saying why. This model does not enable the block at all, for the reason its task
-    records.
+    in the log saying why. What this class re-points instead is ``plot_callback_cls``, because the
+    page the shared callback draws is not one this architecture can be drawn on; see
+    :mod:`~teb_vae.lag_slot_transformer_cfs.sample_page`.
     """
 
     MODEL_CLS = SeqVaeLagResidualTrfCfs
@@ -304,6 +305,26 @@ class LagResidualTrfCfsTrainer(LagAttnCfsTrainer, LagAttnTrfRwsTrainer):
         + tuple(f"train/{name}" for name in _TRAIN_ONLY_SUFFIXES)
         + ("lr",)
     )
+
+    @classmethod
+    def plot_callback_cls(cls) -> type:
+        """Return this package's diagnostic-plot callback, importing it on the way.
+
+        A method rather than a class attribute so the import stays **lazy**: the callback pulls
+        matplotlib and the page module behind it, and a module-level attribute would import both
+        in every run whether or not the config asked for a figure. The shared assembly calls this
+        only inside its enabled branch.
+
+        Re-pointed away from the family's callback because that one runs a forward without the
+        per-lag proposals and hands the result to a page builder that reads two tensors this
+        architecture does not produce; see :mod:`~teb_vae.lag_slot_transformer_cfs.plotting`.
+
+        Returns:
+            The callback class the shared ``train_model`` constructs.
+        """
+        from teb_vae.lag_slot_transformer_cfs.plotting import LagResidualTrfCfsPlotCallback
+
+        return LagResidualTrfCfsPlotCallback
 
     def create_model(self) -> None:
         """Build the net, apply a target-only warm start if one is configured, and wrap it.

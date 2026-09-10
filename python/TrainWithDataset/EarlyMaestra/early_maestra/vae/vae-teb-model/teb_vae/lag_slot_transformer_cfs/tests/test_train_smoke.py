@@ -298,3 +298,30 @@ def test_a_written_checkpoint_rebuilds_the_model_and_its_invariants(fitted) -> N
         selector=torch.zeros(2, n_anchors, first.n_lags),
     )
     assert torch.equal(silenced["mu_post"], silenced["mu_prior"])
+
+
+def test_the_page_is_drawn_by_the_fit_itself(fitted) -> None:
+    """The end-to-end proof that the callback attaches and writes, which no unit test can give.
+
+    Everything up to here exercises the page from a hand-built task. This exercises the seam the
+    shared assembly actually walks: the configuration block, the driver's callback class, the
+    task's row seams, and a real batch out of a real loader. The callback swallows exceptions to
+    protect a multi-day fit, so a page that stopped being drawn in a real run would show up only
+    as one log line per epoch.
+    """
+    driver, _ = fitted
+    block = load_config(str(TINY_CONFIG))["advanced_config"]["callbacks"][
+        "lag_attn_rws_plotting"
+    ]
+    diagnostics = Path(driver.train_results_dir) / "lag_residual_trf_cfs_diagnostics"
+    assert diagnostics.is_dir(), "the callback never ran"
+
+    pages = sorted(diagnostics.glob(f"lag_residual_trf_cfs_epoch*.{block['file_format']}"))
+    # The smoke configuration draws every epoch; the count comes from the configuration rather
+    # than a literal so a changed cadence fails here instead of silently drawing fewer pages.
+    assert len(pages) == SMOKE_EPOCHS * int(block["num_examples"])
+    assert all(page.stat().st_size > 0 for page in pages)
+
+    # The run-level companion, written once for the whole fit whatever the epoch count: the
+    # callback's latch is what keeps a second one off the second validation pass.
+    assert len(list(diagnostics.glob("causal_warmup_budget.*"))) == 1

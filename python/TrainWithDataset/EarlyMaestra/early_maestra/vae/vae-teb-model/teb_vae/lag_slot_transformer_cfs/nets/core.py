@@ -680,6 +680,25 @@ class LagResidualCore(nn.Module):
             self._calibrate_output_heads()
             self._calibrate_prior_scale()
 
+    @property
+    def source_adapter(self) -> Optional[nn.Module]:
+        """The source stream's availability adapter, beside the target's under the family's name.
+
+        A **property**, not an attribute: the adapter is already a child of the source encoder,
+        and binding the same module to a second attribute would emit it twice in the state dict
+        and split every checkpoint this model writes.
+
+        Present only on the arm whose stem announces availability per **stored step**. The
+        pointwise arm announces it per gathered anchor-lag-channel window and has none, and the
+        target-only arm has no source pathway at all. ``None`` on both is what the family's
+        stream-panel builder reads as "nothing masked this stream per step", which is the truth
+        for them; a missing attribute would instead cost the page both of its input rows.
+
+        Returns:
+            The adapter, or ``None`` where the arm applies no per-step availability.
+        """
+        return getattr(self.source_encoder, "adapter", None)
+
     # ------------------------------------------------------------------
     # Construction hooks the mixins and this constructor call
     # ------------------------------------------------------------------

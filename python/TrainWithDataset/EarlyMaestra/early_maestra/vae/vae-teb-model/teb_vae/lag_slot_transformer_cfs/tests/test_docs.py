@@ -195,3 +195,24 @@ def test_every_public_function_and_class_carries_a_docstring() -> None:
             if ast.get_docstring(node) is None:
                 offences.append(f"{path.relative_to(PACKAGE_ROOT)}:{node.lineno}: {node.name}")
     assert offences == []
+
+
+def test_the_page_is_wired_by_the_shared_key_and_this_packages_own_callback() -> None:
+    """The one seam whose failure is a missing figure rather than an error.
+
+    The block name is the shared driver's literal because the callback assembly reads that key: a
+    name matching this package would get no figure, no error and nothing in the log. The callback
+    class is this package's because the family's runs a forward without the per-lag proposals and
+    hands the result to a builder that reads two tensors this architecture does not produce.
+
+    Both halves are asserted together because getting either one right on its own still leaves a
+    run with no page.
+    """
+    from teb_vae.lag_slot_transformer_cfs.plotting import LagResidualTrfCfsPlotCallback
+    from teb_vae.lag_slot_transformer_cfs.trainer import LagResidualTrfCfsTrainer
+
+    assert LagResidualTrfCfsTrainer.PLOT_CONFIG_KEY == "lag_attn_rws_plotting"
+    assert LagResidualTrfCfsTrainer.plot_callback_cls() is LagResidualTrfCfsPlotCallback
+
+    trainer_source = (PACKAGE_ROOT / "trainer.py").read_text(encoding="utf-8")
+    assert "`PLOT_CONFIG_KEY`` deliberately stays the shared driver's literal" in trainer_source

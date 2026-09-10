@@ -183,14 +183,37 @@ def test_the_stride_and_the_model_width_satisfy_the_constructor() -> None:
     assert block["d_model"] % 2 == 0
 
 
-def test_the_diagnostic_page_is_not_enabled() -> None:
-    """It draws an attention matrix this architecture does not compute.
+def test_the_diagnostic_page_keeps_the_shared_drivers_spelling() -> None:
+    """The block name is the shared driver's literal and must stay it.
 
-    Enabled, it raises inside a handler that warns and continues -- so the run would keep going,
-    the figure would never appear, and the suite would stay green.
+    The callback assembly reads that key. A name matching this package instead would get no
+    figure, no error and nothing in the log saying why -- so the key is interpolated from the
+    driver's own attribute here rather than repeated as a literal, and what this cell re-points is
+    the callback class, not the key.
     """
+    from teb_vae.lag_slot_transformer_cfs.trainer import LagResidualTrfCfsTrainer
+
     callbacks = load("default.yaml")["advanced_config"]["callbacks"]
-    assert "lag_attn_rws_plotting" not in callbacks
+    assert LagResidualTrfCfsTrainer.PLOT_CONFIG_KEY in callbacks
+    assert callbacks[LagResidualTrfCfsTrainer.PLOT_CONFIG_KEY]["enabled"] is True
+
+
+def test_the_smoke_configuration_draws_the_page_too() -> None:
+    """A smoke run that never drew it would leave the page's own path exercised by nothing.
+
+    The forward that retains the per-lag proposals, and the anchor arithmetic under every lag row,
+    run nowhere else in a fit.
+    """
+    # The shipped loader, not this file's helper: the helper merges shallowly per top-level block,
+    # which is enough for every model key it checks and not enough here -- the smoke variant
+    # overrides two keys of this block and inherits the third, three levels down.
+    from teb_vae.lag_attn.config import load_config
+
+    resolved = load_config(str(CONFIG_ROOT / "tiny.yaml"))
+    tiny = resolved["advanced_config"]["callbacks"]["lag_attn_rws_plotting"]
+    assert tiny["enabled"] is True
+    assert tiny["num_examples"] == 1
+    assert tiny["file_format"] == "png"
 
 
 def test_the_target_blocks_are_normalised() -> None:
