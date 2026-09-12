@@ -220,3 +220,16 @@ def test_a_length_mismatch_is_refused_rather_than_padded() -> None:
 
     assert np.isnan(record["jensen_shannon"])
     assert np.isnan(record["wasserstein_s"])
+
+
+def test_the_quantile_lags_are_the_first_bins_reaching_each_level() -> None:
+    """The same first-bin rule the stacked reducer applies, on one cell: a distribution with a
+    quarter of its mass in each of four bins reports those bins' lags for the quartiles."""
+    seconds = np.arange(6, dtype=np.float64) * 4.0
+    profile = np.array([0.0, 0.25, 0.25, 0.25, 0.25, 0.0])
+
+    lags = lag_hist.quantile_seconds(profile, seconds, (0.25, 0.5, 0.75))
+
+    assert lags.tolist() == [4.0, 8.0, 12.0]
+    assert np.isnan(lag_hist.quantile_seconds(np.zeros(6), seconds, (0.5,))).all()
+    assert np.isnan(lag_hist.quantile_seconds(profile[:-1], seconds, (0.5,))).all()

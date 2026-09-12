@@ -1037,11 +1037,13 @@ pooled KL attribution and the head-averaged attention at every contributing anch
 cannot either once a profile is flat. A directory collected before the sidecar existed records a
 named skip; re-collect to produce it.
 
-**Exactly two readouts are tested, on two clocks: four Holm families, none joint.** The high band's
+**Two readouts are tested per window on two clocks: four Holm families, none joint.** The high band's
 KL centroid `high_lag_centroid_kl_s` and the high-anchor share `high_anchor_frac`, per window with
 Kruskal–Wallis across classes, Holm across that clock's windows, and pairwise Mann–Whitney with
 Cliff's delta on the survivors — the same three layers and the same severity orientation every clock
-analysis uses — plus the one run-level paired usefulness test below. Everything else ships
+analysis uses — plus the one run-level paired usefulness test below. **Three shape features of the
+histogram are tested the same way** (six further families) and each is tested once more as a
+within-recording drift; both are described with the histogram half below. Everything else ships
 **untested** and the record says so: the `rest`, `top` and `gain` bands' clock trajectories, every
 attention-profile statistic, the hot-lag shares, the decile, argmax and occlusion-join tables and
 the contraction enrichment.
@@ -1086,7 +1088,7 @@ they travel everywhere else here — `attn` counts every selected timestep once,
 how far the source moved the belief — so a shift visible in one and absent from the other is a
 finding about which readout is being read.
 
-Three tables and two figures:
+Seven tables and six figures:
 
 - `lag_high_kl_histogram.csv` — one row per (clock, band, source, class, window, lag): the cell's
   mean density and its inter-quartile range over recordings. Each cell sums to one across the lags.
@@ -1106,8 +1108,29 @@ Three tables and two figures:
   the pooled cell rather than the first window, because "first" means opposite things on the two
   clocks and a reference defined by window order would silently differ between them.
 
-**Every histogram readout ships untested** and the record says so. A distance between two *estimated*
-distributions is positive almost surely even when the two populations coincide, so a value here
+- `lag_high_kl_histogram_significance.csv` and `lag_high_kl_histogram_pairwise.csv` — the tested
+  shape features, in the shape of `lag_high_kl_significance.csv` and `lag_high_kl_pairwise.csv` with
+  the band and source as columns. **Three features of the `high` band's `kl` histogram are tested,
+  per window on both clocks**: the median lag `hist_median_s`, the inter-quartile lag range
+  `hist_iqr_s` and the entropy `hist_entropy_nats` — one from each of the three scale-free families
+  `lag_shape.py` names (where, how wide, how concentrated), so each way two distributions can differ
+  is asked once. The centroid is deliberately not among them, because `high_lag_centroid_kl_s`
+  already tests the position of the same selection and a second family on it would ask one question
+  twice. Six Holm families, one per (clock, feature), each across that clock's windows, none joint
+  with the four above.
+- `lag_high_kl_histogram_drift.csv` and `lag_high_kl_histogram_drift_summary.csv` — the same three
+  features fitted **within each recording** along the clock: the least-squares slope of the feature
+  against forward labour time (the delivery clock's centres negated, so a positive slope means the
+  feature rises as delivery approaches on either clock) over every recording scored in at least
+  three windows, beside its last-minus-first difference. The per-window tests compare different
+  recordings in every window, so a moving class median can be a changing population; the slope is
+  the reading that cannot be. Per clock, two further Holm families across the three features: each
+  (feature, class) slope against zero by Wilcoxon signed-rank, and each feature's Kruskal–Wallis
+  across classes, with pairwise Cliff's delta on the survivors.
+
+**The cells themselves, both distances, every feature on the `attn` source and the `top` band, and
+every untested feature ship untested** and the record says so. A distance between two *estimated*
+distributions is positive almost surely even when the two populations coincide, so a value there
 describes two cells rather than showing that they differ; the recording counts travel on every row,
 and a cell below the shared minimum of three recordings is emitted with its counts and a `NaN`
 distance rather than the zero that would read as agreement. **No peak-lag histogram ships**: the
@@ -1155,10 +1178,10 @@ one row per recording over the whole population, is the source `cross_subgroup` 
 
 **It is `capped`**, for the reason `lag_clocks` is: the second-stage half scores the recordings that
 carry an onset only, by the shared eligibility rule. Both clocks' per-recording and trajectory
-tables, the per-window restricted profiles, the three histogram tables, the significance and
-pairwise tables, and eight figures — a run-level selection page, a run-level usefulness page and,
-per clock, a profile-and-trajectory page, a tested page and a lag-distribution page — are the
-outputs. The axis is stored-coefficient time and every one of them carries the caveat.
+tables, the per-window restricted profiles, the seven histogram tables, the significance and
+pairwise tables, and twelve figures — a run-level selection page, a run-level usefulness page and,
+per clock, a profile-and-trajectory page, a tested page, a lag-distribution page, a tested page for
+the histogram's shape features and a within-recording drift page — are the outputs. The axis is stored-coefficient time and every one of them carries the caveat.
 
 ### spectral_skill
 
