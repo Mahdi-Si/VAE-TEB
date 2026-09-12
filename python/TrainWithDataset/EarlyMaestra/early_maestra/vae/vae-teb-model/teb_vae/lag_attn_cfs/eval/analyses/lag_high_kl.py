@@ -108,7 +108,12 @@ from teb_vae.lag_attn_cfs.eval.lag_axis import (
     compensated_seconds_axis,
     read_lag_support,
 )
-from teb_vae.lag_attn_cfs.eval.lag_hist import cell_distances, normalise
+from teb_vae.lag_attn_cfs.eval.lag_hist import (
+    cell_distances,
+    centroid_seconds,
+    normalise,
+    quantile_seconds,
+)
 from teb_vae.lag_attn_cfs.eval.lag_shape import (
     DEGENERATE_PEAK_TO_MEDIAN,
     DEGENERATE_ZERO_FRACTION,
@@ -141,6 +146,12 @@ OCCLUSION_CONSISTENCY_FILENAME = "lag_high_kl_occlusion_consistency.csv"
 HISTOGRAM_FILENAME = "lag_high_kl_histogram.csv"
 HISTOGRAM_FEATURES_FILENAME = "lag_high_kl_histogram_features.csv"
 HISTOGRAM_DISTANCE_FILENAME = "lag_high_kl_histogram_distance.csv"
+#: The tested half of the histogram: the per-window class tests of the three shape features, their
+#: surviving pairs, and the within-recording drift of the same features along each clock.
+HISTOGRAM_SIGNIFICANCE_FILENAME = "lag_high_kl_histogram_significance.csv"
+HISTOGRAM_PAIRWISE_FILENAME = "lag_high_kl_histogram_pairwise.csv"
+HISTOGRAM_DRIFT_FILENAME = "lag_high_kl_histogram_drift.csv"
+HISTOGRAM_DRIFT_SUMMARY_FILENAME = "lag_high_kl_histogram_drift_summary.csv"
 SELECTION_FIGURE = "lag_high_kl_selection"
 USEFULNESS_FIGURE = "lag_high_kl_usefulness"
 
@@ -368,6 +379,41 @@ HISTOGRAM_FEATURE_COLUMNS: Tuple[str, ...] = tuple(
     histogram_feature_column(statistic) for statistic in HISTOGRAM_STATISTICS
 )
 
+#: The histogram statistics whose class trajectories are **tested**, on the high band's KL
+#: attribution: the median lag (*where* the distribution sits), the inter-quartile lag range (*how
+#: wide* it is) and the entropy (*how concentrated*) -- one from each of the three scale-free
+#: families ``lag_shape`` names, so the three ways a distribution can differ are each asked once.
+#: The centroid is deliberately absent: ``high_lag_centroid_kl_s`` already tests the same position
+#: on the same band and source, and a second family on it would be one question asked twice
+#: against two corrections.
+HISTOGRAM_TESTED_STATISTICS: Tuple[str, ...] = ("median", "iqr", "entropy")
+HISTOGRAM_TESTED_BAND = HIGH_BAND_KEY
+HISTOGRAM_TESTED_SOURCE = "kl"
+
+#: The tested histogram readouts, as feature columns. Each is one Holm family per clock.
+HISTOGRAM_READOUTS: Tuple[str, ...] = tuple(
+    histogram_feature_column(statistic) for statistic in HISTOGRAM_TESTED_STATISTICS
+)
+
+#: Fewest windows a recording must be scored in for a within-recording drift to be fitted. Two
+#: points always fit a line exactly; three is the first count at which a slope carries any evidence
+#: against its own noise.
+MIN_DRIFT_WINDOWS = 3
+
+#: The within-recording drift table, one row per (feature, recording), and its summary: one row
+#: per class (the drift against zero), one per feature (the omnibus across classes) and one per
+#: surviving class pair. Written out so a consumer lays out its reader before calling.
+HISTOGRAM_DRIFT_COLUMNS: Tuple[str, ...] = (
+    "clock", "band", "source", "group_column", "metric", "group", "guid", "n_windows",
+    "span_h", "first_h", "last_h", "value_first", "value_last", "delta_last_minus_first",
+    "slope_per_h",
+)
+HISTOGRAM_DRIFT_SUMMARY_COLUMNS: Tuple[str, ...] = (
+    "clock", "band", "source", "group_column", "metric", "row_kind", "group", "left", "right",
+    "n", "median_slope_per_h", "q25_slope_per_h", "q75_slope_per_h", "test", "statistic",
+    "p_value", "p_holm", "significant", "cliffs_delta", "magnitude", "note",
+)
+
 #: The two comparisons the distance table carries. The first asks whether the classes attend to
 #: different lags in the same window; the second asks whether a class's own distribution moves
 #: across the clock, each window against that class's distribution pooled over every window.
@@ -379,6 +425,30 @@ HISTOGRAM_FEATURE_COLUMNS: Tuple[str, ...] = tuple(
 #: comparable. The pooled cell needs no orientation.
 CLASS_PAIR_COMPARISON = "class_pair"
 WINDOW_DRIFT_COMPARISON = "window_vs_class_pooled"
+
+#: The bottom block of the histogram page, laid out **metric down and comparison across**.
+#:
+#: Both metrics are computed for *both* comparisons, so which one a panel shows is a display
+#: decision rather than a property of the comparison, and it is declared once here rather than four
+#: times at the call sites. Neither metric alone is enough on either comparison: Wasserstein says
+#: how far the distribution moved and is blind to one that broadens or splits in place, while
+#: Jensen-Shannon says how much overlap is left and is blind to distance along the axis once two
+#: supports have separated. A cohort whose lag distribution widened toward delivery without shifting
+#: reads as near zero under the first and plainly non-zero under the second, which is exactly the
+#: finding a single-metric row would lose.
+#:
+#: Laid out this way a **column** reads one comparison under both metrics, and a **row** compares
+#: the two comparisons in one unit.
+DISTANCE_METRICS: Tuple[Tuple[str, str], ...] = (
+    ("wasserstein_s", "1-Wasserstein (s, stored-coefficient time)"),
+    ("jensen_shannon", "Jensen-Shannon distance (base 2)"),
+)
+
+#: The two comparisons across, each with the phrase its panel titles are built from.
+DISTANCE_COMPARISONS: Tuple[Tuple[str, str], ...] = (
+    (WINDOW_DRIFT_COMPARISON, "each window against its own class pooled over the clock"),
+    (CLASS_PAIR_COMPARISON, "between classes, window by window"),
+)
 
 #: Columns of the three histogram tables, written out so a consumer can lay out its reader before
 #: calling and an added field fails there rather than going silently unemitted.
@@ -406,20 +476,28 @@ METHOD = (
     "step-down across that clock's windows as one family, pairwise two-sided Mann-Whitney U with "
     "Cliff's delta for the windows significant after Holm only, every pair oriented from the more "
     "severe class to the less severe one. Two readouts are tested -- the high band's KL centroid "
-    "and the high-anchor share -- on two clocks, so four Holm families, none joint. One further "
-    "run-level test, its own family of one: a Wilcoxon signed-rank test over recordings of the "
-    "high band's mean forecast gain against the rest band's, paired within recording. Classes with "
-    f"fewer than {shared_stats.MIN_GROUP_SIZE} recordings in a window are excluded and recorded."
+    "and the high-anchor share -- on two clocks, so four Holm families, none joint. Three shape "
+    "features of the high band's per-recording KL-attribution histogram -- its median lag, "
+    "inter-quartile lag range and entropy -- are tested the same way on both clocks, six further "
+    "families. Each of the three is also tested as a within-recording DRIFT: the least-squares "
+    "slope of the feature against forward labour time over every recording scored in at least "
+    f"{MIN_DRIFT_WINDOWS} windows, Wilcoxon signed-rank against zero per class and Kruskal-Wallis "
+    "across classes, Holm across the three features of one clock, pairwise on the survivors. One "
+    "further run-level test, its own family of one: a Wilcoxon signed-rank test over recordings "
+    "of the high band's mean forecast gain against the rest band's, paired within recording. "
+    f"Classes with fewer than {shared_stats.MIN_GROUP_SIZE} recordings in a window are excluded "
+    "and recorded."
 )
 
 #: What ships untested, said outright.
 UNTESTED_NOTE = (
     "the rest, top and gain bands' clock trajectories, every attention-profile statistic, the "
     "hot-lag shares, the argmax-by-KL-decile table, the gain-by-decile and gain-by-argmax tables, "
-    "the occlusion-consistency join, the contraction enrichment and EVERY histogram readout -- the "
-    "per-cell lag distributions, their per-recording shape features and both distances between "
-    "cells -- are tabled and drawn with no p-value. They add no Holm family; a trajectory quoted "
-    "from them is a description, not a claim."
+    "the occlusion-consistency join, the contraction enrichment, the histogram's per-cell lag "
+    "distributions, both distances between cells, and every histogram shape feature other than "
+    "the three tested ones (and every one of them on the attention source and the top band) are "
+    "tabled and drawn with no p-value. They add no Holm family; a trajectory quoted from them is a "
+    "description, not a claim."
 )
 
 #: What the histogram half is, in the record, so a reader of one table knows which object it
@@ -437,7 +515,10 @@ HISTOGRAM_NOTE = (
     "NOTE the difference from lag_high_kl_profile.csv, which is not a disagreement: that table "
     "normalises AFTER the (class, window) mean, so it reports where a cohort's coupling mass sits; "
     "this one normalises per recording BEFORE it, so it reports what a typical recording looks "
-    "like. No peak-lag histogram ships: the per-anchor argmax is already resolved by KL decile in "
+    "like. Three shape features of the high band's KL histogram -- median lag, inter-quartile lag "
+    "range, entropy -- are TESTED across classes per window on both clocks, and each is tested "
+    "again as a within-recording drift along the clock; see 'tested'. No peak-lag histogram "
+    "ships: the per-anchor argmax is already resolved by KL decile in "
     "lag_high_kl_argmax_by_quantile.csv, and on a flat profile numpy's first-maximum rule pins it "
     "at lag 0, so a histogram of it would be a picture of that rule."
 )
@@ -483,6 +564,8 @@ class Clock:
         figure: This clock's profile-and-trajectory page.
         windows_figure: This clock's tested page.
         histogram_figure: This clock's lag-distribution page.
+        features_figure: This clock's tested page for the histogram's shape features.
+        drift_figure: This clock's within-recording drift page for the same features.
         eligible_only: Whether the second-stage eligibility rule applies before binning.
     """
 
@@ -495,6 +578,8 @@ class Clock:
     figure: str
     windows_figure: str
     histogram_figure: str
+    features_figure: str
+    drift_figure: str
     eligible_only: bool
 
 
@@ -510,6 +595,8 @@ CLOCKS: Tuple[Clock, ...] = (
         figure="lag_high_kl_time_to_delivery",
         windows_figure="lag_high_kl_time_to_delivery_windows",
         histogram_figure="lag_high_kl_time_to_delivery_histogram",
+        features_figure="lag_high_kl_time_to_delivery_histogram_features",
+        drift_figure="lag_high_kl_time_to_delivery_histogram_drift",
         eligible_only=False,
     ),
     Clock(
@@ -522,6 +609,8 @@ CLOCKS: Tuple[Clock, ...] = (
         figure="lag_high_kl_second_stage",
         windows_figure="lag_high_kl_second_stage_windows",
         histogram_figure="lag_high_kl_second_stage_histogram",
+        features_figure="lag_high_kl_second_stage_histogram_features",
+        drift_figure="lag_high_kl_second_stage_histogram_drift",
         eligible_only=True,
     ),
 )
@@ -1906,6 +1995,358 @@ def histogram_feature_rows(
     return rows
 
 
+def clock_features(clock: Clock, features: pd.DataFrame) -> pd.DataFrame:
+    """Key the per-recording histogram features by the clock's own window columns.
+
+    :func:`histogram_feature_frame` keys its rows ``window`` / ``centre`` because it serves both
+    clocks from one frame; the per-window machinery every tested readout goes through --
+    :func:`window_samples`, :func:`analyse_windows` and the shared page builder -- reads a clock's
+    own ``bin_column`` and ``center_column``. Renaming is what lets the histogram features be
+    tested and drawn by the *same* functions as the two shipped readouts rather than by a copy.
+
+    Args:
+        clock: The clock whose column names the frame should carry.
+        features: :func:`histogram_feature_frame`'s frame.
+
+    Returns:
+        The same frame with the two key columns renamed.
+    """
+    return features.rename(columns={"window": clock.bin_column, "centre": clock.center_column})
+
+
+def forward_hours(clock: Clock, centres: np.ndarray) -> np.ndarray:
+    """Window centres as a coordinate that **increases as labour progresses** on either clock.
+
+    The delivery clock counts hours *before* delivery, so its centres run backwards in time; the
+    second-stage clock is signed through its onset and runs forwards. A slope fitted against the
+    raw centre would therefore carry opposite signs for the same physiological drift on the two
+    clocks, and a reader comparing the two drift tables would read one of them backwards. Negating
+    the inverted clock's centres gives both tables one convention: **positive means the feature
+    rises as delivery approaches**.
+
+    Args:
+        clock: The clock the centres are on.
+        centres: Window centres in hours, as the clock reports them.
+
+    Returns:
+        The forward-time coordinate, in hours.
+    """
+    values = np.asarray(centres, dtype=np.float64)
+    return -values if clock.inverted else values
+
+
+def recording_drift(
+    clock: Clock,
+    band_key: str,
+    source_key: str,
+    features: pd.DataFrame,
+    column: str,
+    *,
+    min_windows: int = MIN_DRIFT_WINDOWS,
+) -> pd.DataFrame:
+    r"""Fit each recording's own drift of one histogram feature along the clock.
+
+    The per-window class tests compare *different* recordings in every window -- a cohort thins
+    toward the edge of the axis and the recordings present at $1$ h are not the recordings present
+    at $6$ h -- so a trajectory of cell medians can move because the population changed rather
+    than because any recording's lag structure did. The drift is the within-recording reading that
+    the between-recording one cannot give: for each recording scored in at least ``min_windows``
+    windows, the least-squares slope
+
+    $$\hat\beta = \frac{\sum_w (t_w - \bar t)(v_w - \bar v)}{\sum_w (t_w - \bar t)^2}$$
+
+    of the feature $v_w$ against the forward-time coordinate $t_w$ of :func:`forward_hours`, in the
+    feature's own unit per hour, beside the plain difference between its last and first scored
+    window. Both are one number per recording, so the tests run on them are over recordings.
+
+    Args:
+        clock: The clock the features are binned on.
+        band_key: The selection band, stamped on every row.
+        source_key: ``"attn"`` or ``"kl"``, stamped on every row.
+        features: :func:`clock_features`' frame -- one row per (class, window, recording).
+        column: The feature column to fit.
+        min_windows: Fewest finite windows a recording needs to be fitted.
+
+    Returns:
+        One row per fitted recording, in :data:`HISTOGRAM_DRIFT_COLUMNS` order. Empty with those
+        columns when the frame is empty, the column is absent, or no recording spans enough
+        windows. A recording whose scored windows all share one centre cannot carry a slope and is
+        skipped rather than reported as zero.
+    """
+    empty = pd.DataFrame(columns=list(HISTOGRAM_DRIFT_COLUMNS))
+    needed = {"group", "guid", clock.center_column, column}
+    if features.empty or not needed <= set(features.columns):
+        return empty
+    rows: List[Dict[str, Any]] = []
+    for (group, guid), block in features.groupby(["group", "guid"], sort=True):
+        values = np.asarray(block[column], dtype=np.float64)
+        centres = np.asarray(block[clock.center_column], dtype=np.float64)
+        finite = np.isfinite(values) & np.isfinite(centres)
+        if int(finite.sum()) < int(min_windows):
+            continue
+        forward = forward_hours(clock, centres[finite])
+        order = np.argsort(forward, kind="stable")
+        forward, fitted, raw = forward[order], values[finite][order], centres[finite][order]
+        span = float(forward[-1] - forward[0])
+        if span <= 0.0:
+            continue
+        centred = forward - forward.mean()
+        slope = float(np.dot(centred, fitted - fitted.mean()) / np.dot(centred, centred))
+        rows.append(
+            {
+                "clock": clock.name,
+                "band": band_key,
+                "source": source_key,
+                "group_column": labels.CLASS_COLUMN,
+                "metric": column,
+                "group": str(group),
+                "guid": str(guid),
+                "n_windows": int(finite.sum()),
+                "span_h": span,
+                # The clock's own centres, so a reader can find the two windows on every other
+                # table; ``first`` is the earliest in labour, whichever way the clock counts.
+                "first_h": float(raw[0]),
+                "last_h": float(raw[-1]),
+                "value_first": float(fitted[0]),
+                "value_last": float(fitted[-1]),
+                "delta_last_minus_first": float(fitted[-1] - fitted[0]),
+                "slope_per_h": slope,
+            }
+        )
+    return pd.DataFrame(rows, columns=list(HISTOGRAM_DRIFT_COLUMNS))
+
+
+def _wilcoxon_against_zero(values: np.ndarray) -> Dict[str, Any]:
+    """One class's drift against no drift: a Wilcoxon signed-rank test of the slopes against zero.
+
+    A one-sample form of the paired test the usefulness block runs: each recording's slope is its
+    own paired difference between later and earlier labour, so the test asks whether the class as a
+    whole drifts, with the between-recording variance removed the same way.
+
+    Returns:
+        ``statistic`` and ``p_value``, ``NaN`` with a ``note`` when fewer than
+        ``shared_stats.MIN_GROUP_SIZE`` finite slopes are available or every slope is exactly zero,
+        which SciPy rejects because the signed ranks then carry nothing.
+    """
+    finite = values[np.isfinite(values)]
+    record: Dict[str, Any] = {
+        "test": "wilcoxon-signed-rank-vs-zero",
+        "n": int(finite.size),
+        "statistic": float("nan"),
+        "p_value": float("nan"),
+    }
+    if finite.size < int(shared_stats.MIN_GROUP_SIZE):
+        record["note"] = f"fewer than {shared_stats.MIN_GROUP_SIZE} fitted recordings"
+        return record
+    if not (finite != 0.0).any():
+        record["note"] = "every slope is exactly zero, so the signed ranks carry nothing"
+        return record
+    from scipy import stats
+
+    statistic, p_value = stats.wilcoxon(finite)
+    record.update({"statistic": float(statistic), "p_value": float(p_value)})
+    return record
+
+
+def analyse_drift(
+    clock: Clock,
+    band_key: str,
+    source_key: str,
+    drifts: Dict[str, pd.DataFrame],
+    *,
+    alpha: float = DEFAULT_ALPHA,
+) -> Dict[str, Any]:
+    r"""Test the within-recording drifts: each class against zero, and the classes against each other.
+
+    Two questions, two Holm families, both spanning the tested features of one clock:
+
+    * **Does a class drift at all?** Per (feature, class), :func:`_wilcoxon_against_zero` on the
+      recordings' slopes. One family of (features $\times$ classes) tests.
+    * **Do the classes drift differently?** Per feature, Kruskal--Wallis across the classes' slopes,
+      one family of (features) tests, and pairwise Mann--Whitney with Cliff's delta on the
+      survivors only -- oriented worst class first, as every pairwise table here is.
+
+    Holm runs across the features rather than across the clocks because the two clocks score two
+    populations and their drift tables are read separately, which is the same reason the per-window
+    families are per clock.
+
+    Args:
+        clock: The clock, named on the record.
+        band_key: The selection band.
+        source_key: ``"attn"`` or ``"kl"``.
+        drifts: Feature column to :func:`recording_drift`'s frame.
+        alpha: Family-wise error rate for both corrections.
+
+    Returns:
+        ``per_class`` (one record per feature and class), ``omnibus`` (one per feature),
+        ``pairwise`` (feature to its surviving comparisons) and the counts, beside the keys that
+        name the family.
+    """
+    per_class: List[Dict[str, Any]] = []
+    omnibus: List[Dict[str, Any]] = []
+    usable_by_metric: Dict[str, Dict[str, np.ndarray]] = {}
+    for metric, table in drifts.items():
+        by_class: Dict[str, np.ndarray] = {}
+        if len(table):
+            groups = cohort.ordered_groups(
+                sorted(set(table["group"].astype(str))), labels.CLASS_COLUMN
+            )
+            for group in groups:
+                slopes = np.asarray(
+                    table.loc[table["group"].astype(str) == group, "slope_per_h"],
+                    dtype=np.float64,
+                )
+                by_class[group] = slopes[np.isfinite(slopes)]
+        for group, slopes in by_class.items():
+            quartiles = (
+                np.percentile(slopes, [25, 50, 75]) if slopes.size else np.full(3, np.nan)
+            )
+            per_class.append(
+                {
+                    "metric": metric,
+                    "group": group,
+                    "q25_slope_per_h": float(quartiles[0]),
+                    "median_slope_per_h": float(quartiles[1]),
+                    "q75_slope_per_h": float(quartiles[2]),
+                    **_wilcoxon_against_zero(slopes),
+                }
+            )
+        usable = {
+            group: slopes for group, slopes in by_class.items()
+            if slopes.size >= int(shared_stats.MIN_GROUP_SIZE)
+        }
+        usable_by_metric[metric] = usable
+        if len(usable) >= 2:
+            omnibus.append({"metric": metric, **shared_stats.kruskal_across_groups(usable)})
+        else:
+            omnibus.append(
+                {
+                    "metric": metric,
+                    "test": "kruskal-wallis",
+                    "n_groups": len(usable),
+                    "n_per_group": {group: int(v.size) for group, v in usable.items()},
+                    "statistic": float("nan"),
+                    "p_value": float("nan"),
+                    "note": shared_stats.TOO_FEW_GROUPS_NOTE,
+                }
+            )
+    # Holm, each family across everything it holds; a non-finite p passes through unchanged and
+    # consumes no rank, which is how the shared adjuster treats an untestable member.
+    for family in (per_class, omnibus):
+        adjusted = shared_stats.holm_adjust([record["p_value"] for record in family])
+        for record, p_holm in zip(family, adjusted):
+            record["p_holm"] = float(p_holm)
+            record["alpha"] = float(alpha)
+            record["significant"] = bool(np.isfinite(p_holm) and p_holm < alpha)
+    pairwise = {
+        record["metric"]: shared_stats.pairwise_comparisons(usable_by_metric[record["metric"]])
+        for record in omnibus
+        if record["significant"]
+    }
+    return {
+        "clock": clock.name,
+        "band": band_key,
+        "source": source_key,
+        "group_column": labels.CLASS_COLUMN,
+        "alpha": float(alpha),
+        "min_windows": int(MIN_DRIFT_WINDOWS),
+        "forward_time": (
+            "slopes are per hour of forward labour time, so positive means the feature rises as "
+            "delivery approaches on both clocks"
+        ),
+        "n_features": len(drifts),
+        "n_classes_drifting": sum(1 for record in per_class if record["significant"]),
+        "n_features_differing": sum(1 for record in omnibus if record["significant"]),
+        "per_class": per_class,
+        "omnibus": omnibus,
+        "pairwise": pairwise,
+    }
+
+
+def drift_summary_frame(records: Sequence[Dict[str, Any]]) -> pd.DataFrame:
+    """Flatten the drift records into one table: class rows, omnibus rows and surviving pairs."""
+    rows: List[Dict[str, Any]] = []
+    for record in records:
+        base = {
+            "clock": record["clock"],
+            "band": record["band"],
+            "source": record["source"],
+            "group_column": record["group_column"],
+        }
+        for item in record["per_class"]:
+            rows.append(
+                {
+                    **base,
+                    "metric": item["metric"],
+                    "row_kind": "class_vs_zero",
+                    "group": item["group"],
+                    "n": item["n"],
+                    "median_slope_per_h": item["median_slope_per_h"],
+                    "q25_slope_per_h": item["q25_slope_per_h"],
+                    "q75_slope_per_h": item["q75_slope_per_h"],
+                    "test": item["test"],
+                    "statistic": item["statistic"],
+                    "p_value": item["p_value"],
+                    "p_holm": item["p_holm"],
+                    "significant": item["significant"],
+                    "note": item.get("note", ""),
+                }
+            )
+        for item in record["omnibus"]:
+            rows.append(
+                {
+                    **base,
+                    "metric": item["metric"],
+                    "row_kind": "across_classes",
+                    "n": sum((item.get("n_per_group") or {}).values()),
+                    "test": item.get("test"),
+                    "statistic": item.get("statistic"),
+                    "p_value": item.get("p_value"),
+                    "p_holm": item["p_holm"],
+                    "significant": item["significant"],
+                    "note": item.get("note", ""),
+                }
+            )
+        for metric, comparisons in record["pairwise"].items():
+            for item in comparisons:
+                rows.append(
+                    {
+                        **base,
+                        "metric": metric,
+                        "row_kind": "class_pair",
+                        "left": item["left"],
+                        "right": item["right"],
+                        "n": int(item["n_left"]) + int(item["n_right"]),
+                        "test": item["test"],
+                        "statistic": item.get("u_statistic"),
+                        "p_value": item["p_value"],
+                        "cliffs_delta": item["cliffs_delta"],
+                        "magnitude": item["magnitude"],
+                        "note": item.get("note", ""),
+                    }
+                )
+    return pd.DataFrame(rows, columns=list(HISTOGRAM_DRIFT_SUMMARY_COLUMNS))
+
+
+def _tagged_frame(
+    builder: Callable[[Sequence[Dict[str, Any]]], pd.DataFrame],
+    records: Sequence[Dict[str, Any]],
+) -> pd.DataFrame:
+    """Flatten histogram significance records through a shared builder, adding band and source.
+
+    The shipped :func:`significance_frame` and :func:`pairwise_frame` know nothing of a band or a
+    source because the readouts they serve are named by column; the histogram families are long
+    form on both, so the two keys are stamped per record and put first.
+    """
+    tables = [
+        builder([record]).assign(band=record["band"], source=record["source"])
+        for record in records
+    ]
+    frame = _concat_tables(tables, [*builder([]).columns, "band", "source"])
+    ordered = ["clock", "band", "source", *[c for c in frame.columns if c not in ("clock", "band", "source")]]
+    return frame[ordered]
+
+
 #: What a comparison reports when it could not be made. Explicit rather than an omitted row, so a
 #: reader meets the pair and its counts and can see *why* there is no number.
 _BLANK_DISTANCE: Dict[str, float] = {
@@ -2619,10 +3060,23 @@ def build_windows_figure(
     return figure
 
 
-#: Line styles a class *pair* is distinguished by on the between-class panel, where a single colour
-#: cannot name two cohorts. Cycled in :func:`~teb_vae.lag_attn_cfs.eval.cohort.ordered_groups`'
-#: pair order, so the same pair draws the same way on both clocks.
+#: Line styles a series is distinguished by on the two distance panels. Cycled in
+#: :func:`~teb_vae.lag_attn_cfs.eval.cohort.ordered_groups`' order, so the same series draws the
+#: same way on both clocks, and carried alongside colour rather than instead of it so the panels
+#: survive a greyscale print and a colour-blind reader.
 _PAIR_STYLES: Tuple[str, ...] = ("-", "--", ":", "-.")
+
+#: Colours a class **pair** is drawn in, and deliberately **off** :data:`CLINICAL_CLASS_COLORS`.
+#:
+#: A between-class distance is a property of the *pair*, not of either cohort in it, so painting it
+#: in one member's colour is a category error with a concrete cost: with three classes, two of the
+#: three pairs are led by the most severe one, so colouring by the leading cohort paints
+#: ``hie vs acidosis`` and ``hie vs healthy`` identically and leaves the line style carrying the
+#: whole distinction. These hues are chosen to be none of the class green, amber or red, so a pair
+#: line cannot be mistaken for a cohort line on a page that carries both.
+_PAIR_COLORS: Tuple[str, ...] = (
+    figures.COLOR_BLUE, figures.COLOR_PURPLE, figures.COLOR_BLACK, figures.COLOR_GRAY,
+)
 
 
 def _draw_distribution_overlay(
@@ -2675,64 +3129,250 @@ def _draw_distribution_overlay(
     return len(drawn)
 
 
-def _draw_window_overlay(
+#: The cumulative-mass levels marked inside a density violin: the quartile lags of the cell's own
+#: distribution, which are the ``hist_median_s`` and ``hist_iqr_s`` the feature table reports.
+_DENSITY_QUARTILES: Tuple[float, ...] = (0.25, 0.5, 0.75)
+
+#: How much of its dodge slot a density violin's body may fill at the cell with the tallest bin.
+#: The same fraction the shared binned violins use, so the two marks read alike on one page.
+_DENSITY_BODY_FRACTION = 0.8
+
+#: Vertical spacing of the ridgeline's baselines, in the axes' own arbitrary unit, and how far the
+#: tallest ridge on the page reaches above its baseline in that unit. Above one, so neighbouring
+#: ridges overlap slightly -- which is what makes the drift readable as a texture rather than as
+#: a stack of separate panels -- and below two, so no ridge hides the one above it entirely.
+_RIDGE_SPACING = 1.0
+_RIDGE_HEIGHT = 1.5
+
+
+def _peak_density(cells: HistogramCells) -> float:
+    """The tallest bin over every cell, which is the one scale every body on a panel is drawn at.
+
+    One scale rather than one per cell, because a body's width has to mean the same share of the
+    distribution in every window and every class or the panel cannot be read across them.
+    """
+    return max(
+        (float(np.nanmax(density)) for density in cells.cell.values() if np.isfinite(density).any()),
+        default=0.0,
+    )
+
+
+def _draw_density_violins(
     ax: Any,
+    clock: Clock,
     cells: HistogramCells,
-    group: str,
     seconds: np.ndarray,
     *,
     title: str,
 ) -> int:
-    """Overlay one class's lag distribution once per window, graded along the clock.
+    r"""One violin per (window, class) cell on the clock, whose **body is the cell's lag
+    distribution itself**.
 
-    The colour ramp is the clock, so "the distribution moved" is a systematic drift of the ramp
-    across the lag axis rather than something a reader must reconstruct from a table. Windows
-    holding fewer than ``shared_stats.MIN_GROUP_SIZE`` recordings are drawn hairline and dashed and
-    are marked as such: they are shown because a gap would read as no data, and marked because
-    a cell of one recording is not a cohort.
+    A shared violin estimates a density from samples; here the density is already known -- the
+    cell's mean per-recording distribution over the lags -- so the body is that distribution drawn
+    directly, with the half-width at lag $\tau_\ell$ proportional to $p_\ell$. It is drawn as a
+    step outline because $p_\ell$ is a share per lag *bin*, and a smooth outline would draw mass
+    at positions no bin covers. The cells are dodged inside each window by class exactly as the
+    shared binned violins are, so a page reader compares the classes side by side within a window
+    and reads the drift along the clock, the two questions this page exists for.
+
+    **Inside each body** the heavy bar spans the distribution's own quartile lags and the white dot
+    is its median lag -- the ``hist_median_s`` and ``hist_iqr_s`` the feature table reports of the
+    same object -- and the short black tick is the centroid, which on these skewed profiles sits
+    well away from the median and is what the ``high_lag_centroid_kl_s`` readout tracks.
+
+    A cell below ``shared_stats.MIN_GROUP_SIZE`` recordings is drawn faint and dashed rather than
+    omitted: a gap would read as no data, and a body of one recording is not a cohort. Every cell
+    carries its recording count above it, because the count is exactly what a body's width hides.
 
     Args:
         ax: Target axes.
+        clock: The clock, for the axis label and its orientation.
         cells: The pooled cells.
-        group: The class this panel is for.
         seconds: The compensated lag axis.
         title: Panel title.
 
     Returns:
-        How many windows were drawn.
+        How many cells were drawn.
     """
-    import matplotlib.pyplot as plt
-
-    windows = [window for window in cells.windows if (group, window) in cells.cell]
-    if not windows:
+    groups = list(cells.groups)
+    peak = _peak_density(cells)
+    if not groups or not cells.windows or peak <= 0.0:
         _empty_panel(ax, title)
         return 0
-    palette = plt.get_cmap("viridis")
+    colours = figures.group_colors(groups)
     minimum = int(shared_stats.MIN_GROUP_SIZE)
-    span = max(len(windows) - 1, 1)
-    for index, window in enumerate(windows):
-        count = cells.cell_counts.get((group, window), 0)
-        thin = count < minimum
-        ax.step(
-            seconds, cells.cell[(group, window)], where="mid", color=palette(index / span),
-            linewidth=figures.LINE_HAIRLINE if thin else figures.LINE_REGULAR,
-            linestyle="--" if thin else "-",
+    slot = float(TRAJECTORY_BIN_HOURS) / float(len(groups) + 1)
+    half_width = 0.5 * _DENSITY_BODY_FRACTION * slot / peak
+    weight = figures.LINE_REGULAR
+    drawn = 0
+    for index, group in enumerate(groups):
+        offset = (float(index) - (len(groups) - 1) / 2.0) * slot
+        colour = colours.get(group, figures.COLOR_BLUE)
+        for window in cells.windows:
+            density = cells.cell.get((group, window))
+            if density is None:
+                continue
+            count = int(cells.cell_counts.get((group, window), 0))
+            thin = count < minimum
+            x = float(cells.centres.get(window, float("nan"))) + offset
+            width = np.where(np.isfinite(density), density, 0.0) * half_width
+            ax.fill_betweenx(
+                seconds, x - width, x + width, step="mid", color=colour,
+                alpha=0.2 if thin else 0.6, linewidth=0, zorder=2,
+            )
+            for side in (x - width, x + width):
+                ax.plot(
+                    side, seconds, drawstyle="steps-mid", color=colour,
+                    linewidth=figures.LINE_HAIRLINE, linestyle="--" if thin else "-", zorder=2,
+                )
+            low, median, high = quantile_seconds(density, seconds, _DENSITY_QUARTILES)
+            ax.vlines(x, low, high, color=figures.COLOR_BLACK, linewidth=weight * 2.0, zorder=3)
+            ax.plot(
+                [x], [median], marker="o", markersize=2.4, markerfacecolor="white",
+                markeredgecolor=figures.COLOR_BLACK, markeredgewidth=weight * 0.6, zorder=4,
+            )
+            ax.plot(
+                [x], [centroid_seconds(density, seconds)], marker="_", markersize=5,
+                color=figures.COLOR_BLACK, markeredgewidth=weight, zorder=4,
+            )
+            ax.annotate(
+                str(count), (x, float(seconds[-1]) + SECONDS_PER_LAG_STEP / 2.0),
+                textcoords="offset points", xytext=(0, 2), ha="center",
+                fontsize=figures.FONT_TINY, color=colour,
+            )
+            drawn += 1
+    # Proxy handles: a filled body carries no usable legend entry of its own.
+    for group in groups:
+        ax.plot([], [], marker="s", linestyle="none", color=colours.get(group, figures.COLOR_BLUE), label=group)
+    ax.plot([], [], marker="o", linestyle="none", markerfacecolor="white", markeredgecolor=figures.COLOR_BLACK, label="median lag")
+    ax.plot([], [], marker="_", linestyle="none", color=figures.COLOR_BLACK, label="centroid lag")
+    ax.set_title(title)
+    ax.set_xlabel(clock.axis_label)
+    ax.set_ylabel(figures.COEFFICIENT_LAG_AXIS_LABEL)
+    centres = [float(cells.centres[window]) for window in cells.windows]
+    ax.set_xlim(min(centres) - float(TRAJECTORY_BIN_HOURS), max(centres) + float(TRAJECTORY_BIN_HOURS))
+    if clock.inverted:
+        ax.invert_xaxis()
+    else:
+        ax.axvline(0.0, color=figures.COLOR_GRAY, linestyle=":", linewidth=figures.LINE_REGULAR, zorder=0)
+    ax.text(
+        0.99, 0.01, f"count above each body = recordings; faint dashed = fewer than {minimum}",
+        transform=ax.transAxes, ha="right", va="bottom", fontsize=figures.FONT_TINY,
+        color=figures.COLOR_GRAY,
+    )
+    ax.legend(fontsize=figures.FONT_LABEL, loc="upper left", ncol=len(groups) + 2)
+    figures.style_axes(ax)
+    return drawn
+
+
+def _draw_ridgeline(
+    ax: Any,
+    clock: Clock,
+    cells: HistogramCells,
+    seconds: np.ndarray,
+    *,
+    title: str,
+) -> int:
+    """One ridge per window, the classes overlaid on each, **time running down the page**.
+
+    The density violins above put the clock across and the lag up, which is the right orientation
+    for reading a drift; this puts the lag across, so the *shape* of each cell -- a second mode, a
+    shoulder, a heavy far tail -- is read at full width, and stacks the windows so a shape change
+    along the clock is a change down the page. The windows are ordered so that labour progresses
+    downward on **both** clocks: farthest from delivery at the top on the delivery clock, earliest
+    before onset at the top on the second-stage clock. Each ridge carries its window centre on the
+    left and its per-class recording counts on the right; a class's median lag is ticked on the
+    baseline. A cell below ``shared_stats.MIN_GROUP_SIZE`` recordings is outlined hairline and
+    dashed with no fill.
+
+    Args:
+        ax: Target axes.
+        clock: The clock, for the window order and the axis label.
+        cells: The pooled cells.
+        seconds: The compensated lag axis.
+        title: Panel title.
+
+    Returns:
+        How many ridges (windows) were drawn.
+    """
+    import matplotlib.transforms as mtransforms
+
+    groups = list(cells.groups)
+    peak = _peak_density(cells)
+    ordered = sorted(
+        cells.windows, key=lambda window: float(cells.centres.get(window, 0.0)),
+        reverse=bool(clock.inverted),
+    )
+    if not groups or not ordered or peak <= 0.0:
+        _empty_panel(ax, title)
+        return 0
+    colours = figures.group_colors(groups)
+    minimum = int(shared_stats.MIN_GROUP_SIZE)
+    scale = _RIDGE_HEIGHT * _RIDGE_SPACING / peak
+    # Blended: x in axes fraction so the counts sit just outside the frame, y in data so they sit
+    # on the ridge they describe.
+    beside = mtransforms.blended_transform_factory(ax.transAxes, ax.transData)
+    baselines: List[float] = []
+    for row, window in enumerate(ordered):
+        baseline = float(len(ordered) - 1 - row) * _RIDGE_SPACING
+        baselines.append(baseline)
+        ax.axhline(baseline, color=figures.COLOR_LIGHT_GRAY, linewidth=figures.LINE_HAIRLINE, zorder=0)
+        counts: List[str] = []
+        for group in groups:
+            density = cells.cell.get((group, window))
+            if density is None:
+                continue
+            count = int(cells.cell_counts.get((group, window), 0))
+            thin = count < minimum
+            colour = colours.get(group, figures.COLOR_BLUE)
+            top = baseline + np.where(np.isfinite(density), density, 0.0) * scale
+            # Later rows draw over earlier ones, so the ridge nearest the reader (lowest on the
+            # page) is the one that is complete -- the usual ridgeline convention.
+            if not thin:
+                ax.fill_between(
+                    seconds, baseline, top, step="mid", color=colour, alpha=0.35, linewidth=0,
+                    zorder=1 + row,
+                )
+            ax.step(
+                seconds, top, where="mid", color=colour,
+                linewidth=figures.LINE_HAIRLINE if thin else figures.LINE_REGULAR,
+                linestyle="--" if thin else "-", zorder=1 + row,
+            )
+            median = float(quantile_seconds(density, seconds, (0.5,))[0])
+            ax.plot(
+                [median], [baseline], marker="|", markersize=5, color=colour,
+                markeredgewidth=figures.LINE_EMPHASIS, zorder=2 + row,
+            )
+            counts.append(f"{group} {count}")
+        ax.text(
+            1.005, baseline, "  ".join(counts), transform=beside, ha="left", va="bottom",
+            fontsize=figures.FONT_TINY, color=figures.COLOR_GRAY,
         )
+    ax.set_yticks(baselines)
+    ax.set_yticklabels(
+        [f"{float(cells.centres.get(window, float('nan'))):g} h" for window in ordered],
+        fontsize=figures.FONT_SMALL,
+    )
+    ax.set_ylim(-0.1 * _RIDGE_SPACING, baselines[0] + _RIDGE_HEIGHT * _RIDGE_SPACING + 0.1)
+    ax.set_xlim(float(seconds[0]) - SECONDS_PER_LAG_STEP / 2.0, float(seconds[-1]) + SECONDS_PER_LAG_STEP / 2.0)
+    for group in groups:
+        ax.plot([], [], marker="s", linestyle="none", color=colours.get(group, figures.COLOR_BLUE), label=group)
+    ax.legend(fontsize=figures.FONT_LABEL, loc="upper right", ncol=len(groups))
     ax.set_title(title)
     ax.set_xlabel(figures.COEFFICIENT_LAG_AXIS_LABEL)
-    ax.set_ylabel("share of the distribution")
-    # The ramp is named at its two ends rather than by a legend: a full clock axis is dozens of
-    # windows, and a legend entry per window would take the panel and leave nothing to read.
+    # Short on purpose: the clock's full sign convention is on every other panel of the page, and
+    # at full length it overruns the panel above.
+    ax.set_ylabel("window centre (h); labour progresses downward")
     ax.text(
-        0.98, 0.95,
-        f"{cells.centres.get(windows[0], float('nan')):.2g} h (lightest) to "
-        f"{cells.centres.get(windows[-1], float('nan')):.2g} h (darkest), "
-        f"{len(windows)} window(s); dashed = fewer than {minimum} recordings",
-        transform=ax.transAxes, ha="right", va="top",
-        fontsize=figures.FONT_LABEL, color=figures.COLOR_GRAY,
+        0.01, 0.99,
+        f"tick on the baseline = median lag; right margin = recordings per class; "
+        f"dashed, unfilled = fewer than {minimum}",
+        transform=ax.transAxes, ha="left", va="top", fontsize=figures.FONT_TINY,
+        color=figures.COLOR_GRAY,
     )
     figures.style_axes(ax)
-    return len(windows)
+    return len(ordered)
 
 
 def _draw_distance_panel(
@@ -2746,6 +3386,13 @@ def _draw_distance_panel(
     title: str,
 ) -> int:
     """Draw one distance column against the clock, one line per class or per class pair.
+
+    **Two colour conventions, because the two comparisons draw two different things.** A
+    ``window_vs_class_pooled`` series belongs to one cohort, so it takes that cohort's severity
+    colour and the page reads the same way round as every other cohort figure in the run. A
+    ``class_pair`` series belongs to *two* cohorts and to neither alone, so it takes a colour from
+    :data:`_PAIR_COLORS` instead -- see that constant for what painting it in one member's colour
+    costs.
 
     Args:
         ax: Target axes.
@@ -2767,7 +3414,10 @@ def _draw_distance_panel(
         _empty_panel(ax, title)
         return 0
     pairs = list(dict.fromkeys(zip(selected["group_left"], selected["group_right"])))
-    colours = figures.group_colors([str(left) for left, _ in pairs])
+    # Only the self-comparisons name one cohort, so only they take the severity palette.
+    cohort_colours = figures.group_colors(
+        [str(left) for left, right in pairs if left == right]
+    )
     drawn = 0
     for index, (left, right) in enumerate(pairs):
         cell = selected[
@@ -2778,7 +3428,11 @@ def _draw_distance_panel(
             continue
         ax.plot(
             np.asarray(cell["bin_center_h_left"], dtype=np.float64), values,
-            marker="o", markersize=3, color=colours.get(str(left), figures.COLOR_BLUE),
+            marker="o", markersize=3,
+            color=(
+                cohort_colours.get(str(left), figures.COLOR_BLUE) if left == right
+                else _PAIR_COLORS[index % len(_PAIR_COLORS)]
+            ),
             linestyle=_PAIR_STYLES[index % len(_PAIR_STYLES)],
             linewidth=figures.LINE_EMPHASIS,
             label=str(left) if left == right else f"{left} vs {right}",
@@ -2804,21 +3458,36 @@ def build_histogram_figure(
     distances: pd.DataFrame,
     seconds: np.ndarray,
 ) -> Any:
-    """One clock's lag-distribution page: the selection read as a distribution rather than a scalar.
+    r"""One clock's lag-distribution page: the selection read as a distribution rather than a scalar.
 
     Four blocks, and each answers one half of the question the page exists for.
 
     1. Per band, the classes overlaid, pooled over the whole clock axis -- **do the classes attend
        to different lags at all**, before any time conditioning.
-    2. Per class, every window overlaid and graded along the clock -- **does a class's distribution
-       move**, read directly rather than through a scalar trajectory.
-    3. The two distances against the clock: each class against its own pooled distribution, and the
-       class pairs within each window.
+    2. The high band's cells as **density violins on the clock**, one body per (window, class)
+       dodged by class, the body being the cell's own lag distribution with its quartile lags,
+       median and centroid marked inside -- **does the distribution move, and do the classes sit
+       at different lags in the same window**, read side by side.
+    3. The same cells as a **ridgeline**, one ridge per window with the classes overlaid and labour
+       running down the page -- the *shape* of each cell at full width, so a second mode or a
+       heavy tail that a violin at dodge width cannot show is visible, and a shape change along the
+       clock is a change down the page.
+    4. The distances against the clock as a $2 \times 2$ block, :data:`DISTANCE_METRICS` down and
+       :data:`DISTANCE_COMPARISONS` across -- **did it move** (Wasserstein, in seconds) and **does
+       it still overlap** (Jensen-Shannon), each asked of both the within-class drift and the
+       between-class separation. Both metrics of one comparison stand in a column because neither
+       answers the other's question: a distribution that broadened in place is near zero under the
+       first and plainly non-zero under the second.
 
     Both profile sources are drawn side by side in every row, and that is the point rather than
     symmetry: the attention counts every selected timestep once while the attribution weights each
     by how far it moved the belief, so a shift visible in one column and absent from the other is a
     finding about which readout is being read.
+
+    The ridgeline row is sized by the number of windows on the clock rather than at the standard
+    row height, which is why the page is laid out through a gridspec rather than
+    :func:`~teb_vae.lag_attn_cfs.eval.figures_seam.new_figure`: a full delivery clock is two
+    dozen windows, and two dozen ridges in three inches is a texture with no readable shape.
 
     Args:
         clock: The clock.
@@ -2829,17 +3498,20 @@ def build_histogram_figure(
     Returns:
         The figure, for :func:`~teb_vae.lag_attn_cfs.eval.figures_seam.render_figure`.
     """
-    # The classes come from whichever source of the high band has them, not from a named one: a
-    # sidecar carrying no attention map would otherwise collapse the per-class block of a page
-    # whose KL column is fully populated.
-    groups: List[str] = []
-    for source_key, _, _ in PROFILE_SOURCES:
-        block = cells.get((HIGH_BAND_KEY, source_key))
-        if block is not None and block.groups:
-            groups = list(block.groups)
-            break
-    n_rows = len(HISTOGRAM_BANDS) + max(len(groups), 1) + 1
-    figure, axes = figures.new_figure(n_rows, 2, height_per_row=3.0, width=13.0)
+    import matplotlib.pyplot as plt
+
+    n_windows = max((len(block.windows) for block in cells.values()), default=0)
+    heights = (
+        [3.0] * len(HISTOGRAM_BANDS)
+        + [4.5]
+        + [max(3.5, 0.32 * n_windows + 1.5)]
+        + [3.0] * len(DISTANCE_METRICS)
+    )
+    figure = plt.figure(figsize=(13.0, float(sum(heights))))
+    grid = figure.add_gridspec(len(heights), 2, height_ratios=heights)
+    axes = np.array(
+        [[figure.add_subplot(grid[row, column]) for column in range(2)] for row in range(len(heights))]
+    )
 
     for row, band_key in enumerate(HISTOGRAM_BANDS):
         for column, (source_key, _, meaning) in enumerate(PROFILE_SOURCES):
@@ -2854,43 +3526,242 @@ def build_histogram_figure(
             )
 
     base = len(HISTOGRAM_BANDS)
-    if not groups:
-        for column in range(2):
-            _empty_panel(
-                axes[base, column],
-                f"{HIGH_BAND_KEY} band by window: no class could be placed on this clock",
-            )
-    for offset, group in enumerate(groups):
-        for column, (source_key, _, _) in enumerate(PROFILE_SOURCES):
-            block = cells.get((HIGH_BAND_KEY, source_key))
-            title = f"{group}: {HIGH_BAND_KEY}-band {source_key} distribution, window by window"
-            if block is None:
-                _empty_panel(axes[base + offset, column], title)
-                continue
-            _draw_window_overlay(
-                axes[base + offset, column], block, group, seconds, title=title
-            )
+    for column, (source_key, _, _) in enumerate(PROFILE_SOURCES):
+        block = cells.get((HIGH_BAND_KEY, source_key))
+        violin_title = (
+            f"{HIGH_BAND_KEY} band, {source_key}: lag distribution per window and class "
+            f"(body = the cell's distribution; untested)"
+        )
+        ridge_title = (
+            f"{HIGH_BAND_KEY} band, {source_key}: the same cells as ridges, labour running down "
+            f"the page (untested)"
+        )
+        if block is None:
+            _empty_panel(axes[base, column], violin_title)
+            _empty_panel(axes[base + 1, column], ridge_title)
+            continue
+        _draw_density_violins(axes[base, column], clock, block, seconds, title=violin_title)
+        _draw_ridgeline(axes[base + 1, column], clock, block, seconds, title=ridge_title)
 
-    last = base + max(len(groups), 1)
+    last = base + 2
     drawn_distances = (
         distances[(distances["band"] == HIGH_BAND_KEY) & (distances["source"] == "attn")]
         if len(distances) else distances
     )
-    _draw_distance_panel(
-        axes[last, 0], clock, drawn_distances,
-        comparison=WINDOW_DRIFT_COMPARISON, column="jensen_shannon",
-        ylabel="Jensen-Shannon distance (base 2)",
-        title=(
-            f"{HIGH_BAND_KEY} band, attn: each window against its own class pooled over the clock "
-            f"(untested)"
+    for row, (metric, ylabel) in enumerate(DISTANCE_METRICS):
+        for column, (comparison, phrase) in enumerate(DISTANCE_COMPARISONS):
+            _draw_distance_panel(
+                axes[last + row, column], clock, drawn_distances,
+                comparison=comparison, column=metric, ylabel=ylabel,
+                title=f"{HIGH_BAND_KEY} band, attn: {phrase} (untested)",
+            )
+    figures.caveat_note(figure)
+    return figure
+
+
+#: The y-axis label each tested histogram feature is drawn under, by statistic.
+_FEATURE_UNITS: Dict[str, str] = {
+    "median": "median lag (s, stored-coefficient time)",
+    "iqr": "inter-quartile lag range (s)",
+    "entropy": "entropy of the lag distribution (nats)",
+}
+
+
+def _feature_label(column: str) -> str:
+    """The unit label for one tested histogram feature column, or the column itself."""
+    for statistic, label in _FEATURE_UNITS.items():
+        if column == histogram_feature_column(statistic):
+            return label
+    return column
+
+
+def build_histogram_features_figure(
+    clock: Clock, features: pd.DataFrame, records: Sequence[Dict[str, Any]]
+) -> Any:
+    """The tested page for the histogram's shape features: the cells, their $p$ and the effects.
+
+    Built by the same shared page builder as :func:`build_windows_figure`, so a violin, a
+    significance bar and a Cliff's-delta cell here are the same marks as on every other tested
+    page of the run -- the features are new readouts, not a new kind of figure.
+
+    Args:
+        clock: The clock.
+        features: :func:`clock_features`' frame for the tested band and source.
+        records: One :func:`analyse_windows` record per column of :data:`HISTOGRAM_READOUTS`, in
+            that order.
+
+    Returns:
+        The figure, for :func:`~teb_vae.lag_attn_cfs.eval.figures_seam.render_figure`.
+    """
+    present = (
+        sorted(set(features["group"].astype(str)))
+        if len(features) and "group" in features.columns else []
+    )
+    readouts = []
+    for column, record in zip(HISTOGRAM_READOUTS, records):
+        samples, _ = window_samples(clock, features, column)
+        order = [int(row["time_bin"]) for row in record.get("per_window") or []]
+        readouts.append((column, [samples.get(key, {}) for key in order], record))
+    figure = figures.windowed_comparison_figure(
+        readouts,
+        groups=cohort.ordered_groups(present, labels.CLASS_COLUMN),
+        bin_width=TRAJECTORY_BIN_HOURS,
+        min_body_size=shared_stats.MIN_GROUP_SIZE,
+        xlabel=clock.axis_label,
+        ylabel=(
+            "value (seconds for the median lag and the inter-quartile range; nats for the entropy)"
         ),
+        delivery_orientation=clock.inverted,
     )
-    _draw_distance_panel(
-        axes[last, 1], clock, drawn_distances,
-        comparison=CLASS_PAIR_COMPARISON, column="wasserstein_s",
-        ylabel="1-Wasserstein (s, stored-coefficient time)",
-        title=f"{HIGH_BAND_KEY} band, attn: between classes, window by window (untested)",
+    figures.caveat_note(figure)
+    return figure
+
+
+def _draw_recording_trajectories(
+    ax: Any, clock: Clock, features: pd.DataFrame, column: str, *, title: str
+) -> int:
+    """Every recording's own trajectory of one feature, thin, with the class median heavy over it.
+
+    The per-window pages draw one distribution per cell; this draws the *recordings*, so a
+    reader can see whether a moving class median is many recordings moving together or a few
+    entering and leaving the population -- the composition question the drift test answers in a
+    number and this panel answers by eye.
+
+    Args:
+        ax: Target axes.
+        clock: The clock, for the axis label and its orientation.
+        features: :func:`clock_features`' frame.
+        column: The feature column.
+        title: Panel title.
+
+    Returns:
+        How many recordings were drawn.
+    """
+    needed = {"group", "guid", clock.center_column, column}
+    if features.empty or not needed <= set(features.columns):
+        _empty_panel(ax, title)
+        return 0
+    frame = features[np.isfinite(np.asarray(features[column], dtype=np.float64))]
+    groups = cohort.ordered_groups(sorted(set(frame["group"].astype(str))), labels.CLASS_COLUMN)
+    if not groups:
+        _empty_panel(ax, title)
+        return 0
+    colours = figures.group_colors(groups)
+    drawn = 0
+    for group in groups:
+        colour = colours.get(group, figures.COLOR_BLUE)
+        block = frame[frame["group"].astype(str) == group]
+        for _, recording in block.groupby("guid", sort=True):
+            ordered = recording.sort_values(clock.center_column)
+            ax.plot(
+                np.asarray(ordered[clock.center_column], dtype=np.float64),
+                np.asarray(ordered[column], dtype=np.float64),
+                color=colour, alpha=0.3, linewidth=figures.LINE_HAIRLINE, marker=".",
+                markersize=1.5, zorder=1,
+            )
+            drawn += 1
+        medians = block.groupby(clock.center_column, sort=True)[column].median()
+        ax.plot(
+            np.asarray(medians.index, dtype=np.float64), np.asarray(medians, dtype=np.float64),
+            color=colour, linewidth=figures.LINE_HEAVY, marker="o", markersize=3, zorder=3,
+            label=f"{group} median (n={int(block['guid'].nunique())} deliveries)",
+        )
+    ax.set_title(title)
+    ax.set_xlabel(clock.axis_label)
+    ax.set_ylabel(_feature_label(column))
+    if clock.inverted:
+        ax.invert_xaxis()
+    else:
+        ax.axvline(0.0, color=figures.COLOR_GRAY, linestyle=":", linewidth=figures.LINE_REGULAR, zorder=0)
+    ax.legend(fontsize=figures.FONT_LABEL, loc="best")
+    figures.style_axes(ax)
+    return drawn
+
+
+def _format_p(value: Any) -> str:
+    """A $p$-value for a title: two significant figures, or ``n/a`` when it was not computed."""
+    return f"{float(value):.2g}" if value is not None and np.isfinite(float(value)) else "n/a"
+
+
+def _draw_drift_violins(
+    ax: Any, drift: pd.DataFrame, record: Dict[str, Any], column: str, *, title: str
+) -> int:
+    """One violin per class of the within-recording slopes, zero marked, the tests in the title."""
+    groups = (
+        cohort.ordered_groups(sorted(set(drift["group"].astype(str))), labels.CLASS_COLUMN)
+        if len(drift) else []
     )
+    samples = {
+        group: np.asarray(drift.loc[drift["group"].astype(str) == group, "slope_per_h"], dtype=np.float64)
+        for group in groups
+    }
+    per_class = {
+        item["group"]: item for item in record.get("per_class", []) if item["metric"] == column
+    }
+    omnibus = next((item for item in record.get("omnibus", []) if item["metric"] == column), {})
+    pairs = record.get("pairwise", {}).get(column, [])
+    lines = [
+        title,
+        "across classes (Kruskal-Wallis, Holm): p = " + _format_p(omnibus.get("p_holm"))
+        + "; vs zero (Wilcoxon, Holm): "
+        + ", ".join(
+            f"{group} p = {_format_p(per_class.get(group, {}).get('p_holm'))}" for group in groups
+        ),
+    ]
+    if pairs:
+        lines.append(
+            "surviving pairs: " + ", ".join(
+                f"{item['left']} vs {item['right']} delta = {float(item['cliffs_delta']):+.2f}"
+                for item in pairs
+            )
+        )
+    drawn = figures.violin_panel(
+        ax, samples, title="\n".join(lines), ylabel=f"{_feature_label(column)} per hour of labour",
+        colors=figures.group_colors(groups), reference=0.0, reference_label="no drift",
+    )
+    ax.set_xticklabels(
+        [f"{group} (n={int(samples[group].size)})" for group in groups],
+        rotation=0, ha="center",
+    )
+    return drawn
+
+
+def build_histogram_drift_figure(
+    clock: Clock,
+    features: pd.DataFrame,
+    drifts: Dict[str, pd.DataFrame],
+    record: Dict[str, Any],
+) -> Any:
+    """The within-recording drift page: each recording's trajectory, and the slopes by class.
+
+    One row per tested feature. Left, every recording's own trajectory along the clock with the
+    class median over it; right, the per-recording slopes as one violin per class with zero
+    marked, the class-against-zero and across-class tests in the title, and any surviving pair's
+    Cliff's delta. The right panel is the test of what the left panel shows.
+
+    Args:
+        clock: The clock.
+        features: :func:`clock_features`' frame for the tested band and source.
+        drifts: Feature column to :func:`recording_drift`'s frame.
+        record: :func:`analyse_drift`'s record for this clock.
+
+    Returns:
+        The figure, for :func:`~teb_vae.lag_attn_cfs.eval.figures_seam.render_figure`.
+    """
+    figure, axes = figures.new_figure(len(HISTOGRAM_READOUTS), 2, height_per_row=3.4, width=13.0)
+    for row, column in enumerate(HISTOGRAM_READOUTS):
+        _draw_recording_trajectories(
+            axes[row, 0], clock, features, column,
+            title=f"{column}: every recording (thin) and the class median (heavy)",
+        )
+        _draw_drift_violins(
+            axes[row, 1], drifts.get(column, pd.DataFrame(columns=list(HISTOGRAM_DRIFT_COLUMNS))),
+            record, column,
+            title=(
+                f"{column}: within-recording slope, recordings scored in >= "
+                f"{MIN_DRIFT_WINDOWS} windows; positive = rises as delivery approaches"
+            ),
+        )
     figures.caveat_note(figure)
     return figure
 
@@ -3108,6 +3979,9 @@ def run_lag_high_kl_analysis(
     histogram_features: List[Dict[str, Any]] = []
     distance_tables: List[pd.DataFrame] = []
     histogram_census: Dict[str, Any] = {}
+    histogram_significance: List[Dict[str, Any]] = []
+    drift_records: List[Dict[str, Any]] = []
+    drift_tables: List[pd.DataFrame] = []
     written: List[str] = []
     for clock in CLOCKS:
         binned, record = clock_rows(clock, featured)
@@ -3156,6 +4030,11 @@ def run_lag_high_kl_analysis(
         # ``add_feature_columns`` and this is a second reading of them.
         clock_cells: Dict[Tuple[str, str], HistogramCells] = {}
         clock_distances: List[pd.DataFrame] = []
+        # The per-recording features of the tested (band, source), kept for the two tested pages
+        # below; empty with its schema when that combination produced nothing.
+        tested_features = clock_features(
+            clock, histogram_feature_frame(pd.DataFrame(), seconds)[0]
+        )
         for band_key in HISTOGRAM_BANDS:
             for source_key, _, _ in PROFILE_SOURCES:
                 densities = recording_densities(
@@ -3167,6 +4046,8 @@ def run_lag_high_kl_analysis(
                     histogram_frame(clock, band_key, source_key, densities, seconds)
                 )
                 features, census = histogram_feature_frame(densities, seconds)
+                if (band_key, source_key) == (HISTOGRAM_TESTED_BAND, HISTOGRAM_TESTED_SOURCE):
+                    tested_features = clock_features(clock, features)
                 histogram_features.extend(
                     histogram_feature_rows(clock, band_key, source_key, features)
                 )
@@ -3185,6 +4066,48 @@ def run_lag_high_kl_analysis(
             build_histogram_figure(clock, clock_cells, clock_distance, seconds),
             directory / clock.histogram_figure,
         ).name))
+
+        # --- The tested half of the histogram: the shape features across classes per window, --
+        # --- and each recording's own drift of them along the clock ---------------------------
+        # The same three layers of inference, through the same functions, as the two shipped
+        # readouts; the features are one more set of columns on a per-recording frame.
+        feature_records = [
+            {
+                **analyse_windows(clock, tested_features, column),
+                "band": HISTOGRAM_TESTED_BAND,
+                "source": HISTOGRAM_TESTED_SOURCE,
+            }
+            for column in HISTOGRAM_READOUTS
+        ]
+        histogram_significance.extend(feature_records)
+        drifts = {
+            column: recording_drift(
+                clock, HISTOGRAM_TESTED_BAND, HISTOGRAM_TESTED_SOURCE, tested_features, column
+            )
+            for column in HISTOGRAM_READOUTS
+        }
+        drift_tables.extend(drifts.values())
+        drift_record = analyse_drift(clock, HISTOGRAM_TESTED_BAND, HISTOGRAM_TESTED_SOURCE, drifts)
+        drift_records.append(drift_record)
+        written.append(str(figures.render_figure(
+            build_histogram_features_figure(clock, tested_features, feature_records),
+            directory / clock.features_figure,
+        ).name))
+        written.append(str(figures.render_figure(
+            build_histogram_drift_figure(clock, tested_features, drifts, drift_record),
+            directory / clock.drift_figure,
+        ).name))
+        record.update(
+            {
+                "n_significant_histogram_windows": {
+                    r["metric_column"]: r.get("n_significant_windows", 0) for r in feature_records
+                },
+                "n_recordings_with_drift": {
+                    column: int(table["guid"].nunique()) if len(table) else 0
+                    for column, table in drifts.items()
+                },
+            }
+        )
         record.update(
             {
                 "drawn": True,
@@ -3273,6 +4196,18 @@ def run_lag_high_kl_analysis(
     _concat_tables(distance_tables, HISTOGRAM_DISTANCE_COLUMNS).to_csv(
         directory / HISTOGRAM_DISTANCE_FILENAME, index=False
     )
+    _tagged_frame(significance_frame, histogram_significance).to_csv(
+        directory / HISTOGRAM_SIGNIFICANCE_FILENAME, index=False
+    )
+    _tagged_frame(pairwise_frame, histogram_significance).to_csv(
+        directory / HISTOGRAM_PAIRWISE_FILENAME, index=False
+    )
+    _concat_tables(drift_tables, HISTOGRAM_DRIFT_COLUMNS).to_csv(
+        directory / HISTOGRAM_DRIFT_FILENAME, index=False
+    )
+    drift_summary_frame(drift_records).to_csv(
+        directory / HISTOGRAM_DRIFT_SUMMARY_FILENAME, index=False
+    )
     significance_frame(significance).to_csv(directory / SIGNIFICANCE_FILENAME, index=False)
     pairwise_frame(significance).to_csv(directory / PAIRWISE_FILENAME, index=False)
     argmax_table.to_csv(directory / ARGMAX_FILENAME, index=False)
@@ -3283,7 +4218,9 @@ def run_lag_high_kl_analysis(
         TRAJECTORY_FILENAME, PROFILE_FILENAME, SIGNIFICANCE_FILENAME, PAIRWISE_FILENAME,
         ARGMAX_FILENAME, CONTRACTION_FILENAME, GAIN_BY_QUANTILE_FILENAME,
         GAIN_BY_ARGMAX_FILENAME, OCCLUSION_CONSISTENCY_FILENAME, HISTOGRAM_FILENAME,
-        HISTOGRAM_FEATURES_FILENAME, HISTOGRAM_DISTANCE_FILENAME, *written,
+        HISTOGRAM_FEATURES_FILENAME, HISTOGRAM_DISTANCE_FILENAME,
+        HISTOGRAM_SIGNIFICANCE_FILENAME, HISTOGRAM_PAIRWISE_FILENAME, HISTOGRAM_DRIFT_FILENAME,
+        HISTOGRAM_DRIFT_SUMMARY_FILENAME, *written,
     ]
     drawn = [record for record in clocks if record.get("drawn")]
     logger.info(
@@ -3292,7 +4229,12 @@ def run_lag_high_kl_analysis(
         f"{selection['bands']['high']['n_anchors_population']} anchors; "
         f"{selection['hot_lags']['n_lags']} hot lag(s); {len(drawn)} of {len(CLOCKS)} clock(s) drawn; "
         f"{sum(r.get('n_significant_windows', 0) for r in significance)} significant window(s) "
-        f"across {len(significance)} Holm family(ies)"
+        f"across {len(significance)} Holm family(ies); histogram features: "
+        f"{sum(r.get('n_significant_windows', 0) for r in histogram_significance)} significant "
+        f"window(s) across {len(histogram_significance)} family(ies), "
+        f"{sum(r['n_classes_drifting'] for r in drift_records)} drifting class(es) and "
+        f"{sum(r['n_features_differing'] for r in drift_records)} feature(s) whose drift differs "
+        f"by class"
     )
     return {
         "n_samples": scored_sample_count(featured, band_column("high", ANCHOR_FRAC_SUFFIX)),
@@ -3313,7 +4255,7 @@ def run_lag_high_kl_analysis(
                 "the second-stage half is scored over the recordings that carry an onset only, "
                 "which is a subset of the evaluated cohort"
             ),
-            "tested_features": len(READOUTS),
+            "tested_features": len(READOUTS) + len(HISTOGRAM_READOUTS),
         },
         "population": {
             "n_anchors": int(population.rows.size),
@@ -3371,6 +4313,34 @@ def run_lag_high_kl_analysis(
                 "tested": False,
             },
             "census": histogram_census,
+            # The tested half: which features, on which band and source, and what came of it. The
+            # per-window and pairwise detail is on the two CSVs, as it is for the shipped readouts.
+            "tested": {
+                "band": HISTOGRAM_TESTED_BAND,
+                "source": HISTOGRAM_TESTED_SOURCE,
+                "statistics": list(HISTOGRAM_TESTED_STATISTICS),
+                "readouts": list(HISTOGRAM_READOUTS),
+                "n_holm_families": len(histogram_significance),
+                "significance": [
+                    {
+                        key: value for key, value in record.items()
+                        if key not in ("per_window", "pairwise")
+                    }
+                    for record in histogram_significance
+                ],
+                "drift": {
+                    "min_windows": int(MIN_DRIFT_WINDOWS),
+                    "forward_time": (
+                        "slopes are per hour of forward labour time, so positive means the "
+                        "feature rises as delivery approaches on both clocks"
+                    ),
+                    "families": (
+                        "per clock, two: every (feature, class) slope against zero, and every "
+                        "feature's omnibus across classes; Holm within each"
+                    ),
+                    "records": drift_records,
+                },
+            },
         },
         "bin_width_hours": float(TRAJECTORY_BIN_HOURS),
         "n_lags": n_lags,

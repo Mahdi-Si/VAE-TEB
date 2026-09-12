@@ -747,35 +747,64 @@ across the lags actually look like — and does that shape differ between the cl
 delivery approaches?"* Every other `lag_high_kl` page reduces that spread to a centroid or a share
 before showing it. This one draws the distribution.
 
-**What it shows.** Four blocks, both profile sources side by side in every row — `attn` on the left,
-`kl` on the right. **Rows 1–2:** the classes overlaid, one step curve each, for the `high` band and
+**What it shows.** Four blocks, both profile sources side by side in every row — `kl` on the left,
+`attn` on the right. **Rows 1–2:** the classes overlaid, one step curve each, for the `high` band and
 then the `top` band, pooled over every window of the clock; the legend carries each class's delivery
-count. **Rows 3 onward, one per class:** that class's `high`-band distribution drawn once per time
-window, coloured light-to-dark along the clock, the legend naming each window's centre in hours and
-its recording count; windows below three recordings are drawn hairline-dashed and left out of the
-legend. **Bottom left:** the Jensen–Shannon distance of each window against its own class's
-distribution pooled over the whole clock — a class whose lag structure is stationary sits flat and
-low. **Bottom right:** the $1$-Wasserstein distance between the classes in each window, in seconds.
+count. **Row 3, the density violins:** the `high` band's cells on the clock, one body per (window,
+class) dodged by class inside each window. The body is **the cell's own lag distribution** — its
+half-width at a lag is that lag's share — drawn as a step outline because a share is per lag bin;
+it is not a kernel density of anything. Inside each body the heavy bar spans the distribution's
+quartile lags, the white dot is its median lag and the short black tick its centroid, which on these
+skewed profiles sits well away from the median. The recording count stands above every body; a cell
+below three recordings is faint and dashed rather than absent. **Row 4, the ridgeline:** the same
+cells with the lag across, one ridge per window, the classes overlaid on each, **labour running down
+the page** on both clocks (farthest from delivery at the top). Each ridge is labelled with its window
+centre on the left and its per-class recording counts on the right; a class's median lag is ticked on
+the baseline. Every body on a panel is drawn at one scale, so widths and heights compare across
+windows and classes. **Bottom two rows:** the distances against the clock, **metric down and comparison across**.
+The left column is each window against its own class pooled over the whole clock, one line per class
+in the severity colours — a cohort whose lag structure is stationary sits flat and near zero. The
+right column is the distance between the classes within each window, one line per class **pair**;
+a pair belongs to two cohorts and to neither alone, so those lines use a separate blue/purple/black
+palette that is none of the class green, amber or red, and the pair is read off the legend rather
+than off the hue. The upper of the two rows is the $1$-Wasserstein distance **in seconds**, which
+says how far the distribution moved; the lower is the Jensen–Shannon distance, which says how much
+overlap is left.
 
-**Axes.** Stored-coefficient lag in seconds across on every distribution panel, share of the
-distribution up. Hours before delivery across on the two bottom panels, drawn with delivery at the
-right; Jensen–Shannon (base $2$, bounded by $1$) and seconds up respectively.
+**Axes.** Stored-coefficient lag in seconds across on the pooled panels and the ridgeline, share of
+the distribution up on the pooled panels and window centre up on the ridgeline. Hours before delivery
+across on the density violins and on all four distance panels, drawn with delivery at the right; lag
+in seconds up on the violins; seconds up on the Wasserstein row, and Jensen–Shannon (base $2$,
+bounded by $1$) up on the row below it.
 
-**How it is misread.** Five ways.
+**How it is misread.** Six ways.
 
 - **It is a distribution per recording, then averaged — not a pooled histogram.** Each recording is
   normalised before the cell mean, so a recording carrying ten times the coupling of its neighbours
   counts once, not ten times. This is why the shape here can differ from the heatmap on
   `lag_high_kl_time_to_delivery.pdf`, which normalises after averaging and therefore reports where a
   cohort's coupling *mass* sits. Neither is wrong; they answer different questions.
-- **Nothing on this page carries a $p$-value.** Both distances are descriptive. A distance between
-  two estimated distributions is positive almost surely even when the two populations coincide, so a
-  non-zero value is not evidence of a difference — read it beside the recording counts on the row.
+- **Nothing on this page carries a $p$-value.** The violins and ridges are the cells themselves and
+  both distances are descriptive; a distance between two estimated distributions is positive almost
+  surely even when the two populations coincide, so a non-zero value is not evidence of a difference
+  — read it beside the recording counts on the row. The tests on these cells' shape features are on
+  `lag_high_kl_time_to_delivery_histogram_features.pdf`, and the within-recording drift on
+  `lag_high_kl_time_to_delivery_histogram_drift.pdf`.
+- **A density violin's width is a share, and its inner marks are the distribution's own.** The bar
+  is the quartile *lags* of the cell's distribution, not the spread of the recordings behind it; the
+  spread over recordings is what the features page's violins show. Two cells with the same body can
+  stand on three recordings or thirty, which is why the count is printed above each.
+- **Neither distance row answers the other's question, so a column is read down, not alone.**
+  Wasserstein measures displacement along the lag axis and is blind to a distribution that broadened
+  or split *in place*; Jensen–Shannon measures overlap and is blind to displacement once two
+  supports have separated, at which point it sits at its ceiling of $1$ however far apart they are.
+  A cohort whose distribution widened toward delivery without shifting reads as near zero on the
+  upper row and plainly non-zero on the lower one, and a single row would lose that finding.
 - **The two columns are not a consistency check, they are the finding.** `attn` counts every
   selected timestep once; `kl` weights each by how far the source moved the belief there. A shift
   visible in one column and absent from the other says which readout is carrying it.
-- **A blank in the colour ramp is a window with no scored recording**, not a window where the
-  distribution collapsed.
+- **A missing body or ridge is a window with no scored recording for that class**, not a window
+  where the distribution collapsed; the dodge keeps every class's slot, so a gap stays a gap.
 - **The lag axis is stored-coefficient time.** A distance quoted in seconds is a displacement on
   that axis and not a change in physiological latency; the caveat at the foot of the page applies to
   every number on it.
@@ -785,12 +814,99 @@ right; Jensen–Shannon (base $2$, bounded by $1$) and seconds up respectively.
 **In plain terms.** The same page against the second clinical landmark: does the lag distribution of
 the coupling-carrying timesteps change around second-stage onset?
 
-**What it shows and its axes.** As `lag_high_kl_time_to_delivery_histogram.pdf`, with the two bottom
-panels on the signed second-stage axis and the onset marked at zero.
+**What it shows and its axes.** As `lag_high_kl_time_to_delivery_histogram.pdf`, with the density
+violins and the four bottom distance panels on the signed second-stage axis and the onset marked at
+zero; the ridgeline still runs earliest-before-onset at the top.
 
 **How it is misread.** As that page, and with the same population caveat as the second-stage profile
 page above: the recordings scored here are those carrying an onset, a strict subset of the cohort,
 so a class's distribution on this page and on the delivery page are over different populations.
+
+## `lag_high_kl/lag_high_kl_time_to_delivery_histogram_features.pdf`
+
+**In plain terms.** *"Do the classes' lag distributions differ in shape, window by window — and is
+the difference real?"* The histogram page draws the cells; this page tests three numbers taken of
+each **recording's own** histogram of the `high` band's KL attribution: its **median lag** (where it
+sits), its **inter-quartile lag range** (how wide it is) and its **entropy** (how concentrated it is)
+— one from each family of shape statistic, so the three ways two distributions can differ are each
+asked once.
+
+**What it shows.** For each of `hist_median_s`, `hist_iqr_s` and `hist_entropy_nats`: one violin per
+(window, class) cell over one value per recording, the Holm-adjusted $p$ of that window's
+Kruskal–Wallis directly beneath it on the same axis, and — at the foot — Cliff's delta for every
+class pair that survived, oriented more severe against less severe so a positive value means the more
+severe class runs higher. Exactly the page `lag_high_kl_time_to_delivery_windows.pdf` is, for three
+more readouts.
+
+**Axes.** Hours before delivery across, delivery at the right. The violin rows share one $y$ label
+because the page carries three units: seconds for the median and the range, nats for the entropy;
+each row's title names which it is.
+
+**How it is misread.** Three ways. **These are three more Holm families per clock**, six across the
+two clocks, and they are not corrected jointly with the four the analysis already defends; a reader
+quoting a window from two families has made two comparisons. **The centroid is deliberately not
+here**: `high_lag_centroid_kl_s` already tests the position of the same selection on the same band
+and source, and a second family on it would ask one question twice. And **the features are of the
+`kl` source alone** — the attention source's features are in `lag_high_kl_histogram_features.csv`
+and drawn on the histogram page, untested.
+
+## `lag_high_kl/lag_high_kl_second_stage_histogram_features.pdf`
+
+**In plain terms.** The tested shape features against the second clock: the same three readouts,
+the same three layers of inference, its own three Holm families.
+
+**What it shows and its axes.** As `lag_high_kl_time_to_delivery_histogram_features.pdf`, on the
+signed second-stage axis with the onset marked at zero.
+
+**How it is misread.** As that page, and with the same population caveat as the second-stage profile
+page above.
+
+## `lag_high_kl/lag_high_kl_time_to_delivery_histogram_drift.pdf`
+
+**In plain terms.** *"Does a recording's own lag distribution move as its labour progresses — and
+does it move differently in the sick classes?"* Every per-window page compares *different*
+recordings in every window: a cohort thins toward the edge of the axis, so a class median can move
+because the population changed rather than because any recording did. This page fits the movement
+**within** each recording and asks the question of the slopes.
+
+**What it shows.** One row per tested feature (`hist_median_s`, `hist_iqr_s`, `hist_entropy_nats`).
+**Left:** every recording's own trajectory of the feature along the clock, thin in its class colour,
+with the class median per window heavy over it — so a moving median can be read as many recordings
+moving together or as a few entering and leaving. **Right:** the least-squares slope of the feature
+against **forward labour time**, one value per recording scored in at least three windows, as one
+violin per class with zero marked. The title carries the tests: the Holm-adjusted Kruskal–Wallis $p$
+across classes, each class's Holm-adjusted Wilcoxon signed-rank $p$ against zero, and Cliff's delta
+for any class pair that survived.
+
+**Axes.** Left: hours before delivery across, delivery at the right; the feature's unit up. Right:
+class across; the feature's unit **per hour of labour** up, zero marked.
+
+**How it is misread.** Four ways.
+
+- **Positive means the feature rises as delivery approaches, on both clocks.** The delivery clock
+  counts backwards, so its centres are negated before the fit; a slope here and a slope on the
+  second-stage page carry the same sign for the same drift. The raw window centres are on
+  `lag_high_kl_histogram_drift.csv` for a reader who wants the fit's inputs.
+- **Two families per clock, each Holm across the three features.** The class-against-zero tests are
+  one family; the across-class tests are another; pairwise runs on survivors only. Neither is joint
+  with the per-window families.
+- **A recording scored in fewer than three windows is absent**, not at zero — the count in each
+  class's tick label is the fitted recordings, which is a subset of the class.
+- **A slope is a straight line through a trajectory that need not be straight.** A distribution
+  that moves out and back reads as no drift; the left panel is where that would be seen.
+
+## `lag_high_kl/lag_high_kl_second_stage_histogram_drift.pdf`
+
+**In plain terms.** The same within-recording drift against the second clock, over the recordings
+that carry an onset.
+
+**What it shows and its axes.** As `lag_high_kl_time_to_delivery_histogram_drift.pdf`; the left
+panels are on the signed second-stage axis, not inverted, with the onset marked at zero, and the
+slopes are already in forward time so the right panels read identically.
+
+**How it is misread.** As that page, and with the same population caveat as the second-stage profile
+page above. A recording with few windows on either side of the onset spans a short clock here even
+when it spanned a long one on the delivery clock, so its slope is the noisier of the two.
 
 ## `lag_high_kl/lag_high_kl_usefulness.pdf`
 

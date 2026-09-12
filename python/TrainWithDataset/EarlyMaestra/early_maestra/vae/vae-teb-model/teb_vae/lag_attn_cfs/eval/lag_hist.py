@@ -48,7 +48,7 @@ running offline against a finished run directory imports it without paying for `
 """
 from __future__ import annotations
 
-from typing import Any, Dict
+from typing import Any, Dict, Sequence
 
 import numpy as np
 
@@ -246,3 +246,35 @@ def cell_distances(left: Any, right: Any, seconds: Any) -> Dict[str, float]:
         "wasserstein_s": wasserstein_seconds(left, right, seconds),
         "centroid_delta_s": centroid_seconds(left, seconds) - centroid_seconds(right, seconds),
     }
+
+
+def quantile_seconds(profile: Any, seconds: Any, quantiles: Sequence[float]) -> np.ndarray:
+    r"""The lags at which one profile's cumulative mass first reaches each quantile.
+
+    $$\tau_q = \min\{\tau_\ell : F(\tau_\ell) \ge q\}, \qquad F(\tau_\ell) = \sum_{k \le \ell} p_k$$
+
+    The same first-bin rule ``lag_shape.profile_statistics`` applies to a *stack* of profiles for
+    its ``median`` and ``iqr`` columns, exposed for a single already-pooled cell so that the
+    quartile marks drawn inside a density violin are the quartiles the feature table reports of
+    that same object, rather than a second reading of it.
+
+    Args:
+        profile: One value per lag.
+        seconds: The compensated lag axis, $(L,)$, ascending.
+        quantiles: The cumulative-mass levels wanted, each in $[0, 1]$.
+
+    Returns:
+        One lag in seconds per requested quantile, in the order given. All ``NaN`` when the profile
+        carries no finite positive mass or the two arrays do not share a length.
+    """
+    mass = _mass(profile)
+    axis = np.asarray(seconds, dtype=np.float64).ravel()
+    wanted = np.asarray(list(quantiles), dtype=np.float64)
+    total = mass.sum()
+    if mass.size == 0 or mass.size != axis.size or total <= 0.0:
+        return np.full(wanted.size, np.nan)
+    cumulative = np.cumsum(mass / total)
+    # Pinned, for the reason ``profile_statistics`` pins it: a cumulative sum landing at
+    # $0.9999999$ through floating point would let ``argmax`` find no bin and return bin 0.
+    cumulative[-1] = 1.0
+    return axis[np.array([int((cumulative >= level).argmax()) for level in wanted])]

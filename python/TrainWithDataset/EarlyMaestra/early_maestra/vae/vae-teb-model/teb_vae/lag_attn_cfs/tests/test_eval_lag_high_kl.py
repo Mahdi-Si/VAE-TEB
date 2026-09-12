@@ -231,7 +231,11 @@ def test_the_hot_lag_set_is_written_lag_by_lag_and_agrees_with_the_record(tmp_pa
 # What is tested, and what is not
 # =================================================================================================
 def test_exactly_the_two_readouts_are_tested_on_both_clocks(tmp_path) -> None:
-    """Four Holm families: the high band's centroid and share, on two clocks, and nothing else."""
+    """Four Holm families on the main table: the high band's centroid and share, on two clocks.
+
+    The histogram's own families live on their own table and in their own block of the record, so
+    a consumer of ``significance`` still meets exactly the four it always did.
+    """
     record, directory = _run(_context(), tmp_path)
 
     assert list(record["readouts"]) == ["high_lag_centroid_kl_s", "high_anchor_frac"]
@@ -240,9 +244,10 @@ def test_exactly_the_two_readouts_are_tested_on_both_clocks(tmp_path) -> None:
     assert set(significance["clock"]) == {"time_to_delivery", "second_stage"}
     families = {(r["clock"], r["metric_column"]) for r in record["significance"]}
     assert len(families) == 4
-    assert record["plan"]["tested_features"] == 2
+    assert record["plan"]["tested_features"] == 2 + len(analysis.HISTOGRAM_READOUTS)
     assert "no p-value" in record["untested_note"]
     assert "four Holm families" in record["method"]
+    assert "six further families" in record["method"]
 
 
 def test_the_second_clock_is_a_subset_and_the_analysis_declares_itself_capped(tmp_path) -> None:
@@ -341,7 +346,7 @@ def test_the_headline_block_resolves_on_the_fixture(tmp_path) -> None:
 # The artifacts, and the refusals
 # =================================================================================================
 def test_every_table_and_figure_is_written(tmp_path) -> None:
-    """Sixteen tables and eight figures, each named in the record's ``files``."""
+    """Twenty tables and twelve figures, each named in the record's ``files``."""
     record, directory = _run(_context(), tmp_path)
 
     tables = {
@@ -351,7 +356,9 @@ def test_every_table_and_figure_is_written(tmp_path) -> None:
         analysis.CONTRACTION_FILENAME, analysis.GAIN_BY_QUANTILE_FILENAME,
         analysis.GAIN_BY_ARGMAX_FILENAME, analysis.OCCLUSION_CONSISTENCY_FILENAME,
         analysis.HISTOGRAM_FILENAME, analysis.HISTOGRAM_FEATURES_FILENAME,
-        analysis.HISTOGRAM_DISTANCE_FILENAME,
+        analysis.HISTOGRAM_DISTANCE_FILENAME, analysis.HISTOGRAM_SIGNIFICANCE_FILENAME,
+        analysis.HISTOGRAM_PAIRWISE_FILENAME, analysis.HISTOGRAM_DRIFT_FILENAME,
+        analysis.HISTOGRAM_DRIFT_SUMMARY_FILENAME,
     }
     figures = {
         f"{analysis.SELECTION_FIGURE}.pdf",
@@ -359,6 +366,8 @@ def test_every_table_and_figure_is_written(tmp_path) -> None:
         *(f"{clock.figure}.pdf" for clock in analysis.CLOCKS),
         *(f"{clock.windows_figure}.pdf" for clock in analysis.CLOCKS),
         *(f"{clock.histogram_figure}.pdf" for clock in analysis.CLOCKS),
+        *(f"{clock.features_figure}.pdf" for clock in analysis.CLOCKS),
+        *(f"{clock.drift_figure}.pdf" for clock in analysis.CLOCKS),
     }
     assert set(record["files"]) == tables | figures
     for name in tables | figures:
@@ -793,11 +802,115 @@ def test_a_rigid_shift_of_one_class_is_reported_in_seconds(shifted_run) -> None:
     assert (pairs["centroid_delta_s"].to_numpy() < 0.0).all()
 
 
-def test_the_record_declares_the_histogram_half_untested(tmp_path) -> None:
-    """No new Holm family: the four the analysis defends are still four."""
+def test_the_record_keeps_the_distances_untested_and_the_main_families_at_four(tmp_path) -> None:
+    """The histogram's families are their own block: the four the analysis defends are still four."""
     record, _ = _run(_context(), tmp_path)
 
     assert record["lag_histogram"]["distance"]["tested"] is False
     assert set(record["lag_histogram"]["bands"]) == set(analysis.HISTOGRAM_BANDS)
     assert "histogram" in record["untested_note"]
     assert len(record["significance"]) == len(analysis.CLOCKS) * len(analysis.READOUTS)
+
+
+# =================================================================================================
+# The tested half of the histogram: shape features per window, and their drift within recordings
+# =================================================================================================
+def test_exactly_the_three_shape_features_are_tested_on_the_high_kl_histogram(tmp_path) -> None:
+    """Six families -- three features on two clocks -- on the high band's KL source, and the
+    centroid, which the main table already tests, is not among them."""
+    record, directory = _run(_context(), tmp_path)
+
+    tested = record["lag_histogram"]["tested"]
+    assert tested["band"] == "high" and tested["source"] == "kl"
+    assert list(tested["readouts"]) == ["hist_median_s", "hist_iqr_s", "hist_entropy_nats"]
+    assert "hist_centroid_s" not in tested["readouts"]
+    families = {(r["clock"], r["metric_column"]) for r in tested["significance"]}
+    assert len(families) == len(analysis.CLOCKS) * len(analysis.HISTOGRAM_READOUTS) == 6
+    assert tested["n_holm_families"] == 6
+    significance = pd.read_csv(directory / analysis.HISTOGRAM_SIGNIFICANCE_FILENAME)
+    assert set(significance["metric_column"]) <= set(analysis.HISTOGRAM_READOUTS)
+    assert set(significance["band"]) == {"high"} and set(significance["source"]) == {"kl"}
+    assert list(significance.columns[:3]) == ["clock", "band", "source"]
+
+
+def test_a_rigid_shift_between_the_classes_is_found_by_the_median_family_alone(shifted_run) -> None:
+    """Known answer: the shifted fixture moves one class's block two lags later and changes nothing
+    else, so the median lag separates the classes in every window of the delivery clock while the
+    width and the entropy -- which a rigid shift leaves alone -- do not."""
+    _, directory = shifted_run
+
+    significance = pd.read_csv(directory / analysis.HISTOGRAM_SIGNIFICANCE_FILENAME)
+    delivery = significance[significance["clock"] == "time_to_delivery"]
+    median = delivery[delivery["metric_column"] == "hist_median_s"]
+    assert len(median) and median["significant"].all()
+    others = delivery[delivery["metric_column"] != "hist_median_s"]
+    assert len(others) and not others["significant"].any()
+    pairwise = pd.read_csv(directory / analysis.HISTOGRAM_PAIRWISE_FILENAME)
+    moved = pairwise[pairwise["metric_column"] == "hist_median_s"]
+    # Worst first, and the healthy class was moved to the longer lag, so the severe class sits at
+    # the shorter one on every surviving window.
+    assert len(moved) and (moved["left"] == "hie").all()
+    assert (moved["cliffs_delta"].to_numpy() < 0.0).all()
+
+
+def test_the_same_construction_in_both_classes_survives_no_histogram_family(aligned_run) -> None:
+    """The negative control of the test above: the families find nothing when there is nothing."""
+    _, directory = aligned_run
+
+    significance = pd.read_csv(directory / analysis.HISTOGRAM_SIGNIFICANCE_FILENAME)
+    assert len(significance) and not significance["significant"].any()
+
+
+def test_the_drift_is_the_slope_against_forward_labour_time_on_both_clocks() -> None:
+    """Known answer for the fit and for its sign convention.
+
+    A feature rising by one unit per hour *toward delivery* is a negative slope against hours before
+    delivery and a positive one against hours from onset; the drift reports it as $+1$ on both, and
+    a recording scored in fewer than the minimum windows is absent rather than at zero.
+    """
+    delivery, second = analysis.CLOCKS
+    for clock, sign in ((delivery, -1.0), (second, 1.0)):
+        recordings = {"A": (3.0, 2.0, 1.0), "B": (2.5, 1.5, 0.5, -0.5), "SHORT": (0.5, 1.0)}
+        rows = [
+            {
+                "group": "hie", "guid": guid,
+                clock.bin_column: int(centre * 2), clock.center_column: centre,
+                # value = 10 + 1 x forward time, forward time being the negated centre on the
+                # delivery clock and the centre itself on the second-stage clock.
+                "hist_median_s": 10.0 + sign * centre,
+            }
+            for guid, centres in recordings.items()
+            for centre in centres
+        ]
+        drift = analysis.recording_drift(clock, "high", "kl", pd.DataFrame(rows), "hist_median_s")
+
+        assert set(drift["guid"]) == {"A", "B"}
+        assert drift["slope_per_h"].to_numpy() == pytest.approx(1.0)
+        assert (drift["delta_last_minus_first"].to_numpy() > 0.0).all()
+        assert set(drift["n_windows"]) == {3, 4}
+
+
+def test_the_drift_summary_carries_every_class_and_feature_and_declares_its_families(
+    aligned_run,
+) -> None:
+    """Every (feature, class) has a row against zero and every feature an omnibus row; the wide
+    fixture's lag placement is constant in time, so nothing drifts and nothing survives.
+
+    The wide fixture rather than the shipped one because only it scores a recording in three
+    windows, the fewest a drift can be fitted over; on the shipped fixture every recording spans
+    two and the drift table is legitimately empty.
+    """
+    record, directory = aligned_run
+
+    summary = pd.read_csv(directory / analysis.HISTOGRAM_DRIFT_SUMMARY_FILENAME)
+    delivery = summary[summary["clock"] == "time_to_delivery"]
+    against_zero = delivery[delivery["row_kind"] == "class_vs_zero"]
+    assert set(against_zero["metric"]) == set(analysis.HISTOGRAM_READOUTS)
+    assert set(against_zero["group"]) == {"hie", "healthy"}
+    omnibus = delivery[delivery["row_kind"] == "across_classes"]
+    assert set(omnibus["metric"]) == set(analysis.HISTOGRAM_READOUTS)
+    assert not summary["significant"].fillna(False).astype(bool).any()
+    drift = pd.read_csv(directory / analysis.HISTOGRAM_DRIFT_FILENAME)
+    assert (drift["n_windows"] >= analysis.MIN_DRIFT_WINDOWS).all()
+    assert record["lag_histogram"]["tested"]["drift"]["min_windows"] == analysis.MIN_DRIFT_WINDOWS
+    assert "positive means" in record["lag_histogram"]["tested"]["drift"]["forward_time"]
