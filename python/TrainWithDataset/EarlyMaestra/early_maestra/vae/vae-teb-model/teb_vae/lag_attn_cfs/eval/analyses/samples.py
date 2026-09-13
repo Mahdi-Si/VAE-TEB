@@ -92,6 +92,14 @@ CLASS_DIRNAME = "by_class"
 #: The manifest of what was rendered and what failed.
 MANIFEST_FILENAME = "sample_pages.csv"
 
+#: The manifest's columns: which selection and variant a file is, and **whose** it is -- the
+#: recording, its segment epoch, and the cohort the recording belongs to on both axes. The
+#: identity travels here so a directory of pages can be filtered by subgroup without opening one,
+#: and so a page whose filename carries only the GUID can be traced back to its cohort.
+MANIFEST_COLUMNS: Tuple[str, ...] = (
+    "selection", "variant", "file", "guid", "epoch", labels.CLASS_COLUMN, labels.SUBGROUP_COLUMN,
+)
+
 #: How many pages the stratified draw renders when ``eval_config.caps.pages`` says nothing, and
 #: how many rows each extreme takes. Constants rather than settings: a page is a picture, and no
 #: number in any table depends on how many were drawn.
@@ -119,7 +127,10 @@ _CLASS_DRAW_SEED_OFFSET = 5
 #: could be worth opening for: the coupling readout, the forecast score and the KL. A metric absent
 #: from the table is skipped and recorded, never guessed at.
 EXTREME_METRICS: Tuple[Tuple[str, str], ...] = (
-    ("pred_gap", "mc_pred_gap"),
+    # The mean-decoded gap rather than the marginalised one: the pages exist to be looked at, and
+    # the mean forecast lanes drawn on them are what that estimator scores. The directory carries
+    # the column's own name so a reader knows which estimator picked the segment.
+    ("mean_pred_gap", "mean_pred_gap"),
     ("nll_full_block", "nll_full_block"),
     ("source_conditioned_kl_raw", "source_conditioned_kl_raw"),
 )
@@ -532,6 +543,9 @@ def render_pages(
                         if np.isfinite(float(row["epoch"])) else 0
                     ),
                     guid=str(row["guid"]),
+                    # The subgroup beside the GUID, so a page lifted out of its directory still
+                    # says which cohort the recording came from.
+                    cohort=_cohort_label(row),
                     beta=float(task.hparams.get("kld_beta", 1.0)),
                     scalars=_page_scalars(row),
                     # Read off the batch rather than from `model_inputs`, which returns only what
@@ -551,7 +565,7 @@ def render_pages(
                     log_lag_attention=log_lag_attention,
                 )
                 page = figures.render_figure(figure, directory / name)
-                written.append({"variant": variant, "file": page.name})
+                written.append({"variant": variant, "file": page.name, **_page_identity(row)})
             except Exception as error:  # noqa: BLE001 - one page is not worth the rest of them
                 logger.warning(
                     f"{ANALYSIS_DIRNAME}: {variant} page for dataset index {index} failed: "
@@ -566,13 +580,45 @@ def render_pages(
 def _page_scalars(row: Any) -> Dict[str, float]:
     """Return the readouts the page's title carries, from the row rather than from a re-scoring."""
     names = (
-        "nll_base_block", "nll_full_block", "pred_gap", "mc_pred_gap",
+        "nll_base_block", "nll_full_block", "pred_gap", "mc_pred_gap", "mean_pred_gap",
         "source_conditioned_kl_raw",
     )
     return {
         name: float(row[name])
         for name in names
         if name in row.index and np.isfinite(float(row[name]))
+    }
+
+
+def _cohort_label(row: Any) -> Optional[str]:
+    """The cohort a page's segment belongs to, for its title: the subgroup, which names the class.
+
+    The subgroup stem (``healthy_bg_no_cs``, ``acidosis_cs``, ...) already carries the clinical
+    class as its prefix, so it is the one label that says both. ``None`` when the row carries
+    no subgroup, which the title then omits rather than printing a placeholder.
+    """
+    for column in (labels.SUBGROUP_COLUMN, labels.CLASS_COLUMN):
+        if column in row.index and not pd.isna(row[column]):
+            return str(row[column])
+    return None
+
+
+def _page_identity(row: Any) -> Dict[str, Any]:
+    """The identity columns the page manifest carries beside each file, so a directory listing
+    can be filtered by cohort without opening a PDF."""
+    return {
+        "guid": str(row["guid"]),
+        "epoch": float(row["epoch"]) if np.isfinite(float(row["epoch"])) else float("nan"),
+        labels.CLASS_COLUMN: (
+            str(row[labels.CLASS_COLUMN])
+            if labels.CLASS_COLUMN in row.index and not pd.isna(row[labels.CLASS_COLUMN])
+            else None
+        ),
+        labels.SUBGROUP_COLUMN: (
+            str(row[labels.SUBGROUP_COLUMN])
+            if labels.SUBGROUP_COLUMN in row.index and not pd.isna(row[labels.SUBGROUP_COLUMN])
+            else None
+        ),
     }
 
 
@@ -804,7 +850,7 @@ def run_samples_analysis(
             n_unlocatable += int(len(frame) - len(rows))
             written += _render(rows, f"{stem}_{side}")
 
-    pd.DataFrame(manifest, columns=["selection", "variant", "file"]).to_csv(
+    pd.DataFrame(manifest, columns=list(MANIFEST_COLUMNS)).to_csv(
         directory / MANIFEST_FILENAME, index=False
     )
     logger.info(

@@ -1170,6 +1170,57 @@ def test_the_tiny_geometry_exercises_the_gated_model(trained_task) -> None:
     assert int(model.decoder_out_channels) < int(TINY_KWARGS["c_y"])
 
 
+def test_the_mean_decoded_score_is_the_training_path_for_the_base_branch_and_not_the_full(
+    task, perturb_posterior, stub_batch
+) -> None:
+    r"""The third score path, pinned by the two identities that define it.
+
+    Under ``base_decode: mean`` the forward decodes the base branch at $\mu^p$, so the
+    mean-decoded base score **is** the training path's ``nll_base_block`` -- per anchor and per
+    sample -- because both put the same latent through the same decoder with the same persistence
+    input. The full branch was sampled on the training path and is decoded at $\mu^q$ here, so the
+    two full scores differ; the gap is the subtraction of the two mean-decoded scores; and no draw
+    enters, so a second call reproduces the first bitwise whatever the generator does.
+    """
+    module = task(model_kwargs=tiny_warmup_kwargs(anchor_stride=TINY_STRIDE, base_decode="mean"))
+    perturb_posterior(module.orig_model)
+    module.eval()
+
+    first = evaluate_batch(
+        module, stub_batch, num_samples=2, mc_generator=torch.Generator().manual_seed(0)
+    )
+    second = evaluate_batch(
+        module, stub_batch, num_samples=2, mc_generator=torch.Generator().manual_seed(1)
+    )
+
+    for readout in (first, second):
+        for name in ("mean_nll_base_block", "mean_nll_full_block", "mean_pred_gap"):
+            assert name in readout.columns, name
+            assert name in readout.per_anchor, name
+        assert torch.allclose(
+            readout.per_anchor["mean_pred_gap"],
+            readout.per_anchor["mean_nll_base_block"] - readout.per_anchor["mean_nll_full_block"],
+        )
+        assert torch.allclose(
+            readout.columns["mean_pred_gap"],
+            readout.columns["mean_nll_base_block"] - readout.columns["mean_nll_full_block"],
+            rtol=RTOL, atol=1e-5,
+        )
+        # The identity with the training path, on the branch the training path also decoded at
+        # its mean, and its absence on the branch it sampled.
+        assert torch.allclose(
+            readout.per_anchor["mean_nll_base_block"], readout.per_anchor["nll_base_block"],
+            rtol=RTOL, atol=1e-5,
+        )
+        assert not torch.allclose(
+            readout.per_anchor["mean_nll_full_block"], readout.per_anchor["nll_full_block"]
+        )
+    # Deterministic: the Monte Carlo generator changed between the two calls and the
+    # mean-decoded columns did not.
+    assert torch.equal(first.columns["mean_pred_gap"], second.columns["mean_pred_gap"])
+    assert not torch.equal(first.columns["mc_pred_gap"], second.columns["mc_pred_gap"])
+
+
 def test_at_one_draw_the_base_branch_is_not_the_training_path_under_mean_decoding(
     task, perturb_posterior, stub_batch
 ) -> None:

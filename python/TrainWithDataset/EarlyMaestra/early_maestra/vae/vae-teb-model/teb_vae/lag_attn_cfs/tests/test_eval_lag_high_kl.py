@@ -358,11 +358,12 @@ def test_every_table_and_figure_is_written(tmp_path) -> None:
         analysis.HISTOGRAM_FILENAME, analysis.HISTOGRAM_FEATURES_FILENAME,
         analysis.HISTOGRAM_DISTANCE_FILENAME, analysis.HISTOGRAM_SIGNIFICANCE_FILENAME,
         analysis.HISTOGRAM_PAIRWISE_FILENAME, analysis.HISTOGRAM_DRIFT_FILENAME,
-        analysis.HISTOGRAM_DRIFT_SUMMARY_FILENAME,
+        analysis.HISTOGRAM_DRIFT_SUMMARY_FILENAME, analysis.COHORT_HISTOGRAM_FILENAME,
     }
     figures = {
         f"{analysis.SELECTION_FIGURE}.pdf",
         f"{analysis.USEFULNESS_FIGURE}.pdf",
+        f"{analysis.SUBGROUP_HISTOGRAM_FIGURE}.pdf",
         *(f"{clock.figure}.pdf" for clock in analysis.CLOCKS),
         *(f"{clock.windows_figure}.pdf" for clock in analysis.CLOCKS),
         *(f"{clock.histogram_figure}.pdf" for clock in analysis.CLOCKS),
@@ -676,6 +677,35 @@ def test_every_histogram_cell_is_a_distribution_over_the_lags(tmp_path) -> None:
     # Every lag of the axis is present in every cell, so a gap is a blank rather than a shift.
     counts = table.groupby(["clock", "band", "source", "group", "time_bin"])["lag_step"].nunique()
     assert set(counts.to_numpy().tolist()) == {N_LAGS}
+
+
+def test_the_whole_population_cohort_histogram_is_a_distribution_on_both_axes(tmp_path) -> None:
+    """The clock-free table: one distribution per cohort on the class axis AND the subgroup axis,
+    each summing to one across the lags, counting recordings rather than segments.
+
+    The fixture gives every recording two segments, so a denominator that counted segments would
+    report twice the recordings; and the high anchors' mass sits in :data:`HIGH_LAGS`, so a table
+    built over every anchor rather than the selected ones would put its density at lag 0.
+    """
+    per_sample, _, _ = _fixture()
+    _, directory = _run(_context(), tmp_path)
+
+    table = pd.read_csv(directory / analysis.COHORT_HISTOGRAM_FILENAME)
+    assert len(table)
+    assert set(table["band"]) == {analysis.HIGH_BAND_KEY}
+    assert set(table["source"]) == {key for key, _, _ in analysis.PROFILE_SOURCES}
+    assert set(table["group_column"]) == {"clinical_class", "subgroup"}
+    totals = table.groupby(["source", "group_column", "group"])["density"].sum()
+    assert totals.to_numpy() == pytest.approx(1.0)
+    # Recordings, not segments: the fixture's classes each hold three recordings of two segments.
+    by_class = table[table["group_column"] == "clinical_class"]
+    counts = by_class.groupby("group")["n_recordings"].max()
+    expected = per_sample.groupby("clinical_class")["guid"].nunique()
+    for group, count in counts.items():
+        assert count == expected[group]
+    # And the selected anchors' mass is where the fixture put it.
+    inside = by_class[by_class["lag_step"].between(*HIGH_LAGS)]
+    assert (inside.groupby(["source", "group"])["density"].sum() > 0.9).all()
 
 
 def test_both_bands_and_both_sources_reach_the_histogram_tables(tmp_path) -> None:

@@ -487,6 +487,72 @@ def mc_predictive_block(
     return scores, contributing
 
 
+@torch.no_grad()
+def mean_decoded_block(
+    model: Any,
+    branches: Dict[str, Tuple[torch.Tensor, torch.Tensor]],
+    target: torch.Tensor,
+    mask: torch.Tensor,
+    *,
+    anchors: torch.Tensor,
+    likelihood: str,
+    persistence: Optional[torch.Tensor] = None,
+) -> Tuple[Dict[str, torch.Tensor], torch.Tensor]:
+    r"""Score every branch's forecast decoded at its latent **mean**, at the decoded anchors.
+
+    The deterministic plug-in estimator: each branch's latent is taken at $z = \mu$ rather than
+    drawn, the decoder produces one $(\mu_y, \log\sigma_y^2)$ per anchor, and the block is scored
+    under the decoder's own predictive variance. No $\epsilon$ is drawn anywhere, so two runs of
+    a checkpoint agree bitwise, and two branches with equal means score identically.
+
+    **Why it exists beside the Monte Carlo estimator.** The marginalised score is a log of an
+    average likelihood over $K$ draws, so it rewards a branch whose latent *spread* happens to
+    put one draw near the truth -- a broad prior can out-score a sharp posterior at small $K$
+    even when its mean forecast is worse, which is exactly the regime a ``base_decode: mean``
+    checkpoint trains in. The mean-decoded score asks the narrower question "is the mean
+    forecast better", which is what the objective itself optimised for the base branch and
+    what a clinician reading the mean forecast lane sees. Under ``base_decode: mean`` the base
+    entry here **is** the training path's ``nll_base_block``, bitwise, because both decode
+    $\mu^p$ through the same decoder with the same persistence input; the full entry differs from
+    ``nll_full_block`` by the one posterior draw the training path took.
+
+    Args:
+        model: The net, for its shared decoder.
+        branches: ``{name: (mu, logvar)}`` latent parameters, each $(B, T, d_z)$. Only ``mu`` is
+            read; ``logvar`` travels so the same dict the Monte Carlo estimator takes can be
+            handed here unchanged.
+        target: The gathered forecast target $(B, A_{\max}, H, C_{\mathrm{keep}})$.
+        mask: The forecast mask $(B, A_{\max}, H)$.
+        anchors: The decoded anchor index $(B, A_{\max})$, as the forward returned it.
+        likelihood: ``'mse'`` or ``'gaussian_nll'``.
+        persistence: The matched forward's own persistence input, or ``None`` -- exactly as
+            :func:`mc_predictive_block` takes it, and for the same reason.
+
+    Returns:
+        ``(scores, contributing)``: the per-anchor block score of each branch decoded at its
+        mean, and the $0/1$ anchor indicator they share.
+
+    Raises:
+        ValueError: If ``branches`` is empty.
+    """
+    if not branches:
+        raise ValueError("mean_decoded_block needs at least one branch to score")
+    reference_mu = next(iter(branches.values()))[0]
+    gather_index = anchors.to(torch.long)[:, :, None].expand(-1, -1, reference_mu.shape[-1])
+    scores: Dict[str, torch.Tensor] = {}
+    contributing: Optional[torch.Tensor] = None
+    for name, (mu, _) in branches.items():
+        forecast_mu, forecast_logvar = model.decoder(
+            mu.gather(1, gather_index), persistence=persistence
+        )
+        block, contributing = masked_raw_block_per_anchor(
+            forecast_mu, target, mask, likelihood=likelihood, logvar=forecast_logvar
+        )
+        scores[name] = block
+    assert contributing is not None  # the loop above ran at least once
+    return scores, contributing
+
+
 # =============================================================================
 # Trivial forecast baselines, in feature space
 # =============================================================================
@@ -1612,7 +1678,11 @@ def evaluate_batch(
     r"""Run one batch through the model and reduce it to per-sample readouts.
 
     Four latent branches are **decoded and scored** against the same feature future, under one
-    shared set of noise draws:
+    shared set of noise draws -- and then a second time, each at its latent **mean** with no draw
+    at all (``mean_nll_*_block``, ``mean_pred_gap``), which is the deterministic plug-in reading of
+    the same four forecasts. The two estimators disagree by construction wherever a branch's
+    latent spread matters, and both travel so the disagreement is on the table rather than
+    hidden inside one of them:
 
     * ``base`` -- the target-only prior $p(z_t \mid Y_{\le t})$.
     * ``full`` -- the source-conditioned posterior $q(z_t \mid Y_{\le t}, U_{\le t})$.
@@ -1754,6 +1824,14 @@ def evaluate_batch(
         # second gather of the same target.
         persistence=outputs.get("persistence"),
     )
+    # The third score path: every branch decoded at its latent MEAN, no draw. One decoder call per
+    # branch against the K per branch above, so it costs a fraction of the marginalised pass and
+    # answers the question that pass cannot -- whether the mean forecast improved -- without the
+    # spread of the prior entering the comparison. See ``mean_decoded_block``.
+    mean_scores, _ = mean_decoded_block(
+        model, branches, target, mask, anchors=anchors, likelihood=likelihood,
+        persistence=outputs.get("persistence"),
+    )
 
     # The training-path score: the forward's own decoded latents, the same functions the objective
     # uses. Under ``base_decode: mean`` ``mu_base`` was decoded at the prior MEAN while ``mu_full``
@@ -1818,6 +1896,16 @@ def evaluate_batch(
         columns[f"mc_nll_{name}_block"] = _per_sample_mean(value, contributing)
     if "mc_nll_base_block" in columns and "mc_nll_full_block" in columns:
         columns["mc_pred_gap"] = columns["mc_nll_base_block"] - columns["mc_nll_full_block"]
+    # The mean-decoded pair under the same naming pattern, so a reader who knows ``mc_*`` knows
+    # ``mean_*``: each branch at its latent mean, scored under the decoder's own variance, and the
+    # gap as the same subtraction. Every branch scored above is scored here too, so the two
+    # controls have a mean-decoded reading beside their marginalised one.
+    for name, value in mean_scores.items():
+        columns[f"mean_nll_{name}_block"] = _per_sample_mean(value, contributing)
+    if "mean_nll_base_block" in columns and "mean_nll_full_block" in columns:
+        columns["mean_pred_gap"] = (
+            columns["mean_nll_base_block"] - columns["mean_nll_full_block"]
+        )
     if shuffled_kl_per_t is not None:
         columns["source_conditioned_kl_shuffled_raw"] = _per_sample_mean(
             shuffled_kl_per_t, kl_support
@@ -2083,6 +2171,14 @@ def evaluate_batch(
             per_anchor[f"mc_nll_{name}_block"] = scores[name]
     if "base" in scores and "full" in scores:
         per_anchor["mc_pred_gap"] = scores["base"] - scores["full"]
+    # The mean-decoded pair per anchor as well, so the per-anchor table recombines into the
+    # per-sample one under both estimators and the anchor-level analyses can read the gain the
+    # mean forecast bought rather than only the marginalised one.
+    for name in ("base", "full"):
+        if name in mean_scores:
+            per_anchor[f"mean_nll_{name}_block"] = mean_scores[name]
+    if "base" in mean_scores and "full" in mean_scores:
+        per_anchor["mean_pred_gap"] = mean_scores["base"] - mean_scores["full"]
 
     # The observation model's calibration census, over the full branch's scored coefficients.
     # Empty under ``'mse'``: the decoder's log-variance head is never fitted there, so a

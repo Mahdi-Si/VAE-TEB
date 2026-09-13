@@ -102,6 +102,10 @@ class Readout(NamedTuple):
 READOUTS: Tuple[Readout, ...] = (
     Readout("kld_per_t", "kld_per_t", "nats per anchor", "kl"),
     Readout("pred_gap_mc_nats", "mc_pred_gap", "nats per anchor", "pred_gap"),
+    # The mean-decoded gap on its own page beside the marginalised one: same axis, same unit,
+    # a different estimator, and on a ``base_decode: mean`` checkpoint routinely a different
+    # sign -- so a reader comparing the two pages is comparing estimators, not recordings.
+    Readout("pred_gap_mean_nats", "mean_pred_gap", "nats per anchor", "pred_gap_mean"),
 )
 
 #: Within a segment, consecutive anchors are exactly ``SECONDS_PER_STEP`` apart; a larger gap
@@ -397,12 +401,15 @@ def _draw_whole_delivery(
         column: The readout's column on that table.
         guid: Which recording to draw, or ``None`` for the longest.
     """
-    if trajectory.empty:
+    # A table without this readout's column -- an older run's, collected before the column
+    # existed -- draws the empty note under the readout's own title rather than a blank frame
+    # with an empty legend.
+    if trajectory.empty or column not in trajectory.columns:
         ax.text(
             0.5, 0.5, figures.EMPTY_NOTE, transform=ax.transAxes,
             ha="center", va="center", fontsize=figures.FONT_NOTE, color=figures.COLOR_GRAY,
         )
-        ax.set_title("Whole-delivery trajectory")
+        ax.set_title(f"Whole-delivery trajectory ({name})")
         figures.style_axes(ax)
         return
 

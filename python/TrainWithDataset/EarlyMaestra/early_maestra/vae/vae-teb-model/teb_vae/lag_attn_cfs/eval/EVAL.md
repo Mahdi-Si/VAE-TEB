@@ -108,11 +108,14 @@ Everything lands in `<run>/eval_results/`:
 
 Three summary blocks matter more than the rest. The **headline** is a flat registry of scalars and
 verdict statuses; a number not registered there is invisible to the acceptance gate and the arm
-tables, which read it and nothing else. It carries two `pred_gap` columns under names that say which
-is which — `pred_gap_mc_nats` (the headline, the log of the average likelihood over $K$ draws) and
-`pred_gap_train_path_nats` (the objective-parity column: base decoded at the prior mean under `base_decode: mean`, full at one sampled latent, so not a second estimate of the headline) — and three percentage columns
+tables, which read it and nothing else. It carries three `pred_gap` columns under names that say which
+is which — `pred_gap_mc_nats` (the gate's headline, the log of the average likelihood over $K$ draws),
+`pred_gap_mean_nats` (both branches decoded at their latent **mean** under the decoder's own variance,
+no draw: whether the mean forecast improved, which is the reading the figures foreground) and
+`pred_gap_train_path_nats` (the objective-parity column: base decoded at the prior mean under `base_decode: mean`, full at one sampled latent, so not a second estimate of either) — and four percentage columns
 restating the same finding proportionally. `pred_gap_convention` says in the artifact itself which is
-which, what a block is here, and which of the three is budget-local. The **sanity** block is the
+which, why the marginalised and the mean-decoded columns can disagree in sign, what a block is here,
+and which of the percentages are budget-local. The **sanity** block is the
 run's three-valued self-consistency record (the KL identity, the cross-table recombination, the lag
 identities, the population checks); it deliberately does *not* move the exit code. The **verdicts**
 are the model's own acceptance criteria, in registry order, never a bare boolean — **ten** of them
@@ -351,10 +354,24 @@ not sum back to the marginalised headline.
 
 ### coupling
 
-What the source added, per recording, with the uncertainty on it. `pred_gap` in both estimators — the
-Monte Carlo marginalised headline and the single-draw training-path parity column, never merged —
-with the fraction of recordings where the gap is positive, a paired Wilcoxon over the per-GUID
-vector, bootstrap intervals over recordings, and quantiles rather than only means.
+What the source added, per recording, with the uncertainty on it. `pred_gap` in all three estimators —
+the Monte Carlo marginalised headline, the **mean-decoded** gap (both branches at their latent mean,
+no draw) and the single-draw training-path parity column, never merged — with the fraction of
+recordings where the gap is positive, a paired Wilcoxon over the per-GUID vector, bootstrap intervals
+over recordings, and quantiles rather than only means.
+
+**The marginalised and the mean-decoded estimators answer different questions, and on a
+`base_decode: mean` checkpoint they routinely disagree in sign.** The marginalised score is
+$-[\operatorname{logsumexp}_r(-D_r) - \log K]$, the log of an *average likelihood* over $K$ latent
+draws, so a branch whose latent spread happens to put one draw near the truth is rewarded for the
+spread: a broad prior can out-score a sharper posterior at small $K$ while its mean forecast is
+worse. The mean-decoded score asks only whether the mean forecast improved, which is what the
+objective itself optimised for the base branch (the mean-decoded base score *is* the training-path
+`nll_base_block`, bitwise). Both travel; the distribution figure draws them against each other per
+recording, with the share of recordings on which they agree in sign, and every other figure that
+draws one estimator draws the mean-decoded one and names it. The gate still reads
+`pred_gap_mc_nats`, because that criterion was pre-registered; moving it is a decision for
+`RESULTS.md`, not for this module.
 
 The positive fraction reports its **denominator**: `np.nan > 0` is `False`, so unscored segments
 would otherwise count silently as evidence against. The KL travels beside the gap as a
@@ -1127,6 +1144,12 @@ Seven tables and six figures:
   the reading that cannot be. Per clock, two further Holm families across the three features: each
   (feature, class) slope against zero by Wilcoxon signed-rank, and each feature's Kruskal–Wallis
   across classes, with pairwise Cliff's delta on the survivors.
+- `lag_high_kl_subgroup_histogram.csv` — the `high` band's lag distribution pooled over the
+  **whole** evaluated population, no clock and no window, by clinical class **and by subgroup**:
+  each recording's selected-anchor profile averaged over every one of its segments, normalised
+  once, then averaged over the recordings of the cohort. The one table that asks the eight-cohort
+  question of the lag structure; descriptive, no test. Drawn on
+  `lag_high_kl_subgroup_histogram.pdf`, nested by class exactly as the `distributions` pages are.
 
 **The cells themselves, both distances, every feature on the `attn` source and the `top` band, and
 every untested feature ship untested** and the record says so. A distance between two *estimated*
@@ -1139,9 +1162,10 @@ first-maximum rule pins it at lag $0$, so a histogram of it would be a picture o
 
 **Whether any of it is *useful* is asked directly, in forecast space, and it is the question the
 analysis exists to settle.** A large $K_t$ says the source moved the belief; it does not say the
-forecast got better. The per-anchor table carries the Monte Carlo forecast gain of the same anchor,
-`mc_pred_gap` $= D_{\mathrm{base}} - D_{\mathrm{full}}$ in nats (the single-draw `pred_gap` on a
-pass without it), and the selection is scored by it four ways:
+forecast got better. The per-anchor table carries the forecast gain of the same anchor,
+$D_{\mathrm{base}} - D_{\mathrm{full}}$ in nats — the mean-decoded `mean_pred_gap` where the pass
+produced it, else the Monte Carlo `mc_pred_gap`, else the single-draw `pred_gap`; the record's
+`usefulness.gain_column` names which — and the selection is scored by it four ways:
 
 - **Per band, the mean gain of its anchors** — `high_pred_gap_nats`, `rest_pred_gap_nats`, … — per
   segment, per recording and on both clocks. The high band's against the rest band's is tested

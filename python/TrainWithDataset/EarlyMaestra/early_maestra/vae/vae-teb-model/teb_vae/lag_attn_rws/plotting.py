@@ -127,6 +127,32 @@ def _get_field(batch: Any, name: str) -> Optional[Any]:
     return getattr(batch, name, None)
 
 
+def _cohort_of(batch: Any, index: int = 0) -> Optional[str]:
+    """Extract the cohort label of sample ``index``, when the batch carries one.
+
+    Read off a ``subgroup`` field first and a ``source_file_basename`` field second -- the
+    shard stem, which is how the evaluation derives the subgroup. ``None`` when the batch
+    carries neither, which is the ordinary training case.
+
+    Args:
+        batch: A batch from the data module.
+        index: Sample index within the batch.
+
+    Returns:
+        The label, or ``None``.
+    """
+    for name in ("subgroup", "source_file_basename"):
+        field = _get_field(batch, name)
+        if field is None:
+            continue
+        if isinstance(field, (list, tuple)):
+            return str(field[index % len(field)]) if field else None
+        if isinstance(field, torch.Tensor):
+            continue
+        return str(field)
+    return None
+
+
 def _guid_of(batch: Any, index: int = 0) -> str:
     """Extract a printable recording identifier for sample ``index``.
 
@@ -426,6 +452,9 @@ class LagAttnRwsPlotCallback(Callback):
                 sample_index=index,
                 epoch=epoch,
                 guid=guid,
+                # A training batch carries no cohort label unless the loader was asked for one;
+                # when it does, the page says which subgroup the recording came from.
+                cohort=_cohort_of(batch, index),
                 beta=beta,
                 scalars={name: float(value) for name, value in scalars.items()},
                 # The raw source, taken from the batch rather than from the forward inputs. A

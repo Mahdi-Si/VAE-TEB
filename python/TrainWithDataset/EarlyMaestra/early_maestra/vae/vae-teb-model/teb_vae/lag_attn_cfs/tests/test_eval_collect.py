@@ -321,6 +321,7 @@ def test_the_per_anchor_table_carries_the_anchor_level_columns(trained_task):
     for name in (
         "kld_per_t", "nll_base_block", "nll_full_block", "pred_gap",
         "mc_nll_base_block", "mc_nll_full_block", "mc_pred_gap", "argmax_lag", "coverage",
+        "mean_nll_base_block", "mean_nll_full_block", "mean_pred_gap",
         "pred_gap_warm_lo", "pred_gap_warm_mid", "pred_gap_warm_hi",
         "seconds_since_contraction",
     ):

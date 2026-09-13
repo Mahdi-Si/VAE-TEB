@@ -40,6 +40,7 @@
       "lag_high_kl_second_stage_histogram_features.pdf",
       "lag_high_kl_second_stage_windows.pdf",
       "lag_high_kl_selection.pdf",
+      "lag_high_kl_subgroup_histogram.pdf",
       "lag_high_kl_time_to_delivery.pdf",
       "lag_high_kl_time_to_delivery_histogram.pdf",
       "lag_high_kl_time_to_delivery_histogram_drift.pdf",
@@ -85,7 +86,8 @@
     ],
     "trajectory": [
       "trajectory_profile_kl.pdf",
-      "trajectory_profile_pred_gap.pdf"
+      "trajectory_profile_pred_gap.pdf",
+      "trajectory_profile_pred_gap_mean.pdf"
     ],
     "warmup": [
       "causal_warmup_budget.pdf",

@@ -162,6 +162,13 @@ INCONCLUSIVE = report.INCONCLUSIVE
 #: exactly why the distinction lives in code rather than in an observation.
 HEADLINE_SCALARS: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
     ("pred_gap_mc_nats", ("readouts", "mc_pred_gap")),
+    # The deterministic plug-in estimator: both branches decoded at their latent MEAN under the
+    # decoder's own variance, no draw. Registered beside the marginalised headline rather than in
+    # its place because the two answer different questions -- "is the mean forecast better"
+    # against "is the average likelihood over draws better" -- and on a ``base_decode: mean``
+    # checkpoint they routinely disagree in sign. The gate still reads ``pred_gap_mc_nats``; this
+    # column is what the figures foreground and what a reader compares it against.
+    ("pred_gap_mean_nats", ("readouts", "mean_pred_gap")),
     ("pred_gap_train_path_nats", ("readouts", "pred_gap")),
     # The same answer as a proportion. Registered because nats do not compare across checkpoints
     # whose block scores differ in scale, which is exactly what an arm table asks them to do -- and
@@ -175,9 +182,17 @@ HEADLINE_SCALARS: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
         "pred_gap_mc_likelihood_pct",
         ("coupling", "pred_gap_percent", "headline", "pred_gap_mc_likelihood_pct"),
     ),
+    (
+        "pred_gap_mean_likelihood_pct",
+        ("coupling", "pred_gap_percent", "headline", "pred_gap_mean_likelihood_pct"),
+    ),
     ("d_base_mc_nats", ("readouts", "mc_nll_base_block")),
     ("d_full_mc_nats", ("readouts", "mc_nll_full_block")),
     ("d_shuffled_mc_nats", ("readouts", "mc_nll_shuffled_block")),
+    # The same two block scores decoded at the mean, so the gap above them can be read as the
+    # difference of two numbers a reader can also see.
+    ("d_base_mean_nats", ("readouts", "mean_nll_base_block")),
+    ("d_full_mean_nats", ("readouts", "mean_nll_full_block")),
     # D_shuffled - D_base, per recording and then averaged, from the permutation control. The one
     # predictive comparison here that is not referenced against the base branch, and therefore the
     # one that still carries signal when the predictive gain is negative: it changes only the
@@ -281,11 +296,19 @@ HEADLINE_VERDICTS: Tuple[str, ...] = (
 PRED_GAP_CONVENTION = (
     "pred_gap_mc_nats is the headline: the Monte Carlo marginalised block score difference "
     "D_base - D_full in nats per anchor, where D = -[logsumexp_r(-D_r) - log K] is the log of "
-    "the average likelihood over K latent draws. pred_gap_train_path_nats is the training-path "
-    "difference the objective itself sees, reported beside it for objective parity only: under "
+    "the average likelihood over K latent draws. pred_gap_mean_nats is the same subtraction on "
+    "the MEAN-DECODED forecasts: both branches decoded at their latent mean under the decoder's "
+    "own variance, with no draw, so it asks whether the mean forecast improved rather than "
+    "whether the average likelihood over draws did. The two disagree by construction wherever "
+    "a branch's latent spread matters -- a broad prior can out-score a sharper posterior under "
+    "the marginalised estimator at small K while its mean forecast is worse -- so a sign that "
+    "differs between them is a finding about the estimator, not a contradiction, and the "
+    "coupling figure draws the two against each other per recording. "
+    "pred_gap_train_path_nats is the training-path "
+    "difference the objective itself sees, reported beside them for objective parity only: under "
     "base_decode: mean the training path decodes the base branch at the prior MEAN and the full "
     "branch at one sampled latent, so that column mixes a source comparison with a "
-    "decoding-policy difference and is not a second estimate of pred_gap_mc_nats. "
+    "decoding-policy difference and is not a second estimate of either. "
     "A block here is H*C_keep target coefficients -- H horizon steps by the C_keep channels the "
     "warm-up budget kept; preflight.json records this run's own horizon, target_kept_width and "
     "block_width -- and not an H*R-sample raw window: the "
@@ -298,8 +321,9 @@ PRED_GAP_CONVENTION = (
     "100*(exp(pred_gap_mc_nats / (H*C_keep)) - 1), the extra probability density the "
     "source-conditioned forecast puts on each observed coefficient, where H*C_keep is the fixed "
     "block size rather than a per-anchor scored-coefficient count and so understates the "
-    "improvement wherever forecast steps are masked. "
-    "That third column is additionally BUDGET-LOCAL and is not comparable across arms: C_keep is "
+    "improvement wherever forecast steps are masked; pred_gap_mean_likelihood_pct is the same "
+    "expression on pred_gap_mean_nats. "
+    "Those likelihood columns are additionally BUDGET-LOCAL and not comparable across arms: C_keep is "
     "whatever the warm-up budget decided, so two arms of this model at two budgets divide by two "
     "different numbers -- as well as being mutually unloadable checkpoints. The nats columns "
     "carry the same caveat one step removed, since a block score is a sum over the kept channels. "
@@ -447,6 +471,9 @@ RECOMBINED_COLUMNS: Dict[str, str] = {
     "mc_nll_base_block": "mc_nll_base_block",
     "mc_nll_full_block": "mc_nll_full_block",
     "mc_pred_gap": "mc_pred_gap",
+    "mean_nll_base_block": "mean_nll_base_block",
+    "mean_nll_full_block": "mean_nll_full_block",
+    "mean_pred_gap": "mean_pred_gap",
     "kld_per_t": "source_conditioned_kl_raw",
 }
 
