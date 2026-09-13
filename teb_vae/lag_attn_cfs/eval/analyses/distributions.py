@@ -185,6 +185,11 @@ METRICS: Tuple[Metric, ...] = (
         "marks it",
     ),
     Metric(
+        "mean_pred_gap", "mean_pred_gap", False, "nats per anchor", 0.0,
+        "the same gap on the mean-decoded forecasts (no latent draw); drawn beside the "
+        "marginalised one because the two disagree wherever a branch's latent spread matters",
+    ),
+    Metric(
         "source_conditioned_kl_raw", "source_conditioned_kl_raw", False, "nats per anchor", None,
         "the unfloored KL between the two latents; readable as a rate only while the prior "
         "variance is off its clamp",

@@ -196,11 +196,11 @@ These have no entry of their own because they are not one figure. Every analysis
 
 **In plain terms.** **This is the headline figure of the whole evaluation.** *"Did reading the uterine pressure make the forecast better, and for how many deliveries?"* Each recording contributes one number: how many nats the source-informed forecast beat the target-only one by. **Zero is the null.**
 
-**What it shows.** Top: the distribution of `mc_pred_gap` over **recordings**, with zero marked and the bootstrap interval on the *mean* shaded. Bottom: the two estimators side by side, each under its own name.
+**What it shows.** Three blocks. **Top, one histogram per estimator** — `mc_pred_gap` (Monte Carlo marginalised, the gate's headline), `mean_pred_gap` (both branches decoded at their latent **mean** under the decoder's own variance, no draw) and `pred_gap` (the training path, the parity column) — each over **recordings**, each with zero marked and the bootstrap interval on its *own* mean shaded, and the share of recordings above zero in its title. **Middle:** the three estimators side by side as violins, one colour per estimator kept across the page. **Bottom:** the mean-decoded estimator against the marginalised one and against the training-path one, one point per recording, with the identity line, the two zero lines, Spearman's $\rho$ and the share of recordings on which the two agree in sign.
 
-**Axes.** Nats per anchor; the histogram's height is a count of recordings, not of segments.
+**Axes.** Nats per anchor throughout; a histogram's height is a count of recordings, not of segments.
 
-**How it is misread.** Three ways. The shaded band is the interval on the **mean**, not the range of the data. The two violins are two *estimators of the same quantity* and their difference is the cost of the marginalisation, not a second finding. And the unit is one recording, so a recording that scored no anchors is absent rather than at zero — the $n$ in the title is the count actually available.
+**How it is misread.** Four ways. The shaded band is the interval on the **mean**, not the range of the data. The three histograms are three *estimators of the same quantity*, and a sign that differs between them is a fact about the estimator rather than a contradiction: the marginalised score is a log of an average likelihood over $K$ draws, so a broad prior can out-score a sharper posterior there while its mean forecast is worse, and on a `base_decode: mean` checkpoint that is the ordinary case — which is why the mean-decoded estimator is the one the other figures foreground and why the scatters exist, since two histograms cannot say whether the recordings that flipped are the same recordings. The unit is one recording, so a recording that scored no anchors is absent rather than at zero — the $n$ in each title is the count actually available. And the gate still reads `pred_gap_mc_nats`; the mean-decoded column is beside it in the headline under its own name, not in its place.
 
 A fourth is this cell's own: **a positive gap here is not yet a source finding.** Read `source_null/source_null_difference.pdf` beside it, because part of a coupling readout can be an availability clock that no control on this figure can see.
 
@@ -208,7 +208,7 @@ A fourth is this cell's own: **a positive gap here is not yet a source finding.*
 
 **In plain terms.** *"By what percentage did the source improve the forecast?"* The figure beside this one answers in nats, which tells a reader nothing about proportion. The top two panels are about the **error**; the bottom is about the **likelihood**. **Zero is the null on all three.**
 
-**What it shows.** Top: the distribution of `pred_gap_rmse_pct` over recordings, zero marked, the interval on the mean shaded. Middle: `pred_gap_rmse_pct` and `pred_gap_mse_pct` side by side — the same ratio under a root, so the mean-square figure is the larger wherever both are positive. Bottom: `pred_gap_mc_likelihood_pct`, **empty under an `mse` checkpoint**, where it is undefined rather than zero.
+**What it shows.** Top: the distribution of `pred_gap_rmse_pct` over recordings, zero marked, the interval on the mean shaded. Middle: `pred_gap_rmse_pct` and `pred_gap_mse_pct` side by side — the same ratio under a root, so the mean-square figure is the larger wherever both are positive. Bottom: `pred_gap_mc_likelihood_pct` and `pred_gap_mean_likelihood_pct` side by side — the same per-coefficient density ratio on the marginalised and on the mean-decoded gap, in the estimator colours of the figure beside this one — **empty under an `mse` checkpoint**, where they are undefined rather than zero.
 
 **Axes.** Percent on every panel; the histogram's height is a count of recordings.
 
@@ -278,7 +278,7 @@ A fourth is this cell's own: **a positive gap here is not yet a source finding.*
 
 **In plain terms.** *"Is a cohort's higher error a uniform shift, a heavier tail, or a handful of segments the model fails on completely?"* Three distributions with the same mean are three different findings, and every other figure in this pipeline has already reduced each recording to one number before drawing anything.
 
-**What it shows.** Eight metrics, one panel each, drawn at **two levels on the same axes**: a filled density of one value per **segment**, and a median / inter-quartile / range **strip** above it of one value per **recording**.
+**What it shows.** Nine metrics, one panel each, drawn at **two levels on the same axes**: a filled density of one value per **segment**, and a median / inter-quartile / range **strip** above it of one value per **recording**. The coupling pair is `mc_pred_gap` and `mean_pred_gap`, adjacent, because the two estimators of the same gap disagree wherever a branch's latent spread matters and a reader should see both distributions before trusting either sign.
 
 **Axes.** The metric's own units in $z$ space; density rather than counts, so a cohort contributing ten times the segments does not simply draw a taller curve.
 
@@ -286,7 +286,7 @@ A fourth is this cell's own: **a positive gap here is not yet a source finding.*
 
 ## `distributions/subgroup_histograms.pdf`
 
-The same eight metrics resolved by subgroup, **nested rather than flat**: one column per clinical class with that class's subgroups overlaid inside it, so a cell holds at most four curves and they are four tints of one hue. Each cohort is a faint fill under a hairline outline at full opacity, drawn in two passes so every outline sits above every fill — one pass per cohort would leave the first cohort's outline veiled by every later fill, and the first legend entry would be the hardest curve to trace.
+The same nine metrics resolved by subgroup, **nested rather than flat**: one column per clinical class with that class's subgroups overlaid inside it, so a cell holds at most four curves and they are four tints of one hue. Each cohort is a faint fill under a hairline outline at full opacity, drawn in two passes so every outline sits above every fill — one pass per cohort would leave the first cohort's outline veiled by every later fill, and the first legend entry would be the hardest curve to trace.
 
 ## `trajectory/trajectory_profile_pred_gap.pdf`
 
@@ -299,6 +299,10 @@ The same eight metrics resolved by subgroup, **nested rather than flat**: one co
 **How it is misread.** The within-segment panel **starts at the anchor floor**, for the same reason `forecast/anchor_profile.pdf` does. Across a delivery the line is **lifted wherever nothing was decoded** — and on this cell that includes the undecoded warm-up prefix of every segment, so the whole-delivery line is a run of short pieces one segment apart by construction, not a recording full of gaps. A **break** in `trajectory_delivery_summary.csv` is only a gap longer than one segment stride, i.e. a missing segment. The averaging of overlapping steps is visible in `n_contributing` rather than inferred.
 
 **Why it is one readout.** The lower panel is a single axis in nats per anchor, and the KL sitting on it beside `pred_gap` is routinely orders of magnitude larger — so a shared page draws the gap as a flat line at the bottom of the KL's range and reports a real movement of a tenth of a nat as nothing. The KL has its own page beside this one.
+
+## `trajectory/trajectory_profile_pred_gap_mean.pdf`
+
+The same two views of `mean_pred_gap` — the gap on the mean-decoded forecasts, no latent draw — on its own page beside the marginalised one. Same axes, same unit, a different estimator; on a `base_decode: mean` checkpoint the two pages routinely disagree in sign, and a reader comparing them is comparing estimators rather than recordings. The caveats of the page above apply unchanged.
 
 ## `trajectory/trajectory_profile_kl.pdf`
 
@@ -748,20 +752,31 @@ delivery approaches?"* Every other `lag_high_kl` page reduces that spread to a c
 before showing it. This one draws the distribution.
 
 **What it shows.** Four blocks, both profile sources side by side in every row — `kl` on the left,
-`attn` on the right. **Rows 1–2:** the classes overlaid, one step curve each, for the `high` band and
-then the `top` band, pooled over every window of the clock; the legend carries each class's delivery
-count. **Row 3, the density violins:** the `high` band's cells on the clock, one body per (window,
-class) dodged by class inside each window. The body is **the cell's own lag distribution** — its
-half-width at a lag is that lag's share — drawn as a step outline because a share is per lag bin;
-it is not a kernel density of anything. Inside each body the heavy bar spans the distribution's
-quartile lags, the white dot is its median lag and the short black tick its centroid, which on these
-skewed profiles sits well away from the median. The recording count stands above every body; a cell
-below three recordings is faint and dashed rather than absent. **Row 4, the ridgeline:** the same
-cells with the lag across, one ridge per window, the classes overlaid on each, **labour running down
-the page** on both clocks (farthest from delivery at the top). Each ridge is labelled with its window
-centre on the left and its per-class recording counts on the right; a class's median lag is ticked on
-the baseline. Every body on a panel is drawn at one scale, so widths and heights compare across
-windows and classes. **Bottom two rows:** the distances against the clock, **metric down and comparison across**.
+`attn` on the right. **Rows 1–6, three per band** (`high` then `top`), pooled over every window of
+the clock: **the classes overlaid** as outlines only, one step curve each, with the recording-weighted
+pool of every class dashed in grey behind them and each class's delivery count in the legend; **each
+class minus that pooled distribution**, in percentage points of share per lag with zero marked — the
+panel a class contrast is actually read on, because three monotone decays that coincide to within a
+few percent of their peak are indistinguishable overlaid and their differences from a common
+reference are not; and **the cumulative distributions**, on which a shift between skewed
+distributions is a horizontal offset readable in seconds, with each class's median lag dropped to the
+axis as a dotted line. **Row 7, the density violins:** the `high` band's cells on the clock, one body
+per (window, class) dodged by class inside each window. The body is **the cell's own lag
+distribution** — its half-width at a lag is that lag's share — drawn as a step outline because a
+share is per lag bin; it is not a kernel density of anything. Inside each body the heavy bar spans
+the distribution's quartile lags, the white dot is its median lag and the short black tick its
+centroid, which on these skewed profiles sits well away from the median. The recording count stands
+above every body; a cell below three recordings is faint and dashed rather than absent. **Row 8, the
+ridges:** the same cells with the lag across, one ridge per window, **one column per class** rather
+than the classes overlaid — three filled decays of nearly the same shape on one baseline blend into a
+colour no legend explains — with **labour running down the page** on both clocks (farthest from
+delivery at the top). Inside every ridge the class's own distribution pooled over the whole clock is
+outlined in grey and dashed, so a ridge that leaves its outline has moved and a column whose ridges
+all sit on it is a stationary class; the same window sits at the same height in every column, so a
+horizontal read compares the classes. The window centre is labelled on the left of the first column,
+the recording count on the right of each ridge, and the cell's median lag is ticked on the baseline.
+Every body on a panel is drawn at one scale, so widths and heights compare across windows and
+classes. **Bottom two rows:** the distances against the clock, **metric down and comparison across**.
 The left column is each window against its own class pooled over the whole clock, one line per class
 in the severity colours — a cohort whose lag structure is stationary sits flat and near zero. The
 right column is the distance between the classes within each window, one line per class **pair**;
@@ -771,8 +786,9 @@ than off the hue. The upper of the two rows is the $1$-Wasserstein distance **in
 says how far the distribution moved; the lower is the Jensen–Shannon distance, which says how much
 overlap is left.
 
-**Axes.** Stored-coefficient lag in seconds across on the pooled panels and the ridgeline, share of
-the distribution up on the pooled panels and window centre up on the ridgeline. Hours before delivery
+**Axes.** Stored-coefficient lag in seconds across on the pooled panels and the ridges; share of the
+distribution up on the overlay, percentage points of share on the difference panel, cumulative share
+on the third, and window centre up on the ridges. Hours before delivery
 across on the density violins and on all four distance panels, drawn with delivery at the right; lag
 in seconds up on the violins; seconds up on the Wasserstein row, and Jensen–Shannon (base $2$,
 bounded by $1$) up on the row below it.
@@ -821,6 +837,30 @@ zero; the ridgeline still runs earliest-before-onset at the top.
 **How it is misread.** As that page, and with the same population caveat as the second-stage profile
 page above: the recordings scored here are those carrying an onset, a strict subset of the cohort,
 so a class's distribution on this page and on the delivery page are over different populations.
+
+## `lag_high_kl/lag_high_kl_subgroup_histogram.pdf`
+
+**In plain terms.** *"Within one clinical class, do the subgroups' coupling-carrying timesteps look
+at different lags?"* Every clock page cuts by class alone; this page asks the eight-cohort question
+once, with no clock and no window.
+
+**What it shows.** The `high` band pooled over the **whole** evaluated population: each recording's
+selected-anchor profile averaged over every one of its segments, normalised once, then averaged over
+the recordings of the cohort. One column per clinical class; inside each, that class's subgroups as
+tints of the class colour with the class's own pooled distribution as a black dashed reference, so a
+subgroup is read against its class rather than against the population. Two rows per profile source
+(`kl` then `attn`): the distributions, and their cumulative forms with the medians dropped to the
+axis. The legend carries each cohort's delivery count. The table beside it,
+`lag_high_kl_subgroup_histogram.csv`, carries the same curves on both cohort axes.
+
+**Axes.** Stored-coefficient lag in seconds across; share of the distribution up on the first row of
+each pair, cumulative share on the second.
+
+**How it is misread.** Three ways. **Nothing here is tested**: the curves are descriptive, and a
+subgroup of six recordings draws as confidently as one of sixty — read the count. **It is
+population-pooled, so it is not the delivery-clock page's pooled row**: that row pools one clock's
+binned recordings, this one every segment within the run's horizon, and a recording enters both once.
+And **the lag axis is stored-coefficient time**, as the foot of the page says.
 
 ## `lag_high_kl/lag_high_kl_time_to_delivery_histogram_features.pdf`
 
@@ -974,7 +1014,9 @@ of the recording's attribution across, occlusion delta in nats up.
 
 **Clocks.** Every model row is at the anchor step, so a column is the same anchor on all of them; only the raw row is in physical time. An aligned input channel at step $t$ carries content centred $\kappa\tau_{\mathrm{ref}}$ earlier — $352$ s on the target input, $252$ s on the source — so the input rows sit that far to the right of the raw row, as their x labels state. To make the alignment checkable, **each input row overlays its own raw signal delayed by that constant**: the raw FHR on the target row, the raw UP on the source row, as a thin black trace on a twin axis. A deceleration and the coefficient columns it produced then coincide on the row itself. The constants come from the resolved budget, which the runner attaches to the loaded task after preflight; an unaligned run has no single constant and draws no overlay.
 
-**Directories.** `stratified/` is a seeded, shard-stratified draw over the whole split, so a cap at or above the shard count reaches every shard. `by_class/` is a **class-balanced** draw: the same number of segments from every clinical class, `eval_config.caps.pages_per_class` of them. Beside them, one directory per headline metric and tail holds the segments at the extremes of that metric.
+**Directories.** `stratified/` is a seeded, shard-stratified draw over the whole split, so a cap at or above the shard count reaches every shard. `by_class/` is a **class-balanced** draw: the same number of segments from every clinical class, `eval_config.caps.pages_per_class` of them. Beside them, one directory per extreme metric and tail holds the segments at the extremes of that metric — `mean_pred_gap_low/` and `mean_pred_gap_high/` on the mean-decoded gap (the estimator that scores the mean forecast lanes the page draws), and the same pair for `nll_full_block` and `source_conditioned_kl_raw`.
+
+**Whose page it is.** The title of every page carries the GUID **and the subgroup** the recording came from (`guid … — subgroup acidosis_cs`), because the filename carries only the GUID and a page lifted out of its directory would otherwise not say which cohort it belongs to. `sample_pages.csv` beside the directories carries the same identity per file — `guid`, `epoch`, `clinical_class`, `subgroup` — so a directory can be filtered by cohort without opening a PDF.
 
 **The two draws are not interchangeable, and reading one as the other is the mistake to avoid.** `stratified/` allocates its quota in proportion to shard size, so what it renders is what the split mostly *contains* — on the shipped cohort, mostly healthy. `by_class/` gives `hie` as many pages as `healthy` and is therefore, by construction, not representative of anything: it is what supports a comparison *across* classes, and it says nothing about how common either class is. Counting pages in `by_class/` as evidence of prevalence inverts the one property it was drawn for.
 

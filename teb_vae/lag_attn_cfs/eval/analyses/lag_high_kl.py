@@ -29,8 +29,10 @@ per window with Holm across windows.
 
 **Whether any of it is *useful* is asked directly, in forecast space.** A large $K_t$ says the
 source moved the belief; it does not say the forecast got better. The per-anchor table carries the
-Monte Carlo forecast gain of the same anchor, ``mc_pred_gap`` $= D_{\mathrm{base}} -
-D_{\mathrm{full}}$ in nats, so every band's anchors are also scored by what the source bought
+forecast gain of the same anchor, $D_{\mathrm{base}} - D_{\mathrm{full}}$ in nats -- the
+mean-decoded ``mean_pred_gap`` where the pass produced it, else the Monte Carlo ``mc_pred_gap``,
+else the training-path ``pred_gap`` (:data:`GAIN_COLUMNS`) -- so every band's anchors are also
+scored by what the source bought
 there: ``<band>_pred_gap_nats`` per segment, the paired within-recording difference of the high
 band's gain against the rest band's with a Wilcoxon signed-rank test over recordings, the gain
 resolved by KL decile and by the anchor's argmax lag, a fourth band ``gain`` -- the anchors in the
@@ -152,6 +154,13 @@ HISTOGRAM_SIGNIFICANCE_FILENAME = "lag_high_kl_histogram_significance.csv"
 HISTOGRAM_PAIRWISE_FILENAME = "lag_high_kl_histogram_pairwise.csv"
 HISTOGRAM_DRIFT_FILENAME = "lag_high_kl_histogram_drift.csv"
 HISTOGRAM_DRIFT_SUMMARY_FILENAME = "lag_high_kl_histogram_drift_summary.csv"
+#: The same lag distributions pooled over the **whole** evaluated population -- no clock, no
+#: window -- by clinical class and by subgroup, so the eight-cohort question ("do the subgroups of
+#: one class look at different lags?") is asked once, where every clock page cuts by class alone.
+#: **Not** named ``*_by_subgroup``: that suffix is the runner's grouped-variant family, and a file
+#: named into it is normalised out of the manifest and never documented.
+COHORT_HISTOGRAM_FILENAME = "lag_high_kl_subgroup_histogram.csv"
+SUBGROUP_HISTOGRAM_FIGURE = "lag_high_kl_subgroup_histogram"
 SELECTION_FIGURE = "lag_high_kl_selection"
 USEFULNESS_FIGURE = "lag_high_kl_usefulness"
 
@@ -168,9 +177,11 @@ OCCLUSION_DELTA_SUFFIX = "_nats"
 KL_MAP_KEY = "kl_lag_map"
 ATTENTION_MAP_KEY = "attention_lag_map"
 KL_COLUMN = "kld_per_t"
-#: The per-anchor forecast gain, $D_{\mathrm{base}} - D_{\mathrm{full}}$ in nats: the Monte Carlo
-#: marginalised one where the pass produced it, else the single-draw training-path one.
-GAIN_COLUMNS: Tuple[str, ...] = ("mc_pred_gap", "pred_gap")
+#: The per-anchor forecast gain, $D_{\mathrm{base}} - D_{\mathrm{full}}$ in nats, in order of
+#: preference: the **mean-decoded** one where the pass produced it -- deterministic, and the one
+#: that does not reward a branch for the spread of its latent -- else the Monte Carlo marginalised
+#: one, else the single-draw training-path one. The record names which was used.
+GAIN_COLUMNS: Tuple[str, ...] = ("mean_pred_gap", "mc_pred_gap", "pred_gap")
 ARGMAX_COLUMN = "argmax_lag"
 SAMPLE_INDEX_COLUMN = "sample_index"
 CONTRACTION_AGE_COLUMN = "seconds_since_contraction"
@@ -464,6 +475,11 @@ HISTOGRAM_DISTANCE_COLUMNS: Tuple[str, ...] = (
     "clock", "band", "source", "group_column", "comparison", "group_left", "group_right",
     "time_bin_left", "time_bin_right", "bin_center_h_left", "bin_center_h_right",
     "n_left", "n_right", "jensen_shannon", "wasserstein_s", "centroid_delta_s",
+)
+#: The population-pooled cohort table: no clock column, because there is no clock.
+COHORT_HISTOGRAM_COLUMNS: Tuple[str, ...] = (
+    "band", "source", "group_column", "group", "n_recordings", "lag_step",
+    "compensated_seconds", "density",
 )
 
 #: The method sentence written into every record, so a $p$-value here is readable without this
@@ -1868,6 +1884,109 @@ def histogram_cells(densities: pd.DataFrame, n_lags: int) -> HistogramCells:
     return HistogramCells(groups, windows, centres, cell, cell_counts, pooled, pooled_counts)
 
 
+@dataclass
+class CohortDensities:
+    """The lag distributions of one (band, source) pooled over the whole population, by cohort.
+
+    Attributes:
+        groups: The cohorts present on the axis, in the canonical order.
+        cell: Cohort to the mean of its recordings' distributions over the lags.
+        counts: Cohort to how many recordings that mean is over.
+    """
+
+    groups: List[str]
+    cell: Dict[str, np.ndarray]
+    counts: Dict[str, int]
+
+
+def cohort_densities(
+    featured: pd.DataFrame, matrix: Optional[np.ndarray], n_lags: int, group_column: str
+) -> CohortDensities:
+    r"""Pool each recording's lag distribution over its **whole** evaluated span, then by cohort.
+
+    The clock pages bin a recording into windows before pooling; this does not. Each recording's
+    selected-anchor profile is averaged over every one of its segments, normalised once into a
+    distribution over the lags, and the cohort mean is taken over recordings -- the same
+    normalise-then-average order the windowed cells use, so a cohort curve here is what a typical
+    recording of that cohort looks like and every recording counts once.
+
+    Args:
+        featured: The featured per-sample table, carrying :data:`ROW_COLUMN`.
+        matrix: The $(n_{\mathrm{segments}}, L)$ restricted profiles in per-sample row order, or
+            ``None`` where the source is absent from the sidecar.
+        n_lags: The lag axis width.
+        group_column: The cohort axis, ``labels.CLASS_COLUMN`` or ``labels.SUBGROUP_COLUMN``.
+
+    Returns:
+        The cohort distributions. Empty throughout when nothing is usable.
+    """
+    empty = CohortDensities([], {}, {})
+    if matrix is None:
+        return empty
+    values = np.asarray(matrix, dtype=np.float64)
+    needed = {group_column, "guid", ROW_COLUMN}
+    if (
+        featured.empty or values.ndim != 2 or values.shape[1] != int(n_lags)
+        or not needed <= set(featured.columns)
+    ):
+        return empty
+    frame = featured[featured[group_column].notna()]
+    if frame.empty:
+        return empty
+    columns = lag_columns(n_lags)
+    table = pd.DataFrame(values[np.asarray(frame[ROW_COLUMN], dtype=np.int64)], columns=columns)
+    table["group"] = [str(value) for value in frame[group_column]]
+    table["guid"] = list(frame["guid"].astype(str))
+    per_recording = table.groupby(["group", "guid"], sort=True)[columns].mean().reset_index()
+    per_recording[columns] = normalise(per_recording[columns].to_numpy(dtype=np.float64))
+    cell: Dict[str, np.ndarray] = {}
+    counts: Dict[str, int] = {}
+    for group, block in per_recording.groupby("group", sort=True):
+        rows = block[columns].to_numpy(dtype=np.float64)
+        usable = np.isfinite(rows).any(axis=1)
+        if not usable.any():
+            continue
+        cell[str(group)] = _cell_mean(rows[usable])
+        counts[str(group)] = int(usable.sum())
+    groups = cohort.ordered_groups(sorted(cell), group_column)
+    return CohortDensities(groups, cell, counts)
+
+
+def cohort_histogram_frame(
+    band_key: str, source_key: str, group_column: str, densities: CohortDensities,
+    seconds: np.ndarray,
+) -> pd.DataFrame:
+    """Lay the population-pooled cohort distributions out long-form: one row per (cohort, lag).
+
+    Args:
+        band_key: The selection band.
+        source_key: ``"attn"`` or ``"kl"``.
+        group_column: The cohort axis the rows are cut on.
+        densities: :func:`cohort_densities`' result.
+        seconds: The compensated lag axis.
+
+    Returns:
+        The table, with :data:`COHORT_HISTOGRAM_COLUMNS`.
+    """
+    rows: List[Dict[str, Any]] = []
+    for group in densities.groups:
+        density = densities.cell[group]
+        for lag in range(int(seconds.size)):
+            rows.append(
+                {
+                    "band": band_key,
+                    "source": source_key,
+                    "group_column": group_column,
+                    "group": group,
+                    "n_recordings": int(densities.counts.get(group, 0)),
+                    "lag_step": int(lag),
+                    "compensated_seconds": float(seconds[lag]),
+                    "density": float(density[lag]),
+                }
+            )
+    return pd.DataFrame(rows, columns=list(COHORT_HISTOGRAM_COLUMNS))
+
+
 def histogram_frame(
     clock: Clock,
     band_key: str,
@@ -3110,21 +3229,191 @@ def _draw_distribution_overlay(
         _empty_panel(ax, title)
         return 0
     colours = figures.group_colors(list(drawn))
+    reference = pooled_reference(profiles, counts, drawn)
+    if reference is not None:
+        # The recording-weighted pool of every class, in grey and dashed: the one curve a class
+        # curve is read against, and the same curve the difference panel below subtracts.
+        ax.step(
+            seconds, reference, where="mid", color=figures.COLOR_GRAY, linestyle="--",
+            linewidth=figures.LINE_THIN, label="all classes pooled", zorder=1,
+        )
     for group in drawn:
         colour = colours.get(group, figures.COLOR_BLUE)
+        # Lines only, deliberately. The three classes' distributions are all monotone decays over
+        # nearly the same support, so a fill per class stacks three tints of nearly the same shape
+        # and the eye reads the blend rather than any of them; an outline at emphasis weight is
+        # what survives the overlap, and the two panels beneath this one carry the contrast.
         ax.step(
             seconds, profiles[group], where="mid", color=colour,
-            linewidth=figures.LINE_EMPHASIS,
+            linewidth=figures.LINE_EMPHASIS, zorder=2,
             label=f"{group} (n={int(counts.get(group, 0))} deliveries)",
-        )
-        ax.fill_between(
-            seconds, np.zeros_like(profiles[group]), profiles[group], step="mid",
-            color=colour, alpha=0.12, linewidth=0,
         )
     ax.set_title(title)
     ax.set_xlabel(figures.COEFFICIENT_LAG_AXIS_LABEL)
     ax.set_ylabel("share of the distribution")
+    ax.set_ylim(bottom=0.0)
     ax.legend(fontsize=figures.FONT_LABEL, loc="best")
+    figures.style_axes(ax)
+    return len(drawn)
+
+
+def pooled_reference(
+    profiles: Dict[str, np.ndarray], counts: Dict[str, int], groups: Sequence[str]
+) -> Optional[np.ndarray]:
+    r"""The recording-weighted pool of every class's distribution: the reference a class is read
+    against.
+
+    $$p^{\mathrm{all}}_\ell = \frac{\sum_g n_g\, p^{(g)}_\ell}{\sum_g n_g}$$
+
+    over the classes present, with $n_g$ the recordings behind class $g$. Weighted by recordings
+    rather than a plain mean of the class curves, so it is the distribution of a typical recording
+    of the whole population and a class's difference from it is read as "this class against
+    everyone", not "this class against the average class". Non-finite bins are dropped from the
+    weighting bin by bin, as every mean in this module drops them.
+
+    Args:
+        profiles: Class to its pooled distribution over the lags.
+        counts: Class to the recordings behind it.
+        groups: The classes to pool over.
+
+    Returns:
+        The pooled distribution, or ``None`` when no class carries a recording.
+    """
+    stack = [np.asarray(profiles[group], dtype=np.float64) for group in groups if group in profiles]
+    weights = np.asarray(
+        [float(counts.get(group, 0)) for group in groups if group in profiles], dtype=np.float64
+    )
+    if not stack or weights.sum() <= 0.0:
+        return None
+    matrix = np.stack(stack, axis=0)
+    finite = np.isfinite(matrix)
+    weighted = np.where(finite, matrix, 0.0) * weights[:, None]
+    denominator = (finite * weights[:, None]).sum(axis=0)
+    return np.divide(
+        weighted.sum(axis=0), denominator,
+        out=np.full(matrix.shape[1], np.nan), where=denominator > 0.0,
+    )
+
+
+def _draw_distribution_difference(
+    ax: Any,
+    profiles: Dict[str, np.ndarray],
+    counts: Dict[str, int],
+    groups: Sequence[str],
+    seconds: np.ndarray,
+    *,
+    title: str,
+) -> int:
+    r"""Each class's distribution **minus the pooled one**, in percentage points of share per lag.
+
+    The panel that makes a small class contrast visible at all: three monotone decays that
+    coincide to within a few percent of their peak are indistinguishable overlaid, and their
+    differences from a common reference are not. Zero is the reference. A class above zero at a
+    lag put more of its attention there than the population did; the areas above and below zero
+    cancel by construction, because every curve and the reference sum to one.
+
+    Args:
+        ax: Target axes.
+        profiles: Class to its pooled distribution over the lags.
+        counts: Class to the recordings behind it, for the reference weighting and the legend.
+        groups: The classes, worst first.
+        seconds: The compensated lag axis.
+        title: Panel title.
+
+    Returns:
+        How many classes were drawn.
+    """
+    drawn = [group for group in groups if group in profiles]
+    reference = pooled_reference(profiles, counts, drawn) if drawn else None
+    if not drawn or reference is None:
+        _empty_panel(ax, title)
+        return 0
+    colours = figures.group_colors(list(drawn))
+    ax.axhline(0.0, color=figures.COLOR_GRAY, linestyle="--", linewidth=figures.LINE_THIN, zorder=1)
+    for group in drawn:
+        colour = colours.get(group, figures.COLOR_BLUE)
+        difference = 100.0 * (np.asarray(profiles[group], dtype=np.float64) - reference)
+        ax.step(
+            seconds, difference, where="mid", color=colour, linewidth=figures.LINE_EMPHASIS,
+            zorder=3, label=f"{group} (n={int(counts.get(group, 0))} deliveries)",
+        )
+        # A faint fill toward zero, so the sign of each excursion reads at a glance; faint, so
+        # three of them overlapping still read as three outlines.
+        ax.fill_between(
+            seconds, 0.0, difference, step="mid", color=colour, alpha=0.10, linewidth=0, zorder=2,
+        )
+    ax.set_title(title)
+    ax.set_xlabel(figures.COEFFICIENT_LAG_AXIS_LABEL)
+    ax.set_ylabel("class minus pooled (percentage points of share)")
+    ax.legend(fontsize=figures.FONT_LABEL, loc="best")
+    figures.style_axes(ax)
+    return len(drawn)
+
+
+def _draw_distribution_cdf(
+    ax: Any,
+    profiles: Dict[str, np.ndarray],
+    counts: Dict[str, int],
+    groups: Sequence[str],
+    seconds: np.ndarray,
+    *,
+    title: str,
+) -> int:
+    r"""Each class's **cumulative** distribution over the lags, with its median lag marked.
+
+    A shift between two skewed distributions is a horizontal offset between their cumulative
+    curves, readable directly in seconds at any level -- which is exactly what the overlaid
+    densities cannot show and what the $1$-Wasserstein rows at the foot of the page measure. The
+    median lag of each class is dropped to the axis at the $0.5$ crossing, so the number the
+    feature table tests is on the picture.
+
+    Args:
+        ax: Target axes.
+        profiles: Class to its pooled distribution over the lags.
+        counts: Class to the recordings behind it.
+        groups: The classes, worst first.
+        seconds: The compensated lag axis.
+        title: Panel title.
+
+    Returns:
+        How many classes were drawn.
+    """
+    drawn = [group for group in groups if group in profiles]
+    if not drawn:
+        _empty_panel(ax, title)
+        return 0
+    colours = figures.group_colors(list(drawn))
+    reference = pooled_reference(profiles, counts, drawn)
+    if reference is not None:
+        ax.step(
+            seconds, np.nancumsum(reference), where="post", color=figures.COLOR_GRAY,
+            linestyle="--", linewidth=figures.LINE_THIN, label="all classes pooled", zorder=1,
+        )
+    ax.axhline(0.5, color=figures.COLOR_LIGHT_GRAY, linestyle=":", linewidth=figures.LINE_HAIRLINE, zorder=0)
+    for group in drawn:
+        colour = colours.get(group, figures.COLOR_BLUE)
+        density = np.asarray(profiles[group], dtype=np.float64)
+        cumulative = np.nancumsum(density)
+        ax.step(
+            seconds, cumulative, where="post", color=colour, linewidth=figures.LINE_EMPHASIS,
+            zorder=2, label=f"{group} (n={int(counts.get(group, 0))} deliveries)",
+        )
+        median = float(quantile_seconds(density, seconds, (0.5,))[0])
+        if np.isfinite(median):
+            ax.vlines(
+                median, 0.0, 0.5, color=colour, linestyle=":", linewidth=figures.LINE_THIN,
+                zorder=2,
+            )
+    ax.set_title(title)
+    ax.set_xlabel(figures.COEFFICIENT_LAG_AXIS_LABEL)
+    ax.set_ylabel("cumulative share of the distribution")
+    ax.set_ylim(0.0, 1.02)
+    ax.text(
+        0.99, 0.02, "dotted drops = each class's median lag",
+        transform=ax.transAxes, ha="right", va="bottom", fontsize=figures.FONT_TINY,
+        color=figures.COLOR_GRAY,
+    )
+    ax.legend(fontsize=figures.FONT_LABEL, loc="lower right", bbox_to_anchor=(1.0, 0.08))
     figures.style_axes(ax)
     return len(drawn)
 
@@ -3267,34 +3556,49 @@ def _draw_density_violins(
 
 
 def _draw_ridgeline(
-    ax: Any,
+    figure: Any,
+    slots: Sequence[Any],
     clock: Clock,
     cells: HistogramCells,
     seconds: np.ndarray,
     *,
     title: str,
 ) -> int:
-    """One ridge per window, the classes overlaid on each, **time running down the page**.
+    """One ridge per window, **one column per class**, time running down the page.
 
     The density violins above put the clock across and the lag up, which is the right orientation
     for reading a drift; this puts the lag across, so the *shape* of each cell -- a second mode, a
     shoulder, a heavy far tail -- is read at full width, and stacks the windows so a shape change
-    along the clock is a change down the page. The windows are ordered so that labour progresses
-    downward on **both** clocks: farthest from delivery at the top on the delivery clock, earliest
-    before onset at the top on the second-stage clock. Each ridge carries its window centre on the
-    left and its per-class recording counts on the right; a class's median lag is ticked on the
+    along the clock is a change down the page.
+
+    **The classes are not overlaid.** They were, and it did not work: three filled decays of
+    nearly the same shape on one baseline blend into a colour no legend explains, and the reader
+    is left comparing three edges of one blot. Each class now has its own column, so a ridge is
+    one distribution in one colour, and the contrast a reader wants -- this class against the
+    population at the same window -- is drawn *inside* every ridge as a grey dashed outline of
+    the class's own distribution pooled over the whole clock. A ridge that leaves the outline has
+    moved; a column whose ridges all sit on their outline is a stationary class. Across the
+    columns, the same window sits at the same height, so a horizontal read compares the classes.
+
+    The windows are ordered so that labour progresses downward on **both** clocks: farthest from
+    delivery at the top on the delivery clock, earliest before onset at the top on the
+    second-stage clock. Each ridge carries its window centre on the left of the first column and
+    its recording count on the right of its own column; the cell's median lag is ticked on the
     baseline. A cell below ``shared_stats.MIN_GROUP_SIZE`` recordings is outlined hairline and
     dashed with no fill.
 
     Args:
-        ax: Target axes.
+        figure: The parent figure, which the class columns are added to.
+        slots: One gridspec cell per class column, left to right, from the page's own grid --
+            rather than a nested grid, which ``tight_layout`` cannot place. A slot beyond the
+            classes present is left empty.
         clock: The clock, for the window order and the axis label.
         cells: The pooled cells.
         seconds: The compensated lag axis.
-        title: Panel title.
+        title: Row title, placed over the first column.
 
     Returns:
-        How many ridges (windows) were drawn.
+        How many ridges (windows) were drawn per column.
     """
     import matplotlib.transforms as mtransforms
 
@@ -3304,34 +3608,48 @@ def _draw_ridgeline(
         cells.windows, key=lambda window: float(cells.centres.get(window, 0.0)),
         reverse=bool(clock.inverted),
     )
-    if not groups or not ordered or peak <= 0.0:
-        _empty_panel(ax, title)
+    if not groups or not ordered or peak <= 0.0 or not len(slots):
+        _empty_panel(figure.add_subplot(slots[0]), title)
         return 0
     colours = figures.group_colors(groups)
     minimum = int(shared_stats.MIN_GROUP_SIZE)
     scale = _RIDGE_HEIGHT * _RIDGE_SPACING / peak
-    # Blended: x in axes fraction so the counts sit just outside the frame, y in data so they sit
-    # on the ridge they describe.
-    beside = mtransforms.blended_transform_factory(ax.transAxes, ax.transData)
-    baselines: List[float] = []
-    for row, window in enumerate(ordered):
-        baseline = float(len(ordered) - 1 - row) * _RIDGE_SPACING
-        baselines.append(baseline)
-        ax.axhline(baseline, color=figures.COLOR_LIGHT_GRAY, linewidth=figures.LINE_HAIRLINE, zorder=0)
-        counts: List[str] = []
-        for group in groups:
+    baselines = [float(len(ordered) - 1 - row) * _RIDGE_SPACING for row in range(len(ordered))]
+    first_axes = None
+    for column, group in enumerate(groups[: len(slots)]):
+        ax = figure.add_subplot(slots[column], sharey=first_axes)
+        if first_axes is None:
+            first_axes = ax
+        colour = colours.get(group, figures.COLOR_BLUE)
+        # Blended: x in axes fraction so the counts sit just inside the right edge, y in data so
+        # they sit on the ridge they describe.
+        beside = mtransforms.blended_transform_factory(ax.transAxes, ax.transData)
+        reference = cells.pooled.get(group)
+        for row, window in enumerate(ordered):
+            baseline = baselines[row]
+            ax.axhline(
+                baseline, color=figures.COLOR_LIGHT_GRAY, linewidth=figures.LINE_HAIRLINE,
+                zorder=0,
+            )
+            if reference is not None:
+                # The class's own pooled distribution under every ridge: the shape a ridge is
+                # read against, at the same scale as the ridge itself.
+                ax.step(
+                    seconds, baseline + np.where(np.isfinite(reference), reference, 0.0) * scale,
+                    where="mid", color=figures.COLOR_GRAY, linestyle="--",
+                    linewidth=figures.LINE_HAIRLINE, zorder=1 + row,
+                )
             density = cells.cell.get((group, window))
             if density is None:
                 continue
             count = int(cells.cell_counts.get((group, window), 0))
             thin = count < minimum
-            colour = colours.get(group, figures.COLOR_BLUE)
             top = baseline + np.where(np.isfinite(density), density, 0.0) * scale
             # Later rows draw over earlier ones, so the ridge nearest the reader (lowest on the
             # page) is the one that is complete -- the usual ridgeline convention.
             if not thin:
                 ax.fill_between(
-                    seconds, baseline, top, step="mid", color=colour, alpha=0.35, linewidth=0,
+                    seconds, baseline, top, step="mid", color=colour, alpha=0.45, linewidth=0,
                     zorder=1 + row,
                 )
             ax.step(
@@ -3341,37 +3659,48 @@ def _draw_ridgeline(
             )
             median = float(quantile_seconds(density, seconds, (0.5,))[0])
             ax.plot(
-                [median], [baseline], marker="|", markersize=5, color=colour,
+                [median], [baseline], marker="|", markersize=5, color=figures.COLOR_BLACK,
                 markeredgewidth=figures.LINE_EMPHASIS, zorder=2 + row,
             )
-            counts.append(f"{group} {count}")
-        ax.text(
-            1.005, baseline, "  ".join(counts), transform=beside, ha="left", va="bottom",
-            fontsize=figures.FONT_TINY, color=figures.COLOR_GRAY,
+            ax.text(
+                0.99, baseline, str(count), transform=beside, ha="right", va="bottom",
+                fontsize=figures.FONT_TINY, color=figures.COLOR_GRAY, zorder=3 + row,
+            )
+        ax.set_xlim(
+            float(seconds[0]) - SECONDS_PER_LAG_STEP / 2.0,
+            float(seconds[-1]) + SECONDS_PER_LAG_STEP / 2.0,
         )
-    ax.set_yticks(baselines)
-    ax.set_yticklabels(
-        [f"{float(cells.centres.get(window, float('nan'))):g} h" for window in ordered],
-        fontsize=figures.FONT_SMALL,
+        ax.set_title(
+            f"{group} (n={int(cells.pooled_counts.get(group, 0))} deliveries)", color=colour
+        )
+        ax.set_xlabel(figures.COEFFICIENT_LAG_AXIS_LABEL)
+        if column == 0:
+            ax.set_yticks(baselines)
+            ax.set_yticklabels(
+                [f"{float(cells.centres.get(window, float('nan'))):g} h" for window in ordered],
+                fontsize=figures.FONT_SMALL,
+            )
+            # Short on purpose: the clock's full sign convention is on every other panel of the
+            # page, and at full length it overruns the panel above.
+            ax.set_ylabel("window centre (h); labour progresses downward")
+        else:
+            ax.tick_params(axis="y", labelleft=False)
+        figures.style_axes(ax)
+    assert first_axes is not None
+    first_axes.set_ylim(-0.1 * _RIDGE_SPACING, baselines[0] + _RIDGE_HEIGHT * _RIDGE_SPACING + 0.1)
+    # The row's own title and its reading rule, over the first column so they are read before
+    # the columns are: the per-column titles name the classes only.
+    first_axes.text(
+        0.0, 1.10, title, transform=first_axes.transAxes, ha="left", va="bottom",
+        fontsize=figures.FONT_NOTE, color=figures.COLOR_BLACK,
     )
-    ax.set_ylim(-0.1 * _RIDGE_SPACING, baselines[0] + _RIDGE_HEIGHT * _RIDGE_SPACING + 0.1)
-    ax.set_xlim(float(seconds[0]) - SECONDS_PER_LAG_STEP / 2.0, float(seconds[-1]) + SECONDS_PER_LAG_STEP / 2.0)
-    for group in groups:
-        ax.plot([], [], marker="s", linestyle="none", color=colours.get(group, figures.COLOR_BLUE), label=group)
-    ax.legend(fontsize=figures.FONT_LABEL, loc="upper right", ncol=len(groups))
-    ax.set_title(title)
-    ax.set_xlabel(figures.COEFFICIENT_LAG_AXIS_LABEL)
-    # Short on purpose: the clock's full sign convention is on every other panel of the page, and
-    # at full length it overruns the panel above.
-    ax.set_ylabel("window centre (h); labour progresses downward")
-    ax.text(
-        0.01, 0.99,
-        f"tick on the baseline = median lag; right margin = recordings per class; "
-        f"dashed, unfilled = fewer than {minimum}",
-        transform=ax.transAxes, ha="left", va="top", fontsize=figures.FONT_TINY,
+    first_axes.text(
+        0.0, 1.035,
+        f"grey dashed = the class pooled over the whole clock; tick = median lag; "
+        f"right margin = recordings; dashed, unfilled = fewer than {minimum}",
+        transform=first_axes.transAxes, ha="left", va="bottom", fontsize=figures.FONT_TINY,
         color=figures.COLOR_GRAY,
     )
-    figures.style_axes(ax)
     return len(ordered)
 
 
@@ -3501,31 +3830,55 @@ def build_histogram_figure(
     import matplotlib.pyplot as plt
 
     n_windows = max((len(block.windows) for block in cells.values()), default=0)
+    # Three rows per band -- the overlay, the difference from the pooled reference, the
+    # cumulative curves -- then the violins, the per-class ridges, and the distance block.
     heights = (
-        [3.0] * len(HISTOGRAM_BANDS)
+        [2.6, 2.2, 2.2] * len(HISTOGRAM_BANDS)
         + [4.5]
-        + [max(3.5, 0.32 * n_windows + 1.5)]
+        + [max(3.5, 0.32 * n_windows + 1.8)]
         + [3.0] * len(DISTANCE_METRICS)
     )
+    # The grid carries one column per class per source, so the ridge row can give each class its
+    # own column while every other row spans a source's columns; a nested grid would do the same
+    # and ``tight_layout`` cannot place one.
+    n_classes = max((len(block.groups) for block in cells.values()), default=1) or 1
+    # No explicit spacing on the grid: a gridspec with its own ``hspace`` is one ``tight_layout``
+    # refuses to place, and every figure in this package is laid out by ``render_figure``.
     figure = plt.figure(figsize=(13.0, float(sum(heights))))
-    grid = figure.add_gridspec(len(heights), 2, height_ratios=heights)
-    axes = np.array(
-        [[figure.add_subplot(grid[row, column]) for column in range(2)] for row in range(len(heights))]
-    )
+    grid = figure.add_gridspec(len(heights), 2 * n_classes, height_ratios=heights)
 
-    for row, band_key in enumerate(HISTOGRAM_BANDS):
+    def span(row: int, column: int) -> Any:
+        """The gridspec cell one source's panel occupies on ``row``."""
+        return grid[row, column * n_classes:(column + 1) * n_classes]
+
+    for index, band_key in enumerate(HISTOGRAM_BANDS):
+        top = 3 * index
         for column, (source_key, _, meaning) in enumerate(PROFILE_SOURCES):
             block = cells.get((band_key, source_key))
-            title = f"{band_key} band, {source_key}: {meaning}, pooled over the whole clock"
+            axes = [figure.add_subplot(span(top + offset, column)) for offset in range(3)]
+            titles = (
+                f"{band_key} band, {source_key}: {meaning}, pooled over the whole clock",
+                f"{band_key} band, {source_key}: each class minus the pooled distribution",
+                f"{band_key} band, {source_key}: cumulative distribution, medians dropped to the axis",
+            )
             if block is None:
-                _empty_panel(axes[row, column], title)
+                for ax, title in zip(axes, titles):
+                    _empty_panel(ax, title)
                 continue
             _draw_distribution_overlay(
-                axes[row, column], block.pooled, block.pooled_counts, block.groups, seconds,
-                title=title,
+                axes[0], block.pooled, block.pooled_counts, block.groups, seconds,
+                title=titles[0],
+            )
+            _draw_distribution_difference(
+                axes[1], block.pooled, block.pooled_counts, block.groups, seconds,
+                title=titles[1],
+            )
+            _draw_distribution_cdf(
+                axes[2], block.pooled, block.pooled_counts, block.groups, seconds,
+                title=titles[2],
             )
 
-    base = len(HISTOGRAM_BANDS)
+    base = 3 * len(HISTOGRAM_BANDS)
     for column, (source_key, _, _) in enumerate(PROFILE_SOURCES):
         block = cells.get((HIGH_BAND_KEY, source_key))
         violin_title = (
@@ -3533,15 +3886,21 @@ def build_histogram_figure(
             f"(body = the cell's distribution; untested)"
         )
         ridge_title = (
-            f"{HIGH_BAND_KEY} band, {source_key}: the same cells as ridges, labour running down "
-            f"the page (untested)"
+            f"{HIGH_BAND_KEY} band, {source_key}: the same cells as ridges, one column per "
+            f"class, labour running down the page (untested)"
         )
         if block is None:
-            _empty_panel(axes[base, column], violin_title)
-            _empty_panel(axes[base + 1, column], ridge_title)
+            _empty_panel(figure.add_subplot(span(base, column)), violin_title)
+            _empty_panel(figure.add_subplot(span(base + 1, column)), ridge_title)
             continue
-        _draw_density_violins(axes[base, column], clock, block, seconds, title=violin_title)
-        _draw_ridgeline(axes[base + 1, column], clock, block, seconds, title=ridge_title)
+        _draw_density_violins(
+            figure.add_subplot(span(base, column)), clock, block, seconds, title=violin_title
+        )
+        _draw_ridgeline(
+            figure,
+            [grid[base + 1, column * n_classes + slot] for slot in range(n_classes)],
+            clock, block, seconds, title=ridge_title,
+        )
 
     last = base + 2
     drawn_distances = (
@@ -3551,10 +3910,95 @@ def build_histogram_figure(
     for row, (metric, ylabel) in enumerate(DISTANCE_METRICS):
         for column, (comparison, phrase) in enumerate(DISTANCE_COMPARISONS):
             _draw_distance_panel(
-                axes[last + row, column], clock, drawn_distances,
+                figure.add_subplot(span(last + row, column)), clock, drawn_distances,
                 comparison=comparison, column=metric, ylabel=ylabel,
                 title=f"{HIGH_BAND_KEY} band, attn: {phrase} (untested)",
             )
+    figures.caveat_note(figure)
+    return figure
+
+
+def build_subgroup_histogram_figure(
+    densities: Dict[Tuple[str, str], CohortDensities],
+    seconds: np.ndarray,
+) -> Any:
+    r"""The high band's lag distribution pooled over the whole population, nested by cohort.
+
+    One column per clinical class, and inside each column that class's **subgroups** as tints of
+    the class colour with the class's own pooled distribution as a black dashed reference -- the
+    layout the ``distributions`` analysis uses for the same reason: eight curves on one axes are
+    unreadable, and a subgroup is a subdivision of a class rather than a cohort of its own. Two
+    rows per profile source: the distribution, and its cumulative form with the medians dropped to
+    the axis, because a shift between skewed distributions is a horizontal offset of the
+    cumulative curves and is invisible in the densities.
+
+    Args:
+        densities: ``(source, group_column)`` to that combination's cohort distributions, for the
+            high band; both axes of one source are read together.
+        seconds: The compensated lag axis.
+
+    Returns:
+        The figure, for :func:`~teb_vae.lag_attn_cfs.eval.figures_seam.render_figure`.
+    """
+    classes: List[str] = []
+    for source_key, _, _ in PROFILE_SOURCES:
+        block = densities.get((source_key, labels.CLASS_COLUMN))
+        if block is not None and block.groups:
+            classes = list(block.groups)
+            break
+    n_columns = max(len(classes), 1)
+    figure, axes = figures.new_figure(
+        2 * len(PROFILE_SOURCES), n_columns, height_per_row=2.8, width=13.0
+    )
+    for index, (source_key, _, meaning) in enumerate(PROFILE_SOURCES):
+        by_class = densities.get((source_key, labels.CLASS_COLUMN))
+        by_subgroup = densities.get((source_key, labels.SUBGROUP_COLUMN))
+        for column in range(n_columns):
+            class_name = classes[column] if column < len(classes) else None
+            density_ax, cdf_ax = axes[2 * index, column], axes[2 * index + 1, column]
+            density_title = (
+                f"{class_name}, {source_key}: subgroups against the class, whole population"
+                if class_name else f"{source_key}: {meaning}"
+            )
+            cdf_title = (
+                f"{class_name}, {source_key}: cumulative, medians dropped to the axis"
+                if class_name else f"{source_key}: cumulative"
+            )
+            members = (
+                [group for group in by_subgroup.groups
+                 if figures._class_of(group) == class_name]
+                if by_subgroup is not None and class_name else []
+            )
+            if class_name is None or by_class is None or not members:
+                _empty_panel(density_ax, density_title)
+                _empty_panel(cdf_ax, cdf_title)
+                continue
+            profiles = {group: by_subgroup.cell[group] for group in members}
+            counts = {group: by_subgroup.counts.get(group, 0) for group in members}
+            reference = by_class.cell.get(class_name)
+            _draw_distribution_overlay(
+                density_ax, profiles, counts, members, seconds, title=density_title
+            )
+            _draw_distribution_cdf(cdf_ax, profiles, counts, members, seconds, title=cdf_title)
+            if reference is not None:
+                # The class the subgroups belong to, over both panels, so a subgroup is read
+                # against its own class rather than against the population.
+                label = (
+                    f"{class_name} pooled (n={int(by_class.counts.get(class_name, 0))} "
+                    f"deliveries)"
+                )
+                density_ax.step(
+                    seconds, reference, where="mid", color=figures.COLOR_BLACK, linestyle="--",
+                    linewidth=figures.LINE_REGULAR, label=label, zorder=4,
+                )
+                cdf_ax.step(
+                    seconds, np.nancumsum(reference), where="post", color=figures.COLOR_BLACK,
+                    linestyle="--", linewidth=figures.LINE_REGULAR, label=label, zorder=4,
+                )
+                density_ax.legend(fontsize=figures.FONT_LABEL, loc="best")
+                cdf_ax.legend(
+                    fontsize=figures.FONT_LABEL, loc="lower right", bbox_to_anchor=(1.0, 0.08)
+                )
     figures.caveat_note(figure)
     return figure
 
@@ -4122,6 +4566,27 @@ def run_lag_high_kl_analysis(
         )
         clocks.append(record)
 
+    # --- The whole-population cohort histogram: by class and by subgroup, no clock ----------------
+    # The eight-cohort question the clock pages cannot ask, on the high band and both sources.
+    cohort_tables: List[pd.DataFrame] = []
+    cohort_blocks: Dict[Tuple[str, str], CohortDensities] = {}
+    for source_key, _, _ in PROFILE_SOURCES:
+        for axis in labels.GROUP_COLUMNS:
+            block = cohort_densities(
+                featured, profiles.get(f"{HIGH_BAND_KEY}_{source_key}"), n_lags, axis
+            )
+            cohort_blocks[(source_key, axis)] = block
+            cohort_tables.append(
+                cohort_histogram_frame(HIGH_BAND_KEY, source_key, axis, block, seconds)
+            )
+    _concat_tables(cohort_tables, COHORT_HISTOGRAM_COLUMNS).to_csv(
+        directory / COHORT_HISTOGRAM_FILENAME, index=False
+    )
+    written.append(str(figures.render_figure(
+        build_subgroup_histogram_figure(cohort_blocks, seconds),
+        directory / SUBGROUP_HISTOGRAM_FIGURE,
+    ).name))
+
     # --- The run-level pages and the tables ------------------------------------------------------
     written.append(str(figures.render_figure(
         build_selection_figure(
@@ -4220,7 +4685,7 @@ def run_lag_high_kl_analysis(
         GAIN_BY_ARGMAX_FILENAME, OCCLUSION_CONSISTENCY_FILENAME, HISTOGRAM_FILENAME,
         HISTOGRAM_FEATURES_FILENAME, HISTOGRAM_DISTANCE_FILENAME,
         HISTOGRAM_SIGNIFICANCE_FILENAME, HISTOGRAM_PAIRWISE_FILENAME, HISTOGRAM_DRIFT_FILENAME,
-        HISTOGRAM_DRIFT_SUMMARY_FILENAME, *written,
+        HISTOGRAM_DRIFT_SUMMARY_FILENAME, COHORT_HISTOGRAM_FILENAME, *written,
     ]
     drawn = [record for record in clocks if record.get("drawn")]
     logger.info(
@@ -4313,6 +4778,20 @@ def run_lag_high_kl_analysis(
                 "tested": False,
             },
             "census": histogram_census,
+            # The clock-free half: the same distributions pooled over the whole population, by
+            # class and by subgroup, with the recordings behind every cohort curve.
+            "whole_population": {
+                "band": HIGH_BAND_KEY,
+                "note": (
+                    "each recording's selected-anchor profile averaged over every one of its "
+                    "segments, normalised once, then averaged over the recordings of the cohort; "
+                    "no clock, no window, every recording counts once. Descriptive: no test."
+                ),
+                "n_recordings": {
+                    f"{source_key}/{axis}": dict(block.counts)
+                    for (source_key, axis), block in cohort_blocks.items()
+                },
+            },
             # The tested half: which features, on which band and source, and what came of it. The
             # per-window and pairwise detail is on the two CSVs, as it is for the shipped readouts.
             "tested": {

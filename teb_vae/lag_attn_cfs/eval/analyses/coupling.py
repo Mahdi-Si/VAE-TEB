@@ -107,6 +107,13 @@ PRED_GAP_COLUMNS: Tuple[Tuple[str, str, str], ...] = (
         "likelihood over K latent draws",
     ),
     (
+        "pred_gap_mean_nats",
+        "mean_pred_gap",
+        "mean-decoded: both branches decoded at their latent mean under the decoder's own "
+        "variance, no draw -- whether the MEAN forecast improved, independent of either "
+        "branch's latent spread",
+    ),
+    (
         "pred_gap_train_path_nats",
         "pred_gap",
         "training path: the objective's own reduction (base decoded at the prior mean under "
@@ -114,9 +121,33 @@ PRED_GAP_COLUMNS: Tuple[Tuple[str, str, str], ...] = (
     ),
 )
 
+#: The estimator the figures foreground and the extremes and the anchor-level analyses read.
+#: The mean-decoded one: it is deterministic, it is the reading the objective itself optimised
+#: for the base branch, and it does not reward a branch for the spread of its latent. The
+#: marginalised column stays the gate's headline -- that is a pre-registered criterion and is not
+#: this module's to move -- and every figure that draws one draws the other beside it.
+PRIMARY_PRED_GAP = "pred_gap_mean_nats"
+
+#: A short label per estimator, for legends and titles where the score path is too long.
+ESTIMATOR_LABELS: Dict[str, str] = {
+    "pred_gap_mc_nats": "Monte Carlo marginalised (K draws)",
+    "pred_gap_mean_nats": "mean-decoded (no draw)",
+    "pred_gap_train_path_nats": "training path (parity)",
+}
+
+#: One colour per estimator, kept across every panel that draws more than one of them so a
+#: reader who has learned the colour on the histograms reads the violins and the scatters
+#: without the legend. Off the cohort palette on purpose: an estimator is not a cohort.
+ESTIMATOR_COLORS: Dict[str, str] = {
+    "pred_gap_mc_nats": figures.COLOR_BLUE,
+    "pred_gap_mean_nats": figures.COLOR_PURPLE,
+    "pred_gap_train_path_nats": figures.COLOR_GRAY,
+}
+
 #: The block scores whose difference each ``pred_gap`` is, for the paired test.
 _PAIRED_SCORES: Dict[str, Tuple[str, str]] = {
     "pred_gap_mc_nats": ("mc_nll_base_block", "mc_nll_full_block"),
+    "pred_gap_mean_nats": ("mean_nll_base_block", "mean_nll_full_block"),
     "pred_gap_train_path_nats": ("nll_base_block", "nll_full_block"),
 }
 
@@ -145,9 +176,12 @@ LIKELIHOOD_PERCENT_REQUIRES = "gaussian_nll"
 #: Every per-sample column this analysis reduces per recording.
 VALUE_COLUMNS: Tuple[str, ...] = (
     "mc_pred_gap",
+    "mean_pred_gap",
     "pred_gap",
     "mc_nll_base_block",
     "mc_nll_full_block",
+    "mean_nll_base_block",
+    "mean_nll_full_block",
     "nll_base_block",
     "nll_full_block",
     *KL_COLUMNS,
@@ -181,14 +215,24 @@ PERCENT_COLUMNS: Tuple[Tuple[str, str], ...] = (
         "whatever the warm-up budget left standing, so the percentage is budget-local and two "
         "runs' values are comparable only where their block widths are",
     ),
+    (
+        "pred_gap_mean_likelihood_pct",
+        "likelihood space: 100 * (exp(mean_pred_gap / (H*C_keep)) - 1), the same per-coefficient "
+        "density ratio on the mean-decoded gap, with the same fixed-block-width and budget-local "
+        "caveats",
+    ),
 )
 
-#: The two error-space percentages, and the likelihood-space one, named rather than positional.
-#: The figure draws the first pair on one axis and the third on its own, and the split is a
-#: statement about what shares a scale -- not something a reader should have to infer from the
-#: registry's ordering.
+#: The two error-space percentages, and the two likelihood-space ones, named rather than
+#: positional. The figure draws the first pair on one axis and the second pair on its own, and
+#: the split is a statement about what shares a scale -- not something a reader should have to
+#: infer from the registry's ordering.
 ERROR_SPACE_PERCENTS: Tuple[str, str] = ("pred_gap_rmse_pct", "pred_gap_mse_pct")
 LIKELIHOOD_SPACE_PERCENT = "pred_gap_mc_likelihood_pct"
+MEAN_LIKELIHOOD_SPACE_PERCENT = "pred_gap_mean_likelihood_pct"
+LIKELIHOOD_SPACE_PERCENTS: Tuple[str, str] = (
+    LIKELIHOOD_SPACE_PERCENT, MEAN_LIKELIHOOD_SPACE_PERCENT,
+)
 
 #: The one promoted to the histogram and to the by-cohort fan-out. Root-mean-square rather than
 #: mean-square for the same reason ``GROUPED_METRICS`` promotes it: the two are one ratio under a
@@ -208,7 +252,9 @@ HEADLINE_PERCENT = ERROR_SPACE_PERCENTS[0]
 #: in nats and a KL in nats are not on the same scale -- the KL is multiplied by an arbitrary
 #: factor whenever the prior variance sits on its clamp -- so a single page carrying both invites
 #: reading one against the other's range. Each group gets its own ``<stem>_by_<axis>`` pair.
-GROUPED_PRED_GAP_METRICS: Tuple[str, ...] = ("mc_pred_gap", "pred_gap", HEADLINE_PERCENT)
+GROUPED_PRED_GAP_METRICS: Tuple[str, ...] = (
+    "mc_pred_gap", "mean_pred_gap", "pred_gap", HEADLINE_PERCENT,
+)
 GROUPED_KL_METRICS: Tuple[str, ...] = KL_COLUMNS
 
 #: The union, in the order the two pages are emitted. Kept as one name because "what this analysis
@@ -402,6 +448,11 @@ def percent_columns(
         columns[LIKELIHOOD_SPACE_PERCENT] = 100.0 * np.expm1(
             finite_column(per_guid, "mc_pred_gap") / float(samples_per_anchor)
         )
+        # The same ratio on the mean-decoded gap, so the two estimators can be read as
+        # percentages beside each other exactly as they are read in nats.
+        columns[MEAN_LIKELIHOOD_SPACE_PERCENT] = 100.0 * np.expm1(
+            finite_column(per_guid, "mean_pred_gap") / float(samples_per_anchor)
+        )
     return columns
 
 
@@ -531,47 +582,148 @@ def _shade_mean_interval(axis: Any, row: Dict[str, Any]) -> None:
     axis.legend(fontsize=figures.FONT_LABEL, loc="best")
 
 
+def _draw_agreement_panel(
+    ax: Any,
+    per_guid: pd.DataFrame,
+    *,
+    x_estimator: str,
+    y_estimator: str,
+) -> int:
+    r"""Scatter two estimators of ``pred_gap`` against each other, one point per recording.
+
+    The panel exists because the estimators can disagree in **sign** on the same recording, and
+    a pair of histograms cannot show that: each histogram says how many recordings sit above zero
+    under its own estimator, and nothing about whether they are the same recordings. Here the
+    four quadrants are the finding. The title carries Spearman's $\rho$ over recordings and the
+    share of recordings on which the two agree in sign, both descriptive.
+
+    Args:
+        ax: Target axes.
+        per_guid: Per-recording means.
+        x_estimator: The estimator on the x axis, a key of :data:`ESTIMATOR_LABELS`.
+        y_estimator: The estimator on the y axis, likewise.
+
+    Returns:
+        How many recordings carried a finite value under both estimators.
+    """
+    columns = {name: column for name, column, _ in PRED_GAP_COLUMNS}
+    x = finite_column(per_guid, columns[x_estimator])
+    y = finite_column(per_guid, columns[y_estimator])
+    both = np.isfinite(x) & np.isfinite(y)
+    title = f"{y_estimator} against {x_estimator}, per recording"
+    if not both.any():
+        ax.text(
+            0.5, 0.5, figures.EMPTY_NOTE, transform=ax.transAxes,
+            ha="center", va="center", fontsize=figures.FONT_NOTE, color=figures.COLOR_GRAY,
+        )
+        ax.set_title(title)
+        figures.style_axes(ax)
+        return 0
+    x, y = x[both], y[both]
+    ax.scatter(
+        x, y, s=6, color=ESTIMATOR_COLORS.get(y_estimator, figures.COLOR_BLUE), alpha=0.45,
+        linewidths=0, zorder=3,
+    )
+    # The identity and the two zero lines: the identity says whether one estimator is a shifted
+    # copy of the other, the zeros cut the quadrants the sign agreement is counted in.
+    limit_lo = float(min(x.min(), y.min()))
+    limit_hi = float(max(x.max(), y.max()))
+    ax.plot(
+        [limit_lo, limit_hi], [limit_lo, limit_hi], color=figures.COLOR_LIGHT_GRAY,
+        linestyle="--", linewidth=figures.LINE_THIN, zorder=1, label="identity",
+    )
+    ax.axhline(0.0, color=figures.COLOR_GRAY, linestyle=":", linewidth=figures.LINE_THIN, zorder=1)
+    ax.axvline(0.0, color=figures.COLOR_GRAY, linestyle=":", linewidth=figures.LINE_THIN, zorder=1)
+    agreement = float(np.mean(np.sign(x) == np.sign(y)))
+    rho = float("nan")
+    if x.size >= 3:
+        # Lazily, as every SciPy use in this package is: a box without it loses one number in a
+        # title and nothing else.
+        try:
+            from scipy.stats import spearmanr
+
+            rho = float(spearmanr(x, y)[0])
+        except Exception:  # noqa: BLE001 - a missing SciPy must not lose the figure
+            rho = float("nan")
+    ax.set_title(
+        f"{title}\nSpearman rho = {rho:.2f}, same sign on {agreement:.0%} of {x.size} "
+        f"recordings (descriptive)"
+    )
+    ax.set_xlabel(f"{x_estimator} (nats per anchor)")
+    ax.set_ylabel(f"{y_estimator} (nats per anchor)")
+    ax.legend(fontsize=figures.FONT_LABEL, loc="best")
+    figures.style_axes(ax)
+    return int(x.size)
+
+
 def build_distribution_figure(
     per_guid: pd.DataFrame, gap_rows: Sequence[Dict[str, Any]]
 ) -> Any:
-    """Draw the per-recording ``pred_gap`` distribution with its interval, and both estimators.
+    r"""Draw the per-recording ``pred_gap`` under every estimator, and the estimators against
+    each other.
 
-    Two panels rather than one. The histogram answers "how many recordings did the source help,
-    and by how much" -- with zero marked, because the sign is the finding and a distribution
-    straddling it is a different result from one sitting above it. The violin puts the two
-    estimators side by side under their own names, so the marginalisation's cost is visible rather
-    than being a difference between two figures.
+    Three blocks. **One histogram per estimator**, each with zero marked and the bootstrap
+    interval on its own mean shaded -- the sign is the finding, and a distribution straddling zero
+    is a different result from one sitting above it, so every estimator gets that reading on its
+    own axis rather than being squeezed onto the marginalised one's range. **The estimators side
+    by side** as violins under their own names. And **the estimators against each other per
+    recording**: the mean-decoded gap against the marginalised one and against the training-path
+    one, with the identity and the zero lines drawn, so that a run whose marginalised gap is
+    negative while its mean-decoded gap is positive shows *which recordings* flipped rather than
+    two summary numbers that disagree.
 
     Args:
         per_guid: Per-recording means.
-        gap_rows: The summary rows, read for the headline estimator's interval.
+        gap_rows: The summary rows, read for each estimator's interval.
 
     Returns:
         The figure; the caller renders and closes it.
     """
-    figure, axes = figures.new_figure(2)
-    headline = next(iter(gap_rows), {})
-    axis = axes[0, 0]
-    figures.histogram_panel(
-        axis,
-        finite_column(per_guid, PRED_GAP_COLUMNS[0][1]),
-        title=(
-            f"pred_gap per recording, n = {int(headline.get('n_recordings_scored') or 0)} "
-            f"(Monte Carlo marginalised)"
-        ),
-        xlabel="nats per anchor",
-        reference=0.0,
-        reference_label="no improvement",
-    )
-    _shade_mean_interval(axis, headline)
+    import matplotlib.pyplot as plt
+
+    rows_by_metric = {str(row.get("metric")): row for row in gap_rows}
+    n_estimators = len(PRED_GAP_COLUMNS)
+    heights = [2.6] * n_estimators + [3.0, 3.4]
+    figure = plt.figure(figsize=(9.0, float(sum(heights))))
+    grid = figure.add_gridspec(len(heights), 2, height_ratios=heights)
+
+    for index, (name, column, _path) in enumerate(PRED_GAP_COLUMNS):
+        axis = figure.add_subplot(grid[index, :])
+        row = rows_by_metric.get(name, {})
+        figures.histogram_panel(
+            axis,
+            finite_column(per_guid, column),
+            title=(
+                f"{name} per recording, n = {int(row.get('n_recordings_scored') or 0)}: "
+                f"{ESTIMATOR_LABELS.get(name, name)}"
+                + (
+                    f"; positive in {float(row['positive_fraction']):.0%}"
+                    if np.isfinite(float(row.get("positive_fraction", float("nan")))) else ""
+                )
+            ),
+            xlabel="nats per anchor",
+            color=ESTIMATOR_COLORS.get(name, figures.COLOR_BLUE),
+            reference=0.0,
+            reference_label="no improvement",
+        )
+        _shade_mean_interval(axis, row)
 
     figures.violin_panel(
-        axes[1, 0],
+        figure.add_subplot(grid[n_estimators, :]),
         {name: finite_column(per_guid, column) for name, column, _ in PRED_GAP_COLUMNS},
         title="pred_gap per recording, by estimator",
         ylabel="nats per anchor",
+        colors=ESTIMATOR_COLORS,
         reference=0.0,
         reference_label="no improvement",
+    )
+    _draw_agreement_panel(
+        figure.add_subplot(grid[n_estimators + 1, 0]), per_guid,
+        x_estimator="pred_gap_mc_nats", y_estimator=PRIMARY_PRED_GAP,
+    )
+    _draw_agreement_panel(
+        figure.add_subplot(grid[n_estimators + 1, 1]), per_guid,
+        x_estimator="pred_gap_train_path_nats", y_estimator=PRIMARY_PRED_GAP,
     )
     return figure
 
@@ -623,12 +775,20 @@ def build_percent_figure(
     )
     # A column the run did not produce reads back as all-NaN, which the panel draws as its empty
     # note -- so a run scored under 'mse', or one whose geometry was unavailable, says "not
-    # measured" on the page rather than dropping a panel and changing the figure's shape.
+    # measured" on the page rather than dropping a panel and changing the figure's shape. Both
+    # likelihood-space percentages share the panel: same expression, two estimators.
     figures.violin_panel(
         axes[2, 0],
-        {LIKELIHOOD_SPACE_PERCENT: finite_column(per_guid, LIKELIHOOD_SPACE_PERCENT)},
-        title="likelihood space: extra density on each observed target coefficient",
+        {name: finite_column(per_guid, name) for name in LIKELIHOOD_SPACE_PERCENTS},
+        title=(
+            "likelihood space: extra density on each observed target coefficient, "
+            "marginalised and mean-decoded"
+        ),
         ylabel="percent",
+        colors={
+            LIKELIHOOD_SPACE_PERCENT: ESTIMATOR_COLORS["pred_gap_mc_nats"],
+            MEAN_LIKELIHOOD_SPACE_PERCENT: ESTIMATOR_COLORS["pred_gap_mean_nats"],
+        },
         reference=0.0,
         reference_label="no improvement",
     )

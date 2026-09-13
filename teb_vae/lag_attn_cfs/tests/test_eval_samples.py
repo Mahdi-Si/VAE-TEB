@@ -613,8 +613,14 @@ def test_one_failing_page_is_recorded_by_index_and_the_rest_still_render(
     assert failures[0]["dataset_index"] == 1
     assert failures[0]["variant"] == samples_analysis.COMPACT_VARIANT
     assert "deliberate page failure" in failures[0]["error"]
-    # The full page of the segment whose reduced page failed is still there.
-    assert {"variant": "full", "file": "sample0001_g1_epoch-1000.pdf"} in written
+    # The full page of the segment whose reduced page failed is still there, and every record
+    # carries the recording's identity beside the file.
+    assert any(
+        record["variant"] == "full" and record["file"] == "sample0001_g1_epoch-1000.pdf"
+        and record["guid"] == "g1"
+        for record in written
+    )
+    assert all(set(samples_analysis.MANIFEST_COLUMNS) - {"selection"} <= set(record) for record in written)
     assert sorted(path.name for path in (tmp_path / "pages").glob("*.pdf")) == sorted(
         record["file"] for record in written
     )

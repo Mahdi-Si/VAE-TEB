@@ -780,6 +780,7 @@ def build_diagnostic_figure(
     guid: str,
     beta: float,
     scalars: Dict[str, float],
+    cohort: Optional[str] = None,
     up_raw: Optional[torch.Tensor] = None,
     normalization_stats: Optional[Dict[str, Any]] = None,
     delay_steps: int = 0,
@@ -818,6 +819,10 @@ def build_diagnostic_figure(
         epoch: Current epoch, for the title.
         guid: Recording identifier, for the title.
         beta: The KL weight **resolved for this epoch**, not the raw hyperparameter.
+        cohort: The cohort the recording belongs to -- its subgroup stem, which names the
+            clinical class as its prefix -- printed beside the GUID so a page lifted out of its
+            directory still says where the recording came from. ``None``, the default, prints
+            nothing extra, which is what a training batch that carries no cohort label gets.
         scalars: Loss readouts for the title (``nll_base_block``, ``nll_full_block``,
             ``pred_gap``, ``source_conditioned_kl_raw``); missing keys are skipped.
         up_raw: The raw source $(B, L_{\mathrm{raw}})$ in loader units, or ``None``. The model
@@ -1197,13 +1202,18 @@ def build_diagnostic_figure(
         readouts = "  ".join(
             f"{name}={float(scalars[name]):.4g}"
             for name in (
-                "nll_base_block", "nll_full_block", "pred_gap", "mc_pred_gap",
+                "nll_base_block", "nll_full_block", "pred_gap", "mc_pred_gap", "mean_pred_gap",
                 "source_conditioned_kl_raw",
             )
             if name in scalars
         )
+        # The cohort sits directly after the GUID, because the two are read together: a GUID
+        # alone says which recording, and only the subgroup says which population it was drawn
+        # from -- which is the first thing a reader of an extreme page wants to know.
+        cohort_text = f" — subgroup {cohort}" if cohort else ""
         fig.suptitle(
-            f"epoch {epoch} — sample {i} — guid {guid} — beta={beta:.4g}\n{readouts}",
+            f"epoch {epoch} — sample {i} — guid {guid}{cohort_text} — beta={beta:.4g}\n"
+            f"{readouts}",
             fontsize=10, y=1.0 - 0.1 / figure_height, va="top",
         )
         return fig

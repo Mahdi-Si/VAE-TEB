@@ -124,18 +124,23 @@ def test_the_denominator_helper_reports_both_counts_on_an_all_nan_input() -> Non
 # =============================================================================
 def test_both_pred_gap_estimators_are_reported_and_labelled_by_path() -> None:
     rows = coupling_analysis.build_gap_rows(
-        _per_guid(mc_pred_gap=[1.0, 2.0, 3.0], pred_gap=[1.1, 2.1, 3.1]), resamples=200, seed=0
+        _per_guid(
+            mc_pred_gap=[1.0, 2.0, 3.0], mean_pred_gap=[1.5, 2.5, 3.5], pred_gap=[1.1, 2.1, 3.1]
+        ),
+        resamples=200, seed=0,
     )
 
     assert [row["metric"] for row in rows] == [
-        "pred_gap_mc_nats", "pred_gap_train_path_nats"
+        "pred_gap_mc_nats", "pred_gap_mean_nats", "pred_gap_train_path_nats"
     ]
-    assert [row["source_column"] for row in rows] == ["mc_pred_gap", "pred_gap"]
+    assert [row["source_column"] for row in rows] == ["mc_pred_gap", "mean_pred_gap", "pred_gap"]
     assert "marginalised" in rows[0]["score_path"]
-    assert "single-draw" in rows[1]["score_path"]
+    assert "mean-decoded" in rows[1]["score_path"]
+    assert "training path" in rows[2]["score_path"]
     # Each estimator's own values, not one standing for both.
     assert rows[0]["mean"] == pytest.approx(2.0)
-    assert rows[1]["mean"] == pytest.approx(2.1)
+    assert rows[1]["mean"] == pytest.approx(2.5)
+    assert rows[2]["mean"] == pytest.approx(2.1)
 
 
 def test_the_paired_test_runs_on_the_two_block_scores_the_gap_is_the_difference_of() -> None:
@@ -225,7 +230,54 @@ def test_the_distribution_figure_marks_zero_and_the_interval_on_the_mean() -> No
 
     assert 0.0 in vertical, "the no-improvement reference must be drawn"
     assert spans == [(pytest.approx(rows[0]["ci_lo"]), pytest.approx(rows[0]["ci_hi"]))]
-    assert n_panels == 2, "the second panel is the two estimators side by side"
+    # One histogram per estimator, the estimators side by side, and the two agreement scatters
+    # of the mean-decoded estimator against the other two.
+    assert n_panels == len(coupling_analysis.PRED_GAP_COLUMNS) + 3
+
+
+def test_the_three_estimators_are_reported_and_the_mean_decoded_one_is_primary() -> None:
+    """The mean-decoded gap is its own row under its own name, beside the marginalised headline
+    and the training-path parity column -- and it is the estimator the figures foreground."""
+    rows = coupling_analysis.build_gap_rows(
+        _per_guid(
+            mc_pred_gap=[-1.0, -2.0, -3.0], mean_pred_gap=[1.0, 2.0, 3.0], pred_gap=[1.1, 2.1, 3.1]
+        ),
+        resamples=200, seed=0,
+    )
+
+    assert [row["metric"] for row in rows] == [
+        "pred_gap_mc_nats", "pred_gap_mean_nats", "pred_gap_train_path_nats"
+    ]
+    by_metric = {row["metric"]: row for row in rows}
+    assert by_metric["pred_gap_mean_nats"]["source_column"] == "mean_pred_gap"
+    assert by_metric["pred_gap_mean_nats"]["mean"] == pytest.approx(2.0)
+    assert by_metric["pred_gap_mc_nats"]["mean"] == pytest.approx(-2.0)
+    assert "mean" in by_metric["pred_gap_mean_nats"]["score_path"]
+    assert coupling_analysis.PRIMARY_PRED_GAP == "pred_gap_mean_nats"
+    assert coupling_analysis.PRIMARY_PRED_GAP in {
+        name for name, _, _ in coupling_analysis.PRED_GAP_COLUMNS
+    }
+
+
+def test_the_agreement_panel_counts_sign_agreement_over_recordings() -> None:
+    """Two estimators that disagree in sign on half the recordings say so in the title."""
+    from teb_vae.lag_attn.eval import figures as shared_figures
+
+    per_guid = _per_guid(
+        mc_pred_gap=[-1.0, -2.0, 3.0, 4.0], mean_pred_gap=[1.0, 2.0, 3.0, 4.0],
+    )
+    figure, axes = shared_figures.new_figure(1)
+    try:
+        drawn = coupling_analysis._draw_agreement_panel(
+            axes[0, 0], per_guid,
+            x_estimator="pred_gap_mc_nats", y_estimator="pred_gap_mean_nats",
+        )
+        title = axes[0, 0].get_title()
+    finally:
+        shared_figures.plt.close(figure)
+
+    assert drawn == 4
+    assert "same sign on 50% of 4 recordings" in title
 
 
 # =============================================================================
@@ -557,6 +609,7 @@ def test_the_analysis_writes_the_percentages_it_can_compute(tmp_path) -> None:
         {
             "guid": ["a", "a", "b", "b", "c", "c"],
             "mc_pred_gap": [1.0, 1.2, 0.8, 0.9, -0.1, 0.2],
+            "mean_pred_gap": [1.2, 1.4, 0.9, 1.0, 0.0, 0.3],
             "pred_gap": [1.1, 1.3, 0.7, 1.0, -0.2, 0.3],
             "sq_error_base": [4.0] * 6,
             "sq_error_full": [1.0, 1.0, 2.0, 2.0, 9.0, 9.0],

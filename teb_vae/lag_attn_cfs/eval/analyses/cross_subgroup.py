@@ -115,6 +115,12 @@ class MetricSource:
 #: **tested**.
 METRIC_SOURCES: Tuple[MetricSource, ...] = (
     MetricSource("coupling", "coupling_per_recording.csv", "mc_pred_gap", higher_is_better=True),
+    # The mean-decoded gap tested beside the marginalised one: a cohort difference that holds
+    # under one estimator and not the other is a finding about the estimator, and only a table
+    # carrying both can show it.
+    MetricSource(
+        "coupling", "coupling_per_recording.csv", "mean_pred_gap", higher_is_better=True,
+    ),
     MetricSource(
         "coupling", "coupling_per_recording.csv", "source_conditioned_kl_raw",
         higher_is_better=True,
