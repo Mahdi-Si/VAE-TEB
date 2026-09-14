@@ -197,10 +197,26 @@ def break_tolerance_s(record: Dict[str, Any]) -> float:
     Returns:
         The tolerance in seconds.
     """
+    return float(segment_stride_s(record) + SECONDS_PER_STEP * 1.5)
+
+
+def segment_stride_s(record: Dict[str, Any]) -> float:
+    r"""Seconds between consecutive stored segments, $T\Delta$, from the collection record.
+
+    The one place the stride is read, so the break tolerance above and the segment-completeness
+    ranking the attribution traces use cannot come to disagree about how many segments a span
+    could hold.
+
+    Args:
+        record: The collection record, read for its ``geometry.t``. An empty mapping falls back
+            to the shipped segment length.
+
+    Returns:
+        The stride in seconds.
+    """
     geometry = dict(record.get("geometry") or {})
     steps = int(geometry.get("t") or 0)
-    stride = steps * SECONDS_PER_STEP if steps > 0 else 300 * SECONDS_PER_STEP
-    return float(stride + SECONDS_PER_STEP * 1.5)
+    return float(steps * SECONDS_PER_STEP if steps > 0 else 300 * SECONDS_PER_STEP)
 
 
 def read_lag_support(results_dir: Any) -> dict:

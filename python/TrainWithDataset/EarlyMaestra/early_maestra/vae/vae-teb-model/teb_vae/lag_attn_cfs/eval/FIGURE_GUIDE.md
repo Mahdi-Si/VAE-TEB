@@ -1128,8 +1128,10 @@ the exactly-zero point, not of any input step. Every class contrast is out of di
 ## The per-recording attribution traces: `attribution/traces/<class>/<guid>_<subgroup>_attribution_trace.pdf`
 
 **In plain terms.** *"How does what the model reacted to move over the hours before delivery?"*
-One recording per class — the first the `recording_traces` analysis traced — attributed at the
-same few anchors of every one of its segments.
+One recording per class — the one whose stored segments most completely fill the window the run
+reads its clocks over, so the page shows an evolution rather than its holes — attributed at the
+same few anchors of every one of its segments. `attribution_traces.csv` and the block's
+`trace_selection` carry each chosen recording's coverage.
 
 **What it shows.** Five rows on the traces' shared figure: the magnitude of the source attribution
 of $K_t$ by offset from the anchor as a heatmap over hours before delivery; the model's own lag

@@ -51,7 +51,7 @@ from teb_vae.lag_attn_cfs.eval.metrics import DENSE_ANCHOR_GEOMETRY, batch_field
 TRACE_MANIFEST_FILENAME = "attribution_traces.csv"
 TRACE_MANIFEST_COLUMNS: Tuple[str, ...] = (
     "guid", labels.CLASS_COLUMN, labels.SUBGROUP_COLUMN, "n_segments", "n_anchors", "span_hours",
-    "arrays_file", "figure_file",
+    "coverage", "arrays_file", "figure_file",
 )
 
 #: The per-recording columns declared for the runner's by-class and by-subgroup fan-out: the
@@ -171,35 +171,120 @@ def select_segments(
     return rows.sort_values("dataset_index").reset_index(drop=True), accounting
 
 
+def recording_completeness(
+    index_map: Mapping[Tuple[str, Optional[int]], int],
+    *,
+    stride_s: float,
+    window_hours: Optional[float],
+) -> pd.DataFrame:
+    r"""How completely each recording's stored segments fill the window a trace is read over.
+
+    $$\texttt{coverage} = \frac{n_{\mathrm{window}}}{\lfloor S / \Delta_{\mathrm{seg}} \rfloor + 1},$$
+
+    with $n_{\mathrm{window}}$ the segments the dataset holds inside the window, $S$ the window's
+    span in seconds and $\Delta_{\mathrm{seg}}$ the stride between consecutive stored segments. The
+    window is the last ``window_hours`` before delivery when the run bounds its clocks, and the
+    recording's own span otherwise -- so a recording with a missing hour scores below one whose
+    segments tile the span, and the trace lands on the recording with the fewest holes rather
+    than on a random one.
+
+    Args:
+        index_map: The dataset's ``{(guid, rounded epoch): index}`` listing, which is what the
+            trace re-reads and therefore what completeness is measured on.
+        stride_s: $\Delta_{\mathrm{seg}}$.
+        window_hours: The bound in hours, or ``None`` for each recording's own span.
+
+    Returns:
+        One row per recording: ``guid``, ``n_segments``, ``n_in_window``, ``n_expected``,
+        ``span_hours`` and ``coverage`` in $[0, 1]$.
+    """
+    epochs: Dict[str, List[float]] = {}
+    for (guid, stamp), _index in index_map.items():
+        if stamp is not None:
+            epochs.setdefault(str(guid), []).append(float(stamp))
+    rows: List[Dict[str, Any]] = []
+    for guid, values in epochs.items():
+        stamps = np.sort(np.asarray(values, dtype=np.float64))
+        if window_hours is not None:
+            inside = stamps[stamps >= -float(window_hours) * cohort.SECONDS_PER_HOUR]
+            span = float(window_hours) * cohort.SECONDS_PER_HOUR
+        else:
+            inside = stamps
+            span = float(stamps.max() - stamps.min()) if stamps.size else 0.0
+        expected = int(span // float(stride_s)) + 1
+        rows.append(
+            {
+                "guid": guid, "n_segments": int(stamps.size), "n_in_window": int(inside.size),
+                "n_expected": expected, "span_hours": span / cohort.SECONDS_PER_HOUR,
+                "coverage": min(float(inside.size) / float(expected), 1.0),
+            }
+        )
+    return pd.DataFrame(rows, columns=["guid", "n_segments", "n_in_window", "n_expected", "span_hours", "coverage"])
+
+
 def select_trace_recordings(
     segments: pd.DataFrame,
     index_map: Mapping[Tuple[str, Optional[int]], int],
     *,
-    seed: int,
+    stride_s: float,
+    window_hours: Optional[float],
+    per_class: int = core.TRACE_RECORDINGS_PER_CLASS,
 ) -> Tuple[pd.DataFrame, Dict[str, Any]]:
-    """The recordings whose attribution is followed through every segment, per class.
+    """The recordings whose attribution is followed through every segment: the most complete per class.
 
-    Drawn under the trace analysis's own seed offset and eligibility floor, so the first
-    recording per class is the first one that analysis traced and the two figures describe the
-    same recording.
+    Ranked by :func:`recording_completeness` rather than drawn, because a trace over a recording
+    with a missing hour shows the hole and not the evolution; ties break on the segment count and
+    then on the identifier, so two runs choose the same recording. A recording with fewer than
+    two segments inside the window has no evolution to show and is never chosen.
 
     Args:
-        segments: From :func:`labelled_segments`.
-        index_map: The dataset listing.
-        seed: The run's seed, before the trace offset.
+        segments: From :func:`labelled_segments`, for the class of each recording.
+        index_map: The dataset listing, for the segments each recording holds.
+        stride_s: The stride between consecutive stored segments, in seconds.
+        window_hours: The bound the run reads its clocks over, or ``None``.
+        per_class: Recordings per class.
 
     Returns:
-        ``(chosen, accounting)`` as :func:`traces.select_recordings` returns them.
+        ``(chosen, accounting)``: the chosen rows with the cohort columns and the completeness
+        columns, and per class how many recordings were labelled, eligible and chosen, with each
+        chosen recording's coverage.
     """
-    recordings = recording_table(segments, index_map)
-    return traces.select_recordings(
-        recordings, per_class=core.TRACE_RECORDINGS_PER_CLASS,
-        seed=int(seed) + traces.TRACE_DRAW_SEED_OFFSET,
-    )
+    labelled = frames.per_recording_labels(segments).reset_index() if not segments.empty else pd.DataFrame(columns=["guid", *labels.GROUP_COLUMNS])
+    completeness = recording_completeness(index_map, stride_s=stride_s, window_hours=window_hours)
+    table = labelled.merge(completeness, on="guid", how="inner") if len(labelled) else completeness.head(0)
+    accounting: Dict[str, Any] = {
+        "per_class": int(per_class), "min_segments_in_window": traces.MIN_SEGMENTS_PER_TRACE,
+        "window_hours": None if window_hours is None else float(window_hours),
+        "segment_stride_s": float(stride_s), "classes": {},
+    }
+    pieces: List[pd.DataFrame] = []
+    if not table.empty and labels.CLASS_COLUMN in table.columns:
+        known = table[table[labels.CLASS_COLUMN].notna()]
+        for name in labels.ordered_groups(list(known[labels.CLASS_COLUMN].unique()), labels.CLASS_COLUMN):
+            members = known[known[labels.CLASS_COLUMN].astype(object) == name]
+            eligible = members[members["n_in_window"] >= traces.MIN_SEGMENTS_PER_TRACE]
+            ranked = eligible.sort_values(["coverage", "n_in_window", "guid"], ascending=[False, False, True])
+            chosen = ranked.head(int(per_class))
+            accounting["classes"][str(name)] = {
+                "n_recordings": int(len(members)), "n_eligible": int(len(eligible)), "n_selected": int(len(chosen)),
+                "coverage": [float(value) for value in chosen["coverage"]],
+            }
+            pieces.append(chosen)
+    columns = ["guid", *labels.GROUP_COLUMNS, "n_segments", "n_in_window", "n_expected", "span_hours", "coverage"]
+    chosen_all = pd.concat(pieces, ignore_index=True) if pieces else pd.DataFrame(columns=columns)
+    return chosen_all[[c for c in columns if c in chosen_all.columns]].reset_index(drop=True), accounting
 
 
 def recording_rows(guid: str, index_map: Mapping[Tuple[str, Optional[int]], int]) -> pd.DataFrame:
-    """Every dataset row of one recording, ascending in dataset index."""
+    """Every dataset row of one recording, ascending in dataset index.
+
+    Args:
+        guid: The recording.
+        index_map: The dataset listing.
+
+    Returns:
+        ``guid``, ``epoch`` and ``dataset_index`` per stored segment.
+    """
     listed = sorted(
         (index, stamp) for (listed_guid, stamp), index in index_map.items()
         if listed_guid == str(guid) and stamp is not None
@@ -912,6 +997,7 @@ def run_traces(
                 "guid": guid, labels.CLASS_COLUMN: clinical_class, labels.SUBGROUP_COLUMN: subgroup,
                 "n_segments": int(len(recording.segments)), "n_anchors": int(len(recording.anchors)),
                 "span_hours": float(span.max() - span.min()) if len(span) else float("nan"),
+                "coverage": float(choice["coverage"]) if "coverage" in choice.index else float("nan"),
                 "arrays_file": Path(arrays).relative_to(directory).as_posix(),
                 "figure_file": Path(figure).relative_to(directory).as_posix(),
             }
@@ -933,6 +1019,7 @@ def run_pass(
     results_dir: Any,
     lag_seconds: np.ndarray,
     break_after_s: float,
+    segment_stride_s: float,
     channel_map: Optional[pd.DataFrame],
     occlusion: Optional[pd.DataFrame],
     spectral: Optional[pd.DataFrame],
@@ -950,6 +1037,8 @@ def run_pass(
         results_dir: The run's results directory; the pass writes into its own subdirectory.
         lag_seconds: The compensated lag axis.
         break_after_s: The trace's break tolerance in seconds.
+        segment_stride_s: The stride between consecutive stored segments, in seconds, for the
+            completeness the traced recordings are ranked by.
         channel_map: The declared-axis channel map, or ``None``.
         occlusion: The occlusion summary, or ``None``.
         spectral: The band-resolved skill table, or ``None``.
@@ -975,7 +1064,10 @@ def run_pass(
         "layer": cell.layer_label, "delay_steps": int(delay_steps),
         "anchor_phase": DENSE_ANCHOR_GEOMETRY[0], "anchor_stride": DENSE_ANCHOR_GEOMETRY[1],
         "trace_recordings_per_class": core.TRACE_RECORDINGS_PER_CLASS,
+        # The bound is not applied to the trace's span -- the whole recording is traced -- but it
+        # is the window the traced recordings are ranked for completeness over.
         "max_hours_before_delivery_applied": False,
+        "trace_completeness_window_hours": eval_config.get("max_hours_before_delivery"),
     }
     labelled = labelled_segments(segments)
     selected, accounting = select_segments(labelled, index_map, cap=cap, seed=seed)
@@ -1038,7 +1130,11 @@ def run_pass(
     ]
     files.extend(Path(path).name for path in figure_paths)
 
-    chosen, trace_accounting = select_trace_recordings(labelled, index_map, seed=int(eval_config.get("seed", 0)))
+    window_hours = eval_config.get("max_hours_before_delivery")
+    chosen, trace_accounting = select_trace_recordings(
+        labelled, index_map, stride_s=segment_stride_s,
+        window_hours=None if window_hours is None else float(window_hours),
+    )
     manifest, failures = run_traces(
         task, loader, chosen, index_map, cell, directory=directory, lag_seconds=lag_seconds,
         break_after_s=break_after_s, n_steps=n_steps, anchors_per_segment=core.ANCHORS_PER_SEGMENT, caveat=caveat,
@@ -1118,7 +1214,8 @@ __all__ = [
     "RECORDING_VALUE_COLUMNS", "SPECTRAL_BANDS_PATH", "TRACE_MANIFEST_COLUMNS",
     "TRACE_MANIFEST_FILENAME", "BatchWork", "attribute_batch", "bands_frame", "labelled_segments",
     "lag_bands_frame", "layer_frame", "null_frame", "read_channel_map", "read_occlusion_summary",
-    "read_spectral_bands", "recording_rows", "recording_table", "recordings_frame", "rows_frame",
+    "read_spectral_bands", "recording_completeness", "recording_rows", "recording_table",
+    "recordings_frame", "rows_frame",
     "run_pass", "run_segments", "run_traces", "select_segments", "select_trace_recordings",
     "stack_vectors", "summary_frame", "target_only_check", "trace_recording",
 ]
