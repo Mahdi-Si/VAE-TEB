@@ -93,6 +93,7 @@ def run_attribution_analysis(
         eval_config=eval_config, results_dir=results_dir,
         lag_seconds=lag_axis.compensated_seconds_axis(n_lags, delay_steps),
         break_after_s=lag_axis.break_tolerance_s(record),
+        segment_stride_s=lag_axis.segment_stride_s(record),
         channel_map=attribution_pass.read_channel_map(results_dir),
         occlusion=attribution_pass.read_occlusion_summary(results_dir),
         spectral=attribution_pass.read_spectral_bands(results_dir),

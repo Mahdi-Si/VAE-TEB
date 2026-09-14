@@ -845,9 +845,11 @@ attribution is the source-content part, and the entry jump is what the normalisa
 the two; under the all-zero baseline the attribution splits between the target and the source
 streams. `attribution_null.csv` carries the per-class means and `attribution_null.pdf` draws them.
 
-**The trace.** One recording per class, drawn under the trace analysis's own seed so it is the
-first recording that analysis traced, is attributed at the same anchors of every one of its
-segments and drawn on the traces' shared figure: the lag-aligned attribution of $K_t$ as a heatmap
+**The trace.** One recording per class — the **most complete** one, ranked by how many of the
+segments the window could hold the dataset actually holds (the last `max_hours_before_delivery`
+hours when that key is set, the recording's own span otherwise, at the segment stride the
+geometry implies; ties on the segment count, then the identifier) — is attributed at the same
+anchors of every one of its segments and drawn on the traces' shared figure: the lag-aligned attribution of $K_t$ as a heatmap
 over hours before delivery beside the model's own lag readout, the agreement, the totals and the
 values. `attribution_traces.csv` is its manifest; the figures are
 `attribution/traces/<class>/<guid>_<subgroup>_attribution_trace.pdf`.

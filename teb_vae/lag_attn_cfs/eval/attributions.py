@@ -106,8 +106,9 @@ DEFAULT_SEGMENTS = 24
 ANCHORS_PER_SEGMENT = 4
 
 #: Recordings followed through every one of their segments **per class**, for the trace figure. One,
-#: because each is a few hundred attributions; drawn under the trace analysis's own seed offset so
-#: it is the first recording that analysis traced and the two figures describe one recording.
+#: because each is a few hundred attributions; the one chosen is the class's most **complete**
+#: recording over the window the run reads its clocks over -- the fewest missing segments -- so
+#: the figure shows an evolution rather than the holes in it.
 TRACE_RECORDINGS_PER_CLASS = 1
 
 #: Integrated-gradient steps and Captum's internal batch of interpolated inputs. The step count is
