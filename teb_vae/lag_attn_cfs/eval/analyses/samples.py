@@ -62,10 +62,17 @@ import numpy as np
 import pandas as pd
 import torch
 from loguru import logger
-from torch.utils.data import DataLoader, Subset
 
 from teb_vae.lag_attn_cfs.eval import figures_seam as figures
 from teb_vae.lag_attn_cfs.eval._reuse import labels, subsample_indices
+from teb_vae.lag_attn_cfs.eval.dataset_rows import (
+    check_identity,
+    dataset_index_map,
+    epoch_stamp,
+    resolve_rows,
+    sanitise_guid,
+    subset_loader,
+)
 from teb_vae.lag_attn_cfs.eval.metrics import (
     DENSE_ANCHOR_GEOMETRY,
     batch_field,
@@ -184,40 +191,6 @@ PAGE_VARIANTS: Tuple[Tuple[str, Optional[Tuple[str, ...]], bool], ...] = (
 #: :data:`EXPECTED_PAGE_ROWS` is: a row silently lost from a PDF is visible nowhere else.
 EXPECTED_COMPACT_PAGE_ROWS = len(COMPACT_PAGE_ROWS)
 
-#: Characters kept from a GUID; everything else becomes ``-``.
-_SAFE_GUID = re.compile(r"[^A-Za-z0-9_-]")
-
-
-def sanitise_guid(guid: Any) -> str:
-    """Return a GUID reduced to filename-safe characters, truncated to 32.
-
-    Args:
-        guid: The recording identifier, or anything printable.
-
-    Returns:
-        The sanitised stem. Never empty -- an unnamed recording becomes ``na``, because an empty
-        component would collapse two underscores and break the pattern the manifest is read by.
-    """
-    text = _SAFE_GUID.sub("-", str(guid))[:32]
-    return text or "na"
-
-
-def epoch_stamp(epoch: Any) -> Optional[int]:
-    """Return an ``epoch`` as a whole number of seconds, or ``None`` when it is not one.
-
-    Args:
-        epoch: The segment's ``epoch``, which is NaN for a segment that carries none and may be
-            absent entirely from an older table.
-
-    Returns:
-        The rounded value, or ``None``.
-    """
-    try:
-        value = float(epoch)
-    except (TypeError, ValueError):
-        return None
-    return int(round(value)) if np.isfinite(value) else None
-
 
 def page_filename(index: int, guid: Any, epoch: Any, *, compact: bool = False) -> str:
     """Return the filename one page is written as.
@@ -240,128 +213,6 @@ def page_filename(index: int, guid: Any, epoch: Any, *, compact: bool = False) -
         f"epoch{'na' if stamp is None else stamp}"
         f"{COMPACT_SUFFIX if compact else ''}"
     )
-
-
-# =============================================================================
-# Mapping a table row back to the dataset it came from
-# =============================================================================
-def dataset_index_map(loader: Any) -> Dict[Tuple[str, Optional[int]], int]:
-    """Return ``{(guid, rounded epoch): dataset index}`` for the evaluation dataset.
-
-    Built from the dataset's own index listing rather than from the pass's row order. The
-    collection pass runs under a seeded shuffle, so a row's ``sample_index`` is its position in
-    *that* pass and not in the dataset; and batches the derangement could not control are skipped
-    entirely, so even an unshuffled pass would drift. The identity a row carries is the only thing
-    that survives both.
-
-    Args:
-        loader: The evaluation dataloader.
-
-    Returns:
-        The mapping, empty when the dataset cannot list its own recordings -- which a caller reads
-        as "no page can be located", not as "no page is needed".
-    """
-    dataset = getattr(loader, "dataset", None)
-    lister = getattr(dataset, "get_the_lists", None)
-    if not callable(lister):
-        return {}
-    guids, epochs, _targets = lister()
-    return {
-        (str(guid), epoch_stamp(epoch)): index
-        for index, (guid, epoch) in enumerate(zip(guids, epochs))
-        if epoch_stamp(epoch) is not None
-    }
-
-
-def resolve_rows(
-    rows: pd.DataFrame, index_map: Dict[Tuple[str, Optional[int]], int]
-) -> pd.DataFrame:
-    """Attach each row's dataset index, dropping and counting the rows that do not resolve.
-
-    Args:
-        rows: Rows of the per-sample table.
-        index_map: From :func:`dataset_index_map`.
-
-    Returns:
-        The resolvable rows with a ``dataset_index`` column, in dataset order -- which is the
-        order a sequential loader over a ``Subset`` visits them in, and is what makes the identity
-        check below a check rather than a coincidence.
-    """
-    if not len(rows) or not index_map:
-        return rows.head(0).assign(dataset_index=pd.Series(dtype=np.int64))
-    resolved = [
-        index_map.get((str(row["guid"]), epoch_stamp(row["epoch"])))
-        for _, row in rows.iterrows()
-    ]
-    frame = rows.copy()
-    frame["dataset_index"] = pd.Series(resolved, index=frame.index, dtype="Int64")
-    frame = frame[frame["dataset_index"].notna()].copy()
-    frame["dataset_index"] = frame["dataset_index"].astype(np.int64)
-    return frame.sort_values("dataset_index").reset_index(drop=True)
-
-
-def page_loader(loader: Any, indices: Sequence[int]) -> DataLoader:
-    """Build a strictly sequential single-sample loader over the chosen dataset rows.
-
-    Args:
-        loader: The evaluation dataloader, read for its dataset and its collation.
-        indices: Dataset indices, ascending.
-
-    Returns:
-        A ``DataLoader`` over a ``Subset``, one sample per batch, no sampler and no shuffle. One
-        sample per batch because a page is one sample and a partly-rendered batch would be paid
-        for in full.
-
-    Raises:
-        ValueError: If the indices are not ascending. The identity check downstream assumes the
-            loader visits them in the order they were resolved in, and a caller reordering them is
-            the one way that assumption breaks silently.
-    """
-    order = [int(value) for value in indices]
-    if any(later <= earlier for earlier, later in zip(order, order[1:])):
-        raise ValueError(
-            f"page indices must be strictly ascending, got {order}. A Subset is visited in the "
-            f"order it was built, so an unordered index list pairs each rendered page with "
-            f"another row's guid and epoch and every page is plausible."
-        )
-    return DataLoader(
-        Subset(loader.dataset, order),
-        batch_size=1,
-        shuffle=False,
-        sampler=None,
-        num_workers=0,
-        collate_fn=loader.collate_fn,
-    )
-
-
-def check_identity(batch: Any, row: Any) -> None:
-    """Raise unless the batch is the segment the row says it is.
-
-    Args:
-        batch: A one-sample batch from :func:`page_loader`.
-        row: The per-sample row it was selected from.
-
-    Raises:
-        ValueError: On any disagreement in ``guid`` or ``epoch``. Asserted rather than assumed:
-            an off-by-one in the index mapping renders a complete, plausible page of the wrong
-            recording, and nothing else in the run would notice.
-    """
-    guid = batch.guid if not isinstance(batch, dict) else batch.get("guid")
-    epoch = batch.epoch if not isinstance(batch, dict) else batch.get("epoch")
-    found_guid = str(guid[0]) if isinstance(guid, (list, tuple)) else str(guid)
-    found_epoch = float(np.asarray(epoch).reshape(-1)[0]) if epoch is not None else float("nan")
-    wanted_guid, wanted_epoch = str(row["guid"]), float(row["epoch"])
-    same_epoch = (
-        abs(found_epoch - wanted_epoch) < 1.0
-        or (not np.isfinite(found_epoch) and not np.isfinite(wanted_epoch))
-    )
-    if found_guid != wanted_guid or not same_epoch:
-        raise ValueError(
-            f"the dataset row rendered as a page is not the row it was selected from: the loader "
-            f"yielded guid={found_guid!r} epoch={found_epoch} where the table row says "
-            f"guid={wanted_guid!r} epoch={wanted_epoch}. The index mapping is wrong, and every "
-            f"page it produced is a plausible picture of the wrong recording."
-        )
 
 
 # =============================================================================
@@ -488,7 +339,7 @@ def render_pages(
 
     model = task.orig_model
     anchor_phase, anchor_stride = DENSE_ANCHOR_GEOMETRY
-    pages = page_loader(loader, list(rows["dataset_index"]))
+    pages = subset_loader(loader, list(rows["dataset_index"]))
     for position, batch in enumerate(pages):
         row = rows.iloc[position]
         index = int(row["dataset_index"])
@@ -707,7 +558,7 @@ def per_class_rows(per_sample: pd.DataFrame, *, per_class: int, seed: int) -> pd
         chosen = member_index[torch.randperm(len(members), generator=generator)[:take]]
         picked.extend(int(value) for value in chosen.tolist())
     # Sorted back into table order, so the pages of one class are not a contiguous block and the
-    # resolved dataset indices are ascending, which `page_loader` requires.
+    # resolved dataset indices are ascending, which `subset_loader` requires.
     return per_sample.iloc[sorted(picked)]
 
 

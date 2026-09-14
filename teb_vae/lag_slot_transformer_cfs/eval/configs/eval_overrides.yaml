@@ -65,6 +65,12 @@ dataset_config:
       # split loaded without it collapses every segment into one recording and the permutation arm
       # is excluded from every batch. `weight` is the only trustworthy validity signal: these
       # coefficients carry no gap sentinel of their own, so it gates every mask.
+      #
+      # `target` is loaded although the model never reads it: it is the weight-scaled class code,
+      # and the per-recording traces draw their class-balanced selection from the class recovered
+      # off it (as a ratio against `weight`, never read directly). Without it every segment is
+      # unlabelled and the traces are recorded as skipped. `epoch` orders a recording's segments
+      # on the absolute axis, which is what a trace is.
       load_fields:
         [
           'fhr_st',
@@ -74,6 +80,7 @@ dataset_config:
           'weight',
           'guid',
           'epoch',
+          'target',
         ]
 
       # 0. Under training the cache is per-worker; at num_workers: 0 it becomes main-process RAM,
@@ -108,8 +115,9 @@ eval_config:
   # Global cap on the segments the pass sees. null evaluates the whole split.
   max_samples: null
 
-  # ONE cap is read by this package's pass, and it bounds a computation rather than a retention:
-  # the pass holds no per-sample forecast arrays and renders no per-sample pages.
+  # TWO caps are read, and both bound a computation rather than a retention: the pass holds no
+  # per-sample forecast arrays and renders no per-sample pages, and the traces re-read the
+  # recordings they draw rather than retaining anything from the pass.
   #
   #   lag_profile   how many segments the SINGLE-LAG predictive profile is scored on. On those
   #                 segments every candidate lag is removed alone from the cached proposals and the
@@ -123,10 +131,17 @@ eval_config:
   #                 them: a single-lag peak read off a window whose joint removal does nothing is
   #                 noise.
   #
+  #   traces_per_class
+  #                 how many RECORDINGS the per-recording traces follow PER CLINICAL CLASS, each
+  #                 re-read through every segment the dataset holds for it in time order, after
+  #                 the pass. A cap on files and figures rather than on what the pass measures;
+  #                 absent means the family default rather than zero.
+  #
   # The block stays present so a reader comparing this delta against a lag-attentive cell's sees
   # which caps this pass reads rather than wondering which were forgotten.
   caps:
     lag_profile: 256
+    traces_per_class: 10
 
   # Image format for every figure the run writes, as a matplotlib filetype: `pdf`, `svg`, `png`,
   # ... The installed matplotlib's own list is what a value is checked against, so a typo is

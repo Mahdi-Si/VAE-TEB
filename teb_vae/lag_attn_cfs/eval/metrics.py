@@ -1666,6 +1666,39 @@ def target_block_membership(model: Any, device: torch.device, dtype: torch.dtype
 
 
 @torch.no_grad()
+def anchor_support(
+    model: Any, weight: torch.Tensor, outputs: Mapping[str, torch.Tensor]
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    r"""The forecast mask, the coverage and the KL support of one dense forward.
+
+    The forecast clock's pooled validity -- the identity object on the stored clock -- so every
+    readout taken over a forward is scored under exactly the mask the training objective used.
+    Built from the anchor set the forward *returned*, never from a second derivation of it: a
+    second computation could disagree, and the disagreement would be a wrong number rather than
+    an exception. One function, because the collection pass and the per-recording traces both
+    need the three tensors and a second expression of the same masks could drift on one side.
+
+    Args:
+        model: The rebuilt net.
+        weight: The decimated validity signal $(B, T)$ the task's target builder returned.
+        outputs: The forward's dict, carrying ``anchor_index`` and ``anchor_valid``.
+
+    Returns:
+        ``(mask, coverage, kl_support)``: the forecast mask $(B, A_{\max}, H)$, each anchor's
+        coverage $(B, A_{\max})$, and the dense KL support $(B, T)$.
+    """
+    anchors, anchor_valid = outputs["anchor_index"], outputs["anchor_valid"]
+    mask, coverage = forecast_mask(
+        model.scored_weight(weight),
+        model.geometry,
+        coverage_floor=model.coverage_floor,
+        anchors=anchors,
+        anchor_valid=anchor_valid,
+    )
+    kl_support = kl_mask(mask, model.geometry, anchors=anchors, anchor_valid=anchor_valid)
+    return mask, coverage, kl_support
+
+
 def evaluate_batch(
     task: Any,
     batch: Any,
@@ -1755,16 +1788,7 @@ def evaluate_batch(
     # disagreement would be a wrong number rather than an exception.
     anchors, anchor_valid = outputs["anchor_index"], outputs["anchor_valid"]
     target = model._build_forecast_target(target_features, anchors)
-    # The forecast clock's pooled validity -- the identity object on the stored clock -- so every
-    # readout in this pass is scored under exactly the mask the training objective used.
-    mask, coverage = forecast_mask(
-        model.scored_weight(weight),
-        model.geometry,
-        coverage_floor=model.coverage_floor,
-        anchors=anchors,
-        anchor_valid=anchor_valid,
-    )
-    kl_support = kl_mask(mask, model.geometry, anchors=anchors, anchor_valid=anchor_valid)
+    mask, coverage, kl_support = anchor_support(model, weight, outputs)
 
     branches: Dict[str, Tuple[torch.Tensor, torch.Tensor]] = {
         "base": (outputs["mu_prior"], outputs["logvar_prior"]),

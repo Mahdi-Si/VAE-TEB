@@ -105,6 +105,7 @@ Everything lands in `<run>/eval_results/`:
 | `collection.json` | The collection record: readouts, provenance sidecar, denominators, retention plan, the measured cost of the pass, and `target_keep_index` — the kept-channel axis the band-resolved readout joins through. |
 | `band_partition.json`, `band_channel_map.csv`, `band_channel_map_kept.csv` | The input channel map (the unskippable data-side step), on the declared axis and on the kept one. |
 | `<analysis>/…` | One subdirectory per analysis: its CSVs and PDFs. |
+| `recording_traces/…` | The traced recordings: `recording_traces.csv` (the manifest), `segment_summary.csv` (one row per segment), `anchor_trace.parquet` (one row per decoded anchor), and per recording under its class directory the full vectors (`<guid>_<subgroup>_full.npz`) and the figure. |
 
 Three summary blocks matter more than the rest. The **headline** is a flat registry of scalars and
 verdict statuses; a number not registered there is invisible to the acceptance gate and the arm
@@ -707,6 +708,62 @@ a metric has too few scored segments. The two tails of one metric are disjoint b
 `<index>` in a filename is the position in the evaluation **dataset**, not in `per_sample.csv` — the
 collection pass runs under a seeded shuffle — and the two are reconciled by a `guid`/`epoch` round
 trip checked before anything is rendered.
+
+### recording_traces
+
+Individual recordings followed through labour. Every other analysis reduces a recording to a number,
+a profile or a window mean; this one takes a class-balanced, seeded draw of recordings — up to
+`eval_config.caps.traces_per_class` from every clinical class, among recordings the dataset holds at
+least two segments for — and re-reads **every** segment the dataset holds for each of them, in
+`epoch` order, writing what the model did at every decoded anchor. It is the analysis that answers
+*"how does this one recording's latent, divergence and lag structure evolve, hour by hour, up to
+delivery"*, and it is deliberately not a population statement: ten recordings per class is what a
+reader can look at one at a time, not a sample anything is tested on.
+
+**Two forms, one identity.** The **full** form is one row per decoded anchor of every traced
+segment: `anchor_trace.parquet` carries the re-read divergence `kld_per_t`, the coverage, the
+argmax lag and the per-anchor attention entropy, the derived latent scalars (`mu_prior_norm`,
+`delta_mu_norm`, the mean log-variances, `prior_rate`, `n_active_dims`, `kld_top_dim_share`), the
+shape statistics of both lag profiles at every anchor (`kl_lag_*`, `attn_lag_*`, the vocabulary of
+`lag_shape.py`), and — **joined** from `per_anchor.parquet` by `(guid, epoch, anchor)` rather than
+recomputed — both `pred_gap` estimators, the block scores and `seconds_since_contraction`. The
+vectors themselves — $\mu^p$, $\mu^q$, both log-variances, the per-coordinate divergence, the
+per-head divergence, the KL attribution over lags and the head-averaged attention — are in one
+compressed array file per recording, `<class>/<guid>_<subgroup>_full.npz`, beside the axes that
+place each row and the per-segment means of the same vectors. The **summary** form is one row per
+segment, `segment_summary.csv`: every per-anchor scalar averaged over the segment's **scored**
+anchors, the lag-shape statistics recomputed on the segment's *mean* profile (the mean of a
+centroid is not the centroid of the mean, and the profile-of-the-mean is what `lag_clocks` reports
+per segment, so a trace and a clock page describe the same object), the within-segment latent
+dispersion, the latent step from the previous segment, the epoch gap and whether it is a break.
+`recording_traces.csv` is the manifest: one row per traced recording with its class, its subgroup,
+how many segments the dataset holds and how many the pass had collected, and the two files.
+
+**Only scored anchors enter a mean, and a segment that scored none is `NaN`.** The latent exists at
+every decoded anchor, including the ones the coverage floor rejected; averaging those in produces a
+state excursion that reads as a physiological event and is a gap. The full table keeps every decoded
+anchor with `contributing` beside it, so the choice is visible rather than made for the reader. The
+latent stored is the **mean**, never the sample: $z$ carries the reparameterisation noise, so two
+passes over one checkpoint would draw two different paths.
+
+**The trace covers the recording as the dataset holds it, not as the pass collected it.** A
+segment a stratified `max_samples` cap left uncollected is traced and carries `NaN` in every joined
+column; `n_segments_collected` on the manifest says how many were. `max_hours_before_delivery` is
+**not** applied — the whole span is the point — and the plan records that it was not. The absolute
+axis is $t_{\mathrm{abs}} = \mathrm{epoch} + \Delta t$, the convention `trajectory` uses, so the two
+cannot disagree about where a recording's points are.
+
+**The re-read forward is checked against the collected one.** The divergence is both recomputed and
+joined, and `kl_agreement_max_abs` in the record is the worst per-anchor disagreement between the
+two over every joined anchor; above `kl_agreement_tolerance` it is logged as a warning. Every batch
+is also checked against the rows it was built from before anything is reduced, for the reason the
+pages check theirs: the collection pass runs under a seeded shuffle, and a trace of the wrong
+recording is a plausible picture that nothing downstream would notice.
+
+Like `samples`, `sufficiency` and `occlusion`, this analysis reaches for `context.task` and
+`context.loader`, and records a skip without them. A recording that fails is recorded by GUID with
+its error and the rest still trace. The figures are `recording_traces_summary.pdf` and one
+`<class>/<guid>_<subgroup>_trace.pdf` per recording — see `FIGURE_GUIDE.md`.
 
 ### warmup
 

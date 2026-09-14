@@ -139,6 +139,24 @@ def test_the_pass_completes_and_writes_a_summary(evaluated) -> None:
     assert summary["n_segments"] > 0
 
 
+def test_the_per_recording_traces_report_their_status_honestly(evaluated) -> None:
+    """The stage runs after the pass and says what it did. The tiny shard carries no class code
+    and one segment per recording, so on this fixture the honest outcome is a recorded skip or an
+    empty draw with the reason named -- never a directory of traces of nothing, and never an
+    error that lost the pass."""
+    from teb_vae.lag_slot_transformer_cfs.eval import recording_traces
+
+    summary, _path, _code = evaluated
+    block = summary["recording_traces"]
+
+    assert block["status"] in {
+        recording_traces.STATUS_SKIPPED, recording_traces.STATUS_EMPTY, recording_traces.STATUS_TRACED
+    }
+    assert "error" not in block
+    if block["status"] != recording_traces.STATUS_TRACED:
+        assert block["reason"]
+
+
 def test_the_matched_gap_carries_a_recording_level_interval(evaluated) -> None:
     """Recordings, not anchors.
 

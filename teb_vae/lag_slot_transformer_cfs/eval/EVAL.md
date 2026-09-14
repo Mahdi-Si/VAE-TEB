@@ -37,7 +37,22 @@ One pass:
 5. draws the figures listed in `FIGURE_GUIDE.md` into `figures/`, from the assembled summary and
    the tables rather than from any tensor, so a figure and the number it illustrates cannot
    disagree and the set can be redrawn from a finished directory. A figure that fails is recorded
-   under `figures.error` and the summary is written regardless.
+   under `figures.error` and the summary is written regardless;
+6. **after** the pass, follows a class-balanced, seeded draw of recordings — up to
+   `eval_config.caps.traces_per_class` from every clinical class, among recordings the dataset
+   holds at least two segments for — through **every** one of their segments in `epoch` order,
+   re-reading each through the loader with the proposals retained and writing the family's
+   shared trace into `recording_traces/`: one row per decoded anchor (`anchor_trace.parquet`),
+   one row per segment (`segment_summary.csv`), a manifest, one compressed array file and one
+   figure per recording under its class directory, and a summary figure. The latent parameters,
+   the divergence and its per-coordinate split, the bounded update and the per-lag proposal
+   norm travel at every anchor; the per-anchor scores are the single-draw block scores off the
+   forward's own forecasts. The class comes off the weight-scaled `target`, which the delta
+   loads for this alone; without it the stage records a skip by name. Every batch is checked
+   against the rows it was built from, and the block `recording_traces` in the summary carries
+   the status, the selection accounting, the manifest and whether the lag family was present
+   at all — it is not on the comparator's normalised fusion nor on the target-only arm. A
+   failure inside the stage is recorded under `recording_traces.error` and the pass completes.
 
 The summary's `scored_split` block names the files the pass opened, the statistics it standardised
 with, their common parent and a digest of the recordings that came back. That block and that table
@@ -403,6 +418,7 @@ its own output rather than from a shell history.
 | `eval_config.bootstrap_resamples` | Resamples behind every interval, drawn over recordings |
 | `eval_config.occlusion_bands` | The lag bands the suppression readout removes, inclusive, in stored steps back from the anchor |
 | `eval_config.caps.lag_profile` | How many segments the single-lag predictive profile is scored on; absent skips it and the summary says so |
+| `eval_config.caps.traces_per_class` | How many recordings the per-recording traces follow per clinical class, each through every segment the dataset holds for it; absent means the family default |
 | `eval_config.figure_format` | The format every figure is written in; `null` keeps the family's default |
 | `eval_config.max_samples` | A cap on the segments the pass sees; `null` evaluates the whole split |
 | `general_config.batch_size.test` | The loader's batch size; it also decides how often a batch admits a cross-recording pairing |

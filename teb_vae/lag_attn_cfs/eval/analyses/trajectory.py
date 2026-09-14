@@ -53,7 +53,7 @@ import numpy as np
 import pandas as pd
 from loguru import logger
 
-from teb_vae.lag_attn_cfs.eval import cohort
+from teb_vae.lag_attn_cfs.eval import cohort, lag_axis
 from teb_vae.lag_attn_cfs.eval import figures_seam as figures
 from teb_vae.lag_attn.nets.lag_report import SECONDS_PER_STEP
 
@@ -113,16 +113,9 @@ READOUTS: Tuple[Readout, ...] = (
 LINE_GAP_S = SECONDS_PER_STEP * 1.5
 
 #: A **break** in the assembled trajectory is a missing segment, not the undecoded prefix of the
-#: next one. Consecutive segments tile at $T\Delta$ seconds and anchors exist only from the floor
-#: $F$ onward, so the gap between one segment's last anchor and the next's first is roughly
-#: $4F$ seconds on every join; counting those as breaks would report one per segment. A gap is
-#: a break when it exceeds one segment stride, read off the run's own geometry, plus a step.
-def break_tolerance_s(record: Dict[str, Any]) -> float:
-    """Seconds a gap must exceed to count as a missing segment, from the collection record."""
-    geometry = dict(record.get("geometry") or {})
-    steps = int(geometry.get("t") or 0)
-    stride = steps * SECONDS_PER_STEP if steps > 0 else 300 * SECONDS_PER_STEP
-    return float(stride + SECONDS_PER_STEP * 1.5)
+#: next one -- see :func:`lag_axis.break_tolerance_s`, bound here so the recording traces and
+#: this analysis cannot come to disagree about what a break is.
+break_tolerance_s = lag_axis.break_tolerance_s
 
 
 def anchor_floor(record: Dict[str, Any]) -> Optional[int]:

@@ -1006,6 +1006,22 @@ of the recording's attribution across, occlusion delta in nats up.
 - **The channel counts in the labels are load-bearing.** A band carried by three channels and one carried by forty are not comparable as evidence, and the label is where that shows.
 - **`unknown` is a band with no frequency, not a leftover.** Three of the 98 scored channels have no recoverable centre frequency because no selected phase-harmonic pair named their filter, and they are reported under their own label rather than bucketed into a neighbour — which would misattribute their skill to a frequency they do not have.
 
+## `recording_traces/recording_traces_summary.pdf`
+
+**In plain terms.** *"Do the traced recordings move, and do the classes move differently?"* Every recording the `recording_traces` analysis followed, reduced to one line per recording over its segments.
+
+**What it shows.** One panel per per-segment summary column — the divergence $K_t$, the mean-decoded forecast gap, the source shift of the latent mean $\lVert \mu^q - \mu^p \rVert$, the active coordinate count, the lag centroid of the KL attribution and its entropy — each drawn against hours before delivery, one line per recording in its **class** colour, one marker per segment. A line is lifted at a break, which is a gap longer than one segment stride, so a missing hour is a hole rather than a slope.
+
+**How it is misread.** These are up to `eval_config.caps.traces_per_class` recordings per class, drawn for looking at rather than for testing: a class whose lines sit higher is a hypothesis, and `cross_subgroup` and the clock analyses are where such a difference is asked properly, on every recording, with a correction. Every value is a mean over the segment's **scored** anchors; a segment that scored none is absent from its line rather than drawn at zero. The lag centroid is in stored-coefficient time.
+
+## The per-recording traces: `recording_traces/<class>/<guid>_<subgroup>_trace.pdf`
+
+**In plain terms.** *"Show me this recording, all of it."* One recording followed through every segment the dataset holds for it, at anchor resolution, on one shared axis of hours before delivery. The filename carries the GUID **and the subgroup**, so a page lifted out of its class directory still says whose it is.
+
+**What it shows.** Ten rows, every model row at the anchor step so a column is the same anchor on every row: the divergence $K_t$; both `pred_gap` estimators, **joined from the collection pass** at those anchors and therefore absent wherever the pass did not collect the segment; the posterior mean $\mu^q$ over the latent coordinates and the source shift $\mu^q - \mu^p$ on a symmetric colour scale, as heatmaps; the per-coordinate divergence; the KL attribution over lags on a **logarithmic** colour scale with the argmax lag drawn over it; the latent norms; the mean log-variances of prior and posterior; the lag centre of the attribution (centroid and median, in seconds); and the lag entropies of the attribution and of the attention. Segment joins are marked by a light vertical line at each segment's first decoded anchor, and a line row is lifted at every unscored anchor so nothing is drawn across a gap. The title carries the GUID, the subgroup, the class, the segment count and the span.
+
+**How it is misread.** Four ways. *A step at a join is geometry*: segments are separate forward passes with a reset encoder state, so a discontinuity at a marked join is a property of the harness rather than of the fetus. *A smooth path is not evidence of smooth physiology*: there is no latent transition density, and consecutive anchors are smooth because the encoders are. *The lag axis is stored-coefficient time*, and the caveat printed under the figure applies to every lag row. *The colour scales are per recording*: two recordings' heatmaps cannot be compared by colour, only the lines and the summary figure can. The full arrays behind every panel are in the `_full.npz` beside the figure.
+
 ## The per-recording pages: `samples/<selection>/sample<index>_<guid>_epoch<epoch>.pdf`
 
 **In plain terms.** *"Show me one, in full."* Every other figure reduces the split to a distribution; these render individual segments so that a number nobody believes can be looked at.

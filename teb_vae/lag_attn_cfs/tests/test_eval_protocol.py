@@ -41,10 +41,11 @@ EXPECTED_KEYWORD_ONLY = ("eval_config", "output_dir", "probe")
 
 #: The only analyses permitted to read ``task`` or ``loader`` off the context, each for a
 #: structural reason the docstring of ``test_only_the_stated_analyses_reach_for_the_model_on_the_context``
-#: gives. Three rather than two, and the third is the strongest case of the same rule: an
+#: gives. Four rather than two: the third is the strongest case of the same rule -- an
 #: INTERVENTION on the model's input cannot be served by any table a forward already wrote, because
-#: the forward it needs is one that never happened.
-MODEL_READING_ANALYSES = frozenset({"samples", "sufficiency", "occlusion"})
+#: the forward it needs is one that never happened -- and the fourth needs the latent at every
+#: anchor of every segment of a recording, which no durable table carries.
+MODEL_READING_ANALYSES = frozenset({"samples", "sufficiency", "occlusion", "recording_traces"})
 
 
 def _analysis_functions() -> Dict[str, Any]:

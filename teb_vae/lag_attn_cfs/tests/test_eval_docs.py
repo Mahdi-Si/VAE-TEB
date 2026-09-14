@@ -238,7 +238,7 @@ def test_the_manifest_is_not_empty(manifest) -> None:
     """A manifest with no figures would pass the binding below vacuously."""
     assert sum(len(names) for names in manifest["figures"].values()) >= 14
     assert set(manifest.get("families", {})) == {
-        "grouped_variants", "sample_pages", "sample_pages_compact"
+        "grouped_variants", "sample_pages", "sample_pages_compact", "recording_traces"
     }
 
 

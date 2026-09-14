@@ -76,6 +76,16 @@ CELL_SPECIFIC_MODULES: Tuple[str, ...] = (
     # divergent: the sibling has no counterpart to classify it against, because the one-sided
     # bank's compensated lag axis is this cell's alone.
     "lag_shape.py",
+    # The per-recording traces: a recording followed through every one of its segments at
+    # anchor resolution. Cell-specific because the trace carries the latent at every decoded
+    # anchor beside the lag readouts on the compensated axis, and the sibling writes neither;
+    # the torch-free core is shared with the lag-slot cell rather than with the sibling.
+    "traces.py",
+    "analyses/recording_traces.py",
+    # Mapping a collected row back to the dataset it came from, lifted out of the pages module
+    # so the traces could reuse it. The sibling keeps the same functions inside its pages
+    # analysis, where nothing else needs them.
+    "dataset_rows.py",
     # How far apart two per-lag distributions are. Cell-specific for lag_shape's reason and for
     # the same one: the transport distance is quoted in seconds on the compensated axis, which is
     # this cell's axis, so a sibling counterpart would be measuring on a different ruler.

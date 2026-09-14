@@ -191,6 +191,10 @@ def test_the_waveform_cap_is_halved_and_the_oracle_cap_stays_absent(overrides) -
     which costs time and no memory. It is set well above what the shipped test split holds, so on a
     production run it binds nothing and is there to stop a much larger split from turning one
     analysis into the run.
+
+    ``traces_per_class`` is a recording count, PER CLASS, and bounds a re-read of those recordings'
+    segments after the pass rather than any retention -- pinned beside the page caps for the same
+    reason ``pages_per_class`` is.
     """
     caps = overrides["eval_config"]["caps"]
 
@@ -199,6 +203,7 @@ def test_the_waveform_cap_is_halved_and_the_oracle_cap_stays_absent(overrides) -
         "attention": 64,
         "pages": 24,
         "pages_per_class": 10,
+        "traces_per_class": 10,
         "occlusion": 512,
     }
     assert "oracle" not in caps

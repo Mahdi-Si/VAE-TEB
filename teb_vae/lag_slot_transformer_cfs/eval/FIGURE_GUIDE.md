@@ -143,6 +143,43 @@ model was already miscalibrated without it.
 
 ---
 
+## The per-recording traces
+
+Drawn into `eval_results/recording_traces/` by the stage that runs after the scoring pass, from the
+forwards it re-reads rather than from the summary -- the one exception to the first rule above, and
+stated as one: a trace is the whole forward output of every segment of a recording, which no summary
+carries. The file layout, the two tables and both figures are the family's shared ones, so a trace
+under this architecture reads beside a trace of the same recording under a lag-attentive one.
+
+### `recording_traces_summary`
+
+One panel per per-segment summary column -- the divergence, the single-draw forecast gap, the source
+shift of the latent mean, the active coordinate count, the lag centroid of the proposal norm and the
+cancellation ratio -- each against hours before delivery, one line per traced recording in its class
+colour, one marker per segment, lifted at a break. Up to `eval_config.caps.traces_per_class`
+recordings per class, drawn for looking at rather than for testing: a class whose lines sit higher is
+a hypothesis and not a finding.
+
+### The per-recording traces: `<class>/<guid>_<subgroup>_trace`
+
+One recording followed through every segment the dataset holds for it, at anchor resolution, on one
+shared axis of hours before delivery; the filename carries the GUID **and the subgroup**. The rows:
+the divergence per anchor; the single-draw forecast gap off the forward's own forecasts; the
+full-branch mean over the latent coordinates and the bounded mean update $a_t$, as heatmaps on a
+symmetric scale; the divergence per coordinate; the **proposal norm over lags** with the lag of the
+largest proposal drawn over it; the latent norms; the mean log-variances; the lag centre of the
+proposal norm; and the cancellation ratio of the mean update. Segment joins are marked by a light
+vertical line, and a line row is lifted at every unscored anchor.
+
+**How it is misread.** The lag row is a proposal *norm* -- an update magnitude before the sum and
+the limiter, not a distribution over lags and not an allocation of the divergence -- and its
+qualification is printed under the figure with the stored-coefficient-time caveat. A step at a
+segment join is geometry: each segment is a separate forward with a reset encoder state. The colour
+scales are per recording. On the comparator's normalised fusion and on the target-only arm the lag
+row is absent, and the block in the summary says so under `lag_family_present`.
+
+---
+
 ## The acceptance pass
 
 Drawn into the directory `--figures` names, from the record after it is assembled.
