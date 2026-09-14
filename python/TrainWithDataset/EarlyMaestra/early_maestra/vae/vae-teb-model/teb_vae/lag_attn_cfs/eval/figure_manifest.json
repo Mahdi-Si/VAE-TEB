@@ -62,6 +62,9 @@
       "occlusion_clock_delta.pdf",
       "occlusion_horizon_delta.pdf"
     ],
+    "recording_traces": [
+      "recording_traces_summary.pdf"
+    ],
     "second_stage": [
       "second_stage_trajectory_kl.pdf",
       "second_stage_trajectory_pred_gap.pdf",
@@ -107,6 +110,10 @@
     "sample_pages_compact": {
       "pattern": "samples/<selection>/sample<index>_<guid>_epoch<epoch>_compact.pdf",
       "guide_marker": "The reduced per-recording pages"
+    },
+    "recording_traces": {
+      "pattern": "recording_traces/<class>/<guid>_<subgroup>_trace.pdf",
+      "guide_marker": "The per-recording traces"
     }
   }
 }

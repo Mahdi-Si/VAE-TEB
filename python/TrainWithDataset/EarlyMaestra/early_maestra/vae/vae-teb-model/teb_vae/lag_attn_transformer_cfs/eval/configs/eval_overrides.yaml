@@ -222,6 +222,13 @@ eval_config:
   #   oracle     how many segments the sufficiency probe caches encoder states for.
   #              THE ONLY CAP HERE WHOSE ABSENCE DOES NOT MEAN ZERO: absent means every segment,
   #              because a probe fitted on nothing is not a cheaper measurement but no measurement.
+  #   traces_per_class
+  #              how many RECORDINGS the per-recording traces follow PER CLINICAL CLASS, each
+  #              through every segment the dataset holds for it, in time order. Per class, for
+  #              the reason `pages_per_class` is. Retains nothing; it bounds a re-read of the
+  #              chosen recordings' segments and the files and figures written for them. Absent
+  #              means the analysis's own default rather than zero, because a trace directory
+  #              with nothing in it would read as a run that had nothing to show.
   #
   # Contraction-CONDITIONED coupling needs none of them: the contraction timing travels on the
   # per-anchor table for every anchor of the split.
@@ -243,6 +250,10 @@ eval_config:
   #                  a time and ten is what fits in one sitting. THREE classes ship, so this is
   #                  30 further segments -- and every selected segment is drawn TWICE, as the
   #                  full page and the reduced one beside it.
+  #   traces_per_class
+  #              10  recordings per clinical class, each re-read through every one of its
+  #                  segments. A recording is tens of segments, so this is a few hundred
+  #                  forwards per class with no Monte Carlo decode -- small beside the pass.
   #
   # `oracle` stays ABSENT on purpose, and that is not an oversight: it is the one cap whose absence
   # means EVERY segment, so naming a number here would REDUCE what the sufficiency probe is fitted
@@ -252,6 +263,7 @@ eval_config:
     attention: 64
     pages: 24
     pages_per_class: 10
+    traces_per_class: 10
     # NOT a retention cap: it bounds how many segments the input-level occlusion readout
     # re-encodes. That analysis costs one encode plus one single-anchor decode PER BAND per batch,
     # and it scores one anchor per segment, so the honest denominator is segments rather than
@@ -387,5 +399,7 @@ eval_config:
   # directory is a durable record of which it was.
   #
   # Applies to the clocks: trajectory, time_to_delivery, second_stage, lag_kl and lag_clocks.
-  # Analyses with no time-before-delivery axis -- forecast, calibration, latent -- are unaffected.
+  # Analyses with no time-before-delivery axis -- forecast, calibration, latent -- are unaffected,
+  # and so are the per-recording traces, which follow a recording through its whole span by
+  # design and record that the bound was not applied.
   max_hours_before_delivery: null

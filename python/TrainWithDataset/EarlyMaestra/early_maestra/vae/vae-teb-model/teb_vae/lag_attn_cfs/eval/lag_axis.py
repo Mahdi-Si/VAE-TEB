@@ -53,7 +53,7 @@ measured and found empty.
 """
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Dict
 
 import numpy as np
 import pandas as pd
@@ -178,6 +178,29 @@ UNMEASURED_LAG_SUPPORT = {
     "lag_support_margin_steps": None,
     "every_lag_valid_at_every_anchor": None,
 }
+
+
+def break_tolerance_s(record: Dict[str, Any]) -> float:
+    r"""Seconds an epoch gap must exceed to count as a missing segment, from the collection record.
+
+    Consecutive stored segments tile at $T\Delta$ seconds and anchors exist only from the floor
+    onward, so the gap between one segment's last anchor and the next's first is a property of the
+    geometry on every join; counting those as breaks would report one per segment. A gap is a
+    break when it exceeds one segment stride, read off the run's own geometry, plus a step. Owned
+    here rather than by an analysis because two analyses -- the whole-delivery trajectory and the
+    per-recording traces -- classify joins, and an analysis may not import another.
+
+    Args:
+        record: The collection record, read for its ``geometry.t``. An empty mapping falls back
+            to the shipped segment length.
+
+    Returns:
+        The tolerance in seconds.
+    """
+    geometry = dict(record.get("geometry") or {})
+    steps = int(geometry.get("t") or 0)
+    stride = steps * SECONDS_PER_STEP if steps > 0 else 300 * SECONDS_PER_STEP
+    return float(stride + SECONDS_PER_STEP * 1.5)
 
 
 def read_lag_support(results_dir: Any) -> dict:

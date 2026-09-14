@@ -62,6 +62,12 @@ FAMILIES: Dict[str, Dict[str, str]] = {
         "pattern": "samples/<selection>/sample<index>_<guid>_epoch<epoch>_compact.pdf",
         "guide_marker": "The reduced per-recording pages",
     },
+    # One figure per traced recording, under its class directory: a family for the same reason
+    # the pages are, and its summary figure beside them is a fixed name the manifest lists.
+    "recording_traces": {
+        "pattern": "recording_traces/<class>/<guid>_<subgroup>_trace.pdf",
+        "guide_marker": "The per-recording traces",
+    },
 }
 
 #: The durable artifact set, by name: the summary and its heartbeat, the two preflight-side
@@ -95,6 +101,10 @@ def observed_figures(results_dir: Path) -> Dict[str, List[str]]:
     for pdf in sorted(results_dir.rglob("*.pdf")):
         relative = pdf.relative_to(results_dir).as_posix()
         if relative.startswith("samples/"):
+            continue
+        # The per-recording trace figures sit one level down, under their class directory;
+        # the analysis's own fixed-name figure at the top level is still listed.
+        if relative.startswith("recording_traces/") and relative.count("/") > 1:
             continue
         if pdf.name.endswith(GROUPED_SUFFIXES):
             continue
