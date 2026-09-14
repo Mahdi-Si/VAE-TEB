@@ -130,6 +130,9 @@ from teb_vae.lag_attn_cfs.eval.analyses import (  # noqa: E402
 from teb_vae.lag_attn_cfs.eval.analyses import events as events_analysis  # noqa: E402
 from teb_vae.lag_attn_cfs.eval.analyses import forecast as forecast_analysis  # noqa: E402
 from teb_vae.lag_attn_cfs.eval.analyses import lag_kl as lag_kl_analysis  # noqa: E402
+from teb_vae.lag_attn_cfs.eval.analyses import (  # noqa: E402
+    recording_traces as recording_traces_analysis,
+)
 from teb_vae.lag_attn_cfs.eval.analyses import latent as latent_analysis  # noqa: E402
 from teb_vae.lag_attn_cfs.eval.analyses import (  # noqa: E402
     perm_control as perm_control_analysis,
@@ -248,6 +251,9 @@ ANALYSIS_FUNCTIONS: Dict[str, Any] = {
     # for it -- and everything it reports is a comparison against readouts the pass already has.
     "sufficiency": sufficiency_analysis.run_sufficiency_analysis,
     "samples": samples_analysis.run_samples_analysis,
+    # Beside the pages, because it is the other analysis that re-reads segments through the
+    # loader: a class-balanced draw of recordings followed through every one of their segments.
+    "recording_traces": recording_traces_analysis.run_recording_traces_analysis,
     "cross_subgroup": cross_subgroup_analysis.run_cross_subgroup_analysis,
 }
 
@@ -1976,6 +1982,10 @@ RUN_ARGS: Dict[str, Any] = {
     #                     decoder. The one analysis whose cost is a training loop, not a forward.
     #   samples:          Per-recording fifteen-row diagnostic PDF pages -- a stratified draw, plus
     #                     the extremes of each headline metric. Needs a checkpoint; skips without.
+    #   recording_traces: A class-balanced draw of recordings followed through EVERY one of their
+    #                     segments in time order: the latent, its parameters, the divergence and
+    #                     the lag readouts at every decoded anchor (full) and per segment
+    #                     (summary), with one figure per recording. Needs a checkpoint.
     #   warmup:           What the causal front end cost. The gap by warm-up tertile, the source
     #                     lag warmth, and the two FAIL-able geometry guards.
     #   source_null:      How much of the coupling readout survives zeroing the source -- the

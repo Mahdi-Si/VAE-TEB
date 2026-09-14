@@ -208,15 +208,15 @@ def test_the_unlocatable_count_is_the_rows_that_failed_to_resolve(tmp_path, monk
     assert result["plan"]["page_rows"] is None
 
 
-def test_the_page_loader_refuses_an_unordered_index_list() -> None:
+def test_the_subset_loader_refuses_an_unordered_index_list() -> None:
     """A ``Subset`` is visited in the order it was built, so an unordered list pairs each page
     with another row's identity and every page still looks right."""
     with pytest.raises(ValueError, match="strictly ascending"):
-        samples_analysis.page_loader(_loader(8), [5, 1])
+        samples_analysis.subset_loader(_loader(8), [5, 1])
 
 
-def test_the_page_loader_visits_the_chosen_rows_in_order_one_at_a_time() -> None:
-    pages = samples_analysis.page_loader(_loader(8), [1, 4, 6])
+def test_the_subset_loader_visits_the_chosen_rows_in_order_one_at_a_time() -> None:
+    pages = samples_analysis.subset_loader(_loader(8), [1, 4, 6])
 
     seen = [batch["guid"][0] for batch in pages]
 
@@ -316,7 +316,7 @@ def test_the_class_draw_is_reproducible_and_is_not_the_stratified_draw() -> None
 
 
 def test_the_class_draw_returns_the_rows_in_table_order() -> None:
-    """``page_loader`` refuses indices that are not ascending, and the pages of one class arriving
+    """``subset_loader`` refuses indices that are not ascending, and the pages of one class arriving
     as a contiguous block is how a draw comes to visit the dataset out of order."""
     frame = _class_frame({"healthy": 30, "acidosis": 30, "hie": 30})
 

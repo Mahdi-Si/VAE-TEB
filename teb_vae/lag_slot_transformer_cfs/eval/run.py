@@ -113,6 +113,7 @@ from teb_vae.lag_attn_cfs.eval.run import (  # noqa: E402
 from teb_vae.lag_attn_rws.nets.raw_masks import forecast_mask  # noqa: E402
 from teb_vae.lag_attn.eval.numerics import configure_numerics  # noqa: E402
 from teb_vae.lag_slot_transformer_cfs.eval import figures, lag_metrics  # noqa: E402
+from teb_vae.lag_slot_transformer_cfs.eval import recording_traces  # noqa: E402
 from teb_vae.lag_slot_transformer_cfs.eval.binding import (  # noqa: E402
     ANALYSES_THIS_ARCHITECTURE_CANNOT_PRODUCE,
     EXCLUDED_ANALYSES,
@@ -208,6 +209,11 @@ PER_RECORDING_KEY = "per_recording_table"
 #: lag profile were bootstrapped from, and they are written out as the two tables above rather
 #: than carried in the summary.
 PER_RECORDING_CURVES_KEY = "per_recording_curves"
+
+#: Key the assembled results carry the scored segments' identities under -- one row per segment
+#: with its recording, epoch, class and subgroup. Popped before the summary is serialised, once the
+#: per-recording traces have drawn their selection from it.
+SEGMENT_IDENTITIES_KEY = "segment_identities"
 
 
 def build_run_config(checkpoint: Any, overrides: Optional[Any] = None) -> Dict[str, Any]:
@@ -309,7 +315,12 @@ def intervened_branches(
         "base": (outputs["mu_prior"], outputs["logvar_prior"]),
         "full": (outputs["mu_post"], outputs["logvar_post"]),
     }
-    record: Dict[str, Any] = {"n_control_pairs": 0, "n_same_recording_pairs": 0, "skipped": {}}
+    record: Dict[str, Any] = {
+        "n_control_pairs": 0,
+        "n_same_recording_pairs": 0,
+        "skipped": {},
+        "batch_without_partner": False,
+    }
 
     # A target-only checkpoint has no source pathway to intervene on, and that is a legitimate
     # subject for this pass rather than an error: the independently trained target-only predictor
@@ -438,6 +449,10 @@ def intervened_branches(
         record["n_control_pairs"] = int(u_stream.shape[0])
         record["n_same_recording_pairs"] = controls.same_recording_pairs(recordings, index)
     else:
+        # A property of this batch, not of the arm: flagged so the pass counts it apart from the
+        # arms that cannot run on the checkpoint at all, and only reports the arm as skipped when
+        # no batch of the split could pair.
+        record["batch_without_partner"] = True
         record["skipped"]["permute"] = (
             "no cross-recording pairing exists in this batch: it carries no recording "
             "identifiers, or one recording holds more than half of it. Counted rather than "
@@ -596,6 +611,11 @@ def score_batch(
         latent_profile = lag_metrics.per_lag_latent_totals(model, outputs, contributing)
     return {
         "guids": batch_guids(batch, batch_size),
+        # Who each segment is, beyond the recording the columns are weighted by: its epoch and
+        # its cohort labels, which the per-recording traces draw their class-balanced selection
+        # from after the pass. Recorded here because this is the one place every scored segment
+        # passes through with its batch fields in hand.
+        "identity": recording_traces.batch_identity(batch, batch_size),
         "columns": {name: value.cpu() for name, value in columns.items()},
         "curves": {name: value.cpu() for name, value in curves.items()},
         "n_anchors": per_sample_anchors.cpu(),
@@ -633,10 +653,15 @@ def aggregate_by_recording(
     under a different empty-segment rule from the mean beside it would describe a different
     population from the number it qualifies.
 
-    The curves are averaged by the same rule, per curve: a curve present on some batches only --
-    the single-lag margins on the segments the profile cap admitted -- is averaged over the
-    segments that carried it, and a recording none of whose segments did is absent from that
-    curve rather than present as zeros.
+    Columns and curves are both averaged per name, over the segments that carried that name,
+    because neither is present on every batch. The single-lag margin curve exists only on the
+    segments the profile cap admitted, and the permute column only on the batches where a
+    cross-recording pairing existed at all -- a trailing batch that one recording holds more than
+    half of records the arm as skipped and carries no such column. A recording none of whose
+    segments carried a name is absent from it rather than present as a zero, and a recording some
+    of whose segments did is averaged over those segments only. The count in the exposure table
+    is the all-columns segment count, which is the population every column present on every batch
+    is read with; the permute margin's own paired count is reported beside its interval.
 
     Args:
         records: The per-batch records :func:`score_batch` returned.
@@ -646,6 +671,7 @@ def aggregate_by_recording(
         {curve: {recording: vector}})``.
     """
     sums: Dict[str, Dict[str, float]] = {}
+    column_counts: Dict[str, Dict[str, int]] = {}
     counts: Dict[str, int] = {}
     anchors: Dict[str, float] = {}
     curve_sums: Dict[str, Dict[str, np.ndarray]] = {}
@@ -657,11 +683,13 @@ def aggregate_by_recording(
             scored = float(record["n_anchors"][position])
             if scored <= 0.0:
                 continue
-            bucket = sums.setdefault(guid, {name: 0.0 for name in names})
+            bucket = sums.setdefault(guid, {})
+            per_column_count = column_counts.setdefault(guid, {})
             counts[guid] = counts.get(guid, 0) + 1
             anchors[guid] = anchors.get(guid, 0.0) + scored
             for name in names:
-                bucket[name] += float(record["columns"][name][position])
+                bucket[name] = bucket.get(name, 0.0) + float(record["columns"][name][position])
+                per_column_count[name] = per_column_count.get(name, 0) + 1
             for name in curve_names:
                 vector = np.asarray(record["curves"][name][position], dtype=np.float64)
                 per_curve = curve_sums.setdefault(name, {})
@@ -669,7 +697,7 @@ def aggregate_by_recording(
                 per_curve[guid] = per_curve.get(guid, 0.0) + vector
                 per_count[guid] = per_count.get(guid, 0) + 1
     per_recording = {
-        guid: {name: total / counts[guid] for name, total in bucket.items()}
+        guid: {name: total / column_counts[guid][name] for name, total in bucket.items()}
         for guid, bucket in sums.items()
     }
     exposure = {
@@ -705,14 +733,16 @@ def headline_block(
         seed: Seed for the resampling, so the interval is reproducible from the summary alone.
 
     Returns:
-        ``{column: bootstrap record}`` for every scored column.
+        ``{column: bootstrap record}`` for every scored column. A column some recordings lack --
+        the permute arm, on recordings every segment of which fell in a batch without a partner --
+        is bootstrapped over the recordings that hold it, and the record's own ``n`` says how many.
     """
     if not per_recording:
         return {}
-    names = sorted(next(iter(per_recording.values())))
+    names = sorted({name for values in per_recording.values() for name in values})
     return {
         name: bootstrap_ci(
-            [values[name] for values in per_recording.values()],
+            [values[name] for values in per_recording.values() if name in values],
             resamples=int(resamples),
             seed=int(seed),
         )
@@ -1026,6 +1056,11 @@ def run_pass(
     control_pairs = same_recording = 0
     profiled_segments = 0
     skipped: Dict[str, str] = {}
+    # Batches the permute arm could not run on because one recording held more than half of
+    # them, typically the trailing partial batch of the split. Counted apart from ``skipped``:
+    # that dict says an arm did not run on this checkpoint at all, and a control that ran on
+    # every batch but the last must not be reported as if it had never run.
+    batches_without_partner = segments_without_partner = 0
     with torch.no_grad():
         for index, batch in enumerate(loader):
             if max_batches is not None and index >= int(max_batches):
@@ -1059,11 +1094,25 @@ def run_pass(
                 )
             control_pairs += int(record["control"]["n_control_pairs"])
             same_recording += int(record["control"]["n_same_recording_pairs"])
-            skipped.update(record["control"]["skipped"])
+            batch_skips = dict(record["control"]["skipped"])
+            if record["control"]["batch_without_partner"]:
+                batches_without_partner += 1
+                segments_without_partner += len(record["guids"])
+                batch_skips.pop("permute")
+            skipped.update(batch_skips)
             records.append(record)
             logger.info(f"scored batch {index + 1}")
 
+    # Only when no batch at all could pair is the arm itself unrun; then the per-batch reason is
+    # the run's reason, and the margin below comes back MISSING with it.
+    if batches_without_partner and not any("nll_permute" in r["columns"] for r in records):
+        skipped["permute"] = (
+            "no batch of the split held a cross-recording pairing: every batch carried no "
+            "recording identifiers, or had one recording holding more than half of it."
+        )
+
     per_recording, per_recording_exposure, curves = aggregate_by_recording(records)
+    identities = recording_traces.identity_frame(records)
     headline = headline_block(per_recording, resamples=resamples, seed=seed)
     band_intervals = paired_margin_block(
         per_recording,
@@ -1083,6 +1132,7 @@ def run_pass(
     horizon = int(model.horizon)
     block_channels = _block_channel_counts(model, block_split)
     return {
+        SEGMENT_IDENTITIES_KEY: identities,
         "headline": headline,
         "anchor_weighted": anchor_weighted,
         "n_recordings": len(per_recording),
@@ -1171,6 +1221,11 @@ def run_pass(
             "permute_margin_interval": control_intervals["permute"],
             "n_control_pairs": control_pairs,
             "n_same_recording_pairs": same_recording,
+            # Batches the permute arm sat out because one recording held more than half of them.
+            # Their segments are still scored on every other column; the permute margin's own
+            # ``n_paired`` says how many recordings it was read over.
+            "n_batches_without_partner": batches_without_partner,
+            "n_segments_without_partner": segments_without_partner,
             "skipped": skipped,
             "note": (
                 "Each margin is the arm's own predictive score less the matched full branch's, in "
@@ -1252,20 +1307,25 @@ def _anchor_weighted(records: Sequence[Mapping[str, Any]]) -> Dict[str, float]:
         records: The per-batch records.
 
     Returns:
-        ``{column: value}``, empty when nothing was scored.
+        ``{column: value}``, empty when nothing was scored. Each column is divided by the anchors
+        of the batches that carried it, since the permute column is absent from a batch without a
+        cross-recording partner; dividing it by every batch's anchors would shrink it toward zero.
     """
     totals: Dict[str, float] = {}
-    denominator = 0.0
+    denominators: Dict[str, float] = {}
     for record in records:
         anchors = record["n_anchors"].to(torch.float64)
-        denominator += float(anchors.sum())
+        batch_anchors = float(anchors.sum())
         for name, values in record["columns"].items():
             totals[name] = totals.get(name, 0.0) + float(
                 (values.to(torch.float64) * anchors).sum()
             )
-    if denominator <= 0.0:
-        return {}
-    return {name: total / denominator for name, total in totals.items()}
+            denominators[name] = denominators.get(name, 0.0) + batch_anchors
+    return {
+        name: total / denominators[name]
+        for name, total in totals.items()
+        if denominators[name] > 0.0
+    }
 
 
 def write_per_recording_table(path: Any, table: Mapping[str, Mapping[str, float]]) -> None:
@@ -1437,6 +1497,41 @@ def scored_split_record(
     }
 
 
+def run_traces(
+    task: Any,
+    loader: Any,
+    identities: Any,
+    *,
+    eval_config: Mapping[str, Any],
+    results_dir: Any,
+) -> Dict[str, Any]:
+    """Run the per-recording traces inside a failure-isolating guard.
+
+    The stage re-reads a handful of recordings through the loader after the pass has finished;
+    a failure in it must not lose the pass, so it is recorded under ``recording_traces.error``
+    and the summary is written regardless.
+
+    Args:
+        task: The loaded task.
+        loader: The evaluation dataloader.
+        identities: The scored segments' identities the pass recorded.
+        eval_config: The validated evaluation settings.
+        results_dir: The run's results directory.
+
+    Returns:
+        The stage's block, or the error.
+    """
+    try:
+        return recording_traces.run_recording_traces(
+            task, loader, identities,
+            eval_config=dict(eval_config), results_dir=results_dir,
+            geometry_record={"t": int(task.orig_model.geometry.t)},
+        )
+    except Exception as error:  # noqa: BLE001 - lost traces must not lose the run
+        logger.exception("the per-recording traces failed; the summary is complete without them")
+        return {"status": "FAILED", "error": f"{type(error).__name__}: {error}"}
+
+
 def render_figures(results: Mapping[str, Any], results_dir: Any) -> Dict[str, Any]:
     """Draw every figure of the run from the assembled summary, inside a failure-isolating guard.
 
@@ -1516,6 +1611,13 @@ def main(
         max_batches=max_batches,
     )
     results.pop(PER_RECORDING_CURVES_KEY, None)
+    # After the pass, from the identities it recorded: a class-balanced draw of recordings
+    # re-read segment by segment. Its own directory beside the tables, its own block in the
+    # summary, and a failure inside it costs the traces rather than the pass.
+    results["recording_traces"] = run_traces(
+        task, loader, results.pop(SEGMENT_IDENTITIES_KEY),
+        eval_config=eval_config, results_dir=results_dir,
+    )
     table = results[PER_RECORDING_KEY]
     write_per_recording_table(results_dir / PER_RECORDING_FILENAME, table)
     logger.info(f"wrote {results_dir / PER_RECORDING_FILENAME}")
