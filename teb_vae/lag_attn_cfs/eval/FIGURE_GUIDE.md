@@ -1022,6 +1022,126 @@ of the recording's attribution across, occlusion delta in nats up.
 
 **How it is misread.** Four ways. *A step at a join is geometry*: segments are separate forward passes with a reset encoder state, so a discontinuity at a marked join is a property of the harness rather than of the fetus. *A smooth path is not evidence of smooth physiology*: there is no latent transition density, and consecutive anchors are smooth because the encoders are. *The lag axis is stored-coefficient time*, and the caveat printed under the figure applies to every lag row. *The colour scales are per recording*: two recordings' heatmaps cannot be compared by colour, only the lines and the summary figure can. The full arrays behind every panel are in the `_full.npz` beside the figure.
 
+## `attribution/attribution_maps.pdf`
+
+**In plain terms.** *"Which coefficients did the model react to, at this anchor?"* One example per
+clinical class: the first attributed anchor of the first drawn recording of that class, with the
+divergence $K_t$ attributed back over every stored step and every declared channel of both input
+streams under the source-null baseline.
+
+**What it shows.** Left and middle: the target-stream and source-stream attribution maps, stored
+step across and declared channel down, on a symmetric colour scale, with the anchor marked as a
+vertical line and each channel's warm-up boundary drawn as a staircase. Right: the source
+attribution re-indexed by offset from the anchor (its magnitude) against the model's own lag
+readout at the same anchor on the compensated seconds axis.
+
+**Axes.** Stored step across; declared channel down; readout units (nats) in colour. The lag
+panel is in stored-coefficient seconds.
+
+**How it is misread.** Four ways. *Every cell after the anchor is exactly zero* on a causal model
+and is drawn, not cropped — a non-zero there is a defect, not a finding. *The map is one anchor of
+one segment of one recording*, drawn for looking at; the population reductions are the other four
+figures. *The colour scale is per panel*, so the two streams cannot be compared by colour, only
+by the totals in `attribution_rows.csv`. *A cold channel's cells are zero because the gate
+multiplied them by zero*, not because the model found nothing there. The caveat under the figure
+applies to every lag panel.
+
+## `attribution/attribution_lag_profile.pdf`
+
+**In plain terms.** *"Does the attribution point at the same lags the model's own readout does?"*
+The source attribution of $K_t$ and of the forecast gap, re-indexed by offset from the anchor,
+laid beside the KL attribution over lags at the same anchors.
+
+**What it shows.** One row per readout, source-null baseline. Left: the mean over recordings of
+the normalised $|q_\ell|$ beside the mean normalised model profile, pooled, with the recording-mean
+Pearson correlation and Jensen–Shannon distance in the title. Right: the same by class, solid for
+the attribution and dashed for the model readout, in the severity colours, with the recording count
+per class in the legend.
+
+**Axes.** Lag in seconds, stored-coefficient time; share per lag.
+
+**How it is misread.** The two profiles are different objects that happen to share an axis: the
+model readout is $K_t$ times the attention, an allocation; the attribution is a sensitivity of
+$K_t$ to the source coefficient at that offset, which can be negative and is drawn by magnitude.
+Agreement is a finding about the model's self-description, disagreement is not a fault in either.
+The axis is stored-coefficient time, uncorrected for the composed group delay. Up to
+`eval_config.caps.attribution_segments` recordings, one segment each.
+
+## `attribution/attribution_bands.pdf`
+
+**In plain terms.** *"Which frequency bands of the input, and which lag bands of the source,
+carried the divergence and the forecast gain?"* — read beside the two analyses that ask the
+adjacent questions.
+
+**What it shows.** Top, one column per readout: the mean over recordings of the source-null
+attribution summed over each frequency band of the declared channel map, one bar group per stream,
+with `spectral_skill`'s per-band gap drawn on a twin axis for the target bands where that pass ran.
+Bottom: per `occlusion_bands` band of the source relative to the anchor, the integrated-gradient
+sum over the band, this analysis's own feature-ablation delta of the readout, and the `occlusion`
+pass's delta where it ran — sign-flipped on the gap readout, because that pass reports the forecast
+cost of removing a band and the gap moves the other way.
+
+**Axes.** Bands across; readout units up (nats per anchor for both readouts; the occlusion series
+in nats per anchor).
+
+**How it is misread.** A frequency-band sum over an input stream is over the **declared** channels
+of that stream, including the ones the budget dropped (their attribution is exactly zero) — the
+channel counts are in `attribution_bands.csv`. The ablation delta and the occlusion delta are the
+same intervention at different anchors and on different readouts, so they agree in sign rather
+than in value. Nothing here is tested.
+
+## `attribution/attribution_layer.pdf`
+
+**In plain terms.** *"Through which head did the source reach the latent, and what fed the
+coordinate that carried the most divergence?"*
+
+**What it shows.** Left: the layer integrated gradients on the head-structured posterior's
+per-head fusion modules, summed over each head's feature at the anchor — one bar per head per
+readout, mean over recordings, source-null baseline. Right: for the anchor's largest per-coordinate
+divergence $K_{t,d}$, the magnitude of its attribution by offset from the anchor, per stream.
+
+**Axes.** Head across (left); lag in stored-coefficient seconds across (right); readout units up.
+
+**How it is misread.** The per-head split sums to the readout difference along the source-null
+path only; under the all-zero baseline the prior's direct route into the posterior bypasses the
+fusion, which is why the split is not taken there. A flat (non-head-structured) posterior has no
+split and the panel is empty. The top coordinate is chosen per anchor, so the right panel pools
+anchors whose coordinate differs.
+
+## `attribution/attribution_null.pdf`
+
+**In plain terms.** *"How much of the divergence is the clock, how much is the source's content,
+and how much is the normalisation snapping out of the exact zero?"*
+
+**What it shows.** Left, per class: the mean over recordings of $K_t$ at the input, at the exact
+null (the availability-clock part), the integrated source-content attribution and the entry jump,
+for the divergence under the source-null baseline. Right: under the all-zero baseline, the split of
+the attribution between the target and the source streams, and the entry jump.
+
+**Axes.** Class across, with the recording count; nats per anchor up.
+
+**How it is misread.** The four bars on the left are not a partition: input equals null plus
+entry jump plus attributed content only up to the completeness residual, which
+`attribution_summary.csv` reports. The entry jump is a property of the encoders' normalisation at
+the exactly-zero point, not of any input step. Every class contrast is out of distribution.
+
+## The per-recording attribution traces: `attribution/traces/<class>/<guid>_<subgroup>_attribution_trace.pdf`
+
+**In plain terms.** *"How does what the model reacted to move over the hours before delivery?"*
+One recording per class — the first the `recording_traces` analysis traced — attributed at the
+same few anchors of every one of its segments.
+
+**What it shows.** Five rows on the traces' shared figure: the magnitude of the source attribution
+of $K_t$ by offset from the anchor as a heatmap over hours before delivery; the model's own lag
+readout at the same anchors; the two agreement statistics; the source and target attribution
+totals; and $K_t$ at the input and at the exact null. The filename carries the GUID **and the
+subgroup**.
+
+**How it is misread.** As the traces are: a step at a segment join is geometry, the colour scales
+are per recording, and the lag axis is stored-coefficient time. The anchors are `ANCHORS_PER_SEGMENT`
+per segment rather than every scored anchor, so a feature narrower than the spacing between them
+is invisible here.
+
 ## The per-recording pages: `samples/<selection>/sample<index>_<guid>_epoch<epoch>.pdf`
 
 **In plain terms.** *"Show me one, in full."* Every other figure reduces the split to a distribution; these render individual segments so that a number nobody believes can be looked at.

@@ -1,0 +1,1539 @@
+r"""Captum attributions of what happens inside a causal-feature forecaster: the shared core.
+
+Every other readout of the lag structure in this family is either **observational** -- the
+attention over lags, the KL attribution built from it, the proposal norm -- or **interventional**
+on one axis, the lag band a source stream is zeroed on. Neither says *which input coefficients, at
+which stored steps and which channels, drove* a given per-anchor quantity. This module answers that
+with gradient attribution: a thin :class:`torch.nn.Module` wrapper turns the model's dense forward
+into one scalar per sample at one chosen anchor -- the divergence $K_t$, the mean-decoded block
+score of either branch and their gap, one latent coordinate, or the model's own lag readout on a
+band -- and Captum attributes that scalar back over the three input streams $(y^{st}, y^{ph}, u)$
+at their **declared** widths on the stored grid.
+
+Two cells go through this module, exactly as they go through
+:mod:`~teb_vae.lag_attn_cfs.eval.traces`: the lag-attentive cells, whose latent tensors are dense
+over $T$ and whose lag readout is an attention distribution, and the lag-residual cell, whose
+latent tensors live on the anchor axis and whose only per-lag magnitude is a proposal norm. A
+:class:`CellBinding` names which is which; the wrapper, the baselines, the reductions and the
+figures are shared, and nothing here touches a loader or a table.
+
+**Which quantities are attributed, and on which branch.** Means, never samples: the readouts are
+functions of $(\mu^p, \ell^p, \mu^q, \ell^q)$ and of the decoder applied to $\mu$ -- the
+mean-decoded block score the collection pass reports as ``mean_pred_gap`` -- so no
+reparameterisation draw enters any attributed number and two runs agree bitwise. A readout defined
+on the sampled branch would need a frozen $\epsilon$ and would attribute the noise as well as the
+input, which no figure here could separate.
+
+**The baselines are a modelling decision, and there are two.** Under the loader's z-scoring an
+exact zero is the channel mean over the region the model reads -- the climatology baseline the
+pipeline already uses -- and the input warm-up gate already multiplies every not-yet-warm step by
+exactly zero, so a zero baseline changes nothing on the steps the model never read.
+:data:`BASELINE_SOURCE_NULL` zeroes the source and holds both target streams fixed: it is the
+exact null arm ``source_null`` measures, so an attribution of $K_t$ or ``pred_gap`` to the source
+under it is an attribution to source *content* -- the availability announcement is a constant of
+$t$, is identical on both ends of the path, and cannot be attributed to any input at all.
+:data:`BASELINE_ALL_ZERO` zeroes every stream and is the reference on which the target streams'
+own attribution is read.
+
+**The path enters the baseline from the side, and the record says by how much.** Every encoder in
+the family normalises per step -- a causal group norm on the conv-LSTM cell, a root-mean-square
+norm on the transformer cells -- and an exactly-zero stream is a degenerate point of that
+normalisation: on every tiny fixture the readout jumps by a finite amount between $\alpha = 0$ and
+$\alpha = 10^{-6}$ along the straight path and the directional derivative at $\alpha = 0$ is of
+order $10^{14}$ to $10^{22}$, so integrated gradients from the exact zero do not converge at any
+step count. The path therefore starts at $x_0 = b + \alpha_0 (x - b)$ with
+$\alpha_0 =$ :data:`BASELINE_ENTRY_FRACTION`, where the integral converges to a relative error
+below $10^{-3}$ at :data:`IG_STEPS` steps on every fixture; the readout at the exact baseline, at
+the entry point and at the input all travel on every row, so the **entry jump**
+$f(x_0) - f(b)$ is a reported scalar rather than a hidden one. It belongs to no input step: it is
+the normalisation snapping out of its degenerate state.
+
+**Structural properties every attribution here is checked against**, and that the tests assert on
+the tiny models: attribution to any stored step later than the anchor is exactly zero; attribution
+to a source step a channel has not warmed up at is exactly zero; the source attribution of a
+target-only readout ($\mu^p$, the base block score) is exactly zero; and the integrated-gradient
+sum reproduces $f(x) - f(x_0)$ within tolerance. The lag axis of every profile here is
+**stored-coefficient time**, and every lag-resolved figure prints the caveat.
+"""
+from __future__ import annotations
+
+import warnings
+from dataclasses import dataclass
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+
+import numpy as np
+import pandas as pd
+import torch
+from captum.attr import FeatureAblation, IntegratedGradients, LayerIntegratedGradients
+from torch import nn
+
+from teb_vae.lag_attn_cfs.eval import cohort, lag_hist, traces
+from teb_vae.lag_attn_cfs.eval import figures_seam as figures
+from teb_vae.lag_attn_cfs.eval._reuse import labels
+from teb_vae.lag_attn_cfs.eval.lag_axis import COEFFICIENT_LAG_AXIS_LABEL, GROUP_DELAY_CAVEAT
+from teb_vae.lag_attn_rws.nets.losses import masked_raw_block_per_anchor
+from teb_vae.lag_attn_rws.nets.raw_masks import forecast_mask
+
+#: This analysis's own subdirectory inside a results directory, and the files it writes.
+ANALYSIS_DIRNAME = "attribution"
+ROWS_FILENAME = "attribution_rows.csv"
+VECTORS_FILENAME = "attribution_vectors.npz"
+MAPS_FILENAME = "attribution_maps.npz"
+RECORDINGS_FILENAME = "attribution_recordings.csv"
+SUMMARY_FILENAME = "attribution_summary.csv"
+BANDS_FILENAME = "attribution_bands.csv"
+LAG_BANDS_FILENAME = "attribution_lag_bands.csv"
+LAYER_FILENAME = "attribution_layer.csv"
+NULL_FILENAME = "attribution_null.csv"
+TRACE_DIRNAME = "traces"
+TRACE_SUFFIX = "_attribution_trace"
+
+#: The fixed-name figures, as stems.
+MAP_FIGURE = "attribution_maps"
+LAG_PROFILE_FIGURE = "attribution_lag_profile"
+BAND_FIGURE = "attribution_bands"
+LAYER_FIGURE = "attribution_layer"
+NULL_FIGURE = "attribution_null"
+
+#: ``eval_config.caps`` name bounding how many **segments** are attributed. Absent means
+#: :data:`DEFAULT_SEGMENTS` rather than every segment: an attribution is tens of forwards and
+#: backwards per anchor, so an uncapped pass over a split would cost more than the collection pass.
+CAP_NAME = "attribution_segments"
+DEFAULT_SEGMENTS = 24
+
+#: Anchors attributed per segment, spread evenly over the segment's scored anchors so the maps
+#: cover its early, middle and late phases rather than one draw of them.
+ANCHORS_PER_SEGMENT = 4
+
+#: Recordings followed through every one of their segments **per class**, for the trace figure. One,
+#: because each is a few hundred attributions; drawn under the trace analysis's own seed offset so
+#: it is the first recording that analysis traced and the two figures describe one recording.
+TRACE_RECORDINGS_PER_CLASS = 1
+
+#: Integrated-gradient steps and Captum's internal batch of interpolated inputs. The step count is
+#: the one at which the completeness residual fell below $10^{-3}$ of the readout on every fixture
+#: with the entry fraction below (the conv-LSTM cell's per-step group norm makes its path the
+#: roughest of the three); the residual is recorded per row so a production run can say whether
+#: it held there too.
+IG_STEPS = 64
+IG_INTERNAL_BATCH_SIZE = 16
+
+#: Where along the straight path the integration starts; see the module docstring.
+BASELINE_ENTRY_FRACTION = 1e-3
+
+#: Offset applied to the run's seed for this analysis's segment draw, distinct from every other
+#: draw's in the pipeline.
+DRAW_SEED_OFFSET = 13
+
+#: The two baselines.
+BASELINE_SOURCE_NULL = "source_null"
+BASELINE_ALL_ZERO = "all_zero"
+BASELINES: Tuple[str, ...] = (BASELINE_SOURCE_NULL, BASELINE_ALL_ZERO)
+
+#: The readouts the wrapper can turn into one scalar per anchor.
+READOUT_KLD = "kld"
+READOUT_KLD_DIM = "kld_dim"
+READOUT_MU_POST_DIM = "mu_post_dim"
+READOUT_MU_PRIOR_DIM = "mu_prior_dim"
+READOUT_NLL_FULL = "nll_full"
+READOUT_NLL_BASE = "nll_base"
+READOUT_PRED_GAP = "pred_gap"
+READOUT_LAG_BAND = "lag_band"
+READOUTS: Tuple[str, ...] = (
+    READOUT_KLD, READOUT_KLD_DIM, READOUT_MU_POST_DIM, READOUT_MU_PRIOR_DIM,
+    READOUT_NLL_FULL, READOUT_NLL_BASE, READOUT_PRED_GAP, READOUT_LAG_BAND,
+)
+#: The readouts whose value depends on the target streams alone, so their source attribution is
+#: zero by construction and is asserted rather than assumed.
+TARGET_ONLY_READOUTS: Tuple[str, ...] = (READOUT_MU_PRIOR_DIM, READOUT_NLL_BASE)
+#: What a production pass attributes under both baselines.
+MAIN_READOUTS: Tuple[str, ...] = (READOUT_KLD, READOUT_PRED_GAP)
+
+#: The two input streams the attributions are reduced on. ``target`` is the declared
+#: concatenation of the two target blocks, ``source`` the declared source stream.
+STREAM_TARGET = "target"
+STREAM_SOURCE = "source"
+STREAMS: Tuple[str, ...] = (STREAM_TARGET, STREAM_SOURCE)
+
+#: The sentence every artifact of this analysis carries.
+ATTRIBUTION_CAVEAT = (
+    "an attribution is a sensitivity of a fitted computation, not a causal claim about the "
+    "physiology: it says which stored coefficients the model's readout responded to along one "
+    "interpolation path from one baseline, under one trained parameterisation. The source "
+    "attribution under the source-null baseline is to source CONTENT relative to the "
+    "availability clock, which is a constant of the step index and cannot be attributed to any "
+    "input. Every lag axis is stored-coefficient time. Every summary is over recordings"
+)
+
+#: What was tried on the tiny fixtures and what came of it, recorded in every block so a reader
+#: of a summary knows which methods were rejected and why rather than only which were kept.
+METHOD_RECORD: Dict[str, Dict[str, str]] = {
+    "IntegratedGradients": {
+        "status": "shipped",
+        "note": "the primary method; completeness holds to 1e-3 at 32 steps once the path enters "
+                "the baseline at the entry fraction, and fails at every step count from the exact "
+                "zero (see BASELINE_ENTRY_FRACTION)",
+    },
+    "LayerIntegratedGradients": {
+        "status": "shipped",
+        "note": "on the posterior head's INPUTS in the lag-attentive cells (the attended per-head "
+                "summaries: a complete per-head split) and on the proposal head's OUTPUT in the "
+                "lag-residual cell (a complete per-lag split through the limiter)",
+    },
+    "FeatureAblation": {
+        "status": "shipped",
+        "note": "model-agnostic; grouped by lag band of the source relative to the anchor, so it is "
+                "the occlusion analysis's intervention read on this analysis's readouts and anchors",
+    },
+    "InputXGradient": {
+        "status": "evaluated, not shipped",
+        "note": "runs and passes every structural check; a single-point gradient, no completeness, "
+                "and it adds nothing the integrated form does not",
+    },
+    "Saliency": {
+        "status": "evaluated, not shipped",
+        "note": "the absolute gradient; unsigned, no completeness",
+    },
+    "GradientShap": {
+        "status": "evaluated, not shipped",
+        "note": "integrated gradients averaged over a random baseline distribution; its per-sample "
+                "completeness residual is of the order of the readout by construction, and the "
+                "randomness of the baseline would make two runs disagree",
+    },
+    "Occlusion": {
+        "status": "evaluated, not shipped",
+        "note": "a sliding window straddles the anchor and assigns a window's effect to steps after "
+                "it, so its per-step output fails the causality check by construction; the grouped "
+                "FeatureAblation above is the same intervention on the right groups",
+    },
+    "DeepLift": {
+        "status": "evaluated, not usable",
+        "note": "runs, but its rescale rule reaches only the nonlinearities it hooks (ReLU, Tanh, "
+                "Sigmoid modules); the GELU and SiLU functionals, the smooth bounds and entmax15 "
+                "pass through as plain gradients, so its completeness residual is of the order of "
+                "the readout itself",
+    },
+    "LayerConductance": {
+        "status": "evaluated, not shipped",
+        "note": "sums differ from the readout difference on the layers tested, where the layer "
+                "integrated gradient is exact; nothing it adds survives that",
+    },
+    "NeuronConductance": {
+        "status": "evaluated, not shipped",
+        "note": "the conductance of one latent coordinate is the input attribution of that "
+                "coordinate's readout, which the readout registry already provides; and the heads "
+                "return tuples the selector cannot index",
+    },
+}
+
+
+# =============================================================================
+# Which cell
+# =============================================================================
+@dataclass(frozen=True)
+class CellBinding:
+    """What differs between the two cells, as far as this module needs to know.
+
+    Attributes:
+        name: ``'attention'`` or ``'slot'``.
+        dense_latent: Whether the latent tensors are dense over $T$ (gathered at the anchor) or
+            already on the anchor axis (selected by column).
+        lag_readout: What the cell's own per-lag magnitude is, for the agreement statistic and the
+            figure legends.
+        lag_qualification: The sentence that qualifies that readout on every artifact.
+        layer_label: What the layer attribution is taken on.
+        layer_axis: The name of the axis the layer attribution is resolved on.
+    """
+
+    name: str
+    dense_latent: bool
+    lag_readout: str
+    lag_qualification: str
+    layer_label: str
+    layer_axis: str
+
+
+ATTENTION_CELL = CellBinding(
+    name="attention",
+    dense_latent=True,
+    lag_readout="KL attribution over lags (K_t times the head-structured attention)",
+    lag_qualification=(
+        "the model's own lag readout here is the KL attribution K_t * alpha, summed over heads, "
+        "which inherits the prior-variance inflation the attention is immune to"
+    ),
+    layer_label="the per-head fused features of the head-structured posterior",
+    layer_axis="head",
+)
+
+SLOT_CELL = CellBinding(
+    name="slot",
+    dense_latent=False,
+    lag_readout="proposal norm ||r_{t,l}||_2 over lags",
+    lag_qualification=(
+        "the model's own lag readout here is the proposal NORM at every lag: an update magnitude "
+        "before the sum and the limiter, not a distribution over lags and not an allocation of "
+        "the divergence"
+    ),
+    layer_label="the per-lag proposals the fusion sums",
+    layer_axis="lag",
+)
+
+
+# =============================================================================
+# The wrapper
+# =============================================================================
+class AnchorReadout(nn.Module):
+    r"""The model's dense forward, reduced to one scalar per sample at one anchor per sample.
+
+    Captum attributes a function of its ``inputs`` tuple; this is that function. It calls the
+    real model at the dense evaluation geometry, picks each row's own anchor from the anchor axis
+    (``columns`` is per row, so a batch of rows can attribute several anchors of one segment in
+    one call), and returns the chosen readout there. The block-score readouts rebuild the
+    forecast target and the forecast mask from the two extra tensors on every call, because
+    Captum expands the batch along its interpolation axis and a target built once outside would
+    no longer match.
+
+    **Every input is tied into the graph with a zero coefficient**, so a readout that does not
+    depend on the source -- the prior mean, the base block score -- still yields a gradient for
+    it: exactly zero, which is the structural fact the tests assert, rather than an autograd
+    error about an unused tensor.
+
+    Attributes:
+        model: The rebuilt net.
+        cell: Which cell's forward and tensor layout this is.
+        readout: One of :data:`READOUTS`.
+        likelihood: The objective's likelihood, for the block-score readouts.
+        lag_band: The inclusive lag band the lag readout sums over.
+    """
+
+    def __init__(
+        self,
+        model: nn.Module,
+        cell: CellBinding,
+        *,
+        readout: str,
+        likelihood: str = "gaussian_nll",
+        lag_band: Tuple[int, int] = (0, 0),
+    ) -> None:
+        """Bind the model and the readout.
+
+        Args:
+            model: The rebuilt net, in evaluation mode.
+            cell: The cell binding.
+            readout: One of :data:`READOUTS`.
+            likelihood: ``'mse'`` or ``'gaussian_nll'``.
+            lag_band: The inclusive ``(lo, hi)`` lag pair the lag readout sums over.
+
+        Raises:
+            ValueError: If ``readout`` is not one of :data:`READOUTS`.
+        """
+        super().__init__()
+        if readout not in READOUTS:
+            raise ValueError(f"readout must be one of {READOUTS}, got {readout!r}")
+        self.model = model
+        self.cell = cell
+        self.readout = str(readout)
+        self.likelihood = str(likelihood)
+        self.lag_band = (int(lag_band[0]), int(lag_band[1]))
+
+    def _forward_kwargs(self) -> Dict[str, Any]:
+        """The dense geometry, plus the retained proposals where the lag readout needs them."""
+        kwargs: Dict[str, Any] = {"anchor_phase": 0, "anchor_stride": 1}
+        if not self.cell.dense_latent:
+            kwargs["return_proposals"] = True
+        return kwargs
+
+    def _at_anchor(self, dense: torch.Tensor, anchors: torch.Tensor, columns: torch.Tensor) -> torch.Tensor:
+        """Read a per-row tensor at each row's own anchor: a gather on a dense axis, a select on the anchor axis."""
+        if self.cell.dense_latent:
+            index = anchors.view(-1, 1, *([1] * (dense.dim() - 2))).expand(-1, 1, *dense.shape[2:])
+            return dense.gather(1, index).squeeze(1)
+        return dense[torch.arange(dense.shape[0], device=dense.device), columns]
+
+    def forward(
+        self,
+        y_st: torch.Tensor,
+        y_ph: torch.Tensor,
+        u_stream: torch.Tensor,
+        target_features: torch.Tensor,
+        weight: torch.Tensor,
+        columns: torch.Tensor,
+        coordinates: torch.Tensor,
+    ) -> torch.Tensor:
+        r"""Run the model and return the readout at each row's anchor.
+
+        Args:
+            y_st: Target scattering block $(B, T, \cdot)$, declared width.
+            y_ph: Target phase-harmonic block $(B, T, \cdot)$, declared width.
+            u_stream: Source stream $(B, T, c_u)$, declared width.
+            target_features: The declared-width target stream the block scores are taken
+                against, $(B, T, c_y)$.
+            weight: The decimated validity signal $(B, T)$.
+            columns: Each row's anchor as a position on the anchor axis, $(B,)$ ``long``.
+            coordinates: Each row's latent coordinate for the per-coordinate readouts, $(B,)$
+                ``long``; ignored by the others.
+
+        Returns:
+            The readout, $(B,)$.
+        """
+        model = self.model
+        outputs = model(y_st, y_ph, u_stream, **self._forward_kwargs())
+        rows = torch.arange(columns.shape[0], device=columns.device)
+        anchors = outputs["anchor_index"][rows, columns]                 # (B,)
+        anchor_valid = outputs["anchor_valid"][rows, columns]           # (B,)
+        name = self.readout
+        # The zero tie: see the class docstring. The two posterior parameters are tied in as
+        # well, so a layer attribution on a module whose output reaches only the parameter a
+        # readout does not read -- the scale proposals under the mean-decoded gap -- still finds
+        # that output on the graph, with a gradient of exactly zero.
+        tie = 0.0 * (
+            y_st.sum() + y_ph.sum() + u_stream.sum()
+            + outputs["mu_post"].sum() + outputs["logvar_post"].sum()
+        )
+
+        if name == READOUT_KLD:
+            dense = outputs["kld_per_t"] if self.cell.dense_latent else outputs["kld_per_anchor"]
+            return self._at_anchor(dense, anchors, columns) + tie
+        if name in (READOUT_KLD_DIM, READOUT_MU_POST_DIM, READOUT_MU_PRIOR_DIM):
+            if name == READOUT_KLD_DIM:
+                dense = (
+                    model.kld_tensor(
+                        mu_prior=outputs["mu_prior"], logvar_prior=outputs["logvar_prior"],
+                        mu_post=outputs["mu_post"], logvar_post=outputs["logvar_post"],
+                    )
+                    if self.cell.dense_latent else outputs["kld_per_anchor_dim"]
+                )
+            else:
+                dense = outputs["mu_post" if name == READOUT_MU_POST_DIM else "mu_prior"]
+            vector = self._at_anchor(dense, anchors, columns)          # (B, d_z)
+            return vector[rows, coordinates] + tie
+        if name in (READOUT_NLL_FULL, READOUT_NLL_BASE, READOUT_PRED_GAP):
+            anchor_column = anchors[:, None]
+            target = model._build_forecast_target(target_features, anchor_column)
+            mask, _coverage = forecast_mask(
+                model.scored_weight(weight), model.geometry,
+                coverage_floor=model.coverage_floor, anchors=anchor_column,
+                anchor_valid=anchor_valid[:, None],
+            )
+            persistence = outputs.get("persistence")
+            if persistence is not None:
+                persistence = persistence[rows, columns][:, None]
+            scores: Dict[str, torch.Tensor] = {}
+            for branch, key in (("full", "mu_post"), ("base", "mu_prior")):
+                if name != READOUT_PRED_GAP and not name.endswith(branch):
+                    continue
+                mu = self._at_anchor(outputs[key], anchors, columns)[:, None]   # (B, 1, d_z)
+                forecast_mu, forecast_logvar = model.decoder(mu, persistence=persistence)
+                block, _ = masked_raw_block_per_anchor(
+                    forecast_mu, target, mask, likelihood=self.likelihood, logvar=forecast_logvar
+                )
+                scores[branch] = block[:, 0]
+            if name == READOUT_PRED_GAP:
+                return scores["base"] - scores["full"] + tie
+            return scores["full" if name == READOUT_NLL_FULL else "base"] + tie
+        # The lag readout: the attention mass on the band in the attentive cells, the proposal
+        # norm on the band in the residual cell.
+        low, high = self.lag_band
+        if self.cell.dense_latent:
+            alpha = self._at_anchor(outputs["attn_weights"], anchors, columns)  # (B, M, L)
+            return alpha.mean(dim=1)[:, low:high + 1].sum(dim=-1) + tie
+        proposals = outputs["mean_proposals"][rows, columns]                    # (B, L, d_z)
+        return proposals[:, low:high + 1].norm(dim=-1).sum(dim=-1) + tie
+
+
+# =============================================================================
+# Inputs, baselines, anchors
+# =============================================================================
+def baselines_for(name: str, inputs: Sequence[torch.Tensor]) -> Tuple[torch.Tensor, ...]:
+    """Build one named baseline tuple for an input tuple.
+
+    Args:
+        name: One of :data:`BASELINES`.
+        inputs: ``(y_st, y_ph, u_stream)``.
+
+    Returns:
+        The baseline tuple, same shapes.
+
+    Raises:
+        ValueError: If the name is unknown.
+    """
+    y_st, y_ph, u_stream = inputs
+    if name == BASELINE_SOURCE_NULL:
+        return (y_st.detach().clone(), y_ph.detach().clone(), torch.zeros_like(u_stream))
+    if name == BASELINE_ALL_ZERO:
+        return tuple(torch.zeros_like(x) for x in inputs)
+    raise ValueError(f"baseline must be one of {BASELINES}, got {name!r}")
+
+
+def entry_point(
+    inputs: Sequence[torch.Tensor],
+    baselines: Sequence[torch.Tensor],
+    fraction: float = BASELINE_ENTRY_FRACTION,
+) -> Tuple[torch.Tensor, ...]:
+    r"""The point the integration starts from: $x_0 = b + \alpha_0 (x - b)$.
+
+    Args:
+        inputs: The input tuple.
+        baselines: The exact baseline tuple.
+        fraction: $\alpha_0$.
+
+    Returns:
+        The entry tuple.
+    """
+    return tuple(b + float(fraction) * (x - b) for x, b in zip(inputs, baselines))
+
+
+@torch.no_grad()
+def contributing_columns(model: Any, weight: torch.Tensor, outputs: Mapping[str, torch.Tensor]) -> np.ndarray:
+    """Which positions of the anchor axis are scored, per sample, as a boolean $(B, A)$ array.
+
+    Built from the same masks the collection pass scores under, so an attributed anchor is one
+    the tables carry a score for.
+
+    Args:
+        model: The rebuilt net.
+        weight: The decimated validity signal $(B, T)$.
+        outputs: The dense forward's dict.
+
+    Returns:
+        The indicator.
+    """
+    from teb_vae.lag_attn_rws.nets.raw_masks import contributing_anchors
+
+    mask, _coverage = forecast_mask(
+        model.scored_weight(weight), model.geometry, coverage_floor=model.coverage_floor,
+        anchors=outputs["anchor_index"], anchor_valid=outputs["anchor_valid"],
+    )
+    return (contributing_anchors(mask) > 0.0).detach().cpu().numpy()
+
+
+def spread_columns(contributing: np.ndarray, per_segment: int = ANCHORS_PER_SEGMENT) -> List[np.ndarray]:
+    """Choose evenly spaced scored anchors per sample.
+
+    Evenly spaced over the scored set rather than drawn, so the attributed anchors of every
+    segment span its early, middle and late phases, and two runs attribute the same ones.
+
+    Args:
+        contributing: The $(B, A)$ scored indicator.
+        per_segment: How many anchors to choose per sample, as an upper bound.
+
+    Returns:
+        One ascending array of anchor-axis positions per sample; empty where none is scored.
+    """
+    chosen: List[np.ndarray] = []
+    for row in np.asarray(contributing, dtype=bool):
+        positions = np.flatnonzero(row)
+        if positions.size == 0:
+            chosen.append(np.zeros(0, dtype=np.int64))
+            continue
+        take = min(int(per_segment), int(positions.size))
+        picks = np.unique(np.round(np.linspace(0, positions.size - 1, take)).astype(np.int64))
+        chosen.append(positions[picks].astype(np.int64))
+    return chosen
+
+
+def _host(tensor: torch.Tensor) -> np.ndarray:
+    """One tensor to a float64 array on the host."""
+    return tensor.detach().cpu().to(torch.float64).numpy()
+
+
+@torch.no_grad()
+def model_lag_readout(
+    model: Any,
+    cell: CellBinding,
+    outputs: Mapping[str, torch.Tensor],
+    sample: torch.Tensor,
+    columns: torch.Tensor,
+) -> np.ndarray:
+    r"""The model's own per-lag magnitude at each row's anchor, $(N, L)$ as float64.
+
+    The KL attribution $\sum_m K^{(m)}_t \alpha^{(m)}_{t,\ell}$ in the attentive cells; the
+    proposal norm $\lVert r^\mu_{t,\ell} \rVert_2$, ``NaN`` where the lag carried no available
+    channel, in the residual cell -- the same two profiles the traces carry. Read off the
+    **unexpanded** forward: a row names the batch element it came from and its anchor column.
+
+    Args:
+        model: The rebuilt net.
+        cell: The cell binding.
+        outputs: The dense forward's dict, taken with the proposals retained in the residual cell.
+        sample: Each row's batch element, $(N,)$ ``long``.
+        columns: Each row's anchor-axis position, $(N,)$ ``long``.
+
+    Returns:
+        The profile per row, or an all-``NaN`` $(N, L)$ array on an arm that produces none.
+    """
+    if cell.dense_latent:
+        anchors = outputs["anchor_index"][sample, columns]
+        dense = outputs["source_kl_lag_map"][sample]                      # (N, T, L)
+        index = anchors[:, None, None].expand(-1, 1, dense.shape[-1])
+        return _host(dense.gather(1, index).squeeze(1))
+    n_lags = int(model.n_lags)
+    proposals = outputs.get("mean_proposals")
+    if proposals is None:
+        return np.full((int(columns.shape[0]), n_lags), np.nan)
+    norm = proposals[sample, columns].norm(dim=-1)
+    valid = outputs["lag_valid"][sample, columns].to(torch.bool)
+    return _host(torch.where(valid, norm, torch.full_like(norm, float("nan"))))
+
+
+def warm_from_step(model: Any, stream: str) -> Optional[np.ndarray]:
+    r"""The stored step each **declared** channel of a stream becomes live at, or ``None``.
+
+    A gathered-and-shifted channel at encoder step $t$ reads stored step $t - d_c$ and is masked
+    while $t < W'_c + d_c$, so in stored coordinates the channel is live from $W'_c$. A channel the
+    gate dropped is live from nowhere and is marked with the sequence length.
+
+    Args:
+        model: The rebuilt net.
+        stream: ``'target'`` or ``'source'``.
+
+    Returns:
+        One step per declared channel, or ``None`` for a stream with no warm-up at all.
+    """
+    waits = model.target_warmup_steps if stream == STREAM_TARGET else model.source_warmup_steps
+    gate = model.target_gate if stream == STREAM_TARGET else model.source_gate
+    width = int(model.c_y if stream == STREAM_TARGET else model.c_u)
+    if waits is None:
+        return None
+    live = np.full(width, int(model.sequence_length), dtype=np.int64)
+    keep = list(range(width)) if gate is None else [int(v) for v in gate.keep_index.tolist()]
+    for channel, wait in zip(keep, waits):
+        live[int(channel)] = int(wait)
+    return live
+
+
+# =============================================================================
+# The attributions
+# =============================================================================
+@dataclass
+class AttributionBatch:
+    """One Captum call's worth of attributions, as arrays on the host.
+
+    Attributes:
+        readout: The readout attributed.
+        baseline: The baseline name.
+        sample: Which sample of the batch each row came from, $(N,)$.
+        column: Each row's anchor-axis position, $(N,)$.
+        anchor: Each row's anchor as a stored step, $(N,)$.
+        coordinate: Each row's latent coordinate, $(N,)$; $-1$ where the readout has none.
+        value_input: The readout at the input, $(N,)$.
+        value_baseline: The readout at the exact baseline, $(N,)$.
+        value_entry: The readout at the entry point, $(N,)$.
+        delta: Captum's convergence delta, attribution sum minus the input-to-entry difference.
+        target: Attribution over the declared target axis, $(N, T, c_y)$ float32.
+        source: Attribution over the declared source axis, $(N, T, c_u)$ float32.
+    """
+
+    readout: str
+    baseline: str
+    sample: np.ndarray
+    column: np.ndarray
+    anchor: np.ndarray
+    coordinate: np.ndarray
+    value_input: np.ndarray
+    value_baseline: np.ndarray
+    value_entry: np.ndarray
+    delta: np.ndarray
+    target: np.ndarray
+    source: np.ndarray
+
+
+def expand_rows(
+    inputs: Sequence[torch.Tensor],
+    extra: Sequence[torch.Tensor],
+    columns_per_sample: Sequence[np.ndarray],
+) -> Tuple[Tuple[torch.Tensor, ...], Tuple[torch.Tensor, ...], torch.Tensor, np.ndarray]:
+    """Repeat every sample once per chosen anchor, so one call attributes several anchors.
+
+    Args:
+        inputs: ``(y_st, y_ph, u_stream)``, $(B, \\ldots)$.
+        extra: ``(target_features, weight)``, $(B, \\ldots)$.
+        columns_per_sample: One array of anchor-axis positions per sample.
+
+    Returns:
+        ``(inputs, extra, columns, sample)``: the row-expanded tensors, the per-row column tensor
+        and the per-row sample index.
+    """
+    counts = [int(len(c)) for c in columns_per_sample]
+    repeats = torch.tensor(counts, dtype=torch.long, device=inputs[0].device)
+    rows_inputs = tuple(x.repeat_interleave(repeats, dim=0) for x in inputs)
+    rows_extra = tuple(x.repeat_interleave(repeats, dim=0) for x in extra)
+    columns = torch.tensor(
+        np.concatenate([np.asarray(c, dtype=np.int64) for c in columns_per_sample])
+        if counts and sum(counts) else np.zeros(0, dtype=np.int64),
+        dtype=torch.long, device=inputs[0].device,
+    )
+    sample = np.concatenate([np.full(n, i, dtype=np.int64) for i, n in enumerate(counts)]) if sum(counts) else np.zeros(0, dtype=np.int64)
+    return rows_inputs, rows_extra, columns, sample
+
+
+def integrated_gradients(
+    wrapper: AnchorReadout,
+    inputs: Sequence[torch.Tensor],
+    extra: Sequence[torch.Tensor],
+    columns: torch.Tensor,
+    *,
+    baseline: str,
+    coordinates: Optional[torch.Tensor] = None,
+    n_steps: int = IG_STEPS,
+    internal_batch_size: int = IG_INTERNAL_BATCH_SIZE,
+    entry_fraction: float = BASELINE_ENTRY_FRACTION,
+) -> AttributionBatch:
+    """Integrated gradients of one readout over the three streams, one row per anchor.
+
+    Args:
+        wrapper: The readout module.
+        inputs: The row-expanded ``(y_st, y_ph, u_stream)``.
+        extra: The row-expanded ``(target_features, weight)``.
+        columns: Per-row anchor-axis positions, $(N,)$.
+        baseline: One of :data:`BASELINES`.
+        coordinates: Per-row latent coordinate, or ``None`` for readouts without one.
+        n_steps: Integration steps.
+        internal_batch_size: Captum's batch of interpolated inputs.
+        entry_fraction: Where the path enters the baseline.
+
+    Returns:
+        The batch of attributions, empty arrays when there is no row.
+    """
+    n_rows = int(columns.shape[0])
+    model = wrapper.model
+    if coordinates is None:
+        coordinates = torch.zeros(n_rows, dtype=torch.long, device=columns.device)
+    empty = np.zeros(0, dtype=np.float64)
+    if n_rows == 0:
+        return AttributionBatch(
+            wrapper.readout, baseline, np.zeros(0, dtype=np.int64), np.zeros(0, dtype=np.int64),
+            np.zeros(0, dtype=np.int64), np.zeros(0, dtype=np.int64), empty, empty, empty, empty,
+            np.zeros((0, *inputs[0].shape[1:2], inputs[0].shape[2] + inputs[1].shape[2]), dtype=np.float32),
+            np.zeros((0, *inputs[2].shape[1:]), dtype=np.float32),
+        )
+    exact = baselines_for(baseline, inputs)
+    start = entry_point(inputs, exact, entry_fraction)
+    forward_args = (extra[0], extra[1], columns, coordinates)
+    with torch.no_grad():
+        value_input = wrapper(*inputs, *forward_args)
+        value_baseline = wrapper(*exact, *forward_args)
+        value_entry = wrapper(*start, *forward_args)
+        anchors = model(*inputs, **wrapper._forward_kwargs())["anchor_index"][
+            torch.arange(n_rows, device=columns.device), columns
+        ]
+    method = IntegratedGradients(wrapper)
+    attributions, delta = method.attribute(
+        tuple(x.detach() for x in inputs),
+        baselines=tuple(x.detach() for x in start),
+        additional_forward_args=forward_args,
+        n_steps=int(n_steps),
+        internal_batch_size=int(internal_batch_size),
+        return_convergence_delta=True,
+    )
+    target = torch.cat([attributions[0], attributions[1]], dim=-1)
+    return AttributionBatch(
+        readout=wrapper.readout,
+        baseline=baseline,
+        sample=np.zeros(n_rows, dtype=np.int64),
+        column=columns.detach().cpu().numpy().astype(np.int64),
+        anchor=anchors.detach().cpu().numpy().astype(np.int64),
+        coordinate=(
+            coordinates.detach().cpu().numpy().astype(np.int64)
+            if wrapper.readout in (READOUT_KLD_DIM, READOUT_MU_POST_DIM, READOUT_MU_PRIOR_DIM)
+            else np.full(n_rows, -1, dtype=np.int64)
+        ),
+        value_input=_host(value_input),
+        value_baseline=_host(value_baseline),
+        value_entry=_host(value_entry),
+        delta=_host(delta),
+        target=target.detach().cpu().to(torch.float32).numpy(),
+        source=attributions[2].detach().cpu().to(torch.float32).numpy(),
+    )
+
+
+def lag_band_feature_mask(
+    anchors: torch.Tensor, bands: Mapping[str, Tuple[int, int]], sequence_length: int, channels: int
+) -> Tuple[torch.Tensor, Dict[str, int]]:
+    r"""Group the source stream's positions by lag band relative to each row's own anchor.
+
+    Step $s$ of row $b$ belongs to band $[\ell_{lo}, \ell_{hi}]$ exactly when
+    $\ell_{lo} \le t_b - s \le \ell_{hi}$, over every channel at once -- the same positions the
+    occlusion analysis zeroes. Everything else -- steps after the anchor and beyond the furthest
+    band -- is group $0$ and is ablated too, so the check that removing it changes nothing is on
+    the table rather than assumed.
+
+    Args:
+        anchors: Each row's anchor as a stored step, $(N,)$.
+        bands: ``{name: (lo, hi)}`` inclusive lag pairs.
+        sequence_length: $T$.
+        channels: The source width.
+
+    Returns:
+        ``(mask, group_of_band)``: the $(N, T, C)$ ``long`` mask and each band's group id.
+    """
+    steps = torch.arange(int(sequence_length), device=anchors.device)[None, :]
+    lag = anchors.to(torch.long)[:, None] - steps                            # (N, T)
+    mask = torch.zeros(anchors.shape[0], int(sequence_length), dtype=torch.long, device=anchors.device)
+    groups: Dict[str, int] = {}
+    for index, (name, (low, high)) in enumerate(bands.items(), start=1):
+        mask = torch.where((lag >= int(low)) & (lag <= int(high)), torch.full_like(mask, index), mask)
+        groups[str(name)] = index
+    return mask[:, :, None].expand(-1, -1, int(channels)).contiguous(), groups
+
+
+def ablate_lag_bands(
+    wrapper: AnchorReadout,
+    inputs: Sequence[torch.Tensor],
+    extra: Sequence[torch.Tensor],
+    columns: torch.Tensor,
+    anchors: Sequence[int],
+    bands: Mapping[str, Tuple[int, int]],
+    *,
+    coordinates: Optional[torch.Tensor] = None,
+    perturbations_per_eval: int = 4,
+) -> Dict[str, np.ndarray]:
+    r"""Zero the source on each lag band relative to each row's anchor and re-read the readout.
+
+    Captum's feature ablation with the band grouping of :func:`lag_band_feature_mask`; the
+    reported number is $f(x^{\setminus \mathrm{band}}) - f(x)$, the **occlusion sign** -- positive
+    means the readout rose without the band -- rather than Captum's own $f(x) - f(x^{\setminus})$.
+
+    Args:
+        wrapper: The readout module.
+        inputs: The row-expanded input tuple.
+        extra: The row-expanded extra tuple.
+        columns: Per-row anchor-axis positions.
+        anchors: Per-row anchor steps.
+        bands: The lag bands.
+        coordinates: Per-row coordinates, or ``None``.
+        perturbations_per_eval: How many ablations Captum batches per forward.
+
+    Returns:
+        ``{band: (N,) delta}`` plus ``'rest'`` for everything outside the bands.
+    """
+    n_rows = int(columns.shape[0])
+    if n_rows == 0:
+        return {**{str(name): np.zeros(0) for name in bands}, "rest": np.zeros(0)}
+    if coordinates is None:
+        coordinates = torch.zeros(n_rows, dtype=torch.long, device=columns.device)
+    anchor_tensor = torch.as_tensor(np.asarray(anchors, dtype=np.int64), device=columns.device)
+    mask, groups = lag_band_feature_mask(anchor_tensor, bands, inputs[2].shape[1], inputs[2].shape[2])
+    # The target streams are one group each and are never ablated: their ids sit above every
+    # source id, and their baselines equal their inputs, so ablating them changes nothing.
+    n_source_groups = len(groups) + 1
+    masks = (
+        torch.full_like(inputs[0], n_source_groups, dtype=torch.long)[:1],
+        torch.full_like(inputs[1], n_source_groups + 1, dtype=torch.long)[:1],
+        mask,
+    )
+    baselines = baselines_for(BASELINE_SOURCE_NULL, inputs)
+    attributions = FeatureAblation(wrapper).attribute(
+        tuple(x.detach() for x in inputs),
+        baselines=tuple(x.detach() for x in baselines),
+        feature_mask=masks,
+        additional_forward_args=(extra[0], extra[1], columns, coordinates),
+        perturbations_per_eval=int(perturbations_per_eval),
+    )
+    source = attributions[2].detach().cpu().to(torch.float64).numpy()
+    host_mask = mask.detach().cpu().numpy()
+    deltas: Dict[str, np.ndarray] = {}
+    for name, group in list(groups.items()) + [("rest", 0)]:
+        values = np.full(n_rows, np.nan)
+        for row in range(n_rows):
+            hit = np.argwhere(host_mask[row] == group)
+            if hit.size:
+                # Captum writes one value on every position of a group; the negation is the sign
+                # convention stated above.
+                values[row] = -float(source[row, hit[0][0], hit[0][1]])
+        deltas[name] = values
+    return deltas
+
+
+def layer_attribution(
+    wrapper: AnchorReadout,
+    inputs: Sequence[torch.Tensor],
+    extra: Sequence[torch.Tensor],
+    columns: torch.Tensor,
+    *,
+    baseline: str,
+    coordinates: Optional[torch.Tensor] = None,
+    n_steps: int = IG_STEPS,
+    internal_batch_size: int = IG_INTERNAL_BATCH_SIZE,
+    entry_fraction: float = BASELINE_ENTRY_FRACTION,
+) -> Dict[str, np.ndarray]:
+    r"""Integrated gradients on the layer where the source enters the latent, per row.
+
+    In the attentive cells the layers are the posterior head's per-head **fusion** modules --
+    one per head under the head-structured posterior, each called once per forward and each
+    reading the target state beside its own head's attended summary -- so the per-head split is
+    $\sum_d$ of the attribution over head $m$'s fused feature at the row's anchor. Under the
+    source-null baseline the target state is fixed along the path, so what flows through the
+    fusion is the source's effect alone and the split sums to the readout difference; under the
+    all-zero baseline the prior's direct route into the posterior bypasses the fusion and the
+    split is partial, which is why the pass takes it under the source-null baseline only. A flat
+    (non-head-structured) posterior has one fusion and no split, and the record says so. In the
+    residual cell the layer is the proposal head and the attribution is on its **output**, the
+    per-lag mean and scale proposals, summed over the latent coordinates at the row's anchor: a
+    per-lag split of the readout through the summation and the limiter, which the cell's own
+    arithmetic cannot allocate.
+
+    Args:
+        wrapper: The readout module.
+        inputs: The row-expanded input tuple.
+        extra: The row-expanded extra tuple.
+        columns: Per-row anchor-axis positions.
+        baseline: One of :data:`BASELINES`.
+        coordinates: Per-row coordinates, or ``None``.
+        n_steps: Integration steps.
+        internal_batch_size: Captum's batch of interpolated inputs.
+        entry_fraction: Where the path enters the baseline.
+
+    Returns:
+        ``{'per_unit': (N, M or L), 'total': (N,), 'off_axis_total': (N,)}`` -- the per-head or
+        per-lag attribution, its sum, and a zero column kept for the row schema. Empty when the
+        cell's model does not build the layer.
+    """
+    n_rows = int(columns.shape[0])
+    model = wrapper.model
+    cell = wrapper.cell
+    if coordinates is None:
+        coordinates = torch.zeros(n_rows, dtype=torch.long, device=columns.device)
+    if cell.dense_latent:
+        head = model.posterior_head
+        layer = list(head.fusion) if getattr(head, "head_structured", False) else None
+    else:
+        layer = getattr(model, "proposal_head", None)
+    if n_rows == 0 or layer is None:
+        return {"per_unit": np.zeros((0, 0)), "total": np.zeros(0), "off_axis_total": np.zeros(0)}
+    exact = baselines_for(baseline, inputs)
+    start = entry_point(inputs, exact, entry_fraction)
+    forward_args = (extra[0], extra[1], columns, coordinates)
+    with warnings.catch_warnings():
+        # Captum warns that a list of layers must not be a chain; the per-head fusion modules
+        # each read the target state and their own head, so the warning does not apply.
+        warnings.simplefilter("ignore", category=UserWarning)
+        method = LayerIntegratedGradients(wrapper, layer)
+    # The residual cell chunks its proposal pass in training; a chunked layer is called several
+    # times per forward and a hook sees only the last call, so the pass runs unchunked here and
+    # the setting is restored whatever happens.
+    chunk_names = ("anchor_chunk", "lag_chunk")
+    saved = {name: getattr(model, name, None) for name in chunk_names if hasattr(model, name)}
+    for name in saved:
+        setattr(model, name, None)
+    try:
+        with torch.no_grad():
+            anchors = model(*inputs, **wrapper._forward_kwargs())["anchor_index"][
+                torch.arange(n_rows, device=columns.device), columns
+            ]
+        out = method.attribute(
+            tuple(x.detach() for x in inputs),
+            baselines=tuple(x.detach() for x in start),
+            additional_forward_args=forward_args,
+            n_steps=int(n_steps),
+            internal_batch_size=int(internal_batch_size),
+        )
+    finally:
+        for name, value in saved.items():
+            setattr(model, name, value)
+    parts = [part for part in (out if isinstance(out, (tuple, list)) else [out]) if part is not None]
+    rows = torch.arange(n_rows, device=columns.device)
+    if cell.dense_latent:
+        # One fused feature per head, each (B, T, d): the split is their sums at the anchor.
+        per_unit = torch.stack([part[rows, anchors].sum(dim=-1) for part in parts], dim=1)   # (N, M)
+    else:
+        # The proposal head's outputs: the mean proposals, and the scale proposals where the arm
+        # has them. Both reach the readout -- the divergence carries the scale update too -- so the
+        # per-lag split sums the two channels at the row's anchor over the latent coordinates.
+        per_unit = torch.stack([part[rows, columns].sum(dim=-1) for part in parts], dim=0).sum(dim=0)
+    off_axis = torch.zeros(n_rows, dtype=per_unit.dtype, device=per_unit.device)
+    return {"per_unit": _host(per_unit), "total": _host(per_unit.sum(dim=-1)), "off_axis_total": _host(off_axis)}
+
+
+# =============================================================================
+# Reductions (numpy only from here on)
+# =============================================================================
+def time_profile(maps: np.ndarray) -> np.ndarray:
+    """Sum an $(N, T, C)$ attribution over its channels: $(N, T)$."""
+    return np.asarray(maps, dtype=np.float64).sum(axis=-1)
+
+
+def channel_profile(maps: np.ndarray) -> np.ndarray:
+    """Sum an $(N, T, C)$ attribution over its steps: $(N, C)$."""
+    return np.asarray(maps, dtype=np.float64).sum(axis=1)
+
+
+def lag_profile(source_time: np.ndarray, anchors: Sequence[int], n_lags: int) -> np.ndarray:
+    r"""Re-index a source time profile by offset from the anchor: $q_\ell = p_{t_a - \ell}$.
+
+    ``NaN`` where $t_a - \ell$ falls before the record: a lag the anchor could not read is not a
+    lag that was read and found empty.
+
+    Args:
+        source_time: $(N, T)$ per-step source attribution.
+        anchors: Per-row anchor steps.
+        n_lags: $L$.
+
+    Returns:
+        $(N, L)$.
+    """
+    profile = np.asarray(source_time, dtype=np.float64)
+    out = np.full((profile.shape[0], int(n_lags)), np.nan)
+    for row, anchor in enumerate(anchors):
+        for lag in range(int(n_lags)):
+            step = int(anchor) - lag
+            if step >= 0:
+                out[row, lag] = profile[row, step]
+    return out
+
+
+def band_sums(profile: np.ndarray, groups: Mapping[str, np.ndarray]) -> Dict[str, np.ndarray]:
+    """Sum a per-channel (or per-lag) profile over each group's positions.
+
+    Args:
+        profile: $(N, K)$.
+        groups: ``{name: positions}``.
+
+    Returns:
+        ``{name: (N,)}``; a group with no position in range sums to ``NaN``.
+    """
+    values = np.asarray(profile, dtype=np.float64)
+    out: Dict[str, np.ndarray] = {}
+    for name, positions in groups.items():
+        index = np.asarray(positions, dtype=np.int64)
+        index = index[(index >= 0) & (index < values.shape[1])]
+        out[str(name)] = np.nansum(values[:, index], axis=1) if index.size else np.full(values.shape[0], np.nan)
+    return out
+
+
+def lag_band_groups(bands: Mapping[str, Tuple[int, int]], n_lags: int) -> Dict[str, np.ndarray]:
+    """The lag positions each inclusive band covers, clipped to the window."""
+    return {
+        str(name): np.arange(max(int(low), 0), min(int(high), int(n_lags) - 1) + 1)
+        for name, (low, high) in bands.items()
+    }
+
+
+def agreement(lag_profiles: np.ndarray, model_profiles: np.ndarray) -> Dict[str, np.ndarray]:
+    r"""How the lag-aligned attribution magnitude agrees with the model's own lag readout, per row.
+
+    Two statistics, because each answers what the other cannot: the Pearson correlation between
+    $|q_\ell|$ and the model's profile over the lags both carry, and the Jensen--Shannon distance
+    between the two normalised to distributions over the same lags -- bounded, and blind to a
+    scale the correlation would be sensitive to.
+
+    Args:
+        lag_profiles: $(N, L)$ attribution by lag.
+        model_profiles: $(N, L)$ the model's own profile.
+
+    Returns:
+        ``{'lag_corr': (N,), 'lag_js': (N,)}``, ``NaN`` where fewer than three lags are shared or
+        either profile carries no mass.
+    """
+    left = np.abs(np.asarray(lag_profiles, dtype=np.float64))
+    right = np.asarray(model_profiles, dtype=np.float64)
+    corr = np.full(left.shape[0], np.nan)
+    js = np.full(left.shape[0], np.nan)
+    for row in range(left.shape[0]):
+        shared = np.isfinite(left[row]) & np.isfinite(right[row])
+        if shared.sum() < 3:
+            continue
+        a, b = left[row][shared], right[row][shared]
+        if a.std() > 0.0 and b.std() > 0.0:
+            corr[row] = float(np.corrcoef(a, b)[0, 1])
+        js[row] = lag_hist.jensen_shannon(a, b)
+    return {"lag_corr": corr, "lag_js": js}
+
+
+def channel_groups_from_map(channel_map: Optional[pd.DataFrame]) -> Dict[str, Dict[str, np.ndarray]]:
+    """Read the declared-axis channel map into ``{stream: {band: positions}}``.
+
+    The attributions live on the model's **input** axis, which is the declared width of each
+    stream, so the join goes through the declared-axis map rather than the kept-axis one the
+    per-channel decoder readouts use.
+
+    Args:
+        channel_map: The ``band_channel_map.csv`` frame, or ``None``.
+
+    Returns:
+        The groups, empty when there is no map.
+    """
+    if channel_map is None or channel_map.empty:
+        return {}
+    groups: Dict[str, Dict[str, np.ndarray]] = {}
+    for stream in STREAMS:
+        rows = channel_map[channel_map["stream"].astype(str) == stream]
+        if rows.empty:
+            continue
+        bands: Dict[str, List[int]] = {}
+        for _, row in rows.iterrows():
+            bands.setdefault(str(row["band"]), []).append(int(row["channel"]))
+        groups[stream] = {name: np.asarray(sorted(index), dtype=np.int64) for name, index in bands.items()}
+    return groups
+
+
+# =============================================================================
+# Figures
+# =============================================================================
+def _empty(ax: Any, title: str = "") -> None:
+    """Mark an axes as holding nothing."""
+    ax.text(
+        0.5, 0.5, figures.EMPTY_NOTE, transform=ax.transAxes,
+        ha="center", va="center", fontsize=figures.FONT_NOTE, color=figures.COLOR_GRAY,
+    )
+    ax.set_title(title)
+    figures.style_axes(ax, grid="none")
+
+
+def _draw_warm_boundary(ax: Any, live: Optional[np.ndarray]) -> None:
+    """Draw the per-channel warm-up boundary as a staircase over a (step x channel) heatmap."""
+    if live is None:
+        return
+    channels = np.arange(live.size)
+    ax.step(live - 0.5, channels, where="mid", color=figures.COLOR_BLACK, linewidth=figures.LINE_THIN)
+
+
+def build_map_figure(
+    maps: Sequence[Dict[str, Any]],
+    *,
+    lag_seconds: np.ndarray,
+    cell: CellBinding,
+    caveat: str,
+) -> Any:
+    r"""One row per example: both streams' attribution maps at an anchor, and the lag view beside them.
+
+    Args:
+        maps: Per example: ``guid, subgroup, clinical_class, anchor, readout, baseline,
+            target (T, c_y), source (T, c_u), lag_profile (L,), model_profile (L,),
+            live_target, live_source``.
+        lag_seconds: The compensated lag axis.
+        cell: The cell binding, for the legend.
+        caveat: The sentence printed under the figure.
+
+    Returns:
+        The figure.
+    """
+    n_rows = max(len(maps), 1)
+    figure, axes = figures.new_figure(n_rows, 3, height_per_row=2.6, width=14.0)
+    for row in range(n_rows):
+        if row >= len(maps):
+            for col in range(3):
+                _empty(axes[row, col])
+            continue
+        item = maps[row]
+        for col, stream in enumerate(STREAMS):
+            field = np.asarray(item[stream], dtype=np.float64).T          # (C, T)
+            ax = axes[row, col]
+            figures.heatmap_with_colorbar(
+                figure, ax, field, symmetric=True, interpolation="none",
+                title=f"{stream} attribution of {item['readout']} ({item['baseline']} baseline)",
+                xlabel="stored step", ylabel="declared channel",
+            )
+            ax.axvline(float(item["anchor"]), color=figures.COLOR_VERMILLION, linewidth=figures.LINE_REGULAR)
+            _draw_warm_boundary(ax, item.get(f"live_{stream}"))
+        ax = axes[row, 2]
+        profile = np.asarray(item["lag_profile"], dtype=np.float64)
+        model_profile = np.asarray(item["model_profile"], dtype=np.float64)
+        if np.isfinite(profile).any():
+            ax.plot(lag_seconds, np.abs(profile), color=figures.COLOR_BLUE, linewidth=figures.LINE_REGULAR,
+                    label="|attribution| by lag")
+            twin = ax.twinx()
+            twin.plot(lag_seconds, model_profile, color=figures.COLOR_ORANGE, linewidth=figures.LINE_THIN,
+                      label=cell.lag_readout)
+            twin.set_ylabel("model lag readout", fontsize=figures.FONT_LABEL)
+            twin.tick_params(labelsize=figures.FONT_TINY)
+            handles, names = ax.get_legend_handles_labels()
+            more, more_names = twin.get_legend_handles_labels()
+            ax.legend(handles + more, names + more_names, fontsize=figures.FONT_TINY, loc="upper right")
+            ax.set_xlabel(COEFFICIENT_LAG_AXIS_LABEL)
+            ax.set_ylabel("|attribution| (readout units)")
+            ax.set_title("lag-aligned source attribution vs the model's lag readout", fontsize=figures.FONT_SMALL)
+            figures.style_axes(ax)
+        else:
+            _empty(ax, "lag-aligned source attribution")
+        axes[row, 0].set_ylabel(
+            f"guid {item['guid']} — subgroup {item['subgroup']} — class {item['clinical_class']}\n"
+            f"anchor step {int(item['anchor'])}\ndeclared channel", fontsize=figures.FONT_TINY,
+        )
+    figures.caveat_note(figure, caveat)
+    return figure
+
+
+def _class_colours(classes: Sequence[str]) -> Dict[str, str]:
+    """The severity palette for a list of class names."""
+    return figures.group_colors([str(name) for name in classes])
+
+
+def build_lag_profile_figure(
+    rows: pd.DataFrame,
+    vectors: Mapping[str, np.ndarray],
+    *,
+    lag_seconds: np.ndarray,
+    readouts: Sequence[str],
+    cell: CellBinding,
+    caveat: str,
+) -> Any:
+    r"""The lag-aligned source attribution against the model's own lag readout, pooled and by class.
+
+    One row per readout under the source-null baseline: the mean over recordings of the
+    normalised $|q_\ell|$ beside the mean normalised model profile, pooled (left) and per class
+    (right), with the recording-mean agreement statistics in the titles. Normalised per row so a
+    recording with a large readout does not decide the shape for every other.
+
+    Args:
+        rows: The per-row table.
+        vectors: The row-aligned arrays, read for ``lag_profile`` and ``model_profile``.
+        lag_seconds: The compensated lag axis.
+        readouts: The readouts to draw, one row each.
+        cell: The cell binding.
+        caveat: The sentence printed under the figure.
+
+    Returns:
+        The figure.
+    """
+    figure, axes = figures.new_figure(max(len(readouts), 1), 2, height_per_row=2.4, width=12.0)
+    for index, readout in enumerate(readouts):
+        selected = np.flatnonzero(
+            (rows["readout"].astype(str) == readout).to_numpy()
+            & (rows["baseline"].astype(str) == BASELINE_SOURCE_NULL).to_numpy()
+        ) if len(rows) else np.zeros(0, dtype=np.int64)
+        if selected.size == 0 or "lag_profile" not in vectors:
+            _empty(axes[index, 0], f"{readout}: lag-aligned attribution")
+            _empty(axes[index, 1], f"{readout}: by class")
+            continue
+        attribution = lag_hist.normalise(np.abs(vectors["lag_profile"][selected]))
+        model_profile = lag_hist.normalise(vectors["model_profile"][selected])
+        subset = rows.iloc[selected]
+        guids = subset["guid"].astype(str).to_numpy()
+        classes = subset[labels.CLASS_COLUMN].astype(object).to_numpy()
+
+        def per_recording(mat: np.ndarray, keep: np.ndarray) -> np.ndarray:
+            """Mean over the rows of each recording, then over recordings."""
+            frames = []
+            for guid in np.unique(guids[keep]):
+                frames.append(np.nanmean(mat[keep][guids[keep] == guid], axis=0))
+            return np.nanmean(np.stack(frames, axis=0), axis=0) if frames else np.full(mat.shape[1], np.nan)
+
+        everything = np.ones(selected.size, dtype=bool)
+        ax = axes[index, 0]
+        ax.plot(lag_seconds, per_recording(attribution, everything), color=figures.COLOR_BLUE,
+                linewidth=figures.LINE_REGULAR, label="|attribution|, normalised")
+        ax.plot(lag_seconds, per_recording(model_profile, everything), color=figures.COLOR_ORANGE,
+                linewidth=figures.LINE_THIN, label="model lag readout, normalised")
+        corr = float(np.nanmean(subset["lag_corr"])) if "lag_corr" in subset else float("nan")
+        js = float(np.nanmean(subset["lag_js"])) if "lag_js" in subset else float("nan")
+        ax.set_title(
+            f"{readout}: pooled over {len(np.unique(guids))} recording(s); corr {corr:.2f}, JS {js:.2f}",
+            fontsize=figures.FONT_SMALL,
+        )
+        ax.set_xlabel(COEFFICIENT_LAG_AXIS_LABEL)
+        ax.set_ylabel("share per lag")
+        ax.legend(fontsize=figures.FONT_TINY, loc="upper right")
+        figures.style_axes(ax)
+
+        ax = axes[index, 1]
+        names = labels.ordered_groups([c for c in pd.unique(classes) if c is not None and not pd.isna(c)], labels.CLASS_COLUMN)
+        colours = _class_colours(names)
+        drawn = 0
+        for name in names:
+            keep = np.asarray([c == name for c in classes], dtype=bool)
+            if not keep.any():
+                continue
+            ax.plot(lag_seconds, per_recording(attribution, keep), color=colours.get(name, figures.COLOR_GRAY),
+                    linewidth=figures.LINE_REGULAR, label=f"{name} |attribution| (n={len(np.unique(guids[keep]))})")
+            ax.plot(lag_seconds, per_recording(model_profile, keep), color=colours.get(name, figures.COLOR_GRAY),
+                    linewidth=figures.LINE_THIN, linestyle="--")
+            drawn += 1
+        if drawn == 0:
+            _empty(ax, f"{readout}: by class")
+        else:
+            ax.set_title(f"{readout}: by class (solid attribution, dashed model readout)", fontsize=figures.FONT_SMALL)
+            ax.set_xlabel(COEFFICIENT_LAG_AXIS_LABEL)
+            ax.legend(fontsize=figures.FONT_TINY, loc="upper right")
+            figures.style_axes(ax)
+    figures.caveat_note(figure, f"{cell.lag_qualification}. {caveat}. {GROUP_DELAY_CAVEAT}")
+    return figure
+
+
+def build_band_figure(
+    bands: pd.DataFrame,
+    lag_bands: pd.DataFrame,
+    *,
+    readouts: Sequence[str],
+    caveat: str,
+) -> Any:
+    """Frequency-band and lag-band attributions, beside the readouts they are read against.
+
+    Top: per readout, the mean over recordings of the attribution summed over each frequency
+    band, one bar group per stream, with the spectral-skill gap per target band drawn on a twin
+    axis where the run carries it. Bottom: per lag band of the source, the integrated-gradient
+    share, the feature-ablation delta of this analysis, and the occlusion analysis's delta where
+    the run carries it.
+
+    Args:
+        bands: The frequency-band table.
+        lag_bands: The lag-band table.
+        readouts: The readouts, one column each.
+        caveat: The sentence printed under the figure.
+
+    Returns:
+        The figure.
+    """
+    n_cols = max(len(readouts), 1)
+    figure, axes = figures.new_figure(2, n_cols, height_per_row=3.0, width=5.0 * n_cols)
+    for col, readout in enumerate(readouts):
+        ax = axes[0, col]
+        subset = bands[bands["readout"].astype(str) == readout] if len(bands) else bands
+        if subset.empty:
+            _empty(ax, f"{readout}: by frequency band")
+        else:
+            names = list(dict.fromkeys(subset["band"].astype(str)))
+            x = np.arange(len(names))
+            width = 0.38
+            for offset, (stream, colour) in enumerate(((STREAM_TARGET, figures.COLOR_BLUE), (STREAM_SOURCE, figures.COLOR_ORANGE))):
+                part = subset[subset["stream"].astype(str) == stream].set_index("band")
+                heights = [float(part["attribution_mean"].get(name, np.nan)) for name in names]
+                ax.bar(x + (offset - 0.5) * width, heights, width=width, color=colour, label=f"{stream} attribution")
+            if "spectral_skill_pred_gap_nats" in subset.columns and subset["spectral_skill_pred_gap_nats"].notna().any():
+                twin = ax.twinx()
+                part = subset[subset["stream"].astype(str) == STREAM_TARGET].set_index("band")
+                twin.plot(x, [float(part["spectral_skill_pred_gap_nats"].get(name, np.nan)) for name in names],
+                          color=figures.COLOR_GREEN, marker="o", markersize=2.5, linewidth=figures.LINE_THIN,
+                          label="spectral_skill pred_gap (target band)")
+                twin.set_ylabel("nats per anchor", fontsize=figures.FONT_LABEL)
+                twin.tick_params(labelsize=figures.FONT_TINY)
+                twin.legend(fontsize=figures.FONT_TINY, loc="lower right")
+            ax.set_xticks(x)
+            ax.set_xticklabels(names, rotation=30, ha="right", fontsize=figures.FONT_TINY)
+            ax.axhline(0.0, color=figures.COLOR_GRAY, linewidth=figures.LINE_HAIRLINE)
+            ax.set_title(f"{readout}: attribution by frequency band (source-null baseline)", fontsize=figures.FONT_SMALL)
+            ax.set_ylabel("attribution (readout units)")
+            ax.legend(fontsize=figures.FONT_TINY, loc="upper right")
+            figures.style_axes(ax)
+
+        ax = axes[1, col]
+        subset = lag_bands[lag_bands["readout"].astype(str) == readout] if len(lag_bands) else lag_bands
+        if subset.empty:
+            _empty(ax, f"{readout}: by lag band")
+        else:
+            names = list(dict.fromkeys(subset["band"].astype(str)))
+            x = np.arange(len(names))
+            series = [
+                ("ig_attribution_mean", "integrated gradients (sum over the band)", figures.COLOR_BLUE),
+                ("ablation_delta_mean", "feature ablation delta (this analysis)", figures.COLOR_PURPLE),
+                ("occlusion_delta_total_nats", "occlusion delta (its own pass)", figures.COLOR_GREEN),
+            ]
+            present = [(column, label, colour) for column, label, colour in series
+                       if column in subset.columns and subset[column].notna().any()]
+            width = 0.8 / max(len(present), 1)
+            indexed = subset.set_index("band")
+            for offset, (column, label, colour) in enumerate(present):
+                ax.bar(x + (offset - (len(present) - 1) / 2) * width,
+                       [float(indexed[column].get(name, np.nan)) for name in names],
+                       width=width, color=colour, label=label)
+            ax.set_xticks(x)
+            ax.set_xticklabels(names, fontsize=figures.FONT_TINY)
+            ax.axhline(0.0, color=figures.COLOR_GRAY, linewidth=figures.LINE_HAIRLINE)
+            ax.set_title(f"{readout}: source by lag band relative to the anchor", fontsize=figures.FONT_SMALL)
+            ax.set_ylabel("readout units (occlusion: nats per anchor)")
+            ax.legend(fontsize=figures.FONT_TINY, loc="upper right")
+            figures.style_axes(ax)
+    figures.caveat_note(figure, f"{caveat}. {GROUP_DELAY_CAVEAT}")
+    return figure
+
+
+def build_layer_figure(
+    layer: pd.DataFrame,
+    top_coordinate: pd.DataFrame,
+    *,
+    cell: CellBinding,
+    lag_seconds: np.ndarray,
+    caveat: str,
+) -> Any:
+    """The layer split and how the top divergence coordinate is fed.
+
+    Left: per readout, the mean over recordings of the layer attribution per unit -- per head in
+    the attentive cells, per lag in the residual cell -- pooled and by class. Right: the mean
+    time profile, per stream, of the attribution of the anchor's largest per-coordinate divergence
+    re-indexed by offset from the anchor.
+
+    Args:
+        layer: The layer table, long-form: ``readout, unit, clinical_class, n_recordings, mean``.
+        top_coordinate: Rows of the per-row table for the top-coordinate readout, with their
+            lag-aligned source and target profiles attached as columns ``lag_profile`` and
+            ``target_lag_profile`` (arrays).
+        cell: The cell binding.
+        lag_seconds: The compensated lag axis.
+        caveat: The sentence printed under the figure.
+
+    Returns:
+        The figure.
+    """
+    figure, axes = figures.new_figure(1, 2, height_per_row=3.2, width=12.0)
+    ax = axes[0, 0]
+    if layer.empty:
+        _empty(ax, f"layer attribution per {cell.layer_axis}")
+    else:
+        readouts = list(dict.fromkeys(layer["readout"].astype(str)))
+        pooled = layer[layer[labels.CLASS_COLUMN].astype(str) == "pooled"]
+        units = np.sort(pooled["unit"].unique()) if not pooled.empty else np.sort(layer["unit"].unique())
+        x = np.asarray(units, dtype=np.float64) if cell.layer_axis == "head" else lag_seconds[np.asarray(units, dtype=np.int64)]
+        for index, readout in enumerate(readouts):
+            part = pooled[pooled["readout"].astype(str) == readout].set_index("unit")
+            values = [float(part["mean"].get(unit, np.nan)) for unit in units]
+            if cell.layer_axis == "head":
+                ax.bar(x + (index - (len(readouts) - 1) / 2) * 0.8 / len(readouts), values,
+                       width=0.8 / len(readouts), label=readout)
+            else:
+                ax.plot(x, values, linewidth=figures.LINE_REGULAR, label=readout)
+        ax.axhline(0.0, color=figures.COLOR_GRAY, linewidth=figures.LINE_HAIRLINE)
+        ax.set_title(f"attribution on {cell.layer_label}, per {cell.layer_axis} (source-null baseline)", fontsize=figures.FONT_SMALL)
+        ax.set_xlabel("head" if cell.layer_axis == "head" else COEFFICIENT_LAG_AXIS_LABEL)
+        ax.set_ylabel("attribution (readout units), mean over recordings")
+        ax.legend(fontsize=figures.FONT_TINY, loc="upper right")
+        figures.style_axes(ax)
+    ax = axes[0, 1]
+    if top_coordinate.empty or "lag_profile" not in top_coordinate.columns:
+        _empty(ax, "how the top divergence coordinate is fed")
+    else:
+        source = np.stack([np.asarray(v, dtype=np.float64) for v in top_coordinate["lag_profile"]], axis=0)
+        target = np.stack([np.asarray(v, dtype=np.float64) for v in top_coordinate["target_lag_profile"]], axis=0)
+        ax.plot(lag_seconds, np.nanmean(np.abs(source), axis=0), color=figures.COLOR_ORANGE,
+                linewidth=figures.LINE_REGULAR, label="source |attribution| by lag")
+        ax.plot(lag_seconds, np.nanmean(np.abs(target), axis=0), color=figures.COLOR_BLUE,
+                linewidth=figures.LINE_REGULAR, label="target |attribution| by offset")
+        ax.set_title(
+            f"the anchor's largest K_(t,d) coordinate: |attribution| by offset from the anchor "
+            f"({len(top_coordinate)} anchor(s), {top_coordinate['guid'].nunique()} recording(s))",
+            fontsize=figures.FONT_SMALL,
+        )
+        ax.set_xlabel(COEFFICIENT_LAG_AXIS_LABEL)
+        ax.set_ylabel("|attribution| (nats)")
+        ax.legend(fontsize=figures.FONT_TINY, loc="upper right")
+        figures.style_axes(ax)
+    figures.caveat_note(figure, f"{caveat}. {GROUP_DELAY_CAVEAT}")
+    return figure
+
+
+def build_null_figure(null: pd.DataFrame, *, caveat: str) -> Any:
+    r"""The null decomposition of $K_t$: clock, content, and the entry jump, by class.
+
+    Left: for the divergence under the source-null baseline, per class, the mean over recordings
+    of the readout at the input, at the exact null (the clock part), the attributed content
+    (the integrated-gradient sum) and the entry jump. Right: under the all-zero baseline, the
+    split of the attribution between the target and the source streams.
+
+    Args:
+        null: The null table, one row per (class, readout).
+        caveat: The sentence printed under the figure.
+
+    Returns:
+        The figure.
+    """
+    figure, axes = figures.new_figure(1, 2, height_per_row=3.2, width=12.0)
+    for col, (baseline, columns, title) in enumerate((
+        (BASELINE_SOURCE_NULL,
+         [("value_input_mean", "K_t at the input"), ("value_baseline_mean", "K_t at the null (clock)"),
+          ("attributed_mean", "attributed content (IG sum)"), ("entry_jump_mean", "entry jump")],
+         "divergence, source-null baseline: clock and content"),
+        (BASELINE_ALL_ZERO,
+         [("target_total_mean", "target attribution"), ("source_total_mean", "source attribution"),
+          ("entry_jump_mean", "entry jump")],
+         "divergence, all-zero baseline: target vs source"),
+    )):
+        ax = axes[0, col]
+        subset = null[(null["baseline"].astype(str) == baseline) & (null["readout"].astype(str) == READOUT_KLD)] if len(null) else null
+        if subset.empty:
+            _empty(ax, title)
+            continue
+        classes = list(dict.fromkeys(subset[labels.CLASS_COLUMN].astype(str)))
+        x = np.arange(len(classes))
+        width = 0.8 / len(columns)
+        indexed = subset.set_index(labels.CLASS_COLUMN)
+        for offset, (column, label) in enumerate(columns):
+            ax.bar(x + (offset - (len(columns) - 1) / 2) * width,
+                   [float(indexed[column].get(name, np.nan)) for name in classes], width=width, label=label)
+        ax.set_xticks(x)
+        ax.set_xticklabels([f"{name} (n={int(indexed['n_recordings'].get(name, 0))})" for name in classes],
+                           fontsize=figures.FONT_TINY)
+        ax.axhline(0.0, color=figures.COLOR_GRAY, linewidth=figures.LINE_HAIRLINE)
+        ax.set_title(title, fontsize=figures.FONT_SMALL)
+        ax.set_ylabel("nats per anchor, mean over recordings")
+        ax.legend(fontsize=figures.FONT_TINY, loc="upper right")
+        figures.style_axes(ax)
+    figures.caveat_note(figure, caveat)
+    return figure
+
+
+#: The rows of a recording's attribution trace figure: the lag-aligned attribution of the
+#: divergence and the model's own lag readout as heatmaps on one lag axis, the agreement and the
+#: source share as lines, and the readout values behind them.
+TRACE_PANELS: Tuple[Any, ...] = (
+    traces.HeatmapPanel("attribution_lag_map", "|source attribution of K_t| by lag (source-null baseline)", "",
+                        lag_axis=True),
+    traces.HeatmapPanel("model_lag_map", "the model's own lag readout", "", lag_axis=True),
+    traces.LinePanel(("lag_corr", "lag_js"), "agreement between the two lag profiles", ""),
+    traces.LinePanel(("source_total", "target_total"), "attribution totals of K_t", "nats"),
+    traces.LinePanel(("value_input", "value_baseline"), "K_t at the input and at the null", "nats"),
+)
+
+#: The lag families a trace's shape statistics are taken of.
+TRACE_LAG_PROFILES: Dict[str, str] = {"attribution_lag_map": "attr_lag", "model_lag_map": "model_lag"}
+
+
+# =============================================================================
+# Cost
+# =============================================================================
+def cost_record(*, elapsed_s: float, n_segments: int, n_rows: int, n_forward_equivalents: int, device: Any) -> Dict[str, Any]:
+    """What the pass cost, in the collection pass's key vocabulary plus this analysis's own rate.
+
+    Args:
+        elapsed_s: Wall-clock seconds of the attribution loop.
+        n_segments: Segments attributed.
+        n_rows: Attribution rows (one per anchor, readout and baseline).
+        n_forward_equivalents: Forward-and-backward passes over one row the loop performed.
+        device: The device, or ``None``.
+
+    Returns:
+        The record. ``peak_allocated_bytes`` is a CUDA figure and ``None`` elsewhere.
+    """
+    elapsed = max(float(elapsed_s), 1e-9)
+    resolved = None if device is None else torch.device(device)
+    peak: Optional[int] = None
+    if resolved is not None and resolved.type == "cuda":
+        peak = int(torch.cuda.max_memory_allocated(resolved))
+    rate = float(n_segments) / elapsed
+    return {
+        "device": None if resolved is None else str(resolved),
+        "n_samples": int(n_segments),
+        "n_rows": int(n_rows),
+        "n_forward_equivalents": int(n_forward_equivalents),
+        "elapsed_s": float(elapsed),
+        "samples_per_second": rate,
+        "hours_per_1000_samples": (1000.0 / rate / 3600.0) if rate > 0.0 else None,
+        "seconds_per_row": (elapsed / n_rows) if n_rows else None,
+        "peak_allocated_bytes": peak,
+        "note": (
+            "measured on this pass at the anchor count, readout set, baseline set and step count "
+            "recorded in the plan. A longer pass extrapolates as hours = (n_samples / 1000) * "
+            "hours_per_1000_samples at those settings; halving IG_STEPS roughly halves "
+            "seconds_per_row. peak_allocated_bytes is the CUDA allocator's process peak and is "
+            "null on any other device."
+        ),
+    }
+
+
+__all__ = [
+    "ANALYSIS_DIRNAME", "ANCHORS_PER_SEGMENT", "ATTENTION_CELL", "ATTRIBUTION_CAVEAT",
+    "AnchorReadout", "AttributionBatch", "BANDS_FILENAME", "BAND_FIGURE", "BASELINES",
+    "BASELINE_ALL_ZERO", "BASELINE_ENTRY_FRACTION", "BASELINE_SOURCE_NULL", "CAP_NAME",
+    "CellBinding", "DEFAULT_SEGMENTS", "DRAW_SEED_OFFSET", "IG_INTERNAL_BATCH_SIZE", "IG_STEPS",
+    "LAG_BANDS_FILENAME", "LAG_PROFILE_FIGURE", "LAYER_FIGURE", "LAYER_FILENAME", "MAIN_READOUTS",
+    "MAPS_FILENAME", "MAP_FIGURE", "METHOD_RECORD", "NULL_FIGURE", "NULL_FILENAME", "READOUTS",
+    "READOUT_KLD", "READOUT_KLD_DIM", "READOUT_LAG_BAND", "READOUT_MU_POST_DIM",
+    "READOUT_MU_PRIOR_DIM", "READOUT_NLL_BASE", "READOUT_NLL_FULL", "READOUT_PRED_GAP",
+    "RECORDINGS_FILENAME", "ROWS_FILENAME", "SLOT_CELL", "STREAMS", "STREAM_SOURCE",
+    "STREAM_TARGET", "SUMMARY_FILENAME", "TARGET_ONLY_READOUTS", "TRACE_DIRNAME",
+    "TRACE_LAG_PROFILES", "TRACE_PANELS", "TRACE_RECORDINGS_PER_CLASS", "TRACE_SUFFIX",
+    "VECTORS_FILENAME", "ablate_lag_bands", "agreement", "band_sums", "baselines_for",
+    "build_band_figure", "build_lag_profile_figure", "build_layer_figure", "build_map_figure",
+    "build_null_figure", "channel_groups_from_map", "channel_profile", "contributing_columns",
+    "cost_record", "entry_point", "expand_rows", "integrated_gradients", "lag_band_feature_mask",
+    "lag_band_groups", "lag_profile", "layer_attribution", "model_lag_readout", "spread_columns",
+    "time_profile", "warm_from_step",
+]

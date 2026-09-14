@@ -136,12 +136,18 @@ eval_config:
   #                 re-read through every segment the dataset holds for it in time order, after
   #                 the pass. A cap on files and figures rather than on what the pass measures;
   #                 absent means the family default rather than zero.
+  #   attribution_segments
+  #                 how many SEGMENTS the Captum attribution stage attributes after the pass, one
+  #                 per drawn recording in a class-balanced draw, a few anchors each: tens of
+  #                 forward-and-backward passes per anchor, readout and baseline, so this bounds
+  #                 a cost the stage's own block measures. Absent means the family default.
   #
   # The block stays present so a reader comparing this delta against a lag-attentive cell's sees
   # which caps this pass reads rather than wondering which were forgotten.
   caps:
     lag_profile: 256
     traces_per_class: 10
+    attribution_segments: 24
 
   # Image format for every figure the run writes, as a matplotlib filetype: `pdf`, `svg`, `png`,
   # ... The installed matplotlib's own list is what a value is checked against, so a typo is

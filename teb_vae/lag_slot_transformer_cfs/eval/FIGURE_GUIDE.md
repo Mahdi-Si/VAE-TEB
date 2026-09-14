@@ -180,6 +180,20 @@ row is absent, and the block in the summary says so under `lag_family_present`.
 
 ---
 
+## The attributions
+
+Drawn into `eval_results/attribution/` by the stage that runs after the traces, from the forwards
+it re-reads and differentiates: five fixed-name figures (`attribution_maps`,
+`attribution_lag_profile`, `attribution_bands`, `attribution_layer`, `attribution_null`) and
+one `traces/<class>/<guid>_<subgroup>_attribution_trace` per traced recording. They are the
+family's shared figures and are documented, panel by panel, in the lag-attentive cells' figure
+guide under the same names. What differs here: the lag row of every figure is the **proposal
+norm**, qualified as the traces qualify it, and the layer figure's left panel is the per-lag
+split of the readout on the proposal head's output -- an attribution through the summation and
+the limiter, not an allocation -- drawn against the compensated lag axis rather than per head.
+
+---
+
 ## The acceptance pass
 
 Drawn into the directory `--figures` names, from the record after it is assembled.

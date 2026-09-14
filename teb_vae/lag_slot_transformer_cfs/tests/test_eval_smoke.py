@@ -157,6 +157,24 @@ def test_the_per_recording_traces_report_their_status_honestly(evaluated) -> Non
         assert block["reason"]
 
 
+def test_the_attributions_report_their_status_honestly(evaluated) -> None:
+    """The second post-pass stage: attributed with the structural checks exactly zero, or a skip
+    with its reason named -- never an error that lost the pass."""
+    from teb_vae.lag_slot_transformer_cfs.eval import attribution
+
+    summary, _path, _code = evaluated
+    block = summary["attribution"]
+
+    assert block["status"] in {attribution.STATUS_ATTRIBUTED, attribution.STATUS_SKIPPED}
+    assert "error" not in block
+    if block["status"] == attribution.STATUS_ATTRIBUTED:
+        assert block["failures"] == []
+        assert block["checks"]["after_anchor_max_abs"] == 0.0
+        assert block["checks"]["target_only"]["source_attr_max_abs"] == 0.0
+    else:
+        assert block["reason"]
+
+
 def test_the_matched_gap_carries_a_recording_level_interval(evaluated) -> None:
     """Recordings, not anchors.
 

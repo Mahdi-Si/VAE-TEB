@@ -105,6 +105,7 @@ Everything lands in `<run>/eval_results/`:
 | `collection.json` | The collection record: readouts, provenance sidecar, denominators, retention plan, the measured cost of the pass, and `target_keep_index` — the kept-channel axis the band-resolved readout joins through. |
 | `band_partition.json`, `band_channel_map.csv`, `band_channel_map_kept.csv` | The input channel map (the unskippable data-side step), on the declared axis and on the kept one. |
 | `<analysis>/…` | One subdirectory per analysis: its CSVs and PDFs. |
+| `attribution/…` | The Captum attributions: `attribution_rows.csv` (one row per attributed anchor, readout and baseline), the row-aligned `attribution_vectors.npz`, the per-recording, summary, band, lag-band, layer and null tables, the first map per class in `attribution_maps.npz`, and under `traces/<class>/` one arrays file and one figure per traced recording. |
 | `recording_traces/…` | The traced recordings: `recording_traces.csv` (the manifest), `segment_summary.csv` (one row per segment), `anchor_trace.parquet` (one row per decoded anchor), and per recording under its class directory the full vectors (`<guid>_<subgroup>_full.npz`) and the figure. |
 
 Three summary blocks matter more than the rest. The **headline** is a flat registry of scalars and
@@ -183,7 +184,7 @@ raises (`True` would silently cap at 1), and a cap of `0` raises.
 | `seed` | Seeds `random`/`numpy`/`torch` and derives the loader-shuffle, derangement, stratified-cap and Monte Carlo generators by fixed offsets. Two runs of one checkpoint at one seed compare byte-identical on `results`. |
 | `num_mc_samples` | Monte Carlo draws $K$ per anchor for the marginalised score, under common random numbers across branches. $K = 1$ is one draw of the same estimator, not the training-path score: under `base_decode: mean` the training path decodes the base branch at the prior mean, which the estimator never does. Convergence in $K$ is unmeasured (CFS-10). |
 | `max_samples` | Seeded **stratified** global sample cap; `null` evaluates the whole split. |
-| `caps` | Per-quantity retention caps (`waveforms`, `attention`, `pages`, `pages_per_class`, `oracle`). Retention is opt-in: a quantity absent from `caps` is retained for no samples — except `oracle`, where absence means every segment, because a probe fitted on nothing is not a cheaper measurement but no measurement. The first cap ships **halved** against the raw cells, at 64: a retained forecast set here is four $(136, 30, 98)$ fp32 tensors, about 6.1 MiB per segment against their 2.0 MiB. |
+| `caps` | Per-quantity retention caps (`waveforms`, `attention`, `pages`, `pages_per_class`, `oracle`, `traces_per_class`, `occlusion`, `attribution_segments`). Retention is opt-in: a quantity absent from `caps` is retained for no samples — except `oracle`, where absence means every segment, because a probe fitted on nothing is not a cheaper measurement but no measurement. The first cap ships **halved** against the raw cells, at 64: a retained forecast set here is four $(136, 30, 98)$ fp32 tensors, about 6.1 MiB per segment against their 2.0 MiB. |
 | `prior_shuffle_min_nats` | The provisional margin the prior-shuffle degradation must clear; the verdict always reports the measured number beside it. |
 | `min_active_dims` | Active latent dimensions below which the latent counts as collapsed. |
 | `event_lag_window_s` | Seconds after a detected contraction within which an anchor counts as event-conditioned. Still read here, because contraction-*conditioned* coupling ports even though the two readouts that scored a clinical trace do not; `lag_high_kl` reads the same window for its contraction enrichment of high-KL anchors, so the two analyses agree about what "near a contraction" means. |
@@ -764,6 +765,108 @@ Like `samples`, `sufficiency` and `occlusion`, this analysis reaches for `contex
 `context.loader`, and records a skip without them. A recording that fails is recorded by GUID with
 its error and the rest still trace. The figures are `recording_traces_summary.pdf` and one
 `<class>/<guid>_<subgroup>_trace.pdf` per recording — see `FIGURE_GUIDE.md`.
+
+### attribution
+
+**Which input coefficients, at which stored steps and which channels, drove the divergence, the
+forecast gain and the lag readout** — asked of the fitted computation itself, with gradient
+attribution, at a few anchors of a class-balanced draw of segments. Every other lag readout here is
+observational (`lag_kl`, `attention`) or interventional on one axis (`occlusion`); this one
+attributes a per-anchor scalar back over the three input streams $(y^{st}, y^{ph}, u)$ on the
+stored grid, at their declared widths. The design record is `ATTRIBUTION.md` beside this file; this
+section is the contract.
+
+**What is attributed.** A thin wrapper turns the dense forward into one scalar per sample at one
+anchor per sample: the divergence $K_t$; the **mean-decoded** block score of either branch and
+their gap (both branches decoded at $\mu$, no draw, so no reparameterisation noise enters any
+attributed number); one latent coordinate; and the model's own lag readout on a band — the
+head-averaged attention mass on the band here, the proposal norm on it in the lag-residual cell. A
+production pass attributes `kld` and `pred_gap` under both baselines, the lag readout on every
+`occlusion_bands` band and the anchor's largest per-coordinate divergence under the source-null
+baseline, at `ANCHORS_PER_SEGMENT` anchors spread evenly over each segment's scored anchors.
+
+**The two baselines, and why the path enters them from the side.** Under z-scoring an exact zero
+is the channel mean over the region the model reads, and the warm-up gate multiplies every
+not-yet-warm step by exactly zero, so a zero baseline changes nothing the model never read.
+`source_null` zeroes the source and holds both target streams fixed — the exact null arm
+`source_null` measures — so a source attribution under it is to source **content**; the
+availability announcement is a constant of $t$, identical on both ends of the path, and is
+attributable to no input. `all_zero` zeroes every stream and is the reference the target streams'
+own attribution is read on. Every encoder in the family normalises per step, and an exactly-zero
+stream is a degenerate point of that normalisation: on every tiny fixture the readout jumps by a
+finite amount between $\alpha = 0$ and $\alpha = 10^{-6}$ along the straight path, and integrated
+gradients from the exact zero do not converge at any step count. The integration therefore starts
+at $x_0 = b + 10^{-3}(x - b)$, where the completeness residual falls below $10^{-3}$ of the readout
+at the shipped step count, and every row records the readout at the exact baseline, at the entry
+point and at the input, so the **entry jump** $f(x_0) - f(b)$ is a reported scalar rather than a
+hidden one — it belongs to no input step.
+
+**Which Captum methods run here, and which do not.** Integrated gradients is the primary method;
+layer integrated gradients on the head-structured posterior's per-head fusion modules gives a
+complete per-head split under the source-null baseline; feature ablation grouped by lag band of
+the source relative to the anchor is `occlusion`'s intervention read on this analysis's readouts
+and anchors. `InputXGradient`, `Saliency`, `GradientShap`, sliding-window `Occlusion`,
+`LayerConductance` and `NeuronConductance` run and were not shipped; `DeepLift` runs but its
+rescale rule reaches only the module nonlinearities it hooks, so its completeness residual is of
+the order of the readout. The block's `methods` record carries each verdict with its reason.
+
+**Four structural properties are proved on the tiny models and measured on every real row.**
+Attribution to any stored step after the anchor is exactly zero (`checks.after_anchor_max_abs`);
+attribution to a source step a channel had not warmed up at is exactly zero
+(`checks.gated_off_max_abs`); the source attribution of a target-only readout — the base block
+score — is exactly zero (`checks.target_only`); and the integrated-gradient sum reproduces
+$f(x) - f(x_0)$ to within `checks.completeness_tolerance` of the readout on all but the rows
+`checks.n_rows_over_tolerance` counts. The conv-LSTM cell needs `causal_norm: true` for the first
+property, exactly as its own causality tests do; the transformer cells are step-wise causal by
+construction.
+
+**The reductions, all on per-recording units.** Per attributed anchor: the time profile per stream
+(summed over channels), the channel profile per stream (summed over steps), the **lag-aligned**
+source profile $q_\ell = p_{t_a - \ell}$ laid beside the model's own lag readout at that anchor on
+the compensated seconds axis with two agreement statistics (the Pearson correlation of $|q|$
+against the readout, and the Jensen–Shannon distance between the two normalised), the sum per
+frequency band through the declared-axis channel map `band_channel_map.csv` (the attributions live
+on the model's input axis, which is the declared width, so the join is through the declared map
+rather than the kept one the decoder-side readouts use), the sum per lag band, the per-head split,
+the band-ablation deltas, and the readout at the input, at the exact baseline and at the entry
+point. `attribution_rows.csv` is one row per attributed anchor, readout and baseline;
+`attribution_vectors.npz` the row-aligned profiles; `attribution_recordings.csv` the per-recording
+means the grouped variants fan over; `attribution_summary.csv`, `attribution_bands.csv`,
+`attribution_lag_bands.csv`, `attribution_layer.csv` and `attribution_null.csv` the reductions
+behind the five figures. The lag-band table joins `occlusion_summary.csv` where that pass ran in
+the directory — sign-flipped on the gap readout, because that pass reports the forecast **cost** of
+removing a band and the gap moves the other way — and the band table joins
+`spectral_skill_bands.csv` on the target bands; both dependencies are on files, recorded as absent
+when the file is.
+
+**The null decomposition.** For the divergence under the source-null baseline, the readout at the
+exact null is the availability-clock part (`kld_source_null` at that anchor), the integrated
+attribution is the source-content part, and the entry jump is what the normalisation does between
+the two; under the all-zero baseline the attribution splits between the target and the source
+streams. `attribution_null.csv` carries the per-class means and `attribution_null.pdf` draws them.
+
+**The trace.** One recording per class, drawn under the trace analysis's own seed so it is the
+first recording that analysis traced, is attributed at the same anchors of every one of its
+segments and drawn on the traces' shared figure: the lag-aligned attribution of $K_t$ as a heatmap
+over hours before delivery beside the model's own lag readout, the agreement, the totals and the
+values. `attribution_traces.csv` is its manifest; the figures are
+`attribution/traces/<class>/<guid>_<subgroup>_attribution_trace.pdf`.
+
+**The selection** is the traces' recording-level class-balanced seeded draw at an eligibility
+floor of one segment, one segment per drawn recording (its middle one by `epoch`), capped by
+`eval_config.caps.attribution_segments` — recording level rather than the pages' segment-level
+draw, because every summary here is over recordings and one segment per recording keeps every
+recording one unit. Absent, the cap means the analysis's own default rather than every segment:
+an attribution is tens of forwards and backwards per anchor, and the `cost` block records what the
+pass took so the cap is set from a measurement. It is `capped`, reads `context.task` and
+`context.loader` like `samples`, `sufficiency`, `occlusion` and `recording_traces`, and records a
+skip without them.
+
+**How this output is misread.** An attribution is a sensitivity of a fitted computation along one
+path from one baseline, not a causal claim about the physiology; the lag axis is
+stored-coefficient time; a source attribution under the source-null baseline is relative to the
+availability clock, which it can never contain; the classes are out of distribution; and every
+summary is over recordings. `ATTRIBUTION.md` carries the full list.
 
 ### warmup
 
@@ -1505,7 +1608,7 @@ catch, because nobody notices a paragraph that was never written.
 - **`preflight.py`** (*divergent*) The causal guard set: transform == 'causal' on every configured shard, the causal widths, causal_reach_budget_s refused outright, fhr_st/fhr_ph normalised in place of the raw 'fhr', guid added to the required load fields, the warm-up budget re-resolved against the evaluation shards and compared with the checkpoint's stamped tuples, and the lag-support margin measured and recorded rather than assumed. NOT_CAUSAL_STATEMENT is replaced -- the sibling's sentence says the inputs read their own future, which is false here and would be a false disclosure rather than a conservative one -- and the shared half of the causality record is wider, because the warm-up budget, the anchor geometry and the lag support belong to the target domain both cfs cells share rather than to either encoder. Also carries GUARD_RECOVERY, a machine-checked table the sibling keeps by hand in EVAL.md. Added since: second_stage_onset joins REQUIRED_EVAL_LOAD_FIELDS and is named in the refusal, which is the config half of the same guard the probe applies to a batch. No new guard function, so GUARD_RECOVERY is unchanged. The sibling carries the same addition.
 - **`probe.py`** (*divergent*) Two halves where the sibling has one. The population pass -- one loader iteration into loader_probe.json, and its four refusals -- is the sibling's, unchanged in behaviour, because it is what run.py and every population sanity check read. Added beside it is a forward-contract pass behind --checkpoint: this cell's forward takes five positional arguments and raises without a phase above stride 1, returns two keys the family's does not, and produces (B, A_max, H, C_keep) forecast tensors rather than (B, T_valid, H, R), so the readout module was written against a contract that was measured rather than read. It therefore loads a checkpoint, which makes this module layer 1 here and layer 0 in the sibling, and it refuses any geometry but the dense one so a contract measured at the training tiling cannot be reported. Added since: second_stage_onset is a required batch field in both halves, and the population pass reports its {n_values, n_nan} coverage beside time_from_labor_onset -- the loader skips a field it was asked for and the shard does not carry, silently, so without the requirement a missing field would present as a cohort with no second stage. The sibling carries the same addition.
 - **`report_seam.py`** (*divergent*) The mechanism is the sibling's, bound object for bound object. Three content differences: the headline registry drops the three coherence entries and reports the calibration gain per coefficient rather than per element of a 4 Hz trace; HEADLINE_VERDICTS carries ten rather than eight, adding coupling_exceeds_availability_clock and anchor_geometry_intact; and the sanity block drops the two cross-spectral checks, which describe an estimator this package does not have. PRED_GAP_CONVENTION states the 2940-coefficient block and that the likelihood percentage is budget-local.
-- **`run.py`** (*divergent*) Registers twenty-one analyses rather than seventeen, defaults to CFS_BINDING, records the dense anchor geometry and the training stride in run_context, and registers no coherence step.
+- **`run.py`** (*divergent*) Registers twenty-two analyses rather than seventeen, defaults to CFS_BINDING, records the dense anchor geometry and the training stride in run_context, and registers no coherence step.
 - **`spectra.py`** (*absent*) Not ported at all. It estimates cross-spectra from a 4 Hz raw residual; here a tau-slice gives 136 samples at 0.25 Hz per channel over band-limited envelopes, and the analysing filter's phase was discarded before the coefficient was stored. The frequency-resolved question is answered instead by spectral_skill, on the frequency axis the channels already carry.
 - **`verify.py`** (*divergent*) Gates the ten-verdict registry rather than eight, adding coupling_exceeds_availability_clock -- which ships INCONCLUSIVE because its threshold ships unset -- and anchor_geometry_intact. Its arm axes are this cell's four sweep arms (anchor_stride, warmup_period, horizon, horizon_depth) rather than the sibling's five, the horizon section carries a refusal rather than a reading rule because a block score is per anchor over H*C_keep coefficients, and it renders a cross-cell table against the transformer cfs cell where the sibling renders none. Two smaller divergences: the kept-channel column is dropped, because the warm-up budget is fixed across all four arms and the column would be constant -- the anchor count and the warm fraction are what these arms move -- and the collapse verdict is reported UNKNOWN unless both per-epoch series are present, where the sibling answers with clause 1 alone and renders the result as 'no'.
 - **`analyses/attention.py`** (*divergent*) The attainable entropy ceiling is MEASURED against preflight's own lag_support_margin_steps rather than assumed: three readings of one property -- the recorded margin, the geometry record's truncated-anchor count and the accumulated ceiling against log L -- are compared and their agreement recorded. The truncation accounting is keyed on anchor_floor rather than on a warm-up prefix, because nothing below the floor is decoded at all here; the lag axis is relabelled stored-coefficient time and the group-delay caveat is printed under both figures.
