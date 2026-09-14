@@ -121,6 +121,7 @@ def run_attribution(
         eval_config=eval_config, results_dir=results_dir,
         lag_seconds=lag_axis.compensated_seconds_axis(int(model.n_lags), 0),
         break_after_s=lag_axis.break_tolerance_s({"geometry": dict(geometry_record or {})}),
+        segment_stride_s=lag_axis.segment_stride_s({"geometry": dict(geometry_record or {})}),
         channel_map=attribution_pass.read_channel_map(results_dir),
         occlusion=None,
         spectral=None,

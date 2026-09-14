@@ -8,7 +8,7 @@ step after the anchor, none to a source step a channel had not warmed up at, non
 to a target-only readout, and the integrated-gradient sum reproduces the readout difference from
 the entry point. **The reductions are the arithmetic they claim** -- the lag re-indexing, the band
 sums, the agreement, the per-head split. **The selection is class-balanced, one segment per
-recording, seeded and capped**, and the traced recording is the one the trace analysis traced.
+recording, seeded and capped**, and the traced recording is the most complete one of its class.
 
 The end-to-end test drives the analysis through the same stub dataset the traces' test uses, at a
 reduced step count, so the whole path -- selection, the sequential subset loader, the identity
@@ -27,7 +27,7 @@ import pandas as pd
 import pytest
 import torch
 
-from teb_vae.lag_attn_cfs.eval import attribution_pass, traces
+from teb_vae.lag_attn_cfs.eval import attribution_pass
 from teb_vae.lag_attn_cfs.eval import attributions as core
 from teb_vae.lag_attn_cfs.eval._reuse import labels
 from teb_vae.lag_attn_cfs.eval.analyses import AnalysisContext
@@ -315,17 +315,49 @@ def test_the_selection_draws_one_middle_segment_per_recording_class_balanced_and
     assert list(again["guid"]) == list(chosen["guid"])
 
 
-def test_the_traced_recording_is_the_first_the_trace_analysis_traces() -> None:
-    segments = _segments({"healthy": 6, "acidosis": 3, "hie": 2})
+def test_completeness_counts_the_segments_a_window_could_hold_against_the_ones_it_does() -> None:
+    """Six-segment tiling over the last two hours at a twenty-minute stride is seven slots; a
+    recording with one slot missing scores below the full one, and the window is the bound when
+    the run sets it and the recording's own span otherwise."""
+    full = [-7200.0 + STRIDE_S * k for k in range(7)]
+    holed = [value for value in full if value != -3600.0]
+    index_map = {("full", int(e)): i for i, e in enumerate(full)}
+    index_map.update({("holed", int(e)): 100 + i for i, e in enumerate(holed)})
+    index_map[("old", -20000)] = 200
+    index_map[("old", -20000 + int(STRIDE_S))] = 201
+
+    bounded = attribution_pass.recording_completeness(index_map, stride_s=STRIDE_S, window_hours=2.0).set_index("guid")
+    unbounded = attribution_pass.recording_completeness(index_map, stride_s=STRIDE_S, window_hours=None).set_index("guid")
+
+    assert bounded.loc["full", "coverage"] == 1.0 and bounded.loc["full", "n_expected"] == 7
+    assert bounded.loc["holed", "coverage"] == pytest.approx(6 / 7)
+    assert bounded.loc["old", "n_in_window"] == 0 and bounded.loc["old", "coverage"] == 0.0
+    # Over its own span the old recording tiles perfectly, and the holed one still shows the hole.
+    assert unbounded.loc["old", "coverage"] == 1.0
+    assert unbounded.loc["holed", "coverage"] == pytest.approx(6 / 7)
+
+
+def test_the_traced_recording_is_the_most_complete_of_its_class_and_ties_break_by_name() -> None:
+    segments = _segments({"healthy": 3, "acidosis": 2, "hie": 2})
     index_map = {(row["guid"], int(row["epoch"])): index for index, (_, row) in enumerate(segments.iterrows())}
-    recordings = attribution_pass.recording_table(segments, index_map)
+    # Knock the middle segment out of every recording but one per class; drop a healthy one to
+    # a single segment, which makes it ineligible however complete it is.
+    for guid in ("healthy00", "healthy02", "acidosis01", "hie00"):
+        index_map.pop((guid, int(-7200.0 + STRIDE_S)))
+    index_map.pop(("healthy02", int(-7200.0)))
 
-    ours, _ = attribution_pass.select_trace_recordings(segments, index_map, seed=5)
-    theirs, _ = traces.select_recordings(recordings, per_class=traces.DEFAULT_TRACES_PER_CLASS, seed=5 + traces.TRACE_DRAW_SEED_OFFSET)
+    chosen, accounting = attribution_pass.select_trace_recordings(segments, index_map, stride_s=STRIDE_S, window_hours=None)
 
-    assert len(ours) == 3
-    for name in ("healthy", "acidosis", "hie"):
-        assert ours[ours[labels.CLASS_COLUMN] == name]["guid"].iloc[0] in set(theirs[theirs[labels.CLASS_COLUMN] == name]["guid"])
+    assert list(chosen["guid"]) == ["hie01", "acidosis00", "healthy01"]
+    assert (chosen["coverage"] == 1.0).all()
+    assert accounting["classes"]["healthy"] == {"n_recordings": 3, "n_eligible": 2, "n_selected": 1, "coverage": [1.0]}
+    assert accounting["window_hours"] is None and accounting["segment_stride_s"] == STRIDE_S
+    # With every recording equally complete the identifier decides, so two runs agree.
+    tied, _ = attribution_pass.select_trace_recordings(
+        segments, {(row["guid"], int(row["epoch"])): index for index, (_, row) in enumerate(segments.iterrows())},
+        stride_s=STRIDE_S, window_hours=None,
+    )
+    assert list(tied["guid"]) == ["hie00", "acidosis00", "healthy00"]
 
 
 # =================================================================================================

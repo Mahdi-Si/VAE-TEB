@@ -305,6 +305,17 @@ which on a GPU is minutes rather than the collection pass's hours, and absent it
 analysis's own default rather than every segment. The trace adds one recording per class at the
 same anchors of every segment, `kld` under `source_null` only.
 
+**Which recording is traced.** Not a random draw: per class, the recording whose stored segments
+most completely fill the window — the last `max_hours_before_delivery` hours when the run sets
+that key, the recording's own span otherwise — measured as the segments the dataset holds inside
+the window over the number the window could hold at the segment stride the geometry implies
+(`attribution_pass.recording_completeness`). Ties break on the segment count and then on the
+identifier, so two runs trace the same recording, and a recording with fewer than two segments
+inside the window is never chosen. The block's `trace_selection` records each chosen recording's
+coverage. A completeness ranking is content-blind by design: it does not look at the uterine
+activity or the decelerations, so the traced recording is the one with the fewest holes, not the
+one where the source is most active.
+
 ## 9. Fixture findings
 
 Measured on the tiny models the suites build, so evidence about the **machinery** and about
