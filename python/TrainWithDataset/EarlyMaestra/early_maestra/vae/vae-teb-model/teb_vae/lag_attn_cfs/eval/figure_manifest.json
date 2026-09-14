@@ -5,6 +5,13 @@
       "attention_profile.pdf",
       "lag_heatmap.pdf"
     ],
+    "attribution": [
+      "attribution_bands.pdf",
+      "attribution_lag_profile.pdf",
+      "attribution_layer.pdf",
+      "attribution_maps.pdf",
+      "attribution_null.pdf"
+    ],
     "coupling": [
       "pred_gap_distribution.pdf",
       "pred_gap_percent.pdf"
@@ -114,6 +121,10 @@
     "recording_traces": {
       "pattern": "recording_traces/<class>/<guid>_<subgroup>_trace.pdf",
       "guide_marker": "The per-recording traces"
+    },
+    "attribution_traces": {
+      "pattern": "attribution/traces/<class>/<guid>_<subgroup>_attribution_trace.pdf",
+      "guide_marker": "The per-recording attribution traces"
     }
   }
 }

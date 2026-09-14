@@ -113,6 +113,7 @@ from teb_vae.lag_attn_cfs.eval.run import (  # noqa: E402
 from teb_vae.lag_attn_rws.nets.raw_masks import forecast_mask  # noqa: E402
 from teb_vae.lag_attn.eval.numerics import configure_numerics  # noqa: E402
 from teb_vae.lag_slot_transformer_cfs.eval import figures, lag_metrics  # noqa: E402
+from teb_vae.lag_slot_transformer_cfs.eval import attribution  # noqa: E402
 from teb_vae.lag_slot_transformer_cfs.eval import recording_traces  # noqa: E402
 from teb_vae.lag_slot_transformer_cfs.eval.binding import (  # noqa: E402
     ANALYSES_THIS_ARCHITECTURE_CANNOT_PRODUCE,
@@ -1532,6 +1533,44 @@ def run_traces(
         return {"status": "FAILED", "error": f"{type(error).__name__}: {error}"}
 
 
+def run_attributions(
+    task: Any,
+    loader: Any,
+    identities: Any,
+    *,
+    config: Mapping[str, Any],
+    eval_config: Mapping[str, Any],
+    results_dir: Any,
+) -> Dict[str, Any]:
+    """Run the Captum attributions inside a failure-isolating guard.
+
+    The stage re-reads a class-balanced draw of segments through the loader after the pass has
+    finished and attributes three per-anchor readouts over the input streams; a failure in it
+    must not lose the pass, so it is recorded under ``attribution.error`` and the summary is
+    written regardless.
+
+    Args:
+        task: The loaded task.
+        loader: The evaluation dataloader.
+        identities: The scored segments' identities the pass recorded.
+        config: The merged run configuration, for the channel map the stage builds.
+        eval_config: The validated evaluation settings.
+        results_dir: The run's results directory.
+
+    Returns:
+        The stage's block, or the error.
+    """
+    try:
+        return attribution.run_attribution(
+            task, loader, identities,
+            config=config, eval_config=dict(eval_config), results_dir=results_dir,
+            geometry_record={"t": int(task.orig_model.geometry.t)},
+        )
+    except Exception as error:  # noqa: BLE001 - lost attributions must not lose the run
+        logger.exception("the attributions failed; the summary is complete without them")
+        return {"status": "FAILED", "error": f"{type(error).__name__}: {error}"}
+
+
 def render_figures(results: Mapping[str, Any], results_dir: Any) -> Dict[str, Any]:
     """Draw every figure of the run from the assembled summary, inside a failure-isolating guard.
 
@@ -1614,9 +1653,17 @@ def main(
     # After the pass, from the identities it recorded: a class-balanced draw of recordings
     # re-read segment by segment. Its own directory beside the tables, its own block in the
     # summary, and a failure inside it costs the traces rather than the pass.
+    identities = results.pop(SEGMENT_IDENTITIES_KEY)
     results["recording_traces"] = run_traces(
-        task, loader, results.pop(SEGMENT_IDENTITIES_KEY),
+        task, loader, identities,
         eval_config=eval_config, results_dir=results_dir,
+    )
+    # The same identities, a second post-pass stage: gradient attributions of the divergence, the
+    # gap and the proposal norm over the input streams, into their own directory and their own
+    # block, and a failure inside it costs the attributions rather than the pass.
+    results["attribution"] = run_attributions(
+        task, loader, identities,
+        config=config, eval_config=eval_config, results_dir=results_dir,
     )
     table = results[PER_RECORDING_KEY]
     write_per_recording_table(results_dir / PER_RECORDING_FILENAME, table)

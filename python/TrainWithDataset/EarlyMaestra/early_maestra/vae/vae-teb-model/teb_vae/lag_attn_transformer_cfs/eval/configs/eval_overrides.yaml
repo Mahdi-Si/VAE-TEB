@@ -254,6 +254,13 @@ eval_config:
   #              10  recordings per clinical class, each re-read through every one of its
   #                  segments. A recording is tens of segments, so this is a few hundred
   #                  forwards per class with no Monte Carlo decode -- small beside the pass.
+  #   attribution_segments
+  #              24  SEGMENTS the Captum attribution analysis attributes, one per drawn recording
+  #                  in a class-balanced draw, a few anchors each. Not a retention cap: it bounds
+  #                  a pass of tens of forward-and-backward passes per anchor, readout and
+  #                  baseline, and the analysis's cost block records what it took so the number is
+  #                  set from a measurement. Absent means the analysis's own default, not every
+  #                  segment.
   #
   # `oracle` stays ABSENT on purpose, and that is not an oversight: it is the one cap whose absence
   # means EVERY segment, so naming a number here would REDUCE what the sufficiency probe is fitted
@@ -264,6 +271,7 @@ eval_config:
     pages: 24
     pages_per_class: 10
     traces_per_class: 10
+    attribution_segments: 24
     # NOT a retention cap: it bounds how many segments the input-level occlusion readout
     # re-encodes. That analysis costs one encode plus one single-anchor decode PER BAND per batch,
     # and it scores one anchor per segment, so the honest denominator is segments rather than
