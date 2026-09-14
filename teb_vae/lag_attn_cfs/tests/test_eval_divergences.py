@@ -86,6 +86,13 @@ CELL_SPECIFIC_MODULES: Tuple[str, ...] = (
     # so the traces could reuse it. The sibling keeps the same functions inside its pages
     # analysis, where nothing else needs them.
     "dataset_rows.py",
+    # Gradient attributions of the per-anchor readouts over the input coefficients: the
+    # Captum wrapper and reductions, the pass both cfs cells and the lag-slot cell share, and
+    # the registered analysis. Cell-specific because the sibling has no warm-up gate, no
+    # source-null arm and no stored-coefficient lag axis to attribute against.
+    "attributions.py",
+    "attribution_pass.py",
+    "analyses/attribution.py",
     # How far apart two per-lag distributions are. Cell-specific for lag_shape's reason and for
     # the same one: the transport distance is quoted in seconds on the compensated axis, which is
     # this cell's axis, so a sibling counterpart would be measuring on a different ruler.

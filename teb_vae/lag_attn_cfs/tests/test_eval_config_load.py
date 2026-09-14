@@ -195,6 +195,10 @@ def test_the_waveform_cap_is_halved_and_the_oracle_cap_stays_absent(overrides) -
     ``traces_per_class`` is a recording count, PER CLASS, and bounds a re-read of those recordings'
     segments after the pass rather than any retention -- pinned beside the page caps for the same
     reason ``pages_per_class`` is.
+
+    ``attribution_segments`` is a segment cap like ``occlusion``'s and bounds a pass of gradient
+    attributions -- tens of forward-and-backward passes per anchor -- rather than any retention;
+    it is the smaller of the two because each of its segments costs an order of magnitude more.
     """
     caps = overrides["eval_config"]["caps"]
 
@@ -204,6 +208,7 @@ def test_the_waveform_cap_is_halved_and_the_oracle_cap_stays_absent(overrides) -
         "pages": 24,
         "pages_per_class": 10,
         "traces_per_class": 10,
+        "attribution_segments": 24,
         "occlusion": 512,
     }
     assert "oracle" not in caps

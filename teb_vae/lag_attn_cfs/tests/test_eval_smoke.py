@@ -68,6 +68,13 @@ FAMILIES: Dict[str, Dict[str, str]] = {
         "pattern": "recording_traces/<class>/<guid>_<subgroup>_trace.pdf",
         "guide_marker": "The per-recording traces",
     },
+    # One attribution trace figure per traced recording, under its class directory inside the
+    # attribution analysis's own trace directory; the five fixed-name figures beside it are
+    # listed as figures.
+    "attribution_traces": {
+        "pattern": "attribution/traces/<class>/<guid>_<subgroup>_attribution_trace.pdf",
+        "guide_marker": "The per-recording attribution traces",
+    },
 }
 
 #: The durable artifact set, by name: the summary and its heartbeat, the two preflight-side
@@ -105,6 +112,8 @@ def observed_figures(results_dir: Path) -> Dict[str, List[str]]:
         # The per-recording trace figures sit one level down, under their class directory;
         # the analysis's own fixed-name figure at the top level is still listed.
         if relative.startswith("recording_traces/") and relative.count("/") > 1:
+            continue
+        if relative.startswith("attribution/traces/"):
             continue
         if pdf.name.endswith(GROUPED_SUFFIXES):
             continue

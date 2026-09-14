@@ -52,7 +52,22 @@ One pass:
    against the rows it was built from, and the block `recording_traces` in the summary carries
    the status, the selection accounting, the manifest and whether the lag family was present
    at all — it is not on the comparator's normalised fusion nor on the target-only arm. A
-   failure inside the stage is recorded under `recording_traces.error` and the pass completes.
+   failure inside the stage is recorded under `recording_traces.error` and the pass completes;
+7. **after** the traces, a second post-pass stage attributes three per-anchor readouts — the
+   divergence, the mean-decoded forecast gap and the proposal norm on each configured lag
+   band — back over the three input streams with Captum integrated gradients, at a few anchors
+   of a class-balanced draw of up to `eval_config.caps.attribution_segments` segments, under a
+   source-null baseline (the source zeroed, the target streams held) and an all-zero one; it
+   takes the per-lag split on the proposal head's output, ablates the source band by band, and
+   follows one recording per class through every segment. The tables, the five figures and the
+   trace directory under `attribution/` are the family's shared ones, and the design record,
+   the baseline decision, the method verdicts and the ways the output is misread are in
+   `teb_vae/lag_attn_cfs/eval/ATTRIBUTION.md`. The lag readout attributed here is the proposal
+   norm, qualified on every artifact exactly as the traces qualify it; the per-lag split is an
+   attribution through the summation and the limiter and not an allocation; and none of the
+   names written is one the acceptance gate refuses. The block `attribution` in the summary
+   carries the status, the measured structural checks and the cost, and a failure inside the
+   stage is recorded under `attribution.error` and the pass completes.
 
 The summary's `scored_split` block names the files the pass opened, the statistics it standardised
 with, their common parent and a digest of the recordings that came back. That block and that table
@@ -419,6 +434,7 @@ its own output rather than from a shell history.
 | `eval_config.occlusion_bands` | The lag bands the suppression readout removes, inclusive, in stored steps back from the anchor |
 | `eval_config.caps.lag_profile` | How many segments the single-lag predictive profile is scored on; absent skips it and the summary says so |
 | `eval_config.caps.traces_per_class` | How many recordings the per-recording traces follow per clinical class, each through every segment the dataset holds for it; absent means the family default |
+| `eval_config.caps.attribution_segments` | How many segments the Captum attribution stage attributes after the pass, one per drawn recording; absent means the family default |
 | `eval_config.figure_format` | The format every figure is written in; `null` keeps the family's default |
 | `eval_config.max_samples` | A cap on the segments the pass sees; `null` evaluates the whole split |
 | `general_config.batch_size.test` | The loader's batch size; it also decides how often a batch admits a cross-recording pairing |

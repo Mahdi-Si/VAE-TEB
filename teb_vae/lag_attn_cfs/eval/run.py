@@ -133,6 +133,9 @@ from teb_vae.lag_attn_cfs.eval.analyses import lag_kl as lag_kl_analysis  # noqa
 from teb_vae.lag_attn_cfs.eval.analyses import (  # noqa: E402
     recording_traces as recording_traces_analysis,
 )
+from teb_vae.lag_attn_cfs.eval.analyses import attribution as attribution_analysis  # noqa: E402
+from teb_vae.lag_attn_cfs.eval.analyses import attribution as attribution_analysis  # noqa: E402
+from teb_vae.lag_attn_cfs.eval.analyses import attribution as attribution_analysis  # noqa: E402
 from teb_vae.lag_attn_cfs.eval.analyses import latent as latent_analysis  # noqa: E402
 from teb_vae.lag_attn_cfs.eval.analyses import (  # noqa: E402
     perm_control as perm_control_analysis,
@@ -254,6 +257,10 @@ ANALYSIS_FUNCTIONS: Dict[str, Any] = {
     # Beside the pages, because it is the other analysis that re-reads segments through the
     # loader: a class-balanced draw of recordings followed through every one of their segments.
     "recording_traces": recording_traces_analysis.run_recording_traces_analysis,
+    # The third analysis that re-reads segments through the loader: gradient attributions of
+    # the divergence, the forecast gap and the lag readout over the input coefficients, at a
+    # few anchors of a class-balanced draw of segments, plus the same along a traced recording.
+    "attribution": attribution_analysis.run_attribution_analysis,
     "cross_subgroup": cross_subgroup_analysis.run_cross_subgroup_analysis,
 }
 
@@ -1986,6 +1993,13 @@ RUN_ARGS: Dict[str, Any] = {
     #                     segments in time order: the latent, its parameters, the divergence and
     #                     the lag readouts at every decoded anchor (full) and per segment
     #                     (summary), with one figure per recording. Needs a checkpoint.
+    #   attribution:      Which input coefficients, at which stored steps and channels, drove
+    #                     the divergence, the forecast gap and the lag readout: Captum
+    #                     integrated gradients at a few anchors of a class-balanced draw of
+    #                     segments, under the source-null and the all-zero baselines, with
+    #                     the lag-aligned, band-resolved and per-head reductions, the band
+    #                     ablation, and the same along one traced recording per class.
+    #                     Needs a checkpoint.
     #   warmup:           What the causal front end cost. The gap by warm-up tertile, the source
     #                     lag warmth, and the two FAIL-able geometry guards.
     #   source_null:      How much of the coupling readout survives zeroing the source -- the
