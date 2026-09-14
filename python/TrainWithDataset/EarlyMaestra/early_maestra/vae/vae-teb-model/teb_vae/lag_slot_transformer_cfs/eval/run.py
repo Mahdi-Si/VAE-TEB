@@ -34,12 +34,30 @@ the selectors-off arm's margin is exactly zero and the empty-band arm's is exact
 of those zeros is then evidence that the intervention path and the forward path are one computation
 rather than two that nearly agree.
 
+**Three axes beyond the block score, all under the same draws.** Every scored arm is additionally
+resolved by horizon step and by stored target block, so a source that informs the first predicted
+step and not the last, or the scattering block and not the phase-harmonic one, is a statement the
+run can make. And on the recommended fusion the lag axis is read at every single lag: cheaply in
+latent space for the whole split, and as a predictive margin on a capped number of segments, where
+each lag's proposals are removed alone and the arm is scored under the same draws as every other.
+The single-lag margins are read **after** the band and joint removals, which is the order the
+design fixes: a single-lag peak read off a window whose joint removal does nothing is noise.
+
+**Every margin travels with a paired interval.** Two arms scored on the same recordings under the
+same draws differ per recording, so the interval on their margin is the interval of those
+differences, drawn once over recordings, and not two overlapping intervals of the two arms.
+
 **What a reader must not take from the output.** The band margins do not decompose the gap and are
 not normalised to; the qualification travels in the artifact beside them. A band with no available
 source is recorded as missing rather than as a measured zero. And a positive source margin is
 necessary rather than sufficient: the whole reason this architecture exists is a checkpoint whose
 source-conditioned branch was a **worse** predictive density than its target-only one, so the
 headline is the gap against the internal base, and its sign is the first thing to read.
+
+**The figures are drawn from the summary, never from the tensors.** Every figure the pass writes
+is built from the blocks the summary carries and the tables beside it, so a figure and the number
+it illustrates cannot disagree, and the same figures can be redrawn from a finished directory on a
+box with no checkpoint and no shard.
 """
 from __future__ import annotations
 
@@ -63,12 +81,14 @@ _REPO_ROOT = os.path.dirname(
 if not __package__ and _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
+import numpy as np  # noqa: E402
 import torch  # noqa: E402
 from loguru import logger  # noqa: E402
 
 from teb_vae.lag_attn.config import load_config  # noqa: E402
 from teb_vae.lag_attn.eval.report import SUMMARY_FILENAME, json_safe  # noqa: E402
 from teb_vae.lag_attn.eval.stats import bootstrap_ci  # noqa: E402
+from teb_vae.lag_attn.nets.lag_report import SECONDS_PER_STEP  # noqa: E402
 from teb_vae.lag_attn_cfs.eval.config_schema import (  # noqa: E402
     force_single_process_loader,
     merge_eval_overrides,
@@ -92,7 +112,7 @@ from teb_vae.lag_attn_cfs.eval.run import (  # noqa: E402
 )
 from teb_vae.lag_attn_rws.nets.raw_masks import forecast_mask  # noqa: E402
 from teb_vae.lag_attn.eval.numerics import configure_numerics  # noqa: E402
-from teb_vae.lag_slot_transformer_cfs.eval import lag_metrics  # noqa: E402
+from teb_vae.lag_slot_transformer_cfs.eval import figures, lag_metrics  # noqa: E402
 from teb_vae.lag_slot_transformer_cfs.eval.binding import (  # noqa: E402
     ANALYSES_THIS_ARCHITECTURE_CANNOT_PRODUCE,
     EXCLUDED_ANALYSES,
@@ -134,6 +154,33 @@ CALIBRATED_BRANCHES: Tuple[str, ...] = ("base", "full")
 #: tell the interventions apart from the two matched branches without a second list to keep aligned.
 SUPPRESSION_PREFIX = "suppress:"
 
+#: Prefix that marks a scored arm as the suppression of one single lag. These arms are scored in the
+#: same draw loop as every other on the segments the profile cap admits, and they reach the summary
+#: as one per-lag curve rather than as one column each: a table with one column per candidate lag
+#: would be unreadable and would put the fine profile on the same footing as the declared bands,
+#: which the design reads first.
+LAG_ARM_PREFIX = "lag:"
+
+#: The cap name under ``eval_config.caps`` that bounds how many segments the single-lag predictive
+#: profile is scored on. Absent means the profile is skipped and recorded as such, matching the
+#: family's rule that retention is opt-in; the committed delta sets it.
+LAG_PROFILE_CAP = "lag_profile"
+
+#: The source controls, and the column each one's margin is taken from. One place, read by the
+#: block that reports them, so the control names in the summary and the columns in the table
+#: cannot drift apart.
+CONTROL_COLUMNS: Mapping[str, str] = {
+    "silence": "nll_silence",
+    "replace_zeros": "nll_replace:zeros",
+    "replace_constant": "nll_replace:constant",
+    "permute": "nll_permute",
+}
+
+#: The two stored target blocks, in the order the kept channel axis carries them: the scattering
+#: coefficients first, the phase-harmonic coefficients after. Named as the configuration names
+#: their weights, so a reader can match a block to the weight it was trained under.
+TARGET_BLOCKS: Tuple[str, ...] = ("st", "ph")
+
 #: The per-recording table, written beside the summary as the siblings' passes write theirs.
 #:
 #: The summary carries each column's interval; this carries the values those intervals were built
@@ -144,10 +191,23 @@ SUPPRESSION_PREFIX = "suppress:"
 #: scored.
 PER_RECORDING_FILENAME = "per_recording.csv"
 
+#: The per-lag table: one row per candidate lag, carrying the exposure, the latent profile and
+#: the predictive margin with its interval. What the lag figures are drawn from.
+LAG_PROFILE_FILENAME = "lag_profile.csv"
+
+#: The horizon-resolved table: one row per scored arm and horizon step, with the interval.
+HORIZON_FILENAME = "horizon_resolved.csv"
+
 #: Key the assembled results carry the table under, popped before the summary is serialised. The
 #: table is a file of its own because it grows with the split while everything else in the summary
 #: is a fixed handful of blocks.
 PER_RECORDING_KEY = "per_recording_table"
+
+#: Key the assembled results carry the per-recording **curves** under -- one vector per recording
+#: per resolved quantity. Popped with the table: the curves are what the resolved blocks and the
+#: lag profile were bootstrapped from, and they are written out as the two tables above rather
+#: than carried in the summary.
+PER_RECORDING_CURVES_KEY = "per_recording_curves"
 
 
 def build_run_config(checkpoint: Any, overrides: Optional[Any] = None) -> Dict[str, Any]:
@@ -172,6 +232,33 @@ def build_run_config(checkpoint: Any, overrides: Optional[Any] = None) -> Dict[s
     return force_single_process_loader(merged)
 
 
+def kept_block_split(model: Any) -> Optional[int]:
+    r"""Where the second stored target block begins on the **kept** channel axis.
+
+    The keep-index is positional into the declared stream, and the survivors are not contiguous,
+    so the boundary is counted rather than taken from the declared split: it is how many kept
+    channels lie below the declared boundary. ``None`` on a model whose kept axis holds one block
+    only, where a split would leave the other block's score as a row of zeros.
+
+    Args:
+        model: The rebuilt net.
+
+    Returns:
+        The kept-position boundary, or ``None``.
+    """
+    declared_split = getattr(model, "TARGET_BLOCK_SPLIT", None)
+    if declared_split is None:
+        return None
+    gate = getattr(model, "target_gate", None)
+    declared = (
+        torch.arange(int(model.c_y)) if gate is None else gate.keep_index.detach().cpu()
+    )
+    first = int((declared < int(declared_split)).sum())
+    if not 0 < first < int(declared.numel()):
+        return None
+    return first
+
+
 def intervened_branches(
     model: Any,
     outputs: Mapping[str, torch.Tensor],
@@ -180,6 +267,7 @@ def intervened_branches(
     *,
     recordings: Optional[Sequence[str]],
     perm_generator: Optional[torch.Generator],
+    single_lags: bool = False,
 ) -> Tuple[Dict[str, Tuple[torch.Tensor, torch.Tensor]], Dict[str, Any]]:
     r"""Build every scored arm's latent parameters from one matched forward.
 
@@ -198,6 +286,10 @@ def intervened_branches(
     are skipped whole on the arm that withholds its source values, where neither is an intervention
     at all.
 
+    The single-lag arms are the band arms at the finest partition and come from the same cached
+    subtraction. They exist only on the local fusion: on the normalised aggregation each would be
+    one more forward per lag, and the reading would be a different quantity in any case.
+
     Args:
         model: The net.
         outputs: The matched forward's dict, taken with ``return_proposals=True``.
@@ -205,6 +297,7 @@ def intervened_branches(
         masks: ``{band: (L,) bool}`` removal masks, including the two reference arms.
         recordings: One recording identifier per sample, or ``None`` when the batch carries none.
         perm_generator: Generator for the cross-recording pairing.
+        single_lags: Whether to add one suppression arm per candidate lag.
 
     Returns:
         ``(branches, record)``. *branches* maps an arm name to its ``(mu, logvar)``; *record* holds
@@ -233,7 +326,7 @@ def intervened_branches(
                 "intervene on: the full distribution IS the prior and the divergence is exactly "
                 "zero by construction."
             )
-            for arm in ("suppress", "silence", "replace", "permute")
+            for arm in ("suppress", "silence", "replace", "permute", "lag_profile")
         }
         return branches, record
 
@@ -265,6 +358,24 @@ def intervened_branches(
             suppressed["mu_post"],
             suppressed["logvar_post"],
         )
+
+    # The finest partition of the same intervention, one lag at a time, from the same cached
+    # subtraction. Read after the bands rather than instead of them.
+    if single_lags:
+        if local_fusion and "mean_proposals" in outputs:
+            n_lags = int(model.n_lags)
+            for lag in range(n_lags):
+                removed = torch.zeros(n_lags, dtype=torch.bool, device=u_stream.device)
+                removed[lag] = True
+                single = controls.suppressed_parameters(model, outputs, removed)
+                branches[f"{LAG_ARM_PREFIX}{lag}"] = (single["mu_post"], single["logvar_post"])
+        else:
+            record["skipped"]["lag_profile"] = (
+                "this checkpoint aggregates its lags with a normalised distribution, which "
+                "produces no per-lag update to remove alone; a single-lag profile there would be "
+                "one re-run forward per lag and a different quantity from the local fusion's "
+                "under the same name. The declared bands are the lag readout on this arm."
+            )
 
     # The selectors-off arm. It verifies the equality invariant and nothing else, and it is scored
     # rather than asserted so that the invariant is checked on the same numbers a margin is read
@@ -343,6 +454,8 @@ def score_batch(
     num_samples: int,
     mc_generator: Optional[torch.Generator],
     perm_generator: Optional[torch.Generator],
+    lag_profile: bool = False,
+    block_split: Optional[int] = None,
 ) -> Dict[str, Any]:
     r"""Run one batch: one forward, every arm, one draw loop.
 
@@ -355,12 +468,17 @@ def score_batch(
         num_samples: Monte Carlo draws $K$.
         mc_generator: Generator for the latent draws.
         perm_generator: Generator for the cross-recording pairing.
+        lag_profile: Whether this batch also scores one suppression arm per candidate lag, under
+            the same draws as every other arm.
+        block_split: The kept-position boundary between the two stored target blocks, for the
+            block-resolved scores; ``None`` resolves the horizon axis alone.
 
     Returns:
-        The batch's record: per-sample scores per arm, the guids that weight them, and the
-        exposure, cancellation and calibration **sums** the pass accumulates. Sums rather than
-        means, so the reported figure is a mean over the whole split rather than a mean of
-        per-batch means, which would weight a short batch equally with a full one.
+        The batch's record: per-sample scores per arm, the per-sample curves the resolved axes are
+        built from, the guids that weight them, and the exposure, cancellation, latent-profile and
+        calibration **sums** the pass accumulates. Sums rather than means, so the reported figure
+        is a mean over the whole split rather than a mean of per-batch means, which would weight a
+        short batch equally with a full one.
     """
     model = task.orig_model
     likelihood = str(task.hparams.get("likelihood", "gaussian_nll"))
@@ -391,8 +509,13 @@ def score_batch(
         masks,
         recordings=recordings,
         perm_generator=perm_generator,
+        single_lags=lag_profile,
     )
 
+    # Every arm but the single-lag ones is resolved by horizon step and by block: a single-lag arm
+    # is scored for one margin and nothing else, and resolving each of them would multiply the
+    # cheapest part of the loop by the lag count for a curve nobody reads.
+    resolved = tuple(name for name in branches if not name.startswith(LAG_ARM_PREFIX))
     scored = matched_predictive_scores(
         model,
         branches,
@@ -406,17 +529,26 @@ def score_batch(
         # this same object.
         persistence=outputs.get("persistence"),
         calibrate=CALIBRATED_BRANCHES,
+        resolve=resolved,
+        block_split=block_split,
     )
     contributing = scored["base"].contributing
     weights = contributing.to(torch.float64)
     per_sample_anchors = weights.sum(dim=1)
 
     def per_sample(values: torch.Tensor) -> torch.Tensor:
-        """Average a per-anchor quantity within each sample, over its scored anchors."""
-        return (values.to(torch.float64) * weights).sum(dim=1) / per_sample_anchors.clamp_min(1.0)
+        """Average a per-anchor quantity within each sample, over its scored anchors.
+
+        Works on a scalar per anchor and on a vector per anchor alike: the anchor axis is the
+        second one and every trailing axis is carried through.
+        """
+        shaped = weights.view(weights.shape + (1,) * (values.dim() - 2))
+        summed = (values.to(torch.float64) * shaped).sum(dim=1)
+        count = per_sample_anchors.clamp_min(1.0).view((-1,) + (1,) * (summed.dim() - 1))
+        return summed / count
 
     columns: Dict[str, torch.Tensor] = {
-        f"nll_{name}": per_sample(branch.marginal) for name, branch in scored.items()
+        f"nll_{name}": per_sample(scored[name].marginal) for name in resolved
     }
     columns["pred_gap"] = columns["nll_base"] - columns["nll_full"]
     columns["kld_per_anchor"] = per_sample(outputs["kld_per_anchor"])
@@ -424,11 +556,32 @@ def score_batch(
         draw_concentration(scored["full"].per_draw)
     )
 
+    # The per-sample curves: one vector per sample per resolved quantity. The horizon and block
+    # axes for every resolved arm, the gap on both, and -- on the batches the profile cap admits --
+    # the single-lag margins as one vector over lags.
+    curves: Dict[str, torch.Tensor] = {}
+    for name in resolved:
+        branch = scored[name]
+        if branch.per_horizon is not None:
+            curves[f"nll_{name}_by_horizon"] = per_sample(branch.per_horizon)
+        if branch.per_block is not None:
+            curves[f"nll_{name}_by_block"] = per_sample(branch.per_block)
+    for axis in ("by_horizon", "by_block"):
+        if f"nll_base_{axis}" in curves:
+            curves[f"pred_gap_{axis}"] = curves[f"nll_base_{axis}"] - curves[f"nll_full_{axis}"]
+    lag_columns = [name for name in branches if name.startswith(LAG_ARM_PREFIX)]
+    if lag_columns:
+        matched = columns["nll_full"]
+        curves["lag_margin"] = torch.stack(
+            [per_sample(scored[name].marginal) - matched for name in lag_columns], dim=1
+        )
+
     # Absent on a target-only checkpoint, where no window was ever gathered. Reported as an empty
     # exposure rather than as counts of zero: nothing was measured, which is a different statement
     # from a source that was available and carried nothing.
     channel_mask = outputs.get("source_channel_mask")
     exposure: Dict[str, torch.Tensor] = {}
+    latent_profile: Dict[str, torch.Tensor] = {}
     if channel_mask is not None:
         exposure = lag_metrics.lag_exposure(
             outputs["lag_valid"], channel_mask, contributing
@@ -436,11 +589,18 @@ def score_batch(
         exposure["channels_per_source_channel"] = lag_metrics.channel_exposure(
             channel_mask, contributing
         )
+    # The latent per-lag profile costs one pass of cheap arithmetic over the cached proposals, so
+    # it is taken on every batch of the split rather than on the capped ones the predictive profile
+    # is scored on. Present only where per-lag updates exist to remove.
+    if "mean_proposals" in outputs and str(getattr(model, "lag_fusion", "local")) == "local":
+        latent_profile = lag_metrics.per_lag_latent_totals(model, outputs, contributing)
     return {
         "guids": batch_guids(batch, batch_size),
         "columns": {name: value.cpu() for name, value in columns.items()},
+        "curves": {name: value.cpu() for name, value in curves.items()},
         "n_anchors": per_sample_anchors.cpu(),
         "exposure": {name: value.cpu() for name, value in exposure.items()},
+        "latent_profile": {name: value.cpu() for name, value in latent_profile.items()},
         "cancellation": lag_metrics.cancellation_totals(outputs, contributing),
         "calibration": {
             name: calibration_census(
@@ -455,8 +615,8 @@ def score_batch(
 
 def aggregate_by_recording(
     records: Sequence[Mapping[str, Any]],
-) -> Tuple[Dict[str, Dict[str, float]], Dict[str, Dict[str, float]]]:
-    """Average each column within a recording, then hand back the per-recording values.
+) -> Tuple[Dict[str, Dict[str, float]], Dict[str, Dict[str, float]], Dict[str, Dict[str, np.ndarray]]]:
+    """Average each column and each curve within a recording, then hand back the per-recording values.
 
     Not a flat mean over anchors or over segments. Consecutive anchors' forecast windows overlap in
     all but one of their steps at the dense geometry, so anchors within a recording are very far
@@ -473,17 +633,26 @@ def aggregate_by_recording(
     under a different empty-segment rule from the mean beside it would describe a different
     population from the number it qualifies.
 
+    The curves are averaged by the same rule, per curve: a curve present on some batches only --
+    the single-lag margins on the segments the profile cap admitted -- is averaged over the
+    segments that carried it, and a recording none of whose segments did is absent from that
+    curve rather than present as zeros.
+
     Args:
         records: The per-batch records :func:`score_batch` returned.
 
     Returns:
-        ``({recording: {column: value}}, {recording: {'n_segments', 'n_scored_anchors'}})``.
+        ``({recording: {column: value}}, {recording: {'n_segments', 'n_scored_anchors'}},
+        {curve: {recording: vector}})``.
     """
     sums: Dict[str, Dict[str, float]] = {}
     counts: Dict[str, int] = {}
     anchors: Dict[str, float] = {}
+    curve_sums: Dict[str, Dict[str, np.ndarray]] = {}
+    curve_counts: Dict[str, Dict[str, int]] = {}
     for record in records:
         names = list(record["columns"])
+        curve_names = list(record.get("curves") or {})
         for position, guid in enumerate(record["guids"]):
             scored = float(record["n_anchors"][position])
             if scored <= 0.0:
@@ -493,6 +662,12 @@ def aggregate_by_recording(
             anchors[guid] = anchors.get(guid, 0.0) + scored
             for name in names:
                 bucket[name] += float(record["columns"][name][position])
+            for name in curve_names:
+                vector = np.asarray(record["curves"][name][position], dtype=np.float64)
+                per_curve = curve_sums.setdefault(name, {})
+                per_count = curve_counts.setdefault(name, {})
+                per_curve[guid] = per_curve.get(guid, 0.0) + vector
+                per_count[guid] = per_count.get(guid, 0) + 1
     per_recording = {
         guid: {name: total / counts[guid] for name, total in bucket.items()}
         for guid, bucket in sums.items()
@@ -504,7 +679,11 @@ def aggregate_by_recording(
         }
         for guid in per_recording
     }
-    return per_recording, exposure
+    curves = {
+        name: {guid: total / float(curve_counts[name][guid]) for guid, total in per_curve.items()}
+        for name, per_curve in curve_sums.items()
+    }
+    return per_recording, exposure, curves
 
 
 def headline_block(
@@ -539,6 +718,116 @@ def headline_block(
         )
         for name in names
     }
+
+
+def paired_margin_block(
+    per_recording: Mapping[str, Mapping[str, float]],
+    columns: Mapping[str, str],
+    *,
+    matched: str = "nll_full",
+    resamples: int,
+    seed: int,
+) -> Dict[str, Any]:
+    """The paired interval of every named arm's margin against the matched branch.
+
+    Args:
+        per_recording: The per-recording column means.
+        columns: ``{name: column}`` naming the intervened arms' columns.
+        matched: The column the margins are taken against.
+        resamples: Bootstrap resamples.
+        seed: Seed for the resampling.
+
+    Returns:
+        ``{name: paired record}``, with :data:`~lag_metrics.MISSING` where an arm did not run.
+    """
+    return {
+        name: lag_metrics.paired_margin(
+            per_recording, column, matched, resamples=int(resamples), seed=int(seed)
+        )
+        for name, column in columns.items()
+    }
+
+
+def curve_difference(
+    left: Mapping[str, np.ndarray], right: Mapping[str, np.ndarray]
+) -> Dict[str, np.ndarray]:
+    """The per-recording difference of two curves, on the recordings both hold.
+
+    Args:
+        left: ``{recording: vector}``.
+        right: ``{recording: vector}``.
+
+    Returns:
+        ``{recording: left - right}``.
+    """
+    return {guid: left[guid] - right[guid] for guid in left if guid in right}
+
+
+def resolved_axis_block(
+    curves: Mapping[str, Mapping[str, np.ndarray]],
+    *,
+    axis: str,
+    positions: Sequence[Any],
+    unit: str,
+    resamples: int,
+    seed: int,
+) -> Dict[str, Any]:
+    r"""One resolved axis of the summary: every arm's curve, the gap, and every margin, paired.
+
+    Every entry is a :func:`~lag_metrics.bootstrap_curve` record -- ``point``, ``lo`` and ``hi``
+    as lists over the axis, under one resampling of the recordings -- so a reader can follow an
+    interval from one position to the next. The margins are intervals of per-recording
+    **differences**, as the scalar margins are.
+
+    Args:
+        curves: The per-recording curves, keyed ``nll_<arm>_<axis>`` and ``pred_gap_<axis>``.
+        axis: ``'by_horizon'`` or ``'by_block'``.
+        positions: The axis labels, one per position.
+        unit: The unit every value is in, recorded beside them.
+        resamples: Bootstrap resamples.
+        seed: Seed for the resampling.
+
+    Returns:
+        The block, empty when no curve of this axis was collected.
+    """
+    suffix = f"_{axis}"
+    arms = {
+        name[len("nll_"):-len(suffix)]: rows
+        for name, rows in curves.items()
+        if name.startswith("nll_") and name.endswith(suffix)
+    }
+    if not arms:
+        return {}
+
+    def interval(rows: Mapping[str, np.ndarray]) -> Dict[str, Any]:
+        """Bootstrap one per-recording curve."""
+        return lag_metrics.bootstrap_curve(rows, resamples=int(resamples), seed=int(seed))
+
+    matched = arms.get("full", {})
+    block: Dict[str, Any] = {
+        "positions": list(positions),
+        "unit": unit,
+        "nll": {arm: interval(rows) for arm, rows in arms.items()},
+        "pred_gap": interval(curves.get(f"pred_gap{suffix}", {})),
+        "band_margins": {
+            arm[len(SUPPRESSION_PREFIX):]: interval(curve_difference(rows, matched))
+            for arm, rows in arms.items()
+            if arm.startswith(SUPPRESSION_PREFIX)
+        },
+        "control_margins": {
+            name: interval(curve_difference(arms[column[len("nll_"):]], matched))
+            for name, column in CONTROL_COLUMNS.items()
+            if column[len("nll_"):] in arms
+        },
+        "note": (
+            "Each position is the marginal mixture of that subset's own likelihood factors under "
+            "the shared draws, so the positions do not sum to the joint block score and are not "
+            "made to. Intervals are percentile bootstraps over recordings under one resampling for "
+            "every position; the margins are intervals of per-recording differences against the "
+            "matched full branch."
+        ),
+    }
+    return block
 
 
 def arm_record(model: Any) -> Dict[str, Any]:
@@ -598,6 +887,104 @@ def arm_record(model: Any) -> Dict[str, Any]:
     }
 
 
+def lag_axis_record(model: Any) -> Dict[str, Any]:
+    """The axis every per-lag figure of this run is drawn against, read off the model.
+
+    Stored-coefficient time: lag $\\ell$ names the source coefficient stored $\\ell$ steps before
+    the anchor, and the seconds beside it are that many stored steps. The delay term is the
+    model's own causal input delay in stored steps, which is what a lag axis compensates for, and
+    nothing else is added to it.
+
+    Args:
+        model: The rebuilt net.
+
+    Returns:
+        ``{'n_lags', 'seconds_per_step', 'delay_steps', 'clock'}``.
+    """
+    return {
+        "n_lags": int(getattr(model, "n_lags", 0) or 0),
+        "seconds_per_step": float(SECONDS_PER_STEP),
+        "delay_steps": int(getattr(model, "source_delay_steps", 0) or 0),
+        "clock": "stored-coefficient time: stored steps back from the anchor",
+    }
+
+
+def lag_profile_block(
+    *,
+    latent_totals: Optional[Mapping[str, torch.Tensor]],
+    exposure_totals: Optional[Mapping[str, torch.Tensor]],
+    lag_margins: Mapping[str, np.ndarray],
+    n_profiled_segments: int,
+    cap: Optional[int],
+    skipped: Optional[str],
+    resamples: int,
+    seed: int,
+) -> Dict[str, Any]:
+    """The per-lag readouts: the latent profile over the split, the predictive one over the cap.
+
+    Args:
+        latent_totals: The accumulated :func:`~lag_metrics.per_lag_latent_totals`, or ``None``.
+        exposure_totals: The accumulated per-lag exposure, or ``None``.
+        lag_margins: ``{recording: (L,) margins}`` from the segments the cap admitted.
+        n_profiled_segments: How many segments the predictive profile was scored on.
+        cap: The configured cap, or ``None`` when the profile was not asked for.
+        skipped: Why the predictive profile did not run on this arm, or ``None``.
+        resamples: Bootstrap resamples.
+        seed: Seed for the resampling.
+
+    Returns:
+        The block.
+    """
+    latent = lag_metrics.lag_profile_summary(
+        latent_totals, None if not exposure_totals else exposure_totals["anchors_per_lag"]
+    )
+    if skipped is not None:
+        predictive: Dict[str, Any] = {"status": "SKIPPED", "detail": skipped}
+    elif cap is None:
+        predictive = {
+            "status": "NOT_REQUESTED",
+            "detail": (
+                f"eval_config.caps.{LAG_PROFILE_CAP} is absent, so no segment was scored with "
+                f"single lags removed. Set it to the number of segments to profile."
+            ),
+        }
+    elif not lag_margins:
+        predictive = {
+            "status": "EMPTY",
+            "detail": "no segment reached the single-lag arms; nothing was scored.",
+            "n_segments": int(n_profiled_segments),
+            "cap": int(cap),
+        }
+    else:
+        predictive = {
+            "status": "READ",
+            "n_segments": int(n_profiled_segments),
+            "n_recordings": len(lag_margins),
+            "cap": int(cap),
+            "margin_nats": lag_metrics.bootstrap_curve(
+                lag_margins, resamples=int(resamples), seed=int(seed)
+            ),
+            "detail": (
+                "each lag's margin is the score with that lag's proposals alone removed less the "
+                "matched score, in nats per anchor, paired per recording under the shared draws "
+                "over the first segments of the split up to the cap. A positive value means the "
+                "fitted model predicts worse without that lag."
+            ),
+        }
+    return {
+        "latent": latent,
+        "predictive": predictive,
+        "note": (
+            "The latent profile removes one lag at a time from the cached proposals and reports "
+            "the proposal norm, the shift of the bounded mean update and the drop of the "
+            "divergence, each averaged over the scored anchors the lag was live at. None is an "
+            "allocation over lags: an exactly zero-sum reallocation changes every one of them at "
+            "every lag while changing no prediction. The single-lag margins are read after the "
+            "band and joint removals, never instead of them."
+        ),
+    }
+
+
 def run_pass(
     task: Any,
     loader: Any,
@@ -621,23 +1008,33 @@ def run_pass(
     model = task.orig_model
     device = task.device
     seed = int(eval_config["seed"])
+    resamples = int(eval_config["bootstrap_resamples"])
     mc_generator = torch.Generator(device=device).manual_seed(seed + _SEED_OFFSET_MC)
     perm_generator = torch.Generator().manual_seed(seed + _SEED_OFFSET_PERM)
     bands = dict(eval_config.get("occlusion_bands") or {})
+    caps = dict(eval_config.get("caps") or {})
+    profile_cap: Optional[int] = caps.get(LAG_PROFILE_CAP)
+    block_split = kept_block_split(model)
 
     masks = lag_metrics.band_masks(bands, model.n_lags, device=device)
 
     records: List[Dict[str, Any]] = []
     exposure_totals: Optional[Dict[str, torch.Tensor]] = None
+    latent_totals: Optional[Dict[str, torch.Tensor]] = None
     cancellation_totals: Optional[Dict[str, Dict[str, float]]] = None
     calibration_totals: Dict[str, Any] = {}
     control_pairs = same_recording = 0
+    profiled_segments = 0
     skipped: Dict[str, str] = {}
     with torch.no_grad():
         for index, batch in enumerate(loader):
             if max_batches is not None and index >= int(max_batches):
                 break
             batch = task.transfer_batch_to_device(batch, device, dataloader_idx=0)
+            # The profile is scored on the first segments of the split up to the cap: the loader
+            # is fixed-seed shuffled, so the leading segments are a draw over the split rather
+            # than one shard's prefix.
+            profile_this_batch = profile_cap is not None and profiled_segments < int(profile_cap)
             record = score_batch(
                 task,
                 batch,
@@ -645,8 +1042,14 @@ def run_pass(
                 num_samples=num_samples,
                 mc_generator=mc_generator,
                 perm_generator=perm_generator,
+                lag_profile=profile_this_batch,
+                block_split=block_split,
             )
+            if "lag_margin" in record["curves"]:
+                profiled_segments += int(record["curves"]["lag_margin"].shape[0])
             exposure_totals = lag_metrics.merge_counts(exposure_totals, record["exposure"])
+            if record["latent_profile"]:
+                latent_totals = lag_metrics.merge_counts(latent_totals, record["latent_profile"])
             cancellation_totals = lag_metrics.merge_cancellation(
                 cancellation_totals, record["cancellation"]
             )
@@ -660,11 +1063,16 @@ def run_pass(
             records.append(record)
             logger.info(f"scored batch {index + 1}")
 
-    per_recording, per_recording_exposure = aggregate_by_recording(records)
-    headline = headline_block(
+    per_recording, per_recording_exposure, curves = aggregate_by_recording(records)
+    headline = headline_block(per_recording, resamples=resamples, seed=seed)
+    band_intervals = paired_margin_block(
         per_recording,
-        resamples=int(eval_config["bootstrap_resamples"]),
+        {band: f"nll_{SUPPRESSION_PREFIX}{band}" for band in masks},
+        resamples=resamples,
         seed=seed,
+    )
+    control_intervals = paired_margin_block(
+        per_recording, CONTROL_COLUMNS, resamples=resamples, seed=seed
     )
     exposure = (
         {}
@@ -672,6 +1080,8 @@ def run_pass(
         else lag_metrics.band_exposure(masks, exposure_totals)
     )
     anchor_weighted = _anchor_weighted(records)
+    horizon = int(model.horizon)
+    block_channels = _block_channel_counts(model, block_split)
     return {
         "headline": headline,
         "anchor_weighted": anchor_weighted,
@@ -684,6 +1094,7 @@ def run_pass(
             guid: {**columns, **per_recording_exposure[guid]}
             for guid, columns in per_recording.items()
         },
+        PER_RECORDING_CURVES_KEY: curves,
         # The first thing a reader of two summaries has to know, because it decides what every
         # other block in the file can possibly say. A target-only arm's gap is exactly zero by
         # construction and its lag readouts are empty; a candidate's are neither.
@@ -695,38 +1106,79 @@ def run_pass(
         "arm": arm_record(model),
         "lag_readouts": lag_metrics.qualified_report(
             {
-                "band_suppression": lag_metrics.band_suppression_block(headline, exposure),
+                "band_suppression": lag_metrics.band_suppression_block(
+                    headline, exposure, intervals=band_intervals
+                ),
+                # The declared edges, so the lag figures can shade the bands where they sit.
+                "band_edges": {name: [int(lo), int(hi)] for name, (lo, hi) in bands.items()},
                 "cancellation": lag_metrics.cancellation_summary(cancellation_totals or {}),
+                # Plain lists rather than tensors, because the tables and the figures read this
+                # block before the summary is serialised.
                 "exposure": {
                     "per_band": exposure,
                     "per_lag_anchors": (
-                        [] if not exposure_totals else exposure_totals["anchors_per_lag"]
+                        [] if not exposure_totals else exposure_totals["anchors_per_lag"].tolist()
                     ),
                     "per_lag_channels": (
-                        [] if not exposure_totals else exposure_totals["channels_per_lag"]
+                        [] if not exposure_totals else exposure_totals["channels_per_lag"].tolist()
                     ),
                     "per_source_channel": (
                         []
                         if not exposure_totals
-                        else exposure_totals["channels_per_source_channel"]
+                        else exposure_totals["channels_per_source_channel"].tolist()
                     ),
                 },
+                "lag_profile": lag_profile_block(
+                    latent_totals=latent_totals,
+                    exposure_totals=exposure_totals,
+                    lag_margins=curves.get("lag_margin", {}),
+                    n_profiled_segments=profiled_segments,
+                    cap=profile_cap,
+                    skipped=skipped.get("lag_profile"),
+                    resamples=resamples,
+                    seed=seed,
+                ),
+                "lag_axis": lag_axis_record(model),
             }
         ),
+        "horizon_resolved": resolved_axis_block(
+            curves,
+            axis="by_horizon",
+            positions=list(range(1, horizon + 1)),
+            unit="nats per anchor per horizon step",
+            resamples=resamples,
+            seed=seed,
+        ),
+        "block_resolved": {
+            **resolved_axis_block(
+                curves,
+                axis="by_block",
+                positions=list(TARGET_BLOCKS),
+                unit="nats per anchor, summed over the block's own channels and the horizon",
+                resamples=resamples,
+                seed=seed,
+            ),
+            "channels_per_block": block_channels,
+        },
         "source_controls": {
             "silence_margin_nats": _margin(headline, "silence"),
             "replace_zeros_margin_nats": _margin(headline, "replace:zeros"),
             "replace_constant_margin_nats": _margin(headline, "replace:constant"),
             "permute_margin_nats": _margin(headline, "permute"),
+            "silence_margin_interval": control_intervals["silence"],
+            "replace_zeros_margin_interval": control_intervals["replace_zeros"],
+            "replace_constant_margin_interval": control_intervals["replace_constant"],
+            "permute_margin_interval": control_intervals["permute"],
             "n_control_pairs": control_pairs,
             "n_same_recording_pairs": same_recording,
             "skipped": skipped,
             "note": (
                 "Each margin is the arm's own predictive score less the matched full branch's, in "
                 "nats per anchor, so a positive value means the fitted model predicts worse under "
-                "the intervention. The silence arm verifies the equality invariant and nothing "
-                "else: its margin equals the base-minus-full gap by construction, because every "
-                "selector off reproduces the prior exactly."
+                "the intervention; the interval beside it is a percentile bootstrap over the "
+                "per-recording differences. The silence arm verifies the equality invariant and "
+                "nothing else: its margin equals the base-minus-full gap by construction, because "
+                "every selector off reproduces the prior exactly."
             ),
         },
         "calibration": {
@@ -754,6 +1206,22 @@ def run_pass(
         },
         "encoder_disclosure": LAG_RESIDUAL_BINDING.encoder_disclosure(model),
     }
+
+
+def _block_channel_counts(model: Any, block_split: Optional[int]) -> Dict[str, int]:
+    """How many kept channels each stored target block holds, read off the model.
+
+    Args:
+        model: The rebuilt net.
+        block_split: The kept-position boundary, or ``None``.
+
+    Returns:
+        ``{block: count}``, empty when no split exists.
+    """
+    if block_split is None:
+        return {}
+    width = int(getattr(model, "decoder_out_channels", 0) or 0)
+    return {TARGET_BLOCKS[0]: int(block_split), TARGET_BLOCKS[1]: max(width - int(block_split), 0)}
 
 
 def _margin(headline: Mapping[str, Any], arm: str) -> Any:
@@ -819,6 +1287,108 @@ def write_per_recording_table(path: Any, table: Mapping[str, Mapping[str, float]
             writer.writerow([guid, *(row.get(name, "") for name in columns)])
 
 
+def lag_profile_rows(results: Mapping[str, Any]) -> List[Dict[str, Any]]:
+    """One row per candidate lag, assembled from the summary's own lag blocks.
+
+    Built from the summary rather than from the tensors, so the table and the figure drawn from
+    it carry exactly the numbers the summary does.
+
+    Args:
+        results: The assembled results.
+
+    Returns:
+        The rows, in lag order; empty when the run read no lag.
+    """
+    readouts = results.get("lag_readouts") or {}
+    axis = readouts.get("lag_axis") or {}
+    exposure = readouts.get("exposure") or {}
+    profile = readouts.get("lag_profile") or {}
+    latent = profile.get("latent") or {}
+    predictive = profile.get("predictive") or {}
+    margin = predictive.get("margin_nats") or {}
+    anchors = list(exposure.get("per_lag_anchors") or [])
+    if not anchors:
+        return []
+    channels = list(exposure.get("per_lag_channels") or [])
+    step = float(axis.get("seconds_per_step", SECONDS_PER_STEP))
+    delay = int(axis.get("delay_steps", 0) or 0)
+    rows: List[Dict[str, Any]] = []
+    for lag in range(len(anchors)):
+        row: Dict[str, Any] = {
+            "lag": lag,
+            "seconds": step * (lag + delay),
+            "anchors": float(anchors[lag]),
+            "channels": float(channels[lag]) if lag < len(channels) else "",
+        }
+        for name in ("proposal_norm", "update_shift", "divergence_drop", "scale_proposal_norm"):
+            values = latent.get(name)
+            row[name] = "" if not values or values[lag] is None else float(values[lag])
+        for part in ("point", "lo", "hi"):
+            values = margin.get(part)
+            row[f"predictive_margin_{part}"] = (
+                "" if not values or lag >= len(values) else float(values[lag])
+            )
+        rows.append(row)
+    return rows
+
+
+def horizon_rows(results: Mapping[str, Any]) -> List[Dict[str, Any]]:
+    """One row per arm and horizon step, assembled from the summary's horizon block.
+
+    Args:
+        results: The assembled results.
+
+    Returns:
+        The rows; empty when the run resolved no horizon axis.
+    """
+    block = results.get("horizon_resolved") or {}
+    positions = list(block.get("positions") or [])
+    rows: List[Dict[str, Any]] = []
+    series: List[Tuple[str, Mapping[str, Any]]] = [
+        (f"nll_{arm}", record) for arm, record in (block.get("nll") or {}).items()
+    ]
+    if block.get("pred_gap"):
+        series.append(("pred_gap", block["pred_gap"]))
+    series += [
+        (f"margin_{SUPPRESSION_PREFIX}{band}", record)
+        for band, record in (block.get("band_margins") or {}).items()
+    ]
+    series += [
+        (f"margin_{name}", record)
+        for name, record in (block.get("control_margins") or {}).items()
+    ]
+    for name, record in series:
+        for position, step in enumerate(positions):
+            rows.append(
+                {
+                    "series": name,
+                    "horizon_step": step,
+                    "point": record["point"][position],
+                    "lo": record["lo"][position],
+                    "hi": record["hi"][position],
+                    "n": record.get("n"),
+                }
+            )
+    return rows
+
+
+def write_rows(path: Any, rows: Sequence[Mapping[str, Any]]) -> None:
+    """Write a list of homogeneous rows as a CSV, or nothing when there are none.
+
+    Args:
+        path: The file to write.
+        rows: The rows, every one carrying the same keys.
+    """
+    if not rows:
+        return
+    columns = list(rows[0])
+    with open(str(path), "w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=columns)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
+
+
 def scored_split_record(
     config: Mapping[str, Any], recordings: Sequence[str]
 ) -> Dict[str, Any]:
@@ -867,6 +1437,31 @@ def scored_split_record(
     }
 
 
+def render_figures(results: Mapping[str, Any], results_dir: Any) -> Dict[str, Any]:
+    """Draw every figure of the run from the assembled summary, inside a failure-isolating guard.
+
+    A figure that fails must not lose a multi-hour pass at its last step, so the failure is
+    recorded in the summary under ``figures.error`` and the pass completes; the summary is then
+    enough to redraw the figures afterwards.
+
+    Args:
+        results: The assembled results, with the per-recording table still attached.
+        results_dir: The run's results directory.
+
+    Returns:
+        The figure manifest: ``{name: relative path}`` plus the format, or the error.
+    """
+    try:
+        return figures.render_run_figures(
+            results,
+            results_dir,
+            per_recording=results.get(PER_RECORDING_KEY) or {},
+        )
+    except Exception as error:  # noqa: BLE001 - a lost figure must not lose the run
+        logger.exception("figure rendering failed; the summary is complete without the figures")
+        return {"error": f"{type(error).__name__}: {error}"}
+
+
 def main(
     checkpoint: Optional[str] = None,
     output_dir: Optional[str] = None,
@@ -905,6 +1500,9 @@ def main(
     results_dir = make_output_dir(config, output_dir, binding=LAG_RESIDUAL_BINDING)
     logger.info(f"writing results to {results_dir}")
     dump_resolved_config(config, results_dir)
+    # Once per run, before any figure: the style mutates global rcParams and the format is a
+    # property of the run, read from the delta so the dumped configuration records it.
+    figures.configure_figure_style(eval_config.get("figure_format"))
 
     blob = read_checkpoint(checkpoint)
     task = load_task(checkpoint, resolved_device, blob=blob, binding=LAG_RESIDUAL_BINDING)
@@ -917,12 +1515,17 @@ def main(
         num_samples=draws,
         max_batches=max_batches,
     )
-    table = results.pop(PER_RECORDING_KEY)
+    results.pop(PER_RECORDING_CURVES_KEY, None)
+    table = results[PER_RECORDING_KEY]
     write_per_recording_table(results_dir / PER_RECORDING_FILENAME, table)
     logger.info(f"wrote {results_dir / PER_RECORDING_FILENAME}")
+    write_rows(results_dir / LAG_PROFILE_FILENAME, lag_profile_rows(results))
+    write_rows(results_dir / HORIZON_FILENAME, horizon_rows(results))
     results["scored_split"] = {
         **scored_split_record(config, list(table)),
         "per_recording_table": PER_RECORDING_FILENAME,
+        "lag_profile_table": LAG_PROFILE_FILENAME,
+        "horizon_table": HORIZON_FILENAME,
     }
     results["run"] = {
         "checkpoint": str(checkpoint),
@@ -950,6 +1553,10 @@ def main(
         # from the delta, and only this line says which it was.
         "argument_sources": dict(sources or {}),
     }
+    # Drawn from the assembled summary and the table, before the table leaves the results: every
+    # figure is a picture of a number the summary carries.
+    results["figures"] = render_figures(results, results_dir)
+    results.pop(PER_RECORDING_KEY)
 
     summary_path = results_dir / SUMMARY_FILENAME
     with open(summary_path, "w", encoding="utf-8") as handle:
@@ -965,11 +1572,12 @@ def main(
 #: ``checkpoint`` MUST be filled in for this file to run at all; everything else may stay ``None``.
 #:
 #: This dict is a launch convenience and not a second configuration surface. Anything that shapes
-#: what the run *measures* -- the seed, the bands, the bootstrap resamples -- belongs in the override
-#: delta, which is dumped into the run directory and is therefore the durable record; a value
-#: injected from Python appears in no artifact and cannot be recovered from the output afterwards.
-#: ``num_mc_samples`` is the one borderline entry and it is here because a draw-count sweep is
-#: exactly the iteration a flag exists for -- the resolved value reaches the summary either way.
+#: what the run *measures* -- the seed, the bands, the bootstrap resamples, the profile cap -- belongs
+#: in the override delta, which is dumped into the run directory and is therefore the durable
+#: record; a value injected from Python appears in no artifact and cannot be recovered from the
+#: output afterwards. ``num_mc_samples`` is the one borderline entry and it is here because a
+#: draw-count sweep is exactly the iteration a flag exists for -- the resolved value reaches the
+#: summary either way.
 RUN_ARGS: Dict[str, Any] = {
     # REQUIRED. Path to the .ckpt to score, repo-root-relative or absolute.
     "checkpoint": None,

@@ -108,11 +108,30 @@ eval_config:
   # Global cap on the segments the pass sees. null evaluates the whole split.
   max_samples: null
 
-  # No retention cap is read by this package's pass: it holds no per-sample forecast arrays and
-  # renders no per-sample pages. The block stays present and empty rather than absent, so a reader
-  # comparing this delta against a lag-attentive cell's sees an explicit "nothing retained" instead
-  # of wondering which caps were forgotten.
-  caps: {}
+  # ONE cap is read by this package's pass, and it bounds a computation rather than a retention:
+  # the pass holds no per-sample forecast arrays and renders no per-sample pages.
+  #
+  #   lag_profile   how many segments the SINGLE-LAG predictive profile is scored on. On those
+  #                 segments every candidate lag is removed alone from the cached proposals and the
+  #                 resulting arm is scored in the same draw loop, under the same draws, as every
+  #                 other arm -- one decoder call per lag per draw, which is why it is capped
+  #                 rather than taken over the whole split. The segments are the first ones the
+  #                 fixed-seed shuffled loader hands out, so they are a draw over the split rather
+  #                 than one shard's prefix. Absent means the profile is skipped and the summary
+  #                 says so; the latent per-lag profile, which costs nothing, always runs over the
+  #                 whole split. The declared bands below are read FIRST and the profile after
+  #                 them: a single-lag peak read off a window whose joint removal does nothing is
+  #                 noise.
+  #
+  # The block stays present so a reader comparing this delta against a lag-attentive cell's sees
+  # which caps this pass reads rather than wondering which were forgotten.
+  caps:
+    lag_profile: 256
+
+  # Image format for every figure the run writes, as a matplotlib filetype: `pdf`, `svg`, `png`,
+  # ... The installed matplotlib's own list is what a value is checked against, so a typo is
+  # refused at config load. `null` -- the shipped setting -- keeps the family's default, `pdf`.
+  figure_format: null
 
   # Resamples behind every interval, drawn over RECORDINGS. Recordings, not anchors: at the dense
   # anchor set consecutive forecast windows overlap in all but one of their steps, so resampling

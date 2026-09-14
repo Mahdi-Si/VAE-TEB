@@ -248,12 +248,17 @@ def test_the_target_only_run_names_every_intervention_it_could_not_make(arms) ->
     summary = arms["reference_summary"]
     controls = summary["source_controls"]
 
-    assert set(controls["skipped"]) == {"suppress", "silence", "replace", "permute"}
+    assert set(controls["skipped"]) == {
+        "suppress", "silence", "replace", "permute", "lag_profile"
+    }
     for reason in controls["skipped"].values():
         assert "no source pathway" in reason
     for margin in ("silence_margin_nats", "permute_margin_nats", "replace_zeros_margin_nats"):
         assert controls[margin] is None, margin
     assert summary["lag_readouts"]["band_suppression"] == {}
+    # The per-lag profile is skipped by name too: there is no lag to read on this arm.
+    assert summary["lag_readouts"]["lag_profile"]["predictive"]["status"] == "SKIPPED"
+    assert summary["lag_readouts"]["lag_profile"]["latent"] == {}
     assert summary["encoder_disclosure"]["source_disabled"] is True
 
 

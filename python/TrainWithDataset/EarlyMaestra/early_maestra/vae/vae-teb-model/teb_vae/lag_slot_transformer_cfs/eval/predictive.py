@@ -32,17 +32,29 @@ unbiased for the model likelihood; its negative logarithm is upward biased for t
 density at finite $K$, and the two branches' biases need not cancel. That is what
 :func:`draw_concentration` is for -- it reports how many of the $K$ draws a score effectively
 rests on -- and it is why a finalist is scored at more than one draw count.
+
+**Subset scores are marginal mixtures of their own factors, and do not add up to the block.** The
+horizon-resolved and block-resolved scores each rescore one subset $\mathcal I$ of the block's
+likelihood factors under the same draws,
+
+$$D^{(K)}_{\mathcal I} = -\operatorname{logsumexp}_k\Bigl(-\sum_{i \in \mathcal I} d^{(k)}_i\Bigr)
+  + \log K,$$
+
+which is the marginal predictive density of that subset. In general
+$\log \mathbb E_Z \prod_i p(V_i \mid Z) \ne \sum_i \log \mathbb E_Z p(V_i \mid Z)$, so the
+per-step scores do not sum to the joint block score and are not made to; each is read on its own
+axis, and the joint score stays the headline.
 """
 from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import torch
 
 from teb_vae.lag_attn_cfs.eval.metrics import marginalise_block_scores
-from teb_vae.lag_attn_rws.nets.losses import masked_raw_block_per_anchor
+from teb_vae.lag_attn_rws.nets.losses import masked_raw_block_per_anchor, raw_sample_score
 
 #: Central probability levels the calibration census reports coverage at. Three rather than one:
 #: a model can be well calibrated in the body and badly calibrated in the tail, and the tail is
@@ -71,12 +83,19 @@ class BranchScores:
             Accumulated inside the draw loop rather than stacked: the stacked forecasts would be
             $K$ times the size of one, which at the production geometry is gigabytes for a
             quantity that reduces to one number per coefficient.
+        per_horizon: The marginalised score of each horizon step's own factors, $(B, A, H)$.
+            A subset mixture rather than a slice of the block score: the steps do not sum to
+            ``marginal`` and are read on their own axis.
+        per_block: The same for each stored target block, $(B, A, n_{\mathrm{blocks}})$, or
+            ``None`` when the caller declared no block boundary.
     """
 
     marginal: torch.Tensor
     per_draw: torch.Tensor
     contributing: torch.Tensor
     cdf_sum: Optional[torch.Tensor] = None
+    per_horizon: Optional[torch.Tensor] = None
+    per_block: Optional[torch.Tensor] = None
 
 
 def gaussian_cdf(value: torch.Tensor, mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
@@ -94,6 +113,66 @@ def gaussian_cdf(value: torch.Tensor, mu: torch.Tensor, logvar: torch.Tensor) ->
     return 0.5 * (1.0 + torch.erf(standardized / _SQRT_TWO))
 
 
+def subset_block_scores(
+    forecast_mu: torch.Tensor,
+    forecast_logvar: torch.Tensor,
+    target: torch.Tensor,
+    mask: torch.Tensor,
+    *,
+    likelihood: str,
+    block_split: Optional[int] = None,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    r"""One draw's per-anchor score, resolved by horizon step and by stored target block.
+
+    The elementwise term is the objective's own :func:`raw_sample_score`, reduced over the
+    channel axis for the horizon curve and over the horizon-and-block axes for the block pair:
+
+    $$D_{b,a,\tau} = m_{b,a,\tau}\sum_c d_{b,a,\tau,c}, \qquad
+      D_{b,a,\beta} = \sum_\tau m_{b,a,\tau} \sum_{c \in \beta} d_{b,a,\tau,c}.$$
+
+    Both are **per-draw** and additive: each sums back to that draw's block score exactly. It is
+    the marginalisation over draws that breaks additivity, and that happens in the caller.
+
+    Args:
+        forecast_mu: The decoder's mean $(B, A, H, C)$.
+        forecast_logvar: The decoder's log-variance, the same shape.
+        target: The gathered forecast target $(B, A, H, C)$.
+        mask: The forecast mask $(B, A, H)$.
+        likelihood: ``'mse'`` or ``'gaussian_nll'``.
+        block_split: The **kept-position** boundary at which the second stored block begins, so
+            channels $[0, \mathrm{split})$ are the first block and the rest the second. ``None``
+            reports no block split at all, which is what a model with no stored-block structure
+            gets rather than a split at a guessed position.
+
+    Returns:
+        ``(per_horizon, per_block)``: $(B, A, H)$ and, when a split was given, $(B, A, 2)$;
+        otherwise ``None`` in the second slot.
+
+    Raises:
+        ValueError: If the split lies outside the channel axis, where one block would be empty
+            and its score a row of zeros that reads as a measurement.
+    """
+    per_sample = raw_sample_score(
+        forecast_mu, target, likelihood=likelihood, logvar=forecast_logvar
+    )
+    masked = per_sample * mask[..., None]
+    per_horizon = masked.sum(dim=3)
+    if block_split is None:
+        return per_horizon, None
+    channels = int(masked.shape[-1])
+    split = int(block_split)
+    if not 0 < split < channels:
+        raise ValueError(
+            f"block_split={split} must lie strictly inside the channel axis of width {channels}; "
+            f"a split at either end leaves one stored block empty and its score would read as a "
+            f"measured zero."
+        )
+    per_block = torch.stack(
+        [masked[..., :split].sum(dim=(2, 3)), masked[..., split:].sum(dim=(2, 3))], dim=-1
+    )
+    return per_horizon, per_block
+
+
 @torch.no_grad()
 def matched_predictive_scores(
     model: Any,
@@ -106,6 +185,8 @@ def matched_predictive_scores(
     generator: Optional[torch.Generator] = None,
     persistence: Optional[torch.Tensor] = None,
     calibrate: Sequence[str] = (),
+    resolve: Sequence[str] = (),
+    block_split: Optional[int] = None,
 ) -> Dict[str, BranchScores]:
     r"""Score every branch's forecast under common random numbers, at the decoded anchors.
 
@@ -134,25 +215,31 @@ def matched_predictive_scores(
         calibrate: Branch names whose mixture cumulative distribution is accumulated over the
             draws. Empty by default: it costs a $(B, A, H, C)$ accumulator per named branch, and
             most branches are scored for a margin rather than for their calibration.
+        resolve: Branch names whose score is additionally resolved by horizon step and by stored
+            target block, through :func:`subset_block_scores`. Empty by default for the reason
+            ``calibrate`` is: a single-lag arm is scored for one margin and nothing else.
+        block_split: The kept-position boundary between the two stored target blocks, handed to
+            :func:`subset_block_scores`; ``None`` resolves the horizon axis alone.
 
     Returns:
         One :class:`BranchScores` per branch, keyed as ``branches`` was.
 
     Raises:
         ValueError: If ``branches`` is empty, if ``num_samples`` is not positive, if a branch's
-            anchor axis disagrees with the target's, or if ``calibrate`` names a branch that was
-            not scored.
+            anchor axis disagrees with the target's, or if ``calibrate`` or ``resolve`` names a
+            branch that was not scored.
     """
     if not branches:
         raise ValueError("matched_predictive_scores needs at least one branch to score")
     if int(num_samples) < 1:
         raise ValueError(f"num_samples must be >= 1, got {num_samples}")
-    unknown = sorted(set(calibrate) - set(branches))
-    if unknown:
-        raise ValueError(
-            f"calibrate names branches that are not being scored: {unknown}. Scored branches are "
-            f"{sorted(branches)}."
-        )
+    for role, names in (("calibrate", calibrate), ("resolve", resolve)):
+        unknown = sorted(set(names) - set(branches))
+        if unknown:
+            raise ValueError(
+                f"{role} names branches that are not being scored: {unknown}. Scored branches "
+                f"are {sorted(branches)}."
+            )
 
     reference_mu = next(iter(branches.values()))[0]
     for name, (mu, _logvar) in branches.items():
@@ -165,6 +252,8 @@ def matched_predictive_scores(
             )
 
     draws: Dict[str, list] = {name: [] for name in branches}
+    horizon_draws: Dict[str, List[torch.Tensor]] = {name: [] for name in resolve}
+    block_draws: Dict[str, List[torch.Tensor]] = {name: [] for name in resolve}
     cdf_sums: Dict[str, torch.Tensor] = {}
     contributing: Optional[torch.Tensor] = None
 
@@ -188,17 +277,43 @@ def matched_predictive_scores(
                 cdf_sums[name] = (
                     component if name not in cdf_sums else cdf_sums[name] + component
                 )
+            if name in resolve:
+                per_horizon, per_block = subset_block_scores(
+                    forecast_mu,
+                    forecast_logvar,
+                    target,
+                    mask,
+                    likelihood=likelihood,
+                    block_split=block_split,
+                )
+                horizon_draws[name].append(per_horizon)
+                if per_block is not None:
+                    block_draws[name].append(per_block)
 
     assert contributing is not None  # the loops above ran at least once
     scored: Dict[str, BranchScores] = {}
     for name, blocks in draws.items():
         per_draw = torch.stack(blocks, dim=0)
         total = cdf_sums.get(name)
+        # The same marginalisation on every subset axis: the draw axis is the leading one in each
+        # stack, and the log-mean-likelihood is taken over it whatever trails.
+        per_horizon = (
+            marginalise_block_scores(torch.stack(horizon_draws[name], dim=0), likelihood)
+            if horizon_draws.get(name)
+            else None
+        )
+        per_block = (
+            marginalise_block_scores(torch.stack(block_draws[name], dim=0), likelihood)
+            if block_draws.get(name)
+            else None
+        )
         scored[name] = BranchScores(
             marginal=marginalise_block_scores(per_draw, likelihood),
             per_draw=per_draw,
             contributing=contributing,
             cdf_sum=None if total is None else total / float(num_samples),
+            per_horizon=per_horizon,
+            per_block=per_block,
         )
     return scored
 
@@ -377,4 +492,5 @@ __all__ = [
     "merge_calibration",
     "gaussian_cdf",
     "matched_predictive_scores",
+    "subset_block_scores",
 ]

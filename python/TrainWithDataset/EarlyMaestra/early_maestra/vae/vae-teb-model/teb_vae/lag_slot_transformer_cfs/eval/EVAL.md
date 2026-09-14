@@ -26,10 +26,18 @@ One pass:
    class by name;
 3. walks the evaluation split once. Per batch it runs **one** dense forward with the per-lag
    proposals retained, builds every intervened arm from it, and scores them all in a single draw
-   loop under one shared `ε` per replicate;
-4. aggregates per recording, bootstraps over recordings, and writes `summary.json` beside the
-   merged configuration it ran under, with `per_recording.csv` beside both — one row per
-   recording, carrying the values every interval in the summary was built from.
+   loop under one shared `ε` per replicate — every arm resolved by horizon step and by stored
+   target block as well as by block, and on the segments the profile cap admits, one further arm
+   per candidate lag;
+4. aggregates per recording, bootstraps over recordings — every margin as a **paired** interval of
+   per-recording differences — and writes `summary.json` beside the merged configuration it ran
+   under, with three tables beside both: `per_recording.csv`, one row per recording carrying the
+   values every scalar interval was built from; `lag_profile.csv`, one row per candidate lag; and
+   `horizon_resolved.csv`, one row per arm and horizon step;
+5. draws the figures listed in `FIGURE_GUIDE.md` into `figures/`, from the assembled summary and
+   the tables rather than from any tensor, so a figure and the number it illustrates cannot
+   disagree and the set can be redrawn from a finished directory. A figure that fails is recorded
+   under `figures.error` and the summary is written regardless.
 
 The summary's `scored_split` block names the files the pass opened, the statistics it standardised
 with, their common parent and a digest of the recordings that came back. That block and that table
@@ -63,9 +71,14 @@ of noise: two arms with identical parameters produce bitwise identical scores.
 | `replace:zeros` | source values become standardized zeros, selectors **enabled** | availability announcement, metadata clock |
 | `replace:constant` | each channel becomes its own per-sample time mean | availability announcement, metadata clock |
 | `permute` | the source stream is paired with a different recording's | within-source time order |
+| `lag:<ℓ>` | the selector of one candidate lag goes to zero — the band arm at the finest partition, one per lag, on the segments `caps.lag_profile` admits | everything a band arm holds fixed |
 
-Only the suppression arms recompute from cached proposals; the rest re-run the forward under a
-substituted stream, because a proposal is a function of the source values it was given.
+Only the suppression arms — the bands and the single lags — recompute from cached proposals; the
+rest re-run the forward under a substituted stream, because a proposal is a function of the source
+values it was given. The single-lag arms reach the summary as one per-lag curve under
+`lag_readouts.lag_profile.predictive` rather than as one column each, and exist on the local fusion
+alone: on the normalised aggregation each would be one re-run forward per lag and a different
+quantity in any case, and the summary records the skip by name.
 
 **Two identities pin the intervention path to the forward path**, and they are checked on real
 weights by the evaluation smoke test:
@@ -134,6 +147,29 @@ but one of their steps at the dense geometry, so resampling anchors would report
 narrower than the data supports. Equal-recording and anchor-weighted summaries are both reported,
 separately, because they differ whenever recordings contribute unequal anchor counts.
 
+**Every margin carries a paired interval.** Two arms scored on the same recordings under the same
+draws differ per recording, so the interval that belongs on their margin is the interval of those
+differences, drawn once over recordings — `margin_interval` beside every band's `margin_nats`, and
+`<control>_margin_interval` beside every control's. Each arm's own interval still travels, but two
+overlapping arm intervals are wider by exactly the shared variation the pairing removes and are not
+what a claim about a margin rests on. The gap is paired by construction, being a per-recording
+difference already.
+
+**The horizon and block axes are subset mixtures.** Every scored arm is also resolved by horizon
+step and by stored target block, under `horizon_resolved` and `block_resolved`: each position is
+the log-mean-likelihood of that subset's own factors under the shared draws,
+
+```
+D^(K)_I = -logsumexp_k(-Σ_{i∈I} d^(k)_i) + log K
+```
+
+so the positions do **not** sum to the joint block score and are not made to — in general
+`log E_Z ∏_i p_i ≠ Σ_i log E_Z p_i`. Each axis carries every arm's curve, the gap, and every
+margin as a paired curve interval under **one** resampling of the recordings for every position, so
+an interval can be followed from one step to the next. The horizon axis is where a source's timing
+is expressible here: a band that informs the first predicted step and not the last is a statement
+the window carries whatever the lag axis resolves.
+
 ---
 
 ## 4. What a reader must not take from the output
@@ -165,6 +201,30 @@ produces.
 **The gap is reported and not gated.** Where an acceptable boundary sits is what the first real runs
 measure. A provisional threshold would decide a pass or a fail on exactly the run that was going to
 supply the answer, and nobody could tell a healthy model failing from a broken one passing.
+
+---
+
+## 4.1 The lag readouts, in the order they are read
+
+Three readouts of the lag axis, and the order is the design's: whole-band and joint removals
+first, single-lag results after them, because a single-lag peak read off a window whose joint
+removal does nothing is noise. All three carry the qualification above and all three are drawn on
+`figures/lag_profile` and `figures/band_suppression`.
+
+| Readout | Where | What it is | Cost |
+| --- | --- | --- | --- |
+| Band suppression | `lag_readouts.band_suppression` | each declared band's margin with its paired interval and its exposure; `none` and `all` are the two identities | one cached subtraction per band, every segment |
+| Latent per-lag profile | `lag_readouts.lag_profile.latent` | per lag, averaged over the scored anchors the lag was live at: the proposal norm `‖r_ℓ‖`, the shift `‖a − a^{∖ℓ}‖` removing that lag alone makes to the bounded mean update, and the signed drop `K − K^{∖ℓ}` it makes to the divergence; the scale proposal's norm where the arm has one | cheap tensor arithmetic over the cached proposals, every segment |
+| Predictive per-lag profile | `lag_readouts.lag_profile.predictive` | the suppression margin of removing each lag alone, scored under the same draws as every other arm and paired over recordings | one decoder call per lag per draw, on the first `caps.lag_profile` segments |
+
+None of the latent quantities is an allocation over lags: an exactly zero-sum reallocation of
+proposals changes every one of them at every lag while changing no prediction. The shift is what
+separates a proposal the limiter has already saturated away from one that moves the update, and
+the drop is signed because removing a lag can raise the divergence when its proposal was cancelling
+another's. The predictive profile is a measurement over a subset of the split, and its segment and
+recording counts travel beside it. `lag_readouts.lag_axis` records the axis every per-lag figure is
+drawn against — stored-coefficient steps back from the anchor, the seconds per step, and the
+model's own input delay — and `lag_profile.csv` carries all three readouts one row per lag.
 
 ---
 
@@ -311,6 +371,21 @@ been scored on, and a base branch that has fallen confidently behind the frozen 
 else is reported with its interval and left ungated, because where an acceptable boundary sits is
 what the runs are meant to measure.
 
+Two views of the record are drawn from it after it is assembled, and neither recomputes anything:
+
+```
+python -m teb_vae.lag_slot_transformer_cfs.eval.acceptance \
+    --runs output/<development evaluations> \
+    --reference output/<frozen target-only>/eval_results/summary.json \
+    --output acceptance.json --report acceptance.md --figures acceptance_figures
+```
+
+`--report` writes the record as a markdown document — the arms and their seeds, the declared
+comparisons, each arm against its base and the reference, the controls, the band search at both
+levels, the draw-count stability, the calibration, the probes and the verdicts — and `--figures`
+draws the three figures `FIGURE_GUIDE.md` describes. The figures pull in the plotting stack only
+when asked for; without them the pass stays stdlib-plus-`numpy`.
+
 ---
 
 ## 8. Settings
@@ -327,6 +402,8 @@ its own output rather than from a shell history.
 | `eval_config.num_mc_samples` | Draws `K`; `8`, `32` and `128` are the counts a finalist is scored at |
 | `eval_config.bootstrap_resamples` | Resamples behind every interval, drawn over recordings |
 | `eval_config.occlusion_bands` | The lag bands the suppression readout removes, inclusive, in stored steps back from the anchor |
+| `eval_config.caps.lag_profile` | How many segments the single-lag predictive profile is scored on; absent skips it and the summary says so |
+| `eval_config.figure_format` | The format every figure is written in; `null` keeps the family's default |
 | `eval_config.max_samples` | A cap on the segments the pass sees; `null` evaluates the whole split |
 | `general_config.batch_size.test` | The loader's batch size; it also decides how often a batch admits a cross-recording pairing |
 

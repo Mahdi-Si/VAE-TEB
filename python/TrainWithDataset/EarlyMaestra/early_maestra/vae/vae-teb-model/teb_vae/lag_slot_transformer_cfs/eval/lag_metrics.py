@@ -26,6 +26,20 @@ the diagnosis this architecture answers reported bands whose intervals spanned z
 unsupported bin presented as a zero is the one reading that cannot be distinguished from an absent
 effect afterwards.
 
+**The per-lag latent profile** is the fine-grained companion of the band margins, and it is read
+in latent space rather than in the forecast because that is where it is cheap enough to take at
+every lag: for each lag $\ell$ the bounded update is recomputed with that lag's proposals alone
+removed, from the cached array, and three things are reported -- the proposal's own norm
+$\lVert r_{t,\ell} \rVert_2$, the shift $\lVert a_t - a_t^{\setminus \ell} \rVert_2$ it makes to
+the bounded mean update, and the drop $K_t - K_t^{\setminus \ell}$ it makes to the divergence. None
+of the three is a per-lag allocation: the shifts and drops of different lags do not sum to anything,
+and the reallocation the qualification names changes every one of them while changing no prediction.
+
+**Every margin travels with a paired interval over recordings.** Two arms scored under one set of
+draws differ per recording, so the interval that belongs on a margin is the interval of those
+differences and not two overlapping intervals of the two arms' own scores, which is wider by exactly
+the shared variation the pairing removes.
+
 Every artifact this module writes carries
 :data:`~teb_vae.lag_slot_transformer_cfs.nets.controls.SUPPRESSION_QUALIFICATION` verbatim. That is
 deliberate placement rather than belt and braces: a caveat that lives only in a planning document is
@@ -33,19 +47,30 @@ one edit away from being dropped from the thing a reader actually opens.
 """
 from __future__ import annotations
 
-from typing import Any, Dict, Mapping, Optional, Sequence
+from typing import Any, Dict, List, Mapping, Optional, Sequence
 
+import numpy as np
 import torch
 
+from teb_vae.lag_attn.eval.stats import MIN_GROUP_SIZE, bootstrap_ci
 from teb_vae.lag_slot_transformer_cfs.nets.controls import (
     SUPPRESSION_QUALIFICATION,
     band_lag_mask,
+)
+from teb_vae.lag_slot_transformer_cfs.nets.lag_updates import (
+    bound_update,
+    residual_kl,
 )
 
 #: What a bin with no support is recorded as. ``None`` survives JSON as ``null``, which a reader and
 #: every downstream tool can tell from a zero; a NaN does not survive ``json.dump`` at all, and a
 #: zero is the reading this module exists to prevent.
 MISSING = None
+
+#: Lags recomputed at once by the per-lag latent profile. The removed-lag update is one array of
+#: the proposals' own shape per chunk, so the chunk bounds the transient at a fraction of the
+#: proposal array that is already held rather than at several copies of it.
+LAG_PROFILE_CHUNK = 16
 
 
 def band_masks(
@@ -243,6 +268,7 @@ def band_suppression_block(
     *,
     matched_key: str = "nll_full",
     suppressed_prefix: str = "nll_suppress:",
+    intervals: Optional[Mapping[str, Mapping[str, Any]]] = None,
 ) -> Dict[str, Any]:
     r"""Each band's margin against the matched full branch, with its usable counts beside it.
 
@@ -251,8 +277,10 @@ def band_suppression_block(
       - \widehat{\mathbb E}\bigl[D^{(K)}_{q,t}\bigr],$$
 
     a difference of two arms' equal-recording means. Each arm's own bootstrap interval travels
-    beside the margin rather than an interval of the difference, so a reader sees both ends of both
-    arms; the margin is a difference of point estimates and is labelled as one.
+    beside the margin so a reader sees both ends of both arms, and where the caller hands in the
+    paired interval of the per-recording differences (:func:`paired_margin`) that travels too,
+    under ``margin_interval`` -- it is the interval a claim about the margin rests on, since the
+    two arms' own intervals overlap by the shared variation the pairing removes.
 
     **Nothing here is renormalised.** The margins do not sum to the gap, to the divergence, or to
     each other: the limiter is applied after the summation, so the update is bounded rather than
@@ -269,9 +297,12 @@ def band_suppression_block(
         band_exposure: ``{band: {'anchors', 'channels'}}`` from :func:`band_exposure`.
         matched_key: The column the margins are taken against.
         suppressed_prefix: The prefix marking a suppressed arm's column.
+        intervals: ``{band: paired bootstrap record}`` from :func:`paired_margin`, or ``None``
+            when the caller has no per-recording table to pair over.
 
     Returns:
-        ``{band: {'margin_nats', 'suppressed_nll', 'band_anchors', 'band_channels'}}``.
+        ``{band: {'margin_nats', 'margin_interval', 'suppressed_nll', 'band_anchors',
+        'band_channels'}}``.
     """
     matched = (headline.get(matched_key) or {}).get("point")
     block: Dict[str, Any] = {}
@@ -290,11 +321,258 @@ def band_suppression_block(
                 if unsupported or matched is None
                 else float(record["point"]) - float(matched)
             ),
+            # Absent rather than a point-only record when no pairing was possible, and absent on
+            # an unsupported band for the reason the point is: an interval on a band that had
+            # nothing to remove would be an interval on the availability schedule.
+            "margin_interval": (
+                MISSING
+                if unsupported or intervals is None or band not in intervals
+                else dict(intervals[band])
+            ),
             "suppressed_nll": record,
             "band_anchors": float(counts.get("anchors", 0.0)),
             "band_channels": channels,
         }
-    return block
+    # In declaration order -- the order the exposure carries, which is the masks' -- rather than
+    # in the alphabetical order the headline happens to hold its columns in, so the figures and
+    # the tables list the bands as the delta declared them. A band the exposure does not name
+    # keeps its place after them rather than being dropped.
+    ordered = [band for band in band_exposure if band in block]
+    ordered += [band for band in block if band not in band_exposure]
+    return {band: block[band] for band in ordered}
+
+
+def paired_margin(
+    per_recording: Mapping[str, Mapping[str, float]],
+    intervened: str,
+    matched: str,
+    *,
+    resamples: int,
+    seed: int,
+) -> Optional[Dict[str, Any]]:
+    r"""The interval of an arm's margin, drawn over the per-recording **differences**.
+
+    $$\Delta_g = \bar D_{g}^{\mathrm{intervened}} - \bar D_{g}^{\mathrm{matched}}$$
+
+    per recording $g$, bootstrapped over recordings. Both arms were scored on the same recordings
+    under the same draws, so their difference exists per recording and the shared variation --
+    which recordings are hard to forecast at all -- cancels inside it. Two separate intervals on
+    the two arms would each carry that variation whole, and reading their overlap as "no
+    difference" is the specific misreading the pairing exists to remove.
+
+    Args:
+        per_recording: ``{recording: {column: value}}``, the table the pass aggregated.
+        intervened: The intervened arm's column.
+        matched: The matched arm's column.
+        resamples: Bootstrap resamples.
+        seed: Seed for the resampling.
+
+    Returns:
+        The bootstrap record of the mean difference, with ``n_paired`` beside it; the point and
+        the bounds are ``NaN`` with a ``note`` below :data:`~teb_vae.lag_attn.eval.stats.MIN_GROUP_SIZE`
+        paired recordings, and :data:`MISSING` when neither column exists in the table.
+    """
+    differences: List[float] = []
+    for row in per_recording.values():
+        left, right = row.get(intervened), row.get(matched)
+        if left is None or right is None:
+            continue
+        differences.append(float(left) - float(right))
+    if not differences:
+        return MISSING
+    record = bootstrap_ci(differences, resamples=int(resamples), seed=int(seed))
+    record["n_paired"] = len(differences)
+    record["pairing"] = "per-recording difference of the intervened and matched arms"
+    return record
+
+
+def bootstrap_curve(
+    rows: Mapping[str, Any],
+    *,
+    resamples: int,
+    seed: int,
+    confidence: float = 0.95,
+) -> Dict[str, Any]:
+    r"""A recording-level percentile bootstrap of a per-recording **vector**, one draw set for all.
+
+    The same interval :func:`~teb_vae.lag_attn.eval.stats.bootstrap_ci` builds for a scalar,
+    taken at every position of the vector under **one** resampling of the recordings. One rather
+    than one per position, and that is the point: a horizon curve or a lag profile whose positions
+    were resampled independently would have an interval at each step that a reader cannot follow
+    from one step to the next, because the recordings behind adjacent steps would differ.
+
+    Args:
+        rows: ``{recording: vector}``, every vector the same length $N$. A recording whose vector
+            is not entirely finite is dropped and counted.
+        resamples: Bootstrap resamples.
+        seed: Seed for the resampling.
+        confidence: Coverage of the interval.
+
+    Returns:
+        ``{'point', 'lo', 'hi'}`` as lists of length $N$, with ``n``, ``n_dropped``,
+        ``resamples``, ``seed``, ``confidence`` and ``method`` beside them. The lists are ``NaN``
+        throughout, with a ``note``, below :data:`~teb_vae.lag_attn.eval.stats.MIN_GROUP_SIZE`
+        recordings.
+
+    Raises:
+        ValueError: If the vectors disagree in length, if ``confidence`` is outside $(0, 1)$, or
+            if ``resamples`` is not positive.
+    """
+    if not 0.0 < float(confidence) < 1.0:
+        raise ValueError(f"confidence must lie in (0, 1), got {confidence!r}.")
+    if int(resamples) < 1:
+        raise ValueError(f"resamples must be positive, got {resamples!r}.")
+    vectors = [np.asarray(list(vector), dtype=np.float64) for vector in rows.values()]
+    lengths = {int(vector.size) for vector in vectors}
+    if len(lengths) > 1:
+        raise ValueError(
+            f"every per-recording vector must have one length, got lengths {sorted(lengths)}."
+        )
+    width = lengths.pop() if lengths else 0
+    finite = [vector for vector in vectors if vector.size and np.isfinite(vector).all()]
+    alpha = 1.0 - float(confidence)
+    record: Dict[str, Any] = {
+        "statistic": "mean",
+        "n": len(finite),
+        "n_dropped": len(vectors) - len(finite),
+        "confidence": float(confidence),
+        "resamples": int(resamples),
+        "seed": int(seed),
+        "method": "percentile bootstrap over recordings, one resampling for every position",
+        "point": [float("nan")] * width,
+        "lo": [float("nan")] * width,
+        "hi": [float("nan")] * width,
+    }
+    if len(finite) < MIN_GROUP_SIZE:
+        record["note"] = (
+            f"only {len(finite)} finite recording(s); below the minimum of {MIN_GROUP_SIZE} a "
+            f"bootstrap interval reproduces the sample rather than estimating its spread"
+        )
+        return record
+    matrix = np.stack(finite, axis=0)
+    generator = np.random.default_rng(int(seed))
+    draws = generator.integers(0, matrix.shape[0], size=(int(resamples), matrix.shape[0]))
+    means = matrix[draws].mean(axis=1)
+    record["point"] = matrix.mean(axis=0).tolist()
+    record["lo"] = np.quantile(means, alpha / 2.0, axis=0).tolist()
+    record["hi"] = np.quantile(means, 1.0 - alpha / 2.0, axis=0).tolist()
+    return record
+
+
+def per_lag_latent_totals(
+    model: Any, outputs: Mapping[str, torch.Tensor], contributing: torch.Tensor
+) -> Dict[str, torch.Tensor]:
+    r"""One batch's per-lag latent readouts, summed over the scored anchors the lag was live at.
+
+    For every lag $\ell$ the bounded update is recomputed with that lag's proposals alone
+    removed, from the cached array and by the same subtraction the band arms use:
+
+    $$\bar a_t^{\setminus \ell} = \bar a_t - c_L\, r^\mu_{t,\ell}, \qquad
+      a_t^{\setminus \ell} = a_{\max}\tanh\bigl(\bar a_t^{\setminus \ell} / a_{\max}\bigr),$$
+
+    and likewise for the scale channel where the arm has one. Three sums come back per lag, each
+    over the scored anchors at which the lag carried any available channel:
+
+    * ``proposal_norm_sum``: $\sum_t \lVert r^\mu_{t,\ell} \rVert_2$, what the head emitted;
+    * ``update_shift_sum``: $\sum_t \lVert a_t - a_t^{\setminus \ell} \rVert_2$, what removing it
+      does to the bounded mean update -- zero where the limiter has saturated, however large the
+      proposal, which is what separates this from the first;
+    * ``divergence_drop_sum``: $\sum_t \bigl(K_t - K_t^{\setminus \ell}\bigr)$, what removing it
+      does to the divergence. Signed: removing a lag can raise the divergence when its proposal
+      was cancelling another's.
+
+    ``scale_proposal_norm_sum`` joins them on an arm with a scale channel. Sums rather than means,
+    so a pass accumulates them with :func:`merge_counts` and divides once by the per-lag anchor
+    count the exposure readout already carries.
+
+    **None of the three is an allocation.** The reallocation the qualification names --
+    $r_\ell \mapsto r_\ell + k_\ell(h_t)$ with $\sum_\ell k_\ell \equiv 0$ -- leaves the update,
+    the divergence and every prediction unchanged while changing all three readouts at every lag.
+
+    Args:
+        model: The net, for $c_L$ and the two residual bounds.
+        outputs: A forward's dict taken with ``return_proposals=True`` on the local fusion.
+        contributing: The $0/1$ scored-anchor indicator, $(B, A)$.
+
+    Returns:
+        ``{'proposal_norm_sum', 'update_shift_sum', 'divergence_drop_sum'}`` and, where the arm
+        has a scale channel, ``'scale_proposal_norm_sum'``, each $(L,)$ in float64.
+
+    Raises:
+        KeyError: If the forward was run without ``return_proposals``, naming the flag.
+    """
+    if "mean_proposals" not in outputs:
+        raise KeyError(
+            "per_lag_latent_totals needs the per-lag proposals: call the forward with "
+            "return_proposals=True."
+        )
+    proposals = outputs["mean_proposals"]  # (B, A, L, d_z)
+    scale_proposals = outputs.get("scale_proposals")
+    raw_b_full = outputs.get("raw_update_logsigma")
+    n_lags = int(proposals.shape[2])
+    scale = float(model.lag_scale)
+    # Weighted by the anchors the lag was live at: an out-of-range or cold lag has an exactly
+    # zero proposal, and averaging its zero shift over every scored anchor would dilute a live
+    # lag's figure by the schedule rather than by the source.
+    live = (outputs["lag_valid"].to(torch.float64) * contributing.to(torch.float64)[:, :, None])
+
+    a_full = outputs["update_mean"]
+    kl_full = outputs["kld_per_anchor"]
+    raw_a_full = outputs["raw_update_mean"]
+
+    proposal_norm = proposals.norm(dim=-1).to(torch.float64)  # (B, A, L)
+    update_shift = torch.zeros_like(proposal_norm)
+    divergence_drop = torch.zeros_like(proposal_norm)
+    for start in range(0, n_lags, LAG_PROFILE_CHUNK):
+        stop = min(start + LAG_PROFILE_CHUNK, n_lags)
+        raw_a = raw_a_full[:, :, None, :] - scale * proposals[:, :, start:stop]
+        a_minus = bound_update(raw_a, model.residual_mu_scale)
+        b_minus: Optional[torch.Tensor] = None
+        if scale_proposals is not None and raw_b_full is not None:
+            raw_b = raw_b_full[:, :, None, :] - scale * scale_proposals[:, :, start:stop]
+            b_minus = bound_update(raw_b, model.residual_logsigma_scale)
+        update_shift[:, :, start:stop] = (a_full[:, :, None, :] - a_minus).norm(dim=-1)
+        divergence_drop[:, :, start:stop] = (
+            kl_full[:, :, None].to(torch.float64)
+            - residual_kl(a_minus, b_minus).sum(dim=-1).to(torch.float64)
+        )
+
+    totals = {
+        "proposal_norm_sum": (proposal_norm * live).sum(dim=(0, 1)),
+        "update_shift_sum": (update_shift * live).sum(dim=(0, 1)),
+        "divergence_drop_sum": (divergence_drop * live).sum(dim=(0, 1)),
+    }
+    if scale_proposals is not None:
+        totals["scale_proposal_norm_sum"] = (
+            scale_proposals.norm(dim=-1).to(torch.float64) * live
+        ).sum(dim=(0, 1))
+    return totals
+
+
+def lag_profile_summary(
+    totals: Optional[Mapping[str, torch.Tensor]], anchors_per_lag: Optional[torch.Tensor]
+) -> Dict[str, Any]:
+    """Reduce the accumulated per-lag sums to per-lag means, missing where a lag had no support.
+
+    Args:
+        totals: The accumulated :func:`per_lag_latent_totals`, or ``None`` when nothing ran.
+        anchors_per_lag: The per-lag live-anchor count from :func:`lag_exposure`, or ``None``.
+
+    Returns:
+        ``{quantity: [per-lag mean or MISSING]}`` with ``anchors_per_lag`` beside it, empty when
+        nothing was accumulated.
+    """
+    if not totals or anchors_per_lag is None:
+        return {}
+    counts = anchors_per_lag.to(torch.float64).cpu()
+    summary: Dict[str, Any] = {"anchors_per_lag": counts.tolist()}
+    for name, total in totals.items():
+        values = total.to(torch.float64).cpu()
+        summary[name[: -len("_sum")]] = [
+            MISSING if float(count) <= 0.0 else float(value) / float(count)
+            for value, count in zip(values.tolist(), counts.tolist())
+        ]
+    return summary
 
 
 def qualified_report(blocks: Dict[str, Any]) -> Dict[str, Any]:
@@ -353,15 +631,20 @@ def band_exposure(
 
 
 __all__ = [
+    "LAG_PROFILE_CHUNK",
     "MISSING",
     "band_exposure",
     "band_masks",
     "band_suppression_block",
+    "bootstrap_curve",
     "cancellation_summary",
     "cancellation_totals",
     "channel_exposure",
     "lag_exposure",
+    "lag_profile_summary",
     "merge_cancellation",
     "merge_counts",
+    "paired_margin",
+    "per_lag_latent_totals",
     "qualified_report",
 ]

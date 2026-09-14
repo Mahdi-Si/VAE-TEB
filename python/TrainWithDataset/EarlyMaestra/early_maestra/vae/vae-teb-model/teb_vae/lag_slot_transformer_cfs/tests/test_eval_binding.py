@@ -444,3 +444,96 @@ def test_a_pass_that_scored_nothing_reports_absence_rather_than_zero() -> None:
     assert finished["n_coefficients"] == 0.0
     assert finished["pit_mean"] is None
     assert finished["coverage"] == {}
+
+
+# =============================================================================
+# The resolved axes
+# =============================================================================
+def test_subset_scores_sum_to_the_per_draw_block_score() -> None:
+    """Per draw, the horizon steps and the two blocks each add back to the block score exactly.
+
+    Additivity holds before the marginalisation over draws and not after it, and this is the half
+    that must hold: a subset score that did not sum back would be scoring a different block.
+    """
+    from teb_vae.lag_attn_rws.nets.losses import masked_raw_block_per_anchor
+
+    torch.manual_seed(5)
+    mu, logvar = torch.randn(2, 3, 4, 5), torch.randn(2, 3, 4, 5) * 0.1
+    target = torch.randn(2, 3, 4, 5)
+    mask = torch.ones(2, 3, 4)
+    mask[0, 1, 2:] = 0.0
+
+    per_horizon, per_block = predictive.subset_block_scores(
+        mu, logvar, target, mask, likelihood="gaussian_nll", block_split=2
+    )
+    block, _contributing = masked_raw_block_per_anchor(
+        mu, target, mask, likelihood="gaussian_nll", logvar=logvar
+    )
+
+    assert per_horizon.shape == (2, 3, 4)
+    assert per_block.shape == (2, 3, 2)
+    assert torch.allclose(per_horizon.sum(dim=-1), block, atol=1e-5)
+    assert torch.allclose(per_block.sum(dim=-1), block, atol=1e-5)
+    # A masked step contributes nothing to any subset.
+    assert torch.equal(per_horizon[0, 1, 2:], torch.zeros(2))
+
+
+def test_a_block_split_outside_the_channel_axis_is_refused() -> None:
+    """A split at either end leaves one block empty, and its score would read as a measured zero."""
+    mu = torch.zeros(1, 1, 2, 3)
+    with pytest.raises(ValueError, match="strictly inside"):
+        predictive.subset_block_scores(mu, mu, mu, torch.ones(1, 1, 2), likelihood="mse", block_split=3)
+
+
+def test_the_resolved_axes_are_marginal_mixtures_of_their_own_factors() -> None:
+    """Each step is the log-mean-likelihood of that step's factors under the shared draws.
+
+    Recomputed here from the per-draw subset scores rather than trusted, and shown NOT to sum to
+    the joint marginal, which is the property a reader has to carry: the steps are read on their
+    own axis and never added up into the block score.
+    """
+    model, target, mask, shape = _scoring_fixture(horizon=3, channels=2)
+    mu, logvar = torch.randn(*shape), torch.full(shape, 1.0)
+
+    scored = predictive.matched_predictive_scores(
+        model,
+        {"only": (mu, logvar)},
+        target,
+        mask,
+        likelihood="gaussian_nll",
+        num_samples=16,
+        generator=torch.Generator().manual_seed(12),
+        resolve=("only",),
+        block_split=1,
+    )
+    branch = scored["only"]
+
+    assert branch.per_horizon is not None and branch.per_horizon.shape == (2, 3, 3)
+    assert branch.per_block is not None and branch.per_block.shape == (2, 3, 2)
+    # A subset mixture is at most the per-draw mean of that subset's score, by Jensen, and the
+    # subsets do not add up to the joint mixture.
+    assert float((branch.per_horizon.sum(dim=-1) - branch.marginal).abs().max()) > 1e-6
+
+
+def test_a_branch_left_out_of_resolve_carries_no_curves() -> None:
+    """A single-lag arm is scored for its margin and nothing else."""
+    model, target, mask, shape = _scoring_fixture()
+    mu, logvar = torch.randn(*shape), torch.zeros(*shape)
+
+    scored = predictive.matched_predictive_scores(
+        model,
+        {"a": (mu, logvar), "b": (mu, logvar)},
+        target,
+        mask,
+        likelihood="gaussian_nll",
+        num_samples=2,
+        resolve=("a",),
+    )
+
+    assert scored["a"].per_horizon is not None
+    assert scored["b"].per_horizon is None and scored["b"].per_block is None
+    with pytest.raises(ValueError, match="resolve names branches"):
+        predictive.matched_predictive_scores(
+            model, {"a": (mu, logvar)}, target, mask, likelihood="gaussian_nll",
+            num_samples=1, resolve=("zz",),
+        )

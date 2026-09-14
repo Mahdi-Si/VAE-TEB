@@ -1,16 +1,19 @@
 r"""Scoring a lag-residual checkpoint: the matched predictive gap, the lag readouts, the controls.
 
-Seven modules, in the order a run uses them:
+Eight modules, in the order a run uses them:
 
 * :mod:`~teb_vae.lag_slot_transformer_cfs.eval.binding` -- which class a checkpoint is rebuilt
   through, which constructor keys are reconciled against it, what this encoder has to disclose
   about its causal standing, and which shared analyses this architecture cannot produce.
 * :mod:`~teb_vae.lag_slot_transformer_cfs.eval.predictive` -- the marginalised Monte Carlo score,
   its concentration diagnostic, and the mixture calibration census.
-* :mod:`~teb_vae.lag_slot_transformer_cfs.eval.lag_metrics` -- band suppression margins, the
-  cancellation ratio with both of its parts, and per-lag and per-channel exposure.
+* :mod:`~teb_vae.lag_slot_transformer_cfs.eval.lag_metrics` -- band suppression margins with
+  their paired intervals, the per-lag latent profile, the cancellation ratio with both of its
+  parts, per-lag and per-channel exposure, and the recording-level bootstrap of a curve.
+* :mod:`~teb_vae.lag_slot_transformer_cfs.eval.figures` -- every figure of a pass and of an
+  acceptance record, drawn from the artifacts alone so a figure and its number cannot disagree.
 * :mod:`~teb_vae.lag_slot_transformer_cfs.eval.run` -- the entry point that drives one pass and
-  writes ``summary.json``.
+  writes ``summary.json``, the per-recording, per-lag and per-horizon tables, and the figures.
 * :mod:`~teb_vae.lag_slot_transformer_cfs.eval.verify` -- the single-run gate, which reads a
   finished summary and needs neither a checkpoint nor a numeric stack.
 * :mod:`~teb_vae.lag_slot_transformer_cfs.eval.latent_probes` -- frozen probes from each latent
