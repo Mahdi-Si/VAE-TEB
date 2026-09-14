@@ -51,6 +51,10 @@ SMOKE_DRAWS = 3
 #: wider interval is not made narrower by resampling it more.
 SMOKE_RESAMPLES = 100
 
+#: Segments the single-lag predictive profile is scored on. Fewer than the fixture holds, so the
+#: cap is exercised as a cap rather than as a whole-split pass under another name.
+SMOKE_PROFILE_SEGMENTS = 3
+
 
 @pytest.fixture(scope="module")
 def evaluated(tmp_path_factory):
@@ -106,6 +110,9 @@ def evaluated(tmp_path_factory):
             "num_mc_samples": SMOKE_DRAWS,
             "bootstrap_resamples": SMOKE_RESAMPLES,
             "occlusion_bands": {"near": [0, 3], "far": [4, 8]},
+            # The single-lag predictive profile on a handful of segments, so the finest lag
+            # readout is exercised on real weights rather than recorded as not requested.
+            "caps": {"lag_profile": SMOKE_PROFILE_SEGMENTS},
         },
     }
     delta_path = tmp_path / "eval_overrides.yaml"
@@ -353,3 +360,102 @@ def test_the_acceptance_gate_passes_on_what_the_run_wrote(evaluated) -> None:
     )
     assert gap_verdict["status"] == "INCONCLUSIVE"
     assert gap_verdict["pred_gap_nats"] is not None
+
+
+def test_every_margin_carries_a_paired_interval_over_recordings(evaluated) -> None:
+    """The interval on a margin is the interval of the per-recording differences.
+
+    Two arms scored on the same recordings under the same draws differ per recording, and two
+    overlapping intervals of the two arms would call a consistent margin no difference.
+    """
+    summary, _path, _code = evaluated
+    bands = summary["lag_readouts"]["band_suppression"]
+    controls = summary["source_controls"]
+
+    for name in ("near", "far", "all"):
+        interval = bands[name]["margin_interval"]
+        assert interval["n_paired"] == summary["n_recordings"]
+        assert interval["lo"] <= bands[name]["margin_nats"] <= interval["hi"]
+    for control in ("replace_zeros", "replace_constant", "permute"):
+        interval = controls[f"{control}_margin_interval"]
+        assert interval["lo"] <= controls[f"{control}_margin_nats"] <= interval["hi"]
+    # The identities have intervals of no width at all, pairing being exact.
+    assert bands["none"]["margin_interval"]["lo"] == pytest.approx(0.0, abs=1e-9)
+    assert bands["none"]["margin_interval"]["hi"] == pytest.approx(0.0, abs=1e-9)
+    # And the bands are listed as the delta declared them, the identities bracketing them.
+    assert list(bands) == ["none", "near", "far", "all"]
+
+
+def test_the_horizon_axis_is_resolved_for_every_arm_under_the_shared_draws(evaluated) -> None:
+    """One curve per scored arm, the gap, and every margin paired per step.
+
+    The empty-band reference reproduces the matched arm at every step, which is the identity that
+    pins the per-step scoring to the per-block one.
+    """
+    summary, _path, _code = evaluated
+    block = summary["horizon_resolved"]
+    steps = block["positions"]
+
+    assert steps == list(range(1, len(steps) + 1))
+    assert {"base", "full", "suppress:none", "suppress:all", "silence"} <= set(block["nll"])
+    for record in block["nll"].values():
+        assert len(record["point"]) == len(steps)
+        assert all(lo <= point <= hi for point, lo, hi in zip(record["point"], record["lo"], record["hi"]))
+    assert all(abs(value) < eval_verify.EXACT_MARGIN_TOLERANCE for value in block["band_margins"]["none"]["point"])
+    assert set(block["control_margins"]) == {"silence", "replace_zeros", "replace_constant", "permute"}
+
+
+def test_the_block_axis_names_both_stored_blocks_with_their_kept_widths(evaluated) -> None:
+    """Scattering and phase-harmonic, each with the channels it actually kept."""
+    summary, _path, _code = evaluated
+    block = summary["block_resolved"]
+
+    assert block["positions"] == ["st", "ph"]
+    assert all(count > 0 for count in block["channels_per_block"].values())
+    assert len(block["pred_gap"]["point"]) == 2
+
+
+def test_the_lag_profile_reads_every_lag_in_latent_space_and_the_capped_ones_predictively(
+    evaluated,
+) -> None:
+    """The latent profile over the whole split; the predictive one over the cap, paired."""
+    summary, _path, _code = evaluated
+    profile = summary["lag_readouts"]["lag_profile"]
+    n_lags = summary["lag_readouts"]["lag_axis"]["n_lags"]
+
+    latent = profile["latent"]
+    assert set(latent) >= {"anchors_per_lag", "proposal_norm", "update_shift", "divergence_drop"}
+    for name in ("proposal_norm", "update_shift", "divergence_drop"):
+        assert len(latent[name]) == n_lags
+        assert all(value is not None for value in latent[name])
+
+    predictive = profile["predictive"]
+    assert predictive["status"] == "READ"
+    assert predictive["cap"] == SMOKE_PROFILE_SEGMENTS
+    assert 0 < predictive["n_segments"] <= summary["n_segments"]
+    assert len(predictive["margin_nats"]["point"]) == n_lags
+    # The profile ran on a subset, and every recording of that subset is paired.
+    assert predictive["n_recordings"] <= summary["n_recordings"]
+
+
+def test_the_figures_and_the_tables_are_written_and_listed(evaluated) -> None:
+    """Every figure the manifest names exists beside the summary, in the run's format, and the
+    per-lag and per-horizon tables carry what the figures were drawn from."""
+    from teb_vae.lag_slot_transformer_cfs.eval import figures as figure_module
+
+    summary, summary_path, _code = evaluated
+    manifest = summary["figures"]
+
+    assert set(manifest["files"]) == set(figure_module.RUN_FIGURES)
+    for relative in manifest["files"].values():
+        assert (summary_path.parent / relative).is_file()
+        assert relative.endswith(f".{manifest['format']}")
+    lag_rows = list(csv.DictReader(
+        (summary_path.parent / eval_run.LAG_PROFILE_FILENAME).read_text(encoding="utf-8").splitlines()
+    ))
+    assert len(lag_rows) == summary["lag_readouts"]["lag_axis"]["n_lags"]
+    assert {"lag", "seconds", "anchors", "divergence_drop", "predictive_margin_point"} <= set(lag_rows[0])
+    horizon_rows = list(csv.DictReader(
+        (summary_path.parent / eval_run.HORIZON_FILENAME).read_text(encoding="utf-8").splitlines()
+    ))
+    assert {row["series"] for row in horizon_rows} >= {"nll_base", "nll_full", "pred_gap"}

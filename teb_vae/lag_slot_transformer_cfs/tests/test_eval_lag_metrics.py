@@ -320,3 +320,204 @@ def test_the_qualification_travels_in_the_readout_rather_than_only_in_the_code()
     assert "physiological delay" in text
     # And it is added beside the blocks rather than replacing them.
     assert "band_suppression" in report
+
+
+# =============================================================================
+# Paired intervals
+# =============================================================================
+def _per_recording(**columns):
+    """A per-recording table from ``column=[values]``, recordings named by position.
+
+    Args:
+        **columns: One list per column, all the same length.
+
+    Returns:
+        ``{recording: {column: value}}``.
+    """
+    length = len(next(iter(columns.values())))
+    return {
+        f"rec{index}": {name: values[index] for name, values in columns.items()}
+        for index in range(length)
+    }
+
+
+def test_a_paired_margin_is_an_interval_of_per_recording_differences() -> None:
+    """The interval that belongs on a margin is the interval of the paired differences.
+
+    Two arms whose scores swing together across recordings have wide intervals of their own and a
+    narrow interval on their difference, and reading the two arm intervals as overlapping would
+    call a consistent margin no difference.
+    """
+    matched = [100.0, 250.0, 40.0, 180.0, 90.0, 300.0]
+    intervened = [value + 2.0 for value in matched]
+    table = _per_recording(nll_full=matched, **{"nll_suppress:near": intervened})
+
+    record = lag_metrics.paired_margin(
+        table, "nll_suppress:near", "nll_full", resamples=200, seed=0
+    )
+
+    assert record["n_paired"] == 6
+    assert record["point"] == pytest.approx(2.0)
+    # Every difference is exactly two, so the interval has no width at all.
+    assert record["lo"] == pytest.approx(2.0)
+    assert record["hi"] == pytest.approx(2.0)
+
+
+def test_a_paired_margin_is_missing_when_an_arm_did_not_run() -> None:
+    """Missing, not zero: an arm that did not run measured nothing."""
+    table = _per_recording(nll_full=[1.0, 2.0, 3.0])
+
+    assert lag_metrics.paired_margin(table, "nll_permute", "nll_full", resamples=100, seed=0) is (
+        lag_metrics.MISSING
+    )
+
+
+def test_the_suppression_block_carries_the_paired_interval_when_given() -> None:
+    """Beside the point margin, under its own key, and absent where no pairing was possible."""
+    headline = _headline(nll_full=10.0, **{"nll_suppress:near": 11.0, "nll_suppress:cold": 10.5})
+    exposure = {
+        "near": {"anchors": 4.0, "channels": 8.0},
+        "cold": {"anchors": 4.0, "channels": 0.0},
+    }
+    intervals = {"near": {"point": 1.0, "lo": 0.5, "hi": 1.5}, "cold": {"point": 0.5}}
+
+    block = lag_metrics.band_suppression_block(headline, exposure, intervals=intervals)
+
+    assert block["near"]["margin_interval"] == intervals["near"]
+    # An unsupported band has no margin and therefore no interval either.
+    assert block["cold"]["margin_interval"] is lag_metrics.MISSING
+    assert lag_metrics.band_suppression_block(headline, exposure)["near"]["margin_interval"] is (
+        lag_metrics.MISSING
+    )
+
+
+# =============================================================================
+# The curve bootstrap
+# =============================================================================
+def test_the_curve_bootstrap_takes_one_resampling_for_every_position() -> None:
+    """A per-position resampling would give adjacent steps intervals over different recordings.
+
+    Checked by the one property a shared resampling has that independent ones do not: a curve
+    that is a constant multiple of another gets an interval that is the same multiple, position
+    for position.
+    """
+    rows = {f"rec{index}": [float(index), 2.0 * float(index)] for index in range(8)}
+
+    record = lag_metrics.bootstrap_curve(rows, resamples=300, seed=3)
+
+    assert record["n"] == 8
+    assert record["point"] == pytest.approx([3.5, 7.0])
+    assert record["lo"][1] == pytest.approx(2.0 * record["lo"][0])
+    assert record["hi"][1] == pytest.approx(2.0 * record["hi"][0])
+    assert record["lo"][0] <= record["point"][0] <= record["hi"][0]
+
+
+def test_the_curve_bootstrap_refuses_vectors_of_two_lengths() -> None:
+    """Two lengths are two axes, and a mean across them is a mean of nothing in particular."""
+    with pytest.raises(ValueError, match="one length"):
+        lag_metrics.bootstrap_curve({"a": [1.0, 2.0], "b": [1.0]}, resamples=100, seed=0)
+
+
+def test_the_curve_bootstrap_reports_absence_below_the_recording_minimum() -> None:
+    """Two recordings reproduce themselves rather than estimating a spread."""
+    record = lag_metrics.bootstrap_curve({"a": [1.0], "b": [2.0]}, resamples=100, seed=0)
+
+    assert record["n"] == 2
+    assert "note" in record
+    assert all(value != value for value in record["point"])  # NaN throughout
+
+
+# =============================================================================
+# The per-lag latent profile
+# =============================================================================
+def _awake_forward():
+    """A tiny model with a non-zero source pathway, and its forward with the proposals kept.
+
+    The constructed head is zero at its output, so every proposal is zero and every per-lag
+    readout is trivially zero; the projection is given random weights first so the profile has
+    something to measure.
+
+    Returns:
+        ``(model, outputs, contributing)``.
+    """
+    from .conftest import build_tiny_model, tiny_streams
+
+    model = build_tiny_model()
+    torch.manual_seed(1)
+    torch.nn.init.normal_(model.proposal_head.output_proj.weight, std=0.3)
+    torch.nn.init.normal_(model.proposal_head.output_proj.bias, std=0.3)
+    model.eval()
+    y_st, y_ph, u_stream = tiny_streams()
+    with torch.no_grad():
+        outputs = model(y_st, y_ph, u_stream, anchor_phase=0, anchor_stride=1, return_proposals=True)
+    contributing = outputs["anchor_valid"].to(torch.float64)
+    return model, outputs, contributing
+
+
+def test_the_latent_profile_agrees_with_removing_one_lag_at_a_time() -> None:
+    """The vectorised, chunked profile is the band suppression at the finest partition.
+
+    Checked against the one-lag-at-a-time path the band arms already use, so the two readouts
+    cannot come to describe different removals.
+    """
+    from teb_vae.lag_slot_transformer_cfs.nets.controls import suppressed_parameters
+
+    model, outputs, contributing = _awake_forward()
+    live = outputs["lag_valid"].to(torch.float64) * contributing[:, :, None]
+
+    totals = lag_metrics.per_lag_latent_totals(model, outputs, contributing)
+
+    n_lags = int(model.n_lags)
+    for lag in range(n_lags):
+        removed = torch.zeros(n_lags, dtype=torch.bool)
+        removed[lag] = True
+        single = suppressed_parameters(model, outputs, removed)
+        drop = (outputs["kld_per_anchor"] - single["kld_per_anchor"]).to(torch.float64)
+        shift = (outputs["update_mean"] - single["update_mean"]).norm(dim=-1).to(torch.float64)
+        assert float(totals["divergence_drop_sum"][lag]) == pytest.approx(
+            float((drop * live[:, :, lag]).sum()), abs=1e-6
+        )
+        assert float(totals["update_shift_sum"][lag]) == pytest.approx(
+            float((shift * live[:, :, lag]).sum()), abs=1e-6
+        )
+    # The proposal norm is what the head emitted, and it is not zero on a woken pathway.
+    assert float(totals["proposal_norm_sum"].sum()) > 0.0
+    assert "scale_proposal_norm_sum" in totals
+
+
+def test_the_latent_profile_has_no_scale_channel_on_the_mean_only_arm() -> None:
+    """No scale head, no scale profile: absent rather than a row of zeros."""
+    from .conftest import build_tiny_model, tiny_streams
+
+    model = build_tiny_model(mean_only_residual=True)
+    model.eval()
+    y_st, y_ph, u_stream = tiny_streams()
+    with torch.no_grad():
+        outputs = model(y_st, y_ph, u_stream, anchor_phase=0, anchor_stride=1, return_proposals=True)
+
+    totals = lag_metrics.per_lag_latent_totals(
+        model, outputs, outputs["anchor_valid"].to(torch.float64)
+    )
+
+    assert "scale_proposal_norm_sum" not in totals
+    assert set(totals) == {"proposal_norm_sum", "update_shift_sum", "divergence_drop_sum"}
+
+
+def test_the_latent_profile_needs_the_proposals() -> None:
+    """Without them there is nothing to remove, and the refusal names the flag."""
+    from .conftest import build_tiny_model
+
+    with pytest.raises(KeyError, match="return_proposals"):
+        lag_metrics.per_lag_latent_totals(build_tiny_model(), {}, torch.ones(1, 1))
+
+
+def test_the_lag_profile_summary_records_missing_where_a_lag_had_no_support() -> None:
+    """A lag no scored anchor was live at has no mean, and a zero there would read as inert."""
+    totals = {"proposal_norm_sum": torch.tensor([4.0, 0.0, 6.0])}
+    anchors = torch.tensor([2.0, 0.0, 3.0])
+
+    summary = lag_metrics.lag_profile_summary(totals, anchors)
+
+    assert summary["proposal_norm"] == [2.0, lag_metrics.MISSING, 2.0]
+    assert summary["anchors_per_lag"] == [2.0, 0.0, 3.0]
+    assert lag_metrics.lag_profile_summary(None, anchors) == {}

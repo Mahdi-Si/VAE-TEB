@@ -42,6 +42,12 @@ not take that on trust: it compares the recordings the two sets actually scored 
 intersect. Two evaluation directories can point at different files and still overlap -- a fold's
 train partition contains another fold's test recordings -- so the file paths are reported and the
 recordings are what decide.
+
+**The record is the artifact; the report and the figures are views of it.** ``--report`` writes
+the same record as a markdown document a reader can put in front of a reviewer, and ``--figures``
+draws its comparisons, its per-arm gaps and its band search. Both are built from the record after
+it is assembled, so nothing in them can differ from it, and both are optional: the figures pull in
+the plotting stack, and the pass stays stdlib-plus-``numpy`` without them.
 """
 from __future__ import annotations
 
@@ -1173,6 +1179,252 @@ def check_confirmation_partition(
 
 
 # =============================================================================
+# The report
+# =============================================================================
+def _cell(record: Optional[Mapping[str, Any]], key: str = "point") -> str:
+    """One interval as a table cell: the point with both ends, or a dash.
+
+    Args:
+        record: A bootstrap record, or ``None``.
+        key: The point's key.
+
+    Returns:
+        ``point [lo, hi]`` formatted for markdown, or ``—`` when nothing was measured.
+    """
+    if not record:
+        return "—"
+    point = record.get(key)
+    if point is None or not np.isfinite(float(point)):
+        return "—"
+    lo, hi = record.get("lo"), record.get("hi")
+    if lo is None or hi is None or not (np.isfinite(float(lo)) and np.isfinite(float(hi))):
+        return f"{float(point):.4g}"
+    return f"{float(point):.4g} [{float(lo):.4g}, {float(hi):.4g}]"
+
+
+def _table(header: Sequence[str], rows: Sequence[Sequence[Any]]) -> List[str]:
+    """A markdown table.
+
+    Args:
+        header: The column names.
+        rows: The rows, each as long as the header.
+
+    Returns:
+        The table's lines.
+    """
+    lines = ["| " + " | ".join(str(cell) for cell in header) + " |"]
+    lines.append("|" + "|".join("---" for _ in header) + "|")
+    for row in rows:
+        lines.append("| " + " | ".join(str(cell) for cell in row) + " |")
+    return lines
+
+
+def _analysis_report(block: Mapping[str, Any], title: str) -> List[str]:
+    """The markdown of one analysis block, selection or confirmation.
+
+    Args:
+        block: The analysis block.
+        title: The section title.
+
+    Returns:
+        The section's lines.
+    """
+    lines: List[str] = [f"## {title}", ""]
+
+    arms = block.get("arms") or {}
+    lines += ["### Arms and their evidence", ""]
+    lines += _table(
+        ["Arm", "Training seeds", "Meets minimum", "Runs"],
+        [
+            [arm, ", ".join(entry.get("training_seeds") or []) or "—",
+             "yes" if entry.get("meets_minimum") else "no", entry.get("n_training_seeds", 0)]
+            for arm, entry in arms.items()
+        ] or [["—", "—", "—", "—"]],
+    )
+
+    comparisons = block.get("primary_comparisons") or {}
+    lines += ["", "### Declared primary comparisons", "",
+              "Every column is a negative log density in nats per anchor, so a **negative** "
+              "difference favours the left arm.", ""]
+    lines += _table(
+        ["Comparison", "Left − right", "Status", "Difference (nats per anchor)", "Isolates"],
+        [
+            [name, f"{entry.get('left_arm')} − {entry.get('right_arm')}", entry.get("status", ""),
+             _cell(entry.get("difference_nats")), str(entry.get("isolates", "")).strip()]
+            for name, entry in comparisons.items()
+        ] or [["—"] * 5],
+    )
+
+    per_arm = block.get("per_arm") or {}
+    lines += ["", "### Each arm against its own base and against the frozen reference", "",
+              "The internal gap is base − full, so positive means the source helped the arm's "
+              "own base. The two reference differences are full − reference and base − reference; "
+              "negative favours the arm, and a confidently positive base − reference is a base "
+              "that joint training left behind.", ""]
+    lines += _table(
+        ["Arm", "Seeds", "Internal gap", "Divergence per anchor", "Full − reference",
+         "Base − reference", "Reference status"],
+        [
+            [arm, entry.get("n_training_seeds", 0), _cell(entry.get("internal_gap_nats")),
+             _cell(entry.get("divergence_per_anchor")),
+             _cell((entry.get("against_reference") or {}).get("full_minus_reference_nats")),
+             _cell((entry.get("against_reference") or {}).get("base_minus_reference_nats")),
+             (entry.get("against_reference") or {}).get("status", "")]
+            for arm, entry in per_arm.items()
+        ] or [["—"] * 7],
+    )
+
+    controls = block.get("source_controls") or {}
+    lines += ["", "### Source controls", "",
+              "Each margin is the intervened arm's score less the matched one's; positive means "
+              "the fitted model predicts worse without what the intervention removed. The "
+              "silence margin equals the gap by construction.", ""]
+    control_names = list(CONTROL_COLUMNS)
+    lines += _table(
+        ["Arm", *control_names],
+        [
+            [arm, *[
+                _cell((entry.get("controls") or {}).get(name, {}).get("margin_nats"))
+                if (entry.get("controls") or {}).get(name, {}).get("status") == "READ"
+                else (entry.get("controls") or {}).get(name, {}).get("status", "—")
+                for name in control_names
+            ]]
+            for arm, entry in controls.items()
+        ] or [["—"] * (len(control_names) + 1)],
+    )
+
+    bands = block.get("exploratory_bands") or {}
+    lines += ["", "### Exploratory lag bands", "",
+              "Nominal intervals first, the family-adjusted interval in the second cell; the "
+              "adjusted one is what a claim about the peak band rests on. The margins do not "
+              "decompose the gap and are not a physiological delay.", ""]
+    band_rows: List[List[Any]] = []
+    for arm, entry in bands.items():
+        if entry.get("status") != "READ":
+            band_rows.append([arm, "—", entry.get("status", ""), "—", "—"])
+            continue
+        for name in entry.get("searched_bands") or []:
+            band = (entry.get("bands") or {}).get(name) or {}
+            band_rows.append([
+                arm, name, "peak" if name == entry.get("peak_band") else "",
+                _cell(band.get("margin_nats")), _cell(band.get("margin_nats_family_adjusted")),
+            ])
+    lines += _table(["Arm", "Band", "Note", "Nominal", "Family-adjusted"], band_rows or [["—"] * 5])
+
+    stability = block.get("monte_carlo_stability") or {}
+    lines += ["", "### Monte Carlo stability of the gap", ""]
+    lines += _table(
+        ["Arm", "Gap by draw count", "Range (nats)", "Missing draw counts"],
+        [
+            [arm, ", ".join(
+                f"K={draws}: {'—' if value is None else f'{value:.4g}'}"
+                for draws, value in (entry.get("gap_by_draw_count") or {}).items()
+            ) or "—",
+             "—" if entry.get("range_nats") is None else f"{entry['range_nats']:.4g}",
+             ", ".join(str(d) for d in entry.get("missing_draw_counts") or []) or "none"]
+            for arm, entry in stability.items()
+        ] or [["—"] * 4],
+    )
+
+    calibration = block.get("calibration") or {}
+    lines += ["", "### Mixture calibration, averaged over seeds", ""]
+    calibration_rows: List[List[Any]] = []
+    for arm, branches in calibration.items():
+        for branch, entry in (branches or {}).items():
+            coverage = entry.get("coverage") or {}
+            calibration_rows.append([
+                arm, branch, f"{entry.get('pit_mean', float('nan')):.3f}",
+                ", ".join(f"{level}: {value:.3f}" for level, value in coverage.items()),
+            ])
+    lines += _table(["Arm", "Branch", "PIT mean", "Coverage by nominal level"],
+                    calibration_rows or [["—"] * 4])
+
+    probes = block.get("latent_probes") or {}
+    lines += ["", "### Latent probes", ""]
+    lines += _table(
+        ["Arm", "Status", "Held-out R² by readout"],
+        [
+            [arm, entry.get("status", ""), ", ".join(
+                f"{name}: {value:.3f}" for name, value in (entry.get("r2") or {}).items()
+            ) or "—"]
+            for arm, entry in probes.items()
+        ] or [["—"] * 3],
+    )
+
+    lines += ["", "### Verdicts", ""]
+    lines += _table(
+        ["Verdict", "Status", "Detail"],
+        [[entry["name"], entry["status"], entry["detail"]] for entry in block.get("verdicts") or []]
+        or [["—"] * 3],
+    )
+    return lines
+
+
+def report_markdown(record: Mapping[str, Any]) -> str:
+    """Render one acceptance record as a markdown document.
+
+    Every number in the document is read from the record; nothing is recomputed, so the document
+    cannot disagree with the JSON beside it.
+
+    Args:
+        record: The acceptance record :func:`assess` returned.
+
+    Returns:
+        The document.
+    """
+    plan = record.get("plan") or {}
+    lines: List[str] = [
+        "# Acceptance record",
+        "",
+        f"Plan `{plan.get('path')}` at digest `{plan.get('digest')}`, revision "
+        f"{plan.get('revision')}, declared on {plan.get('declared_on')}. Protocol: "
+        + ", ".join(f"{key} = {value}" for key, value in (plan.get("protocol") or {}).items())
+        + ".",
+        "",
+        f"{len(record.get('runs') or [])} development run(s)"
+        + (
+            f", {len(record.get('confirmation_runs') or [])} confirmation run(s)"
+            if record.get("confirmation_runs")
+            else ", no confirmation runs"
+        )
+        + (
+            ""
+            if record.get("reference") is None
+            else f"; frozen reference `{(record.get('reference') or {}).get('directory')}`"
+        )
+        + ".",
+        "",
+        "## Overall verdicts",
+        "",
+    ]
+    lines += _table(
+        ["Verdict", "Status", "Detail"],
+        [[entry["name"], entry["status"], entry["detail"]] for entry in record.get("verdicts") or []],
+    )
+    lines += [""]
+    lines += _analysis_report(record.get("selection") or {}, "Selection runs")
+    if record.get("confirmation"):
+        lines += [""]
+        lines += _analysis_report(record["confirmation"], "Confirmation runs")
+    figures = record.get("figures") or {}
+    if figures:
+        lines += ["", "## Figures", ""]
+        lines += [f"- `{name}`: `{path}`" for name, path in figures.items()]
+    lines += ["", "## Runs", ""]
+    lines += _table(
+        ["Directory", "Arm", "Training seed", "Eval seed", "Draws", "Split", "Recordings"],
+        [
+            [entry.get("directory"), entry.get("arm"), entry.get("training_seed"),
+             entry.get("eval_seed"), entry.get("num_mc_samples"), entry.get("split_label"),
+             entry.get("n_recordings")]
+            for entry in record.get("runs") or []
+        ],
+    )
+    lines.append("")
+    return "\n".join(lines)
+
+
+# =============================================================================
 # The pass
 # =============================================================================
 def analyse(
@@ -1318,6 +1570,8 @@ def main(
     confirmation_reference: Optional[str] = None,
     plan: Optional[str] = None,
     output: Optional[str] = None,
+    report: Optional[str] = None,
+    figures: Optional[str] = None,
     sources: Optional[Mapping[str, str]] = None,
 ) -> int:
     """Read the evidence under one predeclaration and report what it supports.
@@ -1330,6 +1584,9 @@ def main(
         confirmation_reference: The frozen reference scored on the reserved partition, or ``None``.
         plan: The predeclaration to read, or ``None`` for the committed one.
         output: Where to write the record, or ``None`` to print it.
+        report: Where to write the record as a markdown document, or ``None`` for no document.
+        figures: A directory to draw the record's figures into, or ``None`` for no figures. The
+            plotting stack is imported only when this is given.
         sources: Where each launch value came from, recorded in the output.
 
     Returns:
@@ -1359,6 +1616,15 @@ def main(
     )
     record["run"] = {"argument_sources": dict(sources or {})}
 
+    if figures is not None:
+        # Imported here and only here: the figures pull in matplotlib, and this pass must stay
+        # runnable on a box that has the record and nothing else.
+        from teb_vae.lag_slot_transformer_cfs.eval import figures as figure_module
+
+        figure_module.configure_figure_style()
+        record["figures"] = figure_module.render_acceptance_figures(record, figures)
+        print(f"wrote {len(record['figures'])} figure(s) into {figures}", file=sys.stderr)
+
     text = json.dumps(json_safe(record), indent=2)
     if output is not None:
         with open(str(output), "w", encoding="utf-8") as handle:
@@ -1366,6 +1632,10 @@ def main(
         print(f"wrote {output}", file=sys.stderr)
     else:
         print(text)
+    if report is not None:
+        with open(str(report), "w", encoding="utf-8") as handle:
+            handle.write(report_markdown(json_safe(record)))
+        print(f"wrote {report}", file=sys.stderr)
     for entry in record["verdicts"]:
         print(f"{entry['status']:<13} {entry['name']}: {entry['detail']}", file=sys.stderr)
     return 0 if record["passed"] else 1
@@ -1391,6 +1661,10 @@ RUN_ARGS: Dict[str, Any] = {
     "plan": None,
     # Where to write the record, or None to print it.
     "output": None,
+    # Where to write the record as a markdown document, or None for no document.
+    "report": None,
+    # A directory to draw the record's figures into, or None for no figures.
+    "figures": None,
 }
 
 
@@ -1422,6 +1696,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--plan", default=None, help="An alternative predeclaration.")
     parser.add_argument("--output", default=None, help="Where to write the record.")
+    parser.add_argument(
+        "--report", default=None, help="Where to write the record as a markdown document."
+    )
+    parser.add_argument(
+        "--figures", default=None, help="A directory to draw the record's figures into."
+    )
     return parser
 
 
