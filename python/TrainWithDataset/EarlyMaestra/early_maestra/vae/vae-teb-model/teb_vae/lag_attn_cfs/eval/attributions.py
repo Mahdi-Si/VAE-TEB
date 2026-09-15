@@ -69,7 +69,7 @@ from torch import nn
 
 from teb_vae.lag_attn_cfs.eval import cohort, lag_hist, traces
 from teb_vae.lag_attn_cfs.eval import figures_seam as figures
-from teb_vae.lag_attn_cfs.eval._reuse import labels
+from teb_vae.lag_attn_cfs.eval._reuse import band_partition, labels
 from teb_vae.lag_attn_cfs.eval.lag_axis import COEFFICIENT_LAG_AXIS_LABEL, GROUP_DELAY_CAVEAT
 from teb_vae.lag_attn_rws.nets.losses import masked_raw_block_per_anchor
 from teb_vae.lag_attn_rws.nets.raw_masks import forecast_mask
@@ -1300,7 +1300,12 @@ def build_band_figure(
                 twin.tick_params(labelsize=figures.FONT_TINY)
                 twin.legend(fontsize=figures.FONT_TINY, loc="lower right")
             ax.set_xticks(x)
-            ax.set_xticklabels(names, rotation=30, ha="right", fontsize=figures.FONT_TINY)
+            # Ticks name the frequency range (period in parentheses), not the clinical band key
+            # the table is keyed by.
+            ax.set_xticklabels(
+                [band_partition.band_display_label(name) for name in names],
+                rotation=30, ha="right", fontsize=figures.FONT_TINY,
+            )
             ax.axhline(0.0, color=figures.COLOR_GRAY, linewidth=figures.LINE_HAIRLINE)
             ax.set_title(f"{readout}: attribution by frequency band (source-null baseline)", fontsize=figures.FONT_SMALL)
             ax.set_ylabel("attribution (readout units)")

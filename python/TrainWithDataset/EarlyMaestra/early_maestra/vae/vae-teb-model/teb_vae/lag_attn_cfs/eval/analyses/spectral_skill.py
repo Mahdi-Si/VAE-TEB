@@ -499,8 +499,9 @@ def build_band_figure(per_guid: pd.DataFrame, rows: Sequence[Dict[str, Any]]) ->
     """Draw the gap and the error-space skill per band, on separate axes.
 
     Two panels because the two are in different units and one shared axis would flatten whichever
-    is smaller into a line at zero. Each violin's label carries its channel count, so a band
-    carried by three channels cannot be read as one carried by forty.
+    is smaller into a line at zero. Each violin is labelled by the band's frequency range with the
+    period in parentheses rather than by its clinical name, and carries its channel count, so a
+    band carried by three channels cannot be read as one carried by forty.
 
     Args:
         per_guid: Per-recording means of the band columns.
@@ -510,8 +511,9 @@ def build_band_figure(per_guid: pd.DataFrame, rows: Sequence[Dict[str, Any]]) ->
         The figure; the caller renders and closes it.
     """
     figure, axes = figures.new_figure(2)
+    # The band KEY stays in the column names and the summary rows; only the drawn label changes.
     labelled = {
-        f"{row['band']} ({int(row['n_channels'])} ch)": finite_column(
+        f"{shared.band_display_label(row['band'])} ({int(row['n_channels'])} ch)": finite_column(
             per_guid, f"pred_gap_{row['band']}"
         )
         for row in rows
@@ -525,7 +527,7 @@ def build_band_figure(per_guid: pd.DataFrame, rows: Sequence[Dict[str, Any]]) ->
         reference_label="no improvement",
     )
     skills = {
-        f"{row['band']} ({int(row['n_channels'])} ch)": skill_against(
+        f"{shared.band_display_label(row['band'])} ({int(row['n_channels'])} ch)": skill_against(
             finite_column(per_guid, f"sq_error_full_{row['band']}"),
             finite_column(per_guid, f"sq_error_base_{row['band']}"),
         )
