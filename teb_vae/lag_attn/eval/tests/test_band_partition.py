@@ -148,6 +148,25 @@ def test_clinical_band_edges(hz, expected):
     assert band_partition.band_of_hz(hz) == expected
 
 
+@pytest.mark.parametrize(
+    "band, expected",
+    [
+        ("slow_baseline", "<0.008 Hz (>125 s)"),
+        ("deceleration", "0.008-0.04 Hz (25-125 s)"),
+        ("variability", "0.04-0.25 Hz (4-25 s)"),
+        ("beat_to_beat", ">0.25 Hz (<4 s)"),
+        # No range to render, so the key passes through unchanged.
+        (band_partition.UNKNOWN_BAND, band_partition.UNKNOWN_BAND),
+    ],
+)
+def test_the_display_label_is_the_frequency_range_with_its_period(band, expected):
+    """Figure labels carry the range, not the clinical name, and the period reads in seconds."""
+    label = band_partition.band_display_label(band)
+    assert label == expected
+    for clinical_name in ("baseline", "deceleration", "beat"):
+        assert clinical_name not in label or band == band_partition.UNKNOWN_BAND
+
+
 def test_the_frequencies_are_used_as_stored_with_no_further_fs_multiplication(partition):
     r"""The writer already multiplied by $f_s$; doing it again lands every channel a factor of
     four high and moves most of them a whole band."""

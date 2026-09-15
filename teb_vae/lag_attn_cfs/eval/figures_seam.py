@@ -5,17 +5,17 @@ multi-line overlay -- are the shared ones, bound rather than forked. They alread
 properties that matter for an unattended multi-hour run, and both are asserted against this seam
 rather than taken on trust:
 
-**Two things here are this package's own rather than the sibling's**, and both are stated where
-they are defined: the cohort palette (:data:`CLINICAL_CLASS_COLORS` -- green, amber, red by
-severity, not ``utils.style``'s blue-first mapping) and a style refinement over the shared
-publication rcParams (:data:`STYLE_REFINEMENT`, with the named weight and type scale beside it).
-Neither reaches the sibling: the refinement is applied by this package's
-:func:`configure_figure_style`, which a sibling run never calls.
+**One thing here is this package's own rather than the sibling's**, and it is stated where it
+is defined: the cohort palette (:data:`CLINICAL_CLASS_COLORS` -- green, amber, red by severity, not
+``utils.style``'s blue-first mapping). The publication style itself -- the open frame, the type
+scale, the unframed legends, the double-column width, the footnote layout -- is the shared layer's
+:data:`~teb_vae.lag_attn.eval.figures.STYLE_REFINEMENT`, bound here as :data:`STYLE_REFINEMENT` so
+the name every analysis reads keeps resolving; the weight and type constants beside it are named
+steps on that scale, kept here because the analyses draw with them by name.
 
-The shared panel primitives now read their weights and sizes from the **active** ``rcParams``
-rather than from literals, which is what lets that refinement reach inside them -- so a figure
-drawn through this seam is lighter than the same builder produces for the sibling, without either
-package owning a second copy of the builder.
+The shared panel primitives read their weights and sizes from the **active** ``rcParams`` rather
+than from literals, which is what lets one style reach inside every builder without any package
+owning a second copy of it.
 
 * **Every panel tolerates empty and all-``NaN`` input.** An analysis that legitimately found
   nothing -- a fully masked split, a metric undefined for this checkpoint -- draws
@@ -69,107 +69,30 @@ LINE_REGULAR = 0.9
 LINE_EMPHASIS = 1.05
 LINE_HEAVY = 2.4
 
-#: Type sizes, a step below the shared style's. Same principle: four steps, each with a job. The
-#: body size comes from ``rcParams`` and is not restated here -- these are the sizes for text that
-#: is deliberately smaller than the axis labels.
-FONT_TINY = 4.5
-FONT_SMALL = 5.5
-FONT_LABEL = 6.0
+#: Type sizes for text that is deliberately smaller than the axis labels: four steps, each with a
+#: job. The body size comes from ``rcParams`` and is not restated here. Nothing sits below the
+#: 5.5 pt floor the journals accept for a label at final size, which is what a per-cell count or a
+#: band name is.
+FONT_TINY = 5.5
+FONT_SMALL = 6.0
+FONT_LABEL = 6.5
 FONT_NOTE = 7.5
 
-#: The refinement this package applies on top of the shared publication style. Every value is a
-#: reduction: the shared style is tuned for figures read at a page's width, and an evaluation run
-#: draws eight-row stacks that are read at a screen's. Lighter frames, tighter type and a quieter
-#: grid let the data carry the ink.
-#:
-#: Applied as a delta over ``apply_publication_style`` rather than replacing it, so the serif
-#: family, the DPI and the white background stay the repository's.
-STYLE_REFINEMENT = {
-    # Type: one step down across the board, and the title no longer shouts over its own axes.
-    "font.size": 7.0,
-    "axes.titlesize": 8.0,
-    "axes.labelsize": 7.0,
-    "xtick.labelsize": 6.0,
-    "ytick.labelsize": 6.0,
-    "legend.fontsize": 6.0,
-    "axes.titlepad": 4.0,
-    "axes.labelpad": 2.5,
-    # Frame and ticks: the lightest marks on the page, so nothing structural competes with data.
-    "axes.linewidth": 0.5,
-    "xtick.major.width": 0.4,
-    "ytick.major.width": 0.4,
-    "xtick.major.size": 2.5,
-    "ytick.major.size": 2.5,
-    "xtick.minor.width": 0.3,
-    "ytick.minor.width": 0.3,
-    # Grid: present enough to read a value off, quiet enough to disappear while reading a shape.
-    "grid.linewidth": 0.25,
-    "grid.alpha": 0.18,
-    # Legend: compact and unboxed-looking. A heavy frame around a legend is the most common way a
-    # careful figure still looks unconsidered.
-    "legend.framealpha": 0.85,
-    "legend.edgecolor": figures.COLOR_LIGHT_GRAY,
-    "legend.borderpad": 0.35,
-    "legend.labelspacing": 0.3,
-    "legend.handlelength": 1.6,
-    "legend.handletextpad": 0.5,
-    "legend.borderaxespad": 0.4,
-    "legend.columnspacing": 1.0,
-    # Data defaults, for every artist drawn without an explicit weight.
-    "lines.linewidth": LINE_REGULAR,
-    "lines.markersize": 2.5,
-    "lines.markeredgewidth": 0.5,
-    "patch.linewidth": 0.5,
-    "hatch.linewidth": 0.5,
-}
+#: The publication style, bound from the shared layer rather than owned: one open frame, one type
+#: scale and one legend convention across every evaluation package, so two figures of the same
+#: quantity from two cells are the same figure. See
+#: :data:`teb_vae.lag_attn.eval.figures.STYLE_REFINEMENT` for what it sets and why.
+STYLE_REFINEMENT = figures.STYLE_REFINEMENT
 
+#: Applied once at run start by ``run.py``, and deliberately not an import side effect:
+#: ``rcParams`` are global to the process, so an import-time call would restyle every other figure
+#: drawn in it -- including a test's. The run's figure format rides along for the same reason.
+configure_figure_style = figures.configure_figure_style
 
-def configure_figure_style(figure_format: Optional[str] = None) -> None:
-    """Apply the repository's publication style, then this package's refinement over it.
-
-    Called once at run start, and deliberately not an import side effect: ``rcParams`` are global
-    to the process, so an import-time call would restyle every other figure drawn in it --
-    including a test's. The run's figure format rides along for the same reason -- it is one
-    property of the whole pass, fixed once, rather than an argument on every drawing call.
-
-    Args:
-        figure_format: The image format every figure of this run is written in, as a matplotlib
-            filetype. ``None`` leaves the active format alone, which is
-            :data:`~teb_vae.lag_attn.eval.figures.DEFAULT_FIGURE_FORMAT` in a fresh process.
-
-    Raises:
-        ValueError: If ``figure_format`` is not a format this matplotlib build can write.
-    """
-    import matplotlib.pyplot as plt
-
-    figures.configure_figure_style(figure_format)
-    plt.rcParams.update(STYLE_REFINEMENT)
-
-
-def style_axes(ax, *, grid: str = "major") -> None:
-    """Style one axes, then re-apply the refined frame and grid weights over the shared ones.
-
-    ``utils.style.style_axes`` sets the spine width and the grid weight as *literals*, so they
-    survive the ``rcParams`` refinement above and would leave every panel framed a third heavier
-    than the style asks for. Re-applying afterwards is what makes the refinement actually reach
-    the page.
-
-    Args:
-        ax: Target axes.
-        grid: One of ``'major'``, ``'both'``, ``'none'`` -- passed straight through.
-    """
-    import matplotlib.pyplot as plt
-
-    figures.style_axes(ax, grid=grid)
-    for spine in ax.spines.values():
-        spine.set_linewidth(plt.rcParams["axes.linewidth"])
-    if grid != "none":
-        ax.grid(
-            True, linestyle="-",
-            alpha=plt.rcParams["grid.alpha"],
-            linewidth=plt.rcParams["grid.linewidth"],
-            color=figures.COLOR_LIGHT_GRAY,
-        )
+#: One axes styled the way every evaluation panel is: an open frame for a value panel, a box for
+#: an image. Bound rather than wrapped, because every weight it draws with is read from the active
+#: ``rcParams`` and there is nothing left to re-apply.
+style_axes = figures.style_axes
 
 #: Figure construction and output. ``render_figure`` tight-layouts, saves at the repository's DPI,
 #: closes the figure and returns the path it wrote.
@@ -186,18 +109,16 @@ def caveat_note(figure, text: str = GROUP_DELAY_CAVEAT) -> None:
     physiological latency -- which is the one claim this axis cannot support. Drawn rather than
     left to the guide, because the guide does not travel with the image.
 
-    Placed here rather than in each analysis so the wording and the placement are one decision:
-    two figures carrying the same caveat at two sizes read as two different caveats.
+    Written through the shared :func:`~teb_vae.lag_attn.eval.figures.footnote`, which wraps the
+    sentence to the figure's width and reserves the room it needs, so the caveat sits under the
+    axes rather than across their x label; ``render_figure`` lays the figure out around it.
 
     Args:
         figure: The figure to annotate.
         text: The sentence. Defaults to the group-delay caveat, which is the one every
             lag-resolved artifact in this package carries.
     """
-    figure.text(
-        0.5, -0.01, str(text),
-        ha="center", va="top", fontsize=FONT_TINY, color=COLOR_GRAY, wrap=True,
-    )
+    figures.footnote(figure, str(text))
 
 #: The generic panels. Each takes an axes and draws into it, so a figure builder composes them
 #: rather than each analysis owning a layout.

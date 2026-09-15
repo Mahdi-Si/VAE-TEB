@@ -35,6 +35,14 @@ physiological delay: the causal feature extraction upstream of the model mixes r
 every coefficient over a span the feature geometry fixes, and the qualification the lag readouts
 must be read with is printed under every lag figure.
 
+The figures share the evaluation packages' publication style, decided once in
+`teb_vae/lag_attn/eval/figures.py`: a double-column width, a 7 pt serif type scale, open frames,
+unframed legends placed in headroom above the data, and the Okabe-Ito colour-blind-safe palette.
+Panels of a multi-panel figure carry bold lowercase letters (**a**, **b**, ...) in row-major order,
+which is how the entries below refer to them; a qualification printed under a figure is a footnote
+set at 6 pt with its own reserved room, never across an axis label. Panel titles are short noun
+phrases: what a panel means is in its axis labels and here.
+
 ---
 
 ## The scoring pass

@@ -14,6 +14,8 @@ Four rules apply to every figure here.
 
 **The order is clinical and the colour is the severity**, on every figure that resolves a quantity by cohort. Left to right in ascending severity: `healthy`, `acidosis`, `hie` on the class axis, and `healthy_no_bg_no_cs`, `healthy_no_bg_cs`, `healthy_bg_no_cs`, `healthy_bg_cs`, `acidosis_no_cs`, `acidosis_cs`, `hie_no_cs`, `hie_cs` on the subgroup axis. Green for healthy, amber for acidosis, red for HIE, each subgroup a shade of its class. One function decides both — `cohort.ordered_groups` — and every CSV row order reads it too, so a table can be read against the figure beside it row for row. A cohort the order does not know is drawn **after** the ones it does rather than dropped. Two consequences: this palette is **this evaluation's**, so a figure here and a training-callback figure of the same cohort are different colours and are reconciled by legend rather than by hue; and a colour ordering is not a result — `cross_subgroup` is the analysis that says whether a visible difference survives being asked properly.
 
+**The style is the evaluation packages' shared publication style**, decided once in `teb_vae/lag_attn/eval/figures.py` and bound through `figures_seam`: a double-column default width, a 7 pt serif type scale with STIX mathtext, open frames (boxed on heatmaps), unframed legends placed in headroom above full-width curves, and the Okabe-Ito colour-blind-safe palette for everything that is not a cohort. Panels of a multi-panel figure carry bold lowercase letters (**a**, **b**, ...) in row-major order. The group-delay caveat and every other qualification printed under a figure is a 6 pt footnote with its own reserved room, so it never crosses an axis label.
+
 ---
 
 # Terminology
@@ -995,7 +997,7 @@ of the recording's attribution across, occlusion delta in nats up.
 
 **In plain terms.** *"Which frequencies does the model forecast well?"* The channel axis of this target domain **is** a frequency axis — a scattering coefficient is the envelope of the signal filtered at one centre frequency — so the forecast can be resolved by band without estimating a spectrum at all.
 
-**What it shows.** Top: the forecast gap per recording, one violin per band, with each violin's **channel count in its label**. Bottom: the error-space skill of the source-conditioned branch against the target-only one, per band.
+**What it shows.** Top: the forecast gap per recording, one violin per band, each labelled by the band's **frequency range with the period in parentheses** (not its clinical name) and with its **channel count in its label**. Bottom: the error-space skill of the source-conditioned branch against the target-only one, per band.
 
 **Axes.** Top: nats per anchor, zero marked. Bottom: $1 - \mathrm{MSE}_{\mathrm{full}}/\mathrm{MSE}_{\mathrm{base}}$, zero marked. Two axes because the two are in different units and one shared axis would flatten whichever is smaller into a line at zero.
 
@@ -1076,6 +1078,8 @@ adjacent questions.
 **What it shows.** Top, one column per readout: the mean over recordings of the source-null
 attribution summed over each frequency band of the declared channel map, one bar group per stream,
 with `spectral_skill`'s per-band gap drawn on a twin axis for the target bands where that pass ran.
+The ticks name each band by its frequency range with the period in parentheses; the `band` column
+of the table keeps the key.
 Bottom: per `occlusion_bands` band of the source relative to the anchor, the integrated-gradient
 sum over the band, this analysis's own feature-ablation delta of the readout, and the `occlusion`
 pass's delta where it ran — sign-flipped on the gap readout, because that pass reports the forecast

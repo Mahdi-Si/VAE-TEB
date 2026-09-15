@@ -159,6 +159,36 @@ def band_of_hz(freq_hz: float, bands: Optional[Dict[str, Tuple[float, float]]] =
     return list(table)[-1]
 
 
+def band_display_label(band: str, bands: Optional[Dict[str, Tuple[float, float]]] = None) -> str:
+    r"""Render a band as its frequency range, with the matching period range in parentheses.
+
+    Figure labels use this rather than the band's key. ``slow_baseline`` or ``beat_to_beat`` are
+    fetal-monitoring names a reader has to look up, and each carries a clinical claim about what
+    the channels contain, whereas the frequency range is exactly what the partition measured. The
+    period $T = 1/f$ is given alongside because lags and traces are read in seconds.
+
+    Args:
+        band: The band key. A key outside the table -- :data:`UNKNOWN_BAND` included -- is
+            returned unchanged, since it has no range to render.
+        bands: The band table. ``None`` uses :data:`CLINICAL_BANDS`.
+
+    Returns:
+        ``'0.008-0.04 Hz (25-125 s)'`` for an interior band; the lowest band, which starts at
+        $0$ Hz, renders as ``'<0.008 Hz (>125 s)'`` and the highest, which is unbounded above, as
+        ``'>0.25 Hz (<4 s)'``.
+    """
+    table = CLINICAL_BANDS if bands is None else bands
+    if band not in table:
+        return band
+    low, high = table[band]
+    # The period range runs the other way round: the high frequency edge is the short period.
+    if low <= 0.0:
+        return f"<{high:g} Hz (>{1.0 / high:g} s)"
+    if not np.isfinite(high):
+        return f">{low:g} Hz (<{1.0 / low:g} s)"
+    return f"{low:g}-{high:g} Hz ({1.0 / high:g}-{1.0 / low:g} s)"
+
+
 @dataclass(frozen=True)
 class ChannelRecord:
     r"""One target channel's identity.
