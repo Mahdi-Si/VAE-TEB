@@ -76,7 +76,7 @@ def candidate_summary() -> Dict[str, Any]:
             "silence", "replace:zeros", "replace:constant", "permute"]
     steps = list(range(1, HORIZON + 1))
     return {
-        "headline": {
+        "arm_scores": {
             **{f"nll_{arm}": _interval(100.0 + index) for index, arm in enumerate(arms)},
             "pred_gap": _interval(-1.0),
             "kld_per_anchor": _interval(0.2),
@@ -143,7 +143,7 @@ def candidate_summary() -> Dict[str, Any]:
             "replace_constant_margin_nats": 0.2, "replace_constant_margin_interval": _interval(0.2),
             "permute_margin_nats": 0.1, "permute_margin_interval": _interval(0.1),
         },
-        "calibration": {
+        "mixture_calibration": {
             branch: {
                 "n_coefficients": 100.0, "pit_mean": 0.5, "pit_var": 0.08,
                 "coverage": {"0.5": 0.48, "0.9": 0.88, "0.99": 0.97},
@@ -162,7 +162,7 @@ def target_only_summary() -> Dict[str, Any]:
         The summary.
     """
     return {
-        "headline": {"nll_base": _interval(100.0), "nll_full": _interval(100.0),
+        "arm_scores": {"nll_base": _interval(100.0), "nll_full": _interval(100.0),
                      "pred_gap": _interval(0.0, 0.0)},
         "anchor_weighted": {"pred_gap": 0.0},
         "arm": {"source_disabled": True},
@@ -177,7 +177,7 @@ def target_only_summary() -> Dict[str, Any]:
                              "control_margins": {}},
         "block_resolved": {},
         "source_controls": {"silence_margin_nats": None, "skipped": {"suppress": "no source"}},
-        "calibration": {"base": {"coverage": {}}, "full": {"coverage": {}}},
+        "mixture_calibration": {"base": {"coverage": {}}, "full": {"coverage": {}}},
         "draws": {"num_mc_samples": 8},
     }
 
@@ -251,23 +251,64 @@ def test_every_builder_survives_an_empty_summary(name: str) -> None:
         plt.close(figure)
 
 
-def test_the_run_figures_are_written_under_the_names_the_manifest_lists(tmp_path: Path) -> None:
-    """A figure the manifest does not list, or a listed figure that was not written, leaves a
-    reader unable to tell a missing figure from a renamed one."""
-    figures.configure_figure_style()
-    manifest = figures.render_run_figures(
-        candidate_summary(), tmp_path, per_recording=per_recording_rows()
+def test_the_three_readout_analyses_write_their_figures_and_tables(tmp_path: Path) -> None:
+    """The run's figures are written by this cell's own analyses, each into its own subdirectory,
+    from the results block alone: no model, no loader, no tensor."""
+    from types import SimpleNamespace
+
+    import pandas as pd
+
+    from teb_vae.lag_slot_transformer_cfs.eval.analyses import (
+        arms, lag_suppression, resolved_axes,
     )
 
-    assert manifest["directory"] == figures.FIGURES_DIRNAME
-    assert manifest["format"] == active_figure_format()
-    assert set(manifest["files"]) == set(figures.RUN_FIGURES)
-    for name, relative in manifest["files"].items():
-        written = tmp_path / relative
-        assert written.is_file(), name
-        assert written.suffix == f".{manifest['format']}"
-    # Nothing else landed in the figures directory.
-    assert len(list((tmp_path / figures.FIGURES_DIRNAME).iterdir())) == len(figures.RUN_FIGURES)
+    figures.configure_figure_style()
+    results = candidate_summary()
+    results["per_recording"] = {
+        guid: {**row, "n_segments": 1.0, "n_scored_anchors": 4.0}
+        for guid, row in per_recording_rows().items()
+    }
+    per_sample = pd.DataFrame(
+        {"guid": list(results["per_recording"]), "mc_nll_full_block": [1.0] * 5}
+    )
+    context = SimpleNamespace(
+        collection=SimpleNamespace(results=results, per_sample=per_sample, record={}),
+        config={"dataset_config": {"vae_test_datasets": ["a/x.hdf5"], "stat_path": "a/s.hdf5"}},
+        task=None,
+        loader=None,
+    )
+    eval_config = {"seed": 0, "bootstrap_resamples": 100, "caps": {"lag_profile": 8}}
+
+    blocks = {
+        arms.ANALYSIS_DIRNAME: arms.run_arms_analysis(
+            context, eval_config=eval_config, output_dir=tmp_path
+        ),
+        lag_suppression.ANALYSIS_DIRNAME: lag_suppression.run_lag_suppression_analysis(
+            context, eval_config=eval_config, output_dir=tmp_path
+        ),
+        resolved_axes.ANALYSIS_DIRNAME: resolved_axes.run_resolved_axes_analysis(
+            context, eval_config=eval_config, output_dir=tmp_path
+        ),
+    }
+
+    extension = active_figure_format()
+    for directory, block in blocks.items():
+        assert {"n_samples", "composition", "plan"} <= set(block), directory
+        for name in block["files"]:
+            assert (tmp_path / directory / name).is_file(), (directory, name)
+    assert {
+        path.name for path in (tmp_path / arms.ANALYSIS_DIRNAME).iterdir()
+    } == {
+        arms.PER_RECORDING_FILENAME,
+        f"{arms.HEADLINE_FIGURE}.{extension}",
+        f"{arms.GAP_FIGURE}.{extension}",
+        f"{arms.CALIBRATION_FIGURE}.{extension}",
+    }
+    assert (tmp_path / lag_suppression.ANALYSIS_DIRNAME / lag_suppression.LAG_PROFILE_FILENAME).is_file()
+    assert (tmp_path / resolved_axes.ANALYSIS_DIRNAME / resolved_axes.HORIZON_FILENAME).is_file()
+    # The scored-split record names the table the acceptance pass reads.
+    assert blocks[arms.ANALYSIS_DIRNAME]["scored_split"]["per_recording_table"] == arms.PER_RECORDING_TABLE
+    assert blocks[arms.ANALYSIS_DIRNAME]["scored_split"]["n_recordings"] == 5
 
 
 def test_the_lag_axis_is_labelled_in_stored_coefficient_time() -> None:
@@ -349,7 +390,7 @@ def acceptance_record() -> Dict[str, Any]:
         "monte_carlo_stability": {"candidate": {"gap_by_draw_count": {"8": -1.0, "32": -1.1},
                                                 "declared_draw_counts": [8, 32, 128],
                                                 "missing_draw_counts": [128], "range_nats": 0.1}},
-        "calibration": {"candidate": {"full": {"pit_mean": 0.5, "coverage": {"0.5": 0.49}}}},
+        "mixture_calibration": {"candidate": {"full": {"pit_mean": 0.5, "coverage": {"0.5": 0.49}}}},
         "latent_probes": {"candidate": {"status": "READ", "r2": {"prior_mean": 0.2}}},
         "verdicts": [{"name": "training_seeds", "status": "PASS", "detail": "ok"}],
         "n_runs": 4,

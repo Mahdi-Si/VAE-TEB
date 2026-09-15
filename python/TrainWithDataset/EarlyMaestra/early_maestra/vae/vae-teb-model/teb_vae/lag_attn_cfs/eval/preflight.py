@@ -1081,7 +1081,10 @@ def load_witnesses(model: Any) -> Dict[str, List[torch.Tensor]]:
         ``posterior_head.delta_mu_head`` and ``delta_logvar_head``, zeroed so that $q \equiv p$ at
         step $0$ and any coupling the model reports had to be learned against that null. Under
         ``posterior_logvar_mode='independent'`` there is no ``delta_logvar_head``; the mean delta is
-        zeroed in both modes, so the witness never becomes empty.
+        zeroed in both modes, so the witness never becomes empty. A model with no head-structured
+        posterior at all -- one whose source correction is summed at the latent-parameter boundary
+        rather than emitted by a posterior head -- carries this witness as an empty group, and the
+        two decoder-side groups below are what its load is verified on.
 
     ``film_generators``
         Every FiLM generator in the horizon core, zeroed *after* the generic initialisation
@@ -1109,9 +1112,11 @@ def load_witnesses(model: Any) -> Dict[str, List[torch.Tensor]]:
         return found
 
     delta_heads: List[torch.Tensor] = []
+    posterior_head = getattr(model, "posterior_head", None)
     for head_name in ("delta_mu_head", "delta_logvar_head"):
-        head = getattr(model.posterior_head, head_name, None)
-        # None under posterior_logvar_mode='independent'; see the docstring.
+        head = None if posterior_head is None else getattr(posterior_head, head_name, None)
+        # None under posterior_logvar_mode='independent', and on a model with no posterior head;
+        # see the docstring.
         if head is not None:
             delta_heads.extend(_tensors(head))
 

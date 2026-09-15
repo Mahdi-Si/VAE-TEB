@@ -67,6 +67,11 @@ from teb_vae.lag_slot_transformer_cfs.nets.lag_updates import (
 #: zero is the reading this module exists to prevent.
 MISSING = None
 
+#: Prefix that marks a scored arm as the suppression of one lag band. One place, read by the pass
+#: that names the arms, the analyses that list them and the figures that draw them, so the three
+#: cannot come to spell it differently.
+SUPPRESSION_PREFIX = "suppress:"
+
 #: Lags recomputed at once by the per-lag latent profile. The removed-lag update is one array of
 #: the proposals' own shape per chunk, so the chunk bounds the transient at a fraction of the
 #: proposal array that is already held rather than at several copies of it.
@@ -267,7 +272,7 @@ def band_suppression_block(
     band_exposure: Mapping[str, Mapping[str, float]],
     *,
     matched_key: str = "nll_full",
-    suppressed_prefix: str = "nll_suppress:",
+    suppressed_prefix: str = f"nll_{SUPPRESSION_PREFIX}",
     intervals: Optional[Mapping[str, Mapping[str, Any]]] = None,
 ) -> Dict[str, Any]:
     r"""Each band's margin against the matched full branch, with its usable counts beside it.
@@ -637,6 +642,7 @@ def band_exposure(
 __all__ = [
     "LAG_PROFILE_CHUNK",
     "MISSING",
+    "SUPPRESSION_PREFIX",
     "band_exposure",
     "band_masks",
     "band_suppression_block",

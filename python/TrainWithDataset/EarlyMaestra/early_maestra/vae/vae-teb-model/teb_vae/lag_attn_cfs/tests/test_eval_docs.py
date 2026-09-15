@@ -239,7 +239,7 @@ def test_the_manifest_is_not_empty(manifest) -> None:
     assert sum(len(names) for names in manifest["figures"].values()) >= 14
     assert set(manifest.get("families", {})) == {
         "grouped_variants", "sample_pages", "sample_pages_compact", "recording_traces",
-        "attribution_traces",
+        "attribution_traces", "attribution_example_maps",
     }
 
 

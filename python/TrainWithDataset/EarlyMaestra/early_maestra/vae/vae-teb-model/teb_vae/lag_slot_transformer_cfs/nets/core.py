@@ -699,6 +699,21 @@ class LagResidualCore(nn.Module):
         """
         return getattr(self.source_encoder, "adapter", None)
 
+    @property
+    def source_delay_steps(self) -> int:
+        r"""The largest shift the source gate applies to any channel, in stored steps.
+
+        The family's name for the family's quantity: the causality disclosure every run writes,
+        and the lag axis every lag figure is drawn on, read it off the model rather than off a
+        guess at the gate's layout. Zero on an unaligned arm, where the gate is a pure gather.
+        The maximum over channels is what is reported, so a lag computed from it is an upper
+        bound; the physical reference instant is resolved from the shards, not from here.
+
+        Returns:
+            The maximum channel shift $\delta$, or $0$ with no source gate.
+        """
+        return 0 if self.source_gate is None else int(self.source_gate.max_delay)
+
     # ------------------------------------------------------------------
     # Construction hooks the mixins and this constructor call
     # ------------------------------------------------------------------

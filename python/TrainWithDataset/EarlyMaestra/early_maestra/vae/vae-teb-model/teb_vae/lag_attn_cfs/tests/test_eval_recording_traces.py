@@ -339,7 +339,54 @@ def test_the_arrays_file_and_both_figures_are_written(tmp_path) -> None:
 def test_an_empty_summary_still_draws_a_figure(tmp_path) -> None:
     figure = traces.build_summary_figure(pd.DataFrame(), metrics=analysis.SUMMARY_METRICS)
     try:
-        assert len(figure.axes) == len(analysis.SUMMARY_METRICS)
+        # One metric row each, under the coverage row.
+        assert len(figure.axes) == len(analysis.SUMMARY_METRICS) + 1
+    finally:
+        plt.close(figure)
+
+
+def test_the_joined_scores_reach_the_summary_form_as_segment_means() -> None:
+    """A column attached to the full form after assembly is averaged over each segment's scored
+    anchors into the summary, so the summary figure can draw it; an unscored segment is NaN."""
+    _module, segments = _segments()
+    seconds = _lag_seconds(segments)
+    recording = traces.assemble_recording(
+        segments, lag_profiles=analysis.LAG_PROFILES, lag_seconds=seconds, break_after_s=BREAK_S
+    )
+    anchors = recording.anchors
+    anchors["mean_pred_gap"] = np.where(anchors["segment_order"] == 0, 2.0, 5.0)
+    anchors["absent_everywhere"] = np.nan
+
+    written = traces.add_segment_means(recording, ("mean_pred_gap", "absent_everywhere", "never_attached"))
+
+    assert written == ["mean_pred_gap", "absent_everywhere"]
+    summary = recording.summary.sort_values("segment_order")
+    scored = anchors[anchors["contributing"]]
+    expected = [2.0 if (scored["segment_order"] == 0).any() else np.nan, 5.0 if (scored["segment_order"] == 1).any() else np.nan]
+    np.testing.assert_allclose(summary["mean_pred_gap"].to_numpy(), expected)
+    assert summary["absent_everywhere"].isna().all()
+
+
+def test_the_recording_figure_lays_itself_out_with_one_column_of_data_axes(tmp_path) -> None:
+    """Every row's data axes share one x extent (the colour axis lives in its own column), the
+    rows share the delivery axis with delivery on the right, and the figure is stamped as laid
+    out so rendering does not re-layout it."""
+    _module, segments = _segments()
+    seconds = _lag_seconds(segments)
+    recording = traces.assemble_recording(
+        segments, lag_profiles=analysis.LAG_PROFILES, lag_seconds=seconds, break_after_s=BREAK_S
+    )
+    figure = traces.build_recording_figure(recording, panels=analysis.PANELS, lag_seconds=seconds, caveat="c")
+    try:
+        data_axes = [ax for ax in figure.axes if ax.get_label() != "<colorbar>"]
+        assert len(data_axes) == len(analysis.PANELS)
+        lefts = {round(ax.get_position().x0, 6) for ax in data_axes}
+        rights = {round(ax.get_position().x1, 6) for ax in data_axes}
+        assert len(lefts) == 1 and len(rights) == 1
+        low, high = data_axes[0].get_xlim()
+        assert low > high, "hours before delivery decrease to the right"
+        assert all(ax.get_shared_x_axes().joined(ax, data_axes[0]) for ax in data_axes[1:])
+        assert getattr(figure, "_eval_layout_done", False) is True
     finally:
         plt.close(figure)
 
