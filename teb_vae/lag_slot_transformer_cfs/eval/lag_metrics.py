@@ -621,10 +621,14 @@ def band_exposure(
         ``{band: {'anchors', 'channels'}}``, summed over the band's own lags.
     """
     anchors, channels = counts["anchors_per_lag"], counts["channels_per_lag"]
+    # The masks live on the model device because they are applied inside the forward; the
+    # counts are accumulated on the CPU with every other per-batch record. This reduction is
+    # the one place the two meet, so the mask follows the counts rather than the pass carrying
+    # a second copy of the masks.
     return {
         band: {
-            "anchors": float(anchors[mask].sum()),
-            "channels": float(channels[mask].sum()),
+            "anchors": float(anchors[mask.to(anchors.device)].sum()),
+            "channels": float(channels[mask.to(channels.device)].sum()),
         }
         for band, mask in masks.items()
     }

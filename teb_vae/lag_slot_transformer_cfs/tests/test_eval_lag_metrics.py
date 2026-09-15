@@ -149,6 +149,42 @@ def test_the_counts_accumulate_across_batches() -> None:
     assert first["anchors_per_lag"].tolist() == [1.0, 2.0]
 
 
+def test_band_exposure_sums_each_band_over_its_own_lags() -> None:
+    """The reference arms come out too: ``none`` removes nothing and ``all`` covers the window."""
+    masks = lag_metrics.band_masks({"near": [0, 1], "far": [2, 3]}, 4)
+    counts = {
+        "anchors_per_lag": torch.tensor([1.0, 2.0, 3.0, 4.0], dtype=torch.float64),
+        "channels_per_lag": torch.tensor([10.0, 20.0, 30.0, 40.0], dtype=torch.float64),
+    }
+
+    exposure = lag_metrics.band_exposure(masks, counts)
+
+    assert exposure == {
+        "none": {"anchors": 0.0, "channels": 0.0},
+        "near": {"anchors": 3.0, "channels": 30.0},
+        "far": {"anchors": 7.0, "channels": 70.0},
+        "all": {"anchors": 10.0, "channels": 100.0},
+    }
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a second device")
+def test_band_exposure_reads_device_masks_against_cpu_counts() -> None:
+    """The pass builds the masks on the model device and accumulates the counts on the CPU.
+
+    The reduction is the one place the two meet, and on a CPU-only run they coincide, so the
+    mismatch only shows on a GPU checkpoint: this is the test that would have caught it.
+    """
+    masks = lag_metrics.band_masks({"near": [0, 1]}, 3, device=torch.device("cuda"))
+    counts = {
+        "anchors_per_lag": torch.tensor([1.0, 2.0, 3.0], dtype=torch.float64),
+        "channels_per_lag": torch.tensor([4.0, 5.0, 6.0], dtype=torch.float64),
+    }
+
+    exposure = lag_metrics.band_exposure(masks, counts)
+
+    assert exposure["near"] == {"anchors": 3.0, "channels": 9.0}
+
+
 # =============================================================================
 # Cancellation
 # =============================================================================
