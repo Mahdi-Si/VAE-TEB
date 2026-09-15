@@ -96,6 +96,7 @@ __all__ = [
     "label_rows",
     "layout_rect",
     "legend_with_headroom",
+    "mark_laid_out",
     "multi_line_panel",
     "render_figure",
     "ribbon_plot",
@@ -216,6 +217,11 @@ _COLORBAR_AXES_LABEL = "<colorbar>"
 #: than a threaded parameter, because the footnote is written by one caller and the layout is done
 #: by another, and neither owns the other's signature.
 _FOOTNOTE_ATTRIBUTE = "_eval_footnote_fraction"
+
+#: The attribute a builder stamps on a figure it laid out itself (a gridspec with explicit
+#: margins, a shared colour-axis column), read back by :func:`render_figure` so ``tight_layout``
+#: does not undo that layout. Stamped through :func:`mark_laid_out`.
+_LAYOUT_DONE_ATTRIBUTE = "_eval_layout_done"
 
 #: Footnote type size and line spacing, in points. 6 pt is the smallest size the journals accept
 #: and the caveats these figures carry are read, not decorative, so they are not set below it.
@@ -1445,8 +1451,9 @@ def render_figure(fig: Any, path: Any, *, tight: bool = True) -> Any:
             unclosed figure in a global registry, and a production pass draws hundreds.
         path: Destination **without** an extension. A :class:`~pathlib.Path` or a string.
         tight: Apply ``tight_layout`` before saving. A builder that laid the figure out itself
-            passes ``False``; the footnote room is honoured either way, because the builder that
-            wrote the footnote is the one that laid the figure out around it.
+            passes ``False`` or stamps the figure with :func:`mark_laid_out`; the footnote room
+            is honoured either way, because the builder that wrote the footnote is the one that
+            laid the figure out around it.
 
     Returns:
         The path actually written, extension included.
@@ -1465,7 +1472,7 @@ def render_figure(fig: Any, path: Any, *, tight: bool = True) -> Any:
         )
     destination = destination.with_name(f"{destination.name}.{_ACTIVE_FIGURE_FORMAT}")
     label_panels(fig)
-    if tight:
+    if tight and not getattr(fig, _LAYOUT_DONE_ATTRIBUTE, False):
         try:
             fig.tight_layout(rect=layout_rect(fig))
             fig.align_ylabels()
@@ -1498,6 +1505,20 @@ def layout_rect(fig: Any) -> Tuple[float, float, float, float]:
         # The title block plus half a line of clearance, in figure fractions.
         top = 1.0 - (lines + 0.5) * float(suptitle.get_fontsize()) * _FOOTNOTE_LINE_HEIGHT / 72.0 / height_in
     return (0.0, bottom, 1.0, max(top, bottom + 0.1))
+
+
+def mark_laid_out(fig: Any) -> None:
+    """Record that a builder laid ``fig`` out itself, so :func:`render_figure` leaves it alone.
+
+    For a figure built on an explicit gridspec -- one with a shared colour-axis column, say --
+    ``tight_layout`` would recompute every margin from the artists and, on a tall page, fail and
+    fall back to matplotlib's default spacing, which is how a carefully placed page ends up
+    crushed into the middle of a blank sheet. The panel lettering still happens at render time.
+
+    Args:
+        fig: The figure.
+    """
+    setattr(fig, _LAYOUT_DONE_ATTRIBUTE, True)
 
 
 def sequence_axis(length: int) -> np.ndarray:

@@ -761,6 +761,7 @@ def build_residual_page(
     forecast_extra_rows: Sequence[Tuple[str, float]] = (),
     lag_panels: Optional[ResidualLagPanels] = None,
     rows: Optional[Sequence[str]] = None,
+    cohort: Optional[str] = None,
 ) -> Any:
     r"""Draw one sample's page and return the figure, which the caller saves and closes.
 
@@ -797,6 +798,9 @@ def build_residual_page(
         rows: The subset of the page's rows to build, by name, or ``None`` for all of them. An
             unrecognised name raises rather than being ignored: a page quietly missing the panel
             it was rendered for is invisible in the output.
+        cohort: The recording's cohort -- its subgroup, which names the class -- written into
+            the title beside the GUID, so a page lifted out of its directory still says which
+            cohort it came from. ``None`` omits it.
 
     Returns:
         The matplotlib ``Figure``.
@@ -1183,7 +1187,9 @@ def build_residual_page(
         # the rows below are one recording's. Unlabelled, a reader would take them for this
         # sample's and find that the gap row does not average to the gap printed above it.
         fig.suptitle(
-            f"epoch {epoch} — sample {index} — guid {guid} — beta={beta:.4g}"
+            f"epoch {epoch} — sample {index} — guid {guid}"
+            + (f" — {cohort}" if cohort else "")
+            + f" — beta={beta:.4g}"
             + (f"\nvalidation epoch: {readouts}" if readouts else ""),
             fontsize=10, y=1.0 - 0.1 / figure_height, va="top",
         )

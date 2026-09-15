@@ -23,7 +23,7 @@ from __future__ import annotations
 import importlib
 import sys
 from pathlib import Path
-from typing import Tuple
+from typing import Any, Dict, Sequence, Tuple
 
 import pytest
 import torch
@@ -230,3 +230,176 @@ def target_state() -> torch.Tensor:
     generator = torch.Generator().manual_seed(20260910)
     n_anchors = TINY_SEQ_LEN - TINY_FLOOR
     return torch.randn(TINY_BATCH, n_anchors, TINY_D_MODEL, generator=generator)
+
+
+# =================================================================================================
+# The generated integer-operator cohort fixture, and the run built on it
+#
+# The committed ``tiny_shard_causal_int.hdf5`` is one file whose ``target`` is all zeros, so every
+# class-, subgroup- and cohort-aware path of the family's evaluation self-skips against it. These
+# fixtures generate the multi-cohort set instead -- eight subgroup shards, real class codes, the
+# clinical fields -- through ``scripts/make_tiny_shard.py``'s ``causal_cohort`` mode, written
+# under the INTEGER phase operator this architecture's first experiment is defined on. The
+# lag-attentive cells' cohort fixture is the same mode under the legacy operator, and a shard
+# written under one operator cannot be read by a model built under the other.
+#
+# The same rule binds here as in the causal cell's suite: eight real raw segments re-used under
+# distinct identities, scored by a tiny model trained for two epochs, are evidence about SCHEMA,
+# SHAPE, FINITENESS, DENOMINATORS, COHORT MEMBERSHIP, COUNTS, IDENTITIES and REFUSALS, and about
+# nothing else. No test may assert the sign, magnitude, direction or significance of any clinical
+# or statistical effect on them.
+# =================================================================================================
+#: Epochs the cohort fit runs. Two rather than one: the second is what steps the scheduler and
+#: rotates the tile phase, and a checkpoint from a model that never left its initialisation would
+#: make every source margin identically zero for a reason about the fit.
+COHORT_FIT_EPOCHS = 2
+
+#: Segments the single-lag predictive profile is scored on in the cohort run. Fewer than the
+#: fixture holds, so the cap is exercised as a cap rather than as a whole-split pass.
+COHORT_PROFILE_SEGMENTS = 4
+
+
+def write_int_cohort_shards(directory: Path) -> Sequence[str]:
+    """Generate the eight causal subgroup shards under the integer operator, and their statistics.
+
+    Driven through ``scripts/make_tiny_shard.py``'s own entry point, exactly as the causal cell's
+    suite drives the legacy-operator set, with one flag more: the phase operator.
+
+    Args:
+        directory: Destination directory.
+
+    Returns:
+        The eight shard paths, in canonical subgroup order.
+    """
+    from scripts.make_tiny_shard import COHORT_SUBGROUPS, PHASE_OPERATOR_INTEGER
+    from scripts.make_tiny_shard import _cli as make_tiny_shard_cli
+    from teb_vae.lag_attn_cfs.tests.conftest import COHORT_SEQ_LEN
+
+    exit_code = make_tiny_shard_cli(
+        [
+            "--variants", "causal_cohort",
+            "--out-dir", str(directory),
+            "--seq-len", str(COHORT_SEQ_LEN),
+            "--phase-operator", PHASE_OPERATOR_INTEGER,
+        ]
+    )
+    assert exit_code == 0
+    return [str(Path(directory) / f"{subgroup}.hdf5") for subgroup in COHORT_SUBGROUPS]
+
+
+@pytest.fixture(scope="session")
+def int_cohort_shards(tmp_path_factory) -> Sequence[str]:
+    """Paths to the eight generated integer-operator subgroup shards. Session-scoped; read-only."""
+    return write_int_cohort_shards(tmp_path_factory.mktemp("causal_cohort_int"))
+
+
+@pytest.fixture(scope="session")
+def int_cohort_stats(int_cohort_shards) -> str:
+    """The statistics file the generator wrote from those same shards, over the whole set."""
+    from teb_vae.lag_attn_cfs.tests.conftest import COHORT_STATS_FILENAME
+
+    return str(Path(int_cohort_shards[0]).parent / COHORT_STATS_FILENAME)
+
+
+@pytest.fixture(scope="session")
+def slot_cohort_run(int_cohort_shards, int_cohort_stats, tmp_path_factory) -> Path:
+    """One real fit of this cell against the generated cohort shards; returns the run directory.
+
+    Marked ``slow`` at every consumer rather than here, and nothing in the fast subset may depend
+    on it. Driven through ``trainer.main`` rather than by assembling a checkpoint by hand, because
+    what an evaluation reads out of this directory is precisely what the driver puts there: the
+    warm-up tuples the budget resolved against these shards, the representation stamp, and
+    ``resolved_config.yaml``.
+    """
+    import yaml
+
+    from teb_vae.lag_attn.config import load_config
+    from teb_vae.lag_attn_cfs.tests.conftest import absolutize_dataset_paths
+    from teb_vae.lag_slot_transformer_cfs import trainer as trainer_module
+
+    run_root = Path(tmp_path_factory.mktemp("slot_cohort_run"))
+    tiny = Path(_REPO_ROOT) / "teb_vae" / "lag_slot_transformer_cfs" / "configs" / "tiny.yaml"
+    config = absolutize_dataset_paths(load_config(str(tiny)))
+    dataset = config["dataset_config"]
+    dataset["vae_train_datasets"] = list(int_cohort_shards)
+    dataset["vae_test_datasets"] = list(int_cohort_shards)
+    dataset["stat_path"] = int_cohort_stats
+    config["general_config"]["folders_config"]["out_dir_base"] = str(run_root)
+    config["general_config"]["epochs"] = COHORT_FIT_EPOCHS
+    config["advanced_config"]["trainer"]["profiler"] = None
+
+    config_path = run_root / "resolved.yaml"
+    config_path.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
+    trainer_module.main(str(config_path))
+
+    checkpoint_dirs = sorted(run_root.rglob("model_checkpoints"))
+    assert len(checkpoint_dirs) == 1, checkpoint_dirs
+    return checkpoint_dirs[0].parent
+
+
+@pytest.fixture(scope="session")
+def slot_cohort_overrides(int_cohort_shards, int_cohort_stats, tmp_path_factory) -> Path:
+    """This package's committed evaluation delta with its placeholder leaves repointed.
+
+    Exactly the edit an operator makes before a real run: a delta carrying only the shard paths
+    would replace the committed one, and with it the clinical ``load_fields`` every cohort-aware
+    readout is asked in. The lag bands are rescaled to the tiny window through the causal cell's
+    helper, and the single-lag profile cap is lowered so it is exercised as a cap.
+    """
+    import yaml
+
+    from teb_vae.lag_attn.config import load_config
+    from teb_vae.lag_attn_cfs.eval.config_schema import load_eval_overrides
+    from teb_vae.lag_attn_cfs.tests.conftest import _tiny_occlusion_bands
+    from teb_vae.lag_slot_transformer_cfs.eval.binding import LAG_RESIDUAL_BINDING
+
+    overrides = load_eval_overrides(LAG_RESIDUAL_BINDING.overrides_path)
+    overrides["dataset_config"]["vae_test_datasets"] = list(int_cohort_shards)
+    overrides["dataset_config"]["stat_path"] = int_cohort_stats
+    overrides["general_config"]["batch_size"]["test"] = 4
+    tiny = Path(_REPO_ROOT) / "teb_vae" / "lag_slot_transformer_cfs" / "configs" / "tiny.yaml"
+    overrides["eval_config"]["occlusion_bands"] = _tiny_occlusion_bands(
+        int(load_config(str(tiny))["model_config"]["VAE_model"]["max_lag"])
+    )
+    overrides["eval_config"]["caps"]["lag_profile"] = COHORT_PROFILE_SEGMENTS
+    # The schema's floor: the fixture holds a handful of recordings and a wider interval is not
+    # made narrower by resampling it more.
+    overrides["eval_config"]["bootstrap_resamples"] = 100
+    path = Path(tmp_path_factory.mktemp("slot_eval_overrides")) / "eval_overrides_repointed.yaml"
+    path.write_text(yaml.safe_dump(overrides, sort_keys=False), encoding="utf-8")
+    return path
+
+
+@pytest.fixture(scope="session")
+def slot_collected_run(slot_cohort_run, slot_cohort_overrides, tmp_path_factory) -> Dict[str, Any]:
+    """One real evaluation of this cell through the family's runner; every artifact it left.
+
+    Marked ``slow`` at every consumer rather than here. Two Monte Carlo draws rather than the
+    shipped count: these tests are about the plumbing, and each draw decodes every arm over every
+    anchor.
+    """
+    import json
+
+    from teb_vae.lag_slot_transformer_cfs.eval import run as run_module
+
+    output_dir = Path(tmp_path_factory.mktemp("slot_eval"))
+    checkpoint = sorted((Path(slot_cohort_run) / "model_checkpoints").glob("*.ckpt"))[0]
+    exit_code = run_module.main(
+        checkpoint=str(checkpoint),
+        output_dir=str(output_dir),
+        overrides=str(slot_cohort_overrides),
+        device="cpu",
+        num_samples=2,
+        argument_sources={"checkpoint": "cli", "overrides": "cli"},
+    )
+    results_dir = output_dir / run_module.RESULTS_DIRNAME
+    summary_path = results_dir / run_module.SUMMARY_FILENAME
+    text = summary_path.read_text(encoding="utf-8")
+    return {
+        "checkpoint": checkpoint,
+        "exit_code": exit_code,
+        "summary_path": summary_path,
+        "text": text,
+        "summary": json.loads(text),
+        "results_dir": results_dir,
+    }

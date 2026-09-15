@@ -11,6 +11,11 @@
 # shipped default.yaml instead would evaluate against what a config file currently says rather than
 # what the run trained under. `load_eval_overrides` refuses a `base:` key here.
 #
+# The run is the family's runner bound to this cell, so the keys below are the family's keys: the
+# same loader fields every cohort-aware readout is asked in, the same caps by the same names, and
+# the same `eval_config` schema. Only the values that need re-justifying against this architecture
+# carry a comment that differs from a lag-attentive cell's.
+#
 # Run from the repo root:
 #   python -m teb_vae.lag_slot_transformer_cfs.eval.run --checkpoint <run>/model_checkpoints/<f>.ckpt
 
@@ -30,12 +35,19 @@ general_config:
 dataset_config:
   # REPOINT THESE. The placeholder paths do not exist, so a misconfigured run fails on a missing
   # file rather than on something further downstream that somebody might "fix" by dropping the
-  # warm-up budget.
+  # warm-up budget. Preflight additionally refuses any path still containing REPOINT_ME.
   #
   # They must be the CAUSAL INTEGER-OPERATOR variant, which is what this architecture's first
   # experiment is defined on. The two-sided files carry every one of these field names and dtypes
   # and differ only in a root attribute and in the stored widths, so evaluating one would report a
-  # causal model on coefficients that contain their own future.
+  # causal model on coefficients that contain their own future. Preflight refuses on both.
+  #
+  # These are the CAUSAL k-fold HOLDOUT split — one HDF5 per canonical subgroup, all eight, all
+  # three clinical classes — rather than the healthy-only pretraining test files default.yaml points
+  # at. The checkpoint trains on `pre_training_dataset/*`, which is disjoint from this cohort, so
+  # evaluation is leakage-free; and the model has never seen ACIDOSIS or HIE, so every class
+  # contrast is an out-of-distribution comparison rather than held-out discrimination. Both facts
+  # are recorded in every summary's cohort block.
   vae_test_datasets:
     - /data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_causal_int/k_fold_cross_validation_dataset/test/healthy_no_bg_no_cs.hdf5
     - /data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_causal_int/k_fold_cross_validation_dataset/test/healthy_no_bg_cs.hdf5
@@ -50,8 +62,9 @@ dataset_config:
   # accumulated EXCLUDING each channel's warm-up region, so a standardized zero is the channel mean
   # over the region the model actually reads — which is exactly what makes the observed-zeros
   # replacement arm the least informative value on the coefficient's own scale rather than an
-  # arbitrary one. A statistics file accumulated over the warm-up breaks that silently: every shape
-  # is right and every number is wrong.
+  # arbitrary one, and what makes `climatology = 0` the right feature-space baseline. A statistics
+  # file accumulated over the warm-up breaks that silently: every shape is right and every number
+  # is wrong.
   #
   # Regenerate it with `hdf5_dataset/calculate_dataset_stats.py` from THESE shards at the run's own
   # `trim_minutes`. Note the key is `stat_path` while the loader parameter is `stats_path`: a
@@ -61,18 +74,31 @@ dataset_config:
   dataloader_config:
     dataset_kwargs:
       # A list replaces wholesale on merge, so the inherited fields are restated rather than
-      # extended. `guid` keys the per-recording aggregation AND the cross-recording pairing, so a
-      # split loaded without it collapses every segment into one recording and the permutation arm
-      # is excluded from every batch. `weight` is the only trustworthy validity signal: these
-      # coefficients carry no gap sentinel of their own, so it gates every mask.
+      # extended. Every field beyond the model's own inputs has exactly one consumer here:
+      #   `fhr`, `up`  the raw traces: the contraction detector reads `up` and puts
+      #                `seconds_since_contraction` on the per-anchor table, which is what the
+      #                contraction-conditioned coupling is built from; the diagnostic page's first
+      #                row draws both.
+      #   `weight`     the ONLY trustworthy validity signal: these coefficients carry no gap sentinel
+      #                of their own, so it gates every mask, every baseline and every event.
+      #   `guid`, `epoch`
+      #                key the per-recording aggregation, the cross-recording pairing, the anchor
+      #                tiling's per-segment phase and every clock; drop either and every segment
+      #                lands on one tile grid with no shape, no count and no metric differing.
+      #   `target`     the weight-scaled class code, recovered as a ratio against `weight` and never
+      #                read directly; every class contrast and every class-balanced draw needs it.
+      #   `cs_label`, `bg_label`
+      #                the two subgroup cuts.
+      #   `time_from_labor_onset`, `second_stage_onset`
+      #                the two clinical clocks, NaN wherever the GUID is absent from the labour-onset
+      #                table -- a fact about the cohort, counted and named rather than dropped.
       #
-      # `target` is loaded although the model never reads it: it is the weight-scaled class code,
-      # and the per-recording traces draw their class-balanced selection from the class recovered
-      # off it (as a ratio against `weight`, never read directly). Without it every segment is
-      # unlabelled and the traces are recorded as skipped. `epoch` orders a recording's segments
-      # on the absolute axis, which is what a trace is.
+      # The loader SKIPS a field a shard does not carry, silently, so presence is asserted by the
+      # loader probe after the first batch rather than assumed from this list.
       load_fields:
         [
+          'fhr',
+          'up',
           'fhr_st',
           'fhr_ph',
           'up_ph',
@@ -81,6 +107,10 @@ dataset_config:
           'guid',
           'epoch',
           'target',
+          'cs_label',
+          'bg_label',
+          'time_from_labor_onset',
+          'second_stage_onset',
         ]
 
       # 0. Under training the cache is per-worker; at num_workers: 0 it becomes main-process RAM,
@@ -93,7 +123,8 @@ dataset_config:
       #
       # `trim_minutes` is inherited and NOT restated, and it decides more than normalisation here:
       # the stored per-channel warm-up vectors are rebased by exactly this trim, so it places every
-      # channel's availability boundary and therefore every lag's exposure.
+      # channel's availability boundary and therefore every lag's exposure. Preflight re-resolves
+      # the whole budget against these shards and compares it with the checkpoint's stamped tuples.
 
 # Evaluation-only settings, validated at load against a closed key set: an unknown key raises and
 # names the valid set, so a misspelling cannot silently mean "no cap". Everything that shapes what a
@@ -112,47 +143,88 @@ eval_config:
   # reported beside every gap.
   num_mc_samples: 8
 
-  # Global cap on the segments the pass sees. null evaluates the whole split.
+  # Global cap on the segments the pass sees. null evaluates the whole split. A cap is drawn
+  # STRATIFIED over the shards, never as a prefix: the loader is unshuffled over eight concatenated
+  # per-subgroup files, so a prefix cap yields one subgroup and one class.
   max_samples: null
 
-  # TWO caps are read, and both bound a computation rather than a retention: the pass holds no
-  # per-sample forecast arrays and renders no per-sample pages, and the traces re-read the
-  # recordings they draw rather than retaining anything from the pass.
+  # The caps, by the family's names. Retention is opt-in: a quantity absent from here is retained
+  # for NO samples, and the family's forecast overlay and event analysis are then silent. Set
+  # rather than empty, so a stock run emits the complete artifact set.
   #
-  #   lag_profile   how many segments the SINGLE-LAG predictive profile is scored on. On those
-  #                 segments every candidate lag is removed alone from the cached proposals and the
-  #                 resulting arm is scored in the same draw loop, under the same draws, as every
-  #                 other arm -- one decoder call per lag per draw, which is why it is capped
-  #                 rather than taken over the whole split. The segments are the first ones the
-  #                 fixed-seed shuffled loader hands out, so they are a draw over the split rather
-  #                 than one shard's prefix. Absent means the profile is skipped and the summary
-  #                 says so; the latent per-lag profile, which costs nothing, always runs over the
-  #                 whole split. The declared bands below are read FIRST and the profile after
-  #                 them: a single-lag peak read off a window whose joint removal does nothing is
-  #                 noise.
-  #
+  #   waveforms  64  the per-anchor forecast blocks (truth, both branches and the full branch's
+  #                  log-variance) plus the raw UP trace and its weight, held for the forecast
+  #                  overlay and the contraction-conditioned coupling. A retained set is a few
+  #                  megabytes per sample; lower it first if a box is tight.
+  #   pages      24  how many stratified per-sample diagnostic pages to render. Retains nothing; a
+  #                  figure count, re-rendered from the loader.
+  #   pages_per_class
+  #              10  how many pages the CLASS-BALANCED draw renders PER CLINICAL CLASS. Per class,
+  #                  not in total: `pages` is allocated in proportion to shard size, which gives the
+  #                  two rare classes a page or two against healthy's dozen.
   #   traces_per_class
-  #                 how many RECORDINGS the per-recording traces follow PER CLINICAL CLASS, each
-  #                 re-read through every segment the dataset holds for it in time order, after
-  #                 the pass. A cap on files and figures rather than on what the pass measures;
-  #                 absent means the family default rather than zero.
+  #              10  how many RECORDINGS the per-recording traces follow PER CLINICAL CLASS, each
+  #                  re-read through every segment the dataset holds for it, in time order. A cap
+  #                  on files and figures rather than on what the pass measures.
   #   attribution_segments
-  #                 how many SEGMENTS the Captum attribution stage attributes after the pass, one
-  #                 per drawn recording in a class-balanced draw, a few anchors each: tens of
-  #                 forward-and-backward passes per anchor, readout and baseline, so this bounds
-  #                 a cost the stage's own block measures. Absent means the family default.
+  #              24  how many SEGMENTS the Captum attribution stage attributes, one per drawn
+  #                  recording in a class-balanced draw, a few anchors each: tens of
+  #                  forward-and-backward passes per anchor, readout and baseline, so this bounds a
+  #                  cost the stage's own block measures.
+  #   lag_profile
+  #             256  how many segments the SINGLE-LAG predictive profile is scored on. On those
+  #                  segments every candidate lag is removed alone from the cached proposals and
+  #                  the resulting arm is scored in the same draw loop, under the same draws, as
+  #                  every other arm -- one decoder call per lag per draw, which is why it is
+  #                  capped rather than taken over the whole split. The segments are the first
+  #                  ones the fixed-seed shuffled loader hands out, so they are a draw over the
+  #                  split rather than one shard's prefix. Absent means the profile is skipped and
+  #                  the summary says so; the latent per-lag profile, which costs nothing, always
+  #                  runs over the whole split. The declared bands below are read FIRST and the
+  #                  profile after them: a single-lag peak read off a window whose joint removal
+  #                  does nothing is noise.
   #
-  # The block stays present so a reader comparing this delta against a lag-attentive cell's sees
-  # which caps this pass reads rather than wondering which were forgotten.
+  # `attention` is deliberately ABSENT: this architecture emits no attention weights, and a cap on
+  # a tensor that never exists would read as a retention that silently kept nothing. `oracle` is
+  # absent because absent means EVERY segment for that one cap, and a sufficiency probe fitted on
+  # fewer segments is not a cheaper measurement but a smaller one.
   caps:
-    lag_profile: 256
+    waveforms: 64
+    pages: 24
+    pages_per_class: 10
     traces_per_class: 10
     attribution_segments: 24
+    lag_profile: 256
+
+  # How much worse, in nats per anchor, a forecast from a stranger's prior latent must be before
+  # the prior is credited with carrying the target's predictive state. The family's verdict
+  # `prior_carries_target_state` reads it; the arm it gates is scored here under the same pairing
+  # as the source permutation, so "a stranger's source" and "a stranger's prior" name one stranger.
+  # Explicitly provisional: where that boundary actually sits is what the first converged run
+  # answers, so the verdict always reports the measured degradation beside this number.
+  prior_shuffle_min_nats: 1.0
+
+  # Latent dimensions that must clear the per-dimension activity epsilon for the latent to count
+  # as uncollapsed, for the family's `latent_not_collapsed` verdict.
+  min_active_dims: 2
+
+  # Seconds after a detected contraction within which an anchor counts as event-conditioned, for
+  # the contraction-conditioned coupling. The family's value: the window is the interval over which
+  # a contraction could still influence what is being predicted, which is a property of the
+  # physiology rather than of this cell's forecast block, and a different value here would make the
+  # readout non-comparable across cells for a reason that has nothing to do with the model.
+  event_lag_window_s: 120.0
 
   # Image format for every figure the run writes, as a matplotlib filetype: `pdf`, `svg`, `png`,
   # ... The installed matplotlib's own list is what a value is checked against, so a typo is
   # refused at config load. `null` -- the shipped setting -- keeps the family's default, `pdf`.
   figure_format: null
+
+  # How far before delivery a segment may be recorded and still be evaluated, in hours. `null` --
+  # the shipped setting -- evaluates everything the split carries. It changes the population every
+  # clock-resolved number is computed over, so a bounded run is not comparable with an unbounded
+  # one; a config key precisely so the dumped configuration is a durable record of which it was.
+  max_hours_before_delivery: null
 
   # Resamples behind every interval, drawn over RECORDINGS. Recordings, not anchors: at the dense
   # anchor set consecutive forecast windows overlap in all but one of their steps, so resampling
@@ -192,7 +264,8 @@ eval_config:
 
   # UNSET, and that is the setting. It gates the lag-attentive cells' availability-clock verdict,
   # whose null arm re-encodes a zeroed stream through a source pathway with parameters. This
-  # architecture's source encoder holds none, so that arm does not exist here and no verdict reads
-  # this key. It is left at its default rather than deleted because the key set is shared: a value
-  # here would look like a threshold this run was gated on.
+  # architecture's source encoder holds none, so that arm does not exist here, the family's
+  # `coupling_exceeds_availability_clock` verdict is INCONCLUSIVE on every run of this cell, and no
+  # verdict reads this key. It is left at its default rather than deleted because the key set is
+  # shared: a value here would look like a threshold this run was gated on.
   clock_margin_min_nats: null

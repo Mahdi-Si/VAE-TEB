@@ -30,7 +30,7 @@
     },
     "binding.py": {
       "state": "divergent",
-      "reason": "The ModelBinding dataclass is unchanged, but this copy also carries the concrete CFS_BINDING and its GEOMETRY_KEYS -- sixteen against the sibling's fourteen, adding anchor_stride and lag_floor -- so it names a model class and sits at layer 1 here against layer 0 there. The sibling keeps its instance in run.py; this cell's binding is reconciled against preflight long before either package has a runner, which is what makes a key that names nothing cheap to find."
+      "reason": "The ModelBinding dataclass gains a `collect` field naming a model's own collection pass (the shared pass is written against the lag-attention forward, and a model without one supplies the pass that writes the same tables from its own), and this copy also carries the concrete CFS_BINDING and its GEOMETRY_KEYS -- sixteen against the sibling's fourteen, adding anchor_stride and lag_floor -- so it names a model class and sits at layer 1 here against layer 0 there. The sibling keeps its instance in run.py; this cell's binding is reconciled against preflight long before either package has a runner, which is what makes a key that names nothing cheap to find."
     },
     "cohort.py": {
       "state": "equivalent",
@@ -101,7 +101,7 @@
     },
     "run.py": {
       "state": "divergent",
-      "reason": "Registers twenty-two analyses rather than seventeen, defaults to CFS_BINDING, records the dense anchor geometry and the training stride in run_context, and registers no coherence step."
+      "reason": "Registers more analyses than the sibling, keeps the three that draw the model's own forward (samples, recording_traces, attribution) on the binding rather than on the shared registry so another architecture can register its own under the same names, defaults to CFS_BINDING, resolves the collection pass through the binding, records the dense anchor geometry and the training stride in run_context, and registers no coherence step."
     },
     "spectra.py": {
       "state": "absent",

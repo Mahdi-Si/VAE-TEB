@@ -1,230 +1,143 @@
-# Figure guide
+# Figure guide for the lag-slot transformer
 
-One entry per figure a scoring pass writes into `eval_results/figures/`, and one per figure the
-acceptance pass draws when asked to: what it shows, what its axes are, and how it is misread.
-`EVAL.md` beside this file is everything that is not a figure.
+Use this guide to read the figures produced by evaluation and multi-run acceptance. Each entry explains the panels, axes, and main interpretation limits. [EVAL.md](EVAL.md) explains how to run the evaluation and defines terms such as anchor, arm, proposal, and margin.
 
-Five rules apply to every figure here.
+Start with `headline_arms` for overall predictive performance, then `pred_gap_recordings` for variation between recordings. Read `band_suppression` before `lag_profile`. Use the calibration plots to assess uncertainty and the acceptance plots to compare separately trained models.
 
-**Every figure is drawn from the summary, never from the tensors.** A figure is a picture of a
-number `summary.json` carries -- an interval, a curve, a margin -- so a figure and the number beside
-it cannot disagree, and the whole set can be redrawn from a finished directory on a box with no
-checkpoint, no shard and no `torch`.
+## Conventions used throughout
 
-**One axis per panel.** A score and a count never share a frame on two y-axes; a quantity in a
-different unit gets its own panel.
+- **Check where the data came from.** Scoring and acceptance figures use saved summary statistics and tables. They can be redrawn without a checkpoint, dataset shard, or PyTorch. Detailed recording traces and input attributions are exceptions: their separate stages rerun the model to collect information that the summary does not contain.
+- **Read the units on each panel.** Different units get separate panels, with no second vertical axis. Predictive scores are in nats per anchor, and lower is better. A predictive gap is base minus full; an intervention margin is the intervened score minus full. Positive values mean source benefit and intervention harm, respectively.
+- **Use paired intervals for comparisons.** Margins are calculated within each recording before bootstrapping recordings. Use the margin's interval to assess the comparison; overlap between the two arms' separate intervals does not answer the same question.
+- **Use labels to identify arms.** Dot-plot colours indicate families: blue for matched branches, grey for reference identities, green for lag bands, and amber for source controls. Curves use fixed band colours in declaration order: amber, green, purple, and vermilion. The text label or legend names the exact arm.
+- **Read missing-data messages.** An unavailable result is labelled with a reason. Target-only models have no band or lag profile, and normalised fusion has no additive latent profile. An absent measurement should not be read as zero.
+- **Lag axes show stored-coefficient time.** Lag $\ell$ identifies a source coefficient stored $\ell$ steps before the anchor. The seconds axis converts stored steps to seconds. Upstream causal feature extraction combines raw history within each coefficient, so these axes do not measure physiological delay. Every lag figure carries this qualification.
 
-**Every interval that exists is drawn, and every margin's interval is the paired one.** Two arms
-scored on the same recordings under the same draws differ per recording, so the interval on a
-margin is the interval of those differences, drawn once over recordings. Two overlapping intervals
-of the two arms are wider by exactly the shared variation the pairing removes and are not what a
-claim about a margin rests on.
+The plots use the shared style in `teb_vae/lag_attn/eval/figures.py`: double-column width, 7 pt serif text, open frames, legends above the data, and the Okabe-Ito colour-blind-safe palette. Panel letters (**a**, **b**, and so on) run left to right, then top to bottom. Qualifications appear as 6 pt footnotes in reserved space below the axes.
 
-**Identity is text, colour is family.** On a dot plot the y label names the arm and the colour says
-whether it is a matched branch (blue), a reference identity (grey), a lag band (green) or a source
-control (amber). On a curve figure the declared lag bands take fixed colours in declaration order --
-amber, green, purple, vermilion -- and a legend names them.
+## Scoring figures
 
-**An empty panel says so.** A block the run did not produce -- a target-only arm has no bands and no
-lag profile, a normalised fusion has no latent profile -- draws a sentence saying what is absent
-rather than an empty frame.
-
-**Every lag axis is stored-coefficient time.** Lag $\ell$ names the source coefficient stored $\ell$
-steps before the anchor, and the seconds axis above it is that many stored steps. It is not a
-physiological delay: the causal feature extraction upstream of the model mixes raw history inside
-every coefficient over a span the feature geometry fixes, and the qualification the lag readouts
-must be read with is printed under every lag figure.
-
-The figures share the evaluation packages' publication style, decided once in
-`teb_vae/lag_attn/eval/figures.py`: a double-column width, a 7 pt serif type scale, open frames,
-unframed legends placed in headroom above the data, and the Okabe-Ito colour-blind-safe palette.
-Panels of a multi-panel figure carry bold lowercase letters (**a**, **b**, ...) in row-major order,
-which is how the entries below refer to them; a qualification printed under a figure is a footnote
-set at 6 pt with its own reserved room, never across an axis label. Panel titles are short noun
-phrases: what a panel means is in its axis labels and here.
-
----
-
-## The scoring pass
+These figures are saved in `eval_results/figures/`. Filenames use the configured figure format.
 
 ### `headline_arms`
 
-Two dot plots.
+**Question:** How well does each condition predict, and how much does each intervention change prediction?
 
-*Left: each arm's own score.* Every scored arm's equal-recording predictive score in nats per anchor,
-lower is better, with its recording-level bootstrap interval. Listed by family: the two matched
-branches, the band suppressions, the silence identity, the source controls. The number beside each
-row is its point estimate. The intervals here are wide on purpose: they carry the whole
-recording-to-recording spread, which is what makes the right panel necessary.
+**Left panel:** One dot per arm shows its equal-recording predictive score in nats per anchor, with a recording-level bootstrap interval. Lower is better. Arms are grouped as matched branches, band suppressions, the silence identity, and source controls. Each row also prints the point estimate.
 
-*Right: margins, paired over recordings.* The gap (base − full) first, then every intervened arm's
-margin against the full branch with the paired interval of the per-recording differences. A positive
-margin means the fitted model predicts worse under the intervention. Three rows are identities that
-verify the intervention path rather than measurements: `suppress:none` is exactly zero, and
-`suppress:all` and `silence` equal the gap exactly.
+**Right panel:** The first row shows the predictive gap, base minus full. Other rows show intervention minus full, each with the paired interval of its per-recording differences. A positive intervention margin means the model predicts worse after that intervention. Three rows check exact identities: `suppress:none` is zero, while `suppress:all` and `silence` equal the predictive gap.
 
-**How it is misread.** The gap is necessary and not sufficient: a candidate's own base branch can
-weaken during joint training, so a positive gap is read beside an independently trained target-only
-reference, which the acceptance figures carry and this one cannot. And the left panel's overlapping
-intervals say nothing about the margins on the right, for the pairing reason above.
+**Interpretation:** An internal gap can grow because joint training weakens the base branch. Use the acceptance figures to compare both branches with a separately trained, frozen target-only reference. Assess margins using the right panel's paired intervals.
 
 ### `pred_gap_recordings`
 
-Two histograms over recordings. *Left*, the predictive gap per recording with the zero line and the
-median: an interval on the mean can exclude zero on a population where a third of the recordings
-sit on the other side, and this is where that shows. *Right*, the effective draw count of the full
-branch per recording, $1 / \sum_k \alpha_k^2$ over the $K$ draws, with $K$ marked: a mass near one is a
-warning that $K$ was too small for those recordings, and a mass near $K$ says the draws agreed, not
-that the estimator converged.
+**Question:** Is the average improvement shared across recordings, and do enough latent draws contribute to the score?
+
+**Left panel:** A histogram of the per-recording predictive gap, with zero and the median marked. Positive gaps mean the source improved prediction. An interval on the overall mean can exclude zero even when many recordings have negative gaps; this panel reveals that variation.
+
+**Right panel:** A histogram of the full branch's effective draw count, $1/\sum_k\alpha_k^2$, with the requested count $K$ marked. Here, $\alpha_k$ is a draw's normalised likelihood weight. Values near one indicate that very few draws dominate the score. Values near $K$ mean the draws received similar weights, but do not prove that increasing $K$ would leave the estimate unchanged.
 
 ### `band_suppression`
 
-*Left*, each declared band's suppression margin with its paired interval, the joint `all` removal
-last in grey. *Right*, the exposure behind each margin: how many scored anchor-lag pairs of the band
-carried any available channel. A band with nothing to remove is drawn as `not measured` rather than
-at zero, because a zero there would read afterwards as a band that did not matter.
+**Question:** Does removing a broad interval of source history worsen prediction?
 
-**How it is misread.** The margins do not decompose the gap and are not normalised to it: the
-limiter is applied after the summation, so two bands' margins need not add to the margin of removing
-both. And a margin is a property of this fitted parameterisation -- an exactly zero-sum reallocation
-of proposals across lags changes every band's margin while changing no prediction.
+**Left panel:** Each declared band's suppression margin and paired interval. The joint `all` removal appears last in grey. Positive values mean removal worsened prediction.
+
+**Right panel:** Exposure for each band: the number of scored anchor-lag pairs with at least one available source channel. A band with no available input is labelled `not measured`.
+
+**Interpretation:** Band margins need not add to the full predictive gap or to a joint-removal margin, because a nonlinear limiter acts after the proposals are summed. They describe the fitted model's response to removal. Contributions can be rearranged across lags while preserving their total and all full-model predictions, yet changing individual removal margins.
 
 ### `lag_profile`
 
-Four panels sharing the lag axis, with the declared bands shaded and named along the top of the
-first panel and the seconds axis above it.
+**Question:** Which stored lags are available, how do their proposals affect the latent state, and what happens when each lag is removed?
 
-1. *Exposure.* The fraction of scored anchors at which the lag carried any available channel, and
-   the mean fraction of the declared source channels available at those anchors. Both are fractions
-   on one axis. A lag deep in the warm-up staircase is low on both, and everything drawn below it is
-   read against that.
-2. *Latent profile: the proposal and the update.* Per lag, averaged over the scored anchors the lag
-   was live at: the norm of the proposal the head emitted, $\lVert r_{t,\ell}\rVert_2$; the shift
-   removing that lag alone makes to the bounded mean update,
-   $\lVert a_t - a_t^{\setminus\ell}\rVert_2$; and, where the arm has a scale channel, the scale
-   proposal's norm. The shift is zero where the limiter has saturated however large the proposal is,
-   which is what separates it from the norm.
-3. *Divergence drop.* $K_t - K_t^{\setminus\ell}$, signed: removing a lag can raise the divergence
-   when its proposal was cancelling another's.
-4. *Predictive margin of removing the lag alone.* The finest partition of the suppression readout,
-   scored under the same draws as every other arm on the segments the profile cap admitted, with its
-   paired interval over the recordings those segments came from. Absent, with the reason, when the
-   cap was not set, when the arm's fusion sums no per-lag updates, or when the checkpoint has no
-   source pathway.
+Four panels share the lag axis. Declared bands are shaded and named above the first panel; the upper axis converts stored lag steps to seconds.
 
-**How it is misread.** None of the three latent quantities is an allocation over lags, and the
-predictive profile is read **after** the band and joint removals of `band_suppression`, never instead
-of them: a single-lag peak read off a window whose joint removal does nothing is noise. The profile
-is over a capped subset of the split, and its recording count is in the panel title.
+1. **Exposure:** The fraction of scored anchors with any available channel at that lag, and the mean fraction of declared source channels available there. Low exposure limits the evidence for the panels below.
+2. **Latent profile:** The proposal norm $\lVert r_{t,\ell}\rVert_2$, the change in bounded mean update after removal $\lVert a_t-a_t^{\setminus\ell}\rVert_2$, and the scale proposal norm where supported. Values are averaged over anchors where the lag was available. A large proposal may have little effect when the limiter is saturated.
+3. **Divergence drop:** The signed change $K_t-K_t^{\setminus\ell}$. It can be negative: removing a proposal that cancelled another proposal may increase divergence.
+4. **Predictive margin:** The score change from removing the lag alone, with its paired recording-level interval. This uses the same draws as the other arms but only the segments allowed by the profile cap. A reason is shown if the cap is unset, the fusion has no per-lag additive updates, or the model has no source pathway.
+
+**Interpretation:** The latent curves do not allocate a fixed total over lags. Read individual peaks alongside broad-band and joint removals; a peak alone is weak evidence when removing the surrounding window has no effect. The predictive profile is based on a capped subset, whose recording count appears in the panel title.
 
 ### `horizon_resolved`
 
-Three panels sharing the horizon axis. *Top*, the gap by horizon step with its interval. *Middle*,
-each declared band's suppression margin by step, paired over recordings, one fixed colour per band.
-*Bottom*, the source control margins by step.
+**Question:** At which future forecast steps does the source help?
 
-Every curve is the marginal mixture of that step's own likelihood factors under the shared draws:
-$D^{(K)}_\tau = -\operatorname{logsumexp}_k(-D^{(k)}_\tau) + \log K$. In general
-$\log \mathbb E_Z \prod_\tau p_\tau \ne \sum_\tau \log \mathbb E_Z p_\tau$, so the steps do **not** sum to
-the joint block score and the axis is read for its shape rather than its total. The horizon axis is
-the one a source's timing is expressible on here: a band that informs the first predicted step and
-not the last is a statement the window carries whatever the lag axis can resolve.
+Three panels share the forecast-step axis. The top panel shows the predictive gap and interval. The middle shows each band's suppression margin with paired intervals and a fixed band colour. The bottom shows the source-control margins by step.
+
+Each step is scored as its own likelihood mixture under the shared draws:
+
+$$
+D_\tau^{(K)}=-\operatorname{logsumexp}_k(-D_\tau^{(k)})+\log K.
+$$
+
+These step scores do not generally sum to the joint block score, because $\log\mathbb E_Z\prod_\tau p_\tau\ne\sum_\tau\log\mathbb E_Zp_\tau$. Read the curves to see where improvement occurs across the forecast window. For example, a band may help the first predicted step more than the last.
 
 ### `block_resolved`
 
-One dot plot per stored target block -- the scattering coefficients and the phase-harmonic
-coefficients, in the order the kept channel axis carries them -- each listing the gap and every
-margin with its paired interval, summed over that block's own channels and the horizon. The
-channel count each block kept is in its title, because the two blocks are not the same size and a
-nat summed over more channels is a larger number for that reason alone. The same subset-mixture
-caveat as the horizon figure applies: the two blocks do not sum to the joint score.
+**Question:** Which target feature block benefits from the source?
+
+One dot plot is shown for each stored target block: scattering coefficients and phase-harmonic coefficients, in kept-channel order. Each panel lists the gap and intervention margins with paired intervals, summed over that block's channels and the horizon. The title gives the number of retained channels.
+
+**Interpretation:** Block size affects the score's scale, so compare channel counts before comparing magnitudes. As with the horizon plot, separately mixed subset scores do not generally sum to the joint block score.
 
 ### `calibration`
 
-*Left*, the observed central coverage of the mixture predictive law at each nominal level, for both
-branches, with the diagonal a calibrated forecast sits on. Below the diagonal is over-confidence,
-above it under-confidence, and the three levels separate a body problem from a tail one. *Right*,
-the mean and variance of the probability integral transform for both branches against the uniform
-reference ($1/2$ and $1/12$). Both branches are drawn because a calibration statement about the
-source-conditioned branch alone cannot say whether the source improved it or whether the observation
-model was already miscalibrated without it.
+**Question:** Does predicted uncertainty match how often observations fall inside forecast intervals?
 
----
+**Left panel:** Observed coverage versus nominal central coverage for both branches. A calibrated forecast follows the diagonal. Points below it indicate overconfidence; points above it indicate underconfidence. The three nominal levels help distinguish errors near the centre of the distribution from errors in its tails.
 
-## The per-recording traces
+**Right panel:** The mean and variance of the probability integral transform, or PIT, for each branch. For a calibrated continuous predictive distribution, PIT values are uniform, with mean $1/2$ and variance $1/12$.
 
-Drawn into `eval_results/recording_traces/` by the stage that runs after the scoring pass, from the
-forwards it re-reads rather than from the summary -- the one exception to the first rule above, and
-stated as one: a trace is the whole forward output of every segment of a recording, which no summary
-carries. The file layout, the two tables and both figures are the family's shared ones, so a trace
-under this architecture reads beside a trace of the same recording under a lag-attentive one.
+**Interpretation:** Compare both branches to assess whether using the source changes calibration. The full branch alone cannot show whether a calibration problem was already present in the base branch.
+
+## Recording traces
+
+These figures are saved in `eval_results/recording_traces/`. Their stage rereads model outputs for every segment of each selected recording. The file layout, tables, and figures follow the shared family format, so recordings can be examined across architectures.
 
 ### `recording_traces_summary`
 
-One panel per per-segment summary column -- the divergence, the single-draw forecast gap, the source
-shift of the latent mean, the active coordinate count, the lag centroid of the proposal norm and the
-cancellation ratio -- each against hours before delivery, one line per traced recording in its class
-colour, one marker per segment, lifted at a break. Up to `eval_config.caps.traces_per_class`
-recordings per class, drawn for looking at rather than for testing: a class whose lines sit higher is
-a hypothesis and not a finding.
+**Question:** How do selected recordings change as delivery approaches?
 
-### The per-recording traces: `<class>/<guid>_<subgroup>_trace`
+A coverage row, then one panel per segment-level summary quantity: divergence, single-draw forecast gap, source-induced latent mean shift, active coordinate count, proposal-norm lag centroid, and cancellation ratio. All rows share one horizontal axis of hours before delivery, with delivery on the right. Each recording is a thin line in its class colour with one marker per segment, lifted at a gap; over the lines the class median per half-hour window is drawn bold, with the inter-quartile band over recordings where at least three recordings fall in the window. The coverage row counts the recordings each window holds per class. When `max_hours_before_delivery` is set the axis is bounded to it and the footnote states how many segments lie beyond.
 
-One recording followed through every segment the dataset holds for it, at anchor resolution, on one
-shared axis of hours before delivery; the filename carries the GUID **and the subgroup**. The rows:
-the divergence per anchor; the single-draw forecast gap off the forward's own forecasts; the
-full-branch mean over the latent coordinates and the bounded mean update $a_t$, as heatmaps on a
-symmetric scale; the divergence per coordinate; the **proposal norm over lags** with the lag of the
-largest proposal drawn over it; the latent norms; the mean log-variances; the lag centre of the
-proposal norm; and the cancellation ratio of the mean update. Segment joins are marked by a light
-vertical line, and a line row is lifted at every unscored anchor.
+Up to `eval_config.caps.traces_per_class` recordings are shown per class. These traces support visual exploration. A median over three recordings is a median of three; read the coverage row before the band. A difference between the class medians needs a separate statistical analysis before it can support a class-level claim.
 
-**How it is misread.** The lag row is a proposal *norm* -- an update magnitude before the sum and
-the limiter, not a distribution over lags and not an allocation of the divergence -- and its
-qualification is printed under the figure with the stored-coefficient-time caveat. A step at a
-segment join is geometry: each segment is a separate forward with a reset encoder state. The colour
-scales are per recording. On the comparator's normalised fusion and on the target-only arm the lag
-row is absent, and the block in the summary says so under `lag_family_present`.
+### Per-recording trace: `<class>/<guid>_<subgroup>_trace`
 
----
+**Question:** What happens within one recording at individual forecast anchors?
 
-## The attributions
+All segments share one axis of hours before delivery, delivery on the right. Rows show divergence, the forward pass's single-draw forecast gap, full-branch latent means, bounded mean update $a_t$, per-coordinate divergence, proposal norms over lags, latent norms, mean log-variances, the proposal-norm lag centroid, and mean-update cancellation ratio. The mean and update heatmaps use symmetric colour scales; every heatmap's colour axis sits in its own column so all rows span the same hours. The largest-proposal lag is drawn over the lag heatmap. On the divergence and forecast-gap rows a black step marks each segment's mean over its scored anchors, the value the summary figure carries. Segments alternate a faint background on the line rows, a gap the dataset holds no segment for is shaded darker on every row, line plots break at unscored anchors, and a clinical clock the recording carries is ruled across the page at its onset (labour onset dashed, second stage dotted).
 
-Drawn into `eval_results/attribution/` by the stage that runs after the traces, from the forwards
-it re-reads and differentiates: five fixed-name figures (`attribution_maps`,
-`attribution_lag_profile`, `attribution_bands`, `attribution_layer`, `attribution_null`) and
-one `traces/<class>/<guid>_<subgroup>_attribution_trace` per traced recording. They are the
-family's shared figures and are documented, panel by panel, in the lag-attentive cells' figure
-guide under the same names. What differs here: the lag row of every figure is the **proposal
-norm**, qualified as the traces qualify it, and the layer figure's left panel is the per-lag
-split of the readout on the proposal head's output -- an attribution through the summation and
-the limiter, not an allocation -- drawn against the compensated lag axis rather than per head.
+**Interpretation:** The lag heatmap shows proposal magnitude before summation and limiting. It is neither a lag probability distribution nor an allocation of divergence. A jump at a segment boundary can reflect the reset encoder state because each segment is a separate forward pass. Colour scales are set per recording. The lag row is absent for normalised fusion and target-only models, as recorded by `lag_family_present`.
 
----
+## Input-attribution figures
 
-## The acceptance pass
+These outputs are saved in `eval_results/attribution/`. The stage reruns and differentiates the model to estimate how inputs affect selected outputs. It produces `attribution_maps`, `attribution_lag_profile`, `attribution_bands`, `attribution_layer`, `attribution_null`, `attribution_channels`, `attribution_lag_channel`, `attribution_time_profile`, `attribution_checks`, `attribution_time_to_delivery`, one `maps/<class>_<guid>_<subgroup>_anchor<step>_attribution_maps` page per class example (the input coefficients beside every readout's attribution maps at one anchor), and one `traces/<class>/<guid>_<subgroup>_attribution_trace` per traced recording (the divergence and the forecast gap attributed at the same anchors).
 
-Drawn into the directory `--figures` names, from the record after it is assembled.
+The panel layouts are shared with the lag-attentive models. See [their figure guide](../../lag_attn_cfs/eval/FIGURE_GUIDE.md#attributionattribution_mapspdf) for the individual panels. Two differences apply here: each lag row shows a proposal norm, with the same limitations as the recording traces; and the layer figure's left panel splits attribution over the proposal head's lag outputs. That split follows the sum and limiter and is drawn against compensated lag, rather than attention head. It does not allocate divergence among lags.
+
+## Acceptance figures
+
+These plots are drawn from the assembled multi-run acceptance record into the directory supplied with `--figures`.
 
 ### `acceptance_comparisons`
 
-The declared primary comparisons, each the paired difference of `nll_full` between its left and right
-arm, averaged over the arms' training seeds and bootstrapped once over recordings. Negative favours
-the left arm. A comparison is blue when it was read at the declared draw count with both arms at
-the seed minimum and grey otherwise; its status is in the record.
+**Question:** Which separately trained model variant predicts better in each declared comparison?
+
+Each row shows the paired difference in `nll_full` between the left and right variants. Scores are averaged across training seeds within each recording, then bootstrapped once over recordings. Negative values favour the left variant. Blue indicates the declared draw count and minimum seed count were satisfied for both variants; grey indicates they were not. The record contains the detailed status.
 
 ### `acceptance_arms`
 
-Three dot plots sharing the arm axis: each arm's internal gap; its full branch against the frozen
-target-only reference (negative favours the arm), which is the comparison the internal gap cannot
-make; and its base branch against that reference, which is the one that can fail -- a confidently
-positive value is a base that joint training left behind, and every gap measured against it is then
-measuring that.
+**Question:** Does an internal gain also hold against the frozen target-only reference?
+
+Three dot plots share the model-variant axis. They show each variant's internal gap, its full branch minus the frozen reference, and its base branch minus that reference. Negative reference differences favour the evaluated variant. A confidently positive base-minus-reference difference can fail the gate: the jointly trained base has fallen behind the reference, which weakens the interpretation of its internal gap.
 
 ### `acceptance_bands`
 
-One panel per arm that searched the lag bands. Each band's margin at the nominal level in the band's
-colour, with the family-adjusted interval -- the one covering every searched band at once, and the
-one a claim about the peak band rests on -- as a wider grey bar behind it. The peak band is named in
-the panel title; it was chosen on the same recordings its interval is built from, which is why the
-adjusted interval exists.
+**Question:** Does a selected lag band still have evidence after accounting for the band search?
+
+Each panel represents a model variant that searched lag bands. A band's coloured interval is the nominal interval. The wider grey interval behind it is adjusted to cover all searched bands together. The selected peak band appears in the title.
+
+**Interpretation:** Use the family-adjusted interval for a claim about the selected peak. The same recordings were used to choose the peak and estimate its margin, so selecting the most favourable nominal interval would overstate the evidence.

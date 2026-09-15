@@ -307,12 +307,12 @@ def test_the_class_draw_is_reproducible_and_is_not_the_stratified_draw() -> None
     once = samples_analysis.per_class_rows(frame, per_class=10, seed=7)
     again = samples_analysis.per_class_rows(frame, per_class=10, seed=7)
     shifted = samples_analysis.per_class_rows(
-        frame, per_class=10, seed=7 + samples_analysis._CLASS_DRAW_SEED_OFFSET
+        frame, per_class=10, seed=7 + samples_analysis.CLASS_DRAW_SEED_OFFSET
     )
 
     assert list(once["guid"]) == list(again["guid"])
     assert list(once["guid"]) != list(shifted["guid"])
-    assert samples_analysis._CLASS_DRAW_SEED_OFFSET != 0
+    assert samples_analysis.CLASS_DRAW_SEED_OFFSET != 0
 
 
 def test_the_class_draw_returns_the_rows_in_table_order() -> None:

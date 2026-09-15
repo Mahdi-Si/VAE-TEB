@@ -5,7 +5,12 @@ than forked: a second copy of it would be a second definition of what a run *mea
 would drift. What is written here is one instance of it, and each field decides something no
 amount of reading the checkpoint could recover.
 
-Three of the fields differ from the lag-attentive cells' in ways worth stating outright.
+Three of the fields differ from the lag-attentive cells' in ways worth stating outright, and
+three more are what let the family's runner evaluate this model at all: ``collect`` names this
+cell's own collection pass, because the shared one reads tensors only a lag-attention forward
+emits; ``extra_analyses`` registers the readouts only this architecture has beside this cell's own
+pages, traces and attributions; and ``headline_scalars`` puts this cell's paired gap interval and
+source-control margins into the block every arm table reads.
 
 ``geometry_keys``
     The attention keys are gone, because this architecture refuses them at construction, and five
@@ -41,6 +46,18 @@ from pathlib import Path
 from typing import Any, Dict, Tuple
 
 from teb_vae.lag_attn_cfs.eval.binding import ModelBinding
+from teb_vae.lag_slot_transformer_cfs.eval.analyses import arms as arms_analysis
+from teb_vae.lag_slot_transformer_cfs.eval.analyses import attribution as attribution_analysis
+from teb_vae.lag_slot_transformer_cfs.eval.analyses import (
+    lag_suppression as lag_suppression_analysis,
+)
+from teb_vae.lag_slot_transformer_cfs.eval.analyses import (
+    recording_traces as recording_traces_analysis,
+)
+from teb_vae.lag_slot_transformer_cfs.eval.analyses import (
+    resolved_axes as resolved_axes_analysis,
+)
+from teb_vae.lag_slot_transformer_cfs.eval.analyses import samples as samples_analysis
 from teb_vae.lag_slot_transformer_cfs.nets.model import MODEL_KIND, SeqVaeLagResidualTrfCfs
 from teb_vae.lag_slot_transformer_cfs.task import SeqVaeLagResidualTrfCfsTask
 
@@ -266,15 +283,69 @@ def residual_encoder_disclosure(model: Any) -> Dict[str, Any]:
     }
 
 
+def collect_tables(task: Any, loader: Any, **kwargs: Any) -> Any:
+    """This cell's own collection pass, as the family's runner calls it through the binding.
+
+    Resolved at call time rather than imported above: the pass reads this module's declarations
+    -- the excluded analyses and the model kind -- so importing it here would be a cycle. What
+    the runner is handed is one callable with the shared pass's signature, and everything from
+    the tables on is the family's.
+
+    Args:
+        task: The loaded task, in evaluation mode.
+        loader: The evaluation dataloader.
+        **kwargs: Exactly :func:`teb_vae.lag_attn_cfs.eval.collect.collect_tables`'s keywords.
+
+    Returns:
+        The collection this cell's pass assembled.
+    """
+    from teb_vae.lag_slot_transformer_cfs.eval.collect import collect_tables as run_pass
+
+    return run_pass(task, loader, **kwargs)
+
+
+#: This cell's own analyses, merged onto the shared registry in declaration order and run after
+#: every shared analysis but the trailing cross-subgroup test, which reads what they write.
+#:
+#: Three draw the readouts only this architecture has, from the results block the pass assembled:
+#: the scored arms and their paired margins, the lag suppression with the per-lag profile, and the
+#: horizon- and block-resolved margins. Three draw this model's own forward under the family's
+#: three names -- the pages, the traces and the attributions -- because each reads a tensor the
+#: lag-attentive forward does not emit and the lag-attentive implementation reads one this
+#: forward does not; the shared name is what keeps two run directories readable down one layout.
+EXTRA_ANALYSES: Dict[str, Any] = {
+    "arms": arms_analysis.run_arms_analysis,
+    "lag_suppression": lag_suppression_analysis.run_lag_suppression_analysis,
+    "resolved_axes": resolved_axes_analysis.run_resolved_axes_analysis,
+    "samples": samples_analysis.run_samples_analysis,
+    "recording_traces": recording_traces_analysis.run_recording_traces_analysis,
+    "attribution": attribution_analysis.run_attribution_analysis,
+}
+
+#: What this cell's own pass puts in the headline block, appended to the family's registry.
+#:
+#: The family's ``pred_gap_mc_nats`` is this cell's marginalised gap already -- the same number
+#: under the family's name -- so what is added is its paired interval over recordings and the four
+#: source-control margins, which are the readouts an arm table of this cell is read down. Every
+#: path is keyed all the way down, and none is keyed by a band name an operator chooses.
+HEADLINE_SCALARS: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
+    ("pred_gap_mc_ci_lo", ("arm_scores", "pred_gap", "lo")),
+    ("pred_gap_mc_ci_hi", ("arm_scores", "pred_gap", "hi")),
+    ("silence_margin_nats", ("source_controls", "silence_margin_nats")),
+    ("replace_zeros_margin_nats", ("source_controls", "replace_zeros_margin_nats")),
+    ("replace_constant_margin_nats", ("source_controls", "replace_constant_margin_nats")),
+    ("permute_margin_nats", ("source_controls", "permute_margin_nats")),
+    ("cancellation_ratio_mean", ("lag_readouts", "cancellation", "mean", "ratio")),
+    ("draw_concentration_full", ("arm_scores", "draw_concentration_full", "point")),
+)
+
 #: The model this package's evaluation scores.
 #:
-#: ``extra_analyses`` is empty and ``headline_scalars`` with it, and that is not a gap to be filled
-#: later: this package does not drive the shared collection pass at all, for the anchor-axis reason
-#: its ``__init__`` records, so an analysis registered here would never be reached. The binding is
-#: declared as a ``ModelBinding`` regardless, because the four facts it carries are exactly the
-#: four this package's own pass needs -- the class to rebuild, the keys to reconcile, the
-#: disclosure to record, and the override delta to merge -- and because ``excluded_analyses`` is
-#: then a checkable statement rather than prose: the merged registry with this binding applied is
+#: Everything the family's runner cannot derive about this model, in one frozen declaration: the
+#: class to rebuild, the keys to reconcile, the disclosure to record, the override delta to merge,
+#: the pass that produces the tables, the analyses only this cell has, the scalars they put in the
+#: headline, and the two shared analyses this architecture cannot produce. ``excluded_analyses``
+#: is a checkable statement rather than prose: the merged registry with this binding applied is
 #: what a reader is told the architecture cannot produce.
 LAG_RESIDUAL_BINDING = ModelBinding(
     model_cls=SeqVaeLagResidualTrfCfs,
@@ -283,16 +354,22 @@ LAG_RESIDUAL_BINDING = ModelBinding(
     geometry_keys=GEOMETRY_KEYS,
     encoder_disclosure=residual_encoder_disclosure,
     overrides_path=DEFAULT_OVERRIDES_PATH,
+    extra_analyses=EXTRA_ANALYSES,
+    headline_scalars=HEADLINE_SCALARS,
     excluded_analyses=EXCLUDED_ANALYSES,
+    collect=collect_tables,
 )
 
 __all__ = [
     "ANALYSES_THIS_ARCHITECTURE_CANNOT_PRODUCE",
     "DEFAULT_OVERRIDES_PATH",
     "EXCLUDED_ANALYSES",
+    "EXTRA_ANALYSES",
     "GEOMETRY_KEYS",
+    "HEADLINE_SCALARS",
     "LAG_RESIDUAL_BINDING",
     "MODEL_KIND",
     "UNREGISTERED_ANALYSES",
+    "collect_tables",
     "residual_encoder_disclosure",
 ]

@@ -50,6 +50,14 @@ ARM_EPOCHS = 2
 ARM_DRAWS = 3
 ARM_RESAMPLES = 100
 
+#: The loader fields an evaluation delta must name: the model inputs, the raw traces the
+#: contraction detector and the page read, the validity signal, the identities and the
+#: clinical labels and clocks. The committed delta names the same list.
+EVAL_LOAD_FIELDS = (
+    "fhr", "up", "fhr_st", "fhr_ph", "up_ph", "up_st", "weight", "guid", "epoch", "target",
+    "cs_label", "bg_label", "time_from_labor_onset", "second_stage_onset",
+)
+
 
 def fit_arm(work: Path, name: str, overrides: Dict[str, Any]) -> Path:
     """Run one short fit through the real entry point and return its last checkpoint.
@@ -124,6 +132,9 @@ def write_eval_delta(work: Path, name: str) -> Path:
         "dataset_config": {
             "vae_test_datasets": config["dataset_config"]["vae_test_datasets"],
             "stat_path": config["dataset_config"]["stat_path"],
+            # The clinical fields every cohort-aware readout is asked in, restated because a
+            # list replaces wholesale on merge and the preflight refuses a delta without them.
+            "dataloader_config": {"dataset_kwargs": {"load_fields": list(EVAL_LOAD_FIELDS)}},
         },
         "eval_config": {
             "seed": 7,
@@ -158,7 +169,7 @@ def score_arm(work: Path, name: str, checkpoint: Path) -> Dict[str, Any]:
             output_dir=str(work / f"eval_{name}"),
             device="cpu",
             overrides=str(delta_path),
-            sources={"checkpoint": "cli"},
+            argument_sources={"checkpoint": "cli"},
         )
         == 0
     )
@@ -234,9 +245,9 @@ def test_the_target_only_arm_scores_a_gap_of_exactly_zero(arms) -> None:
     """
     summary = arms["reference_summary"]
 
-    assert summary["arm"]["source_disabled"] is True
-    assert summary["headline"]["pred_gap"]["point"] == 0.0
-    assert summary["headline"]["nll_full"]["point"] == summary["headline"]["nll_base"]["point"]
+    assert summary["results"]["arm"]["source_disabled"] is True
+    assert summary["results"]["arm_scores"]["pred_gap"]["point"] == 0.0
+    assert summary["results"]["arm_scores"]["nll_full"]["point"] == summary["results"]["arm_scores"]["nll_base"]["point"]
 
 
 def test_the_target_only_run_names_every_intervention_it_could_not_make(arms) -> None:
@@ -246,7 +257,7 @@ def test_the_target_only_run_names_every_intervention_it_could_not_make(arms) ->
     run had no source pathway at all, and the two must not read the same in an artifact.
     """
     summary = arms["reference_summary"]
-    controls = summary["source_controls"]
+    controls = summary["results"]["source_controls"]
 
     assert set(controls["skipped"]) == {
         "suppress", "silence", "replace", "permute", "lag_profile"
@@ -255,11 +266,11 @@ def test_the_target_only_run_names_every_intervention_it_could_not_make(arms) ->
         assert "no source pathway" in reason
     for margin in ("silence_margin_nats", "permute_margin_nats", "replace_zeros_margin_nats"):
         assert controls[margin] is None, margin
-    assert summary["lag_readouts"]["band_suppression"] == {}
+    assert summary["results"]["lag_readouts"]["band_suppression"] == {}
     # The per-lag profile is skipped by name too: there is no lag to read on this arm.
-    assert summary["lag_readouts"]["lag_profile"]["predictive"]["status"] == "SKIPPED"
-    assert summary["lag_readouts"]["lag_profile"]["latent"] == {}
-    assert summary["encoder_disclosure"]["source_disabled"] is True
+    assert summary["results"]["lag_readouts"]["lag_profile"]["predictive"]["status"] == "SKIPPED"
+    assert summary["results"]["lag_readouts"]["lag_profile"]["latent"] == {}
+    assert summary["causality"]["source_disabled"] is True
 
 
 def test_the_gate_passes_on_a_target_only_summary_and_says_why_it_is_quiet(arms) -> None:
@@ -300,10 +311,10 @@ def test_the_candidate_is_scored_through_the_same_estimator_as_the_reference(arm
     """
     candidate, reference = arms["candidate_summary"], arms["reference_summary"]
 
-    assert candidate["draws"]["num_mc_samples"] == reference["draws"]["num_mc_samples"]
-    assert candidate["draws"]["estimator"] == reference["draws"]["estimator"]
-    assert candidate["n_recordings"] == reference["n_recordings"]
-    assert candidate["arm"]["source_disabled"] is False
+    assert candidate["results"]["draws"]["num_mc_samples"] == reference["results"]["draws"]["num_mc_samples"]
+    assert candidate["results"]["draws"]["estimator"] == reference["results"]["draws"]["estimator"]
+    assert candidate["results"]["n_recordings"] == reference["results"]["n_recordings"]
+    assert candidate["results"]["arm"]["source_disabled"] is False
 
 
 # =============================================================================
@@ -323,7 +334,7 @@ def test_the_candidate_is_read_against_the_frozen_reference(arms) -> None:
         if record["name"] == "candidate_against_external_reference"
     )
 
-    assert verdict["reference_nll"] == arms["reference_summary"]["headline"]["nll_base"]["point"]
+    assert verdict["reference_nll"] == arms["reference_summary"]["results"]["arm_scores"]["nll_base"]["point"]
     assert verdict["candidate_full_nll"] is not None
     assert verdict["improvement_over_reference_nats"] is not None
 
@@ -337,8 +348,8 @@ def test_a_candidate_whose_base_fell_behind_the_reference_fails(arms) -> None:
     candidate = json.loads(json.dumps(arms["candidate_summary"]))
     reference = arms["reference_summary"]
     # Push the candidate's base a clear nat behind the frozen reference.
-    candidate["headline"]["nll_base"]["point"] = (
-        float(reference["headline"]["nll_base"]["point"]) + 1.0
+    candidate["results"]["arm_scores"]["nll_base"]["point"] = (
+        float(reference["results"]["arm_scores"]["nll_base"]["point"]) + 1.0
     )
 
     result = eval_verify.verify(candidate, reference)

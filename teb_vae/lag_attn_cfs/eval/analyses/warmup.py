@@ -136,15 +136,17 @@ VALUE_COLUMNS: Tuple[str, ...] = tuple(column for column, _, _ in METRICS) + (
     RECOMPOSITION_SCALE_COLUMN,
 )
 
+#: The two attention-warmth fractions, which exist only on a model with an attention over the
+#: lags. Named once so the rows, the figure and the grouped variants agree on which columns are
+#: optional on a model without one.
+WARMTH_COLUMNS: Tuple[str, ...] = ("source_lag_warmth_frac_st", "source_lag_warmth_frac_ph")
+
 #: The columns worth a by-class and by-subgroup variant. The three tertiles and the two warmth
 #: fractions: a cohort that differs in *which* channels its gap came from, or in how much of the
 #: lag window its source was warm over, is a finding. The two guards are deliberately absent --
 #: they are structural constants of the run, identical on every recording, and a grouped figure of
 #: a constant is a figure of nothing.
-GROUPED_METRICS: Tuple[str, ...] = TERTILE_COLUMNS + (
-    "source_lag_warmth_frac_st",
-    "source_lag_warmth_frac_ph",
-)
+GROUPED_METRICS: Tuple[str, ...] = TERTILE_COLUMNS + WARMTH_COLUMNS
 
 #: The statement that travels with the warmth fractions, so a reader does not treat a small value
 #: as a defect. It cites the design record rather than restating its argument.
@@ -235,6 +237,12 @@ def build_rows(per_guid: pd.DataFrame, *, resamples: int, seed: int) -> List[Dic
     """
     rows: List[Dict[str, Any]] = []
     for column, unit, meaning in METRICS:
+        # A metric the table does not carry is absent from the rows rather than described as a
+        # column of NaNs: the two attention-warmth fractions exist only on a model with a lag
+        # attention, and a model without one reports them nowhere rather than as "no finite
+        # values". The block records which were absent beside the rows.
+        if column not in per_guid.columns:
+            continue
         values = finite_column(per_guid, column)
         interval = shared_stats.bootstrap_ci(values, resamples=resamples, seed=seed)
         rows.append(
@@ -412,7 +420,10 @@ def build_tertile_figure(
     Returns:
         The figure; the caller renders and closes it.
     """
-    figure, axes = figures.new_figure(2)
+    # The warmth panel only where the table carries a warmth fraction: it is a fraction of
+    # attention mass, and a model with no attention over the lags has nothing to draw there.
+    warmth = [name for name in WARMTH_COLUMNS if name in per_guid.columns]
+    figure, axes = figures.new_figure(2 if warmth else 1)
     total = next((row for row in rows if row.get("metric") == TOTAL_COLUMN), {})
     figures.violin_panel(
         axes[0, 0],
@@ -425,15 +436,13 @@ def build_tertile_figure(
         reference=0.0,
         reference_label="no improvement",
     )
-    figures.violin_panel(
-        axes[1, 0],
-        {
-            name: finite_column(per_guid, name)
-            for name in ("source_lag_warmth_frac_st", "source_lag_warmth_frac_ph")
-        },
-        title="attention mass on lags where the source block is warm (a small value is expected)",
-        ylabel="fraction of attention mass",
-    )
+    if warmth:
+        figures.violin_panel(
+            axes[1, 0],
+            {name: finite_column(per_guid, name) for name in warmth},
+            title="attention mass on lags where the source block is warm (a small value is expected)",
+            ylabel="fraction of attention mass",
+        )
     return figure
 
 
@@ -493,9 +502,18 @@ def run_warmup_analysis(
             per_guid, expected_geometry(getattr(collection, "record", None))
         ),
         "source_lag_warmth_note": WARMTH_EXPECTATION,
+        # The declared metrics the table did not carry. The warmth fractions are a fraction of
+        # attention mass, so on a model with no attention over the lags they are absent here
+        # rather than reported as unmeasured.
+        "absent_metrics": [
+            column for column, _, _ in METRICS if column not in per_guid.columns
+        ],
         "budget": budget,
         "grouped_frames": [
-            grouped_frame_entry(ANALYSIS_DIRNAME, PER_RECORDING_FILENAME, GROUPED_METRICS)
+            grouped_frame_entry(
+                ANALYSIS_DIRNAME, PER_RECORDING_FILENAME,
+                [name for name in GROUPED_METRICS if name in per_guid.columns],
+            )
         ],
         "files": [
             PER_RECORDING_FILENAME,

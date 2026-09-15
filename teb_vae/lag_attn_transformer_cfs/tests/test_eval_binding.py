@@ -230,7 +230,11 @@ def test_the_extra_analyses_and_headline_scalars_are_the_parents_objects() -> No
     # of the lag question and is inherited exactly like the other four -- it edits the model's
     # INPUT, which is a question about the source pathway rather than about the encoder that reads
     # it, so a second registration here would be a second copy of one question.
+    # The first three are the model-bound analyses that left the shared registry when the slot
+    # cell registered its own under the same names: they read a forward pass rather than the
+    # tables, and this cell runs the parent's forward.
     assert set(TRF_CFS_BINDING.extra_analyses) == {
+        "samples", "recording_traces", "attribution",
         "warmup", "source_null", "occlusion", "lag_clocks", "lag_kld_scaled", "lag_high_kl",
         "spectral_skill",
     }

@@ -254,9 +254,9 @@ def test_a_flag_overrides_one_launch_dict_entry_and_leaves_the_rest_standing() -
     module = _module("teb_vae.lag_slot_transformer_cfs.eval.run")
     values, _sources = resolve_launch_args(
         module.build_parser(),
-        {"checkpoint": "kept", "num_mc_samples": 8},
-        ["--num-mc-samples", "32"],
+        {"checkpoint": "kept", "num_samples": 8},
+        ["--num-samples", "32"],
     )
 
     assert values["checkpoint"] == "kept"
-    assert values["num_mc_samples"] == 32
+    assert values["num_samples"] == 32

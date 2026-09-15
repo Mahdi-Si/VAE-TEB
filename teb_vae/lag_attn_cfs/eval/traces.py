@@ -51,6 +51,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Mapping, NamedTuple, Optional, Sequence, Tuple
 
 import matplotlib.colors as mcolors
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from matplotlib.lines import Line2D
@@ -574,6 +575,63 @@ def write_recording_arrays(path: Any, recording: RecordingTrace, *, lag_seconds:
 # =============================================================================
 # The figures
 # =============================================================================
+#: Width of both trace figures in inches. Wider than the shared double-column default because a
+#: trace spans hours at anchor resolution and everything it shows is horizontal structure; it is
+#: a page figure that is read across, not a column figure.
+TRACE_FIGURE_WIDTH = 11.0
+
+#: Row heights in inches. A heatmap row needs the room for its coordinate ticks and its colour
+#: axis; a line row does not.
+HEATMAP_ROW_HEIGHT = 1.35
+LINE_ROW_HEIGHT = 1.05
+
+#: Row height of the cross-recording summary figure, in inches, and its width.
+SUMMARY_ROW_HEIGHT = 1.45
+SUMMARY_FIGURE_WIDTH = 9.0
+
+#: Room above the first row for the title and below the last row for the x label, in inches.
+#: The footnote's own room is reserved by the shared footnote helper on top of these.
+_TITLE_ROOM_IN = 0.62
+_XLABEL_ROOM_IN = 0.4
+
+#: Width of the colour-axis column as a fraction of the data column. Every row of the recording
+#: figure -- line rows included -- carries this column, so the data axes of all rows have the
+#: same extent and a column is the same anchor on every row; a colourbar stolen from one axes
+#: would shrink that row alone and silently misalign it against its neighbours.
+_COLORBAR_WIDTH_RATIO = 0.012
+
+#: Vertical gap between rows as a fraction of the mean row height: room for a title and a
+#: title-strip legend, no more.
+_ROW_GAP = 0.38
+
+#: The series colours of a line panel, in column order: the Okabe-Ito set the evaluation figures
+#: share, so the first series of every panel is the same blue.
+LINE_COLOURS: Tuple[str, ...] = (
+    figures.COLOR_BLUE, figures.COLOR_ORANGE, figures.COLOR_GREEN, figures.COLOR_PURPLE,
+)
+
+#: The two clinical clocks a trace can carry per segment, and how each is drawn: the label, the
+#: colour and the line style of the vertical rule marking its onset. ``time_from_labor_onset``
+#: and the second-stage column are both stored as seconds *since* the onset at the segment's
+#: start, so the onset sits ``value / 3600`` hours earlier than the segment on the delivery axis.
+CLOCK_STYLES: Mapping[str, Tuple[str, str, str]] = {
+    "time_from_labor_onset": ("labour onset", figures.COLOR_GRAY, "--"),
+    cohort.SECOND_STAGE_COLUMN: ("second stage", figures.COLOR_BLACK, ":"),
+}
+
+#: Background shades: alternate segments of a line row, and a break -- a stretch of the
+#: recording the dataset holds no segment for -- on every row.
+SEGMENT_SHADE = "#F4F4F4"
+BREAK_SHADE = "#E4E4E4"
+
+#: The window the summary figure's class aggregate is taken over, in hours before delivery, and
+#: the fewest recordings a window must hold for the inter-quartile band to be drawn. Half an hour
+#: because stored segments tile at roughly twenty minutes, so a window holds one or two segments
+#: of every recording present; three recordings because a quartile of two is a coin toss.
+SUMMARY_BIN_HOURS = 0.5
+MIN_RECORDINGS_PER_BAND = 3
+
+
 class HeatmapPanel(NamedTuple):
     r"""One heatmap row of the recording figure: a per-anchor vector against time.
 
@@ -593,6 +651,7 @@ class HeatmapPanel(NamedTuple):
         subtract: A second vector subtracted from the first before drawing, or ``None``. How the
             source shift $\mu^q - \mu^p$ is drawn without a third stored array that could
             disagree with the two it is the difference of.
+        argmax_label: The legend entry of the peak overlay.
     """
 
     vector: str
@@ -603,36 +662,182 @@ class HeatmapPanel(NamedTuple):
     lag_axis: bool = False
     argmax_column: Optional[str] = None
     subtract: Optional[str] = None
+    argmax_label: str = "peak lag"
 
 
 class LinePanel(NamedTuple):
     """One line row of the recording figure: per-anchor scalars against time.
 
     Attributes:
-        columns: The scalar columns drawn, one line each, legend-labelled by name.
+        columns: The scalar columns drawn, one line each.
         title: The panel title.
         ylabel: The vertical axis label.
+        labels: The legend entry of each column, positionally; a column past the end of this
+            tuple is labelled by its name.
+        segment_mean: Whether to draw the first column's per-segment mean over the scored anchors
+            as a black step -- the value the summary figure carries for that segment, so the two
+            figures can be read against each other.
     """
 
     columns: Tuple[str, ...]
     title: str
     ylabel: str
+    labels: Tuple[str, ...] = ()
+    segment_mean: bool = False
+
+
+class SummaryMetric(NamedTuple):
+    """One row of the summary figure: a per-segment column against hours before delivery.
+
+    Attributes:
+        column: The summary column.
+        ylabel: Its axis label.
+        title: The panel title; the column name when empty.
+    """
+
+    column: str
+    ylabel: str
+    title: str = ""
+
+
+def _segment_hours(segment: SegmentTrace) -> np.ndarray:
+    """Each decoded anchor of a segment in hours before delivery (decreasing along the segment)."""
+    anchor = np.asarray(segment.anchor, dtype=np.float64).reshape(-1)
+    return -(float(segment.epoch) + anchor * float(SECONDS_PER_STEP)) / cohort.SECONDS_PER_HOUR
+
+
+def _anchor_spacing(segment: SegmentTrace) -> float:
+    """The typical step between a segment's decoded anchors, in stored steps.
+
+    One on a dense trace. Larger on a sparse one -- the attribution traces attribute a handful
+    of anchors per segment -- where a cell drawn one step wide would be a hairline on a page
+    spanning hours; a cell then spans the gap to its neighbours instead.
+    """
+    anchor = np.asarray(segment.anchor, dtype=np.float64).reshape(-1)
+    if anchor.size < 2:
+        return 1.0
+    return max(float(np.median(np.diff(anchor))), 1.0)
+
+
+def _half_cell_hours(segment: SegmentTrace) -> float:
+    """Half the width of one anchor's cell on the delivery axis, in hours."""
+    return 0.5 * _anchor_spacing(segment) * float(SECONDS_PER_STEP) / cohort.SECONDS_PER_HOUR
 
 
 def _segment_slices(frame: pd.DataFrame) -> List[pd.DataFrame]:
     """The full-form rows split per segment, each in anchor order."""
-    return [
-        cell.sort_values("anchor") for _, cell in frame.groupby("segment_order", sort=True)
-    ]
+    return [cell.sort_values("anchor") for _, cell in frame.groupby("segment_order", sort=True)]
 
 
-def _draw_segment_boundaries(ax: Any, frame: pd.DataFrame) -> None:
-    """Mark where each segment's first decoded anchor lands, so a step at a join reads as a join."""
-    for cell in _segment_slices(frame):
-        ax.axvline(
-            float(cell[cohort.HOURS_COLUMN].iloc[0]), color=figures.COLOR_LIGHT_GRAY,
-            linewidth=figures.LINE_HAIRLINE, zorder=0,
+def _runs(anchor: np.ndarray, spacing: float = 1.0) -> List[slice]:
+    """Split an anchor array into runs of evenly spaced steps, so a gap draws as a gap."""
+    steps = np.asarray(anchor, dtype=np.int64).reshape(-1)
+    if steps.size == 0:
+        return []
+    cuts = np.flatnonzero(np.diff(steps) > 1.5 * float(spacing)) + 1
+    bounds = [0, *cuts.tolist(), int(steps.size)]
+    return [slice(bounds[index], bounds[index + 1]) for index in range(len(bounds) - 1)]
+
+
+def _segment_extent(segment: SegmentTrace) -> Optional[Tuple[float, float]]:
+    """A segment's span on the delivery axis, ``(start, end)`` with start the larger hours value."""
+    hours = _segment_hours(segment)
+    if hours.size == 0:
+        return None
+    half = _half_cell_hours(segment)
+    return float(hours[0]) + half, float(hours[-1]) - half
+
+
+def _axis_range(recording: RecordingTrace) -> Tuple[float, float]:
+    """The delivery-axis limits of a recording figure, ``(high, low)`` so delivery is to the right."""
+    extents = [extent for extent in (_segment_extent(s) for s in recording.segments) if extent is not None]
+    if not extents:
+        return 1.0, 0.0
+    high = max(extent[0] for extent in extents)
+    low = min(extent[1] for extent in extents)
+    pad = 0.01 * max(high - low, 1e-6)
+    return high + pad, low - pad
+
+
+def _clock_positions(recording: RecordingTrace) -> Dict[str, float]:
+    """Where each clinical clock's onset sits on the delivery axis, in hours before delivery.
+
+    Every segment carries the clock as seconds since the onset at the segment's own start, so
+    every segment votes for the same onset up to rounding; the median of the finite votes is
+    taken so one mis-stamped segment cannot move the rule.
+    """
+    summary = recording.summary
+    positions: Dict[str, float] = {}
+    for column in CLOCK_STYLES:
+        if column not in summary.columns or cohort.HOURS_COLUMN not in summary.columns:
+            continue
+        since = np.asarray(summary[column], dtype=np.float64)
+        hours = np.asarray(summary[cohort.HOURS_COLUMN], dtype=np.float64)
+        onset = hours + since / cohort.SECONDS_PER_HOUR
+        finite = onset[np.isfinite(onset)]
+        if finite.size:
+            positions[column] = float(np.median(finite))
+    return positions
+
+
+def _shade_rows(axes: Sequence[Any], recording: RecordingTrace, *, alternate: Sequence[bool]) -> None:
+    """Shade alternate segments on the line rows and every break on every row.
+
+    Args:
+        axes: The data axes, top to bottom.
+        recording: The assembled recording.
+        alternate: Per axes, whether it takes the alternating segment shade (a line row) or only
+            the break shade (a heatmap row, whose cells cover the segment anyway).
+    """
+    extents = [_segment_extent(segment) for segment in recording.segments]
+    breaks = (
+        np.asarray(recording.summary["is_break"], dtype=bool)
+        if "is_break" in recording.summary.columns and len(recording.summary) == len(extents)
+        else np.zeros(len(extents), dtype=bool)
+    )
+    for ax, shaded in zip(axes, alternate):
+        previous: Optional[Tuple[float, float]] = None
+        for index, extent in enumerate(extents):
+            if extent is None:
+                continue
+            if shaded and index % 2 == 1:
+                ax.axvspan(extent[0], extent[1], color=SEGMENT_SHADE, linewidth=0, zorder=0)
+            # A break is the stretch between the previous segment's end and this one's start.
+            if previous is not None and breaks[index]:
+                ax.axvspan(previous[1], extent[0], color=BREAK_SHADE, linewidth=0, zorder=0)
+            previous = extent
+
+
+def _draw_clocks(axes: Sequence[Any], recording: RecordingTrace, x_range: Tuple[float, float]) -> None:
+    """Rule each clinical clock's onset across every row, labelled once on the first row."""
+    high, low = x_range
+    for column, position in _clock_positions(recording).items():
+        if not (low <= position <= high):
+            continue
+        label, colour, style = CLOCK_STYLES[column]
+        for ax in axes:
+            ax.axvline(position, color=colour, linestyle=style, linewidth=figures.LINE_THIN, zorder=1)
+        axes[0].text(
+            position, 0.97, f" {label}", transform=axes[0].get_xaxis_transform(),
+            ha="left", va="top", fontsize=figures.FONT_TINY, color=colour,
         )
+
+
+def _title_legend(ax: Any, ncol: int) -> None:
+    """Put a panel's legend in the title strip, right-aligned, clear of the data."""
+    ax.legend(
+        loc="lower right", bbox_to_anchor=(1.0, 1.0), ncol=max(int(ncol), 1),
+        borderaxespad=0.0, handlelength=1.4, columnspacing=0.9,
+        fontsize=figures.FONT_SMALL,
+    )
+
+
+def _note_empty(ax: Any) -> None:
+    """Mark an axes that had nothing to draw."""
+    ax.text(
+        0.5, 0.5, figures.EMPTY_NOTE, transform=ax.transAxes,
+        ha="center", va="center", fontsize=figures.FONT_NOTE, color=figures.COLOR_GRAY,
+    )
 
 
 def _panel_block(segment: SegmentTrace, panel: HeatmapPanel) -> Optional[np.ndarray]:
@@ -650,6 +855,7 @@ def _panel_block(segment: SegmentTrace, panel: HeatmapPanel) -> Optional[np.ndar
 
 def _draw_heatmap(
     ax: Any,
+    cax: Any,
     figure: Any,
     recording: RecordingTrace,
     panel: HeatmapPanel,
@@ -659,15 +865,14 @@ def _draw_heatmap(
     """Draw one vector family of the whole recording, segment by segment, on the hours axis."""
     blocks = [_panel_block(segment, panel) for segment in recording.segments]
     present = [block for block in blocks if block is not None]
+    ax.set_title(panel.title)
+    ax.set_ylabel(COEFFICIENT_LAG_AXIS_LABEL if panel.lag_axis else panel.ylabel)
     if not present:
-        ax.text(
-            0.5, 0.5, figures.EMPTY_NOTE, transform=ax.transAxes,
-            ha="center", va="center", fontsize=figures.FONT_NOTE, color=figures.COLOR_GRAY,
-        )
-        ax.set_title(panel.title)
+        _note_empty(ax)
+        cax.set_axis_off()
         figures.style_axes(ax, grid="none")
         return
-    stacked = np.concatenate([np.asarray(block, dtype=np.float64) for block in present], axis=0)
+    stacked = np.concatenate(present, axis=0)
     finite = stacked[np.isfinite(stacked)]
     if panel.log:
         positive = finite[finite > 0.0]
@@ -679,58 +884,83 @@ def _draw_heatmap(
         norm = mcolors.Normalize(vmin=-limit, vmax=limit)
         cmap = "RdBu_r"
     else:
-        norm = mcolors.Normalize(
-            vmin=0.0, vmax=float(finite.max()) if finite.size else 1.0
-        )
+        norm = mcolors.Normalize(vmin=0.0, vmax=float(finite.max()) if finite.size else 1.0)
         cmap = "viridis"
 
-    width = float(SECONDS_PER_STEP) / cohort.SECONDS_PER_HOUR
     y_edges = (
         np.concatenate([lag_seconds - 0.5 * SECONDS_PER_STEP, [lag_seconds[-1] + 0.5 * SECONDS_PER_STEP]])
         if panel.lag_axis
         else np.arange(stacked.shape[1] + 1) - 0.5
     )
     mesh = None
+    labelled = False
     for segment, block in zip(recording.segments, blocks):
         if block is None or len(segment.anchor) == 0:
             continue
-        hours = -(float(segment.epoch) + np.asarray(segment.anchor, dtype=np.float64) * SECONDS_PER_STEP) / cohort.SECONDS_PER_HOUR
-        # Anchors are consecutive steps within a segment, so the cell edges are half a step
-        # either side of each anchor; a gap inside a segment draws as missing cells rather than
-        # as a stretched neighbour.
-        x_edges = np.concatenate([hours + 0.5 * width, [hours[-1] - 0.5 * width]])
-        values = np.asarray(block, dtype=np.float64).T
+        hours = _segment_hours(segment)
+        values = np.asarray(block, dtype=np.float64)
         if panel.log:
             values = np.where(values > 0.0, values, np.nan)
-        mesh = ax.pcolormesh(x_edges, y_edges, values, cmap=cmap, norm=norm, rasterized=True, shading="flat")
+        # One mesh per run of evenly spaced anchors, so a gap inside a segment is a gap on the
+        # page rather than a neighbour stretched across it.
+        half = _half_cell_hours(segment)
+        for run in _runs(segment.anchor, _anchor_spacing(segment)):
+            x_edges = np.concatenate([hours[run] + half, [hours[run][-1] - half]])
+            mesh = ax.pcolormesh(
+                x_edges, y_edges, values[run].T, cmap=cmap, norm=norm, rasterized=True, shading="flat",
+            )
         if panel.argmax_column is not None and panel.argmax_column in recording.anchors.columns:
             cell = recording.anchors[recording.anchors["epoch"] == float(segment.epoch)].sort_values("anchor")
             peak = np.asarray(cell[panel.argmax_column], dtype=np.float64)
             if panel.lag_axis:
-                peak = np.where(np.isfinite(peak), lag_seconds[np.clip(peak, 0, len(lag_seconds) - 1).astype(int)], np.nan)
+                index = np.clip(np.nan_to_num(peak, nan=0.0), 0, len(lag_seconds) - 1).astype(int)
+                peak = np.where(np.isfinite(peak), lag_seconds[index], np.nan)
             ax.plot(
                 hours, peak, color=figures.COLOR_VERMILLION, linewidth=figures.LINE_THIN,
-                label=panel.argmax_column,
+                label=None if labelled else panel.argmax_label,
             )
+            labelled = True
     if mesh is not None:
-        figure.colorbar(mesh, ax=ax, pad=0.01, fraction=0.03)
-    if panel.argmax_column is not None:
-        ax.legend(fontsize=figures.FONT_LABEL, loc="upper right")
-    _draw_segment_boundaries(ax, recording.anchors)
-    ax.set_title(panel.title)
-    ax.set_ylabel(panel.ylabel if not panel.lag_axis else COEFFICIENT_LAG_AXIS_LABEL)
-    ax.invert_xaxis()
+        colorbar = figure.colorbar(mesh, cax=cax)
+        colorbar.outline.set_linewidth(figures.LINE_HAIRLINE)
+        cax.tick_params(labelsize=figures.FONT_TINY, width=figures.LINE_HAIRLINE, length=2.0, pad=1.5)
+    else:
+        cax.set_axis_off()
+    if labelled:
+        _title_legend(ax, 1)
     figures.style_axes(ax, grid="none")
+
+
+def _draw_segment_means(ax: Any, recording: RecordingTrace, column: str) -> bool:
+    """Draw a column's per-segment mean as a black step over each segment's span."""
+    summary = recording.summary
+    if column not in summary.columns or "segment_order" not in summary.columns:
+        return False
+    drawn = False
+    for segment, (_, row) in zip(recording.segments, summary.sort_values("segment_order").iterrows()):
+        extent = _segment_extent(segment)
+        value = float(row[column])
+        if extent is None or not np.isfinite(value):
+            continue
+        ax.hlines(
+            value, extent[0], extent[1], color=figures.COLOR_BLACK,
+            linewidth=figures.LINE_EMPHASIS, zorder=3, label=None if drawn else "segment mean",
+        )
+        drawn = True
+    return drawn
 
 
 def _draw_lines(ax: Any, recording: RecordingTrace, panel: LinePanel) -> None:
     """Draw per-anchor scalars of the whole recording, lifted at every unscored anchor."""
     frame = recording.anchors
+    ax.set_title(panel.title)
+    ax.set_ylabel(panel.ylabel)
     drawn = 0
-    colours = [figures.COLOR_BLUE, figures.COLOR_ORANGE, figures.COLOR_GREEN, figures.COLOR_PURPLE]
-    for colour, column in zip(colours, panel.columns):
+    for index, column in enumerate(panel.columns):
         if column not in frame.columns:
             continue
+        colour = LINE_COLOURS[index % len(LINE_COLOURS)]
+        label = panel.labels[index] if index < len(panel.labels) else column
         first = True
         for cell in _segment_slices(frame):
             hours = np.asarray(cell[cohort.HOURS_COLUMN], dtype=np.float64)
@@ -740,22 +970,18 @@ def _draw_lines(ax: Any, recording: RecordingTrace, panel: LinePanel) -> None:
             values = np.where(np.asarray(cell["contributing"], dtype=bool), values, np.nan)
             if np.isfinite(values).any():
                 ax.plot(
-                    hours, values, color=colour, linewidth=figures.LINE_REGULAR,
-                    label=column if first else None,
+                    hours, values, color=colour, linewidth=figures.LINE_THIN,
+                    label=label if first else None, zorder=2,
                 )
                 first = False
                 drawn += 1
+    entries = sum(1 for column in panel.columns if column in frame.columns)
+    if drawn and panel.segment_mean and panel.columns:
+        entries += int(_draw_segment_means(ax, recording, panel.columns[0]))
     if drawn == 0:
-        ax.text(
-            0.5, 0.5, figures.EMPTY_NOTE, transform=ax.transAxes,
-            ha="center", va="center", fontsize=figures.FONT_NOTE, color=figures.COLOR_GRAY,
-        )
+        _note_empty(ax)
     else:
-        ax.legend(fontsize=figures.FONT_LABEL, loc="upper right")
-        _draw_segment_boundaries(ax, frame)
-        ax.invert_xaxis()
-    ax.set_title(panel.title)
-    ax.set_ylabel(panel.ylabel)
+        _title_legend(ax, entries)
     figures.style_axes(ax)
 
 
@@ -766,7 +992,14 @@ def build_recording_figure(
     lag_seconds: np.ndarray,
     caveat: Optional[str] = None,
 ) -> Any:
-    """Draw one recording's trace: every panel against hours before delivery, on a shared axis.
+    """Draw one recording's trace: every panel against hours before delivery, on one shared axis.
+
+    The figure lays itself out: a grid of one data column and one colour-axis column, so every
+    row's data axes span the same hours and a column is the same anchor on every row; the rows
+    share the x axis, which runs from the recording's first anchor on the left to delivery on
+    the right and is labelled once, on the last row. Segments alternate a faint background on the
+    line rows, a stretch the dataset holds no segment for is shaded darker on every row, and each
+    clinical clock the recording carries is ruled across the page at its onset.
 
     Args:
         recording: The assembled recording.
@@ -776,105 +1009,252 @@ def build_recording_figure(
             carries the group-delay caveat.
 
     Returns:
-        The figure; the caller renders and closes it.
+        The figure, already laid out; the caller renders and closes it.
     """
-    figure, axes = figures.new_figure(len(panels), height_per_row=1.7, width=13.0)
+    heights = [HEATMAP_ROW_HEIGHT if isinstance(panel, HeatmapPanel) else LINE_ROW_HEIGHT for panel in panels]
+    height_in = sum(heights) + _TITLE_ROOM_IN + _XLABEL_ROOM_IN
+    figure = plt.figure(figsize=(TRACE_FIGURE_WIDTH, height_in))
+    bottom = _XLABEL_ROOM_IN / height_in
+    if caveat:
+        bottom += figures.caveat_note(figure, caveat)
+    grid = figure.add_gridspec(
+        len(panels), 2, width_ratios=[1.0, _COLORBAR_WIDTH_RATIO], height_ratios=heights,
+        left=0.065, right=0.95, bottom=bottom, top=1.0 - _TITLE_ROOM_IN / height_in,
+        hspace=_ROW_GAP, wspace=0.03,
+    )
+    axes: List[Any] = []
     for row, panel in enumerate(panels):
-        ax = axes[row, 0]
+        ax = figure.add_subplot(grid[row, 0], sharex=axes[0] if axes else None)
+        cax = figure.add_subplot(grid[row, 1])
+        # Named as matplotlib names its own colourbar axes, so the render-time panel lettering
+        # skips it whether or not a colourbar was drawn into it.
+        cax.set_label("<colorbar>")
         if isinstance(panel, HeatmapPanel):
-            _draw_heatmap(ax, figure, recording, panel, lag_seconds=lag_seconds)
+            _draw_heatmap(ax, cax, figure, recording, panel, lag_seconds=lag_seconds)
         else:
+            cax.set_axis_off()
             _draw_lines(ax, recording, panel)
         if row < len(panels) - 1:
-            ax.set_xlabel("")
+            ax.tick_params(labelbottom=False)
         else:
             ax.set_xlabel("Time before delivery (hours)")
+        axes.append(ax)
+    x_range = _axis_range(recording)
+    if axes:
+        axes[0].set_xlim(*x_range)
+        _shade_rows(axes, recording, alternate=[isinstance(panel, LinePanel) for panel in panels])
+        _draw_clocks(axes, recording, x_range)
     n_segments = len(recording.segments)
+    n_breaks = int(recording.summary["is_break"].sum()) if "is_break" in recording.summary.columns else 0
     span = (
         float(recording.summary[cohort.HOURS_COLUMN].max() - recording.summary[cohort.HOURS_COLUMN].min())
         if len(recording.summary) else float("nan")
     )
     figure.suptitle(
         f"guid {recording.guid} — subgroup {recording.subgroup} — class {recording.clinical_class} "
-        f"— {n_segments} segment(s) over {span:.1f} h",
-        fontsize=figures.FONT_NOTE,
+        f"— {n_segments} segment(s) over {span:.1f} h, {n_breaks} break(s)",
+        y=1.0 - 0.22 * _TITLE_ROOM_IN / height_in, fontsize=figures.FONT_NOTE,
     )
-    if caveat:
-        figures.caveat_note(figure, caveat)
+    figures.mark_laid_out(figure)
     return figure
 
 
-class SummaryMetric(NamedTuple):
-    """One row of the summary figure: a per-segment column against hours before delivery.
+def add_segment_means(recording: RecordingTrace, columns: Sequence[str]) -> List[str]:
+    """Average per-anchor columns over each segment's scored anchors into the summary form.
 
-    Attributes:
-        column: The summary column.
-        ylabel: Its axis label.
+    For columns attached to the full form *after* assembly -- the forecast scores a cell joins
+    from its collection pass -- so the summary figure can draw them; the assembly itself averages
+    only what the segments carried.
+
+    Args:
+        recording: The assembled recording, its ``anchors`` already carrying ``columns``.
+        columns: The per-anchor columns to average; ones absent from the full form are skipped.
+
+    Returns:
+        The columns that were written.
     """
+    anchors, summary = recording.anchors, recording.summary
+    present = [name for name in columns if name in anchors.columns]
+    if not present or anchors.empty or summary.empty:
+        return []
+    scored = anchors[np.asarray(anchors["contributing"], dtype=bool)]
+    means = scored.groupby("segment_order")[present].mean() if len(scored) else None
+    for name in present:
+        summary[name] = [
+            float(means[name].get(order, np.nan)) if means is not None else np.nan
+            for order in summary["segment_order"]
+        ]
+    return present
 
-    column: str
-    ylabel: str
+
+def _class_bins(
+    summary: pd.DataFrame, column: str, name: str, *, width: float
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """One class's aggregate of a column over windows of the delivery axis.
+
+    Each recording contributes one value per window -- the mean of its segments inside it -- and
+    the windows are then summarised over recordings, so a recording with many segments in a
+    window weighs the same as one with a single segment there.
+
+    Returns:
+        ``(centres, median, q1, q3, n_recordings)`` over the populated windows, in axis order.
+    """
+    part = summary[summary[labels.CLASS_COLUMN].astype(object) == name]
+    part = part[np.isfinite(np.asarray(part[column], dtype=np.float64))] if column in part.columns else part.head(0)
+    if part.empty:
+        empty = np.zeros(0)
+        return empty, empty, empty, empty, empty
+    hours = np.asarray(part[cohort.HOURS_COLUMN], dtype=np.float64)
+    window = np.floor(hours / float(width)).astype(np.int64)
+    per_recording = (
+        pd.DataFrame({"guid": part["guid"].astype(str).to_numpy(), "window": window,
+                      "value": np.asarray(part[column], dtype=np.float64)})
+        .groupby(["window", "guid"])["value"].mean().reset_index()
+    )
+    grouped = per_recording.groupby("window")["value"]
+    centres = (grouped.median().index.to_numpy(dtype=np.float64) + 0.5) * float(width)
+    return (
+        centres, grouped.median().to_numpy(), grouped.quantile(0.25).to_numpy(),
+        grouped.quantile(0.75).to_numpy(), grouped.count().to_numpy(dtype=np.float64),
+    )
 
 
-def build_summary_figure(summary: pd.DataFrame, *, metrics: Sequence[SummaryMetric]) -> Any:
-    """Draw every traced recording's per-segment summary, one line per recording, by class colour.
+def build_summary_figure(
+    summary: pd.DataFrame,
+    *,
+    metrics: Sequence[SummaryMetric],
+    window_hours: Optional[float] = None,
+) -> Any:
+    """Draw every traced recording's per-segment summary against hours before delivery.
+
+    One row per metric under a coverage row. On a metric row every recording is a thin line in
+    its class colour, one marker per segment, lifted at a break; over them the class **median**
+    per :data:`SUMMARY_BIN_HOURS` window is drawn bold, with the inter-quartile band over
+    recordings where at least :data:`MIN_RECORDINGS_PER_BAND` recordings fall in the window. The
+    coverage row counts the recordings each window holds per class, which is what says how much a
+    median rests on. The x axis is shared and runs to delivery on the right.
 
     Args:
         summary: The stacked segment summaries of every traced recording.
         metrics: The columns to draw, one panel each.
+        window_hours: When given, the axis is bounded to this many hours before delivery and the
+            number of segments left outside is stated under the figure.
 
     Returns:
-        The figure; the caller renders and closes it.
+        The figure, already laid out; the caller renders and closes it.
     """
-    figure, axes = figures.new_figure(len(metrics), height_per_row=1.9, width=11.0)
+    n_rows = len(metrics) + 1
+    height_in = n_rows * SUMMARY_ROW_HEIGHT + _TITLE_ROOM_IN + _XLABEL_ROOM_IN
+    figure = plt.figure(figsize=(SUMMARY_FIGURE_WIDTH, height_in))
     classes = (
-        labels.ordered_groups(
-            [name for name in summary[labels.CLASS_COLUMN].dropna().unique()], labels.CLASS_COLUMN
-        )
+        labels.ordered_groups([name for name in summary[labels.CLASS_COLUMN].dropna().unique()], labels.CLASS_COLUMN)
         if len(summary) and labels.CLASS_COLUMN in summary.columns else []
     )
     colours = figures.group_colors(classes)
-    for row, metric in enumerate(metrics):
-        ax = axes[row, 0]
+    counts = {
+        name: int(summary[summary[labels.CLASS_COLUMN].astype(object) == name]["guid"].nunique())
+        for name in classes
+    }
+    outside = 0
+    if window_hours is not None and len(summary) and cohort.HOURS_COLUMN in summary.columns:
+        outside = int((np.asarray(summary[cohort.HOURS_COLUMN], dtype=np.float64) > float(window_hours)).sum())
+    note = (
+        f"Thin lines: one recording each, its per-segment means over scored anchors, lifted at a break. "
+        f"Bold: the class median over recordings per {SUMMARY_BIN_HOURS:g} h window, with the "
+        f"inter-quartile band where at least {MIN_RECORDINGS_PER_BAND} recordings contribute; the top "
+        f"row counts them. Class order and colour follow severity; a difference between classes here "
+        f"is a hypothesis for the population analyses, not a result."
+        + (f" The axis is bounded to {float(window_hours):g} h before delivery; {outside} segment(s) "
+           f"lie beyond it." if window_hours is not None else "")
+    )
+    bottom = _XLABEL_ROOM_IN / height_in + figures.caveat_note(figure, note)
+    grid = figure.add_gridspec(
+        n_rows, 1, height_ratios=[0.55, *([1.0] * len(metrics))],
+        left=0.08, right=0.98, bottom=bottom, top=1.0 - _TITLE_ROOM_IN / height_in, hspace=_ROW_GAP,
+    )
+    axes = [figure.add_subplot(grid[0, 0])]
+    for row in range(1, n_rows):
+        axes.append(figure.add_subplot(grid[row, 0], sharex=axes[0]))
+
+    # The coverage row.
+    ax = axes[0]
+    ax.set_title(f"Recordings contributing per {SUMMARY_BIN_HOURS:g} h window")
+    ax.set_ylabel("recordings")
+    covered = 0
+    for name in classes:
+        centres, _median, _q1, _q3, n = _class_bins(summary, metrics[0].column if metrics else "guid", name, width=SUMMARY_BIN_HOURS) if metrics else (np.zeros(0),) * 5
+        if centres.size:
+            ax.step(centres, n, where="mid", color=colours.get(name, figures.COLOR_GRAY), linewidth=figures.LINE_REGULAR)
+            covered += 1
+    if covered == 0:
+        _note_empty(ax)
+    if classes:
+        handles = [
+            Line2D([0], [0], color=colours[name], linewidth=figures.LINE_EMPHASIS, label=f"{name} (n={counts[name]})")
+            for name in classes
+        ]
+        ax.legend(
+            handles=handles, loc="lower right", bbox_to_anchor=(1.0, 1.0), ncol=len(handles),
+            borderaxespad=0.0, fontsize=figures.FONT_SMALL,
+        )
+    ax.tick_params(labelbottom=False)
+    figures.style_axes(ax)
+
+    # The metric rows.
+    for row, metric in enumerate(metrics, start=1):
+        ax = axes[row]
+        ax.set_title(metric.title or metric.column)
+        ax.set_ylabel(metric.ylabel)
         drawn = 0
         if metric.column in summary.columns:
-            for guid, cell in summary.groupby("guid", sort=True):
+            for _guid, cell in summary.groupby("guid", sort=True):
                 cell = cell.sort_values("epoch")
                 name = cell[labels.CLASS_COLUMN].iloc[0]
                 hours = np.asarray(cell[cohort.HOURS_COLUMN], dtype=np.float64)
                 values = np.asarray(cell[metric.column], dtype=np.float64)
                 # A break is a gap *before* a segment, so the line is lifted before it.
-                breaks = np.flatnonzero(np.asarray(cell["is_break"], dtype=bool))
+                breaks = np.flatnonzero(np.asarray(cell["is_break"], dtype=bool)) if "is_break" in cell.columns else np.zeros(0, dtype=np.int64)
                 hours = np.insert(hours, breaks, np.nan)
                 values = np.insert(values, breaks, np.nan)
                 if np.isfinite(values).any():
                     ax.plot(
-                        hours, values, marker="o", markersize=2.0,
+                        hours, values, marker="o", markersize=1.6, markeredgewidth=0.0,
                         color=colours.get(str(name), figures.COLOR_GRAY),
-                        linewidth=figures.LINE_THIN, alpha=0.85,
+                        linewidth=figures.LINE_HAIRLINE, alpha=0.4, zorder=2,
                     )
                     drawn += 1
+            for name in classes:
+                centres, median, q1, q3, n = _class_bins(summary, metric.column, name, width=SUMMARY_BIN_HOURS)
+                if centres.size == 0:
+                    continue
+                colour = colours.get(name, figures.COLOR_GRAY)
+                banded = n >= MIN_RECORDINGS_PER_BAND
+                if banded.any():
+                    ax.fill_between(
+                        centres, np.where(banded, q1, np.nan), np.where(banded, q3, np.nan),
+                        color=colour, alpha=0.18, linewidth=0, zorder=3,
+                    )
+                ax.plot(centres, median, color=colour, linewidth=figures.LINE_EMPHASIS * 1.3, zorder=4)
         if drawn == 0:
-            ax.text(
-                0.5, 0.5, figures.EMPTY_NOTE, transform=ax.transAxes,
-                ha="center", va="center", fontsize=figures.FONT_NOTE, color=figures.COLOR_GRAY,
-            )
+            _note_empty(ax)
+        if row < n_rows - 1:
+            ax.tick_params(labelbottom=False)
         else:
-            ax.invert_xaxis()
-        ax.set_title(metric.column)
-        ax.set_ylabel(metric.ylabel)
-        ax.set_xlabel("Time before delivery (hours)" if row == len(metrics) - 1 else "")
+            ax.set_xlabel("Time before delivery (hours)")
         figures.style_axes(ax)
-    if classes:
-        handles = [
-            Line2D([0], [0], color=colours[name], linewidth=figures.LINE_EMPHASIS, label=name)
-            for name in classes
-        ]
-        axes[0, 0].legend(handles=handles, fontsize=figures.FONT_LABEL, loc="upper right")
+
+    if len(summary) and cohort.HOURS_COLUMN in summary.columns:
+        hours = np.asarray(summary[cohort.HOURS_COLUMN], dtype=np.float64)
+        finite = hours[np.isfinite(hours)]
+        high = float(finite.max()) if finite.size else 1.0
+        if window_hours is not None:
+            high = min(high, float(window_hours))
+        axes[0].set_xlim(high * 1.02, 0.0 - 0.02 * high)
     figure.suptitle(
-        "Per-segment summaries of every traced recording, one line per recording",
-        fontsize=figures.FONT_NOTE,
+        "Per-segment summaries of every traced recording, one line per recording, with the class median",
+        y=1.0 - 0.22 * _TITLE_ROOM_IN / height_in, fontsize=figures.FONT_NOTE,
     )
+    figures.mark_laid_out(figure)
     return figure
 
 
@@ -885,6 +1265,7 @@ __all__ = [
     "FULL_ARRAYS_SUFFIX",
     "HeatmapPanel",
     "IDENTITY_COLUMNS",
+    "LINE_COLOURS",
     "LinePanel",
     "MANIFEST_COLUMNS",
     "MANIFEST_FILENAME",
@@ -893,11 +1274,13 @@ __all__ = [
     "SEGMENT_SUMMARY_FILENAME",
     "SUMMARY_FIGURE",
     "SegmentTrace",
+    "SUMMARY_BIN_HOURS",
     "SummaryMetric",
     "TRACES_CAP",
     "TRACE_DRAW_SEED_OFFSET",
     "TRACE_FIGURE_SUFFIX",
     "UNLABELLED_CLASS",
+    "add_segment_means",
     "anchor_rows",
     "assemble_recording",
     "build_recording_figure",

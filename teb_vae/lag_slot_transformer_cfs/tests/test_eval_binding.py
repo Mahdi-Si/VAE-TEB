@@ -32,7 +32,9 @@ from teb_vae.lag_slot_transformer_cfs.eval import predictive
 from teb_vae.lag_slot_transformer_cfs.eval.binding import (
     ANALYSES_THIS_ARCHITECTURE_CANNOT_PRODUCE,
     EXCLUDED_ANALYSES,
+    EXTRA_ANALYSES,
     GEOMETRY_KEYS,
+    HEADLINE_SCALARS,
     LAG_RESIDUAL_BINDING,
     UNREGISTERED_ANALYSES,
     residual_encoder_disclosure,
@@ -153,9 +155,54 @@ def test_the_binding_removes_the_two_shared_analyses_it_cannot_produce() -> None
     shared = list(shared_run.ANALYSIS_FUNCTIONS)
     reduced = list(shared_run.merged_analysis_functions(LAG_RESIDUAL_BINDING))
     assert set(shared) - set(reduced) == set(EXPECTED_REMOVALS)
-    # Nothing else moved, so a reader comparing this cell's output against the lag-attentive one
-    # finds fewer columns in the same order rather than a reordering.
-    assert reduced == [name for name in shared if name not in EXPECTED_REMOVALS]
+    # Nothing else moved among the shared ones, so a reader comparing this cell's output against
+    # the lag-attentive one finds fewer columns in the same order rather than a reordering.
+    assert [name for name in reduced if name in shared] == [
+        name for name in shared if name not in EXPECTED_REMOVALS
+    ]
+    # This cell's own sit after the shared ones and before the trailing cross-subgroup test,
+    # which reads what they write.
+    assert [name for name in reduced if name not in shared] == list(EXTRA_ANALYSES)
+    assert reduced[-1] == "cross_subgroup"
+
+
+def test_the_binding_declares_its_own_collection_pass() -> None:
+    """The family's runner calls whichever pass the binding names, and this cell names its own:
+    the shared pass reads tensors only a lag-attention forward emits."""
+    from teb_vae.lag_slot_transformer_cfs.eval import binding as binding_module
+    from teb_vae.lag_slot_transformer_cfs.eval import collect
+
+    assert LAG_RESIDUAL_BINDING.collect is binding_module.collect_tables
+    assert collect.collect_tables is not binding_module.collect_tables
+    # The three that draw this model's own forward are registered under the family's names.
+    assert {"samples", "recording_traces", "attribution"} <= set(EXTRA_ANALYSES)
+    assert all(callable(function) for function in EXTRA_ANALYSES.values())
+
+
+def test_every_headline_scalar_this_cell_registers_resolves_on_its_own_results() -> None:
+    """A path that resolves to nothing is a column of ``None`` in every arm table; each one is
+    checked against a results block shaped as the pass writes it."""
+    from teb_vae.lag_attn_cfs.eval import report_seam
+
+    results = {
+        "readouts": {"mc_pred_gap": 0.5},
+        "verdicts": [],
+        "arm_scores": {
+            "pred_gap": {"point": 0.5, "lo": 0.1, "hi": 0.9},
+            "draw_concentration_full": {"point": 3.0},
+        },
+        "source_controls": {
+            "silence_margin_nats": 0.5, "replace_zeros_margin_nats": 0.2,
+            "replace_constant_margin_nats": 0.1, "permute_margin_nats": 0.3,
+        },
+        "lag_readouts": {"cancellation": {"mean": {"ratio": 0.7}}},
+    }
+    headline = report_seam.build_headline(results, HEADLINE_SCALARS)
+
+    for name, _path in HEADLINE_SCALARS:
+        assert headline[name] is not None, name
+    assert headline["pred_gap_mc_ci_lo"] == 0.1
+    assert headline["pred_gap_mc_nats"] == 0.5
 
 
 def test_only_analyses_the_shared_registry_holds_may_be_removed() -> None:
