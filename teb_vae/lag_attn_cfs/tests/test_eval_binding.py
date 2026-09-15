@@ -96,6 +96,12 @@ RESOLVED_WARMUP_KWARGS = (
 #: the context, because an intervention on the model's INPUT cannot be served by any table a
 #: forward already wrote.
 CELL_SPECIFIC_ANALYSES = (
+    # The three that draw this model's OWN forward -- the page seams, the attention and the
+    # per-lag divergence map -- lead the extras so the merged run order is unchanged; a model
+    # without that forward registers its own three under the same names.
+    "samples",
+    "recording_traces",
+    "attribution",
     "warmup",
     "source_null",
     "occlusion",
@@ -297,9 +303,15 @@ def test_this_cell_registers_exactly_its_four_own_analyses() -> None:
 def test_the_four_registered_analyses_are_the_functions_their_modules_define() -> None:
     """A registry entry pointing at something else would run outside the analysis protocol."""
     from teb_vae.lag_attn_cfs.eval.analyses import (
-        lag_clocks, source_null, spectral_skill, warmup,
+        attribution, lag_clocks, recording_traces, samples, source_null, spectral_skill, warmup,
     )
 
+    assert CFS_BINDING.extra_analyses["samples"] is samples.run_samples_analysis
+    assert (
+        CFS_BINDING.extra_analyses["recording_traces"]
+        is recording_traces.run_recording_traces_analysis
+    )
+    assert CFS_BINDING.extra_analyses["attribution"] is attribution.run_attribution_analysis
     assert CFS_BINDING.extra_analyses["warmup"] is warmup.run_warmup_analysis
     assert CFS_BINDING.extra_analyses["source_null"] is source_null.run_source_null_analysis
     assert CFS_BINDING.extra_analyses["lag_clocks"] is lag_clocks.run_lag_clocks_analysis
@@ -537,12 +549,15 @@ def test_the_binding_cannot_be_edited_after_it_is_declared() -> None:
 
 
 def test_the_dataclass_itself_still_names_no_model() -> None:
-    """The type is the sibling's, field for field. This package adds a concrete instance beside it
-    and changes nothing about the seam, so a third cell can be bound by declaring one more."""
+    """The type is the sibling's, field for field, plus one: ``collect``, a model's own collection
+    pass, which is what lets an architecture without a lag attention be bound to this runner. The
+    concrete instance beside it names a model; the type still does not, so a third cell is bound
+    by declaring one more."""
     fields = {name: parameter.annotation for name, parameter in
               inspect.signature(ModelBinding.__init__).parameters.items() if name != "self"}
 
     assert list(fields) == [
         "model_cls", "task_cls", "tag", "geometry_keys", "encoder_disclosure", "overrides_path",
-        "extra_analyses", "headline_scalars", "excluded_analyses",
+        "extra_analyses", "headline_scalars", "excluded_analyses", "collect",
     ]
+    assert CFS_BINDING.collect is None

@@ -31,12 +31,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, Mapping, Tuple
+from typing import Any, Callable, Dict, Mapping, Optional, Tuple
 
+from teb_vae.lag_attn_cfs.eval.analyses import attribution as attribution_analysis
 from teb_vae.lag_attn_cfs.eval.analyses import lag_clocks as lag_clocks_analysis
 from teb_vae.lag_attn_cfs.eval.analyses import lag_high_kl as lag_high_kl_analysis
 from teb_vae.lag_attn_cfs.eval.analyses import lag_kld_scaled as lag_kld_scaled_analysis
 from teb_vae.lag_attn_cfs.eval.analyses import occlusion as occlusion_analysis
+from teb_vae.lag_attn_cfs.eval.analyses import recording_traces as recording_traces_analysis
+from teb_vae.lag_attn_cfs.eval.analyses import samples as samples_analysis
 from teb_vae.lag_attn_cfs.eval.analyses import source_null as source_null_analysis
 from teb_vae.lag_attn_cfs.eval.analyses import spectral_skill as spectral_skill_analysis
 from teb_vae.lag_attn_cfs.eval.analyses import warmup as warmup_analysis
@@ -102,6 +105,21 @@ class ModelBinding:
             The removal shows up in a run's recorded ``analyses_selected``, which is what a reader
             comparing two directories reads; a binding whose exclusions need a *reason* on record
             states it where it declares them.
+        collect: The model's own collection pass, or ``None`` for the shared one in
+            :mod:`~teb_vae.lag_attn_cfs.eval.collect`. Called exactly as
+            :func:`~teb_vae.lag_attn_cfs.eval.collect.collect_tables` is and returning the same
+            :class:`~teb_vae.lag_attn_cfs.eval.collect.Collection`, so everything after the pass
+            -- the durable tables, the offline re-run, every registered analysis, the headline and
+            the sanity block -- is one implementation whichever pass wrote the tables.
+
+            It exists because the shared pass is written against the lag-attention forward: it
+            reads the attention weights, the per-lag divergence map and the source-null arm, and
+            reduces a latent produced at every stored step. An architecture that computes none of
+            those, and whose latent is indexed by decoded anchor, cannot be scored by it -- and the
+            one alternative, fabricating the tensors it asks for, is exactly what a lag readout
+            under an attention name would be. So such a model supplies the pass that produces the
+            shared tables from its own forward, under the shared column names where the quantity
+            is the same one and under no name at all where it is not.
     """
 
     model_cls: type
@@ -113,6 +131,7 @@ class ModelBinding:
     extra_analyses: Mapping[str, Any] = field(default_factory=dict)
     headline_scalars: Tuple[Tuple[str, Tuple[str, ...]], ...] = ()
     excluded_analyses: Tuple[str, ...] = ()
+    collect: Optional[Callable[..., Any]] = None
 
 
 # =================================================================================================
@@ -192,8 +211,10 @@ GEOMETRY_KEYS: Tuple[str, ...] = (
 
 #: Analyses only this cell can have, merged onto the shared registry in declaration order. They are
 #: registered **here rather than on the shared registry** so that the fork's run order stays
-#: readable as "the shared twelve, then this cell's four" -- and so that the second cfs cell picks
-#: all four up by binding this pipeline rather than by editing it.
+#: readable as "the shared table-driven analyses, then this cell's own" -- and so that the second
+#: cfs cell picks every one of them up by binding this pipeline rather than by editing it. The
+#: shared registry holds what reads the tables and nothing else; whatever draws this model's own
+#: forward, or reads a tensor only a lag-attention forward emits, is registered here.
 #:
 #: Three are the questions only a causal cell can ask: where in the warm-up staircase the forecast
 #: gap lives and whether the run decoded the population its configuration describes (``warmup``);
@@ -209,6 +230,18 @@ GEOMETRY_KEYS: Tuple[str, ...] = (
 #: sibling's with the absent analyses left out, and an entry there that the sibling never had would
 #: make the two summaries stop being readable side by side.
 EXTRA_ANALYSES: Dict[str, Any] = {
+    # The three that re-read segments through the loader and draw this model's OWN forward: the
+    # per-sample pages through the lag-attentive task's page seams, the per-recording traces
+    # off the attention and the per-lag divergence map, and the Captum attributions of the
+    # attention mass. Each reaches for the model rather than for a table, and each reads a
+    # tensor only a lag-attention forward emits -- so they are registered here, on the binding
+    # of the model whose forward they draw, rather than on the shared registry every binding
+    # inherits. A model without that forward registers its own under the same three names, so
+    # two run directories are read down one layout; the shared registry holds only what reads
+    # the tables. They lead the extras so the merged run order is the one it has always been.
+    "samples": samples_analysis.run_samples_analysis,
+    "recording_traces": recording_traces_analysis.run_recording_traces_analysis,
+    "attribution": attribution_analysis.run_attribution_analysis,
     "warmup": warmup_analysis.run_warmup_analysis,
     "source_null": source_null_analysis.run_source_null_analysis,
     # The interventional half of the lag question, beside the observational one. It costs a

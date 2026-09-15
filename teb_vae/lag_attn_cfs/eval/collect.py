@@ -493,13 +493,20 @@ class Collection:
     from_cache: bool = False
 
 
-class _Collector:
+class Collector:
     """Accumulates the two tables while :func:`~teb_vae.lag_attn_cfs.eval.metrics.evaluate` runs.
 
     A sink rather than a second loop: the readouts, the tables and the retained arrays all come
     off the same forward, and a second pass over the split would double the only expensive part of
     a run. The per-anchor rows are accumulated as per-batch arrays and concatenated once, because
     a real split produces millions of them and a list of dicts would not fit.
+
+    Public, because it is also the sink a binding's **own** collection pass writes the shared
+    tables through: what it reads off a readout is duck-typed -- ``guids``, ``columns``,
+    ``n_anchors``, ``per_anchor``, ``per_anchor_vectors``, ``retained``, ``horizon_sums`` and
+    whichever of :data:`~teb_vae.lag_attn_cfs.eval.metrics.VECTOR_READOUTS` the readout carries
+    -- so a pass over a forward that emits no attention writes the same ``per_sample.csv`` under
+    the same identity columns, and simply carries fewer vectors in the sidecar.
     """
 
     def __init__(
@@ -516,7 +523,10 @@ class _Collector:
         self._device = device
         self._geometry = None if model is None else getattr(model, "geometry", None)
         self._rows: Dict[str, List[Any]] = {}
-        self._vectors: Dict[str, List[np.ndarray]] = {name: [] for name in VECTOR_READOUTS}
+        # Keyed on first observation rather than pre-filled from ``VECTOR_READOUTS``: a readout
+        # that carries a subset writes that subset, and a name it never carried is absent from
+        # the sidecar rather than present as an empty array under an attention-shaped name.
+        self._vectors: Dict[str, List[np.ndarray]] = {}
         self._anchor_blocks: List[Dict[str, np.ndarray]] = []
         self._anchor_vector_blocks: Dict[str, List[np.ndarray]] = {}
         self._retained: Dict[str, List[np.ndarray]] = {}
@@ -527,12 +537,14 @@ class _Collector:
         self._started = time.perf_counter()
 
     # -- the sink -----------------------------------------------------------------
-    def observe(self, batch: Any, readout: BatchReadout) -> None:
+    def observe(self, batch: Any, readout: Any) -> None:
         """Record one scored batch.
 
         Args:
             batch: The batch, on the model's device, for the identity columns.
-            readout: Its per-sample readouts, per-anchor tensors and horizon sums.
+            readout: Its per-sample readouts, per-anchor tensors and horizon sums -- a
+                :class:`~teb_vae.lag_attn_cfs.eval.metrics.BatchReadout`, or any object carrying
+                the attributes the class docstring names.
         """
         batch_size = len(readout.guids)
         n_anchors = readout.n_anchors.detach().cpu().to(torch.float64).numpy()
@@ -613,10 +625,13 @@ class _Collector:
             self._extend(name, np.where(scored, column, np.nan).tolist())
 
     def _append_vectors(self, readout: BatchReadout, scored: np.ndarray) -> None:
-        """Append the per-sample vector readouts, blanked on the same rule as the scalars."""
+        """Append the per-sample vector readouts the readout carries, blanked like the scalars."""
         for name in VECTOR_READOUTS:
-            rows = getattr(readout, name).detach().cpu().to(torch.float64).numpy()
-            self._vectors[name].append(np.where(scored[:, None], rows, np.nan))
+            values = getattr(readout, name, None)
+            if values is None:
+                continue
+            rows = values.detach().cpu().to(torch.float64).numpy()
+            self._vectors.setdefault(name, []).append(np.where(scored[:, None], rows, np.nan))
 
     def _extend(self, name: str, values: Sequence[Any]) -> None:
         """Append one column's per-sample values, keeping every column the same length."""
@@ -795,12 +810,9 @@ class _Collector:
             )
 
         vectors = {
-            name: (
-                np.concatenate(blocks, axis=0)
-                if blocks
-                else np.zeros((0, 0), dtype=np.float64)
-            )
+            name: np.concatenate(blocks, axis=0)
             for name, blocks in self._vectors.items()
+            if blocks
         }
         per_anchor = _concatenate_blocks(self._anchor_blocks)
         anchor_vectors = {
@@ -1167,7 +1179,7 @@ def collect_tables(
         n_total=_loader_length(loader) if n_total is None else int(n_total),
         seed=int(eval_config.get("seed", 0)),
     )
-    collector = _Collector(
+    collector = Collector(
         plan,
         model=model,
         num_mc_samples=int(num_samples),

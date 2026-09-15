@@ -1,433 +1,474 @@
-# Attributing the forecaster's readouts to its inputs
+# Understanding input attribution
 
-What the `attribution` analysis of the two causal-feature forecasters measures, how it is built,
-which Captum methods it rests on and which it rejected, what its four structural checks prove,
-what every table and figure carries, what it costs, and the ways its output invites a reading it
-does not support. `EVAL.md` beside this file is the contract the analysis is bound to by test;
-this is the design record and the findings. The lag-residual cell runs the same pass as a
-post-pass stage and its `EVAL.md` points here.
+This guide explains how the `attribution` analysis relates a model output to the input coefficients that influenced it. It covers the lag-attention forecasters, including the conv-LSTM and transformer variants, and the lag-slot transformer in `lag_slot_transformer_cfs`. The latter is also called the **lag-residual model** because it combines per-lag proposals into a bounded latent update.
 
-## Table of contents
+Start with sections 1–4 to understand the method and read its results. Sections 5–7 explain the saved files, selection, and cost. Sections 8–10 provide implementation details and recorded fixture findings. Section 11 lists what to check on a trained model.
 
-0. What is being asked, and what the pipeline already answered
-1. The wrapper: one scalar per anchor
-2. The readouts, and which branch is attributed
-3. The two baselines, and why the path enters them from the side
-4. Which Captum methods run on these forwards, and which do not
-5. The four structural checks, and what they prove
-6. The reductions
-7. Every table and figure
-8. The cost
-9. Fixture findings
-10. Production-run findings
-11. How this output will be misread
+[EVAL.md](EVAL.md) explains the overall evaluation workflow, and [FIGURE_GUIDE.md](FIGURE_GUIDE.md) explains the individual plots. The lag-residual model uses the same attribution implementation as a stage after its scoring pass; see [its evaluation guide](../../lag_slot_transformer_cfs/eval/EVAL.md).
 
----
+## Contents
 
-## 0. What is being asked, and what the pipeline already answered
+- [1. What attribution tells you](#1-what-attribution-tells-you)
+- [2. Which outputs are attributed](#2-which-outputs-are-attributed)
+- [3. Baselines and the integration path](#3-baselines-and-the-integration-path)
+- [4. Checks to read before interpreting a map](#4-checks-to-read-before-interpreting-a-map)
+- [5. How maps become profiles and summaries](#5-how-maps-become-profiles-and-summaries)
+- [6. Output files and figures](#6-output-files-and-figures)
+- [7. Selection, settings, and cost](#7-selection-settings-and-cost)
+- [8. Implementation: one output per anchor](#8-implementation-one-output-per-anchor)
+- [9. Captum methods and their limitations](#9-captum-methods-and-their-limitations)
+- [10. Recorded fixture findings](#10-recorded-fixture-findings)
+- [11. What to record from a production run](#11-what-to-record-from-a-production-run)
+- [12. Interpretation limits](#12-interpretation-limits)
 
-Every lag readout the pipeline emits is one of two kinds. The **observational** ones — the
-attention over lags, the KL attribution $\widetilde K_{t,\ell} = \sum_m K^{(m)}_t
-\alpha^{(m)}_{t,\ell}$ built from it, the proposal norm $\lVert r^\mu_{t,\ell} \rVert_2$ in the
-lag-residual cell — say where a fitted distribution puts its mass, on a forward in which the
-source was fully present. The **interventional** one, `occlusion`, zeroes a band of source lags
-relative to one anchor per segment and reports what the forecast lost. Neither says which
-**coefficients** — which stored steps, which channels, which frequency bands, of which stream —
-the model's per-anchor quantities actually responded to. The availability-clock hazard
-`source_null` names makes that question sharper than usual here: the source availability pattern
-is a deterministic function of the step index and enters the posterior alone, so the divergence
-carries a term no input coefficient produced.
+## 1. What attribution tells you
 
-Gradient attribution answers the question at the resolution the model's inputs have. A scalar
-readout $f(y^{st}, y^{ph}, u)$ at one anchor is attributed back over every element of the three
-declared-width input streams on the stored grid, and the maps are reduced onto the axes the rest
-of the pipeline reads: stored time, offset from the anchor (the lag axis), channel, frequency
-band, lag band, and — through a layer attribution — head or lag slot. The tools are Captum's,
-installed for this purpose (`captum==0.9.0`; the path integration, the batching over
-interpolations and the completeness deltas are not a few lines to own locally).
+Attribution asks which parts of the input contributed to a particular output of the fitted model. For example, at one forecast anchor, which uterine-pressure coefficients contributed to a change in the predictive gap? The result is a map with one value for each stored time step and input channel.
 
-## 1. The wrapper: one scalar per anchor
+An **anchor** is the time from which a forecast starts. A **coefficient** is a numerical feature produced by the upstream signal transform. A **channel** follows one such feature through time. A **readout** is the single model quantity being explained, such as a score or KL divergence.
 
-`attributions.AnchorReadout` is an `nn.Module` whose forward takes the three input streams and
-two extra tensors — the declared-width target stream the block scores are taken against and the
-decimated validity `weight` — plus two per-row `long` tensors: `columns`, each row's anchor as a
-position on the anchor axis, and `coordinates`, each row's latent coordinate for the
-per-coordinate readouts. It calls the real model at the dense evaluation geometry
-(`anchor_phase=0, anchor_stride=1`, plus `return_proposals=True` in the lag-residual cell),
-selects each row's own anchor, and returns the readout as a $(B,)$ vector.
+| Term | Meaning in this guide |
+| --- | --- |
+| Target streams | The two feature streams being forecast: scattering features $y^{st}$ and phase-harmonic features $y^{ph}$. |
+| Source stream | The additional input $u$ used by the source-conditioned branch. |
+| Base and full | The target-only and source-conditioned forecast branches. |
+| Latent state | The model's compact, uncertain representation of the input history. |
+| Prior and posterior | The target-only and source-conditioned latent distributions, respectively. |
+| KL divergence, $K_t$ | How much the posterior differs from the prior at anchor $t$. A large value does not by itself mean a better forecast. |
+| Predictive gap | Base score minus full score. A positive value means the full branch scored better. |
+| Baseline | A reference input used to define the change that attribution explains. |
+| Gradient | How sensitive the chosen output is to a small change in an input value. |
+| Integrated gradients, or IG | Attribution obtained by accumulating gradients along a path from a reference input to the observed input. |
+| Completeness | The requirement that the summed attributions reproduce the output change along that path, within numerical tolerance. |
+| Lag band | An inclusive range of stored steps before the anchor. |
 
-Three properties of the wrapper are load-bearing.
+### How this differs from the other analyses
 
-* **The anchor is per row, so several anchors of one segment are attributed in one call.** The
-  pass repeats every segment once per chosen anchor (`expand_rows`) and hands Captum a per-row
-  column tensor as an additional forward argument, which Captum expands along its interpolation
-  axis exactly as it expands the inputs. A batch of $B$ segments at $k$ anchors is one call of
-  $Bk$ rows; the tests assert the batched attribution equals the one-at-a-time one to $10^{-5}$.
-* **The block-score readouts rebuild the target block and the mask on every call**, from the two
-  extra tensors and the row's own anchor, through the model's `_build_forecast_target` and the
-  anchored `forecast_mask` at the model's own `coverage_floor` — the same two functions the
-  collection pass scores with. A target built once outside would no longer match a batch Captum
-  has expanded.
-* **Every input and both posterior parameters are tied into the graph with a zero coefficient.**
-  A readout that does not depend on the source — the prior mean, the base block score — would
-  otherwise make autograd raise about an unused tensor; with the tie its source attribution is an
-  exact zero, which is the structural fact the tests assert. The same tie lets a layer attribution
-  on a module whose output reaches only the parameter a readout does not read (the scale
-  proposals under the mean-decoded gap) still find that output on the graph.
+The existing lag profiles describe the model's behaviour with the source present. In the attentive models, these include attention weights and attention-weighted KL attribution:
 
-The two cells differ in how a row's anchor is read: the lag-attentive cells gather a dense
-$(B, T, \cdot)$ tensor at the anchor's stored step, the lag-residual cell selects a column of a
-tensor already on the anchor axis. `CellBinding` names which, and the wrapper, the baselines, the
-reductions and the figures are otherwise one implementation.
+$$
+\widetilde K_{t,\ell}=\sum_m K_t^{(m)}\alpha_{t,\ell}^{(m)}.
+$$
 
-## 2. The readouts, and which branch is attributed
+Here, $m$ identifies an attention head and $\ell$ identifies a lag. In the lag-residual model, a profile may instead show the proposal norm $\lVert r^\mu_{t,\ell}\rVert_2$, the magnitude proposed by that lag before summation and limiting. A proposal norm is not a probability distribution.
 
-| readout | what it is | branch |
-|---|---|---|
-| `kld` | $K_t$ at the anchor: `kld_per_t` gathered, or `kld_per_anchor` selected | means |
-| `kld_dim` | $K_{t,d}$ at the row's coordinate | means |
-| `mu_post_dim`, `mu_prior_dim` | $\mu^q_{t,d}$, $\mu^p_{t,d}$ | means |
-| `nll_full`, `nll_base` | the masked block score of the branch **decoded at its mean**, at the anchor | means |
-| `pred_gap` | `nll_base` − `nll_full`: the mean-decoded gap the collection pass reports as `mean_pred_gap` | means |
-| `lag_band` | the model's own lag readout on an inclusive lag band: the head-averaged attention mass on it (attentive cells), the proposal norm summed over it (residual cell) | — |
+The `occlusion` analysis removes source values from a lag band and measures the resulting forecast change. Input attribution provides a finer view: it assigns an output change to individual coefficients across time, channels, and streams. These analyses describe different aspects of the fitted computation and should be read together.
 
-**Means, never samples.** Every readout is a function of $(\mu^p, \ell^p, \mu^q, \ell^q)$ and of
-the decoder applied to $\mu$, so no reparameterisation draw enters any attributed number and two
-runs of one checkpoint agree bitwise. The Monte Carlo score `mc_pred_gap` is deliberately not a
-readout: attributing it would need a frozen $\epsilon$ and would attribute the draw as well as the
-input, and no figure could separate the two. The mean-decoded gap is the estimator the coupling
-figures foreground and the one `lag_high_kl` scores usefulness by, so the attribution is of the
-number those pages show.
+The availability pattern also matters. It indicates which source channels are usable at each step and is determined by time rather than by the source values. The attentive model can respond to that pattern even with a zeroed source. The baseline comparison in section 3 explains how attribution handles this response.
 
-A production pass attributes `kld` and `pred_gap` under both baselines; the lag readout on every
-`occlusion_bands` band, and the anchor's largest $K_{t,d}$ coordinate, under the source-null
-baseline alone; the layer split of `kld` and `pred_gap`; and the band ablation of both. The
-target-only readouts are attributed on one segment per run as the purity check.
+The implementation uses Captum, pinned as `captum==0.9.0` in `requirements.txt`, for path integration, interpolation batching, and completeness calculations.
 
-## 3. The two baselines, and why the path enters them from the side
+## 2. Which outputs are attributed
 
-A baseline is a modelling decision. Under the loader's z-scoring an exact zero is the channel mean
-over the region the model reads — the climatology baseline `forecast` already scores against, and
-the fill `occlusion` and `source_null` already use — and the input warm-up gate multiplies every
-not-yet-warm step by exactly zero, so a zero baseline changes nothing on the steps the model never
-read and the gate's own zeros are the baseline's zeros.
+The wrapper exposes the following readouts. The symbols $\mu^p$ and $\mu^q$ are prior and posterior means; $\ell^p$ and $\ell^q$ are their log-variances. The coordinate index $d$ identifies one latent dimension.
 
-* **`source_null`** zeroes the source stream and holds both target streams fixed. It is the exact
-  null arm `source_null` measures, so a source attribution under it is to source **content**: the
-  availability announcement $W_m(m_t - \mathbf 1)$ is a constant of $t$, identical on both ends of
-  the path, and is attributable to no input at all. The target streams do not move along the
-  path, so their attribution is exactly zero, which the tests assert.
-* **`all_zero`** zeroes every stream. It is the reference on which the target streams' own
-  attribution is read, and it is what splits a readout between the target and the source.
+| Readout | Quantity explained |
+| --- | --- |
+| `kld` | Divergence $K_t$ at the chosen anchor, taken from `kld_per_t` or `kld_per_anchor`. |
+| `kld_dim` | The divergence contribution $K_{t,d}$ of one latent coordinate. |
+| `mu_post_dim`, `mu_prior_dim` | One posterior or prior mean coordinate, $\mu^q_{t,d}$ or $\mu^p_{t,d}$. |
+| `nll_full`, `nll_base` | The masked forecast-block score after decoding that branch at its latent mean. |
+| `pred_gap` | The mean-decoded difference $D_{\mathrm{base}}-D_{\mathrm{full}}$, reported as `mean_pred_gap` by the collection pass. |
+| `lag_band` | Attention mass averaged over heads within a band for attentive models, or the sum of proposal norms within that band for the lag-residual model. |
 
-**The exactly-zero stream is a degenerate point of every encoder in the family, and the path
-cannot start there.** The conv-LSTM cell's `CausalGroupNorm` normalises each step over the
-channels of a group; the transformer cells' `RMSNorm` normalises each token over its channels. At
-an all-zero input the adapter emits a constant vector at every step past the warm-up, and
-downstream a group or a token with zero variance sits on the $1/\sqrt{\epsilon}$ singularity. The
-measurement, on the three tiny models along the straight path $b + \alpha(x - b)$ for the
-divergence readout, is in §9: the directional derivative at $\alpha = 0$ is of order $10^{13}$ to
-$10^{22}$, the readout moves by a finite amount between $\alpha = 0$ and $\alpha = 10^{-6}$, and
-integrated gradients from the exact zero do not converge at $32$, $128$ or $512$ steps. From
-$\alpha_0 = 10^{-3}$ the singularity is behind the start and the integral converges to a relative
-residual below $10^{-3}$ at $64$ steps on every fixture.
+### The attribution uses latent means
 
-The design therefore starts every path at $x_0 = b + \alpha_0 (x - b)$ with
-$\alpha_0 =$ `BASELINE_ENTRY_FRACTION` $= 10^{-3}$, and every row records the readout at the exact
-baseline, at the entry point and at the input. The **entry jump** $f(x_0) - f(b)$ is a reported
-scalar rather than a hidden one, and it belongs to no input step: it is the normalisation snapping
-out of its degenerate state. Completeness is measured against $f(x) - f(x_0)$, which is what the
-integral is of. For the lag-residual cell's source-null baseline the source pathway is a pointwise
-encoder into a small multilayer perceptron, the path is smooth from $\alpha = 0$, and the jump is
-of order $10^{-3}$ of the readout; for the attentive cells it is not small on the tiny fixtures
-(§9), which is a finding about where `kld_source_null` is evaluated rather than a numerical
-nuisance.
+Forecast-score readouts decode the latent mean, rather than a sampled latent state. The other readouts also use deterministic model outputs. This removes latent sampling noise from the attributed quantity and makes repeated calls comparable under the same execution conditions.
 
-## 4. Which Captum methods run on these forwards, and which do not
+The Monte Carlo predictive score `mc_pred_gap` is not attributed here. Attributing it would require an additional convention for fixing or integrating over random draws. The mean-decoded gap matches the comparison displayed by the relevant coupling figures and preferred by the `lag_high_kl` usefulness analysis.
 
-Every method below was run on the tiny models the test suites build (`make_task` and the stub
-batch of the conv-LSTM cell, the transformer cell's `tiny_warmup_kwargs`, the lag-residual cell's
-`build_tiny_model` and `tiny_streams`), with the wrapper of §1 and the entry point of §3.
+### What a standard pass computes
 
-| method | verdict | why |
-|---|---|---|
-| `IntegratedGradients` | **shipped, primary** | completeness holds to $10^{-3}$ at 64 steps from the entry point on every fixture; causality, gating and target-only purity exact |
-| `LayerIntegratedGradients` | **shipped** | on the per-head fusion modules of the head-structured posterior (attentive cells): a complete per-head split under the source-null baseline, where the target state is fixed and everything that moves flows through the fusion; on the proposal head's output (residual cell): a complete per-lag split of the readout through the summation and the limiter, over both proposal channels. Taken on the posterior head's *inputs* it fails on a `posterior_logvar_mode: independent` head, whose raw prior log-variance is an unused input; taken on the lag attention module it fails because its first output is discarded by the forward |
-| `FeatureAblation` | **shipped** | model-agnostic; grouped by lag band of the source relative to each row's anchor, it is `occlusion`'s intervention read on this analysis's readouts and anchors, reported in `occlusion`'s sign |
-| `InputXGradient`, `Saliency` | evaluated, not shipped | run and pass every structural check; single-point gradients with no completeness, adding nothing the integrated form does not |
-| `GradientShap` | evaluated, not shipped | integrated gradients averaged over a random baseline distribution; its per-sample completeness residual is of the order of the readout by construction, and a random baseline makes two runs disagree |
-| sliding-window `Occlusion` | evaluated, not shipped | a window straddling the anchor assigns its effect to steps after the anchor, so the per-step output fails the causality check by construction; the grouped ablation is the same intervention on the right groups |
-| `DeepLift` | evaluated, **not usable** | runs, but its rescale rule reaches only the module nonlinearities it hooks; the GELU and SiLU functionals, the smooth bounds, the tanh limiter and `entmax15` pass through as plain gradients, and its completeness residual is of the order of the readout |
-| `LayerConductance` | evaluated, not shipped | its sums differ from the readout difference on every layer tested where the layer integrated gradient is exact |
-| `NeuronConductance` | evaluated, not shipped | the conductance of one latent coordinate is the input attribution of that coordinate's readout, which the readout registry already provides; and the heads return tuples its selector cannot index |
+- `kld` and `pred_gap` under both baselines.
+- `lag_band` for each configured `occlusion_bands` band under `source_null`.
+- `kld_dim` for the coordinate with the largest divergence at each selected anchor, under `source_null`.
+- Layer attribution for `kld` and `pred_gap`, split by attention head or lag slot.
+- Source-band ablation for both main readouts.
+- Target-only readouts on one segment per run to verify that source attribution is zero.
+- One **example anchor per class**, attributed for `kld`, `pred_gap`, `nll_full` and `lag_band` on every configured band under both baselines, with the full maps and the input streams kept for the map figures.
+- The per-recording **trace** readouts, `kld` and `pred_gap`, at a few anchors of every segment of one recording per class under `source_null`.
 
-The verdicts travel in every block under `methods`, with the reasons, so a reader of a summary
-sees what was rejected and not only what was kept.
+### Read the sign before interpreting magnitude
 
-Two properties of these forwards decide which layer a split can be taken on. A Captum layer
-attribution replaces the layer's output with an interpolated tensor and differentiates the readout
-against it, so **every output of the layer must reach the readout** (the lag attention's discarded
-`W_o` projection does not) and **the layer must be called once per forward** (the lag-residual
-cell's chunked proposal pass calls the head several times; the pass runs it unchunked for the
-attribution and restores the setting in a `finally`). The per-head fusion modules and the proposal
-head satisfy both.
+A positive signed attribution contributes to increasing the selected readout along the integration path. Its practical meaning depends on the readout. Increasing `pred_gap` means a better score for full relative to base; increasing an NLL means a worse predictive score; increasing `kld` means a larger latent change.
 
-## 5. The four structural checks, and what they prove
+Plots of absolute attribution, such as $|q_\ell|$, show magnitude and discard the sign. They identify where the model was sensitive, but cannot tell you whether that contribution increased or decreased the readout.
 
-Each is asserted exactly on the tiny models by `tests/test_eval_attribution.py` in both cells and
-measured on every row of a real run into the block's `checks`.
+## 3. Baselines and the integration path
 
-1. **Causality.** Attribution to any stored step after the anchor is exactly zero, for every
-   readout, under both baselines, on both streams. On the conv-LSTM cell this holds only with
-   `causal_norm: true` — the shipped setting, and the one its own causality tests build with —
-   because the plain group norm pools over time; on the tiny model without it the attribution
-   after the anchor reaches $0.26$–$0.30$ nats, which is the leak that switch exists to close. The
-   transformer cells are step-wise causal by construction. It is a *gradient* statement, so it is
-   exact; the value-level check (`FeatureAblation` of every step after the anchor, the `rest`
-   group) is zero to the float noise of a kernel re-run.
-2. **The gate.** Attribution to a source step a channel had not warmed up at is exactly zero: the
-   adapter multiplies those positions by exactly zero, so the gradient through them is exactly
-   zero. In stored coordinates a gathered-and-shifted channel is live from $W'_c$ (the encoder
-   reads stored step $t - d_c$ and masks while $t < W'_c + d_c$), which `warm_from_step` computes
-   per declared channel; the dropped channels are live from nowhere.
-3. **Target-only purity.** The source attribution of $\mu^p$ and of the base block score is
-   exactly zero. The prior clock (attentive cells) is the encode of a *zero* source, detached; the
-   metadata clock (residual cell) is a sinusoid of position; neither carries a gradient to the
-   source input.
-4. **Completeness.** The integrated-gradient sum reproduces $f(x) - f(x_0)$. The residual is
-   measured per row against the larger of $|f(x) - f(x_0)|$ and $|f(x)|$ — so a source that barely
-   moves a readout does not report a residual of order one over a difference of order nothing —
-   and the block reports its median, its maximum and the count of rows above
-   `COMPLETENESS_TOLERANCE` $= 10^{-2}$. The tests pin a median below $10^{-2}$ and a maximum below
-   $5 \times 10^{-2}$ on the conv-LSTM tiny model (its per-step group norm makes its path the
-   roughest of the family's) and a maximum below $10^{-3}$ on the residual cell's.
+Attribution explains a change relative to a baseline. It is therefore essential to know both the observed input and the reference it is compared with.
 
-What they prove: that an attribution reaching before the anchor is a statement about the
-history, that a non-zero attribution on a source step is a statement about a coefficient the
-model actually read, that the source-null attribution of a readout is entirely about the source's
-content, and that the maps sum to the number they decompose. What they do not prove is anything
-about the physiology; see §11.
+### Two zero-based references
 
-## 6. The reductions
+The loader standardises each channel, so zero represents its population mean under those statistics. Zero does not mean that an observed signal had no physical activity. The model also gates unavailable steps to zero, so replacing their stored values with zero does not change what the model reads.
 
-All from the $(N, T, c_y)$ and $(N, T, c_u)$ maps of $N$ rows, all per row, and every summary
-statistic then per recording (a row's segment is its recording's one segment in the main draw)
-and then over recordings.
+| Baseline | What changes along the path | What the attribution describes |
+| --- | --- | --- |
+| `source_null` | Source values move from zero toward their observed values; both target streams stay fixed. | The response to source content relative to the model's zero-source response. Target attribution is exactly zero because target inputs do not move. |
+| `all_zero` | All three streams move from zero toward their observed values. | The output change as target and source inputs are introduced together. The split between streams depends on this path. |
 
-* **Time profile** per stream: the sum over channels, $(N, T)$.
-* **Channel profile** per stream: the sum over steps, $(N, C)$.
-* **Lag-aligned source profile** $q_\ell = p^{u}_{t_a - \ell}$ for $\ell = 0, \ldots, L - 1$,
-  `NaN` where $t_a - \ell$ falls before the record. Drawn on the compensated seconds axis
-  `lag_axis.compensated_seconds_axis(L, delay_steps)` — the model's own `source_delay_steps` in
-  the attentive cells, zero in the residual cell — beside the model's own lag readout at the same
-  anchor: the KL attribution `source_kl_lag_map[t_a]` or the proposal norm masked by `lag_valid`.
-  Two **agreement** statistics per row over the lags both carry: the Pearson correlation of
-  $|q_\ell|$ against the readout, and the Jensen–Shannon distance (base 2, in $[0, 1]$, through
-  `lag_hist.jensen_shannon`) between the two normalised to distributions.
-* **Frequency-band sums** per stream through the **declared-axis** channel map
-  `band_channel_map.csv`, with `stream`, `channel` (the index within the stream, which is the
-  index the model's input tensors use) and `band`. The attributions live on the model's input
-  axis, which is the declared width, so the join is through the declared map and not the
-  kept-axis one the decoder-side per-channel readouts use; a dropped channel's attribution is
-  exactly zero (its gate multiplies it by zero) and its band sum carries it. In the lag-residual
-  cell the stage builds the map through `band_partition.emit_partition` when the directory holds
-  none, from the same shards and resolved budget, and records a skip by name when the shards carry
-  no channel provenance.
-* **Lag-band sums** of the lag-aligned profile over each `occlusion_bands` band, clipped to the
-  window.
-* **The layer split**: per head (attentive cells) or per lag (residual cell), as §4 states.
-* **Band ablation**: `FeatureAblation` grouped by lag band relative to each row's anchor over
-  every source channel at once, reported as $f(x^{\setminus \mathrm{band}}) - f(x)$ — `occlusion`'s
-  sign, positive meaning the readout rose without the band — beside a `rest` group of every
-  source position outside the bands. `rest` holds the steps after the anchor, whose ablation is
-  zero to float noise, **and** the steps before the earliest band's reach, whose ablation is not
-  zero on an arm whose source pathway has memory beyond the searched window (the conv stem's
-  receptive field, the deep encoder's unbounded one): that is what the source state at lag $\ell$
-  remembers from before $t_a - \ell$, and it is a measured number rather than an assumption that
-  the window is the whole of what the model reads.
-* **The null decomposition** for the divergence: under `source_null`, $f(b)$ is the null arm's
-  own divergence at the anchor (the availability-clock part), the integrated attribution is the
-  source-content part and the entry jump is what the normalisation does between the two; under
-  `all_zero`, the attribution splits between the target and the source streams.
+Under `source_null`, the availability indicators remain identical at both ends of the path. They are not varying input coefficients, so they receive no input attribution. The exact zero-source readout is saved separately. It includes the model's availability-related response and its behaviour at zero input; it should not be interpreted as a purified measurement of the clock alone.
 
-## 7. Every table and figure
+### Why integration starts slightly above zero
 
-All under `attribution/` in the results directory. Units are the readout's: nats per anchor for
-`kld`, `kld_dim`, `nll_*` and `pred_gap`; a share in $[0, 1]$ for the attentive cells' `lag_band`,
-a norm in latent units for the residual cell's. Every lag axis is stored-coefficient seconds.
+Normalisation can make the model extremely sensitive near an all-zero input. The conv-LSTM uses per-step `CausalGroupNorm`, and the transformer variants use token-wise `RMSNorm`. Near zero variance, the normalisation scale can become very large. The recorded tiny-model experiments found very large gradients and sharp readout changes close to zero; increasing the integration step count did not reliably fix integration from the exact baseline.
 
-| file | one row per | columns |
-|---|---|---|
-| `attribution_rows.csv` | attributed (anchor, readout, baseline, band) | `guid`, `epoch`, `clinical_class`, `subgroup`, `anchor` (stored step), `column`, `readout`, `baseline`, `band`, `coordinate` ($-1$ where none), `value_input`, `value_baseline`, `value_entry`, `entry_jump`, `attributed` (the IG sum), `ig_delta`, `completeness_rel`, `target_total`, `source_total`, `target_abs_total`, `source_abs_total`, `after_anchor_max_abs`, `gated_off_max_abs`, `lag_corr`, `lag_js`, `kld_top_coordinate`, `lagband_<band>`, `band_<stream>_<band>`, `layer_total`, `layer_off_axis_total`, `ablation_<band>`, `ablation_rest` |
-| `attribution_vectors.npz` | the same rows, row-aligned | `time_profile_target` $(N, T)$, `time_profile_source` $(N, T)$, `lag_profile` $(N, L)$, `target_lag_profile` $(N, L)$, `model_profile` $(N, L)$, `channel_profile_target` $(N, c_y)$, `channel_profile_source` $(N, c_u)$, `layer_per_unit` $(N, M$ or $L)$ (`NaN` rows where no split was taken), `lag_seconds` $(L,)$ |
-| `attribution_maps.npz` | the first `kld`/`source_null` row per class | `guid`, `subgroup`, `clinical_class`, `anchor`, `target` $(n, T, c_y)$, `source` $(n, T, c_u)$ |
-| `attribution_recordings.csv` | recording | `<readout>_source_total`, `<readout>_target_total`, `<readout>_lag_corr`, `<readout>_lag_js` for the two main readouts under `source_null`, the cohort columns, `n_segments`; the frame the runner fans by class and subgroup |
-| `attribution_summary.csv` | (readout, baseline, band) | counts, recording-mean values and totals, `completeness_rel_max`, `completeness_rel_median`, `after_anchor_max_abs`, `gated_off_max_abs` |
-| `attribution_bands.csv` | (readout, stream, frequency band) | `attribution_mean`, `n_recordings`, `spectral_skill_pred_gap_nats` (target bands, where that pass ran) |
-| `attribution_lag_bands.csv` | (readout, lag band) | `lag_lo`, `lag_hi`, `ig_attribution_mean`, `ablation_delta_mean`, `occlusion_delta_total_nats` (sign-flipped on `pred_gap`, absent on `kld`), `n_recordings` |
-| `attribution_layer.csv` | (readout, unit, class or `pooled`) | `n_recordings`, `mean` |
-| `attribution_null.csv` | (readout, baseline, class or `pooled`) | recording means of the values, the entry jump, the attributed sum and both totals |
-| `attribution_traces.csv` | traced recording | `guid`, class, subgroup, `n_segments`, `n_anchors`, `span_hours`, `arrays_file`, `figure_file` |
-| `traces/<class>/<guid>_<subgroup>_attribution_trace.npz` | the traced recording | the traces' shared arrays with `attribution_lag_map` and `model_lag_map` |
+The lag-residual model is an important exception on the source-null path: its pointwise source encoder and small multilayer perceptron gave a smooth response there. Its all-zero path still showed strong sensitivity through the target encoder. Section 10 records the measurements for each model.
 
-| figure | what it draws |
-|---|---|
-| `attribution_maps.pdf` | one row per class: both streams' maps of $K_t$ at one anchor (stored step × declared channel, anchor marked, warm-up staircase drawn) and the lag-aligned source attribution against the model's lag readout |
-| `attribution_lag_profile.pdf` | per main readout: the recording-mean normalised $\lvert q_\ell \rvert$ against the normalised model readout, pooled and by class, with the agreement in the title |
-| `attribution_bands.pdf` | top: attribution by frequency band per stream with the band-resolved skill gap on a twin axis; bottom: per lag band, the IG sum, the ablation delta and the occlusion delta |
-| `attribution_layer.pdf` | left: the per-head or per-lag split per readout; right: how the anchor's top $K_{t,d}$ coordinate is fed, by offset, per stream |
-| `attribution_null.pdf` | left: $K_t$ at the input, at the null, the attributed content and the entry jump by class; right: the target/source split under `all_zero` |
-| `traces/<class>/<guid>_<subgroup>_attribution_trace.pdf` | the traces' shared figure: $\lvert q_\ell \rvert$ of $K_t$ over hours before delivery, the model's lag readout, the agreement, the totals, the values |
+To avoid integrating through the most sensitive region, the shared implementation starts slightly toward the observed input:
 
-`FIGURE_GUIDE.md` carries the reading rules of each. Every figure prints
-`ATTRIBUTION_CAVEAT`, the lag-resolved ones the group-delay caveat and the cell's lag
-qualification as well.
+$$
+x_0=b+\alpha_0(x-b),\qquad \alpha_0=10^{-3}.
+$$
 
-**The block** in `summary.json` (`results.attribution` here, `attribution` in the lag-residual
-cell) carries `n_samples` (segments), `composition`, `plan` (cap, seed, anchors per segment, step
-count, entry fraction, baselines, readouts, lag bands, the layer, the geometry), `selection`,
-`trace_selection`, `cost`, `checks`, `summary`, `lag_bands`, `joined` (which of the three files
-were found), `methods`, `lag_qualification`, `caveat`, `traces`, `failures` and `files`; the
-attentive cells add `grouped_frames`. None of its keys is one the lag-residual cell's gate refuses,
-and its test asserts that on the block it writes.
+Here, $b$ is the exact baseline, $x$ is the observed input, and $x_0$ is the integration entry point. The constant is `BASELINE_ENTRY_FRACTION`. Integrated gradients explain the change from $x_0$ to $x$, rather than the entire change from $b$ to $x$.
 
-## 8. The cost
+For an input element $i$, the corresponding attribution has the form:
 
-Per segment, at $k$ anchors: $2 \times 2$ integrated-gradient calls (two readouts, two baselines)
-plus one per lag band plus one for the top coordinate, each of $k$ rows at `IG_STEPS` interpolated
-forwards-and-backwards, plus two layer attributions of the same size, plus two band ablations of
-$1 + n_{\mathrm{bands}}$ forwards per row. On the tiny conv-LSTM fixture on CPU, three segments at
-four anchors each — 108 rows — took $40$ s at 32 steps, about $0.37$ s per row; the shipped 64
-steps roughly doubles the per-row figure. The block's `cost` records `elapsed_s`, `n_rows`,
-`n_forward_equivalents`, `seconds_per_row` and `hours_per_1000_samples` for the pass that ran, and
-`caps.attribution_segments` is set from that measurement rather than guessed: it ships at $24$,
-which on a GPU is minutes rather than the collection pass's hours, and absent it means the
-analysis's own default rather than every segment. The trace adds one recording per class at the
-same anchors of every segment, `kld` under `source_null` only.
+$$
+\mathrm{IG}_i=(x_i-x_{0,i})\int_0^1\frac{\partial f\bigl(x_0+s(x-x_0)\bigr)}{\partial x_i}\,ds.
+$$
 
-**Which recording is traced.** Not a random draw: per class, the recording whose stored segments
-most completely fill the window — the last `max_hours_before_delivery` hours when the run sets
-that key, the recording's own span otherwise — measured as the segments the dataset holds inside
-the window over the number the window could hold at the segment stride the geometry implies
-(`attribution_pass.recording_completeness`). Ties break on the segment count and then on the
-identifier, so two runs trace the same recording, and a recording with fewer than two segments
-inside the window is never chosen. The block's `trace_selection` records each chosen recording's
-coverage. A completeness ranking is content-blind by design: it does not look at the uterine
-activity or the decelerations, so the traced recording is the one with the fewest holes, not the
-one where the source is most active.
+Captum approximates this integral numerically using `IG_STEPS`, currently $64$. More integration steps can improve numerical accuracy, but the saved residual is what determines whether the approximation was adequate for a particular row.
 
-## 9. Fixture findings
+### The entry jump is saved separately
 
-Measured on the tiny models the suites build, so evidence about the **machinery** and about
-nothing clinical: the models are untrained, the batches are Gaussian noise at the causal widths
-(the conv-LSTM and transformer cells) or at the integer-operator widths (the residual cell), and
-every number below is about what the forwards do to a gradient rather than about any recording.
+Each row records `value_baseline` $=f(b)$, `value_entry` $=f(x_0)$, and `value_input` $=f(x)$. The **entry jump** is:
 
-**The exactly-zero baseline is singular, on all three cells.** Along the straight path from the
-source-null baseline for the divergence readout at one anchor (values in nats):
+$$
+\mathrm{entry\_jump}=f(x_0)-f(b).
+$$
 
-| cell | $f(0)$ | $f(10^{-6})$ | $f(10^{-3})$ | $f(1)$ | directional derivative at $0$ |
-|---|---|---|---|---|---|
-| conv-LSTM, `causal_norm` | 2.752 | 2.915 | 2.865 | 2.380 | $1.3 \times 10^{22}$ |
-| transformer, `entmax15` | 7.136 | 4.539 | 3.570 | — | $2.5 \times 10^{14}$ |
-| transformer, softmax | 5.702 | 4.258 | 3.773 | — | $5.1 \times 10^{13}$ |
-| lag-residual | 4.387 | 4.387 | 4.386 | 5.036 | $-0.96$ |
+Together, these values account for the input readout approximately as:
 
-The residual cell's source-null path is smooth (its source pathway is a pointwise encoder into a
-small multilayer perceptron); its all-zero path is singular on the target side ($-1.1 \times
-10^{18}$), for the transformer target encoder's `RMSNorm`. Integrated gradients from the exact
-zero: relative completeness residual $0.23$–$0.43$ (conv-LSTM, source-null), $0.9$–$1.0$
-(transformer, source-null), $1.5$–$15$ (all-zero, every cell), unchanged or worse from 32 to 512
-steps. From the entry point $\alpha_0 = 10^{-3}$: $7 \times 10^{-4}$ at 64 steps and $4 \times
-10^{-6}$ at 256 (conv-LSTM), $1.3 \times 10^{-3}$ and $1.1 \times 10^{-5}$ (transformer, `entmax15`),
-$3 \times 10^{-4}$ and $1.5 \times 10^{-6}$ (transformer, softmax), $9 \times 10^{-7}$ either way
-(residual). The `pred_gap` and `lag_band` readouts behave the same way.
+$$
+f(x)\approx f(b)+\mathrm{entry\_jump}+\sum_i\mathrm{IG}_i.
+$$
 
-**What the entry jump says about the null arm.** On the attentive tiny models the divergence at
-the exact null is far from its value an infinitesimal source away — $7.1$ against $3.6$ nats on
-the transformer cell — so `kld_source_null` is evaluated at a point the encoders' normalisation
-makes discontinuous in the source. Whether a trained checkpoint sits as close to that
-discontinuity is the first thing a production run's `entry_jump_mean` answers (§10); on the
-residual cell the jump is of order $10^{-3}$ of the readout.
+The entry jump belongs to no individual input element in the attribution map. A large jump means that the chosen baseline lies in a region where the model changes sharply. It is information about the baseline comparison and model normalisation, rather than a source attribution that should be distributed over time.
 
-**Causality, the gate and purity are exact**, on every readout, both baselines and both streams,
-on all three cells — and on the conv-LSTM cell only with `causal_norm`, without which the tiny
-model leaks $0.26$–$0.30$ nats of attribution past the anchor. The batched-anchor call agrees with
-the one-at-a-time call to $8 \times 10^{-7}$.
+## 4. Checks to read before interpreting a map
 
-**The per-head split is complete.** On the transformer tiny model (`entmax15`) at anchor step 13
-the four heads' attributions of $K_t$ were $[0.017, 0.022, -0.188, -0.191]$, summing to the
-readout difference $-0.340$ exactly, with the target-state and prior parts zero under the
-source-null baseline. On the residual cell the per-lag split over both proposal channels sums to
-the readout difference to $10^{-3}$; over the mean channel alone it does not, because the
-divergence carries the scale update.
+The tests in [the attentive model's attribution suite](../tests/test_eval_attribution.py) and [the lag-residual model's suite](../../lag_slot_transformer_cfs/tests/test_eval_attribution.py) exercise four properties on small models. The evaluation also records diagnostics in the attribution block's `checks`.
 
-**The band ablation is `occlusion`'s intervention.** On the transformer tiny model the divergence
-fell by $1.08$, $0.04$ and $0.45$ nats when the source was zeroed on the anchor, near and far
-bands, and by $0.009$ on the `rest` group — the memory the conv stem carries from before the
-searched window — while zeroing the target streams changed nothing to $2 \times 10^{-6}$.
+### 4.1 No attribution after the anchor
 
-**End to end on the stub loader** (three segments, four anchors each, the four tiny bands): 108
-rows in the conv-LSTM cell, every structural check exactly zero, the target-only check exactly
-zero; and the same in the residual cell with every completeness residual below $5 \times 10^{-5}$.
+Input-gradient attribution to stored steps after the forecast anchor must be exactly zero. This checks that the attributed output does not use future input values.
 
-## 10. Production-run findings
+For the conv-LSTM, this requires `causal_norm: true`: ordinary group normalisation pools over time and can expose future information. The recorded tiny-model comparison without causal normalisation produced $0.26$–$0.30$ nats of attribution after the anchor. The transformer variants use step-wise causal computation.
 
-*To be filled from a real checkpoint. Nothing below is measured yet.*
+This is a gradient check. A separate value-level intervention that ablates only future positions should change the readout by no more than floating-point rerun noise. Do not confuse that future-only intervention with the broader `rest` ablation group described in section 5.
 
-For each cell and arm, after one run with the shipped cap, record from `results.attribution`:
+### 4.2 No attribution to unavailable source inputs
 
-* `checks.completeness_rel_median` and `_max`, `n_rows_over_tolerance` — whether 64 steps and the
-  entry fraction are enough on the trained weights, and whether the step count should move;
-* `attribution_null.csv`: `value_baseline_mean` against `value_input_mean` (how much of $K_t$ the
-  clock is, per class), `entry_jump_mean` (how close the trained null arm sits to the
-  normalisation's discontinuity), and the `all_zero` target/source split;
-* `attribution_summary.csv`: `lag_corr_mean` and `lag_js_mean` for `kld` and `pred_gap` — whether
-  the model's own lag readout points where its sensitivity is;
-* `attribution_lag_bands.csv`: the IG sum, the ablation delta and the occlusion delta per band,
-  and whether they agree in sign;
-* `attribution_bands.csv`: which frequency bands of the source carried `pred_gap`, against the
-  `spectral_skill` gap of the target bands;
-* `attribution_layer.csv`: which head (or lag) the source reached the latent through;
-* `cost`: the measured rate, and the cap it supports.
+A source coefficient excluded by the warm-up gate must have zero attribution. Multiplication by zero also makes its gradient zero.
 
-## 11. How this output will be misread
+For an aligned channel, the encoder reads stored step $t-d_c$ and masks it while $t<W'_c+d_c$. In original stored coordinates, that channel therefore becomes usable at $W'_c$. The helper `warm_from_step` computes this threshold for each declared channel. Dropped channels never become usable.
 
-* **An attribution is not a causal claim about the physiology.** It is the sensitivity of a
-  fitted computation along one straight path from one baseline, under one trained
-  parameterisation. A large source attribution says the model's readout responded to that
-  coefficient; it does not say the uterus caused the heart-rate change, and two models with the
-  same forecasts can attribute differently. The lag-residual cell's own qualification applies with
-  full force: a zero-sum reallocation of proposals leaves every prediction identical while moving
-  every per-lag attribution.
-* **The lag axis is stored-coefficient time.** $q_\ell$ is the attribution to the source
-  coefficient stored $\ell$ steps before the anchor, on a grid of one-sided filter outputs whose
-  composed group delay reaches the order of the lag search itself; it is not a physiological
-  delay. Every lag figure prints the caveat.
-* **The source-null attribution is relative to the availability clock, which it can never
-  contain.** The announcement is a constant of the step index and is on both ends of the path.
-  $K_t$ at the null is the clock's part, and it is reported beside the content, not inside it.
-* **The entry jump is not an attribution.** It is what the normalisation does between the exact
-  zero and a stream infinitesimally off it, and it belongs to no input. A large jump on a trained
-  model says the null arm is evaluated at a discontinuity, which is a statement about the control,
-  not about the source.
-* **The all-zero baseline's target attribution is not "what the target contributed to $K_t$".**
-  The divergence at an all-zero input is a property of the biases and the clock; the attribution
-  says how the readout moved as both streams were switched on together, and the split between
-  them depends on the path.
-* **The lag readout attributed under a band name is what the cell's own readout is.** An
-  attention mass in the attentive cells; a proposal norm — an update magnitude before the sum and
-  the limiter, neither a distribution nor an allocation — in the residual cell.
-* **The classes are out of distribution.** The checkpoints train on healthy recordings; every
-  class contrast in a by-class panel compares a fitted response on data the model never saw.
-* **Every summary is over recordings**, one segment per recording in the main draw and a few
-  anchors per segment. A class mean is a mean over a handful of recordings up to the cap; the
-  recording counts are on every table and figure, and nothing here is tested.
-* **A frequency-band sum over an input stream is over its declared channels**, dropped ones
-  included at exactly zero, and it is not the skill of that band: `spectral_skill` is, and is drawn
-  beside it for the target bands only.
-* **The maps are one anchor of one segment of one recording**, drawn for looking at. The
-  reductions are the evidence, and they are descriptive.
-* **Completeness is against the entry point**, and a row above the tolerance is a row whose
-  attribution does not sum to what it claims to decompose; the block counts them and the tables
-  carry the residual per row.
+### 4.3 No source attribution for target-only outputs
+
+The prior mean and the base block score must have exactly zero source attribution. The attentive model's prior clock is derived from a detached zero-source encoding; the lag-residual model's metadata clock is a function of position. Neither gives these target-only readouts a gradient path to observed source values.
+
+### 4.4 Attributions reproduce the integrated output change
+
+The sum of integrated gradients should reproduce $f(x)-f(x_0)$. The relative completeness residual scales the absolute discrepancy by the larger of $|f(x)-f(x_0)|$ and $|f(x)|$. This avoids dividing a small numerical error by an almost-zero output change.
+
+The summary records the median residual, maximum residual, and number of rows above `COMPLETENESS_TOLERANCE`, currently $10^{-2}$. Inspect these values before treating a map as an accurate decomposition.
+
+The conv-LSTM fixture tests allow a median below $10^{-2}$ and a maximum below $5\times10^{-2}$. The lag-residual fixture tests require a maximum below $10^{-3}$. These are test tolerances, not evidence that every trained checkpoint will achieve the same accuracy.
+
+Together, the checks establish whether the maps follow the model's causal input support and account for the specified output difference. They do not establish a physiological cause.
+
+## 5. How maps become profiles and summaries
+
+Each attributed row corresponds to an anchor, readout, and baseline, with a band or coordinate where relevant. The two target-stream maps are combined along the target-channel axis. The resulting arrays have shapes $(N,T,c_y)$ for target attribution and $(N,T,c_u)$ for source attribution, where $N$ is the number of attributed rows.
+
+Reductions are first calculated per row, then combined within each recording, then summarised across recordings. The main selection uses one segment per recording and several anchors from that segment.
+
+| Reduction | Calculation and interpretation |
+| --- | --- |
+| Time profile | Sum over channels to obtain a value at each stored step, with shape $(N,T)$. |
+| Channel profile | Sum over time to obtain a value for each input channel, with shape $(N,C)$. |
+| Lag-aligned source profile | Reindex the source time profile relative to the anchor: $q_\ell=p^u_{t_a-\ell}$. |
+| Unsigned channel profile | Sum absolute values over time, $\sum_t \lvert a_{t,c} \rvert$, so a channel whose contributions cancel over time still registers. |
+| Lag-by-channel maps | Reindex the full map by offset from the anchor, $(L, C)$, and accumulate the signed and unsigned means over attributed anchors for the main readouts under both baselines. |
+| Frequency-band sums | Sum input-channel attribution using the declared-channel band map. |
+| Lag-band sums | Sum the lag-aligned profile within each configured inclusive lag band, clipped to the available lag window. |
+| Layer split | Attribute through attention-head fusion modules or through lag-slot proposal outputs. |
+| Band ablation | Zero a group of source inputs and report the resulting change in the readout. |
+| Null decomposition | Report the exact baseline readout, entry jump, and integrated attribution separately. |
+
+### Lag alignment and agreement
+
+For $\ell=0,\ldots,L-1$, the lag profile reads the source attribution at $t_a-\ell$. Positions before the recording are `NaN`. The compensated seconds axis comes from `lag_axis.compensated_seconds_axis(L, delay_steps)`, using `source_delay_steps` for attentive models and zero for the lag-residual model.
+
+The profile is compared with the model's own lag readout at the same anchor: `source_kl_lag_map[t_a]` for attentive models, or proposal norms masked by `lag_valid` for the lag-residual model.
+
+Two statistics describe agreement on their shared valid lags. `lag_corr` is Pearson correlation between $|q_\ell|$ and the model profile. `lag_js` is their Jensen–Shannon distance after normalisation to distributions, using base $2$ and a range of $[0,1]$. Smaller distance means more similar distributions. Empty or unsuitable profiles can produce `NaN`; check counts and validity before comparing these values.
+
+### Frequency bands use the input-channel map
+
+Frequency-band sums join through `band_channel_map.csv`, keyed by `stream`, `channel`, and `band`. Attribution has the model's **declared input width**, so it must use the declared-channel map. Decoder-side skill analyses instead use the retained target-channel map.
+
+Dropped input channels remain on the declared axis with zero attribution because their gates exclude them. The lag-residual stage creates a missing map through `band_partition.emit_partition`, using the same shards and resolved budget. It records a skip if channel provenance is unavailable.
+
+### Ablation has its own sign convention
+
+Source-band ablation reports:
+
+$$
+\Delta_{\mathrm{ablation}}=f(x^{\setminus\mathrm{band}})-f(x).
+$$
+
+A positive value means the readout increased after the band was removed. This is the opposite subtraction order from an attribution describing the contribution of present input, so compare meanings before comparing signs. In particular, an increase in NLL is worse prediction, while an increase in `pred_gap` is a larger advantage for full over base.
+
+`FeatureAblation` removes each band across all source channels relative to that row's anchor. It also removes a `rest` group containing source positions outside the configured bands. That group may contain both future positions and earlier history before the lag window. Future positions should have no effect, but earlier history can matter when the source encoder's receptive field extends beyond the searched lags. A nonzero `ablation_rest` therefore does not by itself establish future leakage.
+
+### Read the null decomposition as a baseline comparison
+
+Under `source_null`, $f(b)$ is the model's exact zero-source divergence at the anchor. The IG sum describes the integrated source-content response, and the entry jump accounts for the excluded start of the path. Under `all_zero`, the IG sum is split across the target and source streams. Both decompositions depend on the chosen baseline and path.
+
+## 6. Output files and figures
+
+All files are written under `attribution/` in the evaluation results directory. NLL, predictive-gap, and divergence attributions use nats per anchor. Mean-coordinate readouts use latent-coordinate units. The attentive `lag_band` readout is an attention share in $[0,1]$; the lag-residual version is a norm in latent units. Signed attributions need not lie within the range of the readout itself.
+
+Every lag axis represents stored-coefficient time. It is not a physiological delay axis.
+
+### Tables and arrays
+
+| File | Contents |
+| --- | --- |
+| `attribution_rows.csv` | One row per attributed anchor, readout, baseline, and band where applicable. Includes identity, readout values, attribution totals, numerical checks, agreement, and intervention results. |
+| `attribution_vectors.npz` | Time, lag, channel, and layer profiles aligned row for row with `attribution_rows.csv`. |
+| `attribution_maps.npz` | One example anchor per class: the input streams the encoders read (`input_target`, `input_source`), the live steps, the model's lag readout, and every example readout's full maps under both baselines (`map_target`, `map_source`, keyed by `map_example`, `map_readout`, `map_baseline`, `map_band`), with the readout at the input and at the exact baseline. |
+| `attribution_examples.csv` | Manifest of the example pages: identity, class, subgroup, epoch, anchor and figure path. |
+| `attribution_lag_channel.npz` | The population lag-by-channel maps: for each main readout, baseline and stream, the mean over attributed anchors of the signed (`<readout>__<baseline>__<stream>__mean`) and unsigned (`__mean_abs`) attribution re-indexed by offset from the anchor, $(L, C)$, with the anchor count. |
+| `attribution_recordings.csv` | One row per recording: main readout totals and lag agreement under `source_null`, cohort labels, and `n_segments`. Used for grouped figures. |
+| `attribution_summary.csv` | One row per readout, baseline, and band: counts, recording-mean values, totals, and structural-check summaries. |
+| `attribution_bands.csv` | One row per readout, stream, and frequency band: `attribution_mean`, `n_recordings`, and target-band `spectral_skill_pred_gap_nats` where available. |
+| `attribution_lag_bands.csv` | One row per readout and lag band: bounds, IG sum, ablation change, recording count, and an occlusion comparison where available. |
+| `attribution_layer.csv` | One row per readout, layer unit, and class or `pooled`: recording count and mean attribution. |
+| `attribution_null.csv` | One row per readout, baseline, and class or `pooled`: recording means of input, baseline and entry values, entry jump, attributed sum, and stream totals. |
+| `attribution_traces.csv` | Manifest of traced recordings: identity, class, subgroup, segment and anchor counts, span, and array/figure paths. |
+| `traces/<class>/<guid>_<subgroup>_attribution_trace.npz` | Shared trace arrays for one recording, including `attribution_lag_map` and `model_lag_map`. |
+
+### Per-anchor column reference
+
+| Column group | Names |
+| --- | --- |
+| Recording and anchor | `guid`, `epoch`, `clinical_class`, `subgroup`, `anchor` (stored step), `column` (anchor-axis position). |
+| Attributed quantity | `readout`, `baseline`, `band`, `coordinate` ($-1$ when no coordinate applies), `kld_top_coordinate`. |
+| Readout values | `value_input`, `value_baseline`, `value_entry`, `entry_jump`. |
+| Attribution totals | `attributed` (IG sum), `target_total`, `source_total`, `target_abs_total`, `source_abs_total`. |
+| Numerical checks | `ig_delta`, `completeness_rel`, `after_anchor_max_abs`, `gated_off_max_abs`. |
+| Lag agreement | `lag_corr`, `lag_js`. |
+| Band and layer summaries | `lagband_<band>`, `band_<stream>_<band>`, `layer_total`, `layer_off_axis_total`. |
+| Ablation results | `ablation_<band>`, `ablation_rest`. |
+
+`attribution_vectors.npz` contains `time_profile_target` and `time_profile_source` with shape $(N,T)$; `lag_profile`, `target_lag_profile`, and `model_profile` with shape $(N,L)$; `channel_profile_target` with shape $(N,c_y)$; `channel_profile_source` with shape $(N,c_u)$; and `lag_seconds` with shape $(L,)$. `layer_per_unit` has shape $(N,M)$ for $M$ attention heads or $(N,L)$ for lag slots, with `NaN` rows where no split was taken.
+
+`attribution_maps.npz` identifies each example with `guid`, `subgroup`, `clinical_class`, and `anchor`. Its full `target` and `source` maps have shapes $(n,T,c_y)$ and $(n,T,c_u)$ for $n$ saved examples.
+
+In `attribution_recordings.csv`, the main metric columns follow `<readout>_source_total`, `<readout>_target_total`, `<readout>_lag_corr`, and `<readout>_lag_js`. The summary table includes `completeness_rel_max`, `completeness_rel_median`, `after_anchor_max_abs`, and `gated_off_max_abs` alongside counts and means.
+
+The lag-band table records `lag_lo`, `lag_hi`, `ig_attribution_mean`, `ablation_delta_mean`, `occlusion_delta_total_nats`, and `n_recordings`. The occlusion comparison is sign-flipped for `pred_gap` and absent for `kld`. These joined columns exist only when the corresponding analysis files are available.
+
+### Figures
+
+| Figure | How to read it |
+| --- | --- |
+| `attribution_maps.pdf` | One example anchor per class: the target and source input coefficients, the target attribution of $K_t$ under `all_zero`, the source attribution of $K_t$ under `source_null`, and a lag panel comparing the source attribution with the model's lag readout. |
+| `maps/<class>_<guid>_<subgroup>_anchor<step>_attribution_maps.pdf` | One page per class example: the inputs, then for every example readout — `kld`, `pred_gap`, `nll_full`, and `lag_band` per configured band — the target map (`all_zero`), the source map (`source_null`) and the lag-aligned comparison. |
+| `attribution_lag_profile.pdf` | Normalised absolute lag attribution versus the normalised model profile, averaged over recordings, pooled and by class, with titles reporting agreement; a last row overlays every readout — divergence, forecast gap and each lag-band readout — on one lag axis, and the band readouts against their own bands. |
+| `attribution_bands.pdf` | Frequency-band attribution by stream above, with target-band spectral skill on a second vertical axis where available. Lag-band IG sums, ablation changes, and occlusion comparisons appear below. Check the axes and sign conventions separately. |
+| `attribution_layer.pdf` | Per-head or per-lag attribution on the left; input profiles for the anchor's highest-divergence coordinate on the right. |
+| `attribution_null.pdf` | Input divergence, exact null response, integrated content attribution, and entry jump by class on the left; the `all_zero` target/source split on the right. |
+| `attribution_channels.pdf` | Per main readout, the signed and unsigned attribution per declared channel of each stream, coloured by frequency band where the channel map exists. |
+| `attribution_lag_channel.pdf` | Per main readout, the mean unsigned attribution by offset from the anchor and declared channel: the target stream under `all_zero`, the source stream under `source_null`. |
+| `attribution_time_profile.pdf` | Per main readout and stream, the mean positive and negative parts of the attribution by offset from the anchor, with the net and unsigned means. |
+| `attribution_checks.pdf` | The per-row completeness residuals against the tolerance, the entry jump against the readout at the input, and the two structural checks per readout. |
+| `attribution_time_to_delivery.pdf` | The source attribution total and the lag centroid of every attributed anchor against hours before delivery, by class. |
+| `traces/<class>/<guid>_<subgroup>_attribution_trace.pdf` | Attribution lag maps of the divergence and of the forecast gap through one recording beside the model lag map, with each readout's agreement, totals and values on the hours-before-delivery axis. |
+
+The [figure guide](FIGURE_GUIDE.md#attributionattribution_mapspdf) provides panel-by-panel interpretation. Every figure prints `ATTRIBUTION_CAVEAT`; lag figures also print the group-delay caveat and the model-specific lag qualification.
+
+### The summary block
+
+The block is `results.attribution` in the attentive evaluator's `summary.json` and `attribution` in the lag-residual evaluator's summary.
+
+It contains `n_samples` (segments), `composition`, `plan`, `selection`, `trace_selection`, `cost`, `checks`, `summary`, `lag_bands`, `joined`, `methods`, `lag_qualification`, `caveat`, `traces`, `failures`, and `files`. The `plan` records the cap, seed, anchors per segment, integration steps, entry fraction, baselines, readouts, lag bands, layer, and geometry. `joined` records which supporting files were found. Attentive evaluators also include `grouped_frames`.
+
+The lag-residual tests check that this block avoids names its acceptance gate reserves for unsupported attention distributions or per-lag KL allocations.
+
+## 7. Selection, settings, and cost
+
+### Main attribution selection
+
+The main pass uses a seeded selection balanced across clinical classes, subject to available recordings and the total cap. It selects one segment per recording: the middle segment in `epoch` order. A recording needs at least one segment to be eligible. Using one segment per recording prevents recordings with many segments from dominating the summaries.
+
+The pass attributes up to `ANCHORS_PER_SEGMENT` anchors spread across each selected segment's scored anchors. The current value is $4$.
+
+| Setting or constant | Current value and meaning |
+| --- | --- |
+| `eval_config.caps.attribution_segments` | Segment cap, currently $24$ in the committed overrides. Omitting it uses the analysis default, rather than every segment. |
+| `DEFAULT_SEGMENTS` | $24$: fallback for the main selection cap. |
+| `ANCHORS_PER_SEGMENT` | $4$: anchors spread over each segment's scored support. |
+| `IG_STEPS` | $64$: integration steps. |
+| `IG_INTERNAL_BATCH_SIZE` | $16$: internal batch size for interpolated inputs. |
+| `BASELINE_ENTRY_FRACTION` | $10^{-3}$: how far to move from the exact baseline before integration. |
+| `COMPLETENESS_TOLERANCE` | $10^{-2}$: relative residual threshold counted by the pass. |
+| `TRACE_RECORDINGS_PER_CLASS` | $1$: detailed attribution trace per clinical class. |
+
+The cap is an evaluation setting. The other names are implementation constants, not additional `eval_config` keys. Use the saved `plan` to identify the values used by a completed run.
+
+### Detailed trace selection
+
+The trace selection is separate from the main random draw. For each class, it chooses the recording whose stored segments most completely cover the relevant window. If `max_hours_before_delivery` is set, that window is the specified interval before delivery; otherwise it uses the recording's own span.
+
+`attribution_pass.recording_completeness` compares the number of stored segments inside the window with the number expected from the segment stride. Ties are broken by segment count and then recording identifier. A recording with fewer than two segments inside the window is ineligible. `trace_selection` records the selected recording's coverage.
+
+This rule favours fewer gaps; it does not select for strong uterine activity, large KL, or large predictive gain. The trace attributes `kld` under `source_null` at the selected anchors across the recording's segments.
+
+### How to estimate runtime
+
+With $k$ anchors per segment, the main work includes four IG calls for the two main readouts and two baselines, one IG call per lag band, one for the top coordinate, two layer attributions, and two grouped band ablations. Each IG call processes $k$ rows through the integration steps. Ablation requires the reference and the configured band interventions. The example anchors add, once per class, one single-row IG call per example readout and baseline — six for the three fixed readouts plus two per configured lag band — and the trace attributes two readouts rather than one at each of its anchors.
+
+The recorded CPU fixture benchmark used three conv-LSTM segments with four anchors each and produced $108$ rows in about $40$ seconds at $32$ integration steps, or about $0.37$ seconds per row. Doubling the step count roughly doubles that part of the work. This is a fixture benchmark; runtime on a trained checkpoint depends on model size, device, batching, and trace length.
+
+Use the completed pass's `cost` values: `elapsed_s`, `n_rows`, `n_forward_equivalents`, `seconds_per_row`, and `hours_per_1000_samples`. Choose a practical segment cap from those measured rates and inspect completeness before reducing the integration step count. The detailed traces add work beyond the main sampled segments.
+
+## 8. Implementation: one output per anchor
+
+`attributions.AnchorReadout` is an `nn.Module` wrapper around the real model. It accepts the three input streams, two extra tensors used for scoring, and two per-row integer tensors:
+
+- The extra tensors are the declared-width target features and decimated validity `weight`.
+- `columns` identifies each row's position on the decoded anchor axis.
+- `coordinates` identifies the latent coordinate for a coordinate-specific readout.
+
+The wrapper calls the model with `anchor_phase=0, anchor_stride=1`. The lag-residual call also sets `return_proposals=True`. It selects each row's anchor and returns a vector of shape $(B,)$, giving Captum one scalar per row.
+
+### Several anchors can share one call
+
+`expand_rows` repeats each segment for its chosen anchors. For $B$ segments and $k$ anchors, the expanded batch has $Bk$ rows. Captum expands the per-row anchor arguments along with its interpolated inputs. Tests compare this batched calculation with one-anchor-at-a-time attribution at an absolute tolerance of $10^{-5}$.
+
+### Targets and masks follow Captum's expanded batch
+
+Block-score readouts rebuild the target block and mask on every wrapper call using the extra tensors and each row's anchor. They use `_build_forecast_target`, the anchored `forecast_mask`, and the model's `coverage_floor`, matching collection scoring. A target block built only once outside the wrapper could become misaligned when Captum expands the batch.
+
+### Unused inputs return zero attribution
+
+Some readouts intentionally do not depend on an input, such as a target-only score's lack of dependence on source values. The wrapper connects every input and both posterior parameters to the computation graph with a zero coefficient. This makes the corresponding derivative exactly zero instead of causing autograd to reject an unused tensor.
+
+The same mechanism supports layer outputs that affect a parameter the chosen readout does not use, such as scale proposals for a mean-decoded gap.
+
+### The binding handles different time axes
+
+Attentive models expose dense tensors over stored time, with shape $(B,T,\ldots)$, so the wrapper gathers the anchor's stored step. The lag-residual model already indexes its tensors by decoded anchor, so the wrapper selects an anchor column. `CellBinding` identifies the layout; baselines, reductions, and figures remain shared.
+
+## 9. Captum methods and their limitations
+
+The following decisions come from experiments on the small models used by the test suites: the conv-LSTM `make_task` and stub batch, the transformer `tiny_warmup_kwargs`, and the lag-residual `build_tiny_model` and `tiny_streams`. These are implementation-specific findings, not general rankings of attribution methods.
+
+| Method | Status here | Reason |
+| --- | --- | --- |
+| `IntegratedGradients` | Primary method. | Integrating from the entry point gives much smaller completeness residuals on the recorded fixtures and supports the causal-support checks. |
+| `LayerIntegratedGradients` | Used. | Produces a per-head split through attentive fusion modules, or a per-lag split through the residual proposal head, under the source-null comparison. |
+| `FeatureAblation` | Used. | Removes source values in groups defined by lag band and anchor, then measures the readout change. |
+| `InputXGradient`, `Saliency` | Evaluated; not included. | Pass the structural support checks but use single-point gradients and do not provide the complete path decomposition used here. |
+| `GradientShap` | Evaluated; not included. | The sampled baseline/path calculation showed large per-sample residuals in these experiments and requires managing additional randomness. |
+| Sliding-window `Occlusion` | Evaluated; not included. | A window crossing the anchor assigns its group effect to future positions as well as past ones. Anchor-relative grouped ablation avoids that attribution layout. |
+| `DeepLift` | Unsuitable for these forwards as tested. | Its rescale hooks miss functional nonlinearities and other operations in these models; measured completeness residuals were large. |
+| `LayerConductance` | Evaluated; not included. | Tested layer sums did not reproduce the readout change where layer integrated gradients did. |
+| `NeuronConductance` | Evaluated; not included. | Coordinate readouts already expose the desired input attribution, and the tested selector does not handle the heads' tuple outputs. |
+
+The `methods` record saves each decision and its reason in the output block.
+
+### Where layer attribution is applied
+
+In attentive models, layer attribution uses the head-structured posterior's per-head fusion modules. Under `source_null`, the target state is fixed and the source-driven change passes through those modules, allowing a complete per-head split.
+
+In the lag-residual model, it uses the proposal head's output across both mean and scale proposal channels. This attributes through the subsequent sum and limiter. Including only mean proposals would omit the scale contribution to divergence.
+
+Other layer choices failed in the recorded tests. Attributing the posterior head's inputs encounters an unused raw prior log-variance with `posterior_logvar_mode: independent`. Attributing the lag-attention module encounters its discarded first output, including the unused `W_o` projection. The relevant layer outputs must remain connected to the readout's graph.
+
+The layer must also be called once per forward for this implementation. The residual model can normally call its proposal head repeatedly in chunks; attribution temporarily runs it unchunked and restores the original setting in a `finally` block.
+
+## 10. Recorded fixture findings
+
+These results were recorded on untrained tiny models and synthetic Gaussian-noise inputs. They describe numerical behaviour of the attribution machinery, not clinical effects or trained-model performance. The values below are retained from the existing design record; this documentation revision does not represent a new experiment.
+
+### 10.1 Behaviour close to the zero baseline
+
+The table follows the source-null path $b+\alpha(x-b)$ for the divergence readout at one anchor. The notation $f(\alpha)$ means the readout evaluated at that path position. Readout values are in nats; the last column is the directional derivative with respect to $\alpha$.
+
+| Model | $f(0)$ | $f(10^{-6})$ | $f(10^{-3})$ | $f(1)$ | Derivative at $0$ |
+| --- | --- | --- | --- | --- | --- |
+| conv-LSTM, `causal_norm` | $2.752$ | $2.915$ | $2.865$ | $2.380$ | $1.3\times10^{22}$ |
+| transformer, `entmax15` | $7.136$ | $4.539$ | $3.570$ | Not recorded. | $2.5\times10^{14}$ |
+| transformer, softmax | $5.702$ | $4.258$ | $3.773$ | Not recorded. | $5.1\times10^{13}$ |
+| lag-residual | $4.387$ | $4.387$ | $4.386$ | $5.036$ | $-0.96$ |
+
+The attentive source-null paths show sharp changes near zero. The lag-residual source-null path is smooth in this example, but its all-zero path has a large target-side derivative, about $-1.1\times10^{18}$, associated with the target encoder's `RMSNorm`.
+
+### 10.2 Integration accuracy
+
+Starting at the exact baseline produced relative completeness residuals of $0.23$–$0.43$ for the conv-LSTM source-null case, $0.9$–$1.0$ for transformer source-null cases, and $1.5$–$15$ for all-zero cases across the models. Increasing the step count from $32$ to $512$ did not consistently improve these results.
+
+Starting at $\alpha_0=10^{-3}$ gave the following recorded residuals:
+
+| Model | $64$ steps | $256$ steps |
+| --- | --- | --- |
+| conv-LSTM | $7\times10^{-4}$ | $4\times10^{-6}$ |
+| transformer, `entmax15` | $1.3\times10^{-3}$ | $1.1\times10^{-5}$ |
+| transformer, softmax | $3\times10^{-4}$ | $1.5\times10^{-6}$ |
+| lag-residual | About $9\times10^{-7}$ | About $9\times10^{-7}$ |
+
+The `pred_gap` and `lag_band` readouts showed the same qualitative improvement when the entry point moved away from exact zero. The recorded transformer `entmax15` residual at $64$ steps is slightly above $10^{-3}$, so the fixtures do not support a universal claim that every residual is below that value.
+
+On the attentive transformer example, the exact-null divergence was about $7.1$ nats and the entry-point value about $3.6$ nats. This large entry jump shows why it must be reported separately. The residual model's source-null jump was of order $10^{-3}$ of the readout. A trained model's own `entry_jump_mean` is needed to assess whether either pattern persists.
+
+### 10.3 Structural support and batching
+
+Causality, warm-up gating, and target-only purity were exact for the tested readouts and baselines on the causal model configurations. Removing `causal_norm` from the conv-LSTM produced the $0.26$–$0.30$ nats of future attribution noted earlier. Batched-anchor attribution agreed with one-at-a-time attribution to $8\times10^{-7}$.
+
+### 10.4 Layer and band results
+
+On the transformer `entmax15` fixture at anchor step $13$, the four heads contributed $[0.017,0.022,-0.188,-0.191]$ nats to the divergence change, summing to $-0.340$. Target-state and prior contributions were zero under `source_null`.
+
+On the residual fixture, the per-lag split across both proposal channels reproduced the readout difference to $10^{-3}$. The mean channel alone did not, because divergence also depends on the scale update.
+
+The transformer band-ablation example reduced divergence by $1.08$, $0.04$, and $0.45$ nats when zeroing the anchor, near, and far source bands, respectively. Removing `rest` reduced it by $0.009$ nats, consistent with earlier history retained by the convolution stem. The recorded target-stream ablation control changed the readout by no more than $2\times10^{-6}$.
+
+### 10.5 End-to-end stub run
+
+The stub loader supplied three segments, four anchors per segment, and four tiny lag bands. The conv-LSTM pass produced $108$ rows, with zero causality, gating, and target-only check values. The residual pass also satisfied those checks, with completeness residuals below $5\times10^{-5}$.
+
+These fixture results validate the small test setup. They do not replace checks on a real checkpoint.
+
+## 11. What to record from a production run
+
+**Production findings have not yet been filled into this design record.** The checklist below specifies what to collect after running a trained checkpoint; it is not a report of measured production results.
+
+Use `results.attribution` for attentive models or `attribution` for the lag-residual model, together with the saved tables.
+
+1. **Numerical accuracy:** Record `checks.completeness_rel_median`, `checks.completeness_rel_max`, and `n_rows_over_tolerance`, and look at `attribution_checks.pdf`, which draws every row's residual against the tolerance beside the entry jumps. Decide whether the integration step count and entry fraction are adequate for the trained weights.
+2. **Baseline behaviour:** In `attribution_null.csv`, compare `value_baseline_mean`, `value_input_mean`, and `entry_jump_mean` by class. Inspect the `all_zero` target/source split separately.
+3. **Lag agreement:** Read `lag_corr_mean` and `lag_js_mean` for `kld` and `pred_gap` in `attribution_summary.csv`. These compare input sensitivity with the model's own lag profile.
+4. **Band comparisons:** Compare IG sums, ablation changes, and available occlusion changes in `attribution_lag_bands.csv`, accounting for their sign conventions.
+5. **Frequency bands:** Inspect source-band attribution to `pred_gap` in `attribution_bands.csv`. Target-band `spectral_skill` is a related predictive measurement, not a substitute for attribution.
+6. **Layer contributions:** Inspect `attribution_layer.csv` to see the per-head or per-lag split and any opposing contributions.
+7. **Runtime and coverage:** Record measured `cost`, the selected recording counts, cap, and trace coverage before choosing a larger run.
+
+## 12. Interpretation limits
+
+- **Attribution describes a fitted computation.** A large value means that the selected output responded to an input along the chosen path. It does not establish that uterine activity caused a heart-rate change. Models with the same predictions can have different attributions.
+- **Lag positions are stored-coefficient time.** Each coefficient already combines raw history through a one-sided transform. Its group delay can be comparable to the lag search window, so a peak is not a physiological delay estimate.
+- **Source-null attribution is relative to the zero-source response.** The availability indicators are fixed along the path and receive no input attribution. Read the baseline value and entry jump beside the IG sum.
+- **The entry jump is separate from the map.** It accounts for the excluded part of the path and is assigned to no input step or channel.
+- **The all-zero split depends on the path.** It describes what happens when target and source streams change together from that reference. It is not a unique division of everything the target and source contribute to the model.
+- **Lag readouts differ by architecture.** Attentive models use attention mass; the lag-residual model uses proposal norms before summation and limiting. A proposal norm is neither a lag distribution nor a KL allocation. Zero-sum changes to proposals can preserve predictions while changing lag-wise attribution.
+- **Class comparisons depend on the training population.** For the documented healthy-pretraining setup, unseen clinical groups are out of distribution. Check the run's cohort provenance before generalising a class contrast.
+- **Summaries are descriptive and use recordings as their unit.** The main draw contains one segment per recording and only a few anchors per segment. Read recording counts and selection limits; no group hypothesis tests are performed by this attribution analysis.
+- **Frequency-band attribution is not frequency-band skill.** It sums over declared input channels, including dropped channels at zero. `spectral_skill` measures predictive performance on retained target channels.
+- **Example maps show individual anchors.** A striking map is one selected example. Use the recording-level summaries to understand whether its pattern is common in the evaluated selection.
+- **Completeness is relative to the entry point.** A row above tolerance does not accurately account for its claimed integrated output difference. Inspect the per-row residuals and summary counts before interpreting its attribution.

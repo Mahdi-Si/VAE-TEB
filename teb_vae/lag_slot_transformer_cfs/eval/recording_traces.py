@@ -78,29 +78,37 @@ PROPOSAL_QUALIFICATION = (
 
 #: The rows of every recording's figure, top to bottom.
 PANELS: Tuple[Any, ...] = (
-    traces.LinePanel(("kld_per_t",), "Divergence per anchor, K_t", "nats"),
-    traces.LinePanel(("pred_gap",), "Forecast gap per anchor, single draw", "nats"),
-    traces.HeatmapPanel("mu_post", "Full-branch mean over the latent coordinates", "coordinate",
+    traces.LinePanel(("kld_per_t",), "Divergence $K_t$ per anchor", "nats", labels=("$K_t$",),
+                     segment_mean=True),
+    traces.LinePanel(("pred_gap",), "Forecast gap per anchor, single draw", "nats",
+                     labels=("base $-$ full",), segment_mean=True),
+    traces.HeatmapPanel("mu_post", "Full-branch mean $\\mu^q$ over the latent coordinates", "coordinate",
                         symmetric=True),
-    traces.HeatmapPanel("update_mean", "Bounded mean update a_t", "coordinate", symmetric=True),
-    traces.HeatmapPanel("kld_per_dim", "Divergence per latent coordinate", "coordinate"),
-    traces.HeatmapPanel("proposal_lag_map", "Proposal norm over lags", "", lag_axis=True,
-                        argmax_column="proposal_argmax_lag"),
-    traces.LinePanel(("mu_prior_norm", "delta_mu_norm"), "Latent norms", "latent units"),
-    traces.LinePanel(("mean_logvar_prior", "mean_logvar_post"), "Mean log-variance", ""),
+    traces.HeatmapPanel("update_mean", "Bounded mean update $a_t$", "coordinate", symmetric=True),
+    traces.HeatmapPanel("kld_per_dim", "Divergence per latent coordinate, $K_{t,d}$", "coordinate"),
+    traces.HeatmapPanel("proposal_lag_map", "Proposal norm $\\| r_{t,\\ell}\\|_2$ over lags", "",
+                        lag_axis=True, argmax_column="proposal_argmax_lag"),
+    traces.LinePanel(("mu_prior_norm", "delta_mu_norm"), "Latent norms", "latent units",
+                     labels=("$\\|\\mu^p\\|_2$", "$\\|\\mu^q - \\mu^p\\|_2$")),
+    traces.LinePanel(("mean_logvar_prior", "mean_logvar_post"), "Mean log-variance over coordinates", "",
+                     labels=("prior", "posterior")),
     traces.LinePanel(("proposal_lag_centroid_s", "proposal_lag_median_s"),
-                     "Lag centre of the proposal norm", "s (stored-coefficient time)"),
-    traces.LinePanel(("cancellation_ratio_mean",), "Cancellation ratio of the mean update", ""),
+                     "Lag centre of the proposal norm", "s (stored-coefficient time)",
+                     labels=("centroid", "median")),
+    traces.LinePanel(("cancellation_ratio_mean",), "Cancellation ratio of the mean update", "",
+                     labels=("cancellation ratio",)),
 )
 
 #: The rows of the cross-recording summary figure.
 SUMMARY_METRICS: Tuple[traces.SummaryMetric, ...] = (
-    traces.SummaryMetric("kld_per_t", "nats per anchor"),
-    traces.SummaryMetric("pred_gap", "nats per anchor"),
-    traces.SummaryMetric("delta_mu_norm", "latent units"),
-    traces.SummaryMetric("n_active_dims", "coordinates"),
-    traces.SummaryMetric("proposal_lag_centroid_s", "s (stored-coefficient time)"),
-    traces.SummaryMetric("cancellation_ratio_mean", "ratio"),
+    traces.SummaryMetric("kld_per_t", "nats per anchor", "Divergence $K_t$"),
+    traces.SummaryMetric("pred_gap", "nats per anchor", "Single-draw forecast gap"),
+    traces.SummaryMetric("delta_mu_norm", "latent units",
+                         "Source shift of the latent mean, $\\|\\mu^q - \\mu^p\\|_2$"),
+    traces.SummaryMetric("n_active_dims", "coordinates", "Active latent coordinates"),
+    traces.SummaryMetric("proposal_lag_centroid_s", "s (stored-coefficient time)",
+                         "Lag centroid of the proposal norm"),
+    traces.SummaryMetric("cancellation_ratio_mean", "ratio", "Cancellation ratio of the mean update"),
 )
 
 
@@ -456,7 +464,9 @@ def run_recording_traces(
         directory / traces.MANIFEST_FILENAME, index=False
     )
     summary_figure = figures.render_figure(
-        traces.build_summary_figure(summary, metrics=SUMMARY_METRICS),
+        traces.build_summary_figure(
+            summary, metrics=SUMMARY_METRICS, window_hours=eval_config.get("max_hours_before_delivery"),
+        ),
         directory / traces.SUMMARY_FIGURE,
     )
     by_class = (

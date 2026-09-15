@@ -65,14 +65,22 @@ import numpy as np  # noqa: E402
 import torch  # noqa: E402
 from loguru import logger  # noqa: E402
 
+from teb_vae.lag_attn.config import load_config  # noqa: E402
 from teb_vae.lag_attn.eval.numerics import configure_numerics  # noqa: E402
 from teb_vae.lag_attn.eval.report import json_safe  # noqa: E402
+from teb_vae.lag_attn_cfs.eval.config_schema import (  # noqa: E402
+    force_single_process_loader,
+    merge_eval_overrides,
+    validate_eval_config,
+)
 from teb_vae.lag_attn_cfs.eval.launch import missing_required, resolve_launch_args  # noqa: E402
 from teb_vae.lag_attn_cfs.eval.metrics import batch_guids, model_inputs  # noqa: E402
 from teb_vae.lag_attn_cfs.eval.probe import (  # noqa: E402
+    DENSE_ANCHOR_GEOMETRY,
     load_task,
     read_checkpoint,
     resolve_device,
+    resolved_config_for,
 )
 from teb_vae.lag_attn_cfs.eval.run import dump_resolved_config, make_output_dir  # noqa: E402
 from teb_vae.lag_attn_rws.nets.raw_masks import forecast_mask  # noqa: E402
@@ -80,14 +88,34 @@ from teb_vae.lag_slot_transformer_cfs.eval.binding import (  # noqa: E402
     LAG_RESIDUAL_BINDING,
     MODEL_KIND,
 )
-from teb_vae.lag_slot_transformer_cfs.eval.run import (  # noqa: E402
-    DENSE_ANCHOR_GEOMETRY,
-    build_run_config,
-)
 from train.data_module import GraphDataModule  # noqa: E402
 
 #: The artifact this pass writes.
 PROBE_FILENAME = "latent_probes.json"
+
+
+def build_run_config(checkpoint: Any, overrides: Optional[Any] = None) -> Dict[str, Any]:
+    """Merge the evaluation delta over the checkpoint's own resolved configuration.
+
+    The same three steps the family's runner takes before it loads a model: the training run's
+    resolved config is the base, the delta is merged on top, and the result is validated and forced
+    single-process. The base is the resolved config rather than the shipped default so the probe
+    is fitted against what produced this checkpoint rather than against what a config file says
+    today.
+
+    Args:
+        checkpoint: The checkpoint being probed; its run's resolved config is found beside it.
+        overrides: An override delta path, or ``None`` for this package's committed one.
+
+    Returns:
+        The merged, validated configuration, with the loader forced single-process.
+    """
+    base = load_config(str(resolved_config_for(checkpoint)))
+    delta = LAG_RESIDUAL_BINDING.overrides_path if overrides is None else overrides
+    merged = merge_eval_overrides(base, delta)
+    merged["eval_config"] = validate_eval_config(merged)
+    force_single_process_loader(merged)
+    return merged
 
 #: Percentage of recordings the probe is FITTED on; the rest are what it is scored on.
 #:

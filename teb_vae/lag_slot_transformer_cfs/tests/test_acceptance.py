@@ -97,24 +97,23 @@ def fake_run(
         },
         "target_only": {"source_disabled": True},
     }[arm]
+    # The family's summary layout: this cell's blocks under ``results``, the training identity
+    # under the runner's ``run_context``, the evaluation seed under ``eval_config``.
     summary = {
-        "arm": {"source_disabled": False, **leaves},
-        "draws": {"num_mc_samples": draws},
-        "run": {"seed": eval_seed, "training_seed": training_seed, "checkpoint": f"{arm}.ckpt"},
-        "scored_split": {"label": label, "n_recordings": len(values)},
-        "calibration": {},
+        "checkpoint": f"{arm}.ckpt",
+        "eval_config": {"seed": eval_seed},
+        "run_context": {"training_seed": training_seed, "training_tag": f"{arm}_{training_seed}"},
+        "results": {
+            "arm": {"source_disabled": False, **leaves},
+            "num_mc_samples": draws,
+            "arms": {"scored_split": {"label": label, "n_recordings": len(values)}},
+            "mixture_calibration": {},
+        },
     }
     return {
-        "directory": f"/runs/{arm}-{training_seed}",
-        "summary": summary,
+        **acceptance.run_identity(f"/runs/{arm}-{training_seed}", summary),
         "table": {guid: dict(row) for guid, row in values.items()},
         "probes": None,
-        "arm": acceptance.arm_of(summary),
-        "training_seed": training_seed,
-        "training_tag": f"{arm}_{training_seed}",
-        "eval_seed": eval_seed,
-        "draws": draws,
-        "split": summary["scored_split"],
     }
 
 
@@ -224,7 +223,8 @@ def test_a_protocol_missing_a_setting_is_refused(tmp_path: Path) -> None:
 )
 def test_the_arm_is_resolved_from_the_leaves(leaves: Dict[str, Any], expected: str) -> None:
     """From what the model was constructed with, not from what a directory was called."""
-    assert acceptance.arm_of({"arm": {"source_disabled": False, **leaves}}) == expected
+    summary = {"results": {"arm": {"source_disabled": False, **leaves}}}
+    assert acceptance.arm_of(summary) == expected
 
 
 def test_an_unrecognised_combination_is_reported_rather_than_guessed() -> None:
@@ -467,9 +467,11 @@ def test_a_source_conditioned_run_is_refused_as_the_reference(tmp_path: Path) ->
     directory = tmp_path / "eval_results"
     directory.mkdir(parents=True)
     (directory / acceptance.SUMMARY_FILENAME).write_text(
-        json.dumps({"arm": {"source_disabled": False}}), encoding="utf-8"
+        json.dumps({"results": {"arm": {"source_disabled": False}}}), encoding="utf-8"
     )
-    (directory / acceptance.PER_RECORDING_FILENAME).write_text("guid\n", encoding="utf-8")
+    table = directory / acceptance.PER_RECORDING_TABLE
+    table.parent.mkdir(parents=True, exist_ok=True)
+    table.write_text("guid\n", encoding="utf-8")
 
     with pytest.raises(ValueError, match="target-only"):
         acceptance.read_reference(str(directory / acceptance.SUMMARY_FILENAME))
@@ -478,9 +480,10 @@ def test_a_source_conditioned_run_is_refused_as_the_reference(tmp_path: Path) ->
 def test_the_protocol_reads_the_filenames_the_passes_write() -> None:
     """The names are pinned here rather than imported, so that a rename in either pass shows up as
     a failure rather than as a protocol that quietly finds nothing."""
-    from teb_vae.lag_slot_transformer_cfs.eval import latent_probes, run as eval_run
+    from teb_vae.lag_slot_transformer_cfs.eval import latent_probes
+    from teb_vae.lag_slot_transformer_cfs.eval.analyses import arms
 
-    assert acceptance.PER_RECORDING_FILENAME == eval_run.PER_RECORDING_FILENAME
+    assert acceptance.PER_RECORDING_TABLE == arms.PER_RECORDING_TABLE
     assert acceptance.PROBE_FILENAME == latent_probes.PROBE_FILENAME
 
 

@@ -19,6 +19,12 @@ any attention-shaped column, the presence of the qualification the lag readouts 
 and the two summaries -- equal-recording and anchor-weighted -- that must both be reported. Those
 are properties of the pipeline and a run that violates one is broken.
 
+**Where the blocks are.** A summary is the family's: this cell's own blocks -- the scored arms,
+the lag readouts, the source controls, the arm record -- sit under its ``results`` key beside the
+family's readouts, verdicts and per-analysis blocks, and every check here reads them there. The
+family's own sanity block and verdict list travel in the same file and are read by the family's
+tools; this gate is the one that knows what a suppression margin is.
+
 The **predictive gap is reported and not gated**, and that is the whole point of shipping it this
 way. Where the boundary of an acceptable gap sits is what the first real runs are supposed to
 measure; a provisional threshold would decide a pass or a fail on exactly the run that was going to
@@ -79,6 +85,18 @@ REQUIRED_QUALIFICATION_PHRASES: Sequence[str] = (
 EXACT_MARGIN_TOLERANCE = 1e-9
 
 
+def blocks_of(summary: Mapping[str, Any]) -> Mapping[str, Any]:
+    """The results block of a summary: where this cell's own readouts live.
+
+    Args:
+        summary: The parsed summary.
+
+    Returns:
+        Its ``results`` mapping, or an empty one when the file carries none.
+    """
+    return summary.get("results") or {}
+
+
 def _verdict(name: str, status: str, detail: str, **numbers: Any) -> Dict[str, Any]:
     """Assemble one verdict record.
 
@@ -130,13 +148,14 @@ def check_reference_arms(summary: Mapping[str, Any]) -> Dict[str, Any]:
     Returns:
         The verdict.
     """
-    bands = (summary.get("lag_readouts") or {}).get("band_suppression") or {}
-    controls = summary.get("source_controls") or {}
-    headline = summary.get("headline") or {}
+    blocks = blocks_of(summary)
+    bands = (blocks.get("lag_readouts") or {}).get("band_suppression") or {}
+    controls = blocks.get("source_controls") or {}
+    scores = blocks.get("arm_scores") or {}
     empty = (bands.get("none") or {}).get("margin_nats")
     every = (bands.get("all") or {}).get("margin_nats")
     silence = controls.get("silence_margin_nats")
-    gap = (headline.get("pred_gap") or {}).get("point")
+    gap = (scores.get("pred_gap") or {}).get("point")
 
     if is_target_only(summary):
         return _verdict(
@@ -204,7 +223,7 @@ def is_target_only(summary: Mapping[str, Any]) -> bool:
     Returns:
         ``True`` for a target-only checkpoint.
     """
-    return bool((summary.get("arm") or {}).get("source_disabled", False))
+    return bool((blocks_of(summary).get("arm") or {}).get("source_disabled", False))
 
 
 def check_no_attention_shaped_column(summary: Mapping[str, Any]) -> Dict[str, Any]:
@@ -219,7 +238,7 @@ def check_no_attention_shaped_column(summary: Mapping[str, Any]) -> Dict[str, An
     keys = set(_walk_keys(summary))
     # The excluded-analysis block names them on purpose, as the reason each analysis was removed,
     # so it is exempted rather than making the gate unpassable on a correct run.
-    keys -= set((summary.get("excluded_analyses") or {}).keys())
+    keys -= set((blocks_of(summary).get("excluded_analyses") or {}).keys())
     offenders = sorted(keys & set(FORBIDDEN_KEYS))
     return _verdict(
         "no_attention_shaped_column",
@@ -246,7 +265,7 @@ def check_qualification_present(summary: Mapping[str, Any]) -> Dict[str, Any]:
     Returns:
         The verdict.
     """
-    text = str((summary.get("lag_readouts") or {}).get("qualification") or "")
+    text = str((blocks_of(summary).get("lag_readouts") or {}).get("qualification") or "")
     missing = [phrase for phrase in REQUIRED_QUALIFICATION_PHRASES if phrase not in text]
     return _verdict(
         "lag_qualification_present",
@@ -273,8 +292,9 @@ def check_both_summaries_reported(summary: Mapping[str, Any]) -> Dict[str, Any]:
     Returns:
         The verdict.
     """
-    equal_recording = "pred_gap" in (summary.get("headline") or {})
-    anchor_weighted = "pred_gap" in (summary.get("anchor_weighted") or {})
+    blocks = blocks_of(summary)
+    equal_recording = "pred_gap" in (blocks.get("arm_scores") or {})
+    anchor_weighted = "pred_gap" in (blocks.get("anchor_weighted") or {})
     both = equal_recording and anchor_weighted
     return _verdict(
         "both_summaries_reported",
@@ -300,7 +320,7 @@ def check_excluded_analyses_recorded(summary: Mapping[str, Any]) -> Dict[str, An
     Returns:
         The verdict.
     """
-    excluded = summary.get("excluded_analyses") or {}
+    excluded = blocks_of(summary).get("excluded_analyses") or {}
     unexplained = sorted(name for name, reason in excluded.items() if not str(reason).strip())
     status = "PASS" if excluded and not unexplained else "FAIL"
     return _verdict(
@@ -326,7 +346,8 @@ def report_predictive_gap(summary: Mapping[str, Any]) -> Dict[str, Any]:
     Returns:
         The verdict, always INCONCLUSIVE, with the measurement beside it.
     """
-    record = (summary.get("headline") or {}).get("pred_gap") or {}
+    scores = blocks_of(summary).get("arm_scores") or {}
+    record = scores.get("pred_gap") or {}
     point, lo, hi = record.get("point"), record.get("lo"), record.get("hi")
     if is_target_only(summary):
         return _verdict(
@@ -336,7 +357,7 @@ def report_predictive_gap(summary: Mapping[str, Any]) -> Dict[str, Any]:
             "not a measurement of anything. What this run contributes is its own predictive score, "
             "which is the number a source-conditioned candidate has to be read against.",
             pred_gap_nats=point,
-            target_only_nll=((summary.get("headline") or {}).get("nll_base") or {}).get("point"),
+            target_only_nll=(scores.get("nll_base") or {}).get("point"),
             n_recordings=record.get("n"),
         )
     return _verdict(
@@ -398,10 +419,10 @@ def check_against_reference(
             "model cannot serve as the baseline its own architecture is measured against.",
         )
 
-    headline = summary.get("headline") or {}
-    candidate_full = (headline.get("nll_full") or {}).get("point")
-    candidate_base = (headline.get("nll_base") or {}).get("point")
-    external = ((reference.get("headline") or {}).get("nll_base") or {}).get("point")
+    scores = blocks_of(summary).get("arm_scores") or {}
+    candidate_full = (scores.get("nll_full") or {}).get("point")
+    candidate_base = (scores.get("nll_base") or {}).get("point")
+    external = ((blocks_of(reference).get("arm_scores") or {}).get("nll_base") or {}).get("point")
     if candidate_full is None or external is None or candidate_base is None:
         return _verdict(
             "candidate_against_external_reference",

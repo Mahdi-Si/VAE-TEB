@@ -7,10 +7,15 @@
     ],
     "attribution": [
       "attribution_bands.pdf",
+      "attribution_channels.pdf",
+      "attribution_checks.pdf",
+      "attribution_lag_channel.pdf",
       "attribution_lag_profile.pdf",
       "attribution_layer.pdf",
       "attribution_maps.pdf",
-      "attribution_null.pdf"
+      "attribution_null.pdf",
+      "attribution_time_profile.pdf",
+      "attribution_time_to_delivery.pdf"
     ],
     "coupling": [
       "pred_gap_distribution.pdf",
@@ -125,6 +130,10 @@
     "attribution_traces": {
       "pattern": "attribution/traces/<class>/<guid>_<subgroup>_attribution_trace.pdf",
       "guide_marker": "The per-recording attribution traces"
+    },
+    "attribution_example_maps": {
+      "pattern": "attribution/maps/<class>_<guid>_<subgroup>_anchor<step>_attribution_maps.pdf",
+      "guide_marker": "The per-class example pages"
     }
   }
 }

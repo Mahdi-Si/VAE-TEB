@@ -95,34 +95,40 @@ CLOCK_COLUMNS: Tuple[str, ...] = ("time_from_labor_onset", cohort.SECOND_STAGE_C
 #: step against hours before delivery, so a column is the same anchor on every row; the joined
 #: forecast gap is the only row read off the collection pass rather than off the re-read forward.
 PANELS: Tuple[Any, ...] = (
-    traces.LinePanel(("kld_per_t",), "Divergence per anchor, K_t", "nats"),
+    traces.LinePanel(("kld_per_t",), "Divergence $K_t$ per anchor", "nats", labels=("$K_t$",),
+                     segment_mean=True),
     traces.LinePanel(
         ("mean_pred_gap", "mc_pred_gap"), "Forecast gap per anchor, joined from the collection pass",
-        "nats",
+        "nats", labels=("mean decode", "Monte Carlo"), segment_mean=True,
     ),
-    traces.HeatmapPanel("mu_post", "Posterior mean over the latent coordinates", "coordinate",
+    traces.HeatmapPanel("mu_post", "Posterior mean $\\mu^q$ over the latent coordinates", "coordinate",
                         symmetric=True),
-    traces.HeatmapPanel("mu_post", "Source shift of the mean, posterior minus prior", "coordinate",
+    traces.HeatmapPanel("mu_post", "Source shift of the mean, $\\mu^q - \\mu^p$", "coordinate",
                         symmetric=True, subtract="mu_prior"),
-    traces.HeatmapPanel("kld_per_dim", "Divergence per latent coordinate", "coordinate"),
+    traces.HeatmapPanel("kld_per_dim", "Divergence per latent coordinate, $K_{t,d}$", "coordinate"),
     traces.HeatmapPanel("kl_lag_map", "KL attribution over lags (log colour scale)", "",
                         log=True, lag_axis=True, argmax_column="argmax_lag"),
-    traces.LinePanel(("mu_prior_norm", "delta_mu_norm"), "Latent norms", "latent units"),
-    traces.LinePanel(("mean_logvar_prior", "mean_logvar_post"), "Mean log-variance", ""),
+    traces.LinePanel(("mu_prior_norm", "delta_mu_norm"), "Latent norms", "latent units",
+                     labels=("$\\|\\mu^p\\|_2$", "$\\|\\mu^q - \\mu^p\\|_2$")),
+    traces.LinePanel(("mean_logvar_prior", "mean_logvar_post"), "Mean log-variance over coordinates", "",
+                     labels=("prior", "posterior")),
     traces.LinePanel(("kl_lag_centroid_s", "kl_lag_median_s"), "Lag centre of the KL attribution",
-                     "s (stored-coefficient time)"),
-    traces.LinePanel(("kl_lag_entropy_nats", "attn_lag_entropy_nats"), "Lag entropy", "nats"),
+                     "s (stored-coefficient time)", labels=("centroid", "median")),
+    traces.LinePanel(("kl_lag_entropy_nats", "attn_lag_entropy_nats"), "Lag entropy", "nats",
+                     labels=("KL attribution", "attention")),
 )
 
 #: The rows of the cross-recording summary figure: one per-segment column each, one line per
-#: traced recording in its class colour.
+#: traced recording in its class colour under the class median.
 SUMMARY_METRICS: Tuple[traces.SummaryMetric, ...] = (
-    traces.SummaryMetric("kld_per_t", "nats per anchor"),
-    traces.SummaryMetric("mean_pred_gap", "nats per anchor"),
-    traces.SummaryMetric("delta_mu_norm", "latent units"),
-    traces.SummaryMetric("n_active_dims", "coordinates"),
-    traces.SummaryMetric("kl_lag_centroid_s", "s (stored-coefficient time)"),
-    traces.SummaryMetric("kl_lag_entropy_nats", "nats"),
+    traces.SummaryMetric("kld_per_t", "nats per anchor", "Divergence $K_t$"),
+    traces.SummaryMetric("mean_pred_gap", "nats per anchor", "Mean-decoded forecast gap"),
+    traces.SummaryMetric("delta_mu_norm", "latent units",
+                         "Source shift of the latent mean, $\\|\\mu^q - \\mu^p\\|_2$"),
+    traces.SummaryMetric("n_active_dims", "coordinates", "Active latent coordinates"),
+    traces.SummaryMetric("kl_lag_centroid_s", "s (stored-coefficient time)",
+                         "Lag centroid of the KL attribution"),
+    traces.SummaryMetric("kl_lag_entropy_nats", "nats", "Lag entropy of the KL attribution"),
 )
 
 
@@ -450,6 +456,9 @@ def run_recording_traces_analysis(
                 break_after_s=break_after_s,
             )
             recording.anchors = join_collected_anchors(recording.anchors, per_anchor)
+            # The joined scores reach the summary form too, averaged over each segment's scored
+            # anchors, so the summary figure can draw the forecast gap beside the divergence.
+            traces.add_segment_means(recording, JOINED_COLUMNS)
             stem = traces.recording_stem(guid, subgroup)
             class_dir = directory / traces.class_dirname(clinical_class)
             arrays = traces.write_recording_arrays(
@@ -493,7 +502,9 @@ def run_recording_traces_analysis(
         directory / traces.MANIFEST_FILENAME, index=False
     )
     summary_figure = figures.render_figure(
-        traces.build_summary_figure(summary, metrics=SUMMARY_METRICS),
+        traces.build_summary_figure(
+            summary, metrics=SUMMARY_METRICS, window_hours=eval_config.get("max_hours_before_delivery"),
+        ),
         directory / traces.SUMMARY_FIGURE,
     )
     agreement = kl_agreement(anchors)

@@ -128,7 +128,7 @@ DEFAULT_PAGES_PER_CLASS = 10
 #: correlated with the stratified draw's rather than independent of them -- and a reader
 #: comparing the two directories would be looking at the same segments twice without being
 #: told. Any fixed non-zero value does the job; this one is the run's own convention.
-_CLASS_DRAW_SEED_OFFSET = 5
+CLASS_DRAW_SEED_OFFSET = 5
 
 #: The metrics the extremes are taken on, as ``(directory stem, column)``. One per axis a page
 #: could be worth opening for: the coupling readout, the forecast score and the KL. A metric absent
@@ -396,9 +396,9 @@ def render_pages(
                     guid=str(row["guid"]),
                     # The subgroup beside the GUID, so a page lifted out of its directory still
                     # says which cohort the recording came from.
-                    cohort=_cohort_label(row),
+                    cohort=cohort_label(row),
                     beta=float(task.hparams.get("kld_beta", 1.0)),
-                    scalars=_page_scalars(row),
+                    scalars=page_scalars(row),
                     # Read off the batch rather than from `model_inputs`, which returns only what
                     # the net is fed: the raw source trace is never one of the model's inputs.
                     # `None` for a batch that does not carry it, which the page renders as an
@@ -416,7 +416,7 @@ def render_pages(
                     log_lag_attention=log_lag_attention,
                 )
                 page = figures.render_figure(figure, directory / name)
-                written.append({"variant": variant, "file": page.name, **_page_identity(row)})
+                written.append({"variant": variant, "file": page.name, **page_identity(row)})
             except Exception as error:  # noqa: BLE001 - one page is not worth the rest of them
                 logger.warning(
                     f"{ANALYSIS_DIRNAME}: {variant} page for dataset index {index} failed: "
@@ -428,7 +428,7 @@ def render_pages(
     return written, failures, n_input_rows
 
 
-def _page_scalars(row: Any) -> Dict[str, float]:
+def page_scalars(row: Any) -> Dict[str, float]:
     """Return the readouts the page's title carries, from the row rather than from a re-scoring."""
     names = (
         "nll_base_block", "nll_full_block", "pred_gap", "mc_pred_gap", "mean_pred_gap",
@@ -441,7 +441,7 @@ def _page_scalars(row: Any) -> Dict[str, float]:
     }
 
 
-def _cohort_label(row: Any) -> Optional[str]:
+def cohort_label(row: Any) -> Optional[str]:
     """The cohort a page's segment belongs to, for its title: the subgroup, which names the class.
 
     The subgroup stem (``healthy_bg_no_cs``, ``acidosis_cs``, ...) already carries the clinical
@@ -454,7 +454,7 @@ def _cohort_label(row: Any) -> Optional[str]:
     return None
 
 
-def _page_identity(row: Any) -> Dict[str, Any]:
+def page_identity(row: Any) -> Dict[str, Any]:
     """The identity columns the page manifest carries beside each file, so a directory listing
     can be filtered by cohort without opening a PDF."""
     return {
@@ -514,7 +514,7 @@ def per_class_rows(per_sample: pd.DataFrame, *, per_class: int, seed: int) -> pd
         per_sample: The per-sample table.
         per_class: How many rows to draw from each class, as an upper bound -- a class with
             fewer segments than that contributes all of them.
-        seed: The draw's seed. Offset from the run's by :data:`_CLASS_DRAW_SEED_OFFSET` by the
+        seed: The draw's seed. Offset from the run's by :data:`CLASS_DRAW_SEED_OFFSET` by the
             caller, so this draw and the stratified one are independent rather than two reads
             of one permutation stream.
 
@@ -684,7 +684,7 @@ def run_samples_analysis(
     # The balanced draw, beside the representative one rather than instead of it. Its own seed
     # offset, so the two are independent rather than two reads of one permutation stream.
     class_rows = per_class_rows(
-        per_sample, per_class=per_class, seed=seed + _CLASS_DRAW_SEED_OFFSET
+        per_sample, per_class=per_class, seed=seed + CLASS_DRAW_SEED_OFFSET
     )
     by_class = resolve_rows(class_rows, index_map)
     n_unlocatable += int(len(class_rows) - len(by_class))

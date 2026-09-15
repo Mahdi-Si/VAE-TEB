@@ -130,18 +130,11 @@ from teb_vae.lag_attn_cfs.eval.analyses import (  # noqa: E402
 from teb_vae.lag_attn_cfs.eval.analyses import events as events_analysis  # noqa: E402
 from teb_vae.lag_attn_cfs.eval.analyses import forecast as forecast_analysis  # noqa: E402
 from teb_vae.lag_attn_cfs.eval.analyses import lag_kl as lag_kl_analysis  # noqa: E402
-from teb_vae.lag_attn_cfs.eval.analyses import (  # noqa: E402
-    recording_traces as recording_traces_analysis,
-)
-from teb_vae.lag_attn_cfs.eval.analyses import attribution as attribution_analysis  # noqa: E402
-from teb_vae.lag_attn_cfs.eval.analyses import attribution as attribution_analysis  # noqa: E402
-from teb_vae.lag_attn_cfs.eval.analyses import attribution as attribution_analysis  # noqa: E402
 from teb_vae.lag_attn_cfs.eval.analyses import latent as latent_analysis  # noqa: E402
 from teb_vae.lag_attn_cfs.eval.analyses import (  # noqa: E402
     perm_control as perm_control_analysis,
 )
 from teb_vae.lag_attn_cfs.eval.analyses import residual as residual_analysis  # noqa: E402
-from teb_vae.lag_attn_cfs.eval.analyses import samples as samples_analysis  # noqa: E402
 from teb_vae.lag_attn_cfs.eval.analyses import second_stage as second_stage_analysis  # noqa: E402
 from teb_vae.lag_attn_cfs.eval.analyses import (  # noqa: E402
     sufficiency as sufficiency_analysis,
@@ -253,14 +246,12 @@ ANALYSIS_FUNCTIONS: Dict[str, Any] = {
     # training loop rather than a forward pass, so a run that fails earlier fails before paying
     # for it -- and everything it reports is a comparison against readouts the pass already has.
     "sufficiency": sufficiency_analysis.run_sufficiency_analysis,
-    "samples": samples_analysis.run_samples_analysis,
-    # Beside the pages, because it is the other analysis that re-reads segments through the
-    # loader: a class-balanced draw of recordings followed through every one of their segments.
-    "recording_traces": recording_traces_analysis.run_recording_traces_analysis,
-    # The third analysis that re-reads segments through the loader: gradient attributions of
-    # the divergence, the forecast gap and the lag readout over the input coefficients, at a
-    # few anchors of a class-balanced draw of segments, plus the same along a traced recording.
-    "attribution": attribution_analysis.run_attribution_analysis,
+    # ``samples``, ``recording_traces`` and ``attribution`` are deliberately NOT here. All three
+    # re-read segments through the loader and draw the model's own forward -- the page seams,
+    # the attention and the per-lag divergence map -- so they belong to the binding of the model
+    # whose forward they read (``binding.EXTRA_ANALYSES``), and a model without that forward
+    # registers its own three under the same names. The shared registry holds what reads the
+    # tables, which is what every binding can run.
     "cross_subgroup": cross_subgroup_analysis.run_cross_subgroup_analysis,
 }
 
@@ -268,7 +259,7 @@ ANALYSIS_FUNCTIONS: Dict[str, Any] = {
 #: its own onto. Deliberately not what ``--only`` and ``--skip`` accept: selection runs against the
 #: registry a *binding* merges (:func:`merged_analysis_functions`), and this cell's own four are
 #: registered on ``CFS_BINDING`` rather than above, so a run of this package selects from
-#: twenty-one names while this tuple holds sixteen.
+#: more names than this tuple holds.
 ANALYSES: Tuple[str, ...] = tuple(ANALYSIS_FUNCTIONS)
 
 
@@ -1088,15 +1079,25 @@ def describe_arm(record: Mapping[str, Any]) -> str:
     def _seconds(value: Any) -> str:
         return "-" if value is None else f"{float(value):.4f} s"
 
+    kv_source = built.get("lag_kv_source") or configured.get("lag_kv_source")
+    # A model with no lag attention has no K/V source to name, as configured or as built; the
+    # clause is left off rather than printed as a provenance note about a rebuild that never
+    # applied to it.
+    kv_clause = (
+        ""
+        if kv_source is None
+        else (
+            f"; lag_kv_source={kv_source!r}"
+            f"{'' if built.get('lag_kv_source') else ' (configured; no model was rebuilt)'}"
+        )
+    )
     return (
         "run arm: causal_align_reference="
         f"{configured.get('causal_align_reference')!r}, causal_align_reference_source="
         f"{configured.get('causal_align_reference_source')!r} -> target clock "
         f"{_seconds(resolved.get('target_reference_delay_s'))}, source clock "
         f"{_seconds(resolved.get('source_reference_delay_s'))}, inter-stream offset "
-        f"{_seconds(resolved.get('inter_stream_offset_s'))}; lag_kv_source="
-        f"{(built.get('lag_kv_source') or configured.get('lag_kv_source'))!r}"
-        f"{'' if built.get('lag_kv_source') else ' (configured; no model was rebuilt)'}"
+        f"{_seconds(resolved.get('inter_stream_offset_s'))}{kv_clause}"
     )
 
 
@@ -1192,12 +1193,20 @@ def build_run_context(
     # identical on the offline path -- which has no model to ask and is the path a re-run's
     # ``results`` must compare equal on.
     geometry = dict(collection.record.get("geometry") or {})
+    general = dict(config.get("general_config") or {})
     return {
         "n_parameters": (
             None if task is None
             else int(sum(parameter.numel() for parameter in task.orig_model.parameters()))
         ),
         "train_epoch": None if blob is None else blob.get("epoch"),
+        # The TRAINING seed and tag, off the checkpoint's own resolved configuration, which the
+        # merge keeps under the evaluation's delta. The evaluation's seed is in ``eval_config``,
+        # and the two answer different questions: several runs of one arm are several training
+        # seeds scored under one evaluation seed, and a protocol grouping runs by seed needs the
+        # first and must not confuse it with the second.
+        "training_seed": general.get("seed"),
+        "training_tag": general.get("tag"),
         # Which architecture produced the run. Copied out of the checkpoint's own stamp -- the
         # only place it is written -- because a run directory otherwise records it nowhere: the
         # dumped config carries every constructor keyword and not the class they build. A table
@@ -1438,6 +1447,7 @@ def main(
             max_batches=max_batches,
             delay_steps=delay_steps,
             report=report,
+            binding=binding,
         )
         if task is None:
             delay_steps = int((collection.results.get("lag") or {}).get("delay_steps") or 0)
@@ -1639,8 +1649,14 @@ def load_or_collect_tables(
     max_batches: Optional[int],
     delay_steps: int,
     report: Report,
+    binding: ModelBinding = CFS_BINDING,
 ) -> Tuple[collect.Collection, Optional[Dict[str, Any]], Optional[DataLoader]]:
-    """Reuse this directory's tables, or run the one shared pass that produces them.
+    """Reuse this directory's tables, or run the one pass that produces them.
+
+    The pass is the binding's own where it declares one and the shared
+    :func:`~teb_vae.lag_attn_cfs.eval.collect.collect_tables` otherwise; both return one
+    :class:`~teb_vae.lag_attn_cfs.eval.collect.Collection`, and everything from the tables on is
+    one implementation whichever pass wrote them.
 
     The **probe** runs only in the second case, and that is what makes an offline re-run cheap: it
     is a full iteration of the split, and a pass reusing tables has no reason to pay for one when
@@ -1666,6 +1682,7 @@ def load_or_collect_tables(
         max_batches: Batch cap for a smoke run.
         delay_steps: The causal input delay, for the lag report.
         report: The run's report, so the probe runs as an isolated step.
+        binding: The model being evaluated, for the collection pass it declares.
 
     Returns:
         ``(collection, probe_record, loader)``. The probe record is ``None`` only when neither
@@ -1744,9 +1761,13 @@ def load_or_collect_tables(
     # rather than the model, so the decoder pass -- four scored branches over H*C_keep
     # coefficients per anchor at K draws, plus the fifth KL-only arm -- happens exactly once per
     # run directory.
+    # The binding's own pass where the model needs one; the shared pass otherwise. Resolved here
+    # rather than inside ``collect`` so that module stays written against one forward.
+    collect_pass = binding.collect if binding.collect is not None else collect.collect_tables
+
     def _collect() -> collect.Collection:
         """Run the pass and record what the sample cap did, before the tables are written."""
-        collected = collect.collect_tables(
+        collected = collect_pass(
             task,
             loader,
             eval_config=eval_config,

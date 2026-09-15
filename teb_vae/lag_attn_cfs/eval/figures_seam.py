@@ -101,7 +101,16 @@ render_figure = figures.render_figure
 figure_filename = figures.figure_filename
 
 
-def caveat_note(figure, text: str = GROUP_DELAY_CAVEAT) -> None:
+#: Stamps a figure a builder laid out itself, so ``render_figure`` keeps that layout rather than
+#: re-running ``tight_layout`` over it.
+mark_laid_out = figures.mark_laid_out
+
+#: A legend placed in headroom made above (or below) the data, for a curve that spans the whole
+#: axis and leaves ``loc="best"`` no corner to find.
+legend_with_headroom = figures.legend_with_headroom
+
+
+def caveat_note(figure, text: str = GROUP_DELAY_CAVEAT) -> float:
     """Print a caveat under a figure, so a lag-resolved artifact carries it on its face.
 
     A figure is the artifact most likely to be lifted out of a run directory and shown on its own,
@@ -117,8 +126,12 @@ def caveat_note(figure, text: str = GROUP_DELAY_CAVEAT) -> None:
         figure: The figure to annotate.
         text: The sentence. Defaults to the group-delay caveat, which is the one every
             lag-resolved artifact in this package carries.
+
+    Returns:
+        The fraction of the figure height the footnote reserved, for a builder that lays its
+        own grid out above it.
     """
-    figures.footnote(figure, str(text))
+    return figures.footnote(figure, str(text))
 
 #: The generic panels. Each takes an axes and draws into it, so a figure builder composes them
 #: rather than each analysis owning a layout.
@@ -501,6 +514,8 @@ __all__ = [
     "WINDOWS_ROW_HEIGHT",
     "binned_violin_panel",
     "caveat_note",
+    "legend_with_headroom",
+    "mark_laid_out",
     "configure_figure_style",
     "figure_filename",
     "group_colors",

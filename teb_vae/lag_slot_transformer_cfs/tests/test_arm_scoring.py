@@ -91,9 +91,9 @@ def test_every_comparator_arm_fits_and_scores_end_to_end(arm: str, scored) -> No
     """
     summary = scored[arm]
 
-    assert summary["arm"]["source_disabled"] is False
-    assert summary["headline"]["pred_gap"]["point"] is not None
-    assert summary["n_recordings"] > 0
+    assert summary["results"]["arm"]["source_disabled"] is False
+    assert summary["results"]["arm_scores"]["pred_gap"]["point"] is not None
+    assert summary["results"]["n_recordings"] > 0
 
 
 @pytest.mark.parametrize("arm", sorted(SCORED_ARMS))
@@ -108,7 +108,7 @@ def test_every_summary_says_which_arm_produced_it(arm: str, scored) -> None:
         arm: The arm to read.
         scored: The fitted and scored arms.
     """
-    block = scored[arm]["arm"]
+    block = scored[arm]["results"]["arm"]
     expected_fusion = (
         "attention"
         if SCORED_ARMS[arm].get("model_config.VAE_model.lag_fusion") == "attention"
@@ -135,12 +135,12 @@ def test_the_attention_arms_record_what_their_band_margins_mean(scored) -> None:
     Args:
         scored: The fitted and scored arms.
     """
-    note = scored["pointwise_attention"]["arm"]["suppression_semantics"]
+    note = scored["pointwise_attention"]["results"]["arm"]["suppression_semantics"]
 
     assert "normalised distribution" in note
     assert "never against the other" in note
     # And the local arm says the opposite, so the distinction is legible from either file alone.
-    assert scored["capacity_control"]["arm"]["suppression_semantics"].startswith(
+    assert scored["capacity_control"]["results"]["arm"]["suppression_semantics"].startswith(
         "a band's proposals are removed from the explicit sum"
     )
 
@@ -190,7 +190,7 @@ def test_the_capacity_control_skips_the_controls_that_are_not_interventions_on_i
     Args:
         scored: The fitted and scored arms.
     """
-    controls = scored["capacity_control"]["source_controls"]
+    controls = scored["capacity_control"]["results"]["source_controls"]
 
     assert {"replace", "permute"} <= set(controls["skipped"])
     for arm in ("replace", "permute"):
@@ -203,7 +203,7 @@ def test_the_capacity_control_skips_the_controls_that_are_not_interventions_on_i
         assert controls[margin] is None, margin
     # The silence arm still runs and is still the equality invariant, on this arm as on every other.
     assert controls["silence_margin_nats"] is not None
-    assert scored["capacity_control"]["lag_readouts"]["band_suppression"] != {}
+    assert scored["capacity_control"]["results"]["lag_readouts"]["band_suppression"] != {}
 
 
 def test_the_convolution_arm_discloses_a_reach_the_pointwise_one_does_not(scored) -> None:
@@ -216,8 +216,8 @@ def test_the_convolution_arm_discloses_a_reach_the_pointwise_one_does_not(scored
     Args:
         scored: The fitted and scored arms.
     """
-    conv = scored["attention_reference"]["encoder_disclosure"]
-    pointwise = scored["pointwise_attention"]["encoder_disclosure"]
+    conv = scored["attention_reference"]["causality"]
+    pointwise = scored["pointwise_attention"]["causality"]
 
     assert conv["source_stem"] == "conv"
     assert pointwise["source_receptive_field_steps"] == 1
@@ -237,7 +237,7 @@ def test_both_fusions_report_the_same_exposure_axes(scored) -> None:
     """
     shapes = {
         arm: {
-            key: len(scored[arm]["lag_readouts"]["exposure"][key])
+            key: len(scored[arm]["results"]["lag_readouts"]["exposure"][key])
             for key in ("per_lag_anchors", "per_lag_channels", "per_source_channel")
         }
         for arm in SCORED_ARMS

@@ -585,7 +585,11 @@ def cohort_weight_profile(seq_len: int) -> np.ndarray:
 
 
 def write_causal_cohort_shards(
-    directory: str, *, seq_len: int, leg_alignment: str = LEG_ALIGNMENT_MODES[0]
+    directory: str,
+    *,
+    seq_len: int,
+    leg_alignment: str = LEG_ALIGNMENT_MODES[0],
+    phase_operator: str = PHASE_OPERATOR_LEGACY,
 ) -> List[str]:
     """Write one causal shard per canonical subgroup, from the real bank over real segments.
 
@@ -608,6 +612,10 @@ def write_causal_cohort_shards(
         seq_len: On-disk (untrimmed) feature-grid length.
         leg_alignment: The phase-harmonic leg alignment every written shard is built at and
             records; the eight files must agree, or the loader refuses the mixed list.
+        phase_operator: The phase-harmonic operator version every written shard is built under
+            and records. The legacy operator by default, which is what the lag-attentive cells'
+            suites read; the integer operator is what the lag-residual cell's first experiment is
+            defined on, and its cohort fixture is written under it.
 
     Returns:
         The written shard paths, in :data:`COHORT_SUBGROUPS` order.
@@ -623,7 +631,8 @@ def write_causal_cohort_shards(
             f"average of identical rows."
         )
     transformed = causal_transform(
-        read_causal_source(available, seq_len * DECIMATION), seq_len, leg_alignment
+        read_causal_source(available, seq_len * DECIMATION), seq_len, leg_alignment,
+        phase_operator,
     )
     blocks, raw = transformed["blocks"], transformed["raw"]
     pipeline = transformed["pipeline"]
@@ -1222,10 +1231,11 @@ RUN_ARGS: Dict[str, Any] = {
     # 'envelope', which is what the committed binaries carry and what the shipped model configs
     # expect. Ignored by 'two_sided', which has no causal phase block at all.
     "leg_alignment": None,
-    # Phase-harmonic operator version for the 'causal' variant only: 'ratio_power_v0' (the legacy
-    # operator every shard on disk shares; the committed tiny_shard_causal.hdf5) or
-    # 'integer_harmonic_v1'. The 'causal_int' variant ignores this and always writes the integer
-    # operator into its own file, tiny_shard_causal_int.hdf5. None -> 'ratio_power_v0'.
+    # Phase-harmonic operator version for the 'causal' and 'causal_cohort' variants:
+    # 'ratio_power_v0' (the legacy operator every shard on disk shares; the committed
+    # tiny_shard_causal.hdf5) or 'integer_harmonic_v1'. The 'causal_int' variant ignores this and
+    # always writes the integer operator into its own file, tiny_shard_causal_int.hdf5. None ->
+    # 'ratio_power_v0'.
     "phase_operator": None,
     # Re-measure an already-written planted shard's coupling instead of writing anything, given its
     # path. This is the self-check run on its own, for a fixture already on disk.
@@ -1304,9 +1314,9 @@ def build_parser() -> argparse.ArgumentParser:
         dest="phase_operator",
         choices=PHASE_OPERATORS,
         help=(
-            "Phase-harmonic operator version for the 'causal' variant; 'ratio_power_v0' by "
-            "default, which is what the committed binary carries. The 'causal_int' variant always "
-            "writes 'integer_harmonic_v1'."
+            "Phase-harmonic operator version for the 'causal' and 'causal_cohort' variants; "
+            "'ratio_power_v0' by default, which is what the committed binary carries. The "
+            "'causal_int' variant always writes 'integer_harmonic_v1'."
         ),
     )
     parser.add_argument(
@@ -1340,7 +1350,8 @@ def main(
         seq_len: On-disk feature length before trimming.
         seed: Seed for the two-sided shard's synthesised values.
         leg_alignment: Phase-harmonic leg alignment for the causal variants.
-        phase_operator: Phase-harmonic operator version for the ``'causal'`` variant.
+        phase_operator: Phase-harmonic operator version for the ``'causal'`` and
+            ``'causal_cohort'`` variants.
         check_planted: An existing planted shard to re-measure instead of writing anything.
 
     Returns:
@@ -1403,7 +1414,8 @@ def main(
             )
         else:
             shards = write_causal_cohort_shards(
-                out_dir, seq_len=seq_len, leg_alignment=leg_alignment
+                out_dir, seq_len=seq_len, leg_alignment=leg_alignment,
+                phase_operator=phase_operator,
             )
         for path in shards:
             print(f"wrote {path}")

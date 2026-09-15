@@ -439,8 +439,25 @@ def test_the_analysis_attributes_a_balanced_draw_end_to_end(tmp_path, monkeypatc
     directory = tmp_path / core.ANALYSIS_DIRNAME
     for name in result["files"]:
         assert (directory / name).is_file(), name
-    for stem in (core.MAP_FIGURE, core.LAG_PROFILE_FIGURE, core.BAND_FIGURE, core.LAYER_FIGURE, core.NULL_FIGURE):
+    for stem in (core.MAP_FIGURE, core.LAG_PROFILE_FIGURE, core.BAND_FIGURE, core.LAYER_FIGURE, core.NULL_FIGURE,
+                 core.CHANNEL_FIGURE, core.LAG_CHANNEL_FIGURE, core.TIME_PROFILE_FIGURE, core.CHECKS_FIGURE,
+                 core.DELIVERY_FIGURE):
         assert (directory / f"{stem}.pdf").is_file()
+    # The population lag-by-channel maps: one per main readout, baseline and stream, on the lag
+    # axis and the declared channel axis, and the unsigned mean is never below the signed one.
+    with np.load(directory / core.LAG_CHANNEL_FILENAME) as handle:
+        model = module.orig_model
+        n_lags = int(model.lag_attn.L)
+        for readout in core.MAIN_READOUTS:
+            for baseline in core.BASELINES:
+                source = handle[f"{readout}__{baseline}__source__mean_abs"]
+                target = handle[f"{readout}__{baseline}__target__mean_abs"]
+                assert source.shape == (n_lags, int(model.c_u)) and target.shape == (n_lags, int(model.c_y))
+                signed = handle[f"{readout}__{baseline}__source__mean"]
+                finite = np.isfinite(source) & np.isfinite(signed)
+                assert np.all(source[finite] + 1e-6 >= np.abs(signed[finite]))
+        # Under the source-null baseline the target inputs never move.
+        assert np.nanmax(handle[f"{core.READOUT_KLD}__{core.BASELINE_SOURCE_NULL}__target__mean_abs"]) == 0.0
     rows = pd.read_csv(directory / core.ROWS_FILENAME)
     assert set(rows["readout"]) == {core.READOUT_KLD, core.READOUT_PRED_GAP, core.READOUT_LAG_BAND, core.READOUT_KLD_DIM}
     assert set(rows[rows["readout"] == core.READOUT_LAG_BAND]["band"]) == set(TINY_BANDS)
@@ -456,6 +473,33 @@ def test_the_analysis_attributes_a_balanced_draw_end_to_end(tmp_path, monkeypatc
         assert (directory / row["figure_file"]).is_file() and (directory / row["arrays_file"]).is_file()
         assert row[labels.SUBGROUP_COLUMN] in row["figure_file"]
         assert row["figure_file"].startswith(f"{core.TRACE_DIRNAME}/{row[labels.CLASS_COLUMN]}/")
+        # Both trace readouts land on the trace under their own prefix, beside one model lag map.
+        with np.load(directory / row["arrays_file"]) as handle:
+            for readout in core.TRACE_READOUTS:
+                assert f"{readout}_attribution_lag_map" in handle.files
+            assert "model_lag_map" in handle.files
+    # One example anchor per class, every example readout and lag band under both baselines, with
+    # the inputs the encoders read kept beside the maps.
+    examples = pd.read_csv(directory / attribution_pass.EXAMPLE_MANIFEST_FILENAME)
+    assert list(examples.columns) == list(attribution_pass.EXAMPLE_MANIFEST_COLUMNS)
+    assert sorted(examples[labels.CLASS_COLUMN]) == ["acidosis", "healthy", "hie"]
+    for _, row in examples.iterrows():
+        assert (directory / row["figure_file"]).is_file()
+        assert row["figure_file"].startswith(f"{core.EXAMPLE_DIRNAME}/{row[labels.CLASS_COLUMN]}_")
+        assert row[labels.SUBGROUP_COLUMN] in row["figure_file"]
+    assert len(result["examples"]) == 3
+    with np.load(directory / core.MAPS_FILENAME, allow_pickle=True) as handle:
+        model = module.orig_model
+        assert handle["input_target"].shape == (3, int(model.sequence_length), int(model.c_y))
+        assert handle["input_source"].shape == (3, int(model.sequence_length), int(model.c_u))
+        readouts = set(zip(handle["map_readout"].tolist(), handle["map_baseline"].tolist(), handle["map_band"].tolist()))
+        expected = {(readout, baseline, "") for readout in core.EXAMPLE_READOUTS for baseline in core.BASELINES}
+        expected |= {(core.READOUT_LAG_BAND, baseline, name) for name in TINY_BANDS for baseline in core.BASELINES}
+        assert readouts == expected
+        assert handle["map_target"].shape[0] == 3 * len(expected)
+        # Under the source-null baseline the target inputs never move, so the target map is zero.
+        null = np.asarray(handle["map_baseline"]) == core.BASELINE_SOURCE_NULL
+        assert np.abs(handle["map_target"][null]).max() == 0.0
     grouped = result["grouped_frames"][0]
     assert (tmp_path / grouped["path"]).is_file()
     assert plt.get_fignums() == []

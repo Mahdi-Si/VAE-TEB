@@ -67,6 +67,7 @@ import torch
 from captum.attr import FeatureAblation, IntegratedGradients, LayerIntegratedGradients
 from torch import nn
 
+from teb_vae.lag_attn.nets.lag_report import SECONDS_PER_STEP
 from teb_vae.lag_attn_cfs.eval import cohort, lag_hist, traces
 from teb_vae.lag_attn_cfs.eval import figures_seam as figures
 from teb_vae.lag_attn_cfs.eval._reuse import band_partition, labels
@@ -94,6 +95,15 @@ LAG_PROFILE_FIGURE = "attribution_lag_profile"
 BAND_FIGURE = "attribution_bands"
 LAYER_FIGURE = "attribution_layer"
 NULL_FIGURE = "attribution_null"
+CHANNEL_FIGURE = "attribution_channels"
+LAG_CHANNEL_FIGURE = "attribution_lag_channel"
+TIME_PROFILE_FIGURE = "attribution_time_profile"
+CHECKS_FIGURE = "attribution_checks"
+DELIVERY_FIGURE = "attribution_time_to_delivery"
+
+#: The population lag-by-channel maps, mean over attributed anchors of the signed and unsigned
+#: attribution re-indexed by offset from the anchor, per main readout, baseline and stream.
+LAG_CHANNEL_FILENAME = "attribution_lag_channel.npz"
 
 #: ``eval_config.caps`` name bounding how many **segments** are attributed. Absent means
 #: :data:`DEFAULT_SEGMENTS` rather than every segment: an attribution is tens of forwards and
@@ -110,6 +120,23 @@ ANCHORS_PER_SEGMENT = 4
 #: recording over the window the run reads its clocks over -- the fewest missing segments -- so
 #: the figure shows an evolution rather than the holes in it.
 TRACE_RECORDINGS_PER_CLASS = 1
+
+#: The readouts the per-recording trace attributes at its anchors: the latent change and the
+#: forecast gain, so a recording's trace shows where the source moved the belief and where it
+#: helped the forecast, on the same anchors.
+TRACE_READOUTS: Tuple[str, ...] = ("kld", "pred_gap")
+
+#: The readouts attributed at one **example** anchor per class, with their full maps kept for the
+#: example pages: the divergence, the forecast gap and the full-branch block score -- the latent
+#: change, the gain, and the output score itself -- beside the lag readout on every configured
+#: band, which the pass adds. Attributed under both baselines at that one anchor, so the target
+#: map (which only the all-zero path moves) and the source map (the source-null comparison) are
+#: both on the page.
+EXAMPLE_READOUTS: Tuple[str, ...] = ("kld", "pred_gap", "nll_full")
+
+#: Where the example pages go, under the analysis directory, and the tail of their names.
+EXAMPLE_DIRNAME = "maps"
+EXAMPLE_SUFFIX = "_attribution_maps"
 
 #: Integrated-gradient steps and Captum's internal batch of interpolated inputs. The step count is
 #: the one at which the completeness residual fell below $10^{-3}$ of the readout on every fixture
@@ -1071,6 +1098,26 @@ def channel_groups_from_map(channel_map: Optional[pd.DataFrame]) -> Dict[str, Di
 # =============================================================================
 # Figures
 # =============================================================================
+# =============================================================================
+# The figures
+# =============================================================================
+#: What each readout is called on a figure.
+READOUT_TITLES: Mapping[str, str] = {
+    READOUT_KLD: "divergence $K_t$",
+    READOUT_PRED_GAP: "forecast gap (base $-$ full)",
+    READOUT_NLL_FULL: "full-branch block score",
+    READOUT_NLL_BASE: "base-branch block score",
+    READOUT_KLD_DIM: "top divergence coordinate $K_{t,d}$",
+    READOUT_LAG_BAND: "lag readout on a band",
+}
+
+#: Colours of the readouts when several are overlaid on one lag axis: the two main readouts in
+#: the shared blue and vermilion, the lag-band readouts in the band colours the rest of the
+#: family uses, in declaration order.
+READOUT_COLOURS: Mapping[str, str] = {READOUT_KLD: figures.COLOR_BLUE, READOUT_PRED_GAP: figures.COLOR_VERMILLION}
+BAND_COLOURS: Tuple[str, ...] = (figures.COLOR_ORANGE, figures.COLOR_GREEN, figures.COLOR_PURPLE, "#56B4E9", "#999999")
+
+
 def _empty(ax: Any, title: str = "") -> None:
     """Mark an axes as holding nothing."""
     ax.text(
@@ -1089,19 +1136,90 @@ def _draw_warm_boundary(ax: Any, live: Optional[np.ndarray]) -> None:
     ax.step(live - 0.5, channels, where="mid", color=figures.COLOR_BLACK, linewidth=figures.LINE_THIN)
 
 
+def _stream_map(
+    figure: Any, ax: Any, field: Optional[np.ndarray], *, title: str, anchor: int,
+    live: Optional[np.ndarray], n_scattering: Optional[int] = None, colorbar_label: str = "",
+) -> None:
+    """One (channel x stored step) map: symmetric colour scale, the anchor ruled, warm-up drawn.
+
+    Args:
+        figure: The figure, for the colourbar.
+        ax: The axes.
+        field: $(T, C)$, or ``None`` for an absent map.
+        title: The panel title.
+        anchor: The anchor's stored step, ruled in vermilion.
+        live: Each channel's first live step, drawn as a staircase, or ``None``.
+        n_scattering: For a target map, the width of the scattering block, so the boundary to the
+            phase-harmonic block is ruled.
+        colorbar_label: The colourbar label.
+    """
+    if field is None:
+        _empty(ax, title)
+        return
+    figures.heatmap_with_colorbar(
+        figure, ax, np.asarray(field, dtype=np.float64).T, symmetric=True, interpolation="none",
+        title=title, xlabel="stored step", ylabel="declared channel", colorbar_label=colorbar_label,
+        separator_row=(int(n_scattering) - 1) if n_scattering else None,
+    )
+    ax.axvline(float(anchor), color=figures.COLOR_VERMILLION, linewidth=figures.LINE_REGULAR)
+    _draw_warm_boundary(ax, live)
+
+
+def _lag_view(
+    ax: Any, profile: np.ndarray, model_profile: np.ndarray, *, lag_seconds: np.ndarray,
+    cell: CellBinding, title: str,
+) -> None:
+    """Normalised $|q_\\ell|$ beside the normalised model lag readout, on one share axis.
+
+    One axis rather than a twin: both are shares per lag once normalised, and two scales on one
+    panel is the one layout a reader cannot check by eye.
+    """
+    profile = np.asarray(profile, dtype=np.float64)
+    if not np.isfinite(profile).any():
+        _empty(ax, title)
+        return
+    share = lag_hist.normalise(np.abs(profile))[0]
+    model_share = lag_hist.normalise(np.asarray(model_profile, dtype=np.float64))[0]
+    ax.plot(lag_seconds, share, color=figures.COLOR_BLUE, linewidth=figures.LINE_REGULAR, label="|attribution|")
+    if np.isfinite(model_share).any():
+        ax.plot(lag_seconds, model_share, color=figures.COLOR_ORANGE, linewidth=figures.LINE_THIN,
+                label="model lag readout")
+    fit = agreement(profile[None, :], np.asarray(model_profile, dtype=np.float64)[None, :])
+    ax.set_title(f"{title}; corr {fit['lag_corr'][0]:.2f}, JS {fit['lag_js'][0]:.2f}")
+    ax.set_xlabel(COEFFICIENT_LAG_AXIS_LABEL)
+    ax.set_ylabel("share per lag")
+    figures.legend_with_headroom(ax, ncol=2, headroom=0.25)
+    figures.style_axes(ax)
+
+
+def _example_title(item: Mapping[str, Any]) -> str:
+    """The identity line of one example anchor: who, where in the cohort, and when."""
+    hours = -(float(item["epoch"]) + float(item["anchor"]) * SECONDS_PER_STEP) / cohort.SECONDS_PER_HOUR
+    return (
+        f"guid {item['guid']} — subgroup {item[labels.SUBGROUP_COLUMN]} — class {item[labels.CLASS_COLUMN]} "
+        f"— anchor step {int(item['anchor'])}, {hours:.2f} h before delivery"
+    )
+
+
 def build_map_figure(
-    maps: Sequence[Dict[str, Any]],
+    examples: Sequence[Mapping[str, Any]],
     *,
     lag_seconds: np.ndarray,
     cell: CellBinding,
     caveat: str,
 ) -> Any:
-    r"""One row per example: both streams' attribution maps at an anchor, and the lag view beside them.
+    r"""One row per class example: the inputs the encoders read, and what $K_t$ was attributed to.
+
+    Five columns. The two **input** maps first -- the declared target stream (scattering block
+    above the phase-harmonic block) and the declared source stream, standardised coefficients over
+    stored step and channel -- because an attribution map is read against the coefficients it
+    was taken on. Then the attribution of $K_t$: to the target under the **all-zero** baseline,
+    which is the only baseline under which target inputs move, and to the source under the
+    **source-null** baseline, which is the primary comparison. Last, the lag-aligned source
+    attribution against the model's own lag readout at that anchor.
 
     Args:
-        maps: Per example: ``guid, subgroup, clinical_class, anchor, readout, baseline,
-            target (T, c_y), source (T, c_u), lag_profile (L,), model_profile (L,),
-            live_target, live_source``.
+        examples: One per class, as :func:`attribution_pass.attribute_example` builds them.
         lag_seconds: The compensated lag axis.
         cell: The cell binding, for the legend.
         caveat: The sentence printed under the figure.
@@ -1109,55 +1227,148 @@ def build_map_figure(
     Returns:
         The figure.
     """
-    n_rows = max(len(maps), 1)
-    figure, axes = figures.new_figure(n_rows, 3, height_per_row=2.6, width=14.0)
+    n_rows = max(len(examples), 1)
+    figure, axes = figures.new_figure(n_rows, 5, height_per_row=2.5, width=17.0)
     for row in range(n_rows):
-        if row >= len(maps):
-            for col in range(3):
+        if row >= len(examples):
+            for col in range(5):
                 _empty(axes[row, col])
             continue
-        item = maps[row]
-        for col, stream in enumerate(STREAMS):
-            field = np.asarray(item[stream], dtype=np.float64).T          # (C, T)
-            ax = axes[row, col]
-            figures.heatmap_with_colorbar(
-                figure, ax, field, symmetric=True, interpolation="none",
-                title=f"{stream} attribution of {item['readout']} ({item['baseline']} baseline)",
-                xlabel="stored step", ylabel="declared channel",
-            )
-            ax.axvline(float(item["anchor"]), color=figures.COLOR_VERMILLION, linewidth=figures.LINE_REGULAR)
-            _draw_warm_boundary(ax, item.get(f"live_{stream}"))
-        ax = axes[row, 2]
-        profile = np.asarray(item["lag_profile"], dtype=np.float64)
-        model_profile = np.asarray(item["model_profile"], dtype=np.float64)
-        if np.isfinite(profile).any():
-            ax.plot(lag_seconds, np.abs(profile), color=figures.COLOR_BLUE, linewidth=figures.LINE_REGULAR,
-                    label="|attribution| by lag")
-            twin = ax.twinx()
-            twin.plot(lag_seconds, model_profile, color=figures.COLOR_ORANGE, linewidth=figures.LINE_THIN,
-                      label=cell.lag_readout)
-            twin.set_ylabel("model lag readout", fontsize=figures.FONT_LABEL)
-            twin.tick_params(labelsize=figures.FONT_TINY)
-            handles, names = ax.get_legend_handles_labels()
-            more, more_names = twin.get_legend_handles_labels()
-            ax.legend(handles + more, names + more_names, fontsize=figures.FONT_TINY, loc="upper right")
-            ax.set_xlabel(COEFFICIENT_LAG_AXIS_LABEL)
-            ax.set_ylabel("|attribution| (readout units)")
-            ax.set_title("lag-aligned source attribution vs the model's lag readout", fontsize=figures.FONT_SMALL)
-            figures.style_axes(ax)
-        else:
-            _empty(ax, "lag-aligned source attribution")
-        axes[row, 0].set_ylabel(
-            f"guid {item['guid']} — subgroup {item['subgroup']} — class {item['clinical_class']}\n"
-            f"anchor step {int(item['anchor'])}\ndeclared channel", fontsize=figures.FONT_TINY,
+        item = examples[row]
+        anchor = int(item["anchor"])
+        inputs = item.get("inputs") or {}
+        maps = item.get("maps") or {}
+        _stream_map(
+            figure, axes[row, 0], inputs.get(STREAM_TARGET), title="target input coefficients (standardised)",
+            anchor=anchor, live=item.get("live_target"), n_scattering=item.get("n_scattering"),
         )
-    figures.caveat_note(figure, caveat)
+        _stream_map(
+            figure, axes[row, 1], inputs.get(STREAM_SOURCE), title="source input coefficients (standardised)",
+            anchor=anchor, live=item.get("live_source"),
+        )
+        all_zero = maps.get((READOUT_KLD, BASELINE_ALL_ZERO, ""))
+        null = maps.get((READOUT_KLD, BASELINE_SOURCE_NULL, ""))
+        _stream_map(
+            figure, axes[row, 2], None if all_zero is None else all_zero[STREAM_TARGET],
+            title="target attribution of $K_t$ (all-zero baseline)", anchor=anchor,
+            live=item.get("live_target"), n_scattering=item.get("n_scattering"), colorbar_label="nats",
+        )
+        _stream_map(
+            figure, axes[row, 3], None if null is None else null[STREAM_SOURCE],
+            title="source attribution of $K_t$ (source-null baseline)", anchor=anchor,
+            live=item.get("live_source"), colorbar_label="nats",
+        )
+        if null is None:
+            _empty(axes[row, 4], "lag-aligned source attribution of $K_t$")
+        else:
+            _lag_view(
+                axes[row, 4], null["lag_profile"], item["model_profile"], lag_seconds=lag_seconds,
+                cell=cell, title="lag-aligned source attribution of $K_t$",
+            )
+        axes[row, 0].text(
+            -0.22, 0.5, _example_title(item).replace(" — ", "\n"), transform=axes[row, 0].transAxes,
+            rotation=90, ha="center", va="center", fontsize=figures.FONT_TINY,
+        )
+    figures.caveat_note(figure, f"{cell.lag_qualification}. {caveat}. {GROUP_DELAY_CAVEAT}")
+    return figure
+
+
+def build_example_figure(
+    item: Mapping[str, Any],
+    *,
+    lag_seconds: np.ndarray,
+    cell: CellBinding,
+    caveat: str,
+    lag_bands: Mapping[str, Tuple[int, int]],
+) -> Any:
+    r"""One anchor of one recording, every example readout: the inputs, and each readout's maps.
+
+    Row one is the input: the target and source coefficients the encoders read, and the model's
+    own lag readout at the anchor. Every further row is one readout -- the divergence, the
+    forecast gap, the full-branch block score, then the lag readout on each configured band --
+    with its target attribution under the all-zero baseline, its source attribution under the
+    source-null baseline, and the lag-aligned source attribution against the model's lag
+    readout. The row label carries the readout's value at the input and at the exact null.
+
+    Args:
+        item: The example, as :func:`attribution_pass.attribute_example` builds it.
+        lag_seconds: The compensated lag axis.
+        cell: The cell binding.
+        caveat: The sentence printed under the figure.
+        lag_bands: The configured lag bands, in the order their rows are drawn.
+
+    Returns:
+        The figure.
+    """
+    maps = item.get("maps") or {}
+    readouts: List[Tuple[str, str]] = [(name, "") for name in EXAMPLE_READOUTS]
+    readouts += [(READOUT_LAG_BAND, str(name)) for name in lag_bands]
+    figure, axes = figures.new_figure(1 + len(readouts), 3, height_per_row=2.4, width=14.0)
+    anchor = int(item["anchor"])
+    inputs = item.get("inputs") or {}
+    _stream_map(
+        figure, axes[0, 0], inputs.get(STREAM_TARGET), title="target input coefficients (standardised)",
+        anchor=anchor, live=item.get("live_target"), n_scattering=item.get("n_scattering"),
+    )
+    _stream_map(
+        figure, axes[0, 1], inputs.get(STREAM_SOURCE), title="source input coefficients (standardised)",
+        anchor=anchor, live=item.get("live_source"),
+    )
+    ax = axes[0, 2]
+    model_profile = np.asarray(item.get("model_profile", np.full(len(lag_seconds), np.nan)), dtype=np.float64)
+    if np.isfinite(model_profile).any():
+        ax.plot(lag_seconds, model_profile, color=figures.COLOR_ORANGE, linewidth=figures.LINE_REGULAR)
+        ax.set_title(f"the model's own lag readout at the anchor: {cell.lag_readout}", fontsize=figures.FONT_SMALL)
+        ax.set_xlabel(COEFFICIENT_LAG_AXIS_LABEL)
+        ax.set_ylabel("readout units")
+        figures.style_axes(ax)
+    else:
+        _empty(ax, "the model's own lag readout at the anchor")
+
+    for row, (readout, band) in enumerate(readouts, start=1):
+        name = READOUT_TITLES[readout] if readout != READOUT_LAG_BAND else f"lag readout on band {band!r}"
+        all_zero = maps.get((readout, BASELINE_ALL_ZERO, band))
+        null = maps.get((readout, BASELINE_SOURCE_NULL, band))
+        _stream_map(
+            figure, axes[row, 0], None if all_zero is None else all_zero[STREAM_TARGET],
+            title=f"target attribution of the {name} (all-zero baseline)", anchor=anchor,
+            live=item.get("live_target"), n_scattering=item.get("n_scattering"), colorbar_label="readout units",
+        )
+        _stream_map(
+            figure, axes[row, 1], None if null is None else null[STREAM_SOURCE],
+            title=f"source attribution of the {name} (source-null baseline)", anchor=anchor,
+            live=item.get("live_source"), colorbar_label="readout units",
+        )
+        if null is None:
+            _empty(axes[row, 2], f"lag-aligned source attribution of the {name}")
+        else:
+            _lag_view(
+                axes[row, 2], null["lag_profile"], model_profile, lag_seconds=lag_seconds, cell=cell,
+                title=f"lag-aligned source attribution of the {name}",
+            )
+            values = (
+                f"at the input {null['value_input']:.3g}, at the null {null['value_baseline']:.3g}"
+            )
+            axes[row, 2].text(
+                0.01, 0.97, values, transform=axes[row, 2].transAxes, ha="left", va="top",
+                fontsize=figures.FONT_TINY, color=figures.COLOR_GRAY,
+            )
+    figure.suptitle(_example_title(item), fontsize=figures.FONT_NOTE)
+    figures.caveat_note(figure, f"{cell.lag_qualification}. {caveat}. {GROUP_DELAY_CAVEAT}")
     return figure
 
 
 def _class_colours(classes: Sequence[str]) -> Dict[str, str]:
     """The severity palette for a list of class names."""
     return figures.group_colors([str(name) for name in classes])
+
+
+def _per_recording_mean(matrix: np.ndarray, guids: np.ndarray, keep: np.ndarray) -> np.ndarray:
+    """Mean over the rows of each recording, then over recordings, of the kept rows."""
+    frames = []
+    for guid in np.unique(guids[keep]):
+        frames.append(np.nanmean(matrix[keep][guids[keep] == guid], axis=0))
+    return np.nanmean(np.stack(frames, axis=0), axis=0) if frames else np.full(matrix.shape[1], np.nan)
 
 
 def build_lag_profile_figure(
@@ -1168,13 +1379,17 @@ def build_lag_profile_figure(
     readouts: Sequence[str],
     cell: CellBinding,
     caveat: str,
+    lag_bands: Optional[Mapping[str, Tuple[int, int]]] = None,
 ) -> Any:
     r"""The lag-aligned source attribution against the model's own lag readout, pooled and by class.
 
     One row per readout under the source-null baseline: the mean over recordings of the
     normalised $|q_\ell|$ beside the mean normalised model profile, pooled (left) and per class
     (right), with the recording-mean agreement statistics in the titles. Normalised per row so a
-    recording with a large readout does not decide the shape for every other.
+    recording with a large readout does not decide the shape for every other. A last row puts
+    every readout on one axis: the divergence, the forecast gap and the lag readout on each band,
+    so where the model is sensitive for its latent change, for its forecast and for each band's
+    own lag readout can be read against each other and against the model's lag profile.
 
     Args:
         rows: The per-row table.
@@ -1183,71 +1398,531 @@ def build_lag_profile_figure(
         readouts: The readouts to draw, one row each.
         cell: The cell binding.
         caveat: The sentence printed under the figure.
+        lag_bands: The configured lag bands, for the comparison row; ``None`` draws the main
+            readouts alone there.
+
+    Returns:
+        The figure.
+    """
+    bands = dict(lag_bands or {})
+    figure, axes = figures.new_figure(len(readouts) + 1, 2, height_per_row=2.4, width=12.0)
+    if len(rows) and "lag_profile" in vectors:
+        null = (rows["baseline"].astype(str) == BASELINE_SOURCE_NULL).to_numpy()
+        readout_column = rows["readout"].astype(str).to_numpy()
+        band_column = rows["band"].astype(str).to_numpy() if "band" in rows.columns else np.full(len(rows), "")
+        guids = rows["guid"].astype(str).to_numpy()
+        classes = rows[labels.CLASS_COLUMN].astype(object).to_numpy()
+        attribution = lag_hist.normalise(np.abs(vectors["lag_profile"]))
+        model_profile = lag_hist.normalise(vectors["model_profile"])
+    else:
+        null = np.zeros(0, dtype=bool)
+        readout_column = band_column = guids = classes = np.zeros(0, dtype=object)
+        attribution = model_profile = np.zeros((0, len(lag_seconds)))
+
+    for index, readout in enumerate(readouts):
+        keep = null & (readout_column == readout) if null.size else null
+        if not keep.any():
+            _empty(axes[index, 0], f"{READOUT_TITLES.get(readout, readout)}: lag-aligned attribution")
+            _empty(axes[index, 1], f"{READOUT_TITLES.get(readout, readout)}: by class")
+            continue
+        subset = rows[keep]
+        ax = axes[index, 0]
+        ax.plot(lag_seconds, _per_recording_mean(attribution, guids, keep), color=figures.COLOR_BLUE,
+                linewidth=figures.LINE_REGULAR, label="|attribution|, normalised")
+        ax.plot(lag_seconds, _per_recording_mean(model_profile, guids, keep), color=figures.COLOR_ORANGE,
+                linewidth=figures.LINE_THIN, label="model lag readout, normalised")
+        corr = float(np.nanmean(subset["lag_corr"])) if "lag_corr" in subset else float("nan")
+        js = float(np.nanmean(subset["lag_js"])) if "lag_js" in subset else float("nan")
+        ax.set_title(
+            f"{READOUT_TITLES.get(readout, readout)}: pooled over {len(np.unique(guids[keep]))} "
+            f"recording(s); corr {corr:.2f}, JS {js:.2f}",
+        )
+        ax.set_xlabel(COEFFICIENT_LAG_AXIS_LABEL)
+        ax.set_ylabel("share per lag")
+        figures.legend_with_headroom(ax, ncol=2, headroom=0.25)
+        figures.style_axes(ax)
+
+        ax = axes[index, 1]
+        names = labels.ordered_groups(
+            [c for c in pd.unique(classes[keep]) if c is not None and not pd.isna(c)], labels.CLASS_COLUMN
+        )
+        colours = _class_colours(names)
+        drawn = 0
+        for name in names:
+            of_class = keep & np.asarray([c == name for c in classes], dtype=bool)
+            if not of_class.any():
+                continue
+            colour = colours.get(name, figures.COLOR_GRAY)
+            ax.plot(lag_seconds, _per_recording_mean(attribution, guids, of_class), color=colour,
+                    linewidth=figures.LINE_REGULAR, label=f"{name} (n={len(np.unique(guids[of_class]))})")
+            ax.plot(lag_seconds, _per_recording_mean(model_profile, guids, of_class), color=colour,
+                    linewidth=figures.LINE_THIN, linestyle="--")
+            drawn += 1
+        if drawn == 0:
+            _empty(ax, f"{READOUT_TITLES.get(readout, readout)}: by class")
+        else:
+            ax.set_title(f"{READOUT_TITLES.get(readout, readout)}: by class (solid attribution, dashed model readout)")
+            ax.set_xlabel(COEFFICIENT_LAG_AXIS_LABEL)
+            ax.set_ylabel("share per lag")
+            figures.legend_with_headroom(ax, ncol=min(max(drawn, 1), 3), headroom=0.25)
+            figures.style_axes(ax)
+
+    # The comparison row: every readout on one axis, then the band readouts against their bands.
+    ax, ax_bands = axes[len(readouts), 0], axes[len(readouts), 1]
+    drawn = 0
+    series: List[Tuple[str, np.ndarray, str]] = []
+    for readout in readouts:
+        keep = null & (readout_column == readout) if null.size else null
+        if keep.any():
+            series.append((READOUT_TITLES.get(readout, readout), _per_recording_mean(attribution, guids, keep),
+                           READOUT_COLOURS.get(readout, figures.COLOR_GRAY)))
+    band_series: List[Tuple[str, np.ndarray, str, Tuple[int, int]]] = []
+    for position, (name, span) in enumerate(bands.items()):
+        keep = null & (readout_column == READOUT_LAG_BAND) & (band_column == str(name)) if null.size else null
+        if keep.any():
+            colour = BAND_COLOURS[position % len(BAND_COLOURS)]
+            profile = _per_recording_mean(attribution, guids, keep)
+            series.append((f"lag readout on {name!r}", profile, colour))
+            band_series.append((str(name), profile, colour, (int(span[0]), int(span[1]))))
+    for label, profile, colour in series:
+        ax.plot(lag_seconds, profile, color=colour, linewidth=figures.LINE_REGULAR, label=label)
+        drawn += 1
+    if null.any():
+        ax.plot(lag_seconds, _per_recording_mean(model_profile, guids, null), color=figures.COLOR_BLACK,
+                linewidth=figures.LINE_THIN, linestyle="--", label="model lag readout")
+    if drawn == 0:
+        _empty(ax, "every readout on one lag axis")
+    else:
+        ax.set_title("every readout on one lag axis: normalised |source attribution|, pooled")
+        ax.set_xlabel(COEFFICIENT_LAG_AXIS_LABEL)
+        ax.set_ylabel("share per lag")
+        figures.legend_with_headroom(ax, ncol=2, headroom=0.35)
+        figures.style_axes(ax)
+    if not band_series:
+        _empty(ax_bands, "the lag-band readouts against their own bands")
+    else:
+        for name, profile, colour, (low, high) in band_series:
+            low, high = max(0, low), min(len(lag_seconds) - 1, high)
+            if low <= high:
+                ax_bands.axvspan(
+                    lag_seconds[low] - 0.5 * SECONDS_PER_STEP, lag_seconds[high] + 0.5 * SECONDS_PER_STEP,
+                    color=colour, alpha=0.12, linewidth=0,
+                )
+            ax_bands.plot(lag_seconds, profile, color=colour, linewidth=figures.LINE_REGULAR, label=name)
+        ax_bands.set_title("the lag-band readouts against their own bands (shaded)")
+        ax_bands.set_xlabel(COEFFICIENT_LAG_AXIS_LABEL)
+        ax_bands.set_ylabel("share per lag")
+        figures.legend_with_headroom(ax_bands, ncol=min(len(band_series), 4), headroom=0.3)
+        figures.style_axes(ax_bands)
+    figures.caveat_note(figure, f"{cell.lag_qualification}. {caveat}. {GROUP_DELAY_CAVEAT}")
+    return figure
+
+
+def offset_channel_map(maps: np.ndarray, anchors: Sequence[int], n_lags: int) -> np.ndarray:
+    r"""Re-index $(N, T, C)$ maps by offset from each row's anchor: $(N, L, C)$, ``NaN`` before the record.
+
+    The per-channel form of :func:`lag_profile`: cell $(\ell, c)$ is the attribution of channel
+    $c$ at stored step $t_a - \ell$, so a population mean over rows is a map of *which channel at
+    which offset* the readout responded to.
+
+    Args:
+        maps: $(N, T, C)$ per-step, per-channel attribution.
+        anchors: Per-row anchor steps.
+        n_lags: $L$.
+
+    Returns:
+        $(N, L, C)$.
+    """
+    field = np.asarray(maps, dtype=np.float64)
+    out = np.full((field.shape[0], int(n_lags), field.shape[2]), np.nan)
+    for row, anchor in enumerate(anchors):
+        high = min(int(anchor) + 1, int(n_lags))
+        if high <= 0:
+            continue
+        # Offsets 0 .. high-1 read stored steps anchor .. anchor-high+1, in that order.
+        out[row, :high, :] = field[row, int(anchor) - np.arange(high), :]
+    return out
+
+
+def _band_colour_of_channels(width: int, groups: Mapping[str, np.ndarray]) -> Tuple[List[str], List[Tuple[str, str]]]:
+    """Colour every channel of a stream by its frequency band; grey where the map names none."""
+    colours = [figures.COLOR_GRAY] * int(width)
+    legend: List[Tuple[str, str]] = []
+    for position, (band, channels) in enumerate(groups.items()):
+        colour = BAND_COLOURS[position % len(BAND_COLOURS)]
+        legend.append((band_partition.band_display_label(str(band)), colour))
+        for channel in np.asarray(channels, dtype=np.int64):
+            if 0 <= int(channel) < width:
+                colours[int(channel)] = colour
+    return colours, legend
+
+
+def _stream_selection(rows: pd.DataFrame, readout: str, stream: str) -> np.ndarray:
+    """The rows of one readout under the baseline a stream's attribution is read on.
+
+    The target inputs move only along the all-zero path, so a target profile is read there; the
+    source is read under the source-null baseline, the primary comparison.
+    """
+    if not len(rows):
+        return np.zeros(0, dtype=bool)
+    baseline = BASELINE_ALL_ZERO if stream == STREAM_TARGET else BASELINE_SOURCE_NULL
+    return (
+        (rows["readout"].astype(str) == readout).to_numpy()
+        & (rows["baseline"].astype(str) == baseline).to_numpy()
+    )
+
+
+def build_channel_figure(
+    rows: pd.DataFrame,
+    vectors: Mapping[str, np.ndarray],
+    *,
+    readouts: Sequence[str],
+    channel_groups: Mapping[str, Mapping[str, np.ndarray]],
+    n_scattering: Optional[int],
+    caveat: str,
+) -> Any:
+    r"""Which declared input channels each readout responded to, summed over stored time.
+
+    One row per readout, the target stream (all-zero baseline) left and the source stream
+    (source-null baseline) right. Bars are the mean over recordings of the **signed** channel
+    profile $\sum_t a_{t,c}$; the line is the mean of the unsigned one $\sum_t |a_{t,c}|$, which
+    says how much the channel mattered when its contributions cancel over time. Bars are coloured
+    by the channel's frequency band where the run wrote a channel map; on the target stream the
+    scattering block sits left of the rule and the phase-harmonic block right of it.
+
+    Args:
+        rows: The per-row table.
+        vectors: The row-aligned arrays, read for the signed and unsigned channel profiles.
+        readouts: The readouts, one row each.
+        channel_groups: ``{stream: {band: positions}}`` from the channel map, possibly empty.
+        n_scattering: Width of the target scattering block, or ``None``.
+        caveat: The sentence printed under the figure.
 
     Returns:
         The figure.
     """
     figure, axes = figures.new_figure(max(len(readouts), 1), 2, height_per_row=2.4, width=12.0)
+    guids = rows["guid"].astype(str).to_numpy() if len(rows) else np.zeros(0, dtype=object)
     for index, readout in enumerate(readouts):
-        selected = np.flatnonzero(
-            (rows["readout"].astype(str) == readout).to_numpy()
-            & (rows["baseline"].astype(str) == BASELINE_SOURCE_NULL).to_numpy()
-        ) if len(rows) else np.zeros(0, dtype=np.int64)
-        if selected.size == 0 or "lag_profile" not in vectors:
-            _empty(axes[index, 0], f"{readout}: lag-aligned attribution")
-            _empty(axes[index, 1], f"{readout}: by class")
-            continue
-        attribution = lag_hist.normalise(np.abs(vectors["lag_profile"][selected]))
-        model_profile = lag_hist.normalise(vectors["model_profile"][selected])
-        subset = rows.iloc[selected]
-        guids = subset["guid"].astype(str).to_numpy()
-        classes = subset[labels.CLASS_COLUMN].astype(object).to_numpy()
-
-        def per_recording(mat: np.ndarray, keep: np.ndarray) -> np.ndarray:
-            """Mean over the rows of each recording, then over recordings."""
-            frames = []
-            for guid in np.unique(guids[keep]):
-                frames.append(np.nanmean(mat[keep][guids[keep] == guid], axis=0))
-            return np.nanmean(np.stack(frames, axis=0), axis=0) if frames else np.full(mat.shape[1], np.nan)
-
-        everything = np.ones(selected.size, dtype=bool)
-        ax = axes[index, 0]
-        ax.plot(lag_seconds, per_recording(attribution, everything), color=figures.COLOR_BLUE,
-                linewidth=figures.LINE_REGULAR, label="|attribution|, normalised")
-        ax.plot(lag_seconds, per_recording(model_profile, everything), color=figures.COLOR_ORANGE,
-                linewidth=figures.LINE_THIN, label="model lag readout, normalised")
-        corr = float(np.nanmean(subset["lag_corr"])) if "lag_corr" in subset else float("nan")
-        js = float(np.nanmean(subset["lag_js"])) if "lag_js" in subset else float("nan")
-        ax.set_title(
-            f"{readout}: pooled over {len(np.unique(guids))} recording(s); corr {corr:.2f}, JS {js:.2f}",
-            fontsize=figures.FONT_SMALL,
-        )
-        ax.set_xlabel(COEFFICIENT_LAG_AXIS_LABEL)
-        ax.set_ylabel("share per lag")
-        ax.legend(fontsize=figures.FONT_TINY, loc="upper right")
-        figures.style_axes(ax)
-
-        ax = axes[index, 1]
-        names = labels.ordered_groups([c for c in pd.unique(classes) if c is not None and not pd.isna(c)], labels.CLASS_COLUMN)
-        colours = _class_colours(names)
-        drawn = 0
-        for name in names:
-            keep = np.asarray([c == name for c in classes], dtype=bool)
-            if not keep.any():
+        for col, stream in enumerate(STREAMS):
+            ax = axes[index, col]
+            title = f"{READOUT_TITLES.get(readout, readout)}: {stream} stream by declared channel"
+            keep = _stream_selection(rows, readout, stream)
+            signed_name, unsigned_name = f"channel_profile_{stream}", f"channel_abs_profile_{stream}"
+            if not keep.any() or signed_name not in vectors:
+                _empty(ax, title)
                 continue
-            ax.plot(lag_seconds, per_recording(attribution, keep), color=colours.get(name, figures.COLOR_GRAY),
-                    linewidth=figures.LINE_REGULAR, label=f"{name} |attribution| (n={len(np.unique(guids[keep]))})")
-            ax.plot(lag_seconds, per_recording(model_profile, keep), color=colours.get(name, figures.COLOR_GRAY),
-                    linewidth=figures.LINE_THIN, linestyle="--")
-            drawn += 1
-        if drawn == 0:
-            _empty(ax, f"{readout}: by class")
-        else:
-            ax.set_title(f"{readout}: by class (solid attribution, dashed model readout)", fontsize=figures.FONT_SMALL)
-            ax.set_xlabel(COEFFICIENT_LAG_AXIS_LABEL)
-            ax.legend(fontsize=figures.FONT_TINY, loc="upper right")
+            signed = _per_recording_mean(vectors[signed_name].astype(np.float64), guids, keep)
+            width = int(signed.size)
+            colours, legend = _band_colour_of_channels(width, channel_groups.get(stream, {}))
+            x = np.arange(width)
+            ax.bar(x, signed, width=0.85, color=colours, linewidth=0, label="signed, mean over recordings")
+            if unsigned_name in vectors:
+                unsigned = _per_recording_mean(vectors[unsigned_name].astype(np.float64), guids, keep)
+                ax.plot(x, unsigned, color=figures.COLOR_BLACK, linewidth=figures.LINE_THIN,
+                        label="unsigned, mean over recordings")
+            ax.axhline(0.0, color=figures.COLOR_GRAY, linewidth=figures.LINE_HAIRLINE)
+            if stream == STREAM_TARGET and n_scattering and 0 < int(n_scattering) < width:
+                ax.axvline(float(n_scattering) - 0.5, color=figures.COLOR_BLACK, linewidth=figures.LINE_HAIRLINE,
+                           linestyle="--")
+                ax.text(float(n_scattering) - 0.5, 0.98, " phase-harmonic block", transform=ax.get_xaxis_transform(),
+                        ha="left", va="top", fontsize=figures.FONT_TINY, color=figures.COLOR_GRAY)
+            for label, colour in legend:
+                ax.plot([], [], marker="s", linestyle="none", color=colour, label=label)
+            ax.set_title(f"{title} ({len(np.unique(guids[keep]))} recording(s))")
+            ax.set_xlabel("declared channel")
+            ax.set_ylabel("attribution (readout units)")
+            ax.set_xlim(-0.5, width - 0.5)
+            figures.legend_with_headroom(ax, ncol=3, headroom=0.35)
             figures.style_axes(ax)
-    figures.caveat_note(figure, f"{cell.lag_qualification}. {caveat}. {GROUP_DELAY_CAVEAT}")
+    figures.caveat_note(figure, caveat)
+    return figure
+
+
+def build_lag_channel_figure(
+    lag_channel: Mapping[Tuple[str, str, str], Mapping[str, Any]],
+    *,
+    lag_seconds: np.ndarray,
+    readouts: Sequence[str],
+    n_scattering: Optional[int],
+    caveat: str,
+) -> Any:
+    r"""Which channel at which offset from the anchor: the population mean of the unsigned maps.
+
+    One row per readout: the target stream re-indexed by offset from the anchor under the
+    all-zero baseline (left) and the source stream by lag under the source-null baseline (right),
+    each the mean over attributed anchors of $|a|$ at that offset and channel. The two marginals
+    the other figures draw -- the lag profile and the channel profile -- are the row and column
+    sums of these maps, and a peak here says both at once: which coefficient, how far back.
+
+    Args:
+        lag_channel: ``{(readout, baseline, stream): {'mean_abs': (L, C), 'mean': (L, C),
+            'n_rows': int}}`` from the pass.
+        lag_seconds: The compensated lag axis.
+        readouts: The readouts, one row each.
+        n_scattering: Width of the target scattering block, or ``None``.
+        caveat: The sentence printed under the figure.
+
+    Returns:
+        The figure.
+    """
+    figure, axes = figures.new_figure(max(len(readouts), 1), 2, height_per_row=2.8, width=12.0)
+    half = 0.5 * float(SECONDS_PER_STEP)
+    for index, readout in enumerate(readouts):
+        for col, stream in enumerate(STREAMS):
+            ax = axes[index, col]
+            baseline = BASELINE_ALL_ZERO if stream == STREAM_TARGET else BASELINE_SOURCE_NULL
+            title = f"{READOUT_TITLES.get(readout, readout)}: |attribution| of the {stream} stream by offset and channel"
+            entry = lag_channel.get((readout, baseline, stream))
+            if entry is None or not np.isfinite(np.asarray(entry["mean_abs"])).any():
+                _empty(ax, title)
+                continue
+            field = np.asarray(entry["mean_abs"], dtype=np.float64).T   # (C, L)
+            figures.heatmap_with_colorbar(
+                figure, ax, field, symmetric=False, interpolation="none",
+                title=f"{title} ({int(entry['n_rows'])} anchor(s), {baseline} baseline)",
+                xlabel=COEFFICIENT_LAG_AXIS_LABEL, ylabel="declared channel", colorbar_label="|attribution|",
+                extent=(float(lag_seconds[0]) - half, float(lag_seconds[-1]) + half, field.shape[0] - 0.5, -0.5),
+                separator_row=(int(n_scattering) - 1) if (stream == STREAM_TARGET and n_scattering) else None,
+            )
+    figures.caveat_note(figure, f"{caveat}. {GROUP_DELAY_CAVEAT}")
+    return figure
+
+
+def build_time_profile_figure(
+    rows: pd.DataFrame,
+    vectors: Mapping[str, np.ndarray],
+    *,
+    lag_seconds: np.ndarray,
+    readouts: Sequence[str],
+    caveat: str,
+) -> Any:
+    r"""The signed attribution by offset from the anchor, for both streams.
+
+    The lag-profile figure draws magnitudes, which say where the model was sensitive and not in
+    which direction. Here, per readout, the source stream (source-null baseline, left) and the
+    target stream (all-zero baseline, right) are drawn by offset from the anchor with the mean
+    **positive** part above the axis and the mean **negative** part below it, the net mean as a
+    line and the unsigned mean dashed. An offset whose positive and negative parts are both large
+    with a small net is one where channels pull the readout both ways.
+
+    Args:
+        rows: The per-row table.
+        vectors: The row-aligned arrays, read for ``lag_profile`` and ``target_lag_profile``.
+        lag_seconds: The compensated lag axis.
+        readouts: The readouts, one row each.
+        caveat: The sentence printed under the figure.
+
+    Returns:
+        The figure.
+    """
+    figure, axes = figures.new_figure(max(len(readouts), 1), 2, height_per_row=2.4, width=12.0)
+    guids = rows["guid"].astype(str).to_numpy() if len(rows) else np.zeros(0, dtype=object)
+    for index, readout in enumerate(readouts):
+        for col, (stream, name) in enumerate(((STREAM_SOURCE, "lag_profile"), (STREAM_TARGET, "target_lag_profile"))):
+            ax = axes[index, col]
+            title = f"{READOUT_TITLES.get(readout, readout)}: signed {stream} attribution by offset from the anchor"
+            keep = _stream_selection(rows, readout, stream)
+            if not keep.any() or name not in vectors:
+                _empty(ax, title)
+                continue
+            profile = vectors[name].astype(np.float64)
+            positive = _per_recording_mean(np.where(profile > 0.0, profile, 0.0), guids, keep)
+            negative = _per_recording_mean(np.where(profile < 0.0, profile, 0.0), guids, keep)
+            net = _per_recording_mean(profile, guids, keep)
+            unsigned = _per_recording_mean(np.abs(profile), guids, keep)
+            ax.fill_between(lag_seconds, 0.0, positive, color=figures.COLOR_VERMILLION, alpha=0.35, linewidth=0,
+                            label="positive part (raises the readout)")
+            ax.fill_between(lag_seconds, negative, 0.0, color=figures.COLOR_BLUE, alpha=0.35, linewidth=0,
+                            label="negative part (lowers the readout)")
+            ax.plot(lag_seconds, net, color=figures.COLOR_BLACK, linewidth=figures.LINE_REGULAR, label="net mean")
+            ax.plot(lag_seconds, unsigned, color=figures.COLOR_GRAY, linewidth=figures.LINE_THIN, linestyle="--",
+                    label="unsigned mean")
+            ax.axhline(0.0, color=figures.COLOR_GRAY, linewidth=figures.LINE_HAIRLINE)
+            ax.set_title(f"{title} ({len(np.unique(guids[keep]))} recording(s))")
+            ax.set_xlabel(COEFFICIENT_LAG_AXIS_LABEL)
+            ax.set_ylabel("attribution (readout units)")
+            figures.legend_with_headroom(ax, ncol=2, headroom=0.4)
+            figures.style_axes(ax)
+    figures.caveat_note(figure, f"{caveat}. {GROUP_DELAY_CAVEAT}")
+    return figure
+
+
+def build_checks_figure(rows: pd.DataFrame, *, tolerance: float, caveat: str) -> Any:
+    r"""The numerical checks behind every row, so a map is read after its residual, not before.
+
+    Left: the relative completeness residual of every row per readout and baseline, on a
+    logarithmic axis against the tolerance the pass counts against. Middle: the entry jump
+    $f(x_0) - f(b)$ against the readout at the input, per baseline -- how much of the readout the
+    excluded start of the path accounts for. Right: the two structural checks, the largest
+    attribution to a step after the anchor and to a gated-off source step, per readout; exactly
+    zero on a causal model, and drawn on a symmetric-log axis so a non-zero shows.
+
+    Args:
+        rows: The per-row table.
+        tolerance: The completeness tolerance the pass counts rows against.
+        caveat: The sentence printed under the figure.
+
+    Returns:
+        The figure.
+    """
+    figure, axes = figures.new_figure(1, 3, height_per_row=3.0, width=13.5)
+    ax = axes[0, 0]
+    if len(rows) and "completeness_rel" in rows.columns:
+        residual = np.asarray(rows["completeness_rel"], dtype=np.float64)
+        finite = residual[np.isfinite(residual) & (residual > 0.0)]
+        if finite.size:
+            edges = np.logspace(np.log10(max(finite.min(), 1e-12)), np.log10(max(finite.max(), tolerance * 10.0)), 30)
+            groups = list(dict.fromkeys(zip(rows["readout"].astype(str), rows["baseline"].astype(str))))
+            for position, (readout, baseline) in enumerate(groups):
+                keep = ((rows["readout"].astype(str) == readout) & (rows["baseline"].astype(str) == baseline)).to_numpy()
+                values = residual[keep]
+                values = values[np.isfinite(values) & (values > 0.0)]
+                if values.size:
+                    ax.hist(values, bins=edges, histtype="step", linewidth=figures.LINE_REGULAR,
+                            color=(list(READOUT_COLOURS.values()) + list(BAND_COLOURS))[position % 7],
+                            linestyle="-" if baseline == BASELINE_SOURCE_NULL else "--",
+                            label=f"{READOUT_TITLES.get(readout, readout)}, {baseline}")
+            ax.axvline(float(tolerance), color=figures.COLOR_BLACK, linestyle=":", linewidth=figures.LINE_REGULAR,
+                       label=f"tolerance {tolerance:g}")
+            over = int((residual > tolerance).sum())
+            ax.set_xscale("log")
+            ax.set_title(f"completeness residual per row ({over} of {residual.size} over tolerance)")
+            ax.set_xlabel("relative completeness residual")
+            ax.set_ylabel("rows")
+            figures.legend_with_headroom(ax, ncol=2, headroom=0.5)
+            figures.style_axes(ax)
+        else:
+            _empty(ax, "completeness residual per row")
+    else:
+        _empty(ax, "completeness residual per row")
+
+    ax = axes[0, 1]
+    if len(rows) and {"entry_jump", "value_input"} <= set(rows.columns):
+        drawn = 0
+        for baseline, colour in ((BASELINE_SOURCE_NULL, figures.COLOR_BLUE), (BASELINE_ALL_ZERO, figures.COLOR_VERMILLION)):
+            keep = (rows["baseline"].astype(str) == baseline).to_numpy()
+            if keep.any():
+                ax.scatter(rows.loc[keep, "value_input"], rows.loc[keep, "entry_jump"], s=9, color=colour,
+                           alpha=0.7, linewidths=0, label=f"{baseline} baseline")
+                drawn += 1
+        if drawn:
+            ax.axhline(0.0, color=figures.COLOR_GRAY, linewidth=figures.LINE_HAIRLINE)
+            ax.set_title("entry jump $f(x_0) - f(b)$ against the readout at the input")
+            ax.set_xlabel("readout at the input")
+            ax.set_ylabel("entry jump (readout units)")
+            figures.legend_with_headroom(ax, ncol=2, headroom=0.3)
+            figures.style_axes(ax)
+        else:
+            _empty(ax, "entry jump against the readout at the input")
+    else:
+        _empty(ax, "entry jump against the readout at the input")
+
+    ax = axes[0, 2]
+    checks = [("after_anchor_max_abs", "after the anchor"), ("gated_off_max_abs", "gated-off source step")]
+    if len(rows) and all(name in rows.columns for name, _ in checks):
+        readouts = list(dict.fromkeys(rows["readout"].astype(str)))
+        x = np.arange(len(readouts))
+        for offset, (name, label) in enumerate(checks):
+            values = [float(np.nanmax(rows.loc[rows["readout"].astype(str) == readout, name])) for readout in readouts]
+            ax.bar(x + (offset - 0.5) * 0.38, values, width=0.38, label=f"largest |attribution| {label}",
+                   color=figures.COLOR_BLUE if offset == 0 else figures.COLOR_ORANGE)
+            for position, value in zip(x + (offset - 0.5) * 0.38, values):
+                ax.annotate(f"{value:.2g}", (position, value), textcoords="offset points", xytext=(0, 2),
+                            ha="center", fontsize=figures.FONT_TINY)
+        ax.set_yscale("symlog", linthresh=1e-6)
+        ax.set_xticks(x)
+        ax.set_xticklabels([READOUT_TITLES.get(readout, readout) for readout in readouts], fontsize=figures.FONT_TINY)
+        ax.set_title("structural checks per readout (exactly zero on a causal model)")
+        ax.set_ylabel("|attribution| (readout units), symmetric log")
+        figures.legend_with_headroom(ax, ncol=1, headroom=0.4)
+        figures.style_axes(ax)
+    else:
+        _empty(ax, "structural checks per readout")
+    figures.caveat_note(figure, caveat)
+    return figure
+
+
+def _lag_centroid(profile: np.ndarray, lag_seconds: np.ndarray) -> np.ndarray:
+    r"""The $|q|$-weighted mean lag of each row, in seconds; ``NaN`` where a row carries no mass."""
+    weights = np.abs(np.asarray(profile, dtype=np.float64))
+    weights = np.where(np.isfinite(weights), weights, 0.0)
+    total = weights.sum(axis=1)
+    return np.divide((weights * lag_seconds[None, :]).sum(axis=1), total, out=np.full(total.shape, np.nan), where=total > 0.0)
+
+
+def build_delivery_figure(
+    rows: pd.DataFrame,
+    vectors: Mapping[str, np.ndarray],
+    *,
+    lag_seconds: np.ndarray,
+    readouts: Sequence[str],
+    caveat: str,
+) -> Any:
+    r"""The attributed anchors on the clinical clock: source attribution against hours before delivery.
+
+    Per readout under the source-null baseline: the source attribution total (left) and the
+    $|q|$-weighted lag centroid of the source attribution (right) of every attributed anchor
+    against its hours before delivery, one point per anchor in its class colour, with the class
+    median per one-hour window drawn where at least three recordings fall in it. The anchors are a
+    few per segment of one segment per recording, so this is a sparse view; the traces and the
+    clock analyses are where the clinical clock is read densely.
+
+    Args:
+        rows: The per-row table.
+        vectors: The row-aligned arrays, read for ``lag_profile``.
+        lag_seconds: The compensated lag axis.
+        readouts: The readouts, one row each.
+        caveat: The sentence printed under the figure.
+
+    Returns:
+        The figure.
+    """
+    figure, axes = figures.new_figure(max(len(readouts), 1), 2, height_per_row=2.4, width=12.0)
+    window = 1.0
+    if len(rows) and "lag_profile" in vectors:
+        hours = -(np.asarray(rows["epoch"], dtype=np.float64) + np.asarray(rows["anchor"], dtype=np.float64) * SECONDS_PER_STEP) / cohort.SECONDS_PER_HOUR
+        centroid = _lag_centroid(vectors["lag_profile"], lag_seconds)
+        classes = rows[labels.CLASS_COLUMN].astype(object).to_numpy()
+        guids = rows["guid"].astype(str).to_numpy()
+    else:
+        hours = centroid = np.zeros(0)
+        classes = guids = np.zeros(0, dtype=object)
+    for index, readout in enumerate(readouts):
+        keep = _stream_selection(rows, readout, STREAM_SOURCE)
+        for col, (values, ylabel, what) in enumerate((
+            (np.asarray(rows["source_total"], dtype=np.float64) if len(rows) else np.zeros(0), "readout units", "source attribution total"),
+            (centroid, "s (stored-coefficient time)", "lag centroid of |source attribution|"),
+        )):
+            ax = axes[index, col]
+            title = f"{READOUT_TITLES.get(readout, readout)}: {what} against hours before delivery"
+            usable = keep & np.isfinite(values) & np.isfinite(hours) if keep.size else keep
+            if not usable.any():
+                _empty(ax, title)
+                continue
+            names = labels.ordered_groups([c for c in pd.unique(classes[usable]) if c is not None and not pd.isna(c)], labels.CLASS_COLUMN)
+            colours = _class_colours(names)
+            for name in names:
+                of_class = usable & np.asarray([c == name for c in classes], dtype=bool)
+                colour = colours.get(name, figures.COLOR_GRAY)
+                ax.scatter(hours[of_class], values[of_class], s=8, color=colour, alpha=0.6, linewidths=0,
+                           label=f"{name} (n={len(np.unique(guids[of_class]))})")
+                bins = np.floor(hours[of_class] / window).astype(np.int64)
+                table = pd.DataFrame({"bin": bins, "guid": guids[of_class], "value": values[of_class]})
+                per_recording = table.groupby(["bin", "guid"])["value"].mean().reset_index()
+                counts = per_recording.groupby("bin")["guid"].nunique()
+                medians = per_recording.groupby("bin")["value"].median()
+                enough = counts[counts >= 3].index
+                if len(enough):
+                    ax.plot((np.asarray(enough, dtype=np.float64) + 0.5) * window, medians.loc[enough].to_numpy(),
+                            color=colour, linewidth=figures.LINE_EMPHASIS, marker="o", markersize=2.5)
+            ax.set_title(title)
+            ax.set_xlabel("hours before delivery")
+            ax.set_ylabel(ylabel)
+            ax.invert_xaxis()
+            figures.legend_with_headroom(ax, ncol=3, headroom=0.35)
+            figures.style_axes(ax)
+    figures.caveat_note(figure, f"{caveat}. {GROUP_DELAY_CAVEAT}")
     return figure
 
 
@@ -1388,6 +2063,10 @@ def build_layer_figure(
             else:
                 ax.plot(x, values, linewidth=figures.LINE_REGULAR, label=readout)
         ax.axhline(0.0, color=figures.COLOR_GRAY, linewidth=figures.LINE_HAIRLINE)
+        if cell.layer_axis == "head":
+            # Heads are integers; a fractional tick between two heads names nothing.
+            ax.set_xticks(x)
+            ax.set_xticklabels([str(int(unit)) for unit in units])
         ax.set_title(f"attribution on {cell.layer_label}, per {cell.layer_axis} (source-null baseline)", fontsize=figures.FONT_SMALL)
         ax.set_xlabel("head" if cell.layer_axis == "head" else COEFFICIENT_LAG_AXIS_LABEL)
         ax.set_ylabel("attribution (readout units), mean over recordings")
@@ -1470,16 +2149,28 @@ def build_null_figure(null: pd.DataFrame, *, caveat: str) -> Any:
 #: divergence and the model's own lag readout as heatmaps on one lag axis, the agreement and the
 #: source share as lines, and the readout values behind them.
 TRACE_PANELS: Tuple[Any, ...] = (
-    traces.HeatmapPanel("attribution_lag_map", "|source attribution of K_t| by lag (source-null baseline)", "",
+    traces.HeatmapPanel("kld_attribution_lag_map", "|source attribution of $K_t$| by lag (source-null baseline)", "",
                         lag_axis=True),
-    traces.HeatmapPanel("model_lag_map", "the model's own lag readout", "", lag_axis=True),
-    traces.LinePanel(("lag_corr", "lag_js"), "agreement between the two lag profiles", ""),
-    traces.LinePanel(("source_total", "target_total"), "attribution totals of K_t", "nats"),
-    traces.LinePanel(("value_input", "value_baseline"), "K_t at the input and at the null", "nats"),
+    traces.HeatmapPanel("pred_gap_attribution_lag_map",
+                        "|source attribution of the forecast gap| by lag (source-null baseline)", "", lag_axis=True),
+    traces.HeatmapPanel("model_lag_map", "The model's own lag readout", "", lag_axis=True),
+    traces.LinePanel(("kld_lag_corr", "pred_gap_lag_corr"),
+                     "Correlation of the lag-aligned attribution with the model's lag readout", "Pearson $r$",
+                     labels=("$K_t$", "forecast gap")),
+    traces.LinePanel(("kld_source_total", "pred_gap_source_total"), "Source attribution totals",
+                     "readout units", labels=("$K_t$", "forecast gap")),
+    traces.LinePanel(("kld_value_input", "kld_value_baseline"), "$K_t$ at the input and at the exact null",
+                     "nats", labels=("input", "null")),
+    traces.LinePanel(("pred_gap_value_input", "pred_gap_value_baseline"),
+                     "Forecast gap at the input and at the exact null", "nats", labels=("input", "null")),
 )
 
 #: The lag families a trace's shape statistics are taken of.
-TRACE_LAG_PROFILES: Dict[str, str] = {"attribution_lag_map": "attr_lag", "model_lag_map": "model_lag"}
+TRACE_LAG_PROFILES: Dict[str, str] = {
+    "kld_attribution_lag_map": "kld_attr_lag",
+    "pred_gap_attribution_lag_map": "gap_attr_lag",
+    "model_lag_map": "model_lag",
+}
 
 
 # =============================================================================
@@ -1535,9 +2226,13 @@ __all__ = [
     "READOUT_MU_PRIOR_DIM", "READOUT_NLL_BASE", "READOUT_NLL_FULL", "READOUT_PRED_GAP",
     "RECORDINGS_FILENAME", "ROWS_FILENAME", "SLOT_CELL", "STREAMS", "STREAM_SOURCE",
     "STREAM_TARGET", "SUMMARY_FILENAME", "TARGET_ONLY_READOUTS", "TRACE_DIRNAME",
-    "TRACE_LAG_PROFILES", "TRACE_PANELS", "TRACE_RECORDINGS_PER_CLASS", "TRACE_SUFFIX",
+    "CHANNEL_FIGURE", "CHECKS_FIGURE", "DELIVERY_FIGURE", "EXAMPLE_DIRNAME", "EXAMPLE_READOUTS",
+    "EXAMPLE_SUFFIX", "LAG_CHANNEL_FIGURE", "LAG_CHANNEL_FILENAME", "READOUT_TITLES", "TIME_PROFILE_FIGURE",
+    "TRACE_LAG_PROFILES", "TRACE_READOUTS", "TRACE_PANELS", "TRACE_RECORDINGS_PER_CLASS", "TRACE_SUFFIX",
     "VECTORS_FILENAME", "ablate_lag_bands", "agreement", "band_sums", "baselines_for",
-    "build_band_figure", "build_lag_profile_figure", "build_layer_figure", "build_map_figure",
+    "build_band_figure", "build_channel_figure", "build_checks_figure", "build_delivery_figure",
+    "build_example_figure", "build_lag_channel_figure", "build_lag_profile_figure", "build_layer_figure",
+    "build_map_figure", "build_time_profile_figure", "offset_channel_map",
     "build_null_figure", "channel_groups_from_map", "channel_profile", "contributing_columns",
     "cost_record", "entry_point", "expand_rows", "integrated_gradients", "lag_band_feature_mask",
     "lag_band_groups", "lag_profile", "layer_attribution", "model_lag_readout", "spread_columns",

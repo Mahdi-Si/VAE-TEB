@@ -89,7 +89,11 @@ DEFAULT_PLAN_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "co
 #: that a possibly older run wrote, and importing the writer would pull a numeric stack into a pass
 #: whose whole point is not needing one. The suite asserts the two agree.
 SUMMARY_FILENAME = "summary.json"
-PER_RECORDING_FILENAME = "per_recording.csv"
+#: The per-recording table, relative to the directory the summary sits in: the scoring pass's
+#: ``arms`` analysis writes it into its own subdirectory. Restated here as a literal rather than
+#: imported from that analysis, so this module stays free of the figure stack; a test pins the two
+#: equal.
+PER_RECORDING_TABLE = "arms/per_recording.csv"
 
 #: The latent-probe artifact. Found anywhere under the same root and attached to the run whose
 #: checkpoint it names, rather than to the directory it happens to sit in.
@@ -253,7 +257,7 @@ def arm_of(summary: Mapping[str, Any]) -> str:
     Returns:
         The arm's name, or ``'unrecognised'`` prefixed with the leaves that were found.
     """
-    arm = summary.get("arm") or {}
+    arm = verify.blocks_of(summary).get("arm") or {}
     if bool(arm.get("source_disabled")):
         return "target_only"
     key = (
@@ -322,22 +326,44 @@ def discover_runs(root: str) -> List[Dict[str, Any]]:
     # probe its own output directory -- and an arm would then report an unprobed latent.
     found: List[Dict[str, Any]] = []
     for directory, summary in summaries:
-        table_path = os.path.join(directory, PER_RECORDING_FILENAME)
+        table_path = os.path.join(directory, PER_RECORDING_TABLE)
         found.append(
             {
-                "directory": directory,
-                "summary": summary,
+                **run_identity(directory, summary),
                 "table": read_table(table_path) if os.path.isfile(table_path) else None,
-                "probes": probes.get(str((summary.get("run") or {}).get("checkpoint", ""))),
-                "arm": arm_of(summary),
-                "training_seed": (summary.get("run") or {}).get("training_seed"),
-                "training_tag": (summary.get("run") or {}).get("training_tag"),
-                "eval_seed": (summary.get("run") or {}).get("seed"),
-                "draws": (summary.get("draws") or {}).get("num_mc_samples"),
-                "split": summary.get("scored_split") or {},
+                "probes": probes.get(str(summary.get("checkpoint", ""))),
             }
         )
     return sorted(found, key=lambda record: record["directory"])
+
+
+def run_identity(directory: str, summary: Mapping[str, Any]) -> Dict[str, Any]:
+    """The provenance the protocol groups a run on, read off the family's summary layout.
+
+    The training seed and tag are in the runner's ``run_context`` block, off the checkpoint's own
+    resolved configuration; the evaluation seed is in the ``eval_config`` block the run was
+    scored under; the draw count and the scored split are in this cell's results, the second
+    written by its ``arms`` analysis beside the per-recording table.
+
+    Args:
+        directory: The directory the summary was read from.
+        summary: The parsed summary.
+
+    Returns:
+        The identity fields of one run record.
+    """
+    results = verify.blocks_of(summary)
+    context = summary.get("run_context") or {}
+    return {
+        "directory": directory,
+        "summary": summary,
+        "arm": arm_of(summary),
+        "training_seed": context.get("training_seed"),
+        "training_tag": context.get("training_tag"),
+        "eval_seed": (summary.get("eval_config") or {}).get("seed"),
+        "draws": results.get("num_mc_samples"),
+        "split": (results.get("arms") or {}).get("scored_split") or {},
+    }
 
 
 def run_descriptor(run: Mapping[str, Any]) -> Dict[str, Any]:
@@ -880,7 +906,8 @@ def calibration_block(evidence: Mapping[str, Any]) -> Dict[str, Any]:
         branches: Dict[str, Any] = {}
         for branch in ("base", "full"):
             blocks = [
-                (record["summary"].get("calibration") or {}).get(branch) or {}
+                (verify.blocks_of(record["summary"]).get("mixture_calibration") or {}).get(branch)
+                or {}
                 for record in group["_members"]
             ]
             populated = [entry for entry in blocks if entry.get("coverage")]
@@ -1490,23 +1517,16 @@ def read_reference(path: Optional[str]) -> Optional[Dict[str, Any]]:
             f"{path} is not a target-only run. A source-conditioned model cannot serve as the "
             f"baseline its own architecture is measured against."
         )
-    table_path = os.path.join(directory, PER_RECORDING_FILENAME)
+    table_path = os.path.join(directory, PER_RECORDING_TABLE)
     if not os.path.isfile(table_path):
         raise ValueError(
             f"{table_path} is missing. The reference is compared per recording, so its "
             f"per-recording table is what the comparison is built from."
         )
     return {
-        "directory": directory,
-        "summary": summary,
+        **run_identity(directory, summary),
         "table": read_table(table_path),
         "probes": None,
-        "arm": arm_of(summary),
-        "training_seed": (summary.get("run") or {}).get("training_seed"),
-        "training_tag": (summary.get("run") or {}).get("training_tag"),
-        "eval_seed": (summary.get("run") or {}).get("seed"),
-        "draws": (summary.get("draws") or {}).get("num_mc_samples"),
-        "split": summary.get("scored_split") or {},
     }
 
 

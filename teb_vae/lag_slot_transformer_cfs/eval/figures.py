@@ -1,10 +1,11 @@
 r"""The figures of one scoring pass and of one acceptance record, drawn from the artifacts alone.
 
-**Every builder here takes the parsed summary, never a tensor.** A figure is a picture of a number
-the summary already carries -- an interval, a curve, a margin -- so a figure and the number beside
-it cannot disagree, and the whole set can be redrawn from a finished directory on a box with no
-checkpoint, no shard and no ``torch``. That is also what makes each builder testable against a
-hand-written summary.
+**Every builder here takes the summary's results block, never a tensor.** A figure is a picture of
+a number the results already carry -- an interval, a curve, a margin -- so a figure and the number
+beside it cannot disagree, and the whole set can be redrawn from a finished directory on a box
+with no checkpoint, no shard and no ``torch``. That is also what makes each builder testable
+against a hand-written block. The run's figures are written by this cell's own analyses, each
+into its own subdirectory; what is here is the drawing.
 
 **What the figures are, and the rule behind each.**
 
@@ -49,7 +50,6 @@ from teb_vae.lag_attn.eval.figures import (  # noqa: E402
     COLOR_VERMILLION,
     EMPTY_NOTE,
     FIGURE_WIDTH,
-    active_figure_format,
     footnote,
     layout_rect,
     histogram_panel,
@@ -59,13 +59,12 @@ from teb_vae.lag_attn.eval.figures import (  # noqa: E402
 )
 from teb_vae.lag_attn.eval.figures import configure_figure_style as _configure_shared_style  # noqa: E402
 from teb_vae.lag_attn.nets.lag_report import SECONDS_PER_STEP  # noqa: E402
+from teb_vae.lag_slot_transformer_cfs.eval.lag_metrics import SUPPRESSION_PREFIX  # noqa: E402
 from teb_vae.lag_slot_transformer_cfs.nets.controls import SUPPRESSION_QUALIFICATION  # noqa: E402
 
 __all__ = [
     "ACCEPTANCE_FIGURES",
     "BAND_COLORS",
-    "FIGURES_DIRNAME",
-    "RUN_FIGURES",
     "build_acceptance_arms_figure",
     "build_acceptance_bands_figure",
     "build_acceptance_comparisons_figure",
@@ -77,11 +76,7 @@ __all__ = [
     "build_lag_profile_figure",
     "configure_figure_style",
     "render_acceptance_figures",
-    "render_run_figures",
 ]
-
-#: The subdirectory of a results directory the run's figures are written into.
-FIGURES_DIRNAME = "figures"
 
 #: Fixed colours for the declared lag bands, assigned in declaration order and never cycled: a
 #: fifth band, should a configuration declare one, takes a shade from a sequential map rather than
@@ -113,9 +108,8 @@ _VALUE_GAP_POINTS = 4.0
 _DOT_ROW_HEIGHT = 0.28
 _DOT_MARGIN_HEIGHT = 1.1
 
-#: The prefix a band's column carries in the summary, restated here so this module reads a summary
-#: without importing the pass that wrote it.
-_SUPPRESSION_PREFIX = "suppress:"
+#: The prefix a band's column carries, from the readout module that names the arms.
+_SUPPRESSION_PREFIX = SUPPRESSION_PREFIX
 
 #: The order the arms of a run are listed in on the headline figure, by family; every arm the
 #: summary carries and this order does not name is appended after them, so nothing is dropped.
@@ -126,18 +120,6 @@ _ARM_ORDER: Tuple[Tuple[str, str], ...] = (
     ("replace:zeros", "control"),
     ("replace:constant", "control"),
     ("permute", "control"),
-)
-
-#: The names the run's figures are written under, in the order they are drawn. Stems: the format
-#: is the run's.
-RUN_FIGURES: Tuple[str, ...] = (
-    "headline_arms",
-    "pred_gap_recordings",
-    "band_suppression",
-    "lag_profile",
-    "horizon_resolved",
-    "block_resolved",
-    "calibration",
 )
 
 #: The names an acceptance record's figures are written under.
@@ -361,16 +343,16 @@ def _band_colour(index: int, count: int) -> Any:
     return plt.get_cmap("cividis")(0.2 + 0.6 * (index - len(BAND_COLORS)) / extra)
 
 
-def _declared_bands(summary: Mapping[str, Any]) -> List[str]:
+def _declared_bands(results: Mapping[str, Any]) -> List[str]:
     """The lag bands a summary declares, in declaration order and without the two identities.
 
     Args:
-        summary: The parsed summary.
+        results: The results block of the summary.
 
     Returns:
         The band names.
     """
-    bands = (summary.get("lag_readouts") or {}).get("band_suppression") or {}
+    bands = (results.get("lag_readouts") or {}).get("band_suppression") or {}
     return [name for name in bands if name not in ("none", "all")]
 
 
@@ -395,7 +377,7 @@ def _lag_seconds_axis(ax: Any, step_seconds: float, delay_steps: int) -> None:
         return
 
 
-def _shade_bands(ax: Any, summary: Mapping[str, Any], *, label: bool) -> None:
+def _shade_bands(ax: Any, results: Mapping[str, Any], *, label: bool) -> None:
     """Shade the declared lag bands on a lag axis and name them along the top.
 
     The band edges come from the run's own override delta as the summary records them under the
@@ -404,11 +386,11 @@ def _shade_bands(ax: Any, summary: Mapping[str, Any], *, label: bool) -> None:
 
     Args:
         ax: The axes whose x axis is the lag index.
-        summary: The parsed summary.
+        results: The results block of the summary.
         label: Whether to write the band names.
     """
-    edges = (summary.get("lag_readouts") or {}).get("band_edges") or {}
-    names = _declared_bands(summary)
+    edges = (results.get("lag_readouts") or {}).get("band_edges") or {}
+    names = _declared_bands(results)
     for index, name in enumerate(names):
         span = edges.get(name)
         if not span:
@@ -429,7 +411,7 @@ def _shade_bands(ax: Any, summary: Mapping[str, Any], *, label: bool) -> None:
 # =============================================================================
 # The run's figures
 # =============================================================================
-def build_headline_figure(summary: Mapping[str, Any]) -> Any:
+def build_headline_figure(results: Mapping[str, Any]) -> Any:
     """Every scored arm's predictive score, and every margin against the matched branch.
 
     Two panels. The left lists each arm's own equal-recording score with its interval, in a fixed
@@ -438,15 +420,15 @@ def build_headline_figure(summary: Mapping[str, Any]) -> Any:
     margin rests on. The gap itself is the first row of the right panel.
 
     Args:
-        summary: The parsed summary.
+        results: The results block of the summary.
 
     Returns:
         The figure.
     """
-    headline = summary.get("headline") or {}
-    readouts = summary.get("lag_readouts") or {}
+    headline = results.get("arm_scores") or {}
+    readouts = results.get("lag_readouts") or {}
     bands = readouts.get("band_suppression") or {}
-    controls = summary.get("source_controls") or {}
+    controls = results.get("source_controls") or {}
 
     ordered: List[Tuple[str, str]] = list(_ARM_ORDER)
     for name in bands:
@@ -510,7 +492,7 @@ def build_headline_figure(summary: Mapping[str, Any]) -> Any:
 
 
 def build_gap_distribution_figure(
-    summary: Mapping[str, Any], per_recording: Mapping[str, Mapping[str, Any]]
+    results: Mapping[str, Any], per_recording: Mapping[str, Mapping[str, Any]]
 ) -> Any:
     """How the gap and the effective draw count are spread across recordings.
 
@@ -520,7 +502,7 @@ def build_gap_distribution_figure(
     warning that $K$ was too small for those recordings.
 
     Args:
-        summary: The parsed summary.
+        results: The results block of the summary.
         per_recording: ``{recording: {column: value}}`` from the per-recording table.
 
     Returns:
@@ -528,7 +510,7 @@ def build_gap_distribution_figure(
     """
     gaps = [row.get("pred_gap") for row in per_recording.values()]
     concentration = [row.get("draw_concentration_full") for row in per_recording.values()]
-    draws = (summary.get("draws") or {}).get("num_mc_samples")
+    draws = (results.get("draws") or {}).get("num_mc_samples")
 
     fig, axes = plt.subplots(1, 2, figsize=(FIGURE_WIDTH, 2.6))
     histogram_panel(
@@ -547,19 +529,19 @@ def build_gap_distribution_figure(
     return _finish(fig)
 
 
-def build_band_figure(summary: Mapping[str, Any]) -> Any:
+def build_band_figure(results: Mapping[str, Any]) -> Any:
     """Each declared band's suppression margin with its paired interval, and its exposure.
 
     Two panels on one band axis: the margin, and the usable anchor count behind it. The second is
     what says whether a small margin is a small effect or a band with little source to remove.
 
     Args:
-        summary: The parsed summary.
+        results: The results block of the summary.
 
     Returns:
         The figure.
     """
-    bands = (summary.get("lag_readouts") or {}).get("band_suppression") or {}
+    bands = (results.get("lag_readouts") or {}).get("band_suppression") or {}
     names = [name for name in bands if name != "none"]
     fig, axes = plt.subplots(1, 2, figsize=(FIGURE_WIDTH, _dot_figure_height(len(names))))
     rows = []
@@ -584,7 +566,7 @@ def build_band_figure(summary: Mapping[str, Any]) -> Any:
     return _finish(fig, footnote_text=SUPPRESSION_QUALIFICATION)
 
 
-def build_lag_profile_figure(summary: Mapping[str, Any]) -> Any:
+def build_lag_profile_figure(results: Mapping[str, Any]) -> Any:
     """The lag axis at every candidate lag: exposure, the latent profile, the predictive margin.
 
     Four panels sharing the lag axis, top to bottom: the fraction of scored anchors at which the
@@ -595,12 +577,12 @@ def build_lag_profile_figure(summary: Mapping[str, Any]) -> Any:
     bands are shaded across every panel.
 
     Args:
-        summary: The parsed summary.
+        results: The results block of the summary.
 
     Returns:
         The figure.
     """
-    readouts = summary.get("lag_readouts") or {}
+    readouts = results.get("lag_readouts") or {}
     exposure = readouts.get("exposure") or {}
     axis = readouts.get("lag_axis") or {}
     profile = readouts.get("lag_profile") or {}
@@ -633,7 +615,7 @@ def build_lag_profile_figure(summary: Mapping[str, Any]) -> Any:
     ax.set_title("Exposure per lag")
     legend_with_headroom(ax, ncol=2, below=True)
     style_axes(ax)
-    _shade_bands(ax, summary, label=True)
+    _shade_bands(ax, results, label=True)
 
     # The latent profile: what the head emitted, and what removing it does to the update.
     ax = axes[1]
@@ -655,7 +637,7 @@ def build_lag_profile_figure(summary: Mapping[str, Any]) -> Any:
         ax.set_title("Latent profile per lag")
         legend_with_headroom(ax, ncol=3)
         style_axes(ax)
-        _shade_bands(ax, summary, label=False)
+        _shade_bands(ax, results, label=False)
     else:
         _note_empty(ax, "no latent profile: this arm sums no per-lag updates")
 
@@ -668,7 +650,7 @@ def build_lag_profile_figure(summary: Mapping[str, Any]) -> Any:
         ax.set_ylabel("nats per anchor")
         ax.set_title("Divergence drop, lag removed alone (signed)")
         style_axes(ax)
-        _shade_bands(ax, summary, label=False)
+        _shade_bands(ax, results, label=False)
     else:
         _note_empty(ax, "no latent profile: this arm sums no per-lag updates")
 
@@ -686,7 +668,7 @@ def build_lag_profile_figure(summary: Mapping[str, Any]) -> Any:
         ax.set_title("Predictive margin, lag removed alone")
         legend_with_headroom(ax)
         style_axes(ax)
-        _shade_bands(ax, summary, label=False)
+        _shade_bands(ax, results, label=False)
     else:
         _note_empty(ax, f"predictive lag profile {predictive.get('status', 'absent')}")
     ax.set_xlabel("lag (stored steps back from the anchor)")
@@ -697,7 +679,7 @@ def build_lag_profile_figure(summary: Mapping[str, Any]) -> Any:
     return _finish(fig, footnote_text=SUPPRESSION_QUALIFICATION)
 
 
-def build_horizon_figure(summary: Mapping[str, Any]) -> Any:
+def build_horizon_figure(results: Mapping[str, Any]) -> Any:
     """The gap and every margin resolved by horizon step, each with its interval.
 
     Three panels sharing the horizon axis: the gap; the band margins, one fixed colour per
@@ -706,12 +688,12 @@ def build_horizon_figure(summary: Mapping[str, Any]) -> Any:
     shape rather than its total.
 
     Args:
-        summary: The parsed summary.
+        results: The results block of the summary.
 
     Returns:
         The figure.
     """
-    block = summary.get("horizon_resolved") or {}
+    block = results.get("horizon_resolved") or {}
     positions = list(block.get("positions") or [])
     fig, axes = plt.subplots(3, 1, figsize=(FIGURE_WIDTH, 6.6), sharex=True)
     if not positions:
@@ -731,7 +713,7 @@ def build_horizon_figure(summary: Mapping[str, Any]) -> Any:
         _note_empty(ax)
 
     ax = axes[1]
-    names = _declared_bands(summary)
+    names = _declared_bands(results)
     band_margins = block.get("band_margins") or {}
     drawn = 0
     for index, name in enumerate(names):
@@ -776,7 +758,7 @@ def build_horizon_figure(summary: Mapping[str, Any]) -> Any:
     )
 
 
-def build_block_figure(summary: Mapping[str, Any]) -> Any:
+def build_block_figure(results: Mapping[str, Any]) -> Any:
     """The gap and the margins resolved by stored target block.
 
     One panel per block, each a dot plot of the gap and every margin with its paired interval.
@@ -784,12 +766,12 @@ def build_block_figure(summary: Mapping[str, Any]) -> Any:
     the same size and a nat summed over more channels is a larger number for that reason alone.
 
     Args:
-        summary: The parsed summary.
+        results: The results block of the summary.
 
     Returns:
         The figure.
     """
-    block = summary.get("block_resolved") or {}
+    block = results.get("block_resolved") or {}
     positions = list(block.get("positions") or [])
     counts = block.get("channels_per_block") or {}
     if not positions:
@@ -797,7 +779,7 @@ def build_block_figure(summary: Mapping[str, Any]) -> Any:
         _note_empty(ax, "no block-resolved score was collected")
         return _finish(fig)
 
-    names = _declared_bands(summary)
+    names = _declared_bands(results)
     fig, axes = plt.subplots(
         1, len(positions), figsize=(min(FIGURE_WIDTH, 3.6 * len(positions)), 2.8), sharex=True,
     )
@@ -820,7 +802,7 @@ def build_block_figure(summary: Mapping[str, Any]) -> Any:
     return _finish(fig)
 
 
-def build_calibration_figure(summary: Mapping[str, Any]) -> Any:
+def build_calibration_figure(results: Mapping[str, Any]) -> Any:
     """Mixture calibration of both branches: central coverage against nominal, and the transform.
 
     Left, the coverage of each central interval against its nominal level, with the diagonal a
@@ -828,12 +810,12 @@ def build_calibration_figure(summary: Mapping[str, Any]) -> Any:
     transform against the uniform reference the summary carries beside them.
 
     Args:
-        summary: The parsed summary.
+        results: The results block of the summary.
 
     Returns:
         The figure.
     """
-    calibration = summary.get("calibration") or {}
+    calibration = results.get("mixture_calibration") or {}
     fig, axes = plt.subplots(1, 2, figsize=(FIGURE_WIDTH, 2.8))
 
     ax = axes[0]
@@ -880,40 +862,6 @@ def build_calibration_figure(summary: Mapping[str, Any]) -> Any:
                label="uniform variance")
     ax.legend(loc="center")
     return _finish(fig)
-
-
-def render_run_figures(
-    summary: Mapping[str, Any],
-    results_dir: Any,
-    *,
-    per_recording: Mapping[str, Mapping[str, Any]],
-) -> Dict[str, Any]:
-    """Draw every figure of one run into its figures directory.
-
-    Args:
-        summary: The assembled summary.
-        results_dir: The run's results directory.
-        per_recording: ``{recording: {column: value}}``, the per-recording table.
-
-    Returns:
-        ``{'directory', 'format', 'files': {name: relative path}}``.
-    """
-    directory = Path(str(results_dir)) / FIGURES_DIRNAME
-    directory.mkdir(parents=True, exist_ok=True)
-    builders = {
-        "headline_arms": lambda: build_headline_figure(summary),
-        "pred_gap_recordings": lambda: build_gap_distribution_figure(summary, per_recording),
-        "band_suppression": lambda: build_band_figure(summary),
-        "lag_profile": lambda: build_lag_profile_figure(summary),
-        "horizon_resolved": lambda: build_horizon_figure(summary),
-        "block_resolved": lambda: build_block_figure(summary),
-        "calibration": lambda: build_calibration_figure(summary),
-    }
-    files: Dict[str, str] = {}
-    for name in RUN_FIGURES:
-        written = render_figure(builders[name](), directory / name, tight=False)
-        files[name] = Path(written).relative_to(Path(str(results_dir))).as_posix()
-    return {"directory": FIGURES_DIRNAME, "format": active_figure_format(), "files": files}
 
 
 # =============================================================================
