@@ -625,8 +625,15 @@ class Collector:
             self._extend(name, np.where(scored, column, np.nan).tolist())
 
     def _append_vectors(self, readout: BatchReadout, scored: np.ndarray) -> None:
-        """Append the per-sample vector readouts the readout carries, blanked like the scalars."""
-        for name in VECTOR_READOUTS:
+        """Append the per-sample vector readouts the readout carries, blanked like the scalars.
+
+        The family's names come from :data:`VECTOR_READOUTS`; a binding's own readout may carry
+        further per-sample vectors under names of its own by listing them in an
+        ``extra_vector_readouts`` attribute. Declared on the readout rather than added to the
+        family's tuple, because that tuple is the contract of what a lag-attentive pass writes
+        and a name only one cell produces does not belong in it.
+        """
+        for name in (*VECTOR_READOUTS, *getattr(readout, "extra_vector_readouts", ())):
             values = getattr(readout, name, None)
             if values is None:
                 continue

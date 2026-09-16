@@ -13,7 +13,7 @@ Start with `headline_arms` for overall predictive performance, then `pred_gap_re
 - **Read missing-data messages.** An unavailable result is labelled with a reason. Target-only models have no band or lag profile, and normalised fusion has no additive latent profile. An absent measurement should not be read as zero.
 - **Lag axes show stored-coefficient time.** Lag $\ell$ identifies a source coefficient stored $\ell$ steps before the anchor. The seconds axis converts stored steps to seconds. Upstream causal feature extraction combines raw history within each coefficient, so these axes do not measure physiological delay. Every lag figure carries this qualification.
 
-The plots use the shared style in `teb_vae/lag_attn/eval/figures.py`: double-column width, 7 pt serif text, open frames, legends above the data, and the Okabe-Ito colour-blind-safe palette. Panel letters (**a**, **b**, and so on) run left to right, then top to bottom. Qualifications appear as 6 pt footnotes in reserved space below the axes.
+The plots use the shared style in `teb_vae/lag_attn/eval/figures.py`: double-column width, a 5.5–7 pt serif type scale, hairline frames and data lines, histogram bars with a thin dark outline, open frames, legends above the data, and the Okabe-Ito colour-blind-safe palette. Panel letters (**a**, **b**, and so on) run left to right, then top to bottom. Qualifications appear as 6 pt footnotes in reserved space below the axes.
 
 ## Scoring figures
 
@@ -111,6 +111,68 @@ Up to `eval_config.caps.traces_per_class` recordings are shown per class. These 
 All segments share one axis of hours before delivery, delivery on the right. Rows show divergence, the forward pass's single-draw forecast gap, full-branch latent means, bounded mean update $a_t$, per-coordinate divergence, proposal norms over lags, latent norms, mean log-variances, the proposal-norm lag centroid, and mean-update cancellation ratio. The mean and update heatmaps use symmetric colour scales; every heatmap's colour axis sits in its own column so all rows span the same hours. The largest-proposal lag is drawn over the lag heatmap. On the divergence and forecast-gap rows a black step marks each segment's mean over its scored anchors, the value the summary figure carries. Segments alternate a faint background on the line rows, a gap the dataset holds no segment for is shaded darker on every row, line plots break at unscored anchors, and a clinical clock the recording carries is ruled across the page at its onset (labour onset dashed, second stage dotted).
 
 **Interpretation:** The lag heatmap shows proposal magnitude before summation and limiting. It is neither a lag probability distribution nor an allocation of divergence. A jump at a segment boundary can reflect the reset encoder state because each segment is a separate forward pass. Colour scales are set per recording. The lag row is absent for normalised fusion and target-only models, as recorded by `lag_family_present`.
+
+## Lag-structure figures
+
+These figures are drawn from the two sidecars the collection pass writes (the per-segment proposal-norm and divergence-drop profiles, and the per-anchor maps) and from the family's tables, with no model. Every one of them carries the suppression qualification as a footnote: the proposal norm is what the fitted head emitted at a lag and the divergence drop is what removing that lag alone does to the divergence; neither is an allocation over lags, and neither is a physiological delay. Lag axes are stored-coefficient seconds; the declared bands are shaded in their fixed colours with their names along the bottom of each panel.
+
+### `proposal_profile/proposal_profile`
+
+**Panels:** (a) the proposal norm by lag, pooled over recordings: the median with its inter-quartile ribbon, the mean dashed. (b) The signed divergence drop by lag, the same way, with zero marked.
+
+**Interpretation:** Each recording's segments are averaged first, so a recording with many segments does not outvote one with few. The guarded peak is marked as a dashed vertical when the family's degeneracy rule accepts it; a legend entry says the peak is degenerate when the profile is too flat for its argmax to name a lag rather than a bin. `proposal_profile_peaks.csv` carries the same reading per cohort.
+
+### `proposal_profile/proposal_profile_stratified`
+
+**Panels:** One row per profile, one column per cohort axis (clinical class; subgroup). Each curve is a cohort's pooled profile normalised to a share over the lags.
+
+**Interpretation:** Shares, not magnitudes, so a cohort with larger proposals does not sit above the others for that reason alone; the magnitude is on `proposal_profile_per_recording.csv` and its `_by_clinical_class` and `_by_subgroup` violin pages. The signed profile is rectified before normalising and its discarded negative mass is on the segment table.
+
+### `proposal_clocks/proposal_<clock>`
+
+**Panels:** One heatmap per clinical class of the class's share of the proposal norm by lag (down) and window (across), on one colour scale; then one panel per tested centroid (`centroid_s_proposal`, `centroid_s_drop`) with the median over recordings per window and its inter-quartile ribbon, the recording count on every point.
+
+**Interpretation:** A class whose mass moves down the lag axis as delivery approaches is a class whose fitted head reads a different past later in labour. The heatmap answers *where*; the band page answers *how much*. The delivery clock reads right-to-left toward delivery; the second-stage clock is signed, negative before onset, and admits recordings with an onset only.
+
+### `proposal_clocks/proposal_<clock>_windows`
+
+**Panels:** For each tested centroid: the per-recording distribution per window and class as dodged violins with counts; the Holm-adjusted $p$ of each window's Kruskal-Wallis against $\alpha$; Cliff's delta for every class pair in a surviving window.
+
+**Interpretation:** The same page as the family's `time_to_delivery_windows`, read the same way. A cross at zero is a window that could not be tested, not a window with no effect.
+
+### `proposal_clocks/proposal_<clock>_bands`
+
+**Panels:** One row per declared band and one column per profile: the band's proposal-norm mass (latent units) and its signed divergence drop (nats per anchor) per class against the clock.
+
+**Interpretation:** The magnitude the share heatmaps divide out. A line moving between rows is the informative past moving; a line moving within a row is that band's magnitude changing. The band's signed drop is summed signed, so a cancelled proposal reduces it; compare it with the same band's suppression margin on `band_margins_<clock>`.
+
+### `band_clocks/band_margins_<clock>`
+
+**Panels:** One row per declared band with the paired suppression margin per window and class (median, inter-quartile ribbon, counts); a final row with the three source-control margins over all classes.
+
+**Interpretation:** Descriptive only: no test runs on these cells. A positive margin means the fitted model predicts that window worse with the band's proposals removed. The reference identities (`none`, `all`) are not drawn.
+
+### `high_kl_anchors/high_kl_selection`
+
+**Panels:** (a) The pooled per-anchor divergence per class on a log axis, with the `high` and `top` thresholds. (b) The mean proposal profile of every selection (`all`, `high`, `rest`, `top`, `gain`), hot lags shaded. (c) The share of each divergence decile's anchors whose largest proposal sits at each lag. (d) Per recording, the high-anchor share inside a contraction window minus outside it, by class.
+
+**Interpretation:** One set of thresholds for the whole run, so every class is cut at the same divergence. The hot-lag set is chosen from the same map it summarises; a share on it describes the run's own selection. A flat picture in (c) says the largest proposal's lag is a property of the geometry rather than of the coupling.
+
+### `high_kl_anchors/high_kl_usefulness`
+
+**Panels:** (a) Mean forecast gain by divergence decile, pooled and per class. (b) Each recording's mean gain on its high anchors against its rest anchors, joined, with the paired difference, its bootstrap interval and the Wilcoxon $p$. (c) Mean gain by the anchor's largest-proposal lag, anchor counts on the bars. (d) The overlap of the high and gain selections against the share independence would give.
+
+**Interpretation:** A large divergence says the latent moved, not that the forecast improved. Positive in (b) means the anchors carrying the divergence are the anchors where the source bought forecast. Two selections naming the same anchors in (d) is one finding; two that do not is the other.
+
+### `high_kl_anchors/high_kl_<clock>` and `high_kl_<clock>_windows`
+
+**Panels:** The tested readouts of the selection (`high_anchor_frac`, `high_centroid_s`) per window and class, and their windows page.
+
+**Interpretation:** Read as `proposal_<clock>` and its windows page. The high-anchor fraction is the share of a segment's anchors above the run's threshold; a class whose fraction rises toward delivery is a class whose latent moves more there.
+
+### Family figures written by this cell
+
+`warmup/warmup_tertiles`, `warmup/causal_warmup_budget`, `warmup/causal_warmup_tradeoff`, `source_null/source_null_difference` and `spectral_skill/spectral_skill_bands` are the family's own figures of the family's own columns, and the family's [figure guide](../../lag_attn_cfs/eval/FIGURE_GUIDE.md) describes them. Two differences apply here: the warm-up page's second panel (the source-lag warmth fractions) is absent, because those are an attention mass; and `source_null` writes no lag-profile figure, because its lag-resolved half is a per-lag divergence allocation this architecture does not compute. The `_by_clinical_class` and `_by_subgroup` pages of every per-recording table above follow the family's grouped-variant convention.
 
 ## Input-attribution figures
 

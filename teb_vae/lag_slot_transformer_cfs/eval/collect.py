@@ -63,26 +63,35 @@ headline is the gap against the internal base, and its sign is the first thing t
 """
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+from pathlib import Path
+from typing import Any, ClassVar, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
 import torch
 from loguru import logger
 
+from teb_vae.lag_attn.eval import labels
 from teb_vae.lag_attn.eval.stats import bootstrap_ci
 from teb_vae.lag_attn.nets.lag_report import SECONDS_PER_STEP
 from teb_vae.lag_attn_cfs.eval import collect as shared_collect
 from teb_vae.lag_attn_cfs.eval.metrics import (
     BASELINE_LOGVAR,
+    DEFAULT_COVERAGE_TAIL_TOLERANCE,
     DENSE_ANCHOR_GEOMETRY,
+    FAIL,
+    INCONCLUSIVE,
     NORMALISED_UNIT,
+    PASS,
     Aggregate,
+    Verdict,
     baseline_forecasts,
     batch_field,
     batch_guids,
     batch_recordings,
+    batch_size_of,
     branch_channel_scores,
     build_verdicts,
     calibration_report,
@@ -100,6 +109,7 @@ from teb_vae.lag_attn_rws.nets.model import LOGVAR_FLOOR_MARGIN_FRAC, SATURATION
 from teb_vae.lag_attn_rws.nets.raw_masks import forecast_mask
 from teb_vae.lag_slot_transformer_cfs.eval import lag_metrics
 from teb_vae.lag_slot_transformer_cfs.eval.binding import (
+    ANALOGUE_ANALYSES,
     ANALYSES_THIS_ARCHITECTURE_CANNOT_PRODUCE,
     EXCLUDED_ANALYSES,
     MODEL_KIND,
@@ -177,6 +187,40 @@ SHARED_ARM_NAMES: Mapping[str, str] = {
 #: The warm-up tertile names, in the order ``warm_tertile_id`` numbers them.
 TERTILE_NAMES: Tuple[str, ...] = ("lo", "mid", "hi")
 
+#: The two per-anchor lag maps this cell writes to the family's per-anchor sidecar, one row per
+#: contributing anchor and one column per candidate lag. The proposal norm
+#: $\lVert r^\mu_{t,\ell} \rVert_2$ and the signed divergence drop $K_t - K_t^{\setminus \ell}$,
+#: exactly zero at a lag the anchor could not read. Named for what they are: neither is an
+#: attention distribution and neither allocates the divergence over lags, and the family's names
+#: for those two tensors are refused by this cell's gate.
+PROPOSAL_LAG_MAP = "proposal_lag_map"
+DIVERGENCE_DROP_LAG_MAP = "divergence_drop_lag_map"
+
+#: The per-anchor column naming the lag whose proposal norm was largest at that anchor, ``-1``
+#: where no lag was live. The proposal-norm counterpart of the family's KL argmax column, under
+#: its own name because it is a different quantity.
+PROPOSAL_ARGMAX_COLUMN = "proposal_argmax_lag"
+
+#: The per-segment predictive margin of every intervened arm against the matched branch, as a
+#: column of the family's per-sample table: ``margin_<arm>`` with the arm's ``:`` written ``_``,
+#: so ``suppress:near`` becomes ``margin_suppress_near`` and ``replace:zeros`` becomes
+#: ``margin_replace_zeros``. Per segment rather than per recording, because the clock-resolved
+#: readouts bin segments; the per-recording margins the headline reads are on this cell's own
+#: table and are the same numbers reduced once more.
+MARGIN_COLUMN_PREFIX = "margin_"
+
+
+def margin_column(arm: str) -> str:
+    """The per-sample column an intervened arm's paired margin travels under.
+
+    Args:
+        arm: The scored arm's name, as this cell's tables name it.
+
+    Returns:
+        ``margin_<arm>`` with ``:`` written as ``_``.
+    """
+    return f"{MARGIN_COLUMN_PREFIX}{arm.replace(':', '_')}"
+
 #: The sentence the two ``pred_gap`` conventions are stated in, written into the results block so
 #: a reader of one table beside the other has it without this module.
 PRED_GAP_CONVENTIONS = (
@@ -188,6 +232,72 @@ PRED_GAP_CONVENTIONS = (
     "because that is the number this cell's acceptance protocol reads. The two tables carry the "
     "same numbers under the two names; neither is a second estimate of the other."
 )
+
+#: What this cell says about the family's sufficiency probe, written beside that analysis's own
+#: block. The probe's oracle conditions on ``target_state`` alone: it sees neither the metadata
+#: clock the prior head reads nor the persistence input the production decoder carries, and it
+#: is invoked as ``probe(states)`` with no persistence path at all. Its gap against ``D_base`` is
+#: therefore not the bottleneck's cost on matched information, and the summary says so where a
+#: reader will meet the number. The repair is deferred, and this marker stays until it lands.
+SUFFICIENCY_QUALIFICATION: Mapping[str, str] = {
+    "interpretation": "UNAVAILABLE",
+    "reason": (
+        "the family's sufficiency probe conditions on target_state alone -- it reads neither the "
+        "metadata clock the prior head conditions on nor the persistence input the production "
+        "decoder receives, and it is invoked without the persistence path -- so its gap against "
+        "D_base compares two predictors with different information and different output "
+        "mechanisms. Read delta_suff_nats as a probe fit, not as the latent bottleneck's cost."
+    ),
+    "block": "sufficiency",
+}
+
+#: The results schema this pass writes. Bumped when a block changes meaning or a column is added
+#: whose absence a reader could mistake for a measurement; ``eval.verify`` accepts every version
+#: it knows. Version 2 added the weighted objective-parity columns, the anchor-within-recording
+#: estimand, the interval-read verdicts and the declared lag-profile cohort.
+RESULTS_SCHEMA_VERSION = 2
+
+#: The four estimators a score column of this cell can be, each under the names that carry it.
+#: Written into the results block so a reader of one table beside another has the distinction
+#: without this module: the four are different numbers answering different questions, and a gap
+#: under one of them is not a second estimate of a gap under another.
+SCORE_CONVENTIONS: Mapping[str, Mapping[str, str]] = {
+    "weighted_objective": {
+        "columns": "nll_full_block_weighted, nll_base_block_weighted, pred_gap_weighted",
+        "meaning": (
+            "the training objective's reconstruction terms: one shared draw, the block summed "
+            "under the configured channel and horizon weights, per contributing anchor. "
+            "Reproduces compute_loss's nll_full_block and nll_base_block. A weighted block score "
+            "is not a log density in nats."
+        ),
+    },
+    "single_draw_conditional": {
+        "columns": "nll_full_block, nll_base_block, pred_gap (per_sample.csv)",
+        "meaning": (
+            "the same shared draw scored UNWEIGHTED over the block: a conditional log density "
+            "given one latent sample, in nats per anchor. Neither the training objective nor "
+            "the predictive density."
+        ),
+    },
+    "latent_mean": {
+        "columns": "mean_nll_full_block, mean_nll_base_block, mean_pred_gap",
+        "meaning": (
+            "the decoder evaluated at the latent MEAN with no draw: a plug-in point forecast's "
+            "score, not a marginalisation over the latent."
+        ),
+    },
+    "predictive_mixture": {
+        "columns": (
+            "mc_nll_<arm>_block, mc_pred_gap (per_sample.csv); nll_<arm>, pred_gap "
+            "(per_recording.csv, arm_scores); pred_gap_mc_nats (headline)"
+        ),
+        "meaning": (
+            "the negative log of the average likelihood over K shared draws: the predictive "
+            "density, in nats per anchor. The headline and every scientific verdict read this "
+            "estimator and no other."
+        ),
+    },
+}
 
 
 @dataclass
@@ -219,8 +329,22 @@ class SharedReadout:
             branch's scored coefficients; empty under ``'mse'``.
         n_control_pairs: Samples paired against another recording by the permutation control.
         n_same_recording_pairs: How many of those pairs landed inside their own recording.
-        per_anchor_vectors: Empty. No per-anchor lag map exists on this architecture.
+        per_anchor_vectors: This cell's own per-anchor lag maps -- :data:`PROPOSAL_LAG_MAP` and
+            :data:`DIVERGENCE_DROP_LAG_MAP`, each $(B, A, L)$ -- written to the family's
+            per-anchor sidecar under this cell's own names. Empty on an arm that sums no per-lag
+            updates. Neither is an attention distribution or a divergence allocation, and neither
+            is written under a name the family gives one.
+        proposal_lag_profile: The per-segment mean of the proposal-norm map over the anchors
+            each lag was live at, $(B, L)$; ``None`` where the arm has no proposals.
+        divergence_drop_lag_profile: The same reduction of the signed divergence-drop map.
     """
+
+    #: The per-sample vectors the shared sink reads off this readout beyond the family's own.
+    #: A class attribute rather than a field: the sink reads it by name and it never varies.
+    extra_vector_readouts: ClassVar[Tuple[str, ...]] = (
+        "proposal_lag_profile",
+        "divergence_drop_lag_profile",
+    )
 
     guids: List[str]
     columns: Dict[str, torch.Tensor]
@@ -236,6 +360,161 @@ class SharedReadout:
     n_control_pairs: int = 0
     n_same_recording_pairs: int = 0
     per_anchor_vectors: Dict[str, torch.Tensor] = field(default_factory=dict)
+    proposal_lag_profile: Optional[torch.Tensor] = None
+    divergence_drop_lag_profile: Optional[torch.Tensor] = None
+
+
+# =============================================================================
+# The single-lag profile's cohort
+# =============================================================================
+def shard_classes(loader: Any) -> List[str]:
+    """The clinical classes the evaluation split's shards declare by their canonical names.
+
+    Read off the dataset's own path list rather than off the batches, because the profile cohort
+    is decided batch by batch and needs to know how many classes it is balancing over before the
+    last batch arrives. A shard outside the canonical eight -- the pretraining split's names --
+    declares no class, and a split of only such shards is balanced over nothing.
+
+    Args:
+        loader: The evaluation dataloader.
+
+    Returns:
+        The distinct class names, in canonical order; empty when no shard names one.
+    """
+    dataset = getattr(loader, "dataset", None)
+    paths = getattr(dataset, "paths", None) or []
+    found: List[str] = []
+    for path in paths:
+        stem = Path(str(path)).name
+        for suffix in (".hdf5", ".h5"):
+            if stem.endswith(suffix):
+                stem = stem[: -len(suffix)]
+        if stem not in labels.CANONICAL_SUBGROUPS:
+            continue
+        name = stem.split("_")[0]
+        if name not in found:
+            found.append(name)
+    return found
+
+
+class LagProfileCohort:
+    r"""Decides, segment by segment, which segments the single-lag predictive profile scores.
+
+    The profile is the most expensive readout of the pass -- one decoder call per candidate lag
+    per draw -- so it is capped, and *which* segments fill the cap decides what population the
+    per-lag margins describe. A cap filled by the first segments the loader hands out is a draw
+    over the split only as far as the loader's shuffle makes it one, and says nothing about its
+    class composition. This cohort admits a segment while the cap has room **and its class has
+    room**: with $n$ classes declared by the split's shards, each class may fill at most
+    $\lceil \mathrm{cap} / n \rceil$ slots, so a rare class is not crowded out by a common one.
+    A split whose shards declare no class -- the pretraining names -- admits on the cap alone,
+    which is the legacy behaviour.
+
+    Every admitted segment's identity is kept, so the summary and the per-lag table say exactly
+    which recordings, at which stored times and of which class and subgroup, the margins were
+    read over.
+
+    Attributes:
+        cap: The segment cap, or ``None`` when the profile was not asked for.
+        quota: Per-class admission ceiling, empty when the split declares no class.
+        counts: Segments admitted so far per class key.
+        rows: The admitted segments' identities, in admission order.
+    """
+
+    #: The class key a segment carrying no clinical class is counted under.
+    UNLABELLED = "unlabelled"
+
+    def __init__(self, cap: Optional[int], classes: Sequence[str]) -> None:
+        """Initialise an empty cohort.
+
+        Args:
+            cap: The segment cap, or ``None``.
+            classes: The classes the split's shards declare, from :func:`shard_classes`.
+        """
+        self.cap = None if cap is None else int(cap)
+        self.quota: Dict[str, int] = {}
+        if self.cap is not None and classes:
+            per_class = int(math.ceil(self.cap / len(classes)))
+            self.quota = {str(name): per_class for name in classes}
+        self.counts: Dict[str, int] = {}
+        self.rows: List[Dict[str, Any]] = []
+
+    @property
+    def n_admitted(self) -> int:
+        """How many segments have been admitted."""
+        return len(self.rows)
+
+    def admit(self, batch: Any) -> Optional[torch.Tensor]:
+        """Decide which segments of one batch join the profile, and record their identities.
+
+        Args:
+            batch: The batch, for its identities and class labels.
+
+        Returns:
+            A ``(B,)`` boolean tensor on the CPU, ``True`` where the segment is admitted; or
+            ``None`` when no segment of the batch is, so the caller skips the single-lag arms.
+        """
+        if self.cap is None:
+            return None
+        batch_size = batch_size_of(batch)
+        guids = batch_guids(batch, batch_size)
+        labelled = labels.batch_labels(batch, batch_size)
+        epochs = batch_field(batch, "epoch")
+        admitted = torch.zeros(batch_size, dtype=torch.bool)
+        for index in range(batch_size):
+            if self.n_admitted >= self.cap:
+                break
+            class_name = labelled[labels.CLASS_COLUMN][index]
+            key = self.UNLABELLED if class_name is None else str(class_name)
+            # A class the shards did not declare -- an unlabelled segment on a labelled split, or
+            # an unexpected code -- is admitted on the cap alone, so it is counted but never
+            # starves a declared class of its own quota.
+            limit = self.quota.get(key, self.cap)
+            if self.counts.get(key, 0) >= limit:
+                continue
+            self.counts[key] = self.counts.get(key, 0) + 1
+            admitted[index] = True
+            epoch = None
+            if epochs is not None:
+                try:
+                    value = float(epochs[index])
+                    epoch = value if math.isfinite(value) else None
+                except (TypeError, ValueError, IndexError):
+                    epoch = None
+            self.rows.append(
+                {
+                    "guid": guids[index],
+                    "epoch": epoch,
+                    labels.CLASS_COLUMN: class_name,
+                    labels.SUBGROUP_COLUMN: labelled[labels.SUBGROUP_COLUMN][index],
+                }
+            )
+        return admitted if bool(admitted.any()) else None
+
+    def record(self) -> Dict[str, Any]:
+        """The cohort as the summary carries it: the identities, the composition, the rule.
+
+        Returns:
+            ``{'segments', 'composition', 'quota', 'selection'}``.
+        """
+        composition: Dict[str, int] = {}
+        for row in self.rows:
+            key = row[labels.CLASS_COLUMN]
+            key = self.UNLABELLED if key is None else str(key)
+            composition[key] = composition.get(key, 0) + 1
+        return {
+            "segments": [dict(row) for row in self.rows],
+            "composition": composition,
+            "quota": dict(self.quota),
+            "selection": (
+                "segments admitted in loader order under a fixed-seed shuffle while the cap and "
+                "the segment's class quota both had room; the quota is ceil(cap / n_classes) "
+                "over the classes the split's shards declare, so no class fills the cap alone"
+                if self.quota
+                else "segments admitted in loader order under a fixed-seed shuffle up to the "
+                "cap; the split's shards declare no clinical class, so no class quota applies"
+            ),
+        }
 
 
 # =============================================================================
@@ -348,6 +627,11 @@ def intervened_branches(
     at all. The permutation's pairing is reused for the prior-shuffle control, which decodes a
     stranger's **prior** under the same pairing.
 
+    Every substituted stream goes through the model's own forward, whose first step applies the
+    configured input ablation, so a control cannot reintroduce an ablated coefficient: a
+    stranger's stream, a constant stream and a zero stream all reach the encoder with the same
+    coordinate zeroed that the matched forward had.
+
     The single-lag arms are the band arms at the finest partition and come from the same cached
     subtraction. They exist only on the local fusion: on the normalised aggregation each would be
     one more forward per lag, and the reading would be a different quantity in any case.
@@ -380,6 +664,11 @@ def intervened_branches(
         # The permuted forward's own divergence per anchor, for the shared table's
         # ``source_conditioned_kl_shuffled_raw``; ``None`` where the arm did not run.
         "shuffled_kld_per_anchor": None,
+        # The zeroed-source forward's own divergence per anchor, for the family's
+        # ``kld_source_null``: the divergence the availability announcement and the clock alone
+        # produce, with every source value at the channel mean. ``None`` where the arm did not
+        # run.
+        "null_kld_per_anchor": None,
     }
 
     # A target-only checkpoint has no source pathway to intervene on, and that is a legitimate
@@ -486,6 +775,11 @@ def intervened_branches(
                 y_st, y_ph, substituted, anchor_phase=phase, anchor_stride=stride
             )
             branches[f"replace:{mode}"] = (replaced["mu_post"], replaced["logvar_post"])
+            if mode == "zeros":
+                # The same forward the family's source-null control reads: a zeroed stream with
+                # the availability announcement untouched. Its divergence is the clock's share
+                # of the coupling readout.
+                record["null_kld_per_anchor"] = replaced["kld_per_anchor"]
 
     if bool(getattr(model, "source_values_withheld", False)):
         # For the reason the replacement arms are skipped above, and one step stronger: the
@@ -528,6 +822,57 @@ def intervened_branches(
             "silently dropped -- a control that stopped being a control looks like one that works."
         )
     return branches, record
+
+
+def objective_parity_scores(
+    model: Any,
+    outputs: Mapping[str, torch.Tensor],
+    target: torch.Tensor,
+    mask: torch.Tensor,
+    *,
+    likelihood: str,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    r"""The two decoded forecasts scored exactly as the training objective scores them.
+
+    $$D^w_{r,b,a} = \sum_{h,c} M_{b,a,h}\, w_h\, w_c\, d^r_{b,a,h,c},$$
+
+    under the model's own registered channel and horizon weights and the same mask and reduction
+    ``compute_loss`` uses, so the per-anchor values here average to the ``nll_full_block`` and
+    ``nll_base_block`` a training log reports. The weights are read the way the objective reads
+    them -- a buffer where the arm registered one, ``None`` otherwise -- so an unweighted arm's
+    parity scores equal its unweighted single-draw scores rather than being multiplied by ones.
+
+    Args:
+        model: The net, for its weight buffers.
+        outputs: The matched forward's dict, for the two decoded forecasts.
+        target: The gathered forecast target $(B, A, H, C_{\mathrm{keep}})$.
+        mask: The forecast mask $(B, A, H)$.
+        likelihood: ``'mse'`` or ``'gaussian_nll'``.
+
+    Returns:
+        ``(full, base)``: the weighted per-anchor block scores, each $(B, A)$.
+    """
+    channel_weight = getattr(model, "target_channel_weight", None)
+    horizon_weight = getattr(model, "horizon_weight", None)
+    full, _ = masked_raw_block_per_anchor(
+        outputs["mu_full"],
+        target,
+        mask,
+        likelihood=likelihood,
+        logvar=outputs["logvar_full"],
+        channel_weight=channel_weight,
+        horizon_weight=horizon_weight,
+    )
+    base, _ = masked_raw_block_per_anchor(
+        outputs["mu_base"],
+        target,
+        mask,
+        likelihood=likelihood,
+        logvar=outputs["logvar_base"],
+        channel_weight=channel_weight,
+        horizon_weight=horizon_weight,
+    )
+    return full, base
 
 
 def mean_decoded_scores(
@@ -725,9 +1070,13 @@ def score_batch(
         )
     # The latent per-lag profile costs one pass of cheap arithmetic over the cached proposals, so
     # it is taken on every batch of the split rather than on the capped ones the predictive profile
-    # is scored on. Present only where per-lag updates exist to remove.
+    # is scored on. Present only where per-lag updates exist to remove. The maps themselves are
+    # kept for the family's readout below, which writes them per anchor and per segment: one
+    # computation behind the sidecar, the table and the pooled profile.
+    lag_maps: Dict[str, torch.Tensor] = {}
     if "mean_proposals" in outputs and str(getattr(model, "lag_fusion", "local")) == "local":
-        latent_profile = lag_metrics.per_lag_latent_totals(model, outputs, contributing)
+        lag_maps = lag_metrics.per_lag_latent_maps(model, outputs, contributing)
+        latent_profile = lag_metrics.latent_totals_from_maps(lag_maps)
     record = {
         "guids": batch_guids(batch, batch_size),
         "columns": {name: value.cpu() for name, value in columns.items()},
@@ -738,7 +1087,8 @@ def score_batch(
         "cancellation": lag_metrics.cancellation_totals(outputs, contributing),
         "calibration": {
             name: calibration_census(
-                scored[name].cdf_sum, mask, levels=DEFAULT_COVERAGE_LEVELS
+                scored[name].cdf_sum, mask, levels=DEFAULT_COVERAGE_LEVELS,
+                block_split=block_split,
             )
             for name in CALIBRATED_BRANCHES
             if scored[name].cdf_sum is not None
@@ -766,6 +1116,7 @@ def score_batch(
         control_record=control_record,
         guids=record["guids"],
         retain=retain,
+        lag_maps=lag_maps,
     )
     return record, readout
 
@@ -788,6 +1139,7 @@ def shared_readout(
     control_record: Mapping[str, Any],
     guids: List[str],
     retain: Sequence[str],
+    lag_maps: Optional[Mapping[str, torch.Tensor]] = None,
 ) -> SharedReadout:
     r"""Reduce one scored batch to the family's per-sample and per-anchor readouts.
 
@@ -827,6 +1179,9 @@ def shared_readout(
         control_record: The pairing bookkeeping :func:`intervened_branches` returned.
         guids: Recording identifier per sample.
         retain: Forward-output names to carry back whole.
+        lag_maps: :func:`~teb_vae.lag_slot_transformer_cfs.eval.lag_metrics.per_lag_latent_maps`
+            of this forward, or empty on an arm that sums no per-lag updates. Written per anchor
+            to the sidecar and per segment to the vector file, under this cell's own names.
 
     Returns:
         The readout the shared sink consumes.
@@ -875,6 +1230,18 @@ def shared_readout(
     }
     columns["delta_mu_rms"] = columns["delta_mu_sq"].sqrt()
     columns["pred_gap"] = columns["nll_base_block"] - columns["nll_full_block"]
+    # The same two forecasts under the objective's own weights -- the reconstruction terms of
+    # ``compute_loss`` exactly -- so a training log and this table can be put side by side. The
+    # unweighted columns above are NOT the training objective; they are the same draw's
+    # conditional log density, which is what ``pred_gap`` on this table has always been.
+    weighted_full, weighted_base = objective_parity_scores(
+        model, outputs, target, mask, likelihood=likelihood
+    )
+    columns["nll_full_block_weighted"] = _per_sample_mean(weighted_full, contributing)
+    columns["nll_base_block_weighted"] = _per_sample_mean(weighted_base, contributing)
+    columns["pred_gap_weighted"] = (
+        columns["nll_base_block_weighted"] - columns["nll_full_block_weighted"]
+    )
     for own, family in SHARED_ARM_NAMES.items():
         # NaN rather than absent on a batch where a pairing control did not run: the shared table
         # holds one row per segment with every column, and a column absent from one batch would
@@ -892,11 +1259,37 @@ def shared_readout(
     columns["source_conditioned_kl_shuffled_raw"] = (
         nan_column if shuffled_kld is None else _per_sample_mean(shuffled_kld, contributing)
     )
+    # The family's availability-clock pair, from the zeroed-source arm: the divergence the clock
+    # and the announcement alone produce, and what the matched source adds over it. NaN where the
+    # arm did not run, which is the family's own representation of "not measured".
+    null_kld = control_record.get("null_kld_per_anchor")
+    columns["kld_source_null"] = (
+        nan_column if null_kld is None else _per_sample_mean(null_kld, contributing)
+    )
+    columns["coupling_minus_clock"] = (
+        columns["source_conditioned_kl_raw"] - columns["kld_source_null"]
+    )
+    # Every intervened arm's paired margin against the matched branch, per segment, so the
+    # clock-resolved readouts can bin the margins the headline reports per recording. The
+    # single-lag arms stay out: they reach the summary as one curve, never as columns. So does
+    # the prior-shuffle arm, which intervenes on the prior and is read against the base branch.
+    for arm in scored:
+        if arm in ("base", "full", PRIOR_SHUFFLE_ARM) or arm.startswith(LAG_ARM_PREFIX):
+            continue
+        columns[margin_column(arm)] = _per_sample_mean(
+            scored[arm].marginal - scored["full"].marginal, contributing
+        )
 
     # The three trivial forecasts, scored through the model's own loss function with the
     # identical mask at the identical anchors, so a skill score is a comparison of predictors
-    # rather than of scoring conventions.
-    baselines = baseline_forecasts(target_features, weight, model, outputs["anchor_index"])
+    # rather than of scoring conventions. Built on the PERMITTED view of the stream -- the same
+    # input ablation the forward applies -- and never on the original: a persistence baseline
+    # handed the original stream would carry the anchor's own ablated coefficient into a
+    # comparison against a model denied it. The labels, gathered above into ``target``, stay the
+    # original coefficients; the view is the same object as the stream when no switch is on.
+    baselines = baseline_forecasts(
+        model.permitted_target_features(target_features), weight, model, outputs["anchor_index"]
+    )
     baseline_logvar = torch.full((), BASELINE_LOGVAR, dtype=target.dtype, device=device)
     for name, baseline_mu in baselines.items():
         baseline_block, _ = masked_raw_block_per_anchor(
@@ -1003,6 +1396,24 @@ def shared_readout(
         selector = (tertile == group).to(gap_by_anchor_channel.dtype)
         per_anchor[f"pred_gap_warm_{name}"] = (gap_by_anchor_channel * selector).sum(dim=2)
 
+    # The lag axis at every anchor and at every segment, from the one set of maps the pooled
+    # profile is summed from. Per anchor: the two maps, zeroed where the anchor could not read
+    # the lag, plus the lag of the largest proposal. Per segment: each map's mean over the
+    # anchors the lag was live at, NaN where it never was.
+    per_anchor_vectors: Dict[str, torch.Tensor] = {}
+    segment_profiles: Dict[str, torch.Tensor] = {}
+    if lag_maps:
+        lag_valid = outputs["lag_valid"].to(torch.float64)
+        per_anchor_vectors[PROPOSAL_LAG_MAP] = lag_maps["proposal_norm"] * lag_valid
+        per_anchor_vectors[DIVERGENCE_DROP_LAG_MAP] = lag_maps["divergence_drop"] * lag_valid
+        any_live = lag_valid.sum(dim=-1) > 0.0
+        per_anchor[PROPOSAL_ARGMAX_COLUMN] = torch.where(
+            any_live,
+            per_anchor_vectors[PROPOSAL_LAG_MAP].argmax(dim=-1),
+            torch.full_like(any_live, -1, dtype=torch.long),
+        )
+        segment_profiles = lag_metrics.per_segment_lag_profiles(lag_maps)
+
     # The observation model's calibration census over the full branch's scored coefficients, as
     # the family accumulates it. Empty under ``'mse'``, where the log-variance head is untrained.
     calibration = (
@@ -1059,6 +1470,9 @@ def shared_readout(
         calibration_sums=calibration,
         n_control_pairs=int(control_record["n_control_pairs"]),
         n_same_recording_pairs=int(control_record["n_same_recording_pairs"]),
+        per_anchor_vectors=per_anchor_vectors,
+        proposal_lag_profile=segment_profiles.get("proposal_norm"),
+        divergence_drop_lag_profile=segment_profiles.get("divergence_drop"),
     )
 
 
@@ -1124,6 +1538,11 @@ def aggregate_by_recording(
                 per_column_count[name] = per_column_count.get(name, 0) + 1
             for name in curve_names:
                 vector = np.asarray(record["curves"][name][position], dtype=np.float64)
+                # A row blanked to NaN is a segment that did not carry the curve -- the
+                # single-lag profile on a segment its cohort did not admit -- and is skipped
+                # exactly as a column absent from a batch is, rather than poisoning the sum.
+                if not np.all(np.isfinite(vector)):
+                    continue
                 per_curve = curve_sums.setdefault(name, {})
                 per_count = curve_counts.setdefault(name, {})
                 per_curve[guid] = per_curve.get(guid, 0.0) + vector
@@ -1144,6 +1563,51 @@ def aggregate_by_recording(
         for name, per_curve in curve_sums.items()
     }
     return per_recording, exposure, curves
+
+
+def aggregate_by_recording_anchor_weighted(
+    records: Sequence[Mapping[str, Any]],
+) -> Dict[str, Dict[str, float]]:
+    r"""The second estimand: anchor sums over anchor counts within each recording.
+
+    :func:`aggregate_by_recording` gives every segment of a recording equal weight whatever its
+    scored-anchor count. This one gives every scored **anchor** of a recording equal weight,
+
+    $$\bar x_g = \frac{\sum_{s \in g} n_s\, \bar x_s}{\sum_{s \in g} n_s},$$
+
+    with $n_s$ the segment's contributing anchors and $\bar x_s$ its per-sample mean -- which is
+    the recording's anchor mean exactly, since a per-sample mean is an anchor sum over $n_s$.
+    Both then weight recordings equally across the population. The two agree on a split where
+    every segment scores the same number of anchors and differ under masks, caps or clock shifts
+    that leave segments unequal; the summary carries both and names which one the headline reads.
+
+    A column absent from some of a recording's segments is averaged over the anchors of the
+    segments that carried it, as the equal-segment estimand averages over those segments.
+
+    Args:
+        records: The per-batch records :func:`score_batch` returned.
+
+    Returns:
+        ``{recording: {column: value}}``.
+    """
+    sums: Dict[str, Dict[str, float]] = {}
+    anchors: Dict[str, Dict[str, float]] = {}
+    for record in records:
+        names = list(record["columns"])
+        for position, guid in enumerate(record["guids"]):
+            scored = float(record["n_anchors"][position])
+            if scored <= 0.0:
+                continue
+            bucket = sums.setdefault(guid, {})
+            weight = anchors.setdefault(guid, {})
+            for name in names:
+                value = float(record["columns"][name][position])
+                bucket[name] = bucket.get(name, 0.0) + scored * value
+                weight[name] = weight.get(name, 0.0) + scored
+    return {
+        guid: {name: total / anchors[guid][name] for name, total in bucket.items()}
+        for guid, bucket in sums.items()
+    }
 
 
 def arm_scores_block(
@@ -1326,6 +1790,10 @@ def arm_record(model: Any) -> Dict[str, Any]:
         "source_scalar_lift": bool(getattr(model, "source_scalar_lift", False)),
         "source_values_withheld": bool(getattr(model, "source_values_withheld", False)),
         "lag_summation_scale": float(getattr(model, "lag_scale", 1.0)),
+        # The input policy, beside the arm leaves: a checkpoint denied a coefficient was fitted
+        # to a different task, and the acceptance pass pairs runs on these flags as it does on
+        # the leaves above.
+        **model.input_ablation_record(),
         "parameters": pathway_parameter_counts(model),
         "note": (
             "a target-only checkpoint: the full distribution is the prior, the divergence is "
@@ -1383,18 +1851,22 @@ def lag_profile_block(
     skipped: Optional[str],
     resamples: int,
     seed: int,
+    cohort: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, Any]:
     """The per-lag readouts: the latent profile over the split, the predictive one over the cap.
 
     Args:
         latent_totals: The accumulated :func:`~lag_metrics.per_lag_latent_totals`, or ``None``.
         exposure_totals: The accumulated per-lag exposure, or ``None``.
-        lag_margins: ``{recording: (L,) margins}`` from the segments the cap admitted.
+        lag_margins: ``{recording: (L,) margins}`` from the segments the cohort admitted.
         n_profiled_segments: How many segments the predictive profile was scored on.
         cap: The configured cap, or ``None`` when the profile was not asked for.
         skipped: Why the predictive profile did not run on this arm, or ``None``.
         resamples: Bootstrap resamples.
         seed: Seed for the resampling.
+        cohort: :meth:`LagProfileCohort.record` -- the admitted segments' identities, the class
+            composition and the admission rule -- carried into the predictive block so the
+            margins name the population they were read over.
 
     Returns:
         The block.
@@ -1431,9 +1903,10 @@ def lag_profile_block(
             "detail": (
                 "each lag's margin is the score with that lag's proposals alone removed less the "
                 "matched score, in nats per anchor, paired per recording under the shared draws "
-                "over the first segments of the split up to the cap. A positive value means the "
-                "fitted model predicts worse without that lag."
+                "over the declared cohort of segments below. A positive value means the fitted "
+                "model predicts worse without that lag."
             ),
+            **(dict(cohort) if cohort else {}),
         }
     return {
         "latent": latent,
@@ -1571,6 +2044,207 @@ def per_recording_chain(
     return per_recording, overall, overall_vectors
 
 
+def _interval_status(lo: Any, hi: Any) -> str:
+    """PASS when a paired interval lies above zero, FAIL below it, INCONCLUSIVE otherwise.
+
+    Args:
+        lo: The interval's lower end, or ``None``.
+        hi: The interval's upper end, or ``None``.
+
+    Returns:
+        The status. An absent or non-finite end is INCONCLUSIVE: an interval that could not be
+        built is not evidence either way.
+    """
+    try:
+        low, high = float(lo), float(hi)
+    except (TypeError, ValueError):
+        return INCONCLUSIVE
+    if not (np.isfinite(low) and np.isfinite(high)):
+        return INCONCLUSIVE
+    if low > 0.0:
+        return PASS
+    if high < 0.0:
+        return FAIL
+    return INCONCLUSIVE
+
+
+def cell_verdicts(
+    verdicts: Sequence[Verdict],
+    *,
+    pred_gap_interval: Optional[Mapping[str, Any]],
+    mixture_calibration: Optional[Mapping[str, Any]],
+    num_samples: int,
+    tail_tolerance: float = DEFAULT_COVERAGE_TAIL_TOLERANCE,
+) -> List[Verdict]:
+    r"""Replace the three family verdicts whose rule does not fit this cell, in place.
+
+    The family decides ``predictive_improvement`` on the sign of a point estimate, reads
+    ``calibration_near_nominal`` off the single-draw conditional census, and explains a pinned
+    prior variance as an inverse-variance inflation of the divergence. None of the three is
+    right here, and each is replaced under its registry name so the order, the headline
+    promotion and every table that reads the list by name are untouched:
+
+    * **The predictive verdict reads the paired recording-bootstrap interval** of the
+      marginalised gap. A positive point estimate whose interval crosses zero is INCONCLUSIVE,
+      which is what the epoch-1002 development run is; PASS needs the whole interval above zero
+      and FAIL the whole interval below.
+    * **The calibration verdict reads the mixture census** -- the averaged component CDF over
+      the $K$ shared draws -- of the full branch, at the same relative tail tolerance the family
+      uses, because the predictive distribution is the mixture and not one draw's conditional.
+      The conditional census still travels under ``calibration`` and is named as such.
+    * **The prior-floor verdict keeps its status and loses its explanation.** Under the residual
+      parameterisation the divergence is $K_t = \tfrac12 \sum_d (a_d^2 + e^{2 b_d} - 1 - 2 b_d)$
+      in prior standard deviations, so a narrow prior does not mechanically inflate it; a pinned
+      prior scale is a representation and optimisation concern, not a rescaling of every
+      coupling number.
+
+    Args:
+        verdicts: The family's list, in registry order.
+        pred_gap_interval: The bootstrap record of this cell's ``pred_gap`` column over
+            recordings -- ``point``, ``lo``, ``hi``, ``n`` -- or ``None`` when nothing scored.
+        mixture_calibration: ``{branch: finished census}`` as the results block carries it.
+        num_samples: Monte Carlo draws $K$, recorded beside the predictive verdict.
+        tail_tolerance: Relative tolerance on each level's tail mass.
+
+    Returns:
+        The same list with the three entries replaced.
+    """
+    replaced: List[Verdict] = []
+    for verdict in verdicts:
+        if verdict.name == "predictive_improvement":
+            replaced.append(
+                _predictive_interval_verdict(verdict, pred_gap_interval, num_samples)
+            )
+        elif verdict.name == "calibration_near_nominal":
+            replaced.append(
+                _mixture_calibration_verdict(mixture_calibration, tail_tolerance=tail_tolerance)
+            )
+        elif verdict.name == "prior_variance_not_pinned":
+            replaced.append(_prior_floor_verdict(verdict))
+        else:
+            replaced.append(verdict)
+    return replaced
+
+
+def _predictive_interval_verdict(
+    family: Verdict, record: Optional[Mapping[str, Any]], num_samples: int
+) -> Verdict:
+    """The interval-read predictive verdict, carrying the family's point values beside it."""
+    values: Dict[str, float] = dict(family.values)
+    values["K"] = float(num_samples)
+    criterion = (
+        "the paired recording-bootstrap interval of the marginalised gap D_base - D_full lies "
+        "above zero (PASS), below zero (FAIL), or crosses it (INCONCLUSIVE)"
+    )
+    if not record:
+        return Verdict(
+            family.name, INCONCLUSIVE, criterion,
+            "no paired interval over recordings was built, so the sign of the point estimate "
+            "is not read as evidence.",
+            values,
+        )
+    for key in ("point", "lo", "hi", "n"):
+        value = record.get(key)
+        if value is not None and np.isfinite(float(value)):
+            values[f"pred_gap_{key}"] = float(value)
+    status = _interval_status(record.get("lo"), record.get("hi"))
+    detail = {
+        PASS: (
+            "the whole recording-bootstrap interval of the marginalised gap lies above zero, so "
+            "the source-conditioned branch is a better predictive density than the target-only "
+            "one on this population."
+        ),
+        FAIL: (
+            "the whole recording-bootstrap interval lies below zero, so the source-conditioned "
+            "branch is a worse predictive density than the target-only one."
+        ),
+        INCONCLUSIVE: (
+            "the recording-bootstrap interval crosses zero: the point estimate's sign is not "
+            "evidence of improvement either way. A positive point with an interval through zero "
+            "is exactly what a source that helps some recordings and hurts others produces."
+        ),
+    }[status]
+    return Verdict(family.name, status, criterion, detail, values)
+
+
+def _mixture_calibration_verdict(
+    mixture: Optional[Mapping[str, Any]], *, tail_tolerance: float
+) -> Verdict:
+    """Central coverage of the full branch's predictive MIXTURE against its nominal levels."""
+    criterion = (
+        f"mixture central coverage of the full branch at every census level within "
+        f"{tail_tolerance:g} relative tail error of nominal"
+    )
+    values: Dict[str, float] = {"tail_tolerance": float(tail_tolerance)}
+    full = (mixture or {}).get("full") or {}
+    coverage = full.get("coverage") or {}
+    if not coverage:
+        return Verdict(
+            "calibration_near_nominal", INCONCLUSIVE, criterion,
+            "no mixture census of the full branch was accumulated -- an 'mse' checkpoint, or a "
+            "pass that scored nothing -- so there is no predictive distribution to calibrate.",
+            values,
+        )
+    worst_level, worst_error = None, 0.0
+    for level, observed in coverage.items():
+        nominal = float(level)
+        nominal_tail = 1.0 - nominal
+        values[f"observed_{level}"] = float(observed)
+        values[f"nominal_{level}"] = nominal
+        base_observed = (((mixture or {}).get("base") or {}).get("coverage") or {}).get(level)
+        if base_observed is not None:
+            values[f"base_observed_{level}"] = float(base_observed)
+        if nominal_tail <= 0.0 or not np.isfinite(float(observed)):
+            continue
+        error = abs((1.0 - float(observed)) - nominal_tail) / nominal_tail
+        if error > worst_error:
+            worst_level, worst_error = level, error
+    values["worst_relative_tail_error"] = float(worst_error)
+    if worst_level is not None:
+        values["worst_level"] = float(worst_level)
+    within = worst_error <= float(tail_tolerance)
+    return Verdict(
+        "calibration_near_nominal", PASS if within else FAIL, criterion,
+        (
+            "the predictive mixture covers the truth at close to its nominal central rates at "
+            "every census level, so the marginalised block NLL is read as a log density."
+            if within
+            else f"the predictive mixture's central coverage misses nominal worst at the "
+                 f"{worst_level} level: an over-covered centre means the mixture is too broad "
+                 f"there, an under-covered one that it is over-confident. The horizon- and "
+                 f"block-resolved census under mixture_calibration says where."
+        ),
+        values,
+    )
+
+
+def _prior_floor_verdict(family: Verdict) -> Verdict:
+    """The family's prior-floor status with this cell's own explanation of what it means."""
+    floor_frac = family.values.get("floor_frac")
+    where = (
+        f"on {100.0 * float(floor_frac):.1f}% of the scored support"
+        if floor_frac is not None else "on an unreported fraction of the scored support"
+    )
+    detail = {
+        FAIL: (
+            f"the prior log-variance sits within its floor margin {where}. Under this cell's "
+            f"residual parameterisation the divergence is K = 1/2 sum(a^2 + exp(2b) - 1 - 2b) "
+            f"in prior standard deviations, so a narrow prior does NOT inflate it by an "
+            f"inverse-variance factor and every coupling number is read as it stands; a pinned "
+            f"prior scale is a representation and optimisation concern -- near-deterministic "
+            f"target codes -- and the reason separate prior and observation bounds are a "
+            f"planned pilot."
+        ),
+        PASS: (
+            "the prior log-variance is off its floor, so the prior scale is a fitted quantity "
+            "rather than a bound; the residual divergence is in prior standard deviations "
+            "either way."
+        ),
+        INCONCLUSIVE: family.detail,
+    }[family.status]
+    return Verdict(family.name, family.status, family.criterion, detail, dict(family.values))
+
+
 def family_results(
     model: Any,
     *,
@@ -1585,6 +2259,8 @@ def family_results(
     same_recording_pairs: int,
     batches_without_partner: int,
     segments_without_partner: int,
+    pred_gap_interval: Optional[Mapping[str, Any]] = None,
+    mixture_calibration: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, Any]:
     r"""The results blocks the family's headline, sanity block and analyses read.
 
@@ -1592,9 +2268,11 @@ def family_results(
     ``calibration``, ``controls``, ``verdicts`` and the population counts -- and built from the
     shared table rather than from this cell's own record, so the number the headline quotes is the
     number the table carries. The verdicts are the family's own registry, decided by the family's
-    own function over the same overall means: the availability-clock criterion is INCONCLUSIVE on
-    this architecture, which computes no source-null arm, and every other criterion reads a
-    quantity this pass produces.
+    own function over the same overall means and then read through :func:`cell_verdicts`, which
+    replaces the three whose family rule does not fit this cell: the predictive verdict reads the
+    paired interval, the calibration verdict reads the mixture census, and the prior-floor verdict
+    keeps its status under the residual divergence's own explanation. The availability-clock
+    criterion is INCONCLUSIVE on this architecture, which computes no source-null arm.
 
     Args:
         model: The rebuilt net.
@@ -1609,6 +2287,9 @@ def family_results(
         same_recording_pairs: Pairs that landed inside their own recording.
         batches_without_partner: Batches on which the pairing controls could not run.
         segments_without_partner: Segments of those batches.
+        pred_gap_interval: The bootstrap record of this cell's ``pred_gap`` column over
+            recordings, for the interval-read predictive verdict.
+        mixture_calibration: The finished mixture census per branch, for the calibration verdict.
 
     Returns:
         The blocks, ready to merge into the results.
@@ -1638,6 +2319,12 @@ def family_results(
         expected_anchors_per_sample=expected_anchors_per_sample(model),
         logvar_margin=LOGVAR_FLOOR_MARGIN_FRAC * (float(clamp[1]) - float(clamp[0])),
         calibration=calibration,
+    )
+    verdicts = cell_verdicts(
+        verdicts,
+        pred_gap_interval=pred_gap_interval,
+        mixture_calibration=mixture_calibration,
+        num_samples=int(num_samples),
     )
     return {
         "n_batches": int(n_batches),
@@ -1747,6 +2434,9 @@ def collect_tables(
     calibration_totals: Dict[str, torch.Tensor] = {}
     control_pairs = same_recording = 0
     profiled_segments = 0
+    # The single-lag profile's cohort: admits segments under the cap and a per-class quota, and
+    # keeps every admitted identity for the summary.
+    cohort = LagProfileCohort(profile_cap, shard_classes(loader))
     skipped: Dict[str, str] = {}
     # Batches the permute arm could not run on because one recording held more than half of
     # them, typically the trailing partial batch of the split. Counted apart from ``skipped``:
@@ -1761,12 +2451,11 @@ def collect_tables(
                 if max_batches is not None and index >= int(max_batches):
                     break
                 batch = task.transfer_batch_to_device(batch, device, dataloader_idx=0)
-                # The profile is scored on the first segments of the split up to the cap: the
-                # loader is fixed-seed shuffled, so the leading segments are a draw over the
-                # split rather than one shard's prefix.
-                profile_this_batch = (
-                    profile_cap is not None and profiled_segments < int(profile_cap)
-                )
+                # The profile's cohort decides per segment; the single-lag arms run on the batch
+                # when any segment of it was admitted, and the rows of the others are blanked
+                # below so the aggregation reads exactly the admitted set.
+                admitted = cohort.admit(batch)
+                profile_this_batch = admitted is not None
                 record, readout = score_batch(
                     task,
                     batch,
@@ -1784,8 +2473,10 @@ def collect_tables(
                         value if name not in calibration_totals
                         else calibration_totals[name] + value
                     )
-                if "lag_margin" in record["curves"]:
-                    profiled_segments += int(record["curves"]["lag_margin"].shape[0])
+                if "lag_margin" in record["curves"] and admitted is not None:
+                    curve = record["curves"]["lag_margin"]
+                    curve[~admitted.to(curve.device)] = float("nan")
+                    profiled_segments += int(admitted.sum())
                 exposure_totals = lag_metrics.merge_counts(exposure_totals, record["exposure"])
                 if record["latent_profile"]:
                     latent_totals = lag_metrics.merge_counts(
@@ -1825,15 +2516,32 @@ def collect_tables(
 
     per_recording, per_recording_exposure, curves = aggregate_by_recording(records)
     arm_scores = arm_scores_block(per_recording, resamples=resamples, seed=seed)
+    band_columns = {band: f"nll_{SUPPRESSION_PREFIX}{band}" for band in masks}
     band_intervals = paired_margin_block(
-        per_recording,
-        {band: f"nll_{SUPPRESSION_PREFIX}{band}" for band in masks},
-        resamples=resamples,
-        seed=seed,
+        per_recording, band_columns, resamples=resamples, seed=seed
     )
     control_intervals = paired_margin_block(
         per_recording, CONTROL_COLUMNS, resamples=resamples, seed=seed
     )
+    # The second estimand, through the identical bootstrap and pairing, so the two can be read
+    # side by side on every scored column and every margin.
+    per_recording_anchor = aggregate_by_recording_anchor_weighted(records)
+    anchor_within_recording = {
+        "estimand": (
+            "anchor sums over anchor counts within each recording, then recordings weighted "
+            "equally; the legacy blocks weight a recording's segments equally instead"
+        ),
+        "arm_scores": arm_scores_block(per_recording_anchor, resamples=resamples, seed=seed),
+        "band_margins": paired_margin_block(
+            per_recording_anchor, band_columns, resamples=resamples, seed=seed
+        ),
+        "control_margins": paired_margin_block(
+            per_recording_anchor, CONTROL_COLUMNS, resamples=resamples, seed=seed
+        ),
+    }
+    #: The headline columns of the second estimand, carried onto the per-recording table so a
+    #: reader can recombine both from one file.
+    anchor_headline_columns = ("nll_base", "nll_full", "pred_gap")
     exposure = (
         {}
         if not exposure_totals
@@ -1843,6 +2551,11 @@ def collect_tables(
     block_channels = _block_channel_counts(model, block_split)
 
     collection = collector.finish()
+    # Finished once, read twice: written under ``mixture_calibration`` and read by the
+    # calibration verdict, so the verdict and the block cannot describe two censuses.
+    mixture_calibration = {
+        branch: finish_calibration(mixture_totals.get(branch)) for branch in CALIBRATED_BRANCHES
+    }
     results: Dict[str, Any] = {
         # The first thing a reader of two summaries has to know, because it decides what every
         # other block in the file can possibly say. A target-only arm's gap is exactly zero by
@@ -1855,9 +2568,18 @@ def collect_tables(
         # cell's own names. Carried out of here rather than rebuilt by a reader from the batches,
         # which no longer exist by the time the summary is written.
         "per_recording": {
-            guid: {**columns, **per_recording_exposure[guid]}
+            guid: {
+                **columns,
+                **{
+                    f"{name}_anchor_weighted": per_recording_anchor[guid][name]
+                    for name in anchor_headline_columns
+                    if name in per_recording_anchor.get(guid, {})
+                },
+                **per_recording_exposure[guid],
+            }
             for guid, columns in per_recording.items()
         },
+        "anchor_within_recording": anchor_within_recording,
         "lag_readouts": lag_metrics.qualified_report(
             {
                 "band_suppression": lag_metrics.band_suppression_block(
@@ -1891,8 +2613,37 @@ def collect_tables(
                     skipped=skipped.get("lag_profile"),
                     resamples=resamples,
                     seed=seed,
+                    cohort=cohort.record(),
                 ),
                 "lag_axis": lag_axis_record(model),
+                # What the two sidecars carry on the lag axis, named so a reader of the
+                # directory knows which file to open and what the numbers in it are not.
+                "sidecars": {
+                    "per_anchor": {
+                        PROPOSAL_LAG_MAP: (
+                            "the proposal norm at every contributing anchor and candidate lag; "
+                            "zero where the anchor could not read the lag"
+                        ),
+                        DIVERGENCE_DROP_LAG_MAP: (
+                            "the signed divergence drop K - K without that lag alone, at every "
+                            "contributing anchor and candidate lag"
+                        ),
+                    },
+                    "per_sample": {
+                        "proposal_lag_profile": (
+                            "the proposal norm averaged over the segment's anchors the lag was "
+                            "live at; NaN where it never was"
+                        ),
+                        "divergence_drop_lag_profile": (
+                            "the signed divergence drop averaged the same way"
+                        ),
+                    },
+                    "note": (
+                        "Neither map is an attention distribution and neither allocates the "
+                        "divergence over lags; both are per-lag readouts of one fitted "
+                        "parameterisation, read under the qualification beside them."
+                    ),
+                },
             }
         ),
         "horizon_resolved": resolved_axis_block(
@@ -1944,10 +2695,7 @@ def collect_tables(
         # Distinct from the family's ``calibration`` block below, which is the observation
         # model's census over the full branch's single forward; the two answer different
         # questions and both travel.
-        "mixture_calibration": {
-            branch: finish_calibration(mixture_totals.get(branch))
-            for branch in CALIBRATED_BRANCHES
-        },
+        "mixture_calibration": mixture_calibration,
         "draws": {
             "num_mc_samples": int(num_samples),
             "estimator": "log mean likelihood, common random numbers across arms",
@@ -1958,7 +2706,19 @@ def collect_tables(
                 "says whether K was large enough for these anchors."
             ),
         },
-        "conventions": PRED_GAP_CONVENTIONS,
+        "schema_version": RESULTS_SCHEMA_VERSION,
+        "sufficiency_qualification": dict(SUFFICIENCY_QUALIFICATION),
+        "conventions": {
+            "pred_gap": PRED_GAP_CONVENTIONS,
+            "estimators": {name: dict(entry) for name, entry in SCORE_CONVENTIONS.items()},
+            "headline_estimator": (
+                "arm_scores and the headline weight a recording's segments equally, then "
+                "recordings equally, as every earlier run of this cell did; "
+                "anchor_within_recording carries the same columns and margins with anchors "
+                "weighted equally within each recording. Prefer the second on a masked, capped "
+                "or clock-shifted split, where segments score unequal anchor counts."
+            ),
+        },
         # Every analysis this architecture cannot produce, with the tensor it would have needed
         # and how it came to be absent: removed from the shared registry by the binding, or never
         # registered here at all. A reader of a directory with fewer columns than a sibling's
@@ -1967,6 +2727,11 @@ def collect_tables(
         "excluded_analyses_mechanism": {
             "removed_from_shared_registry": list(EXCLUDED_ANALYSES),
             "never_registered_here": list(UNREGISTERED_ANALYSES),
+        },
+        # Which analysis of this cell asks each excluded analysis's question, so a reader of two
+        # run directories has the correspondence on the page.
+        "analogue_analyses": {
+            name: list(analogues) for name, analogues in ANALOGUE_ANALYSES.items()
         },
     }
     results.update(
@@ -1983,6 +2748,8 @@ def collect_tables(
             same_recording_pairs=same_recording,
             batches_without_partner=batches_without_partner,
             segments_without_partner=segments_without_partner,
+            pred_gap_interval=arm_scores.get("pred_gap"),
+            mixture_calibration=mixture_calibration,
         )
     )
     collection.results = results

@@ -41,7 +41,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
-from typing import Dict, List, Mapping, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 #: Repository root: ``teb_vae/lag_slot_transformer_cfs/trainer.py`` -> up three.
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -56,6 +56,7 @@ if not __package__ and _REPO_ROOT not in sys.path:
 import torch  # noqa: E402
 from loguru import logger  # noqa: E402
 
+from teb_vae.lag_attn.nets.lag_report import SECONDS_PER_STEP  # noqa: E402
 from teb_vae.lag_attn_cfs.trainer import LagAttnCfsTrainer  # noqa: E402
 from teb_vae.lag_attn_rws.trainer import main as run_training  # noqa: E402
 from teb_vae.lag_attn_transformer_rws.trainer import LagAttnTrfRwsTrainer  # noqa: E402
@@ -64,6 +65,8 @@ from teb_vae.lag_slot_transformer_cfs.nets.model import (  # noqa: E402
 )
 from teb_vae.lag_slot_transformer_cfs.task import (  # noqa: E402
     TASK_METRIC_SUFFIXES,
+    VALIDATION_MC_DRAWS_KEY,
+    VALIDATION_MONITOR_SUFFIXES,
     SeqVaeLagResidualTrfCfsTask,
 )
 
@@ -74,18 +77,22 @@ from teb_vae.lag_slot_transformer_cfs.task import (  # noqa: E402
 #: architecture detail that moves; what does not move is which *component* a target-only model and
 #: this one have in common.
 #:
-#: ``clock_proj.`` is on this list and it was not always. The metadata clock is a function of stored
-#: position and of nothing else, so it belongs to the **prior's** conditioning rather than to the
-#: source pathway -- and the target-only arm of this same class trains it. Re-zeroing it on transfer
-#: would discard a trained target-only component and start the candidate's prior from a state its
-#: baseline never occupied. A checkpoint that carries no such tensor -- a target-only model of some
-#: other architecture -- reports it as missing and leaves it at its constructed zero, which is the
-#: right starting point anyway.
+#: ``clock_proj.`` and ``clock_norm.`` are on this list and were not always. The metadata clock is
+#: a function of stored position and of nothing else, so it belongs to the **prior's** conditioning
+#: rather than to the source pathway -- and the target-only arm of this same class trains both the
+#: projection and the normaliser in front of it. Re-zeroing the projection on transfer would discard
+#: a trained target-only component and start the candidate's prior from a state its baseline never
+#: occupied; leaving the normaliser's affine at its constructed values while copying the projection
+#: would pair a trained weight with an untrained input scale, and the base forecast would then not
+#: equal the donor's. A checkpoint that carries neither tensor -- a target-only model of some other
+#: architecture -- reports both as missing and leaves them as constructed, which is the right
+#: starting point anyway.
 TRANSFERABLE_PREFIXES: Tuple[str, ...] = (
     "target_gate.",
     "target_adapter.",
     "target_encoder.",
     "prior_head.",
+    "clock_norm.",
     "clock_proj.",
     "horizon_core.",
     "decoder.",
@@ -148,6 +155,67 @@ _OBJECTIVE_SUFFIXES: Tuple[str, ...] = (
     "kld_beta",
     "beta_prior",
 )
+
+
+#: The monitor's columns as the driver tracks them: on the validation stage alone, and only for a
+#: run whose configuration set the draw count. Named here so the tracked surface, the callback
+#: check below and the test that pins both read one tuple.
+VALIDATION_MONITOR_COLUMNS: Tuple[str, ...] = tuple(
+    f"val/{name}" for name in VALIDATION_MONITOR_SUFFIXES
+)
+
+
+def validation_monitor_draws(config: Mapping[str, Any]) -> Optional[int]:
+    """Read the predictive monitor's draw count off a resolved configuration, and check it.
+
+    Two refusals, both for a run that would otherwise fail late or not at all. A draw count that
+    is not a positive integer is refused before a model is built. A checkpoint or early-stopping
+    monitor that names one of the monitor's columns while the draw count is unset is refused
+    here by name: left alone, the framework would raise at the first validation end that the
+    monitored key does not exist, after the whole first epoch had been trained.
+
+    Args:
+        config: The resolved configuration.
+
+    Returns:
+        The draw count, or ``None`` when the monitor is off.
+
+    Raises:
+        ValueError: On a malformed draw count, or on a callback monitoring a column the run
+            will not produce.
+    """
+    vae_config = (config.get("model_config") or {}).get("VAE_model") or {}
+    draws = vae_config.get(VALIDATION_MC_DRAWS_KEY)
+    if draws is not None:
+        if isinstance(draws, bool) or int(draws) != draws or int(draws) < 1:
+            raise ValueError(
+                f"model_config.VAE_model.{VALIDATION_MC_DRAWS_KEY}={draws!r} must be a positive "
+                f"integer or null: it is the number of latent draws the predictive validation "
+                f"monitor marginalises over."
+            )
+        draws = int(draws)
+
+    callbacks = (config.get("advanced_config") or {}).get("callbacks") or {}
+    named: List[str] = []
+    for block, keys in (
+        ("early_stopping", ("monitor",)),
+        ("model_checkpoint", ("monitor", "secondary_monitor")),
+    ):
+        section = callbacks.get(block) or {}
+        if block == "early_stopping" and not section.get("enabled", False):
+            continue
+        for key in keys:
+            value = section.get(key)
+            if value in VALIDATION_MONITOR_COLUMNS:
+                named.append(f"advanced_config.callbacks.{block}.{key}={value}")
+    if named and draws is None:
+        raise ValueError(
+            f"{', '.join(named)} names a predictive-monitor column, but "
+            f"model_config.VAE_model.{VALIDATION_MC_DRAWS_KEY} is null, so the run would never "
+            f"log it and the callback would refuse at the end of the first validation epoch. "
+            f"Set the draw count, or point the monitor at a legacy column."
+        )
+    return draws
 
 
 #: Attribute names a task stores the net under, whose keys a checkpoint therefore carries as a
@@ -348,6 +416,8 @@ class LagResidualTrfCfsTrainer(LagAttnCfsTrainer, LagAttnTrfRwsTrainer):
             )
 
         super().create_model()
+        self._log_lag_geometry()
+        self._configure_validation_monitor()
 
         if warm_start is None:
             return
@@ -370,6 +440,53 @@ class LagResidualTrfCfsTrainer(LagAttnCfsTrainer, LagAttnTrfRwsTrainer):
         # the task the inherited construction built wraps this same module object, so it already
         # holds the transferred weights. Rebuilding it would be a second construction whose
         # keyword list is free to drift from the one the family's own path uses.
+
+    def _configure_validation_monitor(self) -> None:
+        """Hand the task the monitor's draw count and track its columns, when configured.
+
+        The draw count reaches the task by the route the seed takes -- applied onto its saved
+        hyperparameters after construction, so it is in the checkpoint -- rather than through the
+        shared constructor call, whose keyword list is the family's. The three columns join the
+        tracked surface **on this instance** only when the run will produce them: a legacy run
+        keeps the class attribute and therefore exactly the columns it always had, and no column
+        is tracked that is empty in every row.
+        """
+        draws = validation_monitor_draws(self.config)
+        if draws is None:
+            return
+        self.apply_config_hyperparameters({VALIDATION_MC_DRAWS_KEY: draws}, self.pl_model)
+        self.TRACKED_METRICS = tuple(self.TRACKED_METRICS) + VALIDATION_MONITOR_COLUMNS
+        logger.info(
+            f"predictive validation monitor on: K={draws} paired draws per dense validation "
+            f"batch, unweighted mixture score of both branches under a fixed noise bank, "
+            f"logged as {', '.join(VALIDATION_MONITOR_COLUMNS)}"
+        )
+
+    def _log_lag_geometry(self) -> None:
+        r"""State the resolved lag bank in the run's first lines: its length, its scale, its depth.
+
+        Three numbers that follow from one configured value and are each misread on their own. The
+        bank length $L$ is one more than the furthest lag because the anchor's own step is a
+        candidate; the summation scale $c_L$ follows from $L$ unless the configuration fixed it,
+        and it changes the proposal amplitude, so two runs at two bank lengths differ in scale as
+        well as in support; and the oldest centre in seconds is $(L - 1)$ steps back, not $L$,
+        which is what "$L$ steps of history" is read as. The resolved configuration written
+        beside the checkpoints carries the configured value; this line carries what it resolved
+        to, on the model that was actually built.
+        """
+        model = self.pytorch_model
+        n_lags = int(model.n_lags)
+        oldest_seconds = float(n_lags - 1) * float(SECONDS_PER_STEP)
+        if bool(getattr(model, "source_disabled", False)):
+            logger.info(
+                "resolved lag bank: none -- this arm builds no source pathway, so no lag is read"
+            )
+            return
+        logger.info(
+            f"resolved lag bank: L={n_lags} candidate lags (0..{n_lags - 1}, the anchor's own "
+            f"step included), summation scale c_L={float(model.lag_scale):.6g}, oldest gathered "
+            f"centre {oldest_seconds:g} s before the anchor in stored-coefficient time"
+        )
 
 
 def main(config_path: str) -> LagResidualTrfCfsTrainer:

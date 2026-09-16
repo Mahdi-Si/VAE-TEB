@@ -38,17 +38,38 @@ simply not requested.
 lean-limit: no per-epoch diagnostic figure for this architecture; replace with a page whose lag rows
 draw proposal suppression and the cancellation ratio when the evaluation package's lag readouts have
 been run on a real arm and their layout is settled.
+
+**Two things the training loop measures that the shared step does not.** The first is the
+predictive validation monitor: with ``validation_mc_draws`` set, every dense validation batch is
+also scored as the unweighted $K$-draw predictive mixture of both branches,
+
+$$D^{(K)}_t = -\operatorname{logsumexp}_{k}\bigl(-D^{(k)}_t\bigr) + \log K,$$
+
+under a noise bank keyed on the batch's segment identities and the run seed, so the number a
+checkpoint is selected on is the estimator the offline evaluation reports it under rather than the
+one-draw weighted objective, and two validation passes at the same weights report the same value.
+The second is the clip fraction: the shared hook logs whether *one sampled step* exceeded the clip,
+and the epoch's CSV row therefore holds a zero or a one; here every optimizer step is counted and
+the row holds the fraction of the epoch's steps the clip bound on.
 """
 from __future__ import annotations
 
+import hashlib
 from functools import partial
-from typing import Any, Callable, Dict, Tuple
+from typing import Any, Callable, Dict, Optional, Sequence, Tuple
 
 import torch
 
-from teb_vae.lag_attn_cfs.task import DENSE_STAGES, SeqVaeLagAttnCfsTask
+from teb_vae.lag_attn_cfs.task import (
+    _KEY_SEPARATOR,
+    DENSE_STAGES,
+    SeqVaeLagAttnCfsTask,
+    _as_float,
+    _as_key,
+)
 from teb_vae.lag_attn_rws.nets.raw_masks import contributing_anchors, forecast_mask
 from teb_vae.lag_attn_transformer_rws.task import SeqVaeLagAttnTrfRwsTask
+from teb_vae.lag_slot_transformer_cfs.nets.objective import _all_reduce_sum
 
 #: Metric names this task adds to the objective's own surface, so a driver can track them by name
 #: without importing the step. Written out rather than derived from a run, because a tracked name
@@ -70,6 +91,72 @@ TASK_METRIC_SUFFIXES: Tuple[str, ...] = (
     "lag_available_frac",
 )
 
+#: The hyperparameter that switches the predictive validation monitor on: the draw count $K$, or
+#: ``None`` for the legacy validation surface. Named once, because the driver reads the same key
+#: off the configuration and hands it to the task by this name.
+VALIDATION_MC_DRAWS_KEY = "validation_mc_draws"
+
+#: The monitor's three columns, produced on the dense stages alone and only when the draw count is
+#: set. Kept apart from :data:`TASK_METRIC_SUFFIXES` for both reasons: a training batch never
+#: carries them, and a legacy run must log exactly the columns it always did, so the driver tracks
+#: these under ``val/`` only when the configuration asked for them.
+VALIDATION_MONITOR_SUFFIXES: Tuple[str, ...] = (
+    "pred_nll_full_mc",
+    "pred_nll_base_mc",
+    "pred_gap_mc",
+)
+
+
+def recording_grouped_totals(
+    values: torch.Tensor, contributing: torch.Tensor, recordings: Sequence[Any]
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    r"""Sum of per-recording means of a per-anchor score, and the number of recordings summed.
+
+    Each recording's mean is over its own scored anchors in this batch, whichever samples they
+    sit in; recordings are then weighted equally,
+
+    $$\sum_{g} \frac{\sum_{b \in g}\sum_a c_{b,a}\, v_{b,a}}{\sum_{b \in g}\sum_a c_{b,a}},$$
+
+    so a recording that contributed several segments to the batch does not outweigh one that
+    contributed one. The sum and the count are returned rather than the mean so a caller can
+    reduce them across ranks first and divide once.
+
+    Args:
+        values: A per-anchor score $(B, A)$.
+        contributing: The $0/1$ scored-anchor indicator $(B, A)$.
+        recordings: One recording identity per sample, in whatever form the batch carries it.
+
+    Returns:
+        ``(sum of recording means, recording count)``, both 0-d ``float64`` tensors on the
+        values' device. Both are zero when no anchor was scored.
+
+    Raises:
+        ValueError: If the identity list is not one per sample.
+    """
+    if len(recordings) != int(values.shape[0]):
+        raise ValueError(
+            f"{len(recordings)} recording identities for a batch of {int(values.shape[0])} "
+            f"samples; the two must be one per sample."
+        )
+    weights = contributing.to(torch.float64)
+    per_sample_sum = (values.to(torch.float64) * weights).sum(dim=1)
+    per_sample_count = weights.sum(dim=1)
+    # One slot per distinct recording, in first-seen order; the GUID is normalised the way the
+    # tiling phase normalises it so two spellings of one recording share a slot.
+    slots: Dict[bytes, int] = {}
+    slot_of = torch.tensor(
+        [slots.setdefault(_as_key(recording), len(slots)) for recording in recordings],
+        dtype=torch.long,
+        device=values.device,
+    )
+    sums = torch.zeros(len(slots), dtype=torch.float64, device=values.device)
+    counts = torch.zeros(len(slots), dtype=torch.float64, device=values.device)
+    sums.index_add_(0, slot_of, per_sample_sum)
+    counts.index_add_(0, slot_of, per_sample_count)
+    scored = counts > 0
+    means = sums[scored] / counts[scored]
+    return means.sum(), scored.sum().to(torch.float64)
+
 
 class SeqVaeLagResidualTrfCfsTask(SeqVaeLagAttnCfsTask, SeqVaeLagAttnTrfRwsTask):
     r"""Lightning task for
@@ -83,6 +170,43 @@ class SeqVaeLagResidualTrfCfsTask(SeqVaeLagAttnCfsTask, SeqVaeLagAttnTrfRwsTask)
     ``main_loss`` keeps its exact, unprefixed name, which is what the loss-spike breaker watches;
     the framework falls back to the returned loss when that key is missing, silently.
     """
+
+    def __init__(
+        self,
+        base_model: Any,
+        *,
+        validation_mc_draws: Optional[int] = None,
+        **kwargs: Any,
+    ) -> None:
+        r"""Initialize the task.
+
+        Args:
+            base_model: The net to wrap.
+            validation_mc_draws: The draw count $K$ of the predictive validation monitor, or
+                ``None`` to leave validation on the legacy one-draw weighted surface. Saved as a
+                hyperparameter so a resumed run monitors what it monitored before it stopped; the
+                driver applies the configured value after construction, by the route the seed
+                takes.
+            **kwargs: Every other keyword, forwarded to the inherited constructor unchanged.
+
+        Raises:
+            ValueError: If the draw count is set and is not a positive integer.
+        """
+        super().__init__(base_model, **kwargs)
+        if validation_mc_draws is not None and (
+            isinstance(validation_mc_draws, bool) or int(validation_mc_draws) < 1
+        ):
+            raise ValueError(
+                f"{VALIDATION_MC_DRAWS_KEY}={validation_mc_draws!r} must be a positive integer "
+                f"or null; the monitor is a mixture over that many draws and a mixture over "
+                f"none is not a score."
+            )
+        self.save_hyperparameters(VALIDATION_MC_DRAWS_KEY)
+        # The clip counters. Device tensors rather than Python numbers so the exceedance
+        # indicator never forces a host synchronisation on the training step; reset at every
+        # training epoch start and read at its last batch.
+        self._clip_exceeded: Optional[torch.Tensor] = None
+        self._clip_counted: int = 0
 
     @property
     def forecast_rows(self) -> Callable[..., None]:
@@ -275,6 +399,18 @@ class SeqVaeLagResidualTrfCfsTask(SeqVaeLagAttnCfsTask, SeqVaeLagAttnTrfRwsTask)
         metrics["main_loss"] = main_loss.detach()
         metrics.update(self._residual_readouts(forward_outputs, weight))
 
+        # The predictive monitor, on the dense stages only: a training batch is tiled and its
+        # score would be over a different anchor set every epoch, and the monitor exists to be
+        # compared across epochs. Absent entirely -- not zero -- when the draw count is unset, so
+        # a legacy run logs exactly the columns it always did.
+        draws = self.hparams.get(VALIDATION_MC_DRAWS_KEY)
+        if draws is not None and stage in DENSE_STAGES:
+            metrics.update(
+                self._predictive_monitor(
+                    batch, forward_outputs, target_features, weight, int(draws)
+                )
+            )
+
         added = self._added_metrics(inputs, forward_outputs, weight, stage)
         collisions = sorted(set(added) & set(metrics))
         if collisions:
@@ -353,5 +489,200 @@ class SeqVaeLagResidualTrfCfsTask(SeqVaeLagAttnCfsTask, SeqVaeLagAttnTrfRwsTask)
                     readouts[key] = masked_mean(forward_outputs[key])
         return readouts
 
+    # ------------------------------------------------------------------
+    # The predictive validation monitor
+    # ------------------------------------------------------------------
+    def validation_noise_generator(self, batch: Any, device: torch.device) -> torch.Generator:
+        r"""The monitor's noise bank for one batch: a generator seeded from what the batch is.
 
-__all__ = ["TASK_METRIC_SUFFIXES", "SeqVaeLagResidualTrfCfsTask"]
+        The seed is a digest of the run seed and, in batch order, each segment's recording and
+        floored start time -- the same two identity fields the tiling phase is keyed on, and for
+        the same reason: a value that is a function of the data and the run, and of nothing that
+        happened to be drawn earlier in the process. Two validation passes at the same weights
+        therefore score the same draws and report the same number, which is what lets the monitor
+        rank checkpoints at all; a global draw would move with every training step in between.
+
+        The bank is fixed at fixed batching. A different batch size or a different loader order
+        composes different batches and therefore different digests; that is a property of the
+        monitor, and the evaluation package's scorer is the one to use for comparisons that must
+        survive a rebatching.
+
+        Args:
+            batch: A batch from the data module, carrying ``guid`` and ``epoch``.
+            device: Where the latent parameters live; the generator is built there.
+
+        Returns:
+            A seeded generator on ``device``.
+        """
+        digest = hashlib.blake2b(digest_size=8)
+        digest.update(str(int(self.hparams.get("seed", 0))).encode("utf-8"))
+        guids = self._phase_field(batch, "guid")
+        starts = self._phase_field(batch, "epoch")
+        for guid, start in zip(guids, starts):
+            digest.update(_KEY_SEPARATOR)
+            digest.update(_as_key(guid))
+            digest.update(_KEY_SEPARATOR)
+            digest.update(str(int(_as_float(start) // 1)).encode("utf-8"))
+        generator = torch.Generator(device=device)
+        generator.manual_seed(int.from_bytes(digest.digest(), "big") % (2**63 - 1))
+        return generator
+
+    def _predictive_monitor(
+        self,
+        batch: Any,
+        forward_outputs: Dict[str, torch.Tensor],
+        target_features: torch.Tensor,
+        weight: torch.Tensor,
+        num_draws: int,
+    ) -> Dict[str, torch.Tensor]:
+        r"""Score both branches as $K$-draw predictive mixtures, recording-grouped, batch-global.
+
+        The scorer is the evaluation package's own, so the monitor is the same estimator the
+        offline headline reads: one $\epsilon^{(k)}$ per draw shared by both branches, the
+        decoder invoked on each, the block scored **unweighted** on the objective's own mask, and
+        the negative log of the average likelihood taken per anchor. With one draw it is the
+        unweighted single-draw conditional score of that draw; the Jensen gap to the average of
+        per-draw scores opens only from the second draw on.
+
+        The reduction is the objective's: per-recording means are summed and counted locally,
+        the sums and the count cross the process group in one packed all-reduce, and the division
+        happens once, so every rank reports one number and a rank holding fewer recordings does
+        not weigh as much as one holding more. Across batches the framework averages these
+        per-batch values, which is the same epoch estimand every other ``val/`` column has.
+
+        Args:
+            batch: The batch, for its recording identities and the noise bank's key.
+            forward_outputs: The matched forward's dict, for the two latent parameter sets, the
+                anchor set and the persistence input.
+            target_features: The declared target stream $(B, T, c_y)$; the labels.
+            weight: Decimated validity signal $(B, T)$.
+            num_draws: The draw count $K$.
+
+        Returns:
+            ``pred_nll_full_mc``, ``pred_nll_base_mc`` and ``pred_gap_mc`` (base minus full),
+            each a 0-d tensor; all three zero when no anchor was scored anywhere.
+        """
+        # Imported here rather than at module load: the scorer sits in the evaluation package,
+        # which a training process otherwise never imports, and the first validation step is
+        # the first moment it is needed.
+        from teb_vae.lag_slot_transformer_cfs.eval.predictive import matched_predictive_scores
+
+        model = self.orig_model
+        anchors = forward_outputs["anchor_index"]
+        target = model._build_forecast_target(target_features, anchors)
+        mask, _coverage = forecast_mask(
+            model.scored_weight(weight),
+            model.geometry,
+            coverage_floor=model.coverage_floor,
+            anchors=anchors,
+            anchor_valid=forward_outputs["anchor_valid"],
+        )
+        scored = matched_predictive_scores(
+            model,
+            {
+                "base": (forward_outputs["mu_prior"], forward_outputs["logvar_prior"]),
+                "full": (forward_outputs["mu_post"], forward_outputs["logvar_post"]),
+            },
+            target,
+            mask,
+            likelihood=str(self.hparams.get("likelihood", "gaussian_nll")),
+            num_samples=int(num_draws),
+            generator=self.validation_noise_generator(batch, anchors.device),
+            # The forward's own persistence tensor: target-only, identical for both branches
+            # and every draw, and the same object both decoder calls of the forward received.
+            persistence=forward_outputs.get("persistence"),
+        )
+        recordings = self._phase_field(batch, "guid")
+        contributing = scored["base"].contributing
+        full_sum, count = recording_grouped_totals(scored["full"].marginal, contributing, recordings)
+        base_sum, _count = recording_grouped_totals(scored["base"].marginal, contributing, recordings)
+        totals = _all_reduce_sum(torch.stack([full_sum, base_sum, count]))
+        dtype = target.dtype
+        n_recordings = float(totals[2])
+        if n_recordings <= 0.0:
+            zero = torch.zeros((), device=anchors.device, dtype=dtype)
+            return {name: zero.clone() for name in VALIDATION_MONITOR_SUFFIXES}
+        full = (totals[0] / n_recordings).to(dtype)
+        base = (totals[1] / n_recordings).to(dtype)
+        return {
+            "pred_nll_full_mc": full,
+            "pred_nll_base_mc": base,
+            "pred_gap_mc": base - full,
+        }
+
+    # ------------------------------------------------------------------
+    # The clip fraction, counted over every optimizer step
+    # ------------------------------------------------------------------
+    def _on_train_epoch_start_hook(self) -> None:
+        """Reset the clip counters, so each epoch's fraction is over that epoch's steps alone."""
+        super()._on_train_epoch_start_hook()
+        self._clip_exceeded = None
+        self._clip_counted = 0
+
+    def _record_clip_exceedance(self, grad_norm: torch.Tensor, clip_val: float) -> torch.Tensor:
+        r"""Count one optimizer step against the clip and return the running fraction.
+
+        $$f = \frac{\#\{\text{steps with } \lVert g \rVert_2 > c\}}{\#\{\text{steps}\}},$$
+
+        both counted from the start of the current training epoch.
+
+        Args:
+            grad_norm: This step's pre-clip gradient norm, a 0-d tensor.
+            clip_val: The clip threshold $c$, known positive.
+
+        Returns:
+            The running fraction, a 0-d tensor on the norm's device.
+        """
+        exceeded = (grad_norm.detach() > float(clip_val)).to(grad_norm.dtype)
+        self._clip_exceeded = exceeded if self._clip_exceeded is None else self._clip_exceeded + exceeded
+        self._clip_counted += 1
+        return self._clip_exceeded / float(self._clip_counted)
+
+    def on_before_optimizer_step(self, optimizer: Any) -> None:
+        r"""Log the pre-clip gradient norm on the sampled steps and the clip fraction over all.
+
+        Overrides the shared hook rather than extending it, because the shared one logs the
+        exceedance **indicator** of the sampled step under the name the CSV reads: the metric
+        history is collected from the bare key during validation, before the training epoch is
+        reduced, so its row held a zero or a one and only their mean over epochs estimated the
+        fraction. Here the norm is computed on every optimizer step -- one fused reduction over
+        the gradients, negligible beside the backward that produced them -- and counted against
+        the threshold; what is logged under ``train/grad_clip_frac`` is the running fraction of
+        this epoch's steps, on the same sampled cadence as the norm and always on the epoch's
+        last batch, where the running value is exactly the epoch's. The bare key the CSV reads
+        therefore holds the fraction of the epoch's optimizer steps the clip bound on.
+
+        ``train/grad_norm`` keeps the shared column's meaning and cadence. Both are omitted when
+        the trainer configures no positive clip, as before: a fraction against no threshold
+        answers no question. A batch the spike breaker skipped has a norm near zero and counts
+        as a step the clip did not bind on; ``train/spike_skipped`` is the column that says so.
+
+        Args:
+            optimizer: The optimizer Lightning is about to step; unused, the gradients are read
+                off the module's own parameters.
+        """
+        grads = [parameter.grad.detach() for parameter in self.parameters() if parameter.grad is not None]
+        if not grads:
+            return
+        grad_norm = torch.nn.utils.get_total_norm(grads)
+        trainer = self.trainer
+        clip_val = trainer.gradient_clip_val
+        clipping = clip_val is not None and float(clip_val) > 0.0
+        fraction = self._record_clip_exceedance(grad_norm, float(clip_val)) if clipping else None
+
+        if not (trainer.is_last_batch or trainer.global_step % self.GRAD_NORM_LOG_EVERY_N_STEPS == 0):
+            return
+        self.log("train/grad_norm", grad_norm, on_step=True, on_epoch=True, logger=True)
+        if fraction is not None:
+            # A running fraction has no meaningful epoch mean, so it is logged per step alone;
+            # the value the CSV samples at the epoch's last batch is the epoch's own fraction.
+            self.log("train/grad_clip_frac", fraction, on_step=True, on_epoch=False, logger=True)
+
+
+__all__ = [
+    "TASK_METRIC_SUFFIXES",
+    "VALIDATION_MC_DRAWS_KEY",
+    "VALIDATION_MONITOR_SUFFIXES",
+    "SeqVaeLagResidualTrfCfsTask",
+    "recording_grouped_totals",
+]

@@ -357,6 +357,7 @@ def calibration_census(
     mask: torch.Tensor,
     *,
     levels: Sequence[float] = DEFAULT_COVERAGE_LEVELS,
+    block_split: Optional[int] = None,
 ) -> Dict[str, Any]:
     r"""Probability-integral transform and central coverage, from the **mixture** distribution.
 
@@ -384,34 +385,137 @@ def calibration_census(
     cannot be recovered from a mean, and recomputing it from a second pass over the data would be a
     second definition of the same quantity.
 
+    **The same census is kept resolved by horizon step and by stored target block**, so a
+    coverage verdict can say *where* a forecast is too broad rather than only that it is: the
+    pooled table over every coefficient of a block cannot separate the first predicted step from
+    the tenth, or the scattering block from the phase-harmonic one, and the two are calibrated
+    differently in practice. The resolved counts are partial sums of the pooled ones on the same
+    coefficients, so they recombine exactly.
+
     Args:
         cdf: The mixture cumulative probability at each scored coefficient, $(B, A, H, C)$.
         mask: The forecast mask $(B, A, H)$, broadcast over the channel axis.
         levels: Central probability levels to report coverage at.
+        block_split: The kept-position boundary between the two stored target blocks, or
+            ``None`` to resolve the horizon axis alone.
 
     Returns:
-        ``{'n_coefficients', 'pit_sum', 'pit_sq_sum', 'inside': {level: count}}``.
+        ``{'n_coefficients', 'pit_sum', 'pit_sq_sum', 'inside': {level: count}, 'resolved':
+        {'by_horizon': {'n_coefficients': [H], 'inside': {level: [H]}}, 'by_block': {...}}}``,
+        with ``by_block`` empty when no split was given.
 
     Raises:
-        ValueError: If a level is not strictly inside $(0, 1)$.
+        ValueError: If a level is not strictly inside $(0, 1)$, or if the split lies outside the
+            channel axis.
     """
     for level in levels:
         if not 0.0 < float(level) < 1.0:
             raise ValueError(f"a central coverage level must lie in (0, 1), got {level}")
+    channels = int(cdf.shape[-1])
+    if block_split is not None and not 0 < int(block_split) < channels:
+        raise ValueError(
+            f"block_split={int(block_split)} must lie strictly inside the channel axis of width "
+            f"{channels}; a split at either end leaves one stored block empty."
+        )
 
     weights = mask.unsqueeze(-1).expand_as(cdf).to(torch.float64)
     values = cdf.to(torch.float64)
     inside: Dict[str, float] = {}
+    inside_by_horizon: Dict[str, List[float]] = {}
+    inside_by_block: Dict[str, List[float]] = {}
     for level in levels:
         half = 0.5 * float(level)
-        within = (values >= 0.5 - half) & (values <= 0.5 + half)
-        inside[f"{float(level):g}"] = float((within.to(torch.float64) * weights).sum())
+        within = ((values >= 0.5 - half) & (values <= 0.5 + half)).to(torch.float64) * weights
+        key = f"{float(level):g}"
+        inside[key] = float(within.sum())
+        inside_by_horizon[key] = within.sum(dim=(0, 1, 3)).tolist()
+        if block_split is not None:
+            split = int(block_split)
+            inside_by_block[key] = [
+                float(within[..., :split].sum()), float(within[..., split:].sum())
+            ]
+    resolved: Dict[str, Any] = {
+        "by_horizon": {
+            "n_coefficients": weights.sum(dim=(0, 1, 3)).tolist(),
+            "inside": inside_by_horizon,
+        },
+        "by_block": {},
+    }
+    if block_split is not None:
+        split = int(block_split)
+        resolved["by_block"] = {
+            "n_coefficients": [
+                float(weights[..., :split].sum()), float(weights[..., split:].sum())
+            ],
+            "inside": inside_by_block,
+        }
     return {
         "n_coefficients": float(weights.sum()),
         "pit_sum": float((values * weights).sum()),
         "pit_sq_sum": float(((values**2) * weights).sum()),
         "inside": inside,
+        "resolved": resolved,
     }
+
+
+def _add_lists(left: Sequence[float], right: Sequence[float]) -> List[float]:
+    """Elementwise sum of two equal-length count vectors.
+
+    Args:
+        left: The running totals.
+        right: This batch's counts.
+
+    Returns:
+        Their sum.
+
+    Raises:
+        ValueError: If the two lengths disagree, which means two batches were censused at two
+            geometries and their resolved counts describe different axes.
+    """
+    if len(left) != len(right):
+        raise ValueError(
+            f"resolved calibration counts of lengths {len(left)} and {len(right)} cannot be "
+            f"merged: the two batches were censused over different axes."
+        )
+    return [float(a) + float(b) for a, b in zip(left, right)]
+
+
+def _merge_resolved(left: Optional[Mapping[str, Any]], right: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
+    """Accumulate the resolved census of two batches, axis by axis and level by level.
+
+    Args:
+        left: The running resolved totals, or ``None``.
+        right: This batch's resolved block, or ``None`` on a census taken before it existed.
+
+    Returns:
+        The merged resolved block; empty axes stay empty.
+    """
+    if not right:
+        return {
+            axis: {
+                "n_coefficients": list(block.get("n_coefficients", [])),
+                "inside": {level: list(v) for level, v in (block.get("inside") or {}).items()},
+            }
+            for axis, block in (left or {}).items()
+        }
+    merged: Dict[str, Any] = {}
+    for axis, block in right.items():
+        previous = (left or {}).get(axis) or {}
+        if not block:
+            merged[axis] = {
+                "n_coefficients": list(previous.get("n_coefficients", [])),
+                "inside": {level: list(v) for level, v in (previous.get("inside") or {}).items()},
+            }
+            continue
+        counts = list(block["n_coefficients"])
+        inside = {level: list(v) for level, v in block["inside"].items()}
+        if previous.get("n_coefficients"):
+            counts = _add_lists(previous["n_coefficients"], counts)
+            for level, vector in inside.items():
+                if level in (previous.get("inside") or {}):
+                    inside[level] = _add_lists(previous["inside"][level], vector)
+        merged[axis] = {"n_coefficients": counts, "inside": inside}
+    return merged
 
 
 def merge_calibration(
@@ -432,12 +536,14 @@ def merge_calibration(
             "pit_sum": float(right["pit_sum"]),
             "pit_sq_sum": float(right["pit_sq_sum"]),
             "inside": dict(right["inside"]),
+            "resolved": _merge_resolved(None, right.get("resolved")),
         }
     merged = {
         "n_coefficients": left["n_coefficients"] + float(right["n_coefficients"]),
         "pit_sum": left["pit_sum"] + float(right["pit_sum"]),
         "pit_sq_sum": left["pit_sq_sum"] + float(right["pit_sq_sum"]),
         "inside": dict(left["inside"]),
+        "resolved": _merge_resolved(left.get("resolved"), right.get("resolved")),
     }
     for level, count in right["inside"].items():
         merged["inside"][level] = merged["inside"].get(level, 0.0) + float(count)
@@ -458,8 +564,10 @@ def finish_calibration(totals: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
 
     Returns:
         ``{'n_coefficients', 'pit_mean', 'pit_var', 'coverage': {level: fraction},
-        'uniform_pit_mean', 'uniform_pit_var'}``, with every measured figure ``None`` where
-        nothing was scored.
+        'uniform_pit_mean', 'uniform_pit_var', 'resolved': {'by_horizon': {'n_coefficients':
+        [H], 'coverage': {level: [H]}}, 'by_block': {...}}}``, with every measured figure
+        ``None`` where nothing was scored and a resolved coverage ``None`` at a position that
+        scored no coefficient.
     """
     reference = {"uniform_pit_mean": 0.5, "uniform_pit_var": 1.0 / 12.0}
     if not totals or float(totals["n_coefficients"]) <= 0.0:
@@ -468,10 +576,26 @@ def finish_calibration(totals: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
             "pit_mean": None,
             "pit_var": None,
             "coverage": {},
+            "resolved": {},
             **reference,
         }
     count = float(totals["n_coefficients"])
     mean = float(totals["pit_sum"]) / count
+    resolved: Dict[str, Any] = {}
+    for axis, block in (totals.get("resolved") or {}).items():
+        counts = [float(value) for value in block.get("n_coefficients", [])]
+        if not counts:
+            continue
+        resolved[axis] = {
+            "n_coefficients": counts,
+            "coverage": {
+                level: [
+                    (float(inside) / total) if total > 0.0 else None
+                    for inside, total in zip(vector, counts)
+                ]
+                for level, vector in (block.get("inside") or {}).items()
+            },
+        }
     return {
         "n_coefficients": count,
         "pit_mean": mean,
@@ -479,6 +603,7 @@ def finish_calibration(totals: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
         "coverage": {
             level: float(inside) / count for level, inside in totals["inside"].items()
         },
+        "resolved": resolved,
         **reference,
     }
 

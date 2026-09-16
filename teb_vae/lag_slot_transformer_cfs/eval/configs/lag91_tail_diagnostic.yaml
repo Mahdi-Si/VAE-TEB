@@ -1,0 +1,124 @@
+# The OLD-BANK TAIL DIAGNOSTIC: rescore an existing 91-entry checkpoint with its tail removed jointly.
+#
+# A copy of `eval_overrides.yaml` -- merged OVER a checkpoint's own resolved_config.yaml exactly as
+# that delta is, with no `base:` key -- that differs in two settings and exists for one question:
+# what does the fitted model lose, or gain, when every proposal older than a candidate cutoff is
+# removed AT ONCE? The shipped four bands answer that band by band, and band margins do not add:
+# proposals interact through the sum, the limiter, the sample and the decoder, so the effect of
+# removing lags 25-90 together is not the sum of the `near`, `mid` and `far` margins and has to be
+# measured as its own arm.
+#
+# EVERY EXTRA ARM HERE IS A BAND, because a suppression band is exactly "remove these lags, hold
+# everything else fixed", and no code path is needed for a curve that is a family of bands:
+#
+#   * `head_0_24` / `tail_25_90` split the window at the proposed 25-entry cutoff. `tail_25_90`
+#     is the joint removal the question asks about; `head_0_24` is its complement, so the two read
+#     together say whether what the head carries alone is what the full bank carries.
+#   * `beyond_<l>` removes every lag ABOVE `l`, so its margin is the score of keeping the prefix
+#     0..l against the matched full branch: a keep-prefix curve read at a short fixed list of
+#     cutoffs. They nest -- each is a subset of the previous -- and the two ends are the reference
+#     identities every band readout already carries: keeping everything (`beyond_90` would be
+#     empty, so it is not declared) is `none`, and keeping nothing is `all`.
+#
+# The four shipped partition bands stay, so this run's `anchor`/`near`/`mid`/`far` margins are
+# comparable with the shipped run's. The extra bands OVERLAP them and each other; `all` is still
+# the union, which is every lag, so the `all`-equals-`silence` identity holds unchanged. Bands
+# are suppressions of cached proposals, so the extra arms cost decoder calls in the shared draw
+# loop and no new forward.
+#
+# NOT AN ACCEPTANCE PROFILE. The acceptance plan's exploratory band family is closed, and this
+# profile searches bands that family does not name; feed its summary to `eval.verify`, not to the
+# acceptance pass. A run under this profile is a diagnostic of one checkpoint, and its extra
+# bands were declared after that checkpoint's shipped band margins were read -- which is why it
+# is a separate file rather than an edit of the committed delta.
+#
+# Run from the repo root, at the primary draw count and then at the two stability counts on the
+# same panel:
+#   python -m teb_vae.lag_slot_transformer_cfs.eval.run --checkpoint <ckpt> \
+#       --overrides teb_vae/lag_slot_transformer_cfs/eval/configs/lag91_tail_diagnostic.yaml
+#   ... --num-samples 8      (and)     ... --num-samples 128
+# The runbook is section 7.3 of eval/EVAL.md.
+
+general_config:
+  batch_size:
+    test: 32
+
+dataset_config:
+  # REPOINT THESE, as in eval_overrides.yaml: the causal integer-operator k-fold holdout shards
+  # and the statistics file accumulated from them. For the epoch-1002 diagnostic use exactly the
+  # shard list that run's summary.json records under config_overrides, so the panel is the same.
+  vae_test_datasets:
+    - /data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_causal_int/k_fold_cross_validation_dataset/test/healthy_no_bg_no_cs.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_causal_int/k_fold_cross_validation_dataset/test/healthy_no_bg_cs.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_causal_int/k_fold_cross_validation_dataset/test/healthy_bg_no_cs.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_causal_int/k_fold_cross_validation_dataset/test/healthy_bg_cs.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_causal_int/k_fold_cross_validation_dataset/test/acidosis_no_cs.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_causal_int/k_fold_cross_validation_dataset/test/acidosis_cs.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_causal_int/k_fold_cross_validation_dataset/test/hie_no_cs.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_causal_int/k_fold_cross_validation_dataset/test/hie_cs.hdf5
+
+  stat_path: /data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_causal_int/k_fold_cross_validation_dataset/stats.hdf5
+
+  dataloader_config:
+    dataset_kwargs:
+      load_fields:
+        [
+          'fhr',
+          'up',
+          'fhr_st',
+          'fhr_ph',
+          'up_ph',
+          'up_st',
+          'weight',
+          'guid',
+          'epoch',
+          'target',
+          'cs_label',
+          'bg_label',
+          'time_from_labor_onset',
+          'second_stage_onset',
+        ]
+      cache_size: 0
+
+eval_config:
+  seed: 42
+
+  # The acceptance plan's PRIMARY draw count rather than the committed delta's eight: a
+  # diagnostic whose whole point is a margin of a few nats is read at the count the comparisons
+  # are read at. Override on the command line for the two stability counts.
+  num_mc_samples: 32
+
+  max_samples: null
+
+  caps:
+    waveforms: 64
+    pages: 24
+    pages_per_class: 10
+    traces_per_class: 10
+    attribution_segments: 24
+    lag_profile: 256
+
+  prior_shuffle_min_nats: 1.0
+  min_active_dims: 2
+  event_lag_window_s: 120.0
+  figure_format: null
+  max_hours_before_delivery: null
+  bootstrap_resamples: 2000
+
+  # The shipped partition first, unchanged, then the cutoff pair, then the keep-prefix family.
+  # Inclusive lag indices on the stored grid, as everywhere in this cell.
+  occlusion_bands:
+    anchor: [0, 14]
+    near: [15, 44]
+    mid: [45, 67]
+    far: [68, 90]
+    head_0_24: [0, 24]
+    tail_25_90: [25, 90]
+    beyond_0: [1, 90]
+    beyond_4: [5, 90]
+    beyond_9: [10, 90]
+    beyond_14: [15, 90]
+    beyond_24: [25, 90]
+    beyond_44: [45, 90]
+
+  clock_margin_min_nats: null

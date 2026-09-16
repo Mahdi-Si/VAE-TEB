@@ -541,7 +541,7 @@ def build_lag_figure(
     top.legend(loc="upper right", fontsize="small")
     top.set_title("Where the coupling exceeded the availability clock")
 
-    bottom.axhline(0.0, linewidth=0.8, color="0.4")
+    bottom.axhline(0.0, linewidth=figures.LINE_THIN, color="0.4")
     bottom.plot(axis, frame["clock_excess_nats"], color="C3", label="clock-excess (signed)")
     bottom.set_ylabel("nats per anchor")
     bottom.set_xlabel(COEFFICIENT_LAG_AXIS_LABEL)

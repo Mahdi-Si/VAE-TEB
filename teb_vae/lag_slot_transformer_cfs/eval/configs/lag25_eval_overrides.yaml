@@ -1,0 +1,125 @@
+# The evaluation override delta for a 25-ENTRY checkpoint, merged OVER its own resolved_config.yaml.
+#
+# A copy of `eval_overrides.yaml` -- no `base:` key, the same loader fields, the same caps under
+# the same names -- that differs in two settings, each because the bank it scores is a different
+# window from the one the committed delta's bands were declared on:
+#
+#   * `num_mc_samples: 32`, the acceptance plan's PRIMARY draw count rather than the committed
+#     delta's eight. Every comparison this arm enters is read at 32, and rescoring at 8 and 128 is
+#     the stability check, not the primary reading.
+#   * `occlusion_bands` declared for a window of 25 entries, lags 0..24 inclusive. The committed
+#     four-band partition reaches past this window's last lag and is refused at config load
+#     against `max_lag: 24`, which is the intended failure: a band that overstates what it
+#     removed would be reported under a name that describes something else.
+#
+# A checkpoint whose `max_lag` is not 24 refuses this delta at the band check, and the committed
+# delta refuses a 25-entry checkpoint the same way. Neither profile silently clips.
+#
+# Run from the repo root:
+#   python -m teb_vae.lag_slot_transformer_cfs.eval.run --checkpoint <run>/model_checkpoints/<f>.ckpt \
+#       --overrides teb_vae/lag_slot_transformer_cfs/eval/configs/lag25_eval_overrides.yaml
+
+general_config:
+  batch_size:
+    test: 32
+
+dataset_config:
+  # REPOINT THESE, exactly as in eval_overrides.yaml: the causal integer-operator k-fold holdout
+  # shards and the statistics file accumulated from them, at the run's own trim.
+  vae_test_datasets:
+    - /data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_causal_int/k_fold_cross_validation_dataset/test/healthy_no_bg_no_cs.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_causal_int/k_fold_cross_validation_dataset/test/healthy_no_bg_cs.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_causal_int/k_fold_cross_validation_dataset/test/healthy_bg_no_cs.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_causal_int/k_fold_cross_validation_dataset/test/healthy_bg_cs.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_causal_int/k_fold_cross_validation_dataset/test/acidosis_no_cs.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_causal_int/k_fold_cross_validation_dataset/test/acidosis_cs.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_causal_int/k_fold_cross_validation_dataset/test/hie_no_cs.hdf5
+    - /data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_causal_int/k_fold_cross_validation_dataset/test/hie_cs.hdf5
+
+  stat_path: /data1/fetal-heart-tracing/HDF5_Datasets/REPOINT_ME_causal_int/k_fold_cross_validation_dataset/stats.hdf5
+
+  dataloader_config:
+    dataset_kwargs:
+      # Restated whole, as in eval_overrides.yaml: a list replaces wholesale on merge, and every
+      # field beyond the model's own inputs has exactly one consumer there.
+      load_fields:
+        [
+          'fhr',
+          'up',
+          'fhr_st',
+          'fhr_ph',
+          'up_ph',
+          'up_st',
+          'weight',
+          'guid',
+          'epoch',
+          'target',
+          'cs_label',
+          'bg_label',
+          'time_from_labor_onset',
+          'second_stage_onset',
+        ]
+      cache_size: 0
+
+eval_config:
+  seed: 42
+
+  # The acceptance plan's primary draw count. See the header.
+  num_mc_samples: 32
+
+  max_samples: null
+
+  caps:
+    waveforms: 64
+    pages: 24
+    pages_per_class: 10
+    traces_per_class: 10
+    attribution_segments: 24
+    lag_profile: 256
+
+  prior_shuffle_min_nats: 1.0
+  min_active_dims: 2
+
+  # UNCHANGED from the committed delta on purpose. This is the event-conditioned REPORTING window
+  # of the contraction analysis, a property of the physiology and of nothing in this bank; it is
+  # not the source-bank length, and shortening it alongside the bank would make the contraction
+  # readout non-comparable with the 91-entry run for a reason about this file.
+  event_lag_window_s: 120.0
+
+  figure_format: null
+  max_hours_before_delivery: null
+  bootstrap_resamples: 2000
+
+  # THE LAG BANDS THE SUPPRESSION READOUT REMOVES, in stored steps back from the anchor, inclusive,
+  # declared for a window of 25 entries.
+  #
+  # The first four PARTITION the window, and separate the anchor's own stored step from its
+  # neighbours because the 91-entry run's evidence put nearly the whole effect on that one
+  # coefficient: a band that folded it in with the next few steps would hide whether anything
+  # beyond it carries an effect at all.
+  #   instant       [0, 0]     the anchor's own stored step
+  #   recent        [1, 4]     the next four steps, 4..16 s back
+  #   intermediate  [5, 12]    20..48 s back
+  #   tail          [13, 24]   52..96 s back, to the window's far edge
+  #
+  # The last two are FIXED CROSS-BANK BANDS, so a 25-entry run and a 91-entry run can be read on
+  # one interval: `common_head` is the 91-entry profile's `anchor` band unchanged, and
+  # `common_tail` is what survives of its `near` band inside this window. They OVERLAP the
+  # partition bands and each other, and every band is a suppression of cached proposals scored in
+  # the shared draw loop, so the overlap costs decoder calls and nothing else. `all` is still the
+  # union of every declared band, which is every lag on this window, so the `all`-equals-`silence`
+  # identity holds unchanged.
+  #
+  # These bands were declared after the 91-entry development run's margins were read, and are
+  # HYPOTHESES about where a shortened bank carries its effect; the acceptance plan lists them as
+  # the searched family for this window, six bands, and the family-adjusted interval pays for all
+  # six. Confirm them on a population the development run never scored.
+  occlusion_bands:
+    instant: [0, 0]
+    recent: [1, 4]
+    intermediate: [5, 12]
+    tail: [13, 24]
+    common_head: [0, 14]
+    common_tail: [15, 24]
+
+  clock_margin_min_nats: null

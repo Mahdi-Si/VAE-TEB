@@ -1,0 +1,66 @@
+# The 25-ENTRY BANK: the joint candidate with its source history shortened to about 100 seconds.
+#
+# One leaf differs from `joint.yaml`: `max_lag`. Everything the lag bank drives follows from it and
+# nothing else is touched -- the anchors, the warm-up budget, the horizon, the kept channels, the
+# training stride and the labels are the parent's, so a difference between this run and the
+# 91-entry candidate is attributable to the bank and to nothing else. The warm start is inherited
+# too: both arms begin from the same target-only checkpoint, which is what makes `joint.yaml` the
+# matched 91-entry reference by construction.
+#
+# WHAT THE ONE VALUE MEANS, written out because each reading of it is easy to get wrong:
+#
+#   * the bank has max_lag + 1 = 25 entries, lags 0..24, the anchor's own stored step INCLUDED;
+#   * the summation scale c_L resolves to (25)^(-1/2) = 0.2 under `lag_scale: null`, against
+#     (91)^(-1/2) ~ 0.1048 on the parent -- so the shortened bank changes the proposal amplitude
+#     as well as the support, and a run that must isolate support alone sets `lag_scale` to the
+#     parent's value explicitly;
+#   * the oldest gathered centre is max_lag stored steps before the anchor, i.e. 24 steps of
+#     raw_per_step raw samples each at the recording's 4 Hz: 24 * 16 / 4 = 96 s. Not 100 s: a
+#     25-bin duration convention gives 100 s, but the centre-to-centre span is 96 s. An exact
+#     100 s oldest centre is `max_lag: 25`, one value.
+#
+# WHAT SHORTENING DOES NOT DO. Each stored coefficient is already a filtered history; the bank
+# bounds which coefficient POSITIONS a proposal may read, not the raw-signal support behind them.
+# And a slow source channel that has not warmed up at an anchor is as unavailable to a 25-entry
+# bank as to a 91-entry one: the channel warm-up is a property of the feature, not of the bank.
+#
+# HOW IT IS SELECTED. Inherited from `joint.yaml`: eight paired draws per dense validation
+# batch, and both the checkpoint and the early-stopping monitor on `val/pred_nll_full_mc`, the
+# unweighted predictive-mixture score of the full branch. The same rule selects the 91-entry
+# candidate and the target-only reference, so the bank-length comparison is not confounded by
+# two selection rules.
+#
+# WHAT CANNOT BE DONE WITH THE 91-ENTRY CHECKPOINT. Its lag embedding has 91 rows and this model
+# builds 25, so a strict load refuses by name; cropping the table would also carry the parent's
+# c_L into a model whose own is 1.908 times larger, which is why this arm warm-starts from the
+# TARGET-ONLY checkpoint like every other arm rather than from the 91-entry candidate.
+#
+# RESOURCE MEASUREMENT (memory.py, S2-T05): to be recorded here by the operator at production
+# widths, for `max_lag: 90` and `max_lag: 24`, training batch 256 and 128, dense evaluation at
+# batch 32 with and without the proposals retained. State the batch size and the draw count
+# beside every number; the local proposal work scales with B * A * L, so the expected saving is
+# in the proposal activations and NOT an end-to-end speed-up, which is not claimed until measured.
+#
+# RUNNING IT
+#   python -m teb_vae.lag_slot_transformer_cfs.trainer \
+#       --config teb_vae/lag_slot_transformer_cfs/configs/lag25.yaml
+# and score it with the matching evaluation profile, whose bands are declared for this window:
+#   ... eval.run --checkpoint <ckpt> \
+#       --overrides teb_vae/lag_slot_transformer_cfs/eval/configs/lag25_eval_overrides.yaml
+
+base: joint.yaml
+
+general_config:
+  tag: lag_residual_trf_cfs_lag25
+
+  # Distinct from every other arm's, so no two arms share training randomness.
+  seed: 17
+
+model_config:
+  # REPOINT THIS at the same target-only checkpoint `joint.yaml` starts from. An arm warm-started
+  # from a different baseline is not comparable with the candidate on anything.
+  target_warm_start_checkpoint: REPOINT_ME_target_only_a_checkpoint.ckpt
+
+  VAE_model:
+    # The one leaf. Candidate lags 0..24 inclusive; see the header for what follows from it.
+    max_lag: 24

@@ -7,7 +7,7 @@
 # says that it was.
 #
 # The three settings most worth not moving are the seed minimum, the draw count the primary
-# comparisons are read at, and the band list. Moving the first turns a two-seed accident into
+# comparisons are read at, and the band families. Moving the first turns a two-seed accident into
 # evidence; moving the second reads two arms under two estimators; moving the third is a search
 # whose family is chosen after its peak.
 #
@@ -15,11 +15,16 @@
 # that is not below raises and names the valid set, so a misspelling cannot silently mean "no
 # minimum".
 
-declared_on: 2026-09-09
+declared_on: 2026-09-15
 
 # Bumped by hand whenever anything below changes, so two records naming two digests also name two
 # revisions rather than leaving a reader to diff them.
-revision: 1
+#
+# Revision 2: `exploratory_bands` became `exploratory_band_families`, keyed by the searched lag
+# window, so a 25-entry run is read under the family declared for its own window rather than
+# failed for searching bands the 91-entry family does not name. The 91-entry family is the
+# revision-1 list unchanged.
+revision: 2
 
 
 protocol:
@@ -64,7 +69,10 @@ protocol:
 # The chain is the one the arm configurations were built as, and the order matters: each adjacent
 # pair differs in exactly one constructor leaf, so a difference between them is attributable to
 # that leaf and to nothing else. A comparison between two arms further apart in the chain measures
-# a package of changes, which is why none is declared here.
+# a package of changes, which is why none is declared here. Two runs are paired only when they
+# were scored at one draw count, on one split, over one lag window and under one input policy:
+# the bank length and the input ablation are leaves of their own, and a pair that differs in
+# either is refused as unmatched rather than read as a comparison of the leaf it names.
 primary_comparisons:
   - name: source_temporal_convolution
     left: pointwise_attention
@@ -107,7 +115,7 @@ primary_comparisons:
       one whose right-hand arm has no source pathway to intervene on.
 
 
-# THE EXPLORATORY LAG BANDS. A search, and declared as one.
+# THE EXPLORATORY LAG BANDS. A search, and declared as one, per lag window.
 #
 # The band carrying the largest suppression margin is chosen on the same data its interval is built
 # from, so a nominal interval on the winner would cover less than it claims. Every band here is
@@ -115,7 +123,17 @@ primary_comparisons:
 # which gives all of them simultaneous coverage -- and a member selected out of a simultaneously
 # covered family keeps that coverage however it was selected.
 #
-# These are the production partition's names. A run that searched FEWER is read with the smaller
-# family and the record says so. A run that searched a band this list does not name is a search
-# whose family was chosen after the fact, and the pass fails it by name.
-exploratory_bands: [anchor, near, mid, far]
+# Keyed by the number of searched lag steps each run records in its causality block, because the
+# bands a window can be partitioned into are a property of the window: the 91-entry partition
+# reaches past a 25-entry window's last lag and is refused there at config load, and the 25-entry
+# bands are a different search. A run is read under the family declared for ITS window. A run that
+# searched FEWER of its family's bands is read with the smaller family and the record says so. A
+# run that searched a band its family does not name, or whose window no family here declares, is
+# a search whose family was chosen after the fact, and the pass fails it by name.
+#
+# The 25-entry family holds the four bands that partition that window AND the two fixed cross-bank
+# bands that overlap them; all six are searched, so all six are in the family the correction pays
+# for.
+exploratory_band_families:
+  91: [anchor, near, mid, far]
+  25: [instant, recent, intermediate, tail, common_head, common_tail]

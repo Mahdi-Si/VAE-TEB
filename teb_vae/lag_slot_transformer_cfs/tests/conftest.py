@@ -23,7 +23,7 @@ from __future__ import annotations
 import importlib
 import sys
 from pathlib import Path
-from typing import Any, Dict, Sequence, Tuple
+from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
 
 import pytest
 import torch
@@ -301,15 +301,41 @@ def int_cohort_stats(int_cohort_shards) -> str:
     return str(Path(int_cohort_shards[0]).parent / COHORT_STATS_FILENAME)
 
 
-@pytest.fixture(scope="session")
-def slot_cohort_run(int_cohort_shards, int_cohort_stats, tmp_path_factory) -> Path:
-    """One real fit of this cell against the generated cohort shards; returns the run directory.
+#: The two smoke training profiles a cohort fit may run: the shipped smoke configuration, and its
+#: short-bank twin, which is the fixture-scale profile the short-window evaluation delta is
+#: declared for.
+SMOKE_CONFIG = "tiny.yaml"
+SHORT_SMOKE_CONFIG = "tiny_lag25.yaml"
 
-    Marked ``slow`` at every consumer rather than here, and nothing in the fast subset may depend
-    on it. Driven through ``trainer.main`` rather than by assembling a checkpoint by hand, because
-    what an evaluation reads out of this directory is precisely what the driver puts there: the
+#: The short-window evaluation delta, declared for the window the short-bank profile builds.
+SHORT_EVAL_OVERRIDES = "lag25_eval_overrides.yaml"
+
+
+def fit_cohort(
+    config_name: str,
+    shards: Sequence[str],
+    stats: str,
+    run_root: Path,
+    *,
+    model_overrides: Optional[Mapping[str, Any]] = None,
+) -> Path:
+    """One real fit of a smoke profile against the generated cohort shards; the run directory.
+
+    Driven through ``trainer.main`` rather than by assembling a checkpoint by hand, because what
+    an evaluation reads out of this directory is precisely what the driver puts there: the
     warm-up tuples the budget resolved against these shards, the representation stamp, and
     ``resolved_config.yaml``.
+
+    Args:
+        config_name: The smoke configuration filename to fit.
+        shards: The cohort shards, used for training and testing alike.
+        stats: The statistics file written from those shards.
+        run_root: Where the run writes.
+        model_overrides: ``model_config.VAE_model`` leaves to set before the fit, for a profile
+            layered on the smoke configuration rather than shipped as a file.
+
+    Returns:
+        The run directory holding ``model_checkpoints``.
     """
     import yaml
 
@@ -317,16 +343,16 @@ def slot_cohort_run(int_cohort_shards, int_cohort_stats, tmp_path_factory) -> Pa
     from teb_vae.lag_attn_cfs.tests.conftest import absolutize_dataset_paths
     from teb_vae.lag_slot_transformer_cfs import trainer as trainer_module
 
-    run_root = Path(tmp_path_factory.mktemp("slot_cohort_run"))
-    tiny = Path(_REPO_ROOT) / "teb_vae" / "lag_slot_transformer_cfs" / "configs" / "tiny.yaml"
-    config = absolutize_dataset_paths(load_config(str(tiny)))
+    source = Path(_REPO_ROOT) / "teb_vae" / "lag_slot_transformer_cfs" / "configs" / config_name
+    config = absolutize_dataset_paths(load_config(str(source)))
     dataset = config["dataset_config"]
-    dataset["vae_train_datasets"] = list(int_cohort_shards)
-    dataset["vae_test_datasets"] = list(int_cohort_shards)
-    dataset["stat_path"] = int_cohort_stats
+    dataset["vae_train_datasets"] = list(shards)
+    dataset["vae_test_datasets"] = list(shards)
+    dataset["stat_path"] = stats
     config["general_config"]["folders_config"]["out_dir_base"] = str(run_root)
     config["general_config"]["epochs"] = COHORT_FIT_EPOCHS
     config["advanced_config"]["trainer"]["profiler"] = None
+    config["model_config"]["VAE_model"].update(dict(model_overrides or {}))
 
     config_path = run_root / "resolved.yaml"
     config_path.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
@@ -337,57 +363,73 @@ def slot_cohort_run(int_cohort_shards, int_cohort_stats, tmp_path_factory) -> Pa
     return checkpoint_dirs[0].parent
 
 
-@pytest.fixture(scope="session")
-def slot_cohort_overrides(int_cohort_shards, int_cohort_stats, tmp_path_factory) -> Path:
-    """This package's committed evaluation delta with its placeholder leaves repointed.
+def repoint_overrides(
+    overrides_path: Path,
+    shards: Sequence[str],
+    stats: str,
+    destination: Path,
+    *,
+    occlusion_bands: Optional[Mapping[str, Sequence[int]]] = None,
+) -> Path:
+    """A shipped evaluation delta with its placeholder leaves repointed at the fixture cohort.
 
     Exactly the edit an operator makes before a real run: a delta carrying only the shard paths
     would replace the committed one, and with it the clinical ``load_fields`` every cohort-aware
-    readout is asked in. The lag bands are rescaled to the tiny window through the causal cell's
-    helper, and the single-lag profile cap is lowered so it is exercised as a cap.
+    readout is asked in. The single-lag profile cap is lowered so it is exercised as a cap.
+
+    Args:
+        overrides_path: The shipped delta.
+        shards: The cohort shards.
+        stats: The statistics file written from them.
+        destination: Where to write the repointed delta.
+        occlusion_bands: Bands to replace the shipped ones with, or ``None`` to keep the delta's
+            own -- which is right when the delta is declared for the window the fit built.
+
+    Returns:
+        The repointed delta's path.
     """
     import yaml
 
-    from teb_vae.lag_attn.config import load_config
     from teb_vae.lag_attn_cfs.eval.config_schema import load_eval_overrides
-    from teb_vae.lag_attn_cfs.tests.conftest import _tiny_occlusion_bands
-    from teb_vae.lag_slot_transformer_cfs.eval.binding import LAG_RESIDUAL_BINDING
 
-    overrides = load_eval_overrides(LAG_RESIDUAL_BINDING.overrides_path)
-    overrides["dataset_config"]["vae_test_datasets"] = list(int_cohort_shards)
-    overrides["dataset_config"]["stat_path"] = int_cohort_stats
+    overrides = load_eval_overrides(overrides_path)
+    overrides["dataset_config"]["vae_test_datasets"] = list(shards)
+    overrides["dataset_config"]["stat_path"] = stats
     overrides["general_config"]["batch_size"]["test"] = 4
-    tiny = Path(_REPO_ROOT) / "teb_vae" / "lag_slot_transformer_cfs" / "configs" / "tiny.yaml"
-    overrides["eval_config"]["occlusion_bands"] = _tiny_occlusion_bands(
-        int(load_config(str(tiny))["model_config"]["VAE_model"]["max_lag"])
-    )
+    if occlusion_bands is not None:
+        overrides["eval_config"]["occlusion_bands"] = dict(occlusion_bands)
     overrides["eval_config"]["caps"]["lag_profile"] = COHORT_PROFILE_SEGMENTS
     # The schema's floor: the fixture holds a handful of recordings and a wider interval is not
     # made narrower by resampling it more.
     overrides["eval_config"]["bootstrap_resamples"] = 100
-    path = Path(tmp_path_factory.mktemp("slot_eval_overrides")) / "eval_overrides_repointed.yaml"
-    path.write_text(yaml.safe_dump(overrides, sort_keys=False), encoding="utf-8")
-    return path
+    destination.write_text(yaml.safe_dump(overrides, sort_keys=False), encoding="utf-8")
+    return destination
 
 
-@pytest.fixture(scope="session")
-def slot_collected_run(slot_cohort_run, slot_cohort_overrides, tmp_path_factory) -> Dict[str, Any]:
-    """One real evaluation of this cell through the family's runner; every artifact it left.
+def collect_run(run_dir: Path, overrides_path: Path, output_dir: Path) -> Dict[str, Any]:
+    """One real evaluation of a fitted run through the family's runner; every artifact it left.
 
-    Marked ``slow`` at every consumer rather than here. Two Monte Carlo draws rather than the
-    shipped count: these tests are about the plumbing, and each draw decodes every arm over every
-    anchor.
+    Two Monte Carlo draws rather than the shipped count: these tests are about the plumbing, and
+    each draw decodes every arm over every anchor.
+
+    Args:
+        run_dir: The training run directory holding ``model_checkpoints``.
+        overrides_path: The repointed evaluation delta.
+        output_dir: Where the evaluation writes.
+
+    Returns:
+        The checkpoint, the exit code, the summary path, its text, the parsed summary and the
+        results directory.
     """
     import json
 
     from teb_vae.lag_slot_transformer_cfs.eval import run as run_module
 
-    output_dir = Path(tmp_path_factory.mktemp("slot_eval"))
-    checkpoint = sorted((Path(slot_cohort_run) / "model_checkpoints").glob("*.ckpt"))[0]
+    checkpoint = sorted((Path(run_dir) / "model_checkpoints").glob("*.ckpt"))[0]
     exit_code = run_module.main(
         checkpoint=str(checkpoint),
         output_dir=str(output_dir),
-        overrides=str(slot_cohort_overrides),
+        overrides=str(overrides_path),
         device="cpu",
         num_samples=2,
         argument_sources={"checkpoint": "cli", "overrides": "cli"},
@@ -403,3 +445,94 @@ def slot_collected_run(slot_cohort_run, slot_cohort_overrides, tmp_path_factory)
         "summary": json.loads(text),
         "results_dir": results_dir,
     }
+
+
+@pytest.fixture(scope="session")
+def slot_cohort_run(int_cohort_shards, int_cohort_stats, tmp_path_factory) -> Path:
+    """One real fit of this cell against the generated cohort shards; returns the run directory.
+
+    Marked ``slow`` at every consumer rather than here, and nothing in the fast subset may depend
+    on it.
+    """
+    return fit_cohort(
+        SMOKE_CONFIG, int_cohort_shards, int_cohort_stats,
+        Path(tmp_path_factory.mktemp("slot_cohort_run")),
+    )
+
+
+@pytest.fixture(scope="session")
+def slot_cohort_overrides(int_cohort_shards, int_cohort_stats, tmp_path_factory) -> Path:
+    """This package's committed evaluation delta with its placeholder leaves repointed.
+
+    The lag bands are rescaled to the tiny window through the causal cell's helper, because the
+    committed partition is declared for the production window and the smoke fit builds a
+    smaller one.
+    """
+    from teb_vae.lag_attn.config import load_config
+    from teb_vae.lag_attn_cfs.tests.conftest import _tiny_occlusion_bands
+    from teb_vae.lag_slot_transformer_cfs.eval.binding import LAG_RESIDUAL_BINDING
+
+    tiny = Path(_REPO_ROOT) / "teb_vae" / "lag_slot_transformer_cfs" / "configs" / SMOKE_CONFIG
+    bands = _tiny_occlusion_bands(
+        int(load_config(str(tiny))["model_config"]["VAE_model"]["max_lag"])
+    )
+    return repoint_overrides(
+        LAG_RESIDUAL_BINDING.overrides_path, int_cohort_shards, int_cohort_stats,
+        Path(tmp_path_factory.mktemp("slot_eval_overrides")) / "eval_overrides_repointed.yaml",
+        occlusion_bands=bands,
+    )
+
+
+@pytest.fixture(scope="session")
+def slot_collected_run(slot_cohort_run, slot_cohort_overrides, tmp_path_factory) -> Dict[str, Any]:
+    """One real evaluation of this cell through the family's runner; every artifact it left.
+
+    Marked ``slow`` at every consumer rather than here.
+    """
+    return collect_run(slot_cohort_run, slot_cohort_overrides, Path(tmp_path_factory.mktemp("slot_eval")))
+
+
+# =================================================================================================
+# The short-bank profile under the target input ablation, end to end
+#
+# A second fit and a second evaluation, of the short-bank smoke twin with the FHR order-zero
+# coefficient ablated at the input, scored under the evaluation delta declared for that window.
+# The two profiles are new and each has behaviour no other fixture exercises: a lag axis of
+# another length under the same figures, six declared bands two of which overlap the partition,
+# an ablated coordinate that every baseline, control and attribution must not read, and an
+# acceptance pass that reads the run under its own window's family.
+# =================================================================================================
+@pytest.fixture(scope="session")
+def slot_short_ablated_run(int_cohort_shards, int_cohort_stats, tmp_path_factory) -> Path:
+    """One real fit of the short-bank smoke twin with the target ablation on; the run directory."""
+    return fit_cohort(
+        SHORT_SMOKE_CONFIG, int_cohort_shards, int_cohort_stats,
+        Path(tmp_path_factory.mktemp("slot_short_run")),
+        model_overrides={"zero_fhr_scattering_s0": True},
+    )
+
+
+@pytest.fixture(scope="session")
+def slot_short_overrides(int_cohort_shards, int_cohort_stats, tmp_path_factory) -> Path:
+    """The short-window evaluation delta repointed at the cohort, its own bands kept.
+
+    The bands are not rescaled: the delta is declared for exactly the window the short-bank
+    smoke twin builds, which is the point of scoring that fit under it.
+    """
+    from teb_vae.lag_slot_transformer_cfs.eval.binding import LAG_RESIDUAL_BINDING
+
+    return repoint_overrides(
+        LAG_RESIDUAL_BINDING.overrides_path.parent / SHORT_EVAL_OVERRIDES,
+        int_cohort_shards, int_cohort_stats,
+        Path(tmp_path_factory.mktemp("slot_short_overrides")) / "short_overrides_repointed.yaml",
+    )
+
+
+@pytest.fixture(scope="session")
+def slot_short_collected_run(
+    slot_short_ablated_run, slot_short_overrides, tmp_path_factory
+) -> Dict[str, Any]:
+    """One real evaluation of the short-bank ablated fit under the short-window delta."""
+    return collect_run(
+        slot_short_ablated_run, slot_short_overrides, Path(tmp_path_factory.mktemp("slot_short_eval"))
+    )

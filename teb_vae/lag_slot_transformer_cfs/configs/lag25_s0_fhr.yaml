@@ -1,0 +1,40 @@
+# The 25-entry bank with the TARGET order-zero scattering coefficient ablated at the input.
+#
+# One leaf differs from `lag25.yaml`. The FHR stream's first scattering channel -- the smoothed
+# heart-rate level -- is zeroed at the model's input boundary, before the persistence gather, the
+# gate and the encoder, so neither branch can read the anchor's own level and the persistence
+# shortcut carries a zero for that channel. The forecast LABELS are the original coefficients:
+# the model still forecasts the level, from a stream in which it cannot see it.
+#
+# WHAT IT ISOLATES. Whether the source-conditioned gain depends on the model reading the absolute
+# FHR level, and how much of the base forecast's skill that one coefficient carries. Read it
+# against `target_only_s0_fhr.yaml`, the target-only reference fitted under the SAME input
+# policy: a comparison against a reference that could read the level would credit the source
+# with closing a gap the ablation opened.
+#
+# WHAT IT IS NOT. Not a missing sensor: the coefficient is announced as available and is zero,
+# which is its training mean on the standardised scale. Not a change of task: every scored
+# coordinate, the level included, stays in the likelihood, the errors and the calibration. The
+# scoring pass reports the level's own score beside the rest so a loss of level context cannot
+# hide inside the aggregate.
+#
+# RUNNING IT
+#   python -m teb_vae.lag_slot_transformer_cfs.trainer \
+#       --config teb_vae/lag_slot_transformer_cfs/configs/lag25_s0_fhr.yaml
+
+base: lag25.yaml
+
+general_config:
+  tag: lag_residual_trf_cfs_lag25_s0_fhr
+
+  seed: 19
+
+model_config:
+  # REPOINT THIS at the `target_only_s0_fhr.yaml` checkpoint: the target-only donor must have
+  # been fitted under this same input policy, or the transferred base branch starts from weights
+  # that expect a level it will never again be shown.
+  target_warm_start_checkpoint: REPOINT_ME_target_only_s0_fhr_checkpoint.ckpt
+
+  VAE_model:
+    # The one leaf.
+    zero_fhr_scattering_s0: true
