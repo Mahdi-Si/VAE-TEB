@@ -140,22 +140,24 @@ FIGURE_WIDTH = 7.2
 #: that makes an evaluation figure a print one. Applied as a delta rather than a replacement so
 #: the serif family, the DPI and the white background stay the repository's.
 STYLE_REFINEMENT = {
-    # Type: a four-step scale, 6-7.5 pt, inside the 5-8 pt band the journals ask for at final size.
+    # Type: a four-step scale, 5.5-7 pt, inside the 5-8 pt band the journals ask for at final size.
+    # Half a point below the earlier scale throughout, so tick labels and legends stop touching on
+    # the dense multi-panel pages while the axis labels stay the largest text on the page.
     # Mathtext in the STIX face so a symbol in a label matches the Times body around it.
-    "font.size": 7.0,
-    "axes.titlesize": 7.5,
+    "font.size": 6.5,
+    "axes.titlesize": 7.0,
     "axes.titleweight": "normal",
     "axes.titlepad": 4.0,
-    "axes.labelsize": 7.0,
+    "axes.labelsize": 6.5,
     "axes.labelpad": 2.5,
-    "xtick.labelsize": 6.0,
-    "ytick.labelsize": 6.0,
-    "legend.fontsize": 6.0,
-    "legend.title_fontsize": 6.0,
+    "xtick.labelsize": 5.5,
+    "ytick.labelsize": 5.5,
+    "legend.fontsize": 5.5,
+    "legend.title_fontsize": 5.5,
     "mathtext.fontset": "stix",
     # Frame: left and bottom spines only, hairline weight, ticks outward. The box frame heatmaps
     # need is restored per axes by ``style_axes``.
-    "axes.linewidth": 0.5,
+    "axes.linewidth": 0.4,
     "axes.edgecolor": COLOR_BLACK,
     "axes.spines.top": False,
     "axes.spines.right": False,
@@ -163,18 +165,18 @@ STYLE_REFINEMENT = {
     "ytick.direction": "out",
     "xtick.major.size": 2.5,
     "ytick.major.size": 2.5,
-    "xtick.major.width": 0.5,
-    "ytick.major.width": 0.5,
+    "xtick.major.width": 0.4,
+    "ytick.major.width": 0.4,
     "xtick.minor.size": 1.5,
     "ytick.minor.size": 1.5,
-    "xtick.minor.width": 0.3,
-    "ytick.minor.width": 0.3,
+    "xtick.minor.width": 0.25,
+    "ytick.minor.width": 0.25,
     "xtick.major.pad": 2.0,
     "ytick.major.pad": 2.0,
     # Grid: a hairline one can read a value against, faint enough to vanish under a shape.
     "grid.color": COLOR_LIGHT_GRAY,
-    "grid.linewidth": 0.3,
-    "grid.alpha": 0.6,
+    "grid.linewidth": 0.25,
+    "grid.alpha": 0.5,
     # Legend: unframed. A box around a legend is the single most common mark of an unconsidered
     # figure, and the entries are short enough to read against the data.
     "legend.frameon": False,
@@ -186,11 +188,11 @@ STYLE_REFINEMENT = {
     "legend.borderaxespad": 0.3,
     "legend.columnspacing": 1.0,
     # Data defaults for every artist drawn without an explicit weight.
-    "lines.linewidth": 0.9,
-    "lines.markersize": 3.0,
-    "lines.markeredgewidth": 0.4,
-    "patch.linewidth": 0.5,
-    "hatch.linewidth": 0.5,
+    "lines.linewidth": 0.7,
+    "lines.markersize": 2.5,
+    "lines.markeredgewidth": 0.3,
+    "patch.linewidth": 0.35,
+    "hatch.linewidth": 0.35,
     # Tick formatting: mathtext exponents rather than ``1e-3`` in a monospace face, and an offset
     # only when the axis really needs one.
     "axes.formatter.use_mathtext": True,
@@ -202,6 +204,11 @@ STYLE_REFINEMENT = {
 
 #: Drawn on an axes that has no finite data, in place of an empty frame that reads as a bug.
 EMPTY_NOTE = "no finite values"
+
+#: Weight in points of the dark outline every histogram bar and bar-chart bar carries. Thin:
+#: about a third of the data line weight, enough to separate adjacent bins at print size and
+#: light enough that a fill reads as one mark.
+HISTOGRAM_EDGE_WIDTH = 0.25
 
 #: Panel letters, stamped by :func:`render_figure` on every figure with more than one data panel,
 #: in the order the axes were created. Lowercase and bold -- the convention of Nature and of the
@@ -553,9 +560,13 @@ def histogram_panel(
         style_axes(ax)
         return 0
 
-    # Bars separated by a white hairline rather than outlined in black: the outline reads as a
-    # second data series at print size.
-    ax.hist(finite, bins=int(bins), color=color, alpha=0.9, edgecolor="white", linewidth=0.3)
+    # Bars outlined in a thin dark hairline, so adjacent bars read as separate bins rather than
+    # as one filled area; the weight is well below the data line weight so the outline never
+    # reads as a second series.
+    ax.hist(
+        finite, bins=int(bins), color=color, alpha=0.85, edgecolor=COLOR_BLACK,
+        linewidth=HISTOGRAM_EDGE_WIDTH,
+    )
     median = float(np.median(finite))
     ax.axvline(median, color=COLOR_VERMILLION, linestyle="--", linewidth=plt.rcParams["lines.linewidth"],
                label=f"median {median:.4g}")
@@ -743,12 +754,12 @@ def heatmap_with_colorbar(
 #: a three-cohort panel and as a sliver on an eight-subgroup one. Weighted in points it is the
 #: same mark on both, which is what lets the two figures be read against each other.
 #:
-#: The multiples are chosen so that under ``lag_attn_rws``'s style refinement they come out at
-#: exactly that package's ``LINE_HEAVY`` ($2.4$) and ``LINE_THIN`` ($0.65$) -- the weights its
+#: The multiples are chosen so that under the refined ``lines.linewidth`` of $0.7$ they come out
+#: at the cfs seam's ``LINE_HEAVY`` ($2.0$) and ``LINE_THIN`` ($0.5$) -- the weights its
 #: ``distributions`` strip already draws an inter-quartile span and a range with. One visual
 #: vocabulary for "these are quartiles", across two figures built by different modules.
-INNER_BOX_BAR_WEIGHT_RATIO = 2.67
-INNER_BOX_WHISKER_WEIGHT_RATIO = 0.72
+INNER_BOX_BAR_WEIGHT_RATIO = 2.86
+INNER_BOX_WHISKER_WEIGHT_RATIO = 0.71
 
 #: The median dot's diameter in points, and the weight of its outline as a multiple of the active
 #: ``lines.linewidth``. Sized to sit inside the bar it marks rather than to straddle it.
@@ -880,7 +891,7 @@ def violin_panel(
         body.set_alpha(0.55)
         # Outlined in its own hue rather than black, so the body reads as one mark.
         body.set_edgecolor(hue)
-        body.set_linewidth(0.5)
+        body.set_linewidth(0.4)
 
     # The interior, one mark per populated group, drawn by the helper the binned panel shares --
     # a convention with an edge case worth not owning twice.
@@ -1040,7 +1051,7 @@ def binned_violin_panel(
                 body.set_facecolor(colour)
                 body.set_alpha(0.55)
                 body.set_edgecolor(colour)
-                body.set_linewidth(0.5)
+                body.set_linewidth(0.4)
             for position, values in zip(body_positions, bodies):
                 _draw_inner_box(ax, position, values)
         if point_x:
@@ -1154,9 +1165,16 @@ def significance_strip(
             label="not testable", zorder=3,
         )
     if not testable:
-        _note_empty(ax)
         if untestable:
+            # Above the row of crosses rather than through it, so the note and the markers that
+            # explain it do not overprint.
+            ax.text(
+                0.5, 0.75, EMPTY_NOTE, transform=ax.transAxes, ha="center", va="center",
+                fontsize=plt.rcParams["axes.labelsize"], fontstyle="italic", color=COLOR_GRAY,
+            )
             ax.legend(loc="best")
+        else:
+            _note_empty(ax)
         style_axes(ax)
         return 0
 
@@ -1169,6 +1187,8 @@ def significance_strip(
         width=SIGNIFICANCE_BAR_FRACTION * float(bin_width),
         color=COLOR_BLUE,
         alpha=0.85,
+        edgecolor=COLOR_BLACK,
+        linewidth=HISTOGRAM_EDGE_WIDTH,
     )
     ax.axhline(
         -np.log10(float(alpha)),
@@ -1376,7 +1396,7 @@ def frequency_scatter(
         hz[usable], quantity[usable],
         c=shades if shades is not None else COLOR_BLUE,
         cmap="viridis" if shades is not None else None,
-        s=18, alpha=0.85, edgecolor=COLOR_BLACK, linewidth=0.3,
+        s=14, alpha=0.85, edgecolor=COLOR_BLACK, linewidth=HISTOGRAM_EDGE_WIDTH,
     )
     ax.set_xscale("log")
     if shades is not None:

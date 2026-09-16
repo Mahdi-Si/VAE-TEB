@@ -1,0 +1,31 @@
+# The TARGET-ONLY arm under the FHR input ablation: the reference for every `*_s0_fhr` arm.
+#
+# One leaf differs from `target_only.yaml`. The FHR stream's order-zero scattering coefficient is
+# zeroed at the model's input boundary, exactly as on `lag25_s0_fhr.yaml` and `lag25_s0_both.yaml`,
+# so this checkpoint is both the warm-start donor those arms begin from and the frozen reference
+# their gaps are read against. A source-enabled ablation compared against the ORDINARY
+# target-only reference would credit the source with closing the gap the ablation itself opened
+# in the base branch; this arm is what removes that confound.
+#
+# Everything `target_only.yaml` says about the arm holds here: no source pathway is built, the
+# full distribution is the prior, the divergence is exactly zero, and the two decoded forecasts
+# agree bitwise in every row. Two roles, two seeds, two tags, as for the parent: `-a` is the
+# donor, `-b` the reference.
+#
+# RUNNING IT
+#   python -m teb_vae.lag_slot_transformer_cfs.trainer \
+#       --config teb_vae/lag_slot_transformer_cfs/configs/target_only_s0_fhr.yaml
+
+base: target_only.yaml
+
+general_config:
+  # CHANGE THIS PER ROLE, as for the parent.
+  tag: lag_residual_trf_cfs_target_only_s0_fhr_a
+
+  # AND THIS. The reference role runs the identical file at a different seed.
+  seed: 42
+
+model_config:
+  VAE_model:
+    # The one leaf beyond the parent's.
+    zero_fhr_scattering_s0: true

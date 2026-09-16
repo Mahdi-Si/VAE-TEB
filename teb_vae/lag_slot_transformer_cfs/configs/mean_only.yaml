@@ -30,6 +30,11 @@
 # architecture, so a base branch is comparable across arms and each arm's gap is read against the
 # same external number.
 
+# WHICH BANK IT ISOLATES ON. `base:` names the bank profile this arm differs from by one leaf. It
+# is rebased on `lag25.yaml` once the bank-length comparison has found the shortened bank
+# competitive under the predeclared tolerance, and stays on `joint.yaml` otherwise; the operator
+# runbook in the evaluation guide records that decision before this arm is trained.
+
 base: joint.yaml
 
 general_config:

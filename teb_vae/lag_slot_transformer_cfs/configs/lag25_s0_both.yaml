@@ -1,0 +1,27 @@
+# The 25-entry bank with BOTH order-zero scattering coefficients ablated at the input.
+#
+# The fourth cell of the input-ablation factorial: neither (`lag25.yaml`), the source alone
+# (`lag25_s0_up.yaml`), the target alone (`lag25_s0_fhr.yaml`), and both. Two leaves differ from
+# `lag25.yaml`, one per stream, and each does exactly what its single-switch profile documents.
+#
+# Read it against `target_only_s0_fhr.yaml`, the target-only reference fitted under the same FHR
+# policy, and warm-start it from that checkpoint for the same reason `lag25_s0_fhr.yaml` does.
+#
+# RUNNING IT
+#   python -m teb_vae.lag_slot_transformer_cfs.trainer \
+#       --config teb_vae/lag_slot_transformer_cfs/configs/lag25_s0_both.yaml
+
+base: lag25.yaml
+
+general_config:
+  tag: lag_residual_trf_cfs_lag25_s0_both
+
+  seed: 29
+
+model_config:
+  # REPOINT THIS at the `target_only_s0_fhr.yaml` checkpoint, which shares this arm's FHR policy.
+  target_warm_start_checkpoint: REPOINT_ME_target_only_s0_fhr_checkpoint.ckpt
+
+  VAE_model:
+    zero_fhr_scattering_s0: true
+    zero_up_scattering_s0: true

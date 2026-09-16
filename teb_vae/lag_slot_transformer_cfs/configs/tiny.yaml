@@ -46,6 +46,11 @@ model_config:
     # squared error never trains it.
     likelihood: gaussian_nll
 
+    # Two draws, the fewest that make the mixture a mixture, so the smoke fit logs the monitor's
+    # three columns and exercises the noise bank. The selectors stay on the parent's legacy
+    # columns here; the short-bank twin is the fixture profile that selects on the monitor.
+    validation_mc_draws: 2
+
 dataset_config:
   vae_train_datasets: [teb_vae/lag_attn/tests/fixtures/tiny_shard_causal_int.hdf5]
   vae_test_datasets: [teb_vae/lag_attn/tests/fixtures/tiny_shard_causal_int.hdf5]

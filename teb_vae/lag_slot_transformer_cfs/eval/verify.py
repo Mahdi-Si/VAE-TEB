@@ -25,19 +25,24 @@ family's readouts, verdicts and per-analysis blocks, and every check here reads 
 family's own sanity block and verdict list travel in the same file and are read by the family's
 tools; this gate is the one that knows what a suppression margin is.
 
-The **predictive gap is reported and not gated**, and that is the whole point of shipping it this
-way. Where the boundary of an acceptable gap sits is what the first real runs are supposed to
-measure; a provisional threshold would decide a pass or a fail on exactly the run that was going to
-answer the question, and nobody reading the output could tell a healthy model failing from a broken
-one passing. The verdict is INCONCLUSIVE with the measured gap and both interval ends beside it.
+The **predictive gap is read from its paired interval, never from its sign.** The measured gap
+travels with a percentile bootstrap over recordings; the gate reports PASS only when that whole
+interval lies above zero, FAIL only when it lies wholly below, and INCONCLUSIVE whenever it
+crosses zero -- whatever the point estimate's sign. No threshold on the gap's size is imposed:
+where a *useful* boundary sits is what the real runs measure. The same rule reads the candidate
+against an independently trained target-only reference, paired recording by recording from the
+two runs' own per-recording tables, and the gate additionally refuses a summary whose verdict
+list disagrees with the interval it carries.
 """
 from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
+import random
 import sys
-from typing import Any, Dict, List, Mapping, Optional, Sequence
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 #: Repository root: ``teb_vae/lag_slot_transformer_cfs/eval/verify.py`` -> up four.
 _REPO_ROOT = os.path.dirname(
@@ -77,6 +82,17 @@ REQUIRED_QUALIFICATION_PHRASES: Sequence[str] = (
     "fitted computation",
     "physiological delay",
 )
+
+#: The results schema versions this gate knows how to read. Version 1 summaries carry a verdict
+#: list decided on the gap's sign and no ``schema_version`` key; the gate reads their interval the
+#: same way and does not fail them for the disagreement, since the list itself was the defect.
+KNOWN_SCHEMA_VERSIONS: Sequence[int] = (1, 2)
+
+#: Resamples the paired comparison against a reference draws when the summary records none.
+DEFAULT_RESAMPLES = 2000
+
+#: Seed for that resampling when the summary records none.
+DEFAULT_BOOTSTRAP_SEED = 42
 
 #: How far a margin that is exactly zero by construction may drift before it is a defect, in nats
 #: per anchor. Zero exactly is what the arithmetic gives -- the reference arms share their latent
@@ -337,14 +353,60 @@ def check_excluded_analyses_recorded(summary: Mapping[str, Any]) -> Dict[str, An
     )
 
 
-def report_predictive_gap(summary: Mapping[str, Any]) -> Dict[str, Any]:
-    """The measured gap and its interval, reported and deliberately not gated.
+def schema_version_of(summary: Mapping[str, Any]) -> int:
+    """The results schema version a summary was written under; ``1`` when it names none.
 
     Args:
         summary: The parsed summary.
 
     Returns:
-        The verdict, always INCONCLUSIVE, with the measurement beside it.
+        The version.
+    """
+    version = blocks_of(summary).get("schema_version")
+    return 1 if version is None else int(version)
+
+
+def interval_status(lo: Any, hi: Any) -> str:
+    """PASS when an interval lies wholly above zero, FAIL wholly below, INCONCLUSIVE otherwise.
+
+    Args:
+        lo: The interval's lower end, or ``None``.
+        hi: The interval's upper end, or ``None``.
+
+    Returns:
+        The status. An absent or non-finite end is INCONCLUSIVE.
+    """
+    try:
+        low, high = float(lo), float(hi)
+    except (TypeError, ValueError):
+        return "INCONCLUSIVE"
+    if not (math.isfinite(low) and math.isfinite(high)):
+        return "INCONCLUSIVE"
+    if low > 0.0:
+        return "PASS"
+    if high < 0.0:
+        return "FAIL"
+    return "INCONCLUSIVE"
+
+
+def _listed_status(summary: Mapping[str, Any], name: str) -> Optional[str]:
+    """The status the summary's own verdict list gives one criterion, or ``None``."""
+    for record in blocks_of(summary).get("verdicts") or []:
+        if isinstance(record, Mapping) and record.get("name") == name:
+            return record.get("status")
+    return None
+
+
+def report_predictive_gap(summary: Mapping[str, Any]) -> Dict[str, Any]:
+    """The measured gap read from its paired interval over recordings.
+
+    Args:
+        summary: The parsed summary.
+
+    Returns:
+        The verdict: PASS when the whole interval lies above zero, FAIL when it lies wholly below
+        or when the summary's own ``predictive_improvement`` verdict disagrees with the interval
+        it carries, INCONCLUSIVE otherwise and on a target-only checkpoint.
     """
     scores = blocks_of(summary).get("arm_scores") or {}
     record = scores.get("pred_gap") or {}
@@ -360,23 +422,113 @@ def report_predictive_gap(summary: Mapping[str, Any]) -> Dict[str, Any]:
             target_only_nll=(scores.get("nll_base") or {}).get("point"),
             n_recordings=record.get("n"),
         )
+    status = interval_status(lo, hi)
+    listed = _listed_status(summary, "predictive_improvement")
+    version = schema_version_of(summary)
+    if listed is not None and listed != status and version >= 2:
+        return _verdict(
+            "predictive_gap_measured",
+            "FAIL",
+            (
+                f"the summary's own predictive_improvement verdict says {listed} while the paired "
+                f"interval [{lo}, {hi}] it carries reads {status}: two report surfaces disagree "
+                f"about the same number, and a reader could quote either."
+            ),
+            pred_gap_nats=point, ci_lo=lo, ci_hi=hi, n_recordings=record.get("n"),
+            listed_status=listed, schema_version=version,
+        )
+    detail = {
+        "PASS": (
+            f"the whole recording-bootstrap interval [{lo}, {hi}] of the gap lies above zero "
+            f"over {record.get('n')} recordings: the source-conditioned branch is the better "
+            f"predictive density on this population."
+        ),
+        "FAIL": (
+            f"the whole recording-bootstrap interval [{lo}, {hi}] lies below zero over "
+            f"{record.get('n')} recordings: the source-conditioned branch is the worse "
+            f"predictive density."
+        ),
+        "INCONCLUSIVE": (
+            f"the gap is {point} nats per anchor with interval [{lo}, {hi}] over "
+            f"{record.get('n')} recordings, and the interval crosses zero: the sign of the point "
+            f"estimate is not evidence either way."
+        ),
+    }[status]
+    if listed is not None and listed != status:
+        detail += (
+            f" The summary's own verdict list says {listed}; it was written under schema "
+            f"version {version}, whose rule read the point estimate's sign, and the interval is "
+            f"what this gate reads."
+        )
+    detail += (
+        " A gap against the INTERNAL base is also not sufficient on its own: it must be read "
+        "beside an independently trained target-only comparator, which no single run of this "
+        "pass produces."
+    )
     return _verdict(
         "predictive_gap_measured",
-        "INCONCLUSIVE",
-        (
-            f"the source-conditioned branch scores {point} nats per anchor better than the "
-            f"target-only branch, interval [{lo}, {hi}] over {record.get('n')} recordings. This "
-            f"ships ungated on purpose: where an acceptable boundary sits is what the first real "
-            f"runs measure, and a guessed threshold would decide the answer on the run that was "
-            f"going to supply it. A positive gap against the INTERNAL base is also not sufficient "
-            f"on its own -- it must be read beside an independently trained target-only "
-            f"comparator, which no single run of this pass produces."
-        ),
+        status,
+        detail,
         pred_gap_nats=point,
         ci_lo=lo,
         ci_hi=hi,
         n_recordings=record.get("n"),
+        listed_status=listed,
+        schema_version=version,
     )
+
+
+def paired_improvement(
+    candidate: Mapping[str, Any],
+    reference: Mapping[str, Any],
+    *,
+    resamples: int,
+    seed: int,
+) -> Tuple[Optional[float], Optional[float], Optional[float], int]:
+    """The candidate's full branch against the reference's base branch, paired per recording.
+
+    Both runs carry a ``per_recording`` block under their own names, so the two scores exist for
+    every recording both runs scored, and their difference per recording is what is resampled --
+    the same pairing every margin in a single summary uses, applied across two summaries.
+
+    Args:
+        candidate: The candidate's parsed summary.
+        reference: The reference's parsed summary.
+        resamples: Percentile-bootstrap resamples over the common recordings.
+        seed: Seed for the resampling.
+
+    Returns:
+        ``(mean, lo, hi, n)``: the mean improvement (reference base minus candidate full, so
+        positive favours the candidate), its interval ends, and the recordings paired. The
+        three numbers are ``None`` below two common recordings.
+    """
+    own = blocks_of(candidate).get("per_recording") or {}
+    other = blocks_of(reference).get("per_recording") or {}
+    differences: List[float] = []
+    for guid, row in own.items():
+        left = (other.get(guid) or {}).get("nll_base")
+        right = row.get("nll_full")
+        if left is None or right is None:
+            continue
+        try:
+            value = float(left) - float(right)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(value):
+            differences.append(value)
+    count = len(differences)
+    if count < 2:
+        return None, None, None, count
+    mean = sum(differences) / count
+    generator = random.Random(int(seed))
+    means: List[float] = []
+    for _ in range(int(resamples)):
+        drawn = generator.choices(differences, k=count)
+        means.append(sum(drawn) / count)
+    means.sort()
+    lo = means[int(0.025 * (len(means) - 1))]
+    hi = means[int(0.975 * (len(means) - 1))]
+    return mean, lo, hi, count
 
 
 def check_against_reference(
@@ -437,25 +589,46 @@ def check_against_reference(
     external_gain = float(external) - float(candidate_full)
     base_drift = float(external) - float(candidate_base)
     degraded = base_drift < 0.0
-    return _verdict(
-        "candidate_against_external_reference",
-        "FAIL" if degraded else "INCONCLUSIVE",
-        (
+    record = scores.get("pred_gap") or {}
+    resamples = int(record.get("resamples") or DEFAULT_RESAMPLES)
+    seed = int(record.get("seed") if record.get("seed") is not None else DEFAULT_BOOTSTRAP_SEED)
+    paired_mean, lo, hi, n_paired = paired_improvement(
+        summary, reference, resamples=resamples, seed=seed
+    )
+    status = "FAIL" if degraded else interval_status(lo, hi)
+    if degraded:
+        detail = (
             f"the candidate's own base branch scores {candidate_base} against the frozen "
             f"reference's {external}, so joint training left the baseline WORSE by "
             f"{-base_drift} nats per anchor. Any gap measured against that base is measuring the "
             f"degradation, whatever its sign."
-            if degraded
-            else f"the candidate's source-conditioned branch improves on the frozen reference by "
-            f"{external_gain} nats per anchor, and its own base branch is within "
-            f"{base_drift} of that reference rather than behind it. Ungated: where an acceptable "
-            f"margin sits is what the first real runs measure."
-        ),
+        )
+    elif n_paired < 2:
+        detail = (
+            f"the candidate's source-conditioned branch improves on the frozen reference by "
+            f"{external_gain} nats per anchor on the equal-recording means, but the two runs "
+            f"share too few recordings ({n_paired}) to pair, so no interval is read."
+        )
+    else:
+        detail = (
+            f"paired over {n_paired} recordings both runs scored, the candidate's "
+            f"source-conditioned branch improves on the frozen reference by {paired_mean} nats "
+            f"per anchor, interval [{lo}, {hi}], which reads {status}; its own base branch is "
+            f"within {base_drift} of that reference rather than behind it."
+        )
+    return _verdict(
+        "candidate_against_external_reference",
+        status,
+        detail,
         candidate_full_nll=candidate_full,
         candidate_base_nll=candidate_base,
         reference_nll=external,
         improvement_over_reference_nats=external_gain,
         base_minus_reference_nats=base_drift,
+        paired_improvement_nats=paired_mean,
+        paired_ci_lo=lo,
+        paired_ci_hi=hi,
+        n_paired=n_paired,
     )
 
 

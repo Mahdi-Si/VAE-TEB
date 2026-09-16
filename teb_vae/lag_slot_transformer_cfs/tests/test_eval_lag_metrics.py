@@ -19,8 +19,45 @@ import pytest
 import torch
 import yaml
 
+from teb_vae.lag_attn_cfs.eval.config_schema import _validate_occlusion_bands
 from teb_vae.lag_slot_transformer_cfs.eval import lag_metrics
 from teb_vae.lag_slot_transformer_cfs.eval.binding import DEFAULT_OVERRIDES_PATH
+
+#: The old-bank tail diagnostic profile, beside the committed delta it copies.
+TAIL_DIAGNOSTIC_PATH = DEFAULT_OVERRIDES_PATH.parent / "lag91_tail_diagnostic.yaml"
+
+#: The short-bank evaluation profile, beside the training profile whose window it is declared for.
+SHORT_PROFILE_PATH = DEFAULT_OVERRIDES_PATH.parent / "lag25_eval_overrides.yaml"
+SHORT_TRAINING_CONFIG = DEFAULT_OVERRIDES_PATH.parents[2] / "configs" / "lag25.yaml"
+
+#: The two shipped evaluation profiles, each with the training configuration whose window it is
+#: declared for and the names of the bands that PARTITION that window. A profile may declare
+#: further bands that overlap the partition; those are read as cross-window bands, not as part
+#: of it.
+SHIPPED_PROFILES = {
+    "wide": (
+        DEFAULT_OVERRIDES_PATH,
+        DEFAULT_OVERRIDES_PATH.parents[2] / "configs" / "default.yaml",
+        ("anchor", "near", "mid", "far"),
+    ),
+    "short": (
+        SHORT_PROFILE_PATH,
+        SHORT_TRAINING_CONFIG,
+        ("instant", "recent", "intermediate", "tail"),
+    ),
+}
+
+
+def _bands_of(path) -> dict:
+    """The lag bands one override delta declares."""
+    return yaml.safe_load(path.read_text(encoding="utf-8"))["eval_config"]["occlusion_bands"]
+
+
+def _max_lag_of(path) -> int:
+    """The furthest candidate lag one training configuration resolves to."""
+    from teb_vae.lag_attn.config import load_config
+
+    return int(load_config(str(path))["model_config"]["VAE_model"]["max_lag"])
 
 
 @pytest.fixture(scope="module")
@@ -30,36 +67,127 @@ def shipped_bands():
     Returns:
         ``{name: [lo, hi]}``.
     """
-    raw = yaml.safe_load(DEFAULT_OVERRIDES_PATH.read_text(encoding="utf-8"))
-    return raw["eval_config"]["occlusion_bands"]
+    return _bands_of(DEFAULT_OVERRIDES_PATH)
+
+
+@pytest.fixture(scope="module", params=sorted(SHIPPED_PROFILES))
+def shipped_profile(request):
+    """One shipped evaluation profile: its bands, its window, and its partition's band names.
+
+    Returns:
+        ``(bands, max_lag, partition names)``.
+    """
+    path, training, partition = SHIPPED_PROFILES[request.param]
+    return _bands_of(path), _max_lag_of(training), partition
 
 
 # =============================================================================
 # Bands and their reference arms
 # =============================================================================
-def test_the_shipped_bands_partition_the_searched_window(shipped_bands) -> None:
-    """A reader comparing two arms compares the same intervals, so the partition is pinned.
+def test_the_shipped_bands_partition_the_searched_window(shipped_profile) -> None:
+    """A reader comparing two arms compares the same intervals, so each partition is pinned.
 
-    Read from the committed delta rather than restated, because the delta is what a run actually
-    uses; a second copy here would be free to describe a partition no run scores.
+    Read from the committed deltas rather than restated, because the delta is what a run actually
+    uses; a second copy here would be free to describe a partition no run scores. Each partition
+    is checked against the window of the training configuration it is declared for: contiguous,
+    starting at the anchor, ending on the window's last lag, and validating against that window.
     """
-    edges = sorted((int(lo), int(hi)) for lo, hi in shipped_bands.values())
+    bands, max_lag, partition = shipped_profile
+    edges = sorted((int(bands[name][0]), int(bands[name][1])) for name in partition)
     assert edges[0][0] == 0
+    assert edges[-1][1] == max_lag
     for (_, previous_hi), (next_lo, _) in zip(edges, edges[1:]):
         assert next_lo == previous_hi + 1, edges
+    assert set(_validate_occlusion_bands(bands, max_lag)) == set(bands)
 
 
-def test_the_two_reference_arms_bracket_the_declared_bands(shipped_bands) -> None:
+def test_the_two_reference_arms_bracket_the_declared_bands(shipped_profile) -> None:
     """Whole-band and joint removals come before any single-lag result, which is what this order
     encodes: a single-lag peak read off a window whose joint removal does nothing is noise."""
-    n_lags = max(int(hi) for _, hi in shipped_bands.values()) + 1
-    masks = lag_metrics.band_masks(shipped_bands, n_lags)
+    bands, max_lag, _partition = shipped_profile
+    masks = lag_metrics.band_masks(bands, max_lag + 1)
 
     assert list(masks)[0] == "none"
     assert list(masks)[-1] == "all"
     assert not bool(masks["none"].any())
-    # The declared partition covers the searched window, so the joint arm removes every lag.
+    # The declared partition covers the searched window, so the joint arm removes every lag --
+    # and does so on a profile with overlapping cross-window bands exactly as on one without.
     assert bool(masks["all"].all())
+
+
+def test_the_short_profile_adds_cross_window_bands_that_overlap_its_partition() -> None:
+    """The two fixed bands are the wide profile's anchor band unchanged and what survives of its
+    next band inside the short window, so a short run and a wide run can be read on one interval;
+    they overlap the partition and are declared beside it rather than replacing it."""
+    short, wide = _bands_of(SHORT_PROFILE_PATH), _bands_of(DEFAULT_OVERRIDES_PATH)
+    max_lag = _max_lag_of(SHORT_TRAINING_CONFIG)
+    partition = SHIPPED_PROFILES["short"][2]
+    extra = [name for name in short if name not in partition]
+
+    assert extra == ["common_head", "common_tail"]
+    assert short["common_head"] == wide["anchor"]
+    assert short["common_tail"] == [wide["near"][0], max_lag]
+    masks = lag_metrics.band_masks(short, max_lag + 1)
+    for name in extra:
+        assert any(bool((masks[name] & masks[other]).any()) for other in partition)
+    assert yaml.safe_load(SHORT_PROFILE_PATH.read_text(encoding="utf-8"))["eval_config"]["num_mc_samples"] == 32
+    assert "base" not in yaml.safe_load(SHORT_PROFILE_PATH.read_text(encoding="utf-8"))
+
+
+def test_a_band_past_the_short_window_refuses_naming_the_window() -> None:
+    """The wide profile's bands reach past the short window and are refused, not clipped."""
+    max_lag = _max_lag_of(SHORT_TRAINING_CONFIG)
+
+    with pytest.raises(ValueError, match=f"max_lag={max_lag}"):
+        _validate_occlusion_bands({"tail": [13, max_lag + 6]}, max_lag)
+    with pytest.raises(ValueError, match=f"max_lag={max_lag}"):
+        _validate_occlusion_bands(_bands_of(DEFAULT_OVERRIDES_PATH), max_lag)
+
+
+@pytest.fixture(scope="module")
+def tail_diagnostic():
+    """The tail diagnostic profile's raw mapping."""
+    return yaml.safe_load(TAIL_DIAGNOSTIC_PATH.read_text(encoding="utf-8"))
+
+
+def test_the_tail_diagnostic_keeps_the_shipped_partition_and_adds_the_cutoff_bands(
+    shipped_bands, tail_diagnostic
+) -> None:
+    """The shipped four bands are carried unchanged, so the diagnostic run's partition margins
+    are comparable with the shipped run's; the cutoff pair partitions the window at the proposed
+    25-entry boundary; and every band validates against the production lag window."""
+    bands = tail_diagnostic["eval_config"]["occlusion_bands"]
+    max_lag = max(int(hi) for _, hi in shipped_bands.values())
+
+    for name, span in shipped_bands.items():
+        assert bands[name] == span, name
+    assert bands["head_0_24"] == [0, 24] and bands["tail_25_90"] == [25, max_lag]
+    validated = _validate_occlusion_bands(bands, max_lag)
+    assert set(validated) == set(bands)
+    assert tail_diagnostic["eval_config"]["num_mc_samples"] == 32
+    assert "base" not in tail_diagnostic
+
+
+def test_the_keep_prefix_family_nests_and_ends_on_the_reference_identities(tail_diagnostic) -> None:
+    """``beyond_l`` removes every lag above ``l``: the masks nest, the widest is the tail at the
+    proposed cutoff's complement's complement -- the whole window less the anchor -- and the
+    joint removal of the declared bands is still every lag, so ``all`` still equals silence."""
+    bands = tail_diagnostic["eval_config"]["occlusion_bands"]
+    n_lags = max(int(hi) for _, hi in bands.values()) + 1
+    masks = lag_metrics.band_masks(bands, n_lags)
+    prefixes = sorted(
+        (int(name.split("_")[1]), name) for name in bands if name.startswith("beyond_")
+    )
+
+    for (cutoff, name), (next_cutoff, next_name) in zip(prefixes, prefixes[1:]):
+        assert cutoff < next_cutoff
+        # A longer kept prefix removes a subset of what a shorter one removes.
+        assert bool((masks[next_name] & ~masks[name]).any()) is False
+        assert int(masks[name].sum()) == n_lags - cutoff - 1
+    assert masks["beyond_24"].tolist() == masks["tail_25_90"].tolist()
+    assert bool((masks["head_0_24"] | masks["tail_25_90"]).all())
+    assert bool(masks["all"].all())
+    assert not bool(masks["none"].any())
 
 
 def test_an_empty_band_refuses_rather_than_reporting_a_row_of_zeros() -> None:

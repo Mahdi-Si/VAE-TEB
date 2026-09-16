@@ -97,9 +97,12 @@ BRANCH_COLORS: Mapping[str, str] = {"base": COLOR_GRAY, "full": COLOR_BLUE}
 
 #: Line weight of an interval bar and of a curve, and marker size of a point estimate. Thin marks,
 #: so the data reads over the frame rather than under it.
-_INTERVAL_WIDTH = 1.0
-_CURVE_WIDTH = 1.0
-_MARKER_SIZE = 3.5
+_INTERVAL_WIDTH = 0.8
+_CURVE_WIDTH = 0.7
+_MARKER_SIZE = 2.8
+
+#: Weight of a reference line -- a zero, a diagonal, a uniform value -- drawn under the data.
+_REFERENCE_WIDTH = 0.5
 
 #: Gap in points between the end of an interval bar and the value written beside it.
 _VALUE_GAP_POINTS = 4.0
@@ -263,7 +266,7 @@ def _dot_intervals(
                     solid_capstyle="butt")
             right = max(hi, point)
         ax.plot(point, position, marker="o", color=colour, markersize=_MARKER_SIZE,
-                markeredgecolor="white", markeredgewidth=0.4, linestyle="none", zorder=3)
+                markeredgecolor="white", markeredgewidth=0.3, linestyle="none", zorder=3)
         if annotate:
             # Beside the bar it belongs to, offset in points so it never lands on the frame or on
             # the neighbouring row whatever the axis range turns out to be.
@@ -277,7 +280,7 @@ def _dot_intervals(
     ax.set_yticklabels([row[0] for row in rows])
     ax.set_ylim(-0.7, len(rows) - 0.3)
     if zero:
-        ax.axvline(0.0, color=COLOR_GRAY, linestyle=":", linewidth=0.7, zorder=0)
+        ax.axvline(0.0, color=COLOR_GRAY, linestyle=":", linewidth=_REFERENCE_WIDTH, zorder=0)
     style_axes(ax, grid="major")
     ax.grid(False, axis="y")
     ax.tick_params(axis="y", length=0)
@@ -646,7 +649,7 @@ def build_lag_profile_figure(results: Mapping[str, Any]) -> Any:
     if values:
         curve = np.asarray([np.nan if v is None else v for v in values], dtype=np.float64)
         ax.plot(lags[: curve.size], curve, color=COLOR_VERMILLION, linewidth=_CURVE_WIDTH)
-        ax.axhline(0.0, color=COLOR_GRAY, linestyle=":", linewidth=0.8)
+        ax.axhline(0.0, color=COLOR_GRAY, linestyle=":", linewidth=_REFERENCE_WIDTH)
         ax.set_ylabel("nats per anchor")
         ax.set_title("Divergence drop, lag removed alone (signed)")
         style_axes(ax)
@@ -663,7 +666,7 @@ def build_lag_profile_figure(results: Mapping[str, Any]) -> Any:
             f"({predictive.get('n_segments', '?')} segments)"
         ),
     ):
-        ax.axhline(0.0, color=COLOR_GRAY, linestyle=":", linewidth=0.8)
+        ax.axhline(0.0, color=COLOR_GRAY, linestyle=":", linewidth=_REFERENCE_WIDTH)
         ax.set_ylabel("nats per anchor")
         ax.set_title("Predictive margin, lag removed alone")
         legend_with_headroom(ax)
@@ -704,7 +707,7 @@ def build_horizon_figure(results: Mapping[str, Any]) -> Any:
     unit = str(block.get("unit", "nats per anchor per horizon step"))
     ax = axes[0]
     if _ribbon(ax, positions, block.get("pred_gap") or {}, colour=COLOR_BLUE, label="pred_gap"):
-        ax.axhline(0.0, color=COLOR_GRAY, linestyle=":", linewidth=0.8)
+        ax.axhline(0.0, color=COLOR_GRAY, linestyle=":", linewidth=_REFERENCE_WIDTH)
         ax.set_title("Predictive gap (base $-$ full) by horizon step")
         ax.set_ylabel(unit)
         legend_with_headroom(ax)
@@ -721,7 +724,7 @@ def build_horizon_figure(results: Mapping[str, Any]) -> Any:
                    colour=_band_colour(index, len(names)), label=f"suppress:{name}"):
             drawn += 1
     if drawn:
-        ax.axhline(0.0, color=COLOR_GRAY, linestyle=":", linewidth=0.8)
+        ax.axhline(0.0, color=COLOR_GRAY, linestyle=":", linewidth=_REFERENCE_WIDTH)
         ax.set_title("Band suppression margins by horizon step, paired over recordings")
         ax.set_ylabel(unit)
         legend_with_headroom(ax, ncol=min(max(drawn, 1), 4))
@@ -739,7 +742,7 @@ def build_horizon_figure(results: Mapping[str, Any]) -> Any:
         if _ribbon(ax, positions, control_margins.get(name) or {}, colour=colour, label=name):
             drawn += 1
     if drawn:
-        ax.axhline(0.0, color=COLOR_GRAY, linestyle=":", linewidth=0.8)
+        ax.axhline(0.0, color=COLOR_GRAY, linestyle=":", linewidth=_REFERENCE_WIDTH)
         ax.set_title("Source control margins by horizon step, paired over recordings")
         ax.set_ylabel(unit)
         legend_with_headroom(ax, ncol=3)
@@ -828,11 +831,11 @@ def build_calibration_figure(results: Mapping[str, Any]) -> Any:
         levels = sorted(float(level) for level in coverage)
         observed = [float(coverage[f"{level:g}"]) for level in levels]
         ax.plot(levels, observed, marker="o", color=colour, linewidth=_CURVE_WIDTH,
-                markersize=_MARKER_SIZE, markeredgecolor="white", markeredgewidth=0.4,
+                markersize=_MARKER_SIZE, markeredgecolor="white", markeredgewidth=0.3,
                 label=branch)
         drawn = True
     if drawn:
-        ax.plot([0.0, 1.0], [0.0, 1.0], color=COLOR_GRAY, linewidth=0.6, linestyle=":",
+        ax.plot([0.0, 1.0], [0.0, 1.0], color=COLOR_GRAY, linewidth=_REFERENCE_WIDTH, linestyle=":",
                 zorder=0, label="calibrated")
         ax.set_xlim(0.0, 1.02)
         ax.set_ylim(0.0, 1.02)
@@ -856,9 +859,9 @@ def build_calibration_figure(results: Mapping[str, Any]) -> Any:
     _dot_intervals(ax, rows, xlabel="value", title="Probability integral transform")
     # The two uniform references go in a legend rather than as labels over the frame, where
     # they collided with the title.
-    ax.axvline(reference_mean, color=COLOR_GRAY, linestyle=":", linewidth=0.7, zorder=0,
+    ax.axvline(reference_mean, color=COLOR_GRAY, linestyle=":", linewidth=_REFERENCE_WIDTH, zorder=0,
                label="uniform mean")
-    ax.axvline(reference_var, color=COLOR_GRAY, linestyle="--", linewidth=0.7, zorder=0,
+    ax.axvline(reference_var, color=COLOR_GRAY, linestyle="--", linewidth=_REFERENCE_WIDTH, zorder=0,
                label="uniform variance")
     ax.legend(loc="center")
     return _finish(fig)

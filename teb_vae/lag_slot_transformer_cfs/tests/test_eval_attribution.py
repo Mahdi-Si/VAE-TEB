@@ -35,9 +35,13 @@ STRIDE_S = 1200.0
 COMPLETENESS_MAX = 1e-3
 
 
-def _task() -> _Task:
-    """The tiny model in evaluation mode, its proposal head moved off its zero start."""
-    model = build_tiny_model()
+def _task(**overrides: Any) -> _Task:
+    """The tiny model in evaluation mode, its proposal head moved off its zero start.
+
+    Args:
+        **overrides: Constructor keywords to replace, for the ablated arms.
+    """
+    model = build_tiny_model(**overrides)
     torch.manual_seed(2)
     with torch.no_grad():
         for parameter in model.proposal_head.output_proj.parameters():
@@ -161,6 +165,47 @@ def test_the_per_lag_split_on_the_proposal_head_is_complete_and_has_one_unit_per
 
     assert layer["per_unit"].shape == (cols.shape[0], int(task.orig_model.n_lags))
     np.testing.assert_allclose(layer["total"], result.value_input - result.value_entry, rtol=1e-3, atol=1e-4)
+
+
+@pytest.mark.parametrize("readout", [core.READOUT_KLD, core.READOUT_PRED_GAP])
+def test_an_ablated_coordinate_takes_exactly_no_attribution_on_either_stream(readout) -> None:
+    """The ablation is the first step of the forward, so the integrated gradient with respect to
+    the ablated coordinate is exactly zero, while its neighbours still carry attribution."""
+    task = _task(zero_fhr_scattering_s0=True, zero_up_scattering_s0=True)
+    result, *_ = _attribute(task, readout, core.BASELINE_ALL_ZERO)
+
+    assert np.abs(result.target[:, :, 0]).max() == 0.0
+    assert np.abs(result.source[:, :, 0]).max() == 0.0
+    assert np.abs(result.target[:, :, 1:]).sum() > 0.0
+
+
+def test_the_stage_marks_the_ablated_coordinates_and_reads_their_attribution_back(tmp_path, monkeypatch) -> None:
+    """The marker table and the check travel in the block; the read-back is exactly zero."""
+    monkeypatch.setattr(core, "IG_STEPS", 4)
+    guids, epochs, codes = _population()
+    identities = pd.DataFrame(
+        {"guid": guids, "epoch": epochs, labels.CLASS_COLUMN: [labels.CLASS_NAMES[code] for code in codes],
+         labels.SUBGROUP_COLUMN: ["hie_cs"] * len(guids)}
+    )
+
+    block = stage.run_attribution(
+        _task(zero_fhr_scattering_s0=True), _loader(_StubDataset(guids, epochs, codes)), identities,
+        config={}, eval_config={"seed": 0, "caps": {core.CAP_NAME: 3}, "occlusion_bands": {"near": [0, 2]}},
+        results_dir=tmp_path, geometry_record={"t": TINY_SEQ_LEN},
+    )
+
+    assert block["status"] == stage.STATUS_ATTRIBUTED
+    ablated = block["ablated_inputs"]
+    assert [entry["field"] for entry in ablated["coordinates"]] == ["fhr_st"]
+    assert ablated["coordinates"][0]["status"] == stage.STATUS_ABLATED
+    assert ablated["max_abs_attribution"] == 0.0
+    assert block["checks"]["ablated_input_max_abs"] == 0.0
+    assert stage.ABLATED_INPUTS_FILENAME in block["files"]
+    table = pd.read_csv(tmp_path / core.ANALYSIS_DIRNAME / stage.ABLATED_INPUTS_FILENAME)
+    assert list(table["status"]) == [stage.STATUS_ABLATED]
+    # And a model with no ablation carries an empty marker rather than none.
+    plain = stage.ablated_input_check(build_tiny_model(), tmp_path / core.ANALYSIS_DIRNAME)
+    assert plain["coordinates"] == [] and plain["max_abs_attribution"] is None
 
 
 def test_the_target_only_arm_has_no_layer_to_split_and_no_lag_readout() -> None:

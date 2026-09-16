@@ -20,7 +20,7 @@ These conventions apply to all figures unless an entry states otherwise.
 
 Colours in training-callback plots may differ; match cohorts by labels and legends. Clinical ordering is a display convention, not evidence of a group difference. Use `cross_subgroup` for statistical comparisons.
 
-**Figures share one publication style.** The style is defined in `teb_vae/lag_attn/eval/figures.py` and accessed through `figures_seam`: double-column default width, 7 pt serif text with STIX mathematics, open frames except for boxed heatmaps, and unframed legends above full-width curves. Non-cohort series use the Okabe-Ito colour-blind-safe palette. Panel letters (**a**, **b**, and so on) run left to right, then top to bottom. Footnotes use reserved space below the axes.
+**Figures share one publication style.** The style is defined in `teb_vae/lag_attn/eval/figures.py` and accessed through `figures_seam`: double-column default width, a 5.5–7 pt serif type scale with STIX mathematics, hairline frames and data lines, histogram bars with a thin dark outline, open frames except for boxed heatmaps, and unframed legends above full-width curves. Non-cohort series use the Okabe-Ito colour-blind-safe palette. Panel letters (**a**, **b**, and so on) run left to right, then top to bottom. Footnotes use reserved space below the axes.
 
 ---
 

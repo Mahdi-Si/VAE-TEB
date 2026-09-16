@@ -326,6 +326,45 @@ def test_the_lag_axis_is_labelled_in_stored_coefficient_time() -> None:
         plt.close(figure)
 
 
+def test_the_lag_axis_and_the_band_labels_follow_the_summary_under_another_window() -> None:
+    """No builder holds a band name or a lag count: a summary over a longer window with six
+    declared bands draws that many lag positions and names those six bands."""
+    n_lags = 25
+    names = ["instant", "recent", "intermediate", "tail", "common_head", "common_tail"]
+    edges = {"instant": [0, 0], "recent": [1, 4], "intermediate": [5, 12], "tail": [13, 24],
+             "common_head": [0, 14], "common_tail": [15, 24]}
+    results = candidate_summary()
+    readouts = results["lag_readouts"]
+    readouts["band_suppression"] = {
+        "none": readouts["band_suppression"]["none"],
+        **{name: {"margin_nats": 0.1, "margin_interval": _interval(0.1),
+                  "band_anchors": 40.0, "band_channels": 400.0} for name in names},
+        "all": readouts["band_suppression"]["all"],
+    }
+    readouts["band_edges"] = edges
+    readouts["exposure"]["per_lag_anchors"] = [40.0] * n_lags
+    readouts["exposure"]["per_lag_channels"] = [200.0] * n_lags
+    for key, values in readouts["lag_profile"]["latent"].items():
+        readouts["lag_profile"]["latent"][key] = list(values)[:1] * n_lags
+    readouts["lag_profile"]["predictive"]["margin_nats"] = _curve([0.1] * n_lags)
+    readouts["lag_axis"]["n_lags"] = n_lags
+
+    assert figures._declared_bands(results) == names
+    figure = figures.build_lag_profile_figure(results)
+    try:
+        lengths = {len(line.get_xdata()) for ax in figure.axes for line in ax.get_lines()}
+        assert n_lags in lengths
+        assert not any(length > n_lags for length in lengths)
+    finally:
+        plt.close(figure)
+    axes = plt.figure().add_subplot(111)
+    try:
+        figures._shade_bands(axes, results, label=True)
+        assert [text.get_text() for text in axes.texts] == names
+    finally:
+        plt.close(axes.figure)
+
+
 def test_a_missing_band_margin_is_drawn_as_not_measured() -> None:
     """A band with nothing to remove stays on the figure, marked, rather than vanishing."""
     figure = figures.build_band_figure(candidate_summary())

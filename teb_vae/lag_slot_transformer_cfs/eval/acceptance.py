@@ -34,7 +34,16 @@ in the plan before any arm was trained, and each is reported at the nominal leve
 are a **search**: the band carrying the largest margin is chosen on the same data its interval is
 built from. Those are additionally reported at a family-adjusted level whose family is the bands
 actually searched, which covers every member of the family at once -- and a member selected out of
-a simultaneously covered family keeps that coverage however it was chosen.
+a simultaneously covered family keeps that coverage however it was chosen. The family is declared
+**per lag window**: a run is read under the band family the plan declares for the number of lag
+steps its own causality record says it searched, because the bands a window can be partitioned
+into are a property of that window, and a run whose window no family names is refused rather
+than read under another window's.
+
+**What a pairing holds fixed.** Two runs are paired per recording only when they were scored at
+one draw count, on one split, over one lag window and under one input policy. The bank length and
+the input ablation are leaves of their own, so a pair that differs in either would carry that
+difference into whichever comparison it entered under the name of a different leaf.
 
 **The reserved partition.** A confirmation is a second set of runs on recordings that no run used
 to choose an architecture, a hyperparameter or a threshold has ever been scored on. This pass does
@@ -57,6 +66,7 @@ import hashlib
 import json
 import os
 import sys
+import warnings
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 #: Repository root: ``teb_vae/lag_slot_transformer_cfs/eval/acceptance.py`` -> up four.
@@ -82,6 +92,21 @@ from teb_vae.lag_slot_transformer_cfs.eval import verify  # noqa: E402
 #: The committed predeclaration, used when no other is named.
 DEFAULT_PLAN_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "configs", "acceptance_plan.yaml")
 
+#: The shipped production training configuration, read for one value: the lag window a plan that
+#: still carries the revision-1 ``exploratory_bands`` key was declared for. That key predates the
+#: per-window families and named the production window's bands without saying so; the window is
+#: read off the configuration rather than written here, so the legacy reading follows the shipped
+#: geometry rather than a number this file remembers.
+SHIPPED_TRAINING_CONFIG = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "configs", "default.yaml"
+)
+
+#: The plan key that declares the exploratory bands per lag window, and the revision-1 key it
+#: replaced. The old key is still read -- as the shipped window's family, with a warning -- so a
+#: record can be produced under an old plan and says which reading it used.
+BAND_FAMILIES_KEY = "exploratory_band_families"
+LEGACY_BANDS_KEY = "exploratory_bands"
+
 #: The two files an evaluation directory is recognised by.
 #:
 #: Named here rather than imported from the pass that writes them, for the reason the gate pins the
@@ -102,7 +127,14 @@ PROBE_FILENAME = "latent_probes.json"
 #: Keys the plan may carry. Closed, matching the evaluation schema's discipline: an unrecognised
 #: key raises and names the valid set, because nothing reads a misspelled one and a plan that
 #: silently dropped its seed minimum would still produce a record.
-PLAN_KEYS = frozenset({"declared_on", "revision", "protocol", "primary_comparisons", "exploratory_bands"})
+PLAN_KEYS = frozenset(
+    {"declared_on", "revision", "protocol", "primary_comparisons", BAND_FAMILIES_KEY, LEGACY_BANDS_KEY}
+)
+
+#: The two input-ablation switches a run's arm record carries. Part of the pairing rule: an arm
+#: fitted without the anchor's own smoothed level is a different task from one fitted with it,
+#: and a comparison across the two would read the ablation as whatever leaf the comparison names.
+INPUT_POLICY_KEYS: Tuple[str, ...] = ("zero_fhr_scattering_s0", "zero_up_scattering_s0")
 
 #: Keys the plan's protocol block may carry.
 PROTOCOL_KEYS = frozenset(
@@ -234,11 +266,88 @@ def load_plan(path: Optional[str] = None) -> Dict[str, Any]:
                     f"arm, which is not one this package builds. Known arms: "
                     f"{', '.join(sorted(known_arms))}."
                 )
+    families, family_source = _band_families(parsed)
     return {
-        **parsed,
+        **{key: value for key, value in parsed.items() if key != LEGACY_BANDS_KEY},
+        BAND_FAMILIES_KEY: families,
+        "band_family_source": family_source,
         "path": resolved,
         "digest": hashlib.sha256(raw).hexdigest()[:16],
     }
+
+
+def shipped_lag_window() -> int:
+    """The number of lag steps the shipped production configuration searches.
+
+    Read off the committed training configuration rather than remembered here, so the legacy
+    reading of a revision-1 plan follows the shipped geometry.
+
+    Returns:
+        The searched lag steps, one more than the configured furthest lag.
+    """
+    with open(SHIPPED_TRAINING_CONFIG, "r", encoding="utf-8") as handle:
+        config = yaml.safe_load(handle) or {}
+    vae = (config.get("model_config") or {}).get("VAE_model") or {}
+    return int(vae["max_lag"]) + 1
+
+
+def _band_families(parsed: Mapping[str, Any]) -> Tuple[Dict[int, List[str]], str]:
+    """Resolve the plan's exploratory band families, by lag window.
+
+    Args:
+        parsed: The parsed plan.
+
+    Returns:
+        ``({searched lag steps: [band names]}, source)``, where *source* says which key the
+        families were read from.
+
+    Raises:
+        ValueError: If both keys are present, if a family is not a list of names, or if a window
+            key is not a positive integer.
+    """
+    declared = parsed.get(BAND_FAMILIES_KEY)
+    legacy = parsed.get(LEGACY_BANDS_KEY)
+    if declared is not None and legacy is not None:
+        raise ValueError(
+            f"the acceptance plan carries both {BAND_FAMILIES_KEY!r} and the revision-1 "
+            f"{LEGACY_BANDS_KEY!r}. The second is read as the shipped window's family, so the two "
+            f"would declare that window twice and a reader could not tell which was meant. Keep "
+            f"the families and drop the legacy key."
+        )
+    if declared is None:
+        if legacy is None:
+            return {}, "none declared"
+        window = shipped_lag_window()
+        warnings.warn(
+            f"the acceptance plan declares its exploratory bands under the revision-1 key "
+            f"{LEGACY_BANDS_KEY!r}, which names one family without saying which lag window it "
+            f"was declared for. Read as the family of the shipped production window of {window} "
+            f"searched lag steps; a run over another window is refused under this plan.",
+            stacklevel=3,
+        )
+        return {window: [str(name) for name in legacy]}, f"legacy {LEGACY_BANDS_KEY} key"
+    if not isinstance(declared, Mapping):
+        raise ValueError(
+            f"{BAND_FAMILIES_KEY} must map a searched lag-step count to a list of band names, "
+            f"got {type(declared).__name__}."
+        )
+    families: Dict[int, List[str]] = {}
+    for key, names in declared.items():
+        try:
+            window = int(key)
+        except (TypeError, ValueError) as error:
+            raise ValueError(
+                f"{BAND_FAMILIES_KEY} key {key!r} is not a searched lag-step count."
+            ) from error
+        if window < 1:
+            raise ValueError(f"{BAND_FAMILIES_KEY} key {key!r} must be a positive lag-step count.")
+        if not isinstance(names, (list, tuple)):
+            raise ValueError(
+                f"{BAND_FAMILIES_KEY}[{key}] must be a list of band names, got "
+                f"{type(names).__name__}."
+            )
+        families[window] = [str(name) for name in names]
+    return families, BAND_FAMILIES_KEY
 
 
 # =============================================================================
@@ -354,6 +463,9 @@ def run_identity(directory: str, summary: Mapping[str, Any]) -> Dict[str, Any]:
     """
     results = verify.blocks_of(summary)
     context = summary.get("run_context") or {}
+    causality = summary.get("causality") or {}
+    arm = results.get("arm") or {}
+    window = causality.get("searched_lag_steps")
     return {
         "directory": directory,
         "summary": summary,
@@ -363,6 +475,12 @@ def run_identity(directory: str, summary: Mapping[str, Any]) -> Dict[str, Any]:
         "eval_seed": (summary.get("eval_config") or {}).get("seed"),
         "draws": results.get("num_mc_samples"),
         "split": (results.get("arms") or {}).get("scored_split") or {},
+        # The lag window the run searched, off its own causality record: ``None`` on a target-only
+        # run, which searches nothing, and on a summary written before the record carried it.
+        "searched_lag_steps": None if window is None else int(window),
+        # Which stored coefficients the model was permitted to read. Absent flags on an older
+        # summary read as off, which is what every run before the switches existed was.
+        "input_policy": {key: bool(arm.get(key, False)) for key in INPUT_POLICY_KEYS},
     }
 
 
@@ -386,6 +504,8 @@ def run_descriptor(run: Mapping[str, Any]) -> Dict[str, Any]:
         "split_label": split.get("label"),
         "recording_digest": split.get("recording_digest"),
         "n_recordings": split.get("n_recordings"),
+        "searched_lag_steps": run.get("searched_lag_steps"),
+        **dict(run.get("input_policy") or {}),
         "has_per_recording_table": run.get("table") is not None,
         "has_latent_probes": run.get("probes") is not None,
     }
@@ -417,6 +537,30 @@ def scoring_mismatch(runs: Sequence[Mapping[str, Any]]) -> Optional[str]:
         return (
             f"the runs scored more than one split: {sorted(map(str, labels))}. A difference "
             f"across two splits is a difference of cohorts."
+        )
+    # The window is a leaf of its own. A target-only run searches no window and records none, so
+    # it pairs with a source-conditioned run of any window; two source-conditioned runs over two
+    # windows do not pair, because their difference is the bank length under another name.
+    windows = {
+        record.get("searched_lag_steps")
+        for record in runs
+        if record.get("searched_lag_steps") is not None
+    }
+    if len(windows) > 1:
+        return (
+            f"the runs searched more than one lag window: {sorted(windows)} lag steps. A "
+            f"difference across two windows is a difference of bank length and of summation "
+            f"scale, whichever leaf the comparison names."
+        )
+    policies = {
+        tuple(sorted((record.get("input_policy") or {}).items())) for record in runs
+    }
+    if len(policies) > 1:
+        return (
+            f"the runs were fitted under more than one input policy: "
+            f"{sorted(str(dict(policy)) for policy in policies)}. A model denied a coefficient and "
+            f"one permitted it were fitted to two tasks, and a difference between them is the "
+            f"ablation whichever leaf the comparison names."
         )
     return None
 
@@ -779,7 +923,7 @@ def band_block(
     Returns:
         ``{arm: record}``.
     """
-    declared = list(plan.get("exploratory_bands") or [])
+    families: Mapping[int, Sequence[str]] = plan.get(BAND_FAMILIES_KEY) or {}
     nominal = float(plan["protocol"]["confidence"])
     block: Dict[str, Any] = {}
     for arm, group in evidence.items():
@@ -789,6 +933,32 @@ def band_block(
             block[arm] = {
                 "status": "NOT_SEARCHED",
                 "detail": "this arm suppressed no lag band, so there was no search to correct.",
+            }
+            continue
+        window, window_note = arm_lag_window(members)
+        if window is None and window_note is not None and "more than one" in window_note:
+            block[arm] = {
+                "status": "MIXED_LAG_WINDOWS",
+                "searched_bands": names,
+                "detail": window_note,
+            }
+            continue
+        declared = list(families.get(window, [])) if window is not None else []
+        if not declared:
+            block[arm] = {
+                "status": "UNDECLARED_FAMILY",
+                "lag_window": window,
+                "lag_window_note": window_note,
+                "searched_bands": names,
+                "declared_windows": sorted(families),
+                "detail": (
+                    f"this arm searched a window of {window} lag steps and the plan declares no "
+                    f"band family for it, so the family the correction would cover was never "
+                    f"fixed. Declare the window's bands in the plan before reading its search."
+                    if window is not None
+                    else "this arm's runs record no searched lag window and the plan declares "
+                    "no family the legacy reading could fall back on."
+                ),
             }
             continue
         undeclared = sorted(set(names) - set(declared))
@@ -823,6 +993,8 @@ def band_block(
         )
         block[arm] = {
             "status": "READ",
+            "lag_window": window,
+            "lag_window_note": window_note,
             "declared_bands": declared,
             "searched_bands": names,
             "undeclared_bands": undeclared,
@@ -840,6 +1012,41 @@ def band_block(
             ),
         }
     return block
+
+
+def arm_lag_window(runs: Sequence[Mapping[str, Any]]) -> Tuple[Optional[int], Optional[str]]:
+    """The lag window one arm's runs searched, and a note where it had to be read indirectly.
+
+    An arm's band family is the family of its window, so its runs must agree on the window. A
+    run written before the causality record carried the window is read under the shipped
+    production window, with a note, rather than refused: the family it was declared under is the
+    revision-1 one, which was that window's.
+
+    Args:
+        runs: One arm's runs.
+
+    Returns:
+        ``(window, note)``. The window is ``None`` when the runs disagree (the note says so) or
+        when none records one and the shipped window could not be read.
+    """
+    windows = {
+        int(record["searched_lag_steps"])
+        for record in runs
+        if record.get("searched_lag_steps") is not None
+    }
+    if len(windows) > 1:
+        return None, (
+            f"this arm's runs searched more than one lag window: {sorted(windows)} lag steps. "
+            f"Two windows are two searches, and one family cannot cover both."
+        )
+    if windows:
+        return windows.pop(), None
+    window = shipped_lag_window()
+    return window, (
+        f"no run of this arm records its searched lag window, so the search is read under the "
+        f"shipped production window of {window} lag steps, which is the window the revision-1 "
+        f"family was declared for."
+    )
 
 
 def stability_block(
@@ -1076,20 +1283,35 @@ def check_declared_bands(bands: Mapping[str, Any]) -> Dict[str, Any]:
         for arm, record in bands.items()
         if record.get("undeclared_bands")
     }
-    if offenders:
+    # A search whose window no family declares, or whose runs span two windows, has no fixed
+    # family either: the correction has nothing to cover, which is the same failure by another
+    # route and is refused by name rather than read under some other window's family.
+    unfamilied = {
+        arm: {
+            "status": record.get("status"),
+            "lag_window": record.get("lag_window"),
+            "searched_bands": record.get("searched_bands", []),
+        }
+        for arm, record in bands.items()
+        if record.get("status") in ("UNDECLARED_FAMILY", "MIXED_LAG_WINDOWS")
+    }
+    if offenders or unfamilied:
         return _verdict(
             "bands_were_predeclared",
             "FAIL",
-            "a band outside the plan's declared list was searched, so the family the correction "
-            "is applied over was not fixed before the peak was seen.",
+            "a band outside the plan's declared family was searched, or a search was made over a "
+            "lag window the plan declares no family for, so the family the correction is applied "
+            "over was not fixed before the peak was seen.",
             undeclared=offenders,
+            undeclared_windows=unfamilied,
         )
     return _verdict(
         "bands_were_predeclared",
         "PASS",
-        "every searched band is one the plan declares, so the family the correction covers was "
-        "fixed before any margin was read.",
+        "every searched band is one the plan declares for the window it was searched over, so "
+        "the family the correction covers was fixed before any margin was read.",
         searched={arm: record.get("searched_bands", []) for arm, record in bands.items()},
+        windows={arm: record.get("lag_window") for arm, record in bands.items()},
     )
 
 

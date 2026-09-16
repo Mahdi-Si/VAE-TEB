@@ -15,8 +15,10 @@
 # WHAT TO READ FIRST, AND IN WHICH ORDER:
 #   1. `val/source_conditioned_kl_raw` at the first validation epoch. It must be ~0.0. Anything else
 #      means the transfer did not leave the source pathway at zero.
-#   2. `val/pred_gap` against zero across training. Positive means the source-conditioned branch
-#      scores better than this run's OWN base branch.
+#   2. `val/pred_gap_mc` against zero across training: the unweighted predictive-mixture gap the
+#      checkpoints are selected on. Positive means the source-conditioned branch scores better
+#      than this run's OWN base branch under the estimator it will be reported under. `val/pred_gap`
+#      beside it is the weighted single-draw training gap, a diagnostic and not a selection rule.
 #   3. The evaluated gap against the FROZEN reference arm's own score. Only this comparison
 #      distinguishes "the source helped" from "the internal base got worse".
 #
@@ -56,3 +58,26 @@ model_config:
     # transfer just copied, and the run would train from a half-calibrated state that neither the
     # baseline nor a fresh model ever occupied.
     head_init_calibration: false
+
+    # The selection rule, the same as the target-only reference's: eight paired draws per dense
+    # validation batch, both selectors on the unweighted mixture score of the full branch. Every
+    # arm based on this file -- the shortened bank, the capacity control, the mean-only arm, the
+    # input ablations -- inherits it, so the matched comparison selects every arm one way.
+    validation_mc_draws: 8
+
+
+advanced_config:
+  callbacks:
+    early_stopping:
+      enabled: true
+      monitor: "val/pred_nll_full_mc"
+      patience: 50
+      min_delta: 0.0001
+
+    model_checkpoint:
+      monitor: "val/pred_nll_full_mc"
+      save_top_k: 3
+      mode: "min"
+      # The weighted objective's own optimum, kept beside the selected one so the two selection
+      # rules can be compared on the same run.
+      secondary_monitor: "val/total_loss"

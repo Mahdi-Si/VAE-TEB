@@ -464,10 +464,10 @@ def bootstrap_curve(
     return record
 
 
-def per_lag_latent_totals(
+def per_lag_latent_maps(
     model: Any, outputs: Mapping[str, torch.Tensor], contributing: torch.Tensor
 ) -> Dict[str, torch.Tensor]:
-    r"""One batch's per-lag latent readouts, summed over the scored anchors the lag was live at.
+    r"""One batch's per-lag latent readouts at **every scored anchor**, before any reduction.
 
     For every lag $\ell$ the bounded update is recomputed with that lag's proposals alone
     removed, from the cached array and by the same subtraction the band arms use:
@@ -475,24 +475,31 @@ def per_lag_latent_totals(
     $$\bar a_t^{\setminus \ell} = \bar a_t - c_L\, r^\mu_{t,\ell}, \qquad
       a_t^{\setminus \ell} = a_{\max}\tanh\bigl(\bar a_t^{\setminus \ell} / a_{\max}\bigr),$$
 
-    and likewise for the scale channel where the arm has one. Three sums come back per lag, each
-    over the scored anchors at which the lag carried any available channel:
+    and likewise for the scale channel where the arm has one. Three maps come back, each
+    $(B, A, L)$:
 
-    * ``proposal_norm_sum``: $\sum_t \lVert r^\mu_{t,\ell} \rVert_2$, what the head emitted;
-    * ``update_shift_sum``: $\sum_t \lVert a_t - a_t^{\setminus \ell} \rVert_2$, what removing it
-      does to the bounded mean update -- zero where the limiter has saturated, however large the
+    * ``proposal_norm``: $\lVert r^\mu_{t,\ell} \rVert_2$, what the head emitted;
+    * ``update_shift``: $\lVert a_t - a_t^{\setminus \ell} \rVert_2$, what removing it does to
+      the bounded mean update -- zero where the limiter has saturated, however large the
       proposal, which is what separates this from the first;
-    * ``divergence_drop_sum``: $\sum_t \bigl(K_t - K_t^{\setminus \ell}\bigr)$, what removing it
-      does to the divergence. Signed: removing a lag can raise the divergence when its proposal
-      was cancelling another's.
+    * ``divergence_drop``: $K_t - K_t^{\setminus \ell}$, what removing it does to the
+      divergence. Signed: removing a lag can raise the divergence when its proposal was
+      cancelling another's.
 
-    ``scale_proposal_norm_sum`` joins them on an arm with a scale channel. Sums rather than means,
-    so a pass accumulates them with :func:`merge_counts` and divides once by the per-lag anchor
-    count the exposure readout already carries.
+    ``scale_proposal_norm`` joins them on an arm with a scale channel, and ``live`` is the
+    $(B, A, L)$ weight -- the lag carried an available channel at a scored anchor -- that every
+    reduction of these maps is taken under. An out-of-range or cold lag has an exactly zero
+    proposal, so its three entries are exactly zero, and the weight is what keeps a zero that
+    means "nothing was there" out of a mean over the lags that carried source.
 
     **None of the three is an allocation.** The reallocation the qualification names --
     $r_\ell \mapsto r_\ell + k_\ell(h_t)$ with $\sum_\ell k_\ell \equiv 0$ -- leaves the update,
     the divergence and every prediction unchanged while changing all three readouts at every lag.
+
+    The maps are what the collection pass writes to the per-anchor sidecar, the per-sample
+    profiles are their within-segment means, and :func:`per_lag_latent_totals` is their sum over
+    the batch -- one computation behind the three, so the sidecar, the table and the pooled
+    profile cannot come to disagree.
 
     Args:
         model: The net, for $c_L$ and the two residual bounds.
@@ -500,15 +507,15 @@ def per_lag_latent_totals(
         contributing: The $0/1$ scored-anchor indicator, $(B, A)$.
 
     Returns:
-        ``{'proposal_norm_sum', 'update_shift_sum', 'divergence_drop_sum'}`` and, where the arm
-        has a scale channel, ``'scale_proposal_norm_sum'``, each $(L,)$ in float64.
+        ``{'proposal_norm', 'update_shift', 'divergence_drop', 'live'}`` and, where the arm has
+        a scale channel, ``'scale_proposal_norm'``, each $(B, A, L)$ in float64.
 
     Raises:
         KeyError: If the forward was run without ``return_proposals``, naming the flag.
     """
     if "mean_proposals" not in outputs:
         raise KeyError(
-            "per_lag_latent_totals needs the per-lag proposals: call the forward with "
+            "per_lag_latent_maps needs the per-lag proposals: call the forward with "
             "return_proposals=True."
         )
     proposals = outputs["mean_proposals"]  # (B, A, L, d_z)
@@ -542,16 +549,92 @@ def per_lag_latent_totals(
             - residual_kl(a_minus, b_minus).sum(dim=-1).to(torch.float64)
         )
 
-    totals = {
-        "proposal_norm_sum": (proposal_norm * live).sum(dim=(0, 1)),
-        "update_shift_sum": (update_shift * live).sum(dim=(0, 1)),
-        "divergence_drop_sum": (divergence_drop * live).sum(dim=(0, 1)),
+    maps = {
+        "proposal_norm": proposal_norm,
+        "update_shift": update_shift,
+        "divergence_drop": divergence_drop,
+        "live": live,
     }
     if scale_proposals is not None:
-        totals["scale_proposal_norm_sum"] = (
-            scale_proposals.norm(dim=-1).to(torch.float64) * live
-        ).sum(dim=(0, 1))
-    return totals
+        maps["scale_proposal_norm"] = scale_proposals.norm(dim=-1).to(torch.float64)
+    return maps
+
+
+def per_lag_latent_totals(
+    model: Any, outputs: Mapping[str, torch.Tensor], contributing: torch.Tensor
+) -> Dict[str, torch.Tensor]:
+    r"""One batch's per-lag latent readouts, summed over the scored anchors the lag was live at.
+
+    The batch sum of :func:`per_lag_latent_maps` under its ``live`` weight: ``<name>_sum`` is
+    $\sum_{b,t} \mathrm{live}_{b,t,\ell}\, m_{b,t,\ell}$ for each map $m$. Sums rather than
+    means, so a pass accumulates them with :func:`merge_counts` and divides once by the per-lag
+    anchor count the exposure readout already carries.
+
+    Args:
+        model: The net, for $c_L$ and the two residual bounds.
+        outputs: A forward's dict taken with ``return_proposals=True`` on the local fusion.
+        contributing: The $0/1$ scored-anchor indicator, $(B, A)$.
+
+    Returns:
+        ``{'proposal_norm_sum', 'update_shift_sum', 'divergence_drop_sum'}`` and, where the arm
+        has a scale channel, ``'scale_proposal_norm_sum'``, each $(L,)$ in float64.
+
+    Raises:
+        KeyError: If the forward was run without ``return_proposals``, naming the flag.
+    """
+    return latent_totals_from_maps(per_lag_latent_maps(model, outputs, contributing))
+
+
+def latent_totals_from_maps(maps: Mapping[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    """Sum :func:`per_lag_latent_maps` over the batch, under its own ``live`` weight.
+
+    Split out so the collection pass, which needs the maps themselves for the sidecar, sums them
+    once rather than recomputing every per-lag removal a second time.
+
+    Args:
+        maps: The maps, carrying ``live``.
+
+    Returns:
+        ``{'<name>_sum': (L,)}`` for every map but ``live``.
+    """
+    live = maps["live"]
+    return {
+        f"{name}_sum": (values * live).sum(dim=(0, 1))
+        for name, values in maps.items()
+        if name != "live"
+    }
+
+
+def per_segment_lag_profiles(maps: Mapping[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    r"""Reduce :func:`per_lag_latent_maps` to one profile per segment, per map.
+
+    Each segment's profile is the mean of the map over the scored anchors at which the lag was
+    live, lag by lag:
+
+    $$\bar m_{b,\ell} = \frac{\sum_t \mathrm{live}_{b,t,\ell}\, m_{b,t,\ell}}
+                              {\sum_t \mathrm{live}_{b,t,\ell}},$$
+
+    ``NaN`` where a segment had no live anchor at a lag -- a lag that was never read rather than
+    a lag that was read and found empty, which the shape statistics keep apart by dropping the
+    non-finite bin from the mass.
+
+    Args:
+        maps: The maps, carrying ``live``.
+
+    Returns:
+        ``{'proposal_norm', 'divergence_drop', ...}``, each $(B, L)$ in float64.
+    """
+    live = maps["live"]
+    count = live.sum(dim=1)  # (B, L)
+    profiles: Dict[str, torch.Tensor] = {}
+    for name, values in maps.items():
+        if name == "live":
+            continue
+        summed = (values * live).sum(dim=1)
+        profiles[name] = torch.where(
+            count > 0.0, summed / count.clamp_min(1.0), torch.full_like(summed, float("nan"))
+        )
+    return profiles
 
 
 def lag_profile_summary(

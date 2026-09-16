@@ -18,10 +18,16 @@ cells' runs are read down one set of names.
   its latent is indexed by decoded anchor, so it produces the family's tables from its own forward
   -- the same identity columns, the same column names wherever the quantity is the same one, and
   no name at all where it is not -- and scores every arm the design defines in one draw loop.
-* :mod:`.analyses` -- six analyses on the binding. Three draw the readouts only this architecture
-  has (the arms, the lag suppression, the resolved axes); three draw this model's own forward
+* :mod:`.analyses` -- ten analyses on the binding, beside three of the family's own. Three draw
+  the readouts only this architecture has (the arms, the lag suppression, the resolved axes);
+  four read the lag structure off the two sidecars the pass writes (``proposal_profile``,
+  ``proposal_clocks``, ``band_clocks``, ``high_kl_anchors``); three draw this model's own forward
   under the family's names (``samples``, ``recording_traces``, ``attribution``), because each
-  reads a tensor the other architecture does not emit.
+  reads a tensor the other architecture does not emit. ``warmup``, ``source_null`` and
+  ``spectral_skill`` are the family's implementations, registered because the columns they read
+  are the same quantities on this cell.
+* :mod:`.lag_structure` -- the shape of the two per-lag profiles per segment, their band masses,
+  and their cut on the two clinical clocks: the layer the four lag-structure analyses share.
 * :mod:`.binding` -- which class a checkpoint is rebuilt through, which constructor keys are
   reconciled against it, what this encoder discloses, the override delta, the pass, the extras,
   and which shared analyses this architecture cannot produce.
@@ -33,10 +39,11 @@ cells' runs are read down one set of names.
 * :mod:`.latent_probes` and :mod:`.acceptance` -- frozen probes from each latent readout, and
   several runs together under one predeclaration.
 
-**What is deliberately absent.** Seven analyses of the family read an attention distribution or a
-per-lag allocation of the divergence. None is handed a substitute: a proposal norm under an
-attention name is a per-lag attribution that does not exist, and every summary names the seven
-with the tensor each would have needed.
+**What is deliberately absent under the family's names.** Six analyses of the family read an
+attention distribution or a per-lag allocation of the divergence. None is handed a substitute
+under its own name: a proposal norm under an attention name is a per-lag attribution that does
+not exist. Each question is asked instead by an analysis of this cell named for what it reads,
+and every summary names the six with the tensor each would have needed and its analogue here.
 
 Launch from the repository root::
 

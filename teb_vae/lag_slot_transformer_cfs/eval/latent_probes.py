@@ -393,8 +393,12 @@ def probe_batch(
     complete = mask.sum(dim=-1) >= mask.shape[-1]
 
     # The anchor's own stored values, gathered by the model's own routine so the probe subtracts
-    # exactly the vector the persistence term carries -- the same channels in the same order.
-    at_anchor = model._anchor_target_values(torch.cat([y_st, y_ph], dim=-1), anchors)
+    # exactly the vector the persistence term carries -- the same channels in the same order, on
+    # the same PERMITTED view of the stream: a probe handed the original stream would read an
+    # ablated coefficient the persistence term itself never carries.
+    at_anchor = model._anchor_target_values(
+        model.permitted_target_features(torch.cat([y_st, y_ph], dim=-1)), anchors
+    )
     residual = (target - at_anchor.unsqueeze(2)).flatten(start_dim=2)
 
     features = latent_features(outputs)

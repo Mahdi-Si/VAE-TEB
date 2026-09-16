@@ -723,7 +723,7 @@ def build_horizon_figure(per_horizon: pd.DataFrame, bands: Dict[str, Tuple[int, 
         xlabel="horizon step",
         ylabel=NATS_PER_ANCHOR_STEP,
     )
-    axis.axhline(0.0, linestyle="--", linewidth=1.0, color="0.4")
+    axis.axhline(0.0, linestyle="--", linewidth=figures.LINE_THIN, color="0.4")
     return figure
 
 

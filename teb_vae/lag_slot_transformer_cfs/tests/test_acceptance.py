@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any, Dict, Mapping
+from typing import Any, Dict, Mapping, Optional
 
 import pytest
 import yaml
@@ -38,7 +38,13 @@ from .test_arms import fit_arm, score_arm
 #: result has been seen is invisible in every number it produces. A deliberate revision updates
 #: this literal and the plan's own revision counter together, and the diff is then the record that
 #: it happened.
-COMMITTED_PLAN_DIGEST = "a48059133e35b9ca"
+COMMITTED_PLAN_DIGEST = "5653fb573d2961c1"
+
+#: The saved production export of the 91-entry development run, read here for its recorded
+#: lag window alone: the acceptance pass must read it under the family declared for that window.
+SAVED_EXPORT_SUMMARY = (
+    Path(__file__).resolve().parents[3] / "output" / "lag_slot_summary" / "summary.json"
+)
 
 #: Draws the integration fixture scores at, and the seeds it fits. Small: this asserts that the
 #: protocol reads what the pass writes, not the convergence of an estimator.
@@ -72,6 +78,8 @@ def fake_run(
     draws: int = 32,
     eval_seed: int = 42,
     label: str = "/data/fold_1/test",
+    searched_lag_steps: Optional[int] = None,
+    input_policy: Optional[Mapping[str, bool]] = None,
 ) -> Dict[str, Any]:
     """One run record in the shape :func:`acceptance.discover_runs` returns.
 
@@ -84,6 +92,9 @@ def fake_run(
         draws: The Monte Carlo draw count the run was scored at.
         eval_seed: The evaluation seed.
         label: The split's label.
+        searched_lag_steps: The lag window the run's causality record names, or ``None`` for a
+            summary that records none, as every summary written before the record carried it.
+        input_policy: The two ablation flags the arm record carries, or ``None`` for both off.
 
     Returns:
         The record.
@@ -98,18 +109,21 @@ def fake_run(
         "target_only": {"source_disabled": True},
     }[arm]
     # The family's summary layout: this cell's blocks under ``results``, the training identity
-    # under the runner's ``run_context``, the evaluation seed under ``eval_config``.
+    # under the runner's ``run_context``, the evaluation seed under ``eval_config``, the searched
+    # window under the promoted ``causality`` record.
     summary = {
         "checkpoint": f"{arm}.ckpt",
         "eval_config": {"seed": eval_seed},
         "run_context": {"training_seed": training_seed, "training_tag": f"{arm}_{training_seed}"},
         "results": {
-            "arm": {"source_disabled": False, **leaves},
+            "arm": {"source_disabled": False, **leaves, **dict(input_policy or {})},
             "num_mc_samples": draws,
             "arms": {"scored_split": {"label": label, "n_recordings": len(values)}},
             "mixture_calibration": {},
         },
     }
+    if searched_lag_steps is not None:
+        summary["causality"] = {"searched_lag_steps": searched_lag_steps}
     return {
         **acceptance.run_identity(f"/runs/{arm}-{training_seed}", summary),
         "table": {guid: dict(row) for guid, row in values.items()},
@@ -399,6 +413,184 @@ def test_a_band_outside_the_declaration_fails_the_gate(tmp_path: Path) -> None:
 
     assert verdict["status"] == "FAIL"
     assert verdict["undeclared"]["candidate"] == ["undeclared"]
+
+
+# =============================================================================
+# The band family is the window's
+# =============================================================================
+def short_window_values(offset: float, *, bands: Mapping[str, Any], n: int = 8) -> Dict[str, Dict[str, float]]:
+    """A per-recording table whose suppression columns are one window's family.
+
+    Args:
+        offset: The value ``nll_full`` sits below ``nll_base`` by.
+        bands: The family's band names, each getting a suppressed column.
+        n: Recordings.
+
+    Returns:
+        ``{recording: {column: value}}``.
+    """
+    table = straight_line(offset, n=n)
+    for row in table.values():
+        for name in list(row):
+            if name.startswith("nll_suppress:") and name not in ("nll_suppress:none", "nll_suppress:all"):
+                del row[name]
+        for position, name in enumerate(bands):
+            row[f"nll_suppress:{name}"] = row["nll_full"] + 0.1 * (position + 1)
+    return table
+
+
+def test_a_run_is_read_under_the_family_declared_for_its_own_window(tmp_path: Path) -> None:
+    """The committed plan declares one family per window; a run over the short window is read
+    under that window's family and is not failed for searching bands the wide family lacks."""
+    plan = plan_with(tmp_path, primary_draws=32, minimum_training_seeds=1, bootstrap_resamples=50)
+    families = plan["exploratory_band_families"]
+    assert len(families) >= 2
+    wide, short = max(families), min(families)
+    runs = [
+        fake_run(
+            "candidate", training_seed=1, searched_lag_steps=short,
+            values=short_window_values(2.0, bands=families[short]),
+        )
+    ]
+
+    block = acceptance.band_block(acceptance.arm_evidence(runs, plan=plan), plan=plan)["candidate"]
+    verdict = acceptance.check_declared_bands({"candidate": block})
+
+    assert block["status"] == "READ"
+    assert block["lag_window"] == short and block["lag_window_note"] is None
+    assert block["declared_bands"] == families[short]
+    assert block["searched_bands"] == sorted(families[short])
+    assert block["undeclared_bands"] == []
+    assert block["family_size"] == len(families[short])
+    assert verdict["status"] == "PASS"
+    assert verdict["windows"] == {"candidate": short}
+    # And the wide family is a different list, so the same bands under the wide window would fail.
+    assert set(families[short]) != set(families[wide])
+
+
+def test_a_run_over_a_window_the_plan_declares_no_family_for_is_refused(tmp_path: Path) -> None:
+    """A search over an undeclared window has no fixed family, which is the same failure as an
+    undeclared band by another route."""
+    plan = plan_with(tmp_path, primary_draws=32, minimum_training_seeds=1, bootstrap_resamples=50)
+    undeclared = max(plan["exploratory_band_families"]) + 7
+    runs = [
+        fake_run("candidate", training_seed=1, searched_lag_steps=undeclared, values=straight_line(2.0))
+    ]
+
+    bands = acceptance.band_block(acceptance.arm_evidence(runs, plan=plan), plan=plan)
+    verdict = acceptance.check_declared_bands(bands)
+
+    assert bands["candidate"]["status"] == "UNDECLARED_FAMILY"
+    assert bands["candidate"]["lag_window"] == undeclared
+    assert verdict["status"] == "FAIL"
+    assert verdict["undeclared_windows"]["candidate"]["lag_window"] == undeclared
+
+
+def test_an_arm_whose_runs_span_two_windows_is_refused_by_name(tmp_path: Path) -> None:
+    """Two windows are two searches, and one family cannot cover both."""
+    plan = plan_with(tmp_path, primary_draws=32, minimum_training_seeds=1, bootstrap_resamples=50)
+    families = plan["exploratory_band_families"]
+    wide, short = max(families), min(families)
+    runs = [
+        fake_run("candidate", training_seed=1, searched_lag_steps=wide, values=straight_line(2.0)),
+        fake_run(
+            "candidate", training_seed=2, searched_lag_steps=short,
+            values=short_window_values(2.0, bands=families[short]),
+        ),
+    ]
+
+    bands = acceptance.band_block(acceptance.arm_evidence(runs, plan=plan), plan=plan)
+
+    assert bands["candidate"]["status"] == "MIXED_LAG_WINDOWS"
+    assert acceptance.check_declared_bands(bands)["status"] == "FAIL"
+
+
+def test_a_summary_that_records_no_window_is_read_under_the_shipped_one(tmp_path: Path) -> None:
+    """Every summary written before the causality record carried the window searched the shipped
+    production window, whose family is the revision-1 list; the record says the reading was
+    indirect."""
+    plan = plan_with(tmp_path, primary_draws=32, minimum_training_seeds=1, bootstrap_resamples=50)
+    runs = [fake_run("candidate", training_seed=1, values=straight_line(2.0))]
+
+    block = acceptance.band_block(acceptance.arm_evidence(runs, plan=plan), plan=plan)["candidate"]
+
+    assert block["status"] == "READ"
+    assert block["lag_window"] == acceptance.shipped_lag_window()
+    assert "shipped production window" in block["lag_window_note"]
+    assert block["declared_bands"] == plan["exploratory_band_families"][acceptance.shipped_lag_window()]
+
+
+def test_a_plan_carrying_only_the_legacy_band_key_is_read_as_the_shipped_windows_family(tmp_path: Path) -> None:
+    """The revision-1 key named one family without saying which window; it was the shipped one."""
+    declaration = yaml.safe_load(Path(acceptance.DEFAULT_PLAN_PATH).read_text(encoding="utf-8"))
+    families = declaration.pop("exploratory_band_families")
+    shipped = acceptance.shipped_lag_window()
+    declaration["exploratory_bands"] = list(families[shipped])
+    path = tmp_path / "legacy_plan.yaml"
+    path.write_text(yaml.safe_dump(declaration, sort_keys=False), encoding="utf-8")
+
+    with pytest.warns(UserWarning, match="revision-1"):
+        plan = acceptance.load_plan(str(path))
+
+    assert plan["exploratory_band_families"] == {shipped: list(families[shipped])}
+    assert plan["band_family_source"].startswith("legacy")
+    assert "exploratory_bands" not in plan
+
+
+def test_a_plan_carrying_both_band_keys_is_refused(tmp_path: Path) -> None:
+    """Two declarations of one window cannot both be the predeclaration."""
+    declaration = yaml.safe_load(Path(acceptance.DEFAULT_PLAN_PATH).read_text(encoding="utf-8"))
+    declaration["exploratory_bands"] = ["anchor"]
+    path = tmp_path / "plan.yaml"
+    path.write_text(yaml.safe_dump(declaration, sort_keys=False), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="exploratory_bands"):
+        acceptance.load_plan(str(path))
+
+
+@pytest.mark.skipif(not SAVED_EXPORT_SUMMARY.is_file(), reason="the saved export is not on this machine")
+def test_the_saved_wide_window_export_is_read_under_the_wide_family() -> None:
+    """The development run's own causality record names its window, and the committed plan
+    declares that window's family: the revision-1 bands unchanged."""
+    summary = json.loads(SAVED_EXPORT_SUMMARY.read_text(encoding="utf-8"))
+    plan = acceptance.load_plan()
+
+    run = acceptance.run_identity(str(SAVED_EXPORT_SUMMARY.parent), summary)
+    window, note = acceptance.arm_lag_window([run])
+
+    assert run["searched_lag_steps"] == window == acceptance.shipped_lag_window()
+    assert note is None
+    assert plan["exploratory_band_families"][window] == ["anchor", "near", "mid", "far"]
+    assert run["input_policy"] == {"zero_fhr_scattering_s0": False, "zero_up_scattering_s0": False}
+
+
+def test_two_windows_or_two_input_policies_do_not_pair(tmp_path: Path) -> None:
+    """The bank length and the ablation are leaves of their own: a pair that differs in either
+    would carry that difference under whichever leaf the comparison names."""
+    plan = plan_with(tmp_path, primary_draws=32, minimum_training_seeds=1, bootstrap_resamples=50)
+    families = plan["exploratory_band_families"]
+    wide, short = max(families), min(families)
+    left = fake_run("candidate", training_seed=1, searched_lag_steps=wide, values=straight_line(1.0))
+    right = fake_run("mean_only", training_seed=1, searched_lag_steps=short, values=straight_line(0.5))
+    ablated = fake_run(
+        "mean_only", training_seed=1, searched_lag_steps=wide, values=straight_line(0.5),
+        input_policy={"zero_fhr_scattering_s0": True},
+    )
+    reference = fake_run("target_only", training_seed=9, values=straight_line(0.0))
+
+    windows = acceptance.primary_comparison_block(
+        acceptance.arm_evidence([left, right], plan=plan), plan=plan
+    )["the_variance_update"]
+    policies = acceptance.primary_comparison_block(
+        acceptance.arm_evidence([left, ablated], plan=plan), plan=plan
+    )["the_variance_update"]
+
+    assert windows["status"] == "UNMATCHED" and "lag window" in windows["detail"]
+    assert policies["status"] == "UNMATCHED" and "input policy" in policies["detail"]
+    # A target-only run searches no window, so it pairs with either window.
+    assert acceptance.scoring_mismatch([left, reference]) is None
+    descriptor = acceptance.run_descriptor(ablated)
+    assert descriptor["zero_fhr_scattering_s0"] is True and descriptor["searched_lag_steps"] == wide
 
 
 # =============================================================================

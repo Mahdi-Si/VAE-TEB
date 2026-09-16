@@ -63,3 +63,29 @@ model_config:
     # FRESH, so the calibrated initialisation applies: this arm is trained from scratch, unlike the
     # candidate that starts from its checkpoint.
     head_init_calibration: true
+
+    # THE SELECTION RULE OF EVERY ARM IN THE MATCHED COMPARISON. Eight paired draws per dense
+    # validation batch; both selectors below read the resulting unweighted mixture score. On this
+    # arm the full and base columns agree bitwise and `val/pred_gap_mc` is exactly zero, which is
+    # one more self-check that the run built the arm it is labelled as. The candidate and every
+    # comparator inherit the same value through `joint.yaml`, so no arm is selected on a
+    # different estimator from the reference it is read against.
+    validation_mc_draws: 8
+
+
+advanced_config:
+  callbacks:
+    # Selection on the predictive monitor. The composite objective it replaces is a weighted
+    # single-draw criterion and not the estimator any run is reported under; its own optimum is
+    # kept on disk by the second criterion so the two can be compared afterwards.
+    early_stopping:
+      enabled: true
+      monitor: "val/pred_nll_full_mc"
+      patience: 50
+      min_delta: 0.0001
+
+    model_checkpoint:
+      monitor: "val/pred_nll_full_mc"
+      save_top_k: 3
+      mode: "min"
+      secondary_monitor: "val/total_loss"

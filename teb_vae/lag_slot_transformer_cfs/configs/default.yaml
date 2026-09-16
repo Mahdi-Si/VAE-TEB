@@ -96,6 +96,18 @@ model_config:
     lambda_full: 1.0
     lambda_base: 1.0
 
+    # The predictive validation monitor. Null leaves validation as it always was -- the one-draw
+    # weighted objective, which is what the checkpoint and early-stopping monitors below read. A
+    # positive integer K additionally scores every dense validation batch as the UNWEIGHTED
+    # K-draw predictive mixture of both branches, under a fixed noise bank keyed on the batch's
+    # segment identities and the run seed, and logs `val/pred_nll_full_mc`, `val/pred_nll_base_mc`
+    # and `val/pred_gap_mc` as recording-grouped means. That is the estimator the offline
+    # evaluation's headline reads, so a checkpoint chosen on it is chosen on the score it is later
+    # reported under; the weighted objective stays logged beside it as the optimisation
+    # diagnostic. The arm profiles set it and point their monitors at the new column. This file
+    # keeps the legacy selection so the shipped run stays reproducible as configured.
+    validation_mc_draws: null
+
     # ---------------------------------------------------------------------------------------
     # Geometry
     # ---------------------------------------------------------------------------------------
@@ -318,6 +330,23 @@ model_config:
     # difference of predicted means. Turn it off only in a named strict latent-only arm, alongside
     # an equally configured source-free comparator.
     persistence_residual: true
+
+    # ---------------------------------------------------------------------------------------
+    # Input ablations
+    # ---------------------------------------------------------------------------------------
+    # Two independent switches that zero one stream's ORDER-ZERO scattering coefficient -- the
+    # smoothed signal level, the first channel of the stream's scattering block -- at the model's
+    # input boundary: after loader normalisation and before the persistence gather, the gates and
+    # the encoders, so no path in the model, the persistence shortcut included, can read it. The
+    # forecast labels, the availability masks and the stored batch are untouched: this is a VALUE
+    # ablation of an observed coefficient, not a missing sensor, and the same policy applies in
+    # training, validation and evaluation. Both off here; the `*_s0_*.yaml` profiles set them, and
+    # every source-enabled ablation has a target-only reference under the same FHR policy.
+    #
+    # The source switch is refused with `use_up_st: false`, where the stream opens with a phase
+    # coefficient rather than the order-zero one.
+    zero_fhr_scattering_s0: false
+    zero_up_scattering_s0: false
 
   # A STRICT load of a checkpoint of this exact model kind -- every key must align, the source
   # pathway included -- or null for a fresh model. It is a resume, not a warm start.

@@ -199,7 +199,10 @@ def build_spectrum_figure(
     values = finite_column(spectrum, "kl_nats")
     if values.size and np.isfinite(values).any():
         positions = np.arange(values.size, dtype=np.float64)
-        axis.bar(positions, values, color=figures.COLOR_BLUE, alpha=0.85, width=0.8)
+        axis.bar(
+            positions, values, color=figures.COLOR_BLUE, alpha=0.85, width=0.8,
+            edgecolor=figures.COLOR_BLACK, linewidth=figures.HISTOGRAM_EDGE_WIDTH,
+        )
         axis.axhline(
             float(threshold), color=figures.COLOR_VERMILLION, linestyle="--", linewidth=figures.LINE_REGULAR,
             label=f"activity threshold {float(threshold):g} nats",

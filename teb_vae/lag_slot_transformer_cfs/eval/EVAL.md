@@ -51,6 +51,10 @@ To launch from an IDE, set `RUN_ARGS` at the bottom of `run.py` and use the Run 
 | `figures/` | Plots made from the summary and tables. |
 | `recording_traces/` | Detailed outputs for selected recordings, produced in a separate stage. |
 | `attribution/` | Input-attribution tables, figures, and traces, produced after the recording traces. |
+| `proposal_profile/`, `proposal_clocks/`, `band_clocks/`, `high_kl_anchors/` | The lag structure read off this cell's own sidecars; see section 5. |
+| `warmup/`, `source_null/`, `spectral_skill/` | The family's own analyses of the columns this pass writes under the family's names; see section 5 and the family's guide. |
+
+Every table-driven analysis of the family also writes its own subdirectory (`forecast/`, `coupling/`, `latent/`, `calibration/`, `distributions/`, `trajectory/`, `time_to_delivery/`, `second_stage/`, `events/`, `sufficiency/`, `cross_subgroup/`), each with its by-class and by-subgroup variants, exactly as on a lag-attentive cell.
 
 The `scored_split` block records the input files, standardisation statistics, their common parent directory, and a digest identifying the recordings actually scored. Keep this block and `per_recording.csv`: the multi-run comparison needs the individual recording scores and identities, not just an interval or a file path.
 
@@ -171,21 +175,33 @@ Latent profiles average over anchors where the lag was available. A large propos
 
 The predictive profile covers a capped subset of the split; its segment and recording counts are saved with it. The `lag_readouts.lag_axis` block records stored steps before the anchor, seconds per step, and the model's input delay. The table `lag_profile.csv` includes all three readouts, one row per lag.
 
-## 5. Analyses this architecture does not provide
+## 5. The lag structure, and the family analyses this cell asks its own way
 
-Seven analyses in the wider model family require tensors that this architecture does not compute. Their names and required tensors are recorded under `excluded_analyses`; `excluded_analyses_mechanism` explains how they were excluded.
+The lag-attentive cells resolve their lag axis through an attention distribution and a per-lag allocation of the divergence. This architecture computes neither. What it computes instead are two per-lag readouts of one fitted parameterisation, which the collection pass writes as sidecars beside the family's tables:
 
-| Analysis | How it is excluded | Required quantity |
-| --- | --- | --- |
-| `attention` | Removed from the shared registry. | Attention distribution over lags. |
-| `lag_kl` | Removed from the shared registry. | Per-lag allocation of divergence. |
-| `source_null` | Never registered here. | The lag-attentive model's parameterised source encoding path for a zeroed stream. |
-| `occlusion` | Never registered here. | Lag attention used to rebuild the full branch. |
-| `lag_clocks` | Never registered here. | Per-lag divergence allocation resolved against clinical time. |
-| `lag_kld_scaled` | Never registered here. | That allocation partitioned over lag bands. |
-| `lag_high_kl` | Never registered here. | Per-anchor lag map used for anchor selection. |
+| Sidecar | Contents |
+| --- | --- |
+| `per_sample_vectors.npz` : `proposal_lag_profile` | Each segment's proposal norm $\lVert r^\mu_{t,\ell} \rVert$ averaged over the anchors at which lag $\ell$ was live; NaN where it never was. |
+| `per_sample_vectors.npz` : `divergence_drop_lag_profile` | The signed divergence drop $K_t - K_t^{\setminus \ell}$ averaged the same way. |
+| `per_anchor_vectors.npz` : `proposal_lag_map`, `divergence_drop_lag_map` | The same two quantities at every contributing anchor, row-aligned with `per_anchor.parquet`, in half precision. |
+| `per_anchor.parquet` : `proposal_argmax_lag` | The lag whose proposal norm was largest at that anchor; `-1` where no lag was live. |
+| `per_sample.csv` : `margin_<arm>` | Every intervened arm's paired margin against the matched branch, per segment (`margin_suppress_near`, `margin_replace_zeros`, ...). |
+| `per_sample.csv` : `kld_source_null`, `coupling_minus_clock` | The divergence under the zeroed-source arm and what the matched source adds over it, the family's own columns. |
 
-The evaluator uses its own suppression and source-replacement analyses where appropriate. It does not relabel proposal norms as attention or divergence allocations. The acceptance gate rejects summaries containing the excluded analysis key names.
+Neither map is an attention distribution and neither allocates the divergence over lags; the summary's `lag_readouts.sidecars` block says so beside the names. Four analyses of this cell read them, and each asks the question one of the absent family analyses asks, named for what it reads rather than for what the family reads:
+
+| Family analysis | Required quantity | This cell's analysis | What it reads |
+| --- | --- | --- | --- |
+| `attention`, `lag_kl` | Attention over lags; per-lag divergence allocation. | `proposal_profile` | The shape of both profiles per segment (centroid, spread, quantiles, entropy, effective support, the guarded peak, band masses), pooled over recordings and per cohort. |
+| `lag_clocks`, `lag_kld_scaled` | That allocation against the clinical clocks; its band masses. | `proposal_clocks` | The same shape statistics and the band masses of both profiles on both clocks, per class, with the two centroids tested per window. |
+| `occlusion` (clock page) | Lag attention rebuilding the full branch. | `band_clocks` (beside `lag_suppression` and `resolved_axes`) | Every band and control margin on both clocks, per class, descriptive. |
+| `lag_high_kl` | The per-anchor KL lag map. | `high_kl_anchors` | Anchors selected by their own divergence at pooled thresholds; their proposal profiles, their forecast gain against the rest, the overlap with a gain-selected band, contraction enrichment, and both clocks. |
+
+Three further family analyses are registered here **unchanged**, because the columns they read are the same quantities on this cell: `warmup` (the warm-up tertile gaps and the geometry guards; the source-lag warmth fractions are reported absent, since they are an attention mass), `source_null` (the divergence under the zeroed-source arm against the matched one, per recording; its lag-resolved half is reported unmeasured) and `spectral_skill` (the per-channel gap vector on the kept frequency bands).
+
+The six family analyses that cannot run here are recorded under `excluded_analyses` with the tensor each would have needed, `excluded_analyses_mechanism` says how each was left out, and `analogue_analyses` names the analysis above that asks its question. Nothing is relabelled: the acceptance gate still rejects a summary carrying an attention-shaped key anywhere.
+
+Read every lag-structure artifact under the qualification the suppression readouts carry: a reallocation $r_\ell \mapsto r_\ell + k_\ell(h_t)$ with $\sum_\ell k_\ell \equiv 0$ leaves the update, the divergence and every prediction unchanged while changing both profiles at every lag. A centroid says where the fitted head's proposals sit; it does not say the source at that lag was necessary. The `high_kl_anchors` hot-lag set is a top-share selection taken from the same map it summarises, and every artifact of that analysis says so.
 
 The shared collection pass is also unsuitable: it expects latent tensors indexed at every stored time step and requires eight attention-derived fields. This model indexes latent tensors by decoded anchor. It reuses architecture-independent components instead: checkpoint and task loading, configuration merging and validation, block scoring, log-mean-likelihood scoring, cross-recording permutation, recording-level bootstrapping, and summary assembly.
 
@@ -259,6 +275,186 @@ python -m teb_vae.lag_slot_transformer_cfs.eval.acceptance --runs output/<develo
 ```
 
 The report includes variants and seeds, declared comparisons, internal and reference comparisons, controls, band-search intervals, draw-count stability, calibration, probes, and verdicts. The report and figures use the assembled record without recomputing its statistics. See [the figure guide](FIGURE_GUIDE.md) for the plots.
+
+### 7.3 Rescoring an existing 91-entry checkpoint with its tail removed jointly
+
+The shipped four bands measure the source pathway band by band, and band margins do not add:
+proposals interact through the sum, the limiter, the sample and the decoder, so the effect of
+removing every lag above a cutoff at once is its own measurement. The profile
+`configs/lag91_tail_diagnostic.yaml` declares that measurement as bands -- the cutoff pair
+`head_0_24` / `tail_25_90` and a keep-prefix family `beyond_<l>` that removes every lag above
+$\ell$ -- beside the shipped partition, at the acceptance plan's primary draw count. It is a copy
+of the committed delta with those two differences and is merged over the checkpoint's own resolved
+configuration in the same way; repoint its shard paths at the panel the checkpoint's shipped
+summary records.
+
+Run it three times on the same panel, at the primary count and the two stability counts:
+
+```bash
+python -m teb_vae.lag_slot_transformer_cfs.eval.run --checkpoint <run>/model_checkpoints/<name>.ckpt \
+    --overrides teb_vae/lag_slot_transformer_cfs/eval/configs/lag91_tail_diagnostic.yaml
+python -m teb_vae.lag_slot_transformer_cfs.eval.run --checkpoint <same> --overrides <same> --num-samples 8
+python -m teb_vae.lag_slot_transformer_cfs.eval.run --checkpoint <same> --overrides <same> --num-samples 128
+```
+
+Read, in this order, from each `summary.json` under `results`:
+
+1. `lag_readouts.band_suppression.tail_25_90.margin_nats` with its paired interval: the joint
+   removal. Compare it with the sum of the `near`, `mid` and `far` margins from the same run; the
+   difference is the interaction the bands cannot show.
+2. `lag_readouts.band_suppression.beyond_<l>` in increasing $\ell$: the keep-prefix curve. Its
+   two ends are the reference identities the readout already carries -- an empty prefix is
+   `all`, which equals `silence`, and the whole window is `none`.
+3. `arm_scores.draw_concentration_full` and the per-recording `draw_concentration_full` column
+   at each draw count. A ranking that moves between 8 and 128 by more than the tail margin's
+   interval width is a draw-count effect, not a lag effect.
+4. `verdicts` and `eval.verify`: the predictive verdict is read from the paired interval; the
+   gate additionally refuses a summary whose verdict list disagrees with the interval it carries.
+
+Keep the three summaries and their `per_recording.csv` tables; the acceptance pass does not read
+this profile, because its bands are outside the plan's declared family. Do not shorten
+`event_lag_window_s` for this profile: it is an event-conditioned reporting window, not the bank.
+
+### 7.4 What the score columns are
+
+Every score column of a summary is one of four estimators, and `results.conventions.estimators`
+names them beside their columns:
+
+| Estimator | Columns | What it is |
+| --- | --- | --- |
+| weighted objective | `nll_*_block_weighted`, `pred_gap_weighted` | the training objective's reconstruction terms, one shared draw under the configured channel and horizon weights; not a log density |
+| single-draw conditional | `nll_*_block`, `pred_gap` on `per_sample.csv` | the same draw scored unweighted, a conditional log density given one latent sample |
+| latent mean | `mean_nll_*_block`, `mean_pred_gap` | the decoder at the latent mean, no draw |
+| predictive mixture | `mc_nll_*_block`, `mc_pred_gap`; `nll_<arm>`, `pred_gap` on `per_recording.csv`; `pred_gap_mc_nats` | the negative log of the average likelihood over $K$ shared draws; the headline and every scientific verdict read this one |
+
+Two aggregation estimands are reported. `arm_scores` and the headline weight a recording's
+segments equally and then recordings equally; `anchor_within_recording` carries the same columns
+and paired margins with anchors weighted equally within each recording, and its headline columns
+sit on `per_recording.csv` under `*_anchor_weighted`. `results.conventions.headline_estimator`
+says which the headline reads. The single-lag predictive profile's cohort is declared under
+`lag_readouts.lag_profile.predictive.segments` and written to
+`lag_suppression/lag_profile_segments.csv`: segments are admitted in loader order under the cap
+and a per-class quota over the classes the split's shards declare, so no class fills the cap
+alone.
+
+The family's sufficiency probe is reported with `results.sufficiency_qualification` marking its
+interpretation unavailable: the probe conditions on the encoder state alone, without the metadata
+clock or the persistence path the production decoder has, so its gap is a probe fit rather than
+the bottleneck's cost. That repair is deferred.
+
+### 7.5 Selecting checkpoints on the predictive monitor
+
+A training run selects its checkpoints on whatever `advanced_config.callbacks.model_checkpoint.monitor`
+names. Shipped, that is `val/total_loss`: the one-draw weighted objective, which is not the
+estimator any summary reports. With `model_config.VAE_model.validation_mc_draws` set to a
+positive $K$, every dense validation batch is also scored as the unweighted $K$-draw predictive
+mixture of both branches under a noise bank keyed on the batch's segment identities and the run
+seed, and three further columns reach `metrics_history.csv`:
+
+| Column | What it is |
+| --- | --- |
+| `val/pred_nll_full_mc` | the full branch's mixture score, recording-grouped within each batch, batch-global across ranks |
+| `val/pred_nll_base_mc` | the same for the base branch, under the identical draws |
+| `val/pred_gap_mc` | base minus full: the paired predictive gain the offline headline reads, at the training run's own $K$ |
+
+Two validation passes at the same weights report the same value, which is what lets the column
+rank checkpoints; the training-stage columns are never monitored, because a training batch is
+tiled and its anchor set changes every epoch. The weighted objective stays logged beside the
+monitor as the optimisation diagnostic, and `train/grad_clip_frac` is the fraction of each
+epoch's optimizer steps on which the clip bound, counted over every step.
+
+The arm profiles (`target_only.yaml`, `joint.yaml` and everything based on them) set $K = 8$ and
+point both the checkpoint and the early-stopping monitor at `val/pred_nll_full_mc`, with the
+weighted objective's own optimum kept by the secondary criterion. `default.yaml` keeps the legacy
+selection so the shipped run stays reproducible as configured. A monitor naming one of the three
+columns while the draw count is null is refused before the model is built.
+
+### 7.6 The matched-arm comparison and the bank-length decision
+
+Six arms, one target-only initialisation, one selection rule, one scoring profile per bank. Run
+them in this order on the GPU box against the integer-operator production shards; every run
+writes its `resolved_config.yaml` beside its checkpoints, which is the durable record of what it
+was.
+
+1. **Two target-only fits.** `target_only.yaml` at its shipped seed (role `-a`, the warm-start
+   donor) and once more at a different seed and tag (role `-b`, the frozen reference). Score both
+   with `eval_overrides.yaml`. Before reading anything else, record the paired predictive
+   difference between the two as the **bank-length noninferiority tolerance**: a shortened bank
+   whose interval against the 91-entry candidate lies within that seed-to-seed spread is
+   competitive, one whose interval lies below it is not. Write the tolerance down first; a
+   tolerance chosen after the comparison is read is not a tolerance.
+2. **The two banks.** `joint.yaml` (91 entries) and `lag25.yaml` (25 entries), both with
+   `target_warm_start_checkpoint` repointed at the `-a` checkpoint. Score `joint.yaml` with
+   `eval_overrides.yaml` and `lag25.yaml` with `lag25_eval_overrides.yaml`, both at the plan's
+   primary $K = 32$; then the finalists at 8 and 128 on the same panel, and read the effective-draw
+   quantiles of both branches at each count.
+3. **The decision.** Read `lag25.yaml` against `joint.yaml` on the arm scores, both paired
+   against the `-b` reference: the predictive interval against the predeclared tolerance, the
+   mixture calibration by horizon and block, the base drift against the reference, and the
+   measured resources at the declared batch and draw counts. Record the decision in the run log
+   below. No arm is promoted on `pred_gap_weighted`, on `mean_pred_gap`, or on its own internal
+   gap alone.
+4. **The two controls.** Set `base:` of `capacity_control.yaml` and `mean_only.yaml` to the
+   chosen bank profile -- `lag25.yaml` if the shortened bank was competitive, `joint.yaml`
+   otherwise -- repoint their warm start at `-a`, train, and score under the chosen bank's
+   evaluation profile.
+5. **One extra run.** The chosen arm again with `lambda_base: 0.5`, the shipped run's value,
+   so the reconstruction weighting is compared against an external reference rather than assumed.
+
+Then assemble the record:
+
+```bash
+python -m teb_vae.lag_slot_transformer_cfs.eval.acceptance --runs output/<development evaluations> \
+    --reference output/<target-only -b>/eval_results/summary.json --output acceptance.json --report acceptance.md
+```
+
+The acceptance pass groups the runs by arm, reads each under its own window's band family, and
+refuses a pairing across two windows or two input policies; it does not compare `lag25.yaml`
+with `joint.yaml` directly, because their lag readouts are declared for different windows. That
+comparison is the arm-score one above, on the common target set, and it is recorded by hand.
+
+**Run log.** One entry per arm, appended here as the runs complete. Every field is required;
+"not measured" is a value.
+
+| Field | What to write |
+| --- | --- |
+| arm, profile, tag, seed | as configured |
+| initialisation | the warm-start checkpoint's path and SHA-256, or "fresh" |
+| effective loss weights | `lambda_full`, `lambda_base`, `beta_prior`, the resolved $\beta$ ramp, channel and horizon weights as resolved |
+| data budget | shards, epochs trained, batch size, optimizer steps, the selected epoch and what selected it |
+| selection | `validation_mc_draws`, the monitor, and `val/pred_nll_full_mc` at the selected epoch |
+| external-base drift | `base_minus_reference_nats` against the `-b` reference, with its interval |
+| predictive | `mc_pred_gap` and `pred_gap_mc_nats` with intervals at $K = 32$, and at 8 and 128 for a finalist; effective-draw quantiles of both branches |
+| calibration | mixture coverage at the three levels, pooled and by horizon and block |
+| resources | peak training memory, dense-evaluation memory and throughput at the declared batch and draw counts |
+| decision | promote / reject / inconclusive, and the one sentence that says why |
+
+No entries yet: the runs need the GPU box and the production shards.
+
+### 7.7 The input-ablation factorial on the chosen bank
+
+Four cells: neither switch (the chosen bank's own run above), the source switch
+(`lag25_s0_up.yaml`), the target switch (`lag25_s0_fhr.yaml`) and both (`lag25_s0_both.yaml`),
+plus the target-only reference under the target switch (`target_only_s0_fhr.yaml`, roles `-a` and
+`-b` as for the parent). If the bank-length decision kept 91 entries, rebase the three ablation
+profiles on `joint.yaml` first; each is a one- or two-leaf delta and moves nothing else.
+
+Warm-start every source-enabled ablation from the target-only checkpoint that shares its FHR
+policy: `lag25_s0_up.yaml` from the ordinary `-a` donor, the two arms that zero the FHR
+coefficient from `target_only_s0_fhr.yaml`'s `-a`. Read each against the reference that shares its
+policy, for the reason the profiles state: a reference that could read the level would credit the
+source with closing a gap the ablation itself opened.
+
+Score every cell at $K = 32$ under the chosen bank's evaluation profile. The summary's
+`causality.effective_inputs` names the ablated coordinates; read the resolved axes so the
+ablated coefficient's own score and the remaining channels' score are reported side by side, and
+never let a loss of level context hide inside the aggregate. Record one run-log entry per cell
+with the fields of 7.6 and, in the decision, whether each switch is kept for the confirmation
+stage and why. Zeroing a coefficient at the input does not establish that its information is
+absent from correlated coefficients; the decision is about the forecast under the policy, not
+about the coefficient's physiology.
+
+No entries yet: the runs need the GPU box and the production shards.
 
 ## 8. Settings
 

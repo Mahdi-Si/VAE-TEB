@@ -25,14 +25,18 @@ import yaml
 from teb_vae.lag_attn_cfs.trainer import LagAttnCfsTrainer
 from teb_vae.lag_attn_transformer_rws.trainer import LagAttnTrfRwsTrainer
 from teb_vae.lag_slot_transformer_cfs.nets.model import SeqVaeLagResidualTrfCfs
+from teb_vae.lag_attn.config import load_config
 from teb_vae.lag_slot_transformer_cfs.task import (
     TASK_METRIC_SUFFIXES,
+    VALIDATION_MC_DRAWS_KEY,
     SeqVaeLagResidualTrfCfsTask,
 )
 from teb_vae.lag_slot_transformer_cfs.trainer import (
+    VALIDATION_MONITOR_COLUMNS,
     WARM_START_KEY,
     LagResidualTrfCfsTrainer,
     _resolve_cli_config_path,
+    validation_monitor_draws,
 )
 
 #: This package's own directory, for the launch-convention checks.
@@ -153,6 +157,78 @@ def test_the_tracked_surface_names_the_objective_columns() -> None:
     ):
         assert f"val/{suffix}" in LagResidualTrfCfsTrainer.TRACKED_METRICS
     assert "lr" in LagResidualTrfCfsTrainer.TRACKED_METRICS
+
+
+def test_the_monitor_columns_are_tracked_only_when_a_run_produces_them() -> None:
+    """The class surface is the legacy one; the monitor joins it per configured instance.
+
+    A tracked name nothing produces is a column empty in every row, so a legacy run must not
+    carry the three monitor columns -- and a run that set the draw count must.
+    """
+    for column in VALIDATION_MONITOR_COLUMNS:
+        assert column.startswith("val/")
+        assert column not in LagResidualTrfCfsTrainer.TRACKED_METRICS
+        assert f"train/{column[4:]}" not in LagResidualTrfCfsTrainer.TRACKED_METRICS
+
+
+@pytest.mark.parametrize(
+    "name,expected",
+    [
+        ("default.yaml", None),
+        ("target_only.yaml", 8),
+        ("joint.yaml", 8),
+        ("lag25.yaml", 8),
+        ("lag25_s0_fhr.yaml", 8),
+        ("target_only_s0_fhr.yaml", 8),
+        ("tiny.yaml", 2),
+        ("tiny_lag25.yaml", 2),
+    ],
+)
+def test_the_shipped_profiles_declare_the_monitor_they_select_on(name: str, expected) -> None:
+    """Every arm of the matched comparison selects on the monitor; the legacy default does not.
+
+    Args:
+        name: The configuration filename.
+        expected: The draw count it resolves to.
+    """
+    config = load_config(str(PACKAGE_ROOT / "configs" / name))
+    assert validation_monitor_draws(config) == expected
+    callbacks = config["advanced_config"]["callbacks"]
+    if expected is None:
+        assert callbacks["model_checkpoint"]["monitor"] not in VALIDATION_MONITOR_COLUMNS
+    elif name not in ("tiny.yaml",):
+        assert callbacks["model_checkpoint"]["monitor"] in VALIDATION_MONITOR_COLUMNS
+        assert callbacks["early_stopping"]["enabled"] is True
+        assert callbacks["early_stopping"]["monitor"] in VALIDATION_MONITOR_COLUMNS
+
+
+def test_a_monitor_on_a_column_the_run_will_not_log_is_refused_before_the_fit() -> None:
+    """Left alone, the framework refuses at the end of the first validation epoch instead."""
+    config = {
+        "model_config": {"VAE_model": {VALIDATION_MC_DRAWS_KEY: None}},
+        "advanced_config": {
+            "callbacks": {"model_checkpoint": {"monitor": VALIDATION_MONITOR_COLUMNS[0]}}
+        },
+    }
+    with pytest.raises(ValueError, match=VALIDATION_MC_DRAWS_KEY):
+        validation_monitor_draws(config)
+    # A disabled early-stopping block naming the column is not a monitor and is not refused.
+    config["advanced_config"]["callbacks"] = {
+        "early_stopping": {"enabled": False, "monitor": VALIDATION_MONITOR_COLUMNS[0]}
+    }
+    assert validation_monitor_draws(config) is None
+
+
+@pytest.mark.parametrize("draws", [0, -1, 2.5, True])
+def test_a_malformed_draw_count_is_refused_by_name(draws) -> None:
+    """A mixture over no draws, a fractional draw or a boolean is not a draw count.
+
+    Args:
+        draws: The malformed value.
+    """
+    config = {"model_config": {"VAE_model": {VALIDATION_MC_DRAWS_KEY: draws}}}
+    with pytest.raises(ValueError, match=VALIDATION_MC_DRAWS_KEY):
+        validation_monitor_draws(config)
 
 
 def test_the_two_checkpoint_keys_are_refused_together() -> None:

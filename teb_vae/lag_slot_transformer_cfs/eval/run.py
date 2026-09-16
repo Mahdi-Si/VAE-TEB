@@ -17,10 +17,12 @@ is read down the same layout as a lag-attentive cell's.
 
 **What is this cell's own is declared on the binding rather than written here.** The collection
 pass, because the shared one is written against the lag-attention forward and this architecture
-computes none of what it reads; and six analyses -- the arms, the lag suppression, the resolved
-axes, and this cell's own pages, traces and attributions under the family's three names. The
-seven analyses the family has that read an attention distribution or a per-lag divergence
-allocation are absent, and the summary names each with the tensor it would have needed.
+computes none of what it reads; and thirteen analyses -- the arms, the lag suppression, the
+resolved axes, the four that read the lag structure off this cell's own sidecars, three of the
+family's own reused where the columns are the same quantities, and this cell's own pages, traces
+and attributions under the family's three names. The six analyses the family has that read an
+attention distribution or a per-lag divergence allocation are absent, and the summary names each
+with the tensor it would have needed and the analysis of this cell that asks its question.
 
 The one thing this module owns is the **registry it names in its own help text**: ``--only`` and
 ``--skip`` interpolate the analyses *this* binding resolves to, which is why the parser is
