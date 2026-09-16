@@ -349,16 +349,21 @@ def test_every_row_spans_the_whole_recording_on_one_axis() -> None:
 
 
 def test_the_lag_rows_columns_land_on_the_decoded_anchors() -> None:
-    """Every latent tensor here is anchor-indexed.
+    """Every latent tensor here is anchor-indexed, and the lag axis is the net's own bank.
 
     A page that read the anchor axis as a stored step would draw real numbers at the wrong
-    columns, and nothing about the array's shape would say so.
+    columns, and nothing about the array's shape would say so. The lag axis is pinned for the
+    converse reason: the rows must span exactly the candidate lags the model was built with,
+    $L = \\texttt{max\\_lag} + 1$, read off the forward rather than off any constant, so a
+    shortened bank draws a shortened axis.
     """
     task = build_task()
     batch = StubBatch()
     outs, _target, _weight, _inputs = _forward(task, batch)
     geometry = task.orig_model.geometry
     seconds_per_step = (float(geometry.raw_len) / 4.0) / float(geometry.t)
+    n_lags = int(task.orig_model.n_lags)
+    assert n_lags == int(outs["mean_proposals"].shape[2])
 
     anchors = outs["anchor_index"][0][outs["anchor_valid"][0]].cpu().numpy()
     figure = _render(task, batch)
@@ -370,13 +375,16 @@ def test_the_lag_rows_columns_land_on_the_decoded_anchors() -> None:
         ]
         assert len(images) == len(sample_page.LAG_ROWS) - 1, "one image per lag heatmap"
         for image in images:
-            left, right, _bottom, _top = image.get_extent()
+            left, right, bottom, top = image.get_extent()
             # Sample-centred: the first anchor sits half a cell in from the left edge.
             spacing = float(np.median(np.diff(anchors))) * seconds_per_step
             assert left == pytest.approx(anchors[0] * seconds_per_step - spacing / 2.0)
             assert right == pytest.approx(
                 anchors[0] * seconds_per_step + (len(anchors) - 0.5) * spacing
             )
+            # One cell per candidate lag, lag 0 at the bottom: the y-extent is the bank length.
+            assert (bottom, top) == (-0.5, n_lags - 0.5)
+            assert image.get_array().shape[0] == n_lags
     finally:
         plt.close(figure)
 
