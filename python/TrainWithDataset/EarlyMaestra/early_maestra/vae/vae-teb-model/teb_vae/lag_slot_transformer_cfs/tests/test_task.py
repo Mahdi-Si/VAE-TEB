@@ -12,15 +12,23 @@ reason recorded, rather than left to fail.
 """
 from __future__ import annotations
 
+from types import SimpleNamespace
+from typing import Dict, Optional
+
 import pytest
 import torch
 
 from teb_vae.lag_attn_cfs.task import SeqVaeLagAttnCfsTask
+from teb_vae.lag_attn_rws.nets.losses import masked_raw_block_per_anchor
+from teb_vae.lag_attn_rws.nets.raw_masks import forecast_mask
 from teb_vae.lag_attn_rws.task import SeqVaeLagAttnRwsTask
 from teb_vae.lag_attn_transformer_rws.task import SeqVaeLagAttnTrfRwsTask
 from teb_vae.lag_slot_transformer_cfs.task import (
     TASK_METRIC_SUFFIXES,
+    VALIDATION_MC_DRAWS_KEY,
+    VALIDATION_MONITOR_SUFFIXES,
     SeqVaeLagResidualTrfCfsTask,
+    recording_grouped_totals,
 )
 from teb_vae.lag_slot_transformer_cfs.tests.conftest import (
     DECLARED_C_U,
@@ -58,19 +66,25 @@ class StubBatch:
         self.epoch = torch.zeros(TINY_BATCH)
 
 
-def build_task(**overrides) -> SeqVaeLagResidualTrfCfsTask:
+def build_task(
+    *, validation_mc_draws: Optional[int] = None, seed: int = 0, **overrides
+) -> SeqVaeLagResidualTrfCfsTask:
     """Wrap a deterministically built tiny model in the task.
 
     Args:
+        validation_mc_draws: The predictive monitor's draw count, or ``None`` for the legacy
+            surface.
+        seed: The run seed the tiling phase and the noise bank are keyed on.
         **overrides: Constructor keywords for the model.
 
     Returns:
         The task, with its source pathway moved off zero so the two branches differ.
     """
     model = build_tiny_model(**overrides)
-    generator = torch.Generator().manual_seed(31)
-    with torch.no_grad():
-        model.proposal_head.output_proj.weight.normal_(0.0, 0.3, generator=generator)
+    if model.proposal_head is not None:
+        generator = torch.Generator().manual_seed(31)
+        with torch.no_grad():
+            model.proposal_head.output_proj.weight.normal_(0.0, 0.3, generator=generator)
     return SeqVaeLagResidualTrfCfsTask(
         model,
         lr=1e-3,
@@ -78,6 +92,8 @@ def build_task(**overrides) -> SeqVaeLagResidualTrfCfsTask:
         kld_beta=1.0,
         beta_prior=0.1,
         beta_schedule=None,
+        seed=seed,
+        validation_mc_draws=validation_mc_draws,
     )
 
 
@@ -283,3 +299,232 @@ def test_a_batch_missing_a_phase_key_field_is_refused_by_name() -> None:
     batch.guid = None
     with pytest.raises(RuntimeError, match="guid"):
         task.compute_loss_and_metrics(batch, 0, "train")
+
+
+# =================================================================================================
+# The predictive validation monitor
+# =================================================================================================
+def dense_forward(task: SeqVaeLagResidualTrfCfsTask, batch: StubBatch):
+    """One dense forward through the task's own input builders, with the labels beside it.
+
+    Args:
+        task: The task.
+        batch: The batch.
+
+    Returns:
+        ``(outputs, target_features, weight)``.
+    """
+    inputs = task._build_forward_inputs(batch)
+    target_features, weight = task._build_raw_target(batch)
+    torch.manual_seed(0)
+    return task.model(*inputs), target_features, weight
+
+
+def test_the_monitor_is_absent_without_the_key_and_on_the_training_stage() -> None:
+    """A legacy run logs exactly the columns it always did; a tiled batch is never monitored."""
+    legacy = build_task()
+    torch.manual_seed(0)
+    _, metrics = legacy.compute_loss_and_metrics(StubBatch(), 0, "val")
+    assert legacy.hparams.get(VALIDATION_MC_DRAWS_KEY) is None
+    assert not any(name in metrics for name in VALIDATION_MONITOR_SUFFIXES)
+
+    monitored = build_task(validation_mc_draws=2)
+    torch.manual_seed(0)
+    _, tiled = monitored.compute_loss_and_metrics(StubBatch(), 0, "train")
+    assert not any(name in tiled for name in VALIDATION_MONITOR_SUFFIXES)
+    torch.manual_seed(0)
+    _, dense = monitored.compute_loss_and_metrics(StubBatch(), 0, "val")
+    for name in VALIDATION_MONITOR_SUFFIXES:
+        assert name in dense and torch.isfinite(dense[name]), name
+    assert torch.equal(dense["pred_gap_mc"], dense["pred_nll_base_mc"] - dense["pred_nll_full_mc"])
+
+
+def test_with_one_draw_the_monitor_is_the_unweighted_conditional_score_of_its_draw() -> None:
+    """The mixture over one draw is that draw's block score, unweighted, averaged over anchors.
+
+    Recomputed by hand from the same noise bank: the decoder at the single latent draw, the
+    objective's own elementwise score on the objective's own mask with no channel or horizon
+    weight, and the anchor mean -- which on this batch equals the recording-grouped mean because
+    every sample is its own recording with the same scored-anchor count.
+    """
+    task = build_task(validation_mc_draws=1)
+    batch = StubBatch()
+    outputs, target_features, weight = dense_forward(task, batch)
+    monitor = task._predictive_monitor(batch, outputs, target_features, weight, 1)
+
+    model = task.orig_model
+    anchors = outputs["anchor_index"]
+    target = model._build_forecast_target(target_features, anchors)
+    mask, _ = forecast_mask(
+        model.scored_weight(weight),
+        model.geometry,
+        coverage_floor=model.coverage_floor,
+        anchors=anchors,
+        anchor_valid=outputs["anchor_valid"],
+    )
+    generator = task.validation_noise_generator(batch, anchors.device)
+    epsilon = torch.empty_like(outputs["mu_post"]).normal_(generator=generator)
+    expected: Dict[str, torch.Tensor] = {}
+    for column, mu_key, logvar_key in (
+        ("pred_nll_full_mc", "mu_post", "logvar_post"),
+        ("pred_nll_base_mc", "mu_prior", "logvar_prior"),
+    ):
+        latent = outputs[mu_key] + epsilon * torch.exp(0.5 * outputs[logvar_key])
+        forecast_mu, forecast_logvar = model.decoder(latent, persistence=outputs.get("persistence"))
+        block, contributing = masked_raw_block_per_anchor(
+            forecast_mu, target, mask, likelihood="gaussian_nll", logvar=forecast_logvar
+        )
+        expected[column] = (block * contributing).sum() / contributing.sum()
+    # The same scored-anchor count in every sample, so the anchor mean and the recording mean
+    # coincide and the hand computation above is the monitor's estimand exactly.
+    assert bool((mask.sum(dim=(1, 2)) == mask[0].sum()).all())
+    for column, value in expected.items():
+        assert torch.allclose(monitor[column].double(), value.double(), rtol=1e-5, atol=1e-6), column
+    # The gap is the difference of the two logged columns in their own dtype, as the objective
+    # forms its own; a difference of two single-precision block scores carries their rounding.
+    assert torch.allclose(
+        monitor["pred_gap_mc"].double(),
+        (expected["pred_nll_base_mc"] - expected["pred_nll_full_mc"]).double(),
+        rtol=1e-3,
+        atol=1e-3,
+    )
+    # And it is the paired difference of the two branches: on this batch the full branch has
+    # moved off the prior, so the gap is not the exact zero of a matched pair.
+    assert float(monitor["pred_gap_mc"]) != 0.0
+
+
+def test_the_monitor_reads_a_fixed_noise_bank() -> None:
+    """Two validation passes at the same weights report the same value, bitwise.
+
+    The objective's own columns move with the process RNG between the two passes, which is what
+    shows the monitor's determinism is the bank's rather than the process's.
+    """
+    task = build_task(validation_mc_draws=4)
+    torch.manual_seed(1)
+    _, first = task.compute_loss_and_metrics(StubBatch(), 0, "val")
+    torch.manual_seed(2)
+    _, second = task.compute_loss_and_metrics(StubBatch(), 0, "val")
+    for name in VALIDATION_MONITOR_SUFFIXES:
+        assert torch.equal(first[name], second[name]), name
+    assert not torch.equal(first["nll_full_block"], second["nll_full_block"])
+
+
+def test_the_bank_is_keyed_on_the_segments_and_the_run_seed() -> None:
+    """Another recording in the batch, or another run seed, is another bank."""
+    task = build_task(validation_mc_draws=4, seed=3)
+    batch = StubBatch()
+    reference = task.validation_noise_generator(batch, torch.device("cpu")).initial_seed()
+
+    renamed = StubBatch()
+    renamed.guid = list(renamed.guid)
+    renamed.guid[0] = "another-recording"
+    assert task.validation_noise_generator(renamed, torch.device("cpu")).initial_seed() != reference
+
+    reseeded = build_task(validation_mc_draws=4, seed=4)
+    assert reseeded.validation_noise_generator(batch, torch.device("cpu")).initial_seed() != reference
+
+    # And the same batch under the same seed is the same bank, whatever the process RNG did.
+    torch.manual_seed(99)
+    assert task.validation_noise_generator(batch, torch.device("cpu")).initial_seed() == reference
+
+
+def test_the_target_only_arm_reports_an_exactly_zero_predictive_gap() -> None:
+    """The full distribution is the prior, the draws are shared, so the two scores are one."""
+    task = build_task(validation_mc_draws=3, source_disabled=True)
+    torch.manual_seed(0)
+    _, metrics = task.compute_loss_and_metrics(StubBatch(), 0, "val")
+    assert torch.equal(metrics["pred_nll_full_mc"], metrics["pred_nll_base_mc"])
+    assert float(metrics["pred_gap_mc"]) == 0.0
+
+
+def test_a_monitored_batch_that_scored_nothing_reports_zero_rather_than_raising() -> None:
+    """As the objective does on the same batch."""
+    task = build_task(validation_mc_draws=2)
+    batch = StubBatch()
+    batch.weight = torch.zeros_like(batch.weight)
+    torch.manual_seed(0)
+    _, metrics = task.compute_loss_and_metrics(batch, 0, "val")
+    for name in VALIDATION_MONITOR_SUFFIXES:
+        assert float(metrics[name]) == 0.0, name
+
+
+def test_a_non_positive_draw_count_is_refused_at_construction() -> None:
+    """A mixture over no draws is not a score."""
+    with pytest.raises(ValueError, match=VALIDATION_MC_DRAWS_KEY):
+        build_task(validation_mc_draws=0)
+
+
+def test_recording_grouped_totals_weight_recordings_equally() -> None:
+    """A recording contributing two segments counts once; an unscored one is not counted.
+
+    Hand-built: recording ``a`` holds two samples with two and one scored anchors, recording
+    ``b`` one sample with one, and recording ``c`` a sample with nothing scored.
+    """
+    values = torch.tensor(
+        [[1.0, 3.0, 100.0], [5.0, 100.0, 100.0], [7.0, 100.0, 100.0], [9.0, 9.0, 9.0]]
+    )
+    contributing = torch.tensor(
+        [[1.0, 1.0, 0.0], [1.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 0.0]]
+    )
+    total, count = recording_grouped_totals(values, contributing, ["a", "a", "b", "c"])
+    # a: (1 + 3 + 5) / 3 = 3; b: 7 / 1 = 7; c: unscored.
+    assert float(count) == 2.0
+    assert float(total) == pytest.approx(3.0 + 7.0)
+    with pytest.raises(ValueError, match="one per sample"):
+        recording_grouped_totals(values, contributing, ["a", "b"])
+
+
+# =================================================================================================
+# The clip fraction
+# =================================================================================================
+def set_gradient_norm(task: SeqVaeLagResidualTrfCfsTask, norm: float) -> None:
+    """Give the task's parameters a gradient whose total norm is exactly ``norm``.
+
+    Args:
+        task: The task.
+        norm: The total gradient norm to plant.
+    """
+    parameters = [parameter for parameter in task.parameters()]
+    for parameter in parameters:
+        parameter.grad = torch.zeros_like(parameter)
+    parameters[0].grad.view(-1)[0] = float(norm)
+
+
+def test_the_clip_fraction_counts_every_optimizer_step_of_the_epoch() -> None:
+    """Steps between the sampled ones are counted too, and the last batch logs the fraction.
+
+    Four steps against a clip of one, two of them over it, only the last on the logging cadence:
+    the logged fraction is one half, not the last step's own zero-or-one.
+    """
+    task = build_task()
+    logged: Dict[str, torch.Tensor] = {}
+    task.log = lambda name, value, **kwargs: logged.__setitem__(name, value.detach().clone())
+    task._on_train_epoch_start_hook()
+
+    for norm, last in ((2.0, False), (0.5, False), (3.0, False), (0.1, True)):
+        task._trainer = SimpleNamespace(gradient_clip_val=1.0, is_last_batch=last, global_step=7)
+        set_gradient_norm(task, norm)
+        task.on_before_optimizer_step(optimizer=None)
+    assert float(logged["train/grad_clip_frac"]) == pytest.approx(0.5)
+    assert float(logged["train/grad_norm"]) == pytest.approx(0.1)
+
+    # A new epoch starts its own count.
+    task._on_train_epoch_start_hook()
+    task._trainer = SimpleNamespace(gradient_clip_val=1.0, is_last_batch=True, global_step=8)
+    set_gradient_norm(task, 0.2)
+    task.on_before_optimizer_step(optimizer=None)
+    assert float(logged["train/grad_clip_frac"]) == 0.0
+
+
+def test_no_clip_fraction_is_logged_without_a_positive_clip() -> None:
+    """A fraction against no threshold answers no question; the norm is still logged."""
+    task = build_task()
+    logged: Dict[str, torch.Tensor] = {}
+    task.log = lambda name, value, **kwargs: logged.__setitem__(name, value.detach().clone())
+    task._on_train_epoch_start_hook()
+    for clip in (None, 0.0):
+        task._trainer = SimpleNamespace(gradient_clip_val=clip, is_last_batch=True, global_step=0)
+        set_gradient_norm(task, 4.0)
+        task.on_before_optimizer_step(optimizer=None)
+        assert "train/grad_clip_frac" not in logged
+        assert float(logged["train/grad_norm"]) == pytest.approx(4.0)

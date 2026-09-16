@@ -26,6 +26,11 @@ ANALYSIS_DIRNAME = "lag_suppression"
 #: the predictive margin with its interval. What the lag figures are drawn from.
 LAG_PROFILE_FILENAME = "lag_profile.csv"
 
+#: The segments the predictive single-lag profile was scored on: one row per admitted segment
+#: with its recording, stored time, clinical class and subgroup, so the margins in the table
+#: above name the population they were read over.
+LAG_PROFILE_SEGMENTS_FILENAME = "lag_profile_segments.csv"
+
 #: The figures, by stem.
 BAND_FIGURE = "band_suppression"
 PROFILE_FIGURE = "lag_profile"
@@ -121,6 +126,13 @@ def run_lag_suppression_analysis(
     rows = lag_profile_rows(results)
     write_rows(directory / LAG_PROFILE_FILENAME, rows)
     written: List[str] = [LAG_PROFILE_FILENAME] if rows else []
+    predictive_block = (
+        ((results.get("lag_readouts") or {}).get("lag_profile") or {}).get("predictive") or {}
+    )
+    cohort_rows = [dict(row) for row in predictive_block.get("segments") or []]
+    if cohort_rows:
+        write_rows(directory / LAG_PROFILE_SEGMENTS_FILENAME, cohort_rows)
+        written.append(LAG_PROFILE_SEGMENTS_FILENAME)
     for stem, figure in (
         (BAND_FIGURE, figures.build_band_figure(results)),
         (PROFILE_FIGURE, figures.build_lag_profile_figure(results)),
@@ -146,6 +158,7 @@ __all__ = [
     "ANALYSIS_DIRNAME",
     "BAND_FIGURE",
     "LAG_PROFILE_FILENAME",
+    "LAG_PROFILE_SEGMENTS_FILENAME",
     "PROFILE_FIGURE",
     "lag_profile_rows",
     "run_lag_suppression_analysis",

@@ -105,6 +105,44 @@ def test_the_metadata_clock_is_transferred_rather_than_re_zeroed() -> None:
     assert torch.equal(model.clock_proj.weight, state["clock_proj.weight"])
 
 
+def test_the_clock_normaliser_is_transferred_beside_its_projection() -> None:
+    """The projection reads the normaliser's output, so the two are one trained component.
+
+    Copying the projection and leaving the normaliser's affine at its constructed values would
+    pair a trained weight with an untrained input scale, and the base forecast would not equal
+    the donor's. The transfer is checked on the forecast rather than on the tensors alone: a
+    warm-started model and its donor must agree bitwise on a fixture batch with the source
+    pathway at zero.
+    """
+    donor = build_tiny_model(seed=5)
+    generator = torch.Generator().manual_seed(5)
+    with torch.no_grad():
+        for name, tensor in donor.state_dict().items():
+            if name.startswith(("clock_norm.", "clock_proj.")) and tensor.is_floating_point():
+                tensor.add_(torch.randn(tensor.shape, generator=generator) * 0.3)
+        donor.proposal_head.zero_output()
+    state = {
+        name: tensor.clone()
+        for name, tensor in donor.state_dict().items()
+        if name.startswith(TRANSFERABLE_PREFIXES)
+    }
+
+    model = build_tiny_model()
+    report = transfer_target_weights(model, state)
+
+    assert any(name.startswith("clock_norm.") for name in report["transferred"])
+    for name in ("clock_norm.weight", "clock_norm.bias"):
+        assert torch.equal(model.state_dict()[name], state[name]), name
+    donor.eval()
+    model.eval()
+    torch.manual_seed(0)
+    expected = donor(*tiny_streams(), anchor_phase=0, anchor_stride=1)
+    torch.manual_seed(0)
+    actual = model(*tiny_streams(), anchor_phase=0, anchor_stride=1)
+    assert torch.equal(actual["mu_base"], expected["mu_base"])
+    assert torch.equal(actual["mu_prior"], expected["mu_prior"])
+
+
 def test_a_donor_without_a_clock_leaves_it_at_its_constructed_zero() -> None:
     """A target-only model of another architecture carries no such tensor.
 
@@ -248,6 +286,33 @@ def test_the_mean_only_arm_and_the_full_arm_have_incompatible_state_dicts() -> N
     lean = build_tiny_model(mean_only_residual=True)
     with pytest.raises(RuntimeError):
         lean.load_state_dict(full.state_dict())
+
+
+def test_a_checkpoint_of_one_lag_window_refuses_to_load_into_another_naming_the_embedding() -> None:
+    """The lag embedding has one row per candidate lag, so two windows are two shapes.
+
+    A strict load refuses by name with both shapes. Cropping the table to fit would also carry
+    the wider window's summation scale into a model whose own is larger, so the refusal is the
+    correct outcome and a shorter-window arm starts from the target-only donor instead.
+    """
+    wide = build_tiny_model()
+    narrow = build_tiny_model(max_lag=wide.max_lag - 2)
+    name = "proposal_head.lag_embedding.weight"
+
+    with pytest.raises(RuntimeError, match=name) as caught:
+        narrow.load_state_dict(wide.state_dict())
+
+    # Both shapes are named: the checkpoint's row count and this model's.
+    message = str(caught.value)
+    assert f"[{wide.n_lags}, {wide.proposal_head.lag_embed_dim}]" in message
+    assert f"[{narrow.n_lags}, {narrow.proposal_head.lag_embed_dim}]" in message
+    # And the target-only transfer path is indifferent to the window: nothing it copies is
+    # indexed by lag, so a donor of one window warm-starts a model of another.
+    report = transfer_target_weights(narrow, {
+        key: tensor for key, tensor in wide.state_dict().items()
+        if key.startswith(TRANSFERABLE_PREFIXES)
+    })
+    assert report["transferred"] and report["missing"] == []
 
 
 def test_the_model_kind_is_stamped_on_the_class() -> None:

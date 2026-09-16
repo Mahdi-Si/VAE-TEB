@@ -36,7 +36,10 @@ from teb_vae.lag_attn_cfs.tests.conftest import absolutize_dataset_paths
 from teb_vae.lag_attn_rws.trainer import RESOLVED_CONFIG_FILENAME
 from teb_vae.lag_slot_transformer_cfs import trainer as trainer_module
 from teb_vae.lag_slot_transformer_cfs.nets.model import SeqVaeLagResidualTrfCfs
-from teb_vae.lag_slot_transformer_cfs.task import TASK_METRIC_SUFFIXES
+from teb_vae.lag_slot_transformer_cfs.task import (
+    TASK_METRIC_SUFFIXES,
+    VALIDATION_MONITOR_SUFFIXES,
+)
 from teb_vae.lag_slot_transformer_cfs.trainer import (
     LagResidualTrfCfsTrainer,
     strip_task_prefix,
@@ -167,6 +170,24 @@ def test_this_architecture_s_own_readouts_reach_the_history(fitted) -> None:
         assert history[column].dropna().notna().all(), column
 
 
+def test_the_predictive_monitor_reaches_the_history_on_the_validation_stage(fitted) -> None:
+    """The smoke configuration sets the draw count, so the three columns exist and are finite.
+
+    On the validation stage alone: a training batch is tiled and is never monitored, so a
+    ``train/`` column under these names would be empty in every row.
+    """
+    _, history = fitted
+    for suffix in VALIDATION_MONITOR_SUFFIXES:
+        column = f"val/{suffix}"
+        assert column in history.columns, column
+        values = history[column].dropna()
+        assert len(values) == len(history), column
+        assert values.notna().all(), column
+        assert f"train/{suffix}" not in history.columns
+    gap = history["val/pred_nll_base_mc"] - history["val/pred_nll_full_mc"]
+    assert (gap - history["val/pred_gap_mc"]).abs().max() < 1e-4
+
+
 def test_no_column_names_a_tensor_this_architecture_lacks(fitted) -> None:
     """The inherited surface names three groups this objective does not produce.
 
@@ -217,8 +238,11 @@ def test_the_gradient_distribution_is_recorded_for_the_next_operator(fitted) -> 
     # of the norm is an aggregate, so "how often did the clip bind" is recoverable from no other
     # recorded quantity -- and a run where it binds every step is optimising little but weight
     # decay while every other column looks healthy.
+    # A fraction of the epoch's optimizer steps, counted over every step, so each row lies in
+    # the unit interval and is not merely the last sampled step's zero or one.
     fraction = history["train/grad_clip_frac"].dropna()
-    assert len(fraction) > 0
+    assert len(fraction) == len(history)
+    assert float(fraction.min()) >= 0.0 and float(fraction.max()) <= 1.0
     assert float(fraction.max()) < 1.0, "the inherited clip rescales every step"
 
     # The spike breaker's own surface, without which a run that trained normally and then skipped

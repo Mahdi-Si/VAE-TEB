@@ -32,6 +32,12 @@
 #   python -m teb_vae.lag_slot_transformer_cfs.trainer \
 #       --config teb_vae/lag_slot_transformer_cfs/configs/capacity_control.yaml
 
+# WHICH BANK IT CONTROLS FOR. `base:` names the bank profile this arm is the control of. It is
+# rebased on `lag25.yaml` once the bank-length comparison has found the shortened bank competitive
+# under the predeclared tolerance, and stays on `joint.yaml` otherwise; the operator runbook in the
+# evaluation guide records that decision before this arm is trained. One line, and everything the
+# arm holds fixed -- the warm start, the selection rule, the geometry -- follows from it.
+
 base: joint.yaml
 
 general_config:

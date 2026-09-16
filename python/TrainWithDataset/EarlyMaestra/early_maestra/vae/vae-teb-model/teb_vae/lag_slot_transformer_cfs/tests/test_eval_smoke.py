@@ -73,15 +73,16 @@ def test_the_full_run_completes_with_exit_code_zero(slot_collected_run) -> None:
 def test_every_registered_analysis_contributes_a_step_record(slot_collected_run) -> None:
     """Every selectable analysis, the unskippable channel map, and the loader probe: a step each,
     every one ok. The registry is the family's less the two this architecture cannot produce, plus
-    this cell's own six -- so this is also the assertion that binding the family's runner did not
-    silently drop a question."""
+    this cell's own thirteen -- so this is also the assertion that binding the family's runner did
+    not silently drop a question."""
     steps = {record["name"]: record["status"] for record in slot_collected_run["summary"]["steps"]}
 
     expected = {"probe", *run_module.UNSKIPPABLE_ANALYSES, *_registry()}
     assert expected <= set(steps), sorted(expected - set(steps))
     assert {"arms", "lag_suppression", "resolved_axes", "samples", "recording_traces",
-            "attribution"} <= set(steps)
-    assert not {"attention", "lag_kl", "source_null", "occlusion", "lag_clocks",
+            "attribution", "proposal_profile", "proposal_clocks", "band_clocks",
+            "high_kl_anchors", "warmup", "source_null", "spectral_skill"} <= set(steps)
+    assert not {"attention", "lag_kl", "occlusion", "lag_clocks",
                 "lag_kld_scaled", "lag_high_kl"} & set(steps)
     assert all(status == "ok" for status in steps.values()), steps
 
@@ -141,10 +142,15 @@ def test_the_shared_tables_carry_the_familys_columns_and_none_of_the_attention_o
         "pred_gap_warm_lo", "pred_gap_warm_mid", "pred_gap_warm_hi", "anchors_per_sample",
         "target_warm_frac", "mean_logvar_prior", "logvar_prior_floor_frac", "mean_logvar_full",
         "logvar_full_floor_frac", "logvar_full_ceil_frac", "delta_mu_sat_frac_masked",
+        "nll_full_block_weighted", "nll_base_block_weighted", "pred_gap_weighted",
     } <= columns, sorted(columns)
+    # The family's availability-clock pair, from the zeroed-source arm, and the per-segment
+    # margins the clock-resolved readouts bin.
+    assert {"kld_source_null", "coupling_minus_clock", "margin_silence", "margin_replace_zeros",
+            "margin_permute"} <= columns
+    assert any(name.startswith("margin_suppress_") for name in columns)
     assert not columns & {
-        "attention_entropy_nats", "source_lag_warmth_frac_st", "kld_source_null",
-        "coupling_minus_clock", "lag_map_identity_max_abs",
+        "attention_entropy_nats", "source_lag_warmth_frac_st", "lag_map_identity_max_abs",
     }
 
 
@@ -198,11 +204,20 @@ def test_the_matched_gap_carries_a_recording_level_interval(slot_collected_run) 
 
 def test_both_summaries_are_reported_separately(slot_collected_run) -> None:
     """They differ whenever recordings contribute unequal anchor counts, which is always, and a
-    run carrying one of them cannot separate a real effect from a length effect."""
+    run carrying one of them cannot separate a real effect from a length effect. The third,
+    anchor-within-recording estimand travels beside them under its own block with the same
+    bootstrap and pairing, and its headline columns sit on the per-recording table."""
     results = _results(slot_collected_run)
 
     assert "pred_gap" in results["arm_scores"]
     assert "pred_gap" in results["anchor_weighted"]
+    within = results["anchor_within_recording"]
+    assert within["arm_scores"]["pred_gap"]["n"] == results["arm_scores"]["pred_gap"]["n"]
+    assert set(within["band_margins"]) == set(results["lag_readouts"]["band_edges"]) | {"none", "all"}
+    assert set(within["control_margins"]) == {"silence", "replace_zeros", "replace_constant", "permute"}
+    first = next(iter(results["per_recording"].values()))
+    assert {"nll_base_anchor_weighted", "nll_full_anchor_weighted", "pred_gap_anchor_weighted"} <= set(first)
+    assert "headline_estimator" in results["conventions"]
 
 
 def test_the_reference_arms_are_exact_on_real_weights(slot_collected_run) -> None:
@@ -261,8 +276,21 @@ def test_the_lag_profile_reads_every_lag_in_latent_space_and_the_capped_ones_pre
     predictive = profile["predictive"]
     assert predictive["status"] == "READ"
     assert predictive["cap"] == COHORT_PROFILE_SEGMENTS
-    assert 0 < predictive["n_segments"] <= COHORT_PROFILE_SEGMENTS + 4
+    assert 0 < predictive["n_segments"] <= COHORT_PROFILE_SEGMENTS
     assert len(predictive["margin_nats"]["point"]) == n_lags
+    # The cohort is declared: every admitted segment by identity, the composition summing to
+    # the count, the per-class quota over the three classes the cohort shards declare, and the
+    # same rows written beside the per-lag table.
+    assert len(predictive["segments"]) == predictive["n_segments"]
+    assert sum(predictive["composition"].values()) == predictive["n_segments"]
+    assert set(predictive["quota"]) == {"healthy", "acidosis", "hie"}
+    assert max(predictive["composition"].values()) <= max(predictive["quota"].values())
+    table_path = (
+        Path(slot_collected_run["results_dir"]) / lag_suppression.ANALYSIS_DIRNAME
+        / lag_suppression.LAG_PROFILE_SEGMENTS_FILENAME
+    )
+    rows = list(csv.DictReader(table_path.read_text(encoding="utf-8").splitlines()))
+    assert [row["guid"] for row in rows] == [row["guid"] for row in predictive["segments"]]
 
 
 def test_the_resolved_axes_and_the_mixture_calibration_are_carried(slot_collected_run) -> None:
@@ -277,7 +305,18 @@ def test_the_resolved_axes_and_the_mixture_calibration_are_carried(slot_collecte
     assert results["block_resolved"]["positions"] == ["st", "ph"]
     for branch in ("base", "full"):
         assert results["mixture_calibration"][branch]["n_coefficients"] > 0
+        resolved = results["mixture_calibration"][branch]["resolved"]
+        assert len(resolved["by_horizon"]["n_coefficients"]) == len(steps)
+        assert len(resolved["by_block"]["n_coefficients"]) == 2
     assert results["calibration"]["n_coefficients"] > 0
+    # The sufficiency probe's interpretation is marked unavailable beside its own block.
+    assert results["sufficiency_qualification"]["interpretation"] == "UNAVAILABLE"
+    assert results["sufficiency_qualification"]["block"] == "sufficiency"
+    # The weighted parity columns travel on the shared table beside the unweighted ones.
+    conventions = results["conventions"]
+    assert set(conventions["estimators"]) == {
+        "weighted_objective", "single_draw_conditional", "latent_mean", "predictive_mixture",
+    }
 
 
 def test_the_traces_and_attributions_ran_under_the_familys_names(slot_collected_run) -> None:
@@ -322,8 +361,16 @@ def test_the_acceptance_gate_passes_on_what_the_run_wrote(slot_collected_run) ->
     gap_verdict = next(
         record for record in result["verdicts"] if record["name"] == "predictive_gap_measured"
     )
-    assert gap_verdict["status"] == "INCONCLUSIVE"
+    # The gate and the summary read one interval: whatever it says, they say it together.
+    listed = {
+        record["name"]: record["status"] for record in _results(slot_collected_run)["verdicts"]
+    }
+    assert gap_verdict["status"] == listed["predictive_improvement"]
+    assert gap_verdict["status"] == eval_verify.interval_status(
+        gap_verdict["ci_lo"], gap_verdict["ci_hi"]
+    )
     assert gap_verdict["pred_gap_nats"] is not None
+    assert _results(slot_collected_run)["schema_version"] == 2
 
 
 def test_the_per_recording_table_carries_what_the_intervals_were_built_from(slot_collected_run) -> None:
@@ -359,10 +406,102 @@ def test_the_run_records_its_provenance_where_the_family_records_it(slot_collect
 
 
 # =================================================================================================
+# The short-bank profile under the target input ablation
+# =================================================================================================
+def _short_results(run: Dict[str, Any]) -> Dict[str, Any]:
+    """The short-bank run's own blocks, and the window it was scored over."""
+    return run["summary"]["results"]
+
+
+def test_the_short_bank_ablated_run_completes_and_declares_its_window(slot_short_collected_run) -> None:
+    """A lag axis of another length, read off the checkpoint rather than off any literal: the
+    summary's axis, its causality record and the fit's own resolved window all agree."""
+    import yaml
+
+    run = slot_short_collected_run
+    assert run["exit_code"] == 0
+    resolved = yaml.safe_load(
+        (run["checkpoint"].parent / "resolved_config.yaml").read_text(encoding="utf-8")
+    )
+    window = int(resolved["model_config"]["VAE_model"]["max_lag"]) + 1
+    results, causality = _short_results(run), run["summary"]["causality"]
+
+    assert results["lag_readouts"]["lag_axis"]["n_lags"] == window
+    assert causality["searched_lag_steps"] == window
+    assert causality["furthest_searched_lag"] == window - 1
+    assert causality["oldest_lag_seconds"] == (window - 1) * results["lag_readouts"]["lag_axis"]["seconds_per_step"]
+    assert len(results["lag_readouts"]["exposure"]["per_lag_anchors"]) == window
+    assert len(results["lag_readouts"]["lag_profile"]["latent"]["proposal_norm"]) == window
+
+
+def test_the_short_bank_run_scores_the_six_declared_bands_and_keeps_the_identities(
+    slot_short_collected_run, slot_short_overrides
+) -> None:
+    """The four partition bands and the two cross-window bands all report margins, and the joint
+    removal of every declared band still reproduces the silenced arm exactly."""
+    import yaml
+
+    declared = yaml.safe_load(Path(slot_short_overrides).read_text(encoding="utf-8"))["eval_config"]["occlusion_bands"]
+    results = _short_results(slot_short_collected_run)
+    bands = results["lag_readouts"]["band_suppression"]
+    scores = results["arm_scores"]
+
+    assert [name for name in bands if name not in ("none", "all")] == list(declared)
+    assert results["lag_readouts"]["band_edges"] == {name: list(span) for name, span in declared.items()}
+    for name in declared:
+        assert bands[name]["margin_nats"] is not None, name
+    assert abs(scores["nll_suppress:all"]["point"] - scores["nll_silence"]["point"]) <= eval_verify.EXACT_MARGIN_TOLERANCE
+    assert abs(scores["nll_suppress:none"]["point"] - scores["nll_full"]["point"]) <= eval_verify.EXACT_MARGIN_TOLERANCE
+
+
+def test_the_short_bank_run_discloses_the_ablated_input_everywhere_it_is_read(slot_short_collected_run) -> None:
+    """The causality record, the arm block and the attribution stage all name the same ablated
+    coordinate, and the attribution through it is exactly zero."""
+    run = slot_short_collected_run
+    results, causality = _short_results(run), run["summary"]["causality"]
+    effective = causality["effective_inputs"]
+
+    assert effective["zero_fhr_scattering_s0"] is True and effective["zero_up_scattering_s0"] is False
+    assert [entry["field"] for entry in effective["ablated_inputs"]] == ["fhr_st"]
+    assert results["arm"]["zero_fhr_scattering_s0"] is True
+    assert results["arm"]["ablated_inputs"][0]["channel"] == 0
+    attribution = results["attribution"]
+    assert attribution["ablated_inputs"]["coordinates"][0]["status"] == "ablated"
+    assert attribution["checks"]["ablated_input_max_abs"] == 0.0
+    assert eval_verify.verify(run["summary"])["failed"] == []
+
+
+def test_the_acceptance_pass_reads_the_short_bank_run_under_its_own_windows_family(
+    slot_short_collected_run, tmp_path
+) -> None:
+    """The run searched bands the wide family does not name, and is read under the family the
+    plan declares for its window rather than failed for them."""
+    from teb_vae.lag_slot_transformer_cfs.eval import acceptance
+    from teb_vae.lag_slot_transformer_cfs.tests.test_acceptance import plan_with
+
+    run = slot_short_collected_run
+    plan = plan_with(tmp_path, primary_draws=2, minimum_training_seeds=1, bootstrap_resamples=100)
+    discovered = acceptance.discover_runs(str(run["results_dir"]))
+    record = acceptance.assess(discovered, plan=plan)
+    window = run["summary"]["causality"]["searched_lag_steps"]
+    band_verdict = next(entry for entry in record["verdicts"] if entry["name"] == "bands_were_predeclared")
+    bands = record["selection"]["exploratory_bands"]["candidate"]
+
+    assert len(discovered) == 1
+    assert discovered[0]["searched_lag_steps"] == window
+    assert acceptance.run_descriptor(discovered[0])["zero_fhr_scattering_s0"] is True
+    assert bands["status"] == "READ" and bands["lag_window"] == window
+    assert bands["declared_bands"] == plan["exploratory_band_families"][window]
+    assert bands["undeclared_bands"] == []
+    assert band_verdict["status"] == "PASS"
+
+
+# =================================================================================================
 # The one pass
 # =================================================================================================
 def test_this_file_starts_no_run_of_its_own() -> None:
-    """The suite performs exactly one end-to-end pass and every artifact assertion reads it."""
+    """The suite performs exactly one end-to-end pass per profile and every artifact assertion
+    reads one of them."""
     source = Path(__file__).read_text(encoding="utf-8")
 
     calls = [

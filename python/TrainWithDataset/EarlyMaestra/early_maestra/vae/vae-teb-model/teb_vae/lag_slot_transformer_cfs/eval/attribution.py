@@ -26,15 +26,23 @@ emits it as an unskippable step; this cell's pass does not, so the frequency-ban
 empty for a reason about the runner rather than about the model. The stage builds it through the
 same function, from the same shards and the same resolved budget, and records a skip by name when
 the shards carry no channel provenance.
+
+**An ablated input coordinate is marked, and its attribution is asserted to be zero.** The model
+applies its input ablation as the first step of its forward, so an integrated gradient with
+respect to an ablated coordinate is exactly zero by construction; the stage reads that back off
+the written example maps and refuses the run if it is not, because an ablated coordinate that
+attracted attribution would mean the ablation is not at the input boundary.
 """
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Dict, Mapping, Optional
+from typing import Any, Dict, List, Mapping, Optional
 
+import numpy as np
 import pandas as pd
 from loguru import logger
 
+from teb_vae.lag_attn.eval.band_partition import KIND_ORDER0
 from teb_vae.lag_attn_cfs.eval import attribution_pass, lag_axis
 from teb_vae.lag_attn_cfs.eval import attributions as core
 from teb_vae.lag_attn_cfs.eval._reuse import labels
@@ -43,6 +51,82 @@ from teb_vae.lag_attn_cfs.eval.dataset_rows import dataset_index_map
 #: Status values the summary block carries.
 STATUS_SKIPPED = "SKIPPED"
 STATUS_ATTRIBUTED = "ATTRIBUTED"
+
+#: The per-coordinate marker table the stage writes beside the family's tables: one row per
+#: ablated input coordinate, with the largest attribution any example map assigned to it.
+ABLATED_INPUTS_FILENAME = "attribution_ablated_inputs.csv"
+
+#: The status an ablated coordinate carries in that table and in the summary block.
+STATUS_ABLATED = "ablated"
+
+
+def ablated_input_check(model: Any, directory: Path) -> Dict[str, Any]:
+    """Mark every ablated input coordinate and read its attribution off the written maps.
+
+    Args:
+        model: The rebuilt net, for its input policy.
+        directory: The attribution stage's own directory, where the example maps were written.
+
+    Returns:
+        ``{'coordinates': [...], 'max_abs_attribution': float | None, 'measured_on': ...}``. The
+        list is empty on a model with no ablation. The maximum is ``None`` when no example map
+        was written, which is a measurement the stage did not make rather than a zero.
+
+    Raises:
+        ValueError: If any example map assigns a nonzero attribution to an ablated coordinate.
+    """
+    # The model's own record of what it ablates, with the partition's coefficient kind added so
+    # the row can be found in the channel map. Read off the model rather than off the binding's
+    # disclosure, which this module must not import: the binding registers this stage.
+    coordinates: List[Dict[str, Any]] = [
+        {**entry, "kind": KIND_ORDER0} for entry in model.input_ablation_record()["ablated_inputs"]
+    ]
+    if not coordinates:
+        return {"coordinates": [], "max_abs_attribution": None, "measured_on": "no ablation"}
+
+    maps_path = directory / core.MAPS_FILENAME
+    if not maps_path.is_file():
+        for entry in coordinates:
+            entry["max_abs_attribution"] = None
+            entry["status"] = STATUS_ABLATED
+        return {
+            "coordinates": coordinates,
+            "max_abs_attribution": None,
+            "measured_on": "no example map was written, so nothing was read back",
+        }
+
+    largest = 0.0
+    with np.load(maps_path) as handle:
+        for entry in coordinates:
+            key = f"map_{entry['stream']}"
+            if key not in handle:
+                entry["max_abs_attribution"] = None
+                entry["status"] = STATUS_ABLATED
+                continue
+            field = np.asarray(handle[key], dtype=np.float64)
+            # The maps are indexed by the declared input axis of each stream, on which the
+            # ablated coordinate sits at the channel the policy names.
+            value = float(np.nanmax(np.abs(field[..., int(entry["channel"])]))) if field.size else 0.0
+            entry["max_abs_attribution"] = value
+            entry["status"] = STATUS_ABLATED
+            largest = max(largest, value)
+    if largest > 0.0:
+        offending = [
+            f"{entry['field']}[{entry['channel']}]"
+            for entry in coordinates
+            if (entry.get("max_abs_attribution") or 0.0) > 0.0
+        ]
+        raise ValueError(
+            f"an ablated input coordinate received a nonzero attribution: {offending}, largest "
+            f"{largest:.3g}. The ablation is applied as the first step of the forward, so the "
+            f"gradient with respect to an ablated coordinate is exactly zero by construction; a "
+            f"nonzero value here means some path read the original stream."
+        )
+    return {
+        "coordinates": coordinates,
+        "max_abs_attribution": largest,
+        "measured_on": f"every example map in {core.MAPS_FILENAME}",
+    }
 
 
 def ensure_channel_map(config: Mapping[str, Any], model: Any, results_dir: Any) -> Dict[str, Any]:
@@ -127,7 +211,30 @@ def run_attribution(
         spectral=None,
         delay_steps=0,
     )
-    return {"status": STATUS_ATTRIBUTED, "channel_map": channel_record, "directory": core.ANALYSIS_DIRNAME, **block}
+    directory = Path(str(results_dir)) / core.ANALYSIS_DIRNAME
+    ablated = ablated_input_check(model, directory)
+    if ablated["coordinates"]:
+        pd.DataFrame(ablated["coordinates"]).to_csv(directory / ABLATED_INPUTS_FILENAME, index=False)
+        block["files"] = [*block.get("files", []), ABLATED_INPUTS_FILENAME]
+    block["checks"] = {
+        **block.get("checks", {}),
+        "ablated_input_max_abs": ablated["max_abs_attribution"],
+    }
+    return {
+        "status": STATUS_ATTRIBUTED,
+        "channel_map": channel_record,
+        "directory": core.ANALYSIS_DIRNAME,
+        "ablated_inputs": ablated,
+        **block,
+    }
 
 
-__all__ = ["STATUS_ATTRIBUTED", "STATUS_SKIPPED", "ensure_channel_map", "run_attribution"]
+__all__ = [
+    "ABLATED_INPUTS_FILENAME",
+    "STATUS_ABLATED",
+    "STATUS_ATTRIBUTED",
+    "STATUS_SKIPPED",
+    "ablated_input_check",
+    "ensure_channel_map",
+    "run_attribution",
+]

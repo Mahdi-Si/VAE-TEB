@@ -41,11 +41,19 @@ FORBIDDEN_TIMELINE_TERMS: Tuple[str, ...] = (
 GEOMETRY_LITERAL_ALLOWLIST: Tuple[str, ...] = (
     "configs/default.yaml",
     "configs/tiny.yaml",
-    # The evaluation override delta, on the same ground as the two above: it is a configuration
-    # file, and the lag bands it declares ARE the geometry of the readout. Their comment restates
-    # each band's own edges beside it, which is what a reader of a partition needs and what the
-    # rule exists to keep out of code.
+    # The profiles that declare a lag window of their own, and their smoke twin: the one leaf
+    # each sets IS the geometry, and a comment that could not say what that leaf resolves to --
+    # the bank length, the summation scale, the oldest centre -- would leave the file unable to
+    # state the one thing it exists to declare.
+    "configs/lag25.yaml",
+    "configs/tiny_lag25.yaml",
+    # The evaluation override deltas, on the same ground as the configurations above: each is a
+    # configuration file, and the lag bands it declares ARE the geometry of the readout. Their
+    # comments restate each band's own edges beside it, which is what a reader of a partition
+    # needs and what the rule exists to keep out of code.
     "eval/configs/eval_overrides.yaml",
+    "eval/configs/lag25_eval_overrides.yaml",
+    "eval/configs/lag91_tail_diagnostic.yaml",
 )
 
 #: Numbers that are geometry when they appear beside a geometry word. Small integers and ratios are

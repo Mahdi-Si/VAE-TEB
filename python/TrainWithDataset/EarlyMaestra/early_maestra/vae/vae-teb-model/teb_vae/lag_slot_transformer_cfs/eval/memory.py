@@ -514,6 +514,7 @@ def main(
     device: Optional[str] = None,
     output: Optional[str] = None,
     batch_sizes: Optional[str] = None,
+    max_lag: Optional[int] = None,
     sources: Optional[Dict[str, str]] = None,
 ) -> int:
     """Measure and record.
@@ -525,6 +526,10 @@ def main(
         output: Where to write the record, or ``None`` to print it only.
         batch_sizes: Comma-separated batch sizes, or ``None`` for the configured training batch and
             its halves -- which is the sweep that settles a batch size rather than confirming one.
+        max_lag: Furthest candidate lag to measure at, replacing the configuration's, or ``None``
+            for the configured one. Two lag windows are compared by measuring one configuration
+            twice under this override, so that nothing but the window differs between the two
+            records; the override is recorded beside the configuration path.
         sources: Where each launch value came from, recorded with the measurement.
 
     Returns:
@@ -534,6 +539,10 @@ def main(
         os.path.join(_REPO_ROOT, "teb_vae", "lag_slot_transformer_cfs", "configs", "default.yaml")
     )
     loaded = load_config(config_path)
+    if max_lag is not None:
+        vae = loaded.setdefault("model_config", {}).setdefault("VAE_model", {})
+        logger.info(f"measuring at max_lag={int(max_lag)} in place of the configured {vae.get('max_lag')}")
+        vae["max_lag"] = int(max_lag)
     # Pinned before anything is built: without it the repeat-run floor below is the device picking a
     # convolution algorithm per call, and the chunking tolerance would inherit that noise.
     numerics = configure_numerics(_NUMERICS_SEED)
@@ -563,6 +572,9 @@ def main(
             else "cpu"
         ),
         "batch_sizes": swept,
+        # The window override, or None when the configuration's own was measured, so two records
+        # of one configuration at two windows say which is which.
+        "max_lag_override": None if max_lag is None else int(max_lag),
         # What was actually in force, read back from global state rather than echoed, so a reader
         # can tell a tolerance measured under a pinned environment from one that was not.
         "numerics": numerics,
@@ -593,6 +605,9 @@ RUN_ARGS: Dict[str, Any] = {
     "output": None,
     # Comma-separated batch sizes, or None for the configured training batch and its halves.
     "batch_sizes": None,
+    # Furthest candidate lag to measure at in place of the configured one, or None. Measure one
+    # configuration twice, once per window, to compare two lag banks with nothing else differing.
+    "max_lag": None,
 }
 
 
@@ -615,6 +630,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output", default=None, help="Where to write the record.")
     parser.add_argument(
         "--batch-sizes", default=None, help="Comma-separated batch sizes to sweep."
+    )
+    parser.add_argument(
+        "--max-lag", dest="max_lag", type=int, default=None,
+        help="Furthest candidate lag to measure at, replacing the configuration's.",
     )
     return parser
 

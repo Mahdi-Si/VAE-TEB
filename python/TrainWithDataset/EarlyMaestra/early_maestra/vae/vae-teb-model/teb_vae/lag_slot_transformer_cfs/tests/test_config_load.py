@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any, Dict, Set
 
 import pytest
+import torch
 import yaml
 
 from teb_vae.lag_slot_transformer_cfs.nets.core import REFUSED_KEYWORDS
@@ -38,6 +39,9 @@ NON_CONSTRUCTOR_KEYS: Set[str] = {
     "lambda_base",
     "likelihood",
     "free_bits",
+    # The predictive validation monitor's draw count: a task hyperparameter the driver applies
+    # after construction, by the route the seed takes, and never a constructor argument.
+    "validation_mc_draws",
     # The causal representation, resolved into the four channel tuples and the novelty vector.
     "causal_reach_budget_s",
     "causal_warmup_budget_steps",
@@ -246,6 +250,122 @@ def test_the_tiny_config_exercises_the_chunked_path() -> None:
     assert block["anchor_chunk"] is not None
     assert block["lag_chunk"] is not None
     assert block["lag_chunk"] < block["max_lag"] + 1
+
+
+#: The keys that describe the data and must agree between a fixture delta and its parent.
+DATA_GEOMETRY_KEYS = (
+    "sequence_length",
+    "horizon",
+    "warmup_period",
+    "causal_warmup_budget_steps",
+    "c_y",
+    "c_u",
+    "anchor_stride",
+)
+
+
+def build_from_config(name: str, **overrides: Any) -> SeqVaeLagResidualTrfCfs:
+    """Build a configuration's model through the same signature sweep the driver applies.
+
+    Ungated, at the declared widths: the warm-up tuples come from the shards, which a test of the
+    configuration does not open. The lag geometry, the anchors and the summation scale do not
+    depend on the gate.
+
+    Args:
+        name: The configuration filename.
+        **overrides: Constructor keywords to replace after the sweep.
+
+    Returns:
+        The constructed model.
+    """
+    parameters = set(inspect.signature(SeqVaeLagResidualTrfCfs.__init__).parameters)
+    kwargs = {key: value for key, value in vae_block(name).items() if key in parameters}
+    kwargs.update(overrides)
+    torch.manual_seed(0)
+    return SeqVaeLagResidualTrfCfs(**kwargs)
+
+
+def test_the_short_bank_profile_builds_the_window_it_declares_and_nothing_else_moves() -> None:
+    """One leaf changed, read back off the model rather than off the file.
+
+    The bank length, the embedding rows, the summation scale and the lag-validity width all
+    follow from that leaf; the anchors, the horizon and the declared widths are the parent's,
+    so the two arms differ in the bank and in nothing else.
+    """
+    block, parent = vae_block("lag25.yaml"), vae_block("joint.yaml")
+    expected_lags = int(block["max_lag"]) + 1
+    for key in DATA_GEOMETRY_KEYS:
+        assert block[key] == parent[key], key
+    assert {key for key in block if block[key] != parent.get(key)} == {"max_lag"}
+
+    model = build_from_config("lag25.yaml").eval()
+    assert model.n_lags == expected_lags
+    assert model.proposal_head.lag_embedding.weight.shape[0] == expected_lags
+    assert model.lag_scale == pytest.approx(expected_lags ** -0.5)
+    assert model.build_lag_mask(model.sequence_length).shape[1] == expected_lags
+
+    steps, split = int(model.sequence_length), int(model.TARGET_BLOCK_SPLIT)
+    y_st = torch.zeros(1, steps, split)
+    y_ph = torch.zeros(1, steps, int(model.c_y) - split)
+    u_stream = torch.zeros(1, steps, int(model.c_u))
+    with torch.no_grad():
+        outputs = model(y_st, y_ph, u_stream, anchor_phase=0, anchor_stride=1, return_proposals=True)
+    dense = int(model.sequence_length) - int(model.warmup_period) - int(model.horizon)
+    assert outputs["lag_valid"].shape == (1, dense, expected_lags)
+    assert outputs["mean_proposals"].shape[2] == expected_lags
+    assert int(outputs["anchor_index"][0, 0]) == int(model.warmup_period)
+    assert int(outputs["anchor_index"][0, -1]) == int(model.sequence_length) - int(model.horizon) - 1
+
+
+def test_a_configuration_that_omits_the_window_builds_the_constructor_default() -> None:
+    """Legacy configurations reconstruct the model they described."""
+    default_max_lag = inspect.signature(SeqVaeLagResidualTrfCfs.__init__).parameters["max_lag"].default
+    block = {key: value for key, value in vae_block("default.yaml").items() if key != "max_lag"}
+    parameters = set(inspect.signature(SeqVaeLagResidualTrfCfs.__init__).parameters)
+
+    torch.manual_seed(0)
+    model = SeqVaeLagResidualTrfCfs(**{k: v for k, v in block.items() if k in parameters})
+
+    assert model.n_lags == int(default_max_lag) + 1
+    assert vae_block("default.yaml")["max_lag"] == default_max_lag
+
+
+def test_the_short_bank_fixture_delta_keeps_the_smoke_settings_and_takes_only_the_window() -> None:
+    """The fixture twin of the short-bank profile: the smoke configuration with that one leaf."""
+    tiny, short = vae_block("tiny.yaml"), vae_block("tiny_lag25.yaml")
+    assert {key for key in short if short[key] != tiny.get(key)} == {"max_lag"}
+    assert short["max_lag"] == vae_block("lag25.yaml")["max_lag"]
+    assert short["lag_chunk"] < short["max_lag"] + 1
+    assert load("tiny_lag25.yaml")["dataset_config"] == load("tiny.yaml")["dataset_config"]
+
+
+@pytest.mark.parametrize(
+    "name,base,leaves",
+    [
+        ("lag25_s0_fhr.yaml", "lag25.yaml", {"zero_fhr_scattering_s0": True}),
+        ("lag25_s0_up.yaml", "lag25.yaml", {"zero_up_scattering_s0": True}),
+        (
+            "lag25_s0_both.yaml",
+            "lag25.yaml",
+            {"zero_fhr_scattering_s0": True, "zero_up_scattering_s0": True},
+        ),
+        ("target_only_s0_fhr.yaml", "target_only.yaml", {"zero_fhr_scattering_s0": True}),
+    ],
+)
+def test_each_ablation_profile_changes_exactly_its_declared_leaves(name, base, leaves) -> None:
+    """A profile that changed a second leaf would attribute two changes to one switch."""
+    block, parent = vae_block(name), vae_block(base)
+    changed = {key: block[key] for key in block if block[key] != parent.get(key)}
+    assert changed == leaves
+    assert load(name)["general_config"]["tag"] != load(base)["general_config"]["tag"]
+
+
+def test_the_ablation_switches_default_off_in_the_production_configuration() -> None:
+    """Off is the shipped model; every profile that turns one on names itself for it."""
+    block = vae_block("default.yaml")
+    assert block["zero_fhr_scattering_s0"] is False
+    assert block["zero_up_scattering_s0"] is False
+    assert vae_block("joint.yaml")["zero_fhr_scattering_s0"] is False
 
 
 def test_the_tiny_config_inherits_the_data_geometry_from_the_parent() -> None:

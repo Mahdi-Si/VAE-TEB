@@ -330,7 +330,10 @@ def build_pit_figure(pit: pd.DataFrame, coverage: pd.DataFrame) -> Any:
     density = finite_column(pit, "density")
     if centers.size and np.isfinite(density).any():
         width = float(finite_column(pit, "bin_right")[0] - finite_column(pit, "bin_left")[0])
-        axis.bar(centers, density, width=width * 0.95, color=figures.COLOR_BLUE, alpha=0.85)
+        axis.bar(
+            centers, density, width=width * 0.95, color=figures.COLOR_BLUE, alpha=0.85,
+            edgecolor=figures.COLOR_BLACK, linewidth=figures.HISTOGRAM_EDGE_WIDTH,
+        )
         axis.axhline(
             1.0, color=figures.COLOR_VERMILLION, linestyle="--", linewidth=figures.LINE_REGULAR,
             label="uniform (calibrated)",
@@ -392,7 +395,10 @@ def build_logvar_figure(histogram: pd.DataFrame, bounds: Dict[str, Any]) -> Any:
         width = float(
             finite_column(histogram, "bin_right")[0] - finite_column(histogram, "bin_left")[0]
         )
-        axis.bar(centers, fraction, width=width * 0.95, color=figures.COLOR_BLUE, alpha=0.85)
+        axis.bar(
+            centers, fraction, width=width * 0.95, color=figures.COLOR_BLUE, alpha=0.85,
+            edgecolor=figures.COLOR_BLACK, linewidth=figures.HISTOGRAM_EDGE_WIDTH,
+        )
     else:
         axis.text(
             0.5, 0.5, figures.EMPTY_NOTE, ha="center", va="center", transform=axis.transAxes

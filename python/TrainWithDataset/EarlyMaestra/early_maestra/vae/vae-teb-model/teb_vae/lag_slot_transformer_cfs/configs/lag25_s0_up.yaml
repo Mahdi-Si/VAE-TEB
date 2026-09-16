@@ -1,0 +1,34 @@
+# The 25-entry bank with the SOURCE order-zero scattering coefficient ablated at the input.
+#
+# One leaf differs from `lag25.yaml`. The UA stream's first scattering channel -- the smoothed
+# uterine-activity level -- is zeroed at the model's input boundary before the source gate and
+# the pointwise encoder, so no proposal at any lag can read it. Its availability announcement is
+# unchanged: the coefficient is observed and is zero, which is its training mean on the
+# standardised scale, and the remaining source channels are read as before.
+#
+# WHAT IT ISOLATES. Whether the source-conditioned gain rests on the smoothed UA level or on the
+# band-resolved and phase coefficients beside it. The target stream is untouched, so the
+# reference this arm is read against is the ordinary `target_only.yaml` checkpoint, and the warm
+# start is the ordinary target-only donor.
+#
+# The switch is refused with `use_up_st: false`, where the stream opens with a phase coefficient.
+#
+# RUNNING IT
+#   python -m teb_vae.lag_slot_transformer_cfs.trainer \
+#       --config teb_vae/lag_slot_transformer_cfs/configs/lag25_s0_up.yaml
+
+base: lag25.yaml
+
+general_config:
+  tag: lag_residual_trf_cfs_lag25_s0_up
+
+  seed: 23
+
+model_config:
+  # REPOINT THIS at the same target-only checkpoint `lag25.yaml` starts from: the target stream
+  # is not ablated on this arm, so the ordinary donor is the matched one.
+  target_warm_start_checkpoint: REPOINT_ME_target_only_a_checkpoint.ckpt
+
+  VAE_model:
+    # The one leaf.
+    zero_up_scattering_s0: true

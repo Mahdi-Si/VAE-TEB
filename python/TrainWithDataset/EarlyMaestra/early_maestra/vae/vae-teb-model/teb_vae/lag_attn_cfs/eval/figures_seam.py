@@ -59,24 +59,28 @@ EMPTY_NOTE = figures.EMPTY_NOTE
 #: more than a handful of distinct weights reads as accidental: the eye takes a change of weight
 #: as a change of meaning, so every weight has to mean something.
 #:
-#: Calibrated against the refined ``axes.linewidth`` of $0.5$ below: the frame is the lightest mark
-#: on the page, a hairline sits at it, and the emphasis weight is roughly twice it. Nothing here is
+#: Calibrated against the refined ``axes.linewidth`` of $0.4$: the frame is the lightest mark on
+#: the page, a hairline sits at it, and the emphasis weight is roughly twice it. Nothing here is
 #: heavier than :data:`LINE_HEAVY`, which exists for the one mark that is a *bar* rather than a
 #: line -- the inter-quartile span of a per-recording strip.
-LINE_HAIRLINE = 0.5
-LINE_THIN = 0.65
-LINE_REGULAR = 0.9
-LINE_EMPHASIS = 1.05
-LINE_HEAVY = 2.4
+LINE_HAIRLINE = 0.4
+LINE_THIN = 0.5
+LINE_REGULAR = 0.7
+LINE_EMPHASIS = 0.85
+LINE_HEAVY = 2.0
+
+#: Marker diameter in points of a point estimate drawn on a curve or a strip: small enough that
+#: a dense trajectory reads as a line with points on it rather than as a string of beads.
+MARKER_SMALL = 2.5
 
 #: Type sizes for text that is deliberately smaller than the axis labels: four steps, each with a
 #: job. The body size comes from ``rcParams`` and is not restated here. Nothing sits below the
-#: 5.5 pt floor the journals accept for a label at final size, which is what a per-cell count or a
-#: band name is.
-FONT_TINY = 5.5
-FONT_SMALL = 6.0
-FONT_LABEL = 6.5
-FONT_NOTE = 7.5
+#: 5 pt floor a per-cell count or a band name is still legible at when the figure is read at its
+#: designed width.
+FONT_TINY = 5.0
+FONT_SMALL = 5.5
+FONT_LABEL = 6.0
+FONT_NOTE = 7.0
 
 #: The publication style, bound from the shared layer rather than owned: one open frame, one type
 #: scale and one legend convention across every evaluation package, so two figures of the same
@@ -138,6 +142,9 @@ def caveat_note(figure, text: str = GROUP_DELAY_CAVEAT) -> float:
 binned_violin_panel = figures.binned_violin_panel
 heatmap_with_colorbar = figures.heatmap_with_colorbar
 histogram_panel = figures.histogram_panel
+
+#: The thin dark outline every histogram and bar carries, bound from the shared layer.
+HISTOGRAM_EDGE_WIDTH = figures.HISTOGRAM_EDGE_WIDTH
 multi_line_panel = figures.multi_line_panel
 ribbon_plot = figures.ribbon_plot
 significance_strip = figures.significance_strip

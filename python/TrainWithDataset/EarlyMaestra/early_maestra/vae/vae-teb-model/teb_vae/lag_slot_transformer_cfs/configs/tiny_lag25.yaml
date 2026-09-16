@@ -1,0 +1,38 @@
+# The 25-entry bank at smoke size: `tiny.yaml` with the lag bank of `lag25.yaml`.
+#
+# A delta on the smoke configuration rather than on `lag25.yaml`, because the profile it mirrors
+# warm-starts from a target-only checkpoint the fixture does not have and turns the head
+# calibration off for that reason; a fixture fit is a fresh fit. What it takes from `lag25.yaml`
+# is the one leaf that defines the bank, so that the evaluation profile declared for that window
+# -- `eval/configs/lag25_eval_overrides.yaml`, whose bands reach the window's last lag -- can be
+# exercised end to end against a checkpoint this geometry actually produced.
+#
+# The chunk sizes are inherited from the smoke configuration and are smaller than the bank, so
+# the chunked accumulation is still exercised over several lag chunks.
+#
+# It selects checkpoints on the predictive monitor, as `lag25.yaml` does through its parent, so
+# the fixture end-to-end run exercises that wiring: the monitor column exists because the smoke
+# configuration sets the draw count, and the checkpoint callback reads it at every validation end.
+
+base: tiny.yaml
+
+general_config:
+  tag: lag_residual_trf_cfs_tiny_lag25
+
+model_config:
+  VAE_model:
+    max_lag: 24
+
+advanced_config:
+  callbacks:
+    early_stopping:
+      enabled: true
+      monitor: "val/pred_nll_full_mc"
+      patience: 50
+      min_delta: 0.0001
+
+    model_checkpoint:
+      monitor: "val/pred_nll_full_mc"
+      save_top_k: 3
+      mode: "min"
+      secondary_monitor: "val/total_loss"

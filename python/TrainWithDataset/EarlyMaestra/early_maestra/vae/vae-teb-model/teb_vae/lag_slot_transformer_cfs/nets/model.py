@@ -70,9 +70,17 @@ from teb_vae.lag_slot_transformer_cfs.nets.pointwise_source import lag_validity
 #: report one model's numbers under the other's name.
 MODEL_KIND = "fhr_lag_residual_cfs_v1"
 
+#: The two input-ablation switches this class owns and the base never sees. Each zeroes one
+#: stream's order-zero scattering coefficient at the model's input boundary; the base builds no
+#: module for either, so forwarding them would be a keyword it does not accept.
+INPUT_ABLATION_KEYWORDS: Tuple[str, ...] = ("zero_fhr_scattering_s0", "zero_up_scattering_s0")
+
 #: What the composing constructor removes from its own ``locals()`` before forwarding the rest to
-#: the base: the mixins' own keywords, the refused ones, and the two implicit entries.
-FORWARDED_EXCLUSIONS_HERE: Tuple[str, ...] = FORWARDED_EXCLUSIONS + tuple(REFUSED_KEYWORDS)
+#: the base: the mixins' own keywords, the refused ones, the ablation switches, and the two
+#: implicit entries.
+FORWARDED_EXCLUSIONS_HERE: Tuple[str, ...] = (
+    FORWARDED_EXCLUSIONS + tuple(REFUSED_KEYWORDS) + INPUT_ABLATION_KEYWORDS
+)
 
 
 class SeqVaeLagResidualTrfCfs(
@@ -149,6 +157,8 @@ class SeqVaeLagResidualTrfCfs(
         target_novelty_frac: Optional[Sequence[float]] = None,
         target_forecast_shift: Optional[Sequence[int]] = None,
         init_weights: bool = True,
+        zero_fhr_scattering_s0: bool = False,
+        zero_up_scattering_s0: bool = False,
         # ----------------------------------------------------------------------------------
         # Refused. Present in the signature and nowhere else, because the experiment driver
         # forwards a configuration key only when the constructor names it -- so a key omitted
@@ -251,6 +261,17 @@ class SeqVaeLagResidualTrfCfs(
             target_novelty_frac: Per-declared-channel novelty share, a readout only.
             target_forecast_shift: The forecast clock's signed re-indexing of the scored element.
             init_weights: Run the generic initialisation pass and the repairs that follow it.
+            zero_fhr_scattering_s0: Zero the target stream's order-zero scattering coefficient
+                $S_0$ -- the first channel of the first stored target block -- at the model's
+                input boundary, before the persistence gather, the gate and the encoder. An
+                **input** ablation: the forecast labels, the availability masks and the stored
+                batch are untouched, so the model is asked to forecast the same future from a
+                stream whose smoothed level it cannot read. Off by default, which is the legacy
+                forward bitwise.
+            zero_up_scattering_s0: The same for the source stream's order-zero scattering
+                coefficient, the first channel of ``u_stream`` when ``use_up_st`` is set. Refused
+                without ``use_up_st``: the stream then opens with a phase coefficient, and zeroing
+                it would ablate a different quantity under this name.
             num_heads: Refused; see :data:`~teb_vae.lag_slot_transformer_cfs.nets.core.REFUSED_KEYWORDS`.
             d_head: Refused.
             source_attention_blocks: Refused.
@@ -271,12 +292,20 @@ class SeqVaeLagResidualTrfCfs(
 
         Raises:
             ValueError: On any refused keyword that carries a value; on a geometry the base
-                refuses; or on a stride, floor or warm-up pairing the causal mixin refuses.
+                refuses; on a stride, floor or warm-up pairing the causal mixin refuses; or on
+                the source ablation switch without the source scattering block.
         """
         # Before anything else, and before the base builds a single module: a refused keyword
         # names a mechanism that does not exist, so there is nothing to build for it and no point
         # constructing a model that is about to be thrown away.
         refuse_incompatible_keywords(locals())
+        if bool(zero_up_scattering_s0) and not bool(use_up_st):
+            raise ValueError(
+                "zero_up_scattering_s0=True was given with use_up_st=False. The source stream "
+                "then carries the phase block alone and opens with a phase coefficient, so the "
+                "switch would zero a quantity that is not the order-zero scattering coefficient "
+                "under a name that says it is. Set use_up_st: true, or leave the switch off."
+            )
 
         # Captured before any local is added below, so the forwarded set is exactly this signature
         # minus the mixins' keywords and the refused ones. Written out as explicit pairs it would be
@@ -318,6 +347,113 @@ class SeqVaeLagResidualTrfCfs(
         # resolves the gate the channel weights are positional over.
         self._validate_causal_geometry()
         self._register_channel_weights()
+
+        # The input ablation switches, after the base so the masks can be registered as buffers.
+        # Non-persistent, like every geometry-shaped tensor here: their widths follow the declared
+        # blocks, and a persistent copy would make a checkpoint fail to load across a width change
+        # as a missing key rather than as the geometry mismatch it is. The switches themselves are
+        # stamped through the checkpoint's constructor kwargs, which is what the evaluation binding
+        # reconciles.
+        self.zero_fhr_scattering_s0 = bool(zero_fhr_scattering_s0)
+        self.zero_up_scattering_s0 = bool(zero_up_scattering_s0)
+        self.register_buffer(
+            "fhr_s0_input_mask",
+            self._first_channel_mask(int(self.TARGET_BLOCK_SPLIT)),
+            persistent=False,
+        )
+        self.register_buffer(
+            "up_s0_input_mask", self._first_channel_mask(self.c_u), persistent=False
+        )
+
+    # ------------------------------------------------------------------
+    # The input ablation boundary
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _first_channel_mask(width: int) -> torch.Tensor:
+        """A channel mask that keeps every channel of a block but its first.
+
+        Args:
+            width: The block's declared channel count.
+
+        Returns:
+            A $(\\text{width},)$ ``float32`` vector: zero at index $0$, one elsewhere.
+        """
+        mask = torch.ones(int(width), dtype=torch.float32)
+        mask[0] = 0.0
+        return mask
+
+    def _ablate_input_streams(
+        self, y_st: torch.Tensor, u_stream: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        r"""Apply the configured input ablations, returning new tensors and writing nothing.
+
+        The first operation of :meth:`forward`, before the persistence gather, the two gates and
+        the encoders, so every path that reads a stream -- the persistence shortcut included --
+        reads the ablated one. A multiplication by a registered mask rather than an in-place
+        write, because the task assembles the encoder inputs and the forecast labels from the
+        same underlying batch fields: an in-place zero would corrupt the labels, and the labels
+        must stay the original coefficients.
+
+        The availability masks are untouched. An ablated coefficient is an observed coefficient
+        whose value the model may not read, which is a value ablation and not a missing-sensor
+        event; the adapter and the source encoder still announce it as available.
+
+        Args:
+            y_st: The first stored target block $(B, T, C^{\mathrm{st}}_Y)$ at the declared width.
+            u_stream: The source stream $(B, T, c_u)$ at the declared width.
+
+        Returns:
+            ``(y_st, u_stream)``: the inputs the rest of the forward reads. The same objects
+            where a switch is off, so the legacy forward is bitwise unchanged.
+        """
+        if self.zero_fhr_scattering_s0:
+            y_st = y_st * self.fhr_s0_input_mask.to(dtype=y_st.dtype)
+        if self.zero_up_scattering_s0:
+            u_stream = u_stream * self.up_s0_input_mask.to(dtype=u_stream.dtype)
+        return y_st, u_stream
+
+    def permitted_target_features(self, target_features: torch.Tensor) -> torch.Tensor:
+        r"""The declared-width target stream as the model is permitted to read it.
+
+        The same ablation :meth:`forward` applies to its first target block, on the concatenated
+        stream a trivial predictor or a probe reads instead. A reference predictor handed the
+        original stream would carry the anchor's own $S_0$ into a comparison against a model
+        that may not read it; this is the view every such reference must be built on, while the
+        forecast **labels** stay the original tensor.
+
+        Args:
+            target_features: The concatenated target stream $(B, T, c_y)$ in declared order.
+
+        Returns:
+            The stream with the ablated coordinate zeroed, or the same object when the target
+            switch is off.
+        """
+        if not self.zero_fhr_scattering_s0:
+            return target_features
+        split = int(self.TARGET_BLOCK_SPLIT)
+        mask = torch.ones(
+            target_features.shape[-1], dtype=target_features.dtype, device=target_features.device
+        )
+        mask[:split] = self.fhr_s0_input_mask.to(dtype=target_features.dtype)
+        return target_features * mask
+
+    def input_ablation_record(self) -> Dict[str, Any]:
+        """The effective input policy, for the run's artifacts.
+
+        Returns:
+            The two switches and, for each that is on, the ablated coordinate named by stream,
+            stored field and declared channel index.
+        """
+        ablated: List[Dict[str, Any]] = []
+        if self.zero_fhr_scattering_s0:
+            ablated.append({"stream": "target", "field": "fhr_st", "channel": 0})
+        if self.zero_up_scattering_s0:
+            ablated.append({"stream": "source", "field": "up_st", "channel": 0})
+        return {
+            "zero_fhr_scattering_s0": self.zero_fhr_scattering_s0,
+            "zero_up_scattering_s0": self.zero_up_scattering_s0,
+            "ablated_inputs": ablated,
+        }
 
     # ------------------------------------------------------------------
     # The objective seam
@@ -481,12 +617,13 @@ class SeqVaeLagResidualTrfCfs(
     ) -> Dict[str, torch.Tensor]:
         r"""Run the pipeline and decode at a tiled anchor set.
 
-        Eleven steps, in this order and for these reasons: the anchor set is built first because
-        every later tensor is indexed by it; the persistence input is gathered before the gate
-        because it is the target's own declared-order vector; the conditioning state is formed
-        before the prior because the proposal head reads the same tensor; and the source encoding
-        is computed once for the whole batch because it is pointwise and shares nothing with the
-        anchor axis.
+        Twelve steps, in this order and for these reasons: the configured input ablations are
+        applied first because every later read of a stream -- the persistence gather included --
+        must see the permitted view; the anchor set is built next because every later tensor is
+        indexed by it; the persistence input is gathered before the gate because it is the
+        target's own declared-order vector; the conditioning state is formed before the prior
+        because the proposal head reads the same tensor; and the source encoding is computed once
+        for the whole batch because it is pointwise and shares nothing with the anchor axis.
 
         Args:
             y_st: Target scattering features $(B, T, \cdot)$.
@@ -538,6 +675,11 @@ class SeqVaeLagResidualTrfCfs(
             them, and a fabricated tensor under one of those names would let an evaluator report a
             per-lag attribution that does not exist.
         """
+        # First, so that nothing below -- not the persistence gather, not the gates, not the
+        # encoders -- can read an ablated coordinate. New tensors where a switch is on; the
+        # caller's tensors, which also feed the labels, are never written into.
+        y_st, u_stream = self._ablate_input_streams(y_st, u_stream)
+
         anchor_index, anchor_valid = self._build_anchor_index(
             batch=int(y_st.shape[0]),
             device=y_st.device,
@@ -961,4 +1103,4 @@ def _reassemble(chunks: List[List[torch.Tensor]]) -> torch.Tensor:
     return torch.cat([torch.cat(row, dim=2) for row in chunks], dim=1)
 
 
-__all__ = ["MODEL_KIND", "SeqVaeLagResidualTrfCfs"]
+__all__ = ["INPUT_ABLATION_KEYWORDS", "MODEL_KIND", "SeqVaeLagResidualTrfCfs"]

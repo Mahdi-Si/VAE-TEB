@@ -28,7 +28,7 @@ import yaml
 
 from teb_vae.lag_attn_cfs.eval import run as shared_run
 from teb_vae.lag_attn_cfs.eval.config_schema import load_eval_overrides
-from teb_vae.lag_slot_transformer_cfs.eval import predictive
+from teb_vae.lag_slot_transformer_cfs.eval import collect, predictive
 from teb_vae.lag_slot_transformer_cfs.eval.binding import (
     ANALYSES_THIS_ARCHITECTURE_CANNOT_PRODUCE,
     EXCLUDED_ANALYSES,
@@ -43,7 +43,7 @@ from teb_vae.lag_slot_transformer_cfs.nets.core import REFUSED_KEYWORDS
 from teb_vae.lag_slot_transformer_cfs.nets.model import SeqVaeLagResidualTrfCfs
 from teb_vae.lag_slot_transformer_cfs.task import SeqVaeLagResidualTrfCfsTask
 
-from .conftest import build_tiny_model
+from .conftest import TINY_SEQ_LEN, build_tiny_model, tiny_streams
 
 #: The shipped production configuration, which the geometry keys are checked against.
 DEFAULT_CONFIG = Path(__file__).resolve().parents[1] / "configs" / "default.yaml"
@@ -53,7 +53,6 @@ DEFAULT_CONFIG = Path(__file__).resolve().parents[1] / "configs" / "default.yaml
 EXPECTED_ABSENT = (
     "attention",
     "lag_kl",
-    "source_null",
     "occlusion",
     "lag_clocks",
     "lag_kld_scaled",
@@ -61,8 +60,15 @@ EXPECTED_ABSENT = (
 )
 
 #: The two of them the SHARED registry actually holds, which are therefore the only two a binding
-#: can remove. The other five are the lag-attentive cell's own extras and are absent here because
-#: nothing registers them, which is a different mechanism with the same cause.
+#: can remove. The other four are the lag-attentive cell's own extras and are absent here because
+#: nothing registers them, which is a different mechanism with the same cause. ``source_null``,
+#: ``warmup`` and ``spectral_skill`` are that cell's extras too and are registered here as the
+#: family's own implementations, because the columns they read are the same quantities here.
+EXPECTED_FAMILY_REUSE = ("warmup", "source_null", "spectral_skill")
+
+#: This cell's own analogues of the absent family analyses, each reading a sidecar this cell's
+#: pass writes under its own names.
+EXPECTED_ANALOGUES = ("proposal_profile", "proposal_clocks", "band_clocks", "high_kl_anchors")
 EXPECTED_REMOVALS = ("attention", "lag_kl")
 
 
@@ -196,6 +202,32 @@ def test_every_headline_scalar_this_cell_registers_resolves_on_its_own_results()
             "replace_constant_margin_nats": 0.1, "permute_margin_nats": 0.3,
         },
         "lag_readouts": {"cancellation": {"mean": {"ratio": 0.7}}},
+        "source_null": {
+            "difference": {
+                "kld_source_null_nats": 0.1, "coupling_minus_clock_nats": 0.2,
+                "ci_lo": 0.15, "ci_hi": 0.25,
+            }
+        },
+        "warmup": {
+            "headline": {
+                "pred_gap_warm_lo_nats": 0.1, "pred_gap_warm_mid_nats": 0.2,
+                "pred_gap_warm_hi_nats": 0.3,
+            },
+            "geometry_guards": {"anchors_per_sample": 4.0, "target_warm_frac": 1.0},
+        },
+        "spectral_skill": {
+            "headline": {
+                "pred_gap_slow_baseline_nats": 0.1, "pred_gap_deceleration_nats": 0.2,
+                "pred_gap_variability_nats": 0.3, "pred_gap_beat_to_beat_nats": 0.4,
+            }
+        },
+        "high_kl_anchors": {
+            "thresholds": {"high_nats": 0.3},
+            "usefulness": {
+                "high_minus_rest_mean_interval": {"point": 0.05},
+                "overlap": {"share_of_high_in_gain": 0.4},
+            },
+        },
     }
     headline = report_seam.build_headline(results, HEADLINE_SCALARS)
 
@@ -205,8 +237,28 @@ def test_every_headline_scalar_this_cell_registers_resolves_on_its_own_results()
     assert headline["pred_gap_mc_nats"] == 0.5
 
 
+def test_the_family_analyses_this_cell_reuses_and_its_own_analogues_are_registered() -> None:
+    """The three family implementations whose columns this pass writes, and the four analogues.
+
+    Registered under the family's names for the three, because the quantity is the same one; and
+    under this cell's own names for the four, because a proposal norm under an attention name is
+    the substitution the design rules out.
+    """
+    for name in (*EXPECTED_FAMILY_REUSE, *EXPECTED_ANALOGUES):
+        assert name in EXTRA_ANALYSES, name
+    assert not set(EXPECTED_ANALOGUES) & set(shared_run.ANALYSIS_FUNCTIONS)
+    from teb_vae.lag_slot_transformer_cfs.eval.binding import ANALOGUE_ANALYSES
+
+    assert set(ANALOGUE_ANALYSES) == set(EXPECTED_ABSENT)
+    for name, analogues in ANALOGUE_ANALYSES.items():
+        assert analogues, name
+        assert set(analogues) <= set(EXTRA_ANALYSES), (name, analogues)
+        # And the reason names its analogue, so the summary carries the correspondence.
+        assert any(a in ANALYSES_THIS_ARCHITECTURE_CANNOT_PRODUCE[name] for a in analogues), name
+
+
 def test_only_analyses_the_shared_registry_holds_may_be_removed() -> None:
-    """The five that are absent rather than removed, and why the distinction has to be kept.
+    """The four that are absent rather than removed, and why the distinction has to be kept.
 
     Naming one of them on the binding would refuse every run: an exclusion the registry does not
     hold is rejected rather than ignored, which is the guard that catches a misspelt one.
@@ -246,6 +298,24 @@ def test_the_disclosure_reads_the_model_rather_than_a_literal() -> None:
     assert record["source_encoder_parameters"] == 0
     assert "NEURAL" in record["qualification"]
     assert "feature extraction" in record["qualification"]
+
+
+def test_the_disclosure_states_the_windows_depth_in_seconds_and_the_input_policy() -> None:
+    """A bank of L entries that includes the anchor reaches L - 1 steps back, and the policy is
+    disclosed on every arm because it is a property of the task, not of the source pathway."""
+    from teb_vae.lag_attn.nets.lag_report import SECONDS_PER_STEP
+
+    model = build_tiny_model()
+    record = residual_encoder_disclosure(model)
+    target_only = residual_encoder_disclosure(
+        build_tiny_model(source_disabled=True, zero_fhr_scattering_s0=True)
+    )
+
+    assert record["oldest_lag_seconds"] == (model.n_lags - 1) * SECONDS_PER_STEP
+    assert record["effective_inputs"]["ablated_inputs"] == []
+    assert target_only["oldest_lag_seconds"] is None
+    assert target_only["effective_inputs"]["zero_fhr_scattering_s0"] is True
+    assert target_only["effective_inputs"]["ablated_inputs"][0]["field"] == "fhr_st"
 
 
 def test_the_disclosure_reports_the_lift_arm_as_having_parameters() -> None:
@@ -584,3 +654,265 @@ def test_a_branch_left_out_of_resolve_carries_no_curves() -> None:
             model, {"a": (mu, logvar)}, target, mask, likelihood="gaussian_nll",
             num_samples=1, resolve=("zz",),
         )
+
+
+# =================================================================================================
+# The weighted objective-parity columns
+# =================================================================================================
+def test_the_parity_scores_reproduce_the_objectives_reconstruction_terms() -> None:
+    """The weighted per-anchor scores average to exactly the ``nll_full_block`` and
+    ``nll_base_block`` the objective reports on the same forward, so a training log and the
+    per-sample table can be read side by side -- and the unweighted columns beside them are a
+    different number, which is the mislabelling the parity columns exist to end."""
+    from teb_vae.lag_attn_rws.nets.raw_masks import forecast_mask
+
+    model = build_tiny_model(target_weight_st=1.0, target_weight_ph=0.1,
+                             horizon_weight_halflife_steps=2.0)
+    generator = torch.Generator().manual_seed(29)
+    with torch.no_grad():
+        model.proposal_head.output_proj.weight.normal_(0.0, 0.3, generator=generator)
+        model.proposal_head.output_proj.bias.normal_(0.0, 0.1, generator=generator)
+    model.eval()
+    y_st, y_ph, u_stream = tiny_streams()
+    torch.manual_seed(0)
+    with torch.no_grad():
+        outputs = model(y_st, y_ph, u_stream, anchor_phase=0, anchor_stride=1)
+    target_features = torch.cat([y_st, y_ph], dim=-1)
+    validity = torch.ones(y_st.shape[0], TINY_SEQ_LEN)
+    metrics = model.compute_loss(outputs, target_features, weight=validity)["metrics"]
+
+    target = model._build_forecast_target(target_features, outputs["anchor_index"])
+    mask, _coverage = forecast_mask(
+        model.scored_weight(validity), model.geometry, coverage_floor=model.coverage_floor,
+        anchors=outputs["anchor_index"], anchor_valid=outputs["anchor_valid"],
+    )
+    full, base = collect.objective_parity_scores(
+        model, outputs, target, mask, likelihood="gaussian_nll"
+    )
+    contributing = (mask.sum(dim=-1) > 0).to(torch.float64)
+    parity_full = float((full.to(torch.float64) * contributing).sum() / contributing.sum())
+    parity_base = float((base.to(torch.float64) * contributing).sum() / contributing.sum())
+
+    assert parity_full == pytest.approx(float(metrics["nll_full_block"]), rel=1e-6)
+    assert parity_base == pytest.approx(float(metrics["nll_base_block"]), rel=1e-6)
+    # The unweighted score is a different number on a weighted arm.
+    from teb_vae.lag_attn_rws.nets.losses import masked_raw_block_per_anchor
+
+    unweighted, _ = masked_raw_block_per_anchor(
+        outputs["mu_full"], target, mask, likelihood="gaussian_nll", logvar=outputs["logvar_full"]
+    )
+    assert not torch.allclose(unweighted.to(torch.float64), full.to(torch.float64))
+
+
+def test_the_parity_scores_are_the_unweighted_ones_on_an_unweighted_arm() -> None:
+    """With no weight buffers registered the parity scores equal the unweighted single-draw
+    scores bitwise rather than being multiplied by ones."""
+    from teb_vae.lag_attn_rws.nets.losses import masked_raw_block_per_anchor
+    from teb_vae.lag_attn_rws.nets.raw_masks import forecast_mask
+
+    model = build_tiny_model(target_weight_st=1.0, target_weight_ph=1.0,
+                             horizon_weight_halflife_steps=None).eval()
+    y_st, y_ph, u_stream = tiny_streams()
+    with torch.no_grad():
+        outputs = model(y_st, y_ph, u_stream, anchor_phase=0, anchor_stride=1)
+    target_features = torch.cat([y_st, y_ph], dim=-1)
+    validity = torch.ones(y_st.shape[0], TINY_SEQ_LEN)
+    target = model._build_forecast_target(target_features, outputs["anchor_index"])
+    mask, _coverage = forecast_mask(
+        model.scored_weight(validity), model.geometry, coverage_floor=model.coverage_floor,
+        anchors=outputs["anchor_index"], anchor_valid=outputs["anchor_valid"],
+    )
+    full, _base = collect.objective_parity_scores(
+        model, outputs, target, mask, likelihood="gaussian_nll"
+    )
+    unweighted, _ = masked_raw_block_per_anchor(
+        outputs["mu_full"], target, mask, likelihood="gaussian_nll", logvar=outputs["logvar_full"]
+    )
+    assert torch.equal(full, unweighted)
+
+
+def test_the_results_conventions_name_every_estimator() -> None:
+    """Four estimators, each with the columns that carry it, and a schema version a gate can
+    read; the legacy sentence still travels beside them."""
+    assert collect.RESULTS_SCHEMA_VERSION == 2
+    assert set(collect.SCORE_CONVENTIONS) == {
+        "weighted_objective", "single_draw_conditional", "latent_mean", "predictive_mixture",
+    }
+    for entry in collect.SCORE_CONVENTIONS.values():
+        assert entry["columns"] and entry["meaning"]
+    assert "pred_gap_weighted" in collect.SCORE_CONVENTIONS["weighted_objective"]["columns"]
+    assert "pred_gap_mc_nats" in collect.SCORE_CONVENTIONS["predictive_mixture"]["columns"]
+
+
+# =================================================================================================
+# The three verdicts this cell reads itself
+# =================================================================================================
+def _family_verdicts():
+    """A family verdict list with the three entries this cell replaces, in registry order."""
+    from teb_vae.lag_attn_cfs.eval.metrics import Verdict
+
+    return [
+        Verdict("predictive_improvement", "PASS", "D_full < D_base", "point below",
+                {"d_base": -120.0, "d_full": -120.2, "pred_gap": 0.2}),
+        Verdict("source_margin_positive", "PASS", "c", "d", {}),
+        Verdict("prior_variance_not_pinned", "FAIL", "c",
+                "the KL carries (mu_q - mu_p)^2 / sigma_p^2 -- inflated",
+                {"floor_frac": 0.56, "max_frac": 0.5}),
+        Verdict("calibration_near_nominal", "PASS", "c", "single-draw", {"tail_tolerance": 0.5}),
+    ]
+
+
+@pytest.mark.parametrize(
+    "interval, expected",
+    [
+        ({"point": 0.2, "lo": 0.05, "hi": 0.4, "n": 10}, "PASS"),
+        ({"point": 0.16, "lo": -0.2, "hi": 0.53, "n": 10}, "INCONCLUSIVE"),
+        ({"point": -0.3, "lo": -0.5, "hi": -0.1, "n": 10}, "FAIL"),
+        (None, "INCONCLUSIVE"),
+    ],
+)
+def test_the_predictive_verdict_reads_the_interval_and_not_the_sign(interval, expected) -> None:
+    """The family says PASS on a point below the base; this cell says what the interval says."""
+    verdicts = collect.cell_verdicts(
+        _family_verdicts(), pred_gap_interval=interval, mixture_calibration=None, num_samples=8
+    )
+    by_name = {verdict.name: verdict for verdict in verdicts}
+    assert [verdict.name for verdict in verdicts] == [
+        "predictive_improvement", "source_margin_positive", "prior_variance_not_pinned",
+        "calibration_near_nominal",
+    ]
+    assert by_name["predictive_improvement"].status == expected
+    assert by_name["predictive_improvement"].values["K"] == 8.0
+    if interval is not None:
+        assert by_name["predictive_improvement"].values["pred_gap_lo"] == interval["lo"]
+
+
+def test_the_calibration_verdict_reads_the_mixture_census() -> None:
+    """Coverage of the full branch's mixture against nominal, at the family's tail tolerance."""
+    mixture = {
+        "base": {"coverage": {"0.5": 0.64, "0.9": 0.936, "0.99": 0.99}},
+        "full": {"coverage": {"0.5": 0.64, "0.9": 0.937, "0.99": 0.9903}},
+    }
+    verdicts = collect.cell_verdicts(
+        _family_verdicts(), pred_gap_interval=None, mixture_calibration=mixture, num_samples=8
+    )
+    verdict = {v.name: v for v in verdicts}["calibration_near_nominal"]
+    # Relative tail errors: 0.28 at the 0.5 level, 0.37 at 0.9, 0.03 at 0.99 -- all inside the
+    # family's 0.5 tolerance, the worst at 0.9; the verdict carries every level of both branches.
+    assert verdict.status == "PASS"
+    assert verdict.values["observed_0.5"] == 0.64
+    assert verdict.values["base_observed_0.9"] == 0.936
+    assert verdict.values["worst_level"] == 0.9
+    assert verdict.values["worst_relative_tail_error"] == pytest.approx(0.37, abs=1e-9)
+    nominal = collect.cell_verdicts(
+        _family_verdicts(), pred_gap_interval=None,
+        mixture_calibration={"full": {"coverage": {"0.5": 0.95}}}, num_samples=8,
+    )
+    assert {v.name: v for v in nominal}["calibration_near_nominal"].status == "FAIL"
+    absent = collect.cell_verdicts(
+        _family_verdicts(), pred_gap_interval=None, mixture_calibration={}, num_samples=8
+    )
+    assert {v.name: v for v in absent}["calibration_near_nominal"].status == "INCONCLUSIVE"
+
+
+def test_the_prior_floor_verdict_keeps_its_status_and_states_the_residual_identity() -> None:
+    """The status is the family's; the explanation is the residual divergence's."""
+    verdicts = collect.cell_verdicts(
+        _family_verdicts(), pred_gap_interval=None, mixture_calibration=None, num_samples=8
+    )
+    verdict = {v.name: v for v in verdicts}["prior_variance_not_pinned"]
+    assert verdict.status == "FAIL"
+    assert "inflate" in verdict.detail and "NOT" in verdict.detail
+    assert "exp(2b)" in verdict.detail
+    assert verdict.values["floor_frac"] == 0.56
+
+
+def test_the_census_resolves_by_horizon_and_block_and_recombines() -> None:
+    """The resolved counts are partial sums of the pooled ones on the same coefficients."""
+    torch.manual_seed(3)
+    cdf = torch.rand(2, 3, 4, 5, dtype=torch.float64)
+    mask = torch.ones(2, 3, 4)
+    mask[0, 0, 3] = 0.0
+    census = predictive.calibration_census(cdf, mask, levels=(0.5, 0.9), block_split=2)
+    resolved = census["resolved"]
+    assert len(resolved["by_horizon"]["n_coefficients"]) == 4
+    assert sum(resolved["by_horizon"]["n_coefficients"]) == pytest.approx(census["n_coefficients"])
+    assert sum(resolved["by_block"]["n_coefficients"]) == pytest.approx(census["n_coefficients"])
+    for level in ("0.5", "0.9"):
+        assert sum(resolved["by_horizon"]["inside"][level]) == pytest.approx(census["inside"][level])
+        assert sum(resolved["by_block"]["inside"][level]) == pytest.approx(census["inside"][level])
+    merged = predictive.merge_calibration(None, census)
+    merged = predictive.merge_calibration(merged, census)
+    finished = predictive.finish_calibration(merged)
+    assert finished["resolved"]["by_horizon"]["n_coefficients"][0] == pytest.approx(
+        2.0 * resolved["by_horizon"]["n_coefficients"][0]
+    )
+    assert len(finished["resolved"]["by_block"]["coverage"]["0.5"]) == 2
+    assert finished["coverage"]["0.5"] == pytest.approx(census["inside"]["0.5"] / census["n_coefficients"])
+    with pytest.raises(ValueError):
+        predictive.calibration_census(cdf, mask, block_split=5)
+
+
+# =================================================================================================
+# The gate reads the interval
+# =================================================================================================
+def _summary(*, lo, hi, listed, schema=2, point=0.16):
+    """A minimal summary carrying a gap interval and a verdict list."""
+    return {
+        "results": {
+            "schema_version": schema,
+            "arm": {"source_disabled": False},
+            "arm_scores": {"pred_gap": {"point": point, "lo": lo, "hi": hi, "n": 10}},
+            "verdicts": [{"name": "predictive_improvement", "status": listed}],
+        }
+    }
+
+
+def test_the_gate_reads_the_interval_and_refuses_a_disagreeing_list() -> None:
+    """Above zero PASS, through zero INCONCLUSIVE, below zero FAIL; a version-2 summary whose
+    own list disagrees with its interval fails, and a version-1 one is read without failing."""
+    from teb_vae.lag_slot_transformer_cfs.eval import verify as gate
+
+    assert gate.report_predictive_gap(_summary(lo=0.05, hi=0.4, listed="PASS"))["status"] == "PASS"
+    crossing = gate.report_predictive_gap(_summary(lo=-0.2, hi=0.53, listed="INCONCLUSIVE"))
+    assert crossing["status"] == "INCONCLUSIVE"
+    assert gate.report_predictive_gap(_summary(lo=-0.5, hi=-0.1, listed="FAIL"))["status"] == "FAIL"
+    disagree = gate.report_predictive_gap(_summary(lo=-0.2, hi=0.53, listed="PASS"))
+    assert disagree["status"] == "FAIL" and "disagree" in disagree["detail"]
+    legacy = gate.report_predictive_gap(_summary(lo=-0.2, hi=0.53, listed="PASS", schema=None))
+    assert legacy["status"] == "INCONCLUSIVE" and legacy["schema_version"] == 1
+    assert legacy["listed_status"] == "PASS"
+
+
+def test_the_gate_pairs_the_candidate_against_the_reference_by_recording() -> None:
+    """The reference comparison resamples per-recording differences from the two tables."""
+    from teb_vae.lag_slot_transformer_cfs.eval import verify as gate
+
+    guids = [f"g{i}" for i in range(12)]
+    candidate = {
+        "results": {
+            "schema_version": 2,
+            "arm": {"source_disabled": False},
+            "arm_scores": {
+                "pred_gap": {"point": 1.0, "lo": 0.5, "hi": 1.5, "n": 12, "resamples": 200, "seed": 1},
+                "nll_full": {"point": -11.0}, "nll_base": {"point": -10.0},
+            },
+            "per_recording": {g: {"nll_full": -11.0 - 0.1 * i, "nll_base": -10.0} for i, g in enumerate(guids)},
+        }
+    }
+    reference = {
+        "results": {
+            "arm": {"source_disabled": True, "model_kind": "fhr_lag_residual_cfs_v1"},
+            "arm_scores": {"nll_base": {"point": -10.0}},
+            "per_recording": {g: {"nll_base": -10.0 - 0.01 * i} for i, g in enumerate(guids)},
+        }
+    }
+    verdict = gate.check_against_reference(candidate, reference)
+    assert verdict["n_paired"] == 12
+    assert verdict["paired_improvement_nats"] > 0.0
+    assert verdict["paired_ci_lo"] > 0.0
+    assert verdict["status"] == "PASS"
+    worse = dict(candidate)
+    worse["results"] = {**candidate["results"], "arm_scores": {
+        **candidate["results"]["arm_scores"], "nll_base": {"point": -9.0}}}
+    assert gate.check_against_reference(worse, reference)["status"] == "FAIL"
