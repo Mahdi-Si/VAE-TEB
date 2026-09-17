@@ -406,8 +406,8 @@ eval_config:
   # unbounded one. This is a config key precisely so the resolved config dumped into the run
   # directory is a durable record of which it was.
   #
-  # Applies to the clocks: trajectory, time_to_delivery, second_stage, lag_kl and lag_clocks.
-  # Analyses with no time-before-delivery axis -- forecast, calibration, latent -- are unaffected,
-  # and so are the per-recording traces, which follow a recording through its whole span by
-  # design and record that the bound was not applied.
+  # Applies to the clocks -- trajectory, time_to_delivery, second_stage, lag_kl and lag_clocks --
+  # and to the per-recording traces (recording_traces and the attribution traces), which then
+  # trace, count and rank only the segments recorded inside the window. Analyses with no
+  # time-before-delivery axis -- forecast, calibration, latent -- are unaffected.
   max_hours_before_delivery: null

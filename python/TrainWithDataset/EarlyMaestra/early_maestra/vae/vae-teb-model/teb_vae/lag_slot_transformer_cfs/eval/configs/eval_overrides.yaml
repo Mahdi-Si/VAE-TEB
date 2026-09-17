@@ -224,6 +224,8 @@ eval_config:
   # the shipped setting -- evaluates everything the split carries. It changes the population every
   # clock-resolved number is computed over, so a bounded run is not comparable with an unbounded
   # one; a config key precisely so the dumped configuration is a durable record of which it was.
+  # The per-recording traces honour it too: only segments inside the window are traced, counted
+  # for eligibility, or drawn from.
   max_hours_before_delivery: null
 
   # Resamples behind every interval, drawn over RECORDINGS. Recordings, not anchors: at the dense

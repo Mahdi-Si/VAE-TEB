@@ -278,6 +278,39 @@ def test_the_stage_traces_a_balanced_draw_end_to_end(tmp_path) -> None:
     assert (directory / f"{traces.SUMMARY_FIGURE}.pdf").is_file()
 
 
+def test_the_stage_traces_only_the_segments_inside_the_delivery_window(tmp_path) -> None:
+    """With ``max_hours_before_delivery`` set, the segment recorded before the window is neither
+    traced nor counted, and the plan records that the bound was applied."""
+    guids, epochs, codes = _population()
+    # A third, earlier segment on every recording: outside a window that keeps the other two.
+    extra = [(guid, -7200.0 - STRIDE_S, code) for guid, epoch, code in zip(guids, epochs, codes)
+             if epoch == -7200.0 and guid != "lonely"]
+    guids += [g for g, _, _ in extra]; epochs += [e for _, e, _ in extra]; codes += [c for _, _, c in extra]
+    dataset = _StubDataset(guids, epochs, codes)
+    identities = pd.DataFrame(
+        {
+            "guid": guids, "epoch": epochs,
+            labels.CLASS_COLUMN: [labels.CLASS_NAMES[code] for code in codes],
+            labels.SUBGROUP_COLUMN: ["hie_cs"] * len(guids),
+        }
+    )
+    window = 7200.0 / 3600.0
+
+    block = stage.run_recording_traces(
+        _Task(build_tiny_model()), _loader(dataset), identities,
+        eval_config={"seed": 0, "caps": {traces.TRACES_CAP: 1}, "max_hours_before_delivery": window},
+        results_dir=tmp_path, geometry_record={"t": TINY_SEQ_LEN},
+    )
+
+    assert block["status"] == stage.STATUS_TRACED, block
+    assert block["plan"]["max_hours_before_delivery"] == window
+    assert block["plan"]["max_hours_before_delivery_applied"] is True
+    manifest = pd.read_csv(tmp_path / traces.ANALYSIS_DIRNAME / traces.MANIFEST_FILENAME)
+    assert (manifest["n_segments"] == 2).all()
+    summary = pd.read_csv(tmp_path / traces.ANALYSIS_DIRNAME / traces.SEGMENT_SUMMARY_FILENAME)
+    assert (summary["epoch"] >= -window * 3600.0).all()
+
+
 def test_the_stage_records_a_skip_when_no_segment_carries_a_class(tmp_path) -> None:
     """What the pass produces when the delta does not name the target field."""
     identities = pd.DataFrame(

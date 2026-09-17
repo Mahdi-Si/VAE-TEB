@@ -274,7 +274,15 @@ def test_the_stage_attributes_a_balanced_draw_end_to_end(tmp_path, monkeypatch) 
     for name in block["files"]:
         assert (directory / name).is_file(), name
     rows = pd.read_csv(directory / core.ROWS_FILENAME)
-    assert set(rows["band"].dropna()) == {"near", "far"}
+    assert set(rows[rows["readout"] == core.READOUT_LAG_BAND]["band"]) == {"near", "far"}
+    # The per-step score rows carry their horizon step in the same column, first and last.
+    horizons = core.horizon_steps(_task().orig_model)
+    assert set(rows[rows["readout"] == core.READOUT_NLL_HORIZON]["band"]) == {f"h{step}" for step in horizons.values()}
+    assert set(rows["readout"]) >= set(core.MAIN_READOUTS)
+    blocks = pd.read_csv(directory / core.BLOCKS_FILENAME)
+    assert set(blocks["block"]) == set(core.BLOCKS)
+    for stem in (core.BLOCK_FIGURE, core.HORIZON_FIGURE):
+        assert (directory / f"{stem}.pdf").is_file()
     with np.load(directory / core.VECTORS_FILENAME) as handle:
         assert handle["layer_per_unit"].shape[1] == int(_task().orig_model.n_lags)
     manifest = pd.read_csv(directory / attribution_pass.TRACE_MANIFEST_FILENAME)

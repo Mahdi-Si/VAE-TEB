@@ -38,7 +38,7 @@ import pandas as pd
 import torch
 from loguru import logger
 
-from teb_vae.lag_attn_cfs.eval import cohort, frames, lag_axis, traces
+from teb_vae.lag_attn_cfs.eval import cohort, frames, lag_axis, traces, traces_html
 from teb_vae.lag_attn_cfs.eval import figures_seam as figures
 from teb_vae.lag_attn_cfs.eval._reuse import labels
 from teb_vae.lag_attn_cfs.eval.dataset_rows import (
@@ -84,10 +84,11 @@ PANELS: Tuple[Any, ...] = (
                      labels=("base $-$ full",), segment_mean=True),
     traces.HeatmapPanel("mu_post", "Full-branch mean $\\mu^q$ over the latent coordinates", "coordinate",
                         symmetric=True),
-    traces.HeatmapPanel("update_mean", "Bounded mean update $a_t$", "coordinate", symmetric=True),
+    traces.HeatmapPanel("update_mean", "Bounded mean update $a_t$ (signed log colour scale)", "coordinate",
+                        symmetric=True, log=True),
     traces.HeatmapPanel("kld_per_dim", "Divergence per latent coordinate, $K_{t,d}$", "coordinate"),
-    traces.HeatmapPanel("proposal_lag_map", "Proposal norm $\\| r_{t,\\ell}\\|_2$ over lags", "",
-                        lag_axis=True, argmax_column="proposal_argmax_lag"),
+    traces.HeatmapPanel("proposal_lag_map", "Proposal norm $\\| r_{t,\\ell}\\|_2$ over lags (log colour scale)", "",
+                        log=True, lag_axis=True, argmax_column="proposal_argmax_lag"),
     traces.LinePanel(("mu_prior_norm", "delta_mu_norm"), "Latent norms", "latent units",
                      labels=("$\\|\\mu^p\\|_2$", "$\\|\\mu^q - \\mu^p\\|_2$")),
     traces.LinePanel(("mean_logvar_prior", "mean_logvar_post"), "Mean log-variance over coordinates", "",
@@ -310,12 +311,12 @@ def trace_recording(
             y_st, y_ph, u_stream, anchor_phase=phase, anchor_stride=stride, return_proposals=True
         )
         target = model._build_forecast_target(target_features, outputs["anchor_index"])
-        gathered.extend(
-            gather_segment_traces(
-                model, outputs, target, weight, batch_rows, likelihood=likelihood,
-                clinical_class=clinical_class, subgroup=subgroup,
-            )
+        segment_traces = gather_segment_traces(
+            model, outputs, target, weight, batch_rows, likelihood=likelihood,
+            clinical_class=clinical_class, subgroup=subgroup,
         )
+        traces.attach_raw_signals(segment_traces, batch)
+        gathered.extend(segment_traces)
     return gathered
 
 
@@ -353,7 +354,9 @@ def run_recording_traces(
         loader: The evaluation dataloader the pass walked.
         identities: One row per scored segment -- ``guid``, ``epoch``, class, subgroup -- as the
             pass recorded them.
-        eval_config: The validated settings, for ``caps.traces_per_class`` and the seed.
+        eval_config: The validated settings, for ``caps.traces_per_class``, the seed and
+            ``max_hours_before_delivery``, which bounds the segments traced to those recorded
+            within that many hours of delivery.
         results_dir: The run's results directory; the stage writes into its own subdirectory.
         geometry_record: The collection-style geometry record the break tolerance is read from,
             or ``None`` for the family's default stride.
@@ -367,11 +370,16 @@ def run_recording_traces(
     caps = dict(eval_config.get("caps") or {})
     per_class = int(caps.get(traces.TRACES_CAP) or traces.DEFAULT_TRACES_PER_CLASS)
     seed = int(eval_config.get("seed", 0)) + traces.TRACE_DRAW_SEED_OFFSET
+    window_hours = eval_config.get("max_hours_before_delivery")
     plan = {
         "capped": True, "traces_per_class": per_class, "seed": seed,
         "min_segments": traces.MIN_SEGMENTS_PER_TRACE,
         "anchor_phase": DENSE_ANCHOR_GEOMETRY[0], "anchor_stride": DENSE_ANCHOR_GEOMETRY[1],
         "lag_qualification": PROPOSAL_QUALIFICATION,
+        # The bound the run reads its clocks over is applied here too: only the segments recorded
+        # within it are traced, counted for eligibility, or drawn from.
+        "max_hours_before_delivery": None if window_hours is None else float(window_hours),
+        "max_hours_before_delivery_applied": window_hours is not None,
     }
     if identities.empty or identities[labels.CLASS_COLUMN].isna().all():
         reason = (
@@ -382,7 +390,7 @@ def run_recording_traces(
         logger.warning(f"{traces.ANALYSIS_DIRNAME}: skipped -- {reason}")
         return {"status": STATUS_SKIPPED, "reason": reason, "plan": plan, "files": []}
 
-    index_map = dataset_index_map(loader)
+    index_map = cohort.within_horizon_index(dataset_index_map(loader), window_hours)
     labelled = frames.per_recording_labels(identities)
     counts: Dict[str, int] = {}
     for guid, _stamp in index_map:
@@ -428,6 +436,13 @@ def run_recording_traces(
                 ),
                 class_dir / f"{stem}{traces.TRACE_FIGURE_SUFFIX}",
             )
+            dashboard = traces_html.write_recording_dashboard(
+                traces_html.build_recording_dashboard(
+                    recording, panels=PANELS, lag_seconds=lag_seconds,
+                    caveat=f"{PROPOSAL_QUALIFICATION} {lag_axis.GROUP_DELAY_CAVEAT}",
+                ),
+                class_dir / f"{stem}{traces.TRACE_FIGURE_SUFFIX}",
+            )
         except Exception as error:  # noqa: BLE001 - one recording is not worth the rest of them
             logger.warning(f"{traces.ANALYSIS_DIRNAME}: recording {guid} failed: {error}")
             failures.append({"guid": guid, "error": f"{type(error).__name__}: {error}"})
@@ -452,6 +467,7 @@ def run_recording_traces(
                 "span_hours": float(span.max() - span.min()) if len(span) else float("nan"),
                 "arrays_file": Path(arrays).relative_to(directory).as_posix(),
                 "figure_file": Path(figure).relative_to(directory).as_posix(),
+                "dashboard_file": Path(dashboard).relative_to(directory).as_posix(),
             }
         )
 
@@ -465,7 +481,7 @@ def run_recording_traces(
     )
     summary_figure = figures.render_figure(
         traces.build_summary_figure(
-            summary, metrics=SUMMARY_METRICS, window_hours=eval_config.get("max_hours_before_delivery"),
+            summary, metrics=SUMMARY_METRICS, window_hours=window_hours,
         ),
         directory / traces.SUMMARY_FIGURE,
     )

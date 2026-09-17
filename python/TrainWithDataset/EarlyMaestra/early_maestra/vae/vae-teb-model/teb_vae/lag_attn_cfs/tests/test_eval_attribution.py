@@ -118,6 +118,74 @@ def test_the_wrapper_returns_the_forwards_own_quantities_at_each_rows_anchor() -
     assert rows.shape[0] == sum(len(c) for c in columns)
 
 
+def test_the_horizon_and_fidelity_readouts_are_the_forwards_own_block_scores() -> None:
+    """The per-step score sums over the block to the full-branch score; the fidelity readouts are the
+    masked squared error of the mean forecast, and its gap, under the same mask."""
+    module = _module()
+    model = module.orig_model
+    inputs, extra, outputs, contributing = _inputs(module)
+    columns = core.spread_columns(contributing, 2)
+    rows_inputs, rows_extra, cols, sample = core.expand_rows(inputs, extra, columns)
+    args = (rows_extra[0], rows_extra[1], cols, torch.zeros_like(cols))
+    horizons = core.horizon_steps(model)
+    assert list(horizons) == ["first", "last"] and horizons["first"] == 0 and horizons["last"] == int(model.horizon) - 1
+    with torch.no_grad():
+        full = core.AnchorReadout(model, core.ATTENTION_CELL, readout=core.READOUT_NLL_FULL)(*rows_inputs, *args)
+        per_step = sum(
+            core.AnchorReadout(model, core.ATTENTION_CELL, readout=core.READOUT_NLL_HORIZON, horizon=step)(*rows_inputs, *args)
+            for step in range(int(model.horizon))
+        )
+        torch.testing.assert_close(per_step, full, rtol=1e-4, atol=1e-4)
+
+        mse_full = core.AnchorReadout(model, core.ATTENTION_CELL, readout=core.READOUT_MSE_FULL)(*rows_inputs, *args)
+        mse_gap = core.AnchorReadout(model, core.ATTENTION_CELL, readout=core.READOUT_MSE_GAP)(*rows_inputs, *args)
+        mask, _coverage, _support = anchor_support(model, extra[1], outputs)
+        target = model._build_forecast_target(extra[0], outputs["anchor_index"])
+        scores, _ = mean_decoded_block(
+            model, {"base": (outputs["mu_prior"], None), "full": (outputs["mu_post"], None)}, target, mask,
+            anchors=outputs["anchor_index"], likelihood="mse", persistence=outputs.get("persistence"),
+        )
+        torch.testing.assert_close(mse_full, scores["full"][torch.as_tensor(sample), cols], rtol=1e-4, atol=1e-4)
+        torch.testing.assert_close(mse_gap, (scores["base"] - scores["full"])[torch.as_tensor(sample), cols], rtol=1e-4, atol=1e-4)
+    # Every variant the example page draws is a readout the wrapper accepts.
+    for readout, tag, band, step in core.example_variants({"near": (0, 2)}, horizons):
+        core.AnchorReadout(model, core.ATTENTION_CELL, readout=readout, lag_band=band, horizon=step)
+        assert core.variant_label(readout, tag)
+
+
+def test_block_sums_partition_the_maps_and_the_cold_cells_are_blanked() -> None:
+    rng = np.random.default_rng(0)
+    target, source = rng.normal(size=(3, 6, 5)), rng.normal(size=(3, 6, 4))
+    sums = core.block_sums(target, source, n_scattering=2, source_split=3)
+    assert list(sums) == list(core.BLOCKS)
+    signed = sum(values[0] for values in sums.values())
+    unsigned = sum(values[1] for values in sums.values())
+    np.testing.assert_allclose(signed, target.sum(axis=(1, 2)) + source.sum(axis=(1, 2)))
+    np.testing.assert_allclose(unsigned, np.abs(target).sum(axis=(1, 2)) + np.abs(source).sum(axis=(1, 2)))
+    # A phase-only source puts everything in the phase block.
+    assert core.block_sums(target, source, n_scattering=2, source_split=0)[core.BLOCK_SOURCE_SCATTERING][1].sum() == 0.0
+
+    field = np.ones((6, 3))
+    masked = core.masked_field(field, np.array([0, 2, 9]), anchor=3)
+    assert np.isnan(masked[:2, 1]).all() and np.isfinite(masked[2:4, 1]).all()
+    assert np.isnan(masked[:, 2]).all()                      # never live
+    assert np.isnan(masked[4:, 0]).all() and np.isfinite(masked[:4, 0]).all()   # after the anchor
+    assert np.isfinite(core.masked_field(field, None)).all()
+    assert np.isfinite(field).all()                            # a copy, never in place
+
+    norm = core.signed_log_norm(np.array([[-2.0, 0.0], [np.nan, 0.5]]))
+    assert norm.vmin == -2.0 and norm.vmax == 2.0 and np.isclose(norm.linthresh, 2.0 * 10 ** -core.LOG_DECADES)
+    assert core.signed_log_norm(np.zeros((2, 2))) is None
+    log = core.unsigned_log_norm(np.array([0.0, 3.0, np.nan]))
+    assert log.vmax == 3.0 and np.isclose(log.vmin, 3.0 * 10 ** -core.LOG_DECADES)
+    assert core.unsigned_log_norm(np.zeros(3)) is None
+    fig, ax = plt.subplots()
+    ax.plot([0, 1], [1e-6, 10.0])
+    core.symlog_axis(ax, np.array([1e-6, 10.0]), headroom=1.0)
+    assert ax.get_yscale() == "symlog" and ax.get_ylim()[1] >= 100.0
+    plt.close(fig)
+
+
 def test_an_unknown_readout_or_baseline_is_refused_by_name() -> None:
     module = _module()
     with pytest.raises(ValueError, match="readout must be one of"):
@@ -441,7 +509,7 @@ def test_the_analysis_attributes_a_balanced_draw_end_to_end(tmp_path, monkeypatc
         assert (directory / name).is_file(), name
     for stem in (core.MAP_FIGURE, core.LAG_PROFILE_FIGURE, core.BAND_FIGURE, core.LAYER_FIGURE, core.NULL_FIGURE,
                  core.CHANNEL_FIGURE, core.LAG_CHANNEL_FIGURE, core.TIME_PROFILE_FIGURE, core.CHECKS_FIGURE,
-                 core.DELIVERY_FIGURE):
+                 core.DELIVERY_FIGURE, core.BLOCK_FIGURE, core.HORIZON_FIGURE):
         assert (directory / f"{stem}.pdf").is_file()
     # The population lag-by-channel maps: one per main readout, baseline and stream, on the lag
     # axis and the declared channel axis, and the unsigned mean is never below the signed one.
@@ -459,8 +527,17 @@ def test_the_analysis_attributes_a_balanced_draw_end_to_end(tmp_path, monkeypatc
         # Under the source-null baseline the target inputs never move.
         assert np.nanmax(handle[f"{core.READOUT_KLD}__{core.BASELINE_SOURCE_NULL}__target__mean_abs"]) == 0.0
     rows = pd.read_csv(directory / core.ROWS_FILENAME)
-    assert set(rows["readout"]) == {core.READOUT_KLD, core.READOUT_PRED_GAP, core.READOUT_LAG_BAND, core.READOUT_KLD_DIM}
+    horizons = core.horizon_steps(module.orig_model)
+    assert set(rows["readout"]) == {*core.MAIN_READOUTS, core.READOUT_LAG_BAND, core.READOUT_KLD_DIM, core.READOUT_NLL_HORIZON}
     assert set(rows[rows["readout"] == core.READOUT_LAG_BAND]["band"]) == set(TINY_BANDS)
+    assert set(rows[rows["readout"] == core.READOUT_NLL_HORIZON]["band"]) == {f"h{step}" for step in horizons.values()}
+    for name in core.BLOCKS:
+        assert f"block_{name}" in rows.columns and f"block_abs_{name}" in rows.columns
+    blocks = pd.read_csv(directory / core.BLOCKS_FILENAME)
+    assert set(blocks["block"]) == set(core.BLOCKS) and set(blocks["baseline"]) == set(core.BASELINES)
+    # A row's unsigned block shares partition its unsigned total.
+    shares = blocks[blocks["baseline"] == core.BASELINE_ALL_ZERO].groupby("label")["share_mean"].sum()
+    assert np.allclose(shares.to_numpy(), 1.0, atol=1e-6)
     assert rows["guid"].nunique() == 3
     for name in TINY_BANDS:
         assert f"lagband_{name}" in rows.columns and f"ablation_{name}" in rows.columns
@@ -493,10 +570,16 @@ def test_the_analysis_attributes_a_balanced_draw_end_to_end(tmp_path, monkeypatc
         assert handle["input_target"].shape == (3, int(model.sequence_length), int(model.c_y))
         assert handle["input_source"].shape == (3, int(model.sequence_length), int(model.c_u))
         readouts = set(zip(handle["map_readout"].tolist(), handle["map_baseline"].tolist(), handle["map_band"].tolist()))
-        expected = {(readout, baseline, "") for readout in core.EXAMPLE_READOUTS for baseline in core.BASELINES}
-        expected |= {(core.READOUT_LAG_BAND, baseline, name) for name in TINY_BANDS for baseline in core.BASELINES}
+        expected = {
+            (readout, baseline, tag)
+            for readout, tag, _band, _step in core.example_variants(TINY_BANDS, horizons)
+            for baseline in core.BASELINES
+        }
         assert readouts == expected
         assert handle["map_target"].shape[0] == 3 * len(expected)
+        # The activations kept beside the maps: the latent at the anchor and the per-head split.
+        assert handle["example_latent_kld_dim"].shape == (3, int(model.d_z))
+        assert handle["map_layer"].shape == (3 * len(expected), int(model.posterior_head.num_heads))
         # Under the source-null baseline the target inputs never move, so the target map is zero.
         null = np.asarray(handle["map_baseline"]) == core.BASELINE_SOURCE_NULL
         assert np.abs(handle["map_target"][null]).max() == 0.0
