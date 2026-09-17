@@ -54,7 +54,8 @@ import numpy as np
 import pandas as pd
 
 from teb_vae.lag_attn_cfs.eval._reuse import band_partition as shared
-from teb_vae.lag_attn_cfs.eval._reuse import figures, stats as shared_stats
+from teb_vae.lag_attn_cfs.eval import figures_seam as figures
+from teb_vae.lag_attn_cfs.eval._reuse import stats as shared_stats
 from teb_vae.lag_attn_cfs.eval.frames import (
     RECOMPOSITION_SCALE_COLUMN,
     describe,
