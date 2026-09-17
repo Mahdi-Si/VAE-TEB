@@ -916,3 +916,28 @@ def test_the_gate_pairs_the_candidate_against_the_reference_by_recording() -> No
     worse["results"] = {**candidate["results"], "arm_scores": {
         **candidate["results"]["arm_scores"], "nll_base": {"point": -9.0}}}
     assert gate.check_against_reference(worse, reference)["status"] == "FAIL"
+
+
+@pytest.mark.parametrize("profile", ["lag25.yaml", "default.yaml"])
+def test_the_committed_delta_partitions_any_window_and_keeps_the_cross_bank_bands(
+    profile: str,
+) -> None:
+    """The partition is derived from the checkpoint's own ``max_lag``, so the one committed delta
+    loads on the production bank and on the long one alike; the two cross-bank bands are declared
+    beside it and abut, so the two banks can be read on one interval."""
+    from teb_vae.lag_attn_cfs.eval.config_schema import PARTITION_WIDTH_KEY, validate_eval_config
+
+    delta = load_eval_overrides(LAG_RESIDUAL_BINDING.overrides_path)["eval_config"]
+    assert PARTITION_WIDTH_KEY in delta["occlusion_bands"]
+    config = Path(__file__).resolve().parents[1] / "configs" / profile
+    max_lag = int(
+        yaml.safe_load(config.read_text(encoding="utf-8"))["model_config"]["VAE_model"]["max_lag"]
+    )
+    bands = validate_eval_config(
+        {"eval_config": delta, "model_config": {"VAE_model": {"max_lag": max_lag}}}
+    )["occlusion_bands"]
+    derived = {name: span for name, span in bands.items() if name.startswith("lags_")}
+    covered = sorted(lag for lo, hi in derived.values() for lag in range(lo, hi + 1))
+    assert covered == list(range(max_lag + 1))
+    head, tail = bands["common_head"], bands["common_tail"]
+    assert head[0] == 0 and head[1] + 1 == tail[0] and tail[1] <= max_lag
