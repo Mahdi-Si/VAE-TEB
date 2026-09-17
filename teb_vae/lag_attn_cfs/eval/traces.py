@@ -101,7 +101,7 @@ UNLABELLED_CLASS = "unlabelled"
 #: The manifest's columns: whose trace a file is, how much it holds and where it is.
 MANIFEST_COLUMNS: Tuple[str, ...] = (
     "guid", labels.CLASS_COLUMN, labels.SUBGROUP_COLUMN, "n_segments", "n_segments_collected",
-    "n_anchors", "n_contributing", "span_hours", "arrays_file", "figure_file",
+    "n_anchors", "n_contributing", "span_hours", "arrays_file", "figure_file", "dashboard_file",
 )
 
 #: Suffixes the lag-shape statistics are written under, keyed by :data:`lag_shape.STATISTIC_KEYS`.
@@ -157,6 +157,9 @@ class SegmentTrace:
             divergence, the lag profiles.
         clocks: Per-segment clinical clocks the cell could read (labour onset, second-stage
             onset), ``NaN`` where the recording has none. Carried through to the summary.
+        raw: ``{name: (N,)}`` the raw signals of the segment as the loader served them (``fhr``,
+            ``up``), at the raw rate from the segment's ``epoch``. Drawn on the interactive page
+            only; absent when the loader was not asked for them.
     """
 
     guid: str
@@ -168,6 +171,22 @@ class SegmentTrace:
     scalars: Dict[str, np.ndarray] = field(default_factory=dict)
     vectors: Dict[str, np.ndarray] = field(default_factory=dict)
     clocks: Dict[str, float] = field(default_factory=dict)
+    raw: Dict[str, np.ndarray] = field(default_factory=dict)
+
+
+#: The raw signal fields a batch may carry, attached to a trace when it does.
+RAW_SIGNAL_FIELDS: Tuple[str, ...] = ("fhr", "up")
+
+
+def attach_raw_signals(segments: Sequence["SegmentTrace"], batch: Any) -> None:
+    """Attach each batch sample's raw signals to its trace, in batch order, where the batch has them."""
+    for name in RAW_SIGNAL_FIELDS:
+        value = batch.get(name) if isinstance(batch, dict) else getattr(batch, name, None)
+        if value is None:
+            continue
+        array = value.detach().cpu().numpy() if hasattr(value, "detach") else np.asarray(value)
+        for position, segment in enumerate(segments):
+            segment.raw[name] = np.asarray(array[position], dtype=np.float32).reshape(-1)
 
 
 @dataclass
@@ -874,7 +893,14 @@ def _draw_heatmap(
         return
     stacked = np.concatenate(present, axis=0)
     finite = stacked[np.isfinite(stacked)]
-    if panel.log:
+    if panel.log and panel.symmetric:
+        # A signed quantity on a log scale: linear inside the floor, logarithmic beyond it.
+        limit = float(np.abs(finite).max()) if finite.size and np.abs(finite).max() > 0 else 1.0
+        norm = mcolors.SymLogNorm(
+            linthresh=limit * 10.0 ** (-LOG_PANEL_DECADES), vmin=-limit, vmax=limit, base=10
+        )
+        cmap = "RdBu_r"
+    elif panel.log:
         positive = finite[finite > 0.0]
         top = float(positive.max()) if positive.size else 1.0
         norm = mcolors.LogNorm(vmin=top * 10.0 ** (-LOG_PANEL_DECADES), vmax=top)
@@ -899,7 +925,7 @@ def _draw_heatmap(
             continue
         hours = _segment_hours(segment)
         values = np.asarray(block, dtype=np.float64)
-        if panel.log:
+        if panel.log and not panel.symmetric:
             values = np.where(values > 0.0, values, np.nan)
         # One mesh per run of evenly spaced anchors, so a gap inside a segment is a gap on the
         # page rather than a neighbour stretched across it.

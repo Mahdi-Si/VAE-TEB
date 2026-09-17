@@ -70,6 +70,8 @@ The wrapper exposes the following readouts. The symbols $\mu^p$ and $\mu^q$ are 
 | `nll_full`, `nll_base` | The masked forecast-block score after decoding that branch at its latent mean. |
 | `pred_gap` | The mean-decoded difference $D_{\mathrm{base}}-D_{\mathrm{full}}$, reported as `mean_pred_gap` by the collection pass. |
 | `lag_band` | Attention mass averaged over heads within a band for attentive models, or the sum of proposal norms within that band for the lag-residual model. |
+| `nll_horizon` | The full-branch block score at one horizon step $\tau$: summed over channels at that step only, so the per-step scores sum to `nll_full`. Attributed at the first and the last step; a row's `band` column carries the step as `h<step>`. |
+| `mse_full`, `mse_gap` | The forecast **fidelity**: the masked squared error of the mean-decoded full forecast, and its base-minus-full gap. Scored under `'mse'` whatever the objective's likelihood, so the learned variance cannot trade against it. |
 
 ### The attribution uses latent means
 
@@ -79,13 +81,14 @@ The Monte Carlo predictive score `mc_pred_gap` is not attributed here. Attributi
 
 ### What a standard pass computes
 
-- `kld` and `pred_gap` under both baselines.
+- The main readouts `kld`, `pred_gap`, `nll_full` and `mse_full` under both baselines.
+- `nll_horizon` at the first and the last horizon step under both baselines.
 - `lag_band` for each configured `occlusion_bands` band under `source_null`.
 - `kld_dim` for the coordinate with the largest divergence at each selected anchor, under `source_null`.
-- Layer attribution for `kld` and `pred_gap`, split by attention head or lag slot.
+- Layer attribution for every main readout, split by attention head or lag slot.
 - Source-band ablation for both main readouts.
 - Target-only readouts on one segment per run to verify that source attribution is zero.
-- One **example anchor per class**, attributed for `kld`, `pred_gap`, `nll_full` and `lag_band` on every configured band under both baselines, with the full maps and the input streams kept for the map figures.
+- One **example anchor per class**, attributed for `kld`, `pred_gap`, `nll_full`, `mse_full`, `mse_gap`, `nll_horizon` at both steps and `lag_band` on every configured band under both baselines, with the full maps, the input streams, the latent at the anchor and every readout's layer split kept for the map pages.
 - The per-recording **trace** readouts, `kld` and `pred_gap`, at a few anchors of every segment of one recording per class under `source_null`.
 
 ### Read the sign before interpreting magnitude
@@ -249,6 +252,7 @@ Every lag axis represents stored-coefficient time. It is not a physiological del
 | `attribution_lag_bands.csv` | One row per readout and lag band: bounds, IG sum, ablation change, recording count, and an occlusion comparison where available. |
 | `attribution_layer.csv` | One row per readout, layer unit, and class or `pooled`: recording count and mean attribution. |
 | `attribution_null.csv` | One row per readout, baseline, and class or `pooled`: recording means of input, baseline and entry values, entry jump, attributed sum, and stream totals. |
+| `attribution_blocks.csv` | One row per readout, band, baseline and input block (target scattering, target phase, source scattering, source phase): recording-mean signed and unsigned sums and the unsigned share. |
 | `attribution_traces.csv` | Manifest of traced recordings: identity, class, subgroup, segment and anchor counts, span, and array/figure paths. |
 | `traces/<class>/<guid>_<subgroup>_attribution_trace.npz` | Shared trace arrays for one recording, including `attribution_lag_map` and `model_lag_map`. |
 
@@ -262,7 +266,7 @@ Every lag axis represents stored-coefficient time. It is not a physiological del
 | Attribution totals | `attributed` (IG sum), `target_total`, `source_total`, `target_abs_total`, `source_abs_total`. |
 | Numerical checks | `ig_delta`, `completeness_rel`, `after_anchor_max_abs`, `gated_off_max_abs`. |
 | Lag agreement | `lag_corr`, `lag_js`. |
-| Band and layer summaries | `lagband_<band>`, `band_<stream>_<band>`, `layer_total`, `layer_off_axis_total`. |
+| Band, block and layer summaries | `lagband_<band>`, `band_<stream>_<band>`, `block_<block>`, `block_abs_<block>`, `layer_total`, `layer_off_axis_total`. |
 | Ablation results | `ablation_<band>`, `ablation_rest`. |
 
 `attribution_vectors.npz` contains `time_profile_target` and `time_profile_source` with shape $(N,T)$; `lag_profile`, `target_lag_profile`, and `model_profile` with shape $(N,L)$; `channel_profile_target` with shape $(N,c_y)$; `channel_profile_source` with shape $(N,c_u)$; and `lag_seconds` with shape $(L,)$. `layer_per_unit` has shape $(N,M)$ for $M$ attention heads or $(N,L)$ for lag slots, with `NaN` rows where no split was taken.
@@ -278,7 +282,7 @@ The lag-band table records `lag_lo`, `lag_hi`, `ig_attribution_mean`, `ablation_
 | Figure | How to read it |
 | --- | --- |
 | `attribution_maps.pdf` | One example anchor per class: the target and source input coefficients, the target attribution of $K_t$ under `all_zero`, the source attribution of $K_t$ under `source_null`, and a lag panel comparing the source attribution with the model's lag readout. |
-| `maps/<class>_<guid>_<subgroup>_anchor<step>_attribution_maps.pdf` | One page per class example: the inputs, then for every example readout — `kld`, `pred_gap`, `nll_full`, and `lag_band` per configured band — the target map (`all_zero`), the source map (`source_null`) and the lag-aligned comparison. |
+| `maps/<class>_<guid>_<subgroup>_anchor<step>_attribution_maps.pdf` | One page per class example on one shared stored-time axis, laid out as the samples pages: the inputs with cold cells blanked, then for every example readout — `kld`, `pred_gap`, `nll_full`, `mse_full`, `mse_gap`, `nll_horizon` at both steps and `lag_band` per configured band — the target map (`all_zero`) above the source map (`source_null`) on symmetric-log colour scales, then the latent at the anchor, the per-head or per-lag activation split of every readout, and every readout's lag-aligned source attribution on one axis. |
 | `attribution_lag_profile.pdf` | Normalised absolute lag attribution versus the normalised model profile, averaged over recordings, pooled and by class, with titles reporting agreement; a last row overlays every readout — divergence, forecast gap and each lag-band readout — on one lag axis, and the band readouts against their own bands. |
 | `attribution_bands.pdf` | Frequency-band attribution by stream above, with target-band spectral skill on a second vertical axis where available. Lag-band IG sums, ablation changes, and occlusion comparisons appear below. Check the axes and sign conventions separately. |
 | `attribution_layer.pdf` | Per-head or per-lag attribution on the left; input profiles for the anchor's highest-divergence coordinate on the right. |
@@ -288,9 +292,11 @@ The lag-band table records `lag_lo`, `lag_hi`, `ig_attribution_mean`, `ablation_
 | `attribution_time_profile.pdf` | Per main readout and stream, the mean positive and negative parts of the attribution by offset from the anchor, with the net and unsigned means. |
 | `attribution_checks.pdf` | The per-row completeness residuals against the tolerance, the entry jump against the readout at the input, and the two structural checks per readout. |
 | `attribution_time_to_delivery.pdf` | The source attribution total and the lag centroid of every attributed anchor against hours before delivery, by class. |
+| `attribution_blocks.pdf` | Per readout, the unsigned share and the signed sum of the attribution in each of the four input blocks. |
+| `attribution_horizon.pdf` | The per-step score at the first and the last horizon step: stream totals, and the source and target attribution by offset per step. |
 | `traces/<class>/<guid>_<subgroup>_attribution_trace.pdf` | Attribution lag maps of the divergence and of the forecast gap through one recording beside the model lag map, with each readout's agreement, totals and values on the hours-before-delivery axis. |
 
-The [figure guide](FIGURE_GUIDE.md#attributionattribution_mapspdf) provides panel-by-panel interpretation. Every figure prints `ATTRIBUTION_CAVEAT`; lag figures also print the group-delay caveat and the model-specific lag qualification.
+The [figure guide](FIGURE_GUIDE.md#attributionattribution_mapspdf) provides panel-by-panel interpretation. Every figure prints `ATTRIBUTION_CAVEAT`; lag figures also print the group-delay caveat and the model-specific lag qualification. Every map blanks the cells the model never read (a channel's cold steps, and the steps after the anchor on an attribution map) and draws attributions on a symmetric-log colour scale spanning `LOG_DECADES` below the map's largest magnitude; line and bar panels of attributions are on symmetric-log axes for the same reason.
 
 ### The summary block
 

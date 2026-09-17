@@ -61,18 +61,23 @@ import warnings
 from dataclasses import dataclass
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
+import matplotlib.pyplot as plt
+import matplotlib.ticker as mticker
 import numpy as np
 import pandas as pd
 import torch
 from captum.attr import FeatureAblation, IntegratedGradients, LayerIntegratedGradients
+from matplotlib import colors as mcolors
+from matplotlib.gridspec import GridSpec
 from torch import nn
 
+from teb_vae.lag_attn.figure_primitives import sample_cell_edges
 from teb_vae.lag_attn.nets.lag_report import SECONDS_PER_STEP
 from teb_vae.lag_attn_cfs.eval import cohort, lag_hist, traces
 from teb_vae.lag_attn_cfs.eval import figures_seam as figures
 from teb_vae.lag_attn_cfs.eval._reuse import band_partition, labels
 from teb_vae.lag_attn_cfs.eval.lag_axis import COEFFICIENT_LAG_AXIS_LABEL, GROUP_DELAY_CAVEAT
-from teb_vae.lag_attn_rws.nets.losses import masked_raw_block_per_anchor
+from teb_vae.lag_attn_rws.nets.losses import masked_raw_block_per_anchor, raw_sample_score
 from teb_vae.lag_attn_rws.nets.raw_masks import forecast_mask
 
 #: This analysis's own subdirectory inside a results directory, and the files it writes.
@@ -100,6 +105,12 @@ LAG_CHANNEL_FIGURE = "attribution_lag_channel"
 TIME_PROFILE_FIGURE = "attribution_time_profile"
 CHECKS_FIGURE = "attribution_checks"
 DELIVERY_FIGURE = "attribution_time_to_delivery"
+BLOCK_FIGURE = "attribution_blocks"
+HORIZON_FIGURE = "attribution_horizon"
+
+#: The per-block table: per readout, baseline and input block, the recording-mean signed and
+#: unsigned attribution and the unsigned share of the block in the row's total.
+BLOCKS_FILENAME = "attribution_blocks.csv"
 
 #: The population lag-by-channel maps, mean over attributed anchors of the signed and unsigned
 #: attribution re-indexed by offset from the anchor, per main readout, baseline and stream.
@@ -132,7 +143,7 @@ TRACE_READOUTS: Tuple[str, ...] = ("kld", "pred_gap")
 #: band, which the pass adds. Attributed under both baselines at that one anchor, so the target
 #: map (which only the all-zero path moves) and the source map (the source-null comparison) are
 #: both on the page.
-EXAMPLE_READOUTS: Tuple[str, ...] = ("kld", "pred_gap", "nll_full")
+EXAMPLE_READOUTS: Tuple[str, ...] = ("kld", "pred_gap", "nll_full", "mse_full", "mse_gap")
 
 #: Where the example pages go, under the analysis directory, and the tail of their names.
 EXAMPLE_DIRNAME = "maps"
@@ -167,15 +178,46 @@ READOUT_NLL_FULL = "nll_full"
 READOUT_NLL_BASE = "nll_base"
 READOUT_PRED_GAP = "pred_gap"
 READOUT_LAG_BAND = "lag_band"
+#: The full-branch block score at ONE horizon step -- the near and the far end of the forecast
+#: block are different questions of the same inputs -- and the forecast FIDELITY readouts: the
+#: masked squared error of the mean-decoded full forecast, which the learned variance cannot
+#: trade against, and its base-minus-full gap. The block score is a log-density and a well
+#: calibrated but wide forecast scores it well; the squared error is what a reader means by
+#: "how close was the forecast".
+READOUT_NLL_HORIZON = "nll_horizon"
+READOUT_MSE_FULL = "mse_full"
+READOUT_MSE_GAP = "mse_gap"
 READOUTS: Tuple[str, ...] = (
     READOUT_KLD, READOUT_KLD_DIM, READOUT_MU_POST_DIM, READOUT_MU_PRIOR_DIM,
     READOUT_NLL_FULL, READOUT_NLL_BASE, READOUT_PRED_GAP, READOUT_LAG_BAND,
+    READOUT_NLL_HORIZON, READOUT_MSE_FULL, READOUT_MSE_GAP,
+)
+#: The block-score readouts, which decode a latent mean and score the forecast block.
+BLOCK_SCORE_READOUTS: Tuple[str, ...] = (
+    READOUT_NLL_FULL, READOUT_NLL_BASE, READOUT_PRED_GAP, READOUT_NLL_HORIZON,
+    READOUT_MSE_FULL, READOUT_MSE_GAP,
 )
 #: The readouts whose value depends on the target streams alone, so their source attribution is
 #: zero by construction and is asserted rather than assumed.
 TARGET_ONLY_READOUTS: Tuple[str, ...] = (READOUT_MU_PRIOR_DIM, READOUT_NLL_BASE)
-#: What a production pass attributes under both baselines.
-MAIN_READOUTS: Tuple[str, ...] = (READOUT_KLD, READOUT_PRED_GAP)
+#: What a production pass attributes under both baselines: the latent change, the forecast gain,
+#: the full-branch score itself and the full-branch fidelity, so which inputs move the score and
+#: which move the error can be read against each other on every population figure.
+MAIN_READOUTS: Tuple[str, ...] = (READOUT_KLD, READOUT_PRED_GAP, READOUT_NLL_FULL, READOUT_MSE_FULL)
+#: The horizon steps the per-horizon block score is attributed at, as names of a position in the
+#: block: the first step and the last, resolved against the model's horizon by
+#: :func:`horizon_steps`. The ``band`` column of a row carries the step as ``h<step>``.
+HORIZON_READOUT_STEPS: Tuple[str, ...] = ("first", "last")
+
+#: The four input blocks every attribution map can be summed over: the two target blocks and
+#: the two source blocks, in the order they are concatenated in.
+BLOCK_TARGET_SCATTERING = "target_scattering"
+BLOCK_TARGET_PHASE = "target_phase"
+BLOCK_SOURCE_SCATTERING = "source_scattering"
+BLOCK_SOURCE_PHASE = "source_phase"
+BLOCKS: Tuple[str, ...] = (
+    BLOCK_TARGET_SCATTERING, BLOCK_TARGET_PHASE, BLOCK_SOURCE_SCATTERING, BLOCK_SOURCE_PHASE,
+)
 
 #: The two input streams the attributions are reduced on. ``target`` is the declared
 #: concatenation of the two target blocks, ``source`` the declared source stream.
@@ -342,6 +384,7 @@ class AnchorReadout(nn.Module):
         readout: str,
         likelihood: str = "gaussian_nll",
         lag_band: Tuple[int, int] = (0, 0),
+        horizon: int = 0,
     ) -> None:
         """Bind the model and the readout.
 
@@ -349,8 +392,10 @@ class AnchorReadout(nn.Module):
             model: The rebuilt net, in evaluation mode.
             cell: The cell binding.
             readout: One of :data:`READOUTS`.
-            likelihood: ``'mse'`` or ``'gaussian_nll'``.
+            likelihood: ``'mse'`` or ``'gaussian_nll'``, for the block-score readouts; the
+                fidelity readouts score under ``'mse'`` whatever this says.
             lag_band: The inclusive ``(lo, hi)`` lag pair the lag readout sums over.
+            horizon: The horizon step the per-horizon readout scores, ``0 <= horizon < H``.
 
         Raises:
             ValueError: If ``readout`` is not one of :data:`READOUTS`.
@@ -363,6 +408,7 @@ class AnchorReadout(nn.Module):
         self.readout = str(readout)
         self.likelihood = str(likelihood)
         self.lag_band = (int(lag_band[0]), int(lag_band[1]))
+        self.horizon = int(horizon)
 
     def _forward_kwargs(self) -> Dict[str, Any]:
         """The dense geometry, plus the retained proposals where the lag readout needs them."""
@@ -435,7 +481,7 @@ class AnchorReadout(nn.Module):
                 dense = outputs["mu_post" if name == READOUT_MU_POST_DIM else "mu_prior"]
             vector = self._at_anchor(dense, anchors, columns)          # (B, d_z)
             return vector[rows, coordinates] + tie
-        if name in (READOUT_NLL_FULL, READOUT_NLL_BASE, READOUT_PRED_GAP):
+        if name in BLOCK_SCORE_READOUTS:
             anchor_column = anchors[:, None]
             target = model._build_forecast_target(target_features, anchor_column)
             mask, _coverage = forecast_mask(
@@ -446,19 +492,29 @@ class AnchorReadout(nn.Module):
             persistence = outputs.get("persistence")
             if persistence is not None:
                 persistence = persistence[rows, columns][:, None]
+            likelihood = "mse" if name in (READOUT_MSE_FULL, READOUT_MSE_GAP) else self.likelihood
+            gap = name in (READOUT_PRED_GAP, READOUT_MSE_GAP)
             scores: Dict[str, torch.Tensor] = {}
             for branch, key in (("full", "mu_post"), ("base", "mu_prior")):
-                if name != READOUT_PRED_GAP and not name.endswith(branch):
+                if not gap and not name.endswith(branch) and name != READOUT_NLL_HORIZON:
+                    continue
+                if name == READOUT_NLL_HORIZON and branch != "full":
                     continue
                 mu = self._at_anchor(outputs[key], anchors, columns)[:, None]   # (B, 1, d_z)
                 forecast_mu, forecast_logvar = model.decoder(mu, persistence=persistence)
+                if name == READOUT_NLL_HORIZON:
+                    # The block score resolved by horizon step: summed over the channels of one
+                    # step rather than over the whole block. Summed over steps it is ``nll_full``.
+                    score = raw_sample_score(forecast_mu, target, likelihood=likelihood, logvar=forecast_logvar)
+                    scores[branch] = (score * mask[..., None]).sum(dim=3)[:, 0, self.horizon]
+                    continue
                 block, _ = masked_raw_block_per_anchor(
-                    forecast_mu, target, mask, likelihood=self.likelihood, logvar=forecast_logvar
+                    forecast_mu, target, mask, likelihood=likelihood, logvar=forecast_logvar
                 )
                 scores[branch] = block[:, 0]
-            if name == READOUT_PRED_GAP:
+            if gap:
                 return scores["base"] - scores["full"] + tie
-            return scores["full" if name == READOUT_NLL_FULL else "base"] + tie
+            return scores["base" if name == READOUT_NLL_BASE else "full"] + tie
         # The lag readout: the attention mass on the band in the attentive cells, the proposal
         # norm on the band in the residual cell.
         low, high = self.lag_band
@@ -628,6 +684,160 @@ def warm_from_step(model: Any, stream: str) -> Optional[np.ndarray]:
     for channel, wait in zip(keep, waits):
         live[int(channel)] = int(wait)
     return live
+
+
+def horizon_steps(model: Any, names: Sequence[str] = HORIZON_READOUT_STEPS) -> Dict[str, int]:
+    """Resolve the named horizon positions against the model's own block length.
+
+    Args:
+        model: The rebuilt net, for ``horizon``.
+        names: ``'first'``, ``'last'`` or a decimal step.
+
+    Returns:
+        ``{name: step}`` in the order given, each ``0 <= step < H``; a name resolving past the
+        block is dropped rather than clipped, so a one-step block attributes one step once.
+    """
+    length = int(getattr(model, "horizon", 1))
+    out: Dict[str, int] = {}
+    for name in names:
+        step = {"first": 0, "last": length - 1}.get(str(name))
+        step = int(name) if step is None else step
+        if 0 <= step < length and step not in out.values():
+            out[str(name)] = step
+    return out
+
+
+def source_block_split(model: Any) -> int:
+    """Where the declared source stream's scattering block ends and its phase block begins."""
+    split = getattr(model, "SOURCE_BLOCK_SPLIT", None)
+    if split is None or not bool(getattr(model, "use_up_st", True)):
+        return 0
+    return int(min(int(split), int(model.c_u)))
+
+
+def block_sums(
+    target: np.ndarray, source: np.ndarray, *, n_scattering: int, source_split: int
+) -> Dict[str, Tuple[np.ndarray, np.ndarray]]:
+    r"""Sum $(N, T, C)$ maps over each of the four input blocks: signed and unsigned.
+
+    Args:
+        target: The declared target maps, scattering block first.
+        source: The declared source maps, scattering block first where the source carries one.
+        n_scattering: Width of the target scattering block.
+        source_split: Width of the source scattering block; $0$ on a phase-only source.
+
+    Returns:
+        ``{block: (signed (N,), unsigned (N,))}`` in :data:`BLOCKS` order.
+    """
+    target = np.asarray(target, dtype=np.float64)
+    source = np.asarray(source, dtype=np.float64)
+    spans = {
+        BLOCK_TARGET_SCATTERING: target[:, :, :int(n_scattering)],
+        BLOCK_TARGET_PHASE: target[:, :, int(n_scattering):],
+        BLOCK_SOURCE_SCATTERING: source[:, :, :int(source_split)],
+        BLOCK_SOURCE_PHASE: source[:, :, int(source_split):],
+    }
+    return {name: (field.sum(axis=(1, 2)), np.abs(field).sum(axis=(1, 2))) for name, field in spans.items()}
+
+
+def masked_field(
+    field: np.ndarray, live: Optional[np.ndarray], *, anchor: Optional[int] = None
+) -> np.ndarray:
+    r"""Blank the cells the model never read: cold steps per channel and, if asked, after the anchor.
+
+    A $(T, C)$ map with ``NaN`` where step $t < $ ``live[c]`` -- the input gate multiplies those
+    cells by zero, so what is stored there is not what the encoder saw and must not set a colour
+    scale -- and, when ``anchor`` is given, at every step after it, where a causal attribution is
+    exactly zero. Drawn as the bad colour, so a blank cell reads as "not read" rather than as a
+    zero the model found.
+
+    Args:
+        field: $(T, C)$.
+        live: Each channel's first live step, or ``None`` for no gate.
+        anchor: The anchor's stored step, or ``None`` to keep the steps after it.
+
+    Returns:
+        A float64 copy with the blanked cells ``NaN``.
+    """
+    out = np.array(field, dtype=np.float64, copy=True)
+    steps = np.arange(out.shape[0])
+    if live is not None:
+        out[steps[:, None] < np.asarray(live, dtype=np.int64)[None, :out.shape[1]]] = np.nan
+    if anchor is not None:
+        out[steps > int(anchor)] = np.nan
+    return out
+
+
+#: Decades of dynamic range every logarithmic colour scale and axis here keeps below its own
+#: maximum -- the traces' constant, so a map here and a trace there stretch the same way.
+LOG_DECADES = traces.LOG_PANEL_DECADES
+
+
+def signed_log_norm(field: np.ndarray) -> Optional[Any]:
+    r"""A symmetric-log colour scale about zero over a signed field, or ``None`` on an empty one.
+
+    Linear inside $\max|a| \cdot 10^{-\mathrm{LOG\_DECADES}}$ and logarithmic beyond it, so a
+    handful of dominant cells no longer flatten every other cell into white.
+    """
+    finite = np.asarray(field, dtype=np.float64)
+    finite = finite[np.isfinite(finite)]
+    if not finite.size or not np.abs(finite).max() > 0.0:
+        return None
+    limit = float(np.abs(finite).max())
+    return mcolors.SymLogNorm(linthresh=limit * 10.0 ** (-LOG_DECADES), vmin=-limit, vmax=limit, base=10)
+
+
+def unsigned_log_norm(field: np.ndarray) -> Optional[Any]:
+    """A log colour scale over a non-negative field's positive mass, or ``None`` when it has none."""
+    finite = np.asarray(field, dtype=np.float64)
+    positive = finite[np.isfinite(finite) & (finite > 0.0)]
+    if not positive.size:
+        return None
+    top = float(positive.max())
+    return mcolors.LogNorm(vmin=top * 10.0 ** (-LOG_DECADES), vmax=top)
+
+
+def symlog_axis(ax: Any, *values: Any, axis: str = "y", headroom: float = 0.0) -> None:
+    """Put an axis on a symmetric-log scale floored :data:`LOG_DECADES` below the data's largest magnitude.
+
+    The linear floor is derived from the data drawn rather than fixed, because a share per lag and
+    a block score in nats are orders of magnitude apart and one threshold cannot serve both. A
+    panel whose data has no magnitude stays linear. ``headroom`` is room for a legend, in
+    **decades** above the data's top -- the linear headroom the shared legend helper makes is a
+    sliver on a log axis.
+    """
+    stacked = np.concatenate([np.asarray(v, dtype=np.float64).reshape(-1) for v in values]) if values else np.zeros(0)
+    finite = stacked[np.isfinite(stacked)]
+    if not finite.size or not np.abs(finite).max() > 0.0:
+        return
+    threshold = float(np.abs(finite).max()) * 10.0 ** (-LOG_DECADES)
+    (ax.set_yscale if axis == "y" else ax.set_xscale)("symlog", linthresh=threshold, base=10)
+    if headroom > 0.0:
+        low, high = ax.get_ylim() if axis == "y" else ax.get_xlim()
+        high = max(float(high), threshold) * 10.0 ** float(headroom)
+        (ax.set_ylim if axis == "y" else ax.set_xlim)(low, high)
+
+
+def symlog_legend(ax: Any, *values: Any, ncol: int = 2, axis: str = "y", **kwargs: Any) -> None:
+    """A symmetric-log axis with a decade of headroom and the legend placed in it."""
+    symlog_axis(ax, *values, axis=axis, headroom=1.0)
+    ax.legend(loc="upper left", ncol=int(ncol), fontsize=figures.FONT_TINY, **kwargs)
+
+
+def _attach_colorbar(figure: Any, image: Any, *, ax: Any, cax: Any, label: str, norm: Any) -> Any:
+    """One colourbar convention for every map here; a symmetric-log scale gets five readable ticks."""
+    colorbar = figure.colorbar(image, cax=cax) if cax is not None else figure.colorbar(image, ax=ax, fraction=0.03, pad=0.015, aspect=30)
+    if isinstance(norm, mcolors.SymLogNorm):
+        top = float(norm.vmax)
+        mid = top * 10.0 ** (-LOG_DECADES / 2.0)
+        colorbar.set_ticks([-top, -mid, 0.0, mid, top])
+        colorbar.ax.yaxis.set_major_formatter(mticker.FuncFormatter(lambda v, _p: "0" if v == 0.0 else f"{v:.0e}"))
+        colorbar.ax.yaxis.set_minor_locator(mticker.NullLocator())
+    if label:
+        colorbar.set_label(label, fontsize=plt.rcParams["axes.labelsize"])
+    colorbar.ax.tick_params(labelsize=plt.rcParams["ytick.labelsize"], width=plt.rcParams["ytick.major.width"])
+    colorbar.outline.set_linewidth(plt.rcParams["axes.linewidth"])
+    return colorbar
 
 
 # =============================================================================
@@ -1107,15 +1317,75 @@ READOUT_TITLES: Mapping[str, str] = {
     READOUT_PRED_GAP: "forecast gap (base $-$ full)",
     READOUT_NLL_FULL: "full-branch block score",
     READOUT_NLL_BASE: "base-branch block score",
+    READOUT_MSE_FULL: "full-branch squared error (fidelity)",
+    READOUT_MSE_GAP: "squared-error gap (base $-$ full)",
+    READOUT_NLL_HORIZON: "full-branch score at one horizon step",
     READOUT_KLD_DIM: "top divergence coordinate $K_{t,d}$",
     READOUT_LAG_BAND: "lag readout on a band",
 }
 
-#: Colours of the readouts when several are overlaid on one lag axis: the two main readouts in
-#: the shared blue and vermilion, the lag-band readouts in the band colours the rest of the
-#: family uses, in declaration order.
-READOUT_COLOURS: Mapping[str, str] = {READOUT_KLD: figures.COLOR_BLUE, READOUT_PRED_GAP: figures.COLOR_VERMILLION}
+#: Colours of the readouts when several are overlaid on one lag axis: the main readouts in the
+#: shared palette, the lag-band readouts in the band colours the rest of the family uses, in
+#: declaration order.
+READOUT_COLOURS: Mapping[str, str] = {
+    READOUT_KLD: figures.COLOR_BLUE, READOUT_PRED_GAP: figures.COLOR_VERMILLION,
+    READOUT_NLL_FULL: figures.COLOR_GREEN, READOUT_MSE_FULL: figures.COLOR_PURPLE,
+    READOUT_MSE_GAP: figures.COLOR_ORANGE, READOUT_NLL_HORIZON: figures.COLOR_GRAY,
+}
 BAND_COLOURS: Tuple[str, ...] = (figures.COLOR_ORANGE, figures.COLOR_GREEN, figures.COLOR_PURPLE, "#56B4E9", "#999999")
+
+#: The colour of a cell the model never read: a cold step of a channel, or a step after the anchor.
+UNREAD_COLOUR = figures.COLOR_LIGHT_GRAY
+
+#: The example page's geometry: the samples pages' width, and inches per unit of row height, so
+#: a page here and a sample page there put one stored second at the same place on the sheet.
+EXAMPLE_PAGE_WIDTH = 14.0
+EXAMPLE_ROW_INCHES = 2.2
+EXAMPLE_HEADER_INCHES = 0.75
+#: Row heights on the example page, in units of :data:`EXAMPLE_ROW_INCHES`.
+EXAMPLE_INPUT_ROW = 1.25
+EXAMPLE_MAP_ROW = 1.0
+EXAMPLE_LATENT_ROW = 0.6
+EXAMPLE_LAYER_ROW = 0.8
+EXAMPLE_LAG_ROW = 1.1
+
+
+def example_variants(
+    lag_bands: Mapping[str, Tuple[int, int]], horizons: Optional[Mapping[str, int]] = None
+) -> List[Tuple[str, str, Tuple[int, int], int]]:
+    """Every readout an example anchor is attributed for, as ``(readout, tag, lag_band, horizon)``.
+
+    The plain example readouts first, then the per-horizon score at each named step, then the
+    lag readout on each configured band. The tag is the row's ``band`` column: empty for a plain
+    readout, ``h<step>`` for a horizon step, the band's name for a band.
+
+    Args:
+        lag_bands: The configured lag bands.
+        horizons: ``{name: step}`` from :func:`horizon_steps`, or ``None`` for none.
+
+    Returns:
+        The variants, in page order.
+    """
+    plan: List[Tuple[str, str, Tuple[int, int], int]] = [(name, "", (0, 0), 0) for name in EXAMPLE_READOUTS]
+    plan += [(READOUT_NLL_HORIZON, f"h{int(step)}", (0, 0), int(step)) for step in dict(horizons or {}).values()]
+    plan += [(READOUT_LAG_BAND, str(name), (int(span[0]), int(span[1])), 0) for name, span in lag_bands.items()]
+    return plan
+
+
+def variant_label(readout: str, tag: str = "") -> str:
+    """What a readout variant is called on a figure: the readout's title, qualified by its tag."""
+    if readout == READOUT_LAG_BAND:
+        return f"lag readout on band {tag!r}"
+    if readout == READOUT_NLL_HORIZON:
+        return f"full-branch score at horizon step {tag[1:] if tag.startswith('h') else tag}"
+    return READOUT_TITLES.get(readout, readout)
+
+
+def variant_colour(readout: str, tag: str, lag_bands: Sequence[str]) -> str:
+    """The overlay colour of a readout variant: the readout's own, or its band's."""
+    if readout == READOUT_LAG_BAND and tag in lag_bands:
+        return BAND_COLOURS[list(lag_bands).index(tag) % len(BAND_COLOURS)]
+    return READOUT_COLOURS.get(readout, figures.COLOR_GRAY)
 
 
 def _empty(ax: Any, title: str = "") -> None:
@@ -1128,19 +1398,20 @@ def _empty(ax: Any, title: str = "") -> None:
     figures.style_axes(ax, grid="none")
 
 
-def _draw_warm_boundary(ax: Any, live: Optional[np.ndarray]) -> None:
-    """Draw the per-channel warm-up boundary as a staircase over a (step x channel) heatmap."""
-    if live is None:
-        return
-    channels = np.arange(live.size)
-    ax.step(live - 0.5, channels, where="mid", color=figures.COLOR_BLACK, linewidth=figures.LINE_THIN)
-
-
 def _stream_map(
     figure: Any, ax: Any, field: Optional[np.ndarray], *, title: str, anchor: int,
     live: Optional[np.ndarray], n_scattering: Optional[int] = None, colorbar_label: str = "",
-) -> None:
-    """One (channel x stored step) map: symmetric colour scale, the anchor ruled, warm-up drawn.
+    kind: str = "signed", cax: Any = None, horizon: int = 0,
+) -> Any:
+    r"""One (channel x stored second) map with the cells the model never read blanked.
+
+    Two kinds. An **input** map shows the standardised coefficients on a sequential scale with
+    robust (1st to 99th percentile) limits taken over the live cells only; the cold cells of every
+    channel, which the input gate multiplies by zero, are blanked rather than drawn, so the
+    warm-up region neither sets the colour scale nor reads as data. A **signed** map shows an
+    attribution on a symmetric-log scale about zero, with the cold cells and every step after the
+    anchor blanked, because both are exactly zero by construction and a zero the model could not
+    have produced is not a finding. The anchor is ruled and the forecast block it scores shaded.
 
     Args:
         figure: The figure, for the colourbar.
@@ -1148,21 +1419,50 @@ def _stream_map(
         field: $(T, C)$, or ``None`` for an absent map.
         title: The panel title.
         anchor: The anchor's stored step, ruled in vermilion.
-        live: Each channel's first live step, drawn as a staircase, or ``None``.
+        live: Each channel's first live step, or ``None``.
         n_scattering: For a target map, the width of the scattering block, so the boundary to the
             phase-harmonic block is ruled.
         colorbar_label: The colourbar label.
+        kind: ``'input'`` or ``'signed'``.
+        cax: An axes to draw the colourbar into, or ``None`` to steal room beside ``ax``.
+        horizon: The block length $H$, for the shaded forecast window; $0$ shades nothing.
+
+    Returns:
+        The image, or ``None`` when nothing was drawn.
     """
     if field is None:
         _empty(ax, title)
-        return
-    figures.heatmap_with_colorbar(
-        figure, ax, np.asarray(field, dtype=np.float64).T, symmetric=True, interpolation="none",
-        title=title, xlabel="stored step", ylabel="declared channel", colorbar_label=colorbar_label,
-        separator_row=(int(n_scattering) - 1) if n_scattering else None,
+        if cax is not None:
+            cax.set_axis_off()
+        return None
+    steps = int(np.asarray(field).shape[0])
+    masked = masked_field(field, live, anchor=None if kind == "input" else int(anchor))
+    finite = masked[np.isfinite(masked)]
+    if kind == "input":
+        colormap = plt.get_cmap("viridis").with_extremes(bad=UNREAD_COLOUR)
+        low, high = (float(np.percentile(finite, 1.0)), float(np.percentile(finite, 99.0))) if finite.size else (0.0, 1.0)
+        norm = mcolors.Normalize(vmin=low, vmax=high if high > low else low + 1.0)
+    else:
+        colormap = plt.get_cmap("RdBu_r").with_extremes(bad=UNREAD_COLOUR)
+        norm = signed_log_norm(masked) or mcolors.Normalize(vmin=-1.0, vmax=1.0)
+    left, right = sample_cell_edges(steps, float(SECONDS_PER_STEP))
+    image = ax.imshow(
+        masked.T, aspect="auto", origin="upper", cmap=colormap, norm=norm, interpolation="none",
+        extent=(left, right, masked.shape[1] - 0.5, -0.5),
     )
-    ax.axvline(float(anchor), color=figures.COLOR_VERMILLION, linewidth=figures.LINE_REGULAR)
-    _draw_warm_boundary(ax, live)
+    if n_scattering and 0 < int(n_scattering) < masked.shape[1]:
+        ax.axhline(int(n_scattering) - 0.5, color=figures.COLOR_BLACK, linewidth=plt.rcParams["axes.linewidth"])
+    if horizon:
+        ax.axvspan((anchor + 0.5) * SECONDS_PER_STEP, (anchor + 0.5 + int(horizon)) * SECONDS_PER_STEP,
+                   color=figures.COLOR_VERMILLION, alpha=0.12, linewidth=0, zorder=2)
+    ax.axvline(float(anchor) * SECONDS_PER_STEP, color=figures.COLOR_VERMILLION, linewidth=figures.LINE_REGULAR)
+    ax.set_xlim(left, right)
+    ax.set_title(title)
+    ax.set_xlabel("stored time (s)")
+    ax.set_ylabel("declared channel")
+    _attach_colorbar(figure, image, ax=ax, cax=cax, label=colorbar_label, norm=norm)
+    figures.style_axes(ax, grid="none")
+    return image
 
 
 def _lag_view(
@@ -1172,7 +1472,8 @@ def _lag_view(
     """Normalised $|q_\\ell|$ beside the normalised model lag readout, on one share axis.
 
     One axis rather than a twin: both are shares per lag once normalised, and two scales on one
-    panel is the one layout a reader cannot check by eye.
+    panel is the one layout a reader cannot check by eye. Symmetric-log, because one lag's share
+    is often a hundred times another's and a linear axis shows only the one.
     """
     profile = np.asarray(profile, dtype=np.float64)
     if not np.isfinite(profile).any():
@@ -1188,7 +1489,7 @@ def _lag_view(
     ax.set_title(f"{title}; corr {fit['lag_corr'][0]:.2f}, JS {fit['lag_js'][0]:.2f}")
     ax.set_xlabel(COEFFICIENT_LAG_AXIS_LABEL)
     ax.set_ylabel("share per lag")
-    figures.legend_with_headroom(ax, ncol=2, headroom=0.25)
+    symlog_legend(ax, share, model_share, ncol=2)
     figures.style_axes(ax)
 
 
@@ -1212,11 +1513,12 @@ def build_map_figure(
 
     Five columns. The two **input** maps first -- the declared target stream (scattering block
     above the phase-harmonic block) and the declared source stream, standardised coefficients over
-    stored step and channel -- because an attribution map is read against the coefficients it
-    was taken on. Then the attribution of $K_t$: to the target under the **all-zero** baseline,
-    which is the only baseline under which target inputs move, and to the source under the
-    **source-null** baseline, which is the primary comparison. Last, the lag-aligned source
-    attribution against the model's own lag readout at that anchor.
+    stored second and channel with the cold cells blanked -- because an attribution map is read
+    against the coefficients it was taken on. Then the attribution of $K_t$: to the target under
+    the **all-zero** baseline, which is the only baseline under which target inputs move, and to
+    the source under the **source-null** baseline, which is the primary comparison, both on a
+    symmetric-log scale. Last, the lag-aligned source attribution against the model's own lag
+    readout at that anchor.
 
     Args:
         examples: One per class, as :func:`attribution_pass.attribute_example` builds them.
@@ -1236,34 +1538,37 @@ def build_map_figure(
             continue
         item = examples[row]
         anchor = int(item["anchor"])
+        horizon = int(item.get("horizon", 0) or 0)
         inputs = item.get("inputs") or {}
         maps = item.get("maps") or {}
         _stream_map(
-            figure, axes[row, 0], inputs.get(STREAM_TARGET), title="target input coefficients (standardised)",
-            anchor=anchor, live=item.get("live_target"), n_scattering=item.get("n_scattering"),
+            figure, axes[row, 0], inputs.get(STREAM_TARGET), title="target input (standardised)",
+            anchor=anchor, live=item.get("live_target"), n_scattering=item.get("n_scattering"), kind="input",
+            horizon=horizon,
         )
         _stream_map(
-            figure, axes[row, 1], inputs.get(STREAM_SOURCE), title="source input coefficients (standardised)",
-            anchor=anchor, live=item.get("live_source"),
+            figure, axes[row, 1], inputs.get(STREAM_SOURCE), title="source input (standardised)",
+            anchor=anchor, live=item.get("live_source"), kind="input", horizon=horizon,
         )
         all_zero = maps.get((READOUT_KLD, BASELINE_ALL_ZERO, ""))
         null = maps.get((READOUT_KLD, BASELINE_SOURCE_NULL, ""))
         _stream_map(
             figure, axes[row, 2], None if all_zero is None else all_zero[STREAM_TARGET],
-            title="target attribution of $K_t$ (all-zero baseline)", anchor=anchor,
+            title="$K_t$ to the target (all-zero)", anchor=anchor,
             live=item.get("live_target"), n_scattering=item.get("n_scattering"), colorbar_label="nats",
+            horizon=horizon,
         )
         _stream_map(
             figure, axes[row, 3], None if null is None else null[STREAM_SOURCE],
-            title="source attribution of $K_t$ (source-null baseline)", anchor=anchor,
-            live=item.get("live_source"), colorbar_label="nats",
+            title="$K_t$ to the source (source-null)", anchor=anchor,
+            live=item.get("live_source"), colorbar_label="nats", horizon=horizon,
         )
         if null is None:
             _empty(axes[row, 4], "lag-aligned source attribution of $K_t$")
         else:
             _lag_view(
                 axes[row, 4], null["lag_profile"], item["model_profile"], lag_seconds=lag_seconds,
-                cell=cell, title="lag-aligned source attribution of $K_t$",
+                cell=cell, title="$K_t$ by lag",
             )
         axes[row, 0].text(
             -0.22, 0.5, _example_title(item).replace(" — ", "\n"), transform=axes[row, 0].transAxes,
@@ -1280,15 +1585,20 @@ def build_example_figure(
     cell: CellBinding,
     caveat: str,
     lag_bands: Mapping[str, Tuple[int, int]],
+    horizons: Optional[Mapping[str, int]] = None,
 ) -> Any:
-    r"""One anchor of one recording, every example readout: the inputs, and each readout's maps.
+    r"""One anchor of one recording, every readout, on one stored-time axis: the sample page's layout.
 
-    Row one is the input: the target and source coefficients the encoders read, and the model's
-    own lag readout at the anchor. Every further row is one readout -- the divergence, the
-    forecast gap, the full-branch block score, then the lag readout on each configured band --
-    with its target attribution under the all-zero baseline, its source attribution under the
-    source-null baseline, and the lag-aligned source attribution against the model's lag
-    readout. The row label carries the readout's value at the input and at the exact null.
+    The page is a stack of full-width rows on one shared time axis, laid out as the samples pages
+    are -- one data column and one colour-axis column, every row spanning the whole segment -- so
+    a column of the page is the same stored second on every row and a reader compares maps by
+    looking down rather than across. The rows: the two input streams the encoders read (cold
+    cells blanked); then, per readout variant, its target attribution under the all-zero baseline
+    and its source attribution under the source-null baseline, each on a symmetric-log scale
+    with the value at the input and at the exact null in the title; then three rows off the time
+    axis -- the latent at the anchor (prior mean, source shift, per-coordinate divergence), the
+    layer split per readout on the cell's own axis (head or lag), and every readout's lag-aligned
+    source attribution overlaid on one lag axis against the model's lag readout.
 
     Args:
         item: The example, as :func:`attribution_pass.attribute_example` builds it.
@@ -1296,65 +1606,305 @@ def build_example_figure(
         cell: The cell binding.
         caveat: The sentence printed under the figure.
         lag_bands: The configured lag bands, in the order their rows are drawn.
+        horizons: The named horizon steps, in the order their rows are drawn, or ``None``.
+
+    Returns:
+        The figure, laid out; the caller renders and closes it.
+    """
+    maps = item.get("maps") or {}
+    inputs = item.get("inputs") or {}
+    anchor = int(item["anchor"])
+    horizon = int(item.get("horizon", 0) or 0)
+    variants = example_variants(lag_bands, horizons)
+    latent = item.get("latent") or {}
+    layer = item.get("layer") or {}
+
+    rows: List[Tuple[str, float]] = [("input_target", EXAMPLE_INPUT_ROW), ("input_source", EXAMPLE_INPUT_ROW)]
+    for readout, tag, _band, _step in variants:
+        rows += [(f"target:{readout}:{tag}", EXAMPLE_MAP_ROW), (f"source:{readout}:{tag}", EXAMPLE_MAP_ROW)]
+    n_time_rows = len(rows)
+    if latent:
+        rows.append(("latent", EXAMPLE_LATENT_ROW))
+    if any(np.asarray(v).size for v in layer.values()):
+        rows.append(("layer", EXAMPLE_LAYER_ROW))
+    rows.append(("lags", EXAMPLE_LAG_ROW))
+
+    heights = [height for _, height in rows]
+    figure_height = sum(heights) * EXAMPLE_ROW_INCHES
+    figure = plt.figure(figsize=(EXAMPLE_PAGE_WIDTH, figure_height))
+    bottom = max(0.02, 0.35 / figure_height) + figures.caveat_note(
+        figure, f"{cell.lag_qualification}. {caveat}. {GROUP_DELAY_CAVEAT}"
+    )
+    grid = GridSpec(
+        len(rows), 2, figure=figure, height_ratios=heights, width_ratios=[1.0, 0.022],
+        left=0.065, right=0.93, top=1.0 - EXAMPLE_HEADER_INCHES / figure_height, bottom=bottom,
+        hspace=0.55, wspace=0.09,
+    )
+    time_axes: List[Any] = []
+
+    def row_axes(position: int, *, shared: bool) -> Tuple[Any, Any]:
+        ax = figure.add_subplot(grid[position, 0], sharex=time_axes[0] if (shared and time_axes) else None)
+        cax = figure.add_subplot(grid[position, 1])
+        cax.set_label("<colorbar>")
+        if shared:
+            time_axes.append(ax)
+        return ax, cax
+
+    for position, (name, _height) in enumerate(rows[:n_time_rows]):
+        ax, cax = row_axes(position, shared=True)
+        if name == "input_target":
+            _stream_map(figure, ax, inputs.get(STREAM_TARGET), title="target input coefficients (standardised; cold cells blanked)",
+                        anchor=anchor, live=item.get("live_target"), n_scattering=item.get("n_scattering"),
+                        kind="input", cax=cax, horizon=horizon)
+        elif name == "input_source":
+            _stream_map(figure, ax, inputs.get(STREAM_SOURCE), title="source input coefficients (standardised; cold cells blanked)",
+                        anchor=anchor, live=item.get("live_source"), kind="input", cax=cax, horizon=horizon)
+        else:
+            stream, readout, tag = name.split(":", 2)
+            baseline = BASELINE_ALL_ZERO if stream == STREAM_TARGET else BASELINE_SOURCE_NULL
+            entry = maps.get((readout, baseline, tag))
+            label = variant_label(readout, tag)
+            values = "" if entry is None else f" — at the input {entry['value_input']:.3g}, at the null {entry['value_baseline']:.3g}"
+            _stream_map(
+                figure, ax, None if entry is None else entry[stream],
+                title=f"{stream} attribution of the {label} ({baseline} baseline){values}", anchor=anchor,
+                live=item.get(f"live_{stream}"), n_scattering=item.get("n_scattering") if stream == STREAM_TARGET else None,
+                colorbar_label="readout units", kind="signed", cax=cax, horizon=horizon,
+            )
+        if position < n_time_rows - 1:
+            ax.tick_params(labelbottom=False)
+            ax.set_xlabel("")
+
+    position = n_time_rows
+    if latent:
+        ax, cax = row_axes(position, shared=False)
+        position += 1
+        field = np.stack([np.asarray(latent[key], dtype=np.float64) for key in ("mu_prior", "shift", "kld_dim")], axis=0)
+        norm = signed_log_norm(field) or mcolors.Normalize(vmin=-1.0, vmax=1.0)
+        image = ax.imshow(field, aspect="auto", origin="upper", cmap="RdBu_r", norm=norm, interpolation="none",
+                          extent=(-0.5, field.shape[1] - 0.5, 2.5, -0.5))
+        ax.set_yticks([0, 1, 2])
+        ax.set_yticklabels(["$\\mu^p$", "$\\mu^q - \\mu^p$", "$K_{t,d}$"])
+        top = int(np.argmax(np.asarray(latent["kld_dim"], dtype=np.float64)))
+        ax.plot([top], [2], marker="v", color=figures.COLOR_BLACK, markersize=4, linestyle="none")
+        ax.set_title(f"the latent at the anchor: prior mean, source shift and per-coordinate divergence "
+                     f"(top coordinate {top}, $K_t$ = {float(np.sum(latent['kld_dim'])):.3g} nats)")
+        ax.set_xlabel("latent coordinate")
+        _attach_colorbar(figure, image, ax=ax, cax=cax, label="latent units / nats", norm=norm)
+        figures.style_axes(ax, grid="none")
+
+    if any(np.asarray(v).size for v in layer.values()):
+        ax, cax = row_axes(position, shared=False)
+        position += 1
+        keys = [(readout, tag) for readout, tag, _b, _s in variants if np.asarray(layer.get((readout, tag), ())).size]
+        width = max(int(np.asarray(layer[key]).size) for key in keys)
+        field = np.full((len(keys), width), np.nan)
+        for index, key in enumerate(keys):
+            values = np.asarray(layer[key], dtype=np.float64).reshape(-1)
+            field[index, :values.size] = values
+        norm = signed_log_norm(field) or mcolors.Normalize(vmin=-1.0, vmax=1.0)
+        if cell.layer_axis == "head":
+            extent = (-0.5, width - 0.5, len(keys) - 0.5, -0.5)
+        else:
+            half = 0.5 * float(SECONDS_PER_STEP)
+            extent = (float(lag_seconds[0]) - half, float(lag_seconds[min(width, len(lag_seconds)) - 1]) + half, len(keys) - 0.5, -0.5)
+        image = ax.imshow(field, aspect="auto", origin="upper", cmap=plt.get_cmap("RdBu_r").with_extremes(bad=UNREAD_COLOUR),
+                          norm=norm, interpolation="none", extent=extent)
+        ax.set_yticks(np.arange(len(keys)))
+        ax.set_yticklabels([variant_label(*key) for key in keys], fontsize=figures.FONT_TINY)
+        ax.set_title(f"activations: attribution on {cell.layer_label}, per {cell.layer_axis}, of every readout (source-null baseline)")
+        ax.set_xlabel("head" if cell.layer_axis == "head" else COEFFICIENT_LAG_AXIS_LABEL)
+        if cell.layer_axis == "head":
+            ax.set_xticks(np.arange(width))
+        _attach_colorbar(figure, image, ax=ax, cax=cax, label="readout units", norm=norm)
+        figures.style_axes(ax, grid="none")
+
+    ax, cax = row_axes(position, shared=False)
+    cax.set_axis_off()
+    model_profile = np.asarray(item.get("model_profile", np.full(len(lag_seconds), np.nan)), dtype=np.float64)
+    series: List[np.ndarray] = []
+    for readout, tag, _band, _step in variants:
+        entry = maps.get((readout, BASELINE_SOURCE_NULL, tag))
+        if entry is None or not np.isfinite(entry["lag_profile"]).any():
+            continue
+        share = lag_hist.normalise(np.abs(np.asarray(entry["lag_profile"], dtype=np.float64)))[0]
+        series.append(share)
+        ax.plot(lag_seconds, share, color=variant_colour(readout, tag, list(lag_bands)),
+                linewidth=figures.LINE_REGULAR, linestyle="--" if readout == READOUT_LAG_BAND else "-",
+                label=variant_label(readout, tag))
+    if np.isfinite(model_profile).any():
+        model_share = lag_hist.normalise(model_profile)[0]
+        series.append(model_share)
+        ax.plot(lag_seconds, model_share, color=figures.COLOR_BLACK, linewidth=figures.LINE_THIN, linestyle=":",
+                label=f"model lag readout ({cell.lag_readout})")
+    if series:
+        ax.set_title("every readout on one lag axis: normalised |source attribution| by offset from the anchor (source-null baseline)")
+        ax.set_xlabel(COEFFICIENT_LAG_AXIS_LABEL)
+        ax.set_ylabel("share per lag")
+        symlog_legend(ax, *series, ncol=3)
+        figures.style_axes(ax)
+    else:
+        _empty(ax, "every readout on one lag axis")
+
+    figure.suptitle(_example_title(item), fontsize=figures.FONT_NOTE, y=1.0 - 0.3 * EXAMPLE_HEADER_INCHES / figure_height)
+    figures.mark_laid_out(figure)
+    return figure
+
+
+def build_block_figure(blocks: pd.DataFrame, *, caveat: str) -> Any:
+    r"""Which input block each readout responded to: the four blocks' shares and signed sums.
+
+    Left: per readout variant, the mean over recordings of the **unsigned** attribution's share
+    in each of the four input blocks -- target scattering, target phase-harmonic, source
+    scattering, source phase-harmonic -- under the all-zero baseline, the one path along which
+    every stream moves, as a stacked bar summing to one. Right: the same rows' **signed** block
+    sums, on a symmetric-log axis, so a block that raised a readout and one that lowered it are
+    told apart. The block score and the squared error answer "which inputs drive the forecast";
+    the divergence and the gap answer "which inputs drive the latent change and the gain".
+
+    Args:
+        blocks: The block table, one row per (readout, band, baseline, block).
+        caveat: The sentence printed under the figure.
 
     Returns:
         The figure.
     """
-    maps = item.get("maps") or {}
-    readouts: List[Tuple[str, str]] = [(name, "") for name in EXAMPLE_READOUTS]
-    readouts += [(READOUT_LAG_BAND, str(name)) for name in lag_bands]
-    figure, axes = figures.new_figure(1 + len(readouts), 3, height_per_row=2.4, width=14.0)
-    anchor = int(item["anchor"])
-    inputs = item.get("inputs") or {}
-    _stream_map(
-        figure, axes[0, 0], inputs.get(STREAM_TARGET), title="target input coefficients (standardised)",
-        anchor=anchor, live=item.get("live_target"), n_scattering=item.get("n_scattering"),
-    )
-    _stream_map(
-        figure, axes[0, 1], inputs.get(STREAM_SOURCE), title="source input coefficients (standardised)",
-        anchor=anchor, live=item.get("live_source"),
-    )
-    ax = axes[0, 2]
-    model_profile = np.asarray(item.get("model_profile", np.full(len(lag_seconds), np.nan)), dtype=np.float64)
-    if np.isfinite(model_profile).any():
-        ax.plot(lag_seconds, model_profile, color=figures.COLOR_ORANGE, linewidth=figures.LINE_REGULAR)
-        ax.set_title(f"the model's own lag readout at the anchor: {cell.lag_readout}", fontsize=figures.FONT_SMALL)
-        ax.set_xlabel(COEFFICIENT_LAG_AXIS_LABEL)
-        ax.set_ylabel("readout units")
-        figures.style_axes(ax)
-    else:
-        _empty(ax, "the model's own lag readout at the anchor")
+    figure, axes = figures.new_figure(1, 2, height_per_row=3.4, width=13.0)
+    subset = blocks[blocks["baseline"].astype(str) == BASELINE_ALL_ZERO] if len(blocks) else blocks
+    if subset.empty:
+        _empty(axes[0, 0], "unsigned attribution share by input block")
+        _empty(axes[0, 1], "signed attribution by input block")
+        figures.caveat_note(figure, caveat)
+        return figure
+    labels_in_order = list(dict.fromkeys(subset["label"].astype(str)))
+    y = np.arange(len(labels_in_order))
+    colours = dict(zip(BLOCKS, (figures.COLOR_BLUE, "#56B4E9", figures.COLOR_ORANGE, figures.COLOR_VERMILLION)))
+    ax = axes[0, 0]
+    left = np.zeros(len(labels_in_order))
+    for block in BLOCKS:
+        part = subset[subset["block"].astype(str) == block].set_index("label")
+        share = np.asarray([float(part["share_mean"].get(name, np.nan)) for name in labels_in_order])
+        share = np.where(np.isfinite(share), share, 0.0)
+        ax.barh(y, share, left=left, color=colours[block], label=block.replace("_", " "), height=0.7)
+        left += share
+    ax.set_yticks(y)
+    ax.set_yticklabels(labels_in_order, fontsize=figures.FONT_TINY)
+    ax.invert_yaxis()
+    ax.set_xlim(0.0, 1.0)
+    ax.set_xlabel("share of the unsigned attribution")
+    ax.set_title("unsigned share by input block (all-zero baseline)", fontsize=figures.FONT_SMALL)
+    ax.legend(fontsize=figures.FONT_TINY, loc="lower right", ncol=2)
+    figures.style_axes(ax)
+    ax = axes[0, 1]
+    width = 0.8 / len(BLOCKS)
+    drawn: List[np.ndarray] = []
+    for offset, block in enumerate(BLOCKS):
+        part = subset[subset["block"].astype(str) == block].set_index("label")
+        values = np.asarray([float(part["signed_mean"].get(name, np.nan)) for name in labels_in_order])
+        drawn.append(values)
+        ax.barh(y + (offset - (len(BLOCKS) - 1) / 2) * width, values, height=width, color=colours[block], label=block.replace("_", " "))
+    ax.set_yticks(y)
+    ax.set_yticklabels(labels_in_order, fontsize=figures.FONT_TINY)
+    ax.invert_yaxis()
+    ax.axvline(0.0, color=figures.COLOR_GRAY, linewidth=figures.LINE_HAIRLINE)
+    symlog_axis(ax, *drawn, axis="x")
+    ax.set_xlabel("signed attribution (symlog)")
+    ax.set_title("signed block sums (positive raised the readout)", fontsize=figures.FONT_SMALL)
+    ax.legend(fontsize=figures.FONT_TINY, loc="lower right", ncol=2)
+    figures.style_axes(ax)
+    figures.caveat_note(figure, caveat)
+    return figure
 
-    for row, (readout, band) in enumerate(readouts, start=1):
-        name = READOUT_TITLES[readout] if readout != READOUT_LAG_BAND else f"lag readout on band {band!r}"
-        all_zero = maps.get((readout, BASELINE_ALL_ZERO, band))
-        null = maps.get((readout, BASELINE_SOURCE_NULL, band))
-        _stream_map(
-            figure, axes[row, 0], None if all_zero is None else all_zero[STREAM_TARGET],
-            title=f"target attribution of the {name} (all-zero baseline)", anchor=anchor,
-            live=item.get("live_target"), n_scattering=item.get("n_scattering"), colorbar_label="readout units",
-        )
-        _stream_map(
-            figure, axes[row, 1], None if null is None else null[STREAM_SOURCE],
-            title=f"source attribution of the {name} (source-null baseline)", anchor=anchor,
-            live=item.get("live_source"), colorbar_label="readout units",
-        )
-        if null is None:
-            _empty(axes[row, 2], f"lag-aligned source attribution of the {name}")
-        else:
-            _lag_view(
-                axes[row, 2], null["lag_profile"], model_profile, lag_seconds=lag_seconds, cell=cell,
-                title=f"lag-aligned source attribution of the {name}",
-            )
-            values = (
-                f"at the input {null['value_input']:.3g}, at the null {null['value_baseline']:.3g}"
-            )
-            axes[row, 2].text(
-                0.01, 0.97, values, transform=axes[row, 2].transAxes, ha="left", va="top",
-                fontsize=figures.FONT_TINY, color=figures.COLOR_GRAY,
-            )
-    figure.suptitle(_example_title(item), fontsize=figures.FONT_NOTE)
-    figures.caveat_note(figure, f"{cell.lag_qualification}. {caveat}. {GROUP_DELAY_CAVEAT}")
+
+def build_horizon_figure(
+    rows: pd.DataFrame,
+    vectors: Mapping[str, np.ndarray],
+    *,
+    lag_seconds: np.ndarray,
+    horizons: Mapping[str, int],
+    caveat: str,
+) -> Any:
+    r"""How the near and the far end of the forecast block read the inputs.
+
+    Three panels over the per-horizon score rows. Left: per named horizon step, the mean over
+    recordings of the unsigned attribution total of the target stream (all-zero baseline) and of
+    the source stream (source-null baseline), with the score itself at the input beside them.
+    Middle: the source attribution by lag per horizon step, source-null baseline, magnitude,
+    mean over recordings. Right: the target attribution by offset from the anchor per step,
+    all-zero baseline. A far step that reads the source more than the near one is a source whose
+    information pays later in the block.
+
+    Args:
+        rows: The per-row table.
+        vectors: The row-aligned arrays.
+        lag_seconds: The compensated lag axis.
+        horizons: ``{name: step}`` from :func:`horizon_steps`.
+        caveat: The sentence printed under the figure.
+
+    Returns:
+        The figure.
+    """
+    figure, axes = figures.new_figure(1, 3, height_per_row=3.0, width=15.0)
+    if not len(rows) or not horizons:
+        for col, title in enumerate(("stream totals per horizon step", "source attribution by lag per horizon step",
+                                     "target attribution by offset per horizon step")):
+            _empty(axes[0, col], title)
+        figures.caveat_note(figure, f"{caveat}. {GROUP_DELAY_CAVEAT}")
+        return figure
+    readout = rows["readout"].astype(str).to_numpy()
+    baseline = rows["baseline"].astype(str).to_numpy()
+    tag = rows["band"].astype(str).to_numpy()
+    guids = rows["guid"].astype(str).to_numpy()
+    names = list(horizons)
+    x = np.arange(len(names))
+    ax = axes[0, 0]
+    bars: List[np.ndarray] = []
+    for offset, (stream, base, colour) in enumerate((
+        (STREAM_TARGET, BASELINE_ALL_ZERO, figures.COLOR_BLUE), (STREAM_SOURCE, BASELINE_SOURCE_NULL, figures.COLOR_ORANGE),
+    )):
+        heights = []
+        for name in names:
+            keep = (readout == READOUT_NLL_HORIZON) & (baseline == base) & (tag == f"h{int(horizons[name])}")
+            column = rows[f"{stream}_abs_total"].to_numpy(dtype=np.float64)
+            heights.append(float(_per_recording_mean(column[:, None], guids, keep)[0]) if keep.any() else np.nan)
+        bars.append(np.asarray(heights))
+        ax.bar(x + (offset - 0.5) * 0.38, heights, width=0.38, color=colour, label=f"{stream} |attribution| total ({base})")
+    scores = []
+    for name in names:
+        keep = (readout == READOUT_NLL_HORIZON) & (baseline == BASELINE_SOURCE_NULL) & (tag == f"h{int(horizons[name])}")
+        column = rows["value_input"].to_numpy(dtype=np.float64)
+        scores.append(float(_per_recording_mean(column[:, None], guids, keep)[0]) if keep.any() else np.nan)
+    ax.plot(x, scores, color=figures.COLOR_BLACK, marker="o", markersize=figures.MARKER_SMALL, linewidth=figures.LINE_THIN,
+            label="score at the input (nats)")
+    ax.set_xticks(x)
+    ax.set_xticklabels([f"{name} (step {int(horizons[name])})" for name in names])
+    ax.set_title("per-step score: stream totals", fontsize=figures.FONT_SMALL)
+    ax.set_ylabel("nats per anchor (symlog)")
+    symlog_legend(ax, *bars, np.asarray(scores), ncol=1)
+    figures.style_axes(ax)
+    for col, (stream, base, vector, xlabel) in enumerate((
+        (STREAM_SOURCE, BASELINE_SOURCE_NULL, "lag_profile", COEFFICIENT_LAG_AXIS_LABEL),
+        (STREAM_TARGET, BASELINE_ALL_ZERO, "target_lag_profile", COEFFICIENT_LAG_AXIS_LABEL),
+    ), start=1):
+        ax = axes[0, col]
+        drawn: List[np.ndarray] = []
+        for index, name in enumerate(names):
+            keep = (readout == READOUT_NLL_HORIZON) & (baseline == base) & (tag == f"h{int(horizons[name])}")
+            if not keep.any() or vector not in vectors:
+                continue
+            profile = _per_recording_mean(np.abs(vectors[vector].astype(np.float64)), guids, keep)
+            drawn.append(profile)
+            ax.plot(lag_seconds, profile, color=(figures.COLOR_BLUE, figures.COLOR_VERMILLION, figures.COLOR_GREEN)[index % 3],
+                    linewidth=figures.LINE_REGULAR, label=f"{name} (step {int(horizons[name])})")
+        if not drawn:
+            _empty(ax, f"{stream} |attribution| by offset per horizon step")
+            continue
+        ax.set_title(f"per-step score: {stream} |attribution| by offset ({base})", fontsize=figures.FONT_SMALL)
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel("|attribution| (nats, symlog)")
+        symlog_legend(ax, *drawn, ncol=2)
+        figures.style_axes(ax)
+    figures.caveat_note(figure, f"{caveat}. {GROUP_DELAY_CAVEAT}")
     return figure
 
 
@@ -1439,7 +1989,7 @@ def build_lag_profile_figure(
         )
         ax.set_xlabel(COEFFICIENT_LAG_AXIS_LABEL)
         ax.set_ylabel("share per lag")
-        figures.legend_with_headroom(ax, ncol=2, headroom=0.25)
+        symlog_legend(ax, _per_recording_mean(attribution, guids, keep), _per_recording_mean(model_profile, guids, keep), ncol=2)
         figures.style_axes(ax)
 
         ax = axes[index, 1]
@@ -1464,7 +2014,7 @@ def build_lag_profile_figure(
             ax.set_title(f"{READOUT_TITLES.get(readout, readout)}: by class (solid attribution, dashed model readout)")
             ax.set_xlabel(COEFFICIENT_LAG_AXIS_LABEL)
             ax.set_ylabel("share per lag")
-            figures.legend_with_headroom(ax, ncol=min(max(drawn, 1), 3), headroom=0.25)
+            symlog_legend(ax, _per_recording_mean(attribution, guids, keep), ncol=min(max(drawn, 1), 3))
             figures.style_axes(ax)
 
     # The comparison row: every readout on one axis, then the band readouts against their bands.
@@ -1496,7 +2046,7 @@ def build_lag_profile_figure(
         ax.set_title("every readout on one lag axis: normalised |source attribution|, pooled")
         ax.set_xlabel(COEFFICIENT_LAG_AXIS_LABEL)
         ax.set_ylabel("share per lag")
-        figures.legend_with_headroom(ax, ncol=2, headroom=0.35)
+        symlog_legend(ax, *[profile for _label, profile, _colour in series], ncol=2)
         figures.style_axes(ax)
     if not band_series:
         _empty(ax_bands, "the lag-band readouts against their own bands")
@@ -1512,7 +2062,7 @@ def build_lag_profile_figure(
         ax_bands.set_title("the lag-band readouts against their own bands (shaded)")
         ax_bands.set_xlabel(COEFFICIENT_LAG_AXIS_LABEL)
         ax_bands.set_ylabel("share per lag")
-        figures.legend_with_headroom(ax_bands, ncol=min(len(band_series), 4), headroom=0.3)
+        symlog_legend(ax_bands, *[profile for _name, profile, _colour, _span in band_series], ncol=min(len(band_series), 4))
         figures.style_axes(ax_bands)
     figures.caveat_note(figure, f"{cell.lag_qualification}. {caveat}. {GROUP_DELAY_CAVEAT}")
     return figure
@@ -1631,9 +2181,9 @@ def build_channel_figure(
                 ax.plot([], [], marker="s", linestyle="none", color=colour, label=label)
             ax.set_title(f"{title} ({len(np.unique(guids[keep]))} recording(s))")
             ax.set_xlabel("declared channel")
-            ax.set_ylabel("attribution (readout units)")
+            ax.set_ylabel("attribution (symlog)")
             ax.set_xlim(-0.5, width - 0.5)
-            figures.legend_with_headroom(ax, ncol=3, headroom=0.35)
+            symlog_legend(ax, signed, unsigned if unsigned_name in vectors else signed, ncol=3)
             figures.style_axes(ax)
     figures.caveat_note(figure, caveat)
     return figure
@@ -1679,9 +2229,9 @@ def build_lag_channel_figure(
                 continue
             field = np.asarray(entry["mean_abs"], dtype=np.float64).T   # (C, L)
             figures.heatmap_with_colorbar(
-                figure, ax, field, symmetric=False, interpolation="none",
+                figure, ax, field, symmetric=False, interpolation="none", norm=unsigned_log_norm(field),
                 title=f"{title} ({int(entry['n_rows'])} anchor(s), {baseline} baseline)",
-                xlabel=COEFFICIENT_LAG_AXIS_LABEL, ylabel="declared channel", colorbar_label="|attribution|",
+                xlabel=COEFFICIENT_LAG_AXIS_LABEL, ylabel="declared channel", colorbar_label="|attribution| (log)",
                 extent=(float(lag_seconds[0]) - half, float(lag_seconds[-1]) + half, field.shape[0] - 0.5, -0.5),
                 separator_row=(int(n_scattering) - 1) if (stream == STREAM_TARGET and n_scattering) else None,
             )
@@ -1741,8 +2291,8 @@ def build_time_profile_figure(
             ax.axhline(0.0, color=figures.COLOR_GRAY, linewidth=figures.LINE_HAIRLINE)
             ax.set_title(f"{title} ({len(np.unique(guids[keep]))} recording(s))")
             ax.set_xlabel(COEFFICIENT_LAG_AXIS_LABEL)
-            ax.set_ylabel("attribution (readout units)")
-            figures.legend_with_headroom(ax, ncol=2, headroom=0.4)
+            ax.set_ylabel("attribution (symlog)")
+            symlog_legend(ax, positive, negative, unsigned, ncol=2)
             figures.style_axes(ax)
     figures.caveat_note(figure, f"{caveat}. {GROUP_DELAY_CAVEAT}")
     return figure
@@ -1983,7 +2533,8 @@ def build_band_figure(
             )
             ax.axhline(0.0, color=figures.COLOR_GRAY, linewidth=figures.LINE_HAIRLINE)
             ax.set_title(f"{readout}: attribution by frequency band (source-null baseline)", fontsize=figures.FONT_SMALL)
-            ax.set_ylabel("attribution (readout units)")
+            ax.set_ylabel("attribution (symlog)")
+            symlog_axis(ax, subset["attribution_mean"].to_numpy(dtype=np.float64), headroom=1.0)
             ax.legend(fontsize=figures.FONT_TINY, loc="upper right")
             figures.style_axes(ax)
 
@@ -2011,7 +2562,8 @@ def build_band_figure(
             ax.set_xticklabels(names, fontsize=figures.FONT_TINY)
             ax.axhline(0.0, color=figures.COLOR_GRAY, linewidth=figures.LINE_HAIRLINE)
             ax.set_title(f"{readout}: source by lag band relative to the anchor", fontsize=figures.FONT_SMALL)
-            ax.set_ylabel("readout units (occlusion: nats per anchor)")
+            ax.set_ylabel("readout units (symlog)")
+            symlog_axis(ax, *[subset[column].to_numpy(dtype=np.float64) for column, _l, _c in present], headroom=1.0)
             ax.legend(fontsize=figures.FONT_TINY, loc="upper right")
             figures.style_axes(ax)
     figures.caveat_note(figure, f"{caveat}. {GROUP_DELAY_CAVEAT}")
@@ -2069,7 +2621,8 @@ def build_layer_figure(
             ax.set_xticklabels([str(int(unit)) for unit in units])
         ax.set_title(f"attribution on {cell.layer_label}, per {cell.layer_axis} (source-null baseline)", fontsize=figures.FONT_SMALL)
         ax.set_xlabel("head" if cell.layer_axis == "head" else COEFFICIENT_LAG_AXIS_LABEL)
-        ax.set_ylabel("attribution (readout units), mean over recordings")
+        ax.set_ylabel("attribution, mean over recordings (symlog)")
+        symlog_axis(ax, pooled["mean"].to_numpy(dtype=np.float64) if not pooled.empty else layer["mean"].to_numpy(dtype=np.float64), headroom=1.0)
         ax.legend(fontsize=figures.FONT_TINY, loc="upper right")
         figures.style_axes(ax)
     ax = axes[0, 1]
@@ -2088,7 +2641,8 @@ def build_layer_figure(
             fontsize=figures.FONT_SMALL,
         )
         ax.set_xlabel(COEFFICIENT_LAG_AXIS_LABEL)
-        ax.set_ylabel("|attribution| (nats)")
+        ax.set_ylabel("|attribution| (nats, symlog)")
+        symlog_axis(ax, np.nanmean(np.abs(source), axis=0), np.nanmean(np.abs(target), axis=0), headroom=1.0)
         ax.legend(fontsize=figures.FONT_TINY, loc="upper right")
         figures.style_axes(ax)
     figures.caveat_note(figure, f"{caveat}. {GROUP_DELAY_CAVEAT}")
@@ -2149,11 +2703,12 @@ def build_null_figure(null: pd.DataFrame, *, caveat: str) -> Any:
 #: divergence and the model's own lag readout as heatmaps on one lag axis, the agreement and the
 #: source share as lines, and the readout values behind them.
 TRACE_PANELS: Tuple[Any, ...] = (
-    traces.HeatmapPanel("kld_attribution_lag_map", "|source attribution of $K_t$| by lag (source-null baseline)", "",
-                        lag_axis=True),
+    traces.HeatmapPanel("kld_attribution_lag_map", "|source attribution of $K_t$| by lag (source-null baseline, log)", "",
+                        log=True, lag_axis=True),
     traces.HeatmapPanel("pred_gap_attribution_lag_map",
-                        "|source attribution of the forecast gap| by lag (source-null baseline)", "", lag_axis=True),
-    traces.HeatmapPanel("model_lag_map", "The model's own lag readout", "", lag_axis=True),
+                        "|source attribution of the forecast gap| by lag (source-null baseline, log)", "", log=True,
+                        lag_axis=True),
+    traces.HeatmapPanel("model_lag_map", "The model's own lag readout (log)", "", log=True, lag_axis=True),
     traces.LinePanel(("kld_lag_corr", "pred_gap_lag_corr"),
                      "Correlation of the lag-aligned attribution with the model's lag readout", "Pearson $r$",
                      labels=("$K_t$", "forecast gap")),
@@ -2237,4 +2792,9 @@ __all__ = [
     "cost_record", "entry_point", "expand_rows", "integrated_gradients", "lag_band_feature_mask",
     "lag_band_groups", "lag_profile", "layer_attribution", "model_lag_readout", "spread_columns",
     "time_profile", "warm_from_step",
+    "BLOCKS", "BLOCKS_FILENAME", "BLOCK_FIGURE", "BLOCK_SCORE_READOUTS", "HORIZON_FIGURE",
+    "HORIZON_READOUT_STEPS", "LOG_DECADES", "READOUT_MSE_FULL", "READOUT_MSE_GAP", "READOUT_NLL_HORIZON",
+    "UNREAD_COLOUR", "block_sums", "build_block_figure", "build_horizon_figure", "example_variants",
+    "horizon_steps", "masked_field", "signed_log_norm", "source_block_split", "symlog_axis",
+    "unsigned_log_norm", "variant_label", "symlog_legend",
 ]

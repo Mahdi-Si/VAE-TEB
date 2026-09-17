@@ -27,10 +27,13 @@ is the check that the forward re-read here is the forward the tables describe, a
 disagreement is recorded rather than assumed away.
 
 **The selection is a seeded draw of eligible recordings, equal per class**, from the recordings
-``per_sample.csv`` labels -- so it is not the population the pass's caps or horizon bound: a trace
-is the whole recording as the dataset holds it, including segments a stratified cap left
-uncollected, which are traced and marked as such rather than dropped to match. A recording with
-one segment has no evolution to show and is counted, never drawn.
+``per_sample.csv`` labels -- so it is not the population the pass's caps bound: a trace is the
+recording as the dataset holds it, including segments a stratified cap left uncollected, which are
+traced and marked as such rather than dropped to match. The one bound that *is* applied is
+``max_hours_before_delivery``: when set, only the segments recorded within it are traced, counted
+for eligibility, or drawn from, so a bounded run's traces describe the population its clocks are
+read over. A recording with one segment (inside the window) has no evolution to show and is
+counted, never drawn.
 """
 from __future__ import annotations
 
@@ -42,7 +45,7 @@ import pandas as pd
 import torch
 from loguru import logger
 
-from teb_vae.lag_attn_cfs.eval import cohort, frames, lag_axis, traces
+from teb_vae.lag_attn_cfs.eval import cohort, frames, lag_axis, traces, traces_html
 from teb_vae.lag_attn_cfs.eval import figures_seam as figures
 from teb_vae.lag_attn_cfs.eval._reuse import labels
 from teb_vae.lag_attn_cfs.eval.dataset_rows import (
@@ -323,12 +326,12 @@ def trace_recording(
         outputs = model(
             y_st, y_ph, u_stream, anchor_phase=anchor_phase, anchor_stride=anchor_stride
         )
-        gathered.extend(
-            gather_segment_traces(
-                model, outputs, weight, batch_rows,
-                clinical_class=clinical_class, subgroup=subgroup,
-            )
+        segment_traces = gather_segment_traces(
+            model, outputs, weight, batch_rows,
+            clinical_class=clinical_class, subgroup=subgroup,
         )
+        traces.attach_raw_signals(segment_traces, batch)
+        gathered.extend(segment_traces)
     return gathered
 
 
@@ -425,7 +428,11 @@ def run_recording_traces_analysis(
     record = dict(getattr(collection, "record", None) or {})
     break_after_s = lag_axis.break_tolerance_s(record)
 
-    index_map = dataset_index_map(loader)
+    window_hours = eval_config.get("max_hours_before_delivery")
+    # The bound the run reads its clocks over: only the segments recorded within it are traced,
+    # counted for eligibility, or drawn from, so a bounded run's traces describe the population
+    # its trajectories do.
+    index_map = cohort.within_horizon_index(dataset_index_map(loader), window_hours)
     recordings = recording_frame(per_sample, index_map)
     chosen, accounting = traces.select_recordings(recordings, per_class=per_class, seed=seed)
 
@@ -471,6 +478,12 @@ def run_recording_traces_analysis(
                 ),
                 class_dir / f"{stem}{traces.TRACE_FIGURE_SUFFIX}",
             )
+            dashboard = traces_html.write_recording_dashboard(
+                traces_html.build_recording_dashboard(
+                    recording, panels=PANELS, lag_seconds=lag_seconds, caveat=lag_axis.GROUP_DELAY_CAVEAT
+                ),
+                class_dir / f"{stem}{traces.TRACE_FIGURE_SUFFIX}",
+            )
         except Exception as error:  # noqa: BLE001 - one recording is not worth the rest of them
             logger.warning(f"{ANALYSIS_DIRNAME}: recording {guid} failed: {error}")
             failures.append({"guid": guid, "error": f"{type(error).__name__}: {error}"})
@@ -490,6 +503,7 @@ def run_recording_traces_analysis(
                 "span_hours": float(span.max() - span.min()) if len(span) else float("nan"),
                 "arrays_file": Path(arrays).relative_to(directory).as_posix(),
                 "figure_file": Path(figure).relative_to(directory).as_posix(),
+                "dashboard_file": Path(dashboard).relative_to(directory).as_posix(),
             }
         )
 
@@ -503,7 +517,7 @@ def run_recording_traces_analysis(
     )
     summary_figure = figures.render_figure(
         traces.build_summary_figure(
-            summary, metrics=SUMMARY_METRICS, window_hours=eval_config.get("max_hours_before_delivery"),
+            summary, metrics=SUMMARY_METRICS, window_hours=window_hours,
         ),
         directory / traces.SUMMARY_FIGURE,
     )
@@ -537,8 +551,8 @@ def run_recording_traces_analysis(
             "anchor_phase": DENSE_ANCHOR_GEOMETRY[0], "anchor_stride": DENSE_ANCHOR_GEOMETRY[1],
             "delay_steps": delay_steps,
             "break_tolerance_s": float(break_after_s),
-            # The whole recording is traced by design, whatever horizon the clocks are bounded to.
-            "max_hours_before_delivery_applied": False,
+            "max_hours_before_delivery": None if window_hours is None else float(window_hours),
+            "max_hours_before_delivery_applied": window_hours is not None,
         },
         "selection": accounting,
         "recordings": manifest,
