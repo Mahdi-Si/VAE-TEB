@@ -47,8 +47,8 @@ import numpy as np
 import pandas as pd
 
 from teb_vae.lag_attn.nets.lag_report import SECONDS_PER_STEP
-from teb_vae.lag_attn_cfs.eval import figures_seam
-from teb_vae.lag_attn_cfs.eval._reuse import figures, stats as shared_stats
+from teb_vae.lag_attn_cfs.eval import figures_seam as figures
+from teb_vae.lag_attn_cfs.eval._reuse import stats as shared_stats
 from teb_vae.lag_attn_cfs.eval.lag_axis import (
     COEFFICIENT_LAG_AXIS_LABEL,
     GROUP_DELAY_CAVEAT,
@@ -573,7 +573,7 @@ def build_lag_figure(
             "clock-excess profile is degenerate: no mask emitted",
             xy=(0.02, 0.05), xycoords="axes fraction", fontsize="small", color="C3",
         )
-    figures_seam.caveat_note(figure)
+    figures.caveat_note(figure)
     return figure
 
 
