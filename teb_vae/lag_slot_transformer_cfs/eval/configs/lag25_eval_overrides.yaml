@@ -1,19 +1,17 @@
 # The evaluation override delta for a 25-ENTRY checkpoint, merged OVER its own resolved_config.yaml.
 #
 # A copy of `eval_overrides.yaml` -- no `base:` key, the same loader fields, the same caps under
-# the same names -- that differs in two settings, each because the bank it scores is a different
-# window from the one the committed delta's bands were declared on:
+# the same names -- that differs in two settings:
 #
 #   * `num_mc_samples: 32`, the acceptance plan's PRIMARY draw count rather than the committed
 #     delta's eight. Every comparison this arm enters is read at 32, and rescoring at 8 and 128 is
 #     the stability check, not the primary reading.
-#   * `occlusion_bands` declared for a window of 25 entries, lags 0..24 inclusive. The committed
-#     four-band partition reaches past this window's last lag and is refused at config load
-#     against `max_lag: 24`, which is the intended failure: a band that overstates what it
-#     removed would be reported under a name that describes something else.
+#   * `occlusion_bands` HAND-DECLARED for a window of 25 entries, lags 0..24 inclusive, where the
+#     committed delta derives a uniform partition from the checkpoint's `max_lag`. The bands here
+#     are hypotheses read off the 91-entry development run, which a uniform width cannot express.
 #
-# A checkpoint whose `max_lag` is not 24 refuses this delta at the band check, and the committed
-# delta refuses a 25-entry checkpoint the same way. Neither profile silently clips.
+# A checkpoint whose `max_lag` is below 24 refuses this delta at the band check rather than
+# clipping; one above 24 loads it, and the bands then cover only the head of its window.
 #
 # Run from the repo root:
 #   python -m teb_vae.lag_slot_transformer_cfs.eval.run --checkpoint <run>/model_checkpoints/<f>.ckpt \

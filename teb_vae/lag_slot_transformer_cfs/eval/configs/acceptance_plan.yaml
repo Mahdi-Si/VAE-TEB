@@ -15,7 +15,7 @@
 # that is not below raises and names the valid set, so a misspelling cannot silently mean "no
 # minimum".
 
-declared_on: 2026-09-15
+declared_on: 2026-09-17
 
 # Bumped by hand whenever anything below changes, so two records naming two digests also name two
 # revisions rather than leaving a reader to diff them.
@@ -24,7 +24,11 @@ declared_on: 2026-09-15
 # window, so a 25-entry run is read under the family declared for its own window rather than
 # failed for searching bands the 91-entry family does not name. The 91-entry family is the
 # revision-1 list unchanged.
-revision: 2
+#
+# Revision 3: the committed delta derives its partition from the checkpoint's `max_lag` through
+# `partition_width`, so the five bands that resolves to on the 25-entry window join that window's
+# family beside the hand-declared bands of `lag25_eval_overrides.yaml`.
+revision: 3
 
 
 protocol:
@@ -131,9 +135,21 @@ primary_comparisons:
 # run that searched a band its family does not name, or whose window no family here declares, is
 # a search whose family was chosen after the fact, and the pass fails it by name.
 #
-# The 25-entry family holds the four bands that partition that window AND the two fixed cross-bank
-# bands that overlap them; all six are searched, so all six are in the family the correction pays
-# for.
+# The 25-entry family holds the four hand-declared bands of `lag25_eval_overrides.yaml` that
+# partition that window, the five bands the committed delta's `partition_width` resolves to on
+# it, AND the two fixed cross-bank bands both deltas declare. A run searches the bands of the delta
+# it was scored under, never all eleven, and the correction pays for the bands that run searched.
 exploratory_band_families:
   91: [anchor, near, mid, far]
-  25: [instant, recent, intermediate, tail, common_head, common_tail]
+  25:
+    - instant
+    - recent
+    - intermediate
+    - tail
+    - lags_000_004
+    - lags_005_009
+    - lags_010_014
+    - lags_015_019
+    - lags_020_024
+    - common_head
+    - common_tail

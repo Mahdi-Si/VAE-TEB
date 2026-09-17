@@ -35,6 +35,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
 
 from teb_vae.lag_attn.eval.stats import bootstrap_ci
+from teb_vae.lag_attn_cfs.eval.config_schema import partition_lag_window
 
 
 @dataclass(frozen=True)
@@ -96,22 +97,9 @@ def lag_windows(n_lags: int, width: int) -> Dict[str, Tuple[int, int]]:
             a single window over the whole axis is a suppression of everything, which is the
             silence arm under another name.
     """
-    if int(n_lags) < 1 or int(width) < 1:
-        raise ValueError(f"n_lags and width must be >= 1, got {n_lags} and {width}")
-    if int(width) >= int(n_lags):
-        raise ValueError(
-            f"a window width of {width} over {n_lags} lags gives one window covering the whole "
-            f"axis, whose suppression is the silence arm rather than a lag readout."
-        )
-    windows: Dict[str, Tuple[int, int]] = {}
-    for low in range(0, int(n_lags), int(width)):
-        high = min(low + int(width), int(n_lags)) - 1
-        if high >= int(n_lags) - int(width):
-            high = int(n_lags) - 1
-        windows[f"{low:03d}_{high:03d}"] = (low, high)
-        if high == int(n_lags) - 1:
-            break
-    return windows
+    # The evaluation's width form partitions the window the same way, so the two share one
+    # function and the campaign's windows are the bands a width-form delta would score.
+    return dict(partition_lag_window(n_lags, width))
 
 
 def interval(values: Sequence[float], criteria: Criteria) -> Dict[str, Any]:

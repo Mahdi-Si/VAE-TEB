@@ -465,7 +465,7 @@ Set evaluation choices in `configs/eval_overrides.yaml`. The merged configuratio
 | `eval_config.seed` | Seeds latent draws and cross-recording pairing as independent random streams. |
 | `eval_config.num_mc_samples` | Number of latent draws $K$. Finalists are evaluated at $8$, $32$, and $128$. |
 | `eval_config.bootstrap_resamples` | Number of recording-level resamples used for intervals. |
-| `eval_config.occlusion_bands` | Inclusive lag bands removed by suppression, in stored steps before the anchor. |
+| `eval_config.occlusion_bands` | Inclusive lag bands removed by suppression, in stored steps before the anchor. The reserved entry `partition_width` is an integer instead of a pair: the run cuts the checkpoint's own lag window into contiguous bands of that width, named `lags_<lo>_<hi>`, so the committed delta loads on any bank length. Bands declared beside it, such as the two fixed cross-bank bands, are kept as written. The dumped `resolved_config.yaml` records the bands a run resolved to. |
 | `eval_config.caps.lag_profile` | Segment cap for single-lag predictive scoring. Omitting it skips that profile with a recorded reason. |
 | `eval_config.caps.traces_per_class` | Maximum traced recordings per clinical class. Each selected recording is followed through every segment. Omission uses the family default. |
 | `eval_config.caps.attribution_segments` | Number of attributed segments, one per sampled recording. Omission uses the family default. |
