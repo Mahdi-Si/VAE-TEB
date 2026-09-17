@@ -335,3 +335,58 @@ def test_the_horizon_floor_is_one_trajectory_bin() -> None:
     from teb_vae.lag_attn_cfs.eval.config_schema import _MIN_HORIZON_HOURS
 
     assert _MIN_HORIZON_HOURS == TRAJECTORY_BIN_HOURS
+
+
+# ---------------------------------------------------------------------------
+# The width form of the occlusion bands
+# ---------------------------------------------------------------------------
+def _with_geometry(max_lag: int, **bands) -> dict:
+    return {
+        "eval_config": {"occlusion_bands": dict(bands)},
+        "model_config": {"VAE_model": {"max_lag": max_lag}},
+    }
+
+
+def test_a_partition_width_resolves_against_the_model_window_and_keeps_declared_bands() -> None:
+    """The derived bands come first and cover the window exactly once; a band declared beside the
+    width is kept as written, which is how the fixed cross-bank bands stay a declaration."""
+    resolved = validate_eval_config(_with_geometry(11, partition_width=4, head=[0, 5]))
+    bands = resolved["occlusion_bands"]
+    assert list(bands) == ["lags_000_003", "lags_004_007", "lags_008_011", "head"]
+    assert bands["lags_008_011"] == (8, 11)
+    assert bands["head"] == (0, 5)
+    covered = sorted(
+        lag
+        for name, (lo, hi) in bands.items()
+        if name.startswith("lags_")
+        for lag in range(lo, hi + 1)
+    )
+    assert covered == list(range(12))
+
+
+def test_the_remainder_folds_into_the_last_derived_band() -> None:
+    """A lag left out of the partition is a lag no suppression arm removes."""
+    bands = validate_eval_config(_with_geometry(9, partition_width=4))["occlusion_bands"]
+    assert list(bands) == ["lags_000_003", "lags_004_009"]
+
+
+def test_a_partition_width_without_geometry_is_refused() -> None:
+    """There is no window to cut, and a silent pass-through would hand an integer to the mask
+    builder under a band's name."""
+    with pytest.raises(ValueError, match="no model geometry"):
+        validate_eval_config(_config(occlusion_bands={"partition_width": 4}))
+
+
+def test_a_partition_width_covering_the_window_is_refused() -> None:
+    with pytest.raises(ValueError, match="whole axis"):
+        validate_eval_config(_with_geometry(3, partition_width=4))
+
+
+def test_a_declared_band_named_like_a_derived_one_is_refused() -> None:
+    with pytest.raises(ValueError, match="also the name"):
+        validate_eval_config(_with_geometry(7, partition_width=4, lags_000_003=[0, 3]))
+
+
+def test_a_non_positive_width_is_refused() -> None:
+    with pytest.raises(ValueError, match="partition_width"):
+        validate_eval_config(_with_geometry(7, partition_width=0))

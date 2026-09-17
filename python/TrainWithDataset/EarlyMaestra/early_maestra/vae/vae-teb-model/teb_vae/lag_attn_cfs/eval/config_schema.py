@@ -76,8 +76,10 @@ VALID_KEYS = frozenset(
         # This package's own, and the only divergence from the sibling's key set.
         "clock_margin_min_nats",
         # The lag bands the input-level occlusion readout scores, as ``{name: [lo, hi]}`` in
-        # stored steps back from the anchor. Empty -- the shipped default -- runs the analysis as
-        # a recorded skip rather than as a zero-band pass, which is a different statement.
+        # stored steps back from the anchor, plus the one reserved entry ``partition_width``,
+        # an integer resolved against the model's own lag window into a contiguous partition
+        # (see :func:`partition_lag_window`). Empty -- the shipped default -- runs the analysis
+        # as a recorded skip rather than as a zero-band pass, which is a different statement.
         "occlusion_bands",
         # The image format every figure of the run is written in. ``None`` -- the shipped
         # setting -- leaves ``figures.DEFAULT_FIGURE_FORMAT`` standing, which is what every
@@ -147,6 +149,49 @@ _MIN_BOOTSTRAP_RESAMPLES = 100
 #: gets an explicit INCONCLUSIVE with the measurement beside it.
 _MIN_CLOCK_MARGIN_NATS = 1e-3
 
+#: The one reserved name inside ``eval_config.occlusion_bands``. Its value is an integer width
+#: rather than a ``[lo, hi]`` pair, and it is resolved against the model's own lag window into a
+#: contiguous partition, so a delta written this way loads on any bank length.
+PARTITION_WIDTH_KEY = "partition_width"
+
+
+def partition_lag_window(n_lags: int, width: int) -> Dict[str, Tuple[int, int]]:
+    r"""Partition the lag axis into contiguous inclusive windows of a declared width.
+
+    The last window absorbs the remainder rather than being dropped, because a lag left out of the
+    partition is a lag no suppression arm ever removes -- and the readout would then be blind to an
+    effect sitting in it without anything saying so. Names are ``lags_<lo>_<hi>``, zero-padded, so
+    they sort in lag order and say what they cover.
+
+    Args:
+        n_lags: $L$, the candidate lag count.
+        width: Lags per window.
+
+    Returns:
+        ``{name: (lo, hi)}``, inclusive, in ascending order.
+
+    Raises:
+        ValueError: If either argument is not positive, or if the width covers the lag axis -- a
+            single window over the whole axis is a suppression of everything, which is the silence
+            arm under another name.
+    """
+    if int(n_lags) < 1 or int(width) < 1:
+        raise ValueError(f"n_lags and width must be >= 1, got {n_lags} and {width}")
+    if int(width) >= int(n_lags):
+        raise ValueError(
+            f"a window width of {width} over {n_lags} lags gives one window covering the whole "
+            f"axis, whose suppression is the silence arm rather than a lag readout."
+        )
+    windows: Dict[str, Tuple[int, int]] = {}
+    for low in range(0, int(n_lags), int(width)):
+        high = min(low + int(width), int(n_lags)) - 1
+        if high >= int(n_lags) - int(width):
+            high = int(n_lags) - 1
+        windows[f"lags_{low:03d}_{high:03d}"] = (low, high)
+        if high == int(n_lags) - 1:
+            break
+    return windows
+
 
 def _validate_occlusion_bands(bands: Any, max_lag: Optional[int]) -> Dict[str, Tuple[int, int]]:
     r"""Validate the occlusion bands against the model's own lag window.
@@ -162,6 +207,14 @@ def _validate_occlusion_bands(bands: Any, max_lag: Optional[int]) -> Dict[str, T
     anchor, so the part of it above the window contributes nothing and the reported band is wider
     than the one that was measured.
 
+    **The width form.** The reserved entry :data:`PARTITION_WIDTH_KEY` carries an integer instead
+    of a pair, and is expanded by :func:`partition_lag_window` over the model's window into the
+    bands it resolves to, listed first. Explicit bands beside it are kept as declared, which is
+    how the fixed cross-bank bands stay a comparison contract rather than a function of the
+    geometry. A width needs the geometry to resolve against, so it is refused when the config
+    carries none, and a declared band that shares a derived band's name is refused rather than
+    silently overwritten.
+
     Written here rather than bound to the shared lag-ablation validator: that one's refusals are
     stated in terms of a keep mask leaving the attention with no valid support, which is a
     different mechanism and a message that would send a reader to the wrong place.
@@ -173,11 +226,12 @@ def _validate_occlusion_bands(bands: Any, max_lag: Optional[int]) -> Dict[str, T
             the analysis refuses a too-wide band against the model it actually rebuilt.
 
     Returns:
-        The bands as ``{name: (lo, hi)}``.
+        The bands as ``{name: (lo, hi)}``, with any derived partition resolved.
 
     Raises:
         ValueError: If the block is not a mapping, a band is not a pair of non-negative integers,
-            a band is empty, or a band exceeds the lag window.
+            a band is empty, a band exceeds the lag window, a width is given with no geometry to
+            resolve it against, or a declared name collides with a derived one.
     """
     if not isinstance(bands, Mapping):
         raise ValueError(
@@ -185,7 +239,30 @@ def _validate_occlusion_bands(bands: Any, max_lag: Optional[int]) -> Dict[str, T
             f"[lo, hi] lag pair, got {type(bands).__name__}."
         )
     validated: Dict[str, Tuple[int, int]] = {}
+    width = bands.get(PARTITION_WIDTH_KEY)
+    if width is not None:
+        width = _require_int(width, f"occlusion_bands.{PARTITION_WIDTH_KEY}", minimum=1)
+        if max_lag is None:
+            raise ValueError(
+                f"eval_config.occlusion_bands.{PARTITION_WIDTH_KEY} = {width} partitions the "
+                f"model's lag window, and this config carries no model geometry to partition. The "
+                f"width form resolves only when merged over a run's resolved config."
+            )
+        try:
+            validated.update(partition_lag_window(int(max_lag) + 1, width))
+        except ValueError as error:
+            raise ValueError(
+                f"eval_config.occlusion_bands.{PARTITION_WIDTH_KEY}: {error}"
+            ) from error
     for name, span in bands.items():
+        if name == PARTITION_WIDTH_KEY:
+            continue
+        if str(name) in validated:
+            raise ValueError(
+                f"eval_config.occlusion_bands.{name} is also the name of a band derived from "
+                f"{PARTITION_WIDTH_KEY}; rename the declared band so neither silently replaces "
+                f"the other."
+            )
         if not isinstance(span, (list, tuple)) or len(span) != 2:
             raise ValueError(
                 f"eval_config.occlusion_bands.{name} must be an inclusive [lo, hi] lag pair, got "

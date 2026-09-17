@@ -26,20 +26,22 @@ from teb_vae.lag_slot_transformer_cfs.eval.binding import DEFAULT_OVERRIDES_PATH
 #: The old-bank tail diagnostic profile, beside the committed delta it copies.
 TAIL_DIAGNOSTIC_PATH = DEFAULT_OVERRIDES_PATH.parent / "lag91_tail_diagnostic.yaml"
 
-#: The short-bank evaluation profile, beside the training profile whose window it is declared for.
+#: The short-bank acceptance profile, beside the production training profile whose window both it
+#: and the committed delta are read on.
 SHORT_PROFILE_PATH = DEFAULT_OVERRIDES_PATH.parent / "lag25_eval_overrides.yaml"
 SHORT_TRAINING_CONFIG = DEFAULT_OVERRIDES_PATH.parents[2] / "configs" / "lag25.yaml"
+WIDE_TRAINING_CONFIG = DEFAULT_OVERRIDES_PATH.parents[2] / "configs" / "default.yaml"
+
+#: The wide window's hand-declared partition, carried today by the tail diagnostic profile.
+WIDE_PARTITION = ("anchor", "near", "mid", "far")
 
 #: The two shipped evaluation profiles, each with the training configuration whose window it is
-#: declared for and the names of the bands that PARTITION that window. A profile may declare
-#: further bands that overlap the partition; those are read as cross-window bands, not as part
-#: of it.
+#: read on and the names of the bands that PARTITION that window -- ``None`` where the profile
+#: derives its partition from the window through ``partition_width``, in which case the derived
+#: names are the partition. A profile may declare further bands that overlap the partition; those
+#: are read as cross-window bands, not as part of it.
 SHIPPED_PROFILES = {
-    "wide": (
-        DEFAULT_OVERRIDES_PATH,
-        DEFAULT_OVERRIDES_PATH.parents[2] / "configs" / "default.yaml",
-        ("anchor", "near", "mid", "far"),
-    ),
+    "committed": (DEFAULT_OVERRIDES_PATH, SHORT_TRAINING_CONFIG, None),
     "short": (
         SHORT_PROFILE_PATH,
         SHORT_TRAINING_CONFIG,
@@ -49,8 +51,13 @@ SHIPPED_PROFILES = {
 
 
 def _bands_of(path) -> dict:
-    """The lag bands one override delta declares."""
+    """The lag bands one override delta declares, as written."""
     return yaml.safe_load(path.read_text(encoding="utf-8"))["eval_config"]["occlusion_bands"]
+
+
+def _resolved_bands_of(path, max_lag: int) -> dict:
+    """The lag bands one override delta resolves to on a window, a derived partition expanded."""
+    return _validate_occlusion_bands(_bands_of(path), max_lag)
 
 
 def _max_lag_of(path) -> int:
@@ -60,25 +67,20 @@ def _max_lag_of(path) -> int:
     return int(load_config(str(path))["model_config"]["VAE_model"]["max_lag"])
 
 
-@pytest.fixture(scope="module")
-def shipped_bands():
-    """The lag bands the committed override delta declares.
-
-    Returns:
-        ``{name: [lo, hi]}``.
-    """
-    return _bands_of(DEFAULT_OVERRIDES_PATH)
-
-
 @pytest.fixture(scope="module", params=sorted(SHIPPED_PROFILES))
 def shipped_profile(request):
-    """One shipped evaluation profile: its bands, its window, and its partition's band names.
+    """One shipped evaluation profile: its resolved bands, its window, and its partition's names.
 
     Returns:
         ``(bands, max_lag, partition names)``.
     """
     path, training, partition = SHIPPED_PROFILES[request.param]
-    return _bands_of(path), _max_lag_of(training), partition
+    max_lag = _max_lag_of(training)
+    bands = _resolved_bands_of(path, max_lag)
+    if partition is None:
+        partition = tuple(name for name in bands if name.startswith("lags_"))
+        assert partition, "the committed delta derives no partition"
+    return bands, max_lag, partition
 
 
 # =============================================================================
@@ -116,10 +118,12 @@ def test_the_two_reference_arms_bracket_the_declared_bands(shipped_profile) -> N
 
 
 def test_the_short_profile_adds_cross_window_bands_that_overlap_its_partition() -> None:
-    """The two fixed bands are the wide profile's anchor band unchanged and what survives of its
+    """The two fixed bands are the wide partition's anchor band unchanged and what survives of its
     next band inside the short window, so a short run and a wide run can be read on one interval;
-    they overlap the partition and are declared beside it rather than replacing it."""
-    short, wide = _bands_of(SHORT_PROFILE_PATH), _bands_of(DEFAULT_OVERRIDES_PATH)
+    they overlap the partition and are declared beside it rather than replacing it, in the
+    acceptance profile and in the committed delta alike."""
+    short, wide = _bands_of(SHORT_PROFILE_PATH), _bands_of(TAIL_DIAGNOSTIC_PATH)
+    committed = _bands_of(DEFAULT_OVERRIDES_PATH)
     max_lag = _max_lag_of(SHORT_TRAINING_CONFIG)
     partition = SHIPPED_PROFILES["short"][2]
     extra = [name for name in short if name not in partition]
@@ -127,6 +131,8 @@ def test_the_short_profile_adds_cross_window_bands_that_overlap_its_partition() 
     assert extra == ["common_head", "common_tail"]
     assert short["common_head"] == wide["anchor"]
     assert short["common_tail"] == [wide["near"][0], max_lag]
+    for name in extra:
+        assert committed[name] == short[name], name
     masks = lag_metrics.band_masks(short, max_lag + 1)
     for name in extra:
         assert any(bool((masks[name] & masks[other]).any()) for other in partition)
@@ -134,14 +140,28 @@ def test_the_short_profile_adds_cross_window_bands_that_overlap_its_partition() 
     assert "base" not in yaml.safe_load(SHORT_PROFILE_PATH.read_text(encoding="utf-8"))
 
 
+def test_the_committed_delta_derives_its_partition_and_loads_on_the_wide_window_too() -> None:
+    """The partition is a function of the checkpoint's window, so the one delta resolves on the
+    production bank and on the wide one, and each resolution covers its window exactly once."""
+    committed = _bands_of(DEFAULT_OVERRIDES_PATH)
+    assert "partition_width" in committed
+    for training in (SHORT_TRAINING_CONFIG, WIDE_TRAINING_CONFIG):
+        max_lag = _max_lag_of(training)
+        bands = _resolved_bands_of(DEFAULT_OVERRIDES_PATH, max_lag)
+        derived = [span for name, span in bands.items() if name.startswith("lags_")]
+        covered = sorted(lag for lo, hi in derived for lag in range(lo, hi + 1))
+        assert covered == list(range(max_lag + 1)), training.name
+        assert bool(lag_metrics.band_masks(bands, max_lag + 1)["all"].all())
+
+
 def test_a_band_past_the_short_window_refuses_naming_the_window() -> None:
-    """The wide profile's bands reach past the short window and are refused, not clipped."""
+    """The wide partition's bands reach past the short window and are refused, not clipped."""
     max_lag = _max_lag_of(SHORT_TRAINING_CONFIG)
 
     with pytest.raises(ValueError, match=f"max_lag={max_lag}"):
         _validate_occlusion_bands({"tail": [13, max_lag + 6]}, max_lag)
     with pytest.raises(ValueError, match=f"max_lag={max_lag}"):
-        _validate_occlusion_bands(_bands_of(DEFAULT_OVERRIDES_PATH), max_lag)
+        _validate_occlusion_bands(_bands_of(TAIL_DIAGNOSTIC_PATH), max_lag)
 
 
 @pytest.fixture(scope="module")
@@ -150,17 +170,19 @@ def tail_diagnostic():
     return yaml.safe_load(TAIL_DIAGNOSTIC_PATH.read_text(encoding="utf-8"))
 
 
-def test_the_tail_diagnostic_keeps_the_shipped_partition_and_adds_the_cutoff_bands(
-    shipped_bands, tail_diagnostic
+def test_the_tail_diagnostic_keeps_the_wide_partition_and_adds_the_cutoff_bands(
+    tail_diagnostic,
 ) -> None:
-    """The shipped four bands are carried unchanged, so the diagnostic run's partition margins
-    are comparable with the shipped run's; the cutoff pair partitions the window at the proposed
-    25-entry boundary; and every band validates against the production lag window."""
+    """The wide four bands partition the wide window, so the diagnostic run's partition margins
+    are comparable with a wide run's; the cutoff pair partitions the window at the proposed
+    25-entry boundary; and every band validates against the wide lag window."""
     bands = tail_diagnostic["eval_config"]["occlusion_bands"]
-    max_lag = max(int(hi) for _, hi in shipped_bands.values())
+    max_lag = _max_lag_of(WIDE_TRAINING_CONFIG)
 
-    for name, span in shipped_bands.items():
-        assert bands[name] == span, name
+    edges = sorted((int(bands[name][0]), int(bands[name][1])) for name in WIDE_PARTITION)
+    assert edges[0][0] == 0 and edges[-1][1] == max_lag
+    for (_, previous_hi), (next_lo, _) in zip(edges, edges[1:]):
+        assert next_lo == previous_hi + 1, edges
     assert bands["head_0_24"] == [0, 24] and bands["tail_25_90"] == [25, max_lag]
     validated = _validate_occlusion_bands(bands, max_lag)
     assert set(validated) == set(bands)

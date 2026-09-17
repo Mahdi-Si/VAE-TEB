@@ -38,7 +38,7 @@ from .test_arms import fit_arm, score_arm
 #: result has been seen is invisible in every number it produces. A deliberate revision updates
 #: this literal and the plan's own revision counter together, and the diff is then the record that
 #: it happened.
-COMMITTED_PLAN_DIGEST = "5653fb573d2961c1"
+COMMITTED_PLAN_DIGEST = "3f20ebb0d36ade11"
 
 #: The saved production export of the 91-entry development run, read here for its recorded
 #: lag window alone: the acceptance pass must read it under the family declared for that window.

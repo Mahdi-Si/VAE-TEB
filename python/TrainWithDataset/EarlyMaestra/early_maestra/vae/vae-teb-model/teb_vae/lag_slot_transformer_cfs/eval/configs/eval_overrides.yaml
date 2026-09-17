@@ -236,18 +236,27 @@ eval_config:
   # THE LAG BANDS THE SUPPRESSION READOUT REMOVES, in stored steps back from the anchor, inclusive.
   #
   # The key is named for the lag-attentive cells' input-level occlusion because the schema's key set
-  # is shared and closed. The PARTITION is the same one and is deliberately so — a reader comparing
-  # two arms compares the same four intervals — but the INTERVENTION is not: there the source
-  # stream's values are zeroed and the model re-encodes; here the selectors s_{t,l} are set to zero
-  # over the band with the target state, the metadata, the original per-channel masks, the remaining
-  # proposals and c_L all held fixed. The two answer different questions and this package reports
-  # its own under its own name, `band_suppression`.
+  # is shared and closed. The INTERVENTION is not theirs: there the source stream's values are
+  # zeroed and the model re-encodes; here the selectors s_{t,l} are set to zero over the band with
+  # the target state, the metadata, the original per-channel masks, the remaining proposals and c_L
+  # all held fixed. The two answer different questions and this package reports its own under its
+  # own name, `band_suppression`.
   #
-  # The four partition the searched window at the boundaries the geometry already draws:
-  #   anchor    [0, 14]   the anchor's own neighbourhood
-  #   near      [15, 44]
-  #   mid       [45, 67]
-  #   far       [68, 90]  up to the window's far edge
+  # THE PARTITION IS DERIVED FROM THE CHECKPOINT, not declared here. `partition_width` is the one
+  # reserved entry: the run reads `max_lag` off the checkpoint's own resolved config and cuts its
+  # window into contiguous bands of this many steps, the last band absorbing the remainder, named
+  # `lags_<lo>_<hi>`. This delta therefore loads on any bank length. The production bank is the
+  # 25-entry one, lags 0..24, where a width of 5 gives five bands of 20 s each:
+  #   lags_000_004, lags_005_009, lags_010_014, lags_015_019, lags_020_024
+  # The dumped resolved_config.yaml in the run directory records the bands it resolved to.
+  #
+  # The two below are FIXED CROSS-BANK BANDS, declared rather than derived, so a 25-entry run and
+  # a 91-entry run can be read on one interval: `common_head` is the 91-entry profile's anchor
+  # band, and `common_tail` is what survives of its near band inside the 25-entry window. They
+  # OVERLAP the partition and each other; every band is a suppression of cached proposals scored
+  # in the shared draw loop, so the overlap costs decoder calls and nothing else. `all` is the
+  # union of every band, which is every lag on the window, so the `all`-equals-`silence` identity
+  # holds unchanged. A checkpoint whose window ends before lag 24 refuses `common_tail` by name.
   #
   # A band whose lags are largely unavailable — deep in the warm-up staircase — has little to
   # remove, and its margin is small for a reason that is about the schedule rather than about the
@@ -255,14 +264,14 @@ eval_config:
   # margin for exactly that, and a bin with no support is recorded as MISSING rather than as a
   # measured zero.
   #
-  # An empty band (lo > hi) and a band above the model's own `max_lag` are both refused by name at
-  # config load. `{}` records the readout as a skip, which is a different statement from a run whose
+  # An empty band (lo > hi), a band above the model's own `max_lag`, a width covering the whole
+  # window and a declared name that collides with a derived one are all refused by name at config
+  # load. `{}` records the readout as a skip, which is a different statement from a run whose
   # bands all measured nothing.
   occlusion_bands:
-    anchor: [0, 14]
-    near: [15, 44]
-    mid: [45, 67]
-    far: [68, 90]
+    partition_width: 5
+    common_head: [0, 14]
+    common_tail: [15, 24]
 
   # UNSET, and that is the setting. It gates the lag-attentive cells' availability-clock verdict,
   # whose null arm re-encodes a zeroed stream through a source pathway with parameters. This
