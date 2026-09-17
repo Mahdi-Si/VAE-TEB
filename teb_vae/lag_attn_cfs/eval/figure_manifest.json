@@ -7,8 +7,10 @@
     ],
     "attribution": [
       "attribution_bands.pdf",
+      "attribution_blocks.pdf",
       "attribution_channels.pdf",
       "attribution_checks.pdf",
+      "attribution_horizon.pdf",
       "attribution_lag_channel.pdf",
       "attribution_lag_profile.pdf",
       "attribution_layer.pdf",

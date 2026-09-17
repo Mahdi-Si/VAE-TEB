@@ -1,7 +1,14 @@
 __all__ = ['solid_harmonic_filter_bank']
 
 import numpy as np
-from scipy.special import sph_harm, factorial
+from scipy.special import factorial
+try:
+    from scipy.special import sph_harm
+except ImportError:  # scipy >= 1.17 removed sph_harm; sph_harm_y swaps the order and degree and the angles.
+    from scipy.special import sph_harm_y
+
+    def sph_harm(m, n, theta, phi):
+        return sph_harm_y(n, m, phi, theta)
 from .utils import get_3d_angles, double_factorial, sqrt
 
 

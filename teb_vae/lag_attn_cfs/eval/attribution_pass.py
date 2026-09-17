@@ -403,6 +403,8 @@ def attribute_example(
     n_steps: int,
     likelihood: str,
     live: Mapping[str, Optional[np.ndarray]],
+    horizons: Optional[Mapping[str, int]] = None,
+    latent: Optional[Mapping[str, np.ndarray]] = None,
 ) -> Tuple[Dict[str, Any], int]:
     r"""Attribute every example readout at one anchor of one sample, keeping the full maps.
 
@@ -427,42 +429,48 @@ def attribute_example(
         n_steps: Integration steps.
         likelihood: The objective's likelihood, for the block-score readouts.
         live: Per stream, each declared channel's first live step.
+        horizons: The named horizon steps the per-step score is attributed at, or ``None``.
+        latent: The latent at the anchor -- ``mu_prior``, ``shift`` ($\mu^q - \mu^p$) and
+            ``kld_dim``, each $(d_z,)$ -- for the page's activation row, or ``None``.
 
     Returns:
         ``(example, forward_equivalents)``: the example record -- identity, ``anchor``, ``column``,
-        ``inputs`` (the declared target stream with its two blocks concatenated, and the source
-        stream, each $(T, C)$), ``n_scattering``, the live steps, ``model_profile`` and ``maps``
-        keyed by ``(readout, baseline, band)`` with the two stream maps, the lag-aligned source
-        profile and the readout at the input and at the exact baseline -- and what it cost.
+        ``horizon``, ``inputs`` (the declared target stream with its two blocks concatenated, and
+        the source stream, each $(T, C)$), ``n_scattering``, the live steps, ``model_profile``,
+        ``latent``, ``maps`` keyed by ``(readout, baseline, band)`` with the two stream maps, the
+        lag-aligned source profile and the readout at the input and at the exact baseline, and
+        ``layer`` keyed by ``(readout, band)`` with the per-unit layer split under the source-null
+        baseline -- and what it cost.
     """
     model = task.orig_model
     one_inputs = tuple(x[sample:sample + 1].detach() for x in inputs)
     one_extra = tuple(x[sample:sample + 1].detach() for x in extra)
     columns = torch.tensor([int(column)], dtype=torch.long, device=one_inputs[0].device)
     n_lags = int(np.asarray(model_profile).shape[-1])
-    plan: List[Tuple[str, str, Optional[Tuple[int, int]], str]] = [
-        (readout, baseline, None, "") for readout in core.EXAMPLE_READOUTS for baseline in core.BASELINES
-    ]
-    plan += [
-        (core.READOUT_LAG_BAND, baseline, (int(span[0]), int(span[1])), str(name))
-        for name, span in lag_bands.items() for baseline in core.BASELINES
-    ]
     maps: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
+    layer: Dict[Tuple[str, str], np.ndarray] = {}
     cost = 0
-    for readout, baseline, band, name in plan:
+    for readout, tag, band, step in core.example_variants(lag_bands, horizons):
         wrapper = core.AnchorReadout(
-            model, cell, readout=readout, likelihood=likelihood, lag_band=band or (0, 0)
+            model, cell, readout=readout, likelihood=likelihood, lag_band=band, horizon=step
         ).eval()
-        result = core.integrated_gradients(wrapper, one_inputs, one_extra, columns, baseline=baseline, n_steps=n_steps)
-        cost += int(n_steps) + 3
-        maps[(readout, baseline, name)] = {
-            core.STREAM_TARGET: result.target[0], core.STREAM_SOURCE: result.source[0],
-            "lag_profile": core.lag_profile(core.time_profile(result.source), [int(anchor)], n_lags)[0],
-            "value_input": float(result.value_input[0]), "value_baseline": float(result.value_baseline[0]),
-        }
+        for baseline in core.BASELINES:
+            result = core.integrated_gradients(wrapper, one_inputs, one_extra, columns, baseline=baseline, n_steps=n_steps)
+            cost += int(n_steps) + 3
+            maps[(readout, baseline, tag)] = {
+                core.STREAM_TARGET: result.target[0], core.STREAM_SOURCE: result.source[0],
+                "lag_profile": core.lag_profile(core.time_profile(result.source), [int(anchor)], n_lags)[0],
+                "value_input": float(result.value_input[0]), "value_baseline": float(result.value_baseline[0]),
+            }
+        # The activation split, under the source-null path along which it is complete.
+        split = core.layer_attribution(wrapper, one_inputs, one_extra, columns, baseline=core.BASELINE_SOURCE_NULL, n_steps=n_steps)
+        if split["per_unit"].size:
+            cost += int(n_steps) + 2
+            layer[(readout, tag)] = np.asarray(split["per_unit"][0], dtype=np.float64)
     y_st, y_ph, u_stream = one_inputs
     example = {
         **dict(identity), "anchor": int(anchor), "column": int(column),
+        "horizon": int(getattr(model, "horizon", 0) or 0),
         "inputs": {
             core.STREAM_TARGET: torch.cat([y_st, y_ph], dim=-1)[0].detach().cpu().to(torch.float32).numpy(),
             core.STREAM_SOURCE: u_stream[0].detach().cpu().to(torch.float32).numpy(),
@@ -470,7 +478,9 @@ def attribute_example(
         "n_scattering": int(y_st.shape[-1]),
         "live_target": live.get(core.STREAM_TARGET), "live_source": live.get(core.STREAM_SOURCE),
         "model_profile": np.asarray(model_profile, dtype=np.float64),
+        "latent": {key: np.asarray(value, dtype=np.float64) for key, value in dict(latent or {}).items()},
         "maps": maps,
+        "layer": layer,
     }
     return example, cost
 
@@ -491,6 +501,7 @@ def attribute_batch(
     with_ablation: bool = True,
     with_lag_readout: bool = True,
     with_top_coordinate: bool = True,
+    with_horizon: bool = True,
     keep_maps_for: Optional[Dict[str, Any]] = None,
     work: Optional[BatchWork] = None,
 ) -> BatchWork:
@@ -511,6 +522,7 @@ def attribute_batch(
         with_ablation: Whether to run the band ablation.
         with_lag_readout: Whether to attribute the lag readout per band.
         with_top_coordinate: Whether to attribute the anchor's top divergence coordinate.
+        with_horizon: Whether to attribute the per-step score at the named horizon steps.
         keep_maps_for: ``{class: None}`` of the classes whose example anchor is still wanted;
             filled in place with the example record as each is attributed.
         work: The accumulator to extend, or ``None`` for a fresh one.
@@ -551,6 +563,8 @@ def attribute_batch(
     n_lags = int(model_profile.shape[1])
     live = {stream: core.warm_from_step(model, stream) for stream in core.STREAMS}
     anchors_all = outputs["anchor_index"].detach().cpu().numpy()
+    horizons = core.horizon_steps(model)
+    source_split = core.source_block_split(model)
 
     def anchor_steps() -> np.ndarray:
         """Each row's anchor as a stored step."""
@@ -563,19 +577,24 @@ def attribute_batch(
         kld_rows = kld_dim.detach().cpu().numpy()[sample, columns.cpu().numpy()]
     top_coordinate = torch.as_tensor(np.argmax(kld_rows, axis=1), dtype=torch.long, device=columns.device)
 
-    calls: List[Tuple[str, str, Optional[Tuple[int, int]], Optional[torch.Tensor], str]] = []
+    calls: List[Tuple[str, str, Optional[Tuple[int, int]], Optional[torch.Tensor], str, int]] = []
     for readout in readouts:
         for baseline in baselines:
-            calls.append((readout, baseline, None, None, ""))
+            calls.append((readout, baseline, None, None, "", 0))
+    # The per-step score at the named horizon steps, under both baselines: the target's share
+    # exists only along the all-zero path, the source's is read along the source-null one.
+    for step in (horizons.values() if with_horizon else ()):
+        for baseline in baselines:
+            calls.append((core.READOUT_NLL_HORIZON, baseline, None, None, f"h{int(step)}", int(step)))
     if with_lag_readout:
         for name, band in lag_bands.items():
-            calls.append((core.READOUT_LAG_BAND, core.BASELINE_SOURCE_NULL, tuple(band), None, str(name)))
+            calls.append((core.READOUT_LAG_BAND, core.BASELINE_SOURCE_NULL, tuple(band), None, str(name), 0))
     if with_top_coordinate:
-        calls.append((core.READOUT_KLD_DIM, core.BASELINE_SOURCE_NULL, None, top_coordinate, ""))
+        calls.append((core.READOUT_KLD_DIM, core.BASELINE_SOURCE_NULL, None, top_coordinate, "", 0))
 
-    for readout, baseline, band, coordinates, band_name in calls:
+    for readout, baseline, band, coordinates, band_name, horizon in calls:
         wrapper = core.AnchorReadout(
-            model, cell, readout=readout, likelihood=likelihood, lag_band=band or (0, 0)
+            model, cell, readout=readout, likelihood=likelihood, lag_band=band or (0, 0), horizon=horizon
         ).eval()
         result = core.integrated_gradients(
             wrapper, rows_inputs, rows_extra, columns, baseline=baseline,
@@ -585,7 +604,7 @@ def attribute_batch(
         _reduce_rows(
             work, result, identity=identity, sample=sample, band_name=band_name, n_lags=n_lags,
             model_profile=model_profile, lag_bands=lag_bands, channel_groups=channel_groups,
-            live=live, kld_rows=kld_rows,
+            live=live, kld_rows=kld_rows, n_scattering=int(y_st.shape[-1]), source_split=source_split,
         )
         layer = None
         if with_layer and readout in core.MAIN_READOUTS and baseline == core.BASELINE_SOURCE_NULL:
@@ -623,10 +642,16 @@ def attribute_batch(
             if of_sample.size == 0:
                 continue
             offset = int(of_sample[of_sample.size // 2])
+            where = (element, int(steps[offset])) if cell.dense_latent else (element, int(columns[offset].item()))
+            with torch.no_grad():
+                mu_prior = outputs["mu_prior"][where].detach().cpu().to(torch.float64).numpy()
+                mu_post = outputs["mu_post"][where].detach().cpu().to(torch.float64).numpy()
+            latent = {"mu_prior": mu_prior, "shift": mu_post - mu_prior, "kld_dim": np.asarray(kld_rows[offset], dtype=np.float64)}
             example, cost = attribute_example(
                 task, inputs, extra, cell, sample=element, column=int(columns[offset].item()),
                 anchor=int(steps[offset]), identity=identity[element], model_profile=model_profile[offset],
                 lag_bands=lag_bands, n_steps=n_steps, likelihood=likelihood, live=live,
+                horizons=horizons, latent=latent,
             )
             work.forward_equivalents += cost
             keep_maps_for[key] = example
@@ -647,11 +672,14 @@ def _reduce_rows(
     channel_groups: Mapping[str, Mapping[str, np.ndarray]],
     live: Mapping[str, Optional[np.ndarray]],
     kld_rows: np.ndarray,
+    n_scattering: int = 0,
+    source_split: int = 0,
 ) -> None:
     """Turn one Captum call's maps into records and row-aligned vectors."""
     n_rows = int(result.anchor.shape[0])
     target_time = core.time_profile(result.target)
     source_time = core.time_profile(result.source)
+    blocks = core.block_sums(result.target, result.source, n_scattering=n_scattering, source_split=source_split)
     target_channels = core.channel_profile(result.target)
     source_channels = core.channel_profile(result.source)
     lags = core.lag_profile(source_time, result.anchor, n_lags)
@@ -720,6 +748,9 @@ def _reduce_rows(
         for stream, bands in band_values.items():
             for name, values in bands.items():
                 record[f"band_{stream}_{name}"] = float(values[offset])
+        for name, (signed, unsigned) in blocks.items():
+            record[f"block_{name}"] = float(signed[offset])
+            record[f"block_abs_{name}"] = float(unsigned[offset])
         work.rows.append(record)
         work.append_vector("time_profile_target", target_time[offset].astype(np.float32))
         work.append_vector("time_profile_source", source_time[offset].astype(np.float32))
@@ -808,8 +839,11 @@ def target_only_check(task: Any, loader: Any, selected: pd.DataFrame, cell: core
         task, moved, selected.iloc[:1], cell, lag_bands={}, channel_groups={}, n_steps=n_steps,
         anchors_per_segment=1, readouts=(core.READOUT_NLL_BASE,), baselines=(core.BASELINE_SOURCE_NULL,),
         with_layer=False, with_ablation=False, with_lag_readout=False, with_top_coordinate=False,
+        with_horizon=False,
     )
-    worst = max((float(row["source_abs_total"]) for row in work.rows), default=None)
+    worst = max(
+        (float(row["source_abs_total"]) for row in work.rows if row["readout"] == core.READOUT_NLL_BASE), default=None
+    )
     return {"readout": core.READOUT_NLL_BASE, "source_attr_max_abs": worst, "n_rows": len(work.rows)}
 
 
@@ -952,6 +986,37 @@ def lag_bands_frame(rows: pd.DataFrame, lag_bands: Mapping[str, Tuple[int, int]]
     return pd.DataFrame(records)
 
 
+def blocks_frame(rows: pd.DataFrame) -> pd.DataFrame:
+    """Per (readout, band, baseline, block): the recording-mean signed and unsigned sums and the unsigned share.
+
+    Every readout but the per-coordinate and the lag-band ones, so the table answers which of
+    the four input blocks the latent change, the gain, the score, the fidelity and the per-step
+    score each responded to. The share is per row -- the block's unsigned sum over the four --
+    then averaged per recording and over recordings, so a segment with a large readout does not
+    decide the population's shares.
+    """
+    records: List[Dict[str, Any]] = []
+    columns = [f"block_abs_{name}" for name in core.BLOCKS]
+    if rows.empty or not all(column in rows.columns for column in columns):
+        return pd.DataFrame(records)
+    keep = ~rows["readout"].isin([core.READOUT_KLD_DIM, core.READOUT_LAG_BAND])
+    total = rows.loc[keep, columns].sum(axis=1)
+    for (readout, band, baseline), subset in rows[keep].groupby(["readout", "band", "baseline"], sort=False):
+        shares = subset[columns].div(total.loc[subset.index].replace(0.0, np.nan), axis=0)
+        for name in core.BLOCKS:
+            signed, count = _mean_over_recordings(subset, f"block_{name}")
+            unsigned, _ = _mean_over_recordings(subset, f"block_abs_{name}")
+            share, _ = _mean_over_recordings(shares.assign(guid=subset["guid"]), f"block_abs_{name}")
+            records.append(
+                {
+                    "readout": readout, "band": band, "baseline": baseline, "block": name,
+                    "label": core.variant_label(str(readout), str(band)),
+                    "signed_mean": signed, "unsigned_mean": unsigned, "share_mean": share, "n_recordings": count,
+                }
+            )
+    return pd.DataFrame(records)
+
+
 def layer_frame(rows: pd.DataFrame, vectors: Mapping[str, np.ndarray]) -> pd.DataFrame:
     """Long-form: per (readout, unit, class or pooled) the recording-mean layer attribution."""
     records: List[Dict[str, Any]] = []
@@ -960,7 +1025,7 @@ def layer_frame(rows: pd.DataFrame, vectors: Mapping[str, np.ndarray]) -> pd.Dat
     matrix = vectors["layer_per_unit"]
     for readout in core.MAIN_READOUTS:
         keep = ((rows["readout"] == readout) & (rows["baseline"] == core.BASELINE_SOURCE_NULL)).to_numpy()
-        keep &= np.isfinite(matrix).any(axis=1)
+        keep = keep & np.isfinite(matrix).any(axis=1)
         if not keep.any():
             continue
         subset = rows[keep]
@@ -1144,6 +1209,7 @@ def example_arrays(examples: Sequence[Mapping[str, Any]]) -> Dict[str, np.ndarra
         "example_clinical_class": np.asarray([str(e[labels.CLASS_COLUMN]) for e in examples], dtype=object),
         "example_epoch": np.asarray([float(e["epoch"]) for e in examples], dtype=np.float64),
         "example_anchor": np.asarray([int(e["anchor"]) for e in examples], dtype=np.int64),
+        "example_horizon": np.asarray([int(e.get("horizon", 0) or 0) for e in examples], dtype=np.int64),
         "example_n_scattering": np.asarray([int(e["n_scattering"]) for e in examples], dtype=np.int64),
         "input_target": np.stack([e["inputs"][core.STREAM_TARGET] for e in examples], axis=0),
         "input_source": np.stack([e["inputs"][core.STREAM_SOURCE] for e in examples], axis=0),
@@ -1163,6 +1229,18 @@ def example_arrays(examples: Sequence[Mapping[str, Any]]) -> Dict[str, np.ndarra
     for stream in core.STREAMS:
         arrays[f"map_{stream}"] = np.stack([examples[i]["maps"][k][stream] for i, k in keys], axis=0)
     arrays["map_lag_profile"] = np.stack([examples[i]["maps"][k]["lag_profile"] for i, k in keys], axis=0)
+    # The latent at the anchor and the layer split, where the examples carry them.
+    for name in ("mu_prior", "shift", "kld_dim"):
+        values = [np.asarray((e.get("latent") or {}).get(name, np.zeros(0)), dtype=np.float64) for e in examples]
+        if all(v.size for v in values):
+            arrays[f"example_latent_{name}"] = np.stack(values, axis=0)
+    splits = [np.asarray((examples[i].get("layer") or {}).get((k[0], k[2]), np.zeros(0)), dtype=np.float64) for i, k in keys]
+    width = max((int(v.size) for v in splits), default=0)
+    if width:
+        layer = np.full((len(splits), width), np.nan)
+        for row, values in enumerate(splits):
+            layer[row, :values.size] = values
+        arrays["map_layer"] = layer
     return arrays
 
 
@@ -1174,6 +1252,7 @@ def write_example_pages(
     cell: core.CellBinding,
     caveat: str,
     lag_bands: Mapping[str, Tuple[int, int]],
+    horizons: Optional[Mapping[str, int]] = None,
 ) -> List[Dict[str, Any]]:
     """Render one example page per class under ``maps/`` and return their manifest rows.
 
@@ -1184,6 +1263,7 @@ def write_example_pages(
         cell: The cell binding.
         caveat: The sentence printed under every page.
         lag_bands: The configured lag bands, in the order their rows are drawn.
+        horizons: The named horizon steps, in the order their rows are drawn, or ``None``.
 
     Returns:
         One row per page, in :data:`EXAMPLE_MANIFEST_COLUMNS` order.
@@ -1198,7 +1278,7 @@ def write_example_pages(
             f"{traces.recording_stem(item['guid'], item[labels.SUBGROUP_COLUMN])}_anchor{int(item['anchor'])}"
         )
         figure = figures.render_figure(
-            core.build_example_figure(item, lag_seconds=lag_seconds, cell=cell, caveat=caveat, lag_bands=lag_bands),
+            core.build_example_figure(item, lag_seconds=lag_seconds, cell=cell, caveat=caveat, lag_bands=lag_bands, horizons=horizons),
             root / f"{stem}{core.EXAMPLE_SUFFIX}",
         )
         manifest.append(
@@ -1331,17 +1411,20 @@ def run_pass(
     configured = dict(eval_config.get("occlusion_bands") or {})
     lag_bands = {str(name): (int(span[0]), int(span[1])) for name, span in configured.items()}
     n_steps = core.IG_STEPS
+    horizons = core.horizon_steps(task.orig_model)
     plan: Dict[str, Any] = {
         "capped": True, "cap": cap, "seed": seed, "anchors_per_segment": core.ANCHORS_PER_SEGMENT,
         "ig_steps": n_steps, "entry_fraction": core.BASELINE_ENTRY_FRACTION,
         "baselines": list(core.BASELINES), "readouts": list(core.MAIN_READOUTS),
+        "horizon_steps": {name: int(step) for name, step in horizons.items()},
+        "example_readouts": list(core.EXAMPLE_READOUTS),
         "lag_readout": cell.lag_readout, "lag_bands": {name: list(span) for name, span in lag_bands.items()},
         "layer": cell.layer_label, "delay_steps": int(delay_steps),
         "anchor_phase": DENSE_ANCHOR_GEOMETRY[0], "anchor_stride": DENSE_ANCHOR_GEOMETRY[1],
         "trace_recordings_per_class": core.TRACE_RECORDINGS_PER_CLASS,
-        # The bound is not applied to the trace's span -- the whole recording is traced -- but it
-        # is the window the traced recordings are ranked for completeness over.
-        "max_hours_before_delivery_applied": False,
+        # The bound is the window the traced recordings are ranked for completeness over, and,
+        # when set, the only segments of each chosen recording that are traced.
+        "max_hours_before_delivery_applied": eval_config.get("max_hours_before_delivery") is not None,
         "trace_completeness_window_hours": eval_config.get("max_hours_before_delivery"),
     }
     labelled = labelled_segments(segments)
@@ -1379,11 +1462,14 @@ def run_pass(
     layer.to_csv(directory / core.LAYER_FILENAME, index=False)
     null = null_frame(rows)
     null.to_csv(directory / core.NULL_FILENAME, index=False)
+    blocks = blocks_frame(rows)
+    blocks.to_csv(directory / core.BLOCKS_FILENAME, index=False)
 
     caveat = core.ATTRIBUTION_CAVEAT
     files: List[str] = [
         core.ROWS_FILENAME, core.VECTORS_FILENAME, core.RECORDINGS_FILENAME, core.SUMMARY_FILENAME,
         core.BANDS_FILENAME, core.LAG_BANDS_FILENAME, core.LAYER_FILENAME, core.NULL_FILENAME,
+        core.BLOCKS_FILENAME,
     ]
     if examples:
         files.append(core.MAPS_FILENAME)
@@ -1430,10 +1516,16 @@ def run_pass(
             core.build_delivery_figure(rows, vectors, lag_seconds=lag_seconds, readouts=core.MAIN_READOUTS, caveat=caveat),
             directory / core.DELIVERY_FIGURE,
         ),
+        figures.render_figure(core.build_block_figure(blocks, caveat=caveat), directory / core.BLOCK_FIGURE),
+        figures.render_figure(
+            core.build_horizon_figure(rows, vectors, lag_seconds=lag_seconds, horizons=horizons, caveat=caveat),
+            directory / core.HORIZON_FIGURE,
+        ),
     ]
     files.extend(Path(path).name for path in figure_paths)
     example_manifest = write_example_pages(
         examples, directory=directory, lag_seconds=lag_seconds, cell=cell, caveat=caveat, lag_bands=lag_bands,
+        horizons=horizons,
     )
     pd.DataFrame(example_manifest, columns=list(EXAMPLE_MANIFEST_COLUMNS)).to_csv(
         directory / EXAMPLE_MANIFEST_FILENAME, index=False
@@ -1446,7 +1538,8 @@ def run_pass(
         window_hours=None if window_hours is None else float(window_hours),
     )
     manifest, failures = run_traces(
-        task, loader, chosen, index_map, cell, directory=directory, lag_seconds=lag_seconds,
+        task, loader, chosen, cohort.within_horizon_index(index_map, window_hours), cell,
+        directory=directory, lag_seconds=lag_seconds,
         break_after_s=break_after_s, n_steps=n_steps, anchors_per_segment=core.ANCHORS_PER_SEGMENT, caveat=caveat,
     )
     pd.DataFrame(manifest, columns=list(TRACE_MANIFEST_COLUMNS)).to_csv(directory / TRACE_MANIFEST_FILENAME, index=False)
@@ -1492,6 +1585,7 @@ def run_pass(
         "checks": checks,
         "summary": summary.to_dict(orient="records"),
         "lag_bands": lag_band_table.to_dict(orient="records"),
+        "blocks": blocks.to_dict(orient="records"),
         "joined": {
             "channel_map": channel_map is not None,
             "occlusion_summary": occlusion is not None,
@@ -1524,7 +1618,7 @@ __all__ = [
     "CHANNEL_MAP_FILENAME", "COMPLETENESS_TOLERANCE", "EXAMPLE_MANIFEST_COLUMNS",
     "EXAMPLE_MANIFEST_FILENAME", "OCCLUSION_SUMMARY_PATH",
     "RECORDING_VALUE_COLUMNS", "SPECTRAL_BANDS_PATH", "TRACE_MANIFEST_COLUMNS",
-    "TRACE_MANIFEST_FILENAME", "BatchWork", "attribute_batch", "attribute_example", "bands_frame",
+    "TRACE_MANIFEST_FILENAME", "BatchWork", "attribute_batch", "attribute_example", "bands_frame", "blocks_frame",
     "example_arrays", "labelled_segments", "lag_channel_arrays", "lag_channel_summary",
     "lag_bands_frame", "layer_frame", "null_frame", "read_channel_map", "read_occlusion_summary",
     "read_spectral_bands", "recording_completeness", "recording_rows", "recording_table",

@@ -482,6 +482,43 @@ def test_the_analysis_traces_a_balanced_draw_end_to_end(tmp_path) -> None:
     assert (directory / f"{traces.SUMMARY_FIGURE}.pdf").is_file()
 
 
+def test_the_analysis_traces_only_the_segments_inside_the_delivery_window(tmp_path) -> None:
+    """With ``max_hours_before_delivery`` set, the segment recorded before the window is neither
+    traced nor counted, and the plan records that the bound was applied."""
+    guids, epochs, classes = _stub_population()
+    extra = [(guid, -7200.0 - STRIDE_S, name) for guid, epoch, name in zip(guids, epochs, classes)
+             if epoch == -7200.0 and guid != "lonely"]
+    guids += [g for g, _, _ in extra]; epochs += [e for _, e, _ in extra]; classes += [c for _, _, c in extra]
+    dataset = _StubDataset(guids, epochs)
+    loader = types.SimpleNamespace(dataset=dataset, collate_fn=_collate_factory(dataset), batch_size=2)
+    per_sample = pd.DataFrame(
+        {"guid": guids, "epoch": epochs, labels.CLASS_COLUMN: classes,
+         labels.SUBGROUP_COLUMN: [f"{name}_cs" for name in classes]}
+    )
+    module = make_task()
+    module.eval()
+    context = AnalysisContext(
+        collection=types.SimpleNamespace(
+            per_sample=per_sample, per_anchor=pd.DataFrame(), record={}, retained={}, results={},
+        ),
+        config={}, task=module, loader=loader,
+    )
+    window = 7200.0 / 3600.0
+
+    result = analysis.run_recording_traces_analysis(
+        context, eval_config={"seed": 0, "caps": {traces.TRACES_CAP: 1}, "max_hours_before_delivery": window},
+        output_dir=tmp_path,
+    )
+
+    assert result["failures"] == [], result["failures"]
+    assert result["plan"]["max_hours_before_delivery"] == window
+    assert result["plan"]["max_hours_before_delivery_applied"] is True
+    manifest = pd.read_csv(tmp_path / traces.ANALYSIS_DIRNAME / traces.MANIFEST_FILENAME)
+    assert len(manifest) == 3 and (manifest["n_segments"] == 2).all()
+    summary = pd.read_csv(tmp_path / traces.ANALYSIS_DIRNAME / traces.SEGMENT_SUMMARY_FILENAME)
+    assert (summary["epoch"] >= -window * 3600.0).all()
+
+
 def test_a_pass_with_no_model_records_a_skip(tmp_path) -> None:
     context = AnalysisContext(
         collection=types.SimpleNamespace(

@@ -658,6 +658,7 @@ def heatmap_with_colorbar(
     separator_row: Optional[int] = None,
     extent: Optional[Tuple[float, float, float, float]] = None,
     interpolation: str = "nearest",
+    norm: Any = None,
 ) -> Any:
     """Draw a heatmap with its colourbar, tolerating empty and all-``NaN`` input.
 
@@ -690,6 +691,9 @@ def heatmap_with_colorbar(
         separator_row: Row index of the last row of the upper feature block. A horizontal rule is
             drawn at ``separator_row + 0.5``, which is where the two blocks actually meet.
         extent: Optional imshow extent, for a panel sharing a physical axis with another.
+        norm: A matplotlib colour normaliser -- a ``LogNorm`` or ``SymLogNorm`` -- that replaces
+            the limits above entirely, for a field whose values span orders of magnitude. ``None``
+            keeps the linear scale the limits describe.
         interpolation: What ``imshow`` does between cells. ``'nearest'`` resamples to the
             renderer's pixel grid; ``'none'`` emits the cells themselves, which is what a
             *vector* output wants -- in a PDF the resampling is done at a resolution the file
@@ -730,9 +734,9 @@ def heatmap_with_colorbar(
             # renders as a single flat colour indistinguishable from an empty panel.
             vmin, vmax = vmin - 0.5, vmax + 0.5
 
+    scale = {"norm": norm} if norm is not None else {"vmin": vmin, "vmax": vmax}
     image = ax.imshow(
-        field, aspect="auto", origin="upper", cmap=colormap, vmin=vmin, vmax=vmax,
-        interpolation=interpolation, extent=extent,
+        field, aspect="auto", origin="upper", cmap=colormap, interpolation=interpolation, extent=extent, **scale,
     )
     if separator_row is not None:
         ax.axhline(float(separator_row) + 0.5, color=COLOR_BLACK, linewidth=plt.rcParams["axes.linewidth"])

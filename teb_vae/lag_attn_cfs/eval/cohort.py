@@ -41,7 +41,7 @@ travels in the record rather than in a document beside it.
 from __future__ import annotations
 
 import os
-from typing import Any, Dict, List, NamedTuple, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, NamedTuple, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -204,6 +204,32 @@ def within_horizon(frame: pd.DataFrame, max_hours: Optional[float]) -> pd.DataFr
     # ``~(hours > horizon)`` rather than ``hours <= horizon``: the negation keeps the non-finite
     # rows, because every comparison against NaN is False. See the docstring.
     return frame[~(hours > float(max_hours))]
+
+
+def within_horizon_index(
+    index_map: Mapping[Tuple[str, Optional[int]], int], max_hours: Optional[float]
+) -> Dict[Tuple[str, Optional[int]], int]:
+    """Restrict a dataset listing to the segments recorded within ``max_hours`` of delivery.
+
+    The same bound as :func:`within_horizon`, on the ``{(guid, rounded epoch): index}`` listing
+    the recording traces re-read segments from rather than on a per-sample table -- so a bounded
+    run traces, counts and ranks recordings over the same population its clocks are read over.
+    A listing entry with no epoch is kept, as :func:`within_horizon` keeps a non-finite one.
+
+    Args:
+        index_map: From ``dataset_rows.dataset_index_map``.
+        max_hours: The horizon in hours before delivery, inclusive, or ``None`` for no bound.
+
+    Returns:
+        A filtered copy, or an unfiltered copy when ``max_hours`` is ``None``.
+    """
+    if max_hours is None:
+        return dict(index_map)
+    limit = -float(max_hours) * SECONDS_PER_HOUR
+    return {
+        (guid, stamp): index for (guid, stamp), index in index_map.items()
+        if stamp is None or float(stamp) >= limit
+    }
 
 
 def add_time_bins(
