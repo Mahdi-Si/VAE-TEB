@@ -146,6 +146,7 @@ def forecast_mask(
     coverage_floor: float = 0.0,
     anchors: Optional[torch.Tensor] = None,
     anchor_valid: Optional[torch.Tensor] = None,
+    validate: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     r"""Per-anchor forecast validity on the decimated grid, plus each anchor's coverage.
 
@@ -186,6 +187,11 @@ def forecast_mask(
         anchors: Optional anchor index $(B, A)$, integer, in $[0, T_{\mathrm{valid}})$.
         anchor_valid: Optional $(B, A)$ boolean companion; ``None`` means every entry is real.
             Ignored when ``anchors`` is ``None``, where the axis has no padding by construction.
+        validate: Whether to run :func:`_validate_anchors` on a supplied anchor set. The check
+            reads the device twice, so a caller that builds this mask several times per step
+            from one index validates it once and passes ``False`` for the rest. Only a caller
+            holding an index the model itself built may pass ``False``; an index from anywhere
+            else is validated.
 
     Returns:
         ``(mask, coverage_frac)``: the forecast mask $(B, A, H)$ and the per-anchor coverage
@@ -217,7 +223,8 @@ def forecast_mask(
         mask = warm[None, :, None] * (anchor * keep)[:, :, None] * future
         return mask, coverage_frac
 
-    _validate_anchors(anchors, anchor_valid, geometry, weight.size(0))
+    if validate:
+        _validate_anchors(anchors, anchor_valid, geometry, weight.size(0))
     index = anchors.to(torch.long)
     rows = torch.arange(weight.size(0), device=weight.device)[:, None]
     future = future[rows, index]  # (B, A, H)
@@ -273,6 +280,7 @@ def kl_mask(
     *,
     anchors: Optional[torch.Tensor] = None,
     anchor_valid: Optional[torch.Tensor] = None,
+    validate: bool = True,
 ) -> torch.Tensor:
     r"""Per-anchor KL support: exactly the anchors the reconstruction scores.
 
@@ -306,6 +314,9 @@ def kl_mask(
         anchors: The anchor index $(B, A)$ the mask was built at, or ``None`` for the dense range.
         anchor_valid: Its $(B, A)$ boolean companion, forwarded only so the same validation runs
             on both masks; the padding is already folded into ``forecast``.
+        validate: Whether to run :func:`_validate_anchors` on a supplied anchor set, under the
+            same contract as :func:`forecast_mask`: only a caller holding an index the model
+            itself built, and already validated once this step, may pass ``False``.
 
     Returns:
         The KL anchor mask $(B, T)$, zero outside $[w, T - H)$ and zero on any anchor the
@@ -330,7 +341,8 @@ def kl_mask(
         tail = forecast.new_zeros((forecast.shape[0], geometry.t - geometry.t_valid))
         return torch.cat((contributing, tail), dim=1)
 
-    _validate_anchors(anchors, anchor_valid, geometry, forecast.shape[0])
+    if validate:
+        _validate_anchors(anchors, anchor_valid, geometry, forecast.shape[0])
     support = forecast.new_zeros((forecast.shape[0], geometry.t))
     return support.scatter_reduce_(
         1, anchors.to(torch.long), contributing, reduce="amax", include_self=True

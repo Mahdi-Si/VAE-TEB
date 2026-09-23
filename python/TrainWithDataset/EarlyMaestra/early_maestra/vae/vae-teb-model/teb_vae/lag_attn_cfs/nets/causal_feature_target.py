@@ -1144,12 +1144,14 @@ class CausalFeatureForecastTarget(FeatureForecastTarget):
         """
         anchors: Optional[torch.Tensor] = forward_outputs.get("anchor_index")
         anchor_valid: Optional[torch.Tensor] = forward_outputs.get("anchor_valid")
+        # The forward's own index, validated by the objective's mask build this step.
         mask, _coverage = forecast_mask(
             weight,
             self.geometry,
             coverage_floor=self.coverage_floor,
             anchors=anchors,
             anchor_valid=anchor_valid,
+            validate=False,
         )
         metrics = self._forecast_gaps_from_mask(
             forward_outputs, target, mask, likelihood=likelihood
