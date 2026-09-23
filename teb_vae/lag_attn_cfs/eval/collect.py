@@ -107,6 +107,7 @@ from teb_vae.lag_attn_cfs.eval.metrics import (
     check_cached_verdicts,
     evaluate,
     expected_anchors_per_sample,
+    likelihood_structure_record,
 )
 from teb_vae.lag_attn_cfs.eval.report_seam import json_safe
 from teb_vae.lag_attn_rws.nets.model import LOGVAR_FLOOR_MARGIN_FRAC, SATURATION_FRAC
@@ -1222,6 +1223,10 @@ def collect_tables(
     collection.record["normalization"] = normalization_record(loader)
     collection.record["bounds"] = bounds_record(model)
     collection.record["likelihood"] = str(results.get("likelihood", ""))
+    # The density every block above was scored under -- the AR(1) residual and the scored cells --
+    # read off the model for the same reason the bounds are: it is a property of the checkpoint,
+    # and an offline re-run has no model to ask.
+    collection.record["likelihood_structure"] = likelihood_structure_record(model)
     check_per_anchor_key(collection.per_anchor)
     if len(collection.per_sample) != int(results["n_samples"]):
         raise ValueError(

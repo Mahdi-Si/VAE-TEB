@@ -111,6 +111,11 @@ GEOMETRY_KEYS: Tuple[str, ...] = (
     # not fail -- it would report the residual model's numbers under the residual-free model's
     # stated architecture.
     "persistence_residual",
+    # Here because it is part of the **density**: every evaluated readout scores each cell on its
+    # AR(1) innovation when it is on, so a config disagreeing about it would report one likelihood's
+    # numbers under another's name. ``target_scored_horizon``, the other density term, is a resolved
+    # vector with no config key and is re-resolved and compared in the reconciliation instead.
+    "forecast_ar_residual",
     "encoder_conv_kernels",
     "encoder_conv_dilations",
     "encoder_num_heads",

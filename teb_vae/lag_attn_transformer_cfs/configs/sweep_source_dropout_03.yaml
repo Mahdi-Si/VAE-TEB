@@ -13,9 +13,10 @@
 # not, which is a coupling number that does not generalise -- and no other key reaches the source
 # map without also reaching the branch it is compared against.
 #
-# TWO ARMS, 0.2 AND 0.3, because the quantity is a rate and one point does not say which direction
-# is better. They are separate files rather than one swept key for the reason every arm here is:
-# one axis per file, so a config is launchable by path and its delta is stated rather than derived.
+# ONE ARM SINCE 2026-09-23: the default now ships 0.2 (previously the `sweep_source_dropout_02`
+# arm), so this is the next point on the axis, and the null end is the pre-revision model rather
+# than a file here. The quantity is a rate and one point does not say which direction is better,
+# which is why this arm is read against the default rather than alone.
 #
 #   TEB_RUN_STAMP="$(date '+%Y-%m-%d--[%H-%M]')" torchrun --nproc_per_node=7 \
 #       -m teb_vae.lag_attn_transformer_cfs.trainer \

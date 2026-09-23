@@ -322,11 +322,14 @@ def build_gap_rows(
 
 
 def coefficients_per_anchor(record: Dict[str, Any]) -> Optional[float]:
-    r"""$H \cdot C_{\mathrm{keep}}$, the coefficients one anchor's forecast block covers, or ``None``.
+    r"""The coefficients one anchor's forecast block **scores**, or ``None``.
 
-    Read off the collection record's geometry block rather than assumed, because it is the
+    $H \cdot C_{\mathrm{keep}}$ on a model that scores every cell, and $\sum_{\tau,c} m_{\tau,c}$
+    under a per-channel scored horizon -- the cells the block log-density is a sum over, which is
+    the ``scored_cells`` entry of the record's ``likelihood_structure`` block wherever the pass
+    recorded one. Read off the collection record rather than assumed, because it is the
     denominator that turns a block score into a per-coefficient one and a wrong constant there
-    would rescale the likelihood percentage silently. Read as ``block_width`` rather than
+    would rescale the likelihood percentage silently. Read as a recorded count rather than
     multiplied out here for a sharper reason than convenience: $C_{\mathrm{keep}}$ is not a
     constant of the architecture but the count the warm-up budget left standing, so the only
     trustworthy source for it is the model the pass actually scored.
@@ -341,7 +344,8 @@ def coefficients_per_anchor(record: Dict[str, Any]) -> Optional[float]:
         reported as a skip rather than as a number divided by a guess.
     """
     geometry = record.get("geometry") or {}
-    block_width = geometry.get("block_width")
+    structure = record.get("likelihood_structure") or {}
+    block_width = structure.get("scored_cells", geometry.get("block_width"))
     if block_width is None:
         return None
     total = float(block_width)
@@ -395,7 +399,8 @@ def likelihood_percent_support(record: Dict[str, Any]) -> Dict[str, Any]:
         # as a flag: what a reader has to do with it is compare two runs' block widths before
         # comparing their percentages, and a bare ``true`` does not say that.
         "budget_local": (
-            "the denominator is H*C_keep, and C_keep is the count of target channels the warm-up "
+            "the denominator is H*C_keep (the scored cells under a per-channel scored horizon), "
+            "and C_keep is the count of target channels the warm-up "
             "budget left standing rather than a constant of the architecture -- so this "
             "percentage is comparable across runs only where their block widths are. The nats it "
             "is derived from and the two error-space percentages carry no such restriction"

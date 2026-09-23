@@ -448,11 +448,12 @@ rather than on the presence of the rows.
 
 ## 12. Configuration
 
-`configs/` ships exactly `default.yaml`, `tiny.yaml`, `smoke_hie.yaml`, `planted.yaml` and eight
+`configs/` ships exactly `default.yaml`, `tiny.yaml`, `smoke_hie.yaml`, `planted.yaml` and nine
 sweep arms — `sweep_anchor_stride_1.yaml`, `sweep_align_target_max.yaml`,
-`sweep_lag_bias_decay.yaml`, `sweep_lag_kv_adapter.yaml`, `sweep_source_dropout_02.yaml`,
-`sweep_source_dropout_03.yaml`, `sweep_target_clock_input.yaml` and
-`sweep_legacy_dualref_physclock.yaml` (the pre-2026-09-05 default, kept as a comparator) — and the directory listing
+`sweep_lag_bias_decay.yaml`, `sweep_source_dropout_03.yaml`, `sweep_target_clock_input.yaml`,
+`sweep_legacy_dualref_physclock.yaml` (the pre-2026-09-05 default, kept as a comparator), and the
+final revision's three comparators `sweep_factorised_likelihood.yaml`,
+`sweep_all_cells_scored.yaml` and `sweep_lag_kv_conv_stem.yaml` (the 2026-09-23 amendment) — and the directory listing
 itself is asserted. Each is written out in full rather than inheriting: a `base:` chain would be the smaller
 file and the worse record, because it hides which settings this run shares with the models it is
 compared against, and that sharing is the whole value of the square.
@@ -1055,3 +1056,122 @@ twins pin the pair. `sweep_legacy_dualref_physclock.yaml` deliberately
 does *not* pin the horizon: it compares the representation, the input references and the clock
 against the default, which is only readable with the horizon held equal — under $H = 10$ its
 physical-clock ceiling is $205$, its span $71$ anchors and its stride-$5$ tiling $14$–$15$ tiles.
+
+
+## Amendment (2026-09-23): the final revision — local keys, a longer horizon, and a forecast density that fits the block
+
+This is the last revision of this cell; the next model moves to the raw-signal domain. It changes
+the configuration in five leaves and adds two structural terms to the forecast likelihood. Both
+terms live in the shared causal-feature mixins and the shared score function, off by default, so
+the conv-LSTM causal cell (`lag_attn_cfs`) is untouched and is **no longer level-comparable** with
+this one: the encoder edge of the six-cell square is closed by this revision, deliberately, and the
+config-parity tests declare every leaf below as a divergence of this cell.
+
+### What moved in the configuration, and the evidence for each
+
+| Leaf | From → to | Evidence |
+| --- | --- | --- |
+| `lag_kv_source` | `conv_stem` → `adapter` | On the planted-delay fixture only the adapter arm put a head on the planted band; the stem and encoder arms read lag $0$. The stem's reach makes neighbouring lag keys near-duplicates, so the lag axis is not identifiable over it. |
+| `horizon`, `anchor_stride`, `horizon_weight_halflife_steps` | $10 \to 30$, $5 \to 15$, $5 \to 30$ | The last evaluated run put all of its source effect at the final step of a $10$-step window, occlusion peaked at steps $8$–$9$, and a raw-signal ceiling check places the FHR nadir a median $48$ s (quartiles $22$/$67$ s) after the contraction peak. A channel with filter delay $d_k$ shows that response at lead $\Lambda_k = \delta + d_k - d_u$, which the old window cut off for every deceleration-band channel. The halflife moves off the $H/2$ rule on purpose: a steep decay down-weights exactly the far steps where the source's effect lands. |
+| `max_lag` | $90 \to 37$ | The raw-signal delay scan shows no source gain beyond about $150$ s, and in `lag_slot_transformer_cfs` occluding lags $15$–$90$ *improved* the score. A shorter window also keeps the first anchors' lags out of the deepest warm-up region. |
+| `source_dropout` | `null` → $0.2$ | The full branch over-fits before the base branch; this is the one seam that regularises the source pathway alone. |
+| `gradient_clip_val`, `additive_margin` | scaled by the block ratio | $H \cdot C_{\mathrm{keep}}$ triples with the horizon, so both constants stated in nats of the block were scaled by $3$ from the previous values, **not re-measured**. Re-derive both from the headline run's own `train/grad_norm` and `main_loss`. |
+
+`horizon_depth` stays $4$: the refine stack's receptive field is $31 \ge H + 1$ at the new horizon.
+`logvar_clamp` stays $[-5, 3]$, because `head_init_calibration` seeds the log-variance bias at the
+pre-image of $0$ under exactly that clamp.
+
+### The per-channel scored horizon $H_c$
+
+A single $H$ is the wrong length for a block that mixes envelopes and phase products. Measured
+held-out on the integer-phase shard (an FHR-only ridge forecast from every kept channel at lags
+$\{0, 1, 2, 4, 8\}$, leave-one-recording-out; `tmp/cfs_channel_horizon/channel_horizon.py`):
+
+| Channels | $R^2$ at $\tau = 1 / 5 / 10 / 20 / 30$ | last $\tau$ with $R^2 \ge 0.1$ |
+| --- | --- | --- |
+| `fhr_st`, every band | $\ge 0.97$ / $\ge 0.51$ / $\ge 0.29$ / $\ge 0.22$ / $\ge 0.17$ (band medians) | whole horizon |
+| `fhr_ph`, slow leg above $0.15$ Hz | $0.92$ / $-0.03$ / $-0.08$ / $-0.08$ / $-0.09$ | $3$ |
+| `fhr_ph`, slow leg $0.03$–$0.15$ Hz | $0.98$ / $0.14$ / $-0.07$ / $-0.08$ / $-0.07$ | $5$ (range $3$–$10$) |
+| `fhr_ph`, slow leg at or below $0.03$ Hz | $1.00$ / $0.90$ / $0.51$ / $-0.01$ / $-0.06$ | $16$ (range $7$–$30$) |
+
+The reason is structural. $S_1 = \phi * |x * \psi_k|$ is a band's power, which follows the fetal
+state and stays forecastable long after the coefficient is made of unseen samples. A phase product
+$\mathrm{Re}\{\phi * ([z_i]^k \bar z_j)\}$ depends on the *relative phase* of two band-limited
+processes, which decorrelates within about the inverse bandwidth; past $\phi$'s own support it is a
+zero-mean random sign that nothing — the source included — can forecast. At the old horizon those
+cells were a minority; at $H = 30$ they are most of every fast phase channel, and a loss summed over
+them pays the shared decoder to flatten the fast channels everywhere, the near steps included.
+
+So each channel is scored over its first $H_c$ steps only,
+
+$$H_c = \begin{cases} H_{\mathrm{fast}} & c \in \texttt{fhr\_ph},\ \xi_{i(c)} > f_{\mathrm{cut}} \\
+H & \text{otherwise,} \end{cases}$$
+
+with $\xi_{i(c)}$ the slow-leg centre frequency the shard records per phase channel
+(`sel_xi_i_hz`), $f_{\mathrm{cut}}$ = `target_phase_fast_cutoff_hz` ($0.03$) and
+$H_{\mathrm{fast}}$ = `target_phase_fast_horizon` ($5$). Contraction-locked decelerations put their
+energy at or below the cutoff, which is where the source's effect lands, so those channels keep the
+whole horizon even though their FHR-only skill fades sooner — that fading is exactly the room a
+source can fill. The rule is resolved from the shards by
+`teb_vae/lag_attn_cfs/scored_horizon.py::resolve_target_scored_horizon` and reaches the network as
+`target_scored_horizon` (per **declared** channel, gathered through the keep-index), so it lands in
+every checkpoint's `model_kwargs`. The network holds it as the non-persistent $(H, C_{\mathrm{keep}})$
+buffer `target_cell_mask`, $m_{\tau,c} = \mathbb 1[\tau < H_c]$.
+
+**It is a mask, not a weight.** Scoring a subset of cells keeps the block a true log-density, so
+$\beta = 1$ keeps its meaning for the scored set and — unlike `target_channel_weight` and
+`horizon_weight`, which the evaluation deliberately leaves out — the evaluation applies it too, and
+the Monte Carlo predictive gap stays a probability statement.
+
+### The AR(1) residual likelihood
+
+The decoder emits every horizon step at once from one latent, and the factorised Gaussian scored
+each cell as if its error were independent of its neighbours'. It is not. On the same held-out
+forecasts (`tmp/cfs_channel_horizon/residual_correlation.py`) the lag-1 correlation of the residual
+across horizon steps is $0.90$–$0.99$ in every band, and the total correlation
+$-\tfrac12 \ln\det R_c$ — the nats a factorised score mis-states per anchor and channel even with
+perfect marginals — is of order $10^2$ per channel. One missed or late deceleration therefore
+produced $H$ near-identical residuals charged $H$ times, which multiplies exactly the penalty the
+evaluation diagnosed behind the negative matched gap: a source branch that is sharper without being
+more accurate.
+
+With `forecast_ar_residual: true` each cell is scored on its innovation,
+
+$$e_{\tau,c} = r_{\tau,c} - \phi_c\, r_{\tau-1,c}, \qquad r = x - \mu, \quad r_{-1} = 0,
+\qquad \phi_c = \tanh(a_c),$$
+
+under the decoder's own log-variance, which becomes the innovation variance for $\tau \ge 1$. The
+map $r \mapsto e$ is unit lower-triangular, so its Jacobian is $1$ and the summed innovation NLL is
+the **exact** joint negative log-density of the horizon block. The mean trajectory still comes from
+$z$ alone: $\phi_c$ is one scalar per channel acting on the residual, so it removes the repeated
+counting without giving the decoder a path around the latent — the failure mode a fully
+autoregressive decoder fed its own targets would have. $a_c$ is a loose parameter seeded at $0$, so
+the model starts bitwise at the factorised score, and it is shared by both decoder invocations, so
+`pred_gap` stays a difference of two joint log-densities of one family and a pure source readout.
+
+Both terms enter through one seam, `FeatureForecastTarget.forecast_likelihood_kwargs()`, which the
+objective, the in-training gap splits and every evaluation scoring site pass to
+`raw_sample_score`. The evaluation scores the trivial baselines under the same mask and the same
+$\phi$, so a model-versus-baseline comparison is between joint densities over one scored set; point
+and squared-error readouts take the mask only.
+
+### What the revision costs
+
+- **No nat from this revision is comparable to any earlier row.** The block, the scored cell set
+  and the density family all changed; so did the encoder-edge pairing, which this revision ends.
+- **The matched gap now reads the chain-rule decomposition of the multi-step coupling.** With the
+  AR term, once a deceleration's onset is visible in the residual of step $\tau - 1$ the credit for
+  step $\tau$ moves to it, so the source's gain concentrates in the first steps after a
+  contraction. That is the correct accounting, not a loss of signal.
+- **Two ablation arms** isolate the two terms: `sweep_factorised_likelihood.yaml` turns the AR term
+  off and `sweep_all_cells_scored.yaml` scores every cell; `sweep_lag_kv_conv_stem.yaml` keeps the
+  previous key/value choice as a comparator. The two former arms that set the adapter memory and
+  a source dropout of $0.2$ are the default now and were deleted.
+
+> lean-limit: $H_c$ is a two-key rule measured on one local subgroup with a linear FHR-only
+> forecaster; replace with a per-channel vector measured on the production training shards when the
+> headline run's per-channel per-step skill shows the rule cutting a channel that still has skill.
+
+> lean-limit: the residual model is AR(1) per channel with no cross-channel term; replace with a
+> low-rank cross-channel innovation covariance when the evaluation's residual diagnostics show the
+> remaining correlation is across channels rather than across steps.

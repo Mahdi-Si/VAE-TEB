@@ -74,8 +74,10 @@ def test_the_forecast_rows_resolve_to_the_causal_cells_builder(task):
     assert rows.func is causal_page.causal_forecast_rows
     assert set(rows.keywords) == {
         "keep_index", "block_split", "training_stride", "likelihood", "coverage_floor",
-        "target_forecast_shift", "forecast_clock_delay_s",
+        "target_forecast_shift", "forecast_clock_delay_s", "cell_mask", "ar_coef",
     }
+    # The rest of the objective's density, off the net: ``None`` on a net that built neither term.
+    assert rows.keywords["cell_mask"] is None and rows.keywords["ar_coef"] is None
     # No resolved budget on a hand-built task, so the forecast rows' axis cannot state a
     # constant; the shift is still bound, because it is a fact of the net.
     assert rows.keywords["forecast_clock_delay_s"] is None

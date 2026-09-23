@@ -408,10 +408,11 @@ def test_the_mixin_section_states_why_neither_inheritance_works(design):
 
 
 def test_the_lean_limits_carry_their_replacement_triggers(design):
-    """A ``lean-limit`` note without a measurable trigger is a permanent excuse. Exactly five here,
-    all inherited from the target domain: the per-segment warm-up, the residual pair-indexed lag
+    """A ``lean-limit`` note without a measurable trigger is a permanent excuse. Exactly seven here:
+    five inherited from the target domain -- the per-segment warm-up, the residual pair-indexed lag
     bias, the lag floor that never varies, the clock the prior cannot cancel, and the persistence
-    residual this row has and the raw-target row does not.
+    residual this row has and the raw-target row does not -- and two the final revision
+    (2026-09-23) added: the two-key scored-horizon rule and the per-channel AR(1) residual.
 
     The second was "the uncorrected group delay" until the alignment corrected the per-channel half
     of it; what is left is the pair-indexed remainder, so the note is narrowed rather than removed.
@@ -423,7 +424,9 @@ def test_the_lean_limits_carry_their_replacement_triggers(design):
     """
     flat = _flat(design)
 
-    assert len(re.findall(r"^> lean-limit: ", design, re.MULTILINE)) == 5
+    assert len(re.findall(r"^> lean-limit: ", design, re.MULTILINE)) == 7
+    assert "when the headline run's per-channel per-step skill shows the rule cutting" in flat
+    assert "when the evaluation's residual diagnostics show the" in flat
     assert "when a measured run shows the anchor floor" in flat
     assert "when a nonzero target reference can be divided out" in flat
     assert "when a run's `source_lag_warmth_frac_ph` falls below" in flat

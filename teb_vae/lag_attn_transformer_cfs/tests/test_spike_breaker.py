@@ -1,13 +1,12 @@
-r"""The loss-spike breaker at this encoder, on a sign-indefinite loss over roughly ten anchors.
+r"""The loss-spike breaker at this encoder, on a sign-indefinite loss over the decoded anchors.
 
-``main_loss`` here is a learned-variance Gaussian NLL summed over $H \cdot C_{\mathrm{keep}} = 2940$
-coefficients and averaged over the anchors the tiling decoded -- about $4.57$ at the shipped stride.
-Both numbers are the conv-LSTM causal cell's, because the **encoder edge changes neither**, which is
-what makes the two breaker constants below inherited-and-re-measured rather than re-derived.
-
-The one constant the edge does move is ``gradient_clip_val``, which is a gradient statistic rather
-than a loss scale, and it is checked here beside the two that did not move so the asymmetry is a
-passing test rather than a claim in a comment.
+``main_loss`` here is a learned-variance Gaussian NLL summed over the $H \cdot C_{\mathrm{keep}}$
+block and averaged over the anchors the tiling decoded. The breaker constants were MEASURED once, at
+the $2940$-coefficient block of the $H = 30$, legacy-operator geometry; every later value, including
+the 2026-09-23 final revision's, is that measurement scaled by the block ratio. The revision moved
+this cell's block and not the conv-LSTM cell's, so since then neither ``additive_margin`` nor
+``gradient_clip_val`` equals that cell's -- the switches (``ema_floor``, ``multiplier``, the escape
+hatch) still do.
 
 Every test drives the breaker with the block **this** ``configs/default.yaml`` ships, at magnitudes
 this objective actually reaches -- the instrumented run the config's comments record saw
@@ -30,9 +29,13 @@ _TARGET_SIBLING = (
     _REPO_ROOT / "teb_vae" / "lag_attn_transformer_fs" / "configs" / "default.yaml"
 )
 
-#: Surviving target channels at the shipped warm-up budget. Written out because this file reasons
-#: about the block's arithmetic bound rather than building a model.
-KEPT_TARGET_CHANNELS = 98
+#: Surviving target channels at the shipped warm-up budget on the integer-operator shards. Written
+#: out because this file reasons about the block's arithmetic bound rather than building a model.
+KEPT_TARGET_CHANNELS = 76
+
+#: The block the instrumented run measured the breaker and clip statistics at: $H = 30$ over the
+#: legacy operator's $98$ survivors. Every shipped value since is scaled from it by the block ratio.
+_MEASURED_BLOCK = 30 * 98
 
 #: A loss magnitude this objective genuinely reaches, used to settle a healthy negative EMA. Chosen
 #: from the instrumented run rather than scaled: that run's post-ramp half sat well below zero with
@@ -45,9 +48,10 @@ _HEALTHY_LOSS = -500.0
 #: window. The margin has to clear it or ordinary batches are skipped -- which reads in the log
 #: exactly like a model that keeps blowing up.
 #:
-#: This is the CONV-LSTM cell's $5090.2$ rather than this cell's own $3927.5$, deliberately: the two
-#: cells share one margin because the encoder edge changes neither the block nor the anchor count,
-#: so the bar that has to be cleared is the larger of the two measurements.
+#: This is the CONV-LSTM cell's $5090.2$ rather than this cell's own $3927.5$, and it is left
+#: UNSCALED although it was measured at the larger $2940$-coefficient block: the larger of the two
+#: measurements at the larger block is the conservative bar for a margin that was itself scaled
+#: rather than re-measured.
 _WORST_MEASURED_EXCURSION = 5090.2
 
 
@@ -91,16 +95,16 @@ def _skipped(metrics) -> bool:
 # --------------------------------------------------------------------------------------
 # Which constants the encoder edge moves, and which it does not
 # --------------------------------------------------------------------------------------
-def test_the_loss_scale_constants_are_the_encoder_siblings_and_the_clip_is_not():
-    """The asymmetry the re-derivation found, as a test. ``additive_margin`` and ``ema_floor`` are
-    stated in nats of the summed block; the encoder edge changes neither the block ($2940$) nor the
-    anchor count ($\\approx 4.57$), so both must equal the conv-LSTM causal cell's exactly.
-    ``gradient_clip_val`` is a gradient-norm statistic, and the encoder is precisely what moves
-    it."""
+def test_the_breaker_switches_are_the_encoder_siblings_and_the_scales_are_not():
+    """``ema_floor``, ``multiplier`` and the escape hatch are switches, not scales, and stay the
+    conv-LSTM causal cell's. ``additive_margin`` is stated in nats of the summed block and
+    ``gradient_clip_val`` is a gradient-norm statistic of it; the 2026-09-23 final revision moved
+    this cell's block and not that cell's, so both differ -- a declared divergence rather than an
+    encoder finding."""
     mine = load_config(str(_CONFIG))["advanced_config"]
     theirs = load_config(str(_ENCODER_SIBLING))["advanced_config"]
 
-    assert mine["spike_breaker"]["additive_margin"] == theirs["spike_breaker"]["additive_margin"]
+    assert mine["spike_breaker"]["additive_margin"] != theirs["spike_breaker"]["additive_margin"]
     assert mine["spike_breaker"]["ema_floor"] == theirs["spike_breaker"]["ema_floor"] >= 1.0e9
     assert mine["spike_breaker"]["multiplier"] == theirs["spike_breaker"]["multiplier"]
     assert (
@@ -177,10 +181,14 @@ def test_the_margin_clears_the_worst_excursion_the_instrumented_run_measured():
 def test_the_clip_sits_above_the_measured_q99_and_below_the_measured_maximum():
     """The family's rule, and the property that makes the value a blow-up guard rather than a
     rescaler: above q99 so a healthy step is untouched, below the observed maximum so the guard has
-    something to catch. Both numbers are the instrumented run's, recorded in the config."""
-    clip = float(load_config(str(_CONFIG))["advanced_config"]["trainer"]["gradient_clip_val"])
+    something to catch. Both numbers are the instrumented run's, recorded in the config, SCALED by
+    the block ratio to the shipped block -- which is how the shipped value was derived, and which
+    the headline run's own ``train/grad_norm`` column must replace."""
+    config = load_config(str(_CONFIG))
+    clip = float(config["advanced_config"]["trainer"]["gradient_clip_val"])
+    ratio = config["model_config"]["VAE_model"]["horizon"] * KEPT_TARGET_CHANNELS / _MEASURED_BLOCK
 
-    assert 13059.7 < clip < 14380.7
+    assert 13059.7 * ratio < clip < 14380.7 * ratio
 
 
 # --------------------------------------------------------------------------------------
