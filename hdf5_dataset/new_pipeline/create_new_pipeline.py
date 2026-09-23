@@ -721,6 +721,13 @@ def create_initial_hdf5(
     two-sided file — the normal state of every dataset already on disk — and
     needs no migration.
 
+    Chunking follows the two read patterns the file serves. Every dataset of
+    two or more dimensions is chunked one sample deep, because the training
+    loader reads one random sample per call and a chunk is the unit HDF5
+    decompresses; the one-dimensional datasets (``epoch``, ``guid``, the
+    labels) are chunked ``chunk_n`` deep, because the loader's index build
+    reads them whole.
+
     Args:
         path: Output HDF5 file path (overwrites if exists).
         len_signal: Raw signal length (e.g. 5760).
@@ -818,6 +825,11 @@ def create_initial_hdf5(
     except OSError:
         pass
 
+    # One sample per chunk on every dataset of two or more dimensions: the training loader reads
+    # one random sample per call, and HDF5 decompresses a whole chunk to serve any part of it, so
+    # a sample-batched chunk would decompress the whole batch for every sample served. The 1-D
+    # datasets keep `chunk_n` because the loader's index build reads them whole, where a
+    # one-element chunk would cost one B-tree lookup per sample.
     chunk_n = 32
     str_dt = h5py.string_dtype(encoding="utf-8")
     with h5py.File(path, "w", libver="latest") as h5f:
@@ -853,7 +865,7 @@ def create_initial_hdf5(
             shape=(0, len_signal),
             maxshape=(None, len_signal),
             dtype="f4",
-            chunks=(chunk_n, len_signal),
+            chunks=(1, len_signal),
             compression="lzf",
         )
         h5f.create_dataset(
@@ -861,7 +873,7 @@ def create_initial_hdf5(
             shape=(0, len_signal),
             maxshape=(None, len_signal),
             dtype="f4",
-            chunks=(chunk_n, len_signal),
+            chunks=(1, len_signal),
             compression="lzf",
         )
         # fhr_st width is fixed by the filter bank, not by a selection: one
@@ -872,7 +884,7 @@ def create_initial_hdf5(
             shape=(0, n_fhr_st_channels, len_sequence),
             maxshape=(None, n_fhr_st_channels, len_sequence),
             dtype="f4",
-            chunks=(chunk_n, n_fhr_st_channels, len_sequence),
+            chunks=(1, n_fhr_st_channels, len_sequence),
             compression="lzf",
         )
         # fhr_ph width comes from the selection, never a literal. A hardcoded
@@ -884,7 +896,7 @@ def create_initial_hdf5(
             shape=(0, n_fhr_ph, len_sequence),
             maxshape=(None, n_fhr_ph, len_sequence),
             dtype="f4",
-            chunks=(chunk_n, n_fhr_ph, len_sequence),
+            chunks=(1, n_fhr_ph, len_sequence),
             compression="lzf",
         )
         _write_selection_attrs(fhr_ph_ds, fhr_ph_selection)
@@ -895,7 +907,7 @@ def create_initial_hdf5(
                 shape=(0, n_cross_phase_channels, len_sequence),
                 maxshape=(None, n_cross_phase_channels, len_sequence),
                 dtype="f4",
-                chunks=(chunk_n, n_cross_phase_channels, len_sequence),
+                chunks=(1, n_cross_phase_channels, len_sequence),
                 compression="lzf",
             )
         # up_st: UP scattering coefficients (optional, same structure as fhr_st)
@@ -906,7 +918,7 @@ def create_initial_hdf5(
                 shape=(0, n_up_st_channels, len_sequence),
                 maxshape=(None, n_up_st_channels, len_sequence),
                 dtype="f4",
-                chunks=(chunk_n, n_up_st_channels, len_sequence),
+                chunks=(1, n_up_st_channels, len_sequence),
                 compression="lzf",
             )
         # up_ph: UP self-phase harmonics (optional). First-class field with its
@@ -919,7 +931,7 @@ def create_initial_hdf5(
                 shape=(0, n_up_ph, len_sequence),
                 maxshape=(None, n_up_ph, len_sequence),
                 dtype="f4",
-                chunks=(chunk_n, n_up_ph, len_sequence),
+                chunks=(1, n_up_ph, len_sequence),
                 compression="lzf",
             )
             _write_selection_attrs(up_ph_ds, up_ph_selection)
@@ -938,7 +950,7 @@ def create_initial_hdf5(
             shape=(0, len_sequence),
             maxshape=(None, len_sequence),
             dtype="f4",
-            chunks=(chunk_n, len_sequence),
+            chunks=(1, len_sequence),
             compression="lzf",
         )
         h5f.create_dataset(
@@ -946,7 +958,7 @@ def create_initial_hdf5(
             shape=(0, len_sequence),
             maxshape=(None, len_sequence),
             dtype="f4",
-            chunks=(chunk_n, len_sequence),
+            chunks=(1, len_sequence),
             compression="lzf",
         )
         h5f.create_dataset(

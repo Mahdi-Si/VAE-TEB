@@ -859,8 +859,13 @@ def test_the_written_causal_shard_has_the_causal_schema(causal_written_file: Pat
         for field, expected in EXPECTED_CAUSAL_WIDTHS.items():
             assert handle[field].shape == (8, expected, LEN_SEQUENCE), field
             assert handle[field].dtype == np.float32, field
+            # One sample per chunk: a random single-sample read decompresses nothing it does
+            # not return. The 1-D datasets stay batched, since the index build reads them whole.
+            assert handle[field].chunks == (1, expected, LEN_SEQUENCE), field
         assert handle["fhr"].shape == handle["up"].shape == (8, LEN_SIGNAL)
+        assert handle["fhr"].chunks == handle["up"].chunks == (1, LEN_SIGNAL)
         assert handle["guid"].shape == (8,)
+        assert handle["guid"].chunks == handle["epoch"].chunks == (32,)
 
 
 def test_the_written_causal_blocks_match_the_numpy_reference(

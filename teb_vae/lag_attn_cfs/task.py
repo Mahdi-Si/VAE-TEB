@@ -52,6 +52,7 @@ from __future__ import annotations
 import hashlib
 from functools import partial
 from pathlib import Path
+from collections.abc import MutableMapping
 from typing import Any, Callable, Dict, Optional, Sequence, Tuple
 
 import torch
@@ -269,6 +270,31 @@ class SeqVaeLagAttnCfsTask(SeqVaeLagAttnFsTask):
     # ------------------------------------------------------------------
     # Batch -> model inputs
     # ------------------------------------------------------------------
+    def transfer_batch_to_device(self, batch: Any, device: torch.device, dataloader_idx: int) -> Any:
+        """Move a batch to the device, keeping its ``epoch`` field on the host.
+
+        ``epoch`` is read by exactly one consumer, :meth:`anchor_phase`, which hashes it per
+        sample on the host. Moved to the device with the rest of the batch it would cost one
+        device-to-host read per sample per step, each of which drains the GPU's queue. Every
+        other field moves as the inherited transfer moves it; ``guid`` is a list and is never
+        moved.
+
+        Args:
+            batch: A batch from the data module, or any mapping the loader collates to.
+            device: The target device.
+            dataloader_idx: Index of the loader the batch came from.
+
+        Returns:
+            The batch with every tensor field but ``epoch`` on ``device``.
+        """
+        if isinstance(batch, MutableMapping) and "epoch" in batch:
+            epoch = batch["epoch"]
+            rest = type(batch)((key, value) for key, value in batch.items() if key != "epoch")
+            moved = super().transfer_batch_to_device(rest, device, dataloader_idx)
+            moved["epoch"] = epoch
+            return moved
+        return super().transfer_batch_to_device(batch, device, dataloader_idx)
+
     def anchor_phase(self, batch: Any) -> torch.Tensor:
         r"""Derive $\varphi_b \in [0, S)$ per sample, as a stable hash of the segment's identity.
 
@@ -300,7 +326,8 @@ class SeqVaeLagAttnCfsTask(SeqVaeLagAttnFsTask):
             batch: A batch from the data module, carrying ``guid`` and ``epoch``.
 
         Returns:
-            A $(B,)$ ``long`` tensor on the batch's own device.
+            A $(B,)$ ``long`` tensor on the host, in pinned memory when a CUDA device exists so
+            the net's copy of it to the device does not block.
 
         Raises:
             RuntimeError: If ``guid`` or ``epoch`` is absent, naming the config key that fixes it.
@@ -329,9 +356,12 @@ class SeqVaeLagAttnCfsTask(SeqVaeLagAttnFsTask):
             )
             digest = hashlib.blake2b(key, digest_size=8).digest()
             phases.append(int.from_bytes(digest, "big") % stride)
-        # Built on the host, where the key already is: the net moves it to the device it builds the
-        # anchor index on, so a device here would be a second decision about the same thing.
-        return torch.tensor(phases, dtype=torch.long)
+        # Built on the host, where the key already is (``epoch`` never leaves it; see
+        # ``transfer_batch_to_device``): the net range-checks it there and moves it to the device
+        # it builds the anchor index on, so a device here would be a second decision about the
+        # same thing. Pinned so that move is asynchronous.
+        phase = torch.tensor(phases, dtype=torch.long)
+        return phase.pin_memory() if torch.cuda.is_available() else phase
 
     @staticmethod
     def _phase_field(batch: Any, name: str):
@@ -428,16 +458,19 @@ class SeqVaeLagAttnCfsTask(SeqVaeLagAttnFsTask):
             anchors = forward_outputs.get("anchor_index")
             anchor_valid = forward_outputs.get("anchor_valid")
             # The forecast clock's pooled validity, so this mask is the one the objective scored
-            # under -- the identity object on the stored clock.
+            # under -- the identity object on the stored clock. The index is the forward's own and
+            # the objective already validated it this step, so neither build validates again.
             forecast, _coverage = forecast_mask(
                 model.scored_weight(weight),
                 model.geometry,
                 coverage_floor=model.coverage_floor,
                 anchors=anchors,
                 anchor_valid=anchor_valid,
+                validate=False,
             )
             support = kl_mask(
-                forecast, model.geometry, anchors=anchors, anchor_valid=anchor_valid
+                forecast, model.geometry, anchors=anchors, anchor_valid=anchor_valid,
+                validate=False,
             )
             gap_sq = (
                 (forward_outputs["mu_post"] - forward_outputs["mu_prior"]) ** 2

@@ -543,15 +543,17 @@ def source_null_kld(
     nulled = source_null_forward_outputs(model, forward_outputs, u_stream)
     anchors = forward_outputs.get("anchor_index")
     anchor_valid = forward_outputs.get("anchor_valid")
+    # The forward's own index, validated by the objective's mask build this step.
     forecast, _coverage = forecast_mask(
         weight,
         model.geometry,
         coverage_floor=model.coverage_floor,
         anchors=anchors,
         anchor_valid=anchor_valid,
+        validate=False,
     )
     support = kl_mask(
-        forecast, model.geometry, anchors=anchors, anchor_valid=anchor_valid
+        forecast, model.geometry, anchors=anchors, anchor_valid=anchor_valid, validate=False
     )
     kld_btd = kld_tensor(
         mu_prior=forward_outputs["mu_prior"],
