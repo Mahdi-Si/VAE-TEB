@@ -58,7 +58,8 @@ encoder.
 the cfs cell's tuple **minus** `causal_norm` — not a constructor parameter of this model, because
 these encoders carry no time-pooling normaliser to causalise — **plus** the seven this architecture
 adds: `encoder_conv_kernels`, `encoder_conv_dilations`, `encoder_num_heads`, `encoder_d_ff`,
-`target_attention_blocks`, `source_attention_blocks` and `source_attention_window`. Each must be both
+`target_attention_blocks`, `source_attention_blocks` and `source_attention_window` — and, since the
+final revision, `forecast_ar_residual`, which only this cell configures. Each must be both
 a constructor parameter and a config key, because `preflight.reconcile` silently skips any key absent
 from either, so a key that is only one of the two is a reconciliation that never happens and never
 says so. The count is left to the code, which is where a reader can check it.
@@ -135,26 +136,16 @@ inter-stream offset in seconds. Three because a config naming one arm while the 
 another is exactly what the re-resolution guard above catches structurally and what this line makes
 visible on the page.
 
-That guard matters here for a specific reason. This package's training config carried
-`causal_align_reference: null` for a window and has since been restored to `target_max`, so a
-checkpoint trained inside that window is an **unaligned** model. Its target width is identical,
-so it would load cleanly and only the numbers would move; the preflight refuses it instead,
-naming the disagreeing tuples. The refusal is right and the checkpoint is the thing that does
-not belong — the unaligned arm is a legitimate arm, but it is not the arm the cross-cell table
-reads, and a summary from it must not be entered in the aligned row.
+That guard is what refuses a checkpoint built at another alignment than the run's shards
+resolve, by naming the disagreeing tuples rather than by loading it and moving the numbers.
 
-Three quantities a summary reports also moved underneath, and none is a re-measurement of the
-same thing. The alignment shifts are scaled by the impulse-response centroid factor
-$\kappa = 0.875$ before quantisation, so the target range is $0$–$85$ steps rather than $0$–$97$ (the
-keep-index is scale-invariant, so no width and no parameter total moved with it).
-`source_lag_warmth_frac_st` / `_ph` are built from $W'_c + d_c$ rather than $W'_c$ alone, which on a
-single-clock aligned configuration is what unpinned `source_lag_warmth_frac_st` from a constant
-$1.0000$ it took for any attention distribution at all. And the **source stream now has its own
-clock**: `causal_align_reference_source` aligns it onto a reference $113.9$ s nearer than the
-target's, which narrows the source keep-index from $47$ channels to $39$ and moves both warmth
-columns again. Values from before any of the three are not comparable to values from after it, and a
-checkpoint trained at one source reference is refused against a run configured at another by the
-re-resolution guard above.
+## The final revision (2026-09-23)
+
+`DESIGN.md` (amendment of this date) records it. Two consequences for a summary: every density
+readout -- block NLLs, `pred_gap`, the matched MC gap, the splits, the baselines -- is scored
+under the checkpoint's own per-channel scored horizon and AR(1) residual, read from the model
+rather than configured, and `summary.json` states both under `likelihood_structure`; and the
+encoder edge above no longer holds, because the conv-LSTM cell was not revised.
 
 ## The gate
 

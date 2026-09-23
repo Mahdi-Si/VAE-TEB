@@ -1,21 +1,33 @@
-# PROMOTED 2026-09-05: this file now carries the corrected representation and the exact-clock
-# task the CFS review recommended -- integer phase operator (44 fhr_ph / 10 up_ph, so c_y = 80 and
-# c_u = 46), NO input-channel alignment (every channel read at its own availability time), the
-# STORED forecast clock (labels are the next 10 stored coefficients; H moved 30 -> 10 on 2026-09-05,
-# see the `horizon` key), and the stride 5 that puts ~31 tiles per sample on that clock's
-# 156-anchor span. The legacy dual-reference,
-# physical-clock, fractional-phase configuration this file used to ship is preserved verbatim as
-# `sweep_legacy_dualref_physclock.yaml`. Prose below that describes the reference clocks and the
-# physical clock describes those mechanisms as they are still available through the sweep arms; the
-# shipped leaves are the ones set at each key. Shards for this config are built with
-# `create_new_pipeline.py` under `phase_operator=integer_harmonic_v1`; see REPOINT_ME_causal_int.
+# FINAL REVISION 2026-09-23. On top of the 2026-09-05 promotion (integer phase operator, so
+# c_y = 80 and c_u = 46; NO input-channel alignment, every channel read at its own availability
+# time; the STORED forecast clock), this file now ships:
+#   * `horizon` back to 30 with `anchor_stride` and `horizon_weight_halflife_steps` re-derived
+#     from it (S = H / 2, half-life = H), and `gradient_clip_val` / `additive_margin` scaled by
+#     the block ratio;
+#   * `lag_kv_source: adapter` and `max_lag: 37` -- the lag attention reads the projected source
+#     stream itself, at one step of reach;
+#   * `source_dropout: 0.2` on the source pathway alone;
+#   * `forecast_ar_residual: true` -- an AR(1) residual likelihood along the horizon;
+#   * `target_phase_fast_cutoff_hz` / `target_phase_fast_horizon` -- a per-channel scored horizon.
+# Each of those has a single-leaf sweep arm restoring the previous choice (see tests/
+# test_sweep_configs.py). The legacy dual-reference, physical-clock, fractional-phase
+# configuration is preserved as `sweep_legacy_dualref_physclock.yaml`. Prose below that describes
+# the reference clocks and the physical clock describes those mechanisms as they are still
+# available through the sweep arms; the shipped leaves are the ones set at each key. Shards for
+# this config are built with `create_new_pipeline.py` under `phase_operator=integer_harmonic_v1`;
+# see REPOINT_ME_causal_int.
+#
+# GEOMETRY IS STATED SYMBOLICALLY BELOW. Every number that follows from `horizon`, `anchor_stride`,
+# `warmup_period`, `sequence_length` and the resolved channel budget is written as a formula; where
+# a figure is given it is labelled as a worked example at the leaves this file ships
+# (H = 30, S = 15, F = 134, T = 300, C_keep = 76), and the startup log prints the resolved values.
 #
 # Causal-feature conv-Transformer lag-attention VAE-TEB: the production training configuration.
 #
 # The sixth cell of the encoder-by-target grid, and the one that closes it. The model forecasts the
-# next 40 SECONDS of the stored ONE-SIDED FHR feature future -- the 76 target channels surviving
-# `causal_warmup_budget_steps` under the integer operator, over 10 decimated steps, so 760
-# coefficients per anchor -- from a
+# next H decimated steps (4 s each) of the stored ONE-SIDED FHR feature future -- the C_keep target
+# channels surviving `causal_warmup_budget_steps`, so H * C_keep coefficients per anchor (worked
+# example: 30 x 76 = 2280) -- from a
 # single shared latent, reached through the two causal conv-Transformer encoders rather than the
 # dilated-conv-plus-LSTM pair. A target-only prior and a source-conditioned posterior share one
 # decoder, invoked twice with nothing else, so the per-step KL between them is the
@@ -34,11 +46,14 @@
 # channel budget is a feasibility requirement rather than a tuning knob.
 #
 # This file is the SQUARE of two edges, and that is what it is for. Against
-# teb_vae/lag_attn_cfs/configs/default.yaml it differs in the encoder block alone (seven keys added,
-# five removed, plus `lr_warmup_steps`) and in `gradient_clip_val`, so a difference in results is
-# attributable to the encoder; against teb_vae/lag_attn_transformer_fs/configs/default.yaml it
-# differs in the target domain alone. Both edges are pinned leaf-for-leaf by
-# tests/test_config_load.py, outside a declared allow-list.
+# teb_vae/lag_attn_cfs/configs/default.yaml it differs in the encoder block (seven keys added,
+# five removed, plus `lr_warmup_steps`) and in `gradient_clip_val` -- and, SINCE 2026-09-23, in the
+# final-revision leaves listed at the top of this file: this cell carries the final revision and
+# the conv-LSTM cell does not, so the encoder edge is no longer an encoder-only comparison on those
+# leaves. Against teb_vae/lag_attn_transformer_fs/configs/default.yaml it differs in the target
+# domain and in the same final-revision leaves. Both edges are pinned leaf-for-leaf by
+# tests/test_config_load.py, outside a declared allow-list that names every one of those
+# divergences.
 #
 # Written out in full rather than inheriting either one, following both precedents and their stated
 # reason: a `base:` chain hides which settings this run shares with the models it is compared
@@ -56,14 +71,13 @@
 #     region the model actually reads -- and therefore what makes the source-null control a floor
 #     rather than a leak.
 #
-# NATS FROM THIS CONFIGURATION ARE COMPARABLE ONLY TO THE CONV-LSTM CAUSAL CELL. The reconstruction
-# is summed over H * C_keep = 10 * 76 = 760 coefficients against `lag_attn_transformer_fs`'s
-# 30 * 78 = 2340: since 2026-09-05 both cfs cells forecast H = 10 while the two-sided cells still
-# forecast 30, so on the TARGET edge neither the block nor the horizon axis is shared and a
-# per-horizon-step reading shares only its first 10 steps, while on the ENCODER edge
-# teb_vae/lag_attn_cfs/configs/default.yaml carries the identical `horizon`, `anchor_stride`,
-# `horizon_weight_halflife_steps` and `additive_margin`, pinned leaf-for-leaf by
-# tests/test_config_load.py, so a loss LEVEL is readable across it as before.
+# NATS FROM THIS CONFIGURATION ARE COMPARABLE TO NO OTHER CELL'S. The reconstruction is summed over
+# the SCORED cells of the H * C_keep block -- `target_phase_fast_*` removes the fast phase
+# channels' trailing steps from the scored set -- under an AR(1) residual density rather than a
+# factorised one. Neither sibling scores that set under that density: the conv-LSTM causal cell
+# keeps its own horizon and factorised all-cells score, and the two-sided cell its own C_keep. A
+# loss LEVEL is readable against this file's own `sweep_factorised_likelihood.yaml` and
+# `sweep_all_cells_scored.yaml` arms, each of which moves one of the two mechanisms alone.
 #
 # Run from the repo root:
 #   python -m teb_vae.lag_attn_transformer_cfs.trainer \
@@ -75,7 +89,7 @@ general_config:
   seed: 42
   cuda_devices: [0, 1, 2, 3, 4, 5, 6]
   # Adam's per-parameter normalisation makes the step size invariant to the loss-scale change from
-  # summing over 760 coefficients instead of 2340, so the sibling's stability-tuned value transfers
+  # summing over a different H * C_keep block, so the sibling's stability-tuned value transfers
   # unchanged; the clip threshold below does NOT and is re-derived for this encoder.
   lr: 0.0003
   # Singular; the experiment driver reads this exact key. Decay is x0.1 per milestone.
@@ -102,9 +116,9 @@ general_config:
   epochs: 5000
   accumulate_grad_batches: 1
   # Held at the comparison models' 128 deliberately: the anchor tiling already cuts the five
-  # anchor-axis tensors by ~5x at the shipped stride (A_max 32 against the dense 156), and
-  # spending that saving on a larger batch would confound the comparison with a different
-  # gradient-noise scale.
+  # anchor-axis tensors by ~S at the shipped stride (A_max = ceil((T_valid - F) / S) against the
+  # dense T_valid - F; worked example 10 against 136), and spending that saving on a larger batch
+  # would confound the comparison with a different gradient-noise scale.
   batch_size:
     train: 128
     test: 128
@@ -126,9 +140,9 @@ model_config:
     # two-sided feature sibling's four-arm sweep. That sweep came out MONOTONE in beta with its
     # lower edge winning every column, which is why the lower edge is what transfers rather than a
     # scale-matched rescaling -- the one prediction that sweep refuted was exactly the
-    # scale-matching argument. The encoder edge does not change the block or the anchor count, so
-    # this pair carries across it unchanged and unmeasured for the same reason it carried across
-    # the transform edge.
+    # scale-matching argument. It carries across the 2026-09-23 revision's horizon, block and
+    # density change unchanged and unmeasured for the same reason it carried across the transform
+    # edge.
     #
     # Resolved by the headline run's `kld_active_frac` and `logvar_prior_floor_frac`. Until then a
     # divergence from either sibling's curves is attributable to the encoder OR to this pair, and
@@ -188,25 +202,29 @@ model_config:
     # divisible by num_heads as the head-structured posterior requires. Held at both comparison
     # models' value, which is what keeps all three comparable.
     d_z: 64
-    # H = 10 decimated steps = 40 s forecast, moved from 30 on 2026-09-05 together with the
-    # conv-LSTM causal cell, so the encoder edge still differs in the encoder alone. The two-sided
-    # cells still forecast 30, so the target edge no longer shares a horizon axis (the NATS
-    # paragraph in the header and tests/test_config_load.py say so).
+    # H decimated steps of 4 s each (worked example: H = 30 is a 120 s forecast). Moved back from
+    # 10 to 30 by the 2026-09-23 final revision, in THIS cell only: the conv-LSTM causal cell stays
+    # at its own horizon, so the encoder edge now carries the horizon as a declared divergence
+    # (tests/test_config_load.py). The long horizon is affordable again because the two
+    # likelihood keys further down stop charging the objective for cells nothing can forecast:
+    # the fast phase channels are scored over their leading steps only, and the serial correlation
+    # of the residual along the horizon is modelled rather than counted H times.
     #
     # It is paid for in anchors, and the tradeoff is geometric rather than clinical. Anchors live in
-    # [F, T - H), so shortening H from 30 to 10 lengthens T_valid from 270 to 290 and the dense
-    # anchor count from 136 to 156. The floor is unaffected by the horizon -- it comes from the
-    # channel warm-up, which does not know what H is -- but at the budget that would keep all
-    # target channels (W' = 278) there are only 12 anchors at H = 10 and exactly ZERO at H = 30, so
-    # keeping every channel remains geometrically impossible here. The horizon remains one of the
-    # two levers on the warm-up cost.
+    # [F, T - H), so the stored-clock ceiling is T_valid = T - H and the dense anchor count is
+    # T - H - F (worked example: 270 and 136). The floor is unaffected by the horizon -- it comes
+    # from the channel warm-up, which does not know what H is -- and at the budget that would keep
+    # all target channels (W' = 278) the span T - H - W' is empty at this H, so keeping every
+    # channel remains geometrically impossible here. The horizon remains one of the two levers on
+    # the warm-up cost.
     #
     # FIVE KEYS FOLLOW IT and are re-derived below rather than left behind: `anchor_stride` (the
-    # tiling of the new 156-anchor span), `horizon_weight_halflife_steps` (stated as H/2),
+    # tiling of the dense span, S = H / 2), `horizon_weight_halflife_steps` (stated as H),
     # `horizon_depth` (its receptive-field criterion is RF >= H + 1), `gradient_clip_val` and
-    # `additive_margin` (both scale with the summed block). The startup log prints the resolved
-    # geometry so a run whose config moved one and not the others says so in its first lines.
-    horizon: 10
+    # `additive_margin` (both scale with the summed block). `target_phase_fast_horizon` must stay
+    # in [1, H]. The startup log prints the resolved geometry so a run whose config moved one and
+    # not the others says so in its first lines.
+    horizon: 30
 
     # A GEOMETRY INPUT, and not the decoder width. TrimmedRawGeometry validates the raw index
     # identities against it and the diagnostic page draws its first row on the raw grid, so the key
@@ -242,10 +260,15 @@ model_config:
     use_up_st: true
     dropout: 0.1
     # Dropout for the SOURCE pathway alone -- its adapter/front end, its encoder, and the attended
-    # source summary inside the posterior fusion. null = exactly the previous model, which is NOT
-    # one number: the adapter and encoder always ran at `dropout` above and keep doing so, while the
-    # dropout on the attended source summary is a site this key INTRODUCED and null leaves off.
-    source_dropout: null
+    # source summary inside the posterior fusion. null = the pre-2026-09-23 model, which is NOT
+    # one number: the adapter and encoder then ran at `dropout` above, while the dropout on the
+    # attended source summary is a site this key INTRODUCED and null leaves off.
+    #
+    # 0.2 SINCE 2026-09-23 (previously the `sweep_source_dropout_02.yaml` arm): a source map that
+    # fits the training source stream too closely inflates the coupling KL on seen data only, and
+    # this is the one seam that regularises it without touching the target pathway.
+    # `sweep_source_dropout_03.yaml` is the next point on the axis.
+    source_dropout: 0.2
     # Hidden width of the shared horizon decoder core. 256, doubled with the latent above: the
     # decoder is the only thing standing between one latent vector and the whole forecast block.
     decoder_hidden: 256
@@ -323,13 +346,15 @@ model_config:
     # forecast the target-only branch can carry alone.
     target_attention_blocks: 6
     # Bounded causal window for the source, so the source state's reach
-    # R_U = 21 + 3*(16-1) = 66 steps = 264 s stays SHORTER than the 364 s lag search range. The
-    # encoder characterises a local source neighbourhood; the lag attention selects which one.
+    # R_U = 21 + 3*(16-1) = 66 steps stays short of the lag search range the encoder arm was
+    # measured under (max_lag 90). The encoder characterises a local source neighbourhood; the lag
+    # attention selects which one.
     #
-    # BOTH APPLY TO THE `encoder` ARM ONLY. Under the shipped `lag_kv_source: conv_stem` the
-    # windowed attention stack they describe is not built at all, and the source reach is the
-    # stem's 21 steps. They are kept rather than removed because they still describe the arm the
-    # comparison is made against, and a sweep back onto `encoder` must find them here.
+    # BOTH APPLY TO THE `encoder` ARM ONLY. Under the shipped `lag_kv_source: adapter` neither the
+    # windowed attention stack nor the conv stem is built, and the source reach is one step; under
+    # the `conv_stem` comparator the reach is the stem's 21 steps. They are kept rather than
+    # removed because they still describe the arm the comparison is made against, and a sweep back
+    # onto `encoder` must find them here.
     source_attention_blocks: 3
     source_attention_window: 16
 
@@ -539,16 +564,16 @@ model_config:
     # S, the spacing between decoded anchors, in [1, H]. Over epochs every anchor in
     # [F, anchor_ceiling) is used, because the per-segment phase rotates with the epoch.
     #
-    # 5 = H / 2, down from 13, and the shorter horizon is why. The stored clock's ceiling is
-    # T_valid = 290, so the anchor span [134, 290) holds 156 dense anchors; S = 5 tiles it into
-    # A_max = 32 tiles at phase 0 and 31 at every other phase (mean 156/5 = 31.2), against the
-    # 10-11 tiles the previous H = 30 / S = 13 geometry decoded. Consecutive windows overlap by
-    # exactly half a horizon, so every scored coefficient is seen from two anchors per step;
-    # every loss denominator is an anchor count, and the KL support is a set either way, so
-    # overlap changes correlation between tiles rather than any denominator. The per-step training
-    # tensors barely move: (B, 32, 10, 76) is 320 anchor-steps per sample against the previous
-    # (B, 11, 30, 76) at 330, and validation, which decodes all 156 anchors densely every epoch,
-    # is what bounds memory either way (156 x 10 = 1560 against the previous 136 x 30 = 4080).
+    # S = H / 2, re-derived with the horizon. The stored clock's ceiling is T_valid = T - H, so the
+    # anchor span [F, T_valid) holds T_valid - F dense anchors and S tiles it into
+    # A_max = ceil((T_valid - F) / S) tiles at phase 0, one fewer at the phases where the last tile
+    # falls off the span. Worked example at the shipped leaves: [134, 270) holds 136 dense anchors,
+    # and S = 15 decodes A_max = 10 tiles at phase 0 and 9 at every other phase. Consecutive
+    # windows overlap by exactly half a horizon, so every scored coefficient is seen from two
+    # anchors per step; every loss denominator is an anchor count, and the KL support is a set
+    # either way, so overlap changes correlation between tiles rather than any denominator. The
+    # per-step training tensors are (B, A_max, H, C_keep), and validation, which decodes all
+    # T_valid - F anchors densely every epoch, is what bounds memory.
     # tests/test_config_load.py and tests/test_sweep_configs.py pin the pairing (horizon, stride)
     # here rather than leaving it to be noticed; the constructor refuses S outside [1, H].
     #
@@ -557,7 +582,7 @@ model_config:
     # a fixed offset from the segment start forever. There is no gradient there, so neither the
     # redundancy argument nor the memory argument applies. `sweep_anchor_stride_1.yaml` is the arm
     # that trains densely too.
-    anchor_stride: 5
+    anchor_stride: 15
 
     # F_u, the earliest source step lag attention may read: the lag mask generalises from
     # 1[t - l >= 0] to 1[t - l >= F_u]. Ships at 0, where it is BITWISE the two-sided siblings' mask,
@@ -613,9 +638,11 @@ model_config:
 
     # --- Horizon weighting of the reconstruction --------------------------------
     # Half-life, in horizon steps, of a decaying weight w_tau ~ 0.5^(tau/halflife) applied to BOTH
-    # reconstruction terms on the horizon axis. 5.0 is half of this cell's H = 10; the rule is
-    # H / 2, so the far step always carries a quarter of the near step's weight before
-    # renormalisation whatever the horizon is.
+    # reconstruction terms on the horizon axis. The rule SINCE 2026-09-23 is half-life = H (it was
+    # H / 2), so the far step carries about half of the near step's weight before renormalisation
+    # whatever the horizon is. Gentler than before because the per-channel scored horizon below
+    # now does the job the steep decay was a proxy for: the far steps a fast channel cannot
+    # forecast are removed from the scored set outright rather than down-weighted.
     #
     # WHY. The objective was uniform over horizon steps, and uniform was never neutral here either.
     # A stored coefficient at anchor t, horizon step tau, is a causal integral over a window that has
@@ -631,9 +658,9 @@ model_config:
     # H / sum(w), so the weighted block sums to the same magnitude the uniform one did. Without it
     # the reconstruction would shrink 1.73x against a KL that did not move -- a 1.73x rise in the
     # effective beta wearing a horizon weight's name, and `gradient_clip_val` and `additive_margin`
-    # would both be out of date. Only the DISTRIBUTION across horizon steps moves. At 5.0 and
-    # H = 10 the resolved weights run from 1.7260 at tau = 0 to 0.4957 at tau = 9, a 3.5x spread
-    # (at the previous 15.0 / H = 30 they ran 1.8063 to 0.4729: the H / 2 rule keeps the profile).
+    # would both be out of date. Only the DISTRIBUTION across horizon steps moves. Worked example at
+    # half-life 30 and H = 30: the resolved weights run from 1.3704 at tau = 0 to 0.7012 at
+    # tau = 29, a 1.95x spread (under the previous H / 2 rule the spread was 3.5x).
     #
     # THE COST, stated because it is not recoverable from the columns. A weighted reconstruction is
     # not a log-density, so beta = 1 is no longer the exact ELBO of the source-conditioned branch and
@@ -646,53 +673,83 @@ model_config:
     # on the channel axis: every `nll_*` and `pred_gap` in `summary.json` is a true log-density in
     # nats. Training optimises the weighted objective; the evaluation measures the unweighted one.
     #
-    # Equal on the ENCODER edge, necessarily: this is a property of the objective, not of an encoder,
-    # so both cfs cells ship the same half-life or the two architectures are compared under two
-    # different losses.
+    # NOT equal on the ENCODER edge since 2026-09-23: this cell carries the final revision and the
+    # conv-LSTM cell does not, so the two architectures are compared under different objectives on
+    # this leaf and tests/test_config_load.py declares the divergence.
     #
     # `null` builds no weight at all and is bitwise the horizon-uniform objective. The two-sided
     # cells never carry this key.
-    horizon_weight_halflife_steps: 5.0
+    horizon_weight_halflife_steps: 30.0
+
+    # --- The forecast DENSITY: serial correlation and the per-channel scored horizon -----------
+    # Unlike the two weightings above, these change the likelihood itself rather than weighting it,
+    # so the evaluation applies them too and every nat it reports is a log-density of THIS density.
+    #
+    # AR(1) residual along the horizon: each channel's residual r_tau = x_tau - mu_tau is scored on
+    # its innovation r_tau - phi_c * r_{tau-1}, with a learnable phi_c = tanh(a_c) seeded at 0 (so
+    # the model starts bitwise at the factorised score). WHY: measured held-out, forecast residuals
+    # are serially correlated across horizon steps (lag-1 correlation 0.90-0.99), and a factorised
+    # Gaussian counts one persistent error up to H times. `sweep_factorised_likelihood.yaml` is the
+    # arm without it.
+    forecast_ar_residual: true
+    # Per-channel scored horizon H_c, resolved from the shards' `sel_xi_i_hz` by
+    # teb_vae/lag_attn_cfs/scored_horizon.py: an `fhr_ph` channel whose slow leg sits above the
+    # cutoff is scored over its first `target_phase_fast_horizon` steps only; every other channel
+    # over all H. WHY: measured held-out, `fhr_st` envelopes stay forecastable across the whole
+    # horizon while `fhr_ph` channels above ~0.03 Hz lose all skill after 3-5 steps (12-20 s);
+    # contraction-locked decelerations sit at or below 0.03 Hz, which is where the source's effect
+    # lands, so those channels keep the full horizon. A pair: both set or both null (null = every
+    # cell scored, `sweep_all_cells_scored.yaml`). The fast horizon must lie in [1, H].
+    target_phase_fast_cutoff_hz: 0.03
+    target_phase_fast_horizon: 5
 
 
     # --- Attention -------------------------------------------------------------
-    max_lag: 90            # L = 91 (~6 minutes of UP history at 4 s/step)
+    # L = max_lag + 1 lags of UP history at 4 s/step (worked example: 37 -> 38 lags, 148 s). Down
+    # from 90 on 2026-09-23 in this cell only; the conv-LSTM cell and both planted twins keep 90.
+    max_lag: 37
     num_heads: 4
     d_head: 32
     use_entmax: true       # exact zeros in the lag distribution, not merely small weights
     attention_grad_checkpoint: false
 
     # --- What the lag attention reads: the source key/value memory ---------------
-    # `conv_stem` builds the attention's keys AND values from the source input adapter followed by
-    # the gated causal convolution stem alone -- the same `encoder_conv_kernels` /
-    # `encoder_conv_dilations` schedule the source encoder's own stem uses, 21 steps = 84 s of
-    # reach -- instead of from the deep source history state. The windowed self-attention stack
-    # above that stem is then NOT BUILT AT ALL: nothing else in the model consumes it, so
-    # `source_attention_blocks` and `source_attention_window`, in the encoder block above, describe
-    # the `encoder` arm only and are inert here.
+    # `adapter` (SHIPPED SINCE 2026-09-23) builds the attention's keys AND values from the source
+    # input adapter's output itself -- a per-step map of the gated source stream, one step of
+    # reach -- so the value at lag ell is a function of stored step t - ell alone. Neither the conv
+    # stem nor the windowed self-attention stack is then built: nothing else in the model consumes
+    # them, so `source_attention_blocks` and `source_attention_window`, in the encoder block above,
+    # describe the `encoder` arm only and are inert here.
+    #
+    # `conv_stem` (the previous default, now `sweep_lag_kv_conv_stem.yaml`) builds them from the
+    # adapter followed by the gated causal convolution stem -- the `encoder_conv_kernels` /
+    # `encoder_conv_dilations` schedule, 21 steps of reach -- instead.
     #
     # WHY. A deep causal state at lag 0 already contains a processed image of the states at every
     # larger lag, so by the data-processing inequality the near lags dominate the searched window
     # whatever the attention would prefer -- and a lag readout taken over such keys and values
     # cannot express a delay it is looking straight at. Measured on the planted-delay fixture, where
     # the informative lags are known and are [15, 44] and nowhere else, both architectures put their
-    # support-corrected argmax at lag 0 with the deep state as memory. A bounded stem makes a key at
-    # lag l a summary of a neighbourhood of l, which is what an attention over lags needs it to be.
+    # support-corrected argmax at lag 0 with the deep state as memory. A bounded memory makes a key
+    # at lag l a summary of a neighbourhood of l, which is what an attention over lags needs it to
+    # be, and the adapter makes that neighbourhood a single step.
     #
     # BOTH K AND V MOVE, and that is not a detail. Localising the keys alone would leave the lag-0
     # value informationally dominant and the degeneracy standing under a better-looking attention
     # map -- the same failure with a nicer picture.
     #
-    # WHAT IT COSTS AND WHAT IT CANNOT FIX. The arm is SMALLER than the default, by the whole
-    # source attention stack. What no model-side change reaches is the resolution floor beneath it:
-    # the stem's own receptive field, and under that the transform's group delay -- a stored
-    # coefficient is a causal integral over its channel's own window. That is the alignment
-    # reference's territory, not this key's.
+    # WHAT IT COSTS AND WHAT IT CANNOT FIX. The local arms are SMALLER than `encoder`, by the whole
+    # source attention stack (and `adapter` by the stem too). The prior's availability clock below
+    # is an encode of this same pathway, so under `adapter` it has no memory of the warm-up
+    # transient and collapses to the constant staircase past the floor: `prior_availability_input`
+    # is inert on the scored anchors here, and a reading of the KL has to carry that. What no
+    # model-side change reaches is the resolution floor beneath it: the transform's group delay --
+    # a stored coefficient is a causal integral over its channel's own window. That is the
+    # alignment reference's territory, not this key's.
     #
     # `encoder` is the deep source state and is bitwise the model that shipped before this key
-    # existed; `adapter` is the sharpest arm, the projected stream itself at one step of reach, and
-    # ships as a named sweep arm rather than as the default.
-    lag_kv_source: conv_stem
+    # existed.
+    lag_kv_source: adapter
     # 'alibi_decay' seeds a learnable per-head short-lag prior on the attention scores.
     lag_bias_init: alibi_decay
 
@@ -743,6 +800,11 @@ model_config:
     # kld_source_null becomes the check that the cancellation worked rather than the estimate of the
     # contamination.
     #
+    # UNDER THE SHIPPED `lag_kv_source: adapter` the pathway has no memory, so the paragraph above
+    # describes the `conv_stem` / `encoder` comparators: here the clock is constant over the scored
+    # anchors and the projection can only learn an offset. It stays on so the comparator arms
+    # differ from this file in their K/V memory alone.
+    #
     # WHAT IT COSTS. One LayerNorm and one bias-free d_model x d_model projection on the prior head's
     # own input, plus one extra source encode per forward -- at BATCH 1, since a zero stream encodes
     # identically in every batch element, then broadcast. The encode is DETACHED and forced out of
@@ -760,14 +822,13 @@ model_config:
 
     # --- Shared horizon decoder core -------------------------------------------
     # Four dilated refine blocks, so the dilations are (1, 2, 4, 8) and the receptive field over the
-    # horizon axis is 31 tokens against this cell's 10 horizon tokens.
+    # horizon axis is RF = 1 + (k-1)(2^d - 1) tokens (31 at k = 3, d = 4).
     #
-    # The family's recorded criterion is RF >= H + 1, i.e. 11 here, and RF = 1 + (k-1)(2^d - 1) = 31
-    # clears it by twenty tokens. Depth 4 is NO LONGER the smallest depth that satisfies it: depth 3
-    # has a receptive field of 15 and clears it by four (depth 2, at 7, does not), so the shorter
-    # horizon would admit a shallower decoder. Kept at 4 for parity: it is what both comparison models ship, so the decoder core stays a
-    # shared object across both edges even though the horizon no longer is, and the conv-LSTM
-    # cell's depth-3 arm is therefore a parameter-economy question alone.
+    # The family's recorded criterion is RF >= H + 1. At the shipped horizon RF = H + 1 exactly
+    # (worked example: 31 >= 31), so depth 4 is again the SMALLEST depth that satisfies it -- depth
+    # 3, at RF = 15, does not -- and a horizon longer than RF - 1 would need depth 5. It is also
+    # what both comparison models ship, so the decoder core stays a shared object across both
+    # edges.
     #
     # Nothing in the shipped code ties this depth to the horizon, so the resolved receptive field is
     # written to the startup log beside H, S, A_max and the block width.
@@ -781,7 +842,8 @@ model_config:
     # --- Target persistence residual in the decoder's mean ----------------------
     # mu[t, tau, c] = w[tau, c] * y[t, c] + f_theta(z_t)[tau, c], with y[t, c] the TARGET's own
     # stored value at the anchor step and w a learnable (H, C) weight seeded to decay in tau
-    # (half-life 5 steps, so w[0] = 1 and w[9] ~ 0.287 before training moves it).
+    # (w[tau] = 0.5^(tau / 5) before training moves it; the 5-step seed half-life is a decoder
+    # constant, not this file's horizon half-life).
     #
     # WHY. Without it the mean head has to synthesise the LEVEL of a strongly autocorrelated
     # coefficient out of z before it can say anything about its motion, and it pays for that out of
@@ -916,18 +978,20 @@ dataset_config:
 advanced_config:
   trainer:
     precision: "32-true"
-    # 3500 SINCE 2026-09-05, SCALED RATHER THAN RE-MEASURED. The clip is a statistic of the summed
-    # block's gradient, and the block moved from the measured 30 x 98 = 2940 coefficients to
-    # 10 x 76 = 760 (the horizon 30 -> 10 and the integer operator's 76 survivors). Scaling the
-    # measured quantiles below by 760 / 2940 = 0.259 gives q99 ~ 3380 and max ~ 3720, and the
-    # family's rounding rule -- the smallest round value above q99 that is still below the maximum,
-    # to 500 here because the next thousand would overshoot the maximum, exactly as at the
-    # one-minute horizon -- lands on 3500. Not measured: the anchor count per step also rose
-    # (~31 tiles against ~4.6), which makes the per-step gradient LESS noisy than a pure block
-    # scaling predicts, so 3500 is
-    # if anything loose, which is the safe direction for a guard that must not bind on a healthy
-    # run. Re-derive from the headline run's own `train/grad_norm` column once it exists. The
-    # paragraphs below are the H = 30 measurement this value was scaled from, kept as the record.
+    # 10500 SINCE 2026-09-23, SCALED BY THE BLOCK RATIO FROM THE PREVIOUS VALUE, NOT RE-MEASURED.
+    # The clip is a statistic of the summed block's gradient, and the block moved from 10 x 76 =
+    # 760 to 30 x 76 = 2280 coefficients (the horizon 10 -> 30), a factor of 3: 3 x 3500 = 10500.
+    # Not measured, and two things the ratio ignores both point the same way: the scored-horizon
+    # mask removes the fast phase channels' trailing cells from the summed block and the AR(1)
+    # innovation shrinks a persistent residual, so the effective block is smaller than 2280 and
+    # 10500 is if anything loose -- the safe direction for a guard that must not bind on a healthy
+    # run. MUST be re-derived from the headline run's own `train/grad_norm` column once it exists.
+    #
+    # 3500 (2026-09-05 to 2026-09-23) was itself SCALED RATHER THAN RE-MEASURED: the block moved
+    # from the measured 30 x 98 = 2940 coefficients to 10 x 76 = 760, and scaling the measured
+    # quantiles below by 760 / 2940 = 0.259 gave q99 ~ 3380 and max ~ 3720, rounded by the family's
+    # rule to 3500. The paragraphs below are the H = 30 measurement both values descend from, kept
+    # as the record.
     #
     # MEASURED for this encoder at this loss scale, and it MOVED: 14000 against the conv-LSTM causal
     # cell's 15000. The encoder edge was the only thing that had changed -- the block was the same
@@ -965,7 +1029,7 @@ advanced_config:
     # regime is 32x smaller than the shipped batch of 128 and is recorded rather than used. Re-derive
     # from the headline run's own `train/grad_norm` column, which samples one optimizer step per
     # epoch.
-    gradient_clip_val: 3500.0
+    gradient_clip_val: 10500.0
 
     gradient_clip_algorithm: "norm"
     sync_batchnorm: false     # there is no BatchNorm anywhere in this model
@@ -1004,17 +1068,17 @@ advanced_config:
   # The RELATIVE test stays off.
   #
   # The relative test is `watched > multiplier * max(EMA, ema_floor)`, which assumes a loss bounded
-  # below by zero. main_loss here is a learned-variance Gaussian NLL summed over 760 coefficients
-  # and averaged over ~31 anchors, so it goes negative early -- the instrumented run below, at the
-  # 2940-coefficient block, reached -7464 within 600 steps. Once the EMA is negative the relative test degenerates to "skip every
+  # below by zero. main_loss here is a learned-variance Gaussian NLL summed over the H * C_keep block
+  # and averaged over the decoded anchors, so it goes negative early -- the instrumented run below,
+  # at the 2940-coefficient block, reached -7464 within 600 steps. Once the EMA is negative the relative test degenerates to "skip every
   # positive batch". So ema_floor sits far above any reachable loss, which switches the relative
   # test off, and additive_margin carries the finite-blow-up detection: skip when
   # watched > EMA + margin, against the RAW EMA, so it works in the negative-loss regime.
   #
   # The margin is in nats of the summed block and does not transfer across block sizes OR across
-  # anchor counts. The ENCODER edge changes neither, which is why both values below are the
-  # conv-LSTM causal cell's -- confirmed by re-measurement rather than assumed, since a faster-fitting
-  # encoder could in principle produce larger excursions.
+  # anchor counts. Until 2026-09-23 the encoder edge changed neither and the margin was the
+  # conv-LSTM causal cell's; the final revision moved this cell's block, so the margin moved with
+  # it and is a declared encoder-edge divergence.
   spike_breaker:
     enabled: true
     multiplier: 5.0
@@ -1023,8 +1087,10 @@ advanced_config:
     comparison_metric: main_loss
     # >> any reachable loss: relative detection off. The per-coefficient Gaussian NLL is bounded
     # below by 0.5*(log 2pi + logvar_clamp_lo) ~ -1.58 at the shipped floor of -5, so the two
-    # reconstruction terms cannot reach beyond ~2 * 760 * 1.58 ~ 2.4e+3 in magnitude at the
-    # shipped 10 x 76 block, and the KL and the prior anchor are both nonnegative. The instrumented
+    # reconstruction terms cannot reach beyond ~2 * H * C_keep * 1.58 in magnitude (worked example
+    # at the 30 x 76 block: ~7.2e+3), and the KL and the prior anchor are both nonnegative. The
+    # AR(1) innovation keeps the same per-cell floor, since the log-variance clamp is unchanged,
+    # and the scored-horizon mask only lowers the bound. The instrumented
     # run at the 2940-coefficient block (bound ~9.3e+3) observed main_loss inside [-7464, +8498],
     # within a factor of 1.1 of its bound, which confirms the bound's form empirically. Five orders
     # of magnitude of headroom either way.
@@ -1034,20 +1100,20 @@ advanced_config:
     ema_floor: 1.0e+9
     # Sign-agnostic finite-spike detection: skip when watched > EMA + margin (nats). 0 disables.
     #
-    # 2.2e+3 SINCE 2026-09-05, SCALED RATHER THAN RE-MEASURED, and the scaling is what keeps the
-    # test LIVE. The margin is in nats of the summed block, and the block moved from the measured
-    # 30 x 98 = 2940 coefficients to 10 x 76 = 760. Two constraints fix it, exactly as they did
-    # at H = 30: it must stay UNDER the ~2.4e+3 magnitude the objective can now reach (see
-    # `ema_floor` above), or no finite loss could exceed EMA + margin and the additive test would
-    # be decoration -- which is what the previous 9.0e+3 had silently become at the promoted
-    # 2280-coefficient block, whose bound is ~7.2e+3 -- and it must clear the worst excursion the
-    # fixture produced. Scaling both measured excursions below by 760 / 2940 gives ~1020 for this
-    # cell and ~1320 for the conv-LSTM cell; 2.2e+3 is 1.7x the larger of the two, the same factor
-    # the H = 30 value carried, and sits under the bound. HELD EQUAL to the conv-LSTM causal cell's,
-    # which was scaled the same way on the same day, so one bar still gates both architectures
-    # across the encoder edge. Re-derive from a production run's own `main_loss` column if the
-    # breaker starts skipping healthy batches. The paragraphs below are the H = 30 measurement this
-    # value was scaled from, kept as the record.
+    # 6.6e+3 SINCE 2026-09-23, SCALED BY THE BLOCK RATIO FROM THE PREVIOUS VALUE, NOT RE-MEASURED.
+    # The margin is in nats of the summed block, and the block moved from 10 x 76 = 760 to
+    # 30 x 76 = 2280 coefficients, a factor of 3: 3 x 2.2e+3 = 6.6e+3. The two constraints that
+    # fix it still hold: it sits UNDER the ~7.2e+3 magnitude the objective can reach at this block
+    # (see `ema_floor` above), or no finite loss could exceed EMA + margin and the additive test
+    # would be decoration, and it clears the scaled worst excursion (~3.0e+3 for this cell, ~3.9e+3
+    # for the conv-LSTM cell, from the H = 30 measurement below scaled by 2280 / 2940). NO LONGER
+    # EQUAL to the conv-LSTM causal cell's, which did not take the final revision. MUST be
+    # re-derived from the headline run's own `main_loss` column; the paragraphs below are the
+    # 2.2e+3 derivation and the H = 30 measurement it was scaled from, kept as the record.
+    #
+    # 2.2e+3 (2026-09-05 to 2026-09-23) was SCALED from the measured 30 x 98 = 2940 block to
+    # 10 x 76 = 760: the scaled excursions were ~1020 for this cell and ~1320 for the conv-LSTM
+    # cell, 2.2e+3 was 1.7x the larger, and it sat under that block's ~2.4e+3 bound.
     #
     # RE-MEASURED AT H = 30, and it moved with the block: 9.0e+3 against the one-minute horizon's
     # 3.0e+3. It still EQUALS the conv-LSTM causal cell's, which is the property that matters on the
@@ -1077,7 +1143,7 @@ advanced_config:
     # magnitude); the batch-1 excursion grew faster than the block did, so the window narrowed.
     # Re-derive from a production run's own `main_loss` column if the breaker starts skipping
     # healthy batches.
-    additive_margin: 2.2e+3
+    additive_margin: 6.6e+3
 
     # Escape hatch: after this many CONSECUTIVE skips, force-accept the next finite-loss batch
     # and hard-re-seed the EMA to it. 0 disables the hatch.
@@ -1095,11 +1161,11 @@ advanced_config:
       # guard rather than a label. A run whose config drifted between machines trains one arm
       # while its records name another, and no metric says so -- which is exactly how a
       # headline evaluation came to be read as the aligned arm having trained unaligned. The
-      # alignment arm is the axis that failure ran along, so it is the axis the name carries: the
-      # inputs are unaligned (every channel read at its own availability time), the phase blocks
-      # are the integer operator's, and the forecast target is scored on the stored clock over
-      # H = 10 steps at stride 5. Every sweep arm below renames both keys after its own delta.
-      run_name: lag_attn_trf_cfs_intphase_unaligned_stored
+      # alignment arm is the axis that failure ran along, so it was the axis the name carried; the
+      # 2026-09-23 final revision adds the two likelihood mechanisms, which change what every nat
+      # means: `arresid` is the AR(1) residual density and `hmask` the per-channel scored horizon.
+      # Every sweep arm renames both keys after its own delta.
+      run_name: lag_attn_trf_cfs_final_arresid_hmask
       artifact_location: null
       # Logs and registers the final eager model at fit end, via the run-logging callback the
       # trainer builder attaches automatically.
@@ -1111,7 +1177,7 @@ advanced_config:
       tags:
         project: teb_vae
         stage: dev
-        variant: lag_attn_trf_cfs_intphase_unaligned_stored
+        variant: lag_attn_trf_cfs_final_arresid_hmask
 
   callbacks:
     # ON, and the patience is the number rather than the flag. A 5000-epoch budget against a run

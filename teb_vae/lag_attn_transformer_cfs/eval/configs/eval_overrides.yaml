@@ -26,12 +26,13 @@
 general_config:
   batch_size:
     # 32, not the training 128. Under no_grad the activation retention that dominates training is
-    # gone, but the transients are not: the pass decodes four scored branches over
-    # A = 156 anchors x H = 10 steps x C_keep = 76 channels at K Monte Carlo draws, which is two
-    # ~463 KB tensors per branch per draw — about 0.9 MB per batch element — plus the (T, M, L)
-    # attention weights at (300, 4, 91). That is roughly 1.7x the raw cells' per-sample decode, and
-    # 32 still leaves the transient under 60 MB, so the sibling's value transfers rather than being
-    # halved on an argument nobody measured.
+    # gone, but the transients are not: the pass decodes four scored branches over all
+    # A = T_valid - F dense anchors x H steps x C_keep channels at K Monte Carlo draws, which is two
+    # (A, H, C_keep) float32 tensors per branch per draw, plus the (T, M, L) attention weights with
+    # L = max_lag + 1. Worked example at the 2026-09-23 training geometry (A = 136, H = 30,
+    # C_keep = 76): ~1.2 MB per tensor, ~2.5 MB per batch element, so 32 keeps the transient near
+    # 80 MB -- well inside any evaluation device, so the sibling's value transfers rather than
+    # being halved on an argument nobody measured.
     #
     # Kept at the conv-LSTM cell's 32 rather than inherited without thought, because this model adds
     # a cost the recurrent encoder did not have: encoder self-attention is O(B T^2 d) at T = 300,
@@ -351,17 +352,17 @@ eval_config:
   # alignment geometry and no model-side change reaches it, while a band that informs the first
   # predicted step and not the last is a statement the window carries whatever the references say.
   #
-  # THE FOUR SHIPPED BANDS PARTITION THE WINDOW at the boundaries the geometry already draws, so a
-  # reader comparing two arms compares the same four intervals:
-  #   anchor    [0, 14]   the anchor's own neighbourhood, 0-60 s back. Under `lag_kv_source:
-  #                       conv_stem` this is roughly the K/V receptive field, so it is the band a
-  #                       local memory can resolve at all.
-  #   near      [15, 44]  60-180 s back. On the shipped dual reference the 20-60 s physiological
-  #                       band lands at lags -0.1 to 38.9 (realised offset, canonical stored
-  #                       timeline), so this is where a contraction-to-
-  #                       deceleration delay is expected to be readable.
-  #   mid       [45, 67]  180-272 s back.
-  #   far       [68, 90]  272-364 s back, up to the window's far edge.
+  # THE FOUR SHIPPED BANDS PARTITION THE WINDOW [0, max_lag] of this cell's final revision, which
+  # reads the source through the pointwise adapter, so lag l is exactly stored step t - l:
+  #   anchor    [0, 4]    the anchor's own neighbourhood, the first 20 s back. On raw signals the
+  #                       strongest single-lag source gain for forecasts up to a minute ahead sat
+  #                       here: the contraction in progress predicts the deceleration still to come.
+  #   near      [5, 14]   20-60 s back.
+  #   mid       [15, 24]  60-100 s back; the raw-signal delay scan's secondary band for the longer
+  #                       forecasts (the previous contraction, through labour's periodicity).
+  #   far       [25, 37]  100 s back up to the window's far edge.
+  # THIS IS THE ONE LEAF WHERE THIS FILE DIFFERS FROM THE CONV-LSTM CELL'S: a band above the model's
+  # own max_lag is refused at config load, and only this cell's final revision shortened the window.
   #
   # A band reaching into the warm-up region occludes steps the availability mechanism had already
   # zeroed, so its delta is zero for a reason that is about the geometry. The analysis reports each
@@ -372,10 +373,10 @@ eval_config:
   # config load: the first would report a row of zeros as a finding, the second would name a wider
   # band than it measured. `{}` -- the schema default -- records the analysis as a skip.
   occlusion_bands:
-    anchor: [0, 14]
-    near: [15, 44]
-    mid: [45, 67]
-    far: [68, 90]
+    anchor: [0, 4]
+    near: [5, 14]
+    mid: [15, 24]
+    far: [25, 37]
 
   # Image format for every figure the run writes, as a matplotlib filetype: `pdf`, `svg`, `png`,
   # `eps`, `webp`, ... The installed matplotlib's own list is what a value is checked against, so

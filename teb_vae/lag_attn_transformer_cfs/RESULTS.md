@@ -325,10 +325,13 @@ TEB_RUN_STAMP="$(date '+%Y-%m-%d--[%H-%M]')" torchrun --nproc_per_node=7 \
     --config teb_vae/lag_attn_transformer_cfs/configs/sweep_legacy_dualref_physclock.yaml
 TEB_RUN_STAMP="$(date '+%Y-%m-%d--[%H-%M]')" torchrun --nproc_per_node=7 \
     -m teb_vae.lag_attn_transformer_cfs.trainer \
-    --config teb_vae/lag_attn_transformer_cfs/configs/sweep_lag_kv_adapter.yaml
+    --config teb_vae/lag_attn_transformer_cfs/configs/sweep_lag_kv_conv_stem.yaml
 TEB_RUN_STAMP="$(date '+%Y-%m-%d--[%H-%M]')" torchrun --nproc_per_node=7 \
     -m teb_vae.lag_attn_transformer_cfs.trainer \
-    --config teb_vae/lag_attn_transformer_cfs/configs/sweep_source_dropout_02.yaml
+    --config teb_vae/lag_attn_transformer_cfs/configs/sweep_factorised_likelihood.yaml
+TEB_RUN_STAMP="$(date '+%Y-%m-%d--[%H-%M]')" torchrun --nproc_per_node=7 \
+    -m teb_vae.lag_attn_transformer_cfs.trainer \
+    --config teb_vae/lag_attn_transformer_cfs/configs/sweep_all_cells_scored.yaml
 TEB_RUN_STAMP="$(date '+%Y-%m-%d--[%H-%M]')" torchrun --nproc_per_node=7 \
     -m teb_vae.lag_attn_transformer_cfs.trainer \
     --config teb_vae/lag_attn_transformer_cfs/configs/sweep_source_dropout_03.yaml

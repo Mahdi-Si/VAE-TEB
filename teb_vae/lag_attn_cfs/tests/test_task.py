@@ -145,7 +145,7 @@ def test_the_page_rows_are_this_packages_and_carry_the_tiling(task):
     # draws and the block each window scores must be the objective's own re-indexing.
     assert set(rows.keywords) == {
         "keep_index", "block_split", "training_stride", "likelihood", "coverage_floor",
-        "target_forecast_shift",
+        "target_forecast_shift", "forecast_clock_delay_s", "cell_mask", "ar_coef",
     }
     assert rows.keywords["block_split"] == 36
     assert rows.keywords["training_stride"] == module.orig_model.anchor_stride == TINY_STRIDE

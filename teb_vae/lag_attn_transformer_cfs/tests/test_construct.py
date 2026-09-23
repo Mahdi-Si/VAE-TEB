@@ -331,6 +331,11 @@ def test_the_signature_is_the_architecture_parents_with_the_delays_replaced():
         # the feature-target cells only, for the reason the novelty vector is -- a raw sample has
         # no per-channel clock to re-index.
         "target_forecast_shift",
+        # The two forecast-DENSITY keywords of the 2026-09-23 final revision: the per-channel
+        # scored horizon (resolved from the shards, so it must land in ``model_kwargs``) and the
+        # AR(1) residual switch. Feature-target causal cells only, like the two above.
+        "target_scored_horizon",
+        "forecast_ar_residual",
     }
     assert not any(
         parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters.values()

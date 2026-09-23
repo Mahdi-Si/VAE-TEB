@@ -1,0 +1,33 @@
+# Likelihood ablation of the 2026-09-23 final revision: the FACTORISED Gaussian along the horizon.
+#
+# The default scores each channel's forecast residual on its AR(1) innovation
+# r_tau - phi_c * r_{tau-1}, with a learnable per-channel phi_c, so a residual that persists across
+# the horizon is counted once. This arm builds no phi and scores every horizon step as an
+# independent Gaussian -- the density every run before the revision was trained under.
+#
+# WHY IT IS AN ARM. Measured held-out, forecast residuals are serially correlated across horizon
+# steps (lag-1 correlation 0.90-0.99), so a factorised Gaussian counts one persistent error up to H
+# times and the objective's cheapest response is to widen the variance everywhere. This arm is
+# what says how much of the revision's result is the AR(1) density; the per-channel scored horizon
+# stays on, so the other mechanism is held.
+#
+# Nats are NOT comparable with the default's: the two are log-densities of two different density
+# families over the same scored cells. Compare the forecast readouts the evaluation reports, not
+# the loss levels.
+#
+#   TEB_RUN_STAMP="$(date '+%Y-%m-%d--[%H-%M]')" torchrun --nproc_per_node=7 \
+#       -m teb_vae.lag_attn_transformer_cfs.trainer --config teb_vae/lag_attn_transformer_cfs/configs/sweep_factorised_likelihood.yaml
+base: default.yaml
+
+model_config:
+  VAE_model:
+    forecast_ar_residual: false
+
+advanced_config:
+  tracking:
+    mlflow:
+      # IDENTITY: the arm in the name, on both keys, so a run's own records say which arm trained
+      # even if the config it was launched from cannot be recovered.
+      run_name: lag_attn_trf_cfs_factorised_likelihood
+      tags:
+        variant: lag_attn_trf_cfs_factorised_likelihood

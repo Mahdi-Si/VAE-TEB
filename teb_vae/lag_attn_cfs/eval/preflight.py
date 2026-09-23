@@ -92,6 +92,9 @@ from teb_vae.lag_attn_cfs.model_kwargs import (
     WARMUP_MODEL_KWARGS,
     warmup_model_kwargs,
 )
+from teb_vae.lag_attn_cfs.scored_horizon import CUTOFF_KEY as SCORED_HORIZON_CUTOFF_KEY
+from teb_vae.lag_attn_cfs.scored_horizon import FAST_HORIZON_KEY as SCORED_HORIZON_FAST_KEY
+from teb_vae.lag_attn_cfs.scored_horizon import resolve_target_scored_horizon
 
 # The training entry point's own guards, imported rather than copied. Their messages name the exact
 # command that regenerates a stats file and the exact reason a width mismatch must not be "fixed" by
@@ -973,6 +976,22 @@ def check_warmup_budget_matches_checkpoint(
 # =================================================================================================
 # Checkpoint reconciliation
 # =================================================================================================
+def _scored_horizon_digest(steps: Optional[Tuple[int, ...]]) -> str:
+    """Name a scored-horizon vector in a refusal without printing one integer per channel.
+
+    Args:
+        steps: $H_c$ per declared channel, or ``None``.
+
+    Returns:
+        ``'none (every cell scored)'``, or the vector's length and its distinct values with counts.
+    """
+    if steps is None:
+        return "none (every cell scored)"
+    values, counts = np.unique(np.asarray(steps, dtype=int), return_counts=True)
+    spread = ", ".join(f"{int(count)} x {int(value)}" for value, count in zip(values, counts))
+    return f"{len(steps)} channels ({spread})"
+
+
 def reconcile_with_checkpoint(
     config: Mapping[str, Any],
     *,
@@ -989,6 +1008,13 @@ def reconcile_with_checkpoint(
 
     Only keys the config actually declares are compared: the constructor owns every default, and a
     key the config leaves out is deferring to it rather than contradicting it.
+
+    One resolved vector is compared as well: ``target_scored_horizon``, the per-channel scored
+    horizon $H_c$. It is part of the forecast density, a constructor parameter and no config key --
+    the trainer resolves it from ``target_phase_fast_cutoff_hz`` / ``target_phase_fast_horizon`` and
+    the shards' phase-leg frequencies -- so the rule is re-resolved against the evaluation shards and
+    the vector compared with the checkpoint's, the way the warm-up tuples are re-resolved by their
+    own guard.
 
     :data:`SCHEDULE_KEYS` are recorded and **not** compared. $\\beta$ and its ramp weight the
     training total only; no evaluated readout applies them, so a schedule edited after the fit is not
@@ -1007,7 +1033,8 @@ def reconcile_with_checkpoint(
         The reconciliation record: what was compared and what the checkpoint carries.
 
     Raises:
-        EvalPreconditionUnmet: Naming every disagreeing key with both values.
+        EvalPreconditionUnmet: Naming every disagreeing key with both values, or when the
+            scored-horizon rule cannot be resolved against the evaluation shards.
     """
     vae_config = _vae_config(config)
     compared: Dict[str, Any] = {}
@@ -1033,6 +1060,34 @@ def reconcile_with_checkpoint(
             disagreements.append(
                 f"model_config.VAE_model.{key}: config says {config_value!r}, the run trained with "
                 f"{checkpoint_value!r}"
+            )
+
+    # The per-channel scored horizon $H_c$: part of the forecast density every readout applies, and
+    # a constructor vector with no config key of its own -- the trainer resolves it from the two
+    # rule keys and the shards' phase-leg frequencies. Neither side of the loop above names it, so
+    # the rule is re-resolved against the evaluation shards here and the vectors compared. Both
+    # ``None`` (no rule, every cell scored) is the common case and reads no shard at all.
+    try:
+        expected_scored = _as_int_tuple(
+            resolve_target_scored_horizon(config_view_for_budget(config))
+        )
+    except (ValueError, OSError, KeyError) as exc:
+        raise EvalPreconditionUnmet(
+            f"the per-channel scored horizon ({SCORED_HORIZON_CUTOFF_KEY} / "
+            f"{SCORED_HORIZON_FAST_KEY}) could not be resolved against "
+            f"dataset_config.vae_test_datasets: {exc}"
+        ) from exc
+    stamped_scored = _as_int_tuple(model_kwargs.get("target_scored_horizon"))
+    if expected_scored is not None or stamped_scored is not None:
+        compared["target_scored_horizon"] = {
+            "config": None if expected_scored is None else list(expected_scored),
+            "checkpoint": None if stamped_scored is None else list(stamped_scored),
+        }
+        if expected_scored != stamped_scored:
+            disagreements.append(
+                f"target_scored_horizon: the config's rule resolves to "
+                f"{_scored_horizon_digest(expected_scored)}, the checkpoint was built with "
+                f"{_scored_horizon_digest(stamped_scored)}"
             )
 
     if disagreements:
@@ -1611,7 +1666,8 @@ GUARD_RECOVERY: Dict[str, Dict[str, str]] = {
         ),
     },
     "reconcile_with_checkpoint": {
-        "cause": "a declared geometry or objective key contradicts the checkpoint",
+        "cause": "a declared geometry or objective key contradicts the checkpoint, or the "
+                 "scored-horizon rule resolves to another per-channel horizon than it was built with",
         "recovery": (
             "evaluate the checkpoint against its own model_checkpoints/resolved_config.yaml, which "
             "the training run writes beside it"

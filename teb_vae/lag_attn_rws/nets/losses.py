@@ -137,6 +137,9 @@ def raw_sample_score(
     logvar: Optional[torch.Tensor] = None,
     channel_weight: Optional[torch.Tensor] = None,
     horizon_weight: Optional[torch.Tensor] = None,
+    cell_mask: Optional[torch.Tensor] = None,
+    ar_coef: Optional[torch.Tensor] = None,
+    step_mask: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     r"""The unmasked, unsummed score of every raw forecast sample.
 
@@ -189,17 +192,50 @@ def raw_sample_score(
             here rather than broadcast by the caller. A $(H,)$ tensor broadcast as it stands would
             land on the *channel* axis and silently weight the wrong thing wherever $H$ and the
             block width agree, so the one axis this argument may occupy is fixed here.
+        cell_mask: Optional $(H, C)$ $0/1$ mask of the scored cells -- the per-channel scored
+            horizon $m_{\tau,c} = \mathbb 1[\tau < H_c]$. Unlike the two weights it keeps the block
+            a true log-density, because it removes cells from the scored set instead of
+            re-weighting them, so the evaluation applies it as well. ``None`` scores every cell.
+        ar_coef: Optional $(C,)$ AR(1) coefficient $\phi_c$ of the forecast residual along the
+            horizon. Passed, every cell is scored on its innovation
+            $e_\tau = r_\tau - \phi_c\, r_{\tau-1}$ with $r = x - \mu$ and $r_{-1} = 0$, so the
+            log-variance is the innovation variance for $\tau \ge 1$ and the block sum is the exact
+            joint negative log-density of a horizon whose residuals are serially correlated.
+            ``None`` is the factorised score, bitwise.
+        step_mask: Optional per-step validity $(\ldots, H)$ -- the forecast mask -- read only with
+            ``ar_coef``. A masked step's residual is zeroed before it is lagged, so the recursion
+            restarts after a gap as it starts at $\tau = 0$ and never conditions on a gap's target.
+            The mask itself is still applied by the caller afterwards.
 
     Returns:
         The per-raw-sample score $(B, T_{\mathrm{valid}}, H, R)$.
 
     Raises:
-        ValueError: On an unknown ``likelihood``, ``'gaussian_nll'`` without ``logvar``, or a
-            ``horizon_weight`` that is not a 1-D tensor of the score's own horizon length.
+        ValueError: On an unknown ``likelihood``, ``'gaussian_nll'`` without ``logvar``, a
+            ``horizon_weight`` that is not a 1-D tensor of the score's own horizon length, an
+            ``ar_coef`` that is not 1-D of the channel width, or a ``cell_mask`` that is not
+            $(H, C)$.
     """
     validate_choice(likelihood, LIKELIHOOD_CHOICES, "likelihood")
 
-    diff2 = (target - mu) ** 2
+    residual = target - mu
+    if ar_coef is not None:
+        # The innovation of a per-channel AR(1) residual along the horizon axis (dim -2):
+        # e_tau = r_tau - phi_c r_{tau-1}, with r_{-1} = 0 so the first step is scored as it
+        # stands. The map r -> e is unit lower-triangular, so its Jacobian is exactly 1 and the
+        # innovation density IS the joint density of the horizon block -- no correction term.
+        if ar_coef.dim() != 1 or ar_coef.shape[0] != residual.shape[-1]:
+            raise ValueError(
+                f"ar_coef must be 1-D of the block's channel width {residual.shape[-1]}, got "
+                f"shape {tuple(ar_coef.shape)}"
+            )
+        # A masked step (a gap inside the window) restarts the recursion exactly as r_{-1} = 0
+        # starts it: its residual is not conditioned on, so no gap target is read and no gradient
+        # reaches the mean at a step the objective does not score.
+        lagged = residual if step_mask is None else residual * step_mask[..., None]
+        previous = F.pad(lagged[..., :-1, :], (0, 0, 1, 0))
+        residual = residual - ar_coef * previous
+    diff2 = residual**2
     if likelihood == "mse":
         score = diff2
     elif logvar is None:
@@ -223,6 +259,13 @@ def raw_sample_score(
                 f"axis wherever the two lengths happen to agree."
             )
         score = score * horizon_weight[:, None]
+    if cell_mask is not None:
+        if cell_mask.shape != score.shape[-2:]:
+            raise ValueError(
+                f"cell_mask must be (H, C) = {tuple(score.shape[-2:])}, got "
+                f"{tuple(cell_mask.shape)}"
+            )
+        score = score * cell_mask
     return score
 
 
@@ -235,6 +278,8 @@ def masked_raw_block_per_anchor(
     logvar: Optional[torch.Tensor] = None,
     channel_weight: Optional[torch.Tensor] = None,
     horizon_weight: Optional[torch.Tensor] = None,
+    cell_mask: Optional[torch.Tensor] = None,
+    ar_coef: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     r"""Each anchor's own masked block score, before any averaging.
 
@@ -279,6 +324,9 @@ def masked_raw_block_per_anchor(
         logvar=logvar,
         channel_weight=channel_weight,
         horizon_weight=horizon_weight,
+        cell_mask=cell_mask,
+        ar_coef=ar_coef,
+        step_mask=mask,
     )
 
     block_per_anchor = (per_sample * mask[..., None]).sum(dim=(2, 3))  # (B, T_valid)
@@ -299,6 +347,8 @@ def masked_raw_likelihood(
     logvar: Optional[torch.Tensor] = None,
     channel_weight: Optional[torch.Tensor] = None,
     horizon_weight: Optional[torch.Tensor] = None,
+    cell_mask: Optional[torch.Tensor] = None,
+    ar_coef: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     r"""Masked reconstruction loss, summed over the forecast block, averaged over anchors.
 
@@ -336,6 +386,8 @@ def masked_raw_likelihood(
         logvar=logvar,
         channel_weight=channel_weight,
         horizon_weight=horizon_weight,
+        cell_mask=cell_mask,
+        ar_coef=ar_coef,
     )
 
     # Average over the anchors that contribute at all: a fully masked anchor (warm-up, gap,
@@ -344,7 +396,13 @@ def masked_raw_likelihood(
     n_anchors = contributing.sum().clamp_min(1.0)
 
     d_block = block_per_anchor.sum() / n_anchors
-    d_sample = d_block / float(mu.shape[2] * mu.shape[3])
+    # Per scored element: the block's own H * X under no cell mask, the scored count under one.
+    elements = (
+        float(target.shape[-2] * target.shape[-1])
+        if cell_mask is None
+        else float(cell_mask.sum().clamp_min(1.0))
+    )
+    d_sample = d_block / elements
     return d_block, d_sample
 
 
@@ -696,6 +754,8 @@ def compute_loss(
     lambda_boundary: float = 0.0,
     channel_weight: Optional[torch.Tensor] = None,
     horizon_weight: Optional[torch.Tensor] = None,
+    cell_mask: Optional[torch.Tensor] = None,
+    ar_coef: Optional[torch.Tensor] = None,
 ) -> Dict[str, Any]:
     r"""Compute the seven-term objective, per anchor.
 
@@ -803,6 +863,12 @@ def compute_loss(
             horizon steps. The three shape terms are deliberately not weighted: they are $L_1$ and
             Huber quantities over the mean rather than parts of the likelihood, and every causal
             cell ships them at $0.0$.
+        cell_mask: Optional $(H, C)$ per-channel scored-horizon mask, reaching both
+            reconstruction terms; see :func:`raw_sample_score`. It changes *which* cells are
+            scored, not their weight, so the block stays a log-density. ``None`` scores all.
+        ar_coef: Optional $(C,)$ AR(1) residual coefficient, reaching both reconstruction terms;
+            see :func:`raw_sample_score`. Both branches are scored under the same $\phi$, so
+            ``pred_gap`` remains a difference of two joint log-densities of one family.
 
     Returns:
         ``{'metrics': ..., 'likelihood': ...}``. ``metrics`` maps names to scalar tensors -- the
@@ -849,6 +915,8 @@ def compute_loss(
         logvar=forward_outputs["logvar_full"],
         channel_weight=channel_weight,
         horizon_weight=horizon_weight,
+        cell_mask=cell_mask,
+        ar_coef=ar_coef,
     )
     nll_base_block, nll_base_sample = masked_raw_likelihood(
         forward_outputs["mu_base"],
@@ -858,6 +926,8 @@ def compute_loss(
         logvar=forward_outputs["logvar_base"],
         channel_weight=channel_weight,
         horizon_weight=horizon_weight,
+        cell_mask=cell_mask,
+        ar_coef=ar_coef,
     )
 
     kld_btd = kld_tensor(
@@ -913,7 +983,13 @@ def compute_loss(
         pred_gap = nll_base_block - nll_full_block
 
         elem_mask = mask[..., None]
-        elem_denom = (elem_mask.sum() * float(block_width)).clamp_min(1.0)
+        if cell_mask is None:
+            elem_denom = (elem_mask.sum() * float(block_width)).clamp_min(1.0)
+        else:
+            # Scored cells only: an unscored cell's log-variance receives no gradient and may drift
+            # to a clamp, which these diagnostics would otherwise report as saturation.
+            elem_mask = elem_mask * cell_mask
+            elem_denom = elem_mask.sum().clamp_min(1.0)
         mean_logvar_full = (forward_outputs["logvar_full"] * elem_mask).sum() / elem_denom
         mean_logvar_base = (forward_outputs["logvar_base"] * elem_mask).sum() / elem_denom
 

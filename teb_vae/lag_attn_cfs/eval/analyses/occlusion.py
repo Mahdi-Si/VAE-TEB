@@ -80,6 +80,7 @@ from teb_vae.lag_attn_cfs.eval.metrics import (
     batch_field,
     batch_guids,
     batch_size_of,
+    forecast_likelihood_terms,
     masked_raw_block_per_horizon_step,
     model_inputs,
 )
@@ -213,7 +214,9 @@ def _horizon_scores(
     ``_build_forecast_target`` and the anchored
     :func:`~teb_vae.lag_attn_rws.nets.raw_masks.forecast_mask` at the model's own ``coverage_floor``
     -- the same two functions the collection pass uses -- so the arms are scored over exactly the
-    coefficients the rest of the run scored, at one anchor instead of all of them.
+    coefficients the rest of the run scored, at one anchor instead of all of them, and under the
+    model's own density (its scored-cell mask and AR(1) coefficient). Under a cell mask a far step
+    sums over fewer channels, so a per-step delta there is over the channels still scored.
 
     Args:
         model: The rebuilt net.
@@ -230,14 +233,17 @@ def _horizon_scores(
     """
     target = model._build_forecast_target(target_features, anchors)
     mask, _coverage = forecast_mask(
-        weight,
+        # The pooled validity ``metrics.anchor_support`` scores under; the identity on the stored
+        # clock, and the only mask that drops a shifted element inside a gap on any other.
+        model.scored_weight(weight),
         model.geometry,
         coverage_floor=model.coverage_floor,
         anchors=anchors,
         anchor_valid=anchor_valid,
     )
     per_tau = masked_raw_block_per_horizon_step(
-        outputs["mu_full"], target, mask, likelihood=likelihood, logvar=outputs["logvar_full"]
+        outputs["mu_full"], target, mask, likelihood=likelihood, logvar=outputs["logvar_full"],
+        **forecast_likelihood_terms(model),
     )
     return per_tau[:, 0, :].to(torch.float64)
 

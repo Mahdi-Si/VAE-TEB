@@ -110,6 +110,8 @@ class SeqVaeLagAttnCfs(CausalWarmupInputs, CausalFeatureForecastTarget, SeqVaeLa
         target_weight_ph: float = 1.0,
         target_novelty_frac: Optional[Sequence[float]] = None,
         target_forecast_shift: Optional[Sequence[int]] = None,
+        target_scored_horizon: Optional[Sequence[int]] = None,
+        forecast_ar_residual: bool = False,
         init_weights: bool = True,
     ) -> None:
         r"""Initialize the model.
@@ -158,6 +160,13 @@ class SeqVaeLagAttnCfs(CausalWarmupInputs, CausalFeatureForecastTarget, SeqVaeLa
                 ``causal_target_forecast_clock`` -- all-advance under ``physical``, all-delay
                 ($-d_c$) under ``input`` -- and ``None`` under the stored clock, where the model
                 is bitwise one constructed before the keyword existed.
+            target_scored_horizon: $H_c$ per **declared** target channel, the number of leading
+                horizon steps scored for that channel, resolved from the shards by
+                :func:`~teb_vae.lag_attn_cfs.scored_horizon.resolve_target_scored_horizon`.
+                ``None`` scores every step of every channel.
+            forecast_ar_residual: Score the horizon under a per-channel AR(1) residual with a
+                learnable $\phi_c = \tanh(a_c)$, seeded at $0$. ``False`` builds no parameter and
+                is the factorised score.
 
         Raises:
             ValueError: If ``anchor_stride`` is outside $[1, H]$ or leaves a phase with no anchor;
@@ -196,6 +205,12 @@ class SeqVaeLagAttnCfs(CausalWarmupInputs, CausalFeatureForecastTarget, SeqVaeLa
         # it changes no width, no mask and no parameter. Stashed before the base for the same
         # reason the weights are -- the keep-index it is gathered through does not exist yet.
         self._set_target_novelty(target_novelty_frac=target_novelty_frac)
+        # The forecast density's own structure: which cells are scored and whether the horizon
+        # residual is AR(1). Stashed before the base for the reason the weights are.
+        self._set_likelihood_structure(
+            target_scored_horizon=target_scored_horizon,
+            forecast_ar_residual=forecast_ar_residual,
+        )
 
         # The alignment shifts reach the base under ITS names, which is the one place in this
         # family where ``ChannelDelay`` does any work. They arrive under names of their own because
@@ -213,3 +228,5 @@ class SeqVaeLagAttnCfs(CausalWarmupInputs, CausalFeatureForecastTarget, SeqVaeLa
         # After the geometry check, which is what resolves the gate the weights
         # are positional over.
         self._register_channel_weights()
+        # After the decoder exists, whose width the AR coefficient and the cell mask share.
+        self._register_likelihood_structure()

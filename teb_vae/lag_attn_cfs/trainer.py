@@ -65,6 +65,7 @@ from teb_vae.lag_attn_cfs.causal_warmup import (  # noqa: E402
     resolve_warmup_budget,
 )
 from teb_vae.lag_attn_cfs.model_kwargs import warmup_model_kwargs  # noqa: E402
+from teb_vae.lag_attn_cfs.scored_horizon import resolve_target_scored_horizon  # noqa: E402
 from teb_vae.lag_attn_cfs.nets.causal_feature_target import (  # noqa: E402
     CausalFeatureForecastTarget,
 )
@@ -182,6 +183,11 @@ class LagAttnCfsTrainer(LagAttnRwsTrainer):
         # resolving it a second time from a second read of the same config.
         self.resolved_warmup = resolve_warmup_budget(self.config)
         model_kwargs.update(warmup_model_kwargs(self.resolved_warmup, self.MODEL_CLS))
+        # The per-channel scored horizon is a property of the shards' phase legs and two config
+        # keys, resolved here so it lands in the checkpoint's model_kwargs like the warm-up tuples.
+        scored = resolve_target_scored_horizon(self.config)
+        if scored is not None:
+            model_kwargs["target_scored_horizon"] = scored
         return model_kwargs
 
     def causal_standing_message(self) -> str:

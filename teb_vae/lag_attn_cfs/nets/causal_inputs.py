@@ -101,6 +101,8 @@ CAUSAL_ONLY_KEYWORDS: Tuple[str, ...] = (
     "source_align_delays",
     "target_novelty_frac",
     "target_forecast_shift",
+    "target_scored_horizon",
+    "forecast_ar_residual",
 )
 
 #: What a composing constructor removes from its own ``locals()`` before forwarding the rest to the

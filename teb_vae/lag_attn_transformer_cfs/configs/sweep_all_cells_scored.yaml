@@ -1,0 +1,33 @@
+# Likelihood ablation of the 2026-09-23 final revision: EVERY cell of the forecast block scored.
+#
+# The default scores an `fhr_ph` channel whose slow leg sits above `target_phase_fast_cutoff_hz`
+# over its first `target_phase_fast_horizon` steps only, and every other channel over all H. This
+# arm nulls the pair, so every channel is scored over the whole horizon -- the scored set every run
+# before the revision was trained on.
+#
+# WHY IT IS AN ARM. Measured held-out, the fast phase channels lose all skill after a few steps: the
+# relative phase of two band-limited processes decorrelates within about the inverse bandwidth, so
+# their trailing cells are noise nothing -- the source included -- can predict, and at a long
+# horizon they are most of the block. This arm is what says how much of the revision's result is
+# removing them; the AR(1) residual stays on, so the other mechanism is held.
+#
+# Nats are NOT comparable with the default's: the summed block covers a different set of cells.
+#
+#   TEB_RUN_STAMP="$(date '+%Y-%m-%d--[%H-%M]')" torchrun --nproc_per_node=7 \
+#       -m teb_vae.lag_attn_transformer_cfs.trainer --config teb_vae/lag_attn_transformer_cfs/configs/sweep_all_cells_scored.yaml
+base: default.yaml
+
+model_config:
+  VAE_model:
+    # A pair: the resolver refuses one without the other.
+    target_phase_fast_cutoff_hz: null
+    target_phase_fast_horizon: null
+
+advanced_config:
+  tracking:
+    mlflow:
+      # IDENTITY: the arm in the name, on both keys, so a run's own records say which arm trained
+      # even if the config it was launched from cannot be recovered.
+      run_name: lag_attn_trf_cfs_all_cells_scored
+      tags:
+        variant: lag_attn_trf_cfs_all_cells_scored

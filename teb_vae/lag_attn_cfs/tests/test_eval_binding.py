@@ -42,17 +42,18 @@ from .conftest import _REPO_ROOT
 #: **ordered** sequence, not a set -- the order is what the reconciliation record is built in and
 #: what a reader of two runs' preflight files compares down.
 #:
-#: Fourteen of the nineteen are the raw cells'. Two this cell adds are the ones that decide the
+#: Fourteen of the twenty are the raw cells'. Two this cell adds are the ones that decide the
 #: population and the lag support: ``anchor_stride`` sets how many anchors a forward scores, and
 #: ``lag_floor`` is one of the three quantities the lag-support margin is made of.
 #:
-#: The last three are architecture switches, and they are here for the same reason the widths are:
-#: the evaluation rebuilds the model from the **checkpoint's** own ``model_kwargs``, so a config
-#: disagreeing about one of them would not fail -- it would report one architecture's numbers under
-#: another's stated description. ``lag_kv_source`` changes what the lag attention reads and
+#: The last four are architecture and density switches, and they are here for the same reason the
+#: widths are: the evaluation rebuilds the model from the **checkpoint's** own ``model_kwargs``, so
+#: a config disagreeing about one of them would not fail -- it would report one architecture's
+#: numbers under another's stated description. ``lag_kv_source`` changes what the lag attention reads and
 #: therefore what every lag readout means; ``prior_availability_input`` changes what the KL is a
 #: divergence between; ``persistence_residual`` changes the predictor every ``nll_*`` and every
-#: skill comparison is measured on.
+#: skill comparison is measured on. ``forecast_ar_residual`` is reconciled in the transformer cell's
+#: tuple only, the one cell whose configuration names it.
 #:
 #: ``horizon_weight_halflife_steps`` is deliberately NOT here, on the same ground as the objective
 #: weights: it re-weights the *training* criterion's horizon axis and this pipeline scores every

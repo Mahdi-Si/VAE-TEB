@@ -63,20 +63,15 @@ SMOKE_EPOCHS = 2
 GUARDED_TARGET_CHANNELS = 76
 GUARDED_SOURCE_CHANNELS = 46
 
-#: The anchor counts the two stages must produce, derived here the way the model derives them so a
-#: geometry change re-derives them rather than failing a literal. The stride is the one literal:
-#: it is what the config states, and the run's stride equalling it is what is asserted.
-SHIPPED_ANCHOR_STRIDE = 5
+#: The tiny variant's resolved model block: the geometry the fit actually trains at, read off the
+#: config rather than restated, so a geometry change re-derives every count below instead of
+#: failing a literal. The run's stride and horizon equalling the config's is what is asserted.
+_TINY_VAE = load_config(str(_TINY))["model_config"]["VAE_model"]
+SHIPPED_ANCHOR_STRIDE = int(_TINY_VAE["anchor_stride"])
+CONFIG_HORIZON = int(_TINY_VAE["horizon"])
 
-
-#: The horizon the CONFIG ships, read off the tiny variant the fit runs on rather than off the
-#: fixture-level ``SHIPPED_HORIZON`` (30), which describes the legacy unit-test geometry the
-#: parameter totals were measured at: since 2026-09-05 this cell forecasts 10 steps, so the two
-#: constants no longer agree and the fit must be checked against the one it actually trains at.
-CONFIG_HORIZON = int(load_config(str(_TINY))["model_config"]["VAE_model"]["horizon"])
-
-# The stored clock advances no label, so the dense span is T_valid - F = 300 - 10 - 134 = 156.
-DENSE_ANCHORS = 300 - CONFIG_HORIZON - SHIPPED_WARMUP_PERIOD
+# The stored clock advances no label, so the dense span is T_valid - F = T - H - F.
+DENSE_ANCHORS = int(_TINY_VAE["sequence_length"]) - CONFIG_HORIZON - SHIPPED_WARMUP_PERIOD
 TILE_COUNT = -(-DENSE_ANCHORS // SHIPPED_ANCHOR_STRIDE)
 
 
@@ -236,9 +231,40 @@ def test_the_run_trains_at_the_budgets_width_and_the_configs_tiling(fit):
     assert isinstance(model, SeqVaeLagAttnTrfCfs)
     assert model.decoder_out_channels == GUARDED_TARGET_CHANNELS
     assert model.anchor_stride == SHIPPED_ANCHOR_STRIDE
-    assert model.horizon == CONFIG_HORIZON == 10
+    assert model.horizon == CONFIG_HORIZON
     assert model.warmup_period == SHIPPED_WARMUP_PERIOD
     assert driver.resolved_warmup is not None
+
+
+def test_the_final_revisions_likelihood_keys_flow_config_to_trainer_to_model(fit):
+    r"""The 2026-09-23 revision's two density mechanisms, end to end through the real driver.
+
+    ``target_phase_fast_*`` names no constructor argument: the trainer resolves it against the
+    shard's ``sel_xi_i_hz`` into ``target_scored_horizon``, one $H_c$ per declared target channel,
+    and that tuple must land in the checkpoint's ``model_kwargs`` or a rebuilt model scores a
+    different set of cells. ``forecast_ar_residual`` is a real keyword the signature sweep forwards,
+    and it must build the learnable ``target_ar_logit`` -- and the fit must have moved it, or the
+    AR(1) coefficient never entered the objective.
+    """
+    driver, _trainer = fit
+    model = driver.pytorch_model
+    path = sorted(Path(driver.model_checkpoint_dir).glob("*.ckpt"))[0]
+    blob = torch.load(path, map_location="cpu", weights_only=False)
+    kwargs = blob["model_kwargs"]
+
+    assert kwargs["forecast_ar_residual"] is True
+    scored = tuple(kwargs["target_scored_horizon"])
+    assert len(scored) == int(_TINY_VAE["c_y"])
+    fast = int(_TINY_VAE["target_phase_fast_horizon"])
+    # Both rule outcomes are present on the committed shard: some phase channels sit above the
+    # cutoff and are scored for the fast horizon, and every envelope keeps the whole horizon.
+    assert set(scored) == {fast, CONFIG_HORIZON}
+    assert tuple(model.target_scored_horizon) == scored
+    assert model.target_cell_mask.shape == (CONFIG_HORIZON, GUARDED_TARGET_CHANNELS)
+
+    ar_key = next(key for key in blob["state_dict"] if key.endswith("target_ar_logit"))
+    assert tuple(blob["state_dict"][ar_key].shape) == (GUARDED_TARGET_CHANNELS,)
+    assert bool(blob["state_dict"][ar_key].abs().gt(0.0).any()), "phi never left its zero seed"
 
 
 def test_the_step_granular_ramp_was_live_during_the_fit(fit):

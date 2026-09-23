@@ -4,15 +4,17 @@
 # forecast clock (labels advanced per channel by round(0.875 (tau_c - tau_min) / 4 s), up to 85
 # steps) and its stride-5 tiling.
 #
-# THE HORIZON IS NOT PINNED HERE and follows default.yaml, which moved to H = 10 on 2026-09-05: the
-# arm exists to compare the representation, the input references and the forecast clock against
-# the promoted default, and that comparison is only readable with the horizon held equal on both
-# sides. Under H = 10 the physical clock's ceiling is T_valid - 85 = 205, the dense span is 71
-# anchors and stride 5 tiles it into 15 tiles at phase 0 (14 otherwise). The
-# `horizon_weight_halflife_steps`, `gradient_clip_val` and `additive_margin` the default re-derived
-# for H = 10 are inherited with it. What this arm is therefore NOT is a bitwise replay of the
-# pre-promotion run, which forecast 30 steps; the run records of that configuration remain the
-# record of it.
+# THE HORIZON IS NOT PINNED HERE and follows default.yaml (H = 30 again since the 2026-09-23
+# final revision), and so does every other final-revision leaf -- `max_lag`, `lag_kv_source`,
+# `source_dropout`, the half-life, the AR(1) residual and the per-channel scored horizon: the arm
+# exists to compare the representation, the input references and the forecast clock against the
+# default, and that comparison is only readable with everything else held equal on both sides.
+# Under the physical clock the anchor ceiling is T_valid - max_c s_c (worked example: 270 - 85 =
+# 185), the dense span is that ceiling less F (51 anchors), and stride 5 tiles it into
+# ceil(51 / 5) = 11 tiles at phase 0 (10 otherwise). The `gradient_clip_val` and `additive_margin`
+# the default scaled for its own block are inherited with it, although this arm's legacy block is
+# wider (H x 98 surviving channels). What this arm is therefore NOT is a bitwise replay of the
+# pre-promotion run; the run records of that configuration remain the record of it.
 #
 # It reads the LEGACY shards (REPOINT_ME_causal), which is why its dataset paths are its own. The
 # review's findings against this arm are recorded in teb_vae/CFS_SCATTERING_PHASE_FORECAST_CRITIQUE.md;

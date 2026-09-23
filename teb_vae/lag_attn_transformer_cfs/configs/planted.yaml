@@ -42,7 +42,8 @@ model_config:
     c_u: 51
     max_lag: 90
     # The horizon and its half-life, PINNED at the values every recorded gate was measured under.
-    # default.yaml moved to H = 10 on 2026-09-05; the shard's planted delay of 45 stored steps
+    # default.yaml has moved both (H = 10 on 2026-09-05; H = 30 with half-life H on 2026-09-23),
+    # and the pins do not follow it; the shard's planted delay of 45 stored steps
     # makes the readable band [delta - H, delta - 1] = [15, 44] only at H = 30, so a horizon that
     # followed the default would move the band this check scores against while the stamp stayed
     # put. Both twins pin the pair, so the two readings stay one instrument;
@@ -65,6 +66,17 @@ model_config:
     # re-indexes the scored element per channel would move the band this check scores against
     # while the stamp stayed put. lag_recovery_check refuses any other clock by name.
     causal_target_forecast_clock: stored
+
+    # The 2026-09-23 final revision, PINNED BACK to the conv-LSTM twin's values. default.yaml moved
+    # these leaves in this cell only; the twin's default did not move them, so inheriting them would
+    # make the two readings differ in the K/V memory, the source regulariser, the forecast density,
+    # the scored set and the spike bar as well as in the encoder. The adapter memory the default
+    # now ships is measured here by overriding `lag_kv_source` on BOTH twins, not by drift.
+    lag_kv_source: conv_stem
+    source_dropout: null
+    forecast_ar_residual: false
+    target_phase_fast_cutoff_hz: null
+    target_phase_fast_horizon: null
     beta_schedule:
       kind: linear_warmup
       start: 0.0
@@ -77,6 +89,9 @@ dataset_config:
   stat_path: teb_vae/lag_attn/tests/fixtures/tiny_stats_causal_planted.hdf5
 
 advanced_config:
+  # The twin's margin, for the reason above: one spike bar across both readings.
+  spike_breaker:
+    additive_margin: 2.2e+3
   callbacks:
     lag_attn_rws_plotting:
       enabled: false

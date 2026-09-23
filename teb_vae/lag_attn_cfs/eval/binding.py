@@ -187,6 +187,15 @@ class ModelBinding:
 #: ``nll_*`` and ``pred_gap`` are true log-densities in nats whatever the fit optimised. A half-life
 #: edited after the fit therefore changes nothing this run measures, and refusing the run for it
 #: would refuse a config that contradicts no reported number.
+#:
+#: ``forecast_ar_residual`` is part of the density rather than a weight on it, and every evaluated
+#: readout applies it -- but it is reconciled only in the transformer cell's tuple, the one cell whose
+#: configuration names it; this cell's config never sets it, so here it could only ever be skipped.
+#: The model's own value still reaches every readout, because the evaluation rebuilds from the
+#: checkpoint's ``model_kwargs``. ``target_scored_horizon`` -- the other density term -- is a
+#: constructor vector resolved from two rule keys and the shards and names no config key, so
+#: ``preflight.reconcile_with_checkpoint`` re-resolves it from the configured rule and compares the
+#: vector instead.
 GEOMETRY_KEYS: Tuple[str, ...] = (
     "sequence_length",
     "d_model",

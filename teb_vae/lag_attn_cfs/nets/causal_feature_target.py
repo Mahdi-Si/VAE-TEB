@@ -511,6 +511,77 @@ class CausalFeatureForecastTarget(FeatureForecastTarget):
             persistent=False,
         )
 
+    def _set_likelihood_structure(
+        self,
+        *,
+        target_scored_horizon: Optional[Sequence[int]],
+        forecast_ar_residual: bool,
+    ) -> None:
+        r"""Stash the forecast density's two structural keywords, **before** the base constructor.
+
+        Split from :meth:`_register_likelihood_structure` for the reason the channel weights are
+        split: this half needs no geometry, that half needs the gate and the horizon.
+
+        Args:
+            target_scored_horizon: $H_c$ per **declared** target channel -- how many leading
+                horizon steps of channel $c$ are scored -- or ``None`` to score every step of every
+                channel. Gathered through the keep-index, like ``target_novelty_frac``, so the
+                resolver never needs the budget's survivors. Resolved from the shards by
+                :func:`~teb_vae.lag_attn_cfs.scored_horizon.resolve_target_scored_horizon`.
+            forecast_ar_residual: Score each channel's horizon under an AR(1) residual with a
+                learnable coefficient $\phi_c = \tanh(a_c)$, seeded at $a_c = 0$ so the model
+                starts bitwise at the factorised score. ``False`` builds no parameter.
+        """
+        self.target_scored_horizon = (
+            None
+            if target_scored_horizon is None
+            else tuple(int(steps) for steps in target_scored_horizon)
+        )
+        self.forecast_ar_residual = bool(forecast_ar_residual)
+
+    def _register_likelihood_structure(self) -> None:
+        r"""Build the scored-cell mask buffer and the AR(1) parameter, after the base.
+
+        ``target_cell_mask`` is $(H, C_{\mathrm{keep}})$ with $m_{\tau,c} = \mathbb 1[\tau < H_c]$,
+        non-persistent for the reason every budget- or horizon-shaped tensor here is; the vector it
+        is built from reaches the checkpoint through ``model_kwargs``. ``target_ar_logit`` is a
+        loose $(C_{\mathrm{keep}},)$ parameter at zero, so the generic initialisation leaves it
+        alone and both decoder invocations -- base and full -- are scored under one $\phi$, which
+        keeps ``pred_gap`` a pure source readout.
+
+        Raises:
+            ValueError: If the scored-horizon vector does not have $c_y$ entries or holds a value
+                outside $[1, H]$ -- a channel scored at no step would be a channel the decoder
+                emits for nothing.
+        """
+        width = int(self.decoder_out_channels)
+        if self.target_scored_horizon is not None:
+            steps = self.target_scored_horizon
+            if len(steps) != int(self.c_y):
+                raise ValueError(
+                    f"target_scored_horizon has {len(steps)} entries against c_y={int(self.c_y)}; "
+                    f"it is positional over the declared channels"
+                )
+            if min(steps) < 1 or max(steps) > int(self.horizon):
+                raise ValueError(
+                    f"target_scored_horizon entries must lie in [1, H={int(self.horizon)}], got "
+                    f"[{min(steps)}, {max(steps)}]"
+                )
+            declared = (
+                torch.arange(self.c_y)
+                if self.target_gate is None
+                else self.target_gate.keep_index.cpu()
+            )
+            kept = torch.as_tensor([steps[int(index)] for index in declared.tolist()])
+            taus = torch.arange(int(self.horizon))
+            self.register_buffer(
+                "target_cell_mask",
+                (taus[:, None] < kept[None, :]).to(torch.float32),
+                persistent=False,
+            )
+        if self.forecast_ar_residual:
+            self.target_ar_logit = torch.nn.Parameter(torch.zeros(width))
+
     @classmethod
     def _resolve_channel_weights(
         cls,
@@ -901,6 +972,8 @@ class CausalFeatureForecastTarget(FeatureForecastTarget):
                 # terms.
                 channel_weight=self.target_channel_weight,
                 horizon_weight=getattr(self, "horizon_weight", None),
+                step_mask=mask,
+                **self.forecast_likelihood_kwargs(),
             ) * mask[..., None]
             return score.sum(dim=(0, 1, 2))
 

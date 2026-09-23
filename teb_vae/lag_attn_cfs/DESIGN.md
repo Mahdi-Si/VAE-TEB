@@ -1845,3 +1845,18 @@ neither needed a code change; comments and guides that quoted the old geometry a
 made symbolic instead. The guard bands for `anchors_per_sample` are now $[31, 32]$ train / $156$ val.
 The target edge, against `lag_attn_fs`, now differs in the horizon as well as the block, and `horizon`
 is back on that edge's exemption list.
+
+
+## Amendment (2026-09-23): two forecast-density terms in the shared mixins, off in this cell
+
+`CausalFeatureForecastTarget` gained two constructor keywords, both off by default, so this cell's
+shipped model and every one of its nats are unchanged: `target_scored_horizon` (per declared
+channel, the number of leading horizon steps scored, held as the $(H, C_{\mathrm{keep}})$ buffer
+`target_cell_mask`, resolved from `target_phase_fast_cutoff_hz` / `target_phase_fast_horizon` by
+`teb_vae/lag_attn_cfs/scored_horizon.py`) and `forecast_ar_residual` (a per-channel AR(1)
+residual along the horizon, $\phi_c = \tanh(a_c)$, scored on innovations so the block is the exact
+joint density). Both reach `raw_sample_score` through
+`FeatureForecastTarget.forecast_likelihood_kwargs()`, in the objective and in the evaluation alike.
+`lag_attn_transformer_cfs` ships them on as its final revision, together with a longer horizon,
+local keys and a shorter lag window, so the encoder edge between the two cfs cells is closed:
+`lag_attn_transformer_cfs/DESIGN.md` (amendment of the same date) is the record.

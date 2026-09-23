@@ -268,7 +268,7 @@ def test_the_anchor_tensor_shape_is_a_geometry_constant_at_every_phase(phase):
 # =================================================================================================
 # The revision's new parameters, and the same claim re-earned on each
 #
-# Three of the mechanisms this family added build a parameter, and every one of them is exactly the
+# Four of the mechanisms this family added build a parameter, and every one of them is exactly the
 # shape ``find_unused_parameters=False`` refuses: a tensor whose gradient path is easy to lose and
 # whose absence changes no shape. The prior's clock projection is fed by a DETACHED encode, so a
 # forward that used the clock and nothing else would starve it; the persistence weight enters the
@@ -279,14 +279,18 @@ def test_the_anchor_tensor_shape_is_a_geometry_constant_at_every_phase(phase):
 # Re-earned rather than argued, on the arm the configs ship, because a starved parameter makes the
 # reducer raise on the first production step and on no development-box run.
 # =================================================================================================
-#: The shipped architecture switches, at the values the causal configs carry.
+#: The shipped architecture switches, at the values this cell's config carries since the 2026-09-23
+#: final revision. ``forecast_ar_residual`` is the fourth parameter-building switch: its AR(1) logit
+#: is a loose parameter seeded at exactly zero -- the state in which a dropped multiply is
+#: invisible -- and it reaches the loss only through the reconstruction terms.
 _SHIPPED_SWITCHES = dict(
-    lag_kv_source="conv_stem",
+    lag_kv_source="adapter",
     prior_availability_input=True,
-    horizon_weight_halflife_steps=5.0,
+    horizon_weight_halflife_steps=30.0,
     alibi_slope_scale=0.0,
     lag_bias_init="alibi_decay",
     persistence_residual=True,
+    forecast_ar_residual=True,
 )
 
 
@@ -297,6 +301,7 @@ _EXPECTED_NEW_PARAMETERS = (
     "prior_head.clock_proj.weight",
     "decoder.persistence_weight",
     "lag_attn.lag_score_bias",
+    "target_ar_logit",
 )
 
 
@@ -304,10 +309,10 @@ _EXPECTED_NEW_PARAMETERS = (
 def test_no_parameter_the_revision_added_is_left_without_a_gradient(
     task, perturb_posterior, beta_prior
 ):
-    """The same claim as above at the shipped switches, and the three parameters it is about.
+    """The same claim as above at the shipped switches, and the four parameters it is about.
 
     Asserted in two halves. The starved set must be empty, which is what the reducer checks; and
-    the three new parameters must be *present*, because an empty starved set is also what a model
+    the four new parameters must be *present*, because an empty starved set is also what a model
     that built none of them would report.
     """
     module = task(

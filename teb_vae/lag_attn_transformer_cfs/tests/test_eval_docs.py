@@ -148,7 +148,15 @@ def test_the_one_declaration_that_differs_is_stated_with_its_arithmetic(eval_doc
     -- which a reader can check against the code and which stays true as the parent's tuple moves.
     So this asserts the names on both sides and leaves the count to the code.
     """
-    assert len(TRF_CFS_BINDING.geometry_keys) == 25
+    # The derivation the document states, asserted as a derivation: the parent's tuple, minus
+    # ``causal_norm``, plus the seven encoder keys -- so the parent's tuple can grow without a
+    # literal here going stale.
+    assert "causal_norm" in CFS_BINDING.geometry_keys
+    # ... plus ``forecast_ar_residual``, which only this cell's final revision configures.
+    assert "forecast_ar_residual" not in CFS_BINDING.geometry_keys
+    assert "forecast_ar_residual" in TRF_CFS_BINDING.geometry_keys
+    assert "`forecast_ar_residual`" in eval_doc
+    assert len(TRF_CFS_BINDING.geometry_keys) == len(CFS_BINDING.geometry_keys) - 1 + 7 + 1
     assert "causal_norm" not in TRF_CFS_BINDING.geometry_keys
     assert "`causal_norm`" in eval_doc
     assert "silently skips" in eval_doc
