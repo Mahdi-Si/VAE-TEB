@@ -12,9 +12,16 @@
 # so a smoke run at a shrunken budget or a shorter window would exercise a decoder and an anchor set
 # the production run does not have. Only the model's widths shrink so a CPU forward is fast.
 #
+# The two likelihood mechanisms of the 2026-09-23 final revision are INHERITED rather than
+# restated, so the smoke run exercises them: `forecast_ar_residual` builds the per-channel AR(1)
+# parameter, and the scored-horizon pair resolves against the committed shard's `sel_xi_i_hz`
+# (the fast horizon is valid because the horizon is the shipped one). Both are asserted by
+# tests/test_train_smoke.py through the checkpoint's model_kwargs and state dict.
+#
 # The encoder shrinks with them, and one property is preserved that a naive miniature would lose:
 # the source encoder's receptive-field bound stays strictly inside the sequence. Stem reach is
-# 1 + (5-1)*1 + (9-1)*2 = 21 steps, so the source bound is 21 + 2*(8-1) = 35 << 300.
+# 1 + (5-1)*1 + (9-1)*2 = 21 steps, so the source bound is 21 + 2*(8-1) = 35 << 300 on the
+# `encoder` arm (the shipped `adapter` arm builds neither the stem nor the stack on the source).
 #
 # `lr_warmup_steps` is deliberately NOT zeroed: a one-epoch run over four windows is a handful of
 # optimizer steps, and the step-granular ramp is exactly the thing a conv-Transformer smoke run

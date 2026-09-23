@@ -1,0 +1,31 @@
+# Lag-attention memory arm: keys and values from the causal CONV STEM, the default this cell shipped
+# until the 2026-09-23 final revision moved it to `adapter`.
+#
+# The default builds K and V from the availability adapter's output directly -- a per-step map of
+# the gated source stream, one step of reach. This arm puts the gated causal convolution stem (the
+# `encoder_conv_kernels` / `encoder_conv_dilations` schedule, 21 steps of reach) between the
+# adapter and the attention, so a key at lag ell summarises a neighbourhood of ell rather than the
+# single stored step t - ell.
+#
+# WHY IT IS AN ARM. It is the comparator for the old key/value choice: everything else in the final
+# revision is held, so a difference against the default is attributable to the K/V memory alone.
+# It is also the arm on which `prior_availability_input` is LIVE -- the prior's clock is an encode
+# of this same pathway, and a pathway with memory remembers the warm-up transient past the floor,
+# while the default's memoryless adapter collapses the clock to a constant there.
+#
+#   TEB_RUN_STAMP="$(date '+%Y-%m-%d--[%H-%M]')" torchrun --nproc_per_node=7 \
+#       -m teb_vae.lag_attn_transformer_cfs.trainer --config teb_vae/lag_attn_transformer_cfs/configs/sweep_lag_kv_conv_stem.yaml
+base: default.yaml
+
+model_config:
+  VAE_model:
+    lag_kv_source: conv_stem
+
+advanced_config:
+  tracking:
+    mlflow:
+      # IDENTITY: the arm in the name, on both keys, so a run's own records say which arm trained
+      # even if the config it was launched from cannot be recovered.
+      run_name: lag_attn_trf_cfs_kv_conv_stem
+      tags:
+        variant: lag_attn_trf_cfs_kv_conv_stem

@@ -41,6 +41,10 @@ from .conftest import absolutize_dataset_paths
 _CONFIG_DIR = Path(__file__).resolve().parents[1] / "configs"
 _TINY = _CONFIG_DIR / "tiny.yaml"
 
+#: The tiny variant's model block, whose geometry is the shipped one (test_config_load.py pins
+#: that): the values the driver must forward are read here rather than restated as literals.
+_TINY_VAE = load_config(str(_TINY))["model_config"]["VAE_model"]
+
 #: The three attributes this class declares, and nothing else.
 _OWN_ATTRIBUTES = {"MODEL_CLS", "TASK_CLS", "CHECKPOINT_STEM"}
 
@@ -216,9 +220,14 @@ def test_the_geometry_and_the_encoder_block_reach_the_constructor(driver):
     kwargs = driver._build_model_kwargs()
 
     assert kwargs["sequence_length"] == 300
-    assert kwargs["horizon"] == 10
+    assert kwargs["horizon"] == _TINY_VAE["horizon"]
     assert kwargs["warmup_period"] == 134
-    assert kwargs["anchor_stride"] == 5
+    assert kwargs["anchor_stride"] == _TINY_VAE["anchor_stride"]
+    assert kwargs["lag_kv_source"] == _TINY_VAE["lag_kv_source"]
+    assert kwargs["forecast_ar_residual"] is _TINY_VAE["forecast_ar_residual"]
+    # A task-level pair, resolved against the shard rather than forwarded by name.
+    assert "target_phase_fast_cutoff_hz" not in kwargs
+    assert len(kwargs["target_scored_horizon"]) == _TINY_VAE["c_y"]
     assert kwargs["c_y"] == 80
     assert kwargs["c_u"] == 46
     assert kwargs["target_attention_blocks"] == 2  # the tiny variant's own override
@@ -286,8 +295,8 @@ def test_the_built_model_is_this_packages_and_carries_both_halves(driver):
 
     assert isinstance(model, SeqVaeLagAttnTrfCfs)
     assert model.decoder_out_channels == 76
-    assert model.horizon == 10
-    assert model.anchor_stride == 5
+    assert model.horizon == _TINY_VAE["horizon"]
+    assert model.anchor_stride == _TINY_VAE["anchor_stride"]
     # The stored clock advances nothing: every anchor up to T_valid is decoded.
     assert model.target_forecast_shift is None
     assert model.anchor_ceiling == model.geometry.t_valid

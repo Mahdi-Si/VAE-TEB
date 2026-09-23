@@ -9,8 +9,10 @@ used it".
 So this module fits an **oracle**: the same decoder, at the same capacity, reading the target
 encoder's own state $h^y_t$ instead of the $d_z$-wide latent $z_t$. It forecasts the identical
 $H \cdot C_{\mathrm{keep}}$-coefficient block, at the identical anchors, against the
-identical target and the identical mask, under the identical likelihood. The only thing that
-differs is what it is conditioned on, so
+identical target and the identical mask, under the identical likelihood -- the checkpoint's own
+scored-cell mask and its own AR(1) coefficient $\phi_c$ included, held fixed rather than refitted,
+so the oracle and the branch are two joint densities of one family over one scored cell set. The
+only thing that differs is what it is conditioned on, so
 
 $$\Delta_{\mathrm{suff}} = D_{\mathrm{base}} - D_{\mathrm{oracle}}$$
 
@@ -77,6 +79,7 @@ from teb_vae.lag_attn_cfs.eval.metrics import (
     batch_field,
     batch_guids,
     expected_anchors_per_sample,
+    forecast_likelihood_terms,
     model_inputs,
 )
 from teb_vae.lag_attn_rws.nets.controls import NoCrossGroupPartner, make_derangement
@@ -632,9 +635,11 @@ def score_rows(
 ) -> Tuple[np.ndarray, np.ndarray]:
     r"""Score the probe's forecast on the given cache positions, one figure per segment.
 
-    The reduction is the pipeline's: an anchor's block score is summed over its
-    $H \cdot C_{\mathrm{keep}}$ coefficients, then averaged over the segment's *contributing*
-    anchors, so the result is in nats per anchor and directly comparable with ``nll_base_block``.
+    The reduction is the pipeline's: an anchor's block score is summed over its scored
+    coefficients -- under the checkpoint's own cell mask and AR(1) coefficient
+    (:func:`~teb_vae.lag_attn_cfs.eval.metrics.forecast_likelihood_terms`) -- then averaged over the
+    segment's *contributing* anchors, so the result is in nats per anchor and directly comparable
+    with ``nll_base_block``.
     A segment with no contributing anchor measured nothing and reads ``NaN``, never ``0.0``.
 
     Args:
@@ -656,12 +661,13 @@ def score_rows(
         return scores, anchors
 
     positions = torch.as_tensor(np.asarray(rows, dtype=np.int64), dtype=torch.long)
+    density = forecast_likelihood_terms(model)
     for start in range(0, len(positions), int(batch_size)):
         chunk = positions[start : start + int(batch_size)]
         states, target, mask = _batch_tensors(model, cache, chunk, chunk, device=device)
         mu, logvar = probe(states)
         block, contributing = masked_raw_block_per_anchor(
-            mu, target, mask, likelihood=likelihood, logvar=logvar
+            mu, target, mask, likelihood=likelihood, logvar=logvar, **density
         )
         counts = contributing.sum(dim=1).detach().cpu().to(torch.float64).numpy()
         totals = (block * contributing).sum(dim=1).detach().cpu().to(torch.float64).numpy()
@@ -813,8 +819,9 @@ def fit_probe(
 
     The objective is the checkpoint's own: the masked block score of
     :func:`~teb_vae.lag_attn_rws.nets.losses.masked_raw_block_per_anchor`, averaged over
-    contributing anchors, so the probe is optimising exactly the quantity $D_{\mathrm{base}}$ is
-    measured in.
+    contributing anchors and scored under the checkpoint's cell mask and AR(1) coefficient, so the
+    probe is optimising exactly the quantity $D_{\mathrm{base}}$ is measured in. Both terms are
+    detached: $\phi$ is a checkpoint parameter, and the probe's backward pass must not reach it.
 
     ``shuffle_conditioning`` is the control that separates "the probe learned to read the state"
     from "the probe learned the population mean": the fit pairs each segment's target with
@@ -845,6 +852,7 @@ def fit_probe(
     probe.to(device)
     optimizer = torch.optim.Adam(probe.parameters(), lr=float(learning_rate))
     generator = torch.Generator().manual_seed(int(seed))
+    density = forecast_likelihood_terms(model)
 
     rows = torch.as_tensor(np.asarray(fit_rows, dtype=np.int64), dtype=torch.long)
     state_source = _conditioning_rows(rows, cache, generator) if shuffle_conditioning else rows
@@ -882,7 +890,7 @@ def fit_probe(
             )
             mu, logvar = probe(states)
             block, contributing = masked_raw_block_per_anchor(
-                mu, target, mask, likelihood=likelihood, logvar=logvar
+                mu, target, mask, likelihood=likelihood, logvar=logvar, **density
             )
             loss = (block * contributing).sum() / contributing.sum().clamp_min(1.0)
             optimizer.zero_grad(set_to_none=True)

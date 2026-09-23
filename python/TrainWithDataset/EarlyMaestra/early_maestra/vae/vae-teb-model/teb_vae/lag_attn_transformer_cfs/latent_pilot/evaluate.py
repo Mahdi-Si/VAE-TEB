@@ -86,7 +86,11 @@ import torch
 from loguru import logger
 from tqdm import tqdm
 
-from teb_vae.lag_attn_cfs.eval.metrics import mc_predictive_block, model_inputs
+from teb_vae.lag_attn_cfs.eval.metrics import (
+    forecast_likelihood_terms,
+    mc_predictive_block,
+    model_inputs,
+)
 from teb_vae.lag_attn_rws.nets.losses import (
     kld_tensor,
     masked_prior_rate,
@@ -109,8 +113,8 @@ from teb_vae.lag_attn_transformer_cfs.latent_pilot.config import PilotConfigErro
 #: The per-anchor scalars a preservation pass produces, in a fixed column order.
 #:
 #: ``mse_full`` is the gated quantity: the **deterministic** forecast from $\mu^q$ -- not from a
-#: draw of $z^q$ -- scored against the checkpoint's own gathered target, per coefficient of the
-#: normalized block. ``mse_base`` is the same for $\mu^p$ and moves only if the freeze broke, so it
+#: draw of $z^q$ -- scored against the checkpoint's own gathered target, per scored coefficient of
+#: the normalized block (the checkpoint's scored-cell mask decides which count). ``mse_base`` is the same for $\mu^p$ and moves only if the freeze broke, so it
 #: is an invariant beside the measurement rather than a second result. ``delta_mu_sat`` is the
 #: fraction of an anchor's latent coordinates whose $|\Delta\mu|$ sits at the model's own bound.
 #: The two Monte Carlo columns (``nll_full``, ``nll_base``) are filled only when a draw count is
@@ -523,18 +527,26 @@ def preservation_pass(
 
                 gather_index = anchor_index[:, :, None].expand(-1, -1, d_z)
                 persistence = outputs.get("persistence")
-                block_width = float(horizon * int(model.decoder_out_channels))
+                # A point error of the mean forecast: the scored-cell mask decides which cells
+                # count, the AR(1) term -- a property of the residual density -- does not apply.
+                cell_mask = forecast_likelihood_terms(model)["cell_mask"]
+                block_width = float(
+                    horizon * int(model.decoder_out_channels)
+                    if cell_mask is None
+                    else cell_mask.sum().item()
+                )
                 scores: Dict[str, torch.Tensor] = {}
                 for name, key in (("mse_full", "mu_post"), ("mse_base", "mu_prior")):
                     forecast_mu, _forecast_logvar = model.decoder(
                         outputs[key].gather(1, gather_index), persistence=persistence
                     )
                     block, _contributing = masked_raw_block_per_anchor(
-                        forecast_mu, target, mask, likelihood="mse"
+                        forecast_mu, target, mask, likelihood="mse", cell_mask=cell_mask
                     )
-                    # Per coefficient of the block, on the objective's own fixed divisor rather
-                    # than on each anchor's surviving element count: a per-anchor divisor would
-                    # make the number drift with mask density instead of with forecast error.
+                    # Per scored coefficient of the block, on a fixed divisor -- the block's scored
+                    # cells -- rather than on each anchor's surviving element count: a per-anchor
+                    # divisor would make the number drift with mask density instead of with
+                    # forecast error.
                     scores[name] = block / block_width
 
                 delta = (outputs["mu_post"] - outputs["mu_prior"]).gather(1, gather_index)
@@ -817,8 +829,9 @@ def _preservation_record(
         "n_latent_coordinates_varying": int(np.sum(latent_std > 0.0)),
         "d_z": int(latent.shape[1]),
         "note": (
-            "mse_* are deterministic mean-decoded forecasts per coefficient of the normalized "
-            "block; nll_* are marginal predictive block scores in nats per anchor and are nan when "
+            "mse_* are deterministic mean-decoded forecasts per scored coefficient of the "
+            "normalized block; nll_* are marginal predictive block scores in nats per anchor under "
+            "the checkpoint's own forecast density (scored cells, AR(1) residual) and are nan when "
             "no draws were requested; the training path's pred_gap is a different quantity and is "
             "not this measurement. source_conditioned_kl, prior_rate and kld_active_frac are "
             "pooled over the n_kl_anchors forecast-contributing anchors of every scored batch, "

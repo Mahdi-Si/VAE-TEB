@@ -123,7 +123,9 @@ class SeqVaeLagAttnCfsTask(SeqVaeLagAttnFsTask):
         the dense set it is itself produced at -- and the two the per-window score row needs. Those
         last two are taken from where the objective takes them, the hyperparameter for the
         likelihood and the net for the coverage floor, so a window's height on that row is the
-        block score this run computed rather than one drawn under some other assumption.
+        block score this run computed rather than one drawn under some other assumption. The net's
+        two density terms (``forecast_likelihood_kwargs``) are bound beside them for the same
+        reason.
 
         Returns:
             A callable taking one
@@ -151,6 +153,13 @@ class SeqVaeLagAttnCfsTask(SeqVaeLagAttnFsTask):
             forecast_clock_delay_s=(
                 None if budget is None else budget.target_forecast_clock_delay_s
             ),
+            # The rest of the objective's density -- the scored-cell mask and the AR(1)
+            # coefficient -- so a window's score row is a partial sum of the block scores in the
+            # page's title. Detached: the page draws, it never backpropagates.
+            **{
+                name: None if value is None else value.detach()
+                for name, value in model.forecast_likelihood_kwargs().items()
+            },
         )
 
     @property

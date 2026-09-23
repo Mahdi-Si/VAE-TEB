@@ -1254,8 +1254,9 @@ def build_run_context(
                 "the end-of-ramp beta, for re-deriving the spike breaker's additive_margin; the "
                 "raw KL stands in for the trained one (exact at free_bits 0.0), and the prior "
                 "scale rate contributes only when the collection recorded it (exact at "
-                "beta_prior 0.0). Every block magnitude here is per anchor over H*C_keep "
-                "coefficients, so it is comparable only against a run at the same warm-up budget."
+                "beta_prior 0.0). Every block magnitude here is per anchor over the scored "
+                "coefficients of the H*C_keep block (see likelihood_structure), so it is "
+                "comparable only against a run at the same warm-up budget and scored horizon."
             ),
         },
     }
@@ -1434,6 +1435,14 @@ def main(
                 f"time and does NOT apply it."
             )
         logger.info(describe_arm(run_arm))
+        # The forecast density, beside the arm: whether the horizon is scored under an AR(1)
+        # residual and how many of the block's cells are scored at all. Off the model when there
+        # is one; a re-read takes it from the tables' own record below.
+        likelihood_structure: Optional[Dict[str, Any]] = (
+            None if task is None else metrics.likelihood_structure_record(task.orig_model)
+        )
+        if likelihood_structure is not None:
+            logger.info(metrics.describe_likelihood_structure(likelihood_structure))
 
         collection, probe_record, loader = load_or_collect_tables(
             results_dir,
@@ -1451,6 +1460,8 @@ def main(
         )
         if task is None:
             delay_steps = int((collection.results.get("lag") or {}).get("delay_steps") or 0)
+            likelihood_structure = collection.record.get("likelihood_structure")
+            logger.info(metrics.describe_likelihood_structure(likelihood_structure))
 
         # Seeded before the analyses so the headline, the sanity block and any analysis that
         # reads a readout all see the same numbers. Into a *separate* mapping: the collection's
@@ -1539,6 +1550,10 @@ def main(
             # Which arm this is, on the page rather than to be reconstructed from a config file
             # that may no longer exist. The console prints the same block as one line.
             "run_arm": run_arm,
+            # The forecast density every nll_*, gap and skill here was scored under: the AR(1)
+            # residual with its per-block mean coefficient, and the scored cells out of the
+            # block's H * C_keep. Null on a re-read of tables collected before it was recorded.
+            "likelihood_structure": likelihood_structure,
             "eval_config": eval_config,
             # Read back from global state rather than echoed from the assignments, so the record
             # is what was in force rather than what was asked for.

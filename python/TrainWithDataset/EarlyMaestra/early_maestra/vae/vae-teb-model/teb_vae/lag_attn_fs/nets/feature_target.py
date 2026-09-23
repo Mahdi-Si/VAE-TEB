@@ -102,6 +102,26 @@ class FeatureForecastTarget:
     #: attribute, which is the whole cost of keeping it a buffer.
     target_channel_weight: Optional[torch.Tensor]
 
+    def forecast_likelihood_kwargs(self) -> Dict[str, Optional[torch.Tensor]]:
+        r"""The two terms that define the forecast *density* rather than weight it.
+
+        ``cell_mask`` is the per-channel scored horizon $(H, C)$ and ``ar_coef`` the AR(1)
+        residual coefficient $\phi_c = \tanh(a_c)$, $(C,)$; see
+        :func:`~teb_vae.lag_attn_rws.nets.losses.raw_sample_score`. Unlike
+        ``target_channel_weight`` and ``horizon_weight`` -- objective weights the evaluation
+        deliberately leaves out -- both belong to the likelihood itself, so **every** site that
+        scores a forecast of this model, training and evaluation alike, passes this dict. A cell that
+        built neither gets ``None`` for both, which is the factorised all-cells score, bitwise.
+
+        Returns:
+            ``{'cell_mask': ..., 'ar_coef': ...}``.
+        """
+        ar_logit = getattr(self, "target_ar_logit", None)
+        return {
+            "cell_mask": getattr(self, "target_cell_mask", None),
+            "ar_coef": None if ar_logit is None else torch.tanh(ar_logit),
+        }
+
     def _default_decoder_out_channels(self) -> int:
         r"""One output per surviving target channel: $C_{\mathrm{keep}}$, or $c_y$ ungated.
 
@@ -298,6 +318,8 @@ class FeatureForecastTarget:
                 # are printed beside -- which is the only property that makes them worth reporting.
                 channel_weight=getattr(self, "target_channel_weight", None),
                 horizon_weight=getattr(self, "horizon_weight", None),
+                step_mask=mask,
+                **self.forecast_likelihood_kwargs(),
             ) * mask[..., None]
             return score.sum(dim=(0, 1, 3)), score.sum(dim=(0, 1, 2))
 
@@ -426,6 +448,8 @@ class FeatureForecastTarget:
             # The same contract on the horizon axis: ``None`` unless a halflife was configured, and
             # applied at the same site, so the gap splits below must carry it for the same reason.
             horizon_weight=getattr(self, "horizon_weight", None),
+            # The scored-cell mask and the AR(1) residual: part of the density, not weights.
+            **self.forecast_likelihood_kwargs(),
         )
         # Added here rather than inside the objective: the raw-signal models' block has one
         # physical channel and thirty horizon steps of one signal, so neither split says anything

@@ -10,14 +10,18 @@ So parity is a tested property on **both** edges of the square:
 
 * against ``teb_vae/lag_attn_cfs/configs/default.yaml`` every leaf must agree outside
   :data:`ENCODER_EDGE_EXEMPT_PATHS` -- the identity keys, the seven encoder keys, the five conv-LSTM
-  keys they replace, ``lr_warmup_steps`` and the re-derived gradient clip;
+  keys they replace, ``lr_warmup_steps``, the re-derived gradient clip, and the leaves of the
+  2026-09-23 final revision (:data:`FINAL_REVISION_PATHS`);
 * against ``teb_vae/lag_attn_transformer_fs/configs/default.yaml`` every leaf must agree outside
   :data:`TARGET_EDGE_EXEMPT_PATHS` -- the identity keys, the dataset, the one-sided geometry, the
-  three keys that have no two-sided counterpart, and the two loss-scale constants this target domain
-  re-derived.
+  keys that have no two-sided counterpart, the two loss-scale constants this target domain
+  re-derived, and the final-revision leaves the two-sided cell shares.
 
-The two exemption sets are disjoint except for the identity keys, which is what makes the square
-close: a key that had to be exempted on both edges would be one neither comparison could read.
+**The final revision breaks the square on purpose.** This cell carries the owner's 2026-09-23 final
+revision and neither sibling does, so its leaves are declared divergences on whichever edge shares
+them. Outside those leaves the two exemption sets are still disjoint except for the identity keys
+and the gradient clip, which is what keeps the square readable for everything the revision did not
+touch.
 """
 from __future__ import annotations
 
@@ -69,9 +73,12 @@ DECLARED_CONFIG_FILES = frozenset(
         "sweep_anchor_stride_1.yaml",
         "sweep_lag_bias_decay.yaml",
         "sweep_align_target_max.yaml",
-        "sweep_lag_kv_adapter.yaml",
-        "sweep_source_dropout_02.yaml",
+        # The previous K/V memory, as the comparator for the 2026-09-23 move to `adapter`.
+        "sweep_lag_kv_conv_stem.yaml",
         "sweep_source_dropout_03.yaml",
+        # The two likelihood ablations of the 2026-09-23 final revision.
+        "sweep_factorised_likelihood.yaml",
+        "sweep_all_cells_scored.yaml",
         # The forecast-clock pair: the stored arm restores today's target and tiling exactly, the
         # input arm scores the continuation of the encoder's own aligned stream.
         "sweep_target_clock_input.yaml",
@@ -128,6 +135,10 @@ TASK_LEVEL_KEYS = (
     # attribute exactly as the leg alignment is; a resolver expectation, not a constructor key.
     "causal_phase_operator",
     "causal_reach_budget_s",
+    # The per-channel scored-horizon rule: resolved by the trainer against the shards' phase-leg
+    # frequencies into the `target_scored_horizon` tuple the constructor takes.
+    "target_phase_fast_cutoff_hz",
+    "target_phase_fast_horizon",
 )
 
 #: The seven keys this architecture adds, all of them describing the encoders being swapped in.
@@ -151,6 +162,28 @@ _IDENTITY_PATHS = (
 
 _VAE = "model_config.VAE_model"
 
+#: The leaves the owner's 2026-09-23 FINAL REVISION moved in this cell and in no sibling. The conv-LSTM
+#: causal cell is deliberately not revised, so each of these is a declared divergence on the encoder
+#: edge; the ones the two-sided cell also carries are declared on the target edge too.
+FINAL_REVISION_PATHS: Dict[str, str] = {
+    f"{_VAE}.horizon": "final revision: H back to 30 in this cell only",
+    f"{_VAE}.anchor_stride": "final revision: S = H / 2 follows the horizon",
+    f"{_VAE}.horizon_weight_halflife_steps": "final revision: half-life = H",
+    f"{_VAE}.max_lag": "final revision: 37 in this cell only",
+    f"{_VAE}.lag_kv_source": "final revision: the one-step adapter memory",
+    f"{_VAE}.source_dropout": "final revision: 0.2 on the source pathway alone",
+    "advanced_config.spike_breaker.additive_margin": (
+        "final revision: scaled by the block ratio with the horizon, not re-measured"
+    ),
+}
+
+#: The keys the final revision ADDED, present in this config and in neither sibling's.
+FINAL_REVISION_KEYS = (
+    "forecast_ar_residual",
+    "target_phase_fast_cutoff_hz",
+    "target_phase_fast_horizon",
+)
+
 #: The ENCODER edge: what may differ from the conv-LSTM causal cell, and why. Anything not here must
 #: be identical, because a difference outside this list would be attributed to the encoder by every
 #: reading of the two runs.
@@ -166,10 +199,10 @@ ENCODER_EDGE_EXEMPT_PATHS: Dict[str, str] = {
         "re-derived for this encoder at the same block and anchor count; the measurement is "
         "recorded in the config"
     ),
-    # `horizon`, `anchor_stride`, `horizon_weight_halflife_steps` and `additive_margin` are
-    # deliberately ABSENT: both cfs cells moved to H = 10 / S = 5 / half-life 5 / margin 2.2e+3
-    # together on 2026-09-05, so the four leaves are pinned equal by the parity test below rather
-    # than exempted, and the encoder edge still differs in the encoder alone.
+    # The transformer cell carries the 2026-09-23 final revision and the conv-LSTM cell does not,
+    # so the encoder edge no longer differs in the encoder alone: every final-revision leaf is
+    # declared here rather than the conv-LSTM config being edited to follow.
+    **FINAL_REVISION_PATHS,
 }
 
 #: The TARGET edge: what may differ from the conv-Transformer two-sided cell.
@@ -183,10 +216,8 @@ TARGET_EDGE_EXEMPT_PATHS: Dict[str, str] = {
     ),
     f"{_VAE}.c_y": "the one-sided cascade keeps 36 + 66 rather than 43 + 66",
     f"{_VAE}.c_u": "the one-sided cascade keeps 36 + 15 rather than 43 + 15",
-    # `horizon` is back on this edge since 2026-09-05: this cell forecasts 10 steps and the two-sided
-    # cell 30, so the two no longer share a horizon axis either. The BLOCK differs as it always did
-    # (10 * 76 against 30 * 78) because C_keep is what the budget decides.
-    f"{_VAE}.horizon": "this cell forecasts 10 steps since 2026-09-05; the two-sided cell 30",
+    # `horizon` is OFF this edge again since 2026-09-23: both cells forecast 30 steps. The BLOCK
+    # differs as it always did because C_keep is what the budget decides.
     f"{_VAE}.warmup_period": "the anchor floor the warm-up budget pairs with",
     f"{_VAE}.causal_reach_budget_s": "undefined on this dataset; the resolver refuses a value",
     f"{_VAE}.causal_warmup_budget_steps": "no two-sided counterpart",
@@ -205,6 +236,9 @@ TARGET_EDGE_EXEMPT_PATHS: Dict[str, str] = {
     "advanced_config.trainer.gradient_clip_val": (
         "measured at this block and anchor count, which the target domain moves"
     ),
+    # The final-revision leaves the two-sided cell also carries (the rest are absent there).
+    f"{_VAE}.max_lag": FINAL_REVISION_PATHS[f"{_VAE}.max_lag"],
+    f"{_VAE}.source_dropout": FINAL_REVISION_PATHS[f"{_VAE}.source_dropout"],
     # The training controls. Only these two appear here: the comparison config has no
     # `secondary_monitor` key at all and the six architecture switches are absent from it too, and
     # this edge compares the paths the two files SHARE -- so a key one side does not have is not a
@@ -442,8 +476,10 @@ def test_the_shipped_config_builds_a_decoder_as_wide_as_the_budget_keeps(tmp_pat
     model = SeqVaeLagAttnTrfCfs(**kwargs)
     assert model.decoder.mean_head.out_features == KEPT_TARGET_CHANNELS
     assert model.raw_per_step == 16  # untouched by the width
-    # 10 x 76: the horizon this cell moved to on 2026-09-05 over the integer operator's survivors.
-    assert model.horizon * model.decoder_out_channels == 760
+    # H x C_keep: the shipped horizon over the integer operator's survivors.
+    shipped_horizon = _get(load_config(str(_CONFIG)), f"{_VAE}.horizon")
+    assert model.horizon == shipped_horizon
+    assert model.horizon * model.decoder_out_channels == shipped_horizon * KEPT_TARGET_CHANNELS
 
 
 def test_the_shipped_geometry_pairs_the_floor_with_the_budget(shipped):
@@ -460,22 +496,32 @@ def test_the_shipped_geometry_pairs_the_floor_with_the_budget(shipped):
 
 
 def test_the_anchor_stride_pairs_with_the_forecast_clock(shipped):
-    """The three travel together: the stored clock's ceiling is T_valid = 300 - H, so at H = 10 the
-    anchor span [134, 290) holds 156 anchors, and S = H / 2 = 5 tiles it into 31-32 training tiles
-    per sample. Asserted rather than defaulted, so a horizon change that left the stride or the
-    half-life behind -- a different tile count and a different weight profile, silently -- fails
-    here rather than training a different objective."""
+    r"""The three travel together: the stored clock's ceiling is $T_\mathrm{valid} = T - H$, and
+    the final revision's rules are $S = H / 2$ and half-life $= H$. Asserted as rules rather than
+    literals, so a horizon change that left the stride or the half-life behind -- a different tile
+    count and a different weight profile, silently -- fails here rather than training a different
+    objective. The fast scored horizon must lie inside the horizon, or the resolver refuses it."""
     vae = _get(shipped, _VAE)
 
     assert vae["causal_target_forecast_clock"] == "stored"
-    assert vae["horizon"] == 10
-    assert vae["anchor_stride"] == 5 == vae["horizon"] // 2
-    assert vae["horizon_weight_halflife_steps"] == 5.0 == vae["horizon"] / 2
+    assert vae["anchor_stride"] == vae["horizon"] // 2
+    assert vae["horizon_weight_halflife_steps"] == float(vae["horizon"])
+    assert 1 <= vae["target_phase_fast_horizon"] <= vae["horizon"]
     assert vae["lag_floor"] == 0
     # The span and the tile count the config comments state, derived the way the net derives them.
     span = vae["sequence_length"] - vae["horizon"] - vae["warmup_period"]
-    assert span == 156
-    assert -(-span // vae["anchor_stride"]) == 32
+    assert span > vae["anchor_stride"]
+    assert -(-span // vae["anchor_stride"]) >= 2
+
+
+def test_the_decoder_depth_still_covers_the_horizon(shipped):
+    r"""The family's receptive-field criterion $\mathrm{RF} = 1 + (k-1)(2^d - 1) \ge H + 1$ over the
+    horizon axis. Nothing in the net ties the depth to the horizon, so a longer horizon that left
+    the depth behind would decode its far tokens from a core that cannot see the near ones."""
+    vae = _get(shipped, _VAE)
+    receptive_field = 1 + (vae["horizon_kernel"] - 1) * (2 ** vae["horizon_depth"] - 1)
+
+    assert receptive_field >= vae["horizon"] + 1
 
 
 # --------------------------------------------------------------------------------------
@@ -503,10 +549,11 @@ def test_every_comparable_leaf_equals_the_encoder_siblings_value(shipped, encode
         differing - set(ENCODER_EDGE_EXEMPT_PATHS)
     )
 
-    # And the key sets differ only where the encoder does.
+    # And the key sets differ only where the encoder does, plus the keys the final revision added.
     assert set(mine) - set(theirs) == {
         "general_config.lr_warmup_steps",
         *(f"{_VAE}.{key}" for key in ENCODER_KEYS),
+        *(f"{_VAE}.{key}" for key in FINAL_REVISION_KEYS),
     }
     assert set(theirs) - set(mine) == {f"{_VAE}.{key}" for key in CONV_LSTM_ONLY_KEYS}
 
@@ -574,6 +621,8 @@ def test_every_comparable_leaf_equals_the_target_siblings_value(shipped, target_
         f"{_VAE}.alibi_slope_scale",
         # The second checkpoint criterion. Absent there, and absence builds no second callback.
         "advanced_config.callbacks.model_checkpoint.secondary_monitor",
+        # The final revision's likelihood keys, which no sibling carries.
+        *(f"{_VAE}.{key}" for key in FINAL_REVISION_KEYS),
     }
     assert set(theirs) - set(mine) == set()
 
@@ -592,55 +641,69 @@ def test_the_target_edge_declares_no_exemption_that_is_no_longer_a_divergence(
     assert stale == []
 
 
-#: The keys exempt on BOTH edges, and therefore readable across neither: the identity keys and the
-#: gradient clip alone. Written out and pinned rather than derived, so a key appearing here would be
-#: a new divergence nobody declared. (For part of 2026-09-05 the horizon leaves sat here too, while
-#: this cell had moved off 30 steps and the conv-LSTM cell had not; the conv-LSTM cell was mirrored the
-#: same day and they left.)
-_EXEMPT_ON_BOTH_EDGES = set(_IDENTITY_PATHS) | {"advanced_config.trainer.gradient_clip_val"}
+#: The keys exempt on BOTH edges, and therefore readable across neither: the identity keys, the
+#: gradient clip, and the final-revision leaves both siblings carry at their pre-revision values
+#: (``max_lag``, ``source_dropout`` and the spike margin). Written out and pinned rather than
+#: derived, so a key appearing here would be a new divergence nobody declared. The final-revision
+#: three are the price of revising this cell alone, and are read against this cell's own sweep arms
+#: rather than across either edge.
+_EXEMPT_ON_BOTH_EDGES = set(_IDENTITY_PATHS) | {
+    "advanced_config.trainer.gradient_clip_val",
+    "advanced_config.spike_breaker.additive_margin",
+    f"{_VAE}.max_lag",
+    f"{_VAE}.source_dropout",
+    # A final-revision leaf on the encoder edge and a key with no two-sided counterpart on the
+    # target edge: exempt twice for two reasons, and read against this cell's own stride arm.
+    f"{_VAE}.anchor_stride",
+}
 
 
 def test_the_two_edges_overlap_only_where_they_must(shipped):
-    """The square closes iff the two allow-lists are disjoint outside the identity keys and the one
-    constant both edges move. A key exempt on both edges is one neither comparison can read, and it
-    would be exempt for two different reasons that nothing forces to agree."""
+    """The square closes iff the two allow-lists are disjoint outside the identity keys, the one
+    constant both edges move, and the declared final-revision leaves. A key exempt on both edges is
+    one neither comparison can read, and it would be exempt for two different reasons that nothing
+    forces to agree."""
     both = set(ENCODER_EDGE_EXEMPT_PATHS) & set(TARGET_EDGE_EXEMPT_PATHS)
 
     assert both == _EXEMPT_ON_BOTH_EDGES
 
 
-def test_the_clip_moved_on_both_edges_and_the_margin_on_only_one(
+#: The block this cell measured its loss-scale constants at before the final revision: the
+#: 2026-09-05 geometry, $H = 10$ over the same $C_\mathrm{keep}$. The revision's two constants are
+#: that block's values scaled by the block ratio, and the config says so.
+_PRE_REVISION_HORIZON = 10
+_PRE_REVISION_CLIP = 3500.0
+_PRE_REVISION_MARGIN = 2.2e3
+
+
+def test_both_loss_scale_constants_are_scaled_by_the_block_ratio_and_the_margin_stays_live(
     shipped, encoder_sibling, target_sibling
 ):
-    """The one asymmetry worth stating as a test. ``additive_margin`` is in nats of the summed block
-    and the encoder edge changes neither the block nor the anchor count, so it must equal the
-    conv-LSTM causal cell's exactly -- and it is the two-sided cell's that differs.
-    ``gradient_clip_val`` is a gradient statistic, which both edges move.
+    """``additive_margin`` and ``gradient_clip_val`` are both statistics of the summed block, and
+    the 2026-09-23 revision moved the block by the horizon ratio with $C_\\mathrm{keep}$ unchanged.
+    Neither was re-measured: both are the pre-revision values times that ratio, which is what the
+    config records and what the headline run must re-derive. Neither equals either sibling's any
+    more -- the conv-LSTM cell did not take the revision.
 
-    Both values were SCALED from the H = 30 measurements by the block ratio $760 / 2940$ when the
-    two cfs cells moved to $H = 10$ together on 2026-09-05, and the config records exactly that. The
-    shared margin has to sit under the reachable magnitude of the two reconstruction terms at this
-    block or the additive test is decoration, so that bound is asserted here beside the equality.
+    The margin has to sit under the reachable magnitude of the two reconstruction terms at this
+    block or the additive test is decoration, so that bound is asserted beside the scaling.
     """
     breaker = "advanced_config.spike_breaker.additive_margin"
     clip = "advanced_config.trainer.gradient_clip_val"
+    vae = _get(shipped, _VAE)
+    ratio = vae["horizon"] / _PRE_REVISION_HORIZON
 
-    assert _get(shipped, breaker) == _get(encoder_sibling, breaker) == 2.2e3
-    assert _get(shipped, breaker) != _get(target_sibling, breaker)
-    assert _get(shipped, clip) == 3500.0
-    assert _get(shipped, clip) != _get(encoder_sibling, clip)
-    assert _get(shipped, clip) != _get(target_sibling, clip)
-    # The shared margin must stay under the reachable magnitude of the two reconstruction terms,
-    # 2 * H * C_keep * |0.5 * (log 2pi + logvar_clamp_lo)| at the shipped log-variance floor of -5,
-    # or the additive spike test is decoration.
-    vae = _get(shipped, _VAE)
-    per_coefficient = 0.5 * (5.0 - math.log(2 * math.pi))
+    assert _get(shipped, breaker) == pytest.approx(_PRE_REVISION_MARGIN * ratio)
+    assert _get(shipped, clip) == pytest.approx(_PRE_REVISION_CLIP * ratio)
+    for sibling in (encoder_sibling, target_sibling):
+        assert _get(shipped, breaker) != _get(sibling, breaker)
+        assert _get(shipped, clip) != _get(sibling, clip)
+    # The margin must stay under the reachable magnitude of the two reconstruction terms,
+    # 2 * H * C_keep * |0.5 * (log 2pi + logvar_clamp_lo)| at the shipped log-variance floor,
+    # or the additive spike test is decoration. The scored-horizon mask only lowers that bound's
+    # attainable part and the AR(1) innovation keeps the per-cell floor, so this is the bound.
+    per_coefficient = 0.5 * (-vae["logvar_clamp"][0] - math.log(2 * math.pi))
     assert _get(shipped, breaker) < 2 * vae["horizon"] * KEPT_TARGET_CHANNELS * per_coefficient
-    # The margin must stay under the reachable magnitude of the two reconstruction terms, which is
-    # 2 * H * C_keep * 0.5 * (log 2pi + 5) at the shipped log-variance floor of -5.
-    vae = _get(shipped, _VAE)
-    reachable = 2 * vae["horizon"] * KEPT_TARGET_CHANNELS * 0.5 * (math.log(2 * math.pi) + 5.0)
-    assert _get(shipped, breaker) < reachable
     # The relative test stays off at the same value on every cell: it is a switch, not a scale.
     floor = "advanced_config.spike_breaker.ema_floor"
     assert _get(shipped, floor) == _get(encoder_sibling, floor) == _get(target_sibling, floor)
@@ -823,10 +886,18 @@ def test_the_resolved_tiny_variant_validates_and_builds(tmp_path, loguru_warning
     # The smoke model is small everywhere except where it must not be: the decoder still emits the
     # production width and the forward still decodes the production tiling, forecast clock
     # included -- the ceiling below is T_valid less the physical clock's 85-step advance.
+    shipped_vae = _get(load_config(str(_CONFIG)), _VAE)
     assert model.d_model == 32
     assert model.decoder_out_channels == KEPT_TARGET_CHANNELS
-    assert model.anchor_stride == 5
-    assert model.horizon == 10
+    assert model.anchor_stride == shipped_vae["anchor_stride"]
+    assert model.horizon == shipped_vae["horizon"]
+    # The final revision's likelihood mechanisms reach the tiny model through the real driver.
+    assert model.forecast_ar_residual is True
+    assert hasattr(model, "target_ar_logit")
+    assert model.target_scored_horizon is not None
+    assert set(model.target_scored_horizon) == {
+        shipped_vae["target_phase_fast_horizon"], shipped_vae["horizon"]
+    }
     # The stored clock advances nothing: every anchor up to T_valid is decoded.
     assert model.target_forecast_shift is None
     assert model.anchor_ceiling == model.geometry.t_valid

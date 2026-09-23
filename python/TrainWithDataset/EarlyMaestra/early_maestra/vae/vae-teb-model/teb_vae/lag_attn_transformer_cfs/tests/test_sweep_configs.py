@@ -5,13 +5,15 @@ decision rather than an oversight. The floor, horizon and depth arms answer ques
 target domain, which ``teb_vae/lag_attn_cfs/configs`` already asks; the encoder arms answer
 questions about the encoder, which ``teb_vae/lag_attn_transformer_rws/configs`` already asks. The
 tiling arm is the only one of those whose answer could differ between the two encoders, because
-what it moves is the per-step gradient noise -- $156$ decoded anchors against $\approx 31$ -- and
-a pre-normalised attention stack is exactly the architecture whose stability is sensitive to that.
+what it moves is the per-step gradient noise -- all $T_\mathrm{valid} - F$ decoded anchors against
+$A_{\max}$ -- and a pre-normalised attention stack is exactly the architecture whose stability is
+sensitive to that.
 
 The **lag** arms beside it exist in both feature-target cells, because every gate that produced
 them was read per parent: the two encoders answer the same question differently and a result on one
-is not a result on the other. The **source-dropout** pair exists here alone, which is the mirror of
+is not a result on the other. The **source-dropout** arm exists here alone, which is the mirror of
 the rule above -- it regularises the source map, and this is the encoder that map is built from.
+The two **likelihood** arms ablate the 2026-09-23 final revision, which only this cell carries.
 
 These tests are a lint, not a fit. They exist so a malformed arm is caught on the development box --
 a key that does not resolve, a stray second delta, a stride left behind by a horizon change, a file
@@ -42,8 +44,7 @@ _VARIANT = "advanced_config.tracking.mlflow.tags.variant"
 #: file whose keys disagree fails against a stated intention instead of against an expression that
 #: would derive the same mistake twice.
 #:
-#: The six declared after the tiling arm carry **three** paths each rather than one: their own
-#: axis, and the two identity keys. The identity pair is not a second delta -- it is the same
+#: Every arm declared after the tiling arm carries its own axis plus the two identity keys. The identity pair is not a second delta -- it is the same
 #: delta, written where a finished run can still be asked which side of the axis it trained on.
 #: Two of them exist in this cell alone: ``source_dropout`` is the one seam that regularises the
 #: source map without touching the target pathway, and this is the encoder whose attention stack
@@ -67,20 +68,29 @@ _ARMS: Dict[str, Dict[str, Any]] = {
         _RUN_NAME: "lag_attn_trf_cfs_align_target_max",
         _VARIANT: "lag_attn_trf_cfs_align_target_max",
     },
-    # The sharp lag memory: keys and values from the adapter output, one step of reach, against the
-    # default's conv stem. The smallest of the three K/V models.
-    "sweep_lag_kv_adapter.yaml": {
-        f"{_VAE}.lag_kv_source": "adapter",
-        _RUN_NAME: "lag_attn_trf_cfs_kv_adapter",
-        _VARIANT: "lag_attn_trf_cfs_kv_adapter",
+    # The previous K/V memory: the conv stem the default shipped until the 2026-09-23 final revision
+    # moved it to the one-step adapter. The comparator for the old key/value choice. (The adapter
+    # and dropout-0.2 arms were deleted that day: both now equal the default.)
+    "sweep_lag_kv_conv_stem.yaml": {
+        f"{_VAE}.lag_kv_source": "conv_stem",
+        _RUN_NAME: "lag_attn_trf_cfs_kv_conv_stem",
+        _VARIANT: "lag_attn_trf_cfs_kv_conv_stem",
     },
-    # The source-regularisation pair. Two points on one axis rather than two axes, which is why
-    # they are two files and not one with two keys.
-    "sweep_source_dropout_02.yaml": {
-        f"{_VAE}.source_dropout": 0.2,
-        _RUN_NAME: "lag_attn_trf_cfs_source_dropout_02",
-        _VARIANT: "lag_attn_trf_cfs_source_dropout_02",
+    # The two likelihood ablations of the final revision, one mechanism each: the factorised
+    # Gaussian along the horizon, and every cell scored.
+    "sweep_factorised_likelihood.yaml": {
+        f"{_VAE}.forecast_ar_residual": False,
+        _RUN_NAME: "lag_attn_trf_cfs_factorised_likelihood",
+        _VARIANT: "lag_attn_trf_cfs_factorised_likelihood",
     },
+    "sweep_all_cells_scored.yaml": {
+        f"{_VAE}.target_phase_fast_cutoff_hz": None,
+        f"{_VAE}.target_phase_fast_horizon": None,
+        _RUN_NAME: "lag_attn_trf_cfs_all_cells_scored",
+        _VARIANT: "lag_attn_trf_cfs_all_cells_scored",
+    },
+    # The source-regularisation axis: the default ships 0.2 since 2026-09-23, so this is the next
+    # point on it.
     "sweep_source_dropout_03.yaml": {
         f"{_VAE}.source_dropout": 0.3,
         _RUN_NAME: "lag_attn_trf_cfs_source_dropout_03",
@@ -94,8 +104,9 @@ _ARMS: Dict[str, Dict[str, Any]] = {
     },
     # The configuration this cell shipped before 2026-09-05, kept as the comparator the promoted
     # default replaced: legacy fractional-phase representation, the dual input reference, the
-    # approximate physical clock and its stride-5 tiling, on the LEGACY shards. The horizon is NOT
-    # part of its delta: it follows the default's H = 10 so the comparison holds the horizon equal.
+    # approximate physical clock and its stride-5 tiling, on the LEGACY shards. The horizon and the
+    # other final-revision leaves are NOT part of its delta: they follow the default, so the
+    # comparison holds them equal.
     "sweep_legacy_dualref_physclock.yaml": {
         f"{_VAE}.c_y": 102,
         f"{_VAE}.c_u": 51,
@@ -230,25 +241,47 @@ def test_the_stride_arm_restores_the_dense_anchor_set():
     at stride 1 the decoded set is the dense range $[F, T_\\mathrm{valid})$ and each target
     coefficient is scored by up to $H$ anchors again."""
     floor, stride, _horizon, t_valid = _geometry(_resolved("sweep_anchor_stride_1.yaml"))
+    default_floor, _s, _h, default_t_valid = _geometry(load_config(str(_DEFAULT)))
 
     assert stride == 1
-    assert -(-(t_valid - floor) // stride) == t_valid - floor == 156
+    assert -(-(t_valid - floor) // stride) == t_valid - floor == default_t_valid - default_floor
 
 
 def test_the_default_pairs_the_stride_with_the_forecast_clock():
-    """The tiling travels with the horizon: on the stored clock the ceiling is T_valid = 300 - H,
-    so H = 10 leaves the 156-anchor span [134, 290), and S = H / 2 = 5 tiles it into 32 tiles at
-    phase 0 and 31 at every other phase. Pinned here as well as in test_config_load.py because
-    this file is where a stride left behind by a horizon change is meant to be caught."""
+    r"""The tiling travels with the horizon: on the stored clock the ceiling is
+    $T_\mathrm{valid} = T - H$, and $S = H / 2$ tiles the span $[F, T_\mathrm{valid})$ into
+    $\lceil (T_\mathrm{valid} - F) / S \rceil$ tiles at phase 0 and one fewer at the last phase
+    whenever the span is not a multiple of $S$. The tile counts are read off the net's own
+    :meth:`_build_anchor_index` rather than restated, so the arithmetic here and the one that runs
+    cannot disagree. Pinned here as well as in test_config_load.py because this file is where a
+    stride left behind by a horizon change is meant to be caught."""
+    import torch
+
+    from teb_vae.lag_attn_cfs.nets.causal_inputs import CausalWarmupInputs
+
     default = load_config(str(_DEFAULT))
     floor, stride, horizon, t_valid = _geometry(default)
+    vae = default["model_config"]["VAE_model"]
 
-    assert default["model_config"]["VAE_model"]["causal_target_forecast_clock"] == "stored"
-    assert horizon == 10
-    assert stride == 5 == horizon // 2
-    assert t_valid - floor == 156
-    assert -(-(t_valid - floor) // stride) == 32
-    assert -(-(t_valid - floor - (stride - 1)) // stride) == 31
+    assert vae["causal_target_forecast_clock"] == "stored"
+    assert stride == horizon // 2
+    assert vae["horizon_weight_halflife_steps"] == float(horizon)
+
+    geometry = type(
+        "_Geometry",
+        (),
+        {"anchor_stride": stride, "horizon": horizon, "warmup_period": floor,
+         "anchor_ceiling": t_valid},
+    )()
+    counts = []
+    for phase in range(stride):
+        _index, valid = CausalWarmupInputs._build_anchor_index(
+            geometry, 1, torch.device("cpu"), anchor_phase=phase
+        )
+        counts.append(int(valid.sum()))
+    a_max = -(-(t_valid - floor) // stride)
+    assert counts[0] == a_max == int(valid.shape[1])
+    assert min(counts) == -(-(t_valid - floor - (stride - 1)) // stride)
 
 
 @pytest.mark.parametrize("name", sorted(_ARMS))

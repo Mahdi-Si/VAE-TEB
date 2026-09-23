@@ -77,6 +77,7 @@ from teb_vae.lag_attn_cfs.eval import cohort, lag_hist, traces
 from teb_vae.lag_attn_cfs.eval import figures_seam as figures
 from teb_vae.lag_attn_cfs.eval._reuse import band_partition, labels
 from teb_vae.lag_attn_cfs.eval.lag_axis import COEFFICIENT_LAG_AXIS_LABEL, GROUP_DELAY_CAVEAT
+from teb_vae.lag_attn_cfs.eval.metrics import forecast_likelihood_terms
 from teb_vae.lag_attn_rws.nets.losses import masked_raw_block_per_anchor, raw_sample_score
 from teb_vae.lag_attn_rws.nets.raw_masks import forecast_mask
 
@@ -183,7 +184,9 @@ READOUT_LAG_BAND = "lag_band"
 #: masked squared error of the mean-decoded full forecast, which the learned variance cannot
 #: trade against, and its base-minus-full gap. The block score is a log-density and a well
 #: calibrated but wide forecast scores it well; the squared error is what a reader means by
-#: "how close was the forecast".
+#: "how close was the forecast". The block scores are taken under the model's own density -- its
+#: scored-cell mask and its AR(1) coefficient -- and the two fidelity readouts under the cell mask
+#: alone, since an error of the mean forecast has no innovation.
 READOUT_NLL_HORIZON = "nll_horizon"
 READOUT_MSE_FULL = "mse_full"
 READOUT_MSE_GAP = "mse_gap"
@@ -492,7 +495,13 @@ class AnchorReadout(nn.Module):
             persistence = outputs.get("persistence")
             if persistence is not None:
                 persistence = persistence[rows, columns][:, None]
-            likelihood = "mse" if name in (READOUT_MSE_FULL, READOUT_MSE_GAP) else self.likelihood
+            fidelity = name in (READOUT_MSE_FULL, READOUT_MSE_GAP)
+            likelihood = "mse" if fidelity else self.likelihood
+            # The density the collection pass scores under, so a block-score readout is the
+            # ``mean_*`` column's own number; the fidelity readouts count the scored cells only.
+            density = forecast_likelihood_terms(model)
+            if fidelity:
+                density["ar_coef"] = None
             gap = name in (READOUT_PRED_GAP, READOUT_MSE_GAP)
             scores: Dict[str, torch.Tensor] = {}
             for branch, key in (("full", "mu_post"), ("base", "mu_prior")):
@@ -505,11 +514,15 @@ class AnchorReadout(nn.Module):
                 if name == READOUT_NLL_HORIZON:
                     # The block score resolved by horizon step: summed over the channels of one
                     # step rather than over the whole block. Summed over steps it is ``nll_full``.
-                    score = raw_sample_score(forecast_mu, target, likelihood=likelihood, logvar=forecast_logvar)
+                    score = raw_sample_score(
+                        forecast_mu, target, likelihood=likelihood, logvar=forecast_logvar,
+                        step_mask=mask, **density,
+                    )
                     scores[branch] = (score * mask[..., None]).sum(dim=3)[:, 0, self.horizon]
                     continue
                 block, _ = masked_raw_block_per_anchor(
-                    forecast_mu, target, mask, likelihood=likelihood, logvar=forecast_logvar
+                    forecast_mu, target, mask, likelihood=likelihood, logvar=forecast_logvar,
+                    **density,
                 )
                 scores[branch] = block[:, 0]
             if gap:

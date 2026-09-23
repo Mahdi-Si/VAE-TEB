@@ -8,18 +8,19 @@
 # stride 1 overlap (H-1)/H, so each target coefficient is scored by up to H anchors: the loss weights
 # every target sample H times and correlates the gradients within one batch element. At stride H the
 # windows partition the timeline, no coefficient is scored twice in a step, and every anchor is still
-# reached over epochs because the per-segment phase rotates. The shipped S = 5 = H / 2 sits between
+# reached over epochs because the per-segment phase rotates. The shipped S = H / 2 sits between
 # the two: windows overlap by half a horizon and each coefficient is scored by two anchors. This arm
-# restores 156 decoded anchors per step against the tiling's ~31, so the per-step loss variance
-# falls by roughly a factor of five -- which is why `gradient_clip_val` and `additive_margin`
-# are inherited rather than re-derived here: both were set at the noisier setting and are therefore
-# loose, not tight, on this arm.
+# restores all T_valid - F dense anchors per step against the tiling's
+# A_max = ceil((T_valid - F) / S) (worked example at the shipped leaves: 136 against 10), so the
+# per-step loss variance falls by roughly a factor of S -- which is why `gradient_clip_val` and
+# `additive_margin` are inherited rather than re-derived here: both were set at the noisier setting
+# and are therefore loose, not tight, on this arm.
 #
-# The memory cost is the reason this is an arm rather than the default: the four forecast tensors and
-# the target go from (B, 32, 10, 76) to (B, 156, 10, 76), which at batch 128 is roughly 61 MB rather
-# than 12 MB EACH in float32. (At H = 30 over 98 channels the same arm cost 206 MB against 7.5 MB.)
+# The memory cost is the reason this is an arm rather than the default: the four forecast tensors
+# and the target go from (B, A_max, H, C_keep) to (B, T_valid - F, H, C_keep) EACH, a factor of
+# about S (worked example at batch 128 in float32: ~12 MB to ~159 MB each).
 #
-# It is the ONE arm this package ships, and the reason is the grid rather than an omission: the floor,
+# It was this package's first arm, and the reason is the grid rather than an omission: the floor,
 # horizon and depth arms answer questions about the target domain, which the conv-LSTM causal cell
 # already asks, and the encoder arms answer questions about the encoder, which
 # `lag_attn_transformer_rws` already asks. The tiling arm is the only one whose answer could differ

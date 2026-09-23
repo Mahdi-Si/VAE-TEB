@@ -982,6 +982,8 @@ def _window_block_scores(
     likelihood: str,
     coverage_floor: float,
     target_forecast_shift: Optional[Sequence[int]] = None,
+    cell_mask: Optional[torch.Tensor] = None,
+    ar_coef: Optional[torch.Tensor] = None,
 ) -> Optional[Dict[str, np.ndarray]]:
     r"""Each drawn window's own block score, under the objective's likelihood and its mask.
 
@@ -997,6 +999,10 @@ def _window_block_scores(
         stitched: The drawn tiling.
         likelihood: ``'mse'`` or ``'gaussian_nll'``, the objective's own.
         coverage_floor: The model's own floor, so an anchor this drops is dropped here too.
+        target_forecast_shift: The model's own forecast clock.
+        cell_mask: The model's $(H, C_{\mathrm{keep}})$ scored-cell mask, or ``None``: part of the
+            density the title's block scores are sums of, so a window scores the same cells.
+        ar_coef: The model's AR(1) coefficient $\phi_c$, or ``None``, for the same reason.
 
     Returns:
         ``{'base': (W,), 'full': (W,)}`` over the drawn windows, or ``None`` when the batch
@@ -1042,7 +1048,8 @@ def _window_block_scores(
                 # predicts scored-clock steps $t+1 \dots t+H$, the forward's own convention.
                 target = gathered[anchor + 1 : anchor + 1 + horizon]
                 per_element = raw_sample_score(
-                    mean[position], target, likelihood=likelihood, logvar=logvar[position]
+                    mean[position], target, likelihood=likelihood, logvar=logvar[position],
+                    cell_mask=cell_mask, ar_coef=ar_coef, step_mask=mask[index, position],
                 )
                 window_scores.append(
                     float((per_element * mask[index, position][:, None]).sum())
@@ -1059,6 +1066,11 @@ def _channel_profile(
     Both are computed over the drawn support alone: outside it there is no forecast, and counting
     an uncovered step as a miss would read as a calibration failure of the model rather than as an
     absence of the figure.
+
+    Under ``forecast_ar_residual`` the decoder's $\sigma$ at $\tau \ge 1$ is the *innovation*
+    scale, narrower than the marginal spread of $x - \mu$, so this band under-reads coverage there;
+    the stitched tiling no longer carries the horizon step an innovation needs. The evaluation's
+    calibration readouts are computed on the innovation and are the ones to read.
 
     Args:
         stitched: The drawn tiling.
@@ -1150,6 +1162,8 @@ def _draw_gap_row(
     coverage_floor: float,
     seconds_per_step: float,
     target_forecast_shift: Optional[Sequence[int]] = None,
+    cell_mask: Optional[torch.Tensor] = None,
+    ar_coef: Optional[torch.Tensor] = None,
 ) -> None:
     r"""Draw ``pred_gap``: each drawn window's block score, base against full, plus the profiles.
 
@@ -1160,6 +1174,8 @@ def _draw_gap_row(
         coverage_floor: The model's own anchor coverage floor.
         seconds_per_step: $\Delta$ in seconds, for placing a window in physical time.
         target_forecast_shift: The model's own forecast clock, for the window scorer.
+        cell_mask: The model's scored-cell mask, for the window scorer.
+        ar_coef: The model's AR(1) coefficient, for the window scorer.
     """
     ax, cax = rows.row_axes("pred_gap")
     cax.set_visible(False)
@@ -1174,6 +1190,8 @@ def _draw_gap_row(
         likelihood=likelihood,
         coverage_floor=coverage_floor,
         target_forecast_shift=target_forecast_shift,
+        cell_mask=cell_mask,
+        ar_coef=ar_coef,
     )
     if scores is None:
         # The row keeps its title, its axis and its place, so the rows below stay column-aligned
@@ -1261,6 +1279,8 @@ def causal_forecast_rows(
     coverage_floor: float = 0.0,
     target_forecast_shift: Optional[Sequence[int]] = None,
     forecast_clock_delay_s: Optional[float] = None,
+    cell_mask: Optional[torch.Tensor] = None,
+    ar_coef: Optional[torch.Tensor] = None,
 ) -> None:
     r"""Draw the causal-feature page's forecast rows, over the anchors the forward decoded.
 
@@ -1301,6 +1321,12 @@ def causal_forecast_rows(
             far before the scored step their content sits, as the input rows state theirs.
             Nothing drawn moves with it: every row stays at the step index, so a column is one
             anchor on the whole page. ``None`` where the page was handed no budget.
+        cell_mask: The model's $(H, C_{\mathrm{keep}})$ scored-cell mask, or ``None``. With
+            ``ar_coef`` it is the rest of the objective's density: bound by the task from the net's
+            own ``forecast_likelihood_kwargs``, so a window's score is a partial sum of the block
+            scores in the page's title. ``None`` scores every cell.
+        ar_coef: The model's AR(1) residual coefficient $\phi_c$, or ``None`` for the factorised
+            score.
 
     Raises:
         KeyError: If the forward dict carries no anchor set.
@@ -1510,4 +1536,6 @@ def causal_forecast_rows(
         coverage_floor=coverage_floor,
         seconds_per_step=seconds_per_step,
         target_forecast_shift=target_forecast_shift,
+        cell_mask=cell_mask,
+        ar_coef=ar_coef,
     )

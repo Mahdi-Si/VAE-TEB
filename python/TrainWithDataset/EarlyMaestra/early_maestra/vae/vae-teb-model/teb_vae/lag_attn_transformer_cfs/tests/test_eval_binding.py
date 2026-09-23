@@ -48,7 +48,7 @@ from .conftest import CONV_LSTM_ONLY_KEYS, _REPO_ROOT, tiny_warmup_kwargs
 #: sequence, not a set -- the order is what the reconciliation record is built in and what a reader of
 #: two runs' preflight files compares down.
 #:
-#: Eighteen of the twenty-five are the conv-LSTM cell's, minus ``causal_norm``, which is not a
+#: Nineteen of the twenty-six are the conv-LSTM cell's, minus ``causal_norm``, which is not a
 #: keyword of this constructor at all. The seven this architecture adds are its encoders'.
 #:
 #: Three of the eighteen are the architecture switches this family's revision added, and each is
@@ -80,6 +80,7 @@ TRF_CFS_GEOMETRY_KEYS = (
     "prior_availability_input",
     "lag_kv_source",
     "persistence_residual",
+    "forecast_ar_residual",
     "encoder_conv_kernels",
     "encoder_conv_dilations",
     "encoder_num_heads",
@@ -114,10 +115,10 @@ def model() -> Any:
 # =================================================================================================
 # The geometry keys
 # =================================================================================================
-def test_the_geometry_keys_are_exactly_the_twenty_five_declared_here() -> None:
+def test_the_geometry_keys_are_exactly_the_twenty_six_declared_here() -> None:
     assert GEOMETRY_KEYS == TRF_CFS_GEOMETRY_KEYS
     assert TRF_CFS_BINDING.geometry_keys is GEOMETRY_KEYS
-    assert len(GEOMETRY_KEYS) == 25
+    assert len(GEOMETRY_KEYS) == 26
     assert len(set(GEOMETRY_KEYS)) == len(GEOMETRY_KEYS), "a duplicate would be compared twice"
 
 
@@ -150,7 +151,12 @@ def test_the_tuple_is_the_cfs_cells_minus_causal_norm_plus_this_architectures_se
         "source_attention_window",
     }
 
-    assert set(GEOMETRY_KEYS) == (set(CFS_GEOMETRY_KEYS) - {"causal_norm"}) | encoder_keys
+    # Plus the one density key only this cell's final revision (2026-09-23) configures.
+    final_revision_keys = {"forecast_ar_residual"}
+
+    assert set(GEOMETRY_KEYS) == (
+        (set(CFS_GEOMETRY_KEYS) - {"causal_norm"}) | encoder_keys | final_revision_keys
+    )
     # And the order of the shared fifteen is the conv-LSTM cell's, so the two reconciliation records
     # are read down the same columns.
     shared = [key for key in GEOMETRY_KEYS if key in set(CFS_GEOMETRY_KEYS)]
@@ -214,6 +220,13 @@ def test_the_override_delta_is_the_cfs_cells_key_for_key_and_value_for_value() -
     with open(CFS_OVERRIDES_PATH, encoding="utf-8") as handle:
         there = yaml.safe_load(handle)
 
+    # The one declared divergence: the occlusion bands must lie inside the model's own window, and
+    # only this cell's final revision (2026-09-23) shortened ``max_lag``. Both still partition a
+    # window from lag 0 into the same four named bands.
+    here_bands = here["eval_config"].pop("occlusion_bands")
+    there_bands = there["eval_config"].pop("occlusion_bands")
+    assert list(here_bands) == list(there_bands)
+    assert here_bands["anchor"][0] == there_bands["anchor"][0] == 0
     assert here == there
     # Non-vacuity: both must actually carry the blocks a difference could hide in.
     assert set(here) >= {"general_config", "dataset_config", "eval_config"}

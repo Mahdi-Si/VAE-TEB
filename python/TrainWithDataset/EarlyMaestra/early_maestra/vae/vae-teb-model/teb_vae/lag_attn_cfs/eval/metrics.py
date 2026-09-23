@@ -45,6 +45,15 @@ carries the numbers that produced it. A label with no numbers behind it is a cla
 cannot check. Ten here against the sibling's eight; the two additions are
 ``coupling_exceeds_availability_clock`` and ``anchor_geometry_intact``.
 
+**Every forecast is scored under the density the model trained under.** Two terms of the
+objective are part of the likelihood rather than weights on it -- the per-channel scored horizon
+$m_{\tau,c} = \mathbb 1[\tau < H_c]$ and the AR(1) residual coefficient $\phi_c$ -- and
+:func:`forecast_likelihood_terms` hands both to every density readout here: the block scores, the
+Monte Carlo marginal, the per-channel and per-horizon splits, the baselines and the calibration.
+The point-error readouts take the cell mask alone, since a squared error of the mean forecast has
+no innovation. The two objective *weights* (``target_channel_weight``, ``horizon_weight``) stay
+out, as they always have: they would turn a log-density into a weighted score.
+
 One aggregation decision runs through all of it: **quantities are averaged per recording, then
 across recordings.** Anchors are not independent samples of anything -- consecutive anchors'
 forecast windows overlap in $H - 1$ of their $H$ horizon steps at the dense evaluation geometry, and
@@ -93,6 +102,7 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 from teb_vae.lag_attn.nets.lag_report import (
     lag_compensated_seconds,
@@ -352,6 +362,142 @@ NORMALISED_UNIT = "normalised"
 
 
 # =============================================================================
+# The likelihood structure
+# =============================================================================
+def forecast_likelihood_terms(model: Any) -> Dict[str, Optional[torch.Tensor]]:
+    r"""The two terms that define the model's forecast *density*, detached, for every site here.
+
+    ``cell_mask`` is the $(H, C_{\mathrm{keep}})$ scored-cell mask
+    $m_{\tau,c} = \mathbb 1[\tau < H_c]$ and ``ar_coef`` the $(C_{\mathrm{keep}},)$ AR(1)
+    coefficient $\phi_c = \tanh(a_c)$ of the residual along the horizon, both from the model's own
+    ``forecast_likelihood_kwargs`` -- the dict its objective passes -- so an evaluated block is the
+    joint negative log-density the model trained under, over the same scored cells and on the same
+    innovations. ``None`` for a model that built neither, which leaves every score bitwise the
+    factorised all-cells one.
+
+    Detached because nothing in the evaluation may reach the checkpoint's parameters: $\phi$ is a
+    parameter, and the oracle probe's optimiser backpropagates through a block score scored under
+    it.
+
+    Args:
+        model: The rebuilt net.
+
+    Returns:
+        ``{'cell_mask': ..., 'ar_coef': ...}``, each a tensor or ``None``.
+    """
+    return {
+        name: None if value is None else value.detach()
+        for name, value in model.forecast_likelihood_kwargs().items()
+    }
+
+
+def forecast_innovation(
+    mu: torch.Tensor,
+    target: torch.Tensor,
+    ar_coef: Optional[torch.Tensor] = None,
+    step_mask: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    r"""The residual each cell's predictive density is actually about.
+
+    $$e_\tau = r_\tau - \phi_c\, r_{\tau-1}, \qquad r = x - \mu, \qquad r_{-1} = 0,$$
+
+    the same innovation :func:`~teb_vae.lag_attn_rws.nets.losses.raw_sample_score` scores, so a
+    calibration statistic standardised by $\sigma$ describes the conditional density the block NLL
+    is a sum of. ``ar_coef=None`` returns $r$ itself.
+
+    Args:
+        mu: Forecast mean, broadcastable to $(B, A_{\max}, H, C_{\mathrm{keep}})$.
+        target: The gathered forecast target $(B, A_{\max}, H, C_{\mathrm{keep}})$.
+        ar_coef: $\phi_c$, $(C_{\mathrm{keep}},)$, or ``None``.
+        step_mask: The forecast mask $(B, A_{\max}, H)$, or ``None``. A masked step's residual is
+            not lagged, so the recursion restarts after a gap exactly as ``raw_sample_score`` does.
+
+    Returns:
+        The innovation, the broadcast shape of ``target - mu``.
+    """
+    residual = target - mu
+    if ar_coef is None:
+        return residual
+    lagged = residual if step_mask is None else residual * step_mask[..., None]
+    return residual - ar_coef * F.pad(lagged[..., :-1, :], (0, 0, 1, 0))
+
+
+def _scored_cells(mask: torch.Tensor, cell_mask: Optional[torch.Tensor]) -> torch.Tensor:
+    r"""The per-coefficient scoring weight $m_{b,a,\tau}\, m_{\tau,c}$, broadcastable to the block.
+
+    Args:
+        mask: The forecast mask $(B, A_{\max}, H)$.
+        cell_mask: The $(H, C_{\mathrm{keep}})$ scored-cell mask, or ``None``.
+
+    Returns:
+        $(B, A_{\max}, H, 1)$ without a cell mask, $(B, A_{\max}, H, C_{\mathrm{keep}})$ with one.
+    """
+    weights = mask[..., None]
+    return weights if cell_mask is None else weights * cell_mask
+
+
+def likelihood_structure_record(model: Any) -> Dict[str, Any]:
+    r"""State which forecast density this model is scored under, for the summary and the console.
+
+    The two AR(1) means are split by stored block through the gate's keep-index, as every other
+    st/ph split here is (:func:`target_block_membership`), because $\phi$ is expected to differ
+    between the slowly varying envelopes and the phase products.
+
+    Args:
+        model: The rebuilt net.
+
+    Returns:
+        ``forecast_ar_residual``, the per-block mean $\phi_c$ (``None`` without the AR term or
+        without a channel in that block), ``scored_cells`` -- the cells per anchor the block sums
+        over -- and ``block_cells``, $H \cdot C_{\mathrm{keep}}$.
+    """
+    terms = forecast_likelihood_terms(model)
+    cell_mask, ar_coef = terms["cell_mask"], terms["ar_coef"]
+    block_cells = int(model.horizon) * int(model.decoder_out_channels)
+
+    def _block_mean(selector: torch.Tensor) -> Optional[float]:
+        if ar_coef is None or not bool(selector.any()):
+            return None
+        return float(ar_coef.cpu()[selector].mean())
+
+    first = target_block_membership(model, torch.device("cpu"), torch.float32) > 0.5
+    return {
+        "forecast_ar_residual": ar_coef is not None,
+        "ar_coef_mean_st": _block_mean(first),
+        "ar_coef_mean_ph": _block_mean(~first),
+        "scored_cells": block_cells if cell_mask is None else int(cell_mask.sum().item()),
+        "block_cells": block_cells,
+    }
+
+
+def describe_likelihood_structure(record: Optional[Mapping[str, Any]]) -> str:
+    """One console line for :func:`likelihood_structure_record`.
+
+    Args:
+        record: The record, or ``None`` on a re-read of a run collected before it existed.
+
+    Returns:
+        The line.
+    """
+    if not record:
+        return "likelihood structure: not recorded by the pass that collected these tables"
+
+    def _phi(value: Any) -> str:
+        return "n/a" if value is None else f"{float(value):+.3f}"
+
+    ar = (
+        f"AR(1) residual on, mean phi st {_phi(record.get('ar_coef_mean_st'))} / "
+        f"ph {_phi(record.get('ar_coef_mean_ph'))}"
+        if record.get("forecast_ar_residual")
+        else "AR(1) residual off"
+    )
+    return (
+        f"likelihood structure: {ar}; {record.get('scored_cells')} of "
+        f"{record.get('block_cells')} block cells scored per anchor"
+    )
+
+
+# =============================================================================
 # Monte Carlo predictive scores
 # =============================================================================
 def marginalise_block_scores(block_scores: torch.Tensor, likelihood: str) -> torch.Tensor:
@@ -410,7 +556,8 @@ def mc_predictive_block(
     $K$ draws into a multi-hour pass. The gather is the model's own, one line of its ``forward``.
 
     Args:
-        model: The net, for its shared decoder.
+        model: The net, for its shared decoder and its forecast density
+            (:func:`forecast_likelihood_terms`).
         branches: ``{name: (mu, logvar)}`` latent parameters, each $(B, T, d_z)$. Every branch
             must share a shape; the first one's shape fixes the noise draw.
         target: The gathered forecast target $(B, A_{\max}, H, C_{\mathrm{keep}})$.
@@ -452,6 +599,9 @@ def mc_predictive_block(
     # and every draw, and rebuilding it per draw would be the only per-draw allocation here that
     # carries no information.
     gather_index = anchors.to(torch.long)[:, :, None].expand(-1, -1, reference_mu.shape[-1])
+    # The model's own density: each draw's block is the joint NLL over the scored cells, so the
+    # log-mean-exp below marginalises the likelihood the objective trained, not a factorised one.
+    density = forecast_likelihood_terms(model)
     draws: Dict[str, List[torch.Tensor]] = {name: [] for name in branches}
     contributing: Optional[torch.Tensor] = None
 
@@ -475,7 +625,8 @@ def mc_predictive_block(
                 latent.gather(1, gather_index), persistence=persistence
             )
             block, contributing = masked_raw_block_per_anchor(
-                forecast_mu, target, mask, likelihood=likelihood, logvar=forecast_logvar
+                forecast_mu, target, mask, likelihood=likelihood, logvar=forecast_logvar,
+                **density,
             )
             draws[name].append(block)
 
@@ -517,7 +668,8 @@ def mean_decoded_block(
     ``nll_full_block`` by the one posterior draw the training path took.
 
     Args:
-        model: The net, for its shared decoder.
+        model: The net, for its shared decoder and its forecast density
+            (:func:`forecast_likelihood_terms`).
         branches: ``{name: (mu, logvar)}`` latent parameters, each $(B, T, d_z)$. Only ``mu`` is
             read; ``logvar`` travels so the same dict the Monte Carlo estimator takes can be
             handed here unchanged.
@@ -539,6 +691,7 @@ def mean_decoded_block(
         raise ValueError("mean_decoded_block needs at least one branch to score")
     reference_mu = next(iter(branches.values()))[0]
     gather_index = anchors.to(torch.long)[:, :, None].expand(-1, -1, reference_mu.shape[-1])
+    density = forecast_likelihood_terms(model)
     scores: Dict[str, torch.Tensor] = {}
     contributing: Optional[torch.Tensor] = None
     for name, (mu, _) in branches.items():
@@ -546,7 +699,8 @@ def mean_decoded_block(
             mu.gather(1, gather_index), persistence=persistence
         )
         block, contributing = masked_raw_block_per_anchor(
-            forecast_mu, target, mask, likelihood=likelihood, logvar=forecast_logvar
+            forecast_mu, target, mask, likelihood=likelihood, logvar=forecast_logvar,
+            **density,
         )
         scores[name] = block
     assert contributing is not None  # the loop above ran at least once
@@ -594,6 +748,13 @@ def baseline_forecasts(
 
     Every forecast is returned at a *broadcastable* shape rather than expanded over the horizon,
     which the scorer does for free.
+
+    **The caller scores them under the model's own density** -- the same ``cell_mask`` and the same
+    ``ar_coef`` (:func:`forecast_likelihood_terms`) -- so a model-against-baseline comparison is two
+    joint densities of one family over one scored cell set. A baseline is a point predictor with no
+    $\phi$ of its own; handing it the model's makes the skill a comparison of *means* under one
+    residual model rather than of two residual models, and a factorised baseline beside an AR(1)
+    model would credit the model with the correlation structure alone.
 
     Args:
         target_features: The loader-normalized target stream $(B, T, c_y)$, at the declared width.
@@ -646,13 +807,21 @@ def baseline_forecasts(
 
 
 def masked_raw_error_sums(
-    mu: torch.Tensor, target: torch.Tensor, mask: torch.Tensor
+    mu: torch.Tensor,
+    target: torch.Tensor,
+    mask: torch.Tensor,
+    *,
+    cell_mask: Optional[torch.Tensor] = None,
 ) -> Dict[str, torch.Tensor]:
     r"""Per-sample sums of the forecast residual, its magnitude and its square.
 
     $$e = \hat{x} - x, \qquad
     S^{1}_b = \sum m\,e, \quad S^{|1|}_b = \sum m\,|e|, \quad S^{2}_b = \sum m\,e^2,
-    \quad n_b = C_{\mathrm{keep}} \sum_{a,\tau} m_{b,a,\tau}.$$
+    \quad n_b = \sum_{a,\tau,c} m_{b,a,\tau}\, m_{\tau,c},$$
+
+    with $m_{\tau,c}$ the model's scored-cell mask, or $1$ without one -- so
+    $n_b = C_{\mathrm{keep}} \sum_{a,\tau} m_{b,a,\tau}$ there. A point error has no innovation, so
+    the AR(1) term plays no part here: $e$ is the plain error of the mean forecast.
 
     Sums rather than finished statistics, and the reason is Jensen: an RMSE is the square root of
     a mean, and averaging finished per-sample RMSEs across a recording is biased **low** -- in the
@@ -666,20 +835,27 @@ def masked_raw_error_sums(
         mu: Forecast mean, broadcastable to $(B, A_{\max}, H, C_{\mathrm{keep}})$.
         target: The gathered forecast target $(B, A_{\max}, H, C_{\mathrm{keep}})$.
         mask: The forecast mask $(B, A_{\max}, H)$.
+        cell_mask: The model's $(H, C_{\mathrm{keep}})$ scored-cell mask, or ``None`` to count
+            every cell of a scored horizon step.
 
     Returns:
         ``sum_residual``, ``sum_abs``, ``sum_sq`` and ``n_coefficients``, each $(B,)$.
         ``n_coefficients`` is the scored coefficient count, which is the denominator every one of
         the three needs and which $H \cdot C_{\mathrm{keep}}$ over-states on any anchor with masked
-        forecast steps.
+        forecast steps or unscored cells.
     """
     residual = mu - target
-    weights = mask[..., None]
+    weights = _scored_cells(mask, cell_mask)
+    counts = (
+        mask.sum(dim=(1, 2)) * float(target.shape[-1])
+        if cell_mask is None
+        else weights.sum(dim=(1, 2, 3))
+    )
     return {
         "sum_residual": (residual * weights).sum(dim=(1, 2, 3)),
         "sum_abs": (residual.abs() * weights).sum(dim=(1, 2, 3)),
         "sum_sq": ((residual**2) * weights).sum(dim=(1, 2, 3)),
-        "n_coefficients": mask.sum(dim=(1, 2)) * float(target.shape[-1]),
+        "n_coefficients": counts,
     }
 
 
@@ -690,6 +866,8 @@ def branch_channel_scores(
     mask: torch.Tensor,
     *,
     likelihood: str,
+    cell_mask: Optional[torch.Tensor] = None,
+    ar_coef: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     r"""One branch's masked score, summed over the horizon and resolved per channel.
 
@@ -709,11 +887,18 @@ def branch_channel_scores(
         target: The gathered forecast target, the same shape.
         mask: The forecast mask $(B, A_{\max}, H)$.
         likelihood: ``'mse'`` or ``'gaussian_nll'``.
+        cell_mask: The model's scored-cell mask, or ``None``; see
+            :func:`forecast_likelihood_terms`. The identity above holds only when the block score
+            it is read beside was scored under the same two terms.
+        ar_coef: The model's AR(1) coefficient, or ``None``.
 
     Returns:
         The per-anchor per-channel score $(B, A_{\max}, C_{\mathrm{keep}})$.
     """
-    score = raw_sample_score(mu, target, likelihood=likelihood, logvar=logvar)
+    score = raw_sample_score(
+        mu, target, likelihood=likelihood, logvar=logvar, cell_mask=cell_mask, ar_coef=ar_coef,
+        step_mask=mask,
+    )
     return (score * mask[..., None]).sum(dim=2)
 
 
@@ -724,13 +909,18 @@ def masked_raw_block_per_horizon_step(
     *,
     likelihood: str,
     logvar: Optional[torch.Tensor] = None,
+    cell_mask: Optional[torch.Tensor] = None,
+    ar_coef: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     r"""The per-anchor block score resolved by horizon step: summed over $c$, not over $\tau$.
 
-    $$D_{b,a,\tau} = m_{b,a,\tau} \sum_{c} \ell\!\left(x_{b,a,\tau,c}, \hat{x}_{b,a,\tau,c}\right),
+    $$D_{b,a,\tau} = m_{b,a,\tau} \sum_{c} m_{\tau,c}\,
+    \ell\!\left(x_{b,a,\tau,c}, \hat{x}_{b,a,\tau,c}\right),
     \qquad \sum_\tau D_{b,a,\tau} = D_{b,a}.$$
 
     The counterpart of :func:`branch_channel_scores` on the other axis, and for the same reason.
+    Under a scored-cell mask $m_{\tau,c}$ a far step sums over fewer channels than a near one --
+    the channels whose $H_c$ it lies beyond are not part of the density at all.
 
     Args:
         mu: Forecast mean, broadcastable to $(B, A_{\max}, H, C_{\mathrm{keep}})$.
@@ -738,11 +928,17 @@ def masked_raw_block_per_horizon_step(
         mask: The forecast mask $(B, A_{\max}, H)$.
         likelihood: ``'mse'`` or ``'gaussian_nll'``.
         logvar: Forecast log-variance, broadcastable to the same shape.
+        cell_mask: The model's scored-cell mask, or ``None``; see
+            :func:`forecast_likelihood_terms`.
+        ar_coef: The model's AR(1) coefficient, or ``None``.
 
     Returns:
         The per-horizon-step block score $(B, A_{\max}, H)$.
     """
-    per_sample = raw_sample_score(mu, target, likelihood=likelihood, logvar=logvar)
+    per_sample = raw_sample_score(
+        mu, target, likelihood=likelihood, logvar=logvar, cell_mask=cell_mask, ar_coef=ar_coef,
+        step_mask=mask,
+    )
     return (per_sample * mask[..., None]).sum(dim=3)
 
 
@@ -753,6 +949,8 @@ def horizon_block_sums(
     mask: torch.Tensor,
     *,
     likelihood: str,
+    cell_mask: Optional[torch.Tensor] = None,
+    ar_coef: Optional[torch.Tensor] = None,
 ) -> Dict[str, torch.Tensor]:
     r"""Accumulate one branch's horizon-resolved block score and its own denominator.
 
@@ -763,19 +961,28 @@ def horizon_block_sums(
     mask has already zeroed wherever that step falls in a gap -- by a count that includes those
     zeros, and the late horizons would read artificially good exactly where the signal is worst.
 
+    It stays an **anchor** count under a scored-cell mask, so $S^{D}_\tau / n^{a}_\tau$ remains
+    the step's share of the per-anchor block and the curve still sums over $\tau$ to it; a far step
+    then sums over fewer channels -- only those with $\tau < H_c$ -- and reads lower for that reason
+    alone, which is a smaller density rather than a better forecast.
+
     Args:
         mu: Forecast mean $(B, A_{\max}, H, C_{\mathrm{keep}})$.
         logvar: Forecast log-variance, the same shape.
         target: The gathered forecast target, the same shape.
         mask: The forecast mask $(B, A_{\max}, H)$.
         likelihood: ``'mse'`` or ``'gaussian_nll'``.
+        cell_mask: The model's scored-cell mask, or ``None``; see
+            :func:`forecast_likelihood_terms`.
+        ar_coef: The model's AR(1) coefficient, or ``None``.
 
     Returns:
         ``sum_block`` and ``n_anchors``, each $(H,)$ in float64 -- a real split reaches $10^9$
         terms, where a float32 accumulator stops adding.
     """
     per_tau = masked_raw_block_per_horizon_step(
-        mu, target, mask, likelihood=likelihood, logvar=logvar
+        mu, target, mask, likelihood=likelihood, logvar=logvar,
+        cell_mask=cell_mask, ar_coef=ar_coef,
     )
     return {
         "sum_block": per_tau.sum(dim=(0, 1), dtype=torch.float64),
@@ -784,13 +991,25 @@ def horizon_block_sums(
 
 
 def horizon_residual_sums(
-    mu: torch.Tensor, logvar: torch.Tensor, target: torch.Tensor, mask: torch.Tensor
+    mu: torch.Tensor,
+    logvar: torch.Tensor,
+    target: torch.Tensor,
+    mask: torch.Tensor,
+    *,
+    cell_mask: Optional[torch.Tensor] = None,
+    ar_coef: Optional[torch.Tensor] = None,
 ) -> Dict[str, torch.Tensor]:
     r"""Sum the residual and the log-variance over every scored coefficient, per horizon step.
 
-    $$S^{\mathrm{sq}}_\tau = \sum_{b,a,c} m_{b,a,\tau}\,(x - \mu)^2, \qquad
-    S^{z}_\tau = \sum_{b,a,c} m_{b,a,\tau}\,(x - \mu)^2 e^{-\log\sigma^2}, \qquad
-    n_\tau = C_{\mathrm{keep}} \sum_{b,a} m_{b,a,\tau}.$$
+    $$S^{\mathrm{sq}}_\tau = \sum_{b,a,c} w\,(x - \mu)^2, \qquad
+    S^{z}_\tau = \sum_{b,a,c} w\,e^2 e^{-\log\sigma^2}, \qquad
+    n_\tau = \sum_{b,a,c} w, \qquad w = m_{b,a,\tau}\, m_{\tau,c},$$
+
+    with $m_{\tau,c}$ the scored-cell mask ($1$ without one, so
+    $n_\tau = C_{\mathrm{keep}} \sum_{b,a} m_{b,a,\tau}$) and $e$ the AR(1) innovation of
+    :func:`forecast_innovation` ($e = x - \mu$ without the AR term). $S^{\mathrm{sq}}$ is a point
+    error and keeps the plain residual; $S^{z}$ is a calibration statement about the density each
+    cell is scored under, which is the innovation's.
 
     An accumulator rather than a retention. The residuals and log-variances themselves are
     $A_{\max} \times H \times C_{\mathrm{keep}}$ per sample -- about a megabyte each, tens of
@@ -810,20 +1029,32 @@ def horizon_residual_sums(
         logvar: Forecast log-variance, the same shape.
         target: The gathered forecast target, the same shape.
         mask: The forecast mask $(B, A_{\max}, H)$.
+        cell_mask: The model's scored-cell mask, or ``None``; see
+            :func:`forecast_likelihood_terms`.
+        ar_coef: The model's AR(1) coefficient, or ``None``.
 
     Returns:
         The four sums, each $(H,)$ in float64.
     """
     residual_sq = (target - mu) ** 2
-    masked = mask[..., None]
-    channels = float(target.shape[-1])
+    innovation_sq = (
+        residual_sq
+        if ar_coef is None
+        else forecast_innovation(mu, target, ar_coef, step_mask=mask) ** 2
+    )
+    masked = _scored_cells(mask, cell_mask)
+    count = (
+        mask.sum(dim=(0, 1), dtype=torch.float64) * float(target.shape[-1])
+        if cell_mask is None
+        else masked.sum(dim=(0, 1, 3), dtype=torch.float64)
+    )
     return {
         "sum_sq": (residual_sq * masked).sum(dim=(0, 1, 3), dtype=torch.float64),
-        "sum_standardised_sq": (residual_sq * torch.exp(-logvar) * masked).sum(
+        "sum_standardised_sq": (innovation_sq * torch.exp(-logvar) * masked).sum(
             dim=(0, 1, 3), dtype=torch.float64
         ),
         "sum_logvar": (logvar * masked).sum(dim=(0, 1, 3), dtype=torch.float64),
-        "count": mask.sum(dim=(0, 1), dtype=torch.float64) * channels,
+        "count": count,
     }
 
 
@@ -950,7 +1181,7 @@ class BatchReadout:
             as soon as a sink has consumed them.
         per_anchor_vectors: Per-anchor **vector** quantities, each $(B, A_{\max}, L)$, gathered
             at the decoded anchors exactly as ``per_anchor`` is: ``kl_lag_map``, the pooled KL
-            attribution $\widetilde K_{t,\ell} = \sum_m K^{(m)}_t lpha^{(m)}_{t,\ell}$ at
+            attribution $\widetilde K_{t,\ell} = \sum_m K^{(m)}_t \alpha^{(m)}_{t,\ell}$ at
             every anchor, and ``attention_lag_map``, the head-averaged attention at the same
             anchors. They are what lets an analysis select anchors by their own $K_t$ and read
             the lag structure of the selection -- a question the per-sample profiles, which
@@ -1010,27 +1241,64 @@ def _per_sample_mean(per_anchor: torch.Tensor, weights: torch.Tensor) -> torch.T
     return (per_anchor * weights).sum(dim=1) / weights.sum(dim=1).clamp_min(1.0)
 
 
-def _per_sample_element_mean(values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+def _per_sample_element_mean(
+    values: torch.Tensor, mask: torch.Tensor, cell_mask: Optional[torch.Tensor] = None
+) -> torch.Tensor:
     r"""Average a per-coefficient quantity within each sample, over its scored coefficients.
 
     The forecast-side counterpart of :func:`_per_sample_mean`: the mask is per anchor and horizon
     step, and every one of the $C_{\mathrm{keep}}$ coefficients inside a horizon step shares its
     validity. The denominator is therefore $C_{\mathrm{keep}} \sum_{a,\tau} m_{a,\tau}$ -- the
     scored coefficient count -- and not $H \cdot C_{\mathrm{keep}}$, which over-states it on any
-    anchor with masked forecast steps.
+    anchor with masked forecast steps. Under a scored-cell mask $m_{\tau,c}$ only the cells with
+    $\tau < H_c$ are scored, and both the numerator and the count are taken over those alone.
 
     Args:
         values: $(B, A_{\max}, H, C_{\mathrm{keep}})$ values, or anything broadcastable to that
             shape.
         mask: The forecast mask $(B, A_{\max}, H)$.
+        cell_mask: The model's $(H, C_{\mathrm{keep}})$ scored-cell mask, or ``None``.
 
     Returns:
         $(B,)$ per-sample means.
     """
-    weights = mask[..., None]
-    channels = float(values.shape[-1])
-    denominator = (mask.sum(dim=(1, 2)) * channels).clamp_min(1.0)
+    weights = _scored_cells(mask, cell_mask)
+    if cell_mask is None:
+        denominator = (mask.sum(dim=(1, 2)) * float(values.shape[-1])).clamp_min(1.0)
+    else:
+        denominator = weights.sum(dim=(1, 2, 3)).clamp_min(1.0)
     return (values * weights).sum(dim=(1, 2, 3)) / denominator
+
+
+def _per_channel_sq_error(
+    mu: torch.Tensor,
+    target: torch.Tensor,
+    mask: torch.Tensor,
+    cell_mask: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    r"""Each channel's masked mean squared error, over that channel's own scored cells.
+
+    $$\mathrm{SE}_{b,c} = \frac{\sum_{a,\tau} w\,(\mu - x)^2}{\sum_{a,\tau} w},
+    \qquad w = m_{b,a,\tau}\, m_{\tau,c}.$$
+
+    Without a cell mask every channel shares the denominator $\sum_{a,\tau} m_{b,a,\tau}$, so the
+    mean over channels is the pooled ``sq_error_*`` exactly; with one a short-horizon channel
+    divides by fewer cells, and the pooled figure is the count-weighted mean instead.
+
+    Args:
+        mu: Forecast mean $(B, A_{\max}, H, C_{\mathrm{keep}})$.
+        target: The gathered forecast target, the same shape.
+        mask: The forecast mask $(B, A_{\max}, H)$.
+        cell_mask: The model's $(H, C_{\mathrm{keep}})$ scored-cell mask, or ``None``.
+
+    Returns:
+        $(B, C_{\mathrm{keep}})$.
+    """
+    weights = _scored_cells(mask, cell_mask)
+    numerator = ((mu - target) ** 2 * weights).sum(dim=(1, 2))
+    if cell_mask is None:
+        return numerator / mask.sum(dim=(1, 2)).clamp_min(1.0)[:, None]
+    return numerator / weights.sum(dim=(1, 2)).clamp_min(1.0)
 
 
 def _per_sample_vector_mean(per_anchor: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
@@ -1225,6 +1493,8 @@ def calibration_sums(
     mask: torch.Tensor,
     *,
     logvar_clamp: Tuple[float, float],
+    cell_mask: Optional[torch.Tensor] = None,
+    ar_coef: Optional[torch.Tensor] = None,
 ) -> Dict[str, torch.Tensor]:
     r"""Accumulate everything the observation model's calibration is judged from.
 
@@ -1233,7 +1503,10 @@ def calibration_sums(
     nothing is retained: each quantity below is a sum or a histogram, and each is exact against a
     full-retention reference because addition is.
 
-    With $z = (x - \mu)/\sigma$:
+    With $z = e/\sigma$, where $e$ is the residual each cell's density is about -- the AR(1)
+    innovation of :func:`forecast_innovation` under ``ar_coef``, $x - \mu$ otherwise -- and over the
+    scored cells only when a ``cell_mask`` is given, so every statistic below describes the density
+    the block NLL is a sum of:
 
     * **PIT.** $u = \Phi(z)$ is uniform on $(0, 1)$ exactly when the observation model is right.
       Histogrammed rather than kept, because the shape is the whole content: a $\cup$ shape means
@@ -1259,6 +1532,11 @@ def calibration_sums(
         mask: The forecast mask $(B, A_{\max}, H)$.
         logvar_clamp: The model's own $(\mathrm{lo}, \mathrm{hi})$ log-variance bound, which fixes
             the histogram's range so two runs' histograms are comparable bin by bin.
+        cell_mask: The model's scored-cell mask, or ``None``; see
+            :func:`forecast_likelihood_terms`.
+        ar_coef: The model's AR(1) coefficient, or ``None``. The homoscedastic alternative is then
+            fitted to the same innovations, so the gain still compares two variances of one
+            residual rather than a variance model against a residual model.
 
     Returns:
         The sums and the two histograms, each reduced in float64 -- the counts alone reach $10^9$,
@@ -1267,8 +1545,10 @@ def calibration_sums(
         float64 before reducing it would double the peak allocation of the pass for no accuracy
         the reduction does not already give.
     """
-    weights = mask[..., None].expand_as(target).reshape(-1)
-    residual = (target - mu).expand_as(target).reshape(-1)
+    weights = _scored_cells(mask, cell_mask).expand_as(target).reshape(-1)
+    residual = (
+        forecast_innovation(mu, target, ar_coef, step_mask=mask).expand_as(target).reshape(-1)
+    )
     flat_logvar = logvar.expand_as(target).reshape(-1)
     sigma = torch.exp(0.5 * flat_logvar)
     standardised = residual / sigma
@@ -1699,6 +1979,7 @@ def anchor_support(
     return mask, coverage, kl_support
 
 
+@torch.no_grad()
 def evaluate_batch(
     task: Any,
     batch: Any,
@@ -1789,6 +2070,10 @@ def evaluate_batch(
     anchors, anchor_valid = outputs["anchor_index"], outputs["anchor_valid"]
     target = model._build_forecast_target(target_features, anchors)
     mask, coverage, kl_support = anchor_support(model, weight, outputs)
+    # The model's own density terms, for every score below: a density readout takes both, a point
+    # error the cell mask alone. See ``forecast_likelihood_terms``.
+    density = forecast_likelihood_terms(model)
+    cell_mask = density["cell_mask"]
 
     branches: Dict[str, Tuple[torch.Tensor, torch.Tensor]] = {
         "base": (outputs["mu_prior"], outputs["logvar_prior"]),
@@ -1863,10 +2148,12 @@ def evaluate_batch(
     # comparison with a decoding-policy difference; it is reported for objective parity only, and
     # the matched common-random-numbers scores above are the ones a source-gain claim reads.
     training_block, _ = masked_raw_block_per_anchor(
-        outputs["mu_full"], target, mask, likelihood=likelihood, logvar=outputs["logvar_full"]
+        outputs["mu_full"], target, mask, likelihood=likelihood, logvar=outputs["logvar_full"],
+        **density,
     )
     training_base_block, _ = masked_raw_block_per_anchor(
-        outputs["mu_base"], target, mask, likelihood=likelihood, logvar=outputs["logvar_base"]
+        outputs["mu_base"], target, mask, likelihood=likelihood, logvar=outputs["logvar_base"],
+        **density,
     )
 
     kld_btd = model.kld_tensor(
@@ -1949,26 +2236,28 @@ def evaluate_batch(
     )
 
     # The three trivial forecasts, scored through the model's *own* loss function with the
-    # identical mask at the identical anchors -- so a skill score is a comparison of predictors
+    # identical mask at the identical anchors -- and under the model's own density terms, the same
+    # scored cells and the same AR(1) coefficient -- so a skill score is a comparison of predictors
     # rather than of scoring conventions. Their observation variance is fixed and stated; see
-    # BASELINE_LOGVAR.
+    # BASELINE_LOGVAR, and ``baseline_forecasts`` for why they borrow the model's phi.
     baselines = baseline_forecasts(target_features, weight, model, anchors)
     baseline_logvar = torch.full(
         (), BASELINE_LOGVAR, dtype=target.dtype, device=target.device
     )
     for name, baseline_mu in baselines.items():
         baseline_block, _ = masked_raw_block_per_anchor(
-            baseline_mu, target, mask, likelihood=likelihood, logvar=baseline_logvar
+            baseline_mu, target, mask, likelihood=likelihood, logvar=baseline_logvar, **density
         )
         columns[f"nll_{name}_block"] = _per_sample_mean(baseline_block, contributing)
 
     # Point-forecast error, in the loader's z units and per *scored coefficient* rather than per
-    # anchor. The squares stay unrooted here -- see :func:`masked_raw_error_sums`.
+    # anchor. The squares stay unrooted here -- see :func:`masked_raw_error_sums`. The cell mask
+    # decides which coefficients count; the AR(1) term does not apply to an error of the mean.
     point_forecasts: Dict[str, torch.Tensor] = {
         "base": outputs["mu_base"], "full": outputs["mu_full"], **baselines
     }
     for name, point_mu in point_forecasts.items():
-        sums = masked_raw_error_sums(point_mu, target, mask)
+        sums = masked_raw_error_sums(point_mu, target, mask, cell_mask=cell_mask)
         scored = sums["n_coefficients"].clamp_min(1.0)
         columns[f"sq_error_{name}"] = sums["sum_sq"] / scored
         if name in ("base", "full"):
@@ -1981,7 +2270,7 @@ def evaluate_batch(
     # reason as the latent quantities above. Distinct from ``pred_gap``, which is a difference of
     # *scores*: two forecasts can differ everywhere and score identically.
     columns["forecast_difference_sq"] = _per_sample_element_mean(
-        (outputs["mu_full"] - outputs["mu_base"]) ** 2, mask
+        (outputs["mu_full"] - outputs["mu_base"]) ** 2, mask, cell_mask
     )
 
     # ---------------------------------------------------------------------
@@ -1992,10 +2281,12 @@ def evaluate_batch(
     # gaps, the three warm-up tertile gaps and their per-anchor rows -- which is what makes all six
     # partial sums of the ``pred_gap`` they are read beside rather than six unrelated numbers.
     base_by_channel = branch_channel_scores(
-        outputs["mu_base"], outputs["logvar_base"], target, mask, likelihood=likelihood
+        outputs["mu_base"], outputs["logvar_base"], target, mask, likelihood=likelihood,
+        **density,
     )
     full_by_channel = branch_channel_scores(
-        outputs["mu_full"], outputs["logvar_full"], target, mask, likelihood=likelihood
+        outputs["mu_full"], outputs["logvar_full"], target, mask, likelihood=likelihood,
+        **density,
     )
     gap_by_anchor_channel = base_by_channel - full_by_channel        # (B, A, C_keep)
     anchor_totals = contributing.sum(dim=1).clamp_min(1.0)           # (B,)
@@ -2046,17 +2337,19 @@ def evaluate_batch(
     columns["logvar_prior_floor_frac"] = _per_sample_mean(
         (outputs["logvar_prior"] <= floor_threshold).to(dtype).mean(dim=-1), kl_support
     )
-    columns["mean_logvar_full"] = _per_sample_element_mean(outputs["logvar_full"], mask)
+    columns["mean_logvar_full"] = _per_sample_element_mean(
+        outputs["logvar_full"], mask, cell_mask
+    )
     # Both ends, separately, and never inferred from the mean: one mean is equally consistent with
     # a well-spread distribution and with half the mass pinned on each clamp. The two ends also
     # fail differently -- on the floor the decoder is over-confident and the squared term
     # explodes; on the ceiling it has given up and is predicting noise, which reads as a healthy
     # falling NLL while ``pred_gap`` goes to zero.
     columns["logvar_full_floor_frac"] = _per_sample_element_mean(
-        (outputs["logvar_full"] <= floor_threshold).to(dtype), mask
+        (outputs["logvar_full"] <= floor_threshold).to(dtype), mask, cell_mask
     )
     columns["logvar_full_ceil_frac"] = _per_sample_element_mean(
-        (outputs["logvar_full"] >= ceil_threshold).to(dtype), mask
+        (outputs["logvar_full"] >= ceil_threshold).to(dtype), mask, cell_mask
     )
 
     # The two saturation fractions, in both framings. The model's own are flat means over *every*
@@ -2210,7 +2503,7 @@ def evaluate_batch(
     calibration = (
         calibration_sums(
             outputs["mu_full"], outputs["logvar_full"], target, mask,
-            logvar_clamp=model.logvar_clamp,
+            logvar_clamp=model.logvar_clamp, **density,
         )
         if likelihood == "gaussian_nll"
         else {}
@@ -2258,13 +2551,13 @@ def evaluate_batch(
         gap_per_channel=gap_per_channel,
         # Per channel and per scored (anchor, horizon-step) pair, so the mean over channels is
         # exactly the pooled ``sq_error_*`` column beside it and a band-level skill has a zero.
-        sq_error_per_channel_base=(
-            ((outputs["mu_base"] - target) ** 2 * mask[..., None]).sum(dim=(1, 2))
-            / mask.sum(dim=(1, 2)).clamp_min(1.0)[:, None]
+        # Under a scored-cell mask each channel divides by its OWN scored pairs; the pooled column
+        # is then the count-weighted mean of these rather than their plain mean.
+        sq_error_per_channel_base=_per_channel_sq_error(
+            outputs["mu_base"], target, mask, cell_mask
         ),
-        sq_error_per_channel_full=(
-            ((outputs["mu_full"] - target) ** 2 * mask[..., None]).sum(dim=(1, 2))
-            / mask.sum(dim=(1, 2)).clamp_min(1.0)[:, None]
+        sq_error_per_channel_full=_per_channel_sq_error(
+            outputs["mu_full"], target, mask, cell_mask
         ),
         calibration_sums=calibration,
         n_control_pairs=n_control_pairs,
@@ -2279,9 +2572,9 @@ def evaluate_batch(
                 ("full", (outputs["mu_full"], outputs["logvar_full"])),
             )
             for statistic, value in {
-                **horizon_residual_sums(branch_mu, branch_logvar, target, mask),
+                **horizon_residual_sums(branch_mu, branch_logvar, target, mask, **density),
                 **horizon_block_sums(
-                    branch_mu, branch_logvar, target, mask, likelihood=likelihood
+                    branch_mu, branch_logvar, target, mask, likelihood=likelihood, **density
                 ),
             }.items()
         },
