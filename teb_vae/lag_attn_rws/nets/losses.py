@@ -397,10 +397,12 @@ def masked_raw_likelihood(
 
     d_block = block_per_anchor.sum() / n_anchors
     # Per scored element: the block's own H * X under no cell mask, the scored count under one.
+    # The count stays a device tensor rather than being read back to the host: it is an integer,
+    # exact in the block's dtype, so the division is the same bits either way and costs no sync.
     elements = (
         float(target.shape[-2] * target.shape[-1])
         if cell_mask is None
-        else float(cell_mask.sum().clamp_min(1.0))
+        else cell_mask.sum().to(d_block.dtype).clamp_min(1.0)
     )
     d_sample = d_block / elements
     return d_block, d_sample
@@ -903,8 +905,10 @@ def compute_loss(
         anchors=anchors,
         anchor_valid=anchor_valid,
     )
+    # The forecast mask above validated the anchor set; the KL support is built from the same
+    # index and skips the two device reads of a second validation.
     kl_support = build_kl_mask(
-        mask, geometry, anchors=anchors, anchor_valid=anchor_valid
+        mask, geometry, anchors=anchors, anchor_valid=anchor_valid, validate=False
     )
 
     nll_full_block, nll_full_sample = masked_raw_likelihood(
@@ -1069,13 +1073,15 @@ def compute_loss(
         "aux_multiscale": aux_multiscale,
         "aux_derivative": aux_derivative,
         "aux_boundary": aux_boundary,
-        "kld_beta": torch.tensor(float(beta), device=device, dtype=dtype),
+        # Filled on the device rather than copied from the host: a host-to-device copy of a
+        # pageable scalar blocks until the stream drains, five times per step.
+        "kld_beta": torch.full((), float(beta), device=device, dtype=dtype),
         # Echoed like kld_beta so a metrics_history.csv identifies its own arm and the
         # weighted terms can be recomposed from the file alone.
-        "beta_prior": torch.tensor(float(beta_prior), device=device, dtype=dtype),
-        "lambda_ms": torch.tensor(float(lambda_ms), device=device, dtype=dtype),
-        "lambda_deriv": torch.tensor(float(lambda_deriv), device=device, dtype=dtype),
-        "lambda_boundary": torch.tensor(float(lambda_boundary), device=device, dtype=dtype),
+        "beta_prior": torch.full((), float(beta_prior), device=device, dtype=dtype),
+        "lambda_ms": torch.full((), float(lambda_ms), device=device, dtype=dtype),
+        "lambda_deriv": torch.full((), float(lambda_deriv), device=device, dtype=dtype),
+        "lambda_boundary": torch.full((), float(lambda_boundary), device=device, dtype=dtype),
         "anchor_coverage_frac": anchor_coverage_frac,
         "mean_logvar_full": mean_logvar_full,
         "mean_logvar_base": mean_logvar_base,

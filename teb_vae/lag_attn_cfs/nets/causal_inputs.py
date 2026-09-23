@@ -111,6 +111,27 @@ CAUSAL_ONLY_KEYWORDS: Tuple[str, ...] = (
 FORWARDED_EXCLUSIONS: Tuple[str, ...] = ("self", "__class__") + CAUSAL_ONLY_KEYWORDS
 
 
+def _refuse_phase_outside(phase: torch.Tensor, stride: int) -> None:
+    r"""Refuse a tile phase outside $[0, S)$, naming the offending value.
+
+    Args:
+        phase: Integer phases, on any device.
+        stride: The stride $S$.
+
+    Raises:
+        ValueError: If any phase is negative or at or above the stride.
+    """
+    outside = (phase < 0) | (phase >= stride)
+    if bool(outside.any()):
+        offending = int(phase[outside][0])
+        raise ValueError(
+            f"anchor_phase {offending} is outside [0, anchor_stride) = [0, {stride}). The "
+            f"anchor set truncates rather than rotating, so a phase at or above the stride "
+            f"drops leading anchors instead of shifting the grid -- and at stride 1 the only "
+            f"admissible phase is 0."
+        )
+
+
 class CausalWarmupInputs:
     r"""The warm-up mask, the lag floor and the tiled anchor set, for any encoder architecture.
 
@@ -691,6 +712,11 @@ class CausalWarmupInputs:
         $\epsilon$ and break every bitwise comparison in the suite -- and would not survive a
         checkpoint resume.
 
+        The range refusal is answered where the phase is. The task derives $\varphi$ on the host
+        and hands it over pinned, so a host tensor is checked there and then copied without
+        blocking, and a training step issues no synchronisation here; a phase that arrives already
+        on the device is checked on the device, at the cost of one.
+
         Args:
             batch: Batch size $B$ the anchor set is built for.
             device: Device to build the indices on.
@@ -731,23 +757,19 @@ class CausalWarmupInputs:
                 )
             phase = torch.zeros(batch, dtype=torch.long, device=device)
         elif isinstance(anchor_phase, torch.Tensor):
-            phase = anchor_phase.to(device=device, dtype=torch.long).reshape(-1)
+            phase = anchor_phase.to(dtype=torch.long).reshape(-1)
             if phase.numel() != batch:
                 raise ValueError(
                     f"anchor_phase has {phase.numel()} entries but the batch is {batch}; the "
                     f"phase is per sample, so a mismatch would tile one sample at another's grid"
                 )
+            # Refused where it is: on the host the answer costs nothing, and the copy that follows
+            # is asynchronous from pinned memory. A device tensor is checked on the device.
+            _refuse_phase_outside(phase, stride)
+            phase = phase.to(device=device, non_blocking=True)
         else:
+            _refuse_phase_outside(torch.tensor([int(anchor_phase)]), stride)
             phase = torch.full((batch,), int(anchor_phase), dtype=torch.long, device=device)
-
-        if bool(((phase < 0) | (phase >= stride)).any()):
-            offending = int(phase[(phase < 0) | (phase >= stride)][0])
-            raise ValueError(
-                f"anchor_phase {offending} is outside [0, anchor_stride) = [0, {stride}). The "
-                f"anchor set truncates rather than rotating, so a phase at or above the stride "
-                f"drops leading anchors instead of shifting the grid -- and at stride 1 the only "
-                f"admissible phase is 0."
-            )
 
         a_max = -(-span // stride)  # ceil, on ints
         steps = torch.arange(a_max, device=device, dtype=torch.long)

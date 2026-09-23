@@ -60,6 +60,9 @@ _REPO_ROOT = Path(__file__).resolve().parents[3]
 #: batch and a net and is called by the plotting callback and by every sibling's tests.
 _OWN_MEMBERS = {
     "__init__",
+    # Keeps ``epoch`` on the host, where ``anchor_phase`` hashes it; every other field moves as
+    # the inherited transfer moves it.
+    "transfer_batch_to_device",
     "anchor_phase",
     "_phase_field",
     "resolve_anchor_geometry",
