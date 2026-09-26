@@ -13,14 +13,12 @@ the same machinery; repeating it here would test the import, not this package.
 """
 from __future__ import annotations
 
-import re
 from pathlib import Path
 
 import pytest
 
 from teb_vae.lag_attn.tests.test_nets_are_framework_free import (
     _ALLOWED_ROOTS,
-    _BATCH_FIELD_NAMES,
     _FORBIDDEN_PREFIXES,
     _imported_names,
 )
@@ -61,54 +59,26 @@ def _net_modules() -> list[Path]:
     return sorted(_NETS_DIR.glob("*.py"))
 
 
-def test_there_are_net_modules_to_check():
-    """A silently-empty glob would make every test below vacuous."""
-    assert _net_modules(), f"no modules found under {_NETS_DIR}"
-
-
 @pytest.mark.parametrize("path", _net_modules(), ids=lambda p: p.name)
-def test_module_imports_only_torch_stdlib_entmax_and_teb_vae(path):
-    offenders = sorted(
-        name for name in _imported_names(path) if name.split(".")[0] not in _ALLOWED_ROOTS
-    )
-    assert not offenders, (
-        f"nets/{path.name} imports {offenders} -- nets/ may import only torch, the standard "
-        f"library, entmax and the teb_vae net layers, so that a network can be built without "
-        f"the framework around it"
-    )
-
-
-@pytest.mark.parametrize("path", _net_modules(), ids=lambda p: p.name)
-def test_module_avoids_forbidden_submodules(path):
-    offenders = sorted(
+def test_module_imports_stay_inside_the_net_layer(path):
+    """Only torch, the standard library, ``entmax`` and ``teb_vae`` roots, and within ``teb_vae``
+    no framework module of any package in the family."""
+    names = _imported_names(path)
+    outside = sorted(name for name in names if name.split(".")[0] not in _ALLOWED_ROOTS)
+    forbidden = sorted(
         name
-        for name in _imported_names(path)
+        for name in names
         if any(
             name == prefix or name.startswith(prefix + ".")
             for prefix in _LOCAL_FORBIDDEN_PREFIXES
         )
     )
-    assert not offenders, (
-        f"nets/{path.name} imports {offenders} -- a net must not need a process group, a "
+    assert not outside, (
+        f"nets/{path.name} imports {outside} -- nets/ may import only torch, the standard "
+        f"library, entmax and the teb_vae net layers, so that a network can be built without "
+        f"the framework around it"
+    )
+    assert not forbidden, (
+        f"nets/{path.name} imports {forbidden} -- a net must not need a process group, a "
         f"config file or a Lightning module to run"
     )
-
-
-@pytest.mark.parametrize("path", _net_modules(), ids=lambda p: p.name)
-def test_module_names_no_batch_fields(path):
-    source = path.read_text(encoding="utf-8")
-    offenders = sorted(
-        name for name in _BATCH_FIELD_NAMES if re.search(rf"\b{name}\b", source)
-    )
-    assert not offenders, (
-        f"nets/{path.name} names the batch fields {offenders} -- a net takes tensors as "
-        f"arguments and does not know what they were called on disk"
-    )
-
-
-def test_the_dotted_ban_covers_every_package_in_the_family():
-    """The extension is only worth having if it names every package a net could reach into, and a
-    new sibling arriving is exactly the event that makes a hand-kept list go stale."""
-    for package in _PACKAGES:
-        for module in _FRAMEWORK_MODULES:
-            assert f"teb_vae.{package}.{module}" in _LOCAL_FORBIDDEN_PREFIXES

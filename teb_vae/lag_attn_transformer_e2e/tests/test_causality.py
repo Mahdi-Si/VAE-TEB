@@ -2,9 +2,10 @@ r"""The assembled model's causality, measured at raw-sample resolution.
 
 This is the claim the package exists to make, measured where it matters: on ``target_state`` and
 ``source_state``, through the front end, the encoder and everything the constructor wired between
-them. The front end's own probe proves the component; this proves the composition, which is where a
-wiring mistake lives -- a stream handed the wrong weight, a transpose that slipped, a front end
-attached to the wrong encoder.
+them. ``test_frontend_causality.py`` probes the front end alone at the production kernels and holds
+the probe's negative control; this proves the composition, which is where a wiring mistake lives --
+a stream handed the wrong weight, a transpose that slipped, a front end attached to the wrong
+encoder.
 
 The cut is stated in **raw samples**, not in tokens, and that is the whole difference from the
 sibling's version of this file. Anchor $t$'s causal endpoint is raw index $16t + 15$. Perturbing raw
@@ -38,7 +39,6 @@ from __future__ import annotations
 import pytest
 import torch
 
-from teb_vae.lag_attn_transformer_e2e.nets import frontend as frontend_module
 from teb_vae.lag_attn_transformer_e2e.nets.model import SeqVaeLagAttnTrfE2E
 from teb_vae.lag_attn_transformer_e2e.tests.conftest import (
     BATCH,
@@ -46,9 +46,6 @@ from teb_vae.lag_attn_transformer_e2e.tests.conftest import (
     SEQ_LEN,
     relative_change,
     resample_raw_after,
-)
-from teb_vae.lag_attn_transformer_e2e.tests.test_frontend_causality import (
-    _SymmetricallyPaddedDecimate,
 )
 
 #: Relative movement a change to an anchor's **single newest** raw sample must exceed. Six orders
@@ -201,33 +198,3 @@ def test_the_latent_carries_the_same_boundary(tiny_kwargs):
 
     assert torch.equal(reference[:, anchor], perturbed[:, anchor])
     assert relative_change(reference[:, -1], perturbed[:, -1]) > MOVEMENT_TOL
-
-
-# ---------------------------------------------------------------------------------------
-# The negative control
-# ---------------------------------------------------------------------------------------
-def test_the_probe_would_catch_a_model_whose_front_end_read_one_sample_ahead(
-    tiny_kwargs, monkeypatch
-):
-    """The control the whole file rests on, planted where a real edit puts it.
-
-    ``padding=(k-1)//2`` is what ``nn.Conv1d`` does by default and what anybody reaching for the
-    ``padding`` argument would write. The planted decimator is the one the front end's own suite uses
-    -- imported rather than rewritten -- and it changes no shape, no parameter count and no reach, so
-    nothing but a causality probe could find it. A centred *offset* would not be a valid control: it
-    makes an anchor depend on raw $\\le 16t$, which is strictly more conservative, so the broken model
-    would pass the bitwise half and the control would prove nothing.
-    """
-    monkeypatch.setattr(frontend_module, "CausalAntiAliasDecimate", _SymmetricallyPaddedDecimate)
-    broken = _model(tiny_kwargs)
-    inputs = _inputs(broken.raw_per_step)
-    anchor = _ANCHORS[0]
-    cut = broken.raw_per_step * (anchor + 1) - 1
-
-    reference = _state(broken, inputs, "target_state")
-    perturbed = _state(broken, _perturbed(inputs, 0, cut), "target_state")
-
-    assert not torch.equal(reference[:, anchor], perturbed[:, anchor]), (
-        "a symmetrically padded front end passed the causality probe; the probe is not measuring "
-        "what it claims to"
-    )

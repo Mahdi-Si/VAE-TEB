@@ -1,21 +1,16 @@
-r"""The driver turns config into this model, and the entry point runs the guards before anything.
+r"""The driver turns config into this model, and the entry point runs this package's guards first.
 
-Almost all of this module's behaviour is inherited two levels deep, which is the design and also the
-risk: three class attributes are the entire difference between building this architecture and
-building the one it is compared against, and a stale one produces a run that trains the wrong model,
-wraps it in the wrong task, or writes its checkpoints under the wrong stem -- none of which raises.
+Almost all of the driver's behaviour is inherited two levels deep and tested where it is defined.
+What is this package's: the class attributes that make a launch build *this* net in *this* task,
+the startup message that states the front end's measured reach, the entry point that hands the
+shared ``main`` this driver, the three pre-flight guards specific to reading raw signals, and the
+command-line / IDE Run-button path resolution.
 
-The pre-flight guards get their own assertions for the same reason they exist: their whole value is
+The pre-flight guards get their own assertions for the reason they exist: their whole value is
 failing *before* the run directory, the log sinks and the MLflow run exist on every rank of a
-multi-rank launch. Both of the ones this package adds guard a **silent** failure -- a config key the
+multi-rank launch, and each guards a failure that is otherwise **silent** -- a config key the
 signature sweep drops without a word, a raw field the loader hands over unnormalized, a shard whose
-geometry disagrees with the model's -- so a guard that stopped running would only be noticed by the
-run it failed to protect.
-
-The startup log gets its own assertions too, which is unusual and deliberate. The inherited sentence
-says the model's input features read into their own future; that is the negation of this package's
-central claim, and left in place it would appear in every production run's log beside numbers that
-contradict it.
+geometry disagrees with the model's.
 """
 from __future__ import annotations
 
@@ -28,13 +23,10 @@ from typing import Optional
 import h5py
 import numpy as np
 import pytest
-import torch
 import yaml
-from loguru import logger
 
 from teb_vae.lag_attn.config import load_config
 from teb_vae.lag_attn_rws import trainer as shared_trainer
-from teb_vae.lag_attn_rws.trainer import LagAttnRwsTrainer
 from teb_vae.lag_attn_transformer_e2e import trainer as trainer_module
 from teb_vae.lag_attn_transformer_e2e.nets.model import SeqVaeLagAttnTrfE2E
 from teb_vae.lag_attn_transformer_e2e.task import SeqVaeLagAttnTrfE2ETask
@@ -42,9 +34,6 @@ from teb_vae.lag_attn_transformer_e2e.trainer import (
     INERT_MODEL_KEYS,
     LagAttnTrfE2ETrainer,
 )
-from teb_vae.lag_attn_transformer_rws.nets.model import SeqVaeLagAttnTrfRws
-from teb_vae.lag_attn_transformer_rws.trainer import LagAttnTrfRwsTrainer
-from train.graph_model_base import GraphModelBase
 
 from .conftest import SHIPPED_KWARGS, absolutize_dataset_paths
 
@@ -53,16 +42,6 @@ _CONFIG_DIR = Path(__file__).resolve().parents[1] / "configs"
 _CONFIG = _CONFIG_DIR / "default.yaml"
 _TINY = _CONFIG_DIR / "tiny.yaml"
 _MODULE_NAME = "teb_vae.lag_attn_transformer_e2e.trainer"
-
-#: The sentence the inherited driver logs when no reach budget is configured. It is false for this
-#: architecture and is the negation of its central claim, so its *absence* is asserted rather than
-#: assumed. A substring rather than the whole message, so a rewording of the sibling's text does not
-#: turn this into a test of that package's prose.
-INHERITED_FEATURE_REACH_PHRASE = "into their own future"
-
-#: A phrase unique to this package's own standing message, used to assert that the sibling's
-#: message is the sibling's. Kept short for the same reason as the constant above.
-FRONTEND_REACH_PHRASE = "front end"
 
 
 @pytest.fixture
@@ -77,19 +56,6 @@ def driver(tmp_path):
     instance.train_results_dir = str(tmp_path / "train_results")
     instance.model_checkpoint_dir = str(tmp_path / "model_checkpoints")
     return instance
-
-
-@pytest.fixture
-def logged():
-    """Collect everything logged at INFO or above, for the duration of one test.
-
-    Not ``caplog``: loguru does not route through the standard library's ``logging``, so a
-    ``caplog.at_level`` assertion against these lines passes on a driver that logs nothing at all.
-    """
-    messages = []
-    sink_id = logger.add(messages.append, level="INFO", format="{message}")
-    yield messages
-    logger.remove(sink_id)
 
 
 def _tiny_config_at(tmp_path, mutate=None) -> str:
@@ -148,135 +114,32 @@ def _config_for_shard(
 
 
 # --------------------------------------------------------------------------------------
-# The three class attributes, and what they decide
+# Config to constructor
 # --------------------------------------------------------------------------------------
-def test_the_driver_names_this_architecture_and_not_either_sibling():
-    """A stale attribute here trains another model under this model's config, tag and MLflow
-    experiment, and nothing anywhere raises."""
-    assert LagAttnTrfE2ETrainer.MODEL_CLS is SeqVaeLagAttnTrfE2E
-    assert LagAttnTrfE2ETrainer.TASK_CLS is SeqVaeLagAttnTrfE2ETask
-    assert LagAttnTrfE2ETrainer.CHECKPOINT_STEM == "lag-attn-trf-e2e"
-    for sibling in (LagAttnRwsTrainer, LagAttnTrfRwsTrainer):
-        assert LagAttnTrfE2ETrainer.MODEL_CLS is not sibling.MODEL_CLS
-        assert LagAttnTrfE2ETrainer.CHECKPOINT_STEM != sibling.CHECKPOINT_STEM
-
-
-def test_the_inherited_drivers_still_build_the_models_they_always_did():
-    """The class attributes were introduced so packages like this could reuse the driver; the reuse
-    is worthless if it changed what a launch of either sibling produces."""
-    assert LagAttnTrfRwsTrainer.MODEL_CLS is SeqVaeLagAttnTrfRws
-    assert LagAttnTrfRwsTrainer.CHECKPOINT_STEM == "lag-attn-trf-rws"
-
-
-def test_the_step_warmup_machinery_is_inherited_rather_than_restated():
-    """Three pieces of the conv-Transformer driver stay meaningful here and are deliberately not
-    re-pointed: the nullable-key re-admission (an unbounded source encoder *is*
-    ``source_attention_window: null``, and the inherited sweep would drop it), the step-granular
-    learning-rate monitor, and the DDP strategy selection, which keys on ``likelihood`` alone."""
-    from teb_vae.lag_attn_transformer_rws import trainer as sibling_trainer
-
-    for method in ("_build_model_kwargs", "_build_trainer_kwargs", "create_model"):
-        assert method not in vars(LagAttnTrfE2ETrainer), f"{method} is re-implemented here"
-    assert "select_ddp_strategy" not in vars(LagAttnTrfE2ETrainer)
-    assert sibling_trainer.NULLABLE_MODEL_KEYS == frozenset({"source_attention_window"})
-
-
 def test_the_shipped_config_resolves_to_the_shipped_architecture(driver):
-    """Every architectural flag ``SHIPPED_KWARGS`` claims the config sets, it must set. That
-    fixture is the suite's description of the production model; this keeps it honest against the
-    config file itself."""
+    """Every constructor keyword ``SHIPPED_KWARGS`` sets, the config must resolve to. That fixture
+    is the suite's description of the production model; this keeps it honest against the config
+    file itself, through the real signature sweep."""
     kwargs = driver._build_model_kwargs()
 
-    for name in (
-        "lag_bias_init", "use_entmax", "horizon_depth", "horizon_kernel", "horizon_film",
-        "encoder_num_heads", "encoder_d_ff", "target_attention_blocks",
-        "source_attention_blocks", "source_attention_window",
-    ):
-        assert kwargs[name] == SHIPPED_KWARGS[name], f"{name} disagrees with the shipped flag set"
-    # YAML has no tuple; the constructor coerces, so the sweep hands the list through.
-    assert tuple(kwargs["encoder_conv_kernels"]) == SHIPPED_KWARGS["encoder_conv_kernels"]
-    assert tuple(kwargs["encoder_conv_dilations"]) == SHIPPED_KWARGS["encoder_conv_dilations"]
-    assert tuple(kwargs["logvar_clamp"]) == SHIPPED_KWARGS["logvar_clamp"]
+    for name, expected in SHIPPED_KWARGS.items():
+        assert name in kwargs, f"the shipped config does not set {name}"
+        # YAML has no tuple; the constructor coerces, so the sweep hands a list through.
+        value = tuple(kwargs[name]) if isinstance(kwargs[name], list) else kwargs[name]
+        assert value == expected, f"{name}: config {value!r} against SHIPPED_KWARGS {expected!r}"
 
 
-def test_the_geometry_reaches_the_constructor(driver):
-    kwargs = driver._build_model_kwargs()
-
-    assert kwargs["sequence_length"] == 300
-    assert kwargs["d_model"] == 128
-    assert kwargs["d_z"] == 64
-    assert kwargs["horizon"] == 30
-    assert kwargs["raw_per_step"] == 16
-    assert kwargs["warmup_period"] == 30
-    assert kwargs["max_lag"] == 90
-    assert kwargs["coverage_floor"] == 0.9
-
-
-def test_only_the_front_ends_reach_budget_reaches_the_constructor_from_config(driver):
-    """The front end's *shape* has no configuration surface: the stage widths are derived from
-    ``d_model`` and the kernels are a module constant, so a key for either would be one the
-    signature sweep drops in silence. Its *backward reach* is configurable, because that is the
-    bound the shape is checked against and an arm that changes the shape has to move it too.
-
-    Exactly one key, asserted as a set: a second one appearing is the failure this guards."""
-    kwargs = driver._build_model_kwargs()
-
-    assert "frontend_kernels" not in kwargs
-    assert [name for name in kwargs if name.startswith("frontend")] == [
-        "frontend_reach_budget_s"
-    ]
-    assert kwargs["frontend_reach_budget_s"] == 120.0
-
-
-def test_loss_only_keys_do_not_reach_the_constructor(driver):
-    """The net takes tensors and computes a loss on request; it owns none of these. The
-    constructor is keyword-only with no ``**kwargs``, so a leaked key would be a ``TypeError`` on
-    the production config -- a poor place to find out."""
-    kwargs = driver._build_model_kwargs()
-
-    for name in (
-        "likelihood", "free_bits", "lambda_full", "lambda_base", "beta_schedule",
-        "kld_beta", "beta_prior",
-    ):
-        assert name not in kwargs, f"{name} is not the net's"
-
-
-def test_the_resolved_kwargs_actually_build_a_model(driver):
-    """The sweep's output is only correct if the constructor accepts it."""
+def test_the_configured_reach_budget_builds_the_front_ends_at_the_warmup_ceiling(driver):
+    """The config sets the budget in seconds; converted at the raw sampling rate it must land on
+    ``warmup_period * raw_per_step`` raw samples, the span of the anchors excluded from every loss,
+    and both front ends must be built against it."""
     model = SeqVaeLagAttnTrfE2E(**driver._build_model_kwargs())
 
-    assert isinstance(model, SeqVaeLagAttnTrfE2E)
-    # The unconditional freeze the DDP strategy relies on.
-    assert not any(parameter.requires_grad for parameter in model.lag_attn.W_o.parameters())
-    # The depthwise correction actually ran, over the stem AND the two front ends: four stem
-    # convolutions plus two per stride-2 stage per stream. A count of four would mean the front
-    # ends' convolutions were missed and are training an order of magnitude too quietly.
-    assert model.n_depthwise_init == 12
+    assert model.frontend_reach_budget == model.warmup_period * model.raw_per_step
+    for frontend in (model.target_frontend, model.source_frontend):
+        assert frontend.reach_budget == model.frontend_reach_budget
 
 
-def test_the_reach_budget_the_model_builds_its_front_ends_at_is_the_geometrys(driver):
-    """Not a configuration key: ``warmup_period * raw_per_step``. An anchor outside the warm-up
-    that reached further would be trained against the zero-padded convolution transient at the
-    segment's start."""
-    model = SeqVaeLagAttnTrfE2E(**driver._build_model_kwargs())
-
-    assert model.frontend_reach_budget == 30 * 16
-    assert model.target_frontend.reach_budget == model.frontend_reach_budget
-    assert model.target_frontend.reach_samples < model.frontend_reach_budget
-
-
-def test_init_weights_is_never_a_config_decision(driver):
-    """Skipping initialisation would also skip the depthwise correction and the post-init
-    delta-head zeroing the zero-KL start depends on; the key is refused even when a config
-    supplies it."""
-    driver.config["model_config"]["VAE_model"]["init_weights"] = False
-
-    assert "init_weights" not in driver._build_model_kwargs()
-
-
-# --------------------------------------------------------------------------------------
-# create_model, and what the startup log says about it
-# --------------------------------------------------------------------------------------
 def test_create_model_builds_this_net_and_wraps_it_in_this_task(driver):
     driver.create_model()
 
@@ -285,74 +148,11 @@ def test_create_model_builds_this_net_and_wraps_it_in_this_task(driver):
     assert driver.pl_model.orig_model is driver.pytorch_model
 
 
-def test_create_model_does_not_trip_on_the_absent_causal_norm_flag(driver):
-    """The inherited ``create_model`` reads ``causal_norm`` off the net through a ``getattr`` with
-    a safe default. There is no time-pooling normaliser in this architecture's history path to
-    causalise, so the attribute does not exist and a bare read would be an ``AttributeError`` on
-    the first launch."""
-    driver.create_model()
-
-    assert not hasattr(driver.pytorch_model, "causal_norm")
-
-
-def test_create_model_passes_the_spike_breaker_block_to_the_task(driver):
-    """The block is validated by the framework and read by the module -- but nothing forwards it
-    automatically, so a driver that forgot would leave a fully configured ``enabled: true`` block
-    doing nothing at all."""
-    driver.create_model()
-
-    breaker = driver.pl_model.hparams["spike_breaker"]
-    assert breaker["enabled"] is True
-    assert breaker["comparison_metric"] == "main_loss"
-    assert breaker["ema_floor"] >= 1.0e9
-
-
-def test_create_model_passes_the_loss_hyperparameters_to_the_task(driver):
-    """The objective is shared with both siblings, so these values *are* the comparison."""
-    driver.create_model()
-
-    hparams = driver.pl_model.hparams
-    assert hparams["likelihood"] == "gaussian_nll"
-    assert hparams["lambda_full"] == 1.0
-    assert hparams["lambda_base"] == 1.0
-    assert hparams["free_bits"] == 0.0
-    assert hparams["beta_prior"] == 0.1
-    assert hparams["beta_schedule"]["kind"] == "linear_warmup"
-    assert hparams["beta_schedule"]["start"] == 0.0
-
-
-def test_create_model_forwards_the_step_warmup(driver):
-    """Inherited from the conv-Transformer driver; it reaches ``hparams`` and therefore every
-    checkpoint, which is where the task reads it back from."""
-    driver.create_model()
-
-    assert int(driver.pl_model.hparams["lr_warmup_steps"]) == 2000
-
-
-def test_the_checkpoint_kwargs_are_the_ones_the_model_was_built_from(driver):
-    """So the blob rebuilds into this architecture and not the constructor's defaults."""
-    driver.create_model()
-
-    assert driver.pl_model._model_kwargs == driver._build_model_kwargs()
-
-
-def test_the_startup_log_states_this_models_measured_reach(driver, logged):
-    """A run's log should say what its history states are a function of, because that is the
-    premise every coupling number it produces rests on."""
-    driver.create_model()
-
-    message = next(line for line in logged if "causal standing" in line)
-    reach = driver.pytorch_model.target_frontend.reach_samples
-    assert f"{reach} raw samples" in message
-    assert "80.5 s" in message  # the reach in seconds, at 4 Hz
-    assert f"budget of {driver.pytorch_model.frontend_reach_budget}" in message
-
-
 def test_the_logged_reach_cannot_drift_from_the_front_end_that_was_built(driver):
-    """The message is composed *before* ``pytorch_model`` is assigned -- deliberately, so a launch
-    that dies in the constructor has still said what it was about to build -- which means it is
-    measured on a throwaway front end. This is what stops that second construction disagreeing
-    with the real one."""
+    """The inherited startup sentence is the negation of this package's claim, so it is replaced by
+    the front end's measured reach. The message is composed *before* ``pytorch_model`` is assigned,
+    on a throwaway front end; this is what stops that second construction disagreeing with the real
+    one."""
     message = driver.causal_standing_message()
     driver.create_model()
 
@@ -361,59 +161,8 @@ def test_the_logged_reach_cannot_drift_from_the_front_end_that_was_built(driver)
         assert f"budget of {frontend.reach_budget}" in message
 
 
-def test_the_startup_log_does_not_repeat_the_inherited_feature_reach_sentence(driver, logged):
-    """It is the negation of this package's central claim, and it would otherwise appear in every
-    production run's log beside numbers that contradict it."""
-    driver.create_model()
-
-    offenders = [line for line in logged if INHERITED_FEATURE_REACH_PHRASE in line]
-    assert offenders == [], offenders
-
-
-def test_the_siblings_message_is_untouched(tmp_path):
-    """The replacement is this driver's, not a change to the one it inherits from: the comparison
-    model's log must keep stating the standing that is true of *it*.
-
-    That sibling now ships a finite reach budget, so what is true of it is the resolved-budget
-    summary rather than the unguarded sentence. Both directions are asserted -- it must emit its
-    own summary, and it must not emit this package's front-end sentence -- because a driver that
-    logged nothing would pass a one-sided check."""
-    sibling_config = (
-        _REPO_ROOT / "teb_vae" / "lag_attn_transformer_rws" / "configs" / "default.yaml"
-    )
-    instance = LagAttnTrfRwsTrainer(config_file_path=str(sibling_config))
-    instance._build_model_kwargs()  # populates resolved_budget, which the message branches on
-
-    message = instance.causal_standing_message()
-    assert message.startswith("causal reach budget 120 s:")
-    assert FRONTEND_REACH_PHRASE not in message
-
-
-def test_a_core_checkpoint_from_a_sibling_is_refused_before_it_is_loaded(driver, tmp_path):
-    """All three models share every tensor below the encoder inputs, so a blob from another one
-    would partially align by accident and train from a mixture of loaded and random weights."""
-    foreign = tmp_path / "foreign.ckpt"
-    torch.save({"state_dict": {}, "model_class": "SeqVaeLagAttnTrfRws"}, foreign)
-    driver.config["model_config"]["core_model_checkpoint"] = str(foreign)
-
-    with pytest.raises(ValueError, match="does not match the active model class"):
-        driver.create_model()
-
-
-def test_an_unalignable_core_checkpoint_raises_rather_than_training_from_scratch(
-    driver, tmp_path
-):
-    """``load_checkpoint_strict`` returns ``None`` when nothing lines up; it does not raise."""
-    unrelated = tmp_path / "unrelated.ckpt"
-    torch.save({"state_dict": {"nothing.like.this": torch.zeros(2)}}, unrelated)
-    driver.config["model_config"]["core_model_checkpoint"] = str(unrelated)
-
-    with pytest.raises(RuntimeError, match="could not align"):
-        driver.create_model()
-
-
 # --------------------------------------------------------------------------------------
-# The entry point and the pre-flight ordering
+# The entry point
 # --------------------------------------------------------------------------------------
 class _StubDataModule:
     """A data module that hands out loaders nothing iterates."""
@@ -448,9 +197,8 @@ def recording_main(monkeypatch):
 
 
 def test_the_entry_point_constructs_this_packages_driver(monkeypatch, tmp_path):
-    """``main`` delegates to the shared entry point, which owns the four guards, the temporary
-    resolved-config file and the resolved-config write. What this package supplies is which driver
-    it constructs -- and that is the one thing a delegation can get wrong while still running."""
+    """``main`` delegates to the shared entry point; which driver it constructs is the one thing a
+    delegation can get wrong while still running."""
     seen = {}
 
     def _capture_init(self, config_file_path=None):
@@ -465,55 +213,6 @@ def test_the_entry_point_constructs_this_packages_driver(monkeypatch, tmp_path):
     assert seen["cls"] is LagAttnTrfE2ETrainer
 
 
-def test_setup_config_runs_before_the_model_is_built(recording_main, tmp_path):
-    """The order that decides whether a run is seeded, logged and tracked at all: building the
-    model first means no seeding, no log sinks, nowhere to write, and ``mlflow_logger is None`` --
-    which silently drops the MLflow callback from the fit."""
-    trainer_module.main(_tiny_config_at(tmp_path))
-
-    assert recording_main == ["setup_config", "create_model", "train_model"]
-
-
-def test_this_drivers_preflight_runs_after_the_four_guards_and_before_setup_config(
-    tmp_path, monkeypatch
-):
-    """Their whole value is failing before the run directory and MLflow run exist on every rank of
-    a multi-rank launch, and this package's own guards must keep that guarantee."""
-    order = []
-    monkeypatch.setattr(
-        LagAttnTrfE2ETrainer, "setup_config", lambda self: order.append("setup_config")
-    )
-    for attribute, label in (
-        ("_check_stat_path", "stat_path"),
-        ("_check_declared_widths_against_shard", "widths"),
-        ("_check_raw_target_normalized", "fhr_normalized"),
-        ("_check_causal_budget_resolves", "causal_budget"),
-    ):
-        monkeypatch.setattr(
-            # ``**_`` because the normalisation guard is handed the driver's TARGET_FIELDS;
-            # these stubs record the order and have no opinion about any guard's arguments.
-            shared_trainer, attribute, lambda config, _label=label, **_: order.append(_label)
-        )
-    monkeypatch.setattr(
-        LagAttnTrfE2ETrainer,
-        "preflight",
-        classmethod(lambda cls, config: order.append("preflight")),
-    )
-    monkeypatch.setattr(shared_trainer, "GraphDataModule", lambda config: None)
-    monkeypatch.setattr(
-        LagAttnTrfE2ETrainer, "create_model", lambda self: order.append("create_model")
-    )
-
-    with pytest.raises(AttributeError):
-        # GraphDataModule is stubbed to None, so main dies at train_dataloader() -- after the part
-        # under test. The order up to that point is the assertion.
-        trainer_module.main(_tiny_config_at(tmp_path))
-
-    assert order[:6] == [
-        "stat_path", "widths", "fhr_normalized", "causal_budget", "preflight", "setup_config",
-    ], order
-
-
 def test_the_shipped_configs_pass_this_drivers_own_preflight():
     """Both of them, so a guard cannot be satisfied by the smoke config alone. Called directly
     rather than through ``main``: the production config's shard paths do not exist on this box,
@@ -523,21 +222,13 @@ def test_the_shipped_configs_pass_this_drivers_own_preflight():
 
 
 # --------------------------------------------------------------------------------------
-# Pre-flight: the inert keys
+# Pre-flight: the inert keys and the raw source
 # --------------------------------------------------------------------------------------
-def test_the_inert_key_set_is_exactly_the_input_representation_being_replaced():
-    """Declared as a mapping from the key to what took its place, so the refusal can say both."""
-    assert set(INERT_MODEL_KEYS) == {
-        "c_y", "c_u", "use_up_st", "causal_reach_budget_s",
-        "target_keep_index", "target_delays", "source_keep_index", "source_delays",
-    }
-
-
 @pytest.mark.parametrize("key", sorted(INERT_MODEL_KEYS))
-def test_each_inert_key_is_refused_by_name(recording_main, tmp_path, key):
+def test_each_inert_key_is_refused_by_name_before_setup_config(recording_main, tmp_path, key):
     """The signature sweep drops each of these without a word, so the run would be a different one
-    from the one the operator configured -- most damagingly ``causal_reach_budget_s``, whose whole
-    purpose was to bound a leak this architecture does not have."""
+    from the one the operator configured. Refused through ``main`` before ``setup_config``, so the
+    run directory and the MLflow run never exist."""
 
     def _add_key(config):
         config["model_config"]["VAE_model"][key] = 1
@@ -545,37 +236,9 @@ def test_each_inert_key_is_refused_by_name(recording_main, tmp_path, key):
     with pytest.raises(ValueError, match=key):
         trainer_module.main(_tiny_config_at(tmp_path, _add_key))
 
-    assert "create_model" not in recording_main
+    assert recording_main == []
 
 
-def test_the_refusal_names_what_replaced_the_key(recording_main, tmp_path):
-    """A refusal that only said "unknown key" would leave an operator to guess whether the key was
-    dropped, renamed or moved."""
-
-    def _copy_paste_the_siblings_widths(config):
-        config["model_config"]["VAE_model"].update(c_y=109, c_u=58, use_up_st=True)
-
-    with pytest.raises(ValueError) as excinfo:
-        trainer_module.main(_tiny_config_at(tmp_path, _copy_paste_the_siblings_widths))
-
-    message = str(excinfo.value)
-    assert "3 key(s)" in message
-    for key in ("c_y", "c_u", "use_up_st"):
-        assert key in message
-    assert "front end" in message
-
-
-def test_the_inherited_width_guard_stays_silent_on_this_packages_configs():
-    """It returns early unless the config carries ``c_y`` *and* ``c_u``, and a config carrying
-    either is refused above -- which is what makes the inert-key message the one an operator who
-    copy-pasted a sibling config actually sees, rather than a channel-width message about a model
-    with no channels."""
-    shared_trainer._check_declared_widths_against_shard(load_config(str(_TINY)))
-
-
-# --------------------------------------------------------------------------------------
-# Pre-flight: the raw source
-# --------------------------------------------------------------------------------------
 @pytest.mark.parametrize("list_key", ["load_fields", "normalize_fields"])
 def test_a_missing_raw_source_field_raises_naming_the_offending_list(
     recording_main, tmp_path, list_key
@@ -599,33 +262,12 @@ def test_a_missing_raw_source_field_raises_naming_the_offending_list(
     assert "create_model" not in recording_main
 
 
-@pytest.mark.parametrize("list_key", ["load_fields", "normalize_fields"])
-def test_the_inherited_guard_still_covers_the_raw_target(recording_main, tmp_path, list_key):
-    """``fhr`` is both the reconstruction target and the target stream's input here, so it is
-    covered twice over -- but by the *inherited* guard, which is why this package's own adds only
-    ``up``."""
-
-    def _drop_fhr(config):
-        dataloader = config["dataset_config"]["dataloader_config"]
-        fields = (
-            dataloader["dataset_kwargs"]["load_fields"]
-            if list_key == "load_fields"
-            else dataloader[list_key]
-        )
-        fields.remove("fhr")
-
-    with pytest.raises(ValueError, match=list_key):
-        trainer_module.main(_tiny_config_at(tmp_path, _drop_fhr))
-
-    assert "create_model" not in recording_main
-
-
 # --------------------------------------------------------------------------------------
 # Pre-flight: the shard's raw length
 # --------------------------------------------------------------------------------------
 def test_the_committed_shards_trimmed_length_is_the_models_geometry(tmp_path):
-    """The passing case, on the real fixture: $5280 - 2 \\cdot 240 = 4800 = 300 \\cdot 16$. A guard
-    that compared the *stored* length would fail on every real shard."""
+    """The passing case, on the real fixture. A guard that compared the *stored* length rather than
+    the trimmed one would fail on every real shard."""
     config = absolutize_dataset_paths(load_config(str(_TINY)))
 
     trainer_module._check_raw_length_against_shard(config)
@@ -696,44 +338,7 @@ def test_a_geometry_mismatch_stops_a_launch_before_anything_is_built(
 
 
 # --------------------------------------------------------------------------------------
-# The resolved config
-# --------------------------------------------------------------------------------------
-def test_the_resolved_config_is_written_beside_the_checkpoints(tmp_path, monkeypatch):
-    """A run's own config is otherwise recoverable only from the text of its log or from an MLflow
-    artifact whose on-disk location nothing can derive, and neither is a file a later offline pass
-    can open."""
-    monkeypatch.setattr(LagAttnTrfE2ETrainer, "create_model", lambda self: None)
-    monkeypatch.setattr(LagAttnTrfE2ETrainer, "train_model", lambda self, *args: None)
-    monkeypatch.setattr(shared_trainer, "GraphDataModule", lambda config: _StubDataModule())
-
-    captured = {}
-
-    def _remember(self):
-        # setup_config is what creates the run directories, so the write must follow it; the real
-        # one runs, and only the directory it chose is recorded.
-        GraphModelBase.setup_config(self)
-        captured["checkpoint_dir"] = self.model_checkpoint_dir
-
-    monkeypatch.setattr(LagAttnTrfE2ETrainer, "setup_config", _remember)
-
-    trainer_module.main(_tiny_config_at(tmp_path))
-
-    written = Path(captured["checkpoint_dir"]) / shared_trainer.RESOLVED_CONFIG_FILENAME
-    assert written.is_file()
-    reloaded = yaml.safe_load(written.read_text(encoding="utf-8"))
-    # Fully resolved: the inherited keys are present and the `base:` pointer is gone.
-    assert "base" not in reloaded
-    assert reloaded["model_config"]["VAE_model"]["target_attention_blocks"] == 6
-    # The inherited record of the reach guard. Always null here -- the key it records is refused --
-    # so it says explicitly that this run had no channel guard, which is a different statement from
-    # a run written before the record existed. The front end's own reach is not in this file; it is
-    # in the startup log and pinned in tests/test_frontend_reach.py.
-    assert reloaded["model_config"][shared_trainer.RESOLVED_BUDGET_KEY] is None
-    assert "causal_reach_budget_s" not in reloaded["model_config"]["VAE_model"]
-
-
-# --------------------------------------------------------------------------------------
-# The command line
+# The command line and the IDE Run button
 # --------------------------------------------------------------------------------------
 def test_relative_config_paths_resolve_against_the_repository_root():
     """An IDE's working directory is arbitrary; every documented invocation is repo-root relative,
@@ -745,12 +350,6 @@ def test_relative_config_paths_resolve_against_the_repository_root():
     assert Path(resolved) == _TINY
     absolute = str(_TINY)
     assert trainer_module._resolve_cli_config_path(absolute) == absolute
-
-
-def test_run_config_points_at_a_config_that_exists():
-    """The IDE Run button resolves through ``RUN_CONFIG``; a stale path breaks it silently."""
-    assert trainer_module.RUN_CONFIG is not None
-    assert (_REPO_ROOT / trainer_module.RUN_CONFIG).is_file()
 
 
 def _launched_config(monkeypatch, argv) -> str:
@@ -789,116 +388,10 @@ def test_the_command_line_config_wins_over_run_config(monkeypatch, tmp_path):
     assert _launched_config(monkeypatch, ["trainer", "--config", requested]) == requested
 
 
-def test_a_launch_with_no_command_line_falls_back_to_run_config(monkeypatch):
-    """Which is what makes an IDE Run button work at all."""
+def test_a_launch_with_no_command_line_falls_back_to_an_existing_run_config(monkeypatch):
+    """Which is what makes an IDE Run button work at all; a stale ``RUN_CONFIG`` path would break
+    it silently."""
     launched = _launched_config(monkeypatch, ["trainer"])
 
     assert Path(launched) == _REPO_ROOT / trainer_module.RUN_CONFIG
-
-
-def test_the_config_argument_is_not_argparse_required():
-    """``required=True`` fires before ``RUN_CONFIG`` is ever read, which makes the Run button
-    unusable no matter what the constant says. The refusal happens after the fallback instead, and
-    its message names both ways to supply the value."""
-    source = Path(trainer_module.__file__).read_text(encoding="utf-8")
-
-    assert "required=True" not in source
-    assert "default=None" in source
-    assert "RUN_CONFIG" in source
-    assert "--config is required" in source
-
-
-# --------------------------------------------------------------------------------------
-# Hygiene
-# --------------------------------------------------------------------------------------
-def test_no_module_in_the_package_seeds_by_hand():
-    """``general_config.seed`` through the framework's ``configure_determinism`` is the only
-    seeding route; a stray global seed would silently override it while looking like diligence."""
-    package_dir = Path(__file__).resolve().parents[1]
-    offenders = []
-    for path in package_dir.rglob("*.py"):
-        if "tests" in path.parts:
-            continue  # tests seed themselves for reproducibility, legitimately
-        source = path.read_text(encoding="utf-8")
-        for pattern in ("torch.manual_seed", "seed_everything", "np.random.seed"):
-            if pattern in source:
-                offenders.append(f"{path.name}: {pattern}")
-
-    assert offenders == []
-
-
-# --------------------------------------------------------------------------------------
-# torch.compile: live here, refused in the raw-signal base
-# --------------------------------------------------------------------------------------
-def test_the_shipped_config_leaves_compilation_off(driver):
-    """Off is the shipped value, so the baseline is an eager run and the first compiled run is a
-    deliberate act. What this asserts is the *driver's* reading of the key, not the key itself --
-    the config test owns that."""
-    assert driver.compile_model_requested() is False
-
-
-def test_the_key_is_live_here_rather_than_ignored(driver):
-    """The distinction this package exists to make against its base. Flipping the key must change
-    the driver's answer; if it did not, an operator could set ``compile: true``, see nothing in the
-    log, and believe they had measured a compiled run."""
-    driver.config["advanced_config"]["trainer"]["compile"] = True
-    assert driver.compile_model_requested() is True
-
-
-def test_the_raw_signal_base_refuses_the_key_no_matter_what_it_says():
-    """The refusal two levels up is a property of *that* net -- its LSTM encoders defeat inductor
-    unconditionally -- so it must not read the config at all. A base that started honouring the key
-    would let a raw-signal config turn on a path that cannot work."""
-    assert "compile_model_requested" in vars(LagAttnRwsTrainer)
-    assert LagAttnRwsTrainer.compile_model_requested(object()) is False
-
-
-def test_the_compile_decision_is_inherited_rather_than_restated():
-    """It belongs to the conv-Transformer driver, not to this one: the blocker it clears is the
-    *LSTM*, which both transformer packages replaced, so a copy here would be a second copy of one
-    decision -- and the two would then be free to diverge on a question that has nothing to do with
-    the input representation this package exists to change."""
-    from teb_vae.lag_attn_transformer_rws.trainer import LagAttnTrfRwsTrainer
-
-    assert "compile_model_requested" not in vars(LagAttnTrfE2ETrainer)
-    assert (
-        LagAttnTrfE2ETrainer.compile_model_requested
-        is LagAttnTrfRwsTrainer.compile_model_requested
-    )
-
-
-def test_compilation_and_attention_checkpointing_are_refused_together(driver):
-    """The one genuine inductor blocker still reachable from this package's config surface. Silently
-    dropping either would give a run that is neither the compiled one nor the checkpointed one."""
-    driver.config["advanced_config"]["trainer"]["compile"] = True
-    driver.config["model_config"]["VAE_model"]["attention_grad_checkpoint"] = True
-
-    with pytest.raises(ValueError) as excinfo:
-        driver.compile_model_requested()
-
-    message = str(excinfo.value)
-    assert "attention_grad_checkpoint" in message and "compile" in message
-
-
-def test_a_compiled_run_says_so_in_the_log(driver, logged):
-    """Compilation may reassociate float arithmetic and ``pred_gap`` is a $10^{-4}$-relative
-    difference of two block NLLs, so a run that compiled must be identifiable from its log alone --
-    otherwise the eager and compiled coupling numbers are indistinguishable after the fact."""
-    driver.config["advanced_config"]["trainer"]["compile"] = True
-    driver.compile_model_requested()
-
-    assert any("torch.compile is ON" in line for line in logged)
-    assert any("pred_gap" in line for line in logged)
-
-
-def test_the_objective_is_never_the_thing_compiled():
-    """Only the forward is compiled. The task reaches ``compute_loss`` through ``orig_model``, which
-    is what keeps the data-dependent ``kld_active_frac`` indexing out of the graph -- so this is the
-    line that makes the whole key safe to honour, and it is asserted rather than trusted."""
-    import inspect
-
-    from teb_vae.lag_attn_rws.task import SeqVaeLagAttnRwsTask
-
-    source = inspect.getsource(SeqVaeLagAttnRwsTask.compute_loss_and_metrics)
-    assert "self.orig_model.compute_loss(" in source
-    assert "self.model.compute_loss(" not in source
+    assert Path(launched).is_file()

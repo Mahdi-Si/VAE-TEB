@@ -57,21 +57,15 @@ def _inputs(model: SeqVaeLagAttnTrfRws, seed: int = 0):
 # --------------------------------------------------------------------------------------
 # base_decode
 # --------------------------------------------------------------------------------------
-def test_the_mean_mode_decodes_the_prior_mean_itself():
-    """``z^p`` *is* ``mu^p``, bitwise -- not a low-variance sample of it."""
-    model = _build(base_decode="mean")
+@pytest.mark.parametrize("mode, decodes_the_mean", [("mean", True), ("sample", False)])
+def test_only_the_mean_mode_decodes_the_prior_mean_itself(mode, decodes_the_mean):
+    """Under ``'mean'`` ``z^p`` *is* ``mu^p``, bitwise -- not a low-variance sample of it. The
+    ``'sample'`` case is the negative control: without it this would pass on a model whose prior
+    variance had merely collapsed, which is the very condition under investigation."""
+    model = _build(base_decode=mode)
     out = model(*_inputs(model))
 
-    assert torch.equal(out["z_prior"], out["mu_prior"])
-
-
-def test_the_sample_mode_still_draws_a_sample():
-    """The negative control: without it the test above would pass on a model whose prior variance
-    had merely collapsed, which is the very condition under investigation."""
-    model = _build(base_decode="sample")
-    out = model(*_inputs(model))
-
-    assert not torch.equal(out["z_prior"], out["mu_prior"])
+    assert torch.equal(out["z_prior"], out["mu_prior"]) is decodes_the_mean
 
 
 @pytest.mark.parametrize(

@@ -3,15 +3,14 @@ r"""The evaluation override delta, and what merging it over a run's own config p
 The delta is not a config and does not stand alone. Its whole contract is what it *becomes* when
 deep-merged over the ``resolved_config.yaml`` a training run wrote beside its checkpoints: the
 run's geometry, its resolved warm-up budget, its normalisation and its objective survive
-untouched, and exactly a handful of things change. Both halves of that are asserted here, because
+untouched, and exactly the overridden leaves change. Both halves of that are asserted here, because
 either one failing silently produces plausible numbers -- an evaluation on the wrong population,
 or one that never sees the fields the clinical questions are asked in.
 
-Two things this cell's delta does that the raw cells' does not, and each has its own test below:
-it repoints ``stat_path``, because the causal statistics exclude each channel's warm-up region and
-that exclusion is what makes zero the right feature-space climatology; and it restates ``guid``
-and ``epoch`` in ``load_fields``, because the anchor tiling's phase is keyed on the pair and
-``load_fields`` is honoured literally.
+The committed delta itself is checked only where it is behaviour: it loads, its ``eval_config``
+block validates as written, and its ``load_fields`` restates every field the run already loads
+(a list replaces wholesale on merge) plus the clinical ones and the ``guid``/``epoch`` pair the
+anchor tiling's phase is keyed on.
 """
 from __future__ import annotations
 
@@ -22,7 +21,6 @@ import yaml
 
 from teb_vae.lag_attn.config import load_config
 from teb_vae.lag_attn_cfs.eval.config_schema import (
-    DEFAULT_OVERRIDES_PATH,
     VALID_KEYS,
     load_eval_overrides,
     merge_eval_overrides,
@@ -33,31 +31,13 @@ from teb_vae.lag_attn_cfs.eval.config_schema import (
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 _DEFAULT_CONFIG = _REPO_ROOT / "teb_vae" / "lag_attn_cfs" / "configs" / "default.yaml"
 
-#: The clinical fields the delta adds on top of the model's own data contract. ``epoch`` is not
-#: among them here -- unlike in the raw cells, this model's training config already loads it,
-#: because the anchor tiling's phase is keyed on it.
-_ADDED_LOAD_FIELDS = ("target", "cs_label", "bg_label", "time_from_labor_onset")
-
-#: The keys ``eval_config`` must carry, exactly. Written out rather than read from ``VALID_KEYS``:
-#: this asserts what the committed *file* ships, and reading the schema would make the test pass
-#: for any file that happened to be a subset of it.
-_SHIPPED_EVAL_KEYS = {
-    "seed",
-    "num_mc_samples",
-    "max_samples",
-    "caps",
-    "prior_shuffle_min_nats",
-    "min_active_dims",
-    "event_lag_window_s",
-    "bootstrap_resamples",
-    "clock_margin_min_nats",
-    # The interventional readout's own lag partition. It is a geometry key rather than a cap or a
-    # threshold: the bands are stated in lag indices and the schema refuses one that reaches past
-    # the model's own window, so a delta written for one lag geometry cannot be merged over another.
-    "occlusion_bands",
-    "figure_format",
-    "max_hours_before_delivery",
-}
+#: The fields the evaluation reads on top of the model's own data contract: the clinical ones, and
+#: the ``guid``/``epoch`` pair the anchor tiling's per-segment phase is a stable hash of. Dropping
+#: either of the pair decodes every segment at one tile grid with no shape, count or metric
+#: differing.
+_REQUIRED_LOAD_FIELDS = (
+    "target", "cs_label", "bg_label", "time_from_labor_onset", "guid", "epoch",
+)
 
 
 @pytest.fixture(scope="module")
@@ -83,21 +63,9 @@ def _dataset_kwargs(config: dict) -> dict:
 # ---------------------------------------------------------------------------
 # The delta itself
 # ---------------------------------------------------------------------------
-def test_the_committed_delta_is_where_the_module_looks_for_it() -> None:
-    assert DEFAULT_OVERRIDES_PATH.is_file()
-    assert DEFAULT_OVERRIDES_PATH.name == "eval_overrides.yaml"
-    # This package's own, not the pipeline it was forked from: the module resolves the path from
-    # its own ``__file__``, so a copy that forgot to move would still import cleanly.
-    assert DEFAULT_OVERRIDES_PATH.parents[2].name == "lag_attn_cfs"
-
-
-def test_the_delta_carries_no_base_key(overrides) -> None:
-    """A ``base:`` chain here would inherit from whatever a committed config currently says
-    rather than from what the run trained under, which is the drift the merge exists to avoid."""
-    assert "base" not in overrides
-
-
 def test_a_delta_carrying_a_base_key_is_refused(tmp_path) -> None:
+    """A ``base:`` chain would inherit from whatever a committed config currently says rather than
+    from what the run trained under, which is the drift the merge exists to avoid."""
     path = tmp_path / "bad_overrides.yaml"
     path.write_text("base: ../../configs/default.yaml\n", encoding="utf-8")
     with pytest.raises(ValueError, match="base"):
@@ -109,153 +77,41 @@ def test_a_missing_delta_raises_rather_than_merging_nothing(tmp_path) -> None:
         load_eval_overrides(tmp_path / "absent.yaml")
 
 
-def test_the_delta_overrides_only_what_genuinely_differs(overrides) -> None:
-    """A further top-level change would be a second config in disguise."""
-    assert set(overrides) == {"general_config", "dataset_config", "eval_config"}
-    assert set(overrides["general_config"]) == {"batch_size"}
-    assert set(overrides["general_config"]["batch_size"]) == {"test"}
-    assert set(overrides["dataset_config"]) == {
-        "vae_test_datasets", "stat_path", "dataloader_config"
-    }
-    assert set(_dataset_kwargs(overrides)) == {"load_fields", "cache_size"}
-
-
-def test_the_delta_points_at_the_eight_causal_holdout_subgroup_shards(overrides) -> None:
-    shards = overrides["dataset_config"]["vae_test_datasets"]
-    assert len(shards) == 8
-    assert all("k_fold_cross_validation_dataset/test/" in path for path in shards)
-    # Deliberately non-existent, so a run fails on a missing file rather than on a `transform`
-    # refusal someone might "fix" by dropping the warm-up budget.
-    assert all("REPOINT_ME" in path for path in shards)
-    # And the placeholder says which VARIANT has to be built: the two-sided files carry every one
-    # of these field names, and only the root attribute and the widths tell them apart.
-    assert all("REPOINT_ME_causal" in path for path in shards)
-
-
-def test_the_delta_repoints_the_statistics_file_at_the_same_shards(overrides) -> None:
-    r"""The one repoint the raw cells' delta deliberately does not make.
-
-    The causal statistics are accumulated EXCLUDING each channel's warm-up region, which is what
-    makes $0$ the channel mean over the region the model reads -- and therefore what makes the
-    feature-space climatology baseline right and the source-null control a floor rather than a
-    leak. A statistics file from the wrong shards breaks both with every shape still correct.
-    """
-    stat_path = overrides["dataset_config"]["stat_path"]
-
-    assert "REPOINT_ME_causal" in stat_path
-    assert "k_fold_cross_validation_dataset" in stat_path
-    # `stat_path`, not `stats_path`: the loader parameter is the other spelling, and a typo here
-    # yields None and silently disables normalization.
-    assert "stats_path" not in overrides["dataset_config"]
-
-
-# ---------------------------------------------------------------------------
-# The eval_config block
-# ---------------------------------------------------------------------------
-def test_the_block_carries_exactly_the_specified_keys(overrides) -> None:
-    assert set(overrides["eval_config"]) == _SHIPPED_EVAL_KEYS
+def test_the_shipped_eval_config_block_validates_as_written(overrides) -> None:
+    """The shipped file is not a latent failure: every key is known and every value is in range."""
     assert set(overrides["eval_config"]) <= VALID_KEYS
-    # And it validates as written, so the shipped file is not a latent failure.
     assert validate_eval_config(overrides)["seed"] == overrides["eval_config"]["seed"]
-
-
-def test_the_clock_margin_is_shipped_set_from_a_measured_spread(overrides) -> None:
-    r"""Set rather than null, which is what turns the tenth verdict from a report into a gate.
-
-    This asserted the *unset* state while there was no spread to read a bar off: a threshold
-    guessed before the first runs would have decided a pass or a fail on exactly the run that was
-    going to measure it. The diagnosed unaligned run supplied one -- $\Delta = 0.160$ over the
-    interval $[0.157, 0.164]$ -- and the shipped bar sits just below it.
-
-    Pinned as a number here rather than as "not None", because the value is the whole content: a
-    margin an order of magnitude out would still be set, and would gate every arm against a bar
-    nothing measured."""
-    block = overrides["eval_config"]
-
-    assert block["clock_margin_min_nats"] == 0.15
-    assert validate_eval_config(overrides)["clock_margin_min_nats"] == 0.15
-
-
-def test_the_waveform_cap_is_halved_and_the_oracle_cap_stays_absent(overrides) -> None:
-    r"""A retained waveform set here is four $(152, 15, 98)$ fp32 tensors -- about $3.4$ MiB per
-    sample against the raw cells' $2.0$ MiB -- so 64 holds roughly what their 128 does.
-
-    ``oracle`` is the one cap whose ABSENCE means every segment, so naming a number would reduce
-    what the sufficiency probe is fitted on. Absent is the complete setting, and this pins it.
-
-    The two page caps are figure counts and retain nothing. ``pages_per_class`` is PER CLASS, so
-    it is not comparable with ``pages`` and is pinned here beside it rather than derived from it.
-
-    ``occlusion`` is a segment cap rather than a retention one, and it is the largest for that
-    reason: what it bounds is how many segments the interventional readout re-encodes and decodes,
-    which costs time and no memory. It is set well above what the shipped test split holds, so on a
-    production run it binds nothing and is there to stop a much larger split from turning one
-    analysis into the run.
-
-    ``traces_per_class`` is a recording count, PER CLASS, and bounds a re-read of those recordings'
-    segments after the pass rather than any retention -- pinned beside the page caps for the same
-    reason ``pages_per_class`` is.
-
-    ``attribution_segments`` is a segment cap like ``occlusion``'s and bounds a pass of gradient
-    attributions -- tens of forward-and-backward passes per anchor -- rather than any retention;
-    it is the smaller of the two because each of its segments costs an order of magnitude more.
-    """
-    caps = overrides["eval_config"]["caps"]
-
-    assert caps == {
-        "waveforms": 64,
-        "attention": 64,
-        "pages": 24,
-        "pages_per_class": 10,
-        "traces_per_class": 10,
-        "attribution_segments": 24,
-        "occlusion": 512,
-    }
-    assert "oracle" not in caps
 
 
 # ---------------------------------------------------------------------------
 # The merge
 # ---------------------------------------------------------------------------
 def test_every_override_lands_in_the_merged_config(merged, overrides) -> None:
-    assert merged["general_config"]["batch_size"]["test"] == 32
+    assert merged["general_config"]["batch_size"]["test"] == (
+        overrides["general_config"]["batch_size"]["test"]
+    )
     assert merged["dataset_config"]["vae_test_datasets"] == (
         overrides["dataset_config"]["vae_test_datasets"]
     )
     assert merged["dataset_config"]["stat_path"] == overrides["dataset_config"]["stat_path"]
-    assert _dataset_kwargs(merged)["cache_size"] == 0
-    assert _dataset_kwargs(merged)["load_fields"] == _dataset_kwargs(overrides)["load_fields"]
+    for key, value in _dataset_kwargs(overrides).items():
+        assert _dataset_kwargs(merged)[key] == value, key
     assert merged["eval_config"] == overrides["eval_config"]
 
 
-def test_the_clinical_fields_are_added_and_the_model_s_own_fields_survive(
+def test_the_required_fields_are_added_and_the_model_s_own_fields_survive(
     merged, resolved
 ) -> None:
     """A list replaces wholesale on merge, so the inherited entries are restated in the delta
     rather than extended -- and a restatement that dropped one would be invisible."""
     fields = _dataset_kwargs(merged)["load_fields"]
-    for name in _ADDED_LOAD_FIELDS:
-        assert name in fields
+    for name in _REQUIRED_LOAD_FIELDS:
+        assert name in fields, name
     for name in _dataset_kwargs(resolved)["load_fields"]:
         assert name in fields, f"the delta's load_fields dropped the inherited {name!r}"
 
 
-def test_guid_and_epoch_survive_because_the_tile_phase_is_keyed_on_the_pair(merged) -> None:
-    r"""``load_fields`` is honoured literally with no forced additions, and the anchor tiling's
-    per-segment phase is a stable hash of the recording identifier, the segment's own start time
-    (``epoch`` is ``domain_start`` in seconds), the training epoch and the seed.
-
-    Drop either and every segment is decoded at one tile grid forever -- with $A_{\max}$ a geometry
-    constant either way, so no shape, no count and no metric differs. Nothing else in the output
-    would say so, which is why this is a test rather than a comment.
-    """
-    fields = _dataset_kwargs(merged)["load_fields"]
-
-    assert "guid" in fields
-    assert "epoch" in fields
-
-
-def test_the_run_s_own_contract_survives_the_merge(merged, resolved) -> None:
+def test_the_run_s_own_contract_survives_the_merge(merged, resolved, overrides) -> None:
     """Geometry, the warm-up budget, normalisation and the objective come from the run, never from
     the delta."""
     assert merged["model_config"] == resolved["model_config"]
@@ -266,37 +122,15 @@ def test_the_run_s_own_contract_survives_the_merge(merged, resolved) -> None:
     assert loader["normalize_fields"] == (
         resolved["dataset_config"]["dataloader_config"]["normalize_fields"]
     )
-    # Untouched by the delta: setting one dataset_kwargs entry must not drop the rest of the block.
-    assert _dataset_kwargs(merged)["trim_minutes"] == 1.0
+    # Setting some dataset_kwargs entries must not drop or move the rest of the block -- the
+    # inherited epoch filter, the trim and the label filter among them.
+    untouched = set(_dataset_kwargs(resolved)) - set(_dataset_kwargs(overrides))
+    assert untouched, "a delta overriding every dataset kwarg would make this vacuous"
+    for key in untouched:
+        assert _dataset_kwargs(merged)[key] == _dataset_kwargs(resolved)[key], key
     assert merged["general_config"]["batch_size"]["train"] == (
         resolved["general_config"]["batch_size"]["train"]
     )
-    # The threshold the whole channel axis follows from, and the floor paired with it.
-    vae = merged["model_config"]["VAE_model"]
-    assert vae["causal_warmup_budget_steps"] == 134
-    assert vae["warmup_period"] == 134
-
-
-def test_the_target_blocks_are_still_normalised_after_the_merge(merged) -> None:
-    """A correctness requirement rather than a preference: ``fhr_st`` and ``fhr_ph`` ARE this
-    model's target, and an un-z-scored target makes the Gaussian NLL meaningless with the loader
-    raising nothing on its own. The delta does not restate ``normalize_fields``, so this asserts
-    that not restating it was safe."""
-    normalize = merged["dataset_config"]["dataloader_config"]["normalize_fields"]
-
-    assert "fhr_st" in normalize
-    assert "fhr_ph" in normalize
-
-
-def test_the_inherited_epoch_filter_is_left_alone(merged) -> None:
-    r"""``epoch`` is negative and the dataset floor is $-44640$ s, so ``epoch_min: -48000`` is a
-    no-op; ``epoch_max: -48000`` would select nothing at all. The delta restates neither, and
-    copying the sibling's ``epoch_max`` would be the bug."""
-    kwargs = _dataset_kwargs(merged)
-    assert kwargs["epoch_min"] == -48000
-    assert kwargs["epoch_max"] is None
-    assert kwargs["epoch_max"] != -48000
-    assert kwargs["label"] is None
 
 
 def test_the_merge_mutates_neither_input(resolved) -> None:

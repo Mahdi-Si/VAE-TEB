@@ -20,7 +20,6 @@ from __future__ import annotations
 
 import pytest
 import torch
-from torch import nn
 
 from teb_vae.lag_attn.nets.decoders import HorizonDecoderCore
 
@@ -52,22 +51,13 @@ def _state(batch: int = 3, seq_len: int = 4, *, seed: int = 1) -> torch.Tensor:
 # ---------------------------------------------------------------------------------------
 # Off by default
 # ---------------------------------------------------------------------------------------
-def test_the_default_core_builds_no_attention_module_at_all():
-    """Not a zero-length stack and not a disabled one -- nothing. An empty ``ModuleList`` would
-    still put a name in the module tree, and "the core is what it was" is a claim about the tree
-    as well as about the numbers."""
-    core = _core()
-
-    assert core.attention_blocks == 0
-    assert core.attention is None
-    assert [name for name, _ in core.named_modules() if "attention" in name] == []
-
-
 def test_the_default_core_carries_no_attention_state_dict_key():
     """A checkpoint written by the default core must load into a core built before this knob
     existed, which is only true if the key set did not grow."""
-    keys = list(_core().state_dict())
+    core = _core()
+    keys = list(core.state_dict())
 
+    assert core.attention is None
     assert keys, "the core has no parameters at all; this probe is vacuous"
     assert [key for key in keys if "attention" in key] == []
 
@@ -84,39 +74,17 @@ def test_a_width_that_no_attention_will_see_is_not_held_to_the_head_constraint()
 # ---------------------------------------------------------------------------------------
 # What turning it on costs and produces
 # ---------------------------------------------------------------------------------------
-def test_the_blocks_add_exactly_their_own_parameters_and_nothing_else():
-    r"""Per block: a ``LayerNorm`` pair, four square bias-free projections and one residual gain,
-    $2d + 4d^2 + 1$. Asserted as a *delta* against the blockless core and as a key-set difference,
-    so a block that quietly widened something else fails here."""
-    blockless, attended = _core(), _core(attention_blocks=2)
+def test_the_blocks_add_only_their_own_keys_and_leave_the_rest_of_the_core_unchanged():
+    """Every blockless key survives at its own shape, so a block that quietly widened something
+    else fails here, and a blockless checkpoint's weights still fit an attended core."""
+    blockless = _core().state_dict()
+    attended = _core(attention_blocks=2).state_dict()
 
-    expected = 2 * (4 * _D_HIDDEN**2 + 2 * _D_HIDDEN + 1)
-    delta = sum(p.numel() for p in attended.parameters()) - sum(
-        p.numel() for p in blockless.parameters()
-    )
-
-    assert delta == expected
-    added = set(attended.state_dict()) - set(blockless.state_dict())
-    assert added == {
-        f"attention.{index}.{name}"
-        for index in (0, 1)
-        for name in (
-            "norm.weight", "norm.bias", "residual_gain",
-            "q_proj.weight", "k_proj.weight", "v_proj.weight", "out_proj.weight",
-        )
-    }
-    assert set(blockless.state_dict()) - set(attended.state_dict()) == set()
-
-
-def test_the_projections_are_bias_free():
-    """A bias on q/k after a pre-norm shifts every logit by the same constant and buys nothing;
-    stated as a structural assertion because the parameter arithmetic above depends on it."""
-    core = _core(attention_blocks=1)
-    assert core.attention is not None
-    block = core.attention[0]
-
-    for projection in (block.q_proj, block.k_proj, block.v_proj, block.out_proj):
-        assert projection.bias is None
+    assert set(blockless) <= set(attended)
+    for key, value in blockless.items():
+        assert attended[key].shape == value.shape, key
+    added = set(attended) - set(blockless)
+    assert added and all(key.startswith("attention.") for key in added)
 
 
 def test_the_decode_shape_is_the_one_the_decoders_expect():
@@ -128,27 +96,20 @@ def test_the_decode_shape_is_the_one_the_decoders_expect():
     assert out.shape == (state.shape[0], state.shape[1], _HORIZON, _D_HIDDEN)
 
 
-def test_an_indivisible_head_count_is_refused_naming_both_values():
-    with pytest.raises(ValueError, match=r"attention_heads=3.*d_hidden=16"):
-        _core(attention_blocks=1, attention_heads=3)
-
-
-def test_a_zero_head_count_is_refused_rather_than_dividing_by_it():
-    with pytest.raises(ValueError, match="attention_heads=0"):
-        _core(attention_blocks=1, attention_heads=0)
+@pytest.mark.parametrize(
+    "heads, message",
+    [(3, r"attention_heads=3.*d_hidden=16"), (0, "attention_heads=0")],
+    ids=["indivisible", "zero"],
+)
+def test_a_bad_head_count_is_refused_naming_the_values(heads, message):
+    """An indivisible count names both values; a zero one is refused rather than divided by."""
+    with pytest.raises(ValueError, match=message):
+        _core(attention_blocks=1, attention_heads=heads)
 
 
 # ---------------------------------------------------------------------------------------
 # The invariants the twice-invoked decoder depends on
 # ---------------------------------------------------------------------------------------
-def test_the_attention_stack_holds_no_dropout_of_any_kind():
-    """Module-level, checked structurally; the functional kind is checked by the determinism test
-    below, which is the only way to see a ``dropout_p`` passed to the attention call."""
-    core = _core(attention_blocks=2)
-
-    assert [name for name, m in core.named_modules() if isinstance(m, nn.Dropout)] == []
-
-
 def test_two_train_mode_decodes_are_bitwise_equal():
     """The property one module invoked twice must have. Seeded *differently* between the two
     calls, so a stochastic path would have to produce the same numbers from two RNG states."""

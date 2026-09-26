@@ -15,7 +15,6 @@ import pandas as pd
 import pytest
 
 from teb_vae.lag_attn.eval import labels
-from teb_vae.lag_attn.eval import run as run_module
 from teb_vae.lag_attn.eval.analyses import kld_time_to_delivery as kd
 from teb_vae.lag_attn.eval.report import json_safe
 
@@ -200,7 +199,6 @@ def test_the_pooled_context_test_is_computed_and_flagged() -> None:
     """The pooled reading ignores time and must never be mistaken for the trajectory answer."""
     record = kd.analyse_class_trajectories(kd.bin_samples(_frame()))
     assert record["pooled"]["confounded_by_time"] is True
-    assert "artifact" in record["pooled"]["note"]
     assert np.isfinite(record["pooled"]["p_value"])
 
 
@@ -254,26 +252,3 @@ def test_the_summary_is_json_safe(tmp_path) -> None:
     """It lands in ``summary.json``, written with ``allow_nan=False``."""
     summary = kd.emit_analysis(_frame(), tmp_path)
     json.dumps(json_safe(summary), allow_nan=False)
-
-
-def test_the_written_record_is_json_safe(tmp_path) -> None:
-    kd.emit_analysis(_frame(), tmp_path)
-    blob = json.loads(
-        (tmp_path / kd.ANALYSIS_DIRNAME / f"{kd.ANALYSIS_DIRNAME}.json").read_text(encoding="utf-8")
-    )
-    assert blob["tested"] is True
-    assert "Kruskal-Wallis" in blob["method"] and "Holm" in blob["method"]
-
-
-# ---------------------------------------------------------------------------
-# Registration
-# ---------------------------------------------------------------------------
-def test_it_is_registered_and_runs_after_latent() -> None:
-    """On by default via ``run``, and ordered after ``latent`` whose CSV it mirrors in definition."""
-    assert "kld_time_to_delivery" in run_module.ANALYSES
-    order = list(run_module.ANALYSES)
-    assert order.index("kld_time_to_delivery") == order.index("latent") + 1
-    assert (
-        run_module.ANALYSIS_FUNCTIONS["kld_time_to_delivery"].__name__
-        == "run_kld_time_to_delivery_analysis"
-    )

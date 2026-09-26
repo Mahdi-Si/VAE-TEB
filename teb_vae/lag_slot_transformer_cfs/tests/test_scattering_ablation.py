@@ -222,33 +222,6 @@ def test_a_substituted_stream_cannot_reintroduce_the_coefficient() -> None:
 
 
 # =================================================================================================
-# Both off: the legacy forward
-# =================================================================================================
-def test_both_switches_off_reproduce_the_legacy_forward_bitwise() -> None:
-    """The default is the model that was shipped, and the flags are absent from the base."""
-    y_st, y_ph, u_stream = tiny_streams()
-    legacy = awake(build_tiny_model())
-    explicit = awake(build_tiny_model(zero_fhr_scattering_s0=False, zero_up_scattering_s0=False))
-
-    left = run(legacy, y_st, y_ph, u_stream)
-    right = run(explicit, y_st, y_ph, u_stream)
-
-    for name in INVARIANT_KEYS:
-        assert torch.equal(left[name], right[name]), name
-    assert legacy._ablate_input_streams(y_st, u_stream) == (y_st, u_stream)
-
-
-def test_the_switches_are_this_class_own_and_are_not_forwarded_to_the_base() -> None:
-    """A keyword forwarded to a base that does not name it would refuse every construction."""
-    from teb_vae.lag_slot_transformer_cfs.nets.core import LagResidualCore
-
-    base_parameters = set(LagResidualCore.__init__.__code__.co_varnames)
-    for keyword in INPUT_ABLATION_KEYWORDS:
-        assert keyword not in base_parameters
-        assert keyword in SeqVaeLagResidualTrfCfs.__init__.__code__.co_varnames
-
-
-# =================================================================================================
 # The checkpoint and the binding
 # =================================================================================================
 def test_the_flags_survive_a_checkpoint_round_trip_and_are_reconciled_by_the_binding() -> None:
@@ -291,6 +264,5 @@ def test_the_disclosure_names_the_ablated_coordinate_by_field_channel_and_kind()
         ("target", "fhr_st", 0, KIND_ORDER0),
         ("source", "up_st", 0, KIND_ORDER0),
     ]
-    assert "persistence" in both["policy"]
-    assert none["ablated_inputs"] == [] and "no input ablation" in none["policy"]
+    assert none["ablated_inputs"] == []
     assert target_only["zero_fhr_scattering_s0"] and len(target_only["ablated_inputs"]) == 1

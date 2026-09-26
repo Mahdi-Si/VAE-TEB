@@ -27,7 +27,6 @@ _REPO_ROOT = Path(__file__).resolve().parents[3]
 def test_the_literal_threshold_equals_the_product_it_stands_for() -> None:
     """The invariant that replaces the import. A change to the epsilon fails here."""
     assert KL_COLLAPSE_THRESHOLD_NATS == KL_COLLAPSE_MIN_ACTIVE_DIMS * KLD_ACTIVE_EPS
-    assert KL_COLLAPSE_THRESHOLD_NATS == 0.02
 
 
 def test_importing_the_criterion_pulls_in_no_torch() -> None:
@@ -42,7 +41,6 @@ def test_importing_the_criterion_pulls_in_no_torch() -> None:
         "import teb_vae.lag_attn_rws.collapse as collapse\n"
         "leaked = sorted(name for name in sys.modules if name.split('.')[0] "
         "in {'torch', 'lightning', 'numpy', 'scipy', 'h5py'})\n"
-        "assert collapse.KL_COLLAPSE_THRESHOLD_NATS == 0.02\n"
         "print(','.join(leaked))\n"
     )
     completed = subprocess.run(

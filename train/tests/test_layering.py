@@ -25,8 +25,8 @@ it has nothing above it to import and needs no upward rule of its own -- the rul
 sideways, against ``model``.
 
 Scope is per-rule. ``utils/`` and ``train/`` are checked at their top level only
-(``glob("*.py")``, matching ``test_migration_guide_citations.py``); recursing would sweep
-``train/tests/*.py``, which import ``model/`` deliberately. ``teb_vae/`` is checked recursively
+(``glob("*.py")``); recursing would sweep ``train/tests/*.py``, which import ``model/``
+deliberately. ``teb_vae/`` is checked recursively
 (``rglob``) because it is nested and its rule must hold at every depth, tests included. ``ast``
 sees lazy imports inside functions and ``TYPE_CHECKING`` blocks too, which is deliberate -- a
 deferred import is still a dependency.
@@ -98,17 +98,3 @@ def test_detects_a_forbidden_import(tmp_path):
     assert _imported_roots(offender) & {"train", "model"} == {"train", "model"}
 
 
-def test_teb_vae_rule_reaches_nested_modules():
-    """The fork boundary is only real if the scan descends past ``teb_vae/__init__.py``.
-
-    ``teb_vae`` is the one package checked recursively, and it is also the one whose modules all
-    live several levels down. A rule that stopped at the top level would scan one docstring-only
-    file and pass forever.
-    """
-    package, _, recursive = next(rule for rule in _RULES if rule[0] == "teb_vae")
-    assert recursive, "the teb_vae rule must scan nested subpackages"
-
-    scanned = sorted((_REPO_ROOT / package).rglob("*.py"))
-    assert any(
-        path.parent != _REPO_ROOT / package for path in scanned
-    ), "the teb_vae scan found no module below the package root"

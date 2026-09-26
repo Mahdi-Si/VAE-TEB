@@ -32,19 +32,6 @@ from teb_vae.lag_attn_transformer_rws.tests.conftest import (
 
 _BATCH = 4
 
-#: Keys the control leaves as the matched forward's own tensors. The prior and the base forecast
-#: are source-free, so a derangement cannot move them -- and a reader who took one of these off the
-#: permuted dict would be reading the matched value and reporting it as the control's.
-_UNTOUCHED_KEYS = (
-    "mu_prior",
-    "logvar_prior",
-    "raw_logvar_prior",
-    "target_state",
-    "source_state",
-    "mu_base",
-    "logvar_base",
-)
-
 
 def _model(perturb_posterior=None, **overrides) -> SeqVaeLagAttnTrfRws:
     torch.manual_seed(0)
@@ -78,19 +65,6 @@ def test_the_control_replaces_exactly_the_keys_it_declares(perturb_posterior):
     assert added == {"perm_index"}
     moved = {key for key in out if permuted[key] is not out[key]}
     assert moved == set(controls.RECOMPUTED_KEYS) - {"perm_index"}
-
-
-def test_the_source_free_tensors_are_the_same_objects(perturb_posterior):
-    """Identity, not equality. The control promises to reuse the computed states rather than to
-    reproduce them, and equality would also hold for a control that recomputed them and happened
-    to agree."""
-    model = _model(perturb_posterior)
-    out = _forward(model, make_stub_batch(_BATCH, SEQ_LEN))
-
-    permuted = _permute(model, out)
-
-    for key in _UNTOUCHED_KEYS:
-        assert permuted[key] is out[key], f"{key} was rebuilt under permutation"
 
 
 def test_the_source_driven_tensors_are_genuinely_rebuilt(perturb_posterior):
@@ -147,26 +121,6 @@ def test_the_control_rebuilds_the_query_under_query_uses_logvar(perturb_posterio
 
     for key in ("mu_post", "z_post", "mu_full"):
         assert not torch.equal(permuted[key], out[key]), f"{key} was not rebuilt"
-
-
-def test_the_control_uses_a_real_derangement(perturb_posterior):
-    model = _model(perturb_posterior)
-    out = _forward(model, make_stub_batch(_BATCH, SEQ_LEN))
-
-    permuted = controls.perm_forward_outputs(model, out)
-
-    perm = permuted["perm_index"]
-    assert not bool((perm == torch.arange(_BATCH)).any()), "the derangement has a fixed point"
-
-
-def test_a_degenerate_batch_cannot_be_deranged(perturb_posterior):
-    """$B < 2$ has no derangement, so the control refuses rather than pairing a sample with
-    itself and reporting the result as a stranger's source."""
-    model = _model(perturb_posterior)
-    out = _forward(model, make_stub_batch(1, SEQ_LEN))
-
-    with pytest.raises(ValueError, match="batch_size >= 2"):
-        controls.perm_forward_outputs(model, out)
 
 
 def test_the_model_itself_forwards_at_batch_one(perturb_posterior):

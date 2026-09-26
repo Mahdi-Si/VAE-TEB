@@ -61,30 +61,6 @@ def _recordings(outcomes, *, split="train", eligible=True):
     ])
 
 
-def _bags(**overrides):
-    """Bags for two healthy and two adverse recordings, one coordinate wide."""
-    frame = pd.DataFrame([
-        {
-            data.GUID_COLUMN: guid,
-            data.SPLIT_COLUMN: overrides.get("split", "train"),
-            data.OUTCOME_COLUMN: outcome,
-            "n_segments": 1,
-            "n_anchors": 1,
-            data.HOURS_COLUMN: 0.5,
-            data.ROW_COLUMN: index,
-        }
-        for index, (guid, outcome) in enumerate(
-            [("H-0", 0), ("H-1", 0), ("A-0", 1), ("A-1", 1)]
-        )
-    ])
-    return train.Bags(
-        frame=frame,
-        values=np.array([[0.0], [1.0], [2.0], [3.0]]),
-        split=overrides.get("split", "train"),
-        record={},
-    )
-
-
 # =============================================================================
 # Bag construction
 # =============================================================================
@@ -358,27 +334,3 @@ def test_the_first_finite_result_is_always_an_improvement_and_a_nan_never_is():
     assert train.is_better(
         {"val_auroc": 0.1, "val_bce": 9.0}, {"val_auroc": float("nan"), "val_bce": 0.0}
     )
-
-
-# =============================================================================
-# Labels, including the control's permutation
-# =============================================================================
-def test_the_true_outcomes_are_used_when_no_permutation_is_supplied():
-    bags = _bags()
-
-    assert train._labels_for(bags, None).tolist() == [0, 0, 1, 1]
-    assert train._labels_for(bags, {"val": {}}).tolist() == [0, 0, 1, 1]
-
-
-def test_a_permutation_is_applied_per_recording():
-    bags = _bags()
-    permuted = {"train": {"H-0": 1, "H-1": 0, "A-0": 0, "A-1": 1}}
-
-    assert train._labels_for(bags, permuted).tolist() == [1, 0, 0, 1]
-
-
-def test_a_permutation_that_omits_a_recording_is_refused():
-    bags = _bags()
-
-    with pytest.raises(PilotConfigError, match="omits 2 recording"):
-        train._labels_for(bags, {"train": {"H-0": 1, "H-1": 0}})

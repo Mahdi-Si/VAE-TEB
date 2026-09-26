@@ -104,15 +104,17 @@ def shipped_kwargs() -> dict:
     return dict(SHIPPED_KWARGS)
 
 
-# The loss hyperparameters the shipped config sets, as the task's constructor takes them.
-# `beta_schedule=None` means the constant `kld_beta` applies, which keeps beta out of the way of
-# tests that are not about the schedule.
+# The loss hyperparameters the shipped config sets, as the task's constructor takes them -- except
+# beta: `beta_schedule=None` means the constant `kld_beta` applies, which keeps beta out of the way
+# of tests that are not about the schedule (the eval suite's `eval_tiny.yaml` restates those two
+# keys to match). Every other leaf must equal `configs/default.yaml`, because the eval preflight
+# refuses a checkpoint whose objective disagrees with the config it is evaluated under.
 PROD_HPARAMS = dict(
     lambda_full=1.0,
     lambda_base=0.5,
     likelihood="gaussian_nll",
     sigma_obs="learned",
-    free_bits=0.1,
+    free_bits=0.01,
     detach_baseline_in_full=True,
     lambda_lag=1.0e-3,
     kld_beta=0.01,

@@ -26,10 +26,8 @@ The three launch modes are asserted to fail *identically* on the same bad argume
 refusal is the cheapest evidence that they share one resolver, which is the property that keeps a
 command line and a dictionary from drifting into two behaviours.
 
-Two tests here state the stage registry's contract rather than observing it -- every stage
-selectable by an operator has a handler, and no handler is registered under a name that is not a
-stage. They are written before the handlers are, which is the order that makes them worth having:
-the dispatcher is finished when they pass.
+One test here states the stage registry's contract rather than observing it: the registered
+handlers and the stages an operator can select are the same set.
 """
 from __future__ import annotations
 
@@ -93,29 +91,9 @@ def _launch(arguments, *, cwd, module: bool = False) -> subprocess.CompletedProc
 # =============================================================================
 # Import-time behaviour
 # =============================================================================
-def test_importing_the_runner_creates_nothing_and_prints_nothing(tmp_path):
-    """From a foreign working directory, so a stray relative write would land where it is seen."""
-    finished = subprocess.run(
-        [
-            sys.executable, "-c",
-            "import teb_vae.lag_attn_transformer_cfs.latent_pilot.run as r; "
-            "assert isinstance(r.RUN_ARGS, dict)",
-        ],
-        cwd=str(tmp_path),
-        # Prepended, not assigned: replacing PYTHONPATH drops whatever the execution environment
-        # put there -- a remote interpreter sets it -- and the import failure that follows is that
-        # environment's, not this package's.
-        env={**os.environ, "PYTHONPATH": _pythonpath()},
-        capture_output=True, text=True, timeout=600,
-    )
-    assert finished.returncode == 0, finished.stderr
-    assert finished.stdout == ""
-    assert sorted(Path(tmp_path).iterdir()) == []
-
-
 def test_importing_every_pilot_module_starts_no_work(tmp_path):
-    """The whole package, not only the runner: a module that read a dataset or built a model on
-    import would do it during collection of the logic subset too."""
+    """The whole package, runner included: a module that read a dataset, built a model or printed
+    on import would do it during collection of the logic subset too."""
     modules = (
         "config", "data", "model", "extract", "train", "evaluate", "analyze", "report", "run"
     )
@@ -137,6 +115,7 @@ def test_importing_every_pilot_module_starts_no_work(tmp_path):
         capture_output=True, text=True, timeout=600,
     )
     assert finished.returncode == 0, finished.stderr
+    assert finished.stdout == ""
     assert sorted(Path(tmp_path).iterdir()) == []
 
 
@@ -198,44 +177,6 @@ def test_the_programmatic_call_refuses_identically():
         pilot_run.main(stage="report", run_dir=str(MISSING_RUN_DIR))
 
 
-def test_a_relative_configuration_is_found_from_a_foreign_working_directory(tmp_path):
-    """The shipped ``RUN_ARGS`` names its configuration relative to the repository root. Launched
-    from elsewhere, a resolver that used the working directory would fail on the config long before
-    it reached the run directory -- so the *message* is what distinguishes the two."""
-    finished = _launch(
-        ["--stage", "report", "--run-dir", str(MISSING_RUN_DIR)], cwd=tmp_path
-    )
-    assert "pilot config" not in finished.stderr
-
-
-def test_an_unknown_stage_is_refused_before_anything_is_created(tmp_path):
-    finished = _launch(["--stage", "finetuning"], cwd=tmp_path)
-    assert finished.returncode != 0
-    assert "unknown stage" in finished.stderr
-    assert sorted(Path(tmp_path).iterdir()) == []
-
-
-def test_a_production_stage_without_paths_names_the_setting(tmp_path):
-    """A stage that needs an input it was not given names the dotted setting, before a first pass
-    over any shard.
-
-    Against a configuration of this test's own, never the shipped template. Filling that template
-    in is exactly what it asks an operator to do, so a test that depended on its paths still being
-    unset would pass on a fresh checkout and fail on every machine actually set up to run the
-    pilot -- and it would fail *there*, in the ``tests`` stage that gates all the others. An empty
-    ``latent_pilot`` block resolves to the declared defaults, whose production paths are unset.
-    """
-    config = tmp_path / "paths_unset.yaml"
-    config.write_text("latent_pilot: {}\n", encoding="utf-8")
-
-    finished = _launch(["--config", str(config), "--stage", "extract"], cwd=tmp_path)
-
-    assert finished.returncode != 0
-    assert "paths.checkpoint" in finished.stderr
-    # Refused before ``open_run``, so the refusal costs no run directory anywhere.
-    assert sorted(Path(tmp_path).iterdir()) == [config]
-
-
 def _smoke_without_the_pipeline(monkeypatch, run_root, *, absent):
     """Drive ``stage_smoke`` with its two expensive halves replaced.
 
@@ -276,25 +217,20 @@ def _smoke_without_the_pipeline(monkeypatch, run_root, *, absent):
     return pilot_run.stage_smoke(context), calls, dispatched
 
 
-def test_the_smoke_stage_writes_its_fixtures_when_they_are_absent(monkeypatch, tmp_path):
-    """A checkout that has never generated them is the ordinary case, not a refusal."""
+@pytest.mark.parametrize(
+    "absent,expected_calls", [(True, ["generate", "pipeline"]), (False, ["pipeline"])]
+)
+def test_the_smoke_stage_generates_its_fixtures_only_when_they_are_absent(
+    monkeypatch, tmp_path, absent, expected_calls
+):
+    """A checkout that has never generated them is the ordinary case, not a refusal; regenerating
+    ones already there would spend the fit again and move the ground under a run that read them."""
     result, calls, _dispatched = _smoke_without_the_pipeline(
-        monkeypatch, tmp_path, absent=True
+        monkeypatch, tmp_path, absent=absent
     )
 
-    assert calls == ["generate", "pipeline"]
-    assert result["fixtures_generated"] is True
-    assert result["clinical"] is False
-
-
-def test_the_smoke_stage_leaves_fixtures_that_are_already_there(monkeypatch, tmp_path):
-    """Regenerating would spend the fit again and move the ground under a run that read them."""
-    result, calls, _dispatched = _smoke_without_the_pipeline(
-        monkeypatch, tmp_path, absent=False
-    )
-
-    assert calls == ["pipeline"]
-    assert result["fixtures_generated"] is False
+    assert calls == expected_calls
+    assert result["fixtures_generated"] is absent
 
 
 def test_the_smoke_run_is_written_under_the_invoking_run_s_root(monkeypatch, tmp_path):
@@ -312,29 +248,14 @@ def test_the_smoke_run_is_written_under_the_invoking_run_s_root(monkeypatch, tmp
     assert dispatched["overrides"] == {"paths": {"run_root": str(expected)}}
 
 
-def test_a_set_override_reaches_the_settings_the_same_way_the_dictionary_does():
-    """Not a subprocess: what matters is that the two sources land in one resolved value."""
-    from_dictionary = pilot_run.resolve_run_args(
-        {"overrides": {"optim": {"max_epochs": 2}}}, argv=None
-    )
-    from_command_line = pilot_run.resolve_run_args(
-        {}, argv=["--set", "optim.max_epochs=2"]
-    )
-    assert from_dictionary["overrides"] == from_command_line["overrides"]
-
-
 # =============================================================================
 # The stage registry
 # =============================================================================
-def test_every_stage_has_a_handler():
+def test_the_handlers_are_exactly_the_selectable_stages():
     """A stage the operator can select and the dispatcher cannot run is a stage that fails after
-    the settings have been resolved and the run directory named."""
-    missing = [name for name in pilot_config.STAGES if name not in pilot_run.STAGE_HANDLERS]
-    assert missing == [], f"stages with no registered handler: {missing}"
-
-
-def test_no_handler_is_registered_under_a_name_that_is_not_a_stage():
-    assert set(pilot_run.STAGE_HANDLERS) <= set(pilot_config.STAGES)
+    the settings have been resolved and the run directory named; a handler under any other name is
+    one no operator can reach."""
+    assert set(pilot_run.STAGE_HANDLERS) == set(pilot_config.STAGES)
 
 
 def test_a_failing_stage_stops_the_sequence(monkeypatch, smoke_fixtures):

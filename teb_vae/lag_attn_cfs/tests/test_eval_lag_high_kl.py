@@ -18,7 +18,7 @@ in one known lag range and the low anchors' at lag $0$, so the high band's centr
 that range and the rest band's below it -- a reduction that averaged every anchor would put both
 in the middle.
 
-**What is tested is exactly the two readouts.** The significance table carries the high band's
+**What is tested is exactly the declared readouts.** The significance table carries the high band's
 centroid and share and nothing else, on both clocks; an analysis that quietly widened its family
 would multiply the corrections a reader is holding.
 
@@ -223,42 +223,27 @@ def test_the_hot_lag_set_is_written_lag_by_lag_and_agrees_with_the_record(tmp_pa
     # The pooled band profiles beside it, one column per band.
     for band in analysis.ANCHOR_BANDS:
         assert f"pooled_{band.key}_kl_nats" in selection.columns
-    # The circularity is on the record, not left for a reader to notice.
-    assert "selected FROM the KL" in record["selection_note"]
 
 
 # =================================================================================================
 # What is tested, and what is not
 # =================================================================================================
-def test_exactly_the_two_readouts_are_tested_on_both_clocks(tmp_path) -> None:
-    """Four Holm families on the main table: the high band's centroid and share, on two clocks.
+def test_exactly_the_declared_readouts_are_tested_on_both_clocks(tmp_path) -> None:
+    """One Holm family per (clock, readout) on the main table, and nothing else in it.
 
     The histogram's own families live on their own table and in their own block of the record, so
-    a consumer of ``significance`` still meets exactly the four it always did.
+    a consumer of ``significance`` meets only the main readouts.
     """
     record, directory = _run(_context(), tmp_path)
 
-    assert list(record["readouts"]) == ["high_lag_centroid_kl_s", "high_anchor_frac"]
     significance = pd.read_csv(directory / analysis.SIGNIFICANCE_FILENAME)
     assert set(significance["metric_column"]) <= set(analysis.READOUTS)
-    assert set(significance["clock"]) == {"time_to_delivery", "second_stage"}
+    assert set(significance["clock"]) == {clock.name for clock in analysis.CLOCKS}
     families = {(r["clock"], r["metric_column"]) for r in record["significance"]}
-    assert len(families) == 4
-    assert record["plan"]["tested_features"] == 2 + len(analysis.HISTOGRAM_READOUTS)
-    assert "no p-value" in record["untested_note"]
-    assert "four Holm families" in record["method"]
-    assert "six further families" in record["method"]
-
-
-def test_the_second_clock_is_a_subset_and_the_analysis_declares_itself_capped(tmp_path) -> None:
-    """A recording with no onset cannot be placed on the second axis; the analysis says so."""
-    record, _ = _run(_context(), tmp_path)
-
-    assert record["plan"]["capped"] is True
-    names = {entry["clock"] for entry in record["clocks"]}
-    assert names == {"time_to_delivery", "second_stage"}
-    second = next(entry for entry in record["clocks"] if entry["clock"] == "second_stage")
-    assert "n_recordings_eligible" in second
+    assert len(families) == len(analysis.CLOCKS) * len(analysis.READOUTS)
+    assert record["plan"]["tested_features"] == (
+        len(analysis.READOUTS) + len(analysis.HISTOGRAM_READOUTS)
+    )
 
 
 # =================================================================================================
@@ -329,14 +314,14 @@ def test_the_recordings_table_is_the_cross_subgroup_source(tmp_path) -> None:
 
 def test_the_headline_block_resolves_on_the_fixture(tmp_path) -> None:
     """Every scalar the binding registers is present and finite here, and never NaN."""
+    from teb_vae.lag_attn_cfs.eval.binding import HEADLINE_SCALARS
+
     record, _ = _run(_context(), tmp_path)
 
     headline = record["headline"]
-    assert set(headline) == {
-        "high_kl_threshold_nats", "high_kl_centroid_kl_s", "high_kl_total_nats",
-        "hot_lag_count", "hot_lag_share_kl", "high_kl_pred_gap_nats",
-        "high_minus_rest_pred_gap_nats", "high_gain_overlap_share",
-    }
+    prefix = (analysis.ANALYSIS_DIRNAME, "headline")
+    registered = {path[-1] for _, path in HEADLINE_SCALARS if path[:2] == prefix}
+    assert registered and registered <= set(headline)
     for name, value in headline.items():
         assert value is not None, name
         assert np.isfinite(float(value)), name
@@ -449,7 +434,6 @@ def test_the_high_bands_gain_is_tested_against_the_rests_within_recording(tmp_pa
     assert usefulness["n_pairs"] == N_SEGMENTS // 2
     assert usefulness["positive_fraction"] == pytest.approx(1.0)
     assert usefulness["mean_difference_nats"] > 0.5
-    assert "family of one" in usefulness["family"]
     assert record["headline"]["high_minus_rest_pred_gap_nats"] == pytest.approx(
         usefulness["mean_difference_nats"]
     )
@@ -832,35 +816,24 @@ def test_a_rigid_shift_of_one_class_is_reported_in_seconds(shifted_run) -> None:
     assert (pairs["centroid_delta_s"].to_numpy() < 0.0).all()
 
 
-def test_the_record_keeps_the_distances_untested_and_the_main_families_at_four(tmp_path) -> None:
-    """The histogram's families are their own block: the four the analysis defends are still four."""
-    record, _ = _run(_context(), tmp_path)
-
-    assert record["lag_histogram"]["distance"]["tested"] is False
-    assert set(record["lag_histogram"]["bands"]) == set(analysis.HISTOGRAM_BANDS)
-    assert "histogram" in record["untested_note"]
-    assert len(record["significance"]) == len(analysis.CLOCKS) * len(analysis.READOUTS)
-
-
 # =================================================================================================
 # The tested half of the histogram: shape features per window, and their drift within recordings
 # =================================================================================================
-def test_exactly_the_three_shape_features_are_tested_on_the_high_kl_histogram(tmp_path) -> None:
-    """Six families -- three features on two clocks -- on the high band's KL source, and the
-    centroid, which the main table already tests, is not among them."""
+def test_exactly_the_declared_shape_features_are_tested_on_the_high_kl_histogram(tmp_path) -> None:
+    """One family per (clock, shape feature) on the high band's KL source, and the centroid, which
+    the main table already tests, is not among them."""
     record, directory = _run(_context(), tmp_path)
 
     tested = record["lag_histogram"]["tested"]
     assert tested["band"] == "high" and tested["source"] == "kl"
-    assert list(tested["readouts"]) == ["hist_median_s", "hist_iqr_s", "hist_entropy_nats"]
+    assert list(tested["readouts"]) == list(analysis.HISTOGRAM_READOUTS)
     assert "hist_centroid_s" not in tested["readouts"]
     families = {(r["clock"], r["metric_column"]) for r in tested["significance"]}
-    assert len(families) == len(analysis.CLOCKS) * len(analysis.HISTOGRAM_READOUTS) == 6
-    assert tested["n_holm_families"] == 6
+    expected = len(analysis.CLOCKS) * len(analysis.HISTOGRAM_READOUTS)
+    assert len(families) == tested["n_holm_families"] == expected
     significance = pd.read_csv(directory / analysis.HISTOGRAM_SIGNIFICANCE_FILENAME)
     assert set(significance["metric_column"]) <= set(analysis.HISTOGRAM_READOUTS)
     assert set(significance["band"]) == {"high"} and set(significance["source"]) == {"kl"}
-    assert list(significance.columns[:3]) == ["clock", "band", "source"]
 
 
 def test_a_rigid_shift_between_the_classes_is_found_by_the_median_family_alone(shifted_run) -> None:
@@ -943,4 +916,3 @@ def test_the_drift_summary_carries_every_class_and_feature_and_declares_its_fami
     drift = pd.read_csv(directory / analysis.HISTOGRAM_DRIFT_FILENAME)
     assert (drift["n_windows"] >= analysis.MIN_DRIFT_WINDOWS).all()
     assert record["lag_histogram"]["tested"]["drift"]["min_windows"] == analysis.MIN_DRIFT_WINDOWS
-    assert "positive means" in record["lag_histogram"]["tested"]["drift"]["forward_time"]

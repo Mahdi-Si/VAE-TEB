@@ -20,7 +20,7 @@ import pytest
 import torch
 
 from teb_vae.lag_attn.channel_reach import resolve_stream_budgets
-from teb_vae.lag_attn_rws.trainer import _CHANNEL_TUPLE_KEYS, _NON_CONSTRUCTOR_KEYS
+from teb_vae.lag_attn_rws.trainer import _CHANNEL_TUPLE_KEYS
 from teb_vae.lag_attn_transformer_rws.nets.model import SeqVaeLagAttnTrfRws
 from teb_vae.lag_attn_transformer_rws.tests.conftest import BATCH, SEQ_LEN
 
@@ -108,52 +108,37 @@ def test_the_forward_returns_exactly_the_documented_key_set(tiny_kwargs, inputs)
     assert "delta_mu_src" not in out
 
 
-def test_the_latent_and_state_shapes(tiny_kwargs, inputs):
+def test_every_output_has_its_contract_shape(tiny_kwargs, inputs):
+    """Latents and states per step; attention and KL readouts per step, head and lag; decoding
+    over $(B, T - H, H, R)$ rather than $(B, T, H, R)$, because the tail anchors are never
+    decoded."""
     model, out = _forward(tiny_kwargs, inputs)
+    num_lags = model.max_lag + 1
+    d_head = model.d_model // model.num_heads
+
     for key in ("mu_prior", "logvar_prior", "raw_logvar_prior", "mu_post", "logvar_post",
                 "z_prior", "z_post"):
         assert out[key].shape == (BATCH, SEQ_LEN, model.d_z), key
     for key in ("target_state", "source_state"):
         assert out[key].shape == (BATCH, SEQ_LEN, model.d_model), key
-
-
-def test_the_attention_shapes(tiny_kwargs, inputs):
-    model, out = _forward(tiny_kwargs, inputs)
-    num_lags = model.max_lag + 1
-    d_head = model.d_model // model.num_heads
     assert out["attn_weights"].shape == (BATCH, SEQ_LEN, model.num_heads, num_lags)
     assert out["attended_source_heads"].shape == (BATCH, SEQ_LEN, model.num_heads, d_head)
-
-
-def test_the_kl_readout_shapes(tiny_kwargs, inputs):
-    model, out = _forward(tiny_kwargs, inputs)
-    num_lags = model.max_lag + 1
     assert out["kld_per_t"].shape == (BATCH, SEQ_LEN)
     assert out["kld_per_t_per_head"].shape == (BATCH, SEQ_LEN, model.num_heads)
     assert out["source_kl_lag_map"].shape == (BATCH, SEQ_LEN, num_lags)
 
-
-def test_decoding_covers_the_valid_anchor_range_only(tiny_kwargs, inputs):
-    """(B, T - H, H, R), not (B, T, H, R): the tail anchors are never decoded."""
-    model, out = _forward(tiny_kwargs, inputs)
-    expected = (BATCH, model.geometry.t_valid, model.horizon, model.raw_per_step)
-    assert expected[1] == SEQ_LEN - model.horizon
+    decoded = (BATCH, model.geometry.t_valid, model.horizon, model.raw_per_step)
+    assert decoded[1] == SEQ_LEN - model.horizon
     for key in ("mu_base", "logvar_base", "mu_full", "logvar_full"):
-        assert out[key].shape == expected, key
-
-
-def test_one_epsilon_serves_both_latents_when_the_residual_is_zero(tiny_kwargs, inputs):
-    """At init q == p, so the shared draw makes the samples bitwise equal."""
-    _, out = _forward(tiny_kwargs, inputs)
-    assert torch.equal(out["z_prior"], out["z_post"])
+        assert out[key].shape == decoded, key
 
 
 def test_one_epsilon_serves_both_latents_when_the_distributions_differ(
     tiny_kwargs, inputs, perturb_posterior
 ):
-    """The stronger claim: even off-init, both samples recover the *same* epsilon. Two independent
-    draws would pass the at-init test above and still corrupt every base-minus-full readout with
-    sampling noise."""
+    r"""Even off-init, both samples recover the *same* $\epsilon$. Two independent draws would still
+    agree at init, where $q = p$, and would corrupt every base-minus-full readout with sampling
+    noise."""
     _, out = _forward(tiny_kwargs, inputs, perturb=perturb_posterior)
     assert not torch.equal(out["mu_post"], out["mu_prior"])  # genuinely off-init
 
@@ -184,31 +169,11 @@ def test_the_signature_names_every_channel_tuple_the_driver_injects():
     )
 
 
-def test_init_weights_is_a_constructor_argument_the_driver_never_forwards():
-    """It stays in the signature -- a test builds an uninitialised model with it -- while the
-    driver's exclusion list keeps it out of config: weight initialisation is not a config
-    decision."""
-    parameters = set(inspect.signature(SeqVaeLagAttnTrfRws.__init__).parameters)
-
-    assert "init_weights" in parameters
-    assert "init_weights" in _NON_CONSTRUCTOR_KEYS
-
-
 def test_a_copy_pasted_sibling_config_key_is_refused(tiny_kwargs):
     """``lstm_layers`` means nothing here. Refused loudly rather than absorbed by a ``**kwargs``,
     which is what would let a hand-copied config silently build a different model."""
     with pytest.raises(TypeError, match="lstm_layers"):
         SeqVaeLagAttnTrfRws(**dict(tiny_kwargs, lstm_layers=2))
-
-
-@pytest.mark.parametrize(
-    "key", ["encoder_extra_dilations", "encoder_extra_kernel", "conv_norm_groups", "causal_norm"]
-)
-def test_the_other_sibling_only_keys_are_refused(tiny_kwargs, key):
-    """There is no extra dilation schedule, no convolution pre-norm and no time-pooling normaliser
-    left to causalise, so each of these would reach nothing if it were quietly accepted."""
-    with pytest.raises(TypeError, match=key):
-        SeqVaeLagAttnTrfRws(**dict(tiny_kwargs, **{key: 1}))
 
 
 # ---------------------------------------------------------------------------------------

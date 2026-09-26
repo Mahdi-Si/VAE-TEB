@@ -168,9 +168,9 @@ def build_headline(results: Dict[str, Any]) -> Dict[str, Any]:
 def build_manifest(output_dir: Any, since: Optional[float] = None) -> Dict[str, Any]:
     """List every file the run emitted, with its size.
 
-    Not bookkeeping. It is what lets the documentation test assert that every emitted figure has
-    a ``FIGURE_GUIDE.md`` entry without hardcoding a filename list -- a hardcoded list would pass
-    by construction and would stop covering the moment an analysis gained a figure.
+    Not bookkeeping. It is what lets every emitted figure be checked for a ``FIGURE_GUIDE.md``
+    entry without hardcoding a filename list -- a hardcoded list would pass by construction and
+    would stop covering the moment an analysis gained a figure.
 
     Written before ``summary.json`` itself, so the summary is the one file the manifest cannot
     list; that is stated here rather than left as a puzzle for whoever diffs the two.
@@ -180,8 +180,7 @@ def build_manifest(output_dir: Any, since: Optional[float] = None) -> Dict[str, 
         since: Run start time as a POSIX timestamp. Files older than it are a *previous* run's,
             which happens whenever ``--output-dir`` names a directory twice -- the default
             timestamped path cannot collide, but an explicit one can. Counting them would
-            attribute another run's figures to this one and would make the documentation test
-            cover files this run never produced. ``None`` lists everything.
+            attribute another run's figures to this one. ``None`` lists everything.
 
     Returns:
         ``files`` -- relative POSIX paths to sizes in bytes -- plus counts, the figure subset,
@@ -205,8 +204,8 @@ def build_manifest(output_dir: Any, since: Optional[float] = None) -> Dict[str, 
         files[path.relative_to(root).as_posix()] = int(stat.st_size)
     # The figure subset is whatever this run actually wrote, so it follows the run's format
     # rather than a literal: a summary that counted only `.pdf` would report zero figures on
-    # an `svg` run and the documentation test would then cover nothing. Imported here rather
-    # than at module scope for the same reason the builder below is -- see `_grouped_figures`.
+    # an `svg` run. Imported here rather than at module scope for the same reason the builder
+    # below is -- see `_grouped_figures`.
     from teb_vae.lag_attn.eval.figures import active_figure_format
 
     suffix = f".{active_figure_format()}"

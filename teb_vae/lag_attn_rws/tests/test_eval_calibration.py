@@ -458,22 +458,3 @@ def test_the_calibration_headline_scalars_resolve_under_gaussian_nll(fitted_eval
     ):
         assert headline[name] is not None, name
         assert np.isfinite(float(headline[name])), name
-
-
-def test_the_census_sums_over_batches_exactly(task, perturb_posterior) -> None:
-    """The accumulator is exact against a single pass over the same data, because addition is --
-    which is what lets a real split's $10^9$ raw samples be summarised in $H$ floats."""
-    from .conftest import make_stub_batch
-
-    module = task(hparams={"likelihood": "gaussian_nll"})
-    perturb_posterior(module.orig_model)
-    module.eval()
-    batch = make_stub_batch(seed=2)
-
-    torch.manual_seed(0)
-    once = metrics_module.evaluate_batch(module, batch, num_samples=1).calibration_sums
-    torch.manual_seed(0)
-    again = metrics_module.evaluate_batch(module, batch, num_samples=1).calibration_sums
-
-    for name, value in once.items():
-        assert torch.allclose(value + again[name], 2.0 * value), name

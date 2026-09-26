@@ -42,7 +42,7 @@ WARMUP_MODEL_KWARGS = (
 )
 
 #: The two the channel alignment produces, in the same stream order. **Separate** from the tuple
-#: above rather than appended to it: ``tests/test_docs.py`` builds the ungated comparison arm by
+#: above rather than appended to it: the ungated comparison arm is built by
 #: removing :data:`WARMUP_MODEL_KWARGS` from a production keyword set, and a model that kept its
 #: shifts while losing its warm-up mask is not the arm that number is meant to name. Emitted only
 #: when a reference is configured, so an unaligned run's kwargs dict is byte for byte what it was.

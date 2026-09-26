@@ -32,15 +32,11 @@ def _model_and_out(prod_kwargs, inputs, perturb_posterior, **overrides):
     return model, out
 
 
-def test_the_perturbation_actually_makes_the_kl_nonzero(prod_kwargs, inputs, perturb_posterior):
-    """The premise every other test in this file rests on."""
-    _, out = _model_and_out(prod_kwargs, inputs, perturb_posterior)
-    assert out["kld_per_t"].abs().max().item() > 1e-6
-
-
 def test_kld_per_t_is_the_raw_full_length_sum(prod_kwargs, inputs, perturb_posterior):
     """It is the reporting curve: raw, full-T, summed over latent dims. Not the trained term."""
     model, out = _model_and_out(prod_kwargs, inputs, perturb_posterior)
+    # The premise every test in this file rests on: the perturbation made the KL nonzero.
+    assert out["kld_per_t"].abs().max().item() > 1e-6
     kld_btd = model.kld_tensor(
         mu_prior=out["mu_prior"],
         logvar_prior=out["logvar_prior"],
@@ -106,12 +102,6 @@ def test_kld_raw_ignores_free_bits(prod_kwargs, inputs, perturb_posterior):
     assert floored["kld_train"].item() > unfloored["kld_train"].item()
 
 
-def test_kld_train_aliases_the_optimised_term(prod_kwargs, inputs, perturb_posterior):
-    model, out = _model_and_out(prod_kwargs, inputs, perturb_posterior)
-    loss = model.compute_loss(out, inputs[0], inputs[1], free_bits=0.1)
-    assert loss["kld_train"] is loss["kld_loss"]
-
-
 def test_kld_raw_is_detached_so_only_kld_train_carries_gradient(
     prod_kwargs, inputs, perturb_posterior
 ):
@@ -124,6 +114,7 @@ def test_kld_raw_is_detached_so_only_kld_train_carries_gradient(
 
     assert not loss["kld_raw"].requires_grad
     assert loss["kld_train"].requires_grad
+    assert loss["kld_train"] is loss["kld_loss"]  # the reported key is the optimised term
 
 
 def test_the_kl_term_carries_gradient(prod_kwargs, inputs, perturb_posterior):

@@ -81,23 +81,18 @@ def _module(name: str) -> Any:
 
 
 @pytest.mark.parametrize("name", ENTRY_POINTS)
-def test_every_entry_point_ships_a_launch_dict(name: str) -> None:
-    """Without one there is nothing to fill in, and the Run button can only fail."""
+def test_every_entry_point_is_launchable_from_its_run_dict(name: str) -> None:
+    """The three ways a Run-button launch breaks silently, checked against what each module ships.
+
+    * a ``RUN_ARGS`` key that is not a parser ``dest`` does nothing;
+    * ``required=True`` fires before ``RUN_ARGS`` is read, whatever the dict says -- required-ness
+      belongs after the merge;
+    * a non-``None`` argparse default is read by the merge as a command-line value, so that key's
+      dict entry becomes unreachable -- real defaults are applied after the merge.
+    """
     module = _module(name)
-
-    assert isinstance(getattr(module, "RUN_ARGS", None), dict), (
-        f"{name} has no RUN_ARGS dict, so it cannot be launched without a command line"
-    )
-
-
-@pytest.mark.parametrize("name", ENTRY_POINTS)
-def test_every_launch_dict_key_is_an_argument(name: str) -> None:
-    """A key that is not a ``dest`` silently does nothing. The resolver refuses it, and this is
-    that refusal exercised against what each module actually ships."""
-    module = _module(name)
-    dests = {
-        action.dest for action in module.build_parser()._actions if action.dest != "help"
-    }
+    actions = [action for action in module.build_parser()._actions if action.dest != "help"]
+    dests = {action.dest for action in actions}
     aliases = _DEST_ALIASES.get(name, {})
     keys = {aliases.get(key, key) for key in module.RUN_ARGS}
 
@@ -106,37 +101,10 @@ def test_every_launch_dict_key_is_an_argument(name: str) -> None:
         f"only in RUN_ARGS: {sorted(keys - dests)}, "
         f"only on the parser: {sorted(dests - keys)}"
     )
-
-
-@pytest.mark.parametrize("name", ENTRY_POINTS)
-def test_no_argument_is_required_by_argparse(name: str) -> None:
-    """``required=True`` fires before the launch dict is consulted, so it makes the Run button
-    unusable whatever the dict says. Required-ness belongs after the merge."""
-    required = [
-        action.dest for action in _module(name).build_parser()._actions if action.required
-    ]
-
-    assert required == [], (
-        f"{name}: {required} are required=True, so launching without a command line raises "
-        f"before RUN_ARGS is read. Enforce them after the merge instead."
-    )
-
-
-@pytest.mark.parametrize("name", ENTRY_POINTS)
-def test_no_argument_carries_a_non_none_argparse_default(name: str) -> None:
-    """The merge reads any non-``None`` parsed value as coming from the command line, so an
-    argparse default makes that key's launch-dict entry unreachable -- the operator edits the dict,
-    nothing changes, and nothing says why. Real defaults are applied after the merge."""
-    defaulted = {
-        action.dest: action.default
-        for action in _module(name).build_parser()._actions
-        if action.dest != "help" and action.default is not None
-    }
-
-    assert defaulted == {}, (
-        f"{name}: {defaulted} carry argparse defaults, which shadow RUN_ARGS. Default to None and "
-        f"apply the real default after resolve_launch_args."
-    )
+    required = [action.dest for action in actions if action.required]
+    assert required == [], f"{name}: {required} are required=True; enforce them after the merge"
+    defaulted = {action.dest: action.default for action in actions if action.default is not None}
+    assert defaulted == {}, f"{name}: {defaulted} carry argparse defaults, which shadow RUN_ARGS"
 
 
 # =============================================================================
@@ -176,13 +144,6 @@ def test_a_launch_dict_key_that_is_not_an_argument_raises_naming_it() -> None:
         launch.resolve_launch_args(_parser(), {"alpah": 1}, [])
 
 
-def test_every_parser_dest_appears_in_the_resolved_values() -> None:
-    """The values are splatted into ``main``, so a missing key is a ``TypeError`` at launch."""
-    values, _ = launch.resolve_launch_args(_parser(), {"alpha": 1}, [])
-
-    assert set(values) == {"alpha", "beta"}
-
-
 def test_a_missing_required_argument_names_both_ways_to_supply_it() -> None:
     """An operator who launched from the Run button cannot act on "pass --config"; the message has
     to name the dict as well."""
@@ -192,8 +153,7 @@ def test_a_missing_required_argument_names_both_ways_to_supply_it() -> None:
     assert "--config" in message
     assert "RUN_ARGS" in message
     assert "other" not in message
-
-
-def test_nothing_missing_is_no_message() -> None:
-    """Not vacuous: the check must stay silent when the values are there."""
+    # And silent when the values are there.
     assert launch.missing_required({"config": "a.yaml"}, ("config",)) is None
+
+

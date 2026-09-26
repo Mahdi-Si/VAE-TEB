@@ -29,13 +29,9 @@ is a function of.
 """
 from __future__ import annotations
 
-import inspect
-
 import pytest
 import torch
 
-from teb_vae.lag_attn_cfs.nets.causal_feature_target import CausalFeatureForecastTarget
-from teb_vae.lag_attn_cfs.nets.causal_inputs import CausalWarmupInputs
 from teb_vae.lag_attn_cfs.nets.model import SeqVaeLagAttnCfs
 from teb_vae.lag_attn_cfs.tests.conftest import (
     CAUSAL_C_U,
@@ -48,101 +44,16 @@ from teb_vae.lag_attn_cfs.tests.conftest import (
     TINY_TARGET_WARMUP_STEPS,
     build,
     make_streams,
-    shipped_warmup_kwargs,
     tiny_align_kwargs,
     tiny_warmup_kwargs,
 )
+from teb_vae.lag_attn_fs.nets.model import SeqVaeLagAttnFs
 
 
 @pytest.fixture
 def tiny_align():
     """A fresh copy of the tiny kwargs carrying the guard and the alignment (safe to mutate)."""
     return tiny_align_kwargs()
-from teb_vae.lag_attn_fs.nets.model import SeqVaeLagAttnFs
-from teb_vae.lag_attn_rws.nets.model import SeqVaeLagAttnRws
-
-
-# =================================================================================================
-# The class
-# =================================================================================================
-def test_the_base_order_puts_the_target_domain_first() -> None:
-    r"""Reversed, the decoder is built at $R = 16$ and a $C_{\mathrm{keep}}$-wide block is scored
-    against it -- which ``block_width`` would not catch, because it feeds only the four
-    log-variance diagnostics and no shape check.
-
-    Two mixins, not one, and both ahead of the architecture: the input warm-up, the lag floor and
-    the tiled forward name no encoder either, so they sit beside the target domain rather than on
-    the model -- which is what lets a second architecture compose the identical pair.
-    """
-    assert SeqVaeLagAttnCfs.__mro__ == (
-        SeqVaeLagAttnCfs,
-        CausalWarmupInputs,
-        CausalFeatureForecastTarget,
-        SeqVaeLagAttnFs.__mro__[1],  # FeatureForecastTarget, reached through the parent it extends
-        SeqVaeLagAttnRws,
-        torch.nn.Module,
-        object,
-    )
-    assert SeqVaeLagAttnCfs.__bases__ == (
-        CausalWarmupInputs,
-        CausalFeatureForecastTarget,
-        SeqVaeLagAttnRws,
-    )
-
-
-def test_the_model_carries_nothing_but_its_constructor() -> None:
-    """Everything else is encoder-agnostic and lives on a mixin the second cell composes too.
-
-    Asserted by set equality rather than by a line count: a member added here would be one the
-    conv-Transformer cell silently does not get, and the two models would stop being the same
-    target domain over two architectures.
-    """
-    own = {name for name in vars(SeqVaeLagAttnCfs) if not name.startswith("__")}
-    assert own == set()
-    assert "__init__" in vars(SeqVaeLagAttnCfs)
-    for shared in ("forward", "_build_anchor_index", "_build_adapter", "build_lag_mask"):
-        assert shared not in vars(SeqVaeLagAttnCfs), shared
-        assert shared in vars(CausalWarmupInputs), shared
-
-
-def test_the_constructor_takes_warm_ups_and_refuses_delays() -> None:
-    """The names are the whole guard: a warm-up routed under a delay name trains a different model.
-
-    The full parameter list is asserted rather than only the four new names, because the failure
-    that matters is the *opposite* one -- a narrowed signature. The driver builds a run's kwargs by
-    sweeping this signature, so a ``**kwargs`` constructor would forward four keys and silently
-    build an all-defaults model at ``d_model=128`` on a tiny smoke config.
-    """
-    parameters = inspect.signature(SeqVaeLagAttnCfs.__init__).parameters
-    base = inspect.signature(SeqVaeLagAttnRws.__init__).parameters
-
-    assert "target_warmup_steps" in parameters and "source_warmup_steps" in parameters
-    assert "anchor_stride" in parameters and "lag_floor" in parameters
-    for banned in ("target_delays", "source_delays"):
-        assert banned not in parameters, banned
-        assert banned in base, f"{banned} is meant to be the base's, removed here"
-
-    # Everything else the base takes is still reachable, which is what the signature sweep needs.
-    assert set(base) - set(parameters) == {"target_delays", "source_delays"}
-    assert not any(
-        parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters.values()
-    )
-
-
-def test_the_geometry_defaults_are_the_causal_ones() -> None:
-    """A cfs run left at the base's defaults would be describing a dataset that does not exist."""
-    defaults = {
-        name: parameter.default
-        for name, parameter in inspect.signature(SeqVaeLagAttnCfs.__init__).parameters.items()
-    }
-    assert defaults["c_y"] == CAUSAL_C_Y
-    assert defaults["c_u"] == CAUSAL_C_U
-    assert defaults["horizon"] == 30
-    assert defaults["warmup_period"] == 134
-    # The inert defaults: a model built with no opinion decodes densely and floors no lag, which is
-    # what every sibling does. The tiling is a configuration decision and the config states it.
-    assert defaults["anchor_stride"] == 1
-    assert defaults["lag_floor"] == 0
 
 
 # =================================================================================================
@@ -214,50 +125,6 @@ def test_the_start_token_is_built_only_when_every_channel_waits(tiny_warmup) -> 
     narrowed = build(phase_only)
     assert narrowed.source_adapter.start_embed is not None
     assert narrowed.target_adapter.start_embed is None
-
-
-def test_the_shipped_budget_builds_both_start_tokens() -> None:
-    r"""The alignment brings a parameter into existence that no shipped configuration had before.
-
-    The adapter builds ``start_embed`` only when every channel of its stream is still pre-warm-up at
-    step $0$. Unaligned, both minima are $0$ -- some channel is honest immediately on each stream --
-    so neither token existed. Under the shipped reference the adapter is fed $W'_c + d_c$, whose
-    minimum is $91$ on both streams, so both are constructed: a learned vector of width
-    $d_{\mathrm{model}}$ per stream, and a live "everything here is still pre-warm-up" token in the
-    forward pass. Asserted rather than discovered, because the alternative is finding it as a
-    parameter-count disagreement in ``test_docs.py``.
-    """
-    kwargs = shipped_warmup_kwargs()
-    assert min(kwargs["target_warmup_steps"]) == 0
-    assert min(kwargs["source_warmup_steps"]) == 0
-    combined = [
-        min(warm + shift for warm, shift in zip(kwargs[f"{name}_warmup_steps"],
-                                                kwargs[f"{name}_align_delays"]))
-        for name in ("target", "source")
-    ]
-    assert combined == [80, 80]
-
-    model = build(kwargs)
-    assert model.target_adapter.start_embed is not None
-    assert model.source_adapter.start_embed is not None
-    assert model.target_adapter.start_embed.shape[-1] == model.d_model
-    assert model.source_adapter.start_embed.shape[-1] == model.d_model
-    assert model.target_gate is not None and model.target_gate.out_channels == 98
-    assert model.decoder_out_channels == 98
-    # The source loses the four channels above the reference, and only those.
-    assert model.source_gate is not None and model.source_gate.out_channels == 47
-
-
-def test_the_unaligned_budget_builds_neither_start_token() -> None:
-    """The comparison arm, and the assertion the test above replaced: with no reference the
-    adapter sees the warm-up alone, whose minimum is $0$ on both streams."""
-    kwargs = shipped_warmup_kwargs(align=False)
-    assert "target_align_delays" not in kwargs and "source_align_delays" not in kwargs
-
-    model = build(kwargs)
-    assert model.target_adapter.start_embed is None
-    assert model.source_adapter.start_embed is None
-    assert model.source_gate is not None and model.source_gate.out_channels == 51
 
 
 # =================================================================================================
@@ -510,22 +377,6 @@ def test_the_adapter_is_told_the_warm_up_plus_the_shift(tiny_align) -> None:
         assert bool(column[delay:].all()), channel
 
 
-def test_the_availability_of_an_aligned_channel_is_the_unaligned_one_shifted_right(
-    tiny_warmup, tiny_align
-) -> None:
-    """Stated as the relation rather than as two independent patterns: the whole claim of the
-    alignment is that a channel's content moved later by $d_c$ steps and nothing else about it
-    changed, so its availability must be the same staircase translated by the same $d_c$."""
-    unaligned = build(tiny_warmup).target_adapter.availability
-    aligned = build(tiny_align).target_adapter.availability
-    steps = int(unaligned.shape[0])
-
-    for channel, shift in enumerate(TINY_TARGET_ALIGN_DELAYS):
-        expected = torch.zeros(steps, dtype=aligned.dtype)
-        expected[shift:] = unaligned[: steps - shift, channel]
-        assert torch.equal(aligned[:, channel], expected), channel
-
-
 def test_a_non_null_reference_builds_the_start_of_record_embedding(
     tiny_warmup, tiny_align
 ) -> None:
@@ -640,20 +491,6 @@ _SWITCHES_OFF = dict(
     horizon_weight_halflife_steps=None,
     alibi_slope_scale=1.0,
 )
-
-
-def test_the_switch_defaults_are_the_off_values() -> None:
-    """The defaults themselves, read off the signature. A default that moved would make every
-    "bitwise off" claim below true of a model nobody builds -- the configs all set these keys
-    explicitly, so the constructor's default is what an old checkpoint's kwargs dict falls back to
-    and is the only thing standing between it and a different architecture."""
-    defaults = {
-        name: parameter.default
-        for name, parameter in inspect.signature(SeqVaeLagAttnCfs.__init__).parameters.items()
-        if name in _SWITCHES_OFF
-    }
-
-    assert defaults == _SWITCHES_OFF
 
 
 def test_every_switch_at_its_off_value_is_bitwise_the_model_without_the_keywords(

@@ -83,9 +83,8 @@ PER_SEGMENT_FILENAME = "per_segment_metrics.csv"
 #: The figures, named as ``FIGURE_GUIDE.md`` names them.
 #:
 #: **The ``<stem>_by_clinical_class.pdf`` / ``<stem>_by_subgroup.pdf`` shape is reserved** for the
-#: runner's grouped-variant fan-out, and a figure named into it disappears: ``test_eval_smoke.py``
-#: normalises those two suffixes out of the manifest as a *family*, so such a file is never
-#: recorded, never documented, and reads to an operator as one of the violin figures it is not.
+#: runner's grouped-variant fan-out, and a figure named into it reads to an operator as one of the
+#: violin figures it is not.
 #: These are named the other way round for that reason.
 CLASS_FIGURE = "class_histograms"
 SUBGROUP_FIGURE = "subgroup_histograms"

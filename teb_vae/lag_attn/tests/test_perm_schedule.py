@@ -4,12 +4,13 @@ The control rides inside the **single main backward**. That is what lets the tas
 automatic optimization -- and with it the gradient clip, gradient accumulation, LR scheduler and
 loss-spike circuit breaker -- while the strategy selector still returns plain ``'ddp'``.
 
-Two invariants make that safe, and both are pinned here:
+Two invariants make that safe:
 
 * On *every* step type, perm and non-perm alike, each ``requires_grad`` parameter receives a
   gradient. Under ``find_unused_parameters=False`` the DDP reducer expects exactly that; a
   parameter left ungradiented on some steps raises or deadlocks. This -- not the strategy string --
-  is what licenses the fast strategy.
+  is what licenses the fast strategy, and ``test_ddp_strategy.py`` pins it at the shipped flag set.
+  Here, a single backward is shown to carry both usages of the twice-run attention.
 * The schedule is a pure function of ``batch_idx``, which Lightning keeps identical across ranks,
   and is MIN-reduced besides, so a rank with a degenerate ($B < 2$) batch cannot branch alone.
 """
@@ -106,24 +107,6 @@ def test_the_shuffled_kl_ratio_is_reported(task, stub_batch, perturb_posterior):
     assert float(metrics["kld_shuffled_ratio"]) == pytest.approx(expected, rel=1e-4)
 
 
-@pytest.mark.parametrize("batch_idx", [0, 1])
-def test_every_parameter_receives_a_gradient(task, stub_batch, perturb_posterior, batch_idx):
-    """The evidence that plain ``'ddp'`` is safe, on both a perm and a plain step."""
-    module = task()
-    perturb_posterior(module.orig_model)
-
-    module.zero_grad(set_to_none=True)
-    loss, _ = module.compute_loss_and_metrics(stub_batch, batch_idx, "train")
-    loss.backward()
-
-    starved = [
-        name
-        for name, parameter in module.orig_model.named_parameters()
-        if parameter.requires_grad and parameter.grad is None
-    ]
-    assert not starved, f"parameters without gradient on batch_idx={batch_idx}: {starved}"
-
-
 def test_a_single_backward_is_enough(task, stub_batch, perturb_posterior):
     """A parameter used twice in one graph must not need a second backward.
 
@@ -167,22 +150,6 @@ def test_validation_runs_the_control_every_step_without_adding_to_the_loss(
         assert float(loss) == pytest.approx(float(metrics["main_loss"]), rel=1e-6)
 
 
-def test_a_degenerate_batch_skips_the_control(task, make_stub_batch_fn, perturb_posterior):
-    """A single-sample batch cannot be deranged, and the last batch of a shard often is one.
-
-    Skipped, not crashed: the derangement helper raises for $B < 2$ by design, so the schedule --
-    not a caught exception -- is what has to keep it away from that call.
-    """
-    module = task()
-    perturb_posterior(module.orig_model)
-
-    loss, metrics = module.compute_loss_and_metrics(make_stub_batch_fn(batch_size=1), 0, "train")
-
-    assert "perm_loss" not in metrics
-    assert "kld_shuffled" not in metrics
-    assert torch.isfinite(loss)
-
-
 def test_the_control_metrics_are_omitted_rather_than_zeroed_when_it_does_not_run(
     task, make_stub_batch_fn, perturb_posterior
 ):
@@ -193,6 +160,10 @@ def test_the_control_metrics_are_omitted_rather_than_zeroed_when_it_does_not_run
     epoch-aggregated ``train/feat_loss_shuffled``, inverting the very ordering the control exists to
     check and making a healthy model read as a collapsed one. Omitted, the mean covers the perm
     steps alone.
+
+    The degenerate case is a single-sample batch, which cannot be deranged and which the last batch
+    of a shard often is. Skipped, not crashed: the derangement helper raises for $B < 2$ by design,
+    so the schedule -- not a caught exception -- is what has to keep it away from that call.
     """
     module = task()
     perturb_posterior(module.orig_model)
@@ -206,11 +177,12 @@ def test_the_control_metrics_are_omitted_rather_than_zeroed_when_it_does_not_run
 
     _, on_schedule = module.compute_loss_and_metrics(make_stub_batch_fn(), 0, "train")
     _, off_schedule = module.compute_loss_and_metrics(make_stub_batch_fn(), 1, "train")
-    _, degenerate = module.compute_loss_and_metrics(make_stub_batch_fn(batch_size=1), 0, "train")
+    loss, degenerate = module.compute_loss_and_metrics(make_stub_batch_fn(batch_size=1), 0, "train")
 
     assert control_keys <= set(on_schedule)
     assert control_keys.isdisjoint(off_schedule)
     assert control_keys.isdisjoint(degenerate)
+    assert torch.isfinite(loss)
 
 
 def test_lambda_perm_zero_keeps_the_readout_but_leaves_the_loss_alone(
@@ -262,7 +234,10 @@ def test_the_permutation_generator_is_seeded_per_rank_after_attach(task, monkeyp
 
     At ``__init__`` the module is unattached, so ``global_rank`` reads 0 on every rank and a
     generator seeded there would be identical everywhere -- while the docstring claimed otherwise.
-    Ranks hold different data, so their shuffles should differ; only the *schedule* must not.
+    Ranks hold different data, so their shuffles should differ; only the *schedule* must not. It is
+    a pure function of ``batch_idx``, which Lightning keeps identical across ranks: a schedule that
+    consulted the rank-seeded generator would diverge, and DDP would deadlock on the first step
+    where two ranks disagreed.
 
     ``global_rank`` is a read-only property that reads the attached trainer, so the second rank is
     faked by shadowing it on the class -- which is what attaching would achieve here.
@@ -275,17 +250,10 @@ def test_the_permutation_generator_is_seeded_per_rank_after_attach(task, monkeyp
     rank_one.setup("fit")
 
     assert rank_zero._perm_generator.initial_seed() != rank_one._perm_generator.initial_seed()
-
-
-def test_the_schedule_itself_is_rank_invariant(task, stub_batch):
-    """The other half: shuffles may differ across ranks, the schedule may not.
-
-    It is a pure function of ``batch_idx``, which Lightning keeps identical across ranks. A
-    schedule that consulted the rank-seeded generator would diverge, and DDP would deadlock on the
-    first step where two ranks disagreed.
-    """
-    module = task()
-
-    assert [module._should_run_perm(i, 4, "train") for i in range(6)] == [
-        True, False, True, False, True, False
+    schedules = [
+        [module._should_run_perm(batch_idx, 4, "train") for batch_idx in range(6)]
+        for module in (rank_zero, rank_one)
     ]
+    assert schedules[0] == schedules[1] == [True, False, True, False, True, False]
+
+

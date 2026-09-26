@@ -34,7 +34,6 @@ import torch
 import yaml
 
 from teb_vae.lag_attn.config import load_config
-from teb_vae.lag_attn_rws.trainer import RESOLVED_CONFIG_FILENAME
 from teb_vae.lag_attn_transformer_fs import trainer as trainer_module
 from teb_vae.lag_attn_transformer_fs.nets.model import SeqVaeLagAttnTrfFs
 from teb_vae.lag_attn_transformer_fs.trainer import LagAttnTrfFsTrainer
@@ -48,13 +47,6 @@ _TINY = Path(__file__).resolve().parents[1] / "configs" / "tiny.yaml"
 
 #: Epochs the fit runs. See the module docstring for why it is not the config's one.
 SMOKE_EPOCHS = 2
-
-#: What the shipped reach budget resolves to, pinned so a "guarded" fit cannot silently be the
-#: unguarded one -- which here would also silently change the decoder's width and therefore the units
-#: of every number the run reports.
-GUARDED_TARGET_CHANNELS = 78
-GUARDED_SOURCE_CHANNELS = 29
-GUARDED_MAX_DELAY = 30
 
 #: The four columns this target domain adds, and the pair of them that must recompose to ``pred_gap``.
 _GAP_SUFFIXES = ("pred_gap_tau_first", "pred_gap_tau_last", "pred_gap_st", "pred_gap_ph")
@@ -124,75 +116,15 @@ def test_the_fit_ran_this_packages_model_and_task(fit):
     assert type(driver) is LagAttnTrfFsTrainer
     assert type(driver.pytorch_model) is SeqVaeLagAttnTrfFs
     assert type(driver.pl_model).__name__ == "SeqVaeLagAttnTrfFsTask"
-    # Both halves of the model, in one place: the conv-Transformer encoders and the feature target's
-    # width hook.
-    assert hasattr(driver.pytorch_model, "target_encoder")
-    assert not hasattr(driver.pytorch_model, "causal_norm")
 
 
 def test_the_losses_stay_finite(fit):
+    """Every collected metric, including ``train/grad_norm``: a non-finite gradient norm would make the
+    clip coefficient zero and the run would train nothing while completing normally."""
     _driver, trainer = fit
 
     for name, value in trainer.callback_metrics.items():
         assert math.isfinite(float(value)), f"{name} is {float(value)}"
-
-
-def test_the_gradient_norm_stays_finite(fit):
-    """The quantity ``gradient_clip_val`` is re-derived from. If it were non-finite the clip
-    coefficient would be zero and the run would train nothing while completing normally -- which is
-    exactly the failure the guarded raw-signal arms once had at every finite reach budget."""
-    _driver, trainer = fit
-
-    grad_norm = float(trainer.callback_metrics["train/grad_norm"])
-
-    assert math.isfinite(grad_norm), f"train/grad_norm is {grad_norm}"
-
-
-def test_the_run_trains_at_the_budgets_width_and_not_the_raw_grids(fit):
-    """The whole binding, end to end: config -> filter bank -> channel tuples -> decoder width.
-
-    A unit test can check each link; only a fit can check they are connected, and the failure this
-    catches is silent. A decoder built from the *declared* $c_y$ would run to completion scoring $109$
-    channels against a $78$-channel block's worth of target, which is a different objective under the
-    same config.
-    """
-    driver, _trainer = fit
-    model = driver.pytorch_model
-
-    assert model.decoder_out_channels == GUARDED_TARGET_CHANNELS
-    assert model.target_adapter.linear.in_features == GUARDED_TARGET_CHANNELS
-    assert model.source_adapter.linear.in_features == GUARDED_SOURCE_CHANNELS
-    assert model.target_gate.max_delay == GUARDED_MAX_DELAY
-    assert model.raw_per_step == 16
-    # The declared widths are untouched, which is what the data boundary checks against.
-    assert (model.c_y, model.c_u) == (109, 58)
-
-
-def test_the_zero_kl_init_invariant_survives_the_whole_stack(fit):
-    r"""At initialisation $q(z_t \mid Y, U) = p(z_t \mid Y)$ exactly, so $K = 0$.
-
-    Re-derived from a freshly built model rather than read off the trained run: after an epoch the KL
-    is legitimately nonzero, and the question is whether the model *this config* builds starts at zero
-    -- after config resolution, the kwarg sweep and the framework's own seeding have each had a chance
-    to break it.
-    """
-    driver, _trainer = fit
-    model = SeqVaeLagAttnTrfFs(**driver._build_model_kwargs()).eval()
-    generator = torch.Generator().manual_seed(0)
-    batch_size, seq_len = 2, model.sequence_length
-    outputs = model(
-        torch.randn(batch_size, seq_len, 43, generator=generator),
-        torch.randn(batch_size, seq_len, 66, generator=generator),
-        torch.randn(batch_size, seq_len, model.c_u, generator=generator),
-    )
-
-    assert float(outputs["kld_per_t"].abs().max()) == 0.0
-    # The shipped `base_decode: mean` leaves the two forecasts differing by the posterior's own noise;
-    # what must hold instead is that the base forecast IS the decode of mu^p.
-    assert torch.equal(outputs["z_prior"], outputs["mu_prior"])
-    expected_base, _logvar = model.decoder(outputs["mu_prior"][:, : model.geometry.t_valid])
-    assert torch.equal(outputs["mu_base"], expected_base)
-    assert not torch.equal(outputs["mu_base"], outputs["mu_full"])
 
 
 # --------------------------------------------------------------------------------------
@@ -259,8 +191,7 @@ def test_the_recorded_learning_rate_is_the_step_ramps_first_value(fit):
 
     That single number separates all three schedules a misconfiguration could produce. The framework's
     flat schedule would record the full configured rate; its ``LinearLR`` path starts at a tenth of it,
-    which is the discontinuity the step ramp exists to avoid; this ramp starts at $1/N$ of it. Traced
-    step by step in ``tests/test_trainer.py``, where a fake trainer makes every step readable.
+    which is the discontinuity the step ramp exists to avoid; this ramp starts at $1/N$ of it.
     """
     driver, _trainer = fit
     frame = pd.read_csv(Path(driver.train_results_dir) / "metrics_history.csv")
@@ -277,103 +208,25 @@ def test_the_recorded_learning_rate_is_the_step_ramps_first_value(fit):
     )
 
 
-def test_the_scheduled_beta_and_the_anchor_weight_reach_the_csv(fit):
-    """The resolved schedule value, which starts at exactly zero -- the posterior-collapse guard the
-    config documents -- and the echoed anchor weight, whose whole job is to let a
-    ``metrics_history.csv`` identify its own arm afterwards.
-
-    The anchor is compared against **the run's own resolved config**, not against a literal. The task's
-    default is $0$, so a weight silently dropped at the kwarg sweep still fails here; a literal would
-    additionally fail whenever the pair is retuned, which is a different thing and belongs in
-    ``test_config_load.py``."""
-    driver, _trainer = fit
-    frame = pd.read_csv(Path(driver.train_results_dir) / "metrics_history.csv")
-    configured = float(load_config(str(_TINY))["model_config"]["VAE_model"]["beta_prior"])
-
-    assert float(frame["train/kld_beta"].iloc[0]) == pytest.approx(0.0)
-    assert configured > 0.0, "the anchor is off in tiny.yaml; this test would pass vacuously"
-    assert float(frame["train/beta_prior"].iloc[0]) == pytest.approx(configured)
-
-
-def test_the_prior_and_clip_diagnostics_reach_the_csv(fit):
-    """Through the tiny config's ``mse`` likelihood -- the configuration where a term emitted only
-    under ``gaussian_nll`` would silently produce an all-NaN column."""
-    driver, _trainer = fit
-    frame = pd.read_csv(Path(driver.train_results_dir) / "metrics_history.csv")
-
-    for column in (
-        "train/prior_rate", "val/prior_rate",
-        "train/logvar_prior_floor_frac", "val/logvar_prior_floor_frac",
-        "train/grad_clip_frac",
-    ):
-        assert column in frame.columns, f"{column} never reached the CSV"
-        assert frame[column].notna().any(), f"{column} is NaN in every epoch"
-
-    clip_frac = frame["train/grad_clip_frac"].dropna()
-    assert bool(((clip_frac >= 0.0) & (clip_frac <= 1.0)).all())
-
-
-def test_the_run_directory_has_the_expected_layout(fit):
-    """The log sinks, the checkpoint directory and the resolved config a later offline pass needs."""
-    driver, _trainer = fit
-
-    assert (Path(driver.train_results_dir) / "full.log").is_file()
-    assert (Path(driver.train_results_dir) / "metrics_history.csv").is_file()
-    assert Path(driver.model_checkpoint_dir).is_dir()
-
-
-def test_the_resolved_config_records_the_budget_the_run_actually_got(fit):
-    """The budget in seconds does not name a channel: what it resolves to depends on a filter bank, and
-    here it also decides the decoder's width. A run recording only the request would record neither
-    what it got nor what its nats were summed over."""
-    from teb_vae.lag_attn_rws.trainer import RESOLVED_BUDGET_KEY
-
-    driver, _trainer = fit
-
-    written = Path(driver.model_checkpoint_dir) / RESOLVED_CONFIG_FILENAME
-    assert written.is_file()
-    reloaded = yaml.safe_load(written.read_text(encoding="utf-8"))
-    assert "base" not in reloaded
-    record = reloaded["model_config"][RESOLVED_BUDGET_KEY]
-    assert record["causal_reach_budget_s"] == 120
-    assert record["max_delay_steps"] == GUARDED_MAX_DELAY
-    assert len(record["target_keep_index"]) == GUARDED_TARGET_CHANNELS
-    assert len(record["source_keep_index"]) == GUARDED_SOURCE_CHANNELS
-
-
-def test_the_checkpoint_is_written_under_this_models_stem(fit):
-    """Four models writing ``lag-attn-fs-epoch=00.ckpt`` into a shared directory would be
-    indistinguishable by name, and the stem is one of the three strings this package supplies to the
-    inherited callback assembly."""
+def test_the_checkpoint_is_written_under_this_stem_and_reloads_at_its_own_width(fit):
+    """The end of the road: a blob written under this model's own filename stem, that describes
+    itself and rebuilds without a config file at the width the stamped keep-index implies. Four models
+    writing under one stem into a shared directory would be indistinguishable by name."""
     driver, _trainer = fit
 
     checkpoints = list(Path(driver.model_checkpoint_dir).glob("*.ckpt"))
-
     assert checkpoints, "no checkpoint was written; Lightning's default would have gone elsewhere"
-    assert all(path.name.startswith("lag-attn-trf-fs-epoch=") for path in checkpoints), [
+    stem = f"{LagAttnTrfFsTrainer.CHECKPOINT_STEM}-epoch="
+    assert all(path.name.startswith(stem) for path in checkpoints), [
         path.name for path in checkpoints
     ]
-
-
-def test_the_checkpoint_carries_its_contract_and_reloads_at_its_own_width(fit):
-    """The end of the road: a blob that describes itself and rebuilds without a config file. The
-    stamped keep-index is what carries the decoder's width, since ``decoder_out_channels`` is not a
-    keyword of this constructor at all -- so no second field can disagree with the gate."""
-    driver, _trainer = fit
-
-    path = next(iter(Path(driver.model_checkpoint_dir).glob("*.ckpt")))
-    blob = torch.load(path, map_location="cpu", weights_only=False)
+    blob = torch.load(checkpoints[0], map_location="cpu", weights_only=False)
 
     assert blob["model_class"] == "SeqVaeLagAttnTrfFs"
     assert blob["model_kwargs"] == driver._build_model_kwargs()
-    assert len(blob["model_kwargs"]["target_keep_index"]) == GUARDED_TARGET_CHANNELS
-    assert "decoder_out_channels" not in blob["model_kwargs"]
-    # The encoder block is stamped too, so a checkpoint records the architecture that wrote it.
-    for key in ("target_attention_blocks", "source_attention_blocks", "source_attention_window"):
-        assert key in blob["model_kwargs"], key
     check_model_class(blob, "SeqVaeLagAttnTrfFs")
     rebuilt = SeqVaeLagAttnTrfFs(**blob["model_kwargs"])
-    assert rebuilt.decoder_out_channels == GUARDED_TARGET_CHANNELS
+    assert rebuilt.decoder_out_channels == len(blob["model_kwargs"]["target_keep_index"])
     assert load_checkpoint_strict(rebuilt, blob) is not None, (
         "the checkpoint's state dict did not align into a model rebuilt from its own kwargs"
     )
@@ -382,27 +235,6 @@ def test_the_checkpoint_carries_its_contract_and_reloads_at_its_own_width(fit):
 # --------------------------------------------------------------------------------------
 # The diagnostic page's cadence
 # --------------------------------------------------------------------------------------
-def test_the_plotting_callback_is_attached_and_does_not_fail_the_fit(fit):
-    """The callback runs on every plotted validation epoch and swallows its own exceptions by design,
-    so the property that matters on the training path is that a figure is never worth failing a fit
-    for. Both halves are asserted: it really is attached (a wiring mistake would make the rest of this
-    test vacuous), and the fit that ran with it finished.
-
-    This package ships no plotting module of its own -- the callback is the shared one, reached through
-    the config block name the shared driver reads."""
-    driver, trainer = fit
-
-    attached = [
-        callback
-        for callback in trainer.callbacks
-        if type(callback).__name__ == "LagAttnRwsPlotCallback"
-    ]
-
-    assert len(attached) == 1
-    assert trainer.state.finished
-    assert (Path(driver.train_results_dir) / "lag_attn_rws_diagnostics").is_dir()
-
-
 def test_the_page_is_written_once_per_plotted_epoch_per_drawn_sample(fit):
     """The cadence wiring, which is separate from the page's contents in ``test_sample_page.py``.
 

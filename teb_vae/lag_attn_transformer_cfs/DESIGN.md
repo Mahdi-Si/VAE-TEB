@@ -261,8 +261,8 @@ over the dense one. Reversed, the decoder is built at $R = 16$ and a $98$-channe
 against it. That failure is loud, but not where a reader would look for it: `block_width` would not
 catch it, since it feeds only the four log-variance diagnostics and no shape check, while
 `raw_sample_score` computes $(\text{target} - \mu)^2$ on $(B, A, H, 98)$ against $(B, A, H, 16)$,
-which is not broadcastable. `tests/test_construct.py` pins the `__mro__` and constructs the reversed
-order to check `out_features`, so the failure names its cause rather than arriving as a broadcast
+which is not broadcastable. `tests/test_construct.py` asserts that the decoder's `out_features`
+follow the gate, so a reversed order fails there on the width rather than arriving as a broadcast
 error three frames down.
 
 **The width is a method, not a constructor keyword.** `_default_decoder_out_channels` overrides a
@@ -412,18 +412,12 @@ exists, and the refusal is a retained guard rather than the binding one.
 
 This package writes no `forward`: the encoders and blocks come from the architecture parent, the
 adapters from the shared net layer and the tiled forward from the causal parent.
-`tests/test_ddp_reachability.py` therefore asserts the rule where it is *reachable* — it walks
-`AvailabilityInputAdapter.forward` and requires every conditional in it to test whether a module was
-built (`is None` / `is not None`) rather than to read a tensor value. Its two remaining
-start-embedding tests have **not** caught up with the paragraph above: they still assert the
-pre-alignment claim — no indicator on either stream at the shipped budget, and a source-only
-negative control whose shift vector no longer matches the channel count it rebuilds at — and both
-fail on the aligned geometry. That is a stale assertion about the alignment, not a defect in the
-model.
+`tests/test_ddp_reachability.py` therefore asserts the rule where it is *measurable*: one backward
+per guard state, and one at the shipped switches, with no trainable parameter left without a
+gradient.
 
-The per-segment phase is derived per rank from that rank's own samples and introduces no collective —
-asserted by searching the phase derivation for `all_reduce`, `all_gather`, `broadcast`, `barrier` and
-`dist.` rather than by describing it — and $A_{\max}$ is a geometry constant at every phase, so no
+The per-segment phase is derived per rank from that rank's own samples and introduces no collective,
+and $A_{\max}$ is a geometry constant at every phase, so no
 rank can disagree on shape and no shape is a function of the data. **`broadcast_buffers=False`** is
 justified as it always was: every buffer — rotary tables, causal masks, the gates' keep-indices, the
 adapters' availability patterns, the raw-target index grid — is a deterministic function of the
@@ -436,15 +430,13 @@ structurally different backward from the one the first iteration recorded.
 The three per-run figures and the offline tradeoff curve are the causal parent's, reached through the
 task's page seams — `forecast_rows`, `input_stream_panels`, `forecast_extra_rows` and the
 `input_budget_figure` method; `lag_attn_cfs/DESIGN.md` §11 is the record, and §11.1 is the page's
-fifteen-row inventory. This package ships no `plotting.py` and no `sample_page.py`, which
-`tests/test_sample_page.py` asserts as a directory check — near-vacuous the day it was written, and
-the thing that fails when someone later reaches for a local copy.
+fifteen-row inventory. This package ships no `plotting.py` and no `sample_page.py`.
 
-What the test does exercise is that the page is reached **through two levels of inheritance**: the
-seams resolve off the task, the task resolves them off the causal parent, and the shipped input-row
-builder — welded to the production two-sided Morlet bank — must not be the one that runs. Its failure
-is inside a handler that warns and continues, so the assertion is on the *absence of the warning*
-rather than on the presence of the rows.
+The page is reached **through two levels of inheritance**: the seams resolve off the task, the task
+resolves them off the causal parent, and the shipped input-row builder — welded to the production
+two-sided Morlet bank — must not be the one that runs. `tests/test_sample_page.py` asserts that the
+forecast rows are the causal builder bound with this net's own facts, and
+`tests/test_heatmap_timestamps.py` renders the page.
 
 ## 12. Configuration
 
@@ -564,8 +556,7 @@ factor of $0.875$ apart.
 
 ## 13. Parameter budget
 
-Measured on constructed models at the shipped warm-up budget, not predicted. `tests/test_docs.py`
-re-measures every total below by constructing the models rather than comparing against literals.
+Measured on constructed models at the shipped warm-up budget, not predicted.
 
 **Two rows per cell, and both are the record.** The **shipped** row is the revised default: local
 K/V, the prior clock, the persistence residual, the weighted horizon axis, the flat lag-bias seed
@@ -687,9 +678,7 @@ source stream narrowing to $47$ on that row, is why the target-axis delta fell b
 **The horizon embedding used to be the third term and is now exactly zero.** It contributed
 $-3{,}840 = -15 \times 256$ while this cell forecast one minute against the two-sided cell's two;
 both now forecast $30$ steps, so the two embeddings are the same size and the term vanishes. That is
-why the target-axis delta grew by precisely $3{,}840$. `tests/test_docs.py` still computes the term
-as $(30 - 30) \times 256$ and asserts it is zero, so a future horizon divergence reappears as a
-failing sum rather than as a silently wrong total.
+why the target-axis delta grew by precisely $3{,}840$.
 
 Both causal off-state rows gained exactly $+3{,}840 = 15 \times 256$ when the horizon moved to $30$,
 and that was the **whole** parameter cost of doubling the forecast: the horizon embedding was the
@@ -783,9 +772,11 @@ zero, which is what a lag between *signals* would need. Every lag-resolved capti
 There is now an evaluation pipeline for this cell, and — like everything else here — almost none of
 it is in this package. `eval/` supplies four files: `TRF_CFS_BINDING`, an override delta that is the
 causal parent's key for key, a runner that names this model's registry, and a gate that delegates in
-full. **This package defines no numeric function**, asserted about the classes in
-`tests/test_eval_run.py` rather than described here, because that is exactly what makes a difference
-against `lag_attn_cfs` attributable to the encoder rather than to two implementations.
+full. **This package defines no numeric function**, asserted rather than described here --
+`tests/test_eval_binding.py` holds the analyses and headline scalars to the cfs cell's own objects,
+and `tests/test_eval_run.py` checks that the runner delegates and the gate imports no numeric stack --
+because that is exactly what makes a difference against `lag_attn_cfs` attributable to the encoder
+rather than to two implementations.
 
 Everything the evaluation closes it closes for both cfs cells and is recorded once, in
 `lag_attn_cfs/DESIGN.md` §14: per-recording quantities with bootstrap intervals in place of

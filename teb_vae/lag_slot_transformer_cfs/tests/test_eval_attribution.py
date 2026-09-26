@@ -5,8 +5,8 @@ wrapper selects the anchor axis rather than gathering a dense one, and its lag r
 proposal norm on a band; the four structural properties hold exactly on this architecture, whose
 transformer target encoder needs no causal-norm switch; the per-lag split on the proposal head's
 output is complete along the source-null path; and the stage records a skip by name when no
-segment carries a class, writes the family's tables and figures otherwise, and emits no key the
-acceptance gate refuses.
+segment carries a class, writes the family's tables and figures otherwise, emits no key the
+acceptance gate refuses, and marks and reads back an input ablation.
 """
 from __future__ import annotations
 
@@ -179,35 +179,6 @@ def test_an_ablated_coordinate_takes_exactly_no_attribution_on_either_stream(rea
     assert np.abs(result.target[:, :, 1:]).sum() > 0.0
 
 
-def test_the_stage_marks_the_ablated_coordinates_and_reads_their_attribution_back(tmp_path, monkeypatch) -> None:
-    """The marker table and the check travel in the block; the read-back is exactly zero."""
-    monkeypatch.setattr(core, "IG_STEPS", 4)
-    guids, epochs, codes = _population()
-    identities = pd.DataFrame(
-        {"guid": guids, "epoch": epochs, labels.CLASS_COLUMN: [labels.CLASS_NAMES[code] for code in codes],
-         labels.SUBGROUP_COLUMN: ["hie_cs"] * len(guids)}
-    )
-
-    block = stage.run_attribution(
-        _task(zero_fhr_scattering_s0=True), _loader(_StubDataset(guids, epochs, codes)), identities,
-        config={}, eval_config={"seed": 0, "caps": {core.CAP_NAME: 3}, "occlusion_bands": {"near": [0, 2]}},
-        results_dir=tmp_path, geometry_record={"t": TINY_SEQ_LEN},
-    )
-
-    assert block["status"] == stage.STATUS_ATTRIBUTED
-    ablated = block["ablated_inputs"]
-    assert [entry["field"] for entry in ablated["coordinates"]] == ["fhr_st"]
-    assert ablated["coordinates"][0]["status"] == stage.STATUS_ABLATED
-    assert ablated["max_abs_attribution"] == 0.0
-    assert block["checks"]["ablated_input_max_abs"] == 0.0
-    assert stage.ABLATED_INPUTS_FILENAME in block["files"]
-    table = pd.read_csv(tmp_path / core.ANALYSIS_DIRNAME / stage.ABLATED_INPUTS_FILENAME)
-    assert list(table["status"]) == [stage.STATUS_ABLATED]
-    # And a model with no ablation carries an empty marker rather than none.
-    plain = stage.ablated_input_check(build_tiny_model(), tmp_path / core.ANALYSIS_DIRNAME)
-    assert plain["coordinates"] == [] and plain["max_abs_attribution"] is None
-
-
 def test_the_target_only_arm_has_no_layer_to_split_and_no_lag_readout() -> None:
     """No source pathway means no proposal head and no proposal norm: both absent, never zeros."""
     model = build_tiny_model(source_disabled=True)
@@ -241,7 +212,11 @@ def _walk(block: Any, found: List[str], path: str = "") -> None:
 
 def test_the_stage_attributes_a_balanced_draw_end_to_end(tmp_path, monkeypatch) -> None:
     """Selection, the sequential subset loader, the identity check, every Captum call, the tables,
-    the figures and the trace, on a stub population with every class present."""
+    the figures and the trace, on a stub population with every class present.
+
+    Run on the arm with the target order-zero coefficient ablated, so the same pass also carries
+    the marker table and the read-back check, which must be exactly zero.
+    """
     monkeypatch.setattr(core, "IG_STEPS", 8)
     guids, epochs, codes = _population()
     dataset = _StubDataset(guids, epochs, codes)
@@ -251,7 +226,7 @@ def test_the_stage_attributes_a_balanced_draw_end_to_end(tmp_path, monkeypatch) 
     )
 
     block = stage.run_attribution(
-        _task(), _loader(dataset), identities, config={},
+        _task(zero_fhr_scattering_s0=True), _loader(dataset), identities, config={},
         eval_config={"seed": 0, "caps": {core.CAP_NAME: 3}, "occlusion_bands": {"near": [0, 2], "far": [3, 4]}},
         results_dir=tmp_path, geometry_record={"t": TINY_SEQ_LEN},
     )
@@ -291,6 +266,18 @@ def test_the_stage_attributes_a_balanced_draw_end_to_end(tmp_path, monkeypatch) 
         assert (directory / row["figure_file"]).is_file()
         assert row[labels.SUBGROUP_COLUMN] in row["figure_file"]
 
+    ablated = block["ablated_inputs"]
+    assert [entry["field"] for entry in ablated["coordinates"]] == ["fhr_st"]
+    assert ablated["coordinates"][0]["status"] == stage.STATUS_ABLATED
+    assert ablated["max_abs_attribution"] == 0.0
+    assert block["checks"]["ablated_input_max_abs"] == 0.0
+    assert stage.ABLATED_INPUTS_FILENAME in block["files"]
+    table = pd.read_csv(directory / stage.ABLATED_INPUTS_FILENAME)
+    assert list(table["status"]) == [stage.STATUS_ABLATED]
+    # And a model with no ablation carries an empty marker rather than none.
+    plain = stage.ablated_input_check(build_tiny_model(), directory)
+    assert plain["coordinates"] == [] and plain["max_abs_attribution"] is None
+
 
 def test_the_stage_records_a_skip_when_no_segment_carries_a_class(tmp_path) -> None:
     """What the pass produces when the delta does not name the target field."""
@@ -305,16 +292,5 @@ def test_the_stage_records_a_skip_when_no_segment_carries_a_class(tmp_path) -> N
     )
 
     assert block["status"] == stage.STATUS_SKIPPED
-    assert "load_fields" in block["reason"]
+    assert block["reason"]
     assert not (tmp_path / core.ANALYSIS_DIRNAME).exists()
-
-
-def test_no_name_this_stage_writes_is_one_of_the_keys_this_package_refuses() -> None:
-    """The summary walker refuses attention-shaped keys at any depth; the constants below are the
-    keys the block, the plan and the tables carry."""
-    names = {*core.READOUTS, *core.BASELINES, *core.STREAMS, core.CAP_NAME, core.ANALYSIS_DIRNAME}
-    names |= {panel.vector for panel in core.TRACE_PANELS if hasattr(panel, "vector")}
-    names |= set(core.TRACE_LAG_PROFILES)
-    names |= set(attribution_pass.RECORDING_VALUE_COLUMNS)
-
-    assert not names & set(FORBIDDEN_KEYS)

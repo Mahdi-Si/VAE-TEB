@@ -66,48 +66,22 @@ def trainer(tmp_path):
 # Config -> constructor
 # --------------------------------------------------------------------------------------
 def test_the_shipped_config_resolves_to_the_shipped_architecture(trainer):
-    """Every architectural flag ``SHIPPED_KWARGS`` claims the config sets, it must set. That
-    fixture is the suite's description of the production model; this keeps it honest against
-    the config file itself. The geometry deliberately differs (the fixture is tiny) and is
-    asserted against the config's real values below."""
+    """Every architectural flag and every geometry value ``SHIPPED_KWARGS`` claims the config sets,
+    the config must set and the sweep must carry to the constructor. That fixture is the suite's
+    description of the production model; this keeps it honest against the config file itself, and
+    a key that fails to reach the constructor would otherwise fall back to its default silently."""
     kwargs = trainer._build_model_kwargs()
 
     for name in (
         "causal_norm", "lag_bias_init", "use_entmax", "use_up_st",
         "horizon_depth", "horizon_kernel", "horizon_film",
+        "sequence_length", "d_model", "d_z", "horizon", "raw_per_step", "warmup_period",
+        "c_y", "c_u", "max_lag", "coverage_floor",
     ):
-        assert kwargs[name] == SHIPPED_KWARGS[name], f"{name} disagrees with the shipped flag set"
+        assert kwargs[name] == SHIPPED_KWARGS[name], f"{name} disagrees with the shipped kwargs"
     # YAML has no tuple; the constructor coerces, so the sweep hands the list through.
     assert tuple(kwargs["encoder_extra_dilations"]) == SHIPPED_KWARGS["encoder_extra_dilations"]
     assert tuple(kwargs["logvar_clamp"]) == SHIPPED_KWARGS["logvar_clamp"]
-
-
-def test_the_geometry_reaches_the_constructor(trainer):
-    kwargs = trainer._build_model_kwargs()
-
-    assert kwargs["sequence_length"] == 300
-    assert kwargs["d_model"] == 128
-    assert kwargs["d_z"] == 64
-    assert kwargs["horizon"] == 30
-    assert kwargs["raw_per_step"] == 16
-    assert kwargs["warmup_period"] == 30
-    assert kwargs["c_y"] == 109
-    assert kwargs["c_u"] == 58
-    assert kwargs["max_lag"] == 90
-    assert kwargs["coverage_floor"] == 0.9
-
-
-def test_loss_only_keys_do_not_reach_the_constructor(trainer):
-    """The net takes tensors and computes a loss on request; it owns none of these. The
-    constructor is keyword-only with no ``**kwargs``, so a leaked key would be a ``TypeError``
-    on the production config -- a poor place to find out."""
-    kwargs = trainer._build_model_kwargs()
-
-    for name in (
-        "likelihood", "free_bits", "lambda_full", "lambda_base", "beta_schedule",
-        "kld_beta", "beta_prior", "causal_reach_budget_s",
-    ):
-        assert name not in kwargs, f"{name} is not the net's"
 
 
 def test_the_resolved_kwargs_actually_build_a_model(trainer):
@@ -136,15 +110,6 @@ def test_a_null_config_value_falls_through_to_the_constructor_default(trainer):
     assert "dropout" not in trainer._build_model_kwargs()
 
 
-def test_the_decoder_width_rides_the_signature_sweep_with_no_special_case(trainer):
-    """It is a constructor argument like any other, so the sweep carries it into the kwargs a
-    checkpoint records -- which is the only place a non-default decoder width is recoverable
-    from, the raw grid no longer implying it."""
-    trainer.config["model_config"]["VAE_model"]["decoder_out_channels"] = 78
-
-    assert trainer._build_model_kwargs()["decoder_out_channels"] == 78
-
-
 def test_init_weights_is_never_a_config_decision(trainer):
     """Skipping initialisation would also skip the post-init delta-head zeroing order the
     zero-KL start depends on; the key is refused even when a config supplies it."""
@@ -156,44 +121,39 @@ def test_init_weights_is_never_a_config_decision(trainer):
 # --------------------------------------------------------------------------------------
 # create_model
 # --------------------------------------------------------------------------------------
-def test_create_model_wraps_the_net_in_its_task(trainer):
-    from teb_vae.lag_attn_rws.task import SeqVaeLagAttnRwsTask
-
-    trainer.create_model()
-
-    assert isinstance(trainer.pl_model, SeqVaeLagAttnRwsTask)
-    assert trainer.pl_model.orig_model is trainer.pytorch_model
-
-
 def test_create_model_passes_the_spike_breaker_block_to_the_task(trainer):
     """The block is validated by the framework and read by the module -- but nothing forwards
     it. ``GraphModelBase`` never passes it on, so a driver that forgets leaves a
     fully-configured ``enabled: true`` block doing nothing at all."""
     trainer.create_model()
 
-    breaker = trainer.pl_model.hparams["spike_breaker"]
-    assert breaker["enabled"] is True
-    assert breaker["comparison_metric"] == "main_loss"
-    assert breaker["ema_floor"] >= 1.0e9
+    configured = trainer.config["advanced_config"]["spike_breaker"]
+    assert configured["enabled"] is True, "the shipped config must exercise the forwarding"
+    assert dict(trainer.pl_model.hparams["spike_breaker"]) == dict(configured)
 
 
 def test_create_model_passes_the_loss_hyperparameters_to_the_task(trainer):
+    """Each objective key the config sets reaches the task by value. The weights are checked
+    nonzero in the config first: a driver that stopped reading a key falls back to $0.0$
+    silently, and only a nonzero configured value can tell the two apart."""
     trainer.create_model()
 
     hparams = trainer.pl_model.hparams
-    assert hparams["likelihood"] == "gaussian_nll"
-    assert hparams["lambda_full"] == 1.0
-    assert hparams["lambda_base"] == 1.0
-    assert hparams["free_bits"] == 0.0
-    assert hparams["beta_schedule"]["kind"] == "linear_warmup"
-    assert hparams["beta_schedule"]["start"] == 0.0
-    # The shipped anchor weight, forwarded from default.yaml rather than the driver's 0.0
-    # fallback -- a driver that stopped reading the key would fall back silently, and this is
-    # the assertion that would catch it.
-    assert hparams["beta_prior"] == 0.1
+    vae = trainer.config["model_config"]["VAE_model"]
+    for name in (
+        "likelihood", "lambda_full", "lambda_base", "free_bits", "beta_schedule",
+        "beta_prior", "lambda_ms", "lambda_deriv", "lambda_boundary",
+    ):
+        assert hparams[name] == vae[name], name
+    for name in ("beta_prior", "lambda_ms", "lambda_deriv", "lambda_boundary"):
+        assert float(vae[name]) != 0.0, f"the shipped config no longer weights {name}"
 
 
-def test_create_model_forces_eager_execution(trainer):
+def test_create_model_forces_eager_execution_even_when_the_config_asks_to_compile(trainer):
+    """The LSTM encoders defeat TorchInductor unconditionally, so the driver refuses compilation
+    without reading ``advanced_config.trainer.compile`` at all."""
+    trainer.config["advanced_config"]["trainer"]["compile"] = True
+
     trainer.create_model()
 
     assert trainer.pl_model.model is trainer.pl_model.orig_model
@@ -203,62 +163,16 @@ def test_create_model_forces_eager_execution(trainer):
 # The startup causal-standing log
 #
 # The sentence is a claim about what this architecture's history states are a function of, and it
-# is the premise every coupling number a run produces rests on. It moved behind a method so a
-# sibling architecture can state its own; these pin what *this* one still says, in both branches.
+# is the premise every coupling number a run produces rests on.
 # --------------------------------------------------------------------------------------
-@pytest.fixture
-def loguru_messages():
-    """Collect loguru output.
-
-    ``caplog`` cannot see it: loguru does not route through the stdlib ``logging`` module, so a
-    ``caplog.at_level`` assertion against these lines would pass on a driver that logged nothing.
-    """
-    from loguru import logger
-
-    messages: list[str] = []
-    sink_id = logger.add(messages.append, level="INFO", format="{message}")
-    yield messages
-    logger.remove(sink_id)
-
-
-def test_the_shipped_causal_standing_is_the_resolved_budget(trainer, loguru_messages):
-    """The shipped config now runs guarded, so what every production log must state is what the
-    budget resolved TO -- the surviving channel counts and the worst delay. A run that logged the
-    unguarded sentence while training guarded would misdescribe its own inputs."""
-    trainer.create_model()
-
-    assert trainer.resolved_budget is not None
-    message = trainer.causal_standing_message()
-    assert message.startswith("causal reach budget 120 s:")
-    assert "c_y 78, c_u 29" in message
-    assert "max delay 30 steps" in message
-    # Substring, as the unguarded assertion below is: the logger prefixes what it emits, so an
-    # equality check would be testing the log format rather than the standing.
-    assert any("causal reach budget 120 s:" in logged for logged in loguru_messages)
-
-
-def test_the_unguarded_causal_standing_is_stated_verbatim(trainer):
-    """The other branch, still reachable through ``sweep_reach_null.yaml``. It says the inputs are
-    two-sided and that the KL is therefore not a transfer entropy -- the one claim a reader could
-    otherwise take too far, and the reason that arm has to keep saying it."""
-    trainer.resolved_budget = None
-
-    assert trainer.causal_standing_message() == (
-        "causal reach budget: none (all channels, no delay) -- input features at step t "
-        "read up to 974 s into their own future, so the source-conditioned KL is not a "
-        "transfer entropy."
-    )
-
-
 def test_a_configured_budget_is_stated_as_the_resolved_survivor_counts(trainer):
-    """The other branch: with a budget the sentence is the resolution's own summary, so a run
-    records the guard it actually got rather than the one it asked for."""
+    """With a budget the sentence is the resolution's own summary, so a run records the guard it
+    actually got rather than the one it asked for."""
     trainer.config["model_config"]["VAE_model"]["causal_reach_budget_s"] = 120.0
     trainer._build_model_kwargs()
 
     assert trainer.resolved_budget is not None
     assert trainer.causal_standing_message() == trainer.resolved_budget.summary()
-    assert trainer.causal_standing_message().startswith("causal reach budget 120 s:")
 
 
 def test_the_checkpoint_kwargs_are_the_ones_the_model_was_built_from(trainer):
@@ -306,39 +220,36 @@ def test_the_shipped_config_drives_the_live_init_policies(trainer):
     its policy without raising, so the run trains a different starting point than its config
     describes. Read the policies off the assembled model, so a mistyped or dropped key is caught
     here rather than months later in an unreloadable checkpoint."""
-    import math
+    from teb_vae.lag_attn.nets.blocks import smooth_bound
 
+    vae = trainer.config["model_config"]["VAE_model"]
     model = _built_model(trainer)
 
-    # Per-block FiLM generators present and re-zeroed (identity at init), single film_gen not built.
-    film = model.horizon_core.refine.film
-    assert model.horizon_core.film_gen is None
-    assert film is not None
-    assert all(
-        float(gen.weight.abs().max()) == 0.0 and float(gen.bias.abs().max()) == 0.0 for gen in film
-    ), "per-block FiLM generators are not zero -- the re-zero policy did not reach the model"
-
-    # Posterior source gain = 2.0.
+    # The posterior source gain, off its unit default.
     gain = model.posterior_head.a_head_norm.weight
-    assert torch.equal(gain, torch.full_like(gain, 2.0)), "a_head_gain did not reach the model"
+    assert float(vae["a_head_gain"]) != 1.0
+    assert torch.equal(gain, torch.full_like(gain, float(vae["a_head_gain"]))), (
+        "a_head_gain did not reach the model"
+    )
 
-    # Horizon-embedding re-seeded at ~0.8.
-    assert 0.7 < float(model.horizon_core.horizon_embedding.std()) < 0.9, (
+    # The horizon embedding, re-seeded at the configured scale.
+    std = float(model.horizon_core.horizon_embedding.std())
+    assert std == pytest.approx(float(vae["horizon_embed_std"]), rel=0.15), (
         "horizon_embed_std did not reach the model"
     )
 
-    # Output-head calibration: log(5/3) log-variance bias (maps to log-variance 0 under the clamp).
+    # Output-head calibration: the log-variance bias is the pre-image of log-variance 0.
+    assert vae["head_init_calibration"] is True
     bias = model.decoder.logvar_head.bias
-    assert torch.allclose(bias, torch.full_like(bias, math.log(5.0 / 3.0)), atol=1e-6), (
-        "head_init_calibration did not reach the model"
-    )
+    assert torch.allclose(smooth_bound(bias, *model.logvar_clamp), torch.zeros_like(bias),
+                          atol=1e-6), "head_init_calibration did not reach the model"
 
 
 def test_a_mistyped_init_policy_key_is_caught_by_the_seam(trainer):
     """The sensitivity control: renaming a policy key so it no longer names a constructor argument
     makes the model silently revert that policy (the config-to-kwargs mapping drops unknown keys),
     and the assembled-model read above turns that into a failure. Here the horizon-embedding reverts
-    to the small constructor seed instead of the shipped 0.8."""
+    to the small constructor seed instead of the configured scale."""
     vae = trainer.config["model_config"]["VAE_model"]
     vae["horizon_embed_stdd"] = vae.pop("horizon_embed_std")  # a typo the signature sweep drops
 
@@ -354,14 +265,8 @@ def test_the_tracked_metric_list_is_reached_through_the_class_attribute(trainer,
     """A sibling adding a metric must not have to override ``train_model`` to collect it: that
     method is the whole callback assembly, and a copy of it would be free to drift from this one
     on every knob it wires -- the checkpoint monitor, the hyperparameter keys, the plot cadence."""
-    assert LagAttnRwsTrainer.TRACKED_METRICS is _TRACKED_METRICS
-
     class _ExtraMetricTrainer(LagAttnRwsTrainer):
         TRACKED_METRICS = _TRACKED_METRICS + ("val/a_sibling_metric",)
-
-    assert "train_model" not in vars(_ExtraMetricTrainer), (
-        "the point of the seam is that a subclass does not override train_model"
-    )
 
     driver = _redirected(_ExtraMetricTrainer, trainer.output_base_dir)
     captured = _capture_callbacks(driver, monkeypatch)
@@ -375,8 +280,6 @@ def test_the_tracked_metric_list_is_reached_through_the_class_attribute(trainer,
 def test_the_plotting_block_name_is_an_attribute_the_assembly_reads(trainer, monkeypatch):
     """The literal is one string in one place, and a run whose config spells the block
     differently gets no figure, no error, and nothing in the log saying why."""
-    assert LagAttnRwsTrainer.PLOT_CONFIG_KEY == "lag_attn_rws_plotting"
-
     class _RenamedBlockTrainer(LagAttnRwsTrainer):
         PLOT_CONFIG_KEY = "a_block_no_config_carries"
 

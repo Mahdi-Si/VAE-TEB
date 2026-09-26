@@ -163,30 +163,6 @@ def resolve_target_budget(budget_s: Optional[float] = SHIPPED_REACH_BUDGET_S):
     return resolve_stream_budgets(config)
 
 
-def build_target_gate(budget_s: Optional[float] = SHIPPED_REACH_BUDGET_S):
-    """Build the target stream's input guard exactly as the model builds it.
-
-    Through the model class's own factory rather than by constructing a
-    :class:`~teb_vae.lag_attn.nets.delays.ChannelGate` here: the factory decides what an absent
-    budget means (no gate at all, not an identity one), and a second decision about that in the
-    test suite is a second thing to keep in step.
-
-    Args:
-        budget_s: The budget in seconds, or ``None`` for the unguarded arm.
-
-    Returns:
-        The gate, or ``None`` when no budget is configured.
-    """
-    from teb_vae.lag_attn_rws.nets.model import SeqVaeLagAttnRws
-
-    budget = resolve_target_budget(budget_s)
-    if budget is None:
-        return SeqVaeLagAttnRws._build_channel_gate(SHIPPED_KWARGS["c_y"], None, None)
-    return SeqVaeLagAttnRws._build_channel_gate(
-        SHIPPED_KWARGS["c_y"], budget.target_keep_index, budget.target_delays
-    )
-
-
 def shipped_gated_kwargs(
     budget_s: Optional[float] = SHIPPED_REACH_BUDGET_S,
 ) -> Dict[str, Any]:
@@ -229,12 +205,6 @@ def tiny_kwargs() -> dict:
 
 
 @pytest.fixture
-def shipped_kwargs() -> dict:
-    """A fresh copy of the production constructor kwargs (safe to mutate)."""
-    return dict(SHIPPED_KWARGS)
-
-
-@pytest.fixture
 def stub_batch():
     """A two-sample stub batch at the tiny geometry, with the deliberate weight gap."""
     return make_stub_batch(BATCH, SEQ_LEN)
@@ -244,12 +214,6 @@ def stub_batch():
 def patterned_batch():
     """A two-sample batch at the tiny geometry whose target blocks carry the known pattern."""
     return make_patterned_batch(BATCH, SEQ_LEN)
-
-
-@pytest.fixture
-def make_stub_batch_fn():
-    """Factory fixture returning the sibling's :func:`make_stub_batch`."""
-    return make_stub_batch
 
 
 def _make_task(model_kwargs: dict | None = None, hparams: dict | None = None, **task_kwargs):

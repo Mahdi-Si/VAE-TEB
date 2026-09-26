@@ -299,82 +299,29 @@ def test_the_two_columns_are_on_every_row_of_every_batch(trained_task) -> None:
 
 
 # =================================================================================================
-# The permutation control's draw
+# The permutation control at the dense geometry
 # =================================================================================================
-@pytest.mark.parametrize(
-    "groups",
-    [
-        ["a", "a", "b", "b"],
-        ["a", "b"],
-        ["a", "a", "b", "c"],
-        ["a"] * 4 + ["b"] * 3 + ["c"] * 1,
-    ],
-)
-def test_a_grouped_derangement_never_pairs_within_a_group(groups) -> None:
-    """The whole point, over compositions ranging from balanced to right at the feasibility
-    boundary. Drawn repeatedly because a construction that is *usually* cross-group would pass a
-    single draw."""
-    generator = torch.Generator().manual_seed(0)
-
-    for _ in range(50):
-        perm = controls.make_derangement(len(groups), generator=generator, groups=groups)
-
-        assert torch.equal(perm.sort().values, torch.arange(len(groups))), "not a permutation"
-        for position, partner in enumerate(perm.tolist()):
-            assert groups[position] != groups[partner], f"{groups} paired within its own group"
-
-
-@pytest.mark.parametrize(
-    "groups,expected",
-    [
-        (["a", "b"], True),
-        (["a", "a", "b", "b"], True),
-        (["a", "a", "a", "b"], False),
-        (["a", "a"], False),
-        (["a"], False),
-    ],
-)
-def test_feasibility_is_the_exact_half_batch_condition(groups, expected) -> None:
-    r"""Hall's theorem gives $2\max_g |g| \le B$ exactly, so the predicate rejects only batches
-    that genuinely have no valid pairing."""
-    assert controls.groups_can_derange(groups) is expected
-
-
 def test_the_forward_control_pairs_across_recordings_at_the_dense_geometry(
     trained_task, stub_batch
 ) -> None:
-    """Threaded all the way through the rebuild, not merely available on the draw -- and at the
-    anchor set the evaluation decodes at, because ``perm_forward_outputs`` gathers the permuted
-    latent at ``anchor_index`` and a control that decoded a different set would be scored against
-    this one's target."""
+    """Threaded all the way through the rebuild, and at the anchor set the evaluation decodes at:
+    ``perm_forward_outputs`` gathers the permuted latent at ``anchor_index`` and falls back to the
+    contiguous prefix without it. That fallback is **silent** at the call site, because
+    ``evaluate_batch`` reads only the permuted posterior's parameters, which are $(B, T, d_z)$
+    either way -- so the withheld call is asserted to differ, which is what makes the first
+    assertion non-vacuous."""
     outputs, _u_stream, _weight, _support = _dense_forward(trained_task, stub_batch)
 
     permuted = controls.perm_forward_outputs(
         trained_task.orig_model, outputs, groups=["a", "b"],
         anchors=outputs["anchor_index"],
     )
-
-    assert permuted["perm_index"].tolist() == [1, 0]
-    assert permuted["mu_full"].shape == outputs["mu_full"].shape
-
-
-def test_the_control_decodes_the_prefix_when_the_anchor_set_is_withheld(
-    trained_task, stub_batch
-) -> None:
-    """The negative control for the call site above, and the reason ``anchors=`` is passed there.
-
-    ``perm_forward_outputs`` takes the anchor set as an argument and falls back to the contiguous
-    prefix without it. That fallback is right for a model that decodes every anchor and wrong here,
-    and it is **silent** at the call site: ``evaluate_batch`` reads only the permuted posterior's
-    two distribution parameters, which are $(B, T, d_z)$ either way. So the wrong shape would
-    surface nowhere until something read the control's forecast.
-    """
-    outputs, _u_stream, _weight, _support = _dense_forward(trained_task, stub_batch)
-
     withheld = controls.perm_forward_outputs(
         trained_task.orig_model, outputs, groups=["a", "b"]
     )
 
+    assert permuted["perm_index"].tolist() == [1, 0]
+    assert permuted["mu_full"].shape == outputs["mu_full"].shape
     assert withheld["mu_full"].shape[1] == trained_task.orig_model.geometry.t_valid
     assert withheld["mu_full"].shape[1] != outputs["mu_full"].shape[1]
 

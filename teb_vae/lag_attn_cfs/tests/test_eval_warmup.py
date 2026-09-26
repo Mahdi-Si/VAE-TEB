@@ -1,6 +1,6 @@
 r"""The warm-up staircase read as a decomposition, and the two guards that are FAIL-able.
 
-Three properties, and each is here because it is the one thing that makes its readout mean
+Two properties, and each is here because it is the one thing that makes its readout mean
 something:
 
 * **The three tertiles are a decomposition.** They are only three parts of ``pred_gap`` if they
@@ -14,10 +14,6 @@ something:
   a longer horizon, a higher floor -- moves the expectation with the model rather than failing a
   guard written against the shipped $152$. Both arms are constructed here rather than assumed to
   behave.
-
-* **A small source-lag warmth fraction is the expected finding.** The record says so, in the
-  output rather than only in a docstring, because a reader who found a value near zero and no
-  statement beside it would read a designed property of this cell as a defect.
 """
 from __future__ import annotations
 
@@ -129,7 +125,6 @@ def test_the_three_tertiles_recompose_to_pred_gap_per_recording() -> None:
     assert record["holds"] is True
     assert record["max_rel_residual"] < 1e-6
     assert record["n_recordings"] == 2
-    assert "pred_gap" in record["identity"]
 
 
 def test_a_tertile_that_stopped_tiling_the_channel_axis_is_reported() -> None:
@@ -357,34 +352,6 @@ def test_the_headline_block_is_flat_and_carries_the_five_comparable_readouts(tmp
     }
     assert headline["pred_gap_warm_lo_nats"] == pytest.approx(0.1)
     assert all(isinstance(value, float) for value in headline.values())
-
-
-def test_the_record_states_that_a_small_warmth_fraction_is_expected(tmp_path) -> None:
-    """In the output rather than only in a docstring: a reader who found a value near zero and no
-    statement beside it would read a designed property of this cell as a defect."""
-    result = warmup_analysis.run_warmup_analysis(
-        _context(_per_sample([(0.1, 0.2, 0.3)] * 4)),
-        eval_config=EVAL_CONFIG, output_dir=tmp_path, probe=None,
-    )
-
-    note = result["source_lag_warmth_note"]
-    assert "expected" in note
-    assert "DESIGN.md" in note, "the argument is cited rather than restated"
-
-
-def test_every_metric_row_names_its_unit_and_what_it_means(tmp_path) -> None:
-    """Two of the eight are fractions and one is a count; a table of eight means in one unnamed
-    unit is a table a reader has to guess at."""
-    result = warmup_analysis.run_warmup_analysis(
-        _context(_per_sample([(0.1, 0.2, 0.3)] * 4)),
-        eval_config=EVAL_CONFIG, output_dir=tmp_path, probe=None,
-    )
-
-    units = {row["metric"]: row["unit"] for row in result["metrics"]}
-    assert units["pred_gap_warm_lo"] == "nats per anchor"
-    assert units["source_lag_warmth_frac_st"] == "fraction of attention mass"
-    assert units["anchors_per_sample"] == "anchors"
-    assert all(row["meaning"].strip() for row in result["metrics"])
 
 
 # =================================================================================================

@@ -88,9 +88,9 @@ SHIPPED_LEG_ALIGNMENT = "envelope"
 #: (``tiny_shard_causal_int.hdf5``) and its own widths; see :data:`INT_C_Y` / :data:`INT_C_U`.
 SHIPPED_PHASE_OPERATOR = "ratio_power_v0"
 
-#: The shipped forecast horizon (two minutes) and the sequence length the loader's trim produces.
-#: Mirrors ``configs/default.yaml``; ``test_config_load.py`` reads the config independently, so the
-#: two routes disagreeing is what catches one of them going stale.
+#: The reference forecast horizon the legacy-fixture tests resolve at, and the sequence length the
+#: loader's trim produces. A test geometry, not a mirror of ``configs/default.yaml``: the shipped
+#: config's own geometry is checked against the constructor and the driver, not against these.
 SHIPPED_HORIZON = 30
 SHIPPED_SEQUENCE_LENGTH = 300
 
@@ -976,21 +976,9 @@ def tiny_warmup() -> Dict[str, Any]:
 
 
 @pytest.fixture
-def streams():
-    """Seeded ``(y_st, y_ph, u_stream)`` at the tiny geometry and the causal widths."""
-    return make_streams(TINY_KWARGS)
-
-
-@pytest.fixture
 def stub_batch():
     """A two-sample stub batch at the tiny geometry, with the deliberate weight gap."""
     return make_stub_batch()
-
-
-@pytest.fixture
-def make_stub_batch_fn():
-    """Factory fixture returning :func:`make_stub_batch`."""
-    return make_stub_batch
 
 
 @pytest.fixture

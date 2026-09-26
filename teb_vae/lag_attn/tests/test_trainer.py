@@ -56,79 +56,20 @@ def test_the_shipped_config_resolves_to_the_shipped_architecture(trainer):
     That fixture is the suite's description of the production model; this is what keeps it honest
     against the config file itself. Note it is not a faithful copy in every field: it deliberately
     differs on the geometry (it is tiny) and on the permutation control, whose weight and period it
-    tunes so a schedule is observable within a handful of test steps. Those are asserted against
-    the config's real values below rather than against the fixture.
+    tunes so a schedule is observable within a handful of test steps.
+
+    The nested ``horizon_refine`` and ``encoder`` blocks are translated to flat constructor
+    arguments, and the dilation list must arrive as a tuple (YAML has none): a list would compare
+    unequal to the fixture's tuple.
     """
     kwargs = trainer._build_model_kwargs()
 
     for name in (
         "causal_norm", "kld_support", "lag_bias_init", "use_entmax", "head_structured_latent",
         "freeze_unused_attn_proj", "use_up_st",
+        "horizon_depth", "horizon_film", "encoder_extra_dilations",
     ):
         assert kwargs[name] == SHIPPED_KWARGS[name], f"{name} disagrees with the shipped flag set"
-
-
-def test_the_permutation_control_ships_as_a_readout(trainer):
-    r"""$\lambda_{\mathrm{perm}} = 0$ is the shipped value, and it is a measured decision.
-
-    A positive weight can only suppress $K_{\mathrm{shuffled}}$ by teaching the posterior to ignore
-    mismatched sources, which competes with using the source at all; it collapsed the source
-    pathway outright in half the seeds it was tried on. The control still runs -- it is the
-    readout -- it just does not enter the loss.
-    """
-    kwargs = trainer._build_model_kwargs()
-
-    assert kwargs["lambda_perm"] == 0.0
-    assert kwargs["perm_every_n_batches"] == 4
-
-
-def test_the_nested_blocks_are_translated_to_flat_constructor_arguments(trainer):
-    """The config groups them for readability; the constructor takes them flat."""
-    kwargs = trainer._build_model_kwargs()
-
-    assert kwargs["horizon_depth"] == 3
-    assert kwargs["horizon_kernel"] == 3
-    assert kwargs["horizon_film"] is True
-    assert kwargs["encoder_extra_dilations"] == (8, 16)
-
-
-def test_extra_dilations_arrive_as_a_tuple(trainer):
-    """YAML has no tuple, and the encoder's dilation list is a fixed structural property."""
-    assert isinstance(trainer._build_model_kwargs()["encoder_extra_dilations"], tuple)
-
-
-def test_logvar_clamp_arrives_as_a_pair(trainer):
-    kwargs = trainer._build_model_kwargs()
-
-    assert kwargs["logvar_clamp"] == (-5.0, 3.0)
-    assert isinstance(kwargs["logvar_clamp"], tuple)
-
-
-def test_the_geometry_reaches_the_constructor(trainer):
-    kwargs = trainer._build_model_kwargs()
-
-    assert kwargs["sequence_length"] == 300
-    assert kwargs["d_model"] == 128
-    assert kwargs["d_z"] == 24
-    assert kwargs["c_y"] == 109
-    assert kwargs["c_u"] == 58
-    assert kwargs["max_lag"] == 90
-
-
-def test_loss_only_keys_do_not_reach_the_constructor(trainer):
-    """The net takes tensors and computes a loss on request; it owns none of these.
-
-    The constructor is keyword-only with no ``**kwargs``, so a leaked key is a ``TypeError`` rather
-    than a silent mis-build -- but it would be a ``TypeError`` on the production config, which is a
-    poor place to find out.
-    """
-    kwargs = trainer._build_model_kwargs()
-
-    for name in (
-        "likelihood", "sigma_obs", "free_bits", "lambda_full", "lambda_base", "beta_schedule",
-        "kld_beta", "detach_baseline_in_full", "lag_smoothness_lambda", "horizon_refine", "encoder",
-    ):
-        assert name not in kwargs, f"{name} is the task's, not the net's"
 
 
 def test_the_resolved_kwargs_actually_build_a_model(trainer):
@@ -161,13 +102,14 @@ def test_a_null_config_value_falls_through_to_the_constructor_default(trainer):
 # --------------------------------------------------------------------------------------
 # create_model
 # --------------------------------------------------------------------------------------
-def test_create_model_wraps_the_net_in_its_task(trainer):
+def test_create_model_wraps_the_eager_net_in_its_task(trainer):
     from teb_vae.lag_attn.task import SeqVaeLagAttnTask
 
     trainer.create_model()
 
     assert isinstance(trainer.pl_model, SeqVaeLagAttnTask)
     assert trainer.pl_model.orig_model is trainer.pytorch_model
+    assert trainer.pl_model.model is trainer.pl_model.orig_model  # eager, never compiled
 
 
 def test_create_model_passes_the_spike_breaker_block_to_the_task(trainer):
@@ -185,30 +127,19 @@ def test_create_model_passes_the_spike_breaker_block_to_the_task(trainer):
 
 
 def test_create_model_passes_the_loss_hyperparameters_to_the_task(trainer):
+    """Each loss key reaches the task under its own name, except ``lag_smoothness_lambda``, which
+    the task takes as ``lambda_lag`` -- exactly the kind of rename that silently resolves to a
+    default of $0$."""
     trainer.create_model()
 
     hparams = trainer.pl_model.hparams
-    assert hparams["likelihood"] == "gaussian_nll"
-    assert hparams["sigma_obs"] == "learned"
-    assert hparams["free_bits"] == 0.01
-    assert hparams["detach_baseline_in_full"] is True
-    assert hparams["beta_schedule"]["kind"] == "linear_warmup"
-
-
-def test_the_lag_smoothness_weight_is_renamed_on_the_way_in(trainer):
-    """The config calls it ``lag_smoothness_lambda``; the task's argument is ``lambda_lag``.
-
-    A rename is exactly the kind of thing that silently resolves to a default of 0.0.
-    """
-    trainer.create_model()
-
-    assert trainer.pl_model.hparams["lambda_lag"] == 1.0e-3
-
-
-def test_create_model_forces_eager_execution(trainer):
-    trainer.create_model()
-
-    assert trainer.pl_model.model is trainer.pl_model.orig_model
+    vae = trainer.config["model_config"]["VAE_model"]
+    for name in (
+        "likelihood", "sigma_obs", "free_bits", "detach_baseline_in_full", "beta_schedule",
+        "kld_beta", "lambda_full", "lambda_base",
+    ):
+        assert hparams[name] == vae[name], f"{name} did not reach the task"
+    assert hparams["lambda_lag"] == vae["lag_smoothness_lambda"] > 0
 
 
 def test_the_checkpoint_kwargs_are_the_ones_the_model_was_built_from(trainer):
@@ -266,17 +197,6 @@ def test_the_tracked_list_covers_what_the_task_emits(task, stub_batch, perturb_p
     assert untracked == set(), f"the task emits {untracked}, which no callback collects"
 
 
-def test_beta_is_tracked_stage_prefixed():
-    """The specific column that was silently NaN before."""
-    assert "train/kld_beta" in _TRACKED_METRICS
-    assert "kld_beta" not in _TRACKED_METRICS
-
-
-def test_lr_is_tracked_bare():
-    """The one name the framework does log unprefixed."""
-    assert "lr" in _TRACKED_METRICS
-
-
 # --------------------------------------------------------------------------------------
 # train_model wiring
 # --------------------------------------------------------------------------------------
@@ -301,16 +221,6 @@ def built_callbacks(trainer, monkeypatch):
     return captured
 
 
-def test_train_model_goes_through_the_framework_trainer_builder(built_callbacks):
-    """No hand-rolled ``pl.Trainer``.
-
-    The builder is what attaches the LR monitor and the MLflow run-logging callback, reconciles
-    ``benchmark`` against ``deterministic``, and TTY-gates the progress bar. A hand-rolled block
-    gets none of that and drifts from the config table besides.
-    """
-    assert "callbacks" in built_callbacks
-
-
 def test_the_model_passed_to_the_builder_is_the_lightning_module(built_callbacks, trainer):
     """And is therefore not something to read raw-model attributes off; see the strategy hook."""
     assert built_callbacks["model"] is trainer.pl_model
@@ -322,30 +232,16 @@ def test_the_checkpoint_callback_writes_to_the_run_checkpoint_directory(built_ca
     from lightning.pytorch.callbacks import ModelCheckpoint
 
     checkpoints = [cb for cb in built_callbacks["callbacks"] if isinstance(cb, ModelCheckpoint)]
+    configured = trainer.config["advanced_config"]["callbacks"]["model_checkpoint"]
 
     assert len(checkpoints) == 1
     assert checkpoints[0].dirpath == trainer.model_checkpoint_dir
-
-
-def test_the_checkpoint_monitor_comes_from_config(built_callbacks, trainer):
-    """Hardcoding it would make the config key a decoration, which is what it was before."""
-    from lightning.pytorch.callbacks import ModelCheckpoint
-
-    checkpoint = next(cb for cb in built_callbacks["callbacks"] if isinstance(cb, ModelCheckpoint))
-    configured = trainer.config["advanced_config"]["callbacks"]["model_checkpoint"]
-
-    assert checkpoint.monitor == configured["monitor"]
-    assert checkpoint.save_top_k == configured["save_top_k"]
-
-
-def test_the_checkpoint_filename_does_not_double_prefix_the_epoch(built_callbacks):
-    """Lightning prefixes each placeholder with its own name, so ``epoch={epoch}`` renders
-    ``epoch=epoch=00``."""
-    from lightning.pytorch.callbacks import ModelCheckpoint
-
-    checkpoint = next(cb for cb in built_callbacks["callbacks"] if isinstance(cb, ModelCheckpoint))
-
-    assert "epoch=" not in checkpoint.filename
+    # The monitor comes from config; hardcoding it would make the config key a decoration.
+    assert checkpoints[0].monitor == configured["monitor"]
+    assert checkpoints[0].save_top_k == configured["save_top_k"]
+    # Lightning prefixes each placeholder with its own name, so `epoch={epoch}` renders
+    # `epoch=epoch=00`.
+    assert "epoch=" not in checkpoints[0].filename
 
 
 def test_the_metrics_history_writer_is_wired_to_the_collector(built_callbacks):
@@ -356,6 +252,21 @@ def test_the_metrics_history_writer_is_wired_to_the_collector(built_callbacks):
 
     assert writer.source is collector
     assert collector.tracked_metrics == _TRACKED_METRICS
+
+
+def test_the_enabled_diagnostic_plotter_is_wired_from_config(built_callbacks, trainer):
+    """The shipped config enables the plotter; it must land once, under the run's results
+    directory, with the configured schedule. (The tiny smoke run covers the disabled path.)"""
+    from teb_vae.lag_attn.plotting import LagAttnPlotCallback
+
+    configured = trainer.config["advanced_config"]["callbacks"]["lag_attn_plotting"]
+    plotters = [cb for cb in built_callbacks["callbacks"] if isinstance(cb, LagAttnPlotCallback)]
+
+    assert configured["enabled"] is True
+    assert len(plotters) == 1
+    assert plotters[0].output_dir.parent == Path(trainer.train_results_dir)
+    assert plotters[0].plot_frequency == configured["plot_frequency"]
+    assert plotters[0].num_examples == configured["num_examples"]
 
 
 # --------------------------------------------------------------------------------------

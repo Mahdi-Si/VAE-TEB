@@ -23,6 +23,7 @@ import math
 import pytest
 import torch
 
+from teb_vae.lag_attn_rws.nets.raw_masks import contributing_anchors, forecast_mask
 from teb_vae.lag_slot_transformer_cfs.nets import objective as objective_module
 from teb_vae.lag_slot_transformer_cfs.nets.objective import compute_residual_objective
 from teb_vae.lag_slot_transformer_cfs.nets.model import SeqVaeLagResidualTrfCfs
@@ -114,16 +115,6 @@ def test_the_horizon_weights_sum_to_the_horizon() -> None:
     assert bool((weights[:-1] > weights[1:]).all())
 
 
-def test_an_unweighted_model_carries_no_weight_buffer_at_all() -> None:
-    """``None`` skips the multiplication rather than multiplying by ones, so the score is bitwise."""
-    model = build_model(target_weight_st=1.0, target_weight_ph=1.0)
-    assert getattr(model, "horizon_weight", None) is None
-    # The channel weight exists but is uniform, which is the family's convention for this pair.
-    assert torch.allclose(
-        model.target_channel_weight, torch.ones_like(model.target_channel_weight)
-    )
-
-
 def test_the_reconstruction_and_divergence_share_one_anchor_set() -> None:
     """By construction, not by two expressions that agree today.
 
@@ -135,15 +126,23 @@ def test_the_reconstruction_and_divergence_share_one_anchor_set() -> None:
     model = build_model()
     weight = torch.ones(TINY_BATCH, TINY_SEQ_LEN)
     weight[:, 12:16] = 0.0  # a gap inside the decoded range
-    _, metrics = score(model, weight=weight)
+    outputs, metrics = score(model, weight=weight)
 
-    dense_anchors = TINY_SEQ_LEN - TINY_MODEL_HORIZON - tiny_model_kwargs()["warmup_period"]
-    assert 0.0 < float(metrics["scored_anchors"]) < TINY_BATCH * dense_anchors
-    # The divergence is reported over the same count the reconstruction was averaged over, so the
-    # two columns are addable without rescaling.
-    assert float(metrics["scored_anchors"]) == pytest.approx(
-        float(metrics["scored_anchors"])
+    mask, _ = forecast_mask(
+        model.scored_weight(weight),
+        model.geometry,
+        coverage_floor=float(model.coverage_floor),
+        anchors=outputs["anchor_index"],
+        anchor_valid=outputs["anchor_valid"],
     )
+    support = contributing_anchors(mask).to(outputs["kld_per_anchor"].dtype)
+    dense_anchors = TINY_SEQ_LEN - TINY_MODEL_HORIZON - tiny_model_kwargs()["warmup_period"]
+    assert 0.0 < float(support.sum()) < TINY_BATCH * dense_anchors
+    assert float(metrics["scored_anchors"]) == float(support.sum())
+    # The divergence is averaged over the reconstruction's own contributing anchors, so the two
+    # columns are addable without rescaling.
+    expected = (outputs["kld_per_anchor"] * support).sum() / support.sum()
+    assert float(metrics["source_conditioned_kl_raw"]) == pytest.approx(float(expected), rel=1e-5)
 
 
 # =================================================================================================

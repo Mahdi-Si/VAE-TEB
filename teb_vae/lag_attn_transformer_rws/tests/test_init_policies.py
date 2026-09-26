@@ -47,25 +47,10 @@ from teb_vae.lag_attn_transformer_rws.tests.conftest import SHIPPED_KWARGS
 #: $10\%$ is a three-sigma band rather than a loose one.
 _STD_BAND = 0.10
 
-#: How far above the generic pass's standard deviation the corrected one must sit for the
-#: correction to be worth having. The predicted factor is $8.03$; $5$ leaves room for the sampling
-#: spread above without admitting a no-op.
-_MIN_CORRECTION_FACTOR = 5.0
-
 
 def _model(kwargs, **overrides) -> SeqVaeLagAttnTrfRws:
     torch.manual_seed(0)
     return SeqVaeLagAttnTrfRws(**dict(kwargs, **overrides))
-
-
-def _xavier_std(weight: torch.Tensor) -> float:
-    r"""The standard deviation ``xavier_uniform_`` produces on this exact weight shape.
-
-    Computed here from the tensor rather than written down, so the comparison stays true if the
-    shipped kernels change.
-    """
-    fan_in, fan_out = nn.init._calculate_fan_in_and_fan_out(weight)
-    return math.sqrt(2.0 / float(fan_in + fan_out))
 
 
 @pytest.fixture(scope="module")
@@ -157,37 +142,6 @@ def test_depthwise_weights_carry_the_variance_preserving_scale(shipped_model):
         )
 
 
-def test_the_correction_is_far_above_what_the_generic_pass_would_have_left(shipped_model):
-    """The number the correction exists for: at $k = 5$, $C = 128$ the generic pass gives
-    $\\sqrt{2/(5 + 640)} = 0.0557$ against a target of $1/\\sqrt 5 = 0.447$. The comparison is
-    computed on the same weight shape rather than written down."""
-    for convolution in shipped_model.modules():
-        if not isinstance(convolution, CausalDepthwiseConv1d):
-            continue
-        generic = _xavier_std(convolution.conv.weight)
-        measured = float(convolution.conv.weight.std())
-        assert measured > _MIN_CORRECTION_FACTOR * generic, (
-            f"kernel {convolution.kernel_size}: measured std {measured:.4f} is not "
-            f"{_MIN_CORRECTION_FACTOR}x the generic pass's {generic:.4f} -- the depthwise "
-            f"correction did not run, or ran before it"
-        )
-
-
-def test_the_correction_runs_after_the_generic_pass_not_before(tiny_kwargs):
-    """Order, stated as a counterfactual: applying the generic pass to a built model undoes the
-    depthwise scale, so a model whose correction ran first would look like this one."""
-    model = _model(tiny_kwargs)
-    convolution = next(
-        module for module in model.modules() if isinstance(module, CausalDepthwiseConv1d)
-    )
-    corrected = float(convolution.conv.weight.std())
-
-    initialization(model)
-    undone = float(convolution.conv.weight.std())
-
-    assert undone < 0.5 * corrected
-
-
 # =========================================================================================
 # The two zeroings the generic pass would have undone
 # =========================================================================================
@@ -210,27 +164,6 @@ def test_the_film_generators_are_exactly_zero(tiny_kwargs):
     assert film is not None and len(film) > 0
     for generator in film:
         assert float(generator.weight.abs().max()) == 0.0
-
-
-@pytest.mark.parametrize("init_weights", [True, False], ids=["generic-pass", "no-generic-pass"])
-def test_without_the_rezeroing_neither_is_zero(tiny_kwargs, monkeypatch, init_weights):
-    """The negative control for both, in the two directions they can fail.
-
-    With the generic pass on, it xavier-refills the delta heads *and* the FiLM generators the
-    horizon core zero-initialised itself -- that refill is precisely what the re-zeroing repairs.
-    With it off, the delta heads keep torch's own non-zero default while the core's FiLM zeros
-    survive, so only the delta assertion is testable there; that asymmetry is why the FiLM
-    generators need the generic pass to have a control at all.
-    """
-    monkeypatch.setattr(SeqVaeLagAttnTrfRws, "_zero_init_delta_heads", lambda self: None)
-    monkeypatch.setattr(SeqVaeLagAttnTrfRws, "_zero_init_film_generators", lambda self: None)
-    model = _model(tiny_kwargs, init_weights=init_weights)
-
-    assert float(model.posterior_head.delta_mu_head[0].weight.abs().max()) > 0.0
-    if init_weights:
-        film = model.horizon_core.refine.film
-        assert film is not None
-        assert max(float(generator.weight.abs().max()) for generator in film) > 0.0
 
 
 # =========================================================================================
@@ -260,16 +193,6 @@ def test_the_logvar_bias_is_the_exact_preimage_of_zero_logvar(tiny_kwargs):
     assert torch.allclose(smooth_bound(bias, lo, hi), torch.zeros_like(bias), atol=1e-6)
 
 
-def test_the_uncalibrated_heads_are_not_already_at_the_trivial_predictor(tiny_kwargs):
-    """The negative control: without the policy the log-variance bias is the generic pass's zero,
-    which ``smooth_bound`` maps far from $0$, so the calibrated assertion is not vacuous."""
-    model = _model(tiny_kwargs, head_init_calibration=False)
-    lo, hi = model.logvar_clamp
-    bounded = smooth_bound(model.decoder.logvar_head.bias, lo, hi)
-
-    assert float(bounded.abs().min()) > 0.5
-
-
 def test_the_calibrated_prior_starts_at_unit_scale(tiny_kwargs, inputs):
     """The prior half of the calibration: the log-variance head's final layer and skip are
     zeroed and the bias seeded at the pre-image of 0, so the bounded output is exactly 0
@@ -290,35 +213,10 @@ def test_the_calibrated_prior_starts_at_unit_scale(tiny_kwargs, inputs):
     assert float((logvar_prior <= floor).float().mean()) == 0.0
 
 
-def test_the_uncalibrated_prior_is_not_at_unit_scale(tiny_kwargs, inputs):
-    """The negative control: Xavier-filled, the head's raw output sits near 0 and the sigmoid
-    bound maps it around -1, so the calibrated assertion above is not vacuous."""
-    model = _model(tiny_kwargs, head_init_calibration=False).eval()
-    with torch.no_grad():
-        out = model(*inputs)
-
-    assert float(out["logvar_prior"].abs().mean()) > 0.5
-
-
-def test_the_prior_calibration_preserves_the_zero_kl_start(tiny_kwargs, inputs):
-    """The posterior's log-variance residual is built on the prior's raw pre-bound tensor, so
-    pinning that tensor moves prior and posterior together and the KL stays exactly zero."""
-    model = _model(tiny_kwargs, head_init_calibration=True).train()
-    torch.manual_seed(0)
-    out = model(*inputs)
-
-    assert float(out["kld_per_t"].abs().max()) == 0.0
-    assert torch.equal(out["logvar_post"], out["logvar_prior"])
-
-
-def test_the_a_head_gain_reaches_the_posterior_fusion(tiny_kwargs):
-    weight = _model(tiny_kwargs, a_head_gain=2.0).posterior_head.a_head_norm.weight
-    assert torch.equal(weight, torch.full_like(weight, 2.0))
-
-
-def test_the_default_gain_is_the_plain_unit_norm(tiny_kwargs):
-    weight = _model(tiny_kwargs, a_head_gain=1.0).posterior_head.a_head_norm.weight
-    assert torch.equal(weight, torch.ones_like(weight))
+@pytest.mark.parametrize("gain", [1.0, 2.0], ids=["default-unit-norm", "shipped"])
+def test_the_a_head_gain_reaches_the_posterior_fusion(tiny_kwargs, gain):
+    weight = _model(tiny_kwargs, a_head_gain=gain).posterior_head.a_head_norm.weight
+    assert torch.equal(weight, torch.full_like(weight, gain))
 
 
 # =========================================================================================

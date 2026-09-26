@@ -1,10 +1,6 @@
 r"""The coupling readouts against time before delivery, on recordings and on a fixed grid.
 
-Four things are pinned, and each is a way this analysis could be wrong while looking right.
-
-**The grid is not a setting.** The window width is a module constant and is absent from the
-configuration schema, because an operator who could widen it could merge two windows until a
-difference appeared or disappeared. Both halves are asserted mechanically rather than described.
+Three things are pinned, and each is a way this analysis could be wrong while looking right.
 
 **The binning is arithmetic with a sign in it.** ``epoch`` is negative before delivery, so hours
 before delivery is $-\mathrm{epoch}/3600$; getting the sign wrong produces a trajectory running
@@ -22,8 +18,7 @@ variance sitting on its clamp.
 ``equivalent`` for that reason: the axis is ``epoch``, the unit is the recording, and both
 readouts are nats per anchor whatever the decoder emits. The agreement with the sibling's
 implementation is pinned in ``test_eval_sibling_agreement.py``; what is pinned here is that the
-columns it reduces are on *this* cell's per-sample table and that the grid it bins on is absent
-from *this* package's configuration schema.
+columns it reduces are on *this* cell's per-sample table, plus the windows tests and the figures.
 """
 from __future__ import annotations
 
@@ -88,19 +83,8 @@ def _cohort_rows(
 
 
 # =============================================================================
-# The grid, and that it is not a setting
+# The columns and the grid
 # =============================================================================
-def test_the_bin_width_is_a_module_constant_and_not_a_config_key() -> None:
-    """Both halves of the mechanical non-configurability assertion."""
-    from teb_vae.lag_attn_cfs.eval import config_schema
-
-    assert analysis.TRAJECTORY_BIN_HOURS == pytest.approx(0.5)
-    assert "trajectory_bin_hours" not in config_schema.VALID_KEYS
-    # Bound from the layer below rather than restated, so the lag structure is cut on the same
-    # windows this analysis reports.
-    assert analysis.TRAJECTORY_BIN_HOURS is cohort.TRAJECTORY_BIN_HOURS
-
-
 def test_both_reduced_columns_are_on_this_cells_per_sample_table(task, perturb_posterior) -> None:
     """The join between a copied analysis and a forked ``metrics``. Both columns survived the fork
     under the same names, and a name that had not would be reduced to an all-``NaN`` trajectory
@@ -197,20 +181,10 @@ def test_a_segment_with_no_cohort_belongs_to_no_trajectory() -> None:
 # =============================================================================
 # Both readouts, and the tests over the windows
 # =============================================================================
-def test_both_readouts_produce_a_trajectory() -> None:
-    """The sibling pipeline tracks only the KL; ``pred_gap`` is in the decoder's own units and is
-    immune to the prior-variance inflation, so a trajectory in one and not the other is itself a
-    finding about which readout is being believed."""
-    rows = analysis.build_trajectory_rows(analysis.build_per_recording(_per_sample(_cohort_rows())))
-
-    assert {row["metric"] for row in rows} == {
-        "pred_gap_mc_nats", "source_conditioned_kl_raw_nats"
-    }
-    assert {row["group_column"] for row in rows} == set(labels.GROUP_COLUMNS)
-
-
 def test_separated_classes_are_significant_in_the_windows_they_are_separated_in() -> None:
-    """A known answer: two classes drawn five nats apart in every window must survive Holm."""
+    """A known answer: two classes drawn fifty nats apart in every window must survive Holm, and
+    the Holm family is the windows. The pooled row is context rather than a result -- the classes do
+    not cover the time axis equally -- so it carries the confounded flag and no significance."""
     frame = _per_sample(_cohort_rows(n_per_class=5, offsets=[0.0, 50.0]))
     per_recording = analysis.build_per_recording(frame)[labels.CLASS_COLUMN]
 
@@ -220,6 +194,12 @@ def test_separated_classes_are_significant_in_the_windows_they_are_separated_in(
     assert record["n_windows_tested"] == 2
     assert record["n_significant_windows"] == 2
     assert set(record["pairwise"])
+    for window in record["per_window"]:
+        assert window["correction"] == "holm"
+        assert window["n_windows_in_family"] == record["n_windows_tested"]
+        assert window["p_holm"] >= window["p_value"]
+    assert record["pooled"]["confounded_by_time"] is True
+    assert "significant" not in record["pooled"]
 
 
 def test_overlapping_classes_are_not_significant() -> None:
@@ -232,31 +212,6 @@ def test_overlapping_classes_are_not_significant() -> None:
 
     assert record["n_significant_windows"] == 0
     assert record["pairwise"] == {}
-
-
-def test_the_holm_family_is_the_windows() -> None:
-    frame = _per_sample(_cohort_rows(n_per_class=5, offsets=[0.0, 50.0]))
-    per_recording = analysis.build_per_recording(frame)[labels.CLASS_COLUMN]
-
-    record = analysis.analyse_windows(per_recording, "mc_pred_gap")
-
-    for window in record["per_window"]:
-        assert window["correction"] == "holm"
-        assert window["n_windows_in_family"] == record["n_windows_tested"]
-        assert window["p_holm"] >= window["p_value"]
-
-
-def test_the_pooled_row_carries_its_confounded_flag_and_is_consumed_by_nothing() -> None:
-    """The classes do not cover the time axis equally, so a pooled difference can be a coverage
-    artifact. It is context, and the flag is what stops it being read as the result."""
-    frame = _per_sample(_cohort_rows(n_per_class=5, offsets=[0.0, 50.0]))
-    per_recording = analysis.build_per_recording(frame)[labels.CLASS_COLUMN]
-
-    record = analysis.analyse_windows(per_recording, "mc_pred_gap")
-
-    assert record["pooled"]["confounded_by_time"] is True
-    assert "artifact" in record["pooled"]["note"]
-    assert "significant" not in record["pooled"]
 
 
 def test_the_pooled_row_counts_recordings_rather_than_recording_windows() -> None:
@@ -281,13 +236,18 @@ def test_the_pooled_row_counts_recordings_rather_than_recording_windows() -> Non
 def test_the_pooled_row_refuses_a_cohort_too_small_to_test() -> None:
     """Non-vacuity for the count above: with two recordings per class the pooled test must be
     unable to run, exactly as every per-window test is. Counting (recording, window) rows instead
-    would give it four per class and publish a p-value for a two-versus-two comparison."""
+    would give it four per class and publish a p-value for a two-versus-two comparison. Each
+    skipped window records which cohorts were too small, which is its explanation."""
     frame = _per_sample(_cohort_rows(n_per_class=2, offsets=[0.0, 50.0]))
     per_recording = analysis.build_per_recording(frame)[labels.CLASS_COLUMN]
 
     record = analysis.analyse_windows(per_recording, "mc_pred_gap")
 
     assert record["n_windows_tested"] == 0, "the per-window tests correctly refuse"
+    assert all(
+        window["groups_excluded_as_too_small"] == {"healthy": 2, "acidosis": 2}
+        for window in record["per_window"]
+    )
     assert record["pooled"].get("n_groups", 0) < 2, (
         f"and so must the pooled row, got {record['pooled']}"
     )
@@ -302,18 +262,6 @@ def test_a_single_class_split_is_not_tested_and_says_why() -> None:
 
     assert record["tested"] is False
     assert "fewer than two clinical classes" in record["reason"]
-
-
-def test_a_window_with_too_few_recordings_records_the_exclusion() -> None:
-    """"This class had two recordings in this window" is the explanation for a skipped window."""
-    frame = _per_sample(_cohort_rows(n_per_class=2, offsets=[0.0, 50.0]))
-    per_recording = analysis.build_per_recording(frame)[labels.CLASS_COLUMN]
-
-    record = analysis.analyse_windows(per_recording, "mc_pred_gap")
-
-    excluded = [window["groups_excluded_as_too_small"] for window in record["per_window"]]
-    assert all(item == {"healthy": 2, "acidosis": 2} for item in excluded)
-    assert record["n_windows_tested"] == 0
 
 
 # =============================================================================

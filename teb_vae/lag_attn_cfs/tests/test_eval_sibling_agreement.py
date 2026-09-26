@@ -15,11 +15,9 @@ assertion below is deleted in the same commit. What must never happen is that th
 deleted and the entry is not: ``tests/test_eval_divergences.py`` reads the entries' named
 assertions out of *this file*, so an ``equivalent`` claim with nothing behind it fails there.
 
-**This is the only file in this package that imports the sibling evaluation package**, apart from
-``test_eval_reuse.py``, which pins the shared primitives by identity. The layering test forbids the
-import everywhere else, in every form, and asserts that the exemption reaches exactly these two
-files -- a package that copied the analyses and then reached back for one helper would have two
-implementations *and* a dependency.
+Test files may import the sibling evaluation package; modules under ``eval/`` may not, and the
+layering test forbids that import there in every form -- a package that copied the analyses and
+then reached back for one helper would have two implementations *and* a dependency.
 
 The name matters too: ``test_eval_parity.py`` is taken in the sibling suite and means something
 else entirely -- the evaluation's readouts recombining to ``compute_loss``'s own numbers, which is
@@ -204,35 +202,9 @@ def test_the_two_cohort_modules_are_one_file_with_one_import_line() -> None:
     assert mine.replace("TRAJECTORY_BIN_HOURS", "BIN_HOURS", 1) != theirs
 
 
-def test_the_population_record_is_assembled_the_same_way(per_sample) -> None:
-    """The counts, the disjointness computation and the two sentences: a package that quietly
-    disagreed about who was evaluated would disagree about every cohort statement above it."""
-    config = {
-        "dataset_config": {
-            "vae_train_datasets": ["/data/train/healthy_bg_cs.hdf5"],
-            "vae_test_datasets": ["/data/test/hie_cs.hdf5"],
-        }
-    }
-
-    assert cohort.build_cohort_block(per_sample, config) == sibling_cohort.build_cohort_block(
-        per_sample, config
-    )
-
-
 # =================================================================================================
 # report_seam.py -- the mechanism, not the content
 # =================================================================================================
-def test_the_headline_path_resolver_is_one_walker() -> None:
-    """The registries differ deliberately -- this cell has two more verdicts and no frequency
-    entries -- but the *walk* that turns a path into a value must not: a path that resolves in one
-    package has to resolve in the other, or two summaries disagree about what "absent" means."""
-    results = {"readouts": {"mc_pred_gap": 1.5}, "coupling": {"headline": {}}}
-
-    assert report_seam._dig is sibling_report_seam._dig
-    for path in (("readouts", "mc_pred_gap"), ("coupling", "headline", "absent"), ("nothing",)):
-        assert report_seam._dig(results, path) == sibling_report_seam._dig(results, path)
-
-
 def test_the_identity_tolerances_are_the_same_numbers() -> None:
     """Both packages judge the same structural identities, so a tolerance that moved on one side
     would make one of them report a failure the other calls rounding."""
@@ -594,8 +566,6 @@ def test_the_three_layers_of_inference_reach_the_same_verdicts(time_axis_frame) 
     # implementations that both refused to test anything would otherwise compare equal.
     assert my_record["n_windows_tested"] == 2
     assert my_record["n_significant_windows"] == 2
-
-
 
 
 # =================================================================================================

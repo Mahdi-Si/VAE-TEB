@@ -43,8 +43,7 @@ else:
   parent. The causal parent defines neither, so lookup passes through, and ``torch.compile`` becomes
   permitted on a model whose causal ancestor never exercised it. That is the right outcome -- it is
   the transformer encoder that makes compilation worth having -- but it arrives by resolution order
-  rather than by anything written down, so ``tests/test_trainer.py`` asserts it explicitly. Shipped
-  configs keep ``compile: false`` regardless.
+  rather than by anything written down. Shipped configs keep ``compile: false`` regardless.
 * ``_build_model_kwargs`` and ``create_model`` are defined on **both** parents, and both run: each
   calls ``super()``, so the linearisation threads the conv-Transformer's contributions (re-admitting
   ``source_attention_window: null``, applying ``lr_warmup_steps``) underneath the causal one's (the

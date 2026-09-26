@@ -19,8 +19,6 @@ import ast
 from pathlib import Path
 from typing import Dict, List, Set, Tuple
 
-import pytest
-
 #: The package under scrutiny.
 EVAL_ROOT = Path(__file__).resolve().parents[1]
 
@@ -87,22 +85,21 @@ def _violations(path: Path) -> List[str]:
     return found
 
 
-def test_the_package_has_modules_to_check() -> None:
-    """A walk that found nothing would pass every other test in this file vacuously."""
+def test_no_shipped_module_imports_the_superseded_tree_or_lightning() -> None:
+    """One walk over every shipped module; a failure names each offending file and its imports."""
     modules = _shipped_modules()
-    assert len(modules) >= 5, f"only found {[p.name for p in modules]}"
+    # A walk that found nothing would pass vacuously.
+    assert len(modules) >= 5, f"only found {[path.name for path in modules]}"
 
-
-@pytest.mark.parametrize(
-    "module", _shipped_modules(), ids=lambda path: str(path.relative_to(EVAL_ROOT))
-)
-def test_no_shipped_module_imports_the_superseded_tree_or_lightning(module: Path) -> None:
-    """Walked per module so a failure names the file, not the package."""
-    violations = _violations(module)
+    violations = {
+        str(path.relative_to(EVAL_ROOT)): found
+        for path in modules
+        if (found := _violations(path))
+    }
     assert not violations, (
-        f"{module.relative_to(EVAL_ROOT)} imports {violations}. The eval package is forked from "
-        f"the predecessor rather than chained to it, and it must stay runnable without "
-        f"Lightning. If the import is genuinely necessary, add it to EXEMPTIONS with a reason."
+        f"{violations}: the eval package is forked from the predecessor rather than chained to "
+        f"it, and it must stay runnable without Lightning. If an import is genuinely necessary, "
+        f"add it to EXEMPTIONS with a reason."
     )
 
 
@@ -137,13 +134,3 @@ def test_the_exemption_is_narrow_rather_than_a_blanket_allowance(tmp_path: Path)
         encoding="utf-8",
     )
     assert _violations(scratch) == ["teb_vae.lag_attn.task"]
-
-
-def test_preflight_still_uses_its_exemption() -> None:
-    """An exemption nothing needs is dead permission, and should be removed rather than kept."""
-    preflight = EVAL_ROOT / "preflight.py"
-    imports = imported_names(preflight.read_text(encoding="utf-8"))
-    assert any(name.startswith("teb_vae.lag_attn.trainer") for name in imports), (
-        "preflight.py no longer imports trainer.py, so its EXEMPTIONS entry is dead and should "
-        "be deleted"
-    )

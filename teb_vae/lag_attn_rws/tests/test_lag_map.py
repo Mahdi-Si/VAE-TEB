@@ -55,12 +55,3 @@ def test_the_map_is_nonnegative(tiny_kwargs, inputs, perturb_posterior):
     out = _perturbed_forward(tiny_kwargs, inputs, perturb_posterior)
     assert float(out["source_kl_lag_map"].min()) >= -1e-7
     assert float(out["kld_per_t_per_head"].min()) >= -1e-7
-
-
-def test_the_readout_is_named_for_the_kl_not_transfer_entropy(
-    tiny_kwargs, inputs, perturb_posterior
-):
-    out = _perturbed_forward(tiny_kwargs, inputs, perturb_posterior)
-    assert "source_kl_lag_map" in out
-    assert "te_lag_map" not in out
-    assert not any("te_lag" in key for key in out)

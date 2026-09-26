@@ -6,16 +6,15 @@ $\ell > m \cdot \max(\mathrm{EMA}, \mathrm{floor})$ -- note $\max(\mathrm{EMA}, 
 **not** $\max(|\mathrm{EMA}|, \mathrm{floor})$ -- which silently assumes a loss bounded below by
 zero. Once the EMA is negative the test degenerates and starts discarding healthy batches, so the
 shipped config switches the relative test off with a floor far above any reachable loss. The first
-block below is the evidence for that choice, in both directions.
+block below is the evidence for that choice.
 
 The 2026-07 baseline then measured what the non-finite guard alone costs: a *finite* blow-up
-(epoch 79, ``main_loss`` $\approx -0.5 \to +4..+10$, no NaN in the run) sailed through and the run
-was lost. The shipped config therefore also enables ``additive_margin`` -- skip when
-$\ell > \mathrm{EMA} + \mathrm{margin}$, against the raw EMA, so it works at a negative baseline
--- and the re-enactment test below drives that exact event through the shipped block.
-
-The other reachable failure is DDP-only, and the last block demonstrates it rather than asserting
-it absent: it is the one that would cost days of a headline run to diagnose from a training curve.
+(``main_loss`` $\approx -0.5 \to +4..+10$, no NaN in the run) sailed through and the run was lost,
+so the shipped config also enables ``additive_margin`` -- skip when
+$\ell > \mathrm{EMA} + \mathrm{margin}$, against the raw EMA, so it works at a negative baseline.
+The additive test, the escape hatch and the DDP skip synchronisation are the framework's and are
+tested in ``train/tests/test_spike_breaker.py``. What stays here depends on this model's loss: its
+sign, its perm-free ``main_loss``, and its real autograd graph on a skipped step.
 """
 from __future__ import annotations
 
@@ -24,7 +23,6 @@ import math
 import torch
 
 from teb_vae.lag_attn.tests.conftest import make_stub_batch
-from train.test_utils import FakeStrategy, FakeTrainer
 
 
 def _breaker_config(**overrides) -> dict:
@@ -92,37 +90,6 @@ def test_a_sustained_negative_loss_never_spikes(task):
     assert module._spike_skips_total == 0
 
 
-def test_a_nan_still_skips_in_that_same_sequence(task):
-    """The guard that survives a zero threshold, because it does not consult the threshold."""
-    module = task()
-    config = _breaker_config()
-    for value in (-10.0, -12.0, -11.0):
-        _feed(module, value, config)
-
-    metrics, returned = _feed(module, float("nan"), config)
-
-    assert _skipped(metrics)
-    assert torch.isfinite(returned), "a skipped step must still return a finite loss"
-
-
-def test_an_infinite_loss_still_skips(task):
-    module = task()
-    config = _breaker_config()
-    _feed(module, -10.0, config)
-
-    assert _skipped(_feed(module, float("inf"), config)[0])
-
-
-def test_a_genuine_positive_spike_is_caught(task):
-    """The breaker's actual job, in the positive regime where the threshold means something."""
-    module = task()
-    config = _breaker_config()
-    for _ in range(5):
-        _feed(module, 2.0, config)  # EMA settles near 2.0
-
-    assert _skipped(_feed(module, 100.0, config)[0])
-
-
 def test_at_a_zero_floor_a_negative_ema_makes_every_positive_batch_a_spike(task):
     """Why the shipped config does NOT use ``ema_floor: 0.0``.
 
@@ -148,47 +115,6 @@ def test_at_a_zero_floor_a_negative_ema_makes_every_positive_batch_a_spike(task)
     assert float(metrics["main_loss"]) < 0.0, "the logged main_loss was replaced by the EMA"
 
 
-def test_the_shipped_floor_leaves_an_ordinary_positive_batch_alone(task):
-    """The shipped configuration: the sign-crossing batch that a zero floor discards must train.
-
-    The ``50.0`` feed pins the additive margin off to show the *relative* test is genuinely off
-    under the huge floor -- with the shipped margin active that batch is caught, which is the
-    following test's subject, not this one's.
-    """
-    module = task()
-    shipped = _breaker_config(ema_floor=1.0e9, additive_margin=3.0)
-    for _ in range(5):
-        _feed(module, -0.5, shipped)
-
-    assert not _skipped(_feed(module, 0.3, shipped)[0])  # +0.3 < EMA + 3.0: inside the margin
-    floor_only = _breaker_config(ema_floor=1.0e9, additive_margin=0.0)
-    assert not _skipped(_feed(module, 50.0, floor_only)[0])  # relative detection is genuinely off
-
-
-def test_the_shipped_margin_catches_the_epoch79_blowup(task):
-    r"""The finite blow-up the 2026-07 baseline actually had, re-enacted under the shipped block.
-
-    That run: ``main_loss`` EMA $\approx -0.5$ for 78 epochs, then finite batches at $+4..+10$
-    in one epoch -- no NaN anywhere, so the non-finite guard had nothing to catch, and the
-    relative test was (correctly) disabled by the floor. The run never recovered. The additive
-    test is the one that fires here: $5.0 > \mathrm{EMA} + 3.0$, sign-agnostic because it
-    compares against the raw EMA rather than ``max(EMA, floor)``.
-    """
-    module = task()
-    shipped = _breaker_config(ema_floor=1.0e9, additive_margin=3.0)
-    for _ in range(5):
-        _feed(module, -0.5, shipped)  # the healthy negative-NLL regime
-    ema_before = module._spike_ema_loss
-    assert ema_before < 0.0
-
-    metrics, returned = _feed(module, 5.0, shipped)
-
-    assert _skipped(metrics)
-    assert torch.isfinite(returned)
-    assert module._spike_ema_loss == ema_before, "a skipped spike must not drag the EMA up"
-    assert float(metrics["main_loss"]) < 0.0, "the logged main_loss was replaced by the EMA"
-
-
 def test_the_shipped_floor_still_catches_a_nan(task):
     """The protection that survives, and the reason the breaker stays enabled at all.
 
@@ -205,19 +131,6 @@ def test_the_shipped_floor_still_catches_a_nan(task):
 
     assert _skipped(metrics)
     assert torch.isfinite(returned)
-
-
-def test_the_ema_never_learns_from_a_skipped_batch(task):
-    """Otherwise one spike drags the threshold up and the next spike looks normal."""
-    module = task()
-    config = _breaker_config()
-    for _ in range(5):
-        _feed(module, 2.0, config)
-    ema_before = module._spike_ema_loss
-
-    _feed(module, 100.0, config)
-
-    assert module._spike_ema_loss == ema_before
 
 
 # Note the ``enabled`` gate is not tested here. It lives in the framework's step dispatcher, not in
@@ -255,39 +168,8 @@ def test_periodic_perm_steps_do_not_trip_the_breaker(task, perturb_posterior):
     assert not any(skips), "the breaker skipped a step; the perm jump is reaching its statistic"
 
 
-# --------------------------------------------------------------------------------------
-# The DDP failure that is reachable
-# --------------------------------------------------------------------------------------
-def test_a_rank_with_a_non_finite_loss_vetoes_the_escape_hatch_forever(task):
-    """The freeze, demonstrated.
-
-    A healthy rank, given a healthy loss, every step, forever -- and it never trains. The single
-    MAX reduce carries both of the peer's facts: its skip flag keeps this rank skipping, and its
-    non-finite flag keeps the escape hatch shut (a force-accept requires every rank finite). The
-    result is permanent zero-gradient training with no error, no exception, and a loss curve that
-    simply stops moving. ``FakeStrategy``'s injected peer value of $1.0$ raises both flags, which
-    is exactly a persistently non-finite peer.
-
-    Nothing here is a bug in this model: it is the framework's arithmetic, and this test exists so
-    the shape of the failure is on record before a multi-day run hits it. From the outside the only
-    tell is ``spike_skipped`` pinned at 1 while ``spike_ema_loss`` never moves.
-    """
-    module = task()
-    module._trainer = FakeTrainer()
-    module._trainer.strategy = FakeStrategy(world_size=2, other_value=1.0)
-    config = _breaker_config(max_consecutive_skips=3)
-
-    skips = [_skipped(_feed(module, -10.0, config)[0]) for _ in range(20)]
-
-    assert all(skips), "expected the MAX reduce to make this rank skip alongside its peer"
-    assert module._spike_forced_accepts_total == 0, (
-        "the escape hatch fired; the veto is no longer reachable and this test is obsolete"
-    )
-    assert module._spike_consecutive == 20  # the run length grows without bound: the freeze
-
-
 def test_the_escape_hatch_does_fire_when_every_rank_is_healthy(task):
-    """The mirror image. Without this, the test above would pass on a breaker that never forces."""
+    """On a single healthy rank the escape hatch force-accepts a run of spikes past the cap."""
     module = task()
     config = _breaker_config(max_consecutive_skips=3)
     for _ in range(5):
@@ -299,6 +181,9 @@ def test_the_escape_hatch_does_fire_when_every_rank_is_healthy(task):
     assert not all(skips), "the escape hatch never fired on a single healthy rank"
 
 
+# --------------------------------------------------------------------------------------
+# A skipped step under DDP
+# --------------------------------------------------------------------------------------
 def test_a_skipped_step_still_touches_every_parameter(task):
     """The skip path is a zero-gradient step, not an absent one.
 

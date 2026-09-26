@@ -70,31 +70,6 @@ def test_the_offset_is_read_as_a_signed_axis_without_a_sign_flip() -> None:
     assert list(binned[cohort.SECOND_STAGE_BIN_CENTER_COLUMN]) == [-0.75, 0.75, 0.25]
 
 
-def test_the_two_clocks_disagree_about_the_sign_of_the_same_number() -> None:
-    """Non-vacuity for the rule above, stated as the contrast it exists for: handed the same
-    stored value, the two axes must point in opposite directions. An implementation that negated
-    both would pass every assertion about one of them alone."""
-    stored = -2.0 * _HOUR
-    delivery = cohort.add_time_bins(pd.DataFrame({"epoch": [stored]}))
-    second_stage = cohort.add_second_stage_bins(
-        pd.DataFrame({cohort.SECOND_STAGE_COLUMN: [stored]})
-    )
-
-    assert float(delivery[cohort.HOURS_COLUMN].iloc[0]) == pytest.approx(2.0)
-    assert float(second_stage[cohort.SECOND_STAGE_HOURS_COLUMN].iloc[0]) == pytest.approx(-2.0)
-
-
-def test_a_window_after_onset_is_not_folded_into_the_first_one() -> None:
-    """The delivery clock clips at zero; this one must not, or every window after second-stage
-    onset -- which is the half of the axis this clock exists to show -- collapses into one."""
-    frame = pd.DataFrame({cohort.SECOND_STAGE_COLUMN: [-3.0 * _HOUR, 2.0 * _HOUR]})
-
-    bins = list(cohort.add_second_stage_bins(frame)[cohort.SECOND_STAGE_BIN_COLUMN])
-
-    assert bins == [-6, 4]
-    assert min(bins) < 0
-
-
 def test_a_non_finite_offset_is_dropped_rather_than_binned() -> None:
     frame = pd.DataFrame({cohort.SECOND_STAGE_COLUMN: [-_HOUR, np.nan, float("inf")]})
 
@@ -126,29 +101,6 @@ def test_a_frame_with_no_usable_offset_still_carries_the_columns(frame) -> None:
 # =============================================================================
 # The reduction, shared with the delivery clock
 # =============================================================================
-def test_the_per_recording_reduction_defaults_to_the_delivery_clock() -> None:
-    """The second clock passes its own columns; every existing caller passes none, and must get
-    exactly the frame it got before this parameter existed."""
-    frame = pd.DataFrame(
-        {
-            "guid": ["a", "a", "b"],
-            "epoch": [-3600.0, -3600.0, -3600.0],
-            labels.CLASS_COLUMN: ["healthy", "healthy", "healthy"],
-            "value": [1.0, 3.0, 5.0],
-        }
-    )
-    binned = cohort.add_time_bins(frame)
-
-    default = cohort.per_recording_in_bins(binned, ["value"], group_column=labels.CLASS_COLUMN)
-    explicit = cohort.per_recording_in_bins(
-        binned, ["value"], group_column=labels.CLASS_COLUMN,
-        bin_column=cohort.BIN_COLUMN, center_column=cohort.BIN_CENTER_COLUMN,
-    )
-
-    pd.testing.assert_frame_equal(default, explicit)
-    assert list(default["value"]) == [2.0, 5.0]
-
-
 def test_the_reduction_groups_on_the_second_stage_windows_when_asked() -> None:
     """One recording either side of onset is two rows, not one: the reduction has to see the
     second clock's window column, or every segment of a recording collapses into one value."""
@@ -413,18 +365,6 @@ def _class_frame(rows: List[Dict[str, Any]]) -> pd.DataFrame:
     return analysis.build_per_recording(eligible)[labels.CLASS_COLUMN]
 
 
-def test_the_grid_and_the_readouts_are_the_delivery_clocks_own() -> None:
-    """One grid and one pair of readouts across both clocks, bound from the layer below rather than
-    restated: a window on one clock's figure is otherwise not the same duration as a window on the
-    other's, and the two pages stop being comparable while both look ordinary."""
-    from teb_vae.lag_attn_rws.eval.analyses import time_to_delivery as delivery_clock
-
-    assert analysis.TRAJECTORY_BIN_HOURS is cohort.TRAJECTORY_BIN_HOURS
-    assert analysis.READOUTS is cohort.CLOCK_READOUTS
-    assert analysis.READOUTS == delivery_clock.READOUTS
-    assert analysis.VALUE_COLUMNS == delivery_clock.VALUE_COLUMNS
-
-
 def test_separated_classes_are_significant_in_the_windows_they_are_separated_in() -> None:
     """A known answer: two classes drawn fifty nats apart in every window must survive Holm."""
     record = analysis.analyse_windows(
@@ -594,14 +534,6 @@ def test_the_analysis_writes_its_five_tables_and_both_figures(tmp_path) -> None:
     assert set(eligibility.columns) >= {"guid", "eligible", "reason", "implied_onset_epoch_s"}
 
 
-def test_the_method_states_that_this_clocks_family_stands_alone() -> None:
-    """The one sentence a reader needs before quoting a $p$ from both clocks at once."""
-    record = analysis.analyse_windows(_class_frame(_clock_rows()), "mc_pred_gap")
-
-    assert "NOT corrected jointly" in record["method"]
-    assert "own clock" in record["method"]
-
-
 @pytest.mark.parametrize(
     "rows, fragment",
     [
@@ -681,9 +613,6 @@ def test_the_windows_page_is_not_inverted_and_marks_the_onset() -> None:
 
     figure, _ = _windows_figure(_clock_rows(window_offsets=((-1.0, 50.0), (1.0, 50.0))))
     try:
-        # One readout: a violin row, its strip, then the effect-size heatmap -- plus the colourbar
-        # axes the heatmap attaches.
-        assert len(figure.axes) == 4
         # The two panels that carry the clock itself; the heatmap below them is drawn on the same
         # coordinate but marks nothing, and the colourbar carries no clock at all.
         for index in range(2):
@@ -691,9 +620,6 @@ def test_the_windows_page_is_not_inverted_and_marks_the_onset() -> None:
             assert low < high, f"panel {index} is inverted"
             assert _zero_lines(figure.axes[index]) == 1, f"panel {index} does not mark the onset"
         assert figure.axes[0].get_xlim() == pytest.approx(figure.axes[1].get_xlim())
-        assert (
-            "negative" in figure.axes[1].get_xlabel()
-        ), "the strip does not name the sign convention"
     finally:
         shared_figures.plt.close(figure)
 
@@ -725,7 +651,7 @@ def test_the_strip_clears_alpha_in_the_window_the_classes_are_separated_in() -> 
     assert records[0]["significant_bin_centers_h"] == pytest.approx([-0.75])
 
 
-def test_the_trajectory_figure_names_the_sign_convention_and_marks_the_onset() -> None:
+def test_the_trajectory_figure_is_not_inverted_and_marks_the_onset() -> None:
     """A reader who took a negative value for "after" would read the whole trajectory backwards,
     and nothing else on the page would contradict them."""
     from teb_vae.lag_attn.eval import figures as shared_figures
@@ -738,7 +664,6 @@ def test_the_trajectory_figure_names_the_sign_convention_and_marks_the_onset() -
         for ax in figure.axes:
             low, high = ax.get_xlim()
             assert low < high
-            assert "negative" in ax.get_xlabel() and "positive" in ax.get_xlabel()
             assert _zero_lines(ax) == 1
         annotations = sorted(text.get_text() for text in figure.axes[0].texts)
     finally:

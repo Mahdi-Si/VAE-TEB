@@ -13,8 +13,8 @@ comparable stop being comparable: an analysis fixed on one side keeps its bug on
 the two ``summary.json`` files stop being readable side by side long before anyone notices.
 
 The :class:`ModelBinding` dataclass itself names no model class and is stdlib-only, exactly as the
-sibling's is: it is read by documentation tests and by anything that wants the *type* without a
-numeric stack. What this module adds beside it is this cell's own concrete
+sibling's is: it is read by anything that wants the *type* without a numeric stack. What this
+module adds beside it is this cell's own concrete
 :data:`CFS_BINDING`, which does name one -- so **this module is layer 1 here and layer 0 in the
 sibling**, and the layering test says so with a named exemption rather than leaving the difference
 to be discovered. The one rule that follows: nothing which must import without ``torch``, the

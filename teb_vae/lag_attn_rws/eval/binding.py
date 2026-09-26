@@ -14,8 +14,8 @@ the two ``summary.json`` files stop being readable side by side long before anyo
 
 **This module names no model class**, deliberately. Naming one would make it layer 1 and cost
 every importer a ``torch`` import; the concrete instances therefore live beside the code that
-already constructs the model. Its own imports are stdlib only, so an acceptance gate or a
-documentation test can read the type without a numeric stack installed.
+already constructs the model. Its own imports are stdlib only, so an acceptance gate can read the
+type without a numeric stack installed.
 """
 from __future__ import annotations
 

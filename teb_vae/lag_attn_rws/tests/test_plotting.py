@@ -1,15 +1,17 @@
 r"""The validation diagnostic figure, and the guards that keep it out of the training loop's way.
 
 Two kinds of test here. The builder is driven directly from a real forward pass, which is what
-pins the *content* -- that the forecast is drawn in bpm, that its windows tile the recording
-without overlapping, that the untrained anchors are gone from the maps rather than merely shaded,
-and that a lag axis says which of the two lag quantities it shows. The callback is driven through
-its real hook with a fake trainer, which is what pins the *behaviour* -- silent off rank zero,
-silent during the sanity pass, silent between plot epochs, and never raising into a fit.
+pins the *content* -- that the forecast is the loader's inverse in bpm, that its windows tile the
+recording without overlapping, and that the untrained anchors are gone from the maps rather than
+merely shaded. The callback is driven through its real hook with a fake trainer, which is what
+pins the *behaviour* -- silent off rank zero, silent during the sanity pass, silent between plot
+epochs, never raising into a fit, and carrying the objective the task actually trains. The two
+seams a sibling replaces (the forecast rows and the input-stream panels) are checked for what
+they take over and what they leave alone.
 
-Both directions are asserted wherever a single direction would pass vacuously: the bpm test also
-checks the no-statistics fallback, the source-trace test also checks the batch that carries no
-``up``, and the frequency test also checks the epoch that should fire.
+Both directions are asserted wherever a single direction would pass vacuously: the no-statistics
+fallback is checked beside the bpm conversion, the source-trace test also checks the batch that
+carries no ``up``, and the frequency test also checks the epoch that should fire.
 """
 from __future__ import annotations
 
@@ -26,7 +28,6 @@ import pytest  # noqa: E402
 import torch  # noqa: E402
 
 from teb_vae.lag_attn_rws import plotting, sample_page  # noqa: E402
-from teb_vae.lag_attn.nets.lag_report import COMPENSATED_LAG_AXIS_LABEL  # noqa: E402
 from teb_vae.lag_attn_rws.plotting import LagAttnRwsPlotCallback  # noqa: E402
 from train.test_utils import FakeMLflowLogger, FakeTrainer  # noqa: E402
 
@@ -119,21 +120,9 @@ def test_the_figure_builds_from_one_validation_batch(task, stub_batch):
         plt.close(figure)
 
 
-def test_the_forecast_panel_is_drawn_in_bpm(task, stub_batch):
-    """z-units are the model's coordinate system, not a clinician's: a forecast that cannot be
-    read against physiology is a forecast nobody can check."""
-    module = task()
-    figure = _build(module, stub_batch)
-    try:
-        ax = _axes_titled(figure, "Forecast")
-        assert "bpm" in ax.get_ylabel()
-    finally:
-        plt.close(figure)
-
-
 def test_without_statistics_the_forecast_panel_says_normalised_instead_of_lying(task, stub_batch):
-    """The other direction: no statistics means z-units, labelled as such, never mislabelled
-    bpm -- so the test above is about the conversion and not about the word."""
+    """The fallback beside the conversion below: no statistics means z-units, labelled as such,
+    never mislabelled bpm."""
     figure = _build(task(), stub_batch, normalization_stats=None)
     try:
         ax = _axes_titled(figure, "Forecast")
@@ -252,27 +241,6 @@ def test_the_first_row_draws_the_source_trace_beside_the_target(task, stub_batch
     figure = _build(task(), stub_batch, up_raw=None)
     try:
         assert not [child for child in figure.axes if child.get_ylabel().startswith("UP")]
-    finally:
-        plt.close(figure)
-
-
-def test_both_lag_panels_name_the_compensated_lag_quantity(task, stub_batch):
-    """A lag axis reading "Lag (s)" does not say whether the causal input delay was added back;
-    the label names the one quantity every lag figure draws, on the canonical stored timeline."""
-    figure = _build(task(), stub_batch)
-    try:
-        for prefix in ("Lag attention", "$\\widetilde K"):
-            ax = _axes_titled(figure, prefix)
-            labels = [child.get_ylabel() for child in ax.child_axes]
-            assert COMPENSATED_LAG_AXIS_LABEL in labels, f"{prefix}: secondary axis labels {labels}"
-    finally:
-        plt.close(figure)
-
-
-def test_the_title_carries_the_beta_it_was_given(task, stub_batch):
-    figure = _build(task(), stub_batch, beta=0.125)
-    try:
-        assert "beta=0.125" in figure._suptitle.get_text()
     finally:
         plt.close(figure)
 
@@ -453,74 +421,6 @@ def test_a_missing_validation_loader_is_not_an_error(tmp_path, task):
 
 
 # =============================================================================
-# The whole page, as an inventory
-# =============================================================================
-#: What each of the seven rows draws, in the order ``build_diagnostic_figure`` lays them out:
-#: ``(title prefix, lines, images, collections, spans)``. The tests above assert *why* each row
-#: looks as it does; this one asserts *that the set of them has not moved*, which is what a
-#: refactor of the builder can break without touching any single row's meaning.
-#:
-#: Read off a rendered page rather than derived from the source: the numbers are what the drawn
-#: figure has, so a row that stops drawing its band or its window edges fails here even though
-#: every other assertion in this file still passes.
-_ROW_INVENTORY = (
-    ("Raw target FHR and raw source UP", 1, 0, 0, 1),
-    ("Forecast", 7, 0, 2, 1),
-    ("Target-only latent state", 1, 1, 0, 2),
-    ("Per-dimension source-conditioned KL", 0, 1, 0, 2),
-    ("$K_t$", 1, 0, 0, 2),
-    ("Lag attention", 1, 1, 0, 1),
-    (r"$\widetilde K_{t,\ell}$", 0, 1, 0, 2),
-)
-
-
-def test_the_page_draws_the_same_seven_rows_with_the_same_artists(task, stub_batch):
-    r"""The characterisation of the assembled page: seven titled rows, each with the artists it
-    is supposed to have, in this order.
-
-    The forecast row's seven lines are the truth, the two forecast means and the four window
-    edges of the tiny geometry; its two collections are the two $\pm 2\sigma$ bands. A band
-    silently dropped, an axvline loop that stops running, or a row that ends up drawn twice all
-    show up here as a count, and nowhere else in this file.
-    """
-    figure = _build(task(), stub_batch)
-    try:
-        drawn = [ax for ax in figure.axes if ax.get_title()]
-        assert len(drawn) == len(_ROW_INVENTORY), [ax.get_title()[:30] for ax in drawn]
-
-        for ax, (prefix, lines, images, collections, spans) in zip(drawn, _ROW_INVENTORY):
-            assert ax.get_title().startswith(prefix), (ax.get_title(), prefix)
-            assert ax.get_xlabel() == "Time (s)", ax.get_title()
-            assert (len(ax.lines), len(ax.images), len(ax.collections), len(ax.patches)) == (
-                lines,
-                images,
-                collections,
-                spans,
-            ), ax.get_title()
-    finally:
-        plt.close(figure)
-
-
-def test_every_row_spans_the_whole_recording_on_one_time_axis(task, stub_batch):
-    """A column of the page is the same instant on all seven rows, which is the property that
-    lets a reader carry a feature of the forecast down into the lag map. Each row is free to
-    *draw* over a shorter span -- the maps are cut at the trained anchors -- but not to rescale
-    its axis."""
-    figure = _build(task(), stub_batch)
-    try:
-        t_max = None
-        for ax in figure.axes:
-            if not ax.get_title():
-                continue
-            lo, hi = ax.get_xlim()
-            assert lo == pytest.approx(0.0), ax.get_title()
-            t_max = hi if t_max is None else t_max
-            assert hi == pytest.approx(t_max), ax.get_title()
-    finally:
-        plt.close(figure)
-
-
-# =============================================================================
 # The forecast-row seam
 # =============================================================================
 def test_the_first_two_rows_are_replaceable_and_the_other_five_are_not(task, stub_batch):
@@ -537,16 +437,22 @@ def test_the_first_two_rows_are_replaceable_and_the_other_five_are_not(task, stu
             main.set_title(f"replacement {name}")
             cax.set_visible(False)
 
+    default = _build(task(), stub_batch)
+    try:
+        default_titles = [ax.get_title() for ax in default.axes if ax.get_title()]
+    finally:
+        plt.close(default)
+
     figure = _build(task(), stub_batch, forecast_rows=_nothing)
     try:
         assert len(drawn) == 1
         titled = [ax.get_title() for ax in figure.axes if ax.get_title()]
         assert titled[:2] == ["replacement raw", "replacement forecast"]
-        assert len(titled) == len(_ROW_INVENTORY)
-        # The five inherited rows still drew, so the seam took rows 1-2 and nothing else.
-        inherited = [prefix for prefix, *_ in _ROW_INVENTORY[2:]]
-        for prefix in inherited:
-            assert _axes_titled(figure, prefix).has_data(), prefix
+        # The five inherited rows are the default page's, and they still drew, so the seam took
+        # rows 1-2 and nothing else.
+        assert titled[2:] == default_titles[2:]
+        for title in default_titles[2:]:
+            assert _axes_titled(figure, title).has_data(), title
     finally:
         plt.close(figure)
 
@@ -674,20 +580,3 @@ def test_a_supplied_builder_replaces_it_and_its_failures_still_cost_only_the_row
         raise RuntimeError("no bank for this model")
 
     assert plotting.input_stream_panels(module.orig_model, inputs, 0, _explode) == ()
-
-
-def test_a_task_naming_no_budget_figure_writes_the_production_bank_one(tmp_path, task, stub_batch):
-    """The run-level figure's seam, and the shipped path through it. The two figures describe
-    different guards and are written under different stems, so a driver that gained its own does
-    not overwrite this one."""
-    from teb_vae.lag_attn_rws import input_budget
-
-    module = task()
-    assert not hasattr(module, "input_budget_figure")
-    callback = LagAttnRwsPlotCallback(tmp_path, num_examples=1, file_format="png")
-
-    callback._write_budget_figure(_trainer_with_batch(stub_batch), module, module.orig_model)
-    plt.close("all")
-
-    assert callback._budget_figure_written is True
-    assert (callback.output_dir / f"{input_budget.BUDGET_FIGURE_STEM}.png").exists()

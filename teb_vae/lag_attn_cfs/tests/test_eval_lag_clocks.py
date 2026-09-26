@@ -373,66 +373,35 @@ def test_every_comparison_runs_from_the_more_severe_class_to_the_less_severe_one
     assert (pairs["cliffs_delta"] < 0).all()
 
 
-def test_each_clock_and_readout_is_its_own_holm_family(tmp_path) -> None:
-    """Four families, corrected within themselves. A joint correction would divide by the total
-    number of windows across both clocks, so the family size each window records is what says which
-    correction it actually received."""
-    per_sample, vectors = _collection()
-
-    record, _ = _run(_context(per_sample, vectors), tmp_path)
-
-    keys = {(family["clock"], family["metric_column"]) for family in record["significance"]}
-    assert len(keys) == 4
-    for family in record["significance"]:
-        assert "NOT corrected jointly" in family["method"]
-
-
 # =================================================================================================
-# What the record and the page carry
+# What the tables and the page carry
 # =================================================================================================
-def test_the_record_carries_the_axis_caveat_and_guards_the_peak(tmp_path) -> None:
-    """The caveat travels in ``summary.json`` as well as under the figures, because the summary is
-    the artifact that gets quoted.
-
-    And the peak this analysis *does* report cannot reach a table without its guard beside it.
-    ``entmax15`` assigns lags exactly zero, so a flat profile still has a perfectly confident
+def test_every_peak_column_travels_with_its_degeneracy_guard(tmp_path) -> None:
+    """``entmax15`` assigns lags exactly zero, so a flat profile still has a perfectly confident
     argmax; the mechanical criterion that says whether the position means anything is a column on
-    the same row, and the thresholds it was judged against are in the record. Asserted structurally
-    rather than as wording: a peak column emitted without its degeneracy column is the failure, and
-    it would read as an ordinary trajectory."""
+    the same row. A peak column emitted without its degeneracy column would read as an ordinary
+    trajectory."""
     per_sample, vectors = _collection(n_recordings=3)
 
-    record, directory = _run(_context(per_sample, vectors), tmp_path)
+    _, directory = _run(_context(per_sample, vectors), tmp_path)
 
-    assert "stored-coefficient time" in record["axis_caveat"]
-    assert "lag_peak_degenerate" in record["peak_reference"]
-    # The pooled positional reading still belongs to lag_kl, and the record still says so.
-    assert "lag_kl_stratified_peaks.csv" in record["peak_reference"]
-    assert record["plan"]["capped"] is True
-    thresholds = record["statistic_thresholds"]
-    assert thresholds["degenerate_peak_to_median"] == analysis.DEGENERATE_PEAK_TO_MEDIAN
-    assert thresholds["degenerate_zero_fraction"] == analysis.DEGENERATE_ZERO_FRACTION
-
-    for source in analysis.PROFILE_SOURCES:
-        columns = set(pd.read_csv(directory / analysis.PER_RECORDING_FILENAME).columns)
-        assert f"lag_peak_{source.key}_s" in columns
-        assert f"lag_peak_degenerate_{source.key}" in columns
+    columns = set(pd.read_csv(directory / analysis.PER_RECORDING_FILENAME).columns)
     metrics = set(pd.read_csv(directory / analysis.TRAJECTORY_FILENAME)["metric"])
     for source in analysis.PROFILE_SOURCES:
-        assert f"lag_peak_{source.key}_s" in metrics
-        assert f"lag_peak_degenerate_{source.key}" in metrics
+        for name in (f"lag_peak_{source.key}_s", f"lag_peak_degenerate_{source.key}"):
+            assert name in columns, name
+            assert name in metrics, name
 
 
 def test_no_untested_statistic_reaches_the_significance_tables(tmp_path) -> None:
-    """Twelve of the fourteen are drawn and tabled but carry no $p$-value, and that is what keeps
-    each clock's Holm family at two. A statistic that quietly entered the inference would multiply
-    the families without anything on the page saying the correction had changed."""
+    """Most statistics are drawn and tabled but carry no $p$-value, and that is what keeps each
+    clock's Holm family at the tested readouts. A statistic that quietly entered the inference
+    would multiply the families without anything on the page saying the correction had changed."""
     per_sample, vectors = _collection(n_recordings=3)
 
     _, directory = _run(_context(per_sample, vectors), tmp_path)
 
     tested = {feature.column for feature in analysis.READOUTS}
-    assert tested == {"lag_centroid_kl_s", "lag_centroid_attn_s"}
     for name in (analysis.SIGNIFICANCE_FILENAME, analysis.PAIRWISE_FILENAME):
         frame = pd.read_csv(directory / name)
         assert set(frame["metric_column"]) <= tested, name

@@ -6,10 +6,8 @@ An analysis is a function
 
     def run_<name>_analysis(context, *, eval_config, output_dir, probe) -> Dict[str, Any]
 
-and that signature is fixed, checked by ``tests/test_eval_protocol.py`` by inspection rather than
-by convention. The runner calls every analysis the same way, so registering one is a line in the
-registry rather than a branch in the run; and an analysis whose signature drifts is caught at the
-gate rather than at the ninth step of a multi-hour pass.
+and that signature is fixed. The runner calls every analysis the same way, so registering one is a
+line in the registry rather than a branch in the run.
 
 **An analysis does not touch the model.** The decoder pass over four latent branches at $K$ draws
 happens once, in the shared collection pass, and what it leaves behind -- two durable tables, a

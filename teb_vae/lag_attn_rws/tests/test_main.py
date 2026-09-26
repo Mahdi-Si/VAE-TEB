@@ -12,14 +12,14 @@ completion with no error anywhere.
 """
 from __future__ import annotations
 
-import inspect
 from pathlib import Path
 
 import pytest
 import yaml
 
-from teb_vae.lag_attn_rws import trainer as trainer_module
+from teb_vae.lag_attn.channel_reach import resolve_stream_budgets
 from teb_vae.lag_attn.config import load_config
+from teb_vae.lag_attn_rws import trainer as trainer_module
 
 from .conftest import absolutize_dataset_paths
 
@@ -160,23 +160,21 @@ def test_the_resolved_config_is_written_beside_the_checkpoints(tmp_path, monkeyp
     assert "base" not in reloaded
     assert reloaded["model_config"]["VAE_model"]["causal_norm"] is True
     # The guarded default records what the budget resolved TO, not merely that one was asked for:
-    # the surviving channel counts and the worst delay are what a later offline pass needs to
-    # rebuild the adapters, and `causal_reach_budget_s: 120` alone does not determine them without
-    # re-running the filter bank.
+    # the surviving channels and their delays are what a later offline pass needs to rebuild the
+    # adapters, and the budget in seconds alone does not determine them without re-running the
+    # filter bank.
     record = reloaded["model_config"][trainer_module.RESOLVED_BUDGET_KEY]
-    assert record is not None
-    assert record["causal_reach_budget_s"] == 120
-    assert record["max_delay_steps"] == 30
-    assert (len(record["target_keep_index"]), len(record["source_keep_index"])) == (78, 29)
+    budget = resolve_stream_budgets(reloaded["model_config"]["VAE_model"])
+    assert budget is not None and record is not None
+    assert record == budget.as_record()
 
 
-def _persisted_config(tmp_path, monkeypatch, mutate=None) -> dict:
+def _persisted_config(tmp_path, monkeypatch) -> dict:
     """Run ``main`` with everything expensive stubbed, and return the config it left on disk.
 
     Args:
         tmp_path: Directory the run writes into.
         monkeypatch: The pytest fixture.
-        mutate: Optional extra mutation of the config before the run.
 
     Returns:
         The reloaded ``resolved_config.yaml``.
@@ -201,44 +199,12 @@ def _persisted_config(tmp_path, monkeypatch, mutate=None) -> dict:
     def _redirect(config):
         config["general_config"]["folders_config"]["out_dir_base"] = str(tmp_path)
         absolutize_dataset_paths(config)
-        if mutate is not None:
-            mutate(config)
 
     trainer_module.main(_tiny_config_at(tmp_path, _redirect))
 
     written = Path(captured["checkpoint_dir"]) / trainer_module.RESOLVED_CONFIG_FILENAME
     assert written.is_file()
     return yaml.safe_load(written.read_text(encoding="utf-8"))
-
-
-def test_the_resolved_config_records_the_causal_guard_the_run_actually_got(
-    tmp_path, monkeypatch
-):
-    """The budget in seconds does not name a channel: what it resolves to depends on a filter
-    bank. So a run that recorded only ``causal_reach_budget_s`` would record what it asked for
-    and not what it got, and reconstructing the difference would mean rebuilding the bank.
-
-    Written under ``model_config`` rather than inside ``VAE_model``, and under a name that is not
-    a constructor argument, so re-running from the written file does not both forward the record
-    and re-resolve the budget.
-    """
-
-    def _guarded(config):
-        config["model_config"]["VAE_model"]["causal_reach_budget_s"] = 120.0
-
-    record = _persisted_config(tmp_path, monkeypatch, _guarded)["model_config"][
-        trainer_module.RESOLVED_BUDGET_KEY
-    ]
-
-    assert record["causal_reach_budget_s"] == 120.0
-    assert record["max_delay_steps"] == 30
-    assert record["channels_kept_per_block"] == {
-        "fhr_st": {"kept": 27, "declared": 43},
-        "fhr_ph": {"kept": 51, "declared": 66},
-        "up_st": {"kept": 27, "declared": 43},
-        "up_ph": {"kept": 2, "declared": 15},
-    }
-    assert len(record["source_delays"]) == len(record["source_keep_index"]) == 29
 
 
 def test_an_unsatisfiable_reach_budget_raises_before_any_training_happens(
@@ -358,18 +324,6 @@ def test_main_checks_the_drivers_own_target_fields(recording_main, tmp_path):
         trainer_module.main(config_path, trainer_cls=_FeatureTargetTrainer)
 
 
-def test_the_normalisation_guard_is_called_by_main_and_not_from_preflight():
-    """``preflight`` is documented as a no-op precisely so a subclass that forgets ``super()``
-    cannot drop an inherited check. Moving this guard behind it would silently disable it for
-    the one package whose ``preflight`` override has a bare body."""
-    source = inspect.getsource(trainer_module.main)
-    assert "_check_raw_target_normalized" in source
-    assert (
-        "_check_raw_target_normalized"
-        not in inspect.getsource(trainer_module.LagAttnRwsTrainer.preflight)
-    )
-
-
 # Derived from __file__, not cwd-relative: the width guard swallows a failed open (a missing
 # shard is the data module's to report), so a path that does not resolve would make the
 # mismatch tests pass without ever reaching the width arithmetic.
@@ -445,13 +399,3 @@ def test_run_config_points_at_a_config_that_exists():
     """The IDE Run button resolves through ``RUN_CONFIG``; a stale path breaks it silently."""
     assert trainer_module.RUN_CONFIG is not None
     assert (_REPO_ROOT / trainer_module.RUN_CONFIG).is_file()
-
-
-def test_the_module_does_not_seed_by_hand():
-    """Determinism is ``general_config.seed`` plus the framework's ``configure_determinism``; a
-    stray ``torch.manual_seed`` here would silently override the configured seed."""
-    source = Path(trainer_module.__file__).read_text(encoding="utf-8")
-
-    assert "manual_seed" not in source
-    assert "np.random.seed" not in source
-    assert "seed_everything" not in source

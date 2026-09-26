@@ -192,31 +192,30 @@ def test_a_run_predating_the_null_profile_reports_it_absent_rather_than_recovere
 
 
 @pytest.mark.parametrize("config", PLANTED_CONFIGS)
-def test_both_planted_configs_resolve_and_pin_the_instruments_geometry(config) -> None:
-    r"""The instrument's geometry is pinned and must stay pinned, on both cells.
+def test_both_planted_configs_put_the_plant_inside_the_searched_window(config) -> None:
+    r"""The shard's stamped delay $\delta$ must sit strictly inside $(H, \mathrm{max\_lag})$ at the
+    config's own horizon and lag window, on both cells.
 
-    Three leaves carry the whole of it. ``max_lag`` is the **production** lag window rather than the
-    tiny variant's, because the planted delay has to sit strictly inside $(H, L - 1)$ and the tiny
-    window makes that interval empty. ``causal_align_reference_source`` is explicitly null even
-    though the shipped default sets it, because the shipped source clock shifts source content
-    twenty-five steps earlier and would move the plant's readable band off the near edge -- so a
-    later default flip cannot move the instrument. And the target reference is pinned for the same
-    reason, one clock rather than two.
-
-    Asserted as a *config* property rather than through a run, because this is what makes every
-    recorded gate comparable to the ones before it.
+    That is what makes the readable band $[\delta - H,\ \delta - 1]$ non-empty, clear of lag $0$ and
+    inside the searched window, and it is what a horizon or window retune could silently break --
+    the tiny variant's window, for one, makes the interval empty. Read off the shard the config
+    points at, as the check itself reads it, rather than restated.
     """
+    import h5py
+
     from teb_vae.lag_attn.config import load_config
 
     resolved = load_config(str(_REPO_ROOT / config))
     vae = resolved["model_config"]["VAE_model"]
+    shard = _REPO_ROOT / resolved["dataset_config"]["vae_test_datasets"][0]
+    with h5py.File(shard, "r") as handle:
+        delay = int(handle.attrs["planted_delay_steps"])
 
-    assert vae["max_lag"] == 90
-    assert vae["horizon"] == 30
-    assert vae["horizon"] < 45 < vae["max_lag"], "the planted delay is not inside the window"
-    assert vae["causal_align_reference"] == "target_max"
-    assert vae["causal_align_reference_source"] is None
-    assert "planted" in resolved["dataset_config"]["vae_train_datasets"][0]
+    assert int(vae["horizon"]) < delay < int(vae["max_lag"]), (
+        "the planted delay is not inside the searched window"
+    )
+    low, high = lag_recovery_check.planted_band(delay, int(vae["horizon"]))
+    assert 0 < low <= high < int(vae["max_lag"])
 
 
 @pytest.mark.parametrize("config", PLANTED_CONFIGS)

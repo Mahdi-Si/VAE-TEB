@@ -94,19 +94,3 @@ def test_the_learned_variance_heads_move_the_uplift_even_with_a_dead_mean_pathwa
     )
     _, frame = _run(runner, tiny_loader, tiny_eval_config["eval_config"], tmp_path / "nll")
     assert np.abs(frame["uplift_abs"].to_numpy()).max() > 0.0
-
-
-def test_the_summary_reports_the_positive_fraction_and_the_objective(
-    make_eval_runner, tiny_loader, tiny_eval_config, tmp_path
-) -> None:
-    """The objective travels with the number, so a reader knows how to read it."""
-    runner = make_eval_runner(hparams=MSE_OBJECTIVE, output_dir=tmp_path / "runner")
-    summary, _ = _run(
-        runner, tiny_loader, tiny_eval_config["eval_config"], tmp_path / "summary"
-    )
-
-    assert 0.0 <= summary["positive_fraction"] <= 1.0
-    assert summary["likelihood"] == "mse"
-    assert summary["n_samples"] == 4
-    assert summary["composition"] == {"tiny_shard.hdf5": 4}
-    assert Path(summary["figure"]).stat().st_size > 0

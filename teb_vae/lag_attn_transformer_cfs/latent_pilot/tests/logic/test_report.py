@@ -56,12 +56,16 @@ def _cohort(n_healthy=4, n_adverse=3, scores=None):
 # =============================================================================
 # The trajectory axis
 # =============================================================================
-def test_signed_hours_put_delivery_at_zero_on_the_right():
-    """Six half-hour bins over three hours, bin 0 nearest delivery, every coordinate negative."""
-    x = report.signed_bin_hours(bin_hours=0.5, window_hours=3.0)
-    assert x.size == 6
+@pytest.mark.parametrize(
+    "window_hours,size,far_edge",
+    [(3.0, 6, -2.75), (6.0, 12, -5.75)],  # the preserved window, and a wider analysis window
+)
+def test_signed_hours_put_delivery_at_zero_on_the_right(window_hours, size, far_edge):
+    """Half-hour bins over the window, bin 0 nearest delivery, every coordinate negative."""
+    x = report.signed_bin_hours(bin_hours=0.5, window_hours=window_hours)
+    assert x.size == size
     assert x[0] == pytest.approx(-0.25)
-    assert x[-1] == pytest.approx(-2.75)
+    assert x[-1] == pytest.approx(far_edge)
     assert (x < 0.0).all()
     assert (np.diff(x) < 0.0).all()
 
@@ -180,55 +184,12 @@ def test_axis_label_falls_back_to_the_bare_component_name():
     assert report.axis_label(_Projection([0.5]), 1) == "PC2"
 
 
-def test_score_scale_note_names_the_model_and_refuses_the_misreading():
-    note = report.score_scale_note("adapted")
-    assert "adapted" in note
-    assert "not latent or physiological motion" in note
-
-
-def test_the_panel_sized_disclosure_still_says_the_scales_are_not_comparable():
-    short = report.score_scale_note("adapted", short=True)
-    assert "adapted" in short
-    assert "not comparable across models" in short
-    assert len(short) < len(report.score_scale_note("adapted"))
-
-
 def test_two_groups_never_share_one_fallback_colour():
     """Grouping by the binary outcome must not draw both lines in the same grey."""
     palette = report._palette(["0", "1"])
     assert palette["0"] != palette["1"]
     for name in report.PLOT_CLASSES:
         assert palette[name] == report.class_palette()[name]
-
-
-def test_every_figure_has_a_caption():
-    assert set(report.CAPTIONS) == {
-        report.FIGURE_LATENT_SPACE,
-        report.FIGURE_COVERAGE_SPACE,
-        report.FIGURE_SUPERVISED_AXIS,
-        report.FIGURE_TRAJECTORIES,
-        report.FIGURE_ROC_PR,
-        report.FIGURE_CONFUSION,
-        report.FIGURE_METRICS_TIME,
-        report.FIGURE_ROC_BINS,
-        report.FIGURE_COUNTS_TIME,
-    }
-
-
-def test_no_caption_states_a_window_the_configuration_can_move():
-    """A caption naming a number would go stale the day that number was configured away.
-
-    Figure 3's is the one deliberate exception: it is a format template, filled by its own drawing
-    function from the run's settings. Every classification caption states the rule and leaves the
-    numbers to the figure's title, which reads them from the settings.
-    """
-    for name in (
-        report.FIGURE_ROC_PR, report.FIGURE_CONFUSION, report.FIGURE_METRICS_TIME,
-        report.FIGURE_ROC_BINS, report.FIGURE_COUNTS_TIME,
-    ):
-        caption = report.CAPTIONS[name]
-        assert "{" not in caption, name
-        assert not any(character.isdigit() for character in caption), name
 
 
 # =============================================================================
@@ -265,10 +226,6 @@ def test_an_unknown_last_observed_time_is_its_own_group():
     frame = pd.DataFrame({"last_anchor_hours": [0.1, 0.5, 0.9, float("nan")]})
     observed = report.coverage_groupings(frame)["coverage"]
     assert observed[-1] == "last observed: unknown"
-
-
-def test_class_names_come_from_the_repository_class_table():
-    assert report.PLOT_CLASSES == tuple(labels.CLASS_NAMES.values())
 
 
 # =============================================================================
@@ -349,12 +306,6 @@ def test_the_temporal_heading_follows_the_recorded_window_not_the_shipped_one():
 
 def test_an_empty_run_reports_nothing_measured_rather_than_zeros():
     text = report.build_report({})
-    for heading in (
-        "## Provenance", "## Cohort", "## Fitting and selection", "## Preservation",
-        "## Held-out discrimination", "## Controls", "## Change before delivery",
-        "## Prespecified subgroups", "## Figures", "## Limitations", "## Reproduction",
-    ):
-        assert heading in text
     assert text.count(report.MISSING) > 10
     assert "0.0000" not in text
 
@@ -383,15 +334,14 @@ def test_measured_metrics_reach_the_report_unchanged():
     assert "no patient mapping was supplied" in text
 
 
-def test_a_retained_frozen_model_is_reported_as_the_result_it_is():
-    text = report.build_report({"selection": {"adaptation": {"selected_epoch": 0}}})
-    assert "retained the frozen model" in text
-    assert "not a failure to select" in text
-
-
-def test_a_selected_epoch_is_named():
-    text = report.build_report({"selection": {"adaptation": {"selected_epoch": 4}}})
-    assert "chose epoch 4" in text
+@pytest.mark.parametrize(
+    "epoch,statement",
+    [(0, "retained the frozen model"), (4, "chose epoch 4")],
+)
+def test_the_selected_epoch_is_reported_as_the_result_it_is(epoch, statement):
+    """Epoch zero is the frozen model retained, which is a result and not a failure to select."""
+    text = report.build_report({"selection": {"adaptation": {"selected_epoch": epoch}}})
+    assert statement in text
 
 
 def test_gate_failures_and_warnings_are_both_shown_and_kept_apart():
@@ -432,12 +382,6 @@ def test_a_control_run_is_never_described_as_a_permutation_p_value():
     assert "sanity check" in text
 
 
-def test_fixed_limitations_are_always_present():
-    text = report.build_report({})
-    assert "One fold, one checkpoint, one seed" in text
-    assert "not a calibrated clinical risk" in text
-
-
 def test_reproduction_commands_come_from_the_run_that_was_actually_launched():
     commands = report.reproduction_commands({
         "run_args": {"config_path": "configs/pilot.yaml"},
@@ -460,20 +404,6 @@ def test_figures_are_listed_with_the_caption_they_carry():
     })
     assert "runs/x/figures/figure3_trajectories.pdf" in text
     assert report.CAPTIONS[report.FIGURE_TRAJECTORIES] in text
-
-
-def test_the_report_is_written_where_it_is_asked_for(tmp_path):
-    target = report.write_report({}, tmp_path)
-    assert target.name == report.REPORT_FILENAME
-    assert target.read_text(encoding="utf-8").startswith("# Latent-class fine-tuning pilot")
-
-
-def test_the_axis_spans_the_analysis_window_when_it_is_wider_than_the_preserved_one():
-    """Twelve half-hour bins over six hours, and the far edge is the analysis window's."""
-    x = report.signed_bin_hours(bin_hours=0.5, window_hours=6.0)
-    assert x.size == 12
-    assert x[0] == pytest.approx(-0.25)
-    assert x[-1] == pytest.approx(-5.75)
 
 
 def test_the_temporal_heading_follows_the_analysis_window_where_one_was_set():

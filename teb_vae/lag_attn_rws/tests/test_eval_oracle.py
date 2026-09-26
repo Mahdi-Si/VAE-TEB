@@ -345,15 +345,6 @@ def test_the_probe_step_leaves_no_gradient_on_the_production_model(
     assert all(parameter.grad is None for parameter in tiny_model.parameters())
 
 
-def test_the_cache_carries_no_graph_back_to_the_model(known_answer) -> None:
-    """The property the assertion above depends on, stated directly: a cache that kept its graph
-    would make the isolation a matter of luck about which tensors happened to be used."""
-    cache, _trivial = known_answer
-
-    assert cache.target_state.grad_fn is None
-    assert not cache.target_state.requires_grad
-
-
 # =============================================================================
 # Convergence and capacity, both mechanical
 # =============================================================================

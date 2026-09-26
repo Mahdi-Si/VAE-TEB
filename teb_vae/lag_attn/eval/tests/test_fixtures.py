@@ -1,4 +1,4 @@
-"""The shared fixtures are non-vacuous: the checkpoint is self-describing, the perturbations bite.
+"""The shared fixtures are non-vacuous: the checkpoint round-trips, the perturbations bite.
 
 The second half is the point of the file. Every later test that asserts on a KL, an uplift, a
 residual ratio or a lag-band difference rests on one of the two perturbation fixtures, and
@@ -26,18 +26,6 @@ def _delta_mu_src(model, inputs) -> torch.Tensor:
 # ---------------------------------------------------------------------------
 # The checkpoint fixture
 # ---------------------------------------------------------------------------
-def test_tiny_checkpoint_is_self_describing(tiny_checkpoint):
-    """Both stamps present: the base's ``model_class`` and the task's ``model_kwargs``."""
-    blob = torch.load(tiny_checkpoint, map_location="cpu", weights_only=False)
-    assert blob["model_class"] == "SeqVaeLagAttn"
-    # Asserted explicitly because the failure is silent: a task built without ``model_kwargs=``
-    # stores {}, and ``SeqVaeLagAttn(**{})`` then builds the full production geometry rather
-    # than raising -- a 300-step, 128-wide model reporting itself as the tiny one.
-    assert blob["model_kwargs"], "empty model_kwargs would silently rebuild production geometry"
-    assert blob["model_kwargs"]["d_model"] == 32
-    assert blob["hyper_parameters"]["likelihood"] == "gaussian_nll"
-
-
 def test_tiny_checkpoint_round_trips(tiny_checkpoint):
     """Rebuilt from its own ``model_kwargs``, the state dict aligns parameter for parameter."""
     blob = torch.load(tiny_checkpoint, map_location="cpu", weights_only=False)

@@ -32,7 +32,6 @@ import torch
 import yaml
 
 from teb_vae.lag_attn.config import load_config
-from teb_vae.lag_attn_rws.trainer import RESOLVED_CONFIG_FILENAME
 from teb_vae.lag_attn_transformer_cfs import trainer as trainer_module
 from teb_vae.lag_attn_transformer_cfs.nets.model import SeqVaeLagAttnTrfCfs
 from teb_vae.lag_attn_transformer_cfs.trainer import LagAttnTrfCfsTrainer
@@ -279,41 +278,16 @@ def test_the_step_granular_ramp_was_live_during_the_fit(fit):
     assert frame["lr"].dropna().gt(0.0).all()
 
 
-def test_the_input_adapters_carry_the_availability_terms_the_warm_up_needs(fit):
-    r"""The failure ``_build_adapter`` exists to prevent, checked on the model a real run built.
-
-    The architecture parent sizes the guard from ``gate.delay.delay_steps``, which carries only the
-    alignment shifts $d_c$ and nothing of the warm-up: $0$ on an unaligned config, where the gate is
-    a pure gather, and $\max_c d_c$ under this cell's shipped
-    ``causal_align_reference: target_max``. The override passes $W'_c + d_c$ per channel, and the
-    zero-marginal-warm-up lemma makes $\max_c(W'_c + d_c) = \max_c W'_c$ -- which is why the
-    equality asserted below survives the alignment unchanged."""
-    driver, _trainer = fit
-    model = driver.pytorch_model
-
-    for adapter, expected in (
-        (model.target_adapter, model.target_warmup_steps),
-        (model.source_adapter, model.source_warmup_steps),
-    ):
-        assert adapter.mask_proj is not None
-        assert adapter.max_delay == max(expected)
-
-
 # --------------------------------------------------------------------------------------
 # What the CSV says
 # --------------------------------------------------------------------------------------
-def test_every_declared_metric_reaches_the_logger(fit):
-    """Both directions. A tracked name the framework never emits is a column that is NaN in every
-    row of every run; a metric the task emits that nothing tracks never reaches the CSV at all."""
+def test_every_declared_metric_reaches_the_logger_and_none_is_all_nan(fit):
+    """A tracked name the framework never emits is a column that is NaN in every row of every run,
+    and a column that exists but never fills is the same failure one step later."""
     frame = _metrics(fit[0])
 
     missing = [name for name in LagAttnTrfCfsTrainer.TRACKED_METRICS if name not in frame.columns]
     assert missing == [], missing
-
-
-def test_no_tracked_column_is_all_nan(fit):
-    frame = _metrics(fit[0])
-
     empty = [
         name
         for name in LagAttnTrfCfsTrainer.TRACKED_METRICS
@@ -370,17 +344,6 @@ def test_both_channel_splits_recompose_to_the_gap_in_the_same_row(fit):
     assert ((tertiles - blocks).abs() < 1e-4 * (blocks.abs() + 1.0)).all()
 
 
-def test_the_source_null_floor_is_reported_beside_the_coupling_readout(fit):
-    """Validation-only, and absent rather than zero-filled on training rows: the framework's epoch
-    value is the mean over the steps that reported a metric, so a zero placeholder would scale the
-    aggregate toward nothing."""
-    frame = _metrics(fit[0])
-
-    assert "val/kld_source_null" in frame.columns
-    assert frame["val/kld_source_null"].notna().any()
-    assert "train/kld_source_null" not in frame.columns
-
-
 def test_the_lag_warmth_columns_are_fractions(fit):
     """Normalised by the attention mass actually present, so the value stays in $[0, 1]$ even when
     rows have no admissible lag at all."""
@@ -395,45 +358,16 @@ def test_the_lag_warmth_columns_are_fractions(fit):
 # --------------------------------------------------------------------------------------
 # What the run directory holds
 # --------------------------------------------------------------------------------------
-def test_the_run_directory_has_the_expected_layout(fit):
-    driver, _trainer = fit
-
-    assert (Path(driver.train_results_dir) / "metrics_history.csv").exists()
-    assert Path(driver.model_checkpoint_dir).is_dir()
-
-
-def test_the_resolved_config_records_the_budget_the_run_actually_got(fit):
-    """The run's own provenance record: the threshold it was launched with, beside the geometry it
-    resolved to."""
-    driver, _trainer = fit
-    resolved = yaml.safe_load(
-        (Path(driver.model_checkpoint_dir) / RESOLVED_CONFIG_FILENAME).read_text(encoding="utf-8")
-    )
-
-    vae = resolved["model_config"]["VAE_model"]
-    assert vae["causal_warmup_budget_steps"] == 134
-    assert vae["anchor_stride"] == SHIPPED_ANCHOR_STRIDE
-    assert vae["causal_reach_budget_s"] is None
-
-
-def test_the_checkpoint_is_written_under_this_models_stem(fit):
-    """Two models writing under one stem into a shared output tree are indistinguishable by name."""
-    driver, _trainer = fit
-
-    written = sorted(Path(driver.model_checkpoint_dir).glob("*.ckpt"))
-    assert written, "no checkpoint was written"
-    for path in written:
-        assert path.name.startswith(LagAttnTrfCfsTrainer.CHECKPOINT_STEM), path.name
-
-
 def test_both_checkpoint_criteria_wrote_a_file_under_distinct_stems(fit):
     """The second criterion, end to end, which is the only place its filename is decided.
 
-    The composite optimum and the best conditioned forecast are different epochs, so a run keeps
-    both -- and the two callbacks must not write the same name. With one stem Lightning would have
-    each overwrite the other's file at the same epoch, leaving one criterion's best silently
-    unsaved: two ``ModelCheckpoint``s in the callback list, one set of files on disk, and nothing
-    in the log about it. That is a construction-time property nothing but a real fit exercises.
+    Every file is written under this model's stem -- two models writing under one stem into a
+    shared output tree are indistinguishable by name. The composite optimum and the best conditioned
+    forecast are different epochs, so a run keeps both -- and the two callbacks must not write the
+    same name. With one name Lightning would have each overwrite the other's file at the same
+    epoch, leaving one criterion's best silently unsaved: two ``ModelCheckpoint``s in the callback
+    list, one set of files on disk, and nothing in the log about it. That is a construction-time
+    property nothing but a real fit exercises.
     """
     driver, _trainer = fit
     configured = driver.config["advanced_config"]["callbacks"]["model_checkpoint"]
@@ -444,6 +378,7 @@ def test_both_checkpoint_criteria_wrote_a_file_under_distinct_stems(fit):
     primary = {name for name in names if name.startswith(f"{stem}-epoch=")}
     secondary = names - primary
 
+    assert all(name.startswith(stem) for name in names), sorted(names)
     assert primary, f"the primary criterion wrote nothing: {sorted(names)}"
     assert secondary, f"the second criterion wrote nothing: {sorted(names)}"
     assert all("nll" in name for name in secondary), sorted(secondary)

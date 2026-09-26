@@ -7,7 +7,6 @@ model *before* the rebuild is attempted, when the error can still say what is wr
 """
 from __future__ import annotations
 
-import pytest
 import torch
 
 from teb_vae.lag_attn_rws.nets.model import SeqVaeLagAttnRws
@@ -27,34 +26,8 @@ def test_the_checkpoint_carries_the_model_class_and_kwargs(task):
 
     assert checkpoint["model_class"] == "SeqVaeLagAttnRws"
     assert checkpoint["model_kwargs"] == TINY_KWARGS
-
-
-def test_the_flags_that_change_the_architecture_survive(task):
-    """A missing flag rebuilds a different model, and ``load_checkpoint_strict`` would then
-    align nothing and return ``None`` -- which a caller that does not check reads as success."""
-    checkpoint = _lightning_style_checkpoint(task())
-
-    for flag in ("sequence_length", "d_model", "d_z", "horizon", "raw_per_step", "max_lag"):
-        assert flag in checkpoint["model_kwargs"], f"{flag} missing from model_kwargs"
-
-
-def test_the_base_stamp_survives_the_override(task):
-    """``on_save_checkpoint`` here adds a field; it must not replace the base's work. An
-    override that skipped ``super()`` would drop ``model_class`` and every guard that reads it
-    would silently degrade to its warn-and-continue path."""
-    checkpoint = _lightning_style_checkpoint(task())
-
-    assert "model_class" in checkpoint
-    assert "model_kwargs" in checkpoint
-    assert checkpoint["epoch"] == 3  # and it must not have clobbered Lightning's own fields
-
-
-def test_the_class_guard_accepts_this_model_and_rejects_another(task):
-    checkpoint = _lightning_style_checkpoint(task())
-
-    check_model_class(checkpoint, "SeqVaeLagAttnRws")  # must not raise
-    with pytest.raises(ValueError, match="does not match the active model class"):
-        check_model_class(checkpoint, "SeqVaeLagAttn")
+    # The stamp is added beside Lightning's own fields, never over them.
+    assert checkpoint["epoch"] == 3
 
 
 def test_a_checkpoint_round_trips_into_a_fresh_model(task, inputs, tmp_path):

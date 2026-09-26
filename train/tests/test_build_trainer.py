@@ -5,6 +5,7 @@ shipped config names 7 CUDA devices while the dev box has one, so building a rea
 ``Trainer`` would validate against hardware. ``torch.cuda.is_available`` is pinned so
 the accelerator branch is deterministic regardless of the test host.
 """
+import pytest
 import torch
 from lightning.pytorch.callbacks import EarlyStopping, LearningRateMonitor
 from lightning.pytorch.profilers import SimpleProfiler
@@ -19,34 +20,44 @@ def _cpu(monkeypatch):
 # --- canonical trainer (shipped config) -------------------------------------
 
 def test_canonical_scalar_kwargs(config_path, monkeypatch):
+    """Each config-driven kwarg carries its ``advanced_config.trainer`` value."""
     _cpu(monkeypatch)
     gm = make_graph_model(config_path)
+    trainer_cfg = gm.config["advanced_config"]["trainer"]
     kw = gm._build_trainer_kwargs([])
 
-    assert kw["precision"] == "bf16-mixed"
-    assert kw["log_every_n_steps"] == 1
-    assert kw["num_sanity_val_steps"] == 0
-    assert kw["use_distributed_sampler"] is True
+    for key in (
+        "precision", "log_every_n_steps", "num_sanity_val_steps", "use_distributed_sampler",
+        "gradient_clip_val", "gradient_clip_algorithm",
+    ):
+        assert kw[key] == trainer_cfg[key], key
     assert kw["enable_checkpointing"] is True
-    assert kw["gradient_clip_val"] == 0.5
-    assert kw["gradient_clip_algorithm"] == "norm"
     assert kw["max_epochs"] == gm.epochs_num
     assert kw["accumulate_grad_batches"] == gm.accumulate_grad_batches
     assert isinstance(kw["profiler"], SimpleProfiler)
 
 
-def test_sync_batchnorm_single_device_false(config_path, monkeypatch):
+@pytest.mark.parametrize(
+    "devices, configured, expected",
+    [([0], True, False), ([0, 1], True, True), ([0, 1], False, False)],
+    ids=["one-device", "multi-device", "multi-device-config-off"],
+)
+def test_sync_batchnorm_needs_the_config_and_more_than_one_device(
+    config_path, monkeypatch, devices, configured, expected
+):
+    """SyncBatchNorm's forward needs an initialised process group, which one device lacks; and on
+    a multi-device run the config wins (a consumer that hardcoded ``len(cuda_devices) > 1`` ran
+    with it on while its own config said off)."""
     _cpu(monkeypatch)
-    gm = make_graph_model(config_path, **{"general_config.cuda_devices": [0]})
+    gm = make_graph_model(
+        config_path,
+        **{
+            "general_config.cuda_devices": devices,
+            "advanced_config.trainer.sync_batchnorm": configured,
+        },
+    )
     kw = gm._build_trainer_kwargs([])
-    assert kw["sync_batchnorm"] is False
-
-
-def test_sync_batchnorm_multi_device_true(config_path, monkeypatch):
-    _cpu(monkeypatch)
-    gm = make_graph_model(config_path, **{"general_config.cuda_devices": [0, 1]})
-    kw = gm._build_trainer_kwargs([])
-    assert kw["sync_batchnorm"] is True
+    assert kw["sync_batchnorm"] is expected
 
 
 def test_lr_monitor_always_attached(config_path, monkeypatch):

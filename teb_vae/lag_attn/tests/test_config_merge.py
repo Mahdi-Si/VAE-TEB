@@ -23,20 +23,6 @@ def _write(path, mapping) -> str:
     return str(path)
 
 
-def test_a_config_without_base_resolves_to_itself(tmp_path):
-    config = {"general_config": {"tag": "solo", "epochs": 5}}
-    assert load_config(_write(tmp_path / "solo.yaml", config)) == config
-
-
-def test_a_child_inherits_every_parent_key_it_does_not_name(tmp_path):
-    _write(tmp_path / "parent.yaml", {"general_config": {"tag": "base", "epochs": 5000, "lr": 0.001}})
-    child = _write(tmp_path / "child.yaml", {"base": "parent.yaml", "general_config": {"epochs": 1}})
-
-    resolved = load_config(child)
-
-    assert resolved["general_config"] == {"tag": "base", "epochs": 1, "lr": 0.001}
-
-
 def test_nested_dicts_merge_key_by_key(tmp_path):
     """The property the whole mechanism rests on.
 
@@ -109,20 +95,18 @@ def test_a_chain_of_three_merges_in_order(tmp_path):
     assert load_config(c)["general_config"] == {"tag": "c", "epochs": 100, "seed": 42}
 
 
-def test_a_cycle_raises(tmp_path):
-    _write(tmp_path / "a.yaml", {"base": "b.yaml"})
-    _write(tmp_path / "b.yaml", {"base": "a.yaml"})
+@pytest.mark.parametrize(
+    "links",
+    [{"a.yaml": "b.yaml", "b.yaml": "a.yaml"}, {"a.yaml": "a.yaml"}],
+    ids=["two-cycle", "self-reference"],
+)
+def test_a_cycle_raises(tmp_path, links):
+    """Including the one-element cycle; a `seen` set that appends too late would recurse forever."""
+    for name, base in links.items():
+        _write(tmp_path / name, {"base": base})
 
     with pytest.raises(ValueError, match="circular"):
         load_config(str(tmp_path / "a.yaml"))
-
-
-def test_a_config_naming_itself_as_its_base_raises(tmp_path):
-    """The one-element cycle; a `seen` set that appends too late would recurse forever here."""
-    self_ref = _write(tmp_path / "self.yaml", {"base": "self.yaml"})
-
-    with pytest.raises(ValueError, match="circular"):
-        load_config(self_ref)
 
 
 def test_a_missing_base_raises_file_not_found(tmp_path):
@@ -147,45 +131,19 @@ def test_a_non_mapping_document_raises(tmp_path):
         load_config(str(path))
 
 
-def test_the_parent_file_is_not_mutated_by_a_merge(tmp_path):
-    """A shared nested dict would let one variant's resolution corrupt the next one's."""
-    parent_path = tmp_path / "parent.yaml"
-    parent = {"model_config": {"VAE_model": {"d_model": 128}}}
-    _write(parent_path, parent)
-    _write(
-        tmp_path / "child.yaml",
-        {"base": "parent.yaml", "model_config": {"VAE_model": {"d_model": 32}}},
-    )
-
-    load_config(str(tmp_path / "child.yaml"))
-
-    assert load_config(str(parent_path))["model_config"]["VAE_model"]["d_model"] == 128
-
-
 def test_resolve_config_file_writes_the_merged_config_and_returns_its_path(tmp_path):
-    """The seam the experiment driver requires: it reads a path, not a dict."""
+    """The seam the experiment driver requires: it reads a path, not a dict.
+
+    Read back raw, so a ``base`` key left in the written provenance record -- which would
+    re-inherit when re-read -- fails the equality. The output directory does not exist yet.
+    """
     _write(tmp_path / "parent.yaml", {"general_config": {"tag": "base", "epochs": 5000}})
     child = _write(tmp_path / "child.yaml", {"base": "parent.yaml", "general_config": {"epochs": 1}})
 
-    written = resolve_config_file(child, str(tmp_path / "run"))
+    written = resolve_config_file(child, str(tmp_path / "run" / "nested"))
 
     assert os.path.isfile(written)
-    assert load_config(written)["general_config"] == {"tag": "base", "epochs": 1}
+    with open(written, encoding="utf-8") as handle:
+        assert yaml.safe_load(handle) == {"general_config": {"tag": "base", "epochs": 1}}
 
 
-def test_resolve_config_file_creates_a_missing_output_directory(tmp_path):
-    config = _write(tmp_path / "solo.yaml", {"general_config": {"tag": "solo"}})
-
-    written = resolve_config_file(config, str(tmp_path / "does" / "not" / "exist"))
-
-    assert os.path.isfile(written)
-
-
-def test_the_resolved_file_carries_no_base_key(tmp_path):
-    """Otherwise the written provenance record re-inherits when it is re-read."""
-    _write(tmp_path / "parent.yaml", {"general_config": {"tag": "base"}})
-    child = _write(tmp_path / "child.yaml", {"base": "parent.yaml"})
-
-    written = resolve_config_file(child, str(tmp_path / "run"))
-
-    assert "base" not in yaml.safe_load(open(written, encoding="utf-8"))

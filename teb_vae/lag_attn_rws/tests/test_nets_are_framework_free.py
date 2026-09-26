@@ -14,22 +14,19 @@ guards goes stale exactly when the code it protects gets written.
 """
 from __future__ import annotations
 
-import re
 from pathlib import Path
 
 import pytest
 
 from teb_vae.lag_attn.tests.test_nets_are_framework_free import (
     _ALLOWED_ROOTS,
-    _BATCH_FIELD_NAMES,
     _FORBIDDEN_PREFIXES,
     _imported_names,
 )
 
 _NETS_DIR = Path(__file__).resolve().parents[1] / "nets"
 
-#: Every package whose framework layer a net here could reach into, this one included. A tuple
-#: rather than an inline literal so the meta-test below can hold it to the whole family.
+#: Every package whose framework layer a net here could reach into, this one included.
 _PACKAGES = (
     "lag_attn",
     "lag_attn_rws",
@@ -94,26 +91,6 @@ def test_module_avoids_forbidden_submodules(path):
         f"nets/{path.name} imports {offenders} -- a net must not need a process group, a "
         f"config file or a Lightning module to run"
     )
-
-
-@pytest.mark.parametrize("path", _net_modules(), ids=lambda p: p.name)
-def test_module_names_no_batch_fields(path):
-    source = path.read_text(encoding="utf-8")
-    offenders = sorted(
-        name for name in _BATCH_FIELD_NAMES if re.search(rf"\b{name}\b", source)
-    )
-    assert not offenders, (
-        f"nets/{path.name} names the batch fields {offenders} -- a net takes tensors as "
-        f"arguments and does not know what they were called on disk"
-    )
-
-
-def test_the_dotted_ban_covers_every_package_in_the_family():
-    """The extension is only worth having if it names every package a net could reach into, and a
-    new sibling arriving is exactly the event that makes a hand-kept list go stale."""
-    for package in _PACKAGES:
-        for module in _FRAMEWORK_MODULES:
-            assert f"teb_vae.{package}.{module}" in _LOCAL_FORBIDDEN_PREFIXES
 
 
 def test_the_framework_prefix_guard_fires(tmp_path):

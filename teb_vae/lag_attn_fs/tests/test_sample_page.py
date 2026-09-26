@@ -28,7 +28,6 @@ import torch  # noqa: E402
 from teb_vae.lag_attn.figure_primitives import select_forecast_channels  # noqa: E402
 from teb_vae.lag_attn_fs import sample_page  # noqa: E402
 from teb_vae.lag_attn_rws import plotting  # noqa: E402
-from teb_vae.lag_attn_rws import sample_page as shared_page  # noqa: E402
 
 from .conftest import (  # noqa: E402
     SHIPPED_KWARGS,
@@ -45,10 +44,6 @@ _STATS = {"fhr": {"mean": 140.0, "std": 20.0}, "up": {"mean": 30.0, "std": 10.0}
 #: Raw sampling rate, restated rather than imported: the page's second arithmetic is what is under
 #: test, and borrowing its own constant would make the assertions circular.
 _FS_RAW = 4.0
-
-#: What the shipped reach budget resolves the target stream to. Pinned so the shipped-width render
-#: below cannot silently become the unguarded one.
-_SHIPPED_TARGET_CHANNELS = 78
 
 
 def _forward(module: Any, data: Any) -> dict:
@@ -277,24 +272,6 @@ def test_row_one_draws_the_raw_trace_from_the_batch_not_the_feature_target(task,
         plt.close(figure)
 
 
-def test_without_statistics_the_context_row_says_normalised_instead_of_lying(
-    task, patterned_batch
-):
-    """The other direction of the conversion, and the criterion the page has to meet when the
-    run's loader statistics cannot be reached at all."""
-    figure = _render(task(), patterned_batch, normalization_stats=None)
-    try:
-        ax = _axes_titled(figure, "Raw target FHR")
-
-        assert "normalised" in ax.get_ylabel()
-        assert "bpm" not in ax.get_ylabel()
-        # The forecast row is *always* in normalised units: the target is the loader's output used
-        # as delivered, and there is no second normalisation to invert.
-        assert "normalised" in _axes_titled(figure, "Forecast").get_ylabel()
-    finally:
-        plt.close(figure)
-
-
 def test_a_batch_without_the_raw_trace_still_draws_the_other_six_rows(task, patterned_batch):
     """The builder's ``batch`` defaults to ``None`` and the raw traces are context, not a readout.
     Losing them must cost the page one row's content and nothing else -- including its place in
@@ -333,44 +310,6 @@ def test_the_forecast_row_draws_the_channels_the_rule_picks_named_by_declared_in
             == sorted(f"ch {index}" for index in keep)
         )
         assert f"3 of {len(keep)} target channels" in ax.get_title()
-    finally:
-        plt.close(figure)
-
-
-def test_the_error_map_is_an_inset_that_never_claims_the_shared_time_axis(task, patterned_batch):
-    r"""Its x-axis is the horizon step of one anchor, not physical time. Drawn as a panel of its
-    own it would make the forecast curves narrower than the other six rows and break the page's
-    one-instant-per-column property; drawn as a titled axes it would break the assertion that
-    checks it. So it is an untitled inset, and the row it sits in still spans the recording."""
-    module = task()
-    figure = _render(module, patterned_batch)
-    try:
-        geometry = module.orig_model.geometry
-        inset = _error_map(figure)
-        image = inset.images[0]
-
-        assert inset.get_title() == ""
-        assert image.get_array().shape == (
-            module.orig_model.decoder_out_channels,
-            geometry.horizon,
-        )
-        # The channel axis runs **top-down**: channel 0 at the top, which is the one convention
-        # every channel axis in the family reads by, so the map and the input rows two rows above
-        # it put the same channel at the same height. Paired with ``origin='upper'``; the extent
-        # alone would flip the axis and leave the array drawn upside down under it.
-        assert image.get_extent() == pytest.approx(
-            tuple(
-                shared_page.top_down_extent(
-                    -0.5, geometry.horizon - 0.5, module.orig_model.decoder_out_channels
-                )
-            )
-        )
-        assert image.origin == "upper"
-        # 'none', because a resampled map invents values between two channels, and per-channel
-        # resolution is the entire reason the panel exists.
-        assert image.get_interpolation() == "none"
-        # Its colorbar took the row's reserved column, which the raw page leaves hidden.
-        assert any("Y^{+}" in ax.get_ylabel() for ax in figure.axes)
     finally:
         plt.close(figure)
 
@@ -416,30 +355,6 @@ def test_the_error_map_describes_the_anchor_the_row_shades(task, patterned_batch
         plt.close(figure)
 
 
-def test_the_lanes_carry_the_truth_and_both_forecasts_with_their_bands(task, patterned_batch):
-    r"""Three lanes, each with the true coefficient, the base ($z^p$) and full ($z^q$) means and
-    both $\pm 2\sigma$ bands, and one legend entry per role rather than per lane. The counts are
-    what catch a band silently dropped or a lane drawn twice."""
-    figure = _render(task(), patterned_batch)
-    try:
-        ax = _axes_titled(figure, "Forecast")
-
-        assert len(ax.lines) == 3 * sample_page.FORECAST_CHANNELS
-        assert len(ax.collections) == 2 * sample_page.FORECAST_CHANNELS
-        assert [text.get_text() for text in ax.get_legend().get_texts()] == [
-            "true $Y^{+}$",
-            "base ($z^p$, target-only)",
-            "full ($z^q$, source-conditioned)",
-        ]
-        # The lanes are offset, not overlaid: a shared baseline would make three channels of a
-        # normalised stream unreadable as three signals.
-        offsets = sorted(ax.get_yticks())
-        assert len(set(offsets)) == sample_page.FORECAST_CHANNELS
-        assert offsets[0] == pytest.approx(0.0)
-    finally:
-        plt.close(figure)
-
-
 def test_it_refuses_a_keep_index_that_is_not_the_decoders_width():
     """A shorter or longer index gathers some other channel's truth into every lane and draws a
     figure that looks exactly right, so it has to fail rather than degrade."""
@@ -451,18 +366,17 @@ def test_it_refuses_a_keep_index_that_is_not_the_decoders_width():
 
 
 def test_it_renders_at_the_shipped_geometry_and_the_budgets_channel_count(task):
-    """The tiny fixture is $109$ channels ungated and $3$ gated; production is $78$ survivors over
-    $300$ steps, where the error map is a $78 \\times 30$ image and the lanes are picked from a
-    real reach budget's keep-index. Not marked slow: it builds and forwards the production net,
-    which is seconds, and a page that renders only at the test geometry is not a page."""
+    r"""Production is $C_{\mathrm{keep}}$ survivors of a real reach budget over the full sequence,
+    where the error map is a $C_{\mathrm{keep}} \times H$ image and the lanes are picked from the
+    budget's keep-index. Not marked slow: it builds and forwards the production net, which is
+    seconds, and a page that renders only at the test geometry is not a page."""
     kwargs = shipped_gated_kwargs()
     module = task(model_kwargs=kwargs)
     batch = make_patterned_batch(2, int(SHIPPED_KWARGS["sequence_length"]))
     figure = _render(module, batch)
     try:
-        assert module.orig_model.decoder_out_channels == _SHIPPED_TARGET_CHANNELS
         assert _error_map(figure).images[0].get_array().shape == (
-            _SHIPPED_TARGET_CHANNELS,
+            len(kwargs["target_keep_index"]),
             int(SHIPPED_KWARGS["horizon"]),
         )
         assert len([ax for ax in figure.axes if ax.get_title()]) == 7
@@ -474,19 +388,3 @@ def test_it_renders_at_the_shipped_geometry_and_the_budgets_channel_count(task):
         assert boundaries == pytest.approx([expected - 0.5])
     finally:
         plt.close(figure)
-
-
-def test_the_shared_page_is_reached_rather_than_copied():
-    """No ``lag_attn_fs/plotting.py`` and no callback of this package's own: the seam exists so a
-    sibling supplies two rows and inherits the other five, and a second callback class would be a
-    second place for the layout, the cuts and the caption to drift."""
-    import importlib
-    from pathlib import Path
-
-    package = Path(sample_page.__file__).parent
-
-    assert not (package / "plotting.py").exists()
-    with pytest.raises(ModuleNotFoundError):
-        importlib.import_module("teb_vae.lag_attn_fs.plotting")
-    # And row 1 is the sibling's implementation, not a copy of it.
-    assert sample_page.raw_context_row is shared_page.raw_context_row

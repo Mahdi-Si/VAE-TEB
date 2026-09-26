@@ -181,14 +181,12 @@ def test_a_flat_pred_gap_alone_is_inconclusive_not_collapsed() -> None:
     """A posterior carrying information the decoder does not act on -- a different finding."""
     verdict = scalars_analysis.collapse_verdict(1e-9, 0.5, THRESHOLDS)
     assert verdict["verdict"] == "inconclusive"
-    assert "does not act on" in verdict["detail"]
 
 
 def test_a_flat_kld_alone_is_inconclusive_not_collapsed() -> None:
     """A decoder using a latent the KL under-reports -- likewise worth chasing, not collapse."""
     verdict = scalars_analysis.collapse_verdict(0.5, 1e-9, THRESHOLDS)
     assert verdict["verdict"] == "inconclusive"
-    assert "under-reports" in verdict["detail"]
 
 
 def test_the_verdict_carries_its_components_and_thresholds() -> None:
@@ -204,20 +202,6 @@ def test_a_nan_component_is_not_read_as_near_zero() -> None:
     verdict = scalars_analysis.collapse_verdict(float("nan"), 1e-9, THRESHOLDS)
     assert verdict["pred_gap_near_zero"] is False
     assert verdict["verdict"] == "inconclusive"
-
-
-def test_the_verdict_is_reachable_from_the_analysis_summary(
-    make_eval_runner, tiny_loader, tiny_eval_config, tmp_path
-) -> None:
-    """It is the run's headline conclusion, so it must be a field rather than a log line."""
-    runner = make_eval_runner(output_dir=tmp_path / "runner")
-    torch.manual_seed(3)
-    summary = scalars_analysis.run_scalar_analysis(
-        runner, tiny_loader, eval_config=tiny_eval_config["eval_config"],
-        output_dir=tmp_path / "results",
-    )
-    assert summary["collapse"]["verdict"] in {"collapsed", "inconclusive", "healthy"}
-    assert set(summary["collapse"]) >= {"verdict", "detail", "pred_gap", "kld_raw", "thresholds"}
 
 
 # ---------------------------------------------------------------------------

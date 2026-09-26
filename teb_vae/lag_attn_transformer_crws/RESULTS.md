@@ -424,8 +424,7 @@ projections and the two start embeddings still dominate. At `target_max` this ce
 raw-signal side of that line too, at +17,792. Every parameter the guard adds here is under an
 adapter.
 
-`DESIGN.md` section 13 carries the same table; `tests/test_docs.py` measures every total in both
-documents by constructing the models rather than comparing against literals.
+`DESIGN.md` section 13 carries the same table.
 
 ---
 

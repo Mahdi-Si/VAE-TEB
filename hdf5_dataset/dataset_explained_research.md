@@ -1332,8 +1332,7 @@ predicted delay, over twelve segments: `fhr_ph` $+0.07 \to +0.80$, `up_ph` $+0.0
 > Those correlation figures, and the ones in the next paragraph, are quoted from
 > the docstrings that recorded them (`causal_scattering.py:1141-1150` and the
 > comparison tool). They derive from `output/causal_scattering/per_channel.csv`,
-> which is git-ignored and not present in a fresh checkout —
-> `hdf5_dataset/tests/test_preprint_numbers.py` *skips* without it. Regenerate
+> which is git-ignored and not present in a fresh checkout. Regenerate
 > the measurement (§11.3 step 3) before relying on a digit.
 
 The alignment costs nothing. $W_j + s_{ij} \le W_i$ holds for all $81$ stored pairs of the legacy
@@ -2526,9 +2525,8 @@ and two more sit at package level:
 | `tests/test_causal_loader.py` | 62 | the loading and statistics stack |
 | `tests/test_causal_torch.py` | 52 | transform geometry, torch-vs-numpy gate, channel plan |
 | `tests/test_phase_operator.py` | 16 | the two operator versions, and the timing / start-up counterexamples |
-| `tests/test_preprint_numbers.py` | 3 | the preprint fidelity table against the measurement CSV |
 | `tests/test_preprocessing_availability.py` | 7 | the retrospective-vs-online sanitiser audit (§3.5) |
-| `test_causal_scattering.py` | 26 | the two load-bearing causality proofs, and the arm-B-reproduces-the-shard gate |
+| `test_causal_scattering.py` | 26 | the load-bearing causality proof, and the arm-B-reproduces-the-shard gate |
 | `test_hdf5_dataset.py` | 0 | a plotting script that skips itself at collection |
 
 `conftest.py` deliberately **raises** rather than skips when the committed

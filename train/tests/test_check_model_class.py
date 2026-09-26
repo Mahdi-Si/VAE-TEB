@@ -64,5 +64,8 @@ def test_the_guard_reads_the_key_the_framework_actually_stamps():
     checkpoint = {}
     module.on_save_checkpoint(checkpoint)
 
-    assert "model_class" in checkpoint
-    check_model_class(checkpoint, checkpoint["model_class"])
+    # The stamp records the eager module's class name (unaffected by torch.compile).
+    assert checkpoint["model_class"] == "TinyModule"
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")  # a guard reading another key would warn, not raise
+        check_model_class(checkpoint, "TinyModule")

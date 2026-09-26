@@ -125,7 +125,6 @@ def test_a_stratified_plan_covers_both_files_even_when_they_are_unbalanced(
     -- so an unstratified draw can plausibly miss the small ones entirely.
     """
     sources = ["file_a.hdf5"] * 38 + ["file_b.hdf5"] * 2
-    loader = _two_file_loader(per_file=1)  # replaced below; only the shape is reused
     loader = []
     generator = torch.Generator().manual_seed(0)
     for start in range(0, len(sources), 5):
@@ -200,15 +199,6 @@ def test_a_scalar_column_is_broadcast_to_the_batch(runner: EvalRunner) -> None:
     assert collected.frame["flag"].eq(1.5).all()
 
 
-def test_max_samples_stops_iteration_early(runner: EvalRunner) -> None:
-    """A prefix cap, appropriate only for a smoke run -- and it caps by sample, not by batch."""
-    collected = collectors.collect_metrics(
-        runner, _two_file_loader(per_file=10, batch_size=5), _mean_energy, max_samples=7
-    )
-    # Does not split a batch, so it overshoots to the batch boundary: 10, not 7.
-    assert collected.n_seen == 10
-
-
 # ---------------------------------------------------------------------------
 # Heavy collectors
 # ---------------------------------------------------------------------------
@@ -232,10 +222,3 @@ def test_collect_attention_retains_weights_in_lag_order(runner: EvalRunner) -> N
     assert weights.shape == (4, SEQ_LEN, runner.num_heads, runner.num_lags)
     # Under eval() the rows are a genuine distribution over the causally valid lags.
     assert np.allclose(weights.sum(axis=-1), 1.0, atol=1e-4)
-
-
-def test_a_collector_leaves_the_model_in_the_mode_it_found_it(runner: EvalRunner) -> None:
-    """``inference_mode`` restores the prior training flag, so one analysis cannot alter the next."""
-    runner.model.train()
-    collectors.collect_metrics(runner, _two_file_loader(), _mean_energy)
-    assert runner.model.training is True

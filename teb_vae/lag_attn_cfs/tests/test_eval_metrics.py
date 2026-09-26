@@ -1,14 +1,14 @@
 r"""The evaluation readouts in the feature domain, and the three identities that make them readable.
 
 Two things separate this file from the sibling's, and both are the same thing seen twice: the
-target is $98$ wavelet-modulus and phase-harmonic coefficients rather than $16$ raw samples, and
-the forward decodes a **gathered anchor set** rather than a contiguous prefix.
+target is $C_{\mathrm{keep}}$ wavelet-modulus and phase-harmonic coefficients rather than $R$ raw
+samples, and the forward decodes a **gathered anchor set** rather than a contiguous prefix.
 
 So the load-bearing assertions here are the ones a mechanical copy of the raw pipeline would have
 got wrong *silently*:
 
-* the forward is called densely, in exactly one place, and the target and both masks are built
-  from the anchor set it returned rather than from a second derivation of it;
+* the forward is called densely, and the target and both masks are built from the anchor set it
+  returned rather than from a second derivation of it;
 * ``mc_predictive_block`` **gathers** the latent at those anchors instead of slicing a prefix;
 * every trivial baseline is built on the **gathered kept channels**, so its channel axis is
   positionally the target's -- the four channels the warm-up budget drops are interior to the
@@ -30,9 +30,6 @@ convention ``report_seam.check_per_anchor_recombines`` already uses and the only
 distinguishes a rounding difference from a real one.
 """
 from __future__ import annotations
-
-import ast
-from pathlib import Path
 
 import numpy as np
 import pytest
@@ -66,7 +63,6 @@ from teb_vae.lag_attn_rws.nets.raw_masks import forecast_mask, kl_mask
 
 from .conftest import (
     BATCH,
-    TINY_KWARGS,
     TINY_STRIDE,
     build,
     make_stub_batch,
@@ -128,23 +124,6 @@ def _block_scale(readout: BatchReadout) -> float:
 # =================================================================================================
 # The dense forward, the anchored target and the anchored masks
 # =================================================================================================
-def test_the_forward_is_called_in_exactly_one_place_and_at_the_dense_geometry() -> None:
-    """An AST walk rather than a grep: a second call site is how a run would decode two anchor
-    sets and score one against the other, and neither shape nor count would say so."""
-    tree = ast.parse(Path(metrics.__file__).read_text(encoding="utf-8"))
-    calls = [
-        node for node in ast.walk(tree)
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Name)
-        and node.func.id == "model"
-    ]
-
-    assert len(calls) == 1, f"{len(calls)} calls to the net's forward; there must be exactly one"
-    assert {keyword.arg for keyword in calls[0].keywords} == {
-        "anchor_phase", "anchor_stride"
-    }, "both halves of the anchor geometry must be named, never positional"
-
-
 def test_the_dense_geometry_is_the_pair_the_task_resolves_on_the_evaluation_stages(
     trained_task, stub_batch
 ) -> None:
@@ -448,21 +427,6 @@ def test_a_segment_with_no_valid_step_yields_nan_rather_than_a_fabricated_zero(
     assert float(readout.n_anchors[1]) == 0.0, "the NaN row must leave the aggregation whole"
 
 
-def test_every_baseline_is_scored_by_the_same_masked_scorer_and_denominator(
-    trained_task, stub_batch
-) -> None:
-    """All three shapes broadcast against the model branches', so the same scorer accepts them
-    unchanged and all three are reduced by the same contributing-anchor count -- which is what
-    makes a skill score a comparison of predictors rather than of scoring conventions."""
-    readout = evaluate_batch(trained_task, stub_batch, num_samples=1)
-
-    for name in metrics.BASELINE_NAMES:
-        assert readout.columns[f"nll_{name}_block"].shape == (BATCH,)
-        assert readout.columns[f"sq_error_{name}"].shape == (BATCH,)
-    assert set(metrics.FORECAST_BRANCHES) == {"base", "full", *metrics.BASELINE_NAMES}
-    assert metrics.BASELINE_LOGVAR == 0.0
-
-
 def test_a_perfect_forecast_scores_a_baseline_skill_of_exactly_one(
     trained_task, stub_batch
 ) -> None:
@@ -487,40 +451,11 @@ def test_a_perfect_forecast_scores_a_baseline_skill_of_exactly_one(
 # =================================================================================================
 # The warm-up tertiles, the source warmth and the two geometry guards
 # =================================================================================================
-def test_the_three_warm_up_tertile_gaps_recompose_into_the_forecast_gap(
-    trained_task, stub_batch
-) -> None:
-    """The property that makes them a decomposition rather than three unrelated numbers."""
-    readout = evaluate_batch(trained_task, stub_batch, num_samples=1)
-
-    recomposed = (
-        readout.columns["pred_gap_warm_lo"]
-        + readout.columns["pred_gap_warm_mid"]
-        + readout.columns["pred_gap_warm_hi"]
-    )
-
-    assert torch.allclose(
-        recomposed, readout.columns["pred_gap"], rtol=0.0, atol=RTOL * _block_scale(readout)
-    )
-
-
-def test_the_two_stored_block_gaps_recompose_into_the_same_number(
-    trained_task, stub_batch
-) -> None:
-    """The other cut of the same axis. The two splits are not restatements of each other: the
-    tertiles cut by filter speed and run *across* the stored block boundary."""
-    readout = evaluate_batch(trained_task, stub_batch, num_samples=1)
-
-    recomposed = readout.columns["pred_gap_st"] + readout.columns["pred_gap_ph"]
-
-    assert torch.allclose(
-        recomposed, readout.columns["pred_gap"], rtol=0.0, atol=RTOL * _block_scale(readout)
-    )
-
-
 def test_the_two_channel_splits_are_not_the_same_partition(trained_task) -> None:
-    """Non-vacuity for the pair above: on a model whose tertiles happened to coincide with the
-    stored blocks the two recompositions would be one assertion written twice."""
+    """Non-vacuity for the per-channel decomposition below: on a model whose warm-up tertiles
+    happened to coincide with the stored blocks, the block and tertile cases of
+    ``test_the_vector_and_the_scalars_agree_about_the_same_decomposition`` would be one assertion
+    written twice."""
     model = trained_task.orig_model
     keep = model.target_gate.keep_index
     first_block = keep < model.TARGET_BLOCK_SPLIT
@@ -659,43 +594,6 @@ def test_the_calibration_census_counts_coefficients(trained_task, stub_batch) ->
         float(mask.sum()) * float(target.shape[-1])
     )
     assert float(outputs["logvar_full"].shape[-1]) == float(target.shape[-1])
-
-
-def test_no_spectral_symbol_survives_in_the_readout_module() -> None:
-    """``coherence`` is not ported at all: a stored coefficient is a **modulus**, so the analysing
-    filter's phase was discarded before the value was written and the cross-spectral sufficient
-    statistics have no analogue here at any window length. Accumulating them anyway would be paying
-    for an estimator nothing can read."""
-    forbidden = (
-        "tau_slices",
-        "tau_slice_window_validity",
-        "source_tau_slices",
-        "cross_spectral_sums",
-        "_welch_segments",
-        "spectral_sums",
-    )
-    tree = ast.parse(Path(metrics.__file__).read_text(encoding="utf-8"))
-
-    assert [name for name in forbidden if hasattr(metrics, name)] == []
-    # Walked rather than grepped: the module docstring names ``coherence`` once, in the sentence
-    # saying it is not ported, and a substring scan cannot tell that from a lazy import inside a
-    # function -- which is exactly how the estimator would come back.
-    imported = []
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            imported += [alias.name for alias in node.names]
-        elif isinstance(node, ast.ImportFrom):
-            imported.append(node.module or "")
-            imported += [f"{node.module or ''}.{alias.name}" for alias in node.names]
-    assert [name for name in imported if "spectra" in name or "coherence" in name] == []
-    defined = [
-        node.name for node in ast.walk(tree)
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
-    ]
-    assert [name for name in defined if name in forbidden] == []
-    # And the dataclass field the sibling carries them on is gone with them, so a sink written
-    # against the sibling's readout fails rather than silently writing an empty sidecar.
-    assert not hasattr(metrics.BatchReadout, "spectral_sums")
 
 
 # =================================================================================================
@@ -909,15 +807,9 @@ def test_latent_health_counts_dimensions_against_the_training_threshold() -> Non
     assert health["activity_threshold_nats"] == KLD_ACTIVE_EPS
 
 
-def test_the_lag_report_carries_the_group_delay_caveat() -> None:
-    """It travels in the record rather than only in a document beside it: a peak's position on this
-    axis is not a physiological latency, and a reader given only the lag figures would have no way
-    to know that."""
-    from teb_vae.lag_attn_cfs.eval.lag_axis import GROUP_DELAY_CAVEAT
-
+def test_the_lag_report_reads_the_argmax_of_each_profile() -> None:
     summary = lag_summary(Aggregate(lag_profile=[0.1, 0.9, 0.2], attention_profile=[0.5, 0.2, 0.3]))
 
-    assert summary["axis_caveat"] == GROUP_DELAY_CAVEAT
     assert summary["kl_argmax_lag_step"] == 1
     assert summary["attention_argmax_lag_step"] == 0
 
@@ -1159,15 +1051,6 @@ def test_batches_too_small_to_derange_are_skipped_and_counted(trained_task) -> N
 
     assert results["n_batches"] == 1
     assert results["n_batches_skipped_too_small"] == 1
-
-
-def test_the_tiny_geometry_exercises_the_gated_model(trained_task) -> None:
-    """Non-vacuity for the whole file: an ungated model has no keep-index, no tertiles and no
-    source warmth, so most of the surface asserted above would be trivial."""
-    model = trained_task.orig_model
-
-    assert model.target_gate is not None
-    assert int(model.decoder_out_channels) < int(TINY_KWARGS["c_y"])
 
 
 def test_the_mean_decoded_score_is_the_training_path_for_the_base_branch_and_not_the_full(

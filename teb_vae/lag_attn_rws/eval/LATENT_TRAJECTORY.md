@@ -3,9 +3,8 @@
 How to summarise, project, draw and *test* the path a recording's latent state takes from the
 start of monitoring to delivery — and how to split that path at the second-stage onset.
 
-This is a design note, not a contract. `EVAL.md` and `FIGURE_GUIDE.md` are bound to the code by
-test; this document is bound to nothing yet, and it exists to be argued with before any of it is
-built. Everything below is stated against the shipped geometry: $T = 300$, $T_{\mathrm{valid}} =
+This is a design note, not a contract: it exists to be argued with before any of it is built.
+Everything below is stated against the shipped geometry: $T = 300$, $T_{\mathrm{valid}} =
 270$, $w = 30$, $H = 30$, $L = 91$, $\Delta = 4$ s, $d_z = 48$, $M = 4$ heads of $g = 12$
 coordinates.
 
@@ -999,15 +998,13 @@ And two pipeline-wide ones that a new analysis re-encounters: read any CSV it wr
 Registering `latent_trajectory` is more than a module. From the current bindings:
 
 1. `eval/analyses/latent_trajectory.py` — the module itself, layer 2.
-2. `eval/run.py` — the registry entry, **and** the launch-table comment block, which
-   `test_eval_docs.py` asserts lists every selectable analysis and only those.
-3. `eval/EVAL.md` — a `### latent_trajectory` heading, by exact slug equality, asserted by test.
-4. `eval/FIGURE_GUIDE.md` — one entry per emitted PDF, asserted by test.
-5. `eval/figure_manifest.json` — the committed manifest, kept equal to a real run's figures.
-6. `tests/test_eval_figures.py` — the second, hand-kept figure table (`("trajectory",
-   ("PROFILE_FIGURE",))` is the pattern).
-7. `tests/test_eval_latent_trajectory.py` — the analysis's own tests.
-8. **The transformer sibling.** `teb_vae/lag_attn_transformer_rws/eval` runs this same registry
+2. `eval/run.py` — the registry entry, **and** the launch-table comment block, which lists every
+   selectable analysis and only those.
+3. `eval/EVAL.md` — a `### latent_trajectory` heading, by exact slug equality.
+4. `eval/FIGURE_GUIDE.md` — one entry per emitted PDF.
+5. `eval/figure_manifest.json` — the committed manifest of a real run's figures.
+6. `tests/test_eval_latent_trajectory.py` — the analysis's own tests.
+7. **The transformer sibling.** `teb_vae/lag_attn_transformer_rws/eval` runs this same registry
    through this same runner, so it carries its own `FIGURE_GUIDE.md` and `figure_manifest.json`
    that must gain the same entries. Missing this is how the two packages' summaries quietly stop
    meaning the same thing — the exact failure the `ModelBinding` seam exists to prevent.

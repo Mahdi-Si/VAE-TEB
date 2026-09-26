@@ -7,6 +7,7 @@ server. DDP rank behaviour is checked with the ``is_global_zero`` flag on ``Fake
 import contextlib
 
 import mlflow
+import pytest
 import mlflow.pytorch
 import mlflow.system_metrics.system_metrics_monitor as smm
 
@@ -203,14 +204,20 @@ def test_callback_on_fit_end_error_is_swallowed(monkeypatch):
     cb.on_fit_end(FakeTrainer(is_global_zero=True), TinyLightningModel(compile_model=False))  # no raise
 
 
-def test_build_trainer_attaches_callback_when_tracking_enabled(config_path, monkeypatch):
+@pytest.mark.parametrize("log_model", [True, False])
+def test_build_trainer_attaches_callback_when_tracking_enabled(config_path, monkeypatch, log_model):
+    """Only when a logger exists, which is the condition a model built before ``setup_config``
+    breaks; and the config's ``log_model`` must reach it -- dropped, it defaults to ``False`` and
+    the run silently registers nothing."""
     import torch
 
     monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
-    gm = make_graph_model(config_path)
+    gm = make_graph_model(config_path, **{"advanced_config.tracking.mlflow.log_model": log_model})
     gm.mlflow_logger = FakeMLflowLogger()
     kw = gm._build_trainer_kwargs([])
-    assert any(isinstance(cb, MLflowRunLoggingCallback) for cb in kw["callbacks"])
+    run_logging = [cb for cb in kw["callbacks"] if isinstance(cb, MLflowRunLoggingCallback)]
+    assert len(run_logging) == 1
+    assert run_logging[0]._log_model is log_model
 
 
 def test_build_trainer_no_callback_when_tracking_disabled(config_path, monkeypatch):

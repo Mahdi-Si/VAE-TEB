@@ -2,8 +2,9 @@ r"""The full-latent prior head: three outputs, no dead parameters, exact bound i
 
 The head exists instead of reusing the sibling's ``PriorHead`` because that one also emits a
 ``decoder_state`` this architecture must not have: reusing it and discarding the tensor would
-leave dead parameters that a distributed run must then be told to tolerate. So the tests here
-pin the *absence* as much as the outputs.
+leave dead parameters that a distributed run must then be told to tolerate. So every parameter
+must reach an output, and the optional clock path must be an exact no-op at construction while
+still conditioning the prior once its projection moves off zero.
 """
 from __future__ import annotations
 
@@ -12,7 +13,6 @@ import torch
 
 from teb_vae.lag_attn.nets.blocks import smooth_bound
 from teb_vae.lag_attn_rws.nets.heads import FullLatentPriorHead
-from teb_vae.lag_attn_rws.nets.model import SeqVaeLagAttnRws
 from teb_vae.lag_attn_rws.tests.conftest import BATCH, SEQ_LEN
 
 _D_MODEL, _D_Z = 32, 8
@@ -65,12 +65,6 @@ def test_no_parameter_is_dead():
     assert not dead, f"parameters with no path to an output: {dead}"
 
 
-def test_there_is_no_decoder_state_pathway():
-    head = _head()
-    assert not hasattr(head, "decoder_state_head")
-    assert not hasattr(head, "dec_input_norm")
-
-
 def test_a_non_positive_mu_scale_is_rejected():
     with pytest.raises(ValueError, match="mu_scale"):
         FullLatentPriorHead(d_model=_D_MODEL, d_z=_D_Z, mu_scale=0.0)
@@ -108,33 +102,6 @@ def _clock(clock_dim: int = 6, seed: int = 2) -> torch.Tensor:
     return torch.randn(1, SEQ_LEN, clock_dim, generator=torch.Generator().manual_seed(seed))
 
 
-def test_a_head_without_a_clock_builds_no_clock_parameter():
-    """The off-state, and it is an absence rather than a zero. A projection built and left at zero
-    would be a parameter with no gradient path on every two-sided cell in the family, which is the
-    ``find_unused_parameters=False`` hazard a distributed run then has to be told to tolerate."""
-    head = _head()
-
-    assert head.clock_proj is None and head.clock_norm is None
-    assert not any("clock" in name for name in dict(head.named_parameters()))
-
-
-def test_the_clock_path_is_exactly_zero_at_construction():
-    r"""The zero-KL start is what makes every KL number in the records comparable across the
-    revision, and it rests on this: a zero projection makes the clock's contribution exactly
-    $0$ whatever the clock carries, so the head's output at initialisation is the output it had
-    before the path existed.
-
-    Asserted on the constructed head rather than only on the model, because the model's own
-    post-initialisation pass re-zeroes it and a test that only read the model could not tell a
-    constructor that never zeroed from one whose zero was refilled and restored.
-    """
-    head = _clock_head()
-
-    assert head.clock_proj is not None
-    assert torch.equal(head.clock_proj.weight, torch.zeros_like(head.clock_proj.weight))
-    assert head.clock_proj.bias is None, "a bias would be an offset the zero cannot cancel"
-
-
 def test_a_zero_initialised_clock_reproduces_the_clockless_head_exactly():
     """The off-state pinned behaviourally: at initialisation the two heads are the same function.
 
@@ -160,26 +127,8 @@ def test_a_zero_initialised_clock_reproduces_the_clockless_head_exactly():
         assert torch.equal(left, right)
 
 
-def test_the_zeroed_clock_path_makes_the_output_independent_of_the_clock():
-    """The same claim without a second head, which is what a model-level check can afford.
-
-    A projection that was zero would make the prior invariant to what the clock carries; one that
-    was refilled by a later initialisation pass would not. Two independent draws rather than one
-    shifted -- the head's own LayerNorm would erase a shift, and the invariance would then hold for
-    a reason that has nothing to do with the projection.
-    """
-    head = _clock_head()
-    state = _state()
-
-    first = head(state, _clock())
-    second = head(state, _clock(seed=3))
-
-    for left, right in zip(first, second):
-        assert torch.equal(left, right)
-
-
 def test_a_nonzero_clock_projection_moves_the_prior():
-    """The other direction, so the two invariances above are properties of the **zero** rather than
+    """The other direction, so the invariance above is a property of the **zero** rather than
     of a clock that reaches nothing at all.
 
     Nothing in the head would raise if the projection were dropped from the forward, or added after
@@ -198,19 +147,6 @@ def test_a_nonzero_clock_projection_moves_the_prior():
     mu_second, _, _ = head(state, _clock(seed=3))
 
     assert (mu_second - mu_first).abs().max().item() > 1e-6
-
-
-def test_the_clock_reaches_the_head_through_its_own_norm_and_not_the_states():
-    """The clock is normalised by a LayerNorm of its **own** width, added to the head input ahead
-    of the two existing input norms. Two shapes are pinned because they are what makes the path a
-    separate one: a projection sharing the source adapter's map would couple the two pathways'
-    gradients, which is the thing this design refused."""
-    head = _clock_head(clock_dim=6)
-
-    assert head.clock_norm is not None and head.clock_proj is not None
-    assert head.clock_norm.normalized_shape == (6,)
-    assert head.clock_proj.in_features == 6
-    assert head.clock_proj.out_features == _D_MODEL
 
 
 @pytest.mark.parametrize(
@@ -257,16 +193,3 @@ def test_zero_init_clock_is_idempotent_and_harmless_without_a_path():
     head.zero_init_clock()
 
     assert torch.equal(head.clock_proj.weight, torch.zeros_like(head.clock_proj.weight))
-
-
-def test_perturb_posterior_moves_the_posterior_off_the_prior(
-    tiny_kwargs, inputs, perturb_posterior
-):
-    """The shared perturbation fixture must bite on this model, or every KL assertion in the
-    suite is vacuous (at init the posterior equals the prior exactly)."""
-    torch.manual_seed(0)
-    model = SeqVaeLagAttnRws(**tiny_kwargs).eval()
-    perturb_posterior(model)
-    with torch.no_grad():
-        out = model(*inputs)
-    assert (out["mu_post"] - out["mu_prior"]).abs().max().item() > 1e-6

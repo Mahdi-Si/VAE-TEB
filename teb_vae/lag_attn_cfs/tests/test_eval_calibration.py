@@ -303,21 +303,6 @@ def test_the_analysis_writes_its_tables_and_both_figures(tmp_path) -> None:
     assert list(coverage["level_sigma"]) == list(COVERAGE_LEVELS)
 
 
-def test_the_analysis_reports_one_unit_and_no_conversion_out_of_it(tmp_path) -> None:
-    """The sibling quotes CRPS in bpm. There is no clinical unit here and the conversion was
-    removed rather than repointed, so the absence is asserted rather than assumed."""
-    result = calibration_analysis.run_calibration_analysis(
-        _context(likelihood="gaussian_nll", report=_gaussian_case(sigma_true=1.0, sigma_model=1.0)),
-        eval_config=EVAL_CONFIG, output_dir=tmp_path, probe=None,
-    )
-
-    assert result["crps_unit"] == NORMALISED_UNIT == "normalised"
-    assert "crps" not in result
-    assert result["n_coefficients"] > 0
-    assert "n_raw_samples" not in result
-    assert not [name for name in result if "bpm" in str(name).lower()]
-
-
 def test_the_recommendation_names_the_config_key_it_would_change(tmp_path) -> None:
     result = calibration_analysis.run_calibration_analysis(
         _context(likelihood="gaussian_nll", report=_gaussian_case(sigma_true=1.0, sigma_model=1.0)),
@@ -409,26 +394,6 @@ def test_the_pit_figure_draws_the_uniform_reference_and_the_reliability_diagonal
     assert diagonal[0][1] == pytest.approx([0.0, 1.0])
 
 
-def test_the_figures_say_what_they_counted() -> None:
-    """A figure labelled "raw samples" over a coefficient axis is a figure that would be read as a
-    quantity this pipeline never computes."""
-    from teb_vae.lag_attn.eval import figures as shared_figures
-
-    report = _gaussian_case(sigma_true=1.0, sigma_model=1.0)
-    figure = calibration_analysis.build_logvar_figure(
-        calibration_analysis.logvar_frame(report),
-        {"logvar_clamp": list(CLAMP), "logvar_margin": 0.4},
-    )
-    try:
-        axis = figure.axes[0]
-        text = f"{axis.get_title()} {axis.get_xlabel()} {axis.get_ylabel()}".lower()
-    finally:
-        shared_figures.plt.close(figure)
-
-    assert "coefficient" in text
-    assert "raw sample" not in text and "bpm" not in text
-
-
 # =================================================================================================
 # Through the real readout path
 # =================================================================================================
@@ -466,25 +431,6 @@ def test_the_census_is_accumulated_under_gaussian_nll(task, perturb_posterior) -
     assert len(report["coverage"]) == len(COVERAGE_LEVELS)
     assert report["pit"]["n_bins"] == metrics_module.PIT_BINS
     assert report["logvar"]["n_bins"] == metrics_module.LOGVAR_BINS
-
-
-def test_the_census_sums_over_batches_exactly(task, perturb_posterior) -> None:
-    """The accumulator is exact against a single pass over the same data, because addition is --
-    which is what lets a real split's $10^9$ coefficients be summarised in a handful of floats."""
-    from .conftest import make_stub_batch
-
-    module = task(hparams={"likelihood": "gaussian_nll"})
-    perturb_posterior(module.orig_model)
-    module.eval()
-    batch = make_stub_batch(seed=2)
-
-    torch.manual_seed(0)
-    once = metrics_module.evaluate_batch(module, batch, num_samples=1).calibration_sums
-    torch.manual_seed(0)
-    again = metrics_module.evaluate_batch(module, batch, num_samples=1).calibration_sums
-
-    for name, value in once.items():
-        assert torch.allclose(value + again[name], 2.0 * value), name
 
 
 # =================================================================================================

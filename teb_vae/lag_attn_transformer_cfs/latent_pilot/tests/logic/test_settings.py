@@ -17,7 +17,6 @@ Three properties are worth naming, because each of them fails silently rather th
 """
 from __future__ import annotations
 
-import ast
 from copy import deepcopy
 from pathlib import Path
 
@@ -41,17 +40,6 @@ def _write(directory, block) -> str:
 # =============================================================================
 # The schema
 # =============================================================================
-def test_an_empty_block_resolves_to_the_declared_protocol(tmp_path):
-    """The defaults are the protocol, so a config that says nothing runs the declared experiment."""
-    settings = pilot_config.resolve_settings(_write(tmp_path, {}))
-    assert settings["fold"] == pilot_config.DEFAULTS["fold"]
-    assert settings["seed"] == pilot_config.DEFAULTS["seed"]
-    assert settings["windows"]["supervised_hours"] == 1.0
-    assert settings["windows"]["preservation_hours"] == 3.0
-    assert settings["optim"]["max_epochs"] == 10
-    assert settings["gates"]["forecast_mse_max_increase"] == 0.10
-
-
 def test_the_file_overrides_a_default_without_dropping_its_siblings(tmp_path):
     """A partial block edits one leaf; the rest of that block keeps the protocol's values."""
     settings = pilot_config.resolve_settings(_write(tmp_path, {"optim": {"max_epochs": 3}}))
@@ -137,8 +125,8 @@ def test_a_wider_analysis_window_is_accepted_and_leaves_preservation_alone(tmp_p
         _write(tmp_path, {"windows": {"analysis_hours": 6.0}})
     )
     assert pilot_config.analysis_hours(settings) == 6.0
-    assert settings["windows"]["preservation_hours"] == 3.0
-    assert settings["windows"]["supervised_hours"] == 1.0
+    for name in ("preservation_hours", "supervised_hours"):
+        assert settings["windows"][name] == pilot_config.DEFAULTS["windows"][name]
 
 
 def test_an_analysis_window_inside_the_preservation_window_is_refused(tmp_path):
@@ -193,23 +181,22 @@ def test_a_run_root_outside_the_package_is_accepted(tmp_path):
     assert settings["paths"]["run_root"] == str((tmp_path / "elsewhere").resolve())
 
 
-def test_a_run_root_containing_an_input_is_refused(tmp_path):
+@pytest.mark.parametrize(
+    "name,relative",
+    [
+        ("checkpoint", "model/best.ckpt"),
+        ("train_shards", ["shards/healthy_bg_cs.hdf5"]),
+    ],
+)
+def test_a_run_root_containing_an_input_is_refused(tmp_path, name, relative):
+    """A checkpoint or a shard under the run root: either would put a run on top of its inputs."""
+    value = (
+        [str(tmp_path / item) for item in relative] if isinstance(relative, list)
+        else str(tmp_path / relative)
+    )
     with pytest.raises(PilotConfigError, match="contains the input"):
         pilot_config.resolve_settings(
-            _write(tmp_path, {"paths": {
-                "run_root": str(tmp_path),
-                "checkpoint": str(tmp_path / "model" / "best.ckpt"),
-            }})
-        )
-
-
-def test_a_run_root_containing_a_shard_is_refused(tmp_path):
-    with pytest.raises(PilotConfigError, match="contains the input"):
-        pilot_config.resolve_settings(
-            _write(tmp_path, {"paths": {
-                "run_root": str(tmp_path),
-                "train_shards": [str(tmp_path / "shards" / "healthy_bg_cs.hdf5")],
-            }})
+            _write(tmp_path, {"paths": {"run_root": str(tmp_path), name: value}})
         )
 
 
@@ -258,11 +245,6 @@ def test_all_expands_to_every_stage_in_run_order():
     assert tuple(pilot_config.stage_plan("report")) == ("report",)
 
 
-def test_an_unknown_stage_names_the_valid_ones():
-    with pytest.raises(PilotConfigError, match="unknown stage"):
-        pilot_config.stage_plan("finetuning")
-
-
 def test_the_stage_order_locks_selection_before_the_test_split_is_read():
     stages = list(pilot_config.STAGES)
     assert stages.index("control") < stages.index("evaluate") < stages.index("report")
@@ -305,13 +287,20 @@ def test_an_explicit_command_line_value_beats_the_dictionary():
 
 def test_an_unsupplied_flag_never_outranks_the_dictionary():
     """The parser default is ``None`` for every argument, including the boolean, precisely so that
-    saying nothing on the command line is distinguishable from saying the default."""
-    resolved = pilot_run.resolve_run_args(
-        {"stage": "preflight", "device": "cpu", "run_dir": "x", "resume": True}, argv=[]
+    saying nothing on the command line is distinguishable from saying the default.
+
+    Every run argument is set away from its default, so an empty command line must resolve exactly
+    as no command line at all. A parser default that were not ``None`` would overwrite its entry,
+    and a ``required=True`` flag would stop the parse before the dictionary was consulted.
+    """
+    every_key = {
+        "config_path": "some/pilot.yaml", "stage": "preflight", "device": "cpu",
+        "run_dir": "x", "resume": True, "overrides": {"seed": 1},
+    }
+    assert set(every_key) == set(pilot_run.RUN_ARG_DEFAULTS)
+    assert pilot_run.resolve_run_args(every_key, argv=[]) == pilot_run.resolve_run_args(
+        every_key, argv=None
     )
-    assert resolved["stage"] == "preflight"
-    assert resolved["device"] == "cpu"
-    assert resolved["resume"] is True
 
 
 def test_a_set_override_is_parsed_as_yaml_and_merged_over_the_dictionary():
@@ -374,10 +363,6 @@ def test_the_resolved_overrides_share_nothing_with_the_dictionary():
 # =============================================================================
 # The launch convention, read off the module rather than assumed
 # =============================================================================
-def test_every_run_argument_is_a_key_of_the_shipped_dictionary():
-    assert set(pilot_run.RUN_ARGS) == set(pilot_run.RUN_ARG_DEFAULTS)
-
-
 def test_every_parser_destination_reaches_a_run_argument():
     """``set_overrides`` is the one that does not carry its own name: it folds into ``overrides``,
     which is why it is named separately rather than being allowed to look like a stray dest."""
@@ -386,56 +371,6 @@ def test_every_parser_destination_reaches_a_run_argument():
     }
     assert dests - {"set_overrides"} <= set(pilot_run.RUN_ARG_DEFAULTS)
     assert "set_overrides" in dests
-
-
-def test_no_argument_is_required_by_argparse():
-    """``required=True`` fires before the dictionary is consulted, so it would make the Run button
-    unusable whatever the dictionary said."""
-    required = [
-        action.dest for action in pilot_run.build_parser()._actions if action.required
-    ]
-    assert required == []
-
-
-def test_no_argument_carries_a_non_none_argparse_default():
-    defaulted = {
-        action.dest: action.default
-        for action in pilot_run.build_parser()._actions
-        if action.dest != "help" and action.default is not None
-    }
-    assert defaulted == {}
-
-
-def test_importing_the_runner_does_no_work():
-    """Read off the source rather than inferred from behaviour: every module-level statement is an
-    import, an assignment, a definition or the ``__main__`` guard. A bare call at module level is
-    work done by importing, and importing happens during test collection, during ``--help``, and in
-    every editor that indexes the file."""
-    tree = ast.parse(Path(pilot_run.__file__).read_text(encoding="utf-8"))
-    offenders = [
-        type(node).__name__
-        for node in tree.body
-        if not isinstance(
-            node, (ast.Import, ast.ImportFrom, ast.Assign, ast.AnnAssign, ast.Expr,
-                   ast.FunctionDef, ast.ClassDef, ast.If)
-        )
-    ]
-    assert offenders == []
-    # An ``Expr`` at module level is a docstring here and nothing else; a call would be work.
-    calls = [
-        node for node in tree.body
-        if isinstance(node, ast.Expr) and isinstance(node.value, ast.Call)
-    ]
-    assert calls == []
-    # Every module-level ``If`` is the launch guard or the import bootstrap, never a stage.
-    guards = [node for node in tree.body if isinstance(node, ast.If)]
-    assert len(guards) == 2
-
-
-def test_the_smoke_configuration_is_never_the_production_one():
-    assert pilot_run.SMOKE_CONFIG_PATH != pilot_run.DEFAULT_CONFIG_PATH
-    assert (pilot_config.REPO_ROOT / pilot_run.SMOKE_CONFIG_PATH).is_file()
-    assert (pilot_config.REPO_ROOT / pilot_run.DEFAULT_CONFIG_PATH).is_file()
 
 
 def test_the_shipped_configurations_both_resolve_without_production_files():

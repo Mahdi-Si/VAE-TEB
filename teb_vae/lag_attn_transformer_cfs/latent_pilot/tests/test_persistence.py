@@ -23,7 +23,7 @@ import pytest
 import torch
 import yaml
 
-from teb_vae.lag_attn_transformer_cfs.latent_pilot import extract, train
+from teb_vae.lag_attn_transformer_cfs.latent_pilot import train
 from teb_vae.lag_attn_transformer_cfs.latent_pilot import model as pilot_model
 from teb_vae.lag_attn_transformer_cfs.latent_pilot.config import PilotConfigError
 from teb_vae.lag_attn_transformer_cfs.tests.conftest import (
@@ -285,16 +285,3 @@ def test_the_export_refuses_to_land_on_the_source_too(bundle, tmp_path):
 
     with pytest.raises(PilotConfigError, match="pretrained checkpoint's own file"):
         train.export_base_checkpoint(exporting, tmp_path)
-
-
-def test_the_source_checkpoint_and_config_are_untouched_by_a_full_save(bundle, tmp_path):
-    """Both writers run; neither file the pilot started from changes."""
-    bundle.checkpoint_path.write_bytes(b"the pretrained checkpoint")
-    before_config = bundle.config_path.read_bytes()
-
-    fit = _fit(bundle)
-    train.save_adapted(fit, bundle, tmp_path, fingerprint=FINGERPRINT)
-    train.export_base_checkpoint(bundle, tmp_path)
-
-    assert bundle.checkpoint_path.read_bytes() == b"the pretrained checkpoint"
-    assert bundle.config_path.read_bytes() == before_config

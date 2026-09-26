@@ -52,51 +52,39 @@ def test_the_forward_returns_exactly_the_documented_key_set(tiny_kwargs, inputs)
     assert "delta_mu_src" not in out
 
 
-def test_the_latent_and_state_shapes(tiny_kwargs, inputs):
-    model, out = _forward(tiny_kwargs, inputs)
-    for key in ("mu_prior", "logvar_prior", "raw_logvar_prior", "mu_post", "logvar_post",
-                "z_prior", "z_post"):
-        assert out[key].shape == (BATCH, SEQ_LEN, model.d_z), key
-    for key in ("target_state", "source_state"):
-        assert out[key].shape == (BATCH, SEQ_LEN, model.d_model), key
-
-
-def test_the_attention_shapes(tiny_kwargs, inputs):
+def test_every_output_has_its_contract_shape(tiny_kwargs, inputs):
+    """Latents and states per step, attention and KL readouts per lag, and the decode over the
+    valid anchor range only: $(B, T - H, H, R)$, not $(B, T, H, R)$ -- the tail anchors are never
+    decoded."""
     model, out = _forward(tiny_kwargs, inputs)
     num_lags = model.max_lag + 1
-    assert out["attn_weights"].shape == (BATCH, SEQ_LEN, model.num_heads, num_lags)
-    assert out["attended_source_heads"].shape == (BATCH, SEQ_LEN, model.num_heads, 8)
-
-
-def test_the_kl_readout_shapes(tiny_kwargs, inputs):
-    model, out = _forward(tiny_kwargs, inputs)
-    num_lags = model.max_lag + 1
-    assert out["kld_per_t"].shape == (BATCH, SEQ_LEN)
-    assert out["kld_per_t_per_head"].shape == (BATCH, SEQ_LEN, model.num_heads)
-    assert out["source_kl_lag_map"].shape == (BATCH, SEQ_LEN, num_lags)
-
-
-def test_decoding_covers_the_valid_anchor_range_only(tiny_kwargs, inputs):
-    """(B, T - H, H, R), not (B, T, H, R): the tail anchors are never decoded."""
-    model, out = _forward(tiny_kwargs, inputs)
-    expected = (BATCH, model.geometry.t_valid, model.horizon, model.raw_per_step)
-    assert expected[1] == SEQ_LEN - model.horizon
-    for key in ("mu_base", "logvar_base", "mu_full", "logvar_full"):
-        assert out[key].shape == expected, key
-
-
-def test_one_epsilon_serves_both_latents_when_the_residual_is_zero(tiny_kwargs, inputs):
-    """At init q == p, so the shared draw makes the samples bitwise equal."""
-    _, out = _forward(tiny_kwargs, inputs)
-    assert torch.equal(out["z_prior"], out["z_post"])
+    decoded = (BATCH, model.geometry.t_valid, model.horizon, model.raw_per_step)
+    assert decoded[1] == SEQ_LEN - model.horizon
+    expected = {
+        **{
+            key: (BATCH, SEQ_LEN, model.d_z)
+            for key in ("mu_prior", "logvar_prior", "raw_logvar_prior", "mu_post",
+                        "logvar_post", "z_prior", "z_post")
+        },
+        "target_state": (BATCH, SEQ_LEN, model.d_model),
+        "source_state": (BATCH, SEQ_LEN, model.d_model),
+        "attn_weights": (BATCH, SEQ_LEN, model.num_heads, num_lags),
+        "attended_source_heads": (BATCH, SEQ_LEN, model.num_heads, tiny_kwargs["d_head"]),
+        "kld_per_t": (BATCH, SEQ_LEN),
+        "kld_per_t_per_head": (BATCH, SEQ_LEN, model.num_heads),
+        "source_kl_lag_map": (BATCH, SEQ_LEN, num_lags),
+        **{key: decoded for key in ("mu_base", "logvar_base", "mu_full", "logvar_full")},
+    }
+    for key, shape in expected.items():
+        assert out[key].shape == shape, key
 
 
 def test_one_epsilon_serves_both_latents_when_the_distributions_differ(
     tiny_kwargs, inputs, perturb_posterior
 ):
-    """The stronger claim: even off-init, both samples recover the *same* epsilon. Two
-    independent draws would pass the at-init test above and still corrupt every base-minus-full
-    readout with sampling noise."""
+    """Off-init, both samples recover the *same* epsilon (the at-init equality is pinned in
+    ``test_zero_kl_init.py``). Two independent draws would corrupt every base-minus-full readout
+    with sampling noise."""
     _, out = _forward(tiny_kwargs, inputs, perturb=perturb_posterior)
     assert not torch.equal(out["mu_post"], out["mu_prior"])  # genuinely off-init
 

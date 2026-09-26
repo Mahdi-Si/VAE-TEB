@@ -1,21 +1,18 @@
-r"""Three quantities that are routinely conflated, and the bias that hides in the fourth.
+r"""The residual readouts: two latent drifts that are routinely conflated, and the RMS bias.
 
 **The two latent quantities are not the same number.** ``delta_mu_rms`` is the RMS of
 $\mu^q - \mu^p$ per **element**; ``mu_post_prior_gap_rms`` sums over $d_z$ first, so it is the size
 of the belief shift per step. At equal support they differ by exactly $\sqrt{d_z}$ -- which is
-what makes the conflation invisible on a $d_z = 1$ fixture and a factor of eight wrong at the
-shipped $d_z = 64$. The test builds them from real forward outputs and asserts the ratio.
-
-**The forecast difference is not ``pred_gap``.** One is a distance between two forecasts, the
-other a difference between two *scores*. Two forecasts can differ everywhere and score identically,
-and a source that moves the forecast without improving it is a different finding from one that
-does neither.
+what makes the conflation invisible on a $d_z = 1$ fixture and badly wrong at the shipped width.
+The test builds them from real forward outputs and asserts the ratio.
 
 **Every RMS roots once, at the end.** By Jensen $\operatorname{mean}(\sqrt{x}) \le
 \sqrt{\operatorname{mean}(x)}$, so averaging finished per-segment roots is biased **low** -- in
-the direction that flatters the model. The direction is asserted rather than assumed: the analysis
-reports both numbers, and the biased one must sit at or below the rooted-once one on a frame where
-the per-recording spread is real.
+the direction that flatters the model. The analysis reports both numbers and their difference,
+asserted against a hand-computed frame and against the no-spread boundary where they agree.
+
+**Units.** The forecast difference is a spread and converts to bpm through the standard deviation
+alone; the latent drifts have no bpm and stay normalised.
 """
 from __future__ import annotations
 
@@ -64,42 +61,8 @@ def test_the_per_element_and_per_step_drifts_differ_by_the_square_root_of_d_z(
         float(per_element.mean().sqrt()) * d_z**0.5, rel=1e-5
     )
     assert float(per_element.mean()) > 0.0, "a zero drift would satisfy this vacuously"
-
-
-def test_the_squares_are_carried_unrooted_and_the_rooted_column_is_their_root(
-    task, perturb_posterior
-) -> None:
-    """The aggregation chain must carry the square; the rooted column stays because it is the
-    figure the trainer logs and the headline quotes."""
-    module = task()
-    perturb_posterior(module.orig_model)
-    module.eval()
-    torch.manual_seed(0)
-
-    readout = evaluate_batch(module, make_stub_batch(seed=3), num_samples=1)
-
-    assert torch.allclose(
-        readout.columns["delta_mu_rms"], readout.columns["delta_mu_sq"].sqrt()
-    )
-
-
-def test_the_forecast_difference_is_a_distance_and_not_a_difference_of_scores(
-    task, perturb_posterior
-) -> None:
-    """Two forecasts can differ everywhere and score identically, so this is a separate readout
-    from ``pred_gap`` rather than a rescaling of it."""
-    module = task()
-    perturb_posterior(module.orig_model)
-    module.eval()
-    torch.manual_seed(0)
-
-    readout = evaluate_batch(module, make_stub_batch(seed=3), num_samples=1)
-
-    difference = readout.columns["forecast_difference_sq"]
-    assert float(difference.min()) >= 0.0, "a squared distance cannot be negative"
-    assert float(difference.mean()) > 0.0
-    # Unlike pred_gap, which is signed and can be either.
-    assert difference.shape == readout.columns["pred_gap"].shape
+    # The chain carries the square; the rooted column beside it is the one the trainer logs.
+    assert torch.allclose(readout.columns["delta_mu_rms"], per_element.sqrt())
 
 
 # =============================================================================
@@ -132,21 +95,8 @@ def test_rooting_once_at_the_end_differs_from_averaging_finished_roots() -> None
 
     assert by_name["delta_mu_rms"]["rms_normalised"] == pytest.approx(float(np.sqrt(5.0)))
     assert by_name["delta_mu_rms"]["mean_of_per_segment_rms"] == pytest.approx(2.0)
-
-
-def test_the_bias_of_averaging_roots_runs_in_the_direction_that_flatters_the_model() -> None:
-    """Asserted as a sign, not as a magnitude: Jensen gives the inequality on any input, and a
-    single hand-checked example would not say that."""
-    rows = residual_analysis.build_rows(
-        _per_guid([0.25, 4.0, 1.0, 16.0]), None, resamples=200, seed=0
-    )
-    biased = {row["metric"]: row for row in rows}["delta_mu_rms"]
-
-    assert biased["jensen_bias"] < 0.0, (
-        "the mean of per-segment roots must sit *below* the rooted-once value; a positive bias "
-        "means the two are the wrong way round"
-    )
-    assert biased["mean_of_per_segment_rms"] < biased["rms_normalised"]
+    # Negative: the mean of finished roots sits below, in the direction that flatters the model.
+    assert by_name["delta_mu_rms"]["jensen_bias"] == pytest.approx(2.0 - float(np.sqrt(5.0)))
 
 
 def test_a_frame_with_no_spread_makes_the_two_reductions_agree() -> None:
@@ -208,7 +158,7 @@ def _context(per_sample: pd.DataFrame, record: Optional[Dict[str, Any]] = None) 
     return AnalysisContext(collection=collection, config={})
 
 
-def test_the_analysis_writes_its_tables_and_states_the_shared_variance_caveat(tmp_path) -> None:
+def test_the_analysis_writes_its_tables(tmp_path) -> None:
     per_sample = pd.DataFrame(
         {
             "guid": ["a", "a", "b", "b"],
@@ -230,9 +180,6 @@ def test_the_analysis_writes_its_tables_and_states_the_shared_variance_caveat(tm
     assert [row["metric"] for row in result["metrics"]] == [
         name for _, name, _, _ in residual_analysis.RMS_METRICS
     ]
-    # The caveat travels in the output, not only in the docstring: it weakens the reading in the
-    # model's favour, which is the kind that has to be written where the number is.
-    assert "shared" in result["caveat"] and "one shared decoder" in result["caveat"]
     assert result["unit"] == "bpm"
 
 

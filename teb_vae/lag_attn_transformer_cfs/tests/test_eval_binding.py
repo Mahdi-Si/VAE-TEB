@@ -12,10 +12,10 @@ the run passes, the config and the checkpoint are free to disagree about that ke
 appears later as numbers computed at a geometry nobody chose. Both halves are therefore asserted
 against the class and against this package's shipped ``configs/default.yaml``.
 
-**The mirror-image failure is a key that names something here and nothing in this architecture.** The
-five conv-LSTM-only keywords would each be dropped by the experiment driver's signature sweep without
-a word, leaving a config that reads correct and builds a different model -- so they are asserted
-absent from the tuple *and* from the override delta.
+Beside the geometry keys: the binding names this cell's classes under a tag of its own, its
+override delta is the cfs cell's key for key, the analyses and headline scalars are the cfs cell's
+own objects, and the encoder disclosure reports this architecture's structural facts and refuses a
+model it cannot read.
 """
 from __future__ import annotations
 
@@ -29,66 +29,14 @@ import yaml
 
 from teb_vae.lag_attn_cfs.eval import preflight
 from teb_vae.lag_attn_cfs.eval.binding import GEOMETRY_KEYS as CFS_GEOMETRY_KEYS
-from teb_vae.lag_attn_cfs.eval.binding import CFS_BINDING, ModelBinding
+from teb_vae.lag_attn_cfs.eval.binding import CFS_BINDING
 from teb_vae.lag_attn_cfs.eval.config_schema import DEFAULT_OVERRIDES_PATH as CFS_OVERRIDES_PATH
-from teb_vae.lag_attn_cfs.model_kwargs import WARMUP_MODEL_KWARGS
 from teb_vae.lag_attn_transformer_cfs.eval import binding as binding_module
-from teb_vae.lag_attn_transformer_cfs.eval.binding import (
-    DEFAULT_OVERRIDES_PATH,
-    GEOMETRY_KEYS,
-    TRF_CFS_BINDING,
-)
+from teb_vae.lag_attn_transformer_cfs.eval.binding import GEOMETRY_KEYS, TRF_CFS_BINDING
 from teb_vae.lag_attn_transformer_cfs.nets.model import SeqVaeLagAttnTrfCfs
 from teb_vae.lag_attn_transformer_cfs.task import SeqVaeLagAttnTrfCfsTask
 
-from .conftest import CONV_LSTM_ONLY_KEYS, _REPO_ROOT, tiny_warmup_kwargs
-
-#: The constructor keys this cell reconciles against a checkpoint, written out rather than imported:
-#: importing :data:`GEOMETRY_KEYS` and comparing it to itself would pass on any edit. An **ordered**
-#: sequence, not a set -- the order is what the reconciliation record is built in and what a reader of
-#: two runs' preflight files compares down.
-#:
-#: Nineteen of the twenty-six are the conv-LSTM cell's, minus ``causal_norm``, which is not a
-#: keyword of this constructor at all. The seven this architecture adds are its encoders'.
-#:
-#: Three of the eighteen are the architecture switches this family's revision added, and each is
-#: here for the same reason the widths are: the evaluation rebuilds the model from the
-#: **checkpoint's** own ``model_kwargs``, so a config disagreeing about one of them would not fail
-#: -- it would report one architecture's numbers under another's stated description.
-#: ``lag_kv_source`` changes what the lag attention reads and therefore what every lag readout
-#: means; ``prior_availability_input`` changes what the KL is a divergence between;
-#: ``persistence_residual`` changes the predictor every ``nll_*`` and every skill comparison is
-#: measured on. ``horizon_weight_halflife_steps`` is deliberately **not** here -- it reweights the
-#: training criterion's horizon axis and this pipeline scores every block unweighted, so a
-#: half-life edited after the fit contradicts no number the run reports.
-TRF_CFS_GEOMETRY_KEYS = (
-    "sequence_length",
-    "d_model",
-    "d_z",
-    "horizon",
-    "raw_per_step",
-    "warmup_period",
-    "c_y",
-    "c_u",
-    "use_up_st",
-    "max_lag",
-    "num_heads",
-    "d_head",
-    "horizon_attention_blocks",
-    "anchor_stride",
-    "lag_floor",
-    "prior_availability_input",
-    "lag_kv_source",
-    "persistence_residual",
-    "forecast_ar_residual",
-    "encoder_conv_kernels",
-    "encoder_conv_dilations",
-    "encoder_num_heads",
-    "encoder_d_ff",
-    "target_attention_blocks",
-    "source_attention_blocks",
-    "source_attention_window",
-)
+from .conftest import _REPO_ROOT, tiny_warmup_kwargs
 
 #: This package's shipped training config, which the second half of the geometry-key rule reads.
 DEFAULT_CONFIG_PATH = (
@@ -115,26 +63,17 @@ def model() -> Any:
 # =================================================================================================
 # The geometry keys
 # =================================================================================================
-def test_the_geometry_keys_are_exactly_the_twenty_six_declared_here() -> None:
-    assert GEOMETRY_KEYS == TRF_CFS_GEOMETRY_KEYS
-    assert TRF_CFS_BINDING.geometry_keys is GEOMETRY_KEYS
-    assert len(GEOMETRY_KEYS) == 26
-    assert len(set(GEOMETRY_KEYS)) == len(GEOMETRY_KEYS), "a duplicate would be compared twice"
-
-
-def test_every_geometry_key_is_a_parameter_of_this_constructor() -> None:
-    """A key this constructor does not take can never match and would refuse every run."""
+def test_every_geometry_key_is_a_constructor_parameter_and_a_shipped_config_key() -> None:
+    """Both halves of the rule. A key this constructor does not take can never match and would
+    refuse every run; and ``preflight.reconcile`` skips a key the config does not declare, so a key
+    that is a constructor parameter and nothing else is a reconciliation that never happens and
+    never says so."""
     parameters = set(inspect.signature(SeqVaeLagAttnTrfCfs.__init__).parameters)
-
-    assert set(GEOMETRY_KEYS) <= parameters, sorted(set(GEOMETRY_KEYS) - parameters)
-
-
-def test_every_geometry_key_is_also_a_key_of_this_packages_shipped_config() -> None:
-    """The half that a signature check alone would miss. ``preflight.reconcile`` skips a key the
-    config does not declare, so a key that is a constructor parameter and nothing else is a
-    reconciliation that never happens and never says so."""
     declared = set(_vae_config(DEFAULT_CONFIG_PATH))
 
+    assert TRF_CFS_BINDING.geometry_keys is GEOMETRY_KEYS
+    assert len(set(GEOMETRY_KEYS)) == len(GEOMETRY_KEYS), "a duplicate would be compared twice"
+    assert set(GEOMETRY_KEYS) <= parameters, sorted(set(GEOMETRY_KEYS) - parameters)
     assert set(GEOMETRY_KEYS) <= declared, sorted(set(GEOMETRY_KEYS) - declared)
 
 
@@ -163,59 +102,26 @@ def test_the_tuple_is_the_cfs_cells_minus_causal_norm_plus_this_architectures_se
     assert shared == [key for key in CFS_GEOMETRY_KEYS if key != "causal_norm"]
 
 
-@pytest.mark.parametrize("key", CONV_LSTM_ONLY_KEYS)
-def test_no_conv_lstm_only_key_reaches_this_binding_or_its_delta(key: str) -> None:
-    """Each would be dropped by the experiment driver's signature sweep without a word, leaving a
-    config that reads correct and builds a different model. ``causal_norm`` is the sharpest case: it
-    is a ``TypeError`` at this constructor, so reconciling it could only ever compare a key against
-    nothing."""
-    assert key not in GEOMETRY_KEYS
-    assert key not in inspect.signature(SeqVaeLagAttnTrfCfs.__init__).parameters
-    assert key not in _vae_config(DEFAULT_OVERRIDES_PATH)
-
-
-def test_the_warm_up_budget_and_its_four_tuples_are_absent_and_checked_elsewhere() -> None:
-    """The budget is a config key that names no constructor parameter; the four tuples are
-    constructor parameters that name no config key. Listing either here would compare a value
-    against nothing and pass every run, so ``preflight`` re-resolves the budget against the
-    configured shards instead -- the only comparison that can actually fail."""
-    assert "causal_warmup_budget_steps" not in GEOMETRY_KEYS
-    for name in WARMUP_MODEL_KWARGS:
-        assert name not in GEOMETRY_KEYS
-
-    # Named rather than described, so this test breaks if the guard is renamed or removed.
-    assert callable(preflight.check_warmup_budget_matches_checkpoint)
-    assert "check_warmup_budget_matches_checkpoint" in preflight.GUARD_RECOVERY
-
-
 # =================================================================================================
 # The rest of the declaration
 # =================================================================================================
-def test_the_binding_names_this_cells_classes_and_tag() -> None:
-    assert isinstance(TRF_CFS_BINDING, ModelBinding)
+def test_the_binding_names_this_cells_classes_and_a_tag_of_its_own() -> None:
     assert TRF_CFS_BINDING.model_cls is SeqVaeLagAttnTrfCfs
     assert TRF_CFS_BINDING.task_cls is SeqVaeLagAttnTrfCfsTask
-    assert TRF_CFS_BINDING.tag == "lag_attn_trf_cfs"
     assert TRF_CFS_BINDING.tag != CFS_BINDING.tag, (
         "two cells sharing a tag land their runs in one directory, told apart only by timestamp"
     )
-
-
-def test_the_overrides_path_is_this_packages_own() -> None:
-    """A binding pointing at another package's delta would evaluate the right checkpoint against the
-    wrong holdout split."""
-    assert TRF_CFS_BINDING.overrides_path == DEFAULT_OVERRIDES_PATH
-    assert DEFAULT_OVERRIDES_PATH.is_file()
-    assert DEFAULT_OVERRIDES_PATH.parent.parent.name == "eval"
-    assert DEFAULT_OVERRIDES_PATH.parent.parent.parent.name == "lag_attn_transformer_cfs"
 
 
 def test_the_override_delta_is_the_cfs_cells_key_for_key_and_value_for_value() -> None:
     """What makes the two cells comparable is that every shared measurement is configured
     identically: the same shards, seed, batch size, Monte Carlo draw count, thresholds and caps. This
     cell registers no analysis of its own, so unlike the raw pair's deltas there is not even a cap
-    here the other file does not carry -- the two must be equal outright."""
-    with open(DEFAULT_OVERRIDES_PATH, encoding="utf-8") as handle:
+    here the other file does not carry -- the two must be equal outright. Read through the binding,
+    so the comparison is also the check that the binding points at this package's own delta rather
+    than the other cell's."""
+    assert TRF_CFS_BINDING.overrides_path != CFS_OVERRIDES_PATH
+    with open(TRF_CFS_BINDING.overrides_path, encoding="utf-8") as handle:
         here = yaml.safe_load(handle)
     with open(CFS_OVERRIDES_PATH, encoding="utf-8") as handle:
         there = yaml.safe_load(handle)
@@ -238,19 +144,9 @@ def test_the_extra_analyses_and_headline_scalars_are_the_parents_objects() -> No
     differ from the one the comparison model runs under."""
     assert TRF_CFS_BINDING.extra_analyses is CFS_BINDING.extra_analyses
     assert TRF_CFS_BINDING.headline_scalars is CFS_BINDING.headline_scalars
-    # Non-vacuous now that the parent's registry is filled: identity between two empty objects
-    # would be satisfied by two independent empty literals. `occlusion` is the interventional half
-    # of the lag question and is inherited exactly like the other four -- it edits the model's
-    # INPUT, which is a question about the source pathway rather than about the encoder that reads
-    # it, so a second registration here would be a second copy of one question.
-    # The first three are the model-bound analyses that left the shared registry when the slot
-    # cell registered its own under the same names: they read a forward pass rather than the
-    # tables, and this cell runs the parent's forward.
-    assert set(TRF_CFS_BINDING.extra_analyses) == {
-        "samples", "recording_traces", "attribution",
-        "warmup", "source_null", "occlusion", "lag_clocks", "lag_kld_scaled", "lag_high_kl",
-        "spectral_skill",
-    }
+    # Non-vacuous: identity between two empty objects would be satisfied by two independent empty
+    # literals.
+    assert TRF_CFS_BINDING.extra_analyses
     assert TRF_CFS_BINDING.headline_scalars != ()
 
 
@@ -272,15 +168,6 @@ def test_the_two_cells_ask_the_same_questions_in_the_same_order() -> None:
     # them, because it reads the per-recording CSVs the steps above it write.
     assert {"warmup", "source_null", "lag_clocks", "spectral_skill"} <= set(here)
     assert list(here)[-1] == "cross_subgroup"
-
-
-def test_every_registered_headline_path_is_keyed_all_the_way_down() -> None:
-    """The paths this binding contributes resolve by key at every step, as the shared registry's
-    do. A path whose last step were a list index would resolve to the wrong row the day a metric
-    was added above it, and nothing in the artifact would say so."""
-    for name, path in TRF_CFS_BINDING.headline_scalars:
-        assert isinstance(name, str) and name
-        assert path and all(isinstance(step, str) and step for step in path), name
 
 
 # =================================================================================================

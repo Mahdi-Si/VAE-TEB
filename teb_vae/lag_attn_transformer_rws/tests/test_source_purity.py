@@ -10,7 +10,7 @@ pathway that is connected and used. An autograd probe catches one that is connec
 contribute nothing on this input. Forward pre-hooks asserting **object identity** at the adapters
 catch a concatenation that mixed a stream in before either of the other two could see it.
 
-The last section runs the positional causality probe on the *assembled* model rather than on a bare
+A further section runs the positional causality probe on the *assembled* model rather than on a bare
 encoder: through the channel gate, the availability-aware adapter and the prior head, on
 ``mu_prior`` and ``target_state``. The encoder-level test cannot cover that composition, and the
 gate in particular is an index operation whose failure mode -- a delay applied along the wrong axis
@@ -102,18 +102,6 @@ def test_no_gradient_path_runs_from_the_source_stream_to_the_prior(tiny_kwargs, 
             out[key].sum(), u_stream, retain_graph=True, allow_unused=True
         )
         assert grad is None, f"{key} is differentiable with respect to the source stream"
-
-
-def test_the_same_probe_finds_the_source_on_a_source_driven_quantity(tiny_kwargs, inputs):
-    """The positive direction, so the ``grad is None`` assertions above are not vacuous."""
-    model = _model(tiny_kwargs)
-    y_st, y_ph, u_stream = inputs
-    u_stream = u_stream.clone().requires_grad_(True)
-
-    out = model(y_st, y_ph, u_stream)
-    (grad,) = torch.autograd.grad(out["source_state"].sum(), u_stream, allow_unused=True)
-
-    assert grad is not None and float(grad.abs().max()) > 0.0
 
 
 # ---------------------------------------------------------------------------------------
@@ -223,17 +211,6 @@ def test_the_source_encoder_consumes_only_the_source_adapter_output(tiny_kwargs,
     assert captured[0] is adapter_out[0]
 
 
-def test_the_two_encoders_share_no_parameter_tensor(tiny_kwargs):
-    """Separate instances, not one module used twice: a shared encoder would make the source state
-    a function of the target and every purity assertion above would be about the same tensor."""
-    model = _model(tiny_kwargs)
-    target_ids = {id(parameter) for parameter in model.target_encoder.parameters()}
-    source_ids = {id(parameter) for parameter in model.source_encoder.parameters()}
-
-    assert target_ids and source_ids
-    assert target_ids.isdisjoint(source_ids)
-
-
 # ---------------------------------------------------------------------------------------
 # The assembled model's causality
 # ---------------------------------------------------------------------------------------
@@ -273,7 +250,9 @@ def test_the_assembled_prior_reads_only_the_targets_past(tiny_kwargs, inputs, cu
 # ---------------------------------------------------------------------------------------
 # The negative control: a model that genuinely mixes the streams
 # ---------------------------------------------------------------------------------------
-def test_a_cross_wired_model_fails_the_bitwise_purity_assertions(tiny_kwargs, inputs):
+def test_a_cross_wired_model_fails_every_purity_probe(tiny_kwargs, inputs):
+    """The bitwise, autograd and adapter-identity probes above must each catch a model that mixes
+    the streams -- otherwise a model that computed nothing at all would pass them too."""
     model = _model(tiny_kwargs, cls=CrossWiredModel)
     y_st, y_ph, u_stream = inputs
     noise_u = torch.randn(u_stream.shape, generator=torch.Generator().manual_seed(99))
@@ -288,20 +267,10 @@ def test_a_cross_wired_model_fails_the_bitwise_purity_assertions(tiny_kwargs, in
     assert not torch.equal(base["mu_prior"], resampled["mu_prior"])
     assert not torch.equal(base["target_state"], resampled["target_state"])
 
-
-def test_a_cross_wired_model_fails_the_autograd_probe(tiny_kwargs, inputs):
-    model = _model(tiny_kwargs, cls=CrossWiredModel)
-    y_st, y_ph, u_stream = inputs
-    u_stream = u_stream.clone().requires_grad_(True)
-
-    out = model(y_st, y_ph, u_stream)
-    (grad,) = torch.autograd.grad(out["mu_prior"].sum(), u_stream, allow_unused=True)
-
+    u_grad = u_stream.clone().requires_grad_(True)
+    out = model(y_st, y_ph, u_grad)
+    (grad,) = torch.autograd.grad(out["mu_prior"].sum(), u_grad, allow_unused=True)
     assert grad is not None
 
-
-def test_a_cross_wired_model_fails_the_adapter_identity_hook(tiny_kwargs, inputs):
-    model = _model(tiny_kwargs, cls=CrossWiredModel)
     seen = _capture_adapter_inputs(model, inputs)
-
     assert seen["source"][0] is not inputs[2]

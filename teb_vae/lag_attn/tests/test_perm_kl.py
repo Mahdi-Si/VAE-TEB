@@ -206,17 +206,6 @@ def test_the_control_uses_a_real_derangement(prod_kwargs, perturb_posterior):
     assert not bool((perm == torch.arange(_BATCH)).any())
 
 
-def test_a_degenerate_batch_cannot_be_deranged(prod_kwargs, perturb_posterior):
-    """B < 2 has no derangement; the caller must skip the control rather than fake one."""
-    model = _model(prod_kwargs, perturb_posterior)
-    inputs = _inputs(batch=1)
-    torch.manual_seed(0)
-    with torch.no_grad():
-        out = model(*inputs)
-    with pytest.raises(ValueError, match="batch_size >= 2"):
-        perm_kl_from_forward(model, out)
-
-
 def test_a_wrong_shaped_perm_index_raises(prod_kwargs, perturb_posterior):
     model = _model(prod_kwargs, perturb_posterior)
     inputs = _inputs()

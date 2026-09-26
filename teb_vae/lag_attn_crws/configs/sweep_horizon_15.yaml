@@ -27,7 +27,7 @@
 #
 # `anchor_stride` moves with it, because the two are one decision: at S < H the windows overlap again
 # and at S > H there are target steps no phase ever covers. The constructor refuses the second and
-# tests/test_sweep_configs.py asserts the equality in every arm.
+# tests/test_sweep_configs.py asserts the equality in every arm that moves the horizon.
 #
 # `horizon_depth` stays at 4. At H = 15 the refine stack's receptive field of 31 tokens clears the
 # family's RF >= H + 1 criterion with room to spare, where at the shipped horizon it meets it

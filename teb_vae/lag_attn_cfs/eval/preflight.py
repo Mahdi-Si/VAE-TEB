@@ -1587,10 +1587,8 @@ def causality_disclosure(
 # =================================================================================================
 #: One row per function carrying a ``raise EvalPreconditionUnmet``, naming what to change.
 #:
-#: A mapping rather than prose so the evaluation record can render it and so
-#: ``tests/test_eval_preflight.py`` can walk this module's AST and assert that every raise site has a
-#: row -- the sibling's table is hand-kept in a document, and a table nothing checks is a table that
-#: goes stale the first time a guard is added.
+#: A mapping rather than prose so the evaluation record can render it -- the sibling's table is
+#: hand-kept in a document.
 #:
 #: Each ``recovery`` names a config key or a command. "The shards are wrong" is a description of the
 #: problem; "repoint dataset_config.vae_test_datasets" is a recovery.

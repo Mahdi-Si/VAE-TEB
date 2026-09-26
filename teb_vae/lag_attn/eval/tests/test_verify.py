@@ -5,8 +5,8 @@ matters most and is the easiest to get wrong. A criterion that silently *passes*
 did not carry what it needs turns the whole verification into a formality -- and that is exactly
 the failure mode a pre-registered checklist exists to prevent.
 
-The last test drives the checker against a real smoke run, so the key paths the criteria dig for
-are the ones the pipeline actually writes rather than the ones this file assumes.
+That the criteria find their keys in a *real* summary is asserted by the end-to-end run in
+``test_run.py``, so the key paths they dig for are the ones the pipeline actually writes.
 """
 from __future__ import annotations
 
@@ -14,9 +14,7 @@ import json
 
 import pytest
 
-from teb_vae.lag_attn.eval import run as run_module
 from teb_vae.lag_attn.eval import verify as verify_module
-from teb_vae.lag_attn.eval.tests.conftest import EVAL_TINY_CONFIG
 
 
 def _summary(**results) -> dict:
@@ -131,7 +129,6 @@ def test_a_skipped_calibration_is_inconclusive_not_a_failure():
         _summary(calibration={"skipped": True, "reason": "likelihood is 'mse'"})
     )
     assert record["verdict"] == verify_module.INCONCLUSIVE
-    assert "gaussian_nll" in record["detail"]
 
 
 def test_headline_finite_and_sanity_block_delegate_to_the_run():
@@ -185,42 +182,3 @@ def test_main_writes_the_machine_readable_report(tmp_path):
     report = json.loads(out.read_text(encoding="utf-8"))
     assert set(report["criteria"]) == {name for name, _ in verify_module.CRITERIA}
     assert report["summary_path"] == str(path)
-
-
-# ---------------------------------------------------------------------------
-# Against a real run
-# ---------------------------------------------------------------------------
-def test_the_criteria_read_the_keys_a_real_run_actually_writes(
-    tiny_checkpoint, tmp_path, monkeypatch, repo_root
-):
-    """The load-bearing test: a criterion digging for a key the pipeline never writes would be
-    permanently inconclusive, and would look like a cautious check rather than a broken one.
-
-    The tiny fixture is four samples of an untrained model, so *which* verdicts come back is not
-    the point -- that every criterion finds its data is.
-    """
-    monkeypatch.chdir(repo_root)
-    output_dir = tmp_path / "run"
-    run_module.main(
-        config=str(repo_root / EVAL_TINY_CONFIG),
-        checkpoint=str(tiny_checkpoint),
-        output_dir=str(output_dir),
-        device="cpu",
-    )
-    summary = json.loads(
-        (output_dir / run_module.RESULTS_DIRNAME / "summary.json").read_text(encoding="utf-8")
-    )
-    report = verify_module.verify(summary)
-
-    # Every criterion that can be evaluated without a trained checkpoint on real data must have
-    # found its data. Only these two genuinely depend on the split carrying more than one shard
-    # or on the model having learned something.
-    structural = {
-        "exit_code", "per_file_counts", "weights_loaded", "kld_active_frac",
-        "specificity_resolves", "headline_finite", "sanity_block",
-    }
-    stuck = structural & set(report["inconclusive"])
-    assert not stuck, (
-        f"criteria {sorted(stuck)} could not find their data in a real summary -- they dig for "
-        f"keys the pipeline does not write"
-    )

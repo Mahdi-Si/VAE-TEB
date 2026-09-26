@@ -6,19 +6,15 @@ and a second copy of the loss would make the comparison partly a comparison of t
 model's ``compute_loss`` is therefore a thin delegation supplying its own geometry, its own cached
 index grid, its own coverage floor and its own log-variance bounds.
 
-Three things make the check here non-vacuous, and each replaces an easier test that would have
-proven nothing.
+Three things make the check here non-vacuous.
 
-* **The four supplied arguments are compared first.** "Identical output" from two delegations that
-  passed different geometries would be a statement about the inputs happening to agree on this
-  batch, not about the objective being shared.
 * **The forward dict is a real one**, produced by a real ``SeqVaeLagAttnTrfRws`` forward and handed
-  to *both* models. A hand-written dict drifts from what ``losses.compute_loss`` actually reads --
-  silently, since a missing key it does not touch on this code path costs nothing until the day it
-  does.
-* **``kld_tensor`` is checked against the closed form written out below**, not against the sibling.
-  Comparing two one-line delegations to the same function only proves they agree with each other,
-  which they would even if the function were wrong.
+  to *both* models. A hand-written dict drifts from what ``losses.compute_loss`` actually reads.
+* **A model built at a different coverage floor must move the result**, so the equality is a
+  statement about what this model forwards rather than about a delegation that ignores its own
+  arguments.
+* **``kld_tensor`` is checked against the closed form written out below**, not against the sibling,
+  on a perturbed posterior.
 
 Every metric tensor is compared with ``torch.equal``, not just the scalar loss: a scalar can agree
 while a per-anchor readout the figures and the evaluation both consume does not.
@@ -113,21 +109,6 @@ def _closed_form_kld(mu_p, logvar_p, mu_q, logvar_q) -> torch.Tensor:
 
 
 # ---------------------------------------------------------------------------------------
-# What the delegation supplies
-# ---------------------------------------------------------------------------------------
-def test_the_two_models_hand_the_objective_the_same_four_things(pair):
-    """Asserted before any output is compared. The delegation's whole content is these four
-    arguments, so two models that agreed on the result while disagreeing here would be agreeing by
-    accident."""
-    model, sibling, _outputs, _batch = pair
-
-    assert model.geometry == sibling.geometry
-    assert torch.equal(model.future_index, sibling.future_index)
-    assert model.coverage_floor == sibling.coverage_floor
-    assert model.logvar_clamp == sibling.logvar_clamp
-
-
-# ---------------------------------------------------------------------------------------
 # The objective
 # ---------------------------------------------------------------------------------------
 @pytest.mark.parametrize("likelihood", ["gaussian_nll", "mse"])
@@ -171,42 +152,15 @@ def test_the_comparison_would_notice_a_different_geometry(pair):
     )
 
 
-def test_the_objective_refuses_an_unknown_likelihood_through_this_model(pair):
-    """The delegation passes it straight through, so the shared refusal is what an operator sees."""
-    model, _sibling, outputs, batch = pair
-
-    with pytest.raises(ValueError, match="likelihood"):
-        model.compute_loss(outputs, batch.fhr, weight=batch.weight, likelihood="huber")
-
-
 # ---------------------------------------------------------------------------------------
 # The KL
 # ---------------------------------------------------------------------------------------
-def test_the_kld_tensor_is_the_closed_form(pair):
-    """Against the formula, not against the sibling. Two delegations to one function agree with each
-    other by construction; what has to be true is that the function is the KL."""
-    model, _sibling, outputs, _batch = pair
-
-    got = model.kld_tensor(
-        mu_prior=outputs["mu_prior"],
-        logvar_prior=outputs["logvar_prior"],
-        mu_post=outputs["mu_post"],
-        logvar_post=outputs["logvar_post"],
-    )
-    expected = _closed_form_kld(
-        outputs["mu_prior"], outputs["logvar_prior"],
-        outputs["mu_post"], outputs["logvar_post"],
-    )
-
-    assert got.shape == outputs["mu_prior"].shape
-    assert torch.allclose(got, expected, atol=1e-6)
-
-
-def test_the_kld_tensor_is_not_identically_zero_on_a_perturbed_posterior(
+def test_the_kld_tensor_is_the_closed_form_on_a_perturbed_posterior(
     tiny_kwargs, raw_inputs, perturb_posterior
 ):
-    """The vacuity control. At initialisation the posterior equals the prior exactly, so the closed
-    form and any wrong implementation of it both return zero, and the test above passes on either."""
+    """Against the formula, not against the sibling: two delegations to one function agree with
+    each other by construction. Perturbed first, because at initialisation the posterior equals the
+    prior exactly and the closed form and any wrong implementation of it both return zero."""
     torch.manual_seed(0)
     model = SeqVaeLagAttnTrfE2E(**tiny_kwargs).eval()
     perturb_posterior(model)

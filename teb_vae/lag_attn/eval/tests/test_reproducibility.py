@@ -8,8 +8,8 @@ actually makes -- so the sampling is seeded rather than removed.
 
 TF32 and ``cudnn.benchmark`` are the other half. ``default.yaml`` sets ``benchmark: true``, and
 nondeterministic algorithm selection would move the low-order bits between runs. Both are
-disabled explicitly by ``configure_numerics``; :func:`test_numerics_are_load_bearing` asserts the
-seeding actually is what holds this together, so the test cannot pass for the wrong reason.
+disabled explicitly by ``configure_numerics``; the test's second half asserts the seeding actually
+is what holds this together, so it cannot pass for the wrong reason.
 """
 from __future__ import annotations
 
@@ -22,10 +22,11 @@ import torch
 from teb_vae.lag_attn.eval import run as run_module
 from teb_vae.lag_attn.eval.tests.conftest import EVAL_TINY_CONFIG
 
-#: Keys whose value legitimately differs between two runs: wall clock, paths, and the run
-#: directory. Compared, they would fail every time and say nothing.
+#: Keys whose value legitimately differs between two runs: wall clock, paths, the run directory,
+#: and the manifest's byte size of ``eval.log``, whose timing lines change width between runs.
+#: Compared, they would fail and say nothing.
 VOLATILE_KEYS = frozenset(
-    {"elapsed_s", "output_dir", "checkpoint", "config", "max_memory_allocated_gb"}
+    {"elapsed_s", "output_dir", "checkpoint", "config", "max_memory_allocated_gb", "eval.log"}
 )
 
 
@@ -71,10 +72,15 @@ def _run_once(checkpoint: Path, output_dir: Path, repo_root: Path) -> Dict[str, 
     return json.loads(summary_path.read_text(encoding="utf-8"))
 
 
-def test_two_runs_produce_identical_numbers(
+def test_two_seeded_runs_are_identical_and_the_seeding_is_what_holds_them(
     tiny_checkpoint, tmp_path, monkeypatch, repo_root
 ) -> None:
-    """Bit-identical, not merely close. Anything else means something is unseeded."""
+    """Bit-identical, not merely close. Anything else means something is unseeded.
+
+    Then the non-vacuity half: with the seeding neutered the sampled $z$ differs and the run's
+    numbers move. Without it the equality would also pass if nothing in the pipeline were actually
+    stochastic, i.e. with ``configure_numerics`` removed.
+    """
     monkeypatch.chdir(repo_root)
 
     first = _numeric_leaves(_run_once(tiny_checkpoint, tmp_path / "run_a", repo_root))
@@ -92,30 +98,14 @@ def test_two_runs_produce_identical_numbers(
     ]
     assert not differences, f"reruns disagreed on {differences[:5]}"
 
-
-def test_numerics_are_load_bearing(tiny_checkpoint, tmp_path, monkeypatch, repo_root) -> None:
-    r"""Without the seeding, the sampled $z$ differs and the run's numbers move.
-
-    This is what stops the reproducibility test above passing for the wrong reason -- if nothing
-    in the pipeline were actually stochastic, it would pass with ``configure_numerics`` removed.
-    """
-    monkeypatch.chdir(repo_root)
-
-    seeded = _run_once(tiny_checkpoint, tmp_path / "seeded", repo_root)
-
     # Re-run with the seeding neutered, so the global generator is left wherever the previous
     # run happened to leave it.
     monkeypatch.setattr(run_module, "configure_numerics", lambda seed: {"seed": int(seed)})
     torch.manual_seed(999)
-    unseeded = _run_once(tiny_checkpoint, tmp_path / "unseeded", repo_root)
+    unseeded = dict(_numeric_leaves(_run_once(tiny_checkpoint, tmp_path / "unseeded", repo_root)))
 
-    seeded_leaves = dict(_numeric_leaves(seeded))
-    unseeded_leaves = dict(_numeric_leaves(unseeded))
-    moved = [
-        key
-        for key in seeded_leaves
-        if key in unseeded_leaves and seeded_leaves[key] != unseeded_leaves[key]
-    ]
+    seeded = dict(first)
+    moved = [key for key in seeded if key in unseeded and seeded[key] != unseeded[key]]
     assert moved, (
         "removing the seeding changed nothing, so the reproducibility assertion is not "
         "actually testing the seeding"

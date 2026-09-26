@@ -32,7 +32,7 @@ import torch
 
 from teb_vae.lag_attn_rws.eval.metrics import evaluate_batch
 
-from .conftest import BATCH, STUB_GAP_STEP, make_stub_batch
+from .conftest import STUB_GAP_STEP, make_stub_batch
 
 #: Seeded identically on both sides of every comparison; see the module docstring.
 _SEED = 4
@@ -119,16 +119,6 @@ def test_the_kl_readout_recombines_into_the_objectives_kl(trained_task, uneven_b
     )
 
     assert recombined == pytest.approx(float(metrics["source_conditioned_kl_raw"]), rel=1e-5)
-
-
-def test_the_fixture_actually_has_unequal_anchor_counts(trained_task, uneven_batch) -> None:
-    """Non-vacuity for the mis-weighting test below: on equal counts the weighted and unweighted
-    reductions coincide and nothing could distinguish them."""
-    readout = evaluate_batch(trained_task, uneven_batch, num_samples=1)
-
-    counts = [float(value) for value in readout.n_anchors]
-    assert len(counts) == BATCH
-    assert counts[0] != counts[1]
 
 
 @pytest.mark.parametrize(

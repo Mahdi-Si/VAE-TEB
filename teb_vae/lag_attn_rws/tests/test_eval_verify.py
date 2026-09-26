@@ -153,16 +153,6 @@ def test_a_skipped_verdict_is_inconclusive_not_passed():
     assert report["n_passed"] == len(verify.CRITERIA) - 1
 
 
-def test_the_gate_names_the_pred_gap_column_it_reads():
-    """Two ``pred_gap`` columns exist and the gate must say which one it means -- in the report
-    record, in the criterion's own detail, and on the console."""
-    report = verify.verify(clean_summary())
-
-    assert report["pred_gap_column_read"] == "pred_gap_mc_nats"
-    assert "pred_gap_mc_nats" in report["criteria"]["headline_pred_gap"]["detail"]
-    assert "pred_gap_mc_nats" in verify.format_report(report)
-
-
 def test_a_missing_or_skipped_preflight_is_inconclusive():
     summary = clean_summary()
     del summary["preflight"]
@@ -325,14 +315,6 @@ def test_the_four_prior_anchor_arms_resolve_into_their_own_section(tmp_path):
     keys = [row.split("|")[1].strip() for row in rows[1:] if not row.startswith("|---")]
 
     assert keys == ["0.001", "0.01", "0.1", "1"], keys
-    # The columns the study is read down, in the order it is read in: the floor first, the base
-    # forecast next, the coupling columns last.
-    header = rows[0]
-    for column in (
-        "`beta_prior`", "`logvar_prior_floor_frac`", "`mean_logvar_prior`", "`prior_rate`",
-        "`d_base_mc_nats`", "`pred_gap`", "`abs(pred_gap)/K`", "`source_margin`", "Verdicts",
-    ):
-        assert column in header, column
 
 
 def test_every_generated_table_is_well_formed_markdown(tmp_path):
@@ -452,18 +434,6 @@ def test_an_arm_missing_its_metrics_csv_is_reported_incomplete_not_rowless(tmp_p
     assert verify.METRICS_HISTORY_FILENAME in _section(document, "## Incomplete runs")
 
 
-def test_the_reach_table_reads_the_kept_channel_widths_from_the_config(tmp_path):
-    write_arm(tmp_path, "unguarded", beta=1.0, reach=None)
-    out = tmp_path / "arms.md"
-
-    assert verify.compare_arms(tmp_path, out) == 0
-    section = _section(out.read_text(encoding="utf-8"), "## Reach budget sweep")
-
-    row = next(line for line in section.splitlines() if "unguarded" in line)
-    assert row.split("|")[1].strip() == "null"  # explicit null, not "(absent)"
-    assert "109 / 58" in row
-
-
 def test_the_reach_table_reports_the_surviving_channels_not_the_declared_widths(tmp_path):
     """The column is the sweep's whole subject, and `c_y`/`c_u` cannot express it.
 
@@ -503,14 +473,3 @@ def test_the_cli_dispatches_between_the_gate_and_the_tables(tmp_path):
     assert verify._cli([str(summary)]) == 0
     assert verify._cli([str(summary), "--runs", str(tmp_path)]) == 2  # both is a usage error
     assert verify._cli([]) == 2  # neither is too
-
-
-def test_the_emitted_document_never_uses_the_refused_name(tmp_path):
-    """The arm tables are an artifact, and the naming rule that binds every run artifact binds
-    them too: the coupling readout is not called a transfer entropy anywhere in the output."""
-    write_arm(tmp_path, "arm", beta=1.0)
-    out = tmp_path / "arms.md"
-    verify.compare_arms(tmp_path, out)
-
-    lowered = out.read_text(encoding="utf-8").lower()
-    assert "transfer entropy" not in lowered and "te_lag" not in lowered

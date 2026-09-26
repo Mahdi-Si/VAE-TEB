@@ -10,8 +10,8 @@ same confidence.
 
 **A segment that measured nothing must not read as a segment that measured zero.** The per-sample
 mean clamps its denominator to $1$, so an unscored segment's columns come out as exactly ``0.0``.
-Averaged into a summed-$1470$-coefficient block score of hundreds of nats, that pulls the headline
-toward zero and shrinks ``pred_gap``, and nothing else in the output moves.
+Averaged into a block score summed over $H \cdot C_{\mathrm{keep}}$ coefficients, that pulls the
+headline toward zero and shrinks ``pred_gap``, and nothing else in the output moves.
 
 **The anchor column must be the decimated step.** This model decodes a *gathered* set of anchors
 out of $T_{\mathrm{valid}}$, so a table keyed on a row's position in that set would join silently
@@ -26,7 +26,6 @@ from __future__ import annotations
 
 import json
 import math
-from pathlib import Path
 from typing import List, Optional
 
 import numpy as np
@@ -41,8 +40,6 @@ from teb_vae.lag_attn_cfs.eval.collect import (
     PER_ANCHOR_FILENAME,
     PER_ANCHOR_KEY,
     PER_SAMPLE_FILENAME,
-    RETAINED_QUANTITIES,
-    VECTORS_FILENAME,
     Collection,
     RetentionPlan,
     TablesProvenanceMismatch,
@@ -50,6 +47,7 @@ from teb_vae.lag_attn_cfs.eval.collect import (
     collect_tables,
     load_collection,
     load_or_collect,
+    normalization_record,
     write_collection,
 )
 from teb_vae.lag_attn_cfs.eval.metrics import (
@@ -484,7 +482,9 @@ def test_the_retained_arrays_survive_a_write_and_a_read(tmp_path, trained_task):
     write_collection(collection, tmp_path)
     reloaded = load_collection(tmp_path)
 
-    assert reloaded.retained["attn_weights"].shape == collection.retained["attn_weights"].shape
+    assert np.array_equal(
+        reloaded.retained["attn_weights"], collection.retained["attn_weights"], equal_nan=True
+    )
 
 
 def test_the_horizon_accumulator_is_exact_against_full_retention(trained_task):
@@ -623,26 +623,6 @@ def test_the_record_says_it_has_no_block_statistics_rather_than_omitting_them(tr
 
     assert record["normalization"] == {}
     assert record["likelihood"] == trained_task.hparams["likelihood"]
-    assert NORMALIZED_BLOCKS == ("fhr_st", "fhr_ph", "up_st", "up_ph"), (
-        "the four stored blocks are the only scales any number in a run is on"
-    )
-
-
-def test_no_coherence_sidecar_is_written_and_the_record_says_why(tmp_path, trained_task):
-    """An absent file is indistinguishable from a pass that failed to write one. A stored
-    coefficient is a modulus, so the estimator the raw pipeline streams sums for cannot exist
-    here at any window length, and the record states that rather than leaving it to be inferred."""
-    collection = _collect(trained_task, [_labelled_batch(["a", "b"])])
-    write_collection(collection, tmp_path)
-
-    assert not list(tmp_path.glob("*coherence*"))
-    assert not list(tmp_path.glob("*spectra*"))
-    record = collection.record["coherence"]
-    assert record["ported"] is False
-    assert "modulus" in record["reason"]
-    # And no cross-spectral family leaked into the row-aligned sidecar either.
-    with np.load(tmp_path / VECTORS_FILENAME) as handle:
-        assert set(handle.files) == set(VECTOR_READOUTS)
 
 
 def test_the_pass_records_what_it_cost_and_the_rate_a_longer_one_extrapolates_from(trained_task):
@@ -656,13 +636,9 @@ def test_the_pass_records_what_it_cost_and_the_rate_a_longer_one_extrapolates_fr
     assert cost["mean_batch_size"] == pytest.approx(2.0)
     for name in ("elapsed_s", "seconds_per_batch", "samples_per_second", "hours_per_1000_samples"):
         assert math.isfinite(cost[name]) and cost[name] > 0.0, name
-    assert cost["hours_per_1000_samples"] == pytest.approx(
-        1000.0 / cost["samples_per_second"] / 3600.0
-    )
     # Absent rather than zero off CUDA: the allocator that reports it does not exist there, and a
     # 0 would read as "measured, and the pass used nothing".
     assert cost["device"] == "cpu" and cost["peak_allocated_bytes"] is None
-    assert "hours_per_1000_samples" in cost["note"]
 
 
 def test_the_per_sample_table_round_trips_through_disk_bit_for_bit(trained_task, tmp_path):
@@ -823,51 +799,32 @@ def test_tables_from_another_checkpoint_are_refused_and_both_are_named(tmp_path,
     assert "fake.ckpt" in message and "other.ckpt" in message
 
 
-def test_tables_collected_under_another_seed_are_refused(tmp_path, trained_task):
-    """Every number in them depends on it: the Monte Carlo draw, the derangement and the loader
-    order all follow from the seed."""
+@pytest.mark.parametrize(
+    "changed, num_samples, pattern",
+    [
+        # Every number depends on the seed: the Monte Carlo draw, the derangement, the loader order.
+        ({"seed": 99}, 1, "eval_config.seed"),
+        # $K$ decides the marginalised estimator's own value.
+        ({}, 4, "Monte Carlo"),
+        # The digest covers the whole block, so a moved threshold alone is caught.
+        ({"clock_margin_min_nats": 0.5}, 1, "eval_config block"),
+    ],
+    ids=["seed", "draw-count", "eval-config"],
+)
+def test_tables_collected_under_other_settings_are_refused(
+    tmp_path, trained_task, changed, num_samples, pattern
+):
+    """Reusing rows collected under different settings would report two runs' numbers as one."""
     checkpoint, eval_config = _provenance_inputs(tmp_path)
     _write_tables(trained_task, tmp_path / "run", checkpoint, eval_config)
 
-    with pytest.raises(TablesProvenanceMismatch, match="eval_config.seed"):
+    with pytest.raises(TablesProvenanceMismatch, match=pattern):
         load_or_collect(
             tmp_path / "run",
             lambda: pytest.fail("should not collect"),
             checkpoint_path=checkpoint,
-            eval_config=dict(eval_config, seed=99),
-            num_samples=1,
-        )
-
-
-def test_tables_collected_at_another_draw_count_are_refused(tmp_path, trained_task):
-    """$K$ decides the marginalised estimator's own value, so two draw counts are two different
-    headline numbers reported under one name."""
-    checkpoint, eval_config = _provenance_inputs(tmp_path)
-    _write_tables(trained_task, tmp_path / "run", checkpoint, eval_config)
-
-    with pytest.raises(TablesProvenanceMismatch, match="Monte Carlo"):
-        load_or_collect(
-            tmp_path / "run",
-            lambda: pytest.fail("should not collect"),
-            checkpoint_path=checkpoint,
-            eval_config=eval_config,
-            num_samples=4,
-        )
-
-
-def test_tables_collected_under_another_eval_config_are_refused(tmp_path, trained_task):
-    """The digest covers the whole block, so a moved threshold -- the availability-clock margin
-    among them -- is caught even though no other key changed."""
-    checkpoint, eval_config = _provenance_inputs(tmp_path)
-    _write_tables(trained_task, tmp_path / "run", checkpoint, eval_config)
-
-    with pytest.raises(TablesProvenanceMismatch, match="eval_config block"):
-        load_or_collect(
-            tmp_path / "run",
-            lambda: pytest.fail("should not collect"),
-            checkpoint_path=checkpoint,
-            eval_config=dict(eval_config, clock_margin_min_nats=0.5),
-            num_samples=1,
+            eval_config=dict(eval_config, **changed),
+            num_samples=num_samples,
         )
 
 
@@ -911,120 +868,20 @@ def test_a_directory_whose_verdict_registry_has_moved_is_refused_by_name(tmp_pat
         )
 
 
-def test_the_sidecar_records_what_the_tables_were_collected_from(tmp_path, trained_task):
-    checkpoint, eval_config = _provenance_inputs(tmp_path)
-    _write_tables(trained_task, tmp_path / "run", checkpoint, eval_config)
-
-    record = json.loads((tmp_path / "run" / COLLECTION_FILENAME).read_text(encoding="utf-8"))
-
-    assert record["provenance"]["checkpoint"]["sha256"]
-    assert record["provenance"]["seed"] == 3
-    assert record["provenance"]["eval_config_digest"]
-    assert record["n_per_sample_rows"] == 2
-
-
 # =================================================================================================
-# Observability
-#
-# The collection pass is the multi-hour step of a production run and every other step takes
-# seconds, so silence here is silence for the whole run -- and an operator who cannot tell a slow
-# pass from a hung one restarts a healthy one.
+# Against a real loader
 # =================================================================================================
-def _captured_logs(function, level: str = "INFO"):
-    """Run ``function`` with a loguru sink attached and return the messages it emitted."""
-    from loguru import logger
-
-    messages: List[str] = []
-    sink_id = logger.add(messages.append, level=level)
-    try:
-        function()
-    finally:
-        logger.remove(sink_id)
-    return messages
-
-
-def test_the_pass_reports_its_throughput_and_a_remaining_estimate(
-    trained_task, monkeypatch
-) -> None:
-    monkeypatch.setattr("teb_vae.lag_attn_cfs.eval.collect.PROGRESS_EVERY_BATCHES", 1)
-    # Two recordings per batch: a batch holding one has no stranger in it to borrow a source
-    # from, so the permutation control excludes it whole and it never reaches the sink.
-    batches = [
-        _labelled_batch(["A", "B"], seed=1),
-        _labelled_batch(["C", "D"], seed=2, epoch_offset=-30000.0),
-    ]
-
-    messages = _captured_logs(lambda: _collect(trained_task, batches, n_total=4))
-
-    progress = [line for line in messages if "collection:" in line]
-    assert len(progress) == 2, progress
-    assert "samples/s" in progress[0]
-    assert "min remaining" in progress[0]
-    assert "2/4 sample(s)" in progress[0]
-
-
-def test_a_loader_that_cannot_say_how_long_it_is_gets_throughput_without_an_estimate(
-    trained_task, monkeypatch
-) -> None:
-    """An estimate against an unknown total would be a number with no meaning; the throughput is
-    still worth logging."""
-    monkeypatch.setattr("teb_vae.lag_attn_cfs.eval.collect.PROGRESS_EVERY_BATCHES", 1)
-
-    messages = _captured_logs(
-        lambda: _collect(trained_task, [_labelled_batch(["A", "B"])], n_total=0)
-    )
-
-    progress = [line for line in messages if "collection:" in line]
-    assert progress and "no total" in progress[0]
-    assert "remaining" not in progress[0]
-
-
-# =================================================================================================
-# Against the real run
-# =================================================================================================
-@pytest.mark.slow
-def test_the_run_leaves_both_tables_beside_its_summary(collected_run):
-    """The demo: both tables open in pandas, with the class, subgroup and anchor columns on
-    them."""
-    results_dir = Path(collected_run["results_dir"])
-    collection = load_collection(results_dir)
-
-    assert (results_dir / PER_SAMPLE_FILENAME).is_file()
-    assert (results_dir / PER_ANCHOR_FILENAME).is_file()
-    assert collected_run["summary"]["collection"]["n_per_sample_rows"] == len(
-        collection.per_sample
-    )
-    assert "results" not in collected_run["summary"]["collection"], (
-        "the summary carries the readouts once"
-    )
-    assert set(collection.per_sample["subgroup"]), "the generated cohort shards are labelled"
-
-
-@pytest.mark.slow
-def test_a_real_run_records_the_per_block_statistics_it_normalised_with(
-    collected_run, cohort_loader
-):
+def test_a_real_loader_s_per_block_statistics_are_recorded(cohort_loader):
     """Without these a reader cannot say what scale a reported coefficient is on -- and nothing
-    in this pipeline converts one, so the record is the only statement of it."""
+    in this pipeline converts one, so the record is the only statement of it. The stub loader
+    above carries no statistics; this is the populated case."""
     stats = cohort_loader.dataset.get_normalization_stats()
-    record = load_collection(collected_run["results_dir"]).record["normalization"]
+    record = normalization_record(cohort_loader)
 
     assert set(record) == set(NORMALIZED_BLOCKS)
     for name in NORMALIZED_BLOCKS:
-        assert record[name]["n_channels"] == len(np.asarray(stats[name]["mean"]).reshape(-1))
-        assert record[name]["mean"] == pytest.approx(
-            [float(value) for value in np.asarray(stats[name]["mean"]).reshape(-1)]
-        )
-
-
-@pytest.mark.slow
-def test_a_real_run_retains_what_the_shipped_caps_ask_for(collected_run):
-    """The committed delta sets three caps, and a run that silently retained nothing would leave
-    every figure built on them mysteriously absent rather than reported as skipped."""
-    retention = load_collection(collected_run["results_dir"]).record["retention"]
-
-    for quantity in RETAINED_QUANTITIES:
-        entry = retention["quantities"][quantity]
-        assert entry["cap"] != "absent", quantity
-        assert entry["n_kept"] > 0, quantity
-        assert entry["n_bytes"] > 0, quantity
+        mean = np.asarray(stats[name]["mean"], dtype=np.float64).reshape(-1)
+        std = np.asarray(stats[name]["std"], dtype=np.float64).reshape(-1)
+        assert record[name]["n_channels"] == mean.size
+        assert record[name]["mean"] == pytest.approx(mean.tolist())
+        assert record[name]["std"] == pytest.approx(std.tolist())

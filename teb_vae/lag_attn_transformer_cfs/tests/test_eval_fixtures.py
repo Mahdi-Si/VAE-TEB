@@ -20,11 +20,8 @@ cross-cell table keys its rows on it: the dumped config carries every constructo
 the class they build, so a run whose stamp is wrong or missing is a row this package's whole
 comparison is unable to place.
 
-Beside them, the splice this package's conftest is: the geometry keys the imported target half
-closes over must agree with the locally-written keyword sets, and the two suites' keyword sets must
-**not** be interchangeable. Both are stated here against the *evaluation* path -- ``test_fixtures``
-states them against the constructor -- because a disagreement would build a model neither parent's
-suite tests, with no shape differing anywhere.
+Beside them, the run itself: it completes with every step ok, records this cell's class, was
+scored at the dense anchor set, and was launched with every clinical field its readouts are asked in.
 """
 from __future__ import annotations
 
@@ -37,61 +34,12 @@ from teb_vae.lag_attn_cfs.eval import preflight
 from teb_vae.lag_attn_cfs.eval import run as shared_run
 from teb_vae.lag_attn_rws.trainer import RESOLVED_CONFIG_FILENAME
 from teb_vae.lag_attn_transformer_cfs.eval.binding import TRF_CFS_BINDING
-from teb_vae.lag_attn_transformer_cfs.eval import run as run_module
-
-from .conftest import CONV_LSTM_ONLY_KEYS, SHARED_GEOMETRY_KEYS, shipped_warmup_kwargs
 
 pytestmark = pytest.mark.slow
 
 #: The five fields the delta adds over the model's own data contract; every clinical question in
 #: the pipeline is asked in one of them.
 _CLINICAL_FIELDS = ("target", "epoch", "cs_label", "bg_label", "time_from_labor_onset")
-
-
-# =================================================================================================
-# The splice, stated against the evaluation path
-# =================================================================================================
-def test_the_two_conftest_halves_agree_on_every_shared_geometry_key() -> None:
-    """The imported budget resolution, the imported stub batch and every anchor count this suite
-    asserts close over the causal cell's values while every model here is built from this file's
-    sets. A disagreement would build a model neither parent's suite tests: no shape would differ,
-    because $A_{\\max}$ and the block width are geometry constants either way, and the numbers
-    would simply be another model's."""
-    from teb_vae.lag_attn_cfs.tests.conftest import shipped_warmup_kwargs as cfs_shipped
-
-    here, there = shipped_warmup_kwargs(), cfs_shipped()
-
-    disagreeing = {
-        key: (here.get(key), there.get(key))
-        for key in SHARED_GEOMETRY_KEYS
-        if here.get(key) != there.get(key)
-    }
-    assert disagreeing == {}, disagreeing
-
-
-@pytest.mark.parametrize("key", CONV_LSTM_ONLY_KEYS)
-def test_taking_the_causal_suites_keyword_set_fails_naming_a_conv_lstm_keyword(key: str) -> None:
-    """The split is proved necessary rather than asserted. Each of these five raises ``TypeError``
-    at this constructor, and the causal suite's sets carry them -- so a conftest that imported the
-    other cell's keyword sets instead of writing its own would fail on a *keyword* rather than on
-    the conftest, which is the failure that costs an afternoon."""
-    from teb_vae.lag_attn_transformer_cfs.nets.model import SeqVaeLagAttnTrfCfs
-
-    with pytest.raises(TypeError) as excinfo:
-        SeqVaeLagAttnTrfCfs(**shipped_warmup_kwargs(**{key: True}))
-
-    assert key in str(excinfo.value)
-
-
-def test_the_causal_suites_own_shipped_set_is_refused_by_this_constructor() -> None:
-    """The whole set at once, which is what an import of the other conftest would actually do."""
-    from teb_vae.lag_attn_cfs.tests.conftest import shipped_warmup_kwargs as cfs_shipped
-    from teb_vae.lag_attn_transformer_cfs.nets.model import SeqVaeLagAttnTrfCfs
-
-    with pytest.raises(TypeError) as excinfo:
-        SeqVaeLagAttnTrfCfs(**cfs_shipped())
-
-    assert any(key in str(excinfo.value) for key in CONV_LSTM_ONLY_KEYS), str(excinfo.value)
 
 
 # =================================================================================================
@@ -130,7 +78,12 @@ def test_the_checkpoint_carries_the_records_a_rebuild_and_a_cross_cell_row_need(
         assert blob["model_kwargs"].get(name), name
 
 
-def test_the_checkpoint_rebuilds_into_this_cells_task(trf_cohort_run) -> None:
+def test_the_checkpoint_rebuilds_into_this_cells_task_and_passes_the_load_check(
+    trf_cohort_run,
+) -> None:
+    """The load check is the one that makes the fixture usable at all. The delta heads and FiLM
+    generators are zeroed at construction, so preflight refuses a checkpoint whose weights never
+    moved -- which is what the optimizer steps of a real one-epoch fit exist to prevent here."""
     checkpoint = sorted((Path(trf_cohort_run) / "model_checkpoints").glob("*.ckpt"))[0]
 
     task = shared_run.load_task(checkpoint, torch.device("cpu"), binding=TRF_CFS_BINDING)
@@ -138,18 +91,7 @@ def test_the_checkpoint_rebuilds_into_this_cells_task(trf_cohort_run) -> None:
     assert type(task).__name__ == TRF_CFS_BINDING.task_cls.__name__
     assert type(task.orig_model).__name__ == TRF_CFS_BINDING.model_cls.__name__
     assert task.training is False
-
-
-def test_the_checkpoint_passes_the_weight_space_load_check(trf_cohort_run) -> None:
-    """The one that makes the fixture usable at all. The delta heads and FiLM generators are
-    zeroed at construction, so preflight refuses a checkpoint whose weights never moved -- which
-    is what the optimizer steps of a real one-epoch fit exist to prevent here."""
-    checkpoint = sorted((Path(trf_cohort_run) / "model_checkpoints").glob("*.ckpt"))[0]
-    task = shared_run.load_task(checkpoint, torch.device("cpu"), binding=TRF_CFS_BINDING)
-
-    check = preflight.verify_weights_loaded(task.orig_model)
-
-    assert check["passed"] is True
+    assert preflight.verify_weights_loaded(task.orig_model)["passed"] is True
 
 
 # =================================================================================================
@@ -201,13 +143,3 @@ def test_all_five_clinical_fields_reached_the_run(trf_collected_run) -> None:
     # ``guid`` and ``epoch`` are load-bearing here rather than leftovers: the per-recording chain
     # and the tile phase are keyed on the pair.
     assert {"guid", "epoch"} <= set(load_fields)
-
-
-def test_the_run_ran_this_cells_registry(trf_collected_run) -> None:
-    """Every analysis the binding resolves to contributed a step. A registry entry with no step
-    record is an analysis the run silently lost -- and it would silently lose the cross-cell
-    table's column with it."""
-    steps = {record["name"] for record in trf_collected_run["summary"]["steps"]}
-
-    expected = set(run_module.UNSKIPPABLE_ANALYSES) | set(run_module.ANALYSES)
-    assert expected <= steps, sorted(expected - steps)

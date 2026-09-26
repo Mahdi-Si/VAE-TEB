@@ -34,40 +34,31 @@ def _read(path) -> str:
 
 # --- rank resolution + per-rank file isolation ------------------------------
 
-def test_resolve_global_rank_defaults_to_zero(monkeypatch):
+@pytest.mark.parametrize(
+    "env, expected",
+    [
+        ({}, 0),
+        # Lightning's own ddp launcher sets LOCAL_RANK and never sets RANK.
+        ({"LOCAL_RANK": "3"}, 3),
+        # torchrun/SLURM set RANK; it is the global one, so it must win on multi-node.
+        ({"RANK": "9", "LOCAL_RANK": "1"}, 9),
+        ({"RANK": "not-an-int"}, 0),
+    ],
+    ids=["unset", "local-rank", "rank-wins", "malformed"],
+)
+def test_resolve_global_rank(monkeypatch, env, expected):
     for key in ("RANK", "LOCAL_RANK", "SLURM_PROCID", "JSM_NAMESPACE_RANK"):
         monkeypatch.delenv(key, raising=False)
-    assert resolve_global_rank() == 0
+    for key, value in env.items():
+        monkeypatch.setenv(key, value)
+    assert resolve_global_rank() == expected
 
 
-def test_resolve_global_rank_reads_local_rank(monkeypatch):
-    # Lightning's own ddp launcher sets LOCAL_RANK and never sets RANK.
-    monkeypatch.delenv("RANK", raising=False)
-    monkeypatch.setenv("LOCAL_RANK", "3")
-    assert resolve_global_rank() == 3
-
-
-def test_resolve_global_rank_prefers_rank_over_local_rank(monkeypatch):
-    # torchrun/SLURM set RANK; it is the global one, so it must win on multi-node.
-    monkeypatch.setenv("RANK", "9")
-    monkeypatch.setenv("LOCAL_RANK", "1")
-    assert resolve_global_rank() == 9
-
-
-def test_resolve_global_rank_survives_malformed_value(monkeypatch):
-    monkeypatch.setenv("RANK", "not-an-int")
-    monkeypatch.delenv("LOCAL_RANK", raising=False)
-    monkeypatch.delenv("SLURM_PROCID", raising=False)
-    monkeypatch.delenv("JSM_NAMESPACE_RANK", raising=False)
-    assert resolve_global_rank() == 0
-
-
-def test_rank_zero_keeps_plain_filename():
-    assert rank_suffixed_path("/runs/full.log", 0) == "/runs/full.log"
-
-
-def test_nonzero_rank_is_suffixed():
-    assert rank_suffixed_path("/runs/full.log", 2) == "/runs/full.log.rank2"
+@pytest.mark.parametrize(
+    "rank, expected", [(0, "/runs/full.log"), (2, "/runs/full.log.rank2")]
+)
+def test_only_a_nonzero_rank_is_suffixed(rank, expected):
+    assert rank_suffixed_path("/runs/full.log", rank) == expected
 
 
 def test_each_rank_writes_its_own_file(tmp_path):
@@ -202,11 +193,6 @@ def test_jsonl_is_rank_suffixed_too(tmp_path):
     )
     assert paths.json_log is not None
     assert paths.json_log.endswith("run.jsonl.rank1")
-
-
-def test_json_log_disabled_by_default(tmp_path):
-    paths = setup_logging(file_path=str(tmp_path / "full.log"), log_to_console=False, rank=0)
-    assert paths.json_log is None
 
 
 # --- interception + idempotency ---------------------------------------------

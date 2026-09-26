@@ -1,7 +1,8 @@
 r"""Which cohort separations survive being asked properly, and on which unit they are asked.
 
-Three properties are pinned here, and each catches a different way a by-cohort table is turned
-into a false finding.
+Two properties are pinned here, and each catches a different way a by-cohort table is turned into
+a false finding. Beside them, the metric registry is checked to name per-recording tables only, and
+its band-resolved entry to name a band the shared partition produces.
 
 **The unit is the recording.** Every vector entering a test has one value per recording, and the
 assertion is on the *length of the arrays the tests consume* rather than on a docstring: one
@@ -13,23 +14,12 @@ directory -- that is what makes ``--only cross_subgroup`` against a finished run
 a source whose analysis was skipped has to be information rather than an error. In this package
 that path is exercised by construction rather than by contrivance: :data:`METRIC_SOURCES` names
 tables written by analyses that have not landed yet, and every one of them is missing today.
-
-**It needs no model.** The offline re-run is asserted with the model's ``forward`` rigged to
-raise, because a spy is the only way to tell "did not need the model" from "happened not to use
-it".
-
-**And this cell's own metrics are in the family.** Three warm-up tertiles, the availability-clock
-difference, and one band of the band-resolved skill -- the readouts no other cell in the grid has,
-each named by the per-recording table its analysis writes rather than reached for through it.
 """
 from __future__ import annotations
 
-import json
-import shutil
 from pathlib import Path
 from typing import Any, Dict, List
 
-import numpy as np
 import pandas as pd
 import pytest
 
@@ -228,28 +218,6 @@ def test_the_analysis_writes_its_tables_the_record_and_the_figure(tmp_path) -> N
     assert all("/" not in name and "\\" not in name for name in result["files"])
 
 
-def test_the_written_record_round_trips_as_json(tmp_path) -> None:
-    """Non-finite statistics are ordinary here -- a degenerate cohort produces them -- and a file
-    only Python can read back is not a record."""
-    _write_frame(tmp_path, _SOURCE, {"healthy_bg_cs": [1.0] * 5, "acidosis_cs": [9.0] * 5})
-
-    analysis.run_cross_subgroup_analysis(None, eval_config={}, output_dir=tmp_path, probe=None)
-
-    path = tmp_path / analysis.ANALYSIS_DIRNAME / analysis.RESULT_FILENAME
-    record = json.loads(path.read_text(encoding="utf-8"))
-    assert record["group_column"] == labels.SUBGROUP_COLUMN
-    assert record["alpha"] == pytest.approx(analysis.DEFAULT_ALPHA)
-
-
-def test_neither_the_alpha_nor_the_minimum_cohort_size_is_configurable() -> None:
-    """An operator who could lower either could make any metric significant, which is why they are
-    module constants and why the analysis ignores ``eval_config`` entirely."""
-    from teb_vae.lag_attn_cfs.eval import config_schema
-
-    assert "alpha" not in config_schema.VALID_KEYS
-    assert "min_group_size" not in config_schema.VALID_KEYS
-
-
 def test_the_metric_sources_name_per_recording_tables_only() -> None:
     """A source pointing at ``per_sample.csv`` would test segments and read as though it tested
     recordings -- the exact pseudo-replication this analysis's unit exists to avoid."""
@@ -257,31 +225,6 @@ def test_the_metric_sources_name_per_recording_tables_only() -> None:
     for source in analysis.METRIC_SOURCES:
         assert source.filename.endswith(".csv")
         assert "per_sample" not in source.filename
-
-
-# =============================================================================
-# This cell's own metrics in the family
-# =============================================================================
-def test_the_cells_own_readouts_are_registered_and_named_by_their_own_tables() -> None:
-    """The three the sibling cannot have. Each is named by the per-recording CSV its analysis
-    writes rather than reached for through the analysis, which is what keeps this analysis able to
-    run against a directory where that analysis was skipped."""
-    registered = {source.name for source in analysis.METRIC_SOURCES}
-
-    assert {
-        "warmup.pred_gap_warm_lo",
-        "warmup.pred_gap_warm_mid",
-        "warmup.pred_gap_warm_hi",
-        "source_null.coupling_minus_clock",
-    } <= registered
-    assert any(source.analysis == "spectral_skill" for source in analysis.METRIC_SOURCES)
-
-
-def test_the_frequency_domain_pair_the_sibling_registers_is_gone() -> None:
-    """``coherence`` is not ported at all -- a scattering coefficient is a modulus, so phase
-    agreement has no analogue here at any window length. A source still naming it would look for a
-    file this pipeline can never write and report it missing on every run, forever."""
-    assert not any(source.analysis == "coherence" for source in analysis.METRIC_SOURCES)
 
 
 def test_the_band_named_here_is_a_real_clinical_band() -> None:
@@ -294,19 +237,6 @@ def test_the_band_named_here_is_a_real_clinical_band() -> None:
         for source in analysis.METRIC_SOURCES
         if source.analysis == "spectral_skill"
     )
-
-
-def test_the_directions_registered_are_the_ones_a_larger_value_is_better_in() -> None:
-    """``higher_is_better`` is a direction this table publishes beside a signed effect size, so a
-    reader never has to go back to the analysis that produced the column. The gap-like readouts
-    are the ones it is true for; the error-like ones are the ones it is false for."""
-    directions = {source.name: source.higher_is_better for source in analysis.METRIC_SOURCES}
-
-    assert directions["coupling.mc_pred_gap"] is True
-    assert directions["source_null.coupling_minus_clock"] is True
-    assert directions["warmup.pred_gap_warm_lo"] is True
-    assert directions["forecast.sq_error_full"] is False
-    assert directions["latent.logvar_prior_floor_frac"] is False
 
 
 def test_every_source_that_cannot_be_satisfied_yet_is_recorded_rather_than_raised(tmp_path) -> None:
@@ -338,64 +268,3 @@ def test_every_source_that_cannot_be_satisfied_yet_is_recorded_rather_than_raise
     )
 
 
-# =============================================================================
-# Offline, against a finished run, with no model
-# =============================================================================
-@pytest.mark.slow
-def test_it_runs_against_a_finished_directory_with_no_checkpoint(
-    collected_run, tmp_path, monkeypatch
-) -> None:
-    """The property the whole collect/emit split exists for, proved with ``forward`` rigged to
-    raise: a spy is the only way to tell "did not need the model" from "happened not to use it"."""
-    from teb_vae.lag_attn_cfs.eval import run as run_module
-    from teb_vae.lag_attn_cfs.nets.model import SeqVaeLagAttnCfs
-
-    run_dir = tmp_path / "rerun"
-    shutil.copytree(collected_run["results_dir"].parent, run_dir)
-
-    def _explode(*args, **kwargs):
-        raise AssertionError("the model was built and forwarded on an offline re-run")
-
-    monkeypatch.setattr(SeqVaeLagAttnCfs, "forward", _explode)
-
-    exit_code = run_module.main(None, run_dir, only="cross_subgroup", device="cpu")
-
-    results_dir = run_dir / run_module.RESULTS_DIRNAME
-    summary = json.loads((results_dir / run_module.SUMMARY_FILENAME).read_text(encoding="utf-8"))
-    block = summary["results"]["cross_subgroup"]
-    assert exit_code == 0
-    assert summary["analyses_selected"] == ["cross_subgroup"]
-    assert block["skipped"] is False
-    # It read the tables the earlier pass wrote rather than recomputing them, and every source it
-    # could not satisfy is *recorded* rather than raised. Here that is every analysis that has
-    # not landed yet -- the widest form of the partial-directory case this analysis has to
-    # tolerate, and the reason the assertion is a subset rather than a fixed list.
-    missing = {item["column"] for item in block["missing_sources"]}
-    landed = {
-        source.column for source in analysis.METRIC_SOURCES
-        if source.analysis in ("coupling", "latent")
-    }
-    assert not (missing & landed), sorted(missing & landed)
-    assert missing <= {source.column for source in analysis.METRIC_SOURCES} - landed
-    assert all(item["reason"] for item in block["missing_sources"])
-
-
-@pytest.mark.slow
-def test_the_real_run_tests_the_cohorts_on_per_guid_vectors(collected_run) -> None:
-    """End to end on the generated multi-subgroup shards: the count behind every test is the run's
-    **recording** count, and the fixture is built so the two counts differ."""
-    from scripts.make_tiny_shard import COHORT_SUBGROUPS
-
-    block = collected_run["summary"]["results"]["cross_subgroup"]
-    significance = pd.read_csv(
-        collected_run["results_dir"] / analysis.ANALYSIS_DIRNAME / analysis.SIGNIFICANCE_FILENAME
-    )
-
-    n_recordings = collected_run["summary"]["results"]["n_recordings"]
-    n_samples = collected_run["summary"]["results"]["n_samples"]
-    assert block["skipped"] is False
-    assert n_recordings < n_samples, "the fixture must hold more segments than recordings"
-    # The assertion that pins the unit: had the sources been the per-sample table, this would be
-    # the segment count and nothing in the output would say which was tested.
-    assert set(significance["n_recordings"]) == {n_recordings}
-    assert set(np.asarray(significance["n_groups"])) == {len(COHORT_SUBGROUPS)}

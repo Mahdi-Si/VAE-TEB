@@ -511,9 +511,7 @@ Both decompose, measured parameter by parameter on constructed models:
   31 of 109 so the narrowing does. On the off-state row the same identity is the six-term one at a
   47-channel source and sums to +15,736.
 
-`DESIGN.md` §13 carries the same table; `tests/test_docs.py` measures every total in both documents
-by constructing the models rather than comparing against literals, so a change to a shared component
-re-costs the tables instead of failing an unrelated assertion.
+`DESIGN.md` §13 carries the same table.
 
 ---
 

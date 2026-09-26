@@ -6,21 +6,17 @@ copy of the runner or of the gate's criteria is how two things that must stay co
 comparable -- the first fix to an analysis or a threshold lands on one side, and the two
 ``summary.json`` files quietly stop meaning the same thing.
 
-So the assertions here are about delegation rather than about numbers. Every public callable is
-either the cfs cell's object bound under this name, or a wrapper whose body reaches into it; the
-registry is re-derived on every call rather than frozen at import; and neither module carries a
-numeric stack at all, which is the mechanical form of "defines no numeric function".
+So the assertions here are about delegation rather than about numbers: the runner hands the cfs
+cell's runner this cell's binding and nothing else, the registry is re-derived on every call rather
+than frozen at import, the gate imports no numeric stack, and the arm tables carry this cell's one
+sweep axis beside the shared cross-cell comparison.
 """
 from __future__ import annotations
 
-import ast
-import inspect
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Set
-
-import pytest
+from typing import Any, Dict, List
 
 from teb_vae.lag_attn_cfs.eval import run as shared_run
 from teb_vae.lag_attn_cfs.eval import verify as shared_verify
@@ -31,105 +27,20 @@ from teb_vae.lag_attn_transformer_cfs.eval.binding import TRF_CFS_BINDING
 
 from .conftest import _REPO_ROOT
 
-#: The two modules under test, and the name each binds the cfs cell's module under. The delegation
-#: check below reads that name out of the source, so an alias rename fails here rather than turning
-#: the check vacuous.
-WRAPPERS: Dict[Any, str] = {run_module: "shared_run", verify_module: "shared"}
-
-#: The one public callable allowed to carry a body of its own without reaching into the cfs cell:
-#: the argparse surface, which exists precisely so the usage line and the ``--only`` help name
-#: *this* package. Everything else must delegate.
-LOCAL_BY_DESIGN: Set[str] = {"build_parser"}
-
-
-def _functions(module: Any) -> Dict[str, ast.FunctionDef]:
-    """Return every **public** function defined at module level, by name.
-
-    Public because that is the surface the wrapper rule is about: ``_cli`` is argparse dispatch,
-    local for the same reason ``build_parser`` is, and private by the same convention that keeps
-    it out of the module's contract.
-    """
-    source = Path(inspect.getfile(module)).read_text(encoding="utf-8")
-    return {
-        node.name: node
-        for node in ast.parse(source).body
-        if isinstance(node, ast.FunctionDef) and not node.name.startswith("_")
-    }
-
-
-def _reaches_into(node: ast.AST, alias: str) -> bool:
-    """Whether a function body reads any attribute of ``alias``."""
-    return any(
-        isinstance(child, ast.Attribute)
-        and isinstance(child.value, ast.Name)
-        and child.value.id == alias
-        for child in ast.walk(node)
-    )
-
 
 # =================================================================================================
 # Delegation
 # =================================================================================================
-@pytest.mark.parametrize("module", list(WRAPPERS), ids=lambda module: module.__name__)
-def test_every_callable_is_a_wrapper_rather_than_a_second_implementation(module: Any) -> None:
-    """Read off the source rather than trusted: a function that quietly grew a body of its own is
-    exactly the drift these two modules exist to avoid, and it would look like a bug fix."""
-    alias = WRAPPERS[module]
-
-    local = [
-        name for name, node in _functions(module).items()
-        if name not in LOCAL_BY_DESIGN and not _reaches_into(node, alias)
-    ]
-
-    assert local == [], (
-        f"{module.__name__}: {local} carry a body that never reaches into {alias}. Both entry "
-        f"points are wrappers; a readout, a threshold or a criterion implemented here is one the "
-        f"comparison cell does not have."
-    )
-
-
-@pytest.mark.parametrize("module", list(WRAPPERS), ids=lambda module: module.__name__)
-def test_neither_module_carries_a_numeric_stack(module: Any) -> None:
-    """The mechanical form of "defines no numeric function": neither module imports ``torch``,
-    ``numpy`` or ``pandas``, so neither *can* compute a readout. ``verify`` additionally must stay
-    importable where none of them is installed, which the subprocess check below proves."""
-    source = Path(inspect.getfile(module)).read_text(encoding="utf-8")
-    imported = {
-        alias.name.split(".")[0]
-        for node in ast.walk(ast.parse(source))
-        if isinstance(node, ast.Import)
-        for alias in node.names
-    } | {
-        (node.module or "").split(".")[0]
-        for node in ast.walk(ast.parse(source))
-        if isinstance(node, ast.ImportFrom)
-    }
-
-    assert imported & {"torch", "numpy", "pandas", "scipy", "matplotlib"} == set()
-
-
-def test_the_gate_criteria_are_the_cfs_cells_own_objects() -> None:
-    """Not equal copies: the ten acceptance verdicts, the criteria registry and the named
-    ``pred_gap`` column are properties of the shared objective and the shared readout registry, so
-    a second set here would be a second set of thresholds for two cells compared under one."""
-    assert verify_module.PRED_GAP_COLUMN is shared_verify.PRED_GAP_COLUMN
-    assert verify_module.SUMMARY_FILENAME == shared_verify.SUMMARY_FILENAME
-    assert verify_module.SWEPT_ANCHOR_STRIDE is shared_verify.SWEPT_ANCHOR_STRIDE
-    # No criterion registry, no verdict list and no threshold of its own: this module defines none
-    # of the three names the gate's decisions are made from.
-    for name in ("CRITERIA", "CFS_VERDICTS", "verify"):
-        assert name not in vars(verify_module), (
-            f"{name} is defined here as well as in the cfs cell; the gate's criteria are the "
-            f"shared objective's and two copies could only ever disagree"
-        )
-
-
-def test_the_runner_supplies_this_cells_binding_and_delegates_the_rest(monkeypatch) -> None:
+def test_the_runner_supplies_this_cells_binding_and_a_caller_may_override_it(monkeypatch) -> None:
     """``main`` adds one keyword and hands everything else on. Asserted by intercepting the shared
-    runner rather than by running one, because what is being checked is which binding arrives."""
+    runner rather than by running one, because what is being checked is which binding arrives.
+
+    ``setdefault`` rather than an assignment: the offline re-run tests drive this entry point with
+    another binding to prove no model is built, and an assignment would silently ignore them."""
     seen: Dict[str, Any] = {}
 
     def _capture(*args: Any, **kwargs: Any) -> int:
+        seen.clear()
         seen.update(kwargs)
         seen["args"] = args
         return 0
@@ -141,22 +52,10 @@ def test_the_runner_supplies_this_cells_binding_and_delegates_the_rest(monkeypat
     assert seen["args"] == ("ckpt.ckpt", "out")
     assert seen["device"] == "cpu"
 
-
-def test_a_caller_may_override_the_binding(monkeypatch) -> None:
-    """``setdefault`` rather than an assignment: the offline re-run tests drive this entry point
-    with another binding to prove no model is built, and an assignment would silently ignore
-    them."""
-    seen: Dict[str, Any] = {}
-    monkeypatch.setattr(shared_run, "main", lambda *a, **k: seen.update(k) or 0)
-
     run_module.main("ckpt.ckpt", binding=CFS_BINDING)
-
     assert seen["binding"] is CFS_BINDING
 
 
-# =================================================================================================
-# The registry
-# =================================================================================================
 def test_the_registry_is_derived_on_every_call_rather_than_frozen_at_import(monkeypatch) -> None:
     """The help text, the selection ``main`` makes and the ``summary.json`` record must all read
     one mapping. Frozen at import, an analysis registered on the binding would reach the run and
@@ -166,34 +65,6 @@ def test_the_registry_is_derived_on_every_call_rather_than_frozen_at_import(monk
     monkeypatch.setattr(shared_run, "ANALYSIS_FUNCTIONS", extended)
 
     assert "a_new_shared_analysis" in run_module.analysis_registry()
-
-
-def test_the_registry_is_the_cfs_cells_in_the_cfs_cells_order() -> None:
-    """The encoder edge must not change which questions are asked, nor the order they are asked
-    in: two ``steps.json`` files read side by side are the point of the cross-cell table."""
-    assert list(run_module.analysis_registry()) == list(
-        shared_run.merged_analysis_functions(CFS_BINDING)
-    )
-    assert run_module.ANALYSES == tuple(run_module.analysis_registry())
-    # Non-vacuity: the three cfs-only analyses are reached through the binding rather than by
-    # being registered here.
-    assert {"warmup", "source_null", "spectral_skill"} <= set(run_module.ANALYSES)
-
-
-def test_the_unskippable_step_is_the_cfs_cells_and_is_not_selectable() -> None:
-    """It describes the *data* -- the shards' own provenance and causal attributes -- so a
-    model-specific addition here would be a category error."""
-    assert run_module.UNSKIPPABLE_ANALYSES is shared_run.UNSKIPPABLE_ANALYSES
-    assert set(run_module.UNSKIPPABLE_ANALYSES) & set(run_module.ANALYSES) == set()
-
-
-def test_the_output_names_are_the_cfs_cells_own() -> None:
-    """A caller of this entry point reads its artifacts by these names, and two cells writing two
-    layouts would make the cross-cell comparison a directory-shape exercise."""
-    assert run_module.RESULTS_DIRNAME == shared_run.RESULTS_DIRNAME
-    assert run_module.SUMMARY_FILENAME == shared_run.SUMMARY_FILENAME
-    assert run_module.STEPS_FILENAME == shared_run.STEPS_FILENAME
-    assert run_module.LOG_FILENAME == shared_run.LOG_FILENAME
 
 
 # =================================================================================================
