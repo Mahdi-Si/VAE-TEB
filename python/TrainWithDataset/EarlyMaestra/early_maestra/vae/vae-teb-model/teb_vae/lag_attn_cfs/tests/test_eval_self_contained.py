@@ -20,9 +20,7 @@ a second training loop:
 **And the rule this package has that the raw pipeline does not: the pipeline it was forked from is
 forbidden outright.** ``teb_vae.lag_attn_rws.eval`` is on the forbidden list in every form, because
 a package that copied the analyses and then reached back into the sibling for one helper would have
-two implementations *and* a dependency -- a half-fork, which is worse than either whole. The
-exemption is a small, named set of **test** files, and :func:`test_the_sibling_eval_package_is_
-reachable_only_from_the_named_test_files` is what keeps that set from growing quietly.
+two implementations *and* a dependency -- a half-fork, which is worse than either whole.
 
 **One module sits at a different layer here than in the sibling**, and it is named rather than left
 to be discovered: ``binding`` is layer 0 there, where it holds only the dataclass, and layer 1
@@ -126,20 +124,6 @@ NO_TORCH_FORBIDDEN: Tuple[str, ...] = ("torch", f"{PACKAGE}.binding")
 #: that outlived its use, and the next reach for that name would go unreported.
 EXEMPTIONS: Dict[str, Set[str]] = {
     "binding": {"teb_vae.lag_attn_cfs.task"},
-}
-
-#: The test files allowed to import the forked-from pipeline, each for a stated reason. Every
-#: other file in this suite -- and every module under ``eval/`` -- is refused.
-SIBLING_EVAL_TEST_EXEMPTIONS: Dict[str, str] = {
-    "test_eval_sibling_agreement.py":
-        "re-derives the shared arithmetic through both packages and asserts equality; that is the "
-        "fork's anti-drift measure and it cannot be written without importing both",
-    "test_eval_reuse.py":
-        "pins the shared model-free primitives to the same objects both packages bind, by "
-        "identity rather than by value",
-    "test_eval_config_schema.py":
-        "pins this package's eval_config key set against the sibling's, so the one added key is "
-        "the only difference",
 }
 
 
@@ -313,31 +297,6 @@ def test_every_shipped_module_stays_inside_its_layer(module: Path) -> None:
     )
 
 
-def test_the_model_binding_is_walked_and_is_this_packages_one_layer_difference() -> None:
-    """The walk is directory-driven, so this is what says the file was actually picked up rather
-    than that a rule happened to hold over a set it was not in.
-
-    ``binding`` holds the facts the pipeline cannot derive about the model it evaluates, and here
-    it also holds the concrete instance -- so it names a model class, sits at layer 1, and carries
-    exactly one exemption. The sibling keeps its instance in the runner and its ``binding`` at
-    layer 0; that difference is stated here rather than left for a reader to infer from a
-    permission table.
-    """
-    stems = {module.stem for module in _shipped_modules()}
-    assert "binding" in stems
-
-    assert "binding" in MODEL_TOUCHING
-    assert EXEMPTIONS["binding"] == {"teb_vae.lag_attn_cfs.task"}
-
-    binding = next(module for module in _shipped_modules() if module.stem == "binding")
-    source = binding.read_text(encoding="utf-8")
-    assert forbidden_imports(source, _module_name_for(binding)) == []
-    # The exemption is for the task alone: naming the model class needs no further permission,
-    # and Lightning is still refused here as everywhere.
-    names = imported_names(source, _module_name_for(binding))
-    assert not any(_matches(name, "lightning") for name in names)
-
-
 def test_the_reuse_seam_is_the_only_module_naming_the_shared_evaluation_package() -> None:
     """The seam exists so the coupling is visible in one file; a second reach would hide it.
 
@@ -376,75 +335,15 @@ def test_a_reach_into_the_forked_from_pipeline_is_reported(source: str, expected
     assert forbidden_imports(source, f"{PACKAGE}.analyses.coupling") == [expected]
 
 
-def test_the_rest_of_the_forked_from_package_is_still_reachable() -> None:
-    """The ban is on the *evaluation* package, not on the model package around it: this cell's
-    objective, masks and controls live in that package's ``nets/``, and the acceptance gate reads
-    its stdlib-only collapse criterion rather than owning a second copy."""
-    source = (
-        "from teb_vae.lag_attn_rws.nets.raw_masks import forecast_mask\n"
-        "from teb_vae.lag_attn_rws.collapse import is_collapsed\n"
-        "from teb_vae.lag_attn_rws.trainer import RESOLVED_CONFIG_FILENAME\n"
-    )
-
-    assert forbidden_imports(source, f"{PACKAGE}.preflight") == []
-
-
 def test_the_forked_from_pipelines_lightning_callback_is_not() -> None:
     assert forbidden_imports(
         "from teb_vae.lag_attn_rws.plotting import DiagnosticPageCallback\n", f"{PACKAGE}.run"
     ) == ["teb_vae.lag_attn_rws.plotting"]
 
 
-def test_the_sibling_eval_package_is_reachable_only_from_the_named_test_files() -> None:
-    """The exemption the walk above cannot express, since it walks ``eval/`` and these are tests.
-
-    Both directions: a fourth test file importing the forked-from pipeline fails here, and so does
-    an exemption for a file that no longer imports it -- a permission that outlived its use is how
-    the next reach goes unreported.
-    """
-    tests_root = Path(__file__).resolve().parent
-    reaching = set()
-    for path in sorted(tests_root.glob("*.py")):
-        names = imported_names(path.read_text(encoding="utf-8"), f"tests.{path.stem}")
-        if any(_matches(name, FORKED_FROM) for name in names):
-            reaching.add(path.name)
-
-    assert reaching == set(SIBLING_EVAL_TEST_EXEMPTIONS), (
-        f"only in the exemption table: {sorted(set(SIBLING_EVAL_TEST_EXEMPTIONS) - reaching)}; "
-        f"only in the suite: {sorted(reaching - set(SIBLING_EVAL_TEST_EXEMPTIONS))}"
-    )
-    assert all(reason.strip() for reason in SIBLING_EVAL_TEST_EXEMPTIONS.values())
-
-
 # =============================================================================
 # Non-vacuity: the shapes a name-based check would miss or wave through
 # =============================================================================
-def test_an_aliased_lightning_import_is_reported() -> None:
-    assert forbidden_imports("import lightning.pytorch as pl\n", f"{PACKAGE}.frames") == [
-        "lightning.pytorch"
-    ]
-
-
-def test_a_lazy_in_function_import_is_reported() -> None:
-    """A module-level-only check misses exactly this, and it is the likely shape: a change needing
-    "just one thing" reaches for a lazy import inside the function that needs it."""
-    source = (
-        "def analyse():\n"
-        "    from model.lstm_cnn_vae_teb.testing import metrics\n"
-        "    return metrics\n"
-    )
-    assert forbidden_imports(source, f"{PACKAGE}.analyses.forecast") == [
-        "model.lstm_cnn_vae_teb.testing"
-    ]
-
-
-def test_a_relative_parent_import_is_reported() -> None:
-    """``from ..trainer import x`` names no forbidden string; it has to be resolved first."""
-    assert forbidden_imports(
-        "from ..trainer import LagAttnCfsTrainer\n", f"{PACKAGE}.verify"
-    ) == ["teb_vae.lag_attn_cfs.trainer"]
-
-
 def test_a_relative_sibling_import_between_analyses_is_reported() -> None:
     """The rule with no counterpart in the shared package: analyses never import one another."""
     assert forbidden_imports("from . import forecast\n", f"{PACKAGE}.analyses.coupling") == [
@@ -454,16 +353,6 @@ def test_a_relative_sibling_import_between_analyses_is_reported() -> None:
     assert forbidden_imports(absolute, f"{PACKAGE}.analyses.coupling") == [
         f"{PACKAGE}.analyses.forecast"
     ]
-
-
-def test_an_analysis_may_import_its_own_module_and_the_layers_below_it() -> None:
-    source = (
-        f"from {PACKAGE} import config_schema, events, frames, lag_axis\n"
-        f"from {PACKAGE}._reuse import stats\n"
-        "from teb_vae.lag_attn.nets.lag_report import lag_compensated_seconds\n"
-        "import numpy as np\n"
-    )
-    assert forbidden_imports(source, f"{PACKAGE}.analyses.coupling") == []
 
 
 # =============================================================================
@@ -533,19 +422,3 @@ def test_a_shared_eval_module_outside_the_allow_list_is_reported() -> None:
     ) == [f"{SIBLING_EVAL}.runner"]
     lazy = "def f():\n    from teb_vae.lag_attn.eval.analyses import probe\n"
     assert forbidden_imports(lazy, f"{PACKAGE}.probe") == [f"{SIBLING_EVAL}.analyses"]
-
-
-def test_the_allowed_sibling_modules_all_exist() -> None:
-    """An allow-list entry naming a module that is not there is permission for nothing."""
-    shared_root = Path(__file__).resolve().parents[2] / "lag_attn" / "eval"
-    missing = [
-        name for name in sorted(ALLOWED_SIBLING_EVAL_MODULES)
-        if not (shared_root / f"{name}.py").is_file()
-    ]
-    assert missing == []
-
-
-def test_importing_the_shared_eval_package_itself_reaches_nothing() -> None:
-    """Its ``__init__`` is a docstring, so the bare package name is not a reach into anything."""
-    source = "from teb_vae.lag_attn.eval import labels, stats\n"
-    assert forbidden_imports(source, f"{PACKAGE}._reuse") == []

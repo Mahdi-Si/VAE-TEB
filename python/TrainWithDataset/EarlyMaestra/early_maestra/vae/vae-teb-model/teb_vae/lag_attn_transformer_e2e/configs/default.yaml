@@ -157,7 +157,7 @@ model_config:
     # value the model derived before the key existed -- explicit and sweepable rather than
     # implied. null restores the derivation. A budget may only tighten the ceiling, never raise
     # it. The shipped front end reaches 322 of those 480; the number is stated in the run's
-    # startup log and pinned by tests/test_frontend_reach.py.
+    # startup log.
     frontend_reach_budget_s: 120.0
     sequence_length: 300
     # NOTE there is no c_y / c_u / use_up_st here, and no front-end key either. The two inputs are

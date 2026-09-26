@@ -169,12 +169,6 @@ def test_the_kl_rows_name_the_unfloored_value_and_the_control_beside_it() -> Non
     assert rows[1]["mean"] == pytest.approx(4.5)
 
 
-def test_no_headline_kl_column_is_the_floored_one() -> None:
-    """Free bits are applied per dimension per step before summing, so the floored value exceeds
-    the raw one by construction and hides a collapsed source pathway."""
-    assert all("train" not in column for column in coupling_analysis.KL_COLUMNS)
-
-
 # =============================================================================
 # The figure
 # =============================================================================

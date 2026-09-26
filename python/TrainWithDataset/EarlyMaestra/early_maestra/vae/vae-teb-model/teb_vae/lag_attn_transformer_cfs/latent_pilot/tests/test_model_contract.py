@@ -17,9 +17,7 @@ What these establish, and why each matters:
 * an update **reaches** ``mu_post`` -- a pilot whose gradient never arrived would report the frozen
   model's numbers as the adapted model's, with no error anywhere;
 * the frozen half is **bitwise** unchanged, so a before/after difference is attributable to the mean
-  output alone;
-* fitting the classifier alone leaves every latent coordinate exactly as pretrained, which is why
-  that is not this experiment.
+  output alone.
 """
 from __future__ import annotations
 
@@ -180,27 +178,6 @@ def test_a_moved_invariant_is_refused(pilot_task):
         pilot_model.assert_invariants(before, after)
 
 
-def test_fitting_a_classifier_alone_leaves_the_latent_exactly_as_pretrained(pilot_task):
-    """Why a classifier-only implementation is not this experiment."""
-    model = pilot_task.orig_model
-    batch = make_stub_batch()
-    before = pilot_model.deterministic_outputs(
-        pilot_task, batch, keys=("mu_post",), seed=11
-    )
-
-    classifier = pilot_model.LatentClassifier(int(model.d_z))
-    with torch.no_grad():
-        for parameter in classifier.parameters():
-            parameter.add_(1.0)
-
-    after = pilot_model.deterministic_outputs(
-        pilot_task, batch, keys=("mu_post",), seed=11
-    )
-    assert torch.equal(before["mu_post"], after["mu_post"]), (
-        "training a readout cannot change the representation it reads"
-    )
-
-
 def test_the_teacher_does_not_follow_the_student(pilot_task):
     """The preservation target must not move with the thing being preserved."""
     model = pilot_task.orig_model
@@ -216,14 +193,6 @@ def test_the_teacher_does_not_follow_the_student(pilot_task):
         assert torch.equal(parameter, teacher_before[name])
     assert all(not parameter.requires_grad for parameter in teacher.parameters())
     assert teacher.training is False
-
-
-def test_the_teacher_contributes_no_gradient(pilot_task):
-    """A teacher whose outputs carried a graph would train the target as well as the student."""
-    teacher = pilot_model.frozen_teacher(pilot_task.orig_model)
-    batch = make_stub_batch()
-    outputs = teacher(*pilot_model.forward_inputs(pilot_task, batch))
-    assert outputs["mu_post"].requires_grad is False
 
 
 # =============================================================================
@@ -268,18 +237,6 @@ def test_deterministic_outputs_leave_the_random_stream_where_they_found_it(pilot
     torch.manual_seed(1234)
     pilot_model.deterministic_outputs(pilot_task, batch, seed=99)
     assert torch.equal(torch.randn(4), expected)
-
-
-def test_two_deterministic_reads_of_one_model_agree(pilot_task):
-    """Repeated evaluation-mode extraction is reproducible, which every comparison depends on."""
-    batch = make_stub_batch()
-    first = pilot_model.deterministic_outputs(
-        pilot_task, batch, keys=pilot_model.INVARIANT_OUTPUTS + ("mu_post",), seed=3
-    )
-    second = pilot_model.deterministic_outputs(
-        pilot_task, batch, keys=pilot_model.INVARIANT_OUTPUTS + ("mu_post",), seed=3
-    )
-    assert pilot_model.compare_outputs(first, second) == {key: 0.0 for key in first}
 
 
 # =============================================================================

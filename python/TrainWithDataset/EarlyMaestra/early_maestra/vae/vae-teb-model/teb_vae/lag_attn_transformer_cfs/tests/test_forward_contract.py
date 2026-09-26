@@ -1,18 +1,17 @@
 r"""What the forward returns, at this architecture, and that it is the causal cell's contract.
 
-Twenty-two keys: the architecture's twenty, plus the anchor index and its validity companion. This
-package needs a forward-contract module where the two-sided conv-Transformer cell does not, and the
-reason is where the forward lives. That cell's forward is its architecture parent's own code object,
+The architecture's keys plus the anchor index and its validity companion. This package needs a
+forward-contract module where the two-sided conv-Transformer cell does not, and the reason is where
+the forward lives. That cell's forward is its architecture parent's own code object,
 pinned by that parent's own suite; this one's is the *causal mixin's*, so what has to be shown here
 is that composing the mixin over a different architecture leaves the contract intact -- same key
-set, same dtypes, same shapes, same arity.
+set, same dtypes, same shapes -- and that the two anchor arguments are refused rather than defaulted
+where a default would silently change the anchor set.
 
 The comparison is made against the conv-LSTM causal cell rather than against a written-out literal,
 so a change to the shared forward moves both sides at once instead of failing a constant here.
 """
 from __future__ import annotations
-
-import inspect
 
 import pytest
 import torch
@@ -41,7 +40,7 @@ _ANCHOR_KEYS = ("anchor_index", "anchor_valid")
 
 
 def _architecture_keys() -> set:
-    """The twenty keys the bare conv-Transformer architecture returns at this geometry."""
+    """The keys the bare conv-Transformer architecture returns at this geometry."""
     kwargs = {
         name: value
         for name, value in tiny_warmup_kwargs().items()
@@ -56,7 +55,7 @@ def _architecture_keys() -> set:
 
 
 def _conv_lstm_keys() -> set:
-    """And the twenty-two the conv-LSTM causal cell returns, which must be the same set."""
+    """And the keys the conv-LSTM causal cell returns, which must be the same set."""
     kwargs = conv_lstm_tiny_warmup_kwargs()
     torch.manual_seed(0)
     model = SeqVaeLagAttnCfs(**kwargs).eval()
@@ -83,23 +82,19 @@ def outputs():
 # =================================================================================================
 # The key set
 # =================================================================================================
-def test_the_forward_returns_exactly_twenty_two_keys(outputs) -> None:
+def test_the_forward_returns_the_architectures_keys_plus_the_anchor_pair(outputs) -> None:
     """By set equality against both neighbours in the grid, so neither a new key nor a lost one
-    passes -- and so that a change to the shared forward fails on the change rather than here."""
+    passes -- and so that a change to the shared forward fails on the change rather than here.
+
+    And the keys this architecture must not return: no ``decoder_state`` and no ``delta_mu_src``,
+    because the decoder receives the latent and nothing else; and no ``persistence`` with the
+    residual off, because a key present and ``None`` would be indistinguishable from a mechanism
+    that ran and produced nothing."""
     _model, out = outputs
 
-    assert len(out) == 22
     assert set(out) == _architecture_keys() | set(_ANCHOR_KEYS)
     assert set(out) == _conv_lstm_keys()
-
-
-def test_the_pathways_this_architecture_does_not_have_are_absent(outputs) -> None:
-    """No ``decoder_state`` and no ``delta_mu_src``: the decoder receives the latent and nothing
-    else, so there is no bypass to report and no source term added around it."""
-    _model, out = outputs
-
-    assert "decoder_state" not in out
-    assert "delta_mu_src" not in out
+    assert not {"decoder_state", "delta_mu_src", "persistence"} & set(out)
 
 
 def test_the_anchor_keys_carry_the_dtypes_their_consumers_index_with(outputs) -> None:
@@ -174,30 +169,8 @@ def test_the_two_causal_cells_agree_shape_for_shape(outputs) -> None:
 
 
 # =================================================================================================
-# The signature
+# The two anchor arguments
 # =================================================================================================
-def test_the_signature_is_the_three_streams_and_the_two_anchor_arguments() -> None:
-    """A literal list, as in every sibling's invariants file: the anchor geometry is an argument
-    rather than something derived from ``self.training``, and the parameter list is where that
-    decision is visible."""
-    assert list(inspect.signature(SeqVaeLagAttnTrfCfs.forward).parameters) == [
-        "self",
-        "y_st",
-        "y_ph",
-        "u_stream",
-        "anchor_phase",
-        "anchor_stride",
-    ]
-    # The architecture parent's is three, which is what the mixin extends -- and it is the reason
-    # the one arity-sensitive consumer in the tree needs a replacement here.
-    assert list(inspect.signature(SeqVaeLagAttnTrfRws.forward).parameters) == [
-        "self",
-        "y_st",
-        "y_ph",
-        "u_stream",
-    ]
-
-
 def test_the_three_tensor_call_still_works_and_agrees_with_a_zero_phase(tiny_warmup) -> None:
     """At the inert default stride both are the dense range, and they agree bitwise."""
     model = build(tiny_warmup).eval()
@@ -243,14 +216,6 @@ def test_a_non_zero_phase_is_refused_at_stride_one(tiny_warmup) -> None:
 # re-decode takes it, or the shuffle gap shifts for a reason that has nothing to do with the source.
 # Recomputing it at each site would be three chances to gather a different row.
 # =================================================================================================
-def test_the_forward_returns_no_persistence_key_when_the_residual_is_off(outputs) -> None:
-    """The off-state on the contract itself. A key present and ``None`` would be indistinguishable
-    from a mechanism that ran and produced nothing, and every consumer would have to test for it."""
-    _model, out = outputs
-
-    assert "persistence" not in out
-
-
 def test_the_persistence_key_is_the_targets_own_value_at_each_anchor() -> None:
     r"""$(B, A_{\max}, C_{\mathrm{keep}})$, gathered from the TARGET stream on the kept axis.
 

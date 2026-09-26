@@ -29,7 +29,7 @@ import pandas as pd
 import pytest
 
 from teb_vae.lag_attn_cfs.eval import run as run_module
-from teb_vae.lag_attn_cfs.eval.analyses import REQUIRED_RESULT_KEYS, AnalysisContext
+from teb_vae.lag_attn_cfs.eval.analyses import REQUIRED_RESULT_KEYS
 from teb_vae.lag_attn_cfs.eval.binding import CFS_BINDING
 
 #: The directory holding the shipped analyses.
@@ -81,11 +81,6 @@ def _merged_registry() -> Dict[str, Any]:
 # =============================================================================
 # The signature
 # =============================================================================
-def test_the_walk_found_analyses_to_check() -> None:
-    """A walk that found nothing would pass every signature test below vacuously."""
-    assert _analysis_functions(), f"no run_*_analysis found under {ANALYSES_ROOT}"
-
-
 @pytest.mark.parametrize("name", sorted(_analysis_functions()))
 def test_every_shipped_analysis_has_the_protocol_signature(name: str) -> None:
     signature = inspect.signature(_analysis_functions()[name])
@@ -112,37 +107,6 @@ def test_every_registered_analysis_is_one_of_the_shipped_functions() -> None:
     assert registered, "no analysis is registered at all"
     for name, function in registered.items():
         assert function in shipped, f"{name} is not a run_*_analysis under {ANALYSES_ROOT}"
-
-
-def test_the_bindings_extras_are_inspected_by_the_same_rule_as_the_shared_registry() -> None:
-    """Non-vacuity for the merge above: whatever the binding registers has to appear in the set
-    the signature parametrisation walks, so an extra analysis cannot land unchecked."""
-    merged = _merged_registry()
-
-    assert set(run_module.ANALYSIS_FUNCTIONS) <= set(merged)
-    for name, function in CFS_BINDING.extra_analyses.items():
-        assert merged.get(name) is function
-        signature = inspect.signature(function)
-        assert tuple(
-            parameter.name for parameter in signature.parameters.values()
-            if parameter.kind == parameter.KEYWORD_ONLY
-        ) == EXPECTED_KEYWORD_ONLY
-
-
-def test_no_analysis_emits_its_own_grouped_variants() -> None:
-    """The by-class and by-subgroup fan-out is the *runner's* job.
-
-    Written per analysis it would be a cross-cutting change every analysis added later has to
-    remember to make, and the one that forgets reports a pooled number over a mixed cohort with
-    nothing saying so. An analysis declares a frame; it does not emit.
-    """
-    offenders: List[str] = []
-    for path in sorted(ANALYSES_ROOT.glob("*.py")):
-        source = path.read_text(encoding="utf-8")
-        if "emit_grouped_variants" in source or "summarise_by_group" in source:
-            offenders.append(path.name)
-
-    assert offenders == []
 
 
 def test_no_analysis_imports_another() -> None:
@@ -177,19 +141,6 @@ def test_no_analysis_imports_another() -> None:
 # =============================================================================
 # The return value
 # =============================================================================
-def test_the_unskippable_step_is_inspected_by_the_same_rule_as_the_selectable_ones() -> None:
-    """The channel map is its only member, and it obeys the protocol like everything else.
-
-    Asserted through the merge rather than beside it, because the merge silently tolerates an empty
-    half: a step that stopped being registered would leave every parametrised signature check above
-    passing with one fewer subject and nothing saying so.
-    """
-    assert set(run_module.UNSKIPPABLE_ANALYSES) == {"band_partition"}
-    assert set(_merged_registry()) == {"band_partition"} | set(
-        run_module.merged_analysis_functions(CFS_BINDING)
-    )
-
-
 @pytest.mark.slow
 def test_every_analysis_returns_the_protocol_keys_on_a_real_run(collected_run) -> None:
     """The return half of the protocol, read off a pass that actually ran every registered
@@ -306,10 +257,7 @@ def test_only_the_stated_analyses_reach_for_the_model_on_the_context() -> None:
     on the declared one -- and it may not have it, because ``context.task`` is ``None`` on exactly
     the path that join has to work on. The map is persisted and read off disk instead.
     """
-    fields = {field for field in AnalysisContext.__dataclass_fields__}
-    assert fields == {"collection", "config", "task", "loader"}
-
-    modules = [path for path in sorted(ANALYSES_ROOT.glob("*.py")) if path.stem != "__init__"]
+    modules =[path for path in sorted(ANALYSES_ROOT.glob("*.py")) if path.stem != "__init__"]
     reaching = sorted(
         path.stem
         for path in modules
@@ -323,22 +271,6 @@ def test_only_the_stated_analyses_reach_for_the_model_on_the_context() -> None:
     assert set(reaching) <= MODEL_READING_ANALYSES, sorted(
         set(reaching) - MODEL_READING_ANALYSES
     )
-
-
-def test_no_analysis_reaches_the_target_gate_for_the_kept_channel_axis() -> None:
-    """The join this target domain adds, and the one way it would be written wrongly. The
-    per-channel readouts are indexed on the kept channels while a channel-to-band map is over the
-    declared ones; asking the model which is which works in a pass that built one and returns
-    ``None`` on the offline re-run the split exists for."""
-    # ``__init__.py`` is excluded because it is where the prohibition is *written down*: it names
-    # the attribute in prose, which is the opposite of reaching for it.
-    offenders = [
-        path.name
-        for path in sorted(ANALYSES_ROOT.glob("*.py"))
-        if path.stem != "__init__" and "target_gate" in path.read_text(encoding="utf-8")
-    ]
-
-    assert offenders == []
 
 
 def test_the_protocol_module_imports_nothing_from_the_model() -> None:

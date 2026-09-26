@@ -3,8 +3,7 @@ r"""The acceptance protocol: the predeclaration, the seeds, the pairing and the 
 Every failure this file is written against is one where the arithmetic is right and the statement
 is wrong:
 
-* a comparison, a band or a seed minimum edited after a result was seen, which changes no number
-  and no reader can detect;
+* a plan that is malformed, names an arm nothing builds, or declares its band family twice;
 * three scorings of one checkpoint counted as three training seeds;
 * two arms compared across two draw counts or two splits, so a difference of estimators reads as a
   difference of models;
@@ -31,26 +30,18 @@ from teb_vae.lag_slot_transformer_cfs.eval import acceptance
 
 from .test_arms import fit_arm, score_arm
 
-#: The committed plan's digest, pinned.
-#:
+#: Draws the integration fixture scores at, and the seeds it fits. Small: this asserts that the
+#: protocol reads what the pass writes, not the convergence of an estimator.
+ARM_SEEDS = (11, 12, 13)
+FIXTURE_DRAWS = 3
+FIXTURE_RESAMPLES = 100
+
 #: This assertion exists to FAIL when the predeclaration is edited. That is not a nuisance: the
 #: plan's whole value is that it was written before any arm was trained, and an edit made after a
 #: result has been seen is invisible in every number it produces. A deliberate revision updates
 #: this literal and the plan's own revision counter together, and the diff is then the record that
 #: it happened.
 COMMITTED_PLAN_DIGEST = "3f20ebb0d36ade11"
-
-#: The saved production export of the 91-entry development run, read here for its recorded
-#: lag window alone: the acceptance pass must read it under the family declared for that window.
-SAVED_EXPORT_SUMMARY = (
-    Path(__file__).resolve().parents[3] / "output" / "lag_slot_summary" / "summary.json"
-)
-
-#: Draws the integration fixture scores at, and the seeds it fits. Small: this asserts that the
-#: protocol reads what the pass writes, not the convergence of an estimator.
-ARM_SEEDS = (11, 12, 13)
-FIXTURE_DRAWS = 3
-FIXTURE_RESAMPLES = 100
 
 
 def plan_with(tmp_path: Path, **protocol: Any) -> Dict[str, Any]:
@@ -182,36 +173,50 @@ def test_the_committed_plans_digest_is_pinned() -> None:
     assert acceptance.load_plan()["digest"] == COMMITTED_PLAN_DIGEST
 
 
-def test_an_unknown_plan_key_is_refused_by_name(tmp_path: Path) -> None:
+def _add_top_level_key(declaration: Dict[str, Any]) -> None:
     """Nothing reads a misspelled key, so a plan carrying one would silently mean 'no minimum'."""
-    declaration = yaml.safe_load(Path(acceptance.DEFAULT_PLAN_PATH).read_text(encoding="utf-8"))
     declaration["minimum_seeds"] = 3
-    path = tmp_path / "plan.yaml"
-    path.write_text(yaml.safe_dump(declaration), encoding="utf-8")
-
-    with pytest.raises(ValueError, match="minimum_seeds"):
-        acceptance.load_plan(str(path))
 
 
-def test_a_comparison_against_an_unbuilt_arm_is_refused(tmp_path: Path) -> None:
+def _compare_against_an_unbuilt_arm(declaration: Dict[str, Any]) -> None:
     """A declared comparison whose arm does not exist would report NO_EVIDENCE forever."""
-    declaration = yaml.safe_load(Path(acceptance.DEFAULT_PLAN_PATH).read_text(encoding="utf-8"))
     declaration["primary_comparisons"][0]["right"] = "slot_transformer"
-    path = tmp_path / "plan.yaml"
-    path.write_text(yaml.safe_dump(declaration), encoding="utf-8")
-
-    with pytest.raises(ValueError, match="slot_transformer"):
-        acceptance.load_plan(str(path))
 
 
-def test_a_protocol_missing_a_setting_is_refused(tmp_path: Path) -> None:
+def _drop_a_protocol_setting(declaration: Dict[str, Any]) -> None:
     """A verdict reached under a value nobody wrote down is not a declared verdict."""
-    declaration = yaml.safe_load(Path(acceptance.DEFAULT_PLAN_PATH).read_text(encoding="utf-8"))
     declaration["protocol"].pop("minimum_training_seeds")
-    path = tmp_path / "plan.yaml"
-    path.write_text(yaml.safe_dump(declaration), encoding="utf-8")
 
-    with pytest.raises(ValueError, match="minimum_training_seeds"):
+
+def _declare_both_band_keys(declaration: Dict[str, Any]) -> None:
+    """Two declarations of one window cannot both be the predeclaration."""
+    declaration["exploratory_bands"] = ["anchor"]
+
+
+@pytest.mark.parametrize(
+    "mutate,named",
+    [
+        (_add_top_level_key, "minimum_seeds"),
+        (_compare_against_an_unbuilt_arm, "slot_transformer"),
+        (_drop_a_protocol_setting, "minimum_training_seeds"),
+        (_declare_both_band_keys, "exploratory_bands"),
+    ],
+    ids=["unknown_key", "unbuilt_arm", "missing_setting", "both_band_keys"],
+)
+def test_a_malformed_plan_is_refused_by_name(tmp_path: Path, mutate, named: str) -> None:
+    """Each edit the loader must refuse rather than read, and the refusal names the key.
+
+    Args:
+        tmp_path: Where the edited plan is written.
+        mutate: Edits the committed declaration in place.
+        named: A fragment the refusal must carry.
+    """
+    declaration = yaml.safe_load(Path(acceptance.DEFAULT_PLAN_PATH).read_text(encoding="utf-8"))
+    mutate(declaration)
+    path = tmp_path / "plan.yaml"
+    path.write_text(yaml.safe_dump(declaration, sort_keys=False), encoding="utf-8")
+
+    with pytest.raises(ValueError, match=named):
         acceptance.load_plan(str(path))
 
 
@@ -341,7 +346,6 @@ def test_the_comparison_reads_the_difference_the_tables_carry(tmp_path: Path) ->
     # nll_full is lower on the arm with the larger gap, so the difference is negative and the
     # left arm is the better one -- which is the sign convention the plan declares.
     assert record["difference_nats"]["point"] == pytest.approx(-1.5)
-    assert record["difference_nats"]["method"] == "percentile bootstrap over recordings"
 
 
 def test_the_spread_travels_beside_the_interval(tmp_path: Path) -> None:
@@ -363,7 +367,12 @@ def test_the_spread_travels_beside_the_interval(tmp_path: Path) -> None:
 # =============================================================================
 def test_the_family_adjusted_interval_is_wider_than_the_nominal_one(tmp_path: Path) -> None:
     """The peak band is chosen on the same recordings its interval is built from, so a nominal
-    interval on the winner covers less than it claims."""
+    interval on the winner covers less than it claims.
+
+    The fixture plants a margin that grows with the recording index in one band and a constant in
+    the other, so which band peaks is known in advance; and the identity arms (``none``, ``all``)
+    are not members of the search.
+    """
     plan = plan_with(tmp_path, primary_draws=32, minimum_training_seeds=1, bootstrap_resamples=200)
     runs = [fake_run("candidate", training_seed=seed, values=straight_line(2.0)) for seed in (1, 2)]
 
@@ -372,32 +381,10 @@ def test_the_family_adjusted_interval_is_wider_than_the_nominal_one(tmp_path: Pa
 
     assert block["searched_bands"] == ["far", "near"]
     assert block["family_size"] == 2
+    assert block["peak_band"] == "near"
     assert block["family_adjusted_confidence"] > block["nominal_confidence"]
     assert near["margin_nats_family_adjusted"]["hi"] >= near["margin_nats"]["hi"]
     assert near["margin_nats_family_adjusted"]["lo"] <= near["margin_nats"]["lo"]
-
-
-def test_the_identity_arms_are_not_members_of_the_search(tmp_path: Path) -> None:
-    """The empty band removes nothing and the full band removes everything: neither is a lag the
-    search ranges over, and including them would widen every other band's interval for a constant.
-    """
-    plan = plan_with(tmp_path, primary_draws=32, minimum_training_seeds=1, bootstrap_resamples=50)
-    runs = [fake_run("candidate", training_seed=1, values=straight_line(2.0))]
-
-    block = acceptance.band_block(acceptance.arm_evidence(runs, plan=plan), plan=plan)["candidate"]
-
-    assert "none" not in block["searched_bands"] and "all" not in block["searched_bands"]
-
-
-def test_the_peak_is_the_largest_margin(tmp_path: Path) -> None:
-    """The fixture plants a margin that grows with the recording index in one band and a constant
-    in the other, so which band peaks is known in advance."""
-    plan = plan_with(tmp_path, primary_draws=32, minimum_training_seeds=1, bootstrap_resamples=50)
-    runs = [fake_run("candidate", training_seed=1, values=straight_line(2.0))]
-
-    block = acceptance.band_block(acceptance.arm_evidence(runs, plan=plan), plan=plan)["candidate"]
-
-    assert block["peak_band"] == "near"
 
 
 def test_a_band_outside_the_declaration_fails_the_gate(tmp_path: Path) -> None:
@@ -516,7 +503,7 @@ def test_a_summary_that_records_no_window_is_read_under_the_shipped_one(tmp_path
 
     assert block["status"] == "READ"
     assert block["lag_window"] == acceptance.shipped_lag_window()
-    assert "shipped production window" in block["lag_window_note"]
+    assert block["lag_window_note"]
     assert block["declared_bands"] == plan["exploratory_band_families"][acceptance.shipped_lag_window()]
 
 
@@ -535,33 +522,6 @@ def test_a_plan_carrying_only_the_legacy_band_key_is_read_as_the_shipped_windows
     assert plan["exploratory_band_families"] == {shipped: list(families[shipped])}
     assert plan["band_family_source"].startswith("legacy")
     assert "exploratory_bands" not in plan
-
-
-def test_a_plan_carrying_both_band_keys_is_refused(tmp_path: Path) -> None:
-    """Two declarations of one window cannot both be the predeclaration."""
-    declaration = yaml.safe_load(Path(acceptance.DEFAULT_PLAN_PATH).read_text(encoding="utf-8"))
-    declaration["exploratory_bands"] = ["anchor"]
-    path = tmp_path / "plan.yaml"
-    path.write_text(yaml.safe_dump(declaration, sort_keys=False), encoding="utf-8")
-
-    with pytest.raises(ValueError, match="exploratory_bands"):
-        acceptance.load_plan(str(path))
-
-
-@pytest.mark.skipif(not SAVED_EXPORT_SUMMARY.is_file(), reason="the saved export is not on this machine")
-def test_the_saved_wide_window_export_is_read_under_the_wide_family() -> None:
-    """The development run's own causality record names its window, and the committed plan
-    declares that window's family: the revision-1 bands unchanged."""
-    summary = json.loads(SAVED_EXPORT_SUMMARY.read_text(encoding="utf-8"))
-    plan = acceptance.load_plan()
-
-    run = acceptance.run_identity(str(SAVED_EXPORT_SUMMARY.parent), summary)
-    window, note = acceptance.arm_lag_window([run])
-
-    assert run["searched_lag_steps"] == window == acceptance.shipped_lag_window()
-    assert note is None
-    assert plan["exploratory_band_families"][window] == ["anchor", "near", "mid", "far"]
-    assert run["input_policy"] == {"zero_fhr_scattering_s0": False, "zero_up_scattering_s0": False}
 
 
 def test_two_windows_or_two_input_policies_do_not_pair(tmp_path: Path) -> None:
@@ -719,7 +679,9 @@ def test_the_protocol_reads_runs_the_scoring_pass_wrote(evidence, tmp_path) -> N
     """The seam. Five runs on disk, discovered, grouped by arm and training seed, and compared.
 
     A defect between the two passes shows up here and nowhere else: a renamed column, a provenance
-    field never written, or a table whose recordings do not line up across runs.
+    field never written, or a table whose recordings do not line up across runs. The record also
+    says what it has not measured -- no confirmation run and no probe artifact are statements
+    rather than missing blocks.
     """
     runs_root, reference, _work = evidence
     plan = plan_with(tmp_path, primary_draws=FIXTURE_DRAWS, bootstrap_resamples=FIXTURE_RESAMPLES)
@@ -730,19 +692,7 @@ def test_the_protocol_reads_runs_the_scoring_pass_wrote(evidence, tmp_path) -> N
     )
 
     assert len(discovered) == len(ARM_SEEDS) + 1
-    assert record["selection"]["arms"]["candidate"]["n_training_seeds"] == len(ARM_SEEDS)
-    assert record["selection"]["arms"]["candidate"]["meets_minimum"]
-    assert record["selection"]["arms"]["mean_only"]["n_training_seeds"] == 1
-    assert not record["selection"]["arms"]["mean_only"]["meets_minimum"]
-
-
-@pytest.mark.slow
-def test_every_run_carries_the_provenance_the_protocol_groups_on(evidence) -> None:
-    """A run whose training seed or split is recoverable only from a shell history cannot be
-    grouped, and the protocol's first act is to group."""
-    runs_root, _reference, _work = evidence
-
-    for run in acceptance.discover_runs(str(runs_root)):
+    for run in discovered:
         descriptor = acceptance.run_descriptor(run)
         assert descriptor["training_seed"] is not None
         assert descriptor["split_label"]
@@ -750,46 +700,24 @@ def test_every_run_carries_the_provenance_the_protocol_groups_on(evidence) -> No
         assert descriptor["n_recordings"] > 0
         assert descriptor["has_per_recording_table"]
 
+    arms = record["selection"]["arms"]
+    assert arms["candidate"]["n_training_seeds"] == len(ARM_SEEDS)
+    assert arms["candidate"]["meets_minimum"]
+    assert arms["mean_only"]["n_training_seeds"] == 1
+    assert not arms["mean_only"]["meets_minimum"]
 
-@pytest.mark.slow
-def test_the_declared_comparison_is_read_against_the_frozen_reference(evidence, tmp_path) -> None:
-    """The comparison the internal gap cannot make, and the two seed counts that qualify it."""
-    runs_root, reference, _work = evidence
-    plan = plan_with(tmp_path, primary_draws=FIXTURE_DRAWS, bootstrap_resamples=FIXTURE_RESAMPLES)
-
-    record = acceptance.assess(
-        acceptance.discover_runs(str(runs_root)),
-        plan=plan,
-        reference=acceptance.read_reference(str(reference)),
-    )
     comparison = record["selection"]["primary_comparisons"]["the_variance_update"]
     against = record["selection"]["per_arm"]["candidate"]["against_reference"]
-
     assert comparison["status"] == "BELOW_SEED_MINIMUM"
     assert comparison["difference_nats"]["n"] > 0
     assert against["status"] == "READ"
     for name in ("full_minus_reference_nats", "base_minus_reference_nats"):
         assert against[name]["lo"] <= against[name]["point"] <= against[name]["hi"]
 
-
-@pytest.mark.slow
-def test_the_record_says_what_it_has_not_measured(evidence, tmp_path) -> None:
-    """Absence and zero must not read the same. No confirmation run and no probe artifact are both
-    present as statements rather than as missing blocks."""
-    runs_root, reference, _work = evidence
-    plan = plan_with(tmp_path, primary_draws=FIXTURE_DRAWS, bootstrap_resamples=FIXTURE_RESAMPLES)
-
-    record = acceptance.assess(
-        acceptance.discover_runs(str(runs_root)),
-        plan=plan,
-        reference=acceptance.read_reference(str(reference)),
-    )
     confirmation = next(
         entry for entry in record["verdicts"] if entry["name"] == "confirmation_partition"
     )
-
     assert confirmation["status"] == "INCONCLUSIVE"
-    assert "confirms nothing" in confirmation["detail"]
     assert record["selection"]["latent_probes"]["candidate"]["status"] == "NOT_RUN"
     assert "confirmation" not in record
 

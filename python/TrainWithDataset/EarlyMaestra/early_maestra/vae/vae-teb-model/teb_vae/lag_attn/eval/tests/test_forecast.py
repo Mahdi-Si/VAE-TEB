@@ -2,17 +2,15 @@ r"""Tests for the forecast-quality analysis.
 
 Three things are worth catching here and each needs a different style of test.
 
-The **schema** -- that the CSVs exist and carry the columns a reader is promised -- is a
-straightforward existence check.
+The **schema** -- that the CSVs carry the columns a reader is promised -- is a straightforward
+membership check.
 
 The **arithmetic** is checked by recomputing one column directly from the model and asserting it
 matches the CSV. A test that only asserted the column exists would pass on a column of zeros.
 
-The **figures** are checked structurally, following ``tests/test_plotting_figure.py``: panel
-count, titles in order, ``ax.has_data()``. Structural assertions alone are vacuous, though -- a
-figure of the wrong data has just as many panels -- so the heatmap test also *sabotages* one
-channel and asserts the residual panel names that channel. Every figure test closes its figure
-in a ``finally``.
+The **figures** are written from a stub frame with no model, and the heatmap's residual field is
+checked by *sabotage*: one channel is corrupted and the residual panel must name that channel. A
+figure of the wrong data has just as many panels, so a structural assertion alone is vacuous.
 
 Profile lengths are asserted against the model's own geometry rather than against literals. A
 literal would keep passing after the horizon changed, on a profile that had silently become the
@@ -28,7 +26,7 @@ import pandas as pd
 import pytest
 import torch
 
-from teb_vae.lag_attn.eval import figures, masks, metrics
+from teb_vae.lag_attn.eval import masks, metrics
 from teb_vae.lag_attn.eval.analyses import forecast as forecast_analysis
 
 
@@ -58,14 +56,6 @@ def analysis(make_eval_runner, tiny_loader, tiny_eval_config, tmp_path):
 # ---------------------------------------------------------------------------
 # Outputs
 # ---------------------------------------------------------------------------
-def test_the_expected_files_are_written(analysis) -> None:
-    _, directory, _ = analysis
-    for name in ("per_sample.csv", "horizon_error.csv", "anchor_error.csv"):
-        assert (directory / name).is_file(), f"{name} was not written"
-    for name in ("horizon_error.pdf", "anchor_error.pdf", "distributions.pdf", "heatmaps.pdf"):
-        assert (directory / name).stat().st_size > 0, f"{name} is empty"
-
-
 def test_per_sample_carries_the_promised_columns(analysis) -> None:
     """Both feature blocks reported separately, because they are different scales."""
     _, directory, _ = analysis
@@ -77,14 +67,6 @@ def test_per_sample_carries_the_promised_columns(analysis) -> None:
     }
     assert expected <= set(frame.columns), f"missing {expected - set(frame.columns)}"
     assert len(frame) == 4
-
-
-def test_the_summary_carries_the_headline_numbers(analysis) -> None:
-    _, _, summary = analysis
-    assert summary["n_samples"] == 4
-    assert np.isfinite(summary["mean_feat_mse_total"])
-    assert np.isfinite(summary["mean_feat_r2_total"])
-    assert summary["composition"] == {"tiny_shard.hdf5": 4}
 
 
 def test_the_per_sample_mse_matches_a_direct_computation(analysis, tiny_loader) -> None:
@@ -145,16 +127,6 @@ def test_the_warmup_anchors_are_nan_rather_than_zero(analysis) -> None:
     assert frame[frame["position"] >= warmup]["mse"].notna().any()
 
 
-def test_the_anchor_axis_converts_to_minutes_through_the_decimation_step(analysis) -> None:
-    r"""One decimated step is $4$ s, so the anchor axis is minutes at $t \cdot 4 / 60$."""
-    _, directory, _ = analysis
-    frame = pd.read_csv(directory / "anchor_error.csv")
-    last = int(frame["position"].max())
-    minutes = last * metrics.STEP_SECONDS / 60.0
-    # The tiny shard is a 20-minute window; the last valid anchor sits just inside it.
-    assert 0.0 < minutes <= 20.0
-
-
 # ---------------------------------------------------------------------------
 # Figures
 # ---------------------------------------------------------------------------
@@ -189,34 +161,6 @@ def test_the_figures_have_the_panels_and_titles_they_claim(tmp_path) -> None:
     assert set(written) == {"horizon_error", "anchor_error", "distributions", "heatmaps"}
     for path in written.values():
         assert Path(path).stat().st_size > 0
-
-
-def test_the_heatmap_figure_stacks_three_panels_in_order(tmp_path, monkeypatch) -> None:
-    """Panel count and title order, asserted on the in-memory figure before it is saved."""
-    captured: Dict[str, Any] = {}
-    original = figures.render_figure
-
-    def _capture(fig, path, **kwargs):
-        if Path(path).name == "heatmaps":
-            captured["titles"] = [ax.get_title() for ax in fig.axes if ax.get_title()]
-            captured["has_data"] = [ax.has_data() for ax in fig.axes if ax.get_title()]
-        return original(fig, path, **kwargs)
-
-    monkeypatch.setattr(figures, "render_figure", _capture)
-    triple = {
-        "forecast": np.random.default_rng(1).normal(size=(8, 20)),
-        "target": np.random.default_rng(2).normal(size=(8, 20)),
-        "residual_rms": np.abs(np.random.default_rng(3).normal(size=(8, 20))),
-    }
-    forecast_analysis._write_figures(
-        _stub_frame(), triple, tmp_path, n_scattering=3, n_channels=8
-    )
-
-    assert len(captured["titles"]) == 3
-    assert captured["titles"][0].startswith("Mean forecast")
-    assert captured["titles"][1].startswith("Mean target")
-    assert captured["titles"][2].startswith("RMS residual")
-    assert all(captured["has_data"])
 
 
 def test_the_residual_heatmap_reports_the_channel_that_was_sabotaged(

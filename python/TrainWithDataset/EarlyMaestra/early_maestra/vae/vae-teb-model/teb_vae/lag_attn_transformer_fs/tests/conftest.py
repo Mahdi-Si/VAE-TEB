@@ -60,22 +60,19 @@ except Exception:
     pass
 
 # ---------------------------------------------------------------------------------------
-# The architecture half: keyword sets, tolerances and the causality probe.
+# The architecture half: keyword sets, the causality probe and the stub batch.
 #
 # Every name here describes the conv-Transformer model. Importing a fixture binds it in this
 # conftest's namespace, which is all pytest needs to serve it to the tests in this directory.
 # ---------------------------------------------------------------------------------------
 from teb_vae.lag_attn_transformer_rws.tests.conftest import (  # noqa: E402,F401
     BATCH,
-    CAUSALITY_TOL,
     MOVEMENT_TOL,
     SEQ_LEN,
     SHIPPED_KWARGS,
-    STUB_GAP_STEP,
     TASK_HPARAMS,
     TINY_KWARGS,
     absolutize_dataset_paths,
-    assert_token_causal,
     inputs,
     make_stub_batch,
     relative_change,
@@ -91,15 +88,12 @@ from teb_vae.lag_attn_transformer_rws.tests.conftest import (  # noqa: E402,F401
 # vacuously without it.
 # ---------------------------------------------------------------------------------------
 from teb_vae.lag_attn_fs.tests.conftest import (  # noqa: E402,F401
-    PATTERN_STEP_SCALE,
     SHIPPED_REACH_BUDGET_S,
     TINY_DELAYS,
     TINY_KEEP_INDEX,
     TINY_SOURCE_DELAYS,
     TINY_SOURCE_KEEP_INDEX,
-    build_target_gate,
     make_patterned_batch,
-    patterned_feature_stream,
     perturb_posterior,
     resolve_target_budget,
 )
@@ -173,12 +167,6 @@ def pytest_configure(config: pytest.Config) -> None:
 def tiny_kwargs() -> dict:
     """A fresh copy of the tiny-model constructor kwargs (safe to mutate)."""
     return dict(TINY_KWARGS)
-
-
-@pytest.fixture
-def shipped_kwargs() -> dict:
-    """A fresh copy of the production constructor kwargs (safe to mutate)."""
-    return dict(SHIPPED_KWARGS)
 
 
 @pytest.fixture

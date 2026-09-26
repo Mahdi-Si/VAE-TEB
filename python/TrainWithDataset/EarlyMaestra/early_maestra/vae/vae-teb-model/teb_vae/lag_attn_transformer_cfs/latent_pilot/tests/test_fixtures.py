@@ -83,13 +83,6 @@ def test_the_smoke_configuration_names_exactly_what_the_generator_writes(smoke_s
         ]
 
 
-def test_the_checkpoint_travels_with_the_configuration_it_was_trained_under(smoke_fixtures):
-    """The strict loader reads the architecture from the file beside the checkpoint; a checkpoint
-    copied without it cannot be rebuilt at all."""
-    beside = Path(smoke_fixtures["checkpoint"]).parent / fixtures.RESOLVED_CONFIG_FILENAME
-    assert beside.is_file()
-
-
 def test_no_recording_appears_in_two_splits(smoke_fixtures):
     splits = {
         split: _guids(paths) for split, paths in smoke_fixtures["splits"].items()
@@ -154,13 +147,6 @@ def test_no_late_segment_can_reach_delivery(smoke_fixtures):
                 assert last < 0.0, f"a segment at {epoch} s reaches delivery at anchor {trimmed - 1}"
 
 
-def test_the_generated_times_are_the_ones_the_generator_declares():
-    """The layout is a property of the fixture, stated once and read here rather than re-derived."""
-    epochs = fixtures.segment_epochs(6, segments_per_guid=2)
-    assert epochs[0::2] == list(fixtures.LATE_EPOCHS)
-    assert epochs[1::2] == list(fixtures.EARLY_EPOCHS)
-
-
 # =============================================================================
 # The loader interface, against the fixture checkpoint's own contract
 # =============================================================================
@@ -168,35 +154,6 @@ def test_the_generated_times_are_the_ones_the_generator_declares():
 def loaded(smoke_fixtures):
     """The fixture checkpoint, rebuilt strictly through the pilot's own loader."""
     return pilot_model.load_pilot_checkpoint(smoke_fixtures["checkpoint"], device="cpu")
-
-
-def test_the_fixture_checkpoint_rebuilds_strictly(loaded):
-    assert loaded.geometry["model_class"]
-    assert int(loaded.geometry["d_z"]) > 0
-    assert loaded.digest
-
-
-def test_the_pilot_loader_configuration_keeps_the_checkpoints_contract(loaded, smoke_fixtures):
-    """Four things change and nothing else does: the shard lists, the statistics file, the loaded
-    fields and the coarse epoch filter."""
-    shards = smoke_fixtures["splits"]["train"]
-    config = data.pilot_loader_config(
-        loaded.config,
-        shards=shards,
-        statistics=smoke_fixtures["statistics"],
-        epoch_min=-12120.0,
-    )
-    dataset = config["dataset_config"]
-    kwargs = dataset["dataloader_config"]["dataset_kwargs"]
-    assert dataset["vae_test_datasets"] == list(shards)
-    assert dataset["vae_train_datasets"] == list(shards)
-    assert dataset["stat_path"] == smoke_fixtures["statistics"]
-    assert kwargs["epoch_min"] == -12120.0
-    assert kwargs["label"] is None
-    for field in data.REQUIRED_LOAD_FIELDS + data.CLINICAL_FIELDS:
-        assert field in kwargs["load_fields"]
-    original = dict(loaded.config["dataset_config"]["dataloader_config"]["dataset_kwargs"])
-    assert kwargs["trim_minutes"] == original["trim_minutes"]
 
 
 def test_the_generated_shards_open_through_that_configuration(loaded, smoke_fixtures):

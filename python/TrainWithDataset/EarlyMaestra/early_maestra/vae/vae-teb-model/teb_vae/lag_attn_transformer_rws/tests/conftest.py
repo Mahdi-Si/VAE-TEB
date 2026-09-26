@@ -5,9 +5,9 @@ which directory pytest is invoked from, and exposes the fixtures the suite is bu
 ``teb_vae/lag_attn_rws/tests/conftest.py``, including its ``utils`` pre-import pin.
 
 The data fixtures are imported from the sibling suite rather than restated: ``perturb_posterior``,
-``make_stub_batch``, ``absolutize_dataset_paths``, the multi-class shard writer and its event and
-level generators, and the two session-wide budget shrinkers. They describe the *data* and the
-*trap*, both of which are shared -- the batch contract is the same one, the shards describe the
+``make_stub_batch``, ``absolutize_dataset_paths``, the multi-class shard writer, and the two
+session-wide budget shrinkers. They describe the *data* and the *trap*, both of which are
+shared -- the batch contract is the same one, the shards describe the
 dataset rather than either model, and the posterior delta heads are zero-initialised in both
 models, so at initialisation every KL assertion passes vacuously in both. The sibling's own
 conftest already establishes the convention by importing a perturbation fixture from *its*
@@ -54,17 +54,9 @@ except Exception:
 from teb_vae.lag_attn.tests.conftest import perturb_posterior  # noqa: E402,F401
 from teb_vae.lag_attn_rws.tests.conftest import (  # noqa: E402,F401
     BATCH,
-    MULTI_CLASS_GUIDS_PER_SHARD,
-    MULTI_CLASS_SEGMENTS_PER_GUID,
-    MULTI_CLASS_SEQ_LEN,
-    MULTI_CLASS_SUBGROUPS,
     STUB_GAP_STEP,
     absolutize_dataset_paths,
-    forecastable_level,
-    inject_events,
-    injected_event_indices,
     make_stub_batch,
-    subgroup_labels,
     suite_oracle_budget,
     suite_page_budget,
     tiny_gated_kwargs,
@@ -305,21 +297,9 @@ def tiny_kwargs() -> dict:
 
 
 @pytest.fixture
-def shipped_kwargs() -> dict:
-    """A fresh copy of the production constructor kwargs (safe to mutate)."""
-    return dict(SHIPPED_KWARGS)
-
-
-@pytest.fixture
 def stub_batch():
     """A two-sample stub batch at the tiny geometry, with the deliberate weight gap."""
     return make_stub_batch(BATCH, SEQ_LEN)
-
-
-@pytest.fixture
-def make_stub_batch_fn():
-    """Factory fixture returning :func:`make_stub_batch`."""
-    return make_stub_batch
 
 
 # The loss hyperparameters the shipped config sets, as the task's constructor takes them.
@@ -514,59 +494,6 @@ def trained_run(multi_class_shards, tmp_path_factory) -> Path:
         yaml.safe_dump(config, sort_keys=False), encoding="utf-8"
     )
     return checkpoint
-
-
-#: Retention for the shared evaluation fixture below. Only this model's own cap is set, and it is
-#: set rather than left absent for one reason: the artifact scan that reads this run has to reach
-#: the tables and figures **this package** writes, and an absent cap makes ``encoder_attention``
-#: record a skip and emit nothing. Eight is what the stratified draw needs to reach all three
-#: clinical classes across the eight subgroup shards. The other four caps stay absent, so the run
-#: costs no retention it does not need.
-EVALUATED_CAPS = {"encoder_attention": 8}
-
-
-@pytest.fixture(scope="session")
-def evaluated(trained_run, multi_class_shards, tmp_path_factory) -> Dict[str, Any]:
-    """One real evaluation run of this model; every assertion built on it questions the same run.
-
-    Driven through this package's committed override delta with its placeholder shards repointed,
-    which is what an operator does before a real run -- so the merge, the preflight guards it
-    satisfies and the generated multi-class shards are all exercised by the same pass.
-
-    Two Monte Carlo draws rather than the shipped eight: the tests reading this fixture are about
-    the artifacts rather than the numbers, and each draw decodes every branch over every anchor.
-
-    ``main`` returns the process **exit code**, not the summary path: an analysis failing must be
-    visible to a shell. The path is therefore assembled from the directory this fixture named,
-    which is what a caller with an explicit ``--output-dir`` does anyway.
-    """
-    import json
-
-    import yaml
-
-    from teb_vae.lag_attn_transformer_rws.eval import run as trf_run
-
-    overrides = write_repointed_overrides(
-        tmp_path_factory.mktemp("evaluated_overrides"), multi_class_shards
-    )
-    delta = yaml.safe_load(overrides.read_text(encoding="utf-8"))
-    delta["eval_config"]["caps"] = dict(EVALUATED_CAPS)
-    overrides.write_text(yaml.safe_dump(delta, sort_keys=False), encoding="utf-8")
-
-    output_dir = tmp_path_factory.mktemp("trf_eval")
-    exit_code = trf_run.main(
-        trained_run, output_dir, overrides=overrides, device="cpu", num_samples=2
-    )
-    results_dir = Path(output_dir) / trf_run.RESULTS_DIRNAME
-    summary_path = results_dir / trf_run.SUMMARY_FILENAME
-    text = summary_path.read_text(encoding="utf-8")
-    return {
-        "exit_code": exit_code,
-        "summary_path": summary_path,
-        "text": text,
-        "summary": json.loads(text),
-        "results_dir": results_dir,
-    }
 
 
 @pytest.fixture

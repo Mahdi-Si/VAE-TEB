@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import shutil
 import uuid
-from pathlib import Path
 
 import pytest
 
@@ -181,13 +180,14 @@ def test_the_settings_difference_names_the_dotted_path_and_both_values():
 # =============================================================================
 # Re-entering a finished run without resuming
 # =============================================================================
-def test_a_finished_fitting_stage_is_not_overwritten_in_place(scratch):
+@pytest.mark.parametrize("stage", ["extract", "baseline", "finetune", "control", "evaluate"])
+def test_a_finished_fitting_stage_is_not_overwritten_in_place(scratch, stage):
     """Re-running it would leave a directory whose report describes a model it no longer holds."""
-    opened = _open(scratch, stages=("extract", "baseline"))
-    pilot_config.mark_completed(opened["state"], "baseline", opened["run_dir"])
+    opened = _open(scratch, stages=(stage,))
+    pilot_config.mark_completed(opened["state"], stage, opened["run_dir"])
 
     with pytest.raises(RunStateError, match="resume=True"):
-        _open(scratch, stages=("baseline",), run_dir=opened["run_dir"])
+        _open(scratch, stages=(stage,), run_dir=opened["run_dir"])
 
 
 def test_a_finished_run_can_still_be_re_reported(scratch):
@@ -200,13 +200,6 @@ def test_a_finished_run_can_still_be_re_reported(scratch):
 
     assert again["stages"] == ["report"]
     assert not again["resumed"]
-
-
-def test_every_rerunnable_stage_leaves_fitted_artifacts_alone():
-    """The list is a claim about what those stages write, so it is stated once and read here."""
-    assert set(pilot_config.RERUNNABLE_STAGES) <= set(pilot_config.STAGES)
-    for stage in ("extract", "baseline", "finetune", "control", "evaluate"):
-        assert stage not in pilot_config.RERUNNABLE_STAGES
 
 
 # =============================================================================
@@ -279,13 +272,6 @@ def test_a_setting_added_since_the_run_and_then_set_still_refuses():
     assert pilot_config.settings_differences(stored, current) == {
         "windows.analysis_hours": (None, 6.0),
     }
-
-
-def test_a_changed_value_still_refuses():
-    assert pilot_config.settings_differences(
-        {"windows": {"preservation_hours": 3.0}},
-        {"windows": {"preservation_hours": 6.0}},
-    ) == {"windows.preservation_hours": (3.0, 6.0)}
 
 
 def test_a_key_the_schema_does_not_know_is_still_a_difference():

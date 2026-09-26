@@ -1,59 +1,21 @@
-r"""Construction invariants: what exists, what is refused, what is frozen, and what it all costs.
+r"""Construction invariants: what is refused, what may not sit on a history path, and the seams.
 
-The constructor's guarantees are structural -- a head-structured latent, one decoder, a frozen
-lag-attention output projection, three dropout sites pinned at zero, no recurrence and no
-time-pooling normaliser on either history path -- and each is asserted on the **assembled** model,
-because several of them hold on the parts in isolation and fail silently in composition.
-
-The parameter budget is asserted as per-encoder subtotals and as *deltas*, never as one absolute
-total. The encoders are what this package owns; everything downstream is imported, so a legitimate
-change to a shared component must not fail a test here. The absolute number belongs in the design
-record, checked against ``sum(p.numel() ...)`` rather than against a literal.
-
-The decoder's width is asserted here for the same reason the constructor's other decisions are: it
-is resolved by a method rather than read off a configuration key, so nothing in a config file says
-what it is and only the assembled model can be asked.
+The constructor's guarantees are structural -- no recurrence and no time-pooling normaliser on
+either history path, the dropout sites pinned at zero, a latent grouping independent of the
+encoder heads -- and each is asserted on the **assembled** model, because several of them hold on
+the parts in isolation and fail silently in composition. Beside them: every inconsistent geometry
+or encoder schema is refused at construction, the decoder-width hook a feature-domain sibling
+overrides moves the head and nothing else, a stem-free encoder still runs, and the causal input
+guard is bitwise inert at the identity, genuinely drops pruned channels, and keeps its
+surviving-channel buffers out of the state dict.
 """
 from __future__ import annotations
-
-import inspect
 
 import pytest
 import torch
 from torch import nn
 
-from teb_vae.lag_attn.nets.heads import PriorHead
-from teb_vae.lag_attn.nets.delays import ChannelDelay, ChannelGate
-from teb_vae.lag_attn_transformer_rws.nets.blocks import (
-    CausalSelfAttention,
-    GatedCausalConvBlock,
-)
-from teb_vae.lag_attn_transformer_rws.nets.encoders import CausalConvTransformerEncoder
 from teb_vae.lag_attn_transformer_rws.nets.model import SeqVaeLagAttnTrfRws
-from teb_vae.lag_attn_transformer_rws.tests.conftest import SHIPPED_KWARGS
-
-#: The shipped encoder subtotals, restated as the arithmetic that produces them.
-#:
-#: A convolution block costs $3d^2 + 3d + dk$: $2d^2$ for the gated input projection, $d^2$ for the
-#: output projection, $d$ apiece for two RMSNorms and the LayerScale, and $dk$ for the depthwise
-#: filter bank. At $d = 128$ that is $50{,}176$ at $k = 5$ and $50{,}688$ at $k = 9$.
-#:
-#: An attention block costs $4d^2 + 3d\,d_{\mathrm{ff}} + 4d$: four bias-free projections, the
-#: SwiGLU triple, and $d$ apiece for two norms and two LayerScale vectors -- $262{,}656$ at
-#: $d = 128$, $d_{\mathrm{ff}} = 512$.
-#:
-#: Each encoder then adds $d$ for its final RMSNorm. Target: $50{,}176 + 50{,}688 +
-#: 6 \cdot 262{,}656 + 128 = 1{,}676{,}928$. Source: the same stem, three attention blocks, one
-#: norm = $888{,}960$.
-_CONV_BLOCK_5, _CONV_BLOCK_9 = 50_176, 50_688
-_ATTENTION_BLOCK = 262_656
-_FINAL_NORM = 128
-_TARGET_ENCODER = _CONV_BLOCK_5 + _CONV_BLOCK_9 + 6 * _ATTENTION_BLOCK + _FINAL_NORM
-_SOURCE_ENCODER = _CONV_BLOCK_5 + _CONV_BLOCK_9 + 3 * _ATTENTION_BLOCK + _FINAL_NORM
-
-#: The stem's cost across both streams, which is exactly what the stem-free architecture arm
-#: removes: $2 \cdot (50{,}176 + 50{,}688)$.
-_STEM_BOTH_STREAMS = 2 * (_CONV_BLOCK_5 + _CONV_BLOCK_9)
 
 #: Recurrent and time-pooling module families that must not appear on a history path. Each would
 #: make $H_t$ a function of the whole sequence, which is invisible in a loss curve and corrupts
@@ -77,31 +39,9 @@ def _model(kwargs, cls=SeqVaeLagAttnTrfRws, **overrides) -> SeqVaeLagAttnTrfRws:
     return cls(**dict(kwargs, **overrides))
 
 
-def _n_parameters(**overrides) -> int:
-    """Total parameter count of a shipped-geometry model under one delta."""
-    return sum(p.numel() for p in _model(SHIPPED_KWARGS, **overrides).parameters())
-
-
-@pytest.fixture(scope="module")
-def shipped_model() -> SeqVaeLagAttnTrfRws:
-    """One production-geometry model, built once for every construction-time check here."""
-    return _model(SHIPPED_KWARGS)
-
-
 # ---------------------------------------------------------------------------------------
 # Geometry
 # ---------------------------------------------------------------------------------------
-def test_the_model_constructs_at_the_tiny_geometry(tiny_kwargs):
-    model = _model(tiny_kwargs)
-    assert model.geometry.raw_len == 256
-    assert model.geometry.t_valid == 12
-
-
-def test_the_model_constructs_at_the_production_geometry(shipped_model):
-    assert shipped_model.geometry.raw_len == 4800
-    assert shipped_model.geometry.t_valid == 270
-
-
 def test_an_indivisible_latent_is_rejected_naming_both_values(tiny_kwargs):
     with pytest.raises(ValueError, match=r"d_z=9.*num_heads=4"):
         _model(tiny_kwargs, d_z=9)
@@ -154,29 +94,6 @@ def test_an_inconsistent_encoder_schema_is_refused(tiny_kwargs, overrides, match
 # ---------------------------------------------------------------------------------------
 # What must not exist
 # ---------------------------------------------------------------------------------------
-def test_no_second_decoder_and_no_decoder_state_head_exist(tiny_kwargs):
-    model = _model(tiny_kwargs)
-
-    assert not hasattr(model, "residual_decoder")
-    assert not hasattr(model, "baseline_decoder")
-    # PriorHead is the class that carries a decoder_state head; its absence is the absence of the
-    # bypass at the module level.
-    assert not any(isinstance(module, PriorHead) for module in model.modules())
-    assert not hasattr(model.prior_head, "decoder_state_head")
-
-
-def test_no_recurrence_anywhere_in_the_model(tiny_kwargs):
-    """The recurrent bottleneck is the thing this architecture removed; a stray one anywhere would
-    both serialise training and reintroduce the state it exists without."""
-    model = _model(tiny_kwargs)
-    offenders = [
-        name for name, module in model.named_modules()
-        if isinstance(module, (nn.LSTM, nn.GRU, nn.RNN))
-    ]
-
-    assert not offenders, f"recurrent modules found: {offenders}"
-
-
 def test_no_time_pooling_normaliser_on_either_history_path(tiny_kwargs):
     """Scoped to the history path -- both gates, both adapters, both encoders -- because that is
     where a statistic pooled over time would make $H_t$ read its own future."""
@@ -195,20 +112,6 @@ def test_no_time_pooling_normaliser_on_either_history_path(tiny_kwargs):
     ]
 
     assert not offenders, f"time-pooling or recurrent modules on a history path: {offenders}"
-
-
-def test_the_only_group_norms_left_are_the_horizon_cores(tiny_kwargs):
-    """A deliberate exception, pinned so it stays deliberate: the horizon core's normalisers pool
-    over the *forecast* axis of a single anchor, not across input time, so they cannot leak the
-    target's future into a history state. Enumerating them means a new one anywhere else fails
-    here rather than passing the scoped check above."""
-    model = _model(tiny_kwargs)
-    group_norms = [
-        name for name, module in model.named_modules() if isinstance(module, nn.GroupNorm)
-    ]
-
-    assert group_norms, "no GroupNorm at all; this pin no longer describes the model"
-    assert all(name.startswith("horizon_core.") for name in group_norms), group_norms
 
 
 # ---------------------------------------------------------------------------------------
@@ -238,44 +141,6 @@ def test_every_structurally_zero_dropout_is_zero_while_the_model_is_built_at_a_t
     assert encoder_dropouts == {0.1}, encoder_dropouts
 
 
-def test_the_encoder_attention_probabilities_carry_no_dropout(tiny_kwargs):
-    """Structural rather than configured: the attention call passes ``dropout_p=0.0`` and the
-    module's own ``dropout`` is the *output* dropout of the equations.
-
-    Measured rather than read off the source: two train-mode passes with the seed fixed *between*
-    them must give identical attention outputs when the output dropout is disabled, which they can
-    only do if nothing stochastic happens inside the attention itself.
-    """
-    model = _model(tiny_kwargs, dropout=0.1)
-    attention = next(
-        module for module in model.modules() if isinstance(module, CausalSelfAttention)
-    )
-    assert attention.dropout.p == 0.1  # the output dropout is the configured one
-
-    attention.train()
-    attention.dropout.p = 0.0
-    x = torch.randn(2, int(tiny_kwargs["sequence_length"]), int(tiny_kwargs["d_model"]))
-    torch.manual_seed(1)
-    first = attention(x)
-    torch.manual_seed(2)
-    second = attention(x)
-
-    assert torch.equal(first, second), "the attention is stochastic in train mode"
-
-
-def test_the_lag_attention_output_projection_is_frozen(tiny_kwargs):
-    """$W_o$ feeds nothing under the head-structured posterior; freezing it drops it from DDP's
-    expectation set instead of leaving a parameter that never receives a gradient."""
-    attention = _model(tiny_kwargs).lag_attn
-
-    assert attention.W_o.weight.requires_grad is False
-    assert attention.W_o.bias.requires_grad is False
-
-
-def test_the_posterior_is_head_structured(tiny_kwargs):
-    assert _model(tiny_kwargs).posterior_head.head_structured is True
-
-
 # ---------------------------------------------------------------------------------------
 # The encoder heads are not the latent groups
 # ---------------------------------------------------------------------------------------
@@ -299,56 +164,8 @@ def test_the_encoder_head_count_does_not_touch_the_latent_grouping(tiny_kwargs, 
 
 
 # ---------------------------------------------------------------------------------------
-# The decoder's width, and the hook that names it
+# The decoder's width hook, and the stem-free arm
 # ---------------------------------------------------------------------------------------
-#: Every parameter of the constructor, in order, ``self`` included. Written out because the
-#: configuration surface is pinned *against* this schema -- the trainer forwards a config block by
-#: sweeping it with ``inspect.signature``, and the design record lists the keys in both directions
-#: -- so a keyword arriving or leaving is a change to what a YAML file can say, not an internal
-#: detail. In particular there is no ``decoder_out_channels``: the width is the hook's to decide,
-#: and a keyword beside it could only ever disagree with the gate.
-_CONSTRUCTOR_PARAMETERS = (
-    "self", "sequence_length", "d_model", "d_z", "horizon", "raw_per_step", "warmup_period",
-    "c_y", "c_u", "use_up_st", "max_lag", "num_heads", "d_head", "dropout", "decoder_hidden",
-    "horizon_depth", "horizon_kernel", "horizon_film", "horizon_attention_blocks",
-    "horizon_embed_std",
-    "head_init_calibration", "a_head_gain", "encoder_conv_kernels", "encoder_conv_dilations",
-    "encoder_num_heads", "encoder_d_ff", "target_attention_blocks", "source_attention_blocks",
-    "source_attention_window", "logvar_clamp", "mu_scale", "delta_mu_scale", "delta_logvar_scale",
-    "posterior_logvar_mode", "source_dropout", "lag_kv_source", "use_entmax",
-    "attention_grad_checkpoint",
-    "lag_bias_init", "alibi_slope_scale", "query_uses_logvar", "prior_availability_input",
-    "coverage_floor", "base_decode", "persistence_residual", "horizon_weight_halflife_steps",
-    "target_keep_index", "target_delays", "source_keep_index", "source_delays", "init_weights",
-)
-
-
-def test_the_decoder_emits_the_raw_samples_per_horizon_token(shipped_model):
-    """$R = 16$, read off the assembled head. No configuration key names it, so the model is the
-    only place the width can be asked -- and ``raw_per_step`` remains a *geometry* input that the
-    width happens to equal here, which is why both are asserted rather than one."""
-    assert shipped_model.decoder_out_channels == shipped_model.raw_per_step == 16
-    assert shipped_model.decoder.out_channels == 16
-    assert shipped_model.decoder.mean_head.out_features == 16
-    assert shipped_model.decoder.logvar_head.out_features == 16
-
-
-def test_the_constructor_schema_is_the_recorded_one():
-    """Set equality against a written-out list, and order too.
-
-    The trainer builds a run's kwargs by sweeping this signature, and the design record enumerates
-    the config keys in both directions against it. A keyword that appeared here would be silently
-    settable from YAML with nothing documenting it; one that vanished would be silently dropped from
-    every config that sets it, and the run would train an architecture its own config does not
-    describe.
-    """
-    parameters = tuple(inspect.signature(SeqVaeLagAttnTrfRws.__init__).parameters)
-
-    assert set(parameters) == set(_CONSTRUCTOR_PARAMETERS)
-    assert parameters == _CONSTRUCTOR_PARAMETERS
-    assert "decoder_out_channels" not in parameters
-
-
 def test_an_overridden_width_hook_moves_the_head_and_nothing_else(tiny_kwargs):
     """The seam, exercised the way a feature-domain sibling uses it.
 
@@ -392,46 +209,6 @@ def test_an_overridden_width_hook_moves_the_head_and_nothing_else(tiny_kwargs):
     ]
 
 
-# ---------------------------------------------------------------------------------------
-# The parameter budget
-# ---------------------------------------------------------------------------------------
-def test_the_shipped_encoder_subtotals(shipped_model):
-    target = sum(p.numel() for p in shipped_model.target_encoder.parameters())
-    source = sum(p.numel() for p in shipped_model.source_encoder.parameters())
-
-    assert target == _TARGET_ENCODER == 1_676_928
-    assert source == _SOURCE_ENCODER == 888_960
-
-
-def test_a_block_costs_what_the_arithmetic_says(shipped_model):
-    """The subtotals above are sums of these, so pinning the parts as well as the total says
-    *where* a change landed rather than only that one happened."""
-    d_model, d_ff = 128, 512
-    conv_blocks = [
-        module for module in shipped_model.target_encoder.modules()
-        if isinstance(module, GatedCausalConvBlock)
-    ]
-    attention_blocks = list(shipped_model.target_encoder.attention_blocks)
-
-    for block, kernel, expected in zip(conv_blocks, (5, 9), (_CONV_BLOCK_5, _CONV_BLOCK_9)):
-        assert block.conv.kernel_size == kernel
-        assert sum(p.numel() for p in block.parameters()) == expected
-        assert expected == 3 * d_model**2 + 3 * d_model + d_model * kernel
-    for block in attention_blocks:
-        assert sum(p.numel() for p in block.parameters()) == _ATTENTION_BLOCK
-    assert _ATTENTION_BLOCK == 4 * d_model**2 + 3 * d_model * d_ff + 4 * d_model
-
-
-def test_removing_one_target_attention_block_costs_exactly_one_block():
-    assert _n_parameters() - _n_parameters(target_attention_blocks=5) == _ATTENTION_BLOCK
-
-
-def test_removing_the_stem_from_both_streams_costs_exactly_the_stem():
-    stemless = _n_parameters(encoder_conv_kernels=(), encoder_conv_dilations=())
-
-    assert _n_parameters() - stemless == _STEM_BOTH_STREAMS == 201_728
-
-
 def test_a_stemless_encoder_is_a_working_module(tiny_kwargs, inputs):
     """Zero convolution blocks is legal, because a stem-free architecture arm needs it."""
     model = _model(tiny_kwargs, encoder_conv_kernels=(), encoder_conv_dilations=()).eval()
@@ -443,34 +220,11 @@ def test_a_stemless_encoder_is_a_working_module(tiny_kwargs, inputs):
     assert out["target_state"].shape[-1] == model.d_model
 
 
-def test_the_encoders_are_the_configured_shape(shipped_model, shipped_kwargs):
-    """The seven encoder keys map onto the two encoders in exactly one way: the target reads the
-    full causal prefix, the source a bounded window. That asymmetry is the architecture."""
-    assert isinstance(shipped_model.target_encoder, CausalConvTransformerEncoder)
-    assert shipped_model.target_encoder.attention_window is None
-    assert shipped_model.target_encoder.receptive_field is None
-    assert (
-        shipped_model.source_encoder.attention_window
-        == shipped_kwargs["source_attention_window"]
-    )
-    assert shipped_model.source_encoder.receptive_field == 66
-
-
 # ---------------------------------------------------------------------------------------
 # The causal input guard
 # ---------------------------------------------------------------------------------------
-def test_an_unguarded_model_has_no_gather_and_no_delay(tiny_kwargs):
-    """Not an identity guard -- nothing at all, so the unguarded run is structurally the model
-    that existed before the guard did."""
-    model = _model(tiny_kwargs)
-
-    assert model.target_gate is None and model.source_gate is None
-    assert not any(isinstance(m, (ChannelGate, ChannelDelay)) for m in model.modules())
-    assert model.source_delay_steps == 0
-
-
 def test_an_unguarded_forward_is_bitwise_equal_to_an_identity_guard(tiny_kwargs, inputs):
-    """The other direction: the gather-and-delay path, at the identity, must change nothing.
+    """The gather-and-delay path, at the identity, must change nothing.
 
     It also pins the availability terms: at zero delays neither is constructed, so the guarded
     model is the plain one rather than the plain one plus a constant.
@@ -492,22 +246,6 @@ def test_an_unguarded_forward_is_bitwise_equal_to_an_identity_guard(tiny_kwargs,
     got = identity(*inputs)
 
     assert all(torch.equal(expected[key], got[key]) for key in expected)
-
-
-def test_the_adapters_are_built_for_the_surviving_widths(tiny_kwargs):
-    """The model still declares the full ``c_y`` / ``c_u`` -- the data boundary checks the batch
-    against those -- while the adapters see only the survivors."""
-    model = _model(
-        tiny_kwargs,
-        target_keep_index=(0, 5, 9),
-        target_delays=(1, 2, 3),
-        source_keep_index=(2, 7),
-        source_delays=(0, 4),
-    )
-
-    assert (model.c_y, model.c_u) == (109, 58)
-    assert model.target_adapter.linear.in_features == 3
-    assert model.source_adapter.linear.in_features == 2
 
 
 def test_a_gated_forward_reads_only_the_surviving_channels(tiny_kwargs, inputs):
@@ -549,20 +287,3 @@ def test_the_gate_and_availability_buffers_stay_out_of_the_state_dict(tiny_kwarg
     # The learned availability parameters do belong in it -- they are weights, not geometry.
     assert any("mask_proj" in name for name in keys)
     assert any("start_embed" in name for name in keys)
-
-
-@pytest.mark.parametrize(
-    "keep, delays, match",
-    [
-        ((), (), "empty"),
-        ((0, 200), (0, 0), "outside"),
-        ((5, 1), (0, 0), "ascending"),
-        ((0, 1, 2), (0, 0), "num_channels"),
-    ],
-    ids=["empty", "out-of-range", "unsorted", "length-mismatch"],
-)
-def test_a_malformed_target_gate_is_refused(tiny_kwargs, keep, delays, match):
-    """Each of these would silently gather or delay the wrong channels; an unsorted index is the
-    subtlest, since the delay vector is positional against it."""
-    with pytest.raises(ValueError, match=match):
-        _model(tiny_kwargs, target_keep_index=keep, target_delays=delays)

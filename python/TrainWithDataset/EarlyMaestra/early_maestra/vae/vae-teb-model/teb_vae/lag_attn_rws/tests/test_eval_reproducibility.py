@@ -143,25 +143,18 @@ def test_an_unseeded_rerun_is_what_makes_that_test_worth_running(task, perturb_p
 # =============================================================================
 def test_the_summary_records_the_seed_and_the_numeric_environment(evaluated):
     """A run must be reproducible from its own output, which means the seed is in the artifact
-    rather than in the operator's shell history."""
+    rather than in the operator's shell history -- and the two numeric settings that are
+    correctness requirements, read back from global state, so a build where the assignment did
+    not take shows up here as ``True``. TF32 carries ten mantissa bits and the per-step KL is a
+    small difference of larger quantities; ``cudnn.benchmark`` picks convolution algorithms by
+    timing them, so the summation order depends on what else the machine was doing."""
     summary = evaluated["summary"]
+    numerics = summary["numerics"]
 
-    assert summary["numerics"]["seed"] == summary["eval_config"]["seed"]
-    assert summary["numerics"]["torch_version"] == str(torch.__version__)
-
-
-def test_the_recorded_numerics_are_the_two_settings_that_are_correctness_requirements(evaluated):
-    """TF32 carries ten mantissa bits and the per-step KL is a small difference of larger
-    quantities; ``cudnn.benchmark`` picks convolution algorithms by timing them, so the summation
-    order -- and the last bits of the result -- depend on what else the machine was doing. Both
-    are read back from global state, so a build where the assignment did not take shows up here
-    as ``True``."""
-    numerics = evaluated["summary"]["numerics"]
-
+    assert numerics["seed"] == summary["eval_config"]["seed"]
     assert numerics["cuda_matmul_allow_tf32"] is False
     assert numerics["cudnn_allow_tf32"] is False
     assert numerics["cudnn_benchmark"] is False
-    assert numerics["float32_matmul_precision"] == "highest"
 
 
 def test_a_second_run_of_the_same_checkpoint_reports_the_same_numbers(

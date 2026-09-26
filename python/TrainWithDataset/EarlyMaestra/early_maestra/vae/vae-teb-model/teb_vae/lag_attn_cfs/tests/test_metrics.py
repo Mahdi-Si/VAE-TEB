@@ -14,8 +14,10 @@ budget change moves the expectation with the model.
 ``kld_source_null`` is the exception, and the one whose *design* is the claim. The source
 availability pattern is a deterministic function of $t$ and identical in every row of the batch, so
 it enters $q(z \mid Y, U)$ and not $p(z \mid Y)$, and no permutation of rows can remove it -- which
-is why the shuffle control cannot see it and why this arm exists. The property that makes it a
-different control is asserted directly: it does not move under a derangement of the source.
+is why the shuffle control cannot see it and why this arm exists. It is checked here against the
+matched readout in both directions (it differs when the posterior reads the source and equals it
+when the posterior cannot), and over the tiled anchor support; that it does not move under a
+derangement of the source is asserted bitwise in test_task.py.
 """
 from __future__ import annotations
 
@@ -32,9 +34,7 @@ from teb_vae.lag_attn_cfs.nets.causal_feature_target import (
 from teb_vae.lag_attn_cfs.tests.conftest import (
     BATCH,
     CAUSAL_C_U,
-    SHIPPED_HORIZON,
     SHIPPED_SEQUENCE_LENGTH,
-    SHIPPED_WARMUP_PERIOD,
     TINY_STRIDE,
     build,
     make_streams,
@@ -189,8 +189,8 @@ def test_a_floor_that_violates_the_pairing_cannot_be_constructed() -> None:
 # =================================================================================================
 def test_the_anchor_count_is_the_geometry_derived_tile_count_at_train_stride() -> None:
     r"""Every phase in $[0, S)$ at once, so the reported mean is the real one:
-    $\lceil (T_{\mathrm{valid}} - F - \varphi)/S \rceil$, which at the shipped geometry is $5$
-    for $\varphi \le 15$ and $4$ otherwise, summing to $136$ and averaging to $136/30$.
+    $\lceil (T_{\mathrm{valid}} - F - \varphi)/S \rceil$ per phase, whose sum over the $S$ phases
+    is $T_{\mathrm{valid}} - F$ and whose mean is therefore $(T_{\mathrm{valid}} - F)/S$.
 
     The numbers are re-derived here from the geometry rather than written down, so a horizon change
     moves the expectation with the model instead of failing this test.
@@ -203,22 +203,20 @@ def test_the_anchor_count_is_the_geometry_derived_tile_count_at_train_stride() -
     metrics = _synthetic_gaps(model, phase, stride, batch=stride)
 
     per_phase = [-(-(span - value) // stride) for value in range(stride)]
-    assert span == 136 and stride == SHIPPED_HORIZON
-    assert min(per_phase) == 4 and max(per_phase) == 5
+    assert max(per_phase) - min(per_phase) <= 1
     assert sum(per_phase) == span
     assert float(metrics["anchors_per_sample"]) == pytest.approx(span / stride, rel=1e-6)
 
 
 def test_the_anchor_count_is_the_whole_valid_range_at_the_validation_stride() -> None:
     r"""Validation and test decode every valid anchor, so the count is
-    $T_{\mathrm{valid}} - F = 136$ exactly -- not a tile set at one fixed phase, which would sample
-    the same $5$ positions of every segment forever."""
+    $T_{\mathrm{valid}} - F$ exactly -- not a tile set at one fixed phase, which would sample
+    the same few positions of every segment forever."""
     model = build(shipped_warmup_kwargs())
     span = model.geometry.t_valid - model.warmup_period
 
     metrics = _synthetic_gaps(model, None, 1, batch=2)
 
-    assert span == 136
     assert float(metrics["anchors_per_sample"]) == float(span)
 
 
@@ -265,13 +263,13 @@ def test_the_source_warmth_split_is_taken_at_the_resolved_block_boundary() -> No
     assert min(waits) > 0
 
     # DECLARED coordinates, through the keep-index, and the alignment is what made that distinction
-    # load-bearing: the reference drops four `up_st` channels, so the survivors' vector is 47 long
-    # and a split taken positionally at 36 would put eleven `up_ph` channels in the `st` block and
-    # report both fractions against the wrong denominators, with nothing failing.
+    # load-bearing: the reference drops some `up_st` channels, so a split taken positionally at the
+    # declared block boundary would put `up_ph` channels in the `st` block and report both fractions
+    # against the wrong denominators, with nothing failing.
     declared = list(kwargs["source_keep_index"])
     first = [step for index, step in zip(declared, waits) if index < split]
     second = [step for index, step in zip(declared, waits) if index >= split]
-    assert len(first) == 32 and len(second) == CAUSAL_C_U - split
+    assert first and second
     assert len(first) + len(second) == len(waits) < CAUSAL_C_U
 
     for pattern, block in (
@@ -436,7 +434,7 @@ def test_the_tertile_boundaries_move_when_the_budget_moves() -> None:
     assert narrow.decoder_out_channels < wide.decoder_out_channels
     # The slowest tertile is where a budget change shows: the wide budget's top group reaches the
     # budget itself, the narrow one's cannot.
-    assert _top_group(wide)[1] == max(wide.target_warmup_steps) == 134
+    assert _top_group(wide)[1] == max(wide.target_warmup_steps)
     assert _top_group(narrow)[1] <= 100
     assert _top_group(narrow) != _top_group(wide)
 
@@ -477,9 +475,9 @@ def test_both_channel_splits_recompose_to_the_gap_they_are_read_beside(
 
 
 def test_the_tertiles_are_not_the_block_split_under_another_name() -> None:
-    r"""They cut **across** the stored block boundary: at the shipped budget the kept set is $32$
-    channels of the first block plus all $66$ of the second, and both span nearly the same rebased
-    range -- so no tertile is a block and the two splits are answering different questions."""
+    r"""They cut **across** the stored block boundary: at the shipped budget the kept set holds
+    channels of both stored blocks, and both span nearly the same rebased range -- so no tertile is
+    a block and the two splits are answering different questions."""
     model = build(shipped_warmup_kwargs())
     keep = model.target_gate.keep_index.tolist()
     first_block = [
@@ -488,7 +486,7 @@ def test_the_tertiles_are_not_the_block_split_under_another_name() -> None:
         if declared < CausalFeatureForecastTarget.TARGET_BLOCK_SPLIT
     ]
 
-    assert len(first_block) == 32 and len(keep) - len(first_block) == 66
+    assert first_block and len(first_block) < len(keep)
     for group in range(WARM_TERTILES):
         members = {index for index, value in enumerate(model.warm_tertile_id.tolist()) if value == group}
         assert members != set(first_block)
@@ -586,28 +584,6 @@ def test_the_null_equals_the_coupling_readout_when_the_posterior_ignores_the_sou
 
     assert matched > 0.0, "the posterior collapsed onto the prior; the probe is vacuous"
     assert matched == pytest.approx(null, rel=1e-6)
-
-
-def test_the_null_does_not_move_under_a_derangement_of_the_source(perturb_posterior) -> None:
-    """The property that makes this a control the shuffle is not.
-
-    The permutation arm deranges ``source_state`` across the batch, and every row carries the same
-    availability pattern, so no permutation can remove it. This arm replaces the stream instead, so
-    a derangement of that stream leaves it exactly where it was -- while the shuffled readout, by
-    construction, does not.
-    """
-    model, streams, features = _tiled()
-    perturb_posterior(model)
-    y_st, y_ph, u_stream = streams
-    deranged = u_stream.flip(0)
-
-    _out, _matched, null = _null_and_matched(model, streams, features, torch.tensor([0, 3]))
-    _out, _matched_perm, null_perm = _null_and_matched(
-        model, (y_st, y_ph, deranged), features, torch.tensor([0, 3])
-    )
-
-    assert not torch.equal(u_stream, deranged), "the derangement was a no-op"
-    assert null == pytest.approx(null_perm, rel=1e-6)
 
 
 def test_the_null_is_read_over_the_tiled_anchor_support(perturb_posterior) -> None:

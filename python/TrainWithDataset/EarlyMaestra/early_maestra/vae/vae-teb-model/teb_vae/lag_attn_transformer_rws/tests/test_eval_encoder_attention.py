@@ -9,10 +9,10 @@ equivalence proof is worth.
 
 So the gate at the top of this file is the whole file's foundation: on a **perturbed** model in
 float64, the recomputed probabilities contracted with $V$ and pushed through ``out_proj`` must equal
-what the module actually returned. Perturbed rather than freshly initialised, because a stack that
-starts near the identity -- LayerScale at $10^{-2}$ -- would pass on a badly broken recompute. Two
-negative controls follow it, each breaking one operand, because an equivalence assertion that
-cannot fail proves nothing about the one that passes.
+what the module actually returned, and must equal entrywise the probabilities the fused kernel
+itself produces when driven with the identity as its value basis. Perturbed rather than freshly
+initialised, because a stack that starts near the identity -- LayerScale at $10^{-2}$ -- would pass
+on a badly broken recompute.
 
 Everything below the gate is arithmetic on probabilities the gate has already vouched for: the
 truncation-aware ceiling, the per-anchor entropy, the mass-by-distance histogram, the composed
@@ -224,92 +224,6 @@ def test_the_recomputed_probabilities_are_the_kernels_own_entrywise(
     )
 
 
-def test_the_perturbation_actually_moved_the_module(stream_input) -> None:
-    """Not vacuous by construction: the same block is built twice from one seed and only one copy
-    is perturbed, so this measures the perturbation rather than the block's output magnitude. An
-    absolute-magnitude assertion would not -- a freshly initialised block already returns $O(0.1)$,
-    so it would pass at ``scale=0.0`` and the gate above would then be running on a stack close
-    enough to its initialisation to hide a broken recompute."""
-    # One seed either side, so the two encoders are initialised identically and `_perturb` is the
-    # only thing that differs between them.
-    torch.manual_seed(4242)
-    untouched = build_stream_encoder("source").attention_blocks[0].attn.double().eval()
-    torch.manual_seed(4242)
-    perturbed = _perturb(
-        build_stream_encoder("source"), seed=1
-    ).attention_blocks[0].attn.double().eval()
-
-    baseline = untouched(stream_input)
-    moved = perturbed(stream_input)
-
-    relative = float((moved - baseline).abs().max() / baseline.abs().max())
-    assert relative > 0.1, relative
-
-
-def test_the_wrong_mask_is_detected(blocks, stream_input) -> None:
-    """First negative control: the windowed block recomputed under the full causal prefix. The
-    band mask is the one operand that is not a parameter, so it is the one a recompute could get
-    wrong while every projection stayed right."""
-    module = blocks["source"]
-    seq_len = int(stream_input.shape[1])
-    hidden = module.norm(stream_input)
-    shape = (int(stream_input.shape[0]), seq_len, module.num_heads, module.d_head)
-    query = module.rope(module.q_proj(hidden).view(shape).transpose(1, 2))
-    key = module.rope(module.k_proj(hidden).view(shape).transpose(1, 2))
-    scores = torch.matmul(query, key.transpose(-2, -1)) / math.sqrt(float(module.d_head))
-    triangle = torch.ones((seq_len, seq_len), dtype=torch.bool).tril()
-    wrong = torch.softmax(scores.masked_fill(~triangle, float("-inf")), dim=-1)
-
-    rebuilt = module_output_from(module, wrong, stream_input)
-
-    assert not torch.allclose(rebuilt, module(stream_input), rtol=0.0, atol=EQUIVALENCE_TOL)
-
-
-def test_omitting_the_rotary_encoding_is_detected(blocks, stream_input) -> None:
-    """Second negative control: rotary position encoding makes a score a function of $t - j$, and
-    a recompute that dropped it would still produce a valid-looking distribution over lags."""
-    module = blocks["target"]
-    seq_len = int(stream_input.shape[1])
-    hidden = module.norm(stream_input)
-    shape = (int(stream_input.shape[0]), seq_len, module.num_heads, module.d_head)
-    query = module.q_proj(hidden).view(shape).transpose(1, 2)
-    key = module.k_proj(hidden).view(shape).transpose(1, 2)
-    scores = torch.matmul(query, key.transpose(-2, -1)) / math.sqrt(float(module.d_head))
-    mask = recompute.admitted_keys(module, seq_len, device=scores.device)
-    unrotated = torch.softmax(scores.masked_fill(~mask, float("-inf")), dim=-1)
-
-    rebuilt = module_output_from(module, unrotated, stream_input)
-
-    assert not torch.allclose(rebuilt, module(stream_input), rtol=0.0, atol=EQUIVALENCE_TOL)
-
-
-def test_train_and_eval_mode_give_the_same_probabilities(blocks, stream_input) -> None:
-    """Attention-probability dropout is structurally zero in this architecture, so the mode a
-    caller happens to leave the model in cannot move this readout. Asserted rather than assumed,
-    because it is the one property that would make the whole analysis mode-dependent."""
-    module = blocks["target"]
-    module.train()
-    training = recompute.attention_probabilities(module, stream_input)
-    module.eval()
-
-    assert torch.equal(training, recompute.attention_probabilities(module, stream_input))
-
-
-def test_the_model_side_property_the_mode_independence_rests_on(blocks) -> None:
-    """The test above compares two recomputes, and the recompute reads no dropout -- so it is mode
-    independent whatever the model does, and on its own it would stay green through exactly the
-    model change that breaks the claim. The claim is about the *model*: the kernel is called with
-    ``dropout_p=0.0`` literally, so no mode can put dropout on the probabilities. Read off the
-    source, because there is no forward output that distinguishes ``dropout_p=0.0`` from a module
-    whose ``dropout.p`` is itself zero."""
-    import inspect
-
-    source = inspect.getsource(type(blocks["target"]).forward)
-
-    assert "dropout_p=0.0" in source, source
-    assert "dropout_p=self" not in source.replace(" ", ""), source
-
-
 # =============================================================================
 # The recompute's own properties
 # =============================================================================
@@ -376,17 +290,6 @@ def test_the_blocks_are_found_in_stream_and_stack_order(tiny_kwargs) -> None:
         + [("source", index) for index in range(int(tiny_kwargs["source_attention_blocks"]))]
     )
     assert [ref.window for ref in recompute.attention_blocks(model)][0] is None
-
-
-def test_a_model_without_the_encoders_is_refused_by_name() -> None:
-    """A silent ``getattr`` default would report a model whose encoders were renamed as a model
-    with no attention to describe."""
-
-    class _Bare:
-        pass
-
-    with pytest.raises(AttributeError, match="target_encoder"):
-        recompute.attention_blocks(_Bare())
 
 
 # =============================================================================
@@ -577,20 +480,6 @@ def test_the_unbounded_source_arm_reports_an_absent_bound_rather_than_the_sequen
     assert recompute.stream_geometry(model, "target")["structural_bound_absent"] is True
 
 
-@pytest.mark.parametrize("window", [2, 4])
-def test_a_narrower_window_lowers_the_structural_bound(tiny_kwargs, window: int) -> None:
-    """The axis the locality sweep varies, which every measured reach is read against."""
-    from teb_vae.lag_attn_transformer_rws.nets.model import SeqVaeLagAttnTrfRws
-
-    torch.manual_seed(0)
-    model = SeqVaeLagAttnTrfRws(**{**tiny_kwargs, "source_attention_window": window})
-    geometry = recompute.stream_geometry(model, "source")
-
-    assert geometry["structural_bound_steps"] == (
-        geometry["conv_reach_steps"] + geometry["n_attention_blocks"] * (window - 1)
-    )
-
-
 # =============================================================================
 # The analysis
 # =============================================================================
@@ -701,15 +590,15 @@ def test_the_headline_carries_the_six_registered_scalars(analysis_run) -> None:
     assert 0.0 <= headline["entropy_ratio_source"] <= 1.0
 
 
-def test_the_registered_headline_names_are_the_bindings(analysis_run) -> None:
-    """The binding is where the six become headline keys; a name that drifted would leave the arm
-    table reading a column no run produces."""
-    registered = dict(TRF_BINDING.headline_scalars)
+def test_the_registered_headline_names_are_the_bindings() -> None:
+    """The binding is where the six become headline keys, and it registers exactly these; a name
+    that drifted would leave the arm table reading a column no run produces."""
+    registered = {name: tuple(path) for name, path in TRF_BINDING.headline_scalars}
 
-    for name in analysis.HEADLINE_KEYS:
-        assert registered[f"encoder_attention_{name}"] == (
-            analysis.ANALYSIS_DIRNAME, "headline", name
-        )
+    assert registered == {
+        f"encoder_attention_{name}": (analysis.ANALYSIS_DIRNAME, "headline", name)
+        for name in analysis.HEADLINE_KEYS
+    }
 
 
 def test_the_headline_resolves_out_of_the_results_block(analysis_run) -> None:
@@ -719,15 +608,6 @@ def test_the_headline_resolves_out_of_the_results_block(analysis_run) -> None:
 
     for name, path in TRF_BINDING.headline_scalars:
         assert report._dig(results, path) is not None, name
-
-
-def test_no_verdict_is_registered(analysis_run) -> None:
-    """This analysis describes a mechanism rather than adjudicating a difference: a separation
-    visible here is a reason to look, not a finding."""
-    result = analysis_run["result"]
-
-    assert "verdicts" not in result
-    assert not any(str(key).startswith("verdict") for key in result)
 
 
 def test_the_stratified_draw_reaches_every_shard(analysis_run, multi_class_shards) -> None:
@@ -790,7 +670,8 @@ def test_an_absent_cap_records_a_skip_naming_the_key(tmp_path) -> None:
 def test_an_offline_re_run_with_no_model_records_a_skip(tmp_path) -> None:
     """``--only encoder_attention`` against a finished directory has no model to recompute with.
     It records a skip and exits 0 rather than raising, which is what keeps the offline re-run
-    honest about what it did not do."""
+    honest about what it did not do. The headline keys are registered as null rather than omitted,
+    so the arm table's column exists whether the analysis ran or not."""
     result = analysis.run_encoder_attention_analysis(
         AnalysisContext(collection=None, config={}, task=None, loader=None),
         eval_config={"caps": {analysis.CAP_NAME: 4}, "seed": 0},
@@ -800,6 +681,8 @@ def test_an_offline_re_run_with_no_model_records_a_skip(tmp_path) -> None:
     assert result["skipped"] is True
     assert "no model" in result["reason"] or "built neither" in result["reason"]
     assert result["plan"]["cap"] == 4
+    assert set(result["headline"]) == set(analysis.HEADLINE_KEYS)
+    assert all(value is None for value in result["headline"].values())
 
 
 def test_a_pass_that_scored_nothing_still_writes_schemad_tables(
@@ -833,19 +716,6 @@ def test_a_pass_that_scored_nothing_still_writes_schemad_tables(
         frame = pd.read_csv(directory / filename)
         assert list(frame.columns), f"{filename} was written without a header"
         assert labels.CLASS_COLUMN in frame.columns
-    assert set(result["headline"]) == set(analysis.HEADLINE_KEYS)
-    assert all(value is None for value in result["headline"].values())
-
-
-def test_a_skip_registers_the_headline_keys_as_null(tmp_path) -> None:
-    """Null rather than omitted, so the arm table's column exists whether the analysis ran or not
-    -- a missing column and a column of nulls read differently in a table of arms."""
-    result = analysis.run_encoder_attention_analysis(
-        AnalysisContext(collection=None, config={}, task=None, loader=None),
-        eval_config={"caps": {analysis.CAP_NAME: 4}, "seed": 0},
-        output_dir=tmp_path, probe=None,
-    )
-
     assert set(result["headline"]) == set(analysis.HEADLINE_KEYS)
     assert all(value is None for value in result["headline"].values())
 

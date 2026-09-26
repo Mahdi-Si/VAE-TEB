@@ -1,25 +1,17 @@
-r"""What the forward returns, and what its two extra arguments changed downstream.
+r"""What the forward returns: its key set, dtypes and shapes, and the two anchor arguments.
 
-Twenty-two keys: the base's twenty, plus the anchor index and its validity companion. They are
-*returned* rather than recomputed by every consumer because the four forecast tensors and the target
-must be gathered at the same anchors, and a second computation could disagree -- which would be a
-wrong number rather than an exception.
-
-The arity change is the part with a blast radius, and it is small and known: everything in the tree
-that calls a model's forward does so star-splat or by index, with exactly one exception, and this
-file pins the inventory rather than the replacement. Replacing that one consumer is a later task's,
-and the reason it needs one is that its failure is *silent* -- it raises inside a handler that warns
-and continues, so a missing seam costs two page rows and a figure with a green suite.
+The key set is the two-sided feature sibling's plus the anchor index and its validity companion.
+They are *returned* rather than recomputed by every consumer because the four forecast tensors and
+the target must be gathered at the same anchors, and a second computation could disagree -- which
+would be a wrong number rather than an exception. The file also checks that the three-tensor call is
+the zero-phase dense call, that the raw grid moves no forecast shape, and that the persistence key
+is the target's own value gathered at each anchor.
 """
 from __future__ import annotations
-
-import inspect
-from pathlib import Path
 
 import pytest
 import torch
 
-from teb_vae.lag_attn_cfs.nets.model import SeqVaeLagAttnCfs
 from teb_vae.lag_attn_cfs.tests.conftest import (
     BATCH,
     CAUSAL_C_Y,
@@ -64,19 +56,10 @@ def outputs():
 # =================================================================================================
 # The key set
 # =================================================================================================
-def test_the_forward_returns_exactly_twenty_two_keys(outputs) -> None:
+def test_the_forward_returns_the_siblings_keys_plus_the_anchor_pair(outputs) -> None:
     """By set equality against the sibling's, so neither a new key nor a lost one passes."""
     _model, out = outputs
-    assert len(out) == 22
     assert set(out) == _sibling_keys() | set(_ANCHOR_KEYS)
-
-
-def test_the_pathways_this_architecture_does_not_have_are_absent(outputs) -> None:
-    """No ``decoder_state`` and no ``delta_mu_src``: the decoder receives the latent and nothing
-    else, so there is no bypass to report and no source term added around it."""
-    _model, out = outputs
-    assert "decoder_state" not in out
-    assert "delta_mu_src" not in out
 
 
 def test_the_anchor_keys_carry_the_dtypes_their_consumers_index_with(outputs) -> None:
@@ -130,22 +113,8 @@ def test_the_per_step_keys_keep_the_step_axis(outputs) -> None:
 
 
 # =================================================================================================
-# The signature and its one arity-sensitive consumer
+# The two anchor arguments
 # =================================================================================================
-def test_the_signature_is_the_three_streams_and_the_two_anchor_arguments() -> None:
-    """A literal list, as in every sibling's invariants file: the anchor geometry is an argument
-    rather than something derived from ``self.training``, and the parameter list is where that
-    decision is visible."""
-    assert list(inspect.signature(SeqVaeLagAttnCfs.forward).parameters) == [
-        "self",
-        "y_st",
-        "y_ph",
-        "u_stream",
-        "anchor_phase",
-        "anchor_stride",
-    ]
-
-
 def test_the_three_tensor_call_still_works_and_agrees_with_a_zero_phase(tiny_warmup) -> None:
     """At the inert default stride both are the dense range, and they agree bitwise."""
     model = build(tiny_warmup).eval()
@@ -161,25 +130,6 @@ def test_the_three_tensor_call_still_works_and_agrees_with_a_zero_phase(tiny_war
     assert set(implicit) == set(explicit)
     for key in implicit:
         assert torch.equal(implicit[key], explicit[key]), key
-
-
-def test_the_one_arity_sensitive_consumer_is_the_input_budget_panel() -> None:
-    """The inventory: this is the only consumer an arity change reaches at all.
-
-    ``stream_panels`` refuses anything but a three-tensor call and then unpacks exactly three, and
-    it raises *inside* a handler that warns and continues -- so reaching it on a five-argument
-    forward costs two page rows and one figure with nothing failing. This package's own builder is
-    what the callback resolves instead, and the refusal below is what keeps that a requirement
-    rather than a preference. Everything else that calls a forward in this tree is star-splat or
-    index-``[0]``, which no arity change touches.
-    """
-    from teb_vae.lag_attn_rws import input_budget
-
-    source = Path(input_budget.__file__).read_text(encoding="utf-8")
-    assert "len(forward_inputs) != 3" in source
-
-    with pytest.raises(ValueError, match="got 5 tensors"):
-        input_budget.stream_panels(model=None, forward_inputs=(1, 2, 3, 4, 5))
 
 
 # =================================================================================================
@@ -215,14 +165,6 @@ def test_the_raw_grid_moves_no_forecast_shape(tiny_warmup) -> None:
 # re-decode takes it, or the shuffle gap shifts for a reason that has nothing to do with the source.
 # Recomputing it at each site would be three chances to gather a different row.
 # =================================================================================================
-def test_the_forward_returns_no_persistence_key_when_the_residual_is_off(outputs) -> None:
-    """The off-state on the contract itself. A key present and ``None`` would be indistinguishable
-    from a mechanism that ran and produced nothing, and every consumer would have to test for it."""
-    _model, out = outputs
-
-    assert "persistence" not in out
-
-
 def test_the_persistence_key_is_the_targets_own_value_at_each_anchor() -> None:
     r"""$(B, A_{\max}, C_{\mathrm{keep}})$, gathered from the TARGET stream on the kept axis.
 

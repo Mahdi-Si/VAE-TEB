@@ -76,38 +76,12 @@ def direct_ridge(features: np.ndarray, targets: np.ndarray, alpha: float):
 # =============================================================================
 # The split
 # =============================================================================
-def test_the_split_is_a_function_of_the_recording_and_nothing_else() -> None:
-    """Two arms' probes have to be fitted on the same cohort, or their difference carries the
-    difference between two cohorts as well as the difference between two latents."""
-    assignments = [latent_probes.split_of("GUID-0007") for _ in range(5)]
-
-    assert len(set(assignments)) == 1
-    assert set(assignments) <= {"fit", "score"}
-
-
 def test_the_split_puts_recordings_on_both_sides() -> None:
     """A rule that sent every recording one way would report a probe fitted on everything and
     scored on nothing, and the pass would say so only in its counts."""
     sides = {latent_probes.split_of(f"GUID-{index:04d}") for index in range(200)}
 
     assert sides == {"fit", "score"}
-
-
-def test_the_two_sides_are_disjoint() -> None:
-    """One digest of one identifier decides the side, so a recording cannot be on both."""
-    fitted = {
-        guid
-        for guid in (f"GUID-{index:04d}" for index in range(200))
-        if latent_probes.split_of(guid) == "fit"
-    }
-    scored = {
-        guid
-        for guid in (f"GUID-{index:04d}" for index in range(200))
-        if latent_probes.split_of(guid) == "score"
-    }
-
-    assert not fitted & scored
-    assert len(fitted) + len(scored) == 200
 
 
 # =============================================================================

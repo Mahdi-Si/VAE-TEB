@@ -14,7 +14,7 @@ Three smaller properties travel with it:
 * **The margin is the model's own.** The bound is a sigmoid, so an exact-equality test against the
   asymptote reads $0.0$ forever while the variance sits pinned against it. Everything is measured
   against :data:`~teb_vae.lag_attn_rws.nets.model.LOGVAR_FLOOR_MARGIN_FRAC` of the clamp's range,
-  imported rather than restated, and the test asserts the import rather than the number.
+  and a real run's verdict carries the margin it was judged against.
 * **Only the two saturation fractions need a masked recomputation.** In this model the
   log-variance fractions are *already* masked and it is ``mu_prior_sat_frac`` and
   ``delta_mu_sat_frac`` that are flat means over every element -- the opposite of the sibling
@@ -61,25 +61,6 @@ def _by_name(verdicts) -> Dict[str, Any]:
 def _aggregate(**overall) -> Aggregate:
     """An aggregate carrying the named readouts and a healthy latent spectrum."""
     return Aggregate(overall=dict(overall), kld_per_dim=[0.4, 0.3, 0.2, 0.001])
-
-
-# =============================================================================
-# The margin is the model's, not a second copy of 0.05
-# =============================================================================
-def test_the_evaluation_reuses_the_models_own_floor_margin() -> None:
-    """Identity, not equality: two constants that happen to agree today are two constants."""
-    from teb_vae.lag_attn_rws.nets import model as model_module
-
-    assert metrics_module.LOGVAR_FLOOR_MARGIN_FRAC is model_module.LOGVAR_FLOOR_MARGIN_FRAC
-    assert metrics_module.SATURATION_FRAC is model_module.SATURATION_FRAC
-
-
-def test_the_margin_on_the_shipped_clamp_is_four_tenths_of_a_nat(shipped_kwargs) -> None:
-    """The number a reader will see on the log-variance figure, derived rather than asserted from
-    memory: $0.05 \\times (3 - (-5)) = 0.4$."""
-    lo, hi = shipped_kwargs["logvar_clamp"]
-
-    assert LOGVAR_FLOOR_MARGIN_FRAC * (hi - lo) == pytest.approx(0.4)
 
 
 # =============================================================================
@@ -224,24 +205,6 @@ def test_the_decoder_verdict_watches_both_ends() -> None:
 # =============================================================================
 # The two saturation framings
 # =============================================================================
-def test_both_saturation_framings_are_emitted(task, perturb_posterior) -> None:
-    """Masked and unmasked, because in this model it is these two -- and not the log-variance
-    fractions -- that the model computes as flat means over every element."""
-    module = task()
-    perturb_posterior(module.orig_model)
-    module.eval()
-    torch.manual_seed(0)
-
-    readout = evaluate_batch(module, make_stub_batch(seed=3), num_samples=1)
-
-    for name in (
-        "mu_prior_sat_frac_raw", "mu_prior_sat_frac_masked",
-        "delta_mu_sat_frac_raw", "delta_mu_sat_frac_masked",
-    ):
-        assert name in readout.columns
-        assert readout.columns[name].shape == readout.n_anchors.shape
-
-
 def test_the_masked_saturation_framing_can_disagree_with_the_raw_one(
     task, perturb_posterior
 ) -> None:

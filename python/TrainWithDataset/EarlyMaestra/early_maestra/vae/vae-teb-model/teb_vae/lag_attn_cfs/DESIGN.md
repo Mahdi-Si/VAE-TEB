@@ -1046,10 +1046,7 @@ rows as text for exactly that reason.
 
 ## 13. Parameter budget
 
-Measured on constructed models at the shipped warm-up budget, not predicted. `tests/test_docs.py`
-re-measures every total below by constructing the models rather than comparing against literals, so a
-legitimate change to a shared imported component re-costs this table instead of failing an unrelated
-assertion.
+Measured on constructed models at the shipped warm-up budget, not predicted.
 
 **Two rows per cell, and both are the record.** The **shipped** row is the revised default: local
 K/V, the prior clock, the persistence residual, the weighted horizon axis, the flat lag-bias seed
@@ -1344,10 +1341,10 @@ There is now an evaluation pipeline for this cell: `eval/`, a `ModelBinding`, tw
 analyses over one shared collection pass, two durable per-recording tables, ten pre-registered
 acceptance verdicts, bootstrap intervals over recordings, and an offline gate that reads
 `summary.json` and imports no `torch`. `eval/EVAL.md` is its contract and `eval/FIGURE_GUIDE.md`
-documents every figure; both are bound to the code by test. It is a **fork** of
+documents every figure. It is a **fork** of
 `teb_vae/lag_attn_rws/eval` edited for this target domain, and it carries four named measures
 against the drift a fork invites — the model-free primitives stay shared, a sibling-agreement test
-re-derives the shared arithmetic through both packages, a machine-checked `divergences.json`
+re-derives the shared arithmetic through both packages, a `divergences.json`
 classifies every one of the sibling's thirty-seven modules, and the layering test forbids reaching
 sideways into the pipeline it was copied from.
 
@@ -1465,8 +1462,7 @@ Where the built package differs from the design it was built from, and why.
   parent's own `_forecast_gaps_from_mask`, so each stays a partial sum of the gap beside it.
 - **`anchor_stride` defaults to $1$, not to $H$.** The inert value, so a model constructed without an
   opinion behaves like the rest of the family; the tiling is a configuration decision and every
-  shipped config states it. `tests/test_config_load.py` asserts `anchor_stride == horizon` in the
-  default and in every arm rather than leaving the pairing to be noticed.
+  shipped config states it.
 - **The gradient clip moved and the additive margin moved; the other two loss-scale constants did
   not, and that is a measurement.** `gradient_clip_val` ships at $6000$ against the two-sided
   sibling's $5000$ (the smallest round value above a measured $q_{99} = 5742$), and

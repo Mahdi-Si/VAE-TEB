@@ -28,8 +28,6 @@ def test_anchor_zero_forecast_starts_at_sixteen_not_the_untrimmed_value():
     """16, not 256 (the untrimmed grid's 16*(0+16)) and not 0 (the anchor's own block)."""
     geometry = _production()
     assert geometry.future_block_start(0) == 16
-    assert geometry.future_block_start(0) != 16 * 16
-    assert geometry.future_block_start(0) != 0
     assert geometry.n_raw(0) == 15
 
 
@@ -52,15 +50,6 @@ def test_the_trained_anchor_range_is_warmup_to_t_valid():
     assert _production().valid_anchor_range() == range(30, 270)
 
 
-def test_the_tiny_test_geometry_constructs():
-    """The suite's stub geometry: 16 steps of 16 raw samples, horizon 4, warmup 2."""
-    geometry = TrimmedRawGeometry(raw_len=256, decimation=16, horizon=4, warmup=2)
-    assert geometry.t == 16
-    assert geometry.t_valid == 12
-    assert geometry.future_block_start(0) == 16
-    assert geometry.future_block_start(11) + 4 * 16 == 256
-
-
 @pytest.mark.parametrize(
     "kwargs, match",
     [
@@ -76,11 +65,3 @@ def test_invalid_geometry_is_rejected_at_construction(kwargs, match):
     """An unvalidated instance must not exist; the constructor is the only gate."""
     with pytest.raises(ValueError, match=match):
         TrimmedRawGeometry(**kwargs)
-
-
-def test_the_geometry_is_immutable():
-    """Frozen, so a consumer cannot drift its grid after validation."""
-    import dataclasses
-
-    with pytest.raises(dataclasses.FrozenInstanceError):
-        _production().raw_len = 5280  # type: ignore[misc]

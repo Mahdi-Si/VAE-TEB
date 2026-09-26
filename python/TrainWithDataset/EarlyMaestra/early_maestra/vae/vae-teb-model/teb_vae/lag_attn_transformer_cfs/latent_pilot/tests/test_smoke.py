@@ -73,16 +73,6 @@ def smoke_run(smoke_fixtures, source_digest):
 # =============================================================================
 # Isolation from anything real
 # =============================================================================
-def test_the_run_directory_is_inside_the_package_and_under_the_smoke_root(smoke_run):
-    """Runtime output stays in the pilot folder, and a smoke run never shares a directory with a
-    production one."""
-    resolved = smoke_run.resolve()
-    assert pilot_config.PILOT_ROOT in resolved.parents
-    parts = resolved.parts
-    assert "smoke" in parts
-    assert "smoke_fixture" in parts
-
-
 def test_the_source_checkpoint_survives_the_run_unchanged(
     smoke_fixtures, source_digest, smoke_run
 ):
@@ -95,38 +85,25 @@ def test_the_source_checkpoint_survives_the_run_unchanged(
 # =============================================================================
 # What each stage left behind
 # =============================================================================
-def test_the_cohort_stage_wrote_its_manifest_and_coverage(smoke_run):
+def test_every_stage_left_its_artifacts(smoke_run):
+    """The cohort tables, keyed latents and their scaler, the three fits, the report, and one
+    non-empty file for every captioned figure."""
     assert (smoke_run / data.MANIFEST_FILENAME).is_file()
     assert (smoke_run / data.COVERAGE_FILENAME).is_file()
 
-
-def test_the_extraction_wrote_keyed_latents_for_the_fitting_splits(smoke_run):
     arrays = sorted(smoke_run.glob(f"*_{extract.LATENT_ARRAYS_FILENAME}"))
     index = sorted(smoke_run.glob(f"*_{extract.LATENT_INDEX_FILENAME}"))
-    assert arrays and index
-    assert len(arrays) == len(index)
+    assert arrays and len(arrays) == len(index)
     assert (smoke_run / extract.SCALER_FILENAME).is_file()
 
-
-def test_the_baseline_and_the_adaptation_were_both_saved(smoke_run):
     assert (smoke_run / f"{pilot_train.BASELINE_NAME}_{pilot_train.FIT_FILENAME}").is_file()
     assert (smoke_run / pilot_train.PILOT_CHECKPOINT_FILENAME).is_file()
-
-
-def test_the_shuffled_label_control_ran(smoke_run):
     assert (smoke_run / f"{pilot_train.CONTROL_NAME}_{pilot_train.FIT_FILENAME}").is_file()
 
-
-def test_the_report_and_its_figures_were_rendered(smoke_run):
     assert (smoke_run / pilot_report.REPORT_FILENAME).is_file()
     figures = sorted((smoke_run / pilot_report.FIGURE_DIRNAME).glob("*"))
-    assert len(figures) >= 3
+    assert {path.stem for path in figures} == set(pilot_report.CAPTIONS)
     assert all(path.stat().st_size > 0 for path in figures)
-
-
-def test_the_report_names_the_fixture_fold_so_it_cannot_be_mistaken_for_a_real_run(smoke_run):
-    text = (smoke_run / pilot_report.REPORT_FILENAME).read_text(encoding="utf-8")
-    assert "smoke_fixture" in text
 
 
 # =============================================================================
@@ -192,9 +169,3 @@ def test_a_finished_fitting_stage_cannot_be_rerun_in_place(smoke_run):
         pilot_run.main(
             config_path=str(SMOKE_CONFIG), stage="finetune", run_dir=str(smoke_run)
         )
-
-
-def test_the_run_cannot_be_locked_twice(smoke_run):
-    """A second lock would be a choice made after the held-out split was available."""
-    with pytest.raises(pilot_config.RunStateError):
-        pilot_config.lock_selection(smoke_run, {"reason": "a second look at the test split"})

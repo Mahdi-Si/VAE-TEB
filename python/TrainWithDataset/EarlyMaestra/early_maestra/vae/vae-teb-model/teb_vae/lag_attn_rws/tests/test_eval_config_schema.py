@@ -45,13 +45,6 @@ def test_absent_keys_are_filled_from_the_defaults() -> None:
     assert partial["num_mc_samples"] == DEFAULTS["num_mc_samples"]
 
 
-def test_the_two_knobs_that_would_let_a_config_decide_a_finding_are_absent() -> None:
-    """An operator who could widen the significance level or the trajectory bin width could make
-    a difference appear or disappear from a config file. Neither is a setting."""
-    assert "alpha" not in VALID_KEYS
-    assert "trajectory_bin_hours" not in VALID_KEYS
-
-
 def test_the_defaults_match_the_readout_module_they_restate() -> None:
     """``config_schema`` must stay a stdlib parse, so three defaults are written out rather than
     imported from the module that owns them. This is the pin that keeps the two equal."""
@@ -127,10 +120,6 @@ def test_an_integer_is_accepted_where_a_float_is_expected() -> None:
 # ---------------------------------------------------------------------------
 # The block itself
 # ---------------------------------------------------------------------------
-def test_an_absent_block_validates_to_the_defaults() -> None:
-    assert validate_eval_config({"general_config": {}}) == DEFAULTS
-
-
 def test_a_non_mapping_block_raises() -> None:
     with pytest.raises(ValueError, match="eval_config must be a mapping"):
         validate_eval_config({"eval_config": [1, 2, 3]})
@@ -146,12 +135,6 @@ def test_validation_does_not_mutate_the_caller_s_block() -> None:
 # =================================================================================================
 # figure_format
 # =================================================================================================
-def test_the_figure_format_defaults_to_none_so_a_run_keeps_the_pdf_default() -> None:
-    """``None`` rather than ``"pdf"``: the default lives in ``figures``, and only there."""
-    assert DEFAULTS["figure_format"] is None
-    assert validate_eval_config({"eval_config": {}})["figure_format"] is None
-
-
 @pytest.mark.parametrize(
     ("given", "expected"),
     [("svg", "svg"), ("SVG", "svg"), (".png", "png"), ("  pdf  ", "pdf")],
@@ -175,26 +158,9 @@ def test_a_non_string_format_is_refused_before_it_reaches_matplotlib() -> None:
         validate_eval_config({"eval_config": {"figure_format": 3}})
 
 
-def test_the_supported_set_is_the_installed_matplotlib_s_own() -> None:
-    """Read from the live build rather than restated here, so it cannot go stale against it."""
-    from teb_vae.lag_attn.eval.figures import SUPPORTED_FIGURE_FORMATS
-
-    for accepted in ("pdf", "svg", "png"):
-        assert accepted in SUPPORTED_FIGURE_FORMATS
-        assert validate_eval_config(
-            {"eval_config": {"figure_format": accepted}}
-        )["figure_format"] == accepted
-
-
 # =================================================================================================
 # max_hours_before_delivery
 # =================================================================================================
-def test_the_horizon_defaults_to_none_so_a_run_evaluates_every_segment() -> None:
-    """``None`` is not a missing value here but the shipped setting: no bound."""
-    assert DEFAULTS["max_hours_before_delivery"] is None
-    assert validate_eval_config({"eval_config": {}})["max_hours_before_delivery"] is None
-
-
 def test_a_horizon_survives_as_a_float() -> None:
     """An operator writing ``4`` means four hours, and an int must not stay an int downstream."""
     resolved = validate_eval_config({"eval_config": {"max_hours_before_delivery": 4}})

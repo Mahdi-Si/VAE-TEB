@@ -13,8 +13,10 @@ checked here on the batch that would trigger it:
 * a rank whose batch scored no anchor at all, which the objective short-circuits;
 * a rank whose validity is mixed, which is the ordinary case and the control for the other two.
 
-The check is the union over batches, because a parameter reached on one and not another is exactly
-the failure that appears hours into a run rather than at its start.
+The arms that change the module tree (mean-only, scalar lift) and the two chunkings are checked the
+same way. Each arrangement is checked on its own batch rather than as a union, because two ranks in
+a real step see different batches and a parameter reached on one and not another is exactly the
+failure that appears hours into a run rather than at its start.
 """
 from __future__ import annotations
 
@@ -73,85 +75,61 @@ def unreached(model) -> List[str]:
     return sorted(name for name, p in model.named_parameters() if p.grad is None)
 
 
-def test_every_parameter_is_reached_on_an_ordinary_batch() -> None:
-    """The control: without it the two cases below could pass by reaching nothing anywhere."""
-    model = build_tiny_model()
-    metrics = step(model)
-    assert float(metrics["scored_anchors"]) > 0.0
-    assert unreached(model) == []
-
-
-def test_every_parameter_is_reached_when_the_source_is_entirely_unavailable() -> None:
-    """The gating is a multiplication in the graph, never a branch that omits the head."""
-    model = build_tiny_model(
-        source_warmup_steps=tuple(TINY_SEQ_LEN for _ in range(DECLARED_C_U))
-    )
-    step(model)
-    assert unreached(model) == []
-
-
-def test_every_parameter_is_reached_when_the_batch_scored_no_anchor() -> None:
-    """The short-circuit path, which is the one place a rank could drop out of the collective.
-
-    A batch landing entirely inside a signal gap is not hypothetical: those anchors cluster around
-    every gap, and on a large enough run one batch will consist of them.
-    """
-    model = build_tiny_model()
-    metrics = step(model, weight=torch.zeros(TINY_BATCH, TINY_SEQ_LEN))
-    assert float(metrics["scored_anchors"]) == 0.0
-    assert unreached(model) == []
-
-
-def test_every_parameter_is_reached_under_mixed_validity() -> None:
+def _mixed_weight() -> torch.Tensor:
     """Some anchors scored and some not, which is what a real batch looks like."""
     weight = torch.ones(TINY_BATCH, TINY_SEQ_LEN)
     weight[0, 10:20] = 0.0
     weight[1, 6:12] = 0.0
-    model = build_tiny_model()
-    metrics = step(model, weight=weight)
-    assert 0.0 < float(metrics["scored_anchors"])
-    assert unreached(model) == []
+    return weight
 
 
-def test_the_union_over_batches_leaves_nothing_unreached() -> None:
-    """A parameter reached on one batch and not another fails hours into a run, not at its start.
-
-    Two ranks in a real step see different batches, so the property has to hold for each of them
-    separately rather than for their union -- which is what checking each arrangement above and
-    then their union together establishes.
-    """
-    weights = (
-        None,
-        torch.zeros(TINY_BATCH, TINY_SEQ_LEN),
-        torch.ones(TINY_BATCH, TINY_SEQ_LEN),
-    )
-    for weight in weights:
-        model = build_tiny_model()
-        step(model, weight=weight)
-        assert unreached(model) == [], weight is None
-
-
-def test_the_mean_only_arm_builds_no_head_it_cannot_reach() -> None:
-    """A scale head that exists but is never read is a starved parameter block."""
-    model = build_tiny_model(mean_only_residual=True)
-    step(model)
-    assert unreached(model) == []
-
-
-def test_the_scalar_lift_arm_reaches_its_per_channel_parameters() -> None:
-    """The one arm that puts learned weights in the source encoder."""
-    model = build_tiny_model(source_scalar_lift=True)
-    step(model)
-    assert unreached(model) == []
-
-
-@pytest.mark.parametrize("grid", [dict(anchor_chunk=2), dict(lag_chunk=2)])
-def test_chunking_does_not_drop_a_parameter_from_the_graph(grid) -> None:
-    """A detached chunk would leave the proposal head partly unreached.
+@pytest.mark.parametrize(
+    "make_weight,scored",
+    [
+        (lambda: None, True),
+        (lambda: torch.zeros(TINY_BATCH, TINY_SEQ_LEN), False),
+        (_mixed_weight, True),
+    ],
+    ids=["ordinary", "no_anchor_scored", "mixed_validity"],
+)
+def test_every_parameter_is_reached_whatever_the_batch_scored(make_weight, scored: bool) -> None:
+    """The ordinary batch is the control, without which the other cases could pass by reaching
+    nothing anywhere. The batch that scored no anchor is the short-circuit path, the one place a
+    rank could drop out of the collective: those anchors cluster around every signal gap, and on a
+    large enough run one batch will consist of them.
 
     Args:
-        grid: The chunk sizes to run under.
+        make_weight: Builds the validity signal, or ``None`` for an all-valid one.
+        scored: Whether the batch scores at least one anchor.
     """
-    model = build_tiny_model(**grid)
+    model = build_tiny_model()
+    metrics = step(model, weight=make_weight())
+    assert (float(metrics["scored_anchors"]) > 0.0) is scored
+    assert unreached(model) == []
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        # Every source channel cold for the whole record: the gating is a multiplication in the
+        # graph, never a branch that omits the head.
+        dict(source_warmup_steps=tuple(TINY_SEQ_LEN for _ in range(DECLARED_C_U))),
+        # A scale head that exists but is never read would be a starved parameter block.
+        dict(mean_only_residual=True),
+        # The one arm that puts learned weights in the source encoder.
+        dict(source_scalar_lift=True),
+        # A detached chunk would leave the proposal head partly unreached.
+        dict(anchor_chunk=2),
+        dict(lag_chunk=2),
+    ],
+    ids=["source_unavailable", "mean_only", "scalar_lift", "anchor_chunk", "lag_chunk"],
+)
+def test_every_parameter_is_reached_on_every_arm_and_chunking(overrides) -> None:
+    """Each arrangement where a Python branch omitting a module would be tempting.
+
+    Args:
+        overrides: Constructor keywords of the arrangement.
+    """
+    model = build_tiny_model(**overrides)
     step(model)
     assert unreached(model) == []

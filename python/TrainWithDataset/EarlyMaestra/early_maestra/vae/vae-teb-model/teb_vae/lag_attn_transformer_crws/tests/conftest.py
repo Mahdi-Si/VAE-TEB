@@ -16,26 +16,20 @@ fails *asymmetrically*: its ``TINY_KWARGS`` carries only one of the five absent 
 path would fail on that one keyword and the shipped path on three more, and every failure would name
 a keyword rather than the conftest.
 
-*The target and input half comes from the conv-LSTM cell.* The committed causal shard and the
-two-sided one beside it, the configuration builder every refusal test starts from, the tiny warm-up
-staircase and its resolved keep-indices, the budget resolver, the stub batch carrying ``guid`` and
-``epoch`` -- the two fields the anchor tiling's phase is keyed on -- the seeded input streams at the
-one-sided channel widths and the seeded raw target signal are all imported rather than restated.
-They describe the *dataset*, the *target domain* and the *anchor geometry*, none of which is a
-property of an encoder, and a second copy of any of them would be free to describe a boundary the
-data no longer has.
-
-*The causality probe and its two tolerances come from the conv-Transformer sibling.* They describe
-the *architecture*: this encoder stack has no time-pooling normaliser to flip, so its control is
-positional rather than the conv-LSTM cell's, and a local re-implementation would be a second
-definition of what "causal" means for these blocks.
+*The target and input half comes from the conv-LSTM cell.* The configuration builder, the tiny
+warm-up staircase and its resolved keep-indices and alignment shifts, the budget resolver, the stub
+batch carrying ``guid`` and ``epoch`` -- the two fields the anchor tiling's phase is keyed on -- the
+seeded input streams at the one-sided channel widths, the seeded raw target signal and the posterior
+perturbation are all imported rather than restated. They describe the *dataset*, the *target
+domain* and the *anchor geometry*, none of which is a property of an encoder, and a second copy of
+any of them would be free to describe a boundary the data no longer has.
 
 The two halves meet at the geometry keys :data:`SHARED_GEOMETRY_KEYS` names. The imported batch
 machinery, the imported budget resolution, the imported raw-signal builder and every anchor
 expectation in this suite close over them while the models here are built from the sets below, so
-the splice is sound only while the two agree. ``test_fixtures.py`` asserts that they do, which is
-what turns the paragraph above into a measurement -- and here it is load-bearing rather than
-decorative, because the two conftests are independently maintained.
+the splice is sound only while the two agree. ``test_fixtures.py`` asserts that they do, and here
+that is load-bearing rather than decorative, because the two conftests are independently
+maintained.
 """
 from __future__ import annotations
 
@@ -64,80 +58,9 @@ try:
 except Exception:
     pass
 
-#: Every name this conftest takes from the conv-Transformer raw-signal suite, as a literal rather
-#: than as whatever the import statement happens to say. All six describe how a *causality* claim is
-#: measured against this encoder stack, which is a property of the architecture and not of what it
-#: reads or emits.
-IMPORTED_FROM_ARCHITECTURE = (
-    "CAUSALITY_TOL",
-    "MOVEMENT_TOL",
-    "assert_token_causal",
-    "build_stream_encoder",
-    "relative_change",
-    "resample_after",
-)
-
-#: Every name this conftest takes from the conv-LSTM causal-input cell's suite. Those in turn are
-#: mostly that suite's own imports from the causal-feature cell, so the objects here are the
-#: family's single copies rather than a second hop's worth of copies -- which is what makes the
-#: identity assertions in ``test_fixtures.py`` meaningful at either end of the chain.
-IMPORTED_FROM_CRWS = (
-    "BATCH",
-    "CAUSAL_C_U",
-    "CAUSAL_C_Y",
-    "CAUSAL_PH_WIDTH",
-    "CAUSAL_SHARD",
-    "CAUSAL_ST_WIDTH",
-    "SHIPPED_BUDGET_STEPS",
-    "SHIPPED_HORIZON",
-    "SHIPPED_SEQUENCE_LENGTH",
-    "SHIPPED_TRIM_MINUTES",
-    "SHIPPED_WARMUP_PERIOD",
-    "TASK_HPARAMS",
-    "TINY_HORIZON",
-    "TINY_SEQ_LEN",
-    "TINY_SOURCE_KEEP_INDEX",
-    "TINY_SOURCE_WARMUP_STEPS",
-    "TINY_STRIDE",
-    "TINY_ALIGNED_WARMUP_PERIOD",
-    "TINY_SOURCE_ALIGN_DELAYS",
-    "TINY_TARGET_ALIGN_DELAYS",
-    "TINY_TARGET_KEEP_INDEX",
-    "TINY_TARGET_WARMUP_STEPS",
-    "TINY_WARMUP_PERIOD",
-    "TWO_SIDED_SHARD",
-    "WARMUP_MODEL_KWARGS",
-    "absolutize_dataset_paths",
-    "causal_config",
-    "hand_seeding_offenders",
-    "make_raw_signal",
-    "make_stub_batch",
-    "make_streams",
-    "perturb_posterior",
-    "stored_warmup",
-    "warmup_model_kwargs",
-)
-
 # ---------------------------------------------------------------------------------------
-# The architecture half: the causality probe and its two tolerances.
-#
-# Every invariant in this suite is measured the same way -- resample the strict future, require
-# bit-stability at the cut *and* visible movement at the end -- and the second half is the negative
-# control without which a dead layer passes every causality test in the package. Importing a fixture
-# binds it in this conftest's namespace, which is all pytest needs to serve it to the tests here.
-# ---------------------------------------------------------------------------------------
-from teb_vae.lag_attn_transformer_rws.tests.conftest import (  # noqa: E402,F401
-    CAUSALITY_TOL,
-    MOVEMENT_TOL,
-    assert_token_causal,
-    build_stream_encoder,
-    relative_change,
-    resample_after,
-)
-
-# ---------------------------------------------------------------------------------------
-# The input and target half: the committed causal shard, the config builder, the tiny warm-up
-# staircase, the stub batch carrying the two phase-key fields and the seeded raw target signal.
+# The input and target half: the config builder, the tiny warm-up staircase, the stub batch
+# carrying the two phase-key fields, the seeded streams and the seeded raw target signal.
 #
 # ``perturb_posterior`` originates in ``lag_attn``; it is taken through the conv-LSTM causal-input
 # suite because that is where the rest of this half comes from, and because the posterior delta
@@ -149,12 +72,9 @@ from teb_vae.lag_attn_crws.tests.conftest import (  # noqa: E402,F401
     CAUSAL_C_U,
     CAUSAL_C_Y,
     CAUSAL_PH_WIDTH,
-    CAUSAL_SHARD,
     CAUSAL_ST_WIDTH,
-    SHIPPED_BUDGET_STEPS,
     SHIPPED_HORIZON,
     SHIPPED_SEQUENCE_LENGTH,
-    SHIPPED_TRIM_MINUTES,
     SHIPPED_WARMUP_PERIOD,
     TASK_HPARAMS,
     TINY_HORIZON,
@@ -168,16 +88,12 @@ from teb_vae.lag_attn_crws.tests.conftest import (  # noqa: E402,F401
     TINY_TARGET_KEEP_INDEX,
     TINY_TARGET_WARMUP_STEPS,
     TINY_WARMUP_PERIOD,
-    TWO_SIDED_SHARD,
-    WARMUP_MODEL_KWARGS,
     absolutize_dataset_paths,
     causal_config,
-    hand_seeding_offenders,
     make_raw_signal,
     make_stub_batch,
     make_streams,
     perturb_posterior,
-    stored_warmup,
     warmup_model_kwargs,
 )
 
@@ -252,11 +168,11 @@ TINY_KWARGS: Dict[str, Any] = dict(
     source_attention_window=4,
 )
 
-# What configs/default.yaml sets, at full production geometry: the causal window and channel widths
-# -- $300$ steps, $c_y = 102$, $c_u = 51$, a one-minute horizon tiled at $S = H$ from a floor of
-# $133$ -- over the conv-Transformer encoders. Construction-time invariants are checked against the
-# model that actually trains, not a miniature of it; forward passes in this suite stay on
-# ``TINY_KWARGS`` for speed.
+# What configs/default.yaml sets, at full production geometry: the causal window, the channel
+# widths, the horizon tiled at $S = H$ and the anchor floor -- all read from the conv-LSTM cell's
+# constants -- over the conv-Transformer encoders. Construction-time invariants are checked
+# against the model that actually trains, not a miniature of it; forward passes in this suite
+# stay on ``TINY_KWARGS`` for speed.
 #
 # Written out rather than derived from the conv-LSTM cell's set: the two are the two halves of the
 # splice, and a set derived from the other could not disagree with it, which would make
@@ -472,49 +388,9 @@ def pytest_configure(config: pytest.Config) -> None:
 
 
 @pytest.fixture
-def config() -> Dict[str, Any]:
-    """A fresh configuration at the shipped causal geometry (safe to mutate)."""
-    return causal_config()
-
-
-@pytest.fixture
-def budget():
-    """The resolved warm-up budget at the shipped threshold, against the committed fixture.
-
-    Shipped means **aligned**: both streams carry a shift, the source is 47 channels wide, and
-    ``reference_delay_s`` is set. :func:`unaligned_budget` is the comparison arm.
-    """
-    from teb_vae.lag_attn_cfs.causal_warmup import resolve_warmup_budget
-
-    resolved = resolve_warmup_budget(causal_config())
-    assert resolved is not None
-    return resolved
-
-
-@pytest.fixture
-def unaligned_budget():
-    """The same budget with the alignment off: no shift, no reference, every source channel kept.
-
-    The comparison arm that stays reachable at one key, and what every assertion phrased as "the
-    warm-up budget alone decides this" is stated against.
-    """
-    from teb_vae.lag_attn_cfs.causal_warmup import resolve_warmup_budget
-
-    resolved = resolve_warmup_budget(causal_config(causal_align_reference=None))
-    assert resolved is not None
-    return resolved
-
-
-@pytest.fixture
 def tiny_kwargs() -> Dict[str, Any]:
     """A fresh copy of the ungated tiny constructor kwargs (safe to mutate)."""
     return dict(TINY_KWARGS)
-
-
-@pytest.fixture
-def shipped_kwargs() -> Dict[str, Any]:
-    """A fresh copy of the ungated production constructor kwargs (safe to mutate)."""
-    return dict(SHIPPED_KWARGS)
 
 
 @pytest.fixture
@@ -527,18 +403,6 @@ def tiny_warmup() -> Dict[str, Any]:
 def tiny_align() -> Dict[str, Any]:
     """A fresh copy of the tiny kwargs carrying the guard and the alignment (safe to mutate)."""
     return tiny_align_kwargs()
-
-
-@pytest.fixture
-def streams():
-    """Seeded ``(y_st, y_ph, u_stream)`` at the tiny geometry and the causal widths."""
-    return make_streams(TINY_KWARGS)
-
-
-@pytest.fixture
-def raw_signal():
-    """A seeded raw target signal at the tiny geometry."""
-    return make_raw_signal(TINY_KWARGS)
 
 
 @pytest.fixture

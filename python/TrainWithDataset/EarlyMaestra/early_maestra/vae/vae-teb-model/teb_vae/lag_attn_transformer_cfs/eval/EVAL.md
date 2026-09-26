@@ -49,7 +49,8 @@ edge.
 **This package defines no numeric function.** Not "few": none. `binding.py` is a frozen record,
 `run.py` and `verify.py` delegate to the shared implementations, and there is no module here that
 computes a quantity a summary reports. That is asserted about the code in
-`tests/test_eval_docs.py` rather than promised by this paragraph, because a prose claim of
+`tests/test_eval_binding.py` and `tests/test_eval_run.py` rather than promised by this paragraph,
+because a prose claim of
 delegation is exactly the claim that decays first: the moment one number is computed locally the two
 cells stop being measured by one implementation, and their difference stops being attributable to the
 encoder.

@@ -187,7 +187,7 @@ Three details are not stylistic, and each is a defect the module is shaped to ma
   model's anchor convention agree with no off-by-one to negotiate. A centred offset would be *more*
   conservative and would still pass a causality probe while silently discarding the newest
   quarter-second of every token; a left offset would read the future.
-  `tests/test_frontend_causality.py` perturbs raw $16t+16$ and requires token $t$ bitwise
+  `tests/test_causality.py` perturbs raw $16t+16$ and requires the state at anchor $t$ bitwise
   identical, and perturbs $16t+15$ and requires it to move.
 * **The coefficients are a non-persistent buffer applied with `F.conv1d`**, never an `nn.Conv1d`.
   `teb_vae/lag_attn/nets/blocks.py::initialization` Xavier-fills every `nn.Conv1d` weight in the
@@ -263,8 +263,7 @@ production (warmup_period 30): d_model=128, total stride 16
   total 120,544 parameters per stream, 241,088 for both
 ```
 
-The $322$ is pinned as `SHIPPED_REACH_SAMPLES` in `tests/test_frontend_reach.py` and checked against
-this document by `tests/test_docs.py`; the $480$ is `warmup_period * raw_per_step` and is derived,
+The $322$ is what the built stack reports as its `reach_samples`; the $480$ is `warmup_period * raw_per_step` and is derived,
 never configured. The kernels $(65, 15, 15, 15)$ are the
 constructor's own default (`FRONTEND_KERNELS`), following the precedent `ROPE_BASE` sets in the
 sibling's blocks: no arm varies them, so a config key would be a configuration surface with nothing
@@ -278,7 +277,7 @@ bound as tight, which nothing requires and which would break the first time a ke
 the formula conservative.
 
 At the smoke geometry `tests/conftest.py` ships $(5, 3, 3, 3)$ against a budget of
-$6 \times 16 = 96$, reaching $94$ (`TINY_REACH_SAMPLES`). Two samples of margin — enough that the
+$6 \times 16 = 96$, reaching $94$. Two samples of margin — enough that the
 reach guard would refuse a seven-tap filter there, which is the guard doing its job rather than a
 problem with it. `configs/tiny.yaml` is a different case and does **not** use those kernels: it
 keeps `warmup_period: 30` and the production kernels and shrinks widths only, so the smoke fit runs
@@ -299,8 +298,8 @@ $$
 
 ending at raw index $16t + 15$ and reaching no further forward. (The formula is
 $R + r(R_U - 1)$, not $R + rR_U$, because both reaches are counts: the two supports overlap on the
-anchor token's own $16$ samples.) `tests/test_docs.py` computes it from a constructed
-shipped-geometry model and checks it against this section.
+anchor token's own $16$ samples.) `tests/test_frontend_reach.py` computes it from a
+constructed shipped-geometry model and requires it to stay inside the lag search range.
 
 $340.5$ s is still **shorter than the lag search range** — $\ell \in \{0, \ldots, 90\}$ spans $90$
 steps, $360$ s — which is the property the sibling's §3 argues the source encoder must have: an
@@ -351,10 +350,10 @@ Measured on a constructed shipped-geometry model, not predicted.
 | Everything else, unchanged | $2{,}274{,}668$ |
 | **Total** | $\mathbf{5{,}081{,}644}$ |
 
-That total is the **one place the absolute number is pinned**, and `tests/test_docs.py` checks it
-against `sum(p.numel() ...)` rather than against a literal in a test — so a legitimate shared change
-to an imported downstream component re-costs this line rather than failing a test elsewhere in the
-package. `tests/test_construct.py` pins the front-end figure as a *delta* instead:
+That total is measured with `sum(p.numel() ...)` and pinned by no test — so a legitimate shared
+change to an imported downstream component re-costs this line rather than failing a test in the
+package; `tests/test_frontend.py` checks the per-stage figures against their arithmetic. As a
+*delta*, the front-end figure is
 $241{,}088$ against the $156{,}288$ of the two adapters replaced, so the entire architectural cost
 of reading the raw signal rather than a two-sided transform of it is $84{,}800$ parameters, about
 $1.7\%$ of the model — and
@@ -362,7 +361,7 @@ $5{,}081{,}644 - 4{,}996{,}844 = 241{,}088 - 156{,}288$ exactly, which is the ar
 that nothing else moved.
 
 The eight anti-alias filters — one per stage per stream — contribute **zero** parameters, which
-`tests/test_construct.py` asserts alongside their count. Held as `nn.Conv1d` layers they would be
+`tests/test_frontend_decimate.py` asserts and `tests/test_construct.py` counts. Held as `nn.Conv1d` layers they would be
 both counted here and Xavier-overwritten at initialisation.
 
 **Step cost and activation memory.** Measured on the development box (RTX 4080 Laptop), batch $16$,
@@ -408,8 +407,8 @@ curve; and the loss-spike breaker's two `.item()` calls per step cost $5.4$ ms o
 
 These are hardware measurements and are the one class of number in this document that **no test
 pins** — the same is true of the smoke gradient norms and the smoke wall time in §12. Every
-structural number here is driven from the code by `tests/test_docs.py` or by the test named beside
-it; a timing is reproduced by re-running the measurement, not by a gate.
+structural number here was measured on the built model, and the tests named beside them check
+the relations between them; a timing is reproduced by re-running the measurement, not by a gate.
 
 **Is the run data-loading bound?** Unresolved on this box, and that is the finding. Dropping the
 four feature blocks removes $(109 + 58) \times 300 = 50{,}100$ elements of read and host-to-device
@@ -436,14 +435,14 @@ Each is enforced by construction and measured by a test, never asserted by conve
 | **Raw-signal causality**, $H_t = f(x_{\le 16t+15})$, per front end and per assembled state | right-offset decimation; left-only convolution padding; every other front-end primitive position-wise on the channel axis | `tests/test_frontend_causality.py`, `tests/test_causality.py` |
 | **The warm-up covers the front end's reach** | the front end refuses at construction against `warmup_period * raw_per_step` | `tests/test_frontend_reach.py`, `tests/test_construct.py` |
 | **No time-pooling or batch-coupling normaliser** in the front ends | `refuse_time_pooling_norms` at the end of every `__init__` | `tests/test_frontend.py` |
-| **No time-pooling normaliser elsewhere, and no recurrence anywhere** | none is constructed; the three surviving `GroupNorm`s are enumerated and each asserted under `horizon_core.`, where they pool the *forecast* axis of one anchor | `tests/test_construct.py` |
+| **No time-pooling normaliser elsewhere, and no recurrence anywhere** | none is constructed; the three surviving `GroupNorm`s sit under `horizon_core.`, where they pool the *forecast* axis of one anchor | `tests/test_causality.py` (a history-path normaliser pooling time fails the bitwise probe) |
 | **Source purity** — the prior never sees the source, the source state never sees the target | separate front ends and encoders; the posterior is a residual on the prior | `tests/test_source_purity.py` |
 | **The two raw arguments are not interchangeable** | a forward-pre-hook identity check, because two same-shaped raw tensors make a swap otherwise invisible | `tests/test_source_purity.py` |
-| **No decoder bypass** — gradient reaches the decoder only through $z$ | `BaselineFutureDecoder.forward` takes exactly one tensor, at $d_z$ in-features | `tests/test_construct.py` |
+| **No decoder bypass** — gradient reaches the decoder only through $z$ | `BaselineFutureDecoder.forward` takes exactly one tensor, at $d_z$ in-features | by construction; no separate test |
 | **Exact zero KL at initialisation**, and bitwise identical base and full *in train mode* | posterior deltas zeroed **after** the generic init; one shared $\epsilon$; decoder and both attention dropouts fixed at $0$ | `tests/test_zero_kl_init.py` |
 | **The lag attribution identity**, $\sum_\ell \widetilde K_{t,\ell} = K_t$, exactly | the lag attention is built at `dropout=0.0`, so the returned probabilities are the ones the posterior consumed | `tests/test_lag_map.py` |
-| **`lag_attn.W_o` frozen** | the head-structured posterior consumes the per-head summaries, so `W_o` receives no gradient; freezing drops it from DDP's expectation set | `tests/test_construct.py` |
-| **The fixed FIRs survive initialisation** | non-persistent buffers applied with `F.conv1d`, never `nn.Conv1d` weights | `tests/test_frontend_decimate.py`, `tests/test_init_policies.py` |
+| **`lag_attn.W_o` frozen** | the head-structured posterior consumes the per-head summaries, so `W_o` receives no gradient; freezing drops it from DDP's expectation set | `tests/test_ddp_reachability.py` |
+| **The fixed FIRs survive initialisation** | non-persistent buffers applied with `F.conv1d`, never `nn.Conv1d` weights | `tests/test_frontend_decimate.py` |
 | **`nets/` reaches no framework layer** | import-graph walk over every `nets/*.py` | `tests/test_nets_are_framework_free.py` |
 
 Two conventions run through the whole suite and are not optional here.
@@ -509,28 +508,24 @@ asserted. Step 3's consequence is quantified in §8.
 
 `n_depthwise_init` is **12** here against the sibling's **4** at equal stem settings: $4$ encoder
 stem convolutions plus $8$ front-end ones, one per stage per stream.
-`tests/test_init_policies.py` asserts the difference is exactly $2 \times \texttt{NUM\_STAGES}$
-rather than merely positive, and proves the *ordering* by running `initialization` again afterwards
-and requiring the measured standard deviation to visibly drop — so "after, never before" is
-measured rather than asserted. This is where the risk of a front-end convolution starting $8\times$
+`tests/test_init_policies.py` asserts the count is the stems' plus exactly
+$2 \times \texttt{NUM\_STAGES}$, and that every depthwise bank sits at the variance-preserving
+$\sigma = 1/\sqrt k$ — which a correction running before the generic pass would not leave — so
+"after, never before" is measured rather than asserted. This is where the risk of a front-end convolution starting $8\times$
 too quiet is actually retired; a count alone would not catch a wrong standard deviation.
 
-Two tolerances there are wider than the sibling's, and the reason is **sampling spread over twelve
+The tolerance there is wider than the sibling's, and the reason is **sampling spread over twelve
 convolutions**, not a narrower bank. At the shipped geometry the narrowest depthwise bank is still
 the encoder stem's $Ck = 640$, exactly the sibling's; what changed is that there are now twelve
 banks to satisfy rather than four, and the worst relative deviation of $\sigma$ from
 $1/\sqrt k$ across twenty-five seeds reaches $9.7\%$. The sibling's $10\%$ band would therefore
-flake here, and the band is $20\%$ instead. The correction-factor bar is $3\times$ rather than the
-sibling's higher one because the predicted factor $\sqrt{(1+C)/2}$ is $8.03$ at $C = 128$ but only
-$4.1$ at the front end's narrowest $C = 32$; for the same reason the ordering counterfactual is
-measured on the **last** front-end stage, where the generic pass has a factor large enough to see.
+flake here, and the band is $20\%$ instead.
 
 **At initialisation each front end is approximately a linear mix of the decimated
 `[value, mask, delta]` channels.** `LayerScale` starts every convolution block's residual branch at
 $10^{-2}$, so each stage is close to its pointwise projection composed with the fixed low-pass. That
-is a sane start rather than a defect, but it is stated rather than left to be discovered, and
-`tests/test_frontend.py` pins it — the first epochs are the stages finding temporal structure that
-is not there yet.
+is a sane start rather than a defect, but it is stated rather than left to be discovered — the
+first epochs are the stages finding temporal structure that is not there yet.
 
 ## 8. DDP reachability
 
@@ -545,16 +540,14 @@ breaks `find_unused_parameters=False` is a parameter left *out of the graph* —
 and not others.
 
 So the rule is: **the front end's masking is multiplicative and unconditional.** No `forward` in
-this package branches on a tensor value. `tests/test_ddp_reachability.py` asserts both halves — every
-`requires_grad` parameter has a gradient after one backward at both keyword sets, with a
-deliberately dangling parameter as the negative control; and an AST walk over `nets/frontend.py` and
+this package branches on a tensor value. `tests/test_ddp_strategy.py` asserts the backward
+half — every `requires_grad` parameter has a gradient after one training step, at both
+prior-anchor weights — and `tests/test_ddp_reachability.py` the static one: an AST walk over `nets/frontend.py` and
 `nets/model.py`, whose machinery is **imported** from the sibling's file rather than retyped, finds
 no `if` or conditional expression inside a `forward` whose test reads a tensor value. The walk finds
 six conditionals across the two modules and flags none: five are shape-metadata guards that raise,
 and the sixth is `forward`'s `... if self.query_uses_logvar else ...`, which reads a Python bool
-fixed at construction and is therefore identical on every rank at every step. A local non-vacuity
-check requires the walk to find *some* conditional, or a renamed `forward` would make it pass on
-anything. The rule admits "an expression built only from constants, names, attributes, `.shape`
+fixed at construction and is therefore identical on every rank at every step. The rule admits "an expression built only from constants, names, attributes, `.shape`
 subscripts, comparisons and boolean operators" and rejects any call, element subscript or
 arithmetic; its one stated gap, inherited with the machinery, is that `self.some_tensor > 0` would
 be admitted — and would raise on the first forward rather than diverge silently.
@@ -573,8 +566,8 @@ pre-normalisation produces derivatives of order $1/\sqrt{\epsilon}$. Under
 `gradient_clip_val: 5000` applied as a global norm, that rescales *every* parameter's gradient for
 the batch by around $10^{-13}$: the batch contributes nothing, and the loss moves too little for the
 spike breaker to notice. Restoring the bias returns the norm to $2.3 \times 10^4$.
-`tests/test_frontend.py` asserts both halves — that the model's own front end emits a non-zero token
-on a fully invalid window, and that every stage projection's bias survives initialisation.
+`tests/test_frontend.py` asserts that both of the model's own front ends emit a non-zero token on a
+fully invalid window, which only a stage-projection bias that survived initialisation allows.
 
 This shaped one production-code detail. The front end's three shape guards were originally written
 `x.dim() != 3` and `int(x.shape[1]) != self.channels`; the walk rejects **any call** inside a
@@ -666,8 +659,8 @@ the logged number against both front ends of the model a real `create_model` pro
 **The run's `resolved_config.yaml` records `model_config.resolved_causal_budget: null` and carries
 no front-end reach at all.** That key is the inherited driver's, and `null` is the correct value —
 there is no forward reach to prune channels against. The front end's *backward* reach is derived
-rather than configured, so it appears in no config artifact; the two places it is recorded are the
-startup log above and `SHIPPED_REACH_SAMPLES` in `tests/test_frontend_reach.py`.
+rather than configured, so it appears in no config artifact; it is recorded in the startup log
+above.
 
 ## 10. Deliberate limitations
 
@@ -746,15 +739,12 @@ Also deliberate:
   than silently dropping one. And the data-dependent mask indexing behind `kld_active_frac` lives
   in `compute_loss`, which `compute_loss_and_metrics` reaches through **`orig_model`** — only the
   forward is ever compiled, so that indexing cannot enter the graph.
-  `tests/test_trainer.py::test_the_objective_is_never_the_thing_compiled` pins that routing,
-  because it is the single line that makes the key safe to honour.
 
   **The hook is `LagAttnTrfRwsTrainer`'s, inherited rather than restated here**, and that placement
   is the point: the blocker it clears is the *LSTM*, which both conv-Transformer packages replaced,
   so the decision belongs to the driver where it first becomes true. A copy here would be a second
   copy of one decision on a question that has nothing to do with the input representation this
   package exists to change, free to diverge from it.
-  `tests/test_trainer.py::test_the_compile_decision_is_inherited_rather_than_restated` pins it.
 
   It ships **off** for a numerical reason rather than a mechanical one: inductor may reassociate
   float arithmetic, and per the table above `pred_gap` is the one number in this model with no
@@ -802,9 +792,7 @@ Every intentional difference between the built module and the design it was buil
   flag would leave half the keyword surface dead on every run. What the two share is their
   *objective* and everything under it, imported rather than retyped.
 - **The eight inert keys are refused by absence**: there is no `**kwargs`, so `TypeError` names the
-  key. The seven **encoder** keys are asserted *live* in the same test file, because the ban and the
-  admission are one decision and a sweep that silently caught an encoder key would be a divergence
-  between two models that are supposed to differ in one thing.
+  key.
 
 **Testing**
 
@@ -812,7 +800,7 @@ Every intentional difference between the built module and the design it was buil
   imported code over $(B, T, d)$ inputs whose behaviour cannot change here, and prefix equivalence
   has no consumer in this package while evaluation is out of scope. The assembled raw-resolution
   probe in `tests/test_causality.py` is the one that catches this package's own wiring.
-- **`tests/test_source_purity.py` carries a planted `SwappedModel`**, which the sibling's equivalent
+- **`tests/test_source_purity.py` carries an object-identity check**, which the sibling's equivalent
   file has no reason to. Both inputs here are $(B, 4800)$ raw signals, so a transposed argument pair
   produces correctly shaped output, a plausible loss curve, and a source-conditioned KL of the
   target against itself — and it is invisible to every other probe in the file, because a swapped
@@ -824,9 +812,6 @@ Every intentional difference between the built module and the design it was buil
   `MOVEMENT_TOL`, and is paired with a whole-step perturbation that does clear the shared tolerance
   (§6). A single threshold cannot fit a quantity that varies by four orders of magnitude across
   anchors.
-- **The startup-log assertions do not use `caplog`.** Loguru does not route through the standard
-  library's `logging`, so a `caplog.at_level` assertion against these lines passes on a driver that
-  logs nothing at all. A loguru sink fixture is used instead.
 
 **Configuration and driver**
 
@@ -838,8 +823,8 @@ Every intentional difference between the built module and the design it was buil
   are *excluded* from the comparison rather than exempted from it — against a five-entry exemption
   table, four of them identity: the output tree, the MLflow experiment, the run name and the variant
   tag. Copying any of those four would write these runs into another model's tree. Both sets are
-  asserted stale-free in the other direction, and all seven encoder keys get their own explicit
-  equality assertion, because *same encoder, different input* is the whole claim.
+  asserted stale-free in the other direction; the encoder keys are held by the same leaf walk,
+  because *same encoder, different input* is the whole claim.
 - **There is no front-end configuration key at all.** Widths are derived from `d_model`, kernels are
   a module constant, and the reach budget is derived from `warmup_period`. §13 lists
   `frontend_kernels` as deliberately absent so the choice reads as a choice.
@@ -850,8 +835,6 @@ Every intentional difference between the built module and the design it was buil
   `_check_declared_widths_against_shard` returns early unless the config carries **both** `c_y` and
   `c_u`, and a config carrying either is refused here anyway, so a copy-pasted sibling config with
   *correct* widths passes that guard in silence and the operator sees the inert-key message.
-  `tests/test_trainer.py::test_the_inherited_width_guard_stays_silent_on_this_packages_configs`
-  pins the mechanism.
 - **The pre-flight also requires `up` in both `load_fields` and `normalize_fields`.** `fhr` is
   already covered by the inherited `_check_raw_target_normalized`. Without `up` in `load_fields` the
   task fails on the first batch, late, after every rank has initialised; without it in
@@ -979,10 +962,10 @@ paragraph exists to prevent.
 
 ## 13. Configuration keys
 
-`tests/test_docs.py` drives this section against `configs/default.yaml` in both directions, so it
-cannot drift: every key in the first list below must exist, every key in the second must not, and
-every `model_config.VAE_model` key the shipped config carries must appear in the first. Outside
-`VAE_model` the first list is the set this document's claims depend on rather than an exhaustive
+The first list below is the required keys, and the second the keys that are deliberately
+absent; `tests/test_config_load.py` requires every `model_config.VAE_model` key
+the shipped config carries to reach the constructor or the task. Outside `VAE_model` the first
+list is the set this document's claims depend on rather than an exhaustive
 inventory of the framework's own settings.
 
 **Required**

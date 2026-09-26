@@ -32,7 +32,6 @@ from teb_vae.lag_attn_cfs.eval import attributions as core
 from teb_vae.lag_attn_cfs.eval._reuse import labels
 from teb_vae.lag_attn_cfs.eval.analyses import AnalysisContext
 from teb_vae.lag_attn_cfs.eval.analyses import attribution as analysis
-from teb_vae.lag_attn_cfs.eval.dataset_rows import dataset_index_map
 from teb_vae.lag_attn_cfs.eval.metrics import DENSE_ANCHOR_GEOMETRY, anchor_support, mean_decoded_block, model_inputs
 from teb_vae.lag_attn_cfs.eval.report_seam import json_safe
 from teb_vae.lag_attn_rws.nets.controls import source_null_forward_outputs
@@ -599,16 +598,6 @@ def test_a_pass_with_no_model_records_a_skip(tmp_path) -> None:
 
     assert result["skipped"] is True and result["n_samples"] is None
     assert "no model" in result["reason"]
-
-
-def test_the_stub_loader_lists_the_recordings_the_selection_resolves() -> None:
-    """Non-vacuity for the end-to-end test: the mapping the selection goes through is the one the
-    dataset lists, so a segment the analysis attributes is one the loader can serve."""
-    guids, epochs, _classes = _stub_population()
-    dataset = _StubDataset(guids, epochs)
-    loader = types.SimpleNamespace(dataset=dataset, collate_fn=_collate_factory(dataset), batch_size=2)
-    index_map = dataset_index_map(loader)
-    assert len(index_map) == len(guids)
 
 
 # =================================================================================================

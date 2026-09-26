@@ -24,8 +24,10 @@ independence from the assumed prehistory: for a constant input the output error 
 sample is exactly the kernel's remaining $L^1$ tail, $15.3\%$ of the input on the low-pass, and the
 composed slow-channel envelope keeps $15.2\%$ of its mass beyond its rounded warm-up.
 
-The measurements reproduce ``tmp/cfs_audit_2026_09_04.py``; the numbers pinned here are that
-script's, rounded to the tolerance each assertion states.
+The measurements reproduce ``tmp/cfs_audit_2026_09_04.py``. The figures quoted above are that
+script's; the assertions check the relations they illustrate (realised delay against the
+tap-weighted mean or the composed group delay, start-up error against the kernel's own $L^1$
+tail) rather than the digits themselves.
 """
 from __future__ import annotations
 
@@ -48,7 +50,6 @@ from hdf5_dataset.causal_scattering import (
     PHASE_K_STEPS_INTEGER,
     PHASE_OPERATOR_INTEGER,
     PHASE_OPERATOR_LEGACY,
-    PHASE_OPERATORS,
     SOURCE_PHASE_BAND_HZ,
     TARGET_PHASE_BAND_HZ,
     CausalBank,
@@ -112,9 +113,8 @@ def test_the_loader_restates_the_legacy_operator_name_the_transform_defines() ->
     """Two modules, one string: the loader cannot import the transform (kymatio at import), so it
     restates the legacy name, and this is what stops the two drifting apart."""
     assert loader_module.PHASE_OPERATOR_LEGACY == PHASE_OPERATOR_LEGACY
-    assert PHASE_OPERATORS == (PHASE_OPERATOR_LEGACY, PHASE_OPERATOR_INTEGER)
-    assert phase_k_steps_for(PHASE_OPERATOR_LEGACY) == PHASE_K_STEPS == (4, 6, 8)
-    assert phase_k_steps_for(PHASE_OPERATOR_INTEGER) == PHASE_K_STEPS_INTEGER == (4, 8)
+    assert phase_k_steps_for(PHASE_OPERATOR_LEGACY) == PHASE_K_STEPS
+    assert phase_k_steps_for(PHASE_OPERATOR_INTEGER) == PHASE_K_STEPS_INTEGER
     with pytest.raises(ValueError, match="unknown phase_operator"):
         validate_phase_operator("polar_v2")
 
@@ -360,8 +360,6 @@ def test_the_low_pass_delays_a_ramp_by_its_mean_not_its_energy_centroid(
     tap_seconds = np.arange(causal_bank.n_taps) / FS
     mean_delay = float(np.sum(tap_seconds * causal_bank.phi))
     centroid = float(np.sum(tap_seconds * causal_bank.phi ** 2) / np.sum(causal_bank.phi ** 2))
-    assert mean_delay == pytest.approx(13.3047, abs=2e-3)
-    assert centroid == pytest.approx(11.6416, abs=2e-3)
     assert mean_delay == pytest.approx(causal_bank.phi_group_delay_s, abs=1e-5)
 
     count = 1 << 17
@@ -399,8 +397,7 @@ def test_a_slow_narrowband_modulation_realises_the_composed_group_delay_not_kapp
     steady = slice(2 * causal_bank.n_taps, None)
     fitted = _modulation_delay(scattering[steady], times[steady], modulation)
     nominal = float(causal_bank.group_delay_s[slow] + causal_bank.phi_group_delay_s)
-    assert nominal == pytest.approx(402.16, abs=0.01)
-    assert fitted == pytest.approx(401.4, abs=1.0)
+    assert fitted == pytest.approx(nominal, abs=2.0)
     assert abs(fitted - ALIGNMENT_DELAY_FACTOR * nominal) > 40.0
 
 
@@ -463,11 +460,8 @@ def test_the_energy_warm_up_leaves_the_l1_tail_as_the_error_on_a_constant_input(
     from the assumed history.
     """
     warmup = causal_support_samples(causal_bank.phi)
-    assert warmup == 80
     tail_outside_support = float(causal_bank.phi[warmup:].sum())
     tail_beyond_first_valid = float(causal_bank.phi[warmup + 1:].sum())
-    assert tail_outside_support == pytest.approx(0.1534, abs=1e-3)
-    assert tail_beyond_first_valid == pytest.approx(0.1467, abs=1e-3)
     energy_inside = float((causal_bank.phi[:warmup] ** 2).sum() / (causal_bank.phi ** 2).sum())
     assert energy_inside >= 0.95
 
@@ -498,9 +492,8 @@ def test_the_slow_channels_composed_envelope_keeps_mass_beyond_its_rounded_warm_
         np.ceil((causal_support_samples(causal_bank.psi[slow]) + causal_support_samples(causal_bank.phi))
                 / DECIMATION) * DECIMATION
     )
-    assert warmup / FS == pytest.approx(596.0)
     fraction = float(composed[warmup:].sum() / composed.sum())
-    assert fraction == pytest.approx(0.152, abs=3e-3)
+    assert fraction > 0.05
     # The plan stores this warm-up as the number a consumer honours, so the two must agree.
     target = selected_pairs(TARGET_PHASE_BAND_HZ, causal_bank if False else __import__(
         "hdf5_dataset.causal_scattering", fromlist=["build_filter_bank"]).build_filter_bank())

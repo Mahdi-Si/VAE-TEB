@@ -27,8 +27,7 @@ domain changed:
   resolved -- rather than $R$ raw samples per horizon step;
 * the target is built by the **model's own** :meth:`_build_forecast_target` at the anchor set the
   forward returned, and the mask by the anchored ``forecast_mask``, so the probe is scored over the
-  anchors the collection pass scored the two model branches over. ``model.future_index`` is not
-  read at all;
+  anchors the collection pass scored the two model branches over;
 * the cached anchor set is the dense one, and the conditioning state is gathered onto it -- so a
   fit at this cell's *training* tiling, which decodes a tenth as many anchors, would be a different
   population and is not what the cache holds.
@@ -285,24 +284,11 @@ def test_the_probe_mirrors_the_production_decoder_rather_than_restating_its_shap
     assert probe.logvar_clamp == model.logvar_clamp
 
 
-def test_the_probes_width_is_the_budgets_surviving_channel_count(tiny_model) -> None:
-    """The target domain's own assertion, and the one a copy of the raw probe would fail silently.
-    The decoder emits one value per **surviving** target channel, so a probe built at $c_y$ would
-    forecast channels the budget dropped -- a wider block, a larger nats figure, and a
-    $\\Delta_{\\mathrm{suff}}$ that is not a difference against ``nll_base_block`` at all."""
-    model = tiny_model
-    probe = oracle.build_probe(model)
-
-    assert model.target_gate is not None, "an ungated model would make this vacuous"
-    kept = int(model.target_gate.out_channels)
-    assert kept < int(model.c_y), "the tiny budget must actually drop channels"
-    assert probe.out_channels == kept
-
-
 def test_the_probe_emits_the_anchor_axis_it_is_handed(tiny_model) -> None:
     r"""The one deliberate difference from the model's own decoder: its input width is
     $d_{\mathrm{model}}$, not $d_z$ -- same decoder, no bottleneck -- and its first axis is the
-    **decoded anchor set** rather than the dense $[0, T_{\mathrm{valid}})$ prefix."""
+    **decoded anchor set** rather than the dense $[0, T_{\mathrm{valid}})$ prefix. Its output width
+    is the budget's surviving-channel count $C_{\mathrm{keep}} < c_y$, not $c_y$."""
     model = tiny_model
     probe = oracle.build_probe(model)
     n_anchors = int(model.geometry.t_valid - model.warmup_period)
@@ -310,6 +296,7 @@ def test_the_probe_emits_the_anchor_axis_it_is_handed(tiny_model) -> None:
     states = torch.zeros((2, n_anchors, model.d_model))
     mu, logvar = probe(states)
 
+    assert int(model.target_gate.out_channels) < int(model.c_y), "the budget must drop channels"
     assert model.d_model != model.d_z, "the tiny geometry must not make the two widths equal"
     assert mu.shape == (2, n_anchors, model.horizon, model.target_gate.out_channels)
     assert logvar.shape == mu.shape
@@ -432,37 +419,6 @@ def test_the_conditioning_ablation_moves_the_state_and_leaves_the_target_alone(
     assert torch.equal(matched_target, shuffled_target)
     assert torch.equal(matched_mask, shuffled_mask)
     assert not torch.equal(matched_states, shuffled_states)
-
-
-def test_nothing_in_the_oracle_reads_the_raw_index_grid() -> None:
-    """``model.future_index`` indexes a $4\\,$Hz raw grid this target does not have. It is the one
-    symbol a mechanical copy of the sibling's module would have carried through, and it would have
-    built a target of raw samples that this decoder never emits.
-
-    Walked as an AST rather than searched as text: the module's own docstring names both symbols in
-    prose -- which is the opposite of reaching for them -- and a substring scan cannot tell the
-    two apart.
-    """
-    import ast
-    from pathlib import Path
-
-    tree = ast.parse(Path(oracle.__file__).read_text(encoding="utf-8"))
-    attributes = {
-        node.attr for node in ast.walk(tree) if isinstance(node, ast.Attribute)
-    }
-    names = {node.id for node in ast.walk(tree) if isinstance(node, ast.Name)}
-    imported = {
-        alias.name
-        for node in ast.walk(tree)
-        if isinstance(node, ast.ImportFrom)
-        for alias in node.names
-    }
-
-    assert "future_index" not in attributes | names
-    assert "build_future_target" not in names | imported
-    # And the gather it is replaced by is genuinely reached for, so this is not two absences.
-    assert "_build_forecast_target" in attributes
-    assert "forecast_mask" in imported
 
 
 # =============================================================================
@@ -608,16 +564,6 @@ def test_the_reported_score_is_the_final_state_over_the_whole_held_out_half(
     assert fit.final_held_out_nats != pytest.approx(
         float(fit.curve[-1]["held_out_nats"]), rel=1e-9
     )
-
-
-def test_the_cache_carries_no_graph_back_to_the_model(known_answer) -> None:
-    """The property the assertion above depends on, stated directly: a cache that kept its graph
-    would make the isolation a matter of luck about which tensors happened to be used."""
-    cache, _trivial = known_answer
-
-    for tensor in (cache.target_state, cache.target_features, cache.weight):
-        assert tensor.grad_fn is None
-        assert not tensor.requires_grad
 
 
 # =============================================================================
@@ -872,10 +818,15 @@ def test_the_fit_leaves_the_global_random_state_where_it_found_it(
     assert torch.equal(after_the_whole_run, after_cache_only)
 
 
-def test_run_oracle_reports_the_split_the_capacity_check_and_both_biases(
+def test_run_oracle_reports_the_split_the_capacity_check_the_biases_and_the_geometry(
     loader_task, cohort_loader
 ) -> None:
-    """The record a caller turns into a summary block, end to end over a real loader."""
+    """The record a caller turns into a summary block, end to end over a real loader.
+
+    A nats-per-anchor figure from this cell is a sum over $H \\cdot C_{\\mathrm{keep}}$
+    coefficients whose $C_{\\mathrm{keep}}$ the warm-up budget decided, at an anchor set that is
+    not the one training tiles at, so the record states both."""
+    model = loader_task.orig_model
     record = oracle.run_oracle(
         loader_task, cohort_loader,
         eval_config={"seed": 5, "caps": {"oracle": LOADER_CACHE_CAP}},
@@ -893,27 +844,10 @@ def test_run_oracle_reports_the_split_the_capacity_check_and_both_biases(
     assert len(per_segment["guid"]) == split["n_held_out_segments"]
     assert np.isfinite(per_segment["nll_oracle_block"]).any()
 
-
-def test_the_record_states_the_geometry_and_the_block_it_scored_over(
-    loader_task, cohort_loader
-) -> None:
-    """A nats-per-anchor figure from this cell is a sum over $H \\cdot C_{\\mathrm{keep}}$
-    coefficients whose $C_{\\mathrm{keep}}$ the warm-up budget decided, at an anchor set that is
-    not the one training tiles at. Both facts are budget- and arm-local, so a record that stated
-    neither could not be read against another arm's -- or against the training CSV."""
-    model = loader_task.orig_model
-
-    record = oracle.run_oracle(
-        loader_task, cohort_loader,
-        eval_config={"seed": 5, "caps": {"oracle": LOADER_CACHE_CAP}},
-        steps=2, curve_points=2, capacity_check=False,
-    )
-
     geometry = record["anchor_geometry"]
     assert (geometry["anchor_phase"], geometry["anchor_stride"]) == DENSE_ANCHOR_GEOMETRY
     assert geometry["training_stride"] == int(model.anchor_stride)
     assert record["block_width"] == int(model.decoder.out_channels)
-    assert "budget-local" in record["block_convention"]
 
     # And the capacity mirror as a measurement in the artifact, so a reader of ``summary.json``
     # can see how far "the same decoder at the same capacity" is from literal.

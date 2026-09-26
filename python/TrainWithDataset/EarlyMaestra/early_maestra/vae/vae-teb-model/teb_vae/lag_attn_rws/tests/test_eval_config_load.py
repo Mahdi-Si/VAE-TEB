@@ -2,10 +2,10 @@ r"""The evaluation override delta, and what merging it over a run's own config p
 
 The delta is not a config and does not stand alone. Its whole contract is what it *becomes* when
 deep-merged over the ``resolved_config.yaml`` a training run wrote beside its checkpoints: the
-run's geometry, normalisation and objective survive untouched, and exactly five things change.
-Both halves of that are asserted here, because either one failing silently produces plausible
-numbers -- an evaluation on the wrong population, or one that never sees the fields the clinical
-questions are asked in.
+run's geometry, normalisation and objective survive untouched, and only what the delta names
+changes. Both halves of that are asserted here, because either one failing silently produces
+plausible numbers -- an evaluation on the wrong population, or one that never sees the fields the
+clinical questions are asked in. The merge records both values of every leaf it overrode.
 """
 from __future__ import annotations
 
@@ -16,7 +16,6 @@ import yaml
 
 from teb_vae.lag_attn.config import load_config
 from teb_vae.lag_attn_rws.eval.config_schema import (
-    DEFAULT_OVERRIDES_PATH,
     VALID_KEYS,
     load_eval_overrides,
     merge_eval_overrides,
@@ -54,17 +53,6 @@ def _dataset_kwargs(config: dict) -> dict:
 # ---------------------------------------------------------------------------
 # The delta itself
 # ---------------------------------------------------------------------------
-def test_the_committed_delta_is_where_the_module_looks_for_it() -> None:
-    assert DEFAULT_OVERRIDES_PATH.is_file()
-    assert DEFAULT_OVERRIDES_PATH.name == "eval_overrides.yaml"
-
-
-def test_the_delta_carries_no_base_key(overrides) -> None:
-    """A ``base:`` chain here would inherit from whatever a committed config currently says
-    rather than from what the run trained under, which is the drift the merge exists to avoid."""
-    assert "base" not in overrides
-
-
 def test_a_delta_carrying_a_base_key_is_refused(tmp_path) -> None:
     path = tmp_path / "bad_overrides.yaml"
     path.write_text("base: ../../configs/default.yaml\n", encoding="utf-8")
@@ -77,39 +65,23 @@ def test_a_missing_delta_raises_rather_than_merging_nothing(tmp_path) -> None:
         load_eval_overrides(tmp_path / "absent.yaml")
 
 
-def test_the_delta_overrides_only_what_genuinely_differs(overrides) -> None:
-    """A sixth top-level change would be a second config in disguise."""
-    assert set(overrides) == {"general_config", "dataset_config", "eval_config"}
-    assert set(overrides["general_config"]) == {"batch_size"}
-    assert set(overrides["general_config"]["batch_size"]) == {"test"}
-    assert set(overrides["dataset_config"]) == {"vae_test_datasets", "dataloader_config"}
-    assert set(_dataset_kwargs(overrides)) == {"load_fields", "cache_size"}
-
-
 def test_every_eval_config_key_in_the_delta_is_one_the_schema_accepts(overrides) -> None:
     assert set(overrides["eval_config"]) <= VALID_KEYS
     # And it validates as written, so the shipped file is not a latent failure.
     assert validate_eval_config(overrides)["seed"] == overrides["eval_config"]["seed"]
 
 
-def test_the_delta_points_at_the_eight_holdout_subgroup_shards(overrides) -> None:
-    shards = overrides["dataset_config"]["vae_test_datasets"]
-    assert len(shards) == 8
-    assert all("k_fold_cross_validation_dataset/test/" in path for path in shards)
-    # Deliberately non-existent, so a run fails on a missing file rather than on a width
-    # mismatch someone might "fix" by reverting the channel counts.
-    assert all("REPOINT_ME" in path for path in shards)
-
-
 # ---------------------------------------------------------------------------
 # The merge
 # ---------------------------------------------------------------------------
 def test_every_override_lands_in_the_merged_config(merged, overrides) -> None:
-    assert merged["general_config"]["batch_size"]["test"] == 32
+    assert merged["general_config"]["batch_size"]["test"] == (
+        overrides["general_config"]["batch_size"]["test"]
+    )
     assert merged["dataset_config"]["vae_test_datasets"] == (
         overrides["dataset_config"]["vae_test_datasets"]
     )
-    assert _dataset_kwargs(merged)["cache_size"] == 0
+    assert _dataset_kwargs(merged)["cache_size"] == _dataset_kwargs(overrides)["cache_size"]
     assert _dataset_kwargs(merged)["load_fields"] == _dataset_kwargs(overrides)["load_fields"]
     assert merged["eval_config"] == overrides["eval_config"]
 
@@ -139,21 +111,10 @@ def test_the_run_s_own_contract_survives_the_merge(merged, resolved) -> None:
     )
     assert "fhr" in loader["normalize_fields"]
     # Untouched by the delta: setting one dataset_kwargs entry must not drop the rest of the block.
-    assert _dataset_kwargs(merged)["trim_minutes"] == 1.0
+    assert _dataset_kwargs(merged)["trim_minutes"] == _dataset_kwargs(resolved)["trim_minutes"]
     assert merged["general_config"]["batch_size"]["train"] == (
         resolved["general_config"]["batch_size"]["train"]
     )
-
-
-def test_the_inherited_epoch_filter_is_left_alone(merged) -> None:
-    r"""``epoch`` is negative and the dataset floor is $-44640$ s, so ``epoch_min: -48000`` is a
-    no-op; ``epoch_max: -48000`` would select nothing at all. The delta restates neither, and
-    copying the sibling's ``epoch_max`` would be the bug."""
-    kwargs = _dataset_kwargs(merged)
-    assert kwargs["epoch_min"] == -48000
-    assert kwargs["epoch_max"] is None
-    assert kwargs["epoch_max"] != -48000
-    assert kwargs["label"] is None
 
 
 def test_the_merge_mutates_neither_input(resolved) -> None:

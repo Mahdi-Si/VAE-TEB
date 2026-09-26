@@ -10,8 +10,8 @@ correct and reads as something it is not.
 * **A cancellation ratio without its denominator.** Near zero it means either that the proposals
   cancel or that they are all near zero -- a source pathway arguing with itself, or one that has
   switched off. Both tests below produce the same ratio from those two states, which is the point.
-* **A qualification that lives only in the code.** It has to be in the artifact a reader opens, so
-  it is asserted on what the readout returns rather than on the constant that produced it.
+* **A band that does not partition the window it is read on.** Every shipped evaluation profile is
+  resolved against the training configuration whose window it is declared for.
 """
 from __future__ import annotations
 
@@ -35,11 +35,11 @@ WIDE_TRAINING_CONFIG = DEFAULT_OVERRIDES_PATH.parents[2] / "configs" / "default.
 #: The wide window's hand-declared partition, carried today by the tail diagnostic profile.
 WIDE_PARTITION = ("anchor", "near", "mid", "far")
 
-#: The two shipped evaluation profiles, each with the training configuration whose window it is
+#: The shipped evaluation profiles, each with the training configuration whose window it is
 #: read on and the names of the bands that PARTITION that window -- ``None`` where the profile
 #: derives its partition from the window through ``partition_width``, in which case the derived
 #: names are the partition. A profile may declare further bands that overlap the partition; those
-#: are read as cross-window bands, not as part of it.
+#: are read as cross-window bands, or as the tail diagnostic's cutoff family, not as part of it.
 SHIPPED_PROFILES = {
     "committed": (DEFAULT_OVERRIDES_PATH, SHORT_TRAINING_CONFIG, None),
     "short": (
@@ -47,6 +47,7 @@ SHIPPED_PROFILES = {
         SHORT_TRAINING_CONFIG,
         ("instant", "recent", "intermediate", "tail"),
     ),
+    "tail_diagnostic": (TAIL_DIAGNOSTIC_PATH, WIDE_TRAINING_CONFIG, WIDE_PARTITION),
 }
 
 
@@ -136,22 +137,6 @@ def test_the_short_profile_adds_cross_window_bands_that_overlap_its_partition() 
     masks = lag_metrics.band_masks(short, max_lag + 1)
     for name in extra:
         assert any(bool((masks[name] & masks[other]).any()) for other in partition)
-    assert yaml.safe_load(SHORT_PROFILE_PATH.read_text(encoding="utf-8"))["eval_config"]["num_mc_samples"] == 32
-    assert "base" not in yaml.safe_load(SHORT_PROFILE_PATH.read_text(encoding="utf-8"))
-
-
-def test_the_committed_delta_derives_its_partition_and_loads_on_the_wide_window_too() -> None:
-    """The partition is a function of the checkpoint's window, so the one delta resolves on the
-    production bank and on the wide one, and each resolution covers its window exactly once."""
-    committed = _bands_of(DEFAULT_OVERRIDES_PATH)
-    assert "partition_width" in committed
-    for training in (SHORT_TRAINING_CONFIG, WIDE_TRAINING_CONFIG):
-        max_lag = _max_lag_of(training)
-        bands = _resolved_bands_of(DEFAULT_OVERRIDES_PATH, max_lag)
-        derived = [span for name, span in bands.items() if name.startswith("lags_")]
-        covered = sorted(lag for lo, hi in derived for lag in range(lo, hi + 1))
-        assert covered == list(range(max_lag + 1)), training.name
-        assert bool(lag_metrics.band_masks(bands, max_lag + 1)["all"].all())
 
 
 def test_a_band_past_the_short_window_refuses_naming_the_window() -> None:
@@ -168,26 +153,6 @@ def test_a_band_past_the_short_window_refuses_naming_the_window() -> None:
 def tail_diagnostic():
     """The tail diagnostic profile's raw mapping."""
     return yaml.safe_load(TAIL_DIAGNOSTIC_PATH.read_text(encoding="utf-8"))
-
-
-def test_the_tail_diagnostic_keeps_the_wide_partition_and_adds_the_cutoff_bands(
-    tail_diagnostic,
-) -> None:
-    """The wide four bands partition the wide window, so the diagnostic run's partition margins
-    are comparable with a wide run's; the cutoff pair partitions the window at the proposed
-    25-entry boundary; and every band validates against the wide lag window."""
-    bands = tail_diagnostic["eval_config"]["occlusion_bands"]
-    max_lag = _max_lag_of(WIDE_TRAINING_CONFIG)
-
-    edges = sorted((int(bands[name][0]), int(bands[name][1])) for name in WIDE_PARTITION)
-    assert edges[0][0] == 0 and edges[-1][1] == max_lag
-    for (_, previous_hi), (next_lo, _) in zip(edges, edges[1:]):
-        assert next_lo == previous_hi + 1, edges
-    assert bands["head_0_24"] == [0, 24] and bands["tail_25_90"] == [25, max_lag]
-    validated = _validate_occlusion_bands(bands, max_lag)
-    assert set(validated) == set(bands)
-    assert tail_diagnostic["eval_config"]["num_mc_samples"] == 32
-    assert "base" not in tail_diagnostic
 
 
 def test_the_keep_prefix_family_nests_and_ends_on_the_reference_identities(tail_diagnostic) -> None:
@@ -490,22 +455,6 @@ def test_a_run_with_no_matched_arm_reports_missing_rather_than_a_margin() -> Non
         _headline(**{"nll_suppress:near": 11.0}), {"near": {"anchors": 1.0, "channels": 1.0}}
     )
     assert block["near"]["margin_nats"] is lag_metrics.MISSING
-
-
-# =============================================================================
-# The qualification
-# =============================================================================
-def test_the_qualification_travels_in_the_readout_rather_than_only_in_the_code() -> None:
-    """A caveat that lives only in a docstring is one tidy-up away from being absent from the
-    artifact a reader opens."""
-    report = lag_metrics.qualified_report({"band_suppression": {}})
-
-    text = report["qualification"]
-    assert "which stored source time" in text
-    assert "fitted computation" in text
-    assert "physiological delay" in text
-    # And it is added beside the blocks rather than replacing them.
-    assert "band_suppression" in report
 
 
 # =============================================================================

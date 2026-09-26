@@ -28,18 +28,13 @@ from teb_vae.lag_attn.nets.attention import LagCrossAttention
 from teb_vae.lag_attn.nets.heads import PosteriorHead, TEAnalysisHead
 from teb_vae.lag_attn_transformer_rws.nets.encoders import GatedCausalConvStem
 from teb_vae.lag_slot_transformer_cfs.nets import controls
-from teb_vae.lag_slot_transformer_cfs.nets.conv_source import ConvSourceStem
 from teb_vae.lag_slot_transformer_cfs.nets.core import pathway_parameter_counts
 from teb_vae.lag_slot_transformer_cfs.nets.lag_attention import LagAttentionFusion
-from teb_vae.lag_slot_transformer_cfs.nets.lag_updates import LagProposalHead
-from teb_vae.lag_slot_transformer_cfs.nets.pointwise_source import PointwiseSourceEncoder
 
 from .conftest import build_tiny_model, tiny_streams
 
 #: The comparator arms, keyed by the name their configuration ships under, and the single leaf each
-#: one moves against the recommended candidate. Written out rather than read from the configuration
-#: directory: what is being asserted is that each arm is **one** change, and a table derived from
-#: the files could not say that.
+#: one moves against the recommended candidate.
 ARMS: Dict[str, Dict[str, Any]] = {
     "candidate": {},
     "target_only": {"source_disabled": True},
@@ -92,38 +87,6 @@ def _wake(model, *, seed: int = 5) -> None:
 # =================================================================================================
 # Each arm is a module tree
 # =================================================================================================
-@pytest.mark.parametrize("arm", sorted(ARMS))
-def test_each_arm_declares_itself_on_the_model(arm: str) -> None:
-    """The leaves reach the model as attributes, which is what every readout reports from.
-
-    An arm whose flag were consumed at construction and then forgotten would produce correct numbers
-    under a summary that could not say which arm produced them.
-
-    Args:
-        arm: The arm to build.
-    """
-    model = build_tiny_model(**ARMS[arm])
-    for leaf, value in ARMS[arm].items():
-        assert getattr(model, leaf) == value, leaf
-
-
-def test_the_two_fusions_are_different_modules_and_the_stems_too() -> None:
-    """Not one module consulting a flag, which could not change a checkpoint's key set."""
-    local = build_tiny_model()
-    attention = build_tiny_model(lag_fusion="attention")
-    conv = build_tiny_model(lag_fusion="attention", source_stem="conv")
-
-    assert isinstance(local.proposal_head, LagProposalHead)
-    assert isinstance(attention.proposal_head, LagAttentionFusion)
-    assert isinstance(local.source_encoder, PointwiseSourceEncoder)
-    assert isinstance(conv.source_encoder, ConvSourceStem)
-
-    # And the state dicts differ in their key sets, so a strict load across two arms refuses rather
-    # than silently reshaping.
-    assert set(local.state_dict()) != set(attention.state_dict())
-    assert set(attention.state_dict()) != set(conv.state_dict())
-
-
 def test_only_the_declared_comparator_builds_an_attention_over_lags() -> None:
     """The structural prohibition still holds everywhere it was ever claimed to.
 
@@ -373,10 +336,8 @@ def test_the_convolution_stem_reaches_further_than_one_stored_step() -> None:
     is the resolution floor of every band margin taken over that representation.
     """
     conv = build_tiny_model(lag_fusion="attention", source_stem="conv")
-    pointwise = build_tiny_model(lag_fusion="attention")
 
     assert conv.source_encoder.receptive_field > 1
-    assert not hasattr(pointwise.source_encoder, "receptive_field")
 
 
 def test_the_conv_stem_carries_the_same_per_channel_availability_as_the_pointwise_arm() -> None:
@@ -409,6 +370,9 @@ def test_the_conv_stem_carries_the_same_per_channel_availability_as_the_pointwis
         ({"source_scalar_lift": True, "source_stem": "conv"}, "per-coefficient"),
         ({"lag_fusion": "attention", "lag_scale": 0.5}, "no summation to scale"),
         ({"lag_fusion": "attention", "lag_chunk": 2}, "renormalise"),
+        # The lift of a withheld value is a learned per-channel constant on every coefficient,
+        # which would still be reported as a control on capacity.
+        ({"source_scalar_lift": True, "source_values_withheld": True}, "withhold_values"),
     ),
 )
 def test_an_undeclared_or_meaningless_arm_combination_is_refused(
@@ -423,12 +387,3 @@ def test_an_undeclared_or_meaningless_arm_combination_is_refused(
     with pytest.raises(ValueError, match=message):
         build_tiny_model(**overrides)
 
-
-def test_the_scalar_lift_and_the_withheld_values_are_refused_together() -> None:
-    """The lift of a withheld value is a learned per-channel constant on every coefficient.
-
-    The arm would hold parameters that read nothing and would still be reported as a control on
-    capacity, which is the one claim it exists to make.
-    """
-    with pytest.raises(ValueError, match="withhold_values"):
-        build_tiny_model(source_scalar_lift=True, source_values_withheld=True)

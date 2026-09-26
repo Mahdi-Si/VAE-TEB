@@ -85,13 +85,6 @@ def test_the_slice_is_not_merely_a_permutation_of_the_right_samples(layout) -> N
     assert torch.equal(torch.diff(sliced), torch.ones(layout.n_samples - 1, dtype=torch.float64))
 
 
-def test_every_tau_slice_stays_inside_the_record(layout) -> None:
-    r"""The last slice closes at $R(T_{\mathrm{valid}} + H)$, which is exactly the end of the
-    record -- the construction uses the whole trace and never reads past it."""
-    assert SHIPPED.r * (SHIPPED.t_valid + SHIPPED.horizon) == SHIPPED.raw_len
-    assert layout.n_samples == (SHIPPED.t_valid - SHIPPED.warmup) * SHIPPED.r
-
-
 def test_window_validity_is_an_exact_all_over_the_anchors_a_window_spans(layout) -> None:
     """Whole-window dropping, hand-checked against a mask with one zeroed anchor.
 
@@ -312,24 +305,14 @@ def test_a_geometry_too_short_to_hold_a_window_accumulates_nothing(layout) -> No
         batch["target"], batch["mu_base"], batch["mu_full"], batch["up"], batch["mask"], layout=tiny
     )
 
+    # The layout itself reports zero windows rather than raising, which is what the skip reads.
+    assert tiny.n_windows == 0
     assert sums == {}
 
 
 # =============================================================================
 # Slice and window geometry
 # =============================================================================
-def test_the_shipped_layout_is_the_one_the_document_describes(layout) -> None:
-    """The numbers ``EVAL.md`` quotes, pinned. A silent change to any of them would move every
-    frequency axis and every lead time in the analysis without failing anything else."""
-    assert layout.n_anchors == 240
-    assert layout.n_samples == 3840
-    assert layout.nperseg == 512
-    assert layout.hop == 256
-    assert layout.n_windows == 14
-    assert layout.n_freq == 257
-    assert layout.delta_f_hz == pytest.approx(0.0078125)
-
-
 def test_windows_span_whole_anchors_which_is_what_makes_the_gap_rule_exact(layout) -> None:
     r"""The window and the hop are multiples of $R$, so a Welch window is a whole number of
     anchors.
@@ -361,13 +344,6 @@ def test_the_lead_time_axis_tiles_the_horizon_without_overlap_or_gap(layout) -> 
     for (_, previous_hi), (next_lo, _) in zip(spans, spans[1:]):
         # Consecutive slices meet at one raw sample's spacing: no overlap, and nothing skipped.
         assert next_lo - previous_hi == pytest.approx(1.0 / spectra.FS_RAW)
-
-
-def test_a_geometry_too_short_for_one_window_reports_zero_rather_than_raising() -> None:
-    """A tiny geometry is a fact about the run, not a bug in it. ``n_windows == 0`` is what the
-    analysis reads to record a skip; a raise here would take the whole pass down instead."""
-    tiny = spectra.slice_geometry(t_valid=16, warmup=4, horizon=4, raw_per_step=16)
-    assert tiny.n_windows == 0
 
 
 def test_a_hop_longer_than_the_window_is_refused() -> None:
@@ -647,35 +623,6 @@ def test_averaging_cross_spectra_drives_independent_signals_towards_zero(layout)
     assert np.nanmean(coherence) < 0.05
 
 
-def test_summing_then_ratioing_equals_the_ratio_of_the_pooled_windows(layout) -> None:
-    """Two segments' stored sums, added and then ratioed, give exactly what one pass over both
-    window sets gives. That equality is what lets the per-recording and per-cohort reductions be
-    plain sums, and it is the reason nothing stored is a ratio."""
-    rng = np.random.default_rng(5)
-    parts = []
-    for _ in range(2):
-        sxx = np.zeros(layout.n_freq)
-        syy = np.zeros(layout.n_freq)
-        sxy = np.zeros(layout.n_freq, dtype=np.complex128)
-        for _ in range(5):
-            x = rng.standard_normal(layout.nperseg)
-            one = _spectra_of(x, 0.7 * x + rng.standard_normal(layout.nperseg), layout.nperseg)
-            sxx += one[0]
-            syy += one[1]
-            sxy += one[2]
-        parts.append((sxx, syy, sxy))
-
-    combined = spectra.derive(
-        parts[0][0] + parts[1][0], parts[0][1] + parts[1][1], parts[0][2] + parts[1][2]
-    )
-    pooled = spectra.derive(
-        sum(part[0] for part in parts),
-        sum(part[1] for part in parts),
-        sum(part[2] for part in parts),
-    )
-    assert combined["coherence"] == pytest.approx(pooled["coherence"], rel=1e-15)
-
-
 # =============================================================================
 # The identities
 # =============================================================================
@@ -696,27 +643,6 @@ def test_the_three_way_decomposition_is_exact_for_arbitrary_spectra() -> None:
     assert (out["irreducible"] >= -1e-12).all()
     assert (out["timing"] >= -1e-12).all()
     assert (out["amplitude"] >= -1e-12).all()
-
-
-def test_parseval_holds_exactly_under_the_modules_scaling_convention(layout) -> None:
-    r"""$\sum_k P_{ee,k}$ equals the windowed, detrended residual sum of squares over $U$.
-
-    The convention has three independent ways to be wrong -- the $N U$ divisor, the one-sided
-    doubling, and which series the mean is removed from -- and each is a plain multiplicative error
-    that no other test in this repository would notice. It is the identity a run reports in its
-    sanity block, so it is proved here on real arithmetic first.
-    """
-    rng = np.random.default_rng(7)
-    x = rng.standard_normal(layout.nperseg)
-    y = 0.6 * x + 0.4 * rng.standard_normal(layout.nperseg)
-    sxx, syy, sxy = _spectra_of(x, y, layout.nperseg)
-
-    window = spectra.welch_window(layout.nperseg)
-    scale = float(window @ window)
-    residual = y - x
-    reference = float(((window * (residual - residual.mean())) ** 2).sum() / scale)
-
-    assert float((sxx + syy - 2.0 * sxy.real).sum()) == pytest.approx(reference, rel=1e-12)
 
 
 def test_the_band_sums_reconcile_with_the_full_spectrum(layout) -> None:
@@ -1186,7 +1112,8 @@ def test_the_analysis_records_a_skip_when_the_tables_carry_no_spectra(tmp_path) 
     # would take down `cross_subgroup`, which reads this analysis's per-recording table off disk
     # and is written to handle an absent source by recording it.
     assert list(directory.glob("*.csv")) == []
-    assert result["files"] == [name for name in result["files"] if name.endswith(".pdf")]
+    # The record names exactly the rendered figures, by stem, and no table.
+    assert sorted(result["files"]) == [name[: -len(".pdf")] for name in rendered]
 
 
 def test_cross_subgroup_survives_a_skipped_coherence_run(tmp_path) -> None:

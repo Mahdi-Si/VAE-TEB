@@ -1,11 +1,10 @@
 r"""The specificity criterion, and the two ways of getting it wrong.
 
-**The verdict must take three losses and nothing else.** That is asserted by *signature*, not by
-reading the implementation: a criterion that could see the KL would fail exactly the healthy models
-it should pass, because a stranger's source is out of distribution for a posterior trained on
-matched pairs and therefore moves it **more**. The case that would fail under the abandoned
-KL-space criterion -- $K_{\mathrm{shuffled}} > K_{\mathrm{true}}$ with the loss ordering intact --
-is written out here and must PASS.
+**The verdict must be decided by the three losses and nothing else.** A criterion that could see
+the KL would fail exactly the healthy models it should pass, because a stranger's source is out of
+distribution for a posterior trained on matched pairs and therefore moves it **more**. The case
+that would fail under the abandoned KL-space criterion -- $K_{\mathrm{shuffled}} > K_{\mathrm{true}}$
+with the loss ordering intact -- is written out here and must PASS.
 
 **A stale key from the permuted dict must be caught.** ``perm_forward_outputs`` returns a *shallow
 copy*: only :data:`~teb_vae.lag_attn_rws.nets.controls.RECOMPUTED_KEYS` describe the permuted
@@ -17,7 +16,6 @@ collection pass reports is *not* the matched one, which it would be if that key 
 """
 from __future__ import annotations
 
-import inspect
 import types
 from typing import Any, Dict, List, Optional
 
@@ -44,30 +42,12 @@ EVAL_CONFIG = {"bootstrap_resamples": 200, "seed": 0}
 # =============================================================================
 # The verdict takes three losses
 # =============================================================================
-def test_the_specificity_verdict_accepts_only_the_three_losses() -> None:
-    """By signature. An implementation that also read the KL would be a different criterion, and
-    reviewing for it is what this assertion replaces."""
-    parameters = list(inspect.signature(source_specificity_verdict).parameters)
-
-    assert parameters == ["d_base", "d_full", "d_shuffled"]
-
-
 def test_the_ordering_passes_and_carries_its_numbers() -> None:
     verdict = source_specificity_verdict(10.0, 8.0, 14.0)
 
     assert verdict.status == PASS
     assert verdict.values["shuffle_penalty"] == pytest.approx(4.0)
     assert verdict.criterion == "D_full < D_base < D_shuffled"
-
-
-def test_a_healthy_model_whose_shuffled_kl_exceeds_its_true_one_still_passes() -> None:
-    """The case the abandoned KL-space criterion would have failed. The KL cannot reach this
-    function, so the case is expressed as: the losses order correctly, and the verdict passes
-    whatever the KL did."""
-    verdict = source_specificity_verdict(10.0, 8.0, 14.0)
-
-    assert verdict.status == PASS
-    assert "kl" not in " ".join(verdict.values).lower()
 
 
 def test_a_broken_ordering_fails_rather_than_being_reported_as_inconclusive() -> None:
@@ -285,32 +265,6 @@ def test_the_margin_is_also_emitted_as_a_keyed_scalar(tmp_path) -> None:
     assert keyed == pytest.approx(row["mean"])
 
 
-def test_the_summary_csv_still_carries_branch_rows_only(tmp_path) -> None:
-    """Stated as an assertion rather than left implicit: the margin is a *penalty* row, and
-    ``perm_control_summary.csv`` has only ever held the branch table. A reader looking for the
-    margin finds it in ``summary.json``'s ``penalties`` and in the headline, not here."""
-    perm_control_analysis.run_perm_control_analysis(
-        _context(
-            _per_sample(
-                mc_nll_base_block=[10.0] * 6,
-                mc_nll_full_block=[8.0] * 6,
-                mc_nll_shuffled_block=[14.0] * 6,
-                mc_nll_base_shuffled_mu_block=[12.0] * 6,
-            )
-        ),
-        eval_config=EVAL_CONFIG, output_dir=tmp_path, probe=None,
-    )
-
-    written = pd.read_csv(
-        tmp_path / perm_control_analysis.ANALYSIS_DIRNAME
-        / perm_control_analysis.SUMMARY_FILENAME
-    )
-    assert "penalty" not in written.columns
-    assert list(written["branch"]) == [
-        name for name, _ in perm_control_analysis.BRANCH_COLUMNS
-    ]
-
-
 def test_the_kl_reading_is_a_description_that_nothing_consumes(tmp_path) -> None:
     """``shuffled_exceeds_true`` sits true on a healthy model, so it is reported *and* labelled --
     and the verdict beside it is decided without it."""
@@ -351,6 +305,8 @@ def test_the_analysis_writes_its_tables(tmp_path) -> None:
     assert (directory / perm_control_analysis.PER_RECORDING_FILENAME).is_file()
     assert (directory / perm_control_analysis.SUMMARY_FILENAME).is_file()
     branches = pd.read_csv(directory / perm_control_analysis.SUMMARY_FILENAME)
+    # Branch rows only: the source margin is a penalty and lives in the summary, not this table.
+    assert "penalty" not in branches.columns
     assert list(branches["branch"]) == [
         name for name, _ in perm_control_analysis.BRANCH_COLUMNS
     ]

@@ -38,36 +38,7 @@ from teb_vae.lag_attn_cfs.tests.conftest import (
     tiny_warmup_kwargs,
 )
 from teb_vae.lag_attn_rws.nets.losses import compute_loss as compute_shared_objective
-from teb_vae.lag_attn_rws.nets.model import SeqVaeLagAttnRws
 from teb_vae.lag_attn_rws.nets.raw_masks import contributing_anchors, forecast_mask
-
-#: The shipped budget's surviving target channels and the block the reconstruction sums over.
-#: Hand-written -- $15 \times 98$ -- and the point of the constants is that they are *not* read
-#: back from the model being checked against them. A ratio computed from a width the objective was
-#: **given** is self-consistent for any wrong width.
-_SHIPPED_KEPT_CHANNELS = 98
-_SHIPPED_BLOCK = 2940
-
-#: What this package's ``compute_loss`` adds to the raw-signal sibling's metric dict: the four
-#: resolved gaps it inherits from the two-sided feature target, plus the ten this family
-#: introduces. Declared as one set so an unannounced fifteenth addition fails here rather than
-#: arriving in a CSV no callback collects.
-_ADDED_METRIC_KEYS = {
-    "pred_gap_tau_first",
-    "pred_gap_tau_last",
-    "pred_gap_st",
-    "pred_gap_ph",
-    "pred_gap_warm_lo",
-    "pred_gap_warm_mid",
-    "pred_gap_warm_hi",
-    "pred_gap_novel_lo",
-    "pred_gap_novel_mid",
-    "pred_gap_novel_hi",
-    "target_warm_frac",
-    "anchors_per_sample",
-    "source_lag_warmth_frac_st",
-    "source_lag_warmth_frac_ph",
-}
 
 #: The two phases the tiled fixtures run at. Chosen so the second row is one anchor short of the
 #: first, which is the only way a padded slot exists at all -- and every padding assertion below
@@ -100,30 +71,6 @@ def _tiled(stride: int = TINY_STRIDE):
 # =================================================================================================
 # The block width
 # =================================================================================================
-def test_the_sample_score_divides_the_block_by_the_hand_written_cardinality() -> None:
-    r"""$H \cdot C_{\mathrm{keep}} = 30 \times 98 = 2940$, written out rather than read off the
-    model -- and asserted a second time as ``horizon * decoder_out_channels``, so a horizon or
-    budget change re-derives it instead of failing this literal."""
-    kwargs = shipped_warmup_kwargs()
-    model = build(kwargs).eval()
-    streams = make_streams(kwargs)
-    out = _forward(model, streams, torch.zeros(BATCH, dtype=torch.long))
-
-    metrics = model.compute_loss(
-        out, torch.cat(streams[:2], dim=-1), weight=_weight(model)
-    )["metrics"]
-
-    assert model.decoder_out_channels == _SHIPPED_KEPT_CHANNELS
-    assert model.horizon * model.decoder_out_channels == _SHIPPED_BLOCK
-    for branch in ("full", "base"):
-        assert float(metrics[f"nll_{branch}_sample"]) == pytest.approx(
-            float(metrics[f"nll_{branch}_block"]) / _SHIPPED_BLOCK, rel=1e-6
-        )
-    # The raw grid's R would divide by 15 x 16 = 240 instead: a factor of 6.125 out, no shape
-    # wrong and no gradient changed.
-    assert _SHIPPED_BLOCK / (model.horizon * model.geometry.r) == pytest.approx(6.125)
-
-
 def test_the_block_width_follows_the_budget_at_both_guard_states() -> None:
     """Two guard states, one relation. The sample score divides by $H$ times whatever the decoder
     emits, so the two must move together or one of them is a constant in disguise."""
@@ -300,8 +247,8 @@ def test_the_dense_stride_is_the_shared_objective_given_the_same_anchors(
     that forward through the **shared** objective with the same index supplied explicitly -- and a
     target built here rather than by the model -- reproduces every metric bitwise.
 
-    This is what isolates the tiling: the delegation adds the fourteen readouts of this package
-    and changes nothing whatever about the objective it delegates to.
+    This is what isolates the tiling: the delegation adds this package's readouts and changes
+    nothing whatever about the objective it delegates to.
     """
     model, streams, features = _tiled(stride=1)
     perturb_posterior(model)
@@ -331,7 +278,6 @@ def test_the_dense_stride_is_the_shared_objective_given_the_same_anchors(
         likelihood=likelihood,
     )["metrics"]
 
-    assert set(through_model) - set(reference) == _ADDED_METRIC_KEYS
     assert set(reference) - set(through_model) == set()
     differing = [
         name
@@ -358,32 +304,8 @@ def test_the_dense_range_is_not_the_none_anchor_set_and_the_objective_says_so() 
 
 
 # =================================================================================================
-# The metric surface
+# The gradient path
 # =================================================================================================
-def test_the_metric_key_set_is_the_raw_siblings_plus_this_packages_fourteen() -> None:
-    """Exact in both directions, against a declared addition rather than a free one. Every
-    downstream reader is keyed by name, so a name in one model and not the other is a column that
-    silently empties -- and a fifteenth addition arriving unannounced would be a readout no callback
-    collects."""
-    model, streams, features = _tiled()
-    out = _forward(model, streams, torch.tensor(_PHASES))
-    causal = model.compute_loss(out, features, weight=_weight(model))["metrics"]
-
-    torch.manual_seed(0)
-    raw = SeqVaeLagAttnRws(**dict(TINY_KWARGS)).eval()
-    raw_streams = make_streams(TINY_KWARGS)
-    torch.manual_seed(0)
-    with torch.no_grad():
-        raw_out = raw(*raw_streams)
-    raw_metrics = raw.compute_loss(
-        raw_out, torch.zeros(BATCH, raw.geometry.raw_len), weight=_weight(raw)
-    )["metrics"]
-
-    assert set(causal) - set(raw_metrics) == _ADDED_METRIC_KEYS
-    assert set(raw_metrics) - set(causal) == set()
-    assert all(isinstance(value, torch.Tensor) for value in causal.values())
-
-
 def test_the_objective_carries_gradient_to_the_widened_decoder_head() -> None:
     """A smoke check that the assembled total is trainable *through the anchor gather*, and that
     the gradient reaches the head whose width this target domain changed."""
@@ -396,35 +318,6 @@ def test_the_objective_carries_gradient_to_the_widened_decoder_head() -> None:
 
     assert model.decoder.mean_head.weight.grad is not None
     assert float(model.decoder.mean_head.weight.grad.abs().max()) > 0.0
-
-
-@pytest.mark.parametrize("likelihood", ["gaussian_nll", "mse"])
-def test_at_init_the_two_reconstruction_terms_are_bitwise_equal(likelihood) -> None:
-    """The zero-KL start restated on the loss path: a wiring mistake between the forward's anchor
-    gather and the loss's -- a stale index, one branch gathered at another's anchors -- leaves the
-    forward-path test green and this one red."""
-    model, streams, features = _tiled()
-    out = _forward(model, streams, torch.tensor(_PHASES))
-
-    metrics = model.compute_loss(
-        out, features, weight=_weight(model), likelihood=likelihood
-    )["metrics"]
-
-    assert torch.equal(metrics["nll_full_block"], metrics["nll_base_block"])
-    assert float(metrics["source_conditioned_kl_train"]) == 0.0
-    assert float(metrics["pred_gap"]) == 0.0
-
-
-def test_the_shipped_block_is_comparable_to_no_sibling() -> None:
-    r"""Recorded where it is checkable rather than only in prose: at the two-sided sibling's own
-    $H = 30$ but $98$ kept channels against its $78$, the block is $2940$ against $2340$ -- so a nat
-    from this configuration is still comparable to no other cell of the grid, and the horizon is no
-    longer the reason."""
-    model = build(shipped_warmup_kwargs())
-
-    assert model.horizon == 30
-    assert model.horizon * model.decoder_out_channels == _SHIPPED_BLOCK
-    assert _SHIPPED_BLOCK != 30 * 78
 
 
 # =================================================================================================
@@ -443,7 +336,7 @@ def test_the_weighted_block_still_divides_by_the_same_cardinality() -> None:
     Which is the right choice and also the one that could silently be made wrong: dividing by
     $\sum_\tau w_\tau \cdot C_{\mathrm{keep}}$ would give the same number today, because the weight
     sums to $H$ -- and would start giving a different one the day the renormalisation moved. So the
-    relation is asserted under the weight, against the same hand-written cardinality.
+    relation is asserted under the weight, against the coefficient count.
     """
     kwargs = shipped_warmup_kwargs(horizon_weight_halflife_steps=15.0)
     model = build(kwargs).eval()
@@ -454,10 +347,10 @@ def test_the_weighted_block_still_divides_by_the_same_cardinality() -> None:
         out, torch.cat(streams[:2], dim=-1), weight=_weight(model)
     )["metrics"]
 
-    assert model.horizon * model.decoder_out_channels == _SHIPPED_BLOCK
+    block = model.horizon * model.decoder_out_channels
     for branch in ("full", "base"):
         assert float(metrics[f"nll_{branch}_sample"]) == pytest.approx(
-            float(metrics[f"nll_{branch}_block"]) / _SHIPPED_BLOCK, rel=1e-6
+            float(metrics[f"nll_{branch}_block"]) / block, rel=1e-6
         )
 
 

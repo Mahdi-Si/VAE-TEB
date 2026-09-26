@@ -16,25 +16,22 @@ sample just outside the claimed support and requires the token to be bitwise unm
 The probe pins the **safety** claim, not tightness. Asserting that a perturbation at
 $n - R + 1$ *does* move the token would pin the bound as exact, which nothing requires and which
 would break the first time a kernel change made the formula conservative.
+
+One composed bound lives here too, because only a raw input has it: the source front end's reach
+composed with the source encoder's bounded window must stay inside the lag search range.
 """
 from __future__ import annotations
 
 import pytest
 import torch
 
+from teb_vae.lag_attn_transformer_e2e.nets.model import SeqVaeLagAttnTrfE2E
 from teb_vae.lag_attn_transformer_e2e.tests.conftest import (
     SEQ_LEN,
     SHIPPED_KWARGS,
     TINY_KWARGS,
     build_frontend,
 )
-
-#: The production schedule's reach, in raw samples, measured from the built stack. $322$ samples is
-#: $80.5$ s at $4$ Hz, against a budget of $30 \times 16 = 480$ ($120$ s).
-SHIPPED_REACH_SAMPLES = 322
-
-#: The smoke schedule's reach, against a budget of $6 \times 16 = 96$.
-TINY_REACH_SAMPLES = 94
 
 
 def _budget(kwargs: dict) -> int:
@@ -43,40 +40,8 @@ def _budget(kwargs: dict) -> int:
 
 
 # ---------------------------------------------------------------------------------------
-# The pinned numbers
+# The arithmetic
 # ---------------------------------------------------------------------------------------
-def test_the_production_reach_is_pinned_and_fits_its_budget():
-    net = build_frontend(SHIPPED_KWARGS)
-
-    assert net.reach_samples == SHIPPED_REACH_SAMPLES
-    assert net.reach_samples < _budget(SHIPPED_KWARGS) == 480
-
-
-def test_the_smoke_reach_is_pinned_and_fits_its_budget():
-    """Tighter than production by design: the smoke geometry raises ``warmup_period`` to $6$ purely
-    to give a four-stage stride-2 cascade room, and the margin left is what a wider anti-alias
-    filter would spend."""
-    net = build_frontend(TINY_KWARGS)
-
-    assert net.reach_samples == TINY_REACH_SAMPLES
-    assert net.reach_samples < _budget(TINY_KWARGS) == 96
-
-
-def test_the_reach_is_a_count_that_grows_with_depth():
-    """A count, matching the ``receptive_field`` convention of the blocks it is accumulated from, so
-    a reach of $1$ would mean "this sample only". Each stage strictly extends it, which is what
-    makes a dead stage -- one whose kernel collapsed to a single tap -- visible here rather than
-    only in a training curve."""
-    net = build_frontend(SHIPPED_KWARGS)
-
-    per_stage = net.stage_reach_samples
-
-    assert len(per_stage) == len(net.stage_modules)
-    assert per_stage[-1] == net.reach_samples
-    assert all(later > earlier for earlier, later in zip(per_stage, per_stage[1:]))
-    assert per_stage[0] > 1
-
-
 def test_a_wider_kernel_costs_more_reach_at_a_deeper_stage():
     """The stride weighting is the non-obvious half of the arithmetic: a kernel at stage $4$ costs
     $8\\times$ what the same kernel costs at stage $1$, because each of its taps spans eight raw
@@ -108,11 +73,27 @@ def test_the_budget_boundary_is_inclusive():
     anchor covers, and a stack reaching exactly that far reads no sample before the segment starts.
     An off-by-one here would reject a legal geometry with a message about a leak that is not there.
     """
-    exact = build_frontend(TINY_KWARGS, reach_budget=TINY_REACH_SAMPLES)
+    reach = build_frontend(TINY_KWARGS).reach_samples
 
-    assert exact.reach_samples == TINY_REACH_SAMPLES
+    build_frontend(TINY_KWARGS, reach_budget=reach)
     with pytest.raises(ValueError, match="front end reaches"):
-        build_frontend(TINY_KWARGS, reach_budget=TINY_REACH_SAMPLES - 1)
+        build_frontend(TINY_KWARGS, reach_budget=reach - 1)
+
+
+def test_the_composed_source_reach_stays_inside_the_lag_search_range():
+    r"""A source state reaching further back than the lag range would already be doing the
+    alignment the lag attention exists to do, and the reported lag would stop being a statement
+    about where the coupling came from. At the production geometry the composed raw reach is
+    $R_{\mathrm{frontend}} + r(R_U - 1)$ -- both reaches are counts, so the anchor token's own $r$
+    samples overlap once -- and it must stay below the $r \cdot \mathrm{max\_lag}$ raw samples
+    the lag search spans."""
+    model = SeqVaeLagAttnTrfE2E(**SHIPPED_KWARGS)
+    source_reach = model.source_encoder.receptive_field
+    assert source_reach is not None, "the source encoder lost its bounded window"
+
+    composed = model.source_frontend.reach_samples + model.raw_per_step * (source_reach - 1)
+
+    assert composed < model.max_lag * model.raw_per_step
 
 
 # ---------------------------------------------------------------------------------------

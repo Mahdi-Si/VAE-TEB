@@ -50,9 +50,12 @@ def test_bare_multistep_drops_at_milestone():
     assert lrs[3] == pytest.approx(0.1)
 
 
-def test_warmup_ramps_then_decays_at_absolute_milestone():
+@pytest.mark.parametrize("via", ["hparams", "constructor"])
+def test_warmup_ramps_then_decays_at_absolute_milestone(via):
+    """``lr_warmup_epochs`` must also be a real constructor knob, not settable only via hparams."""
     warmup, milestone = 3, 5
-    model = _model(lr_milestones=[milestone], lr_gamma=0.1, lr_warmup_epochs=warmup)
+    knobs = dict(lr_milestones=[milestone], lr_gamma=0.1, lr_warmup_epochs=warmup)
+    model = _model(**knobs) if via == "hparams" else TinyLightningModel(**knobs)
     optimizer = _sgd(base_lr=1.0)
     scheduler = model.build_lr_scheduler(optimizer)["scheduler"]
     lrs = _lr_trace(scheduler, optimizer, n_epochs=7)
@@ -64,17 +67,6 @@ def test_warmup_ramps_then_decays_at_absolute_milestone():
     # The decay lands at the ABSOLUTE milestone (epoch 5), not milestone + warmup (8).
     assert lrs[5] == pytest.approx(0.1)
     assert lrs[6] == pytest.approx(0.1)
-
-
-def test_warmup_reachable_via_constructor():
-    # lr_warmup_epochs must be a real constructor knob, not settable only via hparams.
-    model = TinyLightningModel(lr_warmup_epochs=3, lr_milestones=[5], lr_gamma=0.1)
-    optimizer = _sgd(base_lr=1.0)
-    scheduler = model.build_lr_scheduler(optimizer)["scheduler"]
-    lrs = _lr_trace(scheduler, optimizer, n_epochs=6)
-    assert lrs[0] == pytest.approx(0.1)   # warmup start_factor active
-    assert lrs[4] == pytest.approx(1.0)   # full LR before the decay
-    assert lrs[5] == pytest.approx(0.1)   # decay at the absolute milestone
 
 
 def test_warmup_only_no_milestones_ramps_and_holds():

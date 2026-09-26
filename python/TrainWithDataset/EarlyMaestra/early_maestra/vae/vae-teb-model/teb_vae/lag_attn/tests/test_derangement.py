@@ -23,12 +23,7 @@ def test_derangement_has_no_fixed_points(batch_size):
     assert perm.shape == (batch_size,)
     assert perm.dtype == torch.long
     assert not bool((perm == identity).any()), f"fixed point at B={batch_size}"
-
-
-@pytest.mark.parametrize("batch_size", [2, 3, 8, 33])
-def test_derangement_is_a_permutation(batch_size):
-    perm = make_derangement(batch_size)
-    assert torch.equal(perm.sort().values, torch.arange(batch_size))
+    assert torch.equal(perm.sort().values, identity), "not a permutation"
 
 
 def test_derangement_is_deterministic_under_a_seeded_generator():

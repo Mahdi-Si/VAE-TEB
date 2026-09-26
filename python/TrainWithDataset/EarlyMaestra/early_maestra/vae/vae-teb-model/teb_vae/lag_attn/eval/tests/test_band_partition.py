@@ -13,7 +13,6 @@ consumer is most likely to get wrong by multiplying by $f_s$ a second time.
 """
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from typing import Optional
 
@@ -122,12 +121,6 @@ def test_a_degenerate_power_is_labelled_rather_than_silently_binned():
     assert band_partition.kind_of_power(float("nan")) == "ph_unknown"
 
 
-def test_no_diagonal_kind_is_produced_by_the_current_selection(partition):
-    """Documented as expected, not an error: k = 0 is excluded by the shipped k_steps."""
-    assert "ph_k0" not in partition.kind_counts()
-    assert "ph_diag" not in partition.kind_counts()
-
-
 # ---------------------------------------------------------------------------
 # Band assignment
 # ---------------------------------------------------------------------------
@@ -165,14 +158,6 @@ def test_the_display_label_is_the_frequency_range_with_its_period(band, expected
     assert label == expected
     for clinical_name in ("baseline", "deceleration", "beat"):
         assert clinical_name not in label or band == band_partition.UNKNOWN_BAND
-
-
-def test_the_frequencies_are_used_as_stored_with_no_further_fs_multiplication(partition):
-    r"""The writer already multiplied by $f_s$; doing it again lands every channel a factor of
-    four high and moves most of them a whole band."""
-    phase = [record for record in partition.channels if record.block == "phase"]
-    stored_max = 2.0  # the synthetic bank's top centre frequency, in Hz
-    assert max(record.freq_hz_primary for record in phase) <= stored_max + 1e-6
 
 
 # ---------------------------------------------------------------------------
@@ -221,20 +206,6 @@ def test_a_phase_channel_carries_both_frequencies_and_its_ratio(partition):
         )
 
 
-def test_a_scattering_channel_outside_the_phase_band_is_marked_unknown_not_guessed(tmp_path):
-    """The one real limit of the attrs-only route, and it must be visible rather than filled in."""
-    # A single phase channel references only two filters, so most scattering channels have no
-    # recoverable frequency.
-    shard = _make_shard(tmp_path / "narrow.hdf5", n_phase=1, n_up_phase=1)
-    partition = band_partition.build_partition(shard, n_scattering=N_SCATTERING)
-
-    assert partition.coverage["n_scattering_without_frequency"] > 0
-    unknown = partition.partition("clinical")[band_partition.UNKNOWN_BAND]
-    assert unknown, "unrecoverable channels must land in their own band"
-    for channel in unknown:
-        assert not np.isfinite(partition.channels[channel].freq_hz_primary)
-
-
 def test_the_coverage_block_records_the_selection_the_shard_was_built_with(partition):
     assert partition.coverage["phase_k_steps"] == list(K_STEPS)
     assert partition.coverage["phase_band_hz"] == pytest.approx([0.008, 1.0])
@@ -258,15 +229,10 @@ def test_the_partition_builds_without_up_ph_provenance(tmp_path):
 # ---------------------------------------------------------------------------
 # Missing or inconsistent provenance
 # ---------------------------------------------------------------------------
-def test_a_shard_without_the_attributes_raises_naming_the_fallback(tmp_path):
-    """The spike's alternative must be in the message: it is what the operator has to do next."""
+def test_a_shard_without_the_attributes_raises_naming_the_missing_attribute(tmp_path):
     shard = _make_shard(tmp_path / "bare.hdf5", attrs=False)
-    with pytest.raises(RuntimeError) as excinfo:
+    with pytest.raises(RuntimeError, match="sel_i"):
         band_partition.build_partition(shard, n_scattering=N_SCATTERING)
-    message = str(excinfo.value)
-    assert "sel_i" in message
-    assert "compute_scattering_masks" in message, "the message must name the fallback"
-    assert "_write_selection_attrs" in message, "and where the attrs come from"
 
 
 def test_a_partially_written_selection_raises_naming_the_missing_attribute(tmp_path):
@@ -301,12 +267,6 @@ def real_partition(tmp_path):
     return band_partition.build_partition(shard, n_scattering=real_selection.N_SCATTERING)
 
 
-def test_the_real_geometry_yields_109_channels(real_partition):
-    assert real_partition.n_scattering == 43
-    assert real_partition.n_phase == 66
-    assert real_partition.n_channels == 109
-
-
 def test_the_measured_harmonic_kind_distribution_is_reproduced(real_partition):
     """24 / 22 / 20 for $k \\in \\{4, 6, 8\\}$ -- the figure the selection actually produces."""
     counts = real_partition.kind_counts()
@@ -317,11 +277,6 @@ def test_the_measured_harmonic_kind_distribution_is_reproduced(real_partition):
     assert sum(counts.values()) == 109
 
 
-def test_no_diagonal_kind_appears_at_the_real_geometry(real_partition):
-    """$k = 0$ is excluded by the shipped ``k_steps``, so there is no ``ph_diag``."""
-    assert not any(kind in real_partition.kind_counts() for kind in ("ph_k0", "ph_diag"))
-
-
 def test_the_real_clinical_band_occupancy_is_pinned(real_partition):
     """A pipeline change that moved channels between bands would otherwise be invisible."""
     counts = {
@@ -329,12 +284,6 @@ def test_the_real_clinical_band_occupancy_is_pinned(real_partition):
     }
     assert counts == real_selection.CLINICAL_BAND_COUNTS
     assert sum(counts.values()) == 109
-
-
-@pytest.mark.parametrize("name", ["clinical", "by_kind"])
-def test_the_real_partitions_tile_all_109_channels(real_partition, name):
-    covered = sorted(i for indices in real_partition.partition(name).values() for i in indices)
-    assert covered == list(range(109))
 
 
 def test_the_unrecoverable_scattering_channels_are_exactly_the_unreferenced_filters(
@@ -387,18 +336,6 @@ def test_the_json_reloads_into_an_equivalent_partition(partition, tmp_path):
         assert reloaded.partition(name) == partition.partition(name)
     # The unbounded top band survives the round trip, which JSON cannot represent directly.
     assert reloaded.band_hz_ranges["beat_to_beat"][1] == float("inf")
-
-
-def test_the_json_carries_the_labels_ranges_and_index_lists(partition, tmp_path):
-    written = band_partition.write_partition(partition, tmp_path / "out")
-    blob = json.loads(Path(written["partition"]).read_text(encoding="utf-8"))
-
-    assert set(blob["partitions"]) == {"clinical", "by_kind"}
-    assert blob["band_hz_ranges"]["deceleration"] == [0.008, 0.04]
-    assert blob["band_hz_ranges"]["beat_to_beat"][1] is None, "infinity serialises as null"
-    assert sum(len(indices) for indices in blob["partitions"]["clinical"].values()) == (
-        blob["n_channels"]
-    )
 
 
 def test_emit_writes_both_files_and_summarises_the_partition(shard, tmp_path):

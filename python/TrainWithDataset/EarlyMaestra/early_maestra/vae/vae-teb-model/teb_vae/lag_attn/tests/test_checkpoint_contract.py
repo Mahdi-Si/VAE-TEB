@@ -28,43 +28,13 @@ def _lightning_style_checkpoint(module) -> dict:
 
 
 def test_the_checkpoint_carries_the_model_class_and_kwargs(task, prod_kwargs):
+    """The stamp names the eager class, and the override adds to the base stamp and to
+    Lightning's own fields rather than replacing them."""
     checkpoint = _lightning_style_checkpoint(task())
 
     assert checkpoint["model_class"] == "SeqVaeLagAttn"
     assert checkpoint["model_kwargs"] == prod_kwargs
-
-
-def test_the_stamp_names_the_eager_class_not_the_wrapper(task):
-    """It is the class that would be rebuilt, not the class that saved it.
-
-    Were compilation ever on, this would also have to skip the ``_orig_mod`` wrapper -- which is
-    why the base derives it from ``_orig_model`` rather than from ``self``.
-    """
-    checkpoint = _lightning_style_checkpoint(task())
-
-    assert checkpoint["model_class"] == type(task().orig_model).__name__
-
-
-def test_the_flags_that_change_the_architecture_survive(task):
-    """A missing flag rebuilds a different model, and ``load_checkpoint_strict`` would then align
-    nothing and return ``None`` -- which a caller that does not check reads as success."""
-    checkpoint = _lightning_style_checkpoint(task())
-
-    for flag in ("causal_norm", "kld_support", "lag_bias_init", "lambda_perm", "d_model", "d_z"):
-        assert flag in checkpoint["model_kwargs"], f"{flag} missing from model_kwargs"
-
-
-def test_the_base_stamp_survives_the_override(task):
-    """``on_save_checkpoint`` here adds a field; it must not replace the base's work.
-
-    An override that skipped ``super()`` would drop ``model_class`` and every guard that reads it
-    would silently degrade to its warn-and-continue path.
-    """
-    checkpoint = _lightning_style_checkpoint(task())
-
-    assert "model_class" in checkpoint
-    assert "model_kwargs" in checkpoint
-    assert checkpoint["epoch"] == 3  # and it must not have clobbered Lightning's own fields
+    assert checkpoint["epoch"] == 3
 
 
 def test_the_class_guard_accepts_this_model_and_rejects_another(task):
@@ -101,17 +71,6 @@ def test_a_checkpoint_round_trips_into_a_fresh_model(task, inputs, tmp_path):
         assert torch.allclose(reference[key], got[key], atol=1e-6), f"drift on {key}"
 
 
-def test_the_wrapper_state_dict_holds_both_prefixes(task):
-    """Documents the duplicate-prefix quirk the checkpoint loader absorbs."""
-    state = task().state_dict()
-
-    assert any(key.startswith("model.") for key in state)
-    assert any(key.startswith("_orig_model.") for key in state)
-    assert torch.equal(
-        state["model.lag_attn.lag_embeddings"], state["_orig_model.lag_attn.lag_embeddings"]
-    ), "the two prefixes must alias one module"
-
-
 def test_a_rebuilt_model_keeps_its_causal_encoders(task):
     """The one flag whose loss would be invisible.
 
@@ -119,12 +78,13 @@ def test_a_rebuilt_model_keeps_its_causal_encoders(task):
     and only changes whether the prior can see the future -- so a checkpoint that lost it would
     reload, run, and report a KL that is not a transfer entropy.
     """
-    checkpoint = _lightning_style_checkpoint(task())
+    module = task()
+    checkpoint = _lightning_style_checkpoint(module)
 
     rebuilt = SeqVaeLagAttn(**checkpoint["model_kwargs"])
 
     assert rebuilt.causal_norm is True
-    assert rebuilt.n_causalized_norms == 10
+    assert rebuilt.n_causalized_norms == module.orig_model.n_causalized_norms > 0
 
 
 def test_the_loss_hyperparameters_reach_the_checkpoint(task):

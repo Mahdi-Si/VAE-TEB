@@ -29,12 +29,8 @@ whose pathways were dead:
 """
 from __future__ import annotations
 
-import inspect
-
 import pytest
 import torch
-
-from teb_vae.lag_attn_transformer_crws.nets.model import SeqVaeLagAttnTrfCrws
 
 from .conftest import TINY_STRIDE, build, make_streams, tiny_warmup_kwargs
 
@@ -76,15 +72,8 @@ def model(kwargs):
 
 
 # =================================================================================================
-# 0. There is no flag to qualify the claim with
+# 0. No time-pooling normaliser to qualify the claim with
 # =================================================================================================
-def test_causal_norm_is_not_a_keyword_of_this_constructor() -> None:
-    """The architectural difference, stated where the claims below rest on it. The conv-LSTM cells
-    need the key because they have a time-pooling normaliser to causalise; this one does not, so
-    every claim below holds for every configuration this constructor accepts."""
-    assert "causal_norm" not in inspect.signature(SeqVaeLagAttnTrfCrws.__init__).parameters
-
-
 def test_no_history_path_carries_a_time_pooling_normaliser(model) -> None:
     """The other half of the same statement, structurally: a statistic pooled over time on a history
     path is exactly what would make $H_t$ read its own future."""
@@ -102,7 +91,8 @@ def test_no_history_path_carries_a_time_pooling_normaliser(model) -> None:
 @pytest.mark.parametrize("cut", _CUTS)
 def test_the_whole_model_reads_no_step_after_the_anchor(model, kwargs, cut: int) -> None:
     """Every stream is resampled, not only the target: ``mu_full`` reads the source through the lag
-    attention, whose window runs into the strict past, so a source-side leak lands there alone."""
+    attention, whose window runs into the strict past, so a source-side leak lands there alone. The
+    last step must move, or a dead pathway would pass every equality."""
     streams = make_streams(kwargs)
     reference = _forward(model, streams, 1)
     moved = _forward(
@@ -130,18 +120,7 @@ def test_the_whole_model_reads_no_step_after_the_anchor(model, kwargs, cut: int)
     for key in ("mu_base", "logvar_base", "mu_full", "logvar_full"):
         assert torch.equal(reference[key][:, early], moved[key][:, early]), key
 
-
-@pytest.mark.parametrize("cut", _CUTS)
-def test_the_perturbation_did_reach_the_model(model, kwargs, cut: int) -> None:
-    """The paired control for every equality above: without it a dead pathway would pass them all."""
-    streams = make_streams(kwargs)
-    reference = _forward(model, streams, 1)
-    moved = _forward(
-        model,
-        tuple(_resample_after(x, cut, seed=11 + index) for index, x in enumerate(streams)),
-        1,
-    )
-
+    # The paired control: without it a dead pathway would pass every equality above.
     assert not torch.equal(reference["mu_prior"][:, -1], moved["mu_prior"][:, -1])
     assert not torch.equal(reference["source_state"][:, -1], moved["source_state"][:, -1])
 
@@ -149,17 +128,6 @@ def test_the_perturbation_did_reach_the_model(model, kwargs, cut: int) -> None:
 # =================================================================================================
 # 2. Prefix equivalence
 # =================================================================================================
-def test_the_warm_up_mask_is_a_function_of_the_step_alone(model) -> None:
-    """Which is what keeps it from breaking prefix equivalence: sliced to a shorter sequence it is
-    the leading rows of the same constant, not a pattern recomputed against a new length."""
-    adapter = model.target_adapter
-    full = adapter._slice(adapter.availability, model.sequence_length)
-    short = adapter._slice(adapter.availability, model.sequence_length - 5)
-
-    assert torch.equal(short, full[: model.sequence_length - 5])
-    assert not adapter.availability.requires_grad
-
-
 def _history_states(model, streams, length: int):
     r"""$(H^y, H^u)$ over the leading ``length`` steps, through the model's own modules.
 
@@ -202,16 +170,10 @@ def test_running_on_a_prefix_reproduces_the_full_runs_history(model, kwargs) -> 
 
     assert float((full_target[:, :prefix] - short_target).abs().max()) < _PREFIX_TOL
     assert float((full_source[:, :prefix] - short_source).abs().max()) < _PREFIX_TOL
-
-
-def test_the_prefix_probe_is_not_vacuous(model, kwargs) -> None:
-    """A model whose states were all zeros, or constant along time, would satisfy it perfectly."""
-    streams = make_streams(kwargs)
-    target, source = _history_states(model, streams, model.sequence_length)
-
-    assert float(target.abs().max()) > _PREFIX_TOL
-    assert float(source.abs().max()) > _PREFIX_TOL
-    assert float((target[:, 0] - target[:, -1]).abs().max()) > _PREFIX_TOL
+    # Not vacuous: states that were all zeros, or constant along time, would satisfy it perfectly.
+    assert float(full_target.abs().max()) > _PREFIX_TOL
+    assert float(full_source.abs().max()) > _PREFIX_TOL
+    assert float((full_target[:, 0] - full_target[:, -1]).abs().max()) > _PREFIX_TOL
 
 
 def test_a_shorter_sequence_is_refused_rather_than_decoded_at_a_shifted_anchor_set(

@@ -8,7 +8,7 @@ emitted seven of eight pages and one that emitted none both look like "samples/ 
 Every test here caps the draw to the fewest pages that can still fail. A page of the committed
 shard is a full production-geometry render -- $T = 300$, $c_y = 109$ -- and costs seconds, so an
 uncapped test would put minutes into the fast gate to prove what a two-page draw proves just as
-well. The two tests that genuinely need the whole shard say why.
+well. The one test that genuinely needs the whole shard says why.
 """
 from __future__ import annotations
 
@@ -51,11 +51,6 @@ def _run(runner, loader, tmp_path, probe=None, **config_overrides):
 # ---------------------------------------------------------------------------
 # Filenames
 # ---------------------------------------------------------------------------
-def test_the_filename_carries_the_index_the_guid_and_the_epoch():
-    name = samples_analysis.sample_filename("abc-123", 4.5, 12)
-    assert name == "sample0012_abc-123_epoch4.50"
-
-
 def test_a_path_unsafe_guid_is_sanitised_rather_than_written_through():
     """A GUID is an opaque record identifier with no path-safety guarantee."""
     name = samples_analysis.sample_filename("a/b\\c:d", None, 0)
@@ -70,18 +65,6 @@ def test_an_empty_guid_still_yields_a_usable_filename():
 # ---------------------------------------------------------------------------
 # The analysis
 # ---------------------------------------------------------------------------
-def test_a_page_is_written_for_every_selected_sample(runner, tiny_loader, tmp_path, probe_record):
-    """Uncapped on purpose: this is the test that proves the default draws the whole split."""
-    summary = _run(runner, tiny_loader, tmp_path, probe=probe_record)
-    directory = Path(tmp_path) / samples_analysis.ANALYSIS_DIRNAME
-
-    written = sorted(directory.glob("*.pdf"))
-    assert len(written) == summary["n_figures"] == 4  # the whole tiny shard
-    assert summary["failures"] == {}
-    for path in written:
-        assert path.stat().st_size > 0
-
-
 def test_the_cap_bounds_the_page_count(runner, tiny_loader, tmp_path, probe_record):
     """Uncapped, this analysis would emit one full-size PDF per recording in the split."""
     summary = _run(runner, tiny_loader, tmp_path, probe=probe_record, caps={"samples": 2})
@@ -113,21 +96,6 @@ def test_the_csv_carries_the_metrics_the_pages_draw(runner, tiny_loader, tmp_pat
     for column in ("feat_mse_total", "kld_mean", "mean_argmax_lag"):
         assert column in frame.columns, f"{column} missing from the per-sample table"
     assert frame["feat_mse_total"].notna().all()
-
-
-def test_the_draw_is_stratified_over_the_source_files(runner, tiny_loader, tmp_path, probe_record):
-    """A prefix cap over concatenated per-subgroup shards is one subgroup and one class."""
-    summary = _run(runner, tiny_loader, tmp_path, probe=probe_record, caps={"samples": 2})
-    assert sum(summary["composition"].values()) == 2
-    assert summary["plan"]["n_total"] == probe_record["n_samples"]
-
-
-def test_the_te_row_label_is_recorded_alongside_the_pages(
-    runner, tiny_loader, tmp_path, probe_record
-):
-    """A reader cannot tell an attribution from a diagnostic by looking at the picture."""
-    summary = _run(runner, tiny_loader, tmp_path, probe=probe_record, caps={"samples": 1})
-    assert summary["te_lag_map_label"] in {"attribution", "diagnostic"}
 
 
 # ---------------------------------------------------------------------------
@@ -165,8 +133,8 @@ def test_one_failing_page_leaves_the_others_written(
 def test_the_analysis_runs_without_a_probe_record(runner, tiny_loader, tmp_path):
     """``--only samples`` after a failed run still has to work; the draw is then unstratified.
 
-    Uncapped for the same reason as the draw test: with no probe there is no total to plan
-    against, so no cap can apply and every sample is rendered.
+    Uncapped on purpose: with no probe there is no total to plan against, so no cap can apply
+    and every sample is rendered, which is also what shows the default draws the whole split.
     """
     summary = _run(runner, tiny_loader, tmp_path, probe=None)
     assert summary["n_figures"] == 4

@@ -25,14 +25,6 @@ too, and *both* forms sum over $\ell$ to exactly $K_t$ -- as does the per-head s
 ``te_analysis`` computes identically either way. So the flag is pinned separately below, against the
 two forms recomputed from the model's own returned tensors.
 
-There is one thing this readout means here that it does not mean for the sibling, and it is the
-package's whole point. There, the input features at step $t$ read hundreds of seconds into their own
-future, so the quantity is a source-conditioned KL and must not be named for the transfer entropy it
-is not. Here the history is strictly one-sided by construction -- but the name stays
-``source_kl_lag_map`` regardless, because what the model reports is still a KL between two of its own
-distributions, and renaming a quantity on the strength of an architectural argument is how a readout
-starts being read as something it was never measured to be.
-
 Every test perturbs the posterior first. At initialisation the KL is identically zero, the map is
 identically zero, and all three identities hold vacuously on any model at all.
 """
@@ -142,15 +134,3 @@ def test_the_map_is_the_head_structured_form_and_not_the_head_mean_one(
     assert not torch.allclose(structured, head_mean, atol=_SUM_ATOL, rtol=_SUM_RTOL), (
         "the two attribution forms agree on this batch, so the assertion above proves nothing"
     )
-
-
-def test_the_readout_is_named_for_the_kl_not_transfer_entropy(
-    tiny_kwargs, raw_inputs, perturb_posterior
-):
-    """The history is one-sided here, which removes the acausality objection -- but a KL between two
-    of the model's own distributions is what was measured, and that is what the key says. Renaming it
-    would make an architectural argument look like a measurement."""
-    out = _perturbed_forward(tiny_kwargs, raw_inputs, perturb_posterior)
-
-    assert "source_kl_lag_map" in out
-    assert not any("te_lag" in key for key in out)

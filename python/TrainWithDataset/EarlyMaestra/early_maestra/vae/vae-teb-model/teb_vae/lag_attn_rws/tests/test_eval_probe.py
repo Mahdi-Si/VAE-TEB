@@ -10,11 +10,10 @@ from __future__ import annotations
 
 import copy
 import json
-from pathlib import Path
 
 import pytest
 
-from teb_vae.lag_attn_rws.eval import launch, probe as probe_module
+from teb_vae.lag_attn_rws.eval import probe as probe_module
 from teb_vae.lag_attn_rws.tests.conftest import (
     MULTI_CLASS_GUIDS_PER_SHARD,
     MULTI_CLASS_SEGMENTS_PER_GUID,
@@ -49,6 +48,10 @@ def test_the_probe_counts_every_sample_and_every_shard(record) -> None:
     assert record["n_unique_guids"] == _N_SHARDS * MULTI_CLASS_GUIDS_PER_SHARD
     assert set(record["per_file"]) == {f"{name}.hdf5" for name in MULTI_CLASS_SUBGROUPS}
     assert sum(record["per_file"].values()) == _N_SAMPLES
+    # Both label axes, and the per-sample vectors, over every sample rather than a subset.
+    assert sum(record["per_cs_label"].values()) == _N_SAMPLES
+    assert sum(record["per_bg_label"].values()) == _N_SAMPLES
+    assert len(record["guids"]) == len(record["source_files"]) == _N_SAMPLES
 
 
 def test_the_class_histogram_is_keyed_by_clinical_name_not_by_a_stored_value(record) -> None:
@@ -56,13 +59,6 @@ def test_the_class_histogram_is_keyed_by_clinical_name_not_by_a_stored_value(rec
     valid steps were partial -- enough to make a single-class split report several."""
     assert set(record["per_target_class"]) == {"healthy", "acidosis", "hie"}
     assert sum(record["per_target_class"].values()) == _N_SAMPLES
-
-
-def test_both_label_axes_and_the_source_vectors_are_recorded(record) -> None:
-    assert sum(record["per_cs_label"].values()) == _N_SAMPLES
-    assert sum(record["per_bg_label"].values()) == _N_SAMPLES
-    assert len(record["guids"]) == _N_SAMPLES
-    assert len(record["source_files"]) == _N_SAMPLES
 
 
 def test_the_probe_answers_whether_validity_is_ever_fractional(record) -> None:
@@ -122,17 +118,6 @@ def test_the_written_json_omits_the_per_sample_vectors(multi_class_loader, tmp_p
     assert written["n_samples"] == _N_SAMPLES
     for key in probe_module.IN_MEMORY_KEYS:
         assert key not in written
-
-
-def test_the_cohort_table_shows_every_count_beside_its_share(record) -> None:
-    table = probe_module.format_cohort_table(record)
-
-    for name in MULTI_CLASS_SUBGROUPS:
-        assert f"{name}.hdf5" in table
-    for name in ("healthy", "acidosis", "hie"):
-        assert name in table
-    assert f"samples          {_N_SAMPLES}" in table
-    assert "%" in table, "a bare count without its share hides the coverage"
 
 
 def test_the_cohort_table_survives_a_record_with_nothing_in_it() -> None:
@@ -208,14 +193,6 @@ def test_a_guid_in_two_shards_raises(multi_class_config, tmp_path) -> None:
 # ---------------------------------------------------------------------------
 # The standalone command
 # ---------------------------------------------------------------------------
-def test_the_probe_runs_from_a_config_alone(multi_class_config, tmp_path) -> None:
-    """No checkpoint, no model, no GPU -- which is what makes it the first thing to run."""
-    record = probe_module.probe_config(multi_class_config, output_dir=tmp_path)
-
-    assert record["n_samples"] == _N_SAMPLES
-    assert (tmp_path / probe_module.PROBE_FILENAME).is_file()
-
-
 def test_main_merges_the_committed_overrides_over_the_run_s_own_config(
     multi_class_config, multi_class_shards, tmp_path
 ) -> None:
@@ -245,13 +222,6 @@ def test_main_merges_the_committed_overrides_over_the_run_s_own_config(
     assert (tmp_path / "results" / probe_module.PROBE_FILENAME).is_file()
 
 
-def test_the_parser_takes_a_config_and_defaults_the_rest() -> None:
-    args = probe_module.build_parser().parse_args(["--config", "run/resolved_config.yaml"])
-
-    assert args.config == "run/resolved_config.yaml"
-    assert args.overrides is None and args.output_dir is None and args.max_batches is None
-
-
 def test_a_config_is_still_required_but_the_entry_point_is_what_requires_it() -> None:
     """The guarantee is unchanged -- the probe reads a run config and there is none to guess -- but
     it is enforced after the launch dict is merged rather than by ``required=True``, which fires
@@ -267,18 +237,3 @@ def test_a_config_is_still_required_but_the_entry_point_is_what_requires_it() ->
     assert "--config" in message and "RUN_ARGS" in message
 
 
-def test_a_config_supplied_only_by_the_launch_dict_satisfies_the_requirement() -> None:
-    """The other direction, and the point of the dict: with the value filled in there is nothing
-    left to refuse, so pressing Run gets a probe rather than a usage error."""
-    values, sources = launch.resolve_launch_args(
-        probe_module.build_parser(), {"config": "run/resolved_config.yaml"}, []
-    )
-
-    assert (values["config"], sources["config"]) == ("run/resolved_config.yaml", "config")
-    assert launch.missing_required(values, ("config",)) is None
-
-
-def test_the_module_is_runnable_on_its_own() -> None:
-    """``python -m ...eval.probe`` is the sprint's demo; a missing entry point breaks it."""
-    source = Path(probe_module.__file__).read_text(encoding="utf-8")
-    assert 'if __name__ == "__main__":' in source

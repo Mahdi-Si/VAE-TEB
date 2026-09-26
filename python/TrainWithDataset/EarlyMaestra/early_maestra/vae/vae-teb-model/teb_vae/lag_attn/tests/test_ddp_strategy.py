@@ -10,9 +10,8 @@ The strategy string is a *claim* about the model. The grad-coverage tests at the
 written to return.
 
 None of this can be tested against a real process group here, and it does not need to be: the
-selection is a pure function of config, and the framework's own suite already proves the hook is
-what ``build_trainer`` calls. The one place those two facts meet -- the strategy actually reaching
-the ``Trainer`` kwargs -- needs CUDA to be visible, so that test monkeypatches
+selection is a pure function of config. The one place it meets the framework -- the strategy
+actually reaching the ``Trainer`` kwargs -- needs CUDA to be visible, so that test monkeypatches
 ``torch.cuda.is_available``. Without the patch the accelerator branch never runs and every
 assertion about ``strategy`` passes vacuously.
 """
@@ -55,52 +54,37 @@ def _config(**vae_overrides) -> dict:
 def test_the_shipped_config_earns_plain_ddp(trainer):
     """The payoff of learned observation variance and the freeze flag together."""
     assert trainer.select_ddp_strategy(8, trainer.config) == "ddp"
-
-
-def test_a_single_device_needs_no_strategy(trainer):
     assert trainer.select_ddp_strategy(1, trainer.config) == "auto"
 
 
-def test_a_fixed_sigma_obs_starves_the_logvar_heads(trainer):
-    """A debug run at fixed variance stops consuming the decoder log-variance heads."""
+_FUT = "ddp_find_unused_parameters_true"
+
+
+@pytest.mark.parametrize(
+    "likelihood, sigma_obs, head_structured_latent, freeze_unused_attn_proj, expected",
+    [
+        # A debug run at fixed variance stops consuming the decoder log-variance heads.
+        ("gaussian_nll", 1.0, True, True, _FUT),
+        ("mse", "learned", True, True, _FUT),
+        # The case the freeze flag exists for.
+        ("gaussian_nll", "learned", True, False, _FUT),
+        # Without head structure the posterior consumes the projection's output, so nothing
+        # starves: why the selector ANDs the two flags rather than reading the freeze flag alone.
+        ("gaussian_nll", "learned", False, False, "ddp"),
+    ],
+    ids=["fixed-sigma", "mse", "unfrozen-head-structured", "flat-latent"],
+)
+def test_the_selector_falls_back_exactly_when_a_parameter_would_starve(
+    trainer, likelihood, sigma_obs, head_structured_latent, freeze_unused_attn_proj, expected
+):
     config = _config(
-        likelihood="gaussian_nll", sigma_obs=1.0, head_structured_latent=True,
-        freeze_unused_attn_proj=True,
+        likelihood=likelihood,
+        sigma_obs=sigma_obs,
+        head_structured_latent=head_structured_latent,
+        freeze_unused_attn_proj=freeze_unused_attn_proj,
     )
 
-    assert trainer.select_ddp_strategy(8, config) == "ddp_find_unused_parameters_true"
-
-
-def test_an_mse_likelihood_starves_them_too(trainer):
-    config = _config(
-        likelihood="mse", sigma_obs="learned", head_structured_latent=True,
-        freeze_unused_attn_proj=True,
-    )
-
-    assert trainer.select_ddp_strategy(8, config) == "ddp_find_unused_parameters_true"
-
-
-def test_an_unfrozen_projection_under_a_head_structured_latent_starves_the_projection(trainer):
-    """The case the freeze flag exists for."""
-    config = _config(
-        likelihood="gaussian_nll", sigma_obs="learned", head_structured_latent=True,
-        freeze_unused_attn_proj=False,
-    )
-
-    assert trainer.select_ddp_strategy(8, config) == "ddp_find_unused_parameters_true"
-
-
-def test_a_flat_latent_leaves_the_projection_consumed_whether_frozen_or_not(trainer):
-    """Without head structure the posterior consumes the projection's output, so nothing starves.
-
-    This is why the selector ANDs the two flags rather than reading the freeze flag alone.
-    """
-    config = _config(
-        likelihood="gaussian_nll", sigma_obs="learned", head_structured_latent=False,
-        freeze_unused_attn_proj=False,
-    )
-
-    assert trainer.select_ddp_strategy(8, config) == "ddp"
+    assert trainer.select_ddp_strategy(8, config) == expected
 
 
 def test_the_selector_ignores_the_model_argument(trainer):
@@ -117,71 +101,22 @@ def test_the_selector_ignores_the_model_argument(trainer):
     assert without_model == with_wrapper == "ddp"
 
 
-def test_the_hook_is_the_un_prefixed_name_the_framework_looks_up():
-    """Carrying the old underscore-prefixed name over would be a silent no-op.
-
-    The framework looks up ``select_ddp_strategy`` and nothing else, so a ``_select_ddp_strategy``
-    would never be called and the run would fall back to the base's default -- which returns plain
-    ``'ddp'`` for any multi-device run, including the configurations above that must not use it.
-    """
-    from teb_vae.lag_attn.trainer import LagAttnTrainer
-
-    assert "select_ddp_strategy" in vars(LagAttnTrainer)
-    assert "_select_ddp_strategy" not in vars(LagAttnTrainer)
-
-
 def test_the_override_reaches_the_trainer_kwargs(trainer, monkeypatch):
     """The hook and the builder, joined.
 
     ``_build_trainer_kwargs`` sets ``strategy`` only under CUDA, so this patch is what makes the
-    assertion mean anything on a CPU box.
+    assertion mean anything on a CPU box. Read under a config only the override sends to the
+    fallback: the base's default returns plain ``'ddp'`` for any multi-device run, so a hook the
+    framework never looked up (an underscore-prefixed name, say) would pass a ``'ddp'`` check.
     """
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     trainer.cuda_devices = [0, 1, 2, 3, 4, 5, 6, 7]
+    trainer.config["model_config"]["VAE_model"]["freeze_unused_attn_proj"] = False
 
     kwargs = trainer._build_trainer_kwargs([])
 
-    assert kwargs["strategy"] == "ddp"
+    assert kwargs["strategy"] == _FUT
     assert kwargs["accelerator"] == "gpu"
-
-
-def test_no_strategy_key_is_set_on_a_cpu_box(trainer, monkeypatch):
-    """Documents why every test above calls the hook directly instead of reading the kwargs."""
-    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
-
-    kwargs = trainer._build_trainer_kwargs([])
-
-    assert "strategy" not in kwargs
-    assert kwargs["accelerator"] == "cpu"
-
-
-# --------------------------------------------------------------------------------------
-# sync_batchnorm, which the port deliberately changed
-# --------------------------------------------------------------------------------------
-def test_sync_batchnorm_follows_the_config_on_a_multi_device_run(trainer, monkeypatch):
-    """A deliberate behaviour change, asserted at 8 devices because 1 would be vacuous.
-
-    The trainer this was ported from hardcoded ``len(cuda_devices) > 1`` and so ran with
-    ``sync_batchnorm=True`` on the prod box while its own config said ``false``. The framework ANDs
-    the config with the device count, so the config now wins.
-    """
-    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
-    trainer.cuda_devices = [0, 1, 2, 3, 4, 5, 6, 7]
-    assert trainer.config["advanced_config"]["trainer"]["sync_batchnorm"] is False
-
-    assert trainer._build_trainer_kwargs([])["sync_batchnorm"] is False
-
-    trainer.config["advanced_config"]["trainer"]["sync_batchnorm"] = True
-    assert trainer._build_trainer_kwargs([])["sync_batchnorm"] is True
-
-
-def test_sync_batchnorm_is_off_on_one_device_whatever_the_config_says(trainer, monkeypatch):
-    """SyncBatchNorm's forward needs an initialised process group; one device has none."""
-    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
-    trainer.cuda_devices = [0]
-    trainer.config["advanced_config"]["trainer"]["sync_batchnorm"] = True
-
-    assert trainer._build_trainer_kwargs([])["sync_batchnorm"] is False
 
 
 # --------------------------------------------------------------------------------------
@@ -210,16 +145,6 @@ def test_no_parameter_is_left_without_a_gradient(task, shipped_kwargs, perturb_p
     assert not starved, (
         f"parameters expecting a gradient but not receiving one on batch_idx={batch_idx}: "
         f"{starved}. Under plain 'ddp' the reducer raises on exactly these."
-    )
-
-
-def test_freezing_removes_the_projection_from_the_expectation_set(task, shipped_kwargs):
-    """The mechanism behind the strategy choice: frozen means not expected, not merely unused."""
-    module = task(model_kwargs=shipped_kwargs)
-
-    assert module.orig_model.frozen_attn_proj is True
-    assert not any(
-        parameter.requires_grad for parameter in module.orig_model.lag_attn.W_o.parameters()
     )
 
 

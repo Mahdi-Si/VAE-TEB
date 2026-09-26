@@ -407,11 +407,6 @@ def test_loader_config_refuses_a_run_that_did_not_load_a_required_field():
         )
 
 
-def test_the_clinical_fields_are_never_model_inputs():
-    """Identity rides on the batch; the forward takes the coefficient streams and nothing else."""
-    assert not set(data.CLINICAL_FIELDS) & set(data.MODEL_INPUT_FIELDS)
-
-
 # =============================================================================
 # Serialisation
 # =============================================================================

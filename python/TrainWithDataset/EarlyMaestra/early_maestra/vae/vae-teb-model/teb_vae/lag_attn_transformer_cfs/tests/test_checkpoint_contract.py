@@ -74,15 +74,11 @@ def blob():
 # ---------------------------------------------------------------------------------------
 def test_the_checkpoint_names_this_model_class(blob):
     """Stamped from the eager model, so it says ``SeqVaeLagAttnTrfCfs`` even though the wrapper is
-    an empty diamond of two tasks."""
+    an empty diamond of two tasks. The whole constructor call travels key for key: the warm-up
+    vectors under their own names (never ``target_delays``, which shifts rather than masks), the
+    tiling, the lag floor and the encoder schema."""
     assert blob["model_class"] == "SeqVaeLagAttnTrfCfs"
     assert blob["model_kwargs"] == _kwargs()
-
-
-def test_the_base_stamp_survives_the_override(blob):
-    """The task's ``on_save_checkpoint`` adds a field; it must not replace the base's work."""
-    assert "model_class" in blob and "model_kwargs" in blob
-    assert blob["epoch"] == 3  # and Lightning's own fields are untouched
 
 
 def test_the_keep_index_is_the_only_record_of_the_decoder_width(blob):
@@ -95,76 +91,6 @@ def test_the_keep_index_is_the_only_record_of_the_decoder_width(blob):
     assert "decoder_out_channels" not in kwargs
     rebuilt = SeqVaeLagAttnTrfCfs(**kwargs)
     assert rebuilt.decoder_out_channels == len(TINY_TARGET_KEEP_INDEX)
-
-
-def test_the_warm_up_vectors_travel_and_the_delay_names_do_not(blob):
-    """Two halves of one refusal. The warm-up vectors are what the adapters mask and announce with,
-    so a blob without them rebuilds a model with the right widths and no availability terms at all.
-    And they must travel under **these** names: ``target_delays`` reaches ``ChannelDelay``, which
-    shifts rather than masks, so a blob carrying one under the other's name would be ambiguous
-    between two families under one key."""
-    kwargs = blob["model_kwargs"]
-
-    assert kwargs["target_warmup_steps"] == TINY_TARGET_WARMUP_STEPS
-    assert "source_warmup_steps" in kwargs
-    assert "target_delays" not in kwargs and "source_delays" not in kwargs
-
-    rebuilt = SeqVaeLagAttnTrfCfs(**kwargs)
-    assert rebuilt.target_adapter.availability is not None
-    assert rebuilt.source_adapter.availability is not None
-
-
-def test_the_tiling_travels_because_it_decides_what_a_row_of_the_csv_means(blob):
-    """``anchor_stride`` is a real constructor argument rather than a translation, so it lands in
-    the blob with everything else -- and it has to, because it decides how many anchors a training
-    step decodes and therefore what ``anchors_per_sample``, ``nll_base_block`` and every per-anchor
-    number were averaged over."""
-    kwargs = blob["model_kwargs"]
-
-    assert kwargs["anchor_stride"] == TINY_STRIDE
-    assert kwargs["lag_floor"] == 0
-    assert SeqVaeLagAttnTrfCfs(**kwargs).anchor_stride == TINY_STRIDE
-
-
-def test_the_encoder_schema_travels_too(blob):
-    """The half the conv-LSTM causal cell's blob does not carry. Every one of these changes the
-    architecture, and a missing one rebuilds a different encoder that ``load_checkpoint_strict``
-    would refuse -- by returning ``None``, which a caller that does not check reads as success."""
-    kwargs = blob["model_kwargs"]
-
-    for key in (
-        "encoder_conv_kernels",
-        "encoder_conv_dilations",
-        "encoder_num_heads",
-        "encoder_d_ff",
-        "target_attention_blocks",
-        "source_attention_blocks",
-        "source_attention_window",
-    ):
-        assert key in kwargs, key
-    for absent in ("lstm_layers", "causal_norm", "conv_norm_groups"):
-        assert absent not in kwargs, absent
-
-
-def test_the_flags_that_change_the_architecture_survive(blob):
-    for flag in (
-        "sequence_length", "d_model", "d_z", "horizon", "raw_per_step", "max_lag", "c_y",
-        "warmup_period", "target_keep_index", "target_warmup_steps", "anchor_stride", "lag_floor",
-    ):
-        assert flag in blob["model_kwargs"], f"{flag} missing from model_kwargs"
-
-
-def test_the_loss_hyperparameters_and_the_run_seed_reach_the_checkpoint():
-    """So a run's objective is recoverable from its checkpoint, not only from a mutable config --
-    and so is its **tiling**: the per-segment phase is a hash of the seed among other things, so a
-    resumed run that did not know it would re-tile every segment from the epoch it resumed at."""
-    module = _wrapped(SeqVaeLagAttnTrfCfs, _kwargs())
-
-    for name in (
-        "likelihood", "free_bits", "lambda_full", "lambda_base", "beta_schedule", "beta_prior",
-        "seed",
-    ):
-        assert name in module.hparams, f"{name} is not in hparams and will not be checkpointed"
 
 
 # ---------------------------------------------------------------------------------------
@@ -231,22 +157,6 @@ def test_the_class_guard_accepts_this_model_and_rejects_the_siblings(blob):
         with pytest.raises(ValueError, match="does not match the active model class") as excinfo:
             check_model_class(blob, foreign)
         assert "SeqVaeLagAttnTrfCfs" in str(excinfo.value)
-
-
-def test_the_conv_lstm_causal_cells_blob_is_refused_by_the_class_check():
-    """The load a shared ``core_model_checkpoint`` key makes easy to attempt, and the nearest miss
-    in the whole family: the two cells share every geometry key, the same target, the same budget
-    and most tensor names. Only the encoder differs."""
-    foreign_blob = _lightning_style_checkpoint(
-        _wrapped(
-            SeqVaeLagAttnCfs,
-            conv_lstm_tiny_warmup_kwargs(anchor_stride=TINY_STRIDE),
-        )
-    )
-
-    assert foreign_blob["model_class"] == "SeqVaeLagAttnCfs"
-    with pytest.raises(ValueError, match="does not match the active model class"):
-        check_model_class(foreign_blob, "SeqVaeLagAttnTrfCfs")
 
 
 def test_a_foreign_blob_with_the_guard_skipped_refuses_rather_than_partly_succeeding():

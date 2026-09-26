@@ -165,7 +165,7 @@ def profile_column(frame: pd.DataFrame, name: str, size: int) -> np.ndarray:
 #: The preflight artifact the measured lag support is read back from. ``preflight.py`` owns the
 #: record and writes it; this is the reader's name for the same file, restated rather than imported
 #: because that module rebuilds a checkpoint -- and the two analyses that read the number are layer
-#: 2 and run offline, with no model and no GPU. ``tests/test_eval_lag_axis.py`` pins the two names
+#: 2 and run offline, with no model and no GPU. ``tests/test_eval_lag_kl.py`` pins the two names
 #: equal, so a rename cannot leave one side reading a file the other stopped writing.
 PREFLIGHT_FILENAME = "preflight.json"
 

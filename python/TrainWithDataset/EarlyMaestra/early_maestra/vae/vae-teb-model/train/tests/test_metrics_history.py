@@ -124,33 +124,27 @@ def test_the_csv_carries_every_tracked_metric_plus_an_epoch_column(tmp_path):
     assert list(frame["train/total_loss"]) == [3.0, 2.0]
 
 
-def test_the_epoch_column_is_the_real_epoch_not_the_row_index(tmp_path):
+@pytest.mark.parametrize(
+    "history, expected",
+    [([9.9, 3.0, 2.0], [-1, 0, 1]), ([3.0, 2.0], [0, 1])],
+    ids=["after-a-sanity-row", "ordinary-run"],
+)
+def test_the_epoch_column_is_the_real_epoch_not_the_row_index(tmp_path, history, expected):
     """The collector has no sanity-check guard; this writer does.
 
     With ``num_sanity_val_steps > 0`` the source's first history row is the sanity pass -- a row
     this writer skipped. Numbering rows positionally would then label the sanity row 'epoch 0' and
-    shift every real epoch by one against MLflow, the checkpoint filenames and the loss plots.
+    shift every real epoch by one against MLflow, the checkpoint filenames and the loss plots. On
+    an ordinary run the rows are the epochs.
     """
     source = MetricsLoggingCallback(tracked_metrics=("train/total_loss",))
-    source.history["train/total_loss"] = [9.9, 3.0, 2.0]  # sanity row, then epochs 0 and 1
+    source.history["train/total_loss"] = list(history)
     callback = MetricsHistoryCsvCallback(source=source, output_dir=str(tmp_path))
 
     callback.on_validation_epoch_end(FakeTrainer(current_epoch=1), None)
 
     frame = pd.read_csv(tmp_path / "metrics_history.csv")
-    assert list(frame["epoch"]) == [-1, 0, 1]  # the sanity row is visibly not an epoch
-
-
-def test_the_epoch_column_counts_from_zero_on_an_ordinary_run(tmp_path):
-    """The common case: no sanity pass, so the rows are the epochs."""
-    source = MetricsLoggingCallback(tracked_metrics=("train/total_loss",))
-    source.history["train/total_loss"] = [3.0, 2.0]
-    callback = MetricsHistoryCsvCallback(source=source, output_dir=str(tmp_path))
-
-    callback.on_validation_epoch_end(FakeTrainer(current_epoch=1), None)
-
-    frame = pd.read_csv(tmp_path / "metrics_history.csv")
-    assert list(frame["epoch"]) == [0, 1]
+    assert list(frame["epoch"]) == expected
 
 
 def test_the_csv_is_rewritten_each_validation_epoch(tmp_path):

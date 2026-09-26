@@ -801,9 +801,10 @@ fs model gathers the kept channels from its output with `torch.index_select`.
   `future_target` either - its signature is those two block names - so the model unfolds its
   already-concatenated stream itself and S2-T04 pins the two equal.
 
-**Files.** `teb_vae/lag_attn_fs/tests/test_feature_target.py`.
+**Files.** `teb_vae/lag_attn_fs/tests/test_feature_target.py` (since folded into
+`tests/test_objective.py`, which pins the model's own builder to the index identity).
 
-**Validation.** `pytest teb_vae/lag_attn_fs/tests/test_feature_target.py -q`.
+**Validation.** `pytest teb_vae/lag_attn_fs/tests/test_objective.py -q`.
 
 ### S1-T03 - Masks, and the budget-to-width binding on real data
 
@@ -820,10 +821,10 @@ committed shard.
   for the full set's median $47.25$ s.
 - Marked `slow` where it loads the shard.
 
-**Files.** `teb_vae/lag_attn_fs/tests/test_masks.py`,
-`teb_vae/lag_attn_fs/tests/test_budget_width.py`.
+**Files.** `teb_vae/lag_attn_fs/tests/test_masks.py` (since removed: the masks are
+`lag_attn_rws`'s and pinned there), `teb_vae/lag_attn_fs/tests/test_budget_width.py`.
 
-**Validation.** `pytest teb_vae/lag_attn_fs/tests/test_masks.py teb_vae/lag_attn_fs/tests/test_budget_width.py -q`.
+**Validation.** `pytest teb_vae/lag_attn_fs/tests/test_budget_width.py -q -m slow`.
 
 ---
 
@@ -1639,7 +1640,7 @@ ever dropped from `tiny.yaml`.
 
 ## Sprint 6 - The package record
 
-**Landed 2026-08-09.** `DESIGN.md` (14 sections) and `tests/test_docs.py` (49 tests) in one commit,
+**Landed 2026-08-09.** `DESIGN.md` (14 sections) and `tests/test_docs.py` (49 tests, since removed) in one commit,
 the house pattern. 465 tests in this package, all green. The configuration surface is driven in both
 directions - all **44** shipped `VAE_model` keys documented, **16** recorded as deliberately absent
 and verified absent - and the parameter arithmetic is pinned against constructed models rather than
@@ -1698,9 +1699,9 @@ house pattern.
   names a config that exists.
 
 **Files.** `teb_vae/lag_attn_fs/DESIGN.md`,
-`teb_vae/lag_attn_fs/tests/test_docs.py`.
+`teb_vae/lag_attn_fs/tests/test_docs.py` (since removed; the document is no longer test-bound).
 
-**Validation.** `pytest teb_vae/lag_attn_fs/tests/test_docs.py -q`.
+**Validation.** Read-through only.
 
 ---
 

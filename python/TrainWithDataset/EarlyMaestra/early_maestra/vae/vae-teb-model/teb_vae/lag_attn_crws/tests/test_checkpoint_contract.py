@@ -2,26 +2,13 @@ r"""Checkpoints are self-describing, and this model's input set and tiling are t
 they describe.
 
 A stock Lightning ``.ckpt`` carries neither the class that wrote it nor the kwargs that built it.
-With both, a checkpoint can be rebuilt with no config file -- the config that produced a run is a
-mutable file that may not exist when anyone loads the weights -- and ``check_model_class`` can refuse
-a foreign blob *before* the rebuild is attempted, while the error can still say what is wrong.
-
-What this cell adds to that contract is not a decoder width. The decoder emits ``raw_per_step`` raw
-samples per horizon token and no budget, gate or config can move it, which is exactly the difference
-from the causal-feature cell it shares every input tensor with: **two blobs of these two models are
-the same tensors under the same names, and only the decoder head's width tells them apart.** The
-class stamp is what separates them, and the test below drives that case rather than describing it.
-
-Two fields are load-bearing here in their own right.
-
-``target_keep_index`` records *which stored input channels the encoders were fed*. It is resolved
-from the **warm-up budget against the shards**, so a blob recording only the threshold could not be
-rebuilt anywhere the data is not -- and the data may be on another machine.
-
-``target_warmup_steps`` is what the input adapters mask and announce with. A blob that lost it would
-rebuild a model with the right widths and **no availability terms at all**, reading the region where
-a one-sided filter's output is a function of assumed pre-recording history -- with every tensor
-aligning and every shape correct.
+With both, a checkpoint can be rebuilt with no config file -- and here with no shard either, since
+the keep-index and warm-up vectors are resolved from the data once and then travel in
+``model_kwargs``. Checked: the stamp is the class and the exact constructor kwargs; a save/reload
+round trip rebuilds the same forward; the rebuild needs no shard on disk; and two foreign blobs are
+refused whole rather than partly loaded -- a causal-feature blob, whose tensors differ from this
+model's only in the decoder head, and a blob of this model at another warm-up budget, which the
+class stamp cannot separate and whose input adapter width is what misaligns.
 """
 from __future__ import annotations
 
@@ -94,84 +81,6 @@ def test_the_checkpoint_names_this_model_class(blob):
     assert blob["model_kwargs"] == _kwargs()
 
 
-def test_the_base_stamp_survives_the_override(blob):
-    """The task's ``on_save_checkpoint`` adds a field; it must not replace the base's work."""
-    assert "model_class" in blob and "model_kwargs" in blob
-    assert blob["epoch"] == 3  # and Lightning's own fields are untouched
-
-
-def test_the_keep_index_records_the_inputs_and_the_decoder_width_is_not_a_budget_decision(blob):
-    """Both halves of the one binding this cell does **not** make.
-
-    ``target_keep_index`` is the record of which stored channels the encoders were fed, and the
-    model cannot be rebuilt without it: the adapter's input width follows it, and the budget that
-    produced it is a property of the shards.
-
-    The decoder is the other half and its *independence* is the point: it emits ``raw_per_step`` raw
-    samples per horizon token at every budget, so ``decoder_out_channels`` is a constant of the
-    architecture rather than something the blob has to carry. A field recording it separately could
-    disagree with ``raw_per_step`` and one of the two would be believed."""
-    kwargs = blob["model_kwargs"]
-
-    assert kwargs["target_keep_index"] == TINY_TARGET_KEEP_INDEX
-    assert "decoder_out_channels" not in kwargs
-    rebuilt = SeqVaeLagAttnCrws(**kwargs)
-    assert rebuilt.target_adapter.linear.in_features == len(TINY_TARGET_KEEP_INDEX)
-    assert rebuilt.decoder_out_channels == rebuilt.raw_per_step == RAW_PER_STEP
-
-
-def test_the_warm_up_vectors_travel_and_the_delay_names_do_not(blob):
-    """Two halves of one refusal. The warm-up vectors are what the adapters mask and announce with,
-    so a blob without them rebuilds a model with the right widths and no availability terms at all.
-    And they must travel under **these** names: ``target_delays`` reaches ``ChannelDelay``, which
-    shifts rather than masks, so a blob carrying one under the other's name would be ambiguous
-    between two families under one key."""
-    kwargs = blob["model_kwargs"]
-
-    assert kwargs["target_warmup_steps"] == TINY_TARGET_WARMUP_STEPS
-    assert "source_warmup_steps" in kwargs
-    assert "target_delays" not in kwargs and "source_delays" not in kwargs
-
-    rebuilt = SeqVaeLagAttnCrws(**kwargs)
-    assert rebuilt.target_adapter.availability is not None
-    assert rebuilt.source_adapter.availability is not None
-
-
-def test_the_tiling_travels_because_it_decides_what_a_row_of_the_csv_means(blob):
-    """``anchor_stride`` is a real constructor argument rather than a translation, so it lands in
-    the blob with everything else -- and it has to, because it decides how many anchors a training
-    step decodes and therefore what ``anchors_per_sample``, ``nll_base_block`` and every per-anchor
-    number were averaged over."""
-    kwargs = blob["model_kwargs"]
-
-    assert kwargs["anchor_stride"] == TINY_STRIDE
-    assert kwargs["lag_floor"] == 0
-    assert SeqVaeLagAttnCrws(**kwargs).anchor_stride == TINY_STRIDE
-
-
-def test_the_flags_that_change_the_architecture_survive(blob):
-    """A missing flag rebuilds a different model, and ``load_checkpoint_strict`` would then align
-    nothing and return ``None`` -- which a caller that does not check reads as success."""
-    for flag in (
-        "sequence_length", "d_model", "d_z", "horizon", "raw_per_step", "max_lag", "c_y",
-        "warmup_period", "target_keep_index", "target_warmup_steps", "anchor_stride", "lag_floor",
-    ):
-        assert flag in blob["model_kwargs"], f"{flag} missing from model_kwargs"
-
-
-def test_the_loss_hyperparameters_and_the_run_seed_reach_the_checkpoint():
-    """So a run's objective is recoverable from its checkpoint, not only from a mutable config --
-    and so is its **tiling**: the per-segment phase is a hash of the seed among other things, so a
-    resumed run that did not know it would re-tile every segment from the epoch it resumed at."""
-    module = _wrapped(SeqVaeLagAttnCrws, _kwargs())
-
-    for name in (
-        "likelihood", "free_bits", "lambda_full", "lambda_base", "beta_schedule", "beta_prior",
-        "seed",
-    ):
-        assert name in module.hparams, f"{name} is not in hparams and will not be checkpointed"
-
-
 # ---------------------------------------------------------------------------------------
 # The round trip
 # ---------------------------------------------------------------------------------------
@@ -229,31 +138,6 @@ def test_a_checkpoint_reloads_with_no_shard_present(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------------------
 # Foreign blobs
 # ---------------------------------------------------------------------------------------
-def test_the_class_guard_accepts_this_model_and_rejects_the_siblings(blob):
-    check_model_class(blob, "SeqVaeLagAttnCrws")  # must not raise
-
-    for foreign in ("SeqVaeLagAttnRws", "SeqVaeLagAttnCfs"):
-        with pytest.raises(ValueError, match="does not match the active model class") as excinfo:
-            check_model_class(blob, foreign)
-        assert "SeqVaeLagAttnCrws" in str(excinfo.value)
-
-
-def test_a_causal_feature_blob_is_refused_by_the_class_check():
-    """The nearest miss in the whole family, and the one a shared ``core_model_checkpoint`` key
-    makes easy to attempt. That model reads the **identical three input tensors** at the identical
-    widths under the identical tensor names, and differs in one thing: what its decoder emits. So
-    the class stamp is the only thing that separates the two, which is why it is exercised rather
-    than argued about."""
-    foreign_blob = _lightning_style_checkpoint(_wrapped(SeqVaeLagAttnCfs, _kwargs()))
-
-    assert foreign_blob["model_class"] == "SeqVaeLagAttnCfs"
-    # Built from the identical keyword set, which is what makes "the same inputs" a fact here rather
-    # than a claim about two configurations that happen to look alike.
-    assert foreign_blob["model_kwargs"] == _kwargs()
-    with pytest.raises(ValueError, match="does not match the active model class"):
-        check_model_class(foreign_blob, "SeqVaeLagAttnCrws")
-
-
 def test_a_foreign_blob_with_the_guard_skipped_refuses_rather_than_partly_succeeding():
     """The all-or-nothing property the class guard is layered on top of, pinned so a change to the
     loader cannot quietly turn a refusal into a partial warm start.

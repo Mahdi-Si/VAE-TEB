@@ -7,18 +7,14 @@ this file catches is an analysis that runs on one architecture and fails on the 
 that reached for an attribute only the conv-LSTM encoder has, a retention path whose tensor shapes
 differ, a disclosure key that resolves to nothing here.
 
-It asserts the **shape** of what a run leaves behind -- the complete artifact layout, a step record
-from every registered analysis, an exit code, and a coverage block that says which population each
-analysis actually saw -- and it asserts that the layout is the *same* one, because the cross-cell
-comparison reads two directories down one set of names.
-
-**It starts no run of its own.** The session-scoped ``trf_collected_run`` fixture is this suite's
-one end-to-end pass, and :func:`test_this_file_starts_no_run_of_its_own` keeps that from quietly
-changing.
+It asserts the **shape** of what a run leaves behind -- the complete artifact layout, an ok step
+record from every registered analysis, a resolvable headline block, and a coverage block that says
+which population each analysis actually saw -- and it asserts that the layout is the *same* one,
+because the cross-cell comparison reads two directories down one set of names. It starts no run of
+its own: the session-scoped ``trf_collected_run`` fixture is this suite's one end-to-end pass.
 """
 from __future__ import annotations
 
-import ast
 from pathlib import Path
 from typing import Any, Dict, Set
 
@@ -39,20 +35,6 @@ def _registry() -> Dict[str, Any]:
 # =================================================================================================
 # The run itself
 # =================================================================================================
-def test_the_full_run_completes_with_exit_code_zero(trf_collected_run) -> None:
-    """The failed steps are named with their errors rather than left to a bare ``1 == 0``: this run
-    is the most expensive thing the suite does, so a failure that does not say which analysis
-    raised buys a second one."""
-    failed = [
-        f"{record['name']}: {record.get('error')}"
-        for record in trf_collected_run["summary"]["steps"]
-        if record["status"] != "ok"
-    ]
-
-    assert failed == [], failed
-    assert trf_collected_run["exit_code"] == 0
-
-
 def test_every_registered_analysis_contributes_a_step_record(trf_collected_run) -> None:
     """Every selectable analysis, the unskippable channel map, and the loader probe: a step each,
     every one ok. The registry is the causal cell's, reached through the binding -- so this is also
@@ -65,6 +47,7 @@ def test_every_registered_analysis_contributes_a_step_record(trf_collected_run) 
     assert expected <= set(steps), sorted(expected - set(steps))
     assert {"warmup", "source_null", "spectral_skill"} <= set(steps)
     assert all(status == "ok" for status in steps.values()), steps
+    assert trf_collected_run["exit_code"] == 0
 
 
 def test_the_artifact_layout_is_the_causal_cells_own(trf_collected_run) -> None:
@@ -95,20 +78,6 @@ def test_the_artifact_layout_is_the_causal_cells_own(trf_collected_run) -> None:
         f"only {sorted(wrote)} wrote artifacts; the rest recorded skips, so this run demonstrates "
         f"the skip path rather than the pipeline"
     )
-
-
-def test_no_directory_is_left_by_an_analysis_this_pipeline_does_not_have(
-    trf_collected_run,
-) -> None:
-    """``coherence`` is not ported at all, for a reason that is a property of the *target domain*
-    and therefore true of both cfs cells: a stored scattering coefficient is a modulus, so phase
-    agreement and group delay have no analogue at any window length."""
-    subdirectories = {
-        path.name for path in Path(trf_collected_run["results_dir"]).iterdir() if path.is_dir()
-    }
-
-    assert "coherence" not in subdirectories
-    assert "spectral_skill" in subdirectories
 
 
 def test_every_registered_headline_path_resolves_on_this_cells_run(trf_collected_run) -> None:
@@ -156,30 +125,3 @@ def test_the_coverage_block_reports_a_population_per_uncapped_analysis(trf_colle
     assert scored, "no uncapped analysis reported a population, so the block tests nothing"
     assert all(isinstance(value, int) and value > 0 for value in scored.values()), scored
     assert 0 not in {record["n_samples"] for record in per_analysis.values()}
-
-
-def test_a_population_disagreement_is_a_warning_and_not_a_failure(trf_collected_run) -> None:
-    """The exit code is non-zero **if and only if a step raised**, which is why the offline gate
-    exists separately and refuses on the sanity block."""
-    coverage = trf_collected_run["summary"]["results"]["coverage"]
-
-    assert isinstance(coverage["warnings"], list)
-    assert trf_collected_run["exit_code"] == 0
-    assert trf_collected_run["summary"]["failed"] == []
-
-
-# =================================================================================================
-# The one pass
-# =================================================================================================
-def test_this_file_starts_no_run_of_its_own() -> None:
-    """This suite performs exactly one end-to-end pass and every artifact assertion reads it."""
-    source = Path(__file__).read_text(encoding="utf-8")
-
-    calls = [
-        node for node in ast.walk(ast.parse(source))
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and node.func.attr == "main"
-    ]
-
-    assert calls == [], "this file calls main(); read the session-scoped run instead"

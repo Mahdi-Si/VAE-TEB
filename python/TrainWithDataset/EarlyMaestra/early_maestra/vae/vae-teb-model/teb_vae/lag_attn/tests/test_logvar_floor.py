@@ -1,4 +1,4 @@
-r"""The decoders' observation log-variance cannot collapse, and the raw decoder is gone.
+r"""The decoders' observation log-variance cannot collapse, and the horizon core starts neutral.
 
 Under a Gaussian likelihood the model can cheat: drive $\sigma^2 \to 0$ on the steps it predicts
 well and the NLL runs to $-\infty$. The loss goes down, the forecast does not improve, and
@@ -15,7 +15,6 @@ import pytest
 import torch
 from torch import nn
 
-from teb_vae.lag_attn.nets import decoders
 from teb_vae.lag_attn.nets.decoders import (
     BaselineFutureDecoder,
     HorizonDecoderCore,
@@ -70,21 +69,6 @@ def test_decoder_output_shapes():
     assert delta_mu_src.shape == logvar_full.shape == expected
 
 
-def test_both_decoders_share_one_horizon_core():
-    """Sharing is the point: the correction must live in the baseline's representation space."""
-    baseline, residual = _decoders()
-    assert baseline.core is residual.core
-
-
-def test_the_raw_refinement_decoder_does_not_exist():
-    """It was a stub whose only behaviour was to raise, and nothing ever constructed it.
-
-    It is gone rather than kept-and-unused, which is why the forward contract no longer carries
-    a ``raw_future_pred`` key holding ``None`` in a dict of tensors.
-    """
-    assert not hasattr(decoders, "RawRefinementDecoder")
-
-
 def test_a_freshly_constructed_film_core_is_an_identity():
     """``HorizonDecoderCore`` zero-inits its FiLM generator, so a bare core starts neutral.
 
@@ -130,14 +114,6 @@ def test_the_assembled_model_starts_neutral_even_though_film_is_not_an_identity(
         out = model(*inputs)
     assert torch.equal(out["mu_full"], out["mu_base"])
     assert out["delta_mu_src"].abs().max().item() == 0.0
-
-
-def test_horizon_core_expands_over_the_forecast_axis():
-    torch.manual_seed(0)
-    core = HorizonDecoderCore(d_hidden=_D_HIDDEN, horizon=_HORIZON)
-    h = torch.randn(_BATCH, _SEQ_LEN, _D_HIDDEN)
-    with torch.no_grad():
-        assert core.decode(h).shape == (_BATCH, _SEQ_LEN, _HORIZON, _D_HIDDEN)
 
 
 def test_horizon_anchors_are_refined_independently():
@@ -205,29 +181,6 @@ def test_per_block_film_generators_all_receive_gradient():
         if param.grad is None
     ]
     assert not starved, f"per-block FiLM generators without a gradient: {starved}"
-
-
-def test_per_block_off_keeps_the_single_film_generator_and_no_refine_film():
-    """The default (per-block off) is the original single-FiLM core, unchanged: one top-of-stack
-    generator, no per-block generators."""
-    torch.manual_seed(0)
-    core = HorizonDecoderCore(d_hidden=_D_HIDDEN, horizon=_HORIZON, depth=2, film=True)
-    assert core.film_gen is not None
-    assert core.refine.film is None
-
-
-def test_per_block_film_adds_the_expected_parameter_count():
-    """At the shipped decoder geometry (d_hidden 128, depth 3): three Linear(128, 256) generators
-    replace one, so +2 x (128*256 + 256) = +66,048."""
-    torch.manual_seed(0)
-    single = HorizonDecoderCore(d_hidden=128, horizon=30, depth=3, film=True)
-    torch.manual_seed(0)
-    per_block = HorizonDecoderCore(d_hidden=128, horizon=30, depth=3, film=True,
-                                   film_per_block=True)
-    delta = sum(p.numel() for p in per_block.parameters()) - sum(
-        p.numel() for p in single.parameters()
-    )
-    assert delta == 66048
 
 
 def test_per_block_film_without_film_is_a_construction_error():

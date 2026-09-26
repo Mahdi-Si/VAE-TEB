@@ -305,7 +305,7 @@ disagree on shape.
 holding a *distinct legal* anchor would score a target block twice while `kl_mask`'s scatter
 deduplicated it. Here it would make the raw gather below pull one raw window twice — the same
 denominator divergence, on a different tensor — so `tests/test_anchors.py` asserts directly that a
-padded slot's gathered window equals its row's last valid window and contributes zero to the loss.
+padded slot contributes zero to the loss.
 
 ### The anchored raw target
 
@@ -435,8 +435,7 @@ class CausalRawInputs(CausalWarmupInputs): ...
 `CausalWarmupInputs` — the causal-feature cell's input half — holds seven members, and **five of them
 are already target-domain-free**: `_set_causal_inputs`, `_build_adapter`, `build_lag_mask`,
 `_build_anchor_index` and `forward`, whose only trace of a target is the argument *names* `y_st` and
-`y_ph`. Those five are inherited untouched, and `tests/test_causal_raw_inputs.py` asserts each is
-absent from `vars(CausalRawInputs)` and resolves to that mixin's function object by identity. Not one
+`y_ph`. Those five are inherited untouched. Not one
 line of the tiled forward, the warm-up adapter or the floored lag mask is copied. Exactly two members
 are overridden, because exactly two are target-coupled:
 
@@ -453,8 +452,6 @@ defines `_default_decoder_out_channels`, so it resolves to the architecture's, w
 Compose the causal-feature cell's `CausalFeatureForecastTarget` in by mistake and the decoder is
 built at $C_{\mathrm{keep}} = 98$: `raw_sample_score` then computes $(\text{target} - \mu)^2$ on
 shapes that do not broadcast, three frames below the decision that caused it.
-`tests/test_construct.py` builds that wrong composition and reads `mean_head.out_features == 98`,
-so the reason the feature mixin is excluded is a passing test rather than a comment.
 
 **The order of the bases is load-bearing.** The mixin comes first, which is what makes the tiled
 `forward` win method resolution over the architecture's dense one, `_build_adapter` build each
@@ -495,19 +492,19 @@ is what makes "no edit to any existing package" a structural property rather tha
 of them are `staticmethod`s and **must be re-wrapped when bound**: `Owner.some_staticmethod` returns
 the plain function, the descriptor having already resolved, and a plain function assigned in a class
 body becomes an *instance* method that receives `self` as its first argument. That fails three frames
-from the binding, which is why the pins below check each member is callable through `self` at the
-arity its owner declares and not merely `is` the same object.
+from the binding, which is why each is exercised through a call on an instance rather than pinned
+by identity.
 
 | Bound member | Owner | Pinned by |
 | --- | --- | --- |
 | `SOURCE_BLOCK_SPLIT`, `TARGET_BLOCK_SPLIT` | `CausalFeatureForecastTarget` | `tests/test_causal_raw_inputs.py` |
 | `_resolve_block_warm_steps` — re-wrapped as `staticmethod` | `CausalFeatureForecastTarget` | `tests/test_causal_raw_inputs.py` |
-| `_anchors_per_sample`, `_source_lag_warmth` | `CausalFeatureForecastTarget` | `tests/test_causal_raw_inputs.py`, `tests/test_metrics.py` |
+| `_anchors_per_sample`, `_source_lag_warmth` | `CausalFeatureForecastTarget` | `tests/test_anchors.py`, `tests/test_metrics.py` |
 | `anchor_phase`, `_phase_field` — re-wrapped as `staticmethod` —, `resolve_anchor_geometry`, `_build_forward_inputs` | `SeqVaeLagAttnCfsTask` | `tests/test_task.py` |
 | `_mu_gap_rms`, `_added_metrics` | `SeqVaeLagAttnCfsTask` | `tests/test_task.py` |
-| `input_stream_panels` — a `property`, which the binding carries as the descriptor —, `input_budget_figure` | `SeqVaeLagAttnCfsTask` | `tests/test_task.py`, `tests/test_sample_page.py` |
-| `WARMUP_MODEL_KWARGS`, `warmup_model_kwargs` | `lag_attn_cfs/model_kwargs.py` | `tests/test_warmup_budget.py` |
-| `resolve_warmup_budget`, `WarmupBudget` | `lag_attn_cfs/causal_warmup.py` | `tests/test_warmup_budget.py`, `tests/test_preflight.py` |
+| `input_stream_panels` — a `property`, which the binding carries as the descriptor —, `input_budget_figure` | `SeqVaeLagAttnCfsTask` | `tests/test_sample_page.py` |
+| `WARMUP_MODEL_KWARGS`, `warmup_model_kwargs` | `lag_attn_cfs/model_kwargs.py` | `tests/test_trainer.py` |
+| `resolve_warmup_budget`, `WarmupBudget` | `lag_attn_cfs/causal_warmup.py` | `tests/test_preflight.py`, `tests/test_trainer.py` |
 | `_tiling_anchors`, `_draw_anchor_overlay` | `lag_attn_cfs/sample_page.py` | `tests/test_sample_page.py` |
 | `_horizon_receptive_field` | `lag_attn_cfs/trainer.py` | `tests/test_trainer.py` |
 | `_check_raw_target_normalized`, the shared `main` | `lag_attn_rws/trainer.py` | `tests/test_preflight.py`, `tests/test_trainer.py` |
@@ -885,10 +882,9 @@ beside them (`early_stopping.enabled` and its `patience`, and `model_checkpoint.
 each a key the two-sided sibling's constructor does not have and its config never carries, so the
 divergence is *this mechanism exists here* rather than *this number was chosen differently*; and
 **two are measurements** — `gradient_clip_val` and
-`spike_breaker.additive_margin`, declared `RETUNED` and asserted to have moved *down*, because a
-smaller block cannot want a larger threshold. `ema_floor` and `horizon_embed_std` were re-derived
-and came back to the sibling's values, and are listed as `MEASURED_TO_MATCH` so the equality reads
-as a measurement rather than an oversight. `tests/test_config_load.py` also asserts
+`spike_breaker.additive_margin`, declared `RETUNED`. `ema_floor` and `horizon_embed_std` were
+re-derived and came back to the sibling's values, so the parity check holds them there.
+`tests/test_config_load.py` also asserts
 `anchor_stride == horizon` in the default and in every arm, since nothing in the shipped code ties
 the two, and that every key reaches a constructor argument or a task-level consumer.
 
@@ -937,11 +933,7 @@ same number in every row.
 
 Measured on constructed models in one process, not predicted: both cells of this row at the shipped
 warm-up budget and alignment reference and ungated, and the two raw-signal cells they are compared
-against at the shipped reach budget and ungated. `tests/test_docs.py` re-measures every total below
-by constructing the models rather than comparing against literals, so a legitimate change to a shared
-imported component re-costs this table instead of failing an unrelated assertion — and it evaluates
-the stated decomposition parameter name by parameter name, because a table carrying the right delta
-beside a wrong decomposition of it is exactly the half a search for the number cannot see.
+against at the shipped reach budget and ungated.
 
 **Two rows per cell, and both are the record.** The **shipped** row is the revised default: local
 K/V, the prior clock, the weighted horizon axis and the flat lag-bias seed. The **off-state** row is
@@ -1068,8 +1060,7 @@ that the two availability projections it adds outweigh the narrowing of the two 
 the budget and the alignment together drop $64$ of $102$ and $34$ of $51$, so the narrowing dominates
 and the guarded model is *smaller* than the ungated one. It was $+17{,}792$ at the feature cells'
 reference, which is the same expression at $98$ and $47$. Unlike the feature cells, nothing in this
-target domain widens a head: every parameter the guard moves is under an adapter, which
-`tests/test_docs.py` asserts by name. **The expression is the same on the shipped and off-state rows
+target domain widens a head: every parameter the guard moves is under an adapter. **The expression is the same on the shipped and off-state rows
 alike** — five terms, no persistence weight — because this row does not take that key.
 
 ## 14. Deliberate limitations
@@ -1192,9 +1183,8 @@ the target is raw, which is exactly what `teb_vae/lag_attn_rws/eval` evaluates, 
 `teb_vae/lag_attn_transformer_rws/eval/` the working precedent at six modules. The one known
 obstacle is recorded rather than solved: `eval/metrics.py::model_inputs` builds its own three-tensor
 call and deliberately bypasses `_build_forward_inputs`, so it would forward with no phase and no
-stride and silently score the default geometry. `tests/test_lag_consistency.py` asserts the absence
-of an `eval/` directory, so a pipeline arriving here without its lag read site pinned fails against a
-stated intention rather than becoming the third consumer that went unnoticed the first time.
+stride and silently score the default geometry. A pipeline arriving here must pin its lag read
+site, or it becomes the third consumer that went unnoticed the first time.
 
 ## 15. Deviation record
 

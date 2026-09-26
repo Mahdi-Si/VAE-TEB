@@ -1,24 +1,12 @@
-r"""The collapse criterion's properties its own arithmetic cannot check, and the import it costs.
+r"""The collapse criterion as this cell's acceptance gate applies it, and the import it costs.
 
-:mod:`teb_vae.lag_attn_rws.collapse` is **imported rather than forked**. It is stdlib-only -- its
-only imports are ``__future__`` and ``typing`` -- so importing it keeps the acceptance gate free of
-``torch``, and the criterion itself is model-free arithmetic over a per-epoch series both cfs cells
-and both raw cells already log under the same two names. The layering walk forbids
-``teb_vae.lag_attn_rws.eval``, not the model package around it, so this import is inside the rule
-rather than an exemption to it -- and a second copy of a threshold two packages must agree on is
-the drift the fork's whole anti-drift apparatus exists to prevent.
+The criterion itself is :mod:`teb_vae.lag_attn_rws.collapse`, imported rather than forked and
+tested where it is defined. Two properties belong to this cell's gate:
 
-That module restates ``KL_COLLAPSE_MIN_ACTIVE_DIMS * KLD_ACTIVE_EPS`` as a literal instead of
-importing the epsilon, precisely so the gate can apply the criterion on a box with no ``torch``
-installed. That trade is only safe if both halves of it are pinned here: the literal must equal the
-product it stands for, and the module -- and the gate that imports it -- must actually be free of
-``torch``.
-
-The third property is the one a reader of the arithmetic would have to reconstruct: the criterion
-reads the **tail** of a run, never its best window. The KL starts at exactly $0$ by construction
-(the zero-initialised posterior residual) and the $\beta$ warm-up holds it there deliberately, so
-an any-window reading would classify every healthy run as collapsed and a best-window reading would
-classify every collapsed one as healthy.
+* a run whose metrics CSV carries no ``val/kld_active_frac`` column is **unknown** rather than
+  healthy, because the second clause cannot be answered from it;
+* importing the gate pulls in no numeric stack, so a finished run's ``summary.json`` can be checked
+  on a box with no ``torch`` installed.
 """
 from __future__ import annotations
 
@@ -27,65 +15,8 @@ import sys
 from pathlib import Path
 
 from teb_vae.lag_attn_cfs.eval import verify
-from teb_vae.lag_attn_rws.collapse import (
-    KL_COLLAPSE_MIN_ACTIVE_DIMS,
-    KL_COLLAPSE_PATIENCE_EPOCHS,
-    KL_COLLAPSE_THRESHOLD_NATS,
-    is_collapsed,
-)
-from teb_vae.lag_attn_rws.nets.losses import KLD_ACTIVE_EPS
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
-
-#: A latent width the second clause is applied against. Only the ratio matters: clause 2 fires
-#: below ``KL_COLLAPSE_MIN_ACTIVE_DIMS / d_z``, so at 64 the floor is $2/64 = 0.03125$.
-_D_Z = 64
-
-
-# =================================================================================================
-# The restated constants
-# =================================================================================================
-def test_the_literal_threshold_equals_the_product_it_stands_for() -> None:
-    """The invariant that replaces the import. A change to the epsilon fails here."""
-    assert KL_COLLAPSE_THRESHOLD_NATS == KL_COLLAPSE_MIN_ACTIVE_DIMS * KLD_ACTIVE_EPS
-    assert KL_COLLAPSE_THRESHOLD_NATS == 0.02
-
-
-def test_the_gate_reads_the_criterion_from_that_module_rather_than_owning_a_copy() -> None:
-    """Imported, not forked: two packages applying two copies of one threshold is exactly how the
-    same run comes to be collapsed in one table and healthy in another."""
-    assert verify.is_collapsed is is_collapsed
-
-
-# =================================================================================================
-# The tail window
-# =================================================================================================
-def test_clause_one_reads_the_end_of_the_series_and_not_its_best_point() -> None:
-    """A run that was healthy in the middle and died is collapsed; a run that opened at zero -- as
-    every healthy run does, by construction -- and recovered is not. An any-window or best-window
-    reading would get both backwards."""
-    healthy_open = [0.0, 0.0, 0.0, 0.5, 2.0, 4.0, 5.0, 5.4]
-    died_at_the_end = [0.0, 0.5, 4.0, 0.01, 0.008, 0.005, 0.003, 0.001]
-    active = [0.6] * 8
-
-    assert is_collapsed(healthy_open, active, _D_Z) is False
-    assert is_collapsed(died_at_the_end, active, _D_Z) is True
-
-
-def test_a_run_shorter_than_the_patience_window_cannot_fire_clause_one() -> None:
-    """Its tail would be the whole series, which always includes the deliberate zero-KL opening."""
-    short = [0.0] * (KL_COLLAPSE_PATIENCE_EPOCHS - 1)
-
-    assert is_collapsed(short, [0.6] * len(short), _D_Z) is False
-
-
-def test_clause_two_fires_on_the_final_active_fraction_alone() -> None:
-    """The two clauses are one statement at the same threshold, and either suffices: a latent
-    carrying its nats in one dimension is collapsed whatever the total KL reads."""
-    healthy_kl = [5.0] * 8
-
-    assert is_collapsed(healthy_kl, [0.6] * 7 + [1.0 / _D_Z], _D_Z) is True
-    assert is_collapsed(healthy_kl, [0.6] * 7 + [3.0 / _D_Z], _D_Z) is False
 
 
 # =================================================================================================

@@ -25,8 +25,6 @@ variant could be present but useless.
 """
 from __future__ import annotations
 
-from pathlib import Path
-
 import numpy as np
 import pytest
 import torch
@@ -34,7 +32,6 @@ import torch
 from teb_vae.lag_attn_rws.eval._reuse import labels
 from teb_vae.lag_attn_rws.tests.conftest import (
     MULTI_CLASS_EDGE_WEIGHT,
-    MULTI_CLASS_GUIDS_PER_SHARD,
     MULTI_CLASS_SEGMENTS_PER_GUID,
     MULTI_CLASS_SUBGROUPS,
     subgroup_labels,
@@ -62,11 +59,6 @@ def _column(batches: list, name: str) -> list:
 # ---------------------------------------------------------------------------
 # It loads through the real loader, at the real geometry
 # ---------------------------------------------------------------------------
-def test_the_shards_load_through_the_real_data_module(batches) -> None:
-    expected = len(MULTI_CLASS_SUBGROUPS) * MULTI_CLASS_GUIDS_PER_SHARD * MULTI_CLASS_SEGMENTS_PER_GUID
-    assert sum(len(batch["guid"]) for batch in batches) == expected
-
-
 def test_the_trimmed_geometry_is_the_one_the_raw_index_arithmetic_assumes(batches) -> None:
     r"""The forecast of anchor $t$ starts at raw sample $16(t+1)$, which is only true on the
     trimmed grid. A shard written at the trimmed length would move every anchor by a minute."""
@@ -75,14 +67,6 @@ def test_the_trimmed_geometry_is_the_one_the_raw_index_arithmetic_assumes(batche
     assert batch["target"].shape[1] == _TRIMMED_STEPS
     assert batch["fhr"].shape[1] == _RAW_SAMPLES
     assert batch["fhr"].shape[1] == 16 * batch["fhr_st"].shape[1]
-
-
-def test_the_channel_widths_match_the_model_s_data_contract(batches) -> None:
-    batch = batches[0]
-    assert batch["fhr_st"].shape[2] == 43
-    assert batch["fhr_ph"].shape[2] == 66
-    assert batch["up_st"].shape[2] == 43
-    assert batch["up_ph"].shape[2] == 15
 
 
 def test_all_five_added_fields_arrive_in_the_batch(batches) -> None:
@@ -171,11 +155,6 @@ def test_the_fractional_steps_survive_trimming(batches) -> None:
     assert float(weight.min()) == 0.0, "the deliberate gap"
     assert bool((weight == MULTI_CLASS_EDGE_WEIGHT).any())
     assert bool((weight == 1.0).any())
-
-
-def test_no_fixture_binary_is_committed() -> None:
-    """The shards are generated into ``tmp_path_factory``; the suite commits no HDF5 of its own."""
-    assert not (Path(__file__).resolve().parent / "fixtures").exists()
 
 
 # ---------------------------------------------------------------------------

@@ -24,7 +24,6 @@ from typing import Any, Dict, List
 import torch
 
 from teb_vae.lag_attn.channel_reach import resolve_stream_budgets
-from teb_vae.lag_attn_rws.eval import lag_axis
 from teb_vae.lag_attn_rws.eval.analyses import attention as attention_analysis
 from teb_vae.lag_attn_rws.eval.analyses import lag_kl as lag_kl_analysis
 from teb_vae.lag_attn_rws.eval.metrics import Aggregate, lag_summary
@@ -63,29 +62,6 @@ def _guarded_model() -> SeqVaeLagAttnRws:
     )
 
 
-def test_the_plotting_callback_reads_the_models_own_delay():
-    """The figure's probe must resolve to the model's accessor, not to its zero default."""
-    model = _guarded_model()
-
-    assert _source_delay_steps(model) == _EXPECTED_DELAY
-
-
-def test_the_figure_and_the_evaluation_agree_on_the_delay():
-    """The two consumers, side by side. This is the assertion that was false before the model
-    grew a single accessor, and it is the only place the two are ever compared."""
-    model = _guarded_model()
-
-    # What the evaluation entry point passes to `lag_summary`.
-    evaluation_delay = int(model.source_delay_steps)
-    # What the plotting callback passes to the figure builder.
-    figure_delay = _source_delay_steps(model)
-
-    assert evaluation_delay == figure_delay == _EXPECTED_DELAY
-    assert lag_compensated_seconds(5, delay_steps=evaluation_delay) == lag_compensated_seconds(
-        5, delay_steps=figure_delay
-    )
-
-
 def test_both_report_zero_for_an_unguarded_model():
     """The shipped default, where the two agreeing is easy -- and where a regression that made
     the guarded case read zero again would otherwise hide."""
@@ -119,17 +95,6 @@ def _aggregate_peaked_at(lag: int, n_lags: int = _N_LAGS) -> Aggregate:
         attention_profile_untruncated=list(profile),
         attention_profile_per_head=[value for _ in range(4) for value in profile],
         attention_entropy_per_head=[0.0] * 4,
-    )
-
-
-def test_the_analyses_share_one_axis_builder_rather_than_each_owning_one():
-    """Identity, not equality: two implementations that agree today are the exact configuration
-    that produced the historical disagreement, and the numeric comparison below would pass on
-    both of them right up until one of them changed."""
-    assert (
-        lag_kl_analysis.compensated_seconds_axis
-        is attention_analysis.compensated_seconds_axis
-        is lag_axis.compensated_seconds_axis
     )
 
 

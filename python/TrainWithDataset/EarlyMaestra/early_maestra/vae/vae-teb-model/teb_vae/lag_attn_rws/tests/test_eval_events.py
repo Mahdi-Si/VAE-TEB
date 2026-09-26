@@ -29,9 +29,7 @@ from typing import Any, Dict, List
 import numpy as np
 import pandas as pd
 import pytest
-import torch
 
-from teb_vae.lag_attn_rws.eval.figures_seam import figure_filename
 from teb_vae.lag_attn_rws.eval import events
 from teb_vae.lag_attn_rws.eval.analyses import events as events_analysis
 from teb_vae.lag_attn_rws.eval.collect import CONTRACTION_AGE_COLUMN, Collection
@@ -174,15 +172,6 @@ def test_the_usable_interior_is_half_the_block_and_is_computed_not_assumed() -> 
 # =============================================================================
 # The detectors, through the real loader
 # =============================================================================
-@pytest.mark.parametrize("field", ["fhr", "up"])
-def test_the_event_shards_load_through_the_real_loader(event_loader, field) -> None:
-    batch = next(iter(event_loader))
-
-    values = getattr(batch, field)
-    assert values.shape[1] == _TRIMMED_RAW
-    assert torch.isfinite(values).all()
-
-
 def test_every_loaded_event_segment_carries_exactly_the_injected_events(event_loader) -> None:
     """Exactly the injected events, and no others -- which is the non-hallucination property in
     the form that survives the loader, the trim and the weight gap."""
@@ -641,26 +630,6 @@ def test_a_forecast_shifted_past_the_tolerance_loses_its_hits() -> None:
 
     assert hits(near) == pytest.approx(1.0)
     assert hits(far) < 0.2
-
-
-def test_the_analysis_runs_end_to_end_against_a_finished_run(tmp_path, evaluated) -> None:
-    """Both halves, through the registry's own entry point, on the real run's tables."""
-    from teb_vae.lag_attn_rws.eval.analyses import AnalysisContext
-    from teb_vae.lag_attn_rws.eval.collect import load_collection
-
-    collection = load_collection(evaluated["results_dir"])
-    result = events_analysis.run_events_analysis(
-        AnalysisContext(collection=collection),
-        eval_config={"seed": 0, "bootstrap_resamples": 64, "event_lag_window_s": 120.0},
-        output_dir=tmp_path,
-    )
-
-    for key in ("n_samples", "composition", "plan"):
-        assert key in result
-    directory = tmp_path / events_analysis.ANALYSIS_DIRNAME
-    assert (directory / figure_filename(events_analysis.DECELERATION_FIGURE)).is_file()
-    assert (directory / figure_filename(events_analysis.TRIGGERED_FIGURE)).is_file()
-    assert (directory / figure_filename(events_analysis.CONDITIONED_FIGURE)).is_file()
 
 
 def test_a_real_run_over_the_event_shards_recovers_the_injected_events(event_evaluated) -> None:

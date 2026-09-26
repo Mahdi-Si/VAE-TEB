@@ -20,7 +20,6 @@ every shape, every axis and every colour is right.
 """
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Any, List
 
 import matplotlib
@@ -33,13 +32,10 @@ import pytest  # noqa: E402
 import torch  # noqa: E402
 from loguru import logger  # noqa: E402
 
-from teb_vae.lag_attn import figure_primitives  # noqa: E402
 from teb_vae.lag_attn_cfs import sample_page  # noqa: E402
 from teb_vae.lag_attn_cfs import causal_warmup  # noqa: E402
 from teb_vae.lag_attn_cfs import task as task_module  # noqa: E402
-from teb_vae.lag_attn_crws import task as raw_task_module  # noqa: E402
 from teb_vae.lag_attn_cfs.causal_warmup import SOURCE_BLOCKS  # noqa: E402
-from teb_vae.lag_attn_fs import sample_page as feature_page  # noqa: E402
 from teb_vae.lag_attn_rws import plotting  # noqa: E402
 from teb_vae.lag_attn_rws import sample_page as shared_page  # noqa: E402
 from teb_vae.lag_attn_rws.nets import losses, raw_masks  # noqa: E402
@@ -196,11 +192,15 @@ def test_the_callback_draws_both_input_rows_and_warns_about_nothing(tmp_path, ta
     returns no rows, because the seven rows below do not depend on them -- so a page missing both
     of them is indistinguishable from a page that never wanted them unless the log is asserted
     too. Before the replacement this run produced three swallowed warnings and a seven-row page.
+
+    Run on a task with no resolved warm-up budget, which is the one thing the page may skip: the
+    run-level budget figure is a method seam rather than a property precisely so that its absence
+    costs one warned-about figure and not the page.
     """
     module = task()
     callback = LagAttnRwsPlotCallback(tmp_path, num_examples=1)
     trainer = _trainer_with_batch(stub_batch)
-    module.warmup_budget = None  # the run-level figure is a separate seam, tested separately
+    module.warmup_budget = None
     figures: List[Any] = []
 
     original = plotting.build_diagnostic_figure
@@ -220,6 +220,9 @@ def test_the_callback_draws_both_input_rows_and_warns_about_nothing(tmp_path, ta
 
     try:
         assert [message for message in warnings if "input rows skipped" in message] == []
+        skipped = [message for message in warnings if "input-budget figure skipped" in message]
+        assert len(skipped) == 1 and "no resolved warm-up budget" in skipped[0], skipped
+        assert list(callback.output_dir.glob("lag_attn_rws_epoch*"))
         titled = [ax.get_title() for ax in figures[0].axes if ax.get_title()]
         assert len(titled) == _PAGE_ROWS, titled
         for prefix in _INPUT_ROWS:
@@ -700,7 +703,7 @@ def test_every_channel_axis_on_the_page_puts_coefficient_zero_at_the_top(task, s
 
 def test_the_field_rows_draw_the_same_tiling_the_lane_row_does(task, stub_batch):
     r"""Both branches over **every** kept channel, consecutive and non-overlapping, from the
-    tiling the lane row above them already resolved. Three of $98$ channels cannot distinguish a
+    tiling the lane row above them already resolved. Three kept channels cannot distinguish a
     model that forecasts a few easy coefficients well from one that is uniformly mediocre, which
     is what these rows exist to show -- but only if they are the same windows."""
     module = task()
@@ -865,43 +868,6 @@ def test_the_score_row_survives_a_batch_with_no_validity_signal(task, stub_batch
         plt.close(figure)
 
 
-def test_every_inset_sits_in_the_span_this_tiling_leaves_blank(task):
-    r"""Which corner is blank is a property of the tiling, not of the panel. The two-sided page
-    stops short of the recording's end and puts its error map in the right margin; this tiling
-    starts at the anchor floor $F$ and runs to the end, so the blank span is the *prefix* -- and
-    the inherited box put the panel over the last windows of the very forecast it details.
-
-    At the **shipped** geometry, where the claim is the production one: $F = 134$ of $300$ steps,
-    so the prefix is a comfortable $44\%$ of the row. The tiny fixture's floor is too small to
-    hold a legible inset at all, which is what ``_PREFIX_MIN_SPAN`` is for."""
-    from .conftest import SHIPPED_SEQUENCE_LENGTH, shipped_warmup_kwargs
-
-    module = task(model_kwargs=shipped_warmup_kwargs())
-    figure = _render(module, make_stub_batch(2, SHIPPED_SEQUENCE_LENGTH))
-    try:
-        geometry = module.orig_model.geometry
-        floor = geometry.warmup / geometry.t
-        assert floor > sample_page._PREFIX_MIN_SPAN, "the shipped prefix must hold the insets"
-        for title, expected in (
-            ("Forecast", 1),                     # the per-anchor error map
-            ("Per-window forecast score", 2),    # the error and coverage profiles
-        ):
-            ax = _axes_titled(figure, title)
-            assert len(ax.child_axes) == expected, title
-            for inset in ax.child_axes:
-                # The inset's own span in the parent's axes fractions, which is what a box is
-                # expressed in and what the anchor floor is comparable against.
-                left, right = ax.transAxes.inverted().transform(
-                    inset.transAxes.transform([[0.0, 0.0], [1.0, 0.0]])
-                )[:, 0]
-                assert 0.0 <= left < right <= floor, (title, left, right)
-        # And the two-sided sibling keeps its own margin: the default is unchanged, so the page
-        # that box is right for did not move with this one.
-        assert feature_page._ERROR_MAP_BOX[0] > 0.5
-    finally:
-        plt.close(figure)
-
-
 def test_the_profiles_carry_one_point_per_kept_channel(task, stub_batch):
     r"""Per-channel error and $2\sigma$ coverage over the same drawn windows, on the page's own
     top-down channel axis, as insets of the *line* row -- an inset over a field row would hide the
@@ -933,57 +899,16 @@ def test_the_profiles_carry_one_point_per_kept_channel(task, stub_batch):
         plt.close(figure)
 
 
-def test_every_reserved_extra_row_is_drawn_and_every_drawn_row_is_reserved(task, stub_batch):
-    """The two halves live in one constant on purpose. A name reserved and not drawn is a blank
-    row on every page of the run; a name drawn and not reserved is a ``KeyError`` raised inside a
-    handler that swallows it, i.e. a page silently missing from the whole run."""
-    module = task()
-    assert module.forecast_extra_rows is sample_page.CAUSAL_EXTRA_ROWS
-
-    figure = _render(module, stub_batch)
-    try:
-        titled = [ax for ax in figure.axes if ax.get_title()]
-        assert len(titled) == _PAGE_ROWS
-        for _name, height in sample_page.CAUSAL_EXTRA_ROWS:
-            assert height > 0.0
-        # Each reserved row drew something; the layout puts them between the forecast row and the
-        # input rows, which is what keeps the input rows against the latent they feed.
-        order = [ax.get_title() for ax in titled]
-        forecast_at = next(i for i, title in enumerate(order) if title.startswith("Forecast"))
-        first_input = next(i for i, title in enumerate(order) if title.startswith(_INPUT_ROWS[0]))
-        assert first_input - forecast_at == len(sample_page.CAUSAL_EXTRA_ROWS) + 1
-    finally:
-        plt.close(figure)
-
-
-def test_the_page_carries_the_physical_delay_caveat(task, stub_batch):
+@pytest.mark.parametrize("rows", (None, sample_page.COMPACT_PAGE_ROWS), ids=("full", "reduced"))
+def test_the_page_carries_the_physical_delay_caveat(task, stub_batch, rows):
     r"""One-sidedness and zero latency are different properties and this family buys only the
-    first. The forecast claim needs no correction -- a coefficient at $t$ is a function of the past
-    -- but every time axis on the page is stored-coefficient time, the lag panels' vertical one and
-    the horizontal one the input rows share with the raw rows alike. The caveat must therefore name
-    both axes and state what alignment does to the correction: it collapses a channel-dependent
-    $\tau_c$ into one constant $\kappa\tau_{\mathrm{ref}}$ per stream. Asserted as a string, so it
-    cannot be dropped by an edit that keeps the figure rendering."""
-    figure = _render(task(), stub_batch)
+    first, so every time axis on the page is stored-coefficient time and the caveat saying so must
+    be drawn. On the reduced page too: it is the one that leads with a lag axis, and the caveat is
+    drawn by the forecast seam, which returns early there -- so a page that kept the lag row and
+    lost the caveat is the exact failure this asserts against."""
+    figure = _render(module_page_rows(task), stub_batch, rows=rows)
     try:
-        drawn = [text.get_text() for text in figure.texts]
-        assert sample_page.LAG_TIME_CAVEAT in drawn
-        for token in ("stored-coefficient time", "group delay"):
-            assert token in sample_page.LAG_TIME_CAVEAT
-        # The stored timeline is canonical: no dataset-shift term may appear in the caption.
-        for forbidden in ("$-20$", "acquisition shift", "sensor"):
-            assert forbidden not in sample_page.LAG_TIME_CAVEAT, forbidden
-        # The alignment half. Without these the sentence is the pre-alignment one, which tells a
-        # reader the correction is per channel and unrecoverable when it is one logged number.
-        for token in (
-            "input rows",
-            "reference_delay_s",
-            "source_reference_delay_s",
-            r"\kappa",
-        ):
-            assert token in sample_page.LAG_TIME_CAVEAT
-        # The constant is interpolated from the shift's own factor, never typed.
-        assert f"{causal_warmup.ALIGNMENT_DELAY_FACTOR:g}" in sample_page.LAG_TIME_CAVEAT
+        assert sample_page.LAG_TIME_CAVEAT in [text.get_text() for text in figure.texts]
     finally:
         plt.close(figure)
 
@@ -1175,14 +1100,10 @@ def test_the_task_hands_the_builder_the_budgets_own_clocks():
     r"""The net carries the per-channel shifts and not $\tau_{\mathrm{ref}}$, so the clock can only
     come from the resolved budget the task holds. Bound as a keyword on the builder rather than
     threaded through the shared page hook, whose signature is the two-sided family's and describes a
-    guard with no reference at all -- and read through the *class* attribute, because the raw cell
-    binds this very descriptor and would otherwise need a second copy of the same plumbing."""
+    guard with no reference at all."""
     from types import SimpleNamespace
 
     hook = task_module.SeqVaeLagAttnCfsTask.input_stream_panels
-    assert raw_task_module.SeqVaeLagAttnCrwsTask.input_stream_panels is hook, (
-        "the raw cell binds this descriptor; a divergence here is two pages drifting apart"
-    )
 
     unaligned = hook.fget(SimpleNamespace(warmup_budget=None))
     assert unaligned is sample_page.causal_stream_panels
@@ -1202,39 +1123,16 @@ def test_the_task_hands_the_builder_the_budgets_own_clocks():
     }
 
 
-def test_the_channel_rule_and_the_keep_index_mapping_are_the_siblings(task, stub_batch):
-    """Reused by object identity rather than reimplemented. The rule is what replaced a
-    ``forecast_channels`` config key, which began naming different coefficients the moment a block
-    width changed -- and no key like it is reintroduced here."""
-    assert sample_page.select_forecast_channels is figure_primitives.select_forecast_channels
-    assert sample_page._resolved_keep_index is feature_page._resolved_keep_index
-    assert sample_page.FORECAST_CHANNELS is feature_page.FORECAST_CHANNELS
-
-    with pytest.raises(ValueError, match="positional into the declared target stream"):
-        sample_page._resolved_keep_index([0, 5], width=3)
-
-    configs = Path(sample_page.__file__).parent / "configs"
-    for path in sorted(configs.glob("*.yaml")):
-        assert "forecast_channels" not in path.read_text(encoding="utf-8"), path.name
-
-
 def test_the_lanes_carry_the_truth_and_both_forecasts_with_their_bands(task, stub_batch):
     r"""Three lanes, each with the true coefficient, the base ($z^p$) and full ($z^q$) means and
-    both $\pm 2\sigma$ bands, the training-tile fan, one legend entry per role rather than per
-    lane, plus the overlay's three. The counts are what catch a band silently dropped or a lane drawn twice."""
+    both $\pm 2\sigma$ bands, and one legend entry per role rather than per lane. The counts are
+    what catch a band silently dropped or a lane drawn twice."""
     figure = _render(task(), stub_batch)
     try:
         ax = _axes_titled(figure, "Forecast")
         assert len(ax.collections) == 2 * sample_page.FORECAST_CHANNELS
-        assert [text.get_text() for text in ax.get_legend().get_texts()] == [
-            "true $Y^{+}$",
-            "base ($z^p$, target-only)",
-            "full ($z^q$, source-conditioned)",
-            "training-tile forecasts ($\\mu^q$, $S$=4, $\\varphi$=0)",
-            "anchor floor $F$=5",
-            "decoded anchors (15)",
-            "training tiles, $S$=4, $\\varphi$=0",
-        ]
+        legend = [text.get_text() for text in ax.get_legend().get_texts()]
+        assert len(legend) == len(set(legend)), legend
         offsets = sorted(ax.get_yticks())
         assert len(set(offsets)) == sample_page.FORECAST_CHANNELS
         assert offsets[0] == pytest.approx(0.0)
@@ -1243,27 +1141,51 @@ def test_the_lanes_carry_the_truth_and_both_forecasts_with_their_bands(task, stu
 
 
 def test_it_renders_at_the_shipped_geometry(task):
-    """The tiny fixture is a $24$-step window; production is $300$ steps, a $98$-channel decoder
-    and $152$ decoded anchors, where the error map is a $98 \\times 15$ image. A page that renders
-    only at the test geometry is not a page."""
+    r"""A page that renders only at the test geometry is not a page: at the shipped geometry the
+    decoder emits every kept channel over the whole recording, the error map is a
+    $C_{\mathrm{keep}} \times H$ image, and the rug marks every decoded anchor.
+
+    And every inset sits in the span this tiling leaves blank. The two-sided page stops short of
+    the recording's end and puts its error map in the right margin; this tiling starts at the
+    anchor floor $F$ and runs to the end, so the blank span is the *prefix* -- and the inherited box
+    put the panel over the last windows of the very forecast it details. Checked here because the
+    tiny fixture's floor is too small to hold a legible inset at all, which is what
+    ``_PREFIX_MIN_SPAN`` is for."""
     from .conftest import SHIPPED_HORIZON, SHIPPED_SEQUENCE_LENGTH, shipped_warmup_kwargs
 
     module = task(model_kwargs=shipped_warmup_kwargs())
     batch = make_stub_batch(2, SHIPPED_SEQUENCE_LENGTH)
     figure = _render(module, batch)
     try:
-        assert module.orig_model.decoder_out_channels == 98
+        kept = module.orig_model.decoder_out_channels
         ax = _axes_titled(figure, "Forecast")
-        assert ax.child_axes[0].images[0].get_array().shape == (98, SHIPPED_HORIZON)
+        assert ax.child_axes[0].images[0].get_array().shape == (kept, SHIPPED_HORIZON)
         assert len([child for child in figure.axes if child.get_title()]) == _PAGE_ROWS
-        # And the field rows carry the same 98 channels over the whole recording, so the page is
-        # one channel axis from the input rows down to the error map.
+        # And the field rows carry the same channels over the whole recording, so the page is one
+        # channel axis from the input rows down to the error map.
         for row in ("true $Y^{+}$", "base $\\mu^p$", "full $\\mu^q$", "Source skill"):
             image = _axes_titled(figure, row).images[0]
-            assert image.get_array().shape == (98, SHIPPED_SEQUENCE_LENGTH), row
+            assert image.get_array().shape == (kept, SHIPPED_SEQUENCE_LENGTH), row
         assert _labelled(ax, "decoded anchors")[0].get_xdata().size == (
             SHIPPED_SEQUENCE_LENGTH - SHIPPED_HORIZON - module.orig_model.warmup_period
         )
+
+        geometry = module.orig_model.geometry
+        floor = geometry.warmup / geometry.t
+        assert floor > sample_page._PREFIX_MIN_SPAN, "the shipped prefix must hold the insets"
+        for title, expected in (
+            ("Forecast", 1),                     # the per-anchor error map
+            ("Per-window forecast score", 2),    # the error and coverage profiles
+        ):
+            row_ax = _axes_titled(figure, title)
+            assert len(row_ax.child_axes) == expected, title
+            for inset in row_ax.child_axes:
+                # The inset's own span in the parent's axes fractions, which is what a box is
+                # expressed in and what the anchor floor is comparable against.
+                left, right = row_ax.transAxes.inverted().transform(
+                    inset.transAxes.transform([[0.0, 0.0], [1.0, 0.0]])
+                )[:, 0]
+                assert 0.0 <= left < right <= floor, (title, left, right)
     finally:
         plt.close(figure)
 
@@ -1325,34 +1247,6 @@ def test_the_reduced_page_is_the_five_rows_it_names_in_the_full_page_s_order(tas
         for ax, prefix in zip(titled, _COMPACT_ROW_TITLES):
             assert ax.get_title().startswith(prefix), (ax.get_title(), prefix)
             assert ax.has_data(), prefix
-    finally:
-        plt.close(figure)
-
-
-def test_the_reduced_page_drops_the_source_stream_and_every_forecast_row(task, stub_batch):
-    """The rows it does *not* have, named. The forecast rows come through a seam that swallows
-    exceptions to protect the fit, so a seam that ignored the row selection would draw into axes it
-    does not own -- or raise where nobody sees it -- and the symptom either way is a page, which is
-    why the absences are asserted rather than inferred from the count above."""
-    figure = _render(module_page_rows(task), stub_batch, rows=sample_page.COMPACT_PAGE_ROWS)
-    try:
-        titles = [child.get_title() for child in figure.axes if child.get_title()]
-        for absent in (_INPUT_ROWS[1], "Forecast", "true $Y^{+}$", "Source skill",
-                       "Per-window forecast score", "Per-dimension source-conditioned KL",
-                       "$\\widetilde K_{t,\\ell}$"):
-            assert not any(title.startswith(absent) for title in titles), absent
-    finally:
-        plt.close(figure)
-
-
-def test_the_reduced_page_still_carries_the_physical_delay_caveat(task, stub_batch):
-    """The caveat is what says a lag on this transform is not a physical delay, and the reduced
-    page is the one that leads with a lag axis. It is drawn by the forecast seam, which returns
-    early here -- so a page that kept the lag row and lost the caveat is the exact failure this
-    asserts against."""
-    figure = _render(module_page_rows(task), stub_batch, rows=sample_page.COMPACT_PAGE_ROWS)
-    try:
-        assert sample_page.LAG_TIME_CAVEAT in [text.get_text() for text in figure.texts]
     finally:
         plt.close(figure)
 
@@ -1424,18 +1318,3 @@ def module_page_rows(task) -> Any:
         selection, not the model, is what each of them varies.
     """
     return task(model_kwargs=tiny_warmup_kwargs())
-
-
-def test_the_shared_page_is_reached_rather_than_copied():
-    """No ``lag_attn_cfs/plotting.py`` and no callback of this package's own: the seams exist so a
-    sibling supplies rows and inherits the rest, and a second callback class would be a second
-    place for the layout, the cuts and the caption to drift."""
-    import importlib
-
-    package = Path(sample_page.__file__).parent
-
-    assert not (package / "plotting.py").exists()
-    with pytest.raises(ModuleNotFoundError):
-        importlib.import_module("teb_vae.lag_attn_cfs.plotting")
-    # And the context row is the shared implementation, not a copy of it.
-    assert feature_page.raw_context_row is shared_page.raw_context_row

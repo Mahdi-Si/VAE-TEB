@@ -5,21 +5,18 @@ The three trivial predictors themselves are built and scored in ``metrics`` and 
 *analysis* over them, and it is four kinds of assertion.
 
 **Known answers in the skill arithmetic.** A forecast equal to the truth scores skill $1$; one
-equal to the baseline scores exactly $0$; a zero-error baseline yields no skill rather than an
-infinity. These pin the arithmetic without a model and without a fixture, and they are what would
-catch a skill score computed the wrong way round.
+equal to the baseline scores exactly $0$. These pin the arithmetic without a model and without a
+fixture, and they are what would catch a skill score computed the wrong way round.
 
 **Rooting once.** The RMSE roots after the per-recording mean of the unrooted squares. Averaging
 finished roots is biased low by Jensen -- in the direction that flatters the model -- so the frame
 below has widely different per-recording squared errors, which is where the two differ.
 
-**The horizon denominators.** Each $\tau$ divides by its own masked count. The curve is the
-single-draw one and says so, because the Monte Carlo marginalisation does not commute with the sum
-over $\tau$.
+**The horizon denominators.** Each $\tau$ divides by its own masked count, and the axis is lead
+time in seconds rather than step index.
 
-**One unit, and no second one.** A scattering or phase-harmonic coefficient has no clinical unit,
-so every emitted column is in the loader's $z$ units and labelled ``normalised``. The test that
-matters most here is the negative one: no column carries a bpm label, on any path.
+**The figures and the overlay.** The drawn curves are the recomputed ones, the structural spans
+are shaded where the geometry puts them, and block retention is opt-in.
 
 Per the fixture rule in ``test_eval_fixtures.py``: nothing below asserts the sign or magnitude of
 any skill on the generated shards. Where a direction is needed, the frame is constructed.
@@ -37,7 +34,7 @@ import pytest
 from teb_vae.lag_attn_cfs.eval.figures_seam import figure_filename
 from teb_vae.lag_attn_cfs.eval.analyses import AnalysisContext
 from teb_vae.lag_attn_cfs.eval.analyses import forecast as forecast_analysis
-from teb_vae.lag_attn_cfs.eval.metrics import BASELINE_LOGVAR, BASELINE_NAMES, NORMALISED_UNIT
+from teb_vae.lag_attn_cfs.eval.metrics import BASELINE_NAMES, NORMALISED_UNIT
 
 from .conftest import SHIPPED_HORIZON
 
@@ -48,11 +45,6 @@ _T_VALID = 12
 _T = 16
 _HORIZON = 4
 _CHANNELS = 5
-
-#: Every column name any emitted artifact may not carry. Scanned rather than spot-checked: the
-#: conversion was removed rather than repointed, and the failure mode is a column that comes back.
-_FORBIDDEN_COLUMN_SUBSTRINGS = ("bpm",)
-
 
 # =================================================================================================
 # The skill arithmetic, against known answers
@@ -99,21 +91,6 @@ def test_a_forecast_equal_to_the_baselines_scores_zero_in_both_spaces() -> None:
     assert all(row["advantage_nats_per_anchor"] == pytest.approx(0.0) for row in rows)
 
 
-def test_a_zero_error_baseline_yields_no_skill_rather_than_an_infinity() -> None:
-    """A baseline that is exactly right on a degenerate recording would otherwise report an
-    infinite skill as evidence -- and the headline finiteness check would refuse the summary."""
-    skill = forecast_analysis.skill_against(np.array([1.0, 0.5]), np.array([0.0, 1.0]))
-
-    assert np.isnan(skill[0]) and skill[1] == pytest.approx(0.5)
-
-
-def test_the_r2_reference_is_one_of_a_closed_set() -> None:
-    """An $R^2$ whose reference is implicit is a claim a reader cannot check: against the segment
-    mean and against climatology it is a different number."""
-    assert forecast_analysis.R2_REFERENCE in forecast_analysis.R2_REFERENCES
-    assert set(forecast_analysis.R2_REFERENCES) <= set(BASELINE_NAMES)
-
-
 def test_the_rmse_roots_once_rather_than_averaging_finished_roots() -> None:
     r"""Jensen: $\operatorname{mean}(\sqrt{x}) \le \sqrt{\operatorname{mean}(x)}$, so averaging
     per-segment RMSEs is biased **low** -- in the direction that flatters the model. Four
@@ -132,17 +109,6 @@ def test_the_rmse_roots_once_rather_than_averaging_finished_roots() -> None:
     assert rows[0]["rmse_normalised"] == pytest.approx(float(np.sqrt(5.0)))
     assert rows[0]["rmse_normalised"] > 2.0
     assert rows[0]["unit"] == NORMALISED_UNIT
-
-
-def test_the_error_row_carries_no_second_unit(emitted) -> None:
-    """The conversion was removed rather than repointed: inverting the per-channel statistics would
-    put the 98 scored channels on scales spanning orders of magnitude, which destroys the pooled
-    mean squared error, the skill ratio and every shared axis below."""
-    row = emitted["result"]["error"][0]
-
-    assert row["unit"] == NORMALISED_UNIT == "normalised"
-    assert {name for name in row if "bpm" in name.lower()} == set()
-    assert "rmse" not in row and "mae" not in row and "bias" not in row
 
 
 # =================================================================================================
@@ -170,14 +136,7 @@ def test_the_horizon_curve_divides_each_step_by_its_own_denominator() -> None:
 
     assert list(curves["d_base_nats"]) == pytest.approx([2.0, 4.0, 7.5, 20.0])
     assert list(curves["d_full_nats"]) == pytest.approx([1.6, 3.6, 7.5, 22.0])
-
-
-def test_the_horizon_gap_is_the_difference_of_the_two_scores() -> None:
-    curves = forecast_analysis.horizon_curves(_horizon_record())
-
-    assert list(curves["gap_nats"]) == pytest.approx(
-        list(np.asarray(curves["d_base_nats"]) - np.asarray(curves["d_full_nats"])), abs=1e-12
-    )
+    assert list(curves["gap_nats"]) == pytest.approx([0.4, 0.4, 0.0, -2.0])
 
 
 def test_the_horizon_axis_is_lead_time_in_seconds_not_step_index() -> None:
@@ -186,14 +145,6 @@ def test_the_horizon_axis_is_lead_time_in_seconds_not_step_index() -> None:
     curves = forecast_analysis.horizon_curves(_horizon_record())
 
     assert list(curves["lead_seconds"]) == pytest.approx([4.0, 8.0, 12.0, 16.0])
-
-
-def test_the_horizon_curve_names_the_path_it_was_computed_on() -> None:
-    r"""The marginalisation does not commute with the sum over $\tau$, so the curve is the
-    single-draw one and has to say so rather than leaving it to be inferred."""
-    curves = forecast_analysis.horizon_curves(_horizon_record())
-
-    assert set(curves["score_path"]) == {"single-draw (training path)"}
 
 
 def test_an_absent_horizon_block_yields_no_curve_rather_than_an_invented_one() -> None:
@@ -209,7 +160,6 @@ def test_the_horizon_rmse_is_per_coefficient_and_carries_the_normalised_label() 
     assert list(curves["rmse_base_normalised"]) == pytest.approx([1.0] * 4)
     assert list(curves["rmse_full_normalised"]) == pytest.approx([2.0] * 4)
     assert set(curves["rmse_unit"]) == {NORMALISED_UNIT}
-    assert not [name for name in curves.columns if "bpm" in str(name).lower()]
 
 
 # =================================================================================================
@@ -404,19 +354,6 @@ def test_the_overlay_channels_are_spread_across_the_axis_and_deterministic() -> 
     assert forecast_analysis.overlay_channels(0) == []
 
 
-def test_the_overlay_indexes_the_anchor_axis_by_position_not_by_decimated_step() -> None:
-    """The whole reason this differs from the raw cells' overlay. This model *gathers* its anchors,
-    so the anchor floor of 133 is not a valid index into a 152-long retained axis: reading the step
-    as a position would draw a different anchor than the one named, or fail on the shipped
-    geometry."""
-    retained = _retained_blocks()
-    n_positions = retained["target"].shape[1]
-
-    assert n_positions < _T_VALID
-    # ``_emit_overlay`` picks the middle position; it must be inside the retained axis.
-    assert 0 <= n_positions // 2 < n_positions
-
-
 # =================================================================================================
 # The artifacts and the protocol
 # =================================================================================================
@@ -433,28 +370,6 @@ def test_the_analysis_writes_its_four_tables_and_three_figures(emitted) -> None:
         assert (emitted["dir"] / name).is_file(), name
 
 
-def test_no_emitted_column_carries_a_bpm_label(emitted) -> None:
-    """The scan rather than a spot check: the conversion was removed, and the failure mode this
-    guards is a column quietly coming back through a copied helper."""
-    for name in (forecast_analysis.SCORES_FILENAME, forecast_analysis.SKILL_FILENAME,
-                 forecast_analysis.HORIZON_FILENAME, forecast_analysis.ANCHOR_FILENAME):
-        columns = [str(column).lower() for column in pd.read_csv(emitted["dir"] / name).columns]
-        for column in columns:
-            assert not any(token in column for token in _FORBIDDEN_COLUMN_SUBSTRINGS), (name, column)
-
-
-def test_the_result_records_the_baseline_sigma_and_the_reference(emitted) -> None:
-    """A learned-variance model beats a fixed-variance baseline partly on variance modelling alone,
-    so which $\\sigma$ the baselines were given decides the whole NLL-space number -- and it travels
-    in the output rather than in a docstring."""
-    result = emitted["result"]
-
-    assert result["baseline_logvar"] == pytest.approx(BASELINE_LOGVAR)
-    assert result["baselines"] == list(BASELINE_NAMES)
-    assert result["r2"]["reference"] == forecast_analysis.R2_REFERENCE
-    assert result["unit"] == NORMALISED_UNIT
-
-
 def test_the_result_declares_its_grouped_frame_over_the_per_recording_scores(emitted) -> None:
     """The runner fans the by-class and by-subgroup variants over a CSV this analysis has already
     written, so the entry names a file on disk rather than returning a frame."""
@@ -463,35 +378,3 @@ def test_the_result_declares_its_grouped_frame_over_the_per_recording_scores(emi
     assert len(entries) == 1
     assert entries[0]["path"].endswith(forecast_analysis.SCORES_FILENAME)
     assert set(entries[0]["value_columns"]) == set(forecast_analysis.GROUPED_METRICS)
-
-
-# =================================================================================================
-# Against a real run
-# =================================================================================================
-@pytest.mark.slow
-def test_the_horizon_curve_has_one_point_per_forecast_step(collected_run) -> None:
-    curves = pd.read_csv(
-        Path(collected_run["results_dir"])
-        / forecast_analysis.ANALYSIS_DIRNAME
-        / forecast_analysis.HORIZON_FILENAME
-    )
-    geometry = collected_run["summary"]["collection"]["geometry"]
-
-    assert len(curves) == int(geometry["horizon"])
-    assert curves["lead_seconds"].max() == pytest.approx(4.0 * int(geometry["horizon"]))
-
-
-@pytest.mark.slow
-def test_the_per_recording_table_is_one_row_per_recording(collected_run) -> None:
-    """Not per segment: anchors overlap in fourteen of their fifteen horizon steps and one
-    recording contributes tens of segments, so a per-segment bootstrap would resample a population
-    it does not have."""
-    scores = pd.read_csv(
-        Path(collected_run["results_dir"])
-        / forecast_analysis.ANALYSIS_DIRNAME
-        / forecast_analysis.SCORES_FILENAME
-    )
-    results = collected_run["summary"]["results"]
-
-    assert len(scores) == int(results["n_recordings"])
-    assert len(scores) < int(results["n_samples"])

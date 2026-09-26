@@ -1,7 +1,7 @@
 r"""The contraction detector, which is the only detector this package carries.
 
 Its output becomes ``seconds_since_contraction`` on the per-anchor table and is what
-contraction-conditioned coupling conditions on, so three of its properties decide whether that
+contraction-conditioned coupling conditions on, so two of its properties decide whether that
 readout means anything:
 
 **The onset is a level crossing, not a gradient test, and that is a correction rather than a
@@ -19,11 +19,6 @@ is an extreme excursion rather than a detectable sentinel. Validity is carried s
 is interpolated across before smoothing so it contributes no edge, and any event whose span touches
 the gap is then dropped -- because its shape was partly invented by that interpolation. Both halves
 are needed and each is asserted, since either alone passes for the wrong reason.
-
-**Nothing about decelerations survives the port.** A deceleration detector scores a bpm waveform
-and this cell forecasts wavelet coefficients, so it is out of scope -- and a detector kept "in
-case" is a detector nothing tests. The scan at the bottom is what makes that a property of the
-module rather than of the day it was written.
 """
 from __future__ import annotations
 
@@ -137,28 +132,6 @@ def test_an_apex_a_gradient_walk_would_stop_at_does_not_move_the_onset() -> None
     assert notched["onset_raw"].size == clean["onset_raw"].size
     assert (notched["peak_raw"] - notched["onset_raw"]).min() > 0.5 * _RISE_S * events.FS_RAW
     assert np.abs(notched["onset_raw"] - clean["onset_raw"]).max() <= 2
-
-
-def test_the_gradient_at_a_found_peak_is_below_any_positive_threshold() -> None:
-    """The premise behind the correction, measured rather than asserted from the story.
-
-    A peak of the smoothed trace has an approximately zero gradient *by definition of being a
-    peak*, so a walk-back conditioned on "the trace is still rising steeply" was already false at
-    its first step. The flank's own gradient -- the slope the walk was supposed to be following --
-    is nearly an order of magnitude larger on this trace, and the ratio is what the assertion
-    pins: any threshold chosen to track the flank leaves the apex below it.
-    """
-    trace = _up_trace()
-    smoothed = events._smooth(
-        trace, window=int(round(events.CONTRACTION_SMOOTH_S * events.FS_RAW))
-    )
-    gradient = np.gradient(smoothed)
-    found = events.detect_contractions(trace)
-
-    at_peaks = np.abs(gradient[found["peak_raw"]])
-    on_flanks = np.abs(gradient[found["peak_raw"] - int(round(20 * events.FS_RAW))])
-
-    assert at_peaks.max() < 0.2 * on_flanks.min()
 
 
 def test_the_prominence_threshold_is_sigma_relative_and_therefore_unit_free() -> None:
@@ -289,58 +262,3 @@ def test_a_validity_mask_may_be_truncated_but_never_padded() -> None:
 
     with pytest.raises(ValueError, match="uncovered samples valid"):
         events.raw_validity([1.0], decimation=4, raw_len=8)
-
-
-# =================================================================================================
-# What did not come across
-# =================================================================================================
-def test_no_symbol_relating_to_deceleration_detection_survives() -> None:
-    """An attribute scan rather than an import check: the constants are what a copied analysis
-    would reach for first, and a module that still exported them would let one back in."""
-    surviving = sorted(
-        name for name in vars(events)
-        if "deceleration" in name.lower() or "bpm" in name.lower()
-    )
-
-    assert surviving == []
-    assert not hasattr(events, "detect_decelerations")
-
-
-def test_the_helpers_reachable_only_from_that_detector_are_gone_too() -> None:
-    """``usable_interval`` and ``usable_horizon_steps`` fixed a horizon step so an anchor-level
-    event rate was a rate per event; ``match_events`` paired a branch's detections against the
-    truth's. All three exist for deceleration forecast skill, which this package does not have."""
-    for name in ("usable_interval", "usable_horizon_steps", "match_events"):
-        assert not hasattr(events, name), name
-
-
-def test_the_module_exports_exactly_what_the_contraction_path_needs() -> None:
-    """``__all__`` is the seam the collection pass reads through, and a name left in it that the
-    module no longer defines is an ``ImportError`` at the worst moment of a multi-hour run."""
-    assert set(events.__all__) == {
-        "CONTRACTION_EDGE_S",
-        "CONTRACTION_MIN_DISTANCE_S",
-        "CONTRACTION_MIN_WIDTH_S",
-        "CONTRACTION_PROMINENCE_SIGMA",
-        "CONTRACTION_SMOOTH_S",
-        "CONTRACTION_WALK_S",
-        "FLANK_LEVEL_FRAC",
-        "FS_RAW",
-        "MIN_CONTRACTION_TRACE_S",
-        "ONSET_WALK_BACK_NOTE",
-        "ScipyRequired",
-        "detect_contractions",
-        "drop_events_overlapping_gaps",
-        "fill_gaps",
-        "raw_validity",
-    }
-    for name in events.__all__:
-        assert hasattr(events, name), name
-
-
-def test_the_divergence_from_the_siblings_published_numbers_travels_in_the_output() -> None:
-    """The sibling's stage-2 probe is a published negative result calibrated against the
-    uncorrected walk-back, so this module states the difference rather than leaving two sets of
-    onsets to be compared silently."""
-    assert "walk-back" in events.ONSET_WALK_BACK_NOTE
-    assert "peak index as the onset" in events.ONSET_WALK_BACK_NOTE

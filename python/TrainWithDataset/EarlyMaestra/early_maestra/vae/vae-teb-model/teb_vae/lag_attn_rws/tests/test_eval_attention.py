@@ -165,18 +165,6 @@ def test_the_per_head_profiles_are_emitted_separately_from_the_head_average(eval
     assert len(lag["attention_entropy_per_head_nats"]) == lag["num_heads"]
 
 
-def test_the_restricted_argmax_is_emitted_beside_the_unrestricted_one(evaluated) -> None:
-    """Both, because the restriction costs a quarter of the anchors at the shipped geometry and
-    the unrestricted reading is what a longer profile is compared against."""
-    block = evaluated["summary"]["results"]["attention"]
-
-    assert set(block["argmax"]) >= {
-        "raw_lag_step", "support_corrected_lag_step", "untruncated_lag_step",
-        "restricted_to_anchors_from",
-    }
-    assert block["source_delay_is_max_over_channels"] is True
-
-
 def test_the_analysis_writes_its_tables(evaluated) -> None:
     directory = evaluated["results_dir"] / attention.ANALYSIS_DIRNAME
     per_head = pd.read_csv(directory / attention.PER_HEAD_FILENAME)

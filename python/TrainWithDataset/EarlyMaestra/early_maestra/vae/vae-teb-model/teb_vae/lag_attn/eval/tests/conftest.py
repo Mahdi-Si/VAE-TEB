@@ -47,21 +47,15 @@ except Exception:
 
 # Re-exported, not redefined. Flake8 would call these unused; they are the fixtures.
 from teb_vae.lag_attn.tests.conftest import (  # noqa: E402,F401
-    BATCH,
     PROD_HPARAMS,
     PROD_KWARGS,
-    SEQ_LEN,
     SHIPPED_KWARGS,
-    TINY_KWARGS,
     inputs,
-    make_stub_batch,
     make_stub_batch_fn,
     perturb_posterior,
-    prod_kwargs,
     shipped_kwargs,
     stub_batch,
     task,
-    tiny_kwargs,
 )
 
 #: Repo-root-relative path to the eval config the suite runs against.

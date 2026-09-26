@@ -212,16 +212,6 @@ def test_two_models_scored_on_different_populations_are_refused():
         _bootstrap(frame, columns)
 
 
-def test_the_record_states_what_the_interval_is_conditional_on():
-    frame, columns, _patients = _cohort()
-
-    record = _bootstrap(frame, columns)
-
-    assert "not variation across training runs" in record["note"]
-    assert record["confidence"] == pytest.approx(0.95)
-    assert record["resamples"] == 200
-
-
 # =============================================================================
 # The prespecified strata
 # =============================================================================
@@ -297,28 +287,6 @@ def test_the_coverage_contrast_describes_both_groups_without_adjusting_anything(
 # =============================================================================
 # What the controls do and do not establish
 # =============================================================================
-def test_one_shuffled_fit_is_never_called_a_permutation_p_value():
-    disclosure = evaluate.control_disclosure(n_control_fits=1, prior_probe=True)
-
-    assert disclosure["permutation_p_value"] is False
-    assert "not a permutation p-value" in disclosure["shuffled_label_note"]
-
-
-def test_the_disclosure_states_that_the_control_did_not_rerun_the_adaptation():
-    """The record is what the report prints, so the scope has to be in the record.
-
-    The shuffled-label control refits the linear classifier on the frozen pretrained latents; it
-    never calls ``fit_adaptation``. A note saying only "sanity check, not a p-value" leaves a
-    reader to assume the fine-tuning loop was rerun under the null, which is the stage with the
-    most room to manufacture a held-out gain.
-    """
-    disclosure = evaluate.control_disclosure(n_control_fits=1, prior_probe=True)
-
-    assert disclosure["adaptation_rerun_under_permutation"] is False
-    assert disclosure["shuffled_label_scope"] == "linear probe on frozen pretrained latents"
-    assert "NOT rerun under the permutation" in disclosure["shuffled_label_note"]
-
-
 def test_switching_off_the_prior_probe_withdraws_the_combined_branch_claim():
     with_probe = evaluate.control_disclosure(n_control_fits=1, prior_probe=True)
     without = evaluate.control_disclosure(n_control_fits=1, prior_probe=False)

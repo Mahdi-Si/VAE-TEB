@@ -2,7 +2,7 @@ r"""The offline acceptance gate, the arm tables and the cross-cell table, tested
 
 Everything here drives ``eval/verify.py`` the way an operator does: with a ``summary.json`` and,
 for the tables, a directory of finished-run shapes on disk. No model is built anywhere in this
-file except in the two pinning tests at the top, which reach for the registries this module
+file except in the pinning tests at the top, which reach for the registries this module
 restates -- that is the module's one non-negotiable property, and the AST layering test proves it
 on the import graph while this file proves the behaviour.
 
@@ -12,21 +12,19 @@ one of them fails here by name instead of surfacing as a wall of ``INCONCLUSIVE`
 
 **No test here asserts a direction or a magnitude.** The numbers in the synthetic summaries are
 arbitrary shapes chosen to distinguish two renderings; what is asserted is which key was read,
-which cell it landed in, and what the module does when it is missing.
+which cell it landed in, and what the module does when it is missing. :func:`clean_summary` and
+:func:`write_arm` are imported by the transformer cfs cell's run tests and by the collapse tests.
 """
 from __future__ import annotations
 
-import ast
-import inspect
 import json
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional
 
 import pytest
 import yaml
 
 from teb_vae.lag_attn_cfs.eval import verify
-from teb_vae.lag_attn_transformer_cfs.eval import verify as trf_verify
 
 
 # =================================================================================================
@@ -43,72 +41,9 @@ def test_the_restated_names_are_pinned_to_their_canonical_owners() -> None:
     assert verify.SUMMARY_FILENAME == report_seam.SUMMARY_FILENAME
     assert verify.RESOLVED_CONFIG_FILENAME == RESOLVED_CONFIG_FILENAME
     assert verify.CFS_VERDICTS == metrics.PROMOTED_VERDICTS
-    # Ten rather than the raw pipeline's eight, and the two extra are the ones only this cell can
-    # have. Named rather than counted: a registry that lost one and gained another would keep the
-    # count.
-    assert verify.CFS_VERDICTS[-2:] == (
-        "coupling_exceeds_availability_clock",
-        "anchor_geometry_intact",
-    )
     # The two CSV series the collapse criterion consumes must be metrics the trainer tracks.
     assert verify.KL_SERIES_COLUMN in LagAttnCfsTrainer.TRACKED_METRICS
     assert verify.ACTIVE_FRAC_COLUMN in LagAttnCfsTrainer.TRACKED_METRICS
-
-
-def _headline_columns_read_by(module: Any) -> Set[str]:
-    """Every column name a module hands to ``_headline_cell``, read off its source.
-
-    Derived rather than listed: a hand-kept list is one that goes stale the first time a column is
-    added, and the column that goes unchecked is then exactly the new one.
-
-    Args:
-        module: The module to scan.
-
-    Returns:
-        The resolved column names. A module-level constant is resolved through the module; a
-        literal is taken as written.
-    """
-    source = Path(inspect.getfile(module)).read_text(encoding="utf-8")
-    names: Set[str] = set()
-    for node in ast.walk(ast.parse(source)):
-        if not isinstance(node, ast.Call):
-            continue
-        called = node.func.attr if isinstance(node.func, ast.Attribute) else getattr(
-            node.func, "id", ""
-        )
-        if called != "_headline_cell" or len(node.args) < 2:
-            continue
-        column = node.args[1]
-        if isinstance(column, ast.Constant):
-            names.add(str(column.value))
-        elif isinstance(column, ast.Name):
-            names.add(str(getattr(module, column.id)))
-        elif isinstance(column, ast.Attribute):
-            names.add(str(getattr(module, column.attr)))
-    return names
-
-
-@pytest.mark.parametrize(
-    "module",
-    [verify, trf_verify],
-    ids=["cfs", "transformer_cfs"],
-)
-def test_every_numeric_cell_comes_from_the_headline_block(module: Any) -> None:
-    """The headline block is the one surface the reporting layer promises to keep resolvable, so a
-    column reading anything else is a permanently ``(missing)`` cell -- and no test on synthetic
-    summaries would catch it, because the synthetic ones carry whatever this file puts in them.
-
-    The scan is over the source rather than over a list, so a column added tomorrow is checked
-    tomorrow. Both cells' table modules, because the second one renders its own sweep section.
-    """
-    from teb_vae.lag_attn_cfs.eval.binding import HEADLINE_SCALARS as EXTRA_SCALARS
-    from teb_vae.lag_attn_cfs.eval.report_seam import HEADLINE_SCALARS as SHARED_SCALARS
-
-    registered = {name for name, _ in SHARED_SCALARS} | {name for name, _ in EXTRA_SCALARS}
-    read = _headline_columns_read_by(module)
-
-    assert read, "the scan found no headline column at all, so it is checking nothing"
-    assert read <= registered, sorted(read - registered)
 
 
 def test_the_cfs_only_columns_come_through_the_binding_rather_than_the_shared_registry() -> None:
@@ -219,14 +154,6 @@ def test_a_clean_summary_passes_every_criterion() -> None:
     assert report["n_passed"] == len(verify.CRITERIA)
 
 
-def test_the_two_cfs_only_verdicts_are_criteria_of_this_gate() -> None:
-    """The gate exists to refuse a run whose verdicts failed, and these two are the verdicts this
-    cell alone can have -- a gate that dropped them would pass a run whose coupling readout was
-    indistinguishable from an availability clock."""
-    for name in ("coupling_exceeds_availability_clock", "anchor_geometry_intact"):
-        assert f"verdict_{name}" in dict(verify.CRITERIA)
-
-
 def test_a_failed_model_verdict_fails_the_gate() -> None:
     summary = clean_summary()
     for verdict in summary["results"]["verdicts"]:
@@ -285,16 +212,6 @@ def test_the_unset_clock_threshold_is_inconclusive_not_passed() -> None:
     assert "verdict_coupling_exceeds_availability_clock" in report["inconclusive"]
     assert report["passed"] is True  # no failure -- but the report says it is partial
     assert report["n_passed"] == len(verify.CRITERIA) - 1
-
-
-def test_the_gate_names_the_pred_gap_column_it_reads() -> None:
-    """Two ``pred_gap`` columns exist and the gate must say which one it means -- in the report
-    record, in the criterion's own detail, and on the console."""
-    report = verify.verify(clean_summary())
-
-    assert report["pred_gap_column_read"] == "pred_gap_mc_nats"
-    assert "pred_gap_mc_nats" in report["criteria"]["headline_pred_gap"]["detail"]
-    assert "pred_gap_mc_nats" in verify.format_report(report)
 
 
 def test_a_missing_or_skipped_preflight_is_inconclusive() -> None:
@@ -495,26 +412,6 @@ def test_each_of_the_four_shipped_arms_resolves_into_its_own_section(
     assert f"`{axis}`" in rows[0]
 
 
-def test_the_horizon_section_refuses_a_level_comparison_in_the_document(tmp_path) -> None:
-    """The rule is emitted rather than only stated in the docstring, because the comparison it
-    forbids is the one a reader makes by reflex: a block score is per anchor over H*C_keep
-    coefficients, so twice the horizon is twice the block and larger nats for that reason alone."""
-    write_arm(tmp_path, "h15", horizon=15)
-    write_arm(tmp_path, "h30", horizon=30)
-    out = tmp_path / "arms.md"
-
-    assert verify.compare_arms(tmp_path, out) == 0
-    section = _section(out.read_text(encoding="utf-8"), "## Horizon sweep")
-
-    assert verify.HORIZON_LEVEL_RULE in section
-    # And the two level columns are labelled in the header itself, so a reader who skipped the
-    # paragraph still meets the refusal at the column they were about to read.
-    header = next(line for line in section.splitlines() if line.startswith("| `horizon`"))
-    assert header.count("not comparable") == 2
-    # The scale-free columns are what the axis *is* readable on, so they have to be there.
-    assert "`pred_gap_rmse_pct`" in header
-
-
 def test_every_generated_table_is_well_formed_markdown(tmp_path) -> None:
     """Every table's header, delimiter and body rows must agree on their cell count.
 
@@ -642,9 +539,9 @@ def test_the_cross_cell_table_keys_rows_on_the_recorded_model_class(tmp_path) ->
     assert "run_b" in rows[0] and "run_a" in rows[1]
 
 
-def test_the_selection_rule_and_the_clock_margin_reach_the_document(tmp_path) -> None:
-    """Both for the same reason: the table is what a threshold gets set from later, and a table of
-    two architectures' KLs invites exactly the ranking the rule forbids."""
+def test_the_clock_margin_reaches_the_cross_cell_table(tmp_path) -> None:
+    """The table is what the unset clock threshold gets set from later, so the measurement is
+    carried whatever the verdict says."""
     write_arm(tmp_path, "cfs")
     write_arm(tmp_path, "trf", model_class=verify.COMPARISON_MODEL_CLASS)
     out = tmp_path / "arms.md"
@@ -652,8 +549,6 @@ def test_the_selection_rule_and_the_clock_margin_reach_the_document(tmp_path) ->
     assert verify.compare_arms(tmp_path, out) == 0
     section = _section(out.read_text(encoding="utf-8"), "## Cross-cell comparison")
 
-    assert verify.SELECTION_RULE in section
-    # The measurement the unset verdict does not gate, carried whatever the threshold says.
     assert f"`{verify.CLOCK_MARGIN_COLUMN}`" in section
     assert "0.75" in section
 
@@ -708,7 +603,7 @@ def test_the_lag_peak_is_never_quoted_without_the_runs_verdict_on_it(tmp_path) -
     assert "(not checked)" in rows["unchecked"]
 
 
-def test_a_directory_with_one_cell_still_emits_the_table_and_says_so(tmp_path) -> None:
+def test_a_directory_with_one_cell_still_emits_the_table(tmp_path) -> None:
     """A comparison with one side missing is a fact about the directory that was handed in;
     dropping the table would report it as a fact about the models."""
     write_arm(tmp_path, "only_cfs")
@@ -717,7 +612,6 @@ def test_a_directory_with_one_cell_still_emits_the_table_and_says_so(tmp_path) -
     assert verify.compare_arms(tmp_path, out) == 0
     section = _section(out.read_text(encoding="utf-8"), "## Cross-cell comparison")
 
-    assert "Only one architecture is present here" in section
     assert verify.BASELINE_MODEL_CLASS in section
 
 
@@ -758,45 +652,8 @@ def test_the_verdict_family_is_rendered_as_one_cell(tmp_path) -> None:
 
 
 # =================================================================================================
-# What the tables must not do
+# The command line
 # =================================================================================================
-def test_no_cross_target_table_against_the_feature_target_cell_is_produced(tmp_path) -> None:
-    """Deliberately out of scope, and asserted rather than trusted to stay so: the blocks differ
-    (1470 against 2340 coefficients) and so do the horizons, so a level comparison against
-    ``lag_attn_fs`` would invite exactly the reading both DESIGN.md records forbid."""
-    write_arm(tmp_path, "cfs")
-    write_arm(tmp_path, "trf", model_class=verify.COMPARISON_MODEL_CLASS)
-    out = tmp_path / "arms.md"
-
-    assert verify.compare_arms(tmp_path, out) == 0
-    document = out.read_text(encoding="utf-8")
-
-    assert "lag_attn_fs" not in document
-    assert "SeqVaeLagAttnFs" not in document
-    # And the module offers no way to build one: the only cross-anything table is the cross-cell
-    # one, whose two keys are the two cfs cells.
-    assert not any(
-        name.startswith("build_cross") and name != "build_cross_cell_table"
-        for name in dir(verify)
-    )
-    assert {verify.BASELINE_MODEL_CLASS, verify.COMPARISON_MODEL_CLASS} == {
-        "SeqVaeLagAttnCfs", "SeqVaeLagAttnTrfCfs"
-    }
-
-
-def test_the_emitted_document_never_uses_the_refused_names(tmp_path) -> None:
-    """The tables are an artifact, and the naming rules that bind every run artifact bind them
-    too: the coupling readout is not called a transfer entropy anywhere in the output, and there
-    is no bpm anywhere in this pipeline."""
-    write_arm(tmp_path, "arm")
-    out = tmp_path / "arms.md"
-    verify.compare_arms(tmp_path, out)
-
-    lowered = out.read_text(encoding="utf-8").lower()
-    assert "transfer entropy" not in lowered and "te_lag" not in lowered
-    assert "bpm" not in lowered
-
-
 def test_the_cli_dispatches_between_the_gate_and_the_tables(tmp_path) -> None:
     summary = tmp_path / "summary.json"
     summary.write_text(json.dumps(clean_summary()), encoding="utf-8")

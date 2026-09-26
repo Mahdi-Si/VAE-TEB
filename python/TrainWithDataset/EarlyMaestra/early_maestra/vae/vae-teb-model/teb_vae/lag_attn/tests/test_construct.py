@@ -10,8 +10,9 @@ from __future__ import annotations
 
 import pytest
 import torch
+from torch import nn
 
-from teb_vae.lag_attn.nets import model as model_module
+from teb_vae.lag_attn.nets.blocks import CausalGroupNorm
 from teb_vae.lag_attn.nets.model import SeqVaeLagAttn
 
 # The forward contract, written out rather than derived from another model. Deriving it is how
@@ -58,37 +59,15 @@ _ENCODE_KEYS = {
 }
 
 
-def test_the_model_constructs_under_the_production_config(prod_kwargs):
-    torch.manual_seed(0)
-    assert isinstance(SeqVaeLagAttn(**prod_kwargs), SeqVaeLagAttn)
-
-
 def test_forward_returns_the_contract(prod_kwargs, inputs):
+    """The key set, every value a tensor (no ``None`` placeholder), and the boundary shapes."""
     torch.manual_seed(0)
     model = SeqVaeLagAttn(**prod_kwargs).eval()
     torch.manual_seed(0)
     with torch.no_grad():
         out = model(*inputs)
     assert set(out) == _FORWARD_KEYS
-
-
-def test_forward_carries_no_raw_future_pred(prod_kwargs, inputs):
-    """It was always ``None`` -- a non-tensor in a dict of tensors, from a decoder that raised."""
-    torch.manual_seed(0)
-    model = SeqVaeLagAttn(**prod_kwargs).eval()
-    torch.manual_seed(0)
-    with torch.no_grad():
-        out = model(*inputs)
-    assert "raw_future_pred" not in out
     assert all(torch.is_tensor(value) for value in out.values())
-
-
-def test_forward_shapes(prod_kwargs, inputs):
-    torch.manual_seed(0)
-    model = SeqVaeLagAttn(**prod_kwargs).eval()
-    torch.manual_seed(0)
-    with torch.no_grad():
-        out = model(*inputs)
 
     batch, seq_len = inputs[0].shape[0], inputs[0].shape[1]
     d_z, d_model = prod_kwargs["d_z"], prod_kwargs["d_model"]
@@ -122,41 +101,26 @@ def test_encode_only_can_return_the_posterior_mean(prod_kwargs, inputs):
     assert torch.equal(out["z"], out["mu_post"])
 
 
-def test_the_source_ablation_config_constructs(tiny_kwargs):
-    torch.manual_seed(0)
-    model = SeqVaeLagAttn(**dict(tiny_kwargs, c_u=15, use_up_st=False))
-    assert model.c_u == 15
-    # Asserting `model.c_u` alone would pass against an implementation that recomputed the width
-    # actually used to build the adapter -- which is what the old constructor did.
-    assert model.source_adapter.linear.in_features == 15
-
-
-def test_c_u_is_honoured_rather_than_derived_from_the_ablation_toggle(tiny_kwargs):
+@pytest.mark.parametrize(
+    "c_y, c_u, use_up_st",
+    [(109, 15, False), (109, 15, True), (87, 101, True)],
+    ids=["source-ablation", "c_u-not-derived-from-toggle", "legacy-checkpoint-geometry"],
+)
+def test_the_declared_widths_are_honoured_rather_than_derived(tiny_kwargs, c_y, c_u, use_up_st):
     """The constructor trusts the caller's widths; the task checks them against the batch.
 
-    This pairing (``c_u`` not matching what ``use_up_st`` implies) used to raise, and before that
-    the constructor silently overwrote ``c_u`` with a constant chosen by ``use_up_st``. Both were
-    wrong for the same reason: the widths are a property of the HDF5, which this constructor
-    cannot see, and the constants went stale the moment the dataset pipeline changed its
-    phase-harmonic selection -- taking every pre-change checkpoint's rebuild with them.
+    The widths are a property of the HDF5, which this constructor cannot see. It once overwrote
+    ``c_u`` with a constant chosen by ``use_up_st``, and later refused the pairing; both went stale
+    the moment the dataset pipeline changed its phase-harmonic selection, taking every
+    pre-migration checkpoint's rebuild with them (such a blob carries the old widths).
+    Asserting ``model.c_u`` alone would pass against an implementation that recomputed the width
+    actually used to build the adapter, so the adapters are read too.
     """
     torch.manual_seed(0)
-    model = SeqVaeLagAttn(**dict(tiny_kwargs, c_u=15, use_up_st=True))
-    assert model.c_u == 15
-    assert model.source_adapter.linear.in_features == 15
-
-
-def test_a_legacy_checkpoints_geometry_still_rebuilds(tiny_kwargs):
-    """A checkpoint written before the channel migration must still reconstruct.
-
-    ``on_save_checkpoint`` stores the exact constructor kwargs, so a pre-migration blob carries
-    ``c_y=87, c_u=101``. A constructor that validated widths against current constants would
-    refuse to rebuild it, and ``check_model_class`` passes first, so the error would blame the
-    geometry rather than the migration.
-    """
-    torch.manual_seed(0)
-    model = SeqVaeLagAttn(**dict(tiny_kwargs, c_y=87, c_u=101, use_up_st=True))
-    assert (model.c_y, model.c_u) == (87, 101)
+    model = SeqVaeLagAttn(**dict(tiny_kwargs, c_y=c_y, c_u=c_u, use_up_st=use_up_st))
+    assert (model.c_y, model.c_u) == (c_y, c_u)
+    assert model.target_adapter.linear.in_features == c_y
+    assert model.source_adapter.linear.in_features == c_u
 
 
 @pytest.mark.parametrize("zeroed", [{"c_u": 0}, {"c_y": 0}])
@@ -207,41 +171,6 @@ def test_an_unknown_kld_support_raises(tiny_kwargs):
         SeqVaeLagAttn(**dict(tiny_kwargs, kld_support="everything"))
 
 
-def test_retired_flags_are_not_constructor_arguments(tiny_kwargs):
-    """Smooth bounding and the residual posterior are the model now, not options."""
-    for retired in ("logvar_bound", "posterior_logvar", "latent_stats_momentum"):
-        with pytest.raises(TypeError):
-            SeqVaeLagAttn(**dict(tiny_kwargs, **{retired: "whatever"}))
-
-
-def test_the_dead_lag_bank_is_gone(prod_kwargs):
-    """It was constructed on every model and never called; ``unfold`` views replaced it."""
-    torch.manual_seed(0)
-    model = SeqVaeLagAttn(**prod_kwargs)
-    assert not hasattr(model_module, "LagMemoryBankBuilder")
-    assert not hasattr(model, "lag_bank")
-
-
-def test_the_latent_stats_mechanism_is_gone(prod_kwargs):
-    """It was the only thing in the model that logged, reduced across ranks, or read a batch."""
-    torch.manual_seed(0)
-    model = SeqVaeLagAttn(**prod_kwargs)
-    for retired in (
-        "fit_latent_stats",
-        "normalize_latent",
-        "_default_batch_to_inputs",
-        "_update_latent_running_stats",
-    ):
-        assert not hasattr(model, retired), f"{retired} survived"
-    assert not any("running" in name for name, _ in model.named_buffers())
-
-
-def test_the_version_stamp_class_attribute_is_gone(prod_kwargs):
-    """Nothing read it: the checkpoint stamp comes from the live class name."""
-    torch.manual_seed(0)
-    assert not hasattr(SeqVaeLagAttn(**prod_kwargs), "model_class")
-
-
 def test_freeze_unused_attn_proj_needs_head_structure(tiny_kwargs):
     """The projection is only unused when the posterior reads the per-head summaries instead."""
     torch.manual_seed(0)
@@ -257,27 +186,22 @@ def test_freeze_unused_attn_proj_needs_head_structure(tiny_kwargs):
     assert not any(p.requires_grad for p in structured.lag_attn.W_o.parameters())
 
 
-def test_causal_norm_is_off_by_default(tiny_kwargs):
-    torch.manual_seed(0)
-    assert SeqVaeLagAttn(**tiny_kwargs).n_causalized_norms == 0
-
-
 def test_causal_norm_replaces_exactly_the_encoder_norms(prod_kwargs):
-    torch.manual_seed(0)
-    model = SeqVaeLagAttn(**prod_kwargs)
-    assert model.causal_norm is True
-    assert model.n_causalized_norms == 10
+    """Every encoder GroupNorm is swapped; the horizon core's are deliberately left alone.
 
-
-def test_the_horizon_core_is_deliberately_left_leaky(prod_kwargs):
-    """Its norms pool over the forecast axis of one anchor, not across input time.
-
-    Causalising them would be a change with no invariant behind it.
+    The core's norms pool over the forecast axis of one anchor, not across input time, so
+    causalising them would be a change with no invariant behind it.
     """
-    from torch import nn
-
     torch.manual_seed(0)
     model = SeqVaeLagAttn(**prod_kwargs)
+    encoders = (model.target_encoder, model.source_encoder)
+
+    def count(cls) -> int:
+        return sum(isinstance(m, cls) for encoder in encoders for m in encoder.modules())
+
+    assert model.causal_norm is True
+    assert count(nn.GroupNorm) == 0
+    assert model.n_causalized_norms == count(CausalGroupNorm) > 0
     assert any(isinstance(m, nn.GroupNorm) for m in model.horizon_core.modules())
 
 

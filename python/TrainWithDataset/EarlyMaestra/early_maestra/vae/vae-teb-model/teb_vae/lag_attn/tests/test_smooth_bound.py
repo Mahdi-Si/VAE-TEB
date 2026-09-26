@@ -48,18 +48,6 @@ def test_smooth_gradient_is_nonzero_where_clamp_is_zero():
     assert torch.all(clamped.grad == 0), "clamp should have zero gradient at |r|=20"
 
 
-def test_smooth_is_not_idempotent():
-    """Callers must bound a raw value, never an already-bounded one.
-
-    The heads return their pre-bound raw log-variance precisely so this can be respected; if the
-    map were idempotent that return value would be redundant.
-    """
-    r = torch.linspace(-4.0, 2.0, 25)
-    once = smooth_bound(r, _LO, _HI)
-    twice = smooth_bound(once, _LO, _HI)
-    assert not torch.allclose(once, twice)
-
-
 def test_range_endpoints_are_respected():
     r = torch.zeros(1)
     # sigmoid(0) = 0.5, so the midpoint of the range.

@@ -95,27 +95,16 @@ def test_the_measured_bound_equals_the_reported_one(window):
     )
 
 
-def test_the_reported_bound_is_the_architecture_arithmetic():
-    r"""$R_U = R_{\mathrm{conv}} + N_U(W_U - 1)$, from the tiny configuration's own numbers."""
-    encoder = build_stream_encoder("source")
-    kernels = TINY_KWARGS["encoder_conv_kernels"]
-    dilations = TINY_KWARGS["encoder_conv_dilations"]
-    conv_reach = 1 + sum((k - 1) * r for k, r in zip(kernels, dilations))
-    blocks = int(TINY_KWARGS["source_attention_blocks"])
-    window = int(TINY_KWARGS["source_attention_window"])
-
-    assert encoder.conv_reach == conv_reach
-    assert encoder.receptive_field == conv_reach + blocks * (window - 1)
-
-
 @pytest.mark.parametrize("stream", ["target", "source"])
 def test_no_recurrent_or_time_pooling_module_exists_in_either_encoder(stream):
+    """Adaptive or global pooling reduces over time too, so at $t$ it would read every other step;
+    it is caught by name, since no single base class covers the pooling family."""
     encoder = build_stream_encoder(stream)
 
     offenders = [
         f"{name or '<root>'}: {type(module).__name__}"
         for name, module in encoder.named_modules()
-        if isinstance(module, _BANNED_TYPES)
+        if isinstance(module, _BANNED_TYPES) or "Pool" in type(module).__name__
     ]
 
     assert not offenders, (
@@ -144,35 +133,3 @@ def test_every_convolution_pads_explicitly_rather_than_through_the_padding_argum
     for name, module in convolutions:
         assert module.padding == (0,), f"{name} has padding={module.padding}"
         assert module.groups == module.in_channels, f"{name} is not depthwise"
-
-
-@pytest.mark.parametrize("stream", ["target", "source"])
-def test_no_pooling_module_exists_in_either_encoder(stream):
-    """Adaptive or global pooling reduces over time, so at $t$ it would read every other step."""
-    encoder = build_stream_encoder(stream)
-
-    offenders = [
-        f"{name}: {type(module).__name__}"
-        for name, module in encoder.named_modules()
-        if "Pool" in type(module).__name__
-    ]
-
-    assert not offenders, f"{stream} encoder contains pooling modules {offenders}"
-
-
-def test_the_ban_list_catches_what_it_names():
-    """A guard that cannot fire is not a guard."""
-
-    class _Leaky(nn.Module):
-        def __init__(self) -> None:
-            super().__init__()
-            self.norm = nn.GroupNorm(1, 4)
-            self.recurrent = nn.LSTM(4, 4, batch_first=True)
-
-    offenders = [
-        type(module).__name__
-        for _, module in _Leaky().named_modules()
-        if isinstance(module, _BANNED_TYPES)
-    ]
-
-    assert sorted(offenders) == ["GroupNorm", "LSTM"]

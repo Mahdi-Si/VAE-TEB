@@ -538,9 +538,7 @@ projections at `128 * 98` and `128 * 39` plus the two start embeddings at `2 * 1
 persistence weight; the reach budget drops 31 of 109, so the narrowing dominates instead. On the
 off-state row the same identity is the six-term one at a 47-channel source and sums to +15,736.
 
-`DESIGN.md` §13 carries the same tables; `tests/test_docs.py` measures every total in both documents
-by constructing the models rather than comparing against literals, so a change to a shared component
-re-costs the tables instead of failing an unrelated assertion.
+`DESIGN.md` §13 carries the same tables.
 
 ---
 
@@ -755,6 +753,5 @@ and both are to be re-derived from the headline run's own `train/grad_norm` and 
 
 **The encoder edge holds.** Both cfs cells carry the same horizon, anchor stride, horizon half-life
 and additive margin, so they optimise the same criterion over the same block and anchor count and the
-level columns of the cross-cell table remain readable across them; both cells' `test_config_load.py`
-pin the four leaves. The target edge now differs in the horizon as well as the block. `DESIGN.md`'s
+level columns of the cross-cell table remain readable across them. The target edge now differs in the horizon as well as the block. `DESIGN.md`'s
 amendment of the same date carries the full derivation.

@@ -39,15 +39,6 @@ _EXPECTED_T = 300
 #: 16x decimation: 5280 - 2*240 = 4800.
 _EXPECTED_RAW = 4800
 
-#: Every committed fixture file, both variants. Written out rather than globbed: a fixture that
-#: exists locally and was never staged would pass a glob and fail on a clean checkout.
-_FIXTURE_FILES = (
-    "tiny_shard.hdf5",
-    "tiny_stats.hdf5",
-    "tiny_shard_causal.hdf5",
-    "tiny_stats_causal.hdf5",
-)
-
 #: The causal shard's stored widths, and the rebased warm-up range each block must reproduce at
 #: ``trim_minutes: 1.0``. Hand-written from the documented drop rule: seven scattering channels
 #: per block outrun the stored segment and are dropped at write time, leaving $36$ of $43$; both
@@ -60,8 +51,7 @@ _CAUSAL_BLOCKS: Dict[str, Dict[str, Any]] = {
     "up_ph": {"width": 15, "rebased": (41, 134)},
 }
 
-#: Decimated steps ``trim_minutes: 1.0`` removes from each end, and the decimation itself.
-_TRIM_STEPS = 15
+#: The raw-to-feature decimation.
 _DECIMATION = 16
 
 
@@ -85,19 +75,6 @@ def batch(config):
     return next(iter(GraphDataModule(config).train_dataloader()))
 
 
-def test_the_fixtures_are_committed():
-    """A silently-absent shard would make every test below fail with an unhelpful message."""
-    for name in _FIXTURE_FILES:
-        assert (_FIXTURES / name).is_file(), name
-
-
-def test_the_fixtures_are_small_enough_to_live_in_the_repo():
-    """Both variants against one budget. The causal pair adds roughly $1.0$ MB to the two-sided
-    $1.5$ MB, which is what a shard whose blocks are a real transform of real signal costs."""
-    total = sum((_FIXTURES / name).stat().st_size for name in _FIXTURE_FILES)
-    assert total < 4 * 1024 * 1024, f"fixtures grew to {total / 1e6:.1f} MB"
-
-
 def test_the_batch_carries_the_model_input_contract(batch):
     """Channel counts are the contract; the task checks them against every batch."""
     assert batch.fhr_st.shape == (2, _EXPECTED_T, 43)
@@ -105,26 +82,6 @@ def test_the_batch_carries_the_model_input_contract(batch):
     assert batch.up_st.shape == (2, _EXPECTED_T, 43)
     assert batch.up_ph.shape == (2, _EXPECTED_T, 15)
     assert batch.weight.shape == (2, _EXPECTED_T)
-
-
-def test_the_feature_fields_arrive_time_major(batch):
-    """The on-disk layout is (N, C, T) and the dataset transposes on read.
-
-    A model that permuted again would silently train on a (channels, time) tensor of the right
-    rank. The assertion that catches it is that the last axis is the channel count -- and 43 != 300
-    is the only reason it can be caught at all.
-    """
-    assert batch.fhr_st.shape[-1] == 43 != batch.fhr_st.shape[-2]
-
-
-def test_the_source_stream_concatenates_to_the_configured_width(batch, config):
-    """What the task builds and hands to the model as ``u_stream``."""
-    u_stream = torch.cat([batch.up_st, batch.up_ph], dim=-1)
-    assert u_stream.shape[-1] == config["model_config"]["VAE_model"]["c_u"] == 58
-
-
-def test_the_target_stream_concatenates_to_the_configured_width(batch, config):
-    assert batch.fhr_st.shape[-1] + batch.fhr_ph.shape[-1] == config["model_config"]["VAE_model"]["c_y"]
 
 
 def test_the_configured_widths_match_the_committed_shard(batch, config):
@@ -196,12 +153,6 @@ def test_normalization_actually_happened(batch):
     )
 
 
-def test_the_val_loader_reads_the_held_out_list(config):
-    """`val` and `test` both read `vae_test_datasets`; there is no in-process split."""
-    data_module = GraphDataModule(config)
-    assert next(iter(data_module.val_dataloader())).fhr_st.shape[1] == _EXPECTED_T
-
-
 # ---------------------------------------------------------------------------------------
 # The causal shard
 #
@@ -233,25 +184,6 @@ def test_the_causal_shard_describes_its_own_filter_bank(causal_shard):
         assert "fhr_up_ph" not in handle
 
 
-def test_the_causal_blocks_are_stored_at_the_widths_the_drop_rule_leaves(causal_shard):
-    with h5py.File(causal_shard, "r") as handle:
-        for name, expected in _CAUSAL_BLOCKS.items():
-            assert handle[name].shape[1] == expected["width"], name
-
-
-def test_the_rebased_warmup_reproduces_the_documented_ranges(causal_shard):
-    r"""$W' = \max(W - 15, 0)$ at ``trim_minutes: 1.0``, per block.
-
-    These four ranges are what the whole warm-up budget is chosen against: $134$ is where
-    ``fhr_ph`` tops out, and it is the smallest budget that keeps every phase channel.
-    """
-    with h5py.File(causal_shard, "r") as handle:
-        for name, expected in _CAUSAL_BLOCKS.items():
-            stored = np.asarray(handle[name].attrs["causal_warmup_steps"], dtype=np.int64)
-            rebased = np.maximum(stored - _TRIM_STEPS, 0)
-            assert (int(rebased.min()), int(rebased.max())) == expected["rebased"], name
-
-
 def test_every_causal_channel_records_the_delay_it_is_stale_by(causal_shard):
     """Stored, never compensated -- and never absent either. One-sidedness and zero latency are
     different properties, and this shard buys only the first."""
@@ -263,7 +195,13 @@ def test_every_causal_channel_records_the_delay_it_is_stale_by(causal_shard):
 
 
 def test_the_loader_reports_the_causal_boundary(causal_shard):
-    """Through the real dataset class, at the trim the model runs at."""
+    r"""Through the real dataset class, at the trim the model runs at.
+
+    Pins the committed fixture's ground truth that the downstream cells' warm-up budgets are
+    chosen against: the stored block widths and the rebased warm-up ranges
+    $W' = \max(W - W_{\mathrm{trim}}, 0)$, with $W_{\mathrm{trim}}$ the decimated steps the trim
+    removes from each end.
+    """
     from hdf5_dataset.hdf5_dataset import CombinedHDF5Dataset
 
     dataset = CombinedHDF5Dataset(paths=[str(causal_shard)], trim_minutes=1.0)

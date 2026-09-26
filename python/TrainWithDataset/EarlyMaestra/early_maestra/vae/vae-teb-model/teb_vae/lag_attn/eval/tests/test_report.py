@@ -183,7 +183,7 @@ def test_the_manifest_lists_every_emitted_file_with_its_size(tmp_path):
     }
     assert manifest["n_files"] == 3
     assert manifest["files"]["preflight.json"] == 2
-    # The figure subset is what FIGURE_GUIDE.md's test reads, so it must be exactly the PDFs.
+    # The figure subset is exactly the PDFs.
     assert manifest["figures"] == ["forecast/heatmaps.pdf"] and manifest["n_figures"] == 1
 
 
@@ -295,9 +295,6 @@ def test_argmax_lag_measures_uniformity_against_the_attainable_ceiling_not_log_l
         "a structureless attention passed the degeneracy check: the uniformity branch is dead"
     )
     assert verdict["entropy_ratio"] == pytest.approx(1.0, rel=1e-6)
-
-    # The same reading against log L is what the check used to divide by, and it passes.
-    assert 4.397705 < 0.99 * 4.510860
 
 
 def test_argmax_lag_is_inconclusive_when_the_attention_analysis_did_not_report():

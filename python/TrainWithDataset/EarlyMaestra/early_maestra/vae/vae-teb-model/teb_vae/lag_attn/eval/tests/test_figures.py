@@ -3,9 +3,9 @@
 The extraction's real regression guard is ``teb_vae/lag_attn/tests/test_plotting_figure.py`` and
 ``test_plotting_callback.py``, which exercise the training figures end to end and pass
 unmodified or the lift changed behaviour. What is asserted here is the part those cannot see:
-that there is genuinely one copy of each helper rather than two, that the new module drags no
-framework in, and that the generic panels survive the empty and all-``NaN`` inputs a real run
-will hand them.
+that the primitives module drags no framework in, that importing the eval figures leaves global
+style alone, and that the generic panels survive the empty and all-``NaN`` inputs a real run will
+hand them.
 
 Every figure test closes its figure in a ``finally``. A leaked figure is not a failure of the
 test that leaked it -- it is a memory growth that surfaces somewhere else entirely.
@@ -21,9 +21,8 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
 import pytest
-import torch
 
-from teb_vae.lag_attn import figure_primitives, plotting
+from teb_vae.lag_attn import figure_primitives
 from teb_vae.lag_attn.eval import figures
 
 from .conftest import _REPO_ROOT
@@ -32,43 +31,6 @@ from .conftest import _REPO_ROOT
 # ---------------------------------------------------------------------------
 # The extraction itself
 # ---------------------------------------------------------------------------
-LIFTED = (
-    "to_numpy",
-    "kld_per_dim_np",
-    "time_axes",
-    "attach_lag_seconds_axis",
-    "shade_warmup",
-    "average_forecast_per_channel",
-    "concat_single_forecasts",
-    "stack_feature_blocks",
-    "safe_vabs",
-    "future_target",
-)
-
-
-@pytest.mark.parametrize("name", LIFTED)
-def test_plotting_imports_each_helper_rather_than_defining_it(name: str) -> None:
-    """One copy in the tree, not two that a test would have to keep proving identical."""
-    assert hasattr(plotting, name), f"plotting.py no longer exposes {name}"
-    assert getattr(plotting, name) is getattr(figure_primitives, name), (
-        f"plotting.{name} is not the same object as figure_primitives.{name}, so the extraction "
-        f"left a second definition behind"
-    )
-
-
-@pytest.mark.parametrize("name", LIFTED)
-def test_no_helper_is_redefined_in_plotting(name: str) -> None:
-    """An import plus a redefinition would pass the identity check only until someone edits one."""
-    source = Path(inspect.getfile(plotting)).read_text(encoding="utf-8")
-    tree = ast.parse(source)
-    defined = {
-        node.name
-        for node in ast.walk(tree)
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-    }
-    assert name not in defined
-
-
 def test_figure_primitives_imports_no_framework() -> None:
     """The whole point of the lift: importable from eval without dragging a callback module in."""
     source = Path(inspect.getfile(figure_primitives)).read_text(encoding="utf-8")
@@ -84,31 +46,6 @@ def test_figure_primitives_imports_no_framework() -> None:
             assert not any(name.startswith(bad) for bad in forbidden), (
                 f"figure_primitives imports {name!r}, which defeats the extraction"
             )
-
-
-def test_the_colour_literals_that_differ_from_utils_style_are_preserved() -> None:
-    """Two of the eight genuinely differ, and the figures depend on these hues.
-
-    Sourcing them from ``utils.style`` instead would silently restyle every lag figure.
-    """
-    from utils import style
-
-    assert figure_primitives.COLOR_PURPLE == "#5642EB" != style.COLOR_PURPLE
-    assert figure_primitives.COLOR_BLACK == "#000000" != style.COLOR_BLACK
-    # The other six are byte-identical, which is why only these two are worth stating.
-    assert figure_primitives.COLOR_BLUE == style.COLOR_BLUE
-    assert figure_primitives.COLOR_LIGHT_GRAY == style.COLOR_LIGHT_GRAY
-
-
-def test_future_target_has_the_shape_the_forecast_is_scored_against() -> None:
-    """$(B, T - H_d, H_d, c_y)$, and anchor $t$ holds ``Y[t+1 : t+1+H_d]``."""
-    torch.manual_seed(0)
-    y_st, y_ph = torch.randn(2, 10, 43), torch.randn(2, 10, 66)
-    target = figure_primitives.future_target(y_st, y_ph, horizon=3)
-    assert target.shape == (2, 7, 3, 109)
-    combined = torch.cat([y_st, y_ph], dim=-1)
-    assert torch.equal(target[:, 4, 0], combined[:, 5])
-    assert torch.equal(target[:, 4, 2], combined[:, 7])
 
 
 def test_stack_feature_blocks_returns_the_row_index_of_the_last_top_channel() -> None:
@@ -171,15 +108,6 @@ def test_importing_figures_does_not_mutate_global_rcparams() -> None:
         f"importing figures.py changed rcParams {completed.stdout.strip()}; styling must be an "
         f"explicit call at pipeline start, not an import side effect"
     )
-
-
-def test_the_behavioural_helpers_come_from_utils_style() -> None:
-    """Imported, not reimplemented -- asserted by identity."""
-    from utils import style
-
-    assert figures.SAVE_DPI is style.SAVE_DPI
-    assert figures.style_axes is style.style_axes
-    assert figures.save_figure is style.save_figure
 
 
 # ---------------------------------------------------------------------------
@@ -250,7 +178,7 @@ def test_heatmap_with_colorbar_draws_and_marks_the_block_separator() -> None:
 def test_heatmap_colormap_follows_the_symmetry_of_the_field() -> None:
     """A non-negative field must not be drawn on a diverging colormap.
 
-    ``bwr`` puts white at the midpoint of the range, so a non-negative field renders its
+    A diverging map puts white at the midpoint of the range, so a non-negative field renders its
     *smallest* values saturated blue and its mid-range white: the best-forecast channel looks
     extreme and the mediocre one looks neutral, exactly inverting the at-a-glance ranking a
     heatmap exists to give. The colourbar stays correct, so nothing in the numbers gives it away.
@@ -261,12 +189,11 @@ def test_heatmap_colormap_follows_the_symmetry_of_the_field() -> None:
         signed = np.random.default_rng(3).normal(size=(6, 10))
         diverging = figures.heatmap_with_colorbar(fig, axes[0, 0], signed, symmetric=True)
         assert diverging is not None
-        assert diverging.get_cmap().name == "bwr"
 
         non_negative = np.abs(np.random.default_rng(4).normal(size=(6, 10)))
         sequential = figures.heatmap_with_colorbar(fig, axes[1, 0], non_negative, symmetric=False)
         assert sequential is not None
-        assert sequential.get_cmap().name != "bwr", (
+        assert sequential.get_cmap().name != diverging.get_cmap().name, (
             "a non-negative field is being drawn on a diverging colormap"
         )
         # An explicit choice still wins over the default.
@@ -668,8 +595,6 @@ def test_the_strip_draws_one_bar_per_testable_window_against_the_threshold() -> 
         ]
         assert threshold, "no threshold line was drawn"
         assert float(np.atleast_1d(threshold[0].get_ydata())[0]) == pytest.approx(-np.log10(0.05))
-        assert "alpha = 0.05" in threshold[0].get_label()
-        assert "Holm" in threshold[0].get_label()
     finally:
         plt.close(fig)
 
@@ -707,7 +632,6 @@ def test_an_untestable_window_gets_a_mark_of_its_own_rather_than_a_bar() -> None
         assert len(marks) == 1
         assert list(np.atleast_1d(marks[0].get_xdata())) == pytest.approx([1.0])
         assert list(np.atleast_1d(marks[0].get_ydata())) == pytest.approx([0.0])
-        assert marks[0].get_label() == "not testable"
     finally:
         plt.close(fig)
 

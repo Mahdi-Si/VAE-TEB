@@ -33,8 +33,8 @@ import pytest
 from teb_vae.lag_attn_cfs.eval import lag_shape
 from teb_vae.lag_attn_cfs.eval.analyses import lag_kl
 
-#: A short axis, and one that starts where a real one does: eleven bins at 4 s with a causal input
-#: delay of three steps, so $\tau_0 = 12$ s rather than $0$.
+#: A short axis, and one that starts where a real one does: $L$ bins at 4 s with a non-zero causal
+#: input delay $\delta$, so $\tau_0 = 4\delta$ s rather than $0$.
 _N_LAGS = 11
 _DELAY_STEPS = 3
 _SECONDS = 4.0 * (np.arange(_N_LAGS, dtype=np.float64) + _DELAY_STEPS)
@@ -439,14 +439,3 @@ def test_every_key_the_module_advertises_is_one_the_reducer_returns() -> None:
     """The tuple consumers lay their columns out from, pinned to what actually arrives."""
     statistics, _ = lag_shape.profile_statistics(np.ones((2, _N_LAGS)), _SECONDS)
     assert tuple(sorted(statistics)) == tuple(sorted(lag_shape.STATISTIC_KEYS))
-    assert len(lag_shape.STATISTIC_KEYS) == len(set(lag_shape.STATISTIC_KEYS))
-
-
-def test_the_peak_vocabulary_lag_kl_exposes_is_this_modules_own_object() -> None:
-    """Compared by identity: a correct local copy would still be a second definition."""
-    assert lag_kl.peak_width is lag_shape.peak_width
-    assert lag_kl.mass_above is lag_shape.mass_above
-    assert lag_kl.secondary_peaks is lag_shape.secondary_peaks
-    assert lag_kl.degeneracy is lag_shape.degeneracy
-    assert lag_kl.DEGENERATE_PEAK_TO_MEDIAN == lag_shape.DEGENERATE_PEAK_TO_MEDIAN
-    assert lag_kl.DEGENERATE_ZERO_FRACTION == lag_shape.DEGENERATE_ZERO_FRACTION

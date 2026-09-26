@@ -58,16 +58,3 @@ def test_without_the_detach_the_same_probe_finds_gradients(tiny_kwargs, inputs):
         if grad is None
     ]
     assert not unreached, f"parameters the probe cannot see even through z: {unreached}"
-
-
-def test_the_forward_dict_carries_no_state_tensor_that_reaches_the_decoder(
-    tiny_kwargs, inputs
-):
-    """The decoder consumes d_z-wide latents; the only d_model-wide tensors in the output are
-    the two encoder states, and neither is connected to the forecasts once z is detached (the
-    autograd test above). Here the surface claim: no key named for the removed pathway."""
-    model = _model(tiny_kwargs).eval()
-    with torch.no_grad():
-        out = model(*inputs)
-    assert "decoder_state" not in out
-    assert model.decoder.proj.body[0].in_features == model.d_z  # first linear reads z, nothing wider

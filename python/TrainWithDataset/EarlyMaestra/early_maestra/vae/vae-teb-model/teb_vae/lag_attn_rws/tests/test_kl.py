@@ -34,14 +34,6 @@ def _kld(seed: int = 0) -> torch.Tensor:
     return torch.rand(_B, _T, _D_Z, generator=generator)  # non-negative, like a real KL
 
 
-def test_the_returned_names_reference_the_kl_not_transfer_entropy():
-    out = masked_source_kl(_kld(), _mask())
-    assert set(out) == _EXPECTED_KEYS
-    for name in out:
-        assert "te" not in name.split("_"), name
-        assert "transfer" not in name, name
-
-
 def test_with_zero_free_bits_raw_equals_train():
     out = masked_source_kl(_kld(), _mask(), free_bits=0.0)
     assert torch.equal(

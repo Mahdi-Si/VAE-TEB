@@ -92,27 +92,26 @@ def test_the_segment_span_and_coarse_bound_keep_a_crossing_segment():
 # Window and bin boundaries
 # =============================================================================
 @pytest.mark.parametrize(
-    "hours,inside",
+    "hours,high,inside",
     [
-        (0.0, False),      # delivery itself is not in (0, 3]
-        (1e-6, True),
-        (0.5, True),
-        (1.0, True),
-        (3.0, True),       # the closed upper edge
-        (3.0 + 1e-6, False),
+        # The preservation window (0, 3]: delivery itself is outside, the upper edge inside.
+        (0.0, 3.0, False),
+        (1e-6, 3.0, True),
+        (0.5, 3.0, True),
+        (1.0, 3.0, True),
+        (3.0, 3.0, True),
+        (3.0 + 1e-6, 3.0, False),
+        # The supervised window (0, 1]: exactly one hour out is supervised, just beyond it is not.
+        (0.0, 1.0, False),
+        (0.5, 1.0, True),
+        (1.0, 1.0, True),
+        (1.0 + 1e-6, 1.0, False),
+        (3.0, 1.0, False),
     ],
 )
-def test_preservation_window_edges(hours, inside):
-    """The window is half-open at zero and closed at three hours."""
-    assert bool(data.in_window(hours, 0.0, 3.0)) is inside
-
-
-@pytest.mark.parametrize(
-    "hours,inside", [(0.0, False), (0.5, True), (1.0, True), (1.0 + 1e-6, False), (3.0, False)]
-)
-def test_supervised_window_edges(hours, inside):
-    """An anchor exactly one hour out is supervised; one just beyond it is not."""
-    assert bool(data.in_window(hours, 0.0, 1.0)) is inside
+def test_window_edges(hours, high, inside):
+    """Every window is half-open at zero and closed at its upper edge."""
+    assert bool(data.in_window(hours, 0.0, high)) is inside
 
 
 def test_the_six_fixed_bins_and_their_edges():

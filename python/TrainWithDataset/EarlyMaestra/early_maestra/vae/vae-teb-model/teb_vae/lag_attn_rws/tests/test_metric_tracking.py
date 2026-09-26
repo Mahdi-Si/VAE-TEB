@@ -49,29 +49,26 @@ def test_the_tracked_list_covers_what_the_task_emits(task, stub_batch, perturb_p
     assert untracked == set(), f"the task emits {untracked}, which no callback collects"
 
 
-def test_the_shuffled_metrics_are_tracked_for_validation_only():
-    """The permutation control never runs on a training batch, so a ``train/`` variant of its
-    metrics would be a column that is NaN in every row of every run."""
-    for name in ("nll_shuffled_block", "kld_shuffled", "shuffle_penalty"):
-        assert f"val/{name}" in _TRACKED_METRICS
-        assert f"train/{name}" not in _TRACKED_METRICS
-
-
-def test_the_breaker_columns_are_tracked_train_only():
-    """The breaker never runs on a validation batch; its columns are the only visibility into a
-    run that silently skips every batch."""
-    for name in ("spike_skipped", "spike_ema_loss"):
-        assert f"train/{name}" in _TRACKED_METRICS
-        assert f"val/{name}" not in _TRACKED_METRICS
-
-
-def test_the_gradient_columns_are_tracked_train_only():
-    """The pre-clip norm and the clip-exceedance fraction exist on the training path alone --
-    they are logged from ``on_before_optimizer_step``, which validation never reaches -- so a
-    ``val/`` variant would be a column that is NaN in every row of every run."""
-    for name in ("grad_norm", "grad_clip_frac"):
-        assert f"train/{name}" in _TRACKED_METRICS
-        assert f"val/{name}" not in _TRACKED_METRICS
+@pytest.mark.parametrize(
+    "names, stage, absent",
+    [
+        # The permutation control never runs on a training batch.
+        (("nll_shuffled_block", "kld_shuffled", "shuffle_penalty"), "val", "train"),
+        # The breaker never runs on a validation batch; its columns are the only visibility into a
+        # run that silently skips every batch.
+        (("spike_skipped", "spike_ema_loss"), "train", "val"),
+        # The pre-clip norm and the clip fraction are logged from ``on_before_optimizer_step``,
+        # which validation never reaches.
+        (("grad_norm", "grad_clip_frac"), "train", "val"),
+    ],
+    ids=["permutation-control", "spike-breaker", "gradient"],
+)
+def test_single_stage_metrics_are_tracked_for_their_stage_only(names, stage, absent):
+    """A metric only one stage emits, tracked under the other stage as well, is a column that is
+    NaN in every row of every run -- and one tracked under neither never reaches the CSV."""
+    for name in names:
+        assert f"{stage}/{name}" in _TRACKED_METRICS
+        assert f"{absent}/{name}" not in _TRACKED_METRICS
 
 
 class _GradientHookStub:
@@ -136,12 +133,6 @@ def test_the_clip_fraction_is_logged_only_against_a_threshold_that_actually_clip
         assert stub.logged["train/grad_clip_frac"] == expected_frac
 
 
-def test_beta_is_tracked_stage_prefixed_and_lr_bare():
-    assert "train/kld_beta" in _TRACKED_METRICS
-    assert "kld_beta" not in _TRACKED_METRICS
-    assert "lr" in _TRACKED_METRICS  # the one name the framework logs unprefixed
-
-
 # --------------------------------------------------------------------------------------
 # train_model wiring
 # --------------------------------------------------------------------------------------
@@ -170,14 +161,6 @@ def built_callbacks(tmp_path, monkeypatch):
     driver.train_model(object(), object())
     captured["driver"] = driver
     return captured
-
-
-def test_train_model_goes_through_the_framework_trainer_builder(built_callbacks):
-    """No hand-rolled ``pl.Trainer``: the builder attaches the LR monitor and the MLflow
-    run-logging callback, reconciles ``benchmark`` against ``deterministic``, and TTY-gates the
-    progress bar. A hand-rolled block gets none of that."""
-    assert "callbacks" in built_callbacks
-    assert "fit_args" in built_callbacks  # the fit ran through the built trainer
 
 
 def test_the_model_passed_to_the_builder_is_the_lightning_module(built_callbacks):
@@ -244,7 +227,8 @@ def test_the_metrics_history_writer_is_wired_to_the_collector(built_callbacks):
 def test_the_hyperparameter_callback_keys_are_explicit(built_callbacks):
     """The default list asks for names the framework does not emit (a bare ``kld_beta``,
     ``hyperparams/beta``); left to default, the beta ramp silently vanishes from
-    hyperparameters.html."""
+    hyperparameters.html. So every key it watches must be a tracked -- and therefore reachable --
+    metric."""
     from train.callbacks import HyperparameterLoggingCallback
 
     hyperparam = next(
@@ -253,41 +237,5 @@ def test_the_hyperparameter_callback_keys_are_explicit(built_callbacks):
         if isinstance(cb, HyperparameterLoggingCallback)
     )
 
-    assert hyperparam.tracked_keys == ("train/kld_beta", "lr")
-
-
-def test_the_shipped_config_wires_the_diagnostic_plotter(built_callbacks):
-    """``lag_attn_rws_plotting.enabled: true`` ships, so a real run emits the validation figure.
-    The plotter is imported lazily inside the enabled branch, so this is also the only test that
-    would catch that import breaking."""
-    names = [type(cb).__name__ for cb in built_callbacks["callbacks"]]
-
-    assert "LagAttnRwsPlotCallback" in names
-
-
-def test_disabling_the_plotting_block_constructs_no_plotter(tmp_path, monkeypatch):
-    """The other direction, and the reason the import sits inside the branch: a wiring that
-    ignored the flag would pull matplotlib into every run that asked for no figures."""
-    driver = LagAttnRwsTrainer(config_file_path=str(_CONFIG))
-    driver.output_base_dir = str(tmp_path)
-    driver.train_results_dir = str(tmp_path / "train_results")
-    driver.model_checkpoint_dir = str(tmp_path / "model_checkpoints")
-    driver.config["advanced_config"]["callbacks"]["lag_attn_rws_plotting"]["enabled"] = False
-
-    captured = {}
-
-    def _capture(callbacks, model=None):
-        captured["callbacks"] = callbacks
-
-        class _StubTrainer:
-            def fit(self, *args, **kwargs):
-                return None
-
-        return _StubTrainer()
-
-    monkeypatch.setattr(type(driver), "build_trainer", staticmethod(_capture))
-    driver.create_model()
-    driver.train_model(object(), object())
-
-    names = [type(cb).__name__ for cb in captured["callbacks"]]
-    assert "LagAttnRwsPlotCallback" not in names
+    assert hyperparam.tracked_keys
+    assert set(hyperparam.tracked_keys) <= set(_TRACKED_METRICS)

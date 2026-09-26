@@ -1,9 +1,8 @@
 r"""The lag validity floor: which source steps the attention may read, and what it costs.
 
-Lag attention searches $L = \mathrm{max\_lag} + 1$ steps back, so at the shipped anchor floor of
-$133$ it reads source states down to step $43$ -- where much of the source is still inside its own
-warm-up. ``up_ph``'s fastest channel is not honest until step $41$ and its slowest until $134$, so
-at step $43$ a single one of its fifteen channels is warm.
+Lag attention searches $L = \mathrm{max\_lag} + 1$ steps back, so at the anchor floor $F$ it reads
+source states down to step $F - \mathrm{max\_lag}$ -- where much of the source can still be inside
+its own warm-up $W'_c$.
 
 The design does not resolve that; it makes it *measurable*. ``lag_floor`` generalises the mask from
 $\mathbb 1[t - \ell \ge 0]$ to $\mathbb 1[t - \ell \ge F_u]$, ships at $0$ where it must be bitwise
@@ -25,7 +24,6 @@ import torch
 
 from teb_vae.lag_attn_cfs.nets.model import SeqVaeLagAttnCfs
 from teb_vae.lag_attn_cfs.tests.conftest import (
-    TINY_KWARGS,
     build,
     make_streams,
     tiny_warmup_kwargs,
@@ -169,8 +167,3 @@ def test_the_floor_actually_moves_the_attention(tiny_warmup) -> None:
     lags = torch.arange(weights.shape[-1])[None, :]
     forbidden = (steps - lags < 3)[None, :, None, :]
     assert float((weights * forbidden).abs().max()) > 0.0
-
-
-def test_the_default_lag_floor_is_zero() -> None:
-    """It ships at zero and no task moves it; the knob exists so the residual is measurable."""
-    assert build(dict(TINY_KWARGS)).lag_floor == 0

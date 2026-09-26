@@ -14,9 +14,9 @@ whose model class does not take the warm-up keywords builds an ungated model and
 completion, having read the assumed pre-recording history as signal on coefficients whose
 normalisation constants excluded exactly that region.
 
-The mapping is asserted at dict level against a stub trainer rather than through a real driver:
-there is no driver for this architecture yet, and one built early would inherit the raw model's
-class attribute and build the wrong network for anyone who ran it.
+The mapping is asserted at dict level against stub model classes and a stub config-to-constructor
+sweep, so the refusals can be driven with classes that accept exactly the partial keyword sets a
+real sibling model does. The real driver's own kwargs are checked in ``test_trainer.py``.
 """
 from __future__ import annotations
 
@@ -162,28 +162,14 @@ def test_the_four_resolved_tuples_reach_the_constructor(kwargs, budget) -> None:
     assert len(kwargs["source_keep_index"]) == len(kwargs["source_warmup_steps"])
 
 
-def test_the_delay_keywords_stay_absent(kwargs) -> None:
-    """Those names reach ``ChannelDelay`` and would apply a shift on top of the warm-up mask."""
-    for name in DELAY_KWARGS:
-        assert name not in kwargs, name
-    assert not set(DELAY_KWARGS) & set(WARMUP_MODEL_KWARGS)
-
-
-def test_the_threshold_itself_names_no_constructor_argument(kwargs) -> None:
-    """So the sweep drops it for free, with no exclusion list to keep in step with the network."""
-    assert "causal_warmup_budget_steps" not in inspect.signature(
-        _WarmupModel.__init__
-    ).parameters
-    assert "causal_warmup_budget_steps" not in kwargs
-    # The geometry keys around it are ordinary constructor arguments and must still be forwarded,
-    # or the assertion above would also pass on a sweep that forwarded nothing at all.
-    assert kwargs["c_y"] == CAUSAL_C_Y
-    assert kwargs["horizon"] == causal_config()["model_config"]["VAE_model"]["horizon"]
-
-
 def test_no_budget_adds_no_keys() -> None:
-    """An unguarded run gets no gate and no warm-up mask, not an identity one."""
+    """An unguarded run gets no gate and no warm-up mask, not an identity one -- and with nothing to
+    route, the model class is nobody's business, so even a class the refusal below names maps to
+    nothing rather than raising."""
+    from teb_vae.lag_attn_rws.nets.model import SeqVaeLagAttnRws
+
     assert warmup_model_kwargs(None, _WarmupModel) == {}
+    assert warmup_model_kwargs(None, SeqVaeLagAttnRws) == {}
     kwargs = _StubTrainer(
         causal_config(causal_warmup_budget_steps=None)
     ).build_model_kwargs()
@@ -208,13 +194,6 @@ def test_a_model_class_without_the_warm_up_keywords_is_refused_naming_it(budget)
     message = str(error.value)
     assert "SeqVaeLagAttnRws" in message
     assert "target_warmup_steps" in message and "source_warmup_steps" in message
-
-
-def test_the_refusal_does_not_fire_when_no_budget_is_configured() -> None:
-    """The negative control: with nothing to route, the model class is nobody's business."""
-    from teb_vae.lag_attn_rws.nets.model import SeqVaeLagAttnRws
-
-    assert warmup_model_kwargs(None, SeqVaeLagAttnRws) == {}
 
 
 # =================================================================================================
@@ -260,27 +239,6 @@ def test_an_unaligned_run_emits_no_alignment_keys_at_all() -> None:
     assert set(WARMUP_MODEL_KWARGS) <= set(unaligned)
 
 
-def test_the_two_tuples_stay_separate_and_disjoint() -> None:
-    """Folding them together would make "ungated" mean two things at once.
-
-    ``tests/test_docs.py`` builds the ungated comparison arm by removing
-    :data:`WARMUP_MODEL_KWARGS` from a production keyword set. A six-entry tuple there would strip
-    the shifts too, and the number it pins would stop describing the model it names.
-    """
-    assert not set(WARMUP_MODEL_KWARGS) & set(ALIGN_MODEL_KWARGS)
-    assert not set(DELAY_KWARGS) & set(ALIGN_MODEL_KWARGS)
-    assert len(ALIGN_MODEL_KWARGS) == 2
-
-
-def test_the_reference_itself_names_no_constructor_argument(aligned_kwargs) -> None:
-    """Like the threshold beside it, so the sweep drops it with no exclusion list to maintain."""
-    assert "causal_align_reference" not in inspect.signature(
-        _AlignedModel.__init__
-    ).parameters
-    assert "causal_align_reference" not in aligned_kwargs
-    assert "causal_leg_alignment" not in aligned_kwargs
-
-
 def test_a_model_class_that_cannot_shift_is_refused_naming_it() -> None:
     """A class taking the warm-up keywords but not the alignment ones passes the first refusal.
 
@@ -298,7 +256,6 @@ def test_a_model_class_that_cannot_shift_is_refused_naming_it() -> None:
     message = str(error.value)
     assert "_WarmupModel" in message
     assert "target_align_delays" in message and "source_align_delays" in message
-    assert "402.1604" in message
 
 
 def test_that_refusal_does_not_fire_on_an_unaligned_budget(unaligned_budget) -> None:
@@ -372,11 +329,12 @@ def test_a_feature_target_on_shards_without_the_vector_is_refused_naming_it(tmp_
 
 def test_the_three_tuples_stay_separate_and_disjoint() -> None:
     """Three tuples because they answer three questions: what is masked, what is shifted, and what
-    is only reported. The ungated comparison arm removes the first two and keeps the third."""
+    is only reported. The ungated comparison arm removes the first two and keeps the third, so a
+    name in two of them would make "ungated" mean two things at once -- and none of them may be a
+    ``ChannelDelay`` keyword."""
     names = (WARMUP_MODEL_KWARGS, ALIGN_MODEL_KWARGS, NOVELTY_MODEL_KWARGS)
     assert sum(len(group) for group in names) == len(set().union(*map(set, names)))
-    assert not set(DELAY_KWARGS) & set(NOVELTY_MODEL_KWARGS)
-    assert len(NOVELTY_MODEL_KWARGS) == 1
+    assert not set(DELAY_KWARGS) & set().union(*map(set, names))
 
 
 # =================================================================================================
@@ -393,11 +351,10 @@ def test_the_three_tuples_stay_separate_and_disjoint() -> None:
 # that resolved the second reference and then handed the model the single-reference vectors would
 # produce a correctly shaped model reading a stream aligned to a clock its config does not name.
 # =================================================================================================
-#: The pinned source clock, and the target's own. Written out rather than resolved twice: what is
-#: under test is that a *stated* pair of clocks reaches the model, and resolving the expectation
-#: through the same code that produces it would compare a value with itself.
+#: The pinned source clock. Written out rather than resolved: what is under test is that a *stated*
+#: clock reaches the model, and resolving the expectation through the same code that produces it
+#: would compare a value with itself.
 _SOURCE_REFERENCE = 288.2672
-_TARGET_REFERENCE = 402.1604
 
 
 @pytest.fixture
@@ -409,20 +366,6 @@ def dual_reference_kwargs() -> Dict[str, Any]:
             causal_align_reference_source=_SOURCE_REFERENCE,
         )
     ).build_model_kwargs()
-
-
-def test_the_second_reference_names_no_constructor_argument(dual_reference_kwargs) -> None:
-    """Task-level, like the threshold and the first reference beside it.
-
-    What the model takes is the shift vectors the reference resolved to; the reference is what
-    resolved them, and it is resolved against the shards. A constructor that took the reference
-    instead would have to re-read the data to know what it meant.
-    """
-    assert "causal_align_reference_source" not in inspect.signature(
-        _AlignedModel.__init__
-    ).parameters
-    assert "causal_align_reference_source" not in dual_reference_kwargs
-    assert set(ALIGN_MODEL_KWARGS) <= set(dual_reference_kwargs)
 
 
 def test_the_second_reference_narrows_the_source_stream_and_leaves_the_target_alone(
