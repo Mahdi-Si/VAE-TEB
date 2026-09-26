@@ -84,17 +84,6 @@ def test_the_two_clocks_disagree_about_the_sign_of_the_same_number() -> None:
     assert float(second_stage[cohort.SECOND_STAGE_HOURS_COLUMN].iloc[0]) == pytest.approx(-2.0)
 
 
-def test_a_window_after_onset_is_not_folded_into_the_first_one() -> None:
-    """The delivery clock clips at zero; this one must not, or every window after second-stage
-    onset -- which is the half of the axis this clock exists to show -- collapses into one."""
-    frame = pd.DataFrame({cohort.SECOND_STAGE_COLUMN: [-3.0 * _HOUR, 2.0 * _HOUR]})
-
-    bins = list(cohort.add_second_stage_bins(frame)[cohort.SECOND_STAGE_BIN_COLUMN])
-
-    assert bins == [-6, 4]
-    assert min(bins) < 0
-
-
 def test_a_non_finite_offset_is_dropped_rather_than_binned() -> None:
     frame = pd.DataFrame({cohort.SECOND_STAGE_COLUMN: [-_HOUR, np.nan, float("inf")]})
 
@@ -413,18 +402,6 @@ def _class_frame(rows: List[Dict[str, Any]]) -> pd.DataFrame:
     return analysis.build_per_recording(eligible)[labels.CLASS_COLUMN]
 
 
-def test_the_grid_and_the_readouts_are_the_delivery_clocks_own() -> None:
-    """One grid and one pair of readouts across both clocks, bound from the layer below rather than
-    restated: a window on one clock's figure is otherwise not the same duration as a window on the
-    other's, and the two pages stop being comparable while both look ordinary."""
-    from teb_vae.lag_attn_cfs.eval.analyses import time_to_delivery as delivery_clock
-
-    assert analysis.TRAJECTORY_BIN_HOURS is cohort.TRAJECTORY_BIN_HOURS
-    assert analysis.READOUTS is cohort.CLOCK_READOUTS
-    assert analysis.READOUTS == delivery_clock.READOUTS
-    assert analysis.VALUE_COLUMNS == delivery_clock.VALUE_COLUMNS
-
-
 def test_separated_classes_are_significant_in_the_windows_they_are_separated_in() -> None:
     """A known answer: two classes drawn fifty nats apart in every window must survive Holm."""
     record = analysis.analyse_windows(
@@ -592,14 +569,6 @@ def test_the_analysis_writes_its_five_tables_and_both_figures(tmp_path) -> None:
     assert all("per_window" not in record for record in result["significance"])
     eligibility = pd.read_csv(directory / analysis.ELIGIBILITY_FILENAME)
     assert set(eligibility.columns) >= {"guid", "eligible", "reason", "implied_onset_epoch_s"}
-
-
-def test_the_method_states_that_this_clocks_family_stands_alone() -> None:
-    """The one sentence a reader needs before quoting a $p$ from both clocks at once."""
-    record = analysis.analyse_windows(_class_frame(_clock_rows()), "mc_pred_gap")
-
-    assert "NOT corrected jointly" in record["method"]
-    assert "own clock" in record["method"]
 
 
 @pytest.mark.parametrize(

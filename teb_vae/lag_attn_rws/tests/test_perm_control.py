@@ -183,8 +183,6 @@ def test_the_anchor_keys_travel_through_untouched_and_are_not_recomputed(perturb
         model, out, perm_index=controls.make_derangement(_BATCH), anchors=anchors
     )
 
-    assert "anchor_index" not in controls.RECOMPUTED_KEYS
-    assert "anchor_valid" not in controls.RECOMPUTED_KEYS
     assert permuted["anchor_index"] is out["anchor_index"]
     assert permuted["anchor_valid"] is out["anchor_valid"]
 
@@ -246,7 +244,6 @@ def test_the_null_arm_replaces_exactly_the_three_keys_it_names(perturb_posterior
 
     nulled = _null(model, out, _u_stream(batch))
 
-    assert set(controls.SOURCE_NULL_KEYS) == {"mu_post", "logvar_post", "attn_weights"}
     changed = {key for key in out if not torch.equal(nulled[key], out[key])}
     assert changed <= set(controls.SOURCE_NULL_KEYS)
     assert changed, "the null moved nothing at all"

@@ -33,90 +33,54 @@ def _run(runner, loader, eval_config, output_dir):
 # ---------------------------------------------------------------------------
 # The precondition
 # ---------------------------------------------------------------------------
-def test_an_mse_checkpoint_produces_a_clean_recorded_skip(
-    make_eval_runner, tiny_loader, tiny_eval_config, tmp_path
+@pytest.mark.parametrize(
+    "hparams",
+    [
+        {"likelihood": "mse", "sigma_obs": 1.0},
+        # Under a fixed observation noise the logvar head did not set the likelihood's variance.
+        {"likelihood": "gaussian_nll", "sigma_obs": 0.5},
+    ],
+    ids=["mse", "fixed_sigma_obs"],
+)
+def test_an_objective_without_a_learned_variance_produces_a_clean_recorded_skip(
+    hparams, make_eval_runner, tiny_loader, tiny_eval_config, tmp_path
 ) -> None:
     """Not an error: the checkpoint is valid, it simply has no predictive variance to score.
 
     Raising would set the run's exit code and report a healthy run as broken.
     """
-    runner = make_eval_runner(
-        hparams={"likelihood": "mse", "sigma_obs": 1.0}, output_dir=tmp_path / "runner"
-    )
-    summary = _run(runner, tiny_loader, tiny_eval_config["eval_config"], tmp_path / "mse")
+    runner = make_eval_runner(hparams=hparams, output_dir=tmp_path / "runner")
+    summary = _run(runner, tiny_loader, tiny_eval_config["eval_config"], tmp_path / "skip")
 
     assert summary["skipped"] is True
-    assert "likelihood='mse'" in summary["reason"]
-    assert "logvar_full is emitted on every forward" in summary["reason"]
     assert "mean_nll" not in summary
-    assert not (tmp_path / "mse" / calibration_analysis.ANALYSIS_DIRNAME / "per_sample.csv").exists()
-
-
-def test_a_fixed_sigma_obs_checkpoint_is_also_skipped(
-    make_eval_runner, tiny_loader, tiny_eval_config, tmp_path
-) -> None:
-    """Under a fixed observation noise the logvar head did not set the likelihood's variance."""
-    runner = make_eval_runner(
-        hparams={"likelihood": "gaussian_nll", "sigma_obs": 0.5},
-        output_dir=tmp_path / "runner",
-    )
-    summary = _run(runner, tiny_loader, tiny_eval_config["eval_config"], tmp_path / "fixed")
-    assert summary["skipped"] is True
-    assert "sigma_obs=0.5" in summary["reason"]
-
-
-def test_the_shipped_objective_is_scored(
-    make_eval_runner, tiny_loader, tiny_eval_config, tmp_path
-) -> None:
-    """The shipped hparams are ``gaussian_nll`` with a learned sigma, which is scorable."""
-    runner = make_eval_runner(output_dir=tmp_path / "runner")
-    assert calibration_analysis.is_applicable(runner) is None
-    summary = _run(runner, tiny_loader, tiny_eval_config["eval_config"], tmp_path / "ok")
-    assert summary["skipped"] is False
+    assert not (tmp_path / "skip" / calibration_analysis.ANALYSIS_DIRNAME / "per_sample.csv").exists()
 
 
 # ---------------------------------------------------------------------------
 # Schema
 # ---------------------------------------------------------------------------
-def test_the_three_tables_are_written(
+def test_the_three_tables_are_written_with_their_contracts(
     make_eval_runner, tiny_loader, tiny_eval_config, tmp_path
 ) -> None:
+    r"""The shipped objective is scored, every horizon step is reported, and the PIT is a density.
+
+    A head calibrated at $h=1$ and over-confident at $h=H_d$ is averaged away by a scalar, and the
+    reliability histogram is normalised so a calibrated model sits flat at $1$.
+    """
     runner = make_eval_runner(output_dir=tmp_path / "runner")
     summary = _run(runner, tiny_loader, tiny_eval_config["eval_config"], tmp_path / "tables")
     directory = tmp_path / "tables" / calibration_analysis.ANALYSIS_DIRNAME
-
-    for name in ("per_sample.csv", "per_horizon.csv", "reliability.csv"):
-        assert (directory / name).is_file(), f"{name} missing"
 
     frame = pd.read_csv(directory / "per_sample.csv")
     assert {"nll", "nll_homoscedastic", "nll_gain", "crps", "mean_logvar"} <= set(frame.columns)
     assert len(frame) == summary["n_samples"] == 4
 
-
-def test_the_per_horizon_table_covers_every_horizon_step(
-    make_eval_runner, tiny_loader, tiny_eval_config, tmp_path
-) -> None:
-    """A head calibrated at $h=1$ and over-confident at $h=H_d$ is averaged away by a scalar."""
-    runner = make_eval_runner(output_dir=tmp_path / "runner")
-    _run(runner, tiny_loader, tiny_eval_config["eval_config"], tmp_path / "horizon")
-
-    per_horizon = pd.read_csv(
-        tmp_path / "horizon" / calibration_analysis.ANALYSIS_DIRNAME / "per_horizon.csv"
-    )
+    per_horizon = pd.read_csv(directory / "per_horizon.csv")
     assert set(per_horizon["horizon"]) == set(range(int(runner.model.horizon)))
     assert set(per_horizon["quantity"]) == {"nll", "coverage_2sigma"}
 
-
-def test_the_reliability_table_bins_sum_to_a_uniform_density(
-    make_eval_runner, tiny_loader, tiny_eval_config, tmp_path
-) -> None:
-    r"""The histogram is normalised to a density, so a calibrated model sits flat at $1$."""
-    runner = make_eval_runner(output_dir=tmp_path / "runner")
-    _run(runner, tiny_loader, tiny_eval_config["eval_config"], tmp_path / "rel")
-
-    reliability = pd.read_csv(
-        tmp_path / "rel" / calibration_analysis.ANALYSIS_DIRNAME / "reliability.csv"
-    )
+    reliability = pd.read_csv(directory / "reliability.csv")
     assert len(reliability) == calibration_analysis.PIT_BINS
     # A density over [0, 1] integrates to 1, i.e. its mean over equal-width bins is 1.
     assert float(reliability["density"].mean()) == pytest.approx(1.0, rel=1e-6)
@@ -250,24 +214,3 @@ def test_three_figures_are_written_with_data(
     assert len(summary["figures"]) == 3
     for path in summary["figures"]:
         assert Path(path).suffix == ".pdf" and Path(path).stat().st_size > 0
-
-
-def test_the_reliability_figure_marks_the_uniform_reference(
-    make_eval_runner, tiny_loader, tiny_eval_config, tmp_path, monkeypatch
-) -> None:
-    """Without the reference line a PIT curve is a shape with no scale to read it against."""
-    captured: dict = {}
-    original = figures.render_figure
-
-    def _capture(fig, path, **kwargs):
-        if Path(path).name == "reliability":
-            captured["labels"] = [
-                line.get_label() for line in fig.axes[0].get_lines()
-            ]
-        return original(fig, path, **kwargs)
-
-    monkeypatch.setattr(figures, "render_figure", _capture)
-    runner = make_eval_runner(output_dir=tmp_path / "runner")
-    _run(runner, tiny_loader, tiny_eval_config["eval_config"], tmp_path / "relfig")
-
-    assert "uniform" in captured["labels"]

@@ -630,8 +630,8 @@ class SeqVaeLagAttnTrfE2E(nn.Module):
         budget; a raw signal read through a strictly one-sided front end has nothing to compensate
         for, and a lag $\ell$ here refers to source content exactly $\ell$ steps in the past.
 
-        Exposed anyway, and asserted in the suite, because the diagnostic figure reads it through a
-        silent ``getattr(model, "source_delay_steps", 0)``: a model that stopped exposing it would
+        Exposed anyway, because the diagnostic figure reads it through a silent
+        ``getattr(model, "source_delay_steps", 0)``: a model that stopped exposing it would
         keep drawing the same figure, with no error, and the default would happen to be right today
         and wrong the moment anything delays a stream.
         """

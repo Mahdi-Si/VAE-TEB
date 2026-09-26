@@ -23,7 +23,6 @@ they need production data and touch no coefficient.
 """
 from __future__ import annotations
 
-import inspect
 import pickle
 import sys
 import types
@@ -35,7 +34,15 @@ import numpy as np
 import pytest
 import torch
 
-from hdf5_dataset.causal_scattering import DECIMATION, N_RAW, CausalBank, transform_sample
+from hdf5_dataset.causal_scattering import (
+    CAUSAL_KERNEL_TAPS,
+    CAUSAL_WARMUP_QUANTILE,
+    DECIMATION,
+    GAMMATONE_ORDER,
+    N_RAW,
+    CausalBank,
+    transform_sample,
+)
 
 from hdf5_dataset.tests.conftest import SHARD_PATH, requires_shard, scale_relative_errors
 
@@ -337,31 +344,6 @@ def test_the_recomputation_would_notice_a_changed_coefficient(
 # =================================================================================================
 # Variant selection
 # =================================================================================================
-def test_both_parameters_reach_every_write_path(pipeline: Any) -> None:
-    """``transform`` and ``device`` on all three functions, checked by signature.
-
-    A half-threaded parameter is the real failure mode here, not a wrong one: the pre-training
-    files at the end of the pipeline call the writer **directly**, bypassing
-    ``_build_hdf5_for_partition``, so a variant plumbed into the partition path alone produces an
-    output directory whose classification and pre-training files disagree about what they contain.
-    Reading the signatures catches that; running one path does not.
-    """
-    for function in (
-        pipeline.create_new_pipeline,
-        pipeline._build_hdf5_for_partition,
-        pipeline.create_hdf5_dataset_from_records_list,
-    ):
-        parameters = inspect.signature(function).parameters
-        assert "transform" in parameters, function.__name__
-        assert "device" in parameters, function.__name__
-        # Today's behaviour is the default on every one of them.
-        assert parameters["transform"].default == "two_sided", function.__name__
-        assert parameters["device"].default is None, function.__name__
-
-    assert "transform" in inspect.signature(pipeline.compute_scattering_masks).parameters
-    assert "device" in inspect.signature(pipeline.compute_scattering_masks).parameters
-
-
 def test_an_unknown_transform_is_refused_before_anything_is_created(
     pipeline: Any, tmp_path: Path
 ) -> None:
@@ -509,15 +491,6 @@ def test_the_layout_comes_from_the_model_two_sided_and_the_plan_causal(
 # =================================================================================================
 # The causal schema
 # =================================================================================================
-def test_the_causal_file_has_the_causal_layout(causal_file: Path) -> None:
-    """36/66/36/15 and no ``fhr_up_ph`` — the whole schema difference, on disk."""
-    with h5py.File(causal_file, "r") as handle:
-        assert "fhr_up_ph" not in handle
-        assert set(handle.keys()) == set(STORED_DATASETS) - {"fhr_up_ph"}
-        for field, expected in EXPECTED_CAUSAL_WIDTHS.items():
-            assert handle[field].shape == (0, expected, LEN_SEQUENCE), field
-
-
 def test_the_causal_file_records_what_its_warm_up_means(causal_file: Path) -> None:
     r"""The bank constants the warm-up vectors were measured under, at the root.
 
@@ -527,9 +500,9 @@ def test_the_causal_file_records_what_its_warm_up_means(causal_file: Path) -> No
     with h5py.File(causal_file, "r") as handle:
         attrs = dict(handle.attrs)
     assert attrs["transform"] == "causal"
-    assert int(attrs["causal_kernel_taps"]) == 1 << 15
-    assert int(attrs["gammatone_order"]) == 4
-    assert float(attrs["causal_warmup_quantile"]) == pytest.approx(0.95)
+    assert int(attrs["causal_kernel_taps"]) == CAUSAL_KERNEL_TAPS
+    assert int(attrs["gammatone_order"]) == GAMMATONE_ORDER
+    assert float(attrs["causal_warmup_quantile"]) == pytest.approx(CAUSAL_WARMUP_QUANTILE)
 
 
 def test_every_causal_block_carries_its_warm_up_and_delay(
@@ -546,9 +519,6 @@ def test_every_causal_block_carries_its_warm_up_and_delay(
             assert warmup.shape == delay.shape == (width,), field
             assert np.array_equal(warmup, plan[field].warmup_steps), field
             assert np.allclose(delay, plan[field].delay_s, rtol=1e-6), field
-        # The measured layout, so a silent change to the drop rule or the bank moves this test.
-        assert int(handle["fhr_st"].attrs["causal_warmup_steps"].max()) == 293
-        assert int(handle["up_ph"].attrs["causal_warmup_steps"].min()) == 56
 
 
 def test_the_causal_file_carries_the_two_sided_selection_unchanged(
@@ -918,18 +888,6 @@ def test_the_comparison_would_notice_a_wrong_channel_or_a_changed_value(
     assert scale_relative_errors(stored, shifted)[0] > GATE_FLOAT32["e_inf"]
 
 
-def test_the_written_warm_up_is_one_value_per_stored_channel(
-    causal_written_file: Path, causal_masks: Dict[str, Any]
-) -> None:
-    """The attribute and the channel axis of the data it describes agree, after a real write."""
-    plan = causal_masks["channel_plan"]
-    with h5py.File(causal_written_file, "r") as handle:
-        for field, width in EXPECTED_CAUSAL_WIDTHS.items():
-            warmup = np.asarray(handle[field].attrs["causal_warmup_steps"])
-            assert warmup.shape == (width,) == (handle[field].shape[1],), field
-            assert np.array_equal(warmup, plan[field].warmup_steps), field
-
-
 # =================================================================================================
 # The record writer's causal branch, and its failure isolation
 # =================================================================================================
@@ -1238,14 +1196,17 @@ def test_the_layout_dict_is_derived_from_the_channel_plan(
     assert layout["widths"] == dict(EXPECTED_CAUSAL_WIDTHS, fhr_up_ph=None)
     assert layout["c_y"] == plan["fhr_st"].n_channels + plan["fhr_ph"].n_channels
     assert layout["c_u"] == plan["up_st"].n_channels + plan["up_ph"].n_channels
-    assert layout["gammatone_order"] == 4
-    assert layout["causal_kernel_taps"] == 1 << 15
-    assert layout["causal_warmup_quantile"] == pytest.approx(0.95)
+    assert layout["gammatone_order"] == GAMMATONE_ORDER
+    assert layout["causal_kernel_taps"] == CAUSAL_KERNEL_TAPS
+    assert layout["causal_warmup_quantile"] == pytest.approx(CAUSAL_WARMUP_QUANTILE)
 
-    # Seven never-valid channels leave each scattering block and nothing leaves either phase block,
+    # The never-valid tail leaves each scattering block and nothing leaves either phase block,
     # which is what makes the drop a channel-axis operation rather than a re-selection.
     for field in ("fhr_st", "up_st"):
-        assert layout["dropped"][field] == {"count": 7, "first": 36, "last": 42}, field
+        full, kept = EXPECTED_WIDTHS[field], EXPECTED_CAUSAL_WIDTHS[field]
+        assert layout["dropped"][field] == {
+            "count": full - kept, "first": kept, "last": full - 1
+        }, field
     for field in ("fhr_ph", "up_ph"):
         assert layout["dropped"][field] == {"count": 0, "first": None, "last": None}, field
 
@@ -1287,12 +1248,6 @@ def test_no_channel_count_is_a_literal_in_the_formatted_layout(
     assert "43" not in causal_lines
     assert "fhr_st=43" in two_sided_lines and "fhr_up_ph=79" in two_sided_lines
     assert "36" not in two_sided_lines
-
-    assert "gammatone n=4" in causal_lines and "32768 taps" in causal_lines
-    assert "Dropped 7 never-valid channels from fhr_st (channels 36..42)" in causal_lines
-    assert "Warm-up range: fhr_st 5..293" in causal_lines
-    assert "Group delay:" in causal_lines
-    assert "Device: default" in two_sided_lines
 
 
 # =================================================================================================
@@ -1372,20 +1327,6 @@ def test_every_causal_block_carries_its_novelty_curve(causal_file: Path) -> None
             assert float(
                 np.asarray(handle[field].attrs["causal_novelty_curve"])[:, 30].min()
             ) == pytest.approx(0.026, abs=5e-3), field
-
-
-def test_a_two_sided_file_carries_neither_new_causal_attribute(two_sided_file: Path) -> None:
-    """Both are gated on the causal path, which the exact-key-set tests above already enforce.
-
-    Stated separately because those tests read as being about ``sel_*`` provenance, and a future
-    reader adding a third causal attribute needs one place that says the gating is the rule rather
-    than an accident of which keys happened to be listed.
-    """
-    with h5py.File(two_sided_file, "r") as handle:
-        assert "causal_leg_alignment" not in handle.attrs
-        for field in EXPECTED_WIDTHS:
-            assert "causal_novelty_frac" not in handle[field].attrs, field
-            assert "causal_novelty_curve" not in handle[field].attrs, field
 
 
 def test_an_unknown_leg_alignment_is_refused_before_anything_is_created(

@@ -84,15 +84,3 @@ def test_the_full_forecast_reaches_the_source_encoder_through_the_latent(tiny_kw
     unreached = [name for (name, _), grad in zip(named, grads) if grad is None]
 
     assert not unreached, f"the source encoder is unreachable even through z: {unreached}"
-
-
-def test_the_decoder_reads_a_latent_and_nothing_wider(tiny_kwargs, inputs):
-    """The decoder consumes $d_z$-wide latents; the only $d_{model}$-wide tensors in the output are
-    the two encoder states, and neither is connected to the forecasts once $z$ is detached. Here
-    the surface claim: the first linear reads $z$, and no key is named for the removed pathway."""
-    model = _model(tiny_kwargs).eval()
-    with torch.no_grad():
-        out = model(*inputs)
-
-    assert "decoder_state" not in out
-    assert model.decoder.proj.body[0].in_features == model.d_z

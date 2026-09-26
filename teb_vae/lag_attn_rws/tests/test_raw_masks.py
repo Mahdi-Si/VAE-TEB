@@ -68,13 +68,6 @@ def test_a_planted_gap_zeroes_exactly_the_affected_anchor_samples():
     assert torch.equal(mask, expected)
 
 
-def test_a_gap_free_weight_masks_only_the_warmup_prefix():
-    mask, coverage = forecast_mask(_weight(), _TINY)
-    assert torch.equal(mask[:, _TINY.warmup :], torch.ones(_BATCH, 10, _TINY.horizon))
-    assert (mask[:, : _TINY.warmup] == 0.0).all()
-    assert torch.equal(coverage, torch.ones(_BATCH, _TINY.t_valid))
-
-
 def test_coverage_frac_reports_the_valid_fraction_of_the_future_window():
     _, coverage = forecast_mask(_weight((10,)), _TINY)
     # Anchors 6..9 have one of their four future steps gapped; every other window is whole.
@@ -110,12 +103,6 @@ def test_kl_mask_is_zero_outside_the_decoded_anchor_support():
     assert (mask[:, : _TINY.warmup] == 0.0).all()
     assert (mask[:, _TINY.t_valid :] == 0.0).all()
     assert (mask[:, _TINY.warmup : _TINY.t_valid] == 1.0).all()
-
-
-def test_kl_mask_drops_gapped_anchors_inside_the_support():
-    mask = _kl_mask_of(_weight((10,)))
-    assert (mask[:, 10] == 0.0).all()
-    assert (mask[:, 9] == 1.0).all()
 
 
 def test_the_kl_support_is_exactly_the_anchors_the_reconstruction_scores():

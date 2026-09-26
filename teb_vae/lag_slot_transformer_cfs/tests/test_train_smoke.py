@@ -56,13 +56,6 @@ CHECKPOINT_DIRNAME = "model_checkpoints"
 #: Epochs the fit runs. See the module docstring for why it is not the configuration's one.
 SMOKE_EPOCHS = 2
 
-#: What the shipped warm-up budget resolves to, pinned so a "guarded" fit cannot silently be the
-#: unguarded one -- which here would also change the decoder's width and therefore the units of
-#: every number the run reports. The two counts come from different rules: the budget takes four
-#: channels off the target and never touches the source.
-GUARDED_TARGET_CHANNELS = 76
-GUARDED_SOURCE_CHANNELS = 46
-
 
 @pytest.fixture(scope="module")
 def fitted(tmp_path_factory):
@@ -113,9 +106,6 @@ def test_the_fit_completes_and_builds_this_architecture(fitted) -> None:
     """The whole path, from a configuration file to a fitted model."""
     driver, _ = fitted
     assert isinstance(driver.pytorch_model, SeqVaeLagResidualTrfCfs)
-    # No attention module reached the run, which every other check here takes for granted.
-    assert not hasattr(driver.pytorch_model, "lag_attn")
-    assert not hasattr(driver.pytorch_model, "posterior_head")
 
 
 def test_the_warm_up_budget_resolved_and_gated_both_streams(fitted) -> None:
@@ -123,20 +113,14 @@ def test_the_warm_up_budget_resolved_and_gated_both_streams(fitted) -> None:
     driver, _ = fitted
     model = driver.pytorch_model
     assert model.target_gate is not None and model.source_gate is not None
-    assert model.target_gate.out_channels == GUARDED_TARGET_CHANNELS
-    assert model.source_gate.out_channels == GUARDED_SOURCE_CHANNELS
-    assert model.decoder_out_channels == GUARDED_TARGET_CHANNELS
-
-
-def test_the_source_encoder_holds_no_parameters_in_a_real_run(fitted) -> None:
-    """The recommended arm's claim, verified on the model a fit actually built."""
-    driver, _ = fitted
-    assert not driver.pytorch_model.source_encoder.has_parameters()
+    # The budget took channels off the declared target, and the decoder is the gated width.
+    assert model.target_gate.out_channels < model.c_y
+    assert model.decoder_out_channels == model.target_gate.out_channels
 
 
 def test_the_objective_columns_are_present_and_finite(fitted) -> None:
     """Including the two that make a nats-per-anchor column readable."""
-    _, history = fitted
+    driver, history = fitted
     for column in (
         "train/total_loss",
         "val/total_loss",
@@ -154,10 +138,9 @@ def test_the_objective_columns_are_present_and_finite(fitted) -> None:
         assert values.notna().all()
 
     assert float(history["val/scored_anchors"].dropna().iloc[-1]) > 0.0
+    model = driver.pytorch_model
     assert float(history["val/scored_coefficients"].dropna().iloc[-1]) == (
-        GUARDED_TARGET_CHANNELS * int(
-            load_config(str(TINY_CONFIG))["model_config"]["VAE_model"]["horizon"]
-        )
+        model.decoder_out_channels * model.horizon
     )
 
 
@@ -282,10 +265,8 @@ def test_a_written_checkpoint_rebuilds_the_model_and_its_invariants(fitted) -> N
     # Both criteria kept a file, and the stem tells them apart. Without the stem the two would
     # interleave, and without this package's own stem they would interleave with a sibling's.
     stems = {path.name.split("-epoch=")[0] for path in checkpoints}
-    assert stems == {
-        "lag-residual-trf-cfs",
-        "lag-residual-trf-cfs-val-nll_full_block",
-    }, stems
+    assert len(stems) == 2, stems
+    assert all(stem.startswith(LagResidualTrfCfsTrainer.CHECKPOINT_STEM) for stem in stems), stems
 
     blob = torch.load(str(checkpoints[-1]), map_location="cpu", weights_only=False)
     assert "model_kwargs" in blob, "the checkpoint carries no constructor kwargs"

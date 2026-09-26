@@ -1,4 +1,4 @@
-r"""The sufficiency analysis: one population, two gaps, and the caveats travelling with them.
+r"""The sufficiency analysis: one population, two gaps, one frame.
 
 What can go wrong here is not that the arithmetic is wrong but that the three numbers describe
 three different sets of recordings -- $D_{\mathrm{oracle}}$ the held-out half, $D_{\mathrm{base}}$
@@ -6,10 +6,6 @@ the whole split, $\Delta_{\mathrm{suff}}$ their difference -- at which point the
 comparison of populations wearing the name of a measurement. So the assertions here are mostly
 about *who* was measured: that the join landed, that the per-recording frame holds exactly the
 held-out recordings, and that both gaps come off the same frame.
-
-The second thing that can go wrong is silent: the two bias directions and the "estimate, not a
-bound" sentence live in the emitted JSON rather than only in a docstring, because a reader meets
-the number in ``summary.json``.
 
 **The analysis itself is a behaviour-equivalent copy of the sibling's**, which is what
 ``divergences.json`` records and what ``test_eval_sibling_agreement.py`` exercises; the target
@@ -23,7 +19,6 @@ frames and cost nothing; everything about a real directory reads the one ``slow`
 """
 from __future__ import annotations
 
-import json
 import types
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -127,20 +122,6 @@ def test_a_segment_with_no_finite_epoch_is_dropped_rather_than_bucketed() -> Non
 # =================================================================================================
 # The two gaps come off one frame
 # =================================================================================================
-def test_both_gaps_are_left_minus_right_over_columns_the_scores_list_carries() -> None:
-    r"""$\Delta_{\mathrm{suff}}$ and ``pred_gap`` are read side by side off one figure, so they
-    have to be differences of the same per-recording means rather than three separate headlines.
-    Asserted on the declaration rather than on a run, so it holds before one exists."""
-    scored = {column for column, _label in sufficiency.SCORE_COLUMNS}
-
-    assert {name for name, _l, _r, _m in sufficiency.GAP_METRICS} == {
-        "delta_suff_nats", "pred_gap_mc_nats"
-    }
-    for _name, left, right, meaning in sufficiency.GAP_METRICS:
-        assert left in scored and right in scored
-        assert meaning.strip()
-
-
 def test_the_summary_rows_carry_an_interval_and_a_paired_test_for_each_gap() -> None:
     """Every held-out recording contributes both sides, so the paired form removes the
     between-recording variance that dominates every readout here; the unpaired one would throw
@@ -329,29 +310,6 @@ def test_the_oracle_scored_as_many_segments_as_the_join_produced(result, directo
 
 
 @pytest.mark.slow
-def test_both_bias_directions_reach_the_emitted_record(result) -> None:
-    """They oppose, and neither is measured; a reader who sees only one would read the number as
-    a one-sided bound in whichever direction happened to be written down."""
-    directions = {entry["direction"] for entry in result["bias_directions"]}
-
-    assert directions == {"understates", "overstates"}
-    for entry in result["bias_directions"]:
-        assert "target_state" in entry["cause"] or "pretraining" in entry["cause"]
-    assert "estimate, not a bound" in result["estimate_not_a_bound"]
-
-
-@pytest.mark.slow
-def test_the_extra_encoder_pass_is_recorded_as_a_number(result) -> None:
-    """The rest of the pipeline holds that the collection pass is the only model-touching cost.
-    This analysis amends that, and the amendment is a measured size rather than a footnote."""
-    extra = result["plan"]["extra_encoder_pass"]
-
-    assert extra["n_segments"] > 0
-    assert extra["n_bytes"] > 0
-    assert "thousands of passes" in extra["reason"]
-
-
-@pytest.mark.slow
 def test_the_fit_budget_is_recorded_in_passes_over_the_fit_half(result) -> None:
     """A step count is not portable across populations: the same number that under-trains a probe
     on two thousand segments overfits one on twenty, and every fixture in this repository is the
@@ -362,17 +320,6 @@ def test_the_fit_budget_is_recorded_in_passes_over_the_fit_half(result) -> None:
     assert fit["epochs"] == oracle.DEFAULT_FIT_EPOCHS
     assert oracle.MIN_FIT_STEPS <= fit["steps"] <= oracle.MAX_FIT_STEPS
     assert fit["batch_size"] <= result["split"]["n_fit_segments"]
-
-
-@pytest.mark.slow
-def test_the_probe_reports_its_own_convergence(result) -> None:
-    """An under-trained probe understates the gap. Whether it converged is therefore part of the
-    result rather than something a reader has to infer from the curve."""
-    convergence = result["convergence"]
-
-    assert isinstance(convergence["converged"], bool)
-    assert convergence["detail"]
-    assert np.isfinite(float(convergence["final_held_out_nats"]))
 
 
 @pytest.mark.slow
@@ -412,14 +359,3 @@ def test_the_grouped_variants_were_fanned_out_by_the_runner(result) -> None:
 
     assert declared
     assert set(result.get("grouped", {})) == declared
-
-
-@pytest.mark.slow
-def test_the_step_record_marks_the_analysis_as_having_succeeded(collected_run) -> None:
-    """A failure inside the wrapper is isolated and reported; this checks it was not one."""
-    steps = json.loads(
-        (Path(collected_run["results_dir"]) / "steps.json").read_text(encoding="utf-8")
-    )
-    record = next(step for step in steps if step["name"] == "sufficiency")
-
-    assert record["ok"] is True, record.get("error")

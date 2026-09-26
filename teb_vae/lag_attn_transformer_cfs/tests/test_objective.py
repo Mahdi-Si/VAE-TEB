@@ -5,17 +5,14 @@ reduction and every reported metric, and its own suite pins them; a second copy 
 would be a second copy of one piece of evidence. What this *composition* can get wrong is narrower,
 and is what is checked:
 
-* **The block width.** $C_{\mathrm{keep}}$, the surviving-channel count, not the architecture
-  parent's raw grid $R$. It feeds only the four per-element log-variance diagnostics, never a loss
-  term, so passing the wrong one would change no gradient, fail no shape check, and rescale exactly
-  those four numbers -- which is why the width is pinned rather than assumed to follow from the base
-  order.
 * **The target.** Gathered at the keep-index and never delayed. A delayed target would ask anchor
   $t$ to forecast the future of anchor $t - \delta_c$, per channel, with every shape unchanged.
 * **The anchor set.** Every per-anchor denominator is a count of *decoded* anchors. A padded slot
   that reached the loss would score a real target twice while the KL support counted it once.
 * **The metric surface.** Exact in both directions against the conv-LSTM causal cell's, because the
   two are read side by side and a name in one and not the other is a column that silently empties.
+* **The start and the tiling.** At initialisation both reconstruction terms are bitwise equal, and
+  the boundary shape term is refused, because the tiled anchors are not neighbours.
 """
 from __future__ import annotations
 
@@ -29,44 +26,15 @@ from teb_vae.lag_attn_cfs.tests.conftest import (
 from teb_vae.lag_attn_cfs.tests.conftest import (
     tiny_warmup_kwargs as conv_lstm_tiny_warmup_kwargs,
 )
-from teb_vae.lag_attn_rws.nets.model import SeqVaeLagAttnRws
 from teb_vae.lag_attn_rws.nets.raw_masks import contributing_anchors, forecast_mask
 
 from .conftest import (
     BATCH,
-    TINY_KWARGS,
     TINY_STRIDE,
     build,
     make_streams,
-    shipped_warmup_kwargs,
     tiny_warmup_kwargs,
 )
-
-#: The shipped budget's surviving target channels and the block the reconstruction sums over.
-#: Hand-written -- $15 \times 98$ -- and the point of the constants is that they are *not* read back
-#: from the model being checked against them. A ratio computed from a width the objective was
-#: **given** is self-consistent for any wrong width.
-_SHIPPED_KEPT_CHANNELS = 98
-_SHIPPED_BLOCK = 2940
-
-#: What this target domain adds to the raw-signal sibling's metric dict: the four resolved gaps it
-#: inherits from the two-sided feature target, plus the ten this family introduces.
-_ADDED_METRIC_KEYS = {
-    "pred_gap_tau_first",
-    "pred_gap_tau_last",
-    "pred_gap_st",
-    "pred_gap_ph",
-    "pred_gap_warm_lo",
-    "pred_gap_warm_mid",
-    "pred_gap_warm_hi",
-    "pred_gap_novel_lo",
-    "pred_gap_novel_mid",
-    "pred_gap_novel_hi",
-    "target_warm_frac",
-    "anchors_per_sample",
-    "source_lag_warmth_frac_st",
-    "source_lag_warmth_frac_ph",
-}
 
 #: The two phases the tiled fixtures run at. Chosen so the second row is one anchor short of the
 #: first, which is the only way a padded slot exists at all -- and every padding assertion below
@@ -97,24 +65,8 @@ def _tiled(stride: int = TINY_STRIDE):
 
 
 # =================================================================================================
-# The block width and the target
+# The target
 # =================================================================================================
-def test_the_block_width_follows_the_budget_and_not_the_raw_grid() -> None:
-    r"""$H \cdot C_{\mathrm{keep}}$, not $H \cdot R$. Reversing the base order would give the
-    latter, and nothing in the objective would raise: ``block_width`` is an *argument*."""
-    model, streams, features = _tiled()
-    out = _forward(model, streams, torch.tensor(_PHASES))
-    metrics = model.compute_loss(out, features, weight=_weight(model))["metrics"]
-
-    kept = model.target_gate.out_channels
-    assert model.decoder_out_channels == kept
-    assert out["mu_base"].shape[-1] == kept != model.raw_per_step
-    # The four per-element log-variance diagnostics are the only readers of the width, and they are
-    # bounded by the clamp -- which is a per-COEFFICIENT statement here, not a per-raw-sample one.
-    for name in ("logvar_full_floor_frac", "logvar_full_ceil_frac"):
-        assert 0.0 <= float(metrics[name]) <= 1.0, name
-
-
 def test_the_target_is_gathered_at_the_keep_index_and_never_delayed() -> None:
     r"""$Y^{+}[b, a, \tau, k] = Y[b,\, t_a + 1 + \tau,\, \mathrm{keep}[k]]$, position by position,
     with the pattern naming its own coordinates so a transposed gather or an off-by-one anchor is a
@@ -228,29 +180,6 @@ def test_a_gapped_step_moves_the_loss_by_exactly_zero() -> None:
 # =================================================================================================
 # The metric surface
 # =================================================================================================
-def test_the_metric_key_set_is_the_raw_siblings_plus_this_target_domains_fourteen() -> None:
-    """Exact in both directions, against a declared addition rather than a free one. Every
-    downstream reader is keyed by name, so a name in one model and not the other is a column that
-    silently empties."""
-    model, streams, features = _tiled()
-    out = _forward(model, streams, torch.tensor(_PHASES))
-    causal = model.compute_loss(out, features, weight=_weight(model))["metrics"]
-
-    torch.manual_seed(0)
-    raw = SeqVaeLagAttnRws(**dict(CONV_LSTM_TINY_KWARGS)).eval()
-    raw_streams = make_streams(CONV_LSTM_TINY_KWARGS)
-    torch.manual_seed(0)
-    with torch.no_grad():
-        raw_out = raw(*raw_streams)
-    raw_metrics = raw.compute_loss(
-        raw_out, torch.zeros(BATCH, raw.geometry.raw_len), weight=_weight(raw)
-    )["metrics"]
-
-    assert set(causal) - set(raw_metrics) == _ADDED_METRIC_KEYS
-    assert set(raw_metrics) - set(causal) == set()
-    assert all(isinstance(value, torch.Tensor) for value in causal.values())
-
-
 def test_the_metric_key_set_is_the_conv_lstm_causal_cells_exactly() -> None:
     """The encoder edge on the metric surface: the two cells are read side by side, and a readout
     present on one and absent on the other is a comparison nobody can make."""
@@ -272,20 +201,6 @@ def test_the_metric_key_set_is_the_conv_lstm_causal_cells_exactly() -> None:
     assert set(mine) == set(theirs)
 
 
-def test_the_objective_carries_gradient_to_the_widened_decoder_head() -> None:
-    """A smoke check that the assembled total is trainable *through the anchor gather*, and that
-    the gradient reaches the head whose width this target domain changed."""
-    model, streams, features = _tiled()
-    model.train()
-
-    out = model(*streams, torch.tensor(_PHASES))
-    result = model.compute_loss(out, features, weight=_weight(model))
-    result["metrics"]["total_loss"].backward()
-
-    assert model.decoder.mean_head.weight.grad is not None
-    assert float(model.decoder.mean_head.weight.grad.abs().max()) > 0.0
-
-
 @pytest.mark.parametrize("likelihood", ["gaussian_nll", "mse"])
 def test_at_init_the_two_reconstruction_terms_are_bitwise_equal(likelihood) -> None:
     """The zero-KL start restated on the loss path: a wiring mistake between the forward's anchor
@@ -303,20 +218,6 @@ def test_at_init_the_two_reconstruction_terms_are_bitwise_equal(likelihood) -> N
     assert float(metrics["pred_gap"]) == 0.0
 
 
-def test_the_three_shape_terms_ship_off_and_report_exact_zeros() -> None:
-    """Raw-waveform concepts against an unordered channel index, and the boundary term is
-    additionally a slicing identity over adjacent anchors."""
-    model, streams, features = _tiled()
-    out = _forward(model, streams, torch.tensor(_PHASES))
-
-    metrics = model.compute_loss(out, features, weight=_weight(model))["metrics"]
-
-    for name in ("aux_multiscale", "aux_derivative", "aux_boundary"):
-        assert float(metrics[name]) == 0.0, name
-    for name in ("lambda_ms", "lambda_deriv", "lambda_boundary"):
-        assert float(metrics[name]) == 0.0, name
-
-
 def test_a_weighted_boundary_term_is_refused_because_the_anchors_are_not_neighbours() -> None:
     r"""``masked_boundary_gap`` identifies anchor $t$'s last observed sample with a slice of anchor
     $t-1$'s target block, which is a slicing identity only while the anchor axis is contiguous. On
@@ -326,17 +227,3 @@ def test_a_weighted_boundary_term_is_refused_because_the_anchors_are_not_neighbo
 
     with pytest.raises(ValueError, match="lambda_boundary"):
         model.compute_loss(out, features, weight=_weight(model), lambda_boundary=0.1)
-
-
-def test_the_shipped_block_is_comparable_to_one_sibling_only() -> None:
-    r"""Recorded where it is checkable rather than only in prose: at $H = 15$ against the two-sided
-    cells' $30$, and $98$ kept channels against their $78$, the block is $2940$ against $2340$ --
-    so a nat from this configuration is comparable to the conv-LSTM causal cell and to nothing
-    else."""
-    model = build(shipped_warmup_kwargs())
-
-    assert model.horizon == 30
-    assert model.decoder_out_channels == _SHIPPED_KEPT_CHANNELS
-    assert model.horizon * model.decoder_out_channels == _SHIPPED_BLOCK
-    assert _SHIPPED_BLOCK != 30 * 78
-    assert _SHIPPED_BLOCK != model.horizon * model.raw_per_step

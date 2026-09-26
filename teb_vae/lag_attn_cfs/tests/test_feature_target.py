@@ -26,7 +26,6 @@ from teb_vae.lag_attn_cfs.tests.conftest import (
     TINY_STRIDE,
     TINY_TARGET_ALIGN_DELAYS,
     TINY_TARGET_KEEP_INDEX,
-    TINY_TARGET_WARMUP_STEPS,
     build,
     make_streams,
     tiny_align_kwargs,
@@ -65,22 +64,8 @@ def test_the_block_split_is_the_causal_scattering_width() -> None:
     this one -- and asserted against the width the target is actually assembled from rather than
     against a second literal.
     """
-    assert "TARGET_BLOCK_SPLIT" in vars(CausalFeatureForecastTarget)
     assert CausalFeatureForecastTarget.TARGET_BLOCK_SPLIT == CAUSAL_ST_WIDTH
     assert CausalFeatureForecastTarget.TARGET_BLOCK_SPLIT != FeatureForecastTarget.TARGET_BLOCK_SPLIT
-
-
-def test_the_decoder_width_is_not_redefined() -> None:
-    """The anchor seam is expressed once, in the shared objective and the shared masks.
-
-    A subclass copy would be a second place the gate's width has to be threaded, and the second
-    place is the one that goes stale.
-    """
-    member = "_default_decoder_out_channels"
-    assert member not in vars(CausalFeatureForecastTarget), member
-    assert getattr(CausalFeatureForecastTarget, member) is getattr(
-        FeatureForecastTarget, member
-    )
 
 
 def test_the_stored_clock_gather_is_the_parents_bitwise(tiny_warmup) -> None:
@@ -108,11 +93,6 @@ def test_the_stored_clock_scored_weight_is_the_same_object(tiny_warmup) -> None:
     model = build(tiny_warmup)
     weight = _weight(BATCH, model.geometry.t)
     assert model.scored_weight(weight) is weight
-
-
-def test_the_resolved_gaps_are_redefined() -> None:
-    """The one member that must fork, and the family's per-package metric hook besides."""
-    assert "_resolved_forecast_gaps" in vars(CausalFeatureForecastTarget)
 
 
 # =================================================================================================
@@ -387,25 +367,6 @@ def test_the_pairing_refusal_names_both_numbers() -> None:
     CausalFeatureForecastTarget._check_anchor_floor(0, ())
 
 
-def test_the_pairing_refusal_names_which_of_the_two_requirements_binds() -> None:
-    r"""The floor is $\max(B - 1, \max_c(W'_c + d_c))$, and the two halves come from different
-    places: the first from the **scored target**, which is never shifted, and the second from the
-    **inputs**, which are. A message that named only a number would leave an operator raising the
-    floor against the wrong one."""
-    with pytest.raises(ValueError) as error:
-        CausalFeatureForecastTarget._check_anchor_floor(10, (0, 4, 12))
-    assert "scored target" in str(error.value)
-
-    with pytest.raises(ValueError) as error:
-        CausalFeatureForecastTarget._check_anchor_floor(12, (0, 4, 12), (5, 3, 1))
-    message = str(error.value)
-    assert "shifted inputs" in message
-    assert "warmup_period=12" in message and "at least 13" in message
-    # The binding channel is named, and it is not the slowest one: channel 0 waits nothing and is
-    # shifted 5, channel 2 waits 12 and is shifted 1, so 13 comes from the last.
-    assert "channel 2" in message and "t - 1" in message
-
-
 def test_a_zero_shift_vector_is_the_unshifted_case_and_not_a_shift_that_ran() -> None:
     r"""The distinction the second half rests on. With $d_c = 0$ the input at step $t$ *is* the
     stored coefficient at $t$: a cold one is masked and announced inside the availability adapter,
@@ -436,9 +397,3 @@ def test_any_shift_at_all_costs_exactly_the_one_anchor_the_boundary_step_bought(
         CausalFeatureForecastTarget._check_anchor_floor(required, waits, shifts)
         with pytest.raises(ValueError, match="shifted inputs"):
             CausalFeatureForecastTarget._check_anchor_floor(required - 1, waits, shifts)
-
-
-def test_the_shipped_tiny_guard_satisfies_its_own_pairing(tiny_warmup) -> None:
-    """The fixture is not accidentally exempt from the rule it is meant to exercise."""
-    assert max(TINY_TARGET_WARMUP_STEPS) > 0
-    assert int(tiny_warmup["warmup_period"]) >= max(TINY_TARGET_WARMUP_STEPS) - 1

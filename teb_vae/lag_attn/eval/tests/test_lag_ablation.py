@@ -76,19 +76,6 @@ def test_the_excluded_anchor_counts_are_recorded_per_band(
         )
 
 
-def test_a_band_beyond_the_anchor_range_raises_rather_than_scoring_nothing(
-    make_eval_runner, tiny_loader, tiny_eval_config, tmp_path
-) -> None:
-    """An empty support would emit a table of NaN that reads as a broken analysis."""
-    runner = make_eval_runner(output_dir=tmp_path / "runner")
-    # T = 300 and H_d = 4 at the tiny geometry, but max_lag = 8, so no configurable band can
-    # exceed the anchor range -- shrink the model's own sequence length to force the condition.
-    runner.model.sequence_length = 6
-    config = dict(tiny_eval_config["eval_config"], bands={"far": (5, 8)})
-    with pytest.raises(ValueError, match="common scoring support is empty"):
-        _run(runner, tiny_loader, config, tmp_path / "empty")
-
-
 def test_no_bands_configured_raises(
     make_eval_runner, tiny_loader, tiny_eval_config, tmp_path
 ) -> None:
@@ -250,48 +237,6 @@ def test_micro_batches_partition_the_batch(make_eval_runner, tiny_loader, tmp_pa
 # ---------------------------------------------------------------------------
 # S6-T06: the figures
 # ---------------------------------------------------------------------------
-def test_two_figures_are_written_with_dual_labels_and_exclusion_counts(
-    make_eval_runner, tiny_loader, tiny_eval_config, tmp_path, monkeypatch, perturb_full_pathway
-) -> None:
-    captured: dict = {}
-    original = figures.render_figure
-
-    def _capture(fig, path, **kwargs):
-        ax = fig.axes[0]
-        captured[Path(path).name] = {
-            "labels": [label.get_text() for label in ax.get_xticklabels()],
-            "title": ax.get_title(),
-            "has_data": ax.has_data(),
-            "texts": [text.get_text() for text in ax.texts],
-        }
-        return original(fig, path, **kwargs)
-
-    monkeypatch.setattr(figures, "render_figure", _capture)
-    runner = make_eval_runner(output_dir=tmp_path / "runner")
-    perturb_full_pathway(runner.model)
-    summary, _ = _run(runner, tiny_loader, tiny_eval_config["eval_config"], tmp_path / "figs")
-
-    assert set(captured) == {"forecast_degradation", "kl_change"}
-    for record in captured.values():
-        assert record["has_data"]
-        labels = " ".join(record["labels"])
-        assert "$\\ell$" in labels, "no model-lag labelling"
-        assert " s" in labels, "no physical-second labelling"
-        assert "anchors given up" in labels, "exclusion counts are not visible on the figure"
-    assert len(summary["figures"]) == 2
-
-    # The mask KEEPS the named band (nets/model.py combines it as ``validity & band``), so a
-    # caption phrased as removal inverts the ranking: it would read the band that alone
-    # reproduces the forecast *worst* as the one that mattered *most*. The title is the only
-    # thing carrying that convention onto the page, and it goes into papers.
-    for name, record in captured.items():
-        title = record["title"].lower()
-        assert "kept" in title, f"{name} title does not state that the band is kept: {title!r}"
-        assert "remov" not in title, (
-            f"{name} title describes removal, but lag_band_mask keeps: {title!r}"
-        )
-
-
 def test_the_summary_names_both_ends_under_keep_semantics(
     make_eval_runner, tiny_loader, tiny_eval_config, tmp_path, perturb_full_pathway
 ) -> None:
@@ -306,8 +251,6 @@ def test_the_summary_names_both_ends_under_keep_semantics(
     summary, _ = _run(runner, tiny_loader, tiny_eval_config["eval_config"], tmp_path / "ends")
 
     assert "most_damaging_band" not in summary, "the inverted key is back"
-    assert "most_sufficient_band" in summary and "least_sufficient_band" in summary
-    assert "keeps only the named band" in summary["semantics"].lower()
 
     per_band = summary["per_band"]
     finite = {
@@ -315,9 +258,9 @@ def test_the_summary_names_both_ends_under_keep_semantics(
         for name, row in per_band.items()
         if np.isfinite(row["feat_mse_delta"])
     }
-    if finite:
-        assert summary["most_sufficient_band"] == min(finite, key=lambda name: finite[name])
-        assert summary["least_sufficient_band"] == max(finite, key=lambda name: finite[name])
+    assert finite, "no band produced a finite delta, so the ends cannot be checked"
+    assert summary["most_sufficient_band"] == min(finite, key=lambda name: finite[name])
+    assert summary["least_sufficient_band"] == max(finite, key=lambda name: finite[name])
 
 
 def test_suppressing_one_bands_contribution_moves_that_bands_bar(

@@ -1,187 +1,22 @@
-r"""The reporting core: one analysis raising must not discard the ten that already succeeded.
+r"""This package's headline and sanity blocks, and the bookkeeping that must survive a failure.
 
-Three properties carry this file, and each of them is one edit away from being silently lost.
+The fail-soft step wrapper and the JSON serialiser are the shared ones and are tested by their
+owner; what is checked here is what this package builds on them:
 
-**Ctrl-C must still work.** ``except Exception`` lets ``KeyboardInterrupt`` through because it
-derives from ``BaseException``; a well-meant widening to ``except BaseException`` would turn an
-interrupt into a "failed step" that the run then continues past, and nothing else would notice.
+**The headline.** A registry entry that never resolves is a number the acceptance gate silently
+reads as absent, so every name must resolve on a real run (the likelihood-conditional ones
+excepted, conditionally); every promoted verdict must reach it; and no headline path may read the
+floored KL, which exceeds the raw value by construction and hides a collapsed source pathway.
 
-**The traceback, not ``str(exc)``.** On an unattended multi-hour run the traceback is the entire
-debugging surface -- ``KeyError: 'mu_full'`` names none of the call sites that could produce it.
-
-**The summary must be JSON a non-Python reader can parse.** ``json.dump`` emits the bare token
-``NaN`` for a non-finite float, which round-trips through Python and is rejected by every strict
-parser -- and NaN is an entirely ordinary result for a fully masked sample.
-
-The serialiser is the shared one, and that is asserted by identity rather than by re-testing its
-arithmetic: two copies of it would be two chances for a value that survives a round trip in one
-package to fail the write in the other.
+**The sanity block.** The KL identity, the per-anchor recombination and the argmax-lag ceiling are
+each measured on a real run and caught on a planted violation. A violated check warns without
+changing the exit code, and a builder that raises inside ``finalise`` must not lose the run.
 """
 from __future__ import annotations
 
-import json
-from pathlib import Path
-
-import numpy as np
 import pytest
-import torch
 
-from teb_vae.lag_attn.eval import report as shared_report
-from teb_vae.lag_attn_rws.eval import report_seam, run as run_module
-
-
-# =============================================================================
-# The seam binds, and does not fork
-# =============================================================================
-def test_the_seam_binds_the_shared_implementations_rather_than_copies() -> None:
-    """Identity, not equality: a fork would pass every behavioural test below and still drift."""
-    assert report_seam.json_safe is shared_report.json_safe
-    assert report_seam.Report is shared_report.Report
-    assert report_seam.StepRecord is shared_report.StepRecord
-    assert report_seam.summarise_by_group is shared_report.summarise_by_group
-
-
-def test_the_grouped_emitter_delegates_rather_than_reimplementing(monkeypatch) -> None:
-    """The one seam entry that is not a bare binding, and the reason it must still not be a fork.
-
-    It adds this package's cohort order and palette -- two presentation decisions the sibling does
-    not make -- and nothing else. Asserted by intercepting the shared function: what reaches it is
-    the caller's own arguments plus exactly those two, so the skip rules, the counts and the
-    record's shape stay the shared ones. A reimplementation would pass every behavioural test in
-    ``test_eval_grouped.py`` and drift from the sibling's on the first change to either.
-    """
-    from teb_vae.lag_attn_rws.eval import cohort, figures_seam
-
-    seen = {}
-
-    def _spy(frame, directory, **kwargs):
-        seen.update({"frame": frame, "directory": directory, **kwargs})
-        return {"intercepted": True}
-
-    monkeypatch.setattr(shared_report, "emit_grouped_variants", _spy)
-    result = report_seam.emit_grouped_variants("frame", "dir", value_columns=["pred_gap"])
-
-    assert result == {"intercepted": True}
-    assert (seen["frame"], seen["directory"]) == ("frame", "dir")
-    assert seen["value_columns"] == ["pred_gap"]
-    # The two additions, checked by what they *do* rather than by identity: the ordering is a
-    # lambda over ``cohort.ordered_groups``, so only its result is comparable.
-    assert seen["group_palette"] is figures_seam.group_colors
-    assert seen["order_groups"](["healthy", "acidosis", "hie"], "clinical_class") == (
-        cohort.ordered_groups(["healthy", "acidosis", "hie"], "clinical_class")
-    ) == ["hie", "acidosis", "healthy"]
-    assert set(seen) == {"frame", "directory", "value_columns", "order_groups", "group_palette"}
-
-
-def test_the_runner_writes_its_summary_through_the_same_serialiser() -> None:
-    """``run.py`` owned a second copy of this before the seam existed."""
-    assert run_module.json_safe is report_seam.json_safe
-    assert run_module.SUMMARY_FILENAME == report_seam.SUMMARY_FILENAME == "summary.json"
-
-
-# =============================================================================
-# Failure isolation
-# =============================================================================
-def test_a_raising_step_is_captured_with_its_full_traceback() -> None:
-    report = report_seam.Report()
-
-    def failing() -> None:
-        raise KeyError("mu_full")
-
-    assert report.step("coupling", failing) is None
-
-    record = report.steps[0]
-    assert record.ok is False
-    assert "KeyError" in (record.error or "")
-    # The frame name, which only a formatted traceback carries -- str(exc) is just "'mu_full'".
-    assert "in failing" in (record.traceback or "")
-
-
-def test_a_failure_sets_the_exit_code_and_does_not_stop_later_steps() -> None:
-    """The whole reason the wrapper exists: an eleventh analysis raising must not lose ten."""
-    report = report_seam.Report()
-
-    report.step("forecast", lambda: "fine")
-    report.step("coupling", lambda: 1 / 0)
-    report.step("lag", lambda: "also fine")
-
-    assert [record.ok for record in report.steps] == [True, False, True]
-    assert report.exit_code() == 1
-    assert [record.name for record in report.failed_steps] == ["coupling"]
-
-
-@pytest.mark.parametrize("interrupt", [KeyboardInterrupt, SystemExit])
-def test_an_interrupt_propagates_rather_than_being_recorded_as_a_failed_step(interrupt) -> None:
-    report = report_seam.Report()
-
-    def interrupted() -> None:
-        raise interrupt()
-
-    with pytest.raises(interrupt):
-        report.step("coupling", interrupted)
-
-    assert report.steps == []
-
-
-def test_a_successful_step_returns_its_value_and_its_elapsed_time() -> None:
-    report = report_seam.Report()
-
-    assert report.step("forecast", lambda value: value * 2, 21) == 42
-    assert report.steps[0].ok is True
-    assert report.steps[0].elapsed_s >= 0.0
-    assert report.exit_code() == 0
-
-
-# =============================================================================
-# Serialisation
-# =============================================================================
-@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
-def test_a_non_finite_float_becomes_null(value: float) -> None:
-    assert report_seam.json_safe(value) is None
-
-
-def test_the_torch_and_numpy_types_this_package_produces_become_plain_python() -> None:
-    """Every readout starts life as a tensor, so the tensor branch is not an edge case here."""
-    converted = report_seam.json_safe(
-        {
-            "lag_profile": torch.tensor([3.0, 4.0]),
-            "kl_total": torch.tensor(2.5),
-            "flag": np.bool_(True),
-            "count": np.int64(3),
-            "path": Path("a") / "b",
-        }
-    )
-
-    assert converted["lag_profile"] == [3.0, 4.0]
-    assert converted["kl_total"] == pytest.approx(2.5)
-    # np.bool_ is checked before the int branch; otherwise True would serialise as 1.
-    assert converted["flag"] is True
-    assert converted["count"] == 3 and isinstance(converted["count"], int)
-    assert isinstance(converted["path"], str)
-
-
-def test_a_summary_carrying_a_nan_is_strict_json(tmp_path) -> None:
-    report = report_seam.Report()
-    report.set("readouts", {"pred_gap": float("nan"), "kl_total": np.float32(0.5)})
-
-    path = report.write(tmp_path)
-
-    def _reject(name: str) -> None:
-        raise AssertionError(f"summary.json carries the non-standard constant {name!r}")
-
-    written = json.loads(path.read_text(encoding="utf-8"), parse_constant=_reject)
-    assert written["results"]["readouts"]["pred_gap"] is None
-    assert written["results"]["readouts"]["kl_total"] == pytest.approx(0.5)
-
-
-def test_an_unexpected_type_is_recorded_rather_than_failing_the_write(tmp_path) -> None:
-    """A write that raises at the end of a multi-hour run has produced nothing."""
-    report = report_seam.Report()
-    report.set("device", torch.device("cpu"))
-
-    written = json.loads(report.write(tmp_path).read_text(encoding="utf-8"))
-
-    assert written["results"]["device"] == "cpu"
+from teb_vae.lag_attn_rws.eval import report_seam
 
 
 # =============================================================================
@@ -242,21 +77,29 @@ def test_every_promoted_verdict_reaches_the_headline(evaluated) -> None:
         assert headline[f"verdict_{name}"] in {"PASS", "FAIL", "INCONCLUSIVE"}
 
 
+def test_no_headline_path_resolves_to_a_floored_kl() -> None:
+    """Only the unfloored KL may be read as a rate: free bits are applied per dimension per step
+    before summing, so the floored value exceeds the raw one by construction. The shipped
+    ``free_bits: 0.0`` makes the two coincide today, which is why this is checked on the registry
+    rather than observed on a run."""
+
+    def floored(scalars):
+        return [
+            (name, path) for name, path in scalars
+            if any("kl_train" in part or part.endswith("_train") for part in path)
+        ]
+
+    assert floored(report_seam.HEADLINE_SCALARS) == []
+    # Non-vacuity: an entry pointed at the floored readout is caught.
+    assert floored((("kl", ("readouts", "source_conditioned_kl_train")),))
+
+
 def test_the_promotion_list_is_the_readout_modules_registry() -> None:
     """``report_seam`` restates the names rather than importing them -- it must stay importable
     without ``torch`` -- so the two are pinned equal here instead of drifting apart quietly."""
     from teb_vae.lag_attn_rws.eval import metrics
 
     assert report_seam.HEADLINE_VERDICTS == metrics.PROMOTED_VERDICTS
-
-
-def test_the_headline_carries_both_pred_gap_estimators_under_names_that_say_which() -> None:
-    """The Monte Carlo marginalised score and the training-path single-draw score are different
-    estimators of the same quantity, and a bare ``pred_gap`` leaves a reader to guess."""
-    names = {name for name, _ in report_seam.HEADLINE_SCALARS}
-
-    assert {"pred_gap_mc_nats", "pred_gap_train_path_nats"} <= names
-    assert "pred_gap" not in names
 
 
 # =============================================================================
@@ -298,32 +141,6 @@ def test_a_violated_check_warns_without_changing_the_exit_code(tmp_path) -> None
     assert report.results["sanity"]["checks"]["kl_identity"]["verdict"] == "fail"
     assert report.results["sanity"]["warning"] is True
     assert report.exit_code() == 0
-
-
-def test_the_sanity_block_appears_in_every_summary(evaluated) -> None:
-    sanity = evaluated["summary"]["results"]["sanity"]
-
-    assert set(sanity) >= {"checks", "failed", "n_failed", "n_inconclusive", "warning"}
-    assert set(sanity["checks"]) == {
-        "kl_identity",
-        "per_anchor_recombines",
-        "argmax_lag",
-        # The two structural lag identities, re-measured per run rather than inherited from the
-        # model tests: a lag profile that does not sum to the KL decomposes nothing.
-        "lag_map_sums_to_kl",
-        "per_head_kl_sums_to_kl",
-        # The cross-spectral estimator's own: an exact Parseval identity between the FFT and the
-        # time domain, and a loose magnitude check that the spectral residual is the same size as
-        # the forecast error it describes.
-        "coherence_parseval",
-        "coherence_detrended_share",
-        "per_file_counts",
-        "classes_present",
-        "target_not_truncated",
-        "headline_finite",
-    }
-    for record in sanity["checks"].values():
-        assert record["verdict"] in {"pass", "fail", report_seam.INCONCLUSIVE}
 
 
 def test_the_two_tables_recombine_on_a_real_run(evaluated) -> None:

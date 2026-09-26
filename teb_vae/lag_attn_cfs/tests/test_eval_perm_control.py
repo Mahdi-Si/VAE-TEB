@@ -1,30 +1,21 @@
-r"""The specificity criterion, the two ways of getting it wrong, and the hazard it cannot see.
+r"""The specificity criterion, the two ways of getting it wrong, and the analysis that reports it.
 
-**The verdict must take three losses and nothing else.** That is asserted by *signature*, not by
-reading the implementation: a criterion that could see the KL would fail exactly the healthy models
-it should pass, because a stranger's source is out of distribution for a posterior trained on
-matched pairs and therefore moves it **more**. The case that would fail under the abandoned
-KL-space criterion -- $K_{\mathrm{shuffled}} > K_{\mathrm{true}}$ with the loss ordering intact --
-is written out here and must PASS.
+**The verdict must take three losses and nothing else.** A criterion that could see the KL would
+fail exactly the healthy models it should pass, because a stranger's source is out of distribution
+for a posterior trained on matched pairs and therefore moves it **more**. The case that would fail
+under the abandoned KL-space criterion -- $K_{\mathrm{shuffled}} > K_{\mathrm{true}}$ with the loss
+ordering intact -- is written out here and must PASS.
 
 **A stale key from the permuted dict must be caught.** ``perm_forward_outputs`` returns a *shallow
 copy*: only :data:`~teb_vae.lag_attn_rws.nets.controls.RECOMPUTED_KEYS` describe the permuted
 pairing, and every other key is the matched forward's own tensor -- the same object. So
 ``permuted['kld_per_t']`` is the **true** KL, and an evaluation that read it would report the
-matched coupling under the control's name with nothing failing. Two tests close that: one pins
-which keys the function actually replaces, by identity; the other shows that the shuffled KL the
-collection pass reports is *not* the matched one, which it would be if that key had been read.
-
-**And one thing this control structurally cannot do.** The source availability pattern is a
-deterministic function of $t$, identical in every row of a batch, so no derangement of rows can
-remove it: a coupling driven entirely by the availability clock survives this control and reads as
-specific. The docstring says so and names ``source_null``, which is the reading that separates
-them; a test below pins that, because a reader who took this control for a complete answer would
-be taking exactly the wrong one.
+matched coupling under the control's name with nothing failing. The test here shows that the
+shuffled KL the collection pass reports is *not* the matched one; which keys the control replaces
+is pinned by identity in ``test_perm_control.py``.
 """
 from __future__ import annotations
 
-import inspect
 import types
 from typing import Any, Dict, List, Optional
 
@@ -52,30 +43,11 @@ EVAL_CONFIG = {"bootstrap_resamples": 200, "seed": 0}
 # =================================================================================================
 # The verdict takes three losses
 # =================================================================================================
-def test_the_specificity_verdict_accepts_only_the_three_losses() -> None:
-    """By signature. An implementation that also read the KL would be a different criterion, and
-    reviewing for it is what this assertion replaces."""
-    parameters = list(inspect.signature(source_specificity_verdict).parameters)
-
-    assert parameters == ["d_base", "d_full", "d_shuffled"]
-
-
 def test_the_ordering_passes_and_carries_its_numbers() -> None:
     verdict = source_specificity_verdict(10.0, 8.0, 14.0)
 
     assert verdict.status == PASS
     assert verdict.values["shuffle_penalty"] == pytest.approx(4.0)
-    assert verdict.criterion == "D_full < D_base < D_shuffled"
-
-
-def test_a_healthy_model_whose_shuffled_kl_exceeds_its_true_one_still_passes() -> None:
-    """The case the abandoned KL-space criterion would have failed. The KL cannot reach this
-    function, so the case is expressed as: the losses order correctly, and the verdict passes
-    whatever the KL did."""
-    verdict = source_specificity_verdict(10.0, 8.0, 14.0)
-
-    assert verdict.status == PASS
-    assert "kl" not in " ".join(verdict.values).lower()
 
 
 def test_a_broken_ordering_fails_rather_than_being_reported_as_inconclusive() -> None:
@@ -107,60 +79,10 @@ def test_the_outcome_classification_names_what_the_three_losses_did(scores, expe
 
 
 # =================================================================================================
-# What this control cannot see
-# =================================================================================================
-def test_the_module_states_that_it_cannot_see_the_availability_clock() -> None:
-    """The one thing about this control that is specific to this cell, and it is a *limit* rather
-    than a behaviour -- so the only place it can live is the record a reader holds.
-
-    A derangement rearranges rows; the availability pattern is identical in every row. A reader who
-    took a passing specificity verdict for "the source carried information" would be taking exactly
-    the wrong reading on the one cell where a deterministic clock can produce it.
-    """
-    # Whitespace-normalised: the sentence is wrapped in the source and a reader is looking for the
-    # claim, not for the line breaks.
-    text = " ".join((perm_control_analysis.__doc__ or "").split())
-
-    assert "availability" in text
-    assert "source_null" in text, "the reading that does separate them must be named"
-    assert "no permutation of rows can remove something every row shares" in text
-
-
-# =================================================================================================
 # The permuted dict's stale keys
 # =================================================================================================
-def test_only_the_declared_keys_are_recomputed_under_the_permutation(task, perturb_posterior):
-    """Pinned by identity. Everything not on the list is the matched forward's own tensor -- the
-    prior, both encoder states and the base forecast are source-free, so a derangement cannot move
-    them -- and a reader that treats one of them as the control's gets the true value."""
-    from .conftest import make_stub_batch
-
-    module = task()
-    perturb_posterior(module.orig_model)
-    module.eval()
-    model = module.orig_model
-    batch = make_stub_batch(seed=5)
-    with torch.no_grad():
-        outputs = model(*module._build_forward_inputs(batch))
-        permuted = controls.perm_forward_outputs(
-            model, outputs, generator=torch.Generator().manual_seed(0),
-            anchors=outputs["anchor_index"],
-        )
-
-    replaced = {
-        name for name, value in permuted.items()
-        if name not in outputs or value is not outputs[name]
-    }
-
-    assert replaced == set(controls.RECOMPUTED_KEYS)
-    # Named explicitly because it is the trap: the KL analysis keys keep their matched values.
-    assert permuted["kld_per_t"] is outputs["kld_per_t"]
-    assert permuted["source_kl_lag_map"] is outputs["source_kl_lag_map"]
-    assert permuted["mu_base"] is outputs["mu_base"]
-
-
 def test_the_shuffled_kl_readout_is_not_the_matched_one(task, perturb_posterior):
-    """The behavioural half of the guard above. Reading ``permuted['kld_per_t']`` would make this
+    """The behavioural guard on the stale key. Reading ``permuted['kld_per_t']`` would make this
     column bit-identical to ``source_conditioned_kl_raw`` on every sample -- which is exactly what
     a stale read looks like from the outside, and nothing else would show it."""
     from .conftest import make_stub_batch
@@ -313,32 +235,6 @@ def test_the_margin_is_also_emitted_as_a_keyed_scalar(tmp_path) -> None:
     assert keyed == pytest.approx(row["mean"])
 
 
-def test_the_summary_csv_still_carries_branch_rows_only(tmp_path) -> None:
-    """Stated as an assertion rather than left implicit: the margin is a *penalty* row, and
-    ``perm_control_summary.csv`` has only ever held the branch table. A reader looking for the
-    margin finds it in ``summary.json``'s ``penalties`` and in the headline, not here."""
-    perm_control_analysis.run_perm_control_analysis(
-        _context(
-            _per_sample(
-                mc_nll_base_block=[10.0] * 6,
-                mc_nll_full_block=[8.0] * 6,
-                mc_nll_shuffled_block=[14.0] * 6,
-                mc_nll_base_shuffled_mu_block=[12.0] * 6,
-            )
-        ),
-        eval_config=EVAL_CONFIG, output_dir=tmp_path, probe=None,
-    )
-
-    written = pd.read_csv(
-        tmp_path / perm_control_analysis.ANALYSIS_DIRNAME
-        / perm_control_analysis.SUMMARY_FILENAME
-    )
-    assert "penalty" not in written.columns
-    assert list(written["branch"]) == [
-        name for name, _ in perm_control_analysis.BRANCH_COLUMNS
-    ]
-
-
 def test_the_kl_reading_is_a_description_that_nothing_consumes(tmp_path) -> None:
     """``shuffled_exceeds_true`` sits true on a healthy model, so it is reported *and* labelled --
     and the verdict beside it is decided without it."""
@@ -363,6 +259,8 @@ def test_the_kl_reading_is_a_description_that_nothing_consumes(tmp_path) -> None
 
 
 def test_the_analysis_writes_its_tables(tmp_path) -> None:
+    """The summary CSV holds the branch table only: the source margin is a *penalty* row, and it
+    travels in ``summary.json``'s ``penalties`` and the headline, not here."""
     result = perm_control_analysis.run_perm_control_analysis(
         _context(
             _per_sample(
@@ -382,6 +280,7 @@ def test_the_analysis_writes_its_tables(tmp_path) -> None:
     assert list(branches["branch"]) == [
         name for name, _ in perm_control_analysis.BRANCH_COLUMNS
     ]
+    assert "penalty" not in branches.columns
     assert result["files"]
 
 

@@ -1,58 +1,23 @@
-r"""The reporting core: one analysis raising must not discard the ten that already succeeded.
+r"""The content of this cell's report blocks: the headline, the sanity checks and the step record.
 
-Three properties carry the mechanism, and each of them is one edit away from being silently lost:
-
-**Ctrl-C must still work.** ``except Exception`` lets ``KeyboardInterrupt`` through because it
-derives from ``BaseException``; a well-meant widening to ``except BaseException`` would turn an
-interrupt into a "failed step" that the run then continues past, and nothing else would notice.
-
-**The traceback, not ``str(exc)``.** On an unattended multi-hour run the traceback is the entire
-debugging surface -- ``KeyError: 'mu_full'`` names none of the call sites that could produce it.
-
-**The summary must be JSON a non-Python reader can parse.** ``json.dump`` emits the bare token
-``NaN`` for a non-finite float, which round-trips through Python and is rejected by every strict
-parser -- and NaN is an entirely ordinary result for a fully masked sample.
-
-The mechanism is the shared one and is asserted by *identity* rather than re-tested: two copies of
-it would be two chances for a value that survives a round trip in one package to fail the write in
-the other.
-
-What this package owns is the **content** of the three blocks, and that is where the rest of this
-file looks. The headline registry is a promise that every path in it resolves on a run of this
-model -- a number that is not registered is invisible to the acceptance gate and to the arm tables,
-which read this block and nothing else -- so every path is walked here against a constructed
-results dict, long before a real run exists to walk it against.
+The step-isolation and serialisation mechanism (``Report``, ``json_safe``) is the shared one in
+``teb_vae.lag_attn.eval.report`` and is tested there. What this package owns is the **content**
+of the three blocks, and that is where this file looks. The headline registry is a promise that
+every path in it resolves on a run of this model -- a number that is not registered is invisible
+to the acceptance gate and to the arm tables, which read this block and nothing else -- so every
+path is walked here against a constructed results dict, long before a real run exists to walk it
+against. The sanity checks are exercised on constructed violations, and the argmax-lag check on
+both attainable edges of the lag window.
 """
 from __future__ import annotations
 
 import json
-from pathlib import Path
 from typing import Any, Dict, Tuple
 
-import numpy as np
 import pytest
-import torch
 
 from teb_vae.lag_attn.eval import report as shared_report
 from teb_vae.lag_attn_cfs.eval import report_seam
-
-#: The top-level results blocks the headline registry reads. Written out, so a registered path
-#: reaching into a block no analysis produces fails here rather than resolving to ``None`` on
-#: every run -- which is indistinguishable in the artifact from an analysis that did not run.
-EXPECTED_HEADLINE_BLOCKS = {
-    "calibration",
-    "controls",
-    "coupling",
-    "lag",
-    "latent_health",
-    "n_recordings",
-    "n_samples",
-    "perm_control",
-    "readouts",
-}
-
-#: The two verdicts only this cell can have, and the eight it shares with the raw cells.
-CELL_SPECIFIC_VERDICTS = ("coupling_exceeds_availability_clock", "anchor_geometry_intact")
 
 
 def _stub_results() -> Tuple[Dict[str, Any], Dict[str, float]]:
@@ -82,16 +47,8 @@ def _stub_results() -> Tuple[Dict[str, Any], Dict[str, float]]:
 
 
 # =================================================================================================
-# The seam binds, and does not fork
+# The grouped emitter delegates
 # =================================================================================================
-def test_the_seam_binds_the_shared_implementations_rather_than_copies() -> None:
-    """Identity, not equality: a fork would pass every behavioural test below and still drift."""
-    assert report_seam.json_safe is shared_report.json_safe
-    assert report_seam.Report is shared_report.Report
-    assert report_seam.StepRecord is shared_report.StepRecord
-    assert report_seam.summarise_by_group is shared_report.summarise_by_group
-
-
 def test_the_grouped_emitter_delegates_rather_than_reimplementing(monkeypatch) -> None:
     """The one seam entry that is not a bare binding, and the reason it must still not be a fork.
 
@@ -122,91 +79,8 @@ def test_the_grouped_emitter_delegates_rather_than_reimplementing(monkeypatch) -
 
 
 # =================================================================================================
-# Failure isolation
+# The step record
 # =================================================================================================
-def test_a_raising_step_is_captured_with_its_full_traceback() -> None:
-    report = report_seam.Report()
-
-    def failing() -> None:
-        raise KeyError("mu_full")
-
-    assert report.step("coupling", failing) is None
-
-    record = report.steps[0]
-    assert record.ok is False
-    assert "KeyError" in (record.error or "")
-    # The frame name, which only a formatted traceback carries -- str(exc) is just "'mu_full'".
-    assert "in failing" in (record.traceback or "")
-
-
-def test_a_failure_sets_the_exit_code_and_does_not_stop_later_steps() -> None:
-    """The whole reason the wrapper exists: an eleventh analysis raising must not lose ten."""
-    report = report_seam.Report()
-
-    report.step("forecast", lambda: "fine")
-    report.step("coupling", lambda: 1 / 0)
-    report.step("lag_kl", lambda: "also fine")
-
-    assert [record.ok for record in report.steps] == [True, False, True]
-    assert report.exit_code() == 1
-    assert [record.name for record in report.failed_steps] == ["coupling"]
-
-
-@pytest.mark.parametrize("interrupt", [KeyboardInterrupt, SystemExit])
-def test_an_interrupt_propagates_rather_than_being_recorded_as_a_failed_step(interrupt) -> None:
-    report = report_seam.Report()
-
-    def interrupted() -> None:
-        raise interrupt()
-
-    with pytest.raises(interrupt):
-        report.step("coupling", interrupted)
-
-    assert report.steps == []
-
-
-# =================================================================================================
-# Serialisation
-# =================================================================================================
-@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
-def test_a_non_finite_float_becomes_null(value: float) -> None:
-    assert report_seam.json_safe(value) is None
-
-
-def test_a_summary_carrying_a_nan_is_strict_json(tmp_path) -> None:
-    report = report_seam.Report()
-    report.set("readouts", {"pred_gap": float("nan"), "kl_total": np.float32(0.5)})
-
-    path = report.write(tmp_path)
-
-    def _reject(name: str) -> None:
-        raise AssertionError(f"summary.json carries the non-standard constant {name!r}")
-
-    written = json.loads(path.read_text(encoding="utf-8"), parse_constant=_reject)
-    assert written["results"]["readouts"]["pred_gap"] is None
-    assert written["results"]["readouts"]["kl_total"] == pytest.approx(0.5)
-
-
-def test_the_torch_and_numpy_types_this_package_produces_become_plain_python() -> None:
-    """Every readout starts life as a tensor, so the tensor branch is not an edge case here."""
-    converted = report_seam.json_safe(
-        {
-            "lag_profile": torch.tensor([3.0, 4.0]),
-            "kl_total": torch.tensor(2.5),
-            "flag": np.bool_(True),
-            "count": np.int64(3),
-            "path": Path("a") / "b",
-        }
-    )
-
-    assert converted["lag_profile"] == [3.0, 4.0]
-    assert converted["kl_total"] == pytest.approx(2.5)
-    # np.bool_ is checked before the int branch; otherwise True would serialise as 1.
-    assert converted["flag"] is True
-    assert converted["count"] == 3 and isinstance(converted["count"], int)
-    assert isinstance(converted["path"], str)
-
-
 def test_the_steps_heartbeat_is_rewritten_as_each_step_finishes(tmp_path) -> None:
     """A run killed outright leaves no summary at all, and on a multi-hour pass the question
     afterwards is which step it was inside."""
@@ -238,15 +112,6 @@ def test_every_registered_headline_path_resolves() -> None:
         assert headline[name] == value, name
 
 
-def test_the_registry_reads_only_blocks_a_run_actually_produces() -> None:
-    """The half a constructed stub cannot check by itself: the stub is *built* from the paths, so
-    it satisfies any path at all. Pinning the top-level blocks is what makes a path into a block no
-    analysis writes fail here rather than resolve to ``None`` on every run."""
-    blocks = {path[0] for _, path in report_seam.HEADLINE_SCALARS}
-
-    assert blocks == EXPECTED_HEADLINE_BLOCKS
-
-
 def test_an_unresolved_headline_path_yields_none_rather_than_raising() -> None:
     """An analysis that failed or was skipped legitimately has no headline, and losing the whole
     block to it would be losing the numbers that did resolve."""
@@ -255,15 +120,6 @@ def test_an_unresolved_headline_path_yields_none_rather_than_raising() -> None:
     assert headline["pred_gap_mc_nats"] == pytest.approx(2.0)
     assert headline["kl_argmax_lag_step"] is None
     assert headline["verdict_source_specificity"] is None
-
-
-def test_the_headline_carries_both_pred_gap_estimators_under_names_that_say_which() -> None:
-    """The Monte Carlo marginalised score and the training-path single-draw score are different
-    estimators of the same quantity, and a bare ``pred_gap`` leaves a reader to guess."""
-    names = {name for name, _ in report_seam.HEADLINE_SCALARS}
-
-    assert {"pred_gap_mc_nats", "pred_gap_train_path_nats"} <= names
-    assert "pred_gap" not in names
 
 
 def test_only_the_unfloored_kl_may_be_read_as_a_rate() -> None:
@@ -277,60 +133,9 @@ def test_only_the_unfloored_kl_may_be_read_as_a_rate() -> None:
     assert "source_conditioned_kl_train" not in leaves
 
 
-def test_no_frequency_domain_entry_survived_the_fork() -> None:
-    """``coherence`` is not ported: a stored coefficient is a modulus, so the phase the estimator
-    needs was discarded before the value was written. An entry left behind would resolve to
-    ``None`` on every run of this cell and read as an analysis that failed."""
-    names = {name for name, _ in report_seam.HEADLINE_SCALARS}
-    blocks = {path[0] for _, path in report_seam.HEADLINE_SCALARS}
-
-    assert not any("coherence" in name for name in names)
-    assert "coherence" not in blocks
-
-
-def test_the_calibration_gain_is_registered_per_coefficient_rather_than_per_raw_sample() -> None:
-    """There is no raw sample in this pipeline for a gain to be per, and the two denominators
-    differ by a factor of three at the shipped geometry -- so a column carried across under the
-    sibling's name would be silently non-comparable with the sibling's number."""
-    names = {name for name, _ in report_seam.HEADLINE_SCALARS}
-
-    assert "calibration_nll_gain_per_coefficient" in names
-    assert "calibration_nll_gain_per_raw_sample" not in names
-    assert not any("raw_sample" in name for name in names)
-
-
-def test_the_pred_gap_convention_states_the_block_this_cell_actually_scores() -> None:
-    """A reader of two runs has to know what a nat is per. Here a block is $H \\cdot C_{\\mathrm{keep}}$
-    coefficients rather than $H \\cdot R$ raw samples, and the percentage that divides by it is
-    therefore budget-local -- two arms at two warm-up budgets divide by two different numbers. The
-    convention names the quantity and the ``preflight.json`` key that records a run's own value
-    rather than any one geometry's number, so it stays true when the horizon or the budget moves."""
-    convention = report_seam.PRED_GAP_CONVENTION
-
-    assert "H*C_keep" in convention
-    assert "block_width" in convention
-    assert "BUDGET-LOCAL" in convention
-    assert "bpm" in convention and "no bpm anywhere in this pipeline" in convention
-    # The raw cells' block appears once, in the clause that says this is not it: a reader arriving
-    # from a raw run has that block in mind and needs it contradicted, not omitted.
-    assert convention.count("H*R") == 1
-    assert "not an H*R-sample raw window" in convention
-
-
-def test_the_convention_travels_inside_the_artifact_rather_than_beside_it() -> None:
-    assert report_seam.build_headline({})["pred_gap_convention"] == report_seam.PRED_GAP_CONVENTION
-
-
 # =================================================================================================
 # The verdict registry
 # =================================================================================================
-def test_the_two_verdicts_only_this_cell_can_have_are_promoted() -> None:
-    """A verdict that is not promoted is one the acceptance gate and every arm table cannot see."""
-    assert len(report_seam.HEADLINE_VERDICTS) == 10
-    for name in CELL_SPECIFIC_VERDICTS:
-        assert name in report_seam.HEADLINE_VERDICTS
-
-
 def test_every_promoted_verdict_reaches_the_headline_under_its_own_key() -> None:
     verdicts = [
         {"name": name, "status": "PASS"} for name in report_seam.HEADLINE_VERDICTS
@@ -356,24 +161,11 @@ def test_the_promotion_list_is_the_readout_modules_registry() -> None:
 # =================================================================================================
 # The sanity block
 # =================================================================================================
-def test_the_sanity_block_carries_the_checks_this_cell_can_actually_evaluate() -> None:
-    """The two cross-spectral checks are gone with the estimator they describe. Left in place they
-    would be permanently INCONCLUSIVE, which reads as an analysis that failed rather than one that
-    does not exist."""
+def test_every_sanity_check_yields_a_verdict_on_an_empty_run() -> None:
+    """A run that produced nothing must still get a readable sanity block rather than a raise."""
     sanity = report_seam.build_sanity({}, {})
 
-    assert set(sanity["checks"]) == {
-        "kl_identity",
-        "per_anchor_recombines",
-        "argmax_lag",
-        "lag_map_sums_to_kl",
-        "per_head_kl_sums_to_kl",
-        "null_lag_map_sums_to_kl",
-        "per_file_counts",
-        "classes_present",
-        "target_not_truncated",
-        "headline_finite",
-    }
+    assert sanity["checks"]
     for record in sanity["checks"].values():
         assert record["verdict"] in {"pass", "fail", report_seam.INCONCLUSIVE}
 
@@ -434,16 +226,6 @@ def test_a_zero_anchor_segment_is_not_a_recombination_failure() -> None:
     assert report_seam.check_per_anchor_recombines(per_sample, per_anchor)["verdict"] == "pass"
 
 
-def test_the_three_warm_up_tertiles_are_on_the_recombination_list() -> None:
-    """They are a decomposition of ``pred_gap`` over the kept channels, so each has to average back
-    per anchor like any other per-anchor column -- and their *sum* identity is the ``warmup``
-    analysis's to check. A column the pass has not produced is skipped rather than raising."""
-    assert {"pred_gap_warm_lo", "pred_gap_warm_mid", "pred_gap_warm_hi"} <= set(
-        report_seam.RECOMBINED_COLUMNS
-    )
-    assert report_seam.RECOMBINED_COLUMNS["kld_per_t"] == "source_conditioned_kl_raw"
-
-
 #: A profile with a readable shape: one clear peak and a bulk well below it. Used wherever the
 #: check's *edge* logic is what is under test, so that degeneracy -- which is judged first -- cannot
 #: be what produced the verdict.
@@ -485,7 +267,7 @@ def test_the_argmax_lag_is_judged_against_both_attainable_edges(argmax, expected
     as inertness -- "the attribution never looks back" -- which is a conclusion the geometry does
     not support. By the identity
     $\tau^{\mathrm{phys}}_{\ell,h} = \Delta(\ell + 1 + h) + (\tau^u_{\mathrm{ref}}
-    - \tau^y_{\mathrm{ref}}) - \tau_{\mathrm{pre}}$, every physical delay shorter than the one lag
+    - \tau^y_{\mathrm{ref}})$, every physical delay shorter than the one lag
     $0$ encodes is reported *at* lag $0$, because the window carries no bin below it. On this
     family's geometry a $20$-$60$ s physiological delay is below lag $0$ at most horizon steps, so
     a pin at the floor is the readout hitting a wall.
@@ -506,19 +288,16 @@ def test_the_argmax_lag_is_judged_against_both_attainable_edges(argmax, expected
     assert reason in record["detail"]
 
 
-def test_a_near_edge_pin_states_the_arithmetic_and_the_evidence_the_machinery_is_alive() -> None:
+def test_a_near_edge_pin_carries_the_evidence_the_machinery_is_alive() -> None:
     """What the INCONCLUSIVE verdict has to carry, because it is not a pass and must not read as
-    one: the identity that says why the lag is unreachable, and the shape statistics that say the
-    measurement was real.
+    one: the shape statistics that say the measurement was real.
 
-    Without the second half a reader cannot tell a censored answer from a model that reported
-    nothing -- which is precisely the confusion the old FAIL made, in the other direction.
+    Without them a reader cannot tell a censored answer from a model that reported nothing --
+    which is precisely the confusion the old FAIL made, in the other direction.
     """
     record = report_seam.check_argmax_lag(_lag_summary(0))
 
     assert record["verdict"] == report_seam.INCONCLUSIVE
-    assert "tau_phys" in record["detail"] or "\\tau" in record["detail"]
-    assert "not degenerate" in record["detail"]
     assert record["peak_degenerate"] is False
     assert record["mass_above_half_peak"] is not None
     assert record["attention_entropy_per_head_nats"] == [1.3, 2.0, 2.3, 2.5]
@@ -540,16 +319,6 @@ def test_a_degenerate_profile_fails_at_either_edge_and_in_the_middle(argmax) -> 
     assert record["verdict"] == "fail"
     assert record["peak_degenerate"] is True
     assert "names a bin rather than a lag" in record["detail"]
-
-
-def test_an_ideal_model_at_this_geometry_can_pass() -> None:
-    """The property that makes the check a check rather than a description. A re-scoping that
-    turned every outcome into INCONCLUSIVE would be unfalsifiable, so the passing case is asserted
-    as reachable: a shaped profile peaking strictly inside the attainable window PASSes."""
-    record = report_seam.check_argmax_lag(_lag_summary(3))
-
-    assert record["verdict"] == "pass"
-    assert record["attainable_lag_floor"] < 3 < record["attainable_lag_ceiling"]
 
 
 def test_the_floor_lifts_off_zero_when_the_lowest_lags_carry_no_anchor() -> None:

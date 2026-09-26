@@ -324,9 +324,9 @@ checkout rather than an archaeology exercise.
 | `teb_vae/lag_attn_cfs/tests/test_nets_are_framework_free.py` | the same two strings | yes |
 | `teb_vae/lag_attn_transformer_cfs/tests/test_nets_are_framework_free.py` | the same two strings | yes |
 
-Every "inert" claim in the last column is a tested one: each file's own cross-product assertion walks
-ten package names rather than eight, so both new names are asserted present rather than merely added,
-and the seven files pass with unchanged counts before and after the registration. No shipped source
+Every "inert" claim in the last column rests on the first row's reason: each added string only widens
+the forbidden dotted-prefix set and imports nothing, and the seven files pass with unchanged counts
+before and after the registration. No shipped source
 module moved: `scripts/print_objective_metrics.py` prints every objective metric of the four shipped
 forecasters in about a minute, and its output is byte-identical to the fingerprint recorded before
 this package existed. Every other member this package needed from a sibling is **bound by reference**
@@ -436,10 +436,8 @@ instead. It was +17,792 at the feature cells' reference, which is the same expre
 Every parameter the guard moves here is under an adapter — nothing in this target domain widens a
 head.
 
-`DESIGN.md` §13 carries the same table; `tests/test_docs.py` measures every total in both documents
-by constructing the models rather than comparing against literals, so a change to a shared component
-re-costs the tables instead of failing an unrelated assertion. `tests/conftest.py` resolves this
-row's own $42.21$ s reference, so the totals above are the ones that suite measures and pins.
+`DESIGN.md` §13 carries the same table, measured on constructed models at this row's own $42.21$ s
+reference.
 
 ## The loss-scale constants — measured
 

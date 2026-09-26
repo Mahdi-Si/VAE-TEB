@@ -2,10 +2,7 @@
 
 What a run of `teb_vae.lag_attn_transformer_rws.eval` is, what it leaves behind, what each
 analysis means, and how the output is misread. `FIGURE_GUIDE.md` beside this file documents every
-emitted PDF; this document is everything that is not a figure. Both are bound to the code by test:
-every registered analysis has a heading here, every resolved `eval_config` key is mentioned here,
-every way a run can be refused has a recovery row here, and every figure in the committed
-`figure_manifest.json` has a guide entry.
+emitted PDF; this document is everything that is not a figure.
 
 **This document stands alone, and the cost of that is stated rather than hidden.** Almost the whole
 pipeline is imported from `teb_vae/lag_attn_rws/eval`, whose own `EVAL.md` describes the same
@@ -218,7 +215,7 @@ raises (`True` would silently cap at 1), and a cap of `0` raises.
 | `min_active_dims` | Active latent dimensions below which the latent counts as collapsed. |
 | `event_lag_window_s` | Seconds after a detected contraction within which an anchor counts as event-conditioned. |
 | `bootstrap_resamples` | Resamples behind every bootstrap interval, drawn over recordings — never over anchors, whose windows overlap 29/30. |
-| `figure_format` | Image format every figure of the run is written in, as a matplotlib filetype (`pdf`, `svg`, `png`, `eps`, …); validated at config load against the installed matplotlib's own list. `null` — the shipped setting — keeps the `pdf` default, which is what `figure_manifest.json` and `FIGURE_GUIDE.md` record and what the smoke suite compares a real run against; a run that changes it writes filenames those files do not list. |
+| `figure_format` | Image format every figure of the run is written in, as a matplotlib filetype (`pdf`, `svg`, `png`, `eps`, …); validated at config load against the installed matplotlib's own list. `null` — the shipped setting — keeps the `pdf` default, which is what `figure_manifest.json` and `FIGURE_GUIDE.md` record; a run that changes it writes filenames those files do not list. |
 | `max_hours_before_delivery` | How far before delivery a segment may be recorded and still be evaluated, in hours; `4.0` keeps the last four hours, `null` — the shipped setting — evaluates everything. **The bound is on the population, not on an axis**: it is applied to the delivery clock before anything is binned, so every clock answers for the same segments and the second-stage clock re-bins that population on its own signed axis rather than being cut at a second, differently-defined four hours. It moves cohort sizes, window counts and every trajectory, so a bounded run is not comparable with an unbounded one — which is why it is a key, recorded in the run's dumped config. Minimum one 0.5 h bin. |
 
 **The committed delta sets the caps, so a stock run emits the complete artifact set.**
@@ -917,13 +914,10 @@ causal_reach_budget_s: null no channel is pruned and no delay is applied at all.
 labelled a transfer entropy.
 ```
 
-`tests/test_eval_naming.py` scans the whole artifact tree — plus this file and the figure guide — for the name
-the readout refuses, with that sentence removed first.
-
 **The encoder's causality disclosure is this model's own, and it is not the sibling's under another name.** The
 comparison model records `causal_norm` and `n_causalized_norms`, which describe a time-pooling `GroupNorm` on a
 history path. There is no such module here and no key that would turn one on: every normaliser on a history path
-is per-token, which `tests/test_construct.py` proves by enumerating the survivors. So the record says
+is per-token, which `tests/test_construct.py` proves by scanning both history paths. So the record says
 `time_pooling_normalisers: 0` with `time_pooling_normalisers_are_structural: true` and the test that proves it,
 and reports instead `n_depthwise_init`, the two block counts, the source window, and the structural source
 receptive field in steps and seconds beside the lag range with which is larger stated. A shared key that meant
@@ -1140,9 +1134,7 @@ simply belong to another run.
 
 ### Guard recovery table
 
-One row per way preflight refuses a run. Each refusal's own message names the fix; this is the index, and
-`tests/test_eval_docs.py` asserts every raise site in the **shared** `preflight.py` has a row — so a refusal added there
-is reported in both packages.
+One row per way preflight refuses a run. Each refusal's own message names the fix; this is the index.
 
 | Refusal begins | Cause | Recovery |
 |---|---|---|
@@ -1176,8 +1168,7 @@ From the repository root:
 
 Both are needed, and they cover different things. The fast gate holds the binding, the layering walk, the registry parity
 against the sibling, the encoder-attention equivalence and its arithmetic, the verify tables and the documentation
-bindings. The slow gate holds the one full pipeline run — which is what keeps `figure_manifest.json` equal to what a run
-actually emits, and therefore what makes the fast documentation gate mean anything.
+bindings. The slow gate holds the one full pipeline run.
 
 ## The first production checkpoint
 

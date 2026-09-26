@@ -11,11 +11,12 @@ working at a negative baseline.
 
 Every test below drives the breaker with the block ``configs/default.yaml`` actually ships
 (warm-up shortened to zero so the gate is active), so a config edit that regressed the
-behaviour fails here rather than on the production box.
+behaviour fails here rather than on the production box. The breaker's own mechanics -- the
+non-finite skip, the escape hatch, the zero-gradient skipped step -- are the framework's and are
+pinned in ``train/tests/test_spike_breaker.py`` and ``teb_vae/lag_attn/tests/test_spike_breaker.py``.
 """
 from __future__ import annotations
 
-import math
 from pathlib import Path
 
 import torch
@@ -125,38 +126,6 @@ def test_the_shipped_margin_catches_a_finite_blowup(task):
     assert float(metrics["main_loss"]) < 0.0, "the logged main_loss was replaced by the EMA"
 
 
-def test_a_non_finite_loss_still_skips(task):
-    """The guard that survives every threshold setting, because it consults none of them."""
-    module = task()
-    config = _shipped_breaker()
-    for value in (-800.0, -1200.0, -900.0):
-        _feed(module, value, config)
-
-    for bad in (float("nan"), float("inf")):
-        metrics, returned = _feed(module, bad, config)
-        assert _skipped(metrics)
-        assert torch.isfinite(returned)
-
-
-def test_max_consecutive_skips_releases_the_breaker_rather_than_deadlocking(task):
-    """After the cap, the next finite batch is force-accepted and the EMA hard re-seeded --
-    the escape from the frozen-EMA deadlock that once cost a v3 run ~160 epochs."""
-    module = task()
-    config = _shipped_breaker()
-    cap = int(config["max_consecutive_skips"])
-    for _ in range(5):
-        _feed(module, -500.0, config)  # settle a healthy negative EMA
-    spike = module._spike_ema_loss + 10.0 * float(config["additive_margin"])
-
-    skips = [_skipped(_feed(module, spike, config)[0]) for _ in range(cap + 2)]
-
-    assert module._spike_forced_accepts_total >= 1, "the escape hatch never fired"
-    assert not all(skips), "every batch skipped; the breaker deadlocked"
-    # The hard re-seed: after the forced accept the EMA sits at the new level, so the same
-    # value is no longer a spike.
-    assert not _skipped(_feed(module, spike, config)[0])
-
-
 def test_the_configured_comparison_metric_is_one_the_task_emits(
     task, stub_batch, perturb_posterior
 ):
@@ -169,38 +138,3 @@ def test_the_configured_comparison_metric_is_one_the_task_emits(
     _, metrics = module.compute_loss_and_metrics(stub_batch, 0, "train")
 
     assert config["comparison_metric"] in metrics
-
-
-def test_a_skipped_step_still_touches_every_parameter(task):
-    """The skip path is a zero-gradient step, not an absent one: the forward already armed
-    DDP's reducer, which expects one gradient hook per parameter. The breaker returns
-    ``torch.where`` over the REAL loss -- backward still traverses the full graph, so every
-    hook fires -- and ``on_after_backward`` zeroes the NaN that a poisoned graph pushes
-    through the zero incoming gradient."""
-    module = task()
-
-    # A non-finite loss whose autograd graph spans every trainable parameter, as the real
-    # loss does; a leaf NaN would prove nothing about the hooks.
-    real = torch.stack([p.sum() for p in module.parameters() if p.requires_grad]).sum()
-    poisoned = real * float("nan")
-    metrics = {"total_loss": poisoned.detach(), "main_loss": poisoned.detach()}
-    returned = module._apply_spike_breaker(poisoned, metrics, _shipped_breaker())
-    assert _skipped(metrics)
-
-    module.zero_grad(set_to_none=True)
-    returned.backward()
-    module.on_after_backward()
-
-    starved = [
-        name
-        for name, parameter in module.named_parameters()
-        if parameter.requires_grad and parameter.grad is None
-    ]
-    assert not starved, f"parameters left without a gradient hook on a skipped step: {starved}"
-    assert math.isfinite(float(returned))
-    poisoned_grads = [
-        name
-        for name, parameter in module.named_parameters()
-        if parameter.grad is not None and torch.count_nonzero(parameter.grad) > 0
-    ]
-    assert not poisoned_grads, f"non-zero gradients survived a skipped step: {poisoned_grads}"

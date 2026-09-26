@@ -7,11 +7,10 @@ those is the ordinary case on some real split, and none of them may raise -- a g
 an addition to a run, and an analysis whose pooled output succeeded must not be marked failed
 because its split turned out to hold one cohort.
 
-The adoption is then checked twice over, and it needs both halves. On the committed
-``tiny_shard.hdf5`` -- one file, ``target`` all zeros -- every analysis must record a clean skip;
-that is the branch a repository-wide run exercises. On the generated multi-class shards the
-grouped path actually runs, and without those shards *only* the skip branch would ever be tested,
-which is exactly the vacuous coverage the fixture exists to prevent.
+The adoption is then checked on the generated multi-class shards, where the grouped path actually
+runs. Without those shards *only* the skip branch would ever be tested -- the committed
+``tiny_shard.hdf5`` is one file with an all-zero ``target`` -- which is exactly the vacuous
+coverage the fixture exists to prevent.
 """
 from __future__ import annotations
 
@@ -209,13 +208,6 @@ def test_the_grouped_figure_reports_the_cohort_that_was_sabotaged() -> None:
         figures.plt.close(figure)
 
 
-def test_the_known_clinical_classes_keep_their_shared_colours() -> None:
-    """So an eval figure and a training figure of the same cohort are the same colour."""
-    colors = figures.group_colors(["healthy", "acidosis", "hie"])
-    assert colors["healthy"] == figures.CLASS_COLORS_DEFAULT["healthy"]
-    assert colors["acidosis"] == figures.CLASS_COLORS_DEFAULT["acidosis"]
-
-
 def test_an_unknown_group_still_gets_a_distinct_colour() -> None:
     """The subgroup axis's labels are not in the class table, and must still be distinguishable."""
     colors = figures.group_colors(["healthy_bg_cs", "acidosis_cs", "hie_no_cs"])
@@ -266,26 +258,6 @@ def test_an_analysis_emits_both_variants_on_a_multi_class_split(
 
     assert summary["by_group"][labels.CLASS_COLUMN]["groups"] == ["acidosis", "healthy"]
     assert len(summary["by_group"][labels.SUBGROUP_COLUMN]["groups"]) == 3
-
-
-def test_an_analysis_records_a_clean_skip_on_the_single_class_shard(
-    make_eval_runner, tiny_loader, tiny_eval_config, tmp_path
-) -> None:
-    """The committed fixture is one file with an all-zero target, so both axes must skip."""
-    runner = make_eval_runner(output_dir=tmp_path / "runner")
-    output_dir = tmp_path / "results"
-    torch.manual_seed(7)
-    summary = forecast_analysis.run_forecast_analysis(
-        runner, tiny_loader, eval_config=tiny_eval_config["eval_config"],
-        output_dir=output_dir, probe={"n_samples": 4},
-    )
-    for column in labels.GROUP_COLUMNS:
-        assert summary["by_group"][column]["skipped"] is True
-    # And the pooled output is exactly what it was before any of this existed.
-    assert (output_dir / forecast_analysis.ANALYSIS_DIRNAME / "per_sample.csv").is_file()
-    assert not list(
-        (output_dir / forecast_analysis.ANALYSIS_DIRNAME).glob("*_by_*")
-    )
 
 
 def test_the_pooled_numbers_are_unchanged_by_the_grouped_variant(

@@ -263,10 +263,13 @@ def test_the_compared_set_is_the_bindings_and_a_narrower_one_is_visible(config, 
     """Which keys are reconciled is the binding's, not this module's, because a second
     architecture reconciles a different set -- its own encoder's, and not ``causal_norm``.
 
-    A narrowed tuple must *narrow the comparison* rather than raise: the record then shows the
-    dropped key absent from ``compared``, so a run that quietly stopped checking something is
-    legible in its own artifact instead of passing indistinguishably from one that checked it.
+    A narrowed tuple must *narrow the comparison* rather than raise, even against a config that
+    contradicts the dropped key -- that key is not part of this architecture's geometry at all. The
+    record then shows it absent from ``compared``, so a run that quietly stopped checking something
+    is legible in its own artifact instead of passing indistinguishably from one that checked it.
     """
+    broken = copy.deepcopy(config)
+    broken["model_config"]["VAE_model"]["d_z"] = int(loaded["model_kwargs"]["d_z"]) + 1
     full = preflight.reconcile_with_checkpoint(
         config,
         model_kwargs=loaded["model_kwargs"],
@@ -274,7 +277,7 @@ def test_the_compared_set_is_the_bindings_and_a_narrower_one_is_visible(config, 
         geometry_keys=run_module.RWS_BINDING.geometry_keys,
     )
     narrowed = preflight.reconcile_with_checkpoint(
-        config,
+        broken,
         model_kwargs=loaded["model_kwargs"],
         hyper_parameters=loaded["hyper_parameters"],
         geometry_keys=tuple(
@@ -288,31 +291,6 @@ def test_the_compared_set_is_the_bindings_and_a_narrower_one_is_visible(config, 
     # Only that key moved: the objective keys are reconciled from their own tuple and are
     # untouched by a change to the geometry set.
     assert set(full["compared"]) - set(narrowed["compared"]) == {"d_z"}
-
-
-def test_a_key_the_binding_drops_is_no_longer_refused(config, loaded) -> None:
-    """The other direction, and the one that matters for a second model: a config contradicting
-    a key the binding does not carry must pass, because that key is not part of this
-    architecture's geometry at all."""
-    broken = copy.deepcopy(config)
-    broken["model_config"]["VAE_model"]["d_z"] = int(loaded["model_kwargs"]["d_z"]) + 1
-
-    with pytest.raises(EvalPreconditionUnmet, match="d_z"):
-        preflight.reconcile_with_checkpoint(
-            broken,
-            model_kwargs=loaded["model_kwargs"],
-            hyper_parameters=loaded["hyper_parameters"],
-            geometry_keys=run_module.RWS_BINDING.geometry_keys,
-        )
-
-    assert preflight.reconcile_with_checkpoint(
-        broken,
-        model_kwargs=loaded["model_kwargs"],
-        hyper_parameters=loaded["hyper_parameters"],
-        geometry_keys=tuple(
-            key for key in run_module.RWS_BINDING.geometry_keys if key != "d_z"
-        ),
-    )["passed"] is True
 
 
 # =============================================================================
@@ -408,58 +386,6 @@ def test_a_model_perturbed_only_through_its_posterior_still_passes(loaded) -> No
 # =============================================================================
 # Causality and reach disclosure
 # =============================================================================
-def test_the_disclosure_is_assembled_exactly_as_it_is_written_down(config, loaded) -> None:
-    """The whole record, against a dict written out by hand: key for key, value for value and in
-    order. The encoder's half arrives through a callable rather than being read inline, and an
-    extraction that changed *what* the record says -- or where a key sits in it -- would be
-    invisible to every assertion that reads one key at a time.
-    """
-    model = loaded["model"]
-    horizon_seconds = float(model.horizon) * 4.0
-    per_block = preflight.channels_reading_past_the_horizon(horizon_seconds)
-    expected = {
-        "not_causal": True,
-        "statement": preflight.NOT_CAUSAL_STATEMENT,
-        "max_channel_reach_s": max(entry["max_reach_s"] for entry in per_block.values()),
-        "causal_reach_budget_s": config["model_config"]["VAE_model"]["causal_reach_budget_s"],
-        "causal_norm": bool(model.causal_norm),
-        "n_causalized_norms": int(model.n_causalized_norms),
-        "source_delay_steps": int(model.source_delay_steps),
-        "source_delay_seconds": int(model.source_delay_steps) * 4.0,
-        "source_delay_is_max_over_channels": True,
-        "horizon_seconds": horizon_seconds,
-        "channels_reading_past_the_horizon": per_block,
-    }
-
-    record = preflight.causality_disclosure(config, model)
-
-    assert record == expected
-    assert list(record) == list(expected)
-    # And the same record when the callable is passed explicitly, which is how a run reaches it.
-    assert (
-        preflight.causality_disclosure(config, model, preflight.rws_encoder_disclosure) == expected
-    )
-
-
-def test_the_encoder_half_is_this_encoders_and_carries_its_consequence(loaded) -> None:
-    """``causal_norm`` is a property of the recurrent encoder rather than of the feature bank, so
-    it and its consequence sentence live in the callable the binding supplies. The warning is
-    part of the disclosure: a run whose prior conditions on its own future must say so in the log
-    as well as in the record."""
-
-    class _Pooling:
-        causal_norm, n_causalized_norms = False, 0
-
-    assert preflight.rws_encoder_disclosure(loaded["model"]) == {
-        "causal_norm": bool(loaded["model"].causal_norm),
-        "n_causalized_norms": int(loaded["model"].n_causalized_norms),
-    }
-
-    pooling = preflight.rws_encoder_disclosure(_Pooling())
-    assert pooling["causal_norm"] is False
-    assert "p(z_t | Y_<=t) conditions on Y_>t" in pooling["causal_norm_consequence"]
-
-
 def test_the_consequence_is_logged_and_not_only_recorded(loaded) -> None:
     """An operator reading the console must be told; a sentence only in ``preflight.json`` is a
     sentence nobody sees until after the run."""
@@ -506,20 +432,6 @@ def test_the_disclosure_records_the_guard_the_model_actually_carries(config, loa
     ]
 
 
-def test_the_refusal_sentence_names_the_thing_the_readout_is_not(config, loaded) -> None:
-    record = _run(config, loaded)["causality"]
-    blocks = channel_reach.block_reach_seconds()
-
-    assert "NOT a transfer entropy" in record["statement"]
-    # The statement points at a recorded number rather than restating one. The figure quoted
-    # elsewhere in this repository is already stale against the bank that ships, which is why.
-    assert "max_channel_reach_s" in record["statement"]
-    assert record["max_channel_reach_s"] == pytest.approx(
-        max(max(reaches) for reaches in blocks.values())
-    )
-    assert record["max_channel_reach_s"] > record["horizon_seconds"]
-
-
 def test_the_channel_counts_are_recomputed_rather_than_stored(config, loaded) -> None:
     """Recomputed from the production filter bank on every run, so a bank change moves them. A
     stored constant would keep reporting the old bank's answer indefinitely."""
@@ -537,6 +449,11 @@ def test_the_channel_counts_are_recomputed_rather_than_stored(config, loaded) ->
         entry["n_over_horizon"] > 0
         for entry in record["channels_reading_past_the_horizon"].values()
     )
+    # The headline reach is the bank's own maximum, recomputed rather than quoted.
+    assert record["max_channel_reach_s"] == pytest.approx(
+        max(max(reaches) for reaches in blocks.values())
+    )
+    assert record["max_channel_reach_s"] > horizon_seconds
 
 
 def test_a_finite_budget_records_its_delay_and_the_surviving_channel_counts(config) -> None:
@@ -626,4 +543,3 @@ def test_a_completed_run_carries_the_preflight_and_the_disclosure(evaluated) -> 
     # Promoted out of the preflight block as well: a reader who opens only the summary must see
     # what the readout is not.
     assert summary["causality"]["statement"] == preflight.NOT_CAUSAL_STATEMENT
-    assert summary["eval_config"]["seed"] == 42

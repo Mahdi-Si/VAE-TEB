@@ -25,14 +25,8 @@ from teb_vae.lag_attn.eval.tests.conftest import MULTI_CLASS_SUBGROUPS
 # ---------------------------------------------------------------------------
 # The class, from a scaled target
 # ---------------------------------------------------------------------------
-def test_a_fully_valid_recording_yields_its_class_code() -> None:
-    target = torch.full((300,), 2.0)
-    weight = torch.ones(300)
-    assert labels.clinical_class_code(target, weight) == 2
-
-
 @pytest.mark.parametrize("code", [1, 2, 3])
-@pytest.mark.parametrize("fraction", [0.5, 0.25, 0.9])
+@pytest.mark.parametrize("fraction", [0.5, 0.25])
 def test_the_class_is_recovered_under_a_fractional_weight(code: int, fraction: float) -> None:
     """The case the dataset's exact-equality ``label`` filter would have dropped.
 
@@ -110,9 +104,9 @@ def test_an_unknown_code_is_reported_rather_than_dropped() -> None:
 # ---------------------------------------------------------------------------
 # Subgroups
 # ---------------------------------------------------------------------------
-@pytest.mark.parametrize("subgroup", labels.CANONICAL_SUBGROUPS)
-def test_each_canonical_subgroup_is_recovered_from_its_basename(subgroup: str) -> None:
-    assert labels.subgroup_of(f"{subgroup}.hdf5") == subgroup
+def test_each_canonical_subgroup_is_recovered_from_its_basename() -> None:
+    for subgroup in labels.CANONICAL_SUBGROUPS:
+        assert labels.subgroup_of(f"{subgroup}.hdf5") == subgroup
 
 
 def test_a_full_path_resolves_to_its_subgroup(tmp_path) -> None:

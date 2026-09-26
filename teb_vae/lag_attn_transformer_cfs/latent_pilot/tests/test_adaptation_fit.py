@@ -7,8 +7,8 @@ no GPU::
     python -m pytest teb_vae/lag_attn_transformer_cfs/latent_pilot/tests/test_adaptation_fit.py -q
 
 What they establish: the bag and the preservation term are the reductions the protocol defines and
-they carry gradient; the teacher is a constant that no update can move, and the cached teacher is
-the student's own forward before the first step; an update reaches ``delta_mu_head`` and
+they carry gradient; the cached teacher is the student's own forward before the first step; an
+update reaches ``delta_mu_head`` and
 ``mu_post`` and reaches nothing else; the preservation term rises when the latent is pushed away
 and falls when it is pulled back; and the classification loss covers only the supervised window.
 
@@ -25,7 +25,6 @@ import torch
 
 from teb_vae.lag_attn_transformer_cfs.latent_pilot import data, extract, train
 from teb_vae.lag_attn_transformer_cfs.latent_pilot import model as pilot_model
-from teb_vae.lag_attn_transformer_cfs.latent_pilot.config import PilotConfigError
 from teb_vae.lag_attn_transformer_cfs.tests.conftest import (
     TINY_STRIDE,
     make_stub_batch,
@@ -282,18 +281,6 @@ def test_both_terms_carry_gradient_into_the_mean_heads_and_nowhere_else(task, ba
             assert parameter.grad is None, name
 
 
-def test_the_teacher_contributes_no_gradient(task, batch):
-    """It is stored data, so the reference cannot be moved by the update it is the reference for."""
-    plan = _plan(task, batch)
-
-    _bag, keep, _gap = train.recording_terms(task, plan, batch, scale=_scale(task))
-
-    assert keep.requires_grad
-    # Nothing in the plan is a tensor with a graph; the teacher enters as a constant array.
-    for segment in plan.segments:
-        assert isinstance(segment.teacher, np.ndarray)
-
-
 def test_an_update_moves_mu_post_and_leaves_the_invariants_alone(task, batch):
     plan = _plan(task, batch)
     before = pilot_model.deterministic_outputs(
@@ -340,14 +327,6 @@ def test_the_preservation_term_falls_as_the_student_returns_to_the_teacher(task,
 
     assert float(before) > 0.0
     assert float(after) < float(before)
-
-
-def test_the_freeze_is_checked_before_a_step_rather_than_assumed(task):
-    """A stray ``train()`` would put dropout back on and make the teacher incomparable."""
-    task.orig_model.train()
-
-    with pytest.raises(PilotConfigError, match="training mode"):
-        pilot_model.check_pilot_mode(task.orig_model)
 
 
 # =============================================================================

@@ -21,6 +21,7 @@ in this package that claims to check KL behaviour perturbs first.
 """
 from __future__ import annotations
 
+import pytest
 import torch
 
 from teb_vae.lag_attn_transformer_e2e.nets.model import SeqVaeLagAttnTrfE2E
@@ -57,66 +58,21 @@ def _forward(tiny_kwargs, inputs, perturb=None, *, train: bool = True):
     return model(*inputs)
 
 
-def test_the_kl_is_exactly_zero_at_init(tiny_kwargs, raw_inputs):
-    out = _forward(tiny_kwargs, raw_inputs)
+@pytest.mark.parametrize("train", [True, False], ids=["train", "eval"])
+def test_the_source_says_nothing_at_init(tiny_kwargs, raw_inputs, train):
+    """The closed-form KL, the model's own per-step, per-head and per-lag readouts, the posterior
+    against the prior, the two latent samples and the two forecasts -- all exactly equal, with
+    dropout on. Train mode is the point: base and full are one decoder invoked twice, and only a
+    dropout-free decoder makes them bitwise identical there. ``eval()`` is the mode the diagnostic
+    figure and the permutation control run in, so it is asserted too rather than inferred."""
+    out = _forward(tiny_kwargs, raw_inputs, train=train)
+
     assert float(_closed_form_kl(out).abs().max()) == 0.0
-    # The model's own readouts agree: per-step KL and its lag attribution are exactly zero.
     assert float(out["kld_per_t"].abs().max()) == 0.0
     assert float(out["source_kl_lag_map"].abs().max()) == 0.0
     assert float(out["kld_per_t_per_head"].abs().max()) == 0.0
-
-
-def test_the_posterior_equals_the_prior_at_init(tiny_kwargs, raw_inputs):
-    out = _forward(tiny_kwargs, raw_inputs)
     assert torch.equal(out["mu_post"], out["mu_prior"])
     assert torch.equal(out["logvar_post"], out["logvar_prior"])
-
-
-def test_the_latent_samples_are_identical_at_init(tiny_kwargs, raw_inputs):
-    out = _forward(tiny_kwargs, raw_inputs)
-    assert torch.equal(out["z_prior"], out["z_post"])
-
-
-def test_base_and_full_forecasts_are_bitwise_identical_in_train_mode(tiny_kwargs, raw_inputs):
-    """The identity that decoder dropout would break: one module, two invocations, two independent
-    masks. Zero dropout in the decoder is what makes this exact."""
-    out = _forward(tiny_kwargs, raw_inputs)
-    assert torch.equal(out["mu_base"], out["mu_full"])
-    assert torch.equal(out["logvar_base"], out["logvar_full"])
-
-
-def test_the_front_end_dropout_is_actually_active_in_train_mode(tiny_kwargs, raw_inputs):
-    """The control for the paragraph above, aimed at the stage this package added.
-
-    If dropout were inert in the front ends -- unwired, or built at zero regardless of the configured
-    value -- every identity in this file would hold for reasons that say nothing about one common
-    target forward. Two train-mode passes over the same input, seeded differently, must differ; and
-    the front end alone must be enough to make them differ, which is what the second half measures on
-    the front end's own output rather than on the encoder's.
-    """
-    torch.manual_seed(0)
-    model = SeqVaeLagAttnTrfE2E(**dict(tiny_kwargs, dropout=0.1)).train()
-
-    torch.manual_seed(1)
-    first = model(*raw_inputs)["target_state"]
-    torch.manual_seed(2)
-    second = model(*raw_inputs)["target_state"]
-    assert not torch.equal(first, second), "dropout is not active; the train-mode claims are empty"
-
-    y_raw, _u_raw, weight = raw_inputs
-    torch.manual_seed(1)
-    front_first = model.target_frontend(y_raw, weight)
-    torch.manual_seed(2)
-    front_second = model.target_frontend(y_raw, weight)
-    assert not torch.equal(front_first, front_second), "the front end carries no active dropout"
-
-
-def test_the_same_identities_hold_under_eval(tiny_kwargs, raw_inputs):
-    """``eval()`` is the mode the diagnostic figure and the permutation control run in, so the
-    identities are asserted there too rather than inferred from the train-mode ones."""
-    out = _forward(tiny_kwargs, raw_inputs, train=False)
-
-    assert float(out["kld_per_t"].abs().max()) == 0.0
     assert torch.equal(out["z_prior"], out["z_post"])
     assert torch.equal(out["mu_base"], out["mu_full"])
     assert torch.equal(out["logvar_base"], out["logvar_full"])

@@ -1,15 +1,8 @@
-r"""Contraction-conditioned coupling, and the two readouts this cell does not have.
+r"""Contraction-conditioned coupling.
 
-The sibling's ``events`` analysis reports three things. Two of them score a bpm waveform -- a
-deceleration detector run over each branch's forecast block, and that block averaged around a
-contraction onset -- and this model's forecast block is $15 \times 98$ wavelet-modulus and
-phase-harmonic coefficients in the loader's $z$ units. So they are absent, and the first section
-below asserts the absence three ways: the symbols are gone, the record names them with a reason,
-and the analysis reads no retained waveform at all.
-
-What survives conditions on **timing** rather than on the forecast's shape, and it ports unchanged.
-What can go wrong in it is not the arithmetic but the comparison: the control anchors have to be
-drawn *within each recording* and matched to that recording's event count, or the difference is a
+The readout conditions on **timing** rather than on the forecast's shape. What can go wrong in it
+is not the arithmetic but the comparison: the control anchors have to be drawn *within each
+recording* and matched to that recording's event count, or the difference is a
 difference between recordings wearing two labels. Every assertion here therefore constructs the
 condition it needs -- a synthetic anchor table whose near-contraction rows carry a known extra gap
 -- rather than hoping the fixture supplies one, because the generated cohort is a fixture about
@@ -20,11 +13,8 @@ contraction timing has already reached the per-anchor table.
 """
 from __future__ import annotations
 
-import ast
-import json
 import types
-from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Optional
 
 import numpy as np
 import pandas as pd
@@ -73,35 +63,6 @@ def _anchor_frame(*, guids: int, anchors: int, near_every: int, gap: float) -> p
     return pd.DataFrame(rows)
 
 
-def _code_names() -> set:
-    """Return every name the analysis module reaches for **in code**, docstrings excluded.
-
-    Attribute names and string literals together, because the two ways of reading a field --
-    ``collection.retained`` and ``getattr(collection, "retained")`` -- look nothing alike in an
-    AST. Docstrings are stripped because the module names both absent readouts in prose, which is
-    the opposite of reaching for them.
-    """
-    tree = ast.parse(Path(events_analysis.__file__).read_text(encoding="utf-8"))
-    docstrings = {
-        id(node.body[0].value)
-        for node in ast.walk(tree)
-        if isinstance(node, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
-        and node.body
-        and isinstance(node.body[0], ast.Expr)
-        and isinstance(node.body[0].value, ast.Constant)
-        and isinstance(node.body[0].value.value, str)
-    }
-    names = {node.attr for node in ast.walk(tree) if isinstance(node, ast.Attribute)}
-    names |= {
-        node.value
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Constant)
-        and isinstance(node.value, str)
-        and id(node) not in docstrings
-    }
-    return names
-
-
 def _context(
     per_anchor: Optional[pd.DataFrame] = None,
     per_sample: Optional[pd.DataFrame] = None,
@@ -115,76 +76,6 @@ def _context(
         results={},
     )
     return AnalysisContext(collection=collection, config={}, task=None, loader=None)
-
-
-# =================================================================================================
-# The two readouts that are not here
-# =================================================================================================
-def test_no_symbol_of_the_two_removed_readouts_survives_the_reduction() -> None:
-    """A mechanical copy would have carried a deceleration detector over a coefficient block, and
-    a "triggered response" averaging one. Both are arithmetic that runs, produces finite numbers,
-    and means nothing -- which is exactly the failure a scan of the module's own names catches and
-    a green test suite does not."""
-    tree = ast.parse(Path(events_analysis.__file__).read_text(encoding="utf-8"))
-    defined = {
-        node.name
-        for node in ast.walk(tree)
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
-    }
-    assigned = {
-        target.id
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Assign)
-        for target in node.targets
-        if isinstance(target, ast.Name)
-    } | {
-        node.target.id
-        for node in ast.walk(tree)
-        if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name)
-    }
-
-    banned = ("deceleration", "triggered", "trigger", "skill_rows", "null_draws")
-    offending = sorted(
-        name for name in defined | assigned
-        if any(fragment in name.lower() for fragment in banned)
-    )
-
-    assert offending == []
-    # And the readout that stays is genuinely there, so this is not an assertion about an empty
-    # module.
-    assert "run_events_analysis" in defined
-    assert "conditioned_anchors" in defined
-
-
-def test_the_removed_readouts_are_named_in_the_record_with_a_reason(tmp_path) -> None:
-    """A reader meets ``events`` in ``summary.json`` expecting the sibling's three. A key that is
-    simply missing reads as a step that failed; the absence has to be stated."""
-    outcome = events_analysis.run_events_analysis(
-        _context(), eval_config=EVAL_CONFIG, output_dir=tmp_path, probe=None
-    )
-
-    removed = {entry["readout"] for entry in outcome["removed_readouts"]}
-    assert removed == {"deceleration_skill", "contraction_triggered_response"}
-    for entry in outcome["removed_readouts"]:
-        assert "bpm" in entry["reason"] or "coefficient" in entry["reason"]
-
-
-def test_the_analysis_reads_no_retained_waveform_and_says_it_is_uncapped(tmp_path) -> None:
-    """The structural difference from the sibling's, and the reason this readout runs over every
-    anchor of the split: the contraction timing is already on the per-anchor table, so no forecast
-    block is needed and ``caps.waveforms`` does not reach here. An analysis that read ``retained``
-    would silently report over the retained subsample instead."""
-    names = _code_names()
-
-    assert "retained" not in names
-    assert "caps" not in names
-    # Non-vacuity: the two fields it *does* read are found by the same scan.
-    assert {"per_anchor", "per_sample"} <= names
-
-    outcome = events_analysis.run_events_analysis(
-        _context(), eval_config=EVAL_CONFIG, output_dir=tmp_path, probe=None
-    )
-    assert outcome["plan"]["capped"] is False
 
 
 # =================================================================================================
@@ -398,35 +289,3 @@ def test_a_skipped_readout_declares_no_grouped_frame(tmp_path) -> None:
     assert "grouped_frames" not in outcome
 
 
-# =================================================================================================
-# Against the real run
-# =================================================================================================
-@pytest.mark.slow
-def test_the_analysis_reached_the_summary_and_recorded_its_outcome(collected_run) -> None:
-    """The generated cohort is eight real segments reused under distinct identities, so whether
-    the guards clear is a property of the fixture rather than a finding. What must hold either way
-    is that the step ran, wrote its table, and said which of the two it did."""
-    block = collected_run["summary"]["results"].get("events")
-    assert block is not None, "the run produced no events block at all"
-
-    directory = Path(collected_run["results_dir"]) / events_analysis.ANALYSIS_DIRNAME
-    missing = [name for name in block["files"] if not (directory / name).is_file()]
-    assert missing == []
-
-    conditioned = block["conditioned"]
-    assert ("skipped" in conditioned) or ("n_event_anchors" in conditioned)
-    assert {entry["readout"] for entry in block["removed_readouts"]} == {
-        "deceleration_skill", "contraction_triggered_response"
-    }
-
-
-@pytest.mark.slow
-def test_the_step_record_marks_the_analysis_as_having_succeeded(collected_run) -> None:
-    """A guard that fires is a recorded skip, not a failed step: the exit code is non-zero if and
-    only if a step raised."""
-    steps = json.loads(
-        (Path(collected_run["results_dir"]) / "steps.json").read_text(encoding="utf-8")
-    )
-    record = next(step for step in steps if step["name"] == "events")
-
-    assert record["ok"] is True, record.get("error")

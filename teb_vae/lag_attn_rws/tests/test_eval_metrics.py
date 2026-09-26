@@ -1,13 +1,12 @@
-r"""The evaluation readouts, and the parity that keeps them tied to the training objective.
+r"""The evaluation readouts, their aggregation, and the lag and latent reports built on them.
 
-The load-bearing test here is the parity one. Everything else in the evaluation package is
-plumbing around two numbers -- $D_{\mathrm{base}}$ and $D_{\mathrm{full}}$ -- and the whole
-exercise is worthless if those are not the quantities the training loop optimised. So the
-per-sample readouts are recombined into the exact anchor-weighted total the loss reduces to, and
-compared against what the task itself reports on the same batch.
+The reconstruction and KL parity against the training objective lives in ``test_eval_parity.py``,
+on a batch whose samples carry unequal anchor counts. What stays here is the prior-rate parity,
+which recomputes a batch-level loss term per sample, and everything downstream of the per-sample
+columns.
 
-The second theme is aggregation. Anchors are not independent samples: consecutive anchors'
-forecast windows overlap in $29$ of their $30$ horizon steps, and one long recording holds
+The main theme is aggregation. Anchors are not independent samples: consecutive anchors'
+forecast windows overlap in $H - 1$ of their $H$ horizon steps, and one long recording holds
 hundreds of them. Averaging per recording and then across recordings is what stops a headline
 number from being dominated by whichever recording happens to be longest.
 """
@@ -63,43 +62,6 @@ class _OneBatchLoader:
 # =============================================================================
 # Parity with the training objective
 # =============================================================================
-def test_the_per_sample_readouts_recombine_into_the_training_loss(trained_task, stub_batch):
-    r"""The anchor-weighted total of the per-sample values *is* the loss's own reduction,
-    $\sum_b \sum_t / \sum_b n_b$. If these drift, the evaluation is scoring something the
-    objective never saw.
-
-    Both sides are seeded identically because each runs its own forward, and the reparameterised
-    latent is stochastic: the reconstruction terms are a function of the draw, so an unseeded
-    comparison would be comparing two different samples of the same quantity and could only ever
-    be asserted to a loose tolerance -- which is exactly the tolerance a real drift would hide
-    inside.
-    """
-    torch.manual_seed(4)
-    readout = evaluate_batch(trained_task, stub_batch, num_samples=1)
-    torch.manual_seed(4)
-    _loss, metrics = trained_task.compute_loss_and_metrics(stub_batch, 0, "val")
-
-    weights = readout.n_anchors
-    for name in ("nll_base_block", "nll_full_block"):
-        recombined = float(
-            (readout.columns[name] * weights).sum() / weights.sum().clamp_min(1.0)
-        )
-        assert recombined == pytest.approx(float(metrics[name]), rel=1e-5)
-
-
-def test_the_kl_readout_recombines_into_the_training_kl(trained_task, stub_batch):
-    """Same check on the other term, whose mask is a different one -- the KL's anchor support is
-    not the reconstruction's."""
-    readout = evaluate_batch(trained_task, stub_batch, num_samples=1)
-    _loss, metrics = trained_task.compute_loss_and_metrics(stub_batch, 0, "val")
-
-    support = kl_support_counts(trained_task, stub_batch)
-    recombined = float(
-        (readout.columns["source_conditioned_kl_raw"] * support).sum() / support.sum()
-    )
-    assert recombined == pytest.approx(float(metrics["source_conditioned_kl_raw"]), rel=1e-5)
-
-
 def kl_support_counts(module, batch) -> torch.Tensor:
     """Masked anchor counts per sample, from the same masks the loss uses."""
     from teb_vae.lag_attn_rws.nets.raw_masks import forecast_mask, kl_mask
@@ -138,24 +100,6 @@ def test_the_prior_rate_readout_recombines_into_the_objectives_own_term(
     support = support_mask.sum(dim=1)
     recombined = float((readout.columns["prior_rate"] * support).sum() / support.sum())
     assert recombined == pytest.approx(expected, rel=1e-5)
-
-
-def test_the_prior_rate_is_zero_only_at_unit_scale(trained_task, stub_batch):
-    """Nonnegative everywhere and zero exactly at ``sigma_p = 1``, which is what makes it an
-    anchor rather than a penalty with a preferred direction."""
-    readout = evaluate_batch(trained_task, stub_batch, num_samples=1)
-
-    assert bool((readout.columns["prior_rate"] >= 0.0).all())
-    assert "prior_rate" in readout.columns
-
-
-def test_the_predictive_gap_is_the_difference_of_the_two_scores(trained_task, stub_batch):
-    readout = evaluate_batch(trained_task, stub_batch, num_samples=1)
-
-    assert torch.allclose(
-        readout.columns["pred_gap"],
-        readout.columns["nll_base_block"] - readout.columns["nll_full_block"],
-    )
 
 
 # =============================================================================

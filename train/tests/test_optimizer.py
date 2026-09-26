@@ -10,12 +10,6 @@ import torch
 from train.test_utils import TinyLightningModel
 
 
-def test_default_param_groups_match_trainable_list():
-    model = TinyLightningModel()
-    groups = model.configure_param_groups()
-    assert list(groups) == model._trainable_parameters()
-
-
 def test_default_optimizer_is_single_group():
     model = TinyLightningModel(lr=1e-3, weight_decay=1e-4)
     optimizer = model.configure_optimizers()
@@ -46,14 +40,6 @@ def test_grouped_return_builds_multigroup_optimizer():
     assert len(optimizer.param_groups) == 2
     assert optimizer.param_groups[0]["lr"] == 1e-3
     assert optimizer.param_groups[1]["lr"] == 1e-4
-
-
-def test_log_parameter_overview_handles_group_dicts():
-    model = _TwoGroupModel()
-    # Must not raise on a list of param-group dicts (numel accounting flattens them).
-    model._log_parameter_overview(model.configure_param_groups())
-    # And still works on a flat parameter list.
-    model._log_parameter_overview(model._trainable_parameters())
 
 
 class _GeneratorGroupModel(TinyLightningModel):

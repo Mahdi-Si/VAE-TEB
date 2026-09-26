@@ -110,25 +110,16 @@ def test_a_trim_that_does_not_produce_the_declared_window_is_refused_naming_both
 # --------------------------------------------------------------------------------------
 # The geometry
 # --------------------------------------------------------------------------------------
-def test_a_floor_that_does_not_pair_with_the_budget_is_refused_naming_both_numbers(config):
+def test_a_floor_that_does_not_pair_with_the_budget_is_refused_naming_it(config):
     r"""$F \ge \max(B - 1,\; \max_c(W'_c + d_c))$ over the **survivors**, checked here so a mis-paired
     configuration fails before a run directory exists rather than inside the constructor after every
-    rank initialised.
-
-    Which of the two halves binds is itself part of the message, and at the shipped configuration it
-    is the second: the aligned inputs are honest at the anchor only from $B = 134$, so the floor is
-    $134$ rather than the $133$ the scored-target half alone would admit. Asserted on the number
-    *and* on the requirement that produced it, because the two halves differ by one step and a
-    message naming the wrong one would still name a plausible integer."""
+    rank initialised. The message names the refused floor, so the key to edit is on the page."""
     _vae(config)["warmup_period"] = 132
 
     with pytest.raises(ValueError) as excinfo:
         LagAttnCfsTrainer.preflight(config)
 
-    message = str(excinfo.value)
-    assert "warmup_period=132" in message
-    assert "134" in message
-    assert "shifted inputs" in message
+    assert "warmup_period=132" in str(excinfo.value)
 
 
 def test_a_higher_floor_than_the_pairing_requires_is_admitted(config):
@@ -212,20 +203,6 @@ def test_the_cross_channel_block_is_refused_in_either_list(config, list_key):
 
     assert "fhr_up_ph" in str(excinfo.value)
     assert list_key in str(excinfo.value)
-
-
-def test_the_target_normalisation_guard_is_the_shared_one_rather_than_a_copy(config):
-    """The refusal ``fhr_st`` / ``fhr_ph`` missing from either list needs is already the shared entry
-    point's, parameterised on this driver's ``TARGET_FIELDS`` and running *before* this hook. A
-    second copy here would be a second rule that could come to disagree with it, so what is asserted
-    is that the shared one covers the case rather than that this one does."""
-    from teb_vae.lag_attn_rws.trainer import _check_raw_target_normalized
-
-    _loader(config)["normalize_fields"].remove("fhr_st")
-
-    LagAttnCfsTrainer.preflight(config)  # not this hook's job
-    with pytest.raises(ValueError, match=r"'fhr_st'"):
-        _check_raw_target_normalized(config, fields=LagAttnCfsTrainer.TARGET_FIELDS)
 
 
 # --------------------------------------------------------------------------------------

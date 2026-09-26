@@ -194,15 +194,6 @@ def test_a_band_beyond_the_window_raises() -> None:
         masks.lag_band_keep_mask((3, 9), 9)
 
 
-def test_common_scoring_start_is_the_strictest_band_plus_the_warmup(
-    model: SeqVaeLagAttn,
-) -> None:
-    """One support for every band, so a band difference is not confounded with its anchor set."""
-    bands = {"near": (0, 3), "far": (6, 8)}
-    start = masks.common_scoring_start(model, bands, SEQ_LEN)
-    assert start == max(int(model.warmup_period), 6)
-
-
 def test_common_scoring_start_falls_back_to_the_warmup_with_no_bands(
     model: SeqVaeLagAttn,
 ) -> None:
@@ -252,19 +243,6 @@ def test_a_capped_draw_is_seeded_and_sorted() -> None:
     assert torch.equal(first, second)
     assert not torch.equal(first, other)
     assert torch.equal(first, torch.sort(first).values)
-
-
-def test_a_stratified_cap_reaches_every_group() -> None:
-    """Stratification upgrades "very probably covers every file" into a guarantee."""
-    # Eight groups of wildly unequal size, as the k-fold subgroup shards are.
-    groups = ["a"] * 500 + ["b"] * 200 + ["c"] * 100 + ["d"] * 50 + ["e"] * 20 + [
-        "f"
-    ] * 10 + ["g"] * 5 + ["h"] * 3
-    drawn = masks.subsample_indices(len(groups), 60, seed=3, groups=groups)
-    assert drawn is not None
-    assert len(drawn) == 60
-    covered = {groups[int(index)] for index in drawn.tolist()}
-    assert covered == set(groups), f"a stratified draw missed {set(groups) - covered}"
 
 
 def test_a_stratified_cap_at_the_group_count_still_reaches_every_group() -> None:

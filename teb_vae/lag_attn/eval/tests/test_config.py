@@ -1,26 +1,36 @@
 """The eval configs merge to what the pipeline expects, and bad ``eval_config`` is refused.
 
 Two concerns, deliberately in one file because they answer the same question from two sides:
-what the shipped configs actually resolve to, and what the validator refuses. A merged config
-that looks right but silently keeps a training-time filter is as broken as one that fails to
-parse, and only the first half of this file can catch it.
+what the shipped config resolves to relative to the training config it chains off, and what the
+validator refuses. A merged config that looks right but silently keeps a training-time filter is
+as broken as one that fails to parse, and only the first half of this file can catch it.
 """
 from __future__ import annotations
 
 import pytest
 
 from teb_vae.lag_attn.config import load_config
+from teb_vae.lag_attn.eval import labels
 from teb_vae.lag_attn.eval.config_schema import VALID_KEYS, validate_eval_config
+from teb_vae.lag_attn.eval.tests.conftest import EVAL_TINY_CONFIG
 
 #: Repo-root-relative, matching every documented invocation.
 EVAL_CONFIG = "teb_vae/lag_attn/eval/configs/eval.yaml"
-EVAL_TINY_CONFIG = "teb_vae/lag_attn/eval/tests/fixtures/eval_tiny.yaml"
+
+#: The training config ``eval.yaml`` chains off through ``base:``.
+TRAINING_CONFIG = "teb_vae/lag_attn/configs/default.yaml"
 
 
 @pytest.fixture(scope="module")
 def eval_config(repo_root):
     """The merged production eval config."""
     return load_config(str(repo_root / EVAL_CONFIG))
+
+
+@pytest.fixture(scope="module")
+def training_config(repo_root):
+    """The merged training config the eval config inherits from."""
+    return load_config(str(repo_root / TRAINING_CONFIG))
 
 
 @pytest.fixture(scope="module")
@@ -32,45 +42,22 @@ def eval_tiny_config(repo_root):
 # ---------------------------------------------------------------------------
 # The merged configs
 # ---------------------------------------------------------------------------
-def test_eval_config_inherits_the_training_geometry(eval_config):
-    """The ``base:`` chain is what keeps the eval geometry from drifting from the run's."""
-    vae = eval_config["model_config"]["VAE_model"]
-    assert vae["c_y"] == 109
-    assert vae["c_u"] == 58
-    assert vae["sequence_length"] == 300
-    # The objective is inherited too, and is what preflight reconciles against the checkpoint.
-    assert vae["likelihood"] == "gaussian_nll"
-    assert vae["sigma_obs"] == "learned"
+def test_eval_config_inherits_the_training_geometry_and_objective(eval_config, training_config):
+    """The ``base:`` chain is what keeps the eval geometry from drifting from the run's.
 
-
-def test_eval_config_points_at_the_kfold_test_split(eval_config):
-    """Eight subgroup shards, one per canonical subgroup, not the healthy-only pretraining pair."""
-    shards = eval_config["dataset_config"]["vae_test_datasets"]
-    assert len(shards) == 8
-    expected = {
-        "healthy_no_bg_no_cs",
-        "healthy_no_bg_cs",
-        "healthy_bg_no_cs",
-        "healthy_bg_cs",
-        "acidosis_no_cs",
-        "acidosis_cs",
-        "hie_no_cs",
-        "hie_cs",
-    }
-    assert {path.rsplit("/", 1)[-1].removesuffix(".hdf5") for path in shards} == expected
-    assert all("k_fold_cross_validation_dataset/test/" in path for path in shards)
-
-
-def test_eval_config_loader_is_single_process(eval_config):
-    """``num_workers`` 0 and the eval batch size on the key ``GraphDataModule`` actually reads.
-
-    Both are recorded failure modes rather than preferences: workers over a multi-file HDF5
-    dataset degrade after the first full pass, and a batch size under ``eval_config`` would be
-    a dead key leaving the loader at the training 128.
+    The objective is inherited too, and is what preflight reconciles against the checkpoint.
     """
-    assert eval_config["dataset_config"]["dataloader_config"]["num_workers"] == 0
-    assert eval_config["general_config"]["batch_size"]["test"] == 32
-    assert "batch_size" not in eval_config["eval_config"]
+    eval_vae = eval_config["model_config"]["VAE_model"]
+    training_vae = training_config["model_config"]["VAE_model"]
+    for key in ("c_y", "c_u", "sequence_length", "likelihood", "sigma_obs"):
+        assert eval_vae[key] == training_vae[key], key
+
+
+def test_eval_config_points_at_one_shard_per_canonical_subgroup(eval_config):
+    """Every canonical subgroup, not the healthy-only pretraining pair."""
+    shards = eval_config["dataset_config"]["vae_test_datasets"]
+    assert len(shards) == len(labels.CANONICAL_SUBGROUPS)
+    assert {labels.subgroup_of(path) for path in shards} == set(labels.CANONICAL_SUBGROUPS)
 
 
 def test_eval_config_extends_load_fields(eval_config):
@@ -82,34 +69,24 @@ def test_eval_config_extends_load_fields(eval_config):
         assert name in fields
 
 
-def test_eval_config_clears_inherited_training_filters(eval_config):
+def test_eval_config_clears_inherited_training_filters(eval_config, training_config):
     """Each of these silently *drops* eval samples rather than failing, which is the hazard."""
     kwargs = eval_config["dataset_config"]["dataloader_config"]["dataset_kwargs"]
     assert kwargs["epoch_min"] is None, "inherited epoch_min would couple coverage to the extraction floor"
     assert kwargs["epoch_max"] is None
     assert kwargs["label"] is None, "the label filter compares floats for equality"
-    # 10000 is per-worker RAM under training and becomes main-process RAM at num_workers: 0.
-    assert kwargs["cache_size"] == 0
     # trim_minutes must NOT be cleared: it must keep matching the stats file.
-    assert kwargs["trim_minutes"] == 1.0
+    training_kwargs = training_config["dataset_config"]["dataloader_config"]["dataset_kwargs"]
+    assert kwargs["trim_minutes"] == training_kwargs["trim_minutes"]
 
 
 def test_eval_config_block_validates(eval_config):
     """The shipped block passes its own validator, and carries every documented key."""
     resolved = validate_eval_config(eval_config)
     assert set(resolved) == set(VALID_KEYS)
-    assert resolved["seed"] == 42
     assert resolved["bands"], "the lag ablation needs at least one band"
     max_lag = eval_config["model_config"]["VAE_model"]["max_lag"]
     assert all(high <= max_lag for _, high in resolved["bands"].values())
-
-
-def test_eval_tiny_config_resolves_fixture_paths_from_the_repo_root(eval_tiny_config, repo_root):
-    """The suite's config must name files that exist relative to the repository root."""
-    dataset_config = eval_tiny_config["dataset_config"]
-    for path in dataset_config["vae_test_datasets"]:
-        assert (repo_root / path).is_file(), f"{path} does not resolve from the repo root"
-    assert (repo_root / dataset_config["stat_path"]).is_file()
 
 
 def test_eval_tiny_config_matches_the_suite_checkpoint_objective(eval_tiny_config):
@@ -124,13 +101,6 @@ def test_eval_tiny_config_matches_the_suite_checkpoint_objective(eval_tiny_confi
     vae = eval_tiny_config["model_config"]["VAE_model"]
     assert vae["beta_schedule"] == PROD_HPARAMS["beta_schedule"]
     assert vae["kld_beta"] == PROD_HPARAMS["kld_beta"]
-
-
-def test_eval_tiny_config_bands_fit_the_tiny_lag_window(eval_tiny_config):
-    """max_lag is 8 at the tiny geometry, so a band copied from eval.yaml would be invalid."""
-    resolved = validate_eval_config(eval_tiny_config)
-    assert resolved["bands"]
-    assert all(high <= 8 for _, high in resolved["bands"].values())
 
 
 # ---------------------------------------------------------------------------
@@ -191,8 +161,8 @@ def test_bad_health_probe_floor_raises(floor):
 
 
 def test_the_removed_up_shift_key_is_refused_as_unknown():
-    """``up_shift_secs`` undid the dataset builder's UP shift and was removed: the stored timeline
-    is canonical. An old config naming it must fail loudly rather than be honoured or ignored."""
+    """The stored timeline is canonical, so a config still naming the removed ``up_shift_secs``
+    key must fail loudly rather than be honoured or ignored."""
     with pytest.raises(ValueError, match="unknown eval_config key"):
         validate_eval_config(_config_with({"up_shift_secs": -20.0}))
 

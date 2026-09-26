@@ -63,8 +63,7 @@ $R = 16$ and a feature block scored against it, with nothing raising.
 
 The empty body is itself the guarantee. With nothing defined here, the twenty forward keys, the
 posterior's structure, the lag map and the objective's metric set cannot have moved — they are the
-base's own code objects, pinned by the base's own suite — which is why `test_construct.py` asserts
-`vars(SeqVaeLagAttnFs)` carries no callable at all rather than counting methods.
+base's own code objects, pinned by the base's own suite.
 
 One consequence is worth recording because a reader will meet it: a static type checker cannot see
 that the mixin's seven read attributes are set by a *base* constructor, and reports them unresolved
@@ -285,8 +284,7 @@ $29.3$, just past the horizon, while the full set never reaches a fully clean st
 channels reaching $965.5$ s. Restricting it also makes one statement true that is otherwise false:
 **input and target live under one causal budget.**
 
-The blend fraction and that table are recomputed from the shipped filter bank in
-`tests/test_smear.py`, so the figures a reader meets are ones a test reproduces. The preprint at
+The preprint at
 `teb_vae/lag_attn_rws/doc/latex_template/` covers the *input*-side half of two-sidedness in
 `sections/reach.tex`; a dedicated subsection for the backward half stated above is not yet written
 there, and until it is, this section is the record.
@@ -403,8 +401,8 @@ Where the built model differs from the design it was built from, and why.
   the gate.
 - **The model unfolds its own stream** rather than calling `lag_attn/figure_primitives.py`'s
   `future_target`. That helper's signature *is* the two stored block names, which is exactly the
-  schema knowledge `tests/test_nets_are_framework_free.py` forbids inside `nets/`. A test pins the
-  two equal so the duplication is proven inert.
+  schema knowledge kept out of `nets/`. `tests/test_objective.py` pins the model's unfold to the
+  index identity $Y^{+}[t, \tau, k] = Y[t + 1 + \tau, \mathrm{keep}[k]]$ the helper implements.
 - **`future_index` is inherited and present**, not absent. §4.
 
 **Objective and metrics**
@@ -497,9 +495,7 @@ There is no `eval` entry point for this package. §9.
 
 ## 14. Configuration keys
 
-Keys this document's claims depend on. `tests/test_docs.py` asserts each required key exists in
-`configs/default.yaml` and each absent key does not, in both directions, so this section cannot drift
-from the config.
+Keys this document's claims depend on.
 
 **Required**
 

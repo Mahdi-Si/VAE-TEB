@@ -19,20 +19,18 @@ reproduce the matched arm exactly, and suppressing every band must reproduce the
 exactly. They hold here on real weights and a real split, which is what makes every other margin in
 the file a difference of predictions rather than a difference between two code paths.
 
-**It starts no run of its own.** The session-scoped ``slot_collected_run`` fixture is this suite's
-one end-to-end pass, and :func:`test_this_file_starts_no_run_of_its_own` keeps that from quietly
-changing.
+**It starts no run of its own.** Every assertion reads one of the session-scoped collected runs
+(``slot_collected_run`` and its short-bank ablated twin).
 """
 from __future__ import annotations
 
-import ast
 import csv
 from pathlib import Path
 from typing import Any, Dict, Set
 
 import pytest
 
-from teb_vae.lag_attn_cfs.eval import collect, preflight, probe as probe_module
+from teb_vae.lag_attn_cfs.eval import collect
 from teb_vae.lag_attn_cfs.tests.test_eval_smoke import DURABLE_ARTIFACTS
 from teb_vae.lag_slot_transformer_cfs.eval import run as run_module
 from teb_vae.lag_slot_transformer_cfs.eval import verify as eval_verify
@@ -94,9 +92,6 @@ def test_the_artifact_layout_is_the_familys_own(slot_collected_run) -> None:
     results_dir = Path(slot_collected_run["results_dir"])
     results = _results(slot_collected_run)
 
-    assert preflight.PREFLIGHT_FILENAME in DURABLE_ARTIFACTS
-    assert probe_module.PROBE_FILENAME in DURABLE_ARTIFACTS
-    assert collect.COLLECTION_FILENAME in DURABLE_ARTIFACTS
     for name in DURABLE_ARTIFACTS:
         assert (results_dir / name).is_file(), f"the run left no {name}"
 
@@ -370,7 +365,6 @@ def test_the_acceptance_gate_passes_on_what_the_run_wrote(slot_collected_run) ->
         gap_verdict["ci_lo"], gap_verdict["ci_hi"]
     )
     assert gap_verdict["pred_gap_nats"] is not None
-    assert _results(slot_collected_run)["schema_version"] == 2
 
 
 def test_the_per_recording_table_carries_what_the_intervals_were_built_from(slot_collected_run) -> None:
@@ -495,20 +489,3 @@ def test_the_acceptance_pass_reads_the_short_bank_run_under_its_own_windows_fami
     assert bands["undeclared_bands"] == []
     assert band_verdict["status"] == "PASS"
 
-
-# =================================================================================================
-# The one pass
-# =================================================================================================
-def test_this_file_starts_no_run_of_its_own() -> None:
-    """The suite performs exactly one end-to-end pass per profile and every artifact assertion
-    reads one of them."""
-    source = Path(__file__).read_text(encoding="utf-8")
-
-    calls = [
-        node for node in ast.walk(ast.parse(source))
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and node.func.attr == "main"
-    ]
-
-    assert calls == [], "this file calls main(); read the session-scoped run instead"

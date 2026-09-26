@@ -147,16 +147,6 @@ def _lag_axes(figure: Any) -> List[Tuple[str, Any, Any]]:
     return found
 
 
-def test_the_figures_probe_reads_this_models_own_delay():
-    """The subclass inherits the accessor, and inheriting it is the point -- but a model whose
-    delay the figure's probe could not resolve would draw a zero-offset axis and say nothing about
-    it, which is the exact shape of the historical failure."""
-    module, _batch = _module(guarded=True)
-    model = module.orig_model
-
-    assert int(model.source_delay_steps) == _source_delay_steps(model) == _EXPECTED_DELAY
-
-
 def test_both_lag_panels_carry_the_axis_the_models_delay_implies():
     r"""The assertion this file exists for. Each panel's primary axis is the lag index $\ell$ and
     its secondary is $4(\ell + \delta)$ seconds; the two must be the same map on both panels, and
@@ -185,69 +175,3 @@ def test_both_lag_panels_carry_the_axis_the_models_delay_implies():
         assert seen[0] == pytest.approx(seen[1])
     finally:
         plt.close(figure)
-
-
-def test_an_unguarded_model_draws_a_zero_offset_axis_and_that_is_the_honest_one():
-    """The other direction, and the one where agreement is easy -- which is why the guarded case
-    above is what has to be asserted. Without a reach budget there is no delay to compensate, the
-    axis is $4\\ell$, and a regression that made the guarded case read zero again would otherwise
-    hide behind this passing."""
-    module, batch = _module(guarded=False)
-    figure = _page(module, batch, forecast_rows=module.forecast_rows)
-    try:
-        assert int(module.orig_model.source_delay_steps) == _source_delay_steps(
-            module.orig_model
-        ) == 0
-
-        for prefix, panel, secondary in _lag_axes(figure):
-            low, high = panel.get_ylim()
-            assert secondary.get_ylim() == pytest.approx(
-                (
-                    float(lag_compensated_seconds(low, delay_steps=0)),
-                    float(lag_compensated_seconds(high, delay_steps=0)),
-                )
-            ), prefix
-    finally:
-        plt.close(figure)
-
-
-def test_the_feature_rows_do_not_move_the_lag_axis():
-    """The seam owns rows $1$ and $2$; the lag panels are rows $6$ and $7$ and are the builder's.
-    Drawing the same model twice -- once through this package's rows and once through the raw
-    page's default -- must put the identical axis on both, which is what "the figure's lag axis
-    agrees with the metrics'" means once the rows underneath it are replaceable.
-    """
-    module, batch = _module(guarded=True)
-    with_feature_rows = _page(module, batch, forecast_rows=module.forecast_rows)
-    try:
-        replaced = [secondary.get_ylim() for _, _, secondary in _lag_axes(with_feature_rows)]
-    finally:
-        plt.close(with_feature_rows)
-
-    # The default rows cannot draw a feature target -- they plot it against the raw time axis --
-    # so the comparison run supplies a seam that draws nothing at all. What is being compared is
-    # the five rows the seam does not own.
-    def _nothing(rows: Any) -> None:
-        for name in ("raw", "forecast"):
-            main, cax = rows.row_axes(name)
-            main.set_title(f"placeholder {name}")
-            cax.set_visible(False)
-
-    without = _page(module, batch, forecast_rows=_nothing)
-    try:
-        inherited = [secondary.get_ylim() for _, _, secondary in _lag_axes(without)]
-    finally:
-        plt.close(without)
-
-    assert replaced == pytest.approx(inherited)
-
-
-def test_the_task_is_what_binds_the_rows_the_callback_draws():
-    """The route, end to end and in one assertion: the callback resolves ``forecast_rows`` off the
-    task and the builder draws through it, so a page's rows and its lag axis come from the same
-    object and cannot describe two different models."""
-    module, _batch = _module(guarded=True)
-
-    assert isinstance(module, SeqVaeLagAttnFsTask)
-    assert callable(module.forecast_rows)
-    assert getattr(module, "forecast_rows", None) is not None

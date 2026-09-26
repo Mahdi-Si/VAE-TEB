@@ -43,29 +43,21 @@ def _train_mode_forward(tiny_kwargs, inputs, perturb=None):
     return model(*inputs)
 
 
-def test_the_kl_is_exactly_zero_at_init(tiny_kwargs, inputs):
+def test_at_init_the_posterior_is_the_prior_and_both_forecasts_coincide_in_train_mode(
+    tiny_kwargs, inputs
+):
+    """Exact, not approximate: the closed-form KL and the model's own readouts (per-step KL and
+    its lag attribution) are $0$, the posterior equals the prior, $z^p = z^q$ elementwise, and
+    the base and full forecasts are bitwise identical -- the identity decoder dropout would break,
+    one module invoked twice with two independent masks."""
     out = _train_mode_forward(tiny_kwargs, inputs)
+
     assert float(_closed_form_kl(out).abs().max()) == 0.0
-    # The model's own readouts agree: per-step KL and its lag attribution are exactly zero.
     assert float(out["kld_per_t"].abs().max()) == 0.0
     assert float(out["source_kl_lag_map"].abs().max()) == 0.0
-
-
-def test_the_posterior_equals_the_prior_at_init(tiny_kwargs, inputs):
-    out = _train_mode_forward(tiny_kwargs, inputs)
     assert torch.equal(out["mu_post"], out["mu_prior"])
     assert torch.equal(out["logvar_post"], out["logvar_prior"])
-
-
-def test_the_latent_samples_are_identical_at_init(tiny_kwargs, inputs):
-    out = _train_mode_forward(tiny_kwargs, inputs)
     assert torch.equal(out["z_prior"], out["z_post"])
-
-
-def test_base_and_full_forecasts_are_bitwise_identical_in_train_mode(tiny_kwargs, inputs):
-    """The identity that decoder dropout would break: one module, two invocations, two
-    independent masks. Zero dropout in the decoder is what makes this exact."""
-    out = _train_mode_forward(tiny_kwargs, inputs)
     assert torch.equal(out["mu_base"], out["mu_full"])
     assert torch.equal(out["logvar_base"], out["logvar_full"])
 
@@ -74,7 +66,7 @@ def test_everything_above_becomes_false_once_perturbed(tiny_kwargs, inputs, pert
     """The zero must be a property of the init, not of the model being unable to produce a KL.
 
     Without this, a model whose KL was structurally stuck at zero -- a broken posterior, a
-    detached graph -- would pass every test above.
+    detached graph -- would pass the test above.
     """
     out = _train_mode_forward(tiny_kwargs, inputs, perturb=perturb_posterior)
     assert float(_closed_form_kl(out).abs().max()) > _TOL

@@ -62,45 +62,24 @@ except Exception:
     pass
 
 # ---------------------------------------------------------------------------------------
-# The architecture half: the causality probe and its two tolerances.
-#
-# Every invariant in this suite is measured the same way -- resample the strict future, require
-# bit-stability at the cut *and* visible movement at the end -- and the second half is the negative
-# control without which a dead layer passes every causality test in the package. Importing a fixture
-# binds it in this conftest's namespace, which is all pytest needs to serve it to the tests here.
-# ---------------------------------------------------------------------------------------
-from teb_vae.lag_attn_transformer_rws.tests.conftest import (  # noqa: E402,F401
-    CAUSALITY_TOL,
-    MOVEMENT_TOL,
-    assert_token_causal,
-    build_stream_encoder,
-    relative_change,
-    resample_after,
-)
-
-# ---------------------------------------------------------------------------------------
 # The target half: the committed causal shard, the config builder, the tiny warm-up staircase and
 # the stub batch that carries the two phase-key fields.
 #
 # ``perturb_posterior`` originates in ``lag_attn``; it is taken through the causal suite because
 # that is where the rest of this half comes from, and because the delta heads are zero-initialised
 # in every model of the family -- so at initialisation every KL assertion in this suite would pass
-# vacuously without it.
+# vacuously without it. Importing a fixture binds it in this conftest's namespace, which is all
+# pytest needs to serve it to the tests here.
 # ---------------------------------------------------------------------------------------
 from teb_vae.lag_attn_cfs.tests.conftest import (  # noqa: E402,F401
     BATCH,
     CAUSAL_C_U,
     CAUSAL_C_Y,
-    CAUSAL_PH_WIDTH,
     CAUSAL_SHARD,
     CAUSAL_ST_WIDTH,
-    COHORT_STATS_FILENAME,
-    SHIPPED_BUDGET_STEPS,
     SHIPPED_HORIZON,
     SHIPPED_SEQUENCE_LENGTH,
-    SHIPPED_TRIM_MINUTES,
     SHIPPED_WARMUP_PERIOD,
-    STUB_GAP_STEP,
     TASK_HPARAMS,
     TINY_HORIZON,
     TINY_SEQ_LEN,
@@ -121,10 +100,6 @@ from teb_vae.lag_attn_cfs.tests.conftest import (  # noqa: E402,F401
     make_stub_batch,
     make_streams,
     perturb_posterior,
-    stored_warmup,
-    without_key,
-    write_cohort_shards,
-    write_variant,
 )
 
 #: The geometry keys the imported target half closes over. They are read off the *causal* suite's
@@ -556,40 +531,6 @@ def trf_collected_run(trf_cohort_run, trf_cohort_overrides, tmp_path_factory) ->
 
 
 @pytest.fixture
-def config() -> Dict[str, Any]:
-    """A fresh configuration at the shipped causal geometry (safe to mutate)."""
-    return causal_config()
-
-
-@pytest.fixture
-def budget():
-    """The resolved warm-up budget at the shipped threshold, against the committed fixture.
-
-    Shipped means **aligned**: both streams carry a shift, the source is 47 channels wide, and
-    ``reference_delay_s`` is set. :func:`unaligned_budget` is the comparison arm.
-    """
-    from teb_vae.lag_attn_cfs.causal_warmup import resolve_warmup_budget
-
-    resolved = resolve_warmup_budget(causal_config())
-    assert resolved is not None
-    return resolved
-
-
-@pytest.fixture
-def unaligned_budget():
-    """The same budget with the alignment off: no shift, no reference, every source channel kept.
-
-    The comparison arm that stays reachable at one key, and what every assertion phrased as "the
-    warm-up budget alone decides this" is stated against.
-    """
-    from teb_vae.lag_attn_cfs.causal_warmup import resolve_warmup_budget
-
-    resolved = resolve_warmup_budget(causal_config(causal_align_reference=None))
-    assert resolved is not None
-    return resolved
-
-
-@pytest.fixture
 def tiny_kwargs() -> Dict[str, Any]:
     """A fresh copy of the ungated tiny constructor kwargs (safe to mutate)."""
     return dict(TINY_KWARGS)
@@ -614,21 +555,9 @@ def tiny_align() -> Dict[str, Any]:
 
 
 @pytest.fixture
-def streams():
-    """Seeded ``(y_st, y_ph, u_stream)`` at the tiny geometry and the causal widths."""
-    return make_streams(TINY_KWARGS)
-
-
-@pytest.fixture
 def stub_batch():
     """A two-sample stub batch at the tiny geometry, with the deliberate weight gap."""
     return make_stub_batch()
-
-
-@pytest.fixture
-def make_stub_batch_fn():
-    """Factory fixture returning :func:`make_stub_batch`."""
-    return make_stub_batch
 
 
 @pytest.fixture

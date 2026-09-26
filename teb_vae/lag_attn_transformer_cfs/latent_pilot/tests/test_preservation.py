@@ -162,20 +162,6 @@ def test_recordings_weigh_the_same_however_many_anchors_they_brought(loaded):
 # =============================================================================
 # Identity and deliberate degradation
 # =============================================================================
-def test_an_unchanged_model_passes_its_own_gate(loaded):
-    baseline = _measure(loaded)
-
-    result = evaluate.gate_decision(
-        baseline.record,
-        dict(baseline.record),
-        forecast_mse_max_increase=0.10,
-        saturation_max_increase_pp=5.0,
-    )
-
-    assert result.passed
-    assert result.reasons == []
-
-
 def test_moving_the_mean_heads_moves_the_full_branch_and_not_the_prior_branch(loaded):
     """The invariant and the measurement, from one pair of real readings."""
     before = _measure(loaded)

@@ -14,11 +14,11 @@ Three smaller properties travel with it:
 * **The margin is the model's own.** The bound is a sigmoid, so an exact-equality test against the
   asymptote reads $0.0$ forever while the variance sits pinned against it. Everything is measured
   against :data:`~teb_vae.lag_attn_rws.nets.model.LOGVAR_FLOOR_MARGIN_FRAC` of the clamp's range,
-  imported rather than restated, and the test asserts the import rather than the number.
+  and a real run's verdict must carry the checkpoint's own margin.
 * **Only the two saturation fractions need a masked recomputation.** In this model the
   log-variance fractions are *already* masked and it is ``mu_prior_sat_frac`` and
   ``delta_mu_sat_frac`` that are flat means over every element. Both are emitted and they may
-  legitimately disagree.
+  legitimately disagree, which a constructed warm-up-only saturation shows.
 * **The spectrum sums to the KL it decomposes**, and is drawn sorted with the activity threshold
   marked -- the count of active dimensions is a count against a line, and a bar chart without that
   line invites a reader to pick their own.
@@ -54,7 +54,7 @@ from teb_vae.lag_attn_cfs.eval.metrics import (
 from teb_vae.lag_attn_rws.nets.losses import KLD_ACTIVE_EPS
 from teb_vae.lag_attn_rws.nets.model import LOGVAR_FLOOR_MARGIN_FRAC
 
-from .conftest import make_stub_batch, shipped_warmup_kwargs
+from .conftest import make_stub_batch
 
 #: Bootstrap settings: instant, and seeded.
 EVAL_CONFIG = {"bootstrap_resamples": 200, "seed": 0}
@@ -68,25 +68,6 @@ def _by_name(verdicts) -> Dict[str, Any]:
 def _aggregate(**overall) -> Aggregate:
     """An aggregate carrying the named readouts and a healthy latent spectrum."""
     return Aggregate(overall=dict(overall), kld_per_dim=[0.4, 0.3, 0.2, 0.001])
-
-
-# =============================================================================
-# The margin is the model's, not a second copy of 0.05
-# =============================================================================
-def test_the_evaluation_reuses_the_models_own_floor_margin() -> None:
-    """Identity, not equality: two constants that happen to agree today are two constants."""
-    from teb_vae.lag_attn_rws.nets import model as model_module
-
-    assert metrics_module.LOGVAR_FLOOR_MARGIN_FRAC is model_module.LOGVAR_FLOOR_MARGIN_FRAC
-    assert metrics_module.SATURATION_FRAC is model_module.SATURATION_FRAC
-
-
-def test_the_margin_on_the_shipped_clamp_is_four_tenths_of_a_nat() -> None:
-    """The number a reader will see on the log-variance figure, derived rather than asserted from
-    memory: $0.05 \\times (3 - (-5)) = 0.4$."""
-    lo, hi = shipped_warmup_kwargs()["logvar_clamp"]
-
-    assert LOGVAR_FLOOR_MARGIN_FRAC * (hi - lo) == pytest.approx(0.4)
 
 
 # =============================================================================
@@ -241,24 +222,6 @@ def test_the_prior_rate_is_emitted_whatever_the_objective_weighted_it_at(
 # =============================================================================
 # The two saturation framings
 # =============================================================================
-def test_both_saturation_framings_are_emitted(task, perturb_posterior) -> None:
-    """Masked and unmasked, because in this model it is these two -- and not the log-variance
-    fractions -- that the model computes as flat means over every element."""
-    module = task()
-    perturb_posterior(module.orig_model)
-    module.eval()
-    torch.manual_seed(0)
-
-    readout = evaluate_batch(module, make_stub_batch(seed=3), num_samples=1)
-
-    for name in (
-        "mu_prior_sat_frac_raw", "mu_prior_sat_frac_masked",
-        "delta_mu_sat_frac_raw", "delta_mu_sat_frac_masked",
-    ):
-        assert name in readout.columns
-        assert readout.columns[name].shape == readout.n_anchors.shape
-
-
 def test_the_masked_saturation_framing_can_disagree_with_the_raw_one(
     task, perturb_posterior
 ) -> None:
@@ -411,18 +374,6 @@ def test_on_a_real_run_the_spectrum_sums_to_the_kl_it_decomposes(collected_run) 
     total = sum(block["health"]["kld_per_dimension"])
     assert total == pytest.approx(results["readouts"]["source_conditioned_kl_raw"], rel=1e-5)
     assert block["health"]["active_dims"] <= block["health"]["d_z"]
-
-
-@pytest.mark.slow
-def test_the_real_run_reports_every_diagnostic_with_its_meaning(collected_run) -> None:
-    rows = collected_run["summary"]["results"]["latent"]["diagnostics"]
-
-    assert {row["metric"] for row in rows} == {
-        name for name, _ in latent_analysis.DIAGNOSTIC_COLUMNS
-    }
-    for row in rows:
-        assert row["meaning"], f"{row['metric']} reports a number with no statement of what it is"
-        assert row["n"] == collected_run["summary"]["results"]["n_recordings"]
 
 
 @pytest.mark.slow

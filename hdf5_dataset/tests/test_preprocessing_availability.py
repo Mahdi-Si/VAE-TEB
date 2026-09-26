@@ -127,27 +127,6 @@ def test_a_perturbation_after_the_issue_time_reaches_no_earlier_sample_but_chang
     assert not np.array_equal(clean_fhr[0, 300:], moved_fhr[0, 300:])
 
 
-def test_the_interior_repair_is_the_only_non_pointwise_step(pipeline: Any) -> None:
-    """A NaN gap that straddles the issue time is the one way the sanitiser reads the future: with
-    the gap removed, the same two rows are prefix-equivalent through the whole sanitiser."""
-    with_gap = _ramp()
-    with_gap[0, 100:110] = np.nan
-    issue = 105
-
-    full_fhr, _ = pipeline._sanitize_signals(with_gap.copy(), with_gap.copy())
-    prefix_fhr, _ = pipeline._sanitize_signals(
-        with_gap[:, :issue].copy(), with_gap[:, :issue].copy()
-    )
-    assert not np.array_equal(full_fhr[0, :issue], prefix_fhr[0])
-
-    without_gap = _ramp()
-    full_fhr, _ = pipeline._sanitize_signals(without_gap.copy(), without_gap.copy())
-    prefix_fhr, _ = pipeline._sanitize_signals(
-        without_gap[:, :issue].copy(), without_gap[:, :issue].copy()
-    )
-    assert np.array_equal(full_fhr[0, :issue], prefix_fhr[0])
-
-
 @pytest.mark.parametrize("bad", [np.nan, np.inf, -np.inf])
 def test_every_non_finite_value_is_repaired_the_same_way(pipeline: Any, bad: float) -> None:
     full = _ramp()

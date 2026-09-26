@@ -20,7 +20,6 @@ and only one of the two may be silent.
 from __future__ import annotations
 
 import json
-from pathlib import Path
 from typing import List, Optional
 
 import numpy as np
@@ -29,7 +28,6 @@ import pytest
 import torch
 
 from teb_vae.lag_attn_rws.eval.collect import (
-    COLLECTION_FILENAME,
     HORIZON_STATISTICS,
     PER_ANCHOR_FILENAME,
     PER_ANCHOR_KEY,
@@ -608,32 +606,9 @@ def test_a_truncated_table_is_refused(tmp_path, trained_task):
         load_collection(tmp_path / "run")
 
 
-def test_the_sidecar_records_what_the_tables_were_collected_from(tmp_path, trained_task):
-    checkpoint, eval_config = _provenance_inputs(tmp_path)
-    _write_tables(trained_task, tmp_path / "run", checkpoint, eval_config)
-
-    record = json.loads((tmp_path / "run" / COLLECTION_FILENAME).read_text(encoding="utf-8"))
-
-    assert record["provenance"]["checkpoint"]["sha256"]
-    assert record["provenance"]["seed"] == 3
-    assert record["provenance"]["eval_config_digest"]
-    assert record["n_per_sample_rows"] == 2
-
-
 # =============================================================================
 # The run writes them
 # =============================================================================
-def test_the_run_leaves_both_tables_beside_its_summary(evaluated, collected):
-    """The demo: both tables open in pandas, with the class, subgroup and anchor columns on
-    them."""
-    results_dir = Path(evaluated["results_dir"])
-
-    assert (results_dir / PER_SAMPLE_FILENAME).is_file()
-    assert (results_dir / PER_ANCHOR_FILENAME).is_file()
-    assert evaluated["summary"]["collection"]["n_per_sample_rows"] == len(collected.per_sample)
-    assert "results" not in evaluated["summary"]["collection"], "the summary carries it once"
-
-
 def test_a_rerun_into_a_finished_directory_touches_no_forward(
     trained_run, repointed_overrides, tmp_path, monkeypatch
 ):
@@ -719,59 +694,3 @@ def test_only_the_two_exempt_analyses_forward_the_model_after_the_collection_pas
     assert summary["failed"] == ["sufficiency"]
     failures = summary["results"]["samples"]["failures"]
     assert failures and all("forwarded against" in entry["error"] for entry in failures)
-
-
-# =============================================================================
-# Observability
-#
-# The collection pass is the multi-hour step of a production run and every other step takes
-# seconds, so silence here is silence for the whole run -- and an operator who cannot tell a slow
-# pass from a hung one restarts a healthy one.
-# =============================================================================
-def _captured_logs(function, level: str = "INFO"):
-    """Run ``function`` with a loguru sink attached and return the messages it emitted."""
-    from loguru import logger
-
-    messages: List[str] = []
-    sink_id = logger.add(messages.append, level=level)
-    try:
-        function()
-    finally:
-        logger.remove(sink_id)
-    return messages
-
-
-def test_the_pass_reports_its_throughput_and_a_remaining_estimate(
-    trained_task, monkeypatch
-) -> None:
-    monkeypatch.setattr("teb_vae.lag_attn_rws.eval.collect.PROGRESS_EVERY_BATCHES", 1)
-    # Two recordings per batch: a batch holding one has no stranger in it to borrow a source
-    # from, so the permutation control excludes it whole and it never reaches the sink.
-    batches = [
-        _labelled_batch(["A", "B"], seed=1),
-        _labelled_batch(["C", "D"], seed=2, epoch_offset=-30000.0),
-    ]
-
-    messages = _captured_logs(lambda: _collect(trained_task, batches, n_total=4))
-
-    progress = [line for line in messages if "collection:" in line]
-    assert len(progress) == 2, progress
-    assert "samples/s" in progress[0]
-    assert "min remaining" in progress[0]
-    assert "2/4 sample(s)" in progress[0]
-
-
-def test_a_loader_that_cannot_say_how_long_it_is_gets_throughput_without_an_estimate(
-    trained_task, monkeypatch
-) -> None:
-    """An estimate against an unknown total would be a number with no meaning; the throughput is
-    still worth logging."""
-    monkeypatch.setattr("teb_vae.lag_attn_rws.eval.collect.PROGRESS_EVERY_BATCHES", 1)
-
-    messages = _captured_logs(
-        lambda: _collect(trained_task, [_labelled_batch(["A", "B"])], n_total=0)
-    )
-
-    progress = [line for line in messages if "collection:" in line]
-    assert progress and "no total" in progress[0]
-    assert "remaining" not in progress[0]

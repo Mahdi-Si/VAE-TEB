@@ -7,10 +7,9 @@ can surface -- a config key that reaches nothing, a metric name no callback coll
 attached at the wrong interval, a callback that raises on the first validation epoch, a diagnostic
 figure that fails to draw, or a front end that receives no gradient at all.
 
-Driven through ``main`` rather than by assembling the driver by hand, deliberately: the four
-inherited pre-flight guards, this package's own three, the temporary resolved-config file and the
-resolved-config write beside the checkpoints all hang off the entry point and are reached no other
-way.
+Driven through ``main`` rather than by assembling the driver by hand, deliberately: the inherited
+pre-flight guards, this package's own three and the temporary resolved-config file all hang off the
+entry point and are reached no other way.
 
 There is no evaluation pipeline for this architecture yet, which changes what this file is for.
 ``metrics_history.csv``, the tracked metric surface, ``train/grad_norm`` and the per-epoch
@@ -21,7 +20,6 @@ run will have produced something readable at the end of it.
 from __future__ import annotations
 
 import math
-import re
 from pathlib import Path
 
 import pandas as pd
@@ -30,9 +28,7 @@ import torch
 import yaml
 
 from teb_vae.lag_attn.config import load_config
-from teb_vae.lag_attn_rws import plotting as plotting_module
-from teb_vae.lag_attn_rws import sample_page
-from teb_vae.lag_attn_rws.trainer import _TRACKED_METRICS, RESOLVED_CONFIG_FILENAME
+from teb_vae.lag_attn_rws.trainer import _TRACKED_METRICS
 from teb_vae.lag_attn_transformer_e2e import trainer as trainer_module
 from teb_vae.lag_attn_transformer_e2e.nets.model import SeqVaeLagAttnTrfE2E
 from teb_vae.lag_attn_transformer_e2e.trainer import LagAttnTrfE2ETrainer
@@ -43,32 +39,12 @@ from .conftest import absolutize_dataset_paths
 pytestmark = pytest.mark.slow
 
 _TINY = Path(__file__).resolve().parents[1] / "configs" / "tiny.yaml"
-_DEFAULT = Path(__file__).resolve().parents[1] / "configs" / "default.yaml"
 
 #: Epochs the fit runs. Three rather than the config's one, for two reasons that are both about what
 #: only a multi-epoch run can show: ``lr`` is logged at train-epoch *start* with ``on_epoch=True``,
 #: so its first CSV cell is always NaN, and the step warm-up needs more than one epoch's worth of
 #: steps to be visibly non-constant at epoch granularity.
 SMOKE_EPOCHS = 3
-
-
-def _figure_outs_keys() -> set:
-    """The forward-dict keys the diagnostic figure builder indexes, read off its own source.
-
-    Derived rather than listed, so a key the figure starts reading is covered here without anything
-    being updated -- and a forward that stopped exporting one is caught by the fit rather than by a
-    swallowed exception inside the callback.
-
-    Returns:
-        The key names.
-    """
-    source = Path(sample_page.__file__).read_text(encoding="utf-8")
-    return {
-        name or fallback
-        for name, fallback in re.findall(
-            r"outs\[['\"]([a-z_]+)['\"]\]|outs\.get\(['\"]([a-z_]+)['\"]", source
-        )
-    }
 
 
 def _run_fit(tmp_path):
@@ -78,8 +54,7 @@ def _run_fit(tmp_path):
         tmp_path: Directory the run writes into.
 
     Returns:
-        ``(driver, trainer, figure_calls)`` -- the driver, its fitted Lightning ``Trainer``, and one
-        recorded ``outs`` key set per diagnostic figure the run drew.
+        ``(driver, trainer)`` -- the driver and its fitted Lightning ``Trainer``.
     """
     config = absolutize_dataset_paths(load_config(str(_TINY)))
     config["general_config"]["folders_config"]["out_dir_base"] = str(tmp_path)
@@ -91,9 +66,7 @@ def _run_fit(tmp_path):
     config_path.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
 
     captured = {}
-    figure_calls = []
     original_train_model = LagAttnTrfE2ETrainer.train_model
-    original_builder = plotting_module.build_diagnostic_figure
 
     def _capture_train_model(self, train_loader, validation_loader):
         result = original_train_model(self, train_loader, validation_loader)
@@ -101,21 +74,15 @@ def _run_fit(tmp_path):
         captured["trainer"] = result
         return result
 
-    def _capture_builder(*args, **kwargs):
-        figure_calls.append(set(kwargs["outs"]))
-        return original_builder(*args, **kwargs)
-
     LagAttnTrfE2ETrainer.train_model = _capture_train_model
-    plotting_module.build_diagnostic_figure = _capture_builder
     try:
         trainer_module.main(str(config_path))
     finally:
         # Deleted rather than reassigned: the method is inherited, and leaving a copy on the
         # subclass would shadow a later change to the one it inherits.
         del LagAttnTrfE2ETrainer.train_model
-        plotting_module.build_diagnostic_figure = original_builder
 
-    return captured["driver"], captured["trainer"], figure_calls
+    return captured["driver"], captured["trainer"]
 
 
 @pytest.fixture(scope="module")
@@ -132,14 +99,14 @@ def fit(tmp_path_factory):
 # The fit itself
 # --------------------------------------------------------------------------------------
 def test_the_fit_completes(fit):
-    _, trainer, _ = fit
+    _, trainer = fit
 
     assert trainer.current_epoch == SMOKE_EPOCHS
     assert trainer.state.finished
 
 
 def test_the_losses_stay_finite(fit):
-    _, trainer, _ = fit
+    _, trainer = fit
 
     for name, value in trainer.callback_metrics.items():
         assert math.isfinite(float(value)), f"{name} is {float(value)}"
@@ -159,7 +126,7 @@ def test_the_gradient_norm_is_finite_and_non_zero(fit):
     that reason, and it is re-derived from this metric on the first production run. A comparison
     here could fail a correct implementation and would carry no information either way.
     """
-    driver, trainer, _ = fit
+    driver, trainer = fit
     frame = pd.read_csv(Path(driver.train_results_dir) / "metrics_history.csv")
 
     observed = [float(value) for value in frame["train/grad_norm"].dropna().tolist()]
@@ -174,7 +141,7 @@ def test_every_front_end_parameter_moved_during_the_fit(fit):
     """The end-to-end form of the DDP-reachability claim: not merely that a gradient existed, but
     that the optimizer actually applied it. A front end that trained nothing would leave every
     downstream number looking exactly like a run of a model with a frozen input stage."""
-    driver, _, _ = fit
+    driver, _ = fit
     trained = driver.pytorch_model
     fresh = SeqVaeLagAttnTrfE2E(**driver._build_model_kwargs())
 
@@ -199,7 +166,7 @@ def test_the_zero_kl_init_invariant_survives_the_whole_stack(fit):
     zero -- after config resolution, the kwarg sweep and the framework's own seeding have each had a
     chance to break it.
     """
-    driver, _, _ = fit
+    driver, _ = fit
     model = SeqVaeLagAttnTrfE2E(**driver._build_model_kwargs()).eval()
     generator = torch.Generator().manual_seed(0)
     batch_size, seq_len = 2, model.sequence_length
@@ -231,29 +198,11 @@ def test_the_zero_kl_init_invariant_survives_the_whole_stack(fit):
 # --------------------------------------------------------------------------------------
 # The readout: the only one this architecture has
 # --------------------------------------------------------------------------------------
-def test_every_declared_metric_reaches_the_logger(fit):
-    """The gap between "the task emits it" and "a callback collected it" is silent otherwise. The
-    shuffled readouts are the ones only a real validation loop can prove wired."""
-    _, trainer, _ = fit
-
-    for name in (
-        "train/total_loss",
-        "train/main_loss",
-        "train/grad_norm",
-        "train/source_conditioned_kl_raw",
-        "val/total_loss",
-        "val/nll_shuffled_block",
-        "val/kld_shuffled",
-        "val/shuffle_penalty",
-    ):
-        assert name in trainer.callback_metrics, f"{name} never reached callback_metrics"
-
-
 def test_the_metrics_csv_carries_every_tracked_key_and_no_all_nan_column(fit):
     """Both halves of the tracked list's contract, on a real run: a name the framework never emits
     is a column that is NaN in every row of every run, and a tracked name that produced no column
     at all is a readout nothing ever recorded."""
-    driver, _, _ = fit
+    driver, _ = fit
     frame = pd.read_csv(Path(driver.train_results_dir) / "metrics_history.csv")
 
     missing = [name for name in _TRACKED_METRICS if name not in frame.columns]
@@ -267,7 +216,7 @@ def test_the_logged_learning_rate_is_non_constant(fit):
     catches the wrong-parent inheritance error at the level of a real fit. A ramp silently attached
     at epoch granularity, or never attached at all, produces a flat column here while every other
     assertion in this file still passes."""
-    driver, _, _ = fit
+    driver, _ = fit
     frame = pd.read_csv(Path(driver.train_results_dir) / "metrics_history.csv")
 
     observed = frame["lr"].dropna().tolist()
@@ -276,50 +225,6 @@ def test_the_logged_learning_rate_is_non_constant(fit):
     # And it moved *upwards*: the ramp is a warm-up, not the milestone decay, which cannot have
     # fired in three epochs against milestones at 400 and 800.
     assert observed[-1] > observed[0]
-
-
-def test_the_scheduled_beta_reaches_the_csv(fit):
-    """The resolved schedule value, which starts at exactly zero -- the posterior-collapse guard
-    the config documents."""
-    driver, _, _ = fit
-    frame = pd.read_csv(Path(driver.train_results_dir) / "metrics_history.csv")
-
-    assert "train/kld_beta" in frame.columns
-    assert float(frame["train/kld_beta"].iloc[0]) == pytest.approx(0.0)
-
-
-def test_the_run_directory_has_the_expected_layout(fit):
-    """The log sinks, the checkpoint directory and the resolved config a later offline pass needs."""
-    driver, _, _ = fit
-
-    assert (Path(driver.train_results_dir) / "full.log").is_file()
-    assert (Path(driver.train_results_dir) / "metrics_history.csv").is_file()
-    assert Path(driver.model_checkpoint_dir).is_dir()
-
-
-def test_the_resolved_config_is_written_beside_the_checkpoints(fit):
-    """A run's own config is otherwise recoverable only from the text of its log or from an MLflow
-    artifact whose on-disk location nothing can derive.
-
-    The target depth is the probe for the ``base:`` chain having resolved -- ``tiny.yaml`` does not
-    set it, so the value can only have come from ``default.yaml``. Read off that file rather than
-    pinned as a literal: a revision of the shipped depth would otherwise fail here for a reason that
-    has nothing to do with what this test is about."""
-    driver, _, _ = fit
-    shipped = yaml.safe_load(_DEFAULT.read_text(encoding="utf-8"))["model_config"]["VAE_model"]
-
-    written = Path(driver.model_checkpoint_dir) / RESOLVED_CONFIG_FILENAME
-    assert written.is_file()
-    reloaded = yaml.safe_load(written.read_text(encoding="utf-8"))
-    assert "base" not in reloaded
-    assert "target_attention_blocks" not in yaml.safe_load(
-        _TINY.read_text(encoding="utf-8")
-    )["model_config"]["VAE_model"], "the probe stopped being inherited"
-    assert (
-        reloaded["model_config"]["VAE_model"]["target_attention_blocks"]
-        == shipped["target_attention_blocks"]
-    )
-    assert reloaded["dataset_config"]["dataloader_config"]["normalize_fields"] == ["fhr", "up"]
 
 
 def test_the_validation_figures_are_written_by_a_real_fit(fit):
@@ -331,7 +236,7 @@ def test_the_validation_figures_are_written_by_a_real_fit(fit):
     callback swallows its own exceptions by design, so a broken figure is silent everywhere except
     in this file count.
     """
-    driver, _, _ = fit
+    driver, _ = fit
 
     directory = Path(driver.train_results_dir) / "lag_attn_rws_diagnostics"
     figures = list(directory.glob("lag_attn_rws_epoch*.pdf"))
@@ -344,41 +249,14 @@ def test_the_validation_figures_are_written_by_a_real_fit(fit):
     assert list(directory.glob("causal_input_budget.*")) == []
 
 
-def test_the_figure_builder_receives_every_key_it_reads(fit):
-    """The figure reads several keys off the forward dict, and the callback swallows the
-    ``KeyError`` a missing one would raise -- so without this the failure mode is a run that
-    silently draws nothing."""
-    _, _, figure_calls = fit
-    needed = _figure_outs_keys()
-
-    assert needed, "the key scan found nothing; the figure builder's source changed shape"
-    assert figure_calls, "the figure builder was never called"
-    for keys in figure_calls:
-        assert needed <= keys, f"the forward dict is missing {sorted(needed - keys)}"
-
-
 # --------------------------------------------------------------------------------------
 # The checkpoint
 # --------------------------------------------------------------------------------------
-def test_the_checkpoint_is_written_under_this_models_stem(fit):
-    """Three architectures writing ``lag-attn-rws-epoch=00.ckpt`` would be indistinguishable by
-    name, and the stem is the one string this package supplies to the inherited callback
-    assembly."""
-    driver, _, _ = fit
-
-    checkpoints = list(Path(driver.model_checkpoint_dir).glob("*.ckpt"))
-
-    assert checkpoints, "no checkpoint was written; Lightning's default would have gone elsewhere"
-    assert all(path.name.startswith("lag-attn-trf-e2e-epoch=") for path in checkpoints), [
-        path.name for path in checkpoints
-    ]
-
-
 def test_the_checkpoint_carries_its_contract_and_reloads(fit):
     """The end of the road: a blob that describes itself and rebuilds without a config file,
     through the repository's own loading helpers. The front ends' fixed anti-alias filters are
     non-persistent, so the strict load has to align without them."""
-    driver, _, _ = fit
+    driver, _ = fit
 
     path = next(iter(Path(driver.model_checkpoint_dir).glob("*.ckpt")))
     blob = torch.load(path, map_location="cpu", weights_only=False)

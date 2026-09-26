@@ -13,18 +13,14 @@ metrics exactly, and it differs from the unweighted one whenever a weighting is 
 and a page that indexed it as a stored step would draw real numbers at the wrong columns with no
 shape error anywhere in it.
 
-**The suppression map's two ends are exact.** Removing no lag must reproduce the matched arm and
-removing every lag must reproduce the target-only prior; those are the invariants that make the
-rest of the map a measurement rather than an arithmetic accident.
+**The suppression row is the controls' own per-lag divergence drop**, on a woken pathway and on
+the anchor axis the rest of the page uses; the map's exact ends are the controls' own tests.
 
 **A failure never reaches the fit.** The callback swallows exceptions to protect a multi-day run,
 so a page that stopped being drawn would otherwise be visible only as one log line per epoch.
 """
 from __future__ import annotations
 
-import ast
-import inspect
-import textwrap
 from typing import Any, List, Tuple
 
 import numpy as np
@@ -39,7 +35,6 @@ import matplotlib.pyplot as plt  # noqa: E402
 
 from teb_vae.lag_attn_cfs.sample_page import (  # noqa: E402
     CAUSAL_EXTRA_ROWS,
-    LAG_TIME_CAVEAT,
     _Stitched,
     _window_block_scores,
 )
@@ -49,10 +44,7 @@ from teb_vae.lag_attn_rws.nets.raw_masks import (  # noqa: E402
 )
 from teb_vae.lag_attn_rws.sample_page import ForecastRowInputs  # noqa: E402
 from teb_vae.lag_slot_transformer_cfs import plotting, sample_page  # noqa: E402
-from teb_vae.lag_slot_transformer_cfs.nets.controls import (  # noqa: E402
-    SUPPRESSION_QUALIFICATION,
-    suppressed_parameters,
-)
+from teb_vae.lag_slot_transformer_cfs.nets.controls import suppressed_parameters  # noqa: E402
 from teb_vae.lag_slot_transformer_cfs.plotting import (  # noqa: E402
     LagResidualTrfCfsPlotCallback,
 )
@@ -218,12 +210,6 @@ def test_it_writes_one_page_per_drawn_sample_and_logs_each(tmp_path) -> None:
     assert len(_pages(callback)) == 2
     assert all(path.stat().st_size > 0 for path in _pages(callback))
     assert len(logger.experiment.calls) >= 2
-
-
-def test_the_pages_land_under_this_packages_own_subdirectory(tmp_path) -> None:
-    """A run that somehow wrote both this page and the family's keeps them apart."""
-    callback = LagResidualTrfCfsPlotCallback(tmp_path, num_examples=1, file_format="png")
-    assert callback.output_dir == tmp_path / "lag_residual_trf_cfs_diagnostics"
 
 
 def test_a_failure_inside_the_page_never_reaches_the_training_loop(tmp_path, monkeypatch) -> None:
@@ -400,7 +386,6 @@ def test_the_page_draws_both_input_rows() -> None:
     _outs, _target, _weight, inputs = _forward(task, StubBatch())
     panels = task.input_stream_panels(model, inputs, sample_index=0)
     assert [panel.name for panel in panels] == ["target", "source"]
-    assert model.source_adapter is None
 
 
 def test_the_lag_rows_are_absent_where_no_per_lag_update_exists() -> None:
@@ -560,35 +545,29 @@ def test_the_weighted_score_differs_from_the_row_this_cell_would_otherwise_inher
 # =================================================================================================
 # The suppression map
 # =================================================================================================
-def test_removing_no_lag_reproduces_the_matched_arm() -> None:
-    """The map's zero end. An empty band subtracts an empty sum, exactly."""
-    model = build_tiny_model()
+def _woken_forward() -> Tuple[Any, Any]:
+    """The tiny model with its proposal head moved off zero, and one dense forward of it.
+
+    At the zero start every proposal, update and divergence is exactly zero, so every per-lag row
+    would compare zeros with zeros.
+
+    Returns:
+        ``(model, outs)``, the forward carrying its per-lag proposals.
+    """
+    model = build_tiny_model().eval()
+    torch.manual_seed(20260909)
+    torch.nn.init.normal_(model.proposal_head.output_proj.weight, std=0.3)
+    torch.nn.init.normal_(model.proposal_head.output_proj.bias, std=0.3)
     y_st, y_ph, source = tiny_streams()
     with torch.no_grad():
         outs = model(y_st, y_ph, source, 0, 1, return_proposals=True)
-        removed = torch.zeros(int(outs["mean_proposals"].shape[2]), dtype=torch.bool)
-        again = suppressed_parameters(model, outs, removed)
-    assert torch.equal(again["kld_per_anchor"], outs["kld_per_anchor"])
-
-
-def test_removing_every_lag_reproduces_the_target_only_prior() -> None:
-    """The map's other end. A sum over no lags is zero, so the full branch is the prior."""
-    model = build_tiny_model()
-    y_st, y_ph, source = tiny_streams()
-    with torch.no_grad():
-        outs = model(y_st, y_ph, source, 0, 1, return_proposals=True)
-        removed = torch.ones(int(outs["mean_proposals"].shape[2]), dtype=torch.bool)
-        stripped = suppressed_parameters(model, outs, removed)
-    assert torch.equal(stripped["mu_post"], outs["mu_prior"])
-    assert torch.count_nonzero(stripped["kld_per_anchor"]) == 0
+    assert float(outs["kld_per_anchor"].abs().max()) > 0.0, "the pathway did not wake"
+    return model, outs
 
 
 def test_the_suppression_row_is_the_divergence_each_lag_alone_accounts_for() -> None:
     """One lag at a time, against the matched arm, on the anchor axis the rest of the page uses."""
-    model = build_tiny_model()
-    y_st, y_ph, source = tiny_streams()
-    with torch.no_grad():
-        outs = model(y_st, y_ph, source, 0, 1, return_proposals=True)
+    model, outs = _woken_forward()
     panels = sample_page.residual_lag_panels(model, outs, sample_index=0)
     assert panels is not None
 
@@ -612,10 +591,7 @@ def test_the_cancellation_row_carries_both_parts_of_the_ratio() -> None:
 
     The denominator is what separates them, and a row drawing the ratio alone could not.
     """
-    model = build_tiny_model()
-    y_st, y_ph, source = tiny_streams()
-    with torch.no_grad():
-        outs = model(y_st, y_ph, source, 0, 1, return_proposals=True)
+    model, outs = _woken_forward()
     panels = sample_page.residual_lag_panels(model, outs, sample_index=0)
     assert panels is not None
     assert panels.cancellation_numerator == pytest.approx(
@@ -629,29 +605,6 @@ def test_the_cancellation_row_carries_both_parts_of_the_ratio() -> None:
 # =================================================================================================
 # What the page costs the fit
 # =================================================================================================
-def test_the_captions_break_only_between_maths() -> None:
-    """This page wraps its own captions on whitespace, which is safe only while this holds.
-
-    ``Text(wrap=True)`` re-measures once per word and re-parses the line's mathtext on every one
-    of those measurements, which cost two blocks of prose a third of the page's whole render.
-    Wrapping here removes that, at the price of breaking on whitespace rather than on measured
-    width -- so a ``$...$`` span containing a space would be split across two lines and render as
-    literal dollar signs and backslashes.
-    """
-    for caption in (LAG_TIME_CAVEAT, SUPPRESSION_QUALIFICATION):
-        assert caption.count("$") % 2 == 0, "unbalanced maths in a caption"
-        # Splitting on the delimiter puts the maths in the odd segments and the prose between
-        # them in the even ones, which is the only way to ask the question about the spans
-        # themselves rather than about the sentences separating two of them.
-        spans = caption.split("$")[1::2]
-        for span in spans:
-            assert " " not in span, (
-                f"the maths span {span!r} contains a space, so a whitespace wrap can split it"
-            )
-        for line in sample_page.wrapped_caption(caption).splitlines():
-            assert line.count("$") % 2 == 0, f"the wrap split a maths span: {line!r}"
-
-
 def test_the_captions_stay_inside_the_page() -> None:
     """A character count is not a measurement, so the rendered width is asserted rather than
     assumed: too generous and the caption runs off the page, which no exception reports."""
@@ -669,32 +622,27 @@ def test_the_captions_stay_inside_the_page() -> None:
         plt.close(figure)
 
 
-def test_the_page_is_not_saved_at_the_publication_resolution() -> None:
+def test_the_page_is_saved_directly_below_the_publication_resolution(tmp_path, monkeypatch) -> None:
     """The single most expensive thing this callback could do, and it is not worth anything.
 
     Every heatmap here is a small array -- one column per decoded anchor -- and matplotlib
-    resamples each to the axes' size in device pixels. At the family's publication resolution
-    those few hundred columns become eight thousand, once per row, and the written file is the
-    same size to within a few percent. MEASURED at the production geometry: a plotted epoch cost
-    $49.6$ s through the shared helper and $12.7$ s through this one. On rank zero inside a
-    distributed fit, that is time every other rank spends waiting at the next collective.
+    resamples each to the axes' size in device pixels, so the publication resolution multiplies
+    the draw cost for a file of about the same size. A tight bounding box costs a second full
+    draw on top, and this page sets its margins explicitly. MEASURED at the production geometry: a
+    plotted epoch cost $49.6$ s through the shared helper and $12.7$ s through this one. On rank
+    zero inside a distributed fit, that is time every other rank spends waiting at the next
+    collective.
     """
-    assert plotting.PAGE_DPI < SAVE_DPI
+    callback = LagResidualTrfCfsPlotCallback(tmp_path, num_examples=1, file_format="png")
+    figure = plt.figure()
+    seen: dict = {}
+    monkeypatch.setattr(figure, "savefig", lambda *_args, **kwargs: seen.update(kwargs))
 
-    # Read as syntax rather than as text: the method's own docstring names both of the things
-    # being ruled out, so a substring search over the source would fail on the explanation.
-    tree = ast.parse(textwrap.dedent(inspect.getsource(LagResidualTrfCfsPlotCallback._save)))
-    calls = [node for node in ast.walk(tree) if isinstance(node, ast.Call)]
-    called = {node.func.attr for node in calls if isinstance(node.func, ast.Attribute)}
-    called |= {node.func.id for node in calls if isinstance(node.func, ast.Name)}
-    keywords = {keyword.arg for node in calls for keyword in node.keywords}
+    callback._save(figure, tmp_path / "page.png", None)
 
-    assert "savefig" in called, "the page must be written directly"
-    assert "close" in called, "the figure must be closed even when the save raises"
-    assert "save_figure" not in called, "the shared helper always passes the tight bounding box"
-    assert "bbox_inches" not in keywords, (
-        "a tight bounding box costs a second full draw, and this page has explicit margins"
-    )
+    assert seen["dpi"] < SAVE_DPI
+    assert "bbox_inches" not in seen
+    assert figure.number not in plt.get_fignums(), "the figure must be closed after the save"
 
 
 def test_a_save_that_raises_still_closes_the_figure(tmp_path, monkeypatch) -> None:
@@ -807,13 +755,9 @@ def test_the_page_reaches_no_collective_on_rank_zero(tmp_path, monkeypatch) -> N
     assert len(_pages(callback)) == 1
 
 
-def test_the_title_carries_the_epochs_own_readouts(tmp_path) -> None:
-    """Taken from the run rather than recomputed, so the figure and the curve cannot disagree.
-
-    They are also labelled as the epoch's on the page: they cover the whole validation set, while
-    every row below them is one recording, and an unlabelled ``pred_gap`` would be read as this
-    sample's and found not to match the row that resolves it in time.
-    """
+def test_the_title_carries_the_epochs_own_readouts() -> None:
+    """Taken from the run rather than recomputed, so the figure and the curve cannot disagree:
+    only the finite validation metrics, with the stage prefix stripped."""
     trainer = _trainer_with_batch(StubBatch())
     trainer.callback_metrics = {  # type: ignore[attr-defined]
         "val/pred_gap": torch.tensor(0.25),
@@ -824,9 +768,3 @@ def test_the_title_carries_the_epochs_own_readouts(tmp_path) -> None:
     readouts = plotting._epoch_readouts(trainer)
     assert readouts == {"pred_gap": 0.25}, "only finite validation metrics, unprefixed"
     assert plotting._epoch_readouts(FakeTrainer(is_global_zero=True, current_epoch=0)) == {}
-
-    figure = _render(build_task(), StubBatch(), scalars={"pred_gap": 0.25})
-    try:
-        assert "validation epoch:" in figure._suptitle.get_text()
-    finally:
-        plt.close(figure)

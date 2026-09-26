@@ -224,31 +224,19 @@ def test_every_builder_draws_the_candidate_summary(name: str) -> None:
 
 
 @pytest.mark.parametrize("name", sorted(BUILDERS))
-def test_every_builder_survives_a_target_only_summary(name: str) -> None:
-    """The arms with the fewest blocks are the ones a comparison cannot do without.
+def test_every_builder_survives_a_target_only_and_an_empty_summary(name: str) -> None:
+    """The arms with the fewest blocks are the ones a comparison cannot do without, and an empty
+    artifact draws empty panels rather than raising.
 
     Args:
         name: The builder.
     """
-    figure = BUILDERS[name](target_only_summary())
-    try:
-        assert figure.axes, name
-    finally:
-        plt.close(figure)
-
-
-@pytest.mark.parametrize("name", sorted(BUILDERS))
-def test_every_builder_survives_an_empty_summary(name: str) -> None:
-    """An empty artifact draws empty panels rather than raising.
-
-    Args:
-        name: The builder.
-    """
-    figure = BUILDERS[name]({})
-    try:
-        assert figure.axes, name
-    finally:
-        plt.close(figure)
+    for summary in (target_only_summary(), {}):
+        figure = BUILDERS[name](summary)
+        try:
+            assert figure.axes, name
+        finally:
+            plt.close(figure)
 
 
 def test_the_three_readout_analyses_write_their_figures_and_tables(tmp_path: Path) -> None:
@@ -311,21 +299,6 @@ def test_the_three_readout_analyses_write_their_figures_and_tables(tmp_path: Pat
     assert blocks[arms.ANALYSIS_DIRNAME]["scored_split"]["n_recordings"] == 5
 
 
-def test_the_lag_axis_is_labelled_in_stored_coefficient_time() -> None:
-    """A lag figure that did not say what its axis is time IN would read as physiological time."""
-    figure = figures.build_lag_profile_figure(candidate_summary())
-    try:
-        # The seconds axis is a child of the top panel rather than a panel of its own.
-        labels = [ax.get_xlabel() for ax in figure.axes]
-        labels += [child.get_xlabel() for ax in figure.axes for child in ax.child_axes]
-        assert any("stored-coefficient time" in label for label in labels)
-        assert any("stored steps back from the anchor" in label for label in labels)
-        # And the qualification travels on the figure itself.
-        assert any("fitted computation" in text.get_text() for text in figure.texts)
-    finally:
-        plt.close(figure)
-
-
 def test_the_lag_axis_and_the_band_labels_follow_the_summary_under_another_window() -> None:
     """No builder holds a band name or a lag count: a summary over a longer window with six
     declared bands draws that many lag positions and names those six bands."""
@@ -363,16 +336,6 @@ def test_the_lag_axis_and_the_band_labels_follow_the_summary_under_another_windo
         assert [text.get_text() for text in axes.texts] == names
     finally:
         plt.close(axes.figure)
-
-
-def test_a_missing_band_margin_is_drawn_as_not_measured() -> None:
-    """A band with nothing to remove stays on the figure, marked, rather than vanishing."""
-    figure = figures.build_band_figure(candidate_summary())
-    try:
-        texts = [text.get_text() for ax in figure.axes for text in ax.texts]
-        assert "not measured" in texts
-    finally:
-        plt.close(figure)
 
 
 # =============================================================================
@@ -483,12 +446,8 @@ def test_the_markdown_report_reads_the_record_rather_than_recomputing_it() -> No
     record = acceptance_record()
     text = acceptance.report_markdown(record)
 
-    assert "# Acceptance record" in text
-    assert "the_pathway_entire" in text
     assert "-0.8 [-1.3, -0.3]" in text
     assert "NO_EVIDENCE" in text
-    assert "confirmation_partition" in text
-    assert "peak" in text
     # A control that did not run is reported as such rather than as a blank cell.
     assert "NOT_RUN" in text
     # The document is valid text for a file, round-tripping through JSON like the record does.

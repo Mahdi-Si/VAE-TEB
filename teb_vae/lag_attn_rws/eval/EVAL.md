@@ -2,9 +2,7 @@
 
 What a run of `teb_vae.lag_attn_rws.eval` is, what it leaves behind, what each analysis means,
 and how the output is misread. `FIGURE_GUIDE.md` beside this file documents every emitted PDF;
-this document is everything that is not a figure. Both are bound to the code by test: every
-registered analysis has a heading here, every resolved `eval_config` key is mentioned here, and
-every figure in the committed `figure_manifest.json` has a guide entry.
+this document is everything that is not a figure.
 
 ## What a run is
 
@@ -165,7 +163,7 @@ is expected raises (`True` would silently cap at 1), and a cap of `0` raises.
 | `min_active_dims` | Active latent dimensions below which the latent counts as collapsed. |
 | `event_lag_window_s` | Seconds after a detected contraction within which an anchor counts as event-conditioned. |
 | `bootstrap_resamples` | Resamples behind every bootstrap interval, drawn over recordings — never over anchors, whose windows overlap 29/30. |
-| `figure_format` | Image format every figure of the run is written in, as a matplotlib filetype (`pdf`, `svg`, `png`, `eps`, …); validated at config load against the installed matplotlib's own list. `null` — the shipped setting — keeps the `pdf` default, which is what `figure_manifest.json` and `FIGURE_GUIDE.md` record and what the smoke suite compares a real run against; a run that changes it writes filenames those files do not list. |
+| `figure_format` | Image format every figure of the run is written in, as a matplotlib filetype (`pdf`, `svg`, `png`, `eps`, …); validated at config load against the installed matplotlib's own list. `null` — the shipped setting — keeps the `pdf` default, which is what `figure_manifest.json` and `FIGURE_GUIDE.md` record; a run that changes it writes filenames those files do not list. |
 | `max_hours_before_delivery` | How far before delivery a segment may be recorded and still be evaluated, in hours; `4.0` keeps the last four hours, `null` — the shipped setting — evaluates everything. **The bound is on the population, not on an axis**: it is applied to the delivery clock before anything is binned, so every clock answers for the same segments and the second-stage clock re-bins that population on its own signed axis rather than being cut at a second, differently-defined four hours. It moves cohort sizes, window counts and every trajectory, so a bounded run is not comparable with an unbounded one — which is why it is a key, recorded in the run's dumped config. Minimum one 0.5 h bin. |
 
 Deliberately **not** keys: the significance level and the trajectory bin width (an operator who
@@ -834,9 +832,7 @@ These are the readings the numbers invite and do not support.
 `causal_reach_budget_s: null` the input features at step $t$ read far into their own future; the
 reach guard is a 95%-energy quantile rather than a hard support, measured at roughly 20×
 suppression at 120 s rather than removal; and no finite budget is currently trainable. Every run
-carries the refusal sentence verbatim in `preflight.json` and `summary.json`, and
-`tests/test_eval_naming.py` scans the whole artifact tree — plus this file and the figure guide —
-for the name the readout refuses.
+carries the refusal sentence verbatim in `preflight.json` and `summary.json`.
 
 **Specificity is read in prediction space, not in KL space.** See `perm_control`:
 $K_{\mathrm{shuffled}} > K_{\mathrm{true}}$ is what a healthy model does, so a KL-space criterion
@@ -1041,7 +1037,7 @@ would leave two runs' rows under one summary.
 ### Guard recovery table
 
 One row per way preflight refuses a run. Each refusal's own message names the fix; this is the
-index, and `tests/test_eval_docs.py` asserts every raise site in `preflight.py` has a row.
+index.
 
 | Refusal begins | Cause | Recovery |
 |---|---|---|

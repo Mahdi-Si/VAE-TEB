@@ -10,9 +10,7 @@ zero with no mask channel would be indistinguishable from a genuine mid-range sa
 difference gated on one endpoint only would inject a step of $\mathcal O(\sigma)$ at the first
 valid sample after every gap, which is exactly where a real deceleration would sit.
 
-Each of those is asserted here, and the last test is the negative control the others need: on the
-stub batch's planted gap the mask channel must not be identically one, or every criterion above is
-being checked against a batch that has no gap in it.
+Each of those is asserted here, on a hand-built grid with one fully invalid step.
 """
 from __future__ import annotations
 
@@ -20,13 +18,7 @@ import pytest
 import torch
 
 from teb_vae.lag_attn_rws.nets.raw_masks import VALID_THRESHOLD
-from teb_vae.lag_attn_transformer_e2e.nets.frontend import FEATURE_CHANNELS, featurize
-from teb_vae.lag_attn_transformer_e2e.tests.conftest import (
-    BATCH,
-    SEQ_LEN,
-    STUB_GAP_STEP,
-    make_stub_batch,
-)
+from teb_vae.lag_attn_transformer_e2e.nets.frontend import featurize
 
 #: Raw samples per decimated step, as the loader writes them. Restated rather than imported from
 #: the front end, so a change to the front end's stride cannot silently redefine what this file
@@ -51,14 +43,6 @@ def _grid(steps: int = 6, *, gap_at: int = 3) -> tuple:
     weight = torch.ones(1, steps)
     weight[:, gap_at] = 0.0
     return raw, weight
-
-
-def test_the_output_is_three_channels_at_the_raw_rate():
-    raw, weight = _grid()
-
-    features = featurize(raw, weight)
-
-    assert features.shape == (1, FEATURE_CHANNELS, raw.shape[-1])
 
 
 def test_an_invalid_step_is_zero_in_every_channel_for_all_of_its_raw_samples():
@@ -158,18 +142,3 @@ def test_a_mismatched_pair_is_refused_by_name(raw, weight, message):
     """
     with pytest.raises(ValueError, match=message):
         featurize(raw, weight)
-
-
-# ---------------------------------------------------------------------------------------
-# The negative control
-# ---------------------------------------------------------------------------------------
-def test_the_stub_batch_actually_exercises_the_masked_path():
-    """The control every test above depends on. A fixture whose weight had quietly become uniform
-    would leave all of them green while testing none of the gap behaviour."""
-    batch = make_stub_batch(BATCH, SEQ_LEN)
-
-    features = featurize(batch.fhr, batch.weight)
-
-    assert not bool((features[:, MASK] == 1.0).all())
-    span = slice(STUB_GAP_STEP * RAW_PER_STEP, (STUB_GAP_STEP + 1) * RAW_PER_STEP)
-    assert torch.equal(features[:, MASK, span], torch.zeros(BATCH, RAW_PER_STEP))

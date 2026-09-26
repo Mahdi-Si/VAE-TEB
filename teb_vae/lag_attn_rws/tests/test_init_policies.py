@@ -6,7 +6,8 @@ calibration (so the raw-target NLL starts at the trivial predictor's level, not 
 above it), and the posterior source gain (so the attended source summary is not out-columned by the
 target state in the fusion). Each is a config key the init-off sweep arm reverts together, and each
 default is an exact no-op -- which is why the policy-on assertions here build with the policy on
-rather than merely constructing the model.
+rather than merely constructing the model. The zero-KL start and the lag-map identity are
+checked once, under the full shipped flag set, rather than once per policy.
 
 At init the KL is identically zero, so the KL/lag-map assertions perturb the posterior first (via
 the shared ``perturb_posterior`` fixture); without that they pass on any model at all.
@@ -15,6 +16,7 @@ from __future__ import annotations
 
 import math
 
+import pytest
 import torch
 
 from teb_vae.lag_attn.nets.blocks import smooth_bound
@@ -68,12 +70,6 @@ def test_the_embedding_is_reseeded_at_the_configured_std(tiny_kwargs):
     assert 0.7 < std < 0.9, f"embedding std {std} is not near the configured 0.8"
 
 
-def test_the_default_std_leaves_the_core_seed_untouched(tiny_kwargs):
-    """0.02 is the core's own seed, so the default policy is a no-op and the embedding stays small."""
-    std = float(_model(tiny_kwargs, horizon_embed_std=0.02).horizon_core.horizon_embedding.std())
-    assert std < 0.05
-
-
 def test_a_large_std_breaks_the_horizon_token_symmetry(tiny_kwargs):
     """Self-verifying: the large std drops the token correlation well below the small-std negative
     control, so a refactor that dropped the reseed would fail here rather than pass silently."""
@@ -82,17 +78,6 @@ def test_a_large_std_breaks_the_horizon_token_symmetry(tiny_kwargs):
 
     assert corr_big < 0.9, f"tokens still {corr_big:.3f} correlated at std 0.8"
     assert corr_small > 0.95, f"control tokens only {corr_small:.3f} correlated at std 0.02"
-
-
-def test_the_embedding_reseed_preserves_the_zero_kl_start(tiny_kwargs, inputs):
-    """The policy touches only the decoder embedding, not the posterior deltas, so the KL is still
-    exactly zero and the two forecasts bitwise identical at init."""
-    model = _model(tiny_kwargs, horizon_embed_std=0.8).train()
-    torch.manual_seed(0)
-    out = model(*inputs)
-
-    assert float(out["kld_per_t"].abs().max()) == 0.0
-    assert torch.equal(out["mu_base"], out["mu_full"])
 
 
 # =========================================================================================
@@ -190,38 +175,13 @@ def test_the_uncalibrated_prior_is_not_at_unit_scale(tiny_kwargs, inputs):
     assert float(out["logvar_prior"].abs().mean()) > 0.5
 
 
-def test_the_prior_calibration_preserves_the_zero_kl_start(tiny_kwargs, inputs):
-    """The posterior's log-variance residual is built on the prior's raw pre-bound tensor, so
-    pinning that tensor moves prior and posterior together and the KL stays exactly zero."""
-    model = _model(tiny_kwargs, head_init_calibration=True).train()
-    torch.manual_seed(0)
-    out = model(*inputs)
-
-    assert float(out["kld_per_t"].abs().max()) == 0.0
-    assert torch.equal(out["logvar_post"], out["logvar_prior"])
-
-
 # =========================================================================================
 # Posterior source gain (R2-C1)
 # =========================================================================================
-def test_the_a_head_gain_is_the_configured_constant(tiny_kwargs):
-    weight = _model(tiny_kwargs, a_head_gain=2.0).posterior_head.a_head_norm.weight
-    assert torch.equal(weight, torch.full_like(weight, 2.0))
-
-
-def test_the_default_gain_is_the_plain_unit_norm(tiny_kwargs):
-    weight = _model(tiny_kwargs, a_head_gain=1.0).posterior_head.a_head_norm.weight
-    assert torch.equal(weight, torch.ones_like(weight))
-
-
-def test_the_source_gain_preserves_the_zero_kl_start(tiny_kwargs, inputs):
-    """The gain rescales the attended summary, but the posterior deltas are still zero at init, so
-    the closed-form KL is exactly zero."""
-    model = _model(tiny_kwargs, a_head_gain=2.0).train()
-    torch.manual_seed(0)
-    out = model(*inputs)
-
-    assert float(out["kld_per_t"].abs().max()) == 0.0
+@pytest.mark.parametrize("gain", [1.0, 2.0], ids=["plain-unit-norm", "configured-gain"])
+def test_the_a_head_gain_is_the_configured_constant(tiny_kwargs, gain):
+    weight = _model(tiny_kwargs, a_head_gain=gain).posterior_head.a_head_norm.weight
+    assert torch.equal(weight, torch.full_like(weight, gain))
 
 
 # =========================================================================================

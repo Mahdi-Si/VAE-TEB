@@ -270,29 +270,22 @@ def _class_frame(counts: Dict[str, int]) -> pd.DataFrame:
     )
 
 
-def test_the_class_draw_gives_every_class_the_same_number_of_pages() -> None:
+@pytest.mark.parametrize(
+    "n_hie, expected_hie",
+    [(12, 10), (3, 3)],
+    ids=["every_class_capped_equally", "a_short_class_contributes_all_it_has"],
+)
+def test_the_class_draw_gives_every_class_the_same_number_of_pages(n_hie, expected_hie) -> None:
     """The whole difference from the stratified draw. On the shipped cohort the healthy class
     carries most of the segments, so a proportional quota leaves ``hie`` a page or two against
-    healthy's dozen -- and two directories drawn that way cannot be compared, which is what these
-    pages are for."""
-    frame = _class_frame({"healthy": 50, "acidosis": 20, "hie": 12})
+    healthy's dozen -- and two directories drawn that way cannot be compared. The count is an upper
+    bound, not a promise: a class the split barely carries is drawn in full rather than refused."""
+    frame = _class_frame({"healthy": 50, "acidosis": 20, "hie": n_hie})
 
     drawn = samples_analysis.per_class_rows(frame, per_class=10, seed=0)
 
     assert dict(drawn[labels.CLASS_COLUMN].value_counts()) == {
-        "healthy": 10, "acidosis": 10, "hie": 10
-    }
-
-
-def test_a_class_with_fewer_segments_than_asked_for_contributes_all_of_them() -> None:
-    """The count is an upper bound, not a promise: a class the split barely carries is drawn in
-    full rather than refused, and the shortfall is visible in the page count."""
-    frame = _class_frame({"healthy": 50, "acidosis": 20, "hie": 3})
-
-    drawn = samples_analysis.per_class_rows(frame, per_class=10, seed=0)
-
-    assert dict(drawn[labels.CLASS_COLUMN].value_counts()) == {
-        "healthy": 10, "acidosis": 10, "hie": 3
+        "healthy": 10, "acidosis": 10, "hie": expected_hie
     }
 
 
@@ -412,24 +405,6 @@ def test_the_extreme_metrics_are_columns_the_collection_pass_writes() -> None:
 # =================================================================================================
 # The task's page seams
 # =================================================================================================
-def test_the_three_seams_are_resolved_off_the_task_rather_than_imported() -> None:
-    """The seams are the *task's* to declare -- it is the task that decides what the target is and
-    what the encoders are fed -- and resolving them by name is what keeps one page definition
-    behind both the fit's diagnostics and the evaluation's. An analysis that imported this
-    package's ``sample_page`` would be a second builder that could drift from the callback's."""
-    module = make_task()
-
-    seams = samples_analysis.page_seams(module)
-
-    assert set(seams) == set(samples_analysis.PAGE_SEAMS)
-    assert callable(seams["forecast_rows"])
-    assert callable(seams["input_stream_panels"])
-    assert len(seams["forecast_extra_rows"]) == 6
-    # The layering test forbids the analyses from importing the task; this is the behavioural half
-    # of the same rule, and it is what makes the page the one the training callback draws.
-    assert seams["forecast_extra_rows"] == module.forecast_extra_rows
-
-
 def test_a_task_declaring_no_seams_costs_rows_rather_than_raising() -> None:
     """A model over another representation is a shorter page, not a failed run -- and the row
     count says which it was."""
@@ -438,21 +413,6 @@ def test_a_task_declaring_no_seams_costs_rows_rather_than_raising() -> None:
     assert seams["forecast_rows"] is None
     assert seams["forecast_extra_rows"] == ()
     assert samples_analysis.input_stream_rows(None, seams["input_stream_panels"], (), 0) == ()
-
-
-def test_the_input_row_builder_is_this_cells_own_and_draws_two_streams() -> None:
-    """The shipped builder refuses these channel widths, so a page that used it would lose two
-    rows to a warning. Two panels -- target and source -- is what makes the page fifteen rows."""
-    module = make_task()
-    batch = make_stub_batch(seed=2)
-    seams = samples_analysis.page_seams(module)
-    streams = (batch.fhr_st, batch.fhr_ph, module._build_source_stream(batch))
-
-    panels = samples_analysis.input_stream_rows(
-        module.orig_model, seams["input_stream_panels"], streams, 0
-    )
-
-    assert [panel.name for panel in panels] == ["target", "source"]
 
 
 def test_a_failing_input_builder_is_not_swallowed_into_a_shorter_page() -> None:

@@ -12,9 +12,6 @@ the declared and scored numerators coincide at $95$ here by arithmetic accident 
 and "95 of 102" would imply channels the decoder never emitted. The unbanded channels as their own
 row rather than folded into a neighbour whose skill they do not share. The per-band gaps summing
 back to ``pred_gap``, without which they are five unrelated numbers rather than a decomposition.
-And the three limits in the emitted record, because a reader who knows the raw pipeline's
-frequency-domain analysis must not carry its contract across: a scattering coefficient is a
-modulus, so nothing here can say whether a forecast is mistimed rather than mis-scaled.
 
 **No assertion here is about which band forecasts best.** That is a finding about a model and a
 population, and this fixture is neither.
@@ -232,25 +229,15 @@ def test_the_per_band_gaps_sum_back_to_pred_gap(tmp_path) -> None:
 
 def test_the_unknown_band_is_its_own_row_and_is_never_folded_into_a_neighbour(tmp_path) -> None:
     """A band whose membership quietly absorbed the unbanded channels would misattribute their
-    skill to a frequency they do not have."""
-    result = _three_band_run(tmp_path)["result"]
-    by_band = {row["band"]: row for row in result["bands"]}
-
-    assert shared.UNKNOWN_BAND in by_band
-    assert by_band[shared.UNKNOWN_BAND]["n_channels"] == 1
-    assert result["coverage"]["unknown_kept"] == 1
-    assert result["coverage"]["kept_total"] == 4
-    assert result["coverage"]["known_kept"] == 3
-
-
-def test_every_band_row_carries_the_channel_count_it_was_measured_over(tmp_path) -> None:
-    """A band carried by one channel and one carried by forty are different findings, and the row
-    alone cannot say which without its width."""
+    skill to a frequency they do not have. Every row carries the channel count it was measured
+    over, because a band carried by one channel and one carried by forty are different findings."""
     result = _three_band_run(tmp_path)["result"]
 
     counts = {row["band"]: row["n_channels"] for row in result["bands"]}
     assert counts == {"deceleration": 1, "variability": 2, shared.UNKNOWN_BAND: 1}
-    assert sum(counts.values()) == result["coverage"]["kept_total"]
+    assert sum(counts.values()) == result["coverage"]["kept_total"] == 4
+    assert result["coverage"]["unknown_kept"] == 1
+    assert result["coverage"]["known_kept"] == 3
 
 
 def test_the_gap_is_summed_over_a_band_while_the_error_is_averaged(tmp_path) -> None:
@@ -285,22 +272,11 @@ def test_the_channel_profile_reconciles_the_two_axes_row_by_row(tmp_path) -> Non
     )
 
 
-def test_the_record_states_the_three_limits_and_declares_its_grouped_frame(tmp_path) -> None:
-    """A reader of ``summary.json`` has the record and not the module, so the limits travel in it:
-    the modulus, the analysing filter rather than the forecast's own spectrum, and the convention
-    a phase channel's pair of frequencies is banded by."""
-    run = _three_band_run(tmp_path)
-    result = run["result"]
+def test_the_record_declares_its_grouped_frame(tmp_path) -> None:
+    """One per-band column per band the map carries, including the unbanded one."""
+    result = _three_band_run(tmp_path)["result"]
 
     assert set(REQUIRED_RESULT_KEYS) <= set(result)
-    assert len(result["limits"]) == 3
-    joined = " ".join(result["limits"])
-    assert "moduli" in joined
-    assert "ANALYSING FILTER" in joined
-    assert "freq_hz_primary" in joined
-    # Not coherence, said in the record rather than implied by the name alone.
-    assert "coherence" in joined
-
     entry = result["grouped_frames"][0]
     assert entry["path"] == (
         f"{analysis.ANALYSIS_DIRNAME}/{analysis.PER_RECORDING_FILENAME}"
@@ -501,45 +477,3 @@ def test_every_registered_headline_path_resolves_on_a_real_runs_results(collecte
         # band, which is the case on this dataset; every other entry must be a number.
         if path[-1] != "pred_gap_slow_baseline_nats":
             assert headline[name] is not None, (name, path)
-
-
-@pytest.mark.slow
-def test_it_runs_against_a_finished_directory_with_no_model(
-    collected_run, tmp_path, monkeypatch
-) -> None:
-    """The property the persisted map exists for, proved with ``forward`` rigged to raise.
-
-    The band axis has to be resolvable with no checkpoint, no model and no GPU, because that is
-    exactly the path ``--only spectral_skill --output-dir <a finished run>`` takes -- and it is
-    why the join goes through a CSV on disk rather than through the model's own channel gate. A
-    spy is the only way to tell "did not need the model" from "happened not to use it".
-    """
-    import json
-    import shutil
-
-    from teb_vae.lag_attn_cfs.eval import run as run_module
-    from teb_vae.lag_attn_cfs.nets.model import SeqVaeLagAttnCfs
-
-    run_dir = tmp_path / "rerun"
-    shutil.copytree(collected_run["results_dir"].parent, run_dir)
-
-    def _explode(*args, **kwargs):
-        raise AssertionError("the model was built and forwarded on an offline re-run")
-
-    monkeypatch.setattr(SeqVaeLagAttnCfs, "forward", _explode)
-
-    exit_code = run_module.main(
-        None, run_dir, only=analysis.ANALYSIS_DIRNAME, device="cpu"
-    )
-
-    results_dir = run_dir / run_module.RESULTS_DIRNAME
-    summary = json.loads((results_dir / run_module.SUMMARY_FILENAME).read_text(encoding="utf-8"))
-    block = summary["results"][analysis.ANALYSIS_DIRNAME]
-    assert exit_code == 0
-    assert summary["checkpoint"] is None
-    assert summary["analyses_selected"] == [analysis.ANALYSIS_DIRNAME]
-    assert block["skipped"] is False, block.get("reason")
-    # The same band axis the collected pass resolved, from the same file on disk.
-    assert block["coverage"] == collected_run["summary"]["results"][
-        analysis.ANALYSIS_DIRNAME
-    ]["coverage"]

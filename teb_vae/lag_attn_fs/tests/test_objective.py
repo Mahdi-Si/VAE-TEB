@@ -1,31 +1,30 @@
 r"""The objective as this model wires it: the target it builds, and the width it declares.
 
 The arithmetic is not retested here. ``lag_attn_rws/nets/losses.py`` owns every term, every
-reduction and every reported metric, and its own suite pins them; a second copy of those
-assertions would be a second copy of one piece of evidence. What is this model's to get wrong is
-the wiring, and it has exactly two moving parts:
+reduction and every reported metric, and its own suite pins them; this file drives this model's
+metrics through that suite's independent reassembly. What is this model's to get wrong is the
+wiring, and it has three moving parts:
 
 * **The target.** Gathered from the caller's feature stream by the target gate's keep-index and
   unfolded into each anchor's future window -- never delayed, and never rebuilt from a raw grid.
-* **``block_width``.** $C_{\mathrm{keep}}$, the surviving-channel count. It feeds **only** the
-  four per-element log-variance diagnostics, never a loss term, so passing ``geometry.r`` here
-  would change no gradient, fail no shape check, and rescale exactly those four reported numbers
-  by $78/16 = 4.875$ at the shipped budget. Those four are where ``logvar_clamp`` is re-derived
-  from and where a collapsing decoder variance is first visible, so the mistake would be silent
-  and expensive at once.
-
-Both are therefore checked against **hand-written** quantities rather than against the
-implementation. A ratio the objective computes from a width the objective was given is
-self-consistent for any wrong width.
+  Pinned against a slice-and-stack that shares no arithmetic with ``unfold``, and against the
+  planted pattern, whose values name the stored step and channel they came from.
+* **``block_width``.** $C_{\mathrm{keep}}$, the surviving-channel count. It feeds only the
+  per-element log-variance diagnostics, never a loss term, so passing ``geometry.r`` here would
+  change no gradient and fail no shape check. The reassembly harness is handed a hand-written
+  width, which is what catches that.
+* **The four resolved forecast gaps.** Partial sums of ``pred_gap`` by horizon step and by stored
+  block, checked against a per-step and per-channel gap assembled here from the objective's own
+  primitives, with the block boundary taken from the data rather than from the class constant.
 """
 from __future__ import annotations
 
 import pytest
 import torch
 
-from teb_vae.lag_attn.figure_primitives import future_target
 from teb_vae.lag_attn_fs.nets.model import SeqVaeLagAttnFs
 from teb_vae.lag_attn_fs.tests.conftest import (
+    PATTERN_STEP_SCALE,
     SHIPPED_KWARGS,
     STUB_GAP_STEP,
     TINY_KEEP_INDEX,
@@ -35,8 +34,7 @@ from teb_vae.lag_attn_fs.tests.conftest import (
     shipped_gated_kwargs,
     tiny_gated_kwargs,
 )
-from teb_vae.lag_attn_rws.nets.losses import LOGVAR_FLOOR_MARGIN_FRAC, raw_sample_score
-from teb_vae.lag_attn_rws.nets.model import SeqVaeLagAttnRws
+from teb_vae.lag_attn_rws.nets.losses import raw_sample_score
 from teb_vae.lag_attn_rws.nets.raw_masks import contributing_anchors, forecast_mask
 from teb_vae.lag_attn_rws.tests.test_objective import assert_objective_reassembles
 
@@ -47,15 +45,8 @@ _COEFFICIENTS = dict(
     beta=0.7, beta_prior=0.11, lambda_full=1.0, lambda_base=0.3, free_bits=0.05
 )
 
-#: The shipped budget's surviving channels and the block the reconstruction sums over there.
-#: Hand-written: $30 \times 78$. The point of the constant is that it is *not* read back from the
-#: model that is being checked against it.
-_KEPT_CHANNELS = 78
-_SHIPPED_BLOCK = 2340
-
 #: The four metrics this model reports and the raw-signal sibling does not: ``pred_gap`` resolved
-#: by horizon step and split by stored block. Declared once so the key-set comparison names the
-#: same set the resolved-gap tests below drive.
+#: by horizon step and split by stored block.
 _RESOLVED_GAP_KEYS = {
     "pred_gap_tau_first",
     "pred_gap_tau_last",
@@ -82,65 +73,85 @@ def _features(batch) -> torch.Tensor:
     return torch.cat([batch.fhr_st, batch.fhr_ph], dim=-1)
 
 
-def _loss_batch():
-    """A tiny batch whose feature values are order one.
+def _stacked_block(stream: torch.Tensor, horizon: int, t_valid: int) -> torch.Tensor:
+    r"""The target block built by slicing and stacking, sharing no arithmetic with ``unfold``.
+
+    Horizon step $\tau$ of every anchor is one contiguous slice of the stream, so the whole block is
+    $H$ slices stacked on a new axis.
+
+    Args:
+        stream: A feature stream $(B, T, C)$.
+        horizon: The forecast horizon $H$.
+        t_valid: The number of valid anchors.
+
+    Returns:
+        The block $(B, T_{\mathrm{valid}}, H, C)$.
+    """
+    return torch.stack(
+        [stream[:, 1 + tau : 1 + tau + t_valid, :] for tau in range(horizon)], dim=2
+    )
+
+
+def _loss_batch(dtype=torch.float32):
+    """A tiny batch whose feature values are order one, with the stub's deliberate weight gap.
 
     The planted-pattern batch is the right fixture for questions about *which* coefficient landed
     where, and the wrong one for questions about a loss value: its values run to $15{,}000$, a
-    summed squared error over them reaches $10^{10}$, and a float32 four-term recomposition at
-    that magnitude fails on round-off rather than on a wiring mistake.
+    summed squared error over them reaches $10^{10}$, and a float32 recomposition at that
+    magnitude fails on round-off rather than on a wiring mistake.
+
+    Args:
+        dtype: Dtype of the feature blocks and the weight. The resolved-gap tests run in float64:
+            each gap is a small difference of two block-sized sums, and in float32 two summation
+            orders of the same perturbed quantity disagree in the third significant digit.
+
+    Returns:
+        The batch.
     """
-    return make_stub_batch()
-
-
-def _shipped_batch(batch_size: int = 2, gap_step: int = 150):
-    """A production-geometry batch with a deliberate gap, so the mask is not uniformly one.
-
-    The stub batch's own gap sits at step $10$, which is inside the shipped warm-up of $30$ and
-    therefore invisible to every mask; a gap that no mask can see would leave the masked
-    reductions below asserting nothing about masking.
-    """
-    length = SHIPPED_KWARGS["sequence_length"]
-    batch = make_stub_batch(batch_size, length)
-    batch.weight = torch.ones(batch_size, length)
-    batch.weight[:, gap_step] = 0.0
+    batch = make_stub_batch()
+    for name in ("fhr_st", "fhr_ph", "up_st", "up_ph", "weight"):
+        setattr(batch, name, getattr(batch, name).to(dtype))
     return batch
+
+
+#: A tiny target guard whose survivors straddle the stored-block boundary and are not contiguous,
+#: so splitting the *kept* axis at the declared boundary puts a second-block channel in the first
+#: block's total. The tiny suite's own guard keeps first-block channels only.
+_STRADDLING_GUARD = dict(target_keep_index=(0, 5, 44, 60), target_delays=(0, 1, 2, 1))
 
 
 # ---------------------------------------------------------------------------------------
 # The target the objective is handed
 # ---------------------------------------------------------------------------------------
-def test_the_target_is_the_gathered_unfold_the_suite_is_pinned_against(tiny_gated):
-    """The model's own builder against the composition ``test_feature_target.py`` pins: the shared
-    unfold, then ``index_select`` on the surviving channels. Two definitions of the target would
-    let the figure path and the loss path score different windows."""
-    model = _model(tiny_gated)
-    batch = make_patterned_batch()
-
-    built = model._build_forecast_target(_features(batch))
-    expected = torch.index_select(
-        future_target(batch.fhr_st, batch.fhr_ph, model.horizon), -1, model.target_gate.keep_index
-    )
-
-    assert built.shape == expected.shape
-    assert torch.equal(built, expected)
-
-
-def test_gathering_before_the_unfold_is_the_same_target(tiny_gated):
-    """The model gathers first, which keeps the copy at $(B, T, C)$ rather than at
-    $(B, T_{\\mathrm{valid}}, H, C)$ -- a factor of $H$, a third of a gigabyte at the production
-    batch. The two orders commute, and this is where that is checked rather than assumed."""
-    model = _model(tiny_gated)
-    batch = make_patterned_batch()
+@pytest.mark.parametrize("guard", ["shipped-gated", "unguarded"])
+def test_the_target_obeys_the_index_identity_at_every_position(guard):
+    r"""$Y^{+}[b, t, \tau, k] = Y[b,\, t + 1 + \tau,\, \mathrm{keep}[k]]$, whole block, at the
+    production geometry: against a slice-and-stack of the gathered stream, and against the planted
+    pattern read back. Element $(0, t, \tau, k)$ of the pattern is
+    $(t + 1 + \tau)\,S + \mathrm{keep}[k]$, so dividing by $S$ recovers the *stored step* and the
+    remainder the *stored channel* -- which must be $\mathrm{keep}[k]$, not $k$. Unguarded, the
+    keep-index is every declared channel."""
+    model = _model(shipped_gated_kwargs() if guard == "shipped-gated" else dict(SHIPPED_KWARGS))
+    batch = make_patterned_batch(2, SHIPPED_KWARGS["sequence_length"])
     stream = _features(batch)
-
-    gather_last = torch.index_select(
-        stream[:, 1:, :].unfold(dimension=1, size=model.horizon, step=1).permute(0, 1, 3, 2),
-        -1,
-        model.target_gate.keep_index,
+    keep = (
+        torch.arange(model.c_y) if model.target_gate is None else model.target_gate.keep_index
     )
 
-    assert torch.equal(model._build_forecast_target(stream), gather_last)
+    built = model._build_forecast_target(stream)
+
+    t_valid, horizon = model.geometry.t_valid, model.horizon
+    assert torch.equal(
+        built, _stacked_block(torch.index_select(stream, -1, keep), horizon, t_valid)
+    )
+    sample = built[0]
+    recovered_step = torch.div(sample, PATTERN_STEP_SCALE, rounding_mode="floor")
+    recovered_channel = sample - recovered_step * PATTERN_STEP_SCALE
+    expected_step = (
+        torch.arange(t_valid).view(-1, 1) + 1 + torch.arange(horizon).view(1, -1)
+    ).float()
+    assert torch.equal(recovered_step, expected_step.unsqueeze(-1).expand_as(sample))
+    assert torch.equal(recovered_channel, keep.float().view(1, 1, -1).expand_as(sample))
 
 
 def test_the_target_is_not_delayed(tiny_gated):
@@ -166,17 +177,6 @@ def test_the_target_is_not_delayed(tiny_gated):
     shift = int(delays[channel])
     assert shift > 0
     assert torch.equal(delayed[:, 5, :, channel], built[:, 5 - shift, :, channel])
-
-
-def test_the_ungated_target_keeps_every_declared_channel(tiny_kwargs):
-    model = _model(tiny_kwargs)
-    batch = make_patterned_batch()
-
-    built = model._build_forecast_target(_features(batch))
-
-    assert model.target_gate is None
-    assert built.shape[-1] == model.c_y == 109
-    assert torch.equal(built, future_target(batch.fhr_st, batch.fhr_ph, model.horizon))
 
 
 def test_a_named_anchor_set_takes_the_dense_blocks_it_names(tiny_gated):
@@ -234,7 +234,7 @@ def test_a_target_stream_that_does_not_match_the_geometry_is_refused(
 ):
     """The third case is the one worth having: a caller that gathered the channels itself would
     hand over a correctly-ranked tensor whose keep-index positions no longer mean what the model
-    thinks, and the gather would silently take the wrong 78 of them."""
+    thinks, and the gather would silently take the wrong channels."""
     model = _model(tiny_kwargs)
 
     with pytest.raises(ValueError, match=match):
@@ -242,72 +242,19 @@ def test_a_target_stream_that_does_not_match_the_geometry_is_refused(
 
 
 # ---------------------------------------------------------------------------------------
-# The four-term total
-# ---------------------------------------------------------------------------------------
-def test_the_total_is_the_documented_four_term_sum(tiny_gated, perturb_posterior):
-    """Distinct coefficients, perturbed model: the total must recompose from the returned parts
-    under exactly the documented weights, and the three-term recomposition must fall short."""
-    model = _model(tiny_gated)
-    perturb_posterior(model)
-    batch = _loss_batch()
-
-    metrics = model.compute_loss(
-        _forward(model, batch), _features(batch), weight=batch.weight, **_COEFFICIENTS
-    )["metrics"]
-    recomposed = (
-        _COEFFICIENTS["lambda_full"] * metrics["nll_full_block"]
-        + _COEFFICIENTS["lambda_base"] * metrics["nll_base_block"]
-        + _COEFFICIENTS["beta"] * metrics["source_conditioned_kl_train"]
-        + _COEFFICIENTS["beta_prior"] * metrics["prior_rate"]
-    )
-
-    assert torch.allclose(metrics["total_loss"], recomposed, rtol=1e-6, atol=1e-6)
-    assert float(metrics["source_conditioned_kl_train"]) > 0.0
-    assert float(metrics["prior_rate"]) > 0.0
-    three_term = recomposed - _COEFFICIENTS["beta_prior"] * metrics["prior_rate"]
-    assert not torch.allclose(metrics["total_loss"], three_term, rtol=1e-6)
-
-
-def test_the_metric_key_set_is_the_siblings_plus_the_four_resolved_gaps(tiny_kwargs):
-    """Exact in both directions, against a declared addition rather than a free one. Every
-    downstream reader -- the tracked-metric list, the loss-curve page, the spike breaker -- is
-    keyed by name, so a name in one model and not the other is a column that silently empties; and
-    a *fifth* addition arriving unannounced would be a readout no callback collects.
-
-    The four are :data:`_RESOLVED_GAP_KEYS`, and they are partial sums of the ``pred_gap`` beside
-    them rather than new quantities -- which is why the raw-signal sibling neither has them nor
-    needs them: its block is thirty horizon steps of one physical signal, so neither split says
-    anything there."""
-    batch = _loss_batch()
-    feature_model = _model(tiny_kwargs)
-    raw_model = _model(tiny_kwargs, cls=SeqVaeLagAttnRws)
-
-    feature_result = feature_model.compute_loss(
-        _forward(feature_model, batch), _features(batch), weight=batch.weight
-    )
-    raw_result = raw_model.compute_loss(
-        _forward(raw_model, batch), batch.fhr, weight=batch.weight
-    )
-
-    assert set(feature_result) == set(raw_result) == {"metrics", "likelihood"}
-    assert set(feature_result["metrics"]) - set(raw_result["metrics"]) == _RESOLVED_GAP_KEYS
-    assert set(raw_result["metrics"]) - set(feature_result["metrics"]) == set()
-    assert all(isinstance(value, torch.Tensor) for value in feature_result["metrics"].values())
-
-
-# ---------------------------------------------------------------------------------------
 # The resolved forecast gaps
 #
 # Four partial sums of ``pred_gap``, and the only reason they exist is that with no evaluation
 # pipeline the summed number cannot separate forecasting from reconstruction of the part of the
-# target the model's own history already determines. So what is checked is exactly that: they are
-# partial sums (both splits recompose), they are per-anchor (the same denominator), and the block
-# split follows the reach budget's keep-index rather than assuming the survivors are contiguous.
+# target the model's own history already determines. So what is checked is exactly that: each
+# equals the matching slice of a per-step or per-channel gap assembled here, per anchor, and the
+# block split follows the reach budget's keep-index rather than assuming the survivors are
+# contiguous.
 # ---------------------------------------------------------------------------------------
-def _gap_by_horizon_step(model, outs, batch, likelihood: str) -> torch.Tensor:
-    """The per-horizon-step forecast gap, assembled here from the objective's own primitives.
+def _gap_by_axis(model, outs, batch, likelihood: str):
+    r"""The forecast gap by horizon step and by kept channel, from the objective's own primitives.
 
-    Written out rather than read off the model so the two endpoint metrics are checked against a
+    Written out rather than read off the model so the reported metrics are checked against a
     quantity this file computed: a curve derived from the same private method that produced the
     metrics would be self-consistent whatever either did.
 
@@ -318,7 +265,7 @@ def _gap_by_horizon_step(model, outs, batch, likelihood: str) -> torch.Tensor:
         likelihood: ``'mse'`` or ``'gaussian_nll'``.
 
     Returns:
-        The gap $(H,)$, in nats per anchor.
+        ``(by_tau, by_channel)``, shapes $(H,)$ and $(C_{\mathrm{keep}},)$, in nats per anchor.
     """
     target = model._build_forecast_target(_features(batch))
     mask, _coverage = forecast_mask(
@@ -331,128 +278,87 @@ def _gap_by_horizon_step(model, outs, batch, likelihood: str) -> torch.Tensor:
             outs["mu_full"], target, likelihood=likelihood, logvar=outs["logvar_full"]
         )
     ) * mask[..., None]
-    return gap.sum(dim=(0, 1, 3)) / n_anchors
+    return gap.sum(dim=(0, 1, 3)) / n_anchors, gap.sum(dim=(0, 1, 2)) / n_anchors
+
+
+def _gap_case(guard: str, perturb_posterior):
+    """A perturbed float64 model and its batch and forward, for the resolved-gap tests.
+
+    Args:
+        guard: ``'straddling'`` for :data:`_STRADDLING_GUARD`, ``'unguarded'`` for none.
+        perturb_posterior: The perturbation factory fixture.
+
+    Returns:
+        ``(model, batch, outs)``.
+    """
+    kwargs = dict(TINY_KWARGS, **(_STRADDLING_GUARD if guard == "straddling" else {}))
+    model = _model(kwargs).double()
+    perturb_posterior(model)
+    batch = _loss_batch(torch.float64)
+    return model, batch, _forward(model, batch)
 
 
 @pytest.mark.parametrize("likelihood", ["gaussian_nll", "mse"])
-def test_the_horizon_split_recomposes_to_the_reported_gap(shipped_gated, likelihood):
+def test_the_horizon_split_recomposes_to_the_reported_gap(perturb_posterior, likelihood):
     r"""Summed over $\tau$ the horizon curve is ``pred_gap``, and its two endpoints are the two
-    reported scalars. Both halves matter: the endpoints alone would pass for a curve that was not
-    a decomposition of anything, and the recomposition alone would pass for endpoints read off the
-    wrong end."""
-    model = _model(shipped_gated)
-    batch = _shipped_batch()
-    outs = _forward(model, batch)
+    reported scalars. Perturbed, so the curve is not identically zero and its two ends genuinely
+    differ: the endpoints alone would pass for a curve that was not a decomposition of anything,
+    and the recomposition alone would pass for endpoints read off the wrong end."""
+    model, batch, outs = _gap_case("straddling", perturb_posterior)
 
-    by_tau = _gap_by_horizon_step(model, outs, batch, likelihood)
+    by_tau, _ = _gap_by_axis(model, outs, batch, likelihood)
     metrics = model.compute_loss(
         outs, _features(batch), weight=batch.weight, likelihood=likelihood
     )["metrics"]
 
-    assert by_tau.numel() == SHIPPED_KWARGS["horizon"] == 30
-    assert float(metrics["pred_gap_tau_first"]) == pytest.approx(float(by_tau[0]), rel=1e-5)
-    assert float(metrics["pred_gap_tau_last"]) == pytest.approx(float(by_tau[-1]), rel=1e-5)
-    assert float(by_tau.sum()) == pytest.approx(float(metrics["pred_gap"]), rel=1e-4)
-
-
-def test_the_two_reported_steps_are_the_first_and_the_last_and_not_each_other(
-    shipped_gated, perturb_posterior
-):
-    """The endpoints are the whole point of the horizon split -- half the target's support lies in
-    observed history at $\\tau = 0$ and none of it does at $\\tau = 29$ -- so a model whose gap is
-    the same at both would make the readout say nothing. Perturbed, so the two genuinely differ."""
-    model = _model(shipped_gated)
-    perturb_posterior(model)
-    batch = _shipped_batch()
-    outs = _forward(model, batch)
-
-    by_tau = _gap_by_horizon_step(model, outs, batch, "gaussian_nll")
-    metrics = model.compute_loss(outs, _features(batch), weight=batch.weight)["metrics"]
-
+    assert by_tau.numel() == model.horizon
     assert float(by_tau[0]) != pytest.approx(float(by_tau[-1]), rel=1e-6)
-    assert float(metrics["pred_gap_tau_first"]) != pytest.approx(
-        float(metrics["pred_gap_tau_last"]), rel=1e-6
-    )
+    assert float(metrics["pred_gap_tau_first"]) == pytest.approx(float(by_tau[0]), rel=1e-9)
+    assert float(metrics["pred_gap_tau_last"]) == pytest.approx(float(by_tau[-1]), rel=1e-9)
+    assert float(by_tau.sum()) == pytest.approx(float(metrics["pred_gap"]), rel=1e-9)
 
 
 @pytest.mark.parametrize("likelihood", ["gaussian_nll", "mse"])
-def test_the_block_split_recomposes_to_the_reported_gap(shipped_gated, likelihood):
-    """The other axis, and the one where a wrong split is invisible: the two parts add back to
-    ``pred_gap`` for **any** partition of the channels, so recomposition alone would not catch a
-    boundary in the wrong place. The counts are asserted beside it."""
-    model = _model(shipped_gated)
-    batch = _shipped_batch()
+@pytest.mark.parametrize("guard", ["straddling", "unguarded"])
+def test_the_block_split_is_the_declared_boundary_over_the_kept_channels(
+    perturb_posterior, likelihood, guard
+):
+    """The other axis, and the one where a wrong split is invisible to recomposition: the two parts
+    add back to ``pred_gap`` for **any** partition of the channels. So each part is compared with
+    the per-channel gap summed over the kept channels whose *declared* index falls in the first
+    stored block -- the boundary read off the batch's first block width, not off the class
+    constant. Splitting the kept axis at the declared boundary instead, the natural mistake, fails
+    on the straddling guard. Unguarded, every declared channel survives and the split is the two
+    blocks' full widths."""
+    model, batch, outs = _gap_case(guard, perturb_posterior)
+    keep = (
+        torch.arange(model.c_y) if model.target_gate is None else model.target_gate.keep_index
+    )
+    first_block = keep < batch.fhr_st.shape[-1]
 
+    _, by_channel = _gap_by_axis(model, outs, batch, likelihood)
     metrics = model.compute_loss(
-        _forward(model, batch), _features(batch), weight=batch.weight, likelihood=likelihood
+        outs, _features(batch), weight=batch.weight, likelihood=likelihood
     )["metrics"]
 
+    assert 0 < int(first_block.sum()) < keep.numel()
+    assert float(metrics["pred_gap_st"]) == pytest.approx(
+        float(by_channel[first_block].sum()), rel=1e-9
+    )
+    assert float(metrics["pred_gap_ph"]) == pytest.approx(
+        float(by_channel[~first_block].sum()), rel=1e-9
+    )
     assert float(metrics["pred_gap_st"]) + float(metrics["pred_gap_ph"]) == pytest.approx(
-        float(metrics["pred_gap"]), rel=1e-4
+        float(metrics["pred_gap"]), rel=1e-9
     )
 
 
-def test_the_block_split_is_made_against_the_declared_index_not_the_kept_axis(shipped_gated):
-    r"""The boundary is $43$ in the **declared** channel order and $27$ along the **kept** axis the
-    forecast block is indexed by, and those two numbers are what a wrong split confuses.
-
-    At the shipped budget $27$ of the first block's $43$ channels survive and $51$ of the second's
-    $66$. Splitting the kept axis at the declared $43$ instead -- the natural mistake, since $43$
-    is the number written down -- would put $16$ of the second block's channels into the first
-    block's total and leave both reported numbers wrong by a large amount, with everything else
-    unchanged.
-    """
-    model = _model(shipped_gated)
-    keep = model.target_gate.keep_index
-
-    first_block = int((keep < SeqVaeLagAttnFs.TARGET_BLOCK_SPLIT).sum())
-
-    assert SeqVaeLagAttnFs.TARGET_BLOCK_SPLIT == 43
-    assert (first_block, int(keep.numel()) - first_block) == (27, 51)
-    # The two numbers really are different, so the confusion is reachable rather than hypothetical.
-    assert first_block != SeqVaeLagAttnFs.TARGET_BLOCK_SPLIT
-    assert int((keep[:SeqVaeLagAttnFs.TARGET_BLOCK_SPLIT] >= 43).sum()) == 16
-
-
-def test_a_narrower_budget_moves_the_split_with_it(shipped_kwargs):
-    r"""The split is a function of the resolved keep-index, not of a fixed offset, so a different
-    budget re-partitions it. Checked at ``null``, where every declared channel survives and the two
-    parts are the two blocks' full widths -- the one configuration in which the answer is known
-    without consulting the filter bank."""
-    model = _model(shipped_kwargs)
-    outs = _forward(model, _shipped_batch())
-    batch = _shipped_batch()
-
-    metrics = model.compute_loss(outs, _features(batch), weight=batch.weight)["metrics"]
-
-    assert model.target_gate is None
-    assert model.decoder_out_channels == SHIPPED_KWARGS["c_y"] == 109
-    assert float(metrics["pred_gap_st"]) + float(metrics["pred_gap_ph"]) == pytest.approx(
-        float(metrics["pred_gap"]), rel=1e-4
-    )
-
-
-def test_the_resolved_gaps_are_zero_at_init_like_the_gap_they_decompose(shipped_gated):
-    """At initialisation the posterior is the prior, so every part of the gap is zero. A split
-    that read the wrong branch, or scored against a differently-built target, would be nonzero
-    here while ``pred_gap`` stayed at zero."""
-    model = _model(shipped_gated)
-    batch = _shipped_batch()
-
-    metrics = model.compute_loss(
-        _forward(model, batch), _features(batch), weight=batch.weight, likelihood="mse"
-    )["metrics"]
-
-    for name in sorted(_RESOLVED_GAP_KEYS):
-        assert float(metrics[name]) == pytest.approx(0.0, abs=1e-6), name
-
-
-def test_the_resolved_gaps_carry_no_gradient(shipped_gated, perturb_posterior):
-    """They are diagnostics. A term that reached the graph would be a fifth objective term that no
-    weight in the config controls."""
-    model = _model(shipped_gated)
+def test_the_resolved_gaps_carry_no_gradient(tiny_gated, perturb_posterior):
+    """They are diagnostics, computed under ``no_grad``: a term that held the graph would keep a
+    block-sized score tensor alive for every step it was logged."""
+    model = _model(tiny_gated)
     perturb_posterior(model)
-    batch = _shipped_batch()
+    batch = _loss_batch()
 
     outs = model(batch.fhr_st, batch.fhr_ph, torch.cat([batch.up_st, batch.up_ph], dim=-1))
     metrics = model.compute_loss(outs, _features(batch), weight=batch.weight)["metrics"]
@@ -461,45 +367,9 @@ def test_the_resolved_gaps_carry_no_gradient(shipped_gated, perturb_posterior):
         assert not metrics[name].requires_grad, name
 
 
-def test_the_resolved_gaps_are_per_anchor_like_every_other_reported_term(shipped_gated):
-    r"""Same denominator as ``pred_gap``: the contributing-anchor count, not the anchor count.
-
-    Halving the valid anchors must leave the four in the same band rather than halving them, which
-    is what "nats per anchor" means and what makes them addable to the number they decompose. The
-    check is the recomposition itself under a heavier mask -- a split that divided by a different
-    denominator would still recompose to *something*, but not to ``pred_gap``.
-    """
-    model = _model(shipped_gated)
-    batch = _shipped_batch()
-    batch.weight[:, : batch.weight.shape[1] // 2] = 0.0
-
-    metrics = model.compute_loss(
-        _forward(model, batch), _features(batch), weight=batch.weight
-    )["metrics"]
-
-    assert float(metrics["pred_gap_st"]) + float(metrics["pred_gap_ph"]) == pytest.approx(
-        float(metrics["pred_gap"]), rel=1e-4
-    )
-    assert float(metrics["anchor_coverage_frac"]) < 1.0  # the mask really did bite
-
-
-@pytest.mark.parametrize("likelihood", ["gaussian_nll", "mse"])
-def test_at_init_the_two_reconstruction_terms_are_bitwise_equal(tiny_gated, likelihood):
-    """The zero-KL start restated on the loss path: a wiring mistake between forward and loss --
-    a stale key, a wrong branch fed to the wrong term -- leaves the forward-path test green and
-    this one red."""
-    model = _model(tiny_gated)
-    batch = _loss_batch()
-
-    metrics = model.compute_loss(
-        _forward(model, batch), _features(batch), weight=batch.weight, likelihood=likelihood
-    )["metrics"]
-
-    assert torch.equal(metrics["nll_full_block"], metrics["nll_base_block"])
-    assert float(metrics["source_conditioned_kl_train"]) == 0.0
-    assert float(metrics["pred_gap"]) == 0.0
-
-
+# ---------------------------------------------------------------------------------------
+# The loss path
+# ---------------------------------------------------------------------------------------
 def test_an_unknown_likelihood_is_rejected_listing_the_choices(tiny_kwargs):
     model = _model(tiny_kwargs)
     batch = _loss_batch()
@@ -525,9 +395,6 @@ def test_the_objective_carries_gradient(tiny_gated, perturb_posterior):
     assert float(model.decoder.mean_head.weight.grad.abs().max()) > 0.0
 
 
-# ---------------------------------------------------------------------------------------
-# The masked plant
-# ---------------------------------------------------------------------------------------
 def test_a_gapped_step_is_invisible_end_to_end(tiny_gated):
     """The only route by which the target stream enters the loss is the gather, so planting an
     absurd value at the gapped step must leave every reconstruction number bitwise unchanged.
@@ -553,8 +420,9 @@ def test_a_gapped_step_is_invisible_end_to_end(tiny_gated):
     assert not differing, differing
 
     # Not vacuous: an unmasked step moves the loss by a lot. Step 5, not the gap's neighbour --
-    # at H = 4 and coverage_floor = 0.9 the four anchors whose window covers the gap are dropped
-    # *whole*, so steps 7 through 11 are unscored too and planting there would prove nothing.
+    # at the tiny horizon and coverage_floor = 0.9 the anchors whose window covers the gap are
+    # dropped *whole*, so the steps just past the gap are unscored too and planting there would
+    # prove nothing.
     unmasked = stream.clone()
     unmasked[:, 5, :] = 1.0e9
     moved = model.compute_loss(out, unmasked, weight=batch.weight)
@@ -564,105 +432,19 @@ def test_a_gapped_step_is_invisible_end_to_end(tiny_gated):
 
 
 # ---------------------------------------------------------------------------------------
-# block_width: the trap
-# ---------------------------------------------------------------------------------------
-def test_the_sample_score_divides_the_block_by_the_hand_written_cardinality():
-    """$H_d \\cdot C_{\\mathrm{keep}} = 30 \\times 78 = 2340$, written out rather than read off the
-    model. A ratio computed from a width the objective was *given* is self-consistent for any
-    wrong width; only a constant from outside can catch one."""
-    model = _model(shipped_gated_kwargs())
-    batch = _shipped_batch()
-
-    metrics = model.compute_loss(
-        _forward(model, batch), _features(batch), weight=batch.weight
-    )["metrics"]
-
-    assert model.decoder_out_channels == _KEPT_CHANNELS
-    assert float(metrics["nll_full_sample"]) == pytest.approx(
-        float(metrics["nll_full_block"]) / _SHIPPED_BLOCK, rel=1e-6
-    )
-    assert float(metrics["nll_base_sample"]) == pytest.approx(
-        float(metrics["nll_base_block"]) / _SHIPPED_BLOCK, rel=1e-6
-    )
-    # The raw model's block, for the contrast beta is recalibrated against.
-    assert _SHIPPED_BLOCK / (30 * SHIPPED_KWARGS["raw_per_step"]) == pytest.approx(4.875)
-
-
-def test_mean_logvar_full_is_the_per_coefficient_mean_not_the_per_raw_sample_one():
-    """The one assertion that catches ``block_width`` passed as ``geometry.r``.
-
-    That mistake changes no loss, fails no shape check and moves nothing else in the metric dict;
-    it rescales these four numbers by $78/16 = 4.875$. They are what ``logvar_clamp`` is
-    re-derived from and what a collapsing decoder variance shows up in first, so the hand
-    computation is written out here and the wrong denominator is asserted *not* to match.
-    """
-    model = _model(shipped_gated_kwargs())
-    batch = _shipped_batch()
-    out = _forward(model, batch)
-
-    metrics = model.compute_loss(out, _features(batch), weight=batch.weight)["metrics"]
-
-    mask, _ = forecast_mask(batch.weight, model.geometry, coverage_floor=model.coverage_floor)
-    elem_mask = mask[..., None]
-    correct_denominator = elem_mask.sum() * float(_KEPT_CHANNELS)
-    expected = (out["logvar_full"] * elem_mask).sum() / correct_denominator
-
-    assert torch.equal(metrics["mean_logvar_full"], expected)
-    assert torch.equal(
-        metrics["mean_logvar_base"],
-        (out["logvar_base"] * elem_mask).sum() / correct_denominator,
-    )
-
-    # The negative control: the raw grid's R would give a value 4.875x larger, and the reported
-    # one must not be it.
-    wrong = (out["logvar_full"] * elem_mask).sum() / (
-        elem_mask.sum() * float(model.geometry.r)
-    )
-    assert not torch.allclose(metrics["mean_logvar_full"], wrong)
-    assert float(wrong / expected) == pytest.approx(_KEPT_CHANNELS / model.geometry.r, rel=1e-4)
-
-
-def test_the_binding_bound_fractions_use_the_same_coefficient_denominator():
-    """The other two of the four. They are *fractions*, so a wrong denominator does not merely
-    rescale them -- it lets them exceed $1$, and a floor fraction above one is how this mistake
-    would eventually be noticed rather than how it would be caught."""
-    model = _model(shipped_gated_kwargs())
-    batch = _shipped_batch()
-    out = _forward(model, batch)
-
-    metrics = model.compute_loss(out, _features(batch), weight=batch.weight)["metrics"]
-
-    mask, _ = forecast_mask(batch.weight, model.geometry, coverage_floor=model.coverage_floor)
-    elem_mask = mask[..., None]
-    denominator = elem_mask.sum() * float(_KEPT_CHANNELS)
-    lo, hi = model.logvar_clamp
-    margin = LOGVAR_FLOOR_MARGIN_FRAC * (hi - lo)
-
-    expected_floor = (
-        (out["logvar_full"] <= lo + margin).to(out["logvar_full"].dtype) * elem_mask
-    ).sum() / denominator
-    expected_ceil = (
-        (out["logvar_full"] >= hi - margin).to(out["logvar_full"].dtype) * elem_mask
-    ).sum() / denominator
-
-    assert torch.equal(metrics["logvar_full_floor_frac"], expected_floor)
-    assert torch.equal(metrics["logvar_full_ceil_frac"], expected_ceil)
-    assert 0.0 <= float(metrics["logvar_full_floor_frac"]) <= 1.0
-    assert 0.0 <= float(metrics["logvar_full_ceil_frac"]) <= 1.0
-
-
-# ---------------------------------------------------------------------------------------
 # The shared reassembly harness
 # ---------------------------------------------------------------------------------------
 @pytest.mark.parametrize("likelihood", ["gaussian_nll", "mse"])
 @pytest.mark.parametrize("guard", ["ungated", "gated"], ids=["ungated", "gated"])
 def test_every_metric_reassembles_from_the_primitives(perturb_posterior, likelihood, guard):
-    """This model's metrics, against the sibling suite's independent reassembly.
+    """This model's metrics, against the sibling suite's independent reassembly: the total, the
+    per-sample scores, the log-variance diagnostics and the masking, every key, ``torch.equal``.
 
-    The arithmetic is the raw-signal package's -- one objective, one harness -- and what this
-    file supplies is what this model owns: its target, its block width, and the four resolved
-    forecast gaps it adds on top. Declaring those four is what makes an unannounced *fifth*
-    addition fail here rather than pass unnoticed.
+    What this file supplies is what this model owns: its target, built by the slice-and-stack and
+    gathered at the tiny guard's keep-index, its hand-written block width -- which differs from the
+    raw grid's $R$ in both arms, so ``block_width`` passed as ``geometry.r`` fails here -- and the
+    four resolved forecast gaps as package-owned keys, so an unannounced *fifth* addition fails
+    rather than passing unnoticed.
     """
     gated = guard == "gated"
     kwargs = tiny_gated_kwargs() if gated else dict(TINY_KWARGS)
@@ -671,8 +453,7 @@ def test_every_metric_reassembles_from_the_primitives(perturb_posterior, likelih
     batch = _loss_batch()
     outs = _forward(model, batch)
 
-    # Built here, not by the model: the composition is the one `test_feature_target.py` pins.
-    target = future_target(batch.fhr_st, batch.fhr_ph, model.horizon)
+    target = _stacked_block(_features(batch), model.horizon, model.geometry.t_valid)
     if gated:
         target = torch.index_select(target, -1, torch.tensor(TINY_KEEP_INDEX))
 
@@ -690,20 +471,3 @@ def test_every_metric_reassembles_from_the_primitives(perturb_posterior, likelih
         block_width=len(TINY_KEEP_INDEX) if gated else 109,
         package_owned=_RESOLVED_GAP_KEYS,
     )
-
-
-def test_the_block_width_follows_the_gate_at_every_budget(tiny_gated, tiny_kwargs):
-    """Three survivors, then none: the sample score divides by $H_d$ times whatever the decoder
-    emits, so the two must move together or one of them is a constant in disguise."""
-    batch = _loss_batch()
-
-    for kwargs, channels in ((tiny_gated, 3), (tiny_kwargs, 109)):
-        model = _model(kwargs)
-        metrics = model.compute_loss(
-            _forward(model, batch), _features(batch), weight=batch.weight
-        )["metrics"]
-
-        assert model.decoder_out_channels == channels
-        assert float(metrics["nll_full_sample"]) == pytest.approx(
-            float(metrics["nll_full_block"]) / (model.horizon * channels), rel=1e-6
-        )

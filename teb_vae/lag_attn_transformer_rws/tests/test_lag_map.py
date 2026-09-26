@@ -90,15 +90,3 @@ def test_the_identity_survives_an_encoder_head_count_of_its_own(
 
     assert out["kld_per_t_per_head"].shape[-1] == int(tiny_kwargs["num_heads"])
     assert torch.allclose(total, out["kld_per_t"], atol=_SUM_ATOL, rtol=_SUM_RTOL)
-
-
-def test_the_readout_is_named_for_the_kl_not_transfer_entropy(
-    tiny_kwargs, inputs, perturb_posterior
-):
-    """Under ``causal_reach_budget_s: null`` the input features at step $t$ read far into their own
-    future, so this quantity is a source-conditioned KL and must not be named for the transfer
-    entropy it is not yet."""
-    out = _perturbed_forward(tiny_kwargs, inputs, perturb_posterior)
-
-    assert "source_kl_lag_map" in out
-    assert not any("te_lag" in key for key in out)

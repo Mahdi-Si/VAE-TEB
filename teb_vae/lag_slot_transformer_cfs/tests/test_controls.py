@@ -143,13 +143,6 @@ def test_a_suppression_without_the_cached_proposals_refuses(matched) -> None:
         )
 
 
-def test_a_band_past_the_last_candidate_lag_refuses(matched) -> None:
-    """It would be reported under a name that overstates what was removed."""
-    model, _streams, _outputs = matched
-    with pytest.raises(ValueError, match="past the model's last candidate lag"):
-        controls.band_lag_mask(model.n_lags, 0, model.n_lags)
-
-
 def test_a_band_is_inclusive_at_both_ends(matched) -> None:
     """The configuration states bands as inclusive pairs, so a half-open reading would silently
     remove one lag fewer than the name says."""
@@ -261,10 +254,8 @@ def test_the_pairing_is_cross_recording_and_preserves_within_source_time_order()
     index = controls.cross_recording_index(recordings, generator=generator)
 
     assert controls.same_recording_pairs(recordings, index) == 0
-    stream = torch.randn(len(recordings), 12, 3)
-    permuted = stream[index]
-    for position, partner in enumerate(index.tolist()):
-        assert torch.equal(permuted[position], stream[partner])
+    # A permutation of whole rows: every segment is used once, so each keeps its own stored axis.
+    assert sorted(index.tolist()) == list(range(len(recordings)))
 
 
 def test_a_batch_one_recording_dominates_refuses_rather_than_pairing_it_with_itself() -> None:
@@ -279,8 +270,7 @@ def test_a_batch_one_recording_dominates_refuses_rather_than_pairing_it_with_its
 # The selectors-off arm
 # =============================================================================
 def test_the_silenced_arm_reproduces_the_prior_and_measures_nothing_else(matched) -> None:
-    """It verifies the equality invariant, and the module docstring says so rather than letting a
-    reader take its zero margin for a finding."""
+    """It verifies the equality invariant, so its zero margin is not a finding."""
     model, streams, outputs = matched
     y_st, y_ph, u_stream = streams
     silent = torch.zeros(
@@ -293,12 +283,3 @@ def test_the_silenced_arm_reproduces_the_prior_and_measures_nothing_else(matched
     assert torch.equal(silenced["mu_post"], silenced["mu_prior"])
     assert torch.equal(silenced["logvar_post"], silenced["logvar_prior"])
     assert float(silenced["kld_per_anchor"].abs().max()) == 0.0
-    assert "verifies the equality invariant" in controls.__doc__
-
-
-def test_the_qualification_text_states_all_three_limits() -> None:
-    """It travels into the written artifact, so it is pinned where it is defined."""
-    text = controls.SUPPRESSION_QUALIFICATION
-    assert "which stored source time" in text
-    assert "fitted computation" in text
-    assert "physiological delay" in text

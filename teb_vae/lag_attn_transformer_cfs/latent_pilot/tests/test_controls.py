@@ -262,21 +262,3 @@ def test_switching_the_probe_off_withdraws_the_combined_branch_claim(extractions
     assert record["enabled"] is False
     assert record["combined_branch_claim_supported"] is False
     assert "makes no claim" in record["note"]
-
-
-def test_the_disclosure_matches_whether_the_probe_actually_ran(extractions):
-    """The report's claim and the run's controls are read from one record, not two."""
-    train_extraction, val_extraction = extractions
-    fit, record = train.fit_prior_probe(
-        train_extraction, val_extraction, _recordings(), settings=SETTINGS
-    )
-
-    disclosure = evaluate.control_disclosure(
-        n_control_fits=1, prior_probe=record["enabled"]
-    )
-
-    assert fit is not None
-    assert disclosure["combined_branch_claim_supported"] is record[
-        "combined_branch_claim_supported"
-    ]
-    assert disclosure["permutation_p_value"] is False

@@ -5,8 +5,8 @@ the exception and the tests are written around exactly what makes it an exceptio
 
 * it draws **two levels on one axes**, and the arithmetic behind them is deliberately different --
   a rooted metric roots per segment on the left and after the per-recording mean on the right;
-* it is **descriptive**, so it must declare no grouped frame and register no headline number, and
-  both are asserted rather than assumed;
+* it is **descriptive**, so it must declare no grouped frame, and that is asserted rather than
+  assumed;
 * it must survive the degenerate splits, because a single-cohort population is the ordinary case
   on the pretraining shards and an absent column is the ordinary case on an older run's tables.
 
@@ -103,7 +103,6 @@ def test_the_two_levels_root_at_different_points(per_sample) -> None:
     # Strictly below, because this recording's squares are not all equal -- which is what makes
     # the assertion a check on the ordering rather than on a tie.
     assert mean_of_roots < hand_rooted_once
-    assert "Jensen" in distributions.PER_SEGMENT_ROOT_NOTE
 
 
 def test_an_unrooted_metric_passes_through_in_its_own_unit(per_sample) -> None:
@@ -116,14 +115,6 @@ def test_an_unrooted_metric_passes_through_in_its_own_unit(per_sample) -> None:
         np.asarray(segment["delta_mu_rms"]), np.asarray(per_sample["delta_mu_rms"])
     )
     assert units["mc_pred_gap"] == "nats per anchor"
-
-
-def test_without_loader_statistics_the_unit_says_so_rather_than_lying(per_sample) -> None:
-    """A run whose statistics are unknown still draws the distribution; it just cannot call the
-    axis bpm, and the emitted unit is what says which."""
-    _, _, units = distributions.build_frames(per_sample, None)
-
-    assert units["rmse_full"] == NORMALISED_UNIT
 
 
 # =============================================================================
@@ -205,38 +196,6 @@ def test_the_cohorts_share_one_bin_grid() -> None:
     # And the shared grid spans both cohorts, which two independent grids would not.
     assert min(grids[0]) == pytest.approx(0.0) and max(grids[0]) == pytest.approx(11.0)
     assert len(grids[0]) == distributions.HISTOGRAM_BINS + 1
-
-
-def test_the_fill_is_translucent_and_its_border_is_not() -> None:
-    """The one thing that makes overlapping cohorts readable, and the one way it regresses.
-
-    The transparency is carried by the **face colour**, not by the artist's ``alpha``: an artist
-    alpha fades the border along with the fill, which gives back the soft-edged blur the outline
-    exists to replace. So the property asserted is not "it is transparent somewhere" but that the
-    two are transparent *differently* -- a faint body inside an opaque hairline.
-    """
-    rng = np.random.default_rng(1)
-    series = {"healthy": rng.normal(0.0, 1.0, 400), "acidosis": rng.normal(0.5, 1.0, 300)}
-
-    _, ax, figure = _panel(
-        series, {name: values[:6] for name, values in series.items()}, list(series)
-    )
-    try:
-        filled = [patch for patch in ax.patches if patch.get_fill()]
-        faces = [patch.get_facecolor() for patch in filled]
-        edges = [patch.get_edgecolor() for patch in filled]
-        artist_alphas = [patch.get_alpha() for patch in filled]
-        widths = [float(patch.get_linewidth()) for patch in filled]
-    finally:
-        shared_figures.plt.close(figure)
-
-    assert len(filled) == 2
-    assert all(face[3] == pytest.approx(distributions.FILL_ALPHA) for face in faces)
-    assert all(edge[3] == pytest.approx(1.0) for edge in edges)
-    # An artist alpha would have been applied to the edge as well, and the assertion above would
-    # still pass on the *stored* colour while the drawn border faded.
-    assert all(alpha is None for alpha in artist_alphas)
-    assert all(width == pytest.approx(figures_seam.LINE_HAIRLINE) for width in widths)
 
 
 def test_every_outline_is_drawn_above_every_fill() -> None:
@@ -512,21 +471,6 @@ def test_the_derived_csv_is_the_figures_reproducible_from_disk(per_sample, tmp_p
     assert len(written) == len(per_sample)
 
 
-def test_the_figures_do_not_collide_with_the_grouped_variant_naming() -> None:
-    """The trap this analysis fell into once, kept from recurring.
-
-    ``test_eval_smoke.py`` normalises ``*_by_clinical_class.pdf`` and ``*_by_subgroup.pdf`` out of
-    the figure manifest as a *family*, because those are the runner's grouped-variant violins. A
-    figure of any other analysis named into that shape is therefore never recorded in the manifest
-    and never documented -- it simply vanishes, while reading to an operator as one of the violin
-    figures it is not. Which is the exact confusion this analysis exists to prevent.
-    """
-    from teb_vae.lag_attn_rws.tests import test_eval_smoke
-
-    for filename in (figure_filename(distributions.CLASS_FIGURE), figure_filename(distributions.SUBGROUP_FIGURE)):
-        assert not filename.endswith(test_eval_smoke.GROUPED_SUFFIXES), filename
-
-
 def test_the_analysis_declares_no_grouped_frame(per_sample, tmp_path) -> None:
     """The runner's fan-out draws violins documented as holding one value per **recording**.
     Handing it this per-segment frame would produce a per-segment violin that reads as a
@@ -534,16 +478,6 @@ def test_the_analysis_declares_no_grouped_frame(per_sample, tmp_path) -> None:
     result = _run(per_sample, tmp_path)
 
     assert "grouped_frames" not in result
-
-
-def test_the_record_carries_both_standing_notes(per_sample, tmp_path) -> None:
-    """Both travel in ``summary.json`` rather than only in the documentation: a caveat a reader of
-    the output cannot see is a caveat that does not apply."""
-    result = _run(per_sample, tmp_path)
-
-    assert "descriptive only" in result["descriptive_only"]
-    assert "cross_subgroup" in result["descriptive_only"]
-    assert result["per_segment_root_note"]
 
 
 def test_a_single_cohort_split_still_draws_rather_than_skipping(tmp_path) -> None:

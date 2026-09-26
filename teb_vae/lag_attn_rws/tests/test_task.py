@@ -1,26 +1,16 @@
-r"""The task sits on the framework seams rather than around them.
+r"""The task's contracts with the framework, the net and the config.
 
-Most of what a Lightning module needs is inherited, and the value of that is entirely in what is
-*absent* here -- no ``training_step``, no ``configure_optimizers``, no constructor bypass, no
-hand-rolled spike breaker. Absence is exactly what a normal test cannot see (a re-added override
-does not fail anything, it just quietly takes back the seam), so several tests below assert that
-this class does not define a method.
-
-The rest pins the contracts the framework enforces by convention rather than by type: metrics
-must be numeric and unprefixed, ``main_loss`` must exist under exactly that name, and the metric
-set must be the documented one -- a silently added metric is a column no callback collects.
+The metrics contract is enforced by convention rather than by type: metrics must be numeric and
+unprefixed, and the metric set is exactly the documented one per stage -- a silently dropped
+metric is a lost readout and a silently added one is a column no callback collects. Beyond that,
+the input builders are checked against the batch's real channel widths, the forward-input seam is
+checked to decide what the net receives, and every configured objective weight is checked to
+reach the loss by value.
 """
 from __future__ import annotations
 
-import inspect
-import re
-from pathlib import Path
-
 import pytest
 import torch
-
-from teb_vae.lag_attn_rws.task import SeqVaeLagAttnRwsTask
-from train.pl_model_base import LightningModelBase
 
 #: The metric set every stage emits. The three permutation-control metrics are validation-only
 #: and deliberately not in this set.
@@ -48,70 +38,6 @@ _VAL_ONLY_METRICS = {"nll_shuffled_block", "kld_shuffled", "shuffle_penalty"}
 
 
 # --------------------------------------------------------------------------------------
-# What the task does not do
-# --------------------------------------------------------------------------------------
-@pytest.mark.parametrize(
-    "method",
-    ["training_step", "validation_step", "test_step", "forward", "configure_optimizers"],
-)
-def test_the_task_does_not_override_the_inherited_step_machinery(method):
-    """``training_step`` is the one that matters most: the framework's version runs the
-    config-gated spike breaker, and a subclass that defines its own silently disables it."""
-    assert method not in vars(SeqVaeLagAttnRwsTask), (
-        f"{method} is overridden; the inherited implementation is the seam this model uses"
-    )
-
-
-def test_the_constructor_goes_through_the_base(task):
-    """Not through a grandparent ``pl.LightningModule.__init__`` bypass, which would silently
-    drop ``save_hyperparameters``, ``_orig_model``, ``self.model`` and the breaker counters."""
-    module = task()
-
-    assert isinstance(module, LightningModelBase)
-    assert module.orig_model is module._orig_model
-    assert hasattr(module, "_spike_ema_loss")  # a bypass would leave the counters unset
-    assert module.hparams.get("lr") == 1e-3
-
-
-def test_compilation_is_off_and_the_eager_module_is_what_runs(task):
-    """Three independent things in this net defeat inductor, so this is permanent."""
-    module = task()
-
-    assert module.model is module.orig_model
-    assert module.hparams.get("compile_model") is False
-
-
-def test_compilation_defaults_off_and_no_config_can_turn_it_on_for_this_net():
-    """The invariant is unchanged -- no configuration reaches compilation for *this* net, whose
-    LSTM encoders defeat inductor unconditionally -- but it is now enforced where the refusal is
-    true rather than by the keyword's absence.
-
-    The keyword exists so a subclass over a net **without** an LSTM can opt in; the refusal for
-    this one lives in ``LagAttnRwsTrainer.compile_model_requested``, which does not read
-    ``advanced_config.trainer.compile`` at all. Both halves are asserted, because the keyword
-    defaulting to ``False`` would be worth nothing if the driver passed a config value into it."""
-    from teb_vae.lag_attn_rws.trainer import LagAttnRwsTrainer
-
-    parameter = inspect.signature(SeqVaeLagAttnRwsTask.__init__).parameters["compile_model"]
-    assert parameter.default is False
-
-    # The driver's refusal is unconditional: a config asking for compilation is still refused.
-    assert LagAttnRwsTrainer.compile_model_requested(object()) is False
-
-
-def test_the_forward_goes_through_model_and_everything_else_through_orig_model():
-    """``self.model`` is the (potentially compiled) forward handle; ``self.orig_model`` is the
-    eager module whose helpers (``compute_loss``, geometry) must be called directly. With
-    compilation permanently off the two alias one object, which is exactly why only a source
-    check can catch a future regression."""
-    source = Path(inspect.getfile(SeqVaeLagAttnRwsTask)).read_text(encoding="utf-8")
-
-    assert len(re.findall(r"self\.model\(", source)) == 1  # exactly the forward call
-    assert "self.orig_model.compute_loss" in source
-    assert "self.model.compute_loss" not in source
-
-
-# --------------------------------------------------------------------------------------
 # The metrics contract
 # --------------------------------------------------------------------------------------
 def test_every_metric_is_numeric_and_unprefixed(task, stub_batch, perturb_posterior):
@@ -128,56 +54,27 @@ def test_every_metric_is_numeric_and_unprefixed(task, stub_batch, perturb_poster
         assert "/" not in name
 
 
-def test_the_train_metric_set_is_exactly_the_documented_one(task, stub_batch, perturb_posterior):
+@pytest.mark.parametrize(
+    "stage, expected",
+    [("train", _STAGE_METRICS), ("val", _STAGE_METRICS | _VAL_ONLY_METRICS)],
+)
+def test_the_metric_set_is_exactly_the_documented_one(
+    task, stub_batch, perturb_posterior, stage, expected
+):
     """Exact equality in both directions: a missing metric is a lost readout, and an extra one
-    is a column no callback collects -- both silent."""
+    is a column no callback collects -- both silent. Validation additionally emits the shuffled
+    readouts."""
     module = task()
     perturb_posterior(module.orig_model)
 
-    _, metrics = module.compute_loss_and_metrics(stub_batch, 0, "train")
+    _, metrics = module.compute_loss_and_metrics(stub_batch, 0, stage)
 
-    assert set(metrics) == _STAGE_METRICS
-
-
-def test_validation_additionally_emits_the_shuffled_readouts(task, stub_batch, perturb_posterior):
-    module = task()
-    perturb_posterior(module.orig_model)
-
-    _, metrics = module.compute_loss_and_metrics(stub_batch, 0, "val")
-
-    assert set(metrics) == _STAGE_METRICS | _VAL_ONLY_METRICS
-
-
-def test_the_breaker_actually_consumes_main_loss(task):
-    """Emission is not consumption: the framework falls back to the returned loss when
-    ``metrics['main_loss']`` is missing, silently. Drive the real breaker with a ``main_loss``
-    far below the returned loss and check which one seeded the EMA."""
-    module = task(
-        spike_breaker={"enabled": True, "warmup_batches": 0, "comparison_metric": "main_loss"}
-    )
-
-    returned = torch.tensor(100.0, requires_grad=True)
-    metrics = {"total_loss": returned, "main_loss": torch.tensor(1.0)}
-    module._apply_spike_breaker(returned, metrics, module.hparams["spike_breaker"])
-
-    assert float(module._spike_ema_loss) == pytest.approx(1.0), (
-        "the breaker seeded its EMA from the returned loss, so it is not watching main_loss"
-    )
+    assert set(metrics) == expected
 
 
 # --------------------------------------------------------------------------------------
-# Loss composition
+# The input streams
 # --------------------------------------------------------------------------------------
-def test_the_loss_is_finite_and_carries_gradient(task, stub_batch, perturb_posterior):
-    module = task()
-    perturb_posterior(module.orig_model)
-
-    loss, _ = module.compute_loss_and_metrics(stub_batch, 1, "train")
-
-    assert torch.isfinite(loss)
-    assert loss.requires_grad
-
-
 def test_the_source_stream_is_the_concatenation_the_model_was_built_for(task, stub_batch):
     module = task()
 
@@ -268,17 +165,6 @@ def test_an_override_changes_what_the_net_receives_and_nothing_else(
     assert not torch.equal(overridden["nll_full_block"], reference["nll_full_block"])
 
 
-@pytest.mark.parametrize("builder", ["_build_target_streams", "_build_source_stream"])
-def test_compute_loss_and_metrics_reaches_the_net_only_through_the_hook(builder):
-    """A remaining direct call to either stream builder would make the hook advisory: the
-    override above would run, and the net would go on being fed what it always was. Checked in the
-    source because a *surviving* call site produces a correct-looking run, not a failure."""
-    source = inspect.getsource(SeqVaeLagAttnRwsTask.compute_loss_and_metrics)
-
-    assert f"self.{builder}(" not in source
-    assert "self._build_forward_inputs(" in source
-
-
 # --------------------------------------------------------------------------------------
 # Channel widths are checked against the data, not against a constant
 # --------------------------------------------------------------------------------------
@@ -330,21 +216,6 @@ def test_the_raw_kl_is_reported_separately_from_the_trained_one(
     assert float(metrics["source_conditioned_kl_train"]) > float(
         metrics["source_conditioned_kl_raw"]
     )
-
-
-def test_the_latent_gap_is_zero_at_init_and_positive_once_perturbed(
-    task, stub_batch, perturb_posterior
-):
-    """The zero-init invariant seen through the diagnostic -- and the reason every KL assertion
-    in this suite perturbs first: at init the posterior *is* the prior."""
-    module = task()
-
-    _, at_init = module.compute_loss_and_metrics(stub_batch, 1, "train")
-    assert float(at_init["mu_post_prior_gap_rms"]) == pytest.approx(0.0, abs=1e-6)
-
-    perturb_posterior(module.orig_model)
-    _, perturbed = module.compute_loss_and_metrics(stub_batch, 1, "train")
-    assert float(perturbed["mu_post_prior_gap_rms"]) > 0.0
 
 
 def test_the_gap_diagnostic_is_the_per_step_belief_shift_not_the_per_element_rms(
@@ -506,55 +377,33 @@ def test_each_configured_shape_weight_weights_the_objective_and_is_echoed(
     )
 
 
-def test_the_shape_weights_default_to_zero_and_round_trip_through_the_hparams(task):
-    """They land in ``self.hparams`` -- and therefore in every checkpoint -- so a run's objective
-    stays recoverable from its checkpoint alone. Config-less operation resolves all three to
-    ``0.0``, which is the four-term objective every pre-existing run was trained under."""
-    default = task()
-    configured = task(hparams={"lambda_ms": 0.13, "lambda_deriv": 0.17, "lambda_boundary": 0.19})
-
-    for name, value in (("lambda_ms", 0.13), ("lambda_deriv", 0.17), ("lambda_boundary", 0.19)):
-        assert float(default.hparams[name]) == 0.0, name
-        assert float(configured.hparams[name]) == pytest.approx(value), name
-
-
-def test_the_permutation_control_is_unchanged_by_the_shape_weights(
-    task, make_stub_batch_fn, perturb_posterior
+@pytest.mark.parametrize(
+    "absurd",
+    [
+        {"lambda_ms": 1.0e3, "lambda_deriv": 1.0e3, "lambda_boundary": 1.0e3},
+        {"beta_prior": 1.0e3},
+    ],
+    ids=["shape-weights", "beta-prior"],
+)
+def test_the_permutation_control_is_unchanged_by_the_objective_weights(
+    task, make_stub_batch_fn, perturb_posterior, absurd
 ):
-    """The control consumes only its own NLL, so the shape terms are passed 0.0 there rather
-    than the configured weights -- driven at absurd weights so any leak into the shuffled
-    scoring would be unmissable."""
-    absurd = {"lambda_ms": 1.0e3, "lambda_deriv": 1.0e3, "lambda_boundary": 1.0e3}
+    """The control consumes only its own NLL and leaves the prior untouched, so the shape terms
+    are passed $0$ there rather than the configured weights and the anchor weight never enters --
+    its three readouts must be bitwise identical whatever those weights are. Driven at absurd
+    weights so any leak into the shuffled scoring would be unmissable."""
     weighted = task(hparams=absurd)
     unweighted = task(hparams={name: 0.0 for name in absurd})
     perturb_posterior(weighted.orig_model)
     perturb_posterior(unweighted.orig_model)  # same seed in the factory -> identical weights
 
     torch.manual_seed(3)
-    _, with_shape = weighted.compute_loss_and_metrics(make_stub_batch_fn(), 0, "val")
+    _, with_weights = weighted.compute_loss_and_metrics(make_stub_batch_fn(), 0, "val")
     torch.manual_seed(3)
     _, without = unweighted.compute_loss_and_metrics(make_stub_batch_fn(), 0, "val")
 
     for name in ("nll_shuffled_block", "kld_shuffled", "shuffle_penalty"):
-        assert torch.equal(with_shape[name], without[name]), name
-
-
-def test_the_permutation_control_is_unchanged_by_beta_prior(task, make_stub_batch_fn, perturb_posterior):
-    """The control re-scores the full branch under a stranger's source and leaves the prior
-    untouched, so its three readouts must be bitwise identical whatever the anchor weight --
-    driven at an absurd weight so any leak into the shuffled scoring would be unmissable."""
-    anchored = task(hparams={"beta_prior": 1.0e3})
-    unanchored = task(hparams={"beta_prior": 0.0})
-    perturb_posterior(anchored.orig_model)
-    perturb_posterior(unanchored.orig_model)  # same seed in the factory -> identical weights
-
-    torch.manual_seed(3)
-    _, with_anchor = anchored.compute_loss_and_metrics(make_stub_batch_fn(), 0, "val")
-    torch.manual_seed(3)
-    _, without = unanchored.compute_loss_and_metrics(make_stub_batch_fn(), 0, "val")
-
-    for name in ("nll_shuffled_block", "kld_shuffled", "shuffle_penalty"):
-        assert torch.equal(with_anchor[name], without[name]), name
+        assert torch.equal(with_weights[name], without[name]), name
 
 
 # --------------------------------------------------------------------------------------

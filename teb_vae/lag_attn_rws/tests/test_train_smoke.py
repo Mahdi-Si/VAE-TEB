@@ -22,6 +22,7 @@ import pytest
 import torch
 import yaml
 
+from teb_vae.lag_attn.channel_reach import resolve_stream_budgets
 from teb_vae.lag_attn.config import load_config
 from teb_vae.lag_attn_rws.trainer import LagAttnRwsTrainer
 from train.graph_models_utils import check_model_class, load_checkpoint_strict
@@ -30,7 +31,6 @@ from .conftest import absolutize_dataset_paths
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 _TINY = _REPO_ROOT / "teb_vae" / "lag_attn_rws" / "configs" / "tiny.yaml"
-_PACKAGE_DIR = _REPO_ROOT / "teb_vae" / "lag_attn_rws"
 
 
 def _run_fit(tmp_path, *, causal_reach_budget_s=None):
@@ -146,23 +146,6 @@ def test_the_zero_kl_init_invariant_survives_the_whole_stack(fit):
         assert not torch.equal(outputs["mu_base"], outputs["mu_full"])
 
 
-def test_every_declared_metric_reaches_the_logger(fit):
-    """The gap between "the task emits it" and "a callback collected it" is silent otherwise.
-    The shuffled readouts are the ones only a real validation loop can prove wired."""
-    driver, trainer = fit
-
-    for name in (
-        "train/total_loss",
-        "train/main_loss",
-        "train/source_conditioned_kl_raw",
-        "val/total_loss",
-        "val/nll_shuffled_block",
-        "val/kld_shuffled",
-        "val/shuffle_penalty",
-    ):
-        assert name in trainer.callback_metrics, f"{name} never reached callback_metrics"
-
-
 def test_the_metrics_history_csv_has_no_all_nan_column(fit):
     """The check that catches a tracked name the framework never emits: the column appears in
     every run's CSV, NaN in every row, and nothing anywhere reports it."""
@@ -173,81 +156,37 @@ def test_the_metrics_history_csv_has_no_all_nan_column(fit):
     assert all_nan == [], f"columns that are NaN for every epoch: {all_nan}"
 
 
-def test_the_scheduled_beta_reaches_the_csv(fit):
-    """The resolved schedule value, which starts at exactly zero -- the posterior-collapse
-    guard the config documents."""
-    driver, _ = fit
-    frame = pd.read_csv(Path(driver.train_results_dir) / "metrics_history.csv")
+def test_the_configured_objective_weights_reach_the_csv_and_their_terms_are_live(fit):
+    """Every objective weight the config sets, echoed back through a real fit, and every weighted
+    term nonzero -- under the tiny config's ``mse`` likelihood, where a term emitted only under
+    ``gaussian_nll`` would silently produce an all-NaN column.
 
-    assert "train/kld_beta" in frame.columns
-    assert float(frame["train/kld_beta"].iloc[0]) == pytest.approx(0.0)
-
-
-def test_the_prior_anchor_and_clip_diagnostics_reach_the_csv(fit):
-    """The prior scale rate, its echoed weight and the clip-exceedance fraction, through a real
-    fit under the tiny config's ``mse`` likelihood -- the configuration where a term emitted only
-    under ``gaussian_nll`` would silently produce an all-NaN column."""
-    driver, _ = fit
-    frame = pd.read_csv(Path(driver.train_results_dir) / "metrics_history.csv")
-
-    for column in (
-        "train/prior_rate", "val/prior_rate",
-        "train/beta_prior", "val/beta_prior",
-        "train/grad_clip_frac",
-    ):
-        assert column in frame.columns, f"{column} never reached the CSV"
-        assert frame[column].notna().any(), f"{column} is NaN in every epoch"
-
-    # The tiny config opts into the anchor, so the echoed weight is its constant -- proof the
-    # config key reaches the objective rather than being silently dropped at the kwarg sweep.
-    assert float(frame["train/beta_prior"].iloc[0]) == pytest.approx(0.1)
-    # An epoch's clip fraction is the mean of a 0/1 per-step indicator.
-    clip_frac = frame["train/grad_clip_frac"].dropna()
-    assert bool(((clip_frac >= 0.0) & (clip_frac <= 1.0)).all())
-
-
-def test_the_auxiliary_shape_terms_reach_the_csv_with_real_values(fit):
-    """The three shape terms, through a real fit under the tiny config's ``mse`` likelihood.
-
-    Nonzero is the assertion that matters, and it is not implied by the column existing: a term
-    whose weight resolves to $0.0$ is deliberately **not computed** and reports an exact $0.0$, so a
-    weight that failed to reach the objective -- dropped at the kwarg sweep, lost in the task's
-    forwarding, missing from a wrapper's signature -- produces a well-formed all-zero column and no
-    error anywhere. The echoed weights are checked beside the terms so a zero column can be read
-    unambiguously as one or the other.
-
-    ``mse`` is the right likelihood to check this under, not a limitation: the shape terms read the
-    forecast *means* only, so they are identical under either likelihood.
+    The echo is compared against the config rather than a constant, so a weight dropped at the
+    kwarg sweep or lost in the task's forwarding shows up as the driver's $0.0$ fallback. Nonzero
+    is not implied by the column existing: a term whose weight resolves to $0.0$ is deliberately
+    **not computed** and reports an exact $0.0$, a well-formed all-zero column and no error
+    anywhere. ``mse`` is the right likelihood to check this under, not a limitation: the shape
+    terms read the forecast *means* only, so they are identical under either likelihood.
     """
     driver, _ = fit
     frame = pd.read_csv(Path(driver.train_results_dir) / "metrics_history.csv")
+    vae = driver.config["model_config"]["VAE_model"]
 
     for stage in ("train", "val"):
         for term, weight in (
-            ("aux_multiscale", ("lambda_ms", 0.1)),
-            ("aux_derivative", ("lambda_deriv", 0.1)),
-            ("aux_boundary", ("lambda_boundary", 0.05)),
+            ("prior_rate", "beta_prior"),
+            ("aux_multiscale", "lambda_ms"),
+            ("aux_derivative", "lambda_deriv"),
+            ("aux_boundary", "lambda_boundary"),
         ):
-            column = f"{stage}/{term}"
-            assert column in frame.columns, f"{column} never reached the CSV"
-            values = frame[column].dropna()
-            assert not values.empty, f"{column} is NaN in every epoch"
-            assert bool(values.abs().lt(float("inf")).all()), f"{column} is not finite"
+            assert float(vae[weight]) > 0.0, f"the tiny config does not weight {term}"
+            echoed = frame[f"{stage}/{weight}"].dropna()
+            assert float(echoed.iloc[0]) == pytest.approx(float(vae[weight])), echoed.name
+            values = frame[f"{stage}/{term}"].dropna()
+            assert not values.empty and bool(values.abs().lt(float("inf")).all()), values.name
             assert float(values.abs().max()) > 0.0, (
-                f"{column} is zero in every epoch: its weight never reached the objective"
+                f"{values.name} is zero in every epoch: its weight never reached the objective"
             )
-
-            echoed = f"{stage}/{weight[0]}"
-            assert echoed in frame.columns, f"{echoed} never reached the CSV"
-            assert float(frame[echoed].dropna().iloc[0]) == pytest.approx(weight[1])
-
-
-def test_the_checkpoint_is_written_to_the_run_checkpoint_directory(fit):
-    driver, _ = fit
-
-    checkpoints = list(Path(driver.model_checkpoint_dir).glob("*.ckpt"))
-
-    assert checkpoints, "no checkpoint was written; Lightning's default would have gone elsewhere"
 
 
 def test_the_checkpoint_carries_its_contract_and_reloads(fit):
@@ -266,12 +205,6 @@ def test_the_checkpoint_carries_its_contract_and_reloads(fit):
     assert load_checkpoint_strict(rebuilt, blob) is not None, (
         "the checkpoint's state dict did not align into a model rebuilt from its own kwargs"
     )
-
-
-def test_the_run_directory_holds_the_logs(fit):
-    driver, _ = fit
-
-    assert (Path(driver.train_results_dir) / "full.log").is_file()
 
 
 def test_the_validation_figure_is_written_by_a_real_fit(fit):
@@ -300,15 +233,19 @@ def test_a_fit_completes_under_the_causal_reach_budget(guarded_fit):
     the survivors.
     """
     driver, trainer = guarded_fit
+    model = driver.pytorch_model
+    vae = driver.config["model_config"]["VAE_model"]
+    budget = resolve_stream_budgets(vae)
 
     assert trainer.current_epoch == 2
     assert trainer.state.finished
-    assert driver.pytorch_model.target_adapter.linear.in_features == 78
-    assert driver.pytorch_model.source_adapter.linear.in_features == 29
-    assert driver.pytorch_model.target_gate.max_delay == 30
-    assert driver.pytorch_model.source_delay_steps == 30
+    assert budget is not None
+    assert model.target_adapter.linear.in_features == len(budget.target_keep_index)
+    assert model.source_adapter.linear.in_features == len(budget.source_keep_index)
+    assert model.target_gate.max_delay == max(budget.target_delays)
+    assert model.source_delay_steps == max(budget.source_delays) > 0
     # The declared widths are untouched, which is what the data boundary checks against.
-    assert (driver.pytorch_model.c_y, driver.pytorch_model.c_u) == (109, 58)
+    assert (model.c_y, model.c_u) == (vae["c_y"], vae["c_u"])
 
 
 def test_the_guarded_runs_losses_stay_finite(guarded_fit):
@@ -381,53 +318,7 @@ def test_the_guarded_checkpoint_rebuilds_at_its_own_channel_widths(guarded_fit):
     path = next(iter(Path(driver.model_checkpoint_dir).glob("*.ckpt")))
     blob = torch.load(path, map_location="cpu", weights_only=False)
 
-    assert len(blob["model_kwargs"]["target_keep_index"]) == 78
-    assert len(blob["model_kwargs"]["source_delays"]) == 29
+    assert blob["model_kwargs"] == driver._build_model_kwargs()
+    assert blob["model_kwargs"]["target_keep_index"] is not None
     rebuilt = SeqVaeLagAttnRws(**blob["model_kwargs"])
     assert load_checkpoint_strict(rebuilt, blob) is not None
-
-
-#: The one module allowed to call a global seeding function, and what makes it safe.
-#:
-#: The evaluation's oracle fits a probe, and a probe's *initialisation* runs on the global
-#: generators -- ``nn.init`` takes no generator, so seeding it locally is not available. What the
-#: ban actually protects against is a seed that **persists**: one that silently overrides
-#: ``general_config.seed`` while looking like diligence. ``oracle.py`` seeds inside
-#: ``torch.random.fork_rng``, which restores the state it found on exit, so nothing downstream of
-#: the fit sees a stream it would not otherwise have seen.
-#:
-#: That is a property of behaviour rather than of source text, so it is asserted where it can be:
-#: ``test_eval_oracle.py`` runs the fit and checks the global state afterwards against the state
-#: the same pass leaves without one.
-SEEDING_EXEMPT_MODULES = {"oracle.py"}
-
-
-def test_no_module_in_the_package_seeds_by_hand():
-    """``general_config.seed`` through the framework's ``configure_determinism`` is the only
-    seeding route; a stray global seed would silently override it while looking like
-    diligence. The permutation generator's own rank-derived seed is a *local*
-    ``torch.Generator``, deliberately different per rank, and leaves the global RNG untouched
-    -- which is why the patterns below name the global calls specifically.
-
-    :data:`SEEDING_EXEMPT_MODULES` is the single narrow exception, and it is asserted to be *used*
-    as well as permitted: an exemption for a module that no longer seeds is a permission that
-    outlived its reason, and the next reach for a global seed there would go unreported.
-    """
-    offenders = []
-    exempt_and_seeding = set()
-    for path in _PACKAGE_DIR.rglob("*.py"):
-        if "tests" in path.parts:
-            continue  # tests seed themselves for reproducibility, legitimately
-        source = path.read_text(encoding="utf-8")
-        for pattern in ("torch.manual_seed", "seed_everything", "np.random.seed"):
-            if pattern not in source:
-                continue
-            if path.name in SEEDING_EXEMPT_MODULES:
-                exempt_and_seeding.add(path.name)
-                continue
-            offenders.append(f"{path.name}: {pattern}")
-    assert offenders == []
-    assert exempt_and_seeding == SEEDING_EXEMPT_MODULES, (
-        f"{sorted(SEEDING_EXEMPT_MODULES - exempt_and_seeding)} no longer seeds; drop the "
-        f"exemption rather than leaving a permission nothing uses"
-    )

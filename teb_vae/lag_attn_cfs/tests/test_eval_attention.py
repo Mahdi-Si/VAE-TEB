@@ -522,25 +522,3 @@ def test_the_analysis_writes_its_tables(collected_run) -> None:
         float(lag_compensated_seconds(index, delay_steps=lag["delay_steps"]))
         for index in range(lag["n_lags"])
     ]
-
-
-@pytest.mark.slow
-def test_the_heatmap_is_emitted_because_the_shipped_delta_retains_the_attention(
-    collected_run,
-) -> None:
-    """Retention is opt-in, and this package's override delta **sets** ``caps.attention`` rather
-    than leaving it empty -- deliberately, so a stock run emits the complete artifact set. So the
-    heatmap exists here, and the cap that decided it is named in the plan rather than left to be
-    inferred from the figure's presence.
-
-    The sibling ships the opposite default and its test asserts the absence; carrying that
-    assertion across would have passed only while this cap was unset.
-    """
-    block = collected_run["summary"]["results"]["attention"]
-
-    assert block["plan"]["heatmap_cap"] == attention.ATTENTION_CAP
-    assert block["plan"]["heatmap_cap_value"] not in (None, "absent")
-    assert (
-        Path(collected_run["results_dir"]) / attention.ANALYSIS_DIRNAME
-        / figure_filename(attention.HEATMAP_FIGURE)
-    ).is_file()

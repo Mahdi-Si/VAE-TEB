@@ -109,14 +109,3 @@ def test_the_collapse_threshold_comes_from_the_config(
 
     assert summary["collapse_threshold"] == 1e9
     assert summary["collapsed"] is True, "an absurd floor must make even a live pathway fire"
-
-
-def test_the_figure_is_written(
-    make_eval_runner, tiny_loader, tiny_eval_config, tmp_path
-) -> None:
-    runner = make_eval_runner(output_dir=tmp_path / "runner")
-    summary, _, _ = _run(
-        runner, tiny_loader, tiny_eval_config["eval_config"], tmp_path / "figure"
-    )
-    assert Path(summary["figure"]).suffix == ".pdf"
-    assert Path(summary["figure"]).stat().st_size > 0

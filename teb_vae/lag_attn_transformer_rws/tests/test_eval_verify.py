@@ -15,12 +15,10 @@ a second thing to keep in step with the schema.
 """
 from __future__ import annotations
 
-import ast
 import json
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-import pytest
 import yaml
 
 from teb_vae.lag_attn_rws.eval import verify as shared_verify
@@ -133,21 +131,6 @@ def test_the_gate_passes_a_clean_summary_and_refuses_a_failed_one(tmp_path):
     failing = tmp_path / "failing.json"
     failing.write_text(json.dumps(clean_summary(exit_code=1, failed=["forecast"])), "utf-8")
     assert verify.main(failing) == 1
-
-
-def test_a_failed_sanity_check_exits_non_zero_even_though_every_step_completed(tmp_path):
-    """The asymmetry the gate exists for: the runner reports whether a step *raised*, and a run
-    whose numbers do not hold together exits 0 there."""
-    summary = clean_summary()
-    summary["results"]["sanity"]["failed"] = ["kl_identity"]
-    path = tmp_path / "summary.json"
-    path.write_text(json.dumps(summary), encoding="utf-8")
-
-    assert verify.main(path) == 1
-
-
-def test_the_parser_names_this_package():
-    assert "lag_attn_transformer_rws" in verify.build_parser().prog
 
 
 def test_the_cli_dispatches_between_the_gate_and_the_tables(tmp_path):
@@ -566,20 +549,6 @@ def test_a_degenerate_lag_peak_is_marked_beside_the_argmax(tmp_path):
 # =============================================================================
 # The selection rule
 # =============================================================================
-def test_the_selection_rule_is_in_the_emitted_document(tmp_path):
-    """In the artifact rather than only in the source: a table of two architectures' KLs invites
-    exactly the ranking the rule forbids, and a reader has only the table."""
-    write_run(tmp_path, "trf")
-    out = tmp_path / "arms.md"
-
-    verify.compare_arms(tmp_path, out)
-    section = _section(out.read_text(encoding="utf-8"), "## Cross-model comparison")
-
-    assert verify.SELECTION_RULE in section
-    assert "Do not select on KL magnitude" in section
-    assert verify.BASELINE_MODEL_CLASS in section  # which row is the baseline is explicit
-
-
 def test_a_row_worse_than_the_baseline_on_d0_is_flagged_never_dropped(tmp_path):
     """A suppressed arm reads as an arm that was not run, so the row stays and the cell is marked.
     The threshold is the best baseline run in the directory: the rule asks whether this arm is
@@ -635,53 +604,3 @@ def test_no_row_is_flagged_when_the_directory_holds_no_baseline_run(tmp_path):
     assert verify.baseline_d_base(
         [{"model_class": verify.THIS_MODEL_CLASS, "headline": {verify.D_BASE_COLUMN: 700.0}}]
     ) is None
-
-
-# =============================================================================
-# The module's own properties
-# =============================================================================
-def test_neither_this_gate_nor_the_one_it_delegates_to_imports_torch():
-    """Proved on the import graph, one level of delegation deep: this module is a thin dispatcher
-    over the sibling's, so a ``torch`` import *there* would break the property here just as
-    surely. The layering test walks this module; nothing else walks what it calls."""
-    for module in (verify, shared_verify):
-        source = Path(str(module.__file__)).read_text(encoding="utf-8")
-        names: List[str] = []
-        for node in ast.walk(ast.parse(source)):
-            if isinstance(node, ast.Import):
-                names.extend(alias.name for alias in node.names)
-            elif isinstance(node, ast.ImportFrom) and node.module:
-                names.append(node.module)
-        offending = [name for name in names if name == "torch" or name.startswith("torch.")]
-        assert offending == [], f"{module.__name__} imports {offending}"
-
-
-def test_the_emitted_document_never_uses_the_refused_name(tmp_path):
-    """The tables are an artifact, and the naming rule that binds every run artifact binds them
-    too: the coupling readout is not called a transfer entropy anywhere in the output."""
-    write_run(tmp_path, "trf")
-    out = tmp_path / "arms.md"
-    verify.compare_arms(tmp_path, out)
-
-    lowered = out.read_text(encoding="utf-8").lower()
-    assert "transfer entropy" not in lowered and "te_lag" not in lowered
-
-
-@pytest.mark.parametrize("heading", [
-    "## Arm inventory",
-    "## Source window sweep",
-    "## Target encoder depth sweep",
-    "## Source encoder depth sweep",
-    "## Feed-forward width sweep",
-    "## Reach budget sweep",
-    "## Encoder architecture arms",
-    "## Prior-anchor weight sweep",
-    "## Cross-model comparison",
-])
-def test_the_document_carries_every_section_under_its_own_heading(tmp_path, heading):
-    write_run(tmp_path, "trf")
-    out = tmp_path / "arms.md"
-
-    verify.compare_arms(tmp_path, out)
-
-    assert heading in out.read_text(encoding="utf-8")

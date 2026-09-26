@@ -29,7 +29,7 @@ through callables on a binding would have been six or seven new fields plus a bi
 two shipped packages, so the pipeline is copied and edited instead.
 
 A fork is how two things that must stay comparable stop being comparable, so four named measures
-travel with it and each is a test rather than an intention:
+travel with it:
 
 1. The model-free primitives are **not** forked. :mod:`~teb_vae.lag_attn_cfs.eval._reuse` still
    binds ``teb_vae.lag_attn.eval``'s clinical labelling, rank statistics, bootstrap, figure
@@ -37,8 +37,7 @@ travel with it and each is a test rather than an intention:
 2. ``tests/test_eval_sibling_agreement.py`` re-derives the shared arithmetic through both
    packages on identical stub inputs and asserts equality.
 3. ``divergences.json`` beside this file classifies every one of the sibling's modules as
-   ``equivalent``, ``divergent`` or ``absent``, and the register in ``EVAL.md`` is rendered from
-   it rather than hand-kept.
+   ``equivalent``, ``divergent`` or ``absent``, and the register in ``EVAL.md`` mirrors it.
 4. ``tests/test_eval_self_contained.py`` carries ``teb_vae.lag_attn_rws.eval`` on its **forbidden**
    list: this package must not reach sideways into the pipeline it was forked from, because a
    half-fork is worse than either whole.

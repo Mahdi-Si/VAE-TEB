@@ -492,7 +492,7 @@ model_config:
     # tensors barely move: (B, 32, 10, 76) is 320 anchor-steps per sample against the previous
     # (B, 11, 30, 76) at 330, and validation, which decodes all 156 anchors densely every epoch,
     # is what bounds memory either way (156 x 10 = 1560 against the previous 136 x 30 = 4080).
-    # tests/test_config_load.py and tests/test_sweep_configs.py pin the pairing (horizon, stride)
+    # tests/test_config_load.py asserts the pairing (horizon, stride, half-life) as relations
     # here rather than leaving it to be noticed; the constructor refuses S outside [1, H].
     #
     # Validation and test decode every valid anchor -- stride 1, phase 0 -- rather than one tile

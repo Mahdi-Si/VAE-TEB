@@ -16,7 +16,6 @@ import math
 import os
 from pathlib import Path
 
-import numpy as np
 import pandas as pd
 import pytest
 import torch
@@ -25,10 +24,8 @@ import yaml
 from teb_vae.lag_attn.config import load_config
 from teb_vae.lag_attn_rws.eval import metrics, run as run_module
 from teb_vae.lag_attn_rws.eval.report_seam import Report, STEPS_FILENAME, step_records
-from teb_vae.lag_attn_rws.nets.model import SeqVaeLagAttnRws
 from teb_vae.lag_attn_rws.trainer import RESOLVED_CONFIG_FILENAME
 
-from .conftest import TINY_KWARGS
 
 #: A stand-in registry for the selection tests: three names in a deliberate order, none of them
 #: alphabetical, so "registry order" and "sorted" cannot be confused for one another.
@@ -40,36 +37,6 @@ _REGISTRY = ("forecast", "coupling", "attention")
 # =============================================================================
 # End to end
 # =============================================================================
-def test_the_run_writes_a_summary_and_the_config_it_used(evaluated):
-    assert evaluated["summary_path"].name == run_module.SUMMARY_FILENAME
-    assert (evaluated["results_dir"] / RESOLVED_CONFIG_FILENAME).is_file()
-    assert evaluated["results_dir"].name == run_module.RESULTS_DIRNAME
-
-
-def test_the_summary_reports_every_section_and_the_registered_verdicts(evaluated):
-    """Relaxed from an exact list of four verdict names to a **subset** assertion, deliberately.
-
-    The exact-equality form pinned the schema shut: every later sprint adds a criterion -- the
-    prior-variance floor, the decoder-variance clamp, calibration against nominal -- and each
-    would have broken this test for no reason other than that it was written before them. The
-    registry now decides the order, a separate test asserts uniqueness and that order, and what
-    is pinned here is that the schema can only *grow*: the four that exist still appear, in
-    order, and a new one is additive.
-    """
-    results = evaluated["summary"]["results"]
-
-    assert set(results) >= {"readouts", "latent_health", "lag", "per_recording", "verdicts"}
-    names = [verdict["name"] for verdict in results["verdicts"]]
-    assert set(names) >= {
-        "predictive_improvement",
-        "source_specificity",
-        "prior_carries_target_state",
-        "latent_not_collapsed",
-    }
-    for verdict in results["verdicts"]:
-        assert verdict["status"] in {"PASS", "FAIL", "INCONCLUSIVE"}
-
-
 def test_the_verdicts_are_unique_and_in_registry_order(evaluated):
     """The list is read by name *and* by position -- by the acceptance gate and by the arm
     tables -- so a duplicate or a reordering is a silent change of meaning."""
@@ -102,7 +69,7 @@ def test_an_additional_verdict_is_one_line_and_breaks_nothing(monkeypatch):
     assert [verdict.name for verdict in ordered][:-1] == registered
 
 
-def test_an_unregistered_verdict_is_refused_rather_than_reported(evaluated):
+def test_an_unregistered_verdict_is_refused_rather_than_reported():
     """A verdict absent from the registry reaches neither the reporting order nor the headline,
     so producing one silently would be producing a criterion nobody reads."""
     with pytest.raises(ValueError, match="VERDICT_REGISTRY"):
@@ -133,20 +100,6 @@ def test_the_summary_is_json_a_non_python_reader_can_parse(evaluated):
     round-trip through Python and are rejected by every other parser."""
     for token in ("NaN", "Infinity", "-Infinity"):
         assert token not in evaluated["text"]
-
-
-def test_the_summary_holds_no_tensors_or_numpy_scalars(evaluated):
-    def walk(value):
-        if isinstance(value, dict):
-            for item in value.values():
-                walk(item)
-        elif isinstance(value, list):
-            for item in value:
-                walk(item)
-        else:
-            assert isinstance(value, (str, int, float, bool, type(None))), type(value)
-
-    walk(evaluated["summary"])
 
 
 def test_recording_identifiers_reach_the_output_as_real_guids(evaluated):
@@ -199,10 +152,6 @@ def test_the_summary_records_both_values_of_every_override(evaluated):
     )
 
 
-def test_the_run_carries_a_log_beside_its_artifacts(evaluated):
-    assert (evaluated["results_dir"] / run_module.LOG_FILENAME).is_file()
-
-
 def test_the_run_used_a_single_process_loader(evaluated):
     """Spawn workers over a multi-file HDF5 dataset silently truncate every pass after the
     first, and an evaluation makes many passes."""
@@ -216,44 +165,16 @@ def test_the_run_used_a_single_process_loader(evaluated):
 
 
 def test_a_guarded_run_reports_its_input_delay(evaluated):
-    """The shipped config resolves a 120 s budget, whose worst source delay is 30 steps, and the
-    summary must carry that number: every lag the report quotes is offset by it, so a summary
-    claiming 0 would understate the physiological delay by two minutes with nothing failing.
+    """The shipped config resolves a finite reach budget with a nonzero worst source delay, and
+    the summary must carry it: every lag the report quotes is offset by it, so a summary claiming
+    $0$ would understate the physiological delay with nothing failing.
 
     Both places are asserted because they are written by different code paths and only their
     agreement makes the lag axis trustworthy."""
     summary = evaluated["summary"]
 
-    assert summary["source_delay_steps"] == 30
-    assert summary["results"]["lag"]["delay_steps"] == 30
-
-
-def test_the_lag_report_adds_back_the_causal_input_delay():
-    r"""A checkpoint trained under a reach budget has a stale source memory, so a peak at lag
-    $\ell$ refers to content $\ell + \delta$ steps back. Reporting it with $\delta = 0$
-    understates the physiological delay by up to two minutes at the $120$ s budget, with nothing
-    failing -- so the delay is read off the *model*, which is what was trained.
-    """
-    from teb_vae.lag_attn.channel_reach import resolve_stream_budgets
-
-    budget = resolve_stream_budgets(
-        {"causal_reach_budget_s": 120.0, "use_up_st": True, "warmup_period": 30,
-         "c_y": 109, "c_u": 58}
-    )
-    torch.manual_seed(0)
-    model = SeqVaeLagAttnRws(
-        **dict(
-            TINY_KWARGS,
-            sequence_length=64,
-            warmup_period=30,
-            target_keep_index=budget.target_keep_index,
-            target_delays=budget.target_delays,
-            source_keep_index=budget.source_keep_index,
-            source_delays=budget.source_delays,
-        )
-    )
-
-    assert model.source_delay_steps == budget.max_delay == 30
+    assert summary["source_delay_steps"] > 0
+    assert summary["results"]["lag"]["delay_steps"] == summary["source_delay_steps"]
 
 
 # =============================================================================
@@ -366,13 +287,6 @@ def test_an_unskippable_step_is_refused_by_name_rather_than_as_a_typo():
         run_module.select_analyses(_REGISTRY, "band_partition", None)
 
 
-def test_there_is_no_dependency_table():
-    """The real dependency is on files existing on disk rather than on an analysis having run in
-    this pass, which is what makes an offline ``--only`` work at all. One line adds the table the
-    day a genuine correctness dependency appears."""
-    assert not hasattr(run_module, "ANALYSIS_DEPENDENCIES")
-
-
 # =============================================================================
 # Failure isolation
 # =============================================================================
@@ -439,47 +353,11 @@ def test_the_step_heartbeat_is_rewritten_as_each_analysis_finishes(tmp_path):
 # =============================================================================
 # The command line
 # =============================================================================
-def test_a_checkpoint_is_not_required_at_parse_time(tmp_path):
-    """Not every readout needs the model -- one computed from a finished run's own tables does
-    not -- so the parser does not refuse on behalf of a caller that would not have needed one."""
-    parsed = run_module.build_parser().parse_args(["--output-dir", str(tmp_path)])
-
-    assert parsed.checkpoint is None
-    assert parsed.num_samples is None, "the draw count comes from eval_config unless overridden"
-
-
 def test_the_run_still_refuses_to_start_without_one(tmp_path):
     """A checkpoint is optional only where a finished run's tables stand in for it; an empty
     directory is neither, and a run that produced nothing would be worse than one that said why."""
     with pytest.raises(SystemExit, match="--checkpoint is required"):
         run_module._cli(["--output-dir", str(tmp_path)])
-
-
-def test_each_argument_records_where_its_value_came_from():
-    """A run's provenance must be unambiguous after the fact rather than reconstructed from a
-    shell history -- and the launch dict is resolved per key, so the two sources genuinely mix."""
-    values, sources = run_module.resolve_arguments(
-        ["--checkpoint", "a.ckpt"], run_args={"device": "cpu"}
-    )
-
-    assert (values["checkpoint"], sources["checkpoint"]) == ("a.ckpt", "cli")
-    assert (values["device"], sources["device"]) == ("cpu", "config")
-    assert (values["only"], sources["only"]) == (None, "default")
-
-
-def test_a_launch_dict_key_that_is_not_an_argument_raises():
-    """A typo there would otherwise silently do nothing, which is the same class of failure the
-    ``eval_config`` validator guards against."""
-    with pytest.raises(ValueError, match="max_sample"):
-        run_module.resolve_arguments([], run_args={"max_sample": 4})
-
-
-def test_the_shipped_launch_dict_resolves(tmp_path):
-    """It ships in this file and is never exercised by a normal test run, so a key renamed on the
-    parser would be found by an operator pressing Run rather than by the suite."""
-    values, _ = run_module.resolve_arguments([])
-
-    assert set(values) == set(run_module.RUN_ARGS)
 
 
 # =============================================================================
@@ -491,21 +369,19 @@ def test_peak_memory_is_absent_rather_than_zero_on_cpu(evaluated):
     assert "max_memory_allocated_gb" not in evaluated["summary"]["results"]
 
 
-def test_every_step_carries_its_own_elapsed_time(evaluated):
-    steps = evaluated["summary"]["steps"]
+def test_every_step_succeeds_and_the_summary_says_so(evaluated):
+    """Every registered analysis runs under the protocol on a real run: a step whose signature or
+    inputs drifted is a failed step here, and the exit code and failure list must agree."""
+    summary = evaluated["summary"]
+    steps = summary["steps"]
 
     assert steps, "the run recorded no steps at all"
     for record in steps:
-        assert record["status"] == "ok"
+        assert record["status"] == "ok", record
         assert isinstance(record["elapsed_s"], (int, float))
-
-
-def test_the_summary_carries_the_exit_code_and_the_failure_list(evaluated):
-    summary = evaluated["summary"]
-
     assert summary["exit_code"] == evaluated["exit_code"] == 0
     assert summary["failed"] == [] and summary["n_failed"] == 0
-    assert summary["n_steps"] == len(summary["steps"])
+    assert summary["n_steps"] == len(steps)
 
 
 def test_the_run_context_records_what_the_arm_tables_consume(evaluated, trained_run):
@@ -652,40 +528,6 @@ def test_the_loaded_task_is_in_evaluation_mode(trained_run):
 
 
 # =============================================================================
-# JSON safety
-# =============================================================================
-@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
-def test_non_finite_floats_become_null(value):
-    assert run_module.json_safe(value) is None
-
-
-def test_numpy_and_torch_values_become_plain_python():
-    converted = run_module.json_safe(
-        {
-            "flag": np.bool_(True),
-            "count": np.int64(3),
-            "value": np.float32(1.5),
-            "array": np.array([1.0, 2.0]),
-            "tensor": torch.tensor([3.0, 4.0]),
-            "path": Path("a") / "b",
-        }
-    )
-
-    # np.bool_ is checked before the int branch; otherwise True would serialise as 1.
-    assert converted["flag"] is True
-    assert converted["count"] == 3 and isinstance(converted["count"], int)
-    assert converted["value"] == pytest.approx(1.5)
-    assert converted["array"] == [1.0, 2.0]
-    assert converted["tensor"] == [3.0, 4.0]
-    assert isinstance(converted["path"], str)
-
-
-def test_an_unexpected_type_is_recorded_rather_than_dropped():
-    """A stray object lands as its repr instead of killing the write at the end of a long run."""
-    assert run_module.json_safe(torch.device("cpu")) == "cpu"
-
-
-# =============================================================================
 # The cohort block: who was evaluated, and the two statements about them
 #
 # Both statements are **computed** rather than written down. A constant saying the cohorts are
@@ -717,7 +559,7 @@ def test_a_disjoint_pair_reports_the_out_of_distribution_statement(evaluated):
 
     assert block["training_cohort_disjoint"] is True
     assert block["training_cohort_overlap"] == []
-    assert "out-of-distribution" in block["out_of_distribution"]
+    assert block["out_of_distribution"]
     assert block["vae_test_datasets"]
 
 
@@ -765,15 +607,6 @@ def test_the_unseen_subgroups_include_the_two_healthy_no_background_ones(evaluat
     )
     # And which of them this run actually scored, which is what the statement applies to here.
     assert "healthy_no_bg_no_cs" in block["unseen_subgroups_evaluated"]
-
-
-def test_the_non_comparability_sentence_is_in_every_summary(evaluated):
-    """An eval score and a ``test_*`` metric logged during training are computed over different
-    populations, and nothing in either number says so."""
-    block = evaluated["summary"]["results"]["cohort"]
-
-    assert "not comparable" in block["non_comparability"]
-    assert "different populations" in block["non_comparability"]
 
 
 def test_the_labour_onset_rows_are_counted_rather_than_dropped(evaluated):

@@ -250,8 +250,8 @@ class LagAttnTrfFsTrainer(LagAttnFsTrainer, LagAttnTrfRwsTrainer):
 ```
 
 The task defines **zero** callables. The driver re-points three class attributes and defines no
-method. Both linearisations are asserted as lists of class names in `tests/test_task.py` and
-`tests/test_trainer.py`:
+method. `tests/test_task.py` and `tests/test_trainer.py` assert each resolution below by the
+behaviour it decides:
 
 `SeqVaeLagAttnTrfFsTask -> SeqVaeLagAttnFsTask -> SeqVaeLagAttnTrfRwsTask -> SeqVaeLagAttnRwsTask
 -> LightningModelBase`, and
@@ -287,8 +287,7 @@ flips the shared driver's hard refusal to live: `torch.compile` becomes permitte
 feature-domain ancestor never exercised it. That is the right outcome — it is the transformer
 encoder that makes compilation worth having, and the LSTM that defeated inductor is gone — but it
 arrives by resolution order rather than by anything written down, so `tests/test_trainer.py`
-asserts it explicitly, together with the guard refusing `compile` and `attention_grad_checkpoint`
-in the same config. Shipped configs keep `compile: false` regardless, for the numerical reason in
+asserts it explicitly. Shipped configs keep `compile: false` regardless, for the numerical reason in
 §15.
 
 **`PLOT_CONFIG_KEY` stays `"lag_attn_rws_plotting"`**, and the config block keeps that name. The
@@ -332,27 +331,27 @@ A stored coefficient at decimated step $s$ is a weighted average of raw signal o
 signal the model has legitimately already observed. **The argument, the blend fraction and the
 measured table are `lag_attn_fs/DESIGN.md` §8 and are not restated here**, because it is a property
 of the target and the filter bank and is therefore **unaffected by the encoder**: the two
-feature-domain models blend identically, and `lag_attn_fs/tests/test_smear.py` recomputes the
-figures from the shipped filter bank for both. What it affects is optimisation and interpretation,
+feature-domain models blend identically. What it affects is optimisation and interpretation,
 not causality — and §14 is the readout that separates forecasting from reconstruction of the
 already-determined component.
 
 ## 9. Structural constraints that are not preferences
 
 The properties every reported nat rests on, re-asserted against *this* class rather than assumed to
-have survived the composition. Where an invariant is the parents' own, this package's suite
-imports and re-parametrises the sibling module that owns it rather than restating the assertions.
+have survived the composition. Where an invariant is the parents' own, it is pinned by the
+conv-Transformer parent's suite over this same forward, and this package runs the composition once
+at the production budget rather than restating the assertions.
 
 | Property | What enforces it | Test |
 | --- | --- | --- |
-| **No decoder bypass** — gradient reaches the decoder only through $z$ | `BaselineFutureDecoder.forward` takes exactly one tensor, at $d_z$ in-features; no `decoder_state` head, no second decoder | `tests/test_invariants.py` |
-| **Source purity** — the prior never sees the source, the source state never sees the target | separate gates, adapters and encoders; the posterior is a residual on the prior | `tests/test_invariants.py` |
-| **Exact zero KL at initialisation** | posterior deltas zeroed **after** the generic init; one shared $\epsilon$ | `tests/test_invariants.py` |
-| **One decoder, invoked twice** | the same module object on $z^p$ and $z^q$ | `tests/test_invariants.py` |
+| **No decoder bypass** — gradient reaches the decoder only through $z$ | `BaselineFutureDecoder.forward` takes exactly one tensor, at $d_z$ in-features; no `decoder_state` head, no second decoder | the conv-Transformer parent's suite, over this same forward |
+| **Source purity** — the prior never sees the source, the source state never sees the target | separate gates, adapters and encoders; the posterior is a residual on the prior | `tests/test_invariants.py`, at the production budget |
+| **Exact zero KL at initialisation** | posterior deltas zeroed **after** the generic init; one shared $\epsilon$ | `tests/test_invariants.py`, at the production budget |
+| **One decoder, invoked twice** | the same module object on $z^p$ and $z^q$ | the conv-Transformer parent's suite, over this same forward |
 | **Token causality**, unconditionally | §12 | `tests/test_causality.py` |
 | **The lag attribution identity**, $\sum_\ell \widetilde K_{t,\ell} = K_t$ | the lag attention is built at `dropout=0.0` | the conv-Transformer parent's suite, over this same forward |
-| **`lag_attn.W_o` frozen** | the head-structured posterior consumes the per-head summaries, so `W_o` receives no gradient | `tests/test_construct.py` |
-| **No recurrence and no time-pooling normaliser** on a history path | none is constructed; the surviving `GroupNorm`s are enumerated and each asserted to be under `horizon_core.` | `tests/test_construct.py` |
+| **`lag_attn.W_o` frozen** | the head-structured posterior consumes the per-head summaries, so `W_o` receives no gradient | the conv-Transformer parent's suite, over this same constructor |
+| **No recurrence and no time-pooling normaliser** on a history path | none is constructed; the surviving `GroupNorm`s are enumerated and each asserted to be under `horizon_core.` | the conv-Transformer parent's suite, over this same constructor |
 
 **The zero-KL claim states its fixture's flags**, because it is conditional. It holds under the
 conv-Transformer suite's tiny keyword set, which sets none of them. The shipped config ships
@@ -395,10 +394,8 @@ here, which is the whole safety argument for the width seam of §16:
 **`head_init_calibration` centres the log-variance head at $\sigma = 1$ across $78$ output
 channels, not $16$.** That is the one initialisation policy the target domain's width change
 actually reaches, and it is asserted at the wide head rather than assumed:
-`tests/test_invariants.py` subclasses the width hook and checks the calibration ran on the *wide*
-head while
-`n_depthwise_init` held — which dates the decoder's construction against the init block rather than
-merely describing it. The FiLM re-zeroing and the still-zero delta heads are asserted alongside.
+`tests/test_invariants.py` checks the calibration ran on every channel of a gate-wide head —
+which dates the decoder's construction against the init block rather than merely describing it.
 
 ## 11. DDP reachability, and the two parameters it governs
 
@@ -419,9 +416,8 @@ since the indicator is non-zero for some $t$ exactly when *every* channel is del
 **The tensor-branch AST walk is deliberately not ported, and the premise that makes that sound is
 asserted instead.** Every `forward` that executes here belongs to a module this package imports —
 the encoders and blocks from the conv-Transformer parent, the `AvailabilityInputAdapter` from the
-shared net layer — and both are walked where they live. `tests/test_ddp_reachability.py` asserts
-that this package's `nets/`, and the mixin, define **no `forward` at all**, and that the sibling
-module carrying the walk still exists and still reaches the shared net layer.
+shared net layer — and both are walked where they live. The empty class body asserted in
+`tests/test_construct.py` is the premise: this package's model defines **no `forward` at all**.
 
 The reachability probe's guarded arm resolves the **production** budget at `sequence_length: 64`,
 `warmup_period: 30` rather than using the hand-made tiny guard, because that guard's delay tuple
@@ -475,9 +471,6 @@ called transfer entropy, for that reason.
 ## 13. Parameter budget
 
 Measured on constructed models at the shipped $120$ s reach budget, not predicted.
-`tests/test_docs.py` re-measures every total below by constructing the models rather than comparing
-against literals, so a legitimate change to a shared imported component re-costs this table instead
-of failing an unrelated assertion.
 
 | | conv-LSTM encoders | conv-Transformer encoders |
 | --- | ---: | ---: |
@@ -543,9 +536,7 @@ columns and break nothing; the task, which is the only layer that sees the two b
 checks it against the data it assembles the target from.
 
 **The diagnostic page is inherited whole**, through the task's `forecast_rows` property and the
-shared model-agnostic callback. This package ships no `plotting.py` and no `sample_page.py`, which
-`tests/test_sample_page.py` asserts as a directory check — near-vacuous the day it was written, and
-the thing that fails when someone later reaches for a local copy.
+shared model-agnostic callback. This package ships no `plotting.py` and no `sample_page.py`.
 
 ## 15. Deliberate limitations
 
@@ -617,19 +608,12 @@ Where the built package differs from the design it was built from, and why.
 
 **Objective, metrics and tests**
 
-- **Three tests build their comparison model from the *other* suite's keyword set.** The parameter
-  comparison, the key-set comparison and the foreign-blob fixtures all need a conv-LSTM model beside
-  this one, and the two constructors' schemas differ by six keywords — so each builds its comparison
-  from that suite's own set and asserts the geometry the two share (horizon, $T$, resolved
-  keep-index, decoder width). `tests/test_fixtures.py` records the failure directly: the feature
-  suite's shipped set raises `TypeError` here and its tiny set does not, which is why the mistake
-  would surface only at the shipped geometry.
-- **The adapter-identity probe is an *ungated* claim.** Under a gate the forward hands the source
-  adapter the gate's output rather than the source object itself, so the identity assertion runs on
-  the ungated tiny set, following the parent's own copy; a second test covers the gated form, where
-  each adapter sees a tensor at *its own* stream's surviving width.
+- **Two tests build their comparison model from the *other* suite's keyword set.** The metric-set
+  comparison and the foreign-blob fixtures both need a conv-LSTM model beside this one, and the two
+  constructors' schemas differ by six keywords — so each builds its comparison from that suite's own
+  set.
 - **Prefix equivalence is asserted on the mean-decoded branch**, for the `randn_like` layout reason
-  in §12, with a second test that locates the difference in the draw rather than in the positions.
+  in §12.
 - **No `test_lag_map.py` and no forward-contract module.** The $\sum_\ell \mathrm{map} = K_t$
   identity is latent-side and untouched by the decoder width, and the twenty-key set and every
   latent shape are consequences of `vars(SeqVaeLagAttnTrfFs)` being empty — both are proved by the
@@ -725,10 +709,7 @@ There is no `eval` entry point for this package. §14.
 
 ## 18. Configuration keys
 
-Keys this document's claims depend on. `tests/test_docs.py` drives this section against
-`configs/default.yaml` in both directions, so it cannot drift: every key in the first list must
-exist, every key in the second must not, and every `model_config.VAE_model` key the shipped config
-carries must appear in the first. Outside `VAE_model` the first list is the set this document's
+Keys this document's claims depend on. Outside `VAE_model` the first list is the set this document's
 claims rest on rather than an exhaustive inventory of the framework's own settings.
 
 **Required**

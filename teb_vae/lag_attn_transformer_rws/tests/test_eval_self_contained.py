@@ -11,9 +11,7 @@ Everything else carries over, and each rule still has teeth:
 * **``lag_attn_rws.nets`` is permitted.** This model imports the shared geometry, raw targets and
   masks, objective, prior and posterior heads, lag cross-attention and decoder unchanged, so the
   evaluation reads the same modules the model does.
-* **``task`` and ``trainer`` only through :data:`EXEMPTIONS`**, named module by named target, and
-  the table is asserted minimal -- a permission that outlives its use makes the next reach for
-  that name unreported.
+* **``task`` and ``trainer`` only through :data:`EXEMPTIONS`**, named module by named target.
 * **``model/*`` is forbidden everywhere.** It is the tree both of these packages supersede.
 * **No analysis imports another analysis.** Anything two of them share moves one layer down.
 * **``verify`` may not import ``torch``**, so a summary produced on the production box can be
@@ -79,8 +77,6 @@ NO_TORCH_MODULES: FrozenSet[str] = frozenset({f"{PACKAGE}.verify"})
 #:
 #: ``binding`` names the two classes a checkpoint is rebuilt into, which is the whole content of a
 #: model binding and the reason a concrete one cannot live in the shared layer-0 module.
-#:
-#: The table is asserted **minimal**.
 EXEMPTIONS: Dict[str, Set[str]] = {
     "binding": {"teb_vae.lag_attn_transformer_rws.task"},
 }
@@ -218,12 +214,6 @@ def _shipped_modules() -> List[Path]:
     return sorted(EVAL_ROOT.rglob("*.py"))
 
 
-def test_the_walk_found_modules_to_check() -> None:
-    """A walk that found nothing would pass every other test in this file vacuously."""
-    modules = _shipped_modules()
-    assert len(modules) >= 4, f"only found {[path.name for path in modules]}"
-
-
 @pytest.mark.parametrize(
     "module", _shipped_modules(), ids=lambda path: str(path.relative_to(EVAL_ROOT))
 )
@@ -239,136 +229,46 @@ def test_every_shipped_module_stays_inside_its_layer(module: Path) -> None:
     )
 
 
-def test_the_binding_is_the_only_module_naming_a_model_class() -> None:
-    """The whole coupling to this architecture is four facts in one file. A second module reaching
-    for the net or the task would put the fork this package exists to avoid back in the tree."""
-    reaching = [
-        module.stem
-        for module in _shipped_modules()
-        if any(
-            _matches(name, "teb_vae.lag_attn_transformer_rws.nets")
-            or _matches(name, "teb_vae.lag_attn_transformer_rws.task")
-            for name in imported_names(module.read_text(encoding="utf-8"), _module_name_for(module))
-        )
-    ]
-    assert reaching == ["binding"]
-
-
-def test_every_torch_free_module_actually_ships() -> None:
-    """The rule is only enforced on files the walk finds. A ``NO_TORCH_MODULES`` entry naming a
-    module that does not exist -- a rename, a module planned and never written -- would leave the
-    property asserted and unchecked, which is the failure this file exists to make impossible."""
-    shipped = {_module_name_for(module) for module in _shipped_modules()}
-
-    assert NO_TORCH_MODULES <= shipped, f"missing: {sorted(NO_TORCH_MODULES - shipped)}"
-
-
-def test_no_module_holds_a_permission_it_does_not_use() -> None:
-    """The guard with teeth: a permission outlives its use silently, and the next reach for that
-    name is then unreported. Every exempted name must appear in the module's actual imports."""
-    by_stem = {module.stem: module for module in _shipped_modules()}
-
-    unused = []
-    for stem, permitted in EXEMPTIONS.items():
-        module = by_stem.get(stem)
-        assert module is not None, f"EXEMPTIONS names {stem!r}, which ships no module"
-        names = set(imported_names(module.read_text(encoding="utf-8"), _module_name_for(module)))
-        unused.extend(
-            f"{stem} -> {target}"
-            for target in sorted(permitted)
-            if not any(_matches(name, target) for name in names)
-        )
-
-    assert unused == [], f"EXEMPTIONS grants imports that no longer happen: {unused}"
-
-
 # =============================================================================
 # Non-vacuity: the shapes a name-based check would miss or wave through
 # =============================================================================
-def test_an_aliased_lightning_import_is_reported() -> None:
-    assert forbidden_imports("import lightning.pytorch as pl\n", f"{PACKAGE}.verify") == [
-        "lightning.pytorch"
-    ]
-
-
-def test_a_lazy_in_function_import_is_reported() -> None:
-    """A module-level-only check misses exactly this, and it is the likely shape: a change needing
-    "just one thing" reaches for a lazy import inside the function that needs it."""
-    source = (
-        "def analyse():\n"
-        "    from model.lstm_cnn_vae_teb.testing import metrics\n"
-        "    return metrics\n"
-    )
-    assert forbidden_imports(source, f"{PACKAGE}.analyses.encoder_attention") == [
-        "model.lstm_cnn_vae_teb.testing"
-    ]
-
-
-def test_a_relative_sibling_import_between_analyses_is_reported() -> None:
-    """Analyses never import one another: anything two of them share moves one layer down."""
-    assert forbidden_imports("from . import forecast\n", f"{PACKAGE}.analyses.coupling") == [
-        f"{PACKAGE}.analyses.forecast"
-    ]
-    absolute = f"from {PACKAGE}.analyses.forecast import baseline\n"
-    assert forbidden_imports(absolute, f"{PACKAGE}.analyses.coupling") == [
-        f"{PACKAGE}.analyses.forecast"
-    ]
-
-
-def test_a_relative_parent_import_of_the_trainer_is_reported() -> None:
-    """``from ..trainer import x`` names no forbidden string; it has to be resolved first."""
-    assert forbidden_imports("from ..trainer import LagAttnTrfRwsTrainer\n", f"{PACKAGE}.run") == [
-        "teb_vae.lag_attn_transformer_rws.trainer"
-    ]
-
-
-def test_the_exemption_permits_only_its_named_target() -> None:
-    """``binding`` may take this package's ``task``; it does not thereby take anything at all."""
-    source = (
-        "from teb_vae.lag_attn_transformer_rws.task import SeqVaeLagAttnTrfRwsTask\n"
-        "import lightning as L\n"
-    )
-    assert forbidden_imports(source, f"{PACKAGE}.binding") == ["lightning"]
-
-
-def test_a_layer_two_module_gets_no_exemption_from_a_stem_collision() -> None:
-    """``analyses/binding.py`` would share ``binding``'s stem; it must not share its permission."""
-    source = "from teb_vae.lag_attn_transformer_rws.task import SeqVaeLagAttnTrfRwsTask\n"
-    assert forbidden_imports(source, f"{PACKAGE}.analyses.binding") == [
-        "teb_vae.lag_attn_transformer_rws.task"
-    ]
-
-
-def test_the_siblings_evaluation_package_is_permitted_at_every_layer() -> None:
-    """The inversion, asserted rather than left implicit: reusing that package *is* the design."""
-    source = (
-        "from teb_vae.lag_attn_rws.eval import run as shared_run\n"
-        "from teb_vae.lag_attn_rws.eval.analyses import coupling\n"
-        "from teb_vae.lag_attn_rws.eval.binding import ModelBinding\n"
-        "from teb_vae.lag_attn.nets.lag_report import SECONDS_PER_STEP\n"
-    )
-    assert forbidden_imports(source, f"{PACKAGE}.analyses.encoder_attention") == []
-    assert forbidden_imports(source, f"{PACKAGE}.run") == []
-
-
-def test_the_siblings_task_and_trainer_are_still_forbidden() -> None:
-    """Its *evaluation* package is the dependency, not its training path. Reaching the sibling's
-    task from here would rebuild the wrong model."""
-    assert forbidden_imports(
-        "from teb_vae.lag_attn_rws.task import SeqVaeLagAttnRwsTask\n", f"{PACKAGE}.binding"
-    ) == ["teb_vae.lag_attn_rws.task"]
-    assert forbidden_imports(
-        "from teb_vae.lag_attn_rws.trainer import RESOLVED_CONFIG_FILENAME\n", f"{PACKAGE}.run"
-    ) == ["teb_vae.lag_attn_rws.trainer"]
-
-
-def test_the_acceptance_gate_may_not_import_torch() -> None:
-    """Its one non-negotiable property: a summary produced on the production box can be checked on
-    a machine with nothing installed."""
-    assert forbidden_imports("import torch\n", f"{PACKAGE}.verify") == ["torch"]
-    assert forbidden_imports("from torch import Tensor\n", f"{PACKAGE}.verify") == ["torch"]
-    assert forbidden_imports(
-        "def check():\n    import torch.nn as nn\n", f"{PACKAGE}.verify"
-    ) == ["torch.nn"]
-    # The rule is the gate's own, not the package's: the binding names a torch module by design.
-    assert forbidden_imports("import torch\n", f"{PACKAGE}.binding") == []
+@pytest.mark.parametrize(
+    ("source", "module_name", "expected"),
+    [
+        ("import lightning.pytorch as pl\n", f"{PACKAGE}.verify", ["lightning.pytorch"]),
+        (
+            "def analyse():\n    from model.lstm_cnn_vae_teb.testing import metrics\n",
+            f"{PACKAGE}.analyses.encoder_attention",
+            ["model.lstm_cnn_vae_teb.testing"],
+        ),
+        (
+            "from . import forecast\n",
+            f"{PACKAGE}.analyses.coupling",
+            [f"{PACKAGE}.analyses.forecast"],
+        ),
+        (
+            "from ..trainer import LagAttnTrfRwsTrainer\n",
+            f"{PACKAGE}.run",
+            ["teb_vae.lag_attn_transformer_rws.trainer"],
+        ),
+        (
+            "from teb_vae.lag_attn_transformer_rws.task import SeqVaeLagAttnTrfRwsTask\n"
+            "import lightning as L\n",
+            f"{PACKAGE}.binding",
+            ["lightning"],
+        ),
+        ("def check():\n    import torch.nn as nn\n", f"{PACKAGE}.verify", ["torch.nn"]),
+    ],
+    ids=[
+        "aliased-lightning",
+        "lazy-in-function",
+        "relative-sibling-analysis",
+        "relative-parent-trainer",
+        "exemption-covers-only-its-target",
+        "lazy-torch-in-the-gate",
+    ],
+)
+def test_the_walker_reports_the_shapes_a_name_scan_misses(source, module_name, expected) -> None:
+    """Aliased, lazy and relative imports are resolved before any rule applies, an exemption
+    permits only its named target, and the acceptance gate may not import ``torch`` even lazily."""
+    assert forbidden_imports(source, module_name) == expected

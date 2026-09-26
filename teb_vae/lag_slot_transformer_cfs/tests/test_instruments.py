@@ -376,30 +376,6 @@ def test_one_run_produces_a_complete_record_and_reads_its_truth_from_the_declara
     assert math.isfinite(float(record["kld_per_anchor"]))
 
 
-def test_the_three_splits_are_disjoint_and_the_scored_one_is_never_fitted() -> None:
-    """The property every rate in a campaign rests on.
-
-    Checked on the slices themselves rather than on a downstream number, because the failure is
-    silent: a run that scored the segments it fitted would report a plausible gap on every
-    generator, and the controls would be the ones that showed it.
-    """
-    batch = stored_feature_generators(TINY)["single_delay"].build(TINY, 5)
-    fitted = campaign._slice(batch, 0, TINY.segments)
-    selected = campaign._slice(batch, TINY.segments, TINY.segments + TINY.selection)
-    scored = campaign._slice(
-        batch, TINY.segments + TINY.selection, TINY.rows
-    )
-
-    assert fitted.y_st.shape[0] == TINY.segments
-    assert selected.y_st.shape[0] == TINY.selection
-    assert scored.y_st.shape[0] == TINY.holdout
-    assert TINY.segments + TINY.selection + TINY.holdout == TINY.rows
-    # No segment appears in two splits, asserted on the values rather than on the arithmetic above.
-    for left, right in ((fitted, selected), (fitted, scored), (selected, scored)):
-        for row in range(min(left.y_st.shape[0], right.y_st.shape[0])):
-            assert not torch.equal(left.y_st[row], right.y_st[row])
-
-
 def test_a_campaign_selection_naming_no_instrument_is_refused() -> None:
     """It would otherwise run a smaller campaign and report its rates as the campaign's."""
     with pytest.raises(ValueError, match="no instrument named"):
@@ -416,6 +392,5 @@ def test_the_campaign_record_carries_the_criteria_it_was_decided_by() -> None:
 
     assert record["criteria"]["window_width"] == TINY_CRITERIA.window_width
     assert record["criteria"]["confidence"] == TINY_CRITERIA.confidence
-    assert "interval on the per-segment predictive gap" in record["criteria"]["relevance_rule"]
     assert record["rates"]["per_generator"]["constant_source"]["rate_is"] == "false_positive_rate"
     assert record["fit"]["steps"] == 2

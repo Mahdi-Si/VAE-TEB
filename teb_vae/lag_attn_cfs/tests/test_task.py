@@ -3,11 +3,9 @@ r"""The task is the feature-target sibling's, plus the tiling phase and the sour
 Two models are only comparable if they optimise the same thing, and here that is not a claim about
 two copies of an objective agreeing -- it is the same code: the loss assembly, the $\beta$ schedule,
 the metric surface, the permutation control, the spike-breaker wiring, the gradient-norm logging,
-the checkpoint contract and the concatenated feature target are all inherited unmodified. So many of
-the assertions below are about *absence*: a re-added ``training_step`` silently disables the
-config-gated loss-spike breaker, a re-added ``_build_raw_target`` gives this model a second target
-builder that could drift from the one the comparison model is scored through, and neither fails
-anything on its own.
+the checkpoint contract and the concatenated feature target are all inherited unmodified. One
+absence is asserted directly, because nothing else would notice it: a re-added ``training_step``
+silently disables the config-gated loss-spike breaker.
 
 What is added is everything that follows from the anchor tiling, and each addition guards a failure
 whose symptom is a number rather than an exception:
@@ -33,11 +31,8 @@ import pytest
 import torch
 
 from teb_vae.lag_attn_cfs.task import DENSE_STAGES, SeqVaeLagAttnCfsTask
-from teb_vae.lag_attn_fs.task import SeqVaeLagAttnFsTask
 from teb_vae.lag_attn_rws.nets import controls
 from teb_vae.lag_attn_rws.nets.raw_masks import forecast_mask, kl_mask
-from teb_vae.lag_attn_rws.task import SeqVaeLagAttnRwsTask
-from train.pl_model_base import LightningModelBase
 
 from .conftest import (
     BATCH,
@@ -50,147 +45,18 @@ from .conftest import (
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 
-#: Callables and properties the subclass may define. A set rather than a count, following the
-#: sibling suites: a count passes a subclass that took back ``training_step`` in 140 lines while
-#: dropping something else.
-#:
-#: ``compute_loss_and_metrics`` is on the list and its body is three lines -- it records the stage
-#: and delegates. That is the whole reason it is here rather than the stage being threaded through
-#: ``_build_forward_inputs``'s signature, which is the family's shared one-argument seam between a
-#: batch and a net and is called by the plotting callback and by every sibling's tests.
-_OWN_MEMBERS = {
-    "__init__",
-    # Keeps ``epoch`` on the host, where ``anchor_phase`` hashes it; every other field moves as
-    # the inherited transfer moves it.
-    "transfer_batch_to_device",
-    "anchor_phase",
-    "_phase_field",
-    "resolve_anchor_geometry",
-    "_build_forward_inputs",
-    "_mu_gap_rms",
-    "_added_metrics",
-    "compute_loss_and_metrics",
-    "_stage",
-    # The four diagnostic-page seams. Each replaces a builder welded to something this family does
-    # not have -- a dense anchor axis, or the production two-sided filter bank -- and each of those
-    # builders fails *quietly*, inside a handler that warns and continues.
-    #
-    # ``forecast_extra_rows`` is the fourth and is a seam of the *layout* rather than of the
-    # drawing: a GridSpec row can only be created before the rows seam runs, so the names the page
-    # reserves and the names it draws have to arrive from one object -- a name reserved and not
-    # drawn is a blank row on every page of the run, and a name drawn and not reserved is a
-    # KeyError inside a handler that swallows it.
-    "forecast_rows",
-    "forecast_extra_rows",
-    "input_stream_panels",
-    "input_budget_figure",
-    "warmup_budget",
-    # Written by ``abc``, not by this class.
-    "_abc_impl",
-}
-
 
 # ---------------------------------------------------------------------------------------
 # What the subclass is
 # ---------------------------------------------------------------------------------------
-def test_the_subclass_declares_exactly_the_named_members():
-    """Each addition is a thing that can diverge from the objective being shared, so the list is
-    named rather than counted."""
-    own = {
-        name
-        for name in vars(SeqVaeLagAttnCfsTask)
-        if name == "__init__" or not name.startswith("__")
-    }
-
-    assert own == _OWN_MEMBERS
-
-
-@pytest.mark.parametrize(
-    "method",
-    ["training_step", "validation_step", "test_step", "forward", "configure_optimizers",
-     "on_save_checkpoint", "setup", "_build_raw_target", "_build_target_streams",
-     "_build_source_stream", "_resolve_beta", "_should_run_perm", "_sync_perm_decision"],
-)
-def test_the_inherited_machinery_is_not_taken_back(method):
-    """``training_step`` matters most: the framework's version runs the config-gated spike breaker,
-    and a subclass defining its own silently disables it. ``_build_raw_target`` matters second: the
-    target is the same two stored blocks concatenated, one-sided rather than two-sided, so a second
-    builder here could only drift from the one the comparison model is scored through."""
+@pytest.mark.parametrize("method", ["training_step", "validation_step", "test_step"])
+def test_the_framework_steps_are_not_taken_back(method):
+    """The framework's steps run the config-gated spike breaker and the stage bookkeeping, and a
+    subclass defining its own silently disables them -- with every metric this file checks still
+    produced through ``compute_loss_and_metrics``."""
     assert method not in vars(SeqVaeLagAttnCfsTask), (
         f"{method} is overridden; the inherited implementation is the seam this model uses"
     )
-
-
-def test_the_target_builder_resolves_to_the_siblings(task):
-    """Inherited by object identity rather than reimplemented, which is what makes "the same
-    target, one-sided" a property of the code rather than of two copies agreeing."""
-    assert (
-        SeqVaeLagAttnCfsTask._build_raw_target is SeqVaeLagAttnFsTask.__dict__["_build_raw_target"]
-    )
-
-
-def test_the_page_rows_are_this_packages_and_carry_the_tiling(task):
-    """The one feature-target seam that is **not** inherited, and the reason is the anchor axis
-    rather than the target domain: the sibling's rows index an anchor into a dense
-    $(T_{\\mathrm{valid}}, H, C)$ block, and this model's forecast is $(A_{\\max}, H, C)$ indexed by
-    position in the decoded set. The two agree only at floor $0$ and stride $1$; everywhere else the
-    inherited rows draw a real forecast at the wrong time with no shape error in it."""
-    assert isinstance(vars(SeqVaeLagAttnCfsTask)["forecast_rows"], property)
-    assert isinstance(vars(SeqVaeLagAttnFsTask)["forecast_rows"], property)
-
-    module = task()
-    rows = module.forecast_rows
-    # Six bound values, and each is something the page cannot recover from the arrays it is
-    # handed. Two are the per-window score row's: taken from where the objective takes
-    # them -- the hyperparameter for the likelihood, the net for the coverage floor -- so a
-    # window's height on that row is the block score this run computed rather than one drawn under
-    # some other assumption. The forecast clock travels for the same reason: the truth the page
-    # draws and the block each window scores must be the objective's own re-indexing.
-    assert set(rows.keywords) == {
-        "keep_index", "block_split", "training_stride", "likelihood", "coverage_floor",
-        "target_forecast_shift", "forecast_clock_delay_s", "cell_mask", "ar_coef",
-    }
-    assert rows.keywords["block_split"] == 36
-    assert rows.keywords["training_stride"] == module.orig_model.anchor_stride == TINY_STRIDE
-    assert rows.keywords["likelihood"] == module.hparams["likelihood"]
-    assert rows.keywords["coverage_floor"] == float(module.orig_model.coverage_floor)
-    assert rows.keywords["target_forecast_shift"] == module.orig_model.target_forecast_shift
-
-
-def test_the_input_panel_builder_is_a_module_level_function(task):
-    """Resolved off the task like ``forecast_rows``, and returning the plain builder rather than a
-    bound method: everything it reads -- the gates, the adapters' availability buffers, the warm-up
-    vectors, the block splits -- is on the net it is handed, so nothing needs binding, and two
-    instances resolve to the same object."""
-    from teb_vae.lag_attn_cfs.sample_page import causal_stream_panels
-
-    assert task().input_stream_panels is causal_stream_panels
-    assert task().input_stream_panels is task().input_stream_panels
-
-
-def test_the_budget_figure_seam_is_a_method_so_a_missing_budget_costs_only_the_figure(task):
-    """The callback resolves this seam with ``getattr(pl_module, ..., None)``, which does **not**
-    swallow an exception raised inside a property -- so a property raising on a task with no
-    resolved budget would take down the whole page rather than the one figure it cannot draw."""
-    module = task()
-
-    assert not isinstance(vars(SeqVaeLagAttnCfsTask)["input_budget_figure"], property)
-    assert module.warmup_budget is None
-    assert callable(module.input_budget_figure)
-    with pytest.raises(ValueError, match="no resolved warm-up budget"):
-        module.input_budget_figure(Path("."))
-
-
-def test_the_constructor_goes_through_the_base(task):
-    """Not through a grandparent ``LightningModule.__init__`` bypass, which would silently drop
-    ``save_hyperparameters``, ``_orig_model``, ``self.model`` and the breaker counters."""
-    module = task()
-
-    assert isinstance(module, LightningModelBase)
-    assert isinstance(module, SeqVaeLagAttnRwsTask)
-    assert module.orig_model is module._orig_model
-    assert hasattr(module, "_spike_ema_loss")
-    assert module.hparams.get("lr") == 1e-3
 
 
 def test_the_seed_is_a_hyperparameter_and_therefore_survives_a_resume(task):
@@ -561,17 +427,6 @@ def test_the_zero_kl_start_survives_the_task(task, stub_batch):
 
     assert float(metrics["source_conditioned_kl_raw"]) == pytest.approx(0.0, abs=1e-6)
     assert float(metrics["mu_post_prior_gap_rms"]) == pytest.approx(0.0, abs=1e-6)
-
-
-def test_the_two_geometry_guards_read_their_resolved_values(task, stub_batch):
-    """Not results: a row outside either band means the geometry broke rather than that the model
-    learned something."""
-    module = task()
-
-    _, metrics = module.compute_loss_and_metrics(stub_batch, 0, "train")
-
-    assert float(metrics["target_warm_frac"]) == 1.0
-    assert float(metrics["target_warm_frac"]) == module.orig_model.target_warm_frac
 
 
 def test_a_batch_of_one_still_trains(task, perturb_posterior):

@@ -100,23 +100,10 @@ def test_the_mse_reduction_is_the_plain_expectation():
 # =============================================================================
 # Common random numbers
 # =============================================================================
-def test_two_branches_with_the_same_latent_score_bitwise_identically(scoring_setup):
+def test_every_branch_with_the_same_latent_scores_bitwise_identically(scoring_setup):
     """The common-random-numbers property, stated operationally: if the branches disagreed only
-    through their noise draws, identical parameters would still give different scores."""
-    model, target, mask = scoring_setup
-    mu, logvar = _latent(model)
-
-    scores, _ = mc_predictive_block(
-        model,
-        {"base": (mu, logvar), "full": (mu.clone(), logvar.clone())},
-        target, mask, likelihood="gaussian_nll", num_samples=4,
-    )
-
-    assert torch.equal(scores["base"], scores["full"])
-
-
-def test_a_third_branch_shares_the_same_draws_too(scoring_setup):
-    """Every branch, not merely the first two: the shuffled control is compared against both."""
+    through their noise draws, identical parameters would still give different scores. Every
+    branch, not merely the first two: the shuffled control is compared against both."""
     model, target, mask = scoring_setup
     mu, logvar = _latent(model)
     branches = {name: (mu.clone(), logvar.clone()) for name in ("base", "full", "shuffled")}
@@ -125,6 +112,7 @@ def test_a_third_branch_shares_the_same_draws_too(scoring_setup):
         model, branches, target, mask, likelihood="gaussian_nll", num_samples=3
     )
 
+    assert torch.equal(scores["base"], scores["full"])
     assert torch.equal(scores["base"], scores["shuffled"])
 
 

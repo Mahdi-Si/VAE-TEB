@@ -8,9 +8,8 @@ Almost nothing here is new. The data fixtures are the sibling suites' -- ``pertu
 ``make_stub_batch`` and ``absolutize_dataset_paths`` -- because they describe the *data* and the
 *trap*, neither of which is a property of any model: the batch contract is the same one, and the
 posterior delta heads are zero-initialised in all three models, so at initialisation every KL
-assertion passes vacuously in all three. The token-causality probe and its two tolerances are
-imported for the same reason: every structural invariant in this package is measured the same way
-the sibling's are, and a second copy of a probe is a second thing to get wrong.
+assertion passes vacuously in all three. The movement tolerance and ``relative_change`` are
+imported for the same reason: a causality claim here is measured the way the sibling's are.
 
 What is local is the one thing that is genuinely different. This model's history states are claimed
 causal at **raw-sample** resolution rather than at token resolution, so the probe that measures
@@ -62,11 +61,8 @@ from teb_vae.lag_attn_rws.tests.conftest import (  # noqa: E402,F401
     make_stub_batch,
 )
 from teb_vae.lag_attn_transformer_rws.tests.conftest import (  # noqa: E402,F401
-    CAUSALITY_TOL,
     MOVEMENT_TOL,
-    assert_token_causal,
     relative_change,
-    resample_after,
 )
 
 #: Decimated sequence length of the tiny geometry. The raw signals the stub batch carries are
@@ -199,8 +195,8 @@ def pytest_configure(config: pytest.Config) -> None:
 def resample_raw_after(x: torch.Tensor, cut: int, *, seed: int = 0) -> torch.Tensor:
     """Return a copy of ``x`` whose samples strictly after ``cut`` on the **last** axis are redrawn.
 
-    The last axis, not axis $1$, which is what separates this from the imported
-    :func:`resample_after`. A raw input is time-last -- $(B, L)$ as the model takes it, $(B, C, L)$
+    The last axis, not axis $1$, which is what separates this from the sibling's token-major
+    ``resample_after``. A raw input is time-last -- $(B, L)$ as the model takes it, $(B, C, L)$
     once featurised -- while the sibling's token-major $(B, T, C)$ probe perturbs axis $1$. Applied
     to a raw batch that would resample *channels*, and every causality assertion built on it would
     be about nothing.
@@ -237,9 +233,9 @@ def assert_raw_causal(
     r"""Assert that output token $\lfloor \mathrm{cut} / \mathrm{stride} \rfloor$ reads no raw
     sample after ``cut``.
 
-    The raw-resolution counterpart of :func:`assert_token_causal`, and the assertion this package's
-    central claim is measured by. Resamples the raw input strictly after ``cut`` and requires two
-    things at once: the output token whose causal endpoint is ``cut`` must be **bitwise** unmoved,
+    The raw-resolution counterpart of the sibling's ``assert_token_causal``, and the assertion this
+    package's central claim is measured by. Resamples the raw input strictly after ``cut`` and
+    requires two things at once: the output token whose causal endpoint is ``cut`` must be **bitwise** unmoved,
     and the last token must have moved. The second half is the negative control, without which a
     dead stage or an unconnected residual branch passes every causality assertion in the package.
 
@@ -327,21 +323,9 @@ def tiny_kwargs() -> dict:
 
 
 @pytest.fixture
-def shipped_kwargs() -> dict:
-    """A fresh copy of the production constructor kwargs (safe to mutate)."""
-    return dict(SHIPPED_KWARGS)
-
-
-@pytest.fixture
 def stub_batch():
     """A two-sample stub batch at the tiny geometry, with the deliberate weight gap."""
     return make_stub_batch(BATCH, SEQ_LEN)
-
-
-@pytest.fixture
-def make_stub_batch_fn():
-    """Factory fixture returning :func:`make_stub_batch`."""
-    return make_stub_batch
 
 
 # The loss hyperparameters the shipped config sets, as the task's constructor takes them.

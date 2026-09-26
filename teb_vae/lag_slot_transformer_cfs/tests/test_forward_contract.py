@@ -14,7 +14,6 @@ exception:
 """
 from __future__ import annotations
 
-import pytest
 import torch
 
 from teb_vae.lag_slot_transformer_cfs.nets.lag_updates import bound_update
@@ -30,7 +29,6 @@ from teb_vae.lag_slot_transformer_cfs.tests.conftest import (
     TINY_SEQ_LEN,
     TINY_TARGET_KEEP,
     build_tiny_model,
-    tiny_model_kwargs,
     tiny_streams,
 )
 
@@ -121,17 +119,16 @@ def test_the_forward_returns_exactly_the_contract() -> None:
     assert set(run(build_model())) == set(CONTRACT_KEYS)
 
 
-@pytest.mark.parametrize("key", FORBIDDEN_KEYS)
-def test_no_attention_shaped_key_is_emitted(key: str) -> None:
+def test_no_attention_shaped_key_is_emitted() -> None:
     """Under every arm, including the one that retains the proposals for diagnostics.
 
     This architecture computes no attention distribution and no per-lag allocation of the
     divergence, and none exists for it: the cross terms in the summed update can reinforce or
     cancel, so a nonnegative per-lag decomposition is not merely unavailable but absent.
     """
-    for extra in ({}, {"return_proposals": True}):
-        assert key not in run(build_model(), **extra)
-        assert key not in run(build_model(mean_only_residual=True), **extra)
+    for model in (build_model(), build_model(mean_only_residual=True)):
+        for extra in ({}, {"return_proposals": True}):
+            assert not set(run(model, **extra)) & set(FORBIDDEN_KEYS), extra
 
 
 def test_the_mean_only_arm_omits_the_scale_keys_rather_than_zeroing_them() -> None:

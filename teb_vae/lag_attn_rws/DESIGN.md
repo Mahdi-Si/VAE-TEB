@@ -65,8 +65,8 @@ So $c_y = 43 + 66 = 109$ and $c_u = 43 + 15 = 58$ (or $15$ under `use_up_st: fal
 
 `fhr_up_ph` is **never loaded**. A cross-channel coefficient mixes both signals in one number and
 would destroy the separation between $p(z_t \mid Y_{\le t})$ and $q(z_t \mid Y_{\le t}, U_{\le t})$
-that the whole design rests on. `tests/test_config_load.py` asserts the string appears in no
-config at all.
+that the whole design rests on. `tests/test_config_load.py` asserts it is not among the shipped
+config's `load_fields`.
 
 Two contract points fail silently rather than loudly and are therefore guarded at the entry point:
 
@@ -502,7 +502,7 @@ Also deliberate, and not annotated because nothing in the code would prompt the 
 
 The evaluation is complete: fifteen analyses, two durable per-run tables, an offline acceptance
 gate and the arm tables that fill `RESULTS.md`. `eval/EVAL.md` is its contract and
-`eval/FIGURE_GUIDE.md` documents every figure; both are bound to the code by test.
+`eval/FIGURE_GUIDE.md` documents every figure.
 
 What it **closed**, each having been a standing gap in this section:
 
@@ -562,7 +562,7 @@ Every intentional difference between the built module and the design it was buil
 - **`sigma_obs`, `head_structured_latent` and `freeze_unused_attn_proj` are not config keys.** All
   three are unconditional in the net: the learned observation variance, the head-structured
   posterior and the frozen attention projection are structural facts, and a key would read to a
-  maintainer as a control that exists. `tests/test_config_load.py` asserts their absence.
+  maintainer as a control that exists.
 - **`select_ddp_strategy` keys on the likelihood alone**, and returns a configured `DDPStrategy`
   rather than a `'ddp'` / `'ddp_find_unused_parameters_true'` shorthand string. `W_o` is frozen
   unconditionally by the constructor, so it is never in the reducer's expectation set; the only
@@ -809,8 +809,7 @@ guide, including the recovery table for every way preflight refuses a run.
 
 ## 14. Configuration keys
 
-Keys this document's claims depend on. `tests/test_docs.py` asserts each required key exists in
-`configs/default.yaml` and each absent key does not, so this section cannot drift from the config.
+Keys this document's claims depend on.
 
 **Required**
 

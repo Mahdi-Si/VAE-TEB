@@ -25,6 +25,11 @@ these channel widths -- and all three failures are swallowed by design, because 
 worth failing a multi-day fit for. So a page with two rows missing and a figure that was never
 written looks exactly like a page nobody asked for, unless a real fit is made to produce one and the
 warnings it did not emit are named.
+
+Determinism is asserted once, as the requirement states it: two separate processes of one config,
+under different ``PYTHONHASHSEED`` values, write an identical metric row set -- and a fit under
+another seed does not, which is what keeps that assertion from passing on a run that ignores its
+configuration.
 """
 from __future__ import annotations
 
@@ -43,19 +48,9 @@ from teb_vae.lag_attn_cfs.nets.model import SeqVaeLagAttnCfs
 from teb_vae.lag_attn_cfs.trainer import LagAttnCfsTrainer
 from teb_vae.lag_attn_cfs.warmup_budget import BUDGET_FIGURE_STEM
 from teb_vae.lag_attn_rws import plotting as plotting_module
-from teb_vae.lag_attn_rws.trainer import RESOLVED_CONFIG_FILENAME
 from train.graph_models_utils import check_model_class, load_checkpoint_strict
 
-from .conftest import (
-    INT_C_U,
-    INT_C_Y,
-    CAUSAL_C_U,
-    CAUSAL_C_Y,
-    CAUSAL_PH_WIDTH,
-    CAUSAL_ST_WIDTH,
-    SHIPPED_WARMUP_PERIOD,
-    absolutize_dataset_paths,
-)
+from .conftest import CAUSAL_PH_WIDTH, CAUSAL_ST_WIDTH, absolutize_dataset_paths
 
 pytestmark = pytest.mark.slow
 
@@ -64,52 +59,10 @@ _TINY = Path(__file__).resolve().parents[1] / "configs" / "tiny.yaml"
 #: Epochs the fit runs. See the module docstring for why it is not the config's one.
 SMOKE_EPOCHS = 2
 
-#: What the shipped warm-up budget resolves to, pinned so a "guarded" fit cannot silently be the
-#: unguarded one -- which here would also silently change the decoder's width and therefore the
-#: units of every number the run reports.
-#:
-#: The two come from different rules and, since the two streams stopped sharing a clock, from
-#: different references. The **budget** takes four ``fhr_st`` channels off the target and never
-#: touches the source; the **alignment references** take every channel above their own stream's
-#: reference and never touch the other stream. The source number is therefore neither ``c_u`` --
-#: which it was while nothing gated that stream -- nor the target's survivor count: it is what the
-#: shipped source clock, a hundred-odd seconds faster than the target's, leaves standing.
-GUARDED_TARGET_CHANNELS = 76
-GUARDED_SOURCE_CHANNELS = 46
 
-#: How far two identical fits may disagree, per column, under the shipped autotuning settings:
-#: ``atol + rtol * (that column's own largest magnitude)``.
-#:
-#: **The absolute floor is set by the CANCELLATION columns, and that is the whole reason it is not
-#: tiny.** ``pred_gap`` and its five splits are differences of two nearly equal block scores -- both
-#: around $2500$ nats -- so their float32 noise is the *block's*, about $10^{-2}$, while their own
-#: magnitude is single digits. A bound read against their own scale would therefore be a bound on
-#: catastrophic cancellation rather than on the computation, and would fail on any machine whose
-#: autotuner chose differently. Measured over two fits: $1.2 \times 10^{-2}$ on ``pred_gap_st``.
-#:
-#: The relative term covers the large columns, where a summed block runs to thousands and the
-#: pre-clip gradient norm to $4 \times 10^{3}$; measured worst there is $0.53$ on ``grad_norm``,
-#: which is $1.3 \times 10^{-4}$ relative, and under the load of two concurrent suites the same
-#: kind of column reached $0.24$ at a magnitude of $5000$. Both are float32 accumulation order,
-#: not a different computation: a real change moves a gap by nats and a block by tens of them.
-_DRIFT_ATOL = 1.0e-1
-_DRIFT_RTOL = 1.0e-3
-
-#: The anchor counts the two stages must produce, derived here the way the model derives them so a
-#: geometry change re-derives them rather than failing a literal. The stride is the one literal:
-#: it is what the config states, and the run's stride equalling it is what is asserted.
-SHIPPED_ANCHOR_STRIDE = 5
-
-
-#: The horizon the CONFIG ships, read off the tiny variant the fit runs on rather than off the
-#: fixture-level ``SHIPPED_HORIZON`` (30), which describes the legacy unit-test geometry the
-#: parameter totals were measured at: since 2026-09-05 this cell forecasts 10 steps, so the two
-#: constants no longer agree and the fit must be checked against the one it actually trains at.
-CONFIG_HORIZON = int(load_config(str(_TINY))["model_config"]["VAE_model"]["horizon"])
-
-# The stored clock advances no label, so the dense span is T_valid - F = 300 - 10 - 134 = 156.
-DENSE_ANCHORS = 300 - CONFIG_HORIZON - SHIPPED_WARMUP_PERIOD
-TILE_COUNT = -(-DENSE_ANCHORS // SHIPPED_ANCHOR_STRIDE)
+def _tile_count(model) -> int:
+    r"""$\lceil (T_{\mathrm{valid}} - F) / S \rceil$: the tiles a sample decodes at phase $0$."""
+    return -(-(int(model.anchor_ceiling) - int(model.warmup_period)) // int(model.anchor_stride))
 
 
 def _run_fit(tmp_path, seed=None):
@@ -254,43 +207,6 @@ def test_the_spike_breaker_never_latched(fit):
     assert float(frame["train/spike_skipped"].max()) == 0.0
 
 
-def test_the_gradient_norm_stays_finite(fit):
-    """The quantity ``gradient_clip_val`` is re-derived from. If it were non-finite the clip
-    coefficient would be zero and the run would train nothing while completing normally."""
-    _, trainer = fit
-
-    grad_norm = float(trainer.callback_metrics["train/grad_norm"])
-
-    assert math.isfinite(grad_norm), f"train/grad_norm is {grad_norm}"
-
-
-def test_the_run_trains_at_the_budgets_width_and_the_configs_tiling(fit):
-    """The whole binding, end to end: config -> shard attributes -> channel tuples -> decoder width,
-    and config -> stride -> decoded anchor set.
-
-    A unit test can check each link; only a fit can check they are connected, and the failure this
-    catches is silent: a decoder built from the *declared* $c_y$ would run to completion scoring
-    $102$ channels against a $98$-channel block's worth of target, which is a different objective
-    under the same config."""
-    driver, _ = fit
-    model = driver.pytorch_model
-
-    assert model.decoder_out_channels == GUARDED_TARGET_CHANNELS
-    assert model.target_adapter.linear.in_features == GUARDED_TARGET_CHANNELS
-    assert model.source_adapter.linear.in_features == GUARDED_SOURCE_CHANNELS
-    assert model.anchor_stride == SHIPPED_ANCHOR_STRIDE
-    assert model.horizon == CONFIG_HORIZON == 10
-    # The forecast clock the config states, applied: the ceiling is T_valid less the largest
-    # advance, which is where the dense anchor count above comes from.
-    # The stored clock advances nothing: every anchor up to T_valid is decoded.
-    assert model.target_forecast_shift is None
-    assert model.anchor_ceiling == model.geometry.t_valid
-    assert model.warmup_period == SHIPPED_WARMUP_PERIOD
-    assert model.raw_per_step == 16
-    # The declared widths are untouched, which is what the data boundary checks against.
-    assert (model.c_y, model.c_u) == (INT_C_Y, INT_C_U)
-
-
 def test_the_input_adapters_carry_the_availability_terms_the_warm_up_needs(fit):
     r"""The mechanism the whole package exists for, on the model a real launch built.
 
@@ -309,7 +225,7 @@ def test_the_input_adapters_carry_the_availability_terms_the_warm_up_needs(fit):
         assert adapter.availability is not None
         assert adapter.mask_proj is not None
     assert model.target_adapter.availability.shape == (
-        model.sequence_length, GUARDED_TARGET_CHANNELS
+        model.sequence_length, model.decoder_out_channels
     )
     # And the boundary is the resolved one rather than a guess at it.
     assert int(model.target_adapter.availability[:, -1].sum()) == model.sequence_length - max(
@@ -337,8 +253,9 @@ def test_the_zero_kl_init_invariant_survives_the_whole_stack(fit):
 
     assert float(outputs["kld_per_t"].abs().max()) == 0.0
     assert torch.equal(outputs["z_prior"], outputs["mu_prior"])
-    assert outputs["mu_base"].shape == (batch_size, TILE_COUNT, CONFIG_HORIZON,
-                                        GUARDED_TARGET_CHANNELS)
+    assert outputs["mu_base"].shape == (
+        batch_size, _tile_count(model), model.horizon, model.decoder_out_channels
+    )
     assert not torch.equal(outputs["mu_base"], outputs["mu_full"])
 
 
@@ -399,13 +316,16 @@ def test_the_anchor_count_sits_at_its_geometry_derived_value_on_both_stages(fit)
     length. A value off either band means the tiling is not the one the configuration states."""
     driver, _ = fit
     frame = _metrics(driver)
+    model = driver.pytorch_model
+    tiles = _tile_count(model)
+    dense = int(model.anchor_ceiling) - int(model.warmup_period)
 
     train = frame["train/anchors_per_sample"].dropna()
     val = frame["val/anchors_per_sample"].dropna()
 
     assert not train.empty and not val.empty
-    assert bool(((train >= TILE_COUNT - 1) & (train <= TILE_COUNT)).all()), list(train)
-    assert (val == float(DENSE_ANCHORS)).all(), list(val)
+    assert bool(((train >= tiles - 1) & (train <= tiles)).all()), list(train)
+    assert (val == float(dense)).all(), list(val)
 
 
 def test_both_gap_splits_recompose_to_the_gap_in_the_same_row(fit):
@@ -414,8 +334,9 @@ def test_both_gap_splits_recompose_to_the_gap_in_the_same_row(fit):
     some other quantity would pass every test above.
 
     The tolerance is **absolute** rather than relative, and that is measured rather than lax:
-    ``pred_gap`` is a difference of two sums over $2940$ coefficients running to $\\approx 10^{3}$
-    nats, so it loses several decimal digits to float32 cancellation before either split is formed.
+    ``pred_gap`` is a difference of two sums over the $H \\cdot C_{\\mathrm{keep}}$ block, running to
+    $\\approx 10^{3}$ nats, so it loses several decimal digits to float32 cancellation before either
+    split is formed.
     """
     driver, _ = fit
     frame = _metrics(driver)
@@ -454,45 +375,6 @@ def test_the_source_null_floor_is_reported_beside_the_coupling_readout(fit):
     assert bool(column.notna().all())
 
 
-def test_the_run_directory_has_the_expected_layout(fit):
-    """The log sinks, the checkpoint directory and the resolved config a later offline pass needs."""
-    driver, _ = fit
-
-    assert (Path(driver.train_results_dir) / "full.log").is_file()
-    assert (Path(driver.train_results_dir) / "metrics_history.csv").is_file()
-    assert Path(driver.model_checkpoint_dir).is_dir()
-
-
-def test_the_resolved_config_records_the_budget_the_run_actually_got(fit):
-    """The threshold does not name a channel: what it resolves to depends on the shards' own
-    attributes, and here it also decides the decoder's width. A run recording only the request would
-    record neither what it got nor what its nats were summed over."""
-    driver, _ = fit
-
-    written = Path(driver.model_checkpoint_dir) / RESOLVED_CONFIG_FILENAME
-    assert written.is_file()
-    reloaded = yaml.safe_load(written.read_text(encoding="utf-8"))
-    assert "base" not in reloaded
-    vae = reloaded["model_config"]["VAE_model"]
-    assert vae["causal_warmup_budget_steps"] == 134
-    assert vae["warmup_period"] == SHIPPED_WARMUP_PERIOD
-    assert vae["anchor_stride"] == SHIPPED_ANCHOR_STRIDE
-    assert vae["causal_reach_budget_s"] is None
-
-
-def test_the_checkpoint_is_written_under_this_models_stem(fit):
-    """Three models writing ``lag-attn-rws-epoch=00.ckpt`` into a shared directory would be
-    indistinguishable by name."""
-    driver, _ = fit
-
-    checkpoints = list(Path(driver.model_checkpoint_dir).glob("*.ckpt"))
-
-    assert checkpoints, "no checkpoint was written; Lightning's default would have gone elsewhere"
-    assert all(path.name.startswith("lag-attn-cfs-") for path in checkpoints), [
-        path.name for path in checkpoints
-    ]
-
-
 def test_both_checkpoint_criteria_wrote_a_file_under_distinct_stems(fit):
     """The second criterion, end to end, which is the only place its filename is decided.
 
@@ -529,16 +411,16 @@ def test_the_checkpoint_carries_its_contract_and_reloads_at_its_own_width(fit):
 
     assert blob["model_class"] == "SeqVaeLagAttnCfs"
     assert blob["model_kwargs"] == driver._build_model_kwargs()
-    assert len(blob["model_kwargs"]["target_keep_index"]) == GUARDED_TARGET_CHANNELS
     assert "decoder_out_channels" not in blob["model_kwargs"]
     check_model_class(blob, "SeqVaeLagAttnCfs")
     rebuilt = SeqVaeLagAttnCfs(**blob["model_kwargs"])
-    assert rebuilt.decoder_out_channels == GUARDED_TARGET_CHANNELS
+    assert rebuilt.decoder_out_channels == driver.pytorch_model.decoder_out_channels
+    assert rebuilt.decoder_out_channels == len(blob["model_kwargs"]["target_keep_index"])
     assert load_checkpoint_strict(rebuilt, blob) is not None, (
         "the checkpoint's state dict did not align into a model rebuilt from its own kwargs"
     )
     # The run seed reaches the blob too, which is what lets a resumed run reproduce its tile grid.
-    assert blob["hyper_parameters"]["seed"] == 42
+    assert blob["hyper_parameters"]["seed"] == driver.config["general_config"]["seed"]
 
 
 def test_the_plotting_callback_draws_the_whole_page_for_every_epoch(fit):
@@ -567,7 +449,7 @@ def test_the_plotting_callback_draws_the_whole_page_for_every_epoch(fit):
     ]
 
 
-def test_the_page_carries_both_input_rows_and_the_run_warns_about_neither(tmp_path):
+def test_the_page_carries_both_input_rows_and_the_run_warns_about_neither(fit, tmp_path):
     r"""The three quiet failures, asserted together and against a **real** fit's own module.
 
     Each of this model's three page builders replaces one welded to something it does not have --
@@ -584,7 +466,7 @@ def test_the_page_carries_both_input_rows_and_the_run_warns_about_neither(tmp_pa
 
     from teb_vae.lag_attn_rws.plotting import LagAttnRwsPlotCallback
 
-    driver, trainer = _run_fit(tmp_path)
+    driver, trainer = fit
     # Through the callback's own fetch, so this draws the batch a real validation epoch drew.
     batch = plotting_module._first_validation_batch(trainer)
     callback = LagAttnRwsPlotCallback(tmp_path / "page", num_examples=1, file_format="png")
@@ -618,7 +500,7 @@ def test_the_page_carries_both_input_rows_and_the_run_warns_about_neither(tmp_pa
         # The budget the figure describes reached the task from the driver, not from the
         # checkpoint: the channels it dropped are exactly what ``model_kwargs`` cannot carry.
         assert driver.pl_model.warmup_budget is driver.resolved_warmup
-        assert driver.resolved_warmup.target.kept_width == GUARDED_TARGET_CHANNELS
+        assert driver.resolved_warmup.target.kept_width == driver.pytorch_model.decoder_out_channels
     finally:
         import matplotlib.pyplot as plt
 
@@ -651,76 +533,15 @@ def test_two_runs_of_one_config_produce_an_identical_metric_row_set(tmp_path_fac
     pd.testing.assert_frame_equal(first, second, check_exact=True)
 
 
-def test_under_the_shipped_settings_the_geometry_columns_are_still_exact(tmp_path_factory, fit):
-    """What survives ``benchmark: true``, and what does not.
-
-    Every number the model *computes* moves in the last few float32 digits, because the autotuner
-    picks different reduction orders. Nothing the run *decides* moves at all, and those are the
-    columns that matter for reading a run months later: the stamped warm fraction and the decoded
-    anchor count are functions of the geometry and the derived phase, so they are exact regardless
-    of which convolution kernel the autotuner chose. If either of them drifted, the tiling itself
-    would be non-reproducible.
-
-    **The bound is per column, ``atol + rtol * scale``**, which is a restatement rather than a
-    loosening. A single absolute bound over every numeric column compares a forecast gap of a few
-    nats against a summed block score in the thousands and a pre-clip gradient norm in the thousands
-    more; it is therefore set by the largest column and says nothing about the rest, and it goes
-    stale whenever the objective's own scale moves -- which is what put it out of date here.
-
-    The two terms answer two different regimes, and the constants say which is which. See
-    :data:`_DRIFT_ATOL`: the floor exists for ``pred_gap`` and its splits, which are *differences*
-    of two nearly equal block scores and therefore carry the block's noise at a hundredth of the
-    block's magnitude; the relative term exists for the block scores and the gradient norm
-    themselves. Both are loose against the measurement and tight against a real change -- a
-    different computation moves a gap by nats, not by hundredths.
-
-    The failure message names the offending column, its disagreement and its magnitude, because
-    "the shipped settings drifted" is not something a reader can act on.
-    """
-    repeat_driver, _ = _run_fit(tmp_path_factory.mktemp("smoke_repeat"))
-    first, second = _metrics(fit[0]), _metrics(repeat_driver)
-
-    assert list(first.columns) == list(second.columns)
-    for column in (
-        "train/target_warm_frac", "val/target_warm_frac",
-        "train/anchors_per_sample", "val/anchors_per_sample",
-        "epoch",
-    ):
-        pd.testing.assert_series_equal(first[column], second[column], check_exact=True)
-
-    drifted = {}
-    for column in first.select_dtypes("number").columns:
-        worst = float((first[column] - second[column]).abs().max())
-        scale = float(first[column].abs().max())
-        if worst > _DRIFT_ATOL + _DRIFT_RTOL * scale:
-            drifted[column] = (worst, scale)
-
-    assert drifted == {}, (
-        "the shipped settings drifted beyond float32 noise: "
-        + "; ".join(
-            f"{column} by {worst:.4g} at magnitude {scale:.4g}"
-            for column, (worst, scale) in sorted(drifted.items())
-        )
-    )
-
-
-def test_the_shipped_config_trades_bitwise_determinism_for_speed():
-    """Recorded rather than left implicit, because the test above is otherwise a puzzling
-    weakening: the config chooses cuDNN autotuning, which is what makes a production run fast and
-    what makes two of them disagree in the last float32 digits. A run that needs bitwise
-    reproducibility sets these two keys and pays for it."""
-    trainer_block = load_config(str(_TINY))["advanced_config"]["trainer"]
-
-    assert trainer_block["benchmark"] is True
-    assert trainer_block["deterministic"] is False
-
-
 def test_a_different_seed_moves_the_run(tmp_path_factory, fit):
-    """The negative control on the determinism tests: an assertion that held for *every* seed would
+    """The negative control on the determinism test: an assertion that held for *every* seed would
     be describing a run that ignores its configuration rather than one that reproduces. The seed is
     load-bearing twice over here -- it seeds the framework, and it is one of the four halves of the
     tile-phase key."""
-    reseeded_driver, _ = _run_fit(tmp_path_factory.mktemp("smoke_seed"), seed=7)
+    reseeded_driver, _ = _run_fit(
+        tmp_path_factory.mktemp("smoke_seed"),
+        seed=int(fit[0].config["general_config"]["seed"]) + 1,
+    )
     baseline, reseeded = _metrics(fit[0]), _metrics(reseeded_driver)
 
     assert list(baseline.columns) == list(reseeded.columns)

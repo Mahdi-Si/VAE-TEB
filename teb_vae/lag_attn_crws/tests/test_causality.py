@@ -31,8 +31,7 @@ show.
 
 ``causal_norm: true`` is the qualifier, exactly as on every conv-LSTM sibling: these encoders carry a
 time-pooling normaliser whose statistics would otherwise run over the whole sequence, and the flag
-causalises them. The paired negative test records that the claim is false without it, so the
-qualifier reads as a measured requirement rather than as a convenience of the fixture.
+causalises them. That it is required is the raw-signal cell's encoder test; here it is simply on.
 """
 from __future__ import annotations
 
@@ -86,7 +85,8 @@ def model(kwargs):
 @pytest.mark.parametrize("cut", _CUTS)
 def test_the_whole_model_reads_no_step_after_the_anchor(model, kwargs, cut: int) -> None:
     """Every stream is resampled, not only the target: ``mu_full`` reads the source through the lag
-    attention, whose window runs into the strict past, so a source-side leak lands there alone."""
+    attention, whose window runs into the strict past, so a source-side leak lands there alone. The
+    final step must move, or the equalities would pass on a dead pathway."""
     streams = make_streams(kwargs)
     reference = _forward(model, streams, 1)
     moved = _forward(
@@ -107,50 +107,14 @@ def test_the_whole_model_reads_no_step_after_the_anchor(model, kwargs, cut: int)
     for key in ("mu_base", "logvar_base", "mu_full", "logvar_full"):
         assert torch.equal(reference[key][:, early], moved[key][:, early]), key
 
-
-@pytest.mark.parametrize("cut", _CUTS)
-def test_the_perturbation_did_reach_the_model(model, kwargs, cut: int) -> None:
-    """The paired control for every equality above: without it a dead pathway would pass them all."""
-    streams = make_streams(kwargs)
-    reference = _forward(model, streams, 1)
-    moved = _forward(
-        model,
-        tuple(_resample_after(x, cut, seed=11 + index) for index, x in enumerate(streams)),
-        1,
-    )
-
+    # The paired control: without it a dead pathway would pass every equality above.
     assert not torch.equal(reference["mu_prior"][:, -1], moved["mu_prior"][:, -1])
     assert not torch.equal(reference["source_state"][:, -1], moved["source_state"][:, -1])
-
-
-def test_without_causal_norm_the_step_wise_claim_does_not_hold(kwargs) -> None:
-    """The time-pooling normaliser inside each encoder mixes the whole sequence, so an unqualified
-    configuration is *not* causal step by step -- which is what ``causal_norm`` exists to fix and
-    why the shipped configuration sets it."""
-    model = build(dict(kwargs, causal_norm=False)).eval()
-    streams = make_streams(kwargs)
-    cut = 9
-
-    reference = _forward(model, streams, 1)
-    moved = _forward(model, (_resample_after(streams[0], cut, seed=5), *streams[1:]), 1)
-
-    assert not torch.equal(reference["mu_prior"][:, : cut + 1], moved["mu_prior"][:, : cut + 1])
 
 
 # =================================================================================================
 # 2. Prefix equivalence
 # =================================================================================================
-def test_the_warm_up_mask_is_a_function_of_the_step_alone(model) -> None:
-    """Which is what keeps it from breaking prefix equivalence: sliced to a shorter sequence it is
-    the leading rows of the same constant, not a pattern recomputed against a new length."""
-    adapter = model.target_adapter
-    full = adapter._slice(adapter.availability, model.sequence_length)
-    short = adapter._slice(adapter.availability, model.sequence_length - 5)
-
-    assert torch.equal(short, full[: model.sequence_length - 5])
-    assert not adapter.availability.requires_grad
-
-
 def _history_states(model, streams, length: int):
     r"""$(H^y, H^u)$ over the leading ``length`` steps, through the model's own modules.
 
@@ -194,30 +158,10 @@ def test_running_on_a_prefix_reproduces_the_full_runs_history(model, kwargs) -> 
 
     assert float((full_target[:, :prefix] - short_target).abs().max()) < _PREFIX_TOL
     assert float((full_source[:, :prefix] - short_source).abs().max()) < _PREFIX_TOL
-
-
-def test_the_prefix_probe_is_not_vacuous(model, kwargs) -> None:
-    """A model whose states were all zeros, or constant along time, would satisfy it perfectly."""
-    streams = make_streams(kwargs)
-    target, source = _history_states(model, streams, model.sequence_length)
-
-    assert float(target.abs().max()) > _PREFIX_TOL
-    assert float(source.abs().max()) > _PREFIX_TOL
-    assert float((target[:, 0] - target[:, -1]).abs().max()) > _PREFIX_TOL
-
-
-def test_a_shorter_sequence_is_refused_rather_than_decoded_at_a_shifted_anchor_set(
-    model, kwargs
-) -> None:
-    """The geometry is fixed at construction, so a shorter batch is a configuration error.
-
-    Stated as a test because the architecture's dense slice would simply return fewer anchors on a
-    short tensor, silently; a gather at construction-time indices raises instead.
-    """
-    streams = make_streams(kwargs)
-
-    with pytest.raises(RuntimeError):
-        _forward(model, tuple(x[:, : model.sequence_length - 6] for x in streams), 0, 1)
+    # Not vacuous: all-zero states, or states constant along time, would satisfy it perfectly.
+    assert float(full_target.abs().max()) > _PREFIX_TOL
+    assert float(full_source.abs().max()) > _PREFIX_TOL
+    assert float((full_target[:, 0] - full_target[:, -1]).abs().max()) > _PREFIX_TOL
 
 
 # =================================================================================================

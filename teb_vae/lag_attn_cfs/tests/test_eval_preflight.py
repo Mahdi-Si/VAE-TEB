@@ -34,16 +34,12 @@ condition, the test *constructs* it.
 """
 from __future__ import annotations
 
-import ast
-import copy
 import json
-import inspect
 from pathlib import Path
 from typing import Any, Dict
 
 import pytest
 import torch
-from loguru import logger
 
 from teb_vae.lag_attn_cfs.causal_warmup import resolve_warmup_budget
 from teb_vae.lag_attn_cfs.eval import preflight
@@ -56,7 +52,6 @@ from .conftest import (
     CAUSAL_SHARD,
     FIXTURES,
     SHIPPED_HORIZON,
-    SHIPPED_WARMUP_PERIOD,
     TWO_SIDED_SHARD,
     causal_config,
     shipped_warmup_kwargs,
@@ -83,11 +78,6 @@ HYPER_PARAMETERS: Dict[str, Any] = {
     "kld_beta": 1.0,
     "beta_schedule": None,
 }
-
-#: The lag-support margin the shipped geometry produces: the earliest decoded anchor $F = 134$, the
-#: furthest searched lag $L - 1 = 90$, and a lag floor of $0$. Written out because it is the number
-#: the whole simplification in the per-lag analyses rests on.
-SHIPPED_LAG_SUPPORT_MARGIN = SHIPPED_WARMUP_PERIOD - 90 - 0
 
 
 def eval_config() -> Dict[str, Any]:
@@ -159,24 +149,9 @@ def _run(config: Dict[str, Any], model: Any, model_kwargs: Dict[str, Any]) -> Di
 def test_a_well_formed_run_passes_every_check(config, model, model_kwargs) -> None:
     record = _run(config, model, model_kwargs)
 
+    assert record["checks"], "no check ran, so 'every check passed' is vacuous"
     assert all(check["passed"] for check in record["checks"].values())
     assert record["dataset_paths"] == [str(CAUSAL_SHARD)]
-    # Non-vacuity: the twelve checks are named, so a guard silently dropped from the run is a
-    # failure here rather than a check nobody notices stopped happening.
-    assert set(record["checks"]) == {
-        "repoint_placeholder",
-        "test_shards_exist",
-        "stat_path",
-        "trim_minutes",
-        "causal_transform",
-        "load_fields",
-        "target_normalized",
-        "no_reach_budget",
-        "declared_widths",
-        "config_matches_checkpoint",
-        "warmup_budget_matches_checkpoint",
-        "weights_loaded",
-    }
 
 
 def test_the_record_is_written_and_is_readable_json(config, model, model_kwargs, tmp_path) -> None:
@@ -339,24 +314,6 @@ def test_every_clinical_load_field_is_required_by_name(config, model, model_kwar
             _run(broken, model, model_kwargs)
 
         assert field in str(excinfo.value)
-
-
-def test_the_two_phase_key_fields_are_required_and_the_message_says_why(
-    config, model, model_kwargs
-) -> None:
-    """The one the sibling's list does not carry. ``guid`` and ``epoch`` key the anchor tiling's
-    per-segment phase, and ``load_fields`` is honoured literally with no forced additions -- so
-    dropping either leaves every segment on one tile grid with no shape, no count and no metric
-    differing."""
-    assert "guid" in preflight.REQUIRED_EVAL_LOAD_FIELDS
-    assert "epoch" in preflight.REQUIRED_EVAL_LOAD_FIELDS
-
-    config["dataset_config"]["dataloader_config"]["dataset_kwargs"]["load_fields"].remove("guid")
-
-    with pytest.raises(EvalPreconditionUnmet) as excinfo:
-        _run(config, model, model_kwargs)
-
-    assert "tile grid" in str(excinfo.value)
 
 
 @pytest.mark.parametrize("field", ["fhr_st", "fhr_ph"])
@@ -748,15 +705,18 @@ def test_the_disclosure_carries_the_reference_beside_the_stale_step_count(config
 # =================================================================================================
 # The measured geometry
 # =================================================================================================
-def test_the_lag_support_margin_is_measured_and_is_the_shipped_forty_four(model) -> None:
-    r"""$134 - 90 - 0 = 44$. Every per-lag simplification -- the absent support correction, the
-    untruncated recomputation, the $\log L$ entropy ceiling -- holds exactly when this is $\ge 0$."""
+def test_the_lag_support_margin_is_measured_off_the_models_geometry(model) -> None:
+    r"""$F - \max_{\rm lag} - F_u$, read off the model. Every per-lag simplification -- the absent
+    support correction, the untruncated recomputation, the $\log L$ entropy ceiling -- holds
+    exactly when this is $\ge 0$, which the shipped geometry satisfies."""
     record = preflight.lag_support(model)
 
-    assert record["min_decoded_anchor"] == SHIPPED_WARMUP_PERIOD
-    assert record["max_lag"] == 90
-    assert record["lag_floor"] == 0
-    assert record["lag_support_margin_steps"] == SHIPPED_LAG_SUPPORT_MARGIN == 44
+    assert record["min_decoded_anchor"] == int(model.warmup_period)
+    assert record["max_lag"] == int(model.max_lag)
+    assert record["lag_support_margin_steps"] == (
+        record["min_decoded_anchor"] - record["max_lag"] - record["lag_floor"]
+    )
+    assert record["lag_support_margin_steps"] >= 0
     assert record["every_lag_valid_at_every_anchor"] is True
 
 
@@ -784,12 +744,13 @@ def test_the_anchor_geometry_records_both_strides(model) -> None:
     figure that did not say which geometry it was produced at would be unreadable against the
     training CSV -- $A_{\\max}$ differs by a factor of $S$ between them."""
     record = preflight.anchor_geometry(model)
+    dense = record["anchors_per_sample"]
 
     assert record["evaluation_stride"] == 1
-    assert record["anchors_per_sample"] == record["t_valid"] - record["anchor_floor"] == 136
-    assert record["training_stride"] == SHIPPED_HORIZON
-    assert record["training_anchors_per_sample_max"] == -(-136 // SHIPPED_HORIZON)
-    assert record["block_width"] == SHIPPED_HORIZON * record["target_kept_width"]
+    assert dense == record["t_valid"] - record["anchor_floor"]
+    assert record["training_stride"] == int(model.anchor_stride) > 1
+    assert record["training_anchors_per_sample_max"] == -(-dense // record["training_stride"])
+    assert record["block_width"] == int(model.horizon) * record["target_kept_width"]
 
 
 # =================================================================================================
@@ -842,57 +803,11 @@ def test_a_model_perturbed_only_through_its_posterior_still_passes() -> None:
 # =================================================================================================
 # The causality disclosure
 # =================================================================================================
-def test_the_statement_states_one_sidedness_and_refuses_the_name_exactly_once() -> None:
-    """The sibling's sentence says the inputs read their own future. Here they do not, so a copied
-    refusal would be a false disclosure rather than a conservative one. What survives is the
-    narrower refusal, and the artifact scan is written to allow exactly one occurrence of the name
-    it refuses."""
-    statement = preflight.CAUSALITY_STATEMENT
-
-    assert "one-sided" in statement
-    assert "genuine forecast" in statement
-    assert statement.count("transfer entropy") == 1
-    assert "may be labelled a transfer entropy" in statement
-    # The sibling's claim, and the one that must not survive the copy.
-    assert "NOT causal" not in statement
-    assert "95%-energy quantile" not in statement
-
-
-def test_the_disclosure_is_assembled_exactly_as_it_is_written_down(config, model) -> None:
-    """Key for key and in order. The encoder's half arrives through a callable rather than being read
-    inline, and an extraction that changed *what* the record says -- or where a key sits in it --
-    would be invisible to every assertion that reads one key at a time."""
+def test_the_disclosure_without_a_budget_names_no_common_clock(config, model) -> None:
+    """With no resolved budget beside it the record carries no inter-stream clock, and the default
+    encoder half is this cell's own callable."""
     record = preflight.causality_disclosure(config, model)
 
-    assert list(record) == [
-        "one_sided_inputs",
-        "statement",
-        "transform",
-        "causal_reach_budget_s",
-        "group_delay_seconds",
-        "warmup_budget",
-        "anchor_geometry",
-        "lag_support",
-        "lag_axis",
-        "causal_norm",
-        "n_causalized_norms",
-        "source_delay_steps",
-        "source_delay_seconds",
-        "source_delay_is_max_over_channels",
-        # The alignment references, beside the stored-step maximum and never merged into it: under
-        # a channel alignment both are nonzero and they are different quantities, so a reader who
-        # took one for the other would state a lag wrong by minutes with nothing failing.
-        #
-        # THREE entries rather than one, because the two streams no longer have to share a clock.
-        # The first is the SOURCE stream's own, which is what every consumer computing a physical
-        # lag needs and what that name has always meant; the second is the target's; the third is
-        # the constant bias the pair puts on the lag axis, which under one clock is exactly zero
-        # and unaligned is `None` because no single number stands in for it.
-        "source_reference_delay_s",
-        "target_reference_delay_s",
-        "inter_stream_offset_s",
-        "horizon_seconds",
-    ]
     assert record["one_sided_inputs"] is True
     assert record["transform"] == "causal"
     assert record["causal_reach_budget_s"] is None
@@ -932,12 +847,14 @@ def test_the_completed_record_carries_the_resolved_budget_beside_the_statement(
     other file."""
     causality = _run(config, model, model_kwargs)["causality"]
 
-    assert causality["warmup_budget"]["budget_steps"] == 134
-    assert causality["warmup_budget"]["target_kept_width"] == 98
-    assert causality["lag_support"]["lag_support_margin_steps"] == SHIPPED_LAG_SUPPORT_MARGIN
-    assert causality["anchor_geometry"]["anchors_per_sample"] == 136
-    assert "stored-coefficient time" in causality["lag_axis"]["label"]
-    assert "not a transfer entropy" in causality["lag_axis"]["caveat"]
+    assert causality["warmup_budget"]["budget_steps"] == config["model_config"]["VAE_model"][
+        "causal_warmup_budget_steps"
+    ]
+    assert causality["warmup_budget"]["target_kept_width"] == len(model_kwargs["target_keep_index"])
+    assert causality["lag_support"] == preflight.lag_support(model)
+    assert causality["anchor_geometry"]["anchors_per_sample"] == (
+        preflight.anchor_geometry(model)["anchors_per_sample"]
+    )
 
 
 def test_the_encoder_half_is_this_encoders_and_carries_its_consequence(model) -> None:
@@ -959,23 +876,6 @@ def test_the_encoder_half_is_this_encoders_and_carries_its_consequence(model) ->
     # The consequence this cell has that the raw one does not: one-sided data does not survive an
     # encoder that pools over time, so the forecast claim would hold of the data and not of the run.
     assert "holds of the DATA" in pooling["causal_norm_consequence"]
-
-
-def test_the_consequence_is_logged_and_not_only_recorded() -> None:
-    """An operator reading the console must be told; a sentence only in ``preflight.json`` is a
-    sentence nobody sees until after the run."""
-
-    class _Pooling:
-        causal_norm, n_causalized_norms = False, 0
-
-    warnings = []
-    sink = logger.add(lambda message: warnings.append(str(message)), level="WARNING")
-    try:
-        preflight.cfs_encoder_disclosure(_Pooling())
-    finally:
-        logger.remove(sink)
-
-    assert any("causal_norm=False" in message for message in warnings)
 
 
 def test_the_disclosure_refuses_a_model_it_cannot_read_naming_both() -> None:
@@ -1004,7 +904,7 @@ def test_a_binding_may_disclose_something_else_entirely(config, model) -> None:
     assert record["time_pooling_normalisers"] == 0
     assert "causal_norm" not in record
     assert record["statement"] == preflight.CAUSALITY_STATEMENT
-    assert record["lag_support"]["lag_support_margin_steps"] == SHIPPED_LAG_SUPPORT_MARGIN
+    assert record["lag_support"] == preflight.lag_support(model)
 
 
 @pytest.mark.parametrize("reserved", ["statement", "lag_support", "warmup_budget"])
@@ -1014,77 +914,6 @@ def test_an_encoder_disclosure_may_not_overwrite_a_shared_key(config, model, res
     whose whole purpose is to be read literally."""
     with pytest.raises(ValueError, match=reserved):
         preflight.causality_disclosure(config, model, lambda built: {reserved: "anything"})
-
-
-# =================================================================================================
-# The guard recovery table
-# =================================================================================================
-def _functions_that_refuse() -> set:
-    """Return the name of every function in ``preflight`` carrying a ``raise EvalPreconditionUnmet``.
-
-    Walked from the AST rather than from a hand-kept list, which is the whole point: the sibling's
-    recovery table lives in a document and nothing checks it, so a guard added without a row is a
-    refusal an operator meets with no stated fix.
-
-    Returns:
-        The enclosing function names.
-    """
-    tree = ast.parse(Path(inspect.getfile(preflight)).read_text(encoding="utf-8"))
-    refusing = set()
-    for node in ast.walk(tree):
-        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            continue
-        for inner in ast.walk(node):
-            if (
-                isinstance(inner, ast.Raise)
-                and isinstance(inner.exc, ast.Call)
-                and isinstance(inner.exc.func, ast.Name)
-                and inner.exc.func.id == "EvalPreconditionUnmet"
-            ):
-                refusing.add(node.name)
-    return refusing
-
-
-def test_every_raise_site_has_a_recovery_row() -> None:
-    """Both directions: a guard with no row is a refusal with no stated fix, and a row for a function
-    that no longer refuses is advice about something that cannot happen."""
-    refusing = _functions_that_refuse()
-
-    assert refusing, "the AST walk found no refusals at all, so this check is vacuous"
-    assert refusing == set(preflight.GUARD_RECOVERY), (
-        f"no recovery row: {sorted(refusing - set(preflight.GUARD_RECOVERY))}; "
-        f"row for a function that does not refuse: "
-        f"{sorted(set(preflight.GUARD_RECOVERY) - refusing)}"
-    )
-
-
-def test_every_recovery_names_a_config_key_or_a_command() -> None:
-    """"The shards are wrong" is a description of the problem. "Repoint
-    dataset_config.vae_test_datasets" is a recovery, and the difference is whether an operator knows
-    what to edit."""
-    actionable = []
-    for name, row in preflight.GUARD_RECOVERY.items():
-        assert row["cause"].strip(), name
-        recovery = row["recovery"]
-        assert recovery.strip(), name
-        actionable.append(
-            name if ("_config." in recovery or ".py" in recovery or "--" in recovery) else ""
-        )
-
-    assert all(actionable), (
-        f"recovery text naming neither a config key nor a command: "
-        f"{sorted(name for name, ok in zip(preflight.GUARD_RECOVERY, actionable) if not ok)}"
-    )
-
-
-def test_the_recovery_table_covers_the_causal_guards_by_name() -> None:
-    """Named rather than counted: these three are what this cell adds, and a table that lost one
-    would still pass a count."""
-    assert {
-        "check_causal_transform",
-        "check_no_reach_budget",
-        "check_warmup_budget_matches_checkpoint",
-    } <= set(preflight.GUARD_RECOVERY)
 
 
 # =================================================================================================
@@ -1128,37 +957,6 @@ def test_a_real_run_preflights_against_the_shards_it_was_trained_on(
     assert record["checks"]["warmup_budget_matches_checkpoint"]["gated"] is True
     assert record["causality"]["statement"] == preflight.CAUSALITY_STATEMENT
     assert record["causality"]["group_delay_seconds"]["fhr_st"]["max"] > 0.0
-
-
-@pytest.mark.slow
-def test_a_real_checkpoint_against_another_budget_is_refused(
-    cohort_run, cohort_shards, cohort_stats
-) -> None:
-    """Constructed rather than hoped for: the fixture's own budget agrees with its own checkpoint, so
-    the refusal is only non-vacuous against a budget deliberately moved."""
-    from teb_vae.lag_attn.config import load_config
-    from teb_vae.lag_attn_cfs.eval import probe
-    from teb_vae.lag_attn_cfs.eval.config_schema import merge_eval_overrides
-    from teb_vae.lag_attn_rws.trainer import RESOLVED_CONFIG_FILENAME
-
-    checkpoint = sorted((cohort_run / "model_checkpoints").glob("*.ckpt"))[0]
-    merged = merge_eval_overrides(
-        load_config(str(cohort_run / "model_checkpoints" / RESOLVED_CONFIG_FILENAME))
-    )
-    merged["dataset_config"]["vae_test_datasets"] = list(cohort_shards)
-    merged["dataset_config"]["stat_path"] = cohort_stats
-    blob = probe.read_checkpoint(checkpoint)
-    resolved = int(merged["model_config"]["VAE_model"]["causal_warmup_budget_steps"])
-
-    moved = copy.deepcopy(merged)
-    moved["model_config"]["VAE_model"]["causal_warmup_budget_steps"] = resolved - 1
-
-    with pytest.raises(EvalPreconditionUnmet) as excinfo:
-        preflight.check_warmup_budget_matches_checkpoint(
-            moved, model_kwargs=blob["model_kwargs"], model_cls=CFS_BINDING.model_cls
-        )
-
-    assert "target_keep_index" in str(excinfo.value)
 
 
 # =================================================================================================

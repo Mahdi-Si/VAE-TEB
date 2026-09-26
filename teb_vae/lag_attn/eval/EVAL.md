@@ -242,8 +242,7 @@ tree), `lightning`, `pytorch_lightning`, `teb_vae.lag_attn.task`, `teb_vae.lag_a
 `_check_declared_widths_against_shard` — because copying ninety lines of guard is how those guards'
 long actionable error messages drift out of agreement with the trainer's. The exemption is narrow in
 the dimension that matters: `test_self_contained.py` pins that `preflight` importing `task` still
-violates, and a reverse guard fails if `preflight` ever stops importing `trainer`, so a dead
-permission cannot linger.
+violates.
 
 ### `figure_primitives.py`, the shared seam
 
@@ -1530,7 +1529,7 @@ steps ran that should not have.
 | `headline` | Eleven scalars and three verdicts, flattened out of the per-analysis blocks so a reader does not need to know which analysis produced which number: `feat_mse`, `feat_r2`, `uplift_rel`, `uplift_positive_frac`, `residual_ratio`, `kld_mean`, `kld_active_frac` (the **masked** one), `median_argmax_lag`, `attention_entropy_nats`, `nll_gain`, `crps`; plus `collapse`, `source_specificity` and `te_lag_map` (the attribution/diagnostic label). `null` where the producing analysis was skipped or failed. |
 | `sanity` | Five machine-checked verdicts — see below — plus `failed`, `n_failed`, `n_inconclusive`, `warning`. |
 | `coverage` | Effective $n$, per-file composition and capped-ness **per analysis**, plus a warning when two *uncapped* analyses ran on different populations. Metrics from two such analyses reconcile only by coincidence, and nothing else in the output shows it. |
-| `artifacts` | Every file the run emitted with its size, the PDF subset, and `n_excluded_stale`. This is what makes `FIGURE_GUIDE.md`'s coverage test non-circular: a hardcoded filename list would pass by construction. `summary.json` itself is excluded, since the manifest is built before it is written — recorded in a `note` field rather than left as a puzzle. |
+| `artifacts` | Every file the run emitted with its size, the PDF subset, and `n_excluded_stale`. This is what lets `FIGURE_GUIDE.md`'s coverage be checked without a hardcoded filename list, which would pass by construction. `summary.json` itself is excluded, since the manifest is built before it is written — recorded in a `note` field rather than left as a puzzle. |
 | `preflight` | Every precondition checked, its verdict, the health probe, and the `lag_seconds_convention` block (§8). |
 | `config_warnings` | Inert caps — a cap at or above `max_samples` never fires, so the cap an operator is tuning does nothing. |
 | `collapse`, `source_specificity` | The two promoted verdicts. |
@@ -2146,9 +2145,9 @@ The output shape and the sanity checks are §12. Four properties of the wrapper 
   every captured traceback — to a failure in the bookkeeping. That is precisely what `step` exists
   to prevent, and it would be perverse for the summariser to be the one place that does not honour
   it. `console_table()` degrades the same way.
-- **`build_manifest` is not bookkeeping.** It is what lets the documentation test assert that every
-  emitted figure has a `FIGURE_GUIDE.md` entry without hardcoding a filename list — a hardcoded list
-  would pass by construction and stop covering the moment an analysis gained a figure. `since`
+- **`build_manifest` is not bookkeeping.** It is the run's own record of every emitted file and
+  figure, so nothing downstream has to hardcode a filename list — a hardcoded list would stop
+  covering the moment an analysis gained a figure. `since`
   excludes a previous run's files, counted as `n_excluded_stale`; a file that races away between the
   walk and the `stat` is skipped silently, a vanished file not being worth losing the summary over.
 
@@ -2207,14 +2206,8 @@ bookkeeping.
    value_columns=[...])`. It never raises.
 8. **Return a JSON-safe dict.** Nested dicts and lists of numpy scalars are fine; do not return
    tensors, which survive as strings — visible but useless.
-9. **Add a `### <name>` heading to this document.** `tests/test_docs.py` enumerates `analyses/*.py`
-   from the filesystem and matches heading *slugs* by exact equality, after stripping backticks and
-   asterisks and lowercasing. `### <name>` on its own line at column 0; no numbering, no em dash, no
-   qualifier — `### 8. probe` and `### probe — the loader probe` both fail, `### probe` and
-   `` ### `probe` `` both pass. Underscores are not stripped, deliberately, so `te_lag` does not
-   become `telag`.
-10. **Add a `<name>/` entry and every PDF filename to `FIGURE_GUIDE.md`.** The manifest-driven test
-    reads `results.artifacts.figures` from a real smoke run.
+9. **Add a `### <name>` heading to this document.**
+10. **Add a `<name>/` entry and every PDF filename to `FIGURE_GUIDE.md`.**
 11. **If the analysis produces a number a reader should not have to hunt for, add it to
     `report.HEADLINE_SCALARS`** as `(name, path into results)`. Nothing fails if you skip this — and
     that is the trap. The block lands correctly under `results.<name>`, the coverage record is
@@ -2253,7 +2246,7 @@ names an analysis imports directly.
 
 Write with `figures.render_figure`, which applies `tight_layout` (swallowing a layout warning
 rather than losing a completed figure), saves at `SAVE_DPI`, **closes the figure** and returns the
-path. **PDF only**: `build_manifest` filters on `.pdf` and the documentation test reads that subset.
+path. **PDF only**: `build_manifest` filters on `.pdf`.
 
 Any figure that might not reach `render_figure` — a guard between construction and write, an
 exception — must be closed in a `finally`. A leaked figure is not a failure of the code that leaked
@@ -2266,7 +2259,7 @@ Then add the filename and a reading to `FIGURE_GUIDE.md`.
 
 ### Adding an `eval_config` key
 
-Four edits, and the fourth is enforced:
+Four edits:
 
 1. `config_schema.VALID_KEYS` — otherwise the key raises as unknown.
 2. `config_schema.DEFAULTS` — a partial block is legitimate, so absence must be defaulted; only a
@@ -2274,10 +2267,7 @@ Four edits, and the fourth is enforced:
 3. A validator in `validate_eval_config`, with the failure mode in the error message. Reject `bool`
    explicitly wherever an integer is expected, and reject values that would make a check unable to
    fire, because those read as an active check that is not one.
-4. **A backticked mention in this document.** `test_docs.py` resolves the tiny fixture config
-   through `validate_eval_config` and requires the literal `` `key` ``, backticks included, to
-   appear somewhere in `EVAL.md`. Because `DEFAULTS` fills the resolved dict, steps 1 and 2 alone
-   make the test demand it, whether or not the shipped YAML sets it.
+4. **A backticked mention in this document.**
 
 Set it in `configs/eval.yaml` too, with the reasoning as a comment: that file is dumped into the run
 directory and is the durable record. Do **not** add a threshold that gates a promoted verdict (§6).
@@ -2367,13 +2357,12 @@ Which test enforces which documented guarantee:
 | --- | --- |
 | `test_parity.py` | The load-bearing one. The masked feature loss and masked KL every analysis computes through `masks` + `metrics` are the quantities `compute_loss` optimised. Cases are chosen for what separates the two implementations — `kld_support`, `likelihood` — not for coverage. |
 | `test_masks.py` | The mask's *structure*: warm-up and anchor boundaries, the weight product, the lag-band and dead-anchor arithmetic, and the stratified-quota coverage guarantee at `cap ∈ {8, 9, 16}` over eight groups. Numerical agreement lives in `test_parity`. |
-| `test_docs.py` | This document and `FIGURE_GUIDE.md`, driven off the code and a real smoke run rather than a hand-maintained list. See §15. |
 | `test_self_contained.py` | An AST walk over every `.py` under `eval/`: no `model`, no Lightning, no reach into `task.py` — lazy in-function imports included. |
 | `test_reproducibility.py` | A rerun with the same config, checkpoint and seed produces identical numbers — not obviously true, since `forward` samples $z$ unconditionally. A companion assertion checks the seeding *is* what holds it together, so the test cannot pass for the wrong reason. |
 | `test_fixtures.py` | The perturbations bite, and the two are not interchangeable. |
 | `test_config.py` | What the shipped configs actually resolve to, and what the validator refuses. |
-| `test_grouped.py` | The by-class and by-subgroup policy on both branches: clean skips on the single-class committed shard, real emission on the generated multi-class ones. |
-| `test_figures.py` | One copy of each primitive, no framework dragged in, every panel surviving empty and all-`NaN` input. Every test closes its figure in a `finally`. |
+| `test_grouped.py` | The by-class and by-subgroup policy on both branches: clean skips on a single-class or unlabelled frame, real emission on the generated multi-class shards. |
+| `test_figures.py` | No framework dragged into the primitives, every panel surviving empty and all-`NaN` input. Every test closes its figure in a `finally`. |
 | `test_verify.py` | Every acceptance criterion in all three states, `INCONCLUSIVE` included — a criterion that silently *passes* when the run lacks what it needs turns the whole verification into a formality. |
 | `test_stats.py` | The shared rank statistics at their Layer-0 home — Holm against its definition, Cliff's delta against a direct pair count, the Kruskal-Wallis and pairwise wrappers against `scipy` — so the extraction from `cross_subgroup` cannot rot even if that module's re-export is removed. |
 | `test_kld_time_to_delivery.py` | The $30$-minute binning of `epoch`, the (group, window) quartiles against a direct `pandas` reduction, the per-window Kruskal-Wallis against `scipy`, Holm across the windows, pairwise only for survivors, and every skip branch (no `epoch`, one class, no labels). Driven by hand-built frames, model-free, exactly like `test_cross_subgroup`. |

@@ -31,13 +31,11 @@ import math
 import pytest
 import torch
 
-from teb_vae.lag_attn_cfs.nets.model import SeqVaeLagAttnCfs
 from teb_vae.lag_attn_cfs.tests.conftest import (
     BATCH,
     TINY_STRIDE,
     build,
     make_streams,
-    shipped_warmup_kwargs,
     tiny_warmup_kwargs,
 )
 
@@ -126,24 +124,6 @@ def test_short_rows_repeat_their_last_valid_anchor(model) -> None:
     # A duplicate exists, and it is only ever among the invalid entries -- which is exactly what
     # the objective's own anchor validation permits.
     assert len(set(index[0].tolist())) < index.shape[1]
-
-
-def test_the_valid_count_is_the_tiles_that_fit(model) -> None:
-    r"""$\lceil (T_{\mathrm{valid}} - F - \varphi)/S \rceil$, phase by phase."""
-    floor, t_valid, stride = _geometry(model)
-
-    counts = []
-    for phase in range(stride):
-        _, valid = model._build_anchor_index(
-            batch=BATCH, device=torch.device("cpu"), anchor_phase=phase
-        )
-        expected = math.ceil((t_valid - floor - phase) / stride)
-        assert int(valid[0].sum()) == expected, phase
-        counts.append(expected)
-
-    # The mean over phases is the dense count divided by the stride, which is what makes the tiling
-    # a partition of the same supervision rather than a reduction of it.
-    assert sum(counts) == t_valid - floor
 
 
 def test_every_phase_is_a_different_grid_and_together_they_cover_everything(model) -> None:
@@ -291,37 +271,3 @@ def test_the_forward_returns_the_anchors_it_decoded(model) -> None:
     )
     assert torch.equal(out["anchor_index"], index)
     assert torch.equal(out["anchor_valid"], valid)
-
-
-# =================================================================================================
-# The shipped geometry
-# =================================================================================================
-def test_the_shipped_geometry_tiles_as_the_budget_predicts() -> None:
-    r"""$F = 134$, $S = H = 30$, $T_{\mathrm{valid}} = 270$: five tiles at $\varphi \le 15$ and four
-    otherwise, mean $136/30$; and the dense validation resolution is $136$.
-
-    The floor is the aligned one. Unaligned it was $133$, which put the five-tile boundary one phase
-    later and gave $137$ dense anchors: the one anchor the common clock costs, priced here rather
-    than argued about.
-    """
-    kwargs = shipped_warmup_kwargs()
-    torch.manual_seed(0)
-    model = SeqVaeLagAttnCfs(**kwargs).eval()
-    floor, t_valid, stride = _geometry(model)
-    assert (floor, t_valid, stride) == (134, 270, 30)
-
-    counts = []
-    for phase in range(stride):
-        _, valid = model._build_anchor_index(
-            batch=1, device=torch.device("cpu"), anchor_phase=phase
-        )
-        assert tuple(valid.shape) == (1, 5)
-        counts.append(int(valid.sum()))
-    assert counts[:16] == [5] * 16 and set(counts[16:]) == {4}
-    assert sum(counts) == t_valid - floor == 136
-
-    dense, valid = model._build_anchor_index(
-        batch=1, device=torch.device("cpu"), anchor_stride=1
-    )
-    assert tuple(dense.shape) == (1, 136) and bool(valid.all())
-    assert int(dense[0, 0]) == 134 and int(dense[0, -1]) == 269

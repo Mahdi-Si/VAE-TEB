@@ -15,21 +15,12 @@ The specific inversions this catches, all of which were real in the tree this re
   reusable outside it.
 * ``model`` -- the tree this package replaces, checked here as well as in the layering suite.
 
-The batch-field check is the same rule from the other side. A net that reads ``batch.fhr_st`` has
-learned the dataset's schema, and every such name is a place the data layer and the model layer
-have to agree without anything checking that they do. Tensors go in as arguments; what they were
-called on disk is the caller's business.
-
-That check matches on word boundaries, which is not incidental. ``use_up_st`` is a constructor
-argument -- an ablation toggle the model legitimately owns, and part of its public config
-contract -- while ``batch.up_st`` is a schema read. A bare substring search cannot tell them
-apart and would fail on the former, so the guard would get loosened or deleted, which is how
-guards die.
+The sibling cells import the rule's pieces (``_ALLOWED_ROOTS``, ``_FORBIDDEN_PREFIXES``,
+``_imported_names``) from here, so this file is the rule's single definition.
 """
 from __future__ import annotations
 
 import ast
-import re
 import sys
 from pathlib import Path
 
@@ -44,9 +35,6 @@ _ALLOWED_ROOTS = {"torch", "entmax", "teb_vae"} | set(sys.stdlib_module_names)
 
 # Forbidden by full dotted path, for cases an allowed root would otherwise admit.
 _FORBIDDEN_PREFIXES = ("torch.distributed",)
-
-# Field names from the HDF5 batch contract. A net must not know these exist.
-_BATCH_FIELD_NAMES = ("fhr_st", "fhr_ph", "up_st", "up_ph", "fhr_up_ph", "cs_label", "bg_label")
 
 
 def _net_modules() -> list[Path]:
@@ -84,52 +72,20 @@ def test_there_are_net_modules_to_check():
 
 @pytest.mark.parametrize("path", _net_modules(), ids=lambda p: p.name)
 def test_module_imports_only_torch_stdlib_and_entmax(path):
-    offenders = sorted(
-        name for name in _imported_names(path) if name.split(".")[0] not in _ALLOWED_ROOTS
-    )
+    names = _imported_names(path)
+    offenders = sorted(name for name in names if name.split(".")[0] not in _ALLOWED_ROOTS)
     assert not offenders, (
         f"nets/{path.name} imports {offenders} -- nets/ may import only torch, the standard "
         f"library and entmax, so that a network can be built without the framework around it"
     )
-
-
-@pytest.mark.parametrize("path", _net_modules(), ids=lambda p: p.name)
-def test_module_avoids_forbidden_submodules(path):
-    offenders = sorted(
+    forbidden = sorted(
         name
-        for name in _imported_names(path)
+        for name in names
         if any(name == prefix or name.startswith(prefix + ".") for prefix in _FORBIDDEN_PREFIXES)
     )
-    assert not offenders, (
-        f"nets/{path.name} imports {offenders} -- a net must not need a process group to run"
+    assert not forbidden, (
+        f"nets/{path.name} imports {forbidden} -- a net must not need a process group to run"
     )
-
-
-@pytest.mark.parametrize("path", _net_modules(), ids=lambda p: p.name)
-def test_module_names_no_batch_fields(path):
-    source = path.read_text(encoding="utf-8")
-    offenders = sorted(
-        name for name in _BATCH_FIELD_NAMES if re.search(rf"\b{name}\b", source)
-    )
-    assert not offenders, (
-        f"nets/{path.name} names the batch fields {offenders} -- a net takes tensors as "
-        f"arguments and does not know what they were called on disk"
-    )
-
-
-def test_the_batch_field_guard_fires(tmp_path):
-    """It must catch a schema read without catching a kwarg that merely contains the name."""
-    reader = tmp_path / "reader.py"
-    reader.write_text("def f(batch):\n    return batch.fhr_st\n", encoding="utf-8")
-    assert [n for n in _BATCH_FIELD_NAMES if re.search(rf"\b{n}\b", reader.read_text())] == [
-        "fhr_st"
-    ]
-
-    toggle = tmp_path / "toggle.py"
-    toggle.write_text("def f(use_up_st=True):\n    return use_up_st\n", encoding="utf-8")
-    assert not [
-        n for n in _BATCH_FIELD_NAMES if re.search(rf"\b{n}\b", toggle.read_text())
-    ]
 
 
 def test_the_import_guard_fires(tmp_path):

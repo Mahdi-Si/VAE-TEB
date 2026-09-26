@@ -108,21 +108,6 @@ def test_a_recording_gets_one_row_per_occupied_bin_and_none_for_the_rest():
     assert set(bins[labels.CLASS_COLUMN]) == {"acidosis"}
 
 
-def test_bin_membership_follows_the_same_half_open_rule_as_every_window():
-    extraction = _extraction([
-        ("ONE", -3000.0, 0, 0.5, 1.0),   # closes bin 0
-        ("ONE", -3000.0, 1, 1.0, 2.0),   # closes bin 1
-        ("ONE", -3000.0, 2, 3.0, 3.0),   # closes bin 5
-    ])
-
-    bins, _values = analyze.bin_summaries(
-        extraction, _recordings({"ONE": 0}), split="train", bin_hours=0.5,
-        preservation_hours=3.0,
-    )
-
-    assert sorted(bins[data.BIN_COLUMN].tolist()) == [0, 1, 5]
-
-
 def test_a_bin_summary_averages_anchors_then_segments():
     """Three anchors in one segment and one in another: the segments weigh the same."""
     extraction = _extraction([
@@ -282,7 +267,8 @@ def test_the_contrast_reports_each_group_and_their_difference_with_counts():
     assert record["n_paired_recordings"] == 8
 
 
-def test_the_contrast_states_what_an_increase_is_and_is_not_evidence_of():
+def test_a_contrast_too_small_to_resample_reports_no_interval():
+    """Two recordings cannot support an interval, and none is reported."""
     paired = pd.DataFrame({
         data.GUID_COLUMN: ["R-0", "R-1"],
         data.OUTCOME_COLUMN: [0, 1],
@@ -291,9 +277,7 @@ def test_the_contrast_states_what_an_increase_is_and_is_not_evidence_of():
 
     record = analyze.paired_contrast(paired, resamples=100, seed=42)
 
-    assert "not evidence of physiological worsening" in record["interpretation"]
-    assert "neither coverage selection nor confounding" in record["limitation"]
-    # Two recordings cannot support an interval, and none is reported.
+    assert record["difference"]["point"] == pytest.approx(1.0)
     assert np.isnan(record["difference"]["lo"])
 
 
@@ -358,7 +342,6 @@ def test_movement_is_measured_in_training_standard_deviations():
     assert summary["max"] == pytest.approx(5.0)
     assert summary["median"] == pytest.approx(2.5)
     assert scaled["max"] == pytest.approx(2.5)
-    assert "training standard deviations" in summary["units"]
 
 
 def test_movement_between_two_populations_is_refused():

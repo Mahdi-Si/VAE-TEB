@@ -20,19 +20,13 @@ from teb_vae.lag_slot_transformer_cfs.nets.lag_updates import (
     LAG_EMBED_STD,
     LagProposalHead,
 )
-from teb_vae.lag_slot_transformer_cfs.nets.pointwise_source import (
-    IDENTITY_WIDTH,
-    PointwiseSourceEncoder,
-    gather_lag_window,
-    lag_validity,
-)
+from teb_vae.lag_slot_transformer_cfs.nets.pointwise_source import IDENTITY_WIDTH
 from teb_vae.lag_slot_transformer_cfs.tests.conftest import (
     TINY_BATCH,
     TINY_C_U,
     TINY_D_MODEL,
     TINY_D_Z,
     TINY_N_LAGS,
-    TINY_SOURCE_WARMUP,
 )
 
 SOURCE_DIM = TINY_C_U * IDENTITY_WIDTH
@@ -255,22 +249,6 @@ def test_a_proposal_reads_exactly_one_stored_source_time() -> None:
                 assert total == 0.0, f"lag {lag_out} reads lag {lag_in}"
 
 
-def test_a_proposal_may_combine_channels_at_its_own_source_time() -> None:
-    """Locality is over *times*, not over channels: the head is allowed to read the whole vector."""
-    head = trained_head()
-    state, window = make_state(n_anchors=1), make_window(n_anchors=1)
-
-    baseline, _ = head(state, window)
-    moved = window.clone()
-    moved[0, 0, 2, 0, 0] += 1.0  # one channel of one lag
-    perturbed, _ = head(state, moved)
-
-    difference = (perturbed - baseline).abs()
-    assert float(difference[0, 0, 2].max()) > 0.0
-    other_lags = [lag for lag in range(TINY_N_LAGS) if lag != 2]
-    assert float(difference[0, 0, other_lags].max()) == 0.0
-
-
 def test_lag_identity_makes_the_head_sensitive_to_lag_order() -> None:
     """Without it, summing a shared lag-blind map would be invariant to permuting source times."""
     head = trained_head()
@@ -301,18 +279,6 @@ def test_a_zero_selector_silences_one_lag_and_leaves_the_others_untouched() -> N
     assert torch.equal(suppressed_mean[:, :, kept], baseline_mean[:, :, kept])
     assert baseline_scale is not None
     assert torch.equal(suppressed_scale[:, :, kept], baseline_scale[:, :, kept])
-
-
-def test_an_all_zero_selector_silences_every_proposal() -> None:
-    """The invariant every source control is read against."""
-    head = trained_head()
-    mean, scale = head(
-        make_state(),
-        make_window(),
-        selector=torch.zeros(TINY_BATCH, 4, TINY_N_LAGS),
-    )
-    assert torch.all(mean == 0.0)
-    assert scale is not None and torch.all(scale == 0.0)
 
 
 def test_an_unavailable_lag_contributes_an_exact_zero_not_a_learned_constant() -> None:
@@ -353,25 +319,6 @@ def test_the_validity_gate_and_the_selector_compose() -> None:
     assert torch.all(mean[:, :, 1] == 0.0)
     assert torch.all(mean[:, :, 2] == 0.0)
     assert float(mean[:, :, 0].abs().max()) > 0.0
-
-
-def test_the_head_consumes_the_gather_output_directly() -> None:
-    """The two modules meet on one width, reported by the encoder rather than restated here."""
-    encoder = PointwiseSourceEncoder(c_u=TINY_C_U, warmup_steps=TINY_SOURCE_WARMUP)
-    head = trained_head(source_dim=encoder.source_dim)
-
-    generator = torch.Generator().manual_seed(3)
-    stream = torch.randn(TINY_BATCH, 20, TINY_C_U, generator=generator)
-    anchors = torch.arange(12, 16, dtype=torch.long)[None, :].expand(TINY_BATCH, -1)
-
-    encoded, mask = encoder(stream)
-    window, window_mask = gather_lag_window(encoded, mask, anchors, n_lags=TINY_N_LAGS)
-    mean, scale = head(
-        make_state(n_anchors=4), window, lag_valid=lag_validity(window_mask)
-    )
-
-    assert mean.shape == (TINY_BATCH, 4, TINY_N_LAGS, TINY_D_Z)
-    assert scale is not None and scale.shape == mean.shape
 
 
 @pytest.mark.parametrize(

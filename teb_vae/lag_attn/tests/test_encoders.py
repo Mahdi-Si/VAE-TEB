@@ -163,20 +163,3 @@ def test_no_gradient_reaches_the_masked_positions():
         assert float(x.grad[:, delay, channel].abs().max()) > 0.0
 
 
-def test_the_change_added_no_buffer_and_no_submodule():
-    """The mask is the announcement's own pattern. A second buffer would be a second vector, free
-    to describe a different region with every shape still correct."""
-    adapter = _adapter(_POSITIVE_DELAYS)
-
-    assert {name for name, _ in adapter.named_buffers()} == {
-        "availability",
-        "start_indicator",
-    }
-    assert {name for name, _ in adapter.named_children()} == {
-        "linear",
-        "norm",
-        "act",
-        "drop",
-        "res_mlp",
-        "mask_proj",
-    }

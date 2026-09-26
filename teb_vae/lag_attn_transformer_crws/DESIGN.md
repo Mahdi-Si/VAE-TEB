@@ -160,7 +160,7 @@ Two facts about *this* architecture are worth stating where a reader will look f
 delivers `fhr` at $4800$ and `weight` at $300$, `raw_masks._validate_weight` checks
 `weight.size(1) == geometry.t`, and the decoder emits $R = 16$ raw samples per horizon token — so
 unlike the causal-feature cell of this encoder family, `future_index` is inherited **and read**: the
-anchored gather indexes into it, asserted by `data_ptr` identity.
+anchored gather indexes into it.
 
 **The lag validity floor is the causal-input cell's too.** `lag_floor` ships at $0$, where the mask
 is bitwise the architecture parent's, and exists so the source compromise of
@@ -253,9 +253,8 @@ does. Compose the causal-feature cell's `CausalFeatureForecastTarget` in by mist
 is built at $C_{\mathrm{keep}}$ — the *surviving target-input* width, $38$ under the shipped
 reference (§3) — against a $(B, A, H, 16)$ target, and `raw_sample_score` computes
 $(\text{target} - \mu)^2$ on shapes that do not broadcast, three frames below the decision that
-caused it. `tests/test_construct.py` builds that wrong composition and reads `mean_head.out_features`
-back as whatever target keep width its own fixture resolved, so the trap is pinned rather than the
-number.
+caused it. `tests/test_construct.py` asserts the shipped decoder is `raw_per_step` wide and not the
+target gate's surviving width, so the trap is pinned rather than the number.
 
 **The order of the bases is load-bearing.** The mixin comes first, which is what makes the tiled
 forward win method resolution over the architecture parent's dense one, the warm-up adapter win over
@@ -263,7 +262,9 @@ the gate's shift vector alone -- all zeros only on an unaligned arm -- and the a
 `compute_loss` win over the dense raw one.
 Reversed, the model would decode the dense anchor range, return no anchor set at all, and score a
 $(B, T_{\mathrm{valid}}, H, R)$ target against a $(B, A_{\max}, H, R)$ forecast.
-`tests/test_construct.py` pins the `__mro__` as a list.
+The tests read the order through what it decides — the adapter built at the warm-up
+(`tests/test_construct.py`), the anchor set in the forward (`tests/test_forward_contract.py`) and the
+anchored objective's metric set (`tests/test_objective.py`) — rather than pinning the `__mro__`.
 
 **There is no `decoder_out_channels` keyword, and that is the one property this cell has that its
 conv-LSTM twin does not.** The architecture parent declares none — the decoder emits $R$ raw samples
@@ -285,7 +286,7 @@ class LagAttnTrfCrwsTrainer(LagAttnCrwsTrainer, LagAttnTrfRwsTrainer):
 ```
 
 The task defines **zero** callables. The driver re-points three class attributes and defines no
-method. All three linearisations are asserted as lists of class names against the real `__mro__`:
+method. The three linearisations are:
 
 `SeqVaeLagAttnTrfCrws -> CausalRawInputs -> CausalWarmupInputs -> SeqVaeLagAttnTrfRws -> Module`,
 
@@ -327,13 +328,13 @@ halves fire rather than only the outermost.
 causal parent does not define it, so lookup passes through and `torch.compile` becomes permitted on a
 model whose causal ancestor never exercised it. That is the right outcome — it is the transformer
 encoder that makes compilation worth having, and the LSTM that defeated inductor is gone — but it
-arrives by resolution order rather than by anything written down, so `tests/test_trainer.py` asserts
-it explicitly. Shipped configs keep `compile: false` regardless.
+arrives by resolution order rather than by anything written down. Shipped configs keep
+`compile: false` regardless.
 
 **`TARGET_FIELDS` is the shared ancestor's object and neither parent re-points it.** `("fhr",)` on
 every driver of the raw-target row; the causal-feature drivers re-point it to the two feature blocks,
-and that is exactly the edit this row must not make. Asserted as the ancestor's object rather than as
-"comes from the causal parent", which would have been true and unfalsifiable.
+and that is exactly the edit this row must not make. `tests/test_config_load.py` asserts the shipped
+config loads and normalizes every field the tuple names.
 
 **`PLOT_CONFIG_KEY` stays `"lag_attn_rws_plotting"`**, and the config block keeps that name. The
 shared callback assembly reads the literal, so a sibling that renames it to match its own package
@@ -342,9 +343,8 @@ gets no figure, no error and nothing in the log saying why.
 **The task's diamond is well-formed today because its two branches are disjoint** — everything the
 causal-input cell adds against `{build_lr_scheduler}` — and that is a fact about today's code rather
 than a property of the construction. A future member defined on both sides would resolve to the
-causal side by order alone, silently; `tests/test_task.py` asserts the linearisation as a list and
-each behaviour against the class the design names, so a reorder fails rather than trains something
-else.
+causal side by order alone, silently; `tests/test_task.py` reads one behaviour from each side through
+the diamond, so a reorder fails rather than trains something else.
 
 ## 8. Step-wise causality, unconditionally
 
@@ -385,8 +385,8 @@ owns it rather than restating the assertions.
 | **Exact zero KL at initialisation** | posterior deltas zeroed **after** the generic init; one shared $\epsilon$ | `tests/test_invariants.py` |
 | **One decoder, invoked twice** | the same module object on $z^p$ and $z^q$ | `tests/test_invariants.py` |
 | **Token causality**, unconditionally | §8 | `tests/test_causality.py` |
-| **No raw sample scored twice in a step** | the tiled anchor set partitions the timeline; padded slots repeat and are marked invalid, and the anchored gather honours the repeat so the mask can remove it | `tests/test_forward_contract.py`, `tests/test_objective.py` |
-| **The anchored target equals the dense builder at the dense set** | `gather_anchored_future_target` against `build_future_target` under `torch.equal` | `tests/test_objective.py` |
+| **No raw sample scored twice in a step** | the tiled anchor set partitions the timeline; padded slots repeat and are marked invalid, and the anchored gather honours the repeat so the mask can remove it | `tests/test_forward_contract.py`; the objective's own suite, `lag_attn_crws/tests/test_objective.py` |
+| **The anchored target equals the dense builder at the dense set** | `gather_anchored_future_target` against `build_future_target` under `torch.equal` | `lag_attn_crws/tests/test_raw_target.py`, where the gather is written |
 | **The lag attribution identity**, $\sum_\ell \widetilde K_{t,\ell} = K_t$ | the lag attention is built at `dropout=0.0` | `tests/test_invariants.py`, after `perturb_posterior` |
 
 **Because the delta heads are zero-initialised, any KL assertion on a freshly constructed model
@@ -426,27 +426,17 @@ parameter reached only by the leading steps of a segment.
 
 This package writes no `forward`: the encoders and blocks come from the architecture parent, the
 adapters from the shared net layer and the tiled forward from the causal-input parent.
-`tests/test_ddp_reachability.py` therefore asserts the rule where it is *reachable* — it walks
-`AvailabilityInputAdapter.forward` and requires every conditional in it to test whether a module was
-built (`is None` / `is not None`) rather than to read a tensor value. Two of its cases carried a
-**pre-alignment premise** and were corrected alongside the reference change. One asserted the
-*absence* of a start embedding on both streams at the shipped budget; the shift had made that false
-as soon as the adapter began reading $W'_c + d_c$, which was before this row moved to $42.21$ s, so
-the case had been failing against the feature cells' geometry too. The other narrowed the source
-stream to build the negative control without narrowing its shift vector alongside, so `ChannelDelay`
-refused the length mismatch by name and the control measured nothing at all. Both now state what the
-model does.
+`tests/test_ddp_reachability.py` therefore measures the rule's consequence on this composition: no
+parameter is left without a gradient under `gaussian_nll`, on both guard states and at the shipped
+switches, and under `mse` the starved set is exactly the decoder's log-variance head.
 
-This row's shipped minimum of $1$ is pinned rather than assumed: `tests/conftest.py` reaches the
-causal-feature package's `causal_config` through the conv-LSTM sibling's wrapper, which applies
-**this row's** `SHIPPED_ALIGN_REFERENCE` of $42.21$ s rather than the feature cells' `target_max`.
-The sibling's
-`tests/test_ddp_strategy.py::test_the_shipped_aligned_budget_builds_a_start_embedding_on_both_streams`
-pins the same property at the same reference, so the two rows cannot drift on it.
+This row's two start embeddings are pinned rather than assumed: `tests/test_construct.py` measures
+the aligned-minus-unaligned parameter difference, which carries both, at the budget
+`tests/conftest.py` resolves through the conv-LSTM sibling's wrapper — **this row's**
+`SHIPPED_ALIGN_REFERENCE` of $42.21$ s rather than the feature cells' `target_max`.
 
-The per-segment phase is derived per rank from that rank's own samples and introduces no collective —
-asserted by searching the phase derivation for `all_reduce`, `all_gather`, `broadcast`, `barrier` and
-`dist.` rather than by describing it — and $A_{\max}$ is a geometry constant at every phase, so no
+The per-segment phase is derived per rank from that rank's own samples and introduces no collective,
+and $A_{\max}$ is a geometry constant at every phase, so no
 rank can disagree on shape and no shape is a function of the data. **`broadcast_buffers=False`** is
 justified as it always was: every buffer — rotary tables, causal masks, the gates' keep-indices, the
 adapters' availability patterns, the two source-warmth patterns, the raw-target index grid — is a
@@ -460,16 +450,14 @@ The nine-row page and the run-level warm-up figure are the conv-LSTM cell of thi
 through the task's page seams — `forecast_rows`, `input_stream_panels` and the
 `input_budget_figure` method, the last two of which are themselves the causal-feature cell's, bound;
 `lag_attn_crws/DESIGN.md` §11 is the record. This package ships no `plotting.py` and no
-`sample_page.py`, which `tests/test_sample_page.py` asserts as a directory check and by
-`ModuleNotFoundError` — near-vacuous the day it was written, and the thing that fails when someone
-later reaches for a local copy. The forecast rows and the input panel builder resolve, by object
-identity, to the conv-LSTM cell's.
+`sample_page.py`; the forecast rows and the input panel builder resolve to the conv-LSTM cell's.
 
-What the test does exercise is that the page is reached **through two levels of inheritance**: the
-seams resolve off the task, the task resolves them off the causal-input parent, and the shipped raw
-forecast rows — which walk a dense block at an anchor index this model's forecast does not have —
-must not be the one that runs. Their failure is inside a handler that warns and continues, so the
-assertion is on the *absence of the warning* rather than on the presence of the rows. The lag caveat
+The page is reached **through two levels of inheritance**: the seams resolve off the task, the task
+resolves them off the causal-input parent, and the shipped raw forecast rows — which walk a dense
+block at an anchor index this model's forecast does not have — must not be the one that runs. Their
+failure is inside a handler that warns and continues, so the fixture fit in
+`tests/test_train_smoke.py` asserts only that the callback is attached and the fit survives whatever
+it drew; the rows themselves are asserted where they are written. The lag caveat
 the page carries is the one-sided one, and it is the conv-LSTM cell's own string — one string, not
 two: this cell differs from that one in the encoder, and what a lag *means* is a property of the
 target domain and the transform rather than of the architecture. Under the channel alignment that
@@ -490,7 +478,8 @@ $[20.9,\ 496.9]$ s.
 ## 12. Configuration
 
 `configs/` ships exactly `default.yaml`, `tiny.yaml`, `smoke_causal.yaml` and
-`sweep_anchor_stride_1.yaml`, and the directory listing itself is asserted. Each is written out in
+`sweep_anchor_stride_1.yaml`, and every file in the directory is run through the framework's
+validator. Each is written out in
 full rather than inheriting: a `base:` chain would be the smaller file and the worse record, because
 it hides which settings this run shares with the models it is compared against, and that sharing is
 the whole value of the row.
@@ -501,10 +490,9 @@ longer a divergence fails as loudly as a divergence that is not exempt. Five are
 the encoder — the five conv-LSTM keys this architecture does not have and the seven it adds, which is
 the whole declared content of the edge; one is the encoder's optimisation, `lr_warmup_steps`, which
 exists in every conv-Transformer sibling and in no conv-LSTM one; and **one is a measurement**,
-`gradient_clip_val`, declared `RETUNED`. `additive_margin` is in `MEASURED_TO_MATCH_PATHS`
-instead, beside `ema_floor` and `horizon_embed_std`: it was re-measured on this encoder and came back
-to the conv-LSTM cell's value, and the list makes that equality read as a measurement rather than as
-an oversight.
+`gradient_clip_val`, declared `RETUNED`. `additive_margin` was re-measured on this encoder and came
+back to the conv-LSTM cell's value, so it stays under the parity check; `tests/test_spike_breaker.py`
+brackets it, and the clip, against the distribution the instrumented run recorded.
 
 The five conv-LSTM-only keys — `lstm_layers`, `encoder_extra_dilations`, `encoder_extra_kernel`,
 `conv_norm_groups`, `causal_norm` — are absent from every config here and name no argument of this
@@ -550,9 +538,10 @@ unaligned arm and is bitwise the model that shipped before the key existed.
 
 Measured on constructed models in one process, not predicted: both cells of this row at the shipped
 warm-up budget and ungated, and the two raw-signal cells they are compared against at the shipped
-reach budget and ungated. `tests/test_docs.py` re-measures every total below by constructing the
-models rather than comparing against literals, and attributes the stated decomposition parameter name
-by parameter name.
+reach budget and ungated. The totals are a record rather than a test; `tests/test_construct.py`
+asserts the structural claims they rest on — the guard and the alignment move only input-adapter
+parameters, and outside the two history encoders this model is parameter-for-parameter the conv-LSTM
+twin.
 
 **Two rows per configuration, and both are the record.** The **shipped** rows carry the four
 architecture switches of `lag_attn_crws/DESIGN.md` §17 at their revised defaults; the **off-state**
@@ -784,22 +773,18 @@ Where the built package differs from the design it was built from, and why.
 - **This package writes no network code and copies none.** The model is a constructor, the task is
   empty, and the driver is three class attributes. That is what makes a difference against
   `lag_attn_crws` attributable to the encoder alone and a difference against
-  `lag_attn_transformer_rws` to the input representation alone — and it is the reason the empty
-  bodies are asserted as facts about the classes rather than described in prose.
+  `lag_attn_transformer_rws` to the input representation alone.
 - **The conftest is spliced from two siblings, and which half comes from which is not
   interchangeable.** The constructor keyword sets are written here at the conv-Transformer schema;
   the data half — the committed causal shard, the config builder, the tiny warm-up staircase, the
   budget resolver, the stub batch, the seeded streams and the raw signal at the one-sided widths — is
   imported from the conv-LSTM cell of this row, whose own imports are the causal-feature cell's, so
   the objects here are the family's single copies rather than a second hop's worth of copies. The two
-  imported-name lists are literal tuples asserted disjoint, because a name reachable from both would
-  resolve by import order rather than by intention. The two halves meet at a named tuple of nine
-  geometry keys that `tests/test_fixtures.py` asserts agree, **and** whose completeness has its own
-  test with a named allow-list of the shared-but-not-geometry keys — without it the list would pass
-  on whatever the two sets happen to hold today, which is exactly the drift it exists to catch.
-- **The five conv-LSTM keywords are asserted refused *and* asserted to be keywords of
-  `SeqVaeLagAttnCrws`.** `conv_norm_groups` is the fifth, which that cell declares but its shipped
-  config leaves unset; without the second half the refusal test would pass on any misspelling.
+  halves meet at a named tuple of geometry keys, and `tests/test_fixtures.py` asserts that every key
+  both production sets declare agrees, so the tuple cannot pass on whatever the two sets happen to
+  hold today.
+- **The five conv-LSTM keywords are asserted refused by name.** `conv_norm_groups` is the fifth,
+  which that cell declares but its shipped config leaves unset.
 - **The distinct-stem check walks nine drivers rather than six.** The stem is a filename, and a
   filename collides with whatever else is written beside it, so every driver of the grid is in the
   set.
@@ -814,7 +799,7 @@ Where the built package differs from the design it was built from, and why.
   `additive_margin` stays at $5.0\mathrm{e}{+2}$: the worst excursion above the breaker's own EMA
   in the noisiest regime was $283$ against the conv-LSTM cell's $248$, so the value sits at
   $1.8\times$ the worst excursion against $2.0\times$ there, inside the same $(283, 759)$ bracket —
-  a measurement with a stated distance from its floor rather than an inheritance. The `RETUNED` test
+  a measurement with a stated distance from its floor rather than an inheritance. The parity check
   asserts divergence but **not** direction, deliberately: across the input-representation axis the
   block halves and a larger threshold would describe a model with more to clip, but across the
   encoder edge nothing predicts a direction at all. `RESULTS.md` carries the percentiles.
@@ -823,7 +808,7 @@ Where the built package differs from the design it was built from, and why.
   be the thing that refuses.
 - **The permutation control's vacuity at initialisation is about `mu_post` / `logvar_post`, not
   `mu_full`.** The control decodes a fresh $\epsilon$, so the shuffled forecast moves at
-  initialisation for a reason unrelated to the source; the test names the tensors the claim is about.
+  initialisation for a reason unrelated to the source.
 - **`raw_per_step` stays**, for the geometry reason in §3, and `decoder_out_channels` is not a keyword
   of this constructor at all (§6).
 - **`tiny.yaml` shrinks the widths under two independent constraints.** The constructor validates

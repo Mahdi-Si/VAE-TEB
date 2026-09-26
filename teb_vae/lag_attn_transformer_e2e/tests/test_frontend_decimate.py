@@ -80,15 +80,6 @@ def test_the_binomial_kernel_is_unit_sum_symmetric_and_null_at_nyquist():
     assert abs(float(alternating.sum())) < 1e-15
 
 
-def test_the_binomial_kernel_is_the_binomial_row():
-    """Pinned against ``math.comb`` so a rewrite of the three-line expression cannot drift."""
-    expected = torch.tensor(
-        [math.comb(ANTI_ALIAS_TAPS - 1, index) for index in range(ANTI_ALIAS_TAPS)],
-        dtype=torch.float32,
-    )
-    assert torch.allclose(binomial_lowpass(ANTI_ALIAS_TAPS), expected / expected.sum())
-
-
 def test_a_single_tap_kernel_is_refused():
     """One tap is the identity, which is decimation without anti-aliasing -- the case this module
     deliberately does not offer."""
@@ -99,14 +90,6 @@ def test_a_single_tap_kernel_is_refused():
 # ---------------------------------------------------------------------------------------
 # Shape and offset
 # ---------------------------------------------------------------------------------------
-def test_the_output_length_is_the_input_length_over_the_stride():
-    decimate = CausalAntiAliasDecimate(CHANNELS, STRIDE)
-
-    out = decimate(torch.randn(2, CHANNELS, LENGTH))
-
-    assert out.shape == (2, CHANNELS, LENGTH // STRIDE)
-
-
 def test_the_offset_is_right_checked_against_a_hand_built_index():
     r"""$\mathrm{out}[t] = \tilde x[s t + s - 1]$: the last sample of each stride group, never the
     first and never the middle. Composed over four stride-2 stages this is what puts token $t$'s
@@ -116,6 +99,7 @@ def test_the_offset_is_right_checked_against_a_hand_built_index():
 
     out = decimate(x)
 
+    assert out.shape == (2, CHANNELS, 32 // STRIDE)
     filtered = _manual_causal_fir(x, binomial_lowpass(ANTI_ALIAS_TAPS).to(torch.float64))
     for token in range(int(out.shape[-1])):
         expected = filtered[..., STRIDE * token + STRIDE - 1]

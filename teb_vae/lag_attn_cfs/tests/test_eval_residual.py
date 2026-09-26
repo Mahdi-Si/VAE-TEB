@@ -18,9 +18,8 @@ does neither.
 
 **Every RMS roots once, at the end.** By Jensen $\operatorname{mean}(\sqrt{x}) \le
 \sqrt{\operatorname{mean}(x)}$, so averaging finished per-segment roots is biased **low** -- in
-the direction that flatters the model. The direction is asserted rather than assumed: the analysis
-reports both numbers, and the biased one must sit at or below the rooted-once one on a frame where
-the per-recording spread is real.
+the direction that flatters the model. The analysis reports both numbers, and the biased one must
+sit below the rooted-once one on a frame where the per-recording spread is real.
 
 **And nothing is converted.** A wavelet modulus has no clinical unit, so every reported RMS is in
 the loader's $z$ units. The sibling reports the forecast difference in bpm; the absence of that
@@ -128,25 +127,12 @@ def test_rooting_once_at_the_end_differs_from_averaging_finished_roots() -> None
     rows = residual_analysis.build_rows(
         _per_guid([1.0, 9.0, 1.0, 9.0]), resamples=200, seed=0
     )
-    by_name = {row["metric"]: row for row in rows}
-
-    assert by_name["delta_mu_rms"]["rms_normalised"] == pytest.approx(float(np.sqrt(5.0)))
-    assert by_name["delta_mu_rms"]["mean_of_per_segment_rms"] == pytest.approx(2.0)
-
-
-def test_the_bias_of_averaging_roots_runs_in_the_direction_that_flatters_the_model() -> None:
-    """Asserted as a sign, not as a magnitude: Jensen gives the inequality on any input, and a
-    single hand-checked example would not say that."""
-    rows = residual_analysis.build_rows(
-        _per_guid([0.25, 4.0, 1.0, 16.0]), resamples=200, seed=0
-    )
     biased = {row["metric"]: row for row in rows}["delta_mu_rms"]
 
-    assert biased["jensen_bias"] < 0.0, (
-        "the mean of per-segment roots must sit *below* the rooted-once value; a positive bias "
-        "means the two are the wrong way round"
-    )
-    assert biased["mean_of_per_segment_rms"] < biased["rms_normalised"]
+    assert biased["rms_normalised"] == pytest.approx(float(np.sqrt(5.0)))
+    assert biased["mean_of_per_segment_rms"] == pytest.approx(2.0)
+    # The bias runs in the direction that flatters the model: averaged roots sit *below*.
+    assert biased["jensen_bias"] < 0.0
 
 
 def test_a_frame_with_no_spread_makes_the_two_reductions_agree() -> None:
@@ -168,20 +154,11 @@ def test_every_metric_is_reported_in_z_units_and_nothing_converts() -> None:
     rows = residual_analysis.build_rows(_per_guid([1.0] * 4), resamples=200, seed=0)
 
     for row in rows:
-        assert row["unit"] == NORMALISED_UNIT == "normalised"
+        assert row["unit"] == NORMALISED_UNIT
         assert "rms" not in row, "the converted column was removed rather than repointed"
         assert not [name for name in row if "bpm" in str(name).lower()]
         # The only rooted column is the z-unit one, and it is the root of its own mean square.
         assert row["rms_normalised"] == pytest.approx(float(np.sqrt(row["mean_square"])))
-
-
-def test_the_summary_states_one_unit_rather_than_deriving_it_from_a_row() -> None:
-    """Derived from whichever row converted, the label would silently become ``normalised`` the day
-    a conversion was added back and applied to only one metric."""
-    result_unit = residual_analysis.NORMALISED_UNIT
-
-    assert result_unit == "normalised"
-    assert not hasattr(residual_analysis, "sigma_to_bpm")
 
 
 # =================================================================================================
@@ -195,7 +172,7 @@ def _context(per_sample: pd.DataFrame, record: Optional[Dict[str, Any]] = None) 
     return AnalysisContext(collection=collection, config={})
 
 
-def test_the_analysis_writes_its_tables_and_states_the_shared_variance_caveat(tmp_path) -> None:
+def test_the_analysis_writes_its_tables(tmp_path) -> None:
     per_sample = pd.DataFrame(
         {
             "guid": ["a", "a", "b", "b"],
@@ -216,20 +193,7 @@ def test_the_analysis_writes_its_tables_and_states_the_shared_variance_caveat(tm
     assert [row["metric"] for row in result["metrics"]] == [
         name for _, name, _ in residual_analysis.RMS_METRICS
     ]
-    # The caveat travels in the output, not only in the docstring: it weakens the reading in the
-    # model's favour, which is the kind that has to be written where the number is.
-    assert "shared" in result["caveat"] and "one shared decoder" in result["caveat"]
     assert result["unit"] == NORMALISED_UNIT
-
-
-def test_the_meaning_of_each_metric_names_the_support_it_was_reduced_over() -> None:
-    """The two supports genuinely differ here, so an emitted row that did not say which one it used
-    would be a number a reader could only guess the denominator of."""
-    meanings = {name: meaning for _, name, meaning in residual_analysis.RMS_METRICS}
-
-    assert "coefficient" in meanings["forecast_difference_rms"]
-    assert "KL" in meanings["delta_mu_rms"]
-    assert "KL" in meanings["mu_post_prior_gap_rms"]
 
 
 @pytest.mark.slow

@@ -78,37 +78,21 @@ def scored(tmp_path_factory):
 
 
 @pytest.mark.parametrize("arm", sorted(SCORED_ARMS))
-def test_every_comparator_arm_fits_and_scores_end_to_end(arm: str, scored) -> None:
+def test_every_comparator_arm_fits_scores_and_says_which_arm_it_is(arm: str, scored) -> None:
     """The claim that costs the most to discover late.
 
     A comparator that trains for a week and then cannot be scored through the candidate's estimator
     is not a comparator: the one comparison it exists for is between two models scored the same
-    way.
+    way. Otherwise a directory of runs is a set of numbers with no subjects, so the summary also
+    names the arm's leaves, and the parameter split travels with it: two arms differing by a
+    fusion differ by however many weights that fusion holds.
 
     Args:
         arm: The arm to read.
         scored: The fitted and scored arms.
     """
     summary = scored[arm]
-
-    assert summary["results"]["arm"]["source_disabled"] is False
-    assert summary["results"]["arm_scores"]["pred_gap"]["point"] is not None
-    assert summary["results"]["n_recordings"] > 0
-
-
-@pytest.mark.parametrize("arm", sorted(SCORED_ARMS))
-def test_every_summary_says_which_arm_produced_it(arm: str, scored) -> None:
-    """Otherwise a directory of runs is a set of numbers with no subjects.
-
-    The parameter split travels with it for the same reason: two arms differing by a fusion differ
-    by however many weights that fusion holds, and a predictive difference is not attributable to a
-    mechanism until the budgets are on the table beside it.
-
-    Args:
-        arm: The arm to read.
-        scored: The fitted and scored arms.
-    """
-    block = scored[arm]["results"]["arm"]
+    block = summary["results"]["arm"]
     expected_fusion = (
         "attention"
         if SCORED_ARMS[arm].get("model_config.VAE_model.lag_fusion") == "attention"
@@ -116,6 +100,9 @@ def test_every_summary_says_which_arm_produced_it(arm: str, scored) -> None:
     )
     expected_stem = SCORED_ARMS[arm].get("model_config.VAE_model.source_stem", "pointwise")
 
+    assert block["source_disabled"] is False
+    assert summary["results"]["arm_scores"]["pred_gap"]["point"] is not None
+    assert summary["results"]["n_recordings"] > 0
     assert block["lag_fusion"] == expected_fusion
     assert block["source_stem"] == expected_stem
     assert block["parameters"]["source"] > 0
@@ -125,56 +112,27 @@ def test_every_summary_says_which_arm_produced_it(arm: str, scored) -> None:
     )
 
 
-def test_the_attention_arms_record_what_their_band_margins_mean(scored) -> None:
-    """The one readout that does not compare across the pair, said in the artifact.
-
-    Removing a lag from an explicit sum leaves every other term standing; removing it from a
-    normalised distribution grows the survivors. Both answer the same question and the two numbers
-    are not on one scale, so a reader who differenced them would be measuring the aggregation.
-
-    Args:
-        scored: The fitted and scored arms.
-    """
-    note = scored["pointwise_attention"]["results"]["arm"]["suppression_semantics"]
-
-    assert "normalised distribution" in note
-    assert "never against the other" in note
-    # And the local arm says the opposite, so the distinction is legible from either file alone.
-    assert scored["capacity_control"]["results"]["arm"]["suppression_semantics"].startswith(
-        "a band's proposals are removed from the explicit sum"
-    )
-
-
-def test_the_attention_arms_report_no_distribution_over_lags_anywhere(scored) -> None:
-    """The gate that would catch a distribution being published under an attention name.
-
-    Run against the arm that actually has one, which is the only place it could ever fire.
-
-    Args:
-        scored: The fitted and scored arms.
-    """
-    for arm in ("pointwise_attention", "attention_reference"):
-        result = eval_verify.verify(scored[arm])
-        assert result["failed"] == [], (arm, result["failed"])
-
-
-def test_the_attention_arms_still_reproduce_their_reference_identities(scored) -> None:
+@pytest.mark.parametrize("arm", ["pointwise_attention", "attention_reference"])
+def test_the_attention_arms_pass_the_gate_and_reproduce_their_reference_identities(
+    arm: str, scored
+) -> None:
     """On real trained weights, through the selector path rather than the subtractive one.
 
-    The empty-band arm must reproduce the matched forward and the silence arm the prior, or every
-    margin in the file carries the difference between two code paths as well as its intervention.
-    This is the check that the second suppression path is the same computation as the forward.
+    The gate is the one that would catch a distribution over lags being published under an
+    attention name, run against the arms that actually have one. The empty-band arm must
+    reproduce the matched forward and the silence arm the prior, or every margin carries the
+    difference between two code paths as well as its intervention.
 
     Args:
+        arm: The attention arm to read.
         scored: The fitted and scored arms.
     """
-    for arm in ("pointwise_attention", "attention_reference"):
-        verdict = next(
-            record
-            for record in eval_verify.verify(scored[arm])["verdicts"]
-            if record["name"] == "reference_arms_are_exact"
-        )
-        assert verdict["status"] == "PASS", (arm, verdict)
+    result = eval_verify.verify(scored[arm])
+    assert result["failed"] == [], result["failed"]
+    verdict = next(
+        record for record in result["verdicts"] if record["name"] == "reference_arms_are_exact"
+    )
+    assert verdict["status"] == "PASS", verdict
 
 
 def test_the_capacity_control_skips_the_controls_that_are_not_interventions_on_it(

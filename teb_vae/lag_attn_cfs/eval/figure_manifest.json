@@ -1,5 +1,5 @@
 {
-  "_comment": "Every figure a full evaluation run of this cell emits, by analysis directory, with dynamically-named figure families recorded as families. Kept equal to a real run by tests/test_eval_smoke.py; read by the fast documentation tests in tests/test_eval_docs.py. Regenerate by deleting this file and running the smoke suite once.",
+  "_comment": "Every figure a full evaluation run of this cell emits, by analysis directory, with dynamically-named figure families recorded as families. No test or code reads, checks or regenerates this file.",
   "figures": {
     "attention": [
       "attention_profile.pdf",

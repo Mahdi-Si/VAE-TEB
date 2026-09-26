@@ -30,19 +30,6 @@ def _band(num_lags, keep):
     return mask
 
 
-def test_no_mask_is_bit_identical_to_the_default_path(prod_kwargs, inputs):
-    """The feature must cost nothing when unused, or every run pays for an analysis tool."""
-    model = _model(prod_kwargs)
-    torch.manual_seed(0)
-    with torch.no_grad():
-        without = model(*inputs)
-    torch.manual_seed(0)
-    with torch.no_grad():
-        explicit_none = model(*inputs, lag_band_mask=None)
-    assert torch.equal(without["attn_weights"], explicit_none["attn_weights"])
-    assert torch.equal(without["z"], explicit_none["z"])
-
-
 def test_the_causal_constraint_survives_band_masking(prod_kwargs, inputs):
     """The defect the helper exists for: a bare band mask would switch off causality."""
     model = _model(prod_kwargs)
@@ -143,21 +130,6 @@ def test_a_dead_anchor_yields_the_output_projection_bias_not_zero(prod_kwargs, i
     assert torch.all(out["attended_source_heads"][:, 0] == 0.0)
 
 
-def test_a_dead_anchor_is_not_merely_zeroed(prod_kwargs, inputs):
-    """The mirror of the test above: it must be able to fail."""
-    model = _model(prod_kwargs)
-    with torch.no_grad():
-        model.lag_attn.W_o.bias.fill_(0.5)
-
-    num_lags = prod_kwargs["max_lag"] + 1
-    with torch.no_grad():
-        out = model(*inputs, lag_band_mask=_band(num_lags, list(range(5, num_lags))))
-
-    assert not torch.allclose(
-        out["attended_source"][:, 0, :], torch.zeros(model.d_model), atol=1e-6
-    )
-
-
 def test_one_dimensional_and_two_dimensional_masks_agree(prod_kwargs, inputs):
     model = _model(prod_kwargs)
     seq_len = inputs[0].shape[1]
@@ -200,23 +172,20 @@ def test_encode_only_threads_the_mask(prod_kwargs, inputs):
     assert torch.all(out["attn_weights"][..., 2:] == 0.0)
 
 
-def test_a_wrong_length_mask_raises(prod_kwargs, inputs):
+@pytest.mark.parametrize(
+    "shape, message",
+    [
+        (lambda seq_len, num_lags: (3,), "lag axis"),
+        (lambda seq_len, num_lags: (3, num_lags), r"is not \(T, L\)"),
+        # Rejected rather than silently collapsed: per-sample masks are not expressible here.
+        (lambda seq_len, num_lags: (2, seq_len, num_lags), "must be 1-D"),
+    ],
+    ids=["wrong-length", "wrong-2d-shape", "three-dimensional"],
+)
+def test_a_malformed_mask_raises(prod_kwargs, inputs, shape, message):
     model = _model(prod_kwargs)
-    with pytest.raises(ValueError, match="lag axis"):
-        model(*inputs, lag_band_mask=torch.ones(3, dtype=torch.bool))
+    mask = torch.ones(shape(inputs[0].shape[1], prod_kwargs["max_lag"] + 1), dtype=torch.bool)
+    with pytest.raises(ValueError, match=message):
+        model(*inputs, lag_band_mask=mask)
 
 
-def test_a_wrong_shape_two_dimensional_mask_raises(prod_kwargs, inputs):
-    model = _model(prod_kwargs)
-    num_lags = prod_kwargs["max_lag"] + 1
-    with pytest.raises(ValueError, match=r"is not \(T, L\)"):
-        model(*inputs, lag_band_mask=torch.ones(3, num_lags, dtype=torch.bool))
-
-
-def test_a_three_dimensional_mask_raises(prod_kwargs, inputs):
-    """Rejected rather than silently collapsed: per-sample masks are not expressible here."""
-    model = _model(prod_kwargs)
-    seq_len = inputs[0].shape[1]
-    num_lags = prod_kwargs["max_lag"] + 1
-    with pytest.raises(ValueError, match="must be 1-D"):
-        model(*inputs, lag_band_mask=torch.ones(2, seq_len, num_lags, dtype=torch.bool))

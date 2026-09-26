@@ -13,18 +13,16 @@ and the two-sided one beside it, the configuration builder every refusal test st
 warm-up staircase and its resolved keep-indices, and the shipped channel widths all describe the
 *dataset*, which is not a property of what a model forecasts from it. A second copy of any of them
 would be free to describe a boundary the data no longer has -- exactly what reading the shards rather
-than declaring the vectors exists to prevent. :data:`IMPORTED_FROM_CAUSAL` names every one of them,
-and ``test_fixtures.py`` asserts the list is a subset of that suite's namespace, so a name that
-stopped being exported fails here rather than tempting an edit to that package.
+than declaring the vectors exists to prevent.
 
 *The constructor keyword sets are local.* They are the conv-LSTM schema at the causal channel widths
 -- the same architecture the causal-feature cell builds and the same geometry it builds it at -- and
 they are still written here rather than imported, because the geometry is a *choice* this package
-makes rather than a fact it inherits. Nothing about a raw target forces $H = 30$, $F = 134$ or
-$S = 30$: a raw sample is honest at every step, so no validity constraint ties the floor to the
-budget at all. Holding all three at the causal-feature cell's values is what leaves exactly one
-variable between the two cells -- what the decoder emits -- and a local set is what lets an arm
-move one of them without touching the sibling.
+makes rather than a fact it inherits. Nothing about a raw target forces the horizon $H$, the floor
+$F$ or the stride $S$: a raw sample is honest at every step, so no validity constraint ties the
+floor to the budget at all. Holding all three at the causal-feature cell's values is what leaves
+exactly one variable between the two cells -- what the decoder emits -- and a local set is what lets
+an arm move one of them without touching the sibling.
 
 Where a value *is* shared it is referenced rather than restated, so the two cannot come to disagree:
 the widths, the sequence length, the horizon and the floor below are the imported constants, not
@@ -56,61 +54,16 @@ try:
 except Exception:
     pass
 
-#: Every name this conftest takes from the causal-feature cell's suite, as a literal rather than as
-#: whatever the import statement below happens to say. ``test_fixtures.py`` asserts it is a subset of
-#: that suite's namespace: a name that stopped being exported there then fails against a stated
-#: intention, rather than surfacing as an ``ImportError`` in whichever test happened to collect
-#: first -- and rather than tempting a re-export to be added to that package, which this one may not
-#: edit.
-
 #: This package's shipped forecast horizon, in decimated steps, **owned here** rather than imported
 #: from the causal-feature suite.
 #:
-#: The two packages agreed on 15 for as long as both shipped it, and the import was the smaller
-#: line. It was also wrong: a horizon is a property of a TARGET DOMAIN, and this one forecasts a raw
-#: FHR window while that one forecasts stored coefficients whose warm-up bounds the anchor floor.
-#: When `lag_attn_cfs` moved to 30 first, the shared constant silently re-pointed this suite's whole
-#: shipped geometry at a horizon this package did not yet ship, and the failure surfaced as an
-#: unrelated shape mismatch three files away. Both ship 30 now, and agreement between two configs is
-#: not a reason to have one constant.
+#: A horizon is a property of a TARGET DOMAIN: this package forecasts a raw FHR window while the
+#: causal-feature one forecasts stored coefficients whose warm-up bounds the anchor floor. When that
+#: package moved its horizon first, a shared constant silently re-pointed this suite's whole shipped
+#: geometry at a horizon this package did not yet ship, and the failure surfaced as an unrelated
+#: shape mismatch three files away. Agreement between two configs is not a reason to have one
+#: constant.
 SHIPPED_HORIZON = 30
-
-IMPORTED_FROM_CAUSAL = (
-    "BATCH",
-    "CAUSAL_C_U",
-    "CAUSAL_C_Y",
-    "CAUSAL_PH_WIDTH",
-    "CAUSAL_SHARD",
-    "CAUSAL_ST_WIDTH",
-    "SHIPPED_BUDGET_STEPS",
-    "SHIPPED_SEQUENCE_LENGTH",
-    "SHIPPED_TRIM_MINUTES",
-    "SHIPPED_WARMUP_PERIOD",
-    "TASK_HPARAMS",
-    "TINY_HORIZON",
-    "TINY_SEQ_LEN",
-    "TINY_ALIGNED_WARMUP_PERIOD",
-    "TINY_SOURCE_ALIGN_DELAYS",
-    "TINY_SOURCE_KEEP_INDEX",
-    "TINY_SOURCE_WARMUP_STEPS",
-    "TINY_STRIDE",
-    "TINY_TARGET_ALIGN_DELAYS",
-    "TINY_TARGET_KEEP_INDEX",
-    "TINY_TARGET_WARMUP_STEPS",
-    "TINY_WARMUP_PERIOD",
-    # `causal_config` is deliberately ABSENT: this package wraps it (see SHIPPED_ALIGN_REFERENCE
-    # below) rather than binding it by identity, because the sibling's default reference is
-    # `target_max` and this row ships 42.21 s. The wrapper delegates to the sibling's object, so
-    # the "no local copy" property the list exists for still holds -- and
-    # `test_the_wrapped_config_delegates_to_the_siblings_own_builder` is what keeps it holding.
-    "TWO_SIDED_SHARD",
-    "absolutize_dataset_paths",
-    "hand_seeding_offenders",
-    "make_stub_batch",
-    "make_streams",
-    "perturb_posterior",
-    "stored_warmup",
-)
 
 # Importing a fixture binds it in this conftest's namespace, which is all pytest needs to serve it to
 # the tests here. ``perturb_posterior`` originates in ``lag_attn`` and is taken through the causal
@@ -122,11 +75,8 @@ from teb_vae.lag_attn_cfs.tests.conftest import (  # noqa: E402,F401
     CAUSAL_C_U,
     CAUSAL_C_Y,
     CAUSAL_PH_WIDTH,
-    CAUSAL_SHARD,
     CAUSAL_ST_WIDTH,
-    SHIPPED_BUDGET_STEPS,
     SHIPPED_SEQUENCE_LENGTH,
-    SHIPPED_TRIM_MINUTES,
     SHIPPED_WARMUP_PERIOD,
     TASK_HPARAMS,
     TINY_HORIZON,
@@ -143,28 +93,22 @@ from teb_vae.lag_attn_cfs.tests.conftest import (  # noqa: E402,F401
     TWO_SIDED_SHARD,
     absolutize_dataset_paths,
     causal_config,
-    hand_seeding_offenders,
     make_stub_batch,
     make_streams,
     perturb_posterior,
-    stored_warmup,
 )
 
 #: This cell's own alignment reference, in seconds, as ``configs/default.yaml`` ships it.
 #:
-#: The sibling's :func:`causal_config` defaults to ``target_max`` (402.1604 s), which is right for a
-#: FEATURE target and wrong here. With a raw target $\tau^y \equiv 0$, so nothing cancels the source
-#: reference out of the physical-lag identity
-#: $\tau_{\mathrm{phys}}(\ell,h) = \Delta(\ell+1+h) + \kappa\tau_{\mathrm{ref}} - 20$ s, which is
-#: minimised at $\ell = h = 0$ and grows with the lag -- so at ``target_max`` the smallest expressible
-#: lead is $355.9$ s (canonical stored timeline, no dataset-shift term) and the $20$-$120$ s
-#: coupling band is off the axis at every lag index.
+#: The sibling's :func:`causal_config` defaults to ``target_max``, which is right for a FEATURE
+#: target and wrong here. With a raw target $\tau^y \equiv 0$, so nothing cancels the source
+#: reference out of the physical-lag identity $\tau_{\mathrm{phys}}(\ell,h) = \Delta(\ell+1+h) +
+#: \kappa\tau_{\mathrm{ref}}$, which is minimised at $\ell = h = 0$ and grows with the lag -- so at
+#: ``target_max`` the smallest expressible lead is already past the coupling band at every lag index.
 #:
 #: Wrapping the sibling's builder rather than editing it keeps "no edit to any existing package"
 #: true; wrapping it rather than passing the override at each call site is what makes this suite
-#: measure the geometry **this cell's own documents describe**, which is what ``test_docs.py``
-#: exists to check. A suite resolving the sibling's reference would re-measure the sibling's model
-#: and report the difference as a documentation error.
+#: measure this cell's own shipped geometry rather than re-measure the sibling's model.
 SHIPPED_ALIGN_REFERENCE = 42.21
 
 _sibling_causal_config = causal_config
@@ -188,10 +132,8 @@ def causal_config(**overrides: Any) -> Dict[str, Any]:
 # Bound by reference rather than copied, which is what keeps "no edit to any existing package" true
 # while leaving no second definition to drift: the threshold names no constructor argument, so what
 # the network takes is the four concrete channel tuples it resolves to, and there is exactly one
-# translation of the one into the other in the repository. ``test_warmup_budget.py`` asserts both are
-# the sibling's own objects.
+# translation of the one into the other in the repository.
 from teb_vae.lag_attn_cfs.model_kwargs import (  # noqa: E402,F401
-    ALIGN_MODEL_KWARGS,
     WARMUP_MODEL_KWARGS,
     warmup_model_kwargs,
 )
@@ -227,9 +169,8 @@ TINY_KWARGS: Dict[str, Any] = dict(
     dropout=0.0,
 )
 
-#: What the production configuration builds, **ungated**: the causal window and channel widths --
-#: $300$ steps, $c_y = 102$, $c_u = 51$ -- with a one-minute horizon tiled at $S = H$ from a floor of
-#: $133$, over the conv-LSTM encoders. Construction-time invariants are checked against the model
+#: What the production configuration builds, **ungated**: the causal window and channel widths,
+#: with the shipped horizon tiled at $S = H$ from the shipped floor, over the conv-LSTM encoders. Construction-time invariants are checked against the model
 #: that actually trains, not a miniature of it; forward passes stay on :data:`TINY_KWARGS` for speed.
 SHIPPED_KWARGS: Dict[str, Any] = dict(
     sequence_length=SHIPPED_SEQUENCE_LENGTH,
@@ -453,17 +394,11 @@ def pytest_configure(config: pytest.Config) -> None:
 
 
 @pytest.fixture
-def config() -> Dict[str, Any]:
-    """A fresh configuration at the shipped causal geometry (safe to mutate)."""
-    return causal_config()
-
-
-@pytest.fixture
 def budget():
     """The resolved warm-up budget at the shipped threshold, against the committed fixture.
 
-    Shipped means **aligned**: both streams carry a shift, the source is 17 channels wide, and
-    ``reference_delay_s`` is set. :func:`unaligned_budget` is the comparison arm.
+    Shipped means **aligned**: both streams carry a shift, the source keeps only the channels the
+    reference admits, and ``reference_delay_s`` is set.
     """
     from teb_vae.lag_attn_cfs.causal_warmup import resolve_warmup_budget
 
@@ -473,29 +408,9 @@ def budget():
 
 
 @pytest.fixture
-def unaligned_budget():
-    """The same budget with the alignment off: no shift, no reference, every source channel kept.
-
-    The comparison arm that stays reachable at one key, and what every assertion phrased as "the
-    warm-up budget alone decides this" is stated against.
-    """
-    from teb_vae.lag_attn_cfs.causal_warmup import resolve_warmup_budget
-
-    resolved = resolve_warmup_budget(causal_config(causal_align_reference=None))
-    assert resolved is not None
-    return resolved
-
-
-@pytest.fixture
 def tiny_kwargs() -> Dict[str, Any]:
     """A fresh copy of the ungated tiny constructor kwargs (safe to mutate)."""
     return dict(TINY_KWARGS)
-
-
-@pytest.fixture
-def shipped_kwargs() -> Dict[str, Any]:
-    """A fresh copy of the ungated production constructor kwargs (safe to mutate)."""
-    return dict(SHIPPED_KWARGS)
 
 
 @pytest.fixture
@@ -508,18 +423,6 @@ def tiny_warmup() -> Dict[str, Any]:
 def tiny_align() -> Dict[str, Any]:
     """A fresh copy of the tiny kwargs carrying the guard and the alignment (safe to mutate)."""
     return tiny_align_kwargs()
-
-
-@pytest.fixture
-def streams():
-    """Seeded ``(y_st, y_ph, u_stream)`` at the tiny geometry and the causal widths."""
-    return make_streams(TINY_KWARGS)
-
-
-@pytest.fixture
-def raw_signal():
-    """A seeded raw target signal at the tiny geometry."""
-    return make_raw_signal(TINY_KWARGS)
 
 
 @pytest.fixture

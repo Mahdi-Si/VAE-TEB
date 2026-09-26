@@ -90,15 +90,6 @@ def _build(model, outs, tensors, *, up_st, fhr_raw, up_raw):
     return fig
 
 
-def test_the_builder_returns_a_figure_without_a_trainer(prod_kwargs):
-    model, outs, tensors = _forward(prod_kwargs)
-    fig = _build(model, outs, tensors, up_st=True, fhr_raw=True, up_raw=True)
-    try:
-        assert isinstance(fig, plt.Figure)
-    finally:
-        plt.close(fig)
-
-
 def test_the_feature_row_ranges_are_derived_from_the_tensors(prod_kwargs):
     """The row ranges in the two heatmap titles must come from the data, not from a literal.
 

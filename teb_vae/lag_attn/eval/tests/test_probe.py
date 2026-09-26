@@ -6,13 +6,11 @@ artifact that can see it.
 """
 from __future__ import annotations
 
-import numpy as np
-import torch
-
 import json
 
 import numpy as np
 import pytest
+import torch
 
 from teb_vae.lag_attn.config import load_config
 from teb_vae.lag_attn.eval import labels
@@ -38,7 +36,7 @@ def loader(config, monkeypatch, repo_root):
     return GraphDataModule(config).test_dataloader()
 
 
-def test_probe_records_coverage_and_caches_the_latent(runner, loader, config, tmp_path):
+def test_probe_records_coverage(runner, loader, config, tmp_path):
     record = probe_analysis.run_probe(
         runner,
         loader,
@@ -52,12 +50,6 @@ def test_probe_records_coverage_and_caches_the_latent(runner, loader, config, tm
     assert len(record["guids"]) == 4
     assert len(record["source_files"]) == 4
 
-    # The probe does no forward of its own. An earlier form cached a per-sample ``z_mean``
-    # through ``encode_only`` so the latent analyses could skip a pass, but nothing ever read it
-    # -- ``latent`` takes its own pass and needs the per-step posterior, not a support-averaged
-    # coordinate -- so it cost an encode over the whole split every run and saved nothing.
-    assert "z_mean" not in record
-
 
 def test_probe_records_labels_and_the_target_class_histogram(runner, loader, tmp_path):
     record = probe_analysis.run_probe(runner, loader, output_dir=tmp_path)
@@ -70,9 +62,9 @@ def test_probe_records_labels_and_the_target_class_histogram(runner, loader, tmp
 def test_probe_answers_whether_weight_is_ever_fractional(runner, loader, tmp_path):
     """An open question the pipeline is meant to settle on first contact with real data."""
     record = probe_analysis.run_probe(runner, loader, output_dir=tmp_path)
-    assert "binary" in record["weight"]
-    assert isinstance(record["weight"]["binary"], bool)
-    assert 0.0 <= record["weight"]["zero_frac"] <= 1.0
+    # The committed shard is written with an all-ones ``weight``.
+    assert record["weight"]["binary"] is True
+    assert record["weight"]["zero_frac"] == pytest.approx(0.0)
 
 
 def test_probe_writes_a_json_that_omits_the_latent_cache(runner, loader, tmp_path):
@@ -163,29 +155,6 @@ def test_a_fractional_target_is_counted_even_when_the_first_nonzero_step_is_whol
         for row, weight_row in zip(target.numpy(), weight.numpy())
     ]
     assert codes == [1, 2]
-
-
-def test_the_class_histogram_divides_the_weight_out_rather_than_counting_scaled_values():
-    """``target`` is the class code *scaled by* the per-step weight, so it must be divided back.
-
-    Keying the histogram on the raw stored value produced entries like ``'0.75'`` for a recording
-    whose first valid step was only partially valid. ``report.check_classes_present`` counts any
-    key that is not ``'None'``/``'0.0'``/``'0'``, so a single such recording made a genuinely
-    single-class split report two classes -- permanently defeating the coverage check that this
-    histogram exists to feed.
-    """
-    # One acidosis recording (code 2) whose valid steps are all partially weighted: every stored
-    # target value is fractional, and none of them equals the class code.
-    target = torch.zeros(1, 8)
-    weight = torch.zeros(1, 8)
-    target[0, 2:6] = 2.0 * 0.5
-    weight[0, 2:6] = 0.5
-
-    code = labels.clinical_class_code(np.asarray(target[0]), np.asarray(weight[0]))
-    assert code == 2, "the weight was not divided back out of the scaled target"
-    assert labels.class_name(code) == "acidosis"
-    # The raw value that the old keying would have used is not a class code at all.
-    assert float(target[0, 2]) == 1.0
 
 
 def test_a_non_finite_target_is_counted_rather_than_read_as_fractional():

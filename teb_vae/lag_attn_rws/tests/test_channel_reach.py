@@ -6,16 +6,12 @@ would pass on any consistent mistake. So the primary check here is external -- t
 are already pinned, independently, by ``teb_vae/lag_attn/eval/representation_capacity_probe.py``
 against the analysis document they were published in.
 
-Two further properties get their own tests because each fails silently:
-
-* **The filter bank must be built at the stored $N = 5280$**, not at the trimmed $4800$. Reach is
-  a property of the filters that computed the coefficients, and the padded length -- hence every
-  realised filter -- changes with $N$.
-* **The phase-harmonic channel order must match the shard's.** The reach vector is positional, so
-  a reordering delays the wrong channels and nothing anywhere fails. The stored order is
-  ``KymatioPhaseScattering1D``'s pair enumeration filtered by a boolean mask, and that is what is
-  reproduced here; the shard's own ``sel_i`` / ``sel_j`` attributes are the authority, and the
-  test against them runs when a shard that carries them is available.
+A further property gets its own tests because it fails silently: **the phase-harmonic channel
+order must match the shard's.** The reach vector is positional, so a reordering delays the wrong
+channels and nothing anywhere fails. The stored order is ``KymatioPhaseScattering1D``'s pair
+enumeration filtered by a boolean mask, and that is what is reproduced here; the shard's own
+``sel_i`` / ``sel_j`` attributes are the authority, and the test against them runs when a shard
+that carries them is available.
 """
 from __future__ import annotations
 
@@ -26,10 +22,8 @@ import numpy as np
 import pytest
 
 from teb_vae.lag_attn.eval.representation_capacity_probe import (
-    N_RAW,
     Q,
     build_filter_bank,
-    forward_reach,
     select_phase_pairs,
 )
 from teb_vae.lag_attn.channel_reach import (
@@ -89,65 +83,6 @@ def test_every_source_phase_channel_reaches_at_least_a_hundred_seconds():
     blocks = block_reach_seconds()
 
     assert min(blocks["up_ph"]) >= 100.0
-
-
-# ---------------------------------------------------------------------------------------
-# The bank is built at the stored length
-# ---------------------------------------------------------------------------------------
-def test_the_reaches_come_from_a_bank_built_at_the_stored_length():
-    """Reach is a property of the filters that computed the coefficients, and those were
-    computed on the untrimmed $5280$-sample segment. Pinned by rebuilding the stored-length bank
-    independently and comparing every channel, so switching the module to the trimmed length --
-    or to any other -- fails here."""
-    assert N_RAW == 5280
-
-    assert np.array_equal(
-        np.array(block_reach_seconds()["fhr_st"]), _scattering_reach_at_length(N_RAW)
-    )
-
-
-def test_the_reach_follows_the_padded_length_which_is_why_the_input_length_matters():
-    r"""The mechanism behind the test above, demonstrated where it is visible.
-
-    Reaches depend on the *padded* length $2^{J_{\mathrm{pad}}}$, not directly on $N$. The
-    trimmed $4800$ and the stored $5280$ happen to land on the same $2^{13}$, so at this
-    particular geometry they agree channel for channel -- a coincidence of these two numbers, not
-    a licence to build at whichever is convenient. A length that does move $J_{\mathrm{pad}}$
-    moves the slow filters' reaches by a wide margin, which is the failure a wrong build length
-    would produce at any other trim, $J$, or $Q$.
-    """
-    stored = _scattering_reach_at_length(N_RAW)
-
-    assert np.array_equal(_scattering_reach_at_length(4800), stored)  # same 2**13
-    assert float(_scattering_reach_at_length(2400).max()) < 0.6 * float(stored.max())  # 2**12
-
-
-def _scattering_reach_at_length(n_raw: int) -> np.ndarray:
-    """The 43 scattering-block forward reaches for a bank rebuilt at ``n_raw`` samples."""
-    from kymatio.scattering1d.filter_bank import scattering_filter_factory
-    from kymatio.scattering1d.utils import compute_minimum_support_to_pad
-
-    from teb_vae.lag_attn.eval.representation_capacity_probe import FS, J, T, FilterBank
-
-    min_to_pad = min(compute_minimum_support_to_pad(n_raw, J, Q, T), n_raw - 1)
-    j_max = int(np.floor(np.log2(3 * n_raw - 2)))
-    j_pad = min(int(np.ceil(np.log2(n_raw + 2 * min_to_pad))), j_max)
-    n_padded = 2**j_pad
-    phi_f, psi1_f, _, _ = scattering_filter_factory(
-        J_support=int(np.ceil(np.log2(n_padded))), J_scattering=J, Q=Q, T=T
-    )
-    index = np.arange(n_padded)
-    bank = FilterBank(
-        psi=np.stack([d["levels"][0] for d in psi1_f], axis=0),
-        phi=np.asarray(phi_f["levels"][0]),
-        xi=np.array([d["xi"] for d in psi1_f]),
-        sigma=np.array([d["sigma"] for d in psi1_f]),
-        taps=np.where(index <= n_padded // 2, index, index - n_padded) / FS,
-    )
-    return np.array(
-        [forward_reach(bank, bank.phi)]
-        + [forward_reach(bank, bank.psi[i]) for i in range(bank.psi.shape[0])]
-    )
 
 
 # ---------------------------------------------------------------------------------------

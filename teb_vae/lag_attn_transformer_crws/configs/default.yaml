@@ -510,8 +510,8 @@ model_config:
     #
     # 30 = `horizon`, and the two must move together: a horizon change that left the stride behind
     # would either overlap the windows again (S < H) or leave target steps that no phase ever covers
-    # (S > H, which the constructor refuses). tests/test_config_load.py asserts the equality here and
-    # in every arm rather than leaving it to be noticed.
+    # (S > H, which the constructor refuses). tests/test_config_load.py asserts the equality here
+    # rather than leaving it to be noticed.
     #
     # Validation and test decode every valid anchor -- stride 1, phase 0 -- rather than one tile
     # grid: a single phase is deterministic but PHASE-BIASED, sampling the same 5 of 136 anchors at

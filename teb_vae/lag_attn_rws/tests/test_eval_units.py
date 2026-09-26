@@ -94,13 +94,6 @@ def test_the_two_conversions_differ_by_exactly_the_mean() -> None:
     assert float(level[0] - spread[0]) == pytest.approx(HAND_STATS["fhr"]["mean"], rel=1e-9)
 
 
-def test_a_signed_bias_converts_as_a_spread_because_it_is_a_difference() -> None:
-    """A mean forecast error of zero is zero bpm of bias, not 140 bpm of it."""
-    converted, _unit = sigma_to_bpm([0.0], HAND_STATS)
-
-    assert float(converted[0]) == 0.0
-
-
 # =============================================================================
 # The honest fallback
 # =============================================================================

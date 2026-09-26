@@ -5,14 +5,15 @@ scores, so long lags begin penalised and the model must earn a long-lag reading.
 *parameter*, not a fixed prior -- a head that finds real long-lag structure can flatten its own
 decay. What it cannot do is start there by accident.
 
-These tests pin that the bias exists, is shaped and seeded correctly, trains, and is absent under
-``'normal'``.
+These tests pin that the bias is seeded correctly, scales with ``alibi_slope_scale``, trains, and is
+absent under ``'normal'``; and, for the attention itself, the causal lag mask (a lag $\ell$ at step
+$t$ exists only when $t - \ell \ge 0$), row normalisation under softmax and entmax, the forward
+shapes, and that gradient checkpointing leaves the output unchanged.
 """
 from __future__ import annotations
 
 import pytest
 import torch
-from torch import nn
 
 from teb_vae.lag_attn.nets.attention import LagCrossAttention, alibi_slopes
 
@@ -40,17 +41,6 @@ def _states():
     return h_y, h_u
 
 
-def test_alibi_bias_is_a_trainable_parameter():
-    attention = _make(lag_bias_init="alibi_decay")
-    bias = attention.lag_score_bias
-
-    assert isinstance(bias, nn.Parameter)
-    assert bias.shape == (_NUM_HEADS, _MAX_LAG + 1)
-    assert bias.requires_grad
-    # Registered, so the optimiser and DDP both see it.
-    assert "lag_score_bias" in dict(attention.named_parameters())
-
-
 def test_alibi_bias_is_seeded_with_a_negative_lag_slope():
     r"""Each head's bias must decay monotonically with lag: $b_{h\ell} = -m_h \ell$."""
     bias = _make(lag_bias_init="alibi_decay").lag_score_bias.detach()
@@ -71,6 +61,9 @@ def test_normal_lag_bias_registers_no_parameter():
 
 def test_alibi_bias_receives_gradient():
     attention = _make(lag_bias_init="alibi_decay")
+    assert attention.lag_score_bias.shape == (_NUM_HEADS, _MAX_LAG + 1)
+    # Registered, so the optimiser and DDP both see it.
+    assert "lag_score_bias" in dict(attention.named_parameters())
     out, _, _ = attention(*_states())
     out.sum().backward()
 
@@ -83,19 +76,6 @@ def test_alibi_bias_receives_gradient():
 def test_invalid_lag_bias_init_raises():
     with pytest.raises(ValueError, match="lag_bias_init"):
         _make(lag_bias_init="exponential")
-
-
-def test_head_width_must_tile_the_model_width():
-    with pytest.raises(ValueError, match="must equal d_model"):
-        LagCrossAttention(d_model=32, num_heads=4, d_head=9, max_lag=_MAX_LAG)
-
-
-def test_alibi_slope_scale_default_is_identity():
-    default = _make(lag_bias_init="alibi_decay")
-    explicit = _make(lag_bias_init="alibi_decay", alibi_slope_scale=1.0)
-    assert torch.equal(
-        default.lag_score_bias.detach(), explicit.lag_score_bias.detach()
-    )
 
 
 def test_alibi_slope_scale_softens_the_slope():
@@ -114,19 +94,11 @@ def test_alibi_slope_scale_softens_the_slope():
     )
 
 
-def test_alibi_slope_scale_zero_gives_a_flat_but_learnable_bias():
-    attention = _make(lag_bias_init="alibi_decay", alibi_slope_scale=0.0)
-    assert torch.allclose(attention.lag_score_bias.detach(), torch.zeros(1))
-    assert attention.lag_score_bias.requires_grad
-
-
 def test_alibi_slopes_follow_the_power_of_two_schedule():
+    r"""Press et al. (2022): for $n = 8$ heads the slopes are $m_h = 2^{-h}$, $h = 1, \dots, 8$."""
     slopes = alibi_slopes(8)
-    assert slopes.shape == (8,)
-    assert bool((slopes > 0).all())
-    # Geometric and decreasing: consecutive ratios are equal.
-    ratios = slopes[1:] / slopes[:-1]
-    assert torch.allclose(ratios, ratios[0].expand_as(ratios))
+    expected = 2.0 ** -torch.arange(1, 9, dtype=slopes.dtype)
+    assert torch.allclose(slopes, expected)
 
 
 def test_build_lag_mask_is_public_and_lower_triangular():

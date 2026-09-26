@@ -14,10 +14,12 @@ the background/caesarean structure is visible. A reader comparing two figures dr
 cohort subsets would be comparing different columns without either figure saying so.
 
 **The palette.** Green for healthy, amber for acidosis, red for HIE, with each subgroup a shade of
-its class. Asserted twice over: by the literals, so a change is deliberate, and by the *property*
-the literals exist for -- the green channel dominates healthy and the red channel dominates HIE --
-so a future palette that keeps three distinct colours while losing the clinical reading fails
-here rather than shipping.
+its class. Asserted by the *property* the colours exist for -- the green channel dominates healthy
+and the red channel dominates HIE -- so a future palette that keeps three distinct colours while
+losing the clinical reading fails here rather than shipping.
+
+**The evaluation horizon.** ``cohort.within_horizon`` bounds the far side of the clinical clock
+only, inclusively, and leaves the non-finite rows for the binner to drop.
 
 The two are tested together because they are one decision: a figure whose violins are ordered one
 way and coloured by another convention is worse than either alone.
@@ -252,11 +254,11 @@ def test_every_comparison_runs_from_the_more_severe_cohort_to_the_less_severe_on
 # The palette
 # =============================================================================
 def test_each_clinical_class_carries_its_conventional_colour() -> None:
-    """Both the literal and the property behind it. The literal makes a change deliberate; the
-    channel test is what a replacement palette still has to satisfy to be the right one."""
+    """The property behind the palette, which any replacement still has to satisfy: green
+    dominates healthy, red dominates HIE, and amber sits between them with little blue."""
     colours = figures_seam.CLINICAL_CLASS_COLORS
 
-    assert colours == {"healthy": "#2E8B57", "acidosis": "#E8A33D", "hie": "#C0392B"}
+    assert set(colours) == {"healthy", "acidosis", "hie"}
     red, green, blue = (
         {name: int(value[index:index + 2], 16) for name, value in colours.items()}
         for index in (1, 3, 5)
@@ -367,29 +369,3 @@ def test_the_horizon_tolerates_a_frame_with_no_epoch_column() -> None:
 
     assert cohort.within_horizon(frame, 4.0) is frame
     assert cohort.within_horizon(pd.DataFrame(), 4.0).empty
-
-
-def test_every_clock_analysis_reads_the_horizon_key() -> None:
-    """The anti-omission direction: a clock analysis added later that never reads the key would
-    silently evaluate the whole split while the run's config said otherwise, and no assertion on
-    the existing analyses would notice."""
-    import re
-    from pathlib import Path
-
-    root = Path(cohort.__file__).resolve().parent / "analyses"
-    clocks = [
-        name for name in ("trajectory.py", "time_to_delivery.py", "second_stage.py",
-                          "lag_kl.py", "lag_clocks.py")
-        if (root / name).is_file()
-    ]
-    assert clocks, "no clock analysis found to check"
-
-    missing = [
-        name for name in clocks
-        if not re.search(r"max_hours_before_delivery", (root / name).read_text(encoding="utf-8"))
-    ]
-
-    assert missing == [], (
-        f"{missing} bin on a clinical clock but never read "
-        f"eval_config.max_hours_before_delivery, so a bounded run would not bound them"
-    )

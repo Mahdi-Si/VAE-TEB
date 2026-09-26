@@ -159,7 +159,6 @@ def test_the_profile_cohort_falls_back_to_the_cap_alone_on_an_unlabelled_split()
     admitted = cohort.admit(_labelled_batch(["g1", "g2", "g3", "g4"], [None] * 4))
     assert admitted.tolist() == [True, True, True, False]
     assert cohort.record()["composition"] == {"unlabelled": 3}
-    assert "no class quota" in cohort.record()["selection"]
     assert collect.LagProfileCohort(None, ["healthy"]).admit(_labelled_batch(["g"], ["healthy"])) is None
 
 

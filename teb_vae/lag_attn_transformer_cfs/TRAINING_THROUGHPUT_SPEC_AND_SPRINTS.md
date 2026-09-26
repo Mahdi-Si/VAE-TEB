@@ -253,8 +253,8 @@ squares in the input dtype and should upcast, and `entmax15` in
 timed here (no Triton in the Windows venv); the forward has graph breaks at the two
 `bool(...any())` checks in `_build_anchor_index` and at the prior clock's eval toggling in
 `CausalWarmupInputs._prior_clock`, and CUDA graphs are out until the syncs of F3 are gone.
-`tests/test_config_load.py` asserts `precision == "32-true"` and `compile is False` on the
-shipped config, so either belongs in a sweep arm, not the default.
+`tests/test_config_load.py` holds `precision` and `compile` at the conv-LSTM cell's shipped values
+(encoder-edge parity), so either belongs in a sweep arm, not the default.
 
 **F6. What is already right, and what is not a lever.** DDP ships with
 `broadcast_buffers=False`, `gradient_as_bucket_view=True` and `find_unused_parameters` derived
@@ -335,7 +335,7 @@ loader no longer stalling the step.
 | teb_vae/lag_attn_cfs/tests/conftest.py:make_stub_batch | Stub batch with `guid` and `epoch` | reuse in FR-005 script and tests |
 | teb_vae/lag_attn_transformer_cfs/tests/test_objective.py | Bitwise pins of the objective on this cell | must keep passing (NFR-001) |
 | teb_vae/lag_attn_transformer_cfs/tests/test_train_smoke.py | Slow: tiny fit; every metric reaches the logger, no all-NaN column | Sprint 2 integration check |
-| teb_vae/lag_attn_transformer_cfs/tests/test_config_load.py | Pins `precision`, `compile`, and parity of shared leaves | why FR-011, FR-012, FR-015 are arms or deferred |
+| teb_vae/lag_attn_transformer_cfs/tests/test_config_load.py | Parity of shared leaves, `precision` and `compile` included | why FR-011, FR-012, FR-015 are arms or deferred |
 | teb_vae/lag_attn_transformer_cfs/tests/test_sync_free_step.py | CUDA-only sync attribution test | (new) FR-004, FR-006 |
 | teb_vae/lag_attn_transformer_cfs/configs/default.yaml | Shipped leaves: `num_workers: 8`, `prefetch_factor: 4`, `profiler: simple`, `precision: "32-true"`, `compile: false` | read by FR-003; unchanged |
 | teb_vae/lag_attn_transformer_cfs/RESULTS.md | "Distributed smoke, memory and throughput" table with empty rows | record for FR-003 and FR-007 |

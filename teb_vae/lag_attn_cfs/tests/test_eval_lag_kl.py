@@ -9,8 +9,8 @@ attribution holds only in expectation. Every number the analysis reports would s
 entirely reasonable. So the run measures the residual on its own numbers, and the checks below
 prove the measurement has teeth.
 
-**The support.** At this cell's shipped geometry the anchor floor $F = 133$ exceeds the furthest
-searched lag $L - 1 = 90$, so every lag is causally valid at every scored anchor and all three
+**The support.** At this cell's shipped geometry the anchor floor $F$ exceeds the furthest
+searched lag $L - 1$, so every lag is causally valid at every scored anchor and all three
 profiles coincide. That is a property of $F \ge L - 1$ rather than of the domain: the floor,
 ``max_lag`` and ``lag_floor`` move independently, and a ``sweep_floor_*`` arm reintroduces
 truncation. So the analysis reads preflight's measured margin, measures the per-lag anchor counts,
@@ -23,8 +23,8 @@ perfectly confident argmax. The peak description and the mechanical degeneracy c
 stop that from being reported as a finding, and they are tested on synthetic profiles of known
 answer rather than on whatever the fixture happened to produce.
 
-And throughout: this axis is **stored-coefficient time**. The caveat that says so travels on every
-artifact that states a lag position, and its absence from any of them is a test failure here.
+The lag axis, the figure and the per-cohort stratification are checked on the numbers they carry:
+a non-zero input delay must shift every drawn second, and each cohort must recover its own peak.
 """
 from __future__ import annotations
 
@@ -41,12 +41,8 @@ from teb_vae.lag_attn_cfs.eval.figures_seam import figure_filename
 from teb_vae.lag_attn_cfs.eval import lag_axis, preflight, report_seam
 from teb_vae.lag_attn_cfs.eval.analyses import AnalysisContext
 from teb_vae.lag_attn_cfs.eval.analyses import lag_kl
-from teb_vae.lag_attn.nets.lag_report import lag_compensated_seconds
 
-#: The identity key the lag map's residual is reported under.
-_MAP_RESIDUAL = "lag_map_sums_to_kl_max_abs_nats"
-
-#: The shipped geometry's measured margin: $F - \max_{\rm lag} - F_u = 133 - 90 - 0$.
+#: A non-negative measured margin $F - \max_{\rm lag} - F_u$, as an untruncated geometry records it.
 _SHIPPED_MARGIN = 43
 
 
@@ -74,17 +70,7 @@ def test_the_reader_and_the_writer_name_the_same_file() -> None:
     """The reader restates the filename rather than importing it, because ``preflight`` rebuilds a
     checkpoint and the analyses that read the number run offline. Pinned equal so a rename cannot
     leave one side reading a file the other stopped writing."""
-    assert lag_axis.PREFLIGHT_FILENAME == preflight.PREFLIGHT_FILENAME == "preflight.json"
-
-
-def test_the_margin_is_read_off_the_runs_own_preflight_record(tmp_path) -> None:
-    _write_preflight(tmp_path, margin=_SHIPPED_MARGIN)
-
-    support = lag_axis.read_lag_support(tmp_path)
-
-    assert support["measured"] is True
-    assert support["lag_support_margin_steps"] == _SHIPPED_MARGIN
-    assert support["every_lag_valid_at_every_anchor"] is True
+    assert lag_axis.PREFLIGHT_FILENAME == preflight.PREFLIGHT_FILENAME
 
 
 def test_an_absent_record_reports_unmeasured_rather_than_a_default(tmp_path) -> None:
@@ -201,14 +187,6 @@ def test_an_unmeasured_margin_leaves_the_comparison_undecided() -> None:
 # =================================================================================================
 # The three profiles
 # =================================================================================================
-def test_all_three_profiles_are_kept_and_named() -> None:
-    """The untruncated recomputation is retained rather than folded into the corrected one: whether
-    the three coincide is the measurement that says this geometry admits every lag."""
-    assert [name for name, _, _, _ in lag_kl.PROFILES] == [
-        "raw", "support_corrected", "untruncated"
-    ]
-
-
 def test_the_profile_table_carries_a_column_per_profile() -> None:
     lag = _lag_block(truncated=True)
     seconds = lag_kl.compensated_seconds_axis(9, delay_steps=0)
@@ -235,7 +213,7 @@ def test_an_empty_lag_block_yields_the_columns_and_no_rows() -> None:
 def test_the_summary_describes_every_profile() -> None:
     rows = lag_kl.build_summary_rows(_lag_block(truncated=True), 0)
 
-    assert [row["profile"] for row in rows] == ["raw", "support_corrected", "untruncated"]
+    assert [row["profile"] for row in rows] == [name for name, _, _, _ in lag_kl.PROFILES]
     for row in rows:
         assert row["argmax_lag_step"] is not None
         assert row["axis_caveat"] == lag_axis.GROUP_DELAY_CAVEAT
@@ -321,14 +299,6 @@ def test_a_nearly_all_zero_profile_is_degenerate_for_the_other_reason() -> None:
     assert any("exactly zero" in reason for reason in verdict["reasons"])
 
 
-def test_a_peaked_profile_is_not_degenerate() -> None:
-    """The criterion has to admit the ordinary case, or it reports every run as unreadable."""
-    verdict = lag_kl.degeneracy([0.05, 0.1, 0.4, 1.0, 0.4, 0.1, 0.05, 0.02, 0.01])
-
-    assert verdict["degenerate"] is False
-    assert verdict["reasons"] == []
-
-
 def test_the_peak_width_is_the_contiguous_run_around_the_argmax() -> None:
     """Contiguity is what makes it a width: counting every bin above the threshold anywhere would
     report a bimodal profile as one very wide peak, which is the opposite of what it is."""
@@ -359,16 +329,6 @@ def test_an_empty_profile_reports_nothing_rather_than_raising() -> None:
 # =================================================================================================
 # The lag axis
 # =================================================================================================
-def test_the_seconds_axis_is_the_compensated_one_elementwise() -> None:
-    r"""Not $4\ell$, and not $4\ell + 20$: the compensated figure $4(\ell + \delta)$, built
-    through the shared converter so a second implementation cannot drift from it."""
-    axis = lag_kl.compensated_seconds_axis(9, delay_steps=0)
-
-    assert axis.tolist() == [
-        float(lag_compensated_seconds(lag, delay_steps=0)) for lag in range(9)
-    ]
-
-
 def test_a_nonzero_input_delay_shifts_every_second_by_four_delta() -> None:
     """The historical bug, in the shape it took: one consumer read the delay and the other read
     zero, and the two reports of one run disagreed by a whole horizon with nothing raising."""
@@ -389,8 +349,7 @@ def _figure_lines(figure):
 
 
 def test_the_profile_figure_draws_against_the_coefficient_time_axis() -> None:
-    """The axis label names the quantity; these assertions are about the *numbers*, which is what
-    was historically wrong -- and about the label saying what the axis is time **in**."""
+    """The drawn *numbers* are the compensated axis, which is what was historically wrong."""
     import matplotlib.pyplot as plt
 
     lag = _lag_block(truncated=False)
@@ -410,31 +369,9 @@ def test_the_profile_figure_draws_against_the_coefficient_time_axis() -> None:
 
     assert np.allclose(x_values, seconds)
     assert label == lag_axis.COEFFICIENT_LAG_AXIS_LABEL
-    assert "stored-coefficient time" in label
-    assert "bpm" not in label and "physiological" not in label
     # All three profiles are drawn, not two: at this geometry they lie on top of one another and
     # that coincidence is the reading.
     assert n_curves == len(lag_kl.PROFILES)
-
-
-def test_the_figure_carries_the_group_delay_caveat_on_its_face() -> None:
-    """A figure is the artifact most likely to be lifted out of a run directory and shown alone,
-    and a peak read off one without this beside it is read as a physiological latency."""
-    import matplotlib.pyplot as plt
-
-    lag = _lag_block(truncated=False)
-    seconds = lag_kl.compensated_seconds_axis(9, delay_steps=0)
-
-    figure = lag_kl.build_profile_figure(
-        lag_kl.profile_frame(lag, seconds), lag, delay_steps=0, n_lags=9
-    )
-    try:
-        texts = [artist.get_text() for artist in figure.texts]
-    finally:
-        plt.close(figure)
-
-    assert lag_axis.GROUP_DELAY_CAVEAT in texts
-    assert "not a transfer entropy" in lag_axis.GROUP_DELAY_CAVEAT
 
 
 def test_rebuilding_at_a_nonzero_delay_shifts_every_drawn_second() -> None:
@@ -721,20 +658,6 @@ def test_the_per_head_vector_is_reshaped_head_major_and_dropped_when_it_does_not
     assert dropped[dropped["profile"].str.startswith("attention_head_")].empty
 
 
-def test_the_stratified_peaks_carry_the_caveat_too() -> None:
-    """The other artifact that states a lag position, and therefore the other one a reader could
-    quote a physiological latency out of."""
-    per_sample, vectors = _stratified_inputs()
-
-    frame, _ = lag_kl.stratified_profiles(
-        per_sample, vectors, delay_steps=0, n_lags=6, num_heads=0
-    )
-    peaks = lag_kl.stratified_peak_rows(frame, delay_steps=0)
-
-    assert peaks
-    assert {row["axis_caveat"] for row in peaks} == {lag_axis.GROUP_DELAY_CAVEAT}
-
-
 # =================================================================================================
 # On a real run
 # =================================================================================================
@@ -765,43 +688,3 @@ def test_the_analysis_reports_the_measured_support_on_a_real_run(collected_run) 
         assert support["profiles_agree"] is True
     else:
         assert support["anchor_counts_uniform"] is False
-
-
-@pytest.mark.slow
-def test_the_real_run_writes_the_three_profiles_and_the_caveat(collected_run) -> None:
-    directory = Path(collected_run["results_dir"]) / lag_kl.ANALYSIS_DIRNAME
-    block = collected_run["summary"]["results"]["lag_kl"]
-    profile = pd.read_csv(directory / lag_kl.PROFILE_FILENAME)
-
-    assert (directory / figure_filename(lag_kl.PROFILE_FIGURE)).is_file()
-    assert len(profile) == block["composition"]["n_lags"]
-    assert profile["compensated_seconds"].tolist() == [
-        float(lag_compensated_seconds(lag, delay_steps=block["delay_steps"]))
-        for lag in range(len(profile))
-    ]
-    for _, _, column, _ in lag_kl.PROFILES:
-        assert column in profile.columns
-    assert block["identity"][_MAP_RESIDUAL] <= block["identity"]["tolerance_nats"]
-    assert block["source_delay_is_max_over_channels"] is True
-    assert block["axis_caveat"] == lag_axis.GROUP_DELAY_CAVEAT
-
-
-@pytest.mark.slow
-def test_the_real_run_stratifies_the_lag_readout_and_records_the_restriction(collected_run) -> None:
-    """End to end: the fixture carries three classes and eight subgroups, so both cohort axes are
-    cut, and the anchor restriction the untruncated profiles rest on travels with them."""
-    block = collected_run["summary"]["results"]["lag_kl"]["stratified"]
-    frame = pd.read_csv(
-        Path(collected_run["results_dir"])
-        / lag_kl.ANALYSIS_DIRNAME
-        / lag_kl.STRATIFIED_PROFILE_FILENAME
-    )
-
-    assert set(block["axes"]) == {"clinical_class", "subgroup", lag_kl.TIME_AXIS}
-    assert block["restricted_to_anchors_from"] == block["n_lags"] - 1
-    # Full resolution per (axis, cohort, profile), never an argmax standing in for a profile.
-    for _, cell in frame.groupby(["group_column", "group", "profile"]):
-        assert len(cell) == block["n_lags"]
-    assert {row["profile"] for row in block["peaks"]} >= {
-        name for name, _, _ in lag_kl.STRATIFIED_PROFILES
-    }

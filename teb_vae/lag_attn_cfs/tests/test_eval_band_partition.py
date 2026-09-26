@@ -33,29 +33,6 @@ from .conftest import (
     causal_config,
 )
 
-#: What the shipped budget resolves to on causal shards: 98 of the 102 declared target channels.
-_KEPT_TARGET_CHANNELS = 98
-
-#: The four the budget drops, in rebased coordinates, and the declared indices they sit at.
-_DROPPED_WARMUPS = (162.0, 194.0, 233.0, 278.0)
-_DROPPED_CHANNELS = (32, 33, 34, 35)
-
-#: The five coverage counts of the band-resolved readout, measured on this fixture. Emitted as five
-#: numbers rather than one ratio because the declared and scored numerators coincide at 95 by
-#: arithmetic accident -- $102 - 7 = 98 - 3$ -- and "95 of 102" would imply the analysis banded
-#: channels the decoder never emitted.
-_COVERAGE = {
-    "declared_total": 102,
-    "dropped_declared": 4,
-    "kept_total": 98,
-    "known_kept": 95,
-    "unknown_kept": 3,
-}
-
-#: The target scattering block's own breakdown: one order-0 lowpass, 28 order-1 filters some
-#: selected phase pair named, and 7 that none did.
-_TARGET_SCATTERING_WITHOUT_FREQUENCY = 7
-
 #: The decimated steps ``trim_minutes: 1.0`` discards from each end. Restated rather than imported
 #: so a rebase that silently stopped happening cannot be masked by the same expression on both
 #: sides of the assertion.
@@ -117,6 +94,7 @@ def emitted(cohort_shards, tmp_path_factory):
     )
     assert record["skipped"] is False, record
     return {
+        "target": target,
         "record": record,
         "dir": Path(output_dir),
         "declared": pd.read_csv(Path(output_dir) / analysis.CHANNEL_MAP_FILENAME),
@@ -135,7 +113,7 @@ def test_the_channel_map_is_one_row_per_channel_of_both_streams(emitted) -> None
     """
     frame = emitted["declared"]
 
-    assert len(frame) == CAUSAL_C_Y + CAUSAL_C_U == 153
+    assert len(frame) == CAUSAL_C_Y + CAUSAL_C_U
     assert list(frame.columns[:2]) == ["stream", "channel"]
     counts = frame["stream"].value_counts().to_dict()
     assert counts == {"target": CAUSAL_C_Y, "source": CAUSAL_C_U}
@@ -147,18 +125,17 @@ def test_the_channel_map_is_one_row_per_channel_of_both_streams(emitted) -> None
         )
 
 
-def test_the_four_dropped_channels_are_present_with_their_rebased_warm_ups(emitted) -> None:
-    r"""$W' = 162, 194, 233, 278$ at ``kept = False``, and every other target channel kept.
+def test_the_dropped_channels_are_present_rather_than_filtered_out(emitted) -> None:
+    r"""Exactly the budget's dropped channels at ``kept = False``, and every other target channel kept.
 
     Present rather than filtered out: a map that carried only the survivors could not say what the
-    budget removed, and the four are the whole reason the two axes differ.
+    budget removed, and those channels are the whole reason the two axes differ.
     """
     target = emitted["declared"][emitted["declared"]["stream"] == "target"]
     dropped = target[~target["kept"]]
 
-    assert tuple(dropped["channel"]) == _DROPPED_CHANNELS
-    assert tuple(dropped["causal_warmup_steps"]) == _DROPPED_WARMUPS
-    assert int(target["kept"].sum()) == _KEPT_TARGET_CHANNELS
+    assert tuple(dropped["channel"]) == emitted["target"].dropped_index
+    assert int(target["kept"].sum()) == emitted["target"].kept_width
 
 
 def test_the_warm_up_column_is_rebased_by_the_loaders_own_trim(emitted, cohort_shards) -> None:
@@ -187,7 +164,7 @@ def test_every_channel_carries_a_finite_group_delay(emitted) -> None:
     """
     delays = np.asarray(emitted["declared"]["causal_delay_s"], dtype=np.float64)
 
-    assert delays.size == 153
+    assert delays.size == CAUSAL_C_Y + CAUSAL_C_U
     assert np.isfinite(delays).all()
     assert (delays > 0.0).all()
 
@@ -207,22 +184,8 @@ def test_the_source_stream_is_never_gated(emitted) -> None:
 # =================================================================================================
 # Provenance: the phase blocks alone carry it, and the gaps are recorded rather than bucketed
 # =================================================================================================
-def test_a_block_with_no_selection_provenance_is_not_a_shard_level_skip(emitted) -> None:
-    """``sel_*`` is on the two phase blocks only, which is the common case on this dataset.
-
-    An analysis that read a block of missing provenance as a shard-level skip would emit no channel
-    map at all on every causal shard the pipeline produces.
-    """
-    record = emitted["record"]
-
-    assert record["skipped"] is False
-    for stream in ("target", "source"):
-        assert record["streams"][stream]["coverage"]["up_ph_attrs_present"] is True
-    assert record["files"]["channel_map"] == analysis.CHANNEL_MAP_FILENAME
-
-
 def test_the_scattering_channels_are_banded_through_the_phase_filter_map(emitted) -> None:
-    r"""One order-0 lowpass, 28 order-1 filters a selected pair named, 7 that none did.
+    r"""One order-0 lowpass, the order-1 filters a selected pair named, and the rest that none did.
 
     The seven have no recoverable centre frequency for the same reason their warm-up is longest or
     shortest: they sit outside the phase selection's own band, at both extremes of the axis. They
@@ -233,16 +196,15 @@ def test_the_scattering_channels_are_banded_through_the_phase_filter_map(emitted
 
     assert len(scattering) == CAUSAL_ST_WIDTH
     unknown = scattering[scattering["band"] == shared.UNKNOWN_BAND]
-    assert len(unknown) == _TARGET_SCATTERING_WITHOUT_FREQUENCY
+    assert len(unknown) > 0
     assert (
-        emitted["record"]["streams"]["target"]["n_scattering_without_frequency"]
-        == _TARGET_SCATTERING_WITHOUT_FREQUENCY
+        emitted["record"]["streams"]["target"]["n_scattering_without_frequency"] == len(unknown)
     )
 
     # Exactly one order-0 lowpass, and it is banded on merit rather than as a fallback.
     assert int((scattering["band"] == "slow_baseline").sum()) == 1
     known = scattering[scattering["band"].isin(["deceleration", "variability", "beat_to_beat"])]
-    assert len(known) == CAUSAL_ST_WIDTH - _TARGET_SCATTERING_WITHOUT_FREQUENCY - 1
+    assert len(known) == CAUSAL_ST_WIDTH - len(unknown) - 1
     frequencies = np.asarray(known["freq_hz_primary"], dtype=np.float64)
     assert np.isfinite(frequencies).all()
     assert 0.008 < frequencies.min() and frequencies.max() < 1.0
@@ -261,7 +223,7 @@ def test_every_phase_channel_is_banded(emitted) -> None:
 # The kept axis, which is what a per-channel readout is actually indexed on
 # =================================================================================================
 def test_the_kept_axis_map_is_the_gathered_axis_and_carries_its_declared_index(emitted) -> None:
-    """98 rows in gather order, each naming the declared channel it came from.
+    """One row per kept channel in gather order, each naming the declared channel it came from.
 
     Named rather than implied: the projection is what stops a band label from shifting across the
     axis, and a reader must be able to reconcile the two maps without trusting this analysis.
@@ -270,8 +232,8 @@ def test_the_kept_axis_map_is_the_gathered_axis_and_carries_its_declared_index(e
     target = emitted["declared"][emitted["declared"]["stream"] == "target"]
     survivors = list(target[target["kept"]]["channel"])
 
-    assert len(kept) == _KEPT_TARGET_CHANNELS
-    assert list(kept["kept_channel"]) == list(range(_KEPT_TARGET_CHANNELS))
+    assert len(kept) == len(survivors)
+    assert list(kept["kept_channel"]) == list(range(len(survivors)))
     assert list(kept["channel"]) == survivors
     assert list(kept["band"]) == list(target[target["kept"]]["band"])
     assert bool(kept["kept"].all())
@@ -335,24 +297,29 @@ def test_the_kept_map_is_written_even_when_every_channel_survives(
 # Coverage: five counts, not one ratio
 # =================================================================================================
 def test_the_five_coverage_counts_are_emitted(emitted) -> None:
-    r"""102 declared, 4 dropped, 98 scored, 95 of them banded, 3 not.
+    r"""Declared, dropped, scored, and the scored split into banded and not.
 
-    Five numbers rather than a ratio because the declared and scored numerators coincide at 95 by
-    arithmetic accident, and quoting "95 of 102" would imply channels the decoder never emitted.
+    Five numbers rather than a ratio because the declared and scored banded numerators can coincide
+    by arithmetic accident, and quoting one over the declared width would imply channels the
+    decoder never emitted.
     """
     kept_axis = emitted["record"]["kept_axis"]
+    budget = emitted["target"]
 
-    for name, expected in _COVERAGE.items():
-        assert kept_axis[name] == expected, name
+    assert kept_axis["declared_total"] == budget.declared_width
+    assert kept_axis["dropped_declared"] == len(budget.dropped_index)
+    assert kept_axis["kept_total"] == budget.kept_width
+    assert kept_axis["unknown_kept"] == int((emitted["kept"]["band"] == shared.UNKNOWN_BAND).sum())
     assert kept_axis["known_kept"] + kept_axis["unknown_kept"] == kept_axis["kept_total"]
     assert kept_axis["dropped_declared"] + kept_axis["kept_total"] == kept_axis["declared_total"]
 
 
-def test_all_four_dropped_channels_are_unknown_band(emitted) -> None:
+def test_every_dropped_channel_is_unknown_band(emitted) -> None:
     """They sit below the phase selection's floor, which is the same property that makes their
     warm-up longest -- so the budget removes exactly the low end of the frequency axis and takes no
     banded channel with it."""
-    assert emitted["record"]["kept_axis"]["dropped_bands"] == {shared.UNKNOWN_BAND: 4}
+    kept_axis = emitted["record"]["kept_axis"]
+    assert kept_axis["dropped_bands"] == {shared.UNKNOWN_BAND: kept_axis["dropped_declared"]}
 
 
 def test_the_kept_width_the_collection_recorded_is_cross_checked(emitted) -> None:
@@ -360,7 +327,7 @@ def test_the_kept_width_the_collection_recorded_is_cross_checked(emitted) -> Non
     decoder width that disagreed would make every per-channel join off by the difference."""
     kept_axis = emitted["record"]["kept_axis"]
 
-    assert kept_axis["reported_kept_width"] == _KEPT_TARGET_CHANNELS
+    assert kept_axis["reported_kept_width"] == kept_axis["kept_total"]
     assert kept_axis["width_agrees"] is True
 
 

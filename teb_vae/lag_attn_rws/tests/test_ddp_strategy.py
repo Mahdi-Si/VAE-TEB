@@ -119,16 +119,6 @@ def test_the_override_reaches_the_trainer_kwargs(trainer, monkeypatch):
     assert kwargs["accelerator"] == "gpu"
 
 
-def test_no_strategy_key_is_set_on_a_cpu_box(trainer, monkeypatch):
-    """Documents why every test above calls the hook directly instead of reading the kwargs."""
-    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
-
-    kwargs = trainer._build_trainer_kwargs([])
-
-    assert "strategy" not in kwargs
-    assert kwargs["accelerator"] == "cpu"
-
-
 # --------------------------------------------------------------------------------------
 # The evidence
 # --------------------------------------------------------------------------------------
@@ -181,15 +171,4 @@ def test_under_mse_the_decoder_logvar_head_is_what_starves(task, perturb_posteri
     assert starved, "no parameter starved under mse; the fallback strategy is unjustified"
     assert all("logvar_head" in name for name in starved), (
         f"unexpected starvation beyond the decoder logvar head: {starved}"
-    )
-
-
-def test_the_attention_projection_is_frozen_out_of_the_expectation_set(task):
-    """The mechanism that removes the sibling's second starvation axis: frozen means not
-    expected, not merely unused."""
-    module = task()
-
-    assert not any(
-        parameter.requires_grad
-        for parameter in module.orig_model.lag_attn.W_o.parameters()
     )

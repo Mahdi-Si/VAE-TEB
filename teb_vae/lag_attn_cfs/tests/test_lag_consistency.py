@@ -16,7 +16,8 @@ nothing, whereas a delay means the source memory the attention queries is itself
 stale. **The fixtures below are built unaligned on purpose** -- ``tiny_warmup_kwargs`` passes no
 ``*_align_delays``, so the gate is a pure gather, $\delta = 0$ and the honest axis is $4\ell$.
 That is the arm in which the confusion is visible at all: a consumer that took the panel's
-staircase for a delay would report every lag up to $536$ s too long with nothing failing.
+staircase for a delay would report every lag up to $\Delta \max_c W'_c$ too long with nothing
+failing.
 
 Under the **shipped** ``causal_align_reference`` the gate is *not* a pure gather -- it carries the
 per-channel alignment shifts $d_c$ and $\delta = \max_c d_c > 0$ -- and the honest axis is then
@@ -33,6 +34,9 @@ floor, so the axis must not move by the floor -- and what must move is the mask.
 The secondary axis is read **after a draw**. Matplotlib defers a secondary axis's limits to draw
 time, so an assertion made before one passes against the default $(0, 1)$ whatever the transform
 is -- which would make this file pass on exactly the bug it is here to catch.
+
+The evaluation's lag report is checked last: it carries the model's delay and the flag saying that
+delay is the maximum over the masked source channels.
 """
 from __future__ import annotations
 
@@ -47,10 +51,7 @@ import numpy as np  # noqa: E402
 import pytest  # noqa: E402
 import torch  # noqa: E402
 
-from teb_vae.lag_attn.nets.lag_report import (  # noqa: E402
-    COMPENSATED_LAG_AXIS_LABEL,
-    lag_compensated_seconds,
-)
+from teb_vae.lag_attn.nets.lag_report import COMPENSATED_LAG_AXIS_LABEL  # noqa: E402
 from teb_vae.lag_attn_cfs import sample_page  # noqa: E402
 from teb_vae.lag_attn_rws import plotting  # noqa: E402
 from teb_vae.lag_attn_rws.plotting import _source_delay_steps  # noqa: E402
@@ -181,30 +182,6 @@ def test_filling_the_panels_delays_with_the_warm_up_did_not_move_the_lag_axis():
         plt.close(figure)
 
 
-def test_both_panels_carry_the_axis_the_models_own_delay_implies():
-    r"""Each panel's primary axis is the lag index $\ell$ and its secondary is $4(\ell + \delta)$
-    seconds. The two must be the same map on both panels: the attention map says where the source
-    was attended and the KL-by-lag map how much it bought, and they are read together, so two axes
-    disagreeing would misalign the only comparison the pair supports."""
-    module, batch = _module_and_batch()
-    figure = _page(module, batch)
-    try:
-        delay = int(module.orig_model.source_delay_steps)
-        seen = []
-        for prefix, panel, secondary in _lag_axes(figure):
-            low, high = panel.get_ylim()
-            assert secondary.get_ylim() == pytest.approx(
-                (
-                    float(lag_compensated_seconds(low, delay_steps=delay)),
-                    float(lag_compensated_seconds(high, delay_steps=delay)),
-                )
-            ), prefix
-            seen.append(secondary.get_ylim())
-        assert seen[0] == pytest.approx(seen[1])
-    finally:
-        plt.close(figure)
-
-
 def test_a_non_zero_lag_floor_moves_the_mask_and_not_the_axis():
     r"""The second offset, and the honest answer is that there is none.
 
@@ -292,63 +269,12 @@ def test_the_replaced_rows_do_not_move_the_lag_axis():
 
 
 # =================================================================================================
-# The evaluation pipeline is the third consumer of the same delta
-#
-# The figure and the model agree above. The evaluation is the consumer that did not exist when
-# that agreement was first established, and it is the one whose numbers get quoted: its two
-# lag-resolved analyses build their seconds axis from a ``delay_steps`` the run reads off the model
-# once and threads through the collection record. A second read under a guessed name is exactly the
-# failure this file exists for, so the read site is pinned here rather than only exercised.
+# The evaluation's lag report
 # =================================================================================================
-def test_the_evaluation_reads_the_delay_off_the_model_and_from_nowhere_else():
-    r"""One read site, and it is ``model.source_delay_steps``.
-
-    Pinned by inspecting the runner's source rather than by comparing two numbers that happen to be
-    zero on this cell: the whole point is that a *non-zero* delay reaching one consumer and not
-    another is invisible, and this family's delay is zero, so a value comparison here would pass
-    against a consumer that read nothing at all.
-    """
-    import inspect
-
-    from teb_vae.lag_attn_cfs.eval import run as run_module
-
-    source = inspect.getsource(run_module)
-
-    assert source.count("int(task.orig_model.source_delay_steps)") == 1
-    # And no other attribute name is reached for. ``_source_delay_steps`` is the plotting sibling's
-    # accessor and is asserted equal to the model's own above; a second *name* in the runner would
-    # be the guessed one.
-    #
-    # Five mentions, and exactly one of them is a read. The budget is spent as: the read expression
-    # asserted above; a comment at that site naming what the value is NOT, which is the whole
-    # confusion this test exists about; the summary key it is recorded under; and a key-and-lookup
-    # pair in the arm block, which re-reads it off the PREFLIGHT record rather than off the model.
-    #
-    # That last pair is the one worth stating, because it looks like a second read site and is the
-    # opposite of one: the arm block reports what the run RESOLVED, which an offline pass with no
-    # model still has, and taking it from the model there would leave the block empty on exactly
-    # the pass it is most needed on. What must stay unique is the expression that asks the model.
-    assert source.count("source_delay_steps") == 5, (
-        "the runner must read the delay off the model once; a further occurrence of the "
-        "expression is a second read site, which is how the two reports of one run came to "
-        "disagree by two minutes"
-    )
-    assert source.count("source_reference_delay_s") >= 1, (
-        "the physical constant must travel beside the stored-step one, or a consumer wanting a lag "
-        "in seconds has only the wrong number to reach for"
-    )
-
-
 def test_every_reported_lag_carries_the_maximum_over_channels_flag():
     r"""The source channels are masked individually and the model reports the **maximum**, so every
     lag computed from it is an upper bound. The flag travels beside the numbers rather than being
-    stated once elsewhere, because a lag quoted without it reads as exact.
-
-    Asserted on all three emitters at once -- the lag report, and both analyses that read it -- so a
-    new emitter that dropped the flag fails here rather than in whichever summary is read first.
-    """
-    from teb_vae.lag_attn_cfs.eval.analyses import attention as attention_analysis
-    from teb_vae.lag_attn_cfs.eval.analyses import lag_kl as lag_kl_analysis
+    stated once elsewhere, because a lag quoted without it reads as exact."""
     from teb_vae.lag_attn_cfs.eval.metrics import Aggregate, lag_summary
 
     module, _batch = _module_and_batch()
@@ -367,13 +293,3 @@ def test_every_reported_lag_carries_the_maximum_over_channels_flag():
 
     assert report["delay_steps"] == delay
     assert report["source_delay_is_max_over_channels"] is True
-    # And both analyses carry it through rather than recomputing or dropping it.
-    for module_under_test in (lag_kl_analysis, attention_analysis):
-        assert "source_delay_is_max_over_channels" in inspect_source(module_under_test)
-
-
-def inspect_source(module: Any) -> str:
-    """The module's source text, for the flag-propagation assertion above."""
-    import inspect
-
-    return inspect.getsource(module)

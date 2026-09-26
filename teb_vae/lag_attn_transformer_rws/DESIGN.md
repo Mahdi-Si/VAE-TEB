@@ -189,8 +189,8 @@ untouched.
 bool mask held as a non-persistent buffer. Never both: the constructor refuses a window together
 with an explicit `is_causal`, in both directions. Neither form can produce a fully masked row,
 because both always admit $j = t$ and there is no data-driven validity masking in encoder
-self-attention (§10, third bullet) — so `tests/test_attention_block.py` asserts
-`mask.any(-1).all()` structurally rather than testing a NaN path the architecture cannot enter.
+self-attention (§10, third bullet) — so `tests/test_attention_block.py` pins the exact masks, which
+always admit the diagonal, rather than testing a NaN path the architecture cannot enter.
 
 ### 2.4 The final normalisation
 
@@ -262,11 +262,9 @@ Measured on a constructed shipped-geometry model, not predicted.
 | Everything else, adapters and the shared decoder included, imported unchanged | $2{,}430{,}956$ |
 | **Total** | $\mathbf{4{,}996{,}844}$ |
 
-That total is the **one place the absolute number is pinned**, and `tests/test_docs.py` checks it
-against `sum(p.numel() ...)` rather than against a literal in a test — so a legitimate shared change
-to an imported downstream component re-costs this line rather than failing a test in this package.
-The per-block and per-encoder subtotals are pinned separately in `tests/test_construct.py`, as
-deltas.
+These totals are a record rather than a test pin: each is reproduced by `sum(p.numel() ...)` on a
+shipped-geometry model, so a legitimate shared change to an imported downstream component re-costs
+this table rather than failing a test in this package.
 
 Inside that last row, the two horizon self-attention blocks are $262{,}657$ each — four bias-free
 $256 \times 256$ projections, one `LayerNorm` and one scalar residual gain, so
@@ -285,15 +283,15 @@ Each is enforced by construction and measured by a test, never asserted by conve
 
 | Constraint | What enforces it | Test |
 | --- | --- | --- |
-| **Token causality**, $H_t = f(X_{\le t})$, per block and per encoder | left-only convolution padding; `is_causal` / windowed SDPA masks; every other primitive is position-wise | `tests/test_encoder_causality.py`, `tests/test_source_purity.py` |
+| **Token causality**, $H_t = f(X_{\le t})$, per block and per encoder | left-only convolution padding; `is_causal` / windowed SDPA masks; every other primitive is position-wise | `tests/test_blocks.py`, `tests/test_attention_block.py`, `tests/test_encoder_causality.py`, `tests/test_source_purity.py` |
 | **Prefix equivalence**, $\mathcal E(X_{0:T-1})_t = \mathcal E(X_{0:t})_t$ | rotary positions are absolute and start at zero; no right padding anywhere | `tests/test_prefix_equivalence.py` |
 | **Source purity** — the prior never sees the source, the source state never sees the target | separate adapters and encoders; the posterior is a residual on the prior | `tests/test_source_purity.py` |
 | **No decoder bypass** — gradient reaches the decoder only through $z$ | `BaselineFutureDecoder.forward` takes exactly one tensor, at $d_z$ in-features | `tests/test_no_bypass.py` |
 | **Exact zero KL at initialisation**, and bitwise identical base and full *in train mode* | posterior deltas zeroed **after** the generic init; one shared $\epsilon$; decoder and attention dropout fixed at $0$ | `tests/test_zero_kl_init.py` |
 | **The lag attribution identity**, $\sum_\ell \widetilde K_{t,\ell} = K_t$, exactly | the lag attention is built at `dropout=0.0`, so the returned probabilities are the ones the posterior consumed | `tests/test_lag_map.py` |
 | **The bounded source reach** $R_U$ | the window mask, measured rather than computed | `tests/test_source_window.py` |
-| **No recurrence and no time-pooling normaliser** in the history path | none is constructed; the surviving `GroupNorm`s are enumerated and each asserted to be under `horizon_core.`, where they pool the *forecast* axis of one anchor | `tests/test_construct.py` |
-| **`lag_attn.W_o` frozen** | the head-structured posterior consumes the per-head summaries, so `W_o` receives no gradient; freezing drops it from DDP's expectation set | `tests/test_construct.py` |
+| **No recurrence and no time-pooling normaliser** in the history path | none is constructed on either gate, adapter or encoder; the horizon core's `GroupNorm`s pool the *forecast* axis of one anchor | `tests/test_construct.py` |
+| **`lag_attn.W_o` frozen** | the head-structured posterior consumes the per-head summaries, so `W_o` receives no gradient; freezing drops it from DDP's expectation set | `tests/test_ddp_reachability.py` |
 
 Two conventions run through the whole suite and are not optional here. **Every positive invariant
 test is paired with a probe-is-not-vacuous negative test** — the KL is identically zero at
@@ -655,9 +653,9 @@ fails on the development box rather than confounding its own result days later.
 
 ## 13. Configuration keys
 
-`tests/test_docs.py` drives this section against `configs/default.yaml` in both directions, so it
-cannot drift: every key in the first list below must exist, every key in the second must not, and
-every `model_config.VAE_model` key the shipped config carries must appear in the first. Outside
+Every key in the first list below is one `configs/default.yaml` sets, and every key in the second
+is one it must not; `tests/test_config_load.py` checks that every `model_config.VAE_model` key the
+shipped config carries reaches the constructor or the task. Outside
 `VAE_model` the first list is the set this document's claims depend on rather than an exhaustive
 inventory of the framework's own settings.
 

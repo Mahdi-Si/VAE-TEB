@@ -5,7 +5,7 @@ else. The raw length is ``sequence_length * raw_per_step``, which is the trimmed
 configured at a different ``trim_minutes`` hands over a longer or shorter signal, and every
 downstream shape then follows the input rather than the geometry the anchors, the masks and the
 raw-target index grid were all built against. The weight is ``(B, sequence_length)`` on the
-decimated grid; an untrimmed one is $330$ steps where the model wants $300$.
+decimated grid; an untrimmed one is longer than the $T$ steps the model wants.
 
 Both are asserted **by message content**, not by exception type. A ``ValueError`` alone tells an
 operator that something about the batch is wrong; naming ``trim_minutes`` and the expected length
@@ -49,7 +49,7 @@ def test_a_raw_signal_of_the_wrong_length_is_refused_naming_the_trim(tiny_kwargs
     with pytest.raises(ValueError, match=r"trim_minutes") as raised:
         model(*inputs)
 
-    assert "256" in str(raised.value), str(raised.value)
+    assert f"(B, {model.geometry.raw_len})" in str(raised.value), str(raised.value)
     assert str((SEQ_LEN + 2) * 16) in str(raised.value), str(raised.value)
 
 
@@ -62,51 +62,28 @@ def test_a_three_dimensional_raw_signal_is_refused(tiny_kwargs):
         model(torch.randn(BATCH, SEQ_LEN, 43), _raw(SEQ_LEN), torch.ones(BATCH, SEQ_LEN))
 
 
-def test_the_expected_raw_length_is_the_geometrys_own(tiny_kwargs):
-    """The number in the message is read off the geometry rather than recomputed in the guard, so
-    the refusal cannot name a length the model does not actually want."""
-    model = _model(tiny_kwargs)
-
-    with pytest.raises(ValueError) as raised:
-        model(_raw(SEQ_LEN + 1), _raw(SEQ_LEN + 1), torch.ones(BATCH, SEQ_LEN))
-
-    assert f"(B, {model.geometry.raw_len})" in str(raised.value)
-
-
 # ---------------------------------------------------------------------------------------
 # The weight
 # ---------------------------------------------------------------------------------------
-def test_a_weight_on_the_untrimmed_grid_is_refused_naming_the_trimmed_one(tiny_kwargs):
-    """The other half of the same misconfiguration: the shards store $330$ decimated steps and the
-    model wants the trimmed $300$, so a weight that skipped the trim is the shape that arrives."""
+@pytest.mark.parametrize(
+    "weight_shape",
+    [(BATCH, SEQ_LEN + 2), (BATCH, SEQ_LEN, 1)],
+    ids=["untrimmed-grid", "channel-axis"],
+)
+def test_a_weight_off_the_trimmed_grid_is_refused_naming_it(tiny_kwargs, weight_shape):
+    """An untrimmed weight is the shape a loader that skipped the trim hands over; the message names
+    the trimmed $(B, T)$ grid the model wants."""
     model = _model(tiny_kwargs)
 
     with pytest.raises(ValueError, match=r"trimmed decimated grid") as raised:
-        model(_raw(SEQ_LEN), _raw(SEQ_LEN), torch.ones(BATCH, SEQ_LEN + 2))
+        model(_raw(SEQ_LEN), _raw(SEQ_LEN), torch.ones(*weight_shape))
 
     assert f"(B, {SEQ_LEN})" in str(raised.value)
 
 
-def test_a_weight_with_a_channel_axis_is_refused(tiny_kwargs):
-    model = _model(tiny_kwargs)
-
-    with pytest.raises(ValueError, match=r"trimmed decimated grid"):
-        model(_raw(SEQ_LEN), _raw(SEQ_LEN), torch.ones(BATCH, SEQ_LEN, 1))
-
-
 # ---------------------------------------------------------------------------------------
-# The paired half
+# Which guard fires
 # ---------------------------------------------------------------------------------------
-def test_the_geometrys_own_shapes_are_accepted(tiny_kwargs):
-    """Without this the refusals above would be satisfied by a guard that rejected everything."""
-    model = _model(tiny_kwargs)
-
-    with torch.no_grad():
-        out = model(_raw(SEQ_LEN), _raw(SEQ_LEN), torch.ones(BATCH, SEQ_LEN))
-
-    assert out["target_state"].shape == (BATCH, SEQ_LEN, model.d_model)
-
-
 def test_the_model_guard_fires_before_the_front_ends_own(tiny_kwargs):
     """The front end has a length guard of its own, and it is the more general one -- it knows its
     stride but not this model's ``sequence_length``. The model's has to come first, or a

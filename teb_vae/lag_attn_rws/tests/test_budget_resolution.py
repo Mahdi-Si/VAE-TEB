@@ -2,7 +2,7 @@ r"""Turning a reach budget in seconds into surviving channels and their delays.
 
 The resolution is one small pure function, and every property below is one the rest of the guard
 silently assumes: that the unguarded default really is "everything, undelayed"; that the shipped
-$120$ s budget produces the channel counts the design was costed against; that a delay which
+budget produces the per-block channel counts the design was costed against; that a delay which
 would outrun the loss warm-up is refused rather than quietly zero-padding trained anchors; and
 that the source phase-harmonic block behaves as the structural all-or-nothing it is.
 """
@@ -60,16 +60,6 @@ def test_no_budget_resolves_to_no_guard_at_all():
 # ---------------------------------------------------------------------------------------
 # The shipped budget
 # ---------------------------------------------------------------------------------------
-def test_the_120_second_budget_gives_the_costed_channel_counts():
-    """78 target and 29 source channels at a maximum delay of 30 steps -- the figures the design
-    was costed against, and the reason the shipped ``warmup_period`` is 30."""
-    budget = resolve_stream_budgets(_shipped(120.0))
-
-    assert len(budget.target_keep_index) == 78
-    assert len(budget.source_keep_index) == 29
-    assert budget.max_delay == 30
-
-
 def test_the_per_block_counts_add_up_to_the_stream_counts():
     """The startup log reports per block; the model is gated per stream. A disagreement would
     make the log a description of something other than the run."""

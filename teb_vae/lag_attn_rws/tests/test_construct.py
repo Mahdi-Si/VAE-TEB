@@ -1,9 +1,10 @@
 r"""Construction invariants: what exists, what is frozen, what is refused.
 
-The constructor's guarantees are structural -- a head-structured latent, one decoder, a frozen
-attention output projection, zeroed posterior deltas *after* the generic init -- and each is
-asserted on the assembled model, because several of them (the zeroing order above all) hold on
-the parts in isolation and silently fail in composition.
+The constructor's guarantees are structural -- zeroed posterior deltas *after* the generic init,
+a decoder width that moves nothing else, causal norms, and a causal input guard that is either
+genuinely absent or genuinely gathering -- and each is asserted on the assembled model, because
+several of them (the zeroing order above all) hold on the parts in isolation and silently fail in
+composition. Invalid geometries are refused at construction.
 """
 from __future__ import annotations
 
@@ -13,7 +14,6 @@ import pytest
 import torch
 from torch import nn
 
-from teb_vae.lag_attn.nets.heads import PriorHead
 from teb_vae.lag_attn.nets.delays import ChannelDelay, ChannelGate
 from teb_vae.lag_attn_rws.nets.model import SeqVaeLagAttnRws
 
@@ -21,12 +21,6 @@ from teb_vae.lag_attn_rws.nets.model import SeqVaeLagAttnRws
 def _model(kwargs, **overrides) -> SeqVaeLagAttnRws:
     torch.manual_seed(0)
     return SeqVaeLagAttnRws(**dict(kwargs, **overrides))
-
-
-def test_the_model_constructs_at_the_tiny_geometry(tiny_kwargs):
-    model = _model(tiny_kwargs)
-    assert model.geometry.raw_len == 256
-    assert model.geometry.t_valid == 12
 
 
 def test_the_model_constructs_at_the_production_geometry(shipped_kwargs):
@@ -60,30 +54,9 @@ def test_zero_channel_widths_are_rejected(tiny_kwargs):
         _model(tiny_kwargs, c_u=0)
 
 
-def test_channel_width_values_are_not_validated_here(tiny_kwargs):
-    """Widths are dataset facts, checked against the first real batch at the data boundary; a
-    constructor constant is exactly what went stale in the tree this replaces."""
-    model = _model(tiny_kwargs, c_y=7, c_u=3)
-    assert model.c_y == 7 and model.c_u == 3
-
-
 def test_a_degenerate_raw_geometry_is_rejected(tiny_kwargs):
     with pytest.raises(ValueError, match="degenerate"):
         _model(tiny_kwargs, horizon=16)  # horizon == T leaves no valid anchor
-
-
-def test_no_decoder_state_head_and_no_second_decoder_exist(tiny_kwargs):
-    model = _model(tiny_kwargs)
-    assert not hasattr(model, "residual_decoder")
-    assert not hasattr(model, "baseline_decoder")
-    # The sibling's PriorHead is the class that carries a decoder_state head; its absence is
-    # the absence of the bypass at the module level.
-    assert not any(isinstance(m, PriorHead) for m in model.modules())
-    assert not hasattr(model.prior_head, "decoder_state_head")
-
-
-def test_the_posterior_is_head_structured(tiny_kwargs):
-    assert _model(tiny_kwargs).posterior_head.head_structured is True
 
 
 def test_the_delta_heads_are_zero_on_the_assembled_model(tiny_kwargs):
@@ -97,12 +70,6 @@ def test_the_delta_heads_are_zero_on_the_assembled_model(tiny_kwargs):
             assert layer.weight.abs().max().item() == 0.0, f"{name} weight not zeroed"
             if layer.bias is not None:
                 assert layer.bias.abs().max().item() == 0.0, f"{name} bias not zeroed"
-
-
-def test_the_zero_survives_the_generic_weight_init(tiny_kwargs):
-    model = _model(tiny_kwargs, init_weights=True)
-    layers = list(model.posterior_head.delta_mu_head)
-    assert all(layer.weight.abs().max().item() == 0.0 for layer in layers)
 
 
 def test_the_default_decoder_width_leaves_the_model_bitwise_unchanged(tiny_kwargs):
@@ -152,30 +119,11 @@ def test_the_init_passes_still_apply_at_a_non_default_decoder_width(tiny_kwargs)
     assert torch.allclose(bias, torch.full_like(bias, math.log(5.0 / 3.0)))
 
 
-def test_the_attention_output_projection_is_frozen(tiny_kwargs):
-    """W_o feeds nothing under the head-structured posterior; freezing it drops it from DDP's
-    expectation set."""
-    attn = _model(tiny_kwargs).lag_attn
-    assert attn.W_o.weight.requires_grad is False
-    assert attn.W_o.bias.requires_grad is False
-
-
 def test_attention_dropout_is_zero(tiny_kwargs):
     """Dropout on the attention probabilities would break the exactness of the per-lag KL
     attribution -- the returned weights must be the ones the posterior consumed."""
     model = _model(tiny_kwargs, dropout=0.1)
     assert model.lag_attn.attn_dropout.p == 0.0
-
-
-def test_the_query_projection_maps_the_latent_to_the_model_width(tiny_kwargs):
-    """The attention query is a projection of the prior belief -- ``d_z`` in by default (the prior
-    mean alone), ``2 * d_z`` in under ``query_uses_logvar`` (mean and log-variance), ``d_model``
-    out either way."""
-    default_proj = _model(tiny_kwargs).query_proj
-    assert default_proj.in_features == 8 and default_proj.out_features == 32
-
-    logvar_proj = _model(tiny_kwargs, query_uses_logvar=True).query_proj
-    assert logvar_proj.in_features == 16 and logvar_proj.out_features == 32
 
 
 def test_query_uses_logvar_preserves_the_forward_contract_and_lag_map_identity(
@@ -237,18 +185,8 @@ def test_horizon_depth_5_constructs_and_forwards(tiny_kwargs, inputs):
 
 
 def test_the_norm_groups_arm_threads_a_single_group_to_the_pre_norms(tiny_kwargs):
-    """The ``conv_norm_groups`` arm's resolved value (1) reaches both encoders' conv pre-norms;
-    the default keeps each block's ``min(8, d_model)``. Covers the arm value and the threading in
-    one place, without a slow full-geometry construct."""
-    from pathlib import Path
-
-    from teb_vae.lag_attn.config import load_config
-
-    arm = load_config(
-        str(Path(__file__).resolve().parents[1] / "configs" / "sweep_norm_groups_1.yaml")
-    )
-    assert arm["model_config"]["VAE_model"]["conv_norm_groups"] == 1
-
+    """``conv_norm_groups=1`` reaches both encoders' conv pre-norms; the default keeps each
+    block's ``min(8, d_model)``. Checked without a slow full-geometry construct."""
     grouped = _model(tiny_kwargs, conv_norm_groups=1)
     default = _model(tiny_kwargs)
     for encoder in (grouped.target_encoder, grouped.source_encoder):

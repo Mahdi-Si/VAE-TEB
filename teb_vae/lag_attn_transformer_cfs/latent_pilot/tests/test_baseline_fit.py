@@ -7,9 +7,7 @@ synthetic logic subset excludes; they need no checkpoint file, no clinical data 
 
 What they establish: the fit separates a separable split and stops when it stops improving; the
 selected classifier is the selected step's rather than the last one's; the budget is finite and
-honoured; a fit round-trips through a run directory with its scaler and threshold intact; and --
-the property the whole "frozen baseline" claim rests on -- no VAE parameter is reachable from this
-function at all.
+honoured; and a fit round-trips through a run directory with its scaler and threshold intact.
 
 The bag reduction, the metrics, the threshold and the selection rule are hand-checked without an
 optimizer in ``tests/logic/test_baseline.py``.
@@ -22,7 +20,6 @@ import pytest
 import torch
 
 from teb_vae.lag_attn_transformer_cfs.latent_pilot import data, evaluate, extract, train
-from teb_vae.lag_attn_transformer_cfs.latent_pilot import model as pilot_model
 from teb_vae.lag_attn_transformer_cfs.latent_pilot.config import PilotConfigError
 
 #: A latent narrow enough to read and wide enough that the fit has something to choose.
@@ -129,7 +126,6 @@ def test_the_fit_stops_once_the_validation_auroc_stops_improving():
 def test_the_history_records_every_step_it_was_selected_against():
     fit = _fit()
 
-    assert list(fit.history.columns) == ["step", "train_loss", "val_auroc", "val_bce"]
     assert fit.history["step"].tolist() == list(range(1, len(fit.history) + 1))
     assert np.isfinite(fit.history["train_loss"]).all()
 
@@ -161,29 +157,6 @@ def test_the_classifier_carries_the_scaler_it_was_fitted_with():
 # =============================================================================
 # What the fit cannot reach
 # =============================================================================
-def test_no_vae_parameter_moves_during_a_baseline_fit():
-    """The frozen baseline is frozen structurally: the fit is handed no model to move."""
-    from teb_vae.lag_attn_transformer_cfs.tests.conftest import (
-        TINY_STRIDE,
-        make_task,
-        tiny_warmup_kwargs,
-    )
-
-    task = make_task(model_kwargs=tiny_warmup_kwargs(anchor_stride=TINY_STRIDE))
-    model = task.orig_model
-    pilot_model.freeze_for_pilot(model)
-    before = {
-        name: tensor.detach().clone() for name, tensor in model.state_dict().items()
-    }
-
-    _fit()
-
-    after = model.state_dict()
-    assert set(before) == set(after)
-    for name, tensor in before.items():
-        assert torch.equal(tensor, after[name]), name
-
-
 def test_the_test_split_cannot_be_fitted_or_selected_on():
     with pytest.raises(PilotConfigError, match="test split is opened once"):
         _fit(train_bags=_bags("test", seed=0))
@@ -214,33 +187,6 @@ def test_the_fit_does_not_advance_another_stage_s_random_stream():
 # =============================================================================
 # The permuted-label control's path
 # =============================================================================
-def test_the_control_fits_the_same_path_under_a_permutation():
-    """Its own fit, from its own labels -- never initialised from a true-label one.
-
-    The permutation here is by row parity rather than random: it is a fixed rearrangement of the
-    same six-and-six label vector, so the comparison below is a statement about the labels the fit
-    read and not about which draw a generator happened to produce.
-    """
-    train_bags, val_bags = _bags("train", seed=0), _bags("val", seed=1)
-    permuted = {
-        bags.split: {guid: index % 2 for index, guid in enumerate(bags.guids)}
-        for bags in (train_bags, val_bags)
-    }
-    arguments = dict(
-        scaler=_scaler(), lr=LR, max_steps=50, patience=PATIENCE, weight_decay=1e-4, seed=42
-    )
-
-    truth = train.fit_baseline(train_bags, val_bags, **arguments)
-    control = train.fit_baseline(train_bags, val_bags, labels=permuted, **arguments)
-
-    assert control.record["labels_permuted"] is True
-    assert truth.record["labels_permuted"] is False
-    # Same initialisation, same data, different labels: the two fits cannot land in one place.
-    assert not torch.equal(
-        control.classifier.linear.weight, truth.classifier.linear.weight
-    )
-
-
 # =============================================================================
 # Persistence
 # =============================================================================

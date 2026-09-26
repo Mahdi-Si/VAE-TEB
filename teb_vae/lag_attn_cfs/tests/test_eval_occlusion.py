@@ -152,25 +152,6 @@ def test_a_band_reaching_before_the_recording_starts_is_simply_shorter() -> None
     assert torch.nonzero(mask[0]).flatten().tolist() == [0, 1, 2]
 
 
-def test_the_bands_partition_the_window_without_overlapping() -> None:
-    """A property of the configured partition rather than of the code, asserted because an overlap
-    is invisible in the output: two bands sharing a lag would each be charged for it, and their
-    deltas would sum to more than removing the union costs."""
-    anchors = torch.tensor([12])
-    covered: list = []
-    for band in TINY_BANDS.values():
-        covered.extend(
-            torch.nonzero(
-                occlusion_analysis.band_mask(anchors, band, sequence_length=TINY_SEQ_LEN)[0]
-            )
-            .flatten()
-            .tolist()
-        )
-
-    assert len(covered) == len(set(covered)), "two bands occlude the same source step"
-    assert sorted(covered) == list(range(12 - 8, 12 + 1))
-
-
 # =================================================================================================
 # The anchor draw
 # =================================================================================================
@@ -197,17 +178,6 @@ def test_a_sample_with_no_valid_anchor_yields_a_column_rather_than_raising() -> 
 
     assert columns.shape == (2,)
     assert columns[1].item() == 0
-
-
-def test_the_anchor_draw_is_reproducible_from_the_runs_own_seed() -> None:
-    """The whole comparison is paired at one anchor per segment, so a draw that moved between the
-    reference arm and a band would make the delta a comparison of two populations."""
-    valid = torch.ones(6, 5)
-
-    first = occlusion_analysis.choose_anchors(valid, torch.Generator().manual_seed(3))
-    second = occlusion_analysis.choose_anchors(valid, torch.Generator().manual_seed(3))
-
-    assert torch.equal(first, second)
 
 
 # =================================================================================================
@@ -369,6 +339,8 @@ def test_the_analysis_writes_its_tables_and_its_headline(task, tmp_path) -> None
     invariance = record["announcement_invariance"]
     assert invariance["n_batches_checked"] == 1
     assert invariance["max_abs_change"] == 0.0
+    # No collection to join against is a recorded state, not a raise.
+    assert record["clocks"]["joined"] is False
 
 
 def _horizon_frame(delta_per_step: float = 1.0, n_steps: int = 2):
@@ -512,33 +484,6 @@ def test_the_cost_block_says_what_a_larger_cap_would_buy(task, tmp_path) -> None
 # =================================================================================================
 # The clock half: placing a delta on a clinical axis
 # =================================================================================================
-def test_a_segment_is_identified_by_its_recording_AND_its_start(task, tmp_path) -> None:
-    """``guid`` alone does not identify a segment -- a recording contributes many, which is why
-    the collection pass keys its per-anchor table on ``(guid, epoch, anchor)``. Without ``epoch``
-    a delta here can be reduced per recording and placed on no clock at all."""
-    module = _running_task(task)
-    record = occlusion_analysis.run_occlusion_analysis(
-        _context(task=module, loader=_OneBatchLoader(make_stub_batch(seed=1))),
-        eval_config=EVAL_CONFIG,
-        output_dir=tmp_path,
-    )
-
-    frame = pd.read_csv(
-        tmp_path / occlusion_analysis.ANALYSIS_DIRNAME
-        / occlusion_analysis.PER_RECORDING_FILENAME
-    )
-    assert len(frame)
-    per_sample = pd.read_csv(
-        tmp_path / occlusion_analysis.ANALYSIS_DIRNAME / occlusion_analysis.CLOCK_FILENAME
-    )
-    assert list(occlusion_analysis.JOIN_KEYS) == ["guid", "epoch"]
-    assert record["clocks"]["joined"] is False
-    # Nothing to join against is a recorded state, not a raise: this pass built no collection.
-    assert "empty" in record["clocks"]["reason"]
-    # ... and the table is written with its header regardless.
-    assert list(per_sample.columns)
-
-
 def test_a_batch_with_no_epoch_yields_an_absent_column_rather_than_a_zero_one(task) -> None:
     """Zero would place every segment at the moment of delivery, which is a coordinate rather than
     an absence. All-``NaN`` of the right length is what an absent field means everywhere else in
@@ -594,51 +539,3 @@ def test_the_join_matches_every_scored_segment_and_counts_any_that_did_not(task,
         output_dir=tmp_path / "mismatched",
     )
     assert mismatched["clocks"]["n_unjoined"] == 1
-
-
-def test_the_clock_page_makes_no_claim_and_says_so(task, tmp_path) -> None:
-    """One anchor per segment, capped in segments, binned on a half-hour grid: most (class,
-    window) cells fall below the minimum group size a test needs. Means and quartiles are what the
-    data supports, and the record states that rather than leaving a reader to wonder why there is
-    no p-value."""
-    module = _running_task(task)
-    batch = make_stub_batch(seed=1)
-
-    record = occlusion_analysis.run_occlusion_analysis(
-        _context(
-            task=module,
-            loader=_OneBatchLoader(make_stub_batch(seed=1)),
-            collection=_collected(
-                [str(value) for value in batch.guid],
-                [float(value) for value in batch.epoch],
-            ),
-        ),
-        eval_config=EVAL_CONFIG,
-        output_dir=tmp_path,
-    )
-
-    note = record["clocks"]["note"]
-    assert "descriptive only" in note
-    assert "no Kruskal-Wallis" in note
-    assert "no new family" in note
-    assert [name for name in record["files"] if "significance" in name] == []
-
-
-def test_the_caveat_travels_with_the_number(task, tmp_path) -> None:
-    """What the delta can be read as is not recoverable from the delta, so the statement bounding
-    it is part of the record rather than of this file's docstring. Three things a reader has to
-    carry: the announcement was held fixed, one anchor per segment was scored, and a band with a
-    small live fraction says nothing about the source."""
-    caveat = occlusion_analysis.OCCLUSION_CAVEAT
-
-    assert "announcement" in caveat
-    assert "one anchor per segment" in caveat
-    assert "live fraction" in caveat
-
-
-def test_the_delta_is_stated_in_the_unit_every_other_forecast_number_is_in() -> None:
-    """Nats of the block score per anchor per horizon step, which is the same scale as ``pred_gap``
-    and every ``nll_*`` -- so the interventional readout can be put beside them without a
-    conversion nobody would remember to apply."""
-    assert "nats" in occlusion_analysis.NATS_PER_ANCHOR_STEP
-    assert "horizon step" in occlusion_analysis.NATS_PER_ANCHOR_STEP

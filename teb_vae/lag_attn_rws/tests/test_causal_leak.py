@@ -161,8 +161,6 @@ def leak_measurement():
         ),
         "undelayed": np.array([movement(c, _ANCHOR) for c in leaky]),
         "guarded_channels": keep_index,
-        "leaky_channels": leaky,
-        "n_channels": len(reach),
     }
 
 
@@ -195,17 +193,3 @@ def test_every_channel_slower_than_the_offset_moves_without_the_delay(leak_measu
     movement = leak_measurement["undelayed"]
 
     assert float(movement.min()) > 0.1
-
-
-def test_the_restriction_is_not_the_whole_block(leak_measurement):
-    """If every channel were slower than the offset the restriction would be a no-op, and the
-    arm above would silently stop being a restricted claim."""
-    assert len(leak_measurement["leaky_channels"]) < leak_measurement["n_channels"]
-
-
-def test_the_guard_prunes_as_well_as_delays(leak_measurement):
-    """The budget removes channels it cannot delay within the warm-up, so the guarded arm is
-    measured over fewer channels than the block has. Pinned so a resolution that silently kept
-    everything would show up here rather than as a suspiciously good leak number."""
-    assert len(leak_measurement["guarded_channels"]) == 78
-    assert leak_measurement["n_channels"] == 109

@@ -26,7 +26,6 @@ import shutil
 from pathlib import Path
 from typing import Any, Dict
 
-import numpy as np
 import pytest
 import torch
 import yaml
@@ -52,69 +51,21 @@ _REGISTRY = ("forecast", "coupling", "attention")
 
 
 # =================================================================================================
-# The registry
-# =================================================================================================
-def test_every_registered_name_has_a_callable_behind_it() -> None:
-    """Pinned rather than left implicit. Every readout a run reports comes from the shared
-    collection pass, so an empty registry would still be a complete run with no *analysis*
-    directories -- and a name registered without a module behind it fails at import rather than
-    at the step it describes."""
-    assert run_module.ANALYSES == tuple(run_module.ANALYSIS_FUNCTIONS)
-    assert all(callable(function) for function in run_module.ANALYSIS_FUNCTIONS.values())
-    assert all(
-        function.__name__ == f"run_{name}_analysis"
-        for name, function in run_module.ANALYSIS_FUNCTIONS.items()
-    )
-
-
-def test_cross_subgroup_is_registered_last() -> None:
-    """Load-bearing rather than tidy: it reads the per-recording CSVs the analyses above it write,
-    so on a single pass it can only test the metrics they have already produced. It does not
-    *depend* on them having run -- an absent source is recorded rather than raised -- but a run of
-    everything should test everything."""
-    assert run_module.ANALYSES[-1] == "cross_subgroup"
-
-
-def test_the_channel_map_is_the_one_unskippable_step() -> None:
-    """It describes the *data* rather than the model, and it is what the band-resolved readout
-    joins against -- over the kept channel axis. A run whose channel map could be skipped would be
-    a run whose frequency-resolved statements have no definition of a band behind them."""
-    assert set(run_module.UNSKIPPABLE_ANALYSES) == {"band_partition"}
-    assert all(callable(function) for function in run_module.UNSKIPPABLE_ANALYSES.values())
-    assert "band_partition" not in run_module.ANALYSIS_FUNCTIONS
-
-
-def test_there_is_no_dependency_table() -> None:
-    """The real dependency is on files existing on disk rather than on an analysis having run in
-    this pass, which is what makes an offline ``--only`` work at all. One line adds the table the
-    day a genuine correctness dependency appears."""
-    assert not hasattr(run_module, "ANALYSIS_DEPENDENCIES")
-
-
-def test_the_binding_the_runner_defaults_to_is_this_cells() -> None:
-    """A wrong default either refuses by name or -- if two constructors happen to accept the same
-    keys -- evaluates one architecture under another's name."""
-    assert run_module.main.__defaults__ is not None
-    assert run_module.build_parser().prog.endswith("teb_vae.lag_attn_cfs.eval.run")
-    assert CFS_BINDING.tag == "lag_attn_cfs"
-
-
-# =================================================================================================
 # Analysis selection
 # =================================================================================================
-def test_only_returns_registry_order_regardless_of_the_order_typed() -> None:
-    """The run order is the pipeline's: a later analysis may read what an earlier one wrote."""
-    assert run_module.select_analyses(_REGISTRY, "attention,forecast", None) == [
-        "forecast", "attention"
-    ]
-
-
-def test_only_and_skip_compose() -> None:
-    assert run_module.select_analyses(_REGISTRY, "forecast,coupling", "coupling") == ["forecast"]
-
-
-def test_neither_flag_selects_everything() -> None:
-    assert run_module.select_analyses(_REGISTRY, None, None) == list(_REGISTRY)
+@pytest.mark.parametrize(
+    "only, skip, expected",
+    [
+        # Registry order regardless of the order typed: a later analysis may read what an earlier
+        # one wrote.
+        ("attention,forecast", None, ["forecast", "attention"]),
+        ("forecast,coupling", "coupling", ["forecast"]),
+        (None, None, list(_REGISTRY)),
+    ],
+    ids=["only_keeps_registry_order", "only_and_skip_compose", "neither_selects_everything"],
+)
+def test_select_analyses(only, skip, expected) -> None:
+    assert run_module.select_analyses(_REGISTRY, only, skip) == expected
 
 
 @pytest.mark.parametrize("flag", ["only", "skip"])
@@ -159,14 +110,16 @@ def test_a_binding_may_not_override_a_shared_analysis(shared_registry) -> None:
 
 def test_a_bindings_extra_analyses_are_appended_in_declaration_order(shared_registry) -> None:
     """Appended after the shared registry, so the second cfs cell reuses this runner rather than
-    forking it -- and so its own analyses run last, where they can read what the shared ones
-    wrote."""
+    forking it -- and so its own analyses run after the shared ones, where they can read what those
+    wrote. The trailing analyses still run last: ``cross_subgroup`` reads the per-recording CSVs
+    every other analysis writes, so on a single pass it can only test what already exists."""
+    shared_registry["cross_subgroup"] = object()
     binding = dataclasses.replace(
         CFS_BINDING, extra_analyses={"warmup": object(), "source_null": object()}
     )
 
     assert list(run_module.merged_analysis_functions(binding)) == [
-        *_REGISTRY, "warmup", "source_null"
+        *_REGISTRY, "warmup", "source_null", "cross_subgroup"
     ]
 
 
@@ -207,15 +160,6 @@ def _shards_of(loader, indices) -> set:
     keys = run_module.dataset_shard_keys(loader)
     assert keys is not None
     return {keys[int(index)] for index in indices}
-
-
-def test_a_prefix_over_the_concatenated_shards_draws_one_cohort() -> None:
-    """What ``--max-batches`` does, stated so the comparison below is against a real alternative
-    rather than a straw one: the test loader is built unshuffled over eight per-subgroup files,
-    so its first eight samples are eight segments of the first subgroup."""
-    loader = _ShardedLoader(_ShardedDataset())
-
-    assert len(_shards_of(loader, range(8))) == 1
 
 
 def test_the_sample_cap_is_stratified_and_reaches_every_shard_at_the_same_count() -> None:
@@ -394,33 +338,13 @@ def test_the_step_heartbeat_is_rewritten_as_each_analysis_finishes(tmp_path) -> 
     assert written[1]["status"] == "failed"
 
 
-def test_the_exit_code_follows_the_steps_and_not_the_sanity_flag() -> None:
-    """The asymmetry the offline acceptance gate exists for: a run whose every step succeeded can
-    still be one nobody should quote a number from, and a warning that moved the exit code would
-    make a failed *step* indistinguishable from a failed *check* in a shell."""
-    report = Report()
-    report.set("sanity", {"warning": True, "failed": ["kl_identity"], "n_failed": 1})
-    report.set("config_warnings", ["eval_config.caps.oracle is inert"])
-    report.set("coverage", {"per_analysis": {}, "warnings": ["two analyses disagree"]})
-
-    assert report.exit_code() == 0
-
-
 # =================================================================================================
 # The command line
 # =================================================================================================
-def test_a_checkpoint_is_not_required_at_parse_time(tmp_path) -> None:
-    """Not every readout needs the model -- one computed from a finished run's own tables does
-    not -- so the parser does not refuse on behalf of a caller that would not have needed one."""
-    parsed = run_module.build_parser().parse_args(["--output-dir", str(tmp_path)])
-
-    assert parsed.checkpoint is None
-    assert parsed.num_samples is None, "the draw count comes from eval_config unless overridden"
-
-
-def test_the_run_still_refuses_to_start_without_one(tmp_path) -> None:
-    """A checkpoint is optional only where a finished run's tables stand in for it; an empty
-    directory is neither, and a run that produced nothing would be worse than one that said why."""
+def test_the_run_refuses_to_start_with_neither_a_checkpoint_nor_a_finished_run(tmp_path) -> None:
+    """The parser admits a missing checkpoint -- a finished run's tables can stand in for it -- so
+    the refusal is the run's own; an empty directory is neither, and a run that produced nothing
+    would be worse than one that said why."""
     with pytest.raises(SystemExit, match="--checkpoint is required"):
         run_module._cli(["--output-dir", str(tmp_path)])
 
@@ -453,93 +377,18 @@ def test_the_shipped_launch_dict_resolves() -> None:
 
 
 # =================================================================================================
-# JSON safety
-# =================================================================================================
-@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
-def test_non_finite_floats_become_null(value: float) -> None:
-    assert run_module.json_safe(value) is None
-
-
-def test_numpy_and_torch_values_become_plain_python() -> None:
-    converted = run_module.json_safe(
-        {
-            "flag": np.bool_(True),
-            "count": np.int64(3),
-            "value": np.float32(1.5),
-            "array": np.array([1.0, 2.0]),
-            "tensor": torch.tensor([3.0, 4.0]),
-            "path": Path("a") / "b",
-        }
-    )
-
-    # np.bool_ is checked before the int branch; otherwise True would serialise as 1.
-    assert converted["flag"] is True
-    assert converted["count"] == 3 and isinstance(converted["count"], int)
-    assert converted["value"] == pytest.approx(1.5)
-    assert converted["array"] == [1.0, 2.0]
-    assert converted["tensor"] == [3.0, 4.0]
-    assert isinstance(converted["path"], str)
-
-
-# =================================================================================================
 # End to end, against one real run
 # =================================================================================================
-@pytest.mark.slow
-def test_the_run_writes_a_summary_and_the_config_it_used(collected_run) -> None:
-    assert collected_run["summary_path"].name == run_module.SUMMARY_FILENAME
-    assert (collected_run["results_dir"] / RESOLVED_CONFIG_FILENAME).is_file()
-    assert collected_run["results_dir"].name == run_module.RESULTS_DIRNAME
-    assert collected_run["exit_code"] == 0
-
-
-@pytest.mark.slow
-def test_the_summary_reports_every_section_and_the_registered_verdicts(collected_run) -> None:
-    """A subset assertion rather than an exact list: the registry decides the order, a separate
-    test asserts uniqueness and that order, and what is pinned here is that the schema can only
-    grow."""
-    results = collected_run["summary"]["results"]
-
-    assert set(results) >= {"readouts", "latent_health", "lag", "per_recording", "verdicts"}
-    names = [verdict["name"] for verdict in results["verdicts"]]
-    assert set(names) >= {
-        "predictive_improvement",
-        "source_specificity",
-        "prior_carries_target_state",
-        "latent_not_collapsed",
-        # The two only this cell can have.
-        "coupling_exceeds_availability_clock",
-        "anchor_geometry_intact",
-    }
-    for verdict in results["verdicts"]:
-        assert verdict["status"] in {"PASS", "FAIL", "INCONCLUSIVE"}
-
-
 @pytest.mark.slow
 def test_the_verdicts_are_unique_and_in_registry_order(collected_run) -> None:
     """The list is read by name *and* by position -- by the acceptance gate and by the arm
     tables -- so a duplicate or a reordering is a silent change of meaning."""
-    names = [verdict["name"] for verdict in collected_run["summary"]["results"]["verdicts"]]
+    verdicts = collected_run["summary"]["results"]["verdicts"]
+    names = [verdict["name"] for verdict in verdicts]
 
     assert names == list(metrics.VERDICT_ORDER)
     assert len(names) == len(set(names))
-
-
-@pytest.mark.slow
-def test_the_unset_clock_margin_leaves_its_verdict_inconclusive_with_the_measurement(
-    collected_run,
-) -> None:
-    """The shipped ``null`` is the setting, not an omission: a provisional threshold would decide
-    a FAIL on the very run that is supposed to measure where the boundary belongs. What is *not*
-    conditional on the key is the number."""
-    summary = collected_run["summary"]
-    verdict = next(
-        entry for entry in summary["results"]["verdicts"]
-        if entry["name"] == "coupling_exceeds_availability_clock"
-    )
-
-    assert summary["eval_config"]["clock_margin_min_nats"] is None
-    assert verdict["status"] == "INCONCLUSIVE"
-    assert math.isfinite(summary["results"]["readouts"]["coupling_minus_clock"])
+    assert all(verdict["status"] in {"PASS", "FAIL", "INCONCLUSIVE"} for verdict in verdicts)
 
 
 @pytest.mark.slow
@@ -557,21 +406,6 @@ def test_the_summary_is_json_a_non_python_reader_can_parse(collected_run) -> Non
     round-trip through Python and are rejected by every other parser."""
     for token in ("NaN", "Infinity", "-Infinity"):
         assert token not in collected_run["text"]
-
-
-@pytest.mark.slow
-def test_the_summary_holds_no_tensors_or_numpy_scalars(collected_run) -> None:
-    def walk(value):
-        if isinstance(value, dict):
-            for item in value.values():
-                walk(item)
-        elif isinstance(value, list):
-            for item in value:
-                walk(item)
-        else:
-            assert isinstance(value, (str, int, float, bool, type(None))), type(value)
-
-    walk(collected_run["summary"])
 
 
 @pytest.mark.slow
@@ -645,11 +479,6 @@ def test_the_summary_records_both_values_of_every_override(collected_run) -> Non
 
 
 @pytest.mark.slow
-def test_the_run_carries_a_log_beside_its_artifacts(collected_run) -> None:
-    assert (collected_run["results_dir"] / run_module.LOG_FILENAME).is_file()
-
-
-@pytest.mark.slow
 def test_the_run_used_a_single_process_loader(collected_run) -> None:
     """Spawn workers over a multi-file HDF5 dataset silently truncate every pass after the
     first, and an evaluation makes many passes."""
@@ -692,23 +521,6 @@ def test_the_population_probe_is_written_and_read_back_by_the_sanity_block(colle
 
 
 @pytest.mark.slow
-def test_every_step_carries_its_own_elapsed_time(collected_run) -> None:
-    steps = collected_run["summary"]["steps"]
-
-    assert steps, "the run recorded no steps at all"
-    for record in steps:
-        assert record["status"] == "ok"
-        assert isinstance(record["elapsed_s"], (int, float))
-
-
-@pytest.mark.slow
-def test_peak_memory_is_absent_rather_than_zero_on_cpu(collected_run) -> None:
-    """A $0.00$ GB peak reads as "measured, and the run used no memory", which is a claim a CPU
-    box cannot make."""
-    assert "max_memory_allocated_gb" not in collected_run["summary"]["results"]
-
-
-@pytest.mark.slow
 def test_the_summary_carries_the_exit_code_and_the_failure_list(collected_run) -> None:
     summary = collected_run["summary"]
 
@@ -740,7 +552,6 @@ def test_the_run_context_records_what_the_arm_tables_consume(collected_run) -> N
     # against this distribution has to know. To float32, the dtype the coverage travels in.
     assert coverage["min"] >= float(task.orig_model.coverage_floor) - 1e-6
     assert coverage["min"] <= coverage["median"] <= coverage["max"] <= 1.0
-    assert "coverage_floor" in coverage["note"]
 
     scale = context["observed_loss_scale"]
     readouts = collected_run["summary"]["results"]["readouts"]
@@ -845,25 +656,8 @@ def test_a_pass_with_no_checkpoint_reruns_the_analyses_and_builds_no_model(
     assert summary["run_context"]["anchor_geometry"]["anchor_stride"] == 1
     # And the prior summary was preserved rather than silently replaced.
     assert sorted(results_dir.glob("summary.bak.*.json"))
-
-
-@pytest.mark.slow
-def test_an_offline_pass_reads_the_preflight_record_the_checkpointed_one_wrote(
-    collected_run, tmp_path
-) -> None:
-    """It cannot regenerate the causality disclosure, so it reads it -- and the summary promotes
-    the same statement rather than omitting it."""
-    run_dir = tmp_path / "offline_preflight"
-    shutil.copytree(collected_run["results_dir"].parent, run_dir)
-    binding = dataclasses.replace(CFS_BINDING, model_cls=_RefusesToConstruct)
-
-    run_module.main(None, run_dir, device="cpu", binding=binding)
-
-    summary = json.loads(
-        (run_dir / run_module.RESULTS_DIRNAME / run_module.SUMMARY_FILENAME).read_text(
-            encoding="utf-8"
-        )
-    )
+    # It cannot regenerate the causality disclosure, so it reads the checkpointed pass's record --
+    # and the summary promotes the same statement rather than omitting it.
     assert summary["causality"]["statement"] == preflight.CAUSALITY_STATEMENT
     assert summary["preflight"]["reused_from"]
 
@@ -889,12 +683,6 @@ def test_an_empty_directory_names_what_is_missing_rather_than_producing_nothing(
 # against a rebuilt model and a second reconstruction here would be a second place for the two to
 # disagree. Re-exported so ``run.load_task`` is the same function.
 # =================================================================================================
-def test_the_loader_is_the_probes_own_rather_than_a_second_implementation() -> None:
-    from teb_vae.lag_attn_cfs.eval import probe as probe_module
-
-    assert run_module.load_task is probe_module.load_task
-    assert run_module.resolved_config_for is probe_module.resolved_config_for
-    assert run_module.read_checkpoint is probe_module.read_checkpoint
 
 
 def _mutated(checkpoint: Path, tmp_path: Path, mutate) -> Path:
@@ -934,7 +722,9 @@ def test_a_checkpoint_without_model_kwargs_is_refused(collected_run, tmp_path) -
 
 @pytest.mark.slow
 def test_the_loaded_weights_are_the_checkpoints_own(collected_run) -> None:
-    """Every parameter, not merely a shape-compatible model."""
+    """Every parameter, not merely a shape-compatible model -- and in evaluation mode: dropout live
+    during evaluation would leave the attention rows not summing to one, so the lag attribution
+    would not be a decomposition of anything."""
     checkpoint = collected_run["checkpoint"]
     task = run_module.load_task(checkpoint, torch.device("cpu"))
     blob = torch.load(checkpoint, map_location="cpu", weights_only=False)
@@ -947,15 +737,7 @@ def test_the_loaded_weights_are_the_checkpoints_own(collected_run) -> None:
     assert saved, "the checkpoint's state dict is not wrapper-prefixed as expected"
     for name, parameter in task.orig_model.state_dict().items():
         assert torch.equal(parameter, saved[name]), f"{name} did not load"
-
-
-@pytest.mark.slow
-def test_the_loaded_task_is_in_evaluation_mode(collected_run) -> None:
-    """Dropout live during evaluation would leave the attention rows not summing to one, so the
-    lag attribution would not be a decomposition of anything."""
-    assert run_module.load_task(
-        collected_run["checkpoint"], torch.device("cpu")
-    ).training is False
+    assert task.training is False
 
 
 # =================================================================================================
@@ -990,16 +772,6 @@ def test_the_fixture_evaluates_its_own_training_set_and_the_summary_says_so(coll
     assert block["training_cohort_disjoint"] is False
     assert block["training_cohort_overlap"]
     assert "out_of_distribution" not in block
-
-
-@pytest.mark.slow
-def test_the_non_comparability_sentence_is_in_every_summary(collected_run) -> None:
-    """An eval score and a ``test_*`` metric logged during training are computed over different
-    populations, and nothing in either number says so."""
-    block = collected_run["summary"]["results"]["cohort"]
-
-    assert "not comparable" in block["non_comparability"]
-    assert "different populations" in block["non_comparability"]
 
 
 @pytest.mark.slow

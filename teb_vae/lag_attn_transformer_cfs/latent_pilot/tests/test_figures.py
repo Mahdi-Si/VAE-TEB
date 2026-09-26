@@ -1,4 +1,4 @@
-r"""Every figure actually renders, on hand-built frames.
+r"""The figures survive the degenerate shapes a small cohort hands them, on hand-built frames.
 
 **Execution-machine test**, because it draws: it needs matplotlib and writes files, which the
 minimal logic subset does neither of. It needs no model, no checkpoint, no fixtures and no GPU --
@@ -10,7 +10,8 @@ What it establishes is that the panels survive the shapes a real run hands them,
 figure generator fails in practice rather than in principle: a group with no finite value, a bin no
 recording occupied, a recording present in one model's table and not the other's, and a projection
 whose explained variance is not a number. Every one of those is a legitimate state of a small
-cohort, and a run must not lose a completed pipeline at its final step because of one.
+cohort, and a run must not lose a completed pipeline at its final step because of one. The ordinary
+render of every captioned figure is asserted once, by the end-to-end smoke scenario.
 
 What it does not establish is that any figure is *right*: the numbers are invented and nothing here
 reads a value off a rendered panel.
@@ -96,17 +97,6 @@ def _bins(frame: pd.DataFrame, *, occupied=(0, 1, 4), seed: int = 0) -> pd.DataF
 # =============================================================================
 # Figure 1
 # =============================================================================
-def test_the_latent_space_figure_renders_both_versions(tmp_path):
-    frame, values = _bags()
-    written = pilot_report.figure_latent_space(
-        {"pretrained": (frame, values), "adapted": (frame, values + 0.3)},
-        _projection(), tmp_path, n_arrows=3, seed=0,
-    )
-    assert Path(written).is_file() and Path(written).stat().st_size > 0
-    assert Path(written).parent.name == pilot_report.FIGURE_DIRNAME
-    assert Path(written).suffix == ".png"
-
-
 def test_the_latent_space_figure_refuses_misaligned_values(tmp_path):
     frame, values = _bags()
     with pytest.raises(PilotConfigError):
@@ -147,20 +137,6 @@ def test_the_coverage_view_refuses_misaligned_values(tmp_path):
 # =============================================================================
 # Figure 2
 # =============================================================================
-def test_the_supervised_axis_figure_renders_one_panel_per_model(tmp_path):
-    frame, _values = _bags()
-    scores = np.linspace(-2.0, 2.0, len(frame))
-    written = pilot_report.figure_supervised_axis(
-        frame,
-        {"frozen": scores, "adapted": scores * 1.5},
-        tmp_path,
-        metrics={"frozen": {"auroc": 0.6, "average_precision": 0.3, "prevalence": 0.43,
-                            "n_recordings": len(frame)}},
-        thresholds={"frozen": 0.0, "adapted": 0.1},
-    )
-    assert Path(written).is_file() and Path(written).stat().st_size > 0
-
-
 def test_the_supervised_axis_figure_refuses_scores_that_do_not_align(tmp_path):
     frame, _values = _bags()
     with pytest.raises(PilotConfigError):
@@ -310,12 +286,6 @@ def _bin_tables(frame: pd.DataFrame):
     return metrics, curves
 
 
-def test_the_roc_and_pr_figure_renders_both_models(tmp_path):
-    curves, metrics = _classification_inputs(_classification_bins())
-    written = pilot_report.figure_roc_pr(curves, metrics, tmp_path)
-    assert Path(written).is_file() and Path(written).stat().st_size > 0
-
-
 def test_the_roc_figure_renders_when_no_population_carried_both_classes(tmp_path):
     """A cohort too degenerate to draw is a result, not a lost run."""
     from teb_vae.lag_attn_transformer_cfs.latent_pilot import evaluate
@@ -333,12 +303,6 @@ def test_the_roc_figure_renders_when_no_population_carried_both_classes(tmp_path
         )
     }
     assert Path(pilot_report.figure_roc_pr(curves, metrics, tmp_path)).is_file()
-
-
-def test_the_confusion_figure_renders_one_panel_per_model_and_a_rates_panel(tmp_path):
-    _curves, metrics = _classification_inputs(_classification_bins())
-    written = pilot_report.figure_confusion(metrics, tmp_path)
-    assert Path(written).is_file() and Path(written).stat().st_size > 0
 
 
 def test_the_confusion_figure_renders_with_one_model(tmp_path):

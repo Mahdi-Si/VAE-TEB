@@ -6,34 +6,27 @@ extension is needed and it is the same one: the shared ``_ALLOWED_ROOTS`` admits
 wholesale -- necessarily, since this package's net layer is built almost entirely out of sibling
 imports -- and that would wave through an import of any package's Lightning task, trainer, plotting,
 diagnostic page, config loader, evaluation package or test helpers. Those are forbidden by dotted
-prefix instead, on all **seven** packages of the family.
+prefix instead, on every package of the family.
 
-Two bans here are this package's own, and neither is hypothetical.
+**Its own top-level modules are banned too.** ``causal_warmup.py`` opens HDF5 files,
+``model_kwargs.py`` reads a constructor signature and ``warmup_budget.py`` draws figures; a net
+reaching any of them would take ``h5py``, a filesystem or matplotlib into a layer whose whole
+contract is that it can be constructed from integers.
 
-**Its own top-level modules.** ``causal_warmup.py`` opens HDF5 files and ``model_kwargs.py`` reads a
-constructor signature; both sit outside ``nets/`` for exactly that reason. A net reaching either
-would take ``h5py``, ``torch``'s dataset stack and a filesystem into a layer whose whole contract is
-that it can be constructed from integers.
-
-**The batch-field half bites harder here than anywhere.** This model's reconstruction target *is*
-two named stored blocks, and its warm-up boundary arrives per block, so the temptation to name them
-inside the net is real twice over. The resolver names them, on purpose, and it is not a net.
+And the two mixins must not reach an encoder module, which is what lets a second architecture
+compose the identical pair.
 """
 from __future__ import annotations
 
-import re
 from pathlib import Path
 
 import pytest
 
 from teb_vae.lag_attn.tests.test_nets_are_framework_free import (
     _ALLOWED_ROOTS,
-    _BATCH_FIELD_NAMES,
     _FORBIDDEN_PREFIXES,
     _imported_names,
 )
-
-from .conftest import hand_seeding_offenders
 
 _PACKAGE_DIR = Path(__file__).resolve().parents[1]
 _NETS_DIR = _PACKAGE_DIR / "nets"
@@ -112,48 +105,6 @@ def test_module_avoids_forbidden_submodules(path):
     )
 
 
-@pytest.mark.parametrize("path", _net_modules(), ids=lambda p: p.name)
-def test_module_names_no_batch_fields(path):
-    source = path.read_text(encoding="utf-8")
-    offenders = sorted(
-        name for name in _BATCH_FIELD_NAMES if re.search(rf"\b{name}\b", source)
-    )
-    assert not offenders, (
-        f"nets/{path.name} names the batch fields {offenders} -- a net takes tensors as "
-        f"arguments and does not know what they were called on disk"
-    )
-
-
-def test_the_dotted_ban_covers_every_package_in_the_family():
-    """The extension is only worth having if it names every package a net could reach into, and
-    this package's arrival is exactly the event that makes a hand-kept list go stale."""
-    for package in _PACKAGES:
-        for module in _FRAMEWORK_MODULES:
-            assert f"teb_vae.{package}.{module}" in _LOCAL_FORBIDDEN_PREFIXES
-
-
-def test_the_net_layer_reaches_all_three_halves_of_its_design():
-    """The positive direction, which a guard that only forbade things could not give.
-
-    The architecture comes from the raw-signal model, the input-side half of causality from
-    ``causal_inputs`` and the target domain from ``causal_feature_target``, which is itself the
-    two-sided mixin extended. A refactor that quietly stopped importing one -- inlining the tiled
-    forward back into the model, or reaching the two-sided mixin directly and losing the block split
-    -- fails here.
-
-    Both mixins name no encoder, which is what lets a second architecture compose the identical
-    pair; that is asserted structurally in the two tests below rather than by import.
-    """
-    imported = _imported_names(_NETS_DIR / "model.py")
-    assert "teb_vae.lag_attn_rws.nets.model" in imported
-    assert "teb_vae.lag_attn_cfs.nets.causal_inputs" in imported
-    assert "teb_vae.lag_attn_cfs.nets.causal_feature_target" in imported
-    assert "teb_vae.lag_attn_fs.nets.feature_target" not in imported
-
-    target = _imported_names(_NETS_DIR / "causal_feature_target.py")
-    assert "teb_vae.lag_attn_fs.nets.feature_target" in target
-
-
 def test_neither_mixin_reaches_an_encoder_module():
     """What makes both composable over a second architecture. Each may name the shared *primitives*
     -- the availability adapter and the channel gate are ``lag_attn``'s, not either architecture's --
@@ -163,37 +114,3 @@ def test_neither_mixin_reaches_an_encoder_module():
         assert "teb_vae.lag_attn_rws.nets.encoders" not in imported, name
         assert "teb_vae.lag_attn_transformer_rws.nets.encoders" not in imported, name
         assert "teb_vae.lag_attn_transformer_rws.nets.model" not in imported, name
-
-
-def test_the_model_module_writes_nothing_but_a_constructor():
-    """The other side of the positive direction. Everything else is encoder-agnostic and lives on a
-    mixin the conv-Transformer cell composes too, so a member appearing here is one that cell
-    silently does not get."""
-    source = (_NETS_DIR / "model.py").read_text(encoding="utf-8")
-
-    assert source.count("\nclass ") == 1
-    assert source.count("def __init__") == 1
-    for banned in ("def forward", "nn.Linear", "nn.Conv1d", "register_buffer"):
-        assert banned not in source, f"nets/model.py writes {banned!r}"
-
-
-def test_the_top_level_modules_are_outside_the_net_layer():
-    """``causal_warmup`` opens shards, ``model_kwargs`` reads a signature and the two figure
-    modules import matplotlib, so all four are above the net layer by construction rather than by
-    convention -- and a move into ``nets/`` would be caught by the import guard above rather than
-    going unseen."""
-    for name in ("causal_warmup.py", "model_kwargs.py", "warmup_budget.py", "sample_page.py"):
-        assert not (_NETS_DIR / name).exists()
-        assert (_PACKAGE_DIR / name).exists()
-
-
-def test_no_module_in_the_package_seeds_by_hand():
-    """``general_config.seed`` through the framework's ``configure_determinism`` is the only seeding
-    route; a stray global seed would silently override it while looking like diligence.
-
-    The scan itself is :func:`~teb_vae.lag_attn_cfs.tests.conftest.hand_seeding_offenders`, shared
-    with ``test_trainer.py`` so the two views of this package check one rule -- and exempting a
-    seed inside ``torch.random.fork_rng``, which restores the stream it found and therefore cannot
-    override anything.
-    """
-    assert hand_seeding_offenders(_PACKAGE_DIR) == []

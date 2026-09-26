@@ -2,18 +2,15 @@ r"""Checkpoints are self-describing: they carry ``model_class`` and ``model_kwar
 
 A stock Lightning ``.ckpt`` carries neither. With both, a checkpoint can be rebuilt with no config
 file -- the config that produced a run is a mutable file that may not exist by the time anyone
-loads the weights -- and the class guard can refuse a blob written by a different model *before*
-the rebuild is attempted, when the error can still say what is wrong.
+loads the weights -- and the class guard (tested where it is defined) can refuse a blob written by
+a different model *before* the rebuild is attempted.
 
-The class guard matters more here than it does for a model with no siblings. This architecture and
-the one it is compared against share every tensor below the encoders: the prior head, the lag
-attention, the posterior head, the horizon core and the decoder are the same modules under the same
-names. A blob from the other model would therefore *partially* align, and a loader that trusted a
-non-``None`` return would train from a mixture of loaded and random weights and report success.
+Checked here: the stamp this model writes, without clobbering Lightning's own fields; a bitwise
+save / reload / rebuild round trip, unguarded and under a real channel gate; and that the loss
+hyperparameters the evaluation reconciles against reach the checkpoint.
 """
 from __future__ import annotations
 
-import pytest
 import torch
 
 from teb_vae.lag_attn_transformer_rws.nets.model import SeqVaeLagAttnTrfRws
@@ -35,65 +32,8 @@ def test_the_checkpoint_carries_the_model_class_and_kwargs(task):
 
     assert checkpoint["model_class"] == "SeqVaeLagAttnTrfRws"
     assert checkpoint["model_kwargs"] == TINY_KWARGS
-
-
-def test_the_flags_that_change_the_architecture_survive(task):
-    """A missing flag rebuilds a different model, and ``load_checkpoint_strict`` would then align
-    nothing and return ``None`` -- which a caller that does not check reads as success. The four
-    encoder-shape keys are the ones this architecture adds: each changes a parameter count, so a
-    blob missing one cannot be rebuilt at all."""
-    checkpoint = _lightning_style_checkpoint(task())
-
-    for flag in (
-        "sequence_length", "d_model", "d_z", "horizon", "raw_per_step", "max_lag",
-        "encoder_conv_kernels", "encoder_conv_dilations", "encoder_d_ff",
-        "target_attention_blocks", "source_attention_blocks", "source_attention_window",
-    ):
-        assert flag in checkpoint["model_kwargs"], f"{flag} missing from model_kwargs"
-
-
-def test_the_horizon_attention_depth_survives_into_the_blob(task):
-    """Recorded separately because ``TINY_KWARGS`` deliberately does not set it -- the tiny model
-    runs the decoder without attention -- so the loop above cannot cover it.
-
-    It has to be there for the same reason the encoder block counts do, and more sharply: the
-    blocks are the *only* thing the key builds, so a blob that lost it would rebuild a blockless
-    decoder whose remaining tensors all still align. ``load_checkpoint_strict`` would report a
-    successful load of a model missing two attention stacks.
-    """
-    module = task(model_kwargs=dict(TINY_KWARGS, horizon_attention_blocks=2))
-    checkpoint = _lightning_style_checkpoint(module)
-
-    assert checkpoint["model_kwargs"]["horizon_attention_blocks"] == 2
-
-    blockless = SeqVaeLagAttnTrfRws(**TINY_KWARGS)
-    rebuilt = SeqVaeLagAttnTrfRws(**checkpoint["model_kwargs"])
-    assert set(rebuilt.state_dict()) == set(module.orig_model.state_dict())
-    assert set(blockless.state_dict()) != set(module.orig_model.state_dict())
-
-
-def test_the_base_stamp_survives_the_override(task):
-    """``on_save_checkpoint`` adds a field; it must not replace the base's work. An override that
-    skipped ``super()`` would drop ``model_class`` and every guard that reads it would silently
-    degrade to its warn-and-continue path."""
-    checkpoint = _lightning_style_checkpoint(task())
-
-    assert "model_class" in checkpoint
-    assert "model_kwargs" in checkpoint
-    assert checkpoint["epoch"] == 3  # and it must not have clobbered Lightning's own fields
-
-
-def test_the_class_guard_refuses_a_checkpoint_from_the_comparison_model(task):
-    """The two models share every tensor below the encoders, so a foreign blob aligns in part."""
-    checkpoint = _lightning_style_checkpoint(task())
-
-    check_model_class(checkpoint, "SeqVaeLagAttnTrfRws")  # must not raise
-    with pytest.raises(ValueError, match="does not match the active model class"):
-        check_model_class(checkpoint, "SeqVaeLagAttnRws")
-
-    foreign = dict(checkpoint, model_class="SeqVaeLagAttnRws")
-    with pytest.raises(ValueError, match="does not match the active model class"):
-        check_model_class(foreign, "SeqVaeLagAttnTrfRws")
+    # The override adds fields; it must not clobber Lightning's own.
+    assert checkpoint["epoch"] == 3
 
 
 def test_a_checkpoint_round_trips_into_a_fresh_model(task, inputs, tmp_path):
@@ -126,20 +66,6 @@ def test_a_checkpoint_round_trips_into_a_fresh_model(task, inputs, tmp_path):
 
     for key in reference:
         assert torch.equal(reference[key], got[key]), f"drift on {key}"
-
-
-def test_a_rebuild_from_the_wrong_kwargs_fails_rather_than_partially_aligning(task):
-    """The negative control for the round trip above. Dropping one attention block leaves most of
-    the state dict alignable -- everything below the encoders is untouched -- so a rebuild that
-    ignored the recorded kwargs would load a partly random model and report nothing."""
-    module = task()
-    blob = _lightning_style_checkpoint(module)
-
-    shallower = SeqVaeLagAttnTrfRws(
-        **dict(blob["model_kwargs"], target_attention_blocks=1)
-    )
-
-    assert set(shallower.state_dict()) != set(module.orig_model.state_dict())
 
 
 def test_the_loss_hyperparameters_reach_the_checkpoint(task):

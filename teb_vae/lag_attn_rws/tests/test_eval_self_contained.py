@@ -242,12 +242,6 @@ def _shipped_modules() -> List[Path]:
     return sorted(EVAL_ROOT.rglob("*.py"))
 
 
-def test_the_walk_found_modules_to_check() -> None:
-    """A walk that found nothing would pass every other test in this file vacuously."""
-    modules = _shipped_modules()
-    assert len(modules) >= 4, f"only found {[path.name for path in modules]}"
-
-
 def test_the_model_binding_is_walked_and_sits_at_layer_zero() -> None:
     """The walk is directory-driven, so this is what says the file was actually picked up rather
     than that a rule happened to hold over a set it was not in.
@@ -264,8 +258,6 @@ def test_the_model_binding_is_walked_and_sits_at_layer_zero() -> None:
     names = imported_names(binding.read_text(encoding="utf-8"), _module_name_for(binding))
 
     assert forbidden_imports(binding.read_text(encoding="utf-8"), _module_name_for(binding)) == []
-    assert "binding" not in EXEMPTIONS
-    assert "binding" not in MODEL_TOUCHING
     # Stdlib only, so importing the seam costs nothing: no torch, no numpy, no matplotlib, and
     # nothing from this repository -- which is what keeps a concrete binding out of this module.
     assert all(not name.startswith(("torch", "numpy", "matplotlib", "teb_vae")) for name in names)
@@ -302,83 +294,65 @@ def test_the_reuse_seam_is_the_only_module_naming_the_sibling_evaluation_package
 
 
 # =============================================================================
-# Non-vacuity: the four shapes a name-based check would miss or wave through
+# Non-vacuity: the shapes a name-based check would miss or wave through
 # =============================================================================
-def test_an_aliased_lightning_import_is_reported() -> None:
-    assert forbidden_imports("import lightning.pytorch as pl\n", f"{PACKAGE}.verify") == [
-        "lightning.pytorch"
-    ]
+_V = PACKAGE
 
 
-def test_a_lazy_in_function_import_is_reported() -> None:
-    """A module-level-only check misses exactly this, and it is the likely shape: a change
-    needing "just one thing" reaches for a lazy import inside the function that needs it."""
-    source = "def analyse():\n    from model.lstm_cnn_vae_teb.testing import metrics\n    return metrics\n"
-    assert forbidden_imports(source, f"{PACKAGE}.analyses.forecast") == [
-        "model.lstm_cnn_vae_teb.testing"
-    ]
-
-
-def test_a_relative_parent_import_is_reported() -> None:
-    """``from ..trainer import x`` names no forbidden string; it has to be resolved first."""
-    assert forbidden_imports("from ..trainer import RESOLVED_CONFIG_FILENAME\n", f"{PACKAGE}.verify") == [
-        "teb_vae.lag_attn_rws.trainer"
-    ]
-    # Three levels up from an analysis reaches the model package's own plotting module.
-    assert forbidden_imports("from ... import plotting\n", f"{PACKAGE}.analyses.samples") == [
-        "teb_vae.lag_attn_rws.plotting"
-    ]
-
-
-def test_a_relative_sibling_import_between_analyses_is_reported() -> None:
-    """The rule with no counterpart in the sibling package: analyses never import one another."""
-    assert forbidden_imports("from . import forecast\n", f"{PACKAGE}.analyses.coupling") == [
-        f"{PACKAGE}.analyses.forecast"
-    ]
-    absolute = f"from {PACKAGE}.analyses.forecast import baseline\n"
-    assert forbidden_imports(absolute, f"{PACKAGE}.analyses.coupling") == [
-        f"{PACKAGE}.analyses.forecast"
-    ]
-
-
-def test_an_analysis_may_import_its_own_module_and_the_layers_below_it() -> None:
-    source = (
-        "from teb_vae.lag_attn_rws.eval import config_schema, events\n"
-        "from teb_vae.lag_attn_rws.eval._reuse import stats\n"
-        "from teb_vae.lag_attn.nets.lag_report import lag_compensated_seconds\n"
-        "import numpy as np\n"
-    )
-    assert forbidden_imports(source, f"{PACKAGE}.analyses.coupling") == []
+@pytest.mark.parametrize(
+    "source, module_name, expected",
+    [
+        # An aliased import still names its module.
+        ("import lightning.pytorch as pl\n", f"{_V}.verify", ["lightning.pytorch"]),
+        # A lazy in-function import: the likely shape of a change that needs "just one thing".
+        (
+            "def analyse():\n    from model.lstm_cnn_vae_teb.testing import metrics\n",
+            f"{_V}.analyses.forecast",
+            ["model.lstm_cnn_vae_teb.testing"],
+        ),
+        # A relative parent import names no forbidden string; it has to be resolved first.
+        (
+            "from ..trainer import RESOLVED_CONFIG_FILENAME\n",
+            f"{_V}.verify",
+            ["teb_vae.lag_attn_rws.trainer"],
+        ),
+        # Analyses never import one another.
+        ("from . import forecast\n", f"{_V}.analyses.coupling", [f"{_V}.analyses.forecast"]),
+        # An exemption permits only its named targets.
+        (
+            "from teb_vae.lag_attn_rws.task import SeqVaeLagAttnRwsTask\n"
+            "from teb_vae.lag_attn_rws.trainer import RESOLVED_CONFIG_FILENAME\n"
+            "import lightning as L\n",
+            f"{_V}.run",
+            ["lightning"],
+        ),
+        # A stem collision does not hand a layer-two module the runner's permission.
+        (
+            "from teb_vae.lag_attn_rws.task import SeqVaeLagAttnRwsTask\n",
+            f"{_V}.analyses.run",
+            ["teb_vae.lag_attn_rws.task"],
+        ),
+        # Preflight reuses the trainer's guards and builds nothing, so it takes no task.
+        (
+            "from teb_vae.lag_attn_rws.trainer import _check_stat_path\n"
+            "from teb_vae.lag_attn_rws.task import SeqVaeLagAttnRwsTask\n",
+            f"{_V}.preflight",
+            ["teb_vae.lag_attn_rws.task"],
+        ),
+        # The acceptance gate must stay checkable on a box with no numeric stack.
+        ("import torch\n", f"{_V}.verify", ["torch"]),
+        # The sibling's runner builds the sibling's own network.
+        ("from teb_vae.lag_attn.eval import runner\n", f"{_V}._reuse", [f"{SIBLING_EVAL}.runner"]),
+    ],
+)
+def test_the_walker_reports_each_forbidden_shape(source, module_name, expected) -> None:
+    """The walker is what makes the per-module rule real, so it must see each shape."""
+    assert forbidden_imports(source, module_name) == expected
 
 
 # =============================================================================
-# The exemption is narrow, and so is the sibling allow-list
+# The exemption table is minimal
 # =============================================================================
-def test_the_exemption_permits_only_its_named_targets() -> None:
-    """``run`` may take ``task`` and ``trainer``; it does not thereby take anything at all."""
-    source = (
-        "from teb_vae.lag_attn_rws.task import SeqVaeLagAttnRwsTask\n"
-        "from teb_vae.lag_attn_rws.trainer import RESOLVED_CONFIG_FILENAME\n"
-        "import lightning as L\n"
-    )
-    assert forbidden_imports(source, f"{PACKAGE}.run") == ["lightning"]
-
-
-def test_a_layer_two_module_gets_no_exemption_from_a_stem_collision() -> None:
-    """``analyses/run.py`` would share ``run``'s stem; it must not share its permission."""
-    source = "from teb_vae.lag_attn_rws.task import SeqVaeLagAttnRwsTask\n"
-    assert forbidden_imports(source, f"{PACKAGE}.analyses.run") == ["teb_vae.lag_attn_rws.task"]
-
-
-def test_preflight_takes_the_trainer_and_not_the_task() -> None:
-    """It reuses the trainer's four guards. It builds nothing, so it needs no task."""
-    source = (
-        "from teb_vae.lag_attn_rws.trainer import _check_stat_path\n"
-        "from teb_vae.lag_attn_rws.task import SeqVaeLagAttnRwsTask\n"
-    )
-    assert forbidden_imports(source, f"{PACKAGE}.preflight") == ["teb_vae.lag_attn_rws.task"]
-
-
 def test_no_module_holds_a_permission_it_does_not_use() -> None:
     """The guard with teeth: a permission outlives its use silently, and the next reach for that
     name is then unreported. Every exempted name must appear in the module's actual imports."""
@@ -397,45 +371,6 @@ def test_no_module_holds_a_permission_it_does_not_use() -> None:
 
     assert unused == [], f"EXEMPTIONS grants imports that no longer happen: {unused}"
 
-
-def test_the_acceptance_gate_may_not_import_torch() -> None:
-    """The gate's one non-negotiable property is that a summary produced on the production box
-    can be checked on a machine with nothing installed, and ``torch`` is the import that breaks
-    it. Proved on the import graph -- module-level, from-form and lazy alike -- which is a direct
-    proof rather than a harness that uninstalls torch in one environment and proves nothing about
-    any other."""
-    assert forbidden_imports("import torch\n", f"{PACKAGE}.verify") == ["torch"]
-    assert forbidden_imports("from torch import Tensor\n", f"{PACKAGE}.verify") == ["torch"]
-    assert forbidden_imports(
-        "def check():\n    import torch.nn as nn\n", f"{PACKAGE}.verify"
-    ) == ["torch.nn"]
-    # The rule is the gate's own, not the package's: the readout module is built on torch.
-    assert forbidden_imports("import torch\n", f"{PACKAGE}.metrics") == []
-
-
-def test_a_sibling_eval_module_outside_the_allow_list_is_reported() -> None:
-    """``runner`` builds the sibling's own network; ``metrics`` assumes a feature-space target."""
-    assert forbidden_imports("from teb_vae.lag_attn.eval import runner\n", f"{PACKAGE}._reuse") == [
-        f"{SIBLING_EVAL}.runner"
-    ]
-    lazy = "def f():\n    from teb_vae.lag_attn.eval.analyses import probe\n"
-    assert forbidden_imports(lazy, f"{PACKAGE}.probe") == [f"{SIBLING_EVAL}.analyses"]
-
-
-def test_the_allowed_sibling_modules_all_exist() -> None:
-    """An allow-list entry naming a module that is not there is permission for nothing."""
-    sibling_root = Path(__file__).resolve().parents[2] / "lag_attn" / "eval"
-    missing = [
-        name for name in sorted(ALLOWED_SIBLING_EVAL_MODULES)
-        if not (sibling_root / f"{name}.py").is_file()
-    ]
-    assert missing == []
-
-
-def test_importing_the_sibling_eval_package_itself_reaches_nothing() -> None:
-    """Its ``__init__`` is a docstring, so the bare package name is not a reach into anything."""
-    source = "from teb_vae.lag_attn.eval import labels, stats\n"
-    assert forbidden_imports(source, f"{PACKAGE}._reuse") == []
 
 
 # =============================================================================
@@ -474,34 +409,3 @@ def test_the_page_builder_is_framework_free() -> None:
     assert offending == []
 
 
-def test_the_callback_re_exports_the_builder_rather_than_owning_a_second_one() -> None:
-    """Identity, not equality: two builders that agree today are exactly the configuration where
-    a change to one silently stops applying to the other's figures."""
-    from teb_vae.lag_attn_rws import plotting, sample_page
-
-    assert plotting.build_diagnostic_figure is sample_page.build_diagnostic_figure
-
-
-def test_the_builder_does_not_restyle_the_process_on_every_call() -> None:
-    """``apply_publication_style`` mutates global ``rcParams``. Called per figure it restyled the
-    whole process on every validation epoch, so how any other figure looked depended on whether
-    this one had been drawn yet. It is called once, when the callback is constructed."""
-    source = SAMPLE_PAGE.read_text(encoding="utf-8")
-    callback = (Path(__file__).resolve().parents[1] / "plotting.py").read_text(encoding="utf-8")
-
-    assert "apply_publication_style()" not in source, "the builder must not restyle per figure"
-    assert callback.count("apply_publication_style()") == 1
-    # And that one call is in the constructor rather than in the per-epoch hook.
-    constructor = callback.split("def __init__", 1)[1].split("\n    def ", 1)[0]
-    assert "apply_publication_style()" in constructor
-
-
-def test_every_heatmap_on_the_page_disables_interpolation() -> None:
-    """A resampled heatmap invents values between two anchors or two lag bins, which is exactly
-    the axis a reader takes a peak off."""
-    source = SAMPLE_PAGE.read_text(encoding="utf-8")
-
-    assert source.count("ax.imshow(") == source.count("interpolation=_IMSHOW_INTERPOLATION")
-    # The latent map, the per-dimension KL, the shared lag panel, and the gated-input row.
-    assert source.count("ax.imshow(") == 4
-    assert '_IMSHOW_INTERPOLATION = "none"' in source

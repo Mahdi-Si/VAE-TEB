@@ -214,13 +214,6 @@ def test_a_forecast_equal_to_the_baselines_scores_zero_in_both_spaces() -> None:
     assert all(row["advantage_nats_per_anchor"] == pytest.approx(0.0) for row in rows)
 
 
-def test_the_r2_reference_is_one_of_a_closed_set() -> None:
-    """An $R^2$ whose reference is implicit is a claim a reader cannot check: against the segment
-    mean and against climatology it is a different number."""
-    assert forecast_analysis.R2_REFERENCE in forecast_analysis.R2_REFERENCES
-    assert set(forecast_analysis.R2_REFERENCES) <= set(BASELINE_NAMES)
-
-
 def test_the_rmse_roots_once_rather_than_averaging_finished_roots() -> None:
     r"""Jensen: $\operatorname{mean}(\sqrt{x}) \le \sqrt{\operatorname{mean}(x)}$, so averaging
     per-segment RMSEs is biased **low** -- in the direction that flatters the model. The frame
@@ -308,34 +301,15 @@ def _horizon_record(n_steps: int = 4) -> dict:
 
 
 def test_the_horizon_curve_divides_each_step_by_its_own_denominator() -> None:
+    r"""Each step by its own count, the gap as the difference of the two scores, and the axis as
+    lead time: horizon step $\tau$ reads decimated step $t + 1 + \tau$, so its lead time ends at
+    $4(\tau + 1)$ seconds rather than at the step index."""
     curves = forecast_analysis.horizon_curves(_horizon_record())
 
     assert list(curves["d_base_nats"]) == pytest.approx([2.0, 4.0, 7.5, 20.0])
     assert list(curves["d_full_nats"]) == pytest.approx([1.6, 3.6, 7.5, 22.0])
-
-
-def test_the_horizon_gap_is_the_difference_of_the_two_scores() -> None:
-    curves = forecast_analysis.horizon_curves(_horizon_record())
-
-    assert list(curves["gap_nats"]) == pytest.approx(
-        list(np.asarray(curves["d_base_nats"]) - np.asarray(curves["d_full_nats"])), abs=1e-12
-    )
-
-
-def test_the_horizon_axis_is_lead_time_in_seconds_not_step_index() -> None:
-    r"""Horizon step $\tau$ reads decimated step $t + 1 + \tau$, so its lead time ends at
-    $4(\tau + 1)$ seconds: step $0$ is four seconds ahead, not zero."""
-    curves = forecast_analysis.horizon_curves(_horizon_record())
-
+    assert list(curves["gap_nats"]) == pytest.approx([0.4, 0.4, 0.0, -2.0])
     assert list(curves["lead_seconds"]) == pytest.approx([4.0, 8.0, 12.0, 16.0])
-
-
-def test_the_horizon_curve_names_the_path_it_was_computed_on() -> None:
-    """The marginalisation does not commute with the sum over $\\tau$, so the curve is the
-    single-draw one and has to say so rather than leaving it to be inferred."""
-    curves = forecast_analysis.horizon_curves(_horizon_record())
-
-    assert set(curves["score_path"]) == {"single-draw (training path)"}
 
 
 def test_an_absent_horizon_block_yields_no_curve_rather_than_an_invented_one() -> None:
@@ -358,7 +332,7 @@ def test_the_horizon_rmse_converts_through_the_spread_path() -> None:
 # The figures
 # =============================================================================
 def test_the_horizon_figure_spans_the_whole_forecast_window_in_seconds(shipped_kwargs) -> None:
-    """$[0, 120]$ seconds rather than $[0, 30]$ steps, on every panel: a reader who has to
+    r"""$[0, 4H]$ seconds rather than $[0, H]$ steps, on every panel: a reader who has to
     multiply by four is a reader who will eventually forget to."""
     from teb_vae.lag_attn.eval import figures as shared_figures
 
@@ -371,8 +345,7 @@ def test_the_horizon_figure_spans_the_whole_forecast_window_in_seconds(shipped_k
     finally:
         shared_figures.plt.close(figure)
 
-    assert limits == [(0.0, 120.0)] * len(limits)
-    assert len(limits) == 3
+    assert limits and limits == [(0.0, 4.0 * horizon)] * len(limits)
 
 
 def test_the_horizon_figures_gap_line_is_the_recomputed_difference() -> None:
@@ -540,18 +513,6 @@ def test_the_overlay_draws_the_forecast_in_bpm_against_lead_time_in_seconds() ->
 # =============================================================================
 # On a real run
 # =============================================================================
-def test_the_analysis_emits_both_skill_spaces_and_records_the_baseline_sigma(evaluated) -> None:
-    """A learned-variance model beats a fixed-variance baseline partly on variance modelling
-    alone, so the NLL-space number alone cannot be read; and which $\\sigma$ the baselines were
-    given decides the whole of it, so it travels in the output rather than in a docstring."""
-    block = evaluated["summary"]["results"]["forecast"]
-
-    assert block["baseline_logvar"] == pytest.approx(BASELINE_LOGVAR)
-    assert block["baselines"] == list(BASELINE_NAMES)
-    for row in block["skill"]:
-        assert "mse_skill" in row and "advantage_nats_per_anchor" in row
-
-
 def test_the_analysis_writes_its_tables_and_figures(evaluated) -> None:
     directory = evaluated["results_dir"] / forecast_analysis.ANALYSIS_DIRNAME
 

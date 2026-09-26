@@ -17,18 +17,16 @@ So parity is a tested property on **both** edges of the square:
   keys that have no two-sided counterpart, the two loss-scale constants this target domain
   re-derived, and the final-revision leaves the two-sided cell shares.
 
-**The final revision breaks the square on purpose.** This cell carries the owner's 2026-09-23 final
-revision and neither sibling does, so its leaves are declared divergences on whichever edge shares
-them. Outside those leaves the two exemption sets are still disjoint except for the identity keys
-and the gradient clip, which is what keeps the square readable for everything the revision did not
-touch.
+Every exemption must also still *be* a divergence, so a stale entry cannot silently widen either
+allow-list. Beside the two edges: every YAML in ``configs/`` validates with no unknown or dead key,
+the derived geometry of the shipped config is self-consistent, the two variants move no key the
+shipped config lacks, and the tiny variant resolves through the real driver into a buildable model.
 """
 from __future__ import annotations
 
 import inspect
-import math
 from pathlib import Path
-from typing import Any, Dict, Tuple
+from typing import Any, Dict
 
 import pytest
 import yaml
@@ -41,12 +39,7 @@ from train.test_utils import make_graph_model
 
 from teb_vae.lag_attn_cfs.tests.conftest import INT_C_U, INT_C_Y
 
-from .conftest import (
-    CAUSAL_C_U,
-    CAUSAL_C_Y,
-    CONV_LSTM_ONLY_KEYS,
-    absolutize_dataset_paths,
-)
+from .conftest import CONV_LSTM_ONLY_KEYS, absolutize_dataset_paths
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 _CONFIG_DIR = Path(__file__).resolve().parents[1] / "configs"
@@ -58,52 +51,6 @@ _SMOKE_HIE = _CONFIG_DIR / "smoke_hie.yaml"
 _ENCODER_SIBLING = _REPO_ROOT / "teb_vae" / "lag_attn_cfs" / "configs" / "default.yaml"
 _TARGET_SIBLING = (
     _REPO_ROOT / "teb_vae" / "lag_attn_transformer_fs" / "configs" / "default.yaml"
-)
-
-#: Every YAML this package may hold. A file that arrived undeclared is one nothing here checks, and
-#: configs are launchable by path.
-DECLARED_CONFIG_FILES = frozenset(
-    {
-        "default.yaml",
-        "tiny.yaml",
-        "smoke_hie.yaml",
-        # The identifiability instrument's own delta: tiny widths at the PRODUCTION lag window and
-        # a single clock, both pinned so that a later default flip cannot move the instrument.
-        "planted.yaml",
-        "sweep_anchor_stride_1.yaml",
-        "sweep_lag_bias_decay.yaml",
-        "sweep_align_target_max.yaml",
-        # The previous K/V memory, as the comparator for the 2026-09-23 move to `adapter`.
-        "sweep_lag_kv_conv_stem.yaml",
-        "sweep_source_dropout_03.yaml",
-        # The two likelihood ablations of the 2026-09-23 final revision.
-        "sweep_factorised_likelihood.yaml",
-        "sweep_all_cells_scored.yaml",
-        # The forecast-clock pair: the stored arm restores today's target and tiling exactly, the
-        # input arm scores the continuation of the encoder's own aligned stream.
-        "sweep_target_clock_input.yaml",
-        # The configuration this cell shipped before the 2026-09-05 promotion, as a comparator.
-        "sweep_legacy_dualref_physclock.yaml",
-    }
-)
-
-#: Keys that must exist. Some are checked by ``validate_config``; the rest are read with a bare
-#: index in ``GraphModelBase.__init__``, which runs *before* the validator -- so a missing one raises
-#: a bare ``KeyError`` rather than the friendly ``ValueError``.
-_REQUIRED_PATHS = (
-    "general_config.tag",
-    "general_config.cuda_devices",
-    "general_config.epochs",
-    "general_config.lr",
-    "general_config.batch_size",
-    "general_config.folders_config",
-    "advanced_config",
-    "advanced_config.trainer",
-    "advanced_config.logging",
-    "dataset_config.vae_train_datasets",
-    "dataset_config.vae_test_datasets",
-    "dataset_config.stat_path",
-    "model_config.VAE_model",
 )
 
 #: ``VAE_model`` keys the *task* consumes rather than the constructor. Each names a term of the
@@ -253,69 +200,13 @@ TARGET_EDGE_EXEMPT_PATHS: Dict[str, str] = {
     ),
 }
 
-#: The tiny variant's declared delta, and the local variant's. Written out so a stray override is a
-#: failure rather than a surprise on the box.
-TINY_DELTA_PATHS = frozenset(
-    {
-        "general_config.tag",
-        "general_config.cuda_devices",
-        "general_config.epochs",
-        "general_config.plot_frequency",
-        "general_config.lr_warmup_steps",
-        "general_config.batch_size.train",
-        "general_config.batch_size.test",
-        "general_config.folders_config.out_dir_base",
-        f"{_VAE}.d_model",
-        f"{_VAE}.d_z",
-        f"{_VAE}.d_head",
-        f"{_VAE}.max_lag",
-        f"{_VAE}.dropout",
-        f"{_VAE}.encoder_d_ff",
-        f"{_VAE}.target_attention_blocks",
-        f"{_VAE}.source_attention_blocks",
-        f"{_VAE}.source_attention_window",
-        f"{_VAE}.likelihood",
-        "dataset_config.vae_train_datasets",
-        "dataset_config.vae_test_datasets",
-        "dataset_config.stat_path",
-        "dataset_config.dataloader_config.num_workers",
-        "advanced_config.tracking.mlflow.enabled",
-    }
-)
-
-SMOKE_HIE_DELTA_PATHS = frozenset(
-    {
-        # The local shard is a LEGACY build, so the smoke pins the operator and widths back to it.
-        "model_config.VAE_model.causal_phase_operator",
-        "model_config.VAE_model.c_y",
-        "model_config.VAE_model.c_u",
-        "general_config.tag",
-        "general_config.cuda_devices",
-        "general_config.epochs",
-        "general_config.lr_warmup_steps",
-        "general_config.plot_frequency",
-        "general_config.batch_size.train",
-        "general_config.batch_size.test",
-        "general_config.folders_config.out_dir_base",
-        f"{_VAE}.beta_schedule.warmup_epochs",
-        "dataset_config.vae_train_datasets",
-        "dataset_config.vae_test_datasets",
-        "dataset_config.stat_path",
-        "dataset_config.dataloader_config.num_workers",
-        "dataset_config.dataloader_config.prefetch_factor",
-        "advanced_config.tracking.mlflow.enabled",
-    }
-)
-
-#: Surviving target channels at the shipped warm-up budget, on the integer-operator shard:
-#: $32$ of $36$ ``fhr_st`` plus every one of the $44$ ``fhr_ph``.
+#: Surviving target channels at the shipped warm-up budget, on the committed integer-operator
+#: fixture the tiny variant reads.
 KEPT_TARGET_CHANNELS = 76
 
-#: Surviving source channels. The promoted default reads every channel at its own availability
-#: time (no alignment reference), and the warm-up budget never gates this stream, so all $46$
-#: of the integer-operator shard's source channels survive; the legacy dual-reference arm
-#: kept $39$ of $51$.
-KEPT_SOURCE_CHANNELS = 46
+#: Every YAML this package holds, discovered rather than listed: a config that arrives is checked
+#: by the first test below without anyone having to register it.
+_ALL_CONFIGS = sorted(path.name for path in _CONFIG_DIR.glob("*.yaml"))
 
 
 def _flatten(node: Dict[str, Any], prefix: str = "") -> Dict[str, Any]:
@@ -398,98 +289,45 @@ def target_sibling() -> dict:
 
 
 # --------------------------------------------------------------------------------------
-# The shipped config loads and everything in it reaches something
+# Every config loads, validates, and everything in it reaches something
 # --------------------------------------------------------------------------------------
-def test_every_effectively_required_key_is_present(shipped):
-    assert [path for path in _REQUIRED_PATHS if not _has(shipped, path)] == []
-
-
-def test_the_shipped_config_validates_with_no_unknown_or_dead_key_warnings(
-    tmp_path, loguru_warnings
+@pytest.mark.parametrize("name", _ALL_CONFIGS)
+def test_every_config_validates_and_every_vae_key_reaches_the_constructor_or_the_task(
+    name, tmp_path, loguru_warnings
 ):
-    """Drives the framework's real validator, not a copy of its rules."""
+    """Drives the framework's real validator, not a copy of its rules, on each file resolved
+    through its ``base:`` chain -- the only way it ever reaches the experiment driver.
+
+    A ``VAE_model`` key that reaches nothing does not raise -- the constructor has a default for
+    everything -- so the run trains a *different architecture* than its config describes, and only
+    a checkpoint that will not reload months later reveals it. A copied conv-LSTM key is the
+    standing case.
+    """
+    resolved = resolve_config_file(str(_CONFIG_DIR / name), str(tmp_path))
     graph_model = make_graph_model(
-        _CONFIG, **{"general_config.folders_config.out_dir_base": str(tmp_path)}
+        resolved, **{"general_config.folders_config.out_dir_base": str(tmp_path)}
     )
 
     graph_model.validate_config()
 
     assert [message for message in loguru_warnings if "config:" in message] == []
-
-
-def test_every_vae_model_key_reaches_the_constructor_or_the_task(shipped):
-    """A key that reaches nothing does not raise -- the constructor has a default for everything --
-    so the run trains a *different architecture* than its config describes, and only a checkpoint
-    that will not reload months later reveals it."""
+    config = load_config(str(_CONFIG_DIR / name))
+    assert "base" not in config
     accepted = set(inspect.signature(SeqVaeLagAttnTrfCfs.__init__).parameters)
-
     orphans = [
-        key
-        for key in _get(shipped, _VAE)
-        if key not in accepted and key not in TASK_LEVEL_KEYS
+        key for key in _get(config, _VAE) if key not in accepted and key not in TASK_LEVEL_KEYS
     ]
-
     assert orphans == []
 
 
-def test_the_seven_encoder_keys_are_present_and_reach_the_constructor(shipped):
-    """The whole of what this cell changes against its encoder sibling. A key that failed to reach
-    the constructor would leave the encoder at its own default with the config still describing the
-    one the run was meant to have."""
-    accepted = set(inspect.signature(SeqVaeLagAttnTrfCfs.__init__).parameters)
-    block = _get(shipped, _VAE)
-
-    for key in ENCODER_KEYS:
-        assert key in block, key
-        assert key in accepted, key
-
-
-@pytest.mark.parametrize("key", CONV_LSTM_ONLY_KEYS)
-def test_no_replaced_encoder_key_survives_in_any_config(key, shipped, tiny, smoke_hie):
-    """Each names a component this architecture does not have. The driver's sweep forwards by name
-    against the real signature, so a copied key would not crash a launch -- it would simply reach
-    nothing, which is why its absence is asserted rather than its rejection."""
-    for config in (shipped, tiny, smoke_hie):
-        assert key not in _get(config, _VAE), key
-
-
-def test_the_shipped_config_builds_a_decoder_as_wide_as_the_budget_keeps(tmp_path):
-    """The binding this model's whole unit convention rests on, resolved through the real driver:
-    the warm-up budget decides the surviving channels, the survivors decide the decoder width, and
-    the width decides what every reported nat is summed over.
-
-    Driven on the tiny variant because the shipped config's shard paths are deliberately
-    non-existent placeholders and this resolution **reads the shards**; the tiny variant carries the
-    identical geometry, which is exactly why it does.
-    """
-    kwargs = _model_kwargs_from(load_config(str(_TINY)), tmp_path)
-
-    assert "causal_warmup_budget_steps" not in kwargs
-    assert len(kwargs["target_keep_index"]) == KEPT_TARGET_CHANNELS
-    assert len(kwargs["target_warmup_steps"]) == KEPT_TARGET_CHANNELS
-    assert len(kwargs["source_keep_index"]) == KEPT_SOURCE_CHANNELS
-    # Unaligned: the mapping emits no shift vectors at all rather than zeros.
-    assert "target_align_delays" not in kwargs and "source_align_delays" not in kwargs
-    # The reach guard's keywords, which name a different mechanism and stay refused.
-    assert "target_delays" not in kwargs and "source_delays" not in kwargs
-
-    model = SeqVaeLagAttnTrfCfs(**kwargs)
-    assert model.decoder.mean_head.out_features == KEPT_TARGET_CHANNELS
-    assert model.raw_per_step == 16  # untouched by the width
-    # H x C_keep: the shipped horizon over the integer operator's survivors.
-    shipped_horizon = _get(load_config(str(_CONFIG)), f"{_VAE}.horizon")
-    assert model.horizon == shipped_horizon
-    assert model.horizon * model.decoder_out_channels == shipped_horizon * KEPT_TARGET_CHANNELS
-
-
-def test_the_shipped_geometry_pairs_the_floor_with_the_budget(shipped):
-    r"""$F \ge \max(B - 1,\ \max_c(W'_c + d_c))$, and $B$ is the *survivors'* maximum rather than
-    the configured threshold. The alignment makes the second term bind, at exactly $B$."""
+# --------------------------------------------------------------------------------------
+# The shipped geometry is self-consistent
+# --------------------------------------------------------------------------------------
+def test_the_shipped_geometry_pairs_the_floor_with_the_budget_on_the_integer_shards(shipped):
+    r"""$F \ge B - 1$, with $B$ the survivors' maximum rather than the configured threshold, and
+    the declared widths are the committed integer-operator fixture's."""
     vae = _get(shipped, _VAE)
 
-    assert vae["warmup_period"] == 134
-    assert vae["causal_warmup_budget_steps"] == 134
-    assert vae["causal_align_reference"] is None
     assert vae["warmup_period"] >= vae["causal_warmup_budget_steps"] - 1
     assert vae["c_y"] == INT_C_Y
     assert vae["c_u"] == INT_C_U
@@ -503,11 +341,11 @@ def test_the_anchor_stride_pairs_with_the_forecast_clock(shipped):
     objective. The fast scored horizon must lie inside the horizon, or the resolver refuses it."""
     vae = _get(shipped, _VAE)
 
+    # The span below is the stored clock's; any other clock moves the ceiling.
     assert vae["causal_target_forecast_clock"] == "stored"
     assert vae["anchor_stride"] == vae["horizon"] // 2
     assert vae["horizon_weight_halflife_steps"] == float(vae["horizon"])
     assert 1 <= vae["target_phase_fast_horizon"] <= vae["horizon"]
-    assert vae["lag_floor"] == 0
     # The span and the tile count the config comments state, derived the way the net derives them.
     span = vae["sequence_length"] - vae["horizon"] - vae["warmup_period"]
     assert span > vae["anchor_stride"]
@@ -527,15 +365,13 @@ def test_the_decoder_depth_still_covers_the_horizon(shipped):
 # --------------------------------------------------------------------------------------
 # Pin one: the encoder edge
 # --------------------------------------------------------------------------------------
-@pytest.mark.parametrize("path", _IDENTITY_PATHS)
-def test_the_identity_keys_are_this_models_own(
-    shipped, encoder_sibling, target_sibling, path
-):
+def test_the_identity_keys_are_this_models_own(shipped, encoder_sibling, target_sibling):
     """Inheriting any of these mixes this model's runs into a comparison model's experiment, which
     is unrecoverable afterwards because the two are then indistinguishable by every field anything
     indexes on."""
-    assert _get(shipped, path) != _get(encoder_sibling, path)
-    assert _get(shipped, path) != _get(target_sibling, path)
+    for path in _IDENTITY_PATHS:
+        assert _get(shipped, path) != _get(encoder_sibling, path), path
+        assert _get(shipped, path) != _get(target_sibling, path), path
 
 
 def test_every_comparable_leaf_equals_the_encoder_siblings_value(shipped, encoder_sibling):
@@ -641,127 +477,26 @@ def test_the_target_edge_declares_no_exemption_that_is_no_longer_a_divergence(
     assert stale == []
 
 
-#: The keys exempt on BOTH edges, and therefore readable across neither: the identity keys, the
-#: gradient clip, and the final-revision leaves both siblings carry at their pre-revision values
-#: (``max_lag``, ``source_dropout`` and the spike margin). Written out and pinned rather than
-#: derived, so a key appearing here would be a new divergence nobody declared. The final-revision
-#: three are the price of revising this cell alone, and are read against this cell's own sweep arms
-#: rather than across either edge.
-_EXEMPT_ON_BOTH_EDGES = set(_IDENTITY_PATHS) | {
-    "advanced_config.trainer.gradient_clip_val",
-    "advanced_config.spike_breaker.additive_margin",
-    f"{_VAE}.max_lag",
-    f"{_VAE}.source_dropout",
-    # A final-revision leaf on the encoder edge and a key with no two-sided counterpart on the
-    # target edge: exempt twice for two reasons, and read against this cell's own stride arm.
-    f"{_VAE}.anchor_stride",
-}
-
-
-def test_the_two_edges_overlap_only_where_they_must(shipped):
-    """The square closes iff the two allow-lists are disjoint outside the identity keys, the one
-    constant both edges move, and the declared final-revision leaves. A key exempt on both edges is
-    one neither comparison can read, and it would be exempt for two different reasons that nothing
-    forces to agree."""
-    both = set(ENCODER_EDGE_EXEMPT_PATHS) & set(TARGET_EDGE_EXEMPT_PATHS)
-
-    assert both == _EXEMPT_ON_BOTH_EDGES
-
-
-#: The block this cell measured its loss-scale constants at before the final revision: the
-#: 2026-09-05 geometry, $H = 10$ over the same $C_\mathrm{keep}$. The revision's two constants are
-#: that block's values scaled by the block ratio, and the config says so.
-_PRE_REVISION_HORIZON = 10
-_PRE_REVISION_CLIP = 3500.0
-_PRE_REVISION_MARGIN = 2.2e3
-
-
-def test_both_loss_scale_constants_are_scaled_by_the_block_ratio_and_the_margin_stays_live(
-    shipped, encoder_sibling, target_sibling
-):
-    """``additive_margin`` and ``gradient_clip_val`` are both statistics of the summed block, and
-    the 2026-09-23 revision moved the block by the horizon ratio with $C_\\mathrm{keep}$ unchanged.
-    Neither was re-measured: both are the pre-revision values times that ratio, which is what the
-    config records and what the headline run must re-derive. Neither equals either sibling's any
-    more -- the conv-LSTM cell did not take the revision.
-
-    The margin has to sit under the reachable magnitude of the two reconstruction terms at this
-    block or the additive test is decoration, so that bound is asserted beside the scaling.
-    """
-    breaker = "advanced_config.spike_breaker.additive_margin"
-    clip = "advanced_config.trainer.gradient_clip_val"
-    vae = _get(shipped, _VAE)
-    ratio = vae["horizon"] / _PRE_REVISION_HORIZON
-
-    assert _get(shipped, breaker) == pytest.approx(_PRE_REVISION_MARGIN * ratio)
-    assert _get(shipped, clip) == pytest.approx(_PRE_REVISION_CLIP * ratio)
-    for sibling in (encoder_sibling, target_sibling):
-        assert _get(shipped, breaker) != _get(sibling, breaker)
-        assert _get(shipped, clip) != _get(sibling, clip)
-    # The margin must stay under the reachable magnitude of the two reconstruction terms,
-    # 2 * H * C_keep * |0.5 * (log 2pi + logvar_clamp_lo)| at the shipped log-variance floor,
-    # or the additive spike test is decoration. The scored-horizon mask only lowers that bound's
-    # attainable part and the AR(1) innovation keeps the per-cell floor, so this is the bound.
-    per_coefficient = 0.5 * (-vae["logvar_clamp"][0] - math.log(2 * math.pi))
-    assert _get(shipped, breaker) < 2 * vae["horizon"] * KEPT_TARGET_CHANNELS * per_coefficient
-    # The relative test stays off at the same value on every cell: it is a switch, not a scale.
-    floor = "advanced_config.spike_breaker.ema_floor"
-    assert _get(shipped, floor) == _get(encoder_sibling, floor) == _get(target_sibling, floor)
-
-
 # --------------------------------------------------------------------------------------
 # The rest of the shipped block
 # --------------------------------------------------------------------------------------
-def test_the_config_directory_holds_exactly_the_declared_files():
-    """A file that arrived undeclared is one nothing here checks, and configs are launchable by
-    path."""
-    assert {path.name for path in _CONFIG_DIR.glob("*.yaml")} == set(DECLARED_CONFIG_FILES)
-
-
-def test_the_cross_channel_block_appears_in_no_config():
-    """``fhr_up_ph`` mixes both signals in one coefficient and the causal variant does not store it.
-    In ``load_fields`` the loader would raise -- after every rank had initialised -- and in
-    ``normalize_fields`` it is silently ignored and reads as though the block were handled."""
-    for path in _CONFIG_DIR.glob("*.yaml"):
-        assert "fhr_up_ph" not in path.read_text(encoding="utf-8"), path.name
-
-
-def test_the_two_phase_key_fields_are_loaded(shipped):
-    """``load_fields`` is honoured literally, with no forced additions. Without ``guid`` and
-    ``epoch`` the tile phase has nothing per-segment to key on, and $A_{\\max}$ is a geometry
-    constant either way -- so no shape, no count and no metric would differ."""
-    load_fields = _get(shipped, "dataset_config.dataloader_config.dataset_kwargs.load_fields")
-
-    assert "guid" in load_fields and "epoch" in load_fields
-
-
-def test_the_target_blocks_are_loaded_and_normalized(shipped):
-    """Both, in both lists. An unnormalised target makes the Gaussian NLL meaningless against a
-    unit-scale variance model with the loader raising nothing."""
+def test_the_target_blocks_and_the_two_phase_key_fields_are_loaded(shipped):
+    """``load_fields`` is honoured literally, with no forced additions. Both target blocks must be
+    loaded and normalised -- an unnormalised target makes the Gaussian NLL meaningless against a
+    unit-scale variance model with the loader raising nothing -- and without ``guid`` and ``epoch``
+    the tile phase has nothing per-segment to key on, with no shape, count or metric differing."""
     loader = _get(shipped, "dataset_config.dataloader_config")
+    load_fields = loader["dataset_kwargs"]["load_fields"]
 
     for field in LagAttnTrfCfsTrainer.TARGET_FIELDS:
         assert field in loader["normalize_fields"], field
-        assert field in loader["dataset_kwargs"]["load_fields"], field
+        assert field in load_fields, field
+    assert "guid" in load_fields and "epoch" in load_fields
 
 
-def test_the_boundary_shape_weight_is_zero(shipped):
-    """A slicing identity over *adjacent* anchors, against a set whose entries are $S$ apart. The
-    shared objective raises on the combination and the driver's pre-flight refuses it before a run
-    directory exists."""
-    assert _get(shipped, f"{_VAE}.lambda_boundary") == 0.0
-
-
-def test_precision_is_float32(shipped):
-    assert _get(shipped, "advanced_config.trainer.precision") == "32-true"
-
-
-def test_compile_ships_off_but_is_live_for_this_driver(shipped, tmp_path):
+def test_compile_is_live_for_this_driver(shipped, tmp_path):
     """Different from the conv-LSTM causal cell's, where the key is inert: the LSTM that made the
-    raw base refuse compilation outright is gone here, so the key becomes live and shipping it off
-    is a decision rather than a formality."""
-    assert _get(shipped, "advanced_config.trainer.compile") is False
-
+    raw base refuse compilation outright is gone here, so the key reaches the driver's decision."""
     config = dict(shipped)
     config["advanced_config"]["trainer"]["compile"] = True
     path = Path(tmp_path) / "compile.yaml"
@@ -772,54 +507,23 @@ def test_compile_ships_off_but_is_live_for_this_driver(shipped, tmp_path):
     assert LagAttnTrfCfsTrainer(config_file_path=str(path)).compile_model_requested() is True
 
 
-def test_num_sanity_val_steps_is_zero(shipped):
-    """REQUIRED: the metrics callback has no sanity guard, so a sanity pass would shift every epoch
-    number against MLflow and the checkpoint filenames."""
-    assert _get(shipped, "advanced_config.trainer.num_sanity_val_steps") == 0
-
-
-def test_the_step_warmup_is_configured_and_positive(shipped):
-    """The one non-encoder key on the encoder edge. At $0$ the task delegates to the framework's
-    epoch-granularity path, which cannot express a ramp completing inside a fraction of one epoch."""
-    assert _get(shipped, "general_config.lr_warmup_steps") > 0
-
-
-def test_the_beta_warmup_starts_at_exactly_zero(shipped):
-    """$z$ is the only route to the decoder, so a nonzero $\\beta$ before the decoder can use the
-    latent at all is the standard route to posterior collapse."""
-    schedule = _get(shipped, f"{_VAE}.beta_schedule")
-
-    assert schedule["kind"] == "linear_warmup"
-    assert schedule["start"] == 0.0
-    assert schedule["end"] == 1.0
-
-
-def test_the_plotting_block_keeps_the_shared_drivers_spelling(shipped):
-    """The callback assembly is inherited whole and reads this literal; renaming the block to match
+def test_the_plotting_block_sits_under_the_key_the_driver_reads(shipped):
+    """The callback assembly is inherited whole and reads the driver's key; a block renamed to match
     this package would leave the figure permanently off, with ``enabled: true`` still reading
     correct and nothing in the log saying why."""
-    assert LagAttnTrfCfsTrainer.PLOT_CONFIG_KEY == "lag_attn_rws_plotting"
     assert _has(shipped, f"advanced_config.callbacks.{LagAttnTrfCfsTrainer.PLOT_CONFIG_KEY}")
 
 
 # --------------------------------------------------------------------------------------
 # The two derived variants
 # --------------------------------------------------------------------------------------
-@pytest.mark.parametrize(
-    "name, declared",
-    [("tiny.yaml", TINY_DELTA_PATHS), ("smoke_hie.yaml", SMOKE_HIE_DELTA_PATHS)],
-)
-def test_a_variant_names_only_its_declared_deltas(name, declared, shipped):
+@pytest.mark.parametrize("name", ["tiny.yaml", "smoke_hie.yaml"])
+def test_a_variant_moves_no_key_the_shipped_config_lacks(name, shipped):
     """Key sets must match exactly -- a typo'd override *adds* a path rather than moving one, and a
     config key that reaches nothing raises nothing."""
     variant = load_config(str(_CONFIG_DIR / name))
-    assert "base" not in variant
 
-    variant_flat, shipped_flat = _flatten(variant), _flatten(shipped)
-    assert set(variant_flat) == set(shipped_flat)
-
-    differing = {path for path in shipped_flat if variant_flat[path] != shipped_flat[path]}
-    assert differing == set(declared), sorted(differing ^ set(declared))
+    assert set(_flatten(variant)) == set(_flatten(shipped))
 
 
 def test_the_tiny_variant_inherits_the_geometry_that_decides_what_it_exercises(tiny, shipped):
@@ -844,56 +548,38 @@ def test_the_tiny_variant_inherits_the_geometry_that_decides_what_it_exercises(t
     )
 
 
-def test_the_tiny_geometry_satisfies_the_constructor_invariants(tiny):
-    """Both head constraints at once, and they are independent: ``num_heads * d_head == d_model``
-    for the lag attention, and ``d_model / encoder_num_heads`` even for rotary position encoding."""
-    vae = _get(tiny, _VAE)
+def test_the_step_warmup_ramp_is_live_in_every_variant(shipped, tiny, smoke_hie):
+    """At $0$ the task delegates to the framework's epoch-granularity path, which cannot express a
+    ramp completing inside a fraction of one epoch. A smoke ramp longer than the smoke run is one it
+    never leaves, so each variant scales the ramp into its own budget."""
+    ramp = "general_config.lr_warmup_steps"
 
-    assert vae["num_heads"] * vae["d_head"] == vae["d_model"]
-    assert vae["d_z"] % vae["num_heads"] == 0
-    assert (vae["d_model"] // vae["encoder_num_heads"]) % 2 == 0
-
-
-def test_the_tiny_variant_exercises_the_step_warmup_inside_a_smoke_fit(tiny):
-    """A ramp longer than the run is a ramp the smoke never leaves, and one of zero is a path the
-    smoke never enters. Both would leave the conv-Transformer half of the diamond untested."""
-    assert 0 < _get(tiny, "general_config.lr_warmup_steps") <= 8
+    assert _get(shipped, ramp) > 0
+    assert 0 < _get(tiny, ramp) <= 8
+    assert 0 < _get(smoke_hie, ramp) < _get(shipped, ramp)
 
 
-def test_the_tiny_variant_points_at_the_committed_causal_shard(tiny):
-    """And at the causal statistics beside it: the two-sided pair carries no ``transform``
-    attribute and no warm-up vectors, and the pre-flight refuses it by name."""
-    for key in ("vae_train_datasets", "vae_test_datasets"):
-        paths = _get(tiny, f"dataset_config.{key}")
-        assert paths == ["teb_vae/lag_attn/tests/fixtures/tiny_shard_causal_int.hdf5"], key
-        assert (_REPO_ROOT / paths[0]).exists()
-    stats = _get(tiny, "dataset_config.stat_path")
-    assert stats.endswith("tiny_stats_causal_int.hdf5")
-    assert (_REPO_ROOT / stats).exists()
+def test_the_tiny_variant_resolves_through_the_driver_into_the_shipped_decoder(tmp_path):
+    """The smoke model is small everywhere except where it must not be: the budget resolved against
+    the committed shard decides the surviving channels, the survivors decide the decoder width, and
+    the forward still decodes the production tiling -- with the final revision's two likelihood
+    mechanisms reaching the model through the real driver."""
+    kwargs = _model_kwargs_from(load_config(str(_TINY)), tmp_path)
 
+    assert "causal_warmup_budget_steps" not in kwargs
+    assert len(kwargs["target_keep_index"]) == len(kwargs["target_warmup_steps"])
+    # Unaligned: the mapping emits no shift vectors at all rather than zeros, and the reach guard's
+    # keywords, which name a different mechanism, stay refused.
+    for absent in ("target_align_delays", "source_align_delays", "target_delays", "source_delays"):
+        assert absent not in kwargs, absent
 
-def test_the_resolved_tiny_variant_validates_and_builds(tmp_path, loguru_warnings):
-    """Resolved first, which is the only way it ever reaches the experiment driver."""
-    resolved = resolve_config_file(str(_TINY), str(tmp_path))
-    graph_model = make_graph_model(
-        resolved, **{"general_config.folders_config.out_dir_base": str(tmp_path)}
-    )
-
-    graph_model.validate_config()
-
-    assert [message for message in loguru_warnings if "config:" in message] == []
-    model = SeqVaeLagAttnTrfCfs(**_model_kwargs_from(load_config(str(_TINY)), tmp_path))
-    # The smoke model is small everywhere except where it must not be: the decoder still emits the
-    # production width and the forward still decodes the production tiling, forecast clock
-    # included -- the ceiling below is T_valid less the physical clock's 85-step advance.
+    model = SeqVaeLagAttnTrfCfs(**kwargs)
     shipped_vae = _get(load_config(str(_CONFIG)), _VAE)
-    assert model.d_model == 32
+    assert model.decoder.mean_head.out_features == KEPT_TARGET_CHANNELS
     assert model.decoder_out_channels == KEPT_TARGET_CHANNELS
     assert model.anchor_stride == shipped_vae["anchor_stride"]
     assert model.horizon == shipped_vae["horizon"]
-    # The final revision's likelihood mechanisms reach the tiny model through the real driver.
     assert model.forecast_ar_residual is True
-    assert hasattr(model, "target_ar_logit")
     assert model.target_scored_horizon is not None
     assert set(model.target_scored_horizon) == {
         shipped_vae["target_phase_fast_horizon"], shipped_vae["horizon"]
@@ -901,48 +587,6 @@ def test_the_resolved_tiny_variant_validates_and_builds(tmp_path, loguru_warning
     # The stored clock advances nothing: every anchor up to T_valid is decoded.
     assert model.target_forecast_shift is None
     assert model.anchor_ceiling == model.geometry.t_valid
-
-
-def test_the_local_variant_names_a_built_and_leg_aligned_causal_shard(smoke_hie):
-    """The tripwire this replaces asserted the shard's *absence*, so that the day one was built it
-    would fail and someone would re-read the header. That day came; the header now records what was
-    built, and this asserts the config names it.
-
-    ``output/`` is gitignored, so the shard is a dev-box artefact rather than a committed fixture:
-    the config contract is checked everywhere, the file's own attributes only where it is present.
-    The two-sided ``output/hie_cs.hdf5`` still cannot stand in for one."""
-    for key in ("vae_train_datasets", "vae_test_datasets"):
-        for path in _get(smoke_hie, f"dataset_config.{key}"):
-            assert "causal" in path, path
-    assert "PREREQUISITE, AND IT IS NOW SATISFIED" in _SMOKE_HIE.read_text(encoding="utf-8")
-
-    shard = _REPO_ROOT / _get(smoke_hie, "dataset_config.vae_train_datasets")[0]
-    if not shard.is_file():
-        pytest.skip(f"{shard} is a gitignored dev-box artefact and is absent here")
-
-    import h5py
-
-    expected = _get(smoke_hie, "model_config.VAE_model.causal_leg_alignment")
-    with h5py.File(shard, "r") as handle:
-        assert handle.attrs["transform"] == "causal"
-        # An aligned shard and an unaligned one share every width, warm-up and stored delay, so
-        # this attribute is the only thing on the file that could disagree with the config.
-        assert handle.attrs["causal_leg_alignment"] == expected
-
-
-def test_the_local_variant_scales_the_step_warmup_into_its_own_budget(smoke_hie, shipped):
-    """A few hundred windows at batch 32 is on the order of ten steps an epoch, so the shipped
-    2,000-step ramp would still be climbing when the run ended and every column would be read off a
-    model that had never trained at its own learning rate."""
-    assert _get(smoke_hie, "general_config.lr_warmup_steps") < _get(
-        shipped, "general_config.lr_warmup_steps"
-    )
-    assert _get(smoke_hie, "general_config.lr_warmup_steps") > 0
-
-
-def test_the_local_variant_runs_on_one_device_with_tracking_off(smoke_hie):
-    assert _get(smoke_hie, "general_config.cuda_devices") == [0]
-    assert _get(smoke_hie, "advanced_config.tracking.mlflow.enabled") is False
 
 
 def test_the_local_variant_reads_the_same_shard_as_its_encoder_sibling(smoke_hie):

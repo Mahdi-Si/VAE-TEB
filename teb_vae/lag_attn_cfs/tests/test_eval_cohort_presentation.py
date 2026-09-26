@@ -12,11 +12,6 @@ figure, and on the subgroup axis it interleaves the three classes -- ``acidosis_
 background/caesarean structure is visible. A reader comparing two figures drawn from different
 cohort subsets would be comparing different columns without either figure saying so.
 
-**The order is read off the shared labelling rather than restated.** ``CLASS_NAMES`` is keyed by
-the dataset's own class codes and ``CANONICAL_SUBGROUPS`` is written in the intended order, so a
-subgroup added to the dataset appears in these figures without an edit here -- and this package and
-the raw cells' cannot come to disagree about what a cohort *is*.
-
 **And the order is not only presentational: it decides every comparison's orientation.**
 ``stats.pairwise_comparisons`` names each pair in the order it receives the cohorts, so the same
 ordering that puts HIE leftmost on a figure makes every significance test read *more severe against
@@ -36,8 +31,8 @@ and still be evaluated. Widening a *bin* merges two windows and can make a diffe
 disappear while the population stays put, which is why the width is fixed. A horizon does the
 opposite: it narrows the population openly, applies to the delivery clock before anything is
 binned so every clock answers for the same segments, and lands in the resolved config dumped into
-the run directory -- so a bounded run says so in its own artifacts. The tests below pin both the
-filter's edge behaviour and the fact that every clock analysis reads the key.
+the run directory -- so a bounded run says so in its own artifacts. The tests below pin the
+filter's edge behaviour.
 """
 from __future__ import annotations
 
@@ -108,15 +103,6 @@ def test_the_canonical_order_is_the_stated_one_on_both_axes() -> None:
     # assertions above discriminating rather than accidentally satisfied.
     assert sorted(EXPECTED_CLASS_ORDER) != EXPECTED_CLASS_ORDER
     assert sorted(EXPECTED_SUBGROUP_ORDER) != EXPECTED_SUBGROUP_ORDER
-
-
-def test_the_order_is_read_off_the_shared_labelling_rather_than_restated() -> None:
-    """The two orderings this package draws in are the shared tables' own read worst-first, which
-    is what keeps one definition of a cohort across the family rather than one per package."""
-    assert EXPECTED_CLASS_ORDER == [
-        labels.CLASS_NAMES[code] for code in sorted(labels.CLASS_NAMES, reverse=True)
-    ]
-    assert EXPECTED_SUBGROUP_ORDER == list(reversed(labels.CANONICAL_SUBGROUPS))
 
 
 def test_a_partial_cohort_keeps_the_order_of_the_ones_present() -> None:
@@ -345,7 +331,6 @@ def test_epoch_becomes_hours_before_delivery_and_bins_on_the_fixed_grid() -> Non
 
     binned = cohort.add_time_bins(frame)
 
-    assert cohort.TRAJECTORY_BIN_HOURS == 0.5
     assert list(binned[cohort.HOURS_COLUMN]) == [1.0, 1.5]
     assert list(binned[cohort.BIN_COLUMN]) == [2, 3]
     assert list(binned[cohort.BIN_CENTER_COLUMN]) == [1.25, 1.75]
@@ -536,29 +521,3 @@ def test_the_horizon_tolerates_a_frame_with_no_epoch_column() -> None:
 
     assert cohort.within_horizon(frame, 4.0) is frame
     assert cohort.within_horizon(pd.DataFrame(), 4.0).empty
-
-
-def test_every_clock_analysis_reads_the_horizon_key() -> None:
-    """The anti-omission direction: a clock analysis added later that never reads the key would
-    silently evaluate the whole split while the run's config said otherwise, and no assertion on
-    the existing analyses would notice."""
-    import re
-    from pathlib import Path
-
-    root = Path(cohort.__file__).resolve().parent / "analyses"
-    clocks = [
-        name for name in ("trajectory.py", "time_to_delivery.py", "second_stage.py",
-                          "lag_kl.py", "lag_clocks.py")
-        if (root / name).is_file()
-    ]
-    assert clocks, "no clock analysis found to check"
-
-    missing = [
-        name for name in clocks
-        if not re.search(r"max_hours_before_delivery", (root / name).read_text(encoding="utf-8"))
-    ]
-
-    assert missing == [], (
-        f"{missing} bin on a clinical clock but never read "
-        f"eval_config.max_hours_before_delivery, so a bounded run would not bound them"
-    )

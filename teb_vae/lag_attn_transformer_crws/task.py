@@ -23,8 +23,8 @@ TrfRwsTask -> RwsTask -> LightningModelBase`` is a valid linearisation. It is *n
 because the two branches happen to be disjoint -- they are, everything the causal-input cell adds
 against $\{$``build_lr_scheduler``$\}$, but that is a fact about today's code rather than a property
 of the construction. A future member defined on both sides would resolve to the causal side by order
-alone, silently; ``tests/test_task.py`` asserts the linearisation as a list of class names and each
-behaviour against the class the design names, so a reorder fails rather than trains something else.
+alone, silently; ``tests/test_task.py`` reads one behaviour from each side through the diamond (the
+conv-Transformer parent's ramp, the causal parent's five-argument forward and metric surface).
 
 **The empty class body is the guarantee.** There is no ``__init__``: the causal parent already takes
 the run seed the tile phase is derived from and puts it in ``save_hyperparameters``, and a second

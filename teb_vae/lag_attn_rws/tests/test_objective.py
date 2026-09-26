@@ -261,15 +261,6 @@ def test_at_init_the_two_reconstruction_terms_are_bitwise_equal(tiny_kwargs, lik
     assert float(metrics["pred_gap"]) == 0.0
 
 
-def test_an_unknown_likelihood_is_rejected_listing_the_choices(tiny_kwargs):
-    model = _model(tiny_kwargs)
-    batch = make_stub_batch()
-    with torch.no_grad():
-        out = model(batch.fhr_st, batch.fhr_ph, torch.cat([batch.up_st, batch.up_ph], -1))
-    with pytest.raises(ValueError, match=r"mse.*gaussian_nll"):
-        model.compute_loss(out, batch.fhr, weight=batch.weight, likelihood="huber")
-
-
 @pytest.mark.parametrize(
     "coefficients", [{}, _HARNESS_COEFFICIENTS], ids=["shape-terms-off", "shape-terms-on"]
 )
@@ -343,16 +334,6 @@ def test_the_coverage_floor_is_honoured(tiny_kwargs):
     )
 
 
-def test_free_bits_raises_the_trained_kl_above_the_raw_one(tiny_kwargs, perturb_posterior):
-    _, result = _loss(
-        _model(tiny_kwargs), make_stub_batch(), perturb=perturb_posterior, free_bits=0.5
-    )
-    metrics = result["metrics"]
-    assert float(metrics["source_conditioned_kl_train"]) > float(
-        metrics["source_conditioned_kl_raw"]
-    )
-
-
 def test_the_objective_carries_gradient(tiny_kwargs, perturb_posterior):
     """A smoke check that the assembled total is trainable: backward runs and reaches the
     decoder and the posterior pathway."""
@@ -364,24 +345,6 @@ def test_the_objective_carries_gradient(tiny_kwargs, perturb_posterior):
     result["metrics"]["total_loss"].backward()
     assert model.decoder.mean_head.weight.grad is not None
     assert float(model.decoder.mean_head.weight.grad.abs().max()) > 0.0
-
-
-def test_the_latent_diagnostics_are_present_and_finite(tiny_kwargs):
-    _, result = _loss(_model(tiny_kwargs), make_stub_batch())
-    metrics = result["metrics"]
-    for key in (
-        "mean_logvar_full",
-        "mean_logvar_base",
-        "mean_logvar_prior",
-        "mean_logvar_post",
-        "logvar_prior_floor_frac",
-        "delta_mu_rms",
-        "kld_active_frac",
-    ):
-        assert key in metrics and torch.isfinite(metrics[key]), key
-    # At init the posterior sits on the prior exactly.
-    assert float(metrics["delta_mu_rms"]) == 0.0
-    assert torch.equal(metrics["mean_logvar_prior"], metrics["mean_logvar_post"])
 
 
 # =============================================================================

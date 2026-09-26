@@ -71,30 +71,14 @@ def _worst_residual(model: SeqVaeLagAttnRws, inputs) -> float:
 # =============================================================================
 # The identity, at the shipped dropout
 # =============================================================================
-def test_the_attention_carries_no_dropout_even_at_the_shipped_setting(perturb_posterior) -> None:
-    """The structural reason the identity holds, pinned at the line that provides it.
-
-    The obvious expectation reads the other way -- identity under ``eval()``, violation under
-    ``train()`` at ``dropout: 0.1`` -- and it is wrong about this model. ``SeqVaeLagAttnRws``
-    builds ``LagCrossAttention`` at ``dropout=0.0`` unconditionally, so the model's ``dropout``
-    kwarg never reaches the attention probabilities and the identity holds in both modes. That is
-    the stronger property, and this is the assertion that keeps it true: a change to that
-    constructor argument fails here rather than silently making every lag number hold only in
-    expectation.
-    """
-    model = _model_at_shipped_dropout(perturb_posterior)
-
-    assert float(SHIPPED_KWARGS["dropout"]) > 0.0, "a zero shipped dropout makes this vacuous"
-    assert model.lag_attn.attn_dropout.p == 0.0
-
-
 def test_the_identity_holds_in_both_modes_at_the_shipped_dropout(
     perturb_posterior, inputs
 ) -> None:
     """Both modes, because the eval path's correctness must not depend on remembering ``eval()``.
 
-    It does not, for the reason the test above pins -- and asserting it here is what would catch
-    the day it starts to.
+    It does not, because the model builds its attention at zero dropout whatever its ``dropout``
+    kwarg says -- and asserting it here, at the shipped dropout, is what would catch the day that
+    constructor argument changes.
     """
     model = _model_at_shipped_dropout(perturb_posterior)
 
@@ -247,25 +231,20 @@ def test_an_empty_profile_reports_nothing_rather_than_raising() -> None:
 # =============================================================================
 # The lag axis
 # =============================================================================
-def test_the_seconds_axis_is_the_compensated_one_elementwise() -> None:
-    r"""Not $4\ell$, and not $4\ell + 20$: the compensated figure $4(\ell + \delta)$, built
-    through the shared converter so a second implementation cannot drift from it."""
-    axis = lag_kl.compensated_seconds_axis(9, delay_steps=0)
+#: A zero and a nonzero input delay: the historical bug was one consumer reading the delay and
+#: another reading zero, so the two reports of one run disagreed with nothing raising.
+_DELAYS = (0, 30)
+
+
+@pytest.mark.parametrize("delay_steps", _DELAYS)
+def test_the_seconds_axis_is_the_compensated_one_elementwise(delay_steps: int) -> None:
+    r"""The compensated figure $4(\ell + \delta)$, built through the shared converter so a second
+    implementation cannot drift from it, at the delay it was handed."""
+    axis = lag_kl.compensated_seconds_axis(9, delay_steps=delay_steps)
 
     assert axis.tolist() == [
-        float(lag_compensated_seconds(lag, delay_steps=0)) for lag in range(9)
+        float(lag_compensated_seconds(lag, delay_steps=delay_steps)) for lag in range(9)
     ]
-
-
-def test_a_nonzero_input_delay_shifts_every_second_by_four_delta() -> None:
-    """The historical bug, in the shape it took: one consumer read the delay and the other read
-    zero, and the two reports of one run disagreed by two minutes with nothing raising."""
-    delay = 30
-    base = lag_kl.compensated_seconds_axis(9, delay_steps=0)
-
-    shifted = lag_kl.compensated_seconds_axis(9, delay_steps=delay)
-
-    assert np.allclose(shifted - base, 4.0 * delay)
 
 
 # =============================================================================
@@ -277,9 +256,10 @@ def _figure_lines(figure):
     return {line.get_label(): line for line in axis.get_lines()}
 
 
-def test_the_profile_figure_draws_against_the_compensated_seconds_axis() -> None:
-    """The axis label names the quantity; these assertions are about the *numbers*, which is what
-    was historically wrong."""
+@pytest.mark.parametrize("delay_steps", _DELAYS)
+def test_the_profile_figure_draws_against_the_compensated_seconds_axis(delay_steps: int) -> None:
+    """About the drawn *numbers*, which is what was historically wrong: a figure reading its own
+    guess of the delay draws the right shape at the wrong seconds."""
     import matplotlib.pyplot as plt
 
     lag = {
@@ -288,45 +268,17 @@ def test_the_profile_figure_draws_against_the_compensated_seconds_axis() -> None
         "kl_lag_anchor_counts": [9.0] * 9,
         "kl_argmax_lag_step": 1,
     }
-    seconds = lag_kl.compensated_seconds_axis(9, delay_steps=0)
+    seconds = lag_kl.compensated_seconds_axis(9, delay_steps=delay_steps)
     profile = lag_kl.profile_frame(lag, seconds)
 
-    figure = lag_kl.build_profile_figure(profile, lag, delay_steps=0, n_lags=9)
+    figure = lag_kl.build_profile_figure(profile, lag, delay_steps=delay_steps, n_lags=9)
     try:
         drawn = _figure_lines(figure)["raw attribution (sums to the KL)"]
         x_values = np.asarray(drawn.get_xdata(), dtype=float)
-        label = figure.axes[0].get_xlabel()
     finally:
         plt.close(figure)
 
     assert np.allclose(x_values, seconds)
-    assert "compensated" in label
-
-
-def test_rebuilding_at_a_nonzero_delay_shifts_every_drawn_second() -> None:
-    """The property that catches a figure reading its own guess of the delay."""
-    import matplotlib.pyplot as plt
-
-    lag = {"kl_lag_profile": [0.1] * 9, "kl_lag_anchor_counts": [9.0] * 9}
-    delay = 30
-
-    drawn = []
-    for delay_steps in (0, delay):
-        seconds = lag_kl.compensated_seconds_axis(9, delay_steps=delay_steps)
-        figure = lag_kl.build_profile_figure(
-            lag_kl.profile_frame(lag, seconds), lag, delay_steps=delay_steps, n_lags=9
-        )
-        try:
-            drawn.append(
-                np.asarray(
-                    _figure_lines(figure)["raw attribution (sums to the KL)"].get_xdata(),
-                    dtype=float,
-                )
-            )
-        finally:
-            plt.close(figure)
-
-    assert np.allclose(drawn[1] - drawn[0], 4.0 * delay)
 
 
 # =============================================================================

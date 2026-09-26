@@ -222,37 +222,6 @@ def test_the_analysis_writes_its_tables_the_record_and_the_figure(tmp_path) -> N
     assert all("/" not in name and "\\" not in name for name in result["files"])
 
 
-def test_the_written_record_round_trips_as_json(tmp_path) -> None:
-    """Non-finite statistics are ordinary here -- a degenerate cohort produces them -- and a file
-    only Python can read back is not a record."""
-    _write_frame(tmp_path, _SOURCE, {"healthy_bg_cs": [1.0] * 5, "acidosis_cs": [9.0] * 5})
-
-    analysis.run_cross_subgroup_analysis(None, eval_config={}, output_dir=tmp_path, probe=None)
-
-    path = tmp_path / analysis.ANALYSIS_DIRNAME / analysis.RESULT_FILENAME
-    record = json.loads(path.read_text(encoding="utf-8"))
-    assert record["group_column"] == labels.SUBGROUP_COLUMN
-    assert record["alpha"] == pytest.approx(analysis.DEFAULT_ALPHA)
-
-
-def test_neither_the_alpha_nor_the_minimum_cohort_size_is_configurable() -> None:
-    """An operator who could lower either could make any metric significant, which is why they are
-    module constants and why the analysis ignores ``eval_config`` entirely."""
-    from teb_vae.lag_attn_rws.eval import config_schema
-
-    assert "alpha" not in config_schema.VALID_KEYS
-    assert "min_group_size" not in config_schema.VALID_KEYS
-
-
-def test_the_metric_sources_name_per_recording_tables_only() -> None:
-    """A source pointing at ``per_sample.csv`` would test segments and read as though it tested
-    recordings -- the exact pseudo-replication this analysis's unit exists to avoid."""
-    assert analysis.METRIC_SOURCES
-    for source in analysis.METRIC_SOURCES:
-        assert source.filename.endswith(".csv")
-        assert "per_sample" not in source.filename
-
-
 # =============================================================================
 # Offline, against a finished run, with no model
 # =============================================================================

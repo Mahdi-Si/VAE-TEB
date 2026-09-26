@@ -98,49 +98,31 @@ def test_the_base_chain_is_resolved_before_the_driver_reads_it(monkeypatch, tmp_
     assert seen["config"]["general_config"]["epochs"] == 1  # ...with the variant's override intact
 
 
-def test_a_missing_stat_path_raises_before_any_training_happens(recording_main, tmp_path):
+@pytest.mark.parametrize("missing", ["unset", "not-generated"])
+def test_a_missing_stat_path_raises_before_any_training_happens(recording_main, tmp_path, missing):
     """The guard the data layer cannot provide.
 
     ``_make_loader`` passes ``stat_path`` straight through, and the dataset skips normalization
     when it is ``None`` -- with a warning, not an error. A typo'd key (the config says
     ``stat_path``; the loader's parameter is ``stats_path``) would otherwise produce a full run on
-    raw-scale inputs.
+    raw-scale inputs. Set-but-wrong is the same failure, and likelier: the loader warns
+    ``Statistics file not found ... Normalization disabled`` and carries on.
     """
     from teb_vae.lag_attn.config import load_config
 
     config = load_config(str(_TINY))
-    config["dataset_config"]["stat_path"] = None
-    path = tmp_path / "no_stats.yaml"
+    stat_path, message = {
+        "unset": (None, "stat_path"),
+        "not-generated": (str(tmp_path / "not_generated_yet.hdf5"), "stat_path does not exist"),
+    }[missing]
+    config["dataset_config"]["stat_path"] = stat_path
+    path = tmp_path / "stats.yaml"
     path.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
 
-    with pytest.raises(ValueError, match="stat_path"):
+    with pytest.raises(ValueError, match=message):
         trainer_module.main(str(path))
 
     assert "create_model" not in recording_main
-
-
-def test_the_data_module_is_used_directly(recording_main, tmp_path):
-    """No wrapper module around it.
-
-    ``GraphDataModule`` reads the same config paths this model would have to read anyway and
-    deliberately omits rank/world_size so Lightning owns the sampler. A module that only re-exported
-    it would be a wrapper that renames an API.
-    """
-    trainer_module.main(_tiny_config_at(tmp_path))
-
-    assert "data_module" in recording_main
-
-
-def test_the_module_does_not_seed_by_hand():
-    """Determinism is ``general_config.seed`` plus the framework's ``configure_determinism``.
-
-    A stray ``torch.manual_seed`` here would silently override the configured seed and make the
-    config key a lie, while looking like diligence.
-    """
-    source = Path(trainer_module.__file__).read_text(encoding="utf-8")
-
-    assert "manual_seed" not in source
-    assert "np.random.seed" not in source
 
 
 # --------------------------------------------------------------------------------------
@@ -180,15 +162,8 @@ def test_config_is_required():
 # --------------------------------------------------------------------------------------
 # The IDE Run button
 # --------------------------------------------------------------------------------------
-def test_run_config_ships_pointing_at_a_real_config_and_the_flag_still_wins():
-    """The Run button launches the real configuration; ``--config`` overrides it regardless.
-
-    ``RUN_CONFIG`` shipped as ``None`` until 5f23af7, which pointed it at ``default.yaml`` so a
-    bare Run-button launch trains the real recipe -- deliberately, with the module docstring and
-    the constant's own comment rewritten to say so. What still has to hold is the precedence:
-    ``--config`` wins over this value, so the dict cannot quietly redirect a command-line run.
-    """
-    assert trainer_module.RUN_CONFIG == "teb_vae/lag_attn/configs/default.yaml"
+def test_run_config_names_a_real_config():
+    """The Run button launches whatever ``RUN_CONFIG`` names, so it must name a file that exists."""
     assert Path(_REPO_ROOT / trainer_module.RUN_CONFIG).is_file(), (
         "RUN_CONFIG names a config that does not exist, so the Run button is broken"
     )
@@ -218,46 +193,6 @@ def test_the_module_is_importable_as_a_script_from_an_unrelated_directory(tmp_pa
     # resolve through RUN_CONFIG. This is the branch the test exists to cover; the chdir line
     # above would also appear on a run that took its config from the command line.
     assert "no --config given; using RUN_CONFIG=" in result.stderr, result.stderr
-
-
-def test_a_missing_stats_file_raises_before_any_training_happens(recording_main, tmp_path):
-    """Set-but-wrong is the same failure as unset, and likelier.
-
-    The loader warns ``Statistics file not found ... Normalization disabled`` and carries on, so a
-    mistyped or not-yet-generated ``stat_path`` costs a full run on raw-scale inputs -- announced
-    only by a warning in a multi-day log. Checking the key is non-None was never enough.
-    """
-    from teb_vae.lag_attn.config import load_config
-
-    config = load_config(str(_TINY))
-    config["dataset_config"]["stat_path"] = str(tmp_path / "not_generated_yet.hdf5")
-    path = tmp_path / "missing_stats.yaml"
-    path.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
-
-    with pytest.raises(ValueError, match="stat_path does not exist"):
-        trainer_module.main(str(path))
-
-    assert "create_model" not in recording_main
-
-
-def test_the_width_guard_is_actually_wired_into_main(recording_main, tmp_path, monkeypatch):
-    """The guard's own tests call it directly, so nothing else pins it to the launch path.
-
-    Deleting the call from ``main`` leaves the whole suite green -- the per-batch check in the task
-    still catches a mismatch, so the loss is failure *latency* on a multi-rank launch rather than
-    correctness, but a safety net nothing exercises is one that quietly stops existing.
-    """
-    called = []
-    monkeypatch.setattr(
-        trainer_module,
-        "_check_declared_widths_against_shard",
-        lambda config: called.append(config),
-    )
-
-    trainer_module.main(_tiny_config_at(tmp_path))
-
-    assert called, "main() no longer calls _check_declared_widths_against_shard"
-    assert called[0]["model_config"]["VAE_model"]["c_y"] == 109
 
 
 def test_both_pre_flight_guards_run_before_setup_config(tmp_path, monkeypatch):

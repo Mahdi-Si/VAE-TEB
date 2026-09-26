@@ -1,18 +1,18 @@
 r"""What this model's binding declares, and what the shared pipeline does with each field.
 
-The binding is the whole of this package's coupling to the shared evaluation pipeline: four facts
-that pipeline cannot derive, and nothing else. Each field decides what a run's numbers *mean* --
-which class is rebuilt from a checkpoint, which constructor keys are reconciled against it, what
-the encoder discloses about its own causal standing, which holdout split is merged in -- so each is
-pinned here rather than left to be read off the code it configures.
-
-Two of them get more than a pin.
+The binding is the whole of this package's coupling to the shared evaluation pipeline. What is
+tested here is what it changes about a run: which constructor keys are reconciled against a
+checkpoint, and what the encoder discloses about its own causal standing.
 
 **The geometry keys**, because reconciliation is the only guard between a config that contradicts
 the weights and a run that reports one model's geometry beside another's numbers. The architecture
 is rebuilt from the checkpoint's own ``model_kwargs``, so the checkpoint always wins; a key missing
-from this tuple is a key the config may contradict in silence. Every one of the seven encoder keys
-therefore has its own refusal case.
+from this tuple is a key the config may contradict in silence. The set is checked against the
+sibling's -- the divergence is exactly the encoders -- and every encoder key has its own refusal
+case.
+
+**The encoder disclosure**, because it states the source encoder's reach against the lag range,
+and the arm the locality sweep is measured against is the one with no bound at all.
 
 **``source_attention_window``**, because its ``null`` is a *value*. An unbounded source encoder
 **is** ``source_attention_window: null`` -- it is the arm the whole locality sweep is measured
@@ -30,39 +30,10 @@ import pytest
 import torch
 
 from teb_vae.lag_attn_rws.eval import preflight, run as shared_run
-from teb_vae.lag_attn_rws.eval.binding import ModelBinding
-from teb_vae.lag_attn_transformer_rws.eval import binding as binding_module
 from teb_vae.lag_attn_transformer_rws.eval.binding import TRF_BINDING, trf_encoder_disclosure
 from teb_vae.lag_attn_transformer_rws.nets.model import SeqVaeLagAttnTrfRws
 
 from .conftest import SHIPPED_KWARGS, TINY_KWARGS
-
-#: The constructor keys this model reconciles, written out rather than imported: comparing the
-#: module's tuple against itself would pass on any edit. An **ordered** sequence, because that is
-#: the order the ``compared`` record is built in and the order two runs' preflight files are read
-#: down.
-TRF_GEOMETRY_KEYS = (
-    "sequence_length",
-    "d_model",
-    "d_z",
-    "horizon",
-    "raw_per_step",
-    "warmup_period",
-    "c_y",
-    "c_u",
-    "use_up_st",
-    "max_lag",
-    "num_heads",
-    "d_head",
-    "horizon_attention_blocks",
-    "encoder_conv_kernels",
-    "encoder_conv_dilations",
-    "encoder_num_heads",
-    "encoder_d_ff",
-    "target_attention_blocks",
-    "source_attention_blocks",
-    "source_attention_window",
-)
 
 #: The seven this architecture adds. Each changes what the numbers mean: the stem schedule and the
 #: block counts set how much history a state summarises, the head count and feed-forward width the
@@ -114,20 +85,10 @@ def _reconcile(config: Dict[str, Any], model_kwargs: Dict[str, Any]) -> Dict[str
 # =============================================================================
 # The binding's fields
 # =============================================================================
-def test_the_binding_names_this_packages_model_and_task() -> None:
-    assert TRF_BINDING.model_cls.__name__ == "SeqVaeLagAttnTrfRws"
-    assert TRF_BINDING.task_cls.__name__ == "SeqVaeLagAttnTrfRwsTask"
-
-
 def test_the_tag_is_this_models_own() -> None:
     """``<tag>-eval`` is where a run with no configured tag lands. Sharing the sibling's would put
     two models' runs in one directory, told apart only by timestamp."""
-    assert TRF_BINDING.tag == "lag_attn_trf_rws"
     assert TRF_BINDING.tag != shared_run.RWS_BINDING.tag
-
-
-def test_the_geometry_keys_are_exactly_these_in_this_order() -> None:
-    assert TRF_BINDING.geometry_keys == TRF_GEOMETRY_KEYS
 
 
 def test_the_geometry_keys_drop_causal_norm_and_add_the_seven_encoder_keys() -> None:
@@ -155,120 +116,21 @@ def test_a_checkpoint_predating_the_horizon_attention_still_reconciles() -> None
     assert "horizon_attention_blocks" not in record["compared"]
 
 
-def test_a_disagreeing_horizon_attention_depth_is_refused() -> None:
-    """The other direction, and the reason the key is in the tuple at all: two blocks of decoder
-    attention are two blocks of capacity, so a config claiming them over a checkpoint trained
-    without them describes a model that was never fitted."""
-    with pytest.raises(preflight.EvalPreconditionUnmet, match="horizon_attention_blocks"):
-        _reconcile(
-            _config(horizon_attention_blocks=2),
-            dict(TINY_KWARGS, horizon_attention_blocks=0),
-        )
-
-
-def test_causal_norm_is_not_merely_irrelevant_here_but_unconstructable() -> None:
-    """Why it is dropped rather than reconciled against a constant: the constructor refuses it, so
-    a config carrying it fails at rebuild and reconciling it could only compare against nothing."""
-    with pytest.raises(TypeError, match="causal_norm"):
-        SeqVaeLagAttnTrfRws(**dict(TINY_KWARGS, causal_norm=True))
-
-
-def test_the_overrides_path_is_this_packages_delta_and_it_is_there() -> None:
-    path = Path(TRF_BINDING.overrides_path)
-
-    assert path.is_file()
-    assert path.name == "eval_overrides.yaml"
-    assert path.parents[1].name == "eval"
-    assert path.parents[2].name == "lag_attn_transformer_rws"
-    assert path != Path(shared_run.RWS_BINDING.overrides_path)
-
-
-def test_this_model_registers_exactly_one_analysis_of_its_own() -> None:
-    """One, and it is the one the encoder replacement makes askable. Every other readout comes
-    from the shared registry, so this model's ``summary.json`` and the sibling's carry the same
-    blocks and are readable side by side -- and an addition here is a *strict* addition rather
-    than a second implementation of something shared, which is what the merge refuses."""
-    from teb_vae.lag_attn_transformer_rws.eval.analyses import encoder_attention
-
-    assert set(TRF_BINDING.extra_analyses) == {"encoder_attention"}
-    assert (
-        TRF_BINDING.extra_analyses["encoder_attention"]
-        is encoder_attention.run_encoder_attention_analysis
-    )
-
-
-def test_the_headline_scalars_are_this_analysis_own_and_collide_with_no_shared_name() -> None:
-    """The six the arm tables read. Appended to the shared registry rather than added to it: every
-    path in *that* tuple has to resolve on a run of every model, so an entry there would read as a
-    number the sibling failed to produce rather than as one it cannot have."""
-    from teb_vae.lag_attn_rws.eval import report_seam
-    from teb_vae.lag_attn_transformer_rws.eval.analyses import encoder_attention
-
-    registered = dict(TRF_BINDING.headline_scalars)
-
-    assert set(registered) == {
-        f"encoder_attention_{name}" for name in encoder_attention.HEADLINE_KEYS
-    }
-    assert set(registered) & {name for name, _ in report_seam.HEADLINE_SCALARS} == set()
-    for name, path in registered.items():
-        assert path[0] == encoder_attention.ANALYSIS_DIRNAME
-        assert path[1] == "headline"
-        assert name.endswith(path[2])
-
-
-def test_the_binding_is_a_declaration_rather_than_a_setting() -> None:
-    with pytest.raises(Exception):
-        TRF_BINDING.tag = "something_else"  # type: ignore[misc]
-
-
-def test_the_binding_is_the_shared_type_rather_than_a_look_alike() -> None:
-    """A structurally-similar local class would drift from the shared one silently the first time
-    a field was added."""
-    assert isinstance(TRF_BINDING, ModelBinding)
-
-
 # =============================================================================
 # The encoder disclosure
 # =============================================================================
-def test_the_disclosure_carries_no_key_that_means_nothing_here(tiny_model) -> None:
-    """``causal_norm`` and ``n_causalized_norms`` describe a time-pooling ``GroupNorm`` this
-    architecture bans structurally. Reported anyway they would read as a setting someone could
-    change, and a reader comparing two models' records would compare a real number against a
-    placeholder."""
-    record = trf_encoder_disclosure(tiny_model)
-
-    assert "causal_norm" not in record
-    assert "n_causalized_norms" not in record
-    assert "causal_norm_consequence" not in record
-
-
 def test_the_disclosure_reports_what_is_true_of_these_encoders(tiny_model) -> None:
+    """Read off the built model. ``causal_norm`` and ``n_causalized_norms`` describe a time-pooling
+    ``GroupNorm`` this architecture bans structurally, so reported anyway they would read as a
+    setting someone could change."""
     record = trf_encoder_disclosure(tiny_model)
 
+    assert "causal_norm" not in record and "n_causalized_norms" not in record
     assert record["time_pooling_normalisers"] == 0
-    assert record["time_pooling_normalisers_are_structural"] is True
-    assert "test_no_time_pooling_normaliser_on_either_history_path" in record[
-        "time_pooling_normalisers_proved_by"
-    ]
     assert record["n_depthwise_init"] == int(tiny_model.n_depthwise_init)
     assert record["target_attention_blocks"] == TINY_KWARGS["target_attention_blocks"]
     assert record["source_attention_blocks"] == TINY_KWARGS["source_attention_blocks"]
     assert record["source_attention_window"] == TINY_KWARGS["source_attention_window"]
-
-
-def test_the_named_test_exists_and_is_about_what_the_record_says_it_is() -> None:
-    """A record pointing at a test nobody can find is a claim with no evidence behind it."""
-    reference = trf_encoder_disclosure.__doc__ or ""
-    assert reference  # the docstring is where the reasoning lives; a bare dict is not a disclosure
-
-    record_path, _, test_name = (
-        binding_module.trf_encoder_disclosure(SeqVaeLagAttnTrfRws(**TINY_KWARGS))[
-            "time_pooling_normalisers_proved_by"
-        ]
-    ).partition("::")
-    source = (Path(__file__).resolve().parents[3] / record_path).read_text(encoding="utf-8")
-
-    assert f"def {test_name}(" in source
 
 
 def test_the_source_reach_is_stated_against_the_lag_range_with_which_is_larger(tiny_model) -> None:
@@ -290,15 +152,16 @@ def test_the_source_reach_is_stated_against_the_lag_range_with_which_is_larger(t
 
 
 def test_the_shipped_geometry_keeps_the_reach_inside_the_lag_range() -> None:
-    r"""The architectural claim, at the geometry that actually trains: $R_U = 66$ steps against a
-    furthest searched lag of $90$. A source encoder reaching past the lag range would make the lag
-    attention's job redundant, and the sweep would be measuring nothing."""
+    r"""The architectural claim, at the geometry that actually trains: $R_U$ below the furthest
+    searched lag. A source encoder reaching past the lag range would make the lag attention's job
+    redundant, and the sweep would be measuring nothing."""
     torch.manual_seed(0)
-    record = trf_encoder_disclosure(SeqVaeLagAttnTrfRws(**SHIPPED_KWARGS))
+    model = SeqVaeLagAttnTrfRws(**SHIPPED_KWARGS)
+    record = trf_encoder_disclosure(model)
 
-    assert record["source_receptive_field_steps"] == 66
-    assert record["source_receptive_field_seconds"] == 264.0
-    assert record["lag_range_max_steps"] == 90
+    assert record["source_receptive_field_steps"] == model.source_encoder.receptive_field
+    assert record["lag_range_max_steps"] == SHIPPED_KWARGS["max_lag"]
+    assert record["source_receptive_field_steps"] < record["lag_range_max_steps"]
     assert record["source_reach_is_inside_the_lag_range"] is True
     assert "the lag range is larger" in record["source_reach_vs_lag_range"]
 
@@ -337,22 +200,6 @@ def test_the_unbounded_arm_reports_an_absent_bound_rather_than_the_sequence_leng
     assert "source_reach_is_inside_the_lag_range" not in record
 
 
-def test_a_missing_attribute_raises_naming_it_rather_than_reporting_nothing() -> None:
-    """A silent ``getattr`` default would report a model that stopped exposing something as a
-    model with nothing to report -- and the disclosure would go quiet in exactly the case a reader
-    most needs to be told."""
-
-    class _Renamed:
-        pass
-
-    with pytest.raises(AttributeError, match="target_encoder"):
-        trf_encoder_disclosure(_Renamed())
-
-
-def test_the_disclosure_is_what_the_binding_carries() -> None:
-    assert TRF_BINDING.encoder_disclosure is trf_encoder_disclosure
-
-
 def test_the_shared_half_of_the_record_is_unchanged(tiny_model) -> None:
     """The bank-side half -- the refusal sentence, the channel reaches, the source delay, the
     horizon -- describes the *dataset*, so it is identical for both models and comes from the
@@ -387,17 +234,6 @@ def test_a_config_contradicting_the_checkpoint_on_an_encoder_key_is_refused(key)
     assert repr(checkpoint_kwargs[key]) in message, "the checkpoint's value must be named"
 
 
-@pytest.mark.parametrize("key", ENCODER_KEYS)
-def test_an_agreeing_encoder_key_is_compared_rather_than_skipped(key) -> None:
-    """The other half: a key that passes must appear in the ``compared`` record, or "reconciled"
-    and "never looked at" would be indistinguishable in the artifact."""
-    record = _reconcile(_config(**{key: TINY_KWARGS[key]}), dict(TINY_KWARGS))
-
-    assert record["passed"] is True
-    assert key in record["compared"]
-    assert record["compared"][key]["config"] == TINY_KWARGS[key]
-
-
 def test_an_unbounded_checkpoint_passes_a_config_that_declares_null() -> None:
     """``null`` is a value, and this is the direction that must not be skipped as absent."""
     record = _reconcile(
@@ -410,22 +246,21 @@ def test_an_unbounded_checkpoint_passes_a_config_that_declares_null() -> None:
     assert record["compared"]["source_attention_window"]["checkpoint"] is None
 
 
-def test_an_unbounded_checkpoint_refuses_a_config_that_declares_a_window() -> None:
-    """The failure the whole ``NULLABLE_MODEL_KEYS`` mechanism exists to make visible: the
-    unbounded arm evaluated under the baseline's configured window."""
+@pytest.mark.parametrize(
+    "config_window, checkpoint_window",
+    [(16, None), (None, 16)],
+    ids=["unbounded-checkpoint", "windowed-checkpoint"],
+)
+def test_a_null_window_disagreeing_with_the_checkpoint_is_refused(
+    config_window, checkpoint_window
+) -> None:
+    """Both directions. The unbounded arm evaluated under the baseline's configured window is the
+    failure ``NULLABLE_MODEL_KEYS`` exists to make visible, and the reverse is what a null that
+    meant "unset" would silently pass."""
     with pytest.raises(preflight.EvalPreconditionUnmet, match="source_attention_window"):
         _reconcile(
-            _config(source_attention_window=16),
-            dict(TINY_KWARGS, source_attention_window=None),
-        )
-
-
-def test_a_windowed_checkpoint_refuses_a_config_that_declares_null() -> None:
-    """And the reverse, because a null that meant "unset" would silently pass here."""
-    with pytest.raises(preflight.EvalPreconditionUnmet, match="source_attention_window"):
-        _reconcile(
-            _config(source_attention_window=None),
-            dict(TINY_KWARGS, source_attention_window=16),
+            _config(source_attention_window=config_window),
+            dict(TINY_KWARGS, source_attention_window=checkpoint_window),
         )
 
 

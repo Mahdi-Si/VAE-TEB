@@ -1,42 +1,36 @@
 r"""The stored-timeline lag quantity, pinned.
 
 The failure this guards against is not a crash: it is a figure axis or a reported number that
-silently carries -- or silently drops -- the input-delay term, or that reintroduces a dataset
-shift the stored timeline does not have. Both arms are asserted with literal expected values rather
-than by re-deriving the formula, because a test that recomputes the arithmetic under test passes
-whatever the arithmetic happens to be.
+silently carries -- or silently drops -- the input-delay term $\delta$. The expected values are
+literals rather than a re-derivation of the formula, because a test that recomputes the
+arithmetic under test passes whatever the arithmetic happens to be.
 """
 from __future__ import annotations
 
 import pytest
 import torch
 
-from teb_vae.lag_attn.nets import lag_report
-from teb_vae.lag_attn.nets.lag_report import SECONDS_PER_STEP, lag_compensated_seconds
-
-
-def test_the_step_constant_is_the_pipelines_and_there_is_no_shift_constant():
-    """$4$ s per decimated step, and no dataset-shift constant at all: the stored UP/FHR timeline
-    is canonical, so the builder's shift is never undone downstream."""
-    assert SECONDS_PER_STEP == pytest.approx(4.0)
-    assert not hasattr(lag_report, "MECHANICAL_SHIFT_SECONDS")
-    assert not hasattr(lag_report, "lag_original_sensor_seconds")
+from teb_vae.lag_attn.nets.lag_report import lag_compensated_seconds
 
 
 @pytest.mark.parametrize(
-    ("lag_step", "expected"), [(0, 0.0), (1, 4.0), (5, 20.0), (90, 360.0)]
+    ("lag_step", "delay_steps", "expected"),
+    [
+        # $\delta = 0$: the default, and the whole ungated configuration.
+        (0, 0, 0.0),
+        (1, 0, 4.0),
+        (5, 0, 20.0),
+        (90, 0, 360.0),
+        # A source memory read $\delta$ steps stale puts the true lag $\delta$ steps further back;
+        # dropping the term would report a delayed channel as if it were prompt.
+        (0, 30, 120.0),
+        (5, 3, 32.0),
+        (10, 30, 160.0),
+    ],
 )
-def test_with_no_input_delay_the_compensated_lag_is_four_seconds_a_step(lag_step, expected):
-    """$\\delta = 0$: the default, and the whole ungated configuration."""
-    assert lag_compensated_seconds(lag_step) == pytest.approx(expected)
-
-
-@pytest.mark.parametrize(
-    ("lag_step", "delay_steps", "expected"), [(0, 30, 120.0), (5, 3, 32.0), (10, 30, 160.0)]
-)
-def test_a_nonzero_input_delay_lengthens_the_reported_lag(lag_step, delay_steps, expected):
-    """A source memory read $\\delta$ steps stale puts the true lag $\\delta$ steps further back;
-    dropping the term would report a delayed channel as if it were prompt."""
+def test_the_compensated_lag_is_four_seconds_a_step_plus_the_input_delay(
+    lag_step, delay_steps, expected
+):
     assert lag_compensated_seconds(lag_step, delay_steps=delay_steps) == pytest.approx(expected)
 
 

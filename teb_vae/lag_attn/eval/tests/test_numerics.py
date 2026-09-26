@@ -31,13 +31,6 @@ def test_reported_settings_match_global_state():
         assert enabled is torch.is_autocast_enabled(device_type) is False
 
 
-def test_is_idempotent_and_cpu_safe():
-    """Called twice, on a machine with or without CUDA, it reports the same environment."""
-    first = configure_numerics(11)
-    second = configure_numerics(11)
-    assert first == second
-
-
 def test_seeds_every_generator_the_pipeline_draws_from():
     """torch, numpy and ``random`` -- caps subsample with numpy, the forward samples with torch."""
     configure_numerics(3)

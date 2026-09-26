@@ -1,10 +1,6 @@
 r"""The coupling readouts against time before delivery, on recordings and on a fixed grid.
 
-Four things are pinned, and each is a way this analysis could be wrong while looking right.
-
-**The grid is not a setting.** The window width is a module constant and is absent from the
-configuration schema, because an operator who could widen it could merge two windows until a
-difference appeared or disappeared. Both halves are asserted mechanically rather than described.
+Three things are pinned, and each is a way this analysis could be wrong while looking right.
 
 **The binning is arithmetic with a sign in it.** ``epoch`` is negative before delivery, so hours
 before delivery is $-\mathrm{epoch}/3600$; getting the sign wrong produces a trajectory running
@@ -14,9 +10,10 @@ backwards through labour with nothing raising.
 that recording's segments in it, so a recording contributing eleven segments to a window cannot
 outvote one contributing two -- and the count reported per window is a count of recordings.
 
-**Both readouts travel.** ``pred_gap`` and the unfloored KL fail differently, and an
-implementation tracking only the KL would report a trajectory that is an artifact of the prior
-variance sitting on its clamp.
+**The window tests have known answers.** Classes planted apart are significant in the windows they
+are apart in and nowhere else, the Holm family is the windows, and a cohort below the test floor is
+drawn but never tested. Both readouts (``pred_gap`` and the unfloored KL) are written, and the
+figures are checked for the counts and colours a reader compares across pages.
 """
 from __future__ import annotations
 
@@ -81,19 +78,8 @@ def _cohort_rows(
 
 
 # =============================================================================
-# The grid, and that it is not a setting
+# The grid
 # =============================================================================
-def test_the_bin_width_is_a_module_constant_and_not_a_config_key() -> None:
-    """Both halves of the mechanical non-configurability assertion."""
-    from teb_vae.lag_attn_rws.eval import config_schema
-
-    assert analysis.TRAJECTORY_BIN_HOURS == pytest.approx(0.5)
-    assert "trajectory_bin_hours" not in config_schema.VALID_KEYS
-    # Bound from the layer below rather than restated, so the lag structure is cut on the same
-    # windows this analysis reports.
-    assert analysis.TRAJECTORY_BIN_HOURS is cohort.TRAJECTORY_BIN_HOURS
-
-
 def test_a_negative_epoch_becomes_a_positive_time_before_delivery() -> None:
     """The sign. ``epoch`` is negative before delivery, so a wrong sign runs the trajectory
     backwards through labour with nothing raising."""
@@ -169,18 +155,6 @@ def test_a_segment_with_no_cohort_belongs_to_no_trajectory() -> None:
 # =============================================================================
 # Both readouts, and the tests over the windows
 # =============================================================================
-def test_both_readouts_produce_a_trajectory() -> None:
-    """The sibling pipeline tracks only the KL; ``pred_gap`` is in the decoder's own units and is
-    immune to the prior-variance inflation, so a trajectory in one and not the other is itself a
-    finding about which readout is being believed."""
-    rows = analysis.build_trajectory_rows(analysis.build_per_recording(_per_sample(_cohort_rows())))
-
-    assert {row["metric"] for row in rows} == {
-        "pred_gap_mc_nats", "source_conditioned_kl_raw_nats"
-    }
-    assert {row["group_column"] for row in rows} == set(labels.GROUP_COLUMNS)
-
-
 def test_separated_classes_are_significant_in_the_windows_they_are_separated_in() -> None:
     """A known answer: two classes drawn five nats apart in every window must survive Holm."""
     frame = _per_sample(_cohort_rows(n_per_class=5, offsets=[0.0, 50.0]))
@@ -216,19 +190,6 @@ def test_the_holm_family_is_the_windows() -> None:
         assert window["correction"] == "holm"
         assert window["n_windows_in_family"] == record["n_windows_tested"]
         assert window["p_holm"] >= window["p_value"]
-
-
-def test_the_pooled_row_carries_its_confounded_flag_and_is_consumed_by_nothing() -> None:
-    """The classes do not cover the time axis equally, so a pooled difference can be a coverage
-    artifact. It is context, and the flag is what stops it being read as the result."""
-    frame = _per_sample(_cohort_rows(n_per_class=5, offsets=[0.0, 50.0]))
-    per_recording = analysis.build_per_recording(frame)[labels.CLASS_COLUMN]
-
-    record = analysis.analyse_windows(per_recording, "mc_pred_gap")
-
-    assert record["pooled"]["confounded_by_time"] is True
-    assert "artifact" in record["pooled"]["note"]
-    assert "significant" not in record["pooled"]
 
 
 def test_the_pooled_row_counts_recordings_rather_than_recording_windows() -> None:

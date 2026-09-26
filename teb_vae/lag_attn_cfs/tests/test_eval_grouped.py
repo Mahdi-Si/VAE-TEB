@@ -1,18 +1,10 @@
 r"""By-class and by-subgroup variants, written beside the pooled output and never in place of it.
 
-The degenerate cases are the ones the implementation is written for -- a single-cohort split, a
-group column that is entirely unlabelled, a cohort holding one recording -- but they are *not*
-what this file leads with, because every one of them would pass with the emission unimplemented.
-So the happy path is asserted first, by composition and by hand-computed value: two groups of
-known size produce exactly $2 \times n_{\mathrm{metrics}}$ rows, a group holding two NaNs among
-five values reports $n = 3$ rather than a mean over a population that looks healthy, the figure
-carries exactly two violin bodies, and each median is the number a reader would compute by hand.
-
-Then the skips. A single-group frame is a *recorded* skip rather than a one-violin figure: one
-violin invites a comparison there is nothing to compare against, and on the healthy-only
-pretraining split that is the ordinary case rather than an error. And in every case the pooled
-output the analysis already wrote is untouched, so a run over a single-cohort split produces
-exactly what it produced before grouped variants existed.
+The summary arithmetic and the emitter's own skip rules are the shared layer's and are tested
+there. What is checked here is this package's wrapper around the emitter -- both axes emitted, a
+cohort of one reported with its $n$ rather than dropped -- and the runner's fan-out over a frame an
+analysis only *declares*. A single-group frame is a *recorded* skip rather than a one-violin
+figure, and in every case the pooled output the analysis already wrote is untouched.
 
 **The empty-frame path is a case here rather than an assumption**, because it is the one that
 breaks something downstream rather than here: an empty CSV allowed through the fan-out is what
@@ -30,11 +22,9 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import pytest
-from matplotlib.collections import PolyCollection
 
-from teb_vae.lag_attn.eval import figures as shared_figures
 from teb_vae.lag_attn_cfs.eval._reuse import labels
-from teb_vae.lag_attn_cfs.eval.report_seam import emit_grouped_variants, summarise_by_group
+from teb_vae.lag_attn_cfs.eval.report_seam import emit_grouped_variants
 
 #: The metrics a grouped variant is asked for here. Two, so a row count of ``2 x n_metrics``
 #: cannot coincide with a row count of ``2 x n_groups``.
@@ -69,78 +59,11 @@ def two_class_frame() -> pd.DataFrame:
 
 
 # =============================================================================
-# The reserved filenames
-# =============================================================================
-def test_the_reserved_suffixes_are_the_two_the_emitter_actually_writes(
-    two_class_frame, tmp_path
-) -> None:
-    """Non-vacuity for every assertion made against :data:`GROUPED_SUFFIXES` elsewhere: the two
-    strings are compared against the files the emitter puts on disk rather than against a
-    convention this module would then be the only witness to."""
-    emit_grouped_variants(two_class_frame, tmp_path, value_columns=_METRICS)
-
-    written = sorted(path.name for path in tmp_path.glob("*.pdf"))
-
-    assert GROUPED_SUFFIXES == ("_by_clinical_class.pdf", "_by_subgroup.pdf")
-    assert written and all(name.endswith(GROUPED_SUFFIXES) for name in written)
-
-
-def test_no_shipped_analysis_names_a_figure_into_the_reserved_shape() -> None:
-    """Across the package rather than per analysis, so an analysis added later is covered by a
-    test it did not have to remember to write. A figure named into the reserved family is never
-    recorded in the manifest and never documented -- it reads to an operator as one of the violin
-    figures it is not."""
-    import ast
-
-    from teb_vae.lag_attn_cfs.eval import analyses as analyses_package
-
-    root = Path(analyses_package.__file__).parent
-    offending = []
-    for path in sorted(root.glob("*.py")):
-        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
-            if isinstance(node, ast.Constant) and isinstance(node.value, str):
-                if node.value.endswith(GROUPED_SUFFIXES):
-                    offending.append(f"{path.name}: {node.value}")
-
-    assert offending == [], offending
-
-
-# =============================================================================
 # The happy path
 # =============================================================================
-def test_the_summary_has_one_row_per_group_and_metric(two_class_frame) -> None:
-    summary = summarise_by_group(two_class_frame, labels.CLASS_COLUMN, _METRICS)
-
-    assert len(summary) == 2 * len(_METRICS)
-    assert set(summary["group"]) == {"healthy", "acidosis"}
-    assert set(summary["metric"]) == set(_METRICS)
-    assert list(summary.columns) == ["group", "metric", "n", "mean", "q25", "median", "q75"]
-
-
-def test_n_counts_finite_values_only(two_class_frame) -> None:
-    """A group of NaNs must report ``n = 0``, not a mean of NaN over a healthy-looking count."""
-    summary = summarise_by_group(two_class_frame, labels.CLASS_COLUMN, _METRICS)
-    healthy_gap = summary[
-        (summary["group"] == "healthy") & (summary["metric"] == "pred_gap")
-    ].iloc[0]
-
-    assert int(healthy_gap["n"]) == 3
-    assert float(healthy_gap["mean"]) == pytest.approx(2.0)
-
-
-def test_each_quartile_matches_the_hand_computed_value(two_class_frame) -> None:
-    summary = summarise_by_group(two_class_frame, labels.CLASS_COLUMN, _METRICS)
-    acidosis_gap = summary[
-        (summary["group"] == "acidosis") & (summary["metric"] == "pred_gap")
-    ].iloc[0]
-
-    # [10, 20, 30, 40, 50]: linear interpolation puts the quartiles on the samples themselves.
-    assert float(acidosis_gap["median"]) == pytest.approx(30.0)
-    assert float(acidosis_gap["q25"]) == pytest.approx(20.0)
-    assert float(acidosis_gap["q75"]) == pytest.approx(40.0)
-
-
 def test_both_grouping_axes_emit_a_table_and_a_figure(two_class_frame, tmp_path) -> None:
+    """Also the non-vacuity for every assertion made against :data:`GROUPED_SUFFIXES` elsewhere:
+    the reserved endings are compared against the files the emitter actually puts on disk."""
     emitted = emit_grouped_variants(two_class_frame, tmp_path, value_columns=_METRICS)
 
     assert sorted(emitted) == sorted(labels.GROUP_COLUMNS)
@@ -152,34 +75,8 @@ def test_both_grouping_axes_emit_a_table_and_a_figure(two_class_frame, tmp_path)
         assert table.is_file() and figure.is_file() and figure.stat().st_size > 0
         assert len(pd.read_csv(table)) == 2 * len(_METRICS)
         assert record["n_per_group"] == {group: 5 for group in record["groups"]}
-
-
-def test_the_figure_carries_one_violin_body_per_group(two_class_frame) -> None:
-    """Read off the in-memory figure rather than the PDF: what reaches the page is what an
-    operator compares, and a violin silently missing is exactly the failure a file-size check
-    would pass."""
-    groups = ["healthy", "acidosis"]
-    values = {
-        metric: {
-            group: np.asarray(
-                two_class_frame.loc[two_class_frame[labels.CLASS_COLUMN] == group, metric],
-                dtype=np.float64,
-            )
-            for group in groups
-        }
-        for metric in _METRICS
-    }
-
-    figure, axes = shared_figures.grouped_violin_figure(values, groups)
-    try:
-        per_row = [
-            len([a for a in axes[row, 0].collections if isinstance(a, PolyCollection)])
-            for row in range(len(_METRICS))
-        ]
-    finally:
-        shared_figures.plt.close(figure)
-
-    assert per_row == [2, 2]
+    written = [path.name for path in tmp_path.glob("*.pdf")]
+    assert written and all(name.endswith(GROUPED_SUFFIXES) for name in written)
 
 
 def test_a_cohort_with_one_recording_produces_a_row_with_its_n_visible(tmp_path) -> None:
@@ -202,58 +99,6 @@ def test_a_cohort_with_one_recording_produces_a_row_with_its_n_visible(tmp_path)
     lonely = table[table["group"] == "hie"].iloc[0]
     assert int(lonely["n"]) == 1
     assert float(lonely["mean"]) == pytest.approx(9.0)
-
-
-# =============================================================================
-# The recorded skips
-# =============================================================================
-def test_a_single_cohort_split_records_a_skip_and_writes_no_figure(tmp_path) -> None:
-    """The ordinary case on the healthy-only pretraining split, and not an error."""
-    frame = pd.DataFrame(
-        {
-            labels.CLASS_COLUMN: ["healthy"] * 4,
-            labels.SUBGROUP_COLUMN: ["healthy_no_bg_no_cs"] * 4,
-            "pred_gap": [1.0, 2.0, 3.0, 4.0],
-        }
-    )
-
-    emitted = emit_grouped_variants(frame, tmp_path, value_columns=["pred_gap"])
-
-    for axis in labels.GROUP_COLUMNS:
-        assert emitted[axis]["skipped"] is True
-        assert "nothing to compare" in emitted[axis]["reason"]
-    assert list(tmp_path.iterdir()) == []
-
-
-def test_an_unlabelled_group_column_records_a_skip_rather_than_raising(tmp_path) -> None:
-    """``None`` is not a cohort. Folding the unlabelled samples together would create one named
-    after the absence, and every by-class number would then include it."""
-    frame = pd.DataFrame(
-        {
-            labels.CLASS_COLUMN: [None, None, None],
-            labels.SUBGROUP_COLUMN: [None, None, None],
-            "pred_gap": [1.0, 2.0, 3.0],
-        }
-    )
-
-    emitted = emit_grouped_variants(frame, tmp_path, value_columns=["pred_gap"])
-
-    assert all(emitted[axis]["skipped"] is True for axis in labels.GROUP_COLUMNS)
-    assert list(tmp_path.iterdir()) == []
-
-
-def test_a_metric_absent_from_the_frame_is_skipped_rather_than_raising(
-    two_class_frame, tmp_path
-) -> None:
-    """An analysis may name a metric it only sometimes produces; a grouped variant is an addition
-    to a run and must not mark a successful analysis failed."""
-    emitted = emit_grouped_variants(
-        two_class_frame, tmp_path, value_columns=["pred_gap", "not_a_column"]
-    )
-
-    table = pd.read_csv(tmp_path / f"per_sample_by_{labels.CLASS_COLUMN}.csv")
-    assert emitted[labels.CLASS_COLUMN]["skipped"] is False
-    assert set(table["metric"]) == {"pred_gap"}
 
 
 # =============================================================================
@@ -412,68 +257,3 @@ def test_a_relative_declaration_resolves_against_the_results_directory(
         assert record["files"]["table"] == f"fake_analysis/fake_per_recording_by_{axis}.csv"
         assert not Path(record["files"]["figure"]).is_absolute()
     assert not Path(result["grouped_frames"][0]["path"]).is_absolute()
-
-
-# =============================================================================
-# Across the pipeline, on a real run
-#
-# The fan-out is proved above on a fake analysis, which is what says the *runner* does it. What is
-# proved here is that the shipped analyses actually declare a frame -- an analysis that forgot
-# would report a pooled number over a mixed cohort with nothing saying so, and no test of the
-# mechanism would notice.
-# =============================================================================
-#: The registered analyses expected to declare a per-recording frame, each with the **file stems**
-#: it declares. Written out rather than discovered, so an analysis that stopped declaring one fails
-#: here with its own name; the entries arrive as their analyses land. ``coupling`` declares two,
-#: because a gap in nats and a KL in nats do not share a scale and so do not share a page.
-_PARTICIPATING = {
-    "coupling": ("coupling_pred_gap", "coupling_kl"),
-    "latent": ("latent_per_recording",),
-}
-
-
-@pytest.mark.slow
-def test_every_participating_analysis_emits_both_cuts_on_a_real_run(collected_run) -> None:
-    """Both variants, per analysis, on the generated multi-subgroup shards -- which carry three
-    clinical classes and four subgroups, so neither axis is a degenerate one."""
-    results = collected_run["summary"]["results"]
-
-    for analysis, stems in _PARTICIPATING.items():
-        grouped = results[analysis].get("grouped")
-        assert grouped, f"{analysis} declared no grouped frame"
-        for stem, axis in ((stem, axis) for stem in stems for axis in labels.GROUP_COLUMNS):
-            assert stem in grouped, f"{analysis} declared no {stem!r} frame"
-            record = grouped[stem][axis]
-            assert record["skipped"] is False, f"{analysis}/{axis}: {record.get('reason')}"
-            for kind in ("table", "figure"):
-                path = collected_run["results_dir"] / record["files"][kind]
-                assert path.is_file(), path
-            # The unit is the recording: the counts here are per-cohort recording counts, and
-            # they must sum to the run's own recording count rather than to its segment count.
-            assert sum(record["n_per_group"].values()) <= results["n_recordings"]
-
-
-@pytest.mark.slow
-def test_the_grouped_tables_are_summaries_of_per_recording_values(collected_run) -> None:
-    """One row per (cohort, metric), with ``n`` counting recordings -- not the long-form frame."""
-    from teb_vae.lag_attn_cfs.eval.analyses import coupling as coupling_analysis
-
-    grouped = collected_run["summary"]["results"]["coupling"]["grouped"]
-    # Both fan-outs, because between them they must cover every metric the analysis resolves by
-    # cohort: a split that dropped one would leave the other's table looking perfectly correct.
-    for stem, metrics in (
-        (coupling_analysis.GROUPED_PRED_GAP_STEM, coupling_analysis.GROUPED_PRED_GAP_METRICS),
-        (coupling_analysis.GROUPED_KL_STEM, coupling_analysis.GROUPED_KL_METRICS),
-    ):
-        record = grouped[stem]
-        table = pd.read_csv(
-            collected_run["results_dir"] / record[labels.CLASS_COLUMN]["files"]["table"]
-        )
-
-        groups = set(record[labels.CLASS_COLUMN]["groups"])
-        assert list(table.columns) == ["group", "metric", "n", "mean", "q25", "median", "q75"]
-        assert len(table) == len(groups) * len(metrics)
-        assert set(table["metric"]) == set(metrics)
-        assert int(table["n"].sum()) <= collected_run["summary"]["results"][
-            "n_recordings"
-        ] * len(metrics)

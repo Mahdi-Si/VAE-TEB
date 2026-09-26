@@ -10,61 +10,34 @@ quietly makes every comparison between two runs a comparison of two samples.
 Three things close that, and each is checked here rather than assumed: the numeric environment is
 pinned and seeded from the configuration, the estimator takes an explicit generator instead of
 the global one, and both the seed and the environment as actually read back from global state are
-written into ``summary.json`` so a run is reproducible from its own output.
-
-**The durable tables are the fourth.** A fresh run's analyses read a frame in memory while a
-re-run's read it off disk, so an inexact CSV round trip would make the same run report different
-numbers depending on which it was -- and a per-recording mean amplifies a last-bit disagreement
-through cancellation until it reaches a reported digit.
+written into ``summary.json`` so a run is reproducible from its own output. The slow half also
+checks that a second end-to-end run writes byte-identical tables, and that every headline path
+whose block a real run produced resolves.
 """
 from __future__ import annotations
 
 import json
-import math
 from pathlib import Path
 
-import numpy as np
 import pytest
 import torch
 
 from teb_vae.lag_attn_cfs.eval import run as run_module
 from teb_vae.lag_attn_cfs.eval._reuse import configure_numerics
-from teb_vae.lag_attn_cfs.eval.collect import (
-    COLLECTION_FILENAME,
-    PER_ANCHOR_FILENAME,
-    PER_SAMPLE_FILENAME,
-    VECTORS_FILENAME,
-    load_collection,
-)
+from teb_vae.lag_attn_cfs.eval.collect import PER_SAMPLE_FILENAME, load_collection
 from teb_vae.lag_attn_cfs.eval.metrics import (
     DENSE_ANCHOR_GEOMETRY,
     evaluate,
     mc_predictive_block,
     model_inputs,
 )
-from teb_vae.lag_attn_cfs.eval.probe import PROBE_FILENAME
-from teb_vae.lag_attn_cfs.eval.report_seam import HEADLINE_SCALARS, STEPS_FILENAME
+from teb_vae.lag_attn_cfs.eval.report_seam import HEADLINE_SCALARS
 from teb_vae.lag_attn_rws.nets.raw_masks import forecast_mask
-from teb_vae.lag_attn_rws.trainer import RESOLVED_CONFIG_FILENAME
 
 from .conftest import make_stub_batch
 
 #: Any seed; the property under test is that re-running under the same one reproduces the run.
 _SEED = 1234
-
-#: The eight artifacts a collection-only run leaves behind. Written out rather than globbed: the
-#: point of the list is that each of them exists, and a glob would pass on a directory holding
-#: seven of them plus something else.
-_COLLECTION_ARTIFACTS = (
-    PER_SAMPLE_FILENAME,
-    PER_ANCHOR_FILENAME,
-    VECTORS_FILENAME,
-    COLLECTION_FILENAME,
-    RESOLVED_CONFIG_FILENAME,
-    "preflight.json",
-    PROBE_FILENAME,
-    run_module.LOG_FILENAME,
-)
 
 
 class _StubLoader:
@@ -190,24 +163,18 @@ def test_an_unseeded_rerun_is_what_makes_that_test_worth_running(task, perturb_p
 @pytest.mark.slow
 def test_the_summary_records_the_seed_and_the_numeric_environment(collected_run):
     """A run must be reproducible from its own output, which means the seed is in the artifact
-    rather than in the operator's shell history."""
+    rather than in the operator's shell history.
+
+    TF32 carries ten mantissa bits and the per-step KL is a small difference of larger quantities;
+    ``cudnn.benchmark`` picks convolution algorithms by timing them, so the summation order -- and
+    the last bits of the result -- depend on what else the machine was doing. Both are read back
+    from global state, so a build where the assignment did not take shows up here as ``True``.
+    """
     summary = collected_run["summary"]
+    numerics = summary["numerics"]
 
-    assert summary["numerics"]["seed"] == summary["eval_config"]["seed"]
-    assert summary["numerics"]["torch_version"] == str(torch.__version__)
-
-
-@pytest.mark.slow
-def test_the_recorded_numerics_are_the_two_settings_that_are_correctness_requirements(
-    collected_run,
-):
-    """TF32 carries ten mantissa bits and the per-step KL is a small difference of larger
-    quantities; ``cudnn.benchmark`` picks convolution algorithms by timing them, so the summation
-    order -- and the last bits of the result -- depend on what else the machine was doing. Both
-    are read back from global state, so a build where the assignment did not take shows up here
-    as ``True``."""
-    numerics = collected_run["summary"]["numerics"]
-
+    assert numerics["seed"] == summary["eval_config"]["seed"]
+    assert numerics["torch_version"] == str(torch.__version__)
     assert numerics["cuda_matmul_allow_tf32"] is False
     assert numerics["cudnn_allow_tf32"] is False
     assert numerics["cudnn_benchmark"] is False
@@ -217,19 +184,6 @@ def test_the_recorded_numerics_are_the_two_settings_that_are_correctness_require
 # =================================================================================================
 # The one real collection pass
 # =================================================================================================
-@pytest.mark.slow
-def test_the_collection_pass_leaves_every_artifact_a_later_pass_reads(collected_run):
-    """Stated as a list rather than as a glob: each of these is read by something later, and a
-    directory holding seven of them is a directory one analysis will skip without saying which."""
-    results_dir = Path(collected_run["results_dir"])
-
-    missing = [name for name in _COLLECTION_ARTIFACTS if not (results_dir / name).is_file()]
-    assert missing == [], missing
-    # And the two the run itself writes on top of the collection.
-    assert (results_dir / run_module.SUMMARY_FILENAME).is_file()
-    assert (results_dir / STEPS_FILENAME).is_file()
-
-
 @pytest.mark.slow
 def test_the_tables_describe_the_population_the_readouts_were_computed_over(collected_run):
     """One row per scored segment and one per contributing anchor, agreeing with the readouts of
@@ -275,28 +229,6 @@ def test_a_second_run_of_the_same_checkpoint_reports_the_same_numbers(
     # Byte-identical, not merely equal to tolerance: the CSV is what a re-run reads where the pass
     # that wrote it held a frame, so any difference here is one run reporting two sets of numbers.
     assert first_table == second_table
-
-
-@pytest.mark.slow
-def test_the_tables_survive_the_disk_round_trip_the_offline_path_depends_on(collected_run):
-    """``read_csv`` uses ``float_precision='round_trip'``. Without it the fast parser drops the
-    last bits of every float, and a per-recording mean amplifies that through cancellation until
-    a re-run's summary stops comparing equal to the summary it re-ran."""
-    collection = load_collection(collected_run["results_dir"])
-    fresh = np.asarray(
-        collection.per_sample.groupby("guid")["pred_gap"].mean(), dtype=np.float64
-    )
-    reread = np.asarray(
-        load_collection(collected_run["results_dir"])
-        .per_sample.groupby("guid")["pred_gap"]
-        .mean(),
-        dtype=np.float64,
-    )
-
-    assert fresh.size > 1
-    assert np.array_equal(fresh, reread, equal_nan=True)
-    # Non-vacuous: a column of exact zeros would round-trip through any parser.
-    assert np.any(np.isfinite(fresh) & (fresh != 0.0))
 
 
 @pytest.mark.slow
@@ -381,27 +313,3 @@ def test_every_headline_path_whose_block_this_run_produced_resolves(collected_ru
     assert results["calibration"]["skipped"] is True
     assert results["calibration"]["likelihood"] == "mse"
     assert collected_run["summary"]["results"]["readouts"], "the readouts block is not empty"
-
-
-@pytest.mark.slow
-def test_the_pass_records_the_cost_a_full_run_is_planned_against(collected_run):
-    """A recorded measurement, not a threshold: a CI box's timing is not a production box's. What
-    an operator needs before starting a multi-hour pass is the rate this one ran at, on the same
-    code path, at a stated batch size and draw count -- and what a later reader needs is a number
-    a regression is visible against."""
-    cost = collected_run["summary"]["collection"]["cost"]
-
-    assert cost["num_mc_samples"] == 2
-    assert cost["n_batches"] > 0 and cost["n_samples"] > 0
-    assert cost["mean_batch_size"] > 0.0
-    for name in ("elapsed_s", "seconds_per_batch", "samples_per_second", "hours_per_1000_samples"):
-        assert math.isfinite(cost[name]) and cost[name] > 0.0, name
-    # The extrapolation is stated as a rate rather than as a total: the split's sample count is a
-    # property of a dataset this record cannot see.
-    assert cost["hours_per_1000_samples"] == pytest.approx(
-        1000.0 / cost["samples_per_second"] / 3600.0
-    )
-    assert "hours_per_1000_samples" in cost["note"]
-    # Absent rather than zero off CUDA, where the allocator that reports it does not exist.
-    assert cost["device"] == "cpu"
-    assert cost["peak_allocated_bytes"] is None

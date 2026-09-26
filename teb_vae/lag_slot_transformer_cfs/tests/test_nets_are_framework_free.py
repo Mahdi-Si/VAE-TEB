@@ -15,8 +15,6 @@ import ast
 from pathlib import Path
 from typing import List
 
-import pytest
-
 #: The directory whose modules must stay framework-free.
 NETS_ROOT = Path(__file__).resolve().parents[1] / "nets"
 
@@ -64,17 +62,13 @@ def imported_roots(path: Path) -> List[str]:
     return roots
 
 
-@pytest.mark.parametrize("path", net_modules(), ids=lambda p: p.name)
-def test_a_network_module_imports_no_training_framework(path: Path) -> None:
-    """At module scope and inside functions alike.
-
-    Args:
-        path: The module to check.
-    """
-    offending = sorted(FORBIDDEN_ROOTS.intersection(imported_roots(path)))
-    assert offending == [], f"{path.name} imports {offending}"
-
-
-def test_the_directory_is_not_empty() -> None:
-    """So a rename that emptied it would fail here rather than pass every check above."""
-    assert len(net_modules()) >= 5
+def test_no_network_module_imports_a_training_framework() -> None:
+    """At module scope and inside functions alike, in every module under ``nets/``."""
+    modules = net_modules()
+    assert modules, f"no module found under {NETS_ROOT}; the check would pass vacuously"
+    offending = {}
+    for path in modules:
+        roots = sorted(FORBIDDEN_ROOTS.intersection(imported_roots(path)))
+        if roots:
+            offending[path.relative_to(NETS_ROOT).as_posix()] = roots
+    assert offending == {}

@@ -118,41 +118,30 @@ _GUARD_KWARGS = [kwargs for _, kwargs in _GUARDS]
 
 @pytest.mark.parametrize("kwargs", _GUARD_KWARGS, ids=_GUARD_IDS)
 @pytest.mark.parametrize("stride", _STRIDES)
-def test_the_kl_is_exactly_zero_at_init(kwargs, stride: int) -> None:
-    """Both readouts and the closed form, so a model reporting a wrong KL cannot pass on its own."""
-    _model, out = _train_mode_forward(kwargs, stride)
+def test_the_kl_is_exactly_zero_and_the_two_forecasts_identical_at_init(
+    kwargs, stride: int
+) -> None:
+    """One forward, three readings of the same zero.
+
+    The KL from both readouts and from the closed form, so a model reporting a wrong KL cannot pass
+    on its own. The two forecasts bitwise identical -- one decoder, two invocations, one $\\epsilon$,
+    one anchor index -- so the gather cannot have handed the branches different rows. And the
+    objective's own columns through ``compute_loss``, which averages the KL over the *scored anchor
+    support*: a support that had drifted from the decoded set would show here even while the
+    per-step KL was fine, and ``pred_gap`` is the same statement on the reconstruction side.
+    """
+    model, out = _train_mode_forward(kwargs, stride)
 
     assert float(_closed_form_kl(out).abs().max()) == 0.0
     assert float(out["kld_per_t"].abs().max()) == 0.0
     assert float(out["source_kl_lag_map"].abs().max()) == 0.0
 
-
-@pytest.mark.parametrize("kwargs", _GUARD_KWARGS, ids=_GUARD_IDS)
-@pytest.mark.parametrize("stride", _STRIDES)
-def test_the_two_forecasts_are_bitwise_identical_at_init(kwargs, stride: int) -> None:
-    """One decoder, two invocations, one $\\epsilon$, one anchor index -- so the gather cannot have
-    handed the branches different rows."""
-    _model, out = _train_mode_forward(kwargs, stride)
-
     assert torch.equal(out["z_prior"], out["z_post"])
     assert torch.equal(out["mu_base"], out["mu_full"])
     assert torch.equal(out["logvar_base"], out["logvar_full"])
 
-
-@pytest.mark.parametrize("kwargs", _GUARD_KWARGS, ids=_GUARD_IDS)
-@pytest.mark.parametrize("stride", _STRIDES)
-def test_the_objective_reports_the_same_zero(kwargs, stride: int) -> None:
-    """``source_conditioned_kl_raw`` is the column a run is read by, and it is what must read zero.
-
-    Asserted through ``compute_loss`` rather than off the forward, because the objective averages
-    the KL over the *scored anchor support* -- so a support that had drifted from the decoded set
-    would show here even while the per-step KL was fine. ``pred_gap`` is the same statement on the
-    reconstruction side: two identical forecasts against one gathered raw window differ by nothing.
-    """
-    model, out = _train_mode_forward(kwargs, stride)
     signal = make_raw_signal(kwargs)
     weight = torch.ones(BATCH, model.geometry.t)
-
     metrics = model.compute_loss(out, signal, weight=weight, likelihood="mse")["metrics"]
 
     assert float(metrics["source_conditioned_kl_raw"]) == 0.0
@@ -168,7 +157,7 @@ def test_everything_above_becomes_false_once_perturbed(
     """The zero must be a property of the init, not of the model being unable to produce a KL.
 
     Without this, a model whose posterior was structurally stuck at the prior -- a detached graph, a
-    fusion that never reads the source -- would pass every test above, including on a cell whose
+    fusion that never reads the source -- would pass the test above, including on a cell whose
     anchored gather handed the two branches two different raw windows.
     """
     model, out = _train_mode_forward(kwargs, stride, perturb=perturb_posterior)

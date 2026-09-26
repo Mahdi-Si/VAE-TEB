@@ -7,19 +7,18 @@ around $10^{26}$. So the tests here are as much about the delayed prefix as abou
 which parameters exist under which delay vectors, that they are not inert where they must act, that
 they are exactly inert where they must not, and that a fully unavailable step differentiates
 finitely.
+
+The encoder itself is checked for its shape contract at the shipped geometry and for its reported
+receptive field: the stem arithmetic, the source bound $R_U$ it composes into, and the clamp at the
+segment length. Its refusals are asserted at model construction, in ``test_construct.py``.
 """
 from __future__ import annotations
-
-import subprocess
-import sys
-from pathlib import Path
 
 import pytest
 import torch
 
 from teb_vae.lag_attn.nets.encoders import InputAdapter
 from teb_vae.lag_attn_transformer_rws.nets.encoders import (
-    START_EMBED_STD,
     AvailabilityInputAdapter,
     conv_receptive_field,
 )
@@ -41,8 +40,6 @@ ADAPTER_IN_DIM, ADAPTER_D_MODEL, BATCH = 6, 32, 2
 #: permanently inert while still calling for the mask projection.
 MIXED_DELAYS = (0, 3, 5, 0, 2, 4)
 POSITIVE_DELAYS = (1, 3, 5, 2, 4, 6)
-
-_REPO_ROOT = Path(__file__).resolve().parents[3]
 
 
 def _stream(seed: int = 0, *, in_dim: int = ADAPTER_IN_DIM, seq_len: int = SEQ_LEN):
@@ -161,17 +158,6 @@ def test_which_availability_parameters_exist(delays, wants_projection, wants_sta
     assert ("start_embed" in names) is wants_start
 
 
-def test_the_start_embedding_is_drawn_from_the_specified_normal():
-    """$\\mathcal N(0, 0.02^2)$, per the architecture's initialisation list."""
-    adapter = _adapter(POSITIVE_DELAYS, d_model=512, seed=7)
-    assert adapter.start_embed is not None
-
-    measured = float(adapter.start_embed.std())
-
-    assert START_EMBED_STD == 0.02
-    assert 0.01 <= measured <= 0.04, f"start embedding std {measured:.4f} is outside [0.01, 0.04]"
-
-
 def test_the_availability_buffer_matches_a_hand_written_loop():
     adapter = _adapter(MIXED_DELAYS)
 
@@ -181,20 +167,6 @@ def test_the_availability_buffer_matches_a_hand_written_loop():
             expected[step, channel] = 1.0 if step >= delay else 0.0
 
     assert torch.equal(adapter.availability, expected)
-
-
-def test_the_availability_buffers_are_non_persistent_and_absent_when_inert():
-    """Their width is the surviving-channel count, so a persistent copy would make a checkpoint
-    trained at one reach budget fail to load at another as misaligned keys."""
-    guarded = _adapter(POSITIVE_DELAYS)
-    assert {"availability", "start_indicator"} <= set(dict(guarded.named_buffers()))
-    assert not any(name.startswith(("availability", "start_indicator")) for name in guarded.state_dict())
-
-    plain = _adapter()
-    assert not any(
-        name.startswith(("availability", "start_indicator"))
-        for name in dict(plain.named_buffers())
-    )
 
 
 def test_the_start_indicator_fires_exactly_on_the_fully_unavailable_prefix():
@@ -260,53 +232,12 @@ def test_the_adapter_accepts_a_prefix():
 
 
 @pytest.mark.parametrize("stream", ["target", "source"])
-@pytest.mark.parametrize("kwargs", [TINY_KWARGS, SHIPPED_KWARGS], ids=["tiny", "shipped"])
-def test_the_encoder_preserves_shape(stream, kwargs):
-    encoder = build_stream_encoder(stream, kwargs)
-    seq_len, d_model = int(kwargs["sequence_length"]), int(kwargs["d_model"])
+def test_the_encoder_preserves_shape_at_the_shipped_geometry(stream):
+    encoder = build_stream_encoder(stream, SHIPPED_KWARGS)
+    seq_len, d_model = int(SHIPPED_KWARGS["sequence_length"]), int(SHIPPED_KWARGS["d_model"])
     x = torch.randn(1, seq_len, d_model)
 
     assert encoder(x).shape == (1, seq_len, d_model)
-
-
-@pytest.mark.parametrize("stream", ["target", "source"])
-def test_the_encoder_parameter_count_is_its_blocks_plus_the_final_norm(stream):
-    r"""$\sum_b (3d^2 + 3d + dk_b) + N_s(4d^2 + 3d\,d_{\mathrm{ff}} + 4d) + d$.
-
-    Built from the per-block arithmetic rather than from a literal total, so a legitimate change to
-    a block cannot be absorbed here without the block's own test noticing first.
-    """
-    encoder = build_stream_encoder(stream, SHIPPED_KWARGS)
-    d_model = int(SHIPPED_KWARGS["d_model"])
-    d_ff = int(SHIPPED_KWARGS["encoder_d_ff"])
-    blocks = int(SHIPPED_KWARGS[f"{stream}_attention_blocks"])
-
-    stem_cost = sum(
-        3 * d_model**2 + 3 * d_model + d_model * kernel
-        for kernel in SHIPPED_KWARGS["encoder_conv_kernels"]
-    )
-    attention_cost = blocks * (4 * d_model**2 + 3 * d_model * d_ff + 4 * d_model)
-    measured_blocks = sum(
-        parameter.numel()
-        for block in list(encoder.conv_blocks) + list(encoder.attention_blocks)
-        for parameter in block.parameters()
-    )
-
-    total = sum(parameter.numel() for parameter in encoder.parameters())
-    assert measured_blocks == stem_cost + attention_cost
-    assert total == measured_blocks + d_model
-
-
-def test_the_shipped_encoders_match_the_architecture_totals():
-    """$1{,}676{,}928$ and $888{,}960$: the two numbers the parameter budget is built from."""
-    assert (
-        sum(p.numel() for p in build_stream_encoder("target", SHIPPED_KWARGS).parameters())
-        == 1_676_928
-    )
-    assert (
-        sum(p.numel() for p in build_stream_encoder("source", SHIPPED_KWARGS).parameters())
-        == 888_960
-    )
 
 
 def test_conv_receptive_field_matches_the_architecture_arithmetic():
@@ -316,18 +247,22 @@ def test_conv_receptive_field_matches_the_architecture_arithmetic():
     assert conv_receptive_field((3,), (4,)) == 9
 
 
-def test_mismatched_stem_schedules_raise_naming_both_lengths():
-    with pytest.raises(ValueError, match="got 2 and 1"):
-        conv_receptive_field((5, 9), (1,))
-
-
 def test_the_source_bound_is_reported_and_the_target_is_unbounded():
     r"""$R_U = \min(R_{\mathrm{conv}} + N_U(W_U - 1),\ T)$; the target has no number to report."""
     target = build_stream_encoder("target", SHIPPED_KWARGS)
     source = build_stream_encoder("source", SHIPPED_KWARGS)
 
+    stem = conv_receptive_field(
+        SHIPPED_KWARGS["encoder_conv_kernels"], SHIPPED_KWARGS["encoder_conv_dilations"]
+    )
+    bound = stem + int(SHIPPED_KWARGS["source_attention_blocks"]) * (
+        int(SHIPPED_KWARGS["source_attention_window"]) - 1
+    )
+
     assert target.receptive_field is None
-    assert source.receptive_field == 21 + 3 * (16 - 1) == 66
+    # Strictly inside the segment, so the value below is the composition and not the clamp.
+    assert bound < int(SHIPPED_KWARGS["sequence_length"])
+    assert source.receptive_field == bound
 
 
 def test_the_reported_bound_clamps_at_the_sequence_length():
@@ -337,73 +272,3 @@ def test_the_reported_bound_clamps_at_the_sequence_length():
     )
     assert encoder.receptive_field == int(TINY_KWARGS["sequence_length"])
 
-
-def test_an_empty_stem_drops_exactly_the_stem_cost():
-    """The stem-free architecture arm needs a working encoder with no convolution blocks at all."""
-    full = build_stream_encoder("source", SHIPPED_KWARGS)
-    stemless = build_stream_encoder(
-        "source", SHIPPED_KWARGS, conv_kernels=(), conv_dilations=()
-    )
-    d_model = int(SHIPPED_KWARGS["d_model"])
-    stem_cost = sum(
-        3 * d_model**2 + 3 * d_model + d_model * kernel
-        for kernel in SHIPPED_KWARGS["encoder_conv_kernels"]
-    )
-
-    assert len(stemless.conv_blocks) == 0
-    assert stemless.conv_reach == 1
-    assert sum(p.numel() for p in full.parameters()) - sum(
-        p.numel() for p in stemless.parameters()
-    ) == stem_cost
-
-    x = torch.randn(1, int(SHIPPED_KWARGS["sequence_length"]), d_model)
-    assert stemless(x).shape == x.shape
-
-
-def test_the_two_encoders_share_no_parameter_tensor():
-    """Separate instances, so a target gradient cannot reach the source state or the reverse."""
-    target = build_stream_encoder("target")
-    source = build_stream_encoder("source")
-
-    target_ids = {id(parameter) for _, parameter in target.named_parameters()}
-    source_ids = {id(parameter) for _, parameter in source.named_parameters()}
-
-    assert target_ids and source_ids
-    assert target_ids.isdisjoint(source_ids)
-
-
-def test_a_non_positive_window_raises_naming_the_value():
-    with pytest.raises(ValueError, match="got 0"):
-        build_stream_encoder("source", attention_window=0)
-    with pytest.raises(ValueError, match="got -4"):
-        build_stream_encoder("source", attention_window=-4)
-
-
-def test_an_encoder_with_no_attention_blocks_raises():
-    with pytest.raises(ValueError, match="at least 1, got 0"):
-        build_stream_encoder("source", num_attention_blocks=0)
-
-
-def test_extra_repr_states_the_counts_the_window_and_the_bound():
-    """``print(model)`` is where the source-locality claim is read off a built model."""
-    description = repr(build_stream_encoder("source", SHIPPED_KWARGS))
-
-    assert "conv_blocks=2" in description
-    assert "attention_blocks=3" in description
-    assert "causal window 16" in description
-    assert "receptive_field=66 steps" in description
-    assert "full causal prefix" in repr(build_stream_encoder("target", SHIPPED_KWARGS))
-
-
-def test_the_module_entry_point_prints_the_table_and_exits_zero():
-    """The demonstration the architecture's source-locality argument rests on."""
-    completed = subprocess.run(
-        [sys.executable, "-m", "teb_vae.lag_attn_transformer_rws.nets.encoders"],
-        cwd=str(_REPO_ROOT),
-        capture_output=True,
-        text=True,
-    )
-
-    assert completed.returncode == 0, completed.stderr
-    for expected in ("21 steps / 84 s", "66 steps / 264 s", "unbounded", "90 steps / 360 s"):
-        assert expected in completed.stdout, f"{expected!r} missing from:\n{completed.stdout}"

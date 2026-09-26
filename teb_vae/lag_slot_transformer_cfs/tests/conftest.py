@@ -220,18 +220,6 @@ def anchors() -> torch.Tensor:
     return row[None, :].expand(TINY_BATCH, -1).contiguous()
 
 
-@pytest.fixture
-def target_state() -> torch.Tensor:
-    """A seeded target state at the tiny anchor set, as the proposal head conditions on it.
-
-    Returns:
-        A $(B, A, d_h)$ float tensor, with $A$ matching the :func:`anchors` fixture.
-    """
-    generator = torch.Generator().manual_seed(20260910)
-    n_anchors = TINY_SEQ_LEN - TINY_FLOOR
-    return torch.randn(TINY_BATCH, n_anchors, TINY_D_MODEL, generator=generator)
-
-
 # =================================================================================================
 # The generated integer-operator cohort fixture, and the run built on it
 #

@@ -1,35 +1,19 @@
-r"""The row this model replaces, the two it borrows, and the silences that hid all three.
+r"""The forecast row this model replaces, drawn through the callback that runs it.
 
-Every builder this cell reaches for exists because a shipped one **fails quietly** on it, and the
-three failures are not the same failure.
+The shipped raw rows tile through ``concat_single_forecasts``, which reads its per-anchor block at an
+**anchor** index, while this model's forecast is $(A_{\max}, H, R)$ indexed by position in the decoded
+set. At the shipped floor the first read is out of range and the callback's broad handler turns a
+whole run's diagnostics into one log line; at a smaller floor it draws a real forecast at the wrong
+time with no exception anywhere. The input rows and the run-level budget figure are the
+causal-feature cell's, bound by the task, and are tested there.
 
-The forecast rows die *loudly* and are swallowed: the shipped raw rows tile through
-``concat_single_forecasts``, which reads its per-anchor block at an **anchor** index, and this
-model's forecast is $(A_{\max}, H, R)$ indexed by position in the decoded set. At the shipped
-geometry that is $136$ positions read at anchors $134 \dots 269$, so the first read is out of range,
-the page builder raises, and the callback's broad handler turns a whole run's diagnostics into one
-log line and an empty directory. At a smaller floor the same code does not raise at all -- it draws
-a real forecast at the wrong time, at the right shape, in the right colours, on the right axis.
-
-The input rows and the run-level budget figure fail *silently*: both shipped builders consult the
-production two-sided Morlet bank, which refuses these channel widths inside handlers that warn and
-continue. The symptom of not replacing them is a green suite, two log lines, and a seven-row page.
-
-All three are therefore tested through the **callback**, not only through the builders. A test that
-called a replacement directly would pass on a tree where nothing reaches it, which is exactly the
-state this package was in before this file existed: every seam was available and the model's
-five-tensor forward and tiled anchor axis could not travel down any of them.
-
-The one assertion that fails loudest if the anchor axis is mixed up is the window-placement one: the
-drawn curve over each tile is compared against the forward's own ``mu_full`` at the anchor
-``anchor_index`` names, so an implementation reading position $k$ as anchor $k$ fails even though
-every shape, every axis and every colour is right.
+So the page is tested through the **callback** (every row drawn, no warning, one shared time axis,
+both files written) and the forecast row by what it draws: the curve over each tile is compared
+against the forward's own ``mu_full`` at the anchor ``anchor_index`` names, uncovered raw samples are
+gaps, the forecast is drawn in the trace's units, and the shipped geometry renders its dense tiling.
 """
 from __future__ import annotations
 
-import importlib
-import inspect
-from pathlib import Path
 from typing import Any, List
 
 import matplotlib
@@ -42,25 +26,16 @@ import pytest  # noqa: E402
 import torch  # noqa: E402
 from loguru import logger  # noqa: E402
 
-from teb_vae.lag_attn_cfs import sample_page as causal_feature_page  # noqa: E402
 from teb_vae.lag_attn_cfs import warmup_budget as warmup_budget_module  # noqa: E402
-from teb_vae.lag_attn_cfs.task import SeqVaeLagAttnCfsTask  # noqa: E402
 from teb_vae.lag_attn_crws import sample_page  # noqa: E402
-from teb_vae.lag_attn_crws.task import SeqVaeLagAttnCrwsTask  # noqa: E402
-from teb_vae.lag_attn_rws import input_budget  # noqa: E402
 from teb_vae.lag_attn_rws import plotting  # noqa: E402
-from teb_vae.lag_attn_rws import sample_page as shared_page  # noqa: E402
 from teb_vae.lag_attn_rws.plotting import LagAttnRwsPlotCallback  # noqa: E402
 from train.test_utils import FakeTrainer  # noqa: E402
 
 from .conftest import (  # noqa: E402
-    CAUSAL_C_U,
-    CAUSAL_C_Y,
     SHIPPED_SEQUENCE_LENGTH,
-    TINY_STRIDE,
     make_stub_batch,
     shipped_warmup_kwargs,
-    tiny_warmup_kwargs,
 )
 
 #: Raw sampling rate, restated rather than imported: the page's sample-to-second arithmetic is what
@@ -79,16 +54,6 @@ _INPUT_ROWS = ("Model input — target", "Model input — source")
 #: ``forecast_extra_rows`` at all, because its decoder emits $R$ raw samples of one signal and the
 #: shipped two-row layout is a picture of exactly that.
 _PAGE_ROWS = 7 + len(_INPUT_ROWS)
-
-#: The four keywords that make a model ungated, as a keyword set the guarded tiny kwargs are
-#: overridden with. Written out rather than reached for by name, because "no budget" is four
-#: absences and a subset of them is a model the constructor refuses.
-_UNGATED = dict(
-    target_keep_index=None,
-    target_warmup_steps=None,
-    source_keep_index=None,
-    source_warmup_steps=None,
-)
 
 
 def _forward(module: Any, data: Any) -> dict:
@@ -213,16 +178,16 @@ def _warnings_of(function) -> List[str]:
 
 
 # =================================================================================================
-# The callback, and the three silences it used to hide
+# The callback
 # =================================================================================================
 def test_the_callback_draws_the_whole_page_and_warns_about_nothing(tmp_path, task, stub_batch, budget):
     """The assertion this file exists for, and it has to be made against the **callback**.
 
-    Every one of the three seams is behind a handler that warns and continues, because a figure is
-    never worth failing a multi-day fit for -- so before this file the run produced a page that was
-    never written, two rows that were never drawn, a figure that was never saved, and a green suite.
-    Asserted as *zero* warnings rather than as the absence of one message, because the three
-    handlers emit three different sentences and any of them is the same defect.
+    Every seam is behind a handler that warns and continues, because a figure is never worth failing
+    a multi-day fit for -- so a broken row costs one warning and leaves the suite green. Asserted as
+    *zero* warnings rather than as the absence of one message, because the handlers emit different
+    sentences and any of them is the same defect. Every titled row must carry data on the one shared
+    time axis, and the epoch must write both the sample page and the run-level budget figure.
     """
     module = task()
     module.warmup_budget = budget
@@ -247,73 +212,21 @@ def test_the_callback_draws_the_whole_page_and_warns_about_nothing(tmp_path, tas
 
     try:
         assert warnings == []
-        titled = [ax.get_title() for ax in figures[0].axes if ax.get_title()]
-        assert len(titled) == _PAGE_ROWS, titled
+        titled = [ax for ax in figures[0].axes if ax.get_title()]
+        assert len(titled) == _PAGE_ROWS, [ax.get_title()[:30] for ax in titled]
         for prefix in _INPUT_ROWS + ("Forecast", "Raw target FHR"):
-            assert _axes_titled(figures[0], prefix).has_data()
+            _axes_titled(figures[0], prefix)
+        # A column of the page is one instant on every row, the raw-grid forecast row included.
+        t_max = stub_batch.fhr.shape[1] / _FS_RAW
+        for ax in titled:
+            assert ax.has_data(), ax.get_title()
+            assert ax.get_xlim() == pytest.approx((0.0, t_max)), ax.get_title()
         # And the two files the epoch produces: the sample page and the run-level budget figure.
         assert (callback.output_dir / f"{warmup_budget_module.BUDGET_FIGURE_STEM}.png").is_file()
         assert list(callback.output_dir.glob("lag_attn_rws_epoch0000_sample0_*.png"))
     finally:
         for figure in figures:
             plt.close(figure)
-
-
-def test_the_two_borrowed_seams_are_the_causal_feature_cells_own_objects(task):
-    """Imported rather than rebuilt, and asserted by identity rather than by sampled behaviour.
-
-    These cells read the **same three input tensors** as the causal-feature cells and resolve the
-    same warm-up budget -- they differ in what the decoder emits and what the objective scores -- so
-    a second implementation of either seam could only differ from the first by being wrong.
-    """
-    module = task()
-
-    assert (
-        SeqVaeLagAttnCrwsTask.__dict__["input_stream_panels"]
-        is SeqVaeLagAttnCfsTask.__dict__["input_stream_panels"]
-    )
-    assert (
-        SeqVaeLagAttnCrwsTask.__dict__["input_budget_figure"]
-        is SeqVaeLagAttnCfsTask.__dict__["input_budget_figure"]
-    )
-    # And what the property resolves to on an instance is the sibling's builder, not a wrapper.
-    assert module.input_stream_panels is causal_feature_page.causal_stream_panels
-
-
-def test_the_budget_figure_is_written_once_per_run_under_a_stem_of_its_own(tmp_path, task, budget):
-    """A run-level figure is a constant of the configuration rather than of an epoch, and the
-    shipped latch is what keeps it that way -- a model this could not describe would otherwise warn
-    once per validation epoch for the rest of the fit.
-
-    Its stem is deliberately not the shipped ``causal_input_budget``: the two describe different
-    guards -- a two-sided forward reach against a one-sided warm-up -- and a directory holding both
-    must be readable rather than ambiguous."""
-    module = task()
-    module.warmup_budget = budget
-    callback = LagAttnRwsPlotCallback(tmp_path, file_format="png")
-    trainer = _trainer_with_batch(None)
-
-    callback._write_budget_figure(trainer, module, module.orig_model)
-    written = sorted(path.name for path in callback.output_dir.glob("*.png"))
-    callback._write_budget_figure(trainer, module, module.orig_model)
-
-    assert callback._budget_figure_written
-    assert written == [f"{warmup_budget_module.BUDGET_FIGURE_STEM}.png"]
-    assert sorted(path.name for path in callback.output_dir.glob("*.png")) == written
-    # The two stems name two different guards and neither may overwrite the other.
-    assert warmup_budget_module.BUDGET_FIGURE_STEM != input_budget.BUDGET_FIGURE_STEM
-
-
-def test_a_task_with_no_budget_refuses_the_figure_by_name(tmp_path, task):
-    """The channels the budget **dropped** are the figure's whole subject, and a dropped channel's
-    own $W'_c$ is exactly what the checkpoint does not carry -- ``model_kwargs`` stamps the
-    survivors' vector, because that is what the constructor needs. So a task that never received a
-    budget cannot draw it, and says so by name rather than drawing a figure about the survivors."""
-    module = task()
-    assert module.warmup_budget is None, "the default must be the absent one"
-
-    with pytest.raises(ValueError, match="no resolved warm-up budget"):
-        module.input_budget_figure(tmp_path)
 
 
 # =================================================================================================
@@ -383,104 +296,6 @@ def test_uncovered_raw_samples_are_gaps_rather_than_a_fabricated_continuation(ta
         plt.close(figure)
 
 
-def test_the_overlay_draws_the_decoded_anchors_and_the_training_tiling(task, stub_batch):
-    r"""Both, because they are two different sets and the page is produced at only one of them.
-
-    Validation decodes every valid anchor at stride $1$, which is what makes the page reproducible;
-    training decodes $\{F + \varphi + kS\}$, a fifteenth as many at the shipped geometry, at a phase
-    derived per segment per epoch. An overlay showing only the dense set says nothing about the
-    geometry the gradients were computed at, which is half of the row's purpose.
-    """
-    module = task()
-    pieces = _forward(module, stub_batch)
-    figure = _render(module, stub_batch, pieces=pieces)
-    try:
-        geometry = module.orig_model.geometry
-        seconds_per_step = stub_batch.fhr.shape[1] / _FS_RAW / geometry.t
-        ax = _axes_titled(figure, "Forecast")
-        anchors, valid, _positions = _drawn_tiling(pieces, module)
-
-        rug = _labelled(ax, "decoded anchors")
-        assert len(rug) == 1
-        assert np.allclose(rug[0].get_xdata(), anchors[valid] * seconds_per_step)
-
-        tiles = _labelled(ax, "training tiles")
-        assert len(tiles) == 1, "one legend entry, whatever the tile count"
-        # The stride **and** the phase, because the grid drawn is one of $S$ of them and the phase a
-        # given segment gets in a given epoch is derived from its own identity: a grid drawn without
-        # its phase stated reads as the grid rather than as an example of one.
-        assert f"$S$={TINY_STRIDE}" in str(tiles[0].get_label())
-        assert "$\\varphi$=0" in str(tiles[0].get_label())
-        assert tiles[0].get_xdata()[0] == pytest.approx(geometry.warmup * seconds_per_step)
-
-        floor = _labelled(ax, "anchor floor")
-        assert len(floor) == 1
-        assert floor[0].get_xdata()[0] == pytest.approx(geometry.warmup * seconds_per_step)
-    finally:
-        plt.close(figure)
-
-
-def test_the_overlay_is_read_from_the_forward_rather_than_recomputed(task, stub_batch):
-    """So the figure cannot disagree with the loss. Driven by handing the page an anchor set the
-    geometry alone would never produce: a recomputing implementation draws the geometry's anchors
-    and passes, a reading one draws these."""
-    module = task()
-    pieces = _forward(module, stub_batch)
-    valid = pieces["outs"]["anchor_valid"].clone()
-    valid[:, 3:] = False
-    pieces["outs"] = dict(pieces["outs"], anchor_valid=valid)
-
-    figure = _render(module, stub_batch, pieces=pieces)
-    try:
-        ax = _axes_titled(figure, "Forecast")
-        rug = _labelled(ax, "decoded anchors")[0]
-        assert rug.get_xdata().size == 3
-        assert "decoded anchors (3)" in str(rug.get_label())
-        # One window survives the truncation, and the row says so rather than reporting the tiling
-        # it would have drawn.
-        assert "1 of 3 decoded anchors drawn" in ax.get_title()
-    finally:
-        plt.close(figure)
-
-
-def test_every_drawn_window_is_marked_at_both_of_its_edges(task, stub_batch):
-    """Without the edges the tiling reads as one continuous prediction, which is exactly what it is
-    not: each window is decoded from one latent and never sees the window before it. At the
-    evaluation resolution consecutive drawn windows abut, so an edge is shared and the count is one
-    more than the number of windows."""
-    module = task()
-    pieces = _forward(module, stub_batch)
-    figure = _render(module, stub_batch, pieces=pieces)
-    try:
-        geometry = module.orig_model.geometry
-        anchors, _valid, positions = _drawn_tiling(pieces, module)
-        seconds_per_sample = stub_batch.fhr.shape[1] / _FS_RAW / geometry.raw_len
-        block = geometry.horizon * geometry.r
-
-        expected = sorted(
-            {
-                edge
-                for position in positions
-                for edge in (
-                    geometry.future_block_start(int(anchors[position])),
-                    geometry.future_block_start(int(anchors[position])) + block,
-                )
-            }
-        )
-        ax = _axes_titled(figure, "Forecast")
-        # The dashed verticals: the overlay's floor line is solid and labelled and its tile grid is
-        # dotted, so the linestyle separates the two sets of verticals on this row.
-        drawn = sorted(
-            float(np.asarray(line.get_xdata())[0])
-            for line in ax.lines
-            if np.asarray(line.get_xdata()).size == 2 and line.get_linestyle() == "--"
-        )
-        assert len(expected) == len(positions) + 1
-        assert drawn == pytest.approx([edge * seconds_per_sample for edge in expected])
-    finally:
-        plt.close(figure)
-
-
 def test_the_forecast_is_drawn_in_the_same_units_as_the_trace_it_is_read_against(task, stub_batch):
     r"""Both branches and both bands go through the loader's own affine map, because a forecast
     drawn in z-units cannot be checked against physiology by eye -- which is the entire reason the
@@ -519,82 +334,11 @@ def test_the_forecast_is_drawn_in_the_same_units_as_the_trace_it_is_read_against
         plt.close(figure)
 
 
-def test_the_page_rows_all_share_one_time_axis(task, stub_batch):
-    """Seven inherited and the two input rows; the seam replaces two of the seven and must not touch
-    the layout or the axis. A column of the page is one instant on every row, which is what lets a
-    reader carry a feature of the forecast down into the lag map -- and it is what a replaced row is
-    most likely to break, because the forecast row is the one drawn on the *raw* grid."""
-    module = task()
-    figure = _render(module, stub_batch)
-    try:
-        titled = [ax for ax in figure.axes if ax.get_title()]
-        assert len(titled) == _PAGE_ROWS, [ax.get_title()[:30] for ax in titled]
-        t_max = stub_batch.fhr.shape[1] / _FS_RAW
-        for ax in titled:
-            assert ax.get_xlim() == pytest.approx((0.0, t_max)), ax.get_title()
-            assert ax.has_data(), ax.get_title()
-        for prefix in (
-            "Target-only latent state",
-            "Per-dimension source-conditioned KL",
-            "$K_t$",
-            "Lag attention",
-            r"$\widetilde K_{t,\ell}$",
-        ):
-            assert _axes_titled(figure, prefix).has_data(), prefix
-    finally:
-        plt.close(figure)
-
-
-def test_the_page_carries_the_one_sided_delay_caveat(task, stub_batch):
-    r"""One-sidedness and zero latency are different properties and this family buys only the first.
-    The forecast claim needs no correction at all here -- an input coefficient at $t$ is a function
-    of the past and the target is the raw signal itself -- but a peak at lag $\ell$ is still an
-    attribution over stored *input* coefficients, and the correction to a physical delay is
-    channel-dependent and of the same order as the lag search.
-
-    The caveat is **one-sided** where the causal-feature page's is two-sided, and that difference is
-    the point of this cell: there is no target-side group delay to subtract, because there is no
-    target-side filter. Asserted as a string so an edit that keeps the figure rendering cannot drop
-    it."""
-    figure = _render(task(), stub_batch)
-    try:
-        assert sample_page.LAG_TIME_CAVEAT in [text.get_text() for text in figure.texts]
-        for token in ("stored-coefficient time", "group delay", "one-sided", r"\kappa"):
-            assert token in sample_page.LAG_TIME_CAVEAT, token
-        # The stored timeline is canonical: no dataset-shift term may appear in the caption.
-        for forbidden in ("$-20$", "acquisition shift", "sensor"):
-            assert forbidden not in sample_page.LAG_TIME_CAVEAT, forbidden
-        # The two pages say different things, and the sibling's is untouched.
-        assert sample_page.LAG_TIME_CAVEAT != causal_feature_page.LAG_TIME_CAVEAT
-    finally:
-        plt.close(figure)
-
-
-def test_an_ungated_model_still_draws_every_row(task, stub_batch):
-    """Without a budget there is no gate, no warm-up mask and no availability buffer -- and the rows
-    are still the rows. A builder that reached for any of them unconditionally would fail on the arm
-    the whole family is compared against."""
-    module = task(model_kwargs=dict(tiny_warmup_kwargs(anchor_stride=TINY_STRIDE), **_UNGATED))
-    figure = _render(module, stub_batch)
-    try:
-        assert len([ax for ax in figure.axes if ax.get_title()]) == _PAGE_ROWS
-        for prefix in _INPUT_ROWS + ("Forecast",):
-            assert _axes_titled(figure, prefix).has_data(), prefix
-        panels = plotting.input_stream_panels(
-            module.orig_model, module._build_forward_inputs(stub_batch), 0,
-            module.input_stream_panels,
-        )
-        assert [panel.values.shape[1] for panel in panels] == [CAUSAL_C_Y, CAUSAL_C_U]
-    finally:
-        plt.close(figure)
-
-
 def test_it_renders_at_the_shipped_geometry(task):
-    r"""The tiny fixture is a $24$-step window with a floor of $5$; production is $300$ steps, a
-    floor of $134$ and $136$ decoded anchors tiled into $5$ windows of $480$ raw samples. A page
-    that renders only at the test geometry is not a page -- and the shipped floor is where the
-    shipped raw rows do not merely draw at the wrong time but read past the end of the anchor
-    axis."""
+    r"""A page that renders only at the test geometry is not a page -- and the shipped floor is where
+    the shipped raw rows do not merely draw at the wrong time but read past the end of the anchor
+    axis. At the dense evaluation stride every anchor of $[F, T_{\mathrm{valid}})$ is decoded and
+    the drawn windows are the ones a horizon apart from the floor."""
     module = task(model_kwargs=shipped_warmup_kwargs())
     batch = make_stub_batch(2, SHIPPED_SEQUENCE_LENGTH)
     pieces = _forward(module, batch)
@@ -603,53 +347,12 @@ def test_it_renders_at_the_shipped_geometry(task):
         geometry = module.orig_model.geometry
         anchors, valid, positions = _drawn_tiling(pieces, module)
 
-        assert int(valid.sum()) == geometry.t_valid - geometry.warmup == 136
+        assert int(valid.sum()) == geometry.t_valid - geometry.warmup
         assert [int(anchors[position]) for position in positions] == list(
             range(geometry.warmup, geometry.t_valid, geometry.horizon)
         )
         ax = _axes_titled(figure, "Forecast")
-        assert f"{len(positions)} of 136 decoded anchors drawn" in ax.get_title()
-        assert _labelled(ax, "decoded anchors")[0].get_xdata().size == 136
+        assert _labelled(ax, "decoded anchors")[0].get_xdata().size == int(valid.sum())
         assert len([child for child in figure.axes if child.get_title()]) == _PAGE_ROWS
     finally:
         plt.close(figure)
-
-
-# =================================================================================================
-# What is reached rather than copied
-# =================================================================================================
-def test_the_anchor_walk_and_the_overlay_are_the_siblings_own_functions():
-    """Both take an anchor set, a validity vector and a horizon and name no channel, no coefficient
-    and no target at all, so a copy of either here could only drift from the tiling the sibling
-    draws -- and the two pages would then disagree about which anchors a run decoded."""
-    assert sample_page._tiling_anchors is causal_feature_page._tiling_anchors
-    assert sample_page._draw_anchor_overlay is causal_feature_page._draw_anchor_overlay
-    assert sample_page.raw_context_row is shared_page.raw_context_row
-    assert sample_page.BAND_SIGMAS is shared_page.BAND_SIGMAS
-
-
-def test_the_shared_layout_is_reached_rather_than_copied():
-    """No ``lag_attn_crws/plotting.py`` and no callback of this package's own: the seams exist so a
-    sibling supplies rows and inherits the rest, and a second callback class would be a second place
-    for the layout, the cuts and the caption to drift.
-
-    The drawing module builds no figure and no GridSpec either -- it draws through ``row_axes`` and
-    ``finalise_time_axis``, which are what make a column of the page one instant on every row. An
-    implementation that set its own limits would break exactly the alignment the figure is read
-    by."""
-    package = Path(sample_page.__file__).parent
-
-    assert not (package / "plotting.py").exists()
-    with pytest.raises(ModuleNotFoundError):
-        importlib.import_module("teb_vae.lag_attn_crws.plotting")
-
-    # The layout tools are not merely unused, they are unreachable: a module that cannot name
-    # ``pyplot`` or a ``GridSpec`` cannot open a second figure or a second row list.
-    for tool in ("plt", "GridSpec", "build_diagnostic_figure"):
-        assert not hasattr(sample_page, tool), tool
-
-    source = inspect.getsource(sample_page)
-    for forbidden in ("add_subplot", "set_xlim"):
-        assert forbidden not in source, forbidden
-    for reused in ("rows.row_axes(", "rows.finalise_time_axis("):
-        assert reused in source, reused

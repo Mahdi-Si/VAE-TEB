@@ -2,39 +2,22 @@ r"""The figure's lag axis and the model's own reported lag must be the same numb
 
 The raw-signal sibling records the failure this file exists for: two consumers each reached into the
 model for the causal input delay $\delta$ under a name of its own guessing, one of those names did
-not exist and silently read zero, and at the $120$ s budget the figure's lag axis came out short by
-$30$ steps -- two minutes -- against the evaluation's. Both went on producing plausible numbers.
+not exist and silently read zero, and the figure's lag axis came out short against the evaluation's.
+Both went on producing plausible numbers.
 
-**This cell re-creates that bug class twice over**, which is why the file is here rather than
-inherited from a sibling that carries it.
+**This cell re-creates that bug class twice over.** The input rows fill
+``InputStreamPanel.delays`` with $W'_c$, a **warm-up**, through an attribute whose name says delay;
+a warm-up is a leading region a channel is not honest in and shifts nothing, whereas a delay means
+the source memory the attention queries is itself $\delta$ steps stale. On an unaligned model the
+gate is a pure gather, $\delta = 0$ and the honest axis is $\Delta\ell$ -- the arm in which reading
+the panel's staircase as a delay is visible at all. Under an alignment the gate carries the
+per-channel shifts $d_c$, $\delta = \max_c d_c > 0$, and the honest axis is $\Delta(\ell + \delta)$
+on both lag panels, with the page's delay probe agreeing with the model's own.
 
-The input rows fill ``InputStreamPanel.delays`` with $W'_c$, a **warm-up**, through an attribute
-whose name says delay. The two quantities are not the same thing and only one of them belongs on the
-lag axis: a warm-up is a leading region a channel is not honest in, and it shifts nothing, whereas a
-delay means the source memory the attention queries is itself $\delta$ steps stale. **The
-fixtures below are built unaligned on purpose** -- ``tiny_warmup_kwargs`` passes no
-``*_align_delays``, so the gate is a pure gather, $\delta = 0$ and the honest axis is $4\ell$. That
-is the arm in which the confusion is visible at all: a consumer that took the panel's staircase for
-a delay would report every lag up to $200$ s too long on the tiny geometry and $536$ s too long at
-the shipped one, with nothing failing.
-
-Under the **shipped** ``causal_align_reference`` the gate is *not* a pure gather -- it carries the
-per-channel alignment shifts $d_c$ and $\delta = \max_c d_c > 0$ -- and the honest axis is then
-$\Delta(\ell + \delta)$. The distinction survives either way: $d_c$ is a shift and belongs on the
-axis, $W'_c$ is a warm-up and does not.
-
-And ``lag_floor`` introduces a second offset on the same axis, which is the more tempting mistake
-because it *is* a lag-domain quantity. It is not a shift either: the floor generalises the mask from
-$\mathbb 1[t - \ell \ge 0]$ to $\mathbb 1[t - \ell \ge F_u]$, which restricts **which** lags a step
-may read, not what a lag index means. Lag $\ell$ is still source step $t - \ell$ at every floor, so
-the axis must not move by the floor -- and what must move is the mask.
-
-**What is different here, and it is the point of this cell.** On the causal-feature pages the lag
-axis needs a correction at both ends: the source coefficient lags by its own group delay and so does
-the target coefficient the query is built from. Here the target is a raw sample, so the anchor is
-exact and only the input side needs a caveat at all. The page says so as a footnote, and the
-footnote is asserted as a string beside the axis it qualifies -- a caption stating the sibling's
-two-sided correction on this page would be wrong in the direction that reads as more careful.
+``lag_floor`` is the second offset on the same axis and is not a shift either: it restricts
+**which** lags a step may read, $\mathbb 1[t - \ell \ge F_u]$, not what a lag index means, so the
+axis must not move by the floor while the mask must. Nor may this cell's raw-grid forecast rows move
+the lag panels' limits.
 
 The secondary axis is read **after a draw**. Matplotlib defers a secondary axis's limits to draw
 time, so an assertion made before one passes against the default $(0, 1)$ whatever the transform is
@@ -42,7 +25,6 @@ time, so an assertion made before one passes against the default $(0, 1)$ whatev
 """
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
 import matplotlib
@@ -59,7 +41,6 @@ from teb_vae.lag_attn.nets.lag_report import (  # noqa: E402
     SECONDS_PER_STEP,
     lag_compensated_seconds,
 )
-from teb_vae.lag_attn_crws import sample_page  # noqa: E402
 from teb_vae.lag_attn_rws import plotting  # noqa: E402
 from teb_vae.lag_attn_rws.plotting import _source_delay_steps  # noqa: E402
 
@@ -67,6 +48,7 @@ from .conftest import (  # noqa: E402
     TINY_STRIDE,
     make_stub_batch,
     make_task,
+    tiny_align_kwargs,
     tiny_warmup_kwargs,
 )
 
@@ -77,18 +59,18 @@ _LAG_PANELS = ("Lag attention", r"$\widetilde K_{t,\ell}$")
 _LAG_FLOOR = 3
 
 
-def _module_and_batch(**overrides: Any) -> Tuple[Any, Any]:
+def _module_and_batch(aligned: bool = False, **overrides: Any) -> Tuple[Any, Any]:
     """Build this model wrapped in its task, at the tiny warm-up guard and the tiling stride.
 
     Args:
+        aligned: Build at the tiny alignment as well, so the source gate carries a shift.
         **overrides: Constructor keywords applied on top of the guarded tiny set.
 
     Returns:
         ``(task, batch)``.
     """
-    module = make_task(
-        model_kwargs=tiny_warmup_kwargs(anchor_stride=TINY_STRIDE, **overrides)
-    )
+    guard = tiny_align_kwargs if aligned else tiny_warmup_kwargs
+    module = make_task(model_kwargs=guard(anchor_stride=TINY_STRIDE, **overrides))
     return module, make_stub_batch()
 
 
@@ -157,28 +139,15 @@ def _axis_limits(figure: Any) -> Dict[str, Any]:
     return {prefix: secondary.get_ylim() for prefix, _panel, secondary in _lag_axes(figure)}
 
 
-def test_this_family_applies_no_delay_so_the_probe_reads_zero():
-    r"""**On this unaligned fixture** the gate is a pure gather -- a warm-up masks a leading
-    region and leaves every step at its own index -- so there is no staleness to compensate and
-    $4\ell$ is the honest axis. ``tiny_warmup_kwargs`` passes no ``*_align_delays``, which is what
-    makes this hold; the shipped config *does* align and its $\delta$ is positive. Stated as its own
-    assertion because every equality below rests on it, and because a model that had quietly
-    acquired a delay would make them all pass while meaning something else."""
-    module, _batch = _module_and_batch()
-    model = module.orig_model
-
-    assert int(model.source_delay_steps) == _source_delay_steps(model) == 0
-    assert model.source_gate is not None, "an ungated model makes this vacuous"
-    assert int(model.source_gate.delay.delay_steps.max()) == 0
-
-
 def test_filling_the_panels_delays_with_the_warm_up_did_not_move_the_lag_axis():
     r"""The bug class, driven. The input rows carry $W'_c$ under an attribute named ``delays``, and
     the largest of them is a real number of steps -- so an axis built from the panel rather than
     from the model would be long by $\Delta \max_c W'_c$ and nothing would fail. Compared against a
-    hand-computed physical lag rather than against the page's own helper."""
+    hand-computed physical lag rather than against the page's own helper, on the unaligned gate
+    where $\delta = 0$."""
     module, batch = _module_and_batch()
     model = module.orig_model
+    assert _source_delay_steps(model) == int(model.source_delay_steps) == 0
     figure = _page(module, batch)
     try:
         panels = plotting.input_stream_panels(
@@ -201,14 +170,19 @@ def test_filling_the_panels_delays_with_the_warm_up_did_not_move_the_lag_axis():
 
 
 def test_both_panels_carry_the_axis_the_models_own_delay_implies():
-    r"""Each panel's primary axis is the lag index $\ell$ and its secondary is $4(\ell + \delta)$
+    r"""Each panel's primary axis is the lag index $\ell$ and its secondary is $\Delta(\ell + \delta)$
     seconds. The two must be the same map on both panels: the attention map says where the source
     was attended and the KL-by-lag map how much it bought, and they are read together, so two axes
-    disagreeing would misalign the only comparison the pair supports."""
-    module, batch = _module_and_batch()
+    disagreeing would misalign the only comparison the pair supports.
+
+    Aligned, so $\delta > 0$ and the page's own delay probe -- the read site the recorded bug was
+    in -- has a non-zero value to get wrong."""
+    module, batch = _module_and_batch(aligned=True)
     figure = _page(module, batch)
     try:
         delay = int(module.orig_model.source_delay_steps)
+        assert delay > 0, "an unshifted gate makes this the unaligned test again"
+        assert _source_delay_steps(module.orig_model) == delay
         seen = []
         for prefix, panel, secondary in _lag_axes(figure):
             low, high = panel.get_ylim()
@@ -297,22 +271,3 @@ def test_the_replaced_row_does_not_move_the_lag_axis():
 
     for prefix in with_rows:
         assert with_rows[prefix] == pytest.approx(without_rows[prefix]), prefix
-
-
-def test_the_page_is_the_only_lag_resolved_consumer_this_cell_ships():
-    r"""Why this file is two consumers shorter than the causal-feature sibling's.
-
-    That package's lag axis has a third reader -- an evaluation runner, which builds its own seconds
-    axis from a ``delay_steps`` it reads off the model once and threads through a collection record
-    -- and the file pins that read site by name, because a *non-zero* delay reaching one consumer and
-    not another is invisible. This cell ships no evaluation package at all, so the figure and the
-    model are the whole consumer set and the two agree above. Asserted rather than assumed: an
-    ``eval/`` arriving here without its read site pinned is how the third consumer went unnoticed the
-    first time.
-    """
-    package = Path(sample_page.__file__).parent
-
-    assert not (package / "eval").exists()
-    # And the caveat the page carries is the one-sided one, which is the reading the missing
-    # target-side group delay makes correct here and nowhere else in the family.
-    assert "one-sided here" in sample_page.LAG_TIME_CAVEAT

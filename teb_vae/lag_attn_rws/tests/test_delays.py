@@ -72,15 +72,6 @@ def test_the_index_buffer_stays_out_of_the_state_dict():
     assert delay.state_dict() == {}
 
 
-def test_the_buffer_still_moves_with_the_module():
-    """Non-persistent is not the same as detached: it must still follow ``.to()``, or a CUDA
-    forward would gather with a CPU index."""
-    delay = ChannelDelay(num_channels=_CHANNELS, delays=[0, 1, 2, 3, 4]).to(torch.device("cpu"))
-
-    assert delay.delay_steps.device.type == "cpu"
-    assert list(delay.buffers())
-
-
 def test_a_mismatched_delay_vector_raises():
     with pytest.raises(ValueError, match="num_channels"):
         ChannelDelay(num_channels=_CHANNELS, delays=[0, 1])

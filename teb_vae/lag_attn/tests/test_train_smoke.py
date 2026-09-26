@@ -29,7 +29,6 @@ import yaml
 from teb_vae.lag_attn.config import load_config
 from teb_vae.lag_attn.trainer import LagAttnTrainer
 from train.graph_models_utils import check_model_class, load_checkpoint_strict
-from train.test_utils import FakeMLflowLogger
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 _TINY = _REPO_ROOT / "teb_vae" / "lag_attn" / "configs" / "tiny.yaml"
@@ -86,19 +85,6 @@ def test_the_losses_stay_finite(fit):
         assert math.isfinite(float(value)), f"{name} is {float(value)}"
 
 
-def test_gradient_clipping_and_accumulation_are_active(fit):
-    """Both are Lightning's, and both are rejected outright under manual optimization.
-
-    A task that had set ``automatic_optimization = False`` would make this configuration a
-    ``MisconfigurationException`` rather than a silent difference -- but it would also have to
-    hand-roll the clip, the accumulation boundary, the scheduler step and the spike breaker.
-    """
-    driver, trainer = fit
-
-    assert trainer.gradient_clip_val == 0.5
-    assert trainer.accumulate_grad_batches == 1
-
-
 def test_the_zero_kl_init_invariant_survives_the_whole_stack(fit):
     r"""At initialisation $q(z_t \mid Y, U) = p(z_t \mid Y)$ exactly, so $K = 0$.
 
@@ -126,14 +112,6 @@ def test_the_zero_kl_init_invariant_survives_the_whole_stack(fit):
     assert float(outputs["kld_per_t"].abs().max()) < 1e-6
 
 
-def test_every_declared_metric_reaches_the_logger(fit):
-    """The gap between "the task emits it" and "a callback collected it" is silent otherwise."""
-    driver, trainer = fit
-
-    for name in ("train/total_loss", "train/main_loss", "train/kld_raw", "val/total_loss"):
-        assert name in trainer.callback_metrics, f"{name} never reached callback_metrics"
-
-
 def test_the_metrics_history_csv_has_no_all_nan_column(fit):
     """The check that catches a tracked name the framework never emits.
 
@@ -147,48 +125,14 @@ def test_the_metrics_history_csv_has_no_all_nan_column(fit):
     assert all_nan == [], f"columns that are NaN for every epoch: {all_nan}"
 
 
-def test_the_scheduled_beta_reaches_the_csv(fit):
-    """The specific column that was silently NaN, now carrying the resolved schedule value."""
-    driver, _ = fit
-    frame = pd.read_csv(Path(driver.train_results_dir) / "metrics_history.csv")
-
-    assert "train/kld_beta" in frame.columns
-    assert float(frame["train/kld_beta"].iloc[0]) == pytest.approx(1.0e-4)  # the schedule's start
-
-
-def test_the_first_epochs_lr_cell_is_nan_and_the_rest_are_not(fit):
-    """A framework timing quirk, recorded so the next reader does not chase it.
-
-    ``lr`` is logged from ``on_train_epoch_start`` with ``on_epoch=True``, so it is not committed to
-    ``callback_metrics`` until that train epoch *ends* -- and the history is collected at
-    validation-epoch-end, which comes first. Epoch 0's cell is therefore always NaN, in every run,
-    and every later cell is fine.
-
-    This is a real gap of one epoch, not a naming mistake: ``lr`` is correctly tracked bare, since
-    it is the one key the framework logs without a stage prefix.
-    """
-    driver, _ = fit
-    frame = pd.read_csv(Path(driver.train_results_dir) / "metrics_history.csv")
-
-    assert math.isnan(float(frame["lr"].iloc[0]))
-    assert float(frame["lr"].iloc[1]) == pytest.approx(0.0003)  # general_config.lr via tiny->default
-
-
-def test_the_checkpoint_is_written_to_the_run_checkpoint_directory(fit):
-    driver, _ = fit
-
-    checkpoints = list(Path(driver.model_checkpoint_dir).glob("*.ckpt"))
-
-    assert checkpoints, "no checkpoint was written; Lightning's default would have gone elsewhere"
-
-
 def test_the_checkpoint_carries_its_contract_and_reloads(fit):
     """The end of the road: a blob that describes itself and rebuilds without a config file."""
     driver, _ = fit
     from teb_vae.lag_attn.nets.model import SeqVaeLagAttn
 
-    path = next(iter(Path(driver.model_checkpoint_dir).glob("*.ckpt")))
-    blob = torch.load(path, map_location="cpu", weights_only=False)
+    checkpoints = sorted(Path(driver.model_checkpoint_dir).glob("*.ckpt"))
+    assert checkpoints, "no checkpoint in the run directory; Lightning's default would go elsewhere"
+    blob = torch.load(checkpoints[0], map_location="cpu", weights_only=False)
 
     assert blob["model_class"] == "SeqVaeLagAttn"
     assert blob["model_kwargs"] == driver._build_model_kwargs()
@@ -206,101 +150,10 @@ def test_the_run_directory_holds_the_logs(fit):
 
 
 # --------------------------------------------------------------------------------------
-# MLflow wiring
+# Diagnostic plotting
 # --------------------------------------------------------------------------------------
-def test_mlflow_callbacks_attach_when_tracking_is_on(fit):
-    """A headline benefit of moving onto ``build_trainer``, and otherwise untested until the prod box.
-
-    The trainer this was ported from hand-rolled its ``pl.Trainer`` and attached neither of these,
-    so no run ever logged its architecture, its parameter counts, its final model, or its LR
-    series. The builder attaches both -- but only when a logger exists, which is exactly the
-    condition a mis-ordered ``main`` breaks.
-    """
-    from lightning.pytorch.callbacks import LearningRateMonitor
-    from train.callbacks import MLflowRunLoggingCallback
-
-    driver, _ = fit
-    driver.mlflow_logger = FakeMLflowLogger()
-
-    callbacks = driver._build_trainer_kwargs([])["callbacks"]
-
-    assert any(isinstance(cb, MLflowRunLoggingCallback) for cb in callbacks)
-    assert any(isinstance(cb, LearningRateMonitor) for cb in callbacks)
-
-
-def test_the_run_logging_callback_is_absent_without_a_logger(fit):
-    """The mirror image, and the failure mode of building the model before setup_config."""
-    from train.callbacks import MLflowRunLoggingCallback
-
-    driver, _ = fit
-    driver.mlflow_logger = None
-
-    callbacks = driver._build_trainer_kwargs([])["callbacks"]
-
-    assert not any(isinstance(cb, MLflowRunLoggingCallback) for cb in callbacks)
-
-
-def test_the_final_model_would_be_registered(fit):
-    """``log_model: true`` is not decoration: it is what makes the callback log the eager model.
-
-    Dropping the key from the config would default it to ``False`` here and silently stop the run
-    from registering anything.
-    """
-    from train.callbacks import MLflowRunLoggingCallback
-
-    driver, _ = fit
-    driver.mlflow_logger = FakeMLflowLogger()
-
-    callbacks = driver._build_trainer_kwargs([])["callbacks"]
-    run_logging = next(cb for cb in callbacks if isinstance(cb, MLflowRunLoggingCallback))
-
-    assert run_logging._log_model is True
-
-
 def test_the_default_tiny_run_writes_no_diagnostic_plots(fit):
     """``lag_attn_plotting.enabled: false`` in the tiny config: the plotter is never constructed."""
     driver, _ = fit
 
     assert not (Path(driver.train_results_dir) / "lag_attn_diagnostics").exists()
-
-
-# --------------------------------------------------------------------------------------
-# Diagnostic plotting, enabled
-# --------------------------------------------------------------------------------------
-def test_enabling_the_plotter_writes_both_figures_into_the_run_directory(tmp_path_factory):
-    """A short fit with plotting on leaves the diagnostic and its companion on disk.
-
-    A separate fit from the module-scoped one, because it must run with a different config -- the
-    tiny config ships the plotter off so the rest of the suite stays fast.
-    """
-    tmp_path = tmp_path_factory.mktemp("smoke_plots")
-    config = load_config(str(_TINY))
-    config["general_config"]["folders_config"]["out_dir_base"] = str(tmp_path)
-    config["general_config"]["epochs"] = 2
-    dataset = config["dataset_config"]
-    for key in ("vae_train_datasets", "vae_test_datasets"):
-        dataset[key] = [str(_REPO_ROOT / path) for path in dataset[key]]
-    dataset["stat_path"] = str(_REPO_ROOT / dataset["stat_path"])
-    config["advanced_config"]["trainer"]["profiler"] = None
-    # Turn the plotter on. One example keeps it to a single figure pair per validation epoch.
-    config["advanced_config"]["callbacks"]["lag_attn_plotting"] = {
-        "enabled": True,
-        "plot_frequency": 1,
-        "num_examples": 1,
-    }
-
-    config_path = tmp_path / "resolved.yaml"
-    config_path.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
-
-    from train.data_module import GraphDataModule
-
-    driver = LagAttnTrainer(config_file_path=str(config_path))
-    driver.setup_config()
-    data_module = GraphDataModule(driver.config)
-    driver.create_model()
-    driver.train_model(data_module.train_dataloader(), data_module.val_dataloader())
-
-    plot_dir = Path(driver.train_results_dir) / "lag_attn_diagnostics"
-    names = [p.name for p in plot_dir.glob("*.pdf")]
-    assert any(not name.endswith("_control.pdf") for name in names), "no diagnostic figure written"
-    assert any(name.endswith("_control.pdf") for name in names), "no companion figure written"

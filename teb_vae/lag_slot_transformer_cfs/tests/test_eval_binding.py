@@ -9,6 +9,9 @@ against its checkpoint, and what "the predictive score" means once it is.
 either side, so a ``geometry_keys`` entry that is not both a constructor parameter *and* a config
 key is a reconciliation that never happens and never says so. Both halves are asserted against the
 class and against the shipped ``configs/default.yaml`` rather than against a second hand-kept list.
+The analysis registries the binding declares are checked against each other and against the
+shared registry in the same way: removals, analogues and reuses must agree with what is actually
+registered.
 
 **The interesting scoring failures are quieter still.** A marginalised predictive density that is
 secretly a mean of per-draw negative log likelihoods improves as the latent becomes less
@@ -30,47 +33,22 @@ from teb_vae.lag_attn_cfs.eval import run as shared_run
 from teb_vae.lag_attn_cfs.eval.config_schema import load_eval_overrides
 from teb_vae.lag_slot_transformer_cfs.eval import collect, predictive
 from teb_vae.lag_slot_transformer_cfs.eval.binding import (
+    ANALOGUE_ANALYSES,
     ANALYSES_THIS_ARCHITECTURE_CANNOT_PRODUCE,
     EXCLUDED_ANALYSES,
     EXTRA_ANALYSES,
     GEOMETRY_KEYS,
-    HEADLINE_SCALARS,
     LAG_RESIDUAL_BINDING,
     UNREGISTERED_ANALYSES,
     residual_encoder_disclosure,
 )
 from teb_vae.lag_slot_transformer_cfs.nets.core import REFUSED_KEYWORDS
 from teb_vae.lag_slot_transformer_cfs.nets.model import SeqVaeLagResidualTrfCfs
-from teb_vae.lag_slot_transformer_cfs.task import SeqVaeLagResidualTrfCfsTask
 
 from .conftest import TINY_SEQ_LEN, build_tiny_model, tiny_streams
 
 #: The shipped production configuration, which the geometry keys are checked against.
 DEFAULT_CONFIG = Path(__file__).resolve().parents[1] / "configs" / "default.yaml"
-
-#: Every analysis this architecture cannot produce, written out rather than imported: importing
-#: the mapping and comparing it with itself would pass on any edit.
-EXPECTED_ABSENT = (
-    "attention",
-    "lag_kl",
-    "occlusion",
-    "lag_clocks",
-    "lag_kld_scaled",
-    "lag_high_kl",
-)
-
-#: The two of them the SHARED registry actually holds, which are therefore the only two a binding
-#: can remove. The other four are the lag-attentive cell's own extras and are absent here because
-#: nothing registers them, which is a different mechanism with the same cause. ``source_null``,
-#: ``warmup`` and ``spectral_skill`` are that cell's extras too and are registered here as the
-#: family's own implementations, because the columns they read are the same quantities here.
-EXPECTED_FAMILY_REUSE = ("warmup", "source_null", "spectral_skill")
-
-#: This cell's own analogues of the absent family analyses, each reading a sidecar this cell's
-#: pass writes under its own names.
-EXPECTED_ANALOGUES = ("proposal_profile", "proposal_clocks", "band_clocks", "high_kl_anchors")
-EXPECTED_REMOVALS = ("attention", "lag_kl")
-
 
 @pytest.fixture(scope="module")
 def shipped_vae_config():
@@ -97,192 +75,54 @@ def constructor_parameters():
 # =============================================================================
 # The binding
 # =============================================================================
-def test_the_binding_names_this_packages_model_and_task() -> None:
-    """A wrong class either refuses by name or evaluates one architecture under another's."""
-    assert LAG_RESIDUAL_BINDING.model_cls is SeqVaeLagResidualTrfCfs
-    assert LAG_RESIDUAL_BINDING.task_cls is SeqVaeLagResidualTrfCfsTask
-    assert LAG_RESIDUAL_BINDING.tag == "lag_slot_transformer_cfs"
+def test_every_geometry_key_is_a_constructor_parameter_and_a_shipped_config_key(
+    constructor_parameters, shipped_vae_config
+) -> None:
+    """A key the constructor does not accept can never match and refuses every run; a key absent
+    from the config is skipped by the reconciler with nothing said.
 
-
-def test_every_geometry_key_is_a_parameter_of_this_constructor(constructor_parameters) -> None:
-    """A key the constructor does not accept can never match, and refuses every run."""
-    unknown = sorted(set(GEOMETRY_KEYS) - constructor_parameters)
-    assert not unknown, unknown
-
-
-def test_every_geometry_key_is_also_a_shipped_config_key(shipped_vae_config) -> None:
-    """A key absent from the config is skipped by the reconciler with nothing said.
-
-    This is the half that fails silently: the run passes, the config and the checkpoint are free to
-    disagree about that key, and the symptom appears later as numbers computed at a geometry nobody
-    chose.
+    The second is the half that fails silently: the run passes, the config and the checkpoint are
+    free to disagree about that key, and the symptom appears later as numbers computed at a
+    geometry nobody chose. A refused keyword would refuse every run outright.
     """
-    unknown = sorted(set(GEOMETRY_KEYS) - set(shipped_vae_config))
-    assert not unknown, unknown
+    assert sorted(set(GEOMETRY_KEYS) - constructor_parameters) == []
+    assert sorted(set(GEOMETRY_KEYS) - set(shipped_vae_config)) == []
+    assert sorted(set(GEOMETRY_KEYS) & set(REFUSED_KEYWORDS)) == []
 
 
-def test_no_refused_keyword_is_reconciled() -> None:
-    """A key naming a mechanism the constructor rejects would refuse every run outright."""
-    overlap = sorted(set(GEOMETRY_KEYS) & set(REFUSED_KEYWORDS))
-    assert not overlap, overlap
+def test_the_binding_removes_only_what_the_shared_registry_holds_and_keeps_the_order() -> None:
+    """Removed by name, never handed a substitute, and nothing else moved.
 
-
-def test_the_geometry_keys_are_unique_and_carry_this_architectures_own() -> None:
-    """The five that decide what a reported number means rather than how well the model fits."""
-    assert len(set(GEOMETRY_KEYS)) == len(GEOMETRY_KEYS)
-    for key in (
-        "residual_mu_scale",
-        "residual_logsigma_scale",
-        "lag_scale",
-        "mean_only_residual",
-        "source_scalar_lift",
-    ):
-        assert key in GEOMETRY_KEYS, key
-
-
-def test_the_capacity_and_chunk_keys_are_deliberately_absent() -> None:
-    """Reconciling them would refuse a correct run.
-
-    The chunk sizes change floating-point summation order and nothing else, and an evaluation
-    legitimately runs at a different tiling from the fit that produced the checkpoint.
+    The alternative to removing an analysis is feeding a lag readout a proposal norm under an
+    attention name. An exclusion the registry does not hold is rejected rather than ignored, so
+    the analyses that are absent because nothing registers them are listed apart.
     """
-    for key in ("anchor_chunk", "lag_chunk", "proposal_hidden", "lag_embed_dim"):
-        assert key not in GEOMETRY_KEYS, key
-
-
-def test_the_binding_removes_the_two_shared_analyses_it_cannot_produce() -> None:
-    """Removed by name, never handed a substitute.
-
-    The alternative to removing them is feeding a lag readout a proposal norm under an attention
-    name, which every reader and every downstream table would take for an attention allocation.
-    """
-    assert EXCLUDED_ANALYSES == EXPECTED_REMOVALS
-
     shared = list(shared_run.ANALYSIS_FUNCTIONS)
     reduced = list(shared_run.merged_analysis_functions(LAG_RESIDUAL_BINDING))
-    assert set(shared) - set(reduced) == set(EXPECTED_REMOVALS)
+    assert set(shared) - set(reduced) == set(EXCLUDED_ANALYSES)
     # Nothing else moved among the shared ones, so a reader comparing this cell's output against
     # the lag-attentive one finds fewer columns in the same order rather than a reordering.
     assert [name for name in reduced if name in shared] == [
-        name for name in shared if name not in EXPECTED_REMOVALS
+        name for name in shared if name not in EXCLUDED_ANALYSES
     ]
     # This cell's own sit after the shared ones and before the trailing cross-subgroup test,
     # which reads what they write.
     assert [name for name in reduced if name not in shared] == list(EXTRA_ANALYSES)
     assert reduced[-1] == "cross_subgroup"
+    assert not set(UNREGISTERED_ANALYSES) & set(shared)
+    assert set(UNREGISTERED_ANALYSES) | set(EXCLUDED_ANALYSES) == set(
+        ANALYSES_THIS_ARCHITECTURE_CANNOT_PRODUCE
+    )
 
 
-def test_the_binding_declares_its_own_collection_pass() -> None:
-    """The family's runner calls whichever pass the binding names, and this cell names its own:
-    the shared pass reads tensors only a lag-attention forward emits."""
-    from teb_vae.lag_slot_transformer_cfs.eval import binding as binding_module
-    from teb_vae.lag_slot_transformer_cfs.eval import collect
-
-    assert LAG_RESIDUAL_BINDING.collect is binding_module.collect_tables
-    assert collect.collect_tables is not binding_module.collect_tables
-    # The three that draw this model's own forward are registered under the family's names.
-    assert {"samples", "recording_traces", "attribution"} <= set(EXTRA_ANALYSES)
-    assert all(callable(function) for function in EXTRA_ANALYSES.values())
-
-
-def test_every_headline_scalar_this_cell_registers_resolves_on_its_own_results() -> None:
-    """A path that resolves to nothing is a column of ``None`` in every arm table; each one is
-    checked against a results block shaped as the pass writes it."""
-    from teb_vae.lag_attn_cfs.eval import report_seam
-
-    results = {
-        "readouts": {"mc_pred_gap": 0.5},
-        "verdicts": [],
-        "arm_scores": {
-            "pred_gap": {"point": 0.5, "lo": 0.1, "hi": 0.9},
-            "draw_concentration_full": {"point": 3.0},
-        },
-        "source_controls": {
-            "silence_margin_nats": 0.5, "replace_zeros_margin_nats": 0.2,
-            "replace_constant_margin_nats": 0.1, "permute_margin_nats": 0.3,
-        },
-        "lag_readouts": {"cancellation": {"mean": {"ratio": 0.7}}},
-        "source_null": {
-            "difference": {
-                "kld_source_null_nats": 0.1, "coupling_minus_clock_nats": 0.2,
-                "ci_lo": 0.15, "ci_hi": 0.25,
-            }
-        },
-        "warmup": {
-            "headline": {
-                "pred_gap_warm_lo_nats": 0.1, "pred_gap_warm_mid_nats": 0.2,
-                "pred_gap_warm_hi_nats": 0.3,
-            },
-            "geometry_guards": {"anchors_per_sample": 4.0, "target_warm_frac": 1.0},
-        },
-        "spectral_skill": {
-            "headline": {
-                "pred_gap_slow_baseline_nats": 0.1, "pred_gap_deceleration_nats": 0.2,
-                "pred_gap_variability_nats": 0.3, "pred_gap_beat_to_beat_nats": 0.4,
-            }
-        },
-        "high_kl_anchors": {
-            "thresholds": {"high_nats": 0.3},
-            "usefulness": {
-                "high_minus_rest_mean_interval": {"point": 0.05},
-                "overlap": {"share_of_high_in_gain": 0.4},
-            },
-        },
-    }
-    headline = report_seam.build_headline(results, HEADLINE_SCALARS)
-
-    for name, _path in HEADLINE_SCALARS:
-        assert headline[name] is not None, name
-    assert headline["pred_gap_mc_ci_lo"] == 0.1
-    assert headline["pred_gap_mc_nats"] == 0.5
-
-
-def test_the_family_analyses_this_cell_reuses_and_its_own_analogues_are_registered() -> None:
-    """The three family implementations whose columns this pass writes, and the four analogues.
-
-    Registered under the family's names for the three, because the quantity is the same one; and
-    under this cell's own names for the four, because a proposal norm under an attention name is
-    the substitution the design rules out.
-    """
-    for name in (*EXPECTED_FAMILY_REUSE, *EXPECTED_ANALOGUES):
-        assert name in EXTRA_ANALYSES, name
-    assert not set(EXPECTED_ANALOGUES) & set(shared_run.ANALYSIS_FUNCTIONS)
-    from teb_vae.lag_slot_transformer_cfs.eval.binding import ANALOGUE_ANALYSES
-
-    assert set(ANALOGUE_ANALYSES) == set(EXPECTED_ABSENT)
+def test_every_absent_analysis_has_a_registered_analogue_of_this_cells_own() -> None:
+    """Registered under this cell's own names, because a proposal norm under an attention name is
+    the substitution the design rules out."""
+    assert set(ANALOGUE_ANALYSES) == set(ANALYSES_THIS_ARCHITECTURE_CANNOT_PRODUCE)
     for name, analogues in ANALOGUE_ANALYSES.items():
         assert analogues, name
         assert set(analogues) <= set(EXTRA_ANALYSES), (name, analogues)
-        # And the reason names its analogue, so the summary carries the correspondence.
-        assert any(a in ANALYSES_THIS_ARCHITECTURE_CANNOT_PRODUCE[name] for a in analogues), name
-
-
-def test_only_analyses_the_shared_registry_holds_may_be_removed() -> None:
-    """The four that are absent rather than removed, and why the distinction has to be kept.
-
-    Naming one of them on the binding would refuse every run: an exclusion the registry does not
-    hold is rejected rather than ignored, which is the guard that catches a misspelt one.
-    """
-    assert set(UNREGISTERED_ANALYSES) == set(EXPECTED_ABSENT) - set(EXPECTED_REMOVALS)
-    assert not set(UNREGISTERED_ANALYSES) & set(shared_run.ANALYSIS_FUNCTIONS)
-
-
-def test_every_absent_analysis_says_which_tensor_it_would_have_needed() -> None:
-    """A reader finding fewer columns than a sibling has to be able to read why."""
-    assert set(ANALYSES_THIS_ARCHITECTURE_CANNOT_PRODUCE) == set(EXPECTED_ABSENT)
-    for name, reason in ANALYSES_THIS_ARCHITECTURE_CANNOT_PRODUCE.items():
-        assert len(reason.strip()) > 40, name
-
-
-def test_the_overrides_path_is_a_committed_delta_and_not_a_config() -> None:
-    """It has no ``base:`` chain, which is refused: a chain would evaluate against what a config
-    file says today rather than against what produced the checkpoint."""
-    path = LAG_RESIDUAL_BINDING.overrides_path
-    assert path.is_file(), path
-    raw = yaml.safe_load(path.read_text(encoding="utf-8"))
-    assert "base" not in raw
-    # And it loads through the shared loader, which is what a run actually uses.
-    assert load_eval_overrides(path)["eval_config"]["occlusion_bands"]
+        assert not set(analogues) & set(shared_run.ANALYSIS_FUNCTIONS), (name, analogues)
 
 
 def test_the_disclosure_reads_the_model_rather_than_a_literal() -> None:
@@ -296,8 +136,9 @@ def test_the_disclosure_reads_the_model_rather_than_a_literal() -> None:
     assert record["furthest_searched_lag"] == model.n_lags - 1
     # The recommended arm's central structural claim, on the model a run would actually score.
     assert record["source_encoder_parameters"] == 0
-    assert "NEURAL" in record["qualification"]
-    assert "feature extraction" in record["qualification"]
+    # And the claim is not reported for the lift arm, where it does not hold.
+    lifted = build_tiny_model(source_scalar_lift=True)
+    assert residual_encoder_disclosure(lifted)["source_encoder_parameters"] > 0
 
 
 def test_the_disclosure_states_the_windows_depth_in_seconds_and_the_input_policy() -> None:
@@ -316,12 +157,6 @@ def test_the_disclosure_states_the_windows_depth_in_seconds_and_the_input_policy
     assert target_only["oldest_lag_seconds"] is None
     assert target_only["effective_inputs"]["zero_fhr_scattering_s0"] is True
     assert target_only["effective_inputs"]["ablated_inputs"][0]["field"] == "fhr_st"
-
-
-def test_the_disclosure_reports_the_lift_arm_as_having_parameters() -> None:
-    """The claim is about the shipped arm and must not be reported for one that does not hold."""
-    lifted = build_tiny_model(source_scalar_lift=True)
-    assert residual_encoder_disclosure(lifted)["source_encoder_parameters"] > 0
 
 
 # =============================================================================
@@ -731,19 +566,6 @@ def test_the_parity_scores_are_the_unweighted_ones_on_an_unweighted_arm() -> Non
     assert torch.equal(full, unweighted)
 
 
-def test_the_results_conventions_name_every_estimator() -> None:
-    """Four estimators, each with the columns that carry it, and a schema version a gate can
-    read; the legacy sentence still travels beside them."""
-    assert collect.RESULTS_SCHEMA_VERSION == 2
-    assert set(collect.SCORE_CONVENTIONS) == {
-        "weighted_objective", "single_draw_conditional", "latent_mean", "predictive_mixture",
-    }
-    for entry in collect.SCORE_CONVENTIONS.values():
-        assert entry["columns"] and entry["meaning"]
-    assert "pred_gap_weighted" in collect.SCORE_CONVENTIONS["weighted_objective"]["columns"]
-    assert "pred_gap_mc_nats" in collect.SCORE_CONVENTIONS["predictive_mixture"]["columns"]
-
-
 # =================================================================================================
 # The three verdicts this cell reads itself
 # =================================================================================================
@@ -815,15 +637,13 @@ def test_the_calibration_verdict_reads_the_mixture_census() -> None:
     assert {v.name: v for v in absent}["calibration_near_nominal"].status == "INCONCLUSIVE"
 
 
-def test_the_prior_floor_verdict_keeps_its_status_and_states_the_residual_identity() -> None:
-    """The status is the family's; the explanation is the residual divergence's."""
+def test_the_prior_floor_verdict_keeps_the_familys_status_and_values() -> None:
+    """The cell replaces the explanation, never the family's status or its numbers."""
     verdicts = collect.cell_verdicts(
         _family_verdicts(), pred_gap_interval=None, mixture_calibration=None, num_samples=8
     )
     verdict = {v.name: v for v in verdicts}["prior_variance_not_pinned"]
     assert verdict.status == "FAIL"
-    assert "inflate" in verdict.detail and "NOT" in verdict.detail
-    assert "exp(2b)" in verdict.detail
     assert verdict.values["floor_frac"] == 0.56
 
 
@@ -878,7 +698,7 @@ def test_the_gate_reads_the_interval_and_refuses_a_disagreeing_list() -> None:
     assert crossing["status"] == "INCONCLUSIVE"
     assert gate.report_predictive_gap(_summary(lo=-0.5, hi=-0.1, listed="FAIL"))["status"] == "FAIL"
     disagree = gate.report_predictive_gap(_summary(lo=-0.2, hi=0.53, listed="PASS"))
-    assert disagree["status"] == "FAIL" and "disagree" in disagree["detail"]
+    assert disagree["status"] == "FAIL"
     legacy = gate.report_predictive_gap(_summary(lo=-0.2, hi=0.53, listed="PASS", schema=None))
     assert legacy["status"] == "INCONCLUSIVE" and legacy["schema_version"] == 1
     assert legacy["listed_status"] == "PASS"

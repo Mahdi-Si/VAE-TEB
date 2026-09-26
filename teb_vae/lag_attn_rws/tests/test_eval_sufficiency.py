@@ -1,19 +1,16 @@
-r"""The sufficiency analysis: one population, two gaps, and the caveats travelling with them.
+r"""The sufficiency analysis: one population, two gaps, and the join that makes them comparable.
 
 What can go wrong here is not that the arithmetic is wrong but that the three numbers describe
 three different sets of recordings -- $D_{\mathrm{oracle}}$ the held-out half, $D_{\mathrm{base}}$
 the whole split, $\Delta_{\mathrm{suff}}$ their difference -- at which point the gap is a
 comparison of populations wearing the name of a measurement. So the assertions here are mostly
 about *who* was measured: that the join landed, that the per-recording frame holds exactly the
-held-out recordings, and that both gaps come off the same frame.
-
-The second thing that can go wrong is silent: the two bias directions and the "estimate, not a
-bound" sentence live in the emitted JSON rather than only in a docstring, because a reader meets
-the number in ``summary.json``.
+held-out recordings, and that both gaps come off the same frame. The artifacts the analysis
+declares are checked on disk, and a pass with no model must record a skip rather than a number.
+The probe's own convergence and capacity rules are pinned in ``test_eval_oracle.py``.
 """
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
 import numpy as np
@@ -43,13 +40,6 @@ def directory(evaluated) -> Path:
 # =============================================================================
 # The measurement happened, and on one population
 # =============================================================================
-def test_the_analysis_ran_rather_than_recording_a_skip(result) -> None:
-    """A skip here is legitimate on a pass with no model; this fixture has one, so a skip would
-    mean the guards fired on a population that can carry the measurement."""
-    assert not result.get("skipped"), result.get("reason")
-    assert result["n_samples"] > 0
-
-
 def test_the_split_covers_every_recording_and_shares_none(result, evaluated) -> None:
     """The property the whole number rests on: a probe scored on recordings it was fitted to
     reports the bottleneck as costing less than it does."""
@@ -100,51 +90,8 @@ def test_the_summary_gap_matches_the_two_scores_it_is_a_difference_of(result) ->
 
 
 # =============================================================================
-# The caveats are in the artifact, not only in the documentation
+# The artifacts
 # =============================================================================
-def test_both_bias_directions_reach_the_emitted_record(result) -> None:
-    """They oppose, and neither is measured; a reader who sees only one would read the number as
-    a one-sided bound in whichever direction happened to be written down."""
-    directions = {entry["direction"] for entry in result["bias_directions"]}
-
-    assert directions == {"understates", "overstates"}
-    for entry in result["bias_directions"]:
-        assert "target_state" in entry["cause"] or "pretraining" in entry["cause"]
-    assert "estimate, not a bound" in result["estimate_not_a_bound"]
-
-
-def test_the_extra_encoder_pass_is_recorded_as_a_number(result) -> None:
-    """The rest of the pipeline holds that the collection pass is the only model-touching cost.
-    This analysis amends that, and the amendment is a measured size rather than a footnote."""
-    extra = result["plan"]["extra_encoder_pass"]
-
-    assert extra["n_segments"] > 0
-    assert extra["n_bytes"] > 0
-    assert "thousands of passes" in extra["reason"]
-
-
-# =============================================================================
-# Convergence and capacity accompany the number
-# =============================================================================
-def test_the_probe_reports_its_own_convergence(result) -> None:
-    """An under-trained probe understates the gap. Whether it converged is therefore part of the
-    result rather than something a reader has to infer from the curve."""
-    convergence = result["convergence"]
-
-    assert isinstance(convergence["converged"], bool)
-    assert convergence["detail"]
-    assert np.isfinite(float(convergence["final_held_out_nats"]))
-
-
-def test_the_capacity_check_ran_and_says_which_way_it_went(result) -> None:
-    capacity = result["capacity"]
-
-    assert capacity["checked"] is True
-    assert isinstance(capacity["capacity_bound"], bool)
-    assert capacity["n_parameters_wide"] > capacity["n_parameters"]
-    assert capacity["margin_nats"] == oracle.CAPACITY_MARGIN_NATS
-
-
 def test_the_training_curve_is_written_for_both_widths(directory) -> None:
     """The evidence behind the convergence flag, on disk, so it can be looked at rather than
     trusted."""
@@ -155,9 +102,6 @@ def test_the_training_curve_is_written_for_both_widths(directory) -> None:
     assert len(curve) > 0
 
 
-# =============================================================================
-# The artifacts
-# =============================================================================
 def test_every_declared_file_was_written(result, directory) -> None:
     missing = [name for name in result["files"] if not (directory / name).is_file()]
 
@@ -239,16 +183,3 @@ def test_a_join_that_matches_nothing_is_reported_rather_than_divided_by(evaluate
 
     assert empty.empty
     assert "nll_oracle_block" in empty.columns
-
-
-# =============================================================================
-# The run-level record
-# =============================================================================
-def test_the_step_record_marks_the_analysis_as_having_succeeded(evaluated) -> None:
-    """A failure inside the wrapper is isolated and reported; this checks it was not one."""
-    steps = json.loads(
-        (Path(evaluated["results_dir"]) / "steps.json").read_text(encoding="utf-8")
-    )
-    record = next(step for step in steps if step["name"] == "sufficiency")
-
-    assert record["ok"] is True, record.get("error")

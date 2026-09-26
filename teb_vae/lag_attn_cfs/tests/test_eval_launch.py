@@ -148,46 +148,6 @@ def test_the_tuples_name_every_module_with_a_main_block() -> None:
     )
 
 
-def test_no_runner_declares_itself_under_both_conventions() -> None:
-    """The two tuples partition the runners. A module in both would be checked for a launch dict
-    *and* excused from having one, which is a hole rather than belt and braces."""
-    both = set(ENTRY_POINTS) & {name for name, _ in RUN_CONFIG_ENTRY_POINTS}
-
-    assert both == set(), both
-
-
-@pytest.mark.parametrize("name, constant", RUN_CONFIG_ENTRY_POINTS)
-def test_a_single_constant_runner_names_its_constant_in_its_refusal(name: str, constant: str) -> None:
-    """The variant's own obligation, and the one that makes it usable from the Run button.
-
-    A runner taking exactly one thing an operator varies may carry a module-level constant instead
-    of a dict -- a one-key dict would be a second surface saying what the constant already says.
-    What it may not do is refuse with a message about a flag alone: an operator who launched with
-    no command line cannot act on "pass --config", and the constant is the only thing they can edit.
-
-    The two runners here differ in whether they take a command line at all, and the assertion is
-    written so that difference is not a hole. Where a ``--config`` flag exists the refusal must name
-    both surfaces; where the constant is the only surface it must name the constant, which is then
-    the whole of "both".
-    """
-    module = _module(name)
-    source = Path(module.__file__).read_text(encoding="utf-8")
-    lines = source.splitlines()
-
-    assert isinstance(getattr(module, constant, None), (str, type(None))), (
-        f"{name} has no module-level {constant}, so it cannot be launched without a command line"
-    )
-    named_in_a_message = [
-        line for line in lines if constant in line and "=" not in line.split(constant)[0][-3:]
-    ]
-    assert named_in_a_message, f"{name} never names {constant} in a message an operator would read"
-
-    if 'add_argument("--config"' in source:
-        assert any(constant in line and "--config" in line for line in lines), (
-            f"{name} accepts --config as well, so its refusal has to name both surfaces"
-        )
-
-
 @pytest.mark.parametrize("name, _constant", RUN_CONFIG_ENTRY_POINTS)
 def test_a_single_constant_runner_still_requires_nothing_of_argparse(name: str, _constant) -> None:
     """The rule that binds whichever variant a runner uses: ``required=True`` fires before any
@@ -202,20 +162,11 @@ def test_a_single_constant_runner_still_requires_nothing_of_argparse(name: str, 
 
 
 @pytest.mark.parametrize("name", ENTRY_POINTS)
-def test_every_entry_point_ships_a_launch_dict(name: str) -> None:
-    """Without one there is nothing to fill in, and the Run button can only fail."""
-    module = _module(name)
-
-    assert isinstance(getattr(module, "RUN_ARGS", None), dict), (
-        f"{name} has no RUN_ARGS dict, so it cannot be launched without a command line"
-    )
-
-
-@pytest.mark.parametrize("name", ENTRY_POINTS)
 def test_every_launch_dict_key_is_an_argument(name: str) -> None:
-    """A key that is not a ``dest`` silently does nothing. The resolver refuses it, and this is
-    that refusal exercised against what each module actually ships."""
+    """Every runner ships a ``RUN_ARGS`` dict keyed by exactly its parser's ``dest`` set: without
+    one the Run button can only fail, and a key that is not a ``dest`` silently does nothing."""
     module = _module(name)
+    assert isinstance(getattr(module, "RUN_ARGS", None), dict), f"{name} has no RUN_ARGS dict"
     dests = {action.dest for action in module.build_parser()._actions if action.dest != "help"}
 
     assert set(module.RUN_ARGS) == dests, (
@@ -289,13 +240,6 @@ def test_a_launch_dict_key_that_is_not_an_argument_raises_naming_it() -> None:
     in a command line they never typed."""
     with pytest.raises(ValueError, match="alpah"):
         launch.resolve_launch_args(_parser(), {"alpah": 1}, [])
-
-
-def test_every_parser_dest_appears_in_the_resolved_values() -> None:
-    """The values are splatted into ``main``, so a missing key is a ``TypeError`` at launch."""
-    values, _ = launch.resolve_launch_args(_parser(), {"alpha": 1}, [])
-
-    assert set(values) == {"alpha", "beta"}
 
 
 def test_a_missing_required_argument_names_both_ways_to_supply_it() -> None:

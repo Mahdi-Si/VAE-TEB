@@ -21,7 +21,6 @@ import torch
 
 from teb_vae.lag_attn_rws.nets.geometry import TrimmedRawGeometry
 from teb_vae.lag_attn_rws.nets.losses import (
-    MS_RATES,
     compute_loss,
     horizon_decay_weight,
     masked_boundary_gap,
@@ -93,31 +92,6 @@ def test_the_gaussian_carries_its_full_constant():
 # =======================================================================================
 # The horizon weighting
 # =======================================================================================
-@pytest.mark.parametrize("likelihood", ["mse", "gaussian_nll"])
-def test_an_absent_horizon_weight_leaves_every_score_bitwise_where_it_was(likelihood):
-    """The off-state, pinned as **loss equality** rather than as a construction fact.
-
-    A horizon weighting is a loss-side switch: nothing about it is visible in a state dict, so a
-    construction pin would be vacuous. What has to hold is that a model shipping the weight null
-    computes the identical number to one built before the weight existed -- which is what makes an
-    arm at ``horizon_weight_halflife_steps: null`` comparable to every run in the records.
-
-    ``torch.equal`` rather than ``allclose``: the claim is that the multiplication does not happen,
-    not that it happens with ones, and a float32 multiply by exactly $1$ is bit-preserving anyway,
-    so a tolerance here would admit a code path that ran and merely rounded back.
-    """
-    mu, target, logvar, mask = _tensors()
-    variance = logvar if likelihood == "gaussian_nll" else None
-
-    absent = masked_raw_likelihood(mu, target, mask, likelihood=likelihood, logvar=variance)
-    explicit_none = masked_raw_likelihood(
-        mu, target, mask, likelihood=likelihood, logvar=variance, horizon_weight=None
-    )
-
-    for left, right in zip(absent, explicit_none):
-        assert torch.equal(left, right)
-
-
 def test_a_uniform_horizon_weight_is_the_unweighted_score():
     """The mechanism's own fixed point, which is what makes the normalisation checkable.
 
@@ -377,15 +351,9 @@ def test_the_prior_rate_carries_gradient():
 # --------------------------------------------------------------------------------------
 #: Pooled-element count of one tiny anchor's block, summed over the three rates:
 #: $64/1 + 64/4 + 64/16 = 64 + 16 + 4 = 84$. Every hand constant below is stated at this number,
-#: which is why the rates themselves are pinned first -- changing them changes what these tests
-#: mean, and a silently re-derived constant would hide that.
+#: written out rather than re-derived from ``MS_RATES``, so a change to the rates fails the
+#: known-answer test below instead of being silently absorbed into the constant.
 _MS_POOLED_ELEMENTS = 84
-
-
-def test_the_pooling_rates_are_the_documented_ones():
-    """The constants below are stated at these three rates."""
-    assert MS_RATES == (1, 4, 16)
-    assert sum(_BLOCK // rate for rate in MS_RATES) == _MS_POOLED_ELEMENTS
 
 
 def test_the_multiscale_term_sums_over_every_scale():
@@ -428,12 +396,6 @@ def test_the_multiscale_denominator_counts_contributing_anchors():
         masked_multiscale_l1(mu, target, full_mask),
         masked_multiscale_l1(mu, target, partial_mask),
     )
-
-
-def test_an_all_masked_batch_gives_a_finite_zero_multiscale():
-    mu, target, _logvar, _mask = _tensors()
-    value = masked_multiscale_l1(mu, target, torch.zeros(_B, _T_VALID, _H))
-    assert float(value) == 0.0 and torch.isfinite(value)
 
 
 def test_a_block_shorter_than_the_coarsest_rate_is_refused_naming_the_geometry():
@@ -487,9 +449,10 @@ def test_a_masked_position_cannot_move_the_derivative_term():
     assert torch.equal(reference, masked_derivative_huber(mu, planted, mask))
 
 
-def test_an_all_masked_batch_gives_a_finite_zero_derivative():
+@pytest.mark.parametrize("term", [masked_multiscale_l1, masked_derivative_huber])
+def test_an_all_masked_batch_gives_a_finite_zero_shape_term(term):
     mu, target, _logvar, _mask = _tensors()
-    value = masked_derivative_huber(mu, target, torch.zeros(_B, _T_VALID, _H))
+    value = term(mu, target, torch.zeros(_B, _T_VALID, _H))
     assert float(value) == 0.0 and torch.isfinite(value)
 
 

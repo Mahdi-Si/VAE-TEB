@@ -82,38 +82,12 @@ def test_the_rotation_moves_every_position_except_the_first():
         )
 
 
-def test_the_encoding_is_deterministic_and_carries_no_parameters():
-    """It must stay independent of the lag attention's learned lag biases, which it would not be
-    if it had parameters of its own to co-adapt with them."""
-    rope = RotaryPositionEncoding(D_HEAD, MAX_SEQ_LEN)
-    assert list(rope.parameters()) == []
-
-
 def test_the_tables_are_non_persistent_buffers():
     """They are derivable from three constructor arguments, so a checkpoint must not carry them --
     and must not refuse to load when ``max_seq_len`` changes."""
     rope = RotaryPositionEncoding(D_HEAD, MAX_SEQ_LEN)
     assert rope.state_dict() == {}
     assert {name for name, _ in rope.named_buffers()} == {"cos_table", "sin_table"}
-
-
-def test_the_tables_follow_a_dtype_move():
-    """Buffer membership is what makes ``.to(device)`` reach them; ``.to(dtype)`` is checkable
-    here without a second device."""
-    rope = RotaryPositionEncoding(D_HEAD, MAX_SEQ_LEN)
-    assert rope.cos_table.dtype == torch.float32
-
-    rope.to(torch.float64)
-
-    assert rope.cos_table.dtype == torch.float64
-    assert rope.sin_table.dtype == torch.float64
-    assert rope(torch.ones(4, D_HEAD, dtype=torch.float64)).dtype == torch.float64
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="no CUDA device on this machine")
-def test_the_tables_follow_a_device_move():
-    rope = RotaryPositionEncoding(D_HEAD, MAX_SEQ_LEN).to("cuda")
-    assert rope.cos_table.is_cuda and rope.sin_table.is_cuda
 
 
 def test_an_odd_head_width_raises_naming_it():

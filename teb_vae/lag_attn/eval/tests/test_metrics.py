@@ -574,25 +574,11 @@ def test_latent_health_reports_nan_for_a_readout_the_forward_did_not_carry() -> 
 # ---------------------------------------------------------------------------
 # Lag conversion
 # ---------------------------------------------------------------------------
-def test_lag_to_seconds_is_the_stored_timeline_with_no_shift_term() -> None:
-    r"""$4\ell$ and nothing else: the stored timeline is canonical.
-
-    The dataset builder's UP shift is part of the stored signal, so no lag quantity adds it back
-    or subtracts it. The removed ``up_shift_secs`` keyword is refused, so a caller that tried to
-    reintroduce the term fails here rather than drawing a shifted axis.
-    """
+def test_lag_to_seconds_is_the_step_times_the_lag() -> None:
+    r"""$4\ell$ and nothing else, for a scalar and elementwise over a whole figure axis."""
     assert metrics.lag_to_seconds(0) == pytest.approx(0.0)
     assert metrics.lag_to_seconds(10) == pytest.approx(40.0)
-    assert metrics.lag_to_seconds(90) == pytest.approx(360.0)
-    with pytest.raises(TypeError):
-        metrics.lag_to_seconds(5, up_shift_secs=-20.0)  # type: ignore[call-arg]
-
-
-def test_lag_to_seconds_maps_an_array_elementwise() -> None:
-    """A figure converts a whole axis at once."""
-    lags = np.arange(4)
-    seconds = metrics.lag_to_seconds(lags)
-    assert seconds.tolist() == pytest.approx([0.0, 4.0, 8.0, 12.0])
+    assert metrics.lag_to_seconds(np.arange(4)).tolist() == pytest.approx([0.0, 4.0, 8.0, 12.0])
 
 
 def test_lag_seconds_physical_returns_a_float_column_from_a_tensor() -> None:

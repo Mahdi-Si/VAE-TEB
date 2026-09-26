@@ -384,9 +384,8 @@ eval_config:
   #
   # `null` -- the shipped setting -- keeps `figures.DEFAULT_FIGURE_FORMAT`, which is `pdf`. That
   # default is load-bearing: the committed `figure_manifest.json` and `FIGURE_GUIDE.md` record
-  # `.pdf` filenames and the slow smoke suite compares them against a real run, so a run that
-  # changes this writes filenames those files do not list. Change it for a one-off export, not as
-  # the committed setting, unless you also reseed the manifest.
+  # `.pdf` filenames, so a run that changes this writes filenames those files do not list. Change
+  # it for a one-off export, not as the committed setting, unless you also update the manifest.
   #
   # `svg` is the one to reach for when a figure is going into a vector editor or a web page;
   # `png` when something needs a bitmap. Note DPI only affects rasterised content, so the

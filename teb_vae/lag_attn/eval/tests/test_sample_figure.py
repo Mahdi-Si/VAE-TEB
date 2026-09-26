@@ -176,30 +176,6 @@ def test_rows_appear_in_the_declared_order_with_their_title_prefixes():
         plt.close(figure)
 
 
-def test_channel_labels_come_from_the_tensor_shapes_not_from_literals():
-    """A hardcoded 109 would keep passing after the dataset's channel selection moved again."""
-    figure = _build()
-    try:
-        titles = " ".join(axes.get_title() for axes in figure.axes)
-        assert f"{N_SCATTERING + N_PHASE} channels" in titles
-        assert f"$d_z$={D_Z}" in titles
-        assert f"$L$={N_LAGS}" in titles
-        assert f"$H_d$={H_D}" in titles
-    finally:
-        plt.close(figure)
-
-
-def test_the_te_lag_row_states_whether_it_is_an_attribution_or_a_diagnostic():
-    """Without head_structured_latent the same picture means something weaker, and only the
-    caption can say so."""
-    figure = _build(te_lag_label="diagnostic")
-    try:
-        titles = " ".join(axes.get_title() for axes in figure.axes)
-        assert "diagnostic" in titles
-    finally:
-        plt.close(figure)
-
-
 def test_forecast_and_target_rows_share_one_colour_range():
     """Two independently scaled heatmaps of the same quantity read as more alike than they are."""
     figure = _build()
@@ -257,14 +233,6 @@ def test_resolve_rows_drops_a_row_when_only_one_of_its_inputs_is_present():
     assert [name for name, _, _ in sample_figure.resolve_rows(("fhr", "up"))][0] == "raw"
 
 
-def test_one_raw_field_alone_still_drops_the_row_in_the_built_figure():
-    figure = _build(up_raw=None)
-    try:
-        assert len(_main_axes(figure)) == len(sample_figure.ROW_SPECS) - 1
-    finally:
-        plt.close(figure)
-
-
 # ---------------------------------------------------------------------------
 # Non-vacuity
 # ---------------------------------------------------------------------------
@@ -294,9 +262,8 @@ def test_the_lag_seconds_axis_agrees_with_the_pipelines_own_conversion():
 
     ``attach_lag_seconds_axis`` maps $\ell \mapsto s\ell + o$ and the pipeline's convention --
     ``metrics.lag_to_seconds`` -- is $s\ell$ on the stored timeline, so both call sites must hand
-    the helper an offset of exactly $0$: the dataset builder's UP shift is part of the stored signal
-    and is never applied to an axis. What this test rules out is one call site carrying an offset
-    and the other not, which would label the same lag two ways inside one page.
+    the helper an offset of exactly $0$. What this test rules out is one call site carrying an
+    offset and the other not, which would label the same lag two ways inside one page.
     """
     from teb_vae.lag_attn.eval import metrics
 

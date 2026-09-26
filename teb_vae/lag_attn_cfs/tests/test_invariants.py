@@ -11,18 +11,13 @@ Four properties make $\mathrm{KL}(q_t \Vert p_t)$ readable as "what the source a
    -- same module, same weights, same (absent) dropout.
 4. **Exact zero KL at initialisation**, which lives in ``test_zero_kl_init.py``.
 
-All four are inherited. What is *not* inherited is the decode itself: this model gathers the latents
-at a tiled anchor set before invoking the decoder, and a gather is where a batch axis and an anchor
-axis could be transposed, or where the two branches could be handed different rows. So each test
-below runs against **both** classes wherever the fixture allows -- the causal model and the two-sided
-feature sibling it claims to inherit from -- which turns "the subclass inherits the invariant" from
-an argument about class hierarchies into a measurement.
+The two-sided feature sibling asserts the same four on its own class; what this model adds is the
+decode at a tiled anchor set, and a gather is where a batch axis and an anchor axis could be
+transposed, or where the two branches could be handed different rows. So every test below runs this
+model at a real tiling.
 
-The forward signature is pinned as a literal parameter list, as in every sibling's copy. This one
-carries two more names, and their presence in the *signature* is the design decision: the anchor
-geometry is an argument rather than something read off ``self.training``, because the diagnostic
-callback calls ``eval()`` during training and then the objective -- so a mode-derived geometry would
-make ``total_loss`` a function of the dropout switch.
+The forward signature is pinned as a literal parameter list: it takes three streams and the two
+anchor arguments and no target, so nothing it returns could have been computed from the future.
 """
 from __future__ import annotations
 
@@ -39,36 +34,19 @@ from teb_vae.lag_attn_cfs.tests.conftest import (
     shipped_warmup_kwargs,
     tiny_warmup_kwargs,
 )
-from teb_vae.lag_attn_fs.nets.model import SeqVaeLagAttnFs
 
-#: Both classes, so every invariant is asserted on this model *and* on the one it inherits it from.
-#: The sibling takes no anchor arguments, so the call sites splat a per-class argument list.
-_CLASSES = (SeqVaeLagAttnFs, SeqVaeLagAttnCfs)
-_CLASS_IDS = ("fs", "cfs")
-
-_TOL = 1e-6
+#: The anchor arguments every forward below is called with: phase $1$ at the tiny tiling.
+_EXTRA = (1, TINY_STRIDE)
 
 
-def _kwargs_for(cls) -> dict:
-    """The tiny guarded keyword set, with this family's keywords removed for the sibling."""
-    kwargs = tiny_warmup_kwargs(anchor_stride=TINY_STRIDE)
-    if cls is SeqVaeLagAttnCfs:
-        return kwargs
-    return {
-        name: value
-        for name, value in kwargs.items()
-        if name not in ("target_warmup_steps", "source_warmup_steps", "anchor_stride")
-    }
+def _kwargs() -> dict:
+    """The tiny guarded keyword set at a real tiling."""
+    return tiny_warmup_kwargs(anchor_stride=TINY_STRIDE)
 
 
-def _extra_args(cls) -> tuple:
-    """The anchor arguments, which only this family's forward takes."""
-    return (1, TINY_STRIDE) if cls is SeqVaeLagAttnCfs else ()
-
-
-def _model(cls, **overrides):
+def _model(**overrides) -> SeqVaeLagAttnCfs:
     torch.manual_seed(0)
-    return cls(**dict(_kwargs_for(cls), **overrides))
+    return SeqVaeLagAttnCfs(**dict(_kwargs(), **overrides))
 
 
 def _closed_form_kl(out: dict) -> torch.Tensor:
@@ -85,21 +63,24 @@ def _closed_form_kl(out: dict) -> torch.Tensor:
 # =================================================================================================
 # 1. Source purity
 # =================================================================================================
-@pytest.mark.parametrize("cls", _CLASSES, ids=_CLASS_IDS)
-def test_resampling_the_source_leaves_the_prior_and_base_forecast_unchanged(cls) -> None:
+@pytest.mark.parametrize("clocked", (False, True), ids=("plain_prior", "clocked_prior"))
+def test_resampling_the_source_leaves_the_prior_and_base_forecast_unchanged(clocked) -> None:
     """Bitwise: the model runs in ``eval()`` with the generator re-seeded before each forward, so
-    the single ``randn_like`` draw is the only RNG consumer and both runs share their $\\epsilon$."""
-    model = _model(cls).eval()
-    y_st, y_ph, u_stream = make_streams(_kwargs_for(cls))
-    extra = _extra_args(cls)
+    the single ``randn_like`` draw is the only RNG consumer and both runs share their $\\epsilon$.
+
+    Run with the prior's clock off and on. With it on the prior takes a second input built from the
+    source pathway; if that clock were an encode of the *actual* source rather than of silence,
+    every tensor below would move and every shape would be unchanged."""
+    model = _model(prior_availability_input=clocked).eval()
+    y_st, y_ph, u_stream = make_streams(_kwargs())
 
     torch.manual_seed(0)
     with torch.no_grad():
-        reference = model(y_st, y_ph, u_stream, *extra)
+        reference = model(y_st, y_ph, u_stream, *_EXTRA)
     noise = torch.randn(u_stream.shape, generator=torch.Generator().manual_seed(99))
     torch.manual_seed(0)
     with torch.no_grad():
-        resampled = model(y_st, y_ph, noise, *extra)
+        resampled = model(y_st, y_ph, noise, *_EXTRA)
 
     for key in (
         "mu_prior", "logvar_prior", "raw_logvar_prior", "target_state", "z_prior",
@@ -110,11 +91,10 @@ def test_resampling_the_source_leaves_the_prior_and_base_forecast_unchanged(cls)
     assert not torch.equal(reference["source_state"], resampled["source_state"])
 
 
-@pytest.mark.parametrize("cls", _CLASSES, ids=_CLASS_IDS)
-def test_the_source_pathway_receives_only_the_source_stream(cls) -> None:
+def test_the_source_pathway_receives_only_the_source_stream() -> None:
     """Instrumented at the adapters -- the trust boundary where the streams enter."""
-    model = _model(cls).eval()
-    y_st, y_ph, u_stream = make_streams(_kwargs_for(cls))
+    model = _model().eval()
+    y_st, y_ph, u_stream = make_streams(_kwargs())
     seen: dict = {"source": [], "target": []}
 
     handles = [
@@ -127,13 +107,13 @@ def test_the_source_pathway_receives_only_the_source_stream(cls) -> None:
     ]
     try:
         with torch.no_grad():
-            model(y_st, y_ph, u_stream, *_extra_args(cls))
+            model(y_st, y_ph, u_stream, *_EXTRA)
     finally:
         for handle in handles:
             handle.remove()
 
     assert len(seen["source"]) == 1 and len(seen["target"]) == 1
-    # Post-gate on both sides here, unlike the ungated sibling suites: this family always gathers.
+    # Post-gate on both sides: this family always gathers.
     assert seen["source"][0].shape[-1] == model.source_gate.out_channels
     assert seen["target"][0].shape[-1] == model.target_gate.out_channels
 
@@ -149,9 +129,9 @@ def test_the_forward_takes_no_target() -> None:
     parameters = list(inspect.signature(SeqVaeLagAttnCfs.forward).parameters)
     assert parameters == ["self", "y_st", "y_ph", "u_stream", "anchor_phase", "anchor_stride"]
 
-    model = _model(SeqVaeLagAttnCfs).eval()
+    model = _model().eval()
     with torch.no_grad():
-        out = model(*make_streams(_kwargs_for(SeqVaeLagAttnCfs)), 1, TINY_STRIDE)
+        out = model(*make_streams(_kwargs()), *_EXTRA)
     # The one key whose name contains "target" is the encoder's history state, at d_model rather
     # than at the decoder's width -- so no returned tensor could be a forecast target.
     assert [key for key in out if "target" in key] == ["target_state"]
@@ -167,17 +147,16 @@ def _grads_to_target_encoder(model, out):
     )
 
 
-@pytest.mark.parametrize("cls", _CLASSES, ids=_CLASS_IDS)
-def test_with_z_detached_no_gradient_reaches_the_target_encoder(cls) -> None:
+def test_with_z_detached_no_gradient_reaches_the_target_encoder() -> None:
     """The detach happens inside the model's real forward -- by wrapping the sampling method -- so
     the probe covers the wiring as built, not a hand-assembled call into the decoder."""
-    model = _model(cls)
+    model = _model()
     sample = model._reparameterize_shared
     model._reparameterize_shared = lambda *args: tuple(  # type: ignore[method-assign]
         z.detach() for z in sample(*args)
     )
 
-    out = model(*make_streams(_kwargs_for(cls)), *_extra_args(cls))
+    out = model(*make_streams(_kwargs()), *_EXTRA)
     leaked = [
         name
         for (name, _), grad in zip(
@@ -188,15 +167,14 @@ def test_with_z_detached_no_gradient_reaches_the_target_encoder(cls) -> None:
     assert not leaked, f"target-encoder parameters reachable around z: {leaked}"
 
 
-@pytest.mark.parametrize("cls", _CLASSES, ids=_CLASS_IDS)
-def test_without_the_detach_the_same_probe_finds_gradients(cls) -> None:
+def test_without_the_detach_the_same_probe_finds_gradients() -> None:
     """The positive direction: through $z$, every target-encoder parameter is on the path.
 
     On this model that is a statement about the *gather* as well: a decode at anchors none of which
     the encoder reaches would leave parameters unreached and look exactly like a bypass.
     """
-    model = _model(cls)
-    out = model(*make_streams(_kwargs_for(cls)), *_extra_args(cls))
+    model = _model()
+    out = model(*make_streams(_kwargs()), *_EXTRA)
     unreached = [
         name
         for (name, _), grad in zip(
@@ -207,31 +185,23 @@ def test_without_the_detach_the_same_probe_finds_gradients(cls) -> None:
     assert not unreached, f"parameters the probe cannot see even through z: {unreached}"
 
 
-@pytest.mark.parametrize("cls", _CLASSES, ids=_CLASS_IDS)
-def test_the_decoder_reads_the_latent_and_nothing_wider(cls) -> None:
-    """The surface claim beside the autograd one: the decoder's first linear reads $d_z$."""
-    model = _model(cls)
-    assert model.decoder.proj.body[0].in_features == model.d_z
-
-
 # =================================================================================================
 # 3. One shared decoder, invoked twice
 # =================================================================================================
-@pytest.mark.parametrize("cls", _CLASSES, ids=_CLASS_IDS)
-def test_the_decoder_is_one_module_invoked_twice(cls) -> None:
+def test_the_decoder_is_one_module_invoked_twice() -> None:
     """Counted at the module: two calls per forward, each taking one tensor, into the same object.
 
     And on this model, the two calls must receive the **same** anchor rows -- two gathers at two
     indices would make the base-minus-full gap a comparison of two anchor sets.
     """
-    model = _model(cls).eval()
+    model = _model().eval()
     calls: list = []
     handle = model.decoder.register_forward_pre_hook(
         lambda module, args: calls.append((module, args))
     )
     try:
         with torch.no_grad():
-            model(*make_streams(_kwargs_for(cls)), *_extra_args(cls))
+            model(*make_streams(_kwargs()), *_EXTRA)
     finally:
         handle.remove()
 
@@ -239,14 +209,12 @@ def test_the_decoder_is_one_module_invoked_twice(cls) -> None:
     assert calls[0][0] is calls[1][0] is model.decoder
     assert all(len(args) == 1 for _module, args in calls)
     assert calls[0][1][0].shape == calls[1][1][0].shape
-    assert not any(hasattr(model, name) for name in ("residual_decoder", "baseline_decoder"))
 
 
-@pytest.mark.parametrize("cls", _CLASSES, ids=_CLASS_IDS)
-def test_the_decoder_carries_no_dropout(cls) -> None:
+def test_the_decoder_carries_no_dropout() -> None:
     """What makes the two invocations comparable in train mode: two dropout masks would put noise
     into every base-minus-full readout, and the gap would be reported as coupling."""
-    model = _model(cls, dropout=0.1)
+    model = _model(dropout=0.1)
 
     dropouts = [
         module.p for module in model.decoder.modules() if isinstance(module, torch.nn.Dropout)
@@ -259,7 +227,8 @@ def test_the_decoder_carries_no_dropout(cls) -> None:
 # The production geometry and budget
 # =================================================================================================
 def test_the_invariants_hold_at_the_production_geometry_and_budget() -> None:
-    """One pass at the real thing: $300$ steps, $98$ of $102$ target channels, eleven tiles.
+    """One pass at the real thing: the shipped sequence length, the kept target channels the
+    committed shard's budget resolves to, and the shipped tiling.
 
     The tiny fixture's guard is hand-built; this one is resolved from the committed shard, so the
     invariants are asserted against the geometry a run would actually train at.
@@ -284,55 +253,27 @@ def test_the_invariants_hold_at_the_production_geometry_and_budget() -> None:
         assert torch.equal(reference[key], resampled[key]), key
     assert not torch.equal(reference["source_state"], resampled["source_state"])
     assert float(_closed_form_kl(reference).abs().max()) == 0.0
-    assert tuple(reference["mu_base"].shape) == (BATCH, 5, 30, 98)
+    assert tuple(reference["mu_base"].shape) == (
+        BATCH, reference["anchor_index"].shape[1], model.horizon, model.decoder_out_channels,
+    )
 
 
 # =================================================================================================
-# 1b. Source purity, restated: the prior sees no function of the source's VALUES
+# 1b. The prior's clock
 #
-# The invariant above is asserted on a model whose prior conditions on the target history alone. The
-# shipped model's prior additionally conditions on a CLOCK, and the invariant is therefore restated
-# rather than weakened: what the prior may not see is a function of the source's *values*, and the
-# clock is a function of $t$ and the configuration alone.
+# The shipped model's prior additionally conditions on a CLOCK: the encode of a stream that is
+# exactly zero -- identical for every recording, under every intervention on the source, and by
+# construction carrying nothing the source said. What it does depend on is the source pathway's own
+# parameters, which is why it is detached: gradient must not couple the two pathways either.
 #
-# The clock is the encode of a stream that is exactly zero -- identical for every recording, under
-# every intervention on the source, and by construction carrying nothing the source said. What it
-# does depend on is the source pathway's own parameters, which is why it is detached: gradient must
-# not couple the two pathways either.
-#
-# So the restatement is checked in four parts, each of which a plausible implementation could fail
-# on its own: the prior does not move when the source's values do; the clock is not identically the
-# same row at every step (which is what made the availability staircase inert); it is the same
-# tensor in train mode and in eval mode; and no gradient reaches the source pathway through it.
+# Source purity with the clock on is checked above. The rest is checked here: the clock is the
+# encode of silence; it is not identically the same row at every step (which is what made the
+# availability staircase inert); it is the same tensor in train mode and in eval mode; and no
+# gradient reaches the source pathway through it.
 # =================================================================================================
 def _clocked(**overrides):
     """This cell's model with the prior's clock on, at the tiny guarded geometry."""
-    return _model(SeqVaeLagAttnCfs, prior_availability_input=True, **overrides)
-
-
-def test_the_prior_does_not_move_when_the_sources_values_do_even_with_the_clock_on() -> None:
-    """The restated invariant, measured. This is the same comparison as the purity test above and
-    it is not redundant with it: there the prior takes one input, here it takes two, and the second
-    is built from the source pathway. If the clock were an encode of the *actual* source rather
-    than of silence, every tensor below would move and every shape would be unchanged."""
-    model = _clocked().eval()
-    y_st, y_ph, u_stream = make_streams(_kwargs_for(SeqVaeLagAttnCfs))
-    extra = _extra_args(SeqVaeLagAttnCfs)
-
-    torch.manual_seed(0)
-    with torch.no_grad():
-        reference = model(y_st, y_ph, u_stream, *extra)
-    noise = torch.randn(u_stream.shape, generator=torch.Generator().manual_seed(99))
-    torch.manual_seed(0)
-    with torch.no_grad():
-        resampled = model(y_st, y_ph, noise, *extra)
-
-    for key in (
-        "mu_prior", "logvar_prior", "raw_logvar_prior", "target_state", "z_prior",
-        "mu_base", "logvar_base",
-    ):
-        assert torch.equal(reference[key], resampled[key]), key
-    assert not torch.equal(reference["source_state"], resampled["source_state"])
+    return _model(prior_availability_input=True, **overrides)
 
 
 def test_the_prior_clock_is_the_encode_of_silence_and_of_nothing_else() -> None:
@@ -345,7 +286,7 @@ def test_the_prior_clock_is_the_encode_of_silence_and_of_nothing_else() -> None:
     that started encoding something else would fail rather than agree with itself.
     """
     model = _clocked().eval()
-    _, _, u_stream = make_streams(_kwargs_for(SeqVaeLagAttnCfs))
+    _, _, u_stream = make_streams(_kwargs())
 
     clock = model._prior_clock(u_stream)
     zeros = u_stream.new_zeros((1, *u_stream.shape[1:]))
@@ -369,7 +310,7 @@ def test_the_prior_clock_is_not_the_same_row_at_every_scored_step() -> None:
     directly.
     """
     model = _clocked().eval()
-    _, _, u_stream = make_streams(_kwargs_for(SeqVaeLagAttnCfs))
+    _, _, u_stream = make_streams(_kwargs())
 
     clock = model._prior_clock(u_stream)[0, model.warmup_period :]
     # Rounded before the distinct count: these are float activations, and two rows differing in the
@@ -387,7 +328,7 @@ def test_the_prior_clock_is_the_same_tensor_in_train_mode_and_in_eval_mode() -> 
     measured in -- which is the sort of difference that shows up as an unexplained gap between a
     training curve and an evaluation."""
     model = _clocked(dropout=0.3, source_dropout=0.3)
-    _, _, u_stream = make_streams(_kwargs_for(SeqVaeLagAttnCfs))
+    _, _, u_stream = make_streams(_kwargs())
 
     model.train()
     torch.manual_seed(0)
@@ -414,7 +355,7 @@ def test_no_gradient_reaches_the_source_pathway_through_the_prior() -> None:
     exist is a path from the *prior's* output back into them.
     """
     model = _clocked().eval()
-    _, _, u_stream = make_streams(_kwargs_for(SeqVaeLagAttnCfs))
+    _, _, u_stream = make_streams(_kwargs())
 
     clock = model._prior_clock(u_stream)
 

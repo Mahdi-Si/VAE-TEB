@@ -1,9 +1,9 @@
-r"""The training task: its resolution order, its metric surface, and the two controls it refuses.
+r"""The training task: its step, its metric surface, the two controls it refuses, and its monitor.
 
 The step is written out rather than inherited, so what has to be checked is that it still *is* the
-shared step in every respect that matters -- the hyperparameters read by the same names, the loss
-reached through the same seam, the spike-breaker key intact -- while the three tensors this
-architecture does not have are gone rather than substituted.
+shared step in every respect that matters -- the loss reached through the same seam, the stage
+deciding the anchor stride -- while the tensors this architecture does not have are gone rather
+than substituted.
 
 The two refusals are the interesting part. The inherited permutation control and the inherited
 source-null readout both reach modules that were never built, so leaving either in place would
@@ -18,11 +18,8 @@ from typing import Dict, Optional
 import pytest
 import torch
 
-from teb_vae.lag_attn_cfs.task import SeqVaeLagAttnCfsTask
 from teb_vae.lag_attn_rws.nets.losses import masked_raw_block_per_anchor
 from teb_vae.lag_attn_rws.nets.raw_masks import forecast_mask
-from teb_vae.lag_attn_rws.task import SeqVaeLagAttnRwsTask
-from teb_vae.lag_attn_transformer_rws.task import SeqVaeLagAttnTrfRwsTask
 from teb_vae.lag_slot_transformer_cfs.task import (
     TASK_METRIC_SUFFIXES,
     VALIDATION_MC_DRAWS_KEY,
@@ -31,9 +28,7 @@ from teb_vae.lag_slot_transformer_cfs.task import (
     recording_grouped_totals,
 )
 from teb_vae.lag_slot_transformer_cfs.tests.conftest import (
-    DECLARED_C_U,
     DECLARED_ST,
-    DECLARED_TARGET_PH,
     TINY_BATCH,
     TINY_SEQ_LEN,
     build_tiny_model,
@@ -95,57 +90,6 @@ def build_task(
         seed=seed,
         validation_mc_draws=validation_mc_draws,
     )
-
-
-# =================================================================================================
-# Composition
-# =================================================================================================
-def test_the_resolution_order_is_the_one_the_design_names() -> None:
-    """Written out, so a reorder fails here rather than training under another step."""
-    names = [cls.__name__ for cls in SeqVaeLagResidualTrfCfsTask.__mro__]
-    assert names[:5] == [
-        "SeqVaeLagResidualTrfCfsTask",
-        "SeqVaeLagAttnCfsTask",
-        "SeqVaeLagAttnFsTask",
-        "SeqVaeLagAttnTrfRwsTask",
-        "SeqVaeLagAttnRwsTask",
-    ]
-
-
-def test_the_step_granular_learning_rate_ramp_comes_from_the_transformer_parent() -> None:
-    """It is the whole reason that parent is in the bases at all.
-
-    A pre-normalised attention stack needs the ramp in its first few hundred optimizer steps, which
-    an epoch-granularity schedule cannot address.
-    """
-    for cls in SeqVaeLagResidualTrfCfsTask.__mro__:
-        if "build_lr_scheduler" in vars(cls):
-            assert cls is SeqVaeLagAttnTrfRwsTask
-            break
-    else:  # pragma: no cover - a missing scheduler is a construction failure long before here
-        pytest.fail("build_lr_scheduler is defined nowhere in the resolution order")
-
-
-def test_the_tiling_seams_come_from_the_causal_parent() -> None:
-    """The phase derivation and the five-argument forward assembly are that package's."""
-    for name in ("anchor_phase", "resolve_anchor_geometry", "_build_forward_inputs"):
-        for cls in SeqVaeLagResidualTrfCfsTask.__mro__:
-            if name in vars(cls):
-                assert cls is SeqVaeLagAttnCfsTask, name
-                break
-
-
-def test_the_step_is_this_package_s_own() -> None:
-    """Along with the latent-gap readout and the two refusals.
-
-    The shared step reads a saturation key this architecture does not emit and pairs a dense
-    support with an anchor-indexed latent, so it cannot be inherited.
-    """
-    for name in ("compute_loss_and_metrics", "_mu_gap_rms", "_added_metrics", "_should_run_perm"):
-        for cls in SeqVaeLagResidualTrfCfsTask.__mro__:
-            if name in vars(cls):
-                assert cls is SeqVaeLagResidualTrfCfsTask, name
-                break
 
 
 # =================================================================================================

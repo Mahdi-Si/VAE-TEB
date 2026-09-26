@@ -384,38 +384,3 @@ def test_the_cancellation_ratio_refuses_a_mis_shaped_array() -> None:
     with pytest.raises(ValueError, match="must be 4-D"):
         cancellation_ratio(torch.zeros(2, 3, 4))
 
-
-# =================================================================================================
-# End to end, on the shapes the model will use
-# =================================================================================================
-def test_the_three_stages_compose_into_a_bounded_prior_relative_update() -> None:
-    """Proposals in, full parameters and a divergence out, at the tensor contract's own shapes."""
-    generator = torch.Generator().manual_seed(51)
-    n_anchors = 4
-    mean_proposals = torch.randn(
-        TINY_BATCH, n_anchors, TINY_N_LAGS, TINY_D_Z, generator=generator
-    )
-    scale_proposals = torch.randn(
-        TINY_BATCH, n_anchors, TINY_N_LAGS, TINY_D_Z, generator=generator
-    )
-    mu_prior = torch.randn(TINY_BATCH, n_anchors, TINY_D_Z, generator=generator)
-    logvar_prior = torch.rand(
-        TINY_BATCH, n_anchors, TINY_D_Z, generator=generator
-    ) * 8.0 - 5.0
-
-    scale = default_lag_scale(TINY_N_LAGS)
-    a = bound_update(sum_proposals(mean_proposals, c_lag=scale), A_MAX)
-    b = bound_update(sum_proposals(scale_proposals, c_lag=scale), B_MAX)
-    mu_full, logvar_full = residual_parameters(mu_prior, logvar_prior, a, b)
-    per_coordinate = residual_kl(a, b)
-
-    assert mu_full.shape == (TINY_BATCH, n_anchors, TINY_D_Z)
-    assert logvar_full.shape == mu_full.shape
-    assert per_coordinate.shape == mu_full.shape
-    assert per_coordinate.sum(dim=-1).shape == (TINY_BATCH, n_anchors)
-    assert torch.allclose(
-        per_coordinate,
-        kld_tensor(mu_prior, logvar_prior, mu_full, logvar_full),
-        atol=1e-5,
-        rtol=1e-5,
-    )

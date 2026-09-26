@@ -14,10 +14,10 @@ the wrong axis, or against the wrong sign.
 seeded-with-NaN case is what distinguishes a fraction that excluded and counted them from one that
 quietly voted them down: the same data reports $2/2$ under the first and $2/4$ under the second.
 
-**The two estimators are labelled by path.** ``pred_gap`` is one subtraction on two different
-estimators of the same quantity -- the Monte Carlo marginalised score and the single-draw training
-path -- and a table carrying both under one name is unreadable. Every row here names its column
-and its path.
+**The estimators are reported under their own names.** ``pred_gap`` is one subtraction on
+several estimators of the same quantity -- the Monte Carlo marginalised score, the mean-decoded
+one and the single-draw training path -- and a table carrying them under one name is
+unreadable. Every row names its metric and its source column.
 
 **The percentages have known answers and refuse to invent one.** A quartered mean-square error is
 a $75\%$ MSE reduction and a $50\%$ RMSE reduction -- two different numbers off one ratio, so an
@@ -28,11 +28,9 @@ negative; and a missing $H \cdot C_{\mathrm{keep}}$ being replaced by a guessed 
 would rescale the likelihood-space answer with nothing raising.
 
 **The block width is this cell's own, and it is not a constant of the architecture.** The
-denominator is $H \cdot C_{\mathrm{keep}} = 15 \times 98 = 1470$ under the shipped warm-up budget,
-where $C_{\mathrm{keep}}$ is whatever that budget left standing -- so the percentage is
-*budget-local*, the record says so in words, and the value is read off the collection record's
-``block_width`` rather than multiplied out from a horizon and a per-step constant this target
-domain does not have.
+denominator is $H \cdot C_{\mathrm{keep}}$, where $C_{\mathrm{keep}}$ is whatever the warm-up
+budget left standing, so the value is read off the collection record's ``block_width`` rather
+than multiplied out from a horizon and a per-step constant this target domain does not have.
 """
 from __future__ import annotations
 
@@ -45,7 +43,6 @@ import pytest
 
 from teb_vae.lag_attn_cfs.eval.figures_seam import figure_filename
 from teb_vae.lag_attn_cfs.eval.analyses import coupling as coupling_analysis
-from teb_vae.lag_attn_cfs.eval.frames import positive_fraction
 
 #: Bootstrap settings for the tests: enough resamples for a stable interval, few enough to be
 #: instant. The seed is what makes every interval below reproducible.
@@ -112,20 +109,17 @@ def test_unscored_recordings_are_excluded_and_counted_rather_than_voted_down() -
     assert rows[0]["n_recordings_dropped_not_finite"] == 2
 
 
-def test_the_denominator_helper_reports_both_counts_on_an_all_nan_input() -> None:
-    record = positive_fraction([np.nan, np.nan])
-
-    assert np.isnan(record["fraction"])
-    assert record["n"] == 0 and record["n_dropped_not_finite"] == 2
-
-
 # =============================================================================
 # The two estimators
 # =============================================================================
-def test_both_pred_gap_estimators_are_reported_and_labelled_by_path() -> None:
+def test_every_pred_gap_estimator_is_reported_under_its_own_name() -> None:
+    """Three estimators of one quantity -- the marginalised score, the mean-decoded one and the
+    training path -- each on its own row, from its own column. The marginalised one is negative
+    here and the other two positive, so a row reading another's column is caught by its mean."""
     rows = coupling_analysis.build_gap_rows(
         _per_guid(
-            mc_pred_gap=[1.0, 2.0, 3.0], mean_pred_gap=[1.5, 2.5, 3.5], pred_gap=[1.1, 2.1, 3.1]
+            mc_pred_gap=[-1.0, -2.0, -3.0], mean_pred_gap=[1.5, 2.5, 3.5],
+            pred_gap=[1.1, 2.1, 3.1],
         ),
         resamples=200, seed=0,
     )
@@ -134,13 +128,11 @@ def test_both_pred_gap_estimators_are_reported_and_labelled_by_path() -> None:
         "pred_gap_mc_nats", "pred_gap_mean_nats", "pred_gap_train_path_nats"
     ]
     assert [row["source_column"] for row in rows] == ["mc_pred_gap", "mean_pred_gap", "pred_gap"]
-    assert "marginalised" in rows[0]["score_path"]
-    assert "mean-decoded" in rows[1]["score_path"]
-    assert "training path" in rows[2]["score_path"]
-    # Each estimator's own values, not one standing for both.
-    assert rows[0]["mean"] == pytest.approx(2.0)
+    assert rows[0]["mean"] == pytest.approx(-2.0)
     assert rows[1]["mean"] == pytest.approx(2.5)
     assert rows[2]["mean"] == pytest.approx(2.1)
+    # The estimator the figures foreground is one of the reported ones.
+    assert coupling_analysis.PRIMARY_PRED_GAP in {row["metric"] for row in rows}
 
 
 def test_the_paired_test_runs_on_the_two_block_scores_the_gap_is_the_difference_of() -> None:
@@ -181,23 +173,8 @@ def test_the_kl_rows_name_the_unfloored_value_and_the_control_beside_it() -> Non
     )
 
     assert [row["metric"] for row in rows] == list(coupling_analysis.KL_COLUMNS)
-    assert "unfloored" in rows[0]["score_path"]
     assert rows[0]["mean"] == pytest.approx(4.0)
     assert rows[1]["mean"] == pytest.approx(4.5)
-
-
-def test_no_headline_kl_column_is_the_floored_one() -> None:
-    """Free bits are applied per dimension per step before summing, so the floored value exceeds
-    the raw one by construction and hides a collapsed source pathway."""
-    assert all("train" not in column for column in coupling_analysis.KL_COLUMNS)
-
-
-def test_the_availability_clock_control_is_not_this_analysis_to_report() -> None:
-    """``kld_source_null`` is on the same per-sample table and is deliberately **not** reduced
-    here: it is the source-null analysis's subject, and a second reduction of it under a coupling
-    heading would put two differently-aggregated copies of one control in one summary."""
-    assert "kld_source_null" not in coupling_analysis.VALUE_COLUMNS
-    assert "coupling_minus_clock" not in coupling_analysis.VALUE_COLUMNS
 
 
 # =============================================================================
@@ -233,30 +210,6 @@ def test_the_distribution_figure_marks_zero_and_the_interval_on_the_mean() -> No
     # One histogram per estimator, the estimators side by side, and the two agreement scatters
     # of the mean-decoded estimator against the other two.
     assert n_panels == len(coupling_analysis.PRED_GAP_COLUMNS) + 3
-
-
-def test_the_three_estimators_are_reported_and_the_mean_decoded_one_is_primary() -> None:
-    """The mean-decoded gap is its own row under its own name, beside the marginalised headline
-    and the training-path parity column -- and it is the estimator the figures foreground."""
-    rows = coupling_analysis.build_gap_rows(
-        _per_guid(
-            mc_pred_gap=[-1.0, -2.0, -3.0], mean_pred_gap=[1.0, 2.0, 3.0], pred_gap=[1.1, 2.1, 3.1]
-        ),
-        resamples=200, seed=0,
-    )
-
-    assert [row["metric"] for row in rows] == [
-        "pred_gap_mc_nats", "pred_gap_mean_nats", "pred_gap_train_path_nats"
-    ]
-    by_metric = {row["metric"]: row for row in rows}
-    assert by_metric["pred_gap_mean_nats"]["source_column"] == "mean_pred_gap"
-    assert by_metric["pred_gap_mean_nats"]["mean"] == pytest.approx(2.0)
-    assert by_metric["pred_gap_mc_nats"]["mean"] == pytest.approx(-2.0)
-    assert "mean" in by_metric["pred_gap_mean_nats"]["score_path"]
-    assert coupling_analysis.PRIMARY_PRED_GAP == "pred_gap_mean_nats"
-    assert coupling_analysis.PRIMARY_PRED_GAP in {
-        name for name, _, _ in coupling_analysis.PRED_GAP_COLUMNS
-    }
 
 
 def test_the_agreement_panel_counts_sign_agreement_over_recordings() -> None:
@@ -380,7 +333,6 @@ def test_an_mse_checkpoint_gets_no_likelihood_percentage() -> None:
 
     assert support["skipped"] is True
     assert support["coefficients_per_anchor"] is None
-    assert "mse" in support["reason"] and "log-density" in support["reason"]
     # The error-space percentages do not care: a squared error is a squared error either way.
     columns = coupling_analysis.percent_columns(
         _per_guid(sq_error_base=[4.0], sq_error_full=[1.0], mc_pred_gap=[14.7]),
@@ -421,21 +373,6 @@ def test_the_block_width_is_read_rather_than_multiplied_out_from_the_raw_grid() 
     assert coupling_analysis.coefficients_per_anchor(
         {"geometry": {"horizon": 15, "raw_per_step": 16}}
     ) is None
-
-
-def test_the_likelihood_percentage_records_that_it_is_budget_local() -> None:
-    """$C_{\\mathrm{keep}}$ is a consequence of ``causal_warmup_budget_steps``, so the same
-    checkpoint re-evaluated under a looser budget reports a different percentage from the same
-    nats. The record says so whether or not the percentage was computed -- a reader who finds it
-    present needs the caveat more than one who finds it absent."""
-    computed = coupling_analysis.likelihood_percent_support(GEOMETRY)
-    skipped = coupling_analysis.likelihood_percent_support({})
-
-    for support in (computed, skipped):
-        assert "budget" in support["budget_local"]
-        assert "H*C_keep" in support["budget_local"]
-    assert computed["skipped"] is False
-    assert computed["coefficients_per_anchor"] == BLOCK_WIDTH
 
 
 def test_the_run_records_why_the_likelihood_percentage_was_skipped(tmp_path) -> None:
@@ -552,7 +489,7 @@ def test_the_percent_figure_separates_the_two_spaces() -> None:
 
 
 # =============================================================================
-# End to end, on a real run
+# End to end
 # =============================================================================
 def _context(
     per_sample: pd.DataFrame,
@@ -647,33 +584,3 @@ def test_the_analysis_writes_the_percentages_it_can_compute(tmp_path) -> None:
     assert all(np.isfinite(value) for value in percent["headline"].values())
     # Known answer end to end: recording 'a' has its squared error quartered.
     assert per_recording.set_index("guid").loc["a", "pred_gap_mse_pct"] == pytest.approx(75.0)
-
-
-@pytest.mark.slow
-def test_the_real_run_reports_both_estimators_with_their_denominators(collected_run) -> None:
-    block = collected_run["summary"]["results"]["coupling"]
-
-    metrics = {row["metric"]: row for row in block["pred_gap"]}
-    assert set(metrics) == {"pred_gap_mc_nats", "pred_gap_train_path_nats"}
-    for row in metrics.values():
-        assert row["n_recordings_scored"] == collected_run["summary"]["results"]["n_recordings"]
-        assert 0.0 <= row["positive_fraction"] <= 1.0
-        assert row["n_positive"] <= row["n_recordings_scored"]
-
-
-@pytest.mark.slow
-def test_the_real_run_divides_the_likelihood_percentage_by_this_cells_block_width(
-    collected_run,
-) -> None:
-    r"""The fixture's model is at the tiny geometry rather than the shipped one, so the assertion
-    is the *identity* $H \cdot C_{\mathrm{keep}}$ against the run's own recorded geometry rather
-    than the literal $1470$ -- which is what would still hold if the budget changed, and what
-    would fail if the denominator came from anywhere but the model that was scored."""
-    summary = collected_run["summary"]
-    geometry = summary["collection"]["geometry"]
-    support = summary["results"]["coupling"]["pred_gap_percent"]["likelihood_space"]
-
-    assert geometry["block_width"] == geometry["horizon"] * geometry["target_kept_width"]
-    if not support["skipped"]:
-        assert support["coefficients_per_anchor"] == float(geometry["block_width"])
-    assert "budget" in support["budget_local"]

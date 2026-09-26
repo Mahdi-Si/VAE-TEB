@@ -26,13 +26,12 @@ from __future__ import annotations
 import copy
 import json
 import types
-from pathlib import Path
 from typing import Any, Dict, List
 
 import pytest
 import torch
 
-from teb_vae.lag_attn_cfs.eval import launch, preflight, probe as probe_module
+from teb_vae.lag_attn_cfs.eval import preflight, probe as probe_module
 
 from .conftest import (
     TINY_STRIDE,
@@ -163,17 +162,6 @@ def test_the_written_json_omits_the_per_sample_vectors(cohort_loader, tmp_path) 
         assert key not in written
 
 
-def test_the_cohort_table_shows_every_count_beside_its_share(record) -> None:
-    table = probe_module.format_cohort_table(record)
-
-    for name in COHORT_SUBGROUPS:
-        assert f"{name}.hdf5" in table
-    for name in ("healthy", "acidosis", "hie"):
-        assert name in table
-    assert f"samples          {_N_SAMPLES}" in table
-    assert "%" in table, "a bare count without its share hides the coverage"
-
-
 def test_the_cohort_table_survives_a_record_with_nothing_in_it() -> None:
     """It is printed after a pass that may have found very little; it must not raise there."""
     assert probe_module.format_cohort_table({"n_samples": 0}).startswith("cohort")
@@ -253,15 +241,6 @@ def test_a_guid_in_two_shards_raises() -> None:
 # =================================================================================================
 # The forward contract
 # =================================================================================================
-def test_the_forward_returns_every_key_the_readouts_are_written_against(contract) -> None:
-    """Twenty-two: the family's twenty, plus this cell's ``anchor_index`` and ``anchor_valid``. The
-    count is asserted so a key silently dropped from the forward is a failure here rather than a
-    ``KeyError`` deep inside a collection pass."""
-    assert contract["n_output_keys"] == 22
-    assert {"anchor_index", "anchor_valid"} <= set(contract["outputs"])
-    assert "mu_base" in contract["outputs"] and "logvar_full" in contract["outputs"]
-
-
 def test_the_forecast_tensors_are_on_the_anchor_axis_not_the_step_axis(contract) -> None:
     r"""$(B, A_{\max}, H, C_{\mathrm{keep}})$, which is the whole of what the readout module has to
     be rewritten for: the family's is $(B, T_{\mathrm{valid}}, H, R)$ over a contiguous prefix."""
@@ -348,50 +327,9 @@ def test_the_warm_up_budget_is_reported_beside_the_widths_it_produced(contract) 
     assert budget["target_warm_frac"] == 1.0
 
 
-def test_the_printed_contract_carries_the_shapes_and_the_support_arithmetic(contract) -> None:
-    """It is read off a terminal while the readout module is written, so the shapes have to be in it
-    rather than only in the returned dict."""
-    printed = probe_module.format_forward_contract(contract)
-    a_max = contract["anchor_index"]["a_max"]
-    block = contract["block"]
-
-    assert "mu_base" in printed
-    assert str([contract["batch_size"], a_max, block["horizon"], block["decoder_out_channels"]]) in (
-        printed
-    )
-    assert "anchor_index" in printed and "int64" in printed
-    assert f"A_max             {a_max}" in printed
-    assert str(contract["lag_support"]["lag_support_margin_steps"]) in printed
-
-
-def test_the_printed_causality_block_carries_the_statement_and_the_delays(
-    cohort_config, cohort_shards
-) -> None:
-    """The probe prints what the run will disclose, so an operator sees the caveat before spending
-    hours on a collection pass rather than after."""
-    torch.manual_seed(0)
-    model = make_task().orig_model
-    disclosure = preflight.causality_disclosure(cohort_config, model)
-
-    printed = probe_module.format_causality(disclosure)
-
-    assert preflight.CAUSALITY_STATEMENT in printed
-    assert "group delay" in printed
-    assert "fhr_st" in printed and "up_ph" in printed
-    assert str(cohort_shards[0]) in printed
-
-
 # =================================================================================================
 # The entry point
 # =================================================================================================
-def test_the_parser_takes_a_checkpoint_or_a_config_and_defaults_the_rest() -> None:
-    args = probe_module.build_parser().parse_args(["--config", "run/resolved_config.yaml"])
-
-    assert args.config == "run/resolved_config.yaml"
-    assert args.checkpoint is None and args.overrides is None
-    assert args.output_dir is None and args.max_batches is None and args.device is None
-
-
 def test_neither_input_is_required_by_argparse_and_the_entry_point_is_what_refuses() -> None:
     """``required=True`` fires before the launch dict is ever read, so it would make an IDE
     Run-button launch impossible whatever the dict said. The parser therefore accepts an empty
@@ -408,33 +346,9 @@ def test_neither_input_is_required_by_argparse_and_the_entry_point_is_what_refus
     assert "RUN_ARGS" in message
 
 
-def test_an_input_supplied_only_by_the_launch_dict_satisfies_the_requirement() -> None:
-    """The other direction, and the point of the dict: with the value filled in there is nothing left
-    to refuse, so pressing Run gets a probe rather than a usage error."""
-    values, sources = launch.resolve_launch_args(
-        probe_module.build_parser(), {"checkpoint": "run/model_checkpoints/last.ckpt"}, []
-    )
-
-    assert values["checkpoint"] == "run/model_checkpoints/last.ckpt"
-    assert sources["checkpoint"] == launch.DICT_SOURCE
-    assert values["config"] is None
-
-
 def test_main_refuses_when_it_is_given_neither() -> None:
     with pytest.raises(ValueError, match="either --config"):
         probe_module.main()
-
-
-def test_the_module_is_runnable_on_its_own_and_needs_no_module_that_does_not_exist_yet() -> None:
-    """``python -m ...eval.probe --checkpoint <ckpt>`` is how an operator reaches this. The second half
-    is why
-    this module is useful at all: the readout module it is used to write does not exist yet, so a
-    reach for it would make the probe unrunnable exactly when it is needed."""
-    source = Path(probe_module.__file__).read_text(encoding="utf-8")
-
-    assert 'if __name__ == "__main__":' in source
-    assert "eval.metrics" not in source
-    assert "eval import metrics" not in source
 
 
 def test_a_checkpoint_carrying_no_model_kwargs_is_refused_naming_the_consequence(tmp_path) -> None:

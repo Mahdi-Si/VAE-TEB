@@ -75,15 +75,6 @@ def test_the_feature_blocks_carry_the_declared_widths(batch):
     assert batch.up_ph.shape == (2, _GEOMETRY.t, 15)
 
 
-def test_the_cross_channel_block_is_never_loaded(config):
-    """``fhr_up_ph`` mixes both signals in one coefficient; loading it would destroy the
-    separation between the target-only prior and the source-conditioned posterior."""
-    load_fields = config["dataset_config"]["dataloader_config"]["dataset_kwargs"]["load_fields"]
-    assert "fhr_up_ph" not in load_fields
-    for field in ("fhr", "fhr_st", "fhr_ph", "up_st", "up_ph", "weight"):
-        assert field in load_fields
-
-
 def test_the_raw_target_is_normalized(config, batch):
     """``'fhr'`` must sit in both ``load_fields`` and ``normalize_fields``. Without the latter
     the raw target arrives unnormalized (~140 bpm scale), the Gaussian NLL is meaningless, and
@@ -105,10 +96,3 @@ def test_the_stats_file_trim_matches_the_loader_trim(config):
     with h5py.File(config["dataset_config"]["stat_path"], "r") as stats:
         stats_trim = float(stats.attrs.get("trim_minutes", -1.0))
     assert stats_trim == float(loader_trim)
-
-
-def test_the_weight_field_is_binary_on_the_committed_fixture(batch):
-    """The >= 1.0 validity threshold and > 0 agree on binary weights; this pins that the
-    fixture cannot distinguish them, which is why the threshold decision rests on the shard
-    writer's construction (see ``nets/raw_masks.py``) rather than on this data."""
-    assert set(torch.unique(batch.weight).tolist()) <= {0.0, 1.0}

@@ -58,9 +58,8 @@ its target is a heart rate and a clinician thinks in heartbeats. This one foreca
 wavelet-modulus and phase-harmonic coefficients: there is no bpm for one of them, and inverting
 the loader's per-channel statistics would put the channels on scales spanning orders of magnitude
 -- which would destroy the pooled distribution this analysis is entirely about, since every panel
-here draws one metric pooled over all $C_{\mathrm{keep}}$. So every axis is labelled ``normalised``,
-:mod:`~teb_vae.lag_attn_cfs.eval.metrics` exports no conversion to reach for, and
-``tests/test_eval_units.py`` asserts the absence rather than the repointing.
+here draws one metric pooled over all $C_{\mathrm{keep}}$. So every axis is labelled ``normalised``
+and :mod:`~teb_vae.lag_attn_cfs.eval.metrics` exports no conversion to reach for.
 """
 from __future__ import annotations
 
@@ -93,9 +92,8 @@ PER_SEGMENT_FILENAME = "per_segment_metrics.csv"
 #: The figures, named as ``FIGURE_GUIDE.md`` names them.
 #:
 #: **The ``<stem>_by_clinical_class.pdf`` / ``<stem>_by_subgroup.pdf`` shape is reserved** for the
-#: runner's grouped-variant fan-out, and a figure named into it disappears: ``test_eval_smoke.py``
-#: normalises those two suffixes out of the manifest as a *family*, so such a file is never
-#: recorded, never documented, and reads to an operator as one of the violin figures it is not.
+#: runner's grouped-variant fan-out, and a figure named into it reads to an operator as one of the
+#: violin figures it is not (``tests/test_eval_distributions.py`` keeps these names out of it).
 #: These are named the other way round for that reason.
 CLASS_FIGURE = "class_histograms"
 SUBGROUP_FIGURE = "subgroup_histograms"

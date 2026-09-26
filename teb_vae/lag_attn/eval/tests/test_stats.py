@@ -1,10 +1,9 @@
 r"""Tests for the shared rank statistics at their Layer-0 home.
 
 These functions were extracted from ``cross_subgroup`` so a second analysis could reuse them
-without an analysis-to-analysis import. ``test_cross_subgroup`` still exercises them through the
-``cross_subgroup.*`` re-exports; this file pins them at their own module, so the extraction cannot
-silently rot if that re-export is ever removed. Every value is checked against a direct
-``scipy`` / definitional computation, never a recorded constant.
+without an analysis-to-analysis import, and this file is their one home: ``test_cross_subgroup``
+tests only the analysis that composes them. Every value is checked against a direct ``scipy`` /
+definitional computation, never a recorded constant.
 """
 from __future__ import annotations
 
@@ -38,6 +37,19 @@ def test_holm_on_an_empty_family_returns_it_unchanged() -> None:
     assert stats.holm_adjust([]) == []
 
 
+def test_holm_sits_between_the_raw_p_and_bonferroni_and_caps_at_one() -> None:
+    """Never looser than the raw $p$, and never above Bonferroni -- strictly below it somewhere,
+    which is the reason it is used: uniformly more powerful at the same family-wise error rate."""
+    raw = [0.001, 0.01, 0.02, 0.04]
+    holm = stats.holm_adjust(raw)
+    bonferroni = [min(len(raw) * value, 1.0) for value in raw]
+
+    assert all(adjusted >= value for adjusted, value in zip(holm, raw))
+    assert all(h <= b for h, b in zip(holm, bonferroni))
+    assert any(h < b for h, b in zip(holm, bonferroni)), "identical to Bonferroni here"
+    assert stats.holm_adjust([0.5, 0.6]) == pytest.approx([1.0, 1.0])
+
+
 # ---------------------------------------------------------------------------
 # Cliff's delta
 # ---------------------------------------------------------------------------
@@ -56,6 +68,16 @@ def test_cliffs_delta_matches_a_direct_pair_count() -> None:
 
 def test_cliffs_delta_is_undefined_for_an_empty_sample() -> None:
     assert np.isnan(stats.cliffs_delta(0.0, 0, 5))
+
+
+def test_cliffs_delta_is_one_for_disjoint_and_zero_for_identical_samples() -> None:
+    """Ties count as a half, which is what makes identical samples exactly zero rather than nearly."""
+    from scipy import stats as sp
+
+    base = np.arange(10.0)
+    for offset, expected in ((100.0, 1.0), (0.0, 0.0)):
+        statistic, _ = sp.mannwhitneyu(base + offset, base.copy(), alternative="two-sided")
+        assert stats.cliffs_delta(float(statistic), 10, 10) == pytest.approx(expected)
 
 
 @pytest.mark.parametrize(
@@ -97,7 +119,6 @@ def test_pairwise_compares_every_pair_with_a_signed_effect_size() -> None:
     # 'high' runs above 'low', so the left-vs-right delta is negative.
     assert item["cliffs_delta"] < -0.9
     assert item["magnitude"] == "large"
-    assert "left group's values run higher" in item["delta_orientation"]
 
 
 def test_the_callers_order_decides_the_pair_order_and_its_orientation() -> None:
@@ -162,7 +183,6 @@ def test_wilcoxon_matches_a_hand_computed_exact_example() -> None:
     assert record["statistic"] == pytest.approx(4.0)
     assert record["p_value"] == pytest.approx(0.4375)
     assert record["median_difference"] == pytest.approx(2.0)
-    assert "full runs higher than base" in record["difference_orientation"]
 
 
 def test_wilcoxon_drops_non_finite_pairs_and_counts_them() -> None:

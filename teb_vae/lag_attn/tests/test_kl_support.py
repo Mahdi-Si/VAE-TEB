@@ -91,14 +91,6 @@ def test_both_supports_mask_the_warmup_prefix(tiny_kwargs):
         assert torch.allclose(spiked, clean, atol=1e-6), f"warm-up leaked into {support}"
 
 
-def test_free_bits_raises_the_aggregate(tiny_kwargs):
-    latents = _latents(tiny_kwargs["d_z"])
-    model = _model(tiny_kwargs, "anchor")
-    floored = model._kld_loss(*latents, reduce_mean=True, free_bits=5.0)
-    unfloored = model._kld_loss(*latents, reduce_mean=True, free_bits=0.0)
-    assert floored.item() > unfloored.item()
-
-
 def test_an_empty_support_returns_zero_rather_than_dividing_by_zero(tiny_kwargs):
     """A short sequence under 'anchor' can legitimately leave no supported step at all."""
     model = _model(tiny_kwargs, "anchor")

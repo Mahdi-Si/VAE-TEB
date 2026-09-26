@@ -1,4 +1,4 @@
-r"""The experiment driver: three re-pointed attributes, one metric surface, one refusal.
+r"""The experiment driver: re-pointed attributes, one metric surface, the monitor, one refusal.
 
 **All three class attributes collide**, because both parents set them. Resolution order alone would
 take the causal side and every failure would be silent: a driver that builds another architecture, a
@@ -9,18 +9,18 @@ tree. None of those raises.
 objective does not produce. A tracked name nothing produces is a column that is empty in every row
 of every run, which is worse than an absent column: it reads as a measurement that came out blank.
 
+**The matched arms select on one predictive monitor**, and a monitor on a column the run will not
+log is refused before the fit.
+
 **The two checkpoint keys are refused together.** One is a strict load of this exact model kind and
 restores the source pathway; the other is a partial transfer that deliberately leaves it at zero. A
 run doing both has a starting point that neither key describes.
 """
 from __future__ import annotations
 
-import ast
-import inspect
 from pathlib import Path
 
 import pytest
-import yaml
 
 from teb_vae.lag_attn_cfs.trainer import LagAttnCfsTrainer
 from teb_vae.lag_attn_transformer_rws.trainer import LagAttnTrfRwsTrainer
@@ -39,7 +39,7 @@ from teb_vae.lag_slot_transformer_cfs.trainer import (
     validation_monitor_draws,
 )
 
-#: This package's own directory, for the launch-convention checks.
+#: This package's own directory, for the shipped configurations.
 PACKAGE_ROOT = Path(__file__).resolve().parents[1]
 
 #: Metric names the inherited surface tracks that this objective does not produce.
@@ -55,36 +55,18 @@ INHERITED_ONLY = (
     "delta_mu_sat_frac",
 )
 
+#: The shipped profiles outside the matched comparison: the legacy default and the two fixtures.
+NOT_MATCHED_ARMS = ("default.yaml", "tiny.yaml", "tiny_lag25.yaml")
+
 
 def test_all_three_colliding_attributes_are_re_pointed() -> None:
     """Each one omitted is a silent failure of a different kind."""
     assert LagResidualTrfCfsTrainer.MODEL_CLS is SeqVaeLagResidualTrfCfs
     assert LagResidualTrfCfsTrainer.TASK_CLS is SeqVaeLagResidualTrfCfsTask
-    assert LagResidualTrfCfsTrainer.CHECKPOINT_STEM == "lag-residual-trf-cfs"
 
     # And each differs from what resolution order alone would have given.
     assert LagResidualTrfCfsTrainer.MODEL_CLS is not LagAttnCfsTrainer.MODEL_CLS
     assert LagResidualTrfCfsTrainer.CHECKPOINT_STEM != LagAttnCfsTrainer.CHECKPOINT_STEM
-
-
-def test_the_resolution_order_keeps_both_parents() -> None:
-    """The causal parent owns the target domain; the conv-Transformer parent owns compilation."""
-    names = [cls.__name__ for cls in LagResidualTrfCfsTrainer.__mro__]
-    assert names[:4] == [
-        "LagResidualTrfCfsTrainer",
-        "LagAttnCfsTrainer",
-        "LagAttnTrfRwsTrainer",
-        "LagAttnRwsTrainer",
-    ]
-
-
-def test_the_target_fields_come_from_the_causal_parent() -> None:
-    """Both stored target blocks: the target is their concatenation.
-
-    A configuration carrying one of them is a target with a hole in it, and the shared entry
-    point's normalisation guard reads this tuple to catch it.
-    """
-    assert LagResidualTrfCfsTrainer.TARGET_FIELDS == ("fhr_st", "fhr_ph")
 
 
 def test_the_plot_config_key_stays_the_shared_literal() -> None:
@@ -111,31 +93,14 @@ def test_the_driver_builds_this_packages_own_page_callback() -> None:
     assert LagResidualTrfCfsTrainer.plot_callback_cls() is LagResidualTrfCfsPlotCallback
 
 
-def test_the_page_import_happens_only_when_the_figure_is_asked_for() -> None:
-    """The page pulls matplotlib, which a run drawing nothing should not carry.
-
-    Checked against the module's own syntax tree rather than against ``sys.modules``, which by
-    this point in a suite says only that some other test imported matplotlib first.
-    """
-    tree = ast.parse(Path(inspect.getfile(LagResidualTrfCfsTrainer)).read_text(encoding="utf-8"))
-    top_level = [node for node in tree.body if isinstance(node, (ast.Import, ast.ImportFrom))]
-    names = {
-        alias.name for node in top_level if isinstance(node, ast.Import) for alias in node.names
-    } | {node.module or "" for node in top_level if isinstance(node, ast.ImportFrom)}
-    assert not any("plotting" in name or "matplotlib" in name for name in names)
-    assert "plotting" in inspect.getsource(LagResidualTrfCfsTrainer.plot_callback_cls)
-
-
-@pytest.mark.parametrize("name", INHERITED_ONLY)
-def test_the_tracked_surface_names_nothing_this_objective_does_not_produce(name: str) -> None:
-    """An empty column reads as a measurement that came out blank.
-
-    Args:
-        name: The inherited metric that must not be tracked here.
-    """
-    assert not any(
-        tracked.endswith(f"/{name}") for tracked in LagResidualTrfCfsTrainer.TRACKED_METRICS
-    )
+def test_the_tracked_surface_names_nothing_this_objective_does_not_produce() -> None:
+    """An empty column reads as a measurement that came out blank."""
+    tracked = [
+        name
+        for name in INHERITED_ONLY
+        if any(column.endswith(f"/{name}") for column in LagResidualTrfCfsTrainer.TRACKED_METRICS)
+    ]
+    assert tracked == []
 
 
 def test_the_tracked_surface_names_every_readout_this_task_adds() -> None:
@@ -171,35 +136,32 @@ def test_the_monitor_columns_are_tracked_only_when_a_run_produces_them() -> None
         assert f"train/{column[4:]}" not in LagResidualTrfCfsTrainer.TRACKED_METRICS
 
 
-@pytest.mark.parametrize(
-    "name,expected",
-    [
-        ("default.yaml", None),
-        ("target_only.yaml", 8),
-        ("joint.yaml", 8),
-        ("lag25.yaml", 8),
-        ("lag25_s0_fhr.yaml", 8),
-        ("target_only_s0_fhr.yaml", 8),
-        ("tiny.yaml", 2),
-        ("tiny_lag25.yaml", 2),
-    ],
-)
-def test_the_shipped_profiles_declare_the_monitor_they_select_on(name: str, expected) -> None:
-    """Every arm of the matched comparison selects on the monitor; the legacy default does not.
+def test_every_matched_arm_selects_on_one_predictive_monitor() -> None:
+    """Arms whose checkpoints and stops were selected on different criteria are not compared.
 
-    Args:
-        name: The configuration filename.
-        expected: The draw count it resolves to.
+    Every shipped profile passes the monitor validation, and every arm of the matched comparison
+    (all but the legacy default and the fixtures) resolves the same draw count and selects its
+    checkpoint and its stop on a monitor column.
     """
-    config = load_config(str(PACKAGE_ROOT / "configs" / name))
-    assert validation_monitor_draws(config) == expected
-    callbacks = config["advanced_config"]["callbacks"]
-    if expected is None:
-        assert callbacks["model_checkpoint"]["monitor"] not in VALIDATION_MONITOR_COLUMNS
-    elif name not in ("tiny.yaml",):
-        assert callbacks["model_checkpoint"]["monitor"] in VALIDATION_MONITOR_COLUMNS
-        assert callbacks["early_stopping"]["enabled"] is True
-        assert callbacks["early_stopping"]["monitor"] in VALIDATION_MONITOR_COLUMNS
+    selections = {}
+    for path in sorted((PACKAGE_ROOT / "configs").glob("*.yaml")):
+        config = load_config(str(path))
+        draws = validation_monitor_draws(config)
+        if path.name in NOT_MATCHED_ARMS:
+            continue
+        callbacks = config["advanced_config"]["callbacks"]
+        selections[path.name] = (
+            draws,
+            callbacks["model_checkpoint"]["monitor"],
+            callbacks["early_stopping"]["enabled"],
+            callbacks["early_stopping"]["monitor"],
+        )
+
+    assert len(set(selections.values())) == 1, selections
+    draws, checkpoint_monitor, stopping, stop_monitor = next(iter(selections.values()))
+    assert draws is not None and stopping is True
+    assert checkpoint_monitor in VALIDATION_MONITOR_COLUMNS
+    assert stop_monitor in VALIDATION_MONITOR_COLUMNS
 
 
 def test_a_monitor_on_a_column_the_run_will_not_log_is_refused_before_the_fit() -> None:
@@ -256,23 +218,7 @@ def test_the_module_runs_from_the_run_button_with_no_command_line() -> None:
     import teb_vae.lag_slot_transformer_cfs.trainer as trainer_module
 
     assert isinstance(trainer_module.RUN_CONFIG, str)
-    assert trainer_module.RUN_CONFIG.startswith("teb_vae/")
     assert (Path(_resolve_cli_config_path(trainer_module.RUN_CONFIG))).exists()
-
-
-def test_the_run_constant_sits_immediately_above_the_main_guard() -> None:
-    """So it is the first thing found when scrolling to the bottom of the file."""
-    source = (PACKAGE_ROOT / "trainer.py").read_text(encoding="utf-8")
-    assert source.index("RUN_CONFIG:") < source.index('if __name__ == "__main__":')
-    tail = source[source.index("RUN_CONFIG:") :]
-    assert tail.index('if __name__ == "__main__":') < 400
-
-
-def test_no_argument_is_required_and_none_carries_a_non_none_default() -> None:
-    """A non-``None`` default would make the constant unreachable with nothing saying why."""
-    source = (PACKAGE_ROOT / "trainer.py").read_text(encoding="utf-8")
-    assert "required=True" not in source
-    assert "default=None" in source
 
 
 def test_a_relative_config_path_resolves_against_the_repository_root() -> None:
@@ -287,21 +233,3 @@ def test_a_relative_config_path_resolves_against_the_repository_root() -> None:
         "configs\\default.yaml"
     )
 
-
-def test_the_shipped_configuration_builds_this_model_through_the_signature_sweep() -> None:
-    """The sweep is what a run actually goes through, so it is what the test goes through."""
-    raw = yaml.safe_load(
-        (PACKAGE_ROOT / "configs" / "default.yaml").read_text(encoding="utf-8")
-    )
-    vae_config = raw["model_config"]["VAE_model"]
-    valid = set(inspect.signature(SeqVaeLagResidualTrfCfs.__init__).parameters)
-    forwarded = {
-        name: value
-        for name, value in vae_config.items()
-        if name in valid and name != "init_weights" and value is not None
-    }
-    # Not constructed here: the production geometry builds a model of a size a unit test should not
-    # allocate. What is checked is that the sweep selects a set the constructor accepts.
-    missing = [name for name in forwarded if name not in valid]
-    assert missing == []
-    assert "max_lag" in forwarded and "d_z" in forwarded

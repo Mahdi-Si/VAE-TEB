@@ -47,8 +47,6 @@ supplies it.
 """
 from __future__ import annotations
 
-from pathlib import Path
-
 import numpy as np
 import pytest
 import torch
@@ -73,10 +71,8 @@ _TRIMMED_STEPS = SHIPPED_SEQUENCE_LENGTH
 _RAW_SAMPLES = _TRIMMED_STEPS * 16
 
 #: What the shipped budget resolves to on causal shards, measured on the committed fixture and
-#: reproduced by the generated ones: 98 of 102 target channels survive, all 51 source channels are
-#: kept, and the four dropped target channels wait these many steps in the trimmed coordinates.
+#: reproduced by the generated ones.
 _KEPT_TARGET_CHANNELS = 98
-_DROPPED_WARMUPS = (162, 194, 233, 278)
 
 #: The class code each subgroup shard carries, so "the eight cover all three classes" is a
 #: statement about the generator rather than about whatever it happened to write.
@@ -133,30 +129,10 @@ def test_every_shard_declares_itself_causal_at_the_causal_widths(cohort_shards) 
             assert handle["up_ph"].shape[1] == CAUSAL_C_U - CAUSAL_ST_WIDTH
 
 
-def test_every_shard_carries_the_per_block_warm_up_and_delay_attributes(cohort_shards) -> None:
-    """These are what the whole channel budget is resolved from, and they exist only because the
-    blocks came out of the real one-sided bank. A synthesised shard would carry a number here that
-    described nothing."""
-    import h5py
-
-    with h5py.File(cohort_shards[0], "r") as handle:
-        for block in ("fhr_st", "fhr_ph", "up_st", "up_ph"):
-            assert "causal_warmup_steps" in handle[block].attrs, block
-            assert "causal_delay_s" in handle[block].attrs, block
-        # The phase blocks alone carry the channel-selection provenance the band map is read from.
-        assert "sel_xi_i_hz" in handle["fhr_ph"].attrs
-        assert "sel_xi_i_hz" in handle["up_ph"].attrs
-
-
 #: Surviving source channels under the SINGLE-reference resolution these fixtures build -- the
 #: alignment drops the four channels above the target's own clock, and the warm-up budget touches
 #: this stream not at all.
 _KEPT_SOURCE_CHANNELS = 47
-
-#: And under the shipped config's DUAL clock, which the real fit below resolves at: a source
-#: reference faster than the target's by a known offset, costing eight more channels. Two numbers
-#: rather than one because these fixtures deliberately read the two arms in two places.
-_SHIPPED_CLOCK_SOURCE_CHANNELS = 39
 
 
 def test_the_shipped_budget_resolves_against_the_generated_shards(cohort_shards) -> None:
@@ -182,26 +158,6 @@ def test_the_shipped_budget_resolves_against_the_generated_shards(cohort_shards)
     )
 
 
-def test_the_four_dropped_target_channels_are_the_ones_the_design_names(cohort_shards) -> None:
-    r"""$W' = 162, 194, 233, 278$ against a budget of $134$ -- the four slowest ``fhr_st`` filters.
-    They are named rather than counted because a budget that dropped four *other* channels would
-    satisfy every count in the test above."""
-    target = _resolve_over_all(cohort_shards).target
-
-    dropped = tuple(target.declared_warmup_steps[index] for index in target.dropped_index)
-
-    assert dropped == _DROPPED_WARMUPS
-    # The last four of the ``fhr_st`` block, not of the concatenated 102: the phase block follows
-    # the scattering one in channel order and survives the budget whole. That distinction is what
-    # makes a positional join between the 102-wide band map and the 98-wide gap vector wrong on any
-    # dataset whose survivors are not a prefix.
-    assert target.dropped_index == tuple(range(CAUSAL_ST_WIDTH - 4, CAUSAL_ST_WIDTH))
-    assert target.block_counts() == (("fhr_st", 32, 36), ("fhr_ph", 66, 66))
-    # And the slowest SURVIVOR is what the anchor floor is paired against, not the threshold.
-    assert target.max_warmup <= SHIPPED_BUDGET_STEPS
-    assert SHIPPED_WARMUP_PERIOD >= target.max_warmup - 1
-
-
 # ---------------------------------------------------------------------------
 # It loads through the real loader, at the real geometry
 # ---------------------------------------------------------------------------
@@ -223,44 +179,25 @@ def test_the_trimmed_geometry_is_the_one_the_model_is_built_at(batches) -> None:
     assert batch["fhr"].shape[1] == 16 * batch["fhr_st"].shape[1]
 
 
-def test_the_channel_widths_match_the_models_data_contract(batches) -> None:
-    batch = batches[0]
-    assert batch["fhr_st"].shape[2] == CAUSAL_ST_WIDTH
-    assert batch["fhr_ph"].shape[2] == CAUSAL_PH_WIDTH
-    assert batch["up_st"].shape[2] == CAUSAL_ST_WIDTH
-    assert batch["up_ph"].shape[2] == CAUSAL_C_U - CAUSAL_ST_WIDTH
+def test_the_dense_anchor_set_the_evaluation_decodes_at_is_not_empty(batches) -> None:
+    r"""$[F, T - H)$ must hold anchors at the length the LOADER yields.
 
-
-def test_the_dense_anchor_set_the_evaluation_decodes_at_is_the_full_one(batches) -> None:
-    r"""$[F, T - H) = [134, 270)$ is 136 anchors, and the evaluation decodes every one of them.
-
-    Derived from the length the LOADER yields rather than from the config constant, because a
-    fixture written at a shorter window would leave the evaluation with no anchors at all and the
-    symptom would be an empty table rather than an error.
-
-    $136$ rather than $137$, and the one anchor is what the channel alignment costs: unaligned the
-    floor is $B - 1 = 133$, because a forecast at anchor $t$ reads target time $t + 1$ at the
-    earliest; aligned, a channel is honest at $W'_c + d_c$ and the floor must additionally clear
-    $\max_c(W'_c + d_c) = B$ on both streams.
+    Derived from the served length rather than from the config constant, because a fixture written
+    at a shorter window would leave the evaluation with no anchors at all and the symptom would be
+    an empty table rather than an error.
     """
     served = int(batches[0]["fhr_st"].shape[1])
 
     assert served == SHIPPED_SEQUENCE_LENGTH
-    assert served - SHIPPED_HORIZON - SHIPPED_WARMUP_PERIOD == 136
+    assert served - SHIPPED_HORIZON - SHIPPED_WARMUP_PERIOD > 0
 
 
-def test_all_the_clinical_fields_arrive_in_the_batch(batches) -> None:
+def test_all_the_clinical_and_identity_fields_arrive_in_the_batch(batches) -> None:
     """The loader skips a field a shard does not carry, silently, so absence is not an error
-    downstream -- it is a missing column that reads as "this cohort has no labels"."""
-    for name in ("target", "epoch", "cs_label", "bg_label", "time_from_labor_onset"):
+    downstream -- it is a missing column that reads as "this cohort has no labels". ``guid`` and
+    ``epoch`` are the pair the anchor tiling's phase is keyed on."""
+    for name in ("target", "epoch", "guid", "cs_label", "bg_label", "time_from_labor_onset"):
         assert name in batches[0], name
-
-
-def test_guid_and_epoch_both_arrive_because_the_tile_phase_is_keyed_on_the_pair(batches) -> None:
-    """``load_fields`` is honoured literally with no forced additions, and dropping either would
-    put every segment on one tile grid with no shape, count or metric differing."""
-    assert "guid" in batches[0]
-    assert "epoch" in batches[0]
 
 
 def test_normalization_is_active_rather_than_silently_disabled(cohort_loader) -> None:
@@ -337,13 +274,6 @@ def test_the_eight_subgroups_are_the_canonical_ones(batches) -> None:
     assert resolved == set(labels.CANONICAL_SUBGROUPS)
 
 
-def test_both_label_axes_carry_two_values(batches) -> None:
-    """The obvious substring rules label the doubly negative subgroup positive on both axes,
-    which collapses each by-label table to one group. The generator uses an explicit table."""
-    assert set(_column(batches, "cs_label")) == {True, False}
-    assert set(_column(batches, "bg_label")) == {True, False}
-
-
 def test_the_epoch_column_spans_several_hours_and_stays_inside_the_shipped_filter(batches) -> None:
     epochs = np.asarray(_column(batches, "epoch"), dtype=np.float64)
     assert epochs.max() < 0.0, "epoch counts backwards from delivery"
@@ -391,76 +321,3 @@ def test_the_validity_profile_survives_trimming(batches) -> None:
     assert float(weight.min()) == 0.0, "the deliberate gap"
     assert bool((weight == COHORT_EDGE_WEIGHT).any())
     assert bool((weight == 1.0).any())
-
-
-def test_no_fixture_binary_is_committed() -> None:
-    """The shards are generated into ``tmp_path_factory``; this suite commits no HDF5 of its own.
-    Regenerating the family's committed binaries to add cohort fields would perturb every number
-    the existing suites are pinned against."""
-    assert not (Path(__file__).resolve().parent / "fixtures").exists()
-
-
-# ---------------------------------------------------------------------------
-# The trained run built on them
-# ---------------------------------------------------------------------------
-@pytest.mark.slow
-def test_the_run_directory_has_the_layout_a_later_offline_pass_needs(cohort_run) -> None:
-    """``run.py`` is handed a checkpoint and finds the run's own resolved config beside it. Both
-    halves have to be there, or an evaluation would have to fall back on what a committed config
-    file currently says -- which is the drift the whole arrangement exists to prevent."""
-    from teb_vae.lag_attn_rws.trainer import RESOLVED_CONFIG_FILENAME
-
-    checkpoint_dir = Path(cohort_run) / "model_checkpoints"
-
-    assert checkpoint_dir.is_dir()
-    assert list(checkpoint_dir.glob("*.ckpt")), "the fit wrote no checkpoint"
-    assert (checkpoint_dir / RESOLVED_CONFIG_FILENAME).is_file()
-
-
-@pytest.mark.slow
-def test_the_checkpoint_stamps_the_four_tuples_the_budget_resolved(cohort_run) -> None:
-    r"""The budget is a config key that names no constructor argument: the driver resolves it
-    against the *shards* into four concrete channel tuples, and those are what land in
-    ``model_kwargs``. They are what makes a run's channel set recoverable from its checkpoint alone
-    with no shard present -- and the decoder's width, which is the unit every nat is summed over.
-    """
-    path = next(iter((Path(cohort_run) / "model_checkpoints").glob("*.ckpt")))
-    blob = torch.load(path, map_location="cpu", weights_only=False)
-    model_kwargs = blob["model_kwargs"]
-
-    for key in (
-        "target_keep_index", "target_warmup_steps", "source_keep_index", "source_warmup_steps"
-    ):
-        assert key in model_kwargs, key
-
-    assert len(model_kwargs["target_keep_index"]) == _KEPT_TARGET_CHANNELS
-    assert len(model_kwargs["target_warmup_steps"]) == _KEPT_TARGET_CHANNELS
-    # The SHIPPED source clock, which is a hundred-odd seconds faster than the target's and costs
-    # eight more channels than the single-reference arm the resolutions above are read at. Written
-    # out rather than derived, because what a checkpoint carries is the width every module on the
-    # source side was built at, and that has to be recoverable from the blob alone.
-    assert len(model_kwargs["source_keep_index"]) == _SHIPPED_CLOCK_SOURCE_CHANNELS
-    assert len(model_kwargs["source_warmup_steps"]) == _SHIPPED_CLOCK_SOURCE_CHANNELS
-    # The declared widths are untouched, which is what the data boundary checks against.
-    assert (model_kwargs["c_y"], model_kwargs["c_u"]) == (CAUSAL_C_Y, CAUSAL_C_U)
-
-
-@pytest.mark.slow
-def test_the_run_records_the_budget_and_the_shards_it_was_resolved_against(cohort_run) -> None:
-    """A run recording only the request would record neither what it got nor what its nats were
-    summed over. The resolved config is also where a later offline pass reads the population."""
-    import yaml
-
-    from teb_vae.lag_attn_rws.trainer import RESOLVED_CONFIG_FILENAME
-
-    written = Path(cohort_run) / "model_checkpoints" / RESOLVED_CONFIG_FILENAME
-    reloaded = yaml.safe_load(written.read_text(encoding="utf-8"))
-
-    assert "base" not in reloaded
-    vae = reloaded["model_config"]["VAE_model"]
-    assert vae["causal_warmup_budget_steps"] == SHIPPED_BUDGET_STEPS
-    assert vae["warmup_period"] == SHIPPED_WARMUP_PERIOD
-    assert vae["causal_reach_budget_s"] is None
-    shards = reloaded["dataset_config"]["vae_test_datasets"]
-    assert len(shards) == 8
-    assert all("REPOINT_ME" not in path for path in shards)

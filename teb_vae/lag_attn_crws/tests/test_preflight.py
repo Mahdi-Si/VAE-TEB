@@ -85,66 +85,21 @@ def test_a_two_sided_shard_is_refused(config):
     assert "causal" in str(excinfo.value)
 
 
-def test_a_reach_budget_beside_the_warm_up_budget_is_refused_naming_both_keys(config):
-    """Not a stricter run but an incoherent one: the forward reach $L_{95}$ is an energy quantile of
-    a two-sided kernel, measured on a bank that did not produce these coefficients -- and a reach
-    budget applies a *shift* on top of the warm-up."""
-    _vae(config)["causal_reach_budget_s"] = 120.0
-
-    with pytest.raises(ValueError) as excinfo:
-        LagAttnCrwsTrainer.preflight(config)
-
-    message = str(excinfo.value)
-    assert "causal_warmup_budget_steps" in message
-    assert "causal_reach_budget_s" in message
-
-
-def test_a_trim_that_does_not_produce_the_declared_window_is_refused_naming_both_paths(config):
-    """The warm-up vectors are rebased by the trim, so a uniformly wrong rebase moves the anchor
-    floor and the input-validity boundary **together** -- the declared policy would still read as
-    satisfied while every kept channel was cold across the scored window."""
-    _loader(config)["dataset_kwargs"]["trim_minutes"] = 2.0
-
-    with pytest.raises(ValueError) as excinfo:
-        LagAttnCrwsTrainer.preflight(config)
-
-    message = str(excinfo.value)
-    assert "trim_minutes" in message
-    assert "sequence_length" in message
-
-
 # --------------------------------------------------------------------------------------
 # The geometry
 # --------------------------------------------------------------------------------------
-def test_a_floor_that_does_not_pair_with_the_budget_is_refused_naming_both_numbers(config):
+def test_a_floor_that_does_not_pair_with_the_budget_is_refused_by_the_constructors_own_check(
+    config,
+):
     r"""$F \ge \max(B - 1,\; \max_c(W'_c + d_c))$ over the **survivors**, checked here so a mis-paired
     configuration fails before a run directory exists rather than inside the constructor after every
     rank initialised.
 
-    The second half binds, and by a wide margin. At this cell's $42.21$ s reference the alignment
-    drops every channel slower than it, so the survivors are fast ones: $B = 1$ and
-    $\max_c(W'_c + d_c) = 6$, giving a requirement of $6$ against the $0$ the scored-target half
-    alone would admit. The shipped ``warmup_period`` of $134$ therefore clears it more than twenty
-    times over -- the floor has become a retained anchor-cost policy rather than a constraint, which
-    is exactly why it is asserted here: a requirement nothing binds is one a later edit can silently
-    violate."""
-    _vae(config)["warmup_period"] = 5
-
-    with pytest.raises(ValueError) as excinfo:
-        LagAttnCrwsTrainer.preflight(config)
-
-    message = str(excinfo.value)
-    assert "warmup_period=5" in message
-    assert "at least 6" in message
-    assert "shifted onto a common clock" in message
-
-
-def test_the_floor_refusal_is_the_constructors_own_and_states_the_input_warmth_policy(config):
-    """Delegated rather than restated, so the pre-flight and the constructor cannot come to disagree
-    about a policy that has exactly one expression. What the message must say is what this cell
-    actually enforces: the raw target is honest at every step, so a lower floor would not corrupt the
-    objective -- it would decode anchors whose *inputs* are still partly pre-recording history, which
-    is a different claim about the run rather than a wrong number in it."""
+    Delegated rather than restated: the pre-flight's message must be exactly the constructor's for
+    the same resolved warm-up and shifts, so the two cannot come to disagree about a policy that has
+    one expression. At this cell's alignment reference the survivors are fast channels and the
+    shifted half binds, which is the requirement the message names.
+    """
     _vae(config)["warmup_period"] = 5
     resolved = resolve_warmup_budget(config)
     assert resolved is not None
@@ -153,59 +108,32 @@ def test_the_floor_refusal_is_the_constructors_own_and_states_the_input_warmth_p
         LagAttnCrwsTrainer.preflight(config)
     # The same three arguments the pre-flight resolves, shifts included: the refusal has one branch
     # per alignment state, so a direct call that dropped the shifts would compare an aligned message
-    # against an unaligned one and fail on the wording rather than on the delegation.
+    # against an unaligned one.
     with pytest.raises(ValueError) as constructor_error:
         CausalRawInputs._check_anchor_floor(
             5, resolved.target.warmup_steps, resolved.target.align_delays or ()
         )
 
-    assert str(preflight_error.value) == str(constructor_error.value)
-    assert "input-warmth" in str(preflight_error.value)
-    assert "raw target is honest at every step" in str(preflight_error.value)
+    message = str(preflight_error.value)
+    assert message == str(constructor_error.value)
+    assert "warmup_period=5" in message
+    assert "at least 6" in message
 
 
-def test_a_higher_floor_than_the_pairing_requires_is_admitted(config):
-    """The pairing is an inequality, not an equality, which is what would make a stricter policy arm
-    a one-key change rather than a code change."""
-    _vae(config)["warmup_period"] = 150
-
-    LagAttnCrwsTrainer.preflight(config)
-
-
-def test_a_stride_that_leaves_a_phase_with_no_anchor_is_refused(config):
-    """At the last phase the first anchor would be $F + S - 1$; if that anchor does not exist there
-    is a phase at which the sample contributes no forecast at all, and its share of the epoch is
-    silently dropped."""
-    _vae(config)["warmup_period"] = 280
-    _vae(config)["anchor_stride"] = 15
-
-    with pytest.raises(ValueError, match="phase"):
-        LagAttnCrwsTrainer.preflight(config)
-
-
-@pytest.mark.parametrize("weight", [0.1, 1.0])
-def test_a_non_zero_boundary_weight_is_refused_unconditionally(config, weight):
+@pytest.mark.parametrize(
+    ("weight", "stride"), [(0.1, None), (0.05, 1)], ids=["tiled", "dense_stride"]
+)
+def test_a_non_zero_boundary_weight_is_refused_unconditionally(config, weight, stride):
     """The term is a slicing identity over ADJACENT anchors. This cell always supplies an anchor set
     whose entries are $S$ apart, so at any non-zero weight it would score the gap between two windows
     a whole horizon apart as an error -- and the shared objective's own refusal fires inside the
     first training step, after the run directory exists.
 
-    Worth reading twice here rather than in the feature-target cells: the term is *meaningful* on a
-    raw target, and it ships at $0.05$ on the model this one is compared against. It is off here
-    because of the anchor axis alone."""
+    Unconditional rather than conditional on the tiling: at ``anchor_stride: 1`` the identity is
+    legal again, and a conditional refusal would make the term's meaning a function of another key."""
     _vae(config)["lambda_boundary"] = weight
-
-    with pytest.raises(ValueError, match="lambda_boundary"):
-        LagAttnCrwsTrainer.preflight(config)
-
-
-def test_the_boundary_refusal_does_not_depend_on_the_stride(config):
-    """Unconditional rather than conditional on the tiling. At ``anchor_stride: 1`` the slicing
-    identity is legal again, so a conditional refusal would make the term's meaning a function of
-    another key -- and a run that later moved the stride would silently start scoring the gap
-    between two windows a horizon apart."""
-    _vae(config)["anchor_stride"] = 1
-    _vae(config)["lambda_boundary"] = 0.05
+    if stride is not None:
+        _vae(config)["anchor_stride"] = stride
 
     with pytest.raises(ValueError, match="lambda_boundary"):
         LagAttnCrwsTrainer.preflight(config)

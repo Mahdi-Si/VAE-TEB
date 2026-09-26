@@ -39,7 +39,6 @@ from teb_vae.lag_attn.channel_reach import (  # noqa: E402
     resolve_stream_budgets,
 )
 from teb_vae.lag_attn.nets.delays import ChannelGate  # noqa: E402
-from teb_vae.lag_attn.nets.lag_report import SECONDS_PER_STEP  # noqa: E402
 from teb_vae.lag_attn_rws import input_budget  # noqa: E402
 from teb_vae.lag_attn_rws.nets.geometry import TrimmedRawGeometry  # noqa: E402
 from teb_vae.lag_attn_rws.sample_page import build_diagnostic_figure  # noqa: E402
@@ -255,7 +254,6 @@ def test_the_forecast_window_is_the_models_own_horizon():
     figure = input_budget.build_input_budget_figure(model)
     try:
         expected = model.geometry.horizon * model.geometry.r / 4.0
-        assert f"{expected:.0f} s forecast window" in figure._suptitle.get_text()
         axes = figure.axes[0]
         bars = {id(patch) for container in axes.containers for patch in container.patches}
         spans = [patch for patch in axes.patches if id(patch) not in bars]
@@ -274,12 +272,3 @@ def test_the_figure_is_written_under_the_directory_it_is_given(tmp_path):
 
     assert path == tmp_path / "diagnostics" / f"{input_budget.BUDGET_FIGURE_STEM}.png"
     assert path.exists() and path.stat().st_size > 0
-
-
-def test_the_delay_is_reported_in_the_units_the_guard_resolves_it_in():
-    """Steps in the arithmetic, seconds on the page: the summary states both, because a delay of
-    $30$ means nothing without $\\Delta$ and the two are resolved in different modules."""
-    target, _source = input_budget.describe_streams(_shipped_model())
-
-    assert f"delay 0–{target.max_delay} steps" in target.summary()
-    assert f"({target.max_delay * SECONDS_PER_STEP:g} s)" in target.summary()

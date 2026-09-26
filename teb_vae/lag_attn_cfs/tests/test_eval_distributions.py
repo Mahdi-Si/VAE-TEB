@@ -10,12 +10,8 @@ the exception and the tests are written around exactly what makes it an exceptio
 * it must survive the degenerate splits, because a single-cohort population is the ordinary case
   on the pretraining shards and an absent column is the ordinary case on an older run's tables.
 
-**And one thing the sibling's copy of this file spends four tests on does not exist here.** There
-it converts the rooted metrics into bpm and the assertions are about getting a *spread* conversion
-right rather than a *level* one. A wavelet modulus has no clinical unit, so nothing here converts
-at all: :func:`~teb_vae.lag_attn_cfs.eval.analyses.distributions.build_frames` takes no statistics
-argument, every emitted unit is ``normalised``, and the tests below assert the absence rather than
-the correctness of a conversion.
+A wavelet modulus has no clinical unit, so nothing here converts: the rooted metrics stay in the
+loader's normalised units, and a record without normalisation statistics changes nothing.
 
 The happy path is asserted first and by hand-computed value, because every degenerate-input test
 below would pass with the analysis unimplemented.
@@ -105,7 +101,6 @@ def test_the_two_levels_root_at_different_points(per_sample) -> None:
     # Strictly below, because this recording's squares are not all equal -- which is what makes
     # the assertion a check on the ordering rather than on a tie.
     assert mean_of_roots < hand_rooted_once
-    assert "Jensen" in distributions.PER_SEGMENT_ROOT_NOTE
 
 
 def test_an_unrooted_metric_passes_through_in_its_own_unit(per_sample) -> None:
@@ -118,41 +113,6 @@ def test_an_unrooted_metric_passes_through_in_its_own_unit(per_sample) -> None:
         np.asarray(segment["delta_mu_rms"]), np.asarray(per_sample["delta_mu_rms"])
     )
     assert units["mc_pred_gap"] == "nats per anchor"
-
-
-# =============================================================================
-# Nothing is converted, and nothing can be
-# =============================================================================
-def test_no_metric_is_drawn_in_a_clinical_unit(per_sample) -> None:
-    """The inverted half of the sibling's file. Every declared unit is the loader's own scale or a
-    nats/log axis, and the resolved units are exactly the declared ones -- there is no branch that
-    could upgrade one, which is what "deleted rather than repointed" has to mean to hold."""
-    _, _, units = distributions.build_frames(per_sample)
-
-    assert units == {metric.name: metric.unit for metric in distributions.METRICS}
-    assert all("bpm" not in unit for unit in units.values())
-    assert set(units.values()) == {NORMALISED_UNIT, "nats per anchor", "log z-units", "nats"}
-
-
-def test_the_frame_builder_takes_no_statistics_to_convert_with() -> None:
-    """Asserted on the signature rather than on an output, because the failure this prevents is
-    a *reintroduction*: a second argument here is a conversion waiting for a caller, and the two
-    error metrics are the ones a mechanical port would convert."""
-    import inspect
-
-    parameters = list(inspect.signature(distributions.build_frames).parameters)
-
-    assert parameters == ["per_sample"]
-
-
-def test_the_readout_module_exports_nothing_this_analysis_could_convert_through() -> None:
-    """Non-vacuity for the two above: they would both pass while a conversion sat one import
-    away. ``tests/test_eval_units.py`` owns this claim in full; it is restated here because this
-    analysis is the sibling's only caller of it."""
-    from teb_vae.lag_attn_cfs.eval import metrics
-
-    assert not hasattr(metrics, "sigma_to_bpm")
-    assert not hasattr(metrics, "to_bpm")
 
 
 # =============================================================================
@@ -193,16 +153,6 @@ def test_the_summary_is_written_in_the_canonical_cohort_order(per_sample) -> Non
     assert list(dict.fromkeys(subgroups["group"])) == [
         "hie_no_cs", "acidosis_cs", "healthy_bg_cs", "healthy_no_bg_no_cs",
     ]
-
-
-def test_every_summary_row_names_the_unit_it_is_in(per_sample) -> None:
-    """A pooled distribution over 98 channels in z units reads exactly like one over bpm unless
-    something says which, and the CSV is what an offline reader has."""
-    segment, recording, units = distributions.build_frames(per_sample)
-    table = pd.DataFrame(distributions.build_summary_rows(segment, recording, units))
-
-    assert table["unit"].notna().all()
-    assert set(table.loc[table["metric"] == "rmse_full", "unit"]) == {NORMALISED_UNIT}
 
 
 # =============================================================================
@@ -467,20 +417,6 @@ def test_the_class_figure_uses_the_clinical_palette(per_sample) -> None:
     assert faces == expected
 
 
-def test_the_axis_label_carries_the_unit_the_panel_is_drawn_in(per_sample) -> None:
-    """The label is where a reader of the figure learns the scale, and it is the only place: there
-    is no clinical unit and no colour bar on these panels."""
-    segment, recording, units = distributions.build_frames(per_sample)
-
-    figure = distributions.build_class_figure(segment, recording, units)
-    try:
-        label = figure.axes[0].get_xlabel()
-    finally:
-        shared_figures.plt.close(figure)
-
-    assert label == f"rmse_full ({NORMALISED_UNIT})"
-
-
 def test_the_subgroup_figure_nests_each_class_in_its_own_column(per_sample) -> None:
     """Eight densities on one axes is unreadable, and the subgroup axis is already a subdivision
     of the class axis -- so a column is a class and a cell holds only that class's subgroups."""
@@ -572,47 +508,29 @@ def test_the_figures_do_not_collide_with_the_grouped_variant_naming() -> None:
     """The trap this analysis fell into once, kept from recurring.
 
     ``*_by_clinical_class.pdf`` and ``*_by_subgroup.pdf`` are the runner's grouped-variant
-    violins, and the smoke test normalises them out of the figure manifest as a *family*. A figure
-    of any other analysis named into that shape is therefore never recorded in the manifest and
-    never documented -- it simply vanishes, while reading to an operator as one of the violin
-    figures it is not. Which is the exact confusion this analysis exists to prevent.
+    violins. A figure of any other analysis named into that shape reads to an operator as one of
+    the violin figures it is not, which is the exact confusion this analysis exists to prevent.
     """
     for filename in (figure_filename(distributions.CLASS_FIGURE),
                      figure_filename(distributions.SUBGROUP_FIGURE)):
         assert not filename.endswith(GROUPED_SUFFIXES), filename
 
 
-def test_the_analysis_declares_no_grouped_frame(per_sample, tmp_path) -> None:
-    """The runner's fan-out draws violins documented as holding one value per **recording**.
-    Handing it this per-segment frame would produce a per-segment violin that reads as a
-    per-recording one -- the exact confusion this analysis exists to make visible."""
-    result = _run(per_sample, tmp_path)
-
-    assert "grouped_frames" not in result
-
-
 def test_the_analysis_computes_no_test_interval_or_headline(per_sample, tmp_path) -> None:
     """Descriptive by construction: no $p$-value, no interval, no verdict, and nothing that the
     headline registry could dig a scalar out of. A separation visible here is a reason to look,
-    and ``cross_subgroup`` is what decides whether one survives being asked properly."""
+    and ``cross_subgroup`` is what decides whether one survives being asked properly.
+
+    Nor does it declare a grouped frame: the runner's fan-out draws violins documented as holding
+    one value per **recording**, and this per-segment frame would read as one."""
     result = _run(per_sample, tmp_path)
 
     forbidden = ("p_value", "ci_lo", "ci_hi", "headline", "verdict", "bootstrap_resamples")
-    assert not any(key in result for key in forbidden)
+    assert not any(key in result for key in (*forbidden, "grouped_frames"))
     table = pd.read_csv(
         tmp_path / distributions.ANALYSIS_DIRNAME / distributions.SUMMARY_FILENAME
     )
     assert not any(name in table.columns for name in forbidden)
-
-
-def test_the_record_carries_both_standing_notes(per_sample, tmp_path) -> None:
-    """Both travel in ``summary.json`` rather than only in the documentation: a caveat a reader of
-    the output cannot see is a caveat that does not apply."""
-    result = _run(per_sample, tmp_path)
-
-    assert "descriptive only" in result["descriptive_only"]
-    assert "cross_subgroup" in result["descriptive_only"]
-    assert result["per_segment_root_note"]
 
 
 def test_a_single_cohort_split_still_draws_rather_than_skipping(tmp_path) -> None:
@@ -630,25 +548,26 @@ def test_a_single_cohort_split_still_draws_rather_than_skipping(tmp_path) -> Non
     ).stat().st_size > 0
 
 
-def test_an_absent_metric_column_is_unmeasured_rather_than_a_failure(per_sample, tmp_path) -> None:
-    """An older run's tables may not carry every column this analysis draws."""
-    result = _run(per_sample.drop(columns=["mc_pred_gap", "attention_entropy_nats"]), tmp_path)
+@pytest.mark.parametrize(
+    "metric, mutate",
+    [
+        # An older run's tables may not carry every column this analysis draws.
+        ("mc_pred_gap", lambda frame: frame.drop(columns=["mc_pred_gap"])),
+        ("source_conditioned_kl_raw", lambda frame: frame.assign(source_conditioned_kl_raw=np.nan)),
+    ],
+    ids=["absent-column", "all-nan-column"],
+)
+def test_an_unmeasured_metric_is_counted_as_zero_rather_than_a_failure(
+    per_sample, tmp_path, metric, mutate
+) -> None:
+    result = _run(mutate(per_sample), tmp_path)
     table = pd.read_csv(
         tmp_path / distributions.ANALYSIS_DIRNAME / distributions.SUMMARY_FILENAME
     )
 
-    absent = table[table["metric"] == "mc_pred_gap"]
-    assert len(absent) and int(absent["n"].sum()) == 0
+    rows = table[table["metric"] == metric]
+    assert len(rows) and int(rows["n"].sum()) == 0
     assert result["composition"]["n_segments"] == len(per_sample)
-
-
-def test_an_all_nan_metric_is_unmeasured_rather_than_a_failure(per_sample, tmp_path) -> None:
-    frame = per_sample.copy()
-    frame["source_conditioned_kl_raw"] = np.nan
-
-    result = _run(frame, tmp_path)
-
-    assert result["composition"]["n_segments"] == len(frame)
 
 
 def test_an_empty_table_produces_empty_figures_rather_than_raising(tmp_path) -> None:

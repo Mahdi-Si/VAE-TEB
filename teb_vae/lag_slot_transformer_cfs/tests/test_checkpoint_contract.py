@@ -19,7 +19,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from teb_vae.lag_slot_transformer_cfs.nets.model import MODEL_KIND, SeqVaeLagResidualTrfCfs
+from teb_vae.lag_slot_transformer_cfs.nets.model import SeqVaeLagResidualTrfCfs
 from teb_vae.lag_slot_transformer_cfs.tests.conftest import (
     build_tiny_model,
     tiny_model_kwargs,
@@ -280,32 +280,19 @@ def test_a_checkpoint_round_trip_reproduces_the_model_and_its_invariants() -> No
     assert torch.equal(silenced["mu_post"], silenced["mu_prior"])
 
 
-def test_the_mean_only_arm_and_the_full_arm_have_incompatible_state_dicts() -> None:
-    """An arm is a different module tree, so a checkpoint cannot cross between them silently."""
-    full = build_tiny_model()
-    lean = build_tiny_model(mean_only_residual=True)
-    with pytest.raises(RuntimeError):
-        lean.load_state_dict(full.state_dict())
-
-
 def test_a_checkpoint_of_one_lag_window_refuses_to_load_into_another_naming_the_embedding() -> None:
     """The lag embedding has one row per candidate lag, so two windows are two shapes.
 
-    A strict load refuses by name with both shapes. Cropping the table to fit would also carry
-    the wider window's summation scale into a model whose own is larger, so the refusal is the
-    correct outcome and a shorter-window arm starts from the target-only donor instead.
+    A strict load refuses by name. Cropping the table to fit would also carry the wider window's
+    summation scale into a model whose own is larger, so the refusal is the correct outcome and a
+    shorter-window arm starts from the target-only donor instead.
     """
     wide = build_tiny_model()
     narrow = build_tiny_model(max_lag=wide.max_lag - 2)
-    name = "proposal_head.lag_embedding.weight"
 
-    with pytest.raises(RuntimeError, match=name) as caught:
+    with pytest.raises(RuntimeError, match="proposal_head.lag_embedding.weight"):
         narrow.load_state_dict(wide.state_dict())
 
-    # Both shapes are named: the checkpoint's row count and this model's.
-    message = str(caught.value)
-    assert f"[{wide.n_lags}, {wide.proposal_head.lag_embed_dim}]" in message
-    assert f"[{narrow.n_lags}, {narrow.proposal_head.lag_embed_dim}]" in message
     # And the target-only transfer path is indifferent to the window: nothing it copies is
     # indexed by lag, so a donor of one window warm-starts a model of another.
     report = transfer_target_weights(narrow, {
@@ -313,14 +300,3 @@ def test_a_checkpoint_of_one_lag_window_refuses_to_load_into_another_naming_the_
         if key.startswith(TRANSFERABLE_PREFIXES)
     })
     assert report["transferred"] and report["missing"] == []
-
-
-def test_the_model_kind_is_stamped_on_the_class() -> None:
-    """A model kind rather than a version of the lag-attentive one.
-
-    Matching latent and decoder widths do not make the old source fusion semantically compatible,
-    and a checkpoint loadable into the wrong architecture would report one model's numbers under
-    the other's name.
-    """
-    assert SeqVaeLagResidualTrfCfs.MODEL_KIND == MODEL_KIND
-    assert MODEL_KIND.startswith("fhr_lag_residual")

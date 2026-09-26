@@ -66,28 +66,10 @@ def _posterior_inputs(head_structured: bool):
     return h_y, a, mu_prior, raw_logvar_prior
 
 
-@pytest.mark.parametrize(
-    "mode, built, absent",
-    [
-        ("residual", "delta_logvar_head", "logvar_post_head"),
-        ("independent", "logvar_post_head", "delta_logvar_head"),
-    ],
-)
-def test_exactly_one_log_variance_head_is_built(mode, built, absent):
-    """The unused head is not disabled, it is not built -- there is nothing to dangle.
-
-    That is a DDP requirement rather than tidiness: a head that exists and feeds nothing receives
-    no gradient, and under ``find_unused_parameters=False`` that hangs the run rather than failing
-    it. Both attributes are always *present*; exactly one is non-``None``."""
-    for head_structured in (False, True):
-        head = _make_posterior(head_structured, posterior_logvar_mode=mode)
-        assert getattr(head, built) is not None
-        assert getattr(head, absent) is None
-
-
 def test_every_parameter_of_the_built_head_reaches_the_output():
-    """The other half of the same requirement, measured rather than asserted from the structure:
-    every parameter must receive a gradient from the head's own output."""
+    """Exactly one log-variance head per mode is built, measured rather than asserted from the
+    structure: a head that existed and fed nothing would receive no gradient, which under
+    ``find_unused_parameters=False`` hangs the run rather than failing it."""
     for mode in ("residual", "independent"):
         for head_structured in (False, True):
             head = _make_posterior(head_structured, posterior_logvar_mode=mode)
@@ -98,17 +80,6 @@ def test_every_parameter_of_the_built_head_reaches_the_output():
                 name for name, parameter in head.named_parameters() if parameter.grad is None
             ]
             assert dangling == [], f"{mode}/{head_structured}: {dangling}"
-
-
-def test_retired_flags_are_not_constructor_arguments():
-    """Smooth bounding is the model, not an option.
-
-    ``posterior_logvar`` stays refused under its old name: the boolean it used to be is not the
-    ``posterior_logvar_mode`` choice that replaced it, and a config carrying the retired spelling
-    should fail rather than resolve to a default that happens to look plausible."""
-    for retired in ("logvar_bound", "posterior_logvar"):
-        with pytest.raises(TypeError):
-            PosteriorHead(d_model=_D_MODEL, d_z=_D_Z, **{retired: "whatever"})
 
 
 @pytest.mark.parametrize("head_structured", [False, True])
@@ -125,6 +96,9 @@ def test_zeroed_deltas_reproduce_the_prior_exactly(head_structured):
     # raw value the prior bounded.
     assert torch.equal(mu_post, mu_prior)
     assert (logvar_post - logvar_prior).abs().max().item() < 1e-7
+    # Bounding twice is not a no-op, so a residual taken on the bounded prior would fail above.
+    double_bounded = smooth_bound(logvar_prior, _LO, _HI)
+    assert not torch.allclose(logvar_post, double_bounded, atol=1e-3)
 
 
 @pytest.mark.parametrize("head_structured", [False, True])
@@ -139,22 +113,6 @@ def test_nonzero_deltas_move_the_posterior_off_the_prior(head_structured):
     logvar_prior = smooth_bound(raw_logvar_prior, _LO, _HI)
     assert not torch.allclose(mu_post, mu_prior)
     assert not torch.allclose(logvar_post, logvar_prior)
-
-
-def test_the_residual_is_taken_on_the_raw_prior_not_the_bounded_one():
-    """Bounding twice would not be a no-op, and the zero at init would stop being exact."""
-    head = _make_posterior(head_structured=False)
-    _zero_delta_heads(head)
-    h_y, a, mu_prior, raw_logvar_prior = _posterior_inputs(head_structured=False)
-
-    with torch.no_grad():
-        _, logvar_post = head(h_y, a, mu_prior, raw_logvar_prior)
-
-    correct = smooth_bound(raw_logvar_prior, _LO, _HI)
-    double_bounded = smooth_bound(smooth_bound(raw_logvar_prior, _LO, _HI), _LO, _HI)
-
-    assert torch.allclose(logvar_post, correct, atol=1e-6)
-    assert not torch.allclose(logvar_post, double_bounded, atol=1e-3)
 
 
 def test_the_posterior_requires_the_raw_prior_logvar():

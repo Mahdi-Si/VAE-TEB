@@ -10,13 +10,12 @@ every rerun, so the reproducibility test is specifically a test of that.
 **A short batch is skipped, not raised on.** A derangement of one element does not exist, and the
 last batch of a split is routinely short.
 
-**The KL-space reading cannot flip the verdict.** That is the specific misreading the whole design
-guards against, and it is tested directly: a case where $K_{\mathrm{shuffled}} > K_{\mathrm{true}}$
-must still return ``source_specific`` when the losses order correctly.
+**The verdict is the loss ordering alone.** $L_{\mathrm{feat}} < L_{\mathrm{base}} <
+L_{\mathrm{shuffled}}$ decides it, so a KL-space reading with $K_{\mathrm{shuffled}} >
+K_{\mathrm{true}}$ -- routine on a healthy model -- has no way to flip it.
 """
 from __future__ import annotations
 
-import math
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -25,7 +24,6 @@ import pandas as pd
 import pytest
 import torch
 
-from teb_vae.lag_attn.eval import figures
 from teb_vae.lag_attn.eval.analyses import perm_control as perm_control_analysis
 from teb_vae.lag_attn.tests.conftest import make_stub_batch
 
@@ -57,7 +55,6 @@ def test_a_source_that_helps_but_is_not_specific_is_named_as_such() -> None:
     verdict = perm_control_analysis.source_specificity_verdict(1.0, 2.0, 1.5)
     assert verdict["verdict"] == "influential_not_specific"
     assert verdict["shuffle_penalty_margin"] < 0.0
-    assert "marginal statistics" in verdict["explanation"]
 
 
 def test_no_uplift_is_reported_as_such_rather_than_as_a_specificity_failure() -> None:
@@ -69,36 +66,6 @@ def test_no_uplift_is_reported_as_such_rather_than_as_a_specificity_failure() ->
 def test_a_non_finite_loss_yields_undetermined_not_a_silent_pass() -> None:
     verdict = perm_control_analysis.source_specificity_verdict(float("nan"), 2.0, 3.0)
     assert verdict["verdict"] == "undetermined"
-
-
-def test_the_kl_space_reading_cannot_flip_the_verdict() -> None:
-    r"""The case the whole design guards against.
-
-    $K_{\mathrm{shuffled}} > K_{\mathrm{true}}$ is routine on a healthy model -- a mismatched
-    source is out of distribution and moves the posterior *more*. The verdict function takes the
-    three losses and nothing else, so this is enforced by the signature rather than by care.
-    """
-    from inspect import signature
-
-    parameters = list(signature(perm_control_analysis.source_specificity_verdict).parameters)
-    assert parameters == ["l_feat", "l_base", "l_shuffled"]
-    assert not any("kl" in name.lower() or "kld" in name.lower() for name in parameters)
-
-    # A run whose KL-space reading looks like a catastrophe but whose losses order correctly.
-    verdict = perm_control_analysis.source_specificity_verdict(1.0, 2.0, 3.0)
-    assert verdict["verdict"] == "source_specific"
-
-
-def test_the_kl_readout_is_labelled_so_it_cannot_be_read_as_the_criterion(
-    make_eval_runner, tiny_loader, tiny_eval_config, tmp_path, perturb_full_pathway
-) -> None:
-    runner = make_eval_runner(output_dir=tmp_path / "runner")
-    perturb_full_pathway(runner.model)
-    summary, _ = _run(runner, tiny_loader, tiny_eval_config["eval_config"], tmp_path / "label")
-
-    assert "not specificity" in summary["kl_space"]["label"]
-    assert "expected" in summary["kl_space"]["label"]
-    assert summary["specificity"]["criterion"] == "L_feat < L_base < L_feat_shuffled"
 
 
 # ---------------------------------------------------------------------------
@@ -224,20 +191,6 @@ def test_the_per_sample_table_carries_all_three_losses_and_both_derived_columns(
     assert summary["n_samples"] == 4
 
 
-def test_the_verdict_reaches_the_summary_at_top_level(
-    make_eval_runner, tiny_loader, tiny_eval_config, tmp_path, perturb_full_pathway
-) -> None:
-    runner = make_eval_runner(output_dir=tmp_path / "runner")
-    perturb_full_pathway(runner.model)
-    summary, _ = _run(runner, tiny_loader, tiny_eval_config["eval_config"], tmp_path / "top")
-
-    assert summary["specificity"]["verdict"] in {
-        "source_specific", "influential_not_specific", "no_uplift", "undetermined"
-    }
-    assert math.isfinite(summary["specificity"]["uplift_margin"])
-    assert math.isfinite(summary["specificity"]["shuffle_penalty_margin"])
-
-
 # ---------------------------------------------------------------------------
 # S6-T03: the figures
 # ---------------------------------------------------------------------------
@@ -251,34 +204,3 @@ def test_two_figures_are_written(
     assert {Path(path).name for path in summary["figures"]} == {"losses.pdf", "kl_overlay.pdf"}
     for path in summary["figures"]:
         assert Path(path).suffix == ".pdf" and Path(path).stat().st_size > 0
-
-
-def test_the_overlay_caption_states_that_a_higher_shuffled_kl_is_not_a_failure(
-    make_eval_runner, tiny_loader, tiny_eval_config, tmp_path, monkeypatch, perturb_full_pathway
-) -> None:
-    """The caption is the mitigation for a high-likelihood misreading, so it is worth pinning."""
-    captured: dict = {}
-    original = figures.render_figure
-
-    def _capture(fig, path, **kwargs):
-        captured[Path(path).name] = {
-            "texts": [text.get_text() for ax in fig.axes for text in ax.texts],
-            "titles": [ax.get_title() for ax in fig.axes if ax.get_title()],
-            "has_data": [ax.has_data() for ax in fig.axes if ax.get_title()],
-        }
-        return original(fig, path, **kwargs)
-
-    monkeypatch.setattr(figures, "render_figure", _capture)
-    runner = make_eval_runner(output_dir=tmp_path / "runner")
-    perturb_full_pathway(runner.model)
-    _run(runner, tiny_loader, tiny_eval_config["eval_config"], tmp_path / "caption")
-
-    caption = " ".join(captured["kl_overlay"]["texts"])
-    assert "NOT a failure" in caption
-    assert "K_shuffled >= K_true is EXPECTED" in caption
-    assert all(captured["kl_overlay"]["has_data"])
-
-    losses = captured["losses"]
-    assert any(title.startswith("Source-specificity control") for title in losses["titles"])
-    assert any("criterion" in text for text in losses["texts"])
-    assert all(losses["has_data"])

@@ -68,33 +68,24 @@ def _forward(tiny_kwargs, inputs, blocks, perturb=None, *, train: bool = True):
     return model(*inputs)
 
 
-def test_the_kl_is_exactly_zero_at_init(tiny_kwargs, inputs, horizon_attention_blocks):
-    out = _forward(tiny_kwargs, inputs, horizon_attention_blocks)
+@pytest.mark.parametrize("train", [True, False], ids=["train", "eval"])
+def test_the_source_says_exactly_nothing_at_init(
+    tiny_kwargs, inputs, horizon_attention_blocks, train
+):
+    """KL zero by the closed form and by every model readout, $q = p$, $z^p = z^q$, and base and
+    full forecasts bitwise identical. Train mode is the one decoder dropout would break -- one
+    module, two invocations, two independent masks -- and under the attention-on parametrisation
+    it is also the proof that the horizon attention draws no mask of its own. ``eval()`` is the
+    mode the diagnostic figure and the permutation control run in, so it is asserted too rather
+    than inferred."""
+    out = _forward(tiny_kwargs, inputs, horizon_attention_blocks, train=train)
+
     assert float(_closed_form_kl(out).abs().max()) == 0.0
-    # The model's own readouts agree: per-step KL and its lag attribution are exactly zero.
-    assert float(out["kld_per_t"].abs().max()) == 0.0
-    assert float(out["source_kl_lag_map"].abs().max()) == 0.0
-    assert float(out["kld_per_t_per_head"].abs().max()) == 0.0
-
-
-def test_the_posterior_equals_the_prior_at_init(tiny_kwargs, inputs, horizon_attention_blocks):
-    out = _forward(tiny_kwargs, inputs, horizon_attention_blocks)
+    for key in ("kld_per_t", "source_kl_lag_map", "kld_per_t_per_head"):
+        assert float(out[key].abs().max()) == 0.0, key
     assert torch.equal(out["mu_post"], out["mu_prior"])
     assert torch.equal(out["logvar_post"], out["logvar_prior"])
-
-
-def test_the_latent_samples_are_identical_at_init(tiny_kwargs, inputs, horizon_attention_blocks):
-    out = _forward(tiny_kwargs, inputs, horizon_attention_blocks)
     assert torch.equal(out["z_prior"], out["z_post"])
-
-
-def test_base_and_full_forecasts_are_bitwise_identical_in_train_mode(
-    tiny_kwargs, inputs, horizon_attention_blocks
-):
-    """The identity that decoder dropout would break: one module, two invocations, two independent
-    masks. Zero dropout in the decoder is what makes this exact -- and under the attention-on
-    parametrisation it is also the proof that the horizon attention draws no mask of its own."""
-    out = _forward(tiny_kwargs, inputs, horizon_attention_blocks)
     assert torch.equal(out["mu_base"], out["mu_full"])
     assert torch.equal(out["logvar_base"], out["logvar_full"])
 
@@ -118,17 +109,6 @@ def test_the_encoder_dropout_is_actually_active_in_train_mode(
     second = model(*inputs)["target_state"]
 
     assert not torch.equal(first, second), "dropout is not active; the train-mode claims are empty"
-
-
-def test_the_same_identities_hold_under_eval(tiny_kwargs, inputs, horizon_attention_blocks):
-    """``eval()`` is the mode the diagnostic figure and the permutation control run in, so the
-    identities are asserted there too rather than inferred from the train-mode ones."""
-    out = _forward(tiny_kwargs, inputs, horizon_attention_blocks, train=False)
-
-    assert float(out["kld_per_t"].abs().max()) == 0.0
-    assert torch.equal(out["z_prior"], out["z_post"])
-    assert torch.equal(out["mu_base"], out["mu_full"])
-    assert torch.equal(out["logvar_base"], out["logvar_full"])
 
 
 def test_everything_above_becomes_false_once_perturbed(

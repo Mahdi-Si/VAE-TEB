@@ -8,10 +8,10 @@ placement and a labour; the "shuffled" forecast built from one is not the out-of
 control the ordering $D_{\mathrm{full}} < D_{\mathrm{base}} < D_{\mathrm{shuffled}}$ is read
 against, and the contrast is weakened by an amount nothing reports.
 
-So the draw takes the recording identifiers, and three things are checked here: that the pairing
-really does cross recordings, that a batch too concentrated to admit any such pairing is
-excluded *and counted* rather than quietly downgraded, and that the ungrouped draw is unchanged
-for every caller that does not pass groups.
+So the draw takes the recording identifiers, and two things are checked here: that the pairing
+really does cross recordings, and that a batch too concentrated to admit any such pairing is
+excluded *and counted* rather than quietly downgraded. The ungrouped draw is the base package's,
+and is tested there.
 """
 from __future__ import annotations
 
@@ -94,16 +94,6 @@ def test_a_grouped_derangement_is_reproducible_and_not_constant():
 
     assert torch.equal(first, again)
     assert len(seen) > 1
-
-
-def test_the_ungrouped_draw_is_untouched():
-    """Every caller that passes no groups -- the model's own training-time control among them --
-    must get the same permutation it got before, bit for bit."""
-    first = controls.make_derangement(16, generator=torch.Generator().manual_seed(7))
-    second = controls.make_derangement(16, generator=torch.Generator().manual_seed(7))
-
-    assert torch.equal(first, second)
-    assert not bool((first == torch.arange(16)).any())
 
 
 @pytest.mark.parametrize(

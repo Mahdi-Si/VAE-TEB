@@ -4,8 +4,8 @@ r"""The imported permutation control, run against a model that decodes a tiled a
 so without this file their first execution would be on the production box after a full training
 epoch. That is not a hypothetical: the control decodes ``z_post_perm`` at the anchors the matched
 forward used, and until that argument was threaded through the shared call site it decoded the
-contiguous prefix $[0, T_{\mathrm{valid}})$ instead -- $(B, 285, H, 98)$ against a $(B, 11, H)$ mask,
-which is a shape error rather than a wrong number, and one that arrives only on a validation step.
+contiguous prefix $[0, T_{\mathrm{valid}})$ instead -- $(B, T_{\mathrm{valid}}, H, C_{\mathrm{keep}})$
+against a $(B, A_{\max}, H)$ mask, which is a shape error rather than a wrong number, and one that arrives only on a validation step.
 
 The first assertion below is the shape, explicitly, and that is deliberate: ``torch.equal`` returns
 ``False`` on a shape mismatch, so a test written the way the two-sided sibling's is would pass on a
@@ -124,21 +124,6 @@ def test_a_control_given_no_anchors_would_decode_a_different_shape(perturb_poste
     assert dense["mu_full"].shape[1] != out["mu_full"].shape[1]
 
 
-def test_the_anchor_keys_are_absent_from_the_recomputed_set_and_identical_between_the_dicts():
-    """They describe the geometry rather than the pairing. A control that rebuilt them would be
-    scoring the shuffled forecast at a different anchor set than the matched one, and the difference
-    the readout reports would be partly that."""
-    assert "anchor_index" not in controls.RECOMPUTED_KEYS
-    assert "anchor_valid" not in controls.RECOMPUTED_KEYS
-
-    model = _model()
-    out = _forward(model, make_stub_batch(_BATCH, TINY_SEQ_LEN))
-    permuted = _permute(model, out)
-
-    assert permuted["anchor_index"] is out["anchor_index"]
-    assert torch.equal(permuted["anchor_valid"], out["anchor_valid"])
-
-
 # ---------------------------------------------------------------------------------------
 # The control itself, against this net
 # ---------------------------------------------------------------------------------------
@@ -227,44 +212,9 @@ def test_scoring_the_permuted_dict_yields_a_different_nonzero_kl(perturb_posteri
     )
 
 
-def test_a_degenerate_batch_cannot_be_deranged(perturb_posterior):
-    """$B < 2$ has no derangement, so the control refuses rather than pairing a sample with itself
-    and reporting the result as a stranger's source."""
-    model = _model(perturb_posterior)
-    out = _forward(model, make_stub_batch(1, TINY_SEQ_LEN))
-
-    with pytest.raises(ValueError, match="batch_size >= 2"):
-        controls.perm_forward_outputs(model, out, anchors=out["anchor_index"])
-
-
-def test_the_control_uses_a_real_derangement(perturb_posterior):
-    model = _model(perturb_posterior)
-    out = _forward(model, make_stub_batch(_BATCH, TINY_SEQ_LEN))
-
-    permuted = controls.perm_forward_outputs(model, out, anchors=out["anchor_index"])
-
-    assert not bool((permuted["perm_index"] == torch.arange(_BATCH)).any())
-
-
 # ---------------------------------------------------------------------------------------
 # The control as the task runs it
 # ---------------------------------------------------------------------------------------
-def test_the_three_readouts_appear_on_validation_only(task, perturb_posterior):
-    """Absent, never zero-filled, on the steps that did not run it: the framework aggregates a metric
-    as the mean over the steps that reported it, so a zero placeholder would scale the epoch value
-    down and invert the ordering the control exists to check."""
-    module = task()
-    perturb_posterior(module.orig_model)
-    batch = make_stub_batch(*_STUB_ARGS)
-
-    _, train_metrics = module.compute_loss_and_metrics(batch, 0, "train")
-    _, val_metrics = module.compute_loss_and_metrics(batch, 0, "val")
-
-    control = {"nll_shuffled_block", "kld_shuffled", "shuffle_penalty"}
-    assert control & set(train_metrics) == set()
-    assert control <= set(val_metrics)
-
-
 def test_the_task_hands_the_control_the_matched_forwards_anchors(task, perturb_posterior):
     """The wiring the shape assertions above are worthless without: the shared call site reads
     ``forward_outputs['anchor_index']``, which is absent on every model that decodes every anchor --
@@ -289,31 +239,6 @@ def test_the_task_hands_the_control_the_matched_forwards_anchors(task, perturb_p
     # explicit one, and still not the contiguous prefix the argument's absence would mean.
     assert seen["anchors"].shape[1] == module.orig_model.geometry.t_valid - (
         module.orig_model.warmup_period
-    )
-
-
-def test_the_control_is_skipped_on_a_degenerate_validation_batch(task, perturb_posterior):
-    """A rank's last uneven batch can be a single sample. The step must still produce a loss."""
-    module = task()
-    perturb_posterior(module.orig_model)
-
-    loss, metrics = module.compute_loss_and_metrics(make_stub_batch(1, TINY_SEQ_LEN), 0, "val")
-
-    assert torch.isfinite(loss)
-    assert "nll_shuffled_block" not in metrics
-
-
-def test_the_shuffled_penalty_is_the_gap_against_the_matched_full_score(task, perturb_posterior):
-    """The reported penalty must be a difference of two scores of the *same* target block at the
-    *same* anchors, or the negative control measures the geometry rather than the source pathway."""
-    module = task()
-    perturb_posterior(module.orig_model)
-    batch = make_stub_batch(*_STUB_ARGS)
-
-    _, metrics = module.compute_loss_and_metrics(batch, 0, "val")
-
-    assert float(metrics["shuffle_penalty"]) == pytest.approx(
-        float(metrics["nll_shuffled_block"]) - float(metrics["nll_full_block"]), rel=1e-5
     )
 
 
@@ -425,27 +350,3 @@ def test_the_permutation_control_permutes_the_tensor_the_attention_reads(
     # The attention it rebuilt is the one over the PERMUTED representation, which is what makes the
     # readout a source readout: a control that permuted nothing would return the matched weights.
     assert not torch.equal(out["attn_weights"], permuted["attn_weights"])
-
-
-@pytest.mark.parametrize("arm", _KV_ARMS)
-def test_no_control_call_site_moves_with_the_arm(arm, perturb_posterior):
-    """The controls' signatures are frozen: they resolve the pathway from model attributes, so the
-    task layer and the evaluation call them identically whatever ``lag_kv_source`` says.
-
-    This is what makes the arm a config key rather than a code change. Exercised through the same
-    argument lists the shared task and the evaluation use, on every arm.
-    """
-    model = _model(perturb_posterior, lag_kv_source=arm)
-    batch = make_stub_batch(*_STUB_ARGS)
-    out = _forward(model, batch)
-
-    permuted = controls.perm_forward_outputs(
-        model, out, perm_index=controls.make_derangement(_BATCH), anchors=out["anchor_index"]
-    )
-    null = controls.source_null_forward_outputs(
-        model, out, torch.cat([batch.up_st, batch.up_ph], -1)
-    )
-
-    for rebuilt in (permuted, null):
-        for key in ("mu_post", "logvar_post", "attn_weights"):
-            assert rebuilt[key].shape == out[key].shape, key

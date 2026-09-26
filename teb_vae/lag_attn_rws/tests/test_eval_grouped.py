@@ -1,18 +1,16 @@
-r"""By-class and by-subgroup variants, written beside the pooled output and never in place of it.
+r"""By-class and by-subgroup variants, fanned out by the runner beside the pooled output.
 
-The degenerate cases are the ones the implementation is written for -- a single-cohort split, a
-group column that is entirely unlabelled -- but they are *not* what this file leads with, because
-every one of them would pass with the emission unimplemented. So the happy path is asserted
-first, by composition and by hand-computed value: two groups of known size produce exactly
-$2 \times n_{\mathrm{metrics}}$ rows, a group holding two NaNs among five values reports $n = 3$
-rather than a mean over a population that looks healthy, the figure carries exactly two violin
-bodies, and each median is the number a reader would compute by hand.
+The summary arithmetic and the skip rules are the shared emitter's and are tested by its owner;
+this package's cohort order and palette are pinned in ``test_eval_cohort_presentation.py``. What
+is checked here is what this package adds on top:
 
-Then the two skips. A single-group frame is a *recorded* skip rather than a one-violin figure:
-one violin invites a comparison there is nothing to compare against, and on the healthy-only
-pretraining split that is the ordinary case rather than an error. And in both cases the pooled
-output the analysis already wrote is untouched, so a run over a single-cohort split produces
-exactly what it produced before grouped variants existed.
+* **the quartiles** of the long-form summary, against hand-computed values;
+* **the fan-out is the runner's**: an analysis only *declares* a per-sample frame, and the
+  runner emits both cuts beside it, records a single-cohort population as a skip, invents nothing
+  for an analysis that declared nothing, survives an unreadable declaration, and records every
+  path relative to the run directory;
+* **on a real run**, every participating analysis declares its frame and both cuts are emitted
+  with per-recording counts.
 """
 from __future__ import annotations
 
@@ -21,11 +19,9 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import pytest
-from matplotlib.collections import PolyCollection
 
-from teb_vae.lag_attn.eval import figures as shared_figures
 from teb_vae.lag_attn_rws.eval._reuse import labels
-from teb_vae.lag_attn_rws.eval.report_seam import emit_grouped_variants, summarise_by_group
+from teb_vae.lag_attn_rws.eval.report_seam import summarise_by_group
 
 #: The metrics a grouped variant is asked for here. Two, so a row count of ``2 x n_metrics``
 #: cannot coincide with a row count of ``2 x n_groups``.
@@ -50,28 +46,8 @@ def two_class_frame() -> pd.DataFrame:
 
 
 # =============================================================================
-# The happy path
+# The summary quartiles
 # =============================================================================
-def test_the_summary_has_one_row_per_group_and_metric(two_class_frame) -> None:
-    summary = summarise_by_group(two_class_frame, labels.CLASS_COLUMN, _METRICS)
-
-    assert len(summary) == 2 * len(_METRICS)
-    assert set(summary["group"]) == {"healthy", "acidosis"}
-    assert set(summary["metric"]) == set(_METRICS)
-    assert list(summary.columns) == ["group", "metric", "n", "mean", "q25", "median", "q75"]
-
-
-def test_n_counts_finite_values_only(two_class_frame) -> None:
-    """A group of NaNs must report ``n = 0``, not a mean of NaN over a healthy-looking count."""
-    summary = summarise_by_group(two_class_frame, labels.CLASS_COLUMN, _METRICS)
-    healthy_gap = summary[
-        (summary["group"] == "healthy") & (summary["metric"] == "pred_gap")
-    ].iloc[0]
-
-    assert int(healthy_gap["n"]) == 3
-    assert float(healthy_gap["mean"]) == pytest.approx(2.0)
-
-
 def test_each_quartile_matches_the_hand_computed_value(two_class_frame) -> None:
     summary = summarise_by_group(two_class_frame, labels.CLASS_COLUMN, _METRICS)
     acidosis_gap = summary[
@@ -84,100 +60,6 @@ def test_each_quartile_matches_the_hand_computed_value(two_class_frame) -> None:
     assert float(acidosis_gap["q75"]) == pytest.approx(40.0)
 
 
-def test_both_grouping_axes_emit_a_table_and_a_figure(two_class_frame, tmp_path) -> None:
-    emitted = emit_grouped_variants(two_class_frame, tmp_path, value_columns=_METRICS)
-
-    assert sorted(emitted) == sorted(labels.GROUP_COLUMNS)
-    for axis in labels.GROUP_COLUMNS:
-        record = emitted[axis]
-        assert record["skipped"] is False
-        table = tmp_path / f"per_sample_by_{axis}.csv"
-        figure = tmp_path / f"per_sample_by_{axis}.pdf"
-        assert table.is_file() and figure.is_file() and figure.stat().st_size > 0
-        assert len(pd.read_csv(table)) == 2 * len(_METRICS)
-        assert record["n_per_group"] == {group: 5 for group in record["groups"]}
-
-
-def test_the_figure_carries_one_violin_body_per_group(two_class_frame) -> None:
-    """Read off the in-memory figure rather than the PDF: what reaches the page is what an
-    operator compares, and a violin silently missing is exactly the failure a file-size check
-    would pass."""
-    groups = ["healthy", "acidosis"]
-    values = {
-        metric: {
-            group: np.asarray(
-                two_class_frame.loc[two_class_frame[labels.CLASS_COLUMN] == group, metric],
-                dtype=np.float64,
-            )
-            for group in groups
-        }
-        for metric in _METRICS
-    }
-
-    figure, axes = shared_figures.grouped_violin_figure(values, groups)
-    try:
-        per_row = [
-            len([a for a in axes[row, 0].collections if isinstance(a, PolyCollection)])
-            for row in range(len(_METRICS))
-        ]
-    finally:
-        shared_figures.plt.close(figure)
-
-    assert per_row == [2, 2]
-
-
-# =============================================================================
-# The recorded skips
-# =============================================================================
-def test_a_single_cohort_split_records_a_skip_and_writes_no_figure(tmp_path) -> None:
-    """The ordinary case on the healthy-only pretraining split, and not an error."""
-    frame = pd.DataFrame(
-        {
-            labels.CLASS_COLUMN: ["healthy"] * 4,
-            labels.SUBGROUP_COLUMN: ["healthy_no_bg_no_cs"] * 4,
-            "pred_gap": [1.0, 2.0, 3.0, 4.0],
-        }
-    )
-
-    emitted = emit_grouped_variants(frame, tmp_path, value_columns=["pred_gap"])
-
-    for axis in labels.GROUP_COLUMNS:
-        assert emitted[axis]["skipped"] is True
-        assert "nothing to compare" in emitted[axis]["reason"]
-    assert list(tmp_path.iterdir()) == []
-
-
-def test_an_unlabelled_group_column_records_a_skip_rather_than_raising(tmp_path) -> None:
-    """``None`` is not a cohort. Folding the unlabelled samples together would create one named
-    after the absence, and every by-class number would then include it."""
-    frame = pd.DataFrame(
-        {
-            labels.CLASS_COLUMN: [None, None, None],
-            labels.SUBGROUP_COLUMN: [None, None, None],
-            "pred_gap": [1.0, 2.0, 3.0],
-        }
-    )
-
-    emitted = emit_grouped_variants(frame, tmp_path, value_columns=["pred_gap"])
-
-    assert all(emitted[axis]["skipped"] is True for axis in labels.GROUP_COLUMNS)
-    assert list(tmp_path.iterdir()) == []
-
-
-def test_a_metric_absent_from_the_frame_is_skipped_rather_than_raising(
-    two_class_frame, tmp_path
-) -> None:
-    """An analysis may name a metric it only sometimes produces; a grouped variant is an addition
-    to a run and must not mark a successful analysis failed."""
-    emitted = emit_grouped_variants(
-        two_class_frame, tmp_path, value_columns=["pred_gap", "not_a_column"]
-    )
-
-    table = pd.read_csv(tmp_path / f"per_sample_by_{labels.CLASS_COLUMN}.csv")
-    assert emitted[labels.CLASS_COLUMN]["skipped"] is False
-    assert set(table["metric"]) == {"pred_gap"}
-
-
 # =============================================================================
 # The fan-out is the runner's, not the analysis's
 #
@@ -185,10 +67,6 @@ def test_a_metric_absent_from_the_frame_is_skipped_rather_than_raising(
 # reads it and emits both variants. Written per analysis instead, this would be a cross-cutting
 # change every analysis added later has to remember to make, and the one that forgets reports a
 # pooled number over a mixed cohort with nothing saying so.
-#
-# The companion assertion lives in ``test_eval_protocol.py``: no module under ``eval/analyses/``
-# so much as mentions the grouped emitter. Together the two say the fan-out happens *and* that no
-# analysis is the thing making it happen.
 # =============================================================================
 def _declaring_analysis(frame: pd.DataFrame, value_columns):
     """Build a fake analysis that writes ``frame`` and declares it for grouping."""

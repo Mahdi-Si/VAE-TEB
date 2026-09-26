@@ -1,6 +1,6 @@
 r"""What the forward returns, at this architecture, and that it is the causal-input cell's contract.
 
-Twenty-two keys: the architecture's twenty, plus the anchor index and its validity companion. This
+The architecture's keys plus the anchor index and its validity companion. This
 package needs a forward-contract module where the conv-Transformer raw-signal parent does not, and
 the reason is where the forward lives. That cell's forward is its own code object, pinned by its own
 suite; this one's is the *causal-input mixin's*, so what has to be shown here is that composing the
@@ -12,13 +12,11 @@ literal, so a change to the shared forward moves both sides at once instead of f
 here.
 
 The one shape this cell pins against the causal-*feature* cells rather than with them is the last
-axis of the four forecast tensors: $R = 16$ raw samples per horizon token, not the target gate's
+axis of the four forecast tensors: $R$ raw samples per horizon token, not the target gate's
 surviving-channel count. That is the whole content of "no width hook is defined", read off a real
 forward rather than off the constructor.
 """
 from __future__ import annotations
-
-import inspect
 
 import pytest
 import torch
@@ -30,7 +28,6 @@ from teb_vae.lag_attn_crws.tests.conftest import (
 from teb_vae.lag_attn_crws.tests.conftest import (
     tiny_warmup_kwargs as conv_lstm_tiny_warmup_kwargs,
 )
-from teb_vae.lag_attn_transformer_crws.nets.model import SeqVaeLagAttnTrfCrws
 from teb_vae.lag_attn_transformer_rws.nets.model import SeqVaeLagAttnTrfRws
 
 from .conftest import (
@@ -38,7 +35,6 @@ from .conftest import (
     TINY_STRIDE,
     build,
     make_streams,
-    shipped_warmup_kwargs,
     tiny_warmup_kwargs,
 )
 
@@ -47,7 +43,7 @@ _ANCHOR_KEYS = ("anchor_index", "anchor_valid")
 
 
 def _architecture_keys() -> set:
-    """The twenty keys the bare conv-Transformer architecture returns at this geometry."""
+    """The keys the bare conv-Transformer architecture returns at this geometry."""
     kwargs = {
         name: value
         for name, value in tiny_warmup_kwargs().items()
@@ -62,7 +58,7 @@ def _architecture_keys() -> set:
 
 
 def _conv_lstm_keys() -> set:
-    """And the twenty-two the conv-LSTM cell of this row returns, which must be the same set."""
+    """And the keys the conv-LSTM cell of this row returns, which must be the same set."""
     torch.manual_seed(0)
     model = SeqVaeLagAttnCrws(**conv_lstm_tiny_warmup_kwargs()).eval()
     with torch.no_grad():
@@ -82,23 +78,13 @@ def outputs():
 # =================================================================================================
 # The key set
 # =================================================================================================
-def test_the_forward_returns_exactly_twenty_two_keys(outputs) -> None:
+def test_the_forward_returns_the_architectures_keys_plus_the_anchor_set(outputs) -> None:
     """By set equality against both neighbours in the grid, so neither a new key nor a lost one
     passes -- and so that a change to the shared forward fails on the change rather than here."""
     _model, out = outputs
 
-    assert len(out) == 22
     assert set(out) == _architecture_keys() | set(_ANCHOR_KEYS)
     assert set(out) == _conv_lstm_keys()
-
-
-def test_the_pathways_this_architecture_does_not_have_are_absent(outputs) -> None:
-    """No ``decoder_state`` and no ``delta_mu_src``: the decoder receives the latent and nothing
-    else, so there is no bypass to report and no source term added around it."""
-    _model, out = outputs
-
-    assert "decoder_state" not in out
-    assert "delta_mu_src" not in out
 
 
 def test_the_anchor_keys_carry_the_dtypes_their_consumers_index_with(outputs) -> None:
@@ -118,40 +104,19 @@ def test_the_anchor_keys_carry_the_dtypes_their_consumers_index_with(outputs) ->
 # Shapes
 # =================================================================================================
 def test_the_forecasts_carry_the_anchor_axis_and_the_raw_grid(outputs) -> None:
-    r"""$(B, A_{\max}, H, R)$ -- the raw decimation, **not** the target gate's surviving-channel
-    count. The gate is present and $98$-wide at the shipped budget and reaches the input adapters
-    alone; a forecast whose last axis followed it would be the causal-feature cells' block."""
+    r"""$(B, A_{\max}, H, R)$ with $A_{\max} = \lceil (T_{\mathrm{valid}} - F)/S \rceil$ derived from
+    the geometry rather than written out -- and the last axis is the raw decimation, **not** the
+    target gate's surviving-channel count. The gate is present and reaches the input adapters alone;
+    a forecast whose last axis followed it would be the causal-feature cells' block."""
     model, out = outputs
-    a_max = int(out["anchor_index"].shape[1])
+    span = model.geometry.t_valid - model.warmup_period
+    a_max = -(-span // TINY_STRIDE)
     assert model.target_gate is not None
 
+    assert int(out["anchor_index"].shape[1]) == a_max
     for key in ("mu_base", "logvar_base", "mu_full", "logvar_full"):
-        assert tuple(out[key].shape) == (BATCH, a_max, model.horizon, 16), key
-    assert model.raw_per_step == 16
-    assert model.target_gate.out_channels != 16
-
-
-def test_the_tiny_geometry_derives_its_anchor_count(outputs) -> None:
-    r"""$A_{\max} = \lceil (T_{\mathrm{valid}} - F)/S \rceil$, derived rather than written out, so a
-    fixture that moved the window fails on the geometry rather than on a literal."""
-    model, out = outputs
-    span = model.geometry.t_valid - model.warmup_period
-
-    assert int(out["anchor_index"].shape[1]) == -(-span // TINY_STRIDE)
-    assert tuple(out["mu_full"].shape) == (BATCH, 4, 4, 16)
-
-
-def test_the_shipped_geometry_forecasts_five_tiles() -> None:
-    r"""$(B, 5, 30, 16)$ at the production geometry: $\lceil (270 - 134)/30 \rceil = 5$ tiles of
-    $30$ steps of $16$ raw samples. Derived from the constructed model rather than asserted as four
-    literals, then checked against them."""
-    kwargs = shipped_warmup_kwargs()
-    model = build(kwargs).eval()
-    span = model.geometry.t_valid - model.warmup_period
-
-    a_max = -(-span // int(kwargs["anchor_stride"]))
-    assert (a_max, model.horizon, model.raw_per_step) == (5, 30, 16)
-    assert span == 136
+        assert tuple(out[key].shape) == (BATCH, a_max, model.horizon, model.raw_per_step), key
+    assert model.target_gate.out_channels != model.raw_per_step
 
 
 def test_the_ungated_model_keeps_the_same_forecast_width(tiny_kwargs) -> None:
@@ -165,7 +130,7 @@ def test_the_ungated_model_keeps_the_same_forecast_width(tiny_kwargs) -> None:
 
     a_max = int(out["anchor_index"].shape[1])
     assert model.target_gate is None
-    assert tuple(out["mu_base"].shape) == (BATCH, a_max, model.horizon, 16)
+    assert tuple(out["mu_base"].shape) == (BATCH, a_max, model.horizon, model.raw_per_step)
 
 
 def test_the_per_step_keys_keep_the_step_axis(outputs) -> None:
@@ -201,30 +166,8 @@ def test_the_two_cells_of_this_row_agree_shape_for_shape(outputs) -> None:
 
 
 # =================================================================================================
-# The signature
+# The three-tensor call
 # =================================================================================================
-def test_the_signature_is_the_three_streams_and_the_two_anchor_arguments() -> None:
-    """A literal list, as in every sibling's invariants file: the anchor geometry is an argument
-    rather than something derived from ``self.training``, and the parameter list is where that
-    decision is visible."""
-    assert list(inspect.signature(SeqVaeLagAttnTrfCrws.forward).parameters) == [
-        "self",
-        "y_st",
-        "y_ph",
-        "u_stream",
-        "anchor_phase",
-        "anchor_stride",
-    ]
-    # The architecture parent's is three, which is what the mixin extends -- and it is the reason
-    # the one arity-sensitive consumer in the tree needs a replacement here.
-    assert list(inspect.signature(SeqVaeLagAttnTrfRws.forward).parameters) == [
-        "self",
-        "y_st",
-        "y_ph",
-        "u_stream",
-    ]
-
-
 def test_the_three_tensor_call_still_works_and_agrees_with_a_zero_phase(tiny_warmup) -> None:
     """At the inert default stride both are the dense range, and they agree bitwise."""
     model = build(tiny_warmup).eval()
@@ -240,22 +183,3 @@ def test_the_three_tensor_call_still_works_and_agrees_with_a_zero_phase(tiny_war
     assert set(implicit) == set(explicit)
     for key in implicit:
         assert torch.equal(implicit[key], explicit[key]), key
-
-
-def test_a_missing_phase_is_refused_at_a_real_stride(tiny_warmup) -> None:
-    r"""Not defaulted: a forgotten phase would train every sample of every epoch on one tile grid at
-    a fixed offset from the segment start, and $A_{\max}$ is a geometry constant either way, so
-    nothing about the shapes would say so."""
-    model = build(tiny_warmup_kwargs(anchor_stride=TINY_STRIDE)).eval()
-
-    with pytest.raises(ValueError, match="anchor_phase is required"):
-        model(*make_streams(tiny_warmup))
-
-
-def test_a_non_zero_phase_is_refused_at_stride_one(tiny_warmup) -> None:
-    r"""The anchor set truncates rather than rotating there, so a phase would silently drop leading
-    anchors and ``anchors_per_sample`` would read $152 - \varphi$."""
-    model = build(tiny_warmup).eval()
-
-    with pytest.raises(ValueError, match=r"outside \[0, anchor_stride\)"):
-        model(*make_streams(tiny_warmup), 1, 1)

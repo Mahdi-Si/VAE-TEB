@@ -23,36 +23,20 @@ def test_the_index_grid_has_the_documented_shape_and_bounds():
     assert int(idx.max()) == 4799        # anchor 269's last future sample
 
 
-def test_the_gather_returns_the_documented_shape():
-    fhr = torch.randn(3, 4800)
-    assert build_future_target(fhr, _PROD).shape == (3, 270, 30, 16)
-
-
-def test_anchor_zero_gathers_the_first_two_future_minutes():
+@pytest.mark.parametrize(
+    ("anchor", "start", "stop"),
+    [
+        (0, 16, 496),  # the first future window
+        (100, 1616, 2096),  # [16*101, 16*101 + 480)
+        (269, 4320, 4800),  # the last one, ending exactly at the raw end
+    ],
+    ids=["first", "middle", "last"],
+)
+def test_an_anchor_gathers_its_own_future_window(anchor, start, stop):
     fhr = torch.randn(2, 4800)
     target = build_future_target(fhr, _PROD)
-    assert torch.equal(target[:, 0].reshape(2, -1), fhr[:, 16:496])
-
-
-def test_the_last_anchor_gathers_the_final_two_minutes():
-    fhr = torch.randn(2, 4800)
-    target = build_future_target(fhr, _PROD)
-    assert torch.equal(target[:, 269].reshape(2, -1), fhr[:, 4320:4800])
-
-
-def test_a_middle_anchor_gathers_its_own_window():
-    fhr = torch.randn(2, 4800)
-    target = build_future_target(fhr, _PROD)
-    # Anchor 100: window [16*101, 16*101 + 480).
-    assert torch.equal(target[:, 100].reshape(2, -1), fhr[:, 1616:2096])
-
-
-def test_the_tiny_geometry_gathers_the_same_way():
-    fhr = torch.randn(2, 256)
-    target = build_future_target(fhr, _TINY)
-    assert target.shape == (2, 12, 4, 16)
-    assert torch.equal(target[:, 0].reshape(2, -1), fhr[:, 16:80])
-    assert torch.equal(target[:, 11].reshape(2, -1), fhr[:, 192:256])
+    assert target.shape == (2, 270, 30, 16)
+    assert torch.equal(target[:, anchor].reshape(2, -1), fhr[:, start:stop])
 
 
 def test_a_precomputed_index_grid_is_used_verbatim():

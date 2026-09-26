@@ -22,13 +22,9 @@ reported as evidence; $0.0$ would read as "no improvement", which is a measureme
 **The chain reduces *unrooted* quantities.** An RMS is the square root of a mean, and by Jensen the
 average of per-segment roots is biased **low** -- in the direction that flatters the model. So the
 squares travel through this module and the root is taken once, at the end, by whichever analysis
-reports it. Nothing here roots anything, and the test below is what says that difference is large
-enough to matter rather than a rounding argument.
+reports it; the analyses that root assert that in their own tests.
 
-Everything on the chain is in the loader's $z$ units. There is no bpm conversion anywhere in this
-package: the forecast target is 98 wavelet coefficients, and inverting the per-channel statistics
-would put them on scales spanning orders of magnitude, which destroys every pooled statistic
-computed here.
+Everything on the chain is in the loader's $z$ units.
 """
 from __future__ import annotations
 
@@ -168,30 +164,6 @@ def test_a_column_the_pass_did_not_produce_reads_as_unmeasured_rather_than_raisi
     assert np.isnan(missing).all()
     assert frames.describe(missing)["n"] == 0
     assert np.isnan(frames.describe(missing)["mean"])
-
-
-# =================================================================================================
-# The unrooted reduction, and the Jensen gap it keeps measurable
-# =================================================================================================
-def test_rooting_after_the_reduction_and_rooting_before_it_are_different_numbers() -> None:
-    r"""Why this module never roots anything.
-
-    Two segments of one recording with mean squares $1$ and $9$. Rooted **once**, after the
-    reduction, the RMS is $\sqrt{5} \approx 2.236$; averaging the per-segment roots gives $2$, a
-    $10.6\%$ under-report. Both numbers are legitimate quantities and only one of them is an RMS,
-    so the chain carries the squares and the analysis that reports an RMS roots at the end of it.
-    """
-    frame = pd.DataFrame({"guid": ["A", "A"], "sq_error_full": [1.0, 9.0]})
-
-    reduced = frames.per_recording_means(frame, ["sq_error_full"])
-    rooted_once = float(np.sqrt(reduced.loc["A", "sq_error_full"]))
-    average_of_roots = float(np.sqrt(frame["sq_error_full"]).mean())
-
-    assert reduced.loc["A", "sq_error_full"] == pytest.approx(5.0)
-    assert rooted_once == pytest.approx(np.sqrt(5.0))
-    assert average_of_roots == pytest.approx(2.0)
-    # Jensen's direction, which is the one that matters: the biased estimator flatters the model.
-    assert average_of_roots < rooted_once
 
 
 # =================================================================================================
