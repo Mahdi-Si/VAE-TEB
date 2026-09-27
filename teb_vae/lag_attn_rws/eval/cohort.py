@@ -41,11 +41,12 @@ travels in the record rather than in a document beside it.
 from __future__ import annotations
 
 import os
-from typing import Any, Dict, List, NamedTuple, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, NamedTuple, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
 
+from teb_vae.lag_attn_rws.eval import frames
 from teb_vae.lag_attn_rws.eval._reuse import labels
 
 #: Width of a time-before-delivery window, in hours. See the module docstring for why this is a
@@ -206,6 +207,32 @@ def within_horizon(frame: pd.DataFrame, max_hours: Optional[float]) -> pd.DataFr
     return frame[~(hours > float(max_hours))]
 
 
+def within_horizon_index(
+    index_map: Mapping[Tuple[str, Optional[int]], int], max_hours: Optional[float]
+) -> Dict[Tuple[str, Optional[int]], int]:
+    """Restrict a dataset listing to the segments recorded within ``max_hours`` of delivery.
+
+    The same bound as :func:`within_horizon`, on the ``{(guid, rounded epoch): index}`` listing
+    the recording traces re-read segments from rather than on a per-sample table -- so a bounded
+    run traces, counts and ranks recordings over the same population its clocks are read over.
+    A listing entry with no epoch is kept, as :func:`within_horizon` keeps a non-finite one.
+
+    Args:
+        index_map: From ``dataset_index_map``.
+        max_hours: The horizon in hours before delivery, inclusive, or ``None`` for no bound.
+
+    Returns:
+        A filtered copy, or an unfiltered copy when ``max_hours`` is ``None``.
+    """
+    if max_hours is None:
+        return dict(index_map)
+    limit = -float(max_hours) * SECONDS_PER_HOUR
+    return {
+        (guid, stamp): index for (guid, stamp), index in index_map.items()
+        if stamp is None or float(stamp) >= limit
+    }
+
+
 def add_time_bins(
     frame: pd.DataFrame, *, width: float = TRAJECTORY_BIN_HOURS
 ) -> pd.DataFrame:
@@ -331,24 +358,30 @@ def per_recording_in_bins(
         center_column: The window centre travelling with it.
 
     Returns:
-        One row per ``(group, window, guid)`` with the reduced columns and the window's centre.
-        Empty with the key columns present when nothing is usable.
+        One row per ``(group, window, guid)`` with the window's centre, the recording's cohort
+        labels on every axis the frame carries (so a row read on one axis still says where the
+        recording sits on the other), ``n_segments`` -- how many segments the window's value
+        averages -- and the reduced columns. Empty with those columns present when nothing is
+        usable.
     """
     present = [name for name in columns if name in getattr(frame, "columns", [])]
+    identity = [name for name in labels.GROUP_COLUMNS if name in getattr(frame, "columns", [])]
     keys = ["group", bin_column, center_column, "guid"]
+    schema = keys + identity + ["n_segments"] + present
     if frame.empty or not present or group_column not in frame.columns or "guid" not in frame:
-        return pd.DataFrame(columns=keys + present)
+        return pd.DataFrame(columns=schema)
 
     labelled = frame[frame[group_column].notna()].copy()
     if labelled.empty:
-        return pd.DataFrame(columns=keys + present)
+        return pd.DataFrame(columns=schema)
     labelled["group"] = labelled[group_column].astype(str)
-    reduced = (
-        labelled.groupby(["group", bin_column, center_column, "guid"], sort=True)[present]
-        .mean()
-        .reset_index()
-    )
-    return reduced
+    grouped = labelled.groupby(keys, sort=True)
+    reduced = grouped[present].mean()
+    reduced["n_segments"] = grouped.size()
+    reduced = reduced.reset_index()
+    if identity:
+        reduced = reduced.join(frames.per_recording_labels(labelled)[identity], on="guid")
+    return reduced.reindex(columns=schema)
 
 
 def trajectory_rows(
@@ -371,10 +404,12 @@ def trajectory_rows(
             they are on both, and renaming them per clock would fork every consumer of this table.
 
     Returns:
-        One row per non-empty cell: the cohort, the window and its centre, the count of
-        **recordings** behind it, the cohort's distinct-recording total across every window, the
-        mean and the quartiles. Quartiles rather than a standard deviation because these
-        distributions are skewed, matching the grouped-variant convention.
+        One row per non-empty cell: the cohort, the window with its centre and its edges
+        ``[bin_lo_h, bin_hi_h)``, the count of **recordings** behind it, the segments those
+        recordings averaged (``None`` on a frame that does not carry the count), the cohort's
+        distinct-recording total across every window, the mean and the quartiles. Quartiles
+        rather than a standard deviation because these distributions are skewed, matching the
+        grouped-variant convention.
     """
     rows: List[Dict[str, Any]] = []
     if per_recording.empty or column not in per_recording.columns:
@@ -391,17 +426,27 @@ def trajectory_rows(
         ["group", bin_column, center_column], sort=True
     ):
         values = np.asarray(cell[column], dtype=np.float64)
-        values = values[np.isfinite(values)]
+        usable = np.isfinite(values)
+        values = values[usable]
         if values.size == 0:
             continue
+        # Both binners place a centre at $(i + 1/2)\,w$, so the half-width is recoverable from the
+        # two columns every cell carries, whatever width the caller binned at.
+        half_width = float(centre) / (2.0 * int(bin_index) + 1.0)
         rows.append(
             {
                 "metric": metric,
                 "group": str(group),
                 "time_bin": int(bin_index),
                 "bin_center_h": float(centre),
+                "bin_lo_h": float(centre) - half_width,
+                "bin_hi_h": float(centre) + half_width,
                 # Recordings, not segments: the unit every statistic on this table is computed on.
                 "n_recordings": int(values.size),
+                "n_segments": (
+                    int(np.asarray(cell["n_segments"])[usable].sum())
+                    if "n_segments" in cell.columns else None
+                ),
                 "n_recordings_total": int(totals.get(str(group), 0)),
                 "mean": float(values.mean()),
                 "q25": float(np.percentile(values, 25)),
@@ -533,8 +578,9 @@ def second_stage_eligibility(frame: pd.DataFrame) -> pd.DataFrame:
     excluding a recording changes the population every number is computed over and a count does
     not:
 
-    * ``onset_at_delivery`` -- the implied onset falls at delivery itself, which is what a
-      pipeline writes when it substitutes zero for a missing time. The sibling classifier
+    * ``onset_at_delivery`` -- the implied onset falls at delivery itself, within
+      :data:`ONSET_CONSISTENCY_TOLERANCE_S` on every segment, which is what a pipeline writes when
+      it substitutes zero for a missing time. The sibling classifier
       pipeline was burned by exactly this: such recordings pass a NaN filter and then place a
       whole labour at twelve hours before a second stage that never happened.
     * ``inconsistent_onset`` -- the implied onset moves across a recording's own segments by more
@@ -549,12 +595,14 @@ def second_stage_eligibility(frame: pd.DataFrame) -> pd.DataFrame:
         frame: A per-sample table carrying ``guid``, ``epoch`` and :data:`SECOND_STAGE_COLUMN`.
 
     Returns:
-        One row per recording: how many segments it contributed, how many carried a finite offset,
-        the implied onset and its spread, whether it is eligible, and the reason when it is not.
-        Empty with those columns present when the table carries none of what it needs.
+        One row per recording: its cohort labels on every axis the table carries, how many
+        segments it contributed, how many carried a finite offset, the implied onset and its
+        spread, whether it is eligible, and the reason when it is not. Empty with those columns
+        present when the table carries none of what it needs.
     """
+    identity = [name for name in labels.GROUP_COLUMNS if name in getattr(frame, "columns", [])]
     columns = [
-        "guid", "n_segments", "n_finite", "implied_onset_epoch_s", "onset_spread_s",
+        "guid", *identity, "n_segments", "n_finite", "implied_onset_epoch_s", "onset_spread_s",
         "eligible", "reason", "onset_at_delivery", "inconsistent_onset",
     ]
     if (
@@ -564,6 +612,9 @@ def second_stage_eligibility(frame: pd.DataFrame) -> pd.DataFrame:
     ):
         return pd.DataFrame(columns=columns)
 
+    cohorts = frames.per_recording_labels(frame) if identity else pd.DataFrame()
+    # Keyed as the loop below keys its recordings, so a numeric ``guid`` still finds its labels.
+    cohorts.index = cohorts.index.astype(str)
     rows: List[Dict[str, Any]] = []
     for guid, cell in frame.groupby(frame["guid"].astype(str), sort=True):
         offsets = np.asarray(cell[SECOND_STAGE_COLUMN], dtype=np.float64)
@@ -581,14 +632,18 @@ def second_stage_eligibility(frame: pd.DataFrame) -> pd.DataFrame:
         rows.append(
             {
                 "guid": str(guid),
+                **{name: cohorts[name].get(guid) for name in identity},
                 "n_segments": int(offsets.size),
                 "n_finite": int(finite.size),
                 "implied_onset_epoch_s": onset,
                 "onset_spread_s": spread,
                 "eligible": eligible,
                 "reason": "" if eligible else "no second-stage onset recorded",
-                # Counted, never filtered -- see the docstring.
-                "onset_at_delivery": bool(implied.size and np.all(implied == 0.0)),
+                # Counted, never filtered -- see the docstring. Within the tolerance rather than
+                # exactly zero: both operands are stored ``float32``, see the tolerance's note.
+                "onset_at_delivery": bool(
+                    implied.size and np.all(np.abs(implied) <= ONSET_CONSISTENCY_TOLERANCE_S)
+                ),
                 "inconsistent_onset": bool(
                     np.isfinite(spread) and spread > ONSET_CONSISTENCY_TOLERANCE_S
                 ),
@@ -729,6 +784,7 @@ __all__ = [
     "add_second_stage_bins",
     "add_time_bins",
     "within_horizon",
+    "within_horizon_index",
     "build_cohort_block",
     "cohort_counts",
     "labor_onset_readout",

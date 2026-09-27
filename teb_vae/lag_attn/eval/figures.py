@@ -76,7 +76,9 @@ __all__ = [
     "COLOR_PURPLE",
     "COLOR_VERMILLION",
     "DEFAULT_FIGURE_FORMAT",
+    "EVAL_SAVE_DPI",
     "FIGURE_WIDTH",
+    "LINE_PALETTE",
     "SAVE_DPI",
     "STYLE_REFINEMENT",
     "SUPPORTED_FIGURE_FORMATS",
@@ -126,6 +128,12 @@ COLOR_GRAY = "#4D4D4D"
 COLOR_BLACK = "#000000"
 #: Grid, frames behind data, and the reference diagonal: the lightest mark on the page.
 COLOR_LIGHT_GRAY = "#D9D9D9"
+
+#: The order :func:`multi_line_panel` draws its series in: the qualitative hues first, most
+#: distinct pairs first, then the neutral ones.
+LINE_PALETTE = (
+    COLOR_BLUE, COLOR_VERMILLION, COLOR_GREEN, COLOR_ORANGE, COLOR_PURPLE, COLOR_GRAY, COLOR_BLACK,
+)
 
 # =============================================================================
 # The style
@@ -237,6 +245,15 @@ _FOOTNOTE_LINE_HEIGHT = 1.35
 #: Average advance of a serif glyph at 1 pt, used to wrap a footnote to the figure width.
 _GLYPH_ADVANCE_EM = 0.47
 
+
+#: Resolution every evaluation figure is written at, and deliberately **not** ``utils.style``'s
+#: ``SAVE_DPI`` ($600$), which the training callbacks keep. It sets the pixel grid of a raster
+#: format and of any rasterised artist inside a vector one; a heatmap drawn with
+#: ``interpolation='none'`` is embedded in a PDF or SVG at its own cell resolution whatever this
+#: says. MEASURED on the full per-sample page: at $600$ dpi it was a $236$-megapixel PNG, and PNG
+#: encoding plus image resampling were most of its render time; both scale with the square of the
+#: resolution, and at this value the text is still sharp at a reader's zoom.
+EVAL_SAVE_DPI = 200
 
 #: The format a run writes when its config names none. PDF because every committed
 #: ``figure_manifest.json`` and ``FIGURE_GUIDE.md`` in this repository records ``.pdf`` names, and
@@ -432,15 +449,30 @@ def legend_with_headroom(
 
 
 def _data_axes(fig: Any) -> list:
-    """The axes of ``fig`` that hold data: no colourbars, no secondary axes, no insets."""
+    """The axes of ``fig`` that are panels a caption can refer to, in creation order.
+
+    Excluded: colourbar axes -- whether ``fig.colorbar`` made them or a builder reserved a ``cax``
+    and drew into it, which matplotlib marks with ``_colorbar`` rather than with a label --
+    hidden and switched-off axes (the unused colour-axis slot of a line row), secondary axes and
+    insets, which are children of a panel, and the twin of a panel (``twinx``), which draws on its
+    host's frame and must not take a letter of its own.
+    """
     panels = []
     for ax in fig.axes:
-        if ax.get_label() == _COLORBAR_AXES_LABEL:
+        if (
+            ax.get_label() == _COLORBAR_AXES_LABEL
+            or hasattr(ax, "_colorbar")
+            or not ax.get_visible()
+            or not ax.axison
+        ):
             continue
         # A secondary axis or an inset is a child of a data axes rather than a panel of its own.
         if getattr(ax, "_secondary_axes_owner", None) is not None or any(
             ax in getattr(other, "child_axes", ()) for other in fig.axes if other is not ax
         ):
+            continue
+        # A twin is created after its host, so the host is already a panel when the twin is met.
+        if any(other in panels for other in ax._twinned_axes.get_siblings(ax) if other is not ax):
             continue
         panels.append(ax)
     return panels
@@ -657,7 +689,7 @@ def heatmap_with_colorbar(
     colorbar_label: str = "",
     separator_row: Optional[int] = None,
     extent: Optional[Tuple[float, float, float, float]] = None,
-    interpolation: str = "nearest",
+    interpolation: str = "none",
     norm: Any = None,
 ) -> Any:
     """Draw a heatmap with its colourbar, tolerating empty and all-``NaN`` input.
@@ -694,11 +726,12 @@ def heatmap_with_colorbar(
         norm: A matplotlib colour normaliser -- a ``LogNorm`` or ``SymLogNorm`` -- that replaces
             the limits above entirely, for a field whose values span orders of magnitude. ``None``
             keeps the linear scale the limits describe.
-        interpolation: What ``imshow`` does between cells. ``'nearest'`` resamples to the
-            renderer's pixel grid; ``'none'`` emits the cells themselves, which is what a
-            *vector* output wants -- in a PDF the resampling is done at a resolution the file
-            does not carry, so a cell boundary can land half a cell away from where the data
-            says it is. Pass ``'none'`` wherever the reader is expected to index a cell.
+        interpolation: What ``imshow`` does between cells. The default ``'none'`` emits the
+            cells themselves: in a PDF or SVG the array is embedded at its own resolution, so the
+            file stays small and a cell boundary is where the data puts it, and in a raster format
+            it is drawn as nearest-neighbour. ``'nearest'`` resamples to the renderer's pixel grid
+            first, which in a vector output means an image at :data:`EVAL_SAVE_DPI` over the whole
+            axes and a boundary that can land half a cell off.
 
     Returns:
         The image handle, or ``None`` when there was nothing to draw.
@@ -1092,6 +1125,10 @@ P_VALUE_FLOOR = 1e-300
 #: strip is read against its own threshold line, not compared bar to bar.
 SIGNIFICANCE_BAR_FRACTION = 0.4
 
+#: Where an untestable window's cross sits, as a fraction of the strip's height: just inside the
+#: frame, in axes coordinates. At $y = 0$ in data it sat on the bottom spine and vanished into it.
+UNTESTABLE_MARK_HEIGHT = 0.08
+
 
 def significance_strip(
     ax: Any,
@@ -1121,9 +1158,10 @@ def significance_strip(
         centres: The window centres, in drawing order.
         p_holm: The Holm-adjusted $p$ per window, positionally aligned with ``centres``.
             A non-finite entry is a window that could not be tested: it gets **no bar** -- a zero
-            height would read as a window with no evidence -- and a grey cross at zero instead,
-            so that "found nothing" and "never looked at" are distinguishable on the page and not
-            only in the table.
+            height would read as a window with no evidence -- and a grey cross just above the
+            bottom of the frame instead (:data:`UNTESTABLE_MARK_HEIGHT`), so that "found
+            nothing" and "never looked at" are distinguishable on the page and not only in the
+            table.
         alpha: The family-wise error rate the correction controls; drawn as the threshold line.
         bin_width: Window width in the x coordinate's own units, which sets the bar width.
         title: Panel title.
@@ -1162,10 +1200,13 @@ def significance_strip(
         position for position, value in zip(positions, values) if not np.isfinite(value)
     ]
     if untestable:
+        # x in data, y in axes coordinates: on the window, clear of the spine whatever the
+        # strip's scale, and heavy enough to read beside the bars.
         ax.plot(
-            untestable, np.zeros(len(untestable)), marker="x", linestyle="none",
-            markersize=plt.rcParams["lines.markersize"], color=COLOR_GRAY,
-            markeredgewidth=plt.rcParams["lines.linewidth"] * 0.6,
+            untestable, np.full(len(untestable), UNTESTABLE_MARK_HEIGHT),
+            transform=ax.get_xaxis_transform(), marker="x", linestyle="none",
+            markersize=plt.rcParams["lines.markersize"] * 1.6, color=COLOR_GRAY,
+            markeredgewidth=plt.rcParams["lines.linewidth"],
             label="not testable", zorder=3,
         )
     if not testable:
@@ -1176,6 +1217,9 @@ def significance_strip(
                 0.5, 0.75, EMPTY_NOTE, transform=ax.transAxes, ha="center", va="center",
                 fontsize=plt.rcParams["axes.labelsize"], fontstyle="italic", color=COLOR_GRAY,
             )
+            # No bar means no $-\log_{10} p$ scale: the default ticks would label a range nothing
+            # on the panel lives on.
+            ax.set_yticks([])
             ax.legend(loc="best")
         else:
             _note_empty(ax)
@@ -1313,11 +1357,18 @@ def multi_line_panel(
         return 0
 
     drawn = 0
-    palette = plt.get_cmap("viridis")
-    for row in range(int(field.shape[0])):
+    # The Okabe-Ito hues in a fixed order, so a two- or three-line panel reads blue, vermillion,
+    # green. viridis runs out to a yellow that vanishes on white; it is kept only for a stack of
+    # more series than the qualitative set holds, where an ordered sequential map is the point.
+    n_rows = int(field.shape[0])
+    sequential = plt.get_cmap("viridis")
+    for row in range(n_rows):
         if not np.isfinite(field[row]).any():
             continue
-        colour = palette(row / max(int(field.shape[0]) - 1, 1))
+        colour = (
+            LINE_PALETTE[row] if n_rows <= len(LINE_PALETTE)
+            else sequential(row / max(n_rows - 1, 1))
+        )
         label = str(labels[row]) if row < len(labels) else f"group {row}"
         ax.plot(axis_x, field[row], color=colour, linewidth=plt.rcParams["lines.linewidth"], label=label)
         drawn += 1
@@ -1457,8 +1508,8 @@ def label_channel_blocks(ax: Any, n_scattering: int, n_total: int) -> None:
         )
 
 
-def render_figure(fig: Any, path: Any, *, tight: bool = True) -> Any:
-    """Save a figure in the run's configured format at the repository's DPI, and close it.
+def render_figure(fig: Any, path: Any, *, tight: bool = True, crop: bool = True) -> Any:
+    """Save a figure in the run's configured format at :data:`EVAL_SAVE_DPI`, and close it.
 
     ``path`` is a **stem**: the extension is this run's, not the caller's. Every figure-name
     constant in the eval packages is therefore extension-less, and the one place that decides
@@ -1478,6 +1529,10 @@ def render_figure(fig: Any, path: Any, *, tight: bool = True) -> Any:
             passes ``False`` or stamps the figure with :func:`mark_laid_out`; the footnote room
             is honoured either way, because the builder that wrote the footnote is the one that
             laid the figure out around it.
+        crop: Crop the file to the drawn content (``bbox_inches='tight'``). ``False`` writes the
+            figure at exactly its own size -- for a family of pages that must overlay pixel for
+            pixel, whose builder keeps everything inside the figure -- and saves the extra
+            layout pass the crop costs.
 
     Returns:
         The path actually written, extension included.
@@ -1502,7 +1557,15 @@ def render_figure(fig: Any, path: Any, *, tight: bool = True) -> Any:
             fig.align_ylabels()
         except Exception:  # noqa: BLE001 - a layout warning must not lose a completed figure
             pass
-    save_figure(fig, str(destination), dpi=SAVE_DPI, close=True)
+    if crop:
+        save_figure(fig, str(destination), dpi=EVAL_SAVE_DPI, close=True)
+        return destination
+    try:
+        # The figure's own box, explicitly: the publication style sets ``savefig.bbox`` to
+        # ``'tight'``, which a bare ``savefig`` would still apply.
+        fig.savefig(str(destination), dpi=EVAL_SAVE_DPI, bbox_inches=fig.bbox_inches)
+    finally:
+        plt.close(fig)
     return destination
 
 

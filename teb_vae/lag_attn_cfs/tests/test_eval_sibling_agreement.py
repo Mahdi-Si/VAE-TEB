@@ -707,13 +707,34 @@ def oracle_scored_frame() -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+#: The causal cell's mean-decoded estimator, which the raw sibling has no column for.
+CFS_ONLY_SCORES = frozenset({"mean_nll_base_block"})
+CFS_ONLY_GAPS = frozenset({"delta_suff_mean_nats"})
+
+
+def _without(entries, names) -> tuple:
+    """The entries whose first field is not one of ``names``, in order."""
+    return tuple(entry for entry in entries if entry[0] not in names)
+
+
 def test_the_sufficiency_scores_and_both_gaps_are_defined_identically_in_both_packages() -> None:
     """The three columns compared, the two differences taken, and which of them are resolved by
     cohort. A package that renamed a column or reversed a subtraction would put a differently
-    signed ``delta_suff_nats`` under one name in two summaries the arm table reads side by side."""
-    assert sufficiency_analysis.SCORE_COLUMNS == sibling_sufficiency_analysis.SCORE_COLUMNS
-    assert sufficiency_analysis.GAP_METRICS == sibling_sufficiency_analysis.GAP_METRICS
-    assert sufficiency_analysis.GROUPED_METRICS == sibling_sufficiency_analysis.GROUPED_METRICS
+    signed ``delta_suff_nats`` under one name in two summaries the arm table reads side by side.
+
+    The causal cell carries one estimator the raw sibling does not -- the mean-decoded base branch
+    and the gap against it -- so its definitions are the sibling's with exactly those added: every
+    sibling entry, unchanged and in order, plus :data:`CFS_ONLY_SCORES` / :data:`CFS_ONLY_GAPS`.
+    """
+    assert _without(sufficiency_analysis.SCORE_COLUMNS, CFS_ONLY_SCORES) == tuple(
+        sibling_sufficiency_analysis.SCORE_COLUMNS
+    )
+    assert _without(sufficiency_analysis.GAP_METRICS, CFS_ONLY_GAPS) == tuple(
+        sibling_sufficiency_analysis.GAP_METRICS
+    )
+    assert tuple(
+        name for name in sufficiency_analysis.GROUPED_METRICS if name not in CFS_ONLY_GAPS
+    ) == tuple(sibling_sufficiency_analysis.GROUPED_METRICS)
     # Non-vacuity: both gaps are ``left - right`` over columns that are themselves in the score
     # list, which is what makes them differences over one denominator rather than three
     # populations.
@@ -764,8 +785,10 @@ def test_the_oracle_score_join_and_its_summary_rows_agree(oracle_scored_frame) -
     their_rows = sibling_sufficiency_analysis.build_rows(their_guids, resamples=64, seed=3)
 
     # Compared as frames rather than as lists of dicts: a Wilcoxon on four pairs legitimately
-    # reports a NaN p-value, and ``nan != nan`` would fail on two records that agree exactly.
-    pd.testing.assert_frame_equal(pd.DataFrame(my_rows), pd.DataFrame(their_rows))
+    # reports a NaN p-value, and ``nan != nan`` would fail on two records that agree exactly. The
+    # causal cell's mean-decoded rows have no sibling counterpart and are compared on the rest.
+    shared_rows = [row for row in my_rows if str(row["metric"]) not in CFS_ONLY_GAPS | CFS_ONLY_SCORES]
+    pd.testing.assert_frame_equal(pd.DataFrame(shared_rows), pd.DataFrame(their_rows))
     # Non-vacuity again: the gap is a real, signed number over the four recordings rather than the
     # NaN two implementations that both refused to estimate would agree on.
     by_metric = {str(row["metric"]): row for row in my_rows}

@@ -35,9 +35,12 @@ its directory still says whose it is.
   reparameterisation noise, so two passes over one checkpoint would draw two different paths and
   the difference would be $\epsilon$.
 
-**The absolute axis is** $t_{\mathrm{abs}} = \mathrm{epoch} + \Delta\, t$ **seconds**, negative
-before delivery, with $\Delta$ the stored step -- the convention the whole-delivery trajectory
-already uses, so the two cannot disagree by a constant about where a recording's points are.
+**The absolute axis is** $t_{\mathrm{abs}} = \mathrm{epoch} + T_{\mathrm{trim}} + \Delta\, t$
+**seconds**, negative before delivery, with $\Delta$ the stored step and $T_{\mathrm{trim}}$ the
+stretch the loader cuts off the front of every stored segment (``epoch`` is the STORED segment's
+start, loaded step $0$ is $T_{\mathrm{trim}}$ later). :func:`absolute_seconds` is the one place it is
+computed, and the whole-delivery trajectory, the forecast overlay and the attribution pages all
+read it, so no two figures can disagree by a constant about where a recording's points are.
 
 **A lag axis here is stored-coefficient time**, and every lag-resolved panel prints the caveat.
 The shape statistics of a lag profile are the shared vocabulary of :mod:`lag_shape`, so a centroid
@@ -57,11 +60,13 @@ import pandas as pd
 from matplotlib.lines import Line2D
 
 from teb_vae.lag_attn.nets.lag_report import SECONDS_PER_STEP
-from teb_vae.lag_attn_cfs.eval import cohort, lag_shape
+from teb_vae.lag_attn_cfs.eval import cohort, events, lag_shape
 from teb_vae.lag_attn_cfs.eval import figures_seam as figures
 from teb_vae.lag_attn_cfs.eval._reuse import labels
 from teb_vae.lag_attn_cfs.eval.dataset_rows import sanitise_guid
 from teb_vae.lag_attn_cfs.eval.lag_axis import COEFFICIENT_LAG_AXIS_LABEL
+from teb_vae.lag_attn_cfs.eval.metrics import NORMALISED_UNIT
+from teb_vae.lag_attn_cfs.eval.preflight import REQUIRED_TRIM_MINUTES
 from teb_vae.lag_attn_rws.nets.losses import KLD_ACTIVE_EPS
 
 #: The ``eval_config.caps`` name bounding how many recordings are traced **per clinical class**.
@@ -157,9 +162,13 @@ class SegmentTrace:
             divergence, the lag profiles.
         clocks: Per-segment clinical clocks the cell could read (labour onset, second-stage
             onset), ``NaN`` where the recording has none. Carried through to the summary.
-        raw: ``{name: (N,)}`` the raw signals of the segment as the loader served them (``fhr``,
-            ``up``), at the raw rate from the segment's ``epoch``. Drawn on the interactive page
-            only; absent when the loader was not asked for them.
+        raw: ``{name: (N,)}`` the raw signals of the segment (``fhr``, ``up``), at the raw rate
+            from the segment's ``epoch``, in the unit :attr:`raw_units` names and ``NaN`` where the
+            recording holds no signal. Drawn as the top rows of both trace figures; absent when
+            the loader was not asked for them.
+        raw_units: ``{name: unit}`` for each entry of :attr:`raw`: the physical unit when the
+            loader's statistics were known, :data:`~teb_vae.lag_attn_cfs.eval.metrics.
+            NORMALISED_UNIT` otherwise.
     """
 
     guid: str
@@ -172,21 +181,232 @@ class SegmentTrace:
     vectors: Dict[str, np.ndarray] = field(default_factory=dict)
     clocks: Dict[str, float] = field(default_factory=dict)
     raw: Dict[str, np.ndarray] = field(default_factory=dict)
+    raw_units: Dict[str, str] = field(default_factory=dict)
 
 
+# =============================================================================
+# The raw signals, in physical units
+# =============================================================================
 #: The raw signal fields a batch may carry, attached to a trace when it does.
 RAW_SIGNAL_FIELDS: Tuple[str, ...] = ("fhr", "up")
 
+#: The physical unit of each raw signal once the loader's z-scoring is inverted.
+RAW_SIGNAL_UNITS: Mapping[str, str] = {"fhr": "bpm", "up": "mmHg"}
 
-def attach_raw_signals(segments: Sequence["SegmentTrace"], batch: Any) -> None:
-    """Attach each batch sample's raw signals to its trace, in batch order, where the batch has them."""
-    for name in RAW_SIGNAL_FIELDS:
+#: Fixed y-limits of each raw signal in its physical unit: the scales of standard CTG paper. Fixed
+#: rather than fitted, so two recordings' traces -- or two samples on one page -- are read against
+#: the same grid and a flat trace cannot be stretched into an apparent event.
+RAW_SIGNAL_LIMITS: Mapping[str, Tuple[float, float]] = {"fhr": (50.0, 210.0), "up": (0.0, 100.0)}
+
+#: Panel titles and line colours of the raw rows, one pair per field.
+RAW_SIGNAL_TITLES: Mapping[str, str] = {"fhr": "Raw fetal heart rate", "up": "Raw uterine pressure"}
+RAW_SIGNAL_COLOURS: Mapping[str, str] = {"fhr": figures.COLOR_BLACK, "up": figures.COLOR_GREEN}
+
+#: Physical values below which a raw sample is the stored gap sentinel rather than a reading. The
+#: raw FHR stores a lost sample as $0$ bpm, which no heart produces; the UP trace has no such
+#: sentinel because $0$ mmHg is a legitimate resting tone.
+RAW_GAP_FLOOR: Mapping[str, float] = {"fhr": 1.0}
+
+#: The loader's numerical guard in its z-scoring, $(x - m) / (s + \epsilon)$, inverted exactly.
+_NORMALISATION_EPS = 1e-8
+
+
+#: $T_{\mathrm{trim}}$: seconds the loader cuts off the front of every stored segment. Preflight
+#: refuses any ``trim_minutes`` other than this one, so it is a constant of the pipeline.
+LOADER_TRIM_S = 60.0 * float(REQUIRED_TRIM_MINUTES)
+
+
+def absolute_seconds(epoch: Any, step: Any = 0.0) -> np.ndarray:
+    r"""Absolute time of loaded step(s) of a segment, in seconds relative to delivery.
+
+    $$t_{\mathrm{abs}} = \mathrm{epoch} + T_{\mathrm{trim}} + \Delta\, t$$
+
+    ``epoch`` is the stored segment's start, and the loader drops $T_{\mathrm{trim}}$ from its front
+    before step $0$; leaving the trim out would put every anchor and every raw sample one trim early.
+
+    Args:
+        epoch: The segment's stored ``epoch`` (seconds, negative before delivery); scalar or array.
+        step: Loaded step index(es) $t$; fractional values address raw samples ($t = n / R$).
+
+    Returns:
+        $t_{\mathrm{abs}}$ in seconds, broadcast over ``epoch`` and ``step``.
+    """
+    return (
+        np.asarray(epoch, dtype=np.float64)
+        + LOADER_TRIM_S
+        + np.asarray(step, dtype=np.float64) * float(SECONDS_PER_STEP)
+    )
+
+
+def raw_signal_scales(config: Optional[Mapping[str, Any]] = None, loader: Any = None) -> Dict[str, Tuple[float, float]]:
+    r"""The affine map from loader units back to physical units, per raw signal.
+
+    Read from the loader's own statistics and field list when a loader is at hand, and otherwise
+    from the stats file and ``normalize_fields`` the run's configuration names -- so an offline
+    re-run with no loader draws the same units. A field the loader did not normalise maps through
+    the identity; a field whose state cannot be established is absent and stays ``normalised``.
+
+    Args:
+        config: The merged run config, read for ``dataset_config.stat_path`` and
+            ``dataset_config.dataloader_config.normalize_fields``.
+        loader: The evaluation dataloader, or ``None``.
+
+    Returns:
+        ``{field: (mean, scale)}`` with physical $= z \cdot \mathrm{scale} + \mathrm{mean}$.
+    """
+    stats: Dict[str, Tuple[float, float]] = {}
+    getter = getattr(getattr(loader, "dataset", None), "get_normalization_stats", None)
+    if callable(getter):
+        fields = getattr(loader.dataset, "normalize_fields", None)
+        for name, entry in (getter() or {}).items():
+            if name in RAW_SIGNAL_FIELDS:
+                stats[name] = (
+                    float(np.asarray(entry["mean"]).reshape(-1)[0]),
+                    float(np.asarray(entry["std"]).reshape(-1)[0]),
+                )
+    else:
+        dataset = dict((config or {}).get("dataset_config") or {})
+        fields = (dataset.get("dataloader_config") or {}).get("normalize_fields")
+        try:
+            import h5py
+
+            with h5py.File(str(dataset["stat_path"]), "r") as handle:
+                for name in RAW_SIGNAL_FIELDS:
+                    if name in handle:
+                        attrs = handle[name].attrs
+                        stats[name] = (float(attrs["mean_scalar"]), float(attrs["std_scalar"]))
+        except Exception:  # noqa: BLE001 - no readable stats: the units stay unknown, not wrong
+            return {}
+    wanted = None if fields is None else {str(name) for name in fields}
+    return {
+        name: (
+            (stats[name][0], stats[name][1] + _NORMALISATION_EPS)
+            if name in stats and (wanted is None or name in wanted)
+            else (0.0, 1.0)
+        )
+        for name in RAW_SIGNAL_FIELDS
+    }
+
+
+def physical_raw(
+    values: Any, name: str, scales: Mapping[str, Tuple[float, float]], valid: Any = None
+) -> Tuple[np.ndarray, str]:
+    """One raw signal in its physical unit, ``NaN`` wherever it holds no reading.
+
+    Args:
+        values: The signal in loader units, any shape; flattened.
+        name: ``'fhr'`` or ``'up'``.
+        scales: From :func:`raw_signal_scales`. A field absent from it stays in loader units.
+        valid: Per-raw-sample validity, or ``None``. Invalid samples become ``NaN``, so a gap is
+            drawn as a gap rather than as a plunge to the stored sentinel.
+
+    Returns:
+        ``(values, unit)`` as ``float64``.
+    """
+    array = np.asarray(values, dtype=np.float64).reshape(-1).copy()
+    scale = scales.get(name)
+    if scale is None:
+        unit = NORMALISED_UNIT
+    else:
+        array = array * scale[1] + scale[0]
+        unit = RAW_SIGNAL_UNITS[name]
+        floor = RAW_GAP_FLOOR.get(name)
+        if floor is not None:
+            array[array < floor] = np.nan
+    if valid is not None:
+        mask = np.asarray(valid, dtype=bool).reshape(-1)[: array.size]
+        array[: mask.size][~mask] = np.nan
+    return array, unit
+
+
+def raw_validity_of(weight: Any, raw_len: int) -> Optional[np.ndarray]:
+    """Expand one sample's decimated ``weight`` onto the raw grid, or ``None`` when it cannot be."""
+    step = np.asarray(weight, dtype=np.float64).reshape(-1)
+    if step.size == 0 or raw_len % step.size:
+        return None
+    return events.raw_validity(step, decimation=raw_len // step.size, raw_len=raw_len)
+
+
+def attach_raw_signals(
+    segments: Sequence["SegmentTrace"],
+    batch: Any,
+    scales: Optional[Mapping[str, Tuple[float, float]]] = None,
+) -> None:
+    """Attach each batch sample's raw signals to its trace, in batch order, where the batch has them.
+
+    Args:
+        segments: The batch's traces, in batch order.
+        batch: The batch, read for ``fhr``, ``up`` and the decimated ``weight``.
+        scales: From :func:`raw_signal_scales`; ``None`` keeps loader units, labelled so.
+    """
+    def _field(name: str) -> Optional[np.ndarray]:
         value = batch.get(name) if isinstance(batch, dict) else getattr(batch, name, None)
         if value is None:
+            return None
+        return value.detach().cpu().numpy() if hasattr(value, "detach") else np.asarray(value)
+
+    weight = _field("weight")
+    for name in RAW_SIGNAL_FIELDS:
+        array = _field(name)
+        if array is None:
             continue
-        array = value.detach().cpu().numpy() if hasattr(value, "detach") else np.asarray(value)
         for position, segment in enumerate(segments):
-            segment.raw[name] = np.asarray(array[position], dtype=np.float32).reshape(-1)
+            row = np.asarray(array[position]).reshape(-1)
+            valid = None if weight is None else raw_validity_of(weight[position], row.size)
+            values, unit = physical_raw(row, name, scales or {}, valid)
+            segment.raw[name] = values.astype(np.float32)
+            segment.raw_units[name] = unit
+
+
+def draw_raw_signal(ax: Any, x: np.ndarray, values: np.ndarray, name: str, unit: str) -> None:
+    """Draw one raw signal on the fixed physiological scale when it is in physical units.
+
+    Args:
+        ax: Target axes.
+        x: The time coordinate of every sample.
+        values: The signal, ``NaN`` at gaps.
+        name: ``'fhr'`` or ``'up'``.
+        unit: Its unit, as :func:`physical_raw` returned it.
+    """
+    ax.plot(
+        x, values, color=RAW_SIGNAL_COLOURS[name], linewidth=figures.LINE_HAIRLINE,
+        rasterized=True, zorder=2,
+    )
+    ax.set_ylabel(f"{name.upper()} ({unit})")
+    if unit == RAW_SIGNAL_UNITS[name]:
+        ax.set_ylim(*RAW_SIGNAL_LIMITS[name])
+    if not np.isfinite(values).any():
+        _note_empty(ax)
+
+
+def painted_raw(recording: "RecordingTrace", key: str) -> Optional[Tuple[np.ndarray, np.ndarray, str]]:
+    """A raw signal of the whole recording on one uniform grid at the raw rate.
+
+    Segment by segment in ``epoch`` order, so where two stored segments overlap the later one
+    overwrites the earlier and a stretch no segment covers stays ``NaN``.
+
+    Args:
+        recording: The assembled recording.
+        key: ``'fhr'`` or ``'up'``.
+
+    Returns:
+        ``(t_abs_sec, values, unit)``, or ``None`` when no segment carries the signal.
+    """
+    step = 1.0 / float(events.FS_RAW)
+    present = [s for s in recording.segments if key in s.raw and len(s.raw[key])]
+    if not present:
+        return None
+    first = min(float(absolute_seconds(s.epoch)) for s in present)
+    last = max(float(absolute_seconds(s.epoch)) + (len(s.raw[key]) - 1) * step for s in present)
+    n = int(round((last - first) / step)) + 1
+    grid = np.full(n, np.nan)
+    for segment in present:
+        values = np.asarray(segment.raw[key], dtype=np.float64).reshape(-1)
+        index = int(round((float(absolute_seconds(segment.epoch)) - first) / step)) + np.arange(values.size)
+        keep = (index >= 0) & (index < n)
+        grid[index[keep]] = values[keep]
+    unit = present[-1].raw_units.get(key, NORMALISED_UNIT)
+    return first + np.arange(n) * step, grid, unit
 
 
 @dataclass
@@ -358,7 +578,7 @@ def anchor_rows(
         scalars and every lag family's shape statistics, in that order.
     """
     anchor = np.asarray(segment.anchor, dtype=np.int64).reshape(-1)
-    t_abs = float(segment.epoch) + anchor.astype(np.float64) * float(SECONDS_PER_STEP)
+    t_abs = absolute_seconds(segment.epoch, anchor)
     columns: Dict[str, Any] = {
         "guid": segment.guid,
         labels.CLASS_COLUMN: segment.clinical_class,
@@ -569,6 +789,11 @@ def write_recording_arrays(path: Any, recording: RecordingTrace, *, lag_seconds:
     """
     anchors = recording.anchors
     arrays: Dict[str, np.ndarray] = {
+        # The identity, so a file lifted out of its directory still names its recording, cohort
+        # and class; a unicode scalar each rather than a pickled object, so np.load reads it plainly.
+        "guid": np.asarray(str(recording.guid)),
+        labels.SUBGROUP_COLUMN: np.asarray(str(recording.subgroup)),
+        labels.CLASS_COLUMN: np.asarray(str(recording.clinical_class)),
         "epoch": np.asarray(anchors["epoch"], dtype=np.float64),
         "segment_order": np.asarray(anchors["segment_order"], dtype=np.int64),
         "anchor": np.asarray(anchors["anchor"], dtype=np.int64),
@@ -722,7 +947,7 @@ class SummaryMetric(NamedTuple):
 def _segment_hours(segment: SegmentTrace) -> np.ndarray:
     """Each decoded anchor of a segment in hours before delivery (decreasing along the segment)."""
     anchor = np.asarray(segment.anchor, dtype=np.float64).reshape(-1)
-    return -(float(segment.epoch) + anchor * float(SECONDS_PER_STEP)) / cohort.SECONDS_PER_HOUR
+    return -absolute_seconds(segment.epoch, anchor) / cohort.SECONDS_PER_HOUR
 
 
 def _anchor_spacing(segment: SegmentTrace) -> float:
@@ -872,6 +1097,73 @@ def _panel_block(segment: SegmentTrace, panel: HeatmapPanel) -> Optional[np.ndar
     return np.asarray(block, dtype=np.float64)
 
 
+def panel_key(panel: Any) -> str:
+    """The name a panel's shared scale is stored under in :func:`shared_panel_scales`."""
+    if isinstance(panel, HeatmapPanel):
+        return panel.vector if panel.subtract is None else f"{panel.vector}-{panel.subtract}"
+    return "|".join(getattr(panel, "columns", ()))
+
+
+def _heatmap_top(stacked: np.ndarray, panel: HeatmapPanel) -> Optional[float]:
+    r"""The top of a heatmap's colour scale over ``stacked``: $\max|x|$ signed, $\max x$ otherwise."""
+    finite = stacked[np.isfinite(stacked)]
+    if panel.symmetric:
+        finite = np.abs(finite)
+    elif panel.log:
+        finite = finite[finite > 0.0]
+    return float(finite.max()) if finite.size and finite.max() > 0.0 else None
+
+
+def _line_range(recording: RecordingTrace, panel: LinePanel) -> Optional[Tuple[float, float]]:
+    """The finite range of a line panel's scored values in one recording, or ``None``."""
+    frame = recording.anchors
+    scored = np.asarray(frame["contributing"], dtype=bool) if "contributing" in frame else None
+    values = [
+        np.asarray(frame[column], dtype=np.float64)[scored] if scored is not None
+        else np.asarray(frame[column], dtype=np.float64)
+        for column in panel.columns if column in frame.columns
+    ]
+    stacked = np.concatenate(values) if values else np.empty(0)
+    stacked = stacked[np.isfinite(stacked)]
+    return (float(stacked.min()), float(stacked.max())) if stacked.size else None
+
+
+def shared_panel_scales(recordings: Sequence[RecordingTrace], panels: Sequence[Any]) -> Dict[str, Any]:
+    """One colour scale per heatmap and one y range per line panel, over every traced recording.
+
+    Handed to :func:`build_recording_figure` so the same quantity is drawn on the same scale on
+    every recording's page and two pages can be compared by eye; a page scaled to its own maximum
+    makes a quiet recording look as loud as the loudest one.
+
+    Args:
+        recordings: Every recording the run traces.
+        panels: The panels the figures draw.
+
+    Returns:
+        ``{panel_key: top}`` for heatmaps (the colour-scale top) and ``{panel_key: (lo, hi)}`` for
+        line panels; a panel with no finite value anywhere is absent and falls back to its page.
+    """
+    scales: Dict[str, Any] = {}
+    for panel in panels:
+        key = panel_key(panel)
+        if isinstance(panel, HeatmapPanel):
+            tops = [
+                _heatmap_top(block, panel)
+                for recording in recordings for segment in recording.segments
+                for block in [_panel_block(segment, panel)] if block is not None
+            ]
+            tops = [top for top in tops if top is not None]
+            if tops:
+                scales[key] = max(tops)
+        elif isinstance(panel, LinePanel):
+            ranges = [value for value in (_line_range(r, panel) for r in recordings) if value is not None]
+            if ranges:
+                lo, hi = min(low for low, _ in ranges), max(high for _, high in ranges)
+                pad = 0.05 * (hi - lo) if hi > lo else max(abs(hi), 1.0) * 0.05
+                scales[key] = (lo - pad, hi + pad)
+    return scales
+
+
 def _draw_heatmap(
     ax: Any,
     cax: Any,
@@ -880,8 +1172,13 @@ def _draw_heatmap(
     panel: HeatmapPanel,
     *,
     lag_seconds: np.ndarray,
+    top: Optional[float] = None,
 ) -> None:
-    """Draw one vector family of the whole recording, segment by segment, on the hours axis."""
+    """Draw one vector family of the whole recording, segment by segment, on the hours axis.
+
+    ``top`` is the colour-scale top shared across recordings (:func:`shared_panel_scales`);
+    ``None`` scales the panel to this recording alone.
+    """
     blocks = [_panel_block(segment, panel) for segment in recording.segments]
     present = [block for block in blocks if block is not None]
     ax.set_title(panel.title)
@@ -892,25 +1189,23 @@ def _draw_heatmap(
         figures.style_axes(ax, grid="none")
         return
     stacked = np.concatenate(present, axis=0)
-    finite = stacked[np.isfinite(stacked)]
+    if top is None:
+        top = _heatmap_top(stacked, panel)
+    top = 1.0 if top is None else float(top)
     if panel.log and panel.symmetric:
         # A signed quantity on a log scale: linear inside the floor, logarithmic beyond it.
-        limit = float(np.abs(finite).max()) if finite.size and np.abs(finite).max() > 0 else 1.0
         norm = mcolors.SymLogNorm(
-            linthresh=limit * 10.0 ** (-LOG_PANEL_DECADES), vmin=-limit, vmax=limit, base=10
+            linthresh=top * 10.0 ** (-LOG_PANEL_DECADES), vmin=-top, vmax=top, base=10
         )
         cmap = "RdBu_r"
     elif panel.log:
-        positive = finite[finite > 0.0]
-        top = float(positive.max()) if positive.size else 1.0
         norm = mcolors.LogNorm(vmin=top * 10.0 ** (-LOG_PANEL_DECADES), vmax=top)
         cmap = "viridis"
     elif panel.symmetric:
-        limit = float(np.abs(finite).max()) if finite.size else 1.0
-        norm = mcolors.Normalize(vmin=-limit, vmax=limit)
+        norm = mcolors.Normalize(vmin=-top, vmax=top)
         cmap = "RdBu_r"
     else:
-        norm = mcolors.Normalize(vmin=0.0, vmax=float(finite.max()) if finite.size else 1.0)
+        norm = mcolors.Normalize(vmin=0.0, vmax=top)
         cmap = "viridis"
 
     y_edges = (
@@ -976,8 +1271,14 @@ def _draw_segment_means(ax: Any, recording: RecordingTrace, column: str) -> bool
     return drawn
 
 
-def _draw_lines(ax: Any, recording: RecordingTrace, panel: LinePanel) -> None:
-    """Draw per-anchor scalars of the whole recording, lifted at every unscored anchor."""
+def _draw_lines(
+    ax: Any, recording: RecordingTrace, panel: LinePanel, y_range: Optional[Tuple[float, float]] = None
+) -> None:
+    """Draw per-anchor scalars of the whole recording, lifted at every unscored anchor.
+
+    ``y_range`` is the range shared across recordings (:func:`shared_panel_scales`); ``None``
+    autoscales to this recording.
+    """
     frame = recording.anchors
     ax.set_title(panel.title)
     ax.set_ylabel(panel.ylabel)
@@ -1008,6 +1309,8 @@ def _draw_lines(ax: Any, recording: RecordingTrace, panel: LinePanel) -> None:
         _note_empty(ax)
     else:
         _title_legend(ax, entries)
+        if y_range is not None:
+            ax.set_ylim(*y_range)
     figures.style_axes(ax)
 
 
@@ -1017,6 +1320,7 @@ def build_recording_figure(
     panels: Sequence[Any],
     lag_seconds: np.ndarray,
     caveat: Optional[str] = None,
+    scales: Optional[Mapping[str, Any]] = None,
 ) -> Any:
     """Draw one recording's trace: every panel against hours before delivery, on one shared axis.
 
@@ -1027,16 +1331,27 @@ def build_recording_figure(
     line rows, a stretch the dataset holds no segment for is shaded darker on every row, and each
     clinical clock the recording carries is ruled across the page at its onset.
 
+    The raw signals the segments carry lead the page, one row each, on the same axis and on the
+    fixed :data:`RAW_SIGNAL_LIMITS` scale, so every model row is read against the physiology it
+    came from and two recordings' pages share one grid.
+
     Args:
         recording: The assembled recording.
         panels: :class:`HeatmapPanel` and :class:`LinePanel` entries, top to bottom.
         lag_seconds: The compensated lag axis, for the lag-resolved heatmaps.
         caveat: A sentence printed under the figure, or ``None``. A figure carrying a lag axis
             carries the group-delay caveat.
+        scales: From :func:`shared_panel_scales`, so every traced recording draws each panel on
+            one scale; ``None`` scales each panel to this recording alone.
 
     Returns:
         The figure, already laid out; the caller renders and closes it.
     """
+    raw_keys = [
+        key for key in RAW_SIGNAL_FIELDS
+        if any(key in segment.raw and len(segment.raw[key]) for segment in recording.segments)
+    ]
+    panels = [*raw_keys, *panels]
     heights = [HEATMAP_ROW_HEIGHT if isinstance(panel, HeatmapPanel) else LINE_ROW_HEIGHT for panel in panels]
     height_in = sum(heights) + _TITLE_ROOM_IN + _XLABEL_ROOM_IN
     figure = plt.figure(figsize=(TRACE_FIGURE_WIDTH, height_in))
@@ -1055,20 +1370,40 @@ def build_recording_figure(
         # Named as matplotlib names its own colourbar axes, so the render-time panel lettering
         # skips it whether or not a colourbar was drawn into it.
         cax.set_label("<colorbar>")
+        shared = (scales or {}).get(panel_key(panel))
         if isinstance(panel, HeatmapPanel):
-            _draw_heatmap(ax, cax, figure, recording, panel, lag_seconds=lag_seconds)
+            _draw_heatmap(ax, cax, figure, recording, panel, lag_seconds=lag_seconds, top=shared)
+        elif isinstance(panel, LinePanel):
+            cax.set_axis_off()
+            _draw_lines(ax, recording, panel, shared)
         else:
             cax.set_axis_off()
-            _draw_lines(ax, recording, panel)
+            t_abs, values, unit = painted_raw(recording, panel)
+            draw_raw_signal(ax, -t_abs / cohort.SECONDS_PER_HOUR, values, panel, unit)
+            ax.set_title(f"{RAW_SIGNAL_TITLES[panel]} ({unit})")
+            figures.style_axes(ax)
         if row < len(panels) - 1:
             ax.tick_params(labelbottom=False)
         else:
             ax.set_xlabel("Time before delivery (hours)")
         axes.append(ax)
     x_range = _axis_range(recording)
+    if raw_keys:
+        # The raw rows span each segment whole, beyond its first and last decoded anchor.
+        spans = [
+            (
+                float(absolute_seconds(segment.epoch)),
+                float(absolute_seconds(segment.epoch)) + len(segment.raw[key]) / events.FS_RAW,
+            )
+            for segment in recording.segments for key in raw_keys if key in segment.raw
+        ]
+        x_range = (
+            max(x_range[0], -min(start for start, _ in spans) / cohort.SECONDS_PER_HOUR),
+            min(x_range[1], -max(end for _, end in spans) / cohort.SECONDS_PER_HOUR),
+        )
     if axes:
         axes[0].set_xlim(*x_range)
-        _shade_rows(axes, recording, alternate=[isinstance(panel, LinePanel) for panel in panels])
+        _shade_rows(axes, recording, alternate=[not isinstance(panel, HeatmapPanel) for panel in panels])
         _draw_clocks(axes, recording, x_range)
     n_segments = len(recording.segments)
     n_breaks = int(recording.summary["is_break"].sum()) if "is_break" in recording.summary.columns else 0

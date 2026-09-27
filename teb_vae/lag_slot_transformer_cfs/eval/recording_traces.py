@@ -279,6 +279,7 @@ def trace_recording(
     *,
     clinical_class: Optional[str],
     subgroup: Optional[str],
+    raw_scales: Optional[Dict[str, Tuple[float, float]]] = None,
 ) -> List[traces.SegmentTrace]:
     """Re-read every segment of one recording and reduce each forward to a trace.
 
@@ -288,6 +289,8 @@ def trace_recording(
         rows: The recording's rows, ascending in ``dataset_index``.
         clinical_class: The recording's class.
         subgroup: The recording's subgroup.
+        raw_scales: From :func:`~teb_vae.lag_attn_cfs.eval.traces.raw_signal_scales`, so the raw
+            FHR and UP rows are drawn in bpm and mmHg; ``None`` keeps loader units, labelled so.
 
     Returns:
         The segment traces, in dataset order; the assembly sorts them by ``epoch``.
@@ -315,7 +318,7 @@ def trace_recording(
             model, outputs, target, weight, batch_rows, likelihood=likelihood,
             clinical_class=clinical_class, subgroup=subgroup,
         )
-        traces.attach_raw_signals(segment_traces, batch)
+        traces.attach_raw_signals(segment_traces, batch, raw_scales)
         gathered.extend(segment_traces)
     return gathered
 
@@ -346,6 +349,7 @@ def run_recording_traces(
     eval_config: Dict[str, Any],
     results_dir: Any,
     geometry_record: Optional[Dict[str, Any]] = None,
+    raw_scales: Optional[Dict[str, Tuple[float, float]]] = None,
 ) -> Dict[str, Any]:
     """Trace a seeded, class-balanced draw of recordings and write the trace directory.
 
@@ -360,6 +364,8 @@ def run_recording_traces(
         results_dir: The run's results directory; the stage writes into its own subdirectory.
         geometry_record: The collection-style geometry record the break tolerance is read from,
             or ``None`` for the family's default stride.
+        raw_scales: The loader-to-physical map of the raw FHR and UP rows; see
+            :func:`trace_recording`.
 
     Returns:
         The block the summary carries: a status, the selection accounting, the per-recording
@@ -419,7 +425,10 @@ def run_recording_traces(
             failures.append({"guid": guid, "error": "no dataset row resolves to this recording"})
             continue
         try:
-            segments = trace_recording(task, loader, rows, clinical_class=clinical_class, subgroup=subgroup)
+            segments = trace_recording(
+                task, loader, rows, clinical_class=clinical_class, subgroup=subgroup,
+                raw_scales=raw_scales,
+            )
             recording = traces.assemble_recording(
                 segments, lag_profiles=LAG_PROFILES, lag_seconds=lag_seconds,
                 break_after_s=break_after_s,

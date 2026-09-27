@@ -327,6 +327,62 @@ def test_a_leading_dot_and_upper_case_are_accepted_but_an_unknown_format_is_refu
         figures.set_figure_format(previous)
 
 
+def test_only_data_panels_are_lettered() -> None:
+    """A reserved colour-bar axes, a hidden or switched-off slot and a twin are not panels.
+
+    The sample pages reserve a ``cax`` per row and draw into it with ``colorbar(cax=...)``, which
+    leaves no ``<colorbar>`` label behind, hide the slot of a line row, and put a second signal
+    on ``twinx``; every one of those took a letter, so the rows read a, d, f, h.
+    """
+    fig = plt.figure()
+    try:
+        grid = fig.add_gridspec(3, 2, width_ratios=[1.0, 0.05])
+        first, first_cax = fig.add_subplot(grid[0, 0]), fig.add_subplot(grid[0, 1])
+        fig.colorbar(first.imshow(np.eye(3)), cax=first_cax)
+        second, hidden = fig.add_subplot(grid[1, 0]), fig.add_subplot(grid[1, 1])
+        second.plot([0, 1], [0, 1])
+        second.twinx().plot([0, 1], [1, 0])
+        hidden.set_visible(False)
+        third, switched_off = fig.add_subplot(grid[2, 0]), fig.add_subplot(grid[2, 1])
+        third.plot([0, 1], [0, 1])
+        switched_off.set_axis_off()
+
+        assert figures.label_panels(fig) == 3
+        assert [ax.get_title(loc="left") for ax in (first, second, third)] == [
+            "$\\mathbf{a}$", "$\\mathbf{b}$", "$\\mathbf{c}$"
+        ]
+    finally:
+        plt.close(fig)
+
+
+def test_a_few_lines_take_the_qualitative_palette_rather_than_viridis() -> None:
+    """viridis ends in a yellow that vanishes on white, so a two- or three-line panel read as one
+    line; the Okabe-Ito hues are distinct and survive a greyscale print."""
+    fig, ax = plt.subplots()
+    try:
+        figures.multi_line_panel(ax, np.arange(4), np.random.rand(3, 4), ["a", "b", "c"])
+        drawn = [line.get_color() for line in ax.lines if line.get_label() in ("a", "b", "c")]
+        assert drawn == list(figures.LINE_PALETTE[:3])
+    finally:
+        plt.close(fig)
+
+
+def test_an_uncropped_render_keeps_the_figure_size(tmp_path) -> None:
+    """``crop=False`` is what makes every page of a run the same pixel size."""
+    previous = figures.active_figure_format()
+    try:
+        figures.set_figure_format("png")
+        fig = plt.figure(figsize=(4.0, 2.0))
+        fig.add_subplot(1, 1, 1).plot([0, 1], [0, 1])
+
+        written = figures.render_figure(fig, tmp_path / "page", crop=False)
+
+        image = plt.imread(written)
+        assert image.shape[:2] == (2 * figures.EVAL_SAVE_DPI, 4 * figures.EVAL_SAVE_DPI)
+    finally:
+        figures.set_figure_format(previous)
+
+
 def test_render_figure_refuses_a_path_that_already_carries_an_extension(tmp_path) -> None:
     """Guards the one mistake the stem convention can leave behind: a surviving hardcoded suffix.
 
@@ -618,7 +674,7 @@ def test_a_p_value_of_exactly_zero_stays_on_the_page() -> None:
 
 def test_an_untestable_window_gets_a_mark_of_its_own_rather_than_a_bar() -> None:
     """Zero height is "no evidence"; a window that could not be tested is a different statement.
-    It gets no bar -- and a mark at zero, because at any realistic window count an absent bar and
+    It gets no bar -- and a mark just above the bottom of the frame, because at any realistic window count an absent bar and
     an absent window are otherwise the same empty stretch of axis."""
     fig, axes = figures.new_figure(1)
     try:
@@ -631,7 +687,10 @@ def test_an_untestable_window_gets_a_mark_of_its_own_rather_than_a_bar() -> None
         marks = [line for line in axes[0, 0].lines if line.get_marker() == "x"]
         assert len(marks) == 1
         assert list(np.atleast_1d(marks[0].get_xdata())) == pytest.approx([1.0])
-        assert list(np.atleast_1d(marks[0].get_ydata())) == pytest.approx([0.0])
+        # Just inside the frame, in axes coordinates, rather than on the spine at y = 0.
+        assert list(np.atleast_1d(marks[0].get_ydata())) == pytest.approx(
+            [figures.UNTESTABLE_MARK_HEIGHT]
+        )
     finally:
         plt.close(fig)
 

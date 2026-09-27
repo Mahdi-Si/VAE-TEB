@@ -98,8 +98,8 @@ configure_figure_style = figures.configure_figure_style
 #: ``rcParams`` and there is nothing left to re-apply.
 style_axes = figures.style_axes
 
-#: Figure construction and output. ``render_figure`` tight-layouts, saves at the repository's DPI,
-#: closes the figure and returns the path it wrote.
+#: Figure construction and output. ``render_figure`` letters the panels, tight-layouts, saves at
+#: the evaluation's own ``EVAL_SAVE_DPI``, closes the figure and returns the path it wrote.
 new_figure = figures.new_figure
 render_figure = figures.render_figure
 figure_filename = figures.figure_filename
@@ -370,6 +370,9 @@ def windowed_comparison_figure(
     # it does, exactly as ``cohort.ordered_groups`` places it.
     position = {group: index for index, group in enumerate(order)}
     effects: List[Dict[str, Any]] = []
+    # Whether any window of any readout could be tested at all, which is what the effect row says
+    # when it has nothing to draw: "none survived" and "none was testable" are different findings.
+    testable = False
 
     for index, (name, cells, record) in enumerate(readouts):
         per_window = list(record.get("per_window") or [])
@@ -381,12 +384,18 @@ def windowed_comparison_figure(
                 f"mismatch would draw one window's distribution under another window's p-value."
             )
         centres = [float(row["bin_center_h"]) for row in per_window]
+        testable = testable or any(
+            np.isfinite(float(row.get("p_holm", float("nan")))) for row in per_window
+        )
 
         violins = axes[2 * index, 0]
         binned_violin_panel(
             violins, windows, centres,
             groups=order, bin_width=bin_width, min_body_size=min_body_size, colors=colours,
             title=f"{name} per window, by {labels.CLASS_COLUMN}",
+            # Every panel names the clock, not only the strip under it: a panel lifted out of the
+            # page, or read on its own, is otherwise an unlabelled axis in hours.
+            xlabel=xlabel,
             ylabel=ylabel,
         )
         strip = axes[2 * index + 1, 0]
@@ -424,7 +433,8 @@ def windowed_comparison_figure(
                 })
 
     _draw_effect_heatmap(
-        figure, axes[-1, 0], effects, xlabel=xlabel, descending=delivery_orientation
+        figure, axes[-1, 0], effects, xlabel=xlabel, descending=delivery_orientation,
+        testable=testable,
     )
     return figure
 
@@ -436,6 +446,7 @@ def _draw_effect_heatmap(
     *,
     xlabel: str,
     descending: bool,
+    testable: bool = True,
 ) -> None:
     """Draw Cliff's delta for every surviving cohort pair, windows across and pairs down.
 
@@ -453,6 +464,9 @@ def _draw_effect_heatmap(
             the caller's own (readout, left cohort, right cohort) position tuple.
         xlabel: X-axis label, matching the panels above.
         descending: Whether the windows run right to left, as the delivery clock does.
+        testable: Whether any window was testable at all. With nothing to draw, the panel says
+            which of the two reasons it is -- in place of an empty heatmap on a meaningless
+            $[0, 1]$ axis.
     """
     # Keyed on the smallest rank a row was seen with, because one pair can survive in several
     # windows and each of them carries the same rank anyway. A row the caller did not rank sorts
@@ -470,11 +484,18 @@ def _draw_effect_heatmap(
         reverse=bool(descending),
     )
     if not rows or not columns:
-        heatmap_with_colorbar(
-            figure, ax, np.zeros((0, 0)),
-            title="Cliff's delta (no window survived Holm)",
-            symmetric=True, colorbar_label="Cliff's delta",
+        ax.set_title("Cliff's delta for the surviving cohort pairs")
+        ax.set_xlabel(xlabel)
+        ax.set_xticks([])
+        ax.set_yticks([])
+        ax.text(
+            0.5, 0.5,
+            "no cohort pair survived Holm in any window" if testable
+            else "no testable window: no cohort comparison could be made",
+            transform=ax.transAxes, ha="center", va="center", fontstyle="italic",
+            fontsize=FONT_NOTE, color=COLOR_GRAY,
         )
+        style_axes(ax, grid="none")
         return
 
     field = np.full((len(rows), len(columns)), np.nan)

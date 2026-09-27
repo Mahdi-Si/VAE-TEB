@@ -24,6 +24,11 @@ that pass puts it there -- and lands on the per-anchor table as
 analysis runs over **every anchor of the split** rather than over the retained samples alone: it
 needs no forecast block, no waveform retention and no cap, which is exactly why the two readouts
 that did need them are the two that are gone.
+
+**The events themselves are shown, not only counted.** Where the pass retained raw UP, the same
+detector is re-run over those traces and every contraction it finds is listed with the segment's
+identity and drawn on the trace, beside the window after each onset in which an anchor counts as an
+event anchor -- the one place a reader can check that the conditioning is on contractions at all.
 """
 from __future__ import annotations
 
@@ -34,14 +39,16 @@ import numpy as np
 import pandas as pd
 from loguru import logger
 
-from teb_vae.lag_attn_cfs.eval import cohort, events
+from teb_vae.lag_attn_cfs.eval import cohort, events, traces
 from teb_vae.lag_attn_cfs.eval import figures_seam as figures
 from teb_vae.lag_attn_cfs.eval._reuse import labels, stats as shared_stats
+from teb_vae.lag_attn.nets.lag_report import SECONDS_PER_STEP
 from teb_vae.lag_attn_cfs.eval.collect import CONTRACTION_AGE_COLUMN
 from teb_vae.lag_attn_cfs.eval.frames import (
     describe,
     finite_column,
     grouped_frame_entry,
+    per_recording_labels,
 )
 
 #: This analysis's own subdirectory inside the results directory. The sibling's name, kept, because
@@ -49,9 +56,20 @@ from teb_vae.lag_attn_cfs.eval.frames import (
 #: would make the two runs' output trees stop lining up for a reader comparing them.
 ANALYSIS_DIRNAME = "events"
 
-#: What it writes.
+#: What it writes. The per-recording table is **wide** -- one row per recording, one
+#: ``<metric>_{event,control,difference}`` triple per readout -- so the runner's cohort fan-out
+#: resolves each readout on its own rather than pooling two metrics' differences into one violin.
 CONDITIONED_FILENAME = "conditioned_coupling.csv"
 CONDITIONED_PER_RECORDING_FILENAME = "conditioned_coupling_per_recording.csv"
+
+#: The detector's output on the retained raw UP traces: one row per contraction found, and the
+#: figure that shows them on the trace, so the events every conditioned number rests on can be
+#: checked by eye rather than trusted.
+DETECTIONS_FILENAME = "contraction_detections.csv"
+DETECTION_FIGURE = "contraction_detection"
+
+#: Retained segments the detection figure draws, as many from every clinical class.
+DETECTION_SAMPLES_PER_CLASS = 2
 
 #: The figure, named as ``FIGURE_GUIDE.md`` names it.
 CONDITIONED_FIGURE = "conditioned_coupling"
@@ -235,15 +253,197 @@ def _conditioned_row(
     }
 
 
+def per_recording_table(
+    per_recording: pd.DataFrame, split: pd.DataFrame, per_sample: Optional[pd.DataFrame]
+) -> pd.DataFrame:
+    """Lay the per-recording comparison out wide, one row per recording, identity first.
+
+    Args:
+        per_recording: The long frame :func:`conditioned_rows` returns.
+        split: The event and control anchors, for each recording's two anchor counts.
+        per_sample: The per-sample table, for each recording's class and subgroup.
+
+    Returns:
+        ``guid``, the class and subgroup columns, both anchor counts, then one
+        ``<metric>_{event,control,difference}`` triple per readout.
+    """
+    identity = ["guid", labels.CLASS_COLUMN, labels.SUBGROUP_COLUMN]
+    if per_recording.empty:
+        return pd.DataFrame(columns=identity)
+    wide = per_recording.pivot(index="guid", columns="metric", values=["event", "control", "difference"])
+    wide.columns = [f"{metric}_{side}" for side, metric in wide.columns]
+    wide = wide[[
+        f"{name}_{side}" for name, _ in CONDITIONED_READOUTS
+        for side in ("event", "control", "difference") if f"{name}_{side}" in wide.columns
+    ]]
+    counts = split.assign(guid=split["guid"].astype(str)).groupby(["guid", "condition"]).size().unstack(fill_value=0)
+    for side in ("control", "event"):
+        wide.insert(0, f"n_{side}_anchors", counts.get(side, pd.Series(dtype=int)).reindex(wide.index).fillna(0).astype(int))
+    known = (
+        per_recording_labels(per_sample).rename(index=str)
+        if per_sample is not None and not per_sample.empty else pd.DataFrame()
+    )
+    for name in (labels.SUBGROUP_COLUMN, labels.CLASS_COLUMN):
+        values = known[name].reindex(wide.index) if name in known.columns else None
+        wide.insert(0, name, values if values is not None else None)
+    return wide.rename_axis("guid").reset_index()
+
+
+def detection_rows(
+    retained: Dict[str, np.ndarray],
+    per_sample: Optional[pd.DataFrame],
+    *,
+    scales: Dict[str, Tuple[float, float]],
+) -> pd.DataFrame:
+    """Run the detector over every retained raw UP trace and list what it found.
+
+    The same detector, on the same trace and validity, that put ``seconds_since_contraction`` on
+    the per-anchor table -- so these are the events every conditioned number is measured from.
+
+    Args:
+        retained: The collection's retained arrays: ``up_raw``, ``weight`` and the sample index.
+        per_sample: The per-sample table, for each segment's identity.
+        scales: From :func:`~teb_vae.lag_attn_cfs.eval.traces.raw_signal_scales`, for the peak's
+            physical amplitude.
+
+    Returns:
+        One row per contraction: the segment's identity, the onset, peak and end in seconds from
+        the start of the trimmed segment, and the peak pressure with its unit. Empty when no raw
+        UP was retained.
+    """
+    up = retained.get("up_raw")
+    if up is None or len(up) == 0:
+        return pd.DataFrame()
+    weight = retained.get("weight")
+    index = np.asarray(retained.get("waveforms_sample_index", np.arange(len(up))), dtype=np.int64)
+    table = (
+        per_sample.set_index("sample_index", drop=False)
+        if per_sample is not None and "sample_index" in per_sample.columns else None
+    )
+    rows: List[Dict[str, Any]] = []
+    for row in range(len(up)):
+        raw = np.asarray(up[row], dtype=np.float64).reshape(-1)
+        valid = None if weight is None else traces.raw_validity_of(weight[row], raw.size)
+        found = events.detect_contractions(raw, valid=valid)
+        physical, unit = traces.physical_raw(raw, "up", scales, valid)
+        key = int(index[row]) if row < index.size else row
+        identity = table.loc[key] if table is not None and key in table.index else None
+        for onset, peak, end in zip(found["onset_raw"], found["peak_raw"], found["end_raw"]):
+            rows.append(
+                {
+                    **{
+                        name: None if identity is None or name not in identity.index else identity[name]
+                        for name in ("guid", labels.CLASS_COLUMN, labels.SUBGROUP_COLUMN, "epoch")
+                    },
+                    "sample_index": key,
+                    "retained_row": row,
+                    "onset_s": float(onset) / events.FS_RAW,
+                    "peak_s": float(peak) / events.FS_RAW,
+                    "end_s": float(end) / events.FS_RAW,
+                    "peak_value": float(physical[int(peak)]),
+                    "unit": unit,
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+def build_detection_figure(
+    retained: Dict[str, np.ndarray],
+    per_sample: Optional[pd.DataFrame],
+    detections: pd.DataFrame,
+    *,
+    window_s: float,
+    first_anchor_s: float,
+    scales: Dict[str, Tuple[float, float]],
+) -> Optional[Any]:
+    """Draw the detector's contractions on raw UP, a few retained segments per clinical class.
+
+    Each row is one segment on the fixed pressure scale: onset, peak and end marked, the span
+    after each onset in which an anchor counts as an event anchor shaded, and the stretch before
+    the first decoded anchor greyed, since no anchor there can be conditioned on anything.
+
+    Args:
+        retained: The collection's retained arrays.
+        per_sample: The per-sample table, for identity.
+        detections: From :func:`detection_rows`.
+        window_s: ``event_lag_window_s``.
+        first_anchor_s: Seconds into the segment at which the first decoded anchor's step ends.
+        scales: The raw-signal scales.
+
+    Returns:
+        The figure, or ``None`` when no raw UP was retained.
+    """
+    up = retained.get("up_raw")
+    if up is None or len(up) == 0:
+        return None
+    weight = retained.get("weight")
+    index = np.asarray(retained.get("waveforms_sample_index", np.arange(len(up))), dtype=np.int64)
+    table = (
+        per_sample.set_index("sample_index", drop=False)
+        if per_sample is not None and "sample_index" in per_sample.columns else None
+    )
+
+    def _label(row: int, name: str) -> Any:
+        key = int(index[row]) if row < index.size else row
+        found = table.loc[key] if table is not None and key in table.index else None
+        return None if found is None or name not in found.index else found[name]
+
+    classes = [str(_label(row, labels.CLASS_COLUMN)) for row in range(len(up))]
+    chosen: List[int] = []
+    for name in cohort.ordered_groups(list(dict.fromkeys(classes)), labels.CLASS_COLUMN):
+        chosen += [row for row in range(len(up)) if classes[row] == name][:DETECTION_SAMPLES_PER_CLASS]
+
+    figure, axes = figures.new_figure(len(chosen), height_per_row=1.3)
+    for axis, row in zip(axes[:, 0], chosen):
+        raw = np.asarray(up[row], dtype=np.float64).reshape(-1)
+        valid = None if weight is None else traces.raw_validity_of(weight[row], raw.size)
+        physical, unit = traces.physical_raw(raw, "up", scales, valid)
+        seconds = (np.arange(raw.size) + 1.0) / events.FS_RAW
+        axis.axvspan(0.0, first_anchor_s, color=figures.COLOR_LIGHT_GRAY, alpha=0.6, linewidth=0, zorder=0)
+        traces.draw_raw_signal(axis, seconds, physical, "up", unit)
+        found = detections[detections["retained_row"] == row] if len(detections) else detections
+        for _, event in found.iterrows():
+            axis.axvspan(event["onset_s"], event["onset_s"] + window_s, color=figures.COLOR_GREEN,
+                         alpha=0.12, linewidth=0, zorder=0)
+            for key, marker in (("onset_s", "^"), ("peak_s", "o"), ("end_s", "v")):
+                position = int(round(float(event[key]) * events.FS_RAW))
+                axis.plot(event[key], physical[min(position, physical.size - 1)], marker=marker,
+                          color=figures.COLOR_VERMILLION, markersize=figures.MARKER_SMALL + 1.0, linestyle="none")
+        epoch = _label(row, "epoch")
+        hours = f", segment start {-float(epoch) / 3600.0:.2f} h before delivery" if epoch is not None and pd.notna(epoch) else ""
+        axis.set_title(
+            f"{_label(row, 'guid')} | {_label(row, labels.SUBGROUP_COLUMN)} | {_label(row, labels.CLASS_COLUMN)}"
+            f"{hours}: {len(found)} contraction(s)"
+        )
+        axis.set_xlim(0.0, raw.size / events.FS_RAW)
+        axis.set_xlabel("seconds into the segment")
+        figures.style_axes(axis)
+    figures.caveat_note(
+        figure,
+        f"Markers: detected onset, peak and end on the raw UP trace. Green: the {window_s:g} s after each onset in "
+        f"which an anchor counts as an event anchor. Grey: before the first decoded anchor. "
+        f"{events.ONSET_WALK_BACK_NOTE}.",
+    )
+    return figure
+
+
 # =============================================================================
 # The figure
 # =============================================================================
-def build_conditioned_figure(per_recording: pd.DataFrame) -> Any:
+def build_conditioned_figure(per_recording: pd.DataFrame, *, window_s: Optional[float] = None) -> Any:
     """Draw the event-versus-control comparison per readout, split by clinical class.
 
     The classes run HIE, acidosis, healthy and are coloured red, amber, green -- the same order
     and palette every other cohort figure in this evaluation uses, so two of them can be read
-    side by side. ``groupby`` alone would order them alphabetically, putting acidosis first.
+    side by side. ``groupby`` alone would order them alphabetically, putting acidosis first. Each
+    violin names its recording count, and the title the event window it was cut at.
+
+    Args:
+        per_recording: The long per-recording frame, one row per recording and readout.
+        window_s: ``event_lag_window_s``, for the title, or ``None``.
+
+    Returns:
+        The figure; the caller renders and closes it.
     """
     metrics = [name for name, _ in CONDITIONED_READOUTS]
     figure, axes = figures.new_figure(len(metrics))
@@ -265,11 +465,13 @@ def build_conditioned_figure(per_recording: pd.DataFrame) -> Any:
                 name: by_class[name]
                 for name in cohort.ordered_groups(list(by_class), labels.CLASS_COLUMN)
             }
+        within = "" if window_s is None else f" within {float(window_s):g} s after an onset"
         figures.violin_panel(
-            axis, values or {"all": np.zeros(0)},
-            title=f"{metric}: anchors near a contraction minus control anchors",
+            axis, {f"{name} (n={values[name].size})": values[name] for name in values} or {"all": np.zeros(0)},
+            title=f"{metric}: anchors{within} minus count-matched control anchors, per recording",
             ylabel="difference (nats per anchor)",
-            colors=figures.group_colors(list(values)),
+            colors={f"{name} (n={values[name].size})": colour
+                    for name, colour in figures.group_colors(list(values)).items()},
             reference=0.0, reference_label="no conditioning effect",
         )
     return figure
@@ -289,9 +491,8 @@ def run_events_analysis(
 
     Args:
         context: The analysis context, read for the per-anchor table the contraction timing rides
-            on and the per-sample table the clinical labels come from. Neither the model nor the
-            retained waveforms are touched: the two readouts that needed them are the two this
-            package does not have.
+            on, the per-sample table the clinical labels come from, and the retained raw UP the
+            detection figure is drawn on. The model is not touched.
         eval_config: The validated block, for the event window, the bootstrap settings and the
             seed the control draw follows from.
         output_dir: The results directory; this analysis writes into its own subdirectory.
@@ -315,8 +516,14 @@ def run_events_analysis(
     )
     pd.DataFrame(conditioned["rows"]).to_csv(directory / CONDITIONED_FILENAME, index=False)
     figure_name = str(figures.render_figure(
-        build_conditioned_figure(conditioned["per_recording"]), directory / CONDITIONED_FIGURE
+        build_conditioned_figure(conditioned["per_recording"], window_s=window_s),
+        directory / CONDITIONED_FIGURE,
     ).name)
+    written = [CONDITIONED_FILENAME, figure_name]
+    if len(conditioned["per_recording"]):
+        written.append(CONDITIONED_PER_RECORDING_FILENAME)
+    detection = _detection_readout(context, directory, window_s=window_s)
+    written += detection.pop("files")
 
     result: Dict[str, Any] = {
         # The anchors this analysis actually compared, not the segments behind them: the readout is
@@ -338,16 +545,49 @@ def run_events_analysis(
             "event_lag_window_s": window_s,
         },
         "conditioned": conditioned["record"],
+        "detection": detection,
         "removed_readouts": [dict(entry) for entry in REMOVED_READOUTS],
-        "files": [CONDITIONED_FILENAME, figure_name],
+        "files": written,
     }
     if len(conditioned["per_recording"]):
         result["grouped_frames"] = [
             grouped_frame_entry(
-                ANALYSIS_DIRNAME, CONDITIONED_PER_RECORDING_FILENAME, ("difference",)
+                ANALYSIS_DIRNAME, CONDITIONED_PER_RECORDING_FILENAME,
+                [f"{name}_difference" for name, _ in CONDITIONED_READOUTS],
             )
         ]
     return result
+
+
+def _detection_readout(context: Any, directory: Path, *, window_s: float) -> Dict[str, Any]:
+    """List and draw the detector's contractions on the retained raw UP, or record why not."""
+    collection = context.collection
+    retained = dict(getattr(collection, "retained", None) or {})
+    if retained.get("up_raw") is None:
+        return {"skipped": True, "reason": "no raw UP was retained (eval_config.caps.waveforms)", "files": []}
+    per_sample = getattr(collection, "per_sample", None)
+    scales = traces.raw_signal_scales(getattr(context, "config", None))
+    detections = detection_rows(retained, per_sample, scales=scales)
+    detections.to_csv(directory / DETECTIONS_FILENAME, index=False)
+    geometry = dict((getattr(collection, "record", None) or {}).get("geometry") or {})
+    first = int(geometry.get("anchor_first", geometry.get("anchor_floor", 0)) or 0)
+    figure = build_detection_figure(
+        retained, per_sample, detections, window_s=window_s,
+        first_anchor_s=(first + 1) * SECONDS_PER_STEP,
+        scales=scales,
+    )
+    files = [DETECTIONS_FILENAME]
+    if figure is not None:
+        files.append(str(figures.render_figure(figure, directory / DETECTION_FIGURE).name))
+    n_segments = int(len(retained["up_raw"]))
+    return {
+        "skipped": False,
+        "n_retained_segments": n_segments,
+        "n_contractions": int(len(detections)),
+        "contractions_per_segment": float(len(detections)) / n_segments if n_segments else None,
+        "onset_convention": events.ONSET_WALK_BACK_NOTE,
+        "files": files,
+    }
 
 
 def _conditioned_readout(
@@ -392,7 +632,9 @@ def _conditioned_readout(
     rows, per_recording = conditioned_rows(
         split, labels_by_guid, resamples=resamples, seed=seed
     )
-    per_recording.to_csv(directory / CONDITIONED_PER_RECORDING_FILENAME, index=False)
+    per_recording_table(per_recording, split, per_sample).to_csv(
+        directory / CONDITIONED_PER_RECORDING_FILENAME, index=False
+    )
     logger.info(
         f"{ANALYSIS_DIRNAME}: {n_event_anchors} event anchor(s) against {n_control_anchors} "
         f"count-matched control(s) over {n_recordings} recording(s)"

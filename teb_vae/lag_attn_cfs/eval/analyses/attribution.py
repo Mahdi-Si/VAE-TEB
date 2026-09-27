@@ -6,8 +6,8 @@ This analysis asks the mechanistic question directly: **which input coefficients
 steps and which channels, drove** the divergence $K_t$, the mean-decoded forecast gap and the
 attention mass on each lag band, at a chosen anchor of a chosen segment. The arithmetic -- the
 wrapper that turns the dense forward into one scalar per anchor, the two baselines, the
-integrated gradients with their entry point, the layer split on the posterior head's inputs, the
-band ablation, the reductions and the figures -- lives one layer down in
+integrated gradients with their entry point, the layer split on the posterior head's per-head
+fusion outputs, the band ablation, the reductions and the figures -- lives one layer down in
 :mod:`~teb_vae.lag_attn_cfs.eval.attributions` and the pass in
 :mod:`~teb_vae.lag_attn_cfs.eval.attribution_pass`, shared with the lag-residual cell so the two
 directories hold the same tables under the same names.

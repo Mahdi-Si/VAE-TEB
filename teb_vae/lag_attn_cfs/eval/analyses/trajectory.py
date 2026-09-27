@@ -21,9 +21,9 @@ fully observed future. Here, only the last of those three is still visible:
 * **The lag truncation is inert.** The furthest searched lag is $L - 1$ and the floor
   $F$ clears it, so every lag is causally valid at every scored anchor and there is no early-anchor
   truncation to see. This is a consequence of the floor rather than of the lag axis, and an arm
-  that lowered the floor below $90$ would reintroduce it.
-* **The final $H$ anchors are still never scored**, exactly as in the raw cells, and $H$ is $15$
-  here rather than $30$.
+  that lowered the floor below $L - 1$ would reintroduce it.
+* **The final $H$ anchors are still never scored**, exactly as in the raw cells, with $H$ the
+  checkpoint's own horizon.
 
 So the expected shape is a profile that begins at $F$ and is otherwise flat, and a profile that
 is *not* is the finding.
@@ -41,8 +41,11 @@ pipeline did that nothing else here reproduces, and it needs three things done r
 * **The segment joins are recorded.** A discontinuity at a join is an artifact of assembly rather
   than a physiological event, and ``epoch_boundaries`` is what lets a reader tell the two apart.
 
-The absolute coordinate is $t_{\mathrm{abs}} = \mathrm{epoch} + 4t$ seconds, negative before
-delivery: ``epoch`` is the segment's own start on that axis and an anchor is $4$ s of it.
+The absolute coordinate is $t_{\mathrm{abs}} = \mathrm{epoch} + t\,\Delta$ seconds, negative
+before delivery, with $\Delta$ the step length: ``epoch`` is the segment's own start on that axis.
+
+Every per-recording table this writes carries the recording's clinical class and subgroup beside
+its ``guid``, read off the per-sample table, and the page naming a recording names both.
 """
 from __future__ import annotations
 
@@ -53,8 +56,9 @@ import numpy as np
 import pandas as pd
 from loguru import logger
 
-from teb_vae.lag_attn_cfs.eval import cohort, lag_axis
+from teb_vae.lag_attn_cfs.eval import cohort, frames, lag_axis, traces
 from teb_vae.lag_attn_cfs.eval import figures_seam as figures
+from teb_vae.lag_attn_cfs.eval._reuse import labels
 from teb_vae.lag_attn.nets.lag_report import SECONDS_PER_STEP
 
 #: This analysis's own subdirectory inside the results directory.
@@ -225,10 +229,7 @@ def whole_delivery(per_anchor: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame
         )
 
     frame = per_anchor[["guid", "epoch", "anchor", *present]].copy()
-    frame["t_abs_sec"] = (
-        np.asarray(frame["epoch"], dtype=np.float64)
-        + np.asarray(frame["anchor"], dtype=np.float64) * float(SECONDS_PER_STEP)
-    )
+    frame["t_abs_sec"] = traces.absolute_seconds(frame["epoch"], frame["anchor"])
 
     pieces: List[pd.DataFrame] = []
     boundaries: List[Dict[str, Any]] = []
@@ -306,6 +307,34 @@ def delivery_summary(
             }
         )
     return pd.DataFrame(rows, columns=columns)
+
+
+def with_cohort_labels(table: pd.DataFrame, per_sample: Optional[pd.DataFrame]) -> pd.DataFrame:
+    """Insert each recording's clinical class and subgroup right after ``guid``.
+
+    The per-anchor table carries neither label, so a whole-delivery table built from it would name
+    recordings with nothing saying which cohort they belong to. The labels come from the
+    per-sample table through :func:`~teb_vae.lag_attn_cfs.eval.frames.per_recording_labels`, the
+    one definition of a recording's cohort.
+
+    Args:
+        table: A per-recording or per-timestep table carrying ``guid``.
+        per_sample: The collected per-sample table, or ``None``.
+
+    Returns:
+        The table with one string column per cohort axis the per-sample table carries; empty
+        where a recording has no label there. Unchanged when there is nothing to join.
+    """
+    if per_sample is None or "guid" not in getattr(table, "columns", []):
+        return table
+    identity = frames.per_recording_labels(per_sample)
+    if not len(identity.columns):
+        return table
+    # String rather than object: a recording missing from the per-sample table joins as NaN, and a
+    # float among strings is a column parquet refuses to write.
+    joined = table.join(identity.astype("string"), on="guid")
+    order = ["guid", *identity.columns, *[name for name in table.columns if name != "guid"]]
+    return joined.reindex(columns=order)
 
 
 # =============================================================================
@@ -410,6 +439,18 @@ def _draw_whole_delivery(
         trajectory.groupby("guid").size().sort_values(ascending=False).index[0]
     )
     cell = trajectory[trajectory["guid"].astype(str) == str(chosen)].sort_values("t_abs_sec")
+    # A page naming a recording names its subgroup and class too, and draws it in its class's
+    # colour, so it reads against every other clinical figure of the run.
+    cohorts: Dict[str, Optional[str]] = {}
+    for axis in (labels.SUBGROUP_COLUMN, labels.CLASS_COLUMN):
+        known = cell[axis].dropna() if axis in cell.columns else ()
+        cohorts[axis] = str(known.iloc[0]) if len(known) else None
+    tag = ", ".join(value or f"no {axis}" for axis, value in cohorts.items())
+    clinical_class = cohorts[labels.CLASS_COLUMN]
+    colour = (
+        figures.group_colors([clinical_class]).get(clinical_class) if clinical_class
+        else figures.COLOR_BLUE
+    )
     hours = np.asarray(cell["hours_before_delivery"], dtype=np.float64)
     gaps = np.asarray(cell["gap_before_s"], dtype=np.float64)
     # A break is the gap *before* a sample, so overwriting that sample with NaN to draw the break
@@ -422,8 +463,10 @@ def _draw_whole_delivery(
     hours_with_breaks = np.insert(hours, breaks, np.nan)
     if column in cell.columns:
         values = np.insert(np.asarray(cell[column], dtype=np.float64), breaks, np.nan)
-        ax.plot(hours_with_breaks, values, linewidth=figures.LINE_REGULAR, label=name)
-    ax.set_title(f"Whole-delivery trajectory: {chosen} ({name})")
+        ax.plot(
+            hours_with_breaks, values, linewidth=figures.LINE_REGULAR, label=name, color=colour
+        )
+    ax.set_title(f"Whole-delivery trajectory: {chosen} ({tag}), {name}")
     ax.set_xlabel("Time before delivery (hours)")
     ax.set_ylabel("nats per anchor")
     ax.invert_xaxis()
@@ -487,11 +530,16 @@ def run_trajectory_analysis(
     floor = anchor_floor(dict(getattr(context.collection, "record", None) or {}))
     profile = within_segment_profile(per_anchor)
     profile.to_csv(directory / WITHIN_SEGMENT_FILENAME, index=False)
+    per_sample = getattr(context.collection, "per_sample", None)
     trajectory, boundaries = whole_delivery(per_anchor)
+    trajectory = with_cohort_labels(trajectory, per_sample)
+    boundaries = with_cohort_labels(boundaries, per_sample)
     trajectory.to_parquet(directory / WHOLE_DELIVERY_FILENAME, index=False)
     boundaries.to_csv(directory / BOUNDARIES_FILENAME, index=False)
     break_after_s = break_tolerance_s(dict(getattr(context.collection, "record", None) or {}))
-    summary = delivery_summary(trajectory, boundaries, break_after_s=break_after_s)
+    summary = with_cohort_labels(
+        delivery_summary(trajectory, boundaries, break_after_s=break_after_s), per_sample
+    )
     summary.to_csv(directory / SUMMARY_FILENAME, index=False)
 
     # One page per readout rather than one carrying both, so neither is drawn on the other's

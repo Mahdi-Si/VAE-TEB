@@ -521,3 +521,12 @@ def test_the_horizon_tolerates_a_frame_with_no_epoch_column() -> None:
 
     assert cohort.within_horizon(frame, 4.0) is frame
     assert cohort.within_horizon(pd.DataFrame(), 4.0).empty
+
+
+def test_the_horizon_bounds_a_dataset_listing_the_way_it_bounds_a_table() -> None:
+    """The traces read segments through the listing rather than the table, and a bounded run must
+    trace the same population its clocks are read over."""
+    listing = {("a", -3600): 0, ("a", -18000): 1, ("b", -14400): 2}
+
+    assert cohort.within_horizon_index(listing, None) == listing
+    assert cohort.within_horizon_index(listing, 4.0) == {("a", -3600): 0, ("b", -14400): 2}

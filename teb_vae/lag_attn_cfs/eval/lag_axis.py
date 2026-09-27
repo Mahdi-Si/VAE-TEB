@@ -1,19 +1,19 @@
 r"""The lag axis, and reading a per-lag vector against it. One implementation, three consumers.
 
 A lag index $\ell$ is not seconds. The figure to report is the **compensated** one,
-$\tau_\ell = 4(\ell + \delta)$, where $\delta$ is the causal input delay the source channels are
-read with -- so a peak at lag $\ell$ refers to source content $\ell + \delta$ steps back. The
-other seconds figure, which *subtracts* the $20$ s the preprocessing already removed -- it advanced
-the source trace, so undoing that moves the figure down -- exists only to locate a finding in the
-original sensor files and appears in no analysis.
+$\tau_\ell = \Delta(\ell + \delta)$ with $\Delta$ the step length, where $\delta$ is the causal
+input delay the source channels are read with (the model's ``source_delay_steps``) -- so a peak at
+lag $\ell$ refers to source content $\ell + \delta$ stored steps back. The stored timeline is
+canonical: no other term is ever added to or subtracted from this axis.
 
 **What that axis is time *in* is where this module differs from the raw cells', and the
 arithmetic is not what differs.** $\tau_\ell$ is computed here by the identical shared converter.
 But the streams this model reads are not signals: they are wavelet-modulus and phase-harmonic
 coefficients produced by a strictly one-sided filter bank, and a one-sided filter has a group
 delay. A coefficient stored at step $t$ therefore summarises signal content centred somewhere
-*before* $t$, by a per-channel amount the shards record as ``causal_delay_s`` -- 13.3 s to 791.0 s
-on the committed causal fixture. Nothing in this pipeline corrects for it, deliberately: the
+*before* $t$, by a per-channel amount the shards record as ``causal_delay_s`` -- up to
+:data:`MAX_MEASURED_GROUP_DELAY_SECONDS` on the committed causal fixture. Nothing in this pipeline
+corrects for it, deliberately: the
 correction is per channel *pair* while the lag map is per head over a pooled source state, so the
 mapping would itself be an unvalidated construction (both ``DESIGN.md`` records carry the
 ``lean-limit:`` for it).
@@ -42,7 +42,8 @@ gets quoted.
 This module exists because two analyses draw that axis and a third will. The historical failure
 was exactly this shape: two consumers computed the same quantity their own way, one of them read
 the delay under a name that did not exist, and the two reports of one run disagreed by up to a
-whole horizon -- $H$ steps -- with nothing raising. The conversion itself lives in ``nets/lag_report``
+whole horizon -- $H$ steps -- with nothing raising. The conversion itself lives in
+``nets/lag_report``
 and is shared with the training figure; what lives here is the *axis* built from it, and the two
 helpers for laying a per-lag vector alongside that axis.
 
@@ -76,23 +77,17 @@ COEFFICIENT_LAG_AXIS_LABEL = "lag (s, stored-coefficient time)"
 #: where a reader of one run's artifacts gets the figure that applies to that run.
 MAX_MEASURED_GROUP_DELAY_SECONDS = 791.0
 
-#: The shipped lag window: ``max_lag = 90`` searched lags plus lag $0$, so $L = 91$ bins spanning
-#: $L \cdot \Delta = 364$ s. Written as the model's ``max_lag`` rather than as $L$ because that is
-#: the config key an arm moves, and multiplied by the shared :data:`SECONDS_PER_STEP` rather than
-#: by a restated $4$.
-SHIPPED_MAX_LAG_STEPS = 90
-SHIPPED_LAG_SPAN_SECONDS = (SHIPPED_MAX_LAG_STEPS + 1) * SECONDS_PER_STEP
-
 #: The sentence every lag-resolved artifact carries. The comparison is the point rather than
-#: either number: a group delay of the same order as the lag search means a peak's *position* on
-#: this axis cannot be read as a physiological delay at all, and a reader given only the lag
-#: figures would have no way to know that.
+#: either number: a group delay as long as the lag search means a peak's *position* on this axis
+#: cannot be read as a physiological delay at all, and a reader given only the lag figures would
+#: have no way to know that. It quotes no lag-window geometry, which is a per-run config value; the
+#: run's own window is on every lag-resolved table and figure axis.
 GROUP_DELAY_CAVEAT = (
     f"this lag axis is stored-coefficient time, not physiological time: the coefficients are "
-    f"produced by a strictly one-sided bank whose composed per-channel group delay reaches "
-    f"{MAX_MEASURED_GROUP_DELAY_SECONDS:g} s on the committed causal fixture, which is the same "
-    f"order as the {SHIPPED_LAG_SPAN_SECONDS:g} s lag search itself "
-    f"({SHIPPED_MAX_LAG_STEPS + 1} lags at {SECONDS_PER_STEP:g} s per step). The lag map is an "
+    f"produced by a strictly one-sided bank whose composed per-channel group delay runs to "
+    f"hundreds of seconds ({MAX_MEASURED_GROUP_DELAY_SECONDS:g} s on the committed causal "
+    f"fixture; this run's own per-block range is preflight.json causality.group_delay_seconds), "
+    f"of the order of, or longer than, the whole lag search window. The lag map is an "
     f"attribution over the axis the coefficients are stored on, uncorrected for that delay, and "
     f"is therefore not a physiological latency and not a transfer entropy"
 )

@@ -130,6 +130,13 @@ DEFAULT_LEARNING_RATE = 1e-3
 #: rises exactly as far as the batch falls and the probe sees the same data.
 MAX_FIT_ACTIVATION_ELEMENTS = 4_000_000
 
+#: Segments per **scoring** forward -- the held-out curve and the final held-out score -- which is
+#: never lowered by :data:`MAX_FIT_ACTIVATION_ELEMENTS`. That ceiling exists for the backward pass,
+#: which keeps every block's activation alive; a scoring forward runs under ``no_grad`` and holds
+#: one block's at a time, so the fit batch the ceiling may have cut to one segment would only make
+#: every curve point a long run of single-segment forwards.
+SCORE_BATCH_SIZE = DEFAULT_FIT_BATCH_SIZE
+
 #: Bounds on the derived step count. The floor keeps a tiny population from producing a curve with
 #: no shape at all; the ceiling bounds a production run, where the probe is the one analysis whose
 #: cost is a training loop rather than a forward pass.
@@ -724,6 +731,10 @@ class FitResult:
         convergence_detail: The arithmetic behind that flag, in words.
         shuffled_conditioning: Whether this fit was the conditioning control rather than the
             measurement.
+        held_out_scores: The final state's per-segment score over the whole held-out half, in
+            ``held_out_rows`` order -- what ``final_held_out_nats`` pools, kept so the caller
+            joins these rather than scoring the same half a second time. Not in :meth:`describe`.
+        held_out_anchors: The contributing-anchor count behind each of those scores.
     """
 
     width_multiplier: int
@@ -736,6 +747,8 @@ class FitResult:
     converged: bool
     convergence_detail: str
     shuffled_conditioning: bool = False
+    held_out_scores: Optional[np.ndarray] = None
+    held_out_anchors: Optional[np.ndarray] = None
 
     def describe(self) -> Dict[str, Any]:
         """Return the fit as a record for the summary."""
@@ -860,24 +873,41 @@ def fit_probe(
     curve: List[Dict[str, float]] = []
     steps = max(1, int(steps))
     eval_every = max(1, int(eval_every))
+    held_out_all = np.asarray(held_out_rows, dtype=np.int64)
     # Fixed for the whole run, both sides: a curve whose points are measured over different
     # segments moves with the draw as much as with the fit.
-    curve_held_out = _curve_sample(held_out_rows, seed=int(seed) + 1)
+    curve_held_out = _curve_sample(held_out_all, seed=int(seed) + 1)
     curve_fit = _curve_sample(fit_rows, seed=int(seed) + 2)
+    # Whether the held-out curve sample IS the whole held-out half, in which case the final curve
+    # point and the reported score are one measurement and are taken once.
+    curve_is_whole_half = np.array_equal(curve_held_out, held_out_all)
+    final: Dict[str, np.ndarray] = {}
 
     def _score(positions: np.ndarray) -> float:
         values, counts = score_rows(
             probe, cache, positions,
-            model=model, likelihood=likelihood, device=device, batch_size=int(batch_size),
+            model=model, likelihood=likelihood, device=device,
+            batch_size=max(int(batch_size), SCORE_BATCH_SIZE),
         )
         return _pooled(values, counts)
 
     def _evaluate(step: int) -> None:
-        curve.append({
-            "step": float(step),
-            "held_out_nats": _score(curve_held_out),
-            "fit_nats": _score(curve_fit),
-        })
+        if step == steps:
+            # The reported score is measured over the **whole** held-out half, once, at the final
+            # state -- not read off the curve, whose points are a fixed subsample, and not off the
+            # curve's best point, which would be selecting the step by the held-out score it is
+            # about to report.
+            final["scores"], final["anchors"] = score_rows(
+                probe, cache, held_out_all,
+                model=model, likelihood=likelihood, device=device,
+                batch_size=max(int(batch_size), SCORE_BATCH_SIZE),
+            )
+        held_out = (
+            _pooled(final["scores"], final["anchors"])
+            if step == steps and curve_is_whole_half
+            else _score(curve_held_out)
+        )
+        curve.append({"step": float(step), "held_out_nats": held_out, "fit_nats": _score(curve_fit)})
         probe.train()
 
     probe.train()
@@ -910,13 +940,7 @@ def fit_probe(
         int(curve[held_out.index(best)]["step"]) if finite and best in held_out else -1
     )
     converged, detail = assess_convergence(curve)
-    # The reported score is measured over the **whole** held-out half, once, at the final state --
-    # not read off the curve, whose points are a fixed subsample, and not off the curve's best
-    # point, which would be selecting the step by the held-out score it is about to report.
-    final_scores, final_anchors = score_rows(
-        probe, cache, np.asarray(held_out_rows, dtype=np.int64),
-        model=model, likelihood=likelihood, device=device, batch_size=int(batch_size),
-    )
+    final_scores, final_anchors = final["scores"], final["anchors"]
     return FitResult(
         width_multiplier=int(width_multiplier),
         n_parameters=parameter_count(probe),
@@ -928,6 +952,8 @@ def fit_probe(
         converged=converged,
         convergence_detail=detail,
         shuffled_conditioning=bool(shuffle_conditioning),
+        held_out_scores=final_scores,
+        held_out_anchors=final_anchors,
     )
 
 
@@ -1196,9 +1222,9 @@ def run_oracle(
             probe, cache, fit_rows, held_out_rows,
             seed=seed + _SEED_OFFSET_BATCH, width_multiplier=1, **shared, **resolved,
         )
-        scores, anchors = score_rows(
-            probe, cache, held_out_rows, batch_size=resolved["batch_size"], **shared
-        )
+        # The fit's own final scoring of the whole held-out half, in ``held_out_rows`` order: the
+        # probe is frozen after it, so scoring the half again would reproduce it exactly.
+        scores, anchors = fit.held_out_scores, fit.held_out_anchors
 
         wide_fit: Optional[FitResult] = None
         if capacity_check:

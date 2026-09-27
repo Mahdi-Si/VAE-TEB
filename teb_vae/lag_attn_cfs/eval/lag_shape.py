@@ -57,20 +57,23 @@ DEGENERATE_ZERO_FRACTION = 0.9
 #: is the step size rather than a call to the compensated converter.
 SECONDS_PER_LAG_STEP = SECONDS_PER_STEP
 
-#: Lag offset, measured from the **shortest lag the axis carries**, inside which mass counts as
-#: sitting near the anchor. Fifteen steps of the shipped 91-bin, 364 s search.
+#: Fraction of the lag window's span, $\tau_{L-1} - \tau_0$, measured from the **shortest lag the
+#: axis carries**, inside which mass counts as sitting near the anchor.
 #:
-#: Measured from the axis's own start rather than from zero, and that is not a detail: the
-#: compensated axis begins at $\tau_0 = 4\delta$ rather than at $0$, so a threshold stated in
-#: absolute compensated seconds would admit a different number of bins on every run whose causal
-#: input delay differs -- and a cohort comparison would then be reading two different windows. The
-#: offset is delay-invariant, so the same fraction means the same thing across runs and across the
-#: two cells that share this pipeline.
-NEAR_SECONDS = 60.0
+#: A fraction of the window rather than a number of seconds, and that is not a detail: ``max_lag``
+#: is a per-cell config value, and an absolute threshold longer than a cell's window turns
+#: ``far_mass`` into an identically-zero column (and ``near_mass`` into an identically-one one)
+#: that reads in every table as a measurement. Measured from the axis's own start rather than from
+#: zero for the second reason: the compensated axis begins at $\tau_0 = \Delta\delta$, so an
+#: offset from zero would admit a different number of bins on every run whose causal input delay
+#: differs. Both thresholds are therefore delay-invariant and window-relative; the seconds they
+#: resolve to on a run are :func:`near_far_thresholds` of its own axis.
+NEAR_SPAN_FRACTION = 1.0 / 6.0
 
-#: ... and the offset beyond which mass counts as sitting far from the anchor. Sixty steps, so the
-#: near and far windows do not touch: a profile can be diffuse without being counted as either.
-FAR_SECONDS = 240.0
+#: ... and the fraction beyond which mass counts as sitting far from the anchor. Well clear of the
+#: near one, so the two windows do not touch: a profile can be diffuse without being counted as
+#: either.
+FAR_SPAN_FRACTION = 2.0 / 3.0
 
 #: Every statistic :func:`profile_statistics` returns, in the order a table carries them. Written
 #: out rather than derived from the returned mapping, so a consumer can lay out its columns before
@@ -102,6 +105,25 @@ STATISTIC_KEYS: Tuple[str, ...] = (
 )
 
 
+def near_far_thresholds(seconds: Any) -> Tuple[float, float]:
+    r"""The two mass-share offsets on one axis, in seconds from its shortest lag.
+
+    $$o_{\mathrm{near}} = f_{\mathrm{near}}\,(\tau_{L-1} - \tau_0), \qquad
+    o_{\mathrm{far}} = f_{\mathrm{far}}\,(\tau_{L-1} - \tau_0).$$
+
+    Args:
+        seconds: The compensated lag axis, ascending.
+
+    Returns:
+        ``(near, far)`` offsets in seconds; ``(nan, nan)`` on an empty axis.
+    """
+    axis = np.asarray(seconds, dtype=np.float64).ravel()
+    if axis.size == 0:
+        return float("nan"), float("nan")
+    span = float(axis[-1] - axis[0])
+    return NEAR_SPAN_FRACTION * span, FAR_SPAN_FRACTION * span
+
+
 # =================================================================================================
 # One profile at a time: the peak, described rather than merely located
 # =================================================================================================
@@ -118,8 +140,11 @@ def peak_width(profile: Sequence[float], *, fraction: float = PEAK_FRACTION) -> 
         fraction: Height, as a fraction of the peak, defining the peak's edge.
 
     Returns:
-        The argmax, the peak value, the inclusive bin bounds of the peak, and its width in bins.
-        All ``None`` on an empty or non-finite profile.
+        The argmax, the peak value, the inclusive bin bounds of the peak, its width in bins, and
+        ``at_window_edge`` -- ``True`` when the argmax is the **longest** lag the window carries.
+        That peak is censored rather than located: the true maximum may lie beyond the searched
+        window, and the width is truncated on that side. (Lag $0$ is no such edge: a causal model
+        has no negative lag to put mass on.) All ``None`` on an empty or non-finite profile.
 
     .. warning::
 
@@ -131,7 +156,10 @@ def peak_width(profile: Sequence[float], *, fraction: float = PEAK_FRACTION) -> 
     """
     values = np.asarray(list(profile), dtype=np.float64)
     if values.size == 0 or not np.isfinite(values).any():
-        return {"argmax": None, "peak": None, "lo": None, "hi": None, "width_bins": None}
+        return {
+            "argmax": None, "peak": None, "lo": None, "hi": None, "width_bins": None,
+            "at_window_edge": None,
+        }
     finite = np.where(np.isfinite(values), values, -np.inf)
     argmax = int(np.argmax(finite))
     peak = float(finite[argmax])
@@ -148,6 +176,7 @@ def peak_width(profile: Sequence[float], *, fraction: float = PEAK_FRACTION) -> 
         "lo": int(lo),
         "hi": int(hi),
         "width_bins": int(hi - lo + 1),
+        "at_window_edge": bool(finite.size > 1 and argmax == finite.size - 1),
     }
 
 
@@ -279,15 +308,14 @@ def restrict_to_band(
     r"""Cut a profile and its axis down to one inclusive lag band.
 
     The point of restricting is that a statistic taken over the whole window is diluted by the
-    lags that carry nothing: at the shipped geometry $91$ bins are reduced together, and the
-    diagnosed run put $67.5\%$ of the KL in a clock that is readable at every one of them. A
-    statistic on a band is the same reduction asked of the lags a partition says are worth asking
-    about.
+    lags that carry nothing: all $L$ bins are reduced together, and a diagnosed run put most of
+    the KL in an availability clock that is readable at every one of them. A statistic on a band
+    is the same reduction asked of the lags a partition says are worth asking about.
 
     **Two statistics must not be taken on the result, and this function cannot stop them.**
-    ``near_mass`` and ``far_mass`` are measured from ``seconds[0]``, so on a band they silently
-    become "within $60$ s of *the band's* start" and, for any band narrower than
-    :data:`FAR_SECONDS`, an identically zero column. The caller decides which statistics a
+    ``near_mass`` and ``far_mass`` are fractions of the axis's own span measured from
+    ``seconds[0]``, so on a band they silently become shares of *the band's* first and last
+    stretch -- a different quantity under the same name. The caller decides which statistics a
     restricted source carries; see the ``restrictable`` flag on the analysis that does.
 
     Args:
@@ -534,8 +562,11 @@ def profile_statistics(
     effective_support = SECONDS_PER_LAG_STEP * np.exp(entropy)
 
     offset = seconds - float(seconds[0])
-    near_mass = shares[:, offset <= NEAR_SECONDS].sum(axis=1)
-    far_mass = shares[:, offset >= FAR_SECONDS].sum(axis=1)
+    near_offset, far_offset = near_far_thresholds(seconds)
+    # A nanosecond of slack either way, so a bin sitting exactly on a threshold that the fraction
+    # lands on in exact arithmetic is not dropped by the last bit of the product.
+    near_mass = shares[:, offset <= near_offset + 1e-9].sum(axis=1)
+    far_mass = shares[:, offset >= far_offset - 1e-9].sum(axis=1)
 
     # --- The peak, and the guard that says whether to read it ------------------------------------
     # Filled with $-\infty$ rather than with zero, matching :func:`peak_width` bin for bin: a bin

@@ -244,8 +244,8 @@ HEADLINE_SCALARS: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
     # Per **coefficient**, not per raw sample: the scored unit here is one of the
     # $H \cdot C_{\mathrm{keep}}$ wavelet coefficients of a forecast block, and there is no raw
     # sample anywhere in this pipeline for a gain to be per. The rename is not cosmetic -- the two
-    # denominators differ by a factor of three at the shipped geometry, so a column carried across
-    # under the sibling's name would be silently non-comparable with the sibling's number.
+    # denominators differ, so a column carried across under the sibling's name would be silently
+    # non-comparable with the sibling's number.
     ("calibration_nll_gain_per_coefficient", ("calibration", "nll", "gain_per_coefficient")),
     # No frequency-domain entries. ``coherence`` is not ported at all: the stored coefficients are
     # moduli, so phase agreement, group delay and the residual's three-way split have no analogue
@@ -399,7 +399,7 @@ IDENTITY_ATOL = 1e-8
 #: see the failure these guard against.
 #:
 #: A floor rather than the whole rule: both identities are exact in real arithmetic, so the only
-#: thing they can differ by is float32 accumulation over $L = 91$ or $M = 4$ terms -- which grows
+#: thing they can differ by is float32 accumulation over $L$ lags or $M$ heads -- which grows
 #: with the *magnitude of the KL being decomposed*, not with a fixed number of nats. At the tiny
 #: geometry the measured residual is $2 \times 10^{-5}$ against a KL of $11$ nats; at a
 #: production KL an order of magnitude larger it would cross a flat $10^{-4}$ while saying
@@ -691,7 +691,7 @@ def check_lag_identity(results: Dict[str, Any], name: str) -> Dict[str, Any]:
 #: lag is the smallest one the window carries, and every physical delay shorter than what that
 #: lag encodes lands below it and is reported there whatever the model found.
 #:
-#: Written on the canonical stored timeline: there is no dataset-shift term, and ``tau_y_ref`` is
+#: Written on the stored timeline. ``tau_y_ref`` is
 #: the clock of the SCORED target (``tau_min`` under a physical forecast clock), not the target
 #: encoder's input reference.
 PHYSICAL_LAG_IDENTITY = (
@@ -710,8 +710,8 @@ def check_argmax_lag(results: Dict[str, Any]) -> Dict[str, Any]:
     - \tau^y_{\mathrm{ref}})$ on the canonical stored timeline, every physical delay shorter than
     what that lag encodes is reported *at* it, because the window carries no bin below it. On this
     cell's geometry a $20$-$60$ s physiological delay sits below lag $0$ at most horizon steps
-    under the single reference and grazes lag $0$ at the far horizon step under the shipped dual
-    reference ($\ell = -0.1$ at $h = 29$), so a pin
+    under the single reference and grazes lag $0$ only near the far horizon step $h = H - 1$ under
+    the dual reference, so a pin
     at the floor is the readout hitting a wall rather than the machinery failing to look back --
     and reading it as inertness is a conclusion the geometry does not support.
 
@@ -825,7 +825,7 @@ def build_lag_heads(results: Dict[str, Any]) -> Dict[str, Any]:
 
     The entropies are the attention's own and the KL split is the posterior's, so both travel: a
     head can be sharp in where it attends and carry almost none of the divergence, and the pair is
-    what separates "this head looks at lag 33" from "this head is what moved the belief".
+    what separates "this head looks at lag $\ell$" from "this head is what moved the belief".
 
     Args:
         results: The accumulated results, read for the ``lag`` block.

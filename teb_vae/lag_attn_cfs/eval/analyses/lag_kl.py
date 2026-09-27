@@ -232,6 +232,9 @@ def build_summary_rows(lag: Dict[str, Any], delay_steps: int) -> List[Dict[str, 
                     None if peak["width_bins"] is None
                     else float(peak["width_bins"]) * float(SECONDS_PER_LAG_STEP)
                 ),
+                # Censored rather than located: the argmax is the longest lag searched, so the true
+                # maximum may lie beyond the window and the width is truncated on that side.
+                "peak_at_window_edge": peak["at_window_edge"],
                 "mass_above_half_peak": concentration["share"],
                 "n_bins_above_half_peak": concentration["n_bins"],
                 "n_secondary_peaks": len(secondary),
@@ -324,7 +327,7 @@ def measured_lag_support(lag: Dict[str, Any], recorded: Dict[str, Any]) -> Dict[
 # Stratified profiles
 #
 # No pipeline before this one cut the lag readout by anything. What is emitted here is the whole
-# 91-bin profile per cohort and per time window rather than a per-cohort argmax, because an argmax
+# L-bin profile per cohort and per time window rather than a per-cohort argmax, because an argmax
 # is not a reading of a profile -- and because two cohorts whose peaks coincide can still put very
 # different amounts of mass near them.
 #
@@ -656,6 +659,7 @@ def stratified_peak_rows(frame: pd.DataFrame, delay_steps: int) -> List[Dict[str
                     else float(lag_compensated_seconds(argmax, delay_steps=delay_steps))
                 ),
                 "peak_value": peak["peak"],
+                "peak_at_window_edge": peak["at_window_edge"],
                 "peak_width_bins": peak["width_bins"],
                 "peak_width_seconds": (
                     None if peak["width_bins"] is None

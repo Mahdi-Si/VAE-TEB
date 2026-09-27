@@ -180,7 +180,7 @@ def test_the_horizon_figure_spans_the_whole_forecast_window_in_seconds() -> None
         shared_figures.plt.close(figure)
 
     assert limits == [(0.0, 4.0 * horizon)] * len(limits)
-    assert len(limits) == 3
+    assert len(limits) == 4
 
 
 def test_the_horizon_figures_gap_line_is_the_recomputed_difference() -> None:
@@ -317,41 +317,79 @@ def test_a_retained_block_is_drawn_and_recorded(emitted) -> None:
     assert (emitted["dir"] / figure_filename(forecast_analysis.OVERLAY_FIGURE)).is_file()
 
 
-def test_the_overlay_draws_one_panel_per_channel_against_lead_time() -> None:
+def test_the_overlay_draws_the_raw_rows_then_one_row_per_channel_against_time() -> None:
     r"""Not the raw cells' single waveform: what this model forecasts is an
-    $H \times C_{\mathrm{keep}}$ block, so the comparison being drawn is between the three curves
-    *within* a channel and each channel gets its own panel and its own y-axis."""
+    $H \times C_{\mathrm{keep}}$ block, so the comparison being drawn is between the curves
+    *within* a channel, each channel on its own row under the raw FHR and UP rows."""
     from teb_vae.lag_attn.eval import figures as shared_figures
 
-    channels = forecast_analysis.overlay_channels(_CHANNELS)
+    channels = forecast_analysis.overlay_channels(_CHANNELS, 3)
+    retained = _retained_blocks()
+    geometry = {"horizon": _HORIZON, "anchor_first": _ANCHOR_FLOOR, "anchor_stride": 1}
+    samples = forecast_analysis.overlay_samples(
+        retained, pd.DataFrame({"guid": ["g0", "g1"]}), None, geometry=geometry, count=2
+    )
     figure = forecast_analysis.build_overlay_figure(
-        _retained_blocks(), row=0, anchor=0, channels=channels
+        retained, samples, channels, geometry=geometry, predictive_band=False
     )
     try:
-        axis = figure.axes[0]
-        lines = {line.get_label(): np.asarray(line.get_ydata()) for line in axis.lines}
-        x = np.asarray(axis.lines[0].get_xdata(), dtype=np.float64)
-        n_panels = len(figure.axes)
+        n_axes = len(figure.axes)
+        # Column 0 of the first channel row, below the two raw rows.
+        axis = figure.axes[2 * len(samples)]
+        lines = [np.asarray(line.get_ydata(), dtype=np.float64) for line in axis.lines]
+        x = np.asarray(axis.lines[1].get_xdata(), dtype=np.float64)
     finally:
         shared_figures.plt.close(figure)
 
-    assert n_panels == len(channels) == forecast_analysis.OVERLAY_CHANNELS
-    assert lines["truth"] == pytest.approx(np.zeros(x.size))
-    assert lines["target-only (base)"] == pytest.approx(np.full(x.size, 0.5))
-    assert lines["source-conditioned (full)"] == pytest.approx(np.full(x.size, -0.5))
+    assert n_axes == (2 + len(channels)) * len(samples)
+    # History (dashed), truth, base mean, full mean, in that order.
+    assert lines[1] == pytest.approx(np.zeros(_HORIZON))
+    assert lines[2] == pytest.approx(np.full(_HORIZON, 0.5))
+    assert lines[3] == pytest.approx(np.full(_HORIZON, -0.5))
     # One point per horizon step, the first of them one decimated step ahead of the anchor.
-    assert x.size == _HORIZON
     assert list(x) == pytest.approx([4.0, 8.0, 12.0, 16.0])
 
 
-def test_the_overlay_channels_are_spread_across_the_axis_and_deterministic() -> None:
-    """Fixed and evenly spaced so two runs of one checkpoint draw the same channels and a figure
-    can be compared across arms rather than only read."""
-    assert forecast_analysis.overlay_channels(98) == [0, 48, 97]
+def test_the_overlay_channels_are_deterministic_and_one_per_band_when_the_map_is_known() -> None:
+    """Fixed so two runs of one checkpoint draw the same channels and a figure can be compared
+    across arms rather than only read; with the channel map, one scattering channel per band and
+    the phase channel scored over the fewest horizon steps."""
+    assert forecast_analysis.overlay_channels(98, 3) == [0, 48, 97]
     assert forecast_analysis.overlay_channels(98) == forecast_analysis.overlay_channels(98)
     # Degenerate widths do not raise and do not invent a channel.
     assert forecast_analysis.overlay_channels(2) == [0, 1]
     assert forecast_analysis.overlay_channels(0) == []
+
+    kept = pd.DataFrame(
+        {
+            "kept_channel": range(8),
+            "block": ["scattering"] * 5 + ["phase"] * 3,
+            "band": ["slow_baseline", "beat_to_beat", "variability", "deceleration", "deceleration",
+                     "beat_to_beat", "variability", "deceleration"],
+        }
+    )
+    scored = np.asarray([30, 30, 30, 30, 30, 5, 30, 30])
+    assert forecast_analysis.overlay_channels(8, kept_map=kept, scored_horizon=scored) == [0, 1, 2, 4, 5]
+
+
+def test_the_history_before_an_anchor_is_an_earlier_anchors_future() -> None:
+    """Horizon step tau of the anchor at step t is step t + 1 + tau, so the stored target at every
+    step the decoded anchors look ahead to is recovered from the retained block alone."""
+    first, anchors, horizon = 6, 4, 3
+    steps = first + np.arange(anchors)[:, None] + 1 + np.arange(horizon)[None, :]
+    series = forecast_analysis.step_series(steps.astype(float), first=first, stride=1)
+
+    assert list(series[first + 1:]) == pytest.approx(list(range(first + 1, first + anchors + horizon)))
+    assert np.isnan(series[: first + 1]).all()
+
+
+def test_the_band_widens_to_the_marginal_variance_under_the_ar_residual() -> None:
+    r"""$v_\tau = \sigma^2_\tau + \phi^2 v_{\tau-1}$: the density scores the innovation, so the
+    residual accumulates earlier innovations and the band drawn around the mean must too."""
+    variance = forecast_analysis.marginal_variance(np.ones(3), 0.5)
+
+    assert list(variance) == pytest.approx([1.0, 1.25, 1.3125])
+    assert list(forecast_analysis.marginal_variance(np.ones(3), None)) == [1.0, 1.0, 1.0]
 
 
 # =================================================================================================

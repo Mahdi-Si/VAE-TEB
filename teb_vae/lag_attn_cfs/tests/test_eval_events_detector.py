@@ -154,6 +154,19 @@ def test_a_quiet_trace_carries_no_contractions() -> None:
     assert events.detect_contractions(quiet)["peak_raw"].size == 0
 
 
+def test_a_peak_with_no_rising_edge_inside_the_walk_is_not_a_contraction() -> None:
+    """A slow drift to a peak never falls through the event's own level within the onset walk, so
+    the walk returns its bound -- an onset set by ``CONTRACTION_WALK_S`` rather than by the trace,
+    from which every contraction age would be measured. It is dropped, not reported."""
+    rng = np.random.default_rng(2)
+    peak = int(400.0 * events.FS_RAW)
+    drift = 30.0 + _NOISE * rng.standard_normal(_N_SAMPLES) + _AMPLITUDE * _triangle(
+        _N_SAMPLES, peak, int(5.0 * events.CONTRACTION_WALK_S * events.FS_RAW), int(_FALL_S * events.FS_RAW)
+    )
+
+    assert events.detect_contractions(drift)["peak_raw"].size == 0
+
+
 def test_a_trace_shorter_than_the_detector_can_work_on_returns_no_events() -> None:
     short = _up_trace()[: int(0.5 * events.MIN_CONTRACTION_TRACE_S * events.FS_RAW)]
 

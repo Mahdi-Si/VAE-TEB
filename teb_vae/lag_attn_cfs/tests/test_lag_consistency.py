@@ -51,7 +51,7 @@ import numpy as np  # noqa: E402
 import pytest  # noqa: E402
 import torch  # noqa: E402
 
-from teb_vae.lag_attn.nets.lag_report import COMPENSATED_LAG_AXIS_LABEL  # noqa: E402
+from teb_vae.lag_attn_rws.sample_page import LAG_SECONDS_LABEL  # noqa: E402
 from teb_vae.lag_attn_cfs import sample_page  # noqa: E402
 from teb_vae.lag_attn_rws import plotting  # noqa: E402
 from teb_vae.lag_attn_rws.plotting import _source_delay_steps  # noqa: E402
@@ -177,7 +177,13 @@ def test_filling_the_panels_delays_with_the_warm_up_did_not_move_the_lag_axis():
             assert secondary.get_ylim() != pytest.approx(
                 (4.0 * (low + worst), 4.0 * (high + worst))
             ), prefix
-            assert secondary.get_ylabel() == COMPENSATED_LAG_AXIS_LABEL, prefix
+            # No delay was added back, so the axis must not claim a compensation.
+            assert secondary.get_ylabel() == LAG_SECONDS_LABEL, prefix
+            # And it is readable: whole minutes left a short lag range with the lone tick 0.
+            shown = [
+                tick for tick in secondary.get_yticks() if 4.0 * low <= tick <= 4.0 * high
+            ]
+            assert len(shown) >= 2, (prefix, shown)
     finally:
         plt.close(figure)
 

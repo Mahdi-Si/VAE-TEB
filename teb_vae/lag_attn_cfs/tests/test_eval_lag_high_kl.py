@@ -173,16 +173,16 @@ def test_the_high_and_rest_bands_partition_every_segments_anchors(tmp_path) -> N
     _, directory = _run(_context(), tmp_path)
 
     per_recording = pd.read_csv(directory / analysis.PER_RECORDING_FILENAME)
-    delivery = per_recording[
-        (per_recording["clock"] == "time_to_delivery")
-        & (per_recording["group_column"] == "clinical_class")
-    ]
+    delivery = per_recording[per_recording["clock"] == "time_to_delivery"]
     assert len(delivery)
+    # One row per (recording, window), naming both of the recording's cohorts.
+    assert not delivery.duplicated(["guid", "time_bin"]).any()
+    assert delivery["subgroup"].notna().all() and delivery["clinical_class"].notna().all()
     total = delivery["high_n_anchors"] + delivery["rest_n_anchors"]
     assert (total == ANCHORS_PER_SEGMENT).all()
     assert (delivery["high_anchor_frac"] + delivery["rest_anchor_frac"]).to_numpy() == pytest.approx(1.0)
     # And the more severe class, which the fixture gave more high anchors, has the larger share.
-    by_class = delivery.groupby("group")["high_anchor_frac"].mean()
+    by_class = delivery.groupby("clinical_class")["high_anchor_frac"].mean()
     assert by_class["hie"] > by_class["healthy"]
 
 
