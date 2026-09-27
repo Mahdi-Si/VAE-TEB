@@ -69,6 +69,13 @@ CONTRACTION_WALK_S = 60.0
 #: gradient because a gradient test cannot be made to work at either end: see :func:`_flank`.
 FLANK_LEVEL_FRAC = 0.9
 
+#: How much of its own prominence an event must have risen through inside the onset walk to count
+#: as a contraction at all. Below it the walk found no rising edge -- a slow drift, or a noise bump
+#: on a flat trace that the sigma-relative prominence admitted -- and its onset would be the walk
+#: bound. Half rather than :data:`FLANK_LEVEL_FRAC`: a contraction whose baseline wanders above
+#: the level still rose through most of its prominence, and keeps its bounded onset.
+ONSET_MIN_RISE_FRAC = 0.5
+
 #: Shortest trace the detector will look at, in seconds. Below it ``find_peaks`` has nothing to
 #: work with and the edge rule has already removed the whole trace; it returns no events, which
 #: is why a caller reports the length rather than the empty result.
@@ -296,6 +303,12 @@ def detect_contractions(
         prominence_sigma: Required prominence, in units of $\sigma$ of the smoothed trace.
         edge_seconds: Drop peaks within this many seconds of either end.
 
+    **An event whose onset walk finds no rising edge is dropped.** When the smoothed trace falls
+    through less than :data:`ONSET_MIN_RISE_FRAC` of the event's prominence within
+    :data:`CONTRACTION_WALK_S` before the peak, the walk returns its bound, which is a property of
+    the walk rather than of the trace; such a peak is a slow drift or a noise bump, not a
+    contraction with an onset to measure an age from.
+
     Returns:
         ``{'onset_raw', 'peak_raw', 'end_raw'}`` of ``int64`` raw-sample indices, parallel and
         possibly empty.
@@ -327,8 +340,12 @@ def detect_contractions(
         return empty
 
     onsets, ends = _event_flanks(smooth, peaks, prominences, walk_seconds=CONTRACTION_WALK_S, fs=fs)
+    # An onset walk that ran its full length through less than ONSET_MIN_RISE_FRAC of the event's
+    # prominence found no rising edge: the "onset" is then the walk bound, a number set by
+    # CONTRACTION_WALK_S rather than by the trace, and every age measured from it would be too.
+    rising = smooth[peaks] - smooth[onsets] >= ONSET_MIN_RISE_FRAC * prominences
     return drop_events_overlapping_gaps(
-        {"onset_raw": onsets, "peak_raw": peaks, "end_raw": ends},
+        {"onset_raw": onsets[rising], "peak_raw": peaks[rising], "end_raw": ends[rising]},
         valid,
         span_keys=("onset_raw", "end_raw"),
     )
@@ -411,6 +428,7 @@ __all__ = [
     "FLANK_LEVEL_FRAC",
     "FS_RAW",
     "MIN_CONTRACTION_TRACE_S",
+    "ONSET_MIN_RISE_FRAC",
     "ONSET_WALK_BACK_NOTE",
     "ScipyRequired",
     "detect_contractions",

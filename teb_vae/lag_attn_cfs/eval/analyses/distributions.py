@@ -156,7 +156,7 @@ class Metric:
     meaning: str
 
 
-#: The eight distributions drawn, two per question this pipeline asks. Deliberately a short
+#: The distributions drawn, two or three per question this pipeline asks. Deliberately a short
 #: explicit list rather than every numeric column on the table: the per-sample frame carries about
 #: thirty-five, and a figure with thirty-five rows is one nobody reads. The choice of *which* is an
 #: editorial claim about which distributions matter, and it belongs in one visible table.
@@ -174,7 +174,8 @@ METRICS: Tuple[Metric, ...] = (
     Metric(
         "nll_full_block", "nll_full_block", False, "nats per anchor", None,
         "the source-conditioned block score: accuracy and confidence together, summed over the "
-        "H*C_keep coefficients of one anchor's forecast block",
+        "scored cells of one anchor's H x C_keep forecast block (the scored-cell mask drops the "
+        "fast channels past their scored horizon)",
     ),
     # --- Coupling ------------------------------------------------------------
     Metric(
@@ -194,7 +195,7 @@ METRICS: Tuple[Metric, ...] = (
     ),
     # --- Latent and calibration ----------------------------------------------
     Metric(
-        "delta_mu_rms", "delta_mu_rms", False, NORMALISED_UNIT, None,
+        "delta_mu_rms", "delta_mu_rms", False, "latent units", None,
         "per-element RMS of mu_post - mu_prior: how far the source moved the belief. Already "
         "rooted by the collection pass, so it is drawn as it is stored",
     ),
@@ -264,12 +265,14 @@ def build_frames(
         recording[metric.name] = recording_values
         units[metric.name] = metric.unit
 
-    for name in IDENTITY_COLUMNS:
-        if name in getattr(per_sample, "columns", []):
-            segment[name] = per_sample[name].to_numpy()
+    identity = [name for name in IDENTITY_COLUMNS if name in getattr(per_sample, "columns", [])]
+    for name in identity:
+        segment[name] = per_sample[name].to_numpy()
     for name in labels.GROUP_COLUMNS:
         if name in getattr(per_guid, "columns", []):
             recording[name] = per_guid[name]
+    # Identity first, so a row of the written CSV reads as whose segment before what it measured.
+    segment = segment[identity + [name for name in segment.columns if name not in identity]]
 
     return segment, recording, units
 

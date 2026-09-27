@@ -84,7 +84,6 @@ from teb_vae.lag_attn_cfs.eval.lag_axis import (
     COEFFICIENT_LAG_AXIS_LABEL,
     GROUP_DELAY_CAVEAT,
     MAX_MEASURED_GROUP_DELAY_SECONDS,
-    SHIPPED_LAG_SPAN_SECONDS,
 )
 from teb_vae.lag_attn_cfs.model_kwargs import (
     ALIGN_MODEL_KWARGS,
@@ -175,9 +174,10 @@ SCHEDULE_KEYS: Tuple[str, ...] = ("kld_beta", "beta_schedule")
 #: bank is strictly one-sided, so the forecast claim is exact.
 #:
 #: What survives is the narrower refusal, and it is why the string "transfer entropy" appears here
-#: exactly once -- in the clause that refuses the name. The two figures are drawn from
+#: exactly once -- in the clause that refuses the name. The group-delay figure is drawn from
 #: :mod:`~teb_vae.lag_attn_cfs.eval.lag_axis` rather than restated, so the caveat and the axis it
-#: qualifies cannot come to quote different numbers; the run's **own** per-block delays are recorded
+#: qualifies cannot come to quote different numbers, and no lag window is quoted because it is a
+#: per-run config value; the run's **own** per-block delays are recorded
 #: beside this sentence in :func:`group_delay_summary`.
 CAUSALITY_STATEMENT = (
     "The stored coefficients are produced by a strictly one-sided filter bank, so a coefficient at "
@@ -186,8 +186,8 @@ CAUSALITY_STATEMENT = (
     "named source_conditioned_kl_raw and no number in this run may be labelled a transfer entropy: "
     f"the lag map is an attribution over stored-coefficient time, uncorrected for a composed "
     f"one-sided group delay reaching {MAX_MEASURED_GROUP_DELAY_SECONDS:g} s on the committed causal "
-    f"fixture -- the same order as the {SHIPPED_LAG_SPAN_SECONDS:g} s lag search itself. "
-    "causal_delay_s records this run's own per-block delays."
+    "fixture -- as long as a lag search window or longer (this run's window is lag.n_lags in its "
+    "collection record). causal_delay_s records this run's own per-block delays."
 )
 
 #: The causality-record keys the *shared* half owns, which no encoder disclosure may return.
@@ -618,7 +618,7 @@ def _as_int_tuple(values: Any) -> Optional[Tuple[int, ...]]:
 _FORECAST_CLOCK_LABELS: Dict[str, str] = {
     "stored": (
         "stored: each target channel scored at its own later stored coefficient, available "
-        "4-120 s after the anchor (exact coefficient availability)"
+        "4 s to 4 H s after the anchor (exact coefficient availability)"
     ),
     "physical": (
         "physical: APPROXIMATE delay compensation -- each channel advanced by "
@@ -949,7 +949,7 @@ def check_warmup_budget_matches_checkpoint(
             - resolved.max_forecast_advance - geometry["warmup_period"]
         ),
         # The input shifts, so a reader can see how much fresh trajectory the alignment withheld
-        # (340 s at the shipped target reference) without re-resolving the budget.
+        # without re-resolving the budget.
         "max_target_input_shift_s": float(SECONDS_PER_STEP * resolved.target.max_align_delay),
         "max_source_input_shift_s": float(SECONDS_PER_STEP * resolved.source.max_align_delay),
         # The source-to-label content separation from the ACTUAL gathers, on the canonical stored
@@ -963,10 +963,8 @@ def check_warmup_budget_matches_checkpoint(
         "source_dropped_index": list(resolved.source.dropped_index),
         "target_max_align_delay": int(resolved.target.max_align_delay),
         "source_max_align_delay": int(resolved.source.max_align_delay),
-        # The forecast clock, beside the input clocks: which stored step each target channel was
-        # SCORED at is as much a property of the run as which step it was read at.
-        "target_forecast_clock": resolved.target_forecast_clock,
-        "target_forecast_reference_s": resolved.target_forecast_reference_s,
+        # The forecast clock itself is recorded above, beside its label; this is the same advance
+        # under the name the budget record has always carried it.
         "max_forecast_advance": int(resolved.max_forecast_advance),
         "quantile": resolved.quantile,
         "summary": resolved.summary(),
@@ -1274,8 +1272,8 @@ def lag_support(model: Any) -> Dict[str, Any]:
     $$\texttt{lag\_support\_margin\_steps} = \min_t \mathcal A - (L - 1) - F_u,$$
 
     where $\min_t \mathcal A = F$ is the earliest decoded anchor, $L - 1 = \texttt{max\_lag}$ is the
-    furthest searched lag and $F_u$ is the lag floor. At a floor of $133$, $L = 91$ and no lag
-    floor it is $133 - 90 - 0 = 43$.
+    furthest searched lag and $F_u$ is the lag floor; it is non-negative exactly when
+    $F \ge \texttt{max\_lag} + F_u$.
 
     Everything the per-lag analyses simplify away holds exactly when this is $\ge 0$: the raw
     pipeline's per-lag support correction, its untruncated recomputation over the anchors where every

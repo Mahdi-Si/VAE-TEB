@@ -237,6 +237,21 @@ def test_the_whole_collection_is_bit_identical_when_repeated(task) -> None:
         assert np.array_equal(first["deltas"][name], second["deltas"][name]), name
 
 
+def test_each_batch_draws_its_own_anchors_rather_than_replaying_the_first(task) -> None:
+    """Regression: the generators were seeded with one constant on every batch, so row i of every
+    batch was scored at the same anchor column and the pass visited only as many anchor phases as
+    a batch has rows. The batch position now enters the seed; the draw stays reproducible."""
+    module = _running_task(task)
+    batch = make_stub_batch(seed=1)
+
+    first = occlusion_analysis.collect_batch(module, batch, bands=TINY_BANDS, seed=0)
+    again = occlusion_analysis.collect_batch(module, batch, bands=TINY_BANDS, seed=0, batch_index=0)
+    later = occlusion_analysis.collect_batch(module, batch, bands=TINY_BANDS, seed=0, batch_index=1)
+
+    assert np.array_equal(first["anchors"], again["anchors"])
+    assert not np.array_equal(first["anchors"], later["anchors"])
+
+
 def test_an_empty_occlusion_is_exactly_the_reference_arm(task) -> None:
     """The mechanism's own fixed point, and the strongest available check that the reference and the
     bands are one computation.
@@ -524,6 +539,13 @@ def test_the_join_matches_every_scored_segment_and_counts_any_that_did_not(task,
     assert matched["clocks"]["joined"] is True
     assert matched["clocks"]["n_scored"] == BATCH
     assert matched["clocks"]["n_unjoined"] == 0
+    # The join is also what names every recording's cohorts on the per-segment and per-recording
+    # tables, which the grouped fan-out cuts on.
+    directory = tmp_path / "matched" / occlusion_analysis.ANALYSIS_DIRNAME
+    for name in (occlusion_analysis.PER_SEGMENT_FILENAME, occlusion_analysis.PER_RECORDING_FILENAME):
+        table = pd.read_csv(directory / name)
+        assert {"guid", "subgroup", "clinical_class"} <= set(table.columns), name
+        assert table["subgroup"].notna().all(), name
 
     # One epoch moved: that segment can no longer be matched, and the census says so rather than
     # the table simply being one row shorter.

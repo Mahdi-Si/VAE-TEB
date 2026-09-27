@@ -23,6 +23,14 @@ the model read that band); the anchor's largest per-coordinate divergence under 
 baseline; the layer split of the divergence and the gap; and the source zeroed band by band, as
 feature ablation, on the divergence and the gap. The structural checks are measured on every row
 of a real run and land in the block beside the fixture-proved ones.
+
+**One example anchor per class keeps its full maps**, for the example pages and the overview,
+beside the raw FHR and UP of its segment. Its maps are the main calls' own rows at that anchor,
+kept as they are made; only the variants no main call takes are integrated again for it.
+
+**Every written table names its rows**: ``guid``, subgroup, class, ``epoch`` and ``anchor`` on
+every per-row and per-anchor file (the row-aligned arrays carry them under a ``row_`` prefix), and
+the ``unit`` of the readout, which is also the unit of its attributions.
 """
 from __future__ import annotations
 
@@ -405,6 +413,10 @@ def attribute_example(
     live: Mapping[str, Optional[np.ndarray]],
     horizons: Optional[Mapping[str, int]] = None,
     latent: Optional[Mapping[str, np.ndarray]] = None,
+    maps: Optional[Mapping[Tuple[str, str, str], Dict[str, Any]]] = None,
+    layer: Optional[Mapping[Tuple[str, str], np.ndarray]] = None,
+    raw: Optional[Mapping[str, np.ndarray]] = None,
+    raw_units: Optional[Mapping[str, str]] = None,
 ) -> Tuple[Dict[str, Any], int]:
     r"""Attribute every example readout at one anchor of one sample, keeping the full maps.
 
@@ -414,6 +426,9 @@ def attribute_example(
     readout of :data:`~teb_vae.lag_attn_cfs.eval.attributions.EXAMPLE_READOUTS` and the lag
     readout on every configured band is attributed under **both** baselines, because the target
     map exists only along the all-zero path and the source map is read along the source-null one.
+    The maps and layer splits the main pass already took at this very row arrive in ``maps`` and
+    ``layer`` and are not taken again: every attribution here is deterministic, so a second call
+    would return the same arrays at the cost of a full integration.
 
     Args:
         task: The loaded task.
@@ -432,41 +447,45 @@ def attribute_example(
         horizons: The named horizon steps the per-step score is attributed at, or ``None``.
         latent: The latent at the anchor -- ``mu_prior``, ``shift`` ($\mu^q - \mu^p$) and
             ``kld_dim``, each $(d_z,)$ -- for the page's activation row, or ``None``.
+        maps: The maps already taken at this row, keyed as the returned ``maps`` are, or ``None``.
+        layer: The layer splits already taken at this row, keyed as the returned ``layer`` is, or
+            ``None``.
+        raw: The segment's raw signals in physical units (``fhr``, ``up``), or ``None``.
+        raw_units: Their units, or ``None``.
 
     Returns:
         ``(example, forward_equivalents)``: the example record -- identity, ``anchor``, ``column``,
         ``horizon``, ``inputs`` (the declared target stream with its two blocks concatenated, and
         the source stream, each $(T, C)$), ``n_scattering``, the live steps, ``model_profile``,
-        ``latent``, ``maps`` keyed by ``(readout, baseline, band)`` with the two stream maps, the
-        lag-aligned source profile and the readout at the input and at the exact baseline, and
-        ``layer`` keyed by ``(readout, band)`` with the per-unit layer split under the source-null
-        baseline -- and what it cost.
+        ``latent``, ``raw`` and ``raw_units``, ``maps`` keyed by ``(readout, baseline, band)`` with
+        the two stream maps, the lag-aligned source profile and the readout at the input and at the
+        exact baseline, and ``layer`` keyed by ``(readout, band)`` with the per-unit layer split
+        under the source-null baseline -- and what the attributions taken here cost.
     """
     model = task.orig_model
     one_inputs = tuple(x[sample:sample + 1].detach() for x in inputs)
     one_extra = tuple(x[sample:sample + 1].detach() for x in extra)
     columns = torch.tensor([int(column)], dtype=torch.long, device=one_inputs[0].device)
     n_lags = int(np.asarray(model_profile).shape[-1])
-    maps: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
-    layer: Dict[Tuple[str, str], np.ndarray] = {}
+    maps = dict(maps or {})
+    layer = dict(layer or {})
     cost = 0
     for readout, tag, band, step in core.example_variants(lag_bands, horizons):
         wrapper = core.AnchorReadout(
             model, cell, readout=readout, likelihood=likelihood, lag_band=band, horizon=step
         ).eval()
         for baseline in core.BASELINES:
+            if (readout, baseline, tag) in maps:
+                continue
             result = core.integrated_gradients(wrapper, one_inputs, one_extra, columns, baseline=baseline, n_steps=n_steps)
             cost += int(n_steps) + 3
-            maps[(readout, baseline, tag)] = {
-                core.STREAM_TARGET: result.target[0], core.STREAM_SOURCE: result.source[0],
-                "lag_profile": core.lag_profile(core.time_profile(result.source), [int(anchor)], n_lags)[0],
-                "value_input": float(result.value_input[0]), "value_baseline": float(result.value_baseline[0]),
-            }
+            maps[(readout, baseline, tag)] = example_map(result, 0, n_lags)
         # The activation split, under the source-null path along which it is complete.
-        split = core.layer_attribution(wrapper, one_inputs, one_extra, columns, baseline=core.BASELINE_SOURCE_NULL, n_steps=n_steps)
-        if split["per_unit"].size:
-            cost += int(n_steps) + 2
-            layer[(readout, tag)] = np.asarray(split["per_unit"][0], dtype=np.float64)
+        if (readout, tag) not in layer:
+            split = core.layer_attribution(wrapper, one_inputs, one_extra, columns, baseline=core.BASELINE_SOURCE_NULL, n_steps=n_steps)
+            if split["per_unit"].size:
+                cost += int(n_steps) + 2
+                layer[(readout, tag)] = np.asarray(split["per_unit"][0], dtype=np.float64)
     y_st, y_ph, u_stream = one_inputs
     example = {
         **dict(identity), "anchor": int(anchor), "column": int(column),
@@ -479,10 +498,31 @@ def attribute_example(
         "live_target": live.get(core.STREAM_TARGET), "live_source": live.get(core.STREAM_SOURCE),
         "model_profile": np.asarray(model_profile, dtype=np.float64),
         "latent": {key: np.asarray(value, dtype=np.float64) for key, value in dict(latent or {}).items()},
+        "raw": dict(raw or {}),
+        "raw_units": dict(raw_units or {}),
         "maps": maps,
         "layer": layer,
     }
     return example, cost
+
+
+def example_map(result: core.AttributionBatch, offset: int, n_lags: int) -> Dict[str, Any]:
+    """What an example page keeps of one row of one Captum call: both maps, the lag profile, the values.
+
+    Args:
+        result: The call's attributions.
+        offset: The row.
+        n_lags: $L$.
+
+    Returns:
+        ``{target, source, lag_profile, value_input, value_baseline}``.
+    """
+    source = result.source[offset:offset + 1]
+    return {
+        core.STREAM_TARGET: result.target[offset], core.STREAM_SOURCE: result.source[offset],
+        "lag_profile": core.lag_profile(core.time_profile(source), [int(result.anchor[offset])], n_lags)[0],
+        "value_input": float(result.value_input[offset]), "value_baseline": float(result.value_baseline[offset]),
+    }
 
 
 def attribute_batch(
@@ -504,8 +544,13 @@ def attribute_batch(
     with_horizon: bool = True,
     keep_maps_for: Optional[Dict[str, Any]] = None,
     work: Optional[BatchWork] = None,
+    raw_scales: Optional[Mapping[str, Tuple[float, float]]] = None,
 ) -> BatchWork:
     """Run every attribution of one batch and reduce each row to its record and vectors.
+
+    The example anchor of a class that still wants one is chosen before the calls -- the middle
+    of its sample's chosen anchors -- so each call's maps at that row are kept as they are made;
+    :func:`attribute_example` then integrates only the variants no call here took.
 
     Args:
         task: The loaded task.
@@ -526,6 +571,8 @@ def attribute_batch(
         keep_maps_for: ``{class: None}`` of the classes whose example anchor is still wanted;
             filled in place with the example record as each is attributed.
         work: The accumulator to extend, or ``None`` for a fresh one.
+        raw_scales: From :func:`~teb_vae.lag_attn_cfs.eval.traces.raw_signal_scales`, for the
+            example's raw signals in physical units; ``None`` keeps loader units, labelled so.
 
     Returns:
         The accumulator.
@@ -577,6 +624,21 @@ def attribute_batch(
         kld_rows = kld_dim.detach().cpu().numpy()[sample, columns.cpu().numpy()]
     top_coordinate = torch.as_tensor(np.argmax(kld_rows, axis=1), dtype=torch.long, device=columns.device)
 
+    example_rows: Dict[str, int] = {}
+    for element in range(len(identity)) if keep_maps_for is not None else ():
+        key = str(identity[element][labels.CLASS_COLUMN])
+        if key not in keep_maps_for or keep_maps_for[key] is not None or key in example_rows:
+            continue
+        of_sample = np.flatnonzero(sample == element)
+        if of_sample.size:
+            example_rows[key] = int(of_sample[of_sample.size // 2])
+    wanted = {
+        (readout, baseline, tag)
+        for readout, tag, _band, _step in core.example_variants(lag_bands, horizons) for baseline in core.BASELINES
+    }
+    kept_maps: Dict[str, Dict[Tuple[str, str, str], Dict[str, Any]]] = {key: {} for key in example_rows}
+    kept_layer: Dict[str, Dict[Tuple[str, str], np.ndarray]] = {key: {} for key in example_rows}
+
     calls: List[Tuple[str, str, Optional[Tuple[int, int]], Optional[torch.Tensor], str, int]] = []
     for readout in readouts:
         for baseline in baselines:
@@ -605,13 +667,20 @@ def attribute_batch(
             work, result, identity=identity, sample=sample, band_name=band_name, n_lags=n_lags,
             model_profile=model_profile, lag_bands=lag_bands, channel_groups=channel_groups,
             live=live, kld_rows=kld_rows, n_scattering=int(y_st.shape[-1]), source_split=source_split,
+            unit=core.readout_unit(readout, cell),
         )
+        if (readout, baseline, band_name) in wanted:
+            for key, offset in example_rows.items():
+                kept_maps[key][(readout, baseline, band_name)] = example_map(result, offset, n_lags)
         layer = None
         if with_layer and readout in core.MAIN_READOUTS and baseline == core.BASELINE_SOURCE_NULL:
             layer = core.layer_attribution(
                 wrapper, rows_inputs, rows_extra, columns, baseline=baseline, n_steps=n_steps
             )
             work.forward_equivalents += n_rows * (int(n_steps) + 2)
+            if layer["per_unit"].size:
+                for key, offset in example_rows.items():
+                    kept_layer[key][(readout, band_name)] = np.asarray(layer["per_unit"][offset], dtype=np.float64)
         ablation: Optional[Dict[str, np.ndarray]] = None
         if with_ablation and readout in core.MAIN_READOUTS and baseline == core.BASELINE_SOURCE_NULL and lag_bands:
             ablation = core.ablate_lag_bands(
@@ -623,7 +692,6 @@ def attribute_batch(
             record = work.rows[start + offset]
             if layer is not None and layer["per_unit"].size:
                 record["layer_total"] = float(layer["total"][offset])
-                record["layer_off_axis_total"] = float(layer["off_axis_total"][offset])
                 per_unit = layer["per_unit"][offset]
             else:
                 per_unit = np.full(0, np.nan)
@@ -631,31 +699,36 @@ def attribute_batch(
             if ablation is not None:
                 for name, values in ablation.items():
                     record[f"ablation_{name}"] = float(values[offset])
-    # One example anchor per class that still wants one: the middle of the sample's chosen anchors,
-    # attributed with its full maps kept for the map figures.
-    if keep_maps_for is not None:
-        for element in range(len(identity)):
-            key = str(identity[element][labels.CLASS_COLUMN])
-            if key not in keep_maps_for or keep_maps_for[key] is not None:
-                continue
-            of_sample = np.flatnonzero(sample == element)
-            if of_sample.size == 0:
-                continue
-            offset = int(of_sample[of_sample.size // 2])
-            where = (element, int(steps[offset])) if cell.dense_latent else (element, int(columns[offset].item()))
-            with torch.no_grad():
-                mu_prior = outputs["mu_prior"][where].detach().cpu().to(torch.float64).numpy()
-                mu_post = outputs["mu_post"][where].detach().cpu().to(torch.float64).numpy()
-            latent = {"mu_prior": mu_prior, "shift": mu_post - mu_prior, "kld_dim": np.asarray(kld_rows[offset], dtype=np.float64)}
-            example, cost = attribute_example(
-                task, inputs, extra, cell, sample=element, column=int(columns[offset].item()),
-                anchor=int(steps[offset]), identity=identity[element], model_profile=model_profile[offset],
-                lag_bands=lag_bands, n_steps=n_steps, likelihood=likelihood, live=live,
-                horizons=horizons, latent=latent,
-            )
-            work.forward_equivalents += cost
-            keep_maps_for[key] = example
-            work.examples[key] = example
+    if not example_rows:
+        return work
+    # The example anchors, their full maps kept for the map figures, beside the raw signals of
+    # their segments in physical units -- attached through the traces' own path, so a gap is a
+    # gap here exactly as it is on a trace.
+    holders = [
+        traces.SegmentTrace(
+            guid=str(who["guid"]), epoch=float(who["epoch"]), clinical_class=None, subgroup=None,
+            anchor=np.zeros(0, dtype=np.int64), contributing=np.zeros(0, dtype=bool),
+        )
+        for who in identity
+    ]
+    traces.attach_raw_signals(holders, batch, raw_scales)
+    for key, offset in example_rows.items():
+        element = int(sample[offset])
+        where = (element, int(steps[offset])) if cell.dense_latent else (element, int(columns[offset].item()))
+        with torch.no_grad():
+            mu_prior = outputs["mu_prior"][where].detach().cpu().to(torch.float64).numpy()
+            mu_post = outputs["mu_post"][where].detach().cpu().to(torch.float64).numpy()
+        latent = {"mu_prior": mu_prior, "shift": mu_post - mu_prior, "kld_dim": np.asarray(kld_rows[offset], dtype=np.float64)}
+        example, cost = attribute_example(
+            task, inputs, extra, cell, sample=element, column=int(columns[offset].item()),
+            anchor=int(steps[offset]), identity=identity[element], model_profile=model_profile[offset],
+            lag_bands=lag_bands, n_steps=n_steps, likelihood=likelihood, live=live,
+            horizons=horizons, latent=latent, maps=kept_maps[key], layer=kept_layer[key],
+            raw=holders[element].raw, raw_units=holders[element].raw_units,
+        )
+        work.forward_equivalents += cost
+        keep_maps_for[key] = example
+        work.examples[key] = example
     return work
 
 
@@ -674,8 +747,14 @@ def _reduce_rows(
     kld_rows: np.ndarray,
     n_scattering: int = 0,
     source_split: int = 0,
+    unit: str = "readout units",
 ) -> None:
-    """Turn one Captum call's maps into records and row-aligned vectors."""
+    """Turn one Captum call's maps into records and row-aligned vectors.
+
+    Every record carries the row's identity (``guid``, ``epoch``, class, subgroup, ``anchor``),
+    what was attributed (``readout``, ``baseline``, ``band``) and the ``unit`` of the readout,
+    which is also the unit of every attribution column beside it.
+    """
     n_rows = int(result.anchor.shape[0])
     target_time = core.time_profile(result.target)
     source_time = core.time_profile(result.source)
@@ -714,6 +793,7 @@ def _reduce_rows(
             "readout": result.readout,
             "baseline": result.baseline,
             "band": band_name,
+            "unit": unit,
             "coordinate": int(result.coordinate[offset]),
             "value_input": float(result.value_input[offset]),
             "value_baseline": float(result.value_baseline[offset]),
@@ -778,6 +858,7 @@ def run_segments(
     channel_groups: Mapping[str, Mapping[str, np.ndarray]],
     n_steps: int,
     anchors_per_segment: int,
+    raw_scales: Optional[Mapping[str, Tuple[float, float]]] = None,
 ) -> Tuple[BatchWork, int]:
     """Re-read the selected segments in dataset order and attribute every one.
 
@@ -790,6 +871,7 @@ def run_segments(
         channel_groups: From the channel map.
         n_steps: Integration steps.
         anchors_per_segment: Anchors per segment.
+        raw_scales: The raw signals' physical scales, for the example pages.
 
     Returns:
         ``(work, n_batches)``.
@@ -812,6 +894,7 @@ def run_segments(
         attribute_batch(
             task, moved, batch_rows, cell, lag_bands=lag_bands, channel_groups=channel_groups,
             n_steps=n_steps, anchors_per_segment=anchors_per_segment, keep_maps_for=classes, work=work,
+            raw_scales=raw_scales,
         )
         n_batches += 1
     return work, n_batches
@@ -873,6 +956,10 @@ def stack_vectors(work: BatchWork) -> Dict[str, np.ndarray]:
 def recordings_frame(rows: pd.DataFrame) -> pd.DataFrame:
     """One row per recording: the main readouts' totals and agreement under the source-null baseline.
 
+    The readouts are joined anchor by anchor, averaged over each segment's anchors and then over
+    the recording's segments -- the family's aggregation chain -- so ``n_segments`` counts
+    segments.
+
     Args:
         rows: The per-row table.
 
@@ -882,20 +969,25 @@ def recordings_frame(rows: pd.DataFrame) -> pd.DataFrame:
     """
     if rows.empty:
         return pd.DataFrame(columns=[*RECORDING_VALUE_COLUMNS, *labels.GROUP_COLUMNS, "n_segments"])
+    keys = ["guid", "epoch", "anchor", *labels.GROUP_COLUMNS]
     pieces = []
     for readout in core.MAIN_READOUTS:
         subset = rows[(rows["readout"] == readout) & (rows["baseline"] == core.BASELINE_SOURCE_NULL)]
         if subset.empty:
             continue
-        part = subset[["guid", "epoch", *labels.GROUP_COLUMNS, "source_total", "target_total", "lag_corr", "lag_js"]].copy()
+        part = subset[[*keys, "source_total", "target_total", "lag_corr", "lag_js"]].copy()
         part = part.rename(columns={name: f"{readout}_{name}" for name in ("source_total", "target_total", "lag_corr", "lag_js")})
         pieces.append(part)
     if not pieces:
         return pd.DataFrame(columns=[*RECORDING_VALUE_COLUMNS, *labels.GROUP_COLUMNS, "n_segments"])
     merged = pieces[0]
     for part in pieces[1:]:
-        merged = merged.merge(part, on=["guid", "epoch", *labels.GROUP_COLUMNS], how="outer")
-    return frames.per_recording_means(merged, [c for c in RECORDING_VALUE_COLUMNS if c in merged.columns])
+        merged = merged.merge(part, on=keys, how="outer")
+    values = [c for c in RECORDING_VALUE_COLUMNS if c in merged.columns]
+    per_segment = merged.groupby(["guid", "epoch"], as_index=False, dropna=False).agg(
+        {**{name: "mean" for name in values}, **{name: "first" for name in labels.GROUP_COLUMNS}}
+    )
+    return frames.per_recording_means(per_segment, values)
 
 
 def _mean_over_recordings(rows: pd.DataFrame, column: str) -> Tuple[float, int]:
@@ -915,6 +1007,7 @@ def summary_frame(rows: pd.DataFrame) -> pd.DataFrame:
     for (readout, baseline, band), subset in rows.groupby(["readout", "baseline", "band"], sort=False):
         record: Dict[str, Any] = {
             "readout": readout, "baseline": baseline, "band": band,
+            "unit": str(subset["unit"].iloc[0]) if "unit" in subset.columns else "readout units",
             "n_rows": int(len(subset)), "n_segments": int(subset[["guid", "epoch"]].drop_duplicates().shape[0]),
             "n_recordings": int(subset["guid"].nunique()),
         }
@@ -938,32 +1031,49 @@ def bands_frame(rows: pd.DataFrame, spectral: Optional[pd.DataFrame]) -> pd.Data
     skill = {}
     if spectral is not None and "band" in spectral.columns and "pred_gap_nats" in spectral.columns:
         skill = {str(row["band"]): float(row["pred_gap_nats"]) for _, row in spectral.iterrows()}
+    # Each stream on the path along which it moves: the target under the all-zero baseline, the
+    # source under the source-null one. The target's attribution on the source-null path is zero
+    # by construction and would be a column of zeros rather than a reading.
+    stream_baseline = {core.STREAM_TARGET: core.BASELINE_ALL_ZERO, core.STREAM_SOURCE: core.BASELINE_SOURCE_NULL}
     for readout in core.MAIN_READOUTS:
-        subset = rows[(rows["readout"] == readout) & (rows["baseline"] == core.BASELINE_SOURCE_NULL)]
-        if subset.empty:
-            continue
         for column in band_columns:
             _, stream, name = column.split("_", 2)
+            baseline = stream_baseline.get(stream, core.BASELINE_SOURCE_NULL)
+            subset = rows[(rows["readout"] == readout) & (rows["baseline"] == baseline)]
+            if subset.empty:
+                continue
             mean, count = _mean_over_recordings(subset, column)
             records.append(
                 {
-                    "readout": readout, "stream": stream, "band": name, "attribution_mean": mean,
-                    "n_recordings": count,
+                    "readout": readout, "stream": stream, "baseline": baseline, "band": name,
+                    "attribution_mean": mean, "n_recordings": count,
                     "spectral_skill_pred_gap_nats": skill.get(name, float("nan")) if stream == core.STREAM_TARGET else float("nan"),
-                    "unit": "readout units (nats per anchor for both readouts)",
+                    "unit": core.READOUT_UNITS[readout],
                 }
             )
     return pd.DataFrame(records)
 
 
 def lag_bands_frame(rows: pd.DataFrame, lag_bands: Mapping[str, Tuple[int, int]], occlusion: Optional[pd.DataFrame]) -> pd.DataFrame:
-    """Per (readout, lag band): the IG sum, the ablation delta and the occlusion delta where present."""
+    """Per (readout, lag band): the IG sum, the ablation delta and the occlusion delta where present.
+
+    The occlusion delta is that pass's mean over recordings of the horizon-summed change in the
+    full-branch block score when the band is zeroed -- the same aggregation as the two columns
+    beside it -- read from its pooled column only on a summary that carries no recording mean.
+    It is the change of ``nll_full`` itself and minus the change of ``pred_gap``, whose base
+    branch reads no source; the divergence and the squared error it does not score.
+    """
     records: List[Dict[str, Any]] = []
     if rows.empty or not lag_bands:
         return pd.DataFrame(records)
-    occluded = {}
-    if occlusion is not None and "band" in occlusion.columns and "delta_total_nats" in occlusion.columns:
-        occluded = {str(row["band"]): float(row["delta_total_nats"]) for _, row in occlusion.iterrows()}
+    occluded: Dict[str, float] = {}
+    if occlusion is not None and "band" in occlusion.columns:
+        column = next(
+            (name for name in ("delta_total_recording_mean_nats", "delta_total_nats") if name in occlusion.columns), None
+        )
+        if column is not None:
+            occluded = {str(row["band"]): float(row[column]) for _, row in occlusion.iterrows()}
+    sign = {core.READOUT_NLL_FULL: 1.0, core.READOUT_PRED_GAP: -1.0}
     for readout in core.MAIN_READOUTS:
         subset = rows[(rows["readout"] == readout) & (rows["baseline"] == core.BASELINE_SOURCE_NULL)]
         if subset.empty:
@@ -976,11 +1086,9 @@ def lag_bands_frame(rows: pd.DataFrame, lag_bands: Mapping[str, Tuple[int, int]]
                 {
                     "readout": readout, "band": name, "lag_lo": int(low), "lag_hi": int(high),
                     "ig_attribution_mean": ig_mean, "ablation_delta_mean": ablation_mean,
-                    # The occlusion pass reports the forecast COST of removing the band; on the gap
-                    # readout that cost is minus the gap's own change, so the sign is flipped here
-                    # and left absent on the divergence, which that pass does not score.
-                    "occlusion_delta_total_nats": (-delta if readout == core.READOUT_PRED_GAP else float("nan")),
+                    "occlusion_delta_total_nats": sign[readout] * delta if readout in sign else float("nan"),
                     "n_recordings": count,
+                    "unit": core.READOUT_UNITS[readout],
                 }
             )
     return pd.DataFrame(records)
@@ -1079,13 +1187,15 @@ def trace_recording(
     subgroup: Optional[str],
     n_steps: int,
     anchors_per_segment: int,
+    raw_scales: Optional[Mapping[str, Tuple[float, float]]] = None,
 ) -> List[traces.SegmentTrace]:
     """Attribute the trace readouts at the chosen anchors of every segment of one recording.
 
     Every readout of :data:`~teb_vae.lag_attn_cfs.eval.attributions.TRACE_READOUTS` is attributed
     at the same anchors under the source-null baseline, and each lands on the trace under its own
     prefix -- ``kld_value_input``, ``pred_gap_source_total`` -- beside one model lag map, so the
-    latent change and the forecast gain are read against each other anchor by anchor.
+    latent change and the forecast gain are read against each other anchor by anchor. Each
+    segment carries its raw signals, which the trace figure draws on its top rows.
 
     Args:
         task: The loaded task.
@@ -1096,9 +1206,10 @@ def trace_recording(
         subgroup: The recording's subgroup.
         n_steps: Integration steps.
         anchors_per_segment: Anchors per segment.
+        raw_scales: The raw signals' physical scales, or ``None`` for loader units.
 
     Returns:
-        One trace per segment, in dataset order.
+        One trace per segment that scored an anchor, in dataset order.
     """
     batch_size = max(1, int(getattr(loader, "batch_size", None) or 1))
     segments = subset_loader(loader, list(rows["dataset_index"]), batch_size=batch_size)
@@ -1118,10 +1229,13 @@ def trace_recording(
             task, moved, batch_rows, cell, lag_bands={}, channel_groups={}, n_steps=n_steps,
             anchors_per_segment=anchors_per_segment, readouts=core.TRACE_READOUTS,
             baselines=(core.BASELINE_SOURCE_NULL,), with_layer=False, with_ablation=False,
-            with_lag_readout=False, with_top_coordinate=False,
+            with_lag_readout=False, with_top_coordinate=False, with_horizon=False,
         )
         table = rows_frame(work)
         vectors = stack_vectors(work)
+        # One trace per batch sample, in batch order, so the raw signals attach by position; the
+        # samples that scored no anchor are dropped after.
+        batch_traces: List[traces.SegmentTrace] = []
         for _, row in batch_rows.iterrows():
             of_segment = (table["epoch"] == float(row["epoch"])).to_numpy() if len(table) else np.zeros(0, dtype=bool)
             parts = {
@@ -1130,6 +1244,10 @@ def trace_recording(
             }
             lead = parts[core.TRACE_READOUTS[0]]
             if not lead.any():
+                batch_traces.append(traces.SegmentTrace(
+                    guid=str(row["guid"]), epoch=float(row["epoch"]), clinical_class=clinical_class,
+                    subgroup=subgroup, anchor=np.zeros(0, dtype=np.int64), contributing=np.zeros(0, dtype=bool),
+                ))
                 continue
             anchors = table[lead]["anchor"].to_numpy().astype(np.int64)
             scalars: Dict[str, np.ndarray] = {}
@@ -1148,7 +1266,7 @@ def trace_recording(
                 for name in scalar_names:
                     scalars[f"{readout}_{name}"] = part[name].to_numpy().astype(np.float64)
                 trace_vectors[f"{readout}_attribution_lag_map"] = np.abs(vectors["lag_profile"][keep]).astype(np.float64)
-            gathered.append(
+            batch_traces.append(
                 traces.SegmentTrace(
                     guid=str(row["guid"]), epoch=float(row["epoch"]),
                     clinical_class=clinical_class, subgroup=subgroup,
@@ -1156,6 +1274,8 @@ def trace_recording(
                     scalars=scalars, vectors=trace_vectors,
                 )
             )
+        traces.attach_raw_signals(batch_traces, moved, raw_scales)
+        gathered.extend(segment for segment in batch_traces if len(segment.anchor))
     return gathered
 
 
@@ -1219,6 +1339,15 @@ def example_arrays(examples: Sequence[Mapping[str, Any]]) -> Dict[str, np.ndarra
         live = [e.get(f"live_{stream}") for e in examples]
         if all(value is not None for value in live):
             arrays[f"live_{stream}"] = np.stack([np.asarray(value, dtype=np.int64) for value in live], axis=0)
+    # The raw signals of each example's segment in the unit they were drawn in, NaN at gaps, on
+    # the raw grid from the segment's start.
+    for name in traces.RAW_SIGNAL_FIELDS:
+        raw = [(e.get("raw") or {}).get(name) for e in examples]
+        if all(value is not None for value in raw) and len({np.asarray(value).size for value in raw}) == 1:
+            arrays[f"example_raw_{name}"] = np.stack([np.asarray(value, dtype=np.float32) for value in raw], axis=0)
+            arrays[f"example_raw_{name}_unit"] = np.asarray(
+                [str((e.get("raw_units") or {}).get(name, "normalised")) for e in examples], dtype=object
+            )
     keys = [(index, key) for index, e in enumerate(examples) for key in e["maps"]]
     arrays["map_example"] = np.asarray([index for index, _ in keys], dtype=np.int64)
     arrays["map_readout"] = np.asarray([key[0] for _, key in keys], dtype=object)
@@ -1272,13 +1401,18 @@ def write_example_pages(
     root = Path(directory) / core.EXAMPLE_DIRNAME
     if examples:
         root.mkdir(parents=True, exist_ok=True)
+    # One set of colour scales for every page, so a colour means one value on all of them.
+    norms = core.example_norms(examples)
     for item in examples:
         stem = (
             f"{traces.class_dirname(item[labels.CLASS_COLUMN])}_"
             f"{traces.recording_stem(item['guid'], item[labels.SUBGROUP_COLUMN])}_anchor{int(item['anchor'])}"
         )
         figure = figures.render_figure(
-            core.build_example_figure(item, lag_seconds=lag_seconds, cell=cell, caveat=caveat, lag_bands=lag_bands, horizons=horizons),
+            core.build_example_figure(
+                item, lag_seconds=lag_seconds, cell=cell, caveat=caveat, lag_bands=lag_bands, horizons=horizons,
+                norms=norms,
+            ),
             root / f"{stem}{core.EXAMPLE_SUFFIX}",
         )
         manifest.append(
@@ -1304,15 +1438,22 @@ def run_traces(
     n_steps: int,
     anchors_per_segment: int,
     caveat: str,
-) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    raw_scales: Optional[Mapping[str, Tuple[float, float]]] = None,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], pd.DataFrame]:
     """Trace every chosen recording and write its arrays and figure under its class directory.
 
     Returns:
-        ``(manifest, failures)``.
+        ``(manifest, failures, anchors)``: the manifest rows, the failures, and every traced
+        anchor's row -- identity, clock, the trace readouts' scalars and lag statistics -- which
+        the figure draws and the arrays file does not carry.
     """
     manifest: List[Dict[str, Any]] = []
     failures: List[Dict[str, Any]] = []
+    anchor_frames: List[pd.DataFrame] = []
     root = Path(directory) / core.TRACE_DIRNAME
+    # Drawn after every recording is traced, so each panel shares one scale across the classes and
+    # the pages compare by eye: (recording, destination, manifest row).
+    pending: List[Tuple[Any, Path, int]] = []
     for _, choice in chosen.iterrows():
         guid = str(choice["guid"])
         clinical_class = choice[labels.CLASS_COLUMN]
@@ -1324,7 +1465,7 @@ def run_traces(
         try:
             segments = trace_recording(
                 task, loader, rows, cell, clinical_class=clinical_class, subgroup=subgroup,
-                n_steps=n_steps, anchors_per_segment=anchors_per_segment,
+                n_steps=n_steps, anchors_per_segment=anchors_per_segment, raw_scales=raw_scales,
             )
             if not segments:
                 failures.append({"guid": guid, "error": "no segment of this recording scored an anchor"})
@@ -1335,17 +1476,11 @@ def run_traces(
             stem = traces.recording_stem(guid, subgroup)
             class_dir = root / traces.class_dirname(clinical_class)
             arrays = traces.write_recording_arrays(class_dir / f"{stem}{core.TRACE_SUFFIX}.npz", recording, lag_seconds=lag_seconds)
-            figure = figures.render_figure(
-                traces.build_recording_figure(
-                    recording, panels=core.TRACE_PANELS, lag_seconds=lag_seconds,
-                    caveat=f"{cell.lag_qualification}. {caveat}. {lag_axis.GROUP_DELAY_CAVEAT}",
-                ),
-                class_dir / f"{stem}{core.TRACE_SUFFIX}",
-            )
         except Exception as error:  # noqa: BLE001 - one recording is not worth the rest of them
             logger.warning(f"{core.ANALYSIS_DIRNAME}: trace of {guid} failed: {error}")
             failures.append({"guid": guid, "error": f"{type(error).__name__}: {error}"})
             continue
+        anchor_frames.append(recording.anchors)
         span = recording.summary[cohort.HOURS_COLUMN]
         manifest.append(
             {
@@ -1354,15 +1489,58 @@ def run_traces(
                 "span_hours": float(span.max() - span.min()) if len(span) else float("nan"),
                 "coverage": float(choice["coverage"]) if "coverage" in choice.index else float("nan"),
                 "arrays_file": Path(arrays).relative_to(directory).as_posix(),
-                "figure_file": Path(figure).relative_to(directory).as_posix(),
+                "figure_file": None,
             }
         )
-    return manifest, failures
+        pending.append((recording, class_dir / f"{stem}{core.TRACE_SUFFIX}", len(manifest) - 1))
+    scales = traces.shared_panel_scales([recording for recording, _, _ in pending], core.TRACE_PANELS)
+    for recording, destination, row in pending:
+        try:
+            figure = figures.render_figure(
+                traces.build_recording_figure(
+                    recording, panels=core.TRACE_PANELS, lag_seconds=lag_seconds,
+                    caveat=f"{cell.lag_qualification}. {caveat}. {lag_axis.GROUP_DELAY_CAVEAT}",
+                    scales=scales,
+                ),
+                destination,
+            )
+            manifest[row]["figure_file"] = Path(figure).relative_to(directory).as_posix()
+        except Exception as error:  # noqa: BLE001 - one figure is not worth the rest of them
+            logger.warning(f"{core.ANALYSIS_DIRNAME}: trace figure of {recording.guid} failed: {error}")
+            failures.append({"guid": recording.guid, "error": f"{type(error).__name__}: {error}"})
+    return manifest, failures, (pd.concat(anchor_frames, ignore_index=True) if anchor_frames else pd.DataFrame())
 
 
 # =============================================================================
 # The whole pass
 # =============================================================================
+#: Every traced anchor's row, all traced recordings in one table.
+TRACE_ANCHORS_FILENAME = "attribution_trace_anchors.csv"
+
+#: The identity every row of the per-row table carries, restated in the row-aligned arrays file
+#: under a ``row_`` prefix so the arrays read without the table beside them.
+ROW_IDENTITY_COLUMNS: Tuple[str, ...] = (
+    "guid", labels.SUBGROUP_COLUMN, labels.CLASS_COLUMN, "epoch", "anchor", "readout", "baseline", "band",
+)
+
+
+def row_identity(rows: pd.DataFrame) -> Dict[str, np.ndarray]:
+    """The per-row identity arrays for the row-aligned arrays file, as strings and numbers (no pickle)."""
+    arrays: Dict[str, np.ndarray] = {}
+    for name in ROW_IDENTITY_COLUMNS:
+        if name not in rows.columns:
+            continue
+        if name in ("epoch", "anchor"):
+            arrays[f"row_{name}"] = rows[name].to_numpy(dtype=np.float64 if name == "epoch" else np.int64)
+        else:
+            arrays[f"row_{name}"] = rows[name].astype(str).to_numpy(dtype=str)
+    return arrays
+
+
+def source_channel_shifts(model: Any) -> List[int]:
+    """The per-channel shift the source gate applies before the lag attention, in stored steps."""
+    steps = getattr(getattr(getattr(model, "source_gate", None), "delay", None), "delay_steps", None)
+    return [] if steps is None else [int(step) for step in torch.as_tensor(steps).reshape(-1).tolist()]
 def run_pass(
     task: Any,
     loader: Any,
@@ -1412,6 +1590,17 @@ def run_pass(
     lag_bands = {str(name): (int(span[0]), int(span[1])) for name, span in configured.items()}
     n_steps = core.IG_STEPS
     horizons = core.horizon_steps(task.orig_model)
+    # ponytail: every lag here is a stored-step offset t - s, which is the attention's lag only
+    # while the source gate shifts no channel (the shipped unaligned arms). An aligned arm needs
+    # the per-channel shift added to the offset in lag_profile, offset_channel_map and
+    # lag_band_feature_mask; until then it is recorded and warned about, not corrected.
+    shifts = source_channel_shifts(task.orig_model)
+    if any(shifts):
+        logger.warning(
+            f"{core.ANALYSIS_DIRNAME}: the source gate shifts channels by up to {max(shifts)} "
+            f"step(s), so the stored-step lags of this analysis sit that far from the attention's "
+            f"own lags and from the occlusion bands"
+        )
     plan: Dict[str, Any] = {
         "capped": True, "cap": cap, "seed": seed, "anchors_per_segment": core.ANCHORS_PER_SEGMENT,
         "ig_steps": n_steps, "entry_fraction": core.BASELINE_ENTRY_FRACTION,
@@ -1419,8 +1608,13 @@ def run_pass(
         "horizon_steps": {name: int(step) for name, step in horizons.items()},
         "example_readouts": list(core.EXAMPLE_READOUTS),
         "lag_readout": cell.lag_readout, "lag_bands": {name: list(span) for name, span in lag_bands.items()},
+        "lag_definition": "stored-step offset from the anchor, t - s",
+        "source_channel_shift_steps_max": max(shifts, default=0),
         "layer": cell.layer_label, "delay_steps": int(delay_steps),
+        # The anchor axis the attributed anchors are chosen on, and what the attributed forward
+        # decodes: each row's own anchor alone, at the two latent means (attributed_forward).
         "anchor_phase": DENSE_ANCHOR_GEOMETRY[0], "anchor_stride": DENSE_ANCHOR_GEOMETRY[1],
+        "attributed_forward": "one anchor per row, decoded at the latent means, no epsilon drawn",
         "trace_recordings_per_class": core.TRACE_RECORDINGS_PER_CLASS,
         # The bound is the window the traced recordings are ranked for completeness over, and,
         # when set, the only segments of each chosen recording that are traced.
@@ -1430,11 +1624,12 @@ def run_pass(
     labelled = labelled_segments(segments)
     selected, accounting = select_segments(labelled, index_map, cap=cap, seed=seed)
     channel_groups = core.channel_groups_from_map(channel_map)
+    raw_scales = traces.raw_signal_scales(None, loader)
 
     started = time.perf_counter()
     work, n_batches = run_segments(
         task, loader, selected, cell, lag_bands=lag_bands, channel_groups=channel_groups,
-        n_steps=n_steps, anchors_per_segment=core.ANCHORS_PER_SEGMENT,
+        n_steps=n_steps, anchors_per_segment=core.ANCHORS_PER_SEGMENT, raw_scales=raw_scales,
     )
     purity = target_only_check(task, loader, selected, cell, n_steps=n_steps)
     elapsed = time.perf_counter() - started
@@ -1442,7 +1637,10 @@ def run_pass(
     rows = rows_frame(work)
     vectors = stack_vectors(work)
     rows.to_csv(directory / core.ROWS_FILENAME, index=False)
-    np.savez_compressed(directory / core.VECTORS_FILENAME, lag_seconds=np.asarray(lag_seconds, dtype=np.float64), **vectors)
+    np.savez_compressed(
+        directory / core.VECTORS_FILENAME, lag_seconds=np.asarray(lag_seconds, dtype=np.float64),
+        **row_identity(rows), **vectors,
+    )
     # The example anchors in class order, worst first, as every cohort figure orders them.
     examples = [work.examples[name] for name in labels.ordered_groups(list(work.examples), labels.CLASS_COLUMN)]
     if examples:
@@ -1537,13 +1735,17 @@ def run_pass(
         labelled, index_map, stride_s=segment_stride_s,
         window_hours=None if window_hours is None else float(window_hours),
     )
-    manifest, failures = run_traces(
+    trace_started = time.perf_counter()
+    manifest, failures, trace_anchors = run_traces(
         task, loader, chosen, cohort.within_horizon_index(index_map, window_hours), cell,
         directory=directory, lag_seconds=lag_seconds,
         break_after_s=break_after_s, n_steps=n_steps, anchors_per_segment=core.ANCHORS_PER_SEGMENT, caveat=caveat,
+        raw_scales=raw_scales,
     )
+    trace_elapsed = time.perf_counter() - trace_started
     pd.DataFrame(manifest, columns=list(TRACE_MANIFEST_COLUMNS)).to_csv(directory / TRACE_MANIFEST_FILENAME, index=False)
-    files.append(TRACE_MANIFEST_FILENAME)
+    trace_anchors.to_csv(directory / TRACE_ANCHORS_FILENAME, index=False)
+    files.extend([TRACE_MANIFEST_FILENAME, TRACE_ANCHORS_FILENAME])
 
     main_rows = rows[rows["readout"].isin(core.MAIN_READOUTS)] if len(rows) else rows
     checks = {
@@ -1566,7 +1768,8 @@ def run_pass(
     by_class = {str(name): int(count) for name, count in selected[labels.CLASS_COLUMN].value_counts().items()} if len(selected) else {}
     logger.info(
         f"{core.ANALYSIS_DIRNAME}: attributed {len(selected)} segment(s) at {len(rows)} row(s) in "
-        f"{elapsed:.1f} s; traced {len(manifest)} recording(s), {len(failures)} failed"
+        f"{elapsed:.1f} s; traced {len(manifest)} recording(s) in {trace_elapsed:.1f} s, "
+        f"{len(failures)} failed"
     )
     return {
         "n_samples": int(len(selected)),
@@ -1578,10 +1781,16 @@ def run_pass(
         "plan": plan,
         "selection": accounting,
         "trace_selection": trace_accounting,
-        "cost": core.cost_record(
-            elapsed_s=elapsed, n_segments=int(len(selected)), n_rows=int(len(rows)),
-            n_forward_equivalents=int(work.forward_equivalents), device=getattr(task, "device", None),
-        ),
+        "cost": {
+            **core.cost_record(
+                elapsed_s=elapsed, n_segments=int(len(selected)), n_rows=int(len(rows)),
+                n_forward_equivalents=int(work.forward_equivalents), device=getattr(task, "device", None),
+            ),
+            # The traces are a second attribution loop, over every segment of one recording per
+            # class, and are timed apart from the drawn segments the rate above describes.
+            "trace_elapsed_s": float(trace_elapsed),
+            "trace_n_anchors": int(len(trace_anchors)),
+        },
         "checks": checks,
         "summary": summary.to_dict(orient="records"),
         "lag_bands": lag_band_table.to_dict(orient="records"),
@@ -1610,7 +1819,6 @@ def _top_coordinate_rows(rows: pd.DataFrame, vectors: Mapping[str, np.ndarray]) 
         return pd.DataFrame()
     subset = rows[keep].copy()
     subset["lag_profile"] = list(vectors["lag_profile"][keep])
-    subset["target_lag_profile"] = list(vectors["target_lag_profile"][keep])
     return subset
 
 
@@ -1625,4 +1833,5 @@ __all__ = [
     "recordings_frame", "rows_frame",
     "run_pass", "run_segments", "run_traces", "select_segments", "select_trace_recordings",
     "stack_vectors", "summary_frame", "target_only_check", "trace_recording", "write_example_pages",
+    "ROW_IDENTITY_COLUMNS", "TRACE_ANCHORS_FILENAME", "example_map", "row_identity", "source_channel_shifts",
 ]

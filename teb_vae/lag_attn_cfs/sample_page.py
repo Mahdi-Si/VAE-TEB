@@ -62,11 +62,11 @@ the zeros on the row and the staircase over them are one tensor rather than two 
 
 **Each input row overlays the raw signal it was computed from, delayed onto its own clock.** The
 row is at the model's step index, and an aligned channel at step $t$ carries content centred at
-$t\Delta - \kappa\tau_{\mathrm{ref}}$ -- $352$ s earlier on the shipped target clock, $252$ s on
-the source's -- so against the raw row several rows up the coefficients sit that far to the
-right, and a reader cannot tell a misaligned channel from the design. The raw FHR delayed by
-$\kappa\tau^y_{\mathrm{ref}}$ over the target row, and the raw UP delayed by
-$\kappa\tau^u_{\mathrm{ref}}$ over the source row, put trace and coefficients on one clock, so a
+$t\Delta - \kappa\tau_{\mathrm{ref}}$ -- $\kappa\tau^y_{\mathrm{ref}}$ earlier on the target
+clock, $\kappa\tau^u_{\mathrm{ref}}$ on the source's -- so against the raw row several rows up
+the coefficients sit that far to the right, and a reader cannot tell a misaligned channel from the
+design. The raw FHR delayed by $\kappa\tau^y_{\mathrm{ref}}$ over the target row, and the raw UP
+delayed by $\kappa\tau^u_{\mathrm{ref}}$ over the source row, put trace and coefficients on one clock, so a
 deceleration and the columns it produced coincide on the row itself; every model row keeps one
 column = one anchor step, which is what the latent and lag rows below are read against. The
 delay is the panel's :attr:`~teb_vae.lag_attn_rws.sample_page.InputStreamPanel.raw_delay_s` and
@@ -83,7 +83,7 @@ is why :class:`~teb_vae.lag_attn_rws.sample_page.InputStreamPanel` carries the l
 
 **The lag axis is stored-coefficient time, not physical delay.** One-sidedness and zero latency are
 different properties and this family buys only the first: beyond its warm-up a causal channel still
-lags by its composed group delay, up to $791$ s, and nothing compensates for it. The forecast claim
+lags by its composed group delay $\tau_c$, and nothing compensates for it. The forecast claim
 survives that untouched -- a coefficient at $t$ is a function of $\{x(s) : s \le t\}$, so predicting
 $t + 1 + \tau$ from history up to $t$ is a genuine forecast whatever the internal latency -- but a
 peak at lag $\ell$ is an attribution over stored coefficients, not a physiological delay. The page
@@ -141,6 +141,7 @@ from teb_vae.lag_attn_rws.nets.raw_masks import forecast_mask  # noqa: E402
 from teb_vae.lag_attn_rws.sample_page import (  # noqa: E402
     BAND_SIGMAS,
     FORECAST_ROW,
+    NORMALISED_LIMITS,
     ForecastRowInputs,
     InputStreamPanel,
     top_down_extent,
@@ -171,26 +172,17 @@ RAW_FIELDS: Mapping[str, str] = {"target": "fhr", "source": "up"}
 #: four shipped models must not gain a caption about a transform they do not use. $\kappa$ is
 #: interpolated from :data:`~teb_vae.lag_attn_cfs.causal_warmup.ALIGNMENT_DELAY_FACTOR` rather
 #: than typed, so the sentence and the shift it describes cannot state two different constants.
+#: No ``$...$`` span holds a space, so a caller that wraps it on whitespace cannot split one.
 #: Asserted as a string by the suite, so it cannot be dropped by an edit that keeps the figure
 #: rendering.
 LAG_TIME_CAVEAT = (
-    "Time axes are stored-coefficient time, not physical time. A causal channel lags by its own "
-    "composed group delay (13-791 s as declared); aligning a stream replaces that per-channel lag "
-    "with one constant, so every kept channel drawn at step $t$ carries content centred at "
-    f"$t-\\kappa\\tau_{{\\mathrm{{ref}}}}$, $\\kappa={ALIGNMENT_DELAY_FACTOR:g}$ -- each input "
-    "row states its own, and the run logs them as reference_delay_s and source_reference_delay_s. "
-    "The input rows therefore sit that constant to the right of the raw rows above them, and under "
-    "a dual reference the two differ from each other by "
-    "$\\kappa(\\tau^y_{\\mathrm{ref}}-\\tau^u_{\\mathrm{ref}})$; each input row overlays its own "
-    "raw signal delayed by its constant, so the alignment is read off the row itself. The forecast "
-    "rows sit the scored clock's own constant to the right, stated on their axis -- "
-    "$\\kappa\\tau_{\\min}$ under the physical clock, each channel's own $\\kappa\\tau_c$ under "
-    "the stored one. Every model row is at the step index, so a column is one anchor on all of "
-    "them; only the raw row is physical time. Converting a lag peak to a "
-    "content lead time needs the same constants and nothing else -- the stored timeline is "
-    "canonical and carries no dataset-shift term -- and is done where a physical lag is "
-    "reported. Unaligned, each $\\tau_{\\mathrm{ref}}$ becomes the "
-    "channel's own $\\tau_c$ and no single number labels either axis."
+    "Every model row is drawn at its step index $t$, so one column is one anchor step on every "
+    "row; only the raw row is physical time. A causal coefficient at step $t$ describes the "
+    f"signal centred at $t-\\kappa\\tau_c$ ($\\kappa={ALIGNMENT_DELAY_FACTOR:g}$, $\\tau_c$ the "
+    "channel's composed one-sided group delay); an aligned stream replaces every $\\tau_c$ by one "
+    "reference $\\tau_{\\mathrm{ref}}$, and each input row and the forecast rows state their own "
+    "on their x axis. A lag $\\ell$ is a distance between stored coefficients, not a "
+    "physiological delay."
 )
 
 #: Lane spacing as a multiple of the widest lane's own drawn extent, the two-sided page's rule and
@@ -223,20 +215,24 @@ CAUSAL_EXTRA_ROWS: Tuple[Tuple[str, float], ...] = (
 
 #: The rows the **reduced** page keeps, in the full page's own order, handed to
 #: :func:`~teb_vae.lag_attn_rws.sample_page.build_diagnostic_figure` through its ``rows``
-#: argument. Everything a reader needs to answer "what did this recording's latent and
-#: attention do": the physiological context, the target block as the encoder receives it, the
-#: latent state and its source-derived shift, $K_t$, and the lag attention. What it drops is the
-#: forecast itself -- eight rows of what the model predicted, which is the other question.
+#: argument. A complete summary of one segment on half the page: the raw FHR and UP, the forecast
+#: -- truth against the base and full means with their $\pm 2\sigma$ bands and the per-channel
+#: scored-horizon mask marked on each lane -- both input streams as the encoders receive them,
+#: the latent state and its source-derived shift, $K_t$, and both lag maps. What it drops is the
+#: per-channel detail: the five field rows, the per-window score and the per-dimension KL.
 #:
-#: ``input_target`` is the name the layout derives from :func:`causal_stream_panels`'s first
-#: panel, which is why this constant lives here rather than beside the layout: the shared
-#: builder does not know what this cell's streams are called.
+#: ``input_target`` and ``input_source`` are the names the layout derives from
+#: :func:`causal_stream_panels`'s panels, which is why this constant lives here rather than beside
+#: the layout: the shared builder does not know what this cell's streams are called.
 COMPACT_PAGE_ROWS: Tuple[str, ...] = (
     "raw",
+    FORECAST_ROW,
     "input_target",
+    "input_source",
     "latent",
     "kld_total",
     "lag_attn",
+    "kl_lag_map",
 )
 
 #: Coverage a correctly calibrated $\mu \pm 2\sigma$ band attains under the Gaussian the
@@ -257,13 +253,15 @@ _PREFIX_MARGIN = 0.03
 _PREFIX_MIN_SPAN = 0.30
 
 #: Vertical placement of the two profile insets inside the gap row, as ``(y0, height)`` in axes
-#: fractions. Nearly the full height: that row's own content is eleven markers on one curve.
-_PROFILE_VERTICAL = (0.10, 0.84)
+#: fractions. Most of the height -- that row's own content is one marker per drawn window -- but
+#: raised off the bottom so the insets' own tick labels and axis labels stay clear of the row's.
+_PROFILE_VERTICAL = (0.22, 0.72)
 
-#: Vertical placement of the per-anchor error map inside the forecast row. Stops well below the
-#: top because the lane row's legend sits at its upper left -- in the same blank prefix, and it is
-#: the legend that names which of the three curves in a lane is which.
-_ERROR_MAP_VERTICAL = (0.06, 0.60)
+#: Vertical placement of the per-anchor error map inside the forecast row. Raised off the bottom
+#: for the same reason, and stopping well below the top because the lane row's legend sits at its
+#: upper left -- in the same blank prefix, and it is the legend that names which of the three
+#: curves in a lane is which.
+_ERROR_MAP_VERTICAL = (0.21, 0.44)
 
 #: Robust colour-limit percentiles for the field rows, the input rows' own rule and for its
 #: reason: these are z-scored wavelet coefficients and one heavy-tailed channel otherwise sets the
@@ -324,8 +322,8 @@ def _time_label(reference_delay_s: Optional[float]) -> str:
 
     The row is drawn at the model's **step index** while the raw rows it shares a column with are
     in physical time, so an aligned channel's content sits $\kappa\tau_{\mathrm{ref}}$ to the left
-    of where the column puts it -- $352$ s on this cell's shipped target clock, over a quarter of
-    the drawn window. Naming it on the axis is what closes that at the point of use; the page
+    of where the column puts it -- on a slow reference, a sizeable fraction of the drawn window.
+    Naming it on the axis is what closes that at the point of use; the page
     footnote states the rule the number comes from.
 
     Args:
@@ -353,9 +351,9 @@ def _forecast_time_label(
     r"""The forecast rows' x-axis label, naming the clock the scored target sits on.
 
     Those rows are drawn at the scored step $u$, and the element scored there carries content
-    from before it: $\kappa\tau_{\min}$ -- $12$ s at the shipped bank -- under the ``physical``
-    clock, where every channel is advanced onto the fastest one's; $\kappa\tau^y_{\mathrm{ref}}$
-    under ``input``; and each channel's own $\kappa\tau_c$, $12$ to $352$ s, under ``stored``,
+    from before it: $\kappa\tau_{\min}$ under the ``physical`` clock, where every channel is
+    advanced onto the fastest one's; $\kappa\tau^y_{\mathrm{ref}}$ under ``input``; and each
+    channel's own $\kappa\tau_c$ under ``stored``,
     where nothing is re-indexed. The lane row, the five field rows and the per-window score all
     share the column, so they share the label.
 
@@ -640,6 +638,45 @@ def _tail_anchor(
     return list(positions)
 
 
+def _tiled_scored(
+    cell_mask: Optional[torch.Tensor],
+    anchors: np.ndarray,
+    positions: Sequence[int],
+    horizon: int,
+    steps: int,
+) -> Optional[np.ndarray]:
+    r"""Lay the model's scored-cell mask onto the drawn tiling, by :func:`_tiled_branch`'s rule.
+
+    The objective scores kept channel $c$ at horizon step $\tau$ only where the
+    $(H, C_{\mathrm{keep}})$ mask is set -- a fast phase channel only for its first $H_c$ steps -- so a stitched step is
+    scored exactly when the window that drew it scores that step. First writer wins, as in the
+    tiling, so the mask and the drawn values always come from the same window.
+
+    Args:
+        cell_mask: The model's mask, or ``None`` for a model that scores every cell.
+        anchors: The decoded anchor indices of the sample being drawn.
+        positions: The drawn positions, ascending.
+        horizon: $H$.
+        steps: $T$.
+
+    Returns:
+        A boolean $(T, C_{\mathrm{keep}})$ array, ``False`` outside every drawn window, or
+        ``None`` when ``cell_mask`` is.
+    """
+    if cell_mask is None:
+        return None
+    mask = to_numpy(cell_mask).astype(bool)
+    scored = np.zeros((int(steps), mask.shape[1]), dtype=bool)
+    covered = np.zeros(int(steps), dtype=bool)
+    for position in positions:
+        start = int(anchors[position]) + 1
+        stop = min(start + int(horizon), int(steps))
+        fresh = ~covered[start:stop]
+        scored[start:stop][fresh] = mask[: stop - start][fresh]
+        covered[start:stop] = True
+    return scored
+
+
 def _draw_anchor_overlay(
     ax: Any,
     rows: ForecastRowInputs,
@@ -743,6 +780,10 @@ class _Stitched:
             the scored target sits on -- see :func:`_forecast_time_label`. On the stitched
             description rather than recomputed per row, for the reason the tiling is: eight rows
             sharing one column must state one clock.
+        scored: Whether the objective scores each drawn cell $(T, C_{\mathrm{keep}})$ -- the
+            model's per-channel scored horizon laid onto the same tiling, ``False`` outside the
+            drawn windows -- or ``None`` when the model scores every cell of its block. See
+            :func:`_tiled_scored`.
     """
 
     truth: np.ndarray
@@ -755,6 +796,7 @@ class _Stitched:
     anchors: np.ndarray
     positions: Sequence[int]
     time_label: str = "Time (s)"
+    scored: Optional[np.ndarray] = None
 
     @property
     def block_spans(self) -> Tuple[Tuple[str, int, int], ...]:
@@ -887,63 +929,77 @@ def _draw_field_rows(rows: ForecastRowInputs, stitched: _Stitched) -> None:
     """
     windows = len(stitched.positions)
     kept = int(stitched.keep.size)
-    # One scale for the three fields that are the same quantity, taken from the **truth**: scaled
+    # One scale for the three fields that are the same quantity, and a FIXED one: the target is
+    # z-scored per channel, so the normalised range means the same thing on every page. Scaled
     # each to its own range instead, a branch that predicts a flat line and one that tracks the
-    # signal would render as equally structured pictures.
-    shared = _robust_limits(stitched.truth)
+    # signal would render as equally structured pictures -- and two pages would not compare.
     for row_name, field, quantity in (
         ("pred_truth", stitched.truth, "true $Y^{+}$"),
         ("pred_base", stitched.base_mean, "base $\\mu^p$ — target-only"),
         ("pred_full", stitched.full_mean, "full $\\mu^q$ — source-conditioned"),
     ):
+        if not rows.wants(row_name):
+            continue
         _field_row(
             rows, row_name, field, stitched,
             title=(
                 f"{quantity} over all {kept} target channels — {windows} consecutive "
-                f"windows (first anchor wins), shared colour scale with the two rows beside it; grey: "
-                f"no drawn window"
+                f"windows (first anchor wins), fixed normalised colour scale shared with the two "
+                f"rows beside it; grey: no drawn window"
             ),
             cmap="viridis",
-            limits=shared,
+            limits=NORMALISED_LIMITS,
             cbar_label="normalised",
         )
 
     # Where the source earned its keep. The same subtraction ``pred_gap`` is, resolved on both
     # axes it is summed over -- and signed, because the interesting failure is the region where
-    # conditioning on UP makes the forecast *worse*, which no scalar on the page can show.
+    # conditioning on UP makes the forecast *worse*, which no scalar on the page can show. A cell
+    # the objective does not score is not part of that sum, so it is drawn as absent.
     skill = np.abs(stitched.truth - stitched.base_mean) - np.abs(
         stitched.truth - stitched.full_mean
     )
-    # Symmetric, so zero is the colormap's own centre -- but at the field rows' robust percentile
-    # rather than at ``safe_vabs``'s maximum: the difference of two absolute errors is heavy-tailed
-    # in exactly the way one outlying cell washes the whole map to white. ``_robust_limits``
-    # returns a strictly positive upper edge for a non-negative field, which is what this is.
-    _, vabs = _robust_limits(np.abs(skill))
-    _field_row(
-        rows, "pred_skill", skill, stitched,
-        title=(
-            "Source skill — $|Y^{+}-\\mu^p| - |Y^{+}-\\mu^q|$, the per-channel per-step "
-            "decomposition of the gap: red where conditioning on the source helped, blue where "
-            "it hurt"
-        ),
-        cmap="bwr",
-        limits=(-vabs, vabs),
-        cbar_label="normalised",
-    )
+    if stitched.scored is not None:
+        skill = np.where(stitched.scored, skill, np.nan)
+    if rows.wants("pred_skill"):
+        # Symmetric, so zero is the colormap's own centre: at the run's shared edge when the
+        # caller computed one, else at this page's robust percentile rather than at ``safe_vabs``'s
+        # maximum -- the difference of two absolute errors is heavy-tailed in exactly the way one
+        # outlying cell washes the whole map to white.
+        vabs = rows.row_limits.get("pred_skill") or _robust_limits(np.abs(skill))[1]
+        _field_row(
+            rows, "pred_skill", skill, stitched,
+            title=(
+                "Source skill — $|Y^{+}-\\mu^p| - |Y^{+}-\\mu^q|$ on the scored cells, the "
+                "per-channel per-step decomposition of the gap: red where conditioning on the "
+                "source helped, blue where it hurt; grey: not drawn or not scored"
+            ),
+            cmap="bwr",
+            limits=(-float(vabs), float(vabs)),
+            cbar_label="normalised",
+        )
 
-    # Sigma on its own row rather than as a band, because at 98 channels a band is unreadable and
-    # a variance collapse -- sigma pinned at its floor while the error above it is not -- is the
-    # failure this family has actually had.
-    _field_row(
-        rows, "pred_sigma", stitched.full_sigma, stitched,
-        title=(
-            "Predicted $\\sigma^q$ of the source-conditioned forecast — read against the error "
-            "two rows above: a flat map under a structured error is a collapsed variance head"
-        ),
-        cmap="magma",
-        limits=(0.0, _robust_limits(stitched.full_sigma)[1]),
-        cbar_label="normalised",
-    )
+    # Sigma on its own row rather than as a band, because at $C_{keep}$ channels a band is
+    # unreadable and a variance collapse -- sigma pinned at its floor while the error above it is
+    # not -- is the failure this family has actually had.
+    if rows.wants("pred_sigma"):
+        _field_row(
+            rows, "pred_sigma", stitched.full_sigma, stitched,
+            title=(
+                "Predicted $\\sigma^q$ of the source-conditioned forecast — read against the "
+                "error two rows above: a flat map under a structured error is a collapsed "
+                "variance head"
+            ),
+            cmap="magma",
+            limits=(
+                0.0,
+                float(
+                    rows.row_limits.get("pred_sigma")
+                    or _robust_limits(stitched.full_sigma)[1]
+                ),
+            ),
+            cbar_label="normalised",
+        )
 
 
 def _scored_clock_view(gathered: np.ndarray, shift: Optional[Sequence[int]]) -> np.ndarray:
@@ -1005,9 +1061,10 @@ def _window_block_scores(
         ar_coef: The model's AR(1) coefficient $\phi_c$, or ``None``, for the same reason.
 
     Returns:
-        ``{'base': (W,), 'full': (W,)}`` over the drawn windows, or ``None`` when the batch
-        carries no ``weight`` -- the mask is a function of it, and scoring an invalid span would
-        put a spike on the row that the objective never saw.
+        ``{'base': (W,), 'full': (W,)}`` over the drawn windows, ``NaN`` for a window whose
+        every step the mask drops, or ``None`` when the batch carries no ``weight`` -- the mask
+        is a function of it, and scoring an invalid span would put a spike on the row that the
+        objective never saw.
     """
     weight = _batch_field(rows.batch, "weight")
     if weight is None or not stitched.positions:
@@ -1047,13 +1104,17 @@ def _window_block_scores(
                 # The anchor's own target block, gathered to the decoder's lanes: anchor $t$
                 # predicts scored-clock steps $t+1 \dots t+H$, the forward's own convention.
                 target = gathered[anchor + 1 : anchor + 1 + horizon]
+                step_mask = mask[index, position]
+                if not bool(step_mask.any()):
+                    # A window the objective dropped -- its anchor's coverage is below the floor --
+                    # has no score, and a zero drawn for it read as a perfect forecast.
+                    window_scores.append(float("nan"))
+                    continue
                 per_element = raw_sample_score(
                     mean[position], target, likelihood=likelihood, logvar=logvar[position],
-                    cell_mask=cell_mask, ar_coef=ar_coef, step_mask=mask[index, position],
+                    cell_mask=cell_mask, ar_coef=ar_coef, step_mask=step_mask,
                 )
-                window_scores.append(
-                    float((per_element * mask[index, position][:, None]).sum())
-                )
+                window_scores.append(float((per_element * step_mask[:, None]).sum()))
             scores[branch] = np.asarray(window_scores, dtype=float)
     return scores
 
@@ -1063,7 +1124,8 @@ def _channel_profile(
 ) -> Tuple[np.ndarray, np.ndarray]:
     r"""One branch's per-channel error and $2\sigma$ coverage over the drawn windows.
 
-    Both are computed over the drawn support alone: outside it there is no forecast, and counting
+    Both are computed over the drawn support alone, and within it over the cells the objective
+    scores when :attr:`_Stitched.scored` says which: outside it there is no forecast, and counting
     an uncovered step as a miss would read as a calibration failure of the model rather than as an
     absence of the figure.
 
@@ -1084,6 +1146,10 @@ def _channel_profile(
     sigma = stitched.base_sigma if branch == "base" else stitched.full_sigma
     error = stitched.truth - mean
     drawn = np.isfinite(error)
+    if stitched.scored is not None:
+        # The objective's cells only: a fast channel's unscored tail is not a forecast the model
+        # was trained or is judged on, and averaged in it reads as that channel's calibration.
+        drawn &= stitched.scored
 
     with np.errstate(invalid="ignore"):
         rmse = np.sqrt(_column_mean(np.where(drawn, error**2, np.nan)))
@@ -1233,11 +1299,13 @@ def _draw_gap_row(
         label="$D_1$ full ($z^q$, source-conditioned)",
     )
 
-    gap = float(np.mean(base - full)) if base.size else float("nan")
+    scored = np.isfinite(base) & np.isfinite(full)
+    gap = float(np.mean((base - full)[scored])) if scored.any() else float("nan")
     ax.set_title(
         f"Per-window forecast score under the objective's own likelihood "
         f"('{likelihood}', masked at the model's coverage floor {coverage_floor:g}) — "
-        f"{base.size} windows, mean gap $D_0-D_1$ = {gap:.4g} over the drawn set.\n"
+        f"{int(scored.sum())} of {base.size} drawn windows scored, mean gap $D_0-D_1$ = "
+        f"{gap:.4g} over them.\n"
         f"Insets: per-channel error and $\\pm${BAND_SIGMAS:.0f}$\\sigma$ coverage over the same "
         f"windows, on the channel axis of the rows above.",
         fontsize=9, pad=6,
@@ -1269,133 +1337,36 @@ def _draw_gap_row(
     )
 
 
-def causal_forecast_rows(
+def _draw_lane_row(
     rows: ForecastRowInputs,
+    stitched: _Stitched,
     *,
-    keep_index: Optional[Sequence[int]] = None,
-    block_split: Optional[int] = None,
-    training_stride: int = 1,
-    likelihood: str = "gaussian_nll",
-    coverage_floor: float = 0.0,
-    target_forecast_shift: Optional[Sequence[int]] = None,
-    forecast_clock_delay_s: Optional[float] = None,
-    cell_mask: Optional[torch.Tensor] = None,
-    ar_coef: Optional[torch.Tensor] = None,
+    valid: np.ndarray,
+    scored_stream: np.ndarray,
+    training_stride: int,
+    anchor_ceiling: int,
+    seconds_per_step: float,
 ) -> None:
-    r"""Draw the causal-feature page's forecast rows, over the anchors the forward decoded.
+    r"""Draw :data:`FORECAST_ROW`: three kept channels as offset lanes, with the anchor overlay.
 
-    Bound to a model's channel facts and its tiling by the task and handed to
-    :func:`~teb_vae.lag_attn_rws.sample_page.build_diagnostic_figure` as its ``forecast_rows`` seam.
-    Row $1$ is the shared raw-context row, drawn from the batch because this model's target is a
-    feature block; row $2$ is the three-lane forecast, which is where the anchor axis makes this
-    different from the two-sided sibling's version; the six rows below it are
-    :data:`CAUSAL_EXTRA_ROWS`, which the same seam reserves and which draw the same tiling over
-    every kept channel.
-
-    On a page built for a subset of the rows -- see :data:`COMPACT_PAGE_ROWS` -- only the raw
-    context row and the lag footnote are drawn, and the function returns before the forecast is
-    stitched at all, so none of the per-window scoring below is paid for a page that has nowhere
-    to put it.
+    Each lane carries the truth, both branches' means with their $\pm 2\sigma$ bands, the
+    training-tile fan and -- where the model scores only part of a channel's horizon -- the
+    unscored steps marked under the truth. The per-anchor error map is inset into the prefix.
 
     Args:
-        rows: The row inputs and the layout hooks. ``rows.outs`` must carry ``anchor_index`` and
-            ``anchor_valid``: the forecast tensors are indexed by *position in the decoded set*,
-            not by anchor, so without them a window would be drawn at the wrong time with no shape
-            error anywhere in it.
-        keep_index: The budget's surviving target channels, positional into the declared $c_y$.
-            ``None`` for an ungated model, whose decoder emits every declared channel in order.
-        block_split: How many declared channels belong to the first stored block, for the error
-            map's and the field rows' boundary line. ``None`` draws no boundary.
-        training_stride: $S$, so the overlay can mark the tile grid a training step would use
-            beside the dense set this page draws.
-        likelihood: The objective's own likelihood, for the per-window score row. Bound by the
-            task from the same hyperparameter the callback passes to ``compute_loss``, so the
-            curve and the scalar beside it in the title are the same quantity.
-        coverage_floor: The model's own anchor coverage floor, so a window the objective dropped
-            is dropped from the score row too.
-        target_forecast_shift: $s_c$ per kept channel, the model's own forecast clock, so the
-            truth every row draws and the block every window scores are the ones the objective
-            saw. ``None`` -- the stored clock -- draws the stream as stored.
-        forecast_clock_delay_s: $\tau$ of that clock in seconds -- the resolved budget's
-            ``target_forecast_clock_delay_s`` -- so the forecast rows' time axis can state how
-            far before the scored step their content sits, as the input rows state theirs.
-            Nothing drawn moves with it: every row stays at the step index, so a column is one
-            anchor on the whole page. ``None`` where the page was handed no budget.
-        cell_mask: The model's $(H, C_{\mathrm{keep}})$ scored-cell mask, or ``None``. With
-            ``ar_coef`` it is the rest of the objective's density: bound by the task from the net's
-            own ``forecast_likelihood_kwargs``, so a window's score is a partial sum of the block
-            scores in the page's title. ``None`` scores every cell.
-        ar_coef: The model's AR(1) residual coefficient $\phi_c$, or ``None`` for the factorised
-            score.
-
-    Raises:
-        KeyError: If the forward dict carries no anchor set.
-        ValueError: If ``keep_index`` does not have one entry per forecast channel.
+        rows: The row inputs and the layout hooks.
+        stitched: The drawn tiling.
+        valid: Which decoded anchors are real $(A_{\max},)$.
+        scored_stream: The kept target stream on the scored clock $(T, C_{\mathrm{keep}})$, for
+            the error map.
+        training_stride: $S$, the stride a training step would tile at.
+        anchor_ceiling: One past the last anchor that exists.
+        seconds_per_step: $\Delta$ in seconds.
     """
     index, geometry = rows.sample_index, rows.geometry
-    _draw_context_row(rows)
-
-    # The footnote the lag panels are read under. Added here rather than to their titles because
-    # those panels are the shared builder's and are drawn for six other models whose transform
-    # this caveat is not about. Placed inside the GridSpec's bottom margin, so it costs no row --
-    # and written before the early return below, because a page that keeps the lag rows and drops
-    # the forecast rows is exactly the page that leads with a lag axis.
-    rows.figure.text(
-        0.5, 0.004, LAG_TIME_CAVEAT,
-        ha="center", va="bottom", fontsize=7, color=COLOR_GRAY, wrap=True,
-    )
-
-    # Everything below belongs to the forecast row and the six rows reserved under it. A page
-    # built without them has no axes for any of it, and ``row_axes`` raises rather than
-    # inventing one -- inside a callback that swallows exceptions, which would cost the page.
-    if not rows.wants(FORECAST_ROW):
-        return
-
-    anchors = to_numpy(rows.outs["anchor_index"][index]).astype(int).ravel()
-    valid = to_numpy(rows.outs["anchor_valid"][index]).astype(bool).ravel()
-    positions = _tail_anchor(
-        anchors, valid, _tiling_anchors(anchors, valid, int(geometry.horizon)),
-        int(geometry.horizon),
-    )
-
-    base_mean, base_sigma = _tiled_branch(rows, "base", anchors, positions)
-    full_mean, full_sigma = _tiled_branch(rows, "full", anchors, positions)
-    keep = _resolved_keep_index(keep_index, full_mean.shape[-1])
-
-    # The truth on the decimated grid, gathered to the channels the decoder emits, re-indexed
-    # onto the model's own forecast clock, and restricted to the drawn windows, so an uncovered
-    # span reads as absent rather than as unpredicted. Re-indexed ONCE and shared with the error
-    # map below: a second gather from the stored clock is how the inset came to score a
-    # physical-clock forecast against stored-clock truth.
-    stream = to_numpy(rows.target[index])
-    scored_stream = _scored_clock_view(stream[:, keep], target_forecast_shift)
-    truth = np.where(np.isfinite(full_mean), scored_stream, np.nan)
-
-    # The model's own anchor ceiling, re-derived exactly as the net derives it: under an advancing
-    # forecast clock the trailing max_c(s_c) anchors of [F, T_valid) read past the stored record
-    # and are never built, so the overlay's tile grid and ceiling mark must stop where the
-    # anchors do.
-    anchor_ceiling = int(geometry.t_valid) - max(
-        [0, *(int(shift) for shift in target_forecast_shift or ())]
-    )
-
-    # The one resolved description of what this page draws, shared by the lane row, the error map
-    # and the six rows below: a second walk of the anchor set, or a second count of the surviving
-    # first-block channels, is how a page comes to draw two tilings that only look aligned.
-    stitched = _Stitched(
-        truth=truth,
-        base_mean=base_mean,
-        base_sigma=base_sigma,
-        full_mean=full_mean,
-        full_sigma=full_sigma,
-        keep=keep,
-        block_split=(
-            0 if block_split is None else int(np.count_nonzero(keep < int(block_split)))
-        ),
-        anchors=anchors,
-        positions=positions,
-        time_label=_forecast_time_label(target_forecast_shift, forecast_clock_delay_s),
-    )
+    anchors, positions, keep = stitched.anchors, stitched.positions, stitched.keep
+    truth, full_mean, full_sigma = stitched.truth, stitched.full_mean, stitched.full_sigma
+    base_mean, base_sigma = stitched.base_mean, stitched.base_sigma
 
     lanes, coverage = select_forecast_channels(
         truth, full_mean, full_sigma, count=FORECAST_CHANNELS, n_sigmas=BAND_SIGMAS
@@ -1403,7 +1374,6 @@ def causal_forecast_rows(
 
     ax, cax = rows.row_axes(FORECAST_ROW)
     _, time_dec, _ = time_axes(geometry.t, geometry.raw_len)
-    seconds_per_step = rows.t_max / float(geometry.t)
 
     def lane_extent(channel: int) -> float:
         """Total vertical span the widest artist of one lane needs.
@@ -1427,12 +1397,25 @@ def causal_forecast_rows(
     if not np.isfinite(stride) or stride <= 0.0:
         stride = 1.0
 
+    marked = False
     for lane, channel in enumerate(int(value) for value in lanes):
         offset = lane * stride
         ax.plot(
             time_dec, truth[:, channel] + offset, color=COLOR_BLACK, linewidth=0.7,
             label="true $Y^{+}$" if lane == 0 else None,
         )
+        # The per-channel scored horizon, on the lane itself: a fast channel is scored only for
+        # the first steps of each window, and the rest of its forecast is drawn but never
+        # judged. Marked under the truth rather than by a second band, and only where it bites.
+        if stitched.scored is not None:
+            unscored = np.isfinite(truth[:, channel]) & ~stitched.scored[:, channel]
+            if unscored.any():
+                ax.plot(
+                    time_dec, np.where(unscored, truth[:, channel] + offset, np.nan),
+                    color=COLOR_LIGHT_GRAY, linewidth=3.0, solid_capstyle="butt", zorder=1,
+                    label=None if marked else "not scored (per-channel horizon mask)",
+                )
+                marked = True
         for mean_all, sigma_all, colour, alpha, style, label in (
             (base_mean, base_sigma, COLOR_GRAY, 0.22, "--", "base ($z^p$, target-only)"),
             (full_mean, full_sigma, COLOR_VERMILLION, 0.18, "-",
@@ -1508,7 +1491,8 @@ def causal_forecast_rows(
     _draw_anchor_overlay(
         ax, rows, anchors, valid, seconds_per_step, int(training_stride), anchor_ceiling
     )
-    ax.legend(loc="upper left", fontsize=6, framealpha=0.95, ncol=2)
+    # Three columns, so the legend stays a short strip above the error map in the same prefix.
+    ax.legend(loc="upper left", fontsize=6, framealpha=0.95, ncol=3)
 
     # $(C, H)$ rather than $(H, C)$: imshow's first axis is the vertical one, and the channel is
     # what a reader scans for a failure. From the SCORED stream, not the stored one: the forecast
@@ -1527,15 +1511,162 @@ def causal_forecast_rows(
         # span here is the prefix below the anchor floor.
         box=_prefix_boxes(rows, 1, _ERROR_MAP_VERTICAL)[0],
     )
+    # The run's shared edge when the caller computed one, so the inset -- the last child of the
+    # row, just drawn -- reads alike on every page; its colour bar follows the image's limits.
+    error_limit = rows.row_limits.get("pred_error")
+    if error_limit:
+        ax.child_axes[-1].images[0].set_clim(0.0, float(error_limit))
 
-    _draw_field_rows(rows, stitched)
-    _draw_gap_row(
-        rows,
-        stitched,
-        likelihood=likelihood,
-        coverage_floor=coverage_floor,
-        seconds_per_step=seconds_per_step,
-        target_forecast_shift=target_forecast_shift,
-        cell_mask=cell_mask,
-        ar_coef=ar_coef,
+
+
+def causal_forecast_rows(
+    rows: ForecastRowInputs,
+    *,
+    keep_index: Optional[Sequence[int]] = None,
+    block_split: Optional[int] = None,
+    training_stride: int = 1,
+    likelihood: str = "gaussian_nll",
+    coverage_floor: float = 0.0,
+    target_forecast_shift: Optional[Sequence[int]] = None,
+    forecast_clock_delay_s: Optional[float] = None,
+    cell_mask: Optional[torch.Tensor] = None,
+    ar_coef: Optional[torch.Tensor] = None,
+) -> None:
+    r"""Draw the causal-feature page's forecast rows, over the anchors the forward decoded.
+
+    Bound to a model's channel facts and its tiling by the task and handed to
+    :func:`~teb_vae.lag_attn_rws.sample_page.build_diagnostic_figure` as its ``forecast_rows`` seam.
+    Row $1$ is the shared raw-context row, drawn from the batch because this model's target is a
+    feature block; row $2$ is the three-lane forecast, which is where the anchor axis makes this
+    different from the two-sided sibling's version; the six rows below it are
+    :data:`CAUSAL_EXTRA_ROWS`, which the same seam reserves and which draw the same tiling over
+    every kept channel.
+
+    On a page built for a subset of the rows -- see :data:`COMPACT_PAGE_ROWS` -- only the raw
+    context row and the lag footnote are drawn, and the function returns before the forecast is
+    stitched at all, so none of the per-window scoring below is paid for a page that has nowhere
+    to put it.
+
+    Args:
+        rows: The row inputs and the layout hooks. ``rows.outs`` must carry ``anchor_index`` and
+            ``anchor_valid``: the forecast tensors are indexed by *position in the decoded set*,
+            not by anchor, so without them a window would be drawn at the wrong time with no shape
+            error anywhere in it.
+        keep_index: The budget's surviving target channels, positional into the declared $c_y$.
+            ``None`` for an ungated model, whose decoder emits every declared channel in order.
+        block_split: How many declared channels belong to the first stored block, for the error
+            map's and the field rows' boundary line. ``None`` draws no boundary.
+        training_stride: $S$, so the overlay can mark the tile grid a training step would use
+            beside the dense set this page draws.
+        likelihood: The objective's own likelihood, for the per-window score row. Bound by the
+            task from the same hyperparameter the callback passes to ``compute_loss``, so the
+            curve and the scalar beside it in the title are the same quantity.
+        coverage_floor: The model's own anchor coverage floor, so a window the objective dropped
+            is dropped from the score row too.
+        target_forecast_shift: $s_c$ per kept channel, the model's own forecast clock, so the
+            truth every row draws and the block every window scores are the ones the objective
+            saw. ``None`` -- the stored clock -- draws the stream as stored.
+        forecast_clock_delay_s: $\tau$ of that clock in seconds -- the resolved budget's
+            ``target_forecast_clock_delay_s`` -- so the forecast rows' time axis can state how
+            far before the scored step their content sits, as the input rows state theirs.
+            Nothing drawn moves with it: every row stays at the step index, so a column is one
+            anchor on the whole page. ``None`` where the page was handed no budget.
+        cell_mask: The model's $(H, C_{\mathrm{keep}})$ scored-cell mask, or ``None``. With
+            ``ar_coef`` it is the rest of the objective's density: bound by the task from the net's
+            own ``forecast_likelihood_kwargs``, so a window's score is a partial sum of the block
+            scores in the page's title. ``None`` scores every cell.
+        ar_coef: The model's AR(1) residual coefficient $\phi_c$, or ``None`` for the factorised
+            score.
+
+    Raises:
+        KeyError: If the forward dict carries no anchor set.
+        ValueError: If ``keep_index`` does not have one entry per forecast channel.
+    """
+    index, geometry = rows.sample_index, rows.geometry
+    _draw_context_row(rows)
+
+    # The footnote the lag panels are read under. Added here rather than to their titles because
+    # those panels are the shared builder's and are drawn for six other models whose transform
+    # this caveat is not about. Placed inside the GridSpec's bottom margin, so it costs no row --
+    # and written before the early return below, because a page that keeps the lag rows and drops
+    # the forecast rows still leads to a lag axis.
+    rows.figure.text(
+        0.5, 0.004, LAG_TIME_CAVEAT,
+        ha="center", va="bottom", fontsize=7, color=COLOR_GRAY, wrap=True,
     )
+
+    # Everything below belongs to the forecast row and the six rows reserved under it. A page
+    # built without any of them has no axes for it, and ``row_axes`` raises rather than inventing
+    # one -- inside a callback that swallows exceptions, which would cost the page. Each row is
+    # checked on its own below, so a page keeping the lane row alone scores no window.
+    if not any(rows.wants(name) for name in (FORECAST_ROW, *dict(CAUSAL_EXTRA_ROWS))):
+        return
+
+    anchors = to_numpy(rows.outs["anchor_index"][index]).astype(int).ravel()
+    valid = to_numpy(rows.outs["anchor_valid"][index]).astype(bool).ravel()
+    positions = _tail_anchor(
+        anchors, valid, _tiling_anchors(anchors, valid, int(geometry.horizon)),
+        int(geometry.horizon),
+    )
+
+    base_mean, base_sigma = _tiled_branch(rows, "base", anchors, positions)
+    full_mean, full_sigma = _tiled_branch(rows, "full", anchors, positions)
+    keep = _resolved_keep_index(keep_index, full_mean.shape[-1])
+
+    # The truth on the decimated grid, gathered to the channels the decoder emits, re-indexed
+    # onto the model's own forecast clock, and restricted to the drawn windows, so an uncovered
+    # span reads as absent rather than as unpredicted. Re-indexed ONCE and shared with the error
+    # map below: a second gather from the stored clock is how the inset came to score a
+    # physical-clock forecast against stored-clock truth.
+    stream = to_numpy(rows.target[index])
+    scored_stream = _scored_clock_view(stream[:, keep], target_forecast_shift)
+    truth = np.where(np.isfinite(full_mean), scored_stream, np.nan)
+
+    # The model's own anchor ceiling, re-derived exactly as the net derives it: under an advancing
+    # forecast clock the trailing max_c(s_c) anchors of [F, T_valid) read past the stored record
+    # and are never built, so the overlay's tile grid and ceiling mark must stop where the
+    # anchors do.
+    anchor_ceiling = int(geometry.t_valid) - max(
+        [0, *(int(shift) for shift in target_forecast_shift or ())]
+    )
+
+    # The one resolved description of what this page draws, shared by the lane row, the error map
+    # and the six rows below: a second walk of the anchor set, or a second count of the surviving
+    # first-block channels, is how a page comes to draw two tilings that only look aligned.
+    stitched = _Stitched(
+        truth=truth,
+        base_mean=base_mean,
+        base_sigma=base_sigma,
+        full_mean=full_mean,
+        full_sigma=full_sigma,
+        keep=keep,
+        block_split=(
+            0 if block_split is None else int(np.count_nonzero(keep < int(block_split)))
+        ),
+        anchors=anchors,
+        positions=positions,
+        time_label=_forecast_time_label(target_forecast_shift, forecast_clock_delay_s),
+        scored=_tiled_scored(
+            cell_mask, anchors, positions, int(geometry.horizon), int(geometry.t)
+        ),
+    )
+
+    seconds_per_step = rows.t_max / float(geometry.t)
+    if rows.wants(FORECAST_ROW):
+        _draw_lane_row(
+            rows, stitched, valid=valid, scored_stream=scored_stream,
+            training_stride=int(training_stride), anchor_ceiling=anchor_ceiling,
+            seconds_per_step=seconds_per_step,
+        )
+    _draw_field_rows(rows, stitched)
+    if rows.wants("pred_gap"):
+        _draw_gap_row(
+            rows,
+            stitched,
+            likelihood=likelihood,
+            coverage_floor=coverage_floor,
+            seconds_per_step=seconds_per_step,
+            target_forecast_shift=target_forecast_shift,
+            cell_mask=cell_mask,
+            ar_coef=ar_coef,
+        )

@@ -131,7 +131,8 @@ def anchor_frame(collection: Any, eval_config: Mapping[str, Any]) -> Tuple[pd.Da
         return pd.DataFrame(), "the per-anchor table carries no forecast gain column"
     identity = [
         name for name in lag_structure.IDENTITY_COLUMNS
-        if name in per_sample.columns and name not in ("guid", "epoch")
+        if name in per_sample.columns
+        and (name == "sample_index" or name not in per_anchor.columns)
     ]
     kept = cohort.within_horizon(per_sample, eval_config.get("max_hours_before_delivery"))
     frame = per_anchor.reset_index(drop=True)

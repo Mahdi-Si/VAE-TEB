@@ -201,10 +201,9 @@ def test_the_per_head_sources_sum_to_the_pooled_one(tmp_path) -> None:
     per_recording = pd.read_csv(directory / analysis.PER_RECORDING_FILENAME)
     totals = per_recording[
         (per_recording["statistic"] == "total_nats")
-        & (per_recording["group_column"] == "clinical_class")
         & (per_recording["clock"] == "time_to_delivery")
     ]
-    keys = ["group", "guid", "time_bin"]
+    keys = ["guid", "time_bin"]
     pooled = totals[totals["source"] == "kl"].set_index(keys)["value"]
     heads = (
         totals[totals["source"].isin([f"kl_h{head}" for head in range(N_HEADS)])]

@@ -581,3 +581,44 @@ def test_the_real_run_bins_the_generated_epochs(collected_run) -> None:
     assert set(trajectory["group_column"]) == set(labels.GROUP_COLUMNS)
     # Every cell reports the recordings behind it, never the segments.
     assert (trajectory["n_recordings"] > 0).all()
+
+
+# =============================================================================
+# What the emitted tables say about each window and each recording
+# =============================================================================
+def test_a_window_whose_classes_were_all_too_small_still_reports_what_it_held() -> None:
+    """The omnibus counts cover only the classes that entered it, so a window whose classes all
+    fell below the floor used to read as a window holding no recordings at all."""
+    frame = _per_sample(
+        [
+            {"guid": f"{name}_{index}", "epoch": -_HOUR, labels.CLASS_COLUMN: name,
+             labels.SUBGROUP_COLUMN: f"{name}_shard", "mc_pred_gap": float(index)}
+            for name in ("healthy", "acidosis")
+            for index in range(2)
+        ]
+    )
+    per_recording = analysis.build_per_recording(frame)[labels.CLASS_COLUMN]
+
+    table = analysis.significance_frame([analysis.analyse_windows(per_recording, "mc_pred_gap")])
+    row = table.iloc[0]
+
+    assert row["n_recordings"] == 0
+    assert row["n_recordings_in_window"] == 4
+    assert row["n_segments_in_window"] == 4
+    assert row["excluded_as_too_small"] == "acidosis:2;healthy:2"
+    assert (row["bin_lo_h"], row["bin_hi_h"]) == pytest.approx((1.0, 1.5))
+
+
+def test_the_per_recording_rows_name_both_cohorts_and_the_segments_behind_them() -> None:
+    """A row read on the class axis still says which subgroup the recording belongs to, and how
+    many segments its window value averages."""
+    frame = _per_sample(_cohort_rows(n_per_class=3, segments=2))
+
+    tall = analysis.build_per_recording(frame)[labels.CLASS_COLUMN]
+    rows = analysis.build_trajectory_rows(analysis.build_per_recording(frame))
+
+    assert set(tall[labels.SUBGROUP_COLUMN]) == {"shard_0", "shard_1"}
+    assert (tall[labels.CLASS_COLUMN] == tall["group"]).all()
+    assert (tall["n_segments"] == 1).all()
+    assert all(row["bin_hi_h"] - row["bin_lo_h"] == pytest.approx(0.5) for row in rows)
+    assert all(row["n_segments"] == row["n_recordings"] for row in rows)

@@ -439,3 +439,19 @@ def test_the_budget_figures_are_drawn_from_the_resolver_the_driver_itself_calls(
     assert record["source_kept_width"] == 47
     for name in record["files"]:
         assert (tmp_path / name).is_file(), name
+
+
+def test_the_budget_figures_are_written_in_the_runs_figure_format(tmp_path) -> None:
+    """Regression: both writers default to PDF for the training driver, and the evaluation called
+    them without a format -- so a PNG run wrote these two as PDF beside every other figure."""
+    from teb_vae.lag_attn_cfs.eval import figures_seam
+
+    previous = figures_seam.figure_filename("x").rsplit(".", 1)[-1]
+    figures_seam.figures.set_figure_format("png")
+    try:
+        record = warmup_analysis.write_budget_figures(causal_config(), tmp_path)
+    finally:
+        figures_seam.figures.set_figure_format(previous)
+
+    assert record["skipped"] is False, record
+    assert record["files"] and all(str(name).endswith(".png") for name in record["files"])

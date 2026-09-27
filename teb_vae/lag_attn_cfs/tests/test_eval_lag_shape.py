@@ -220,7 +220,7 @@ def test_the_mass_shares_are_measured_from_the_axis_start_rather_than_from_zero(
     absolute threshold it would not: every bin would move further from zero and the near share
     would shrink toward nothing for a reason that has nothing to do with the model.
     """
-    # A forty-bin axis, so the near window is a real cut: bins 0-15 sit within 60 s of the start.
+    # A forty-bin axis, so the near window is a real cut: bins 0-6 sit within a sixth of its span.
     width = 40
     axis = 4.0 * (np.arange(width, dtype=np.float64) + _DELAY_STEPS)
     profile = np.zeros(width)
@@ -235,11 +235,37 @@ def test_the_mass_shares_are_measured_from_the_axis_start_rather_than_from_zero(
 
 def test_the_far_share_starts_where_the_near_share_ends_and_they_do_not_overlap() -> None:
     """Stated as a property of the constants, so moving one cannot make a profile count twice."""
-    assert lag_shape.FAR_SECONDS > lag_shape.NEAR_SECONDS
+    assert lag_shape.FAR_SPAN_FRACTION > lag_shape.NEAR_SPAN_FRACTION
     wide = 4.0 * (np.arange(200, dtype=np.float64) + _DELAY_STEPS)
     profile = np.ones(200)
     statistics, _ = lag_shape.profile_statistics(profile[None, :], wide)
     assert statistics["near_mass"][0] + statistics["far_mass"][0] <= 1.0
+
+
+@pytest.mark.parametrize("width", [9, 25, 38, 91])
+def test_the_mass_shares_are_window_relative_so_no_window_makes_them_structural(width) -> None:
+    """Regression: the shares were cut at 60 s and 240 s, so on any window shorter than 240 s --
+    every shipped transformer cell -- ``far_mass`` was identically zero and, on a short one,
+    ``near_mass`` identically one. As fractions of the span both are real cuts on every width,
+    and at the historical 91-bin window they reproduce the old 60 s / 240 s exactly."""
+    axis = 4.0 * (np.arange(width, dtype=np.float64) + _DELAY_STEPS)
+    far = np.zeros(width)
+    far[-1] = 1.0
+    near = np.zeros(width)
+    near[0] = 1.0
+    statistics, _ = lag_shape.profile_statistics(np.vstack([far, near]), axis)
+    assert statistics["far_mass"].tolist() == pytest.approx([1.0, 0.0])
+    assert statistics["near_mass"].tolist() == pytest.approx([0.0, 1.0])
+    if width == 91:
+        assert lag_shape.near_far_thresholds(axis) == pytest.approx((60.0, 240.0))
+
+
+def test_a_peak_on_the_longest_lag_is_flagged_as_censored_by_the_window() -> None:
+    """The argmax on the last searched lag is a censored reading, and the record says so."""
+    rising = np.linspace(0.1, 1.0, _N_LAGS)
+    assert lag_shape.peak_width(rising)["at_window_edge"] is True
+    assert lag_shape.peak_width(rising[::-1])["at_window_edge"] is False
+    assert lag_shape.peak_width([])["at_window_edge"] is None
 
 
 def test_the_peak_width_counts_the_contiguous_run_and_not_every_tall_bin() -> None:

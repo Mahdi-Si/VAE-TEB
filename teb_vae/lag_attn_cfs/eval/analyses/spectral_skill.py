@@ -25,7 +25,7 @@ by the shared channel map's ``freq_hz_primary`` convention, which is stated rath
 **One join is the whole correctness risk of this module.** The per-channel readouts are positional
 against the $C_{\mathrm{keep}}$ channels the warm-up budget left standing; the channel-to-band map
 is over the $c_y$ **declared** ones. Joining them positionally would shift band membership across
-the axis -- and on the shipped dataset the dropped channels happen to be the trailing four, so a
+the axis -- and on the shipped dataset the dropped channels happen to be the trailing ones, so a
 positional join looks right here and is wrong on any dataset whose survivors are not a prefix. A
 join that is accidentally correct on the fixture is worse than one that is wrong, because no test
 catches it.
@@ -40,8 +40,9 @@ disagrees with the vectors' width is a **raise** rather than a truncation, becau
 shortened join gives every band statement a silently wrong denominator.
 
 **Coverage is emitted as five counts rather than one ratio.** The declared
-and scored numerators can coincide by arithmetic accident ($102 - 7 = 98 - 3 = 95$ on one dataset), and quoting
-"95 of 102" would imply this analysis scored channels the decoder never emitted. The channels no
+and scored numerators can coincide by arithmetic accident -- the known channels of the declared
+axis and of the kept axis can be the same number although different channels make them up -- and
+quoting one as a share of $c_y$ would imply this analysis scored channels the decoder never emitted. The channels no
 selected filter pair named are reported as their own ``unknown`` row with their count, never
 bucketed into a neighbouring band whose skill they do not share and never dropped.
 """
@@ -217,8 +218,9 @@ def coverage_counts(
     r"""The five counts of the covered axis, never one ratio.
 
     Five rather than one because the declared and scored numerators can coincide by arithmetic
-    accident -- $102 - 7 = 98 - 3 = 95$ on one dataset -- and "95 of 102"
-    would imply this analysis scored channels the decoder never emitted.
+    accident -- the declared axis's known channels and the kept axis's can be one number made up
+    of different channels -- and quoting one as a share of $c_y$ would imply this analysis scored
+    channels the decoder never emitted.
 
     Args:
         kept: The persisted kept-axis map.

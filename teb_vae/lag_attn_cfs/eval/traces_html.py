@@ -38,10 +38,10 @@ from teb_vae.lag_attn_cfs.eval.lag_axis import COEFFICIENT_LAG_AXIS_LABEL
 DASHBOARD_EXTENSION = ".html"
 
 #: The raw signals drawn above the model panels, in order: the key in
-#: :attr:`traces.SegmentTrace.raw`, the panel title and the axis label.
+#: :attr:`traces.SegmentTrace.raw`, the panel title and the axis label (the unit is appended).
 RAW_PANELS: Tuple[Tuple[str, str, str], ...] = (
-    ("fhr", "Fetal heart rate", "FHR"),
-    ("up", "Uterine activity", "UA"),
+    ("fhr", traces.RAW_SIGNAL_TITLES["fhr"], "FHR"),
+    ("up", traces.RAW_SIGNAL_TITLES["up"], "UP"),
 )
 
 #: Row heights in pixels, by row kind.
@@ -82,7 +82,7 @@ def _paint(
 
 def _segment_t(segment: traces.SegmentTrace) -> np.ndarray:
     """A segment's anchors on the absolute axis, in seconds."""
-    return float(segment.epoch) + np.asarray(segment.anchor, dtype=np.float64) * float(SECONDS_PER_STEP)
+    return traces.absolute_seconds(segment.epoch, segment.anchor)
 
 
 def _anchor_axis(recording: traces.RecordingTrace) -> Tuple[float, int]:
@@ -137,21 +137,6 @@ def _painted_scalar(recording: traces.RecordingTrace, column: str, origin: float
             values = np.where(np.asarray(cell["contributing"], dtype=bool), values, np.nan)
         _paint(grid, origin, float(SECONDS_PER_STEP), np.asarray(cell["t_abs_sec"], dtype=np.float64), values)
     return grid
-
-
-def _painted_raw(recording: traces.RecordingTrace, key: str) -> Optional[Tuple[np.ndarray, np.ndarray]]:
-    """A raw signal on its own uniform grid, ``(hours, values)``, or ``None`` when absent."""
-    step = 1.0 / float(RAW_SAMPLING_HZ)
-    present = [s for s in recording.segments if key in s.raw and len(s.raw[key])]
-    if not present:
-        return None
-    spans = [(float(s.epoch), float(s.epoch) + (len(s.raw[key]) - 1) * step) for s in present]
-    origin, n = _grid(min(a for a, _ in spans), max(b for _, b in spans), step)
-    grid = np.full(n, np.nan)
-    for segment in present:
-        values = np.asarray(segment.raw[key], dtype=np.float64).reshape(-1)
-        _paint(grid, origin, step, float(segment.epoch) + np.arange(values.size) * step, values)
-    return (origin + np.arange(n) * step) * _HOURS, grid
 
 
 # =============================================================================
@@ -253,16 +238,20 @@ def build_recording_dashboard(
         legend = f"legend{row if row > 1 else ''}"
         entries = 0
         if not isinstance(spec, (traces.HeatmapPanel, traces.LinePanel)):
-            key, _title, unit = spec
-            painted = _painted_raw(recording, key)
+            key, _title, label = spec
+            painted = traces.painted_raw(recording, key)
+            unit = painted[2] if painted is not None else ""
             if painted is not None:
                 figure.add_trace(go.Scattergl(
-                    x0=float(painted[0][0]), dx=_HOURS / float(RAW_SAMPLING_HZ),
-                    y=painted[1].astype(np.float32), mode="lines", name=unit,
-                    line=dict(color=figures.COLOR_BLUE, width=1), connectgaps=False,
-                    hovertemplate=_hover(unit), showlegend=False,
+                    x0=float(painted[0][0]) * _HOURS, dx=_HOURS / float(RAW_SAMPLING_HZ),
+                    y=painted[1].astype(np.float32), mode="lines", name=label,
+                    line=dict(color=traces.RAW_SIGNAL_COLOURS[key], width=1), connectgaps=False,
+                    hovertemplate=_hover(label, unit), showlegend=False,
                 ), row=row, col=1)
-            figure.layout[yaxis].title = unit
+            figure.layout[yaxis].title = f"{label} ({unit})" if unit else label
+            if unit == traces.RAW_SIGNAL_UNITS[key]:
+                # The fixed CTG-paper scale, as on the printed page, so recordings compare.
+                figure.layout[yaxis].range = list(traces.RAW_SIGNAL_LIMITS[key])
         elif isinstance(spec, traces.HeatmapPanel):
             z = _painted_vector(recording, spec, origin, n)
             figure.layout[yaxis].title = COEFFICIENT_LAG_AXIS_LABEL if spec.lag_axis else spec.ylabel

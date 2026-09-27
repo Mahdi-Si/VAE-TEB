@@ -840,6 +840,11 @@ def test_the_per_window_score_is_the_objectives_own_number(task, stub_batch):
                     )
                     * mask[0, position][:, None]
                 ).sum()
+                if not bool(mask[0, position].any()):
+                    # A window the objective dropped whole has no score, and is not drawn as a
+                    # zero -- which would read as a perfect forecast.
+                    assert np.isnan(drawn[lane]), (branch, position)
+                    continue
                 assert drawn[lane] == pytest.approx(float(expected), rel=1e-5), (branch, position)
     finally:
         plt.close(figure)
@@ -1229,14 +1234,17 @@ _UNGATED = dict(
 #: itself.
 _COMPACT_ROW_TITLES = (
     "Raw target FHR",
+    "Forecast",
     "Model input — target",
+    "Model input — source",
     "Target-only latent state",
     "$K_t$",
     "Lag attention",
+    "$\\widetilde K_{t,\\ell}$",
 )
 
 
-def test_the_reduced_page_is_the_five_rows_it_names_in_the_full_page_s_order(task, stub_batch):
+def test_the_reduced_page_is_the_rows_it_names_in_the_full_page_s_order(task, stub_batch):
     """The reduced page is the full page with rows removed, not a second page: every row on it is a
     row of the other, drawn by the same code, in the same order. That is what lets a reader who
     knows one read the other -- and it is why the rows are *selected* rather than re-listed."""

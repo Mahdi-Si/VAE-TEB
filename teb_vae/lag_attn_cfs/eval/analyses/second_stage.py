@@ -318,7 +318,8 @@ def window_samples(
         ``samples`` holds **every** class present in that window, unfiltered;
         :func:`testable_windows` is what applies the floor, because the figure and the test want
         different halves of the same split. ``meta`` holds what each window publishes beside its
-        test -- the centre, the classes excluded as too small, and the floor they were excluded at.
+        test -- the centre, every recording and segment the window holds before the floor, the
+        classes excluded as too small, and the floor they were excluded at.
     """
     samples: Dict[int, Dict[str, np.ndarray]] = {}
     meta: Dict[int, Dict[str, Any]] = {}
@@ -331,8 +332,17 @@ def window_samples(
         cell = per_recording[per_recording[cohort.SECOND_STAGE_BIN_COLUMN] == bin_index]
         values_by_class = _class_values(cell, column)
         samples[int(bin_index)] = values_by_class
+        measured = np.isfinite(np.asarray(cell[column], dtype=np.float64))
         meta[int(bin_index)] = {
             "bin_center_h": float(cell[cohort.SECOND_STAGE_BIN_CENTER_COLUMN].iloc[0]),
+            # The whole window, before the floor: the omnibus's own counts cover only the classes
+            # that entered it, so without these a window whose classes were all too small reads
+            # as a window holding no recordings.
+            "n_recordings_in_window": int(sum(values.size for values in values_by_class.values())),
+            "n_segments_in_window": (
+                int(np.asarray(cell["n_segments"])[measured].sum())
+                if "n_segments" in cell.columns else None
+            ),
             "groups_excluded_as_too_small": {
                 group: int(values.size) for group, values in values_by_class.items()
                 if values.size < shared_stats.MIN_GROUP_SIZE
@@ -473,17 +483,31 @@ def _pooled_test(per_recording: pd.DataFrame, column: str) -> Dict[str, Any]:
 # Emission
 # =============================================================================
 def significance_frame(records: Sequence[Dict[str, Any]]) -> pd.DataFrame:
-    """Flatten the per-window omnibus results of every readout into one table."""
+    """Flatten the per-window omnibus results of every readout into one table.
+
+    ``n_classes`` and ``n_recordings`` count what entered the test; ``n_recordings_in_window``,
+    ``n_segments_in_window`` and ``excluded_as_too_small`` (``class:n`` pairs) say what the window
+    held before the floor, so an untested window is told apart from an empty one.
+    """
     rows: List[Dict[str, Any]] = []
     for record in records:
+        half_width = 0.5 * float(record.get("bin_width_hours", TRAJECTORY_BIN_HOURS))
         for window in record.get("per_window") or []:
+            excluded = window.get("groups_excluded_as_too_small") or {}
             rows.append(
                 {
                     "metric_column": record["metric_column"],
                     "time_bin": window["time_bin"],
                     "bin_center_h": window["bin_center_h"],
+                    "bin_lo_h": float(window["bin_center_h"]) - half_width,
+                    "bin_hi_h": float(window["bin_center_h"]) + half_width,
                     "n_classes": window.get("n_groups"),
                     "n_recordings": sum((window.get("n_per_group") or {}).values()),
+                    "n_recordings_in_window": window.get("n_recordings_in_window"),
+                    "n_segments_in_window": window.get("n_segments_in_window"),
+                    "excluded_as_too_small": ";".join(
+                        f"{group}:{count}" for group, count in excluded.items()
+                    ),
                     "statistic": window.get("statistic"),
                     "p_value": window.get("p_value"),
                     "p_holm": window.get("p_holm", float("nan")),
@@ -494,8 +518,9 @@ def significance_frame(records: Sequence[Dict[str, Any]]) -> pd.DataFrame:
     return pd.DataFrame(
         rows,
         columns=[
-            "metric_column", "time_bin", "bin_center_h", "n_classes", "n_recordings",
-            "statistic", "p_value", "p_holm", "significant", "alpha",
+            "metric_column", "time_bin", "bin_center_h", "bin_lo_h", "bin_hi_h", "n_classes",
+            "n_recordings", "n_recordings_in_window", "n_segments_in_window",
+            "excluded_as_too_small", "statistic", "p_value", "p_holm", "significant", "alpha",
         ],
     )
 
@@ -593,30 +618,46 @@ def _draw_panel(ax: Any, rows: Sequence[Dict[str, Any]], axis: str, *, title: st
     # From this package's one cohort palette, so a class is the same green / amber / red here as on
     # every other figure this evaluation draws of it.
     colours = figures.group_colors(groups)
+    # Which cohorts share each window, in the drawing order, so a count is lifted only as far
+    # as it needs to be to clear the counts of the cohorts drawn before it in that window.
+    sharing: Dict[int, List[str]] = {}
+    for group in groups:
+        for row in rows:
+            if row["group"] == group:
+                sharing.setdefault(int(row["time_bin"]), []).append(group)
     for group in groups:
         cell = sorted(
-            (row for row in rows if row["group"] == group), key=lambda row: row["bin_center_h"]
+            (row for row in rows if row["group"] == group), key=lambda row: row["time_bin"]
         )
         if not cell:
             continue
-        x = np.array([row["bin_center_h"] for row in cell], dtype=np.float64)
+        # A window this cohort has no recording in lifts the pen rather than being drawn across:
+        # a straight line between two windows hours apart reads as a measured trend through
+        # nothing -- and on this clock the windows either side of onset are the sparse ones.
+        gaps = np.flatnonzero(np.diff([int(row["time_bin"]) for row in cell]) > 1) + 1
+
+        def _series(key: str) -> np.ndarray:
+            """One field of this cohort's cells, with a NaN at every missing window."""
+            return np.insert(np.array([row[key] for row in cell], dtype=np.float64), gaps, np.nan)
+
+        x = _series("bin_center_h")
         colour = colours.get(group, figures.COLOR_BLUE)
         ax.fill_between(
-            x,
-            np.array([row["q25"] for row in cell], dtype=np.float64),
-            np.array([row["q75"] for row in cell], dtype=np.float64),
-            color=colour, alpha=0.15, linewidth=0,
+            x, _series("q25"), _series("q75"), color=colour, alpha=0.15, linewidth=0,
         )
         ax.plot(
-            x, np.array([row["median"] for row in cell], dtype=np.float64),
+            x, _series("median"),
             marker="o", markersize=3, color=colour, linewidth=figures.LINE_EMPHASIS,
             label=f"{group} (n={int(cell[0].get('n_recordings_total', 0))} deliveries)",
         )
         for row in cell:
+            # Staggered within a shared window, so two cohorts there do not print one count
+            # over the other.
+            lift = sharing[int(row["time_bin"])].index(group)
             ax.annotate(
                 str(int(row["n_recordings"])),
                 (float(row["bin_center_h"]), float(row["median"])),
-                textcoords="offset points", xytext=(0, 5), ha="center",
+                textcoords="offset points", xytext=(0, 5 + 7 * lift), ha="center",
                 fontsize=figures.FONT_TINY, color=colour,
             )
     ax.set_title(title)

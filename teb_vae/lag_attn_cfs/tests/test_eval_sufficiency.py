@@ -130,6 +130,7 @@ def test_the_summary_rows_carry_an_interval_and_a_paired_test_for_each_gap() -> 
         {
             "nll_oracle_block": [90.0, 91.0, 92.0, 93.0],
             "mc_nll_base_block": [100.0, 101.0, 102.0, 103.0],
+            "mean_nll_base_block": [95.0, 96.0, 97.0, 98.0],
             "mc_nll_full_block": [99.0, 100.0, 101.0, 102.0],
         }
     )
@@ -144,6 +145,8 @@ def test_the_summary_rows_carry_an_interval_and_a_paired_test_for_each_gap() -> 
     }
     gap = by_metric["delta_suff_nats"]
     assert gap["value"] == pytest.approx(10.0)
+    # The deterministic comparison is its own row, against the mean-decoded base.
+    assert by_metric["delta_suff_mean_nats"]["value"] == pytest.approx(5.0)
     assert gap["lo"] <= gap["value"] <= gap["hi"]
     assert "p_value" in gap and "median_paired_difference" in gap
     # The three score rows carry no paired test: there is nothing to pair them against.

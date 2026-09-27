@@ -295,7 +295,10 @@ def test_the_two_columns_are_on_every_row_of_every_batch(trained_task) -> None:
 
     assert readout.columns["kld_source_null"].shape == (1,)
     assert readout.columns["coupling_minus_clock"].shape == (1,)
-    assert "mc_nll_shuffled_block" not in readout.columns
+    assert bool(torch.isfinite(readout.columns["coupling_minus_clock"]).all())
+    # The permutation control has no stranger here: present, so the column set is the same on
+    # every batch, and NaN, so it reads as unmeasured rather than as a score.
+    assert bool(torch.isnan(readout.columns["mc_nll_shuffled_block"]).all())
 
 
 # =================================================================================================
@@ -336,20 +339,22 @@ def test_a_batch_spanning_two_recordings_pairs_across_them(trained_task) -> None
     assert readout.n_same_recording_pairs == 0
 
 
-def test_a_single_recording_batch_is_excluded_and_counted(trained_task) -> None:
-    """Excluded whole rather than scored without its control: a partially scored batch produces
-    a different column set, and averaging an inconsistent set together is how a control stops
-    being reported with nothing failing. Counted because the batches one recording fills on its
-    own are the *longest* recordings' -- dropping them silently removes a non-random slice."""
+def test_a_single_recording_batch_is_scored_without_its_control_and_counted(trained_task) -> None:
+    """Scored, with only the control missing: dropping the batch would remove its samples from
+    every table and analysis rather than from the control alone. Counted because the batches one
+    recording fills on its own are the *longest* recordings' -- the control's average leans away
+    from them, and a reader must be able to see by how many samples."""
     loader = _OneBatchLoader(
         [_labelled(2, ["solo", "solo"]), _labelled(2, ["a", "b"], seed=1)]
     )
 
     results = evaluate(trained_task, loader, num_samples=1)
 
-    assert results["n_batches"] == 1
+    assert results["n_batches"] == 2
+    assert "solo" in results["per_recording"]
     assert results["controls"]["n_batches_excluded_no_cross_recording_partner"] == 1
     assert results["controls"]["n_samples_excluded_no_cross_recording_partner"] == 2
+    assert results["controls"]["n_control_pairs"] == 2
     assert results["controls"]["same_recording_pairing_rate"] == 0.0
 
 

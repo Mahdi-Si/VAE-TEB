@@ -734,3 +734,50 @@ def test_an_empty_population_draws_the_note_rather_than_raising(builder) -> None
         assert notes.count(shared_figures.EMPTY_NOTE) >= 1
     finally:
         shared_figures.plt.close(figure)
+
+
+def test_the_trajectory_lifts_the_pen_across_a_window_no_recording_fell_in() -> None:
+    """Windows either side of onset are the sparse ones, and a line drawn straight from one to a
+    window hours away reads as a measured trend through nothing."""
+    from teb_vae.lag_attn.eval import figures as shared_figures
+
+    readout = analysis.READOUTS[0]
+    rows = [
+        {"group_column": labels.CLASS_COLUMN, "metric": readout.name, "group": "healthy",
+         "time_bin": index, "bin_center_h": (index + 0.5) * 0.5, "q25": 0.0, "median": 1.0,
+         "q75": 2.0, "n_recordings": 3, "n_recordings_total": 3}
+        for index in (-6, -1, 0)
+    ]
+    figure = analysis.build_trajectory_figure(rows, labels.CLASS_COLUMN, readout)
+    try:
+        line = next(
+            line for line in figure.axes[0].get_lines()
+            if str(line.get_label()).startswith("healthy")
+        )
+        x = np.asarray(line.get_xdata(), dtype=np.float64)
+    finally:
+        shared_figures.plt.close(figure)
+
+    # One gap (between -6 and -1), none between the adjacent -1 and 0.
+    assert int(np.isnan(x).sum()) == 1
+    assert np.isnan(x[1])
+
+
+def test_the_eligibility_table_names_each_recordings_cohort_and_tolerates_float32() -> None:
+    """The record of who was dropped names the subgroup and class of every recording, and an
+    onset a float32 round trip left a fraction of a second off delivery is still at delivery."""
+    table = pd.DataFrame(
+        {
+            "guid": ["a", "a"],
+            "epoch": [-7200.0, -6400.0],
+            cohort.SECOND_STAGE_COLUMN: [-7200.004, -6399.996],
+            labels.CLASS_COLUMN: ["hie", "hie"],
+            labels.SUBGROUP_COLUMN: ["hie_cs", "hie_cs"],
+        }
+    )
+
+    record = cohort.second_stage_eligibility(table).set_index("guid")
+
+    assert record.loc["a", labels.CLASS_COLUMN] == "hie"
+    assert record.loc["a", labels.SUBGROUP_COLUMN] == "hie_cs"
+    assert bool(record.loc["a", "onset_at_delivery"]) is True

@@ -34,7 +34,6 @@ from teb_vae.lag_attn_cfs.eval.metrics import (
     evaluate_batch,
     source_specificity_verdict,
 )
-from teb_vae.lag_attn_rws.nets import controls
 
 #: Bootstrap settings: instant, and seeded so every interval is reproducible.
 EVAL_CONFIG = {"bootstrap_resamples": 200, "seed": 0}
@@ -281,7 +280,13 @@ def test_the_analysis_writes_its_tables(tmp_path) -> None:
         name for name, _ in perm_control_analysis.BRANCH_COLUMNS
     ]
     assert "penalty" not in branches.columns
-    assert result["files"]
+    # The three paired controls -- the source margin among them -- reach a table of their own
+    # rather than only the summary record.
+    penalties = pd.read_csv(directory / perm_control_analysis.PENALTIES_FILENAME)
+    assert set(penalties["penalty"]) == {
+        "shuffle_penalty", "prior_shuffle_penalty", perm_control_analysis.SOURCE_MARGIN_PENALTY,
+    }
+    assert perm_control_analysis.PENALTIES_FILENAME in result["files"]
 
 
 class _Loader:
@@ -294,18 +299,19 @@ class _Loader:
         return iter(self._batches)
 
 
-def test_a_batch_with_no_cross_recording_partner_is_excluded_and_counted(
+def test_a_batch_with_no_cross_recording_partner_is_scored_without_its_control_and_counted(
     task, perturb_posterior
 ) -> None:
-    """The derangement is GUID-aware, and a batch too concentrated to pair across recordings is
-    dropped **whole**.
+    """The derangement is GUID-aware, and a batch too concentrated to pair across recordings keeps
+    every readout but its control.
 
-    Silently, that would remove the longest recordings preferentially -- they are the ones whose
-    segments fill a batch -- and shrink every readout that depends on them with nothing in the
-    output saying so. Two halves are asserted: the per-batch entry point *refuses* such a batch
-    rather than falling back to a within-recording pairing, and the loop above it excludes and
-    counts it rather than propagating the refusal.
+    Two halves are asserted: the per-batch entry point never falls back to a within-recording
+    pairing -- its control columns are NaN instead -- and the loop above it counts the batch, since
+    the samples missing from the control are the longest recordings' and the control's average
+    leans away from them.
     """
+    from teb_vae.lag_attn_cfs.eval.metrics import CONTROL_COLUMNS
+
     from .conftest import make_stub_batch
 
     module = task()
@@ -316,8 +322,11 @@ def test_a_batch_with_no_cross_recording_partner_is_excluded_and_counted(
     concentrated = make_stub_batch(seed=11)
     concentrated.guid = ["ONE"] * len(concentrated.guid)
 
-    with pytest.raises(controls.NoCrossGroupPartner, match="no cross-group derangement"):
-        evaluate_batch(module, concentrated, num_samples=1)
+    readout = evaluate_batch(module, concentrated, num_samples=1)
+    assert readout.n_control_pairs == 0
+    for name in CONTROL_COLUMNS:
+        assert bool(torch.isnan(readout.columns[name]).all()), name
+    assert bool(torch.isfinite(readout.columns["mc_pred_gap"]).all())
 
     torch.manual_seed(0)
     results = metrics_module.evaluate(

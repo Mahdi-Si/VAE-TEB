@@ -1,9 +1,9 @@
 r"""What each of the model's input channels is, read off the shards rather than re-derived.
 
 The model consumes two streams, and every later frequency-resolved statement about either of them
-needs to know which channel is which: that a given ``fhr_ph`` coefficient pairs filters at $0.021$
-and $0.05$ Hz and therefore sits in the deceleration band, or that seven of the thirty-six target
-scattering channels have no recoverable centre frequency at all.
+needs to know which channel is which: that a given ``fhr_ph`` coefficient pairs two filters whose
+centre frequencies put it in the deceleration band, or that some of the target scattering channels
+have no recoverable centre frequency at all.
 
 The shards already carry the answer. ``create_new_pipeline.py::_write_selection_attrs`` stamps
 per-channel provenance -- ``sel_i``, ``sel_j``, ``sel_xi_i_hz``, ``sel_xi_j_hz``, ``sel_power``,
@@ -53,7 +53,7 @@ composed group delay. Both are stamped per channel on every stored block, and bo
 readouts the collection pass writes are positional against the $C_{\mathrm{keep}}$ *surviving*
 target channels while everything above is over the $c_y$ *declared* ones, so joining the two
 positionally would shift band membership across the axis -- and on the shipped dataset the dropped
-channels happen to be the trailing four, which makes a positional join look right here and be wrong
+channels happen to be the trailing ones, which makes a positional join look right here and be wrong
 on any dataset whose survivors are not a prefix. A join that is accidentally correct is worse than
 one that is wrong, because no test catches it.
 
@@ -331,8 +331,9 @@ def coverage_counts(
     r"""Count what the band map does and does not cover, on both axes.
 
     Five counts rather than one ratio, because the declared and scored numerators can coincide by
-    arithmetic accident -- $102 - 7 = 98 - 3 = 95$ on one dataset -- and
-    quoting "95 of 102" would imply the analysis banded channels the decoder never emitted.
+    arithmetic accident -- the declared axis's known channels and the kept axis's can be one number
+    made up of different channels -- and quoting one as a share of $c_y$ would imply the analysis
+    banded channels the decoder never emitted.
 
     Args:
         rows: The declared-axis rows.

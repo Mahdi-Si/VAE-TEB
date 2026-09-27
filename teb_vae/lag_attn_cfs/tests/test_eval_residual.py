@@ -154,7 +154,12 @@ def test_every_metric_is_reported_in_z_units_and_nothing_converts() -> None:
     rows = residual_analysis.build_rows(_per_guid([1.0] * 4), resamples=200, seed=0)
 
     for row in rows:
-        assert row["unit"] == NORMALISED_UNIT
+        # The forecast difference is in the loader's z units; the latent drift is not.
+        expected = (
+            residual_analysis.LATENT_UNIT if row["metric"] in residual_analysis.LATENT_METRICS
+            else NORMALISED_UNIT
+        )
+        assert row["unit"] == expected
         assert "rms" not in row, "the converted column was removed rather than repointed"
         assert not [name for name in row if "bpm" in str(name).lower()]
         # The only rooted column is the z-unit one, and it is the root of its own mean square.

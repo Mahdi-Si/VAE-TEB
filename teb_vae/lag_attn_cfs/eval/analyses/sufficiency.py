@@ -18,10 +18,10 @@ probe on the evaluation population while $D_{\mathrm{base}}$ comes from a model 
 disjoint, healthier pretraining cohort biases it **up**. The two oppose, neither is measured, and
 both sentences are written into the emitted record rather than left in a document beside it.
 
-**Three quantities, one set of recordings.** $D_{\mathrm{oracle}}$, $D_{\mathrm{base}}$ and
-$D_{\mathrm{full}}$ are all resolved on the *held-out* recordings, by joining the probe's
-per-segment scores onto the per-sample table -- so the two gaps drawn on ``sufficiency.pdf`` are
-differences over the same denominator, not three numbers from three populations.
+**One set of recordings.** $D_{\mathrm{oracle}}$, $D_{\mathrm{base}}$ (marginalised and
+mean-decoded) and $D_{\mathrm{full}}$ are all resolved on the *held-out* recordings, by joining
+the probe's per-segment scores onto the per-sample table -- so the gaps drawn on the sufficiency
+figure are differences over the same denominator, not numbers from different populations.
 
 **This is the second analysis that touches the model**, and for a reason retention cannot serve: a
 probe fit is thousands of passes over the same segments, and what it needs -- the encoder state of
@@ -67,13 +67,17 @@ CURVE_FILENAME = "oracle_training_curve.csv"
 #: The figure, named as ``FIGURE_GUIDE.md`` names it.
 SUFFICIENCY_FIGURE = "sufficiency"
 
-#: The three block scores compared, as ``(column, label)``. All three are Monte Carlo marginalised
-#: where the model produced them, so the oracle -- which has no latent to marginalise over -- is
-#: compared against the same estimator the headline quotes rather than against the training-path
-#: single-draw column.
+#: The block scores compared, as ``(column, label)``. The two branches are Monte Carlo
+#: marginalised where the model produced them, so the oracle is compared against the same
+#: estimator the headline quotes -- and the target-only branch **also mean-decoded**, because the
+#: oracle has no latent at all: it is a deterministic forecast, and the marginalised base pays for
+#: the spread of its prior draws as well as for the bottleneck. The mean-decoded base is the
+#: like-for-like deterministic comparison (and the branch the objective decodes under the shipped
+#: ``base_decode: mean``); the gap between the two base scores is what the prior's spread costs.
 SCORE_COLUMNS: Tuple[Tuple[str, str], ...] = (
     ("nll_oracle_block", "oracle (target_state)"),
     ("mc_nll_base_block", "target-only (base)"),
+    ("mean_nll_base_block", "target-only (base), mean-decoded"),
     ("mc_nll_full_block", "source-conditioned (full)"),
 )
 
@@ -89,6 +93,13 @@ GAP_METRICS: Tuple[Tuple[str, str, str, str], ...] = (
         "forecast, as an estimate biased in two unmeasured directions",
     ),
     (
+        "delta_suff_mean_nats",
+        "mean_nll_base_block",
+        "nll_oracle_block",
+        "the same gap against the mean-decoded target-only branch: deterministic against "
+        "deterministic, so it carries the bottleneck without the cost of the prior's spread",
+    ),
+    (
         "pred_gap_mc_nats",
         "mc_nll_base_block",
         "mc_nll_full_block",
@@ -99,7 +110,7 @@ GAP_METRICS: Tuple[Tuple[str, str, str, str], ...] = (
 
 #: The metrics resolved by cohort.
 GROUPED_METRICS: Tuple[str, ...] = (
-    "delta_suff_nats", "nll_oracle_block", "mc_nll_base_block",
+    "delta_suff_nats", "delta_suff_mean_nats", "nll_oracle_block", "mc_nll_base_block",
 )
 
 
@@ -426,8 +437,10 @@ def run_sufficiency_analysis(
         "metrics": rows,
         "gap": {
             "delta_suff_nats": by_metric["delta_suff_nats"]["value"],
+            "delta_suff_mean_nats": by_metric["delta_suff_mean_nats"]["value"],
             "d_oracle_nats": by_metric["nll_oracle_block"]["value"],
             "d_base_mc_nats": by_metric["mc_nll_base_block"]["value"],
+            "d_base_mean_nats": by_metric["mean_nll_base_block"]["value"],
             "d_full_mc_nats": by_metric["mc_nll_full_block"]["value"],
         },
         "split": record["split"],

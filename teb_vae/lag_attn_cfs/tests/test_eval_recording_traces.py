@@ -127,6 +127,37 @@ def test_the_gathered_divergence_is_the_sum_of_its_per_coordinate_split() -> Non
 # =================================================================================================
 # The reductions
 # =================================================================================================
+def test_every_recording_page_draws_a_panel_on_the_one_shared_scale() -> None:
+    """A quiet recording must not be stretched to look as loud as a loud one: the shared scale is
+    the maximum over every traced recording, and the quiet page draws on it."""
+    _module, quiet_segments = _segments(guid="QUIET")
+    _module, loud_segments = _segments(guid="LOUD")
+    for segment in loud_segments:
+        segment.vectors["mu_post"] = 10.0 * np.asarray(segment.vectors["mu_post"])
+    seconds = _lag_seconds(quiet_segments)
+    quiet, loud = (
+        traces.assemble_recording(
+            segments, lag_profiles=analysis.LAG_PROFILES, lag_seconds=seconds, break_after_s=BREAK_S
+        )
+        for segments in (quiet_segments, loud_segments)
+    )
+    panel = next(
+        p for p in analysis.PANELS
+        if getattr(p, "vector", None) == "mu_post" and getattr(p, "subtract", "x") is None
+    )
+
+    scales = traces.shared_panel_scales([quiet, loud], [panel])
+
+    loud_top = max(float(np.nanmax(np.abs(s.vectors["mu_post"]))) for s in loud_segments)
+    assert scales["mu_post"] == pytest.approx(loud_top)
+    figure = traces.build_recording_figure(quiet, panels=[panel], lag_seconds=seconds, scales=scales)
+    try:
+        meshes = [artist for artist in figure.axes[0].collections if hasattr(artist, "norm")]
+        assert meshes and all(mesh.norm.vmax == pytest.approx(loud_top) for mesh in meshes)
+    finally:
+        plt.close(figure)
+
+
 def test_segments_are_ordered_by_epoch_and_anchors_placed_on_the_absolute_axis() -> None:
     _module, segments = _segments(epochs=(-3600.0 + STRIDE_S, -3600.0))
     seconds = _lag_seconds(segments)
@@ -138,7 +169,7 @@ def test_segments_are_ordered_by_epoch_and_anchors_placed_on_the_absolute_axis()
     assert [segment.epoch for segment in recording.segments] == [-3600.0, -3600.0 + STRIDE_S]
     assert list(recording.summary["segment_order"]) == [0, 1]
     first = recording.anchors[recording.anchors["segment_order"] == 0]
-    expected = -3600.0 + first["anchor"].to_numpy() * 4.0
+    expected = -3600.0 + traces.LOADER_TRIM_S + first["anchor"].to_numpy() * 4.0
     np.testing.assert_allclose(first["t_abs_sec"].to_numpy(), expected)
     np.testing.assert_allclose(first["hours_before_delivery"].to_numpy(), -expected / 3600.0)
     # The epoch gap between consecutive segments is the stride and is not a break.

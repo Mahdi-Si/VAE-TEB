@@ -5,7 +5,8 @@ One figure per sample, from a single forward pass:
 1. The raw target FHR **in bpm** and the raw source UP **in mmHg**, on one time axis with one
    y-axis each. UP shares the row rather than getting one of its own because rows 6 and 7 are
    statements *about* this trace: a contraction has to be findable in the same column of the page
-   as the response it is claimed to drive.
+   as the response it is claimed to drive. Both y-axes are pinned to :data:`RAW_TRACE_LIMITS`,
+   the paper chart's physiological ranges, so two pages are read against one scale.
 2. The forecast over the whole recording, tiled into **consecutive non-overlapping** windows: the
    true future against the base ($z^p$) and full ($z^q$) forecasts and their $\mu \pm 2\sigma$
    bands, with a thin dashed vertical at every window edge. This is the panel the whole model
@@ -14,9 +15,10 @@ One figure per sample, from a single forward pass:
    forecast drawn in z-units cannot be checked against physiology by eye. The tiling is this
    module's alone; see :func:`build_diagnostic_figure`.
 3. $\mu^p_t$ over $\mu^q_t - \mu^p_t$: the target-only latent state, and the additional
-   source-derived shift, on one colour scale so their relative size is visible. The design's
-   claim is that the second is *small but useful*; a delta as large as the state itself means the
-   posterior is doing the prior's job.
+   source-derived shift, each on **its own** symmetric colour scale with its own colour bar. The
+   design's claim is that the second is *small but useful*, which is exactly why one shared scale
+   drew it as a blank band; the two bars' ranges state their relative size instead, and a shift
+   whose bar is as wide as the state's means the posterior is doing the prior's job.
 4. The per-step per-dimension KL, which is where a collapse into one or two dimensions shows up.
 5. The total per-step KL $K_t$.
 6. The lag-attention matrix, head-averaged, with its per-step argmax overlaid.
@@ -44,10 +46,16 @@ anything, and is imported by no part of the training loop or of any metric. The 
 particular is *not* how the model forecasts -- the forward pass decodes every valid anchor at
 stride $1$, and the objective and every reported number are computed over all of them.
 
-Both lag panels carry a secondary axis in **compensated** seconds -- $4\,(\ell + \delta)$, the
-lag on the stored timeline with the causal input delay $\delta$ added back -- and say so in the
-label. The stored timeline is canonical: the dataset builder's UP shift is part of the signal and
-no figure adds it back or subtracts it.
+Both lag panels carry a secondary axis in seconds, $\Delta(\ell + \delta)$. The causal input
+delay $\delta$ is added only when the model has one, and the label says *compensated* only then;
+at $\delta = 0$ the axis is the plain $\Delta\ell$ and is labelled so.
+
+**Pages of different samples are comparable by construction.** The raw traces sit on fixed
+physiological ranges, every normalised coefficient heatmap on the fixed symmetric
+:data:`NORMALISED_LIMITS`, and the latent, KL and attention rows on the limits a caller passes in
+``row_limits`` -- the evaluation computes one set per run from its tables before the first page is
+drawn -- so the same colour is the same value on every page of a run. Every model row is drawn at
+its step index and only the raw row is physical time; each x label states which.
 
 **Why this lives at the package root.** Two consumers draw this page and they sit on opposite
 sides of the layering: the training callback in :mod:`~teb_vae.lag_attn_rws.plotting`, which is a
@@ -65,8 +73,8 @@ rather than on every figure this builds.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Any, Callable, Dict, FrozenSet, List, Optional, Sequence, Tuple
+from dataclasses import dataclass, field
+from typing import Any, Callable, Dict, FrozenSet, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -77,6 +85,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 from matplotlib.colors import LogNorm, Normalize  # noqa: E402
 from matplotlib.gridspec import GridSpec  # noqa: E402
+from matplotlib.ticker import MultipleLocator  # noqa: E402
 
 from teb_vae.lag_attn.figure_primitives import (  # noqa: E402
     COLOR_BLACK,
@@ -107,6 +116,11 @@ __all__ = [
     "DELAY_STAIRCASE_LABEL",
     "ForecastRowInputs",
     "InputStreamPanel",
+    "LAG_SECONDS_LABEL",
+    "NORMALISED_LIMITS",
+    "RAW_TIME_LABEL",
+    "RAW_TRACE_LIMITS",
+    "STEP_TIME_LABEL",
     "annotate_channel_frequencies",
     "build_diagnostic_figure",
     "log_attention_norm",
@@ -136,15 +150,43 @@ BAND_SIGMAS = 2.0
 #: than putting one of these on an axis it cannot honour.
 _SIGNAL_UNITS = {"fhr": "bpm", "up": "mmHg"}
 
+#: The fixed y-range of each raw signal in its physical unit: the international paper chart's FHR
+#: scale in bpm and its full UP scale in mmHg. Fixed rather than autoscaled so every page of a run
+#: -- and of every run -- draws one bpm at one height; a sample outside the range is clipped at
+#: the frame. Applied only when the loader's statistics put the trace in that unit.
+RAW_TRACE_LIMITS: Mapping[str, Tuple[float, float]] = {"fhr": (50.0, 210.0), "up": (0.0, 100.0)}
+
+#: Colour range of every heatmap of **normalised** coefficients -- the input rows, and the
+#: truth and forecast fields a forecast seam draws. The stored blocks are z-scored per channel,
+#: so $\pm 3$ spans the bulk of every channel and means the same thing on every page; a
+#: heavy-tailed value saturates rather than rescaling the map it sits in.
+NORMALISED_LIMITS: Tuple[float, float] = (-3.0, 3.0)
+
+#: The two x labels a row can carry, naming the clock its columns are on. Only the raw row is in
+#: physical time; every model row is drawn at its step index $t$, i.e. at $t\Delta$ seconds, so a
+#: column is one anchor on all of them.
+RAW_TIME_LABEL = "Time (s) — raw samples, physical time"
+STEP_TIME_LABEL = "Time (s) — step index, $t\\Delta$"
+
+#: The lag panels' secondary axis label when no input delay is added, i.e. the axis is $\Delta\ell$.
+LAG_SECONDS_LABEL = "lag (s)"
+
+#: Roughly how many ticks the lag panels' seconds axis carries. Ticks sit every $k$ lags, with $k$
+#: chosen for about this many, so each lands on a lag cell's centre rather than between two.
+_LAG_TICKS = 5
+
+#: Height in inches of one unit of row height ratio. The page is a stack of full-width rows, so
+#: this is what decides whether a reader can take in a row at once.
+_ROW_INCHES = 1.8
+
 #: Vertical strip reserved above the first panel for the two-line title, in inches.
 _HEADER_INCHES = 0.75
 
 #: Vertical strip reserved below the last panel, in inches, for its time-axis label and for
 #: whatever a caller writes into the figure's bottom margin -- the causal pages put their
 #: lag-time caveat there. Physical rather than fractional for the header's reason and applied as
-#: a FLOOR on the fractional margin, which is what keeps every full-length page byte-identical:
-#: at fifteen rows the existing 3% is 1.44 in and already wider than this, and only a short page
-#: -- where 3% is under half an inch and the caveat lands on top of the axis label -- is moved.
+#: a FLOOR on the fractional margin: 3% of a short page is under half an inch, and the caveat
+#: would land on top of the last row's axis label.
 _FOOTER_INCHES = 1.3
 
 #: Interpolation for every heatmap on the page. ``'none'`` rather than matplotlib's default
@@ -358,25 +400,15 @@ def _input_stream_row(
     values = np.asarray(panel.values, dtype=float)
     n_channels = values.shape[1]
 
-    # Robust limits rather than min/max: these are z-scored wavelet coefficients, and one
-    # heavy-tailed channel otherwise sets the scale for all of them and flattens the rest to a
-    # single colour. NaN-aware because a gated stream may carry non-finite values from the loader.
-    finite = values[np.isfinite(values)]
-    low, high = (
-        (float(np.percentile(finite, 1.0)), float(np.percentile(finite, 99.0)))
-        if finite.size
-        else (0.0, 1.0)
-    )
-    if not high > low:
-        high = low + 1.0
-
     # Channel $0$ at the **top** -- see :func:`top_down_extent`. Nothing else on the row moves:
     # the dividers, the block ticks and the staircase below are all in channel coordinates, and
-    # only the direction of the axis changes.
+    # only the direction of the axis changes. The colour range is the fixed normalised one rather
+    # than this page's own percentiles, so a colour is one z-score on every page.
     time_left, time_right = sample_cell_edges(values.shape[0], seconds_per_step)
     image = ax.imshow(
         values.T, aspect="auto", cmap="viridis", origin="upper",
-        vmin=low, vmax=high, extent=top_down_extent(time_left, time_right, n_channels),
+        vmin=NORMALISED_LIMITS[0], vmax=NORMALISED_LIMITS[1],
+        extent=top_down_extent(time_left, time_right, n_channels),
         interpolation=_IMSHOW_INTERPOLATION,
     )
 
@@ -427,6 +459,7 @@ def _input_stream_row(
         twin.tick_params(axis="y", labelsize=6)
         twin.grid(False)
         twin.set_xlim(0.0, t_max)
+        _pin_trace_limits(twin, str(panel.raw_field), unit)
     # Labelled artists only: the block divider is an unlabelled ``axhline`` on the same axes and
     # would otherwise appear as ``_child1``. Lower *left*, inside the warm-up prefix, which is the
     # one span of the row the overlay never reaches.
@@ -445,6 +478,20 @@ def _input_stream_row(
     ax.set_xlabel(panel.time_label, fontsize=8)
     ax.set_ylabel("Input channel", fontsize=8)
     return image
+
+
+def _pin_trace_limits(ax: Any, field: str, unit: str) -> None:
+    """Pin a raw trace's y-axis to :data:`RAW_TRACE_LIMITS` when it is drawn in that unit.
+
+    Args:
+        ax: The axes the trace is drawn on.
+        field: The loader field, ``'fhr'`` or ``'up'``.
+        unit: The unit the trace was drawn in; anything but the field's physical unit -- a trace
+            left in loader units because no statistics were found -- keeps its autoscale, since a
+            bpm range would put a z-scored trace flat on the floor of the axis.
+    """
+    if field in RAW_TRACE_LIMITS and unit == _SIGNAL_UNITS.get(field):
+        ax.set_ylim(*RAW_TRACE_LIMITS[field])
 
 
 def _raw_overlay(
@@ -540,6 +587,9 @@ class ForecastRowInputs:
             must check :meth:`wants` before drawing a row it owns: on a page built for a
             subset of the rows that row has no axes at all, and ``row_axes`` raises
             ``KeyError`` rather than inventing one.
+        row_limits: The shared colour limits the caller passed, keyed by row name -- the upper
+            edge of a non-negative field, the half-width of a signed one. A row the mapping does
+            not name is scaled to its own page, which is what the training callback gets.
     """
 
     outs: Dict[str, Any]
@@ -553,10 +603,11 @@ class ForecastRowInputs:
     t_max: float
     row_axes: Callable[[str], Tuple[Any, Any]]
     finalise_time_axis: Callable[..., None]
-    attach_cbar: Callable[[Any, Any, str], None]
+    attach_cbar: Callable[[Any, Any, str], Any]
     heatmap_spines: Callable[[Any], None]
     figure: Any
     included_rows: FrozenSet[str]
+    row_limits: Mapping[str, float] = field(default_factory=dict)
 
     def wants(self, name: str) -> bool:
         """Whether ``name`` is a row this page reserved.
@@ -609,8 +660,9 @@ def raw_context_row(rows: ForecastRowInputs, fhr_values: torch.Tensor) -> Tuple[
 
     ax.plot(rows.time_raw, fhr_np, color=COLOR_BLUE, linewidth=0.7, label=f"FHR ({unit})")
     ax.set_title("Raw target FHR and raw source UP", fontsize=9, pad=6)
-    ax.set_xlabel("Time (s)", fontsize=8)
+    ax.set_xlabel(RAW_TIME_LABEL, fontsize=8)
     ax.set_ylabel(f"FHR ({unit})", fontsize=8, color=COLOR_BLUE)
+    _pin_trace_limits(ax, "fhr", unit)
     style_axes(ax, grid="both")
     rows.finalise_time_axis(ax)
     if up_np is not None:
@@ -623,6 +675,7 @@ def raw_context_row(rows: ForecastRowInputs, fhr_values: torch.Tensor) -> Tuple[
         twin.tick_params(axis="y", labelsize=7, colors=COLOR_GREEN)
         twin.grid(False)
         twin.set_xlim(0.0, rows.t_max)
+        _pin_trace_limits(twin, "up", up_unit)
         handles = list(ax.get_lines()) + list(twin.get_lines())
         ax.legend(
             handles, [handle.get_label() for handle in handles],
@@ -632,7 +685,9 @@ def raw_context_row(rows: ForecastRowInputs, fhr_values: torch.Tensor) -> Tuple[
     return fhr_np, unit
 
 
-def log_attention_norm(values: np.ndarray) -> Optional[LogNorm]:
+def log_attention_norm(
+    values: np.ndarray, vmax: Optional[float] = None, vmin: Optional[float] = None
+) -> Optional[LogNorm]:
     r"""Return a log colour normaliser over a lag panel's positive mass, or ``None``.
 
     Attention is a softmax over lags, so every weight is non-negative and the mass is spread
@@ -641,6 +696,10 @@ def log_attention_norm(values: np.ndarray) -> Optional[LogNorm]:
 
     Args:
         values: The panel's ``(T, L)`` weights.
+        vmax: A shared upper edge -- the run's own, so every page of it uses one scale -- or
+            ``None`` for this panel's maximum.
+        vmin: A shared lower edge to go with ``vmax``, or ``None``. Either way the lower edge
+            is at least :data:`_LOG_ATTENTION_FLOOR` of the upper one.
 
     Returns:
         The normaliser, or ``None`` when a log scale would be meaningless -- an all-zero or
@@ -651,6 +710,11 @@ def log_attention_norm(values: np.ndarray) -> Optional[LogNorm]:
     positive = finite[finite > 0.0]
     if not positive.size:
         return None
+    if vmax is not None and np.isfinite(vmax) and float(vmax) > 0.0:
+        low = float(vmax) * _LOG_ATTENTION_FLOOR
+        if vmin is not None and np.isfinite(vmin) and low < float(vmin) < float(vmax):
+            low = float(vmin)
+        return LogNorm(vmin=low, vmax=float(vmax))
     vmax = float(positive.max())
     # The floor is relative to this panel's own maximum, so it is a statement about dynamic
     # range rather than about the absolute size of a weight -- which depends on $L$.
@@ -761,8 +825,9 @@ def raw_forecast_rows(rows: ForecastRowInputs) -> None:
         f"dashed: window edges)",
         fontsize=9, pad=6,
     )
-    ax.set_xlabel("Time (s)", fontsize=8)
+    ax.set_xlabel(RAW_TIME_LABEL, fontsize=8)
     ax.set_ylabel(f"FHR ({unit})", fontsize=8)
+    _pin_trace_limits(ax, "fhr", unit)
     ax.legend(loc="upper right", fontsize=7, framealpha=0.95)
     style_axes(ax, grid="both")
     rows.finalise_time_axis(ax)
@@ -790,6 +855,8 @@ def build_diagnostic_figure(
     forecast_extra_rows: Sequence[Tuple[str, float]] = (),
     rows: Optional[Sequence[str]] = None,
     log_lag_attention: bool = False,
+    row_limits: Optional[Mapping[str, float]] = None,
+    page_title: Optional[str] = None,
 ) -> Any:
     r"""Build the seven-row diagnostic figure for one sample.
 
@@ -856,6 +923,19 @@ def build_diagnostic_figure(
         log_lag_attention: Whether to draw the lag-attention row on a logarithmic colour
             scale. ``False`` -- the default -- keeps the linear scale every existing page has.
             The lag axis is unaffected either way; this is the colour normalisation alone.
+        row_limits: Colour (or, for ``kld_total``, y) limits shared by every page of a run, keyed
+            by row name: ``latent`` and ``latent_shift`` are the half-widths of the symmetric
+            $\mu^p$ and $\mu^q-\mu^p$ scales, ``kld_dims``, ``kld_total``, ``lag_attn`` and
+            ``kl_lag_map`` the upper edges of non-negative ones, ``lag_attn_floor`` the lower
+            edge of the log attention scale, and any other key is handed to the forecast seam
+            through :attr:`ForecastRowInputs.row_limits`. ``None`` or a missing
+            key scales that row to this page alone, which is right for a training callback and
+            wrong for a directory of pages somebody compares.
+        page_title: The first line of the title, naming the sample. ``None`` -- the training
+            callback's case -- writes ``epoch``, the batch position ``sample_index``, the GUID,
+            the cohort and ``beta``; an evaluation passes its own line, because there the segment
+            is identified by its dataset index and its place before delivery, and ``beta`` is not
+            resolved per epoch.
 
     Raises:
         ValueError: If ``rows`` names a row this page does not reserve.
@@ -918,7 +998,8 @@ def build_diagnostic_figure(
         row_specs = [spec for spec in row_specs if spec[0] in keep]
     included = frozenset(name for name, _ in row_specs)
     height_ratios = [height for _, height in row_specs]
-    figure_height = sum(height_ratios) * 2.6
+    figure_height = sum(height_ratios) * _ROW_INCHES
+    limits = dict(row_limits or {})
     fig = plt.figure(figsize=(14, figure_height))
     # Same contract as the sibling page builder: the figure is this function's until it is
     # returned, so a row that raises closes it here rather than orphaning it in pyplot's registry.
@@ -948,11 +1029,12 @@ def build_diagnostic_figure(
             index = row_of[name]
             return fig.add_subplot(grid[index, 0]), fig.add_subplot(grid[index, 1])
 
-        def attach_cbar(cax: Any, image: Any, label: str) -> None:
-            """Attach a colorbar for ``image`` onto a row's reserved cax."""
+        def attach_cbar(cax: Any, image: Any, label: str) -> Any:
+            """Attach a colorbar for ``image`` onto a row's reserved cax, and return it."""
             cbar = fig.colorbar(image, cax=cax)
             cbar.set_label(label, fontsize=8, color=COLOR_BLACK)
             cbar.ax.tick_params(labelsize=7, colors=COLOR_BLACK)
+            return cbar
 
         def heatmap_spines(ax: Any) -> None:
             """Draw all four spines on a heatmap axes."""
@@ -1025,9 +1107,10 @@ def build_diagnostic_figure(
                 interpolation=_IMSHOW_INTERPOLATION,
             )
             ax.set_title(title, fontsize=9, pad=6)
-            ax.set_xlabel("Time (s)", fontsize=8)
+            ax.set_xlabel(STEP_TIME_LABEL, fontsize=8)
             ax.set_ylabel("Lag $\\ell$ (steps)", fontsize=8)
             heatmap_spines(ax)
+            offset_seconds = float(delay_steps) * seconds_per_step
             secondary = attach_lag_seconds_axis(
                 ax,
                 # The run's own step, derived from the raw length and the decimated length above
@@ -1036,12 +1119,21 @@ def build_diagnostic_figure(
                 step_seconds=seconds_per_step,
                 # The whole compensation, expressed as the axis offset: lag 0 already sits at
                 # delta steps once the source channels are read delta steps stale.
-                offset_seconds=float(delay_steps) * seconds_per_step,
+                offset_seconds=offset_seconds,
             )
             if secondary is not None:
                 # Overriding the primitive's generic label: which of the two lag quantities is drawn
-                # is exactly the thing a reader must not have to guess.
-                secondary.set_ylabel(COMPENSATED_LAG_AXIS_LABEL, fontsize=8)
+                # is exactly the thing a reader must not have to guess -- and "compensated" is
+                # claimed only when a delay was actually added back.
+                secondary.set_ylabel(
+                    COMPENSATED_LAG_AXIS_LABEL if delay_steps else LAG_SECONDS_LABEL, fontsize=8
+                )
+                # A tick every `every` lags, on the cells' own centres. The primitive's whole
+                # minutes left a short lag range with the single tick 0.
+                every = max(1, int(np.ceil(n_lags / _LAG_TICKS)))
+                secondary.yaxis.set_major_locator(
+                    MultipleLocator(every * seconds_per_step, offset=offset_seconds)
+                )
             finalise_time_axis(ax, tail=drop_tail)
             return image
 
@@ -1066,6 +1158,7 @@ def build_diagnostic_figure(
                 heatmap_spines=heatmap_spines,
                 figure=fig,
                 included_rows=included,
+                row_limits=limits,
             )
         )
 
@@ -1091,32 +1184,40 @@ def build_diagnostic_figure(
         # ---- Row: prior mean over the source-derived delta ---------------------
         if "latent" in included:
             ax, cax = row_axes("latent")
-            # Stacked time-first so the cut below is one slice of one axis, then transposed
-            # for imshow.
-            latent_stack, _ = trained_columns(
-                np.concatenate([mu_prior_np, delta_mu_np], axis=1), drop_tail=True
-            )
-            vabs = safe_vabs(latent_stack)
+            # Two blocks of one axes, each on its own symmetric scale with its own bar in the
+            # row's colour column: the shift is small by design, and on the state's scale it
+            # drew as a blank band. The two bars' ranges are what compare the two sizes.
+            state, _ = trained_columns(mu_prior_np, drop_tail=True)
+            shift, _ = trained_columns(delta_mu_np, drop_tail=True)
             time_left, time_right = sample_cell_edges(
-                latent_stack.shape[0], seconds_per_step, first=warmup_sec
+                state.shape[0], seconds_per_step, first=warmup_sec
             )
-            image = ax.imshow(
-                latent_stack.T, aspect="auto", cmap="bwr", origin="upper",
-                vmin=-vabs, vmax=vabs,
-                extent=[time_left, time_right, 2 * d_z - 0.5, -0.5],
-                interpolation=_IMSHOW_INTERPOLATION,
-            )
-            ax.axhline(d_z - 0.5, color="white", linewidth=1.2, linestyle="--")
-            ax.set_yticks([d_z // 2, d_z + d_z // 2])
+            bars = (cax.inset_axes([0.0, 0.53, 1.0, 0.47]), cax.inset_axes([0.0, 0.0, 1.0, 0.47]))
+            cax.set_axis_off()
+            for block, (values, name, label) in enumerate((
+                (state, "latent", "$\\mu^p$"),
+                (shift, "latent_shift", "$\\mu^q-\\mu^p$"),
+            )):
+                vabs = float(limits.get(name) or safe_vabs(values))
+                image = ax.imshow(
+                    values.T, aspect="auto", cmap="bwr", origin="upper",
+                    vmin=-vabs, vmax=vabs,
+                    extent=[time_left, time_right, (block + 1) * d_z - 0.5, block * d_z - 0.5],
+                    interpolation=_IMSHOW_INTERPOLATION,
+                )
+                attach_cbar(bars[block], image, label)
+            ax.set_ylim(2 * d_z - 0.5, -0.5)
+            ax.axhline(d_z - 0.5, color=COLOR_BLACK, linewidth=0.8, linestyle="--")
+            ax.set_yticks([0.5 * d_z - 0.5, 1.5 * d_z - 0.5])
             ax.set_yticklabels(["$\\mu^p$", "$\\mu^q-\\mu^p$"])
+            ax.set_ylabel("Latent dim", fontsize=8)
             ax.set_title(
-                "Target-only latent state and the source-derived shift (shared colour scale, "
-                "trained anchors only)",
+                "Target-only latent state $\\mu^p$ and the source-derived shift "
+                "$\\mu^q-\\mu^p$ (each on its own colour scale; trained anchors only)",
                 fontsize=9, pad=6,
             )
-            ax.set_xlabel("Time (s)", fontsize=8)
+            ax.set_xlabel(STEP_TIME_LABEL, fontsize=8)
             heatmap_spines(ax)
-            attach_cbar(cax, image, "value")
             finalise_time_axis(ax, tail=True)
 
         # ---- Row: per-dimension KL --------------------------------------------
@@ -1135,12 +1236,16 @@ def build_diagnostic_figure(
                 kld_dims_trained.T, aspect="auto", cmap="magma", origin="upper",
                 extent=top_down_extent(time_left, time_right, d_z),
                 interpolation=_IMSHOW_INTERPOLATION,
+                **(
+                    {"vmin": 0.0, "vmax": float(limits["kld_dims"])}
+                    if limits.get("kld_dims") else {}
+                ),
             )
             ax.set_title(
                 "Per-dimension source-conditioned KL (nats, trained anchors only)",
                 fontsize=9, pad=6,
             )
-            ax.set_xlabel("Time (s)", fontsize=8)
+            ax.set_xlabel(STEP_TIME_LABEL, fontsize=8)
             ax.set_ylabel("Latent dim", fontsize=8)
             heatmap_spines(ax)
             attach_cbar(cax, image, "nats")
@@ -1155,11 +1260,13 @@ def build_diagnostic_figure(
             kld_trained, _ = trained_columns(kld_total_np, drop_tail=True)
             kld_time, _ = trained_columns(time_dec, drop_tail=True)
             ax.plot(kld_time, kld_trained, color=COLOR_VERMILLION, linewidth=0.9)
+            if limits.get("kld_total"):
+                ax.set_ylim(0.0, float(limits["kld_total"]))
             ax.set_title(
                 "$K_t$ — total source-conditioned KL per step (trained anchors only)",
                 fontsize=9, pad=6,
             )
-            ax.set_xlabel("Time (s)", fontsize=8)
+            ax.set_xlabel(STEP_TIME_LABEL, fontsize=8)
             ax.set_ylabel("nats", fontsize=8)
             style_axes(ax, grid="both")
             finalise_time_axis(ax, tail=True)
@@ -1175,7 +1282,12 @@ def build_diagnostic_figure(
             # Resolved here rather than inside `lag_panel`, which draws the KL-by-lag row too:
             # that row is nats attributed across lags and is read against the KL panels above
             # it, so putting both on a log scale would change a row the caller did not ask about.
-            attention_norm = log_attention_norm(alpha_np) if log_lag_attention else None
+            shared = limits.get("lag_attn")
+            attention_norm = (
+                log_attention_norm(alpha_np, shared, limits.get("lag_attn_floor"))
+                if log_lag_attention
+                else (Normalize(0.0, float(shared)) if shared else None)
+            )
             image = lag_panel(
                 ax, alpha_np, "Lag attention (head-averaged) with per-step argmax", "viridis",
                 drop_tail=False, norm=attention_norm,
@@ -1186,9 +1298,20 @@ def build_diagnostic_figure(
                 attn_time, attn_trained.argmax(axis=1),
                 color=COLOR_ORANGE, linewidth=0.7, alpha=0.85,
             )
-            attach_cbar(
-                cax, image, "attention (log)" if attention_norm is not None else "attention"
+            cbar = attach_cbar(
+                cax, image,
+                "attention (log)" if isinstance(attention_norm, LogNorm) else "attention",
             )
+            if isinstance(attention_norm, LogNorm):
+                # A log range of a decade or so carries one major tick; label the 1-2-5 steps
+                # inside it instead, so the bar can be read without counting minor ticks.
+                ticks = [
+                    base * 10.0 ** power for power in range(-6, 1) for base in (1.0, 2.0, 5.0)
+                    if attention_norm.vmin <= base * 10.0 ** power <= attention_norm.vmax
+                ]
+                if len(ticks) >= 2:
+                    cbar.set_ticks(ticks, labels=[f"{value:g}" for value in ticks])
+                    cbar.ax.minorticks_off()
 
         # ---- Row: the KL attributed across lags --------------------------------
         if "kl_lag_map" in included:
@@ -1196,6 +1319,10 @@ def build_diagnostic_figure(
             image = lag_panel(
                 ax, kl_lag_np, "$\\widetilde K_{t,\\ell}$ — source-conditioned KL by lag", "magma",
                 drop_tail=True,
+                norm=(
+                    Normalize(0.0, float(limits["kl_lag_map"]))
+                    if limits.get("kl_lag_map") else None
+                ),
             )
             attach_cbar(cax, image, "nats")
 
@@ -1211,9 +1338,12 @@ def build_diagnostic_figure(
         # alone says which recording, and only the subgroup says which population it was drawn
         # from -- which is the first thing a reader of an extreme page wants to know.
         cohort_text = f" — subgroup {cohort}" if cohort else ""
+        header = (
+            f"epoch {epoch} — sample {i} — guid {guid}{cohort_text} — beta={beta:.4g}"
+            if page_title is None else str(page_title)
+        )
         fig.suptitle(
-            f"epoch {epoch} — sample {i} — guid {guid}{cohort_text} — beta={beta:.4g}\n"
-            f"{readouts}",
+            f"{header}\n{readouts}",
             fontsize=10, y=1.0 - 0.1 / figure_height, va="top",
         )
         return fig

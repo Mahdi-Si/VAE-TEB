@@ -53,7 +53,9 @@ from teb_vae.lag_attn_cfs.eval.metrics import (
     lag_profiles,
     lag_summary,
     latent_health,
+    marginalise_block_scores,
     masked_raw_error_sums,
+    mc_gap_error,
     mc_predictive_block,
     model_inputs,
     source_lag_warmth_per_sample,
@@ -124,6 +126,37 @@ def _block_scale(readout: BatchReadout) -> float:
 # =================================================================================================
 # The dense forward, the anchored target and the anchored masks
 # =================================================================================================
+def test_the_monte_carlo_error_is_the_delete_one_jackknife_over_draws() -> None:
+    """Known answer on random draws: the error is the jackknife over draws taken out of BOTH
+    branches at once, the half-K value uses the first half of the draws, and one draw defines
+    neither. Identical branches have no gap and no error, whatever the draws."""
+    generator = torch.Generator().manual_seed(0)
+    draws, batch, anchors = 6, 3, 5
+    base = 100.0 + 5.0 * torch.randn(draws, batch, anchors, generator=generator, dtype=torch.float64)
+    full = base - 1.0 + torch.randn(draws, batch, anchors, generator=generator, dtype=torch.float64)
+    contributing = torch.ones(batch, anchors, dtype=torch.float64)
+    contributing[0, -2:] = 0.0
+
+    error = mc_gap_error(base, full, contributing, "gaussian_nll")
+
+    def gap(keep):
+        difference = marginalise_block_scores(base[keep], "gaussian_nll") - marginalise_block_scores(
+            full[keep], "gaussian_nll"
+        )
+        return (difference * contributing).sum(dim=1) / contributing.sum(dim=1)
+
+    left_out = torch.stack([gap([j for j in range(draws) if j != i]) for i in range(draws)])
+    expected = torch.sqrt((draws - 1) / draws * ((left_out - left_out.mean(dim=0)) ** 2).sum(dim=0))
+    torch.testing.assert_close(error["se"], expected)
+    torch.testing.assert_close(error["half_k"], gap(list(range(draws // 2))))
+    assert bool((error["se"] > 0).all())
+
+    same = mc_gap_error(base, base, contributing, "gaussian_nll")
+    assert torch.equal(same["se"], torch.zeros(batch, dtype=torch.float64))
+    single = mc_gap_error(base[:1], full[:1], contributing, "gaussian_nll")
+    assert bool(torch.isnan(single["se"]).all()) and bool(torch.isnan(single["half_k"]).all())
+
+
 def test_the_dense_geometry_is_the_pair_the_task_resolves_on_the_evaluation_stages(
     trained_task, stub_batch
 ) -> None:
@@ -380,10 +413,8 @@ def test_zero_is_the_channel_mean_over_the_region_the_model_reads(
 
 
 def test_the_segment_mean_reads_only_the_segments_valid_steps(trained_task) -> None:
-    """Deliberately the stronger baseline -- it is **not** causal, since it reads the segment's
-    whole future -- so a model that fails to beat it has learned nothing recording-specific that a
-    constant could not say. Averaging the gap in would make it a weaker one for the wrong reason.
-    """
+    """The segment's running mean over its observed steps; averaging the gap in would make it a
+    weaker baseline for the wrong reason."""
     batch = make_stub_batch(seed=6)
     batch.fhr_st = torch.ones_like(batch.fhr_st)
     batch.fhr_ph = torch.ones_like(batch.fhr_ph)
@@ -402,6 +433,46 @@ def test_the_segment_mean_reads_only_the_segments_valid_steps(trained_task) -> N
     assert torch.allclose(
         baselines["segment_mean"], torch.ones_like(baselines["segment_mean"]), rtol=RTOL
     )
+
+
+def test_the_retained_forecast_pair_is_the_mean_decoded_one(trained_task, stub_batch) -> None:
+    """Both retained branches are decoded at their latent mean -- the pair ``mean_pred_gap``
+    scores -- so a figure drawing them side by side compares two means rather than a mean against
+    one posterior draw."""
+    names = ("mu_base", "logvar_base", "mu_full", "logvar_full")
+    readout = evaluate_batch(trained_task, stub_batch, num_samples=1, retain=names)
+    outputs, *_ = _dense_pieces(trained_task, stub_batch)
+    model = trained_task.orig_model
+    index = outputs["anchor_index"][:, :, None].expand(-1, -1, outputs["mu_post"].shape[-1])
+
+    with torch.no_grad():
+        for branch, latent in (("base", "mu_prior"), ("full", "mu_post")):
+            mu, logvar = model.decoder(
+                outputs[latent].gather(1, index), persistence=outputs.get("persistence")
+            )
+            assert torch.allclose(readout.retained[f"mu_{branch}"], mu, atol=1e-6), branch
+            assert torch.allclose(readout.retained[f"logvar_{branch}"], logvar, atol=1e-6), branch
+
+
+def test_the_baselines_read_nothing_past_the_persistence_step() -> None:
+    r"""Causal on the model's own clock: each channel reads stored steps up to
+    $t_a + \min(s_c, 0)$ -- the step the decoder's persistence input is gathered at -- and the
+    running mean only its warm ones, falling back to persistence where none is warm yet. A mean
+    over the whole segment would average the steps being forecast into the forecast."""
+    from types import SimpleNamespace
+
+    steps, channels = 12, 3
+    ramp = torch.arange(steps, dtype=torch.float32)[None, :, None].expand(1, steps, channels)
+    model = SimpleNamespace(
+        target_gate=None, target_forecast_shift=(0, -2, -2), target_warmup_steps=(0, 0, 3)
+    )
+
+    baselines = baseline_forecasts(
+        ramp.clone(), torch.ones(1, steps), model, torch.tensor([[4, 7]])
+    )
+
+    assert baselines["persistence"][0, :, 0, :].tolist() == [[4.0, 2.0, 2.0], [7.0, 5.0, 5.0]]
+    assert baselines["segment_mean"][0, :, 0, :].tolist() == [[2.0, 1.0, 2.0], [3.5, 2.5, 4.0]]
 
 
 def test_a_segment_with_no_valid_step_yields_nan_rather_than_a_fabricated_zero(
@@ -778,14 +849,40 @@ def test_the_vector_readouts_take_the_same_route_as_the_scalars() -> None:
         assert getattr(aggregate, name)[0] == pytest.approx(6.0)
 
 
-def test_inconsistent_columns_are_refused_rather_than_averaged(trained_task) -> None:
-    """A last batch too small to derange produces a different column set; averaging it in would
-    quietly drop the negative control from the headline."""
+def test_a_batch_too_small_to_pair_is_scored_with_only_its_controls_blank(trained_task) -> None:
+    """A trailing single-sample batch keeps every readout and loses only the permutation control:
+    it writes the full column set with the control columns NaN, and the aggregation averages each
+    control over the samples that carry it rather than dropping the batch -- which would remove
+    those samples from every table and analysis, not from the control alone."""
     full = evaluate_batch(trained_task, make_stub_batch(batch=2), num_samples=1)
-    partial = evaluate_batch(trained_task, make_stub_batch(batch=1), num_samples=1)
+    partial = evaluate_batch(
+        trained_task, make_stub_batch(batch=1, seed=3, guid_prefix="LONE"), num_samples=1
+    )
 
-    with pytest.raises(ValueError, match="different readout columns"):
-        aggregate_by_recording([full, partial])
+    assert list(partial.columns) == list(full.columns)
+    for name in metrics.CONTROL_COLUMNS:
+        assert bool(torch.isnan(partial.columns[name]).all()), name
+        assert bool(torch.isfinite(full.columns[name]).all()), name
+    assert bool(torch.isfinite(partial.columns["mc_pred_gap"]).all())
+
+    aggregate = aggregate_by_recording([full, partial])
+    lone = next(guid for guid in aggregate.per_recording if guid.startswith("LONE"))
+    assert np.isnan(aggregate.per_recording[lone]["mc_nll_shuffled_block"])
+    paired = [
+        values["mc_nll_shuffled_block"]
+        for guid, values in aggregate.per_recording.items() if guid != lone
+    ]
+    assert aggregate.overall["mc_nll_shuffled_block"] == pytest.approx(float(np.mean(paired)))
+    everyone = [values["mc_nll_full_block"] for values in aggregate.per_recording.values()]
+    assert aggregate.overall["mc_nll_full_block"] == pytest.approx(float(np.mean(everyone)))
+
+
+def test_a_nan_outside_the_control_columns_still_reaches_the_headline() -> None:
+    """Skipping a NaN is reserved for the controls, where it means "no stranger to pair with";
+    anywhere else it is a fault, and averaging around it would hide one."""
+    aggregate = aggregate_by_recording([_readout(["a", "b"], [float("nan"), 1.0], [10, 10])])
+
+    assert np.isnan(aggregate.overall["score"])
 
 
 def test_no_batches_aggregates_to_nothing_rather_than_raising() -> None:
@@ -1044,13 +1141,17 @@ def test_the_evaluation_loop_leaves_the_task_as_it_found_it(trained_task) -> Non
     assert trained_task.training is True
 
 
-def test_batches_too_small_to_derange_are_skipped_and_counted(trained_task) -> None:
-    loader = _OneBatchLoader([make_stub_batch(batch=1), make_stub_batch(batch=2)])
+def test_batches_too_small_to_derange_are_scored_and_counted(trained_task) -> None:
+    loader = _OneBatchLoader(
+        [make_stub_batch(batch=1, guid_prefix="LONE"), make_stub_batch(batch=2)]
+    )
 
     results = evaluate(trained_task, loader, num_samples=1)
 
-    assert results["n_batches"] == 1
+    assert results["n_batches"] == 2
+    assert results["n_samples"] == 3, "the single sample is scored, not dropped"
     assert results["n_batches_skipped_too_small"] == 1
+    assert results["controls"]["n_control_pairs"] == 2
 
 
 def test_the_mean_decoded_score_is_the_training_path_for_the_base_branch_and_not_the_full(

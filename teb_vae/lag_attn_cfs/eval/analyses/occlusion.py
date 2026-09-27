@@ -48,7 +48,11 @@ under the deep encoder, tens of steps under the convolution stem -- so a band oc
 anchor $a$ contaminates the state of every anchor after it. Scoring a second anchor in the same
 forward would attribute one anchor's loss to another's band. The anchor is drawn once per segment
 from a seeded generator, uniformly over the anchors the forward marked valid, and is held fixed
-across every band **and** the reference arm: that is what makes the difference paired.
+across every band **and** the reference arm: that is what makes the difference paired. The
+generators are seeded **per batch** from the run's seed and the batch's position: seeded once per
+batch with one constant, every batch would replay the same draw, so row $i$ of every batch would be
+scored at the same anchor column and the whole pass would visit only as many anchor phases as a
+batch has rows.
 
 **Common random numbers.** The two arms differ by one band of source values and by nothing else,
 including the reparameterisation draw: the generator is reseeded to the same value before each
@@ -70,7 +74,7 @@ import numpy as np
 import pandas as pd
 import torch
 
-from teb_vae.lag_attn.nets.lag_report import SECONDS_PER_STEP
+from teb_vae.lag_attn.nets.lag_report import lag_compensated_seconds
 from teb_vae.lag_attn_cfs.eval import cohort
 from teb_vae.lag_attn_cfs.eval import figures_seam as figures
 from teb_vae.lag_attn_cfs.eval._reuse import labels, stats as shared_stats
@@ -94,6 +98,10 @@ ANALYSIS_DIRNAME = "occlusion"
 #: fan-out, so both are a contract rather than a filename and a label.
 PER_RECORDING_FILENAME = "occlusion_per_recording.csv"
 PER_HORIZON_FILENAME = "occlusion_per_horizon.csv"
+#: One row per scored segment: its identity (GUID, subgroup, clinical class, ``epoch``), the anchor
+#: it was scored at, the reference block score and every band's horizon-summed delta -- the rows
+#: every other table here is a reduction of.
+PER_SEGMENT_FILENAME = "occlusion_per_segment.csv"
 SUMMARY_FILENAME = "occlusion_summary.csv"
 HORIZON_FIGURE = "occlusion_horizon_delta"
 
@@ -130,6 +138,7 @@ CAP_NAME = "occlusion"
 #: streams rather than a replay of the collection pass's.
 _SEED_OFFSET_ANCHOR = 11
 _SEED_OFFSET_NOISE = 12
+_BATCH_SEED_STRIDE = 1_000_003
 
 #: The unit every delta here is in: the block score is a sum over the kept channels at one horizon
 #: step, in nats, so a difference of two of them is nats per anchor per horizon step.
@@ -307,6 +316,7 @@ def collect_batch(
     *,
     bands: Dict[str, Tuple[int, int]],
     seed: int,
+    batch_index: int = 0,
 ) -> Dict[str, Any]:
     r"""Score every band and the reference arm on one batch, at one anchor per sample.
 
@@ -326,6 +336,9 @@ def collect_batch(
         batch: One batch, already on the model's device.
         bands: The configured bands, ``{name: (lo, hi)}``.
         seed: This analysis's own seed, for the anchor draw and the latent noise.
+        batch_index: The batch's position in the pass. Folded into both generators' seeds, so
+            each batch draws its own anchors and its own noise rather than replaying the first
+            batch's; the draw stays reproducible from the run's seed and the loader order.
 
     Returns:
         ``guids``, the $(B, H)$ reference score, one $(B, H)$ delta per band, the per-band live
@@ -340,8 +353,11 @@ def collect_batch(
     )
 
     device = y_st.device
+    # One stride per batch, far wider than the two offsets, so no batch's anchor stream can
+    # coincide with another batch's noise stream.
+    batch_seed = int(seed) + _BATCH_SEED_STRIDE * int(batch_index)
     anchor_generator = torch.Generator(device=device)
-    anchor_generator.manual_seed(int(seed) + _SEED_OFFSET_ANCHOR)
+    anchor_generator.manual_seed(batch_seed + _SEED_OFFSET_ANCHOR)
     columns = choose_anchors(outputs["anchor_valid"], anchor_generator)
     index = columns[:, None]
     anchors = outputs["anchor_index"].gather(1, index)
@@ -364,7 +380,7 @@ def collect_batch(
 
     def _arm(occlusion: Optional[torch.Tensor]) -> torch.Tensor:
         noise_generator = torch.Generator(device=device)
-        noise_generator.manual_seed(int(seed) + _SEED_OFFSET_NOISE)
+        noise_generator.manual_seed(batch_seed + _SEED_OFFSET_NOISE)
         arm = occluded_forward_outputs(
             model,
             scored,
@@ -710,13 +726,13 @@ def build_horizon_figure(per_horizon: pd.DataFrame, bands: Dict[str, Tuple[int, 
         return figure
 
     steps = np.sort(per_horizon["horizon_step"].unique())
-    curves, labels = [], []
+    curves, names = [], []
     for name, band in bands.items():
         subset = per_horizon[per_horizon["band"] == name].sort_values("horizon_step")
         if subset.empty:
             continue
         curves.append(np.asarray(subset["delta_nats"], dtype=np.float64))
-        labels.append(
+        names.append(
             f"{name} [{int(band[0])}, {int(band[1])}] "
             f"(live {float(subset['live_fraction'].iloc[0]):.2f})"
         )
@@ -724,7 +740,7 @@ def build_horizon_figure(per_horizon: pd.DataFrame, bands: Dict[str, Tuple[int, 
         axis,
         steps,
         np.asarray(curves, dtype=np.float64) if curves else np.asarray([]),
-        labels,
+        names,
         title="forecast cost of removing a band of source, by horizon step",
         xlabel="horizon step",
         ylabel=NATS_PER_ANCHOR_STEP,
@@ -840,17 +856,18 @@ def cost_record(
     }
 
 
-def clock_frames(
-    per_sample: pd.DataFrame, collected: Any, bands: Dict[str, Tuple[int, int]]
+def join_collected(
+    per_sample: pd.DataFrame, collected: Any
 ) -> Tuple[pd.DataFrame, Dict[str, Any]]:
-    """Place each band's per-segment delta on both clinical clocks.
+    """Attach each scored segment's cohort labels and second-stage onset from the collected table.
 
-    **A join, not three more reads off the batch.** The clock coordinate needs ``epoch``, the
-    second clock needs ``second_stage_onset`` and the cohort split needs ``clinical_class`` and
+    **A join, not more reads off the batch.** The clock coordinate needs ``epoch``, the second
+    clock needs ``second_stage_onset`` and every cohort split needs ``clinical_class`` and
     ``subgroup`` -- and every one of them is already on the collected per-sample table, resolved
     once, by the pass every other analysis reads. Joining on ``(guid, epoch)`` picks them all up
-    and additionally guarantees this analysis cannot disagree with any other about which class a
-    segment belongs to, which reading them again here could not.
+    and guarantees this analysis cannot disagree with any other about which class a segment belongs
+    to. It is also what puts the subgroup and the class on the per-segment and per-recording tables,
+    and what gives the runner's by-class and by-subgroup fan-out a cohort to cut on.
 
     **What does not join is counted rather than dropped.** A segment scored here that the collected
     table does not carry means the two passes disagree about the population, and a silently shorter
@@ -858,32 +875,27 @@ def clock_frames(
 
     Args:
         per_sample: This analysis's per-segment frame, carrying :data:`JOIN_KEYS`.
-        collected: The run's :class:`~teb_vae.lag_attn_cfs.eval.collect.Collection`.
-        bands: The configured bands, for the delta columns.
+        collected: The run's :class:`~teb_vae.lag_attn_cfs.eval.collect.Collection`, or ``None``.
 
     Returns:
-        ``(frame, record)`` -- long-form rows per ``(clock, cohort axis, cohort, band, window)``,
-        and the join's own census.
+        ``(frame, census)`` -- the per-segment frame with the carried columns beside it (the input
+        unchanged when nothing could be joined), and the join's own census.
     """
-    columns = [_band_column(name) for name in bands]
-    keys = ["clock", "group_column", "group", "band", "time_bin", "bin_center_h",
-            "n_recordings", "mean", "q25", "median", "q75"]
     collected_frame = getattr(collected, "per_sample", None)
     if per_sample.empty or collected_frame is None or collected_frame.empty:
-        return pd.DataFrame(columns=keys), {
+        return per_sample, {
             "joined": False,
             "reason": "one of the two tables was empty, so there was nothing to place on a clock",
         }
     available = [name for name in JOIN_KEYS if name in collected_frame.columns]
     if list(available) != list(JOIN_KEYS):
-        return pd.DataFrame(columns=keys), {
+        return per_sample, {
             "joined": False,
             "reason": (
                 f"the collected table carries {available} of the join key {list(JOIN_KEYS)}, so a "
                 f"segment here cannot be matched to its clinical coordinates"
             ),
         }
-
     carried = [
         name
         for name in (*labels.GROUP_COLUMNS, cohort.SECOND_STAGE_COLUMN)
@@ -898,7 +910,7 @@ def clock_frames(
     # The tripwire. Zero on a healthy run; anything else means the two passes drew different
     # segments, and the number says how many rather than the table quietly being shorter.
     unjoined = int(merged[carried[0]].isna().sum()) if carried else int(len(merged))
-    census: Dict[str, Any] = {
+    return merged, {
         "joined": True,
         "n_scored": int(len(per_sample)),
         "n_unjoined": unjoined,
@@ -906,7 +918,25 @@ def clock_frames(
         "note": CLOCK_NOTE,
     }
 
-    rows: List[pd.DataFrame] = []
+
+def clock_frames(merged: pd.DataFrame, bands: Dict[str, Tuple[int, int]]) -> pd.DataFrame:
+    """Place each band's per-segment delta on both clinical clocks.
+
+    Args:
+        merged: :func:`join_collected`'s frame, carrying the cohort labels and the onset.
+        bands: The configured bands, for the delta columns.
+
+    Returns:
+        Long-form rows per ``(clock, cohort axis, cohort, band, window)``; empty with its columns
+        when the frame carries no cohort to place a segment with.
+    """
+    columns = [_band_column(name) for name in bands]
+    keys = ["clock", "group_column", "group", "band", "time_bin", "bin_center_h",
+            "n_recordings", "mean", "q25", "median", "q75"]
+    if merged.empty or not any(axis in merged.columns for axis in labels.GROUP_COLUMNS):
+        return pd.DataFrame(columns=keys)
+
+    rows: List[Dict[str, Any]] = []
     for clock_name, binner, bin_column, center_column in (
         ("time_to_delivery", cohort.add_time_bins, cohort.BIN_COLUMN, cohort.BIN_CENTER_COLUMN),
         (
@@ -938,13 +968,13 @@ def clock_frames(
                 ):
                     entry = {"clock": clock_name, "group_column": axis, "band": band, **row}
                     entry.pop("metric", None)
-                    rows.append(pd.DataFrame([entry]))
-    frame = pd.concat(rows, ignore_index=True) if rows else pd.DataFrame(columns=keys)
-    census["n_rows"] = int(len(frame))
-    return frame, census
+                    rows.append(entry)
+    return pd.DataFrame(rows) if rows else pd.DataFrame(columns=keys)
 
 
-def build_clock_figure(frame: pd.DataFrame, bands: Dict[str, Tuple[int, int]]) -> Any:
+def build_clock_figure(
+    frame: pd.DataFrame, bands: Dict[str, Tuple[int, int]], *, delay_steps: int = 0
+) -> Any:
     """One panel per band: what removing it cost, window by window before delivery.
 
     The interventional counterpart of ``lag_kld_scaled``'s band trajectories, on the same
@@ -954,6 +984,8 @@ def build_clock_figure(frame: pd.DataFrame, bands: Dict[str, Tuple[int, int]]) -
     Args:
         frame: The long-form clock table.
         bands: The partition, in panel order.
+        delay_steps: The causal input delay, so a band's span is quoted in the same compensated
+            seconds every lag axis of the run is drawn in.
 
     Returns:
         The figure.
@@ -968,7 +1000,12 @@ def build_clock_figure(frame: pd.DataFrame, bands: Dict[str, Tuple[int, int]]) -
         if len(frame)
         else frame
     )
-    groups = sorted({str(value) for value in subset["group"]}) if len(subset) else []
+    groups = (
+        cohort.ordered_groups(
+            sorted({str(value) for value in subset["group"]}), labels.CLASS_COLUMN
+        )
+        if len(subset) else []
+    )
     colors = figures.group_colors(groups) if groups else {}
     for index, name in enumerate(names):
         panel = axes[index][0]
@@ -991,7 +1028,8 @@ def build_clock_figure(frame: pd.DataFrame, bands: Dict[str, Tuple[int, int]]) -
         span = bands[name]
         panel.set_title(
             f"{name}: lags {span[0]}-{span[1]} steps "
-            f"({span[0] * SECONDS_PER_STEP:g}-{(span[1] + 1) * SECONDS_PER_STEP:g} s back)",
+            f"({float(lag_compensated_seconds(span[0], delay_steps=delay_steps)):g}-"
+            f"{float(lag_compensated_seconds(span[1], delay_steps=delay_steps)):g} s)",
             fontsize=figures.FONT_SMALL,
         )
         panel.set_ylabel("nats per anchor")
@@ -1063,20 +1101,24 @@ def run_occlusion_analysis(
         if cap is not None and n_scored >= int(cap):
             break
         moved = task.transfer_batch_to_device(batch, task.device, dataloader_idx=0)
-        record = collect_batch(task, moved, bands=bands, seed=seed)
+        record = collect_batch(task, moved, bands=bands, seed=seed, batch_index=n_batches)
         records.append(record)
         invariances.append(record["announcement_max_abs_change"])
         n_scored += len(record["guids"])
         n_batches += 1
     elapsed_s = time.perf_counter() - started
 
-    per_sample, per_horizon = build_frames(records, bands)
+    scored, per_horizon = build_frames(records, bands)
+    # The cohort labels and the onset first, so the per-segment and per-recording tables carry the
+    # subgroup and the class beside every GUID and the grouped fan-out has a cohort to cut on.
+    per_sample, clock_census = join_collected(scored, getattr(context, "collection", None))
+    per_sample.to_csv(directory / PER_SEGMENT_FILENAME, index=False)
     # Before the summary rather than after it: the per-band interval is taken over RECORDINGS, so
     # the summary needs this frame. The two were the other way round while the summary reported a
     # delta and no spread.
     band_columns = [_band_column(name) for name in bands]
     per_guid = (
-        per_recording_means(per_sample, band_columns)
+        per_recording_means(per_sample, ["reference_block_nats", *band_columns])
         if not per_sample.empty
         else pd.DataFrame()
     )
@@ -1103,13 +1145,21 @@ def run_occlusion_analysis(
     # The deltas placed on the two clinical clocks, by joining this frame's ``(guid, epoch)`` onto
     # the collected per-sample table -- which is where the class, the subgroup and the second-stage
     # offset already live, resolved once by the pass every other analysis reads.
-    clocks, clock_census = clock_frames(per_sample, context.collection, bands)
+    clocks = clock_frames(per_sample if clock_census["joined"] else pd.DataFrame(), bands)
+    clock_census["n_rows"] = int(len(clocks))
     # Written with its header even when the join produced nothing: a table a reader can open and
     # find empty is a different statement from a table that was never written.
     clocks.to_csv(directory / CLOCK_FILENAME, index=False)
+    lag_block = dict(
+        dict(getattr(getattr(context, "collection", None), "results", None) or {}).get("lag")
+        or {}
+    )
     clock_figure = str(
         figures.render_figure(
-            build_clock_figure(clocks, bands), directory / CLOCK_FIGURE
+            build_clock_figure(
+                clocks, bands, delay_steps=int(lag_block.get("delay_steps") or 0)
+            ),
+            directory / CLOCK_FIGURE,
         ).name
     )
 
@@ -1164,7 +1214,7 @@ def run_occlusion_analysis(
             grouped_frame_entry(ANALYSIS_DIRNAME, PER_RECORDING_FILENAME, tuple(band_columns))
         ],
         "files": [
-            PER_RECORDING_FILENAME, PER_HORIZON_FILENAME, SUMMARY_FILENAME, CLOCK_FILENAME,
-            figure_name, clock_figure,
+            PER_SEGMENT_FILENAME, PER_RECORDING_FILENAME, PER_HORIZON_FILENAME, SUMMARY_FILENAME,
+            CLOCK_FILENAME, figure_name, clock_figure,
         ],
     }

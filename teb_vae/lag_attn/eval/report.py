@@ -370,7 +370,8 @@ def emit_grouped_variants(
             produces.
         group_columns: The grouping axes. ``None`` uses
             :data:`~teb_vae.lag_attn.eval.labels.GROUP_COLUMNS`.
-        stem: Filename stem, yielding ``<stem>_by_<group>.csv`` and ``.pdf``.
+        stem: Filename stem, yielding ``<stem>_by_<group>.csv`` and the figure of the same stem
+            in the run's figure format.
         references: Optional metric-to-reference-value mapping, drawn as a horizontal line.
         order_groups: Optional ``(groups, group_column) -> ordered groups``, deciding the
             left-to-right violin order and the CSV's row order alike. ``None`` uses
@@ -469,7 +470,7 @@ def emit_grouped_variants(
             colors=None if group_palette is None else group_palette(groups),
         )
         try:
-            pdf_path = figures.render_figure(figure, directory / f"{stem}_by_{group_column}")
+            figure_path = figures.render_figure(figure, directory / f"{stem}_by_{group_column}")
         finally:
             figures.plt.close(figure)
 
@@ -479,7 +480,7 @@ def emit_grouped_variants(
             "n_per_group": {
                 group: int((frame[group_column].astype(str) == group).sum()) for group in groups
             },
-            "files": {"table": str(csv_path), "figure": str(pdf_path)},
+            "files": {"table": str(csv_path), "figure": str(figure_path)},
         }
     return emitted
 
@@ -559,12 +560,12 @@ def check_argmax_lag(results: Dict[str, Any]) -> Dict[str, Any]:
     and the lag attribution is noise wearing a peak.
 
     **The ceiling is the attainable one, not $\log L$.** Causal masking gives anchor $t$ only
-    $\min(t + 1, L)$ valid lags, so at the production geometry ($L = 91$, warmup $30$) sixty of
-    the two hundred and forty supported anchors cannot reach $\log 91$ at all. Attention that is
-    exactly uniform over every causally available lag -- the degenerate case this check exists to
-    catch -- scores $4.398$ against $\log 91 = 4.511$, a ratio of $0.9749$. Divided by $\log L$
-    the $0.99$ threshold could therefore **never fire**, and its 1% margin, justified below as
-    floating-point slack, is twenty-four times smaller than that systematic gap.
+    $\min(t + 1, L)$ valid lags, so wherever the warm-up is shorter than $L - 1$ the early
+    supported anchors cannot reach $\log L$ at all, and attention exactly uniform over every
+    causally available lag -- the degenerate case this check exists to catch -- scores
+    $\operatorname{mean}_t \log \min(t + 1, L) < \log L$. Divided by $\log L$ the $0.99$ threshold
+    could then **never fire** once that systematic gap exceeds its 1% margin, which is meant as
+    floating-point slack and nothing more.
     """
     attention = results.get("attention")
     if not isinstance(attention, dict):

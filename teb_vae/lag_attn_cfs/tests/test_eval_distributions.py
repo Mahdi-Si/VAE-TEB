@@ -108,7 +108,7 @@ def test_an_unrooted_metric_passes_through_in_its_own_unit(per_sample) -> None:
     ``delta_mu_rms`` -- must not be rooted twice."""
     segment, _, units = distributions.build_frames(per_sample)
 
-    assert units["delta_mu_rms"] == NORMALISED_UNIT
+    assert units["delta_mu_rms"] == "latent units"
     assert np.allclose(
         np.asarray(segment["delta_mu_rms"]), np.asarray(per_sample["delta_mu_rms"])
     )

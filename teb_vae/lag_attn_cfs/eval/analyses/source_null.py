@@ -336,7 +336,7 @@ def delta_mask(positive: Sequence[float], shape: Dict[str, Any]) -> Tuple[
 
     **Withheld entirely when the profile is degenerate**, and that is the load-bearing half. This
     family's diagnosed run put $67.5\%$ of its KL in an availability clock and $0.160$ nats of
-    source content across $91$ lags; a mask cut from a profile that flat would name a band on
+    source content across the whole lag window; a mask cut from a profile that flat would name a band on
     arithmetic accident, and it would look exactly like a finding. The guard firing is a result to
     report, not a failure to route around.
 
@@ -447,6 +447,7 @@ def lag_record(
                 "clock_excess_argmax_lag_step": None,
                 "clock_excess_compensated_seconds": None,
                 "clock_excess_peak_share": None,
+                "clock_excess_at_window_edge": None,
                 "clock_excess_degenerate": None,
                 "clock_excess_rectified_frac": None,
                 "net_nats": None,
@@ -484,6 +485,8 @@ def lag_record(
                 None if argmax is None or argmax >= seconds.size else float(seconds[argmax])
             ),
             "clock_excess_peak_share": _finite_or_none(peak_share),
+            # A peak on the longest searched lag is censored by the window rather than located.
+            "clock_excess_at_window_edge": above.get("at_window_edge"),
             "clock_excess_degenerate": bool(shape["degenerate"]),
             "clock_excess_rectified_frac": _finite_or_none(census["rectified_frac"]),
             # The signed sum, which is the gated scalar, beside the two halves it is made of.
@@ -529,20 +532,32 @@ def build_lag_figure(
     Returns:
         The figure.
     """
-    import matplotlib.pyplot as plt
-
-    figure, (top, bottom) = plt.subplots(
-        2, 1, figsize=(9.0, 6.0), sharex=True, gridspec_kw={"height_ratios": [2, 1]}
-    )
+    figure, grid = figures.new_figure(2, height_per_row=2.5)
+    top, bottom = grid[0, 0], grid[1, 0]
+    # The arms on the taller panel, the residual on the shorter one, sharing the lag axis.
+    top.get_gridspec().set_height_ratios([2, 1])
+    bottom.sharex(top)
+    top.tick_params(labelbottom=False)
     axis = np.asarray(frame["compensated_seconds"], dtype=np.float64)
-    top.plot(axis, frame["kl_nats"], label="matched: KL(q(z|Y,U) || p(z|Y))")
-    top.plot(axis, frame["kl_null_nats"], label="source-null: the availability clock")
+    top.plot(
+        axis, frame["kl_nats"], color=figures.COLOR_BLUE, linewidth=figures.LINE_EMPHASIS,
+        marker="o", markersize=figures.MARKER_SMALL,
+        label="matched: KL(q(z|Y,U) || p(z|Y))",
+    )
+    top.plot(
+        axis, frame["kl_null_nats"], color=figures.COLOR_ORANGE, linewidth=figures.LINE_EMPHASIS,
+        marker="o", markersize=figures.MARKER_SMALL,
+        label="source-null: the availability clock",
+    )
     top.set_ylabel("nats per anchor")
-    top.legend(loc="upper right", fontsize="small")
     top.set_title("Where the coupling exceeded the availability clock")
 
-    bottom.axhline(0.0, linewidth=figures.LINE_THIN, color="0.4")
-    bottom.plot(axis, frame["clock_excess_nats"], color="C3", label="clock-excess (signed)")
+    bottom.axhline(0.0, linewidth=figures.LINE_THIN, color=figures.COLOR_GRAY)
+    bottom.plot(
+        axis, frame["clock_excess_nats"], color=figures.COLOR_VERMILLION,
+        linewidth=figures.LINE_EMPHASIS, marker="o", markersize=figures.MARKER_SMALL,
+        label="clock-excess (signed)",
+    )
     bottom.set_ylabel("nats per anchor")
     bottom.set_xlabel(COEFFICIENT_LAG_AXIS_LABEL)
 
@@ -551,28 +566,45 @@ def build_lag_figure(
     # Bin EDGES: the bands are inclusive lag ranges, so a shade from centre to centre would be
     # one bin short at each end, adjacent bands would leave a gap, and a one-lag band would vanish.
     half_lag = SECONDS_PER_STEP / 2.0
+    # The legends go into headroom made above the data first, so the band names written along
+    # the top edge below sit over that empty strip rather than across the curves or the legend.
+    figures.legend_with_headroom(top, ncol=2, headroom=0.35, fontsize=figures.FONT_SMALL)
     for index, (name, span) in enumerate(bands.items()):
         lo = float(seconds[max(span[0], 0)]) - half_lag if seconds.size else 0.0
         hi = float(seconds[min(span[1], seconds.size - 1)]) + half_lag if seconds.size else 0.0
         for panel in (top, bottom):
-            panel.axvspan(lo, hi, color="0.9" if index % 2 else "0.95", zorder=0)
+            panel.axvspan(
+                lo, hi, color=figures.COLOR_LIGHT_GRAY, alpha=0.5 if index % 2 else 0.25,
+                linewidth=0, zorder=0,
+            )
         top.annotate(
-            name, xy=((lo + hi) / 2.0, top.get_ylim()[1]), ha="center", va="top",
-            fontsize="x-small", color="0.35",
+            name, xy=((lo + hi) / 2.0, 0.0), xycoords=("data", "axes fraction"),
+            xytext=(0, 2), textcoords="offset points", ha="center", va="bottom",
+            fontsize=figures.FONT_TINY, color=figures.COLOR_GRAY,
         )
 
     mask = record.get("delta_mask")
     if mask and seconds.size:
         bottom.axvspan(
             float(seconds[mask[0]]) - half_lag, float(seconds[mask[1]]) + half_lag,
-            color="C3", alpha=0.15, zorder=1, label="delta mask",
+            color=figures.COLOR_VERMILLION, alpha=0.15, zorder=1, label="delta mask",
         )
-    bottom.legend(loc="upper right", fontsize="small")
+    figures.legend_with_headroom(bottom, ncol=2, headroom=0.35, fontsize=figures.FONT_SMALL)
+    notes = []
     if record.get("clock_excess_degenerate"):
-        bottom.annotate(
-            "clock-excess profile is degenerate: no mask emitted",
-            xy=(0.02, 0.05), xycoords="axes fraction", fontsize="small", color="C3",
+        notes.append("clock-excess profile is degenerate: no mask emitted")
+    if record.get("clock_excess_at_window_edge"):
+        notes.append(
+            "clock-excess peak is on the longest searched lag: censored by the window, "
+            "the true peak may lie beyond it"
         )
+    if notes:
+        bottom.annotate(
+            "; ".join(notes), xy=(0.01, 0.04), xycoords="axes fraction",
+            fontsize=figures.FONT_TINY, color=figures.COLOR_VERMILLION,
+        )
+    figures.style_axes(top)
+    figures.style_axes(bottom)
     figures.caveat_note(figure)
     return figure
 

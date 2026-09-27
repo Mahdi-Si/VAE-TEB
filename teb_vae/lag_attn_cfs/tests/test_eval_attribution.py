@@ -117,6 +117,24 @@ def test_the_wrapper_returns_the_forwards_own_quantities_at_each_rows_anchor() -
     assert rows.shape[0] == sum(len(c) for c in columns)
 
 
+def test_the_attributed_forward_draws_no_random_number_and_restores_the_model() -> None:
+    """The readout is a deterministic function of its inputs: the attributed forward decodes at the
+    latent means, so it consumes no random number, and it leaves no shadowed seam on the model."""
+    module = _module()
+    model = module.orig_model
+    inputs, extra, _outputs, contributing = _inputs(module)
+    rows_inputs, rows_extra, cols, _sample = core.expand_rows(inputs, extra, core.spread_columns(contributing, 2))
+    wrapper = core.AnchorReadout(model, core.ATTENTION_CELL, readout=core.READOUT_NLL_FULL).eval()
+    state = torch.random.get_rng_state()
+    with torch.no_grad():
+        first = wrapper(*rows_inputs, *rows_extra, cols, torch.zeros_like(cols))
+        second = wrapper(*rows_inputs, *rows_extra, cols, torch.zeros_like(cols))
+    assert torch.equal(torch.random.get_rng_state(), state)
+    assert torch.equal(first, second)
+    for name in ("_build_anchor_index", *core.REPARAMETERISATION_SEAMS):
+        assert name not in vars(model)
+
+
 def test_the_horizon_and_fidelity_readouts_are_the_forwards_own_block_scores() -> None:
     """The per-step score sums over the block to the full-branch score; the fidelity readouts are the
     masked squared error of the mean forecast, and its gap, under the same mask."""
@@ -543,6 +561,16 @@ def test_the_analysis_attributes_a_balanced_draw_end_to_end(tmp_path, monkeypatc
     with np.load(directory / core.VECTORS_FILENAME) as handle:
         assert handle["lag_profile"].shape == (len(rows), int(module.orig_model.lag_attn.L))
         assert handle["layer_per_unit"].shape[1] == int(module.orig_model.posterior_head.num_heads)
+        # The arrays name their rows without the table beside them.
+        assert list(handle["row_guid"]) == list(rows["guid"].astype(str))
+        assert list(handle["row_subgroup"]) == list(rows[labels.SUBGROUP_COLUMN].astype(str))
+        assert np.array_equal(handle["row_anchor"], rows["anchor"].to_numpy())
+    assert rows["unit"].notna().all()
+    # One segment per drawn recording, counted as one: the readouts join anchor by anchor.
+    recordings = pd.read_csv(directory / core.RECORDINGS_FILENAME)
+    assert (recordings["n_segments"] == 1).all() and len(recordings) == 3
+    trace_anchors = pd.read_csv(directory / attribution_pass.TRACE_ANCHORS_FILENAME)
+    assert {"guid", labels.CLASS_COLUMN, labels.SUBGROUP_COLUMN, "anchor", "kld_value_input"} <= set(trace_anchors.columns)
     manifest = pd.read_csv(directory / attribution_pass.TRACE_MANIFEST_FILENAME)
     assert list(manifest.columns) == list(attribution_pass.TRACE_MANIFEST_COLUMNS)
     for _, row in manifest.iterrows():
@@ -568,6 +596,10 @@ def test_the_analysis_attributes_a_balanced_draw_end_to_end(tmp_path, monkeypatc
         model = module.orig_model
         assert handle["input_target"].shape == (3, int(model.sequence_length), int(model.c_y))
         assert handle["input_source"].shape == (3, int(model.sequence_length), int(model.c_u))
+        # The raw signals of each example's segment travel with its maps, on the raw grid.
+        for name in ("fhr", "up"):
+            assert handle[f"example_raw_{name}"].shape == (3, 16 * int(model.sequence_length))
+            assert len(handle[f"example_raw_{name}_unit"]) == 3
         readouts = set(zip(handle["map_readout"].tolist(), handle["map_baseline"].tolist(), handle["map_band"].tolist()))
         expected = {
             (readout, baseline, tag)

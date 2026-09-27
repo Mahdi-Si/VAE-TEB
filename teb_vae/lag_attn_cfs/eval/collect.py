@@ -22,8 +22,8 @@ plus a fifth KL-only arm -- and almost every analysis wants the same forward. So
   else in the run. The value written is the forward's own ``anchor_index``.
 * ``per_sample_vectors.npz`` -- the per-sample vector readouts (the per-dimension KL, the four
   $L$-wide lag vectors, the attention profiles and the three $C_{\mathrm{keep}}$-wide channel
-  vectors), in ``per_sample.csv``'s row order. A sidecar rather than $4L + d_z + 3C_{\mathrm{keep}}$
-  extra CSV columns, which at the shipped geometry would be $722$ of them.
+  vectors), in ``per_sample.csv``'s row order and carrying its ``sample_index`` key. A sidecar
+  rather than $4L + d_z + 3C_{\mathrm{keep}}$ extra CSV columns.
 * ``collection.json`` -- the provenance sidecar: which checkpoint, which seed, which
   ``eval_config``, how many rows, what was excluded and why, what the pass cost and at what rate,
   the readouts the pass produced, and
@@ -34,43 +34,42 @@ plus a fifth KL-only arm -- and almost every analysis wants the same forward. So
 
 **A segment that scored no anchors measured nothing, and its columns are NaN rather than zero.**
 The per-sample mean divides by a denominator clamped to $1$, so an empty numerator reads as
-exactly ``0.0`` -- a fabricated score, not a small one. Averaged into a summed-$H \cdot C_{\mathrm{keep}}$-coefficient
-block figure of hundreds of nats it drags the headline toward zero and shrinks ``pred_gap`` with
-no other symptom. NaN is the representation that makes every downstream ``mean()`` skip it by
-default, and the exclusions are counted per recording and per subgroup rather than merely dropped.
+exactly ``0.0`` -- a fabricated score, not a small one. Averaged into a summed
+$H \cdot C_{\mathrm{keep}}$-coefficient block figure of hundreds of nats it drags the headline
+toward zero and shrinks ``pred_gap`` with no other symptom. NaN is the representation that makes
+every downstream ``mean()`` skip it by default, and the exclusions are counted per recording and
+per subgroup rather than merely dropped.
 
 **Heavy quantities, one decision each.** Three things several later analyses want are on neither
-table, and each gets a different treatment rather than a blanket one. Per retained sample at the
-geometry these figures were sized at ($T = 300$, $T_{\mathrm{valid}} = 270$, $F = 133$,
-$A_{\max} = 137$, $H = 30$, $C_{\mathrm{keep}} = 98$, $L = 91$, $M = 4$, fp32) -- every figure below
-scales with a run's own $A_{\max}$, $H$ and $C_{\mathrm{keep}}$, which ``preflight.json`` records:
+table, and each gets a different treatment rather than a blanket one. Every size below is in
+float32 elements per retained sample, symbolic in the run's own $T$, $A_{\max}$, $H$,
+$C_{\mathrm{keep}}$, $L$ and $M$, which ``preflight.json`` records:
 
-* **Per-coefficient residuals and log-variances** ($A_{\max} \times H \times C_{\mathrm{keep}}$,
-  $874$ KiB per tensor) -- **streamed as an exact accumulator**, resolved by horizon step. What
-  calibration and horizon-resolved skill need from them are sums, and a sum over the whole split
-  costs $H$ floats instead of terabytes. Resolved by $\tau$ because that axis exists on neither
-  table and cannot be recovered from either.
-* **The per-anchor forecast block** (the same $874$ KiB tensor, four of them for truth, base, full
-  and the full branch's log-variance: $\approx 3.4$ MiB per sample) -- **retained under a seeded
-  cap**, ``caps.waveforms``. That is $1.7\times$ the raw cells' per-sample cost, which is why the
-  shipped cap is halved to $64$.
-* **The attention weights** ($T \times M \times L$, $427$ KiB per sample) -- **retained under
-  ``caps.attention``**, unchanged from the raw cells, whose lag geometry this cell shares.
+* **Per-coefficient residuals and log-variances** ($A_{\max} H C_{\mathrm{keep}}$ per tensor) --
+  **streamed as an exact accumulator**, resolved by horizon step. What calibration and
+  horizon-resolved skill need from them are sums, and a sum over the whole split costs $H$ floats
+  instead of terabytes. Resolved by $\tau$ because that axis exists on neither table and cannot
+  be recovered from either.
+* **The per-anchor forecast block** (the same tensor, four of them for truth, base, full and the
+  full branch's log-variance: $4 A_{\max} H C_{\mathrm{keep}}$) -- **retained under a seeded
+  cap**, ``caps.waveforms``, beside the anchor index that places its rows on the decimated axis.
+* **The attention weights** ($T M L$) -- **retained under ``caps.attention``**, unchanged from
+  the raw cells, whose lag geometry this cell shares.
 * **The per-anchor lag map** -- **written as a third sidecar**, ``per_anchor_vectors.npz``, at
-  the *decoded* anchors only ($A_{\max} \times L$ rather than $T \times L$) and in ``float16``:
-  the pooled KL attribution and the head-averaged attention at every contributing anchor, row for
-  row with ``per_anchor.parquet``. It exists for one consumer, ``lag_high_kl``, which selects
-  anchors by their own $K_t$ and reads the lag structure of the selection -- a question the
-  per-sample profiles, which average every anchor of a segment together, cannot answer, and the
-  per-anchor ``argmax_lag`` column cannot either once a profile is flat. Half precision because
-  the sidecar is a *reading* of the map rather than its accounting copy: the per-anchor
-  ``kld_per_t`` column and the per-sample profiles keep the exact sums, and a relative
-  $2^{-11}$ on a per-lag share moves no statistic taken from it. At the shipped geometry it is
-  $51 \times 91 \times 2$ bytes $\approx 9$ KiB per segment per map before compression.
+  the *decoded* anchors only ($A_{\max} L$ rather than $T L$) and in ``float16``: the pooled KL
+  attribution and the head-averaged attention at every contributing anchor, row for row with
+  ``per_anchor.parquet``. It exists for one consumer, ``lag_high_kl``, which selects anchors by
+  their own $K_t$ and reads the lag structure of the selection -- a question the per-sample
+  profiles, which average every anchor of a segment together, cannot answer, and the per-anchor
+  ``argmax_lag`` column cannot either once a profile is flat. Half precision because the sidecar
+  is a *reading* of the map rather than its accounting copy: the per-anchor ``kld_per_t`` column
+  and the per-sample profiles keep the exact sums, and a relative $2^{-11}$ on a per-lag share
+  moves no statistic taken from it.
 
 A cap is **opt-in**: a quantity absent from ``eval_config.caps`` is retained for *no* samples.
-The alternative default -- retain everything unless capped -- is $3.8$ MiB per sample, which is
-several gigabytes over a real split, held for a figure nobody asked for.
+The alternative default -- retain everything unless capped -- is the four forecast blocks and the
+attention for every sample, which is gigabytes over a real split, held for a figure nobody asked
+for.
 
 **Nothing frequency-domain is accumulated.** The raw pipeline streams cross-spectral sums here and
 writes a third sidecar for them; a stored scattering or phase-harmonic coefficient is a *modulus*,
@@ -131,6 +130,9 @@ PER_ANCHOR_VECTORS_FILENAME = "per_anchor_vectors.npz"
 RETAINED_FILENAME = "retained_arrays.npz"
 COLLECTION_FILENAME = "collection.json"
 
+#: The key column every sidecar row is aligned on, written into the per-sample vector sidecar too.
+SAMPLE_INDEX_KEY = "sample_index"
+
 #: Storage precision of the per-anchor vector sidecar. Half precision, deliberately: the sidecar
 #: is a reading of the per-anchor lag map rather than its accounting copy (``kld_per_t`` on the
 #: per-anchor table and the per-sample profiles keep the exact sums), and at a real split's
@@ -183,20 +185,40 @@ _PER_ANCHOR_CONSUMED: Tuple[str, ...] = ("contributing", "anchor_index")
 #: forward-output keys, plus ``target`` for the gathered feature future the forecast is scored
 #: against, so a retained array cannot be a differently assembled version of what was scored.
 #:
-#: ``up_raw`` and ``weight`` ride with the waveforms rather than forming a third quantity, and
-#: that is a correctness choice rather than a saving. The event analysis triggers on contractions
-#: found in ``up_raw`` and averages the forecast blocks around them; a separate cap would draw a
-#: separate sample set, and the two halves of that average would then describe different
-#: recordings. They cost about $1\%$ of what they travel with -- $4800$ and $300$ floats against
-#: four $(A_{\max}, H, C_{\mathrm{keep}})$ blocks.
+#: On the shared pass the forecast pair ``mu_base`` / ``logvar_base`` / ``mu_full`` /
+#: ``logvar_full`` is the **mean-decoded** one (:data:`RETAINED_FORECAST_DECODE`, which that pass
+#: writes into the retention record): both branches decoded at their latent
+#: mean, which is what ``mean_pred_gap`` scores. The forward's own full forecast is one posterior
+#: sample, and drawn beside a mean-decoded base it would show that draw's noise as the source's
+#: effect.
 #:
-#: ``fhr_raw`` is deliberately **not** retained although the readout offers it: the raw target
-#: trace is drawn on the per-sample diagnostic page, and that page is re-rendered from the loader
-#: rather than from a retained array, because a page is the whole forward output of one segment.
+#: ``up_raw``, ``fhr_raw`` and ``weight`` ride with the waveforms rather than forming a third
+#: quantity, and that is a correctness choice rather than a saving. The event analysis triggers on
+#: contractions found in ``up_raw`` and averages the forecast blocks around them, and the forecast
+#: overlay draws both raw traces above the coefficients they were computed from; a separate cap
+#: would draw a separate sample set, and the two halves would then describe different recordings.
+#: They cost a small fraction of what they travel with -- $2 \cdot 16T$ and $T$ floats against five
+#: $(A_{\max}, H, C_{\mathrm{keep}})$ blocks. ``anchor_index`` rides for the same reason: it is the
+#: decimated step each forecast row scores, so the retained blocks place themselves on the time
+#: axis rather than relying on a reader re-deriving the dense anchor set.
 RETAINED_QUANTITIES: Dict[str, Tuple[str, ...]] = {
-    "waveforms": ("target", "mu_base", "mu_full", "logvar_full", "up_raw", "weight"),
+    "waveforms": (
+        "target", "mu_base", "mu_full", "logvar_base", "logvar_full", "up_raw", "fhr_raw",
+        "weight", "anchor_index",
+    ),
     "attention": ("attn_weights",),
 }
+
+#: Retained names a batch carries only when ``load_fields`` asked for the raw trace behind them.
+OPTIONAL_RETAINED: Tuple[str, ...] = ("up_raw", "fhr_raw")
+
+#: How the retained forecast pair was decoded, written into the retention record so the arrays are
+#: self-describing on disk.
+RETAINED_FORECAST_DECODE = (
+    "mu_base/logvar_base and mu_full/logvar_full are the mean-decoded forecasts: each branch's "
+    "latent taken at its mean (prior for base, posterior for full) and decoded with the anchor's "
+    "own persistence input -- the pair mean_nll_*_block and mean_pred_gap score"
+)
 
 #: Per-anchor column naming how long ago the most recent contraction started, in seconds. NaN
 #: where the anchor has no contraction behind it in this segment -- never a large number, which
@@ -684,6 +706,10 @@ class Collector:
             ],
             "anchor": anchor_index[sample_positions, anchor_positions],
         }
+        # The cohort labels too, off the same per-sample columns, so a per-anchor row names its
+        # recording's subgroup and class without a join (a GUID never travels without them).
+        for name in (labels.SUBGROUP_COLUMN, labels.CLASS_COLUMN):
+            block[name] = np.asarray(self._rows[name][-batch_size:], dtype=object)[sample_positions]
         for name, values in readout.per_anchor.items():
             if name in _PER_ANCHOR_CONSUMED:
                 continue
@@ -718,9 +744,7 @@ class Collector:
         anchor floor at the dense geometry and by more than that at any other, and an age computed
         against the wrong endpoint is a plausible number rather than an error.
 
-        The onset is taken on the **stored** timeline, which the preprocessing has already
-        advanced UP by $20\,$s on. Adding that back would double-count a correction that was made
-        once, deliberately, upstream.
+        The onset is taken on the stored timeline, the one every other number in the run is on.
 
         Args:
             batch: The batch, for its raw ``up`` and its ``weight``.
@@ -763,7 +787,12 @@ class Collector:
 
     # -- heavy arrays --------------------------------------------------------------
     def _append_retained(self, readout: BatchReadout, batch_size: int) -> None:
-        """Keep the planned samples' heavy arrays, and nothing else."""
+        """Keep the planned samples' heavy arrays, and nothing else.
+
+        The raw traces are :data:`OPTIONAL_RETAINED`: a batch carries them only when
+        ``load_fields`` asked, and a split without ``fhr`` must still retain its forecast blocks
+        rather than silently retaining nothing because one trace was absent.
+        """
         if not readout.retained:
             return
         for quantity, tensors in RETAINED_QUANTITIES.items():
@@ -772,12 +801,15 @@ class Collector:
                 for offset in range(batch_size)
                 if self._plan.keeps(quantity, self._sample_index + offset)
             ]
-            if not keep or not all(name in readout.retained for name in tensors):
+            required = [name for name in tensors if name not in OPTIONAL_RETAINED]
+            if not keep or not all(name in readout.retained for name in required):
                 continue
             self._retained_index.setdefault(quantity, []).extend(
                 self._sample_index + offset for offset in keep
             )
             for name in tensors:
+                if name not in readout.retained:
+                    continue
                 rows = readout.retained[name].detach().cpu().numpy()
                 self._retained.setdefault(name, []).append(rows[keep])
 
@@ -822,6 +854,9 @@ class Collector:
             for name, blocks in self._vectors.items()
             if blocks
         }
+        if vectors and not per_sample.empty:
+            # The sidecar's own key, so it joins on ``sample_index`` rather than only by position.
+            vectors[SAMPLE_INDEX_KEY] = per_sample["sample_index"].to_numpy(dtype=np.int64)
         per_anchor = _concatenate_blocks(self._anchor_blocks)
         anchor_vectors = {
             name: np.concatenate(blocks, axis=0)
@@ -1227,6 +1262,9 @@ def collect_tables(
     # read off the model for the same reason the bounds are: it is a property of the checkpoint,
     # and an offline re-run has no model to ask.
     collection.record["likelihood_structure"] = likelihood_structure_record(model)
+    # Stated by this pass rather than by the sink: it is ``evaluate_batch`` that hands the
+    # mean-decoded pair to the retention, and a binding's own pass retains what its readout does.
+    collection.record["retention"]["forecast_decode"] = RETAINED_FORECAST_DECODE
     check_per_anchor_key(collection.per_anchor)
     if len(collection.per_sample) != int(results["n_samples"]):
         raise ValueError(
@@ -1296,7 +1334,11 @@ def config_digest(eval_config: Dict[str, Any]) -> str:
 
 
 def provenance(
-    *, checkpoint_path: Optional[Any], eval_config: Dict[str, Any], num_samples: int
+    *,
+    checkpoint_path: Optional[Any],
+    eval_config: Dict[str, Any],
+    num_samples: int,
+    max_batches: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Return the identity of the run whose tables these are.
 
@@ -1305,6 +1347,9 @@ def provenance(
         eval_config: The validated ``eval_config`` block.
         num_samples: The Monte Carlo draw count actually used, which may differ from the
             configured one on a smoke run and is what the numbers depend on.
+        max_batches: The smoke-run batch cap, or ``None`` for the whole loader. It decides the
+            population as surely as ``max_samples`` does, and it lives outside ``eval_config``, so
+            without it here a smoke run's tables would be reused as a full run's.
 
     Returns:
         The provenance record.
@@ -1319,6 +1364,7 @@ def provenance(
         "checkpoint": checkpoint,
         "seed": int(eval_config.get("seed", 0)),
         "num_mc_samples": int(num_samples),
+        "max_batches": None if max_batches is None else int(max_batches),
         "eval_config_digest": config_digest(eval_config),
     }
 
@@ -1344,7 +1390,10 @@ def write_collection(collection: Collection, results_dir: Any) -> Path:
     if collection.anchor_vectors:
         np.savez_compressed(results_dir / PER_ANCHOR_VECTORS_FILENAME, **collection.anchor_vectors)
     if collection.retained:
-        np.savez_compressed(results_dir / RETAINED_FILENAME, **collection.retained)
+        # Uncompressed, unlike the sidecars: these are float32 model outputs that deflate to only
+        # about 70% of their size, at twenty times the write time -- measured at 32 s against 1.4 s
+        # for 207 MB -- while the sidecars are half precision and NaN-blanked and do compress.
+        np.savez(results_dir / RETAINED_FILENAME, **collection.retained)
 
     path = results_dir / COLLECTION_FILENAME
     with open(path, "w", encoding="utf-8") as handle:
@@ -1449,7 +1498,8 @@ def load_collection(results_dir: Any) -> Collection:
             retained = {name: handle[name] for name in handle.files}
 
     _check_row_counts(record, per_sample, per_anchor, results_dir)
-    _check_anchor_vector_rows(anchor_vectors, per_anchor, results_dir)
+    _check_sidecar_rows(anchor_vectors, per_anchor, results_dir / PER_ANCHOR_VECTORS_FILENAME)
+    _check_sidecar_rows(vectors, per_sample, results_dir / VECTORS_FILENAME)
     return Collection(
         per_sample=per_sample,
         per_anchor=per_anchor,
@@ -1489,30 +1539,27 @@ def _check_row_counts(
             )
 
 
-def _check_anchor_vector_rows(
-    anchor_vectors: Dict[str, np.ndarray], per_anchor: pd.DataFrame, results_dir: Path
-) -> None:
-    """Raise when a per-anchor vector sidecar is not row-aligned with the per-anchor table.
+def _check_sidecar_rows(arrays: Dict[str, np.ndarray], table: pd.DataFrame, path: Path) -> None:
+    """Raise when a vector sidecar is not row-aligned with the table it belongs to.
 
-    The sidecar carries no key of its own -- row $i$ *is* row $i$ of the table -- so a length
-    mismatch is the one corruption that would otherwise pass silently: every row would still be
-    a well-formed profile, attributed to the wrong anchor.
+    Row $i$ of a sidecar *is* row $i$ of its table, so a length mismatch is the one corruption that
+    would otherwise pass silently: every row would still be a well-formed vector, attributed to
+    the wrong segment or the wrong anchor.
 
     Args:
-        anchor_vectors: The sidecar's arrays as read.
-        per_anchor: The per-anchor table as read.
-        results_dir: The directory, for the message.
+        arrays: The sidecar's arrays as read.
+        table: The table it is aligned with, as read.
+        path: The sidecar's path, for the message.
 
     Raises:
         TablesProvenanceMismatch: Naming the array, its row count and the table's.
     """
-    for name, array in anchor_vectors.items():
-        if int(array.shape[0]) != len(per_anchor):
+    for name, array in arrays.items():
+        if int(array.shape[0]) != len(table):
             raise TablesProvenanceMismatch(
-                f"{results_dir / PER_ANCHOR_VECTORS_FILENAME}[{name!r}] holds "
-                f"{int(array.shape[0])} row(s) against {len(per_anchor)} in "
-                f"{PER_ANCHOR_FILENAME}. The sidecar is aligned with the table by row position "
-                f"alone, so a mismatch would attribute every lag map to the wrong anchor."
+                f"{path}[{name!r}] holds {int(array.shape[0])} row(s) against {len(table)} in "
+                f"the table it is aligned with. The sidecar is aligned by row position, so a "
+                f"mismatch would attribute every vector to the wrong row."
             )
 
 
@@ -1542,6 +1589,7 @@ def check_provenance(record: Dict[str, Any], expected: Dict[str, Any]) -> None:
     for key, label in (
         ("seed", "eval_config.seed"),
         ("num_mc_samples", "the Monte Carlo draw count"),
+        ("max_batches", "the --max-batches smoke cap"),
         ("eval_config_digest", "the eval_config block"),
     ):
         if key in found and key in expected and found[key] != expected[key]:
@@ -1559,6 +1607,7 @@ def load_or_collect(
     checkpoint_path: Optional[Any],
     eval_config: Dict[str, Any],
     num_samples: int,
+    max_batches: Optional[int] = None,
 ) -> Collection:
     """Reuse a finished run's tables when they describe this run, otherwise collect them.
 
@@ -1572,6 +1621,7 @@ def load_or_collect(
         checkpoint_path: The checkpoint being evaluated, or ``None``.
         eval_config: The validated ``eval_config`` block.
         num_samples: The Monte Carlo draw count in force.
+        max_batches: The smoke-run batch cap in force, or ``None``.
 
     Returns:
         The collection, either read back or freshly collected and written.
@@ -1582,7 +1632,8 @@ def load_or_collect(
     """
     results_dir = Path(results_dir)
     expected = provenance(
-        checkpoint_path=checkpoint_path, eval_config=eval_config, num_samples=num_samples
+        checkpoint_path=checkpoint_path, eval_config=eval_config, num_samples=num_samples,
+        max_batches=max_batches,
     )
     if (results_dir / COLLECTION_FILENAME).is_file():
         collection = load_collection(results_dir)

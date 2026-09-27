@@ -104,7 +104,7 @@ from loguru import logger
 from teb_vae.lag_attn_cfs.eval import cohort
 from teb_vae.lag_attn_cfs.eval import figures_seam as figures
 from teb_vae.lag_attn_cfs.eval._reuse import labels, stats as shared_stats
-from teb_vae.lag_attn_cfs.eval.frames import scored_sample_count
+from teb_vae.lag_attn_cfs.eval.frames import per_recording_labels, scored_sample_count
 from teb_vae.lag_attn_cfs.eval.lag_axis import (
     GROUP_DELAY_CAVEAT,
     compensated_seconds_axis,
@@ -1322,7 +1322,7 @@ def occlusion_consistency(
         the record: per band, the recording count and Spearman's rho between the all-anchor share
         and the delta, descriptive only.
     """
-    columns = ["guid", labels.CLASS_COLUMN, "band", "lag_lo", "lag_hi",
+    columns = ["guid", labels.CLASS_COLUMN, labels.SUBGROUP_COLUMN, "band", "lag_lo", "lag_hi",
                "attribution_share_all", "attribution_share_high", "occlusion_delta_nats"]
     path = Path(output_dir) / OCCLUSION_PER_RECORDING[0] / OCCLUSION_PER_RECORDING[1]
     if not bands:
@@ -1353,12 +1353,8 @@ def occlusion_consistency(
         share = share_on(matrix, mask)
         return pd.Series(share, index=featured["guid"].astype(str).to_numpy()).groupby(level=0).mean()
 
-    identity = featured.drop_duplicates("guid")
-    classes = pd.Series(
-        identity[labels.CLASS_COLUMN].to_numpy() if labels.CLASS_COLUMN in identity.columns
-        else [None] * len(identity),
-        index=identity["guid"].astype(str).to_numpy(),
-    )
+    identity = per_recording_labels(featured)
+    identity.index = identity.index.astype(str)
     rows: List[Dict[str, Any]] = []
     record: Dict[str, Any] = {"available": True, "bands": {}, "tested": False}
     for name, span in bands.items():
@@ -1377,7 +1373,13 @@ def occlusion_consistency(
             rows.append(
                 {
                     "guid": str(guid),
-                    labels.CLASS_COLUMN: classes.get(str(guid)),
+                    **{
+                        axis: (
+                            identity.at[str(guid), axis]
+                            if axis in identity.columns and str(guid) in identity.index else None
+                        )
+                        for axis in (labels.CLASS_COLUMN, labels.SUBGROUP_COLUMN)
+                    },
                     "band": name,
                     "lag_lo": int(span[0]),
                     "lag_hi": int(span[1]),
@@ -1615,6 +1617,54 @@ def analyse_windows(
         "per_window": outcome["per_window"],
         "pairwise": outcome["pairwise"],
     }
+
+
+def recording_table(
+    clock: Clock, binned: pd.DataFrame, identity: pd.DataFrame
+) -> pd.DataFrame:
+    """One row per (recording, window) on one clock, carrying the recording's subgroup and class.
+
+    The emitted per-recording table. A recording's mean in a window does not depend on which
+    cohort axis it is later grouped by, so the per-axis frames stacked wrote every value once per
+    axis and named each row by one label only; this writes each row once, with both labels.
+
+    Args:
+        clock: The clock whose windows to group on.
+        binned: The binned featured table.
+        identity: :func:`~teb_vae.lag_attn_cfs.eval.frames.per_recording_labels` of the table.
+
+    Returns:
+        ``clock, guid, <labels>, time_bin, bin_center_h`` and :data:`FEATURE_COLUMNS`.
+    """
+    wide = cohort.per_recording_in_bins(
+        binned, FEATURE_COLUMNS, group_column="guid",
+        bin_column=clock.bin_column, center_column=clock.center_column,
+    )
+    if wide.empty:
+        return wide
+    wide = wide.drop(columns="group").rename(
+        columns={clock.bin_column: "time_bin", clock.center_column: "bin_center_h"}
+    )
+    wide.insert(0, "clock", clock.name)
+    missing = [name for name in identity.columns if name not in wide.columns]
+    if missing:
+        wide = wide.merge(identity[missing], left_on="guid", right_index=True, how="left")
+    keys = ["clock", "guid", *identity.columns, "time_bin", "bin_center_h"]
+    return wide[keys + [column for column in wide.columns if column not in keys]]
+
+
+def narrow(frame: pd.DataFrame, column: str, bin_column: str, center_column: str) -> pd.DataFrame:
+    """The columns :func:`~teb_vae.lag_attn_cfs.eval.cohort.trajectory_rows` reads, and no more.
+
+    Handed a frame carrying every feature, that reduction copies the whole width on its finite-row
+    filter and on every cell of its groupby -- once per summarised column, so a table as wide as
+    :data:`FEATURE_COLUMNS` cost the square of its width. The same rows come out either way.
+    """
+    keep = [
+        name for name in ("group", bin_column, center_column, "guid", "n_segments", column)
+        if name in frame.columns
+    ]
+    return frame[keep]
 
 
 def lag_columns(n_lags: int) -> List[int]:
@@ -2100,7 +2150,8 @@ def histogram_feature_rows(
     for statistic in HISTOGRAM_STATISTICS:
         column = histogram_feature_column(statistic)
         for row in cohort.trajectory_rows(
-            features, column, metric=column, bin_column="window", center_column="centre"
+            narrow(features, column, "window", "centre"), column, metric=column,
+            bin_column="window", center_column="centre",
         ):
             rows.append(
                 {
@@ -3563,6 +3614,7 @@ def _draw_ridgeline(
     seconds: np.ndarray,
     *,
     title: str,
+    header: Any = None,
 ) -> int:
     """One ridge per window, **one column per class**, time running down the page.
 
@@ -3595,7 +3647,12 @@ def _draw_ridgeline(
         clock: The clock, for the window order and the axis label.
         cells: The pooled cells.
         seconds: The compensated lag axis.
-        title: Row title, placed over the first column.
+        title: Row title, and the reading rule under it, written as the title of ``header``.
+        header: A gridspec cell spanning the class columns, one short row above them. The row's
+            title is that switched-off axes' title rather than free text over the first column:
+            free text hung off a column a third of the width is counted in that column's layout
+            box, which is what made ``tight_layout`` give the whole page up and fall back to
+            matplotlib's default margins.
 
     Returns:
         How many ridges (windows) were drawn per column.
@@ -3688,19 +3745,16 @@ def _draw_ridgeline(
         figures.style_axes(ax)
     assert first_axes is not None
     first_axes.set_ylim(-0.1 * _RIDGE_SPACING, baselines[0] + _RIDGE_HEIGHT * _RIDGE_SPACING + 0.1)
-    # The row's own title and its reading rule, over the first column so they are read before
-    # the columns are: the per-column titles name the classes only.
-    first_axes.text(
-        0.0, 1.10, title, transform=first_axes.transAxes, ha="left", va="bottom",
-        fontsize=figures.FONT_NOTE, color=figures.COLOR_BLACK,
-    )
-    first_axes.text(
-        0.0, 1.035,
-        f"grey dashed = the class pooled over the whole clock; tick = median lag; "
-        f"right margin = recordings; dashed, unfilled = fewer than {minimum}",
-        transform=first_axes.transAxes, ha="left", va="bottom", fontsize=figures.FONT_TINY,
-        color=figures.COLOR_GRAY,
-    )
+    # The row's own title and its reading rule, read before the columns are: the per-column
+    # titles name the classes only.
+    if header is not None:
+        head = figure.add_subplot(header)
+        head.axis("off")
+        head.set_title(
+            f"{title}\ngrey dashed = the class pooled over the whole clock; tick = median lag; "
+            f"right margin = recordings; dashed, unfilled = fewer than {minimum}",
+            loc="left", fontsize=figures.FONT_SMALL, color=figures.COLOR_BLACK,
+        )
     return len(ordered)
 
 
@@ -3835,6 +3889,8 @@ def build_histogram_figure(
     heights = (
         [2.6, 2.2, 2.2] * len(HISTOGRAM_BANDS)
         + [4.5]
+        # The ridge row's header: a switched-off axes carrying the row's title, see _draw_ridgeline.
+        + [0.05]
         + [max(3.5, 0.32 * n_windows + 1.8)]
         + [3.0] * len(DISTANCE_METRICS)
     )
@@ -3851,11 +3907,17 @@ def build_histogram_figure(
         """The gridspec cell one source's panel occupies on ``row``."""
         return grid[row, column * n_classes:(column + 1) * n_classes]
 
+    # Every block's axes are created row by row, across both sources, before anything is drawn:
+    # the panel letters follow creation order, so this is what makes them read across the page.
     for index, band_key in enumerate(HISTOGRAM_BANDS):
         top = 3 * index
+        created = [
+            [figure.add_subplot(span(top + offset, column)) for column in range(len(PROFILE_SOURCES))]
+            for offset in range(3)
+        ]
         for column, (source_key, _, meaning) in enumerate(PROFILE_SOURCES):
             block = cells.get((band_key, source_key))
-            axes = [figure.add_subplot(span(top + offset, column)) for offset in range(3)]
+            axes = [created[offset][column] for offset in range(3)]
             titles = (
                 f"{band_key} band, {source_key}: {meaning}, pooled over the whole clock",
                 f"{band_key} band, {source_key}: each class minus the pooled distribution",
@@ -3879,30 +3941,35 @@ def build_histogram_figure(
             )
 
     base = 3 * len(HISTOGRAM_BANDS)
+    # The violin row across both sources first, then the ridge row, for the same lettering reason.
     for column, (source_key, _, _) in enumerate(PROFILE_SOURCES):
         block = cells.get((HIGH_BAND_KEY, source_key))
         violin_title = (
             f"{HIGH_BAND_KEY} band, {source_key}: lag distribution per window and class "
             f"(body = the cell's distribution; untested)"
         )
+        if block is None:
+            _empty_panel(figure.add_subplot(span(base, column)), violin_title)
+            continue
+        _draw_density_violins(
+            figure.add_subplot(span(base, column)), clock, block, seconds, title=violin_title
+        )
+    for column, (source_key, _, _) in enumerate(PROFILE_SOURCES):
+        block = cells.get((HIGH_BAND_KEY, source_key))
         ridge_title = (
             f"{HIGH_BAND_KEY} band, {source_key}: the same cells as ridges, one column per "
             f"class, labour running down the page (untested)"
         )
         if block is None:
-            _empty_panel(figure.add_subplot(span(base, column)), violin_title)
-            _empty_panel(figure.add_subplot(span(base + 1, column)), ridge_title)
+            _empty_panel(figure.add_subplot(span(base + 2, column)), ridge_title)
             continue
-        _draw_density_violins(
-            figure.add_subplot(span(base, column)), clock, block, seconds, title=violin_title
-        )
         _draw_ridgeline(
             figure,
-            [grid[base + 1, column * n_classes + slot] for slot in range(n_classes)],
-            clock, block, seconds, title=ridge_title,
+            [grid[base + 2, column * n_classes + slot] for slot in range(n_classes)],
+            clock, block, seconds, title=ridge_title, header=span(base + 1, column),
         )
 
-    last = base + 2
+    last = base + 3
     drawn_distances = (
         distances[(distances["band"] == HIGH_BAND_KEY) & (distances["source"] == "attn")]
         if len(distances) else distances
@@ -4383,6 +4450,7 @@ def run_lag_high_kl_analysis(
 
     directory = Path(output_dir) / ANALYSIS_DIRNAME
     directory.mkdir(parents=True, exist_ok=True)
+    identity = per_recording_labels(per_sample)
 
     classes = (
         np.asarray(per_sample[labels.CLASS_COLUMN].astype(object))[population.sample_rows]
@@ -4440,14 +4508,13 @@ def run_lag_high_kl_analysis(
             )
             for axis in labels.GROUP_COLUMNS
         }
-        for axis, frame in frames.items():
-            if len(frame):
-                per_recording_tables.append(frame.assign(clock=clock.name, group_column=axis))
+        per_recording_tables.append(recording_table(clock, binned, identity))
         rows: List[Dict[str, Any]] = []
         for axis, frame in frames.items():
             for column in FEATURE_COLUMNS:
                 for row in cohort.trajectory_rows(
-                    frame, column, metric=column,
+                    narrow(frame, column, clock.bin_column, clock.center_column),
+                    column, metric=column,
                     bin_column=clock.bin_column, center_column=clock.center_column,
                 ):
                     rows.append({"clock": clock.name, "group_column": axis, **row})
@@ -4633,17 +4700,18 @@ def run_lag_high_kl_analysis(
     argmax_gain.to_csv(directory / GAIN_BY_ARGMAX_FILENAME, index=False)
     consistency.to_csv(directory / OCCLUSION_CONSISTENCY_FILENAME, index=False)
     recordings.to_csv(directory / RECORDINGS_FILENAME, index=False)
-    (
-        pd.concat(per_recording_tables, ignore_index=True)
-        if per_recording_tables
-        else pd.DataFrame(columns=["clock", "group_column", "group", "guid", *FEATURE_COLUMNS])
+    _concat_tables(
+        per_recording_tables,
+        ["clock", "guid", *identity.columns, "time_bin", "bin_center_h", *FEATURE_COLUMNS],
     ).to_csv(directory / PER_RECORDING_FILENAME, index=False)
-    pd.DataFrame(
-        trajectory,
-        columns=[
-            "clock", "group_column", "metric", "group", "time_bin", "bin_center_h",
-            "n_recordings", "mean", "q25", "median", "q75",
-        ],
+    leading = [
+        "clock", "group_column", "metric", "group", "time_bin", "bin_center_h",
+        "n_recordings", "mean", "q25", "median", "q75",
+    ]
+    # Every field the shared cell summary carries, after the leading keys.
+    table = pd.DataFrame(trajectory)
+    table.reindex(
+        columns=leading + [name for name in table.columns if name not in leading]
     ).to_csv(directory / TRAJECTORY_FILENAME, index=False)
     (
         pd.concat(profile_tables, ignore_index=True)
@@ -4655,8 +4723,10 @@ def run_lag_high_kl_analysis(
     _concat_tables(histogram_tables, HISTOGRAM_COLUMNS).to_csv(
         directory / HISTOGRAM_FILENAME, index=False
     )
-    pd.DataFrame(
-        histogram_features, columns=list(HISTOGRAM_FEATURE_TABLE_COLUMNS)
+    table = pd.DataFrame(histogram_features)
+    table.reindex(
+        columns=list(HISTOGRAM_FEATURE_TABLE_COLUMNS)
+        + [name for name in table.columns if name not in HISTOGRAM_FEATURE_TABLE_COLUMNS]
     ).to_csv(directory / HISTOGRAM_FEATURES_FILENAME, index=False)
     _concat_tables(distance_tables, HISTOGRAM_DISTANCE_COLUMNS).to_csv(
         directory / HISTOGRAM_DISTANCE_FILENAME, index=False

@@ -22,7 +22,8 @@ sparse $(B, A_{\max}, H)$ anchor mask while the KL reduces over a dense $(B, T)$
 shift averaged over the forecast's support would be a mean over a different set of steps than the
 KL it is read beside.
 
-**Everything stays in $z$ units.** There is no conversion out of them and the omission is
+**The forecast difference stays in $z$ units, the drift in latent units.** There is no
+conversion out of either, and the omission is
 deliberate: a wavelet modulus has no clinical unit, and inverting the per-channel statistics would
 put the $C_{\mathrm{keep}}$ scored channels on scales spanning orders of magnitude -- which is exactly what a
 single pooled RMS cannot survive.
@@ -97,6 +98,12 @@ RMS_METRICS: Tuple[Tuple[str, str, str], ...] = (
     ),
 )
 
+#: The unit of a latent-space RMS. The latent is not in the loader's $z$ units -- it lives in the
+#: prior's coordinates -- so the two drift metrics carry this label rather than
+#: :data:`~teb_vae.lag_attn_cfs.eval.metrics.NORMALISED_UNIT`, whatever their column is called.
+LATENT_UNIT = "latent units"
+LATENT_METRICS = frozenset({"delta_mu_rms", "mu_post_prior_gap_rms"})
+
 #: The rooted column the collection pass also carries, kept so the Jensen bias is a measured
 #: number rather than a claim: it is the mean of per-segment roots, which is what this analysis
 #: does *not* report as the RMS.
@@ -146,7 +153,7 @@ def build_rows(
             if np.isfinite(interval["lo"]) else float("nan"),
             "rms_hi_normalised": float(np.sqrt(max(interval["hi"], 0.0)))
             if np.isfinite(interval["hi"]) else float("nan"),
-            "unit": NORMALISED_UNIT,
+            "unit": LATENT_UNIT if name in LATENT_METRICS else NORMALISED_UNIT,
         }
         biased_column = _ROOTED_PER_SEGMENT.get(square_column)
         if biased_column is not None:
@@ -203,9 +210,10 @@ def run_residual_analysis(
         "plan": {"capped": False, "bootstrap_resamples": resamples, "seed": seed},
         "metrics": rows,
         "mean_square_distribution": list(distribution.values()),
-        # One unit, stated rather than derived from whichever row happened to convert: nothing
-        # here converts, and a reader must not have to infer that from the absence of a column.
+        # The forecast-space unit, stated rather than derived from whichever row happened to
+        # convert: nothing here converts. The two latent rows carry their own unit per row.
         "unit": NORMALISED_UNIT,
+        "latent_unit": LATENT_UNIT,
         "caveat": SHARED_VARIANCE_CAVEAT,
         "grouped_frames": [
             grouped_frame_entry(ANALYSIS_DIRNAME, PER_RECORDING_FILENAME, GROUPED_METRICS)

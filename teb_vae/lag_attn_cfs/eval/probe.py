@@ -410,7 +410,7 @@ def run_probe(
         "per_cs_label": dict(sorted(per_cs_label.items())),
         "per_bg_label": dict(sorted(per_bg_label.items())),
         "per_target_class": dict(sorted(per_target_class.items())),
-        # Distinct from per_target_class: that is one code per recording, this is every value.
+        # Distinct from per_target_class: that is one code per segment, this is every value.
         "target_values": _merge_target_summaries(target_summaries),
         "weight": _merge_weight_summaries(weight_summaries),
         "epoch": _epoch_summary(epochs),
@@ -637,8 +637,8 @@ def resolved_config_for(checkpoint: Any) -> Path:
     raise FileNotFoundError(
         f"no {RESOLVED_CONFIG_FILENAME} found for checkpoint {checkpoint}. Tried: "
         + ", ".join(str(path) for path in candidates)
-        + f". The training entry point writes it beside the checkpoints; a checkpoint copied out of "
-        f"its run directory must be copied together with that file."
+        + ". The training entry point writes it beside the checkpoints; a checkpoint copied out of "
+        "its run directory must be copied together with that file."
     )
 
 

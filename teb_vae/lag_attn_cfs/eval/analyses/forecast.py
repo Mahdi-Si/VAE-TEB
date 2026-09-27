@@ -25,7 +25,7 @@ $\sigma$ is fixed, stated and recorded for the same reason.
 
 **Units, and the conversion that is deliberately absent.** Everything stays in the loader's $z$
 units, labelled ``normalised``. A scattering or phase-harmonic coefficient has no clinical unit,
-and inverting the per-channel statistics would put the $98$ scored channels on scales spanning
+and inverting the per-channel statistics would put the $C_{\mathrm{keep}}$ scored channels on scales spanning
 orders of magnitude -- which destroys every pooled statistic here: the mean squared error, the
 skill ratio and the shared axis of every figure below. So there is no second unit and no column
 carrying one; the ``normalised`` label exists to say that out loud rather than to leave a bare
@@ -55,8 +55,13 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
+from matplotlib.lines import Line2D
+from matplotlib.patches import Patch
 
+from teb_vae.lag_attn_cfs.eval import cohort, events, traces
 from teb_vae.lag_attn_cfs.eval import figures_seam as figures
+from teb_vae.lag_attn_cfs.eval._reuse import band_partition as shared_bands
+from teb_vae.lag_attn_cfs.eval._reuse import labels
 from teb_vae.lag_attn_cfs.eval._reuse import stats as shared_stats
 from teb_vae.lag_attn_cfs.eval.frames import finite_column as _finite_column
 from teb_vae.lag_attn_cfs.eval.frames import grouped_frame_entry
@@ -103,10 +108,26 @@ R2_REFERENCE = "climatology"
 _BLOCK_COLUMN = "nll_{branch}_block"
 _SQUARED_ERROR_COLUMN = "sq_error_{branch}"
 
-#: How many target channels the forecast overlay draws, and where they are taken from. Evenly
-#: spaced across the kept channel axis and fixed, so two runs of one checkpoint draw the same
-#: channels and a figure can be compared across arms rather than only read.
-OVERLAY_CHANNELS = 3
+#: The forecast overlay's layout: at most this many target channels under the raw rows (one per
+#: clinical band plus one phase-harmonic channel, see :func:`overlay_channels`), for this many
+#: retained samples side by side, each with this many horizons of target history before its
+#: anchor -- as long a past as the future it is asked to extend.
+OVERLAY_CHANNELS = 5
+OVERLAY_SAMPLES = 3
+OVERLAY_HISTORY_HORIZONS = 1
+
+#: The overlay's panel size in inches: one column per sample, one row per signal or channel.
+OVERLAY_COLUMN_WIDTH_IN = 3.4
+OVERLAY_ROW_HEIGHT_IN = 1.15
+
+#: Offset added to the run's seed for the overlay's sample draw, so it is not another draw's rows.
+OVERLAY_SEED_OFFSET = 11
+
+#: The table naming every sample the overlay draws -- the identity a figure lifted out of the run
+#: must still be traceable to -- and the kept-axis channel map it names the channels from, written
+#: into the results root by the channel-map step.
+OVERLAY_SAMPLES_FILENAME = "forecast_overlay_samples.csv"
+KEPT_CHANNEL_MAP_FILENAME = "band_channel_map_kept.csv"
 
 #: The metrics resolved by cohort: the two model branches' squared error and the full branch's
 #: block score. Not the baselines' columns, which describe how forecastable a cohort's recordings
@@ -236,6 +257,11 @@ def horizon_curves(horizon: Dict[str, Any]) -> pd.DataFrame:
     Args:
         horizon: The collection record's ``horizon`` block, one list per branch and statistic.
 
+    Where the record carries the scored-coefficient counts $n_\tau$, each branch's score is also
+    reported per scored coefficient, $S^{D}_\tau / n_\tau$, beside its standardised innovation
+    variance and mean log-variance, and the channel count $n_\tau / n^{a}_\tau$ the scored-cell mask
+    leaves at each lead.
+
     Returns:
         One row per horizon step, carrying the lead time in seconds, both branches' scores, the
         gap, and each branch's RMSE. Empty when the record carries no horizon block -- a pass at
@@ -272,13 +298,28 @@ def horizon_curves(horizon: Dict[str, Any]) -> pd.DataFrame:
     for branch in MODEL_BRANCHES:
         squares = f"{branch}_sum_sq"
         counts = f"{branch}_count"
-        if squares in horizon and counts in horizon:
-            # ``count`` already carries the channel factor, so this is the per-coefficient mean
-            # square rather than a per-anchor one, matching ``sq_error_*`` on the sample table.
+        if counts not in horizon:
+            continue
+        # ``count`` is the scored coefficients behind each step -- under the scored-cell mask a far
+        # step holds fewer channels than a near one -- so a per-coefficient score is the one that
+        # compares across the horizon, where the per-step score also moves with the channel count.
+        frame[f"d_{branch}_nats_per_coefficient"] = _mean(f"{branch}_sum_block", counts)
+        if squares in horizon:
+            # Per coefficient too, matching ``sq_error_*`` on the sample table.
             frame[f"rmse_{branch}_normalised"] = np.sqrt(
                 np.clip(_mean(squares, counts), 0.0, None)
             )
             frame["rmse_unit"] = NORMALISED_UNIT
+        if f"{branch}_sum_standardised_sq" in horizon:
+            # $e^2 / \sigma^2$ on the AR(1) innovation, which a calibrated variance puts at 1.
+            frame[f"standardised_sq_{branch}"] = _mean(f"{branch}_sum_standardised_sq", counts)
+        if f"{branch}_sum_logvar" in horizon:
+            frame[f"mean_logvar_{branch}"] = _mean(f"{branch}_sum_logvar", counts)
+    if "full_count" in horizon:
+        frame["n_scored_coefficients"] = np.asarray(horizon["full_count"], dtype=np.float64)
+        # $\sum_c m_{\tau,c}$: the channels the density holds at this lead. It steps down where
+        # the fast phase channels' scored horizon $H_c$ ends.
+        frame["scored_channels_per_anchor"] = _mean("full_count", "full_n_anchors")
     return frame
 
 
@@ -437,14 +478,22 @@ def build_horizon_figure(curves: pd.DataFrame, *, horizon_steps: int) -> Any:
     Returns:
         The figure.
     """
-    figure, axes = figures.new_figure(3)
+    figure, axes = figures.new_figure(4)
     lead = _finite_column(curves, "lead_seconds")
+    # Per scored coefficient where the record carries the counts: the per-step score also falls
+    # wherever the fast channels' scored horizon ends, which is fewer terms and not a better
+    # forecast. Panel d draws that channel count.
+    per_coefficient = "d_base_nats_per_coefficient" in getattr(curves, "columns", [])
+    suffix = "_per_coefficient" if per_coefficient else ""
     figures.multi_line_panel(
         axes[0, 0], lead,
-        np.vstack([_finite_column(curves, "d_base_nats"), _finite_column(curves, "d_full_nats")]),
+        np.vstack(
+            [_finite_column(curves, f"d_base_nats{suffix}"), _finite_column(curves, f"d_full_nats{suffix}")]
+        ),
         ["target-only (base)", "source-conditioned (full)"],
         title="Forecast score by lead time (single-draw path)",
-        xlabel="lead time (s)", ylabel="nats per horizon step",
+        xlabel="lead time (s)",
+        ylabel="nats per scored coefficient" if per_coefficient else "nats per horizon step",
     )
     figures.multi_line_panel(
         axes[1, 0], lead, _finite_column(curves, "gap_nats")[None, :], ["pred_gap"],
@@ -462,17 +511,36 @@ def build_horizon_figure(curves: pd.DataFrame, *, horizon_steps: int) -> Any:
         title="Forecast error by lead time",
         xlabel="lead time (s)", ylabel=f"RMSE per coefficient ({unit})",
     )
-    for axis in (axes[0, 0], axes[1, 0], axes[2, 0]):
+    figures.multi_line_panel(
+        axes[3, 0], lead, _finite_column(curves, "scored_channels_per_anchor")[None, :],
+        ["scored channels"],
+        title="Channels in the forecast density at each lead (scored-cell mask)",
+        xlabel="lead time (s)", ylabel="channels per anchor",
+    )
+    for axis in axes[:, 0]:
         axis.set_xlim(0.0, float(horizon_steps) * SECONDS_PER_STEP)
     return figure
 
 
-def overlay_channels(width: int, count: int = OVERLAY_CHANNELS) -> List[int]:
-    """Choose which kept target channels the overlay draws, evenly spaced and deterministic.
+def overlay_channels(
+    width: int,
+    count: int = OVERLAY_CHANNELS,
+    kept_map: Optional[pd.DataFrame] = None,
+    scored_horizon: Optional[np.ndarray] = None,
+) -> List[int]:
+    r"""Choose which kept target channels the overlay draws, deterministically.
+
+    With the kept-axis channel map: the middle scattering channel of every clinical band, in
+    ascending frequency, and one phase-harmonic channel -- the one scored over the fewest horizon
+    steps when $H_c$ is known, since its unscored cells are what the figure has to show. Without
+    the map, evenly spaced positions. Fixed either way, so two runs of one checkpoint draw the same
+    channels and a figure can be compared across arms rather than only read.
 
     Args:
-        width: $C_{\\mathrm{keep}}$, the retained block's channel axis.
-        count: How many to draw.
+        width: $C_{\mathrm{keep}}$, the retained block's channel axis.
+        count: How many to draw at most.
+        kept_map: The persisted kept-axis channel map, or ``None``.
+        scored_horizon: $H_c$ per kept channel, or ``None``.
 
     Returns:
         Ascending channel positions on the kept axis, without duplicates. Empty when the block
@@ -480,72 +548,395 @@ def overlay_channels(width: int, count: int = OVERLAY_CHANNELS) -> List[int]:
     """
     if width <= 0 or count <= 0:
         return []
-    if width <= count:
-        return list(range(width))
-    positions = np.linspace(0, width - 1, num=count)
-    return sorted({int(round(float(value))) for value in positions})
+    usable = (
+        kept_map is not None and len(kept_map) == int(width)
+        and {"kept_channel", "band"} <= set(kept_map.columns)
+    )
+    if not usable:
+        if width <= count:
+            return list(range(width))
+        positions = np.linspace(0, width - 1, num=count)
+        return sorted({int(round(float(value))) for value in positions})
+    ordered = kept_map.sort_values("kept_channel")
+    position = ordered["kept_channel"].to_numpy(dtype=np.int64)
+    band = ordered["band"].astype(str).to_numpy()
+    scattering = (
+        ordered["block"].astype(str).to_numpy() == "scattering"
+        if "block" in ordered.columns else np.ones(position.size, dtype=bool)
+    )
+    picks: List[int] = []
+    for name in shared_bands.CLINICAL_BANDS:
+        members = position[(band == name) & scattering]
+        if members.size:
+            picks.append(int(members[members.size // 2]))
+    phase = position[~scattering]
+    if phase.size:
+        fastest = (
+            int(phase[int(np.argmin(np.asarray(scored_horizon)[phase]))])
+            if scored_horizon is not None else int(phase[phase.size // 2])
+        )
+        picks.append(fastest)
+    return sorted(dict.fromkeys(picks[:count]))
+
+
+def channel_label(kept_map: Optional[pd.DataFrame], channel: int) -> str:
+    """Name a kept channel by what it is: its declared index, its kind, its frequency and band."""
+    if kept_map is None or "kept_channel" not in kept_map.columns:
+        return f"kept channel {channel}"
+    rows = kept_map[kept_map["kept_channel"] == channel]
+    if rows.empty:
+        return f"kept channel {channel}"
+    row = rows.iloc[0]
+    frequencies = [
+        float(row[name]) for name in ("freq_hz_primary", "freq_hz_secondary")
+        if name in row.index and pd.notna(row[name])
+    ]
+    hertz = "/".join(f"{value:.3g}" for value in frequencies) + " Hz" if frequencies else "no centre frequency"
+    return f"declared ch {int(row.get('channel', channel))} {row.get('kind', '')}, {hertz} ({row.get('band', '')})"
+
+
+def overlay_density_terms(
+    context: Any, record: Dict[str, Any], width: int
+) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+    r"""The scored horizon $H_c$ and the AR(1) coefficient $\phi_c$ per kept channel.
+
+    Read off the collection record's ``likelihood_structure`` -- written from the model's own
+    ``forecast_likelihood_kwargs``, the terms every score in this run was computed under -- so the
+    offline re-run draws the same boundary and band as the pass did, and this analysis stays one
+    that never reaches for the model. A record from before the per-channel vectors existed falls
+    back to $H_c$ re-resolved from the run's configuration and its shards, with no $\phi_c$.
+
+    Args:
+        context: The analysis context, read for the merged config on the fallback path.
+        record: The collection record, for the likelihood structure and the kept-channel index.
+        width: $C_{\mathrm{keep}}$.
+
+    Returns:
+        ``(scored_horizon, ar_coef)``, each $(C_{\mathrm{keep}},)$ or ``None`` where unknown.
+        ``None`` for $H_c$ on a model without a scored-cell mask means every channel is scored
+        over the whole horizon.
+    """
+    structure = dict(record.get("likelihood_structure") or {})
+
+    def _vector(name: str, dtype: Any) -> Optional[np.ndarray]:
+        values = structure.get(name)
+        if values is None:
+            return None
+        array = np.asarray(values, dtype=dtype).reshape(-1)
+        return array if array.size == int(width) else None
+
+    if "scored_horizon_per_channel" in structure or "ar_coef_per_channel" in structure:
+        return (
+            _vector("scored_horizon_per_channel", np.int64),
+            _vector("ar_coef_per_channel", np.float64),
+        )
+    try:
+        from teb_vae.lag_attn_cfs.scored_horizon import resolve_target_scored_horizon
+
+        declared = resolve_target_scored_horizon(dict(getattr(context, "config", None) or {}))
+    except Exception:  # noqa: BLE001 - an unreadable shard leaves the boundary undrawn, not wrong
+        declared = None
+    if declared is None:
+        return None, None
+    declared = np.asarray(declared, dtype=np.int64)
+    keep = (record.get("geometry") or {}).get("target_keep_index")
+    scored = declared if keep is None else declared[np.asarray(keep, dtype=np.int64)]
+    return (scored if scored.size == int(width) else None), None
+
+
+def marginal_variance(innovation_variance: np.ndarray, phi: Optional[float]) -> np.ndarray:
+    r"""The forecast variance of each horizon step under the AR(1) residual.
+
+    $$v_\tau = \sigma^2_\tau + \phi_c^2\, v_{\tau-1}, \qquad v_{-1} = 0,$$
+
+    because the density scores the innovation $e_\tau = r_\tau - \phi_c r_{\tau-1}$, so the
+    residual $r_\tau$ itself accumulates the earlier steps' innovations. ``phi=None`` returns the
+    innovation variance, which is the marginal one only without the AR term.
+
+    Args:
+        innovation_variance: $\sigma^2_\tau$ along the horizon, $(H,)$.
+        phi: $\phi_c$, or ``None``.
+
+    Returns:
+        $v_\tau$, $(H,)$.
+    """
+    variance = np.asarray(innovation_variance, dtype=np.float64).reshape(-1)
+    if phi is None:
+        return variance
+    out = np.empty_like(variance)
+    carried = 0.0
+    for step, value in enumerate(variance):
+        carried = float(value) + float(phi) ** 2 * carried
+        out[step] = carried
+    return out
+
+
+def step_series(block: np.ndarray, *, first: int, stride: int) -> np.ndarray:
+    r"""Lay one sample's gathered $(A, H)$ block out on the decimated step axis it came from.
+
+    Horizon step $\tau$ of the anchor at step $t$ is step $t + 1 + \tau$, so every stored step the
+    decoded anchors look ahead to is recovered -- including the history before any one anchor,
+    which is an earlier anchor's future.
+
+    Args:
+        block: $(A, H)$, one channel of the retained target.
+        first: The first decoded anchor's step.
+        stride: The decoded anchors' stride.
+
+    Returns:
+        The coefficient at every step, ``NaN`` at steps no anchor looks ahead to.
+    """
+    anchors, horizon = block.shape
+    steps = first + stride * np.arange(anchors)[:, None] + 1 + np.arange(horizon)[None, :]
+    series = np.full(int(steps.max()) + 1, np.nan)
+    series[steps.ravel()] = np.asarray(block, dtype=np.float64).ravel()
+    return series
+
+
+def overlay_samples(
+    retained: Dict[str, np.ndarray],
+    per_sample: pd.DataFrame,
+    per_anchor: Optional[pd.DataFrame],
+    *,
+    geometry: Dict[str, Any],
+    count: int = OVERLAY_SAMPLES,
+    seed: int = 0,
+) -> List[Dict[str, Any]]:
+    """Choose the retained samples the overlay draws, one per clinical class first, and their anchor.
+
+    The rows are a seeded draw over the retained set taken class by class in the evaluation's
+    cohort order, so the three classes sit side by side where the retention holds them. The anchor
+    is each sample's median **scored** anchor from the per-anchor table -- the same relative place
+    in every segment -- or the middle decoded position where the table cannot say.
+
+    Args:
+        retained: The collection's retained arrays.
+        per_sample: The per-sample table, for each retained row's identity.
+        per_anchor: The per-anchor table, for the scored anchors, or ``None``.
+        geometry: The collection record's geometry.
+        count: Samples to draw at most.
+        seed: The draw's seed.
+
+    Returns:
+        One record per sample: the retained row, the anchor position and step, and the identity
+        (``guid``, ``subgroup``, ``clinical_class``, ``epoch``, ``sample_index``).
+    """
+    target = retained["target"]
+    n_rows, n_anchors = int(target.shape[0]), int(target.shape[1])
+    first = int(geometry.get("anchor_first", geometry.get("anchor_floor", 0)) or 0)
+    stride = int(geometry.get("anchor_stride") or 1)
+    index = np.asarray(retained.get("waveforms_sample_index", np.arange(n_rows)), dtype=np.int64)
+    table = (
+        per_sample.set_index("sample_index", drop=False)
+        if "sample_index" in per_sample.columns else per_sample
+    )
+
+    def _identity(row: int) -> Dict[str, Any]:
+        key = int(index[row]) if row < index.size else row
+        found = table.loc[key] if key in table.index else None
+        found = found.iloc[0] if isinstance(found, pd.DataFrame) else found
+        record: Dict[str, Any] = {
+            name: None if found is None or name not in found.index else found[name]
+            for name in ("guid", labels.SUBGROUP_COLUMN, labels.CLASS_COLUMN, "epoch")
+        }
+        record["sample_index"] = key
+        return record
+
+    identities = [_identity(row) for row in range(n_rows)]
+    order = np.random.default_rng(int(seed)).permutation(n_rows)
+    classes = [str(item[labels.CLASS_COLUMN]) for item in identities if item[labels.CLASS_COLUMN] is not None]
+    chosen: List[int] = []
+    for name in cohort.ordered_groups(list(dict.fromkeys(classes)), labels.CLASS_COLUMN):
+        match = [int(row) for row in order if str(identities[row][labels.CLASS_COLUMN]) == name]
+        if match:
+            chosen.append(match[0])
+    chosen += [int(row) for row in order if int(row) not in chosen]
+
+    samples: List[Dict[str, Any]] = []
+    for row in chosen[: int(count)]:
+        position = n_anchors // 2
+        if per_anchor is not None and {"sample_index", "anchor"} <= set(per_anchor.columns):
+            scored = np.sort(np.asarray(
+                per_anchor.loc[per_anchor["sample_index"] == identities[row]["sample_index"], "anchor"],
+                dtype=np.int64,
+            ))
+            if scored.size:
+                position = int(np.clip((scored[scored.size // 2] - first) // stride, 0, n_anchors - 1))
+        step = first + stride * position
+        epoch = identities[row]["epoch"]
+        samples.append(
+            {
+                **identities[row], "row": row, "anchor_position": position, "anchor": step,
+                # The trace convention: the absolute time of the anchor's step, before delivery.
+                "hours_before_delivery": (
+                    -float(traces.absolute_seconds(epoch, step)) / cohort.SECONDS_PER_HOUR
+                    if epoch is not None and pd.notna(epoch) else float("nan")
+                ),
+            }
+        )
+    return samples
 
 
 def build_overlay_figure(
     retained: Dict[str, np.ndarray],
-    *,
-    row: int,
-    anchor: int,
+    samples: Sequence[Dict[str, Any]],
     channels: Sequence[int],
+    *,
+    geometry: Dict[str, Any],
+    channel_labels: Optional[Sequence[str]] = None,
+    scored_horizon: Optional[np.ndarray] = None,
+    ar_coef: Optional[np.ndarray] = None,
+    raw_scales: Optional[Dict[str, Tuple[float, float]]] = None,
+    predictive_band: bool = True,
 ) -> Any:
-    r"""Draw one anchor's truth and both forecasts against lead time, for a few channels.
+    r"""Draw retained samples side by side: the raw signals, then each chosen channel's forecast.
 
-    Not the raw-grid overlay the raw cells draw, and the difference is the target domain rather
-    than a simplification: what this model forecasts is an $H \times C_{\mathrm{keep}}$ block of
-    wavelet coefficients, so there is no single waveform to overlay. Three channels are drawn as
-    separate panels rather than the block as one heatmap, because the comparison being made is
-    *between the three curves within a channel*, and three heatmaps on three independent colour
-    scales cannot support it.
+    One column per sample, on one time axis in seconds from the anchor's causal endpoint, so
+    $x < 0$ is what the model had read and $x > 0$ the forecast window of $H$ steps. The top rows
+    are the raw FHR and UP on the fixed CTG scale, the contractions the event detector found shaded
+    on UP; under them one row per chosen channel carries the target's history, the truth over the
+    horizon, both branches' means and the predictive $\pm 1\sigma$ band. Cells past a channel's
+    scored horizon $H_c$ are shaded: the decoder emits them but the density does not contain them.
+    Every row shares its y-axis across the samples, so a column is compared with its neighbours
+    rather than only read.
 
     Args:
-        retained: The collection's retained arrays, each $(N, A_{\max}, H, C_{\mathrm{keep}})$.
-        row: Which retained sample to draw.
-        anchor: Which **position** in the decoded anchor set, not which decimated step.
+        retained: The collection's retained arrays: ``target``, ``mu_*`` and ``logvar_*`` as
+            $(N, A_{\max}, H, C_{\mathrm{keep}})$, ``up_raw`` / ``fhr_raw`` as $(N, R)$ and
+            ``weight`` as $(N, T)$. Whatever is absent is left out of the drawing, not invented.
+        samples: From :func:`overlay_samples`.
         channels: Positions on the kept channel axis.
+        geometry: The collection record's geometry, for $H$ and the decoded anchor grid.
+        channel_labels: One label per channel, or ``None`` for the kept index.
+        scored_horizon: $H_c$ per kept channel, or ``None`` when every cell is scored.
+        ar_coef: $\phi_c$ per kept channel, or ``None``; widens the band to the marginal variance.
+        raw_scales: From :func:`~teb_vae.lag_attn_cfs.eval.traces.raw_signal_scales`.
+        predictive_band: Whether the log-variance head was trained, so a band means anything.
 
     Returns:
-        The figure.
+        The figure, already laid out; the caller renders and closes it.
     """
-    panels = list(channels) or [0]
-    figure, axes = figures.new_figure(len(panels))
-    for panel, channel in enumerate(panels):
-        axis = axes[panel, 0]
-        curves: List[np.ndarray] = []
-        labels: List[str] = []
-        for name, label in (
-            ("target", "truth"),
-            ("mu_base", "target-only (base)"),
-            ("mu_full", "source-conditioned (full)"),
-        ):
-            block = retained.get(name)
-            if block is None or row >= len(block):
-                continue
-            values = np.asarray(block[row, anchor], dtype=np.float64)
-            if values.ndim != 2 or channel >= values.shape[1]:
-                continue
-            curves.append(values[:, channel])
-            labels.append(label)
+    target = np.asarray(retained["target"])
+    horizon = int(geometry.get("horizon") or target.shape[2])
+    first = int(geometry.get("anchor_first", geometry.get("anchor_floor", 0)) or 0)
+    stride = int(geometry.get("anchor_stride") or 1)
+    history = OVERLAY_HISTORY_HORIZONS * horizon
+    x_limits = (-history * SECONDS_PER_STEP, (horizon + 0.5) * SECONDS_PER_STEP)
+    labels_of = list(channel_labels or [f"kept channel {channel}" for channel in channels])
+    rows = [*traces.RAW_SIGNAL_FIELDS, *channels]
+    columns = max(len(samples), 1)
+    figure, axes = figures.new_figure(
+        len(rows), columns, height_per_row=OVERLAY_ROW_HEIGHT_IN,
+        width=OVERLAY_COLUMN_WIDTH_IN * columns + 0.9,
+    )
 
-        if curves:
-            # Horizon step tau covers decimated step t + 1 + tau, so the first point is one
-            # decimated step ahead of the anchor rather than at it.
-            lead = (np.arange(curves[0].size, dtype=np.float64) + 1.0) * SECONDS_PER_STEP
-            figures.multi_line_panel(
-                axis, lead, np.vstack(curves), labels,
-                title=f"Kept channel {channel}, retained row {row}, anchor position {anchor}",
-                xlabel="lead time (s)", ylabel=f"coefficient ({NORMALISED_UNIT})",
-            )
-        else:
-            figures.multi_line_panel(
-                axis, np.zeros(0), np.zeros((0, 0)), [],
-                title=f"Kept channel {channel}",
-                xlabel="lead time (s)", ylabel=f"coefficient ({NORMALISED_UNIT})",
-            )
+    for column, sample in enumerate(samples):
+        row, position, step = int(sample["row"]), int(sample["anchor_position"]), int(sample["anchor"])
+        weight = retained.get("weight")
+        for index, name in enumerate(traces.RAW_SIGNAL_FIELDS):
+            axis = axes[index, column]
+            values = retained.get(f"{name}_raw")
+            if values is None or row >= len(values):
+                axis.text(0.5, 0.5, f"raw {name.upper()} not retained by this run", transform=axis.transAxes,
+                          ha="center", va="center", fontsize=figures.FONT_NOTE, color=figures.COLOR_GRAY)
+                axis.set_ylabel(name.upper())
+                axis.set_yticks([])
+                continue
+            raw = np.asarray(values[row], dtype=np.float64).reshape(-1)
+            valid = None if weight is None else traces.raw_validity_of(weight[row], raw.size)
+            physical, unit = traces.physical_raw(raw, name, raw_scales or {}, valid)
+            # Raw sample i ends at (i + 1) / f_s into the segment; the anchor's step ends at 4(t + 1).
+            x = (np.arange(raw.size) + 1.0) / events.FS_RAW - (step + 1) * SECONDS_PER_STEP
+            window = (x >= x_limits[0]) & (x <= x_limits[1])
+            traces.draw_raw_signal(axis, x[window], physical[window], name, unit)
+            if name == "up":
+                found = events.detect_contractions(raw, valid=valid)
+                for onset, end in zip(found["onset_raw"], found["end_raw"]):
+                    axis.axvspan(x[onset], x[end], color=figures.COLOR_GREEN, alpha=0.12, linewidth=0, zorder=0)
+
+        for offset, channel in enumerate(channels):
+            axis = axes[len(traces.RAW_SIGNAL_FIELDS) + offset, column]
+            series = step_series(target[row, :, :, channel], first=first, stride=stride)
+            past = np.arange(step - history + 1, step + 1)
+            known = (past >= 0) & (past < series.size)
+            axis.plot((past[known] - step) * SECONDS_PER_STEP, series[past[known]],
+                      color=figures.COLOR_BLACK, linewidth=figures.LINE_THIN, linestyle="--")
+            lead = (np.arange(horizon) + 1.0) * SECONDS_PER_STEP
+            axis.plot(lead, target[row, position, :, channel], color=figures.COLOR_BLACK,
+                      linewidth=figures.LINE_REGULAR)
+            for branch, colour in (("base", figures.COLOR_BLUE), ("full", figures.COLOR_VERMILLION)):
+                mean = retained.get(f"mu_{branch}")
+                if mean is None:
+                    continue
+                mean = np.asarray(mean[row, position, :, channel], dtype=np.float64)
+                axis.plot(lead, mean, color=colour, linewidth=figures.LINE_REGULAR)
+                logvar = retained.get(f"logvar_{branch}")
+                if predictive_band and logvar is not None:
+                    spread = np.sqrt(marginal_variance(
+                        np.exp(np.asarray(logvar[row, position, :, channel], dtype=np.float64)),
+                        None if ar_coef is None else float(ar_coef[channel]),
+                    ))
+                    axis.fill_between(lead, mean - spread, mean + spread, color=colour, alpha=0.15, linewidth=0)
+            if scored_horizon is not None and int(scored_horizon[channel]) < horizon:
+                axis.axvspan((int(scored_horizon[channel]) + 0.5) * SECONDS_PER_STEP, x_limits[1],
+                             color=figures.COLOR_LIGHT_GRAY, alpha=0.7, linewidth=0, zorder=0)
+            if column == 0:
+                scored = "" if scored_horizon is None else f", scored {int(scored_horizon[channel])} of {horizon} steps"
+                axis.set_title(f"{labels_of[offset]}{scored}")
+                axis.set_ylabel(f"coefficient ({NORMALISED_UNIT})")
+
+        hours = sample.get("hours_before_delivery", float("nan"))
+        hours = f"{float(hours):.2f} h before delivery" if pd.notna(hours) else "time unknown"
+        axes[0, column].set_title(
+            f"{sample.get('guid')} | {sample.get(labels.SUBGROUP_COLUMN)} | {sample.get(labels.CLASS_COLUMN)}\n"
+            f"anchor step {step}, {hours}"
+        )
+
+    for grid_row in range(len(rows)):
+        drawn = [axis for axis in axes[grid_row] if axis.has_data()]
+        if drawn:
+            low = min(axis.get_ylim()[0] for axis in drawn)
+            high = max(axis.get_ylim()[1] for axis in drawn)
+            for axis in axes[grid_row]:
+                axis.set_ylim(low, high)
+        for axis in axes[grid_row]:
+            axis.set_xlim(*x_limits)
+            axis.axvline(0.0, color=figures.COLOR_GRAY, linestyle=":", linewidth=figures.LINE_THIN)
+            figures.style_axes(axis)
+            if grid_row < len(rows) - 1:
+                axis.tick_params(labelbottom=False)
+            else:
+                axis.set_xlabel("time from the anchor's causal endpoint (s)")
+
+    handles = [
+        Line2D([0], [0], color=figures.COLOR_BLACK, linewidth=figures.LINE_THIN, linestyle="--", label="target, history"),
+        Line2D([0], [0], color=figures.COLOR_BLACK, linewidth=figures.LINE_REGULAR, label="target, forecast window"),
+        Line2D([0], [0], color=figures.COLOR_BLUE, linewidth=figures.LINE_REGULAR, label="target-only mean (base)"),
+        Line2D([0], [0], color=figures.COLOR_VERMILLION, linewidth=figures.LINE_REGULAR, label="source-conditioned mean (full)"),
+        Patch(color=figures.COLOR_LIGHT_GRAY, label="cells past the scored horizon"),
+        Patch(color=figures.COLOR_GREEN, alpha=0.3, label="detected contraction"),
+    ]
+    band = (
+        "The shaded band is the predictive $\\pm 1\\sigma$ of each branch whose log-variance was retained"
+        + (", widened to the AR(1) residual's marginal variance." if ar_coef is not None
+           else "; it is the per-cell innovation sigma, narrower than the marginal spread when the AR(1) residual is on.")
+        if predictive_band
+        else "No predictive band is drawn: this checkpoint's likelihood does not train the log-variance head."
+    )
+    height_in = float(figure.get_size_inches()[1])
+    bottom = figures.caveat_note(
+        figure,
+        "One column per retained sample, one anchor each, at its median scored anchor. The raw rows are drawn "
+        "on the fixed CTG scale and every coefficient row shares its y-axis across samples. Coefficients are in "
+        f"the loader's z units. {band}",
+    )
+    figure.legend(handles=handles, loc="upper center", ncol=len(handles), frameon=False,
+                  fontsize=figures.FONT_SMALL, bbox_to_anchor=(0.5, 1.0))
+    figure.subplots_adjust(
+        left=0.9 / float(figure.get_size_inches()[0]), right=0.99,
+        top=1.0 - 0.75 / height_in, bottom=bottom + 0.45 / height_in, hspace=0.55, wspace=0.12,
+    )
+    figures.mark_laid_out(figure)
     return figure
 
 
@@ -611,9 +1002,7 @@ def run_forecast_analysis(
             directory / HORIZON_FIGURE,
         ).name),
     ]
-    overlay = _emit_overlay(collection, directory)
-    if overlay is not None:
-        written.append(overlay)
+    written += _emit_overlay(context, directory, output_dir=output_dir, seed=seed)
 
     r2_rows = [row for row in skill_rows if row["is_r2_reference"]]
     return {
@@ -646,7 +1035,7 @@ def run_forecast_analysis(
     }
 
 
-def _emit_overlay(collection: Any, directory: Path) -> Optional[str]:
+def _emit_overlay(context: Any, directory: Path, *, output_dir: Any, seed: int) -> List[str]:
     """Draw the forecast overlay when a block was retained, and say nothing when none was.
 
     Retention is opt-in -- ``eval_config.caps.waveforms`` -- because the tensors this figure needs
@@ -654,28 +1043,45 @@ def _emit_overlay(collection: Any, directory: Path) -> Optional[str]:
     is silence rather than an empty page.
 
     Args:
-        collection: What the pass produced.
+        context: The analysis context: the collection, and the model and loader when present.
         directory: This analysis's output directory.
+        output_dir: The results directory, where the kept-axis channel map is read from.
+        seed: The run's seed, offset by :data:`OVERLAY_SEED_OFFSET` for the sample draw.
 
     Returns:
-        The filename written, or ``None``.
+        The files written -- the figure and its sample table -- or nothing.
     """
+    collection = context.collection
     retained = dict(getattr(collection, "retained", None) or {})
     if not all(name in retained for name in ("target", "mu_base", "mu_full")):
-        return None
+        return []
     target = retained["target"]
     if len(target) == 0 or target.ndim != 4:
-        return None
-    # The first retained row, and the middle **position** of the decoded anchor set. The row is
-    # arbitrary because the retention draw is already a seeded stratified sample over the whole
-    # split, so position 0 is a uniform draw rather than a prefix. The anchor is a position rather
-    # than a decimated step: this model gathers its anchors, so a step index would be out of range
-    # on the retained axis and silently draw a different anchor than the one named.
-    anchor = int(target.shape[1] // 2)
-    figure = build_overlay_figure(
-        retained,
-        row=0,
-        anchor=anchor,
-        channels=overlay_channels(int(target.shape[3])),
+        return []
+    record = dict(getattr(collection, "record", None) or {})
+    geometry = dict(record.get("geometry") or {})
+    width = int(target.shape[3])
+    map_path = Path(output_dir) / KEPT_CHANNEL_MAP_FILENAME
+    kept_map = pd.read_csv(map_path) if map_path.is_file() else None
+    scored_horizon, ar_coef = overlay_density_terms(context, record, width)
+    channels = overlay_channels(width, kept_map=kept_map, scored_horizon=scored_horizon)
+    samples = overlay_samples(
+        retained, collection.per_sample, getattr(collection, "per_anchor", None),
+        geometry=geometry, seed=seed + OVERLAY_SEED_OFFSET,
     )
-    return str(figures.render_figure(figure, directory / OVERLAY_FIGURE).name)
+    figure = build_overlay_figure(
+        retained, samples, channels,
+        geometry=geometry,
+        channel_labels=[channel_label(kept_map, channel) for channel in channels],
+        scored_horizon=scored_horizon,
+        ar_coef=ar_coef,
+        raw_scales=traces.raw_signal_scales(getattr(context, "config", None)),
+        predictive_band=str(record.get("likelihood") or "") == "gaussian_nll",
+    )
+    written = figures.render_figure(figure, directory / OVERLAY_FIGURE)
+    table = pd.DataFrame(samples)
+    table["kept_channels"] = ";".join(str(channel) for channel in channels)
+    table["channel_labels"] = " ; ".join(channel_label(kept_map, channel) for channel in channels)
+    table["figure_file"] = written.name
+    table.to_csv(directory / OVERLAY_SAMPLES_FILENAME, index=False)
+    return [str(written.name), OVERLAY_SAMPLES_FILENAME]

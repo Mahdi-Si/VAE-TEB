@@ -351,8 +351,10 @@ def build_pit_figure(pit: pd.DataFrame, coverage: pd.DataFrame) -> Any:
     axis = axes[1, 0]
     counts = finite_column(pit, "count")
     if counts.size and counts.sum() > 0.0:
-        empirical = np.cumsum(counts) / float(counts.sum())
-        edges = finite_column(pit, "bin_right")
+        # From the origin: the empirical CDF of the PIT is 0 at 0, and a curve starting at the
+        # first bin's right edge hides exactly the lowest-tail departure the panel is there for.
+        empirical = np.concatenate([[0.0], np.cumsum(counts) / float(counts.sum())])
+        edges = np.concatenate([finite_column(pit, "bin_left")[:1], finite_column(pit, "bin_right")])
         axis.plot([0.0, 1.0], [0.0, 1.0], color=figures.COLOR_GRAY, linestyle=":",
                   linewidth=figures.LINE_REGULAR, label="calibrated")
         axis.plot(edges, empirical, color=figures.COLOR_BLUE,
@@ -363,7 +365,7 @@ def build_pit_figure(pit: pd.DataFrame, coverage: pd.DataFrame) -> Any:
             0.5, 0.5, figures.EMPTY_NOTE, ha="center", va="center", transform=axis.transAxes
         )
     observed = ", ".join(
-        f"{int(row['level_sigma'])}s {float(row['observed']):.4f}/{float(row['nominal']):.4f}"
+        f"{int(row['level_sigma'])}$\\sigma$ {float(row['observed']):.4f}/{float(row['nominal']):.4f}"
         for row in coverage.to_dict("records")
     ) if len(coverage) else "no coverage measured"
     axis.set_title(f"Reliability: observed vs nominal ({observed})")
@@ -512,7 +514,7 @@ def run_calibration_analysis(
         "plan": {"capped": False, "bootstrap_resamples": resamples, "seed": seed},
         "likelihood": likelihood,
         # The scored unit, named rather than implied: it is a target coefficient, and the sibling's
-        # per-raw-sample denominator differs from it by a factor of three at this geometry.
+        # per-raw-sample denominator is a different count, so the two are not comparable.
         "n_coefficients": int(report.get("n_coefficients", 0)),
         "weighting": report.get("weighting"),
         "coverage": coverage.to_dict("records"),

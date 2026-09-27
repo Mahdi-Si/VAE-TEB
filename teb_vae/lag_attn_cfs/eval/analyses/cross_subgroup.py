@@ -15,7 +15,14 @@ the arithmetic that says which of those separations survive being asked properly
   it is uniformly more powerful at the same family-wise error rate.
 * **Pairwise Mann-Whitney with Cliff's delta**, for the metrics that survived Holm **only**.
   Running $\binom{8}{2} = 28$ pairwise tests on a metric whose omnibus found nothing is the
-  multiple-comparison problem with extra steps.
+  multiple-comparison problem with extra steps. The omnibus gate alone protects the pairs only at
+  three cohorts, so the pairs of one metric are Holm-corrected again as their own family
+  (``p_holm``); the raw $p$ travels beside it.
+
+**Out of distribution, not discrimination.** A checkpoint trained on a healthy cohort has never
+seen most of these subgroups, so a separation here says the model's readouts *behave* differently
+on them -- it is not held-out clinical discrimination, and the cohort block's disjointness flag
+says which of the two cohorts the checkpoint saw.
 
 Cliff's delta comes back with every pair because a $p$-value is not an effect size. At the
 eight-subgroup scale a difference of no clinical consequence reaches significance readily, and
@@ -203,7 +210,21 @@ METHOD = (
     "values run higher. Non-parametric throughout because these distributions are skewed and "
     "heavy-tailed. Cohorts with fewer than "
     f"{shared_stats.MIN_GROUP_SIZE} finite recordings are excluded and recorded rather than "
-    "entered."
+    "entered. The pairs of each surviving metric are Holm-corrected as their own family "
+    "(p_holm); p_value is the raw Mann-Whitney p."
+)
+
+#: Written into every record beside the method: what a cohort difference here may be read as.
+SCOPE = (
+    "a cohort difference here is a difference in how the model's readouts behave on cohorts the "
+    "checkpoint may never have trained on (see the cohort block's disjointness flag and unseen "
+    "subgroups); it is an out-of-distribution comparison, not held-out clinical discrimination"
+)
+
+#: The pairwise table's columns, fixed so a run where no metric survived still writes a header.
+PAIRWISE_COLUMNS = (
+    "metric", "test", "left", "right", "n_left", "n_right", "u_statistic", "p_value", "p_holm",
+    "significant", "cliffs_delta", "magnitude", "delta_orientation", "note",
 )
 
 
@@ -342,7 +363,9 @@ def analyse_metrics(
         record["significant"] = bool(np.isfinite(value) and value < float(alpha))
 
     pairwise = {
-        record["metric"]: shared_stats.pairwise_comparisons(samples_by_metric[record["metric"]])
+        record["metric"]: _holm_within_metric(
+            shared_stats.pairwise_comparisons(samples_by_metric[record["metric"]]), alpha
+        )
         for record in omnibus
         if record["significant"]
     }
@@ -355,7 +378,28 @@ def analyse_metrics(
         "n_metrics_tested": n_tested,
         "missing_sources": missing,
         "method": METHOD,
+        "scope": SCOPE,
     }
+
+
+def _holm_within_metric(comparisons: List[Dict[str, Any]], alpha: float) -> List[Dict[str, Any]]:
+    r"""Holm-correct one metric's pairs as their own family, in place, and return them.
+
+    The omnibus gate protects the pairs only when there are three cohorts; at eight there are
+    $\binom{8}{2}$ of them, and a raw $p < \alpha$ among those is expected by chance alone.
+
+    Args:
+        comparisons: :func:`~teb_vae.lag_attn.eval.stats.pairwise_comparisons` records.
+        alpha: The family-wise error rate.
+
+    Returns:
+        The same records, each carrying ``p_holm`` and ``significant``.
+    """
+    adjusted = shared_stats.holm_adjust([item["p_value"] for item in comparisons])
+    for item, value in zip(comparisons, adjusted):
+        item["p_holm"] = float(value)
+        item["significant"] = bool(np.isfinite(value) and value < float(alpha))
+    return comparisons
 
 
 # =============================================================================
@@ -398,7 +442,7 @@ def pairwise_frame(record: Dict[str, Any]) -> pd.DataFrame:
         for metric, comparisons in record["pairwise"].items()
         for item in comparisons
     ]
-    return pd.DataFrame(rows)
+    return pd.DataFrame(rows).reindex(columns=list(PAIRWISE_COLUMNS))
 
 
 def build_heatmap_figure(record: Dict[str, Any]) -> Any:
@@ -417,19 +461,28 @@ def build_heatmap_figure(record: Dict[str, Any]) -> Any:
     """
     figure, axes = figures.new_figure(2, height_per_row=3.2)
     table = significance_frame(record)
-    finite = (
-        table.loc[np.isfinite(table["p_holm"].to_numpy(dtype=np.float64))]
-        if len(table) else table
-    )
     axis = axes[0, 0]
-    if len(finite):
+    p_holm = table["p_holm"].to_numpy(dtype=np.float64) if len(table) else np.zeros(0)
+    if np.isfinite(p_holm).any():
+        # Every metric keeps its row, an untestable one included and labelled as such: dropping
+        # it would make a metric that could not be tested look like one nobody registered.
         # Floored so a p of exactly zero -- which a rank test can return at large n -- does not
         # become an infinite bar that rescales the whole axis.
-        heights = -np.log10(np.clip(finite["p_holm"].to_numpy(dtype=np.float64), 1e-300, 1.0))
-        positions = np.arange(len(finite))
+        heights = np.where(
+            np.isfinite(p_holm), -np.log10(np.clip(p_holm, 1e-300, 1.0)), 0.0
+        )
+        positions = np.arange(len(table))
         axis.barh(positions, heights, color=figures.COLOR_BLUE, alpha=0.85)
+        for position in positions[~np.isfinite(p_holm)]:
+            axis.text(
+                0.0, position, " not testable", va="center", ha="left",
+                fontsize=figures.FONT_TINY, color=figures.COLOR_GRAY,
+            )
         axis.set_yticks(positions)
-        axis.set_yticklabels(list(finite["metric"]), fontsize=figures.FONT_SMALL)
+        axis.set_yticklabels(
+            [f"{row.metric} (n={int(row.n_recordings)})" for row in table.itertuples()],
+            fontsize=figures.FONT_SMALL,
+        )
         axis.axvline(
             -np.log10(float(record["alpha"])), color=figures.COLOR_VERMILLION,
             linestyle="--", linewidth=figures.LINE_REGULAR,
@@ -495,13 +548,18 @@ def _draw_effect_heatmap(figure: Any, ax: Any, record: Dict[str, Any]) -> None:
         record: The analysis record.
     """
     pairs = pairwise_frame(record)
-    metrics = sorted(record["pairwise"])
+    # The omnibus panel's order rather than alphabetical, so a metric sits at the same rank on
+    # both panels.
+    metrics = [item["metric"] for item in record["omnibus"] if item["metric"] in record["pairwise"]]
     if not metrics or not len(pairs):
         figures.heatmap_with_colorbar(
             figure, ax, np.zeros((0, 0)),
             title="Cliff's delta (no metric survived Holm)",
             symmetric=True, colorbar_label="Cliff's delta",
         )
+        # No field, so no axis to read: the unit-square ticks would suggest one.
+        ax.set_xticks([])
+        ax.set_yticks([])
         return
 
     labels_x = _ordered_pair_labels(pairs, record["group_column"])
@@ -547,6 +605,7 @@ def largest_effects(pairs: pd.DataFrame, limit: int = LARGEST_EFFECTS) -> List[D
             "cliffs_delta": float(row.cliffs_delta),
             "magnitude": row.magnitude,
             "p_value": float(row.p_value),
+            "p_holm": float(row.p_holm),
         }
         for row in ordered.head(int(limit)).itertuples()
     ]
@@ -629,5 +688,6 @@ def run_cross_subgroup_analysis(
         "largest_effects": largest_effects(pairs),
         "missing_sources": record["missing_sources"],
         "method": record["method"],
+        "scope": record["scope"],
         "files": [SIGNIFICANCE_FILENAME, PAIRWISE_FILENAME, RESULT_FILENAME, figure_name],
     }
