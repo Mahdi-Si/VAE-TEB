@@ -104,6 +104,7 @@ from teb_vae.lag_attn_rws.nets.raw_masks import forecast_mask  # noqa: E402
 from teb_vae.lag_attn_rws.sample_page import (  # noqa: E402
     BAND_SIGMAS,
     FORECAST_ROW,
+    LAG_SECONDS_LABEL,
     ForecastRowInputs,
     InputStreamPanel,
     _input_stream_row,
@@ -975,7 +976,9 @@ def build_residual_page(
                 offset_seconds=float(delay_steps) * seconds_per_step,
             )
             if secondary is not None:
-                secondary.set_ylabel(COMPENSATED_LAG_AXIS_LABEL, fontsize=8)
+                secondary.set_ylabel(
+                    COMPENSATED_LAG_AXIS_LABEL if delay_steps else LAG_SECONDS_LABEL, fontsize=8
+                )
             finalise_time_axis(ax, tail=True)
             return image
 

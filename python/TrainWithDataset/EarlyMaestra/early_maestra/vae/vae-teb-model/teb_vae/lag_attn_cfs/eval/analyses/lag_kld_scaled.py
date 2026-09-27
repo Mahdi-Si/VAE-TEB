@@ -6,7 +6,7 @@ and on this family both of those are load-bearing limitations rather than conven
 
 * **Most of the profile is not source content.** The diagnosed conv-Transformer run put
   $\texttt{kld\_source\_null} = 0.333$ of a $\texttt{kl\_total} = 0.494$ -- $67.5\%$ of the
-  coupling readout survives zeroing the source -- leaving $0.160$ nats spread over $91$ lags. The
+  coupling readout survives zeroing the source -- leaving $0.160$ nats spread over the whole lag window. The
   availability staircase behind that share is a deterministic function of $t$ and is readable from
   the source state at *any* lag, so it enters the attribution wherever the attention happens to sit
   and no renormalisation of the matched profile removes it.
@@ -39,16 +39,14 @@ its own suite runs unchanged.
   the pooled profile exactly.
 
 **Two statistics are absent from every banded source, and their absence is a measurement.**
-``near_mass`` and ``far_mass`` are measured from the axis's own start
-(:mod:`~teb_vae.lag_attn_cfs.eval.lag_shape`), so on a band they would silently mean "within
-:data:`~teb_vae.lag_attn_cfs.eval.lag_shape.NEAR_SECONDS` of *the band's* start" -- and
-``far_mass`` would be identically zero on every band narrower than
-:data:`~teb_vae.lag_attn_cfs.eval.lag_shape.FAR_SECONDS`, which is three of the four shipped ones.
-Four columns of structural zeros presented as measurements is worse than four absent ones.
+``near_mass`` and ``far_mass`` are fractions of the axis's own span measured from its start
+(:mod:`~teb_vae.lag_attn_cfs.eval.lag_shape`), so on a band they would silently mean the first and
+last stretch of *the band* -- a different quantity under the whole window's name. Columns that
+change meaning with the support they are taken on are withheld rather than mislabelled.
 
 **Nothing here is tested, and that is a decision rather than an omission.** Every feature ships
 untested, so this analysis adds **no** Holm family to the four ``lag_clocks`` already carries and
-writes no significance table at all. At $0.160$ nats of clock-exceeding coupling across $91$ lags,
+writes no significance table at all. At $0.160$ nats of clock-exceeding coupling across the whole lag window,
 per-segment restricted centroids are very likely noise, and eight new corrected families over
 noise is how a family-wise correction stops being believed. Promoting one is a single flag; the
 record says so outright rather than leaving a reader to infer that a $p$-value was withheld.
@@ -81,7 +79,7 @@ import pandas as pd
 from teb_vae.lag_attn_cfs.eval import cohort
 from teb_vae.lag_attn_cfs.eval import figures_seam as figures
 from teb_vae.lag_attn_cfs.eval._reuse import labels
-from teb_vae.lag_attn_cfs.eval.frames import scored_sample_count
+from teb_vae.lag_attn_cfs.eval.frames import per_recording_labels, scored_sample_count
 from teb_vae.lag_attn_cfs.eval.lag_axis import (
     GROUP_DELAY_CAVEAT,
     compensated_seconds_axis,
@@ -140,9 +138,8 @@ UNITS: Dict[str, str] = {
 }
 
 #: The two statistics a **restricted** source may not carry, and the reason is arithmetic rather
-#: than editorial: both are measured from ``seconds[0]``, so on a band they silently re-base onto
-#: the band's own start, and ``far_mass`` is identically zero on any band narrower than
-#: ``FAR_SECONDS``. Emitting them would be emitting structural zeros as measurements.
+#: than editorial: both are fractions of the axis span measured from ``seconds[0]``, so on a band
+#: they silently re-base onto the band's own start and width and name a different quantity.
 NON_RESTRICTABLE: Tuple[str, ...] = ("near_mass", "far_mass")
 
 #: What a **full-support** source carries: the two that keep the scale, and nothing else. The
@@ -178,7 +175,8 @@ NO_INFERENCE_NOTE = (
     "feature here is untested, so it adds NO Holm family to the four lag_clocks carries and a "
     "reader quoting a trajectory from this page is quoting a description, not a claim. That is a "
     "decision and not an omission: at the clock-exceeding coupling this family has measured -- "
-    "0.160 nats spread over 91 lags on the diagnosed run -- per-segment restricted centroids are "
+    "a fraction of a nat spread over the whole lag window on the diagnosed run -- per-segment "
+    "restricted centroids are "
     "very likely noise, and correcting eight new families over noise is how a family-wise "
     "correction stops being believed. Promoting a feature is the Feature.tested flag and nothing "
     "else"
@@ -581,52 +579,64 @@ def _split(column: str) -> Tuple[str, str]:
 
 
 def per_recording_frame(
-    clock: Clock, binned: pd.DataFrame, columns: Sequence[str]
+    clock: Clock,
+    binned: pd.DataFrame,
+    columns: Sequence[str],
+    identity: Optional[pd.DataFrame] = None,
 ) -> pd.DataFrame:
-    """One row per (cohort, window, recording, source, statistic), long-form.
+    """One row per (recording, window, source, statistic), long-form, naming the recording's cohorts.
 
     Reduced wide -- :func:`~teb_vae.lag_attn_cfs.eval.cohort.per_recording_in_bins` takes a column
     list -- and melted immediately, so ``source`` and ``statistic`` become row keys. That is what
     lets ``num_heads`` be a run property and a band be added without widening a table.
 
+    **One row per recording, not one per cohort axis.** A recording's mean in a window does not
+    depend on which axis it is later grouped by, so the frame is reduced on the recording alone and
+    carries its subgroup and its clinical class as columns: the same values written once per axis
+    doubled a table that is already the largest this analysis writes, and named each row by one
+    label only.
+
     Args:
         clock: The clock whose windows to group on.
         binned: The binned per-sample table.
         columns: The working columns.
+        identity: :func:`~teb_vae.lag_attn_cfs.eval.frames.per_recording_labels` of the table,
+            indexed by ``guid``; ``None`` derives it from ``binned``.
 
     Returns:
         The long-form frame, empty with its key columns present when nothing is usable.
     """
-    keys = ["clock", "group_column", "group", "guid", "time_bin", "bin_center_h",
+    identity = per_recording_labels(binned) if identity is None else identity
+    label_columns = list(identity.columns)
+    wide = cohort.per_recording_in_bins(
+        binned,
+        columns,
+        group_column="guid",
+        bin_column=clock.bin_column,
+        center_column=clock.center_column,
+    )
+    # How many segments each window's value averages, where the reduction reports it.
+    counted = ["n_segments"] if "n_segments" in getattr(wide, "columns", []) else []
+    keys = ["clock", "guid", *label_columns, "time_bin", "bin_center_h", *counted,
             "source", "statistic", "unit", "value"]
-    frames: List[pd.DataFrame] = []
-    for axis in labels.GROUP_COLUMNS:
-        wide = cohort.per_recording_in_bins(
-            binned,
-            columns,
-            group_column=axis,
-            bin_column=clock.bin_column,
-            center_column=clock.center_column,
-        )
-        present = [name for name in columns if name in getattr(wide, "columns", [])]
-        if wide.empty or not present:
-            continue
-        melted = wide.melt(
-            id_vars=["group", clock.bin_column, clock.center_column, "guid"],
-            value_vars=present,
-            var_name="_column",
-            value_name="value",
-        )
-        melted["clock"] = clock.name
-        melted["group_column"] = axis
-        melted["statistic"] = [_split(name)[0] for name in melted["_column"]]
-        melted["source"] = [_split(name)[1] for name in melted["_column"]]
-        melted["unit"] = [UNITS.get(name, "") for name in melted["statistic"]]
-        melted = melted.rename(
-            columns={clock.bin_column: "time_bin", clock.center_column: "bin_center_h"}
-        )
-        frames.append(melted[keys])
-    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(columns=keys)
+    present = [name for name in columns if name in getattr(wide, "columns", [])]
+    if wide.empty or not present:
+        return pd.DataFrame(columns=keys)
+    melted = wide.melt(
+        id_vars=[clock.bin_column, clock.center_column, "guid", *counted],
+        value_vars=present,
+        var_name="_column",
+        value_name="value",
+    )
+    melted["clock"] = clock.name
+    split = melted["_column"].str.partition(COLUMN_SEPARATOR)
+    melted["statistic"] = split[0]
+    melted["source"] = split[2]
+    melted["unit"] = melted["statistic"].map(UNITS).fillna("")
+    melted = melted.rename(
+        columns={clock.bin_column: "time_bin", clock.center_column: "bin_center_h"}
+    ).merge(identity, left_on="guid", right_index=True, how="left")
+    return melted[keys]
 
 
 def trajectory_frame(
@@ -655,12 +665,18 @@ def trajectory_frame(
         )
         if wide.empty:
             continue
+        # The columns every call reads besides its own: handed the whole wide table the reduction
+        # copies every column per call, which makes this loop cost the square of the table width.
+        base = [
+            name for name in ("group", clock.bin_column, clock.center_column, "guid", "n_segments")
+            if name in wide.columns
+        ]
         for column in columns:
             if column not in wide.columns:
                 continue
             statistic, source = _split(column)
             for row in cohort.trajectory_rows(
-                wide,
+                wide[[*base, column]],
                 column,
                 metric=column,
                 bin_column=clock.bin_column,
@@ -885,6 +901,7 @@ def run_lag_kld_scaled_analysis(
 
     featured, columns, feature_record = add_feature_columns(per_sample, sources, matrices, axes)
     weight, _ = soft_weight(lag)
+    identity = per_recording_labels(per_sample)
 
     per_recording: List[pd.DataFrame] = []
     trajectory: List[pd.DataFrame] = []
@@ -896,7 +913,7 @@ def run_lag_kld_scaled_analysis(
         if binned.empty:
             population["reason"] = f"no segment could be placed on the {clock.name} clock"
             continue
-        per_recording.append(per_recording_frame(clock, binned, columns))
+        per_recording.append(per_recording_frame(clock, binned, columns, identity))
         clock_trajectory = trajectory_frame(clock, binned, columns)
         trajectory.append(clock_trajectory)
         written.append(

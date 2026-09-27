@@ -953,10 +953,11 @@ def attach_warmup_budget(task: Any, config: Mapping[str, Any]) -> Optional[Warmu
     The diagnostic page's seams read it off the task: the input rows take the two input clocks
     $\tau^y_{\mathrm{ref}}$, $\tau^u_{\mathrm{ref}}$ and the forecast rows the scored clock's
     $\tau$ from it, and shift their columns by $\kappa\tau$ so a coefficient sits at the physical
-    instant its content describes rather than up to $352$ s to the right of the raw trace it was
-    computed from. The net cannot supply those constants -- it stamps the per-channel *step*
-    shifts, from which no $\tau$ is recoverable -- and :func:`load_task` builds the task from the
-    checkpoint alone, so without this call every page of an evaluation was drawn at step index.
+    instant its content describes rather than up to the largest $\kappa\tau$ to the right of the
+    raw trace it was computed from. The net cannot supply those constants -- it stamps the
+    per-channel *step* shifts, from which no $\tau$ is recoverable -- and :func:`load_task` builds
+    the task from the checkpoint alone, so without this call every page of an evaluation was drawn
+    at step index.
 
     Called **after** preflight, which has already refused any budget that does not re-resolve to
     the checkpoint's own stamped tuples; what is attached here is therefore the budget the
@@ -1503,8 +1504,9 @@ def main(
             )
 
         # Only on CUDA, and **absent** rather than zero on CPU: a 0.00 GB peak reads as "measured,
-        # and the run used no memory", which is a claim a CPU box cannot make.
-        if resolved_device.type == "cuda":
+        # and the run used no memory", which is a claim a CPU box cannot make -- nor an offline
+        # re-run, which builds no model and puts nothing on the device it resolved.
+        if resolved_device.type == "cuda" and task is not None:
             report.set(
                 "max_memory_allocated_gb",
                 float(torch.cuda.max_memory_allocated(resolved_device)) / (1024**3),
@@ -1710,27 +1712,32 @@ def load_or_collect_tables(
     """
     draws = int(eval_config["num_mc_samples"] if num_samples is None else num_samples)
     if collect.has_collection(results_dir):
+        recorded = (collect.read_record(results_dir) or {}).get("provenance") or {}
         if task is None and num_samples is None:
             # Nothing to collect *with*, so the draw count the tables were collected under is a
             # fact about them rather than a setting to compare against: refusing here would refuse
             # every offline re-run of a smoke pass, and there is no forward to redo at another K.
             # An explicitly requested count still reaches the comparison, and is still refused.
-            recorded = (
-                (collect.read_record(results_dir) or {}).get("provenance") or {}
-            ).get("num_mc_samples")
-            if recorded is not None and int(recorded) != draws:
+            if recorded.get("num_mc_samples") is not None and int(
+                recorded["num_mc_samples"]
+            ) != draws:
                 logger.info(
-                    f"the tables here were collected with {int(recorded)} Monte Carlo draw(s), "
-                    f"not the configured {draws}; this pass builds no model, so it reports them "
-                    f"as collected."
+                    f"the tables here were collected with {int(recorded['num_mc_samples'])} "
+                    f"Monte Carlo draw(s), not the configured {draws}; this pass builds no model, "
+                    f"so it reports them as collected."
                 )
-                draws = int(recorded)
+                draws = int(recorded["num_mc_samples"])
+        if task is None and max_batches is None:
+            # The batch cap on the same footing: adopted from the tables on a pass that cannot
+            # re-collect, compared -- and refused on a mismatch -- on one that could.
+            max_batches = recorded.get("max_batches")
         collection = collect.load_or_collect(
             results_dir,
             _refuse_to_collect,
             checkpoint_path=checkpoint_path,
             eval_config=eval_config,
             num_samples=draws,
+            max_batches=max_batches,
         )
         # Unshuffled, unlike the collection pass's: nothing here is batched through the model, and
         # the per-sample pages build their own strictly sequential loader over a Subset of this
@@ -1808,6 +1815,7 @@ def load_or_collect_tables(
         checkpoint_path=checkpoint_path,
         eval_config=eval_config,
         num_samples=draws,
+        max_batches=max_batches,
     )
     return collection, probe_record, loader
 
@@ -1996,7 +2004,8 @@ RUN_ARGS: Dict[str, Any] = {
     # over the shards.
     #
     #   forecast:         Is the forecast any good. Skill against persistence, climatology and
-    #                     the segment's own mean, in the loader's z units, by horizon step.
+    #                     the segment's causal running mean, in the loader's z units, by horizon
+    #                     step.
     #   coupling:         What the source added. `pred_gap` per recording in both estimators,
     #                     with a paired Wilcoxon, bootstrap intervals and the positive fraction.
     #   perm_control:     Is it *this* recording's source. The GUID-aware shuffle control, whose
@@ -2023,8 +2032,9 @@ RUN_ARGS: Dict[str, Any] = {
     #                     three; the two that scored a bpm waveform have no analogue here.
     #   sufficiency:      What the latent bottleneck costs, against an evaluation-only oracle
     #                     decoder. The one analysis whose cost is a training loop, not a forward.
-    #   samples:          Per-recording fifteen-row diagnostic PDF pages -- a stratified draw, plus
-    #                     the extremes of each headline metric. Needs a checkpoint; skips without.
+    #   samples:          Per-recording diagnostic pages, in eval_config.figure_format -- a
+    #                     stratified draw, plus the extremes of each headline metric. Needs a
+    #                     checkpoint; skips without.
     #   recording_traces: A class-balanced draw of recordings followed through EVERY one of their
     #                     segments in time order: the latent, its parameters, the divergence and
     #                     the lag readouts at every decoded anchor (full) and per segment

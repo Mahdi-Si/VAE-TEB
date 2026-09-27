@@ -112,6 +112,9 @@ def test_the_untruncated_mask_is_the_anchors_that_see_every_lag() -> None:
     mask = untruncated_anchor_mask(seq_len=8, n_lags=4)
 
     assert mask.tolist() == [False, False, False, True, True, True, True, True]
+    # A lag floor pushes the first complete anchor out by exactly the floor.
+    floored = untruncated_anchor_mask(seq_len=8, n_lags=4, lag_floor=2)
+    assert floored.tolist() == [False] * 5 + [True] * 3
 
 
 # =================================================================================================
@@ -123,6 +126,11 @@ def test_the_attainable_ceiling_is_log_of_the_lags_that_exist() -> None:
 
     assert ceiling.tolist() == pytest.approx(
         [math.log(1.0), math.log(2.0), math.log(3.0), math.log(3.0), math.log(3.0)]
+    )
+    # Under a lag floor only $t + 1 - F_u$ lags exist, and never fewer than the one the mask keeps.
+    floored = attainable_lag_entropy(seq_len=5, n_lags=3, lag_floor=2)
+    assert floored.tolist() == pytest.approx(
+        [math.log(1.0), math.log(1.0), math.log(1.0), math.log(2.0), math.log(3.0)]
     )
 
 

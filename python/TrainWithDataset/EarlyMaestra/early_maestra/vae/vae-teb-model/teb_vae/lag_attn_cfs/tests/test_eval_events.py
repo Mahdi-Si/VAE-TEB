@@ -273,7 +273,13 @@ def test_it_declares_a_grouped_frame_so_the_runner_fans_the_cohort_cuts(tmp_path
     declared = outcome["grouped_frames"]
     assert len(declared) == 1
     assert declared[0]["directory"] == events_analysis.ANALYSIS_DIRNAME
-    assert declared[0]["value_columns"] == ["difference"]
+    assert declared[0]["value_columns"] == [
+        f"{name}_difference" for name, _ in events_analysis.CONDITIONED_READOUTS
+    ]
+    # One row per recording, so a cohort cut never pools two readouts' differences.
+    written = pd.read_csv(tmp_path / declared[0]["path"])
+    assert written["guid"].is_unique
+    assert set(declared[0]["value_columns"]) <= set(written.columns)
     # The declaration names a CSV **on disk**, which is what makes the runner's fan-out work at
     # all -- and what makes ``--only events --output-dir <a finished run>`` reproduce it.
     assert (tmp_path / declared[0]["path"]).is_file()

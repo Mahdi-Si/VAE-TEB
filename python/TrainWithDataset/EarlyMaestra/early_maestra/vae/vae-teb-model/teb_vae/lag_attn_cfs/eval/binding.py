@@ -41,6 +41,7 @@ from teb_vae.lag_attn_cfs.eval.analyses import occlusion as occlusion_analysis
 from teb_vae.lag_attn_cfs.eval.analyses import recording_traces as recording_traces_analysis
 from teb_vae.lag_attn_cfs.eval.analyses import samples as samples_analysis
 from teb_vae.lag_attn_cfs.eval.analyses import source_null as source_null_analysis
+from teb_vae.lag_attn_cfs.eval.analyses import time_shift as time_shift_analysis
 from teb_vae.lag_attn_cfs.eval.analyses import spectral_skill as spectral_skill_analysis
 from teb_vae.lag_attn_cfs.eval.analyses import warmup as warmup_analysis
 from teb_vae.lag_attn_cfs.eval.config_schema import DEFAULT_OVERRIDES_PATH
@@ -253,6 +254,8 @@ EXTRA_ANALYSES: Dict[str, Any] = {
     "attribution": attribution_analysis.run_attribution_analysis,
     "warmup": warmup_analysis.run_warmup_analysis,
     "source_null": source_null_analysis.run_source_null_analysis,
+    # The within-recording misalignment control: the same recording's source from another time.
+    "time_shift": time_shift_analysis.run_time_shift_analysis,
     # The interventional half of the lag question, beside the observational one. It costs a
     # re-encode and a decode per band per batch, so it is registered after the two cheap causal
     # readouts and before the two that only read tables -- and it is the second analysis in this
@@ -302,7 +305,16 @@ EXTRA_ANALYSES: Dict[str, Any] = {
 #: finite scalars for exactly this purpose, as the shared ``coupling`` analysis already does, rather
 #: than being indexed into by position: a path whose last step is a list index resolves to the wrong
 #: row the day a metric is added above it, and nothing in the artifact would say so.
+#: Result blocks the cfs COLLECTION pass writes itself (``metrics.evaluate``), which a headline path
+#: may start from beside an extra analysis's name: ``mc_error`` is the gate column's Monte Carlo
+#: error, measured from the draws the pass took, so it belongs to the pass rather than to any
+#: analysis run after it. Declared rather than implied so a path starting anywhere else still fails.
+COLLECTION_HEADLINE_BLOCKS: Tuple[str, ...] = ("mc_error",)
+
 HEADLINE_SCALARS: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
+    # The gate column's own Monte Carlo error: the K draws' error in pred_gap_mc_nats itself.
+    ("pred_gap_mc_se_nats", ("mc_error", "pred_gap_mc_se_nats")),
+    ("pred_gap_mc_half_k_nats", ("mc_error", "pred_gap_mc_half_k_nats")),
     ("kld_source_null_nats", ("source_null", "difference", "kld_source_null_nats")),
     ("coupling_minus_clock_nats", ("source_null", "difference", "coupling_minus_clock_nats")),
     ("coupling_minus_clock_ci_lo", ("source_null", "difference", "ci_lo")),

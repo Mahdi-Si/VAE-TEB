@@ -17,8 +17,9 @@ independent sampling noise. Under a Gaussian likelihood the marginal is
 $\operatorname{logsumexp}_r \log p_r - \log K$ -- an average of *likelihoods*, not of log
 likelihoods, which is a different and larger number.
 
-**The baselines.** Persistence, climatology and the segment's own mean, rebuilt **in feature
-space** (:func:`baseline_forecasts`) and scored through the same loss function over the same mask
+**The baselines.** Persistence, climatology and the segment's own running mean -- all causal --
+rebuilt **in feature space** (:func:`baseline_forecasts`) and scored through the same loss
+function over the same mask
 at the same anchors. A summed-$H \cdot C_{\mathrm{keep}}$-coefficient block score is a large number under every
 predictor -- its scale is set by the block, not by the model -- so it is only readable against
 predictors that know nothing. Their observation variance is fixed at $\sigma = 1$ in the loader's
@@ -92,7 +93,7 @@ attribution divides every lag bin by the same anchor support, so it keeps summin
 is the decomposition the identity test pins. The **support-corrected** profile divides each bin by
 its own contributing-anchor count. Wherever the anchor floor clears the furthest lag, $F \ge L - 1$,
 both corrections are inert -- every lag exists at every scored anchor -- and that is a fact to **measure** rather than assume: an arm lowering the
-floor below $90$ reintroduces truncation, and these are what would catch it.
+floor below $L - 1$ reintroduces truncation, and these are what would catch it.
 """
 from __future__ import annotations
 
@@ -179,6 +180,23 @@ BASELINE_NAMES: Tuple[str, ...] = ("persistence", "climatology", "segment_mean")
 
 #: Every point forecast the run scores, model branches first.
 FORECAST_BRANCHES: Tuple[str, ...] = ("base", "full", *BASELINE_NAMES)
+
+#: The two permutation-control branches: a stranger's source posterior, and a stranger's prior.
+#: They need a cross-recording partner inside the batch, which a batch of one sample -- or one
+#: recording holding more than half of it -- does not have.
+CONTROL_BRANCHES: Tuple[str, ...] = ("shuffled", "base_shuffled_mu")
+
+#: Every latent branch the Monte Carlo and mean-decoded estimators score, in column order.
+LATENT_BRANCHES: Tuple[str, ...] = ("base", "full", *CONTROL_BRANCHES)
+
+#: The per-sample columns the permutation controls produce. On a batch the control cannot pair
+#: they are ``NaN`` rather than absent -- every batch writes one column set, so no sample is dropped
+#: to keep the tables aligned -- and :func:`aggregate_by_recording` averages each of them over the
+#: samples that carry it. Every other column keeps propagating a ``NaN``, which is a fault there.
+CONTROL_COLUMNS: Tuple[str, ...] = (
+    *(f"{estimator}_nll_{name}_block" for estimator in ("mc", "mean") for name in CONTROL_BRANCHES),
+    "source_conditioned_kl_shuffled_raw",
+)
 
 #: The observation log-variance handed to a trivial baseline: $\sigma = 1$ in the loader's own
 #: $z$ units, matching the decoder's head-init calibration.
@@ -321,6 +339,23 @@ def batch_recordings(batch: Any, batch_size: int) -> Optional[List[str]]:
     return [str(field_value)] * batch_size
 
 
+def control_pairable(batch_size: int, recordings: Optional[Sequence[str]]) -> bool:
+    """Whether the permutation controls can pair every sample of a batch with a stranger.
+
+    A property of the batch's *composition*, tested before any forward: one sample has no partner
+    at all, and one recording holding more than half the batch leaves some sample with only its own
+    recording to borrow from. Unknown grouping (``None``) pairs by index, as the derangement does.
+
+    Args:
+        batch_size: Samples in the batch.
+        recordings: One recording identifier per sample, or ``None`` when the batch carries none.
+
+    Returns:
+        ``True`` when a cross-recording derangement exists.
+    """
+    return batch_size >= 2 and (recordings is None or controls.groups_can_derange(recordings))
+
+
 def batch_guids(batch: Any, batch_size: int) -> List[str]:
     """Return one recording identifier per sample, falling back to ``'unknown'``.
 
@@ -347,10 +382,10 @@ def batch_guids(batch: Any, batch_size: int) -> List[str]:
 #:
 #: The sibling's ``BPM_UNIT``, ``to_bpm``, ``sigma_to_bpm`` and ``fhr_normalization`` are **deleted
 #: rather than repointed**, and the deletion is the decision: a scattering or phase-harmonic
-#: coefficient has no clinical unit, and inverting the per-channel statistics would put the $98$
-#: channels on scales spanning orders of magnitude -- which destroys every pooled statistic, every
-#: shared colour bar and the warm-up tertile split. A function that could be called would be
-#: called, so there is none.
+#: coefficient has no clinical unit, and inverting the per-channel statistics would put the
+#: $C_{\mathrm{keep}}$ channels on scales spanning orders of magnitude -- which destroys every
+#: pooled statistic, every shared colour bar and the warm-up tertile split. A function that could be
+#: called would be called, so there is none.
 #:
 #: The **other half of this decision lives in** ``collect.normalization_record``, which the
 #: sibling points at ``("fhr", "up")`` and this package points at the four stored feature blocks:
@@ -449,11 +484,15 @@ def likelihood_structure_record(model: Any) -> Dict[str, Any]:
     Returns:
         ``forecast_ar_residual``, the per-block mean $\phi_c$ (``None`` without the AR term or
         without a channel in that block), ``scored_cells`` -- the cells per anchor the block sums
-        over -- and ``block_cells``, $H \cdot C_{\mathrm{keep}}$.
+        over -- and ``block_cells``, $H \cdot C_{\mathrm{keep}}$; plus the two per-channel vectors
+        an offline re-run needs to draw either term, positional against the kept channel axis:
+        ``scored_horizon_per_channel`` ($H_c = \sum_\tau m_{\tau,c}$, every channel $H$ without a
+        cell mask) and ``ar_coef_per_channel`` ($\phi_c$, ``None`` without the AR term).
     """
     terms = forecast_likelihood_terms(model)
     cell_mask, ar_coef = terms["cell_mask"], terms["ar_coef"]
-    block_cells = int(model.horizon) * int(model.decoder_out_channels)
+    horizon, channels = int(model.horizon), int(model.decoder_out_channels)
+    block_cells = horizon * channels
 
     def _block_mean(selector: torch.Tensor) -> Optional[float]:
         if ar_coef is None or not bool(selector.any()):
@@ -467,6 +506,14 @@ def likelihood_structure_record(model: Any) -> Dict[str, Any]:
         "ar_coef_mean_ph": _block_mean(~first),
         "scored_cells": block_cells if cell_mask is None else int(cell_mask.sum().item()),
         "block_cells": block_cells,
+        "scored_horizon_per_channel": (
+            [horizon] * channels
+            if cell_mask is None
+            else [int(value) for value in cell_mask.sum(dim=0).cpu().tolist()]
+        ),
+        "ar_coef_per_channel": (
+            None if ar_coef is None else [float(value) for value in ar_coef.cpu().tolist()]
+        ),
     }
 
 
@@ -541,6 +588,7 @@ def mc_predictive_block(
     num_samples: int = DEFAULT_NUM_SAMPLES,
     generator: Optional[torch.Generator] = None,
     persistence: Optional[torch.Tensor] = None,
+    draws_out: Optional[Dict[str, torch.Tensor]] = None,
 ) -> Tuple[Dict[str, torch.Tensor], torch.Tensor]:
     r"""Score every branch's forecast under common random numbers, at the decoded anchors.
 
@@ -581,6 +629,9 @@ def mc_predictive_block(
             from ``forward_outputs['persistence']`` by the caller rather than re-gathered here: it
             is target-only and identical across branches and draws, so re-deriving it would be a
             second definition of a tensor the forward already produced.
+        draws_out: When given, filled with each branch's per-draw block scores $(K, B, A_{\max})$,
+            so the caller can measure the estimator's own Monte Carlo error
+            (:func:`mc_gap_error`) from the draws already taken rather than from a second pass.
 
     Returns:
         ``(scores, contributing)``: the marginalised per-anchor score of each branch, and the
@@ -631,11 +682,132 @@ def mc_predictive_block(
             draws[name].append(block)
 
     assert contributing is not None  # the loops above ran at least once
-    scores = {
-        name: marginalise_block_scores(torch.stack(blocks, dim=0), likelihood)
-        for name, blocks in draws.items()
-    }
+    stacked = {name: torch.stack(blocks, dim=0) for name, blocks in draws.items()}
+    if draws_out is not None:
+        draws_out.update(stacked)
+    scores = {name: marginalise_block_scores(value, likelihood) for name, value in stacked.items()}
     return scores, contributing
+
+
+def mc_gap_error(
+    base_draws: torch.Tensor,
+    full_draws: torch.Tensor,
+    contributing: torch.Tensor,
+    likelihood: str,
+) -> Dict[str, torch.Tensor]:
+    r"""The Monte Carlo error of one segment's marginalised ``mc_pred_gap``, from its own draws.
+
+    The marginalised score is a log-mean-exp over $K$ draws, a nonlinear and biased estimator, so
+    its error is measured by the delete-one jackknife over draws: with $\hat g_{(i)}$ the
+    per-segment gap recomputed without draw $i$,
+
+    $$\mathrm{SE}_{\mathrm{MC}} = \sqrt{\tfrac{K - 1}{K} \sum_{i=1}^{K}
+    \big(\hat g_{(i)} - \bar g_{(\cdot)}\big)^2 }.$$
+
+    Draw $i$ is left out of **both** branches at once, because common random numbers pair them:
+    the draws are independent across draws, not across branches. The same gap from the first
+    $\lfloor K/2 \rfloor$ draws is returned beside it; its distance from the $K$-draw value is
+    the estimator's convergence (and the sign of its bias) read directly.
+
+    Args:
+        base_draws: The target-only branch's per-draw block scores $(K, B, A)$.
+        full_draws: The source-conditioned branch's, on the same draws $(K, B, A)$.
+        contributing: The $0/1$ anchor indicator $(B, A)$ the per-segment means average over.
+        likelihood: ``'mse'`` or ``'gaussian_nll'``, choosing the marginalisation.
+
+    Returns:
+        ``{'se': (B,), 'half_k': (B,)}``, both ``NaN`` at $K < 2$ where neither is defined.
+    """
+    num_samples = int(base_draws.shape[0])
+    missing = torch.full(
+        contributing.shape[:1], float("nan"), dtype=base_draws.dtype, device=base_draws.device
+    )
+    if num_samples < 2:
+        return {"se": missing, "half_k": missing.clone()}
+
+    def _gap(keep: torch.Tensor) -> torch.Tensor:
+        base = marginalise_block_scores(base_draws[keep], likelihood)
+        full = marginalise_block_scores(full_draws[keep], likelihood)
+        return _per_sample_mean(base - full, contributing)
+
+    everything = torch.arange(num_samples, device=base_draws.device)
+    left_out = torch.stack([_gap(everything[everything != draw]) for draw in range(num_samples)])
+    spread = ((left_out - left_out.mean(dim=0)) ** 2).sum(dim=0)
+    return {
+        "se": torch.sqrt(spread * (num_samples - 1) / float(num_samples)),
+        "half_k": _gap(everything[: num_samples // 2]),
+    }
+
+
+def mc_error_summary(readouts: Sequence["BatchReadout"], num_samples: int) -> Dict[str, Any]:
+    r"""The Monte Carlo error of the run-level ``pred_gap_mc_nats``, beside the value it qualifies.
+
+    The headline is a mean over recordings of each recording's mean over its segments, and the
+    draws are independent across segments, so its Monte Carlo variance is
+    $\frac{1}{R^2} \sum_r \frac{1}{n_r^2} \sum_{s \in r} \mathrm{SE}_s^2$. That is the error the
+    $K$ draws leave in the number itself; it is **not** the between-recording uncertainty the
+    coupling analysis bootstraps, and the two are read against each other: a Monte Carlo error
+    that is a sizeable share of the bootstrap interval says $K$ is too small for the claim.
+
+    Args:
+        readouts: Every batch's readouts, carrying ``mc_pred_gap``, ``mc_pred_gap_se`` and
+            ``mc_pred_gap_half_k`` per segment.
+        num_samples: $K$, the draws per anchor.
+
+    Returns:
+        The record ``summary.json`` carries under ``mc_error``: the run-level standard error, the
+        half-$K$ estimate beside the $K$-draw one, and the per-segment error's median and maximum.
+        Every value is ``None`` below two draws, where no error is defined.
+    """
+    record: Dict[str, Any] = {
+        "num_mc_samples": int(num_samples),
+        "pred_gap_mc_se_nats": None,
+        "pred_gap_mc_nats": None,
+        "pred_gap_mc_half_k_nats": None,
+        "per_segment_se_median_nats": None,
+        "per_segment_se_max_nats": None,
+        "n_segments": 0,
+        "note": (
+            "Monte Carlo error of the marginalised gap from the draws the pass took (delete-one "
+            "jackknife over draws, both branches together); not the between-recording "
+            "uncertainty, which the coupling analysis bootstraps"
+        ),
+    }
+    if int(num_samples) < 2:
+        return record
+    # Per recording: [sum of gaps, sum of half-K gaps, sum of squared errors, segment count].
+    sums: Dict[str, List[float]] = {}
+    errors: List[float] = []
+    for readout in readouts:
+        if not all(name in readout.columns for name in ("mc_pred_gap", "mc_pred_gap_se", "mc_pred_gap_half_k")):
+            continue
+        gap, se, half = (
+            readout.columns[name].detach().cpu().to(torch.float64).numpy()
+            for name in ("mc_pred_gap", "mc_pred_gap_se", "mc_pred_gap_half_k")
+        )
+        for guid, value, error, halved in zip(readout.guids, gap, se, half):
+            if not (np.isfinite(value) and np.isfinite(error)):
+                continue
+            cell = sums.setdefault(str(guid), [0.0, 0.0, 0.0, 0.0])
+            cell[0] += float(value)
+            cell[1] += float(halved)
+            cell[2] += float(error) ** 2
+            cell[3] += 1.0
+            errors.append(float(error))
+    if not sums:
+        return record
+    cells = np.asarray(list(sums.values()), dtype=np.float64)
+    counts = cells[:, 3]
+    recordings = float(len(cells))
+    record.update(
+        pred_gap_mc_se_nats=float(np.sqrt((cells[:, 2] / counts**2).sum()) / recordings),
+        pred_gap_mc_nats=float((cells[:, 0] / counts).mean()),
+        pred_gap_mc_half_k_nats=float((cells[:, 1] / counts).mean()),
+        per_segment_se_median_nats=float(np.median(errors)),
+        per_segment_se_max_nats=float(np.max(errors)),
+        n_segments=len(errors),
+    )
+    return record
 
 
 @torch.no_grad()
@@ -648,6 +820,7 @@ def mean_decoded_block(
     anchors: torch.Tensor,
     likelihood: str,
     persistence: Optional[torch.Tensor] = None,
+    forecasts: Optional[Dict[str, Tuple[torch.Tensor, torch.Tensor]]] = None,
 ) -> Tuple[Dict[str, torch.Tensor], torch.Tensor]:
     r"""Score every branch's forecast decoded at its latent **mean**, at the decoded anchors.
 
@@ -679,6 +852,9 @@ def mean_decoded_block(
         likelihood: ``'mse'`` or ``'gaussian_nll'``.
         persistence: The matched forward's own persistence input, or ``None`` -- exactly as
             :func:`mc_predictive_block` takes it, and for the same reason.
+        forecasts: If given, filled with each branch's decoded ``(mu, logvar)`` forecast, each
+            $(B, A_{\max}, H, C_{\mathrm{keep}})$, so a caller that keeps the mean-decoded forecast
+            does not decode it a second time.
 
     Returns:
         ``(scores, contributing)``: the per-anchor block score of each branch decoded at its
@@ -703,6 +879,8 @@ def mean_decoded_block(
             **density,
         )
         scores[name] = block
+        if forecasts is not None:
+            forecasts[name] = (forecast_mu, forecast_logvar)
     assert contributing is not None  # the loop above ran at least once
     return scores, contributing
 
@@ -723,8 +901,15 @@ def baseline_forecasts(
     predictor, so the only readable form of it is a comparison against predictors that know
     nothing.
 
-    * **persistence** -- anchor $t$'s whole window is filled with the coefficient vector at the
-      last **observed** step at or before $t$, per channel. "Last observed" rather than "last"
+    Every baseline reads only what the model could have read: stored steps at or before the
+    anchor's **persistence step** $p_{a,c} = t_a + \min(s_c, 0)$, the step the decoder's own
+    persistence input is gathered at (``_anchor_target_values``). With no forecast clock
+    $s_c \equiv 0$ and $p_{a,c} = t_a$; under a delaying clock the scored element at horizon step
+    $\tau = d_c - 1$ *is* stored step $t_a$, so a baseline reading $t_a$ would be handed one scored
+    cell for free and read the scored clock's future at every step before it.
+
+    * **persistence** -- anchor $t$'s whole window is filled with the coefficient at the last
+      **observed** step at or before $p_{a,c}$, per channel. "Last observed" rather than "last"
       because ``weight`` is the only trustworthy validity signal here: unlike the raw trace, the
       coefficients carry no gap sentinel at all, so a carried-forward invalid step is not an
       outlier that would show up -- it is an ordinary-looking number that would quietly measure the
@@ -733,10 +918,14 @@ def baseline_forecasts(
     * **climatology** -- exactly $0$ per channel, which is the z-scored population mean. The
       statistics were accumulated *excluding* each channel's warm-up region, which is what makes
       zero the channel mean over the region the model reads.
-    * **segment_mean** -- the mean of this segment's own observed steps, per channel. It is
-      deliberately the stronger form: **not causal**, since it reads the segment's whole future, so
-      a model that fails to beat it has learned nothing recording-specific that a constant could
-      not say.
+    * **segment_mean** -- the segment's own **running** mean per channel,
+      $\bar y_{a,c} = \operatorname{mean}\{y_{u,c} : W'_c \le u \le p_{a,c},\ w_u \text{ valid}\}$:
+      every observed, warm step of this segment up to the anchor. Causal, like the other two -- a
+      mean over the whole segment would average the very steps being forecast into the forecast,
+      and a baseline that reads its own answer is not a baseline. Warm steps only, because a
+      coefficient inside its channel's warm-up $W'_c$ was computed over assumed pre-recording
+      history and is not a value of this recording; where no warm step precedes the anchor yet,
+      the channel falls back to its persistence value.
 
     **Every baseline is built on the gathered kept channels, never on the declared width.** The
     history each reads is ``index_select(target_features, -1, target_gate.keep_index)`` -- the same
@@ -759,7 +948,8 @@ def baseline_forecasts(
     Args:
         target_features: The loader-normalized target stream $(B, T, c_y)$, at the declared width.
         weight: The decimated validity signal $(B, T)$.
-        model: The net, for its target gate.
+        model: The net, for its target gate, its forecast clock ``target_forecast_shift`` and its
+            per-survivor warm-up ``target_warmup_steps`` -- either absent reads as zero.
         anchors: The decoded anchor index $(B, A_{\max})$.
 
     Returns:
@@ -771,37 +961,51 @@ def baseline_forecasts(
         if model.target_gate is None
         else torch.index_select(target_features, -1, model.target_gate.keep_index)
     )
-    channels = int(gathered.shape[-1])
-    index = anchors.to(torch.long)
+    batch, seq_len, channels = (int(size) for size in gathered.shape)
+    device = gathered.device
     valid = weight >= VALID_THRESHOLD                                        # (B, T)
+
+    def _per_channel(values: Any) -> torch.Tensor:
+        """A per-survivor integer vector off the model, zeros where it declares none."""
+        return torch.tensor(
+            [int(value) for value in values] if values else [0] * channels,
+            dtype=torch.long, device=device,
+        )
+
+    # The persistence step p = t_a + min(s_c, 0), per anchor and channel -- the model's own clamp.
+    offsets = _per_channel(getattr(model, "target_forecast_shift", None)).clamp_max(0)
+    reads = (anchors.to(torch.long)[:, :, None] + offsets).clamp(0, seq_len - 1)  # (B, A, C)
+    flat_reads = reads.reshape(batch, -1)
 
     # Index of the most recent valid step at or before each step. ``cummax`` over the step
     # indices, with invalid steps sent to -1 so they never win the running maximum.
-    steps = torch.arange(weight.shape[1], device=weight.device).expand_as(valid)
+    steps = torch.arange(seq_len, device=device).expand_as(valid)
     last_valid = torch.cummax(torch.where(valid, steps, torch.full_like(steps, -1)), dim=1).values
     # An anchor with no valid step at or before it is fully masked by ``forecast_mask`` (its own
     # step is invalid), so the clamped fallback never reaches a scored term.
-    at_anchor = last_valid.gather(1, index).clamp_min(0)                     # (B, A)
-    persistence = gathered.gather(
-        1, at_anchor[:, :, None].expand(-1, -1, channels)
-    )[:, :, None, :]                                                         # (B, A, 1, C_keep)
+    carried = last_valid.gather(1, flat_reads).reshape(reads.shape)
+    persistence = gathered.gather(1, carried.clamp_min(0))                   # (B, A, C_keep)
 
-    observed = valid.to(gathered.dtype)
-    counts = observed.sum(dim=1, keepdim=True)                               # (B, 1)
-    totals = (gathered * observed[:, :, None]).sum(dim=1)                    # (B, C_keep)
-    # NaN rather than 0.0 where a segment carries no valid step at all: zero is the *climatology*
-    # here, so a fabricated zero would silently report the population mean as this segment's mean
-    # and score a second identical baseline under a different name. Such a segment scores no
-    # anchors, so its whole row leaves the aggregation anyway.
+    # The running mean over observed, warm steps: two cumulative sums read at the persistence
+    # step. Accumulated in float64 so a long record's early steps are not rounded away.
+    warm = steps[0][:, None] >= _per_channel(getattr(model, "target_warmup_steps", None))
+    usable = (valid[:, :, None] & warm[None]).to(torch.float64)              # (B, T, C_keep)
+    totals = torch.cumsum(gathered.to(torch.float64) * usable, dim=1).gather(1, reads)
+    counts = torch.cumsum(usable, dim=1).gather(1, reads)
+    # The floor admits a channel whose warm-up ends one step past the anchor -- its first SCORED
+    # step is warm, its anchor step need not be -- so an early anchor can have no warm step behind
+    # it yet. That channel's running mean is then its persistence value: the one observation the
+    # decoder is handed too. NaN only where nothing observed precedes the anchor at all: zero is the
+    # *climatology* here, so a fabricated zero would silently report the population mean as this
+    # segment's own, and such an anchor has no valid step of its own, so the mask drops it anyway.
+    running = torch.where(counts > 0.0, totals / counts.clamp_min(1.0), persistence.double())
     segment_mean = torch.where(
-        counts > 0.0,
-        totals / counts.clamp_min(1.0),
-        torch.full_like(totals, float("nan")),
-    )[:, None, None, :]                                                      # (B, 1, 1, C_keep)
+        carried >= 0, running, torch.full_like(running, float("nan"))
+    ).to(gathered.dtype)[:, :, None, :]                                      # (B, A, 1, C_keep)
 
     return {
-        "persistence": persistence,
-        "climatology": torch.zeros((), dtype=gathered.dtype, device=gathered.device),
+        "persistence": persistence[:, :, None, :],                            # (B, A, 1, C_keep)
+        "climatology": torch.zeros((), dtype=gathered.dtype, device=device),
         "segment_mean": segment_mean,
     }
 
@@ -1188,8 +1392,8 @@ class BatchReadout:
             average every anchor together, cannot answer. Released by :func:`evaluate` with
             ``per_anchor`` once a sink has consumed them.
         retained: Whole model tensors a caller asked to keep, by their forward-output name.
-            Empty unless ``retain`` named them: a retained forecast set here is four
-            $(A_{\max}, H, C_{\mathrm{keep}})$ tensors, about $3.4$ MiB per sample.
+            Empty unless ``retain`` named them: a retained forecast set here is five
+            $(A_{\max}, H, C_{\mathrm{keep}})$ tensors per retained sample.
         horizon_sums: Residual, log-variance and block-score sums resolved by horizon step, each
             $(H,)$, per branch. The $\tau$ axis lives inside an anchor, so it survives on neither
             table and cannot be recovered from either.
@@ -1376,9 +1580,9 @@ def lag_profiles(
 
 
 def untruncated_anchor_mask(
-    seq_len: int, n_lags: int, *, device: Optional[torch.device] = None
+    seq_len: int, n_lags: int, *, device: Optional[torch.device] = None, lag_floor: int = 0
 ) -> torch.Tensor:
-    r"""Anchors at which **every** lag exists: $t \ge L - 1$.
+    r"""Anchors at which **every** lag exists: $t \ge L - 1 + F_u$.
 
     The support correction of :func:`lag_profiles` fixes each bin's *denominator*. It cannot fix
     its numerator, and for a quantity that is a probability distribution over lags it does not
@@ -1395,11 +1599,13 @@ def untruncated_anchor_mask(
         seq_len: Sequence length $T$.
         n_lags: Lag window width $L$.
         device: Device to build the mask on.
+        lag_floor: $F_u$, the earliest source step the model may read (``model.lag_floor``); lag
+            $\ell$ exists at $t$ only when $t - \ell \ge F_u$.
 
     Returns:
         A $(T,)$ bool mask, ``True`` where the anchor's lag support is complete.
     """
-    return torch.arange(int(seq_len), device=device) >= (int(n_lags) - 1)
+    return torch.arange(int(seq_len), device=device) >= (int(n_lags) - 1 + int(lag_floor))
 
 
 def attainable_lag_entropy(
@@ -1408,10 +1614,11 @@ def attainable_lag_entropy(
     *,
     device: Optional[torch.device] = None,
     dtype: torch.dtype = torch.float32,
+    lag_floor: int = 0,
 ) -> torch.Tensor:
     r"""The largest entropy an attention distribution can have at each anchor, in nats.
 
-    $$H^{\max}_t = \log \min(t + 1, L).$$
+    $$H^{\max}_t = \log \min(\max(t + 1 - F_u, 1), L).$$
 
     A uniform distribution over $n$ outcomes has entropy $\log n$, and at anchor $t$ only
     $\min(t + 1, L)$ lags exist at all. So $\log L$ is **not** the ceiling on a sequence whose
@@ -1429,7 +1636,7 @@ def attainable_lag_entropy(
         A $(T,)$ tensor of per-anchor attainable entropies.
     """
     steps = torch.arange(int(seq_len), device=device, dtype=dtype)
-    return torch.log(torch.clamp(steps + 1.0, max=float(n_lags)))
+    return torch.log(torch.clamp(steps + 1.0 - float(lag_floor), min=1.0, max=float(n_lags)))
 
 
 def attention_entropy(attn_weights: torch.Tensor) -> torch.Tensor:
@@ -1519,9 +1726,10 @@ def calibration_sums(
       the NLL, is bounded and does not diverge on a single badly-placed coefficient.
     * **The three NLL sums**, which turn into the gain over the homoscedastic MLE fitted to these
       very residuals -- the comparison that says whether the *learned* variance earned anything
-      over one constant $\sigma$. One constant across all $98$ channels, which is what makes it a
-      floor rather than a flattering estimate: the channels are z-scored individually, so a single
-      $\sigma$ is a stronger competitor here than it would be on a raw waveform.
+      over one constant $\sigma$. One constant across all $C_{\mathrm{keep}}$ channels, which is
+      what makes it a floor rather than a flattering estimate: the channels are z-scored
+      individually, so a single $\sigma$ is a stronger competitor here than it would be on a raw
+      waveform.
     * **The log-variance histogram**, over the clamp's own range. A mean alone is equally
       consistent with a well-spread distribution and with half the mass pinned on each clamp.
 
@@ -1627,9 +1835,8 @@ def calibration_report(
 
     **The scored unit is a coefficient, and the key names say so.** The sibling reports
     ``gain_per_raw_sample``; there is no raw sample anywhere in this pipeline for a gain to be per,
-    and the two denominators differ by a factor of three at the shipped geometry -- so a column
-    carried across under the sibling's name would be silently non-comparable with the sibling's
-    number.
+    and the two denominators differ -- so a column carried across under the sibling's name would be
+    silently non-comparable with the sibling's number.
 
     Args:
         sums: What :func:`calibration_sums` accumulated, as tensors, arrays or plain lists.
@@ -1831,7 +2038,7 @@ def source_null_kld_per_sample(
     n_lags = int(nulled["attn_weights"].shape[-1])
     lag_validity = model.build_lag_mask(seq_len, device=kl_support.device)
     untruncated = untruncated_anchor_mask(
-        seq_len, n_lags, device=kl_support.device
+        seq_len, n_lags, device=kl_support.device, lag_floor=int(getattr(model, "lag_floor", 0))
     ).to(kl_support.dtype)
     profile_null, _, _ = lag_profiles(lag_map_null, kl_support, lag_validity)
 
@@ -2037,20 +2244,18 @@ def evaluate_batch(
         perm_generator: Generator seeding the derangement, so a run is reproducible.
         mc_generator: Generator for the Monte Carlo $\epsilon$, on the model's device.
         retain: Forward-output names to carry back whole on the readout, plus ``'target'`` for
-            the gathered feature future and ``'up_raw'`` / ``'weight'`` for the source trace and
-            the validity behind it. Empty by default: a forecast tensor is
-            $(B, A_{\max}, H, C_{\mathrm{keep}})$, about $0.9$ MiB per sample, so retaining one is
-            a decision a caller makes rather than a default it inherits.
+            the gathered feature future and ``'up_raw'`` / ``'fhr_raw'`` / ``'weight'`` for the
+            two raw traces and the validity behind them. ``mu_*`` / ``logvar_*`` of the base
+            and full branches resolve to the MEAN-DECODED pair, not the forward's own. Empty by
+            default: a forecast tensor is
+            $(B, A_{\max}, H, C_{\mathrm{keep}})$ floats per batch, so retaining one is a decision a
+            caller makes rather than a default it inherits.
 
     Returns:
-        The batch's per-sample readouts.
-
-    Raises:
-        NoCrossGroupPartner: If the batch carries recording identifiers but no cross-recording
-            pairing exists -- one recording holding more than half the batch. Callers running a
-            whole loader test this with
-            :func:`~teb_vae.lag_attn_rws.nets.controls.groups_can_derange` and exclude such a
-            batch, counting the exclusion.
+        The batch's per-sample readouts. On a batch the permutation controls cannot pair -- one
+        sample, or one recording holding more than half of it (:func:`control_pairable`) -- every
+        sample is still scored and the :data:`CONTROL_COLUMNS` are ``NaN``: a sample without a
+        stranger in its batch has no control reading, but it has every other one.
     """
     model = task.orig_model
     likelihood = str(task.hparams.get("likelihood", "gaussian_nll"))
@@ -2084,23 +2289,28 @@ def evaluate_batch(
     n_control_pairs = 0
     n_same_recording_pairs = 0
     shuffled_kl_per_t: Optional[torch.Tensor] = None
-    if batch_size >= 2:
+    if control_pairable(batch_size, recordings):
         # Grouped by recording where the batch says which recording each sample came from: an
         # unshuffled loader over per-recording shards puts a segment next to its own recording's
         # neighbouring segment, and pairing those two is not "a stranger's source".
         #
-        # ``anchors=`` is not optional here even though this call site reads only the permuted
-        # posterior's two distribution parameters: without it the control decodes the contiguous
-        # prefix $[0, T_{\rm valid})$ instead of the decoded set, which is a $(B, 285, H, C)$
-        # forecast nothing asked for -- silent, because the two parameters it *is* read for are
-        # $(B, T, d_z)$ either way.
+        # ONE anchor per row. This call site reads only the permuted posterior's two distribution
+        # parameters, which are $(B, T, d_z)$ whatever is decoded; the permuted forecast is scored
+        # below through the shared Monte Carlo decode instead. So the definition's own decode runs
+        # at the first anchor alone rather than at $A_{\max}$ of them -- the same code path at
+        # $1/A_{\max}$ of a full decoder pass. Never ``None``, which decodes the contiguous prefix
+        # $[0, T_{\rm valid})$.
         permuted = controls.perm_forward_outputs(
-            model, outputs, generator=perm_generator, groups=recordings, anchors=anchors
+            model, outputs, generator=perm_generator, groups=recordings, anchors=anchors[:, :1]
         )
         index = permuted["perm_index"]
         branches["shuffled"] = (permuted["mu_post"], permuted["logvar_post"])
         # The same derangement for both controls, so "a stranger's source" and "a stranger's
-        # prior" name the same stranger and the two numbers are comparable.
+        # prior" name the same stranger and the two numbers are comparable. Decoded with the
+        # anchor's OWN persistence input, like every other branch: the question is whether the
+        # prior LATENT carries recording-specific state beyond what the persistence residual
+        # already hands the decoder, and a stranger's persistence level would answer a different
+        # one -- the verdict would then pass on the residual alone.
         branches["base_shuffled_mu"] = (
             outputs["mu_prior"][index],
             outputs["logvar_prior"][index],
@@ -2125,6 +2335,7 @@ def evaluate_batch(
                 if recordings[position] == recordings[partner]
             )
 
+    mc_draws: Dict[str, torch.Tensor] = {}
     scores, contributing = mc_predictive_block(
         model, branches, target, mask, anchors=anchors, likelihood=likelihood,
         num_samples=num_samples, generator=mc_generator,
@@ -2132,16 +2343,11 @@ def evaluate_batch(
         # the decoder is then also in; present, it is the forward's own tensor rather than a
         # second gather of the same target.
         persistence=outputs.get("persistence"),
+        draws_out=mc_draws,
     )
-    # The third score path: every branch decoded at its latent MEAN, no draw. One decoder call per
-    # branch against the K per branch above, so it costs a fraction of the marginalised pass and
-    # answers the question that pass cannot -- whether the mean forecast improved -- without the
-    # spread of the prior entering the comparison. See ``mean_decoded_block``.
-    mean_scores, _ = mean_decoded_block(
-        model, branches, target, mask, anchors=anchors, likelihood=likelihood,
-        persistence=outputs.get("persistence"),
-    )
-
+    # The gate column's own Monte Carlo error, from the draws just taken: no second decode.
+    mc_error = mc_gap_error(mc_draws["base"], mc_draws["full"], contributing, likelihood)
+    del mc_draws
     # The training-path score: the forward's own decoded latents, the same functions the objective
     # uses. Under ``base_decode: mean`` ``mu_base`` was decoded at the prior MEAN while ``mu_full``
     # was decoded at one posterior sample, so ``nll_base_block - nll_full_block`` mixes a source
@@ -2155,6 +2361,30 @@ def evaluate_batch(
         outputs["mu_base"], target, mask, likelihood=likelihood, logvar=outputs["logvar_base"],
         **density,
     )
+
+    # The third score path: every branch decoded at its latent MEAN, no draw. One decoder call per
+    # branch against the K per branch above, so it costs a fraction of the marginalised pass and
+    # answers the question that pass cannot -- whether the mean forecast improved -- without the
+    # spread of the prior entering the comparison. See ``mean_decoded_block``. Under
+    # ``base_decode: mean`` the forward already decoded $\mu^p$ at these anchors with this
+    # persistence input, so the base entry IS the training-path block, bitwise, and is read
+    # rather than decoded a second time.
+    base_is_mean = getattr(model, "base_decode", None) == "mean"
+    mean_forecasts: Dict[str, Tuple[torch.Tensor, torch.Tensor]] = {}
+    mean_scores, _ = mean_decoded_block(
+        model,
+        {name: value for name, value in branches.items() if not (base_is_mean and name == "base")},
+        target, mask, anchors=anchors, likelihood=likelihood,
+        # Kept only when a caller retains forecasts: four branches' decoded blocks held to the end
+        # of the batch are the largest transient here, and nothing else reads them.
+        persistence=outputs.get("persistence"), forecasts=mean_forecasts if retain else None,
+    )
+    if base_is_mean:
+        mean_scores["base"] = training_base_block
+        mean_forecasts["base"] = (outputs["mu_base"], outputs["logvar_base"])
+    mean_forecasts = {
+        name: mean_forecasts[name] for name in ("base", "full") if name in mean_forecasts
+    }
 
     kld_btd = model.kld_tensor(
         mu_prior=outputs["mu_prior"],
@@ -2203,24 +2433,33 @@ def evaluate_batch(
     }
     columns["delta_mu_rms"] = columns["delta_mu_sq"].sqrt()
     columns["pred_gap"] = columns["nll_base_block"] - columns["nll_full_block"]
-    for name, value in scores.items():
-        columns[f"mc_nll_{name}_block"] = _per_sample_mean(value, contributing)
-    if "mc_nll_base_block" in columns and "mc_nll_full_block" in columns:
-        columns["mc_pred_gap"] = columns["mc_nll_base_block"] - columns["mc_nll_full_block"]
+    # Every branch column on every batch, NaN where the control could not pair: a batch writes one
+    # column set whatever it held, so no sample has to be dropped to keep the tables aligned.
+    unpaired = torch.full_like(columns["nll_base_block"], float("nan"))
+    for name in LATENT_BRANCHES:
+        columns[f"mc_nll_{name}_block"] = (
+            _per_sample_mean(scores[name], contributing) if name in scores else unpaired
+        )
+    columns["mc_pred_gap"] = columns["mc_nll_base_block"] - columns["mc_nll_full_block"]
+    # Its Monte Carlo error and its half-K value (see ``mc_gap_error``). Only from two draws up,
+    # where they are defined: below that they would be columns of NaN on every row.
+    if int(num_samples) >= 2:
+        columns["mc_pred_gap_se"] = mc_error["se"]
+        columns["mc_pred_gap_half_k"] = mc_error["half_k"]
     # The mean-decoded pair under the same naming pattern, so a reader who knows ``mc_*`` knows
     # ``mean_*``: each branch at its latent mean, scored under the decoder's own variance, and the
     # gap as the same subtraction. Every branch scored above is scored here too, so the two
     # controls have a mean-decoded reading beside their marginalised one.
-    for name, value in mean_scores.items():
-        columns[f"mean_nll_{name}_block"] = _per_sample_mean(value, contributing)
-    if "mean_nll_base_block" in columns and "mean_nll_full_block" in columns:
-        columns["mean_pred_gap"] = (
-            columns["mean_nll_base_block"] - columns["mean_nll_full_block"]
+    for name in LATENT_BRANCHES:
+        columns[f"mean_nll_{name}_block"] = (
+            _per_sample_mean(mean_scores[name], contributing) if name in mean_scores else unpaired
         )
-    if shuffled_kl_per_t is not None:
-        columns["source_conditioned_kl_shuffled_raw"] = _per_sample_mean(
-            shuffled_kl_per_t, kl_support
-        )
+    columns["mean_pred_gap"] = columns["mean_nll_base_block"] - columns["mean_nll_full_block"]
+    columns["source_conditioned_kl_shuffled_raw"] = (
+        unpaired
+        if shuffled_kl_per_t is None
+        else _per_sample_mean(shuffled_kl_per_t, kl_support)
+    )
 
     # The availability-clock arm. Unconditional -- unlike the permutation controls it needs no
     # second sample in the batch, because the null is a zeroed stream rather than a stranger's --
@@ -2389,7 +2628,7 @@ def evaluate_batch(
         head_averaged_attention, kl_support, lag_validity
     )
     untruncated = untruncated_anchor_mask(
-        seq_len, n_lags, device=kl_support.device
+        seq_len, n_lags, device=kl_support.device, lag_floor=int(getattr(model, "lag_floor", 0))
     ).to(kl_support.dtype)
     attention_profile_untruncated = _per_sample_vector_mean(
         head_averaged_attention, kl_support * untruncated
@@ -2438,7 +2677,8 @@ def evaluate_batch(
     columns["attention_entropy_nats"] = per_head_entropy.mean(dim=-1)
     columns["attention_entropy_attainable_nats"] = _per_sample_mean(
         attainable_lag_entropy(
-            seq_len, n_lags, device=kl_support.device, dtype=kl_support.dtype
+            seq_len, n_lags, device=kl_support.device, dtype=kl_support.dtype,
+            lag_floor=int(getattr(model, "lag_floor", 0)),
         ).expand(batch_size, -1),
         kl_support,
     )
@@ -2484,18 +2724,14 @@ def evaluate_batch(
         selector = (tertile == group).to(gap_by_anchor_channel.dtype)
         per_anchor[f"pred_gap_warm_{name}"] = (gap_by_anchor_channel * selector).sum(dim=2)
     for name in ("base", "full"):
-        if name in scores:
-            per_anchor[f"mc_nll_{name}_block"] = scores[name]
-    if "base" in scores and "full" in scores:
-        per_anchor["mc_pred_gap"] = scores["base"] - scores["full"]
+        per_anchor[f"mc_nll_{name}_block"] = scores[name]
+    per_anchor["mc_pred_gap"] = scores["base"] - scores["full"]
     # The mean-decoded pair per anchor as well, so the per-anchor table recombines into the
     # per-sample one under both estimators and the anchor-level analyses can read the gain the
     # mean forecast bought rather than only the marginalised one.
     for name in ("base", "full"):
-        if name in mean_scores:
-            per_anchor[f"mean_nll_{name}_block"] = mean_scores[name]
-    if "base" in mean_scores and "full" in mean_scores:
-        per_anchor["mean_pred_gap"] = mean_scores["base"] - mean_scores["full"]
+        per_anchor[f"mean_nll_{name}_block"] = mean_scores[name]
+    per_anchor["mean_pred_gap"] = mean_scores["base"] - mean_scores["full"]
 
     # The observation model's calibration census, over the full branch's scored coefficients.
     # Empty under ``'mse'``: the decoder's log-variance head is never fitted there, so a
@@ -2516,6 +2752,13 @@ def evaluate_batch(
     if retain:
         available: Dict[str, torch.Tensor] = dict(outputs)
         available["target"] = target
+        # The forecast pair is the MEAN-DECODED one -- both branches at their latent mean, the
+        # forecasts ``mean_pred_gap`` scores -- rather than the forward's own: that decodes the full
+        # branch at one posterior SAMPLE and, under ``base_decode: mean``, the base branch at the
+        # prior mean, so a figure drawing the two side by side would compare a noisy draw against
+        # a mean and show the draw's noise as the source's effect.
+        for name, (forecast_mu, forecast_logvar) in mean_forecasts.items():
+            available[f"mu_{name}"], available[f"logvar_{name}"] = forecast_mu, forecast_logvar
         # The two raw traces beside the forecast, for the event analyses and the diagnostic page.
         # ``up_raw`` is the only signal in this pipeline the model never sees in raw form -- the
         # source reaches it as scattering and phase channels -- so a contraction can be located
@@ -2657,16 +2900,25 @@ class Aggregate:
 def aggregate_by_recording(readouts: Sequence[BatchReadout]) -> Aggregate:
     r"""Average each column within a recording, then across recordings.
 
-    Not a flat mean over anchors or over segments. Consecutive anchors' $15$-step forecast
-    windows overlap in $14$ of them at the dense evaluation geometry, so anchors within a
-    recording are very far from independent; averaging over them and reporting the result as if it
-    had that many samples behind it overstates the precision of every number here, and weights the
-    headline toward whichever recordings happen to be longest.
+    Not a flat mean over anchors or over segments. Consecutive anchors' $H$-step forecast windows
+    overlap in $H - 1$ of them at the dense evaluation geometry, so anchors within a recording are
+    very far from independent; averaging over them and reporting the result as if it had that many
+    samples behind it overstates the precision of every number here, and weights the headline
+    toward whichever recordings happen to be longest.
 
     The vector readouts of :data:`VECTOR_READOUTS` travel the identical chain, including the
     zero-anchor exclusion. Averaging them per *batch* instead -- which is what a stack-and-mean
     over batches does -- weights each batch equally however many anchors or recordings it held,
     and the per-dimension KL then no longer sums to the headline KL it decomposes.
+
+    The :data:`CONTROL_COLUMNS` are averaged over the samples that carry them -- a sample whose
+    batch had no stranger to pair it with has no control reading, not a zero one -- and a recording
+    none of whose samples was paired leaves them ``NaN`` and out of the mean across recordings.
+    Every other column propagates a ``NaN``, because there it is a fault rather than an absence.
+
+    Each readout is moved to host memory once, as whole columns, rather than read element by
+    element: on an accelerator every scalar read is a device synchronisation, and a real split
+    holds tens of thousands of samples times some seventy columns.
 
     Args:
         readouts: Per-batch readouts.
@@ -2687,42 +2939,55 @@ def aggregate_by_recording(readouts: Sequence[BatchReadout]) -> Aggregate:
         if list(readout.columns) != names:
             raise ValueError(
                 f"batches produced different readout columns: {names} vs "
-                f"{list(readout.columns)}. A batch too small to derange skips the permutation "
-                f"controls, so a run whose last batch has one sample must drop that batch "
-                f"rather than average an inconsistent set."
+                f"{list(readout.columns)}. Every batch writes one column set -- a control that "
+                f"could not pair is NaN, not absent -- so this is two passes' readouts mixed."
             )
+    optional = np.asarray([name in CONTROL_COLUMNS for name in names])
+
+    def _host(values: torch.Tensor) -> np.ndarray:
+        return values.detach().to(device="cpu", dtype=torch.float64).numpy()
 
     # Sums and counts per recording, so a recording split across several batches is one unit.
-    sums: Dict[str, Dict[str, float]] = {}
-    vector_sums: Dict[str, Dict[str, torch.Tensor]] = {}
+    sums: Dict[str, np.ndarray] = {}
+    present: Dict[str, np.ndarray] = {}
+    vector_sums: Dict[str, Dict[str, np.ndarray]] = {}
     counts: Dict[str, int] = {}
     for readout in readouts:
         aggregate.n_samples += len(readout.guids)
+        table = np.stack([_host(readout.columns[name]) for name in names], axis=1)  # (B, N)
+        vectors_of = {name: _host(getattr(readout, name)) for name in VECTOR_READOUTS}
+        n_anchors = _host(readout.n_anchors)
         for position, guid in enumerate(readout.guids):
             # A segment that scored no anchors -- every anchor gapped or below the coverage
             # floor -- measured nothing. Its columns are not small, they are absent: the
             # per-sample mean divides by a denominator clamped to 1, so an empty numerator
-            # reads as exactly 0.0. Averaging that in would pull a summed-(H*C_keep)-coefficient block
-            # score (hundreds of nats) toward zero and shrink pred_gap, with no other symptom.
-            if float(readout.n_anchors[position]) <= 0.0:
+            # reads as exactly 0.0. Averaging that in would pull a summed-(H*C_keep)-coefficient
+            # block score toward zero and shrink pred_gap, with no other symptom.
+            if n_anchors[position] <= 0.0:
                 aggregate.n_samples_without_anchors += 1
                 continue
-            bucket = sums.setdefault(guid, {name: 0.0 for name in names})
+            row = table[position]
+            carried = ~optional | np.isfinite(row)
+            sums[guid] = sums.get(guid, 0.0) + np.where(carried, row, 0.0)
+            present[guid] = present.get(guid, 0) + carried.astype(np.int64)
             counts[guid] = counts.get(guid, 0) + 1
-            for name in names:
-                bucket[name] += float(readout.columns[name][position])
             # The vectors take the identical route -- same exclusion, same per-recording
             # denominator -- which is what keeps a decomposition equal to the scalar it
             # decomposes.
             vectors = vector_sums.setdefault(guid, {})
             for name in VECTOR_READOUTS:
-                row = getattr(readout, name)[position].detach().to(torch.float64)
-                vectors[name] = row.clone() if name not in vectors else vectors[name] + row
+                vector = vectors_of[name][position]
+                vectors[name] = vector.copy() if name not in vectors else vectors[name] + vector
 
-    aggregate.per_recording = {
-        guid: {name: total / counts[guid] for name, total in bucket.items()}
-        for guid, bucket in sums.items()
-    }
+    with np.errstate(invalid="ignore", divide="ignore"):
+        aggregate.per_recording = {
+            guid: {
+                name: float(value)
+                for name, value in zip(names, np.where(present[guid] > 0, total / present[guid],
+                                                       np.nan))
+            }
+            for guid, total in sums.items()
+        }
     if not aggregate.per_recording:
         # Every segment scored zero anchors, so the pass measured nothing. `overall` stays empty,
         # exactly as it does for an empty `readouts` above. Dividing by a denominator clamped to 1
@@ -2731,11 +2996,13 @@ def aggregate_by_recording(readouts: Sequence[BatchReadout]) -> Aggregate:
         # log-variance nothing ever wrote, and `anchor_geometry_intact` would FAIL on a geometry
         # no forward ever ran. Absent lets each verdict reach its own "not measured" branch.
         return aggregate
-    n_recordings = float(len(aggregate.per_recording))
-    aggregate.overall = {
-        name: sum(values[name] for values in aggregate.per_recording.values()) / n_recordings
-        for name in names
-    }
+    per_recording = np.asarray(
+        [[values[name] for name in names] for values in aggregate.per_recording.values()]
+    )
+    carried = ~optional[None, :] | np.isfinite(per_recording)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        across = np.where(carried, per_recording, 0.0).sum(axis=0) / carried.sum(axis=0)
+    aggregate.overall = {name: float(value) for name, value in zip(names, across)}
 
     for name in VECTOR_READOUTS:
         per_recording_vectors = [
@@ -2743,8 +3010,8 @@ def aggregate_by_recording(readouts: Sequence[BatchReadout]) -> Aggregate:
         ]
         if not per_recording_vectors:
             continue
-        across = torch.stack(per_recording_vectors, dim=0).mean(dim=0)
-        setattr(aggregate, name, [float(value) for value in across])
+        across_vector = np.stack(per_recording_vectors, axis=0).mean(axis=0)
+        setattr(aggregate, name, [float(value) for value in across_vector])
     return aggregate
 
 
@@ -2949,8 +3216,6 @@ def lag_summary(
         "kl_lag_compensated_seconds": float(
             lag_compensated_seconds(kl_argmax, delay_steps=delay_steps)
         ),
-        # No sensor-timeline twin of the figure above: the stored UP/FHR timeline is canonical
-        # and the builder's shift is never undone downstream.
         "kl_argmax_lag_step_support_corrected": corrected_argmax,
         "kl_lag_compensated_seconds_support_corrected": (
             None
@@ -3094,9 +3359,11 @@ class Verdict:
 
 
 def _score(overall: Dict[str, float], name: str) -> Optional[float]:
-    """Return a marginalised branch score, or ``None`` when the branch did not run."""
-    value = overall.get(f"mc_nll_{name}_block")
-    return None if value is None else float(value)
+    """Return a marginalised branch score, or ``None`` when the branch did not run.
+
+    A control no batch could pair is ``NaN`` rather than absent, and reads as not run here.
+    """
+    return _finite(overall, f"mc_nll_{name}_block")
 
 
 def _finite(overall: Mapping[str, float], name: str) -> Optional[float]:
@@ -3145,7 +3412,7 @@ def source_specificity_verdict(
     if d_base is None or d_full is None or d_shuffled is None:
         return Verdict(
             "source_specificity", INCONCLUSIVE, criterion,
-            "the permutation control did not run; it needs a batch of at least two samples.",
+            "the permutation control did not run: no batch held a cross-recording pairing.",
             {},
         )
     ordered = d_full < d_base < d_shuffled
@@ -3188,7 +3455,7 @@ def source_margin_verdict(
     if d_full is None or d_shuffled is None:
         return Verdict(
             "source_margin_positive", INCONCLUSIVE, criterion,
-            "the permutation control did not run; it needs a batch of at least two samples.",
+            "the permutation control did not run: no batch held a cross-recording pairing.",
             {},
         )
     margin = float(d_shuffled) - float(d_full)
@@ -3586,8 +3853,8 @@ def build_verdicts(
             Verdict(
                 "prior_carries_target_state", INCONCLUSIVE,
                 f"D_base(shuffled mu_p) - D_base >= {prior_shuffle_min_nats} nats/anchor",
-                "the prior-shuffle control did not run; it needs a batch of at least two "
-                "samples.",
+                "the prior-shuffle control did not run: no batch held a cross-recording "
+                "pairing.",
                 {},
             )
         )
@@ -3873,12 +4140,13 @@ def evaluate(
 ) -> Dict[str, Any]:
     """Evaluate a loaded task over a dataloader and assemble the JSON-shaped results.
 
-    Two kinds of batch are skipped rather than partially scored, because a partially scored batch
-    produces a different set of columns and averaging an inconsistent set together is how a
-    control quietly stops being reported without anything failing: a batch too small to derange,
-    and a batch whose samples come from too few distinct recordings for any pairing to be with a
-    stranger. Both are counted, in batches and in samples -- the second in particular removes a
-    non-random slice, since it is the longest recordings that fill a batch on their own.
+    **Every batch is scored.** Two kinds of batch cannot run the permutation controls -- one too
+    small to derange, and one whose samples come from too few distinct recordings for every pairing
+    to be with a stranger -- and on those the :data:`CONTROL_COLUMNS` alone are ``NaN``; every
+    other readout, table row and analysis still has the samples. Dropping the batch instead would
+    remove them from everything, and not at random: the trailing short batch of a split, and the
+    longest recordings, which are the ones that fill a batch on their own. Both kinds are counted,
+    in batches and in samples, so a control averaged over fewer samples than the rest says so.
 
     Args:
         task: The Lightning task wrapping the loaded net, already in ``eval`` mode.
@@ -3905,23 +4173,19 @@ def evaluate(
     was_training = task.training
     task.eval()
     readouts: List[BatchReadout] = []
-    skipped = 0
+    too_small = 0
     batches_without_partner = 0
     samples_without_partner = 0
     try:
         for batch in loader:
             batch = task.transfer_batch_to_device(batch, task.device, dataloader_idx=0)
             size = batch_size_of(batch)
+            # Counted, not skipped: the batch is scored below and only its control is missing.
             if size < 2:
-                skipped += 1
-                continue
-            recordings = batch_recordings(batch, size)
-            # Tested before the forward, not caught after it: the check is a Counter over a list
-            # of strings, and a batch that cannot be controlled must not cost a decoder pass.
-            if recordings is not None and not controls.groups_can_derange(recordings):
+                too_small += 1
+            elif not control_pairable(size, batch_recordings(batch, size)):
                 batches_without_partner += 1
                 samples_without_partner += size
-                continue
             readout = evaluate_batch(
                 task, batch, num_samples=num_samples,
                 perm_generator=perm_generator, mc_generator=mc_generator, retain=retain,
@@ -3980,7 +4244,8 @@ def evaluate(
     same_recording_pairs = sum(readout.n_same_recording_pairs for readout in readouts)
     return {
         "n_batches": len(readouts),
-        "n_batches_skipped_too_small": skipped,
+        # Scored, with their permutation controls NaN: a single-sample batch has no stranger.
+        "n_batches_skipped_too_small": too_small,
         "n_samples": aggregate.n_samples,
         "n_samples_without_anchors": aggregate.n_samples_without_anchors,
         "n_recordings": aggregate.n_recordings,
@@ -3999,6 +4264,7 @@ def evaluate(
         },
         "units": NORMALISED_UNIT,
         "readouts": dict(aggregate.overall),
+        "mc_error": mc_error_summary(readouts, int(num_samples)),
         "latent_health": latent_health(aggregate),
         "lag": lag_summary(
             aggregate,
@@ -4016,9 +4282,9 @@ def evaluate(
             ),
             "n_control_pairs": control_pairs,
             "n_same_recording_pairs": same_recording_pairs,
-            # A batch too concentrated to pair across recordings is dropped whole. Silently, it
-            # would remove the longest recordings preferentially and shrink every readout that
-            # depends on them, with nothing in the output saying so.
+            # A batch too concentrated to pair across recordings is scored with its control NaN.
+            # Counted because the samples missing from the control are the longest recordings'
+            # -- they fill a batch on their own -- so the control's average leans away from them.
             "n_batches_excluded_no_cross_recording_partner": batches_without_partner,
             "n_samples_excluded_no_cross_recording_partner": samples_without_partner,
         },

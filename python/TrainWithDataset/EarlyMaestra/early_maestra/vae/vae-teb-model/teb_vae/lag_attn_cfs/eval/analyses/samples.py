@@ -12,11 +12,16 @@ gated-input rows, and the five latent and lag rows the layout owns.
 
 **Every selected segment is drawn twice**, from one forward pass -- see :data:`PAGE_VARIANTS`.
 The full page is the fifteen-row one above. The reduced page beside it, named with a ``_compact``
-tail, keeps :data:`~teb_vae.lag_attn_cfs.sample_page.COMPACT_PAGE_ROWS`: the raw context, the
-target block as the encoder receives it, the latent state, $K_t$, and the lag attention on a
-logarithmic colour scale. It answers what this recording's latent and attention did, which is a
-different question from what the model predicted, and eight rows of forecast between the two is
-what makes the full page slow to read for it.
+tail, keeps :data:`~teb_vae.lag_attn_cfs.sample_page.COMPACT_PAGE_ROWS`: the raw FHR and UP, the
+forecast lanes (truth against both branches, their bands, the scored-horizon mask), both input
+streams, the latent state and its shift, $K_t$, and both lag maps -- the whole segment at a
+glance, without the per-channel field rows.
+
+**Pages are comparable across segments.** The raw traces sit on fixed physiological ranges and
+the normalised coefficient maps on one fixed range, both set by the page builder; the latent, KL,
+attention, skill and $\sigma$ rows take the limits :func:`shared_row_limits` computes **once per
+run**, from the collection's own tables, before the first page is drawn -- so one colour is one
+value on every page of the run, whichever selection it sits in.
 
 Three draws, and they answer different questions:
 
@@ -32,6 +37,9 @@ Three draws, and they answer different questions:
 * **The extremes.** ``per_sample.csv`` sorted by each headline metric, head and tail. This is what
   turns an outlier in a distribution into a recording somebody can inspect, and it can only be
   done after the pass: the rows are chosen by a table that did not exist while the pass ran.
+
+A segment picked by more than one draw is rendered once and its files copied into the other
+directories, so the two copies are the same picture rather than two stochastic forwards.
 
 **This is one of the two analyses that touch the model**, and it is worth being explicit about why
 the alternative does not work. A page needs the entire forward output of one segment -- and here
@@ -55,8 +63,9 @@ A pass with no checkpoint has no model to render with, and records a skip.
 from __future__ import annotations
 
 import re
+import shutil
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -65,6 +74,7 @@ from loguru import logger
 
 from teb_vae.lag_attn_cfs.eval import figures_seam as figures
 from teb_vae.lag_attn_cfs.eval._reuse import labels, subsample_indices
+from teb_vae.lag_attn_cfs.eval.cohort import SECONDS_PER_HOUR
 from teb_vae.lag_attn_cfs.eval.dataset_rows import (
     check_identity,
     dataset_index_map,
@@ -99,12 +109,23 @@ CLASS_DIRNAME = "by_class"
 #: The manifest of what was rendered and what failed.
 MANIFEST_FILENAME = "sample_pages.csv"
 
-#: The manifest's columns: which selection and variant a file is, and **whose** it is -- the
-#: recording, its segment epoch, and the cohort the recording belongs to on both axes. The
-#: identity travels here so a directory of pages can be filtered by subgroup without opening one,
-#: and so a page whose filename carries only the GUID can be traced back to its cohort.
+#: The readouts a page's title prints, read off the row rather than re-scored. The manifest
+#: carries them too, so a directory of pages can be sorted by any of them without opening one.
+PAGE_SCALARS: Tuple[str, ...] = (
+    "nll_base_block", "nll_full_block", "pred_gap", "mc_pred_gap", "mean_pred_gap",
+    "source_conditioned_kl_raw",
+)
+
+#: The manifest's columns: which selection and variant a file is, the file names of **both**
+#: variants of its segment, and **whose** it is -- the dataset index the filename carries, the
+#: recording, the cohort it belongs to on both axes, its segment epoch in seconds and its place
+#: before delivery in hours -- followed by :data:`PAGE_SCALARS`. The identity travels here so a
+#: directory of pages can be filtered by subgroup without opening one, and so a page whose
+#: filename carries only the GUID can be traced back to its cohort.
 MANIFEST_COLUMNS: Tuple[str, ...] = (
-    "selection", "variant", "file", "guid", "epoch", labels.CLASS_COLUMN, labels.SUBGROUP_COLUMN,
+    "selection", "variant", "file", "full_file", "compact_file", "dataset_index", "guid",
+    labels.SUBGROUP_COLUMN, labels.CLASS_COLUMN, "epoch", "hours_before_delivery",
+    *PAGE_SCALARS,
 )
 
 #: How many pages the stratified draw renders when ``eval_config.caps.pages`` says nothing, and
@@ -113,8 +134,9 @@ MANIFEST_COLUMNS: Tuple[str, ...] = (
 #:
 #: Ten per selection, so every directory under ``samples/`` holds the same number and a reader
 #: comparing two of them is comparing like with like. ``EXTREME_PAGES_PER_TAIL`` is an **upper**
-#: bound rather than a promise -- see :func:`extreme_rows`, which lowers it rather than let the two
-#: tails of one metric overlap.
+#: bound rather than a promise -- ``caps.pages`` lowers it too, so a capped run is capped
+#: everywhere, and :func:`extreme_rows` lowers it rather than let the two tails of one metric
+#: overlap.
 DEFAULT_STRATIFIED_PAGES = 10
 EXTREME_PAGES_PER_TAIL = 10
 
@@ -177,19 +199,108 @@ COMPACT_SUFFIX = f"_{COMPACT_VARIANT}"
 #: forward pass -- see :func:`render_pages` -- so the reduced page costs drawing and nothing
 #: else, and the two cannot describe different states of the model.
 #:
-#: The reduced page is the one to open when the question is what the latent and the attention
-#: did; the full one carries the eight forecast rows as well. Its lag attention is drawn on a
-#: **logarithmic** colour scale, which the full page's is not: on a page that leads with the lag
-#: panel the small weights are the content, and a linear scale flattens them under whichever lag
-#: happens to dominate.
+#: The reduced page is the one-glance summary; the full one adds the per-channel field rows, the
+#: per-window score and the per-dimension KL. Both draw the lag attention on the same
+#: **logarithmic** colour scale, so one colour is one weight on either: the weights are spread
+#: over every lag, and a linear scale flattens them under whichever lag happens to dominate.
 PAGE_VARIANTS: Tuple[Tuple[str, Optional[Tuple[str, ...]], bool], ...] = (
-    (FULL_VARIANT, None, False),
+    (FULL_VARIANT, None, True),
     (COMPACT_VARIANT, COMPACT_PAGE_ROWS, True),
 )
 
 #: How many rows the reduced page has. Recorded in the analysis's ``plan`` for the same reason
 #: :data:`EXPECTED_PAGE_ROWS` is: a row silently lost from a PDF is visible nowhere else.
 EXPECTED_COMPACT_PAGE_ROWS = len(COMPACT_PAGE_ROWS)
+
+#: Percentile of a run-wide distribution that a shared page limit is taken at. High enough that a
+#: page's own content almost never saturates, low enough that one outlying anchor of one segment
+#: cannot flatten every other page of the run into the bottom of the colour map.
+SHARED_LIMIT_PERCENTILE = 99.5
+
+#: A latent row's half-width in multiples of the run's per-segment RMS of that quantity. The
+#: tables carry the RMS rather than the elements, and three of them spans nearly all of a
+#: roughly Gaussian latent while leaving its structure well away from saturation.
+LATENT_RMS_MULTIPLE = 3.0
+
+
+def shared_row_limits(collection: Any) -> Dict[str, float]:
+    r"""The colour limits every page of a run shares, from the collection's own tables.
+
+    Computed once, before the first page is drawn, over the **whole split** rather than over the
+    pages: the pages are a handful of extremes and a draw, and a scale fitted to them would move
+    with the draw. Each limit is the :data:`SHARED_LIMIT_PERCENTILE` percentile of its quantity:
+
+    * ``kld_total`` and ``kld_dims`` -- $K_t$ per anchor (``per_anchor.kld_per_t``); the
+      per-dimension map shares it, so one dimension carrying all of $K_t$ reads at full colour.
+      ``kld_total`` is a line, which a percentile would clip, so it takes the run's **maximum**;
+    * ``kl_lag_map`` and ``lag_attn`` -- the per-anchor lag maps' cells, and ``lag_attn_floor``
+      the low percentile of the positive attention weights, the bottom of the log scale;
+    * ``latent`` and ``latent_shift`` -- :data:`LATENT_RMS_MULTIPLE` times the per-segment RMS of
+      $\mu^p$ and of $\mu^q-\mu^p$;
+    * ``pred_error``, ``pred_skill`` and ``pred_sigma`` -- $|Y^{+}-\mu^q|$,
+      $\bigl||Y^{+}-\mu^p|-|Y^{+}-\mu^q|\bigr|$ and $\sigma^q$ over the retained forecast blocks,
+      when the run retained any.
+
+    Args:
+        collection: The collection the pages are drawn beside.
+
+    Returns:
+        Row name to limit, holding only the limits with a finite positive value -- a missing one
+        leaves that row scaled to its own page, which is what the builder does without any.
+    """
+    per_anchor = getattr(collection, "per_anchor", None)
+    per_sample = getattr(collection, "per_sample", None)
+    vectors = getattr(collection, "anchor_vectors", None) or {}
+    retained = getattr(collection, "retained", None) or {}
+
+    def column(frame: Any, name: str) -> Optional[np.ndarray]:
+        """A table column as floats, or ``None`` where the table does not carry it."""
+        if frame is None or name not in getattr(frame, "columns", ()):
+            return None
+        return frame[name].to_numpy(dtype=float)
+
+    kl = column(per_anchor, "kld_per_t")
+    attention = vectors.get("attention_lag_map")
+    top, bottom = SHARED_LIMIT_PERCENTILE, 100.0 - SHARED_LIMIT_PERCENTILE
+    # Row name to (values, multiple, percentile).
+    sources: Dict[str, Tuple[Any, float, float]] = {
+        "kld_total": (kl, 1.05, 100.0),
+        "kld_dims": (kl, 1.0, top),
+        "kl_lag_map": (vectors.get("kl_lag_map"), 1.0, top),
+        "lag_attn": (attention, 1.0, top),
+        "lag_attn_floor": (
+            None if attention is None else attention[np.asarray(attention) > 0.0], 1.0, bottom
+        ),
+        "latent": (column(per_sample, "mu_prior_rms"), LATENT_RMS_MULTIPLE, top),
+        "latent_shift": (column(per_sample, "delta_mu_rms"), LATENT_RMS_MULTIPLE, top),
+    }
+    if {"target", "mu_base", "mu_full"} <= set(retained):
+        target = np.asarray(retained["target"], dtype=np.float32)
+        full_error = np.abs(target - np.asarray(retained["mu_full"], dtype=np.float32))
+        sources["pred_error"] = (full_error, 1.0, top)
+        sources["pred_skill"] = (
+            np.abs(np.abs(target - np.asarray(retained["mu_base"], dtype=np.float32)) - full_error),
+            1.0,
+            top,
+        )
+    if "logvar_full" in retained:
+        sources["pred_sigma"] = (
+            np.exp(0.5 * np.asarray(retained["logvar_full"], dtype=np.float32)), 1.0, top
+        )
+
+    limits: Dict[str, float] = {}
+    for name, (values, multiple, percentile) in sources.items():
+        if values is None:
+            continue
+        # In the array's own precision: the retained blocks are the one large input here.
+        flat = np.asarray(values).ravel()
+        finite = flat[np.isfinite(flat)]
+        if not finite.size:
+            continue
+        edge = float(multiple) * float(np.percentile(finite, percentile))
+        if edge > 0.0:
+            limits[name] = edge
+    return limits
 
 
 def page_filename(index: int, guid: Any, epoch: Any, *, compact: bool = False) -> str:
@@ -308,7 +419,9 @@ def render_pages(
     delay_steps: int,
     normalization: Optional[Dict[str, Any]],
     seams: Dict[str, Any],
-) -> Tuple[List[Dict[str, str]], List[Dict[str, Any]], Optional[int]]:
+    row_limits: Optional[Mapping[str, float]] = None,
+    rendered: Optional[Dict[int, Dict[str, Path]]] = None,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], Optional[int]]:
     """Render every page variant of every row, recording any that fail rather than losing the rest.
 
     Args:
@@ -316,22 +429,30 @@ def render_pages(
         loader: The evaluation dataloader, for its dataset and collation.
         rows: Resolved rows carrying ``dataset_index``, ascending.
         directory: Where the pages go; created if absent.
-        delay_steps: The model's causal input delay, for the compensated lag axes.
+        delay_steps: The model's causal input delay, for the lag axes.
         normalization: The loader's statistics, so the raw-context row renders in physical units.
         seams: The task's three page seams, from :func:`page_seams`.
+        row_limits: The run's shared colour limits, from :func:`shared_row_limits`, or ``None``
+            to scale every page to itself.
+        rendered: Dataset index to ``{variant: path}`` of segments an earlier selection of the
+            same run already drew. A segment found here is **copied** rather than drawn again:
+            the forward is stochastic, so a second render would put two different pictures of
+            one segment in two directories, and it would double the analysis's only real cost.
+            Updated in place with every segment this call draws in full. ``None`` renders
+            everything.
 
     Returns:
-        ``(written, failures, input rows drawn)``. ``written`` carries one
-        ``{'variant', 'file'}`` entry per **file** -- every one of :data:`PAGE_VARIANTS` for
-        every row that rendered -- so the manifest indexes the whole directory rather than half
-        of it. A failure carries its dataset index, its variant and the error, so a page that
-        could not be drawn is a recorded absence rather than a gap nobody notices. The third
-        element is how many gated-input rows the seam actually produced -- ``None`` when no page
-        was rendered, and **measured rather than assumed**, because it is what decides whether
-        the page has the rows a reader expects.
+        ``(written, failures, input rows drawn)``. ``written`` carries one :func:`page_record`
+        per **file** -- every one of :data:`PAGE_VARIANTS` for every row that rendered -- so the
+        manifest indexes the whole directory rather than half of it. A failure carries its
+        dataset index, its variant and the error, so a page that could not be drawn is a
+        recorded absence rather than a gap nobody notices. The third element is how many
+        gated-input rows the seam actually produced -- ``None`` when no page was drawn here, and
+        **measured rather than assumed**, because it is what decides whether the page has the
+        rows a reader expects.
     """
     directory.mkdir(parents=True, exist_ok=True)
-    written: List[Dict[str, str]] = []
+    written: List[Dict[str, Any]] = []
     failures: List[Dict[str, Any]] = []
     n_input_rows: Optional[int] = None
     if not len(rows):
@@ -343,6 +464,12 @@ def render_pages(
     for position, batch in enumerate(pages):
         row = rows.iloc[position]
         index = int(row["dataset_index"])
+        drawn = (rendered or {}).get(index)
+        if drawn:
+            for variant, source in drawn.items():
+                shutil.copy2(source, directory / source.name)
+                written.append(page_record(row, variant, source.name))
+            continue
         # The forward is separated from the drawing so that both variants come off **one** dict. A
         # second forward would double this analysis's model time, and -- the real reason -- would
         # let two pages of one segment disagree about what the model did.
@@ -374,6 +501,7 @@ def render_pages(
         # One try per variant rather than one around both: a reduced page that fails must not turn
         # a full page that already wrote into a recorded failure. They are independent drawings of
         # the same forward, and a run is better off with one of them than with neither.
+        files: Dict[str, Path] = {}
         for variant, page_rows, log_lag_attention in PAGE_VARIANTS:
             name = page_filename(
                 index, row["guid"], row["epoch"], compact=variant == COMPACT_VARIANT
@@ -414,9 +542,15 @@ def render_pages(
                     forecast_extra_rows=seams["forecast_extra_rows"],
                     rows=page_rows,
                     log_lag_attention=log_lag_attention,
+                    row_limits=row_limits,
+                    page_title=page_title(row, index),
                 )
-                page = figures.render_figure(figure, directory / name)
-                written.append({"variant": variant, "file": page.name, **page_identity(row)})
+                # Laid out by the builder's own GridSpec, and written uncropped: every page of the
+                # run is then the same size in the same place, so two of them overlay row for row.
+                figures.mark_laid_out(figure)
+                page = figures.render_figure(figure, directory / name, crop=False)
+                files[variant] = page
+                written.append(page_record(row, variant, page.name))
             except Exception as error:  # noqa: BLE001 - one page is not worth the rest of them
                 logger.warning(
                     f"{ANALYSIS_DIRNAME}: {variant} page for dataset index {index} failed: "
@@ -425,33 +559,95 @@ def render_pages(
                 failures.append({"dataset_index": index, "guid": str(row["guid"]),
                                  "variant": variant,
                                  "error": f"{type(error).__name__}: {error}"})
+        if rendered is not None and len(files) == len(PAGE_VARIANTS):
+            rendered[index] = files
     return written, failures, n_input_rows
 
 
 def page_scalars(row: Any) -> Dict[str, float]:
     """Return the readouts the page's title carries, from the row rather than from a re-scoring."""
-    names = (
-        "nll_base_block", "nll_full_block", "pred_gap", "mc_pred_gap", "mean_pred_gap",
-        "source_conditioned_kl_raw",
-    )
     return {
         name: float(row[name])
-        for name in names
+        for name in PAGE_SCALARS
         if name in row.index and np.isfinite(float(row[name]))
     }
 
 
+def _label(row: Any, column: str) -> Optional[str]:
+    """A row's label in ``column`` as text, or ``None`` where it is absent or missing."""
+    if column in row.index and not pd.isna(row[column]):
+        return str(row[column])
+    return None
+
+
 def cohort_label(row: Any) -> Optional[str]:
-    """The cohort a page's segment belongs to, for its title: the subgroup, which names the class.
+    """The cohort a page's segment belongs to: the subgroup, which names the class.
 
     The subgroup stem (``healthy_bg_no_cs``, ``acidosis_cs``, ...) already carries the clinical
     class as its prefix, so it is the one label that says both. ``None`` when the row carries
-    no subgroup, which the title then omits rather than printing a placeholder.
+    neither, which the title then omits rather than printing a placeholder.
     """
-    for column in (labels.SUBGROUP_COLUMN, labels.CLASS_COLUMN):
-        if column in row.index and not pd.isna(row[column]):
-            return str(row[column])
-    return None
+    return _label(row, labels.SUBGROUP_COLUMN) or _label(row, labels.CLASS_COLUMN)
+
+
+def hours_before_delivery(epoch: Any) -> float:
+    r"""A segment's place on the delivery clock, $h = -\mathrm{epoch}/3600$, or ``NaN``."""
+    stamp = epoch_stamp(epoch)
+    return float("nan") if stamp is None else -float(stamp) / SECONDS_PER_HOUR
+
+
+def page_title(row: Any, index: int) -> str:
+    """The first line of a page's title: which segment of which recording, from which cohort.
+
+    The dataset index is the one in the filename, so a page and its file name agree; the
+    subgroup and the clinical class are both named, because a page of an extreme is read for
+    whose it is before anything else; and the epoch is given with its place before delivery.
+
+    Args:
+        row: The resolved row the page is drawn from.
+        index: Its dataset index.
+
+    Returns:
+        The line.
+    """
+    stamp = epoch_stamp(row["epoch"])
+    when = (
+        "epoch n/a" if stamp is None
+        else f"epoch {stamp} s ({hours_before_delivery(stamp):.2f} h before delivery)"
+    )
+    return (
+        f"dataset sample {int(index):04d} — guid {row['guid']} — subgroup "
+        f"{_label(row, labels.SUBGROUP_COLUMN) or 'n/a'} — class "
+        f"{_label(row, labels.CLASS_COLUMN) or 'n/a'} — {when}"
+    )
+
+
+def page_record(row: Any, variant: str, file: str) -> Dict[str, Any]:
+    """One manifest row: the file, both variants' names, the segment's identity and its readouts.
+
+    Args:
+        row: The resolved row the page was drawn from, carrying ``dataset_index``.
+        variant: Which of :data:`PAGE_VARIANTS` the file is.
+        file: The file's name as written.
+
+    Returns:
+        Every :data:`MANIFEST_COLUMNS` entry but ``selection``, which the caller adds. The pair's
+        names are derived from :func:`page_filename` and the run's format, so the full page's
+        record names its compact twin and the other way round.
+    """
+    index = int(row["dataset_index"])
+    return {
+        "variant": variant,
+        "file": file,
+        "full_file": figures.figure_filename(page_filename(index, row["guid"], row["epoch"])),
+        "compact_file": figures.figure_filename(
+            page_filename(index, row["guid"], row["epoch"], compact=True)
+        ),
+        **page_identity(row),
+        "dataset_index": index,
+        "hours_before_delivery": hours_before_delivery(row["epoch"]),
+        **{name: float(row[name]) if name in row.index else float("nan") for name in PAGE_SCALARS},
+    }
 
 
 def page_identity(row: Any) -> Dict[str, Any]:
@@ -460,16 +656,8 @@ def page_identity(row: Any) -> Dict[str, Any]:
     return {
         "guid": str(row["guid"]),
         "epoch": float(row["epoch"]) if np.isfinite(float(row["epoch"])) else float("nan"),
-        labels.CLASS_COLUMN: (
-            str(row[labels.CLASS_COLUMN])
-            if labels.CLASS_COLUMN in row.index and not pd.isna(row[labels.CLASS_COLUMN])
-            else None
-        ),
-        labels.SUBGROUP_COLUMN: (
-            str(row[labels.SUBGROUP_COLUMN])
-            if labels.SUBGROUP_COLUMN in row.index and not pd.isna(row[labels.SUBGROUP_COLUMN])
-            else None
-        ),
+        labels.CLASS_COLUMN: _label(row, labels.CLASS_COLUMN),
+        labels.SUBGROUP_COLUMN: _label(row, labels.SUBGROUP_COLUMN),
     }
 
 
@@ -643,6 +831,11 @@ def run_samples_analysis(
     seams = page_seams(task)
     normalization = raw_trace_normalization(loader)
     index_map = dataset_index_map(loader)
+    # Before the first page, over the whole split, so every page of the run shares one scale.
+    row_limits = shared_row_limits(collection)
+    # A capped run is capped in every selection, the extremes included.
+    per_tail = min(EXTREME_PAGES_PER_TAIL, cap)
+    rendered: Dict[int, Dict[str, Path]] = {}
 
     manifest: List[Dict[str, Any]] = []
     failures: List[Dict[str, Any]] = []
@@ -665,6 +858,7 @@ def run_samples_analysis(
         records, failed, observed = render_pages(
             task, loader, rows, directory / selection,
             delay_steps=delay_steps, normalization=normalization, seams=seams,
+            row_limits=row_limits, rendered=rendered,
         )
         manifest.extend({"selection": selection, **record} for record in records)
         failures.extend({"selection": selection, **entry} for entry in failed)
@@ -692,7 +886,7 @@ def run_samples_analysis(
 
     missing: List[str] = []
     for stem, column in EXTREME_METRICS:
-        tails = extreme_rows(per_sample, column, per_tail=EXTREME_PAGES_PER_TAIL)
+        tails = extreme_rows(per_sample, column, per_tail=per_tail)
         if not len(tails["low"]) and not len(tails["high"]):
             missing.append(column)
             continue
@@ -728,7 +922,11 @@ def run_samples_analysis(
             "capped": True, "cap": int(cap), "seed": seed,
             "pages_per_class": int(per_class),
             "page_variants": [variant for variant, _, _ in PAGE_VARIANTS],
-            "extreme_pages_per_tail": int(EXTREME_PAGES_PER_TAIL),
+            "extreme_pages_per_tail": int(per_tail),
+            # The shared scales every page of this run was drawn on, and the percentile they were
+            # taken at, so a colour on a page can be turned back into a number.
+            "row_limits": dict(row_limits),
+            "shared_limit_percentile": SHARED_LIMIT_PERCENTILE,
             "anchor_phase": DENSE_ANCHOR_GEOMETRY[0],
             "anchor_stride": DENSE_ANCHOR_GEOMETRY[1],
             # Which of the task's seams resolved, and how many rows the page therefore has. A seam

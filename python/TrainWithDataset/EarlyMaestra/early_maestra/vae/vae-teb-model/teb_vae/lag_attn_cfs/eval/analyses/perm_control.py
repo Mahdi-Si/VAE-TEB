@@ -62,6 +62,10 @@ ANALYSIS_DIRNAME = "perm_control"
 #: What it writes.
 PER_RECORDING_FILENAME = "perm_control_per_recording.csv"
 SUMMARY_FILENAME = "perm_control_summary.csv"
+#: The three paired controls -- the two penalties and the source margin -- with their intervals and
+#: tests. Their own table rather than rows of the branch summary: a branch row is one block score,
+#: a control row is a per-recording difference of two, and one schema cannot carry both honestly.
+PENALTIES_FILENAME = "perm_control_penalties.csv"
 
 #: The four branch scores the ordering is read from, marginalised, in reporting order.
 BRANCH_COLUMNS: Tuple[Tuple[str, str], ...] = (
@@ -311,6 +315,7 @@ def run_perm_control_analysis(
     branch_rows = build_branch_rows(per_guid, resamples=resamples, seed=seed)
     penalty_rows = build_penalty_rows(per_guid, resamples=resamples, seed=seed)
     pd.DataFrame(branch_rows).to_csv(directory / SUMMARY_FILENAME, index=False)
+    pd.DataFrame(penalty_rows).to_csv(directory / PENALTIES_FILENAME, index=False)
 
     scores = {row["branch"]: row["mean"] for row in branch_rows}
 
@@ -349,5 +354,5 @@ def run_perm_control_analysis(
         "grouped_frames": [
             grouped_frame_entry(ANALYSIS_DIRNAME, PER_RECORDING_FILENAME, GROUPED_METRICS)
         ],
-        "files": [PER_RECORDING_FILENAME, SUMMARY_FILENAME],
+        "files": [PER_RECORDING_FILENAME, SUMMARY_FILENAME, PENALTIES_FILENAME],
     }

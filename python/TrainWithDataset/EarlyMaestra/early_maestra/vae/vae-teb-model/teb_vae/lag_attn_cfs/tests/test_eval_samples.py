@@ -586,6 +586,75 @@ def test_one_failing_page_is_recorded_by_index_and_the_rest_still_render(
     )
 
 
+def test_a_segment_two_draws_picked_is_drawn_once_and_copied(tmp_path, monkeypatch) -> None:
+    """The forward is stochastic, so a second render of one segment would put two different
+    pictures of it in two directories -- and cost the analysis's only real time twice."""
+    from matplotlib.figure import Figure
+
+    calls = {"n": 0}
+
+    def counting(**kwargs):
+        calls["n"] += 1
+        return Figure()
+
+    monkeypatch.setattr(samples_analysis, "build_diagnostic_figure", counting)
+    monkeypatch.setattr(
+        samples_analysis, "model_inputs", lambda task, batch: (None, None, None, None, None)
+    )
+    rows = pd.DataFrame({"guid": ["g1"], "epoch": [-1000.0], "dataset_index": [1]})
+    rendered: Dict[int, Dict[str, Path]] = {}
+    for selection in ("first", "second"):
+        written, failures, _ = samples_analysis.render_pages(
+            _FakeTask(), _loader(2), rows, tmp_path / selection,
+            delay_steps=0, normalization=None, seams=_no_seams(), rendered=rendered,
+        )
+        assert failures == [] and len(written) == len(samples_analysis.PAGE_VARIANTS)
+
+    assert calls["n"] == len(samples_analysis.PAGE_VARIANTS)
+    assert sorted(p.name for p in (tmp_path / "first").iterdir()) == sorted(
+        p.name for p in (tmp_path / "second").iterdir()
+    )
+    # Every record names both files of the pair and where the segment sits before delivery.
+    record = written[0]
+    assert record["full_file"].endswith(".pdf") and "_compact" in record["compact_file"]
+    assert record["hours_before_delivery"] == pytest.approx(1000.0 / 3600.0)
+    assert record["dataset_index"] == 1
+
+
+def test_the_page_title_names_the_segment_its_cohort_and_its_place_before_delivery() -> None:
+    """The title carries the dataset index the filename carries -- not the batch position, which
+    is always 0 on a page drawn one segment at a time -- and both cohort labels."""
+    row = pd.Series({
+        "guid": "G1", "epoch": -9000.0, labels.SUBGROUP_COLUMN: "hie_cs",
+        labels.CLASS_COLUMN: "hie",
+    })
+    title = samples_analysis.page_title(row, 24)
+
+    assert "sample 0024" in title and "guid G1" in title
+    assert "subgroup hie_cs" in title and "class hie" in title
+    assert "2.50 h before delivery" in title
+
+
+def test_the_shared_limits_come_from_the_whole_split() -> None:
+    """One set per run, so a colour means one value on every page; the $K_t$ line takes the
+    maximum (a percentile would clip it) and a quantity the tables lack is simply absent."""
+    per_anchor = pd.DataFrame({"kld_per_t": np.linspace(0.0, 2.0, 201)})
+    per_sample = pd.DataFrame({"mu_prior_rms": [1.0, 1.0], "delta_mu_rms": [0.01, 0.02]})
+    attention = np.full((201, 4), 0.25)
+    collection = types.SimpleNamespace(
+        per_anchor=per_anchor, per_sample=per_sample,
+        anchor_vectors={"attention_lag_map": attention}, retained={},
+    )
+    limits = samples_analysis.shared_row_limits(collection)
+
+    assert limits["kld_total"] == pytest.approx(2.0 * 1.05)
+    assert limits["kld_dims"] < limits["kld_total"]
+    assert limits["lag_attn"] == pytest.approx(0.25)
+    assert limits["latent"] == pytest.approx(samples_analysis.LATENT_RMS_MULTIPLE)
+    assert 0.0 < limits["latent_shift"] < limits["latent"]
+    assert "kl_lag_map" not in limits and "pred_skill" not in limits
+
+
 # =================================================================================================
 # The analysis
 # =================================================================================================

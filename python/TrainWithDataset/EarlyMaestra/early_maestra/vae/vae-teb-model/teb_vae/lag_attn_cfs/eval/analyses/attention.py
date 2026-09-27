@@ -4,8 +4,8 @@ Three things this reports that a head-averaged profile against $\log L$ cannot.
 
 **Per head.** The posterior is head-structured: latent group $m$ is written by attention head $m$
 alone, which is what makes the per-head KL an additive decomposition rather than an arbitrary
-slice. Averaging the four heads before profiling discards exactly that -- four heads attending at
-four different delays and one attending everywhere produce the same head-averaged profile. So the
+slice. Averaging the $M$ heads before profiling discards exactly that -- heads attending at
+different delays and one attending everywhere produce the same head-averaged profile. So the
 per-head profiles, the per-head entropies and the per-head KL travel separately, and the
 head-averaged profile is emitted beside them **named as such** rather than as "the" profile.
 
@@ -38,9 +38,11 @@ Either way all three profiles travel together.
 in the emitted record: the coefficients come from a one-sided bank whose composed group delay is
 the same order as the lag search, so an attention peak's position is not a physiological latency.
 
-The lag heatmap needs the attention weights themselves, which are $427$ KiB per sample and
+The lag heatmap needs the attention weights themselves, $(T, M, L)$ per sample, and they are
 therefore retained only under ``eval_config.caps.attention``. A run that did not ask for them
-emits no heatmap: the absence is silence rather than failure.
+emits no heatmap: the absence is silence rather than failure. The heatmap names the recording it
+draws -- GUID, subgroup, clinical class and the segment's time before delivery -- because a
+retained row index identifies nothing outside the run.
 """
 from __future__ import annotations
 
@@ -109,8 +111,8 @@ GROUPED_METRICS: Tuple[str, ...] = VALUE_COLUMNS
 #:
 #: $10^{-6}$ discriminates with room to spare. The smallest truncation this could hide is one
 #: anchor of $A$ seeing $L - 1$ lags instead of $L$, which moves the mean by
-#: $(\log L - \log(L-1))/A$ -- about $7 \times 10^{-5}$ at $A = 137$, $L = 91$: two orders of
-#: magnitude above the bound.
+#: $(\log L - \log(L-1))/A \approx 1/(LA)$ -- orders of magnitude above the bound at any geometry
+#: this family runs, where $LA$ is a few thousand.
 CEILING_TOLERANCE = 1e-6
 
 
@@ -457,12 +459,17 @@ def _shade_truncated(axis: Any, seconds: np.ndarray, truncation: Dict[str, Any])
 
 
 def build_heatmap_figure(
-    attention: np.ndarray, *, row: int, delay_steps: int, geometry: Dict[str, Any]
+    attention: np.ndarray,
+    *,
+    row: int,
+    delay_steps: int,
+    geometry: Dict[str, Any],
+    identity: str = "",
 ) -> Any:
     r"""Draw one retained recording's attention as an anchor $\times$ lag field.
 
     Head-averaged, because the panel is about *when* rather than *which head*: the per-head
-    resolution is in the profile figure, where four curves are readable and four heatmaps are not.
+    resolution is in the profile figure, where $M$ curves are readable and $M$ heatmaps are not.
 
     ``interpolation='none'`` rather than the default resampling: this is a vector output whose
     reader is expected to index a cell, and a resampled cell boundary can land half a cell from
@@ -473,6 +480,8 @@ def build_heatmap_figure(
         row: Which retained sample to draw.
         delay_steps: The causal input delay, for the lag axis.
         geometry: The collection record's geometry block, for the time axis.
+        identity: Which recording and segment the row is -- GUID, subgroup, class and position --
+            for the title. Empty falls back to the retained row index.
 
     Returns:
         The figure; the caller renders and closes it.
@@ -492,7 +501,10 @@ def build_heatmap_figure(
     # the training callback's lag panels already use.
     figures.heatmap_with_colorbar(
         figure, axes[0, 0], field.T[::-1],
-        title=f"Attention by anchor and lag, retained sample row {row} (head-averaged)",
+        title=(
+            "Attention by anchor and lag, head-averaged: "
+            + (identity or f"retained sample row {row}")
+        ),
         xlabel="time in segment (s)",
         ylabel=figures.COEFFICIENT_LAG_AXIS_LABEL,
         symmetric=False,
@@ -622,6 +634,12 @@ def run_attention_analysis(
                 "attention_lag_compensated_seconds_untruncated"
             ),
             "restricted_to_anchors_from": truncation["first_untruncated_anchor"],
+            # A peak on the longest searched lag is censored by the window rather than located:
+            # the true maximum may lie beyond it. Stated beside the argmax so it is not read alone.
+            "raw_at_window_edge": _at_edge(lag.get("attention_argmax_lag_step"), n_lags),
+            "untruncated_at_window_edge": _at_edge(
+                lag.get("attention_argmax_lag_step_untruncated"), n_lags
+            ),
         },
         "kld_per_head": per_head_kl(lag),
         "kld_per_head_total_nats": lag.get("kld_per_head_total_nats"),
@@ -632,6 +650,13 @@ def run_attention_analysis(
             PROFILE_FILENAME, PER_HEAD_FILENAME, ENTROPY_FILENAME, PER_RECORDING_FILENAME
         ] + written,
     }
+
+
+def _at_edge(argmax: Any, n_lags: int) -> Optional[bool]:
+    """Whether an argmax sits on the longest searched lag; ``None`` when there is no argmax."""
+    if argmax is None or n_lags <= 1:
+        return None
+    return bool(int(argmax) == int(n_lags) - 1)
 
 
 def per_head_kl(lag: Dict[str, Any]) -> List[float]:
@@ -671,6 +696,45 @@ def _emit_heatmap(
     # Row 0 is a uniform draw rather than a prefix: the retention plan is already a seeded
     # stratified sample over the whole split.
     figure = build_heatmap_figure(
-        np.asarray(attention), row=0, delay_steps=delay_steps, geometry=geometry
+        np.asarray(attention), row=0, delay_steps=delay_steps, geometry=geometry,
+        identity=retained_identity(collection, ATTENTION_CAP, 0),
     )
     return str(figures.render_figure(figure, directory / HEATMAP_FIGURE).name)
+
+
+def retained_identity(collection: Any, quantity: str, row: int) -> str:
+    """Name the segment one retained row is: GUID, subgroup, clinical class and clock position.
+
+    Through the retained ``<quantity>_sample_index`` array, which maps a retained row onto the
+    per-sample table's ``sample_index`` -- the only key a retained array carries.
+
+    Args:
+        collection: What the pass produced.
+        quantity: The retention quantity, e.g. :data:`ATTENTION_CAP`.
+        row: The retained row.
+
+    Returns:
+        ``"<guid> (<subgroup>, <class>), segment starting <h> h before delivery"``, or an empty
+        string when the row cannot be traced.
+    """
+    retained = dict(getattr(collection, "retained", None) or {})
+    positions = retained.get(f"{quantity}_sample_index")
+    per_sample = getattr(collection, "per_sample", None)
+    if positions is None or per_sample is None or "sample_index" not in per_sample.columns:
+        return ""
+    positions = np.asarray(positions).reshape(-1)
+    if row >= positions.size:
+        return ""
+    match = per_sample[per_sample["sample_index"] == int(positions[row])]
+    if match.empty:
+        return ""
+    first = match.iloc[0]
+    cohorts = ", ".join(
+        str(first[name]) for name in ("subgroup", "clinical_class")
+        if name in match.columns and isinstance(first[name], str)
+    )
+    text = str(first.get("guid", "?")) + (f" ({cohorts})" if cohorts else "")
+    epoch = pd.to_numeric(pd.Series([first.get("epoch")]), errors="coerce").iloc[0]
+    if np.isfinite(epoch):
+        text += f", segment starting {-float(epoch) / 3600.0:.2f} h before delivery"
+    return text

@@ -163,8 +163,8 @@ def attach_lag_seconds_axis(ax: Any, step_seconds: float, offset_seconds: float 
     Maps a decimated lag index $\ell$ to $s\,\ell + o$, so the lag panels read in both model-lag
     and second coordinates. The offset $o$ exists for one legitimate use: a page whose source
     channels are read $\delta$ steps stale passes $o = \Delta\delta$ so lag $0$ is labelled at
-    the delay it already carries. It is **never** a dataset UP shift: the stored timeline is
-    canonical and the builder's shift is part of the signal, so no caller may pass one.
+    the delay it already carries. No other offset is legitimate: the stored timeline is
+    canonical.
 
     Non-fatal by design: any matplotlib error is swallowed, because this is called from a
     training callback where a failed axis decoration must not take down a run.

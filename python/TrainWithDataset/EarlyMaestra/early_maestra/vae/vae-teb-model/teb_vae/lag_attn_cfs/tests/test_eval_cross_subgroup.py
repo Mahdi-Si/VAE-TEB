@@ -268,3 +268,33 @@ def test_every_source_that_cannot_be_satisfied_yet_is_recorded_rather_than_raise
     )
 
 
+def test_the_pairs_of_a_surviving_metric_are_corrected_as_their_own_family(tmp_path) -> None:
+    """The omnibus gate protects the pairs only at three cohorts; past that, every raw pairwise
+    p has to be read against its own Holm-adjusted value."""
+    groups = ("hie_cs", "acidosis_cs", "healthy_bg_cs", "healthy_no_bg_cs")
+    _write_frame(
+        tmp_path, _SOURCE,
+        {name: [10.0 * rank + step for step in range(5)] for rank, name in enumerate(groups)},
+    )
+
+    record = analysis.analyse_metrics(tmp_path, sources=(_SOURCE,))
+    pairs = record["pairwise"][_SOURCE.name]
+
+    assert len(pairs) == 6
+    assert all(item["p_holm"] >= item["p_value"] for item in pairs)
+    assert max(item["p_holm"] for item in pairs) > max(item["p_value"] for item in pairs)
+
+
+def test_a_run_where_nothing_survived_still_writes_a_pairwise_header(tmp_path) -> None:
+    """An empty pairwise table is a finding and has to be readable as one: a zero-byte CSV is
+    unreadable by ``pd.read_csv`` and indistinguishable from a write that failed."""
+    _write_frame(
+        tmp_path, _SOURCE,
+        {"healthy_bg_cs": [1.0, 1.1, 1.2, 1.3], "acidosis_cs": [1.05, 1.15, 1.25, 1.35]},
+    )
+
+    analysis.run_cross_subgroup_analysis(None, eval_config={}, output_dir=tmp_path, probe=None)
+    pairs = pd.read_csv(tmp_path / analysis.ANALYSIS_DIRNAME / analysis.PAIRWISE_FILENAME)
+
+    assert pairs.empty
+    assert list(pairs.columns) == list(analysis.PAIRWISE_COLUMNS)

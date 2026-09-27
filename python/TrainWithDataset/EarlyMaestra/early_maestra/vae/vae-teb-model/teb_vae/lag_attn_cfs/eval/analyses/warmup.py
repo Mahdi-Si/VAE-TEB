@@ -153,7 +153,7 @@ GROUPED_METRICS: Tuple[str, ...] = TERTILE_COLUMNS + WARMTH_COLUMNS
 #: as a defect. It cites the design record rather than restating its argument.
 WARMTH_EXPECTATION = (
     "a small warmth fraction is the expected finding on this cell rather than a fault: the source "
-    "blocks' causal warm-ups are long against the 91-step lag window, so most of the searched lag "
+    "blocks' causal warm-ups are long against the lag window, so most of the searched lag "
     "range reads source steps that are still settling. See lag_attn_cfs/DESIGN.md section 8. The "
     "number is here to be compared across arms, not to be passed."
 )
@@ -369,8 +369,14 @@ def write_budget_figures(config: Dict[str, Any], directory: Any) -> Dict[str, An
         }
 
     horizon = int(vae_config["horizon"])
+    # The run's own format, passed explicitly: both writers default to PDF for the training
+    # driver, and an evaluation that asked for ``eval_config.figure_format`` must not get a PDF
+    # beside every other figure in that format. Read off the one place the run's format lives.
+    file_format = figures.figure_filename("x").rsplit(".", 1)[-1]
     written = [
-        write_warmup_budget_figure(budget, Path(directory), horizon=horizon).name,
+        write_warmup_budget_figure(
+            budget, Path(directory), horizon=horizon, file_format=file_format
+        ).name,
         write_tradeoff_figure(
             budget_tradeoff(
                 budget.target.declared_warmup_steps,
@@ -380,6 +386,7 @@ def write_budget_figures(config: Dict[str, Any], directory: Any) -> Dict[str, An
             ),
             Path(directory),
             shipped_budget=budget.budget_steps,
+            file_format=file_format,
         ).name,
     ]
     return {

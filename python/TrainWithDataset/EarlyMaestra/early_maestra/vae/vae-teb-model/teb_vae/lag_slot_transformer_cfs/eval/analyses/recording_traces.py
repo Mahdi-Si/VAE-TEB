@@ -14,6 +14,7 @@ from typing import Any, Dict, Optional
 from loguru import logger
 
 from teb_vae.lag_attn_cfs.eval._reuse import labels
+from teb_vae.lag_attn_cfs.eval import traces
 from teb_vae.lag_attn_cfs.eval.traces import ANALYSIS_DIRNAME
 from teb_vae.lag_slot_transformer_cfs.eval import recording_traces as stage
 
@@ -60,6 +61,7 @@ def run_recording_traces_analysis(
         task, loader, identities,
         eval_config=dict(eval_config), results_dir=output_dir,
         geometry_record=dict((getattr(collection, "record", None) or {}).get("geometry") or {}),
+        raw_scales=traces.raw_signal_scales(getattr(context, "config", None), loader),
     )
     return {
         # Segments traced, or None when the stage drew nothing: a capped analysis reports what it

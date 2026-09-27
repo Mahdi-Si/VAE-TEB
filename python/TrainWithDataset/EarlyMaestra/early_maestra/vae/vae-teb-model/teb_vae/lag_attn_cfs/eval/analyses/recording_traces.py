@@ -56,6 +56,7 @@ from teb_vae.lag_attn_cfs.eval.dataset_rows import (
 )
 from teb_vae.lag_attn_cfs.eval.metrics import (
     DENSE_ANCHOR_GEOMETRY,
+    NORMALISED_UNIT,
     anchor_support,
     attention_entropy,
     batch_field,
@@ -94,7 +95,8 @@ KL_AGREEMENT_TOLERANCE = 1e-3
 #: collected. A segment the cap left uncollected carries ``NaN`` on both.
 CLOCK_COLUMNS: Tuple[str, ...] = ("time_from_labor_onset", cohort.SECOND_STAGE_COLUMN)
 
-#: The rows of every recording's figure, top to bottom. Every model quantity is at the anchor
+#: The model rows of every recording's figure, top to bottom, under the raw FHR and UP rows the
+#: figure leads with (:func:`~teb_vae.lag_attn_cfs.eval.traces.build_recording_figure`). Every model quantity is at the anchor
 #: step against hours before delivery, so a column is the same anchor on every row; the joined
 #: forecast gap is the only row read off the collection pass rather than off the re-read forward.
 PANELS: Tuple[Any, ...] = (
@@ -296,6 +298,7 @@ def trace_recording(
     *,
     clinical_class: Optional[str],
     subgroup: Optional[str],
+    raw_scales: Optional[Dict[str, Tuple[float, float]]] = None,
 ) -> List[traces.SegmentTrace]:
     """Re-read every segment of one recording and reduce each forward to a trace.
 
@@ -305,6 +308,8 @@ def trace_recording(
         rows: The recording's rows from :func:`recording_rows`, ascending in ``dataset_index``.
         clinical_class: The recording's class.
         subgroup: The recording's subgroup.
+        raw_scales: From :func:`~teb_vae.lag_attn_cfs.eval.traces.raw_signal_scales`, so the raw
+            rows are drawn in physical units; ``None`` keeps loader units, labelled so.
 
     Returns:
         The segment traces, in dataset order; the caller sorts them by ``epoch``.
@@ -330,7 +335,7 @@ def trace_recording(
             model, outputs, weight, batch_rows,
             clinical_class=clinical_class, subgroup=subgroup,
         )
-        traces.attach_raw_signals(segment_traces, batch)
+        traces.attach_raw_signals(segment_traces, batch, raw_scales)
         gathered.extend(segment_traces)
     return gathered
 
@@ -428,6 +433,7 @@ def run_recording_traces_analysis(
     record = dict(getattr(collection, "record", None) or {})
     break_after_s = lag_axis.break_tolerance_s(record)
 
+    raw_scales = traces.raw_signal_scales(getattr(context, "config", None), loader)
     window_hours = eval_config.get("max_hours_before_delivery")
     # The bound the run reads its clocks over: only the segments recorded within it are traced,
     # counted for eligibility, or drawn from, so a bounded run's traces describe the population
@@ -441,6 +447,9 @@ def run_recording_traces_analysis(
     anchor_frames: List[pd.DataFrame] = []
     summary_frames: List[pd.DataFrame] = []
     lag_seconds: Optional[np.ndarray] = None
+    # Figures are drawn after every recording is traced, so each panel can share one scale across
+    # them all and two recordings' pages compare by eye: (recording, destination, manifest row).
+    pending: List[Tuple[Any, Path, int]] = []
     for _, choice in chosen.iterrows():
         guid = str(choice["guid"])
         clinical_class = choice[labels.CLASS_COLUMN]
@@ -453,7 +462,8 @@ def run_recording_traces_analysis(
             continue
         try:
             segments = trace_recording(
-                task, loader, rows, clinical_class=clinical_class, subgroup=subgroup
+                task, loader, rows, clinical_class=clinical_class, subgroup=subgroup,
+                raw_scales=raw_scales,
             )
             if lag_seconds is None:
                 n_lags = int(segments[0].vectors["kl_lag_map"].shape[-1])
@@ -471,12 +481,6 @@ def run_recording_traces_analysis(
             arrays = traces.write_recording_arrays(
                 class_dir / f"{stem}{traces.FULL_ARRAYS_SUFFIX}.npz", recording,
                 lag_seconds=lag_seconds,
-            )
-            figure = figures.render_figure(
-                traces.build_recording_figure(
-                    recording, panels=PANELS, lag_seconds=lag_seconds, caveat=lag_axis.GROUP_DELAY_CAVEAT
-                ),
-                class_dir / f"{stem}{traces.TRACE_FIGURE_SUFFIX}",
             )
             dashboard = traces_html.write_recording_dashboard(
                 traces_html.build_recording_dashboard(
@@ -502,10 +506,26 @@ def run_recording_traces_analysis(
                 "n_contributing": int(recording.anchors["contributing"].sum()),
                 "span_hours": float(span.max() - span.min()) if len(span) else float("nan"),
                 "arrays_file": Path(arrays).relative_to(directory).as_posix(),
-                "figure_file": Path(figure).relative_to(directory).as_posix(),
+                "figure_file": None,
                 "dashboard_file": Path(dashboard).relative_to(directory).as_posix(),
             }
         )
+        pending.append((recording, class_dir / f"{stem}{traces.TRACE_FIGURE_SUFFIX}", len(manifest) - 1))
+
+    scales = traces.shared_panel_scales([recording for recording, _, _ in pending], PANELS)
+    for recording, destination, row in pending:
+        try:
+            figure = figures.render_figure(
+                traces.build_recording_figure(
+                    recording, panels=PANELS, lag_seconds=lag_seconds,
+                    caveat=lag_axis.GROUP_DELAY_CAVEAT, scales=scales,
+                ),
+                destination,
+            )
+            manifest[row]["figure_file"] = Path(figure).relative_to(directory).as_posix()
+        except Exception as error:  # noqa: BLE001 - one figure is not worth the rest of them
+            logger.warning(f"{ANALYSIS_DIRNAME}: figure for {recording.guid} failed: {error}")
+            failures.append({"guid": recording.guid, "error": f"{type(error).__name__}: {error}"})
 
     anchors = pd.concat(anchor_frames, ignore_index=True) if anchor_frames else pd.DataFrame()
     summary = pd.concat(summary_frames, ignore_index=True) if summary_frames else pd.DataFrame()
@@ -553,6 +573,13 @@ def run_recording_traces_analysis(
             "break_tolerance_s": float(break_after_s),
             "max_hours_before_delivery": None if window_hours is None else float(window_hours),
             "max_hours_before_delivery_applied": window_hours is not None,
+            # The unit each raw row is drawn in: physical when the loader's statistics were read.
+            "raw_units": {
+                name: traces.RAW_SIGNAL_UNITS[name] if name in raw_scales else NORMALISED_UNIT
+                for name in traces.RAW_SIGNAL_FIELDS
+            },
+            # The one colour-scale top (heatmaps) or y range (lines) every recording's page shares.
+            "panel_scales": scales,
         },
         "selection": accounting,
         "recordings": manifest,

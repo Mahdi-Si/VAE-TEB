@@ -529,9 +529,14 @@ def test_the_analysis_writes_its_tables_and_figure(tmp_path) -> None:
     for name in (
         coupling_analysis.PER_RECORDING_FILENAME,
         coupling_analysis.SUMMARY_FILENAME,
+        coupling_analysis.AGREEMENT_FILENAME,
         figure_filename(coupling_analysis.DISTRIBUTION_FIGURE),
     ):
         assert (directory / name).is_file(), name
+    # One agreement row per estimator pair, the same block the record carries.
+    agreement = pd.read_csv(directory / coupling_analysis.AGREEMENT_FILENAME)
+    assert len(agreement) == len(coupling_analysis.AGREEMENT_PAIRS)
+    assert len(result["estimator_agreement"]) == len(coupling_analysis.AGREEMENT_PAIRS)
     # One row per recording, not per segment.
     assert len(pd.read_csv(directory / coupling_analysis.PER_RECORDING_FILENAME)) == 3
     assert result["composition"]["n_recordings"] == 3

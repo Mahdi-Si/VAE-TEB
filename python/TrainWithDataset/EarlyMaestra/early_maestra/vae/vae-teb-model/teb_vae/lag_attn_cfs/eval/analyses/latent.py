@@ -118,25 +118,35 @@ GROUPED_METRICS: Tuple[str, ...] = (
 
 
 def spectrum_frame(
-    kld_per_dimension: Sequence[float], *, threshold: float = KLD_ACTIVE_EPS
+    kld_per_dimension: Sequence[float],
+    *,
+    threshold: float = KLD_ACTIVE_EPS,
+    num_heads: int = 0,
 ) -> pd.DataFrame:
-    """Lay the per-dimension KL out as a table, sorted by how much each dimension carries.
+    r"""Lay the per-dimension KL out as a table, sorted by how much each dimension carries.
 
     Args:
         kld_per_dimension: The chained per-dimension KL, in latent-dimension order.
         threshold: The activity threshold a dimension must clear to count as carrying anything.
+        num_heads: The attention head count $M$. The posterior is head-structured -- latent group
+            $m$ is dimensions $[m\,d_z/M, (m+1)\,d_z/M)$, written by head $m$ alone -- so each
+            dimension's head is a column whenever $M$ divides $d_z$; that is what says whether a
+            concentrated spectrum is one head's group. ``0`` omits the column.
 
     Returns:
-        One row per latent dimension -- its index, its KL, its share of the total, whether it is
-        active, and its rank. Sorted descending, because the question the spectrum answers is
-        "how many dimensions carry this" and that is read off the head of a sorted list.
+        One row per latent dimension -- its index, its head where known, its KL, its share of the
+        total, whether it is active, and its rank. Sorted descending, because the question the
+        spectrum answers is "how many dimensions carry this" and that is read off the head of a
+        sorted list.
     """
     values = np.asarray(list(kld_per_dimension), dtype=np.float64)
+    grouped = int(num_heads) > 0 and values.size % int(num_heads) == 0
+    columns = ["dimension", *(["head"] if grouped else []), "kl_nats", "share", "active", "rank"]
     if values.size == 0:
-        return pd.DataFrame(columns=["dimension", "kl_nats", "share", "active", "rank"])
+        return pd.DataFrame(columns=columns)
     total = float(values.sum())
     order = np.argsort(-values)
-    return pd.DataFrame(
+    frame = pd.DataFrame(
         {
             "dimension": order.astype(int),
             "kl_nats": values[order],
@@ -145,6 +155,9 @@ def spectrum_frame(
             "rank": np.arange(values.size, dtype=int),
         }
     )
+    if grouped:
+        frame["head"] = order // (values.size // int(num_heads))
+    return frame[columns]
 
 
 def build_diagnostic_rows(
@@ -247,7 +260,14 @@ def run_latent_analysis(
     directory.mkdir(parents=True, exist_ok=True)
 
     health = dict(results.get("latent_health") or {})
-    spectrum = spectrum_frame(health.get("kld_per_dimension") or [])
+    # The threshold the pass itself counted active dimensions against, so the spectrum's
+    # ``active`` column and the health block's ``active_dims`` cannot disagree.
+    threshold = float(health.get("activity_threshold_nats", KLD_ACTIVE_EPS))
+    spectrum = spectrum_frame(
+        health.get("kld_per_dimension") or [],
+        threshold=threshold,
+        num_heads=int((results.get("lag") or {}).get("num_heads") or 0),
+    )
     spectrum.to_csv(directory / SPECTRUM_FILENAME, index=False)
 
     columns = [name for name, _ in DIAGNOSTIC_COLUMNS] + list(_KL_COLUMNS)
@@ -261,7 +281,7 @@ def run_latent_analysis(
 
     figure_name = str(
         figures.render_figure(
-            build_spectrum_figure(spectrum), directory / SPECTRUM_FIGURE
+            build_spectrum_figure(spectrum, threshold=threshold), directory / SPECTRUM_FIGURE
         ).name
     )
     verdicts = {
@@ -274,7 +294,7 @@ def run_latent_analysis(
         "composition": {"n_recordings": int(len(per_guid))},
         "plan": {"capped": False, "bootstrap_resamples": resamples, "seed": seed},
         "health": health,
-        "activity_threshold_nats": float(KLD_ACTIVE_EPS),
+        "activity_threshold_nats": threshold,
         "diagnostics": diagnostic_rows,
         # The clamp and the margin the fractions above were measured against, read from the model
         # that produced them rather than from a config file that may since have changed.

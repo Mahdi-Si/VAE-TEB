@@ -278,9 +278,12 @@ def test_the_vector_readouts_are_blanked_on_the_same_rule_as_the_scalars(trained
     batch = _labelled_batch(["a", "b"])
     batch.weight[0] = 0.0
 
-    vectors = _collect(trained_task, [batch]).vectors
+    collection = _collect(trained_task, [batch])
+    vectors = collection.vectors
 
-    assert set(vectors) == set(VECTOR_READOUTS)
+    # The readouts, plus the key the sidecar joins on.
+    assert set(vectors) == set(VECTOR_READOUTS) | {"sample_index"}
+    assert vectors["sample_index"].tolist() == collection.per_sample["sample_index"].tolist()
     for name in ("kld_per_dim", "gap_per_channel", "sq_error_per_channel_full"):
         assert np.isnan(vectors[name][0]).all(), name
         assert np.isfinite(vectors[name][1]).all(), name
@@ -497,16 +500,19 @@ def test_the_horizon_accumulator_is_exact_against_full_retention(trained_task):
     model = trained_task.orig_model
     streamed = {}
     kept = {"target": [], "mu_full": [], "logvar_full": [], "mask": []}
+    # The pass's own forward, captured as it runs: the accumulator sums the TRAINING-PATH
+    # forecast, while the retained pair is the mean-decoded one a figure draws.
+    forwards = []
+    handle = model.register_forward_hook(lambda _module, _inputs, output: forwards.append(output))
 
     def _sink(batch, readout):
+        outputs = forwards[-1]
         for name, value in readout.horizon_sums.items():
             streamed[name] = streamed.get(name, 0.0) + value.to(torch.float64)
-        for name in ("target", "mu_full", "logvar_full"):
-            kept[name].append(readout.retained[name])
-        y_st, y_ph, u_stream, _target_features, weight = model_inputs(trained_task, batch)
-        phase, stride = DENSE_ANCHOR_GEOMETRY
-        with torch.no_grad():
-            outputs = model(y_st, y_ph, u_stream, anchor_phase=phase, anchor_stride=stride)
+        kept["target"].append(readout.retained["target"])
+        kept["mu_full"].append(outputs["mu_full"])
+        kept["logvar_full"].append(outputs["logvar_full"])
+        _y_st, _y_ph, _u_stream, _target_features, weight = model_inputs(trained_task, batch)
         mask, _coverage = forecast_mask(
             weight, model.geometry, coverage_floor=model.coverage_floor,
             anchors=outputs["anchor_index"], anchor_valid=outputs["anchor_valid"],
@@ -514,15 +520,18 @@ def test_the_horizon_accumulator_is_exact_against_full_retention(trained_task):
         kept["mask"].append(mask)
 
     torch.manual_seed(_SEED)
-    evaluate(
-        trained_task,
-        _StubLoader(batches),
-        num_samples=1,
-        perm_generator=torch.Generator().manual_seed(_SEED),
-        mc_generator=torch.Generator().manual_seed(_SEED),
-        retain=("target", "mu_full", "logvar_full"),
-        on_batch=_sink,
-    )
+    try:
+        evaluate(
+            trained_task,
+            _StubLoader(batches),
+            num_samples=1,
+            perm_generator=torch.Generator().manual_seed(_SEED),
+            mc_generator=torch.Generator().manual_seed(_SEED),
+            retain=("target",),
+            on_batch=_sink,
+        )
+    finally:
+        handle.remove()
 
     reference = horizon_residual_sums(
         torch.cat(kept["mu_full"]),
@@ -733,6 +742,17 @@ def test_the_per_anchor_vector_sidecar_is_row_aligned_with_the_per_anchor_table(
     with pytest.raises(TablesProvenanceMismatch, match="kl_lag_map"):
         load_collection(tmp_path)
 
+    # The per-sample sidecar is aligned the same way and refused the same way.
+    from teb_vae.lag_attn_cfs.eval.collect import VECTORS_FILENAME
+
+    np.savez_compressed(tmp_path / PER_ANCHOR_VECTORS_FILENAME, **collection.anchor_vectors)
+    np.savez_compressed(
+        tmp_path / VECTORS_FILENAME,
+        **{name: rows[:-1] for name, rows in collection.vectors.items()},
+    )
+    with pytest.raises(TablesProvenanceMismatch, match="kld_per_dim"):
+        load_collection(tmp_path)
+
 
 # =================================================================================================
 # Discovery and provenance
@@ -825,6 +845,24 @@ def test_tables_collected_under_other_settings_are_refused(
             checkpoint_path=checkpoint,
             eval_config=dict(eval_config, **changed),
             num_samples=num_samples,
+        )
+
+
+def test_a_smoke_runs_tables_are_not_reused_as_a_full_run(tmp_path, trained_task):
+    """``--max-batches`` decides the population as surely as ``max_samples`` does and lives outside
+    ``eval_config``, so it must be on the provenance record: otherwise a smoke run's handful of
+    batches would be read back as the full split's tables with nothing failing."""
+    checkpoint, eval_config = _provenance_inputs(tmp_path)
+    _write_tables(trained_task, tmp_path / "run", checkpoint, eval_config)
+
+    with pytest.raises(TablesProvenanceMismatch, match="max-batches"):
+        load_or_collect(
+            tmp_path / "run",
+            lambda: pytest.fail("should not collect"),
+            checkpoint_path=checkpoint,
+            eval_config=eval_config,
+            num_samples=1,
+            max_batches=1,
         )
 
 

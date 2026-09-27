@@ -4,12 +4,15 @@ Two numbers carry the whole claim of this architecture, and both are reported he
 question is asked in -- one recording, one observation.
 
 **``pred_gap``** $= D_{\mathrm{base}} - D_{\mathrm{full}}$, in nats per anchor: how many nats the
-source-conditioned forecast saves over the target-only one. It comes in two flavours and they are
-never merged. The **headline** is the Monte Carlo marginalised difference,
+source-conditioned forecast saves over the target-only one. It comes from three estimators and
+they are never merged. The **gate's headline** is the Monte Carlo marginalised difference,
 $D = -[\operatorname{logsumexp}_r(-D_r) - \log K]$, the log of the average likelihood over $K$
-latent draws. The **training-path** column is one draw scored through the objective's own
-functions, and sits beside it as the parity check -- the two agree to the extent that $K$ draws
-were enough, and their difference is the cost of the marginalisation rather than a second answer.
+latent draws. The **mean-decoded** one decodes both branches at their latent mean, with no draw --
+whether the mean forecast improved, independent of either branch's latent spread -- and is what
+the figures foreground. The **training-path** column is the objective's own single-draw reduction
+and sits beside them as the parity check. How far the three agree, recording by recording, is
+reported as its own block (:func:`estimator_agreement`), because two estimators with the same
+mean can still disagree in sign on most recordings.
 
 **``source_conditioned_kl_raw``** $= \bar K$, the unfloored KL between the two latents. Unfloored
 because only that value is a rate: ``source_conditioned_kl_train`` has free bits applied per
@@ -90,6 +93,7 @@ ANALYSIS_DIRNAME = "coupling"
 #: What it writes.
 PER_RECORDING_FILENAME = "coupling_per_recording.csv"
 SUMMARY_FILENAME = "coupling_summary.csv"
+AGREEMENT_FILENAME = "coupling_estimator_agreement.csv"
 
 #: The figures, named as ``FIGURE_GUIDE.md`` names them.
 DISTRIBUTION_FIGURE = "pred_gap_distribution"
@@ -208,17 +212,18 @@ PERCENT_COLUMNS: Tuple[Tuple[str, str], ...] = (
     ),
     (
         "pred_gap_mc_likelihood_pct",
-        "likelihood space: 100 * (exp(mc_pred_gap / (H*C_keep)) - 1), how much more probability "
-        "density the source-conditioned forecast puts on each observed target coefficient. "
-        "H*C_keep is the fixed block width, not a per-anchor scored-coefficient count, so this "
-        "understates the improvement on any anchor with masked forecast steps; and C_keep is "
-        "whatever the warm-up budget left standing, so the percentage is budget-local and two "
-        "runs' values are comparable only where their block widths are",
+        "likelihood space: 100 * (exp(mc_pred_gap / n_cells) - 1), how much more probability "
+        "density the source-conditioned forecast puts on each observed target coefficient, with "
+        "n_cells the scored cells of one anchor's block (H*C_keep, fewer under a per-channel "
+        "scored horizon). A fixed per-anchor count, so it understates the improvement on any "
+        "anchor whose validity mask dropped forecast steps; and C_keep is whatever the warm-up "
+        "budget left standing, so the percentage is budget-local and two runs' values are "
+        "comparable only where their scored-cell counts are",
     ),
     (
         "pred_gap_mean_likelihood_pct",
-        "likelihood space: 100 * (exp(mean_pred_gap / (H*C_keep)) - 1), the same per-coefficient "
-        "density ratio on the mean-decoded gap, with the same fixed-block-width and budget-local "
+        "likelihood space: 100 * (exp(mean_pred_gap / n_cells) - 1), the same per-coefficient "
+        "density ratio on the mean-decoded gap, with the same scored-cell and budget-local "
         "caveats",
     ),
 )
@@ -587,6 +592,64 @@ def _shade_mean_interval(axis: Any, row: Dict[str, Any]) -> None:
     axis.legend(fontsize=figures.FONT_LABEL, loc="best")
 
 
+#: The estimator pairs whose per-recording agreement is reported, ``(x, y)``: the foregrounded
+#: mean-decoded gap against the gate's marginalised one and against the training-path parity
+#: column, and the gate's against the parity column.
+AGREEMENT_PAIRS: Tuple[Tuple[str, str], ...] = (
+    ("pred_gap_mc_nats", PRIMARY_PRED_GAP),
+    ("pred_gap_train_path_nats", PRIMARY_PRED_GAP),
+    ("pred_gap_train_path_nats", "pred_gap_mc_nats"),
+)
+
+
+def pair_agreement(per_guid: pd.DataFrame, x_estimator: str, y_estimator: str) -> Dict[str, Any]:
+    r"""How far two ``pred_gap`` estimators agree, recording by recording. Descriptive only.
+
+    Spearman's $\rho$ over recordings, the share of recordings on which the two have the same
+    sign, and the mean and median of the per-recording difference $y - x$ -- the last because
+    two estimators can rank recordings identically while one sits a constant above the other.
+
+    Args:
+        per_guid: Per-recording means.
+        x_estimator: A key of :data:`ESTIMATOR_LABELS`.
+        y_estimator: Another.
+
+    Returns:
+        ``{x, y, n_recordings, spearman_rho, same_sign_share, mean_difference_nats,
+        median_difference_nats}``; ``NaN`` where fewer than three recordings carry both (for
+        $\rho$) or none do (for the rest).
+    """
+    columns = {name: column for name, column, _ in PRED_GAP_COLUMNS}
+    x = finite_column(per_guid, columns[x_estimator])
+    y = finite_column(per_guid, columns[y_estimator])
+    both = np.isfinite(x) & np.isfinite(y)
+    x, y = x[both], y[both]
+    rho = float("nan")
+    if x.size >= 3:
+        # Lazily, as every SciPy use in this package is: a box without it loses one number.
+        try:
+            from scipy.stats import spearmanr
+
+            rho = float(spearmanr(x, y)[0])
+        except Exception:  # noqa: BLE001 - a missing SciPy must not lose the block
+            rho = float("nan")
+    difference = y - x
+    return {
+        "x": x_estimator,
+        "y": y_estimator,
+        "n_recordings": int(x.size),
+        "spearman_rho": rho,
+        "same_sign_share": float(np.mean(np.sign(x) == np.sign(y))) if x.size else float("nan"),
+        "mean_difference_nats": float(difference.mean()) if x.size else float("nan"),
+        "median_difference_nats": float(np.median(difference)) if x.size else float("nan"),
+    }
+
+
+def estimator_agreement(per_guid: pd.DataFrame) -> List[Dict[str, Any]]:
+    """The agreement of every pair in :data:`AGREEMENT_PAIRS`, for the record and the CSV."""
+    return [pair_agreement(per_guid, x, y) for x, y in AGREEMENT_PAIRS]
+
+
 def _draw_agreement_panel(
     ax: Any,
     per_guid: pd.DataFrame,
@@ -639,20 +702,12 @@ def _draw_agreement_panel(
     )
     ax.axhline(0.0, color=figures.COLOR_GRAY, linestyle=":", linewidth=figures.LINE_THIN, zorder=1)
     ax.axvline(0.0, color=figures.COLOR_GRAY, linestyle=":", linewidth=figures.LINE_THIN, zorder=1)
-    agreement = float(np.mean(np.sign(x) == np.sign(y)))
-    rho = float("nan")
-    if x.size >= 3:
-        # Lazily, as every SciPy use in this package is: a box without it loses one number in a
-        # title and nothing else.
-        try:
-            from scipy.stats import spearmanr
-
-            rho = float(spearmanr(x, y)[0])
-        except Exception:  # noqa: BLE001 - a missing SciPy must not lose the figure
-            rho = float("nan")
+    # The same numbers the record and the summary CSV carry, from the one function that computes
+    # them, so the panel title cannot quote a different agreement from the table beside it.
+    agreement = pair_agreement(per_guid, x_estimator, y_estimator)
     ax.set_title(
-        f"{title}\nSpearman rho = {rho:.2f}, same sign on {agreement:.0%} of {x.size} "
-        f"recordings (descriptive)"
+        f"{title}\nSpearman rho = {agreement['spearman_rho']:.2f}, same sign on "
+        f"{agreement['same_sign_share']:.0%} of {x.size} recordings (descriptive)"
     )
     ax.set_xlabel(f"{x_estimator} (nats per anchor)")
     ax.set_ylabel(f"{y_estimator} (nats per anchor)")
@@ -844,6 +899,8 @@ def run_coupling_analysis(
     pd.DataFrame(gap_rows + percent_rows + kl_rows).to_csv(
         directory / SUMMARY_FILENAME, index=False
     )
+    agreement = estimator_agreement(per_guid)
+    pd.DataFrame(agreement).to_csv(directory / AGREEMENT_FILENAME, index=False)
 
     figure_names = [
         str(
@@ -871,6 +928,9 @@ def run_coupling_analysis(
             "likelihood_space": support,
         },
         "kl": kl_rows,
+        # How far the three estimators agree recording by recording -- descriptive, and the same
+        # numbers the two agreement scatters carry in their titles.
+        "estimator_agreement": agreement,
         # Declared, not emitted: the by-class and by-subgroup variants are the runner's fan-out
         # over this frame, which carries one row per recording and the cohort each belongs to.
         "grouped_frames": [
@@ -883,5 +943,5 @@ def run_coupling_analysis(
                 stem=GROUPED_KL_STEM,
             ),
         ],
-        "files": [PER_RECORDING_FILENAME, SUMMARY_FILENAME, *figure_names],
+        "files": [PER_RECORDING_FILENAME, SUMMARY_FILENAME, AGREEMENT_FILENAME, *figure_names],
     }

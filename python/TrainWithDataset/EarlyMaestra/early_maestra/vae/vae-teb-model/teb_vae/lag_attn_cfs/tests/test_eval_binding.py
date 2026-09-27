@@ -27,7 +27,12 @@ import yaml
 
 from teb_vae.lag_attn_cfs.eval import preflight, report_seam
 from teb_vae.lag_attn_cfs.eval import run as run_module
-from teb_vae.lag_attn_cfs.eval.binding import CFS_BINDING, GEOMETRY_KEYS, ModelBinding
+from teb_vae.lag_attn_cfs.eval.binding import (
+    CFS_BINDING,
+    COLLECTION_HEADLINE_BLOCKS,
+    GEOMETRY_KEYS,
+    ModelBinding,
+)
 from teb_vae.lag_attn_cfs.nets.model import SeqVaeLagAttnCfs
 
 from .conftest import _REPO_ROOT
@@ -157,7 +162,9 @@ def test_every_registered_headline_path_is_keyed_all_the_way_down() -> None:
     for name, path in CFS_BINDING.headline_scalars:
         assert path, name
         assert all(isinstance(step, str) for step in path), (name, path)
-        assert path[0] in CFS_BINDING.extra_analyses, (name, path)
+        assert path[0] in CFS_BINDING.extra_analyses or path[0] in COLLECTION_HEADLINE_BLOCKS, (
+            name, path,
+        )
 
 
 def test_every_registered_headline_path_resolves_against_the_blocks_the_analyses_return() -> None:
@@ -165,6 +172,8 @@ def test_every_registered_headline_path_resolves_against_the_blocks_the_analyses
     end-to-end fixture asserts the same paths against a real run's results, which is where a path
     that resolves on a stub and not in reality would fail."""
     results = {
+        # The collection pass's own block (``metrics.mc_error_summary``), not an analysis's.
+        "mc_error": {"pred_gap_mc_se_nats": 0.02, "pred_gap_mc_half_k_nats": 0.4},
         "warmup": {
             "headline": {
                 "pred_gap_warm_lo_nats": 0.1,

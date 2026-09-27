@@ -106,9 +106,11 @@ def resolve_rows(
     """
     if not len(rows) or not index_map:
         return rows.head(0).assign(dataset_index=pd.Series(dtype=np.int64))
+    # Zipped columns rather than ``iterrows``, which builds a Series per row: the traces resolve
+    # every segment of every chosen recording through here.
     resolved = [
-        index_map.get((str(row["guid"]), epoch_stamp(row["epoch"])))
-        for _, row in rows.iterrows()
+        index_map.get((str(guid), epoch_stamp(epoch)))
+        for guid, epoch in zip(rows["guid"], rows["epoch"])
     ]
     frame = rows.copy()
     frame["dataset_index"] = pd.Series(resolved, index=frame.index, dtype="Int64")

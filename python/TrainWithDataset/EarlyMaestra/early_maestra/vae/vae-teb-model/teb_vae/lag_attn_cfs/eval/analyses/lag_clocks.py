@@ -86,7 +86,7 @@ from loguru import logger
 from teb_vae.lag_attn_cfs.eval import cohort
 from teb_vae.lag_attn_cfs.eval import figures_seam as figures
 from teb_vae.lag_attn_cfs.eval._reuse import labels, stats as shared_stats
-from teb_vae.lag_attn_cfs.eval.frames import scored_sample_count
+from teb_vae.lag_attn_cfs.eval.frames import per_recording_labels, scored_sample_count
 from teb_vae.lag_attn_cfs.eval.lag_axis import (
     GROUP_DELAY_CAVEAT,
     compensated_seconds_axis,
@@ -95,11 +95,12 @@ from teb_vae.lag_attn_cfs.eval.lag_axis import (
 from teb_vae.lag_attn_cfs.eval.lag_shape import (
     DEGENERATE_PEAK_TO_MEDIAN,
     DEGENERATE_ZERO_FRACTION,
-    FAR_SECONDS,
-    NEAR_SECONDS,
+    FAR_SPAN_FRACTION,
+    NEAR_SPAN_FRACTION,
     PEAK_FRACTION,
     SECONDS_PER_LAG_STEP,
     STATISTIC_KEYS,
+    near_far_thresholds,
     profile_statistics,
 )
 
@@ -181,12 +182,13 @@ class Statistic:
             has to infer is one they will infer wrongly.
         unit: The $y$-axis label of a panel drawing it. ``None`` takes the shared lag axis label,
             which is what every seconds-valued statistic is drawn on.
-        drawn: Whether the features page carries a panel for it. Five do not. The centroid and the
+        drawn: Whether the features page carries a panel for it. Six do not. The centroid and the
             spread are already the two reduced panels of the *profile* page, and drawing them twice
-            would put one quantity on two pages under two ribbons. The peak's width and mass and
-            the zero fraction are each a second reading of a panel that is on this page -- the
-            peak, and the degenerate share it is guarded by -- and the page is nine rows as it
-            stands. All five reach both tables regardless.
+            would put one quantity on two pages under two ribbons. The effective support is a
+            monotone transform of the entropy, so its panel would be the entropy panel relabelled.
+            The peak's width and mass and the zero fraction are each a second reading of a panel
+            that is on this page -- the peak, and the degenerate share it is guarded by. All six
+            reach both tables regardless.
         tested: Whether the three-layer inference runs on it. Only the centroid is, which keeps
             each clock's Holm family at two rather than at twenty-eight and the windows page at
             five rows. Promoting a statistic is this flag and nothing else.
@@ -246,8 +248,10 @@ STATISTICS: Tuple[Statistic, ...] = (
             "spread over more lags, with no reference to where its centre sits"
         ),
     ),
+    # Tabled, not drawn: it is $\Delta e^{H}$, a monotone transform of the entropy, so every
+    # per-recording median of it is the entropy panel's median re-labelled -- the same panel twice.
     Statistic(
-        "effective_support", "_s", None, drawn=True, tested=False,
+        "effective_support", "_s", None, drawn=False, tested=False,
         meaning=(
             "the width a uniform profile of the same entropy would occupy, in seconds; how "
             "many lags the mass effectively covers, independent of where its centre is"
@@ -256,14 +260,16 @@ STATISTICS: Tuple[Statistic, ...] = (
     Statistic(
         "near_mass", "", "share of the mass", drawn=True, tested=False,
         meaning=(
-            f"share of the mass within {NEAR_SECONDS:g} s of the shortest lag the axis carries; "
-            "measured from the axis's own start, so it means the same thing at any causal delay"
+            f"share of the mass within the first {NEAR_SPAN_FRACTION:.3g} of the lag window's "
+            "span, measured from the shortest lag the axis carries, so it means the same thing at "
+            "any causal delay and any window width"
         ),
     ),
     Statistic(
         "far_mass", "", "share of the mass", drawn=True, tested=False,
         meaning=(
-            f"share of the mass beyond {FAR_SECONDS:g} s from the shortest lag the axis carries"
+            f"share of the mass beyond {FAR_SPAN_FRACTION:.3g} of the lag window's span from the "
+            "shortest lag the axis carries"
         ),
     ),
     Statistic(
@@ -618,6 +624,42 @@ def per_recording_frames(clock: Clock, binned: pd.DataFrame) -> Dict[str, pd.Dat
     }
 
 
+def recording_table(
+    clock: Clock, binned: pd.DataFrame, identity: pd.DataFrame
+) -> pd.DataFrame:
+    """One row per (recording, window) on one clock, carrying the recording's subgroup and class.
+
+    The emitted per-recording table. **Not** the per-cohort-axis frames above stacked: a
+    recording's mean in a window does not depend on which cohort axis it is later grouped by, so
+    stacking the class and the subgroup frame wrote every value twice and named the recording by
+    one label per row. Here each row is written once and carries both labels.
+
+    Args:
+        clock: The clock whose windows to group on.
+        binned: The binned per-sample table.
+        identity: :func:`~teb_vae.lag_attn_cfs.eval.frames.per_recording_labels` of the table,
+            indexed by ``guid``.
+
+    Returns:
+        ``clock, guid, <labels>, time_bin, bin_center_h`` and :data:`FEATURE_COLUMNS`.
+    """
+    wide = cohort.per_recording_in_bins(
+        binned, FEATURE_COLUMNS, group_column="guid",
+        bin_column=clock.bin_column, center_column=clock.center_column,
+    )
+    if wide.empty:
+        return wide
+    wide = wide.drop(columns="group").rename(
+        columns={clock.bin_column: "time_bin", clock.center_column: "bin_center_h"}
+    )
+    wide.insert(0, "clock", clock.name)
+    missing = [name for name in identity.columns if name not in wide.columns]
+    if missing:
+        wide = wide.merge(identity[missing], left_on="guid", right_index=True, how="left")
+    keys = ["clock", "guid", *identity.columns, "time_bin", "bin_center_h"]
+    return wide[keys + [column for column in wide.columns if column not in keys]]
+
+
 def trajectory_rows(clock: Clock, per_recording: Dict[str, pd.DataFrame]) -> List[Dict[str, Any]]:
     """Summarise every feature within each (cohort, window) cell, over its recordings.
 
@@ -632,8 +674,17 @@ def trajectory_rows(clock: Clock, per_recording: Dict[str, pd.DataFrame]) -> Lis
     rows: List[Dict[str, Any]] = []
     for axis, frame in per_recording.items():
         for feature in FEATURES:
+            # Only the columns the reduction reads: handed the whole feature table it copies every
+            # column per call, which makes the loop cost the square of the table's width.
+            keep = [
+                name for name in (
+                    "group", clock.bin_column, clock.center_column, "guid", "n_segments",
+                    feature.column,
+                )
+                if name in frame.columns
+            ]
             for row in cohort.trajectory_rows(
-                frame,
+                frame[keep],
                 feature.column,
                 metric=feature.column,
                 bin_column=clock.bin_column,
@@ -1538,6 +1589,7 @@ def run_lag_clocks_analysis(
 
     directory = Path(output_dir) / ANALYSIS_DIRNAME
     directory.mkdir(parents=True, exist_ok=True)
+    identity = per_recording_labels(per_sample)
 
     clocks: List[Dict[str, Any]] = []
     significance: List[Dict[str, Any]] = []
@@ -1556,9 +1608,7 @@ def run_lag_clocks_analysis(
             continue
 
         frames = per_recording_frames(clock, binned)
-        for axis, frame in frames.items():
-            if len(frame):
-                per_recording_tables.append(frame.assign(clock=clock.name, group_column=axis))
+        per_recording_tables.append(recording_table(clock, binned, identity))
         rows = trajectory_rows(clock, frames)
         trajectory.extend(rows)
 
@@ -1630,18 +1680,25 @@ def run_lag_clocks_analysis(
 
     # Written even when empty, with the key columns present: a table a reader can open and find
     # nothing in is a different statement from a table that was never written.
+    tables = [table for table in per_recording_tables if len(table)]
     tall = (
-        pd.concat(per_recording_tables, ignore_index=True)
-        if per_recording_tables
-        else pd.DataFrame(columns=["clock", "group_column", "group", "guid", *FEATURE_COLUMNS])
+        pd.concat(tables, ignore_index=True)
+        if tables
+        else pd.DataFrame(
+            columns=["clock", "guid", *identity.columns, "time_bin", "bin_center_h",
+                     *FEATURE_COLUMNS]
+        )
     )
     tall.to_csv(directory / PER_RECORDING_FILENAME, index=False)
-    pd.DataFrame(
-        trajectory,
-        columns=[
-            "clock", "group_column", "metric", "group", "time_bin", "bin_center_h",
-            "n_recordings", "mean", "q25", "median", "q75",
-        ],
+    leading = [
+        "clock", "group_column", "metric", "group", "time_bin", "bin_center_h",
+        "n_recordings", "mean", "q25", "median", "q75",
+    ]
+    # Every field the shared cell summary carries -- the window edges, the segment count and the
+    # cohort total among them -- after the leading keys, rather than only the ones listed here.
+    table = pd.DataFrame(trajectory)
+    table.reindex(
+        columns=leading + [name for name in table.columns if name not in leading]
     ).to_csv(directory / TRAJECTORY_FILENAME, index=False)
     (
         pd.concat(profiles, ignore_index=True) if profiles else profile_frame(
@@ -1694,11 +1751,14 @@ def run_lag_clocks_analysis(
         # in the module, because a share of the mass "near the anchor" is meaningless without the
         # number that decided what near is, and ``summary.json`` is the artifact that gets quoted.
         "statistic_thresholds": {
-            "near_seconds": float(NEAR_SECONDS),
-            "far_seconds": float(FAR_SECONDS),
+            "near_span_fraction": float(NEAR_SPAN_FRACTION),
+            "far_span_fraction": float(FAR_SPAN_FRACTION),
+            # The seconds those fractions resolve to on this run's own axis.
+            "near_seconds": float(near_far_thresholds(seconds)[0]),
+            "far_seconds": float(near_far_thresholds(seconds)[1]),
             "near_far_measured_from": (
-                "the shortest lag the axis carries, not zero, so the two shares mean the same "
-                "thing at any causal input delay"
+                "the shortest lag the axis carries, not zero, as fractions of the window's span, "
+                "so the two shares mean the same thing at any causal input delay and window width"
             ),
             "peak_fraction": float(PEAK_FRACTION),
             "degenerate_peak_to_median": float(DEGENERATE_PEAK_TO_MEDIAN),

@@ -101,6 +101,9 @@ def test_the_structure_is_on_and_not_inert(structured_task) -> None:
     assert 0 < record["scored_cells"] < record["block_cells"]
     assert record["ar_coef_mean_st"] is not None and record["ar_coef_mean_ph"] is not None
     assert "AR(1) residual on" in describe_likelihood_structure(record)
+    # The per-channel vectors an offline re-run draws the two terms from, on the kept axis.
+    assert sum(record["scored_horizon_per_channel"]) == record["scored_cells"]
+    assert record["ar_coef_per_channel"] == pytest.approx(terms["ar_coef"].tolist())
 
 
 def test_the_eval_block_scores_are_the_training_objectives(structured_task) -> None:

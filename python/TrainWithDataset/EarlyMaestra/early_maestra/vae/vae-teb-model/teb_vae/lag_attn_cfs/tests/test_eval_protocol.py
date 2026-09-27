@@ -47,7 +47,7 @@ EXPECTED_KEYWORD_ONLY = ("eval_config", "output_dir", "probe")
 #: anchor of every segment of a recording, which no durable table carries, and the fifth needs a
 #: GRADIENT of that forward, which no table can hold either.
 MODEL_READING_ANALYSES = frozenset(
-    {"samples", "sufficiency", "occlusion", "recording_traces", "attribution"}
+    {"samples", "sufficiency", "occlusion", "recording_traces", "attribution", "time_shift"}
 )
 
 

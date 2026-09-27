@@ -33,6 +33,7 @@ import pandas as pd
 import pytest
 
 from teb_vae.lag_attn_cfs.eval.figures_seam import figure_filename
+from teb_vae.lag_attn_cfs.eval import traces
 from teb_vae.lag_attn_cfs.eval.analyses import trajectory as analysis
 from teb_vae.lag_attn.nets.lag_report import SECONDS_PER_STEP
 
@@ -95,16 +96,19 @@ def test_overlapping_timesteps_from_adjacent_segments_are_averaged_not_duplicate
     assert float(trajectory["kld_per_t"].iloc[-1]) == pytest.approx(3.0)
 
 
-def test_the_absolute_coordinate_is_the_epoch_plus_four_seconds_per_anchor() -> None:
+def test_the_absolute_coordinate_is_the_epoch_plus_the_trim_plus_four_seconds_per_anchor() -> None:
+    # ``epoch`` is the STORED segment's start and the loader cuts the trim off its front, so loaded
+    # step 0 sits one trim after the epoch; leaving it out put every point one trim early.
     per_anchor = _anchors(_segment("a", -1000.0, range(3), value=1.0))
 
     trajectory, _ = analysis.whole_delivery(per_anchor)
 
+    start = -1000.0 + traces.LOADER_TRIM_S
     assert list(trajectory["t_abs_sec"]) == [
-        -1000.0, -1000.0 + SECONDS_PER_STEP, -1000.0 + 2 * SECONDS_PER_STEP
+        start, start + SECONDS_PER_STEP, start + 2 * SECONDS_PER_STEP
     ]
     # Negative before delivery, so hours before delivery is the sign-flipped figure over 3600.
-    assert float(trajectory["hours_before_delivery"].iloc[0]) == pytest.approx(1000.0 / 3600.0)
+    assert float(trajectory["hours_before_delivery"].iloc[0]) == pytest.approx(-start / 3600.0)
 
 
 # =============================================================================
@@ -128,7 +132,7 @@ def test_a_gap_produces_a_break_rather_than_an_interpolation() -> None:
 
 
 def test_a_break_is_a_missing_segment_not_the_undecoded_prefix_of_the_next_one() -> None:
-    """Consecutive segments tile at $T\Delta$ seconds and anchors start at the floor, so every
+    r"""Consecutive segments tile at $T\Delta$ seconds and anchors start at the floor, so every
     join carries a gap of roughly $4F$ seconds with nothing decoded in it. The drawn line is lifted
     there, but a *break* -- the count a reader takes as missing recording -- needs a gap longer
     than one segment stride, read off the run's own geometry."""
@@ -394,3 +398,41 @@ def test_the_real_runs_profile_starts_at_that_runs_own_floor(collected_run) -> N
     assert block["within_segment"]["anchor_floor"] == geometry["anchor_floor"]
     assert block["within_segment"]["first_anchor"] == geometry["anchor_floor"]
     assert block["within_segment"]["starts_at_floor"] is True
+
+
+def test_the_whole_delivery_tables_and_page_name_each_recordings_cohort(tmp_path) -> None:
+    """The per-anchor table carries no cohort, so every whole-delivery table used to name a
+    recording with nothing saying which subgroup or class it belongs to -- the page included."""
+    per_anchor = _anchors(
+        _segment("a", -4000.0, range(10), value=1.0) + _segment("b", -9000.0, range(4), value=2.0)
+    )
+    per_sample = pd.DataFrame(
+        {"guid": ["a", "b"], "clinical_class": ["hie", "healthy"],
+         "subgroup": ["hie_cs", "healthy_bg_cs"]}
+    )
+    context = _context(per_anchor)
+    context.collection.per_sample = per_sample
+
+    analysis.run_trajectory_analysis(context, eval_config={}, output_dir=tmp_path, probe=None)
+    directory = tmp_path / analysis.ANALYSIS_DIRNAME
+    for table in (
+        pd.read_parquet(directory / analysis.WHOLE_DELIVERY_FILENAME),
+        pd.read_csv(directory / analysis.BOUNDARIES_FILENAME),
+        pd.read_csv(directory / analysis.SUMMARY_FILENAME),
+    ):
+        assert list(table.columns[:3]) == ["guid", "clinical_class", "subgroup"]
+        assert dict(zip(table["guid"], table["subgroup"])) == {"a": "hie_cs", "b": "healthy_bg_cs"}
+
+    trajectory, _ = analysis.whole_delivery(per_anchor)
+    figure = analysis.build_profile_figure(
+        analysis.within_segment_profile(per_anchor),
+        analysis.with_cohort_labels(trajectory, per_sample),
+        analysis.READOUTS[0],
+    )
+    try:
+        title = figure.axes[1].get_title()
+    finally:
+        import matplotlib.pyplot as plt
+
+        plt.close(figure)
+    assert "a (hie_cs, hie)" in title
