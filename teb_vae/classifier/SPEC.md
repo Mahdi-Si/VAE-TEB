@@ -12,7 +12,7 @@ This is the normative spec for a downstream classification module. It predicts a
 
 - **MUST / SHOULD / MAY** carry RFC-2119 meaning.
 - **[FACT]** marks something verified in the code or data on 2026-09-28, with a `file:line` reference. **[DECISION]** marks a design choice this spec makes. **[OPEN]** marks a question for the project owner (collected in §18). Defaults of [OPEN] items are chosen so implementation can proceed.
-- Implement **phase by phase** (§16). Each phase has acceptance criteria. Do not build later phases' options early.
+- Implement **phase by phase** (§16). Each phase has acceptance criteria. Do not build later phases' options early. Progress is tracked in the phase table at the top of §16: mark a phase `done` only when its acceptance criteria pass.
 - Reuse the existing code listed in §3 before writing new code. Do not copy files out of `tmp/`: that folder is temporary and is never committed. Read it for reference only.
 - Keep this package small. There is one function per option, selected by a config string. There is no plugin registry, no factory hierarchy, and no base class that has only one subclass.
 
@@ -2260,6 +2260,20 @@ python -m teb_vae.classifier.run compare --runs RUN_A RUN_B [--level guid] [--po
 ## 16. Implementation plan (phases and acceptance criteria)
 
 Each phase ends with its tests green and a short `CHANGELOG` entry at the bottom of this file. Do not start a phase before the previous one is accepted.
+
+**Progress tracker.** Update this table when a phase's acceptance criteria are met: set Status to `done`, fill Date, and add a `CHANGELOG` entry. Use `in progress` while working on a phase.
+
+| Phase | Scope | Status | Date |
+|---|---|---|---|
+| P0 | Config, cohort, folds | todo | |
+| P1 | Feature sources and cache | todo | |
+| P2 | Evaluation engine and baselines | todo | |
+| P3 | Neural segment scope + training framework | todo | |
+| P4 | Sequence scope and online evaluation | todo | |
+| P5 | Context, covariates, labeling strategies | todo | |
+| P6 | 3-class, full analysis catalogue, verify | todo | |
+| P7 | Adaptation regimes | todo | |
+| P8 | Seeds, ensembles, comparison | todo | |
 
 **P0 — Config, cohort, folds (§5.6, §6, §7.1-7.2, §12 L2/L3/L6-L9).**
 - *Deliverables:* `config.py`, `cohort.py` (without covariates), `run.py --stage cohort`, and the fixture generator.
