@@ -1,0 +1,191 @@
+# Classifier default configuration (SPEC §13 + §13.1). Every other config is `base: default.yaml` plus deltas.
+# Validated by teb_vae/classifier/config.py (pydantic, extra="forbid"); paths resolve against the repo root.
+classifier:
+  run:
+    name: trf_cfs_adverse_seq
+    out_root: runs/classifier
+    seeds: [42]
+    folds: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+    device: cuda:0
+    num_workers: 4
+    report_workers: 4                # figure processes in `report`, each with its own copy of the tables
+                                     # (~3-5 GB at full scale); 0 renders serially (one copy)
+    fail_fast: false
+    plot_frequency: 5               # → general_config.plot_frequency (ClassifierPlotCallback cadence)
+
+  data:
+    kfold_root: /path/to/k_fold_cross_validation_dataset   # [OPEN] placeholder
+    fold_dir: "fold_{k}"
+    split_dirs: {train: train, val: val, test: test}
+    subgroups: all                  # or list of shard basenames
+    stride_s: auto                  # inferred; error if multimodal
+    epoch_min_s: -44640             # one window for every split (L6)
+    min_valid_frac: 0.1
+    patient_map: null               # JSON guid -> patient id
+    shared_test_policy: first_fold  # first_fold | exclude
+    allow_pretrain_overlap: false
+
+  cohort:
+    include_healthy_no_bg: true
+    min_segments_per_guid: 1
+
+  labels:
+    task: adverse_vs_healthy        # §6.3
+    head: binary                    # binary | multiclass | ordinal
+    aux_3class_weight: 0.3          # λ3; 0 disables
+    strategy: horizon_decay         # propagate | horizon | horizon_decay | final_only | mil
+    horizon_h: 1.0
+    decay_halflife_h: 0.5
+    k_warm: auto                    # drops the first k positions (sequence scope); auto = 3 for propagate, else 0
+    eval_window: all                # all | horizon | stage:first | stage:second
+
+  context:
+    tlo: {enabled: true, missing: indicator, pre_onset: clip}   # signed: pre-onset time until onset (ablation)
+    stage: {enabled: true}
+    time_in_ss: {enabled: true}
+    delta_t: {enabled: true}
+    elapsed: {enabled: false}       # ablation only (§7.1)
+    valid_frac: {enabled: true}
+    covariates:
+      static_csv: null
+      timed_csv: null
+      variables: []                 # [{name: temp_c, kind: numeric, available_at: prospective}]
+      max_age_h: 2.0
+      age_feature: true
+      missing: indicator            # indicator | no_indicator
+      dropout_p: 0.2
+      block_dropout_p: 0.1
+    fusion: late                    # concat | film | token | late (covariates)
+    missing_confound_max: 0.10
+    auto_ablate_missing: false
+
+  source:
+    kind: vae                       # vae | hdf5
+    vae:
+      package: lag_attn_transformer_cfs
+      checkpoint: /path/to/best.ckpt
+      keys:
+        - {name: mu_prior}
+        - {name: delta_mu}
+        - {name: kld_per_t, transform: log1p, role: attention}
+      step_support: causal_all      # causal_all | supervised
+      lag_bins: [[0, 4], [5, 12], [13, 24], [25, 37]]
+      sample_z_train: false         # frozen_online only
+    hdf5:
+      fields: [fhr_st, fhr_ph, up_st, up_ph]
+      stats_path: /path/to/stats.hdf5
+      trim_minutes: 1.0
+      min_step: auto
+    time_pool: 1
+    cache_root: runs/classifier_cache
+    cache_dtype: float16
+
+  model:
+    scope: sequence                 # segment | sequence
+    step: {d: 64, temporal: none, dropout: 0.1}
+    pooling: {kind: gated_attention, d_attn: 64}
+    token: {d: 128, dropout: 0.1}
+    sequence: {kind: causal_transformer, causal: true, layers: 2, heads: 4, d_ff: 256,
+               dropout: 0.1, time_bias_buckets: 32, time_bias_max_h: 12.0}
+    segment_head: true
+    head: {hidden: 64, dropout: 0.1, bias_init: prior}
+    segment_aggregators: [max, mean, lse, last, topk_mean]   # post-hoc GUID scores (§11.2)
+    lse_tau: 1.0
+
+  train:
+    regime: frozen_cached           # frozen_cached | frozen_online | partial | lpft | cotrain
+    unfreeze: []
+    backbone_lr: 1.0e-5
+    lpft_head_epochs: 30
+    loss: {name: bce, weighting: none, beta_en: 0.999, focal_gamma: 2.0, focal_alpha: null,
+           logit_adjust_tau: 1.0, label_smoothing: 0.0}
+    loss_weights: {final: 1.0, positions: 0.5, bag: 0.0, segment: 0.3}
+    sampler: natural                # natural | class_balanced
+    batch_guids: 16
+    batch_segments: 256
+    segment_dropout: 0.1
+    optimizer: {lr: 1.0e-3, weight_decay: 1.0e-2, betas: [0.9, 0.999]}
+    schedule: {warmup_steps: 200, kind: cosine, min_lr_frac: 0.05}
+    max_epochs: 150
+    ema: 0.999                      # EMAWeightAveraging; null disables
+    # grad clip, early stopping, checkpointing, MLflow: advanced_config (§13.1)
+    cotrain:
+      vae_weight: 1.0
+      cls_weight: 1.0
+      l2sp: 1.0e-4
+      detach_head_input: false
+      vae_chunk: 32
+      grad_segments: all
+      gates: {forecast_mse_rel: 0.10}
+
+  calibration: {method: temperature}  # temperature | platt | none
+
+  baselines:
+    probe_last_n: 3
+    shortcut_warn_auroc: 0.60
+    shuffled_control: true
+
+  eval:
+    levels: [segment, guid, online]
+    thresholds:
+      # basis: guid_final | instantaneous | committed_cumulative | committed_overall | segment (§11.3)
+      - {id: np30, policy: fpr_cap, alpha: 0.30, method: np_umbrella, delta: 0.05, allow_fallback: false,
+         basis: committed_overall, axis: to_delivery, at: end}
+      - {id: emp30, policy: fpr_cap, alpha: 0.30, method: empirical, basis: committed_overall, at: end}
+      - {id: emp15, policy: fpr_cap, alpha: 0.15, method: empirical, basis: committed_overall, at: end}
+      - {id: inst30_1h, policy: fpr_cap, alpha: 0.30, method: empirical, basis: instantaneous, at: 1.0}
+      - {id: cum30_1h, policy: fpr_cap, alpha: 0.30, method: empirical, basis: committed_cumulative, at: 1.0}
+      - {id: ovr30_1h, policy: fpr_cap, alpha: 0.30, method: empirical, basis: committed_overall, at: 1.0}  # previous v1 primary
+      - {id: youden, policy: youden, basis: guid_final}
+    primary_policy: np30
+    report_tpr_at_fpr: [0.05, 0.10, 0.15, 0.20, 0.30]
+    metric_types: [instantaneous, committed_cumulative, committed_overall]   # all evaluated for every policy
+    exclude_last_min: 0
+    alarm_rule: {kind: latch}       # latch | k_of_n {k, n}
+    checkpoints_h: [6, 4, 3, 2, 1, 0.5]
+    snapshot_max_staleness_h: 1.0
+    time_axes: [to_delivery, from_onset, rel_second_stage, position, elapsed]
+    bin_h: 0.5
+    min_bin_class_n: 5
+    subgroup_families: [class, source_file, class_x_cs, healthy_x_bg, healthy_bg_x_cs, cs, bg, stage_last,
+                        reached_second_stage, has_tlo, admission_tlo_tertile, labour_duration_tertile,
+                        n_segments_tertile, span_tertile, valid_frac_tertile, late_coverage, shared_test, fold]
+    restricted_pairs: [[healthy, acidosis], [healthy, hie], [acidosis, hie]]
+    min_subgroup_n: 10
+    ovr_thresholds: auto            # auto = true for three_class tasks
+    decision_horizons_h: [0.5, 1, 2, 4, 6]
+    per_fold_figures: true
+    fold_band: minmax               # minmax | none
+    figure_formats: [pdf]           # add png if wanted
+    error_analysis: {top_k: 10}
+    attribution: {enabled: false, n_steps: 32}
+    covariates_off: false
+    bootstrap: {resamples: 2000, refit_threshold: false, seed: 0}
+    reference_prevalence: null
+    trajectory_pages: {per_class: 3, top_errors: 3}
+
+advanced_config:
+  trainer:
+    precision: 32-true
+    gradient_clip_val: 1.0
+    gradient_clip_algorithm: norm
+    deterministic: true
+    log_every_n_steps: 10
+    num_sanity_val_steps: 2
+    profiler: null
+  logging: {console_level: INFO, file_level: INFO, json_log: true, rotation: 50 MB, retention: 14 days}
+  spike_breaker: {enabled: false}
+  tracking:
+    mlflow:
+      enabled: false
+      tracking_uri: http://localhost:5000
+      experiment_name: ctg-classifier
+      log_model: false              # F10
+      log_checkpoints: false
+      log_config_artifact: true
+      tags: {}
+  callbacks:
+    early_stopping: {enabled: true, monitor: val/guid_logloss, mode: min, patience: 25, min_delta: 0.0}
+    model_checkpoint: {save_last: true}   # monitor/mode = early_stopping's (§10.10.2 #6)
+    classifier_plotting: {enabled: true, every_n_epochs: 5, file_format: pdf,
+                          train_eval_every: 5, train_eval_guids: 256}

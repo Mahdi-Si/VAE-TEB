@@ -1,0 +1,10 @@
+# 3-class healthy / acidosis / HIE (SPEC §6.3, §13.3): softmax head, sqrt-inverse class weights (HIE is rare, §10.2),
+# no aux head (the main head is 3-class). labels.head: ordinal takes train.loss.name coral | cumulative_link.
+# Binary policies threshold the collapsed adverse score; eval.ovr_thresholds: auto adds per-class OvR ones (§11.3).
+base: default.yaml
+
+classifier:
+  run: {name: trf_cfs_three_class_seq}
+  labels: {task: three_class, head: multiclass, aux_3class_weight: 0.0}
+  train:
+    loss: {name: weighted_ce, weighting: sqrt_inverse}

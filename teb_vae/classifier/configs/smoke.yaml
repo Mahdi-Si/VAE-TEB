@@ -1,0 +1,54 @@
+# Smoke run on the generated fixture tree (SPEC §13.3, §15): CPU, folds 1-2, ST/PH source, tiny budgets.
+#
+#   python -m teb_vae.classifier.tests.fixtures.make_fixture --out output/classifier_fixture
+#   python -m teb_vae.classifier.run --config teb_vae/classifier/configs/smoke.yaml --stage all
+#
+# Tests point data.kfold_root and source.hdf5.stats_path at their own tmp fixture via --set.
+base: default.yaml
+
+classifier:
+  run: {name: smoke, out_root: output/classifier_smoke, folds: [1, 2], device: cpu, num_workers: 0,
+        plot_frequency: 1}
+  data: {kfold_root: output/classifier_fixture}
+  context:
+    # The fixture's covariate tables; unused until variables are declared, e.g. (tests: conftest.COVARIATES)
+    #   --set 'classifier.context.covariates.variables=[{name: parity, kind: categorical, available_at: prospective},
+    #          {name: temp_c, kind: numeric, available_at: prospective}]' --set classifier.eval.covariates_off=true
+    covariates: {static_csv: output/classifier_fixture/static_covariates.csv,
+                 timed_csv: output/classifier_fixture/timed_covariates.csv}
+    # The fixture's has_tlo missing rate differs across classes by > 0.10 in folds 2-3 (L10): train the noind
+    # ablation (§7.3.4), which verify criterion 10 requires then.
+    auto_ablate_missing: true
+  source:
+    kind: hdf5
+    hdf5: {stats_path: output/classifier_fixture/stats.hdf5}
+    cache_root: output/classifier_cache
+  model:
+    step: {d: 16}
+    pooling: {d_attn: 16}
+    token: {d: 32}
+    sequence: {layers: 1, heads: 2, d_ff: 64}
+    head: {hidden: 16}
+  # 6 epochs; segment scope at 32 segments per batch (~6 steps per epoch): both scopes reach a fold-mean test GUID
+  # AUROC of 1.0 on the planted signal (T-X1 needs > 0.9); 3 epochs x 64 left the segment scope at 0.65.
+  train: {max_epochs: 6, batch_guids: 8, batch_segments: 32, schedule: {warmup_steps: 5}, ema: null}
+  eval:
+    bootstrap: {resamples: 50}
+    # The fixture's val split holds 6 healthy GUIDs per fold, fewer than the 9 the NP umbrella needs at
+    # alpha 0.3 / delta 0.05, so np30 falls back to empirical there, flagged `fallback: true` (§11.3).
+    # Lists replace on merge: the rest is default.yaml's policy set unchanged.
+    thresholds:
+      - {id: np30, policy: fpr_cap, alpha: 0.30, method: np_umbrella, delta: 0.05, allow_fallback: true,
+         basis: committed_overall, axis: to_delivery, at: end}
+      - {id: emp30, policy: fpr_cap, alpha: 0.30, method: empirical, basis: committed_overall, at: end}
+      - {id: emp15, policy: fpr_cap, alpha: 0.15, method: empirical, basis: committed_overall, at: end}
+      - {id: inst30_1h, policy: fpr_cap, alpha: 0.30, method: empirical, basis: instantaneous, at: 1.0}
+      - {id: cum30_1h, policy: fpr_cap, alpha: 0.30, method: empirical, basis: committed_cumulative, at: 1.0}
+      - {id: ovr30_1h, policy: fpr_cap, alpha: 0.30, method: empirical, basis: committed_overall, at: 1.0}
+      - {id: youden, policy: youden, basis: guid_final}
+
+advanced_config:
+  trainer: {num_sanity_val_steps: 0, log_every_n_steps: 1}
+  callbacks:
+    early_stopping: {patience: 2}
+    classifier_plotting: {every_n_epochs: 1, train_eval_every: 1, train_eval_guids: 16}

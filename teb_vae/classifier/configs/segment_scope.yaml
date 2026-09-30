@@ -1,0 +1,6 @@
+# Segment scope (SPEC §9.1, §13.3): one item per segment; GUID scores are post-hoc aggregators (§11.2).
+base: default.yaml
+
+classifier:
+  run: {name: trf_cfs_adverse_seg}
+  model: {scope: segment}
