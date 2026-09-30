@@ -11,6 +11,7 @@ __pycache__/
 *.pyd
 *.egg-info/
 output/
+runs/
 hdf5_dataset/dataset_histograms.png/
 hdf5_dataset/hie_cs.hdf5
 hdf5_dataset/stats_with_log_transform.hdf5
