@@ -1,0 +1,6 @@
+# ST/PH features straight from the HDF5 shards instead of the VAE (SPEC §8.3, §13.3).
+base: default.yaml
+
+classifier:
+  run: {name: st_ph_adverse_seq}
+  source: {kind: hdf5}
