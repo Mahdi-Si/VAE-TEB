@@ -108,8 +108,8 @@ def build_clock_figure(
             axes[index, 0],
             [row for row in rows if row["metric"] == column and row["group"] != "all"],
             axis=labels.CLASS_COLUMN, clock=clock,
-            title=f"suppress:{band} margin per window, by {labels.CLASS_COLUMN}",
-            ylabel="paired margin (nats per anchor)", zero=True,
+            title=f"suppress:{band}",
+            ylabel="margin (nats per anchor)", zero=True, legend=index == 0,
         )
     if columns["controls"]:
         ax = axes[len(panels), 0]
@@ -135,13 +135,13 @@ def build_clock_figure(
                 label=column[len(MARGIN_PREFIX):],
             )
             drawn += 1
-        ax.set_title("source control margins per window, all classes")
+        ax.set_title("Source controls")
         if drawn:
             ax.axhline(0.0, color=figures.COLOR_GRAY, linestyle=":", linewidth=figures.LINE_THIN)
             if clock.inverted:
                 ax.invert_xaxis()
             ax.set_xlabel(clock.axis_label)
-            ax.set_ylabel("paired margin (nats per anchor)")
+            ax.set_ylabel("margin (nats per anchor)")
             ax.legend(fontsize=figures.FONT_SMALL, loc="best")
         else:
             ax.text(
@@ -155,7 +155,7 @@ def build_clock_figure(
             va="center", fontsize=figures.FONT_NOTE, color=figures.COLOR_GRAY, fontstyle="italic",
         )
         figures.style_axes(axes[0, 0])
-    figures.caveat_note(figure, lag_structure.QUALIFICATION)
+    figures.caveat_note(figure)
     return figure
 
 

@@ -60,7 +60,7 @@ _FS_RAW = 4.0
 _STATS = {"fhr": {"mean": 140.0, "std": 20.0}, "up": {"mean": 30.0, "std": 10.0}}
 
 #: The two rows this package's input builder adds, by title prefix.
-_INPUT_ROWS = ("Model input — target", "Model input — source")
+_INPUT_ROWS = ("Target input", "Source input")
 
 #: Every titled row of this package's page: the sibling's seven, the two input rows, and the six
 #: of ``CAUSAL_EXTRA_ROWS``. Stated as arithmetic rather than as ``15`` so a row added to the
@@ -304,8 +304,9 @@ def test_the_staircase_is_the_warm_up_and_says_so(task, stub_batch):
         plt.close(figure)
 
 
-def test_the_row_title_reports_the_budget_the_counts_and_the_range_in_seconds(task, stub_batch):
-    """What a reader needs to size the guard without holding the config beside the page."""
+def test_the_row_title_reports_the_kept_channel_count(task, stub_batch):
+    """The title names the stream and how many of its declared channels the budget kept; the rest
+    of the guard (budget, warm-up range) is the run-level figure's."""
     module = task()
     model = module.orig_model
     panels = sample_page.causal_stream_panels(
@@ -314,11 +315,9 @@ def test_the_row_title_reports_the_budget_the_counts_and_the_range_in_seconds(ta
     kept = model.target_gate.out_channels
 
     title = panels[0].title
-    assert f"{kept}/{CAUSAL_C_Y} channels kept" in title
-    assert f"{CAUSAL_C_Y - kept} dropped" in title
-    assert f"{max(model.target_warmup_steps) * 4.0:g} s" in title
+    assert title == f"Target input, {kept}/{CAUSAL_C_Y} channels"
     # The source is never gated, and the row says so rather than leaving it to be inferred.
-    assert f"{CAUSAL_C_U}/{CAUSAL_C_U} channels kept, 0 dropped" in panels[1].title
+    assert panels[1].title == f"Source input, {CAUSAL_C_U}/{CAUSAL_C_U} channels"
 
 
 def test_the_block_dividers_are_in_surviving_channel_coordinates(task, stub_batch):
@@ -394,7 +393,7 @@ def test_the_page_rows_all_share_one_time_axis(task, stub_batch):
             assert ax.get_xlim() == pytest.approx((0.0, t_max)), ax.get_title()
             assert ax.has_data(), ax.get_title()
         for prefix in (
-            "Target-only latent state",
+            "Latent state",
             "Per-dimension source-conditioned KL",
             "$K_t$",
             "Lag attention",
@@ -494,7 +493,6 @@ def test_the_overlay_draws_the_decoded_anchors_and_the_training_tiling(task, stu
 
         tiles = _labelled(ax, "training tiles")
         assert len(tiles) == 1, "one legend entry, whatever the tile count"
-        assert f"$S$={TINY_STRIDE}" in str(tiles[0].get_label())
         assert tiles[0].get_xdata()[0] == pytest.approx(
             geometry.warmup * seconds_per_step
         )
@@ -525,7 +523,6 @@ def test_the_overlay_is_read_from_the_forward_rather_than_recomputed(task, stub_
         ax = _axes_titled(figure, "Forecast")
         rug = _labelled(ax, "decoded anchors")[0]
         assert rug.get_xdata().size == 3
-        assert "decoded anchors (3)" in str(rug.get_label())
     finally:
         plt.close(figure)
 
@@ -670,9 +667,9 @@ def test_the_error_map_reads_truth_on_the_models_own_forecast_clock(task, stub_b
 #: Every panel on the page whose y-axis is a target or source **channel**, by title prefix. The
 #: latent, KL and lag panels are deliberately absent: their axes are latent dimensions and lags.
 _CHANNEL_AXES = _INPUT_ROWS + (
-    "true $Y^{+}$",
-    "base $\\mu^p$",
-    "full $\\mu^q$",
+    "Target $Y^{+}$",
+    "Base $\\mu^p$",
+    "Full $\\mu^q$",
     "Source skill",
     "Predicted $\\sigma^q$",
 )
@@ -719,9 +716,9 @@ def test_the_field_rows_draw_the_same_tiling_the_lane_row_does(task, stub_batch)
         drawn = {
             name: _axes_titled(figure, prefix).images[0].get_array()
             for name, prefix in (
-                ("truth", "true $Y^{+}$"),
-                ("base", "base $\\mu^p$"),
-                ("full", "full $\\mu^q$"),
+                ("truth", "Target $Y^{+}$"),
+                ("base", "Base $\\mu^p$"),
+                ("full", "Full $\\mu^q$"),
             )
         }
         for field in drawn.values():
@@ -747,7 +744,7 @@ def test_the_field_rows_draw_the_same_tiling_the_lane_row_does(task, stub_batch)
         # One colour scale across the three, so a branch cannot be rescaled into looking right.
         limits = {
             _axes_titled(figure, prefix).images[0].get_clim()
-            for prefix in ("true $Y^{+}$", "base $\\mu^p$", "full $\\mu^q$")
+            for prefix in ("Target $Y^{+}$", "Base $\\mu^p$", "Full $\\mu^q$")
         }
         assert len(limits) == 1
     finally:
@@ -774,9 +771,9 @@ def test_the_skill_row_is_the_gap_resolved_per_channel_and_per_step(task, stub_b
         fields = {
             name: _axes_titled(figure, prefix).images[0].get_array()
             for name, prefix in (
-                ("truth", "true $Y^{+}$"),
-                ("base", "base $\\mu^p$"),
-                ("full", "full $\\mu^q$"),
+                ("truth", "Target $Y^{+}$"),
+                ("base", "Base $\\mu^p$"),
+                ("full", "Full $\\mu^q$"),
             )
         }
         image = _axes_titled(figure, "Source skill").images[0]
@@ -935,14 +932,11 @@ def test_the_x_label_states_the_clock_the_rows_content_sits_on(task, stub_batch)
     for panel in panels:
         expected = causal_warmup.ALIGNMENT_DELAY_FACTOR * reference[panel.name]
         assert f"content at $t-{expected:.0f}$ s" in panel.time_label
-        assert "step index" in panel.time_label
 
     # An unaligned run has no single constant, and the clause is omitted rather than filled with a
     # number that would be wrong on every channel but one.
     plain = sample_page.causal_stream_panels(model, inputs, sample_index=0)
     for panel in plain:
-        assert "unaligned" in panel.time_label
-        assert "step index" in panel.time_label
         assert "\\kappa\\tau_c" in panel.time_label
 
 
@@ -956,7 +950,7 @@ def test_the_forecast_rows_axis_names_the_scored_clock(task, stub_batch):
     from types import SimpleNamespace
 
     forecast_rows = (
-        "Forecast", "true $Y^{+}$ over", "base $\\mu^p$", "full $\\mu^q$", "Source skill",
+        "Forecast", "Target $Y^{+}$", "Base $\\mu^p$", "Full $\\mu^q$", "Source skill",
         "Predicted $\\sigma^q$", "Per-window forecast score",
     )
 
@@ -971,7 +965,6 @@ def test_the_forecast_rows_axis_names_the_scored_clock(task, stub_batch):
     try:
         for prefix in forecast_rows:
             label = _axes_titled(figure, prefix).get_xlabel()
-            assert "scored step" in label, prefix
             assert f"$t-{expected:.0f}$ s" in label, prefix
     finally:
         plt.close(figure)
@@ -982,7 +975,6 @@ def test_the_forecast_rows_axis_names_the_scored_clock(task, stub_batch):
     try:
         for prefix in forecast_rows:
             label = _axes_titled(figure, prefix).get_xlabel()
-            assert "stored step" in label, prefix
             assert "\\kappa\\tau_c" in label, prefix
     finally:
         plt.close(figure)
@@ -1065,7 +1057,7 @@ def test_the_raw_trace_is_drawn_over_each_input_row_delayed_onto_its_clock(task,
                 line
                 for ax in figure.axes
                 for line in ax.lines
-                if str(line.get_label()).startswith(f"raw {field} as the encoder receives it")
+                if str(line.get_label()).startswith(f"raw {field}, delayed")
             ]
             assert len(traces) == 1, prefix
             assert np.allclose(traces[0].get_xdata(), time_raw + delay)
@@ -1168,7 +1160,7 @@ def test_it_renders_at_the_shipped_geometry(task):
         assert len([child for child in figure.axes if child.get_title()]) == _PAGE_ROWS
         # And the field rows carry the same channels over the whole recording, so the page is one
         # channel axis from the input rows down to the error map.
-        for row in ("true $Y^{+}$", "base $\\mu^p$", "full $\\mu^q$", "Source skill"):
+        for row in ("Target $Y^{+}$", "Base $\\mu^p$", "Full $\\mu^q$", "Source skill"):
             image = _axes_titled(figure, row).images[0]
             assert image.get_array().shape == (kept, SHIPPED_SEQUENCE_LENGTH), row
         assert _labelled(ax, "decoded anchors")[0].get_xdata().size == (
@@ -1235,9 +1227,9 @@ _UNGATED = dict(
 _COMPACT_ROW_TITLES = (
     "Raw target FHR",
     "Forecast",
-    "Model input — target",
-    "Model input — source",
-    "Target-only latent state",
+    "Target input",
+    "Source input",
+    "Latent state",
     "$K_t$",
     "Lag attention",
     "$\\widetilde K_{t,\\ell}$",

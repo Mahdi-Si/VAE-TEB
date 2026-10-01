@@ -30,8 +30,8 @@ for.
 
 * **Density, not counts.** The healthy cohort contributes an order of magnitude more segments than
   HIE. On a count axis every panel would show one tall healthy curve and two flat lines, which is
-  a statement about the cohort sizes rather than about the metric. Each curve's $n$ travels in the
-  legend at both levels instead.
+  a statement about the cohort sizes rather than about the metric. Each cohort's segment and
+  recording counts travel in :data:`SUMMARY_FILENAME` instead of in the legend.
 * **One bin grid per panel**, computed from the pooled values across the cohorts drawn there. Two
   histograms on two different grids are not a comparison, and the difference between them can be
   the binning.
@@ -380,10 +380,10 @@ RECORDING_STRIP_FRACTION = 0.28
 #: value a reader is most likely to be looking for.
 LEGEND_HEADROOM_FRACTION = 0.24
 
-#: The y label, which is where the two levels are named. Not the title: the nested figure puts
-#: three cells across a 13-inch page, and a title long enough to explain both levels overflows its
-#: column and collides with its neighbours. A label is compact, vertical, and on every panel.
-DENSITY_YLABEL = "density (bars); recordings (strip)"
+#: The y label. It names the density only: the strip's encoding (one mark per recording) is
+#: written in ``FIGURE_GUIDE.md``, because a label long enough to explain both levels is repeated on
+#: every panel of a page that has twenty-four of them.
+DENSITY_YLABEL = "density"
 
 #: How opaque a cohort's filled body is. Faint on purpose: up to four cohorts are drawn on top of
 #: one another in a single panel, and a fill heavy enough to read on its own hides whatever is
@@ -418,6 +418,7 @@ def draw_density_panel(
     title: str,
     xlabel: str,
     reference: Optional[float] = None,
+    legend: bool = True,
 ) -> int:
     """Draw the segment-level density per cohort, with the recording-level spread above it.
 
@@ -448,7 +449,9 @@ def draw_density_panel(
         groups: The cohorts, in the order they should be drawn and legended.
         title: Panel title.
         xlabel: X-axis label, carrying the unit.
-        reference: Optional vertical line -- a null, or a calibrated value.
+        reference: Optional vertical line -- a null, or a calibrated value. Drawn unlabelled.
+        legend: Whether this panel carries the cohort legend, and the headroom above the strip it
+            sits in. A page whose panels share their cohorts names them once, in its first panel.
 
     Returns:
         The number of cohorts that contributed at least one finite segment value. Zero draws the
@@ -495,10 +498,7 @@ def draw_density_panel(
             values, bins=edges, density=True, histtype="stepfilled",
             color=to_rgba(colour, FILL_ALPHA), edgecolor=colour,
             linewidth=figures.LINE_HAIRLINE, zorder=FILL_ZORDER,
-            label=(
-                f"{group} ({values.size} seg / "
-                f"{recording_by_group.get(group, np.zeros(0)).size} rec)"
-            ),
+            label=group,
         )
         # The same staircase re-stroked above every fill, and deliberately unlabelled so the legend
         # keeps one row per cohort. Identical geometry, colour and weight to the border above, so
@@ -509,14 +509,17 @@ def draw_density_panel(
         )
         drawn.append(group)
 
-    _draw_recording_strip(ax, recording_by_group, drawn, colours)
+    _draw_recording_strip(
+        ax, recording_by_group, drawn, colours,
+        headroom=LEGEND_HEADROOM_FRACTION if legend else 0.0,
+    )
 
     if reference is not None and np.isfinite(reference):
         ax.axvline(
             float(reference), color=figures.COLOR_GRAY, linestyle=":", linewidth=figures.LINE_REGULAR,
-            label=f"reference {float(reference):g}",
         )
-    ax.legend(fontsize=figures.FONT_SMALL, loc="upper right", framealpha=0.85)
+    if legend:
+        ax.legend(fontsize=figures.FONT_SMALL, loc="upper right", framealpha=0.85)
     figures.style_axes(ax)
     return len(drawn)
 
@@ -526,6 +529,7 @@ def _draw_recording_strip(
     recording_by_group: Dict[str, np.ndarray],
     groups: Sequence[str],
     colours: Dict[str, str],
+    headroom: float = LEGEND_HEADROOM_FRACTION,
 ) -> None:
     """Lay each cohort's per-recording median, quartiles and range across the top of the panel.
 
@@ -537,6 +541,7 @@ def _draw_recording_strip(
         recording_by_group: Cohort to its finite recording-level values.
         groups: The cohorts that were drawn, in order.
         colours: The cohort palette.
+        headroom: Fraction of the panel height left empty above the strip, for the legend.
     """
     top = float(ax.get_ylim()[1])
     if not groups or top <= 0.0:
@@ -545,7 +550,7 @@ def _draw_recording_strip(
     # than by an axes-fraction transform, so the densities keep their own scale and the strip
     # cannot land on top of a tall bar.
     strip = top * RECORDING_STRIP_FRACTION
-    ax.set_ylim(0.0, top + strip + top * LEGEND_HEADROOM_FRACTION)
+    ax.set_ylim(0.0, top + strip + top * headroom)
 
     for index, group in enumerate(groups):
         values = recording_by_group.get(group, np.zeros(0))
@@ -566,11 +571,6 @@ def _draw_recording_strip(
         )
 
 
-def _panel_title(metric: Metric, prefix: str = "") -> str:
-    """The title a panel carries: the metric, and on the nested figure the class it is cut to."""
-    return f"{prefix}{metric.name}"
-
-
 def build_class_figure(
     segment: pd.DataFrame, recording: pd.DataFrame, units: Dict[str, str]
 ) -> Any:
@@ -588,14 +588,17 @@ def build_class_figure(
     groups = cohorts_present(segment, axis)
     figure, axes = figures.new_figure(len(METRICS), 1, height_per_row=3.0)
     for row, metric in enumerate(METRICS):
+        # Untitled: the x label names the metric and its unit. The cohorts are named once, in the
+        # first panel's legend.
         draw_density_panel(
             axes[row, 0],
             {group: _series(segment, axis, group, metric.name) for group in groups},
             {group: _series(recording, axis, group, metric.name) for group in groups},
             groups,
-            title=_panel_title(metric),
+            title="",
             xlabel=f"{metric.name} ({units.get(metric.name, metric.unit)})",
             reference=metric.reference,
+            legend=row == 0,
         )
     return figure
 
@@ -631,14 +634,17 @@ def build_subgroup_figure(
                 {group: _series(segment, axis, group, metric.name) for group in groups},
                 {group: _series(recording, axis, group, metric.name) for group in groups},
                 groups,
-                title=_panel_title(metric, prefix=f"{class_name}: "),
+                # A column is a class: it is titled once, in the first row, and each cell's
+                # x label names the metric.
+                title=class_name if row == 0 else "",
                 xlabel=f"{metric.name} ({units.get(metric.name, metric.unit)})",
                 reference=metric.reference,
+                legend=row == 0,
             )
         if not classes:
             draw_density_panel(
                 axes[row, 0], {}, {}, [],
-                title=_panel_title(metric),
+                title="",
                 xlabel=f"{metric.name} ({units.get(metric.name, metric.unit)})",
                 reference=metric.reference,
             )

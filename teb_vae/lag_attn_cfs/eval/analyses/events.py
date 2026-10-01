@@ -360,13 +360,15 @@ def build_detection_figure(
 
     Each row is one segment on the fixed pressure scale: onset, peak and end marked, the span
     after each onset in which an anchor counts as an event anchor shaded, and the stretch before
-    the first decoded anchor greyed, since no anchor there can be conditioned on anything.
+    the first decoded anchor greyed, since no anchor there can be conditioned on anything. The
+    page carries one short key line; the event window length and the onset convention are in the
+    record (``event_lag_window_s``, ``onset_convention``) and ``FIGURE_GUIDE.md``.
 
     Args:
         retained: The collection's retained arrays.
         per_sample: The per-sample table, for identity.
         detections: From :func:`detection_rows`.
-        window_s: ``event_lag_window_s``.
+        window_s: ``event_lag_window_s``, the width of the shaded span after each onset.
         first_anchor_s: Seconds into the segment at which the first decoded anchor's step ends.
         scales: The raw-signal scales.
 
@@ -409,20 +411,15 @@ def build_detection_figure(
                 position = int(round(float(event[key]) * events.FS_RAW))
                 axis.plot(event[key], physical[min(position, physical.size - 1)], marker=marker,
                           color=figures.COLOR_VERMILLION, markersize=figures.MARKER_SMALL + 1.0, linestyle="none")
-        epoch = _label(row, "epoch")
-        hours = f", segment start {-float(epoch) / 3600.0:.2f} h before delivery" if epoch is not None and pd.notna(epoch) else ""
         axis.set_title(
-            f"{_label(row, 'guid')} | {_label(row, labels.SUBGROUP_COLUMN)} | {_label(row, labels.CLASS_COLUMN)}"
-            f"{hours}: {len(found)} contraction(s)"
+            f"guid {_label(row, 'guid')}, subgroup {_label(row, labels.SUBGROUP_COLUMN)}"
         )
         axis.set_xlim(0.0, raw.size / events.FS_RAW)
         axis.set_xlabel("seconds into the segment")
         figures.style_axes(axis)
     figures.caveat_note(
         figure,
-        f"Markers: detected onset, peak and end on the raw UP trace. Green: the {window_s:g} s after each onset in "
-        f"which an anchor counts as an event anchor. Grey: before the first decoded anchor. "
-        f"{events.ONSET_WALK_BACK_NOTE}.",
+        "^ onset, o peak, v end. Green: event window. Grey: before first anchor.",
     )
     return figure
 
@@ -436,11 +433,12 @@ def build_conditioned_figure(per_recording: pd.DataFrame, *, window_s: Optional[
     The classes run HIE, acidosis, healthy and are coloured red, amber, green -- the same order
     and palette every other cohort figure in this evaluation uses, so two of them can be read
     side by side. ``groupby`` alone would order them alphabetically, putting acidosis first. Each
-    violin names its recording count, and the title the event window it was cut at.
+    violin names its recording count on its tick label; the event window it was cut at is in the
+    record and ``FIGURE_GUIDE.md``.
 
     Args:
         per_recording: The long per-recording frame, one row per recording and readout.
-        window_s: ``event_lag_window_s``, for the title, or ``None``.
+        window_s: ``event_lag_window_s``. Unused by the drawing; kept for the caller's signature.
 
     Returns:
         The figure; the caller renders and closes it.
@@ -465,14 +463,13 @@ def build_conditioned_figure(per_recording: pd.DataFrame, *, window_s: Optional[
                 name: by_class[name]
                 for name in cohort.ordered_groups(list(by_class), labels.CLASS_COLUMN)
             }
-        within = "" if window_s is None else f" within {float(window_s):g} s after an onset"
         figures.violin_panel(
             axis, {f"{name} (n={values[name].size})": values[name] for name in values} or {"all": np.zeros(0)},
-            title=f"{metric}: anchors{within} minus count-matched control anchors, per recording",
-            ylabel="difference (nats per anchor)",
+            title=metric,
+            ylabel="event minus control (nats)",
             colors={f"{name} (n={values[name].size})": colour
                     for name, colour in figures.group_colors(list(values)).items()},
-            reference=0.0, reference_label="no conditioning effect",
+            reference=0.0, reference_label="no effect",
         )
     return figure
 

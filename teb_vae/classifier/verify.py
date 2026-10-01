@@ -260,7 +260,7 @@ def load_summary(run_dir: Any) -> Optional[Dict[str, Any]]:
     if not path.is_file():
         return None
     on_disk = {"predictions_written_at": json.loads(prov.read_text()).get("written_at") if prov.is_file() else None,
-               "summary_md_headings": [x for x in md.read_text().splitlines() if x.startswith("## ")]
+               "summary_md_headings": [x for x in md.read_text(encoding="utf-8").splitlines() if x.startswith("## ")]
                if md.is_file() else None}
     return json.loads(path.read_text()) | {"on_disk": on_disk}
 

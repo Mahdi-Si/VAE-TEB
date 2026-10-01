@@ -107,10 +107,10 @@ READOUTS: Tuple[cohort.ClockReadout, ...] = cohort.CLOCK_READOUTS
 #: The per-sample columns this analysis reduces, in the order the tables carry them.
 VALUE_COLUMNS: Tuple[str, ...] = cohort.CLOCK_VALUE_COLUMNS
 
-#: The x-axis label of both figures. It names the sign convention explicitly rather than leaving
-#: "hours from onset" to be read either way round: a reader who takes a negative value for "after"
-#: reads the whole trajectory backwards, and nothing on the page would contradict them.
-AXIS_LABEL = "Hours from second-stage onset (negative = before onset, positive = after)"
+#: The x-axis label of both figures. The sign convention (negative before onset, positive after)
+#: is not spelled out on the axis: the onset is marked by a dotted line at zero, which tells the two
+#: halves apart, and the convention is written in ``FIGURE_GUIDE.md``.
+AXIS_LABEL = "Hours from second-stage onset"
 
 #: The method sentence written into every record, so a $p$-value here is readable without this
 #: module -- including the fact that its family stops at this clock.
@@ -588,7 +588,7 @@ def build_trajectory_figure(
             if row["group_column"] == axis and row["metric"] == readout.name
         ],
         axis,
-        title=f"{readout.name} against time from second-stage onset, by {axis}",
+        title=readout.name,
     )
     return figure
 
@@ -648,7 +648,7 @@ def _draw_panel(ax: Any, rows: Sequence[Dict[str, Any]], axis: str, *, title: st
         ax.plot(
             x, _series("median"),
             marker="o", markersize=3, color=colour, linewidth=figures.LINE_EMPHASIS,
-            label=f"{group} (n={int(cell[0].get('n_recordings_total', 0))} deliveries)",
+            label=group,
         )
         for row in cell:
             # Staggered within a shared window, so two cohorts there do not print one count

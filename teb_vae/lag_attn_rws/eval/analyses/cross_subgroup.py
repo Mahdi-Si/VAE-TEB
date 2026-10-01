@@ -386,7 +386,7 @@ def build_heatmap_figure(record: Dict[str, Any]) -> Any:
         axis.axvline(
             -np.log10(float(record["alpha"])), color=figures.COLOR_VERMILLION,
             linestyle="--", linewidth=figures.LINE_REGULAR,
-            label=f"alpha = {float(record['alpha']):g} (Holm-adjusted)",
+            label=f"$\\alpha$ = {float(record['alpha']):g}",
         )
         axis.legend(fontsize=figures.FONT_LABEL, loc="best")
         axis.invert_yaxis()
@@ -395,7 +395,7 @@ def build_heatmap_figure(record: Dict[str, Any]) -> Any:
             0.5, 0.5, figures.EMPTY_NOTE, transform=axis.transAxes,
             ha="center", va="center", fontsize=figures.FONT_NOTE, color=figures.COLOR_GRAY,
         )
-    axis.set_title(f"Omnibus significance by {record['group_column']} (Kruskal-Wallis, Holm)")
+    axis.set_title(f"Omnibus test by {record['group_column']}")
     axis.set_xlabel("$-\\log_{10}$ Holm-adjusted $p$")
     figures.style_axes(axis)
 
@@ -464,7 +464,7 @@ def _draw_effect_heatmap(figure: Any, ax: Any, record: Dict[str, Any]) -> None:
             row.cliffs_delta
         )
     figures.heatmap_with_colorbar(
-        figure, ax, field, title="Cliff's delta for the pairs of every surviving metric",
+        figure, ax, field, title="Cliff's delta",
         symmetric=True, colorbar_label="Cliff's delta", interpolation="none",
     )
     ax.set_yticks(np.arange(len(metrics)))

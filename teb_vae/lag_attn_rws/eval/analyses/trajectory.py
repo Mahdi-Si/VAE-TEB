@@ -29,7 +29,7 @@ delivery: ``epoch`` is the segment's own start on that axis and an anchor is $4$
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Dict, List, NamedTuple, Optional, Tuple
+from typing import Any, Dict, List, Mapping, NamedTuple, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -37,6 +37,7 @@ from loguru import logger
 
 from teb_vae.lag_attn_rws.eval import cohort
 from teb_vae.lag_attn_rws.eval import figures_seam as figures
+from teb_vae.lag_attn_rws.eval._reuse import labels
 from teb_vae.lag_attn.nets.lag_report import SECONDS_PER_STEP
 
 #: This analysis's own subdirectory inside the results directory.
@@ -262,6 +263,7 @@ def build_profile_figure(
     readout: Readout,
     *,
     guid: Optional[str] = None,
+    subgroups: Optional[Mapping[str, str]] = None,
 ) -> Any:
     """Draw one readout's within-segment profile and its assembled trajectory across a delivery.
 
@@ -276,6 +278,8 @@ def build_profile_figure(
         readout: The entry of :data:`READOUTS` this page resolves.
         guid: Which recording to draw. The longest one when omitted, chosen because a short
             recording shows neither an overlap nor a break.
+        subgroups: Recording to subgroup, so the lower panel's title names the subgroup of the
+            recording it draws beside its GUID. A recording absent from the map is named alone.
 
     Returns:
         The figure; the caller renders and closes it.
@@ -286,13 +290,30 @@ def build_profile_figure(
     )
     _draw_within_segment(
         axes[0, 0], cell,
-        title=f"{readout.name} against time in segment",
+        title=readout.name,
         ylabel=readout.ylabel,
     )
     _draw_whole_delivery(
-        axes[1, 0], trajectory, name=readout.name, column=readout.column, guid=guid
+        axes[1, 0], trajectory, name=readout.name, column=readout.column, guid=guid,
+        subgroups=subgroups,
     )
     return figure
+
+
+def recording_subgroups(per_sample: Optional[pd.DataFrame]) -> Dict[str, str]:
+    """Map each recording to its subgroup, for a figure that names a GUID.
+
+    Args:
+        per_sample: The per-sample table, or ``None``.
+
+    Returns:
+        GUID to subgroup label; empty when the table carries neither column.
+    """
+    columns = getattr(per_sample, "columns", [])
+    if "guid" not in columns or labels.SUBGROUP_COLUMN not in columns:
+        return {}
+    known = per_sample[["guid", labels.SUBGROUP_COLUMN]].dropna().drop_duplicates("guid")
+    return dict(zip(known["guid"].astype(str), known[labels.SUBGROUP_COLUMN].astype(str)))
 
 
 def _draw_within_segment(ax: Any, cell: pd.DataFrame, *, title: str, ylabel: str) -> None:
@@ -310,11 +331,11 @@ def _draw_within_segment(ax: Any, cell: pd.DataFrame, *, title: str, ylabel: str
     ax.fill_between(
         x, np.asarray(ordered["q25"], dtype=np.float64),
         np.asarray(ordered["q75"], dtype=np.float64),
-        color=figures.COLOR_BLUE, alpha=0.2, linewidth=0, label="IQR over recordings",
+        color=figures.COLOR_BLUE, alpha=0.2, linewidth=0, label="IQR",
     )
     ax.plot(
         x, np.asarray(ordered["median"], dtype=np.float64),
-        color=figures.COLOR_BLUE, linewidth=figures.LINE_EMPHASIS, label="median over recordings",
+        color=figures.COLOR_BLUE, linewidth=figures.LINE_EMPHASIS, label="median",
     )
     ax.set_title(title)
     ax.set_xlabel("Time in segment (s)")
@@ -324,7 +345,8 @@ def _draw_within_segment(ax: Any, cell: pd.DataFrame, *, title: str, ylabel: str
 
 
 def _draw_whole_delivery(
-    ax: Any, trajectory: pd.DataFrame, *, name: str, column: str, guid: Optional[str]
+    ax: Any, trajectory: pd.DataFrame, *, name: str, column: str, guid: Optional[str],
+    subgroups: Optional[Mapping[str, str]] = None,
 ) -> None:
     """Draw one readout of one recording's assembled trajectory, with its breaks left as breaks.
 
@@ -338,13 +360,14 @@ def _draw_whole_delivery(
         name: The readout's reported name, for the legend.
         column: The readout's column on that table.
         guid: Which recording to draw, or ``None`` for the longest.
+        subgroups: Recording to subgroup, for the title.
     """
     if trajectory.empty:
         ax.text(
             0.5, 0.5, figures.EMPTY_NOTE, transform=ax.transAxes,
             ha="center", va="center", fontsize=figures.FONT_NOTE, color=figures.COLOR_GRAY,
         )
-        ax.set_title("Whole-delivery trajectory")
+        ax.set_title("Whole delivery")
         figures.style_axes(ax)
         return
 
@@ -363,11 +386,11 @@ def _draw_whole_delivery(
     if column in cell.columns:
         values = np.insert(np.asarray(cell[column], dtype=np.float64), breaks, np.nan)
         ax.plot(hours_with_breaks, values, linewidth=figures.LINE_REGULAR, label=name)
-    ax.set_title(f"Whole-delivery trajectory: {chosen} ({name})")
+    subgroup = (subgroups or {}).get(str(chosen))
+    ax.set_title(f"guid {chosen}, subgroup {subgroup}" if subgroup else f"guid {chosen}")
     ax.set_xlabel("Time before delivery (hours)")
     ax.set_ylabel("nats per anchor")
     ax.invert_xaxis()
-    ax.legend(fontsize=figures.FONT_LABEL, loc="best")
     figures.style_axes(ax)
 
 
@@ -433,10 +456,11 @@ def run_trajectory_analysis(
 
     # One page per readout rather than one carrying both, so neither is drawn on the other's
     # scale on the shared whole-delivery axis.
+    subgroups = recording_subgroups(getattr(context.collection, "per_sample", None))
     figure_names = [
         str(
             figures.render_figure(
-                build_profile_figure(profile, trajectory, readout),
+                build_profile_figure(profile, trajectory, readout, subgroups=subgroups),
                 directory / f"{PROFILE_FIGURE}_{readout.slug}",
             ).name
         )

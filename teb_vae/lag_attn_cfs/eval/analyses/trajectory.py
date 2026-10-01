@@ -370,7 +370,7 @@ def build_profile_figure(
     )
     _draw_within_segment(
         axes[0, 0], cell,
-        title=f"{readout.name} against time in segment",
+        title=readout.name,
         ylabel=readout.ylabel,
     )
     _draw_whole_delivery(
@@ -394,11 +394,11 @@ def _draw_within_segment(ax: Any, cell: pd.DataFrame, *, title: str, ylabel: str
     ax.fill_between(
         x, np.asarray(ordered["q25"], dtype=np.float64),
         np.asarray(ordered["q75"], dtype=np.float64),
-        color=figures.COLOR_BLUE, alpha=0.2, linewidth=0, label="IQR over recordings",
+        color=figures.COLOR_BLUE, alpha=0.2, linewidth=0, label="IQR",
     )
     ax.plot(
         x, np.asarray(ordered["median"], dtype=np.float64),
-        color=figures.COLOR_BLUE, linewidth=figures.LINE_EMPHASIS, label="median over recordings",
+        color=figures.COLOR_BLUE, linewidth=figures.LINE_EMPHASIS, label="median",
     )
     ax.set_title(title)
     ax.set_xlabel("Time in segment (s)")
@@ -419,7 +419,8 @@ def _draw_whole_delivery(
     Args:
         ax: Target axes.
         trajectory: The whole-delivery table.
-        name: The readout's reported name, for the legend.
+        name: The readout's reported name. The panel is one series, so it carries no legend; the
+            readout is named by the profile panel above it.
         column: The readout's column on that table.
         guid: Which recording to draw, or ``None`` for the longest.
     """
@@ -431,7 +432,7 @@ def _draw_whole_delivery(
             0.5, 0.5, figures.EMPTY_NOTE, transform=ax.transAxes,
             ha="center", va="center", fontsize=figures.FONT_NOTE, color=figures.COLOR_GRAY,
         )
-        ax.set_title(f"Whole-delivery trajectory ({name})")
+        ax.set_title("Whole-delivery trajectory")
         figures.style_axes(ax)
         return
 
@@ -445,7 +446,12 @@ def _draw_whole_delivery(
     for axis in (labels.SUBGROUP_COLUMN, labels.CLASS_COLUMN):
         known = cell[axis].dropna() if axis in cell.columns else ()
         cohorts[axis] = str(known.iloc[0]) if len(known) else None
-    tag = ", ".join(value or f"no {axis}" for axis, value in cohorts.items())
+    tag = ", ".join(
+        f"{word} {value or 'n/a'}"
+        for word, value in (
+            ("subgroup", cohorts[labels.SUBGROUP_COLUMN]), ("class", cohorts[labels.CLASS_COLUMN])
+        )
+    )
     clinical_class = cohorts[labels.CLASS_COLUMN]
     colour = (
         figures.group_colors([clinical_class]).get(clinical_class) if clinical_class
@@ -463,14 +469,11 @@ def _draw_whole_delivery(
     hours_with_breaks = np.insert(hours, breaks, np.nan)
     if column in cell.columns:
         values = np.insert(np.asarray(cell[column], dtype=np.float64), breaks, np.nan)
-        ax.plot(
-            hours_with_breaks, values, linewidth=figures.LINE_REGULAR, label=name, color=colour
-        )
-    ax.set_title(f"Whole-delivery trajectory: {chosen} ({tag}), {name}")
+        ax.plot(hours_with_breaks, values, linewidth=figures.LINE_REGULAR, color=colour)
+    ax.set_title(f"guid {chosen}, {tag}")
     ax.set_xlabel("Time before delivery (hours)")
     ax.set_ylabel("nats per anchor")
     ax.invert_xaxis()
-    ax.legend(fontsize=figures.FONT_LABEL, loc="best")
     figures.style_axes(ax)
 
 

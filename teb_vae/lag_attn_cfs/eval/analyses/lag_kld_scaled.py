@@ -56,8 +56,9 @@ That is what lets ``num_heads`` be a *run* property (it is a ``binding.GEOMETRY_
 arm can change it) and a band be added without widening a table, and it is the shape
 ``lag_clocks``' own trajectory table and ``lag_kl``'s stratified profile already use.
 
-**The axis is stored-coefficient time.** Every row and every figure carries
-:data:`~teb_vae.lag_attn_cfs.eval.lag_axis.GROUP_DELAY_CAVEAT`.
+**The axis is stored-coefficient time.** Every row carries
+:data:`~teb_vae.lag_attn_cfs.eval.lag_axis.GROUP_DELAY_CAVEAT` and every figure the one-line
+:data:`~teb_vae.lag_attn_cfs.eval.lag_axis.GROUP_DELAY_NOTE`.
 
 .. note::
 
@@ -242,7 +243,7 @@ CLOCKS: Tuple[Clock, ...] = (
         binner=cohort.add_second_stage_bins,
         bin_column=cohort.SECOND_STAGE_BIN_COLUMN,
         center_column=cohort.SECOND_STAGE_BIN_CENTER_COLUMN,
-        axis_label="Hours from second-stage onset (negative = before onset, positive = after)",
+        axis_label="Hours from second-stage onset",
         inverted=False,
         figure="lag_kld_scaled_second_stage",
         eligible_only=True,
@@ -757,7 +758,7 @@ def build_band_figure(
         clock: The clock, for its axis label and orientation.
         trajectory: The long-form trajectory frame.
         bands: The partition, in panel order.
-        seconds: The compensated axis, for each band's span in the panel title.
+        seconds: The compensated axis, for each band's span in seconds in the panel title.
 
     Returns:
         The figure.
@@ -779,7 +780,7 @@ def build_band_figure(
         panel = axes[index][0]
         span = bands[name]
         # The band's EDGES: an inclusive lag range spans half a step past its first and last
-        # centre, so "lags 0-14" is 0-60 s rather than 0-56 s.
+        # centre, so the span is one lag step wider than the range of the centres.
         half_lag = SECONDS_PER_LAG_STEP / 2.0
         lo = float(seconds[max(span[0], 0)]) - half_lag if seconds.size else 0.0
         hi = float(seconds[min(span[1], seconds.size - 1)]) + half_lag if seconds.size else 0.0
@@ -798,10 +799,7 @@ def build_band_figure(
                 color=colors.get(group, figures.COLOR_GRAY),
                 linewidth=figures.LINE_REGULAR, label=group,
             )
-        panel.set_title(
-            f"{name}: lags {span[0]}-{span[1]} steps ({max(lo, 0.0):g}-{hi:g} s)",
-            fontsize=figures.FONT_SMALL,
-        )
+        panel.set_title(f"{name.capitalize()}, {max(lo, 0.0):g}-{hi:g} s", fontsize=figures.FONT_SMALL)
         panel.set_ylabel("nats per anchor")
         if clock.inverted:
             panel.invert_xaxis()

@@ -357,7 +357,8 @@ def build_baseline_figure(
     Args:
         per_guid: Per-recording means.
         skill_rows: The skill table, as :func:`build_skill_rows` returns it.
-        unit: The unit label the error panel is in.
+        unit: The unit the errors are in. Unused by the drawing, because the skill is a unitless
+            ratio; kept so the builder's signature matches the record it is called with.
 
     Returns:
         The figure; the caller renders and closes it.
@@ -369,7 +370,7 @@ def build_baseline_figure(
             name: _finite_column(per_guid, _BLOCK_COLUMN.format(branch=name))
             for name in FORECAST_BRANCHES
         },
-        title="Block score per recording (lower is better)",
+        title="Block score",
         ylabel="nats per anchor",
     )
 
@@ -397,7 +398,7 @@ def build_baseline_figure(
         axis.set_yticklabels(labels, fontsize=figures.FONT_LABEL)
     else:
         axis.text(0.5, 0.5, figures.EMPTY_NOTE, ha="center", va="center", transform=axis.transAxes)
-    axis.set_title(f"Squared-error skill, bootstrap CI over recordings (errors in {unit})")
+    axis.set_title("Squared-error skill")
     axis.set_xlabel("1 - MSE(model) / MSE(baseline)")
     figures.style_axes(axis)
     return figure
@@ -441,9 +442,9 @@ def build_anchor_profile_figure(
                 _finite_column(profile, "nll_full_block"),
             ]
         ),
-        ["target-only (base)", "source-conditioned (full)"],
-        title="Block score against time in segment",
-        xlabel="anchor (decimated steps from the start of the trimmed segment)",
+        ["target-only", "source-conditioned"],
+        title="Block score",
+        xlabel="anchor (decimated steps)",
         ylabel="nats per anchor",
     )
     figures.multi_line_panel(
@@ -451,8 +452,8 @@ def build_anchor_profile_figure(
         anchors,
         _finite_column(profile, "pred_gap")[None, :],
         ["pred_gap"],
-        title="pred_gap against time in segment",
-        xlabel="anchor (decimated steps from the start of the trimmed segment)",
+        title="Forecast gap",
+        xlabel="anchor (decimated steps)",
         ylabel="nats per anchor",
     )
     for axis in (axes[0, 0], axes[1, 0]):
@@ -490,14 +491,14 @@ def build_horizon_figure(curves: pd.DataFrame, *, horizon_steps: int) -> Any:
         np.vstack(
             [_finite_column(curves, f"d_base_nats{suffix}"), _finite_column(curves, f"d_full_nats{suffix}")]
         ),
-        ["target-only (base)", "source-conditioned (full)"],
-        title="Forecast score by lead time (single-draw path)",
+        ["target-only", "source-conditioned"],
+        title="Forecast score",
         xlabel="lead time (s)",
         ylabel="nats per scored coefficient" if per_coefficient else "nats per horizon step",
     )
     figures.multi_line_panel(
         axes[1, 0], lead, _finite_column(curves, "gap_nats")[None, :], ["pred_gap"],
-        title="Source contribution by lead time",
+        title="Forecast gap",
         xlabel="lead time (s)", ylabel="nats per horizon step",
     )
     has_unit = len(curves) and "rmse_unit" in getattr(curves, "columns", [])
@@ -508,13 +509,13 @@ def build_horizon_figure(curves: pd.DataFrame, *, horizon_steps: int) -> Any:
             [_finite_column(curves, f"rmse_{branch}_normalised") for branch in MODEL_BRANCHES]
         ),
         list(MODEL_BRANCHES),
-        title="Forecast error by lead time",
-        xlabel="lead time (s)", ylabel=f"RMSE per coefficient ({unit})",
+        title="Forecast error",
+        xlabel="lead time (s)", ylabel=f"RMSE ({unit})",
     )
     figures.multi_line_panel(
         axes[3, 0], lead, _finite_column(curves, "scored_channels_per_anchor")[None, :],
         ["scored channels"],
-        title="Channels in the forecast density at each lead (scored-cell mask)",
+        title="Scored channels",
         xlabel="lead time (s)", ylabel="channels per anchor",
     )
     for axis in axes[:, 0]:
@@ -837,7 +838,7 @@ def build_overlay_figure(
             axis = axes[index, column]
             values = retained.get(f"{name}_raw")
             if values is None or row >= len(values):
-                axis.text(0.5, 0.5, f"raw {name.upper()} not retained by this run", transform=axis.transAxes,
+                axis.text(0.5, 0.5, "not retained", transform=axis.transAxes,
                           ha="center", va="center", fontsize=figures.FONT_NOTE, color=figures.COLOR_GRAY)
                 axis.set_ylabel(name.upper())
                 axis.set_yticks([])
@@ -881,15 +882,12 @@ def build_overlay_figure(
                 axis.axvspan((int(scored_horizon[channel]) + 0.5) * SECONDS_PER_STEP, x_limits[1],
                              color=figures.COLOR_LIGHT_GRAY, alpha=0.7, linewidth=0, zorder=0)
             if column == 0:
-                scored = "" if scored_horizon is None else f", scored {int(scored_horizon[channel])} of {horizon} steps"
-                axis.set_title(f"{labels_of[offset]}{scored}")
-                axis.set_ylabel(f"coefficient ({NORMALISED_UNIT})")
+                axis.set_title(labels_of[offset])
+                axis.set_ylabel("coefficient ($z$)")
 
-        hours = sample.get("hours_before_delivery", float("nan"))
-        hours = f"{float(hours):.2f} h before delivery" if pd.notna(hours) else "time unknown"
+        subgroup = sample.get(labels.SUBGROUP_COLUMN)
         axes[0, column].set_title(
-            f"{sample.get('guid')} | {sample.get(labels.SUBGROUP_COLUMN)} | {sample.get(labels.CLASS_COLUMN)}\n"
-            f"anchor step {step}, {hours}"
+            f"guid {sample.get('guid')}, subgroup {'n/a' if pd.isna(subgroup) else subgroup}"
         )
 
     for grid_row in range(len(rows)):
@@ -906,29 +904,22 @@ def build_overlay_figure(
             if grid_row < len(rows) - 1:
                 axis.tick_params(labelbottom=False)
             else:
-                axis.set_xlabel("time from the anchor's causal endpoint (s)")
+                axis.set_xlabel("time from anchor (s)")
 
     handles = [
         Line2D([0], [0], color=figures.COLOR_BLACK, linewidth=figures.LINE_THIN, linestyle="--", label="target, history"),
-        Line2D([0], [0], color=figures.COLOR_BLACK, linewidth=figures.LINE_REGULAR, label="target, forecast window"),
-        Line2D([0], [0], color=figures.COLOR_BLUE, linewidth=figures.LINE_REGULAR, label="target-only mean (base)"),
-        Line2D([0], [0], color=figures.COLOR_VERMILLION, linewidth=figures.LINE_REGULAR, label="source-conditioned mean (full)"),
-        Patch(color=figures.COLOR_LIGHT_GRAY, label="cells past the scored horizon"),
-        Patch(color=figures.COLOR_GREEN, alpha=0.3, label="detected contraction"),
+        Line2D([0], [0], color=figures.COLOR_BLACK, linewidth=figures.LINE_REGULAR, label="target, forecast"),
+        Line2D([0], [0], color=figures.COLOR_BLUE, linewidth=figures.LINE_REGULAR, label="target-only"),
+        Line2D([0], [0], color=figures.COLOR_VERMILLION, linewidth=figures.LINE_REGULAR, label="source-conditioned"),
+        Patch(color=figures.COLOR_LIGHT_GRAY, label="unscored cells"),
+        Patch(color=figures.COLOR_GREEN, alpha=0.3, label="contraction"),
     ]
-    band = (
-        "The shaded band is the predictive $\\pm 1\\sigma$ of each branch whose log-variance was retained"
-        + (", widened to the AR(1) residual's marginal variance." if ar_coef is not None
-           else "; it is the per-cell innovation sigma, narrower than the marginal spread when the AR(1) residual is on.")
-        if predictive_band
-        else "No predictive band is drawn: this checkpoint's likelihood does not train the log-variance head."
-    )
     height_in = float(figure.get_size_inches()[1])
-    bottom = figures.caveat_note(
-        figure,
-        "One column per retained sample, one anchor each, at its median scored anchor. The raw rows are drawn "
-        "on the fixed CTG scale and every coefficient row shares its y-axis across samples. Coefficients are in "
-        f"the loader's z units. {band}",
+    # One short key for the band, and only where a band is drawn; the rest of what a reader may ask
+    # (the anchor each column is drawn at, the shared scales, the AR(1) widening) is in
+    # ``FIGURE_GUIDE.md``.
+    bottom = (
+        figures.caveat_note(figure, "Band: predictive $\\pm 1\\sigma$.") if predictive_band else 0.0
     )
     figure.legend(handles=handles, loc="upper center", ncol=len(handles), frameon=False,
                   fontsize=figures.FONT_SMALL, bbox_to_anchor=(0.5, 1.0))

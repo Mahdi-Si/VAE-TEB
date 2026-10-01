@@ -19,14 +19,16 @@ into its own subdirectory; what is here is the drawing.
   the declared bands take fixed colours in declaration order and a legend names them.
 * An empty panel says so. A block the run did not produce -- a target-only arm has no bands, a
   normalised fusion has no latent profile -- draws :data:`EMPTY_NOTE` rather than an empty frame.
-* Every lag axis is stored-coefficient time, labelled as such, with the qualification the lag
-  readouts must be read with drawn under the figure rather than left in the summary.
+* Every lag axis is stored-coefficient time, labelled as such, and a figure that reads one carries
+  the one-line :data:`~teb_vae.lag_attn_cfs.eval.lag_axis.GROUP_DELAY_NOTE` under it. The long
+  qualification (:data:`~teb_vae.lag_slot_transformer_cfs.nets.controls.SUPPRESSION_QUALIFICATION`)
+  travels in the summary and the figure guide, not across the image.
 
 The style is the shared evaluation publication style -- open frames, a 7 pt serif scale,
 unframed legends, panel letters, a double-column width -- applied once per process by
 :func:`configure_figure_style`; importing this module restyles nothing. Titles are short noun
-phrases; what a panel means is written in its axis labels and in the figure guide beside this
-package, not in a sentence across its top.
+phrases, a figure carries at most one short note line, and what a panel means is written in its
+axis labels and in the figure guide beside this package, not in a sentence across its top.
 """
 from __future__ import annotations
 
@@ -59,8 +61,8 @@ from teb_vae.lag_attn.eval.figures import (  # noqa: E402
 )
 from teb_vae.lag_attn.eval.figures import configure_figure_style as _configure_shared_style  # noqa: E402
 from teb_vae.lag_attn.nets.lag_report import SECONDS_PER_STEP  # noqa: E402
+from teb_vae.lag_attn_cfs.eval.lag_axis import GROUP_DELAY_NOTE  # noqa: E402
 from teb_vae.lag_slot_transformer_cfs.eval.lag_metrics import SUPPRESSION_PREFIX  # noqa: E402
-from teb_vae.lag_slot_transformer_cfs.nets.controls import SUPPRESSION_QUALIFICATION  # noqa: E402
 
 __all__ = [
     "ACCEPTANCE_FIGURES",
@@ -199,13 +201,13 @@ def _finish(fig: Any, *, footnote_text: Optional[str] = None) -> Any:
     """Lay the figure out, leaving room for a footnote when one was written.
 
     The footnote goes through the shared :func:`~teb_vae.lag_attn.eval.figures.footnote`, which
-    wraps it to the figure width and reserves the room the wrapped block needs; the layout here is
-    then done above that room, so a long qualification pushes the axes up rather than crossing
-    their x label.
+    reserves the room the line needs; the layout here is then done above that room, so the note
+    sits under the axes rather than across their x label. A note is one short line, at most
+    :data:`~teb_vae.lag_attn.eval.figures.FOOTNOTE_MAX_CHARS` characters.
 
     Args:
         fig: The figure.
-        footnote_text: The footnote, or ``None``.
+        footnote_text: The one-line note, or ``None``.
 
     Returns:
         The same figure.
@@ -455,7 +457,7 @@ def build_headline_figure(results: Mapping[str, Any]) -> Any:
     margin_rows = []
     gap = headline.get("pred_gap") or {}
     margin_rows.append(
-        ("pred_gap (base $-$ full)", _finite(gap.get("point")), _finite(gap.get("lo")),
+        ("pred_gap", _finite(gap.get("point")), _finite(gap.get("lo")),
          _finite(gap.get("hi")), FAMILY_COLORS["branch"])
     )
     for name, block in bands.items():
@@ -476,20 +478,16 @@ def build_headline_figure(results: Mapping[str, Any]) -> Any:
     height = _dot_figure_height(max(len(score_rows), len(margin_rows)))
     fig, axes = plt.subplots(1, 2, figsize=(FIGURE_WIDTH, height))
     _dot_intervals(
-        axes[0], score_rows, xlabel="predictive score (nats per anchor; lower is better)",
-        title="Score per arm",
+        axes[0], score_rows, xlabel="score (nats per anchor)", title="Score per arm",
     )
     _dot_intervals(
-        axes[1], margin_rows, xlabel="paired margin against the full branch (nats per anchor)",
-        title="Margins, paired over recordings", zero=True,
+        axes[1], margin_rows, xlabel="margin vs full (nats per anchor)", title="Paired margin",
+        zero=True,
     )
     return _finish(
         fig,
         footnote_text=(
-            "A positive margin means the fitted model predicts worse under the intervention. The "
-            "silence, suppress:none and suppress:all rows are identities that verify the "
-            "intervention path; the gap is necessary and not sufficient, and is read beside an "
-            "independently trained target-only reference."
+            "Lower score is better; a positive margin means worse prediction under the intervention."
         ),
     )
 
@@ -523,8 +521,7 @@ def build_gap_distribution_figure(
     )
     histogram_panel(
         axes[1], [value for value in concentration if value not in (None, "")],
-        title="Effective draw count per recording (full branch)",
-        xlabel="$1 / \\sum_k w_k^2$ over the $K$ draws",
+        title="Effective draw count", xlabel="$1 / \\sum_k w_k^2$",
         color=COLOR_PURPLE,
         reference=None if draws is None else float(draws),
         reference_label="" if draws is None else f"K = {int(draws)}",
@@ -559,14 +556,12 @@ def build_band_figure(results: Mapping[str, Any]) -> Any:
         )
         exposure_rows.append((name, _finite(block.get("band_anchors")), None, None, colour))
     _dot_intervals(
-        axes[0], rows, xlabel="paired suppression margin (nats per anchor)",
-        title="Band suppression", zero=True,
+        axes[0], rows, xlabel="margin (nats per anchor)", title="Band suppression", zero=True,
     )
     _dot_intervals(
-        axes[1], exposure_rows, xlabel="scored anchor-lag pairs with an available channel",
-        title="Exposure behind each margin",
+        axes[1], exposure_rows, xlabel="usable anchor-lag pairs", title="Exposure",
     )
-    return _finish(fig, footnote_text=SUPPRESSION_QUALIFICATION)
+    return _finish(fig, footnote_text=GROUP_DELAY_NOTE)
 
 
 def build_lag_profile_figure(results: Mapping[str, Any]) -> Any:
@@ -601,8 +596,8 @@ def build_lag_profile_figure(results: Mapping[str, Any]) -> Any:
     fig, axes = plt.subplots(4, 1, figsize=(FIGURE_WIDTH, 8.0), sharex=True)
     if anchors.size == 0:
         for ax in axes:
-            _note_empty(ax, "no lag was read: this arm has no source pathway")
-        return _finish(fig, footnote_text=SUPPRESSION_QUALIFICATION)
+            _note_empty(ax, "no source pathway")
+        return _finish(fig, footnote_text=GROUP_DELAY_NOTE)
 
     # Exposure, as two fractions on one axis.
     ax = axes[0]
@@ -612,7 +607,7 @@ def build_lag_profile_figure(results: Mapping[str, Any]) -> Any:
         channel_fraction = mean_channels / float(max(n_source, 1))
     ax.plot(lags, live, color=COLOR_GRAY, linewidth=_CURVE_WIDTH, label="live anchors")
     ax.plot(lags, channel_fraction, color=COLOR_BLUE, linewidth=_CURVE_WIDTH,
-            label="available channels at live anchors")
+            label="channels available")
     ax.set_ylim(-0.02, 1.02)
     ax.set_ylabel("fraction")
     ax.set_title("Exposure per lag")
@@ -625,7 +620,7 @@ def build_lag_profile_figure(results: Mapping[str, Any]) -> Any:
     drawn = False
     for name, colour, label in (
         ("proposal_norm", COLOR_GRAY, "proposal norm"),
-        ("update_shift", COLOR_BLUE, "mean-update shift when removed"),
+        ("update_shift", COLOR_BLUE, "update shift"),
         ("scale_proposal_norm", COLOR_PURPLE, "scale proposal norm"),
     ):
         values = latent.get(name)
@@ -642,7 +637,7 @@ def build_lag_profile_figure(results: Mapping[str, Any]) -> Any:
         style_axes(ax)
         _shade_bands(ax, results, label=False)
     else:
-        _note_empty(ax, "no latent profile: this arm sums no per-lag updates")
+        _note_empty(ax, "no latent profile")
 
     ax = axes[2]
     values = latent.get("divergence_drop")
@@ -651,35 +646,30 @@ def build_lag_profile_figure(results: Mapping[str, Any]) -> Any:
         ax.plot(lags[: curve.size], curve, color=COLOR_VERMILLION, linewidth=_CURVE_WIDTH)
         ax.axhline(0.0, color=COLOR_GRAY, linestyle=":", linewidth=_REFERENCE_WIDTH)
         ax.set_ylabel("nats per anchor")
-        ax.set_title("Divergence drop, lag removed alone (signed)")
+        ax.set_title("Divergence drop, lag removed")
         style_axes(ax)
         _shade_bands(ax, results, label=False)
     else:
-        _note_empty(ax, "no latent profile: this arm sums no per-lag updates")
+        _note_empty(ax, "no latent profile")
 
     ax = axes[3]
     margin = predictive.get("margin_nats") or {}
     if predictive.get("status") == "READ" and _ribbon(
-        ax, lags, margin, colour=COLOR_GREEN,
-        label=(
-            f"single-lag suppression margin, paired over {margin.get('n', '?')} recordings "
-            f"({predictive.get('n_segments', '?')} segments)"
-        ),
+        ax, lags, margin, colour=COLOR_GREEN, label="margin",
     ):
         ax.axhline(0.0, color=COLOR_GRAY, linestyle=":", linewidth=_REFERENCE_WIDTH)
         ax.set_ylabel("nats per anchor")
-        ax.set_title("Predictive margin, lag removed alone")
-        legend_with_headroom(ax)
+        ax.set_title("Predictive margin, lag removed")
         style_axes(ax)
         _shade_bands(ax, results, label=False)
     else:
         _note_empty(ax, f"predictive lag profile {predictive.get('status', 'absent')}")
-    ax.set_xlabel("lag (stored steps back from the anchor)")
+    ax.set_xlabel("lag (stored steps)")
     _lag_seconds_axis(
         axes[0], float(axis.get("seconds_per_step", SECONDS_PER_STEP)),
         int(axis.get("delay_steps", 0) or 0),
     )
-    return _finish(fig, footnote_text=SUPPRESSION_QUALIFICATION)
+    return _finish(fig, footnote_text=GROUP_DELAY_NOTE)
 
 
 def build_horizon_figure(results: Mapping[str, Any]) -> Any:
@@ -701,16 +691,15 @@ def build_horizon_figure(results: Mapping[str, Any]) -> Any:
     fig, axes = plt.subplots(3, 1, figsize=(FIGURE_WIDTH, 6.6), sharex=True)
     if not positions:
         for ax in axes:
-            _note_empty(ax, "no horizon-resolved score was collected")
+            _note_empty(ax, "no horizon-resolved score")
         return _finish(fig)
 
     unit = str(block.get("unit", "nats per anchor per horizon step"))
     ax = axes[0]
     if _ribbon(ax, positions, block.get("pred_gap") or {}, colour=COLOR_BLUE, label="pred_gap"):
         ax.axhline(0.0, color=COLOR_GRAY, linestyle=":", linewidth=_REFERENCE_WIDTH)
-        ax.set_title("Predictive gap (base $-$ full) by horizon step")
+        ax.set_title("Predictive gap")
         ax.set_ylabel(unit)
-        legend_with_headroom(ax)
         style_axes(ax)
     else:
         _note_empty(ax)
@@ -725,12 +714,12 @@ def build_horizon_figure(results: Mapping[str, Any]) -> Any:
             drawn += 1
     if drawn:
         ax.axhline(0.0, color=COLOR_GRAY, linestyle=":", linewidth=_REFERENCE_WIDTH)
-        ax.set_title("Band suppression margins by horizon step, paired over recordings")
+        ax.set_title("Band suppression")
         ax.set_ylabel(unit)
         legend_with_headroom(ax, ncol=min(max(drawn, 1), 4))
         style_axes(ax)
     else:
-        _note_empty(ax, "no band was suppressed")
+        _note_empty(ax, "no band suppressed")
 
     ax = axes[2]
     control_margins = block.get("control_margins") or {}
@@ -743,21 +732,17 @@ def build_horizon_figure(results: Mapping[str, Any]) -> Any:
             drawn += 1
     if drawn:
         ax.axhline(0.0, color=COLOR_GRAY, linestyle=":", linewidth=_REFERENCE_WIDTH)
-        ax.set_title("Source control margins by horizon step, paired over recordings")
+        ax.set_title("Source controls")
         ax.set_ylabel(unit)
         legend_with_headroom(ax, ncol=3)
         style_axes(ax)
     else:
-        _note_empty(ax, "no source control ran")
+        _note_empty(ax, "no control run")
     ax.set_xlabel("horizon step")
     ax.set_xticks(positions)
     return _finish(
         fig,
-        footnote_text=(
-            "Each step is the marginal mixture of its own likelihood factors under the shared "
-            "draws; the steps do not sum to the joint block score. Positive margins mean the "
-            "fitted model predicts that step worse under the intervention."
-        ),
+        footnote_text="A positive margin is worse prediction; steps do not sum to the block score.",
     )
 
 
@@ -779,7 +764,7 @@ def build_block_figure(results: Mapping[str, Any]) -> Any:
     counts = block.get("channels_per_block") or {}
     if not positions:
         fig, ax = plt.subplots(1, 1, figsize=(FIGURE_WIDTH * 0.5, 2.2))
-        _note_empty(ax, "no block-resolved score was collected")
+        _note_empty(ax, "no block-resolved score")
         return _finish(fig)
 
     names = _declared_bands(results)
@@ -798,7 +783,7 @@ def build_block_figure(results: Mapping[str, Any]) -> Any:
             rows.append((control, *_curve_at(record, index), FAMILY_COLORS["control"]))
         held = counts.get(name)
         _dot_intervals(
-            axes[index], rows, xlabel="nats per anchor, summed over the block",
+            axes[index], rows, xlabel="nats per anchor (block sum)",
             title=f"Block {name}" + ("" if held is None else f" ({int(held)} channels)"),
             zero=True,
         )
@@ -842,7 +827,7 @@ def build_calibration_figure(results: Mapping[str, Any]) -> Any:
         ax.set_aspect("equal", adjustable="box")
         ax.set_xlabel("nominal central coverage")
         ax.set_ylabel("observed coverage")
-        ax.set_title("Central coverage of the mixture")
+        ax.set_title("Central coverage")
         ax.legend(loc="upper left")
         style_axes(ax)
     else:
@@ -911,18 +896,10 @@ def build_acceptance_comparisons_figure(record: Mapping[str, Any]) -> Any:
                      _finite(interval.get("hi")), colour))
     fig, ax = plt.subplots(1, 1, figsize=(FIGURE_WIDTH, 0.5 * max(len(rows), 3) + _DOT_MARGIN_HEIGHT))
     _dot_intervals(
-        ax, rows, xlabel="left $-$ right, nll_full (nats per anchor)\nnegative favours the left",
-        title="Primary comparisons, paired over recordings and averaged over seeds",
+        ax, rows, xlabel="$\\Delta$ nll_full (nats per anchor)", title="Primary comparisons",
         zero=True,
     )
-    return _finish(
-        fig,
-        footnote_text=(
-            "A comparison is READ at the declared draw count when both arms carry the seed "
-            "minimum; a grey row is one that was not read, and its interval, where drawn, is "
-            "below the seed minimum or unmatched."
-        ),
-    )
+    return _finish(fig, footnote_text="Negative favours the left arm; a grey row was not read.")
 
 
 def build_acceptance_arms_figure(record: Mapping[str, Any]) -> Any:
@@ -949,13 +926,11 @@ def build_acceptance_arms_figure(record: Mapping[str, Any]) -> Any:
     against = {arm: (entry.get("against_reference") or {}) for arm, entry in per_arm.items()}
     _dot_intervals(
         axes[1], _record_rows(against, "full_minus_reference_nats", FAMILY_COLORS["control"]),
-        xlabel="full $-$ reference (nats per anchor)\nnegative favours the arm",
-        title="Full branch against the frozen reference", zero=True,
+        xlabel="full $-$ reference (nats per anchor)", title="Full vs reference", zero=True,
     )
     _dot_intervals(
         axes[2], _record_rows(against, "base_minus_reference_nats", FAMILY_COLORS["reference"]),
-        xlabel="base $-$ reference (nats per anchor)\npositive is a degraded base",
-        title="Base branch against the frozen reference", zero=True,
+        xlabel="base $-$ reference (nats per anchor)", title="Base vs reference", zero=True,
     )
     return _finish(fig)
 
@@ -978,8 +953,8 @@ def build_acceptance_bands_figure(record: Mapping[str, Any]) -> Any:
     searched = {arm: entry for arm, entry in bands_block.items() if entry.get("status") == "READ"}
     if not searched:
         fig, ax = plt.subplots(1, 1, figsize=(FIGURE_WIDTH * 0.5, 2.2))
-        _note_empty(ax, "no arm searched the lag bands")
-        return _finish(fig, footnote_text=SUPPRESSION_QUALIFICATION)
+        _note_empty(ax, "no band search")
+        return _finish(fig)
     fig, axes = plt.subplots(
         1, len(searched), figsize=(min(FIGURE_WIDTH, 3.6 * len(searched)), 2.8),
         sharey=True, squeeze=False,
@@ -1000,16 +975,11 @@ def build_acceptance_bands_figure(record: Mapping[str, Any]) -> Any:
                          _finite(nominal.get("hi")), _band_colour(index, len(names))))
         peak = entry.get("peak_band")
         _dot_intervals(
-            ax, rows, xlabel="paired suppression margin (nats per anchor)",
-            title=f"{arm}" + ("" if peak is None else f" (peak band: {peak})"), zero=True,
+            ax, rows, xlabel="margin (nats per anchor)",
+            title=f"{arm}" + ("" if peak is None else f": peak {peak}"), zero=True,
         )
     return _finish(
-        fig,
-        footnote_text=(
-            "Coloured bars are nominal intervals; the grey bar behind each is the family-adjusted "
-            "interval covering every searched band at once, which is the one a claim about the "
-            "peak rests on. " + SUPPRESSION_QUALIFICATION
-        ),
+        fig, footnote_text="Coloured: nominal interval; grey: family-adjusted over every searched band.",
     )
 
 

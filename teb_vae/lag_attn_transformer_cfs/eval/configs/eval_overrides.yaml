@@ -13,12 +13,15 @@
 # rather than what the run trained under. `load_eval_overrides` refuses a `base:` key here.
 #
 # This is the conv-Transformer cell's delta. It is deliberately the conv-LSTM cell's, key for key
-# and value for value, and `tests/test_eval_binding.py` asserts that: the two models are compared
-# against each other, so a holdout split, a Monte Carlo draw count or a retention cap that differed
-# between them would make every side-by-side number a comparison of two protocols rather than of two
-# architectures. Only the comments below differ, where a value needed re-justifying against this
-# architecture's costs. This cell registers no extra analysis, so unlike the raw pair's deltas there
-# is not even a cap here that the sibling's file does not carry.
+# and value for value, with ONE declared exception: `eval_config.occlusion_bands`, rescaled to lie
+# inside this cell's shorter `max_lag` (see that leaf below). `tests/test_eval_binding.py` asserts
+# exactly that -- the same band names, both starting at lag 0, and every other leaf equal: the two
+# models are compared against each other, so a holdout split, a Monte Carlo draw count or a
+# retention cap that differed between them would make every side-by-side number a comparison of two
+# protocols rather than of two architectures. Otherwise only the comments below differ, where a
+# value needed re-justifying against this architecture's costs. This cell registers no extra
+# analysis, so unlike the raw pair's deltas there is not even a cap here that the sibling's file
+# does not carry.
 #
 # Run from the repo root:
 #   python -m teb_vae.lag_attn_transformer_cfs.eval.probe --checkpoint <run>/model_checkpoints/<name>.ckpt
@@ -29,15 +32,15 @@ general_config:
     # gone, but the transients are not: the pass decodes four scored branches over all
     # A = T_valid - F dense anchors x H steps x C_keep channels at K Monte Carlo draws, which is two
     # (A, H, C_keep) float32 tensors per branch per draw, plus the (T, M, L) attention weights with
-    # L = max_lag + 1. Worked example at the 2026-09-23 training geometry (A = 136, H = 30,
-    # C_keep = 76): ~1.2 MB per tensor, ~2.5 MB per batch element, so 32 keeps the transient near
-    # 80 MB -- well inside any evaluation device, so the sibling's value transfers rather than
-    # being halved on an argument nobody measured.
+    # L = max_lag + 1, every factor read from the checkpoint's own geometry. At the geometries this
+    # cell has trained, 32 keeps that transient under a hundred MB -- well inside any evaluation
+    # device, so the sibling's value transfers rather than being halved on an argument nobody
+    # measured.
     #
     # Kept at the conv-LSTM cell's 32 rather than inherited without thought, because this model adds
-    # a cost the recurrent encoder did not have: encoder self-attention is O(B T^2 d) at T = 300,
-    # quadratic where the LSTM was linear. It stays 32 because that cost is TIME rather than memory —
-    # `CausalSelfAttention` runs through fused `scaled_dot_product_attention`, which never
+    # a cost the recurrent encoder did not have: encoder self-attention is O(B T^2 d) in the window
+    # length T, quadratic where the LSTM was linear. It stays 32 because that cost is TIME rather
+    # than memory — `CausalSelfAttention` runs through fused `scaled_dot_product_attention`, which never
     # materialises the (B, H_e, T, T) probability tensor, so peak memory is linear in B exactly as it
     # was. A smaller batch would make every run slower without making any of them fit, and it would
     # put this model's runs on a different loader shape from the cell it is compared against.

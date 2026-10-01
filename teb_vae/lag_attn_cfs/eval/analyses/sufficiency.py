@@ -253,36 +253,26 @@ def build_sufficiency_figure(
 ) -> Any:
     r"""Draw the three scores side by side and the probe's own convergence beneath them.
 
-    The upper panel is where the two gaps are read, so both are annotated on it rather than left
-    for a reader to subtract: $\Delta_{\mathrm{suff}}$ between the oracle and the base violin, and
-    ``pred_gap`` between the base and full ones. The lower panel is the evidence for whether the
-    upper one may be believed -- a held-out curve still descending at its right-hand edge is a
+    The upper panel is where the two gaps are read: $\Delta_{\mathrm{suff}}$ between the oracle and
+    the base violin, and ``pred_gap`` between the base and full ones. Their point estimates and
+    intervals are in the summary rows, not on the page. The lower panel is the evidence for whether
+    the upper one may be believed -- a held-out curve still descending at its right-hand edge is a
     probe that understates the gap it was fitted to measure.
 
     Args:
         per_guid: Per-recording means of the three score columns.
         curve: The long-format training curve.
-        rows: The summary rows, read for the two gap point estimates.
+        rows: The summary rows. Unused by the drawing; kept so the builder's signature matches
+            the record it is called with.
 
     Returns:
         The figure; the caller renders and closes it.
     """
-    by_metric = {str(row["metric"]): row for row in rows}
-    gaps = " | ".join(
-        f"{name} = {float(by_metric[name]['value']):.4g} "
-        f"[{float(by_metric[name]['lo']):.4g}, {float(by_metric[name]['hi']):.4g}]"
-        for name, _left, _right, _meaning in GAP_METRICS
-        if name in by_metric and np.isfinite(float(by_metric[name]["value"]))
-    )
-
     figure, axes = figures.new_figure(2)
     figures.violin_panel(
         axes[0, 0],
         {label: finite_column(per_guid, column) for column, label in SCORE_COLUMNS},
-        title=(
-            "Block score per held-out recording (lower is better)"
-            + (f" -- {gaps}" if gaps else "")
-        ),
+        title="Block score",
         ylabel="nats per anchor",
     )
 
@@ -302,7 +292,7 @@ def build_sufficiency_figure(
                 labels.append(f"width x{width}, {kind}")
         figures.multi_line_panel(
             axis, steps, np.vstack(series), labels,
-            title="Oracle probe fit (curve points are a fixed subsample of each side)",
+            title="Oracle probe fit",
             xlabel="optimizer step", ylabel="nats per anchor",
         )
     else:

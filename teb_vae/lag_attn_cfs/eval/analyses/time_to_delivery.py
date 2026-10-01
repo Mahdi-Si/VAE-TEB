@@ -499,7 +499,7 @@ def build_trajectory_figure(
             if row["group_column"] == axis and row["metric"] == readout.name
         ],
         axis,
-        title=f"{readout.name} against time before delivery, by {axis}",
+        title=readout.name,
     )
     return figure
 
@@ -559,7 +559,7 @@ def _draw_panel(ax: Any, rows: Sequence[Dict[str, Any]], axis: str, *, title: st
         ax.plot(
             x, _series("median"),
             marker="o", markersize=3, color=colour, linewidth=figures.LINE_EMPHASIS,
-            label=f"{group} (n={int(cell[0].get('n_recordings_total', 0))} deliveries)",
+            label=group,
         )
         for row in cell:
             # Staggered within a shared window, so two cohorts there do not print one count

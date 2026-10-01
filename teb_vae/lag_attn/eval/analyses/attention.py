@@ -22,8 +22,12 @@ the same lag are one head with four times the parameters, and the per-head KL de
 attribute across them regardless -- producing four confident, identical numbers.
 
 **Every lag figure carries two axes.** The model-lag index is what the tensors are indexed by;
-seconds is what a reader wants. The conversion is $s\ell$ on the stored timeline, which is
-canonical: the dataset builder's UP shift is part of the stored signal and is never undone here.
+seconds is what a reader wants. The conversion is $s\ell$ on the stored timeline, with no
+offset term.
+
+**The figures carry no caption prose.** A title names what is drawn, the axis labels carry the
+quantity and its unit, and the one caveat a reader needs to read the argmax panel is a single
+footnote line. The reading guide is ``FIGURE_GUIDE.md``.
 """
 from __future__ import annotations
 
@@ -34,12 +38,16 @@ import numpy as np
 import pandas as pd
 from loguru import logger
 
-from teb_vae.lag_attn.eval import figures, masks, metrics, report
+from teb_vae.lag_attn.eval import figures, labels, masks, metrics, report
 from teb_vae.lag_attn.eval.collectors import CollectionPlan, collect_attention, collect_metrics
 from teb_vae.lag_attn.eval.runner import EvalRunner, get_field
 
 #: Subdirectory of the run directory receiving this analysis's artifacts.
 ANALYSIS_DIRNAME = "attention"
+
+#: The one line the summary figure carries under its panels: the caveat on reading the argmax
+#: histogram. Well under :data:`teb_vae.lag_attn.eval.figures.FOOTNOTE_MAX_CHARS`.
+ARGMAX_NOTE = "Argmax is uninformative where attention is near uniform."
 
 #: Metrics resolved by clinical class and by canonical subgroup, when the split holds more than
 #: one of either. Whether the selected lag differs between cohorts is the question that would
@@ -134,16 +142,24 @@ def _write_heatmaps(
     n_samples, seq_len, _, num_lags = weights.shape
     warmup = int(runner.model._warmup_steps(seq_len))
     guids = list(collected.frame["guid"]) if "guid" in collected.frame else [""] * n_samples
+    sources = (
+        list(collected.frame["source_file"])
+        if "source_file" in collected.frame
+        else [None] * n_samples
+    )
 
     figure, axes = figures.new_figure(n_samples, height_per_row=2.2)
     try:
         for row in range(n_samples):
             ax = axes[row, 0]
+            # The row identifies its recording and nothing else: the quantity is the colourbar's
+            # and the y label's. A GUID is always followed by its subgroup.
+            subgroup = labels.subgroup_of(sources[row]) or "unknown"
             figures.heatmap_with_colorbar(
                 figure,
                 ax,
                 weights[row].mean(axis=1).T,
-                title=f"Head-averaged attention $\\alpha_{{t,\\ell}}$ -- {guids[row]}",
+                title=f"guid {guids[row]}, subgroup {subgroup}",
                 xlabel="Anchor $t$ (decimated steps)" if row == n_samples - 1 else "",
                 ylabel="Model lag $\\ell$",
                 cmap="magma",
@@ -153,12 +169,6 @@ def _write_heatmaps(
             )
             figures.shade_warmup(ax, warmup, float(seq_len), seq_len)
             figures.attach_lag_seconds_axis(ax, metrics.STEP_SECONDS, 0.0)
-        figure.suptitle(
-            f"Lag axis: seconds = {metrics.STEP_SECONDS:g}$\\ell$ on the stored timeline "
-            f"(canonical; no dataset-shift term). Shaded: warm-up.",
-            fontsize=7,
-            y=0.999,
-        )
         return str(figures.render_figure(figure, directory / "attention_heatmaps"))
     finally:
         figures.plt.close(figure)
@@ -189,7 +199,7 @@ def _write_summary_figure(frame: pd.DataFrame, lag_columns: list, directory: Pat
         figures.histogram_panel(
             axes[0, 0],
             argmax_lag[argmax_lag >= 0],
-            title="Per-sample argmax lag",
+            title="Argmax lag",
             xlabel="Model lag $\\ell$",
             bins=max(len(lag_columns), 1),
         )
@@ -197,10 +207,10 @@ def _write_summary_figure(frame: pd.DataFrame, lag_columns: list, directory: Pat
             axes[1, 0],
             lags,
             profile,
-            title="Attention mass by lag, over the valid support",
+            title="Attention mass by lag",
             xlabel="Model lag $\\ell$",
             ylabel="$\\bar{\\alpha}_\\ell$",
-            label="median over samples",
+            label="median",
         )
         # The lag axis is the x here, not the y, so the shared secondary-axis helper -- which
         # decorates a y-axis -- does not apply; the equivalent x conversion is inlined.
@@ -211,24 +221,19 @@ def _write_summary_figure(frame: pd.DataFrame, lag_columns: list, directory: Pat
                 lambda sec: sec / metrics.STEP_SECONDS,
             ),
         )
-        seconds.set_xlabel("Physical delay (s)", fontsize=8)
+        seconds.set_xlabel("Lag (s)", fontsize=8)
         figures.histogram_panel(
             axes[2, 0],
             frame.get("head_diversity", pd.Series(dtype=float)),
-            title="Head diversity (mean pairwise total variation between heads' lag profiles)",
-            xlabel="head_diversity",
+            title="Head diversity",
+            xlabel="Pairwise total variation between heads",
             color=figures.COLOR_PURPLE,
             reference=0.0,
-            reference_label="all heads identical",
+            reference_label="identical heads",
         )
-        figure.suptitle(
-            f"Lag axis: seconds = {metrics.STEP_SECONDS:g}$\\ell$ on the stored timeline "
-            f"(canonical; no dataset-shift term). Read argmax_lag only "
-            f"against the entropy: near the attainable ceiling the row is flat and its peak "
-            f"is noise.",
-            fontsize=7,
-            y=0.999,
-        )
+        # The one reading a reader of the argmax panel must not get wrong; the entropy that
+        # decides it is in ``per_sample.csv`` and the full argument is in ``FIGURE_GUIDE.md``.
+        figures.footnote(figure, ARGMAX_NOTE)
         return str(figures.render_figure(figure, directory / "attention"))
     finally:
         figures.plt.close(figure)
@@ -339,7 +344,7 @@ def run_attention_analysis(
         "heatmap_plan": None if heatmap_plan is None else heatmap_plan.describe(),
         "num_lags": len(lag_columns),
         # The seconds convention every lag figure and column of this analysis uses: the stored
-        # timeline, with no dataset-shift term.
+        # timeline.
         "step_seconds": float(metrics.STEP_SECONDS),
         "mean_entropy_nats": mean_entropy,
         # The bound the uniformity check must divide by: the support-weighted mean of

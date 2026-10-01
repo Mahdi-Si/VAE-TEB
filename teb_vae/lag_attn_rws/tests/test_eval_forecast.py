@@ -503,8 +503,8 @@ def test_the_overlay_draws_the_forecast_in_bpm_against_lead_time_in_seconds() ->
 
     # target 0 -> 140 bpm, mu_base +0.5 -> 145, mu_full -0.5 -> 135.
     assert lines["truth"] == pytest.approx(np.full(x.size, 140.0), rel=1e-6)
-    assert lines["target-only (base)"] == pytest.approx(np.full(x.size, 145.0), rel=1e-6)
-    assert lines["source-conditioned (full)"] == pytest.approx(np.full(x.size, 135.0), rel=1e-6)
+    assert lines["base"] == pytest.approx(np.full(x.size, 145.0), rel=1e-6)
+    assert lines["full"] == pytest.approx(np.full(x.size, 135.0), rel=1e-6)
     # 480 raw samples at 4 Hz on the production grid; H * R samples of 0.25 s here.
     assert x.size == GEOMETRY.horizon * GEOMETRY.r
     assert float(x[-1]) == pytest.approx(GEOMETRY.horizon * 4.0)

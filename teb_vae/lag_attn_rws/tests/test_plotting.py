@@ -197,7 +197,7 @@ def test_the_untrained_anchors_are_cut_from_the_maps_rather_than_shaded_over(tas
         trained = geometry.t_valid - geometry.warmup
 
         expected = {
-            "Target-only latent state": (warmup_sec, tail_sec, trained),
+            "Latent state": (warmup_sec, tail_sec, trained),
             "Per-dimension source-conditioned KL": (warmup_sec, tail_sec, trained),
             "$\\widetilde K": (warmup_sec, tail_sec, trained),
             # Attention is a property of the source stream and is defined at every step; only the

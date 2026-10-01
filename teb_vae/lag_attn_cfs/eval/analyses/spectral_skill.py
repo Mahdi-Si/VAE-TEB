@@ -524,7 +524,7 @@ def build_band_figure(per_guid: pd.DataFrame, rows: Sequence[Dict[str, Any]]) ->
     figures.violin_panel(
         axes[0, 0],
         labelled,
-        title="forecast gap per recording, by the band of the target coefficient",
+        title="Forecast gap by band",
         ylabel="nats per anchor",
         reference=0.0,
         reference_label="no improvement",
@@ -539,7 +539,7 @@ def build_band_figure(per_guid: pd.DataFrame, rows: Sequence[Dict[str, Any]]) ->
     figures.violin_panel(
         axes[1, 0],
         skills,
-        title="error-space skill of the source-conditioned branch against the target-only one",
+        title="Error-space skill by band",
         ylabel="1 - MSE_full / MSE_base",
         reference=0.0,
         reference_label="no improvement",

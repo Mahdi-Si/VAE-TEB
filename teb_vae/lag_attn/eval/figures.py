@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import string
 import textwrap
+import warnings
 from pathlib import Path
 from typing import Any, Optional, Sequence, Tuple
 
@@ -78,6 +79,7 @@ __all__ = [
     "DEFAULT_FIGURE_FORMAT",
     "EVAL_SAVE_DPI",
     "FIGURE_WIDTH",
+    "FOOTNOTE_MAX_CHARS",
     "LINE_PALETTE",
     "SAVE_DPI",
     "STYLE_REFINEMENT",
@@ -242,6 +244,11 @@ _LAYOUT_DONE_ATTRIBUTE = "_eval_layout_done"
 #: and the caveats these figures carry are read, not decorative, so they are not set below it.
 FOOTNOTE_SIZE = 6.0
 _FOOTNOTE_LINE_HEIGHT = 1.35
+#: The longest footnote a figure carries, in characters: one line at the double-column width. A
+#: journal figure holds a short note and leaves the argument to its caption, which here is the
+#: records, ``summary.json`` and ``FIGURE_GUIDE.md``; a caveat that needs a paragraph is written
+#: there, not under the axes.
+FOOTNOTE_MAX_CHARS = 120
 #: Average advance of a serif glyph at 1 pt, used to wrap a footnote to the figure width.
 _GLYPH_ADVANCE_EM = 0.47
 
@@ -401,7 +408,20 @@ def footnote(fig: Any, text: str) -> float:
 
     Returns:
         The fraction of the figure height reserved under the axes.
+
+    Warns:
+        UserWarning: If ``text`` is longer than :data:`FOOTNOTE_MAX_CHARS`. Warned rather than
+            raised or truncated: a long caveat is a style fault, never a reason to lose a figure
+            at the end of a multi-hour run, but it should be loud so the caveat moves to the
+            records and the guide.
     """
+    if len(str(text)) > FOOTNOTE_MAX_CHARS:
+        warnings.warn(
+            f"footnote of {len(str(text))} characters exceeds FOOTNOTE_MAX_CHARS="
+            f"{FOOTNOTE_MAX_CHARS}: {str(text)[:60]!r}...",
+            UserWarning,
+            stacklevel=2,
+        )
     width_in, height_in = (float(v) for v in fig.get_size_inches())
     # The line count is estimated here from the average glyph advance, for the reservation; the
     # wrapping itself is left to matplotlib, so the artist carries the caveat verbatim and a
@@ -601,10 +621,10 @@ def histogram_panel(
     )
     median = float(np.median(finite))
     ax.axvline(median, color=COLOR_VERMILLION, linestyle="--", linewidth=plt.rcParams["lines.linewidth"],
-               label=f"median {median:.4g}")
+               label="median")
     if reference is not None and np.isfinite(reference):
         ax.axvline(float(reference), color=COLOR_GRAY, linestyle=":", linewidth=plt.rcParams["lines.linewidth"],
-                   label=reference_label or f"reference {float(reference):.4g}")
+                   label=reference_label or "reference")
     ax.legend(loc="best")
     style_axes(ax)
     return int(finite.size)
@@ -937,7 +957,7 @@ def violin_panel(
 
     if reference is not None and np.isfinite(reference):
         ax.axhline(float(reference), color=COLOR_GRAY, linestyle=":", linewidth=plt.rcParams["lines.linewidth"],
-                   label=reference_label or f"reference {float(reference):.4g}")
+                   label=reference_label or "reference")
         ax.legend(loc="best")
     style_axes(ax)
     return len(populated)
@@ -1243,7 +1263,7 @@ def significance_strip(
         color=COLOR_VERMILLION,
         linestyle="--",
         linewidth=plt.rcParams["lines.linewidth"],
-        label=f"alpha = {float(alpha):g} (Holm-adjusted)",
+        label=f"$\\alpha = {float(alpha):g}$",
     )
     ax.legend(loc="best")
     ax.set_xlim(min(positions) - float(bin_width), max(positions) + float(bin_width))
@@ -1306,11 +1326,13 @@ def grouped_violin_figure(
         violin_panel(
             axes[row, 0],
             {group: samples.get(group, []) for group in groups},
-            title=f"{title_prefix}{metric}" if title_prefix else str(metric),
+            # No title without a prefix: the y label already names the metric, so a title would
+            # print it twice on every stacked panel.
+            title=f"{title_prefix}{metric}" if title_prefix else "",
             ylabel=str(metric),
             colors=colors,
             reference=reference,
-            reference_label="" if reference is None else f"{metric} = {float(reference):g}",
+            reference_label="" if reference is None else f"{float(reference):g}",
         )
     return fig, axes
 
@@ -1325,7 +1347,7 @@ def multi_line_panel(
     xlabel: str = "",
     ylabel: str = "",
 ) -> int:
-    """Overlay one line per row of ``curves``, with a legend naming each.
+    """Overlay one line per row of ``curves``, with a legend naming each when there are several.
 
     Used where a ribbon would not do: comparing several *groups* against each other on one axes,
     rather than showing the spread within a single group.
@@ -1373,8 +1395,10 @@ def multi_line_panel(
         ax.plot(axis_x, field[row], color=colour, linewidth=plt.rcParams["lines.linewidth"], label=label)
         drawn += 1
     # Every curve spans the whole axis, so the legend gets headroom rather than a corner; the
-    # column count grows with the group count so the strip stays one or two rows deep.
-    legend_with_headroom(ax, ncol=min(max(drawn, 1), 4), headroom=0.25)
+    # column count grows with the group count so the strip stays one or two rows deep. A panel
+    # with one curve has no legend: its title and y label already name it.
+    if drawn > 1:
+        legend_with_headroom(ax, ncol=min(drawn, 4), headroom=0.25)
     style_axes(ax)
     return drawn
 
@@ -1463,7 +1487,7 @@ def frequency_scatter(
     if n_dropped:
         # In the legend rather than only in a CSV: a panel silently missing 14 of 43 channels
         # looks complete.
-        ax.plot([], [], linestyle="none", label=f"{n_dropped} channel(s) with no centre frequency")
+        ax.plot([], [], linestyle="none", label=f"{n_dropped} without frequency")
         ax.legend(loc="best")
     style_axes(ax)
     return handle

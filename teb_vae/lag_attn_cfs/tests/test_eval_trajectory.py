@@ -435,4 +435,4 @@ def test_the_whole_delivery_tables_and_page_name_each_recordings_cohort(tmp_path
         import matplotlib.pyplot as plt
 
         plt.close(figure)
-    assert "a (hie_cs, hie)" in title
+    assert "guid a" in title and "subgroup hie_cs" in title and "class hie" in title

@@ -457,7 +457,8 @@ class GuidEpochMetricsCallback(Callback):
 class ClassifierPlotCallback(Callback):
     """#5: one diagnostics page per ``every_n_epochs`` (rank 0, not in sanity; a failure only warns): val GUID ROC
     and PR, score histograms by class, reliability (equal-mass bins), confusion at the val-quantile FPR-cap
-    threshold, pooling-attention entropy. ``classifier_diagnostics/epoch{E:04d}_diagnostics.<fmt>``."""
+    threshold, pooling-attention entropy. The only figure text is the panel titles and ``epoch N``.
+    ``classifier_diagnostics/epoch{E:04d}_diagnostics.<fmt>``."""
 
     def __init__(self, output_dir: Any, every_n_epochs: int = 5, file_format: str = "pdf",
                  mlflow_logger: Any = None) -> None:
@@ -495,19 +496,19 @@ class ClassifierPlotCallback(Callback):
         ax[0, 1].set(title="PR", xlabel="recall", ylabel="precision")
         for k, name in ((0, "negative"), (1, "positive")):
             ax[0, 2].hist(s[y == k], bins=20, alpha=0.6, label=name)
-        ax[0, 2].axvline(thr, color="k", ls="--", label="q30 threshold")
+        ax[0, 2].axvline(thr, color="k", ls="--", label="threshold")
         ax[0, 2].set(title="GUID score by class", xlabel="logit")
         ax[0, 2].legend()
         frac, mean_p = calibration_curve(y, 1 / (1 + np.exp(-s)), n_bins=max(2, min(10, len(y) // 5)),
                                          strategy="quantile")
         ax[1, 0].plot(mean_p, frac, "o-")
         ax[1, 0].plot([0, 1], [0, 1], ":", color="grey")
-        ax[1, 0].set(title="reliability (equal mass)", xlabel="predicted", ylabel="observed")
+        ax[1, 0].set(title="reliability", xlabel="predicted", ylabel="observed")
         cm = confusion_matrix(y, (s > thr).astype(int), labels=[0, 1])
         ax[1, 1].imshow(cm, cmap="Blues")
         for (i, j), v in np.ndenumerate(cm):
             ax[1, 1].text(j, i, str(v), ha="center", va="center")
-        ax[1, 1].set(title="confusion at q30", xlabel="predicted", ylabel="true", xticks=[0, 1], yticks=[0, 1])
+        ax[1, 1].set(title="confusion", xlabel="predicted", ylabel="true", xticks=[0, 1], yticks=[0, 1])
         ax[1, 2].hist(seg["attn_entropy"], bins=30)
         ax[1, 2].set(title="pooling attention entropy", xlabel="nats")
         fig.suptitle(f"epoch {epoch}")
@@ -861,6 +862,12 @@ class ClassifierTrainer(GraphModelBase):
 
 
 # ---- the unit (outer loop steps 1-3) ------------------------------------------------------------------------------
+#: This process's own log pair, relative to the run dir, which :func:`_teardown` re-installs after each unit: the run's
+#: ``run.log`` in the main process; a fold process (``run.fold_job``, SPEC §14.4) points it at its fold's files, so it
+#: never writes (or rotates) the run-level log another process owns.
+PROCESS_LOGS: Tuple[str, str] = ("run.log", "run.jsonl")
+
+
 def _teardown(gm: Optional[ClassifierTrainer], run_dir: Path) -> None:
     """F7: the base leaks every driver (atexit upload), its system-metrics monitor, and replaces loguru's sinks."""
     if gm is not None:
@@ -873,7 +880,8 @@ def _teardown(gm: Optional[ClassifierTrainer], run_dir: Path) -> None:
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
-    setup_logging(file_path=str(run_dir / "run.log"), json_path=str(run_dir / "run.jsonl"), compression=None)
+    setup_logging(file_path=str(run_dir / PROCESS_LOGS[0]), json_path=str(run_dir / PROCESS_LOGS[1]),
+                  compression=None)
 
 
 def train_unit(cfg: Config, run_dir: Any, manifest: Mapping[str, Any], *, fold: int, seed: int, kind: str,

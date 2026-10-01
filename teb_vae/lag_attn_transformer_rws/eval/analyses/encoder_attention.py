@@ -361,19 +361,21 @@ def build_entropy_figure(entropy: pd.DataFrame) -> Any:
             axis.axhline(
                 1.0, color=figures.COLOR_VERMILLION, linestyle="--",
                 linewidth=figures.LINE_REGULAR,
-                label="uniform over every admitted key",
+                label="uniform",
             )
             axis.set_xticks(np.arange(values.size, dtype=np.float64))
             axis.set_xticklabels(
                 [f"b{int(block)}h{int(head)}" for block, head in zip(rows["block"], rows["head"])],
                 fontsize=figures.FONT_TINY,
             )
-            axis.legend(fontsize=figures.FONT_LABEL, loc="best")
+            if position == 0:
+                # The same reference line in every stream's panel, named once.
+                axis.legend(fontsize=figures.FONT_LABEL, loc="best")
         else:
             axis.text(
                 0.5, 0.5, figures.EMPTY_NOTE, ha="center", va="center", transform=axis.transAxes
             )
-        axis.set_title(f"{stream} encoder: attention entropy against its attainable ceiling")
+        axis.set_title(f"{stream} encoder")
         axis.set_xlabel("block and head")
         axis.set_ylabel("entropy / attainable ceiling")
         figures.style_axes(axis)
@@ -415,13 +417,15 @@ def build_entropy_class_figure(entropy: pd.DataFrame, cohorts: Sequence[str]) ->
                     float(np.nanmean(pooled)), color=figures.COLOR_BLACK, linestyle="--",
                     linewidth=figures.LINE_THIN, label="pooled",
                 )
-                axis.legend(fontsize=figures.FONT_LABEL, loc="best")
+                if position == 0:
+                    # The same pooled line in every stream's panel, named once.
+                    axis.legend(fontsize=figures.FONT_LABEL, loc="best")
         else:
             axis.text(
                 0.5, 0.5, figures.EMPTY_NOTE, ha="center", va="center", transform=axis.transAxes
             )
-        axis.set_title(f"{stream} encoder: entropy ratio by clinical class")
-        axis.set_xlabel("clinical class, in ascending severity")
+        axis.set_title(f"{stream} encoder")
+        axis.set_xlabel("clinical class")
         axis.set_ylabel("entropy / attainable ceiling")
         figures.style_axes(axis)
     return figure
@@ -457,10 +461,13 @@ def build_distance_figure(distance: pd.DataFrame, geometry: Dict[str, Dict[str, 
             axis, seconds,
             np.vstack(curves) if curves else np.zeros((0, seconds.size)),
             [f"head {head}" for head in heads],
-            title=f"{stream} encoder, block {block}: attention mass by temporal distance",
+            title=f"{stream} encoder, block {block}",
             xlabel="temporal distance t - j (s)",
             ylabel="attention mass",
         )
+        if position:
+            # The same head keys and colours as the first panel's legend.
+            figures.drop_legend(axis)
         window = geometry[stream]["attention_window"]
         if window is not None:
             axis.axvline(
@@ -504,7 +511,7 @@ def build_distance_class_figure(
             axis, seconds,
             np.vstack(curves) if curves else np.zeros((0, seconds.size)),
             list(drawn),
-            title=f"{stream} encoder: attention mass by temporal distance, by clinical class",
+            title=f"{stream} encoder",
             xlabel="temporal distance t - j (s)",
             ylabel="attention mass",
         )
@@ -515,8 +522,11 @@ def build_distance_class_figure(
             colour = palette.get(str(line.get_label()))
             if colour is not None:
                 line.set_color(colour)
-        if drawn:
+        if drawn and position == 0:
+            # The same class keys and colours in every stream's panel, named once.
             axis.legend(fontsize=figures.FONT_LABEL, loc="best", ncol=2)
+        elif position:
+            figures.drop_legend(axis)
         window = geometry[stream]["attention_window"]
         if window is not None:
             axis.axvline(
@@ -549,7 +559,7 @@ def build_heatmap_figure(result: Any) -> Any:
         left, right = sample_cell_edges(result.seq_len, SECONDS_PER_STEP)
         figures.heatmap_with_colorbar(
             figure, axes[position, 0], np.asarray(result.heatmaps[key], dtype=np.float64),
-            title=f"{stream} encoder, block {block}: one segment's attention, head-averaged",
+            title=f"{stream} encoder, block {block}",
             xlabel="key step j (s)",
             ylabel="anchor step t (s)",
             symmetric=False,

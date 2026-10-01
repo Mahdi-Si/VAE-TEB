@@ -20,11 +20,11 @@ analysis that was skipped, a control that could not run, a threshold that ships 
 different outcome from the criterion being met and is **never counted as a pass**: a report with
 inconclusive rows says so, so a partially-verified run cannot be mistaken for a fully verified one.
 
-That last case is this cell's standing one rather than an edge case.
-``eval_config.clock_margin_min_nats`` ships unset, so ``coupling_exceeds_availability_clock`` is
-INCONCLUSIVE on every run until somebody sets it from measured data -- and the measurement reaches
-the arm tables regardless, through the ``coupling_minus_clock_nats`` headline scalar, which is what
-makes setting the threshold from data possible at all.
+``eval_config.clock_margin_min_nats`` is the standing example. The schema default is unset,
+which makes ``coupling_exceeds_availability_clock`` INCONCLUSIVE; the committed override delta sets
+it from measured data. Either way the measurement reaches the arm tables through the
+``coupling_minus_clock_nats`` headline scalar, which is what makes setting the threshold from data
+possible at all.
 
 Which ``pred_gap`` the gate reads is stated in the machinery rather than in prose:
 :data:`PRED_GAP_COLUMN` names the Monte Carlo marginalised headline column, the report carries it
@@ -994,9 +994,11 @@ def build_cross_cell_table(arms: Sequence[Dict[str, Any]]) -> List[str]:
         "",
         f"Rows keyed by the `model_class` each run recorded in its own `run_context`, never by "
         f"directory name. The baseline cell is `{BASELINE_MODEL_CLASS}`; "
-        f"`{COMPARISON_MODEL_CLASS}` replaces both history encoders and changes nothing else -- "
-        f"the same objective, the same target domain, the same anchor tiling and the same warm-up "
-        f"budget -- so every number below is the same objective's.",
+        f"`{COMPARISON_MODEL_CLASS}` replaces both history encoders. A level in one row is "
+        f"comparable with a level in the other only when the two runs score the same block: the "
+        f"same horizon, anchor tiling and warm-up budget in `preflight.json` and the same "
+        f"`likelihood_structure` in `summary.json`. Where they differ, read signs and orderings "
+        f"only.",
         "",
         SELECTION_RULE,
         "",

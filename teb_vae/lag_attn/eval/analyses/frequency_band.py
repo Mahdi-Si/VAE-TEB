@@ -396,13 +396,10 @@ def _write_partition_figures(
             }
             figures.violin_panel(
                 axes[row, 0], samples,
-                title=(
-                    f"Per-sample masked MSE by {name} band" if metric == "mse"
-                    else f"Per-sample $R^2$ by {name} band"
-                ),
+                title="Masked MSE by band" if metric == "mse" else "$R^2$ by band",
                 ylabel="Masked MSE" if metric == "mse" else "$R^2$",
                 reference=None if metric == "mse" else 0.0,
-                reference_label="$R^2 = 0$ (predicting the channel mean)",
+                reference_label="$R^2 = 0$",
             )
         written["band_violins"] = str(
             figures.render_figure(figure, directory / "band_violins")
@@ -419,21 +416,23 @@ def _write_partition_figures(
 
     figure, axes = figures.new_figure(3, height_per_row=2.8)
     try:
+        # The legend carries the bare band names; the Hz range and channel count sit once, on the
+        # row labels of the two heatmaps below it, which list the bands in the same order.
         figures.multi_line_panel(
             axes[0, 0], figures.sequence_axis(horizon.shape[1] if horizon.size else 0),
-            horizon, rendered,
-            title=f"Forecast error by horizon step, per {name} band",
+            horizon, list(labels),
+            title="Masked MSE by horizon step",
             xlabel="Horizon step $h$", ylabel="Mean masked MSE",
         )
         figures.heatmap_with_colorbar(
             figure, axes[1, 0], horizon,
-            title=f"Band by horizon ({name})", xlabel="Horizon step $h$", ylabel="",
+            title="Band by horizon", xlabel="Horizon step $h$", ylabel="",
             symmetric=False, colorbar_label="Mean masked MSE",
         )
         figures.label_rows(axes[1, 0], rendered)
         figures.heatmap_with_colorbar(
             figure, axes[2, 0], anchor,
-            title=f"Band by anchor ({name})",
+            title="Band by anchor",
             xlabel="Anchor $t$ (decimated steps)", ylabel="",
             symmetric=False, colorbar_label="Mean masked MSE",
         )
@@ -484,11 +483,8 @@ def _write_channel_figure(
             figures.frequency_scatter(
                 figure, axes[row, 0], frequencies, errors,
                 colour_by=ratios if block == "phase" else None,
-                colour_label="harmonic ratio $p = \\xi_j / \\xi_i$",
-                title=(
-                    "Per-channel MSE against centre frequency (scattering)" if block == "scattering"
-                    else "Per-channel MSE against $\\xi_j$ (phase-harmonic)"
-                ),
+                colour_label="$p = \\xi_j / \\xi_i$",
+                title="Scattering channels" if block == "scattering" else "Phase-harmonic channels",
                 xlabel="Centre frequency (Hz)" if block == "scattering" else "$\\xi_j$ (Hz)",
                 ylabel="Pooled masked MSE",
             )
